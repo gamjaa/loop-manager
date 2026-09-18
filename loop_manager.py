@@ -172,10 +172,30 @@ def git_bytes(repo: Path, *arguments: str) -> bytes:
     return result.stdout
 
 
+def _git_tree_blobs(repo: Path, revision: str) -> dict[bytes, bytes]:
+    tree = git_bytes(repo, "ls-tree", "-r", "-z", "--full-tree", revision)
+    blobs: dict[bytes, bytes] = {}
+    for record in tree.split(b"\0"):
+        if not record:
+            continue
+        metadata, separator, path = record.partition(b"\t")
+        parts = metadata.split()
+        if not separator or len(parts) != 3:
+            raise RuntimeError("Git tree 항목 형식이 올바르지 않습니다.")
+        _mode, object_type, object_id = parts
+        if object_type == b"blob":
+            blobs[path] = object_id
+    return blobs
+
+
+def _is_active_requirement(path: bytes) -> bool:
+    return re.fullmatch(rb"docs/requirements/[^/]*\.md", path) is not None
+
+
 def _is_planning_input(path: bytes) -> bool:
     if path in {b"AGENTS.md", b"docs/PRODUCT.md", b"docs/ARCHITECTURE.md"}:
         return True
-    if re.fullmatch(rb"docs/requirements/[^/]*\.md", path):
+    if _is_active_requirement(path):
         return True
     return not path.startswith(b"docs/")
 
@@ -192,17 +212,9 @@ def _planning_input_digest(entries: list[tuple[bytes, bytes]]) -> str:
 
 
 def _planning_input_fingerprint(repo: Path, revision: str) -> str:
-    tree = git_bytes(repo, "ls-tree", "-r", "-z", "--full-tree", revision)
     entries: list[tuple[bytes, bytes]] = []
-    for record in tree.split(b"\0"):
-        if not record:
-            continue
-        metadata, separator, path = record.partition(b"\t")
-        parts = metadata.split()
-        if not separator or len(parts) != 3:
-            raise RuntimeError("Git tree 항목 형식이 올바르지 않습니다.")
-        _mode, object_type, object_id = parts
-        if object_type == b"blob" and _is_planning_input(path):
+    for path, object_id in _git_tree_blobs(repo, revision).items():
+        if _is_planning_input(path):
             contents = git_bytes(repo, "cat-file", "blob", object_id.decode("ascii"))
             entries.append((path, contents))
     return _planning_input_digest(entries)
@@ -210,6 +222,41 @@ def _planning_input_fingerprint(repo: Path, revision: str) -> str:
 
 def planning_input_fingerprint(repo: Path, base: str) -> str:
     return _planning_input_fingerprint(repo, f"origin/{base}")
+
+
+def _is_requirement_archive_only_change(
+    repo: Path,
+    previous_revision: str,
+    current_revision: str,
+) -> bool:
+    previous_tree = _git_tree_blobs(repo, previous_revision)
+    current_tree = _git_tree_blobs(repo, current_revision)
+    previous_inputs = {
+        path: object_id for path, object_id in previous_tree.items() if _is_planning_input(path)
+    }
+    current_inputs = {
+        path: object_id for path, object_id in current_tree.items() if _is_planning_input(path)
+    }
+
+    removed = previous_inputs.keys() - current_inputs.keys()
+    added = current_inputs.keys() - previous_inputs.keys()
+    changed = {
+        path
+        for path in previous_inputs.keys() & current_inputs.keys()
+        if previous_inputs[path] != current_inputs[path]
+    }
+    if not removed or added or changed:
+        return False
+
+    requirement_prefix = b"docs/requirements/"
+    archive_prefix = b"docs/requirements/archive/"
+    for path in removed:
+        if not _is_active_requirement(path):
+            return False
+        archived_path = archive_prefix + path.removeprefix(requirement_prefix)
+        if archived_path in previous_tree or current_tree.get(archived_path) != previous_inputs[path]:
+            return False
+    return True
 
 
 def file_hash(path: Path) -> str:
@@ -652,6 +699,7 @@ def clear_active(
     connection: sqlite3.Connection,
     repo: str,
     *,
+    processed_sha: str | None = None,
     planning_fingerprint: str | None = None,
 ) -> None:
     values: dict[str, object] = {
@@ -663,6 +711,8 @@ def clear_active(
         "pr_url": None,
         "last_error": None,
     }
+    if processed_sha is not None:
+        values["processed_sha"] = processed_sha
     if planning_fingerprint is not None:
         values["planning_fingerprint"] = planning_fingerprint
     update_project(connection, repo, **values)
@@ -748,9 +798,30 @@ def run_project(
         update_project(connection, repo, base_branch=base)
         row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
 
+    if row["phase"] == "PLANNING":
+        started_fingerprint = _planning_input_fingerprint(repo_path, row["active_sha"])
+        if started_fingerprint != current_fingerprint:
+            stale_worktree = Path(row["worktree"])
+            if stale_worktree.exists():
+                git(repo_path, "worktree", "remove", "--force", str(stale_worktree))
+            clear_active(connection, repo)
+            row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
+
     if not row["phase"] and row["planning_fingerprint"] == current_fingerprint:
+        update_project(connection, repo, processed_sha=base_sha)
         print("계획 입력이 바뀌지 않아 Codex를 실행하지 않습니다.")
         return 0
+
+    if not row["phase"] and row["planning_fingerprint"] and row["processed_sha"]:
+        processed_fingerprint = _planning_input_fingerprint(repo_path, row["processed_sha"])
+        if processed_fingerprint == current_fingerprint:
+            update_project(connection, repo, processed_sha=base_sha)
+            print("계획 입력이 바뀌지 않아 Codex를 실행하지 않습니다.")
+            return 0
+        if _is_requirement_archive_only_change(repo_path, row["processed_sha"], base_sha):
+            update_project(connection, repo, processed_sha=base_sha)
+            print("Requirement archive 이동 외의 계획 입력이 바뀌지 않아 Codex를 실행하지 않습니다.")
+            return 0
 
     if not row["phase"]:
         project_id = hashlib.sha256(repo.encode()).hexdigest()[:16]
@@ -803,7 +874,12 @@ def run_project(
                 if not planned_files:
                     completed_fingerprint = _planning_input_fingerprint(repo_path, row["active_sha"])
                     git(repo_path, "worktree", "remove", str(planning_worktree))
-                    clear_active(connection, repo, planning_fingerprint=completed_fingerprint)
+                    clear_active(
+                        connection,
+                        repo,
+                        processed_sha=row["active_sha"],
+                        planning_fingerprint=completed_fingerprint,
+                    )
                     print("추가로 계획할 작업이 없습니다.")
                     return 0
                 if len(planned_files) != 1 or not re.fullmatch(r"docs/plans/[^/]+\.md", planned_files[0]):

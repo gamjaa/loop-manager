@@ -222,6 +222,12 @@ class LoopManagerTest(unittest.TestCase):
             commit_and_push(repo, "Change excluded documentation")
             self.assertEqual(loop_manager.planning_input_fingerprint(repo, "main"), initial)
 
+            (repo / "docs/requirements/archive/Old.md").write_text(
+                "# Changed archived requirement\n", encoding="utf-8"
+            )
+            commit_and_push(repo, "Change archived requirement")
+            self.assertEqual(loop_manager.planning_input_fingerprint(repo, "main"), initial)
+
             (repo / "docs/PRODUCT.md").write_text("# Changed product\n", encoding="utf-8")
             commit_and_push(repo, "Change product")
             changed = loop_manager.planning_input_fingerprint(repo, "main")
@@ -302,6 +308,64 @@ class LoopManagerTest(unittest.TestCase):
             ).fetchone()["planning_fingerprint"]
             self.assertNotEqual(second, first)
 
+    def test_requirement_archive_move_does_not_run_planner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            state_dir = Path(directory) / "state"
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.run_codex", return_value=(0, "")
+            ) as planner:
+                self.assertEqual(
+                    loop_manager.run_project(
+                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                    ),
+                    0,
+                )
+                completed_fingerprint = connection.execute(
+                    "SELECT planning_fingerprint FROM projects WHERE repo = ?", (str(repo),)
+                ).fetchone()["planning_fingerprint"]
+                planner.reset_mock()
+
+                active = repo / "docs/requirements/Active.md"
+                archived = repo / "docs/requirements/archive/Active.md"
+                active.rename(archived)
+                commit_and_push(repo, "Archive completed requirement")
+
+                self.assertEqual(
+                    loop_manager.run_project(
+                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                    ),
+                    0,
+                )
+                self.assertEqual(
+                    loop_manager.run_project(
+                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                    ),
+                    0,
+                )
+                planner.assert_not_called()
+
+            row = connection.execute(
+                "SELECT processed_sha, planning_fingerprint FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(row["processed_sha"], git_command(repo, "rev-parse", "origin/main"))
+            self.assertEqual(row["planning_fingerprint"], completed_fingerprint)
+            self.assertNotEqual(
+                row["planning_fingerprint"],
+                loop_manager.planning_input_fingerprint(repo, "main"),
+            )
+
     def test_planner_failure_and_invalid_result_do_not_save_fingerprint(self):
         def fail_planner(_worktree, *_args, **_kwargs):
             return 1, "planner failed"
@@ -350,6 +414,63 @@ class LoopManagerTest(unittest.TestCase):
                 self.assertEqual(planner.call_count, 2)
                 self.assertEqual(row["phase"], "PLANNING")
                 self.assertIsNone(row["planning_fingerprint"])
+
+    def test_changed_remote_input_restarts_failed_planning_from_latest_origin(self):
+        seen_source_contents = []
+
+        def fail_planner(worktree, *_args, **_kwargs):
+            seen_source_contents.append(
+                (worktree / "src/app.py").read_text(encoding="utf-8")
+            )
+            return 1, "planner failed"
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            state_dir = Path(directory) / "state"
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.run_codex", side_effect=fail_planner
+            ):
+                self.assertEqual(
+                    loop_manager.run_project(
+                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                    ),
+                    1,
+                )
+                first = connection.execute(
+                    "SELECT active_sha, worktree FROM projects WHERE repo = ?", (str(repo),)
+                ).fetchone()
+
+                (repo / "src/app.py").write_text("VALUE = 2\n", encoding="utf-8")
+                commit_and_push(repo, "Change source while planning is pending")
+
+                self.assertEqual(
+                    loop_manager.run_project(
+                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                    ),
+                    1,
+                )
+
+            second = connection.execute(
+                "SELECT active_sha, worktree, phase, planning_fingerprint FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(seen_source_contents, ["VALUE = 1\n", "VALUE = 2\n"])
+            self.assertNotEqual(second["active_sha"], first["active_sha"])
+            self.assertNotEqual(second["worktree"], first["worktree"])
+            self.assertFalse(Path(first["worktree"]).exists())
+            self.assertEqual(second["active_sha"], git_command(repo, "rev-parse", "origin/main"))
+            self.assertEqual(second["phase"], "PLANNING")
+            self.assertIsNone(second["planning_fingerprint"])
 
     def test_new_execplan_does_not_save_completed_input_fingerprint(self):
         roles = []
