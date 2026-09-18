@@ -1241,17 +1241,37 @@ risk: medium
         config = loop_manager.ROOT / "config/config.ini.example"
         calls = []
 
-        def codex_run(arguments, **kwargs):
-            calls.append(arguments)
-            kwargs["stdout"].write(
-                json.dumps(
-                    {
-                        "type": "thread.started",
-                        "thread_id": "0199a213-81c0-7800-8aa1-bbab2a035a53",
-                    }
-                )
-                + "\n"
+        thread_event = (
+            json.dumps(
+                {
+                    "type": "thread.started",
+                    "thread_id": "0199a213-81c0-7800-8aa1-bbab2a035a53",
+                }
             )
+            + "\n"
+        )
+
+        class StartedOutput:
+            def __iter__(self):
+                return iter((thread_event,))
+
+            def close(self):
+                pass
+
+        class StartedProcess:
+            def __init__(self, arguments, **_kwargs):
+                calls.append(arguments)
+                self.stdin = mock.Mock()
+                self.stdout = StartedOutput()
+
+            def wait(self):
+                return 0
+
+            def kill(self):
+                raise AssertionError("completed Planner process must not be killed")
+
+        def codex_run(arguments, **_kwargs):
+            calls.append(arguments)
             return subprocess.CompletedProcess(arguments, 0)
 
         with tempfile.TemporaryDirectory() as directory:
@@ -1261,6 +1281,8 @@ risk: medium
             with mock.patch(
                 "loop_manager.codex_model_efforts",
                 return_value={"gpt-5.6-sol": frozenset({"xhigh"})},
+            ), mock.patch(
+                "loop_manager.subprocess.Popen", side_effect=StartedProcess
             ), mock.patch("loop_manager.subprocess.run", side_effect=codex_run):
                 started = loop_manager.run_codex(
                     worktree,
@@ -1292,6 +1314,111 @@ risk: medium
         self.assertNotIn("--ephemeral", calls[0])
         self.assertEqual(calls[1][:4], ["codex", "exec", "resume", "--json"])
         self.assertIn(started.session_id, calls[1])
+
+    def test_interrupted_planner_persists_started_session_and_resumes(self):
+        session_id = "0199a213-81c0-7800-8aa1-bbab2a035a53"
+        thread_event = json.dumps(
+            {"type": "thread.started", "thread_id": session_id}
+        ) + "\n"
+
+        class InterruptedOutput:
+            def __iter__(self):
+                yield thread_event
+                raise RuntimeError("Planner process interrupted")
+
+            def close(self):
+                pass
+
+        class InterruptedProcess:
+            def __init__(self):
+                self.stdin = mock.Mock()
+                self.stdout = InterruptedOutput()
+                self.killed = False
+
+            def wait(self):
+                return -9
+
+            def kill(self):
+                self.killed = True
+
+        process = InterruptedProcess()
+        real_popen = subprocess.Popen
+
+        def start_process(arguments, *args, **kwargs):
+            if arguments[0] == "codex":
+                return process
+            return real_popen(arguments, *args, **kwargs)
+
+        resumed_sessions = []
+
+        def stopped_resume(_worktree, _state, _config, role_name, _prompt, **kwargs):
+            self.assertEqual(role_name, "planner")
+            resumed_sessions.append(kwargs["session_id"])
+            return loop_manager.CodexResult(
+                1, "stop after persisted session check", kwargs["session_id"]
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            state_dir = Path(directory) / "state"
+            state_dir.mkdir()
+            config = loop_manager.ROOT / "config/config.ini.example"
+            connection = loop_manager.connect_database(state_dir, create=True)
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.codex_model_efforts",
+                return_value={"gpt-5.6-sol": frozenset({"xhigh"})},
+            ), mock.patch(
+                "loop_manager.subprocess.Popen", side_effect=start_process
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Planner process interrupted"):
+                    loop_manager.run_project(
+                        connection,
+                        state_dir,
+                        str(repo),
+                        config,
+                        "main",
+                        False,
+                    )
+            connection.close()
+
+            with loop_manager.connect_database(state_dir) as connection:
+                interrupted = connection.execute(
+                    "SELECT * FROM projects WHERE repo = ?", (str(repo),)
+                ).fetchone()
+                self.assertEqual(interrupted["phase"], "PLANNING")
+                self.assertEqual(interrupted["planner_session_id"], session_id)
+                self.assertTrue(Path(interrupted["worktree"]).is_dir())
+                self.assertTrue(process.killed)
+
+                with mock.patch(
+                    "loop_manager.validate_repository", return_value=repo
+                ), mock.patch(
+                    "loop_manager.remote_base", return_value="main"
+                ), mock.patch(
+                    "loop_manager.ensure_safe_base_worktree"
+                ), mock.patch(
+                    "loop_manager.run_codex", side_effect=stopped_resume
+                ):
+                    self.assertEqual(
+                        loop_manager.run_project(
+                            connection,
+                            state_dir,
+                            str(repo),
+                            config,
+                            "main",
+                            False,
+                        ),
+                        1,
+                    )
+
+        self.assertEqual(resumed_sessions, [session_id])
 
     def test_unsupported_worker_effort_fails_before_codex_starts(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 import configparser
 import contextlib
 from dataclasses import dataclass
@@ -624,6 +625,7 @@ def run_codex(
     level: int | None = None,
     persist_session: bool = False,
     session_id: str | None = None,
+    on_session_started: Callable[[str], None] | None = None,
 ) -> tuple[int, str] | CodexResult:
     if role_name == "worker":
         if level is None:
@@ -669,40 +671,74 @@ def run_codex(
             str(last_message),
             "-",
         ]
-    with log.open("w", encoding="utf-8") as output:
-        result = subprocess.run(
-            arguments,
-            input=prompt,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=output,
-            stderr=subprocess.STDOUT,
-            env=agent_environment(),
-        )
-    message = last_message.read_text(encoding="utf-8") if last_message.is_file() else ""
-    if result.returncode and not message:
-        message = log.read_text(encoding="utf-8")[-6000:]
     resolved_session_id = session_id
-    if persist_session and not resolved_session_id:
-        for line in log.read_text(encoding="utf-8").splitlines():
+    if persist_session and not session_id:
+        with log.open("w", encoding="utf-8") as output:
+            process = subprocess.Popen(
+                arguments,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=agent_environment(),
+            )
+            assert process.stdin is not None
+            assert process.stdout is not None
             try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if event.get("type") == "thread.started" and isinstance(
-                event.get("thread_id"), str
-            ):
-                resolved_session_id = event["thread_id"]
-                break
-        if result.returncode == 0 and not resolved_session_id:
+                process.stdin.write(prompt)
+                process.stdin.close()
+                for line in process.stdout:
+                    output.write(line)
+                    output.flush()
+                    if resolved_session_id:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if event.get("type") == "thread.started" and isinstance(
+                        event.get("thread_id"), str
+                    ):
+                        resolved_session_id = event["thread_id"]
+                        if on_session_started:
+                            on_session_started(resolved_session_id)
+                returncode = process.wait()
+            except BaseException:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+                process.wait()
+                raise
+            finally:
+                process.stdout.close()
+    else:
+        with log.open("w", encoding="utf-8") as output:
+            result = subprocess.run(
+                arguments,
+                input=prompt,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                env=agent_environment(),
+            )
+        returncode = result.returncode
+    message = last_message.read_text(encoding="utf-8") if last_message.is_file() else ""
+    if returncode and not message:
+        message = log.read_text(encoding="utf-8")[-6000:]
+    if persist_session and not resolved_session_id:
+        if returncode == 0:
             return CodexResult(
                 1,
                 "Planner 실행 결과에서 세션 ID를 확인할 수 없습니다.",
             )
     if persist_session or session_id:
-        return CodexResult(result.returncode, message.strip(), resolved_session_id)
-    return result.returncode, message.strip()
+        return CodexResult(returncode, message.strip(), resolved_session_id)
+    return returncode, message.strip()
 
 
 def verify(worktree: Path) -> tuple[bool, str]:
@@ -1045,6 +1081,11 @@ def run_project(
                     read_only=False,
                     persist_session=True,
                     session_id=row["planner_session_id"],
+                    on_session_started=lambda started_session_id: update_project(
+                        connection,
+                        repo,
+                        planner_session_id=started_session_id,
+                    ),
                 )
             except Exception:
                 if retrying_validation:
