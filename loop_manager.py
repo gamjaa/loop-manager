@@ -281,18 +281,105 @@ def ensure_safe_base_worktree(repo: Path, base: str) -> None:
         raise RuntimeError("기본 worktree가 원격보다 앞서 있거나 diverge되어 작업을 시작하지 않습니다.")
 
 
-def role(config_path: Path, name: str) -> tuple[str, str]:
-    parser = configparser.ConfigParser()
-    if not parser.read(config_path, encoding="utf-8"):
-        raise RuntimeError(f"설정 파일이 없습니다: {config_path}")
+def worker_level(plan: dict[str, object]) -> int:
+    complexity_scores = {"low": 1, "medium": 3, "high": 5}
+    risk_scores = {"low": 0, "medium": 1, "high": 2, "critical": 3}
     try:
-        alias, effort = (part.strip() for part in parser["codex.roles"][name].split(",", 1))
-        model = parser["codex.models"][alias]
-    except (KeyError, ValueError) as error:
-        raise RuntimeError(f"Codex {name} Model/Effort 설정이 올바르지 않습니다.") from error
-    if not model or not effort:
-        raise RuntimeError(f"Codex {name} Model/Effort 설정이 비어 있습니다.")
+        complexity = complexity_scores[plan["complexity"]]
+        risk = risk_scores[plan["risk"]]
+    except (KeyError, TypeError) as error:
+        raise ValueError("검증된 ExecPlan complexity와 risk가 필요합니다.") from error
+    return min(complexity + risk, 7)
+
+
+def codex_model_efforts(worktree: Path | None = None) -> dict[str, frozenset[str]]:
+    try:
+        catalog = json.loads(
+            command(
+                ["codex", "debug", "models"],
+                cwd=worktree,
+                env=agent_environment(),
+            ).stdout
+        )
+        models = catalog["models"]
+        return {
+            model["slug"]: frozenset(level["effort"] for level in model["supported_reasoning_levels"])
+            for model in models
+        }
+    except (KeyError, TypeError, json.JSONDecodeError) as error:
+        raise RuntimeError("Codex CLI model catalog 형식이 올바르지 않습니다.") from error
+
+
+def codex_profile(
+    config_path: Path,
+    section: str,
+    name: str,
+    label: str,
+    worktree: Path | None = None,
+) -> tuple[str, str]:
+    parser = configparser.ConfigParser()
+    try:
+        loaded = parser.read(config_path, encoding="utf-8")
+    except configparser.Error as error:
+        raise RuntimeError(f"Codex 설정 파일 형식이 올바르지 않습니다: {config_path}") from error
+    if not loaded:
+        raise RuntimeError(f"설정 파일이 없습니다: {config_path}")
+    if section not in parser:
+        raise RuntimeError(f"{label} 설정 section [{section}]이 없습니다.")
+    if name not in parser[section]:
+        raise RuntimeError(f"{label} 설정이 없습니다: [{section}] {name}")
+
+    try:
+        value = parser[section][name]
+    except configparser.InterpolationError as error:
+        raise RuntimeError(
+            f"{label} 설정 값 형식이 올바르지 않습니다: [{section}] {name}"
+        ) from error
+    if not value.strip():
+        raise RuntimeError(f"{label} Model alias/Effort 설정이 비어 있습니다.")
+    parts = [part.strip() for part in value.split(",")]
+    if len(parts) != 2:
+        raise RuntimeError(f"{label} 설정은 `Model alias,Effort` 형식이어야 합니다.")
+    alias, effort = parts
+    if not alias:
+        raise RuntimeError(f"{label} Model alias 설정이 비어 있습니다.")
+    if not effort:
+        raise RuntimeError(f"{label} Effort 설정이 비어 있습니다.")
+    if "codex.models" not in parser:
+        raise RuntimeError(f"{label} Model alias section [codex.models]가 없습니다.")
+    if alias not in parser["codex.models"]:
+        raise RuntimeError(f"{label} Model alias가 [codex.models]에 없습니다: {alias}")
+    try:
+        model = parser["codex.models"][alias].strip()
+    except configparser.InterpolationError as error:
+        raise RuntimeError(
+            f"{label} 설정 값 형식이 올바르지 않습니다: [codex.models] {alias}"
+        ) from error
+    if not model:
+        raise RuntimeError(f"{label} Model 설정이 비어 있습니다: [codex.models] {alias}")
+    supported = codex_model_efforts(worktree).get(model)
+    if supported is None:
+        raise RuntimeError(f"{label} Model을 Codex CLI가 지원하지 않습니다: {model}")
+    if effort not in supported:
+        raise RuntimeError(
+            f"{label} Model/Effort 조합을 Codex CLI가 지원하지 않습니다: {model},{effort}"
+        )
     return model, effort
+
+
+def role(config_path: Path, name: str, worktree: Path | None = None) -> tuple[str, str]:
+    return codex_profile(config_path, "codex.roles", name, f"Codex {name}", worktree)
+
+
+def worker_profile(
+    config_path: Path,
+    level: int,
+    worktree: Path | None = None,
+) -> tuple[str, str]:
+    if type(level) is not int or not 1 <= level <= 7:
+        raise RuntimeError(f"Codex Worker level이 유효하지 않습니다: {level}")
+    name = f"level{level}"
+    return codex_profile(config_path, "codex.worker", name, f"Codex Worker {name}", worktree)
 
 
 def agent_environment() -> dict[str, str]:
@@ -328,8 +415,16 @@ def run_codex(
     prompt: str,
     *,
     read_only: bool,
+    level: int | None = None,
 ) -> tuple[int, str]:
-    model, effort = role(config_path, role_name)
+    if role_name == "worker":
+        if level is None:
+            raise RuntimeError("Codex Worker level이 없습니다.")
+        model, effort = worker_profile(config_path, level, worktree)
+    else:
+        if level is not None:
+            raise RuntimeError(f"Codex {role_name}에 Worker level을 지정할 수 없습니다.")
+        model, effort = role(config_path, role_name, worktree)
     project_dir = state_dir / "logs" / hashlib.sha256(str(worktree).encode()).hexdigest()[:16]
     project_dir.mkdir(parents=True, exist_ok=True)
     last_message = project_dir / f"{role_name}-last.txt"
@@ -650,13 +745,16 @@ def run_project(
     make_worktree(repo_path, worktree, branch, base)
 
     if row["phase"] in {"WORKING", "BLOCKED"}:
+        plan = validate_execplan(worktree, row["plan_path"])
+        level = worker_level(plan)
         code, message = run_codex(
             worktree,
             state_dir,
             config_path,
-            "planner",
+            "worker",
             worker_prompt(row["plan_path"], row["last_error"]),
             read_only=False,
+            level=level,
         )
         if code:
             update_project(connection, repo, phase="WORKING", last_error=message or f"Codex 종료 코드 {code}")
