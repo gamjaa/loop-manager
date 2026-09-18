@@ -9,6 +9,49 @@ from unittest import mock
 import loop_manager
 
 
+def make_catalog_root(directory: str) -> Path:
+    root = Path(directory)
+    (root / "docs/plans").mkdir(parents=True)
+    (root / "docs/PRODUCT.md").write_text("# Product\n", encoding="utf-8")
+    return root
+
+
+def write_execplan(
+    root: Path,
+    plan_id: str,
+    title: str,
+    *,
+    sources: tuple[str, ...] = ("docs/PRODUCT.md",),
+    depends_on: tuple[str, ...] = (),
+    complexity: str = "low",
+    risk: str = "low",
+) -> Path:
+    source_lines = "sources: []" if not sources else "sources:\n" + "".join(
+        f"  - {source}\n" for source in sources
+    ).rstrip("\n")
+    dependency_lines = "depends_on: []" if not depends_on else "depends_on:\n" + "".join(
+        f"  - {dependency}\n" for dependency in depends_on
+    ).rstrip("\n")
+    plan = root / "docs/plans" / f"[{plan_id}] {title}.md"
+    plan.write_text(
+        f"""---
+id: {plan_id}
+title: {title}
+{source_lines}
+{dependency_lines}
+complexity: {complexity}
+risk: {risk}
+---
+
+## Purpose
+
+Test plan.
+""",
+        encoding="utf-8",
+    )
+    return plan
+
+
 class LoopManagerTest(unittest.TestCase):
     def test_codex_uses_mutually_exclusive_sandbox_options(self):
         self.assertEqual(loop_manager.codex_sandbox_arguments(False), ["--approve-for-me"])
@@ -51,6 +94,129 @@ risk: medium
         )
 
         self.assertEqual(values["id"], "G-001")
+
+    def test_execplan_catalog_is_deterministic_and_indexed_by_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_catalog_root(directory)
+            requirement = root / "docs/requirements/[R-001] Active.md"
+            requirement.parent.mkdir()
+            requirement.write_text("# Requirement\n", encoding="utf-8")
+            write_execplan(root, "G-003", "Third", depends_on=("G-002",))
+            write_execplan(root, "G-001", "First")
+            write_execplan(
+                root,
+                "G-002",
+                "Second",
+                sources=("docs/requirements/[R-001] Active.md",),
+                depends_on=("G-001",),
+            )
+            nested = root / "docs/plans/archive/[G-999] Ignored.md"
+            nested.parent.mkdir()
+            nested.write_text("not an active plan", encoding="utf-8")
+
+            catalog = loop_manager.load_execplan_catalog(root)
+
+        self.assertEqual(list(catalog), ["G-001", "G-002", "G-003"])
+        self.assertEqual(catalog["G-002"]["title"], "Second")
+
+    def test_execplan_catalog_rejects_duplicate_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_catalog_root(directory)
+            write_execplan(root, "G-001", "First")
+            write_execplan(root, "G-001", "Duplicate")
+
+            with self.assertRaisesRegex(RuntimeError, "중복 ExecPlan id.*G-001"):
+                loop_manager.load_execplan_catalog(root)
+
+    def test_execplan_catalog_restricts_sources_to_active_product_inputs(self):
+        invalid_sources = (
+            (),
+            ("/docs/PRODUCT.md",),
+            ("../PRODUCT.md",),
+            ("docs/requirements/archive/Old.md",),
+            ("README.md",),
+            ("docs/requirements/Missing.md",),
+        )
+        for sources in invalid_sources:
+            with self.subTest(sources=sources), tempfile.TemporaryDirectory() as directory:
+                root = make_catalog_root(directory)
+                (root / "README.md").write_text("# Readme\n", encoding="utf-8")
+                archived = root / "docs/requirements/archive/Old.md"
+                archived.parent.mkdir(parents=True)
+                archived.write_text("# Old\n", encoding="utf-8")
+                write_execplan(root, "G-001", "Invalid Source", sources=sources)
+
+                with self.assertRaisesRegex(RuntimeError, "ExecPlan source"):
+                    loop_manager.load_execplan_catalog(root)
+
+    def test_execplan_catalog_validates_fixed_metadata(self):
+        cases = (
+            ("id", "BAD", "Plan", "low", "low", "id는 G-000"),
+            ("filename", "G-001", "Plan", "low", "low", "파일명"),
+            ("complexity", "G-001", "Plan", "tiny", "low", "complexity"),
+            ("risk", "G-001", "Plan", "low", "extreme", "risk"),
+            ("keys", "G-001", "Plan", "low", "low", "frontmatter key"),
+        )
+        for name, plan_id, title, complexity, risk, message in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = make_catalog_root(directory)
+                plan = write_execplan(
+                    root, plan_id, title, complexity=complexity, risk=risk
+                )
+                if name == "filename":
+                    plan.rename(plan.with_name("[G-001] Wrong.md"))
+                elif name == "keys":
+                    contents = plan.read_text(encoding="utf-8")
+                    plan.write_text(
+                        contents.replace("risk: low\n", "risk: low\nstatus: READY\n"),
+                        encoding="utf-8",
+                    )
+
+                with self.assertRaisesRegex(RuntimeError, message):
+                    loop_manager.load_execplan_catalog(root)
+
+    def test_execplan_catalog_rejects_invalid_and_missing_dependencies(self):
+        cases = (("G-1", "depends_on ID 형식"), ("G-999", "존재하지 않는 depends_on"))
+        for dependency, message in cases:
+            with self.subTest(dependency=dependency), tempfile.TemporaryDirectory() as directory:
+                root = make_catalog_root(directory)
+                write_execplan(root, "G-001", "Plan", depends_on=(dependency,))
+
+                with self.assertRaisesRegex(RuntimeError, message):
+                    loop_manager.load_execplan_catalog(root)
+
+    def test_execplan_catalog_rejects_self_dependency(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_catalog_root(directory)
+            write_execplan(root, "G-001", "Plan", depends_on=("G-001",))
+
+            with self.assertRaisesRegex(RuntimeError, r"G-001 -> G-001"):
+                loop_manager.load_execplan_catalog(root)
+
+    def test_execplan_catalog_rejects_multistep_cycle_with_all_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_catalog_root(directory)
+            write_execplan(root, "G-001", "First", depends_on=("G-003",))
+            write_execplan(root, "G-002", "Second", depends_on=("G-001",))
+            write_execplan(root, "G-003", "Third", depends_on=("G-002",))
+
+            with self.assertRaises(RuntimeError) as raised:
+                loop_manager.load_execplan_catalog(root)
+
+        message = str(raised.exception)
+        self.assertIn("순환 ExecPlan 의존성", message)
+        for plan_id in ("G-001", "G-002", "G-003"):
+            self.assertIn(plan_id, message)
+
+    def test_selected_execplan_requires_valid_whole_catalog(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_catalog_root(directory)
+            selected = write_execplan(root, "G-001", "Selected")
+            write_execplan(root, "G-002", "Broken", depends_on=("G-999",))
+            relative_path = selected.relative_to(root).as_posix()
+
+            with self.assertRaisesRegex(RuntimeError, "G-002.*G-999"):
+                loop_manager.validate_execplan(root, relative_path)
 
     def test_role_resolves_model_alias(self):
         config = loop_manager.ROOT / "config/config.ini.example"

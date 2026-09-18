@@ -193,12 +193,10 @@ def parse_frontmatter(text: str) -> dict[str, object]:
     return values
 
 
-def validate_execplan(worktree: Path, relative_path: str) -> dict[str, object]:
+def _parse_execplan(worktree: Path, path: Path) -> dict[str, object]:
     allowed = {"id", "title", "sources", "depends_on", "complexity", "risk"}
-    required = allowed
-    path = worktree / relative_path
     values = parse_frontmatter(path.read_text(encoding="utf-8"))
-    if set(values) != required:
+    if set(values) != allowed:
         raise RuntimeError("ExecPlan frontmatter key가 docs/PLANS.md 형식과 다릅니다.")
     plan_id = values["id"]
     title = values["title"]
@@ -210,28 +208,93 @@ def validate_execplan(worktree: Path, relative_path: str) -> dict[str, object]:
     dependencies = values["depends_on"]
     if not isinstance(sources, list) or not sources:
         raise RuntimeError("ExecPlan sources가 하나 이상 필요합니다.")
-    if not isinstance(dependencies, list) or plan_id in dependencies:
+    if not isinstance(dependencies, list):
         raise RuntimeError("ExecPlan depends_on이 유효하지 않습니다.")
     for source in sources:
-        source_path = Path(str(source))
-        if source_path.is_absolute() or ".." in source_path.parts or not (worktree / source_path).is_file():
+        if not isinstance(source, str) or not (
+            source == "docs/PRODUCT.md"
+            or re.fullmatch(r"docs/requirements/[^/\\]+\.md", source)
+        ):
+            raise RuntimeError(f"허용되지 않는 ExecPlan source입니다: {source}")
+        if not (worktree / source).is_file():
             raise RuntimeError(f"존재하지 않는 ExecPlan source입니다: {source}")
+    for dependency in dependencies:
+        if not isinstance(dependency, str) or not re.fullmatch(r"G-\d{3,}", dependency):
+            raise RuntimeError(f"ExecPlan depends_on ID 형식이 유효하지 않습니다: {dependency}")
     if values["complexity"] not in {"low", "medium", "high"}:
         raise RuntimeError("ExecPlan complexity가 유효하지 않습니다.")
     if values["risk"] not in {"low", "medium", "high", "critical"}:
         raise RuntimeError("ExecPlan risk가 유효하지 않습니다.")
-    other_ids: set[str] = set()
-    for other in (worktree / "docs/plans").glob("*.md"):
-        if other != path:
-            other_id = parse_frontmatter(other.read_text(encoding="utf-8")).get("id")
-            if isinstance(other_id, str):
-                other_ids.add(other_id)
-    missing = set(str(item) for item in dependencies) - other_ids
-    if missing:
-        raise RuntimeError("존재하지 않는 depends_on ID입니다: " + ", ".join(sorted(missing)))
-    if plan_id in other_ids:
-        raise RuntimeError(f"중복 ExecPlan id입니다: {plan_id}")
     return values
+
+
+def _validate_dependency_graph(catalog: dict[str, dict[str, object]]) -> None:
+    for plan_id, plan in catalog.items():
+        dependencies = plan["depends_on"]
+        assert isinstance(dependencies, list)
+        missing = sorted(dependency for dependency in dependencies if dependency not in catalog)
+        if missing:
+            raise RuntimeError(
+                f"ExecPlan {plan_id}의 존재하지 않는 depends_on ID입니다: "
+                + ", ".join(missing)
+            )
+
+    states: dict[str, str] = {}
+    stack: list[str] = []
+
+    def visit(plan_id: str) -> None:
+        states[plan_id] = "visiting"
+        stack.append(plan_id)
+        dependencies = catalog[plan_id]["depends_on"]
+        assert isinstance(dependencies, list)
+        for dependency in sorted(dependencies):
+            if states.get(dependency) == "visiting":
+                cycle_start = stack.index(dependency)
+                cycle = [*stack[cycle_start:], dependency]
+                raise RuntimeError("순환 ExecPlan 의존성입니다: " + " -> ".join(cycle))
+            if states.get(dependency) is None:
+                visit(dependency)
+        stack.pop()
+        states[plan_id] = "visited"
+
+    for plan_id in catalog:
+        if states.get(plan_id) is None:
+            visit(plan_id)
+
+
+def load_execplan_catalog(worktree: Path) -> dict[str, dict[str, object]]:
+    entries: list[tuple[str, dict[str, object]]] = []
+    plans_directory = worktree / "docs/plans"
+    plan_paths = sorted(
+        (path for path in plans_directory.glob("*.md") if path.is_file()),
+        key=lambda path: path.name,
+    )
+    for path in plan_paths:
+        plan = _parse_execplan(worktree, path)
+        plan_id = plan["id"]
+        assert isinstance(plan_id, str)
+        entries.append((plan_id, plan))
+
+    catalog: dict[str, dict[str, object]] = {}
+    for plan_id, plan in sorted(entries, key=lambda entry: entry[0]):
+        if plan_id in catalog:
+            raise RuntimeError(f"중복 ExecPlan id입니다: {plan_id}")
+        catalog[plan_id] = plan
+
+    _validate_dependency_graph(catalog)
+    return catalog
+
+
+def validate_execplan(worktree: Path, relative_path: str) -> dict[str, object]:
+    catalog = load_execplan_catalog(worktree)
+    match = re.fullmatch(r"docs/plans/\[(G-\d{3,})\] [^/]+\.md", relative_path)
+    if match:
+        plan = catalog.get(match.group(1))
+        if plan is not None:
+            expected_path = f"docs/plans/[{plan['id']}] {plan['title']}.md"
+            if relative_path == expected_path:
+                return plan
+    raise RuntimeError(f"검증된 ExecPlan 카탈로그에 계획이 없습니다: {relative_path}")
 
 
 def validate_repository(path: Path, *, allow_agents_mismatch: bool) -> Path:
