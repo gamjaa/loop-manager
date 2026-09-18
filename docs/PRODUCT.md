@@ -46,6 +46,8 @@
 - ExecPlan 실행 상태의 유일한 원본은 Loop Manager의 SQLite다
 - ExecPlan 생성 전 Planner 실패는 프로젝트의 `planning_error`로 SQLite에 저장하며 ExecPlan BLOCKED 상태를 만들지 않는다
 - 미충족 PRODUCT 또는 Requirement에 근거해서만 ExecPlan을 작성한다
+- Planner는 최신 `origin/<base-branch>` 기준의 detached planning worktree에서 ExecPlan만 작성한다
+- 검증된 ExecPlan은 구현을 시작하기 전에 commit하고 `origin/<base-branch>`에 fast-forward push한다
 - 같은 프로젝트에는 여러 READY ExecPlan을 등록할 수 있지만 동시에 하나의 ExecPlan만 실행한다
 - ExecPlan은 모든 `depends_on`의 PR이 실제로 Merge된 뒤에만 시작한다
 - 각 ExecPlan은 하나의 결정적 branch, 별도 worktree와 하나의 PR을 사용한다
@@ -125,17 +127,20 @@
 9. 프로그램이 Planner의 변경 범위, ExecPlan 메타데이터와 `depends_on`을 코드로 검증한다
 10. 검증 실패 내용을 같은 Planner 세션에 전달하고 최대 3회까지 수정을 요청한다
 11. 3회 후에도 유효하지 않으면 프로젝트의 `planning_error`에 원인과 계획 입력 지문을 저장하고 처리를 중단한다
-12. 유효한 각 ExecPlan을 SQLite에 READY 상태로 등록하고 기존 `planning_error`를 지운다
-13. 모든 `depends_on`이 MERGED인 READY ExecPlan 하나를 선택한다
-14. 프로그램이 해당 ExecPlan 전용 branch와 worktree를 생성하거나 기존 작업 공간을 복구한다
-15. 프로그램이 complexity와 risk를 Worker level로 환산해 Model과 Effort를 결정한다
-16. Worker가 구현, 관련 테스트와 전체 검증 스크립트를 작성하거나 갱신한다
-17. Requirement 구현으로 장기 제품 규칙이 바뀌면 Worker가 같은 PR의 `PRODUCT.md`를 갱신한다
-18. 프로그램이 최신 원격 기준 branch를 rebase로 반영한다
-19. 프로그램이 전체 검증 스크립트를 실행하고, 실패한 경우에만 출력 내용을 같은 Worker 세션에 전달한다
-20. 검증이 성공하면 읽기 전용 Reviewer를 실행한다
-21. 프로그램이 같은 branch의 기존 PR을 확인하고, 없을 때만 새 PR을 생성한 뒤 SQLite 상태를 PR_OPEN으로 변경한다
-22. 해당 프로젝트는 PR이 Merge되거나 BLOCKED가 해제될 때까지 다른 ExecPlan을 시작하지 않는다
+12. 유효한 ExecPlan을 planning worktree에서 commit한다
+13. 계획 commit이 아직 원격에 없는데 `origin/<base-branch>`가 계획 기준 이후 바뀌었으면 planning worktree를 정리하고 최신 기준으로 다시 계획한다
+14. 기준이 그대로면 계획 commit을 `origin/<base-branch>`에 fast-forward push한다
+15. push된 commit을 확인한 뒤에만 각 ExecPlan을 SQLite에 READY 상태로 등록하고 planning worktree와 기존 `planning_error`를 정리한다
+16. 모든 `depends_on`이 MERGED인 READY ExecPlan 하나를 선택한다
+17. 갱신된 `origin/<base-branch>`에서 해당 ExecPlan 전용 branch와 worktree를 생성하거나 기존 작업 공간을 복구한다
+18. 프로그램이 complexity와 risk를 Worker level로 환산해 Model과 Effort를 결정한다
+19. Worker가 구현, 관련 테스트와 전체 검증 스크립트를 작성하거나 갱신한다
+20. Requirement 구현으로 장기 제품 규칙이 바뀌면 Worker가 같은 PR의 `PRODUCT.md`를 갱신한다
+21. 프로그램이 최신 원격 기준 branch를 rebase로 반영한다
+22. 프로그램이 전체 검증 스크립트를 실행하고, 실패한 경우에만 출력 내용을 같은 Worker 세션에 전달한다
+23. 검증이 성공하면 읽기 전용 Reviewer를 실행한다
+24. 프로그램이 같은 branch의 기존 PR을 확인하고, 없을 때만 새 PR을 생성한 뒤 SQLite 상태를 PR_OPEN으로 변경한다
+25. 해당 프로젝트는 PR이 Merge되거나 BLOCKED가 해제될 때까지 다른 ExecPlan을 시작하지 않는다
 
 ### 실패와 재시도
 
@@ -145,6 +150,11 @@ Planner 결과 검증 실패:
 3. 계속 실패하면 계획 입력 지문과 원인을 `planning_error`에 저장하고 planning worktree를 보존한다
 4. 같은 계획 입력 지문에서는 Planner를 다시 실행하지 않는다
 5. 계획 입력 지문이 바뀌면 이전 planning worktree의 검증 기록을 보존하고 해당 worktree를 정리한 뒤 `planning_error`를 지우고 새로운 planning worktree에서 다시 시작한다
+
+ExecPlan 게시 실패:
+1. 계획 commit을 push하기 전에 `origin/<base-branch>`가 바뀌면 기존 계획 commit을 rebase하지 않고 폐기한 뒤 최신 기준으로 다시 계획한다
+2. fast-forward push가 거부되면 계획 commit과 오류를 보존하고 다음 실행에서 다시 시도한다
+3. push 성공을 원격에서 확인하기 전에는 ExecPlan을 READY로 등록하거나 Worker를 시작하지 않는다
 
 전체 검증 또는 Review 실패:
 1. 프로그램이 전체 검증 실패 내용 또는 Reviewer의 blocking issue를 같은 Worker 세션에 전달한다

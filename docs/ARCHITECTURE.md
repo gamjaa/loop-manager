@@ -128,20 +128,24 @@ ExecPlan 하나의 실행 흐름은 다음과 같다.
 5. 계속 실패하면 원인과 계획 입력 지문을 프로젝트의 `planning_error`에 저장하고 planning worktree와 세션을 보존한 뒤 처리를 중단한다
 6. 같은 지문에서는 Planner를 다시 실행하지 않는다. 계획 입력 지문이 바뀌면 검증 오류와 diff를 로그에 보존하고, Planner만 수정할 수 있었던 이전 planning worktree를 제거한 뒤 `planning_error`를 지우고 새 지문의 planning worktree에서 다시 시작한다
 7. 추가 계획이 없으면 `planning_error`를 지우고 입력 지문을 저장한 뒤 planning worktree를 제거한다
-8. 유효한 ExecPlan이 생성되면 각각 SQLite에 READY 상태로 등록하고 `planning_error`를 지운다
-9. 모든 `depends_on`이 MERGED인 READY ExecPlan 하나를 선택한다
-10. 새로 계획한 작업이면 planning worktree에서 `loop-manager/<execplan-id>` branch를 만들고, 기존 READY 작업이면 최신 `origin/<base-branch>`에서 같은 이름의 branch와 `<state-dir>/worktrees/<project-id>/<execplan-id>/` worktree를 만든다
-11. branch나 worktree가 이미 있으면 새로 만들지 않고 SQLite 및 Git 상태와 대조해 복구한다
-12. Worker가 해당 worktree에서 구현, 관련 테스트와 verify 스크립트를 작성하고 필요한 PRODUCT, 선택된 ExecPlan 기록과 FUTURE_IDEAS를 갱신한다
-13. 프로그램이 변경을 commit한 뒤 `git fetch`로 원격 기준 branch를 다시 갱신한다
-14. branch가 최신 원격 기준 branch보다 뒤처졌으면 프로그램이 관리 worktree에서 `git rebase origin/<base-branch>`를 실행한다
-15. rebase 충돌이 발생하면 충돌 내용을 같은 Worker 세션에 전달한다. Worker가 관리 worktree 안에서 충돌을 해결하면 프로그램이 변경 범위를 검증하고 stage한 뒤 rebase를 계속하며, 해결할 수 없으면 BLOCKED로 전이한다
-16. rebase가 끝난 commit을 기준으로 프로그램이 전체 검증을 실행하고 읽기 전용 Reviewer를 호출한다
-17. PR 생성 직전에 원격 기준 branch가 다시 변경됐으면 13~16단계를 반복한다
-18. 프로그램이 같은 head branch의 GitHub PR을 조회해 기존 PR을 복구하고, 없을 때만 branch를 push한 뒤 PR을 생성한다
-19. GitHub Merge를 확인한 뒤에만 SQLite 상태를 MERGED로 바꾸고, 다음 실행 가능한 READY ExecPlan은 갱신된 원격 기준 branch에서 새로운 전용 branch와 worktree를 만든다
+8. 유효한 ExecPlan을 planning worktree에서 하나의 계획 commit으로 만든다
+9. `git fetch` 후 `origin/<base-branch>`가 planning worktree의 시작 commit과 다르면 계획 commit을 rebase하지 않고 planning worktree를 정리한 뒤 최신 기준으로 다시 계획한다
+10. 기준이 그대로면 계획 commit을 `origin/<base-branch>`에 fast-forward push한다. force push는 사용하지 않는다
+11. push된 commit을 원격에서 확인한 뒤에만 각 ExecPlan을 SQLite에 READY 상태로 등록하고 `planning_error`를 지운다. push 후 SQLite 기록 전에 중단된 경우 원격의 ExecPlan을 다시 파싱해 복구한다
+12. planning worktree를 제거한다
+13. 모든 `depends_on`이 MERGED인 READY ExecPlan 하나를 선택한다
+14. 갱신된 `origin/<base-branch>`에서 `loop-manager/<execplan-id>` branch와 `<state-dir>/worktrees/<project-id>/<execplan-id>/` worktree를 만든다
+15. branch나 worktree가 이미 있으면 새로 만들지 않고 SQLite 및 Git 상태와 대조해 복구한다
+16. Worker가 해당 worktree에서 구현, 관련 테스트와 verify 스크립트를 작성하고 필요한 PRODUCT, 선택된 ExecPlan 기록과 FUTURE_IDEAS를 갱신한다
+17. 프로그램이 변경을 commit한 뒤 `git fetch`로 원격 기준 branch를 다시 갱신한다
+18. branch가 최신 원격 기준 branch보다 뒤처졌으면 프로그램이 관리 worktree에서 `git rebase origin/<base-branch>`를 실행한다
+19. rebase 충돌이 발생하면 충돌 내용을 같은 Worker 세션에 전달한다. Worker가 관리 worktree 안에서 충돌을 해결하면 프로그램이 변경 범위를 검증하고 stage한 뒤 rebase를 계속하며, 해결할 수 없으면 BLOCKED로 전이한다
+20. rebase가 끝난 commit을 기준으로 프로그램이 전체 검증을 실행하고 읽기 전용 Reviewer를 호출한다
+21. PR 생성 직전에 원격 기준 branch가 다시 변경됐으면 17~20단계를 반복한다
+22. 프로그램이 같은 head branch의 GitHub PR을 조회해 기존 PR을 복구하고, 없을 때만 branch를 push한 뒤 PR을 생성한다
+23. GitHub Merge를 확인한 뒤에만 SQLite 상태를 MERGED로 바꾸고, 다음 실행 가능한 READY ExecPlan은 갱신된 원격 기준 branch에서 새로운 전용 branch와 worktree를 만든다
 
-첫 PR에는 아직 구현하지 않은 후속 ExecPlan 파일이 함께 포함될 수 있다. 후속 계획은 SQLite에서 READY로 대기하며, 같은 프로젝트의 직렬 실행 규칙과 `depends_on`을 모두 만족한 뒤에만 Worker가 시작된다.
+ExecPlan 파일은 구현 PR에 처음 포함하지 않는다. Planner 단계에서 먼저 base branch에 게시되며, 각 구현 branch는 해당 ExecPlan이 포함된 원격 기준에서 시작한다.
 
 사용자가 BLOCKED의 근거 PRODUCT/Requirement를 기본 branch에서 수정한 경우 변경을 commit하고 push해야 한다. Loop Manager는 변경된 `origin/<base-branch>`를 관리 branch에 rebase한 뒤 재개한다. 이 과정에서도 기본 worktree의 파일, index와 HEAD는 바꾸지 않는다. 사용자는 안내된 관리 worktree의 ExecPlan을 직접 수정할 수도 있다.
 
@@ -234,6 +238,7 @@ BLOCKED → PR_OPEN
 ## GitHub와 PR
 
 - branch, commit, push와 PR 생성은 프로그램 코드가 수행한다
+- Planner의 검증된 계획 commit은 `origin/<base-branch>`에 fast-forward push하며 별도 PR을 만들지 않는다
 - 하나의 ExecPlan에는 하나의 결정적 branch와 하나의 PR만 연결한다
 - PR 생성 전 같은 head branch의 Open, Closed 또는 Merged PR을 조회하고 기존 PR이 있으면 SQLite에 연결한다
 - PR 생성 직후 SQLite 기록 전에 중단돼도 다음 실행에서 기존 PR을 찾아 복구하며 중복 PR을 만들지 않는다
@@ -261,6 +266,7 @@ Telegram token과 chat ID가 모두 설정된 경우에만 알림 이벤트와 �
 
 - 등록 프로젝트의 기본 worktree가 dirty하거나 원격보다 앞서 있거나 diverge됐으면 자동 변경을 시작하지 않는다. 원격보다 뒤처진 상태는 허용한다
 - 사용자 파일 삭제, reset, 일반적인 강제 push와 자동 Merge를 수행하지 않는다
+- 계획 commit의 base branch 직접 push는 fast-forward만 허용한다. branch protection 등으로 거부되면 우회하지 않고 계획 오류로 보존한다
 - 기본 worktree에서는 파일 쓰기, checkout, pull, reset, stash, clean과 commit을 수행하지 않는다
 - 관리 worktree, SQLite, 임시 파일, 로그와 lock은 source checkout 밖의 `<state-dir>`에만 만든다
 - 모든 계획과 구현 변경은 Loop Manager가 만든 관리 worktree 안에서만 수행한다

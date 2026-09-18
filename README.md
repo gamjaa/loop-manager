@@ -4,8 +4,6 @@ Loop Manager는 외부 스케줄러가 반복 실행하며 여러 로컬 GitHub 
 
 프로젝트 문서에서 작업을 찾고 Planner, Worker, Reviewer를 순서대로 실행한다. 작업 상태와 AI Agent 세션은 재실행 후에도 이어지며 서로 다른 프로젝트를 병렬로 처리할 수 있다. 같은 프로젝트에서는 한 번에 하나의 작업만 실행하고, 의존 작업은 선행 PR이 Merge될 때까지 기다린다. PR 생성, 작업 차단과 프로젝트 완료는 Telegram으로 알린다.
 
-현재 저장소는 제품 명세와 공통 템플릿을 작성하는 단계다. 실행 CLI가 구현되면 실제 설치 및 실행 명령을 이 문서에 추가한다.
-
 ## 주요 동작
 
 - 여러 로컬 Git 프로젝트 등록 및 상태 관리
@@ -56,7 +54,19 @@ Specification Skill을 사용하면 템플릿을 바탕으로 초안을 작성�
 
 문서 작성이 끝나면 변경사항을 commit하고 push한다. Loop Manager는 최신 원격 branch를 자동 작업의 기준으로 사용하며 기본 worktree의 파일, index와 HEAD를 수정하지 않는다. 기본 worktree가 원격보다 뒤처진 상태는 허용하지만 dirty하거나 원격보다 앞선 변경은 자동 작업에 포함되지 않으므로 해당 프로젝트를 건너뛴다.
 
-### 3. Loop Manager 설정
+### 3. 실행 환경과 Loop Manager 설정
+
+저장소를 받은 뒤 한 번만 환경 준비 스크립트를 실행한다. 기존 `.venv`가 있으면 재사용하고 `requirements.txt`의 패키지만 설치한다.
+
+```powershell
+pwsh -NoProfile -File scripts/setup.ps1
+```
+
+```sh
+bash scripts/setup.sh
+```
+
+현재 최소 실행기는 외부 Python 패키지를 사용하지 않으므로 `requirements.txt`에는 의존성이 없다. 이후 패키지가 추가돼도 같은 스크립트를 다시 실행하면 된다.
 
 `config/config.ini.example`을 `config/config.ini`로 복사한 뒤 사용할 AI Agent 모델, Telegram 설정과 동시 실행 수를 입력한다. `max_workers` 기본값은 3이다.
 
@@ -68,36 +78,55 @@ Copy-Item -LiteralPath config/config.ini.example -Destination config/config.ini
 cp config/config.ini.example config/config.ini
 ```
 
-실제 `config.ini`는 Telegram token을 포함할 수 있으므로 Git에 커밋하지 않는다. token과 chat ID를 모두 비워두면 Telegram 알림을 사용하지 않는다. 등록 프로젝트, 작업 상태, 세션과 PR 정보는 source checkout 밖의 운영체제 사용자 상태 디렉터리에 있는 SQLite에 저장한다.
+실제 `config.ini`는 향후 Telegram token을 포함할 수 있으므로 Git에 커밋하지 않는다. 작업 상태와 PR 정보는 source checkout 밖의 운영체제 사용자 상태 디렉터리에 있는 SQLite에 저장한다.
 
-일반 실행 중 SQLite가 없거나 손상되면 자동으로 새 상태를 만들지 않고 중단한다. 상태 디렉터리를 백업해두고, 필요할 때 백업을 복원하거나 설정 모드에서 명시적으로 재설정한다.
+일반 실행 중 SQLite가 없거나 손상되면 자동으로 새 상태를 만들지 않고 중단한다. 상태 디렉터리를 백업해두고, 필요할 때 백업을 복원하거나 손상된 DB를 별도로 보관한 뒤 `init`으로 다시 만든다.
 
-### 4. 프로젝트 등록 및 반복 실행 설정
+### 4. 초기화 및 반복 실행 설정
 
-1. Loop Manager 설정 모드에서 프로젝트 경로와 Codex 또는 Claude를 선택한다.
-2. `AGENTS.md` 경고가 발생하면 공통 규칙을 병합하거나 현재 파일로 강제 등록할지 결정한다.
-3. Loop Manager를 한 번 실행해 프로젝트 설정이 유효한지 확인한다.
-4. cron 또는 Windows 작업 스케줄러로 같은 실행 명령을 반복하도록 설정한다.
+최소 실행기는 별도 프로젝트 등록 명령 없이 `run`에 전달된 저장소 하나를 처리한다. 공통 `AGENTS.md`가 포함되지 않은 저장소는 거부하며, 내용을 확인한 경우에만 `--allow-agents-mismatch`로 실행할 수 있다.
 
-진행 중이거나 대기 중인 ExecPlan 또는 해결되지 않은 계획 단계 오류가 있는 프로젝트는 등록 해제할 수 없다. `AGENTS.md`와 `docs/PLANS.md` 검사는 최초 등록 시에만 수행한다.
+Planner가 만든 ExecPlan은 검증 후 대상 저장소의 base branch에 fast-forward push된다. 따라서 해당 branch는 Loop Manager 계정의 직접 push를 허용해야 한다. 이후 구현은 `loop-manager/<execplan-id>` branch에서 진행되고 PR로 제출된다.
 
-실제 설치, 설정 모드와 실행 명령은 CLI 구현 후 이 문서에 추가한다.
+상태 DB를 한 번 초기화한다.
+
+```powershell
+& .\.venv\Scripts\python.exe loop_manager.py init
+```
+
+```sh
+.venv/bin/python loop_manager.py init
+```
+
+그다음 cron에서 대상 저장소를 지정해 반복 실행한다.
+
+```powershell
+& .\.venv\Scripts\python.exe loop_manager.py run D:\repo\my-project
+```
+
+```sh
+.venv/bin/python loop_manager.py run /path/to/project
+```
+
+실행기는 한 번에 한 프로젝트의 작은 작업 하나만 별도 worktree에서 처리한다. PR을 생성하면 Merge될 때까지 새 작업을 시작하지 않으며, 현재 기준 commit에서 할 일이 없다고 판단한 뒤에는 commit이 바뀔 때까지 Codex를 다시 호출하지 않는다. 서버에는 Python 3, Git, GitHub CLI와 인증된 Codex CLI가 필요하다.
+
+cron에는 같은 `run` 명령을 등록한다. 동시 실행은 전역 잠금으로 거부하므로 여러 프로젝트 병렬 처리나 같은 실행에서의 프로젝트 순회는 후속 구현에서 추가한다.
 
 ### 5. Pull Request 검토
 
-Telegram 알림을 사용하는 경우 전달된 Pull Request를 검토하고 Merge한다. 선행 PR을 Merge하기 전에는 해당 PR에 의존하는 다음 작업이 시작되지 않는다. `BLOCKED`가 발생하면 안내된 worktree의 ExecPlan 또는 그 근거가 된 PRODUCT/Requirement를 수정한다. Planner가 유효한 ExecPlan을 만들지 못한 계획 단계 오류는 계획 입력이 변경된 뒤 다시 시도한다. PR을 Merge하지 않고 닫아서 BLOCKED가 됐다면 문서 수정이 아니라 같은 PR을 다시 열어야 한다.
+최소 실행기는 생성한 PR URL을 표준 출력에 표시한다. 사용자는 PR을 검토하고 Merge하며, 열린 동안에는 다음 실행도 같은 PR을 기다린다. PR을 Merge하지 않고 닫았다면 같은 PR을 다시 열어야 한다.
 
-Merge된 작업의 worktree에 미커밋 또는 미푸시 변경이 남아 있으면 삭제하지 않고 `cleanup_pending`으로 보존한다. 이는 다음 작업이나 프로젝트 완료를 막지 않는다.
+Merge된 worktree가 깨끗하면 자동으로 정리한다. 미커밋 또는 미푸시 변경이 남아 있으면 삭제하지 않고 경로를 출력한 뒤 중단한다. `cleanup_pending`과 Telegram 알림은 후속 구현 대상이다.
 
 ## 사용자가 직접 작성하지 않는 항목
 
 - `docs/PLANS.md`와 `docs/*.template.md`는 복사된 공통 파일을 그대로 사용한다.
 - `docs/plans/*.md`의 ExecPlan은 Planner가 생성한다.
-- ExecPlan 실행 상태와 재시도 횟수는 Loop Manager의 SQLite가 관리한다.
+- 현재 작업 phase, branch, worktree와 PR은 Loop Manager의 SQLite가 관리한다.
 - Worker가 기능을 구현하고 관련 테스트를 작성한다.
 - Worker가 프로젝트에 맞는 `scripts/verify.ps1` 또는 `scripts/verify.sh`를 생성하고 유지한다.
 - Worker는 전체 검증 스크립트를 직접 실행하지 않는다.
 - Loop Manager가 전체 검증을 실행하고 실패 출력만 Worker에게 전달한 뒤 읽기 전용 Reviewer와 Pull Request 생성을 진행한다.
-- worktree, branch, 작업 상태와 AI Agent 세션은 Loop Manager가 관리한다.
+- worktree, branch와 현재 작업 상태는 Loop Manager가 관리한다.
 
 일반적인 실행 중에는 사용자가 코드, 테스트, ExecPlan이나 SQLite 상태를 수정할 필요가 없다. 단, BLOCKED 원인을 해소할 때는 ExecPlan 또는 제품 문서를 수정할 수 있다.
