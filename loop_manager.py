@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import configparser
 import contextlib
-import datetime as dt
 import hashlib
 import json
 import os
@@ -22,6 +21,7 @@ ROOT = Path(__file__).resolve().parent
 FIELDS = {
     "base_branch",
     "processed_sha",
+    "planning_fingerprint",
     "active_sha",
     "phase",
     "branch",
@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS projects (
     repo TEXT PRIMARY KEY,
     base_branch TEXT NOT NULL,
     processed_sha TEXT,
+    planning_fingerprint TEXT,
     active_sha TEXT,
     phase TEXT,
     branch TEXT,
@@ -109,8 +110,14 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
             connection.close()
             raise RuntimeError("상태 DB를 읽을 수 없습니다. 백업을 복원하거나 다시 초기화하세요.") from error
     columns = {row[1] for row in connection.execute("PRAGMA table_info(projects)")}
-    if "plan_path" not in columns:
-        connection.execute("ALTER TABLE projects ADD COLUMN plan_path TEXT")
+    migrations = {
+        "plan_path": "TEXT",
+        "planning_fingerprint": "TEXT",
+    }
+    for column, definition in migrations.items():
+        if column not in columns:
+            connection.execute(f"ALTER TABLE projects ADD COLUMN {column} {definition}")
+    if not migrations.keys() <= columns:
         connection.commit()
     return connection
 
@@ -151,6 +158,111 @@ def command(
 
 def git(repo: Path, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     return command(["git", "-C", str(repo), *arguments], check=check)
+
+
+def git_bytes(repo: Path, *arguments: str) -> bytes:
+    result = subprocess.run(
+        ["git", "-C", str(repo), *arguments],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    if result.returncode:
+        output = result.stdout[-6000:].decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"명령 실패 (git -C {repo}):\n{output}")
+    return result.stdout
+
+
+def _git_tree_entries(repo: Path, revision: str) -> dict[bytes, tuple[bytes, bytes]]:
+    tree = git_bytes(repo, "ls-tree", "-r", "-z", "--full-tree", revision)
+    entries: dict[bytes, tuple[bytes, bytes]] = {}
+    for record in tree.split(b"\0"):
+        if not record:
+            continue
+        metadata, separator, path = record.partition(b"\t")
+        parts = metadata.split()
+        if not separator or len(parts) != 3:
+            raise RuntimeError("Git tree 항목 형식이 올바르지 않습니다.")
+        _mode, object_type, object_id = parts
+        if object_type not in {b"blob", b"commit"}:
+            raise RuntimeError("지원하지 않는 Git tree 항목 형식입니다.")
+        entries[path] = (object_type, object_id)
+    return entries
+
+
+def _is_active_requirement(path: bytes) -> bool:
+    return re.fullmatch(rb"docs/requirements/[^/]*\.md", path) is not None
+
+
+def _is_planning_input(path: bytes) -> bool:
+    if path in {b"AGENTS.md", b"docs/PRODUCT.md", b"docs/ARCHITECTURE.md"}:
+        return True
+    if _is_active_requirement(path):
+        return True
+    return not path.startswith(b"docs/")
+
+
+def _planning_input_digest(entries: list[tuple[bytes, bytes, bytes]]) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"loop-manager-planning-input-v2\0")
+    for path, object_type, contents in sorted(entries, key=lambda entry: entry[0]):
+        digest.update(len(path).to_bytes(8, "big"))
+        digest.update(path)
+        digest.update(len(object_type).to_bytes(8, "big"))
+        digest.update(object_type)
+        digest.update(len(contents).to_bytes(8, "big"))
+        digest.update(contents)
+    return digest.hexdigest()
+
+
+def _planning_input_fingerprint(repo: Path, revision: str) -> str:
+    entries: list[tuple[bytes, bytes, bytes]] = []
+    for path, (object_type, object_id) in _git_tree_entries(repo, revision).items():
+        if _is_planning_input(path):
+            if object_type == b"blob":
+                contents = git_bytes(repo, "cat-file", "blob", object_id.decode("ascii"))
+            else:
+                contents = object_id
+            entries.append((path, object_type, contents))
+    return _planning_input_digest(entries)
+
+
+def planning_input_fingerprint(repo: Path, base: str) -> str:
+    return _planning_input_fingerprint(repo, f"origin/{base}")
+
+
+def _is_requirement_archive_only_change(
+    repo: Path,
+    previous_revision: str,
+    current_revision: str,
+) -> bool:
+    previous_tree = _git_tree_entries(repo, previous_revision)
+    current_tree = _git_tree_entries(repo, current_revision)
+    previous_inputs = {
+        path: object_id for path, object_id in previous_tree.items() if _is_planning_input(path)
+    }
+    current_inputs = {
+        path: object_id for path, object_id in current_tree.items() if _is_planning_input(path)
+    }
+
+    removed = previous_inputs.keys() - current_inputs.keys()
+    added = current_inputs.keys() - previous_inputs.keys()
+    changed = {
+        path
+        for path in previous_inputs.keys() & current_inputs.keys()
+        if previous_inputs[path] != current_inputs[path]
+    }
+    if not removed or added or changed:
+        return False
+
+    requirement_prefix = b"docs/requirements/"
+    archive_prefix = b"docs/requirements/archive/"
+    for path in removed:
+        if not _is_active_requirement(path):
+            return False
+        archived_path = archive_prefix + path.removeprefix(requirement_prefix)
+        if archived_path in previous_tree or current_tree.get(archived_path) != previous_inputs[path]:
+            return False
+    return True
 
 
 def file_hash(path: Path) -> str:
@@ -589,7 +701,13 @@ def clean_worktree(repo: Path, worktree: Path, base: str) -> bool:
     return True
 
 
-def clear_active(connection: sqlite3.Connection, repo: str, *, processed_sha: str | None = None) -> None:
+def clear_active(
+    connection: sqlite3.Connection,
+    repo: str,
+    *,
+    processed_sha: str | None = None,
+    planning_fingerprint: str | None = None,
+) -> None:
     values: dict[str, object] = {
         "active_sha": None,
         "phase": None,
@@ -601,6 +719,8 @@ def clear_active(connection: sqlite3.Connection, repo: str, *, processed_sha: st
     }
     if processed_sha is not None:
         values["processed_sha"] = processed_sha
+    if planning_fingerprint is not None:
+        values["planning_fingerprint"] = planning_fingerprint
     update_project(connection, repo, **values)
 
 
@@ -674,6 +794,7 @@ def run_project(
     base = remote_base(repo_path, requested_base or (row["base_branch"] if row else None))
     ensure_safe_base_worktree(repo_path, base)
     base_sha = git(repo_path, "rev-parse", f"origin/{base}").stdout.strip()
+    current_fingerprint = planning_input_fingerprint(repo_path, base)
 
     if not row:
         connection.execute("INSERT INTO projects (repo, base_branch) VALUES (?, ?)", (repo, base))
@@ -683,14 +804,34 @@ def run_project(
         update_project(connection, repo, base_branch=base)
         row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
 
-    if not row["phase"] and row["processed_sha"] == base_sha:
-        print("기준 commit이 바뀌지 않아 Codex를 실행하지 않습니다.")
+    if row["phase"] == "PLANNING":
+        started_fingerprint = _planning_input_fingerprint(repo_path, row["active_sha"])
+        if started_fingerprint != current_fingerprint:
+            stale_worktree = Path(row["worktree"])
+            if stale_worktree.exists():
+                git(repo_path, "worktree", "remove", "--force", str(stale_worktree))
+            clear_active(connection, repo)
+            row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
+
+    if not row["phase"] and row["planning_fingerprint"] == current_fingerprint:
+        update_project(connection, repo, processed_sha=base_sha)
+        print("계획 입력이 바뀌지 않아 Codex를 실행하지 않습니다.")
         return 0
 
+    if not row["phase"] and row["planning_fingerprint"] and row["processed_sha"]:
+        processed_fingerprint = _planning_input_fingerprint(repo_path, row["processed_sha"])
+        if processed_fingerprint == current_fingerprint:
+            update_project(connection, repo, processed_sha=base_sha)
+            print("계획 입력이 바뀌지 않아 Codex를 실행하지 않습니다.")
+            return 0
+        if _is_requirement_archive_only_change(repo_path, row["processed_sha"], base_sha):
+            update_project(connection, repo, processed_sha=base_sha)
+            print("Requirement archive 이동 외의 계획 입력이 바뀌지 않아 Codex를 실행하지 않습니다.")
+            return 0
+
     if not row["phase"]:
-        timestamp = dt.datetime.now(dt.UTC).strftime("%Y%m%d%H%M%S")
         project_id = hashlib.sha256(repo.encode()).hexdigest()[:16]
-        worktree = state_dir / "worktrees" / project_id / "planning" / timestamp
+        worktree = state_dir / "worktrees" / project_id / "planning" / current_fingerprint
         update_project(
             connection,
             repo,
@@ -737,8 +878,14 @@ def run_project(
             else:
                 planned_files = changed_files(planning_worktree, str(row["active_sha"]))
                 if not planned_files:
+                    completed_fingerprint = _planning_input_fingerprint(repo_path, row["active_sha"])
                     git(repo_path, "worktree", "remove", str(planning_worktree))
-                    clear_active(connection, repo, processed_sha=base_sha)
+                    clear_active(
+                        connection,
+                        repo,
+                        processed_sha=row["active_sha"],
+                        planning_fingerprint=completed_fingerprint,
+                    )
                     print("추가로 계획할 작업이 없습니다.")
                     return 0
                 if len(planned_files) != 1 or not re.fullmatch(r"docs/plans/[^/]+\.md", planned_files[0]):
@@ -837,7 +984,7 @@ def run_project(
         ahead = int(git(worktree, "rev-list", "--count", f"origin/{base}..HEAD").stdout)
         if not dirty and not ahead:
             git(repo_path, "worktree", "remove", str(worktree))
-            clear_active(connection, repo, processed_sha=base_sha)
+            clear_active(connection, repo)
             print("추가로 구현할 작업이 없습니다.")
             return 0
         if dirty:
