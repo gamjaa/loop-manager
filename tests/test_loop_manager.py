@@ -173,11 +173,11 @@ risk: medium
                         with self.assertRaisesRegex(RuntimeError, message):
                             loop_manager.worker_profile(config, 1)
 
-    def test_codex_model_efforts_reads_bundled_catalog(self):
+    def test_codex_model_efforts_reads_effective_catalog_for_worktree(self):
         catalog = {
             "models": [
                 {
-                    "slug": "gpt-5.6-sol",
+                    "slug": "gpt-reserve",
                     "supported_reasoning_levels": [
                         {"effort": "max"}, {"effort": "ultra"}
                     ],
@@ -185,11 +185,38 @@ risk: medium
             ]
         }
         completed = subprocess.CompletedProcess([], 0, stdout=json.dumps(catalog))
+        worktree = Path("/project/worktree")
         with mock.patch("loop_manager.command", return_value=completed) as command:
-            efforts = loop_manager.codex_model_efforts()
+            efforts = loop_manager.codex_model_efforts(worktree)
 
-        self.assertEqual(efforts, {"gpt-5.6-sol": frozenset({"max", "ultra"})})
-        self.assertEqual(command.call_args.args[0], ["codex", "debug", "models", "--bundled"])
+        self.assertEqual(efforts, {"gpt-reserve": frozenset({"max", "ultra"})})
+        self.assertEqual(command.call_args.args[0], ["codex", "debug", "models"])
+        self.assertEqual(command.call_args.kwargs["cwd"], worktree)
+
+    def test_run_codex_validates_profile_in_worker_catalog(self):
+        config = loop_manager.ROOT / "config/config.ini.example"
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory) / "worktree"
+            worktree.mkdir()
+            state_dir = Path(directory) / "state"
+            completed = subprocess.CompletedProcess([], 0)
+            with mock.patch(
+                "loop_manager.codex_model_efforts",
+                return_value={"gpt-5.6-terra": frozenset({"high"})},
+            ) as model_efforts, mock.patch(
+                "loop_manager.subprocess.run", return_value=completed
+            ):
+                loop_manager.run_codex(
+                    worktree,
+                    state_dir,
+                    config,
+                    "worker",
+                    "prompt",
+                    read_only=False,
+                    level=4,
+                )
+
+        model_efforts.assert_called_once_with(worktree)
 
     def test_profiles_validate_model_specific_efforts(self):
         model_efforts = {

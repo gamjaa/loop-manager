@@ -292,11 +292,12 @@ def worker_level(plan: dict[str, object]) -> int:
     return min(complexity + risk, 7)
 
 
-def codex_model_efforts() -> dict[str, frozenset[str]]:
+def codex_model_efforts(worktree: Path | None = None) -> dict[str, frozenset[str]]:
     try:
         catalog = json.loads(
             command(
-                ["codex", "debug", "models", "--bundled"],
+                ["codex", "debug", "models"],
+                cwd=worktree,
                 env=agent_environment(),
             ).stdout
         )
@@ -314,6 +315,7 @@ def codex_profile(
     section: str,
     name: str,
     label: str,
+    worktree: Path | None = None,
 ) -> tuple[str, str]:
     parser = configparser.ConfigParser()
     try:
@@ -345,7 +347,7 @@ def codex_profile(
     model = parser["codex.models"][alias].strip()
     if not model:
         raise RuntimeError(f"{label} Model 설정이 비어 있습니다: [codex.models] {alias}")
-    supported = codex_model_efforts().get(model)
+    supported = codex_model_efforts(worktree).get(model)
     if supported is None:
         raise RuntimeError(f"{label} Model을 Codex CLI가 지원하지 않습니다: {model}")
     if effort not in supported:
@@ -355,15 +357,19 @@ def codex_profile(
     return model, effort
 
 
-def role(config_path: Path, name: str) -> tuple[str, str]:
-    return codex_profile(config_path, "codex.roles", name, f"Codex {name}")
+def role(config_path: Path, name: str, worktree: Path | None = None) -> tuple[str, str]:
+    return codex_profile(config_path, "codex.roles", name, f"Codex {name}", worktree)
 
 
-def worker_profile(config_path: Path, level: int) -> tuple[str, str]:
+def worker_profile(
+    config_path: Path,
+    level: int,
+    worktree: Path | None = None,
+) -> tuple[str, str]:
     if type(level) is not int or not 1 <= level <= 7:
         raise RuntimeError(f"Codex Worker level이 유효하지 않습니다: {level}")
     name = f"level{level}"
-    return codex_profile(config_path, "codex.worker", name, f"Codex Worker {name}")
+    return codex_profile(config_path, "codex.worker", name, f"Codex Worker {name}", worktree)
 
 
 def agent_environment() -> dict[str, str]:
@@ -404,11 +410,11 @@ def run_codex(
     if role_name == "worker":
         if level is None:
             raise RuntimeError("Codex Worker level이 없습니다.")
-        model, effort = worker_profile(config_path, level)
+        model, effort = worker_profile(config_path, level, worktree)
     else:
         if level is not None:
             raise RuntimeError(f"Codex {role_name}에 Worker level을 지정할 수 없습니다.")
-        model, effort = role(config_path, role_name)
+        model, effort = role(config_path, role_name, worktree)
     project_dir = state_dir / "logs" / hashlib.sha256(str(worktree).encode()).hexdigest()[:16]
     project_dir.mkdir(parents=True, exist_ok=True)
     last_message = project_dir / f"{role_name}-last.txt"
