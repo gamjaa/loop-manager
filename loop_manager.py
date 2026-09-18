@@ -19,7 +19,6 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parent
-CODEX_EFFORTS = frozenset({"minimal", "low", "medium", "high", "xhigh"})
 FIELDS = {
     "base_branch",
     "processed_sha",
@@ -293,7 +292,29 @@ def worker_level(plan: dict[str, object]) -> int:
     return min(complexity + risk, 7)
 
 
-def codex_profile(config_path: Path, section: str, name: str, label: str) -> tuple[str, str]:
+def codex_model_efforts() -> dict[str, frozenset[str]]:
+    try:
+        catalog = json.loads(
+            command(
+                ["codex", "debug", "models", "--bundled"],
+                env=agent_environment(),
+            ).stdout
+        )
+        models = catalog["models"]
+        return {
+            model["slug"]: frozenset(level["effort"] for level in model["supported_reasoning_levels"])
+            for model in models
+        }
+    except (KeyError, TypeError, json.JSONDecodeError) as error:
+        raise RuntimeError("Codex CLI model catalog 형식이 올바르지 않습니다.") from error
+
+
+def codex_profile(
+    config_path: Path,
+    section: str,
+    name: str,
+    label: str,
+) -> tuple[str, str]:
     parser = configparser.ConfigParser()
     try:
         loaded = parser.read(config_path, encoding="utf-8")
@@ -317,8 +338,6 @@ def codex_profile(config_path: Path, section: str, name: str, label: str) -> tup
         raise RuntimeError(f"{label} Model alias 설정이 비어 있습니다.")
     if not effort:
         raise RuntimeError(f"{label} Effort 설정이 비어 있습니다.")
-    if effort not in CODEX_EFFORTS:
-        raise RuntimeError(f"{label} Effort를 Codex CLI가 지원하지 않습니다: {effort}")
     if "codex.models" not in parser:
         raise RuntimeError(f"{label} Model alias section [codex.models]가 없습니다.")
     if alias not in parser["codex.models"]:
@@ -326,6 +345,13 @@ def codex_profile(config_path: Path, section: str, name: str, label: str) -> tup
     model = parser["codex.models"][alias].strip()
     if not model:
         raise RuntimeError(f"{label} Model 설정이 비어 있습니다: [codex.models] {alias}")
+    supported = codex_model_efforts().get(model)
+    if supported is None:
+        raise RuntimeError(f"{label} Model을 Codex CLI가 지원하지 않습니다: {model}")
+    if effort not in supported:
+        raise RuntimeError(
+            f"{label} Model/Effort 조합을 Codex CLI가 지원하지 않습니다: {model},{effort}"
+        )
     return model, effort
 
 

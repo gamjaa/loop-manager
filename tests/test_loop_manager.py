@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import subprocess
 import tempfile
@@ -54,7 +55,11 @@ risk: medium
     def test_role_resolves_model_alias(self):
         config = loop_manager.ROOT / "config/config.ini.example"
 
-        self.assertEqual(loop_manager.role(config, "planner"), ("gpt-5.6-sol", "xhigh"))
+        with mock.patch(
+            "loop_manager.codex_model_efforts",
+            return_value={"gpt-5.6-sol": frozenset({"xhigh"})},
+        ):
+            self.assertEqual(loop_manager.role(config, "planner"), ("gpt-5.6-sol", "xhigh"))
 
     def test_worker_level_boundaries_and_cap(self):
         cases = [
@@ -80,9 +85,15 @@ risk: medium
     def test_worker_profile_resolves_level_alias(self):
         config = loop_manager.ROOT / "config/config.ini.example"
 
-        self.assertEqual(loop_manager.worker_profile(config, 1), ("gpt-5.6-luna", "medium"))
-        self.assertEqual(loop_manager.worker_profile(config, 4), ("gpt-5.6-terra", "high"))
-        self.assertEqual(loop_manager.worker_profile(config, 7), ("gpt-5.6-sol", "xhigh"))
+        model_efforts = {
+            "gpt-5.6-luna": frozenset({"medium"}),
+            "gpt-5.6-terra": frozenset({"high"}),
+            "gpt-5.6-sol": frozenset({"xhigh"}),
+        }
+        with mock.patch("loop_manager.codex_model_efforts", return_value=model_efforts):
+            self.assertEqual(loop_manager.worker_profile(config, 1), ("gpt-5.6-luna", "medium"))
+            self.assertEqual(loop_manager.worker_profile(config, 4), ("gpt-5.6-terra", "high"))
+            self.assertEqual(loop_manager.worker_profile(config, 7), ("gpt-5.6-sol", "xhigh"))
 
     def test_worker_profile_rejects_invalid_level(self):
         config = loop_manager.ROOT / "config/config.ini.example"
@@ -121,8 +132,13 @@ risk: medium
             ),
             (
                 "unsupported-effort",
-                "[codex.models]\nfast = model-fast\n[codex.worker]\nlevel1 = fast,invalid\n",
-                "Effort를 Codex CLI가 지원하지 않습니다: invalid",
+                "[codex.models]\nfast = gpt-5.6-sol\n[codex.worker]\nlevel1 = fast,minimal\n",
+                "Model/Effort 조합을 Codex CLI가 지원하지 않습니다: gpt-5.6-sol,minimal",
+            ),
+            (
+                "unsupported-model",
+                "[codex.models]\nfast = unavailable\n[codex.worker]\nlevel1 = fast,medium\n",
+                "Model을 Codex CLI가 지원하지 않습니다: unavailable",
             ),
             (
                 "missing-alias",
@@ -146,8 +162,67 @@ risk: medium
                 with self.subTest(name=name):
                     config = Path(directory) / f"{name}.ini"
                     config.write_text(contents, encoding="utf-8")
-                    with self.assertRaisesRegex(RuntimeError, message):
-                        loop_manager.worker_profile(config, 1)
+                    with mock.patch(
+                        "loop_manager.codex_model_efforts",
+                        return_value={
+                            "gpt-5.6-sol": frozenset(
+                                {"low", "medium", "high", "xhigh", "max", "ultra"}
+                            )
+                        },
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, message):
+                            loop_manager.worker_profile(config, 1)
+
+    def test_codex_model_efforts_reads_bundled_catalog(self):
+        catalog = {
+            "models": [
+                {
+                    "slug": "gpt-5.6-sol",
+                    "supported_reasoning_levels": [
+                        {"effort": "max"}, {"effort": "ultra"}
+                    ],
+                }
+            ]
+        }
+        completed = subprocess.CompletedProcess([], 0, stdout=json.dumps(catalog))
+        with mock.patch("loop_manager.command", return_value=completed) as command:
+            efforts = loop_manager.codex_model_efforts()
+
+        self.assertEqual(efforts, {"gpt-5.6-sol": frozenset({"max", "ultra"})})
+        self.assertEqual(command.call_args.args[0], ["codex", "debug", "models", "--bundled"])
+
+    def test_profiles_validate_model_specific_efforts(self):
+        model_efforts = {
+            "gpt-5.6-sol": frozenset({"low", "medium", "high", "xhigh", "max", "ultra"}),
+            "gpt-5.6-luna": frozenset({"low", "medium", "high", "xhigh", "max"}),
+        }
+        contents = (
+            "[codex.models]\n"
+            "strong = gpt-5.6-sol\n"
+            "fast = gpt-5.6-luna\n"
+            "[codex.roles]\n"
+            "planner = strong,max\n"
+            "reviewer = strong,ultra\n"
+            "[codex.worker]\n"
+            "level1 = fast,max\n"
+            "level2 = strong,minimal\n"
+            "level3 = fast,ultra\n"
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config.ini"
+            config.write_text(contents, encoding="utf-8")
+            with mock.patch(
+                "loop_manager.codex_model_efforts",
+                return_value=model_efforts,
+            ):
+                self.assertEqual(loop_manager.role(config, "planner"), ("gpt-5.6-sol", "max"))
+                self.assertEqual(loop_manager.role(config, "reviewer"), ("gpt-5.6-sol", "ultra"))
+                self.assertEqual(loop_manager.worker_profile(config, 1), ("gpt-5.6-luna", "max"))
+                for level in (2, 3):
+                    with self.subTest(level=level):
+                        with self.assertRaisesRegex(RuntimeError, "Model/Effort 조합"):
+                            loop_manager.worker_profile(config, level)
 
     def test_worker_codex_uses_level_model_and_effort(self):
         config = loop_manager.ROOT / "config/config.ini.example"
@@ -156,7 +231,10 @@ risk: medium
             worktree.mkdir()
             state_dir = Path(directory) / "state"
             completed = subprocess.CompletedProcess([], 0)
-            with mock.patch("loop_manager.subprocess.run", return_value=completed) as run:
+            with mock.patch(
+                "loop_manager.codex_model_efforts",
+                return_value={"gpt-5.6-terra": frozenset({"high"})},
+            ), mock.patch("loop_manager.subprocess.run", return_value=completed) as run:
                 code, message = loop_manager.run_codex(
                     worktree,
                     state_dir,
@@ -177,11 +255,16 @@ risk: medium
             root = Path(directory)
             config = root / "config.ini"
             config.write_text(
-                "[codex.models]\nfast = model-fast\n[codex.worker]\nlevel1 = fast,invalid\n",
+                "[codex.models]\nstrong = gpt-5.6-sol\n[codex.worker]\nlevel1 = strong,minimal\n",
                 encoding="utf-8",
             )
-            with mock.patch("loop_manager.subprocess.run") as run:
-                with self.assertRaisesRegex(RuntimeError, "Effort를 Codex CLI가 지원하지 않습니다"):
+            with mock.patch(
+                "loop_manager.codex_model_efforts",
+                return_value={
+                    "gpt-5.6-sol": frozenset({"low", "medium", "high", "xhigh", "max", "ultra"})
+                },
+            ), mock.patch("loop_manager.subprocess.run") as run:
+                with self.assertRaisesRegex(RuntimeError, "Model/Effort 조합"):
                     loop_manager.run_codex(
                         root / "worktree",
                         root / "state",
