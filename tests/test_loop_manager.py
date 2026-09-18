@@ -155,6 +155,16 @@ risk: medium
                 "codex.models]\nfast = model-fast\n",
                 "설정 파일 형식이 올바르지 않습니다",
             ),
+            (
+                "malformed-profile-interpolation",
+                "[codex.models]\nfast = model-fast\n[codex.worker]\nlevel1 = fast,%\n",
+                r"설정 값 형식이 올바르지 않습니다: \[codex.worker\] level1",
+            ),
+            (
+                "malformed-model-interpolation",
+                "[codex.models]\nfast = model-%\n[codex.worker]\nlevel1 = fast,medium\n",
+                r"설정 값 형식이 올바르지 않습니다: \[codex.models\] fast",
+            ),
         ]
 
         with tempfile.TemporaryDirectory() as directory:

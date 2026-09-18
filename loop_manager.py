@@ -329,7 +329,12 @@ def codex_profile(
     if name not in parser[section]:
         raise RuntimeError(f"{label} 설정이 없습니다: [{section}] {name}")
 
-    value = parser[section][name]
+    try:
+        value = parser[section][name]
+    except configparser.InterpolationError as error:
+        raise RuntimeError(
+            f"{label} 설정 값 형식이 올바르지 않습니다: [{section}] {name}"
+        ) from error
     if not value.strip():
         raise RuntimeError(f"{label} Model alias/Effort 설정이 비어 있습니다.")
     parts = [part.strip() for part in value.split(",")]
@@ -344,7 +349,12 @@ def codex_profile(
         raise RuntimeError(f"{label} Model alias section [codex.models]가 없습니다.")
     if alias not in parser["codex.models"]:
         raise RuntimeError(f"{label} Model alias가 [codex.models]에 없습니다: {alias}")
-    model = parser["codex.models"][alias].strip()
+    try:
+        model = parser["codex.models"][alias].strip()
+    except configparser.InterpolationError as error:
+        raise RuntimeError(
+            f"{label} 설정 값 형식이 올바르지 않습니다: [codex.models] {alias}"
+        ) from error
     if not model:
         raise RuntimeError(f"{label} Model 설정이 비어 있습니다: [codex.models] {alias}")
     supported = codex_model_efforts(worktree).get(model)
