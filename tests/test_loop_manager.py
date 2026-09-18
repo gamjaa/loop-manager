@@ -194,19 +194,28 @@ class LoopManagerTest(unittest.TestCase):
                 self.assertEqual(loop_manager._is_planning_input(path), expected)
 
     def test_planning_input_digest_is_ordered_and_unambiguous(self):
-        entries = [(b"src/b.py", b"two"), (b"src/a.py", b"one")]
+        entries = [
+            (b"src/b.py", b"blob", b"two"),
+            (b"src/a.py", b"blob", b"one"),
+        ]
 
         fingerprint = loop_manager._planning_input_digest(entries)
 
         self.assertEqual(fingerprint, loop_manager._planning_input_digest(list(reversed(entries))))
         self.assertEqual(len(fingerprint), 64)
         self.assertNotEqual(
-            loop_manager._planning_input_digest([(b"a", b"bc")]),
-            loop_manager._planning_input_digest([(b"ab", b"c")]),
+            loop_manager._planning_input_digest([(b"a", b"blob", b"bc")]),
+            loop_manager._planning_input_digest([(b"ab", b"blob", b"c")]),
         )
         self.assertNotEqual(
-            loop_manager._planning_input_digest([(b"src/a.py", b"one")]),
-            loop_manager._planning_input_digest([(b"src/renamed.py", b"one")]),
+            loop_manager._planning_input_digest([(b"src/a.py", b"blob", b"one")]),
+            loop_manager._planning_input_digest(
+                [(b"src/renamed.py", b"blob", b"one")]
+            ),
+        )
+        self.assertNotEqual(
+            loop_manager._planning_input_digest([(b"vendor/lib", b"blob", b"abc")]),
+            loop_manager._planning_input_digest([(b"vendor/lib", b"commit", b"abc")]),
         )
 
     def test_planning_input_fingerprint_uses_origin_tree_and_input_boundary(self):
@@ -244,6 +253,35 @@ class LoopManagerTest(unittest.TestCase):
             (repo / "src/app.py").rename(repo / "src/renamed.py")
             commit_and_push(repo, "Rename source")
             self.assertNotEqual(loop_manager.planning_input_fingerprint(repo, "main"), changed)
+
+    def test_planning_input_fingerprint_includes_gitlink_commit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            first_target = git_command(repo, "rev-parse", "HEAD")
+            git_command(
+                repo,
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                f"160000,{first_target},vendor/library",
+            )
+            git_command(repo, "commit", "-m", "Add tracked submodule commit")
+            git_command(repo, "push", "origin", "HEAD:main")
+            first = loop_manager.planning_input_fingerprint(repo, "main")
+
+            second_target = git_command(repo, "rev-parse", "HEAD")
+            git_command(
+                repo,
+                "update-index",
+                "--cacheinfo",
+                f"160000,{second_target},vendor/library",
+            )
+            git_command(repo, "commit", "-m", "Update tracked submodule commit")
+            git_command(repo, "push", "origin", "HEAD:main")
+
+            self.assertNotEqual(
+                loop_manager.planning_input_fingerprint(repo, "main"), first
+            )
 
     def test_planner_no_change_saves_fingerprint_and_skip_gate_uses_it(self):
         with tempfile.TemporaryDirectory() as directory:

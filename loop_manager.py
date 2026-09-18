@@ -172,9 +172,9 @@ def git_bytes(repo: Path, *arguments: str) -> bytes:
     return result.stdout
 
 
-def _git_tree_blobs(repo: Path, revision: str) -> dict[bytes, bytes]:
+def _git_tree_entries(repo: Path, revision: str) -> dict[bytes, tuple[bytes, bytes]]:
     tree = git_bytes(repo, "ls-tree", "-r", "-z", "--full-tree", revision)
-    blobs: dict[bytes, bytes] = {}
+    entries: dict[bytes, tuple[bytes, bytes]] = {}
     for record in tree.split(b"\0"):
         if not record:
             continue
@@ -183,9 +183,10 @@ def _git_tree_blobs(repo: Path, revision: str) -> dict[bytes, bytes]:
         if not separator or len(parts) != 3:
             raise RuntimeError("Git tree 항목 형식이 올바르지 않습니다.")
         _mode, object_type, object_id = parts
-        if object_type == b"blob":
-            blobs[path] = object_id
-    return blobs
+        if object_type not in {b"blob", b"commit"}:
+            raise RuntimeError("지원하지 않는 Git tree 항목 형식입니다.")
+        entries[path] = (object_type, object_id)
+    return entries
 
 
 def _is_active_requirement(path: bytes) -> bool:
@@ -200,23 +201,28 @@ def _is_planning_input(path: bytes) -> bool:
     return not path.startswith(b"docs/")
 
 
-def _planning_input_digest(entries: list[tuple[bytes, bytes]]) -> str:
+def _planning_input_digest(entries: list[tuple[bytes, bytes, bytes]]) -> str:
     digest = hashlib.sha256()
-    digest.update(b"loop-manager-planning-input-v1\0")
-    for path, contents in sorted(entries, key=lambda entry: entry[0]):
+    digest.update(b"loop-manager-planning-input-v2\0")
+    for path, object_type, contents in sorted(entries, key=lambda entry: entry[0]):
         digest.update(len(path).to_bytes(8, "big"))
         digest.update(path)
+        digest.update(len(object_type).to_bytes(8, "big"))
+        digest.update(object_type)
         digest.update(len(contents).to_bytes(8, "big"))
         digest.update(contents)
     return digest.hexdigest()
 
 
 def _planning_input_fingerprint(repo: Path, revision: str) -> str:
-    entries: list[tuple[bytes, bytes]] = []
-    for path, object_id in _git_tree_blobs(repo, revision).items():
+    entries: list[tuple[bytes, bytes, bytes]] = []
+    for path, (object_type, object_id) in _git_tree_entries(repo, revision).items():
         if _is_planning_input(path):
-            contents = git_bytes(repo, "cat-file", "blob", object_id.decode("ascii"))
-            entries.append((path, contents))
+            if object_type == b"blob":
+                contents = git_bytes(repo, "cat-file", "blob", object_id.decode("ascii"))
+            else:
+                contents = object_id
+            entries.append((path, object_type, contents))
     return _planning_input_digest(entries)
 
 
@@ -229,8 +235,8 @@ def _is_requirement_archive_only_change(
     previous_revision: str,
     current_revision: str,
 ) -> bool:
-    previous_tree = _git_tree_blobs(repo, previous_revision)
-    current_tree = _git_tree_blobs(repo, current_revision)
+    previous_tree = _git_tree_entries(repo, previous_revision)
+    current_tree = _git_tree_entries(repo, current_revision)
     previous_inputs = {
         path: object_id for path, object_id in previous_tree.items() if _is_planning_input(path)
     }
