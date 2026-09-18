@@ -1,0 +1,47 @@
+; config.ini로 복사한 뒤 현재 CLI가 지원하는 정확한 값을 입력한다.
+; config.ini는 Telegram token을 포함하므로 Git에 커밋하지 않는다.
+
+[loop]
+max_workers = 3
+
+[telegram]
+; token과 chat_id가 모두 비어 있으면 알림을 사용하지 않는다.
+; 둘 중 하나만 입력하면 설정 오류다.
+token =
+chat_id =
+
+[codex.models]
+strong = gpt-5.6-sol
+balanced = gpt-5.6-terra
+fast = gpt-5.6-luna
+
+[codex.roles]
+planner = strong,xhigh
+reviewer = strong,high
+
+[codex.worker]
+level1 = fast,medium
+level2 = balanced,low
+level3 = balanced,medium
+level4 = balanced,high
+level5 = strong,medium
+level6 = strong,high
+level7 = strong,xhigh
+
+[claude.models]
+strong = claude-opus-5
+balanced = claude-sonnet-5
+fast = claude-haiku-4-5-20251001
+
+[claude.roles]
+planner = strong,high
+reviewer = strong,high
+
+[claude.worker]
+level1 = fast,medium
+level2 = balanced,low
+level3 = balanced,medium
+level4 = balanced,high
+level5 = strong,medium
+level6 = strong,high
+level7 = strong,xhigh
