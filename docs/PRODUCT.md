@@ -21,6 +21,7 @@
 - 프로젝트 공통 파일을 코드로 검증하고 사용자 선택으로 `AGENTS.md` 불일치를 승인할 수 있다
 - Specification Skill로 PRODUCT, Requirement와 ARCHITECTURE 작성을 도울 수 있다
 - PRODUCT와 Requirement를 읽어 필요한 구현 작업을 하나 이상의 ExecPlan으로 작성할 수 있다
+- 현재 입력에서 식별 가능한 구현 작업 전체를 Worker 시작 전에 ExecPlan 카탈로그로 만들고, 안전한 무인 자동화에 기여하는 순서로 처리할 수 있다
 - ExecPlan의 고정 메타데이터와 의존성을 코드로 파싱해 실행 가능 여부, Model과 Effort를 결정할 수 있다
 - ExecPlan 실행 상태, 재시도 횟수, AI Agent 세션과 작업 공간을 SQLite로 관리할 수 있다
 - Worker가 구현, 관련 테스트와 프로젝트별 전체 검증 스크립트를 작성할 수 있다
@@ -46,6 +47,8 @@
 - ExecPlan 실행 상태의 유일한 원본은 Loop Manager의 SQLite다
 - ExecPlan 생성 전 Planner 실패는 프로젝트의 `planning_error`로 SQLite에 저장하며 ExecPlan BLOCKED 상태를 만들지 않는다
 - 미충족 PRODUCT 또는 Requirement에 근거해서만 ExecPlan을 작성한다
+- 계획 입력이 변경되면 다음 Worker를 시작하기 전에 현재 입력에서 식별 가능한 모든 미충족 작업을 하나의 계획 주기에 ExecPlan으로 작성한다
+- 실행 중인 작업은 새 계획으로 선점하지 않으며, 실행 가능한 READY ExecPlan은 안전한 무인 자동화를 막는 작업을 우선하는 결정적 순서로 선택한다
 - Planner는 최신 `origin/<base-branch>` 기준의 detached planning worktree에서 ExecPlan만 작성한다
 - 검증된 ExecPlan은 구현을 시작하기 전에 commit하고 `origin/<base-branch>`에 fast-forward push한다
 - 같은 프로젝트에는 여러 READY ExecPlan을 등록할 수 있지만 동시에 하나의 ExecPlan만 실행한다
@@ -119,11 +122,11 @@
 1. 프로그램이 GitHub PR 상태와 SQLite의 ExecPlan 상태를 동기화한다
 2. BLOCKED ExecPlan과 `planning_error`의 근거 입력 변경 여부를 확인한다
 3. 동시에 처리할 프로젝트를 `max_workers` 범위에서 선택한다
-4. 대기 중인 READY ExecPlan이 있으면 계획 생성을 건너뛰고 실행 가능한 계획 선택으로 이동한다
-5. 실행 중인 작업과 READY ExecPlan이 없고 계획 입력이 변경됐으면 최신 원격 기준 branch에서 임시 planning worktree를 만든다
+4. 실행 중인 작업이 없고 계획 입력이 변경됐으면 READY ExecPlan의 존재와 관계없이 최신 원격 기준 branch에서 임시 planning worktree를 만든다
+5. 계획 입력이 변경되지 않았고 대기 중인 READY ExecPlan이 있으면 계획 생성을 건너뛰고 실행 가능한 계획 선택으로 이동한다
 6. Planner가 PRODUCT, Requirement, ARCHITECTURE, 현재 코드와 기존 ExecPlan을 확인한다
 7. 추가 작업이 없으면 계획 입력 지문을 저장하고 planning worktree를 정리한 뒤 프로젝트 완료 여부를 확인한다
-8. 작업이 필요하면 Planner가 필요한 ExecPlan을 planning worktree의 `docs/plans/`에 하나 이상 작성한다
+8. 작업이 필요하면 Planner가 현재 입력에서 식별 가능한 미충족 작업 전체를 독립적으로 검증·Merge할 수 있는 ExecPlan으로 나누어 planning worktree의 `docs/plans/`에 일괄 작성하고, 의존성과 제품 우선순위를 기록한다
 9. 프로그램이 Planner의 변경 범위, ExecPlan 메타데이터와 `depends_on`을 코드로 검증한다
 10. 검증 실패 내용을 같은 Planner 세션에 전달하고 최대 3회까지 수정을 요청한다
 11. 3회 후에도 유효하지 않으면 프로젝트의 `planning_error`에 원인과 계획 입력 지문을 저장하고 처리를 중단한다
@@ -131,7 +134,7 @@
 13. 계획 commit이 아직 원격에 없는데 `origin/<base-branch>`가 계획 기준 이후 바뀌었으면 planning worktree를 정리하고 최신 기준으로 다시 계획한다
 14. 기준이 그대로면 계획 commit을 `origin/<base-branch>`에 fast-forward push한다
 15. push된 commit을 확인한 뒤에만 각 ExecPlan을 SQLite에 READY 상태로 등록하고 planning worktree와 기존 `planning_error`를 정리한다
-16. 모든 `depends_on`이 MERGED인 READY ExecPlan 하나를 선택한다
+16. 모든 `depends_on`이 MERGED인 READY ExecPlan 중 제품 우선순위가 가장 높은 계획 하나를 결정적으로 선택한다
 17. 갱신된 `origin/<base-branch>`에서 해당 ExecPlan 전용 branch와 worktree를 생성하거나 기존 작업 공간을 복구한다
 18. 프로그램이 complexity와 risk를 Worker level로 환산해 Model과 Effort를 결정한다
 19. Worker가 구현, 관련 테스트와 전체 검증 스크립트를 작성하거나 갱신한다
@@ -190,7 +193,7 @@ ExecPlan 게시 실패:
 1. 사용자가 PR을 검토하고 Merge한다
 2. 다음 실행에서 프로그램이 GitHub의 Merge 상태를 확인한다
 3. SQLite의 ExecPlan 상태를 MERGED로 변경한다
-4. 관리 worktree에 미커밋 또는 미푸시 변경이 없으면 정리한다
+4. PR Merge 방식과 관계없이 관리 worktree에 미커밋 변경이나 PR에 포함되지 않은 로컬 전용 commit이 없으면 정리한다
 5. 변경이 남아 있으면 worktree를 보존하고 `cleanup_pending`에 경로와 원인을 기록한다
 6. 의존성이 충족된 다음 READY ExecPlan이 있으면 새 관리 worktree에서 처리한다
 7. 대기 중인 ExecPlan이 없으면 Planner가 추가 ExecPlan이 필요한지 다시 확인한다
@@ -255,7 +258,7 @@ BLOCKED → PR_OPEN (같은 PR을 사용자가 다시 열음)
 - `docs/requirements/` 바로 아래의 모든 `*.md`를 Planner 입력으로 사용한다
 - `docs/REQUIREMENT.template.md`와 `docs/requirements/archive/`는 Planner 입력에서 제외한다
 - ExecPlan의 `sources`에는 근거가 된 PRODUCT 또는 Requirement 경로가 있어야 한다
-- Planner는 같은 프로젝트에 실행 중인 작업과 대기 중인 READY ExecPlan이 없을 때 필요한 ExecPlan을 하나 이상 작성할 수 있다
+- 계획 입력이 변경되면 Planner는 실행 중인 작업이 없는 다음 선택 시점에 READY ExecPlan의 존재와 관계없이 전체 카탈로그를 확인하고, 현재 식별 가능한 미충족 작업을 한 번에 모두 계획한다
 - ExecPlan의 `depends_on`은 선행 ExecPlan ID 목록이며, 모든 선행 상태가 MERGED여야 Worker를 시작할 수 있다
 - Worker는 장기 제품 규칙이 바뀌는 경우에만 코드와 같은 PR에서 `PRODUCT.md`를 갱신한다
 
@@ -278,8 +281,10 @@ BLOCKED → PR_OPEN (같은 PR을 사용자가 다시 열음)
 
 - 같은 프로젝트에 여러 READY ExecPlan이 대기할 수 있다
 - 같은 프로젝트에서는 IMPLEMENTING부터 PR_OPEN 또는 BLOCKED까지 하나의 ExecPlan만 현재 작업으로 둔다
+- 새 계획 입력은 실행 중인 작업을 선점하지 않지만, 다음 Worker를 시작하기 전에 ExecPlan 카탈로그와 우선순위에 반영한다
 - READY ExecPlan은 모든 `depends_on`이 MERGED이고 다른 현재 작업이 없을 때만 시작한다
-- 실행 가능한 READY ExecPlan이 여럿이면 숫자 ExecPlan ID가 가장 작은 계획을 먼저 선택한다
+- 제품 우선순위는 안전한 무인 실행을 막거나 반복적인 사용자 복구를 요구하는 작업, 정상 경로의 사용자 개입을 제거하는 핵심 자동화, 그 밖의 Current Goal, 선택적 편의와 최적화 순이다
+- 실행 가능한 READY ExecPlan이 여럿이면 제품 우선순위가 높은 계획을 먼저 선택하고 같은 우선순위에서는 숫자 ExecPlan ID가 가장 작은 계획을 선택한다
 - 각 ExecPlan은 고유하고 결정적인 이름의 branch와 별도 관리 worktree에서 작업한다
 - 서로 다른 프로젝트는 `max_workers` 범위에서 병렬로 처리한다
 - `max_workers` 기본값은 3이며 `config/config.ini`에서 변경할 수 있다
@@ -302,6 +307,9 @@ BLOCKED → PR_OPEN (같은 PR을 사용자가 다시 열음)
 - Reviewer의 blocking issue가 없어야 한다
 - 같은 ExecPlan branch에 기존 PR이 있으면 이를 복구해 사용하고 중복 PR을 생성하지 않는다
 - 프로그램은 PR을 자동으로 Merge하지 않는다
+- Merge commit, Squash merge와 Rebase merge를 모두 정상 Merge로 처리하며 Merge 방식만으로 관리 worktree를 보존하지 않는다
+- Merge된 PR의 head와 관리 worktree를 대조해 PR 이후의 로컬 전용 commit이 없고 worktree가 clean이면 원격 head branch의 존재 여부와 관계없이 worktree를 자동 정리한다
+- 미커밋 변경, PR 이후의 로컬 전용 commit 또는 안전 여부를 확인할 수 없는 상태만 `cleanup_pending`으로 보존한다
 
 ### 프로젝트 완료 조건
 

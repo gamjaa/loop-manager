@@ -79,9 +79,12 @@ depends_on:
   - G-001
 complexity: medium
 risk: high
+priority: high
 ```
 
-프로그램은 전체 YAML을 지원하지 않고 위 key/value, `sources` 목록과 `depends_on` 목록만 파싱한다. 선행 작업이 없으면 `depends_on: []`로 기록한다. `id`, `title`, 하나 이상의 `sources`, `depends_on`, 유효한 `complexity`와 `risk`가 없으면 ExecPlan을 등록하지 않는다. 존재하지 않는 ID, 자기 의존과 순환 의존도 거부한다. 실행 상태와 재시도 횟수는 frontmatter에 쓰지 않는다.
+프로그램은 전체 YAML을 지원하지 않고 위 key/value, `sources` 목록과 `depends_on` 목록만 파싱한다. 선행 작업이 없으면 `depends_on: []`로 기록한다. `id`, `title`, 하나 이상의 `sources`, `depends_on`, 유효한 `complexity`, `risk`와 `priority`가 없으면 새 ExecPlan을 등록하지 않는다. 존재하지 않는 ID, 자기 의존과 순환 의존도 거부한다. 실행 상태와 재시도 횟수는 frontmatter에 쓰지 않는다.
+
+priority는 `critical`, `high`, `normal`, `low` 순이며 안전한 무인 실행 차단 또는 반복적인 수동 복구는 `critical`, 정상 경로의 사용자 개입을 없애는 핵심 자동화는 `high`, 그 밖의 Current Goal과 필수 유지보수는 `normal`, 선택적 편의와 최적화는 `low`로 기록한다. 이 기능 전에 작성된 ExecPlan에는 `normal`을 적용해 호환성을 유지한다. priority 형식은 공통 `docs/PLANS.md`와 파서를 같은 구현 변경에서 함께 갱신한다.
 
 ## Source of Truth
 
@@ -121,8 +124,8 @@ Loop Manager는 등록 프로젝트 기본 worktree의 파일, index와 HEAD를 
 
 ExecPlan 하나의 실행 흐름은 다음과 같다.
 
-1. 실행 중인 작업과 대기 중인 READY ExecPlan이 없으면 `<state-dir>/worktrees/<project-id>/planning/<input-fingerprint>/`에 `origin/<base-branch>` 기준의 detached planning worktree를 만든다
-2. Planner가 planning worktree의 `docs/plans/*.md`에 필요한 ExecPlan을 하나 이상 작성한다
+1. 실행 중인 작업이 없고 계획 입력이 변경됐으면 READY ExecPlan의 존재와 관계없이 `<state-dir>/worktrees/<project-id>/planning/<input-fingerprint>/`에 `origin/<base-branch>` 기준의 detached planning worktree를 만든다
+2. Planner가 기존 ExecPlan 카탈로그와 현재 입력을 대조하고 식별 가능한 미충족 작업 전체를 독립적인 ExecPlan으로 나누어 priority와 `depends_on`을 포함해 일괄 작성한다
 3. 프로그램이 Planner의 변경 범위, ExecPlan 메타데이터와 의존성 그래프를 코드로 검증한다
 4. 검증에 실패하면 오류를 같은 Planner 세션에 전달하고 최대 3회까지 수정과 재검증을 수행한다
 5. 계속 실패하면 원인과 계획 입력 지문을 프로젝트의 `planning_error`에 저장하고 planning worktree와 세션을 보존한 뒤 처리를 중단한다
@@ -133,7 +136,7 @@ ExecPlan 하나의 실행 흐름은 다음과 같다.
 10. 기준이 그대로면 계획 commit을 `origin/<base-branch>`에 fast-forward push한다. force push는 사용하지 않는다
 11. push된 commit을 원격에서 확인한 뒤에만 각 ExecPlan을 SQLite에 READY 상태로 등록하고 `planning_error`를 지운다. push 후 SQLite 기록 전에 중단된 경우 원격의 ExecPlan을 다시 파싱해 복구한다
 12. planning worktree를 제거한다
-13. 모든 `depends_on`이 MERGED인 READY ExecPlan 하나를 선택한다
+13. 모든 `depends_on`이 MERGED인 READY ExecPlan 중 priority가 가장 높은 계획을 선택하고, 같은 priority에서는 숫자 ID가 가장 작은 계획을 선택한다
 14. 갱신된 `origin/<base-branch>`에서 `loop-manager/<execplan-id>` branch와 `<state-dir>/worktrees/<project-id>/<execplan-id>/` worktree를 만든다
 15. branch나 worktree가 이미 있으면 새로 만들지 않고 SQLite 및 Git 상태와 대조해 복구한다
 16. Worker가 해당 worktree에서 구현, 관련 테스트와 verify 스크립트를 작성하고 필요한 PRODUCT, 선택된 ExecPlan 기록과 FUTURE_IDEAS를 갱신한다
@@ -152,8 +155,9 @@ ExecPlan 파일은 구현 PR에 처음 포함하지 않는다. Planner 단계에
 ## 동시 실행
 
 - 하나의 프로젝트에는 여러 READY ExecPlan이 존재할 수 있지만 활성 ExecPlan, branch, worktree와 Worker는 하나만 존재한다
+- 계획 입력이 변경되면 활성 작업을 선점하지 않으며, 다음 Worker 선택 전에 기존 READY 계획을 포함한 전체 카탈로그를 갱신한다
 - READY ExecPlan은 모든 `depends_on`이 MERGED일 때만 실행 후보가 된다
-- 실행 가능한 READY ExecPlan이 여럿이면 숫자 ExecPlan ID가 가장 작은 계획을 먼저 선택한다
+- 실행 가능한 READY ExecPlan이 여럿이면 priority가 높은 계획을 먼저 선택하고 같은 priority에서는 숫자 ExecPlan ID가 가장 작은 계획을 선택한다
 - 각 ExecPlan은 `loop-manager/<execplan-id>` 형식의 고유한 branch와 별도 관리 worktree를 사용한다
 - PR_OPEN 또는 BLOCKED 프로젝트에서는 다른 ExecPlan을 시작하거나 Planner를 다시 실행하지 않는다
 - 서로 다른 프로젝트만 병렬로 처리한다
@@ -166,7 +170,8 @@ ExecPlan 파일은 구현 PR에 처음 포함하지 않는다. Planner 단계에
 
 - Planner, Worker와 Reviewer prompt는 Loop Manager에 내장한다
 - 프로젝트별 prompt 재정의는 지원하지 않는다
-- Planner는 PRODUCT, 활성 Requirement, ARCHITECTURE, 현재 코드와 완료되거나 대기 중인 ExecPlan을 읽고 필요한 ExecPlan을 하나 이상 작성할 수 있다
+- Planner는 PRODUCT, 활성 Requirement, ARCHITECTURE, 현재 코드와 완료되거나 대기 중인 ExecPlan을 읽고 현재 식별 가능한 미충족 작업 전체를 한 계획 주기에 작성한다
+- Planner는 안전한 무인 실행 차단과 반복적인 사용자 복구 제거를 최우선으로 priority를 정하고, 정상 경로 자동화, 그 밖의 Current Goal, 선택적 편의와 최적화 순으로 계획한다
 - Planner는 `docs/plans/*.md`만 생성하거나 수정할 수 있으며 프로그램이 실행 전후 diff로 범위를 검증한다
 - Worker는 ExecPlan을 구현하고 관련 테스트와 전체 검증 스크립트를 작성하거나 갱신한다. 장기 제품 규칙이 바뀔 때만 PRODUCT를, 진행 기록이 필요할 때만 선택된 ExecPlan을 수정할 수 있으며 범위 밖 아이디어는 FUTURE_IDEAS에 기록할 수 있다
 - Worker는 전체 검증 스크립트를 직접 실행하지 않는다
@@ -250,7 +255,9 @@ BLOCKED → PR_OPEN
 - PR이 Merge 없이 닫히면 BLOCKED로 전이한다
 - 닫힌 PR은 프로그램이 새 PR로 대체하지 않으며 사용자가 같은 PR을 다시 열어야 한다
 - PR Merge 후 ExecPlan을 MERGED로 전이하고 `git fetch`로 `origin/<base-branch>`가 갱신된 것을 확인한 뒤 의존성이 충족된 다음 READY 계획을 시작한다
-- Merge된 worktree에 미커밋 또는 미푸시 변경이 남아 있으면 제거하지 않고 `cleanup_pending`에 경로와 원인을 기록한다
+- PR의 Merge 상태와 head commit을 기준으로 관리 worktree의 commit이 모두 PR에 push됐는지 확인한다. base branch의 commit ancestry는 Merge commit에서만 성립하므로 push 여부 판단에 사용하지 않는다
+- Merge commit, Squash merge와 Rebase merge 모두에서 worktree가 clean하고 로컬 HEAD가 PR head보다 앞서지 않았으면 원격 head branch가 삭제됐더라도 관리 worktree를 자동 제거한다
+- 미커밋 변경, PR head에 없는 로컬 commit 또는 안전 여부를 확인할 수 없는 상태가 남아 있으면 제거하지 않고 `cleanup_pending`에 경로와 구체적인 원인을 기록한다
 
 ## Telegram 알림
 
@@ -272,7 +279,8 @@ Telegram token과 chat ID가 모두 설정된 경우에만 알림 이벤트와 �
 - 모든 계획과 구현 변경은 Loop Manager가 만든 관리 worktree 안에서만 수행한다
 - AI Agent가 접근하고 수정할 수 있는 경로를 해당 관리 worktree로 제한한다
 - `git fetch`와 `git worktree add/remove`는 공유 Git metadata만 변경하며 기본 worktree의 파일, index와 HEAD는 변경하지 않아야 한다
-- 관리 worktree는 미커밋 또는 미푸시 변경이 없을 때만 강제 옵션 없이 제거한다. MERGED된 worktree에 변경이 남아 있으면 보존하고 `cleanup_pending`으로 기록한다
+- 관리 worktree는 미커밋 변경과 PR head에 없는 로컬 commit이 없다고 확인된 때만 강제 옵션 없이 제거한다. base branch ancestry나 GitHub Merge 방식은 push 여부 판정에 사용하지 않는다
+- PR head 정보나 commit 관계를 확인할 수 없으면 worktree를 보존하고 `cleanup_pending`으로 기록한다
 - `cleanup_pending` worktree가 이후 clean해지거나 경로가 사라지면 기록을 지우고 강제 옵션 없이 정리한다
 - planning worktree는 Planner만 수정할 수 있으므로 검증 실패 기록과 diff를 보존한 뒤 새 계획 입력으로 재시작할 때 폐기할 수 있다
 - Merge된 로컬 관리 branch만 비강제 삭제할 수 있으며 원격 branch는 자동으로 삭제하지 않는다
