@@ -120,6 +120,11 @@ risk: medium
                 "Effort 설정이 비어",
             ),
             (
+                "unsupported-effort",
+                "[codex.models]\nfast = model-fast\n[codex.worker]\nlevel1 = fast,invalid\n",
+                "Effort를 Codex CLI가 지원하지 않습니다: invalid",
+            ),
+            (
                 "missing-alias",
                 "[codex.models]\nfast = model-fast\n[codex.worker]\nlevel1 = strong,high\n",
                 "Model alias가 .* 없습니다",
@@ -167,16 +172,16 @@ risk: medium
         self.assertEqual(arguments[arguments.index("-m") + 1], "gpt-5.6-terra")
         self.assertIn('model_reasoning_effort="high"', arguments)
 
-    def test_worker_config_error_happens_before_codex_starts(self):
+    def test_unsupported_worker_effort_fails_before_codex_starts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = root / "config.ini"
             config.write_text(
-                "[codex.models]\nfast = model-fast\n[codex.worker]\nlevel1 = fast\n",
+                "[codex.models]\nfast = model-fast\n[codex.worker]\nlevel1 = fast,invalid\n",
                 encoding="utf-8",
             )
             with mock.patch("loop_manager.subprocess.run") as run:
-                with self.assertRaisesRegex(RuntimeError, "Model alias,Effort"):
+                with self.assertRaisesRegex(RuntimeError, "Effort를 Codex CLI가 지원하지 않습니다"):
                     loop_manager.run_codex(
                         root / "worktree",
                         root / "state",

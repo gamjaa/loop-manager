@@ -19,6 +19,7 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parent
+CODEX_EFFORTS = frozenset({"minimal", "low", "medium", "high", "xhigh"})
 FIELDS = {
     "base_branch",
     "processed_sha",
@@ -316,6 +317,8 @@ def codex_profile(config_path: Path, section: str, name: str, label: str) -> tup
         raise RuntimeError(f"{label} Model alias 설정이 비어 있습니다.")
     if not effort:
         raise RuntimeError(f"{label} Effort 설정이 비어 있습니다.")
+    if effort not in CODEX_EFFORTS:
+        raise RuntimeError(f"{label} Effort를 Codex CLI가 지원하지 않습니다: {effort}")
     if "codex.models" not in parser:
         raise RuntimeError(f"{label} Model alias section [codex.models]가 없습니다.")
     if alias not in parser["codex.models"]:
