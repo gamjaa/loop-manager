@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import configparser
 import contextlib
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -18,10 +19,17 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parent
+MAX_PLANNER_VALIDATION_RETRIES = 3
 FIELDS = {
     "base_branch",
     "processed_sha",
     "planning_fingerprint",
+    "planning_attempt_fingerprint",
+    "planning_retry_count",
+    "planner_session_id",
+    "planning_validation_error",
+    "planning_error",
+    "planning_error_fingerprint",
     "active_sha",
     "phase",
     "branch",
@@ -37,6 +45,12 @@ CREATE TABLE IF NOT EXISTS projects (
     base_branch TEXT NOT NULL,
     processed_sha TEXT,
     planning_fingerprint TEXT,
+    planning_attempt_fingerprint TEXT,
+    planning_retry_count INTEGER NOT NULL DEFAULT 0,
+    planner_session_id TEXT,
+    planning_validation_error TEXT,
+    planning_error TEXT,
+    planning_error_fingerprint TEXT,
     active_sha TEXT,
     phase TEXT,
     branch TEXT,
@@ -46,6 +60,17 @@ CREATE TABLE IF NOT EXISTS projects (
     last_error TEXT
 )
 """
+
+
+@dataclass(frozen=True)
+class CodexResult:
+    code: int
+    message: str
+    session_id: str | None = None
+
+    def __iter__(self):
+        # Keep two-value unpacking compatible with callers that do not manage sessions.
+        return iter((self.code, self.message))
 
 
 def state_directory(value: str | None = None) -> Path:
@@ -113,6 +138,12 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
     migrations = {
         "plan_path": "TEXT",
         "planning_fingerprint": "TEXT",
+        "planning_attempt_fingerprint": "TEXT",
+        "planning_retry_count": "INTEGER NOT NULL DEFAULT 0",
+        "planner_session_id": "TEXT",
+        "planning_validation_error": "TEXT",
+        "planning_error": "TEXT",
+        "planning_error_fingerprint": "TEXT",
     }
     for column, definition in migrations.items():
         if column not in columns:
@@ -591,7 +622,9 @@ def run_codex(
     *,
     read_only: bool,
     level: int | None = None,
-) -> tuple[int, str]:
+    persist_session: bool = False,
+    session_id: str | None = None,
+) -> tuple[int, str] | CodexResult:
     if role_name == "worker":
         if level is None:
             raise RuntimeError("Codex Worker level이 없습니다.")
@@ -605,21 +638,37 @@ def run_codex(
     last_message = project_dir / f"{role_name}-last.txt"
     log = project_dir / f"{role_name}.log"
     last_message.unlink(missing_ok=True)
-    arguments = [
-        "codex",
-        "exec",
-        "--ephemeral",
-        *codex_sandbox_arguments(read_only),
-        "-C",
-        str(worktree),
-        "-m",
-        model,
-        "-c",
-        f'model_reasoning_effort="{effort}"',
-        "-o",
-        str(last_message),
-        "-",
-    ]
+    if session_id:
+        arguments = [
+            "codex",
+            "exec",
+            "resume",
+            "--json",
+            "-m",
+            model,
+            "-c",
+            f'model_reasoning_effort="{effort}"',
+            "-o",
+            str(last_message),
+            session_id,
+            "-",
+        ]
+    else:
+        arguments = [
+            "codex",
+            "exec",
+            *(["--json"] if persist_session else ["--ephemeral"]),
+            *codex_sandbox_arguments(read_only),
+            "-C",
+            str(worktree),
+            "-m",
+            model,
+            "-c",
+            f'model_reasoning_effort="{effort}"',
+            "-o",
+            str(last_message),
+            "-",
+        ]
     with log.open("w", encoding="utf-8") as output:
         result = subprocess.run(
             arguments,
@@ -634,6 +683,25 @@ def run_codex(
     message = last_message.read_text(encoding="utf-8") if last_message.is_file() else ""
     if result.returncode and not message:
         message = log.read_text(encoding="utf-8")[-6000:]
+    resolved_session_id = session_id
+    if persist_session and not resolved_session_id:
+        for line in log.read_text(encoding="utf-8").splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") == "thread.started" and isinstance(
+                event.get("thread_id"), str
+            ):
+                resolved_session_id = event["thread_id"]
+                break
+        if result.returncode == 0 and not resolved_session_id:
+            return CodexResult(
+                1,
+                "Planner 실행 결과에서 세션 ID를 확인할 수 없습니다.",
+            )
+    if persist_session or session_id:
+        return CodexResult(result.returncode, message.strip(), resolved_session_id)
     return result.returncode, message.strip()
 
 
@@ -701,6 +769,77 @@ def clean_worktree(repo: Path, worktree: Path, base: str) -> bool:
     return True
 
 
+def planning_diagnostics_path(
+    state_dir: Path,
+    repo: str,
+    fingerprint: str,
+) -> Path:
+    project_id = hashlib.sha256(repo.encode()).hexdigest()[:16]
+    return state_dir / "logs" / project_id / "planning" / f"{fingerprint}.txt"
+
+
+def preserve_planning_diagnostics(
+    state_dir: Path,
+    repo: str,
+    row: sqlite3.Row,
+) -> Path:
+    fingerprint = row["planning_attempt_fingerprint"]
+    if not fingerprint:
+        fingerprint = row["planning_error_fingerprint"] or "unknown"
+    worktree = Path(row["worktree"]) if row["worktree"] else None
+    diff = ""
+    if worktree and worktree.is_dir():
+        try:
+            # Intent-to-add makes untracked Planner output visible in the archived diff.
+            git(worktree, "add", "--intent-to-add", "-A")
+            diff = git(worktree, "diff", "--binary", "HEAD").stdout
+        except RuntimeError as error:
+            diff = f"diff 보존 실패: {error}"
+    diagnostic = planning_diagnostics_path(state_dir, repo, fingerprint)
+    diagnostic.parent.mkdir(parents=True, exist_ok=True)
+    error = (
+        row["planning_error"]
+        or row["planning_validation_error"]
+        or row["last_error"]
+        or ""
+    )
+    diagnostic.write_text(
+        "\n".join(
+            [
+                f"input_fingerprint: {fingerprint}",
+                f"planning_worktree: {worktree or ''}",
+                f"planner_session_id: {row['planner_session_id'] or ''}",
+                f"validation_retries: {row['planning_retry_count']}",
+                "",
+                "last_error:",
+                str(error),
+                "",
+                "diff:",
+                diff,
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return diagnostic
+
+
+def clear_planning_validation_state(
+    connection: sqlite3.Connection,
+    repo: str,
+) -> None:
+    update_project(
+        connection,
+        repo,
+        planning_attempt_fingerprint=None,
+        planning_retry_count=0,
+        planner_session_id=None,
+        planning_validation_error=None,
+        planning_error=None,
+        planning_error_fingerprint=None,
+        last_error=None,
+    )
+
+
 def clear_active(
     connection: sqlite3.Connection,
     repo: str,
@@ -716,6 +855,12 @@ def clear_active(
         "plan_path": None,
         "pr_url": None,
         "last_error": None,
+        "planning_attempt_fingerprint": None,
+        "planning_retry_count": 0,
+        "planner_session_id": None,
+        "planning_validation_error": None,
+        "planning_error": None,
+        "planning_error_fingerprint": None,
     }
     if processed_sha is not None:
         values["processed_sha"] = processed_sha
@@ -804,9 +949,28 @@ def run_project(
         update_project(connection, repo, base_branch=base)
         row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
 
+    if row["planning_error"]:
+        if row["planning_error_fingerprint"] == current_fingerprint:
+            print(
+                f"계획 오류가 해결되지 않았습니다: {row['planning_error']}\n"
+                f"보존된 planning worktree: {row['worktree']}",
+                file=sys.stderr,
+            )
+            return 1
+        preserve_planning_diagnostics(state_dir, repo, row)
+        stale_worktree = Path(row["worktree"]) if row["worktree"] else None
+        if stale_worktree and stale_worktree.exists():
+            git(repo_path, "worktree", "remove", "--force", str(stale_worktree))
+        clear_active(connection, repo)
+        row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
+
     if row["phase"] == "PLANNING":
-        started_fingerprint = _planning_input_fingerprint(repo_path, row["active_sha"])
+        started_fingerprint = row["planning_attempt_fingerprint"]
+        if not started_fingerprint:
+            started_fingerprint = _planning_input_fingerprint(repo_path, row["active_sha"])
         if started_fingerprint != current_fingerprint:
+            if row["planning_validation_error"]:
+                preserve_planning_diagnostics(state_dir, repo, row)
             stale_worktree = Path(row["worktree"])
             if stale_worktree.exists():
                 git(repo_path, "worktree", "remove", "--force", str(stale_worktree))
@@ -836,6 +1000,12 @@ def run_project(
             connection,
             repo,
             active_sha=base_sha,
+            planning_attempt_fingerprint=current_fingerprint,
+            planning_retry_count=0,
+            planner_session_id=None,
+            planning_validation_error=None,
+            planning_error=None,
+            planning_error_fingerprint=None,
             phase="PLANNING",
             branch=None,
             worktree=str(worktree),
@@ -851,20 +1021,58 @@ def run_project(
         make_planning_worktree(repo_path, planning_worktree, base)
         head = git(planning_worktree, "rev-parse", "HEAD").stdout.strip()
         dirty_files = changed_files(planning_worktree)
-        if head == row["active_sha"] and (not dirty_files or row["last_error"]):
-            code, message = run_codex(
-                planning_worktree,
-                state_dir,
-                config_path,
-                "planner",
-                planner_prompt(row["last_error"]),
-                read_only=False,
-            )
+        if head == row["active_sha"] and (
+            not dirty_files or row["planning_validation_error"] or row["last_error"]
+        ) and not (
+            row["planning_validation_error"]
+            and row["planning_retry_count"] >= MAX_PLANNER_VALIDATION_RETRIES
+        ):
+            retrying_validation = bool(row["planning_validation_error"])
+            previous_retry_count = row["planning_retry_count"]
+            if retrying_validation:
+                update_project(
+                    connection,
+                    repo,
+                    planning_retry_count=previous_retry_count + 1,
+                )
+            try:
+                result = run_codex(
+                    planning_worktree,
+                    state_dir,
+                    config_path,
+                    "planner",
+                    planner_prompt(row["planning_validation_error"] or row["last_error"]),
+                    read_only=False,
+                    persist_session=True,
+                    session_id=row["planner_session_id"],
+                )
+            except Exception:
+                if retrying_validation:
+                    update_project(
+                        connection,
+                        repo,
+                        planning_retry_count=previous_retry_count,
+                    )
+                raise
+            code, message = result
+            result_session_id = getattr(result, "session_id", None)
+            if result_session_id:
+                update_project(
+                    connection,
+                    repo,
+                    planner_session_id=result_session_id,
+                )
             if code:
-                update_project(connection, repo, last_error=message or f"Planner 종료 코드 {code}")
+                values = {"last_error": message or f"Planner 종료 코드 {code}"}
+                if retrying_validation:
+                    values["planning_retry_count"] = previous_retry_count
+                update_project(connection, repo, **values)
                 print(message or "Planner 실행에 실패했습니다.", file=sys.stderr)
                 return 1
             update_project(connection, repo, last_error=None)
+            row = connection.execute(
+                "SELECT * FROM projects WHERE repo = ?", (repo,)
+            ).fetchone()
             dirty_files = changed_files(planning_worktree)
 
         try:
@@ -893,10 +1101,21 @@ def run_project(
                 plan_path = planned_files[0]
                 plan = validate_execplan(planning_worktree, plan_path)
         except RuntimeError as error:
-            update_project(connection, repo, last_error=str(error))
+            validation_error = str(error)
+            values = {
+                "planning_validation_error": validation_error,
+                "last_error": None,
+            }
+            if row["planning_retry_count"] >= MAX_PLANNER_VALIDATION_RETRIES:
+                values.update(
+                    planning_error=validation_error,
+                    planning_error_fingerprint=current_fingerprint,
+                )
+            update_project(connection, repo, **values)
             print(str(error), file=sys.stderr)
             return 1
 
+        clear_planning_validation_state(connection, repo)
         plan_commit = git(planning_worktree, "rev-parse", "HEAD").stdout.strip()
         git(repo_path, "fetch", "origin")
         latest_sha = git(repo_path, "rev-parse", f"origin/{base}").stdout.strip()
