@@ -52,6 +52,63 @@ Test plan.
     return plan
 
 
+def git_command(repo: Path, *arguments: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo), *arguments],
+        check=True,
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    return result.stdout.strip()
+
+
+def make_remote_repository(directory: str) -> Path:
+    parent = Path(directory)
+    remote = parent / "remote.git"
+    repo = parent / "repo"
+    subprocess.run(
+        ["git", "init", "--bare", "--initial-branch=main", str(remote)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    repo.mkdir()
+    git_command(repo, "init", "--initial-branch=main")
+    git_command(repo, "config", "user.email", "loop-manager@example.com")
+    git_command(repo, "config", "user.name", "Loop Manager Test")
+    git_command(repo, "remote", "add", "origin", str(remote))
+
+    files = {
+        "AGENTS.md": "# Agents\n",
+        "README.md": "# Readme\n",
+        "config/settings.ini": "setting=true\n",
+        "docs/ARCHITECTURE.md": "# Architecture\n",
+        "docs/PLANS.md": "# Plans\n",
+        "docs/PRODUCT.md": "# Product\n",
+        "docs/notes.md": "# Notes\n",
+        "docs/requirements/Active.md": "# Active\n",
+        "docs/requirements/archive/Old.md": "# Old\n",
+        "src/app.py": "VALUE = 1\n",
+        "tests/test_app.py": "def test_app(): pass\n",
+    }
+    for relative_path, contents in files.items():
+        path = repo / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents, encoding="utf-8")
+    git_command(repo, "add", "-A")
+    git_command(repo, "commit", "-m", "Initial")
+    git_command(repo, "push", "-u", "origin", "main")
+    return repo
+
+
+def commit_and_push(repo: Path, message: str) -> None:
+    git_command(repo, "add", "-A")
+    git_command(repo, "commit", "-m", message)
+    git_command(repo, "push", "origin", "HEAD:main")
+
+
 class LoopManagerTest(unittest.TestCase):
     def test_codex_uses_mutually_exclusive_sandbox_options(self):
         self.assertEqual(loop_manager.codex_sandbox_arguments(False), ["--approve-for-me"])
@@ -63,10 +120,278 @@ class LoopManagerTest(unittest.TestCase):
         connection.execute(loop_manager.SCHEMA)
         connection.execute("INSERT INTO projects (repo, base_branch) VALUES ('repo', 'main')")
 
-        loop_manager.update_project(connection, "repo", phase="WORKING", active_sha="abc")
+        loop_manager.update_project(
+            connection,
+            "repo",
+            phase="WORKING",
+            active_sha="abc",
+            planning_fingerprint="fingerprint",
+        )
 
         row = connection.execute("SELECT * FROM projects WHERE repo = 'repo'").fetchone()
-        self.assertEqual((row["phase"], row["active_sha"]), ("WORKING", "abc"))
+        self.assertEqual(
+            (row["phase"], row["active_sha"], row["planning_fingerprint"]),
+            ("WORKING", "abc", "fingerprint"),
+        )
+
+    def test_existing_database_adds_planning_fingerprint_without_losing_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            database = sqlite3.connect(state_dir / "loop-manager.db")
+            database.execute(
+                """
+                CREATE TABLE projects (
+                    repo TEXT PRIMARY KEY,
+                    base_branch TEXT NOT NULL,
+                    processed_sha TEXT,
+                    active_sha TEXT,
+                    phase TEXT,
+                    branch TEXT,
+                    worktree TEXT,
+                    pr_url TEXT,
+                    last_error TEXT
+                )
+                """
+            )
+            database.execute(
+                "INSERT INTO projects (repo, base_branch, phase) VALUES ('repo', 'main', 'WORKING')"
+            )
+            database.commit()
+            database.close()
+
+            with loop_manager.connect_database(state_dir) as connection:
+                columns = {
+                    row[1] for row in connection.execute("PRAGMA table_info(projects)")
+                }
+                row = connection.execute(
+                    "SELECT * FROM projects WHERE repo = 'repo'"
+                ).fetchone()
+
+        self.assertIn("plan_path", columns)
+        self.assertIn("planning_fingerprint", columns)
+        self.assertEqual((row["base_branch"], row["phase"]), ("main", "WORKING"))
+        self.assertIsNone(row["planning_fingerprint"])
+
+    def test_planning_input_path_boundary(self):
+        cases = {
+            b"AGENTS.md": True,
+            b"docs/PRODUCT.md": True,
+            b"docs/ARCHITECTURE.md": True,
+            b"docs/requirements/Active.md": True,
+            b"README.md": True,
+            b"docs/requirements/.md": True,
+            b".github/workflows/test.yml": True,
+            b"src/app.py": True,
+            b"docs/PLANS.md": False,
+            b"docs/FUTURE_IDEAS.md": False,
+            b"docs/plans/[G-999] Ignored.md": False,
+            b"docs/requirements/archive/Old.md": False,
+            b"docs/requirements/nested/Requirement.md": False,
+            b"docs/requirements/NotMarkdown.txt": False,
+        }
+        for path, expected in cases.items():
+            with self.subTest(path=path):
+                self.assertEqual(loop_manager._is_planning_input(path), expected)
+
+    def test_planning_input_digest_is_ordered_and_unambiguous(self):
+        entries = [(b"src/b.py", b"two"), (b"src/a.py", b"one")]
+
+        fingerprint = loop_manager._planning_input_digest(entries)
+
+        self.assertEqual(fingerprint, loop_manager._planning_input_digest(list(reversed(entries))))
+        self.assertEqual(len(fingerprint), 64)
+        self.assertNotEqual(
+            loop_manager._planning_input_digest([(b"a", b"bc")]),
+            loop_manager._planning_input_digest([(b"ab", b"c")]),
+        )
+        self.assertNotEqual(
+            loop_manager._planning_input_digest([(b"src/a.py", b"one")]),
+            loop_manager._planning_input_digest([(b"src/renamed.py", b"one")]),
+        )
+
+    def test_planning_input_fingerprint_uses_origin_tree_and_input_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            initial = loop_manager.planning_input_fingerprint(repo, "main")
+
+            (repo / "src/app.py").write_text("VALUE = 99\n", encoding="utf-8")
+            self.assertEqual(loop_manager.planning_input_fingerprint(repo, "main"), initial)
+            (repo / "src/app.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+            (repo / "docs/notes.md").write_text("# Changed notes\n", encoding="utf-8")
+            commit_and_push(repo, "Change excluded documentation")
+            self.assertEqual(loop_manager.planning_input_fingerprint(repo, "main"), initial)
+
+            (repo / "docs/PRODUCT.md").write_text("# Changed product\n", encoding="utf-8")
+            commit_and_push(repo, "Change product")
+            changed = loop_manager.planning_input_fingerprint(repo, "main")
+            self.assertNotEqual(changed, initial)
+
+            git_command(repo, "checkout", "--detach", "HEAD^")
+            self.assertNotEqual(
+                git_command(repo, "rev-parse", "HEAD"),
+                git_command(repo, "rev-parse", "origin/main"),
+            )
+            self.assertEqual(loop_manager.planning_input_fingerprint(repo, "main"), changed)
+
+            git_command(repo, "checkout", "main")
+            (repo / "src/app.py").rename(repo / "src/renamed.py")
+            commit_and_push(repo, "Rename source")
+            self.assertNotEqual(loop_manager.planning_input_fingerprint(repo, "main"), changed)
+
+    def test_planner_no_change_saves_fingerprint_and_skip_gate_uses_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            state_dir = Path(directory) / "state"
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.run_codex", return_value=(0, "")
+            ) as planner:
+                self.assertEqual(
+                    loop_manager.run_project(
+                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                    ),
+                    0,
+                )
+                first = connection.execute(
+                    "SELECT planning_fingerprint FROM projects WHERE repo = ?", (str(repo),)
+                ).fetchone()["planning_fingerprint"]
+                self.assertIsNotNone(first)
+                self.assertEqual(planner.call_count, 1)
+
+                planner.reset_mock()
+                self.assertEqual(
+                    loop_manager.run_project(
+                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                    ),
+                    0,
+                )
+                planner.assert_not_called()
+
+                (repo / "docs/notes.md").write_text("# Other notes\n", encoding="utf-8")
+                commit_and_push(repo, "Change excluded docs again")
+                self.assertEqual(
+                    loop_manager.run_project(
+                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                    ),
+                    0,
+                )
+                planner.assert_not_called()
+
+                (repo / "src/app.py").write_text("VALUE = 2\n", encoding="utf-8")
+                commit_and_push(repo, "Change source")
+                self.assertEqual(
+                    loop_manager.run_project(
+                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                    ),
+                    0,
+                )
+                self.assertEqual(planner.call_count, 1)
+
+            second = connection.execute(
+                "SELECT planning_fingerprint FROM projects WHERE repo = ?", (str(repo),)
+            ).fetchone()["planning_fingerprint"]
+            self.assertNotEqual(second, first)
+
+    def test_planner_failure_and_invalid_result_do_not_save_fingerprint(self):
+        def fail_planner(_worktree, *_args, **_kwargs):
+            return 1, "planner failed"
+
+        def write_invalid_file(worktree, *_args, **_kwargs):
+            (worktree / "unexpected.txt").write_text("invalid\n", encoding="utf-8")
+            return 0, ""
+
+        for name, planner_effect in (
+            ("failure", fail_planner),
+            ("invalid-result", write_invalid_file),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                repo = make_remote_repository(directory)
+                state_dir = Path(directory) / "state"
+                connection = sqlite3.connect(":memory:")
+                connection.row_factory = sqlite3.Row
+                connection.execute(loop_manager.SCHEMA)
+
+                with mock.patch(
+                    "loop_manager.validate_repository", return_value=repo
+                ), mock.patch(
+                    "loop_manager.remote_base", return_value="main"
+                ), mock.patch(
+                    "loop_manager.ensure_safe_base_worktree"
+                ), mock.patch(
+                    "loop_manager.run_codex", side_effect=planner_effect
+                ) as planner:
+                    for _attempt in range(2):
+                        self.assertEqual(
+                            loop_manager.run_project(
+                                connection,
+                                state_dir,
+                                str(repo),
+                                Path("unused.ini"),
+                                "main",
+                                False,
+                            ),
+                            1,
+                        )
+
+                row = connection.execute(
+                    "SELECT phase, planning_fingerprint FROM projects WHERE repo = ?",
+                    (str(repo),),
+                ).fetchone()
+                self.assertEqual(planner.call_count, 2)
+                self.assertEqual(row["phase"], "PLANNING")
+                self.assertIsNone(row["planning_fingerprint"])
+
+    def test_new_execplan_does_not_save_completed_input_fingerprint(self):
+        roles = []
+
+        def agent(worktree, _state, _config, role_name, _prompt, **_kwargs):
+            roles.append(role_name)
+            if role_name == "planner":
+                (worktree / "docs/plans").mkdir(parents=True, exist_ok=True)
+                write_execplan(worktree, "G-001", "Generated")
+                return 0, ""
+            return 1, "stop after planning"
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            state_dir = Path(directory) / "state"
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.run_codex", side_effect=agent
+            ):
+                self.assertEqual(
+                    loop_manager.run_project(
+                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                    ),
+                    1,
+                )
+
+            row = connection.execute(
+                "SELECT phase, planning_fingerprint FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(roles, ["planner", "worker"])
+            self.assertEqual(row["phase"], "WORKING")
+            self.assertIsNone(row["planning_fingerprint"])
 
     def test_execplan_frontmatter_parser(self):
         values = loop_manager.parse_frontmatter(
