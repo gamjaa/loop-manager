@@ -473,6 +473,15 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                 (repo / "docs/plans").mkdir()
                 write_execplan(repo, "G-001", "Queued", priority="high")
                 commit_and_push(repo, "Add queued plan")
+                external_repo = Path(directory) / "external"
+                git_command(
+                    repo,
+                    "clone",
+                    str(Path(directory) / "remote.git"),
+                    str(external_repo),
+                )
+                git_command(external_repo, "config", "user.email", "user@example.com")
+                git_command(external_repo, "config", "user.name", "External User")
                 state_dir = Path(directory) / "state"
                 connection = self._connection(str(repo))
                 self._insert_plan(
@@ -487,11 +496,13 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                 roles = []
 
                 def advance_remote():
-                    (repo / "src/app.py").write_text(
+                    git_command(external_repo, "fetch", "origin")
+                    git_command(external_repo, "merge", "--ff-only", "origin/main")
+                    (external_repo / "src/app.py").write_text(
                         "VALUE = 2\n",
                         encoding="utf-8",
                     )
-                    commit_and_push(repo, "Change input during planning")
+                    commit_and_push(external_repo, "Change input during planning")
 
                 def agent(worktree, _state, _config, role_name, _prompt, **_kwargs):
                     roles.append(role_name)
@@ -3417,6 +3428,153 @@ class AgentScopeValidatorTest(unittest.TestCase):
                         selected_plan_path=plan_path,
                     )
 
+    def test_shared_git_metadata_changes_are_rejected(self):
+        scenarios = (
+            (
+                "branch",
+                lambda repo, _root: git_command(
+                    repo, "branch", "agent-created"
+                ),
+                "refs",
+                r"공유 Git refs 변경 .*refs/heads/agent-created",
+            ),
+            (
+                "tag",
+                lambda repo, _root: git_command(repo, "tag", "agent-tag"),
+                "refs",
+                r"공유 Git refs 변경 .*refs/tags/agent-tag",
+            ),
+            (
+                "worktree",
+                lambda repo, root: git_command(
+                    repo,
+                    "worktree",
+                    "add",
+                    "--detach",
+                    str(root / "agent-worktree"),
+                    "HEAD",
+                ),
+                "worktrees",
+                r"Git worktree 등록 변경 .*agent-worktree",
+            ),
+        )
+        for name, mutate, state_field, expected in scenarios:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, plan_path = self._repository_with_plan(directory)
+                before = loop_manager.capture_git_snapshot(repo)
+                self.assertEqual(
+                    loop_manager.GitSnapshot.deserialize(before.serialize()),
+                    before,
+                )
+
+                mutate(repo, root)
+                after = loop_manager.capture_git_snapshot(repo)
+
+                self.assertNotEqual(
+                    getattr(before, state_field),
+                    getattr(after, state_field),
+                )
+                with self.assertRaisesRegex(
+                    loop_manager.AgentScopeError,
+                    expected,
+                ):
+                    loop_manager.validate_agent_scope(
+                        "worker",
+                        repo,
+                        before,
+                        after,
+                        selected_plan_path=plan_path,
+                    )
+
+    def test_blocked_resume_does_not_excuse_agent_base_ref_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, plan_path = self._repository_with_plan(directory)
+            worktree = root / "managed"
+            loop_manager.make_worktree(
+                repo,
+                worktree,
+                "loop-manager/G-001",
+                "main",
+            )
+            before = loop_manager.capture_git_snapshot(worktree)
+            git_command(
+                worktree,
+                "update-ref",
+                "refs/remotes/origin/main",
+                "HEAD^",
+            )
+            blocked_result = loop_manager.capture_git_snapshot(worktree)
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                """
+                INSERT INTO projects (
+                    repo, base_branch, agent_role, agent_snapshot,
+                    agent_result_snapshot
+                ) VALUES (?, 'main', 'reviewer', ?, ?)
+                """,
+                (
+                    str(repo),
+                    before.serialize(),
+                    blocked_result.serialize(),
+                ),
+            )
+            connection.commit()
+
+            (repo / "docs/PRODUCT.md").write_text(
+                "# Product changed after blocked review\n",
+                encoding="utf-8",
+            )
+            commit_and_push(repo, "Change source after base ref mutation")
+
+            with self.assertRaisesRegex(
+                loop_manager.AgentScopeError,
+                r"refs/remotes/origin/main",
+            ):
+                loop_manager.validate_blocked_agent_scope(
+                    connection,
+                    repo,
+                    str(repo),
+                    "main",
+                    worktree,
+                    plan_path,
+                )
+
+    def test_index_flags_are_rejected_for_worker_allowed_path(self):
+        for option in ("--skip-worktree", "--assume-unchanged"):
+            with self.subTest(option=option), tempfile.TemporaryDirectory() as directory:
+                repo, plan_path = self._repository_with_plan(directory)
+                before = loop_manager.capture_git_snapshot(repo)
+
+                git_command(
+                    repo,
+                    "update-index",
+                    option,
+                    "--",
+                    "src/app.py",
+                )
+                after = loop_manager.capture_git_snapshot(repo)
+
+                self.assertNotEqual(
+                    before.index["src/app.py"],
+                    after.index["src/app.py"],
+                )
+                with self.assertRaisesRegex(
+                    loop_manager.AgentScopeError,
+                    r"src/app\.py .*index flags",
+                ):
+                    loop_manager.validate_agent_scope(
+                        "worker",
+                        repo,
+                        before,
+                        after,
+                        selected_plan_path=plan_path,
+                    )
+
+
     def test_existing_database_adds_persistent_agent_scope_fields(self):
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
@@ -3442,16 +3600,22 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     for row in connection.execute("PRAGMA table_info(projects)")
                 }
                 row = connection.execute(
-                    "SELECT agent_role, agent_snapshot, planning_workspace_owned "
+                    "SELECT agent_role, agent_snapshot, agent_result_snapshot, "
+                    "planning_workspace_owned "
                     "FROM projects "
                     "WHERE repo = 'repo'"
                 ).fetchone()
 
             self.assertTrue(
-                {"agent_role", "agent_snapshot", "planning_workspace_owned"}
+                {
+                    "agent_role",
+                    "agent_snapshot",
+                    "agent_result_snapshot",
+                    "planning_workspace_owned",
+                }
                 <= columns
             )
-            self.assertEqual(tuple(row), (None, None, 0))
+            self.assertEqual(tuple(row), (None, None, None, 0))
 
     def test_reviewer_mutation_blocks_even_when_verdict_passes(self):
 
@@ -3515,7 +3679,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 )
 
             project = connection.execute(
-                "SELECT phase, last_error, agent_role, agent_snapshot "
+                "SELECT phase, last_error, agent_role, agent_snapshot, "
+                "agent_result_snapshot "
                 "FROM projects WHERE repo = ?",
                 (str(repo),),
             ).fetchone()
@@ -3530,6 +3695,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
             self.assertEqual(plan["status"], "BLOCKED")
             self.assertEqual(project["agent_role"], "reviewer")
             self.assertIsNotNone(project["agent_snapshot"])
+            self.assertIsNotNone(project["agent_result_snapshot"])
             self.assertNotIn("keep for diagnosis", project["agent_snapshot"])
             self.assertIsNotNone(plan["blocked_fingerprint"])
             self.assertTrue((worktree / "reviewer.txt").is_file())
@@ -3560,7 +3726,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 )
 
             resumed_project = connection.execute(
-                "SELECT phase, last_error, agent_role, agent_snapshot "
+                "SELECT phase, last_error, agent_role, agent_snapshot, "
+                "agent_result_snapshot "
                 "FROM projects WHERE repo = ?",
                 (str(repo),),
             ).fetchone()
@@ -3576,6 +3743,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 resumed_project["last_error"],
             )
             self.assertIn("reviewer.txt", resumed_project["last_error"])
+            self.assertNotIn("공유 Git refs 변경", resumed_project["last_error"])
+            self.assertNotIn("Git worktree 등록 변경", resumed_project["last_error"])
             self.assertEqual(resumed_project["agent_role"], "reviewer")
             self.assertIsNotNone(resumed_project["agent_snapshot"])
             self.assertEqual(resumed_plan["status"], "BLOCKED")

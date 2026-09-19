@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 import configparser
 import contextlib
 import errno
@@ -55,6 +55,7 @@ FIELDS = {
     "last_error",
     "agent_role",
     "agent_snapshot",
+    "agent_result_snapshot",
 }
 
 SCHEMA = """
@@ -84,7 +85,8 @@ CREATE TABLE IF NOT EXISTS projects (
     pr_url TEXT,
     last_error TEXT,
     agent_role TEXT,
-    agent_snapshot TEXT
+    agent_snapshot TEXT,
+    agent_result_snapshot TEXT
 )
 """
 
@@ -170,17 +172,24 @@ class GitSnapshot:
     branch: str | None
     index: dict[str, tuple[str, ...]]
     dirty: dict[str, tuple[tuple[str, ...], str]]
+    refs: dict[str, tuple[str, str]]
+    worktrees: dict[str, tuple[str, ...]]
+    shared_metadata_complete: bool = True
 
     def serialize(self) -> str:
         return json.dumps(
             {
-                "version": 1,
+                "version": 2,
                 "head": self.head,
                 "branch": self.branch,
                 "index": {path: list(entries) for path, entries in self.index.items()},
                 "dirty": {
                     path: [list(kinds), signature]
                     for path, (kinds, signature) in self.dirty.items()
+                },
+                "refs": {name: list(state) for name, state in self.refs.items()},
+                "worktrees": {
+                    path: list(state) for path, state in self.worktrees.items()
                 },
             },
             ensure_ascii=True,
@@ -191,7 +200,8 @@ class GitSnapshot:
     @classmethod
     def deserialize(cls, value: str) -> GitSnapshot:
         parsed = json.loads(value)
-        if parsed.get("version") != 1:
+        version = parsed.get("version")
+        if version not in {1, 2}:
             raise RuntimeError("저장된 Agent Git snapshot 형식을 지원하지 않습니다.")
         return cls(
             head=str(parsed["head"]),
@@ -207,6 +217,15 @@ class GitSnapshot:
                 )
                 for path, state in parsed["dirty"].items()
             },
+            refs={
+                str(name): (str(state[0]), str(state[1]))
+                for name, state in parsed.get("refs", {}).items()
+            },
+            worktrees={
+                str(path): tuple(str(entry) for entry in state)
+                for path, state in parsed.get("worktrees", {}).items()
+            },
+            shared_metadata_complete=version == 2,
         )
 
 
@@ -360,6 +379,7 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
         "planning_error_fingerprint": "TEXT",
         "agent_role": "TEXT",
         "agent_snapshot": "TEXT",
+        "agent_result_snapshot": "TEXT",
     }
     for column, definition in migrations.items():
         if column not in columns:
@@ -1783,7 +1803,9 @@ def _nul_git_paths(repo: Path, *arguments: str) -> list[str]:
 
 def _index_entries(worktree: Path) -> dict[str, tuple[str, ...]]:
     entries: dict[str, list[str]] = {}
-    for record in git_bytes(worktree, "ls-files", "--stage", "-z").split(b"\0"):
+    for record in git_bytes(
+        worktree, "ls-files", "--stage", "-v", "-z"
+    ).split(b"\0"):
         if not record:
             continue
         metadata, separator, raw_path = record.partition(b"\t")
@@ -1796,6 +1818,71 @@ def _index_entries(worktree: Path) -> dict[str, tuple[str, ...]]:
         path: tuple(sorted(metadata))
         for path, metadata in entries.items()
     }
+
+
+def _non_default_index_flags(entries: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            entry.split(" ", 1)[0]
+            for entry in entries
+            if not entry.startswith("H ")
+        )
+    )
+
+
+def _shared_ref_entries(worktree: Path) -> dict[str, tuple[str, str]]:
+    refs: dict[str, tuple[str, str]] = {}
+    output = git(
+        worktree,
+        "for-each-ref",
+        "--format=%(refname)%00%(objectname)%00%(symref)",
+    ).stdout
+    for line in output.splitlines():
+        fields = line.split("\0")
+        if len(fields) != 3 or not fields[0]:
+            raise RuntimeError("Git ref snapshot을 해석할 수 없습니다.")
+        refname, objectname, symref = fields
+        if refname in refs:
+            raise RuntimeError(f"Git ref snapshot에 중복 ref가 있습니다: {refname}")
+        refs[refname] = (objectname, symref)
+    return refs
+
+
+def _registered_worktree_entries(
+    worktree: Path,
+) -> dict[str, tuple[str, ...]]:
+    entries: dict[str, tuple[str, ...]] = {}
+    for record in _worktree_catalog(worktree):
+        raw_path = record.get("worktree")
+        if not isinstance(raw_path, str) or not raw_path:
+            raise RuntimeError("Git worktree snapshot에 경로가 없습니다.")
+        path = str(_canonical_path(Path(raw_path)))
+        if path in entries:
+            raise RuntimeError(
+                f"Git worktree snapshot에 중복 경로가 있습니다: {path}"
+            )
+        entries[path] = tuple(
+            sorted(
+                f"{key}={value}"
+                for key, value in record.items()
+                if key != "worktree"
+            )
+        )
+    return entries
+
+
+def _metadata_changes_after_block(
+    before: Mapping[str, object],
+    blocked: Mapping[str, object],
+    current: Mapping[str, object],
+    candidates: frozenset[str],
+) -> frozenset[str]:
+    return frozenset(
+        key
+        for key in candidates
+        if before.get(key) == blocked.get(key)
+        and blocked.get(key) != current.get(key)
+    )
 
 
 def _path_signature(worktree: Path, relative_path: str) -> str:
@@ -1834,7 +1921,7 @@ def _path_signature(worktree: Path, relative_path: str) -> str:
 
 
 def capture_git_snapshot(worktree: Path) -> GitSnapshot:
-    """Capture HEAD, index, and dirty path state without staging any content."""
+    """Capture worktree and shared Git state without staging any content."""
 
     head = git(worktree, "rev-parse", "--verify", "HEAD").stdout.strip()
     branch_result = git(
@@ -1886,7 +1973,14 @@ def capture_git_snapshot(worktree: Path) -> GitSnapshot:
         path: (tuple(sorted(kinds)), _path_signature(worktree, path))
         for path, kinds in sorted(path_kinds.items())
     }
-    return GitSnapshot(head, branch, _index_entries(worktree), dirty)
+    return GitSnapshot(
+        head=head,
+        branch=branch,
+        index=_index_entries(worktree),
+        dirty=dirty,
+        refs=_shared_ref_entries(worktree),
+        worktrees=_registered_worktree_entries(worktree),
+    )
 
 
 def agent_snapshot_changes(
@@ -1896,8 +1990,14 @@ def agent_snapshot_changes(
 ) -> list[AgentChange]:
     changes: dict[str, set[str]] = {}
     for path in set(before.index) | set(after.index):
-        if before.index.get(path) != after.index.get(path):
+        before_entries = before.index.get(path, ())
+        after_entries = after.index.get(path, ())
+        if before_entries != after_entries:
             changes.setdefault(path, set()).add("index")
+            before_flags = _non_default_index_flags(before_entries)
+            after_flags = _non_default_index_flags(after_entries)
+            if before_flags != after_flags:
+                changes[path].add("index flags")
     for path in set(before.dirty) | set(after.dirty):
         if before.dirty.get(path) != after.dirty.get(path):
             before_kinds = before.dirty.get(path, ((), ""))[0]
@@ -1946,6 +2046,8 @@ def validate_agent_scope(
     after: GitSnapshot,
     *,
     selected_plan_path: str | None = None,
+    allowed_ref_changes: frozenset[str] = frozenset(),
+    allowed_worktree_changes: frozenset[str] = frozenset(),
 ) -> None:
     """Validate the net Git mutation made by one Agent role."""
 
@@ -1959,7 +2061,43 @@ def validate_agent_scope(
             f"{after.branch or 'detached'})"
         )
 
+    if not before.shared_metadata_complete or not after.shared_metadata_complete:
+        violations.append("공유 Git metadata 기준 snapshot 누락")
+    else:
+        metadata_states = (
+            (
+                "공유 Git refs",
+                before.refs,
+                after.refs,
+                allowed_ref_changes,
+            ),
+            (
+                "Git worktree 등록",
+                before.worktrees,
+                after.worktrees,
+                allowed_worktree_changes,
+            ),
+        )
+        for label, before_state, after_state, allowed_changes in metadata_states:
+            changed_keys = sorted(
+                key
+                for key in set(before_state) | set(after_state)
+                if before_state.get(key) != after_state.get(key)
+                and key not in allowed_changes
+            )
+            if changed_keys:
+                displayed = ", ".join(changed_keys[:8])
+                remainder = len(changed_keys) - 8
+                if remainder > 0:
+                    displayed += f", 외 {remainder}개"
+                violations.append(f"{label} 변경 ({displayed})")
+
     for change in changes:
+        if "index flags" in change.kinds:
+            violations.append(
+                f"{change.path} ({', '.join(change.kinds)})"
+            )
+            continue
         allowed = False
         if role_name == "planner":
             allowed = bool(
@@ -2010,12 +2148,19 @@ def begin_agent_scope(
         repo,
         agent_role=role_name,
         agent_snapshot=snapshot.serialize(),
+        agent_result_snapshot=None,
     )
     return snapshot
 
 
 def clear_agent_scope(connection: sqlite3.Connection, repo: str) -> None:
-    update_project(connection, repo, agent_role=None, agent_snapshot=None)
+    update_project(
+        connection,
+        repo,
+        agent_role=None,
+        agent_snapshot=None,
+        agent_result_snapshot=None,
+    )
 
 
 def validate_planning_workspace_identity(
@@ -2371,6 +2516,7 @@ def clear_planning_validation_state(
         last_error=None,
         agent_role=None,
         agent_snapshot=None,
+        agent_result_snapshot=None,
     )
 
 
@@ -2402,6 +2548,7 @@ def _clear_active_values(
         "planning_error_fingerprint": None,
         "agent_role": None,
         "agent_snapshot": None,
+        "agent_result_snapshot": None,
     }
     if processed_sha is not None:
         values["processed_sha"] = processed_sha
@@ -2540,7 +2687,8 @@ def block_active_execplan(
     verify_result: str,
 ) -> None:
     project = connection.execute(
-        "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
+        "SELECT plan_path, agent_snapshot FROM projects WHERE repo = ?",
+        (repo,),
     ).fetchone()
     plan_id = _plan_id_from_path(str(project["plan_path"] or "")) if project else None
     plan = (
@@ -2554,6 +2702,12 @@ def block_active_execplan(
     if plan is None:
         raise RuntimeError("차단할 활성 ExecPlan을 찾을 수 없습니다.")
     fingerprint = _worktree_execplan_input_fingerprint(worktree, plan)
+    agent_result_snapshot = None
+    if project["agent_snapshot"]:
+        try:
+            agent_result_snapshot = capture_git_snapshot(worktree).serialize()
+        except RuntimeError:
+            pass
     with connection:
         connection.execute(
             """
@@ -2567,10 +2721,11 @@ def block_active_execplan(
         connection.execute(
             """
             UPDATE projects
-            SET phase = 'BLOCKED', last_error = ?, verify_result = ?
+            SET phase = 'BLOCKED', last_error = ?, verify_result = ?,
+                agent_result_snapshot = ?
             WHERE repo = ?
             """,
-            (error, verify_result, repo),
+            (error, verify_result, agent_result_snapshot, repo),
         )
 
 
@@ -2610,14 +2765,17 @@ def block_active_execplan_from_revision(
 
 def validate_blocked_agent_scope(
     connection: sqlite3.Connection,
+    repo_path: Path,
     repo: str,
+    base: str,
     worktree: Path,
     selected_plan_path: str,
 ) -> None:
     """Revalidate preserved Agent output before a BLOCKED plan can resume."""
 
     project = connection.execute(
-        "SELECT agent_role, agent_snapshot FROM projects WHERE repo = ?",
+        "SELECT agent_role, agent_snapshot, agent_result_snapshot "
+        "FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
     if project is None:
@@ -2636,14 +2794,52 @@ def validate_blocked_agent_scope(
         raise AgentScopeError(
             f"저장된 BLOCKED Agent Git snapshot이 유효하지 않습니다: {error}"
         ) from error
+    current = capture_git_snapshot(worktree)
+    allowed_ref_changes: frozenset[str] = frozenset()
+    allowed_worktree_changes: frozenset[str] = frozenset()
+    result_serialized = project["agent_result_snapshot"]
+    if result_serialized:
+        try:
+            blocked_result = GitSnapshot.deserialize(str(result_serialized))
+        except (KeyError, TypeError, ValueError, RuntimeError) as error:
+            raise AgentScopeError(
+                f"저장된 BLOCKED Agent 결과 snapshot이 유효하지 않습니다: {error}"
+            ) from error
+
+        if (
+            before.shared_metadata_complete
+            and blocked_result.shared_metadata_complete
+            and current.shared_metadata_complete
+        ):
+            allowed_ref_changes = _metadata_changes_after_block(
+                before.refs,
+                blocked_result.refs,
+                current.refs,
+                frozenset(
+                    (
+                        f"refs/heads/{base}",
+                        f"refs/remotes/origin/{base}",
+                    )
+                ),
+            )
+            primary_worktree = str(_canonical_path(repo_path))
+            allowed_worktree_changes = _metadata_changes_after_block(
+                before.worktrees,
+                blocked_result.worktrees,
+                current.worktrees,
+                frozenset((primary_worktree,)),
+            )
+
     validate_agent_scope(
         role_name,
         worktree,
         before,
-        capture_git_snapshot(worktree),
+        current,
         selected_plan_path=(
             selected_plan_path if role_name == "worker" else None
         ),
+        allowed_ref_changes=allowed_ref_changes,
+        allowed_worktree_changes=allowed_worktree_changes,
     )
 
 
@@ -2688,7 +2884,9 @@ def resume_blocked_execplan_if_inputs_changed(
     try:
         validate_blocked_agent_scope(
             connection,
+            repo_path,
             repo,
+            base,
             worktree,
             str(plan["path"]),
         )
