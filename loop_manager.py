@@ -1289,7 +1289,7 @@ def parse_worker_result(message: str, plan: dict[str, object]) -> WorkerPublicat
     plan_title = str(plan["title"])
     normalized = " ".join(title.split()).casefold().rstrip(" .,:;!?…")
     generic_titles = {
-        "implement", "implementation", "changes", "change", "code changes",
+        "implement", "implementation", "implement changes", "changes", "change", "code changes",
         "update", "updates", "update code", "fix", "fixes", "변경", "변경 사항", "구현",
     }
     prohibited = {
@@ -1897,7 +1897,7 @@ def run_project(
                 origin_url, plan_sha,
             )
             git(worktree, "push", "-u", "origin", branch)
-            title = git(worktree, "log", "-1", "--pretty=%s").stdout.strip()
+            title = f"Implement {plan['id']}: {plan['title']}"
             created = command(
                 [
                     "gh",

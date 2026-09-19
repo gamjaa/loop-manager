@@ -2038,6 +2038,7 @@ class WorkerPublicationTest(unittest.TestCase):
             worker_result("Update", "Summary", "test: PASS"),
             worker_result("Implement G-008 worker metadata", "Summary", "test: PASS"),
             worker_result("Update.", "Summary", "test: PASS"),
+            worker_result("Implement changes", "Summary", "test: PASS"),
             worker_result("Fix!", "Summary", "test: PASS"),
             worker_result("Descriptive Worker Commits.", "Summary", "test: PASS"),
         )
@@ -2171,6 +2172,14 @@ class WorkerPublicationTest(unittest.TestCase):
             state_dir.mkdir()
             (repo / "docs/plans").mkdir()
             plan = write_execplan(repo, "G-001", "Worker Boundary")
+            git_command(repo, "add", str(plan.relative_to(repo)))
+            git_command(repo, "commit", "-m", "Add ExecPlan G-001: Worker Boundary")
+            git_command(repo, "push", "origin", "main")
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
+            worktree = state_dir / "worktrees" / "G-001"
+            base_file = (repo / "src/app.py").read_text(encoding="utf-8")
+            base_index = git_command(repo, "diff", "--cached")
+            base_head = git_command(repo, "rev-parse", "HEAD")
             connection = sqlite3.connect(":memory:")
             connection.row_factory = sqlite3.Row
             connection.execute(loop_manager.SCHEMA)
@@ -2180,9 +2189,9 @@ class WorkerPublicationTest(unittest.TestCase):
                 ) VALUES (?, 'main', ?, ?, 'WORKING', 'loop-manager/G-001', ?, ?)""",
                 (
                     str(repo),
-                    git_command(repo, "rev-parse", "origin/main"),
-                    git_command(repo, "rev-parse", "origin/main"),
-                    str(repo),
+                    plan_sha,
+                    plan_sha,
+                    str(worktree),
                     plan.relative_to(repo).as_posix(),
                 ),
             )
@@ -2208,15 +2217,26 @@ class WorkerPublicationTest(unittest.TestCase):
                 reviewer_prompts.append(prompt)
                 return 0, next(review_messages)
 
+            gh_commands = []
+            original_command = loop_manager.command
+
+            def command_stub(arguments, **kwargs):
+                if arguments[-3:] == ["remote", "get-url", "origin"]:
+                    return subprocess.CompletedProcess(arguments, 0, stdout="git@github.com:octo/loop-manager.git\n")
+                if arguments[:3] == ["gh", "pr", "create"]:
+                    gh_commands.append(arguments)
+                    return subprocess.CompletedProcess(arguments, 0, stdout="https://example.test/pr/1\n")
+                return original_command(arguments, **kwargs)
+
             with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
                 "loop_manager.remote_base", return_value="main"
             ), mock.patch("loop_manager.ensure_safe_base_worktree"), mock.patch(
                 "loop_manager.pr_for_branch",
-                side_effect=[None, None, None, {"url": "https://example.test/pr/1"}],
+                side_effect=[None, None, None, None],
             ), mock.patch("loop_manager.run_codex", side_effect=agent), mock.patch(
                 "loop_manager.verify",
                 side_effect=[(False, "verify failed"), (True, "verify: PASS"), (True, "verify: PASS")],
-            ):
+            ), mock.patch("loop_manager.command", side_effect=command_stub):
                 for expected in (1, 1, 0):
                     self.assertEqual(
                         loop_manager.run_project(
@@ -2228,7 +2248,7 @@ class WorkerPublicationTest(unittest.TestCase):
                     "SELECT worker_result, phase FROM projects WHERE repo = ?", (str(repo),)
                 ).fetchone()
 
-                latest_title = git_command(repo, "log", "-1", "--pretty=%s")
+                latest_title = git_command(worktree, "log", "-1", "--pretty=%s")
                 latest_body = loop_manager.build_pr_body(
                     loop_manager.parse_worker_result(row["worker_result"], self.plan),
                     {**self.plan, "sources": ["docs/requirements/Active.md"]},
@@ -2238,6 +2258,9 @@ class WorkerPublicationTest(unittest.TestCase):
                     "a" * 40,
                 )
 
+                base_file_after = (repo / "src/app.py").read_text(encoding="utf-8")
+                base_index_after = git_command(repo, "diff", "--cached")
+                base_head_after = git_command(repo, "rev-parse", "HEAD")
         self.assertEqual(latest_title, "Publish reviewed context")
         self.assertEqual(
             row["worker_result"],
@@ -2247,6 +2270,16 @@ class WorkerPublicationTest(unittest.TestCase):
         self.assertIn("Final summary", reviewer_prompts[-1])
         self.assertNotIn("Initial summary", reviewer_prompts[-1])
         self.assertIn("Final summary", latest_body)
+        self.assertEqual(row["phase"], "PR_OPEN")
+        self.assertNotEqual(worktree, repo)
+        self.assertEqual(base_file_after, base_file)
+        self.assertEqual(base_index_after, base_index)
+        self.assertEqual(base_head_after, base_head)
+        self.assertEqual(len(gh_commands), 1)
+        pr_title = gh_commands[0][gh_commands[0].index("--title") + 1]
+        self.assertEqual(pr_title, "Implement G-001: Worker Boundary")
+        self.assertNotEqual(pr_title, "Publish reviewed context")
+
 
     def test_invalid_worker_result_resumes_same_session_without_verify(self):
         with tempfile.TemporaryDirectory() as directory:
