@@ -218,6 +218,7 @@ class AutomationFirstCatalogTest(unittest.TestCase):
             database.close()
 
             with loop_manager.connect_database(state_dir) as connection:
+                loop_manager.migrate_legacy_execplans(connection, target_repo=str(root))
                 before_reconciliation = connection.execute(
                     "SELECT plan_id, status FROM exec_plans WHERE repo = ? ORDER BY plan_id",
                     (str(root),),
@@ -2926,6 +2927,7 @@ class WorkerPublicationTest(unittest.TestCase):
             database.close()
 
             with loop_manager.connect_database(state_dir) as connection:
+                loop_manager.backfill_plan_shas(connection, target_repo=str(repo))
                 row = connection.execute(
                     "SELECT plan_sha, phase FROM projects WHERE repo = ?", (str(repo),)
                 ).fetchone()
@@ -2956,6 +2958,7 @@ class WorkerPublicationTest(unittest.TestCase):
             database.close()
 
             with loop_manager.connect_database(state_dir) as connection:
+                loop_manager.backfill_plan_shas(connection, target_repo=str(repo))
                 blocked = connection.execute(
                     "SELECT phase, last_error FROM projects WHERE repo = ?", (str(repo),)
                 ).fetchone()
@@ -3613,6 +3616,89 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 self.assertIn(expected_key, project["last_error"])
                 self.assertNotIn(sensitive_value, project["last_error"])
                 migration.assert_not_called()
+                unsafe_git.assert_not_called()
+                agent.assert_not_called()
+
+    def test_interrupted_config_change_stops_before_database_git_migrations(self):
+        scenarios = (
+            (
+                "remote-url",
+                ("remote", "set-url", "origin"),
+                "https://secret@attacker.invalid/repo.git",
+                "local:remote.origin.url",
+            ),
+            (
+                "hooks-path",
+                ("config", "core.hooksPath"),
+                "agent-hooks",
+                "local:core.hookspath",
+            ),
+        )
+        for name, arguments, configured_value, expected_key in scenarios:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, _plan_path = self._repository_with_plan(directory)
+                before = loop_manager.capture_git_snapshot(repo)
+                state_dir = root / "state"
+                state_dir.mkdir()
+                database = sqlite3.connect(state_dir / "loop-manager.db")
+                database.execute(loop_manager.SCHEMA)
+                database.execute(
+                    """
+                    INSERT INTO projects (
+                        repo, base_branch, phase, worktree, agent_role,
+                        agent_snapshot
+                    ) VALUES (?, 'main', 'WORKING', ?, 'worker', ?)
+                    """,
+                    (str(repo), str(repo), before.serialize()),
+                )
+                database.commit()
+                database.close()
+
+                sensitive_value = (
+                    str(root / configured_value)
+                    if name == "hooks-path"
+                    else configured_value
+                )
+                git_command(repo, *arguments, sensitive_value)
+
+                with mock.patch.object(
+                    loop_manager.sys,
+                    "argv",
+                    [
+                        "loop_manager.py",
+                        "--state-dir",
+                        str(state_dir),
+                        "run",
+                        str(repo),
+                        "--base",
+                        "main",
+                    ],
+                ), mock.patch(
+                    "loop_manager.validate_repository",
+                    return_value=repo,
+                ), mock.patch(
+                    "loop_manager.git",
+                    side_effect=AssertionError(
+                        "unsafe Git command before config validation"
+                    ),
+                ) as unsafe_git, mock.patch(
+                    "loop_manager.run_codex"
+                ) as agent:
+                    result = loop_manager.main()
+                    database = sqlite3.connect(state_dir / "loop-manager.db")
+                    database.row_factory = sqlite3.Row
+                    project = database.execute(
+                        "SELECT phase, last_error FROM projects WHERE repo = ?",
+                        (str(repo),),
+                    ).fetchone()
+                    database.close()
+
+                self.assertEqual(result, 1)
+                self.assertEqual(project["phase"], "WORKING")
+                self.assertIn("config 선검증 실패", project["last_error"])
+                self.assertIn(expected_key, project["last_error"])
+                self.assertNotIn(sensitive_value, project["last_error"])
                 unsafe_git.assert_not_called()
                 agent.assert_not_called()
 

@@ -397,8 +397,8 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
     _ensure_execplans_schema(connection)
     connection.execute(CLEANUP_PENDING_SCHEMA)
     connection.commit()
-    backfill_plan_shas(connection)
-    migrate_legacy_execplans(connection)
+    # Repository-aware migrations belong in run_project, after persisted Agent
+    # config has been checked against its pre-invocation snapshot.
     return connection
 
 
@@ -455,7 +455,11 @@ def github_repository(origin_url: str) -> str:
     return f"{match.group('owner')}/{match.group('repo')}".lower()
 
 
-def backfill_plan_shas(connection: sqlite3.Connection) -> None:
+def backfill_plan_shas(
+    connection: sqlite3.Connection,
+    *,
+    target_repo: str | None = None,
+) -> None:
     rows = connection.execute(
         """
         SELECT repo, plan_path
@@ -465,6 +469,8 @@ def backfill_plan_shas(connection: sqlite3.Connection) -> None:
           AND phase IN ('WORKING', 'VERIFYING', 'REVIEWING', 'PUBLISHING')
         """
     ).fetchall()
+    if target_repo is not None:
+        rows = [row for row in rows if row["repo"] == target_repo]
     for row in rows:
         result = git(
             Path(row["repo"]),
@@ -2809,7 +2815,7 @@ def block_active_execplan_from_revision(
         )
 
 
-def validate_blocked_agent_config(
+def validate_persisted_agent_config(
     connection: sqlite3.Connection,
     repo_path: Path,
     repo: str,
@@ -2817,23 +2823,19 @@ def validate_blocked_agent_config(
     """Check persisted Agent config state before any remote or hook-capable Git work."""
 
     project = connection.execute(
-        "SELECT phase, worktree, agent_snapshot FROM projects WHERE repo = ?",
+        "SELECT worktree, agent_snapshot FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
-    if (
-        project is None
-        or project["phase"] != "BLOCKED"
-        or not project["agent_snapshot"]
-    ):
+    if project is None or not project["agent_snapshot"]:
         return
     try:
         before = GitSnapshot.deserialize(str(project["agent_snapshot"]))
     except (KeyError, TypeError, ValueError, RuntimeError) as error:
         raise AgentScopeError(
-            f"저장된 BLOCKED Agent Git snapshot이 유효하지 않습니다: {error}"
+            f"저장된 Agent Git snapshot이 유효하지 않습니다: {error}"
         ) from error
     if not before.shared_metadata_complete:
-        raise AgentScopeError("BLOCKED Agent Git config 기준 snapshot이 없습니다.")
+        raise AgentScopeError("저장된 Agent Git config 기준 snapshot이 없습니다.")
 
     saved_worktree = Path(str(project["worktree"] or ""))
     config_context = saved_worktree if saved_worktree.is_dir() else repo_path
@@ -2849,7 +2851,7 @@ def validate_blocked_agent_config(
     remainder = len(changed_keys) - 8
     if remainder > 0:
         displayed += f", 외 {remainder}개"
-    raise AgentScopeError(f"BLOCKED Agent Git config 변경 ({displayed})")
+    raise AgentScopeError(f"저장된 Agent Git config 변경 ({displayed})")
 
 
 def validate_blocked_agent_scope(
@@ -3323,20 +3325,21 @@ def run_project(
         "SELECT * FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
-    if row and row["phase"] == "BLOCKED":
+    if row and row["agent_snapshot"]:
         try:
-            validate_blocked_agent_config(connection, repo_path, repo)
+            validate_persisted_agent_config(connection, repo_path, repo)
         except AgentScopeError as error:
             detail = str(error)
         except RuntimeError:
-            detail = "BLOCKED Agent Git config를 안전하게 읽을 수 없습니다."
+            detail = "저장된 Agent Git config를 안전하게 읽을 수 없습니다."
         else:
             detail = None
         if detail is not None:
-            message = f"BLOCKED Agent config 선검증 실패:\n{detail}"
+            message = f"Agent config 선검증 실패:\n{detail}"
             update_project(connection, repo, last_error=message)
             operation_print(message, file=sys.stderr)
             return 1
+    backfill_plan_shas(connection, target_repo=repo)
     migrate_legacy_execplans(
         connection,
         reconcile_history=True,
