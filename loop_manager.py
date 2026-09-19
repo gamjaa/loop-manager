@@ -1648,6 +1648,11 @@ def make_worktree(
         == 0
     )
     if branch_exists:
+        if allow_create_branch:
+            raise WorkspaceOwnershipError(
+                f"새 ExecPlan의 관리 branch가 이미 존재해 소유권을 증명할 수 없습니다: "
+                f"{branch}"
+            )
         for record in _worktree_catalog(repo):
             if record.get("branch") == f"refs/heads/{branch}":
                 owner = Path(str(record["worktree"]))
@@ -1993,6 +1998,29 @@ def validate_planning_workspace_identity(
     )
 
 
+def validate_planning_worktree_ownership(
+    repo_path: Path,
+    state_dir: Path,
+    repo: str,
+    fingerprint: str,
+    worktree: Path,
+) -> None:
+    """Validate a saved planning path before reading, changing, or removing it."""
+
+    if not fingerprint:
+        raise WorkspaceOwnershipError(
+            "planning worktree의 입력 fingerprint가 저장되지 않았습니다."
+        )
+    validate_planning_workspace_identity(
+        state_dir,
+        repo,
+        fingerprint,
+        worktree,
+    )
+    if worktree.exists():
+        validate_managed_worktree(repo_path, worktree, None)
+
+
 def changed_files(worktree: Path, since: str | None = None) -> list[str]:
     if since:
         output = git(worktree, "diff", "--name-only", f"{since}..HEAD").stdout
@@ -2073,6 +2101,45 @@ def assess_cleanup(worktree: Path, pr_head_oid: str | None) -> CleanupAssessment
     )
 
 
+def validate_pending_cleanup_worktree(
+    repo_path: Path,
+    state_dir: Path,
+    repo: str,
+    worktree: Path,
+) -> None:
+    """Prove a pending cleanup path belongs to its deterministic ExecPlan."""
+
+    if not worktree.exists():
+        return
+    branch_result = git(
+        worktree,
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        "HEAD",
+        check=False,
+    )
+    if branch_result.returncode:
+        raise WorkspaceOwnershipError(
+            "보존된 cleanup worktree가 branch에 연결되어 있지 않습니다."
+        )
+    branch = branch_result.stdout.strip()
+    match = re.fullmatch(r"loop-manager/(G-\d+)", branch)
+    if match is None:
+        raise WorkspaceOwnershipError(
+            f"보존된 cleanup worktree branch의 소유권을 증명할 수 없습니다: {branch}"
+        )
+    plan_id = match.group(1)
+    validate_execplan_workspace_identity(
+        state_dir,
+        repo,
+        plan_id,
+        branch,
+        worktree,
+    )
+    validate_managed_worktree(repo_path, worktree, branch)
+
+
 def remove_cleanup_worktree(
     repo: Path, worktree: Path, assessment: CleanupAssessment
 ) -> CleanupAssessment:
@@ -2112,7 +2179,10 @@ def _store_cleanup_pending(
 
 
 def recheck_cleanup_pending(
-    connection: sqlite3.Connection, repo_path: Path, repo: str
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    repo: str,
+    state_dir: Path,
 ) -> list[sqlite3.Row]:
     _ensure_cleanup_pending_schema(connection)
     pending = connection.execute(
@@ -2120,8 +2190,21 @@ def recheck_cleanup_pending(
     ).fetchall()
     for item in pending:
         worktree = Path(item["worktree"])
-        assessment = assess_cleanup(worktree, item["pr_head_oid"])
-        assessment = remove_cleanup_worktree(repo_path, worktree, assessment)
+        try:
+            validate_pending_cleanup_worktree(
+                repo_path,
+                state_dir,
+                repo,
+                worktree,
+            )
+        except (RuntimeError, WorkspaceOwnershipError) as error:
+            assessment = CleanupAssessment(
+                "unverifiable",
+                f"cleanup workspace 소유권 검증 실패: {error}",
+            )
+        else:
+            assessment = assess_cleanup(worktree, item["pr_head_oid"])
+            assessment = remove_cleanup_worktree(repo_path, worktree, assessment)
         if assessment.status in {"safe", "missing"}:
             connection.execute(
                 "DELETE FROM cleanup_pending WHERE repo = ? AND worktree = ?",
@@ -2552,17 +2635,32 @@ def complete_merged_worktree(
     connection: sqlite3.Connection,
     repo_path: Path,
     repo: str,
+    state_dir: Path,
     worktree: Path,
     pr_url: str,
     pr_head_oid: str | None,
 ) -> CleanupAssessment:
+    project = connection.execute(
+        "SELECT plan_path, branch FROM projects WHERE repo = ?", (repo,)
+    ).fetchone()
+    if project is None:
+        raise WorkspaceOwnershipError("Merge cleanup 프로젝트를 찾을 수 없습니다.")
+    plan_id = _plan_id_from_path(str(project["plan_path"] or ""))
+    if plan_id is None:
+        raise WorkspaceOwnershipError("Merge cleanup ExecPlan ID를 확인할 수 없습니다.")
+    branch = str(project["branch"] or "")
+    validate_execplan_workspace_identity(
+        state_dir,
+        repo,
+        plan_id,
+        branch,
+        worktree,
+    )
+    if worktree.exists():
+        validate_managed_worktree(repo_path, worktree, branch)
     assessment = assess_cleanup(worktree, pr_head_oid)
     assessment = remove_cleanup_worktree(repo_path, worktree, assessment)
     values = _clear_active_values()
-    project = connection.execute(
-        "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
-    ).fetchone()
-    plan_id = _plan_id_from_path(str(project["plan_path"] or "")) if project else None
     assignments = ", ".join(f"{name} = ?" for name in values)
     with connection:
         _ensure_execplans_schema(connection)
@@ -2809,7 +2907,9 @@ def run_project(
         row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
     base = row["base_branch"] if row else requested_base
 
-    cleanup_pending = recheck_cleanup_pending(connection, repo_path, repo)
+    cleanup_pending = recheck_cleanup_pending(
+        connection, repo_path, repo, state_dir
+    )
     for pending in cleanup_pending:
         operation_print(
             f"보존된 worktree: {pending['worktree']} ({pending['reason']})",
@@ -2863,14 +2963,29 @@ def run_project(
                 worktree = Path(row["worktree"])
                 head_value = existing_pr.get("headRefOid")
                 pr_head_oid = str(head_value) if head_value else None
-                assessment = complete_merged_worktree(
-                    connection,
-                    repo_path,
-                    repo,
-                    worktree,
-                    str(existing_pr["url"]),
-                    pr_head_oid,
-                )
+                try:
+                    assessment = complete_merged_worktree(
+                        connection,
+                        repo_path,
+                        repo,
+                        state_dir,
+                        worktree,
+                        str(existing_pr["url"]),
+                        pr_head_oid,
+                    )
+                except (RuntimeError, WorkspaceOwnershipError) as error:
+                    workspace_error = (
+                        f"Merge cleanup workspace 소유권 검증 실패: {error}"
+                    )
+                    block_active_execplan_from_revision(
+                        connection,
+                        repo_path,
+                        repo,
+                        f"refs/remotes/origin/{row['base_branch']}",
+                        workspace_error,
+                    )
+                    operation_print(workspace_error, file=sys.stderr)
+                    return 1
                 if assessment.status in {"safe", "missing"}:
                     operation_print(f"Merge 확인 및 worktree 정리 완료: {existing_pr['url']}")
                 else:
@@ -2937,9 +3052,39 @@ def run_project(
         row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
 
     if row["planning_error"]:
-        preserve_planning_diagnostics(state_dir, repo, row)
         stale_worktree = Path(row["worktree"]) if row["worktree"] else None
-        if stale_worktree and stale_worktree.exists():
+        stored_fingerprint = str(
+            row["planning_attempt_fingerprint"]
+            or row["planning_error_fingerprint"]
+            or ""
+        )
+        try:
+            if stale_worktree is None:
+                raise WorkspaceOwnershipError(
+                    "planning worktree 경로가 저장되지 않았습니다."
+                )
+            validate_planning_worktree_ownership(
+                repo_path,
+                state_dir,
+                repo,
+                stored_fingerprint,
+                stale_worktree,
+            )
+        except (RuntimeError, WorkspaceOwnershipError) as error:
+            cleanup_error = (
+                f"planning workspace cleanup 소유권 검증 실패: {error}"
+            )
+            update_project(
+                connection,
+                repo,
+                planning_error=cleanup_error,
+                planning_error_fingerprint=current_fingerprint,
+                last_error=cleanup_error,
+            )
+            operation_print(cleanup_error, file=sys.stderr)
+            return 1
+        preserve_planning_diagnostics(state_dir, repo, row)
+        if stale_worktree.exists():
             git(repo_path, "worktree", "remove", "--force", str(stale_worktree))
         clear_active(connection, repo)
         row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
@@ -2949,9 +3094,34 @@ def run_project(
         if not started_fingerprint:
             started_fingerprint = _planning_input_fingerprint(repo_path, row["active_sha"])
         if started_fingerprint != current_fingerprint:
+            stale_worktree = Path(row["worktree"]) if row["worktree"] else None
+            try:
+                if stale_worktree is None:
+                    raise WorkspaceOwnershipError(
+                        "planning worktree 경로가 저장되지 않았습니다."
+                    )
+                validate_planning_worktree_ownership(
+                    repo_path,
+                    state_dir,
+                    repo,
+                    str(started_fingerprint),
+                    stale_worktree,
+                )
+            except (RuntimeError, WorkspaceOwnershipError) as error:
+                cleanup_error = (
+                    f"planning workspace cleanup 소유권 검증 실패: {error}"
+                )
+                update_project(
+                    connection,
+                    repo,
+                    planning_error=cleanup_error,
+                    planning_error_fingerprint=current_fingerprint,
+                    last_error=cleanup_error,
+                )
+                operation_print(cleanup_error, file=sys.stderr)
+                return 1
             if row["planning_validation_error"]:
                 preserve_planning_diagnostics(state_dir, repo, row)
-            stale_worktree = Path(row["worktree"])
             if stale_worktree.exists():
                 git(repo_path, "worktree", "remove", "--force", str(stale_worktree))
             clear_active(connection, repo)
@@ -3211,6 +3381,13 @@ def run_project(
 
         if validated_result is None:
             completed_fingerprint = _planning_input_fingerprint(repo_path, row["active_sha"])
+            validate_planning_worktree_ownership(
+                repo_path,
+                state_dir,
+                repo,
+                current_fingerprint,
+                planning_worktree,
+            )
             git(repo_path, "worktree", "remove", str(planning_worktree))
             clear_active(
                 connection,
@@ -3249,6 +3426,13 @@ def run_project(
                     check=False,
                 ).returncode == 0
                 if not published:
+                    validate_planning_worktree_ownership(
+                        repo_path,
+                        state_dir,
+                        repo,
+                        current_fingerprint,
+                        planning_worktree,
+                    )
                     git(repo_path, "worktree", "remove", str(planning_worktree))
                     clear_active(connection, repo)
                     operation_print(
@@ -3290,6 +3474,13 @@ def run_project(
                 plans,
                 plan_commit,
                 current_fingerprint,
+            )
+            validate_planning_worktree_ownership(
+                repo_path,
+                state_dir,
+                repo,
+                current_fingerprint,
+                planning_worktree,
             )
             git(repo_path, "worktree", "remove", str(planning_worktree))
             base_sha = latest_sha

@@ -428,7 +428,10 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                 priority="critical",
                 depends_on=("G-001",),
             )
-            missing_worktree = Path(directory) / "already-removed"
+            state_dir = Path(directory) / "state"
+            _branch, missing_worktree = loop_manager.expected_execplan_workspace(
+                state_dir, "repo", "G-001"
+            )
             connection.execute(
                 """
                 UPDATE projects
@@ -445,6 +448,7 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                 connection,
                 Path(directory),
                 "repo",
+                state_dir,
                 missing_worktree,
                 "https://pr/1",
                 None,
@@ -3507,6 +3511,35 @@ class WorkspaceRecoveryTest(unittest.TestCase):
         loop_manager.make_worktree(repo, worktree, branch, "main")
         return repo, state_dir, branch, worktree
 
+    def _ready_execplan(self, directory: str):
+        repo = make_remote_repository(directory)
+        state_dir = Path(directory) / "state"
+        (repo / "docs/plans").mkdir()
+        plan = write_execplan(repo, "G-012", "Recovery Safety")
+        commit_and_push(repo, "Add recovery safety plan")
+        plan_sha = git_command(repo, "rev-parse", "origin/main")
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute(loop_manager.SCHEMA)
+        connection.execute(
+            "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+            (str(repo),),
+        )
+        connection.commit()
+        relative_plan = plan.relative_to(repo).as_posix()
+        loop_manager.register_execplans(
+            connection,
+            str(repo),
+            repo,
+            [(relative_plan, loop_manager._parse_execplan(repo, plan))],
+            plan_sha,
+            loop_manager.planning_input_fingerprint(repo, "main"),
+        )
+        branch, worktree = loop_manager.expected_execplan_workspace(
+            state_dir, str(repo), "G-012"
+        )
+        return repo, state_dir, connection, plan, plan_sha, branch, worktree
+
     def test_missing_worktree_is_recovered_from_owned_branch(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, _state_dir, branch, worktree = self._workspace(directory)
@@ -3609,6 +3642,67 @@ class WorkspaceRecoveryTest(unittest.TestCase):
                 (str(repo),),
             ).fetchone()
 
+            plan_status = connection.execute(
+                "SELECT status FROM exec_plans WHERE repo = ? AND plan_id = 'G-012'",
+                (str(repo),),
+            ).fetchone()["status"]
+
+            self.assertEqual(result, 1)
+            self.assertEqual(blocked["phase"], "BLOCKED")
+            self.assertIn("모두 복구할 수 없습니다", blocked["last_error"])
+            self.assertEqual(plan_status, "BLOCKED")
+            run_agent.assert_not_called()
+
+
+    def test_new_activation_rejects_preexisting_branch_without_agent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                repo,
+                state_dir,
+                connection,
+                _plan,
+                _plan_sha,
+                branch,
+                worktree,
+            ) = self._ready_execplan(directory)
+            git_command(repo, "branch", branch, "origin/main")
+            branch_head = git_command(repo, "rev-parse", branch)
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as run_agent:
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            plan_status = connection.execute(
+                "SELECT status FROM exec_plans WHERE repo = ? AND plan_id = 'G-012'",
+                (str(repo),),
+            ).fetchone()["status"]
+
+            self.assertEqual(result, 1)
+            self.assertEqual(project["phase"], "BLOCKED")
+            self.assertIn("이미 존재해 소유권을 증명할 수 없습니다", project["last_error"])
+            self.assertEqual(plan_status, "BLOCKED")
+            self.assertEqual(git_command(repo, "rev-parse", branch), branch_head)
+            self.assertFalse(worktree.exists())
+            run_agent.assert_not_called()
+
     def test_started_planning_worktree_is_not_recreated_from_origin(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -3628,6 +3722,74 @@ class WorkspaceRecoveryTest(unittest.TestCase):
 
             self.assertFalse(missing.exists())
 
+
+    def test_changed_planning_input_preserves_unowned_saved_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = make_remote_repository(directory)
+            state_dir = root / "state"
+            victim = root / "user-worktree"
+            victim_branch = "user/planning"
+            git_command(
+                repo,
+                "worktree",
+                "add",
+                "-b",
+                victim_branch,
+                str(victim),
+                "origin/main",
+            )
+            marker = victim / "keep.txt"
+            marker.write_text("keep\n", encoding="utf-8")
+            victim_head = git_command(victim, "rev-parse", "HEAD")
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                """
+                INSERT INTO projects (
+                    repo, base_branch, active_sha, phase, worktree,
+                    planning_attempt_fingerprint, planning_validation_error
+                ) VALUES (?, 'main', ?, 'PLANNING', ?, 'stale-input', 'invalid')
+                """,
+                (str(repo), plan_sha, str(victim)),
+            )
+            connection.commit()
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as run_agent:
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, planning_error, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(result, 1)
+            self.assertEqual(project["phase"], "PLANNING")
+            self.assertIn(
+                "planning workspace cleanup 소유권 검증 실패",
+                project["planning_error"],
+            )
+            self.assertEqual(project["last_error"], project["planning_error"])
+            self.assertTrue(marker.is_file())
+            self.assertEqual(git_command(victim, "rev-parse", "HEAD"), victim_head)
+            loop_manager.validate_managed_worktree(repo, victim, victim_branch)
+            run_agent.assert_not_called()
 
     def test_wrong_branch_and_wrong_deterministic_path_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -3663,6 +3825,112 @@ class WorkspaceRecoveryTest(unittest.TestCase):
                     branch,
                     root / "elsewhere",
                 )
+
+
+    def test_merge_cleanup_preserves_unowned_saved_path_and_blocks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (
+                repo,
+                state_dir,
+                connection,
+                plan,
+                plan_sha,
+                branch,
+                _worktree,
+            ) = self._ready_execplan(directory)
+            victim = root / "user-merge-worktree"
+            victim_branch = "user/merge"
+            git_command(
+                repo,
+                "worktree",
+                "add",
+                "-b",
+                victim_branch,
+                str(victim),
+                "origin/main",
+            )
+            marker = victim / "keep.txt"
+            marker.write_text("keep\n", encoding="utf-8")
+            git_command(victim, "add", "keep.txt")
+            git_command(victim, "commit", "-m", "Keep user worktree")
+            victim_head = git_command(victim, "rev-parse", "HEAD")
+            pr_url = "https://example.test/pr/12"
+            connection.execute(
+                """
+                UPDATE exec_plans
+                SET status = 'PR_OPEN', active_sha = ?, branch = ?, worktree = ?,
+                    pr_url = ?
+                WHERE repo = ? AND plan_id = 'G-012'
+                """,
+                (plan_sha, branch, str(victim), pr_url, str(repo)),
+            )
+            connection.execute(
+                """
+                UPDATE projects
+                SET active_sha = ?, plan_sha = ?, phase = 'PR_OPEN',
+                    branch = ?, worktree = ?, plan_path = ?, pr_url = ?
+                WHERE repo = ?
+                """,
+                (
+                    plan_sha,
+                    plan_sha,
+                    branch,
+                    str(victim),
+                    plan.relative_to(repo).as_posix(),
+                    pr_url,
+                    str(repo),
+                ),
+            )
+            connection.commit()
+            merged_pr = {
+                "url": pr_url,
+                "state": "MERGED",
+                "mergedAt": "2026-01-01T00:00:00Z",
+                "headRefOid": victim_head,
+            }
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=merged_pr
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as run_agent:
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            plan_status = connection.execute(
+                "SELECT status FROM exec_plans WHERE repo = ? AND plan_id = 'G-012'",
+                (str(repo),),
+            ).fetchone()["status"]
+            pending_count = connection.execute(
+                "SELECT COUNT(*) FROM cleanup_pending WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()[0]
+
+            self.assertEqual(result, 1)
+            self.assertEqual(project["phase"], "BLOCKED")
+            self.assertIn(
+                "Merge cleanup workspace 소유권 검증 실패",
+                project["last_error"],
+            )
+            self.assertEqual(plan_status, "BLOCKED")
+            self.assertEqual(pending_count, 0)
+            self.assertTrue(marker.is_file())
+            self.assertEqual(git_command(victim, "rev-parse", "HEAD"), victim_head)
+            loop_manager.validate_managed_worktree(repo, victim, victim_branch)
+            run_agent.assert_not_called()
 
 
 class MergeIndependentWorktreeCleanupTest(unittest.TestCase):
@@ -3796,7 +4064,16 @@ class MergeIndependentWorktreeCleanupTest(unittest.TestCase):
     def test_pending_recheck_removes_safe_worktree_and_missing_record(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            repo, worktree, _branch, pr_head = self._managed_worktree(root)
+            repo = make_remote_repository(directory)
+            state_dir = root / "state"
+            branch, worktree = loop_manager.expected_execplan_workspace(
+                state_dir, str(repo), "G-001"
+            )
+            loop_manager.make_worktree(repo, worktree, branch, "main")
+            (worktree / "src/app.py").write_text("VALUE = 2\n", encoding="utf-8")
+            git_command(worktree, "add", "src/app.py")
+            git_command(worktree, "commit", "-m", "Implement cleanup fixture")
+            pr_head = git_command(worktree, "rev-parse", "HEAD")
             connection = self._memory_connection(repo)
             missing = root / "already-gone"
             for path, oid in ((worktree, pr_head), (missing, None)):
@@ -3811,7 +4088,7 @@ class MergeIndependentWorktreeCleanupTest(unittest.TestCase):
             connection.commit()
 
             remaining = loop_manager.recheck_cleanup_pending(
-                connection, repo, str(repo)
+                connection, repo, str(repo), state_dir
             )
 
             self.assertEqual(remaining, [])
@@ -3820,18 +4097,31 @@ class MergeIndependentWorktreeCleanupTest(unittest.TestCase):
     def test_merged_dirty_worktree_becomes_nonblocking_pending(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            repo, worktree, branch, pr_head = self._managed_worktree(root)
+            repo = make_remote_repository(directory)
+            (repo / "docs/plans").mkdir()
+            write_execplan(repo, "G-001", "Cleanup")
+            commit_and_push(repo, "Add cleanup plan")
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
+            state_dir = root / "state"
+            branch, worktree = loop_manager.expected_execplan_workspace(
+                state_dir, str(repo), "G-001"
+            )
+            loop_manager.make_worktree(repo, worktree, branch, "main")
+            (worktree / "src/app.py").write_text("VALUE = 2\n", encoding="utf-8")
+            git_command(worktree, "add", "src/app.py")
+            git_command(worktree, "commit", "-m", "Implement cleanup fixture")
+            pr_head = git_command(worktree, "rev-parse", "HEAD")
             (worktree / "untracked.txt").write_text("keep\n", encoding="utf-8")
             connection = self._memory_connection(repo)
             connection.execute(
                 """
                 UPDATE projects
-                SET active_sha = ?, phase = 'PR_OPEN', branch = ?, worktree = ?,
+                SET active_sha = ?, plan_sha = ?, phase = 'PR_OPEN', branch = ?, worktree = ?,
                     plan_path = 'docs/plans/[G-001] Cleanup.md',
                     pr_url = 'https://example.test/pr/1'
                 WHERE repo = ?
                 """,
-                (pr_head, branch, str(worktree), str(repo)),
+                (pr_head, plan_sha, branch, str(worktree), str(repo)),
             )
             connection.commit()
             merged_pr = {
@@ -3846,7 +4136,7 @@ class MergeIndependentWorktreeCleanupTest(unittest.TestCase):
             ), mock.patch("loop_manager.pr_for_branch", return_value=merged_pr):
                 result = loop_manager.run_project(
                     connection,
-                    root / "state",
+                    state_dir,
                     str(repo),
                     Path("unused.ini"),
                     "main",
