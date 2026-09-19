@@ -1947,5 +1947,222 @@ risk: medium
             self.assertEqual(row["worker_session_id"], "worker-session")
             self.assertEqual(row["verify_result"], "verify: PASS")
 
+
+class MergeIndependentWorktreeCleanupTest(unittest.TestCase):
+    def _managed_worktree(self, root: Path, name: str = "managed"):
+        repo = make_remote_repository(str(root))
+        worktree = root / name
+        branch = f"loop-manager/{name}"
+        git_command(repo, "worktree", "add", "-b", branch, str(worktree), "origin/main")
+        (worktree / "src/app.py").write_text("VALUE = 2\n", encoding="utf-8")
+        git_command(worktree, "add", "src/app.py")
+        git_command(worktree, "commit", "-m", "Implement cleanup fixture")
+        return repo, worktree, branch, git_command(worktree, "rev-parse", "HEAD")
+
+    def _memory_connection(self, repo: Path):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute(loop_manager.SCHEMA)
+        connection.execute(loop_manager.CLEANUP_PENDING_SCHEMA)
+        connection.execute(
+            "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+            (str(repo),),
+        )
+        connection.commit()
+        return connection
+
+    def test_merge_modes_do_not_use_base_ancestry_for_cleanup(self):
+        for mode in ("merge", "squash", "rebase"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, worktree, branch, pr_head = self._managed_worktree(root)
+
+                if mode == "merge":
+                    git_command(repo, "merge", "--no-ff", "-m", "Merge PR", branch)
+                elif mode == "squash":
+                    git_command(repo, "merge", "--squash", branch)
+                    git_command(repo, "commit", "-m", "Squash PR")
+                else:
+                    (repo / "README.md").write_text("# Base changed\n", encoding="utf-8")
+                    git_command(repo, "add", "README.md")
+                    git_command(repo, "commit", "-m", "Advance base")
+                    git_command(repo, "cherry-pick", pr_head)
+
+                base_contains_head = subprocess.run(
+                    ["git", "-C", str(repo), "merge-base", "--is-ancestor", pr_head, "main"]
+                ).returncode == 0
+                self.assertEqual(base_contains_head, mode == "merge")
+                assessment = loop_manager.assess_cleanup(worktree, pr_head)
+                self.assertEqual(assessment.status, "safe")
+                self.assertEqual(
+                    loop_manager.remove_cleanup_worktree(repo, worktree, assessment).status,
+                    "safe",
+                )
+                self.assertFalse(worktree.exists())
+
+    def test_deleted_remote_branch_still_uses_saved_pr_head(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, worktree, branch, pr_head = self._managed_worktree(root)
+            git_command(worktree, "push", "-u", "origin", branch)
+            git_command(repo, "push", "origin", "--delete", branch)
+
+            self.assertEqual(loop_manager.assess_cleanup(worktree, pr_head).status, "safe")
+
+    def test_dirty_reasons_cover_tracked_staged_and_untracked_changes(self):
+        changes = {
+            "tracked 파일 수정": lambda worktree: (
+                worktree / "src/app.py"
+            ).write_text("VALUE = 3\n", encoding="utf-8"),
+            "staged 변경": lambda worktree: (
+                (worktree / "src/app.py").write_text("VALUE = 3\n", encoding="utf-8"),
+                git_command(worktree, "add", "src/app.py"),
+            ),
+            "untracked 파일": lambda worktree: (
+                worktree / "untracked.txt"
+            ).write_text("keep\n", encoding="utf-8"),
+        }
+        for expected_reason, change in changes.items():
+            with self.subTest(reason=expected_reason), tempfile.TemporaryDirectory() as directory:
+                repo, worktree, _branch, pr_head = self._managed_worktree(Path(directory))
+                change(worktree)
+
+                assessment = loop_manager.assess_cleanup(worktree, pr_head)
+
+                self.assertEqual(assessment.status, "dirty")
+                self.assertIn(expected_reason, assessment.reason)
+                self.assertTrue(worktree.exists())
+
+    def test_local_only_and_unverifiable_commits_are_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _repo, worktree, _branch, pr_head = self._managed_worktree(root)
+            (worktree / "README.md").write_text("# Local only\n", encoding="utf-8")
+            git_command(worktree, "add", "README.md")
+            git_command(worktree, "commit", "-m", "Local only")
+
+            local_only = loop_manager.assess_cleanup(worktree, pr_head)
+            missing_head = loop_manager.assess_cleanup(worktree, None)
+            missing_object = loop_manager.assess_cleanup(worktree, "f" * 40)
+
+            self.assertEqual(local_only.status, "local-only commits")
+            self.assertIn("PR head에 포함되지 않은", local_only.reason)
+            self.assertEqual(missing_head.status, "unverifiable")
+            self.assertIn("PR head commit 정보", missing_head.reason)
+            self.assertEqual(missing_object.status, "unverifiable")
+            self.assertIn("commit object", missing_object.reason)
+
+    def test_existing_database_adds_cleanup_pending_without_losing_project(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            database = sqlite3.connect(state_dir / "loop-manager.db")
+            database.execute(
+                "CREATE TABLE projects (repo TEXT PRIMARY KEY, base_branch TEXT NOT NULL, phase TEXT)"
+            )
+            database.execute(
+                "INSERT INTO projects (repo, base_branch, phase) VALUES ('repo', 'main', 'PR_OPEN')"
+            )
+            database.commit()
+            database.close()
+
+            with loop_manager.connect_database(state_dir) as connection:
+                table = connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cleanup_pending'"
+                ).fetchone()
+                row = connection.execute(
+                    "SELECT repo, base_branch, phase FROM projects WHERE repo = 'repo'"
+                ).fetchone()
+
+            self.assertIsNotNone(table)
+            self.assertEqual(tuple(row), ("repo", "main", "PR_OPEN"))
+
+    def test_pending_recheck_removes_safe_worktree_and_missing_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, worktree, _branch, pr_head = self._managed_worktree(root)
+            connection = self._memory_connection(repo)
+            missing = root / "already-gone"
+            for path, oid in ((worktree, pr_head), (missing, None)):
+                loop_manager._store_cleanup_pending(
+                    connection,
+                    str(repo),
+                    path,
+                    "https://example.test/pr/1",
+                    oid,
+                    "preserved",
+                )
+            connection.commit()
+
+            remaining = loop_manager.recheck_cleanup_pending(
+                connection, repo, str(repo)
+            )
+
+            self.assertEqual(remaining, [])
+            self.assertFalse(worktree.exists())
+
+    def test_merged_dirty_worktree_becomes_nonblocking_pending(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, worktree, branch, pr_head = self._managed_worktree(root)
+            (worktree / "untracked.txt").write_text("keep\n", encoding="utf-8")
+            connection = self._memory_connection(repo)
+            connection.execute(
+                """
+                UPDATE projects
+                SET active_sha = ?, phase = 'PR_OPEN', branch = ?, worktree = ?,
+                    plan_path = 'docs/plans/[G-001] Cleanup.md',
+                    pr_url = 'https://example.test/pr/1'
+                WHERE repo = ?
+                """,
+                (pr_head, branch, str(worktree), str(repo)),
+            )
+            connection.commit()
+            merged_pr = {
+                "url": "https://example.test/pr/1",
+                "state": "MERGED",
+                "mergedAt": "2026-01-01T00:00:00Z",
+                "headRefOid": pr_head,
+            }
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch("loop_manager.pr_for_branch", return_value=merged_pr):
+                result = loop_manager.run_project(
+                    connection,
+                    root / "state",
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, branch, worktree, pr_url, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            pending = connection.execute(
+                "SELECT worktree, pr_head_oid, reason FROM cleanup_pending WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(result, 0)
+            self.assertEqual(tuple(project), (None, None, None, None, None))
+            self.assertEqual(pending["worktree"], str(worktree))
+            self.assertEqual(pending["pr_head_oid"], pr_head)
+            self.assertIn("untracked 파일", pending["reason"])
+            self.assertTrue(worktree.exists())
+
+    def test_pr_queries_request_immutable_head_oid(self):
+        response = subprocess.CompletedProcess(
+            ["gh"], 0, stdout='{"url":"u","state":"MERGED","mergedAt":"t","headRefOid":"abc"}'
+        )
+        with mock.patch("loop_manager.command", return_value=response) as command:
+            row = loop_manager.pr_for_branch(
+                Path("/repo"), "loop-manager/G-007", "https://example.test/pr/7"
+            )
+
+        self.assertEqual(row["headRefOid"], "abc")
+        self.assertIn("headRefOid", command.call_args.args[0][-1])
+
+
 if __name__ == "__main__":
     unittest.main()

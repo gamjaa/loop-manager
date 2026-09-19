@@ -116,7 +116,7 @@ cron에는 같은 `run` 명령을 등록한다. 동시 실행은 전역 잠금�
 
 최소 실행기는 생성한 PR URL을 표준 출력에 표시한다. 사용자는 PR을 검토하고 Merge하며, 열린 동안에는 다음 실행도 같은 PR을 기다린다. PR을 Merge하지 않고 닫았다면 같은 PR을 다시 열어야 한다.
 
-Merge된 worktree가 깨끗하면 자동으로 정리한다. 미커밋 또는 미푸시 변경이 남아 있으면 삭제하지 않고 경로를 출력한 뒤 중단한다. `cleanup_pending`과 Telegram 알림은 후속 구현 대상이다.
+GitHub가 Merge를 확인하면 PR head commit을 기준으로 로컬 전용 commit이 없는 깨끗한 관리 worktree를 Merge, Squash, Rebase 방식과 관계없이 자동 정리한다. 미커밋 변경, PR에 포함되지 않은 로컬 commit 또는 commit 관계를 확인할 수 없는 worktree는 삭제하지 않고 `cleanup_pending`에 경로와 원인을 기록한다. 이 경고는 다음 작업이나 프로젝트 완료를 막지 않으며, 이후 실행에서 안전 조건이 충족되거나 경로가 사라지면 자동으로 해제된다.
 
 ## 사용자가 직접 작성하지 않는 항목
 
