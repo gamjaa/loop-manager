@@ -7552,6 +7552,8 @@ def _run_project_step(
             parse_worker_result(message, plan)
         except WorkerResultError as error:
             validation_error = f"Worker 결과 검증 실패:\n{error}"
+            if resolving_rebase:
+                validation_error = REBASE_CONFLICT_PREFIX + validation_error
             update_project(
                 connection,
                 repo,
