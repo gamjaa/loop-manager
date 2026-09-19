@@ -60,6 +60,7 @@ FIELDS = {
     "last_error",
     "agent_role",
     "agent_snapshot",
+    "agent_input_fingerprint",
     "agent_result_snapshot",
     "agent_manager_snapshot",
 }
@@ -92,6 +93,7 @@ CREATE TABLE IF NOT EXISTS projects (
     last_error TEXT,
     agent_role TEXT,
     agent_snapshot TEXT,
+    agent_input_fingerprint TEXT,
     agent_result_snapshot TEXT,
     agent_manager_snapshot TEXT
 )
@@ -128,6 +130,7 @@ CREATE TABLE IF NOT EXISTS exec_plans (
     pr_url TEXT,
     last_error TEXT,
     blocked_fingerprint TEXT,
+    blocked_worktree_fingerprint TEXT,
     retry_count INTEGER NOT NULL DEFAULT 0,
     worker_session_id TEXT,
     worker_result TEXT,
@@ -396,6 +399,10 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
     columns = {row[1] for row in connection.execute("PRAGMA table_info(exec_plans)")}
     if "blocked_fingerprint" not in columns:
         connection.execute("ALTER TABLE exec_plans ADD COLUMN blocked_fingerprint TEXT")
+    if "blocked_worktree_fingerprint" not in columns:
+        connection.execute(
+            "ALTER TABLE exec_plans ADD COLUMN blocked_worktree_fingerprint TEXT"
+        )
     if "workspace_owned" not in columns:
         connection.execute(
             "ALTER TABLE exec_plans ADD COLUMN workspace_owned "
@@ -440,6 +447,7 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
         "planning_error_fingerprint": "TEXT",
         "agent_role": "TEXT",
         "agent_snapshot": "TEXT",
+        "agent_input_fingerprint": "TEXT",
         "agent_result_snapshot": "TEXT",
         "agent_manager_snapshot": "TEXT",
     }
@@ -2403,6 +2411,8 @@ def begin_agent_scope(
     repo: str,
     worktree: Path,
     role_name: str,
+    *,
+    input_fingerprint: str | None = None,
 ) -> GitSnapshot:
     row = connection.execute(
         "SELECT agent_role, agent_snapshot FROM projects WHERE repo = ?",
@@ -2423,6 +2433,7 @@ def begin_agent_scope(
         repo,
         agent_role=role_name,
         agent_snapshot=snapshot.serialize(),
+        agent_input_fingerprint=input_fingerprint,
         agent_result_snapshot=None,
         agent_manager_snapshot=None,
     )
@@ -2435,6 +2446,7 @@ def clear_agent_scope(connection: sqlite3.Connection, repo: str) -> None:
         repo,
         agent_role=None,
         agent_snapshot=None,
+        agent_input_fingerprint=None,
         agent_result_snapshot=None,
         agent_manager_snapshot=None,
     )
@@ -2793,6 +2805,7 @@ def clear_planning_validation_state(
         last_error=None,
         agent_role=None,
         agent_snapshot=None,
+        agent_input_fingerprint=None,
         agent_result_snapshot=None,
         agent_manager_snapshot=None,
     )
@@ -2826,6 +2839,7 @@ def _clear_active_values(
         "planning_error_fingerprint": None,
         "agent_role": None,
         "agent_snapshot": None,
+        "agent_input_fingerprint": None,
         "agent_result_snapshot": None,
         "agent_manager_snapshot": None,
     }
@@ -3025,7 +3039,8 @@ def block_active_execplan(
     preserved_agent_result_snapshot: str | None = None,
 ) -> None:
     project = connection.execute(
-        "SELECT plan_path, agent_snapshot FROM projects WHERE repo = ?",
+        "SELECT plan_path, agent_snapshot, agent_input_fingerprint "
+        "FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
     plan_id = _plan_id_from_path(str(project["plan_path"] or "")) if project else None
@@ -3039,7 +3054,12 @@ def block_active_execplan(
     )
     if plan is None:
         raise RuntimeError("차단할 활성 ExecPlan을 찾을 수 없습니다.")
-    fingerprint = _worktree_execplan_input_fingerprint(worktree, plan)
+    blocked_worktree_fingerprint = _worktree_execplan_input_fingerprint(
+        worktree, plan
+    )
+    fingerprint = str(
+        project["agent_input_fingerprint"] or blocked_worktree_fingerprint
+    )
     agent_result_snapshot = preserved_agent_result_snapshot
     if agent_result_snapshot is None and project["agent_snapshot"]:
         try:
@@ -3050,11 +3070,18 @@ def block_active_execplan(
         connection.execute(
             """
             UPDATE exec_plans
-            SET status = 'BLOCKED', blocked_fingerprint = ?, last_error = ?,
-                verify_result = ?
+            SET status = 'BLOCKED', blocked_fingerprint = ?,
+                blocked_worktree_fingerprint = ?, last_error = ?, verify_result = ?
             WHERE repo = ? AND plan_id = ?
             """,
-            (fingerprint, error, verify_result, repo, plan_id),
+            (
+                fingerprint,
+                blocked_worktree_fingerprint,
+                error,
+                verify_result,
+                repo,
+                plan_id,
+            ),
         )
         connection.execute(
             """
@@ -3082,13 +3109,20 @@ def block_active_execplan_from_revision(
     plan = active_execplan(connection, repo)
     if plan is None:
         raise RuntimeError("차단할 활성 ExecPlan을 찾을 수 없습니다.")
-    fingerprint = _revision_execplan_input_fingerprint(repo_path, revision, plan)
+    project = connection.execute(
+        "SELECT agent_input_fingerprint FROM projects WHERE repo = ?",
+        (repo,),
+    ).fetchone()
+    fingerprint = str(
+        (project["agent_input_fingerprint"] if project else None)
+        or _revision_execplan_input_fingerprint(repo_path, revision, plan)
+    )
     with connection:
         connection.execute(
             """
             UPDATE exec_plans
-            SET status = 'BLOCKED', blocked_fingerprint = ?, last_error = ?,
-                verify_result = ?
+            SET status = 'BLOCKED', blocked_fingerprint = ?,
+                blocked_worktree_fingerprint = NULL, last_error = ?, verify_result = ?
             WHERE repo = ? AND plan_id = ?
             """,
             (fingerprint, error, verify_result, repo, plan["plan_id"]),
@@ -3412,15 +3446,16 @@ def validate_persisted_agent_scope(
             raise AgentScopeError(
                 f"저장된 Manager Git checkpoint가 유효하지 않습니다: {error}"
             ) from error
-        validate_agent_scope(
-            role_name,
-            saved_worktree,
-            before,
-            checkpoint.snapshot,
-            selected_plan_path=(
-                selected_plan_path if role_name == "worker" else None
-            ),
-        )
+        if project["phase"] != "BLOCKED":
+            validate_agent_scope(
+                role_name,
+                saved_worktree,
+                before,
+                checkpoint.snapshot,
+                selected_plan_path=(
+                    selected_plan_path if role_name == "worker" else None
+                ),
+            )
         manager_refs = frozenset(
             refname
             for refname in set(checkpoint.snapshot.refs) | set(current.refs)
@@ -3428,9 +3463,15 @@ def validate_persisted_agent_scope(
             and (
                 refname.startswith("refs/remotes/origin/")
                 or refname.startswith("refs/tags/")
+                or (
+                    project["phase"] == "BLOCKED"
+                    and refname == f"refs/heads/{project['base_branch']}"
+                )
             )
         )
         allowed_cleanup = checkpoint.cleanup_worktrees | manager_cleanup_worktrees
+        if project["phase"] == "BLOCKED":
+            allowed_cleanup |= frozenset((str(_canonical_path(repo_path)),))
         try:
             validate_agent_scope(
                 "reviewer",
@@ -3584,7 +3625,7 @@ def validate_blocked_agent_scope(
     """Revalidate preserved Agent output before a BLOCKED plan can resume."""
 
     project = connection.execute(
-        "SELECT agent_role, agent_snapshot, agent_result_snapshot "
+        "SELECT agent_role, agent_snapshot, agent_result_snapshot, agent_manager_snapshot "
         "FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
@@ -3608,6 +3649,16 @@ def validate_blocked_agent_scope(
     scope_before = before
     allowed_ref_changes: frozenset[str] = frozenset()
     allowed_worktree_changes: frozenset[str] = frozenset()
+    if project["agent_manager_snapshot"]:
+        try:
+            manager_checkpoint = ManagerGitCheckpoint.deserialize(
+                str(project["agent_manager_snapshot"])
+            )
+        except (KeyError, TypeError, ValueError, RuntimeError) as error:
+            raise AgentScopeError(
+                f"저장된 BLOCKED Manager Git checkpoint가 유효하지 않습니다: {error}"
+            ) from error
+        allowed_worktree_changes |= manager_checkpoint.cleanup_worktrees
     result_serialized = project["agent_result_snapshot"]
     if result_serialized:
         try:
@@ -3644,7 +3695,7 @@ def validate_blocked_agent_scope(
                 manager_ref_candidates,
             )
             primary_worktree = str(_canonical_path(repo_path))
-            allowed_worktree_changes = _metadata_changes_after_block(
+            allowed_worktree_changes |= _metadata_changes_after_block(
                 before.worktrees,
                 blocked_result.worktrees,
                 current.worktrees,
@@ -3711,7 +3762,8 @@ def _requeue_blocked_execplan(
         connection.execute(
             """
             UPDATE exec_plans
-            SET status = 'READY', blocked_fingerprint = NULL, retry_count = 0,
+            SET status = 'READY', blocked_fingerprint = NULL,
+                blocked_worktree_fingerprint = NULL, retry_count = 0,
                 last_error = NULL, worker_session_id = NULL, worker_result = NULL,
                 verify_result = NULL
             WHERE repo = ? AND plan_id = ?
@@ -3830,9 +3882,15 @@ def resume_blocked_execplan_if_inputs_changed(
         message = f"BLOCKED Agent 범위 재검증 실패:\n{error}"
         _update_blocked_error(connection, repo, str(plan["plan_id"]), message)
         return False
-    worktree_changed = (
-        worktree.is_dir()
-        and _worktree_execplan_input_fingerprint(worktree, plan) != stored
+    current_worktree_fingerprint = (
+        _worktree_execplan_input_fingerprint(worktree, plan)
+        if worktree.is_dir()
+        else None
+    )
+    blocked_worktree_fingerprint = plan["blocked_worktree_fingerprint"]
+    worktree_changed = bool(
+        current_worktree_fingerprint != stored
+        and current_worktree_fingerprint != blocked_worktree_fingerprint
     )
     if not worktree_changed and not remote_changed:
         return False
@@ -4191,8 +4249,6 @@ def run_project(
         else:
             detail = None
             scope_result_snapshot = None
-            if row["phase"] == "BLOCKED":
-                validated_agent_scope = None
         if detail is not None:
             message = block_persisted_agent_scope_violation(
                 connection,
@@ -4357,6 +4413,7 @@ def run_project(
             str(row["base_branch"]),
             state_dir,
         ):
+            validated_agent_scope = None
             row = connection.execute(
                 "SELECT * FROM projects WHERE repo = ?", (repo,)
             ).fetchone()
@@ -5020,6 +5077,9 @@ def run_project(
             repo,
             worktree,
             "worker",
+            input_fingerprint=_worktree_execplan_input_fingerprint(
+                worktree, catalog_plan
+            ),
         )
         result = run_codex(
             worktree,
@@ -5271,6 +5331,9 @@ def run_project(
             repo,
             worktree,
             "reviewer",
+            input_fingerprint=_worktree_execplan_input_fingerprint(
+                worktree, catalog_plan
+            ),
         )
 
         code, review = run_codex(
