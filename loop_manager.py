@@ -5148,7 +5148,7 @@ def resume_blocked_execplan_if_inputs_changed(
         message = f"BLOCKED Agent 변경 보존 실패:\n{error}"
         _update_blocked_error(connection, repo, str(plan["plan_id"]), message)
         return False
-    if remote_changed and not worktree_changed and worktree.is_dir():
+    if remote_changed and worktree.is_dir():
         rebased = git(
             worktree,
             "rebase",
