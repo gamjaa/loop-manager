@@ -34,6 +34,7 @@ FIELDS = {
     "processed_sha",
     "planning_fingerprint",
     "planning_attempt_fingerprint",
+    "planning_workspace_owned",
     "planning_retry_count",
     "planner_session_id",
     "worker_session_id",
@@ -63,6 +64,7 @@ CREATE TABLE IF NOT EXISTS projects (
     processed_sha TEXT,
     planning_fingerprint TEXT,
     planning_attempt_fingerprint TEXT,
+    planning_workspace_owned INTEGER NOT NULL DEFAULT 0,
     planning_retry_count INTEGER NOT NULL DEFAULT 0,
     planner_session_id TEXT,
     worker_session_id TEXT,
@@ -344,6 +346,7 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
         "plan_path": "TEXT",
         "planning_fingerprint": "TEXT",
         "planning_attempt_fingerprint": "TEXT",
+        "planning_workspace_owned": "INTEGER NOT NULL DEFAULT 0",
         "planning_retry_count": "INTEGER NOT NULL DEFAULT 0",
         "planner_session_id": "TEXT",
         "plan_sha": "TEXT",
@@ -1710,12 +1713,18 @@ def make_planning_worktree(
     base: str,
     *,
     allow_create: bool = True,
+    allow_existing: bool = True,
 ) -> str:
     if worktree.exists() and not worktree.is_dir():
         raise WorkspaceOwnershipError(
             f"planning worktree 경로가 디렉터리가 아닙니다: {worktree}"
         )
     if worktree.is_dir():
+        if not allow_existing:
+            raise WorkspaceOwnershipError(
+                "새 planning worktree 경로가 이미 존재해 소유권을 증명할 수 "
+                f"없습니다: {worktree}"
+            )
         validate_managed_worktree(repo, worktree, None)
         return "existing"
     if not allow_create:
@@ -2028,6 +2037,7 @@ def validate_planning_workspace_identity(
 
 
 def validate_planning_worktree_ownership(
+    connection: sqlite3.Connection,
     repo_path: Path,
     state_dir: Path,
     repo: str,
@@ -2035,6 +2045,20 @@ def validate_planning_worktree_ownership(
     worktree: Path,
 ) -> None:
     """Validate a saved planning path before reading, changing, or removing it."""
+
+    project = connection.execute(
+        "SELECT worktree, planning_workspace_owned FROM projects WHERE repo = ?",
+        (repo,),
+    ).fetchone()
+    if worktree.exists() and (
+        project is None
+        or not bool(project["planning_workspace_owned"])
+        or Path(str(project["worktree"] or "")) != worktree
+    ):
+        raise WorkspaceOwnershipError(
+            "planning worktree의 Loop Manager 소유권이 확인되지 않았습니다: "
+            f"{worktree}"
+        )
 
     if not fingerprint:
         raise WorkspaceOwnershipError(
@@ -2365,6 +2389,7 @@ def _clear_active_values(
         "pr_url": None,
         "last_error": None,
         "planning_attempt_fingerprint": None,
+        "planning_workspace_owned": 0,
         "planning_retry_count": 0,
         "planner_session_id": None,
         "worker_session_id": None,
@@ -2583,6 +2608,45 @@ def block_active_execplan_from_revision(
         )
 
 
+def validate_blocked_agent_scope(
+    connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+    selected_plan_path: str,
+) -> None:
+    """Revalidate preserved Agent output before a BLOCKED plan can resume."""
+
+    project = connection.execute(
+        "SELECT agent_role, agent_snapshot FROM projects WHERE repo = ?",
+        (repo,),
+    ).fetchone()
+    if project is None:
+        raise AgentScopeError("BLOCKED Agent 범위를 확인할 프로젝트가 없습니다.")
+    serialized = project["agent_snapshot"]
+    if not serialized:
+        return
+    role_name = str(project["agent_role"] or "")
+    if role_name not in {"planner", "worker", "reviewer"}:
+        raise AgentScopeError(
+            f"저장된 BLOCKED Agent 역할이 유효하지 않습니다: {role_name or '없음'}"
+        )
+    try:
+        before = GitSnapshot.deserialize(str(serialized))
+    except (KeyError, TypeError, ValueError, RuntimeError) as error:
+        raise AgentScopeError(
+            f"저장된 BLOCKED Agent Git snapshot이 유효하지 않습니다: {error}"
+        ) from error
+    validate_agent_scope(
+        role_name,
+        worktree,
+        before,
+        capture_git_snapshot(worktree),
+        selected_plan_path=(
+            selected_plan_path if role_name == "worker" else None
+        ),
+    )
+
+
 def resume_blocked_execplan_if_inputs_changed(
     connection: sqlite3.Connection,
     repo_path: Path,
@@ -2619,6 +2683,17 @@ def resume_blocked_execplan_if_inputs_changed(
         )
     except (RuntimeError, WorkspaceOwnershipError) as error:
         message = f"BLOCKED worktree 복구 실패:\n{error}"
+        _update_blocked_error(connection, repo, str(plan["plan_id"]), message)
+        return False
+    try:
+        validate_blocked_agent_scope(
+            connection,
+            repo,
+            worktree,
+            str(plan["path"]),
+        )
+    except (AgentScopeError, RuntimeError) as error:
+        message = f"BLOCKED Agent 범위 재검증 실패:\n{error}"
         _update_blocked_error(connection, repo, str(plan["plan_id"]), message)
         return False
     worktree_changed = (
@@ -2694,6 +2769,22 @@ def complete_merged_worktree(
     if plan_id is None:
         raise WorkspaceOwnershipError("Merge cleanup ExecPlan ID를 확인할 수 없습니다.")
     branch = str(project["branch"] or "")
+    _ensure_execplans_schema(connection)
+    plan = connection.execute(
+        "SELECT branch, worktree, workspace_owned FROM exec_plans "
+        "WHERE repo = ? AND plan_id = ?",
+        (repo, plan_id),
+    ).fetchone()
+    if worktree.exists() and (
+        plan is None
+        or not bool(plan["workspace_owned"])
+        or str(plan["branch"] or "") != branch
+        or Path(str(plan["worktree"] or "")) != worktree
+    ):
+        raise WorkspaceOwnershipError(
+            "Merge cleanup worktree의 Loop Manager 소유권이 확인되지 않았습니다: "
+            f"{worktree}"
+        )
     validate_execplan_workspace_identity(
         state_dir,
         repo,
@@ -3120,6 +3211,7 @@ def run_project(
                     "planning worktree 경로가 저장되지 않았습니다."
                 )
             validate_planning_worktree_ownership(
+                connection,
                 repo_path,
                 state_dir,
                 repo,
@@ -3157,6 +3249,7 @@ def run_project(
                         "planning worktree 경로가 저장되지 않았습니다."
                     )
                 validate_planning_worktree_ownership(
+                    connection,
                     repo_path,
                     state_dir,
                     repo,
@@ -3210,6 +3303,7 @@ def run_project(
             active_sha=base_sha,
             plan_sha=None,
             planning_attempt_fingerprint=current_fingerprint,
+            planning_workspace_owned=0,
             planning_retry_count=0,
             planner_session_id=None,
             worker_session_id=None,
@@ -3248,12 +3342,17 @@ def run_project(
                 or row["planning_retry_count"]
                 or row["last_error"]
             )
+            planning_workspace_owned = bool(row["planning_workspace_owned"])
             make_planning_worktree(
                 repo_path,
                 planning_worktree,
                 base,
-                allow_create=not planning_started,
+                allow_create=(
+                    not planning_started and not planning_workspace_owned
+                ),
+                allow_existing=planning_workspace_owned,
             )
+            update_project(connection, repo, planning_workspace_owned=1)
         except WorkspaceOwnershipError as error:
             validation_error = f"planning workspace 소유권 검증 실패: {error}"
             update_project(
@@ -3438,6 +3537,7 @@ def run_project(
         if validated_result is None:
             completed_fingerprint = _planning_input_fingerprint(repo_path, row["active_sha"])
             validate_planning_worktree_ownership(
+                connection,
                 repo_path,
                 state_dir,
                 repo,
@@ -3483,6 +3583,7 @@ def run_project(
                 ).returncode == 0
                 if not published:
                     validate_planning_worktree_ownership(
+                        connection,
                         repo_path,
                         state_dir,
                         repo,
@@ -3523,6 +3624,14 @@ def run_project(
                     operation_print("ExecPlan push 결과 확인에 실패했습니다.", file=sys.stderr)
                     return 1
 
+            validate_planning_worktree_ownership(
+                connection,
+                repo_path,
+                state_dir,
+                repo,
+                current_fingerprint,
+                planning_worktree,
+            )
             register_execplans(
                 connection,
                 repo,
@@ -3530,13 +3639,6 @@ def run_project(
                 plans,
                 plan_commit,
                 current_fingerprint,
-            )
-            validate_planning_worktree_ownership(
-                repo_path,
-                state_dir,
-                repo,
-                current_fingerprint,
-                planning_worktree,
             )
             git(repo_path, "worktree", "remove", str(planning_worktree))
             base_sha = latest_sha

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import io
 import os
@@ -3441,12 +3442,16 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     for row in connection.execute("PRAGMA table_info(projects)")
                 }
                 row = connection.execute(
-                    "SELECT agent_role, agent_snapshot FROM projects "
+                    "SELECT agent_role, agent_snapshot, planning_workspace_owned "
+                    "FROM projects "
                     "WHERE repo = 'repo'"
                 ).fetchone()
 
-            self.assertTrue({"agent_role", "agent_snapshot"} <= columns)
-            self.assertEqual(tuple(row), (None, None))
+            self.assertTrue(
+                {"agent_role", "agent_snapshot", "planning_workspace_owned"}
+                <= columns
+            )
+            self.assertEqual(tuple(row), (None, None, 0))
 
     def test_reviewer_mutation_blocks_even_when_verdict_passes(self):
 
@@ -3528,6 +3533,55 @@ class AgentScopeValidatorTest(unittest.TestCase):
             self.assertNotIn("keep for diagnosis", project["agent_snapshot"])
             self.assertIsNotNone(plan["blocked_fingerprint"])
             self.assertTrue((worktree / "reviewer.txt").is_file())
+
+            (repo / "docs/PRODUCT.md").write_text(
+                "# Product changed after blocked review\n",
+                encoding="utf-8",
+            )
+            commit_and_push(repo, "Change source after blocked review")
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as resumed_agent:
+                resumed_result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            resumed_project = connection.execute(
+                "SELECT phase, last_error, agent_role, agent_snapshot "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            resumed_plan = connection.execute(
+                "SELECT status, blocked_fingerprint FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(resumed_result, 1)
+            self.assertEqual(resumed_project["phase"], "BLOCKED")
+            self.assertIn(
+                "BLOCKED Agent 범위 재검증 실패",
+                resumed_project["last_error"],
+            )
+            self.assertIn("reviewer.txt", resumed_project["last_error"])
+            self.assertEqual(resumed_project["agent_role"], "reviewer")
+            self.assertIsNotNone(resumed_project["agent_snapshot"])
+            self.assertEqual(resumed_plan["status"], "BLOCKED")
+            self.assertIsNotNone(resumed_plan["blocked_fingerprint"])
+            self.assertTrue((worktree / "reviewer.txt").is_file())
+            resumed_agent.assert_not_called()
 
 
 class WorkspaceRecoveryTest(unittest.TestCase):
@@ -3834,6 +3888,119 @@ class WorkspaceRecoveryTest(unittest.TestCase):
             self.assertFalse(worktree.exists())
             resumed_agent.assert_not_called()
 
+    def test_new_planning_rejects_preexisting_detached_worktree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = make_remote_repository(directory)
+            state_dir = root / "state"
+            fingerprint = loop_manager.planning_input_fingerprint(repo, "main")
+            project_id = hashlib.sha256(str(repo).encode()).hexdigest()[:16]
+            planning_worktree = (
+                state_dir
+                / "worktrees"
+                / project_id
+                / "planning"
+                / fingerprint
+            )
+            planning_worktree.parent.mkdir(parents=True)
+            git_command(
+                repo,
+                "worktree",
+                "add",
+                "--detach",
+                str(planning_worktree),
+                "origin/main",
+            )
+            marker = planning_worktree / "keep.txt"
+            marker.write_text("preserve me\n", encoding="utf-8")
+            original_head = git_command(planning_worktree, "rev-parse", "HEAD")
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+                (str(repo),),
+            )
+            connection.commit()
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as run_agent:
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, planning_error, planning_workspace_owned "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(result, 1)
+            self.assertEqual(project["phase"], "PLANNING")
+            self.assertIn(
+                "새 planning worktree 경로가 이미 존재",
+                project["planning_error"],
+            )
+            self.assertEqual(project["planning_workspace_owned"], 0)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "preserve me\n")
+            self.assertEqual(
+                git_command(planning_worktree, "rev-parse", "HEAD"),
+                original_head,
+            )
+            run_agent.assert_not_called()
+
+            (repo / "docs/PRODUCT.md").write_text(
+                "# Changed planning input\n",
+                encoding="utf-8",
+            )
+            commit_and_push(repo, "Change planning input")
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as resumed_agent:
+                resumed_result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            resumed = connection.execute(
+                "SELECT planning_error, planning_workspace_owned "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(resumed_result, 1)
+            self.assertIn(
+                "planning worktree의 Loop Manager 소유권이 확인되지 않았습니다",
+                resumed["planning_error"],
+            )
+            self.assertEqual(resumed["planning_workspace_owned"], 0)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "preserve me\n")
+            self.assertEqual(
+                git_command(planning_worktree, "rev-parse", "HEAD"),
+                original_head,
+            )
+            resumed_agent.assert_not_called()
+
     def test_started_planning_worktree_is_not_recreated_from_origin(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -3957,6 +4124,93 @@ class WorkspaceRecoveryTest(unittest.TestCase):
                     root / "elsewhere",
                 )
 
+
+    def test_merge_cleanup_preserves_unowned_deterministic_worktree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                repo,
+                state_dir,
+                connection,
+                plan,
+                plan_sha,
+                branch,
+                worktree,
+            ) = self._ready_execplan(directory)
+            loop_manager.make_worktree(repo, worktree, branch, "main")
+            (worktree / "src/app.py").write_text("VALUE = 2\n", encoding="utf-8")
+            git_command(worktree, "add", "src/app.py")
+            git_command(worktree, "commit", "-m", "Unowned implementation")
+            pr_head = git_command(worktree, "rev-parse", "HEAD")
+            pr_url = "https://example.test/pr/12"
+            connection.execute(
+                """
+                UPDATE exec_plans
+                SET status = 'PR_OPEN', active_sha = ?, branch = ?, worktree = ?,
+                    pr_url = ?
+                WHERE repo = ? AND plan_id = 'G-012'
+                """,
+                (plan_sha, branch, str(worktree), pr_url, str(repo)),
+            )
+            connection.execute(
+                """
+                UPDATE projects
+                SET active_sha = ?, plan_sha = ?, phase = 'PR_OPEN',
+                    branch = ?, worktree = ?, plan_path = ?, pr_url = ?
+                WHERE repo = ?
+                """,
+                (
+                    plan_sha,
+                    plan_sha,
+                    branch,
+                    str(worktree),
+                    plan.relative_to(repo).as_posix(),
+                    pr_url,
+                    str(repo),
+                ),
+            )
+            connection.commit()
+            merged_pr = {
+                "url": pr_url,
+                "state": "MERGED",
+                "mergedAt": "2026-01-01T00:00:00Z",
+                "headRefOid": pr_head,
+            }
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=merged_pr
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as run_agent:
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            plan_status = connection.execute(
+                "SELECT status, workspace_owned FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-012'",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(result, 1)
+            self.assertEqual(project["phase"], "BLOCKED")
+            self.assertIn(
+                "Merge cleanup worktree의 Loop Manager 소유권이 확인되지 않았습니다",
+                project["last_error"],
+            )
+            self.assertEqual(tuple(plan_status), ("BLOCKED", 0))
+            self.assertTrue(worktree.is_dir())
+            self.assertEqual(git_command(worktree, "rev-parse", "HEAD"), pr_head)
+            run_agent.assert_not_called()
 
     def test_merge_cleanup_preserves_unowned_saved_path_and_blocks(self):
         with tempfile.TemporaryDirectory() as directory:
