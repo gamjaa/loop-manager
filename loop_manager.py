@@ -5032,11 +5032,11 @@ def resume_blocked_execplan_if_inputs_changed(
     worktree = Path(str(plan["worktree"]))
     branch = str(plan["branch"] or "")
     revision = f"refs/remotes/origin/{base}"
-    remote_changed = (
+    remote_input_changed = (
         _revision_execplan_input_fingerprint(repo_path, revision, plan) != stored
     )
     if int(plan["workspace_owned"]) != WORKSPACE_OWNED:
-        if not remote_changed:
+        if not remote_input_changed:
             return False
         try:
             validate_execplan_workspace_identity(
@@ -5134,7 +5134,7 @@ def resume_blocked_execplan_if_inputs_changed(
         current_worktree_fingerprint != stored
         and current_worktree_fingerprint != blocked_worktree_fingerprint
     )
-    if not worktree_changed and not remote_changed:
+    if not worktree_changed and not remote_input_changed:
         return False
     try:
         preserved_before = preserve_blocked_agent_changes(
@@ -5148,7 +5148,22 @@ def resume_blocked_execplan_if_inputs_changed(
         message = f"BLOCKED Agent 변경 보존 실패:\n{error}"
         _update_blocked_error(connection, repo, str(plan["plan_id"]), message)
         return False
-    if remote_changed and worktree.is_dir():
+    base_ancestry = git(
+        worktree,
+        "merge-base",
+        "--is-ancestor",
+        revision,
+        "HEAD",
+        check=False,
+    )
+    if base_ancestry.returncode not in (0, 1):
+        error = (
+            "BLOCKED 해제 전 원격 base ancestry 확인 실패:\n"
+            f"{base_ancestry.stdout[-8000:]}"
+        )
+        _update_blocked_error(connection, repo, str(plan["plan_id"]), error)
+        return False
+    if base_ancestry.returncode == 1:
         rebased = git(
             worktree,
             "rebase",

@@ -5317,7 +5317,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
             self.assertEqual(project["agent_input_plan"], input_plan)
             self.assertEqual(project["agent_result_plan"], result_plan)
 
-    def test_blocked_scope_resume_rebases_remote_and_accepts_direct_execplan_edit(self):
+    def test_blocked_scope_resume_rebases_non_source_remote_and_direct_execplan_edit(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo, plan_path = self._repository_with_plan(directory)
@@ -5444,12 +5444,20 @@ class AgentScopeValidatorTest(unittest.TestCase):
             self.assertIsNotNone(persisted_block["agent_manager_snapshot"])
             blocked_agent.assert_not_called()
 
-            (repo / "docs/PRODUCT.md").write_text(
-                "# Product\n\nRemote clarification after scope block.\n",
+            (repo / "docs/notes.md").write_text(
+                "# Notes\n\nRemote non-input change.\n",
                 encoding="utf-8",
             )
-            commit_and_push(repo, "Clarify blocked scope input")
+            commit_and_push(repo, "Change non-input documentation")
             remote_head = git_command(repo, "rev-parse", "origin/main")
+            self.assertEqual(
+                loop_manager._revision_execplan_input_fingerprint(
+                    repo,
+                    "refs/remotes/origin/main",
+                    plan,
+                ),
+                input_fingerprint,
+            )
 
             user_mixed_plan_text = plan_file.read_text(encoding="utf-8") + (
                 "\nUser clarification after scope block.\n"
@@ -5494,25 +5502,25 @@ class AgentScopeValidatorTest(unittest.TestCase):
             recovery_temp.write_bytes(b"partial interrupted contents")
             self.assertFalse((worktree / "reviewer.txt").exists())
 
-            def resumed_planner(_agent_worktree, *_args, **_kwargs):
-                self.assertEqual(_args[2], "planner")
+            def resumed_worker(agent_worktree, *_args, **_kwargs):
+                self.assertEqual(_args[2], "worker")
                 self.assertEqual(
-                    (worktree / plan_path).read_text(encoding="utf-8"),
+                    (agent_worktree / plan_path).read_text(encoding="utf-8"),
                     user_plan_text,
                 )
                 self.assertNotIn(
                     "Reviewer mutation.",
-                    (worktree / plan_path).read_text(encoding="utf-8"),
+                    (agent_worktree / plan_path).read_text(encoding="utf-8"),
                 )
-                self.assertIn(
-                    "Remote clarification after scope block.",
-                    (worktree / "docs/PRODUCT.md").read_text(
+                self.assertEqual(
+                    (agent_worktree / "docs/notes.md").read_text(
                         encoding="utf-8"
                     ),
+                    "# Notes\n\nRemote non-input change.\n",
                 )
                 self.assertEqual(
                     git_command(
-                        worktree,
+                        agent_worktree,
                         "merge-base",
                         "--is-ancestor",
                         remote_head,
@@ -5520,11 +5528,11 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     ),
                     "",
                 )
-                self.assertFalse((worktree / "reviewer.txt").exists())
+                self.assertFalse((agent_worktree / "reviewer.txt").exists())
                 return loop_manager.CodexResult(
                     1,
                     "stop after combined input recovery",
-                    "planner-session",
+                    "worker-session",
                 )
 
             with mock.patch(
@@ -5536,7 +5544,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
             ), mock.patch(
                 "loop_manager.pr_for_branch", return_value=None
             ), mock.patch(
-                "loop_manager.run_codex", side_effect=resumed_planner
+                "loop_manager.run_codex", side_effect=resumed_worker
             ) as resumed_agent:
                 result = loop_manager.run_project(
                     connection,
@@ -5558,13 +5566,13 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 (str(repo),),
             ).fetchone()
             self.assertEqual(result, 1)
-            self.assertEqual(project["phase"], "PLANNING")
+            self.assertEqual(project["phase"], "WORKING")
             self.assertEqual(
                 project["last_error"],
                 "stop after combined input recovery",
             )
             self.assertIsNone(project["agent_snapshot"])
-            self.assertEqual(resumed_plan["status"], "READY")
+            self.assertEqual(resumed_plan["status"], "IMPLEMENTING")
             self.assertIsNone(resumed_plan["blocked_fingerprint"])
             self.assertIsNone(resumed_plan["blocked_worktree_fingerprint"])
             self.assertEqual(plan_file.read_text(encoding="utf-8"), user_plan_text)
@@ -5578,7 +5586,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
             )
             self.assertIn("Reviewer mutation.", stashed_plan)
             resumed_agent.assert_called_once()
-            self.assertEqual(resumed_agent.call_args.args[3], "planner")
+            self.assertEqual(resumed_agent.call_args.args[3], "worker")
 
     def test_verify_mutation_of_worker_protected_file_blocks_before_commit(self):
         with tempfile.TemporaryDirectory() as directory:
