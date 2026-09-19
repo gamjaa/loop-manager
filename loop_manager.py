@@ -1122,11 +1122,10 @@ def run_project(
         if (
             row["planning_result_pending_validation"]
             and not row["planning_result_completed"]
-            and head == row["active_sha"]
-            and not dirty_files
         ):
-            # An interrupted Planner that produced no filesystem result has
-            # not reached a validation boundary. Resume its saved session.
+            # A Planner CLI interruption has not reached a validation boundary,
+            # even when the previous invalid result remains in the worktree.
+            # Resume its saved session before considering that old diff again.
             update_project(
                 connection,
                 repo,

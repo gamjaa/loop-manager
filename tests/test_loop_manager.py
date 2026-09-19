@@ -687,24 +687,27 @@ class LoopManagerTest(unittest.TestCase):
             self.assertIsNone(resumed["planning_error"])
 
 
-    def test_interrupted_planner_correction_is_validated_before_another_resume(self):
+    def test_interrupted_planner_correction_before_edit_resumes_with_invalid_diff(self):
         planner_calls = 0
 
         def agent(worktree, _state, _config, role_name, _prompt, **_kwargs):
             nonlocal planner_calls
             self.assertEqual(role_name, "planner")
             planner_calls += 1
-            (worktree / "unexpected.txt").write_text(
-                f"invalid {planner_calls}\n", encoding="utf-8"
-            )
+            if planner_calls == 1:
+                (worktree / "unexpected.txt").write_text(
+                    "invalid\n", encoding="utf-8"
+                )
+                return loop_manager.CodexResult(0, "", "planner-session")
             if planner_calls == 2:
                 saved = connection.execute(
                     "SELECT planning_result_pending_validation FROM projects WHERE repo = ?",
                     (str(repo),),
                 ).fetchone()
                 self.assertEqual(saved["planning_result_pending_validation"], 1)
-                raise RuntimeError("process interrupted during Planner correction")
-            return loop_manager.CodexResult(0, "", "planner-session")
+                raise RuntimeError("process interrupted before Planner correction")
+            self.assertEqual(_kwargs["session_id"], "planner-session")
+            return loop_manager.CodexResult(1, "planner timeout", "planner-session")
 
         with tempfile.TemporaryDirectory() as directory:
             repo = make_remote_repository(directory)
@@ -738,6 +741,7 @@ class LoopManagerTest(unittest.TestCase):
                 ).fetchone()
                 self.assertEqual(interrupted["planning_result_pending_validation"], 1)
                 self.assertEqual(interrupted["planning_retry_count"], 0)
+                self.assertTrue((Path(interrupted["worktree"]) / "unexpected.txt").is_file())
 
                 self.assertEqual(
                     loop_manager.run_project(
@@ -749,8 +753,8 @@ class LoopManagerTest(unittest.TestCase):
             resumed = connection.execute(
                 "SELECT * FROM projects WHERE repo = ?", (str(repo),)
             ).fetchone()
-            self.assertEqual(planner_calls, 2)
-            self.assertEqual(resumed["planning_retry_count"], 1)
+            self.assertEqual(planner_calls, 3)
+            self.assertEqual(resumed["planning_retry_count"], 0)
             self.assertEqual(resumed["planning_result_pending_validation"], 0)
             self.assertIsNone(resumed["planning_error"])
 
