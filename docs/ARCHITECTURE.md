@@ -95,7 +95,7 @@ priority는 `critical`, `high`, `normal`, `low` 순이며 안전한 무인 실�
 
 SQLite는 `<state-dir>/loop-manager.db`에 저장하며 상태 변경은 transaction으로 기록한다. 문서 본문이나 ExecPlan 본문은 SQLite에 복제하지 않고 경로와 내용 해시만 저장한다.
 
-SQLite에는 등록 프로젝트, 기준 branch, 선택한 provider, `AGENTS.md` 승인 해시, 계획 입력 지문과 `planning_error`, ExecPlan 메타데이터와 의존성, 실행 상태와 재시도 횟수, AI Agent 세션, worktree, branch, PR, `cleanup_pending`, 알림과 프로젝트 완료 주기를 저장한다.
+SQLite에는 등록 프로젝트, 기준 branch, 선택한 provider, 등록 시 `AGENTS.md` 승인 해시, `AGENTS.md` 변경 제안에 대한 대상 경로·사용자 결정·확정 patch 해시, 계획 입력 지문과 `planning_error`, ExecPlan 메타데이터와 의존성, 실행 상태와 재시도 횟수, AI Agent 세션, worktree, branch, PR, `cleanup_pending`, 알림과 프로젝트 완료 주기를 저장한다.
 
 실행 시작 시 SQLite, Git worktree/branch와 GitHub PR 상태를 대조한다. 서로 다르면 GitHub Merge 상태, 프로젝트 파일, SQLite 실행 정보 순으로 각 소유 영역의 원본을 적용한다.
 
@@ -185,6 +185,19 @@ ExecPlan 파일은 구현 PR에 처음 포함하지 않는다. Planner 단계에
 - 상태 분류, 설정 검증, Git/GitHub 명령과 verify 실행은 프로그램 코드가 담당한다
 - AI Agent와 verify subprocess에는 역할 수행에 필요한 환경 변수만 전달하고 Telegram token을 포함한 Loop Manager 비밀값을 상속하지 않는다
 
+### AGENTS.md 변경 제안과 승인
+
+- Worker는 현재 ExecPlan에 필요한 `AGENTS.md` 변경을 발견해도 파일을 직접 수정하지 않고 선택된 ExecPlan의 `Decision Log`에 대상 경로, 프로젝트 전용·공통 범위, 이유, 영향과 정확한 patch를 기록한다
+- 현재 프로젝트의 `AGENTS.md`는 해당 프로젝트 Worker가 제안할 수 있다. 향후 프로젝트 설정에 사용하는 기준 `AGENTS.md`의 공통 규칙은 Loop Manager 자체 저장소의 Worker만 제안할 수 있다
+- 프로그램은 Worker 결과와 ExecPlan diff에서 완전한 제안을 확인한 뒤 제안이 포함된 ExecPlan 및 기존 구현 변경을 보존하고, commit과 검증 전에 ExecPlan을 BLOCKED로 전환한다
+- AGENTS 변경 승인 BLOCKED에는 일반적인 source 내용 해시 해제를 적용하지 않는다. 사용자는 보존된 관리 worktree의 같은 ExecPlan에서 해당 제안의 `User Decision`만 수정해 승인, 거절 또는 정확한 대체 patch를 기록한다
+- 프로그램은 결정이 참조하는 제안, 대상 경로와 확정 patch를 정규화해 hash하고 SQLite 승인 기록과 결합한다. 결정란 밖의 문서 변경은 승인으로 해석하지 않는다
+- 승인 또는 대체 결정이면 같은 Worker 세션을 재개해 확정 patch를 적용하고, 거절이면 `AGENTS.md`를 변경하지 않은 채 재개한다
+- Agent 실행 후 실제 `AGENTS.md` diff를 승인된 대상과 patch에 결정적으로 대조한다. 차이가 있으면 게시하지 않고 승인을 무효화한 뒤 최신 patch 제안을 요구한다
+- 승인된 변경을 적용한 뒤에는 일반 Worker 변경과 동일하게 targeted test, 전체 verify와 읽기 전용 Review를 거쳐 같은 구현 PR에 포함한다
+- Planner와 Reviewer의 `AGENTS.md` 변경, 승인 전 Worker의 직접 변경 및 승인 대상 밖의 변경은 제안 흐름이 아니라 역할 범위 위반으로 처리한다
+- 승인된 기준 `AGENTS.md`는 이후 프로젝트 설정의 공통 원본으로만 사용하고 기존 등록 프로젝트에는 자동 배포하지 않는다
+
 ## Model과 Effort
 
 기본 Model alias는 다음 계열을 사용한다.
@@ -223,7 +236,7 @@ BLOCKED → PR_OPEN
 - PR_OPEN은 GitHub 상태를 확인해 MERGED 또는 BLOCKED로 전이한다
 - 닫힌 PR로 인한 BLOCKED는 같은 PR이 다시 Open됐을 때만 PR_OPEN으로 전이한다
 
-일반적인 BLOCKED 전환 시 ExecPlan과 `sources` 문서의 내용 해시를 저장한다. 이후 어느 하나가 바뀌면 재시도 횟수를 초기화하고 READY로 전이한다. 내용이 같으면 BLOCKED를 유지한다. 단, 닫힌 PR로 인한 BLOCKED에는 이 규칙을 적용하지 않는다.
+일반적인 BLOCKED 전환 시 ExecPlan과 `sources` 문서의 내용 해시를 저장한다. 이후 어느 하나가 바뀌면 재시도 횟수를 초기화하고 READY로 전이한다. 내용이 같으면 BLOCKED를 유지한다. 닫힌 PR과 `AGENTS.md` 변경 승인을 기다리는 BLOCKED에는 이 규칙을 적용하지 않는다. `AGENTS.md` 변경 승인은 선택된 ExecPlan의 대응하는 `User Decision`에 유효한 결정이 기록되고 대상 경로 및 확정 patch hash가 저장된 경우에만 READY로 전이한다.
 
 `planning_error`는 ExecPlan 생성 전 프로젝트 단위 오류다. 해결되지 않은 동안 같은 계획 입력 지문으로 Planner를 다시 실행하거나 프로젝트 완료 처리하지 않는다. `cleanup_pending`은 MERGED된 ExecPlan의 worktree를 보존했다는 경고이며 ExecPlan 상태 전이를 만들거나 다음 작업과 프로젝트 완료를 막지 않는다.
 
@@ -284,6 +297,7 @@ Telegram token과 chat ID가 모두 설정된 경우에만 알림 이벤트와 �
 - 관리 worktree, SQLite, 임시 파일, 로그와 lock은 source checkout 밖의 `<state-dir>`에만 만든다
 - 모든 계획과 구현 변경은 Loop Manager가 만든 관리 worktree 안에서만 수행한다
 - AI Agent가 접근하고 수정할 수 있는 경로를 해당 관리 worktree로 제한한다
+- Worker가 제안한 `AGENTS.md` 변경은 승인 전 실제 파일에 적용하지 않으며, 승인 후에도 사용자 결정에 결합된 대상과 patch만 허용한다
 - `git fetch`와 `git worktree add/remove`는 공유 Git metadata만 변경하며 기본 worktree의 파일, index와 HEAD는 변경하지 않아야 한다
 - 관리 worktree는 미커밋 변경과 PR head에 없는 로컬 commit이 없다고 확인된 때만 강제 옵션 없이 제거한다. base branch ancestry나 GitHub Merge 방식은 push 여부 판정에 사용하지 않는다
 - PR head 정보나 commit 관계를 확인할 수 없으면 worktree를 보존하고 `cleanup_pending`으로 기록한다
