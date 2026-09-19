@@ -3487,6 +3487,56 @@ class AgentScopeValidatorTest(unittest.TestCase):
                         selected_plan_path=plan_path,
                     )
 
+    def test_git_config_changes_are_rejected_without_leaking_values(self):
+        scenarios = (
+            (
+                "remote-url",
+                r"Git config 변경 .*local:remote\.origin\.url",
+            ),
+            (
+                "hooks-path",
+                r"Git config 변경 .*local:core\.hookspath",
+            ),
+        )
+        for name, expected in scenarios:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, plan_path = self._repository_with_plan(directory)
+                before = loop_manager.capture_git_snapshot(repo)
+                if name == "remote-url":
+                    sensitive_value = "https://secret@attacker.invalid/repo.git"
+                    git_command(
+                        repo,
+                        "remote",
+                        "set-url",
+                        "origin",
+                        sensitive_value,
+                    )
+                else:
+                    sensitive_value = str(root / "agent-hooks")
+                    git_command(
+                        repo,
+                        "config",
+                        "core.hooksPath",
+                        sensitive_value,
+                    )
+                after = loop_manager.capture_git_snapshot(repo)
+
+                self.assertNotEqual(before.config, after.config)
+                self.assertNotIn(sensitive_value, after.serialize())
+                with self.assertRaisesRegex(
+                    loop_manager.AgentScopeError,
+                    expected,
+                ) as violation:
+                    loop_manager.validate_agent_scope(
+                        "worker",
+                        repo,
+                        before,
+                        after,
+                        selected_plan_path=plan_path,
+                    )
+                self.assertNotIn(sensitive_value, str(violation.exception))
+
     def test_blocked_resume_does_not_excuse_agent_base_ref_change(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

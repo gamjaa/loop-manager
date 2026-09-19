@@ -174,12 +174,13 @@ class GitSnapshot:
     dirty: dict[str, tuple[tuple[str, ...], str]]
     refs: dict[str, tuple[str, str]]
     worktrees: dict[str, tuple[str, ...]]
+    config: dict[str, tuple[str, ...]]
     shared_metadata_complete: bool = True
 
     def serialize(self) -> str:
         return json.dumps(
             {
-                "version": 2,
+                "version": 3,
                 "head": self.head,
                 "branch": self.branch,
                 "index": {path: list(entries) for path, entries in self.index.items()},
@@ -191,6 +192,9 @@ class GitSnapshot:
                 "worktrees": {
                     path: list(state) for path, state in self.worktrees.items()
                 },
+                "config": {
+                    key: list(values) for key, values in self.config.items()
+                },
             },
             ensure_ascii=True,
             separators=(",", ":"),
@@ -201,7 +205,7 @@ class GitSnapshot:
     def deserialize(cls, value: str) -> GitSnapshot:
         parsed = json.loads(value)
         version = parsed.get("version")
-        if version not in {1, 2}:
+        if version not in {1, 2, 3}:
             raise RuntimeError("저장된 Agent Git snapshot 형식을 지원하지 않습니다.")
         return cls(
             head=str(parsed["head"]),
@@ -225,7 +229,11 @@ class GitSnapshot:
                 str(path): tuple(str(entry) for entry in state)
                 for path, state in parsed.get("worktrees", {}).items()
             },
-            shared_metadata_complete=version == 2,
+            config={
+                str(key): tuple(str(value) for value in values)
+                for key, values in parsed.get("config", {}).items()
+            },
+            shared_metadata_complete=version == 3,
         )
 
 
@@ -1871,6 +1879,37 @@ def _registered_worktree_entries(
     return entries
 
 
+def _config_entries(worktree: Path) -> dict[str, tuple[str, ...]]:
+    records = git_bytes(
+        worktree,
+        "config",
+        "--null",
+        "--show-origin",
+        "--show-scope",
+        "--list",
+        "--includes",
+    ).split(b"\0")
+    if records and not records[-1]:
+        records.pop()
+    if len(records) % 3:
+        raise RuntimeError("Git config snapshot을 해석할 수 없습니다.")
+
+    entries: dict[str, list[str]] = {}
+    for offset in range(0, len(records), 3):
+        raw_scope, raw_origin, definition = records[offset : offset + 3]
+        raw_name, separator, raw_value = definition.partition(b"\n")
+        if not raw_scope or not raw_origin or not raw_name or not separator:
+            raise RuntimeError("Git config snapshot을 해석할 수 없습니다.")
+        scope = raw_scope.decode("ascii", errors="replace")
+        name = raw_name.decode("utf-8", errors="replace")
+        digest = hashlib.sha256(raw_origin + b"\0" + raw_value).hexdigest()
+        entries.setdefault(f"{scope}:{name}", []).append(digest)
+    return {
+        key: tuple(sorted(values))
+        for key, values in entries.items()
+    }
+
+
 def _metadata_changes_after_block(
     before: Mapping[str, object],
     blocked: Mapping[str, object],
@@ -1980,6 +2019,7 @@ def capture_git_snapshot(worktree: Path) -> GitSnapshot:
         dirty=dirty,
         refs=_shared_ref_entries(worktree),
         worktrees=_registered_worktree_entries(worktree),
+        config=_config_entries(worktree),
     )
 
 
@@ -2076,6 +2116,12 @@ def validate_agent_scope(
                 before.worktrees,
                 after.worktrees,
                 allowed_worktree_changes,
+            ),
+            (
+                "Git config",
+                before.config,
+                after.config,
+                frozenset(),
             ),
         )
         for label, before_state, after_state, allowed_changes in metadata_states:
