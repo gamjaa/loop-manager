@@ -2043,6 +2043,52 @@ class WorkerPublicationTest(unittest.TestCase):
                 with self.assertRaises(loop_manager.WorkerResultError):
                     loop_manager.parse_worker_result(result, self.plan)
 
+    def test_github_origin_normalization_matches_repository_validation(self):
+        self.assertEqual(
+            loop_manager.github_repository("HTTPS://WWW.GitHub.Com/Owner/Repo.GIT"),
+            "owner/repo",
+        )
+        url = loop_manager.immutable_github_blob_url(
+            "https://www.github.com/Owner/Repo.git",
+            "a" * 40,
+            "docs/plans/[G-008] 한글.md",
+        )
+        self.assertIn("github.com/owner/repo/blob/", url)
+        self.assertIn("%5BG-008%5D%20%ED%95%9C%EA%B8%80.md", url)
+
+    def test_existing_active_database_backfills_plan_sha_or_blocks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            (repo / "docs/plans").mkdir()
+            plan = write_execplan(repo, "G-001", "Worker Boundary")
+            git_command(repo, "add", str(plan.relative_to(repo)))
+            git_command(repo, "commit", "-m", "Add ExecPlan G-001: Worker Boundary")
+            plan_sha = git_command(repo, "rev-parse", "HEAD")
+            state_dir = Path(directory) / "state"
+            state_dir.mkdir()
+            database = sqlite3.connect(state_dir / "loop-manager.db")
+            database.execute(loop_manager.SCHEMA.replace("    plan_sha TEXT,\n", ""))
+            database.execute(
+                "INSERT INTO projects (repo, base_branch, active_sha, phase, plan_path) "
+                "VALUES (?, 'main', 'rebased', 'WORKING', ?)",
+                (str(repo), plan.relative_to(repo).as_posix()),
+            )
+            database.commit()
+            database.close()
+
+            with loop_manager.connect_database(state_dir) as connection:
+                row = connection.execute(
+                    "SELECT plan_sha, phase FROM projects WHERE repo = ?", (str(repo),)
+                ).fetchone()
+                loop_manager.clear_active(connection, str(repo))
+                cleared = connection.execute(
+                    "SELECT plan_sha FROM projects WHERE repo = ?", (str(repo),)
+                ).fetchone()
+
+        self.assertEqual(row["plan_sha"], plan_sha)
+        self.assertEqual(row["phase"], "WORKING")
+        self.assertIsNone(cleared["plan_sha"])
+
     def test_invalid_worker_result_resumes_same_session_without_verify(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = make_remote_repository(directory)

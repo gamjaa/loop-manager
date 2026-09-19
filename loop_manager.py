@@ -204,6 +204,7 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
         connection.commit()
     connection.execute(CLEANUP_PENDING_SCHEMA)
     connection.commit()
+    backfill_plan_shas(connection)
     return connection
 
 
@@ -243,6 +244,59 @@ def command(
 
 def git(repo: Path, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     return command(["git", "-C", str(repo), *arguments], check=check)
+
+
+def github_repository(origin_url: str) -> str:
+    match = re.fullmatch(
+        r"(?:git@|ssh://git@|https://)(?:www\.)?github\.com[:/](?P<owner>[^/:\s]+)/(?P<repo>[^/\s]+?)(?:\.git)?/?",
+        origin_url.strip(),
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        raise RuntimeError("origin이 GitHub 저장소가 아닙니다.")
+    return f"{match.group('owner')}/{match.group('repo')}".lower()
+
+
+def backfill_plan_shas(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        """
+        SELECT repo, plan_path
+        FROM projects
+        WHERE plan_sha IS NULL
+          AND plan_path IS NOT NULL
+          AND phase IN ('WORKING', 'VERIFYING', 'REVIEWING', 'PUBLISHING', 'BLOCKED')
+        """
+    ).fetchall()
+    for row in rows:
+        result = git(
+            Path(row["repo"]),
+            "log",
+            "--all",
+            "--diff-filter=A",
+            "--format=%H",
+            "--",
+            row["plan_path"],
+            check=False,
+        )
+        commits = [
+            value
+            for value in result.stdout.splitlines()
+            if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", value)
+        ]
+        if len(commits) == 1:
+            connection.execute(
+                "UPDATE projects SET plan_sha = ? WHERE repo = ?",
+                (commits[0], row["repo"]),
+            )
+        else:
+            connection.execute(
+                "UPDATE projects SET phase = 'BLOCKED', last_error = ? WHERE repo = ?",
+                (
+                    "계획 commit SHA를 기존 작업에서 안전하게 복구할 수 없습니다.",
+                    row["repo"],
+                ),
+            )
+    connection.commit()
 
 
 def git_bytes(repo: Path, *arguments: str) -> bytes:
@@ -534,9 +588,7 @@ def validate_repository(path: Path, *, allow_agents_mismatch: bool) -> Path:
     root = Path(git(path, "rev-parse", "--show-toplevel").stdout.strip()).resolve()
     if root != path:
         raise RuntimeError(f"저장소 루트 경로를 지정하세요: {root}")
-    remote = git(root, "remote", "get-url", "origin").stdout.strip().lower()
-    if not re.match(r"^(?:git@|ssh://git@|https://)(?:www\.)?github\.com[:/]", remote):
-        raise RuntimeError("origin이 GitHub 저장소가 아닙니다.")
+    github_repository(git(root, "remote", "get-url", "origin").stdout)
     required = [root / "AGENTS.md", root / "docs/PLANS.md", root / "docs/ARCHITECTURE.md"]
     missing = [str(item.relative_to(root)) for item in required if not item.is_file()]
     requirements = root / "docs/requirements"
@@ -1255,23 +1307,10 @@ def parse_worker_result(message: str, plan: dict[str, object]) -> WorkerPublicat
         )
     return WorkerPublication(title, summary, test_evidence)
 
-def normalize_github_repository(origin_url: str) -> str:
-    """Return the owner/repository slug for a GitHub origin URL."""
-    match = re.fullmatch(
-        r"(?:git@github\.com:|(?:https?|ssh|git)://(?:git@)?github\.com/)(?P<owner>[^/]+)/(?P<repo>[^/]+)/?",
-        origin_url.strip(),
-    )
-    if not match:
-        raise RuntimeError(f"GitHub origin URL이 유효하지 않습니다: {origin_url}")
-    owner = match.group("owner")
-    repository = match.group("repo").removesuffix(".git")
-    return f"{owner}/{repository}"
-
-
 def immutable_github_blob_url(origin_url: str, commit_sha: str, relative_path: str) -> str:
     if not re.fullmatch(r"[0-9a-fA-F]{7,64}", commit_sha):
         raise RuntimeError("계획 commit SHA가 유효하지 않습니다.")
-    repository = normalize_github_repository(origin_url)
+    repository = github_repository(origin_url)
     encoded_path = quote(relative_path, safe="/")
     return f"https://github.com/{repository}/blob/{commit_sha}/{encoded_path}"
 
@@ -1828,7 +1867,10 @@ def run_project(
     if row["phase"] == "PUBLISHING":
         existing_pr = pr_for_branch(repo_path, branch)
         if not existing_pr:
-            plan_sha = str(row["plan_sha"] or row["active_sha"] or "")
+            plan_sha = str(row["plan_sha"] or "")
+            if not plan_sha:
+                update_project(connection, repo, phase="BLOCKED", last_error="계획 commit SHA가 없습니다.")
+                return 1
             plan_text = git(worktree, "show", f"{plan_sha}:{row['plan_path']}").stdout
             plan = published_execplan(str(row["plan_path"]), plan_text)
             try:
