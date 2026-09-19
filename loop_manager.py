@@ -1988,6 +1988,7 @@ def capture_git_snapshot(worktree: Path) -> GitSnapshot:
         check=False,
     )
     branch = branch_result.stdout.strip() if branch_result.returncode == 0 else None
+    index = _index_entries(worktree)
     path_kinds: dict[str, set[str]] = {}
     path_groups = (
         (
@@ -2024,6 +2025,9 @@ def capture_git_snapshot(worktree: Path) -> GitSnapshot:
     for kind, paths in path_groups:
         for relative_path in paths:
             path_kinds.setdefault(relative_path, set()).add(kind)
+    for relative_path, entries in index.items():
+        if _non_default_index_flags(entries):
+            path_kinds.setdefault(relative_path, set()).add("index-hidden")
     dirty = {
         path: (tuple(sorted(kinds)), _path_signature(worktree, path))
         for path, kinds in sorted(path_kinds.items())
@@ -2031,7 +2035,7 @@ def capture_git_snapshot(worktree: Path) -> GitSnapshot:
     return GitSnapshot(
         head=head,
         branch=branch,
-        index=_index_entries(worktree),
+        index=index,
         dirty=dirty,
         refs=_shared_ref_entries(worktree),
         worktrees=_registered_worktree_entries(worktree),

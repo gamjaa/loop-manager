@@ -4061,6 +4061,53 @@ class AgentScopeValidatorTest(unittest.TestCase):
                         selected_plan_path=plan_path,
                     )
 
+    def test_preexisting_index_flags_do_not_hide_agent_file_changes(self):
+        scenarios = (
+            ("planner", "README.md"),
+            ("worker", "docs/requirements/Active.md"),
+            ("reviewer", "src/app.py"),
+        )
+        for option in ("--skip-worktree", "--assume-unchanged"):
+            for role_name, relative_path in scenarios:
+                with self.subTest(option=option, role=role_name):
+                    with tempfile.TemporaryDirectory() as directory:
+                        repo, plan_path = self._repository_with_plan(directory)
+                        git_command(
+                            repo,
+                            "update-index",
+                            option,
+                            "--",
+                            relative_path,
+                        )
+                        before = loop_manager.capture_git_snapshot(repo)
+
+                        (repo / relative_path).write_text(
+                            f"changed by {role_name}\n",
+                            encoding="utf-8",
+                        )
+                        after = loop_manager.capture_git_snapshot(repo)
+
+                        self.assertEqual(
+                            before.index[relative_path],
+                            after.index[relative_path],
+                        )
+                        self.assertNotEqual(
+                            before.dirty[relative_path],
+                            after.dirty[relative_path],
+                        )
+                        with self.assertRaises(
+                            loop_manager.AgentScopeError
+                        ) as raised:
+                            loop_manager.validate_agent_scope(
+                                role_name,
+                                repo,
+                                before,
+                                after,
+                                selected_plan_path=(
+                                    plan_path if role_name == "worker" else None
+                                ),
+                            )
+                        self.assertIn(relative_path, str(raised.exception))
 
     def test_existing_database_adds_persistent_agent_scope_fields(self):
         with tempfile.TemporaryDirectory() as directory:
