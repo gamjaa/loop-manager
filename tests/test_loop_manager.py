@@ -3282,6 +3282,61 @@ class AgentScopeValidatorTest(unittest.TestCase):
         commit_and_push(repo, "Add scope safety plan")
         return repo, plan.relative_to(repo).as_posix()
 
+    def _persist_interrupted_worker(
+        self,
+        state_dir: Path,
+        repo: Path,
+        plan_path: str,
+        snapshot: loop_manager.GitSnapshot,
+    ) -> None:
+        state_dir.mkdir()
+        database = sqlite3.connect(state_dir / "loop-manager.db")
+        database.row_factory = sqlite3.Row
+        database.execute(loop_manager.SCHEMA)
+        database.execute(
+            "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+            (str(repo),),
+        )
+        plan_sha = git_command(repo, "rev-parse", "origin/main")
+        loop_manager.register_execplans(
+            database,
+            str(repo),
+            repo,
+            [(plan_path, loop_manager._parse_execplan(repo, repo / plan_path))],
+            plan_sha,
+            loop_manager.planning_input_fingerprint(repo, "main"),
+        )
+        branch = "loop-manager/G-001"
+        with database:
+            database.execute(
+                """
+                UPDATE exec_plans
+                SET status = 'IMPLEMENTING', active_sha = ?, branch = ?,
+                    worktree = ?, workspace_owned = 1
+                WHERE repo = ? AND plan_id = 'G-001'
+                """,
+                (plan_sha, branch, str(repo), str(repo)),
+            )
+            database.execute(
+                """
+                UPDATE projects
+                SET active_sha = ?, plan_sha = ?, phase = 'WORKING',
+                    branch = ?, worktree = ?, plan_path = ?,
+                    agent_role = 'worker', agent_snapshot = ?
+                WHERE repo = ?
+                """,
+                (
+                    plan_sha,
+                    plan_sha,
+                    branch,
+                    str(repo),
+                    plan_path,
+                    snapshot.serialize(),
+                    str(repo),
+                ),
+            )
+        database.close()
+
     def test_role_boundaries_reject_protected_and_read_only_changes(self):
         scenarios = (
             (
@@ -3612,7 +3667,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 ).fetchone()
                 self.assertEqual(result, 1)
                 self.assertEqual(project["phase"], "BLOCKED")
-                self.assertIn("config 선검증 실패", project["last_error"])
+                self.assertIn("범위 선검증 실패", project["last_error"])
                 self.assertIn(expected_key, project["last_error"])
                 self.assertNotIn(sensitive_value, project["last_error"])
                 migration.assert_not_called()
@@ -3637,23 +3692,10 @@ class AgentScopeValidatorTest(unittest.TestCase):
         for name, arguments, configured_value, expected_key in scenarios:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                repo, _plan_path = self._repository_with_plan(directory)
+                repo, plan_path = self._repository_with_plan(directory)
                 before = loop_manager.capture_git_snapshot(repo)
                 state_dir = root / "state"
-                state_dir.mkdir()
-                database = sqlite3.connect(state_dir / "loop-manager.db")
-                database.execute(loop_manager.SCHEMA)
-                database.execute(
-                    """
-                    INSERT INTO projects (
-                        repo, base_branch, phase, worktree, agent_role,
-                        agent_snapshot
-                    ) VALUES (?, 'main', 'WORKING', ?, 'worker', ?)
-                    """,
-                    (str(repo), str(repo), before.serialize()),
-                )
-                database.commit()
-                database.close()
+                self._persist_interrupted_worker(state_dir, repo, plan_path, before)
 
                 sensitive_value = (
                     str(root / configured_value)
@@ -3692,15 +3734,96 @@ class AgentScopeValidatorTest(unittest.TestCase):
                         "SELECT phase, last_error FROM projects WHERE repo = ?",
                         (str(repo),),
                     ).fetchone()
+                    plan = database.execute(
+                        "SELECT status, blocked_fingerprint FROM exec_plans "
+                        "WHERE repo = ? AND plan_id = 'G-001'",
+                        (str(repo),),
+                    ).fetchone()
                     database.close()
 
                 self.assertEqual(result, 1)
-                self.assertEqual(project["phase"], "WORKING")
-                self.assertIn("config 선검증 실패", project["last_error"])
+                self.assertEqual(project["phase"], "BLOCKED")
+                self.assertEqual(plan["status"], "BLOCKED")
+                self.assertIsNotNone(plan["blocked_fingerprint"])
+                self.assertIn("범위 선검증 실패", project["last_error"])
                 self.assertIn(expected_key, project["last_error"])
                 self.assertNotIn(sensitive_value, project["last_error"])
                 unsafe_git.assert_not_called()
                 agent.assert_not_called()
+
+    def test_interrupted_ref_change_blocks_before_migration_fetch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, plan_path = self._repository_with_plan(directory)
+            before = loop_manager.capture_git_snapshot(repo)
+            state_dir = root / "state"
+            self._persist_interrupted_worker(state_dir, repo, plan_path, before)
+            changed_ref = git_command(repo, "rev-parse", "HEAD^")
+            git_command(
+                repo,
+                "update-ref",
+                "refs/remotes/origin/main",
+                changed_ref,
+            )
+            real_git = loop_manager.git
+            git_calls = []
+
+            def reject_fetch(repo_path, *arguments, **kwargs):
+                git_calls.append(arguments)
+                if arguments[:2] == ("fetch", "origin"):
+                    raise AssertionError("migration fetch ran before scope validation")
+                return real_git(repo_path, *arguments, **kwargs)
+
+            with mock.patch.object(
+                loop_manager.sys,
+                "argv",
+                [
+                    "loop_manager.py",
+                    "--state-dir",
+                    str(state_dir),
+                    "run",
+                    str(repo),
+                    "--base",
+                    "main",
+                ],
+            ), mock.patch(
+                "loop_manager.validate_repository",
+                return_value=repo,
+            ), mock.patch(
+                "loop_manager.git",
+                side_effect=reject_fetch,
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as agent:
+                result = loop_manager.main()
+
+            database = sqlite3.connect(state_dir / "loop-manager.db")
+            database.row_factory = sqlite3.Row
+            project = database.execute(
+                "SELECT phase, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            plan = database.execute(
+                "SELECT status, blocked_fingerprint FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            database.close()
+
+            self.assertEqual(result, 1)
+            self.assertEqual(project["phase"], "BLOCKED")
+            self.assertEqual(plan["status"], "BLOCKED")
+            self.assertIsNotNone(plan["blocked_fingerprint"])
+            self.assertIn("공유 Git refs 변경", project["last_error"])
+            self.assertIn("refs/remotes/origin/main", project["last_error"])
+            self.assertEqual(
+                git_command(repo, "rev-parse", "refs/remotes/origin/main"),
+                changed_ref,
+            )
+            self.assertFalse(
+                any(arguments[:2] == ("fetch", "origin") for arguments in git_calls)
+            )
+            agent.assert_not_called()
 
     def test_blocked_resume_does_not_excuse_agent_base_ref_change(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -3954,7 +4077,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
             self.assertEqual(resumed_result, 1)
             self.assertEqual(resumed_project["phase"], "BLOCKED")
             self.assertIn(
-                "BLOCKED Agent 범위 재검증 실패",
+                "Agent 범위 선검증 실패",
                 resumed_project["last_error"],
             )
             self.assertIn("reviewer.txt", resumed_project["last_error"])
@@ -4178,7 +4301,7 @@ class WorkspaceRecoveryTest(unittest.TestCase):
 
             self.assertEqual(marker.read_text(encoding="utf-8"), "preserve me\n")
 
-    def test_new_activation_rejects_preexisting_branch_without_agent(self):
+    def test_branch_collision_blocks_then_resumes_after_conflict_removal(self):
         with tempfile.TemporaryDirectory() as directory:
             (
                 repo,
@@ -4266,11 +4389,70 @@ class WorkspaceRecoveryTest(unittest.TestCase):
             ).fetchone()
             self.assertEqual(resumed_result, 1)
             self.assertEqual(resumed_project["phase"], "BLOCKED")
-            self.assertIn("소유권이 확인되지 않았습니다", resumed_project["last_error"])
+            self.assertIn("충돌이 해소되지 않았습니다", resumed_project["last_error"])
             self.assertEqual(tuple(resumed_plan), ("BLOCKED", 0))
             self.assertEqual(git_command(repo, "rev-parse", branch), branch_head)
             self.assertFalse(worktree.exists())
             resumed_agent.assert_not_called()
+
+            git_command(repo, "branch", "-D", branch)
+            planner_stop = loop_manager.CodexResult(
+                1,
+                "stop after ownership recovery",
+                "planner-session",
+            )
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.run_codex", return_value=planner_stop
+            ) as recovered_agent:
+                recovered_result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            recovered_project = connection.execute(
+                "SELECT phase, branch, worktree, last_error "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            recovered_plan = connection.execute(
+                "SELECT status, workspace_owned FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-012'",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(recovered_result, 1)
+            self.assertEqual(recovered_project["phase"], "PLANNING")
+            self.assertIsNone(recovered_project["branch"])
+            self.assertEqual(
+                recovered_project["last_error"],
+                "stop after ownership recovery",
+            )
+            self.assertEqual(tuple(recovered_plan), ("READY", 0))
+            self.assertFalse(worktree.exists())
+            self.assertEqual(
+                loop_manager.git(
+                    repo,
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    f"refs/heads/{branch}",
+                    check=False,
+                ).returncode,
+                1,
+            )
+            recovered_agent.assert_called_once()
+            self.assertEqual(recovered_agent.call_args.args[3], "planner")
 
     def test_new_planning_rejects_preexisting_detached_worktree(self):
         with tempfile.TemporaryDirectory() as directory:
