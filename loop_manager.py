@@ -29,6 +29,7 @@ FIELDS = {
     "planning_retry_count",
     "planner_session_id",
     "planning_validation_error",
+    "planning_result_pending_validation",
     "planning_error",
     "planning_error_fingerprint",
     "active_sha",
@@ -50,6 +51,7 @@ CREATE TABLE IF NOT EXISTS projects (
     planning_retry_count INTEGER NOT NULL DEFAULT 0,
     planner_session_id TEXT,
     planning_validation_error TEXT,
+    planning_result_pending_validation INTEGER NOT NULL DEFAULT 0,
     planning_error TEXT,
     planning_error_fingerprint TEXT,
     active_sha TEXT,
@@ -143,6 +145,7 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
         "planning_retry_count": "INTEGER NOT NULL DEFAULT 0",
         "planner_session_id": "TEXT",
         "planning_validation_error": "TEXT",
+        "planning_result_pending_validation": "INTEGER NOT NULL DEFAULT 0",
         "planning_error": "TEXT",
         "planning_error_fingerprint": "TEXT",
     }
@@ -439,6 +442,39 @@ def validate_execplan(worktree: Path, relative_path: str) -> dict[str, object]:
             if relative_path == expected_path:
                 return plan
     raise RuntimeError(f"검증된 ExecPlan 카탈로그에 계획이 없습니다: {relative_path}")
+
+
+class PlannerValidationError(RuntimeError):
+    """A Planner output error that is eligible for a correction attempt."""
+
+
+def validate_planner_result(
+    worktree: Path,
+    active_sha: str,
+    dirty_files: list[str],
+) -> tuple[str, dict[str, object]] | None:
+    """Validate only the Planner-owned output, leaving Git publication outside.
+
+    Scope and ExecPlan catalog errors are deliberately translated to a
+    dedicated exception. Operational Git failures must retain their normal
+    recovery boundary and never consume the Planner validation retry budget.
+    """
+    if dirty_files:
+        if len(dirty_files) != 1 or not re.fullmatch(r"docs/plans/[^/]+\.md", dirty_files[0]):
+            raise PlannerValidationError("Planner는 docs/plans의 ExecPlan 하나만 변경해야 합니다.")
+        plan_path = dirty_files[0]
+    else:
+        planned_files = changed_files(worktree, active_sha)
+        if not planned_files:
+            return None
+        if len(planned_files) != 1 or not re.fullmatch(r"docs/plans/[^/]+\.md", planned_files[0]):
+            raise PlannerValidationError("Planner commit에는 ExecPlan 하나만 있어야 합니다.")
+        plan_path = planned_files[0]
+
+    try:
+        return plan_path, validate_execplan(worktree, plan_path)
+    except RuntimeError as error:
+        raise PlannerValidationError(str(error)) from error
 
 
 def validate_repository(path: Path, *, allow_agents_mismatch: bool) -> Path:
@@ -789,9 +825,10 @@ def changed_files(worktree: Path, since: str | None = None) -> list[str]:
     if since:
         output = git(worktree, "diff", "--name-only", f"{since}..HEAD").stdout
         return sorted(line for line in output.splitlines() if line)
-    tracked = git(worktree, "diff", "--name-only").stdout.splitlines()
+    unstaged = git(worktree, "diff", "--name-only").stdout.splitlines()
+    staged = git(worktree, "diff", "--cached", "--name-only").stdout.splitlines()
     untracked = git(worktree, "ls-files", "--others", "--exclude-standard").stdout.splitlines()
-    return sorted(set(tracked + untracked))
+    return sorted(set(unstaged + staged + untracked))
 
 
 def clean_worktree(repo: Path, worktree: Path, base: str) -> bool:
@@ -870,6 +907,7 @@ def clear_planning_validation_state(
         planning_retry_count=0,
         planner_session_id=None,
         planning_validation_error=None,
+        planning_result_pending_validation=0,
         planning_error=None,
         planning_error_fingerprint=None,
         last_error=None,
@@ -895,6 +933,7 @@ def clear_active(
         "planning_retry_count": 0,
         "planner_session_id": None,
         "planning_validation_error": None,
+        "planning_result_pending_validation": 0,
         "planning_error": None,
         "planning_error_fingerprint": None,
     }
@@ -1040,6 +1079,7 @@ def run_project(
             planning_retry_count=0,
             planner_session_id=None,
             planning_validation_error=None,
+            planning_result_pending_validation=0,
             planning_error=None,
             planning_error_fingerprint=None,
             phase="PLANNING",
@@ -1066,30 +1106,25 @@ def run_project(
             dirty_files = changed_files(planning_worktree)
         if head == row["active_sha"] and (
             not dirty_files or row["planning_validation_error"] or row["last_error"]
-        ) and not (
+        ) and not row["planning_result_pending_validation"] and not (
             row["planning_validation_error"]
             and row["planning_retry_count"] >= MAX_PLANNER_VALIDATION_RETRIES
         ):
-            retrying_validation = bool(row["planning_validation_error"])
-            previous_retry_count = row["planning_retry_count"]
-            try:
-                result = run_codex(
-                    planning_worktree,
-                    state_dir,
-                    config_path,
-                    "planner",
-                    planner_prompt(row["planning_validation_error"] or row["last_error"]),
-                    read_only=False,
-                    persist_session=True,
-                    session_id=row["planner_session_id"],
-                    on_session_started=lambda started_session_id: update_project(
-                        connection,
-                        repo,
-                        planner_session_id=started_session_id,
-                    ),
-                )
-            except Exception:
-                raise
+            result = run_codex(
+                planning_worktree,
+                state_dir,
+                config_path,
+                "planner",
+                planner_prompt(row["planning_validation_error"] or row["last_error"]),
+                read_only=False,
+                persist_session=True,
+                session_id=row["planner_session_id"],
+                on_session_started=lambda started_session_id: update_project(
+                    connection,
+                    repo,
+                    planner_session_id=started_session_id,
+                ),
+            )
             code, message = result
             result_session_id = getattr(result, "session_id", None)
             if result_session_id:
@@ -1099,56 +1134,39 @@ def run_project(
                     planner_session_id=result_session_id,
                 )
             if code:
-                values = {"last_error": message or f"Planner 종료 코드 {code}"}
-                if retrying_validation:
-                    values["planning_retry_count"] = previous_retry_count
-                update_project(connection, repo, **values)
+                update_project(connection, repo, last_error=message or f"Planner 종료 코드 {code}")
                 print(message or "Planner 실행에 실패했습니다.", file=sys.stderr)
                 return 1
-            values = {"last_error": None}
-            if retrying_validation:
-                # A correction attempt consumes its budget only after its
-                # Planner invocation returns successfully. An interrupted
-                # process therefore resumes with the same remaining attempt.
-                values["planning_retry_count"] = previous_retry_count + 1
-            update_project(connection, repo, **values)
+            # Persist the successful Planner result before inspecting it. If
+            # the process stops here, the next run validates this exact output
+            # rather than asking the same session to produce another result.
+            update_project(
+                connection,
+                repo,
+                last_error=None,
+                planning_result_pending_validation=1,
+            )
             row = connection.execute(
                 "SELECT * FROM projects WHERE repo = ?", (repo,)
             ).fetchone()
             dirty_files = changed_files(planning_worktree)
 
         try:
-            if dirty_files:
-                if len(dirty_files) != 1 or not re.fullmatch(r"docs/plans/[^/]+\.md", dirty_files[0]):
-                    raise RuntimeError("Planner는 docs/plans의 ExecPlan 하나만 변경해야 합니다.")
-                plan_path = dirty_files[0]
-                plan = validate_execplan(planning_worktree, plan_path)
-                git(planning_worktree, "add", "--", plan_path)
-                git(planning_worktree, "commit", "-m", f"Add ExecPlan {plan['id']}: {plan['title']}")
-            else:
-                planned_files = changed_files(planning_worktree, str(row["active_sha"]))
-                if not planned_files:
-                    completed_fingerprint = _planning_input_fingerprint(repo_path, row["active_sha"])
-                    git(repo_path, "worktree", "remove", str(planning_worktree))
-                    clear_active(
-                        connection,
-                        repo,
-                        processed_sha=row["active_sha"],
-                        planning_fingerprint=completed_fingerprint,
-                    )
-                    print("추가로 계획할 작업이 없습니다.")
-                    return 0
-                if len(planned_files) != 1 or not re.fullmatch(r"docs/plans/[^/]+\.md", planned_files[0]):
-                    raise RuntimeError("Planner commit에는 ExecPlan 하나만 있어야 합니다.")
-                plan_path = planned_files[0]
-                plan = validate_execplan(planning_worktree, plan_path)
-        except RuntimeError as error:
+            validated_result = validate_planner_result(
+                planning_worktree, str(row["active_sha"]), dirty_files
+            )
+        except PlannerValidationError as error:
             validation_error = str(error)
+            retry_count = row["planning_retry_count"]
+            if row["planning_result_pending_validation"] and row["planning_validation_error"]:
+                retry_count += 1
             values = {
                 "planning_validation_error": validation_error,
+                "planning_result_pending_validation": 0,
                 "last_error": None,
+                "planning_retry_count": retry_count,
             }
-            if row["planning_retry_count"] >= MAX_PLANNER_VALIDATION_RETRIES:
+            if retry_count >= MAX_PLANNER_VALIDATION_RETRIES:
                 values.update(
                     planning_error=validation_error,
                     planning_error_fingerprint=current_fingerprint,
@@ -1156,6 +1174,25 @@ def run_project(
             update_project(connection, repo, **values)
             print(str(error), file=sys.stderr)
             return 1
+
+        if validated_result is None:
+            completed_fingerprint = _planning_input_fingerprint(repo_path, row["active_sha"])
+            git(repo_path, "worktree", "remove", str(planning_worktree))
+            clear_active(
+                connection,
+                repo,
+                processed_sha=row["active_sha"],
+                planning_fingerprint=completed_fingerprint,
+            )
+            print("추가로 계획할 작업이 없습니다.")
+            return 0
+
+        plan_path, plan = validated_result
+        if dirty_files:
+            # Publishing failures are operational failures, not Planner
+            # validation failures. Leave the validated result for retry.
+            git(planning_worktree, "add", "--", plan_path)
+            git(planning_worktree, "commit", "-m", f"Add ExecPlan {plan['id']}: {plan['title']}")
 
         clear_planning_validation_state(connection, repo)
         plan_commit = git(planning_worktree, "rev-parse", "HEAD").stdout.strip()
