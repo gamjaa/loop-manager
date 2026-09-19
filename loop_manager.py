@@ -1057,6 +1057,13 @@ def run_project(
         make_planning_worktree(repo_path, planning_worktree, base)
         head = git(planning_worktree, "rev-parse", "HEAD").stdout.strip()
         dirty_files = changed_files(planning_worktree)
+        if row["planning_validation_error"] and head != row["active_sha"]:
+            # The Planner is not allowed to commit. Turn an invalid Planner
+            # commit back into a worktree change so the persisted validation
+            # error can be repaired in the same session on the next run.
+            git(planning_worktree, "reset", "--mixed", str(row["active_sha"]))
+            head = git(planning_worktree, "rev-parse", "HEAD").stdout.strip()
+            dirty_files = changed_files(planning_worktree)
         if head == row["active_sha"] and (
             not dirty_files or row["planning_validation_error"] or row["last_error"]
         ) and not (
@@ -1065,12 +1072,6 @@ def run_project(
         ):
             retrying_validation = bool(row["planning_validation_error"])
             previous_retry_count = row["planning_retry_count"]
-            if retrying_validation:
-                update_project(
-                    connection,
-                    repo,
-                    planning_retry_count=previous_retry_count + 1,
-                )
             try:
                 result = run_codex(
                     planning_worktree,
@@ -1088,12 +1089,6 @@ def run_project(
                     ),
                 )
             except Exception:
-                if retrying_validation:
-                    update_project(
-                        connection,
-                        repo,
-                        planning_retry_count=previous_retry_count,
-                    )
                 raise
             code, message = result
             result_session_id = getattr(result, "session_id", None)
@@ -1110,7 +1105,13 @@ def run_project(
                 update_project(connection, repo, **values)
                 print(message or "Planner 실행에 실패했습니다.", file=sys.stderr)
                 return 1
-            update_project(connection, repo, last_error=None)
+            values = {"last_error": None}
+            if retrying_validation:
+                # A correction attempt consumes its budget only after its
+                # Planner invocation returns successfully. An interrupted
+                # process therefore resumes with the same remaining attempt.
+                values["planning_retry_count"] = previous_retry_count + 1
+            update_project(connection, repo, **values)
             row = connection.execute(
                 "SELECT * FROM projects WHERE repo = ?", (repo,)
             ).fetchone()

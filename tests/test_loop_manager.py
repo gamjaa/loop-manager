@@ -483,6 +483,8 @@ class LoopManagerTest(unittest.TestCase):
                         "Generated",
                         depends_on=("G-999",),
                     )
+                    git_command(worktree, "add", "-A")
+                    git_command(worktree, "commit", "-m", "Invalid Planner output")
                 else:
                     write_execplan(worktree, "G-001", "Generated")
                 return loop_manager.CodexResult(0, "", "planner-session")
@@ -550,6 +552,11 @@ class LoopManagerTest(unittest.TestCase):
                 invalid.write_text("invalid\n", encoding="utf-8")
                 return loop_manager.CodexResult(0, "", "planner-session")
             if planner_calls == 2:
+                saved_retry_count = connection.execute(
+                    "SELECT planning_retry_count FROM projects WHERE repo = ?",
+                    (str(repo),),
+                ).fetchone()["planning_retry_count"]
+                self.assertEqual(saved_retry_count, 0)
                 return loop_manager.CodexResult(1, "planner timeout", "planner-session")
             invalid.unlink()
             (worktree / "docs/plans").mkdir(parents=True, exist_ok=True)
