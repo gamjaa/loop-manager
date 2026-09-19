@@ -2982,6 +2982,41 @@ def validate_active_execplan_metadata(
     return current
 
 
+def validate_worker_workspace_scope(
+    repo_path: Path,
+    worktree: Path,
+    branch: str,
+    selected_plan_path: str,
+    catalog_plan: sqlite3.Row,
+    before: GitSnapshot,
+    *,
+    allow_rebase: bool = False,
+) -> dict[str, object]:
+    """Validate one Worker-controlled operation before Manager Git writes."""
+
+    after = capture_git_snapshot(worktree)
+    validate_agent_scope(
+        "worker",
+        worktree,
+        before,
+        after,
+        selected_plan_path=selected_plan_path,
+    )
+    plan = validate_active_execplan_metadata(
+        repo_path,
+        worktree,
+        selected_plan_path,
+        catalog_plan,
+    )
+    validate_managed_worktree(
+        repo_path,
+        worktree,
+        branch,
+        allow_rebase=allow_rebase,
+    )
+    return plan
+
+
 def _blocked_execplan_metadata_error(
     repo_path: Path,
     worktree: Path,
@@ -5103,24 +5138,13 @@ def run_project(
             update_project(connection, repo, worker_session_id=result_session_id)
 
         try:
-            worker_scope_after = capture_git_snapshot(worktree)
-            validate_agent_scope(
-                "worker",
-                worktree,
-                worker_scope_before,
-                worker_scope_after,
-                selected_plan_path=str(row["plan_path"]),
-            )
-            plan = validate_active_execplan_metadata(
-                repo_path,
-                worktree,
-                str(row["plan_path"]),
-                catalog_plan,
-            )
-            validate_managed_worktree(
+            plan = validate_worker_workspace_scope(
                 repo_path,
                 worktree,
                 branch,
+                str(row["plan_path"]),
+                catalog_plan,
+                worker_scope_before,
                 allow_rebase=resolving_rebase,
             )
         except (AgentScopeError, WorkspaceOwnershipError, RuntimeError) as error:
@@ -5214,7 +5238,37 @@ def run_project(
             operation_print(validation_error, file=sys.stderr)
             return 1
 
+        verify_scope_before = begin_agent_scope(
+            connection,
+            repo,
+            worktree,
+            "worker",
+            input_fingerprint=_worktree_execplan_input_fingerprint(
+                worktree, catalog_plan
+            ),
+        )
         passed, output = verify(worktree)
+        try:
+            plan = validate_worker_workspace_scope(
+                repo_path,
+                worktree,
+                branch,
+                str(row["plan_path"]),
+                catalog_plan,
+                verify_scope_before,
+            )
+        except (AgentScopeError, WorkspaceOwnershipError, RuntimeError) as error:
+            scope_error = str(error)
+            block_active_execplan(
+                connection,
+                repo,
+                worktree,
+                scope_error,
+                output,
+            )
+            operation_print(scope_error, file=sys.stderr)
+            return 1
+        clear_agent_scope(connection, repo)
         if not passed:
             operation_log(f"Worker 반환: {plan['id']} {plan['title']} (전체 verify 실패)", error=True)
             update_project(
@@ -5273,7 +5327,37 @@ def run_project(
                 operation_print(rebased.stdout, file=sys.stderr)
                 return 1
             operation_log(f"전체 verify 시작: {plan['id']} {plan['title']} (rebase 후)")
+            verify_scope_before = begin_agent_scope(
+                connection,
+                repo,
+                worktree,
+                "worker",
+                input_fingerprint=_worktree_execplan_input_fingerprint(
+                    worktree, catalog_plan
+                ),
+            )
             passed, output = verify(worktree)
+            try:
+                plan = validate_worker_workspace_scope(
+                    repo_path,
+                    worktree,
+                    branch,
+                    str(row["plan_path"]),
+                    catalog_plan,
+                    verify_scope_before,
+                )
+            except (AgentScopeError, WorkspaceOwnershipError, RuntimeError) as error:
+                scope_error = str(error)
+                block_active_execplan(
+                    connection,
+                    repo,
+                    worktree,
+                    scope_error,
+                    output,
+                )
+                operation_print(scope_error, file=sys.stderr)
+                return 1
+            clear_agent_scope(connection, repo)
             if not passed:
                 operation_log(f"Worker 반환: {plan['id']} {plan['title']} (rebase 후 전체 verify 실패)", error=True)
                 update_project(

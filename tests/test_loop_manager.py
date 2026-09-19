@@ -5015,6 +5015,107 @@ class AgentScopeValidatorTest(unittest.TestCase):
             self.assertEqual(resumed_agent.call_args.args[3], "planner")
 
 
+    def test_verify_mutation_of_worker_protected_file_blocks_before_commit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, plan_path = self._repository_with_plan(directory)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            branch, worktree = loop_manager.expected_execplan_workspace(
+                state_dir, str(repo), "G-001"
+            )
+            loop_manager.make_worktree(repo, worktree, branch, "main")
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
+            initial_head = git_command(worktree, "rev-parse", "HEAD")
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                """
+                INSERT INTO projects (
+                    repo, base_branch, active_sha, plan_sha, phase, branch,
+                    worktree, plan_path, worker_result
+                ) VALUES (?, 'main', ?, ?, 'VERIFYING', ?, ?, ?, ?)
+                """,
+                (
+                    str(repo),
+                    plan_sha,
+                    plan_sha,
+                    branch,
+                    str(worktree),
+                    plan_path,
+                    worker_result(),
+                ),
+            )
+            connection.commit()
+
+            def verify_with_protected_mutation(agent_worktree):
+                (agent_worktree / "docs/requirements/Active.md").write_text(
+                    "# changed by verify\n",
+                    encoding="utf-8",
+                )
+                return True, "verify: PASS"
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.verify", side_effect=verify_with_protected_mutation
+            ) as verify, mock.patch(
+                "loop_manager.run_codex"
+            ) as agent:
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, last_error, verify_result, agent_role, "
+                "agent_snapshot, agent_result_snapshot "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            plan = connection.execute(
+                "SELECT status FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+
+            self.assertEqual(result, 1)
+            self.assertEqual(project["phase"], "BLOCKED")
+            self.assertIn("worker Git 범위 위반", project["last_error"])
+            self.assertIn(
+                "docs/requirements/Active.md",
+                project["last_error"],
+            )
+            self.assertEqual(project["verify_result"], "verify: PASS")
+            self.assertEqual(project["agent_role"], "worker")
+            self.assertIsNotNone(project["agent_snapshot"])
+            self.assertIsNotNone(project["agent_result_snapshot"])
+            self.assertEqual(plan["status"], "BLOCKED")
+            self.assertEqual(
+                git_command(worktree, "rev-parse", "HEAD"),
+                initial_head,
+            )
+            self.assertEqual(
+                (worktree / "docs/requirements/Active.md").read_text(
+                    encoding="utf-8"
+                ),
+                "# changed by verify\n",
+            )
+            verify.assert_called_once_with(worktree)
+            agent.assert_not_called()
+
+
 class WorkspaceRecoveryTest(unittest.TestCase):
     def _workspace(
         self, directory: str
