@@ -1,3 +1,4 @@
+import hashlib
 import json
 import io
 import os
@@ -150,6 +151,7 @@ class AutomationFirstCatalogTest(unittest.TestCase):
         depends_on: tuple[str, ...] = (),
         repo: str = "repo",
         title: str | None = None,
+        plan_sha: str = "plan-sha",
     ) -> None:
         title = title or f"Plan {plan_id}"
         connection.execute(
@@ -169,7 +171,7 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                 priority,
                 f"hash-{plan_id}",
                 status,
-                "plan-sha",
+                plan_sha,
             ),
         )
         connection.commit()
@@ -217,6 +219,7 @@ class AutomationFirstCatalogTest(unittest.TestCase):
             database.close()
 
             with loop_manager.connect_database(state_dir) as connection:
+                loop_manager.migrate_legacy_execplans(connection, target_repo=str(root))
                 before_reconciliation = connection.execute(
                     "SELECT plan_id, status FROM exec_plans WHERE repo = ? ORDER BY plan_id",
                     (str(root),),
@@ -428,7 +431,10 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                 priority="critical",
                 depends_on=("G-001",),
             )
-            missing_worktree = Path(directory) / "already-removed"
+            state_dir = Path(directory) / "state"
+            _branch, missing_worktree = loop_manager.expected_execplan_workspace(
+                state_dir, "repo", "G-001"
+            )
             connection.execute(
                 """
                 UPDATE projects
@@ -445,6 +451,7 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                 connection,
                 Path(directory),
                 "repo",
+                state_dir,
                 missing_worktree,
                 "https://pr/1",
                 None,
@@ -468,6 +475,15 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                 (repo / "docs/plans").mkdir()
                 write_execplan(repo, "G-001", "Queued", priority="high")
                 commit_and_push(repo, "Add queued plan")
+                external_repo = Path(directory) / "external"
+                git_command(
+                    repo,
+                    "clone",
+                    str(Path(directory) / "remote.git"),
+                    str(external_repo),
+                )
+                git_command(external_repo, "config", "user.email", "user@example.com")
+                git_command(external_repo, "config", "user.name", "External User")
                 state_dir = Path(directory) / "state"
                 connection = self._connection(str(repo))
                 self._insert_plan(
@@ -482,11 +498,13 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                 roles = []
 
                 def advance_remote():
-                    (repo / "src/app.py").write_text(
+                    git_command(external_repo, "fetch", "origin")
+                    git_command(external_repo, "merge", "--ff-only", "origin/main")
+                    (external_repo / "src/app.py").write_text(
                         "VALUE = 2\n",
                         encoding="utf-8",
                     )
-                    commit_and_push(repo, "Change input during planning")
+                    commit_and_push(external_repo, "Change input during planning")
 
                 def agent(worktree, _state, _config, role_name, _prompt, **_kwargs):
                     roles.append(role_name)
@@ -567,7 +585,15 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                 commit_and_push(repo, "Add queued plan")
                 state_dir = Path(directory) / "state"
                 connection = self._connection(str(repo))
-                self._insert_plan(connection, "G-001", "READY", priority="high", repo=str(repo), title="Queued")
+                self._insert_plan(
+                    connection,
+                    "G-001",
+                    "READY",
+                    priority="high",
+                    repo=str(repo),
+                    title="Queued",
+                    plan_sha=git_command(repo, "rev-parse", "origin/main"),
+                )
                 fingerprint = loop_manager.planning_input_fingerprint(repo, "main")
                 connection.execute(
                     """
@@ -1003,8 +1029,6 @@ class LoopManagerTest(unittest.TestCase):
                         "Generated",
                         depends_on=("G-999",),
                     )
-                    git_command(worktree, "add", "-A")
-                    git_command(worktree, "commit", "-m", "Invalid Planner output")
                 else:
                     write_execplan(worktree, "G-001", "Generated")
                 return loop_manager.CodexResult(0, "", "planner-session")
@@ -1310,8 +1334,6 @@ class LoopManagerTest(unittest.TestCase):
             with mock.patch(
                 "loop_manager.validate_repository", return_value=repo
             ), mock.patch(
-                "loop_manager.remote_base", return_value="main"
-            ), mock.patch(
                 "loop_manager.ensure_safe_base_worktree"
             ), mock.patch(
                 "loop_manager.run_codex", side_effect=agent
@@ -1333,6 +1355,13 @@ class LoopManagerTest(unittest.TestCase):
                 self.assertEqual(interrupted["planning_result_pending_validation"], 1)
                 self.assertEqual(interrupted["planning_retry_count"], 0)
                 self.assertTrue((Path(interrupted["worktree"]) / "unexpected.txt").is_file())
+                plan_sha = git_command(repo, "rev-parse", "origin/main")
+                git_command(
+                    Path(directory) / "remote.git",
+                    "update-ref",
+                    "refs/heads/planner-correction-update",
+                    plan_sha,
+                )
 
                 self.assertEqual(
                     loop_manager.run_project(
@@ -1348,6 +1377,14 @@ class LoopManagerTest(unittest.TestCase):
             self.assertEqual(resumed["planning_retry_count"], 0)
             self.assertEqual(resumed["planning_result_pending_validation"], 0)
             self.assertIsNone(resumed["planning_error"])
+            self.assertEqual(
+                git_command(
+                    repo,
+                    "rev-parse",
+                    "refs/remotes/origin/planner-correction-update",
+                ),
+                plan_sha,
+            )
 
     def test_planner_cli_failure_does_not_consume_validation_retry(self):
         planner_calls = 0
@@ -2362,19 +2399,28 @@ risk: medium
         state_dir.mkdir()
         (repo / "docs/plans").mkdir()
         plan = write_execplan(repo, "G-001", "Worker Boundary")
+        commit_and_push(repo, "Add worker plan")
+        plan_sha = git_command(repo, "rev-parse", "origin/main")
+        branch, worktree = loop_manager.expected_execplan_workspace(
+            state_dir, str(repo), "G-001"
+        )
+        loop_manager.make_worktree(repo, worktree, branch, "main")
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row
         connection.execute(loop_manager.SCHEMA)
         connection.execute(
             """
             INSERT INTO projects (
-                repo, base_branch, active_sha, phase, branch, worktree, plan_path
-            ) VALUES (?, 'main', ?, 'WORKING', 'loop-manager/G-001', ?, ?)
+                repo, base_branch, active_sha, plan_sha, phase, branch,
+                worktree, plan_path
+            ) VALUES (?, 'main', ?, ?, 'WORKING', ?, ?, ?)
             """,
             (
                 str(repo),
-                git_command(repo, "rev-parse", "origin/main"),
-                str(repo),
+                plan_sha,
+                plan_sha,
+                branch,
+                str(worktree),
                 plan.relative_to(repo).as_posix(),
             ),
         )
@@ -2384,17 +2430,12 @@ risk: medium
     def test_worker_without_diff_requeues_after_source_change(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, state_dir, connection = self._make_active_worker_project(directory)
-            commit_and_push(repo, "Add worker plan")
-            plan_sha = git_command(repo, "rev-parse", "HEAD")
-            managed = Path(directory) / "managed"
-            git_command(
-                repo,
-                "worktree",
-                "add",
-                "-b",
-                "loop-manager/G-001",
-                str(managed),
-                plan_sha,
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
+            managed = Path(
+                connection.execute(
+                    "SELECT worktree FROM projects WHERE repo = ?",
+                    (str(repo),),
+                ).fetchone()["worktree"]
             )
             planning_fingerprint = loop_manager.planning_input_fingerprint(repo, "main")
             connection.execute(
@@ -2576,17 +2617,12 @@ risk: medium
     def test_rebase_that_drops_worker_patch_blocks_before_review(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, state_dir, connection = self._make_active_worker_project(directory)
-            commit_and_push(repo, "Add worker plan")
-            plan_sha = git_command(repo, "rev-parse", "HEAD")
-            managed = Path(directory) / "managed"
-            git_command(
-                repo,
-                "worktree",
-                "add",
-                "-b",
-                "loop-manager/G-001",
-                str(managed),
-                plan_sha,
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
+            managed = Path(
+                connection.execute(
+                    "SELECT worktree FROM projects WHERE repo = ?",
+                    (str(repo),),
+                ).fetchone()["worktree"]
             )
             connection.execute(
                 """
@@ -2824,10 +2860,6 @@ risk: medium
                 verify.assert_called_once()
 
             self.assertEqual(logs[:3], [("Worker 시작: G-001 Worker Boundary", {}), ("전체 verify 시작: G-001 Worker Boundary", {}), ("Reviewer 시작: G-001 Worker Boundary", {})])
-            self.assertEqual(
-                git_command(repo, "log", "-1", "--pretty=%s"),
-                "Persist worker change",
-            )
             self.assertEqual([role for role, _prompt, _kwargs in calls], ["worker", "reviewer"])
             reviewer_prompt = calls[1][1]
             self.assertIn("targeted test: PASS", reviewer_prompt)
@@ -2837,6 +2869,14 @@ risk: medium
             row = connection.execute(
                 "SELECT * FROM projects WHERE repo = ?", (str(repo),)
             ).fetchone()
+            self.assertEqual(
+                git_command(Path(row["worktree"]), "log", "-1", "--pretty=%s"),
+                "Persist worker change",
+            )
+            self.assertEqual(
+                git_command(repo, "log", "-1", "--pretty=%s"),
+                "Add worker plan",
+            )
             self.assertEqual(row["phase"], "PR_OPEN")
             self.assertEqual(row["worker_session_id"], "worker-session")
             self.assertEqual(row["verify_result"], "verify: PASS")
@@ -2909,6 +2949,7 @@ class WorkerPublicationTest(unittest.TestCase):
             database.close()
 
             with loop_manager.connect_database(state_dir) as connection:
+                loop_manager.backfill_plan_shas(connection, target_repo=str(repo))
                 row = connection.execute(
                     "SELECT plan_sha, phase FROM projects WHERE repo = ?", (str(repo),)
                 ).fetchone()
@@ -2939,6 +2980,7 @@ class WorkerPublicationTest(unittest.TestCase):
             database.close()
 
             with loop_manager.connect_database(state_dir) as connection:
+                loop_manager.backfill_plan_shas(connection, target_repo=str(repo))
                 blocked = connection.execute(
                     "SELECT phase, last_error FROM projects WHERE repo = ?", (str(repo),)
                 ).fetchone()
@@ -3004,7 +3046,10 @@ class WorkerPublicationTest(unittest.TestCase):
             git_command(repo, "commit", "-m", "Add ExecPlan G-001: Worker Boundary")
             git_command(repo, "push", "origin", "main")
             plan_sha = git_command(repo, "rev-parse", "origin/main")
-            worktree = state_dir / "worktrees" / "G-001"
+            branch, worktree = loop_manager.expected_execplan_workspace(
+                state_dir, str(repo), "G-001"
+            )
+            loop_manager.make_worktree(repo, worktree, branch, "main")
             base_file = (repo / "src/app.py").read_text(encoding="utf-8")
             base_index = git_command(repo, "diff", "--cached")
             base_head = git_command(repo, "rev-parse", "HEAD")
@@ -3119,6 +3164,12 @@ class WorkerPublicationTest(unittest.TestCase):
             state_dir.mkdir()
             (repo / "docs/plans").mkdir()
             plan = write_execplan(repo, "G-001", "Worker Boundary")
+            commit_and_push(repo, "Add worker plan")
+            branch, worktree = loop_manager.expected_execplan_workspace(
+                state_dir, str(repo), "G-001"
+            )
+            loop_manager.make_worktree(repo, worktree, branch, "main")
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
             connection = sqlite3.connect(":memory:")
             connection.row_factory = sqlite3.Row
             connection.execute(loop_manager.SCHEMA)
@@ -3130,9 +3181,9 @@ class WorkerPublicationTest(unittest.TestCase):
                 """,
                 (
                     str(repo),
-                    git_command(repo, "rev-parse", "origin/main"),
-                    git_command(repo, "rev-parse", "origin/main"),
-                    str(repo),
+                    plan_sha,
+                    plan_sha,
+                    str(worktree),
                     plan.relative_to(repo).as_posix(),
                 ),
             )
@@ -3244,6 +3295,4047 @@ risk: medium
         self.assertIn("Keep review context stable.", body)
         self.assertIn(f"/blob/{sha}/docs/plans/%5BG-008%5D%20Descriptive%20Worker%20Commits.md", body)
         self.assertIn("%5BR-004%5D%20%ED%95%9C%EA%B8%80%20%EC%9A%94%EA%B5%AC%EC%82%AC%ED%95%AD.md", body)
+
+class AgentScopeValidatorTest(unittest.TestCase):
+    def _repository_with_plan(self, directory: str) -> tuple[Path, str]:
+        repo = make_remote_repository(directory)
+        (repo / "docs/plans").mkdir()
+        plan = write_execplan(repo, "G-001", "Scope Safety")
+        commit_and_push(repo, "Add scope safety plan")
+        return repo, plan.relative_to(repo).as_posix()
+
+    def _persist_interrupted_worker(
+        self,
+        state_dir: Path,
+        repo: Path,
+        plan_path: str,
+        snapshot: loop_manager.GitSnapshot,
+    ) -> None:
+        state_dir.mkdir()
+        database = sqlite3.connect(state_dir / "loop-manager.db")
+        database.row_factory = sqlite3.Row
+        database.execute(loop_manager.SCHEMA)
+        database.execute(
+            "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+            (str(repo),),
+        )
+        plan_sha = git_command(repo, "rev-parse", "origin/main")
+        loop_manager.register_execplans(
+            database,
+            str(repo),
+            repo,
+            [(plan_path, loop_manager._parse_execplan(repo, repo / plan_path))],
+            plan_sha,
+            loop_manager.planning_input_fingerprint(repo, "main"),
+        )
+        branch = "loop-manager/G-001"
+        with database:
+            database.execute(
+                """
+                UPDATE exec_plans
+                SET status = 'IMPLEMENTING', active_sha = ?, branch = ?,
+                    worktree = ?, workspace_owned = 1
+                WHERE repo = ? AND plan_id = 'G-001'
+                """,
+                (plan_sha, branch, str(repo), str(repo)),
+            )
+            database.execute(
+                """
+                UPDATE projects
+                SET active_sha = ?, plan_sha = ?, phase = 'WORKING',
+                    branch = ?, worktree = ?, plan_path = ?,
+                    agent_role = 'worker', agent_snapshot = ?
+                WHERE repo = ?
+                """,
+                (
+                    plan_sha,
+                    plan_sha,
+                    branch,
+                    str(repo),
+                    plan_path,
+                    snapshot.serialize(),
+                    str(repo),
+                ),
+            )
+        database.close()
+
+    def test_interrupted_planner_scope_violation_resumes_correction_from_result_snapshot(self):
+        planner_sessions = []
+
+        def agent(worktree, _state, _config, role_name, _prompt, **kwargs):
+            if role_name != "planner":
+                return loop_manager.CodexResult(
+                    1,
+                    "stop after corrected planning",
+                    "worker-session",
+                )
+            planner_sessions.append(kwargs["session_id"])
+            unexpected = worktree / "unexpected.txt"
+            if len(planner_sessions) == 1:
+                kwargs["on_session_started"]("planner-session")
+                unexpected.write_text("invalid\n", encoding="utf-8")
+                raise RuntimeError("process interrupted after invalid Planner edit")
+            self.assertEqual(kwargs["session_id"], "planner-session")
+            unexpected.unlink()
+            (worktree / "docs/plans").mkdir(parents=True, exist_ok=True)
+            write_execplan(worktree, "G-001", "Recovered")
+            return loop_manager.CodexResult(0, "", "planner-session")
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            state_dir = Path(directory) / "state"
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+
+            with mock.patch(
+                "loop_manager.validate_repository",
+                return_value=repo,
+            ), mock.patch(
+                "loop_manager.remote_base",
+                return_value="main",
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.run_codex",
+                side_effect=agent,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "process interrupted",
+                ):
+                    loop_manager.run_project(
+                        connection,
+                        state_dir,
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
+                    )
+
+                self.assertEqual(
+                    loop_manager.run_project(
+                        connection,
+                        state_dir,
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
+                    ),
+                    1,
+                )
+                blocked = connection.execute(
+                    "SELECT * FROM projects WHERE repo = ?",
+                    (str(repo),),
+                ).fetchone()
+                self.assertIn(
+                    "unexpected.txt",
+                    blocked["planning_validation_error"],
+                )
+                self.assertEqual(planner_sessions, [None])
+                start_snapshot = loop_manager.GitSnapshot.deserialize(
+                    blocked["agent_snapshot"]
+                )
+                result_snapshot = loop_manager.GitSnapshot.deserialize(
+                    blocked["agent_result_snapshot"]
+                )
+                self.assertNotEqual(start_snapshot, result_snapshot)
+                self.assertIn("unexpected.txt", result_snapshot.dirty)
+
+                self.assertEqual(
+                    loop_manager.run_project(
+                        connection,
+                        state_dir,
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
+                    ),
+                    1,
+                )
+
+            resumed = connection.execute(
+                "SELECT phase, planning_retry_count, planning_error "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(planner_sessions, [None, "planner-session"])
+            self.assertEqual(resumed["phase"], "WORKING")
+            self.assertEqual(resumed["planning_retry_count"], 0)
+            self.assertIsNone(resumed["planning_error"])
+
+    def test_role_boundaries_reject_protected_and_read_only_changes(self):
+        scenarios = (
+            (
+                "planner-existing-plan",
+                "planner",
+                lambda repo, _plan: (repo / _plan).write_text(
+                    "changed\n", encoding="utf-8"
+                ),
+                None,
+                "docs/plans/[G-001] Scope Safety.md",
+            ),
+            (
+                "worker-requirement",
+                "worker",
+                lambda repo, _plan: (
+                    repo / "docs/requirements/Active.md"
+                ).write_text("# changed\n", encoding="utf-8"),
+                "docs/plans/[G-001] Scope Safety.md",
+                "docs/requirements/Active.md",
+            ),
+            (
+                "reviewer-staged-and-untracked",
+                "reviewer",
+                lambda repo, _plan: (
+                    (repo / "src/app.py").write_text(
+                        "VALUE = 2\n", encoding="utf-8"
+                    ),
+                    git_command(repo, "add", "src/app.py"),
+                    (repo / "review.txt").write_text(
+                        "unexpected\n", encoding="utf-8"
+                    ),
+                ),
+                None,
+                "review.txt",
+            ),
+        )
+        for name, role_name, mutate, selected_plan, expected in scenarios:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                repo, plan_path = self._repository_with_plan(directory)
+                before = loop_manager.capture_git_snapshot(repo)
+                mutate(repo, plan_path)
+                after = loop_manager.capture_git_snapshot(repo)
+
+                with self.assertRaisesRegex(
+                    loop_manager.AgentScopeError,
+                    expected.replace("[", r"\[").replace("]", r"\]"),
+                ):
+                    loop_manager.validate_agent_scope(
+                        role_name,
+                        repo,
+                        before,
+                        after,
+                        selected_plan_path=selected_plan,
+                    )
+
+    def test_ignored_untracked_creation_and_change_are_rejected(self):
+        scenarios = (
+            ("planner", None, "created by planner\n"),
+            ("reviewer", "before review\n", "changed by reviewer\n"),
+        )
+        for role_name, before_contents, after_contents in scenarios:
+            with self.subTest(role=role_name), tempfile.TemporaryDirectory() as directory:
+                repo, _plan_path = self._repository_with_plan(directory)
+                (repo / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+                commit_and_push(repo, "Ignore diagnostic fixture")
+                ignored = repo / "ignored.txt"
+                if before_contents is not None:
+                    ignored.write_text(before_contents, encoding="utf-8")
+                before = loop_manager.capture_git_snapshot(repo)
+
+                ignored.write_text(after_contents, encoding="utf-8")
+                after = loop_manager.capture_git_snapshot(repo)
+
+                self.assertIn("ignored.txt", after.dirty)
+                if before_contents is not None:
+                    self.assertIn("ignored.txt", before.dirty)
+                with self.assertRaisesRegex(
+                    loop_manager.AgentScopeError,
+                    "ignored.txt",
+                ):
+                    loop_manager.validate_agent_scope(
+                        role_name,
+                        repo,
+                        before,
+                        after,
+                    )
+
+    def test_planner_new_plan_and_worker_selected_plan_are_allowed(self):
+        for role_name in ("planner", "worker"):
+            with self.subTest(role=role_name), tempfile.TemporaryDirectory() as directory:
+                repo, plan_path = self._repository_with_plan(directory)
+                before = loop_manager.capture_git_snapshot(repo)
+                selected = plan_path
+                if role_name == "planner":
+                    write_execplan(repo, "G-002", "New Plan")
+                    selected = None
+                else:
+                    (repo / plan_path).write_text(
+                        (repo / plan_path).read_text(encoding="utf-8")
+                        + "\n## Progress\n\n- [x] complete\n",
+                        encoding="utf-8",
+                    )
+                after = loop_manager.capture_git_snapshot(repo)
+
+                loop_manager.validate_agent_scope(
+                    role_name,
+                    repo,
+                    before,
+                    after,
+                    selected_plan_path=selected,
+                )
+
+    def test_agent_commit_and_branch_switch_are_rejected(self):
+        mutations = (
+            (
+                "commit",
+                lambda repo: (
+                    (repo / "src/app.py").write_text(
+                        "VALUE = 2\n", encoding="utf-8"
+                    ),
+                    git_command(repo, "add", "src/app.py"),
+                    git_command(repo, "commit", "-m", "Agent commit"),
+                ),
+                "HEAD 변경",
+            ),
+            (
+                "branch",
+                lambda repo: git_command(repo, "switch", "-c", "agent-branch"),
+                "branch 전환",
+            ),
+        )
+        for name, mutate, expected in mutations:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                repo, plan_path = self._repository_with_plan(directory)
+                before = loop_manager.capture_git_snapshot(repo)
+                mutate(repo)
+                after = loop_manager.capture_git_snapshot(repo)
+
+                with self.assertRaisesRegex(
+                    loop_manager.AgentScopeError, expected
+                ):
+                    loop_manager.validate_agent_scope(
+                        "worker",
+                        repo,
+                        before,
+                        after,
+                        selected_plan_path=plan_path,
+                    )
+
+    def test_unfinished_merge_is_rejected_even_for_worker_allowed_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, plan_path = self._repository_with_plan(directory)
+            git_command(repo, "switch", "-c", "merge-source")
+            (repo / "src/app.py").write_text(
+                "VALUE = 2\n",
+                encoding="utf-8",
+            )
+            git_command(repo, "add", "src/app.py")
+            git_command(repo, "commit", "-m", "Prepare merge source")
+            git_command(repo, "switch", "main")
+            before = loop_manager.capture_git_snapshot(repo)
+
+            git_command(
+                repo,
+                "merge",
+                "--no-ff",
+                "--no-commit",
+                "merge-source",
+            )
+            after = loop_manager.capture_git_snapshot(repo)
+
+            self.assertNotIn("MERGE_HEAD", before.operations)
+            self.assertIn("MERGE_HEAD", after.operations)
+            with self.assertRaisesRegex(
+                loop_manager.AgentScopeError,
+                r"Git operation 상태 변경 .*MERGE_HEAD",
+            ):
+                loop_manager.validate_agent_scope(
+                    "worker",
+                    repo,
+                    before,
+                    after,
+                    selected_plan_path=plan_path,
+                )
+
+    def test_shared_git_metadata_changes_are_rejected(self):
+        scenarios = (
+            (
+                "branch",
+                lambda repo, _root: git_command(
+                    repo, "branch", "agent-created"
+                ),
+                "refs",
+                r"공유 Git refs 변경 .*refs/heads/agent-created",
+            ),
+            (
+                "tag",
+                lambda repo, _root: git_command(repo, "tag", "agent-tag"),
+                "refs",
+                r"공유 Git refs 변경 .*refs/tags/agent-tag",
+            ),
+            (
+                "worktree",
+                lambda repo, root: git_command(
+                    repo,
+                    "worktree",
+                    "add",
+                    "--detach",
+                    str(root / "agent-worktree"),
+                    "HEAD",
+                ),
+                "worktrees",
+                r"Git worktree 등록·HEAD·index·파일 상태 변경 .*agent-worktree",
+            ),
+        )
+        for name, mutate, state_field, expected in scenarios:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, plan_path = self._repository_with_plan(directory)
+                before = loop_manager.capture_git_snapshot(repo)
+                self.assertEqual(
+                    loop_manager.GitSnapshot.deserialize(before.serialize()),
+                    before,
+                )
+
+                mutate(repo, root)
+                after = loop_manager.capture_git_snapshot(repo)
+
+                self.assertNotEqual(
+                    getattr(before, state_field),
+                    getattr(after, state_field),
+                )
+                with self.assertRaisesRegex(
+                    loop_manager.AgentScopeError,
+                    expected,
+                ):
+                    loop_manager.validate_agent_scope(
+                        "worker",
+                        repo,
+                        before,
+                        after,
+                        selected_plan_path=plan_path,
+                    )
+
+    def test_changes_in_another_registered_worktree_are_rejected(self):
+        for mutation in ("file", "index"):
+            with self.subTest(mutation=mutation):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    repo, plan_path = self._repository_with_plan(directory)
+                    managed = root / "managed"
+                    loop_manager.make_worktree(
+                        repo,
+                        managed,
+                        "loop-manager/G-099",
+                        "main",
+                    )
+                    before = loop_manager.capture_git_snapshot(managed)
+
+                    if mutation == "file":
+                        (repo / "src/app.py").write_text(
+                            "VALUE = 2\n",
+                            encoding="utf-8",
+                        )
+                    else:
+                        git_command(
+                            repo,
+                            "update-index",
+                            "--assume-unchanged",
+                            "--",
+                            "src/app.py",
+                        )
+                    after = loop_manager.capture_git_snapshot(managed)
+
+                    external_path = str(repo.resolve())
+                    self.assertNotEqual(
+                        before.worktrees[external_path],
+                        after.worktrees[external_path],
+                    )
+                    with self.assertRaises(
+                        loop_manager.AgentScopeError
+                    ) as raised:
+                        loop_manager.validate_agent_scope(
+                            "worker",
+                            managed,
+                            before,
+                            after,
+                            selected_plan_path=plan_path,
+                        )
+                    self.assertIn(external_path, str(raised.exception))
+
+    def test_active_execplan_fixed_metadata_must_match_published_plan(self):
+        replacements = (
+            (
+                "sources",
+                "sources:\n  - docs/PRODUCT.md",
+                "sources:\n  - docs/requirements/Active.md",
+                True,
+            ),
+            (
+                "depends_on",
+                "depends_on: []",
+                "depends_on:\n  - G-002",
+                True,
+            ),
+            ("complexity", "complexity: low", "complexity: medium", True),
+            ("risk", "risk: low", "risk: high", True),
+            ("priority", "priority: normal", "priority: critical", True),
+            ("body", "Test plan.", "Updated implementation progress.", False),
+        )
+        for name, original, replacement, rejected in replacements:
+            with self.subTest(field=name):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo, plan_path = self._repository_with_plan(directory)
+                    write_execplan(repo, "G-002", "Dependency")
+                    commit_and_push(repo, "Add dependency plan")
+                    plan_sha = git_command(repo, "rev-parse", "origin/main")
+                    connection = sqlite3.connect(":memory:")
+                    connection.row_factory = sqlite3.Row
+                    connection.execute(loop_manager.SCHEMA)
+                    connection.execute(
+                        "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+                        (str(repo),),
+                    )
+                    parsed = loop_manager._parse_execplan(
+                        repo,
+                        repo / plan_path,
+                    )
+                    loop_manager.register_execplans(
+                        connection,
+                        str(repo),
+                        repo,
+                        [(plan_path, parsed)],
+                        plan_sha,
+                        loop_manager.planning_input_fingerprint(repo, "main"),
+                    )
+                    connection.execute(
+                        "UPDATE exec_plans SET status = 'IMPLEMENTING' "
+                        "WHERE repo = ? AND plan_id = 'G-001'",
+                        (str(repo),),
+                    )
+                    connection.commit()
+                    stored = loop_manager.active_execplan(
+                        connection,
+                        str(repo),
+                    )
+                    self.assertIsNotNone(stored)
+                    assert stored is not None
+
+                    plan_file = repo / plan_path
+                    plan_file.write_text(
+                        plan_file.read_text(encoding="utf-8").replace(
+                            original,
+                            replacement,
+                        ),
+                        encoding="utf-8",
+                    )
+
+                    if rejected:
+                        with self.assertRaisesRegex(
+                            RuntimeError,
+                            "고정 메타데이터는 변경할 수 없습니다",
+                        ):
+                            loop_manager.validate_active_execplan_metadata(
+                                repo,
+                                repo,
+                                plan_path,
+                                stored,
+                            )
+                    else:
+                        current = loop_manager.validate_active_execplan_metadata(
+                            repo,
+                            repo,
+                            plan_path,
+                            stored,
+                        )
+                        self.assertEqual(current["id"], "G-001")
+
+    def test_git_config_changes_are_rejected_without_leaking_values(self):
+        scenarios = (
+            (
+                "remote-url",
+                r"Git config 변경 .*local:remote\.origin\.url",
+            ),
+            (
+                "hooks-path",
+                r"Git config 변경 .*local:core\.hookspath",
+            ),
+        )
+        for name, expected in scenarios:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, plan_path = self._repository_with_plan(directory)
+                before = loop_manager.capture_git_snapshot(repo)
+                if name == "remote-url":
+                    sensitive_value = "https://secret@attacker.invalid/repo.git"
+                    git_command(
+                        repo,
+                        "remote",
+                        "set-url",
+                        "origin",
+                        sensitive_value,
+                    )
+                else:
+                    sensitive_value = str(root / "agent-hooks")
+                    git_command(
+                        repo,
+                        "config",
+                        "core.hooksPath",
+                        sensitive_value,
+                    )
+                after = loop_manager.capture_git_snapshot(repo)
+
+                self.assertNotEqual(before.config, after.config)
+                self.assertNotIn(sensitive_value, after.serialize())
+                with self.assertRaisesRegex(
+                    loop_manager.AgentScopeError,
+                    expected,
+                ) as violation:
+                    loop_manager.validate_agent_scope(
+                        "worker",
+                        repo,
+                        before,
+                        after,
+                        selected_plan_path=plan_path,
+                    )
+                self.assertNotIn(sensitive_value, str(violation.exception))
+
+    def test_blocked_config_change_stops_before_git_reentry(self):
+        scenarios = (
+            (
+                "remote-url",
+                ("remote", "set-url", "origin"),
+                "https://secret@attacker.invalid/repo.git",
+                "local:remote.origin.url",
+            ),
+            (
+                "hooks-path",
+                ("config", "core.hooksPath"),
+                "agent-hooks",
+                "local:core.hookspath",
+            ),
+        )
+        for name, arguments, configured_value, expected_key in scenarios:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, _plan_path = self._repository_with_plan(directory)
+                before = loop_manager.capture_git_snapshot(repo)
+                sensitive_value = (
+                    str(root / configured_value)
+                    if name == "hooks-path"
+                    else configured_value
+                )
+                git_command(repo, *arguments, sensitive_value)
+                blocked_result = loop_manager.capture_git_snapshot(repo)
+                connection = sqlite3.connect(":memory:")
+                connection.row_factory = sqlite3.Row
+                connection.execute(loop_manager.SCHEMA)
+                connection.execute(
+                    """
+                    INSERT INTO projects (
+                        repo, base_branch, phase, worktree, agent_role,
+                        agent_snapshot, agent_result_snapshot
+                    ) VALUES (?, 'main', 'BLOCKED', ?, 'worker', ?, ?)
+                    """,
+                    (
+                        str(repo),
+                        str(repo),
+                        before.serialize(),
+                        blocked_result.serialize(),
+                    ),
+                )
+                connection.commit()
+
+                with mock.patch(
+                    "loop_manager.validate_repository",
+                    return_value=repo,
+                ), mock.patch(
+                    "loop_manager.migrate_legacy_execplans"
+                ) as migration, mock.patch(
+                    "loop_manager.git",
+                    side_effect=AssertionError("unsafe Git command before config validation"),
+                ) as unsafe_git, mock.patch(
+                    "loop_manager.run_codex"
+                ) as agent:
+                    result = loop_manager.run_project(
+                        connection,
+                        root / "state",
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
+                    )
+
+                project = connection.execute(
+                    "SELECT phase, last_error FROM projects WHERE repo = ?",
+                    (str(repo),),
+                ).fetchone()
+                self.assertEqual(result, 1)
+                self.assertEqual(project["phase"], "BLOCKED")
+                self.assertIn("범위 선검증 실패", project["last_error"])
+                self.assertIn(expected_key, project["last_error"])
+                self.assertNotIn(sensitive_value, project["last_error"])
+                migration.assert_not_called()
+                unsafe_git.assert_not_called()
+                agent.assert_not_called()
+
+    def test_interrupted_config_change_stops_before_database_git_migrations(self):
+        scenarios = (
+            (
+                "remote-url",
+                ("remote", "set-url", "origin"),
+                "https://secret@attacker.invalid/repo.git",
+                "local:remote.origin.url",
+            ),
+            (
+                "hooks-path",
+                ("config", "core.hooksPath"),
+                "agent-hooks",
+                "local:core.hookspath",
+            ),
+        )
+        for name, arguments, configured_value, expected_key in scenarios:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, plan_path = self._repository_with_plan(directory)
+                before = loop_manager.capture_git_snapshot(repo)
+                state_dir = root / "state"
+                self._persist_interrupted_worker(state_dir, repo, plan_path, before)
+
+                sensitive_value = (
+                    str(root / configured_value)
+                    if name == "hooks-path"
+                    else configured_value
+                )
+                git_command(repo, *arguments, sensitive_value)
+
+                with mock.patch.object(
+                    loop_manager.sys,
+                    "argv",
+                    [
+                        "loop_manager.py",
+                        "--state-dir",
+                        str(state_dir),
+                        "run",
+                        str(repo),
+                        "--base",
+                        "main",
+                    ],
+                ), mock.patch(
+                    "loop_manager.git",
+                    side_effect=AssertionError(
+                        "unsafe Git command before config validation"
+                    ),
+                ) as unsafe_git, mock.patch(
+                    "loop_manager.run_codex"
+                ) as agent:
+                    result = loop_manager.main()
+                    database = sqlite3.connect(state_dir / "loop-manager.db")
+                    database.row_factory = sqlite3.Row
+                    project = database.execute(
+                        "SELECT phase, last_error FROM projects WHERE repo = ?",
+                        (str(repo),),
+                    ).fetchone()
+                    plan = database.execute(
+                        "SELECT status, blocked_fingerprint FROM exec_plans "
+                        "WHERE repo = ? AND plan_id = 'G-001'",
+                        (str(repo),),
+                    ).fetchone()
+                    database.close()
+
+                self.assertEqual(result, 1)
+                self.assertEqual(project["phase"], "BLOCKED")
+                self.assertEqual(plan["status"], "BLOCKED")
+                self.assertIsNotNone(plan["blocked_fingerprint"])
+                self.assertIn("범위 선검증 실패", project["last_error"])
+                self.assertIn(expected_key, project["last_error"])
+                self.assertNotIn(sensitive_value, project["last_error"])
+                unsafe_git.assert_not_called()
+                agent.assert_not_called()
+
+    def test_interrupted_ref_change_blocks_before_migration_fetch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, plan_path = self._repository_with_plan(directory)
+            before = loop_manager.capture_git_snapshot(repo)
+            state_dir = root / "state"
+            self._persist_interrupted_worker(state_dir, repo, plan_path, before)
+            changed_ref = git_command(repo, "rev-parse", "HEAD^")
+            git_command(
+                repo,
+                "update-ref",
+                "refs/remotes/origin/main",
+                changed_ref,
+            )
+            real_git = loop_manager.git
+            git_calls = []
+
+            def reject_fetch(repo_path, *arguments, **kwargs):
+                git_calls.append(arguments)
+                if arguments[:2] == ("fetch", "origin"):
+                    raise AssertionError("migration fetch ran before scope validation")
+                return real_git(repo_path, *arguments, **kwargs)
+
+            with mock.patch.object(
+                loop_manager.sys,
+                "argv",
+                [
+                    "loop_manager.py",
+                    "--state-dir",
+                    str(state_dir),
+                    "run",
+                    str(repo),
+                    "--base",
+                    "main",
+                ],
+            ), mock.patch(
+                "loop_manager.validate_repository",
+                return_value=repo,
+            ), mock.patch(
+                "loop_manager.git",
+                side_effect=reject_fetch,
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as agent:
+                result = loop_manager.main()
+
+            database = sqlite3.connect(state_dir / "loop-manager.db")
+            database.row_factory = sqlite3.Row
+            project = database.execute(
+                "SELECT phase, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            plan = database.execute(
+                "SELECT status, blocked_fingerprint FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            database.close()
+
+            self.assertEqual(result, 1)
+            self.assertEqual(project["phase"], "BLOCKED")
+            self.assertEqual(plan["status"], "BLOCKED")
+            self.assertIsNotNone(plan["blocked_fingerprint"])
+            self.assertIn("공유 Git refs 변경", project["last_error"])
+            self.assertIn("refs/remotes/origin/main", project["last_error"])
+            self.assertEqual(
+                git_command(repo, "rev-parse", "refs/remotes/origin/main"),
+                changed_ref,
+            )
+            self.assertFalse(
+                any(arguments[:2] == ("fetch", "origin") for arguments in git_calls)
+            )
+            agent.assert_not_called()
+
+    def test_interrupted_worker_resume_accepts_manager_fetched_remote_ref(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, plan_path = self._repository_with_plan(directory)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
+            branch, worktree = loop_manager.expected_execplan_workspace(
+                state_dir, str(repo), "G-001"
+            )
+            loop_manager.make_worktree(repo, worktree, branch, "main")
+            cleanup_branch, cleanup_worktree = loop_manager.expected_execplan_workspace(
+                state_dir, str(repo), "G-099"
+            )
+            loop_manager.make_worktree(repo, cleanup_worktree, cleanup_branch, "main")
+
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+                (str(repo),),
+            )
+            loop_manager.register_execplans(
+                connection,
+                str(repo),
+                repo,
+                [(plan_path, loop_manager._parse_execplan(repo, repo / plan_path))],
+                plan_sha,
+                loop_manager.planning_input_fingerprint(repo, "main"),
+            )
+            loop_manager._ensure_cleanup_pending_schema(connection)
+            loop_manager._store_cleanup_pending(
+                connection,
+                str(repo),
+                cleanup_worktree,
+                "https://example.test/pr/99",
+                plan_sha,
+                "pending cleanup",
+            )
+            connection.commit()
+            before = loop_manager.capture_git_snapshot(worktree)
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE exec_plans
+                    SET status = 'IMPLEMENTING', active_sha = ?, branch = ?,
+                        worktree = ?, workspace_owned = 1,
+                        worker_session_id = 'worker-session'
+                    WHERE repo = ? AND plan_id = 'G-001'
+                    """,
+                    (plan_sha, branch, str(worktree), str(repo)),
+                )
+                connection.execute(
+                    """
+                    UPDATE projects
+                    SET active_sha = ?, plan_sha = ?, phase = 'WORKING',
+                        branch = ?, worktree = ?, plan_path = ?,
+                        worker_session_id = 'worker-session',
+                        agent_role = 'worker', agent_snapshot = ?
+                    WHERE repo = ?
+                    """,
+                    (
+                        plan_sha,
+                        plan_sha,
+                        branch,
+                        str(worktree),
+                        plan_path,
+                        before.serialize(),
+                        str(repo),
+                    ),
+                )
+
+            (worktree / "src/app.py").write_text(
+                "VALUE = 2\n",
+                encoding="utf-8",
+            )
+
+            remote = root / "remote.git"
+            git_command(
+                remote,
+                "update-ref",
+                "refs/heads/manager-update",
+                plan_sha,
+            )
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.refresh_persisted_agent_scope_after_manager_git",
+                side_effect=KeyboardInterrupt("interrupt after Manager checkpoint"),
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as interrupted_agent:
+                with self.assertRaisesRegex(
+                    KeyboardInterrupt,
+                    "Manager checkpoint",
+                ):
+                    loop_manager.run_project(
+                        connection,
+                        state_dir,
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
+                    )
+
+            interrupted_checkpoint = connection.execute(
+                "SELECT agent_manager_snapshot FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()["agent_manager_snapshot"]
+            self.assertIsNotNone(interrupted_checkpoint)
+            self.assertFalse(cleanup_worktree.exists())
+            self.assertEqual(
+                git_command(repo, "rev-parse", "refs/remotes/origin/manager-update"),
+                plan_sha,
+            )
+            interrupted_agent.assert_not_called()
+
+            sessions = []
+
+            def resumed_worker(_worktree, _state, _config, role_name, _prompt, **kwargs):
+                self.assertEqual(role_name, "worker")
+                sessions.append(kwargs["session_id"])
+                return loop_manager.CodexResult(
+                    1, "stop after resumed worker", "worker-session"
+                )
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.run_codex", side_effect=resumed_worker
+            ):
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, last_error, agent_snapshot, agent_manager_snapshot "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            plan_status = connection.execute(
+                "SELECT status FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()["status"]
+
+            self.assertEqual(result, 1)
+            self.assertEqual(sessions, ["worker-session"])
+            self.assertEqual(project["phase"], "WORKING")
+            self.assertEqual(plan_status, "IMPLEMENTING")
+            self.assertEqual(project["last_error"], "stop after resumed worker")
+            self.assertIsNone(project["agent_snapshot"])
+            self.assertIsNone(project["agent_manager_snapshot"])
+            self.assertEqual(
+                git_command(repo, "rev-parse", "refs/remotes/origin/manager-update"),
+                plan_sha,
+            )
+            self.assertFalse(cleanup_worktree.exists())
+            self.assertEqual(
+                connection.execute(
+                    "SELECT count(*) FROM cleanup_pending WHERE repo = ?",
+                    (str(repo),),
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_blocked_checkpoint_allows_manager_cleanup_and_later_resume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, plan_path = self._repository_with_plan(directory)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
+            branch, worktree = loop_manager.expected_execplan_workspace(
+                state_dir, str(repo), "G-001"
+            )
+            loop_manager.make_worktree(repo, worktree, branch, "main")
+            cleanup_branch, cleanup_worktree = loop_manager.expected_execplan_workspace(
+                state_dir, str(repo), "G-099"
+            )
+            loop_manager.make_worktree(
+                repo,
+                cleanup_worktree,
+                cleanup_branch,
+                "main",
+            )
+
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+                (str(repo),),
+            )
+            loop_manager.register_execplans(
+                connection,
+                str(repo),
+                repo,
+                [(plan_path, loop_manager._parse_execplan(repo, repo / plan_path))],
+                plan_sha,
+                loop_manager.planning_input_fingerprint(repo, "main"),
+            )
+            plan = connection.execute(
+                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            input_fingerprint = loop_manager._worktree_execplan_input_fingerprint(
+                worktree,
+                plan,
+            )
+            before = loop_manager.capture_git_snapshot(worktree)
+            (worktree / "reviewer.txt").write_text(
+                "preserve violation\n",
+                encoding="utf-8",
+            )
+            blocked_result = loop_manager.capture_git_snapshot(worktree)
+            loop_manager._ensure_cleanup_pending_schema(connection)
+            loop_manager._store_cleanup_pending(
+                connection,
+                str(repo),
+                cleanup_worktree,
+                "https://example.test/pr/99",
+                plan_sha,
+                "pending cleanup",
+            )
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE exec_plans
+                    SET status = 'BLOCKED', active_sha = ?, branch = ?,
+                        worktree = ?, workspace_owned = 1,
+                        blocked_fingerprint = ?,
+                        blocked_worktree_fingerprint = ?,
+                        last_error = 'scope blocked'
+                    WHERE repo = ? AND plan_id = 'G-001'
+                    """,
+                    (
+                        plan_sha,
+                        branch,
+                        str(worktree),
+                        input_fingerprint,
+                        input_fingerprint,
+                        str(repo),
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE projects
+                    SET active_sha = ?, plan_sha = ?, phase = 'BLOCKED',
+                        branch = ?, worktree = ?, plan_path = ?,
+                        last_error = 'scope blocked', agent_role = 'reviewer',
+                        agent_snapshot = ?, agent_input_fingerprint = ?,
+                        agent_result_snapshot = ?
+                    WHERE repo = ?
+                    """,
+                    (
+                        plan_sha,
+                        plan_sha,
+                        branch,
+                        str(worktree),
+                        plan_path,
+                        before.serialize(),
+                        input_fingerprint,
+                        blocked_result.serialize(),
+                        str(repo),
+                    ),
+                )
+
+            common_patches = (
+                mock.patch("loop_manager.validate_repository", return_value=repo),
+                mock.patch("loop_manager.remote_base", return_value="main"),
+                mock.patch("loop_manager.ensure_safe_base_worktree"),
+                mock.patch("loop_manager.pr_for_branch", return_value=None),
+            )
+            with common_patches[0], common_patches[1], common_patches[2], common_patches[3], mock.patch(
+                "loop_manager.run_codex"
+            ) as blocked_agent:
+                blocked_run = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            blocked_project = connection.execute(
+                "SELECT phase, last_error, agent_manager_snapshot "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(blocked_run, 1)
+            self.assertEqual(blocked_project["phase"], "BLOCKED")
+            self.assertEqual(blocked_project["last_error"], "scope blocked")
+            self.assertIsNotNone(blocked_project["agent_manager_snapshot"])
+            self.assertFalse(cleanup_worktree.exists())
+            self.assertEqual(
+                connection.execute(
+                    "SELECT count(*) FROM cleanup_pending WHERE repo = ?",
+                    (str(repo),),
+                ).fetchone()[0],
+                0,
+            )
+            blocked_agent.assert_not_called()
+
+            (repo / "docs/PRODUCT.md").write_text(
+                "# Product changed after cleanup\n",
+                encoding="utf-8",
+            )
+            commit_and_push(repo, "Change source after blocked cleanup")
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.run_codex",
+                return_value=loop_manager.CodexResult(
+                    1,
+                    "stop after cleanup recovery",
+                    "planner-session",
+                ),
+            ) as resumed_agent:
+                resumed_run = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            resumed_project = connection.execute(
+                "SELECT phase, last_error, agent_snapshot, agent_manager_snapshot "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            resumed_plan = connection.execute(
+                "SELECT status, blocked_fingerprint, blocked_worktree_fingerprint "
+                "FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(resumed_run, 1)
+            self.assertEqual(resumed_project["phase"], "PLANNING")
+            self.assertEqual(
+                resumed_project["last_error"],
+                "stop after cleanup recovery",
+            )
+            self.assertIsNone(resumed_project["agent_snapshot"])
+            self.assertIsNone(resumed_project["agent_manager_snapshot"])
+            self.assertEqual(resumed_plan["status"], "READY")
+            self.assertIsNone(resumed_plan["blocked_fingerprint"])
+            self.assertIsNone(resumed_plan["blocked_worktree_fingerprint"])
+            resumed_agent.assert_called_once()
+            self.assertEqual(resumed_agent.call_args.args[3], "planner")
+
+    def test_blocked_resume_does_not_excuse_agent_base_ref_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, plan_path = self._repository_with_plan(directory)
+            worktree = root / "managed"
+            loop_manager.make_worktree(
+                repo,
+                worktree,
+                "loop-manager/G-001",
+                "main",
+            )
+            before = loop_manager.capture_git_snapshot(worktree)
+            git_command(
+                worktree,
+                "update-ref",
+                "refs/remotes/origin/main",
+                "HEAD^",
+            )
+            blocked_result = loop_manager.capture_git_snapshot(worktree)
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                """
+                INSERT INTO projects (
+                    repo, base_branch, agent_role, agent_snapshot,
+                    agent_result_snapshot
+                ) VALUES (?, 'main', 'reviewer', ?, ?)
+                """,
+                (
+                    str(repo),
+                    before.serialize(),
+                    blocked_result.serialize(),
+                ),
+            )
+            connection.commit()
+
+            (repo / "docs/PRODUCT.md").write_text(
+                "# Product changed after blocked review\n",
+                encoding="utf-8",
+            )
+            commit_and_push(repo, "Change source after base ref mutation")
+
+            with self.assertRaisesRegex(
+                loop_manager.AgentScopeError,
+                r"refs/remotes/origin/main",
+            ):
+                loop_manager.validate_blocked_agent_scope(
+                    connection,
+                    repo,
+                    str(repo),
+                    "main",
+                    worktree,
+                    plan_path,
+                )
+
+    def test_agent_commit_isolated_automatically_after_blocked_input_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, plan_path = self._repository_with_plan(directory)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            branch, worktree = loop_manager.expected_execplan_workspace(
+                state_dir,
+                str(repo),
+                "G-001",
+            )
+            loop_manager.make_worktree(repo, worktree, branch, "main")
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+                (str(repo),),
+            )
+            loop_manager.register_execplans(
+                connection,
+                str(repo),
+                repo,
+                [(plan_path, loop_manager._parse_execplan(repo, repo / plan_path))],
+                plan_sha,
+                loop_manager.planning_input_fingerprint(repo, "main"),
+            )
+            plan = connection.execute(
+                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            blocked_fingerprint = loop_manager._worktree_execplan_input_fingerprint(
+                worktree,
+                plan,
+            )
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE exec_plans
+                    SET status = ?, active_sha = ?, branch = ?,
+                        worktree = ?, workspace_owned = 1
+                    WHERE repo = ? AND plan_id = ?
+                    """,
+                    (
+                        "IMPLEMENTING",
+                        plan_sha,
+                        branch,
+                        str(worktree),
+                        str(repo),
+                        "G-001",
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE projects
+                    SET active_sha = ?, plan_sha = ?, phase = ?,
+                        branch = ?, worktree = ?, plan_path = ?
+                    WHERE repo = ?
+                    """,
+                    (
+                        plan_sha,
+                        plan_sha,
+                        "WORKING",
+                        branch,
+                        str(worktree),
+                        plan_path,
+                        str(repo),
+                    ),
+                )
+            (worktree / "src/app.py").write_text(
+                "VALUE = 2\n",
+                encoding="utf-8",
+            )
+            git_command(worktree, "add", "src/app.py")
+            (worktree / "README.md").write_text(
+                "# preserved unstaged Worker change\n",
+                encoding="utf-8",
+            )
+            (worktree / "tests/evidence.txt").write_text(
+                "targeted tests passed\n",
+                encoding="utf-8",
+            )
+            before = loop_manager.begin_agent_scope(
+                connection,
+                str(repo),
+                worktree,
+                "worker",
+                input_fingerprint=blocked_fingerprint,
+            )
+            self.assertTrue(before.dirty)
+            self.assertIn("staged", before.dirty["src/app.py"][0])
+            (worktree / "docs/requirements/Active.md").write_text(
+                "# changed by committing Agent\n",
+                encoding="utf-8",
+            )
+            git_command(worktree, "add", "-A")
+            git_command(worktree, "commit", "-m", "Agent commit")
+            agent_commit = git_command(worktree, "rev-parse", "HEAD")
+            blocked_result = loop_manager.capture_git_snapshot(worktree)
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE exec_plans
+                    SET status = 'BLOCKED', active_sha = ?, branch = ?,
+                        worktree = ?, workspace_owned = 1,
+                        blocked_fingerprint = ?,
+                        blocked_worktree_fingerprint = ?
+                    WHERE repo = ? AND plan_id = 'G-001'
+                    """,
+                    (
+                        plan_sha,
+                        branch,
+                        str(worktree),
+                        blocked_fingerprint,
+                        blocked_fingerprint,
+                        str(repo),
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE projects
+                    SET active_sha = ?, plan_sha = ?, phase = 'BLOCKED',
+                        branch = ?, worktree = ?, plan_path = ?,
+                        agent_role = 'worker', agent_snapshot = ?,
+                        agent_input_fingerprint = ?,
+                        agent_result_snapshot = ?
+                    WHERE repo = ?
+                    """,
+                    (
+                        plan_sha,
+                        plan_sha,
+                        branch,
+                        str(worktree),
+                        plan_path,
+                        before.serialize(),
+                        blocked_fingerprint,
+                        blocked_result.serialize(),
+                        str(repo),
+                    ),
+                )
+
+            (repo / "docs/PRODUCT.md").write_text(
+                "# Product changed after blocked Agent commit\n",
+                encoding="utf-8",
+            )
+            commit_and_push(repo, "Change source after blocked Agent commit")
+
+            def stop_after_isolation(*_args, **_kwargs):
+                restored = loop_manager.capture_git_snapshot(worktree)
+                self.assertIn("staged", restored.dirty["src/app.py"][0])
+                self.assertIn("unstaged", restored.dirty["README.md"][0])
+                self.assertIn(
+                    "untracked",
+                    restored.dirty["tests/evidence.txt"][0],
+                )
+                return loop_manager.CodexResult(
+                    1,
+                    "stop after automatic commit isolation",
+                    "planner-session",
+                )
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.run_codex",
+                side_effect=stop_after_isolation,
+            ) as resumed_agent:
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, last_error, agent_snapshot, agent_recovery "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            resumed_plan = connection.execute(
+                "SELECT status, blocked_fingerprint FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            diagnostic_refs = git_command(
+                worktree,
+                "for-each-ref",
+                "--format=%(objectname)",
+                "refs/loop-manager/violations/",
+            ).splitlines()
+            self.assertEqual(result, 1)
+            self.assertEqual(project["phase"], "PLANNING")
+            self.assertEqual(
+                project["last_error"],
+                "stop after automatic commit isolation",
+            )
+            self.assertIsNone(project["agent_snapshot"])
+            self.assertIsNone(project["agent_recovery"])
+            self.assertEqual(resumed_plan["status"], "READY")
+            self.assertIsNone(resumed_plan["blocked_fingerprint"])
+            self.assertIn(agent_commit, diagnostic_refs)
+            self.assertEqual(
+                (worktree / "src/app.py").read_text(encoding="utf-8"),
+                "VALUE = 2\n",
+            )
+            self.assertEqual(
+                (worktree / "tests/evidence.txt").read_text(encoding="utf-8"),
+                "targeted tests passed\n",
+            )
+            restored = loop_manager.capture_git_snapshot(worktree)
+            self.assertIn("staged", restored.dirty["src/app.py"][0])
+            self.assertIn("unstaged", restored.dirty["README.md"][0])
+            self.assertIn("untracked", restored.dirty["tests/evidence.txt"][0])
+            self.assertEqual(
+                (worktree / "README.md").read_text(encoding="utf-8"),
+                "# preserved unstaged Worker change\n",
+            )
+            self.assertEqual(
+                (worktree / "docs/requirements/Active.md").read_text(
+                    encoding="utf-8"
+                ),
+                "# Active\n",
+            )
+            resumed_agent.assert_called_once()
+            self.assertEqual(resumed_agent.call_args.args[3], "planner")
+
+    def test_restored_worker_git_metadata_allows_changed_input_to_requeue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, plan_path = self._repository_with_plan(directory)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            branch, worktree = loop_manager.expected_execplan_workspace(
+                state_dir,
+                str(repo),
+                "G-001",
+            )
+            loop_manager.make_worktree(repo, worktree, branch, "main")
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+                (str(repo),),
+            )
+            loop_manager.register_execplans(
+                connection,
+                str(repo),
+                repo,
+                [(plan_path, loop_manager._parse_execplan(repo, repo / plan_path))],
+                plan_sha,
+                loop_manager.planning_input_fingerprint(repo, "main"),
+            )
+            plan = connection.execute(
+                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            blocked_fingerprint = loop_manager._worktree_execplan_input_fingerprint(
+                worktree,
+                plan,
+            )
+            before = loop_manager.capture_git_snapshot(worktree)
+
+            (worktree / "src/app.py").write_text(
+                "VALUE = 2\n",
+                encoding="utf-8",
+            )
+            git_command(worktree, "add", "src/app.py")
+            git_command(worktree, "commit", "-m", "Agent commit")
+            git_command(worktree, "switch", "-c", "agent-branch")
+            git_command(
+                worktree,
+                "update-ref",
+                "refs/tags/agent-tag",
+                "HEAD",
+            )
+            git_command(worktree, "config", "core.hooksPath", ".agent-hooks")
+            blocked_result = loop_manager.capture_git_snapshot(worktree)
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE exec_plans
+                    SET status = 'BLOCKED', active_sha = ?, branch = ?,
+                        worktree = ?, workspace_owned = 1,
+                        blocked_fingerprint = ?
+                    WHERE repo = ? AND plan_id = 'G-001'
+                    """,
+                    (
+                        plan_sha,
+                        branch,
+                        str(worktree),
+                        blocked_fingerprint,
+                        str(repo),
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE projects
+                    SET active_sha = ?, plan_sha = ?, phase = 'BLOCKED',
+                        branch = ?, worktree = ?, plan_path = ?,
+                        agent_role = 'worker', agent_snapshot = ?,
+                        agent_result_snapshot = ?
+                    WHERE repo = ?
+                    """,
+                    (
+                        plan_sha,
+                        plan_sha,
+                        branch,
+                        str(worktree),
+                        plan_path,
+                        before.serialize(),
+                        blocked_result.serialize(),
+                        str(repo),
+                    ),
+                )
+
+            git_command(worktree, "config", "--unset", "core.hooksPath")
+            git_command(worktree, "switch", branch)
+            git_command(worktree, "reset", "--hard", plan_sha)
+            git_command(worktree, "branch", "-D", "agent-branch")
+            git_command(worktree, "update-ref", "-d", "refs/tags/agent-tag")
+            (repo / "docs/PRODUCT.md").write_text(
+                "# Product changed after Git recovery\n",
+                encoding="utf-8",
+            )
+            commit_and_push(repo, "Change source after Git recovery")
+
+            with mock.patch(
+                "loop_manager.validate_repository",
+                return_value=repo,
+            ), mock.patch(
+                "loop_manager.remote_base",
+                return_value="main",
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch",
+                return_value=None,
+            ), mock.patch(
+                "loop_manager.run_codex",
+                return_value=loop_manager.CodexResult(
+                    1,
+                    "stop after restored metadata",
+                    "planner-session",
+                ),
+            ) as resumed_agent:
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, last_error, agent_snapshot, agent_result_snapshot "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            plan = connection.execute(
+                "SELECT status, blocked_fingerprint FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(result, 1)
+            self.assertEqual(project["phase"], "PLANNING")
+            self.assertEqual(project["last_error"], "stop after restored metadata")
+            self.assertIsNone(project["agent_snapshot"])
+            self.assertIsNone(project["agent_result_snapshot"])
+            self.assertEqual(plan["status"], "READY")
+            self.assertIsNone(plan["blocked_fingerprint"])
+            resumed_agent.assert_called_once()
+            self.assertEqual(resumed_agent.call_args.args[3], "planner")
+
+    def test_index_flags_are_rejected_for_worker_allowed_path(self):
+        for option in ("--skip-worktree", "--assume-unchanged"):
+            with self.subTest(option=option), tempfile.TemporaryDirectory() as directory:
+                repo, plan_path = self._repository_with_plan(directory)
+                before = loop_manager.capture_git_snapshot(repo)
+
+                git_command(
+                    repo,
+                    "update-index",
+                    option,
+                    "--",
+                    "src/app.py",
+                )
+                after = loop_manager.capture_git_snapshot(repo)
+
+                self.assertNotEqual(
+                    before.index["src/app.py"],
+                    after.index["src/app.py"],
+                )
+                with self.assertRaisesRegex(
+                    loop_manager.AgentScopeError,
+                    r"src/app\.py .*index flags",
+                ):
+                    loop_manager.validate_agent_scope(
+                        "worker",
+                        repo,
+                        before,
+                        after,
+                        selected_plan_path=plan_path,
+                    )
+
+    def test_preexisting_index_flags_do_not_hide_agent_file_changes(self):
+        scenarios = (
+            ("planner", "README.md"),
+            ("worker", "docs/requirements/Active.md"),
+            ("reviewer", "src/app.py"),
+        )
+        for option in ("--skip-worktree", "--assume-unchanged"):
+            for role_name, relative_path in scenarios:
+                with self.subTest(option=option, role=role_name):
+                    with tempfile.TemporaryDirectory() as directory:
+                        repo, plan_path = self._repository_with_plan(directory)
+                        git_command(
+                            repo,
+                            "update-index",
+                            option,
+                            "--",
+                            relative_path,
+                        )
+                        before = loop_manager.capture_git_snapshot(repo)
+
+                        (repo / relative_path).write_text(
+                            f"changed by {role_name}\n",
+                            encoding="utf-8",
+                        )
+                        after = loop_manager.capture_git_snapshot(repo)
+
+                        self.assertEqual(
+                            before.index[relative_path],
+                            after.index[relative_path],
+                        )
+                        self.assertNotEqual(
+                            before.dirty[relative_path],
+                            after.dirty[relative_path],
+                        )
+                        with self.assertRaises(
+                            loop_manager.AgentScopeError
+                        ) as raised:
+                            loop_manager.validate_agent_scope(
+                                role_name,
+                                repo,
+                                before,
+                                after,
+                                selected_plan_path=(
+                                    plan_path if role_name == "worker" else None
+                                ),
+                            )
+                        self.assertIn(relative_path, str(raised.exception))
+
+    def test_existing_database_adds_persistent_agent_scope_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            database = sqlite3.connect(state_dir / "loop-manager.db")
+            database.execute(
+                """
+                CREATE TABLE projects (
+                    repo TEXT PRIMARY KEY,
+                    base_branch TEXT NOT NULL,
+                    phase TEXT
+                )
+                """
+            )
+            database.execute(
+                "INSERT INTO projects (repo, base_branch) VALUES ('repo', 'main')"
+            )
+            database.commit()
+            database.close()
+
+            with loop_manager.connect_database(state_dir) as connection:
+                columns = {
+                    row[1]
+                    for row in connection.execute("PRAGMA table_info(projects)")
+                }
+                row = connection.execute(
+                    "SELECT agent_role, agent_snapshot, agent_input_fingerprint, agent_result_snapshot, "
+                    "planning_workspace_owned "
+                    "FROM projects "
+                    "WHERE repo = 'repo'"
+                ).fetchone()
+
+            self.assertTrue(
+                {
+                    "agent_role",
+                    "agent_snapshot",
+                    "agent_input_fingerprint",
+                    "agent_result_snapshot",
+                    "planning_workspace_owned",
+                }
+                <= columns
+            )
+            self.assertEqual(tuple(row), (None, None, None, None, 0))
+
+    def test_reviewer_mutation_blocks_even_when_verdict_passes(self):
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, plan_path = self._repository_with_plan(directory)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            branch, worktree = loop_manager.expected_execplan_workspace(
+                state_dir, str(repo), "G-001"
+            )
+            loop_manager.make_worktree(repo, worktree, branch, "main")
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                """
+                INSERT INTO projects (
+                    repo, base_branch, active_sha, plan_sha, phase, branch,
+                    worktree, plan_path, worker_result, verify_result
+                ) VALUES (?, 'main', ?, ?, 'REVIEWING', ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(repo),
+                    plan_sha,
+                    plan_sha,
+                    branch,
+                    str(worktree),
+                    plan_path,
+                    worker_result(),
+                    "verify: PASS",
+                ),
+            )
+            connection.commit()
+
+            def reviewer(agent_worktree, *_args, **_kwargs):
+                (agent_worktree / "reviewer.txt").write_text(
+                    "keep for diagnosis\n", encoding="utf-8"
+                )
+                (agent_worktree / "docs/PRODUCT.md").write_text(
+                    "# Product changed by Reviewer\n", encoding="utf-8"
+                )
+                return 0, "VERDICT: PASS"
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.run_codex", side_effect=reviewer
+            ):
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, last_error, agent_role, agent_snapshot, "
+                "agent_result_snapshot "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            plan = connection.execute(
+                "SELECT * FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(result, 1)
+            self.assertEqual(project["phase"], "BLOCKED")
+            self.assertIn("reviewer Git 범위 위반", project["last_error"])
+            self.assertEqual(plan["status"], "BLOCKED")
+            self.assertEqual(project["agent_role"], "reviewer")
+            self.assertIsNotNone(project["agent_snapshot"])
+            self.assertIsNotNone(project["agent_result_snapshot"])
+            self.assertNotIn("keep for diagnosis", project["agent_snapshot"])
+            self.assertIsNotNone(plan["blocked_fingerprint"])
+            self.assertEqual(
+                plan["blocked_fingerprint"],
+                loop_manager._revision_execplan_input_fingerprint(
+                    repo, "refs/remotes/origin/main", plan
+                ),
+            )
+            self.assertNotEqual(
+                plan["blocked_fingerprint"],
+                plan["blocked_worktree_fingerprint"],
+            )
+            self.assertTrue((worktree / "reviewer.txt").is_file())
+
+            blocked_error = project["last_error"]
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as unchanged_agent:
+                unchanged_result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            unchanged_project = connection.execute(
+                "SELECT phase, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            unchanged_plan = connection.execute(
+                "SELECT status, blocked_fingerprint FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(unchanged_result, 1)
+            self.assertEqual(unchanged_project["phase"], "BLOCKED")
+            self.assertEqual(unchanged_project["last_error"], blocked_error)
+            self.assertEqual(unchanged_plan["status"], "BLOCKED")
+            self.assertEqual(
+                unchanged_plan["blocked_fingerprint"],
+                plan["blocked_fingerprint"],
+            )
+            self.assertEqual(
+                (worktree / "docs/PRODUCT.md").read_text(encoding="utf-8"),
+                "# Product changed by Reviewer\n",
+            )
+            unchanged_agent.assert_not_called()
+
+            (repo / "docs/PRODUCT.md").write_text(
+                "# Product changed after blocked review\n",
+                encoding="utf-8",
+            )
+            commit_and_push(repo, "Change source after blocked review")
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.run_codex",
+                return_value=loop_manager.CodexResult(
+                    1, "stop after scope unblock", "planner-session"
+                ),
+            ) as resumed_agent:
+                resumed_result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            resumed_project = connection.execute(
+                "SELECT phase, last_error, agent_role, agent_snapshot, "
+                "agent_result_snapshot "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            resumed_plan = connection.execute(
+                "SELECT status, blocked_fingerprint FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(resumed_result, 1)
+            self.assertEqual(resumed_project["phase"], "PLANNING")
+            self.assertEqual(
+                resumed_project["last_error"],
+                "stop after scope unblock",
+            )
+            self.assertIsNone(resumed_project["agent_role"])
+            self.assertIsNone(resumed_project["agent_snapshot"])
+            self.assertIsNone(resumed_project["agent_result_snapshot"])
+            self.assertEqual(resumed_plan["status"], "READY")
+            self.assertIsNone(resumed_plan["blocked_fingerprint"])
+            self.assertFalse((worktree / "reviewer.txt").exists())
+            self.assertIn(
+                "loop-manager scope violation G-001",
+                git_command(worktree, "stash", "list"),
+            )
+            resumed_agent.assert_called_once()
+            self.assertEqual(resumed_agent.call_args.args[3], "planner")
+
+
+    def test_reviewer_scope_block_records_execplan_body_boundaries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, plan_path = self._repository_with_plan(directory)
+            worktree = root / "managed"
+            loop_manager.make_worktree(
+                repo,
+                worktree,
+                "loop-manager/G-001",
+                "main",
+            )
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                """
+                INSERT INTO projects (repo, base_branch, plan_path)
+                VALUES (?, 'main', ?)
+                """,
+                (str(repo), plan_path),
+            )
+            loop_manager.register_execplans(
+                connection,
+                str(repo),
+                repo,
+                [(plan_path, loop_manager._parse_execplan(repo, repo / plan_path))],
+                plan_sha,
+                loop_manager.planning_input_fingerprint(repo, "main"),
+            )
+            loop_manager.update_project(connection, str(repo), plan_path=plan_path)
+            plan = connection.execute(
+                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            input_fingerprint = loop_manager._worktree_execplan_input_fingerprint(
+                worktree,
+                plan,
+            )
+            plan_file = worktree / plan_path
+            input_plan = plan_file.read_text(encoding="utf-8")
+            loop_manager.begin_agent_scope(
+                connection,
+                str(repo),
+                worktree,
+                "reviewer",
+                input_fingerprint=input_fingerprint,
+            )
+            result_plan = input_plan.replace("Test plan.", "Reviewer mutation.")
+            plan_file.write_text(result_plan, encoding="utf-8")
+
+            loop_manager.block_active_execplan(
+                connection,
+                str(repo),
+                worktree,
+                "reviewer scope violation",
+                "",
+            )
+
+            project = connection.execute(
+                "SELECT agent_input_plan, agent_result_plan "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(project["agent_input_plan"], input_plan)
+            self.assertEqual(project["agent_result_plan"], result_plan)
+
+    def test_blocked_scope_resume_rebases_non_source_remote_and_direct_execplan_edit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, plan_path = self._repository_with_plan(directory)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            branch, worktree = loop_manager.expected_execplan_workspace(
+                state_dir,
+                str(repo),
+                "G-001",
+            )
+            loop_manager.make_worktree(repo, worktree, branch, "main")
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+                (str(repo),),
+            )
+            loop_manager.register_execplans(
+                connection,
+                str(repo),
+                repo,
+                [(plan_path, loop_manager._parse_execplan(repo, repo / plan_path))],
+                plan_sha,
+                loop_manager.planning_input_fingerprint(repo, "main"),
+            )
+            plan = connection.execute(
+                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            input_fingerprint = loop_manager._worktree_execplan_input_fingerprint(
+                worktree,
+                plan,
+            )
+            plan_file = worktree / plan_path
+            original_plan_text = plan_file.read_text(encoding="utf-8")
+            before = loop_manager.capture_git_snapshot(worktree)
+            reviewer_plan_text = original_plan_text.replace(
+                "Test plan.", "Reviewer mutation."
+            )
+            plan_file.write_text(reviewer_plan_text, encoding="utf-8")
+            blocked_worktree_fingerprint = (
+                loop_manager._worktree_execplan_input_fingerprint(worktree, plan)
+            )
+            (worktree / "reviewer.txt").write_text(
+                "preserve violation\n",
+                encoding="utf-8",
+            )
+            blocked_result = loop_manager.capture_git_snapshot(worktree)
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE exec_plans
+                    SET status = 'BLOCKED', active_sha = ?, branch = ?,
+                        worktree = ?, workspace_owned = 1,
+                        blocked_fingerprint = ?,
+                        blocked_worktree_fingerprint = ?,
+                        last_error = 'scope blocked'
+                    WHERE repo = ? AND plan_id = 'G-001'
+                    """,
+                    (
+                        plan_sha,
+                        branch,
+                        str(worktree),
+                        input_fingerprint,
+                        blocked_worktree_fingerprint,
+                        str(repo),
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE projects
+                    SET active_sha = ?, plan_sha = ?, phase = 'BLOCKED',
+                        branch = ?, worktree = ?, plan_path = ?,
+                        last_error = 'scope blocked', agent_role = 'reviewer',
+                        agent_snapshot = ?, agent_input_fingerprint = ?,
+                        agent_result_snapshot = ?, agent_input_plan = ?,
+                        agent_result_plan = ?
+                    WHERE repo = ?
+                    """,
+                    (
+                        plan_sha,
+                        plan_sha,
+                        branch,
+                        str(worktree),
+                        plan_path,
+                        before.serialize(),
+                        input_fingerprint,
+                        blocked_result.serialize(),
+                        original_plan_text,
+                        reviewer_plan_text,
+                        str(repo),
+                    ),
+                )
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as blocked_agent:
+                unchanged_run = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            persisted_block = connection.execute(
+                "SELECT phase, agent_manager_snapshot "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(unchanged_run, 1)
+            self.assertEqual(persisted_block["phase"], "BLOCKED")
+            self.assertIsNotNone(persisted_block["agent_manager_snapshot"])
+            blocked_agent.assert_not_called()
+
+            (repo / "docs/notes.md").write_text(
+                "# Notes\n\nRemote non-input change.\n",
+                encoding="utf-8",
+            )
+            commit_and_push(repo, "Change non-input documentation")
+            remote_head = git_command(repo, "rev-parse", "origin/main")
+            self.assertEqual(
+                loop_manager._revision_execplan_input_fingerprint(
+                    repo,
+                    "refs/remotes/origin/main",
+                    plan,
+                ),
+                input_fingerprint,
+            )
+
+            user_mixed_plan_text = plan_file.read_text(encoding="utf-8") + (
+                "\nUser clarification after scope block.\n"
+            )
+            plan_file.write_text(user_mixed_plan_text, encoding="utf-8")
+            user_plan_text = original_plan_text + "\nUser clarification after scope block.\n"
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.os.replace",
+                side_effect=KeyboardInterrupt,
+            ), self.assertRaises(KeyboardInterrupt):
+                loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            interrupted = connection.execute(
+                "SELECT phase, agent_recovery FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(interrupted["phase"], "BLOCKED")
+            self.assertIsNotNone(interrupted["agent_recovery"])
+            recovery = json.loads(interrupted["agent_recovery"])
+            recovery_temp = worktree / recovery["plan_temp_path"]
+            self.assertEqual(
+                plan_file.read_text(encoding="utf-8"),
+                original_plan_text,
+            )
+            self.assertTrue(recovery_temp.is_file())
+            recovery_temp.write_bytes(b"partial interrupted contents")
+            self.assertFalse((worktree / "reviewer.txt").exists())
+
+            def resumed_worker(agent_worktree, *_args, **_kwargs):
+                self.assertEqual(_args[2], "worker")
+                self.assertEqual(
+                    (agent_worktree / plan_path).read_text(encoding="utf-8"),
+                    user_plan_text,
+                )
+                self.assertNotIn(
+                    "Reviewer mutation.",
+                    (agent_worktree / plan_path).read_text(encoding="utf-8"),
+                )
+                self.assertEqual(
+                    (agent_worktree / "docs/notes.md").read_text(
+                        encoding="utf-8"
+                    ),
+                    "# Notes\n\nRemote non-input change.\n",
+                )
+                self.assertEqual(
+                    git_command(
+                        agent_worktree,
+                        "merge-base",
+                        "--is-ancestor",
+                        remote_head,
+                        "HEAD",
+                    ),
+                    "",
+                )
+                self.assertFalse((agent_worktree / "reviewer.txt").exists())
+                return loop_manager.CodexResult(
+                    1,
+                    "stop after combined input recovery",
+                    "worker-session",
+                )
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.run_codex", side_effect=resumed_worker
+            ) as resumed_agent:
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, last_error, agent_snapshot "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            resumed_plan = connection.execute(
+                "SELECT status, blocked_fingerprint, blocked_worktree_fingerprint "
+                "FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(result, 1)
+            self.assertEqual(project["phase"], "WORKING")
+            self.assertEqual(
+                project["last_error"],
+                "stop after combined input recovery",
+            )
+            self.assertIsNone(project["agent_snapshot"])
+            self.assertEqual(resumed_plan["status"], "IMPLEMENTING")
+            self.assertIsNone(resumed_plan["blocked_fingerprint"])
+            self.assertIsNone(resumed_plan["blocked_worktree_fingerprint"])
+            self.assertEqual(plan_file.read_text(encoding="utf-8"), user_plan_text)
+            self.assertFalse((worktree / "reviewer.txt").exists())
+            self.assertIn(
+                "loop-manager scope violation G-001",
+                git_command(worktree, "stash", "list"),
+            )
+            stashed_plan = git_command(
+                worktree, "show", f"stash@{{0}}:{plan_path}"
+            )
+            self.assertIn("Reviewer mutation.", stashed_plan)
+            resumed_agent.assert_called_once()
+            self.assertEqual(resumed_agent.call_args.args[3], "worker")
+
+    def test_verify_mutation_of_worker_protected_file_blocks_before_commit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, plan_path = self._repository_with_plan(directory)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            branch, worktree = loop_manager.expected_execplan_workspace(
+                state_dir, str(repo), "G-001"
+            )
+            loop_manager.make_worktree(repo, worktree, branch, "main")
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
+            initial_head = git_command(worktree, "rev-parse", "HEAD")
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                """
+                INSERT INTO projects (
+                    repo, base_branch, active_sha, plan_sha, phase, branch,
+                    worktree, plan_path, worker_result
+                ) VALUES (?, 'main', ?, ?, 'VERIFYING', ?, ?, ?, ?)
+                """,
+                (
+                    str(repo),
+                    plan_sha,
+                    plan_sha,
+                    branch,
+                    str(worktree),
+                    plan_path,
+                    worker_result(),
+                ),
+            )
+            connection.commit()
+
+            def verify_with_protected_mutation(agent_worktree):
+                (agent_worktree / "docs/requirements/Active.md").write_text(
+                    "# changed by verify\n",
+                    encoding="utf-8",
+                )
+                return True, "verify: PASS"
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.verify", side_effect=verify_with_protected_mutation
+            ) as verify, mock.patch(
+                "loop_manager.run_codex"
+            ) as agent:
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, last_error, verify_result, agent_role, "
+                "agent_snapshot, agent_result_snapshot "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            plan = connection.execute(
+                "SELECT status FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+
+            self.assertEqual(result, 1)
+            self.assertEqual(project["phase"], "BLOCKED")
+            self.assertIn("worker Git 범위 위반", project["last_error"])
+            self.assertIn(
+                "docs/requirements/Active.md",
+                project["last_error"],
+            )
+            self.assertEqual(project["verify_result"], "verify: PASS")
+            self.assertEqual(project["agent_role"], "worker")
+            self.assertIsNotNone(project["agent_snapshot"])
+            self.assertIsNotNone(project["agent_result_snapshot"])
+            self.assertEqual(plan["status"], "BLOCKED")
+            self.assertEqual(
+                git_command(worktree, "rev-parse", "HEAD"),
+                initial_head,
+            )
+            self.assertEqual(
+                (worktree / "docs/requirements/Active.md").read_text(
+                    encoding="utf-8"
+                ),
+                "# changed by verify\n",
+            )
+            verify.assert_called_once_with(worktree)
+            agent.assert_not_called()
+
+    def test_rebase_verify_allowed_change_is_committed_before_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, plan_path = self._repository_with_plan(directory)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            branch, worktree = loop_manager.expected_execplan_workspace(
+                state_dir, str(repo), "G-001"
+            )
+            loop_manager.make_worktree(repo, worktree, branch, "main")
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                """
+                INSERT INTO projects (
+                    repo, base_branch, active_sha, plan_sha, phase, branch,
+                    worktree, plan_path
+                ) VALUES (?, 'main', ?, ?, 'WORKING', ?, ?, ?)
+                """,
+                (
+                    str(repo),
+                    plan_sha,
+                    plan_sha,
+                    branch,
+                    str(worktree),
+                    plan_path,
+                ),
+            )
+            connection.commit()
+
+            (repo / "README.md").write_text(
+                "# base advanced\n",
+                encoding="utf-8",
+            )
+            commit_and_push(repo, "Advance base before worker publication")
+            roles = []
+            verify_calls = []
+
+            def agent(agent_worktree, _state, _config, role_name, _prompt, **_kwargs):
+                roles.append(role_name)
+                if role_name == "worker":
+                    (agent_worktree / "src/app.py").write_text(
+                        "VALUE = 2\n",
+                        encoding="utf-8",
+                    )
+                    return loop_manager.CodexResult(
+                        0,
+                        worker_result("Persist rebased verify output"),
+                        "worker-session",
+                    )
+                self.assertEqual(role_name, "reviewer")
+                self.assertEqual(
+                    git_command(agent_worktree, "status", "--porcelain"),
+                    "",
+                )
+                self.assertEqual(
+                    git_command(
+                        agent_worktree,
+                        "show",
+                        "HEAD:verify-output.txt",
+                    ),
+                    "created after rebase",
+                )
+                return 1, "VERDICT: FAIL\nstop after publication check"
+
+            def verify_after_rebase(agent_worktree):
+                verify_calls.append(agent_worktree)
+                if len(verify_calls) == 2:
+                    (agent_worktree / "verify-output.txt").write_text(
+                        "created after rebase\n",
+                        encoding="utf-8",
+                    )
+                return True, f"verify pass {len(verify_calls)}"
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.run_codex", side_effect=agent
+            ), mock.patch(
+                "loop_manager.verify", side_effect=verify_after_rebase
+            ):
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            published_paths = git_command(
+                worktree,
+                "diff",
+                "--name-only",
+                "origin/main...HEAD",
+            ).splitlines()
+
+            self.assertEqual(result, 1)
+            self.assertEqual(roles, ["worker", "reviewer"])
+            self.assertEqual(len(verify_calls), 2)
+            self.assertEqual(project["phase"], "WORKING")
+            self.assertIn("Review 실패", project["last_error"])
+            self.assertIn("src/app.py", published_paths)
+            self.assertIn("verify-output.txt", published_paths)
+            self.assertEqual(
+                git_command(worktree, "status", "--porcelain"),
+                "",
+            )
+            self.assertEqual(
+                git_command(worktree, "log", "-1", "--pretty=%s"),
+                "Persist rebased verify output",
+            )
+
+
+
+class WorkspaceRecoveryTest(unittest.TestCase):
+    def _workspace(
+        self, directory: str
+    ) -> tuple[Path, Path, str, Path]:
+        root = Path(directory)
+        repo = make_remote_repository(directory)
+        state_dir = root / "state"
+        branch, worktree = loop_manager.expected_execplan_workspace(
+            state_dir, str(repo), "G-012"
+        )
+        loop_manager.make_worktree(repo, worktree, branch, "main")
+        return repo, state_dir, branch, worktree
+
+    def _ready_execplan(self, directory: str):
+        repo = make_remote_repository(directory)
+        state_dir = Path(directory) / "state"
+        (repo / "docs/plans").mkdir()
+        plan = write_execplan(repo, "G-012", "Recovery Safety")
+        commit_and_push(repo, "Add recovery safety plan")
+        plan_sha = git_command(repo, "rev-parse", "origin/main")
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute(loop_manager.SCHEMA)
+        connection.execute(
+            "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+            (str(repo),),
+        )
+        connection.commit()
+        relative_plan = plan.relative_to(repo).as_posix()
+        loop_manager.register_execplans(
+            connection,
+            str(repo),
+            repo,
+            [(relative_plan, loop_manager._parse_execplan(repo, plan))],
+            plan_sha,
+            loop_manager.planning_input_fingerprint(repo, "main"),
+        )
+        branch, worktree = loop_manager.expected_execplan_workspace(
+            state_dir, str(repo), "G-012"
+        )
+        return repo, state_dir, connection, plan, plan_sha, branch, worktree
+
+    def test_execplan_reservation_rejects_branch_inserted_before_create(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                repo,
+                state_dir,
+                connection,
+                _plan,
+                plan_sha,
+                branch,
+                worktree,
+            ) = self._ready_execplan(directory)
+            real_git = loop_manager.git
+
+            def interrupt_before_worktree_add(target, *arguments, **kwargs):
+                if arguments[:3] == ("worktree", "add", "-b"):
+                    raise KeyboardInterrupt(
+                        "interrupt before ExecPlan worktree creation"
+                    )
+                return real_git(target, *arguments, **kwargs)
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.git", side_effect=interrupt_before_worktree_add
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as interrupted_agent:
+                with self.assertRaisesRegex(
+                    KeyboardInterrupt,
+                    "before ExecPlan worktree creation",
+                ):
+                    loop_manager.run_project(
+                        connection,
+                        state_dir,
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
+                    )
+
+            reserved = connection.execute(
+                "SELECT workspace_owned FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-012'",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(
+                reserved["workspace_owned"],
+                loop_manager.WORKSPACE_RESERVED,
+            )
+            self.assertFalse(worktree.exists())
+            self.assertEqual(
+                loop_manager.git(
+                    repo,
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    f"refs/heads/{branch}",
+                    check=False,
+                ).returncode,
+                1,
+            )
+            interrupted_agent.assert_not_called()
+
+            git_command(
+                repo,
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                str(worktree),
+                "origin/main",
+            )
+            (worktree / "external.txt").write_text(
+                "not owned by Loop Manager\n",
+                encoding="utf-8",
+            )
+            git_command(worktree, "add", "external.txt")
+            git_command(worktree, "commit", "-m", "Create external branch state")
+            external_head = git_command(worktree, "rev-parse", "HEAD")
+            git_command(repo, "worktree", "remove", str(worktree))
+            self.assertFalse(worktree.exists())
+            self.assertNotEqual(external_head, plan_sha)
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as resumed_agent:
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            blocked = connection.execute(
+                "SELECT status, workspace_owned FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-012'",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(result, 1)
+            self.assertEqual(project["phase"], "BLOCKED")
+            self.assertIn(
+                "예약 ExecPlan branch가 저장된 기준 commit과 다릅니다",
+                project["last_error"],
+            )
+            self.assertEqual(
+                tuple(blocked),
+                ("BLOCKED", loop_manager.WORKSPACE_RESERVED),
+            )
+            self.assertFalse(worktree.exists())
+            self.assertEqual(
+                git_command(repo, "rev-parse", f"refs/heads/{branch}"),
+                external_head,
+            )
+            self.assertEqual(
+                git_command(repo, "show", f"{branch}:external.txt"),
+                "not owned by Loop Manager",
+            )
+            resumed_agent.assert_not_called()
+
+    def test_planning_reservation_preserves_clean_external_path_on_input_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            state_dir = Path(directory) / "state"
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            real_git = loop_manager.git
+
+            def interrupt_before_worktree_add(target, *arguments, **kwargs):
+                if arguments[:3] == ("worktree", "add", "--detach"):
+                    raise KeyboardInterrupt(
+                        "interrupt before planning worktree creation"
+                    )
+                return real_git(target, *arguments, **kwargs)
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.git", side_effect=interrupt_before_worktree_add
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as interrupted_agent:
+                with self.assertRaisesRegex(
+                    KeyboardInterrupt,
+                    "before planning worktree creation",
+                ):
+                    loop_manager.run_project(
+                        connection,
+                        state_dir,
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
+                    )
+
+            reserved = connection.execute(
+                "SELECT active_sha, phase, worktree, planning_workspace_owned "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            planning_worktree = Path(reserved["worktree"])
+            self.assertEqual(reserved["phase"], "PLANNING")
+            self.assertEqual(
+                reserved["planning_workspace_owned"],
+                loop_manager.WORKSPACE_RESERVED,
+            )
+            self.assertFalse(planning_worktree.exists())
+            interrupted_agent.assert_not_called()
+
+            git_command(
+                repo,
+                "worktree",
+                "add",
+                "--detach",
+                str(planning_worktree),
+                reserved["active_sha"],
+            )
+            self.assertEqual(
+                git_command(planning_worktree, "status", "--porcelain"),
+                "",
+            )
+            (repo / "docs/PRODUCT.md").write_text(
+                "# changed after planning reservation\n",
+                encoding="utf-8",
+            )
+            commit_and_push(repo, "Change input after planning reservation")
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as resumed_agent:
+                first_result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+                second_result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            preserved = connection.execute(
+                "SELECT phase, planning_error, planning_workspace_owned "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual((first_result, second_result), (1, 1))
+            self.assertEqual(preserved["phase"], "PLANNING")
+            self.assertIn(
+                "planning workspace cleanup 소유권 검증 실패",
+                preserved["planning_error"],
+            )
+            self.assertIn(
+                "planning worktree의 Loop Manager 소유권이 확인되지 않았습니다",
+                preserved["planning_error"],
+            )
+            self.assertEqual(
+                preserved["planning_workspace_owned"],
+                loop_manager.WORKSPACE_RESERVED,
+            )
+            self.assertTrue(planning_worktree.is_dir())
+            self.assertEqual(
+                git_command(planning_worktree, "rev-parse", "HEAD"),
+                reserved["active_sha"],
+            )
+            self.assertEqual(
+                git_command(planning_worktree, "status", "--porcelain"),
+                "",
+            )
+            resumed_agent.assert_not_called()
+
+
+    def test_planning_workspace_reservation_survives_post_create_interruption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            state_dir = Path(directory) / "state"
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            real_make_planning_worktree = loop_manager.make_planning_worktree
+
+            def interrupt_after_create(*args, **kwargs):
+                real_make_planning_worktree(*args, **kwargs)
+                raise KeyboardInterrupt("interrupt after planning worktree creation")
+
+            with mock.patch(
+                "loop_manager.validate_repository",
+                return_value=repo,
+            ), mock.patch(
+                "loop_manager.remote_base",
+                return_value="main",
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.make_planning_worktree",
+                side_effect=interrupt_after_create,
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as interrupted_agent:
+                with self.assertRaisesRegex(
+                    KeyboardInterrupt,
+                    "planning worktree creation",
+                ):
+                    loop_manager.run_project(
+                        connection,
+                        state_dir,
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
+                    )
+
+            interrupted = connection.execute(
+                "SELECT phase, worktree, planning_workspace_owned "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(interrupted["phase"], "PLANNING")
+            self.assertEqual(
+                interrupted["planning_workspace_owned"],
+                loop_manager.WORKSPACE_RESERVED,
+            )
+            self.assertTrue(Path(interrupted["worktree"]).is_dir())
+            interrupted_agent.assert_not_called()
+
+            with mock.patch(
+                "loop_manager.validate_repository",
+                return_value=repo,
+            ), mock.patch(
+                "loop_manager.remote_base",
+                return_value="main",
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.run_codex",
+                return_value=loop_manager.CodexResult(
+                    1,
+                    "stop after planning reservation recovery",
+                    "planner-session",
+                ),
+            ) as resumed_agent:
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            resumed = connection.execute(
+                "SELECT phase, planning_error, planning_workspace_owned "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(result, 1)
+            self.assertEqual(resumed["phase"], "PLANNING")
+            self.assertIsNone(resumed["planning_error"])
+            self.assertEqual(
+                resumed["planning_workspace_owned"],
+                loop_manager.WORKSPACE_OWNED,
+            )
+            resumed_agent.assert_called_once()
+            self.assertEqual(resumed_agent.call_args.args[3], "planner")
+
+    def test_execplan_workspace_reservation_survives_post_create_interruption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                repo,
+                state_dir,
+                connection,
+                _plan,
+                _plan_sha,
+                _branch,
+                worktree,
+            ) = self._ready_execplan(directory)
+            real_make_worktree = loop_manager.make_worktree
+
+            def interrupt_after_create(*args, **kwargs):
+                real_make_worktree(*args, **kwargs)
+                raise KeyboardInterrupt("interrupt after ExecPlan worktree creation")
+
+            with mock.patch(
+                "loop_manager.validate_repository",
+                return_value=repo,
+            ), mock.patch(
+                "loop_manager.remote_base",
+                return_value="main",
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.make_worktree",
+                side_effect=interrupt_after_create,
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as interrupted_agent:
+                with self.assertRaisesRegex(
+                    KeyboardInterrupt,
+                    "ExecPlan worktree creation",
+                ):
+                    loop_manager.run_project(
+                        connection,
+                        state_dir,
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
+                    )
+
+            interrupted = connection.execute(
+                "SELECT phase FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            interrupted_plan = connection.execute(
+                "SELECT status, workspace_owned FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-012'",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(interrupted["phase"], "WORKING")
+            self.assertEqual(
+                tuple(interrupted_plan),
+                ("IMPLEMENTING", loop_manager.WORKSPACE_RESERVED),
+            )
+            self.assertTrue(worktree.is_dir())
+            interrupted_agent.assert_not_called()
+
+            with mock.patch(
+                "loop_manager.validate_repository",
+                return_value=repo,
+            ), mock.patch(
+                "loop_manager.remote_base",
+                return_value="main",
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch",
+                return_value=None,
+            ), mock.patch(
+                "loop_manager.run_codex",
+                return_value=loop_manager.CodexResult(
+                    1,
+                    "stop after ExecPlan reservation recovery",
+                    "worker-session",
+                ),
+            ) as resumed_agent:
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            resumed = connection.execute(
+                "SELECT phase, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            resumed_plan = connection.execute(
+                "SELECT status, workspace_owned FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-012'",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(result, 1)
+            self.assertEqual(resumed["phase"], "WORKING")
+            self.assertEqual(
+                resumed["last_error"],
+                "stop after ExecPlan reservation recovery",
+            )
+            self.assertEqual(
+                tuple(resumed_plan),
+                ("IMPLEMENTING", loop_manager.WORKSPACE_OWNED),
+            )
+            resumed_agent.assert_called_once()
+            self.assertEqual(resumed_agent.call_args.args[3], "worker")
+
+    def test_existing_catalog_does_not_infer_workspace_ownership(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute(
+            """
+            CREATE TABLE exec_plans (
+                repo TEXT NOT NULL,
+                plan_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                branch TEXT,
+                worktree TEXT,
+                blocked_fingerprint TEXT
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO exec_plans "
+            "(repo, plan_id, status, branch, worktree, blocked_fingerprint) "
+            "VALUES ('repo', 'G-012', 'BLOCKED', 'loop-manager/G-012', "
+            "'managed', 'fingerprint')"
+        )
+
+        loop_manager._ensure_execplans_schema(connection)
+
+        row = connection.execute(
+            "SELECT workspace_owned, blocked_worktree_fingerprint "
+            "FROM exec_plans WHERE repo = 'repo'"
+        ).fetchone()
+        self.assertEqual(tuple(row), (0, None))
+
+    def test_missing_worktree_is_recovered_from_owned_branch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, _state_dir, branch, worktree = self._workspace(directory)
+            original_head = git_command(worktree, "rev-parse", "HEAD")
+            git_command(repo, "worktree", "remove", str(worktree))
+
+            outcome = loop_manager.make_worktree(
+                repo,
+                worktree,
+                branch,
+                "main",
+                allow_create_branch=False,
+            )
+
+            self.assertEqual(outcome, "recovered")
+            self.assertEqual(git_command(worktree, "rev-parse", "HEAD"), original_head)
+            loop_manager.validate_managed_worktree(repo, worktree, branch)
+
+    def test_interrupted_worker_recovers_missing_owned_worktree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                repo,
+                state_dir,
+                connection,
+                plan,
+                plan_sha,
+                branch,
+                worktree,
+            ) = self._ready_execplan(directory)
+            loop_manager.make_worktree(repo, worktree, branch, "main")
+            before = loop_manager.capture_git_snapshot(worktree)
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE exec_plans
+                    SET status = 'IMPLEMENTING', active_sha = ?, branch = ?,
+                        worktree = ?, workspace_owned = 1,
+                        worker_session_id = 'worker-session'
+                    WHERE repo = ? AND plan_id = 'G-012'
+                    """,
+                    (plan_sha, branch, str(worktree), str(repo)),
+                )
+                connection.execute(
+                    """
+                    UPDATE projects
+                    SET active_sha = ?, plan_sha = ?, phase = 'WORKING',
+                        branch = ?, worktree = ?, plan_path = ?,
+                        worker_session_id = 'worker-session',
+                        agent_role = 'worker', agent_snapshot = ?
+                    WHERE repo = ?
+                    """,
+                    (
+                        plan_sha,
+                        plan_sha,
+                        branch,
+                        str(worktree),
+                        plan.relative_to(repo).as_posix(),
+                        before.serialize(),
+                        str(repo),
+                    ),
+                )
+
+            git_command(repo, "worktree", "remove", str(worktree))
+            sessions = []
+
+            def resumed_worker(
+                _worktree, _state, _config, role_name, _prompt, **kwargs
+            ):
+                self.assertEqual(role_name, "worker")
+                sessions.append(kwargs["session_id"])
+                return loop_manager.CodexResult(
+                    1, "stop after recovery", "worker-session"
+                )
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.run_codex", side_effect=resumed_worker
+            ):
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, last_error, agent_snapshot FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            plan_status = connection.execute(
+                "SELECT status FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-012'",
+                (str(repo),),
+            ).fetchone()["status"]
+
+            self.assertEqual(result, 1)
+            self.assertEqual(sessions, ["worker-session"])
+            self.assertTrue(worktree.is_dir())
+            loop_manager.validate_managed_worktree(repo, worktree, branch)
+            self.assertEqual(project["phase"], "WORKING")
+            self.assertEqual(project["last_error"], "stop after recovery")
+            self.assertIsNone(project["agent_snapshot"])
+            self.assertEqual(plan_status, "IMPLEMENTING")
+
+    def test_rebase_conflict_resumes_same_worker_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                repo,
+                state_dir,
+                connection,
+                plan,
+                plan_sha,
+                branch,
+                worktree,
+            ) = self._ready_execplan(directory)
+            loop_manager.make_worktree(repo, worktree, branch, "main")
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE exec_plans
+                    SET status = 'VERIFYING', active_sha = ?, branch = ?,
+                        worktree = ?, workspace_owned = 1,
+                        worker_session_id = 'worker-session',
+                        worker_result = ?
+                    WHERE repo = ? AND plan_id = 'G-012'
+                    """,
+                    (
+                        plan_sha,
+                        branch,
+                        str(worktree),
+                        worker_result(),
+                        str(repo),
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE projects
+                    SET active_sha = ?, plan_sha = ?, phase = 'VERIFYING',
+                        branch = ?, worktree = ?, plan_path = ?,
+                        worker_session_id = 'worker-session',
+                        worker_result = ?
+                    WHERE repo = ?
+                    """,
+                    (
+                        plan_sha,
+                        plan_sha,
+                        branch,
+                        str(worktree),
+                        plan.relative_to(repo).as_posix(),
+                        worker_result(),
+                        str(repo),
+                    ),
+                )
+
+            (worktree / "src/app.py").write_text(
+                "VALUE = 'worker'\n",
+                encoding="utf-8",
+            )
+            (repo / "src/app.py").write_text(
+                "VALUE = 'base'\n",
+                encoding="utf-8",
+            )
+            commit_and_push(repo, "Advance base with conflicting source")
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.verify", return_value=(True, "verify before rebase")
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as unexpected_agent:
+                first_result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            conflicted = connection.execute(
+                "SELECT phase, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(first_result, 1)
+            self.assertEqual(conflicted["phase"], "WORKING")
+            self.assertTrue(
+                conflicted["last_error"].startswith(
+                    loop_manager.REBASE_CONFLICT_PREFIX
+                )
+            )
+            self.assertTrue(
+                loop_manager._rebase_in_progress_for_branch(worktree, branch)
+            )
+            self.assertEqual(git_command(worktree, "branch", "--show-current"), "")
+            unexpected_agent.assert_not_called()
+
+            sessions = []
+
+            def resolve_conflict(
+                agent_worktree, _state, _config, role_name, _prompt, **kwargs
+            ):
+                self.assertEqual(role_name, "worker")
+                sessions.append(kwargs["session_id"])
+                (agent_worktree / "src/app.py").write_text(
+                    "VALUE = 'resolved'\n",
+                    encoding="utf-8",
+                )
+                return loop_manager.CodexResult(
+                    0,
+                    worker_result(),
+                    "worker-session",
+                )
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.verify",
+                return_value=(False, "stop after rebase resolution"),
+            ), mock.patch(
+                "loop_manager.run_codex", side_effect=resolve_conflict
+            ):
+                resumed_result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            resumed = connection.execute(
+                "SELECT phase, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(resumed_result, 1)
+            self.assertEqual(sessions, ["worker-session"])
+            self.assertEqual(resumed["phase"], "WORKING")
+            self.assertEqual(
+                resumed["last_error"],
+                "전체 검증 실패:\nstop after rebase resolution",
+            )
+            self.assertFalse(
+                loop_manager._rebase_in_progress_for_branch(worktree, branch)
+            )
+            self.assertEqual(
+                git_command(worktree, "branch", "--show-current"),
+                branch,
+            )
+            self.assertEqual(
+                (worktree / "src/app.py").read_text(encoding="utf-8"),
+                "VALUE = 'resolved'\n",
+            )
+
+
+    def test_missing_worktree_and_branch_blocks_without_recreation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state_dir, branch, worktree = self._workspace(directory)
+            git_command(repo, "worktree", "remove", str(worktree))
+            git_command(repo, "branch", "-D", branch)
+
+            with self.assertRaisesRegex(
+                loop_manager.WorkspaceOwnershipError,
+                "모두 복구할 수 없습니다",
+            ):
+                loop_manager.make_worktree(
+                    repo,
+                    worktree,
+                    branch,
+                    "main",
+                    allow_create_branch=False,
+                )
+
+            self.assertFalse(worktree.exists())
+            self.assertNotEqual(
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(repo),
+                        "show-ref",
+                        "--verify",
+                        "--quiet",
+                        f"refs/heads/{branch}",
+                    ]
+                ).returncode,
+                0,
+            )
+
+            (repo / "docs/plans").mkdir()
+            plan = write_execplan(repo, "G-012", "Recovery Safety")
+            commit_and_push(repo, "Add recovery safety plan")
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                """
+                INSERT INTO projects (
+                    repo, base_branch, active_sha, plan_sha, phase, branch,
+                    worktree, plan_path
+                ) VALUES (?, 'main', ?, ?, 'WORKING', ?, ?, ?)
+                """,
+                (
+                    str(repo),
+                    plan_sha,
+                    plan_sha,
+                    branch,
+                    str(worktree),
+                    plan.relative_to(repo).as_posix(),
+                ),
+            )
+            connection.commit()
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as run_agent:
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            blocked = connection.execute(
+                "SELECT phase, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+
+            plan_status = connection.execute(
+                "SELECT status FROM exec_plans WHERE repo = ? AND plan_id = 'G-012'",
+                (str(repo),),
+            ).fetchone()["status"]
+
+            self.assertEqual(result, 1)
+            self.assertEqual(blocked["phase"], "BLOCKED")
+            self.assertIn("모두 복구할 수 없습니다", blocked["last_error"])
+            self.assertEqual(plan_status, "BLOCKED")
+            run_agent.assert_not_called()
+
+
+    def test_new_workspace_rejects_preexisting_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, _state_dir, _connection, _plan, _plan_sha, branch, worktree = (
+                self._ready_execplan(directory)
+            )
+            worktree.mkdir(parents=True)
+            marker = worktree / "unrelated.txt"
+            marker.write_text("preserve me\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                loop_manager.WorkspaceOwnershipError,
+                "worktree가 이미 존재",
+            ):
+                loop_manager.make_worktree(
+                    repo,
+                    worktree,
+                    branch,
+                    "main",
+                    allow_create_branch=True,
+                    allow_recovery=False,
+                    allow_existing=False,
+                )
+
+            self.assertEqual(marker.read_text(encoding="utf-8"), "preserve me\n")
+
+    def test_branch_collision_blocks_then_resumes_after_conflict_removal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                repo,
+                state_dir,
+                connection,
+                _plan,
+                _plan_sha,
+                branch,
+                worktree,
+            ) = self._ready_execplan(directory)
+            git_command(repo, "branch", branch, "origin/main")
+            branch_head = git_command(repo, "rev-parse", branch)
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as run_agent:
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            plan_status = connection.execute(
+                "SELECT status FROM exec_plans WHERE repo = ? AND plan_id = 'G-012'",
+                (str(repo),),
+            ).fetchone()["status"]
+
+            self.assertEqual(result, 1)
+            self.assertEqual(project["phase"], "BLOCKED")
+            self.assertIn("이미 존재해 소유권을 증명할 수 없습니다", project["last_error"])
+            self.assertEqual(plan_status, "BLOCKED")
+            self.assertEqual(git_command(repo, "rev-parse", branch), branch_head)
+            self.assertFalse(worktree.exists())
+            run_agent.assert_not_called()
+
+            ownership = connection.execute(
+                "SELECT workspace_owned FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-012'",
+                (str(repo),),
+            ).fetchone()["workspace_owned"]
+            self.assertEqual(ownership, 0)
+
+            (repo / "docs/PRODUCT.md").write_text(
+                "# Resolve blocked input\n",
+                encoding="utf-8",
+            )
+            commit_and_push(repo, "Change blocked plan input")
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as resumed_agent:
+                resumed_result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            resumed_project = connection.execute(
+                "SELECT phase, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            resumed_plan = connection.execute(
+                "SELECT status, workspace_owned FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-012'",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(resumed_result, 1)
+            self.assertEqual(resumed_project["phase"], "BLOCKED")
+            self.assertIn("충돌이 해소되지 않았습니다", resumed_project["last_error"])
+            self.assertEqual(tuple(resumed_plan), ("BLOCKED", 0))
+            self.assertEqual(git_command(repo, "rev-parse", branch), branch_head)
+            self.assertFalse(worktree.exists())
+            resumed_agent.assert_not_called()
+
+            git_command(repo, "branch", "-D", branch)
+            planner_stop = loop_manager.CodexResult(
+                1,
+                "stop after ownership recovery",
+                "planner-session",
+            )
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.run_codex", return_value=planner_stop
+            ) as recovered_agent:
+                recovered_result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            recovered_project = connection.execute(
+                "SELECT phase, branch, worktree, last_error "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            recovered_plan = connection.execute(
+                "SELECT status, workspace_owned FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-012'",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(recovered_result, 1)
+            self.assertEqual(recovered_project["phase"], "PLANNING")
+            self.assertIsNone(recovered_project["branch"])
+            self.assertEqual(
+                recovered_project["last_error"],
+                "stop after ownership recovery",
+            )
+            self.assertEqual(tuple(recovered_plan), ("READY", 0))
+            self.assertFalse(worktree.exists())
+            self.assertEqual(
+                loop_manager.git(
+                    repo,
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    f"refs/heads/{branch}",
+                    check=False,
+                ).returncode,
+                1,
+            )
+            recovered_agent.assert_called_once()
+            self.assertEqual(recovered_agent.call_args.args[3], "planner")
+
+    def test_new_planning_rejects_preexisting_detached_worktree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = make_remote_repository(directory)
+            state_dir = root / "state"
+            fingerprint = loop_manager.planning_input_fingerprint(repo, "main")
+            project_id = hashlib.sha256(str(repo).encode()).hexdigest()[:16]
+            planning_worktree = (
+                state_dir
+                / "worktrees"
+                / project_id
+                / "planning"
+                / fingerprint
+            )
+            planning_worktree.parent.mkdir(parents=True)
+            git_command(
+                repo,
+                "worktree",
+                "add",
+                "--detach",
+                str(planning_worktree),
+                "origin/main",
+            )
+            marker = planning_worktree / "keep.txt"
+            marker.write_text("preserve me\n", encoding="utf-8")
+            original_head = git_command(planning_worktree, "rev-parse", "HEAD")
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+                (str(repo),),
+            )
+            connection.commit()
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as run_agent:
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, planning_error, planning_workspace_owned "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(result, 1)
+            self.assertEqual(project["phase"], "PLANNING")
+            self.assertIn(
+                "새 planning worktree 경로가 이미 존재",
+                project["planning_error"],
+            )
+            self.assertEqual(project["planning_workspace_owned"], 0)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "preserve me\n")
+            self.assertEqual(
+                git_command(planning_worktree, "rev-parse", "HEAD"),
+                original_head,
+            )
+            run_agent.assert_not_called()
+
+            (repo / "docs/PRODUCT.md").write_text(
+                "# Changed planning input\n",
+                encoding="utf-8",
+            )
+            commit_and_push(repo, "Change planning input")
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as resumed_agent:
+                resumed_result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            resumed = connection.execute(
+                "SELECT planning_error, planning_workspace_owned "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(resumed_result, 1)
+            self.assertIn(
+                "planning worktree의 Loop Manager 소유권이 확인되지 않았습니다",
+                resumed["planning_error"],
+            )
+            self.assertEqual(resumed["planning_workspace_owned"], 0)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "preserve me\n")
+            self.assertEqual(
+                git_command(planning_worktree, "rev-parse", "HEAD"),
+                original_head,
+            )
+            resumed_agent.assert_not_called()
+
+    def test_started_planning_worktree_is_not_recreated_from_origin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = make_remote_repository(directory)
+            missing = root / "state/worktrees/project/planning/fingerprint"
+
+            with self.assertRaisesRegex(
+                loop_manager.WorkspaceOwnershipError,
+                "복구할 branch가 없습니다",
+            ):
+                loop_manager.make_planning_worktree(
+                    repo,
+                    missing,
+                    "main",
+                    allow_create=False,
+                )
+
+            self.assertFalse(missing.exists())
+
+
+    def test_changed_planning_input_preserves_unowned_saved_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = make_remote_repository(directory)
+            state_dir = root / "state"
+            victim = root / "user-worktree"
+            victim_branch = "user/planning"
+            git_command(
+                repo,
+                "worktree",
+                "add",
+                "-b",
+                victim_branch,
+                str(victim),
+                "origin/main",
+            )
+            marker = victim / "keep.txt"
+            marker.write_text("keep\n", encoding="utf-8")
+            victim_head = git_command(victim, "rev-parse", "HEAD")
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                """
+                INSERT INTO projects (
+                    repo, base_branch, active_sha, phase, worktree,
+                    planning_attempt_fingerprint, planning_validation_error
+                ) VALUES (?, 'main', ?, 'PLANNING', ?, 'stale-input', 'invalid')
+                """,
+                (str(repo), plan_sha, str(victim)),
+            )
+            connection.commit()
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as run_agent:
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, planning_error, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(result, 1)
+            self.assertEqual(project["phase"], "PLANNING")
+            self.assertIn(
+                "planning workspace cleanup 소유권 검증 실패",
+                project["planning_error"],
+            )
+            self.assertEqual(project["last_error"], project["planning_error"])
+            self.assertTrue(marker.is_file())
+            self.assertEqual(git_command(victim, "rev-parse", "HEAD"), victim_head)
+            loop_manager.validate_managed_worktree(repo, victim, victim_branch)
+            run_agent.assert_not_called()
+
+    def test_wrong_branch_and_wrong_deterministic_path_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = make_remote_repository(directory)
+            state_dir = root / "state"
+            branch, worktree = loop_manager.expected_execplan_workspace(
+                state_dir, str(repo), "G-012"
+            )
+            git_command(
+                repo,
+                "worktree",
+                "add",
+                "-b",
+                "loop-manager/other",
+                str(worktree),
+                "origin/main",
+            )
+
+            with self.assertRaisesRegex(
+                loop_manager.WorkspaceOwnershipError,
+                "branch 불일치",
+            ):
+                loop_manager.make_worktree(repo, worktree, branch, "main")
+            with self.assertRaisesRegex(
+                loop_manager.WorkspaceOwnershipError,
+                "결정적 소유 경계",
+            ):
+                loop_manager.validate_execplan_workspace_identity(
+                    state_dir,
+                    str(repo),
+                    "G-012",
+                    branch,
+                    root / "elsewhere",
+                )
+
+
+    def test_merge_cleanup_preserves_unowned_deterministic_worktree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                repo,
+                state_dir,
+                connection,
+                plan,
+                plan_sha,
+                branch,
+                worktree,
+            ) = self._ready_execplan(directory)
+            loop_manager.make_worktree(repo, worktree, branch, "main")
+            (worktree / "src/app.py").write_text("VALUE = 2\n", encoding="utf-8")
+            git_command(worktree, "add", "src/app.py")
+            git_command(worktree, "commit", "-m", "Unowned implementation")
+            pr_head = git_command(worktree, "rev-parse", "HEAD")
+            pr_url = "https://example.test/pr/12"
+            connection.execute(
+                """
+                UPDATE exec_plans
+                SET status = 'PR_OPEN', active_sha = ?, branch = ?, worktree = ?,
+                    pr_url = ?
+                WHERE repo = ? AND plan_id = 'G-012'
+                """,
+                (plan_sha, branch, str(worktree), pr_url, str(repo)),
+            )
+            connection.execute(
+                """
+                UPDATE projects
+                SET active_sha = ?, plan_sha = ?, phase = 'PR_OPEN',
+                    branch = ?, worktree = ?, plan_path = ?, pr_url = ?
+                WHERE repo = ?
+                """,
+                (
+                    plan_sha,
+                    plan_sha,
+                    branch,
+                    str(worktree),
+                    plan.relative_to(repo).as_posix(),
+                    pr_url,
+                    str(repo),
+                ),
+            )
+            connection.commit()
+            merged_pr = {
+                "url": pr_url,
+                "state": "MERGED",
+                "mergedAt": "2026-01-01T00:00:00Z",
+                "headRefOid": pr_head,
+            }
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=merged_pr
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as run_agent:
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            plan_status = connection.execute(
+                "SELECT status, workspace_owned FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-012'",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(result, 1)
+            self.assertEqual(project["phase"], "BLOCKED")
+            self.assertIn(
+                "Merge cleanup worktree의 Loop Manager 소유권이 확인되지 않았습니다",
+                project["last_error"],
+            )
+            self.assertEqual(tuple(plan_status), ("BLOCKED", 0))
+            self.assertTrue(worktree.is_dir())
+            self.assertEqual(git_command(worktree, "rev-parse", "HEAD"), pr_head)
+            run_agent.assert_not_called()
+
+    def test_merge_cleanup_preserves_unowned_saved_path_and_blocks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (
+                repo,
+                state_dir,
+                connection,
+                plan,
+                plan_sha,
+                branch,
+                _worktree,
+            ) = self._ready_execplan(directory)
+            victim = root / "user-merge-worktree"
+            victim_branch = "user/merge"
+            git_command(
+                repo,
+                "worktree",
+                "add",
+                "-b",
+                victim_branch,
+                str(victim),
+                "origin/main",
+            )
+            marker = victim / "keep.txt"
+            marker.write_text("keep\n", encoding="utf-8")
+            git_command(victim, "add", "keep.txt")
+            git_command(victim, "commit", "-m", "Keep user worktree")
+            victim_head = git_command(victim, "rev-parse", "HEAD")
+            pr_url = "https://example.test/pr/12"
+            connection.execute(
+                """
+                UPDATE exec_plans
+                SET status = 'PR_OPEN', active_sha = ?, branch = ?, worktree = ?,
+                    pr_url = ?
+                WHERE repo = ? AND plan_id = 'G-012'
+                """,
+                (plan_sha, branch, str(victim), pr_url, str(repo)),
+            )
+            connection.execute(
+                """
+                UPDATE projects
+                SET active_sha = ?, plan_sha = ?, phase = 'PR_OPEN',
+                    branch = ?, worktree = ?, plan_path = ?, pr_url = ?
+                WHERE repo = ?
+                """,
+                (
+                    plan_sha,
+                    plan_sha,
+                    branch,
+                    str(victim),
+                    plan.relative_to(repo).as_posix(),
+                    pr_url,
+                    str(repo),
+                ),
+            )
+            connection.commit()
+            merged_pr = {
+                "url": pr_url,
+                "state": "MERGED",
+                "mergedAt": "2026-01-01T00:00:00Z",
+                "headRefOid": victim_head,
+            }
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=merged_pr
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as run_agent:
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            plan_status = connection.execute(
+                "SELECT status FROM exec_plans WHERE repo = ? AND plan_id = 'G-012'",
+                (str(repo),),
+            ).fetchone()["status"]
+            pending_count = connection.execute(
+                "SELECT COUNT(*) FROM cleanup_pending WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()[0]
+
+            self.assertEqual(result, 1)
+            self.assertEqual(project["phase"], "BLOCKED")
+            self.assertIn(
+                "Merge cleanup workspace 소유권 검증 실패",
+                project["last_error"],
+            )
+            self.assertEqual(plan_status, "BLOCKED")
+            self.assertEqual(pending_count, 0)
+            self.assertTrue(marker.is_file())
+            self.assertEqual(git_command(victim, "rev-parse", "HEAD"), victim_head)
+            loop_manager.validate_managed_worktree(repo, victim, victim_branch)
+            run_agent.assert_not_called()
+
 
 class MergeIndependentWorktreeCleanupTest(unittest.TestCase):
     def _managed_worktree(self, root: Path, name: str = "managed"):
@@ -3376,7 +7468,16 @@ class MergeIndependentWorktreeCleanupTest(unittest.TestCase):
     def test_pending_recheck_removes_safe_worktree_and_missing_record(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            repo, worktree, _branch, pr_head = self._managed_worktree(root)
+            repo = make_remote_repository(directory)
+            state_dir = root / "state"
+            branch, worktree = loop_manager.expected_execplan_workspace(
+                state_dir, str(repo), "G-001"
+            )
+            loop_manager.make_worktree(repo, worktree, branch, "main")
+            (worktree / "src/app.py").write_text("VALUE = 2\n", encoding="utf-8")
+            git_command(worktree, "add", "src/app.py")
+            git_command(worktree, "commit", "-m", "Implement cleanup fixture")
+            pr_head = git_command(worktree, "rev-parse", "HEAD")
             connection = self._memory_connection(repo)
             missing = root / "already-gone"
             for path, oid in ((worktree, pr_head), (missing, None)):
@@ -3391,7 +7492,7 @@ class MergeIndependentWorktreeCleanupTest(unittest.TestCase):
             connection.commit()
 
             remaining = loop_manager.recheck_cleanup_pending(
-                connection, repo, str(repo)
+                connection, repo, str(repo), state_dir
             )
 
             self.assertEqual(remaining, [])
@@ -3400,18 +7501,31 @@ class MergeIndependentWorktreeCleanupTest(unittest.TestCase):
     def test_merged_dirty_worktree_becomes_nonblocking_pending(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            repo, worktree, branch, pr_head = self._managed_worktree(root)
+            repo = make_remote_repository(directory)
+            (repo / "docs/plans").mkdir()
+            write_execplan(repo, "G-001", "Cleanup")
+            commit_and_push(repo, "Add cleanup plan")
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
+            state_dir = root / "state"
+            branch, worktree = loop_manager.expected_execplan_workspace(
+                state_dir, str(repo), "G-001"
+            )
+            loop_manager.make_worktree(repo, worktree, branch, "main")
+            (worktree / "src/app.py").write_text("VALUE = 2\n", encoding="utf-8")
+            git_command(worktree, "add", "src/app.py")
+            git_command(worktree, "commit", "-m", "Implement cleanup fixture")
+            pr_head = git_command(worktree, "rev-parse", "HEAD")
             (worktree / "untracked.txt").write_text("keep\n", encoding="utf-8")
             connection = self._memory_connection(repo)
             connection.execute(
                 """
                 UPDATE projects
-                SET active_sha = ?, phase = 'PR_OPEN', branch = ?, worktree = ?,
+                SET active_sha = ?, plan_sha = ?, phase = 'PR_OPEN', branch = ?, worktree = ?,
                     plan_path = 'docs/plans/[G-001] Cleanup.md',
                     pr_url = 'https://example.test/pr/1'
                 WHERE repo = ?
                 """,
-                (pr_head, branch, str(worktree), str(repo)),
+                (pr_head, plan_sha, branch, str(worktree), str(repo)),
             )
             connection.commit()
             merged_pr = {
@@ -3426,7 +7540,7 @@ class MergeIndependentWorktreeCleanupTest(unittest.TestCase):
             ), mock.patch("loop_manager.pr_for_branch", return_value=merged_pr):
                 result = loop_manager.run_project(
                     connection,
-                    root / "state",
+                    state_dir,
                     str(repo),
                     Path("unused.ini"),
                     "main",
