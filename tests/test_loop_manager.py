@@ -2163,6 +2163,25 @@ class MergeIndependentWorktreeCleanupTest(unittest.TestCase):
         self.assertEqual(row["headRefOid"], "abc")
         self.assertIn("headRefOid", command.call_args.args[0][-1])
 
+    def test_main_ignores_unknown_options(self):
+        state_dir = Path("state")
+        with mock.patch(
+            "sys.argv",
+            [
+                "loop_manager.py",
+                "init",
+                "--future-option=value",
+            ],
+        ), mock.patch(
+            "loop_manager.state_directory", return_value=state_dir
+        ), mock.patch("loop_manager.process_lock") as process_lock, mock.patch(
+            "loop_manager.connect_database"
+        ) as connect_database, mock.patch("builtins.print"):
+            self.assertEqual(loop_manager.main(), 0)
+
+        process_lock.assert_called_once_with(state_dir)
+        connect_database.assert_called_once_with(state_dir, create=True)
+
 
 if __name__ == "__main__":
     unittest.main()

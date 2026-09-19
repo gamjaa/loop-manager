@@ -1690,7 +1690,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    args = build_parser().parse_args()
+    args, _ = build_parser().parse_known_args()
     state_dir = state_directory(args.state_dir)
     try:
         with process_lock(state_dir):
