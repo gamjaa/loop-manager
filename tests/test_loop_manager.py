@@ -54,6 +54,17 @@ Test plan.
     return plan
 
 
+
+def worker_result(
+    title: str = "Preserve worker test evidence",
+    summary: str = "Stores the Worker result for review.",
+    tests: str = "targeted test: PASS",
+) -> str:
+    return (
+        f"COMMIT_TITLE: {title}\nPR_SUMMARY: {summary}\n"
+        f"TARGETED_TESTS:\n{tests}"
+    )
+
 def git_command(repo: Path, *arguments: str) -> str:
     result = subprocess.run(
         ["git", "-C", str(repo), *arguments],
@@ -1883,6 +1894,9 @@ risk: medium
         self.assertIn("targeted: PASS", reviewer)
         self.assertIn("verify: PASS", reviewer)
         self.assertIn("테스트 command와 scripts/verify를 실행하지 말고", reviewer)
+        self.assertIn("COMMIT_TITLE:", worker)
+        self.assertIn("PR_SUMMARY:", worker)
+        self.assertIn("TARGETED_TESTS:", worker)
 
     def test_existing_database_adds_worker_session_and_result_fields(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1922,7 +1936,7 @@ risk: medium
                 self.assertEqual(role_name, "worker")
                 sessions.append(kwargs["session_id"])
                 prompts.append(prompt)
-                return loop_manager.CodexResult(0, "targeted test: PASS", "worker-session")
+                return loop_manager.CodexResult(0, worker_result(), "worker-session")
 
             with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
                 "loop_manager.remote_base", return_value="main"
@@ -1942,7 +1956,7 @@ risk: medium
                 ).fetchone()
                 self.assertEqual(row["phase"], "WORKING")
                 self.assertEqual(row["worker_session_id"], "worker-session")
-                self.assertEqual(row["worker_result"], "targeted test: PASS")
+                self.assertEqual(row["worker_result"], worker_result())
                 self.assertIsNone(row["verify_result"])
                 self.assertIn("전체 검증 실패:\nverify failed", row["last_error"])
                 verify.assert_called_once()
@@ -1966,7 +1980,7 @@ risk: medium
                 calls.append((role_name, prompt, kwargs))
                 if role_name == "worker":
                     (worktree / "src/app.py").write_text("VALUE = 2\n", encoding="utf-8")
-                    return loop_manager.CodexResult(0, "targeted test: PASS", "worker-session")
+                    return loop_manager.CodexResult(0, worker_result("Persist worker change"), "worker-session")
                 self.assertEqual(role_name, "reviewer")
                 return 0, "VERDICT: PASS"
 
@@ -1985,6 +1999,10 @@ risk: medium
                 )
                 verify.assert_called_once()
 
+            self.assertEqual(
+                git_command(repo, "log", "-1", "--pretty=%s"),
+                "Persist worker change",
+            )
             self.assertEqual([role for role, _prompt, _kwargs in calls], ["worker", "reviewer"])
             reviewer_prompt = calls[1][1]
             self.assertIn("targeted test: PASS", reviewer_prompt)
@@ -1998,6 +2016,165 @@ risk: medium
             self.assertEqual(row["worker_session_id"], "worker-session")
             self.assertEqual(row["verify_result"], "verify: PASS")
 
+
+
+class WorkerPublicationTest(unittest.TestCase):
+    plan = {"id": "G-008", "title": "Descriptive Worker Commits"}
+
+    def test_worker_result_contract_preserves_fields_and_rejects_bad_titles(self):
+        publication = loop_manager.parse_worker_result(
+            worker_result("Store immutable plan links", "Adds immutable PR context.", "test_one: PASS"),
+            self.plan,
+        )
+
+        self.assertEqual(publication.commit_title, "Store immutable plan links")
+        self.assertEqual(publication.summary, "Adds immutable PR context.")
+        self.assertEqual(publication.test_evidence, "test_one: PASS")
+        invalid_results = (
+            worker_result("", "Summary", "test: PASS"),
+            "COMMIT_TITLE: First line\nsecond line\nPR_SUMMARY: Summary\nTARGETED_TESTS:\ntest: PASS",
+            worker_result("Descriptive Worker Commits", "Summary", "test: PASS"),
+            worker_result("Implement G-008: Descriptive Worker Commits", "Summary", "test: PASS"),
+            worker_result("Update", "Summary", "test: PASS"),
+            worker_result("Implement G-008 worker metadata", "Summary", "test: PASS"),
+        )
+        for result in invalid_results:
+            with self.subTest(result=result):
+                with self.assertRaises(loop_manager.WorkerResultError):
+                    loop_manager.parse_worker_result(result, self.plan)
+
+    def test_invalid_worker_result_resumes_same_session_without_verify(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            state_dir = Path(directory) / "state"
+            state_dir.mkdir()
+            (repo / "docs/plans").mkdir()
+            plan = write_execplan(repo, "G-001", "Worker Boundary")
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                """
+                INSERT INTO projects (
+                    repo, base_branch, active_sha, plan_sha, phase, branch, worktree, plan_path
+                ) VALUES (?, 'main', ?, ?, 'WORKING', 'loop-manager/G-001', ?, ?)
+                """,
+                (
+                    str(repo),
+                    git_command(repo, "rev-parse", "origin/main"),
+                    git_command(repo, "rev-parse", "origin/main"),
+                    str(repo),
+                    plan.relative_to(repo).as_posix(),
+                ),
+            )
+            connection.commit()
+            sessions = []
+            prompts = []
+
+            def worker(_worktree, _state, _config, _role, prompt, **kwargs):
+                sessions.append(kwargs["session_id"])
+                prompts.append(prompt)
+                result = (
+                    worker_result("Worker Boundary", "Bad title", "test: PASS")
+                    if len(sessions) == 1
+                    else worker_result("Validate worker metadata", "Good title", "test: PASS")
+                )
+                return loop_manager.CodexResult(0, result, "worker-session")
+
+            with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch("loop_manager.ensure_safe_base_worktree"), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch("loop_manager.run_codex", side_effect=worker), mock.patch(
+                "loop_manager.verify", return_value=(False, "verify failed")
+            ) as verify:
+                self.assertEqual(
+                    loop_manager.run_project(
+                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                    ),
+                    1,
+                )
+                row = connection.execute(
+                    "SELECT phase, last_error FROM projects WHERE repo = ?", (str(repo),)
+                ).fetchone()
+                self.assertEqual(row["phase"], "WORKING")
+                self.assertIn("Worker 결과 검증 실패", row["last_error"])
+                verify.assert_not_called()
+
+                self.assertEqual(
+                    loop_manager.run_project(
+                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                    ),
+                    1,
+                )
+
+            self.assertEqual(sessions, [None, "worker-session"])
+            self.assertIn("Worker 결과 검증 실패", prompts[1])
+            verify.assert_called_once()
+
+    def test_plan_sha_migration_and_clear_active(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            database = sqlite3.connect(state_dir / "loop-manager.db")
+            database.execute(loop_manager.SCHEMA.replace("    plan_sha TEXT,\n", ""))
+            database.execute("INSERT INTO projects (repo, base_branch) VALUES ('repo', 'main')")
+            database.commit()
+            database.close()
+
+            with loop_manager.connect_database(state_dir) as connection:
+                columns = {row[1] for row in connection.execute("PRAGMA table_info(projects)")}
+                loop_manager.update_project(connection, "repo", active_sha="current", plan_sha="planned")
+                loop_manager.update_project(connection, "repo", active_sha="rebased")
+                preserved = connection.execute(
+                    "SELECT active_sha, plan_sha FROM projects WHERE repo = 'repo'"
+                ).fetchone()
+                self.assertEqual(tuple(preserved), ("rebased", "planned"))
+                loop_manager.clear_active(connection, "repo")
+                row = connection.execute(
+                    "SELECT active_sha, plan_sha FROM projects WHERE repo = 'repo'"
+                ).fetchone()
+
+        self.assertIn("plan_sha", columns)
+        self.assertEqual(tuple(row), (None, None))
+
+
+    def test_immutable_url_and_pr_body_encode_plan_context(self):
+        plan = {
+            "id": "G-008",
+            "title": "Descriptive Worker Commits",
+            "sources": ["docs/requirements/[R-004] 한글 요구사항.md"],
+        }
+        plan_path = "docs/plans/[G-008] Descriptive Worker Commits.md"
+        plan_text = "---\nid: G-008\n---\n\n## Purpose\n\nKeep review context stable.\n"
+        published = loop_manager.published_execplan(
+            plan_path,
+            """---
+id: G-008
+title: Descriptive Worker Commits
+sources:
+  - docs/requirements/[R-004] 한글 요구사항.md
+depends_on: []
+complexity: medium
+risk: medium
+---
+""",
+        )
+        self.assertEqual(published["sources"], plan["sources"])
+
+        sha = "a" * 40
+        body = loop_manager.build_pr_body(
+            loop_manager.WorkerPublication("Describe changes", "Adds PR context.", "test: PASS"),
+            plan,
+            plan_path,
+            plan_text,
+            "git@github.com:octo/loop-manager.git",
+            sha,
+        )
+
+        self.assertIn("Adds PR context.", body)
+        self.assertIn("Keep review context stable.", body)
+        self.assertIn(f"/blob/{sha}/docs/plans/%5BG-008%5D%20Descriptive%20Worker%20Commits.md", body)
+        self.assertIn("%5BR-004%5D%20%ED%95%9C%EA%B8%80%20%EC%9A%94%EA%B5%AC%EC%82%AC%ED%95%AD.md", body)
 
 class MergeIndependentWorktreeCleanupTest(unittest.TestCase):
     def _managed_worktree(self, root: Path, name: str = "managed"):
