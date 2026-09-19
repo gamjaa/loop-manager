@@ -3756,6 +3756,11 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         invalid_reviews = (
             "blocking issue without an identifier\nVERDICT: FAIL",
             "ISSUE_ID: app.py:42 prose\nblocking issue\nVERDICT: FAIL",
+            "ISSUE_ID: app.py::pass-issue::blocking\nVERDICT: PASS",
+            "ISSUE_ID: app.py::missing-verdict::blocking\nblocking issue",
+            "VERDICT: PASS\nVERDICT: FAIL",
+            "ISSUE_ID: app.py::unknown-verdict::blocking\nVERDICT: MAYBE",
+            "VERDICT: PASS\ntrailing explanation",
         )
         for review in invalid_reviews:
             with self.subTest(review=review), tempfile.TemporaryDirectory() as directory:

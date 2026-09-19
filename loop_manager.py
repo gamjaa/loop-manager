@@ -1940,24 +1940,37 @@ _TEMP_DIRECTORY_CONTEXT = re.compile(
 
 
 _REVIEW_ISSUE_ID = re.compile(
-    r"(?mi)^ISSUE_ID:[ \t]*(?P<identifier>[^\r\n]+?)[ \t]*$"
+    r"(?mi)^[ \t]*ISSUE_ID:[ \t]*(?P<identifier>[^\r\n]+?)[ \t]*$"
 )
+_REVIEW_ISSUE_DECLARATION = re.compile(r"(?i)^[ \t]*ISSUE_ID\b")
 _REVIEW_ISSUE_IDENTIFIER = re.compile(
     r"(?i)^(?!/)(?!.*(?:^|/)\.\.(?:/|$))"
     r"[a-z0-9_.\-/]+::[a-z0-9_.<>/-]+::[a-z0-9][a-z0-9-]*$"
 )
+_REVIEW_VERDICT_DECLARATION = re.compile(r"(?i)^[ \t]*VERDICT\b")
+_REVIEW_VERDICT = re.compile(r"(?i)^[ \t]*VERDICT:[ \t]*(PASS|FAIL)[ \t]*$")
 
 
 def _normalize_review_issue_ids(output: str) -> tuple[str, ...]:
-    raw_identifiers = [
-        " ".join(match.group("identifier").split()).casefold()
-        for match in _REVIEW_ISSUE_ID.finditer(output)
-        if match.group("identifier").strip()
+    output = output.replace("\r\n", "\n").replace("\r", "\n")
+    declarations = [
+        line
+        for line in output.splitlines()
+        if _REVIEW_ISSUE_DECLARATION.match(line)
     ]
-    if not raw_identifiers:
+    if not declarations:
         raise ReviewerProtocolError(
             "Reviewer FAIL 결과에 유효한 ISSUE_ID가 없습니다."
         )
+    matches = list(_REVIEW_ISSUE_ID.finditer(output))
+    if len(matches) != len(declarations):
+        raise ReviewerProtocolError(
+            "Reviewer FAIL 결과의 ISSUE_ID 형식이 유효하지 않습니다."
+        )
+    raw_identifiers = [
+        " ".join(match.group("identifier").split()).casefold()
+        for match in matches
+    ]
     if any(
         _REVIEW_ISSUE_IDENTIFIER.fullmatch(identifier) is None
         for identifier in raw_identifiers
@@ -1967,6 +1980,50 @@ def _normalize_review_issue_ids(output: str) -> tuple[str, ...]:
         )
     identifiers = set(raw_identifiers)
     return tuple(f"ISSUE_ID:{identifier}" for identifier in sorted(identifiers))
+
+
+def parse_reviewer_result(output: str) -> tuple[str, tuple[str, ...]]:
+    """Validate the Reviewer response contract before any state transition."""
+
+    lines = output.replace("\r\n", "\n").replace("\r", "\n").splitlines()
+    meaningful_lines = [
+        (index, line)
+        for index, line in enumerate(lines)
+        if line.strip()
+    ]
+    verdict_lines = [
+        (index, line)
+        for index, line in meaningful_lines
+        if _REVIEW_VERDICT_DECLARATION.match(line)
+    ]
+    if len(verdict_lines) != 1:
+        raise ReviewerProtocolError(
+            "Reviewer 결과는 정확히 하나의 VERDICT를 포함해야 합니다."
+        )
+    verdict_index, verdict_line = verdict_lines[0]
+    verdict_match = _REVIEW_VERDICT.fullmatch(verdict_line)
+    if verdict_match is None:
+        raise ReviewerProtocolError(
+            "Reviewer VERDICT는 PASS 또는 FAIL이어야 합니다."
+        )
+    if verdict_index != meaningful_lines[-1][0]:
+        raise ReviewerProtocolError(
+            "Reviewer VERDICT는 마지막 비어 있지 않은 줄이어야 합니다."
+        )
+
+    verdict = verdict_match.group(1).upper()
+    issue_declarations = [
+        line
+        for _index, line in meaningful_lines
+        if _REVIEW_ISSUE_DECLARATION.match(line)
+    ]
+    if verdict == "PASS":
+        if issue_declarations:
+            raise ReviewerProtocolError(
+                "Reviewer PASS 결과에는 ISSUE_ID가 없어야 합니다."
+            )
+        return verdict, ()
+    return verdict, _normalize_review_issue_ids(output)
 
 
 def _normalize_temp_path(match: re.Match[str]) -> str:
@@ -7538,31 +7595,28 @@ def _run_project_step(
             operation_print(reviewer_error, file=sys.stderr)
             return step_result
 
-        passed = (
-            code == 0
-            and re.search(r"(?mi)^VERDICT:\s*PASS\s*$", review)
-            and not re.search(r"(?mi)^VERDICT:\s*FAIL\s*$", review)
-        )
-        if not passed:
-            try:
-                decision = transition_validation_failure(
-                    connection,
-                    repo,
-                    worktree,
-                    "review",
-                    review,
-                )
-            except ReviewerProtocolError as error:
-                reviewer_error = f"Reviewer 결과 프로토콜 오류: {error}"
-                update_project(
-                    connection,
-                    repo,
-                    phase="REVIEWING",
-                    last_error=reviewer_error,
-                    review_result=review,
-                )
-                operation_print(reviewer_error, file=sys.stderr)
-                return 1
+        try:
+            verdict, _issue_ids = parse_reviewer_result(review)
+        except ReviewerProtocolError as error:
+            reviewer_error = f"Reviewer 결과 프로토콜 오류: {error}"
+            update_project(
+                connection,
+                repo,
+                phase="REVIEWING",
+                last_error=reviewer_error,
+                review_result=review,
+            )
+            operation_print(reviewer_error, file=sys.stderr)
+            return 1
+
+        if verdict == "FAIL":
+            decision = transition_validation_failure(
+                connection,
+                repo,
+                worktree,
+                "review",
+                review,
+            )
             operation_log(f"Worker 반환: {plan['id']} {plan['title']} (Review 실패)", error=True)
             operation_print(review or "Reviewer 결과가 유효하지 않습니다.", file=sys.stderr)
             return 1 if decision.blocked else PROJECT_STEP_RETRY
