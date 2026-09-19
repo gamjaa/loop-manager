@@ -30,6 +30,7 @@ FIELDS = {
     "planner_session_id",
     "planning_validation_error",
     "planning_result_pending_validation",
+    "planning_result_completed",
     "planning_error",
     "planning_error_fingerprint",
     "active_sha",
@@ -52,6 +53,7 @@ CREATE TABLE IF NOT EXISTS projects (
     planner_session_id TEXT,
     planning_validation_error TEXT,
     planning_result_pending_validation INTEGER NOT NULL DEFAULT 0,
+    planning_result_completed INTEGER NOT NULL DEFAULT 0,
     planning_error TEXT,
     planning_error_fingerprint TEXT,
     active_sha TEXT,
@@ -146,6 +148,7 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
         "planner_session_id": "TEXT",
         "planning_validation_error": "TEXT",
         "planning_result_pending_validation": "INTEGER NOT NULL DEFAULT 0",
+        "planning_result_completed": "INTEGER NOT NULL DEFAULT 0",
         "planning_error": "TEXT",
         "planning_error_fingerprint": "TEXT",
     }
@@ -863,9 +866,13 @@ def preserve_planning_diagnostics(
     diff = ""
     if worktree and worktree.is_dir():
         try:
-            # Intent-to-add makes untracked Planner output visible in the archived diff.
+            # Compare with the planning base rather than HEAD so an invalid
+            # Planner commit remains in the diagnostic when this worktree is
+            # forcibly removed after its input changes. Intent-to-add makes
+            # untracked output visible as well.
             git(worktree, "add", "--intent-to-add", "-A")
-            diff = git(worktree, "diff", "--binary", "HEAD").stdout
+            base_revision = row["active_sha"] or "HEAD"
+            diff = git(worktree, "diff", "--binary", base_revision).stdout
         except RuntimeError as error:
             diff = f"diff 보존 실패: {error}"
     diagnostic = planning_diagnostics_path(state_dir, repo, fingerprint)
@@ -908,6 +915,7 @@ def clear_planning_validation_state(
         planner_session_id=None,
         planning_validation_error=None,
         planning_result_pending_validation=0,
+        planning_result_completed=0,
         planning_error=None,
         planning_error_fingerprint=None,
         last_error=None,
@@ -934,6 +942,7 @@ def clear_active(
         "planner_session_id": None,
         "planning_validation_error": None,
         "planning_result_pending_validation": 0,
+        "planning_result_completed": 0,
         "planning_error": None,
         "planning_error_fingerprint": None,
     }
@@ -1080,6 +1089,7 @@ def run_project(
             planner_session_id=None,
             planning_validation_error=None,
             planning_result_pending_validation=0,
+            planning_result_completed=0,
             planning_error=None,
             planning_error_fingerprint=None,
             phase="PLANNING",
@@ -1104,12 +1114,44 @@ def run_project(
             git(planning_worktree, "reset", "--mixed", str(row["active_sha"]))
             head = git(planning_worktree, "rev-parse", "HEAD").stdout.strip()
             dirty_files = changed_files(planning_worktree)
+        if (
+            row["planning_result_pending_validation"]
+            and not row["planning_result_completed"]
+            and head == row["active_sha"]
+            and not dirty_files
+        ):
+            # An interrupted Planner that produced no filesystem result has
+            # not reached a validation boundary. Resume its saved session.
+            update_project(
+                connection,
+                repo,
+                planning_result_pending_validation=0,
+                planning_result_completed=0,
+            )
+            row = connection.execute(
+                "SELECT * FROM projects WHERE repo = ?", (repo,)
+            ).fetchone()
+
         if head == row["active_sha"] and (
             not dirty_files or row["planning_validation_error"] or row["last_error"]
         ) and not row["planning_result_pending_validation"] and not (
             row["planning_validation_error"]
             and row["planning_retry_count"] >= MAX_PLANNER_VALIDATION_RETRIES
         ):
+            # A Planner can modify the worktree before its CLI invocation
+            # returns. Persist this boundary first so an interrupted process
+            # validates that exact output on restart instead of asking the
+            # same session for another correction.
+            update_project(
+                connection,
+                repo,
+                last_error=None,
+                planning_result_pending_validation=1,
+                planning_result_completed=0,
+            )
+            row = connection.execute(
+                "SELECT * FROM projects WHERE repo = ?", (repo,)
+            ).fetchone()
             result = run_codex(
                 planning_worktree,
                 state_dir,
@@ -1134,17 +1176,20 @@ def run_project(
                     planner_session_id=result_session_id,
                 )
             if code:
-                update_project(connection, repo, last_error=message or f"Planner 종료 코드 {code}")
+                update_project(
+                    connection,
+                    repo,
+                    last_error=message or f"Planner 종료 코드 {code}",
+                    planning_result_pending_validation=0,
+                    planning_result_completed=0,
+                )
                 print(message or "Planner 실행에 실패했습니다.", file=sys.stderr)
                 return 1
-            # Persist the successful Planner result before inspecting it. If
-            # the process stops here, the next run validates this exact output
-            # rather than asking the same session to produce another result.
             update_project(
                 connection,
                 repo,
                 last_error=None,
-                planning_result_pending_validation=1,
+                planning_result_completed=1,
             )
             row = connection.execute(
                 "SELECT * FROM projects WHERE repo = ?", (repo,)
@@ -1163,6 +1208,7 @@ def run_project(
             values = {
                 "planning_validation_error": validation_error,
                 "planning_result_pending_validation": 0,
+                "planning_result_completed": 0,
                 "last_error": None,
                 "planning_retry_count": retry_count,
             }

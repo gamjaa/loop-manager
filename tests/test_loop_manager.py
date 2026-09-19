@@ -183,6 +183,7 @@ class LoopManagerTest(unittest.TestCase):
         self.assertIn("planning_validation_error", columns)
         self.assertIn("planning_error", columns)
         self.assertIn("planning_result_pending_validation", columns)
+        self.assertIn("planning_result_completed", columns)
         self.assertIn("planning_error_fingerprint", columns)
         self.assertEqual((row["base_branch"], row["phase"]), ("main", "WORKING"))
         self.assertIsNone(row["planning_fingerprint"])
@@ -684,6 +685,73 @@ class LoopManagerTest(unittest.TestCase):
             self.assertIsNone(resumed["planning_error"])
 
 
+    def test_interrupted_planner_correction_is_validated_before_another_resume(self):
+        planner_calls = 0
+
+        def agent(worktree, _state, _config, role_name, _prompt, **_kwargs):
+            nonlocal planner_calls
+            self.assertEqual(role_name, "planner")
+            planner_calls += 1
+            (worktree / "unexpected.txt").write_text(
+                f"invalid {planner_calls}\n", encoding="utf-8"
+            )
+            if planner_calls == 2:
+                saved = connection.execute(
+                    "SELECT planning_result_pending_validation FROM projects WHERE repo = ?",
+                    (str(repo),),
+                ).fetchone()
+                self.assertEqual(saved["planning_result_pending_validation"], 1)
+                raise RuntimeError("process interrupted during Planner correction")
+            return loop_manager.CodexResult(0, "", "planner-session")
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            state_dir = Path(directory) / "state"
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.run_codex", side_effect=agent
+            ):
+                self.assertEqual(
+                    loop_manager.run_project(
+                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                    ),
+                    1,
+                )
+                with self.assertRaisesRegex(RuntimeError, "process interrupted"):
+                    loop_manager.run_project(
+                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                    )
+
+                interrupted = connection.execute(
+                    "SELECT * FROM projects WHERE repo = ?", (str(repo),)
+                ).fetchone()
+                self.assertEqual(interrupted["planning_result_pending_validation"], 1)
+                self.assertEqual(interrupted["planning_retry_count"], 0)
+
+                self.assertEqual(
+                    loop_manager.run_project(
+                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                    ),
+                    1,
+                )
+
+            resumed = connection.execute(
+                "SELECT * FROM projects WHERE repo = ?", (str(repo),)
+            ).fetchone()
+            self.assertEqual(planner_calls, 2)
+            self.assertEqual(resumed["planning_retry_count"], 1)
+            self.assertEqual(resumed["planning_result_pending_validation"], 0)
+            self.assertIsNone(resumed["planning_error"])
+
     def test_planner_cli_failure_does_not_consume_validation_retry(self):
         planner_calls = 0
 
@@ -814,6 +882,8 @@ class LoopManagerTest(unittest.TestCase):
                 f"invalid {len(planner_sessions)}\n",
                 encoding="utf-8",
             )
+            git_command(worktree, "add", "unexpected.txt")
+            git_command(worktree, "commit", "-m", "Invalid Planner output")
             session_id = kwargs["session_id"] or "planner-session"
             return loop_manager.CodexResult(0, "", session_id)
 
@@ -904,6 +974,7 @@ class LoopManagerTest(unittest.TestCase):
             diagnostic_text = diagnostic.read_text(encoding="utf-8")
             self.assertIn(blocked["planning_error"], diagnostic_text)
             self.assertIn("unexpected.txt", diagnostic_text)
+            self.assertIn("+invalid 4", diagnostic_text)
 
     def test_changed_remote_input_restarts_failed_planning_from_latest_origin(self):
         seen_source_contents = []
