@@ -17,10 +17,12 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+from urllib.parse import quote
 
 
 ROOT = Path(__file__).resolve().parent
 MAX_PLANNER_VALIDATION_RETRIES = 3
+PLAN_SHA_BACKFILL_ERROR = "계획 commit SHA를 기존 작업에서 안전하게 복구할 수 없습니다."
 FIELDS = {
     "base_branch",
     "processed_sha",
@@ -37,6 +39,7 @@ FIELDS = {
     "planning_error",
     "planning_error_fingerprint",
     "active_sha",
+    "plan_sha",
     "phase",
     "branch",
     "worktree",
@@ -63,6 +66,7 @@ CREATE TABLE IF NOT EXISTS projects (
     planning_error TEXT,
     planning_error_fingerprint TEXT,
     active_sha TEXT,
+    plan_sha TEXT,
     phase TEXT,
     branch TEXT,
     worktree TEXT,
@@ -103,7 +107,19 @@ class CleanupAssessment:
     reason: str | None = None
 
 
+@dataclass(frozen=True)
+class WorkerPublication:
+    """The Worker-provided metadata used for its commit and pull request."""
+
+    commit_title: str
+    summary: str
+    test_evidence: str
+
+class WorkerResultError(RuntimeError):
+    """A Worker final response cannot safely be published."""
+
 def state_directory(value: str | None = None) -> Path:
+
     if value:
         return Path(value).expanduser().resolve()
     if configured := os.environ.get("LOOP_MANAGER_STATE_DIR"):
@@ -172,6 +188,7 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
         "planning_attempt_fingerprint": "TEXT",
         "planning_retry_count": "INTEGER NOT NULL DEFAULT 0",
         "planner_session_id": "TEXT",
+        "plan_sha": "TEXT",
         "worker_session_id": "TEXT",
         "worker_result": "TEXT",
         "verify_result": "TEXT",
@@ -188,6 +205,7 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
         connection.commit()
     connection.execute(CLEANUP_PENDING_SCHEMA)
     connection.commit()
+    backfill_plan_shas(connection)
     return connection
 
 
@@ -227,6 +245,59 @@ def command(
 
 def git(repo: Path, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     return command(["git", "-C", str(repo), *arguments], check=check)
+
+
+def github_repository(origin_url: str) -> str:
+    match = re.fullmatch(
+        r"(?:git@|ssh://git@|https://)(?:www\.)?github\.com[:/](?P<owner>[^/:\s]+)/(?P<repo>[^/\s]+?)(?:\.git)?/?",
+        origin_url.strip(),
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        raise RuntimeError("origin이 GitHub 저장소가 아닙니다.")
+    return f"{match.group('owner')}/{match.group('repo')}".lower()
+
+
+def backfill_plan_shas(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        """
+        SELECT repo, plan_path
+        FROM projects
+        WHERE plan_sha IS NULL
+          AND plan_path IS NOT NULL
+          AND phase IN ('WORKING', 'VERIFYING', 'REVIEWING', 'PUBLISHING')
+        """
+    ).fetchall()
+    for row in rows:
+        result = git(
+            Path(row["repo"]),
+            "log",
+            "--all",
+            "--diff-filter=A",
+            "--format=%H",
+            "--",
+            row["plan_path"],
+            check=False,
+        )
+        commits = [
+            value
+            for value in result.stdout.splitlines()
+            if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", value)
+        ]
+        if len(commits) == 1:
+            connection.execute(
+                "UPDATE projects SET plan_sha = ? WHERE repo = ?",
+                (commits[0], row["repo"]),
+            )
+        else:
+            connection.execute(
+                "UPDATE projects SET phase = 'BLOCKED', last_error = ? WHERE repo = ?",
+                (
+                    PLAN_SHA_BACKFILL_ERROR,
+                    row["repo"],
+                ),
+            )
+    connection.commit()
 
 
 def git_bytes(repo: Path, *arguments: str) -> bytes:
@@ -518,9 +589,7 @@ def validate_repository(path: Path, *, allow_agents_mismatch: bool) -> Path:
     root = Path(git(path, "rev-parse", "--show-toplevel").stdout.strip()).resolve()
     if root != path:
         raise RuntimeError(f"저장소 루트 경로를 지정하세요: {root}")
-    remote = git(root, "remote", "get-url", "origin").stdout.strip().lower()
-    if not re.match(r"^(?:git@|ssh://git@|https://)(?:www\.)?github\.com[:/]", remote):
-        raise RuntimeError("origin이 GitHub 저장소가 아닙니다.")
+    github_repository(git(root, "remote", "get-url", "origin").stdout)
     required = [root / "AGENTS.md", root / "docs/PLANS.md", root / "docs/ARCHITECTURE.md"]
     missing = [str(item.relative_to(root)) for item in required if not item.is_file()]
     requirements = root / "docs/requirements"
@@ -1082,6 +1151,7 @@ def _clear_active_values(
 ) -> dict[str, object]:
     values: dict[str, object] = {
         "active_sha": None,
+        "plan_sha": None,
         "phase": None,
         "branch": None,
         "worktree": None,
@@ -1181,9 +1251,134 @@ docs/plans에 새 ExecPlan을 만들지 말고 불필요한 후속 기능도 구
 구현과 관련 unit test를 작성하거나 갱신한 뒤, 수정한 코드와 새로 작성하거나 변경한 테스트를 직접 검증하는 최소 범위의 targeted unit test만 실행하라. 개별 test case, test class, test module 또는 이에 준하는 좁은 단위만 허용된다.
 targeted unit test가 실패하면 같은 세션에서 원인을 수정하고 같은 targeted test를 다시 실행하라. 문서·설정 전용 변경이거나 실행 가능한 관련 unit test가 없으면 테스트 범위를 확대하지 말고, 실행하지 못한 구체적인 사유를 최종 결과에 남겨라.
 전체 test suite, integration test, end-to-end test, 프로젝트 전체 lint·build·type check 및 scripts/verify 실행은 절대 실행하지 마라. 전체 verify는 Worker 종료 뒤 Loop Manager가 실행하며, 실패한 경우에만 이 세션으로 진단을 전달한다.
+작업이 완료되면 최종 응답 마지막에 아래 형식을 정확히 포함하라. 제목과 Summary는 최종 diff 전체를 설명해야 하며 ExecPlan 제목이나 일반적인 변경 문구를 쓰지 마라:
+COMMIT_TITLE: 한 줄의 구체적인 변경 제목
+PR_SUMMARY: 실제 변경을 간결히 설명하는 Summary
+TARGETED_TESTS:
+실행한 최소 범위 targeted unit test와 결과, 또는 실행하지 못한 구체적인 사유
 {failure}
 """.strip()
 
+
+
+def parse_worker_result(message: str, plan: dict[str, object]) -> WorkerPublication:
+    """Parse and validate the Worker final-result contract before publishing."""
+    match = re.search(
+        r"(?ms)^COMMIT_TITLE:[ \t]*(?P<title>[^\r\n]*)\r?\nPR_SUMMARY:[ \t]*(?P<summary>.*?)\r?\nTARGETED_TESTS:\s*(?P<tests>.+)\Z",
+        message.strip(),
+    )
+    if not match:
+        title_line = re.search(r"(?m)^COMMIT_TITLE:.*$", message)
+        if title_line and not re.match(r"\r?\nPR_SUMMARY:", message[title_line.end():]):
+            raise WorkerResultError("Worker commit 제목은 한 줄이어야 합니다.")
+        raise WorkerResultError(
+            "Worker 결과에는 COMMIT_TITLE, PR_SUMMARY, TARGETED_TESTS 형식이 모두 필요합니다."
+        )
+
+    title = match.group("title").strip()
+    summary = match.group("summary").strip()
+    test_evidence = match.group("tests").strip()
+    if not title:
+        raise WorkerResultError("Worker commit 제목이 비어 있습니다.")
+    if not summary:
+        raise WorkerResultError("Worker PR Summary가 비어 있습니다.")
+    if not test_evidence:
+        raise WorkerResultError("Worker targeted unit test 증거가 비어 있습니다.")
+
+    plan_id = str(plan["id"])
+    plan_title = str(plan["title"])
+    normalized = " ".join(title.split()).casefold().rstrip(" .,:;!?…")
+    generic_title_words = {
+        "implement", "implementation", "implementations", "change", "changes", "code",
+        "update", "updates", "fix", "fixes", "the", "work", "feature", "features",
+        "변경", "사항", "구현",
+    }
+    prohibited = {
+        " ".join(plan_title.split()).casefold().rstrip(" .,:;!?…"),
+        f"implement {plan_id}".casefold(),
+        f"implement {plan_id}: {plan_title}".casefold(),
+        f"implement {plan_title}".casefold(),
+    }
+    if (
+        (bool(normalized.split()) and set(normalized.split()) <= generic_title_words)
+        or normalized in prohibited
+        or re.match(rf"implement\s+(?:execplan\s+)?{re.escape(plan_id.casefold())}\b", normalized)
+    ):
+        raise WorkerResultError(
+            "Worker commit 제목은 ExecPlan 제목이나 일반적인 변경 문구가 아니라 실제 변경을 설명해야 합니다."
+        )
+    return WorkerPublication(title, summary, test_evidence)
+
+def immutable_github_blob_url(origin_url: str, commit_sha: str, relative_path: str) -> str:
+    if not re.fullmatch(r"[0-9a-fA-F]{7,64}", commit_sha):
+        raise RuntimeError("계획 commit SHA가 유효하지 않습니다.")
+    repository = github_repository(origin_url)
+    encoded_path = quote(relative_path, safe="/")
+    return f"https://github.com/{repository}/blob/{commit_sha}/{encoded_path}"
+
+
+def execplan_purpose(plan_text: str) -> str:
+    body = re.sub(r"(?s)\A---.*?---\s*", "", plan_text, count=1)
+    match = re.search(r"(?ms)^## Purpose\s*\n+(.*?)(?=^## |\Z)", body)
+    if not match or not match.group(1).strip():
+        raise RuntimeError("ExecPlan Purpose를 찾을 수 없습니다.")
+    return " ".join(match.group(1).split())
+
+
+def published_execplan(plan_path: str, plan_text: str) -> dict[str, object]:
+    """Read metadata from the immutable ExecPlan commit without live source checks."""
+    plan = parse_frontmatter(plan_text)
+    required = {"id", "title", "sources", "depends_on", "complexity", "risk"}
+    if set(plan) != required:
+        raise RuntimeError("게시된 ExecPlan frontmatter가 올바르지 않습니다.")
+    plan_id = plan["id"]
+    title = plan["title"]
+    if not isinstance(plan_id, str) or not isinstance(title, str):
+        raise RuntimeError("게시된 ExecPlan ID 또는 제목이 유효하지 않습니다.")
+    if Path(plan_path).name != f"[{plan_id}] {title}.md":
+        raise RuntimeError("게시된 ExecPlan 경로가 메타데이터와 일치하지 않습니다.")
+    sources = plan["sources"]
+    if not isinstance(sources, list) or not sources:
+        raise RuntimeError("게시된 ExecPlan source가 하나 이상 필요합니다.")
+    for source in sources:
+        if not isinstance(source, str) or not (
+            source == "docs/PRODUCT.md"
+            or re.fullmatch(r"docs/requirements/[^/\\]+\.md", source)
+        ):
+            raise RuntimeError(f"게시된 ExecPlan source가 유효하지 않습니다: {source}")
+    return plan
+
+
+def build_pr_body(
+    worker: WorkerPublication,
+    plan: dict[str, object],
+    plan_path: str,
+    plan_text: str,
+    origin_url: str,
+    plan_sha: str,
+) -> str:
+    plan_id = str(plan["id"])
+    plan_title = str(plan["title"])
+    plan_link = immutable_github_blob_url(origin_url, plan_sha, plan_path)
+    sources = plan["sources"]
+    assert isinstance(sources, list)
+    source_lines = [
+        f"- [{source}]({immutable_github_blob_url(origin_url, plan_sha, str(source))})"
+        for source in sources
+    ]
+    return "\n".join(
+        [
+            "## Summary",
+            worker.summary,
+            "",
+            "## ExecPlan",
+            f"- [{plan_id}: {plan_title}]({plan_link})",
+            f"- Purpose: {execplan_purpose(plan_text)}",
+            "",
+            "## Sources",
+            *source_lines,
+        ]
+    )
 
 def reviewer_prompt(
     base: str,
@@ -1260,6 +1455,13 @@ def run_project(
             print(f"닫힌 PR을 다시 열어야 합니다: {existing_pr['url']}", file=sys.stderr)
             return 1
 
+    if row and row["phase"] == "BLOCKED":
+        print(
+            f"작업이 차단되어 있습니다: {row['last_error'] or '사용자 조치가 필요합니다.'}",
+            file=sys.stderr,
+        )
+        return 1
+
     base = remote_base(repo_path, requested_base or (row["base_branch"] if row else None))
     base_sha = git(repo_path, "rev-parse", f"origin/{base}").stdout.strip()
     current_fingerprint = planning_input_fingerprint(repo_path, base)
@@ -1329,6 +1531,7 @@ def run_project(
             connection,
             repo,
             active_sha=base_sha,
+            plan_sha=None,
             planning_attempt_fingerprint=current_fingerprint,
             planning_retry_count=0,
             planner_session_id=None,
@@ -1528,6 +1731,7 @@ def run_project(
             connection,
             repo,
             active_sha=latest_sha,
+            plan_sha=plan_commit,
             phase="WORKING",
             branch=branch,
             worktree=str(worktree),
@@ -1541,7 +1745,7 @@ def run_project(
     worktree = Path(row["worktree"])
     make_worktree(repo_path, worktree, branch, base)
 
-    if row["phase"] in {"WORKING", "BLOCKED"}:
+    if row["phase"] == "WORKING":
         plan = validate_execplan(worktree, row["plan_path"])
         level = worker_level(plan)
         result = run_codex(
@@ -1569,6 +1773,18 @@ def run_project(
             update_project(connection, repo, phase="WORKING", last_error=message or f"Codex 종료 코드 {code}")
             print(message or "Codex 실행에 실패했습니다.", file=sys.stderr)
             return 1
+        try:
+            parse_worker_result(message, plan)
+        except WorkerResultError as error:
+            validation_error = f"Worker 결과 검증 실패:\n{error}"
+            update_project(
+                connection,
+                repo,
+                phase="WORKING",
+                last_error=validation_error,
+            )
+            print(validation_error, file=sys.stderr)
+            return 1
         update_project(
             connection,
             repo,
@@ -1580,6 +1796,15 @@ def run_project(
 
     row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
     if row["phase"] == "VERIFYING":
+        plan = validate_execplan(worktree, row["plan_path"])
+        try:
+            worker_publication = parse_worker_result(str(row["worker_result"] or ""), plan)
+        except WorkerResultError as error:
+            validation_error = f"Worker 결과 검증 실패:\n{error}"
+            update_project(connection, repo, phase="WORKING", last_error=validation_error)
+            print(validation_error, file=sys.stderr)
+            return 1
+
         passed, output = verify(worktree)
         if not passed:
             update_project(
@@ -1602,7 +1827,7 @@ def run_project(
         if dirty:
             git(worktree, "add", "-A")
             plan = validate_execplan(worktree, row["plan_path"])
-            git(worktree, "commit", "-m", f"Implement {plan['id']}: {plan['title']}")
+            git(worktree, "commit", "-m", worker_publication.commit_title)
 
         git(repo_path, "fetch", "origin")
         latest_sha = git(repo_path, "rev-parse", f"origin/{base}").stdout.strip()
@@ -1651,8 +1876,29 @@ def run_project(
     if row["phase"] == "PUBLISHING":
         existing_pr = pr_for_branch(repo_path, branch)
         if not existing_pr:
+            plan_sha = str(row["plan_sha"] or "")
+            if not plan_sha:
+                update_project(connection, repo, phase="BLOCKED", last_error="계획 commit SHA가 없습니다.")
+                return 1
+            plan_text = git(worktree, "show", f"{plan_sha}:{row['plan_path']}").stdout
+            plan = published_execplan(str(row["plan_path"]), plan_text)
+            try:
+                worker_publication = parse_worker_result(str(row["worker_result"] or ""), plan)
+            except WorkerResultError as error:
+                validation_error = f"Worker 결과 검증 실패:\n{error}"
+                update_project(connection, repo, phase="WORKING", last_error=validation_error)
+                print(validation_error, file=sys.stderr)
+                return 1
+            origin_url = git(worktree, "remote", "get-url", "origin").stdout.strip()
+            body = build_pr_body(
+                worker_publication,
+                plan,
+                str(row["plan_path"]),
+                plan_text,
+                origin_url, plan_sha,
+            )
             git(worktree, "push", "-u", "origin", branch)
-            title = git(worktree, "log", "-1", "--pretty=%s").stdout.strip()
+            title = f"Implement {plan['id']}: {plan['title']}"
             created = command(
                 [
                     "gh",
@@ -1665,7 +1911,7 @@ def run_project(
                     "--title",
                     title,
                     "--body",
-                    "Loop Manager 최소 부트스트랩 실행기가 생성한 PR입니다.",
+                    body,
                 ],
                 cwd=worktree,
             )
