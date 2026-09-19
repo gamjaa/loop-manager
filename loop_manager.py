@@ -28,6 +28,8 @@ PLAN_SHA_BACKFILL_ERROR = "계획 commit SHA를 기존 작업에서 안전하게
 WORKSPACE_UNOWNED = 0
 WORKSPACE_OWNED = 1
 WORKSPACE_RESERVED = 2
+REBASE_IN_PROGRESS_ERROR = "Manager rebase 진행 중"
+REBASE_CONFLICT_PREFIX = "rebase 충돌 해결 필요:\n"
 PRIORITY_ORDER = {"critical": 0, "high": 1, "normal": 2, "low": 3}
 ACTIVE_EXECPLAN_STATUSES = frozenset(
     {"IMPLEMENTING", "VERIFYING", "REVIEWING", "PUBLISHING", "PR_OPEN", "BLOCKED"}
@@ -59,6 +61,7 @@ FIELDS = {
     "agent_role",
     "agent_snapshot",
     "agent_result_snapshot",
+    "agent_manager_snapshot",
 }
 
 SCHEMA = """
@@ -89,7 +92,8 @@ CREATE TABLE IF NOT EXISTS projects (
     last_error TEXT,
     agent_role TEXT,
     agent_snapshot TEXT,
-    agent_result_snapshot TEXT
+    agent_result_snapshot TEXT,
+    agent_manager_snapshot TEXT
 )
 """
 
@@ -237,6 +241,38 @@ class GitSnapshot:
                 for key, values in parsed.get("config", {}).items()
             },
             shared_metadata_complete=version == 3,
+        )
+
+
+@dataclass(frozen=True)
+class ManagerGitCheckpoint:
+    """Validated Agent state before Manager-owned Git mutations."""
+
+    snapshot: GitSnapshot
+    cleanup_worktrees: frozenset[str]
+
+    def serialize(self) -> str:
+        return json.dumps(
+            {
+                "version": 1,
+                "snapshot": self.snapshot.serialize(),
+                "cleanup_worktrees": sorted(self.cleanup_worktrees),
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    @classmethod
+    def deserialize(cls, value: str) -> ManagerGitCheckpoint:
+        parsed = json.loads(value)
+        if parsed.get("version") != 1:
+            raise RuntimeError("저장된 Manager Git checkpoint 형식을 지원하지 않습니다.")
+        return cls(
+            snapshot=GitSnapshot.deserialize(str(parsed["snapshot"])),
+            cleanup_worktrees=frozenset(
+                str(path) for path in parsed.get("cleanup_worktrees", [])
+            ),
         )
 
 
@@ -399,6 +435,7 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
         "agent_role": "TEXT",
         "agent_snapshot": "TEXT",
         "agent_result_snapshot": "TEXT",
+        "agent_manager_snapshot": "TEXT",
     }
     for column, definition in migrations.items():
         if column not in columns:
@@ -1672,10 +1709,29 @@ def _worktree_catalog(repo: Path) -> list[dict[str, str | bool]]:
     return records
 
 
+def _rebase_head_name(worktree: Path) -> str | None:
+    for directory in ("rebase-merge", "rebase-apply"):
+        result = git(worktree, "rev-parse", "--git-path", f"{directory}/head-name", check=False)
+        if result.returncode:
+            continue
+        git_path = Path(result.stdout.strip())
+        if not git_path.is_absolute():
+            git_path = worktree / git_path
+        if git_path.is_file():
+            return git_path.read_text(encoding="utf-8").strip()
+    return None
+
+
+def _rebase_in_progress_for_branch(worktree: Path, branch: str) -> bool:
+    return _rebase_head_name(worktree) == f"refs/heads/{branch}"
+
+
 def validate_managed_worktree(
     repo: Path,
     worktree: Path,
     branch: str | None,
+    *,
+    allow_rebase: bool = False,
 ) -> None:
     """Prove that a path is registered to this repository and expected branch."""
 
@@ -1701,6 +1757,12 @@ def validate_managed_worktree(
                 f"planning worktree가 detached HEAD가 아닙니다: {worktree}"
             )
     elif actual_branch != f"refs/heads/{branch}":
+        if (
+            allow_rebase
+            and "detached" in record
+            and _rebase_in_progress_for_branch(worktree, branch)
+        ):
+            return
         rendered = actual_branch or "detached"
         raise WorkspaceOwnershipError(
             f"관리 worktree branch 불일치: {worktree} "
@@ -1716,6 +1778,7 @@ def make_worktree(
     *,
     allow_recovery: bool = True,
     allow_existing: bool = True,
+    allow_rebase: bool = False,
     allow_create_branch: bool = True,
     ownership_reserved: bool = False,
     before_create: Callable[[], None] | None = None,
@@ -1732,7 +1795,7 @@ def make_worktree(
                 f"새 ExecPlan의 관리 worktree가 이미 존재해 소유권을 증명할 수 없습니다: "
                 f"{worktree}"
             )
-        validate_managed_worktree(repo, worktree, branch)
+        validate_managed_worktree(repo, worktree, branch, allow_rebase=allow_rebase)
         return "existing"
 
     worktree.parent.mkdir(parents=True, exist_ok=True)
@@ -1773,7 +1836,7 @@ def make_worktree(
             f"저장된 worktree와 관리 branch를 모두 복구할 수 없습니다: "
             f"{worktree} ({branch})"
         )
-    validate_managed_worktree(repo, worktree, branch)
+    validate_managed_worktree(repo, worktree, branch, allow_rebase=allow_rebase)
     return outcome
 
 
@@ -2287,6 +2350,7 @@ def begin_agent_scope(
         agent_role=role_name,
         agent_snapshot=snapshot.serialize(),
         agent_result_snapshot=None,
+        agent_manager_snapshot=None,
     )
     return snapshot
 
@@ -2298,6 +2362,7 @@ def clear_agent_scope(connection: sqlite3.Connection, repo: str) -> None:
         agent_role=None,
         agent_snapshot=None,
         agent_result_snapshot=None,
+        agent_manager_snapshot=None,
     )
 
 
@@ -2655,6 +2720,7 @@ def clear_planning_validation_state(
         agent_role=None,
         agent_snapshot=None,
         agent_result_snapshot=None,
+        agent_manager_snapshot=None,
     )
 
 
@@ -2687,6 +2753,7 @@ def _clear_active_values(
         "agent_role": None,
         "agent_snapshot": None,
         "agent_result_snapshot": None,
+        "agent_manager_snapshot": None,
     }
     if processed_sha is not None:
         values["processed_sha"] = processed_sha
@@ -2919,7 +2986,7 @@ def block_active_execplan(
             """
             UPDATE projects
             SET phase = 'BLOCKED', last_error = ?, verify_result = ?,
-                agent_result_snapshot = ?
+                agent_result_snapshot = ?, agent_manager_snapshot = NULL
             WHERE repo = ?
             """,
             (error, verify_result, agent_result_snapshot, repo),
@@ -2956,7 +3023,7 @@ def block_active_execplan_from_revision(
             """
             UPDATE projects
             SET phase = 'BLOCKED', last_error = ?, verify_result = ?,
-                agent_result_snapshot = ?
+                agent_result_snapshot = ?, agent_manager_snapshot = NULL
             WHERE repo = ?
             """,
             (error, verify_result, preserved_agent_result_snapshot, repo),
@@ -3077,6 +3144,62 @@ def recover_persisted_agent_worktree(
         ) from error
 
 
+def _blocked_agent_local_baseline(
+    before: GitSnapshot,
+    result: GitSnapshot,
+    worktree: Path,
+) -> GitSnapshot:
+    """Accept only the already-diagnosed local file/index result."""
+
+    if not before.shared_metadata_complete or not result.shared_metadata_complete:
+        raise AgentScopeError("저장된 BLOCKED Agent Git metadata 기준 snapshot이 없습니다.")
+    if before.head != result.head or before.branch != result.branch:
+        raise AgentScopeError("BLOCKED Agent가 변경한 HEAD 또는 branch를 자동 복구할 수 없습니다.")
+    if before.refs != result.refs:
+        changed_refs = sorted(
+            refname
+            for refname in set(before.refs) | set(result.refs)
+            if before.refs.get(refname) != result.refs.get(refname)
+        )
+        raise AgentScopeError(
+            "BLOCKED Agent가 변경한 공유 Git refs를 자동 복구할 수 없습니다: "
+            + ", ".join(changed_refs)
+        )
+    if before.config != result.config:
+        changed_config = sorted(
+            key
+            for key in set(before.config) | set(result.config)
+            if before.config.get(key) != result.config.get(key)
+        )
+        raise AgentScopeError(
+            "BLOCKED Agent가 변경한 Git config를 자동 복구할 수 없습니다: "
+            + ", ".join(changed_config)
+        )
+
+    worktree_key = str(_canonical_path(worktree))
+    changed_worktrees = {
+        path
+        for path in set(before.worktrees) | set(result.worktrees)
+        if before.worktrees.get(path) != result.worktrees.get(path)
+    }
+    if changed_worktrees - {worktree_key}:
+        raise AgentScopeError("BLOCKED Agent가 변경한 다른 worktree 등록을 자동 복구할 수 없습니다.")
+    result_registration = result.worktrees.get(worktree_key)
+    if result_registration is None:
+        raise AgentScopeError("BLOCKED Agent 결과에 관리 worktree 등록이 없습니다.")
+    worktrees = dict(before.worktrees)
+    worktrees[worktree_key] = result_registration
+    return GitSnapshot(
+        head=before.head,
+        branch=before.branch,
+        index=result.index,
+        dirty=result.dirty,
+        refs=before.refs,
+        worktrees=worktrees,
+        config=before.config,
+    )
+
+
 def validate_persisted_agent_scope(
     connection: sqlite3.Connection,
     repo_path: Path,
@@ -3084,12 +3207,13 @@ def validate_persisted_agent_scope(
     repo: str,
     *,
     allow_planner_worktree_correction: bool = False,
+    manager_cleanup_worktrees: frozenset[str] = frozenset(),
 ) -> GitSnapshot | None:
     """Validate persisted Agent output before repository-aware Git work."""
 
     project = connection.execute(
         "SELECT phase, base_branch, branch, worktree, agent_role, agent_snapshot, "
-        "agent_result_snapshot, plan_path FROM projects WHERE repo = ?",
+        "agent_result_snapshot, agent_manager_snapshot, plan_path FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
     if project is None or not project["agent_snapshot"]:
@@ -3211,6 +3335,50 @@ def validate_persisted_agent_scope(
         )
         return current
 
+    if project["agent_manager_snapshot"]:
+        try:
+            checkpoint = ManagerGitCheckpoint.deserialize(
+                str(project["agent_manager_snapshot"])
+            )
+        except (KeyError, TypeError, ValueError, RuntimeError) as error:
+            raise AgentScopeError(
+                f"저장된 Manager Git checkpoint가 유효하지 않습니다: {error}"
+            ) from error
+        validate_agent_scope(
+            role_name,
+            saved_worktree,
+            before,
+            checkpoint.snapshot,
+            selected_plan_path=(
+                selected_plan_path if role_name == "worker" else None
+            ),
+        )
+        manager_refs = frozenset(
+            refname
+            for refname in set(checkpoint.snapshot.refs) | set(current.refs)
+            if checkpoint.snapshot.refs.get(refname) != current.refs.get(refname)
+            and (
+                refname.startswith("refs/remotes/origin/")
+                or refname.startswith("refs/tags/")
+            )
+        )
+        allowed_cleanup = checkpoint.cleanup_worktrees | manager_cleanup_worktrees
+        try:
+            validate_agent_scope(
+                "reviewer",
+                saved_worktree,
+                checkpoint.snapshot,
+                current,
+                allowed_ref_changes=manager_refs,
+                allowed_worktree_changes=allowed_cleanup,
+            )
+        except AgentScopeError as error:
+            raise AgentScopeError(
+                f"중단된 Manager Git 작업 후 Agent scope 검증 실패: {error}"
+            ) from error
+        return current
+
+    scope_before = before
     allowed_ref_changes: frozenset[str] = frozenset()
     allowed_worktree_changes: frozenset[str] = frozenset()
     if project["phase"] == "BLOCKED" and project["agent_result_snapshot"]:
@@ -3223,17 +3391,26 @@ def validate_persisted_agent_scope(
                 f"저장된 BLOCKED Agent 결과 snapshot이 유효하지 않습니다: {error}"
             ) from error
         if blocked_result.shared_metadata_complete:
+            scope_before = _blocked_agent_local_baseline(
+                before,
+                blocked_result,
+                saved_worktree,
+            )
             base = str(project["base_branch"])
+            manager_ref_candidates = frozenset(
+                {f"refs/heads/{base}"}
+                | {
+                    refname
+                    for refname in set(before.refs) | set(current.refs)
+                    if refname.startswith("refs/remotes/origin/")
+                    or refname.startswith("refs/tags/")
+                }
+            )
             allowed_ref_changes = _metadata_changes_after_block(
                 before.refs,
                 blocked_result.refs,
                 current.refs,
-                frozenset(
-                    (
-                        f"refs/heads/{base}",
-                        f"refs/remotes/origin/{base}",
-                    )
-                ),
+                manager_ref_candidates,
             )
             allowed_worktree_changes = _metadata_changes_after_block(
                 before.worktrees,
@@ -3245,7 +3422,7 @@ def validate_persisted_agent_scope(
     validate_agent_scope(
         role_name,
         saved_worktree,
-        before,
+        scope_before,
         current,
         selected_plan_path=(
             selected_plan_path if role_name == "worker" else None
@@ -3317,7 +3494,12 @@ def refresh_persisted_agent_scope_after_manager_git(
         worktrees=refreshed_worktrees,
         config=stored.config,
     )
-    update_project(connection, repo, agent_snapshot=refreshed.serialize())
+    update_project(
+        connection,
+        repo,
+        agent_snapshot=refreshed.serialize(),
+        agent_manager_snapshot=None,
+    )
     return refreshed
 
 
@@ -3353,6 +3535,7 @@ def validate_blocked_agent_scope(
             f"저장된 BLOCKED Agent Git snapshot이 유효하지 않습니다: {error}"
         ) from error
     current = capture_git_snapshot(worktree)
+    scope_before = before
     allowed_ref_changes: frozenset[str] = frozenset()
     allowed_worktree_changes: frozenset[str] = frozenset()
     result_serialized = project["agent_result_snapshot"]
@@ -3369,16 +3552,25 @@ def validate_blocked_agent_scope(
             and blocked_result.shared_metadata_complete
             and current.shared_metadata_complete
         ):
+            scope_before = _blocked_agent_local_baseline(
+                before,
+                blocked_result,
+                worktree,
+            )
+            manager_ref_candidates = frozenset(
+                {f"refs/heads/{base}"}
+                | {
+                    refname
+                    for refname in set(before.refs) | set(current.refs)
+                    if refname.startswith("refs/remotes/origin/")
+                    or refname.startswith("refs/tags/")
+                }
+            )
             allowed_ref_changes = _metadata_changes_after_block(
                 before.refs,
                 blocked_result.refs,
                 current.refs,
-                frozenset(
-                    (
-                        f"refs/heads/{base}",
-                        f"refs/remotes/origin/{base}",
-                    )
-                ),
+                manager_ref_candidates,
             )
             primary_worktree = str(_canonical_path(repo_path))
             allowed_worktree_changes = _metadata_changes_after_block(
@@ -3391,7 +3583,7 @@ def validate_blocked_agent_scope(
     validate_agent_scope(
         role_name,
         worktree,
-        before,
+        scope_before,
         current,
         selected_plan_path=(
             selected_plan_path if role_name == "worker" else None
@@ -3399,6 +3591,42 @@ def validate_blocked_agent_scope(
         allowed_ref_changes=allowed_ref_changes,
         allowed_worktree_changes=allowed_worktree_changes,
     )
+
+
+def preserve_blocked_agent_changes(
+    connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+    plan_id: str,
+) -> None:
+    """Move a diagnosed scope violation out of the publishable worktree."""
+
+    project = connection.execute(
+        "SELECT agent_snapshot, agent_result_snapshot FROM projects WHERE repo = ?",
+        (repo,),
+    ).fetchone()
+    if project is None or not project["agent_snapshot"] or not project["agent_result_snapshot"]:
+        return
+    try:
+        before = GitSnapshot.deserialize(str(project["agent_snapshot"]))
+        result = GitSnapshot.deserialize(str(project["agent_result_snapshot"]))
+    except (KeyError, TypeError, ValueError, RuntimeError) as error:
+        raise AgentScopeError(
+            f"보존할 BLOCKED Agent snapshot이 유효하지 않습니다: {error}"
+        ) from error
+    _blocked_agent_local_baseline(before, result, worktree)
+    stashed = git(
+        worktree,
+        "stash",
+        "push",
+        "--all",
+        "-m",
+        f"loop-manager scope violation {plan_id}",
+        check=False,
+    )
+    if stashed.returncode:
+        raise AgentScopeError(f"BLOCKED Agent 변경 보존 실패:\n{stashed.stdout[-8000:]}")
+
 
 def _requeue_blocked_execplan(
     connection: sqlite3.Connection,
@@ -3535,6 +3763,17 @@ def resume_blocked_execplan_if_inputs_changed(
         and _worktree_execplan_input_fingerprint(worktree, plan) != stored
     )
     if not worktree_changed and not remote_changed:
+        return False
+    try:
+        preserve_blocked_agent_changes(
+            connection,
+            repo,
+            worktree,
+            str(plan["plan_id"]),
+        )
+    except (AgentScopeError, RuntimeError) as error:
+        message = f"BLOCKED Agent 변경 보존 실패:\n{error}"
+        _update_blocked_error(connection, repo, str(plan["plan_id"]), message)
         return False
     if remote_changed and not worktree_changed and worktree.is_dir():
         rebased = git(
@@ -3849,6 +4088,14 @@ def run_project(
         "SELECT * FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
+    _ensure_cleanup_pending_schema(connection)
+    cleanup_candidates = frozenset(
+        str(_canonical_path(Path(item["worktree"])))
+        for item in connection.execute(
+            "SELECT worktree FROM cleanup_pending WHERE repo = ?", (repo,)
+        ).fetchall()
+    )
+    checkpoint_cleanup_candidates = cleanup_candidates
     validated_agent_scope: GitSnapshot | None = None
     if row and row["agent_snapshot"]:
         planner_correction = bool(
@@ -3861,6 +4108,7 @@ def run_project(
                 state_dir,
                 repo,
                 allow_planner_worktree_correction=planner_correction,
+                manager_cleanup_worktrees=cleanup_candidates,
             )
         except AgentScopeError as error:
             detail = str(error)
@@ -3871,10 +4119,7 @@ def run_project(
         else:
             detail = None
             scope_result_snapshot = None
-            if (
-                row["phase"] == "BLOCKED"
-                or (row["agent_result_snapshot"] and not planner_correction)
-            ):
+            if row["phase"] == "BLOCKED":
                 validated_agent_scope = None
         if detail is not None:
             message = block_persisted_agent_scope_violation(
@@ -3887,6 +4132,19 @@ def run_project(
             )
             operation_print(message, file=sys.stderr)
             return 1
+        if validated_agent_scope is not None:
+            if row["agent_manager_snapshot"]:
+                checkpoint_cleanup_candidates |= ManagerGitCheckpoint.deserialize(
+                    str(row["agent_manager_snapshot"])
+                ).cleanup_worktrees
+            update_project(
+                connection,
+                repo,
+                agent_manager_snapshot=ManagerGitCheckpoint(
+                    validated_agent_scope,
+                    checkpoint_cleanup_candidates,
+                ).serialize(),
+            )
     repo_path = validate_repository(
         repo_path,
         allow_agents_mismatch=allow_agents_mismatch,
@@ -3917,7 +4175,7 @@ def run_project(
         str(_canonical_path(Path(item["worktree"])))
         for item in cleanup_pending
     )
-    manager_worktree_changes = cleanup_candidates - remaining_cleanup
+    manager_worktree_changes = checkpoint_cleanup_candidates - remaining_cleanup
     for pending in cleanup_pending:
         operation_print(
             f"보존된 worktree: {pending['worktree']} ({pending['reason']})",
@@ -4595,6 +4853,19 @@ def run_project(
     workspace_ownership = int(catalog_plan["workspace_owned"] if catalog_plan else 0)
     workspace_owned = workspace_ownership != WORKSPACE_UNOWNED
     workspace_reserved = workspace_ownership == WORKSPACE_RESERVED
+    rebase_error = str(row["last_error"] or "")
+    rebase_recovery = bool(
+        row["phase"] == "WORKING"
+        and (
+            rebase_error == REBASE_IN_PROGRESS_ERROR
+            or rebase_error.startswith(REBASE_CONFLICT_PREFIX)
+        )
+    )
+    resolving_rebase = bool(
+        rebase_recovery
+        and worktree.is_dir()
+        and _rebase_in_progress_for_branch(worktree, branch)
+    )
     try:
         if plan_id is None:
             raise WorkspaceOwnershipError(
@@ -4625,6 +4896,7 @@ def run_project(
                 repo,
                 plan_id,
             ),
+            allow_rebase=resolving_rebase,
         )
         mark_execplan_workspace_owned(connection, repo, plan_id)
     except (RuntimeError, WorkspaceOwnershipError) as error:
@@ -4640,6 +4912,14 @@ def run_project(
         operation_print(workspace_error, file=sys.stderr)
         return 1
 
+    if rebase_recovery and not resolving_rebase:
+        update_project(
+            connection,
+            repo,
+            phase="VERIFYING",
+            last_error=None,
+        )
+        row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
     assert catalog_plan is not None
     try:
         plan = validate_active_execplan_metadata(
@@ -4705,7 +4985,12 @@ def run_project(
                 str(row["plan_path"]),
                 catalog_plan,
             )
-            validate_managed_worktree(repo_path, worktree, branch)
+            validate_managed_worktree(
+                repo_path,
+                worktree,
+                branch,
+                allow_rebase=resolving_rebase,
+            )
         except (AgentScopeError, WorkspaceOwnershipError, RuntimeError) as error:
             scope_error = str(error)
             block_active_execplan(
@@ -4721,8 +5006,13 @@ def run_project(
 
 
         if code:
-            update_project(connection, repo, phase="WORKING", last_error=message or f"Codex 종료 코드 {code}")
-            operation_print(message or "Codex 실행에 실패했습니다.", file=sys.stderr)
+            worker_error = message or f"Codex 종료 코드 {code}"
+            if resolving_rebase:
+                worker_error = REBASE_CONFLICT_PREFIX + worker_error
+            update_project(
+                connection, repo, phase="WORKING", last_error=worker_error
+            )
+            operation_print(worker_error, file=sys.stderr)
             return 1
         try:
             parse_worker_result(message, plan)
@@ -4736,6 +5026,42 @@ def run_project(
             )
             operation_print(validation_error, file=sys.stderr)
             return 1
+        if resolving_rebase:
+            git(worktree, "add", "-A")
+            continued = git(
+                worktree,
+                "-c",
+                "core.editor=true",
+                "rebase",
+                "--continue",
+                check=False,
+            )
+            if continued.returncode:
+                continuation_error = REBASE_CONFLICT_PREFIX + continued.stdout[-8000:]
+                if not _rebase_in_progress_for_branch(worktree, branch):
+                    block_active_execplan(
+                        connection,
+                        repo,
+                        worktree,
+                        continuation_error,
+                        str(row["verify_result"] or ""),
+                    )
+                else:
+                    update_project(
+                        connection,
+                        repo,
+                        phase="WORKING",
+                        last_error=continuation_error,
+                    )
+                operation_print(continuation_error, file=sys.stderr)
+                return 1
+            latest_sha = git(
+                worktree,
+                "rev-parse",
+                f"origin/{base}",
+            ).stdout.strip()
+            update_project(connection, repo, active_sha=latest_sha)
+
         update_project(
             connection,
             repo,
@@ -4797,9 +5123,21 @@ def run_project(
         git(repo_path, "fetch", "origin")
         latest_sha = git(repo_path, "rev-parse", f"origin/{base}").stdout.strip()
         if latest_sha != row["active_sha"]:
+            update_project(
+                connection,
+                repo,
+                phase="WORKING",
+                last_error=REBASE_IN_PROGRESS_ERROR,
+            )
             rebased = git(worktree, "rebase", f"origin/{base}", check=False)
             if rebased.returncode:
-                update_project(connection, repo, phase="WORKING", last_error=f"rebase 실패:\n{rebased.stdout[-8000:]}")
+                if _rebase_in_progress_for_branch(worktree, branch):
+                    rebase_failure = REBASE_CONFLICT_PREFIX + rebased.stdout[-8000:]
+                else:
+                    rebase_failure = f"rebase 실패:\n{rebased.stdout[-8000:]}"
+                update_project(
+                    connection, repo, phase="WORKING", last_error=rebase_failure
+                )
                 operation_print(rebased.stdout, file=sys.stderr)
                 return 1
             operation_log(f"전체 verify 시작: {plan['id']} {plan['title']} (rebase 후)")

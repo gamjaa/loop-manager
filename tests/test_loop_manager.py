@@ -4168,6 +4168,41 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "refs/heads/manager-update",
                 plan_sha,
             )
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.refresh_persisted_agent_scope_after_manager_git",
+                side_effect=KeyboardInterrupt("interrupt after Manager checkpoint"),
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as interrupted_agent:
+                with self.assertRaisesRegex(
+                    KeyboardInterrupt,
+                    "Manager checkpoint",
+                ):
+                    loop_manager.run_project(
+                        connection,
+                        state_dir,
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
+                    )
+
+            interrupted_checkpoint = connection.execute(
+                "SELECT agent_manager_snapshot FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()["agent_manager_snapshot"]
+            self.assertIsNotNone(interrupted_checkpoint)
+            self.assertFalse(cleanup_worktree.exists())
+            self.assertEqual(
+                git_command(repo, "rev-parse", "refs/remotes/origin/manager-update"),
+                plan_sha,
+            )
+            interrupted_agent.assert_not_called()
+
             sessions = []
 
             def resumed_worker(_worktree, _state, _config, role_name, _prompt, **kwargs):
@@ -4194,7 +4229,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 )
 
             project = connection.execute(
-                "SELECT phase, last_error, agent_snapshot FROM projects WHERE repo = ?",
+                "SELECT phase, last_error, agent_snapshot, agent_manager_snapshot "
+                "FROM projects WHERE repo = ?",
                 (str(repo),),
             ).fetchone()
             plan_status = connection.execute(
@@ -4209,6 +4245,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
             self.assertEqual(plan_status, "IMPLEMENTING")
             self.assertEqual(project["last_error"], "stop after resumed worker")
             self.assertIsNone(project["agent_snapshot"])
+            self.assertIsNone(project["agent_manager_snapshot"])
             self.assertEqual(
                 git_command(repo, "rev-parse", "refs/remotes/origin/manager-update"),
                 plan_sha,
@@ -4496,7 +4533,10 @@ class AgentScopeValidatorTest(unittest.TestCase):
             ), mock.patch(
                 "loop_manager.pr_for_branch", return_value=None
             ), mock.patch(
-                "loop_manager.run_codex"
+                "loop_manager.run_codex",
+                return_value=loop_manager.CodexResult(
+                    1, "stop after scope unblock", "planner-session"
+                ),
             ) as resumed_agent:
                 resumed_result = loop_manager.run_project(
                     connection,
@@ -4519,23 +4559,23 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 (str(repo),),
             ).fetchone()
             self.assertEqual(resumed_result, 1)
-            self.assertEqual(resumed_project["phase"], "BLOCKED")
+            self.assertEqual(resumed_project["phase"], "PLANNING")
+            self.assertEqual(
+                resumed_project["last_error"],
+                "stop after scope unblock",
+            )
+            self.assertIsNone(resumed_project["agent_role"])
+            self.assertIsNone(resumed_project["agent_snapshot"])
+            self.assertIsNone(resumed_project["agent_result_snapshot"])
+            self.assertEqual(resumed_plan["status"], "READY")
+            self.assertIsNone(resumed_plan["blocked_fingerprint"])
+            self.assertFalse((worktree / "reviewer.txt").exists())
             self.assertIn(
-                "Agent 범위 선검증 실패",
-                resumed_project["last_error"],
+                "loop-manager scope violation G-001",
+                git_command(worktree, "stash", "list"),
             )
-            self.assertIn("reviewer.txt", resumed_project["last_error"])
-            self.assertNotIn("공유 Git refs 변경", resumed_project["last_error"])
-            self.assertNotIn(
-                "Git worktree 등록·HEAD·index·파일 상태 변경",
-                resumed_project["last_error"],
-            )
-            self.assertEqual(resumed_project["agent_role"], "reviewer")
-            self.assertIsNotNone(resumed_project["agent_snapshot"])
-            self.assertEqual(resumed_plan["status"], "BLOCKED")
-            self.assertIsNotNone(resumed_plan["blocked_fingerprint"])
-            self.assertTrue((worktree / "reviewer.txt").is_file())
-            resumed_agent.assert_not_called()
+            resumed_agent.assert_called_once()
+            self.assertEqual(resumed_agent.call_args.args[3], "planner")
 
 
 class WorkspaceRecoveryTest(unittest.TestCase):
@@ -4925,6 +4965,169 @@ class WorkspaceRecoveryTest(unittest.TestCase):
             self.assertEqual(project["last_error"], "stop after recovery")
             self.assertIsNone(project["agent_snapshot"])
             self.assertEqual(plan_status, "IMPLEMENTING")
+
+    def test_rebase_conflict_resumes_same_worker_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                repo,
+                state_dir,
+                connection,
+                plan,
+                plan_sha,
+                branch,
+                worktree,
+            ) = self._ready_execplan(directory)
+            loop_manager.make_worktree(repo, worktree, branch, "main")
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE exec_plans
+                    SET status = 'VERIFYING', active_sha = ?, branch = ?,
+                        worktree = ?, workspace_owned = 1,
+                        worker_session_id = 'worker-session',
+                        worker_result = ?
+                    WHERE repo = ? AND plan_id = 'G-012'
+                    """,
+                    (
+                        plan_sha,
+                        branch,
+                        str(worktree),
+                        worker_result(),
+                        str(repo),
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE projects
+                    SET active_sha = ?, plan_sha = ?, phase = 'VERIFYING',
+                        branch = ?, worktree = ?, plan_path = ?,
+                        worker_session_id = 'worker-session',
+                        worker_result = ?
+                    WHERE repo = ?
+                    """,
+                    (
+                        plan_sha,
+                        plan_sha,
+                        branch,
+                        str(worktree),
+                        plan.relative_to(repo).as_posix(),
+                        worker_result(),
+                        str(repo),
+                    ),
+                )
+
+            (worktree / "src/app.py").write_text(
+                "VALUE = 'worker'\n",
+                encoding="utf-8",
+            )
+            (repo / "src/app.py").write_text(
+                "VALUE = 'base'\n",
+                encoding="utf-8",
+            )
+            commit_and_push(repo, "Advance base with conflicting source")
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.verify", return_value=(True, "verify before rebase")
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as unexpected_agent:
+                first_result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            conflicted = connection.execute(
+                "SELECT phase, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(first_result, 1)
+            self.assertEqual(conflicted["phase"], "WORKING")
+            self.assertTrue(
+                conflicted["last_error"].startswith(
+                    loop_manager.REBASE_CONFLICT_PREFIX
+                )
+            )
+            self.assertTrue(
+                loop_manager._rebase_in_progress_for_branch(worktree, branch)
+            )
+            self.assertEqual(git_command(worktree, "branch", "--show-current"), "")
+            unexpected_agent.assert_not_called()
+
+            sessions = []
+
+            def resolve_conflict(
+                agent_worktree, _state, _config, role_name, _prompt, **kwargs
+            ):
+                self.assertEqual(role_name, "worker")
+                sessions.append(kwargs["session_id"])
+                (agent_worktree / "src/app.py").write_text(
+                    "VALUE = 'resolved'\n",
+                    encoding="utf-8",
+                )
+                return loop_manager.CodexResult(
+                    0,
+                    worker_result(),
+                    "worker-session",
+                )
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.verify",
+                return_value=(False, "stop after rebase resolution"),
+            ), mock.patch(
+                "loop_manager.run_codex", side_effect=resolve_conflict
+            ):
+                resumed_result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            resumed = connection.execute(
+                "SELECT phase, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(resumed_result, 1)
+            self.assertEqual(sessions, ["worker-session"])
+            self.assertEqual(resumed["phase"], "WORKING")
+            self.assertEqual(
+                resumed["last_error"],
+                "전체 검증 실패:\nstop after rebase resolution",
+            )
+            self.assertFalse(
+                loop_manager._rebase_in_progress_for_branch(worktree, branch)
+            )
+            self.assertEqual(
+                git_command(worktree, "branch", "--show-current"),
+                branch,
+            )
+            self.assertEqual(
+                (worktree / "src/app.py").read_text(encoding="utf-8"),
+                "VALUE = 'resolved'\n",
+            )
+
 
     def test_missing_worktree_and_branch_blocks_without_recreation(self):
         with tempfile.TemporaryDirectory() as directory:
