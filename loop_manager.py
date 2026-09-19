@@ -1468,6 +1468,7 @@ def make_worktree(repo: Path, worktree: Path, branch: str, base: str) -> None:
     if worktree.is_dir():
         return
     worktree.parent.mkdir(parents=True, exist_ok=True)
+    git(repo, "worktree", "prune", "--expire", "now")
     branch_exists = git(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}", check=False).returncode == 0
     if branch_exists:
         git(repo, "worktree", "add", str(worktree), branch)
@@ -1812,7 +1813,7 @@ def _blocked_execplan_metadata_error(
     path = str(plan["path"])
     try:
         current = _parse_execplan(worktree, worktree / path)
-    except RuntimeError as error:
+    except (OSError, RuntimeError) as error:
         return f"BLOCKED ExecPlan을 다시 검증할 수 없습니다: {error}"
 
     plan_sha = str(plan["plan_sha"] or "")
@@ -1919,6 +1920,26 @@ def resume_blocked_execplan_if_inputs_changed(
         return False
     stored = str(plan["blocked_fingerprint"])
     worktree = Path(str(plan["worktree"]))
+    if not worktree.is_dir():
+        branch = str(plan["branch"] or "")
+        branch_exists = bool(branch) and git(
+            repo_path,
+            "show-ref",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{branch}",
+            check=False,
+        ).returncode == 0
+        if not branch_exists:
+            error = "BLOCKED worktree를 복구할 로컬 branch가 없습니다."
+            _update_blocked_error(connection, repo, str(plan["plan_id"]), error)
+            return False
+        try:
+            make_worktree(repo_path, worktree, branch, base)
+        except RuntimeError as error:
+            message = f"BLOCKED worktree 복구 실패:\n{error}"
+            _update_blocked_error(connection, repo, str(plan["plan_id"]), message)
+            return False
     worktree_changed = (
         worktree.is_dir()
         and _worktree_execplan_input_fingerprint(worktree, plan) != stored
@@ -2599,6 +2620,18 @@ def run_project(
             row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
 
     if not row["phase"]:
+        git(repo_path, "fetch", "origin")
+        latest_selection_sha = git(
+            repo_path, "rev-parse", f"origin/{base}"
+        ).stdout.strip()
+        latest_selection_fingerprint = planning_input_fingerprint(repo_path, base)
+        if latest_selection_fingerprint != current_fingerprint:
+            operation_print(
+                "계획 중 입력이 변경되어 READY Worker보다 재계획을 우선합니다.",
+                file=sys.stderr,
+            )
+            return 1
+        base_sha = latest_selection_sha
         selected = activate_ready_execplan(connection, repo, state_dir, base_sha)
         if selected is None:
             operation_print("실행 가능한 READY ExecPlan이 없습니다.")
