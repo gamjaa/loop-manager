@@ -1924,8 +1924,12 @@ _DURATION_NOISE = re.compile(
     r"(?i)\b(?:in|after|elapsed[:=]?)\s+\d+(?:[.,]\d+)?\s*(?:ms|s|sec|secs|seconds?)\b"
 )
 _TEMP_PATH_NOISE = re.compile(
-    r"(?i)(?<![\w])(?:[a-z]:[\\/][^\r\n]*?[\\/]temp|/(?:private/)?(?:var/)?tmp)"
-    r"[\\/][^\s:]+"
+    r"(?i)(?<![\w])"
+    r"(?P<root>[a-z]:[\\/][^\r\n]*?[\\/]temp|/(?:private/)?(?:var/)?tmp)"
+    r"(?P<tail>[\\/][^\s:]+)"
+)
+_GENERATED_TEMP_COMPONENT = re.compile(
+    r"(?i)^(?:tmp[._a-z0-9-]*|pytest(?:[-_].*)?)$"
 )
 
 
@@ -1953,6 +1957,17 @@ def _normalize_review_issue_ids(output: str) -> str:
         return "REVIEW_PROTOCOL_ERROR:INVALID_ISSUE_ID"
     identifiers = set(raw_identifiers)
     return "\n".join(f"ISSUE_ID:{identifier}" for identifier in sorted(identifiers))
+
+
+def _normalize_temp_path(match: re.Match[str]) -> str:
+    tail = match.group("tail").strip("\\/")
+    components = [part for part in re.split(r"[\\/]", tail) if part]
+    leaf = components[-1]
+    if _GENERATED_TEMP_COMPONENT.fullmatch(leaf):
+        return "<TEMP_PATH>"
+    if len(components) > 1 or "." in leaf:
+        return f"<TEMP_PATH>/{leaf}"
+    return "<TEMP_PATH>"
 
 
 def normalize_validation_failure(
@@ -1984,13 +1999,7 @@ def normalize_validation_failure(
                     normalized,
                     flags=re.IGNORECASE,
                 )
-    normalized = _TEMP_PATH_NOISE.sub(
-        lambda match: (
-            "<TEMP_PATH>/"
-            + re.split(r"[\\/]", match.group(0).rstrip("\\/"))[-1]
-        ),
-        normalized,
-    )
+    normalized = _TEMP_PATH_NOISE.sub(_normalize_temp_path, normalized)
     normalized = _TIMESTAMP_NOISE.sub("<TIMESTAMP>", normalized)
     normalized = _DURATION_NOISE.sub("<DURATION>", normalized)
     if stage == "review":
@@ -5848,7 +5857,7 @@ AGENTS.md와 {plan_path}를 읽고 해당 ExecPlan 하나만 구현하라.
 docs/plans에 새 ExecPlan을 만들지 말고 불필요한 후속 기능도 구현하지 마라.
 구현과 관련 unit test를 작성하거나 갱신한 뒤, 수정한 코드와 새로 작성하거나 변경한 테스트를 직접 검증하는 최소 범위의 targeted unit test만 실행하라. 개별 test case, test class, test module 또는 이에 준하는 좁은 단위만 허용된다.
 targeted unit test가 실패하면 같은 세션에서 원인을 수정하고 같은 targeted test를 다시 실행하라. 문서·설정 전용 변경이거나 실행 가능한 관련 unit test가 없으면 테스트 범위를 확대하지 말고, 실행하지 못한 구체적인 사유를 최종 결과에 남겨라.
-실패 이력을 보고할 때는 수정 후 동일 test의 재실행 명령과 실패가 없는 최종 결과를 별도의 `RERUN:` 구간으로 명시하라. 하나의 실행에서 성공·실패가 섞인 요약은 통과로 보고하지 마라.
+실패 이력을 보고할 때는 실패한 명령만 적은 `FAILED_COMMAND:` 줄과 수정 후 동일 명령만 적은 `RERUN:` 줄을 각각 두고, 재실행의 실패가 없는 최종 결과를 그 뒤에 명시하라. 두 명령은 공백을 정규화한 뒤 정확히 같아야 하며 하나의 실행에서 성공·실패가 섞인 요약은 통과로 보고하지 마라.
 전체 test suite, integration test, end-to-end test, 프로젝트 전체 lint·build·type check 및 scripts/verify 실행은 절대 실행하지 마라. 전체 verify는 Worker 종료 뒤 Loop Manager가 실행하며, 실패한 경우에만 이 세션으로 진단을 전달한다.
 작업이 완료되면 최종 응답 마지막에 아래 형식을 정확히 포함하라. 제목과 Summary는 최종 diff 전체를 설명해야 하며 ExecPlan 제목이나 일반적인 변경 문구를 쓰지 마라:
 COMMIT_TITLE: 한 줄의 구체적인 변경 제목
@@ -5868,14 +5877,21 @@ _TARGETED_TEST_FAILURE = re.compile(
 _TARGETED_TEST_SUCCESS = re.compile(
     r"(?i)(?<![\w])(?:PASS(?:ED)?|SUCCESS|OK|성공|통과)(?![\w])"
 )
-_TARGETED_TEST_RERUN = re.compile(
-    r"(?i)(?<![\w])(?:RE[- ]?RUN|RETRY|재실행)(?![\w])"
+_TARGETED_TEST_COMMAND = re.compile(
+    r"(?mi)^[ \t]*(?:[-*][ \t]+)?"
+    r"(?P<label>FAILED_COMMAND|RERUN):[ \t]*(?P<command>\S.*?)?[ \t]*$"
 )
 
 
 def _targeted_test_failure_matches(evidence: str) -> list[re.Match[str]]:
     failures = []
+    command_spans = [
+        (match.start(), match.end())
+        for match in _TARGETED_TEST_COMMAND.finditer(evidence)
+    ]
     for match in _TARGETED_TEST_FAILURE.finditer(evidence):
+        if any(start <= match.start() < end for start, end in command_spans):
+            continue
         prefix = evidence[max(0, match.start() - 32):match.start()]
         count = re.search(
             r"(?i)(?<![\w])(\d+)(?:\s+(?:tests?|cases?))?\s*$",
@@ -5890,14 +5906,54 @@ def _targeted_test_failure_matches(evidence: str) -> list[re.Match[str]]:
 
 
 def _has_unresolved_targeted_test_failure(evidence: str) -> bool:
+    commands = list(_TARGETED_TEST_COMMAND.finditer(evidence))
     failures = _targeted_test_failure_matches(evidence)
     if not failures:
-        return False
-    tail = evidence[failures[-1].end():]
-    rerun = _TARGETED_TEST_RERUN.search(tail)
-    if rerun is None:
+        return bool(commands)
+    recovery_rerun = None
+
+    for index, failure in enumerate(failures):
+        prior_commands = [
+            match
+            for match in commands
+            if match.end() <= failure.start()
+        ]
+        if not prior_commands:
+            return True
+        failed_run = prior_commands[-1]
+        if (
+            index == 0
+            and failed_run.group("label").upper() != "FAILED_COMMAND"
+        ):
+            return True
+        failed_command = " ".join(
+            (failed_run.group("command") or "").split()
+        )
+        if not failed_command:
+            return True
+
+        subsequent_commands = [
+            match
+            for match in commands
+            if match.start() >= failure.end()
+        ]
+        if not subsequent_commands:
+            return True
+        rerun = subsequent_commands[0]
+        rerun_command = " ".join((rerun.group("command") or "").split())
+        if (
+            rerun.group("label").upper() != "RERUN"
+            or rerun_command != failed_command
+        ):
+            return True
+        recovery_rerun = rerun
+
+    if recovery_rerun is None:
         return True
-    return _TARGETED_TEST_SUCCESS.search(tail, rerun.end()) is None
+    return (
+        _TARGETED_TEST_SUCCESS.search(evidence, recovery_rerun.end())
+        is None
+    )
 
 
 def parse_worker_result(message: str, plan: dict[str, object]) -> WorkerPublication:

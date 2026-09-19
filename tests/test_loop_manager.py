@@ -2727,6 +2727,8 @@ risk: medium
         self.assertIn("ISSUE_ID: relative/path::stable-symbol-or-test::category-slug", reviewer)
         self.assertIn("이전과 정확히 같은 ID", reviewer)
         self.assertIn("RERUN:", worker)
+        self.assertIn("FAILED_COMMAND:", worker)
+        self.assertIn("공백을 정규화한 뒤 정확히 같아야", worker)
         self.assertIn("성공·실패가 섞인 요약", worker)
         self.assertIn("COMMIT_TITLE:", worker)
         self.assertIn("PR_SUMMARY:", worker)
@@ -3090,6 +3092,12 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         different_temp_file, _ = loop_manager.validation_failure_fingerprint(
             "verify", "FAIL /tmp/run-three/test_other.py:42"
         )
+        temp_directory_first, _ = loop_manager.validation_failure_fingerprint(
+            "verify", "workspace cleanup failed: /tmp/tmpABC"
+        )
+        temp_directory_second, _ = loop_manager.validation_failure_fingerprint(
+            "verify", "workspace cleanup failed: /tmp/tmpXYZ"
+        )
 
         self.assertEqual(first_normalized, second_normalized)
         self.assertEqual(first_fingerprint, second_fingerprint)
@@ -3097,6 +3105,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         self.assertNotEqual(first_fingerprint, review_fingerprint)
         self.assertEqual(same_temp_first, same_temp_second)
         self.assertNotEqual(same_temp_first, different_temp_file)
+        self.assertEqual(temp_directory_first, temp_directory_second)
 
     def test_review_fingerprints_use_stable_issue_ids_not_explanatory_prose(self):
         first = "\n".join(
@@ -3711,11 +3720,15 @@ class WorkerPublicationTest(unittest.TestCase):
             worker_result(
                 "Record resolved test evidence",
                 "Records a corrected targeted test.",
-                "first run: FAIL\nrerun: PASS",
+                "FAILED_COMMAND: python3 -m unittest tests.test_one\n"
+                "first run: FAIL\n"
+                "RERUN: python3 -m unittest tests.test_one\nPASS",
             ),
             self.plan,
         )
-        self.assertIn("rerun: PASS", resolved.test_evidence)
+        self.assertIn(
+            "RERUN: python3 -m unittest tests.test_one", resolved.test_evidence
+        )
         invalid_results = (
             worker_result("", "Summary", "test: PASS"),
             worker_result(
@@ -3745,8 +3758,9 @@ class WorkerPublicationTest(unittest.TestCase):
         valid_evidence = (
             "pytest: 0 failed, 2 passed",
             (
+                "FAILED_COMMAND: python3  -m unittest tests.test_case\n"
                 "first run: 1 failed, 2 passed\n"
-                "RERUN: python3 -m unittest tests.test_case\n3 passed"
+                "RERUN: python3 -m  unittest tests.test_case\n3 passed"
             ),
         )
         for evidence in valid_evidence:
@@ -3764,6 +3778,11 @@ class WorkerPublicationTest(unittest.TestCase):
             "unittest: 1 error, 2 passed",
             "RERUN: pytest: 1 failed, 2 passed",
             "targeted test: FAIL\nunable to run the rerun",
+            (
+                "FAILED_COMMAND: python3 -m unittest tests.test_a\n"
+                "test_a: FAIL\n"
+                "RERUN: python3 -m unittest tests.test_b\nPASS"
+            ),
         )
         for evidence in invalid_evidence:
             with self.subTest(evidence=evidence):
