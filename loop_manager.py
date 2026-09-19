@@ -11,6 +11,7 @@ import difflib
 import errno
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 import hashlib
 import json
 import os
@@ -22,11 +23,21 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 from urllib.parse import quote
 
 
 ROOT = Path(__file__).resolve().parent
 MAX_PLANNER_VALIDATION_RETRIES = 3
+MAX_VALIDATION_FINGERPRINT_REPEATS = 3
+MAX_TRANSIENT_AGENT_RETRIES = 3
+AGENT_CLI_TIMEOUT_SECONDS = 3600
+PROJECT_STEP_RETRY = 2
+PROJECT_STEP_TRANSIENT_PAUSE = 3
+PROJECT_STEP_USAGE_PAUSE = 4
+PROJECT_STEP_PLANNING_PENDING = 5
+TRANSIENT_AGENT_ERROR_PREFIX = "일시적 Agent 실패 (상태 보존):"
+USAGE_LIMIT_ERROR_PREFIX = "AI 사용 한도 소진 (상태 보존):"
 PLAN_SHA_BACKFILL_ERROR = "계획 commit SHA를 기존 작업에서 안전하게 복구할 수 없습니다."
 WORKSPACE_UNOWNED = 0
 WORKSPACE_OWNED = 1
@@ -46,8 +57,10 @@ FIELDS = {
     "planning_retry_count",
     "planner_session_id",
     "worker_session_id",
+    "reviewer_session_id",
     "worker_result",
     "verify_result",
+    "review_result",
     "planning_validation_error",
     "planning_result_pending_validation",
     "planning_result_completed",
@@ -83,8 +96,10 @@ CREATE TABLE IF NOT EXISTS projects (
     planning_retry_count INTEGER NOT NULL DEFAULT 0,
     planner_session_id TEXT,
     worker_session_id TEXT,
+    reviewer_session_id TEXT,
     worker_result TEXT,
     verify_result TEXT,
+    review_result TEXT,
     planning_validation_error TEXT,
     planning_result_pending_validation INTEGER NOT NULL DEFAULT 0,
     planning_result_completed INTEGER NOT NULL DEFAULT 0,
@@ -145,8 +160,12 @@ CREATE TABLE IF NOT EXISTS exec_plans (
     blocked_worktree_fingerprint TEXT,
     retry_count INTEGER NOT NULL DEFAULT 0,
     worker_session_id TEXT,
+    reviewer_session_id TEXT,
     worker_result TEXT,
     verify_result TEXT,
+    review_result TEXT,
+    verify_failure_history TEXT NOT NULL DEFAULT '{}',
+    review_failure_history TEXT NOT NULL DEFAULT '{}',
     workspace_owned INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (repo, plan_id),
     UNIQUE (repo, path),
@@ -161,15 +180,51 @@ WHERE status IN ('IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING', 'PR_OPE
 """
 
 
+class AgentResultKind(str, Enum):
+    SUCCESS = "success"
+    TRANSIENT_FAILURE = "transient_failure"
+    USAGE_LIMIT = "usage_limit"
+    PERMANENT_CONFIGURATION = "permanent_configuration"
+
+
+class ProjectRunKind(str, Enum):
+    COMPLETED = "completed"
+    WAITING = "waiting"
+    BLOCKED = "blocked"
+    TRANSIENT_PAUSE = "transient_pause"
+    USAGE_LIMIT_PAUSE = "usage_limit_pause"
+    OPERATIONAL_ERROR = "operational_error"
+
+
+@dataclass(frozen=True)
+class ProjectRunResult:
+    kind: ProjectRunKind
+    exit_code: int
+    detail: str | None = None
+
+
 @dataclass(frozen=True)
 class CodexResult:
     code: int
     message: str
     session_id: str | None = None
+    kind: AgentResultKind | None = None
 
     def __iter__(self):
         # Keep two-value unpacking compatible with callers that do not manage sessions.
         return iter((self.code, self.message))
+
+    @property
+    def result_kind(self) -> AgentResultKind:
+        return self.kind or classify_agent_result(self.code, self.message)
+
+
+@dataclass(frozen=True)
+class ValidationFailureDecision:
+    stage: str
+    fingerprint: str
+    occurrences: int
+    blocked: bool
 
 
 @dataclass(frozen=True)
@@ -323,8 +378,135 @@ class WorkerResultError(RuntimeError):
     """A Worker final response cannot safely be published."""
 
 
+class ReviewerProtocolError(RuntimeError):
+    """A failed Reviewer response does not identify actionable issues."""
+
+
 class ProcessLockBusyError(RuntimeError):
     """The single Loop Manager process lock is already held."""
+
+
+def classify_agent_result(code: int, message: str) -> AgentResultKind:
+    """Classify an Agent CLI result without another Agent call."""
+
+    if code == 0:
+        return AgentResultKind.SUCCESS
+    normalized = " ".join(message.casefold().split())
+    if any(
+        phrase in normalized
+        for phrase in (
+            "usage limit",
+            "usage cap",
+            "quota exceeded",
+            "insufficient_quota",
+            "credit balance",
+        )
+    ):
+        return AgentResultKind.USAGE_LIMIT
+    if any(
+        phrase in normalized
+        for phrase in (
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "service unavailable",
+            "connection reset",
+            "connection refused",
+            "network error",
+            "dns error",
+            "gateway timeout",
+            "internal server error",
+            "try again later",
+            "http 429",
+            "http 500",
+            "http 502",
+            "http 503",
+            "http 504",
+            "too many requests",
+        )
+    ):
+        return AgentResultKind.TRANSIENT_FAILURE
+    return AgentResultKind.PERMANENT_CONFIGURATION
+
+
+def session_resume_unavailable(message: str) -> bool:
+    normalized = " ".join(message.casefold().split())
+    return bool(
+        re.search(
+            r"(?:session|thread|rollout).{0,80}(?:not found|does not exist|expired)",
+            normalized,
+        )
+    ) or any(
+        phrase in normalized
+        for phrase in (
+            "unknown session",
+            "unknown thread",
+            "cannot resume",
+            "could not resume",
+            "unable to resume",
+        )
+    )
+
+
+def _coerce_codex_result(
+    result: tuple[int, str] | CodexResult,
+    session_id: str | None,
+) -> CodexResult:
+    if isinstance(result, CodexResult):
+        return result
+    code, message = result
+    return CodexResult(code, message, session_id)
+
+
+def run_agent_with_retries(
+    invoke: Callable[[str | None, bool], tuple[int, str] | CodexResult],
+    *,
+    session_id: str | None,
+) -> CodexResult:
+    """Retry transient CLI failures and replace an unavailable saved session once."""
+
+    active_session_id = session_id
+    transient_retries = 0
+    session_fallback = False
+    while True:
+        try:
+            raw_result = invoke(active_session_id, session_fallback)
+            result = _coerce_codex_result(raw_result, active_session_id)
+        except subprocess.TimeoutExpired as error:
+            result = CodexResult(
+                1,
+                f"Agent CLI timeout: {error}",
+                active_session_id,
+                AgentResultKind.TRANSIENT_FAILURE,
+            )
+        except OSError as error:
+            result = CodexResult(
+                1,
+                f"Agent CLI 실행 실패: {error}",
+                active_session_id,
+                AgentResultKind.TRANSIENT_FAILURE,
+            )
+
+        if result.session_id:
+            active_session_id = result.session_id
+        if result.result_kind is AgentResultKind.SUCCESS:
+            return result
+        if (
+            result.result_kind is not AgentResultKind.USAGE_LIMIT
+            and active_session_id is not None
+            and not session_fallback
+            and session_resume_unavailable(result.message)
+        ):
+            active_session_id = None
+            session_fallback = True
+            continue
+        if (
+            result.result_kind is AgentResultKind.TRANSIENT_FAILURE
+            and transient_retries < MAX_TRANSIENT_AGENT_RETRIES
+        ):
+            transient_retries += 1
+            continue
+        return result
 
 
 def local_now() -> datetime:
@@ -420,6 +602,17 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
             "ALTER TABLE exec_plans ADD COLUMN workspace_owned "
             "INTEGER NOT NULL DEFAULT 0"
         )
+    migrations = {
+        "reviewer_session_id": "TEXT",
+        "review_result": "TEXT",
+        "verify_failure_history": "TEXT NOT NULL DEFAULT '{}'",
+        "review_failure_history": "TEXT NOT NULL DEFAULT '{}'",
+    }
+    for column, definition in migrations.items():
+        if column not in columns:
+            connection.execute(
+                f"ALTER TABLE exec_plans ADD COLUMN {column} {definition}"
+            )
     connection.execute(EXEC_PLANS_ACTIVE_INDEX)
 
 
@@ -450,8 +643,10 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
         "planner_session_id": "TEXT",
         "plan_sha": "TEXT",
         "worker_session_id": "TEXT",
+        "reviewer_session_id": "TEXT",
         "worker_result": "TEXT",
         "verify_result": "TEXT",
+        "review_result": "TEXT",
         "planning_validation_error": "TEXT",
         "planning_result_pending_validation": "INTEGER NOT NULL DEFAULT 0",
         "planning_result_completed": "INTEGER NOT NULL DEFAULT 0",
@@ -1269,7 +1464,8 @@ def activate_ready_execplan(
             UPDATE projects
             SET active_sha = ?, plan_sha = ?, phase = 'WORKING', branch = ?,
                 worktree = ?, plan_path = ?, pr_url = NULL, last_error = NULL,
-                worker_session_id = NULL, worker_result = NULL, verify_result = NULL
+                worker_session_id = NULL, reviewer_session_id = NULL,
+                worker_result = NULL, verify_result = NULL, review_result = NULL
             WHERE repo = ?
             """,
             (
@@ -1299,7 +1495,8 @@ def hydrate_active_project(connection: sqlite3.Connection, repo: str) -> None:
         UPDATE projects
         SET active_sha = ?, plan_sha = ?, phase = ?, branch = ?, worktree = ?,
             plan_path = ?, pr_url = ?, last_error = ?, worker_session_id = ?,
-            worker_result = ?, verify_result = ?
+            reviewer_session_id = ?, worker_result = ?, verify_result = ?,
+            review_result = ?
         WHERE repo = ?
         """,
         (
@@ -1312,8 +1509,10 @@ def hydrate_active_project(connection: sqlite3.Connection, repo: str) -> None:
             plan["pr_url"],
             plan["last_error"],
             plan["worker_session_id"],
+            plan["reviewer_session_id"],
             plan["worker_result"],
             plan["verify_result"],
+            plan["review_result"],
             repo,
         ),
     )
@@ -1343,8 +1542,10 @@ def _mirror_project_update_to_execplan(
         "pr_url",
         "last_error",
         "worker_session_id",
+        "reviewer_session_id",
         "worker_result",
         "verify_result",
+        "review_result",
     ):
         if field in values:
             translated[field] = values[field]
@@ -1593,6 +1794,7 @@ def run_codex(
             "-",
         ]
     resolved_session_id = session_id
+    timeout_triggered = threading.Event()
     if persist_session and not session_id:
         with log.open("w", encoding="utf-8") as output:
             process = subprocess.Popen(
@@ -1608,6 +1810,20 @@ def run_codex(
             )
             assert process.stdin is not None
             assert process.stdout is not None
+
+            def terminate_on_timeout() -> None:
+                timeout_triggered.set()
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+
+            timeout = threading.Timer(
+                AGENT_CLI_TIMEOUT_SECONDS,
+                terminate_on_timeout,
+            )
+            timeout.daemon = True
+            timeout.start()
             try:
                 process.stdin.write(prompt)
                 process.stdin.close()
@@ -1635,6 +1851,7 @@ def run_codex(
                 process.wait()
                 raise
             finally:
+                timeout.cancel()
                 process.stdout.close()
     else:
         with log.open("w", encoding="utf-8") as output:
@@ -1648,9 +1865,12 @@ def run_codex(
                 stderr=subprocess.STDOUT,
                 env=agent_environment(),
                 cwd=worktree,
+                timeout=AGENT_CLI_TIMEOUT_SECONDS,
             )
         returncode = result.returncode
     message = last_message.read_text(encoding="utf-8") if last_message.is_file() else ""
+    if timeout_triggered.is_set():
+        message = f"Codex {role_name} 실행 timeout ({AGENT_CLI_TIMEOUT_SECONDS}초)"
     if returncode and not message:
         message = log.read_text(encoding="utf-8")[-6000:]
     if persist_session and not resolved_session_id:
@@ -1660,8 +1880,29 @@ def run_codex(
                 f"Codex {role_name} 실행 결과에서 세션 ID를 확인할 수 없습니다.",
             )
     if persist_session or session_id:
-        return CodexResult(returncode, message.strip(), resolved_session_id)
+        return CodexResult(
+            returncode,
+            message.strip(),
+            resolved_session_id,
+            (
+                AgentResultKind.TRANSIENT_FAILURE
+                if timeout_triggered.is_set()
+                else None
+            ),
+        )
     return returncode, message.strip()
+
+
+class VerifyOutput(str):
+    """Bounded persisted feedback that retains full output for fingerprinting."""
+
+    fingerprint_source: str
+
+    def __new__(cls, output: str) -> VerifyOutput:
+        fingerprint_source = output.strip()
+        instance = super().__new__(cls, fingerprint_source[-8000:])
+        instance.fingerprint_source = fingerprint_source
+        return instance
 
 
 def verify(worktree: Path) -> tuple[bool, str]:
@@ -1675,7 +1916,241 @@ def verify(worktree: Path) -> tuple[bool, str]:
     if not script.is_file():
         return False, f"전체 검증 스크립트가 없습니다: {script.relative_to(worktree)}"
     result = command(arguments, cwd=worktree, check=False)
-    return result.returncode == 0, result.stdout[-8000:].strip()
+    return result.returncode == 0, VerifyOutput(result.stdout)
+
+
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_TIMESTAMP_NOISE = re.compile(
+    r"(?ix)"
+    r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b"
+    r"|\b\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\b"
+)
+_DURATION_NOISE = re.compile(
+    r"(?i)\b(?:in|after|elapsed[:=]?)\s+\d+(?:[.,]\d+)?\s*(?:ms|s|sec|secs|seconds?)\b"
+)
+_TEMP_PATH_NOISE = re.compile(
+    r"(?i)(?<![\w])"
+    r"(?P<root>[a-z]:[\\/][^\r\n]*?[\\/]temp|/(?:private/)?(?:var/)?tmp)"
+    r"(?P<tail>[\\/][^\s:]+)"
+)
+_TEMP_DIRECTORY_CONTEXT = re.compile(
+    r"(?i)(?:\b(?:temporary\s+directory|directory|workspace|worktree)\b"
+    r"|디렉터리|작업\s*공간)"
+)
+
+
+_REVIEW_ISSUE_ID = re.compile(
+    r"(?mi)^[ \t]*ISSUE_ID:[ \t]*(?P<identifier>[^\r\n]+?)[ \t]*$"
+)
+_REVIEW_ISSUE_DECLARATION = re.compile(r"(?i)^[ \t]*ISSUE_ID\b")
+_REVIEW_ISSUE_IDENTIFIER = re.compile(
+    r"(?i)^(?!/)(?!.*(?:^|/)\.\.(?:/|$))"
+    r"[a-z0-9_.\-/]+::[a-z0-9_.<>/-]+::[a-z0-9][a-z0-9-]*$"
+)
+_REVIEW_VERDICT_DECLARATION = re.compile(r"(?i)^[ \t]*VERDICT\b")
+_REVIEW_VERDICT = re.compile(r"(?i)^[ \t]*VERDICT:[ \t]*(PASS|FAIL)[ \t]*$")
+
+
+def _normalize_review_issue_ids(output: str) -> tuple[str, ...]:
+    output = output.replace("\r\n", "\n").replace("\r", "\n")
+    declarations = [
+        line
+        for line in output.splitlines()
+        if _REVIEW_ISSUE_DECLARATION.match(line)
+    ]
+    if not declarations:
+        raise ReviewerProtocolError(
+            "Reviewer FAIL 결과에 유효한 ISSUE_ID가 없습니다."
+        )
+    matches = list(_REVIEW_ISSUE_ID.finditer(output))
+    if len(matches) != len(declarations):
+        raise ReviewerProtocolError(
+            "Reviewer FAIL 결과의 ISSUE_ID 형식이 유효하지 않습니다."
+        )
+    raw_identifiers = [
+        " ".join(match.group("identifier").split()).casefold()
+        for match in matches
+    ]
+    if any(
+        _REVIEW_ISSUE_IDENTIFIER.fullmatch(identifier) is None
+        for identifier in raw_identifiers
+    ):
+        raise ReviewerProtocolError(
+            "Reviewer FAIL 결과의 ISSUE_ID 형식이 유효하지 않습니다."
+        )
+    identifiers = set(raw_identifiers)
+    return tuple(f"ISSUE_ID:{identifier}" for identifier in sorted(identifiers))
+
+
+def parse_reviewer_result(output: str) -> tuple[str, tuple[str, ...]]:
+    """Validate the Reviewer response contract before any state transition."""
+
+    lines = output.replace("\r\n", "\n").replace("\r", "\n").splitlines()
+    meaningful_lines = [
+        (index, line)
+        for index, line in enumerate(lines)
+        if line.strip()
+    ]
+    verdict_lines = [
+        (index, line)
+        for index, line in meaningful_lines
+        if _REVIEW_VERDICT_DECLARATION.match(line)
+    ]
+    if len(verdict_lines) != 1:
+        raise ReviewerProtocolError(
+            "Reviewer 결과는 정확히 하나의 VERDICT를 포함해야 합니다."
+        )
+    verdict_index, verdict_line = verdict_lines[0]
+    verdict_match = _REVIEW_VERDICT.fullmatch(verdict_line)
+    if verdict_match is None:
+        raise ReviewerProtocolError(
+            "Reviewer VERDICT는 PASS 또는 FAIL이어야 합니다."
+        )
+    if verdict_index != meaningful_lines[-1][0]:
+        raise ReviewerProtocolError(
+            "Reviewer VERDICT는 마지막 비어 있지 않은 줄이어야 합니다."
+        )
+
+    verdict = verdict_match.group(1).upper()
+    issue_declarations = [
+        line
+        for _index, line in meaningful_lines
+        if _REVIEW_ISSUE_DECLARATION.match(line)
+    ]
+    if verdict == "PASS":
+        if issue_declarations:
+            raise ReviewerProtocolError(
+                "Reviewer PASS 결과에는 ISSUE_ID가 없어야 합니다."
+            )
+        return verdict, ()
+    return verdict, _normalize_review_issue_ids(output)
+
+
+def _normalize_temp_path(match: re.Match[str]) -> str:
+    tail = match.group("tail").strip("\\/")
+    components = [part for part in re.split(r"[\\/]", tail) if part]
+    leaf = components[-1]
+    line_start = match.string.rfind("\n", 0, match.start()) + 1
+    prefix = match.string[line_start:match.start()]
+    if len(components) == 1 and _TEMP_DIRECTORY_CONTEXT.search(prefix):
+        return "<TEMP_PATH>"
+    return f"<TEMP_PATH>/{leaf}"
+
+
+def normalize_validation_failure(
+    stage: str,
+    output: str,
+    worktree: Path | None = None,
+) -> str:
+    """Remove unstable execution noise and make failure line ordering irrelevant."""
+
+    if stage not in {"verify", "review"}:
+        raise ValueError(f"검증 실패 단계가 유효하지 않습니다: {stage}")
+    fingerprint_source = (
+        output.fingerprint_source if isinstance(output, VerifyOutput) else output
+    )
+    normalized = fingerprint_source.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = _ANSI_ESCAPE.sub("", normalized)
+    if worktree is not None:
+        path_values = {
+            str(worktree),
+            str(worktree.resolve()),
+            str(worktree).replace("\\", "/"),
+            str(worktree).replace("/", "\\"),
+        }
+        for path_value in sorted(path_values, key=len, reverse=True):
+            if path_value:
+                normalized = re.sub(
+                    re.escape(path_value),
+                    "<WORKTREE>",
+                    normalized,
+                    flags=re.IGNORECASE,
+                )
+    normalized = _TEMP_PATH_NOISE.sub(_normalize_temp_path, normalized)
+    normalized = _TIMESTAMP_NOISE.sub("<TIMESTAMP>", normalized)
+    normalized = _DURATION_NOISE.sub("<DURATION>", normalized)
+    if stage == "review":
+        return "\n".join(_normalize_review_issue_ids(normalized))
+    lines = []
+    for line in normalized.splitlines():
+        line = " ".join(line.split())
+        if not line:
+            continue
+        lines.append(line)
+    return "\n".join(sorted(lines))
+
+
+def validation_failure_fingerprints(
+    stage: str,
+    output: str,
+    worktree: Path | None = None,
+) -> tuple[tuple[str, str], ...]:
+    normalized = normalize_validation_failure(stage, output, worktree)
+    failures = normalized.splitlines() if stage == "review" else [normalized]
+    fingerprints = []
+    for failure in failures:
+        digest = hashlib.sha256()
+        digest.update(b"loop-manager-validation-failure-v1\0")
+        digest.update(stage.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(failure.encode("utf-8"))
+        fingerprints.append((digest.hexdigest(), failure))
+    return tuple(fingerprints)
+
+
+def validation_failure_fingerprint(
+    stage: str,
+    output: str,
+    worktree: Path | None = None,
+) -> tuple[str, str]:
+    fingerprints = validation_failure_fingerprints(stage, output, worktree)
+    if len(fingerprints) != 1:
+        raise ValueError(
+            "복수 Review issue는 validation_failure_fingerprints()로 처리해야 합니다."
+        )
+    return fingerprints[0]
+
+
+def _deserialize_failure_history(value: object) -> dict[str, dict[str, object]]:
+    if value in {None, ""}:
+        return {}
+    parsed = json.loads(str(value))
+    if not isinstance(parsed, dict):
+        raise RuntimeError("저장된 검증 실패 지문 이력이 유효하지 않습니다.")
+    history: dict[str, dict[str, object]] = {}
+    for fingerprint, record in parsed.items():
+        if not isinstance(fingerprint, str) or not isinstance(record, dict):
+            raise RuntimeError("저장된 검증 실패 지문 이력이 유효하지 않습니다.")
+        occurrences = record.get("occurrences")
+        if type(occurrences) is not int or occurrences < 1:
+            raise RuntimeError("저장된 검증 실패 반복 횟수가 유효하지 않습니다.")
+        history[fingerprint] = {
+            "occurrences": occurrences,
+            "sample": str(record.get("sample", "")),
+        }
+    return history
+
+
+def clear_validation_failure_history(
+    connection: sqlite3.Connection,
+    repo: str,
+    stage: str,
+) -> None:
+    column = {
+        "verify": "verify_failure_history",
+        "review": "review_failure_history",
+    }.get(stage)
+    if column is None:
+        raise ValueError(f"검증 성공 단계가 유효하지 않습니다: {stage}")
+    plan = active_execplan(connection, repo)
+    if plan is None:
+        raise RuntimeError("지문 이력을 초기화할 활성 ExecPlan을 찾을 수 없습니다.")
+    with connection:
+        connection.execute(
+            f"UPDATE exec_plans SET {column} = '{{}}' "
+            "WHERE repo = ? AND plan_id = ?",
+            (repo, plan["plan_id"]),
+        )
 
 
 def pr_for_branch(repo: Path, branch: str, url: str | None = None) -> dict[str, object] | None:
@@ -3127,8 +3602,10 @@ def clear_planning_validation_state(
         planning_retry_count=0,
         planner_session_id=None,
         worker_session_id=None,
+        reviewer_session_id=None,
         worker_result=None,
         verify_result=None,
+        review_result=None,
         planning_validation_error=None,
         planning_result_pending_validation=0,
         planning_result_completed=0,
@@ -3166,8 +3643,10 @@ def _clear_active_values(
         "planning_retry_count": 0,
         "planner_session_id": None,
         "worker_session_id": None,
+        "reviewer_session_id": None,
         "worker_result": None,
         "verify_result": None,
+        "review_result": None,
         "planning_validation_error": None,
         "planning_result_pending_validation": 0,
         "planning_result_completed": 0,
@@ -3477,6 +3956,115 @@ def block_active_execplan(
             """,
             (error, verify_result, agent_result_snapshot, agent_result_plan, repo),
         )
+
+
+def transition_validation_failure(
+    connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+    stage: str,
+    output: str,
+) -> ValidationFailureDecision:
+    """Persist stage-local failures and own their retry/BLOCKED transition."""
+
+    columns = {
+        "verify": "verify_failure_history",
+        "review": "review_failure_history",
+    }
+    labels = {"verify": "전체 verify", "review": "Review"}
+    history_column = columns.get(stage)
+    if history_column is None:
+        raise ValueError(f"검증 실패 단계가 유효하지 않습니다: {stage}")
+    plan = active_execplan(connection, repo)
+    if plan is None:
+        raise RuntimeError("검증 실패를 기록할 활성 ExecPlan을 찾을 수 없습니다.")
+    failures = validation_failure_fingerprints(stage, output, worktree)
+    history = _deserialize_failure_history(plan[history_column])
+    recorded_failures = []
+    for fingerprint, normalized in failures:
+        previous = history.get(fingerprint, {"occurrences": 0})
+        occurrences = int(previous["occurrences"]) + 1
+        history[fingerprint] = {
+            "occurrences": occurrences,
+            "sample": normalized[-2000:],
+        }
+        recorded_failures.append((fingerprint, normalized, occurrences))
+    blocking_failure = next(
+        (
+            failure
+            for failure in recorded_failures
+            if failure[2] > MAX_VALIDATION_FINGERPRINT_REPEATS
+        ),
+        None,
+    )
+    fingerprint, normalized, occurrences = blocking_failure or max(
+        recorded_failures,
+        key=lambda failure: failure[2],
+    )
+    serialized_history = json.dumps(
+        history,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    blocked = blocking_failure is not None
+    if blocked:
+        error = (
+            f"{labels[stage]} 동일 실패가 Worker 수정 후 "
+            f"{MAX_VALIDATION_FINGERPRINT_REPEATS}회 다시 발생했습니다.\n"
+            f"실패 지문: {fingerprint}\n{output[-8000:]}"
+        )
+        blocked_input = _worktree_execplan_input_fingerprint(worktree, plan)
+    else:
+        prefix = "전체 검증 실패" if stage == "verify" else "Review 실패"
+        error = f"{prefix}:\n{output[-8000:]}"
+        blocked_input = None
+
+    execplan_assignments = [
+        f"{history_column} = ?",
+        "status = ?",
+        "last_error = ?",
+    ]
+    execplan_values: list[object] = [
+        serialized_history,
+        "BLOCKED" if blocked else "IMPLEMENTING",
+        error,
+    ]
+    project_assignments = ["phase = ?", "last_error = ?"]
+    project_values: list[object] = ["BLOCKED" if blocked else "WORKING", error]
+    if stage == "verify":
+        execplan_assignments.append("verify_result = ?")
+        execplan_values.append(output)
+        project_assignments.append("verify_result = ?")
+        project_values.append(output)
+    else:
+        execplan_assignments.append("review_result = ?")
+        execplan_values.append(output)
+        project_assignments.append("review_result = ?")
+        project_values.append(output)
+    if blocked:
+        execplan_assignments.extend(
+            ["blocked_fingerprint = ?", "blocked_worktree_fingerprint = ?"]
+        )
+        execplan_values.extend([blocked_input, blocked_input])
+        project_assignments.append("agent_manager_snapshot = NULL")
+
+    with connection:
+        connection.execute(
+            f"UPDATE exec_plans SET {', '.join(execplan_assignments)} "
+            "WHERE repo = ? AND plan_id = ?",
+            (*execplan_values, repo, plan["plan_id"]),
+        )
+        connection.execute(
+            f"UPDATE projects SET {', '.join(project_assignments)} WHERE repo = ?",
+            (*project_values, repo),
+        )
+    return ValidationFailureDecision(
+        stage,
+        fingerprint,
+        occurrences,
+        blocked,
+    )
 
 
 def block_active_execplan_from_revision(
@@ -5027,8 +5615,10 @@ def _requeue_blocked_execplan(
             UPDATE exec_plans
             SET status = 'READY', blocked_fingerprint = NULL,
                 blocked_worktree_fingerprint = NULL, retry_count = 0,
-                last_error = NULL, worker_session_id = NULL, worker_result = NULL,
-                verify_result = NULL
+                last_error = NULL, worker_session_id = NULL,
+                reviewer_session_id = NULL, worker_result = NULL,
+                verify_result = NULL, review_result = NULL,
+                verify_failure_history = '{}', review_failure_history = '{}'
             WHERE repo = ? AND plan_id = ?
             """,
             (repo, plan_id),
@@ -5287,7 +5877,6 @@ def complete_merged_worktree(
             assessment = assess_cleanup(worktree, pr_head_oid)
             assessment = remove_cleanup_worktree(repo_path, worktree, assessment)
     values = _clear_active_values()
-    assignments = ", ".join(f"{name} = ?" for name in values)
     with connection:
         _ensure_execplans_schema(connection)
         _ensure_cleanup_pending_schema(connection)
@@ -5311,6 +5900,15 @@ def complete_merged_worktree(
                 "UPDATE exec_plans SET status = 'MERGED', last_error = NULL WHERE repo = ? AND plan_id = ?",
                 (repo, plan_id),
             )
+        unfinished = connection.execute(
+            "SELECT 1 FROM exec_plans "
+            "WHERE repo = ? AND status != 'MERGED' LIMIT 1",
+            (repo,),
+        ).fetchone()
+        if unfinished is None:
+            values["processed_sha"] = None
+            values["planning_fingerprint"] = None
+        assignments = ", ".join(f"{name} = ?" for name in values)
         connection.execute(
             f"UPDATE projects SET {assignments} WHERE repo = ?",
             [*values.values(), repo],
@@ -5335,8 +5933,28 @@ catalog에서 현재 입력과 겹치는 비종료 계획만 필요할 때 전�
 """.strip()
 
 
-def worker_prompt(plan_path: str, error: str | None) -> str:
+def worker_prompt(
+    plan_path: str,
+    error: str | None,
+    previous_result: str | None = None,
+    validation_feedback: str | None = None,
+    *,
+    session_recovery: bool = False,
+) -> str:
     failure = f"\n이전 실행에서 다음 문제가 발생했다. 원인을 해결하라:\n{error[-6000:]}\n" if error else ""
+    saved_feedback = (
+        "\nSQLite에 보존된 전체 verify 또는 Review 실패 피드백:\n"
+        f"{validation_feedback[-6000:]}\n"
+        if validation_feedback
+        else ""
+    )
+    recovery = ""
+    if session_recovery:
+        recovery = (
+            "\n저장된 Worker 세션을 재개할 수 없어 새 세션에서 이어간다. "
+            "현재 worktree와 아래 이전 Worker 결과 및 실패 내용을 기준으로 계속하라:\n"
+            f"{(previous_result or '이전 Worker 결과 없음')[-6000:]}\n"
+        )
     return f"""
 당신은 Loop Manager의 Worker다.
 AGENTS.md와 {plan_path}를 읽고 해당 ExecPlan 하나만 구현하라.
@@ -5344,15 +5962,116 @@ AGENTS.md와 {plan_path}를 읽고 해당 ExecPlan 하나만 구현하라.
 docs/plans에 새 ExecPlan을 만들지 말고 불필요한 후속 기능도 구현하지 마라.
 구현과 관련 unit test를 작성하거나 갱신한 뒤, 수정한 코드와 새로 작성하거나 변경한 테스트를 직접 검증하는 최소 범위의 targeted unit test만 실행하라. 개별 test case, test class, test module 또는 이에 준하는 좁은 단위만 허용된다.
 targeted unit test가 실패하면 같은 세션에서 원인을 수정하고 같은 targeted test를 다시 실행하라. 문서·설정 전용 변경이거나 실행 가능한 관련 unit test가 없으면 테스트 범위를 확대하지 말고, 실행하지 못한 구체적인 사유를 최종 결과에 남겨라.
+실패 이력을 보고할 때는 실패한 명령만 적은 `FAILED_COMMAND:` 줄과 수정 후 동일 명령만 적은 `RERUN:` 줄을 각각 두고, 재실행의 실패가 없는 최종 결과를 그 뒤에 명시하라. 두 명령은 공백을 정규화한 뒤 정확히 같아야 하며 하나의 실행에서 성공·실패가 섞인 요약은 통과로 보고하지 마라.
 전체 test suite, integration test, end-to-end test, 프로젝트 전체 lint·build·type check 및 scripts/verify 실행은 절대 실행하지 마라. 전체 verify는 Worker 종료 뒤 Loop Manager가 실행하며, 실패한 경우에만 이 세션으로 진단을 전달한다.
 작업이 완료되면 최종 응답 마지막에 아래 형식을 정확히 포함하라. 제목과 Summary는 최종 diff 전체를 설명해야 하며 ExecPlan 제목이나 일반적인 변경 문구를 쓰지 마라:
 COMMIT_TITLE: 한 줄의 구체적인 변경 제목
 PR_SUMMARY: 실제 변경을 간결히 설명하는 Summary
 TARGETED_TESTS:
 실행한 최소 범위 targeted unit test와 결과, 또는 실행하지 못한 구체적인 사유
+{recovery}
+{saved_feedback}
 {failure}
 """.strip()
 
+
+
+_TARGETED_TEST_FAILURE = re.compile(
+    r"(?i)(?<![\w])(?:FAIL(?:ED|URES?)?|ERRORS?|실패)(?![\w])"
+)
+_TARGETED_TEST_EXCEPTION_FAILURE = re.compile(
+    r"(?m)(?<![\w])[A-Z][A-Za-z0-9_]*(?:Error|Exception)"
+    r"(?=[ \t]*(?::|발생|occurred\b|(?:was[ \t]+)?raised\b|$))"
+)
+_TARGETED_TEST_SUCCESS = re.compile(
+    r"(?i)(?<![\w])(?:PASS(?:ED)?|SUCCESS|OK|성공|통과)(?![\w])"
+)
+_TARGETED_TEST_COMMAND = re.compile(
+    r"(?mi)^[ \t]*(?:[-*][ \t]+)?"
+    r"(?P<label>FAILED_COMMAND|RERUN):[ \t]*(?P<command>\S.*?)?[ \t]*$"
+)
+
+
+def _targeted_test_failure_matches(evidence: str) -> list[re.Match[str]]:
+    failures = []
+    command_spans = [
+        (match.start(), match.end())
+        for match in _TARGETED_TEST_COMMAND.finditer(evidence)
+    ]
+    candidates = sorted(
+        (
+            *_TARGETED_TEST_FAILURE.finditer(evidence),
+            *_TARGETED_TEST_EXCEPTION_FAILURE.finditer(evidence),
+        ),
+        key=lambda match: (match.start(), match.end()),
+    )
+    for match in candidates:
+        if any(start <= match.start() < end for start, end in command_spans):
+            continue
+        prefix = evidence[max(0, match.start() - 32):match.start()]
+        count = re.search(
+            r"(?i)(?<![\w])(\d+)(?:\s+(?:tests?|cases?))?\s*$",
+            prefix,
+        )
+        if count is not None and int(count.group(1)) == 0:
+            continue
+        if re.search(r"(?i)\b(?:no|without)\s+$", prefix):
+            continue
+        failures.append(match)
+    return failures
+
+
+def _has_unresolved_targeted_test_failure(evidence: str) -> bool:
+    commands = list(_TARGETED_TEST_COMMAND.finditer(evidence))
+    failures = _targeted_test_failure_matches(evidence)
+    if not failures:
+        return bool(commands)
+    recovery_rerun = None
+
+    for index, failure in enumerate(failures):
+        prior_commands = [
+            match
+            for match in commands
+            if match.end() <= failure.start()
+        ]
+        if not prior_commands:
+            return True
+        failed_run = prior_commands[-1]
+        if (
+            index == 0
+            and failed_run.group("label").upper() != "FAILED_COMMAND"
+        ):
+            return True
+        failed_command = " ".join(
+            (failed_run.group("command") or "").split()
+        )
+        if not failed_command:
+            return True
+
+        subsequent_commands = [
+            match
+            for match in commands
+            if match.start() >= failure.end()
+        ]
+        if not subsequent_commands:
+            return True
+        rerun = subsequent_commands[0]
+        rerun_command = " ".join((rerun.group("command") or "").split())
+        if (
+            rerun.group("label").upper() != "RERUN"
+            or rerun_command != failed_command
+        ):
+            return True
+        recovery_rerun = rerun
+
+    if recovery_rerun is None:
+        return True
+    if commands[-1].start() != recovery_rerun.start():
+        return True
+    return (
+        _TARGETED_TEST_SUCCESS.search(evidence, recovery_rerun.end())
+        is None
+    )
 
 
 def parse_worker_result(message: str, plan: dict[str, object]) -> WorkerPublication:
@@ -5378,6 +6097,10 @@ def parse_worker_result(message: str, plan: dict[str, object]) -> WorkerPublicat
         raise WorkerResultError("Worker PR Summary가 비어 있습니다.")
     if not test_evidence:
         raise WorkerResultError("Worker targeted unit test 증거가 비어 있습니다.")
+    if _has_unresolved_targeted_test_failure(test_evidence):
+        raise WorkerResultError(
+            "Worker가 해결되지 않은 targeted unit test 실패를 보고했습니다."
+        )
 
     plan_id = str(plan["id"])
     plan_title = str(plan["title"])
@@ -5494,9 +6217,19 @@ def reviewer_prompt(
     base: str,
     worker_result: str | None = None,
     verify_result: str | None = None,
+    review_result: str | None = None,
+    *,
+    session_recovery: bool = False,
 ) -> str:
     worker_evidence = (worker_result or "Worker가 targeted unit test 결과 또는 미실행 사유를 보고하지 않았습니다.")[-6000:]
     verify_evidence = (verify_result or "Loop Manager 전체 verify가 성공했습니다(출력 없음).")[-6000:]
+    recovery = ""
+    if session_recovery:
+        recovery = (
+            "\n저장된 Reviewer 세션을 재개할 수 없어 새 세션에서 이어간다. "
+            "아래 이전 Review 결과를 포함해 현재 diff를 다시 검토하라:\n"
+            f"{(review_result or '이전 Review 결과 없음')[-6000:]}\n"
+        )
     return f"""
 origin/{base}와 현재 HEAD의 차이를 읽기 전용으로 검토하라.
 AGENTS.md, 근거 PRODUCT/Requirement, ARCHITECTURE와 ExecPlan을 기준으로 correctness, 회귀, 테스트 누락, verify 약화를 확인하라.
@@ -5505,14 +6238,17 @@ Worker가 보고한 targeted unit test 결과 또는 미실행 사유:
 
 Loop Manager가 실행한 전체 verify 결과:
 {verify_evidence}
-
+{recovery}
 테스트 command와 scripts/verify를 실행하지 말고, 코드·테스트·verify 스크립트의 diff 및 위 결과만으로 판단하라.
+blocking issue마다 설명 직전에 `ISSUE_ID: relative/path::stable-symbol-or-test::category-slug`를 한 줄로 기록하라.
+ISSUE_ID에는 줄 번호나 자연어 설명을 넣지 말고, 같은 issue가 재발하면 위치·표현이 바뀌어도 이전과 정확히 같은 ID를 사용하라.
+`VERDICT: FAIL`은 하나 이상의 ISSUE_ID가 있어야 하며, 서로 다른 issue는 서로 다른 ID를 사용하라.
 blocking issue가 있으면 간결히 설명하고 마지막 줄을 `VERDICT: FAIL`로 끝내라.
 blocking issue가 없으면 마지막 줄을 `VERDICT: PASS`로 끝내라. 파일은 수정하지 마라.
 """.strip()
 
 
-def run_project(
+def _run_project_step(
     connection: sqlite3.Connection,
     state_dir: Path,
     repo_arg: str,
@@ -5741,7 +6477,7 @@ def run_project(
                         f"({assessment.reason or assessment.status})",
                         file=sys.stderr,
                     )
-                return 0
+                return PROJECT_STEP_PLANNING_PENDING
             update_project(connection, repo, phase="BLOCKED", last_error="PR이 Merge 없이 닫혔습니다.")
             operation_print(f"닫힌 PR을 다시 열어야 합니다: {existing_pr['url']}", file=sys.stderr)
             return 1
@@ -6059,23 +6795,26 @@ def run_project(
                 planning_worktree,
                 "planner",
             )
-            result = run_codex(
-                planning_worktree,
-                state_dir,
-                config_path,
-                "planner",
-                planner_prompt(
-                    row["planning_validation_error"] or row["last_error"],
-                    compact_execplan_catalog(connection, repo),
+            result = run_agent_with_retries(
+                lambda current_session_id, _session_recovery: run_codex(
+                    planning_worktree,
+                    state_dir,
+                    config_path,
+                    "planner",
+                    planner_prompt(
+                        row["planning_validation_error"] or row["last_error"],
+                        compact_execplan_catalog(connection, repo),
+                    ),
+                    read_only=False,
+                    persist_session=True,
+                    session_id=current_session_id,
+                    on_session_started=lambda started_session_id: update_project(
+                        connection,
+                        repo,
+                        planner_session_id=started_session_id,
+                    ),
                 ),
-                read_only=False,
-                persist_session=True,
                 session_id=row["planner_session_id"],
-                on_session_started=lambda started_session_id: update_project(
-                    connection,
-                    repo,
-                    planner_session_id=started_session_id,
-                ),
             )
             code, message = result
             result_session_id = getattr(result, "session_id", None)
@@ -6107,15 +6846,24 @@ def run_project(
                 clear_agent_scope(connection, repo)
 
             if code:
+                agent_error = message or f"Planner 종료 코드 {code}"
+                if result.result_kind is AgentResultKind.TRANSIENT_FAILURE:
+                    agent_error = f"{TRANSIENT_AGENT_ERROR_PREFIX} {agent_error}"
+                    step_result = PROJECT_STEP_TRANSIENT_PAUSE
+                elif result.result_kind is AgentResultKind.USAGE_LIMIT:
+                    agent_error = f"{USAGE_LIMIT_ERROR_PREFIX} {agent_error}"
+                    step_result = PROJECT_STEP_USAGE_PAUSE
+                else:
+                    step_result = 1
                 update_project(
                     connection,
                     repo,
-                    last_error=message or f"Planner 종료 코드 {code}",
+                    last_error=agent_error,
                     planning_result_pending_validation=0,
                     planning_result_completed=0,
                 )
-                operation_print(message or "Planner 실행에 실패했습니다.", file=sys.stderr)
-                return 1
+                operation_print(agent_error, file=sys.stderr)
+                return step_result
             update_project(
                 connection,
                 repo,
@@ -6434,21 +7182,42 @@ def run_project(
                 worktree, catalog_plan
             ),
         )
-        result = run_codex(
-            worktree,
-            state_dir,
-            config_path,
-            "worker",
-            worker_prompt(row["plan_path"], row["last_error"]),
-            read_only=False,
-            level=level,
-            persist_session=True,
-            session_id=row["worker_session_id"],
-            on_session_started=lambda started_session_id: update_project(
-                connection,
-                repo,
-                worker_session_id=started_session_id,
+        persisted_validation_feedback = []
+        if _deserialize_failure_history(
+            catalog_plan["verify_failure_history"]
+        ):
+            persisted_validation_feedback.append(str(row["verify_result"] or ""))
+        if _deserialize_failure_history(
+            catalog_plan["review_failure_history"]
+        ):
+            persisted_validation_feedback.append(str(row["review_result"] or ""))
+        validation_feedback = "\n\n".join(
+            feedback for feedback in persisted_validation_feedback if feedback
+        )
+        result = run_agent_with_retries(
+            lambda current_session_id, session_recovery: run_codex(
+                worktree,
+                state_dir,
+                config_path,
+                "worker",
+                worker_prompt(
+                    row["plan_path"],
+                    row["last_error"],
+                    row["worker_result"],
+                    validation_feedback,
+                    session_recovery=session_recovery,
+                ),
+                read_only=False,
+                level=level,
+                persist_session=True,
+                session_id=current_session_id,
+                on_session_started=lambda started_session_id: update_project(
+                    connection,
+                    repo,
+                    worker_session_id=started_session_id,
+                ),
             ),
+            session_id=row["worker_session_id"],
         )
         code, message = result
         result_session_id = getattr(result, "session_id", None)
@@ -6483,11 +7252,19 @@ def run_project(
             worker_error = message or f"Codex 종료 코드 {code}"
             if resolving_rebase:
                 worker_error = REBASE_CONFLICT_PREFIX + worker_error
+            if result.result_kind is AgentResultKind.TRANSIENT_FAILURE:
+                worker_error = f"{TRANSIENT_AGENT_ERROR_PREFIX} {worker_error}"
+                step_result = PROJECT_STEP_TRANSIENT_PAUSE
+            elif result.result_kind is AgentResultKind.USAGE_LIMIT:
+                worker_error = f"{USAGE_LIMIT_ERROR_PREFIX} {worker_error}"
+                step_result = PROJECT_STEP_USAGE_PAUSE
+            else:
+                step_result = 1
             update_project(
                 connection, repo, phase="WORKING", last_error=worker_error
             )
             operation_print(worker_error, file=sys.stderr)
-            return 1
+            return step_result
         try:
             parse_worker_result(message, plan)
         except WorkerResultError as error:
@@ -6589,15 +7366,20 @@ def run_project(
         clear_agent_scope(connection, repo)
         if not passed:
             operation_log(f"Worker 반환: {plan['id']} {plan['title']} (전체 verify 실패)", error=True)
-            update_project(
+            decision = transition_validation_failure(
                 connection,
                 repo,
-                phase="WORKING",
-                verify_result=None,
-                last_error=f"전체 검증 실패:\n{output}",
+                worktree,
+                "verify",
+                output,
             )
             operation_print(output, file=sys.stderr)
-            return 1
+            return 1 if decision.blocked else PROJECT_STEP_RETRY
+
+        # Every successful verify is a progress boundary. Clear its stage-local
+        # history before checking for a newer base or running a second verify
+        # after rebase, so later failures cannot inherit pre-success repeats.
+        clear_validation_failure_history(connection, repo, "verify")
 
         dirty = bool(git(worktree, "status", "--porcelain").stdout.strip())
         if not dirty and not branch_has_changes(worktree, base):
@@ -6644,6 +7426,9 @@ def run_project(
                 )
                 operation_print(rebased.stdout, file=sys.stderr)
                 return 1
+            # The rebase completed even if its follow-up verify later fails.
+            # Persist the new base now so recovery does not repeat that rebase.
+            update_project(connection, repo, active_sha=latest_sha)
             operation_log(f"전체 verify 시작: {plan['id']} {plan['title']} (rebase 후)")
             verify_scope_before = begin_agent_scope(
                 connection,
@@ -6678,15 +7463,16 @@ def run_project(
             clear_agent_scope(connection, repo)
             if not passed:
                 operation_log(f"Worker 반환: {plan['id']} {plan['title']} (rebase 후 전체 verify 실패)", error=True)
-                update_project(
+                decision = transition_validation_failure(
                     connection,
                     repo,
-                    phase="WORKING",
-                    verify_result=None,
-                    last_error=f"rebase 후 전체 검증 실패:\n{output}",
+                    worktree,
+                    "verify",
+                    output,
                 )
                 operation_print(output, file=sys.stderr)
-                return 1
+                return 1 if decision.blocked else PROJECT_STEP_RETRY
+            clear_validation_failure_history(connection, repo, "verify")
             if git(worktree, "status", "--porcelain").stdout.strip():
                 git(worktree, "add", "-A")
                 plan = validate_active_execplan_metadata(
@@ -6747,14 +7533,37 @@ def run_project(
             ),
         )
 
-        code, review = run_codex(
-            worktree,
-            state_dir,
-            config_path,
-            "reviewer",
-            reviewer_prompt(base, row["worker_result"], row["verify_result"]),
-            read_only=True,
+        review_result = run_agent_with_retries(
+            lambda current_session_id, session_recovery: run_codex(
+                worktree,
+                state_dir,
+                config_path,
+                "reviewer",
+                reviewer_prompt(
+                    base,
+                    row["worker_result"],
+                    row["verify_result"],
+                    row["review_result"],
+                    session_recovery=session_recovery,
+                ),
+                read_only=True,
+                persist_session=True,
+                session_id=current_session_id,
+                on_session_started=lambda started_session_id: update_project(
+                    connection,
+                    repo,
+                    reviewer_session_id=started_session_id,
+                ),
+            ),
+            session_id=row["reviewer_session_id"],
         )
+        code, review = review_result
+        if review_result.session_id:
+            update_project(
+                connection,
+                repo,
+                reviewer_session_id=review_result.session_id,
+            )
         try:
             reviewer_scope_after = capture_git_snapshot(worktree)
             validate_agent_scope(
@@ -6777,18 +7586,59 @@ def run_project(
             return 1
         clear_agent_scope(connection, repo)
 
+        if code:
+            reviewer_error = review or f"Reviewer 종료 코드 {code}"
+            if review_result.result_kind is AgentResultKind.TRANSIENT_FAILURE:
+                reviewer_error = f"{TRANSIENT_AGENT_ERROR_PREFIX} {reviewer_error}"
+                step_result = PROJECT_STEP_TRANSIENT_PAUSE
+            elif review_result.result_kind is AgentResultKind.USAGE_LIMIT:
+                reviewer_error = f"{USAGE_LIMIT_ERROR_PREFIX} {reviewer_error}"
+                step_result = PROJECT_STEP_USAGE_PAUSE
+            else:
+                step_result = 1
+            update_project(
+                connection,
+                repo,
+                phase="REVIEWING",
+                last_error=reviewer_error,
+                review_result=review,
+            )
+            operation_print(reviewer_error, file=sys.stderr)
+            return step_result
 
-        passed = (
-            code == 0
-            and re.search(r"(?mi)^VERDICT:\s*PASS\s*$", review)
-            and not re.search(r"(?mi)^VERDICT:\s*FAIL\s*$", review)
-        )
-        if not passed:
-            operation_log(f"Worker 반환: {plan['id']} {plan['title']} (Review 실패)", error=True)
-            update_project(connection, repo, phase="WORKING", last_error=f"Review 실패:\n{review[-8000:]}")
-            operation_print(review or "Reviewer 실행에 실패했습니다.", file=sys.stderr)
+        try:
+            verdict, _issue_ids = parse_reviewer_result(review)
+        except ReviewerProtocolError as error:
+            reviewer_error = f"Reviewer 결과 프로토콜 오류: {error}"
+            update_project(
+                connection,
+                repo,
+                phase="REVIEWING",
+                last_error=reviewer_error,
+                review_result=review,
+            )
+            operation_print(reviewer_error, file=sys.stderr)
             return 1
-        update_project(connection, repo, phase="PUBLISHING", last_error=None)
+
+        if verdict == "FAIL":
+            decision = transition_validation_failure(
+                connection,
+                repo,
+                worktree,
+                "review",
+                review,
+            )
+            operation_log(f"Worker 반환: {plan['id']} {plan['title']} (Review 실패)", error=True)
+            operation_print(review or "Reviewer 결과가 유효하지 않습니다.", file=sys.stderr)
+            return 1 if decision.blocked else PROJECT_STEP_RETRY
+        clear_validation_failure_history(connection, repo, "review")
+        update_project(
+            connection,
+            repo,
+            phase="PUBLISHING",
+            last_error=None,
+            review_result=review,
+        )
 
     row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
     if row["phase"] == "PUBLISHING":
@@ -6839,6 +7689,75 @@ def run_project(
         update_project(connection, repo, phase="PR_OPEN", pr_url=url, last_error=None)
         operation_print(f"PR 생성 완료: {url}")
     return 0
+
+
+def run_project_result(
+    connection: sqlite3.Connection,
+    state_dir: Path,
+    repo_arg: str,
+    config_path: Path,
+    requested_base: str | None,
+    allow_agents_mismatch: bool,
+) -> ProjectRunResult:
+    """Run retryable validation progress to a stable project-level outcome."""
+
+    while True:
+        step_result = _run_project_step(
+            connection,
+            state_dir,
+            repo_arg,
+            config_path,
+            requested_base,
+            allow_agents_mismatch,
+        )
+        if step_result != PROJECT_STEP_RETRY:
+            break
+
+    repo = str(Path(repo_arg).expanduser().resolve())
+    row = connection.execute(
+        "SELECT phase, last_error FROM projects WHERE repo = ?",
+        (repo,),
+    ).fetchone()
+    detail = str(row["last_error"] or "") if row else None
+    if step_result == PROJECT_STEP_TRANSIENT_PAUSE:
+        return ProjectRunResult(ProjectRunKind.TRANSIENT_PAUSE, 0, detail)
+    if step_result == PROJECT_STEP_USAGE_PAUSE:
+        return ProjectRunResult(ProjectRunKind.USAGE_LIMIT_PAUSE, 0, detail)
+    if step_result == PROJECT_STEP_PLANNING_PENDING:
+        return ProjectRunResult(ProjectRunKind.WAITING, 0, detail)
+    if row is not None and row["phase"] == "BLOCKED":
+        return ProjectRunResult(ProjectRunKind.BLOCKED, 1, detail)
+    if step_result != 0:
+        return ProjectRunResult(ProjectRunKind.OPERATIONAL_ERROR, 1, detail)
+    if row is not None and row["phase"] is not None:
+        return ProjectRunResult(ProjectRunKind.WAITING, 0, detail)
+    unfinished = connection.execute(
+        "SELECT 1 FROM exec_plans WHERE repo = ? AND status != 'MERGED' LIMIT 1",
+        (repo,),
+    ).fetchone()
+    if unfinished is not None:
+        return ProjectRunResult(ProjectRunKind.WAITING, 0, detail)
+    return ProjectRunResult(ProjectRunKind.COMPLETED, 0, detail)
+
+
+def run_project(
+    connection: sqlite3.Connection,
+    state_dir: Path,
+    repo_arg: str,
+    config_path: Path,
+    requested_base: str | None,
+    allow_agents_mismatch: bool,
+) -> int:
+    """CLI-compatible adapter for the reusable structured project result."""
+
+    return run_project_result(
+        connection,
+        state_dir,
+        repo_arg,
+        config_path,
+        requested_base,
+        allow_agents_mismatch,
+    ).exit_code
 
 
 def build_parser() -> argparse.ArgumentParser:

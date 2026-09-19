@@ -1367,16 +1367,21 @@ class LoopManagerTest(unittest.TestCase):
                     loop_manager.run_project(
                         connection, state_dir, str(repo), Path("unused.ini"), "main", False
                     ),
-                    1,
+                    0,
                 )
 
             resumed = connection.execute(
                 "SELECT * FROM projects WHERE repo = ?", (str(repo),)
             ).fetchone()
-            self.assertEqual(planner_calls, 3)
+            self.assertEqual(planner_calls, 6)
             self.assertEqual(resumed["planning_retry_count"], 0)
             self.assertEqual(resumed["planning_result_pending_validation"], 0)
             self.assertIsNone(resumed["planning_error"])
+            self.assertIsNotNone(resumed["planning_validation_error"])
+            self.assertIn(
+                loop_manager.TRANSIENT_AGENT_ERROR_PREFIX,
+                resumed["last_error"],
+            )
             self.assertEqual(
                 git_command(
                     repo,
@@ -1398,7 +1403,7 @@ class LoopManagerTest(unittest.TestCase):
             if planner_calls == 1:
                 invalid.write_text("invalid\n", encoding="utf-8")
                 return loop_manager.CodexResult(0, "", "planner-session")
-            if planner_calls == 2:
+            if 2 <= planner_calls <= 5:
                 saved_retry_count = connection.execute(
                     "SELECT planning_retry_count FROM projects WHERE repo = ?",
                     (str(repo),),
@@ -1426,18 +1431,28 @@ class LoopManagerTest(unittest.TestCase):
             ), mock.patch(
                 "loop_manager.run_codex", side_effect=agent
             ):
-                for _attempt in range(2):
-                    self.assertEqual(
-                        loop_manager.run_project(
-                            connection,
-                            state_dir,
-                            str(repo),
-                            Path("unused.ini"),
-                            "main",
-                            False,
-                        ),
-                        1,
-                    )
+                self.assertEqual(
+                    loop_manager.run_project(
+                        connection,
+                        state_dir,
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
+                    ),
+                    1,
+                )
+                self.assertEqual(
+                    loop_manager.run_project(
+                        connection,
+                        state_dir,
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
+                    ),
+                    0,
+                )
                 failed = connection.execute(
                     "SELECT * FROM projects WHERE repo = ?", (str(repo),)
                 ).fetchone()
@@ -1455,7 +1470,7 @@ class LoopManagerTest(unittest.TestCase):
             final = connection.execute(
                 "SELECT * FROM projects WHERE repo = ?", (str(repo),)
             ).fetchone()
-            self.assertEqual(planner_calls, 3)
+            self.assertEqual(planner_calls, 6)
             self.assertEqual(final["phase"], "WORKING")
             self.assertEqual(final["planning_retry_count"], 0)
             self.assertIsNone(final["planning_validation_error"])
@@ -2709,6 +2724,12 @@ risk: medium
         self.assertIn("targeted: PASS", reviewer)
         self.assertIn("verify: PASS", reviewer)
         self.assertIn("테스트 command와 scripts/verify를 실행하지 말고", reviewer)
+        self.assertIn("ISSUE_ID: relative/path::stable-symbol-or-test::category-slug", reviewer)
+        self.assertIn("이전과 정확히 같은 ID", reviewer)
+        self.assertIn("RERUN:", worker)
+        self.assertIn("FAILED_COMMAND:", worker)
+        self.assertIn("공백을 정규화한 뒤 정확히 같아야", worker)
+        self.assertIn("성공·실패가 섞인 요약", worker)
         self.assertIn("COMMIT_TITLE:", worker)
         self.assertIn("PR_SUMMARY:", worker)
         self.assertIn("TARGETED_TESTS:", worker)
@@ -2741,94 +2762,164 @@ risk: medium
         self.assertIsNone(row["worker_result"])
         self.assertIsNone(row["verify_result"])
 
-    def test_verify_failure_resumes_same_worker_session_without_reviewer(self):
+    def test_repeated_verify_failure_blocks_in_one_run_without_reviewer(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, state_dir, connection = self._make_active_worker_project(directory)
             sessions = []
             prompts = []
-            logs = []
 
             def worker(_worktree, _state, _config, role_name, prompt, **kwargs):
                 self.assertEqual(role_name, "worker")
                 sessions.append(kwargs["session_id"])
                 prompts.append(prompt)
-                return loop_manager.CodexResult(0, worker_result(), "worker-session")
+                return loop_manager.CodexResult(
+                    0, worker_result(), "worker-session"
+                )
 
-            with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
                 "loop_manager.remote_base", return_value="main"
-            ), mock.patch("loop_manager.ensure_safe_base_worktree"), mock.patch(
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
                 "loop_manager.pr_for_branch", return_value=None
-            ), mock.patch("loop_manager.run_codex", side_effect=worker), mock.patch(
+            ), mock.patch(
+                "loop_manager.run_codex", side_effect=worker
+            ), mock.patch(
                 "loop_manager.verify", return_value=(False, "verify failed")
-            ) as verify, mock.patch("loop_manager.operation_log", side_effect=lambda message, **kwargs: logs.append((message, kwargs))):
+            ) as verify:
                 self.assertEqual(
                     loop_manager.run_project(
-                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
-                    ),
-                    1,
-                )
-                row = connection.execute(
-                    "SELECT * FROM projects WHERE repo = ?", (str(repo),)
-                ).fetchone()
-                self.assertEqual(row["phase"], "WORKING")
-                self.assertEqual(row["worker_session_id"], "worker-session")
-                self.assertEqual(row["worker_result"], worker_result())
-                self.assertIsNone(row["verify_result"])
-                self.assertIn("전체 검증 실패:\nverify failed", row["last_error"])
-                verify.assert_called_once()
-
-                self.assertEqual(
-                    loop_manager.run_project(
-                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                        connection,
+                        state_dir,
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
                     ),
                     1,
                 )
 
-            self.assertEqual(sessions, [None, "worker-session"])
-            self.assertIn("전체 검증 실패:\nverify failed", prompts[1])
-            self.assertEqual(
-                logs,
-                [
-                    ("Worker 시작: G-001 Worker Boundary", {}),
-                    ("전체 verify 시작: G-001 Worker Boundary", {}),
-                    ("Worker 반환: G-001 Worker Boundary (전체 verify 실패)", {"error": True}),
-                    ("verify failed", {"error": True}),
-                    ("Worker 시작: G-001 Worker Boundary", {}),
-                    ("전체 verify 시작: G-001 Worker Boundary", {}),
-                    ("Worker 반환: G-001 Worker Boundary (전체 verify 실패)", {"error": True}),
-                    ("verify failed", {"error": True}),
-                ],
-            )
+            row = connection.execute(
+                "SELECT * FROM projects WHERE repo = ?", (str(repo),)
+            ).fetchone()
+            plan = connection.execute(
+                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            history = json.loads(plan["verify_failure_history"])
 
-    def test_rebase_verify_failure_returns_to_worker_with_identifying_logs(self):
+        self.assertEqual(row["phase"], "BLOCKED")
+        self.assertEqual(row["worker_session_id"], "worker-session")
+        self.assertEqual(row["worker_result"], worker_result())
+        self.assertEqual(row["verify_result"], "verify failed")
+        self.assertIn("실패 지문:", row["last_error"])
+        self.assertEqual(sessions, [None] + ["worker-session"] * 3)
+        self.assertIn("전체 검증 실패:\nverify failed", prompts[1])
+        self.assertEqual(verify.call_count, 4)
+        self.assertEqual(
+            [record["occurrences"] for record in history.values()], [4]
+        )
+
+    def test_rebase_verify_failure_recovers_after_initial_success(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, state_dir, connection = self._make_active_worker_project(directory)
-            logs = []
             original_git = loop_manager.git
             origin_reads = 0
+            sessions = []
+            loop_manager.migrate_legacy_execplans(
+                connection, target_repo=str(repo)
+            )
+            managed = Path(
+                connection.execute(
+                    "SELECT worktree FROM projects WHERE repo = ?", (str(repo),)
+                ).fetchone()["worktree"]
+            )
+            for _ in range(3):
+                loop_manager.transition_validation_failure(
+                    connection, str(repo), managed, "verify", "rebased verify failed"
+                )
 
             def git_after_base_advance(path, *arguments, **kwargs):
                 nonlocal origin_reads
                 if arguments == ("rev-parse", "origin/main"):
                     origin_reads += 1
                     if origin_reads > 1:
-                        return subprocess.CompletedProcess(["git", *arguments], 0, stdout="f" * 40 + "\n")
+                        return subprocess.CompletedProcess(
+                            ["git", *arguments], 0, stdout="f" * 40 + "\n"
+                        )
                 if arguments == ("rebase", "origin/main"):
-                    return subprocess.CompletedProcess(["git", *arguments], 0, stdout="")
+                    return subprocess.CompletedProcess(
+                        ["git", *arguments], 0, stdout=""
+                    )
                 return original_git(path, *arguments, **kwargs)
 
-            def worker(worktree, _state, _config, _role, _prompt, **_kwargs):
-                (worktree / "src/app.py").write_text("VALUE = 2\n", encoding="utf-8")
-                return loop_manager.CodexResult(0, worker_result("Rebase failure context"), "worker-session")
+            def worker(worktree, _state, _config, role_name, _prompt, **kwargs):
+                if role_name == "reviewer":
+                    return loop_manager.CodexResult(
+                        0, "VERDICT: PASS", "reviewer-session"
+                    )
+                self.assertEqual(role_name, "worker")
+                sessions.append(kwargs["session_id"])
+                (worktree / "src/app.py").write_text(
+                    "VALUE = 2\n", encoding="utf-8"
+                )
+                return loop_manager.CodexResult(
+                    0,
+                    worker_result("Rebase failure context"),
+                    "worker-session",
+                )
 
-            with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch("loop_manager.remote_base", return_value="main"), mock.patch("loop_manager.ensure_safe_base_worktree"), mock.patch("loop_manager.pr_for_branch", return_value=None), mock.patch("loop_manager.run_codex", side_effect=worker), mock.patch("loop_manager.verify", side_effect=[(True, "first verify"), (False, "rebased verify failed")]) as verify, mock.patch("loop_manager.git", side_effect=git_after_base_advance), mock.patch("loop_manager.operation_log", side_effect=lambda message, **kwargs: logs.append((message, kwargs))):
-                self.assertEqual(loop_manager.run_project(connection, state_dir, str(repo), Path("unused.ini"), "main", False), 1)
+            verify_results = [
+                (True, "first verify"),
+                (False, "rebased verify failed"),
+                (True, "final verify"),
+            ]
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch",
+                side_effect=[
+                    None, None, {"url": "https://example.test/pr/1"}
+                ],
+            ), mock.patch(
+                "loop_manager.run_codex", side_effect=worker
+            ), mock.patch(
+                "loop_manager.verify", side_effect=verify_results
+            ) as verify, mock.patch(
+                "loop_manager.git", side_effect=git_after_base_advance
+            ):
+                self.assertEqual(
+                    loop_manager.run_project(
+                        connection,
+                        state_dir,
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
+                    ),
+                    0,
+                )
 
-            row = connection.execute("SELECT phase, last_error FROM projects WHERE repo = ?", (str(repo),)).fetchone()
-            self.assertEqual(row["phase"], "WORKING")
-            self.assertIn("rebase 후 전체 검증 실패:\nrebased verify failed", row["last_error"])
-            self.assertEqual(verify.call_count, 2)
-            self.assertEqual(logs, [("Worker 시작: G-001 Worker Boundary", {}), ("전체 verify 시작: G-001 Worker Boundary", {}), ("전체 verify 시작: G-001 Worker Boundary (rebase 후)", {}), ("Worker 반환: G-001 Worker Boundary (rebase 후 전체 verify 실패)", {"error": True}), ("rebased verify failed", {"error": True})])
+            row = connection.execute(
+                "SELECT phase, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            plan = connection.execute(
+                "SELECT verify_failure_history FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-001'", (str(repo),)
+            ).fetchone()
+
+        self.assertEqual(row["phase"], "PR_OPEN")
+        self.assertIsNone(row["last_error"])
+        self.assertEqual(json.loads(plan["verify_failure_history"]), {})
+        self.assertEqual(verify.call_count, 3)
+        self.assertEqual(sessions, [None, "worker-session"])
 
     def test_verify_success_passes_worker_and_verify_results_to_reviewer(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2883,6 +2974,984 @@ risk: medium
 
 
 
+class BoundedExecutionRecoveryTest(unittest.TestCase):
+    def _failure_state(
+        self,
+        directory: str,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> tuple[Path, sqlite3.Connection]:
+        root = make_catalog_root(directory)
+        plan = write_execplan(root, "G-013", "Bounded Recovery")
+        connection = connection or sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute(loop_manager.SCHEMA)
+        loop_manager._ensure_execplans_schema(connection)
+        connection.execute(
+            """
+            INSERT INTO projects (
+                repo, base_branch, phase, plan_path, worktree,
+                worker_session_id, reviewer_session_id
+            ) VALUES (?, 'main', 'VERIFYING', ?, ?, 'worker-session', 'reviewer-session')
+            """,
+            (str(root), plan.relative_to(root).as_posix(), str(root)),
+        )
+        connection.execute(
+            """
+            INSERT INTO exec_plans (
+                repo, plan_id, path, title, sources, depends_on, priority,
+                content_hash, status, worktree, worker_session_id,
+                reviewer_session_id
+            ) VALUES (?, 'G-013', ?, 'Bounded Recovery', ?, '[]', 'critical',
+                      'hash', 'VERIFYING', ?, 'worker-session', 'reviewer-session')
+            """,
+            (
+                str(root),
+                plan.relative_to(root).as_posix(),
+                json.dumps(["docs/PRODUCT.md"]),
+                str(root),
+            ),
+        )
+        connection.commit()
+        return root, connection
+
+    def _active_worker_project(
+        self, directory: str
+    ) -> tuple[Path, Path, sqlite3.Connection]:
+        repo = make_remote_repository(directory)
+        state_dir = Path(directory) / "state"
+        state_dir.mkdir()
+        (repo / "docs/plans").mkdir()
+        plan = write_execplan(repo, "G-001", "Worker Boundary")
+        commit_and_push(repo, "Add worker plan")
+        plan_sha = git_command(repo, "rev-parse", "origin/main")
+        branch, worktree = loop_manager.expected_execplan_workspace(
+            state_dir, str(repo), "G-001"
+        )
+        loop_manager.make_worktree(repo, worktree, branch, "main")
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute(loop_manager.SCHEMA)
+        connection.execute(
+            """
+            INSERT INTO projects (
+                repo, base_branch, active_sha, plan_sha, phase, branch,
+                worktree, plan_path
+            ) VALUES (?, 'main', ?, ?, 'WORKING', ?, ?, ?)
+            """,
+            (
+                str(repo),
+                plan_sha,
+                plan_sha,
+                branch,
+                str(worktree),
+                plan.relative_to(repo).as_posix(),
+            ),
+        )
+        connection.commit()
+        return repo, state_dir, connection
+
+    def _run_review_sequence(
+        self,
+        directory: str,
+        review_messages: tuple[str, ...],
+        *,
+        publish: bool,
+    ) -> dict[str, object]:
+        repo, state_dir, connection = self._active_worker_project(directory)
+        roles = []
+        reviewer_sessions = []
+        worker_version = 1
+        transitions = []
+        original_transition = loop_manager.transition_validation_failure
+
+        def record_transition(*args, **kwargs):
+            decision = original_transition(*args, **kwargs)
+            transitions.append(
+                (
+                    decision.stage,
+                    decision.fingerprint,
+                    decision.occurrences,
+                    decision.blocked,
+                )
+            )
+            return decision
+
+        def agent(worktree, _state, _config, role_name, _prompt, **kwargs):
+            nonlocal worker_version
+            roles.append(role_name)
+            if role_name == "worker":
+                worker_version += 1
+                (worktree / "src/app.py").write_text(
+                    f"VALUE = {worker_version}\n", encoding="utf-8"
+                )
+                return loop_manager.CodexResult(
+                    0,
+                    worker_result(f"Record review sequence {worker_version}"),
+                    "worker-session",
+                )
+            reviewer_sessions.append(kwargs["session_id"])
+            return loop_manager.CodexResult(
+                0, next(responses), "reviewer-session"
+            )
+
+        responses = iter(review_messages)
+        pr_results: list[dict[str, str] | None] = [None] * len(review_messages)
+        if publish:
+            pr_results.append({"url": "https://example.test/pr/13"})
+
+        with mock.patch(
+            "loop_manager.validate_repository", return_value=repo
+        ), mock.patch(
+            "loop_manager.remote_base", return_value="main"
+        ), mock.patch(
+            "loop_manager.ensure_safe_base_worktree"
+        ), mock.patch(
+            "loop_manager.pr_for_branch", side_effect=pr_results
+        ), mock.patch(
+            "loop_manager.run_codex", side_effect=agent
+        ), mock.patch(
+            "loop_manager.verify", return_value=(True, "verify: PASS")
+        ) as verify, mock.patch(
+            "loop_manager.transition_validation_failure",
+            side_effect=record_transition,
+        ):
+            result = loop_manager.run_project_result(
+                connection,
+                state_dir,
+                str(repo),
+                Path("unused.ini"),
+                "main",
+                False,
+            )
+
+        project = connection.execute(
+            "SELECT phase, worker_session_id, reviewer_session_id, "
+            "last_error, review_result FROM projects WHERE repo = ?",
+            (str(repo),),
+        ).fetchone()
+        plan = connection.execute(
+            "SELECT status, review_failure_history "
+            "FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+            (str(repo),),
+        ).fetchone()
+        return {
+            "result": result,
+            "roles": roles,
+            "reviewer_sessions": reviewer_sessions,
+            "transitions": transitions,
+            "project": project,
+            "plan": plan,
+            "verify_calls": verify.call_count,
+        }
+
+    def test_failure_fingerprints_normalize_noise_and_preserve_issue_identity(self):
+        first_root = Path("/tmp/run-one/worktree")
+        second_root = Path("/tmp/run-two/worktree")
+        first = "\n".join(
+            (
+                "2026-09-19T10:20:30Z FAIL tests/test_b.py::test_b",
+                f"{first_root}/tests/test_a.py:42: assertion failed",
+                "FAIL tests/test_a.py::test_a in 0.23s",
+            )
+        )
+        second = "\n".join(
+            (
+                "FAIL tests/test_a.py::test_a in 9.91s",
+                f"{second_root}/tests/test_a.py:42: assertion failed",
+                "2027-01-01 22:11:09 FAIL tests/test_b.py::test_b",
+            )
+        )
+
+        first_fingerprint, first_normalized = loop_manager.validation_failure_fingerprint(
+            "verify", first, first_root
+        )
+        second_fingerprint, second_normalized = loop_manager.validation_failure_fingerprint(
+            "verify", second, second_root
+        )
+        changed_fingerprint, _ = loop_manager.validation_failure_fingerprint(
+            "verify",
+            second.replace("test_b", "test_c"),
+            second_root,
+        )
+        review_fingerprint, _ = loop_manager.validation_failure_fingerprint(
+            "review",
+            "ISSUE_ID: tests/test_a.py::test-a::blocking\nVERDICT: FAIL",
+            second_root,
+        )
+        same_temp_first, _ = loop_manager.validation_failure_fingerprint(
+            "verify", "FAIL /tmp/run-one/test_same.py:42"
+        )
+        same_temp_second, _ = loop_manager.validation_failure_fingerprint(
+            "verify", "FAIL /tmp/run-two/test_same.py:42"
+        )
+        different_temp_file, _ = loop_manager.validation_failure_fingerprint(
+            "verify", "FAIL /tmp/run-three/test_other.py:42"
+        )
+        temp_directory_first, _ = loop_manager.validation_failure_fingerprint(
+            "verify", "workspace cleanup failed: /tmp/tmpABC"
+        )
+        temp_directory_second, _ = loop_manager.validation_failure_fingerprint(
+            "verify", "workspace cleanup failed: /tmp/tmpXYZ"
+        )
+        extensionless_file_first, _ = loop_manager.validation_failure_fingerprint(
+            "verify", "FAIL /tmp/inputA"
+        )
+        extensionless_file_second, _ = loop_manager.validation_failure_fingerprint(
+            "verify", "FAIL /tmp/inputB"
+        )
+        prefixed_file_first, _ = loop_manager.validation_failure_fingerprint(
+            "verify", "FAIL /tmp/tmpInputA"
+        )
+        prefixed_file_second, _ = loop_manager.validation_failure_fingerprint(
+            "verify", "FAIL /tmp/tmpInputB"
+        )
+
+        self.assertEqual(first_normalized, second_normalized)
+        self.assertEqual(first_fingerprint, second_fingerprint)
+        self.assertNotEqual(first_fingerprint, changed_fingerprint)
+        self.assertNotEqual(first_fingerprint, review_fingerprint)
+        self.assertEqual(same_temp_first, same_temp_second)
+        self.assertNotEqual(same_temp_first, different_temp_file)
+        self.assertEqual(temp_directory_first, temp_directory_second)
+        self.assertNotEqual(extensionless_file_first, extensionless_file_second)
+        self.assertNotEqual(prefixed_file_first, prefixed_file_second)
+
+    def test_review_fingerprints_use_stable_issue_ids_not_explanatory_prose(self):
+        first = "\n".join(
+            (
+                "ISSUE_ID: loop_manager.py::run_project::session-recovery",
+                "[P1] line 120: the saved session was not resumed.",
+                "ISSUE_ID: tests/test_loop_manager.py::retry-case::missing-coverage",
+                "Add a regression test near line 3000.",
+                "VERDICT: FAIL",
+            )
+        )
+        reworded = "\n".join(
+            (
+                "ISSUE_ID: tests/test_loop_manager.py::retry-case::missing-coverage",
+                "The scenario is still untested at a different location.",
+                "ISSUE_ID: LOOP_MANAGER.PY::RUN_PROJECT::SESSION-RECOVERY",
+                "Session continuation remains broken, phrased differently.",
+                "VERDICT: FAIL",
+            )
+        )
+        changed = reworded.replace("SESSION-RECOVERY", "USAGE-LIMIT")
+
+        first_fingerprints = loop_manager.validation_failure_fingerprints(
+            "review", first
+        )
+        reworded_fingerprints = loop_manager.validation_failure_fingerprints(
+            "review", reworded
+        )
+        changed_fingerprints = loop_manager.validation_failure_fingerprints(
+            "review", changed
+        )
+        with self.assertRaisesRegex(
+            loop_manager.ReviewerProtocolError, "유효한 ISSUE_ID가 없습니다"
+        ):
+            loop_manager.validation_failure_fingerprints(
+                "review", "first free-form explanation\nVERDICT: FAIL"
+            )
+        with self.assertRaisesRegex(
+            loop_manager.ReviewerProtocolError, "형식이 유효하지 않습니다"
+        ):
+            loop_manager.validation_failure_fingerprints(
+                "review", "ISSUE_ID: app.py:10 prose\nVERDICT: FAIL"
+            )
+
+        self.assertEqual(first_fingerprints, reworded_fingerprints)
+        self.assertEqual(
+            tuple(normalized for _fingerprint, normalized in first_fingerprints),
+            (
+                "ISSUE_ID:loop_manager.py::run_project::session-recovery",
+                "ISSUE_ID:tests/test_loop_manager.py::retry-case::missing-coverage",
+            ),
+        )
+        first_by_issue = {
+            normalized: fingerprint
+            for fingerprint, normalized in first_fingerprints
+        }
+        changed_by_issue = {
+            normalized: fingerprint
+            for fingerprint, normalized in changed_fingerprints
+        }
+        self.assertEqual(
+            first_by_issue[
+                "ISSUE_ID:tests/test_loop_manager.py::retry-case::missing-coverage"
+            ],
+            changed_by_issue[
+                "ISSUE_ID:tests/test_loop_manager.py::retry-case::missing-coverage"
+            ],
+        )
+        self.assertEqual(
+            set(first_by_issue) & set(changed_by_issue),
+            {"ISSUE_ID:tests/test_loop_manager.py::retry-case::missing-coverage"},
+        )
+
+    def test_verify_fingerprint_uses_full_output_before_feedback_truncation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            scripts = worktree / "scripts"
+            scripts.mkdir()
+            (scripts / "verify.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+            lines = [
+                f"FAIL tests/test_{index:04}.py::test_case assertion {index}"
+                for index in range(400)
+            ]
+            ordered = "\n".join(lines)
+            reordered = "\n".join(reversed(lines))
+            results = [
+                subprocess.CompletedProcess(["verify"], 1, stdout=ordered),
+                subprocess.CompletedProcess(["verify"], 1, stdout=reordered),
+            ]
+            with mock.patch("loop_manager.command", side_effect=results):
+                first_passed, first_output = loop_manager.verify(worktree)
+                second_passed, second_output = loop_manager.verify(worktree)
+
+        self.assertFalse(first_passed)
+        self.assertFalse(second_passed)
+        self.assertLessEqual(len(first_output), 8000)
+        self.assertLessEqual(len(second_output), 8000)
+        self.assertNotEqual(first_output, second_output)
+        first_fingerprint, _ = loop_manager.validation_failure_fingerprint(
+            "verify", first_output, worktree
+        )
+        second_fingerprint, _ = loop_manager.validation_failure_fingerprint(
+            "verify", second_output, worktree
+        )
+        self.assertEqual(first_fingerprint, second_fingerprint)
+
+    def test_stage_histories_survive_cycles_and_block_only_fourth_occurrence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, connection = self._failure_state(directory)
+            outputs = ["failure A", "failure B", "failure C", "failure D"]
+            decisions = [
+                loop_manager.transition_validation_failure(
+                    connection, str(root), root, "verify", output
+                )
+                for output in outputs
+            ]
+            for _ in range(2):
+                decisions.append(
+                    loop_manager.transition_validation_failure(
+                        connection, str(root), root, "verify", "failure A"
+                    )
+                )
+            review = loop_manager.transition_validation_failure(
+                connection, str(root), root, "review", "ISSUE_ID: app.py::failure-a::blocking\nfailure A\nVERDICT: FAIL"
+            )
+            final = loop_manager.transition_validation_failure(
+                connection, str(root), root, "verify", "failure A"
+            )
+            row = connection.execute(
+                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-013'",
+                (str(root),),
+            ).fetchone()
+            verify_history = json.loads(row["verify_failure_history"])
+            review_history = json.loads(row["review_failure_history"])
+
+        self.assertTrue(all(not decision.blocked for decision in decisions))
+        self.assertFalse(review.blocked)
+        self.assertTrue(final.blocked)
+        self.assertEqual(final.occurrences, 4)
+        self.assertEqual(row["status"], "BLOCKED")
+        self.assertIn(final.fingerprint, row["last_error"])
+        self.assertEqual(verify_history[final.fingerprint]["occurrences"], 4)
+        self.assertEqual(review_history[review.fingerprint]["occurrences"], 1)
+        self.assertEqual(
+            sorted(record["occurrences"] for record in verify_history.values()),
+            [1, 1, 1, 4],
+        )
+
+    def test_history_persists_and_stage_success_or_blocked_requeue_clears_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory) / "state"
+            state_dir.mkdir()
+            database = sqlite3.connect(state_dir / "loop-manager.db")
+            database.row_factory = sqlite3.Row
+            root, connection = self._failure_state(
+                str(Path(directory) / "catalog"), connection=database
+            )
+            verify = loop_manager.transition_validation_failure(
+                connection, str(root), root, "verify", "failure A"
+            )
+            review = loop_manager.transition_validation_failure(
+                connection, str(root), root, "review", "ISSUE_ID: app.py::issue-r::blocking\nissue R\nVERDICT: FAIL"
+            )
+            connection.close()
+
+            reopened = sqlite3.connect(state_dir / "loop-manager.db")
+            reopened.row_factory = sqlite3.Row
+            persisted = reopened.execute(
+                "SELECT verify_failure_history, review_failure_history "
+                "FROM exec_plans WHERE repo = ? AND plan_id = 'G-013'",
+                (str(root),),
+            ).fetchone()
+            self.assertEqual(
+                json.loads(persisted["verify_failure_history"])[verify.fingerprint][
+                    "occurrences"
+                ],
+                1,
+            )
+            self.assertEqual(
+                json.loads(persisted["review_failure_history"])[review.fingerprint][
+                    "occurrences"
+                ],
+                1,
+            )
+
+            loop_manager.clear_validation_failure_history(
+                reopened, str(root), "verify"
+            )
+            stage_cleared = reopened.execute(
+                "SELECT verify_failure_history, review_failure_history "
+                "FROM exec_plans WHERE repo = ? AND plan_id = 'G-013'",
+                (str(root),),
+            ).fetchone()
+            self.assertEqual(json.loads(stage_cleared["verify_failure_history"]), {})
+            self.assertNotEqual(json.loads(stage_cleared["review_failure_history"]), {})
+
+            reopened.execute(
+                "UPDATE exec_plans SET status = 'BLOCKED' "
+                "WHERE repo = ? AND plan_id = 'G-013'",
+                (str(root),),
+            )
+            reopened.execute(
+                "UPDATE projects SET phase = 'BLOCKED' WHERE repo = ?",
+                (str(root),),
+            )
+            reopened.commit()
+            loop_manager._requeue_blocked_execplan(
+                reopened, str(root), "G-013"
+            )
+            requeued = reopened.execute(
+                "SELECT verify_failure_history, review_failure_history, "
+                "worker_session_id, reviewer_session_id "
+                "FROM exec_plans WHERE repo = ? AND plan_id = 'G-013'",
+                (str(root),),
+            ).fetchone()
+            reopened.close()
+
+        self.assertEqual(json.loads(requeued["verify_failure_history"]), {})
+        self.assertEqual(json.loads(requeued["review_failure_history"]), {})
+        self.assertIsNone(requeued["worker_session_id"])
+        self.assertIsNone(requeued["reviewer_session_id"])
+
+    def test_agent_retry_usage_limit_and_session_fallback_are_bounded(self):
+        transient_calls = []
+
+        def transient_then_success(session_id, recovery):
+            transient_calls.append((session_id, recovery))
+            if len(transient_calls) <= loop_manager.MAX_TRANSIENT_AGENT_RETRIES:
+                return loop_manager.CodexResult(1, "service unavailable", session_id)
+            return loop_manager.CodexResult(0, "ok", "resumed-session")
+
+        recovered = loop_manager.run_agent_with_retries(
+            transient_then_success,
+            session_id="resumed-session",
+        )
+        self.assertEqual(recovered.result_kind, loop_manager.AgentResultKind.SUCCESS)
+        self.assertEqual(
+            len(transient_calls), loop_manager.MAX_TRANSIENT_AGENT_RETRIES + 1
+        )
+
+        timeout_calls = []
+
+        def timeout_then_success(session_id, recovery):
+            timeout_calls.append((session_id, recovery))
+            if len(timeout_calls) == 1:
+                raise subprocess.TimeoutExpired(["codex"], 1)
+            return loop_manager.CodexResult(0, "ok", session_id)
+
+        timeout_recovered = loop_manager.run_agent_with_retries(
+            timeout_then_success,
+            session_id="timeout-session",
+        )
+        self.assertEqual(
+            timeout_recovered.result_kind, loop_manager.AgentResultKind.SUCCESS
+        )
+        self.assertEqual(len(timeout_calls), 2)
+
+        usage_calls = []
+        usage = loop_manager.run_agent_with_retries(
+            lambda session_id, recovery: (
+                usage_calls.append((session_id, recovery))
+                or loop_manager.CodexResult(1, "usage limit reached", session_id)
+            ),
+            session_id="usage-session",
+        )
+        self.assertEqual(usage.result_kind, loop_manager.AgentResultKind.USAGE_LIMIT)
+        self.assertEqual(len(usage_calls), 1)
+
+        fallback_calls = []
+
+        def fallback(session_id, recovery):
+            fallback_calls.append((session_id, recovery))
+            if session_id:
+                return loop_manager.CodexResult(
+                    1, "session not found", session_id
+                )
+            return loop_manager.CodexResult(0, "fresh", "fresh-session")
+
+        fresh = loop_manager.run_agent_with_retries(
+            fallback,
+            session_id="missing-session",
+        )
+        self.assertEqual(fresh.session_id, "fresh-session")
+        self.assertEqual(
+            fallback_calls,
+            [("missing-session", False), (None, True)],
+        )
+        recovered_prompt = loop_manager.worker_prompt(
+            "docs/plans/[G-013] Recovery.md",
+            "temporary CLI failure",
+            "previous Worker result",
+            "verify failure output",
+            session_recovery=True,
+        )
+        self.assertIn("이전 Worker 결과", recovered_prompt)
+        self.assertIn("previous Worker result", recovered_prompt)
+        self.assertIn("verify failure output", recovered_prompt)
+
+    def test_project_results_distinguish_pause_block_and_operational_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = str((Path(directory) / "repo").resolve())
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            loop_manager._ensure_execplans_schema(connection)
+            connection.execute(
+                "INSERT INTO projects (repo, base_branch, phase, last_error) "
+                "VALUES (?, 'main', 'WORKING', 'saved')",
+                (repo,),
+            )
+            connection.commit()
+
+            cases = (
+                (
+                    loop_manager.PROJECT_STEP_TRANSIENT_PAUSE,
+                    "WORKING",
+                    loop_manager.ProjectRunKind.TRANSIENT_PAUSE,
+                    0,
+                ),
+                (
+                    loop_manager.PROJECT_STEP_USAGE_PAUSE,
+                    "REVIEWING",
+                    loop_manager.ProjectRunKind.USAGE_LIMIT_PAUSE,
+                    0,
+                ),
+                (1, "BLOCKED", loop_manager.ProjectRunKind.BLOCKED, 1),
+                (
+                    1,
+                    "WORKING",
+                    loop_manager.ProjectRunKind.OPERATIONAL_ERROR,
+                    1,
+                ),
+            )
+            for step, phase, expected_kind, expected_code in cases:
+                with self.subTest(kind=expected_kind):
+                    connection.execute(
+                        "UPDATE projects SET phase = ? WHERE repo = ?",
+                        (phase, repo),
+                    )
+                    connection.commit()
+                    with mock.patch(
+                        "loop_manager._run_project_step", return_value=step
+                    ):
+                        result = loop_manager.run_project_result(
+                            connection,
+                            Path(directory) / "state",
+                            repo,
+                            Path("unused.ini"),
+                            "main",
+                            False,
+                        )
+                    self.assertEqual(result.kind, expected_kind)
+                    self.assertEqual(result.exit_code, expected_code)
+
+    def test_distinct_verify_failures_recover_in_one_run_with_persistent_sessions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state_dir, connection = self._active_worker_project(directory)
+            roles = []
+            worker_sessions = []
+            reviewer_sessions = []
+            worker_version = 1
+
+            def agent(worktree, _state, _config, role_name, _prompt, **kwargs):
+                nonlocal worker_version
+                roles.append(role_name)
+                if role_name == "worker":
+                    worker_sessions.append(kwargs["session_id"])
+                    worker_version += 1
+                    (worktree / "src/app.py").write_text(
+                        f"VALUE = {worker_version}\n", encoding="utf-8"
+                    )
+                    return loop_manager.CodexResult(
+                        0,
+                        worker_result(f"Record recovery {worker_version}"),
+                        "worker-session",
+                    )
+                reviewer_sessions.append(kwargs["session_id"])
+                return loop_manager.CodexResult(
+                    0, "VERDICT: PASS", "reviewer-session"
+                )
+
+            verify_results = [
+                (False, "failure A"),
+                (False, "failure B"),
+                (False, "failure C"),
+                (False, "failure D"),
+                (True, "verify: PASS"),
+            ]
+            pr_results = [None] * 5 + [{"url": "https://example.test/pr/13"}]
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", side_effect=pr_results
+            ), mock.patch(
+                "loop_manager.run_codex", side_effect=agent
+            ), mock.patch(
+                "loop_manager.verify", side_effect=verify_results
+            ) as verify:
+                result = loop_manager.run_project_result(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, worker_session_id, reviewer_session_id "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            plan = connection.execute(
+                "SELECT verify_failure_history, review_failure_history "
+                "FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(verify.call_count, 5)
+        self.assertEqual(roles, ["worker"] * 5 + ["reviewer"])
+        self.assertEqual(worker_sessions, [None] + ["worker-session"] * 4)
+        self.assertEqual(reviewer_sessions, [None])
+        self.assertEqual(project["phase"], "PR_OPEN")
+        self.assertEqual(project["worker_session_id"], "worker-session")
+        self.assertEqual(project["reviewer_session_id"], "reviewer-session")
+        self.assertEqual(json.loads(plan["verify_failure_history"]), {})
+        self.assertEqual(json.loads(plan["review_failure_history"]), {})
+
+    def test_distinct_review_issues_continue_past_four_failures(self):
+        messages = (
+            "ISSUE_ID: app.py::issue-a::blocking\nissue A\nVERDICT: FAIL",
+            "ISSUE_ID: app.py::issue-b::blocking\nissue B\nVERDICT: FAIL",
+            "ISSUE_ID: app.py::issue-c::blocking\nissue C\nVERDICT: FAIL",
+            "ISSUE_ID: app.py::issue-d::blocking\nissue D\nVERDICT: FAIL",
+            "VERDICT: PASS",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            data = self._run_review_sequence(
+                directory, messages, publish=True
+            )
+
+        result = data["result"]
+        transitions = data["transitions"]
+        project = data["project"]
+        plan = data["plan"]
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(data["verify_calls"], 5)
+        self.assertEqual(data["roles"], ["worker", "reviewer"] * 5)
+        self.assertEqual(
+            data["reviewer_sessions"],
+            [None] + ["reviewer-session"] * 4,
+        )
+        self.assertEqual(
+            [
+                (stage, occurrences, blocked)
+                for stage, _fingerprint, occurrences, blocked in transitions
+            ],
+            [("review", 1, False)] * 4,
+        )
+        self.assertEqual(
+            len(
+                {
+                    fingerprint
+                    for _stage, fingerprint, _occurrences, _blocked in transitions
+                }
+            ),
+            4,
+        )
+        self.assertEqual(project["phase"], "PR_OPEN")
+        self.assertEqual(plan["status"], "PR_OPEN")
+        self.assertEqual(json.loads(plan["review_failure_history"]), {})
+
+    def test_review_issue_in_changing_sets_blocks_exactly_on_fourth_occurrence(self):
+        messages = (
+            "ISSUE_ID: app.py::a-shared-issue::blocking\n"
+            "ISSUE_ID: app.py::z-extra-a::blocking\nVERDICT: FAIL",
+            "ISSUE_ID: app.py::a-shared-issue::blocking\n"
+            "ISSUE_ID: app.py::z-extra-b::blocking\nVERDICT: FAIL",
+            "ISSUE_ID: app.py::a-shared-issue::blocking\n"
+            "ISSUE_ID: app.py::z-extra-c::blocking\nVERDICT: FAIL",
+            "ISSUE_ID: app.py::a-shared-issue::blocking\n"
+            "ISSUE_ID: app.py::z-extra-d::blocking\nVERDICT: FAIL",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            data = self._run_review_sequence(
+                directory, messages, publish=False
+            )
+
+        result = data["result"]
+        transitions = data["transitions"]
+        project = data["project"]
+        plan = data["plan"]
+        history = json.loads(plan["review_failure_history"])
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.BLOCKED)
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(data["verify_calls"], 4)
+        self.assertEqual(data["roles"], ["worker", "reviewer"] * 4)
+        self.assertEqual(
+            data["reviewer_sessions"],
+            [None] + ["reviewer-session"] * 3,
+        )
+        self.assertEqual(
+            [
+                (stage, occurrences, blocked)
+                for stage, _fingerprint, occurrences, blocked in transitions
+            ],
+            [
+                ("review", 1, False),
+                ("review", 2, False),
+                ("review", 3, False),
+                ("review", 4, True),
+            ],
+        )
+        self.assertEqual(
+            len(
+                {
+                    fingerprint
+                    for _stage, fingerprint, _occurrences, _blocked in transitions
+                }
+            ),
+            1,
+        )
+        self.assertEqual(project["phase"], "BLOCKED")
+        self.assertEqual(plan["status"], "BLOCKED")
+        self.assertEqual(
+            sorted(record["occurrences"] for record in history.values()),
+            [1, 1, 1, 1, 4],
+        )
+
+    def test_review_protocol_errors_do_not_retry_worker_or_consume_history(self):
+        invalid_reviews = (
+            "blocking issue without an identifier\nVERDICT: FAIL",
+            "ISSUE_ID: app.py:42 prose\nblocking issue\nVERDICT: FAIL",
+            "ISSUE_ID: app.py::pass-issue::blocking\nVERDICT: PASS",
+            "ISSUE_ID: app.py::missing-verdict::blocking\nblocking issue",
+            "VERDICT: PASS\nVERDICT: FAIL",
+            "ISSUE_ID: app.py::unknown-verdict::blocking\nVERDICT: MAYBE",
+            "VERDICT: PASS\ntrailing explanation",
+        )
+        for review in invalid_reviews:
+            with self.subTest(review=review), tempfile.TemporaryDirectory() as directory:
+                data = self._run_review_sequence(
+                    directory, (review,), publish=False
+                )
+
+            result = data["result"]
+            project = data["project"]
+            plan = data["plan"]
+            self.assertEqual(
+                result.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR
+            )
+            self.assertEqual(result.exit_code, 1)
+            self.assertEqual(data["roles"], ["worker", "reviewer"])
+            self.assertEqual(data["reviewer_sessions"], [None])
+            self.assertEqual(data["verify_calls"], 1)
+            self.assertEqual(data["transitions"], [])
+            self.assertEqual(project["phase"], "REVIEWING")
+            self.assertIn("Reviewer 결과 프로토콜 오류", project["last_error"])
+            self.assertEqual(project["review_result"], review)
+            self.assertEqual(plan["status"], "REVIEWING")
+            self.assertEqual(json.loads(plan["review_failure_history"]), {})
+
+    def test_review_failure_then_verify_failure_keeps_stage_counts_independent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state_dir, connection = self._active_worker_project(directory)
+            roles = []
+            worker_sessions = []
+            reviewer_sessions = []
+            review_messages = iter(
+                ("ISSUE_ID: app.py::issue-a::blocking\nblocking issue A\nVERDICT: FAIL", "VERDICT: PASS")
+            )
+            worker_version = 1
+            transitions = []
+            original_transition = loop_manager.transition_validation_failure
+
+            def record_transition(*args, **kwargs):
+                decision = original_transition(*args, **kwargs)
+                transitions.append(
+                    (decision.stage, decision.fingerprint, decision.occurrences)
+                )
+                return decision
+
+            def agent(worktree, _state, _config, role_name, _prompt, **kwargs):
+                nonlocal worker_version
+                roles.append(role_name)
+                if role_name == "worker":
+                    worker_sessions.append(kwargs["session_id"])
+                    worker_version += 1
+                    (worktree / "src/app.py").write_text(
+                        f"VALUE = {worker_version}\n", encoding="utf-8"
+                    )
+                    return loop_manager.CodexResult(
+                        0,
+                        worker_result(f"Record review recovery {worker_version}"),
+                        "worker-session",
+                    )
+                reviewer_sessions.append(kwargs["session_id"])
+                return loop_manager.CodexResult(
+                    0, next(review_messages), "reviewer-session"
+                )
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch",
+                side_effect=[
+                    None,
+                    None,
+                    None,
+                    {"url": "https://example.test/pr/13"},
+                ],
+            ), mock.patch(
+                "loop_manager.run_codex", side_effect=agent
+            ), mock.patch(
+                "loop_manager.verify",
+                side_effect=[
+                    (True, "verify: PASS"),
+                    (False, "verify issue V"),
+                    (True, "verify: PASS"),
+                ],
+            ), mock.patch(
+                "loop_manager.transition_validation_failure",
+                side_effect=record_transition,
+            ):
+                result = loop_manager.run_project_result(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            row = connection.execute(
+                "SELECT phase, reviewer_session_id FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            plan = connection.execute(
+                "SELECT verify_failure_history, review_failure_history "
+                "FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
+        self.assertEqual(
+            roles,
+            ["worker", "reviewer", "worker", "worker", "reviewer"],
+        )
+        self.assertEqual(
+            worker_sessions, [None, "worker-session", "worker-session"]
+        )
+        self.assertEqual(
+            reviewer_sessions, [None, "reviewer-session"]
+        )
+        self.assertEqual(
+            [(stage, occurrences) for stage, _fingerprint, occurrences in transitions],
+            [("review", 1), ("verify", 1)],
+        )
+        self.assertEqual(row["phase"], "PR_OPEN")
+        self.assertEqual(row["reviewer_session_id"], "reviewer-session")
+        self.assertEqual(json.loads(plan["verify_failure_history"]), {})
+        self.assertEqual(json.loads(plan["review_failure_history"]), {})
+
+    def test_existing_database_migrates_recovery_fields_without_losing_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            database = sqlite3.connect(state_dir / "loop-manager.db")
+            legacy_projects = loop_manager.SCHEMA.replace(
+                "    reviewer_session_id TEXT,\n", ""
+            ).replace("    review_result TEXT,\n", "")
+            legacy_execplans = loop_manager.EXEC_PLANS_SCHEMA
+            for line in (
+                "    reviewer_session_id TEXT,\n",
+                "    review_result TEXT,\n",
+                "    verify_failure_history TEXT NOT NULL DEFAULT '{}',\n",
+                "    review_failure_history TEXT NOT NULL DEFAULT '{}',\n",
+            ):
+                legacy_execplans = legacy_execplans.replace(line, "")
+            database.execute(legacy_projects)
+            database.execute(legacy_execplans)
+            database.execute(
+                "INSERT INTO projects (repo, base_branch, phase) "
+                "VALUES ('repo', 'main', 'VERIFYING')"
+            )
+            database.execute(
+                """
+                INSERT INTO exec_plans (
+                    repo, plan_id, path, title, sources, depends_on, priority,
+                    content_hash, status, retry_count
+                ) VALUES ('repo', 'G-013', 'plan.md', 'Plan', '[]', '[]',
+                          'critical', 'hash', 'VERIFYING', 2)
+                """
+            )
+            database.commit()
+            database.close()
+
+            with loop_manager.connect_database(state_dir) as migrated:
+                project_columns = {
+                    row[1] for row in migrated.execute("PRAGMA table_info(projects)")
+                }
+                plan_columns = {
+                    row[1] for row in migrated.execute("PRAGMA table_info(exec_plans)")
+                }
+                row = migrated.execute(
+                    "SELECT retry_count, verify_failure_history, "
+                    "review_failure_history FROM exec_plans"
+                ).fetchone()
+
+        self.assertTrue(
+            {"reviewer_session_id", "review_result"} <= project_columns
+        )
+        self.assertTrue(
+            {
+                "reviewer_session_id",
+                "review_result",
+                "verify_failure_history",
+                "review_failure_history",
+            }
+            <= plan_columns
+        )
+        self.assertEqual(row["retry_count"], 2)
+        self.assertEqual(json.loads(row["verify_failure_history"]), {})
+        self.assertEqual(json.loads(row["review_failure_history"]), {})
+
+
 class WorkerPublicationTest(unittest.TestCase):
     plan = {"id": "G-008", "title": "Descriptive Worker Commits"}
 
@@ -2895,8 +3964,26 @@ class WorkerPublicationTest(unittest.TestCase):
         self.assertEqual(publication.commit_title, "Store immutable plan links")
         self.assertEqual(publication.summary, "Adds immutable PR context.")
         self.assertEqual(publication.test_evidence, "test_one: PASS")
+        resolved = loop_manager.parse_worker_result(
+            worker_result(
+                "Record resolved test evidence",
+                "Records a corrected targeted test.",
+                "FAILED_COMMAND: python3 -m unittest tests.test_one\n"
+                "first run: FAIL\n"
+                "RERUN: python3 -m unittest tests.test_one\nPASS",
+            ),
+            self.plan,
+        )
+        self.assertIn(
+            "RERUN: python3 -m unittest tests.test_one", resolved.test_evidence
+        )
         invalid_results = (
             worker_result("", "Summary", "test: PASS"),
+            worker_result(
+                "Report unresolved targeted failure",
+                "Summary",
+                "test: FAIL",
+            ),
             "COMMIT_TITLE: First line\nsecond line\nPR_SUMMARY: Summary\nTARGETED_TESTS:\ntest: PASS",
             worker_result("Descriptive Worker Commits", "Summary", "test: PASS"),
             worker_result("Implement G-008: Descriptive Worker Commits", "Summary", "test: PASS"),
@@ -2914,6 +4001,60 @@ class WorkerPublicationTest(unittest.TestCase):
             with self.subTest(result=result):
                 with self.assertRaises(loop_manager.WorkerResultError):
                     loop_manager.parse_worker_result(result, self.plan)
+
+    def test_targeted_test_evidence_requires_a_clean_explicit_rerun(self):
+        valid_evidence = (
+            "pytest: 0 failed, 2 passed",
+            (
+                "FAILED_COMMAND: python3  -m unittest tests.test_case\n"
+                "first run: 1 failed, 2 passed\n"
+                "RERUN: python3 -m  unittest tests.test_case\n3 passed"
+            ),
+            (
+                "FAILED_COMMAND: python3 -m unittest tests.test_syntax\n"
+                "first run: SyntaxError 발생\n"
+                "RERUN: python3 -m unittest tests.test_syntax\n1 passed"
+            ),
+        )
+        for evidence in valid_evidence:
+            with self.subTest(evidence=evidence):
+                publication = loop_manager.parse_worker_result(
+                    worker_result(
+                        "Validate clean targeted reruns", "Summary", evidence
+                    ),
+                    self.plan,
+                )
+                self.assertEqual(publication.test_evidence, evidence)
+
+        invalid_evidence = (
+            "pytest: 1 failed, 2 passed",
+            "unittest: 1 error, 2 passed",
+            "RERUN: pytest: 1 failed, 2 passed",
+            "SyntaxError 발생, 수정 후 통과",
+            "targeted test raised AssertionError: mismatch; then passed",
+            "targeted test: FAIL\nunable to run the rerun",
+            (
+                "FAILED_COMMAND: python3 -m unittest tests.test_a\n"
+                "test_a: FAIL\n"
+                "RERUN: python3 -m unittest tests.test_b\nPASS"
+            ),
+            (
+                "FAILED_COMMAND: python3 -m unittest tests.test_a\n"
+                "test_a: FAIL\n"
+                "RERUN: python3 -m unittest tests.test_a\n"
+                "FAILED_COMMAND: python3 -m unittest tests.test_b\n"
+                "test_b OK"
+            ),
+        )
+        for evidence in invalid_evidence:
+            with self.subTest(evidence=evidence):
+                with self.assertRaises(loop_manager.WorkerResultError):
+                    loop_manager.parse_worker_result(
+                        worker_result(
+                            "Reject mixed targeted summaries", "Summary", evidence
+                        ),
+                        self.plan,
+                    )
 
     def test_github_origin_normalization_matches_repository_validation(self):
         self.assertEqual(
@@ -3077,7 +4218,7 @@ class WorkerPublicationTest(unittest.TestCase):
                 )
             )
             versions = iter((2, 3, 4))
-            review_messages = iter(("VERDICT: FAIL", "VERDICT: PASS"))
+            review_messages = iter(("ISSUE_ID: src/app.py::value::incorrect\nVERDICT: FAIL", "VERDICT: PASS"))
             reviewer_prompts = []
             logs = []
 
@@ -3111,13 +4252,12 @@ class WorkerPublicationTest(unittest.TestCase):
                 "loop_manager.verify",
                 side_effect=[(False, "verify failed"), (True, "verify: PASS"), (True, "verify: PASS")],
             ), mock.patch("loop_manager.command", side_effect=command_stub), mock.patch("loop_manager.operation_log", side_effect=lambda message, **kwargs: logs.append((message, kwargs))):
-                for expected in (1, 1, 0):
-                    self.assertEqual(
-                        loop_manager.run_project(
-                            connection, state_dir, str(repo), Path("unused.ini"), "main", False
-                        ),
-                        expected,
-                    )
+                self.assertEqual(
+                    loop_manager.run_project(
+                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                    ),
+                    0,
+                )
                 row = connection.execute(
                     "SELECT worker_result, phase FROM projects WHERE repo = ?", (str(repo),)
                 ).fetchone()
@@ -3191,22 +4331,33 @@ class WorkerPublicationTest(unittest.TestCase):
             sessions = []
             prompts = []
 
-            def worker(_worktree, _state, _config, _role, prompt, **kwargs):
+            def worker(agent_worktree, _state, _config, role_name, prompt, **kwargs):
+                if role_name == "reviewer":
+                    return loop_manager.CodexResult(
+                        0, "VERDICT: PASS", "reviewer-session"
+                    )
                 sessions.append(kwargs["session_id"])
                 prompts.append(prompt)
-                result = (
-                    worker_result("Worker Boundary", "Bad title", "test: PASS")
-                    if len(sessions) == 1
-                    else worker_result("Validate worker metadata", "Good title", "test: PASS")
-                )
+                if len(sessions) == 1:
+                    result = worker_result(
+                        "Worker Boundary", "Bad title", "test: PASS"
+                    )
+                else:
+                    (agent_worktree / "src/app.py").write_text(
+                        "VALUE = 2\n", encoding="utf-8"
+                    )
+                    result = worker_result(
+                        "Validate worker metadata", "Good title", "test: PASS"
+                    )
                 return loop_manager.CodexResult(0, result, "worker-session")
 
             with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
                 "loop_manager.remote_base", return_value="main"
             ), mock.patch("loop_manager.ensure_safe_base_worktree"), mock.patch(
-                "loop_manager.pr_for_branch", return_value=None
+                "loop_manager.pr_for_branch",
+                side_effect=[None, None, {"url": "https://example.test/pr/1"}],
             ), mock.patch("loop_manager.run_codex", side_effect=worker), mock.patch(
-                "loop_manager.verify", return_value=(False, "verify failed")
+                "loop_manager.verify", return_value=(True, "verify: PASS")
             ) as verify:
                 self.assertEqual(
                     loop_manager.run_project(
@@ -3225,7 +4376,7 @@ class WorkerPublicationTest(unittest.TestCase):
                     loop_manager.run_project(
                         connection, state_dir, str(repo), Path("unused.ini"), "main", False
                     ),
-                    1,
+                    0,
                 )
 
             self.assertEqual(sessions, [None, "worker-session"])
@@ -5753,7 +6904,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     ),
                     "created after rebase",
                 )
-                return 1, "VERDICT: FAIL\nstop after publication check"
+                return 1, "stop after publication check"
 
             def verify_after_rebase(agent_worktree):
                 verify_calls.append(agent_worktree)
@@ -5800,8 +6951,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
             self.assertEqual(result, 1)
             self.assertEqual(roles, ["worker", "reviewer"])
             self.assertEqual(len(verify_calls), 2)
-            self.assertEqual(project["phase"], "WORKING")
-            self.assertIn("Review 실패", project["last_error"])
+            self.assertEqual(project["phase"], "REVIEWING")
+            self.assertIn("stop after publication check", project["last_error"])
             self.assertIn("src/app.py", published_paths)
             self.assertIn("verify-output.txt", published_paths)
             self.assertEqual(
@@ -6576,13 +7727,19 @@ class WorkspaceRecoveryTest(unittest.TestCase):
             ):
                 self.assertEqual(role_name, "worker")
                 sessions.append(kwargs["session_id"])
-                (agent_worktree / "src/app.py").write_text(
-                    "VALUE = 'resolved'\n",
-                    encoding="utf-8",
-                )
+                if len(sessions) == 1:
+                    (agent_worktree / "src/app.py").write_text(
+                        "VALUE = 'resolved'\n",
+                        encoding="utf-8",
+                    )
+                    return loop_manager.CodexResult(
+                        0,
+                        worker_result(),
+                        "worker-session",
+                    )
                 return loop_manager.CodexResult(
-                    0,
-                    worker_result(),
+                    1,
+                    "stop after same-run verify recovery",
                     "worker-session",
                 )
 
@@ -6614,11 +7771,13 @@ class WorkspaceRecoveryTest(unittest.TestCase):
                 (str(repo),),
             ).fetchone()
             self.assertEqual(resumed_result, 1)
-            self.assertEqual(sessions, ["worker-session"])
+            self.assertEqual(
+                sessions, ["worker-session", "worker-session"]
+            )
             self.assertEqual(resumed["phase"], "WORKING")
             self.assertEqual(
                 resumed["last_error"],
-                "전체 검증 실패:\nstop after rebase resolution",
+                "stop after same-run verify recovery",
             )
             self.assertFalse(
                 loop_manager._rebase_in_progress_for_branch(worktree, branch)
@@ -7195,14 +8354,32 @@ class WorkspaceRecoveryTest(unittest.TestCase):
                 "headRefOid": pr_head,
             }
 
+            def planner(_worktree, _state, _config, role_name, _prompt, **_kwargs):
+                self.assertEqual(role_name, "planner")
+                return loop_manager.CodexResult(0, "", "planner-session")
+
             with mock.patch(
                 "loop_manager.validate_repository", return_value=repo
             ), mock.patch(
                 "loop_manager.pr_for_branch", return_value=merged_pr
             ), mock.patch(
-                "loop_manager.run_codex"
+                "loop_manager.run_codex", side_effect=planner
             ) as run_agent:
-                result = loop_manager.run_project(
+                merge_result = loop_manager.run_project_result(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+                after_merge = connection.execute(
+                    "SELECT phase, planning_fingerprint, processed_sha "
+                    "FROM projects WHERE repo = ?",
+                    (str(repo),),
+                ).fetchone()
+                run_agent.assert_not_called()
+                completion_result = loop_manager.run_project_result(
                     connection,
                     state_dir,
                     str(repo),
@@ -7224,7 +8401,14 @@ class WorkspaceRecoveryTest(unittest.TestCase):
                 "SELECT workspace_owned, reason FROM cleanup_pending WHERE repo = ?",
                 (str(repo),),
             ).fetchone()
-            self.assertEqual(result, 0)
+            self.assertEqual(merge_result.kind, loop_manager.ProjectRunKind.WAITING)
+            self.assertEqual(merge_result.exit_code, 0)
+            self.assertEqual(
+                completion_result.kind,
+                loop_manager.ProjectRunKind.COMPLETED,
+            )
+            self.assertEqual(completion_result.exit_code, 0)
+            self.assertEqual(tuple(after_merge), (None, None, None))
             self.assertEqual(tuple(project), (None, None))
             self.assertEqual(tuple(plan_status), ("MERGED", 0))
             self.assertEqual(pending["workspace_owned"], 0)
@@ -7234,7 +8418,7 @@ class WorkspaceRecoveryTest(unittest.TestCase):
             )
             self.assertTrue(worktree.is_dir())
             self.assertEqual(git_command(worktree, "rev-parse", "HEAD"), pr_head)
-            run_agent.assert_not_called()
+            run_agent.assert_called_once()
 
     def test_merge_cleanup_preserves_unowned_saved_path_as_nonblocking_pending(self):
         with tempfile.TemporaryDirectory() as directory:
