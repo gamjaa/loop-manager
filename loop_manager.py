@@ -787,7 +787,35 @@ def register_execplans(
         )
 
 
-def migrate_legacy_execplans(connection: sqlite3.Connection) -> None:
+def _legacy_plan_sha(root: Path, revision: str, relative_path: str) -> str:
+    result = git(
+        root,
+        "log",
+        revision,
+        "--diff-filter=A",
+        "--format=%H",
+        "--",
+        relative_path,
+        check=False,
+    )
+    commits = [
+        value
+        for value in result.stdout.splitlines()
+        if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", value)
+    ]
+    if len(commits) != 1:
+        raise RuntimeError(
+            f"Legacy ExecPlan의 게시 commit을 안전하게 확인할 수 없습니다: {relative_path}"
+        )
+    return commits[0]
+
+
+def migrate_legacy_execplans(
+    connection: sqlite3.Connection,
+    *,
+    reconcile_history: bool = False,
+    target_repo: str | None = None,
+) -> None:
     """Conservatively move legacy project-owned execution state into the catalog."""
 
     _ensure_execplans_schema(connection)
@@ -799,12 +827,19 @@ def migrate_legacy_execplans(connection: sqlite3.Connection) -> None:
         "PR_OPEN": "PR_OPEN",
         "BLOCKED": "BLOCKED",
     }
-    projects = connection.execute("SELECT * FROM projects ORDER BY repo").fetchall()
+    if target_repo is None:
+        projects = connection.execute("SELECT * FROM projects ORDER BY repo").fetchall()
+    else:
+        projects = connection.execute(
+            "SELECT * FROM projects WHERE repo = ?", (target_repo,)
+        ).fetchall()
     with connection:
         for project in projects:
             if project["phase"] == "PLANNING":
                 continue
             root = Path(project["repo"])
+            if reconcile_history:
+                git(root, "fetch", "origin")
             active_path = str(project["plan_path"] or "")
             documents: dict[str, str] = {}
             plans_directory = root / "docs/plans"
@@ -853,7 +888,24 @@ def migrate_legacy_execplans(connection: sqlite3.Connection) -> None:
                 ).fetchone():
                     continue
                 is_active = relative_path == active_path and project["phase"] in phase_status
-                status = phase_status[str(project["phase"])] if is_active else "MERGED"
+                if not is_active and not reconcile_history:
+                    continue
+                historical_pr = None
+                if is_active:
+                    status = phase_status[str(project["phase"])]
+                    plan_sha = project["plan_sha"]
+                else:
+                    historical_pr = pr_for_branch(root, f"loop-manager/{plan_id}")
+                    if historical_pr is None:
+                        status = "READY"
+                    elif historical_pr["state"] == "MERGED" or historical_pr.get("mergedAt"):
+                        status = "MERGED"
+                    else:
+                        raise RuntimeError(
+                            f"Legacy ExecPlan의 PR 상태를 자동 이관할 수 없습니다: "
+                            f"{plan_id} ({historical_pr['state']})"
+                        )
+                    plan_sha = _legacy_plan_sha(root, revision, relative_path)
                 sources, dependencies, priority = _execplan_metadata(plan)
                 connection.execute(
                     """
@@ -873,11 +925,13 @@ def migrate_legacy_execplans(connection: sqlite3.Connection) -> None:
                         priority,
                         hashlib.sha256(plan_text.encode("utf-8")).hexdigest(),
                         status,
-                        project["plan_sha"] if is_active else None,
+                        plan_sha,
                         project["active_sha"] if is_active else None,
                         project["branch"] if is_active else None,
                         project["worktree"] if is_active else None,
-                        project["pr_url"] if is_active else None,
+                        project["pr_url"] if is_active else (
+                            str(historical_pr["url"]) if historical_pr else None
+                        ),
                         project["last_error"] if is_active else None,
                         project["worker_session_id"] if is_active else None,
                         project["worker_result"] if is_active else None,
@@ -1933,7 +1987,11 @@ def run_project(
     repo_path = validate_repository(Path(repo_arg), allow_agents_mismatch=allow_agents_mismatch)
     repo = str(repo_path)
     _ensure_execplans_schema(connection)
-    migrate_legacy_execplans(connection)
+    migrate_legacy_execplans(
+        connection,
+        reconcile_history=True,
+        target_repo=repo,
+    )
     row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
     if row:
         hydrate_active_project(connection, repo)
@@ -2007,7 +2065,11 @@ def run_project(
     if not row:
         connection.execute("INSERT INTO projects (repo, base_branch) VALUES (?, ?)", (repo, base))
         connection.commit()
-        migrate_legacy_execplans(connection)
+        migrate_legacy_execplans(
+            connection,
+            reconcile_history=True,
+            target_repo=repo,
+        )
         row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
     elif not row["phase"]:
         update_project(connection, repo, base_branch=base)
@@ -2373,17 +2435,19 @@ def run_project(
         dirty = bool(git(worktree, "status", "--porcelain").stdout.strip())
         ahead = int(git(worktree, "rev-list", "--count", f"origin/{base}..HEAD").stdout)
         if not dirty and not ahead:
-            git(repo_path, "worktree", "remove", str(worktree))
-            plan_id = _plan_id_from_path(str(row["plan_path"]))
-            if plan_id:
-                connection.execute(
-                    "UPDATE exec_plans SET status = 'MERGED' WHERE repo = ? AND plan_id = ?",
-                    (repo, plan_id),
-                )
-                connection.commit()
-            clear_active(connection, repo)
-            operation_print("추가로 구현할 작업이 없습니다.")
-            return 0
+            no_change_error = (
+                "Worker가 변경을 만들지 않아 PR을 생성할 수 없습니다. "
+                "ExecPlan은 연결된 PR의 Merge가 확인된 경우에만 MERGED가 됩니다."
+            )
+            update_project(
+                connection,
+                repo,
+                phase="BLOCKED",
+                verify_result=output,
+                last_error=no_change_error,
+            )
+            operation_print(no_change_error, file=sys.stderr)
+            return 1
         if dirty:
             git(worktree, "add", "-A")
             plan = validate_execplan(worktree, row["plan_path"])

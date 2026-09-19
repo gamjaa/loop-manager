@@ -188,11 +188,15 @@ class AutomationFirstCatalogTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "priority"):
                 loop_manager._parse_execplan(root, invalid)
 
-    def test_legacy_database_migration_preserves_active_plan_and_marks_history_merged(self):
+    def test_legacy_database_migration_reconciles_only_confirmed_merge_history(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = make_catalog_root(str(Path(directory) / "project"))
+            root = make_remote_repository(directory)
+            (root / "docs/plans").mkdir()
             write_execplan(root, "G-001", "Completed", priority=None)
-            active = write_execplan(root, "G-002", "Active", priority="high")
+            write_execplan(root, "G-002", "Unconfirmed")
+            active = write_execplan(root, "G-003", "Active", priority="high")
+            commit_and_push(root, "Add legacy plans")
+            plan_sha = git_command(root, "rev-parse", "HEAD")
             state_dir = Path(directory) / "state"
             state_dir.mkdir()
             database = sqlite3.connect(state_dir / "loop-manager.db")
@@ -202,28 +206,59 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                 INSERT INTO projects (
                     repo, base_branch, phase, plan_path, plan_sha, active_sha,
                     branch, worktree, pr_url, worker_session_id
-                ) VALUES (?, 'main', 'PR_OPEN', ?, 'plan-sha', 'base-sha',
-                          'loop-manager/G-002', 'managed', 'https://pr/2', 'worker-session')
+                ) VALUES (?, 'main', 'PR_OPEN', ?, ?, 'base-sha',
+                          'loop-manager/G-003', 'managed', 'https://pr/3', 'worker-session')
                 """,
-                (str(root), active.relative_to(root).as_posix()),
+                (str(root), active.relative_to(root).as_posix(), plan_sha),
             )
             database.commit()
             database.close()
 
             with loop_manager.connect_database(state_dir) as connection:
+                before_reconciliation = connection.execute(
+                    "SELECT plan_id, status FROM exec_plans WHERE repo = ? ORDER BY plan_id",
+                    (str(root),),
+                ).fetchall()
+                looked_up = []
+
+                def history(_repo, branch, _url=None):
+                    looked_up.append(branch)
+                    if branch == "loop-manager/G-001":
+                        return {
+                            "url": "https://pr/1",
+                            "state": "MERGED",
+                            "mergedAt": "2026-01-01T00:00:00Z",
+                        }
+                    return None
+
+                with mock.patch("loop_manager.pr_for_branch", side_effect=history):
+                    loop_manager.migrate_legacy_execplans(
+                        connection,
+                        reconcile_history=True,
+                        target_repo=str(root),
+                    )
                 rows = connection.execute(
                     """
-                    SELECT plan_id, status, priority, pr_url, worker_session_id
+                    SELECT plan_id, status, priority, plan_sha, pr_url, worker_session_id
                     FROM exec_plans WHERE repo = ? ORDER BY plan_id
                     """,
                     (str(root),),
                 ).fetchall()
 
         self.assertEqual(
+            [tuple(row) for row in before_reconciliation],
+            [("G-003", "PR_OPEN")],
+        )
+        self.assertEqual(
+            looked_up,
+            ["loop-manager/G-001", "loop-manager/G-002"],
+        )
+        self.assertEqual(
             [tuple(row) for row in rows],
             [
-                ("G-001", "MERGED", "normal", None, None),
-                ("G-002", "PR_OPEN", "high", "https://pr/2", "worker-session"),
+                ("G-001", "MERGED", "normal", plan_sha, "https://pr/1", None),
+                ("G-002", "READY", "normal", plan_sha, None, None),
+                ("G-003", "PR_OPEN", "high", plan_sha, "https://pr/3", "worker-session"),
             ],
         )
 
@@ -2246,6 +2281,73 @@ risk: medium
         )
         connection.commit()
         return repo, state_dir, connection
+
+    def test_worker_without_diff_blocks_plan_until_pr_merge(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state_dir, connection = self._make_active_worker_project(directory)
+            commit_and_push(repo, "Add worker plan")
+            plan_sha = git_command(repo, "rev-parse", "HEAD")
+            connection.execute(
+                """
+                UPDATE projects
+                SET active_sha = ?, plan_sha = ?
+                WHERE repo = ?
+                """,
+                (plan_sha, plan_sha, str(repo)),
+            )
+            connection.commit()
+            roles = []
+
+            def worker(_worktree, _state, _config, role_name, _prompt, **_kwargs):
+                roles.append(role_name)
+                return loop_manager.CodexResult(0, worker_result(), "worker-session")
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.run_codex", side_effect=worker
+            ), mock.patch(
+                "loop_manager.verify", return_value=(True, "verify: PASS")
+            ) as verify:
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                """
+                SELECT phase, worktree, pr_url, last_error, verify_result
+                FROM projects WHERE repo = ?
+                """,
+                (str(repo),),
+            ).fetchone()
+            plan = connection.execute(
+                "SELECT status, pr_url, last_error FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            worktree_preserved = Path(project["worktree"]).exists()
+
+        self.assertEqual(result, 1)
+        self.assertEqual(roles, ["worker"])
+        verify.assert_called_once()
+        self.assertEqual(project["phase"], "BLOCKED")
+        self.assertEqual(project["verify_result"], "verify: PASS")
+        self.assertIsNone(project["pr_url"])
+        self.assertTrue(worktree_preserved)
+        self.assertIn("PR을 생성할 수 없습니다", project["last_error"])
+        self.assertEqual(plan["status"], "BLOCKED")
+        self.assertIsNone(plan["pr_url"])
+        self.assertEqual(plan["last_error"], project["last_error"])
 
     def test_worker_and_reviewer_prompts_define_test_execution_boundary(self):
         worker = loop_manager.worker_prompt("docs/plans/[G-001] Worker Boundary.md", None)
