@@ -1888,6 +1888,18 @@ def run_codex(
     return returncode, message.strip()
 
 
+class VerifyOutput(str):
+    """Bounded persisted feedback that retains full output for fingerprinting."""
+
+    fingerprint_source: str
+
+    def __new__(cls, output: str) -> VerifyOutput:
+        fingerprint_source = output.strip()
+        instance = super().__new__(cls, fingerprint_source[-8000:])
+        instance.fingerprint_source = fingerprint_source
+        return instance
+
+
 def verify(worktree: Path) -> tuple[bool, str]:
     if os.name == "nt":
         script = worktree / "scripts/verify.ps1"
@@ -1899,7 +1911,7 @@ def verify(worktree: Path) -> tuple[bool, str]:
     if not script.is_file():
         return False, f"전체 검증 스크립트가 없습니다: {script.relative_to(worktree)}"
     result = command(arguments, cwd=worktree, check=False)
-    return result.returncode == 0, result.stdout[-8000:].strip()
+    return result.returncode == 0, VerifyOutput(result.stdout)
 
 
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -1926,7 +1938,10 @@ def normalize_validation_failure(
 
     if stage not in {"verify", "review"}:
         raise ValueError(f"검증 실패 단계가 유효하지 않습니다: {stage}")
-    normalized = output.replace("\r\n", "\n").replace("\r", "\n")
+    fingerprint_source = (
+        output.fingerprint_source if isinstance(output, VerifyOutput) else output
+    )
+    normalized = fingerprint_source.replace("\r\n", "\n").replace("\r", "\n")
     normalized = _ANSI_ESCAPE.sub("", normalized)
     if worktree is not None:
         path_values = {
@@ -1943,7 +1958,13 @@ def normalize_validation_failure(
                     normalized,
                     flags=re.IGNORECASE,
                 )
-    normalized = _TEMP_PATH_NOISE.sub("<TEMP_PATH>", normalized)
+    normalized = _TEMP_PATH_NOISE.sub(
+        lambda match: (
+            "<TEMP_PATH>/"
+            + re.split(r"[\\/]", match.group(0).rstrip("\\/"))[-1]
+        ),
+        normalized,
+    )
     normalized = _TIMESTAMP_NOISE.sub("<TIMESTAMP>", normalized)
     normalized = _DURATION_NOISE.sub("<DURATION>", normalized)
     lines = []
@@ -7133,6 +7154,11 @@ def _run_project_step(
             operation_print(output, file=sys.stderr)
             return 1 if decision.blocked else PROJECT_STEP_RETRY
 
+        # Every successful verify is a progress boundary. Clear its stage-local
+        # history before checking for a newer base or running a second verify
+        # after rebase, so later failures cannot inherit pre-success repeats.
+        clear_validation_failure_history(connection, repo, "verify")
+
         dirty = bool(git(worktree, "status", "--porcelain").stdout.strip())
         if not dirty and not branch_has_changes(worktree, base):
             no_change_error = (
@@ -7178,6 +7204,9 @@ def _run_project_step(
                 )
                 operation_print(rebased.stdout, file=sys.stderr)
                 return 1
+            # The rebase completed even if its follow-up verify later fails.
+            # Persist the new base now so recovery does not repeat that rebase.
+            update_project(connection, repo, active_sha=latest_sha)
             operation_log(f"전체 verify 시작: {plan['id']} {plan['title']} (rebase 후)")
             verify_scope_before = begin_agent_scope(
                 connection,
@@ -7233,7 +7262,6 @@ def _run_project_step(
                 git(worktree, "commit", "-m", worker_publication.commit_title)
             update_project(connection, repo, active_sha=latest_sha, verify_result=output)
         else:
-            clear_validation_failure_history(connection, repo, "verify")
             update_project(connection, repo, verify_result=output)
         try:
             plan = validate_active_execplan_metadata(

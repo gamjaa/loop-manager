@@ -2816,12 +2816,24 @@ risk: medium
             [record["occurrences"] for record in history.values()], [4]
         )
 
-    def test_rebase_verify_failure_uses_same_fingerprint_limit(self):
+    def test_rebase_verify_failure_recovers_after_initial_success(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, state_dir, connection = self._make_active_worker_project(directory)
             original_git = loop_manager.git
             origin_reads = 0
             sessions = []
+            loop_manager.migrate_legacy_execplans(
+                connection, target_repo=str(repo)
+            )
+            managed = Path(
+                connection.execute(
+                    "SELECT worktree FROM projects WHERE repo = ?", (str(repo),)
+                ).fetchone()["worktree"]
+            )
+            for _ in range(3):
+                loop_manager.transition_validation_failure(
+                    connection, str(repo), managed, "verify", "rebased verify failed"
+                )
 
             def git_after_base_advance(path, *arguments, **kwargs):
                 nonlocal origin_reads
@@ -2838,6 +2850,10 @@ risk: medium
                 return original_git(path, *arguments, **kwargs)
 
             def worker(worktree, _state, _config, role_name, _prompt, **kwargs):
+                if role_name == "reviewer":
+                    return loop_manager.CodexResult(
+                        0, "VERDICT: PASS", "reviewer-session"
+                    )
                 self.assertEqual(role_name, "worker")
                 sessions.append(kwargs["session_id"])
                 (worktree / "src/app.py").write_text(
@@ -2850,12 +2866,9 @@ risk: medium
                 )
 
             verify_results = [
-                result
-                for _ in range(4)
-                for result in (
-                    (True, "first verify"),
-                    (False, "rebased verify failed"),
-                )
+                (True, "first verify"),
+                (False, "rebased verify failed"),
+                (True, "final verify"),
             ]
             with mock.patch(
                 "loop_manager.validate_repository", return_value=repo
@@ -2864,7 +2877,10 @@ risk: medium
             ), mock.patch(
                 "loop_manager.ensure_safe_base_worktree"
             ), mock.patch(
-                "loop_manager.pr_for_branch", return_value=None
+                "loop_manager.pr_for_branch",
+                side_effect=[
+                    None, None, {"url": "https://example.test/pr/1"}
+                ],
             ), mock.patch(
                 "loop_manager.run_codex", side_effect=worker
             ), mock.patch(
@@ -2881,19 +2897,23 @@ risk: medium
                         "main",
                         False,
                     ),
-                    1,
+                    0,
                 )
 
             row = connection.execute(
                 "SELECT phase, last_error FROM projects WHERE repo = ?",
                 (str(repo),),
             ).fetchone()
+            plan = connection.execute(
+                "SELECT verify_failure_history FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-001'", (str(repo),)
+            ).fetchone()
 
-        self.assertEqual(row["phase"], "BLOCKED")
-        self.assertIn("rebased verify failed", row["last_error"])
-        self.assertIn("실패 지문:", row["last_error"])
-        self.assertEqual(verify.call_count, 8)
-        self.assertEqual(sessions, [None] + ["worker-session"] * 3)
+        self.assertEqual(row["phase"], "PR_OPEN")
+        self.assertIsNone(row["last_error"])
+        self.assertEqual(json.loads(plan["verify_failure_history"]), {})
+        self.assertEqual(verify.call_count, 3)
+        self.assertEqual(sessions, [None, "worker-session"])
 
     def test_verify_success_passes_worker_and_verify_results_to_reviewer(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -3057,11 +3077,55 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         review_fingerprint, _ = loop_manager.validation_failure_fingerprint(
             "review", second + "\nVERDICT: FAIL", second_root
         )
+        same_temp_first, _ = loop_manager.validation_failure_fingerprint(
+            "verify", "FAIL /tmp/run-one/test_same.py:42"
+        )
+        same_temp_second, _ = loop_manager.validation_failure_fingerprint(
+            "verify", "FAIL /tmp/run-two/test_same.py:42"
+        )
+        different_temp_file, _ = loop_manager.validation_failure_fingerprint(
+            "verify", "FAIL /tmp/run-three/test_other.py:42"
+        )
 
         self.assertEqual(first_normalized, second_normalized)
         self.assertEqual(first_fingerprint, second_fingerprint)
         self.assertNotEqual(first_fingerprint, changed_fingerprint)
         self.assertNotEqual(first_fingerprint, review_fingerprint)
+        self.assertEqual(same_temp_first, same_temp_second)
+        self.assertNotEqual(same_temp_first, different_temp_file)
+
+    def test_verify_fingerprint_uses_full_output_before_feedback_truncation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            scripts = worktree / "scripts"
+            scripts.mkdir()
+            (scripts / "verify.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+            lines = [
+                f"FAIL tests/test_{index:04}.py::test_case assertion {index}"
+                for index in range(400)
+            ]
+            ordered = "\n".join(lines)
+            reordered = "\n".join(reversed(lines))
+            results = [
+                subprocess.CompletedProcess(["verify"], 1, stdout=ordered),
+                subprocess.CompletedProcess(["verify"], 1, stdout=reordered),
+            ]
+            with mock.patch("loop_manager.command", side_effect=results):
+                first_passed, first_output = loop_manager.verify(worktree)
+                second_passed, second_output = loop_manager.verify(worktree)
+
+        self.assertFalse(first_passed)
+        self.assertFalse(second_passed)
+        self.assertLessEqual(len(first_output), 8000)
+        self.assertLessEqual(len(second_output), 8000)
+        self.assertNotEqual(first_output, second_output)
+        first_fingerprint, _ = loop_manager.validation_failure_fingerprint(
+            "verify", first_output, worktree
+        )
+        second_fingerprint, _ = loop_manager.validation_failure_fingerprint(
+            "verify", second_output, worktree
+        )
+        self.assertEqual(first_fingerprint, second_fingerprint)
 
     def test_stage_histories_survive_cycles_and_block_only_fourth_occurrence(self):
         with tempfile.TemporaryDirectory() as directory:
