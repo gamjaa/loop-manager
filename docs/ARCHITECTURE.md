@@ -173,9 +173,10 @@ ExecPlan 파일은 구현 PR에 처음 포함하지 않는다. Planner 단계에
 - Planner는 PRODUCT, 활성 Requirement, ARCHITECTURE, 현재 코드와 완료되거나 대기 중인 ExecPlan을 읽고 현재 식별 가능한 미충족 작업 전체를 한 계획 주기에 작성한다
 - Planner는 안전한 무인 실행 차단과 반복적인 사용자 복구 제거를 최우선으로 priority를 정하고, 정상 경로 자동화, 그 밖의 Current Goal, 선택적 편의와 최적화 순으로 계획한다
 - Planner는 `docs/plans/*.md`만 생성하거나 수정할 수 있으며 프로그램이 실행 전후 diff로 범위를 검증한다
-- Worker는 ExecPlan을 구현하고 관련 테스트와 전체 검증 스크립트를 작성하거나 갱신한다. 장기 제품 규칙이 바뀔 때만 PRODUCT를, 진행 기록이 필요할 때만 선택된 ExecPlan을 수정할 수 있으며 범위 밖 아이디어는 FUTURE_IDEAS에 기록할 수 있다
-- Worker는 전체 검증 스크립트를 직접 실행하지 않는다
-- Reviewer는 파일을 수정하지 않고 요구사항 충족, 회귀, 테스트 누락과 verify 스크립트 약화를 포함한 blocking issue를 확인한다
+- Worker는 ExecPlan을 구현하고 관련 unit test와 전체 검증 스크립트를 작성하거나 갱신한다. 장기 제품 규칙이 바뀔 때만 PRODUCT를, 진행 기록이 필요할 때만 선택된 ExecPlan을 수정할 수 있으며 범위 밖 아이디어는 FUTURE_IDEAS에 기록할 수 있다
+- Worker는 수정한 코드와 새로 작성하거나 변경한 테스트를 직접 검증하는 최소 범위의 targeted unit test만 실행한다. 실패하면 같은 세션에서 수정하고 해당 테스트를 다시 실행하며, 실행 가능한 관련 unit test가 없으면 그 사유를 결과에 포함한다
+- Worker는 전체 test suite, integration test, end-to-end test, 프로젝트 전체 lint·build·type check와 전체 검증 스크립트를 직접 실행하지 않는다
+- Reviewer는 Worker의 targeted unit test와 프로그램의 전체 verify가 통과한 뒤 실행되며 테스트 command나 verify 스크립트를 다시 실행하지 않는다. 파일을 수정하지 않고 코드, 테스트, verify 스크립트의 diff와 전달된 결과를 읽어 요구사항 충족, 회귀, 테스트 누락과 verify 약화를 포함한 blocking issue를 확인한다
 - 프로그램은 각 Agent 실행 전후 diff를 검사한다. Planner의 범위 위반은 `planning_error` 흐름으로 처리하고, Worker 또는 Reviewer의 범위 위반은 해당 ExecPlan을 BLOCKED로 처리한다
 - Worker와 Reviewer는 ExecPlan이 PR 생성 준비를 마칠 때까지 각자의 세션을 재사용한다
 - 세션을 재개할 수 없으면 같은 worktree, ExecPlan과 저장된 실패 내용을 전달해 새 세션을 시작한다
@@ -226,15 +227,18 @@ BLOCKED → PR_OPEN
 
 ## 검증과 재시도
 
-- Worker는 구현과 관련 targeted test를 작성한다
+- Worker는 구현과 관련 targeted unit test를 작성하고, 수정 범위에 직접 관련된 최소 unit test command만 실행한다
+- targeted unit test 실패는 Worker가 같은 세션에서 수정하고 재실행한다. 실행 가능한 관련 unit test가 없는 변경은 사유를 남기며 전체 검증을 생략하는 근거로 사용하지 않는다
 - Worker는 현재 운영체제용 verify 스크립트가 없으면 생성하고 테스트 명령이 바뀌면 갱신한다
   - Windows: `scripts/verify.ps1`
   - Linux: `scripts/verify.sh`
 - verify 스크립트는 프로젝트 전체 검증을 수행하고 실패 시 0이 아닌 종료 코드를 반환한다
+- 전체 test suite, integration test, end-to-end test, 프로젝트 전체 lint·build·type check는 verify 스크립트만 실행한다
 - 프로그램은 verify 스크립트를 AI Agent 밖에서 실행한다
 - 프로그램은 verify 성공 시 Worker를 다시 호출하거나 성공 출력을 전달하지 않는다
 - verify 실패 시에만 종료 코드와 필요한 출력 내용을 같은 Worker 세션에 전달한다
-- Reviewer는 verify 스크립트 변경이 검증 범위를 약화하지 않았는지 확인한다
+- Reviewer는 성공한 Worker targeted unit test와 전체 verify 결과를 넘겨받고 테스트를 다시 실행하지 않는다
+- Reviewer는 코드와 테스트의 diff 및 verify 스크립트 변경이 검증 범위를 약화하지 않았는지 읽기 전용으로 확인한다
 
 전체 검증과 Review는 최초 실패 후 단계별로 최대 3회 재시도한다. 횟수는 SQLite에 저장해 프로그램 재실행으로 초기화되지 않으며, 성공하거나 BLOCKED 원인 문서가 변경됐을 때 초기화한다. 3회 재시도 후에도 실패하면 BLOCKED로 전이한다.
 

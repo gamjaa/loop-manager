@@ -31,7 +31,9 @@ ExecPlan의 실행 상태, 재시도 횟수, 세션과 작업 공간 정보는 L
 
 Planner는 `docs/plans/*.md`만 생성하거나 수정한다.
 
-Worker는 구현, 관련 targeted test 작성과 전체 검증 스크립트 생성을 담당한다.
+Worker는 구현, 관련 targeted unit test 작성·실행과 전체 검증 스크립트 생성을 담당한다.
+
+Worker는 자신이 수정한 코드와 새로 작성하거나 변경한 테스트를 직접 검증하는 최소 범위의 unit test만 실행한다. targeted unit test가 실패하면 같은 세션에서 원인을 수정하고 해당 테스트를 다시 실행한다. 문서·설정만 변경했거나 실행 가능한 관련 unit test가 없으면 그 사유를 명시한다.
 
 Worker는 프로젝트가 사용하는 언어, 프레임워크와 도구에 맞춰 현재 실행 환경의 전체 검증 스크립트를 생성하고 유지한다.
 - Windows: `scripts/verify.ps1`
@@ -39,9 +41,9 @@ Worker는 프로젝트가 사용하는 언어, 프레임워크와 도구에 맞�
 
 전체 검증 스크립트는 프로젝트에 필요한 전체 테스트와 검증을 실행하고, 실패 시 0이 아닌 종료 코드를 반환해야 한다.
 
-Worker는 전체 검증 스크립트를 직접 실행하지 않는다. Loop Manager 코드가 AI Agent 밖에서 실행하고, 실패한 경우에만 출력 내용을 같은 Worker 세션에 전달한다.
+Worker는 전체 test suite, integration test, end-to-end test, 프로젝트 전체 lint·build·type check와 전체 검증 스크립트를 직접 실행하지 않는다. Loop Manager 코드가 전체 검증 스크립트를 AI Agent 밖에서 실행하고, 실패한 경우에만 출력 내용을 같은 Worker 세션에 전달한다.
 
-Reviewer는 파일을 수정하지 않고 읽기 전용으로 검토한다.
+Reviewer는 파일을 수정하지 않고 읽기 전용으로 검토한다. Worker의 targeted unit test와 Loop Manager의 전체 verify가 통과한 결과를 넘겨받으며, 테스트 command나 전체 검증 스크립트를 다시 실행하지 않는다. 테스트 누락과 검증 약화는 코드, 테스트, verify 스크립트의 diff와 전달된 결과를 기준으로 판단한다.
 
 ## Code Quality and Change Structure
 
