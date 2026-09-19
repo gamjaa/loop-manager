@@ -3363,8 +3363,10 @@ def _blocked_agent_local_baseline(
     result: GitSnapshot,
     current: GitSnapshot,
     worktree: Path,
+    *,
+    allowed_dirty_paths: frozenset[str] = frozenset(),
 ) -> GitSnapshot:
-    """Accept only a diagnosed local result that has not changed again."""
+    """Accept a diagnosed result plus explicit user-edited input files."""
 
     if (
         not before.shared_metadata_complete
@@ -3374,13 +3376,16 @@ def _blocked_agent_local_baseline(
         raise AgentScopeError("저장된 BLOCKED Agent Git metadata 기준 snapshot이 없습니다.")
 
     new_local_changes: set[str] = set()
-    for before_state, result_state, current_state in (
-        (before.index, result.index, current.index),
-        (before.dirty, result.dirty, current.dirty),
+    for state_name, before_state, result_state, current_state in (
+        ("index", before.index, result.index, current.index),
+        ("dirty", before.dirty, result.dirty, current.dirty),
     ):
         for path in set(before_state) | set(result_state) | set(current_state):
             value = current_state.get(path)
-            if value not in (before_state.get(path), result_state.get(path)):
+            if (
+                value not in (before_state.get(path), result_state.get(path))
+                and not (state_name == "dirty" and path in allowed_dirty_paths)
+            ):
                 new_local_changes.add(path)
     if new_local_changes:
         displayed = ", ".join(sorted(new_local_changes)[:8])
@@ -3562,6 +3567,15 @@ def validate_persisted_agent_scope(
                     selected_plan_path if role_name == "worker" else None
                 ),
             )
+        checkpoint_scope_before = checkpoint.snapshot
+        if project["phase"] == "BLOCKED" and selected_plan_path:
+            checkpoint_scope_before = _blocked_agent_local_baseline(
+                checkpoint.snapshot,
+                checkpoint.snapshot,
+                current,
+                saved_worktree,
+                allowed_dirty_paths=frozenset((selected_plan_path,)),
+            )
         manager_refs = frozenset(
             refname
             for refname in set(checkpoint.snapshot.refs) | set(current.refs)
@@ -3582,7 +3596,7 @@ def validate_persisted_agent_scope(
             validate_agent_scope(
                 "reviewer",
                 saved_worktree,
-                checkpoint.snapshot,
+                checkpoint_scope_before,
                 current,
                 allowed_ref_changes=manager_refs,
                 allowed_worktree_changes=allowed_cleanup,
@@ -3611,6 +3625,11 @@ def validate_persisted_agent_scope(
                 blocked_result,
                 current,
                 saved_worktree,
+                allowed_dirty_paths=(
+                    frozenset((selected_plan_path,))
+                    if selected_plan_path
+                    else frozenset()
+                ),
             )
             base = str(project["base_branch"])
             manager_ref_candidates = frozenset(
@@ -3784,6 +3803,7 @@ def validate_blocked_agent_scope(
                 blocked_result,
                 current,
                 worktree,
+                allowed_dirty_paths=frozenset((selected_plan_path,)),
             )
             manager_ref_candidates = frozenset(
                 {f"refs/heads/{base}"}
@@ -3826,6 +3846,8 @@ def preserve_blocked_agent_changes(
     repo: str,
     worktree: Path,
     plan_id: str,
+    *,
+    preserved_input_path: str | None = None,
 ) -> None:
     """Move a diagnosed scope violation out of the publishable worktree."""
 
@@ -3843,16 +3865,40 @@ def preserve_blocked_agent_changes(
             f"보존할 BLOCKED Agent snapshot이 유효하지 않습니다: {error}"
         ) from error
     current = capture_git_snapshot(worktree)
-    _blocked_agent_local_baseline(before, result, current, worktree)
-    stashed = git(
+    allowed_dirty_paths = (
+        frozenset((preserved_input_path,))
+        if preserved_input_path is not None
+        else frozenset()
+    )
+    _blocked_agent_local_baseline(
+        before,
+        result,
+        current,
         worktree,
+        allowed_dirty_paths=allowed_dirty_paths,
+    )
+    preserved_paths = frozenset(
+        path
+        for path in allowed_dirty_paths
+        if current.dirty.get(path)
+        not in (before.dirty.get(path), result.dirty.get(path))
+    )
+    stash_arguments = [
         "stash",
         "push",
         "--all",
         "-m",
         f"loop-manager scope violation {plan_id}",
-        check=False,
-    )
+    ]
+    if preserved_paths:
+        stash_arguments.extend(
+            [
+                "--",
+                ".",
+                *(f":(top,literal,exclude){path}" for path in sorted(preserved_paths)),
+            ]
+        )
+    stashed = git(worktree, *stash_arguments, check=False)
     if stashed.returncode:
         raise AgentScopeError(f"BLOCKED Agent 변경 보존 실패:\n{stashed.stdout[-8000:]}")
 
@@ -4000,12 +4046,25 @@ def resume_blocked_execplan_if_inputs_changed(
     )
     if not worktree_changed and not remote_changed:
         return False
+    metadata_validated = False
+    if worktree_changed:
+        metadata_error = _blocked_execplan_metadata_error(repo_path, worktree, plan)
+        if metadata_error:
+            _update_blocked_error(
+                connection,
+                repo,
+                str(plan["plan_id"]),
+                metadata_error,
+            )
+            return False
+        metadata_validated = True
     try:
         preserve_blocked_agent_changes(
             connection,
             repo,
             worktree,
             str(plan["plan_id"]),
+            preserved_input_path=(str(plan["path"]) if worktree_changed else None),
         )
     except (AgentScopeError, RuntimeError) as error:
         message = f"BLOCKED Agent 변경 보존 실패:\n{error}"
@@ -4022,15 +4081,16 @@ def resume_blocked_execplan_if_inputs_changed(
             error = f"BLOCKED 해제 전 rebase 실패:\n{rebased.stdout[-8000:]}"
             _update_blocked_error(connection, repo, str(plan["plan_id"]), error)
             return False
-    metadata_error = _blocked_execplan_metadata_error(repo_path, worktree, plan)
-    if metadata_error:
-        _update_blocked_error(
-            connection,
-            repo,
-            str(plan["plan_id"]),
-            metadata_error,
-        )
-        return False
+    if not metadata_validated:
+        metadata_error = _blocked_execplan_metadata_error(repo_path, worktree, plan)
+        if metadata_error:
+            _update_blocked_error(
+                connection,
+                repo,
+                str(plan["plan_id"]),
+                metadata_error,
+            )
+            return False
 
     _requeue_blocked_execplan(connection, repo, str(plan["plan_id"]))
     return True
