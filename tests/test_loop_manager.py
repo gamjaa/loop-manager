@@ -2318,9 +2318,15 @@ risk: medium
             connection.commit()
             roles = []
 
-            def worker(_worktree, _state, _config, role_name, _prompt, **_kwargs):
+            def worker(worktree, _state, _config, role_name, _prompt, **_kwargs):
                 roles.append(role_name)
                 if role_name == "planner":
+                    write_execplan(
+                        worktree,
+                        "G-002",
+                        "Deferred",
+                        priority="low",
+                    )
                     return loop_manager.CodexResult(0, "", "planner-session")
                 if roles.count("worker") == 1:
                     return loop_manager.CodexResult(0, worker_result(), "worker-session")
@@ -2382,6 +2388,29 @@ risk: medium
                     (str(repo),),
                 ).fetchone()
 
+                blocked_plan_path = managed / "docs/plans/[G-001] Worker Boundary.md"
+                original_plan_text = blocked_plan_path.read_text(encoding="utf-8")
+                blocked_plan_path.write_text(
+                    original_plan_text.replace("priority: normal", "priority: critical"),
+                    encoding="utf-8",
+                )
+                metadata_result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+                rejected_metadata = connection.execute(
+                    """
+                    SELECT status, priority, depends_on, last_error, retry_count
+                    FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'
+                    """,
+                    (str(repo),),
+                ).fetchone()
+                blocked_plan_path.write_text(original_plan_text, encoding="utf-8")
+
                 (repo / "docs/PRODUCT.md").write_text(
                     "# Product changed to resolve block\n",
                     encoding="utf-8",
@@ -2398,7 +2427,7 @@ risk: medium
 
             resumed_project = connection.execute(
                 """
-                SELECT phase, worktree, pr_url, last_error
+                SELECT active_sha, phase, worktree, pr_url, last_error
                 FROM projects WHERE repo = ?
                 """,
                 (str(repo),),
@@ -2411,8 +2440,13 @@ risk: medium
                 (str(repo),),
             ).fetchone()
             rebased_source = (managed / "docs/PRODUCT.md").read_text(encoding="utf-8")
+            managed_head = git_command(managed, "rev-parse", "HEAD")
+            origin_head = git_command(repo, "rev-parse", "origin/main")
 
-        self.assertEqual((blocked_result, unchanged_result, resumed_result), (1, 1, 1))
+        self.assertEqual(
+            (blocked_result, unchanged_result, metadata_result, resumed_result),
+            (1, 1, 1, 1),
+        )
         self.assertEqual(roles, ["worker", "planner", "worker"])
         verify.assert_called_once()
         self.assertEqual(blocked_project["phase"], "BLOCKED")
@@ -2423,8 +2457,15 @@ risk: medium
         self.assertEqual(blocked_plan["status"], "BLOCKED")
         self.assertIsNotNone(blocked_plan["blocked_fingerprint"])
         self.assertEqual(tuple(unchanged_plan), ("BLOCKED", 2))
+        self.assertEqual(rejected_metadata["status"], "BLOCKED")
+        self.assertEqual(rejected_metadata["priority"], "normal")
+        self.assertEqual(rejected_metadata["depends_on"], "[]")
+        self.assertIn("고정 메타데이터는 변경할 수 없습니다", rejected_metadata["last_error"])
+        self.assertEqual(rejected_metadata["retry_count"], 2)
         self.assertEqual(resumed_project["phase"], "WORKING")
         self.assertEqual(resumed_project["last_error"], "stop after source change")
+        self.assertEqual(resumed_project["active_sha"], managed_head)
+        self.assertNotEqual(resumed_project["active_sha"], origin_head)
         self.assertEqual(resumed_plan["status"], "IMPLEMENTING")
         self.assertIsNone(resumed_plan["blocked_fingerprint"])
         self.assertEqual(resumed_plan["retry_count"], 0)

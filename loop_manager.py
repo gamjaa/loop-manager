@@ -1020,6 +1020,11 @@ def activate_ready_execplan(
         if selected["worktree"]
         else state_dir / "worktrees" / project_id / str(selected["plan_id"])
     )
+    activation_sha = (
+        git(worktree, "rev-parse", "HEAD").stdout.strip()
+        if worktree.is_dir()
+        else base_sha
+    )
     with connection:
         changed = connection.execute(
             """
@@ -1028,7 +1033,7 @@ def activate_ready_execplan(
                 last_error = NULL
             WHERE repo = ? AND plan_id = ? AND status = 'READY'
             """,
-            (base_sha, branch, str(worktree), repo, selected["plan_id"]),
+            (activation_sha, branch, str(worktree), repo, selected["plan_id"]),
         )
         if changed.rowcount != 1:
             raise RuntimeError("READY ExecPlan 선택 상태가 변경되었습니다.")
@@ -1041,7 +1046,7 @@ def activate_ready_execplan(
             WHERE repo = ?
             """,
             (
-                base_sha,
+                activation_sha,
                 selected["plan_sha"],
                 branch,
                 str(worktree),
@@ -1799,6 +1804,68 @@ def _revision_execplan_input_fingerprint(
     return _execplan_input_fingerprint(entries)
 
 
+def _blocked_execplan_metadata_error(
+    repo_path: Path,
+    worktree: Path,
+    plan: sqlite3.Row,
+) -> str | None:
+    path = str(plan["path"])
+    try:
+        current = _parse_execplan(worktree, worktree / path)
+    except RuntimeError as error:
+        return f"BLOCKED ExecPlan을 다시 검증할 수 없습니다: {error}"
+
+    plan_sha = str(plan["plan_sha"] or "")
+    if plan_sha:
+        shown = git(repo_path, "show", f"{plan_sha}:{path}", check=False)
+        if shown.returncode:
+            return "BLOCKED ExecPlan의 게시 메타데이터를 확인할 수 없습니다."
+        try:
+            published = published_execplan(path, shown.stdout)
+        except RuntimeError as error:
+            return f"BLOCKED ExecPlan의 게시 메타데이터가 유효하지 않습니다: {error}"
+        metadata_fields = (
+            "id",
+            "title",
+            "sources",
+            "depends_on",
+            "complexity",
+            "risk",
+            "priority",
+        )
+        if any(current[field] != published[field] for field in metadata_fields):
+            return "BLOCKED ExecPlan의 고정 메타데이터는 변경할 수 없습니다."
+        return None
+
+    sources, dependencies, priority = _execplan_metadata(current)
+    if (
+        current["id"] != plan["plan_id"]
+        or current["title"] != plan["title"]
+        or sources != plan["sources"]
+        or dependencies != plan["depends_on"]
+        or priority != plan["priority"]
+    ):
+        return "BLOCKED ExecPlan의 SQLite 메타데이터와 현재 파일이 일치하지 않습니다."
+    return None
+
+
+def _update_blocked_error(
+    connection: sqlite3.Connection,
+    repo: str,
+    plan_id: str,
+    error: str,
+) -> None:
+    with connection:
+        connection.execute(
+            "UPDATE exec_plans SET last_error = ? WHERE repo = ? AND plan_id = ?",
+            (error, repo, plan_id),
+        )
+        connection.execute(
+            "UPDATE projects SET last_error = ? WHERE repo = ?",
+            (error, repo),
+        )
+
+
 def block_active_execplan(
     connection: sqlite3.Connection,
     repo: str,
@@ -1875,19 +1942,17 @@ def resume_blocked_execplan_if_inputs_changed(
         )
         if rebased.returncode:
             error = f"BLOCKED 해제 전 rebase 실패:\n{rebased.stdout[-8000:]}"
-            with connection:
-                connection.execute(
-                    """
-                    UPDATE exec_plans SET last_error = ?
-                    WHERE repo = ? AND plan_id = ?
-                    """,
-                    (error, repo, plan["plan_id"]),
-                )
-                connection.execute(
-                    "UPDATE projects SET last_error = ? WHERE repo = ?",
-                    (error, repo),
-                )
+            _update_blocked_error(connection, repo, str(plan["plan_id"]), error)
             return False
+    metadata_error = _blocked_execplan_metadata_error(repo_path, worktree, plan)
+    if metadata_error:
+        _update_blocked_error(
+            connection,
+            repo,
+            str(plan["plan_id"]),
+            metadata_error,
+        )
+        return False
 
     values = _clear_active_values()
     assignments = ", ".join(f"{name} = ?" for name in values)
@@ -2222,6 +2287,9 @@ def run_project(
                 "SELECT * FROM projects WHERE repo = ?", (repo,)
             ).fetchone()
         else:
+            row = connection.execute(
+                "SELECT * FROM projects WHERE repo = ?", (repo,)
+            ).fetchone()
             operation_print(
                 f"작업이 차단되어 있습니다: {row['last_error'] or '사용자 조치가 필요합니다.'}",
                 file=sys.stderr,
