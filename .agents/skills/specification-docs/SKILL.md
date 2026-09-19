@@ -1,6 +1,6 @@
 ---
 name: specification-docs
-description: Create, review, and refine PRODUCT.md, ARCHITECTURE.md, and requirements/*.md from the Loop Manager templates through conversation with the user. Use when defining product behavior, documenting a requested change, recording technical design, finding missing scenarios or edge cases, or deciding whether a specification is ready for Planner.
+description: Create, review, and refine PRODUCT.md, ARCHITECTURE.md, requirements/*.md, and FUTURE_IDEAS.md from the Loop Manager templates through conversation with the user. Use when defining product behavior, documenting a requested change, recording technical design or deferred ideas, finding missing scenarios or edge cases, or deciding whether a specification is ready for Planner.
 ---
 
 # Specification Docs
@@ -22,8 +22,22 @@ description: Create, review, and refine PRODUCT.md, ARCHITECTURE.md, and require
 - `PRODUCT.md`: 현재 Merge된 제품에서 참이어야 하는 사용자 동작, 경계, 상태와 장기 규칙
 - `requirements/*.md`: 제품에 원하는 변화, 이유, Acceptance Criteria와 제품 영향
 - `ARCHITECTURE.md`: PRODUCT와 Requirement를 보장하는 구조, 기술 선택, 책임, 저장과 복구 방식
+- `FUTURE_IDEAS.md`: 현재 범위 밖이라 구현하지 않지만 나중에 검토할 가치가 있는 아이디어
 
 초기 제품은 `PRODUCT.md`에서 정의할 수 있다. 운영 중 새 기능이나 정책 변경은 Requirement에서 시작하고, 구현이 완료된 뒤 계속 유지할 규칙만 `PRODUCT.md`에 반영한다. 구현 세부를 PRODUCT나 Requirement에 넣거나 사용자 동작을 ARCHITECTURE에 중복하지 않는다.
+
+## Write Scope
+
+프로젝트의 다른 파일은 문맥 확인을 위해 읽을 수 있지만, 일반적인 Skill 작업에서 생성·수정·삭제할 수 있는 파일은 다음으로 제한한다.
+
+- `docs/PRODUCT.md`
+- `docs/ARCHITECTURE.md`
+- `docs/requirements/*.md`
+- `docs/FUTURE_IDEAS.md`
+
+코드, 테스트, 설정, README, AGENTS, 템플릿, 다른 Skill 파일을 포함한 나머지 파일은 수정하지 않는다. 필요한 변경을 발견하면 이유와 대상만 사용자에게 알린다.
+
+`docs/plans/*.md`는 다른 Agent가 작업 중일 수 있으므로 생성·수정·삭제하지 않는다. 사용자가 특정 ExecPlan 파일에 대한 구체적인 변경을 명시적으로 요청한 경우에만 그 파일과 요청한 범위에 한해 예외로 수정할 수 있다. 일반적인 문서 정리나 정합성 보완 요청을 ExecPlan 수정 권한으로 확대 해석하지 않는다.
 
 ## Workflow
 
@@ -53,4 +67,4 @@ Requirement는 frontmatter나 별도 상태 없이 제품에 원하는 변화와
 - 구현자가 임의로 제품 정책을 정해야 하는 미결정 사항이 없다.
 - PRODUCT, Requirement와 ARCHITECTURE가 서로 모순되지 않는다.
 
-문서 작성 요청은 사용자가 소유한 명세를 함께 작성하라는 명시적 위임으로 취급한다. 이 Skill 작업에서는 코드 구현이나 ExecPlan 생성을 함께 수행하지 않는다.
+문서 작성 요청은 사용자가 소유한 명세를 함께 작성하라는 명시적 위임으로 취급한다. 이 Skill 작업에서는 코드 구현을 함께 수행하지 않으며, ExecPlan은 위 Write Scope의 명시적 예외가 없으면 변경하지 않는다.
