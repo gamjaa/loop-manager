@@ -2724,6 +2724,10 @@ risk: medium
         self.assertIn("targeted: PASS", reviewer)
         self.assertIn("verify: PASS", reviewer)
         self.assertIn("테스트 command와 scripts/verify를 실행하지 말고", reviewer)
+        self.assertIn("ISSUE_ID: relative/path::stable-symbol-or-test::category-slug", reviewer)
+        self.assertIn("이전과 정확히 같은 ID", reviewer)
+        self.assertIn("RERUN:", worker)
+        self.assertIn("성공·실패가 섞인 요약", worker)
         self.assertIn("COMMIT_TITLE:", worker)
         self.assertIn("PR_SUMMARY:", worker)
         self.assertIn("TARGETED_TESTS:", worker)
@@ -3094,6 +3098,75 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         self.assertEqual(same_temp_first, same_temp_second)
         self.assertNotEqual(same_temp_first, different_temp_file)
 
+    def test_review_fingerprints_use_stable_issue_ids_not_explanatory_prose(self):
+        first = "\n".join(
+            (
+                "ISSUE_ID: loop_manager.py::run_project::session-recovery",
+                "[P1] line 120: the saved session was not resumed.",
+                "ISSUE_ID: tests/test_loop_manager.py::retry-case::missing-coverage",
+                "Add a regression test near line 3000.",
+                "VERDICT: FAIL",
+            )
+        )
+        reworded = "\n".join(
+            (
+                "ISSUE_ID: tests/test_loop_manager.py::retry-case::missing-coverage",
+                "The scenario is still untested at a different location.",
+                "ISSUE_ID: LOOP_MANAGER.PY::RUN_PROJECT::SESSION-RECOVERY",
+                "Session continuation remains broken, phrased differently.",
+                "VERDICT: FAIL",
+            )
+        )
+        changed = reworded.replace("SESSION-RECOVERY", "USAGE-LIMIT")
+
+        first_fingerprint, first_normalized = (
+            loop_manager.validation_failure_fingerprint("review", first)
+        )
+        reworded_fingerprint, reworded_normalized = (
+            loop_manager.validation_failure_fingerprint("review", reworded)
+        )
+        changed_fingerprint, _ = loop_manager.validation_failure_fingerprint(
+            "review", changed
+        )
+
+        missing_first, missing_normalized = (
+            loop_manager.validation_failure_fingerprint(
+                "review", "first free-form explanation\nVERDICT: FAIL"
+            )
+        )
+        missing_second, _ = loop_manager.validation_failure_fingerprint(
+            "review", "entirely reworded explanation\nVERDICT: FAIL"
+        )
+        invalid_first, invalid_normalized = (
+            loop_manager.validation_failure_fingerprint(
+                "review", "ISSUE_ID: app.py:10 prose\nVERDICT: FAIL"
+            )
+        )
+        invalid_second, _ = loop_manager.validation_failure_fingerprint(
+            "review", "ISSUE_ID: app.py:99 other prose\nVERDICT: FAIL"
+        )
+
+        self.assertEqual(first_fingerprint, reworded_fingerprint)
+        self.assertEqual(first_normalized, reworded_normalized)
+        self.assertEqual(
+            first_normalized,
+            "\n".join(
+                (
+                    "ISSUE_ID:loop_manager.py::run_project::session-recovery",
+                    "ISSUE_ID:tests/test_loop_manager.py::retry-case::missing-coverage",
+                )
+            ),
+        )
+        self.assertEqual(missing_first, missing_second)
+        self.assertEqual(
+            missing_normalized, "REVIEW_PROTOCOL_ERROR:MISSING_ISSUE_ID"
+        )
+        self.assertEqual(invalid_first, invalid_second)
+        self.assertEqual(
+            invalid_normalized, "REVIEW_PROTOCOL_ERROR:INVALID_ISSUE_ID"
+        )
+        self.assertNotEqual(first_fingerprint, changed_fingerprint)
+
     def test_verify_fingerprint_uses_full_output_before_feedback_truncation(self):
         with tempfile.TemporaryDirectory() as directory:
             worktree = Path(directory)
@@ -3144,7 +3217,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                     )
                 )
             review = loop_manager.transition_validation_failure(
-                connection, str(root), root, "review", "failure A\nVERDICT: FAIL"
+                connection, str(root), root, "review", "ISSUE_ID: app.py::failure-a::blocking\nfailure A\nVERDICT: FAIL"
             )
             final = loop_manager.transition_validation_failure(
                 connection, str(root), root, "verify", "failure A"
@@ -3182,7 +3255,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                 connection, str(root), root, "verify", "failure A"
             )
             review = loop_manager.transition_validation_failure(
-                connection, str(root), root, "review", "issue R\nVERDICT: FAIL"
+                connection, str(root), root, "review", "ISSUE_ID: app.py::issue-r::blocking\nissue R\nVERDICT: FAIL"
             )
             connection.close()
 
@@ -3462,7 +3535,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             worker_sessions = []
             reviewer_sessions = []
             review_messages = iter(
-                ("blocking issue A\nVERDICT: FAIL", "VERDICT: PASS")
+                ("ISSUE_ID: app.py::issue-a::blocking\nblocking issue A\nVERDICT: FAIL", "VERDICT: PASS")
             )
             worker_version = 1
             transitions = []
@@ -3668,6 +3741,40 @@ class WorkerPublicationTest(unittest.TestCase):
                 with self.assertRaises(loop_manager.WorkerResultError):
                     loop_manager.parse_worker_result(result, self.plan)
 
+    def test_targeted_test_evidence_requires_a_clean_explicit_rerun(self):
+        valid_evidence = (
+            "pytest: 0 failed, 2 passed",
+            (
+                "first run: 1 failed, 2 passed\n"
+                "RERUN: python3 -m unittest tests.test_case\n3 passed"
+            ),
+        )
+        for evidence in valid_evidence:
+            with self.subTest(evidence=evidence):
+                publication = loop_manager.parse_worker_result(
+                    worker_result(
+                        "Validate clean targeted reruns", "Summary", evidence
+                    ),
+                    self.plan,
+                )
+                self.assertEqual(publication.test_evidence, evidence)
+
+        invalid_evidence = (
+            "pytest: 1 failed, 2 passed",
+            "unittest: 1 error, 2 passed",
+            "RERUN: pytest: 1 failed, 2 passed",
+            "targeted test: FAIL\nunable to run the rerun",
+        )
+        for evidence in invalid_evidence:
+            with self.subTest(evidence=evidence):
+                with self.assertRaises(loop_manager.WorkerResultError):
+                    loop_manager.parse_worker_result(
+                        worker_result(
+                            "Reject mixed targeted summaries", "Summary", evidence
+                        ),
+                        self.plan,
+                    )
+
     def test_github_origin_normalization_matches_repository_validation(self):
         self.assertEqual(
             loop_manager.github_repository("HTTPS://WWW.GitHub.Com/Owner/Repo.GIT"),
@@ -3830,7 +3937,7 @@ class WorkerPublicationTest(unittest.TestCase):
                 )
             )
             versions = iter((2, 3, 4))
-            review_messages = iter(("VERDICT: FAIL", "VERDICT: PASS"))
+            review_messages = iter(("ISSUE_ID: src/app.py::value::incorrect\nVERDICT: FAIL", "VERDICT: PASS"))
             reviewer_prompts = []
             logs = []
 

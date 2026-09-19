@@ -1929,6 +1929,32 @@ _TEMP_PATH_NOISE = re.compile(
 )
 
 
+_REVIEW_ISSUE_ID = re.compile(
+    r"(?mi)^ISSUE_ID:[ \t]*(?P<identifier>[^\r\n]+?)[ \t]*$"
+)
+_REVIEW_ISSUE_IDENTIFIER = re.compile(
+    r"(?i)^(?!/)(?!.*(?:^|/)\.\.(?:/|$))"
+    r"[a-z0-9_.\-/]+::[a-z0-9_.<>/-]+::[a-z0-9][a-z0-9-]*$"
+)
+
+
+def _normalize_review_issue_ids(output: str) -> str:
+    raw_identifiers = [
+        " ".join(match.group("identifier").split()).casefold()
+        for match in _REVIEW_ISSUE_ID.finditer(output)
+        if match.group("identifier").strip()
+    ]
+    if not raw_identifiers:
+        return "REVIEW_PROTOCOL_ERROR:MISSING_ISSUE_ID"
+    if any(
+        _REVIEW_ISSUE_IDENTIFIER.fullmatch(identifier) is None
+        for identifier in raw_identifiers
+    ):
+        return "REVIEW_PROTOCOL_ERROR:INVALID_ISSUE_ID"
+    identifiers = set(raw_identifiers)
+    return "\n".join(f"ISSUE_ID:{identifier}" for identifier in sorted(identifiers))
+
+
 def normalize_validation_failure(
     stage: str,
     output: str,
@@ -1967,14 +1993,12 @@ def normalize_validation_failure(
     )
     normalized = _TIMESTAMP_NOISE.sub("<TIMESTAMP>", normalized)
     normalized = _DURATION_NOISE.sub("<DURATION>", normalized)
+    if stage == "review":
+        return _normalize_review_issue_ids(normalized)
     lines = []
     for line in normalized.splitlines():
         line = " ".join(line.split())
         if not line:
-            continue
-        if stage == "review" and re.fullmatch(
-            r"(?i)VERDICT:\s*(?:PASS|FAIL)", line
-        ):
             continue
         lines.append(line)
     return "\n".join(sorted(lines))
@@ -5824,6 +5848,7 @@ AGENTS.md와 {plan_path}를 읽고 해당 ExecPlan 하나만 구현하라.
 docs/plans에 새 ExecPlan을 만들지 말고 불필요한 후속 기능도 구현하지 마라.
 구현과 관련 unit test를 작성하거나 갱신한 뒤, 수정한 코드와 새로 작성하거나 변경한 테스트를 직접 검증하는 최소 범위의 targeted unit test만 실행하라. 개별 test case, test class, test module 또는 이에 준하는 좁은 단위만 허용된다.
 targeted unit test가 실패하면 같은 세션에서 원인을 수정하고 같은 targeted test를 다시 실행하라. 문서·설정 전용 변경이거나 실행 가능한 관련 unit test가 없으면 테스트 범위를 확대하지 말고, 실행하지 못한 구체적인 사유를 최종 결과에 남겨라.
+실패 이력을 보고할 때는 수정 후 동일 test의 재실행 명령과 실패가 없는 최종 결과를 별도의 `RERUN:` 구간으로 명시하라. 하나의 실행에서 성공·실패가 섞인 요약은 통과로 보고하지 마라.
 전체 test suite, integration test, end-to-end test, 프로젝트 전체 lint·build·type check 및 scripts/verify 실행은 절대 실행하지 마라. 전체 verify는 Worker 종료 뒤 Loop Manager가 실행하며, 실패한 경우에만 이 세션으로 진단을 전달한다.
 작업이 완료되면 최종 응답 마지막에 아래 형식을 정확히 포함하라. 제목과 Summary는 최종 diff 전체를 설명해야 하며 ExecPlan 제목이나 일반적인 변경 문구를 쓰지 마라:
 COMMIT_TITLE: 한 줄의 구체적인 변경 제목
@@ -5835,6 +5860,44 @@ TARGETED_TESTS:
 {failure}
 """.strip()
 
+
+
+_TARGETED_TEST_FAILURE = re.compile(
+    r"(?i)(?<![\w])(?:FAIL(?:ED|URES?)?|ERRORS?|실패)(?![\w])"
+)
+_TARGETED_TEST_SUCCESS = re.compile(
+    r"(?i)(?<![\w])(?:PASS(?:ED)?|SUCCESS|OK|성공|통과)(?![\w])"
+)
+_TARGETED_TEST_RERUN = re.compile(
+    r"(?i)(?<![\w])(?:RE[- ]?RUN|RETRY|재실행)(?![\w])"
+)
+
+
+def _targeted_test_failure_matches(evidence: str) -> list[re.Match[str]]:
+    failures = []
+    for match in _TARGETED_TEST_FAILURE.finditer(evidence):
+        prefix = evidence[max(0, match.start() - 32):match.start()]
+        count = re.search(
+            r"(?i)(?<![\w])(\d+)(?:\s+(?:tests?|cases?))?\s*$",
+            prefix,
+        )
+        if count is not None and int(count.group(1)) == 0:
+            continue
+        if re.search(r"(?i)\b(?:no|without)\s+$", prefix):
+            continue
+        failures.append(match)
+    return failures
+
+
+def _has_unresolved_targeted_test_failure(evidence: str) -> bool:
+    failures = _targeted_test_failure_matches(evidence)
+    if not failures:
+        return False
+    tail = evidence[failures[-1].end():]
+    rerun = _TARGETED_TEST_RERUN.search(tail)
+    if rerun is None:
+        return True
+    return _TARGETED_TEST_SUCCESS.search(tail, rerun.end()) is None
 
 
 def parse_worker_result(message: str, plan: dict[str, object]) -> WorkerPublication:
@@ -5860,25 +5923,7 @@ def parse_worker_result(message: str, plan: dict[str, object]) -> WorkerPublicat
         raise WorkerResultError("Worker PR Summary가 비어 있습니다.")
     if not test_evidence:
         raise WorkerResultError("Worker targeted unit test 증거가 비어 있습니다.")
-    failures = list(
-        re.finditer(
-            r"(?i)(?:^|[\s:=-])(?:FAIL(?:ED|URE)?|ERROR|실패)(?=$|[\s:=-])",
-            test_evidence,
-        )
-    )
-    successes = list(
-        re.finditer(
-            r"(?i)(?:^|[\s:=-])(?:PASS(?:ED)?|SUCCESS|성공|통과)(?=$|[\s:=-])",
-            test_evidence,
-        )
-    )
-    not_run = re.search(
-        r"(?i)(?:not run|unable to run|no (?:relevant |executable )?(?:unit )?tests?|미실행|실행하지 못|실행 가능한.*없)",
-        test_evidence,
-    )
-    if failures and not not_run and (
-        not successes or failures[-1].start() > successes[-1].start()
-    ):
+    if _has_unresolved_targeted_test_failure(test_evidence):
         raise WorkerResultError(
             "Worker가 해결되지 않은 targeted unit test 실패를 보고했습니다."
         )
@@ -6021,6 +6066,9 @@ Loop Manager가 실행한 전체 verify 결과:
 {verify_evidence}
 {recovery}
 테스트 command와 scripts/verify를 실행하지 말고, 코드·테스트·verify 스크립트의 diff 및 위 결과만으로 판단하라.
+blocking issue마다 설명 직전에 `ISSUE_ID: relative/path::stable-symbol-or-test::category-slug`를 한 줄로 기록하라.
+ISSUE_ID에는 줄 번호나 자연어 설명을 넣지 말고, 같은 issue가 재발하면 위치·표현이 바뀌어도 이전과 정확히 같은 ID를 사용하라.
+`VERDICT: FAIL`은 하나 이상의 ISSUE_ID가 있어야 하며, 서로 다른 issue는 서로 다른 ID를 사용하라.
 blocking issue가 있으면 간결히 설명하고 마지막 줄을 `VERDICT: FAIL`로 끝내라.
 blocking issue가 없으면 마지막 줄을 `VERDICT: PASS`로 끝내라. 파일은 수정하지 마라.
 """.strip()
