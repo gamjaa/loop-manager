@@ -8864,6 +8864,601 @@ class MergeIndependentWorktreeCleanupTest(unittest.TestCase):
         connect_database.assert_called_once_with(state_dir, create=True)
 
 
+class LatestBasePublicationTest(unittest.TestCase):
+    def _publication_state(self, directory: str):
+        repo = make_remote_repository(directory)
+        state_dir = Path(directory) / "state"
+        state_dir.mkdir()
+        (repo / "docs/plans").mkdir()
+        plan = write_execplan(
+            repo,
+            "G-014",
+            "Latest Base Publication",
+            complexity="high",
+            risk="high",
+            priority="critical",
+        )
+        commit_and_push(repo, "Add latest-base publication plan")
+        plan_sha = git_command(repo, "rev-parse", "origin/main")
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute(loop_manager.SCHEMA)
+        connection.execute(
+            "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+            (str(repo),),
+        )
+        connection.commit()
+        relative_plan = plan.relative_to(repo).as_posix()
+        loop_manager.register_execplans(
+            connection,
+            str(repo),
+            repo,
+            [(relative_plan, loop_manager._parse_execplan(repo, plan))],
+            plan_sha,
+            loop_manager.planning_input_fingerprint(repo, "main"),
+        )
+        branch, worktree = loop_manager.expected_execplan_workspace(
+            state_dir, str(repo), "G-014"
+        )
+        loop_manager.make_worktree(repo, worktree, branch, "main")
+        (worktree / "src/app.py").write_text(
+            "VALUE = 2\n", encoding="utf-8"
+        )
+        git_command(worktree, "add", "src/app.py")
+        git_command(worktree, "commit", "-m", "Change application value")
+        result = worker_result(
+            "Publish verified application value",
+            "Updates the application value after latest-base validation.",
+            "LatestBasePublicationTest: PASS",
+        )
+        with connection:
+            connection.execute(
+                """
+                UPDATE exec_plans
+                SET status = 'PUBLISHING', active_sha = ?,
+                    validated_base_sha = ?, branch = ?, worktree = ?,
+                    workspace_owned = 1, worker_result = ?,
+                    verify_result = 'verify: PASS',
+                    review_result = 'VERDICT: PASS'
+                WHERE repo = ? AND plan_id = 'G-014'
+                """,
+                (
+                    plan_sha,
+                    plan_sha,
+                    branch,
+                    str(worktree),
+                    result,
+                    str(repo),
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE projects
+                SET active_sha = ?, validated_base_sha = ?, plan_sha = ?,
+                    phase = 'PUBLISHING', branch = ?, worktree = ?,
+                    plan_path = ?, worker_result = ?,
+                    verify_result = 'verify: PASS',
+                    review_result = 'VERDICT: PASS'
+                WHERE repo = ?
+                """,
+                (
+                    plan_sha,
+                    plan_sha,
+                    plan_sha,
+                    branch,
+                    str(worktree),
+                    relative_plan,
+                    result,
+                    str(repo),
+                ),
+            )
+        return repo, state_dir, connection, plan, branch, worktree
+
+    def _command_stub(self, created_urls, git_calls=None):
+        original = loop_manager.command
+
+        def run(arguments, **kwargs):
+            if arguments[:3] == ["gh", "pr", "create"]:
+                created_urls.append(arguments)
+                return subprocess.CompletedProcess(
+                    arguments,
+                    0,
+                    stdout="https://example.test/pr/14\n",
+                )
+            if git_calls is not None and arguments[:3] == ["git", "-C", str(kwargs.get("cwd"))]:
+                git_calls.append(arguments)
+            return original(arguments, **kwargs)
+
+        return run
+
+    def test_publication_revalidates_after_verify_and_review_base_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                repo,
+                state_dir,
+                connection,
+                _plan,
+                _branch,
+                _worktree,
+            ) = self._publication_state(directory)
+            (repo / "docs/notes.md").write_text(
+                "# Base two\n", encoding="utf-8"
+            )
+            commit_and_push(repo, "Advance base before publication")
+            reviews = []
+            created = []
+            review_base_advanced = False
+
+            def reviewer(_worktree, _state, _config, role_name, _prompt, **_kwargs):
+                self.assertEqual(role_name, "reviewer")
+                reviews.append(role_name)
+                return loop_manager.CodexResult(
+                    0, "VERDICT: PASS", "reviewer-session"
+                )
+
+            def pr_lookup(*_args, **_kwargs):
+                nonlocal review_base_advanced
+                phase = connection.execute(
+                    "SELECT phase FROM projects WHERE repo = ?",
+                    (str(repo),),
+                ).fetchone()["phase"]
+                if (
+                    reviews == ["reviewer"]
+                    and phase == "PUBLISHING"
+                    and not review_base_advanced
+                ):
+                    review_base_advanced = True
+                    (repo / "README.md").write_text(
+                        "# Base three\n", encoding="utf-8"
+                    )
+                    commit_and_push(repo, "Advance base during review")
+                return None
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", side_effect=pr_lookup
+            ), mock.patch(
+                "loop_manager.run_codex", side_effect=reviewer
+            ), mock.patch(
+                "loop_manager.verify", return_value=(True, "verify: PASS")
+            ) as verify, mock.patch(
+                "loop_manager.build_pr_body", return_value="body"
+            ), mock.patch(
+                "loop_manager.command",
+                side_effect=self._command_stub(created),
+            ):
+                outcome = loop_manager.run_project_result(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, active_sha, validated_base_sha, pr_head_oid "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            latest_base = git_command(repo, "rev-parse", "origin/main")
+
+        self.assertEqual(outcome.kind, loop_manager.ProjectRunKind.WAITING)
+        self.assertEqual(project["phase"], "PR_OPEN")
+        self.assertEqual(project["active_sha"], latest_base)
+        self.assertEqual(project["validated_base_sha"], latest_base)
+        self.assertIsNotNone(project["pr_head_oid"])
+        self.assertEqual(verify.call_count, 2)
+        self.assertEqual(reviews, ["reviewer", "reviewer"])
+        self.assertEqual(len(created), 1)
+
+    def test_publication_rebase_conflict_blocks_when_worker_cannot_resolve(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                repo,
+                state_dir,
+                connection,
+                _plan,
+                branch,
+                worktree,
+            ) = self._publication_state(directory)
+            (repo / "src/app.py").write_text(
+                "VALUE = 'base'\n", encoding="utf-8"
+            )
+            commit_and_push(repo, "Create publication conflict")
+
+            common_patches = (
+                mock.patch("loop_manager.validate_repository", return_value=repo),
+                mock.patch("loop_manager.remote_base", return_value="main"),
+                mock.patch("loop_manager.ensure_safe_base_worktree"),
+                mock.patch("loop_manager.pr_for_branch", return_value=None),
+            )
+            with common_patches[0], common_patches[1], common_patches[2], common_patches[3], mock.patch(
+                "loop_manager.run_codex"
+            ) as agent, mock.patch("loop_manager.verify") as verify:
+                first = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+            conflicted = connection.execute(
+                "SELECT phase, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(first, 1)
+            self.assertEqual(conflicted["phase"], "WORKING")
+            self.assertTrue(
+                conflicted["last_error"].startswith(
+                    loop_manager.REBASE_CONFLICT_PREFIX
+                )
+            )
+            self.assertTrue(
+                loop_manager._rebase_in_progress_for_branch(worktree, branch)
+            )
+            agent.assert_not_called()
+            verify.assert_not_called()
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.run_codex",
+                return_value=loop_manager.CodexResult(
+                    1, "cannot resolve conflict", "worker-session"
+                ),
+            ):
+                second = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            blocked = connection.execute(
+                "SELECT phase, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            plan = connection.execute(
+                "SELECT status FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-014'",
+                (str(repo),),
+            ).fetchone()
+
+        self.assertEqual(second, 1)
+        self.assertEqual(blocked["phase"], "BLOCKED")
+        self.assertIn("cannot resolve conflict", blocked["last_error"])
+        self.assertEqual(plan["status"], "BLOCKED")
+
+    def test_publication_rebase_that_removes_change_blocks_before_verify(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                repo,
+                state_dir,
+                connection,
+                _plan,
+                _branch,
+                _worktree,
+            ) = self._publication_state(directory)
+            (repo / "src/app.py").write_text(
+                "VALUE = 2\n", encoding="utf-8"
+            )
+            commit_and_push(repo, "Apply implementation upstream")
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as agent, mock.patch("loop_manager.verify") as verify:
+                outcome = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            blocked = connection.execute(
+                "SELECT phase, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+
+        self.assertEqual(outcome, 1)
+        self.assertEqual(blocked["phase"], "BLOCKED")
+        self.assertIn("rebase 후 Worker 변경이 남지 않아", blocked["last_error"])
+        agent.assert_not_called()
+        verify.assert_not_called()
+
+    def test_remote_branch_push_interruption_recovers_without_another_push(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                repo,
+                state_dir,
+                connection,
+                _plan,
+                branch,
+                worktree,
+            ) = self._publication_state(directory)
+            git_command(
+                worktree,
+                "push",
+                "origin",
+                f"HEAD:refs/heads/{branch}",
+            )
+            created = []
+            git_calls = []
+            original_git = loop_manager.git
+
+            def recording_git(path, *arguments, **kwargs):
+                if arguments and arguments[0] == "push":
+                    git_calls.append(arguments)
+                return original_git(path, *arguments, **kwargs)
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.build_pr_body", return_value="body"
+            ), mock.patch(
+                "loop_manager.command",
+                side_effect=self._command_stub(created),
+            ), mock.patch(
+                "loop_manager.git", side_effect=recording_git
+            ):
+                outcome = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, publication_remote_oid, pr_head_oid "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            local_head = git_command(worktree, "rev-parse", "HEAD")
+
+        self.assertEqual(outcome, 0)
+        self.assertEqual(project["phase"], "PR_OPEN")
+        self.assertEqual(project["publication_remote_oid"], local_head)
+        self.assertEqual(project["pr_head_oid"], local_head)
+        self.assertEqual(git_calls, [])
+        self.assertEqual(len(created), 1)
+
+    def test_owned_remote_branch_rebase_uses_explicit_force_with_lease(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                repo,
+                state_dir,
+                connection,
+                _plan,
+                branch,
+                worktree,
+            ) = self._publication_state(directory)
+            old_head = git_command(worktree, "rev-parse", "HEAD")
+            git_command(
+                worktree,
+                "push",
+                "origin",
+                f"HEAD:refs/heads/{branch}",
+            )
+            (repo / "docs/notes.md").write_text(
+                "# New base\n", encoding="utf-8"
+            )
+            commit_and_push(repo, "Advance base after interrupted push")
+            pushes = []
+            created = []
+            original_git = loop_manager.git
+
+            def recording_git(path, *arguments, **kwargs):
+                if arguments and arguments[0] == "push":
+                    pushes.append(arguments)
+                return original_git(path, *arguments, **kwargs)
+
+            def reviewer(_worktree, _state, _config, role_name, _prompt, **_kwargs):
+                self.assertEqual(role_name, "reviewer")
+                return loop_manager.CodexResult(
+                    0, "VERDICT: PASS", "reviewer-session"
+                )
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.verify", return_value=(True, "verify: PASS")
+            ), mock.patch(
+                "loop_manager.run_codex", side_effect=reviewer
+            ), mock.patch(
+                "loop_manager.build_pr_body", return_value="body"
+            ), mock.patch(
+                "loop_manager.command",
+                side_effect=self._command_stub(created),
+            ), mock.patch(
+                "loop_manager.git", side_effect=recording_git
+            ):
+                outcome = loop_manager.run_project_result(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+        lease = f"--force-with-lease=refs/heads/{branch}:{old_head}"
+        self.assertEqual(outcome.kind, loop_manager.ProjectRunKind.WAITING)
+        self.assertEqual(len(pushes), 1)
+        self.assertIn(lease, pushes[0])
+        self.assertNotIn("--force", pushes[0])
+        self.assertEqual(len(created), 1)
+
+    def test_unowned_remote_branch_is_blocked_without_force_push(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                repo,
+                state_dir,
+                connection,
+                _plan,
+                branch,
+                _worktree,
+            ) = self._publication_state(directory)
+            git_command(
+                repo,
+                "push",
+                "origin",
+                f"HEAD:refs/heads/{branch}",
+            )
+            pushes = []
+            original_git = loop_manager.git
+
+            def recording_git(path, *arguments, **kwargs):
+                if arguments and arguments[0] == "push":
+                    pushes.append(arguments)
+                return original_git(path, *arguments, **kwargs)
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.git", side_effect=recording_git
+            ):
+                outcome = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            blocked = connection.execute(
+                "SELECT phase, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+
+        self.assertEqual(outcome, 1)
+        self.assertEqual(blocked["phase"], "BLOCKED")
+        self.assertIn("갱신을 거부", blocked["last_error"])
+        self.assertEqual(pushes, [])
+
+    def test_existing_open_closed_reopened_and_merged_prs_are_reused(self):
+        for initial_state in ("OPEN", "CLOSED", "MERGED"):
+            with self.subTest(state=initial_state), tempfile.TemporaryDirectory() as directory:
+                (
+                    repo,
+                    state_dir,
+                    connection,
+                    _plan,
+                    branch,
+                    worktree,
+                ) = self._publication_state(directory)
+                head = git_command(worktree, "rev-parse", "HEAD")
+                pull_request = {
+                    "url": "https://example.test/pr/14",
+                    "state": initial_state,
+                    "mergedAt": (
+                        "2026-09-19T00:00:00Z"
+                        if initial_state == "MERGED"
+                        else None
+                    ),
+                    "headRefOid": head,
+                    "headRefName": branch,
+                }
+                with mock.patch(
+                    "loop_manager.validate_repository", return_value=repo
+                ), mock.patch(
+                    "loop_manager.pr_for_branch", return_value=pull_request
+                ), mock.patch("loop_manager.run_codex") as agent:
+                    outcome = loop_manager.run_project(
+                        connection,
+                        state_dir,
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
+                    )
+                agent.assert_not_called()
+
+                plan = connection.execute(
+                    "SELECT status, pr_url, pr_head_oid FROM exec_plans "
+                    "WHERE repo = ? AND plan_id = 'G-014'",
+                    (str(repo),),
+                ).fetchone()
+                if initial_state == "OPEN":
+                    self.assertEqual(outcome, 0)
+                    self.assertEqual(plan["status"], "PR_OPEN")
+                    self.assertEqual(plan["pr_head_oid"], head)
+                elif initial_state == "CLOSED":
+                    self.assertEqual(outcome, 1)
+                    self.assertEqual(plan["status"], "BLOCKED")
+                    reopened = {**pull_request, "state": "OPEN"}
+                    with mock.patch(
+                        "loop_manager.validate_repository", return_value=repo
+                    ), mock.patch(
+                        "loop_manager.pr_for_branch", return_value=reopened
+                    ):
+                        self.assertEqual(
+                            loop_manager.run_project(
+                                connection,
+                                state_dir,
+                                str(repo),
+                                Path("unused.ini"),
+                                "main",
+                                False,
+                            ),
+                            0,
+                        )
+                    resumed = connection.execute(
+                        "SELECT status, pr_url FROM exec_plans "
+                        "WHERE repo = ? AND plan_id = 'G-014'",
+                        (str(repo),),
+                    ).fetchone()
+                    self.assertEqual(resumed["status"], "PR_OPEN")
+                    self.assertEqual(resumed["pr_url"], pull_request["url"])
+                else:
+                    self.assertEqual(outcome, 0)
+                    self.assertEqual(plan["status"], "MERGED")
+                    self.assertFalse(worktree.exists())
+
+
 class TimestampedExecutionProgressLogsTest(unittest.TestCase):
     def test_operation_log_uses_fixed_local_timestamp_for_both_streams(self):
         stdout = io.StringIO()

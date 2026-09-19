@@ -67,12 +67,15 @@ FIELDS = {
     "planning_error",
     "planning_error_fingerprint",
     "active_sha",
+    "validated_base_sha",
+    "publication_remote_oid",
     "plan_sha",
     "phase",
     "branch",
     "worktree",
     "plan_path",
     "pr_url",
+    "pr_head_oid",
     "last_error",
     "agent_role",
     "agent_snapshot",
@@ -106,12 +109,15 @@ CREATE TABLE IF NOT EXISTS projects (
     planning_error TEXT,
     planning_error_fingerprint TEXT,
     active_sha TEXT,
+    validated_base_sha TEXT,
+    publication_remote_oid TEXT,
     plan_sha TEXT,
     phase TEXT,
     branch TEXT,
     worktree TEXT,
     plan_path TEXT,
     pr_url TEXT,
+    pr_head_oid TEXT,
     last_error TEXT,
     agent_role TEXT,
     agent_snapshot TEXT,
@@ -152,9 +158,12 @@ CREATE TABLE IF NOT EXISTS exec_plans (
     status TEXT NOT NULL,
     plan_sha TEXT,
     active_sha TEXT,
+    validated_base_sha TEXT,
+    publication_remote_oid TEXT,
     branch TEXT,
     worktree TEXT,
     pr_url TEXT,
+    pr_head_oid TEXT,
     last_error TEXT,
     blocked_fingerprint TEXT,
     blocked_worktree_fingerprint TEXT,
@@ -382,6 +391,10 @@ class ReviewerProtocolError(RuntimeError):
     """A failed Reviewer response does not identify actionable issues."""
 
 
+class PublicationSafetyError(RuntimeError):
+    """A remote publication branch cannot be proven safe to update."""
+
+
 class ProcessLockBusyError(RuntimeError):
     """The single Loop Manager process lock is already held."""
 
@@ -605,6 +618,9 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
     migrations = {
         "reviewer_session_id": "TEXT",
         "review_result": "TEXT",
+        "validated_base_sha": "TEXT",
+        "publication_remote_oid": "TEXT",
+        "pr_head_oid": "TEXT",
         "verify_failure_history": "TEXT NOT NULL DEFAULT '{}'",
         "review_failure_history": "TEXT NOT NULL DEFAULT '{}'",
     }
@@ -652,6 +668,9 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
         "planning_result_completed": "INTEGER NOT NULL DEFAULT 0",
         "planning_error": "TEXT",
         "planning_error_fingerprint": "TEXT",
+        "validated_base_sha": "TEXT",
+        "publication_remote_oid": "TEXT",
+        "pr_head_oid": "TEXT",
         "agent_role": "TEXT",
         "agent_snapshot": "TEXT",
         "agent_input_fingerprint": "TEXT",
@@ -1462,8 +1481,10 @@ def activate_ready_execplan(
         connection.execute(
             """
             UPDATE projects
-            SET active_sha = ?, plan_sha = ?, phase = 'WORKING', branch = ?,
-                worktree = ?, plan_path = ?, pr_url = NULL, last_error = NULL,
+            SET active_sha = ?, validated_base_sha = NULL,
+                publication_remote_oid = NULL, plan_sha = ?, phase = 'WORKING',
+                branch = ?, worktree = ?, plan_path = ?, pr_url = NULL,
+                pr_head_oid = NULL, last_error = NULL,
                 worker_session_id = NULL, reviewer_session_id = NULL,
                 worker_result = NULL, verify_result = NULL, review_result = NULL
             WHERE repo = ?
@@ -1493,20 +1514,23 @@ def hydrate_active_project(connection: sqlite3.Connection, repo: str) -> None:
     connection.execute(
         """
         UPDATE projects
-        SET active_sha = ?, plan_sha = ?, phase = ?, branch = ?, worktree = ?,
-            plan_path = ?, pr_url = ?, last_error = ?, worker_session_id = ?,
-            reviewer_session_id = ?, worker_result = ?, verify_result = ?,
-            review_result = ?
+        SET active_sha = ?, validated_base_sha = ?, publication_remote_oid = ?,
+            plan_sha = ?, phase = ?, branch = ?, worktree = ?, plan_path = ?,
+            pr_url = ?, pr_head_oid = ?, last_error = ?, worker_session_id = ?,
+            reviewer_session_id = ?, worker_result = ?, verify_result = ?, review_result = ?
         WHERE repo = ?
         """,
         (
             plan["active_sha"],
+            plan["validated_base_sha"],
+            plan["publication_remote_oid"],
             plan["plan_sha"],
             phase,
             plan["branch"],
             plan["worktree"],
             plan["path"],
             plan["pr_url"],
+            plan["pr_head_oid"],
             plan["last_error"],
             plan["worker_session_id"],
             plan["reviewer_session_id"],
@@ -1536,10 +1560,13 @@ def _mirror_project_update_to_execplan(
     translated: dict[str, object] = {}
     for field in (
         "active_sha",
+        "validated_base_sha",
+        "publication_remote_oid",
         "plan_sha",
         "branch",
         "worktree",
         "pr_url",
+        "pr_head_oid",
         "last_error",
         "worker_session_id",
         "reviewer_session_id",
@@ -2154,7 +2181,7 @@ def clear_validation_failure_history(
 
 
 def pr_for_branch(repo: Path, branch: str, url: str | None = None) -> dict[str, object] | None:
-    fields = "url,state,mergedAt,headRefOid"
+    fields = "url,state,mergedAt,headRefOid,headRefName"
     if url:
         result = command(["gh", "pr", "view", url, "--json", fields], cwd=repo)
         return json.loads(result.stdout)
@@ -2164,6 +2191,164 @@ def pr_for_branch(repo: Path, branch: str, url: str | None = None) -> dict[str, 
     )
     rows = json.loads(result.stdout)
     return rows[0] if rows else None
+
+
+def remote_branch_oid(repo: Path, branch: str) -> str | None:
+    """Return the fetched remote branch OID without consulting local branch names."""
+
+    result = git(
+        repo,
+        "show-ref",
+        "--hash",
+        f"refs/remotes/origin/{branch}",
+        check=False,
+    )
+    if result.returncode == 1:
+        return None
+    if result.returncode:
+        raise RuntimeError(
+            f"원격 publication branch 확인 실패 (git 종료 코드 {result.returncode})."
+        )
+    oid = result.stdout.strip()
+    if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", oid) is None:
+        raise RuntimeError("원격 publication branch OID 형식이 유효하지 않습니다.")
+    return oid
+
+
+def _owned_publication_plan(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    state_dir: Path,
+    repo: str,
+    branch: str,
+    worktree: Path,
+) -> sqlite3.Row:
+    plan = active_execplan(connection, repo)
+    if (
+        plan is None
+        or plan["status"] != "PUBLISHING"
+        or int(plan["workspace_owned"]) != WORKSPACE_OWNED
+        or str(plan["branch"] or "") != branch
+        or Path(str(plan["worktree"] or "")) != worktree
+    ):
+        raise PublicationSafetyError(
+            "publication branch의 Loop Manager 소유권을 SQLite에서 확인할 수 없습니다."
+        )
+    validate_execplan_workspace_identity(
+        state_dir,
+        repo,
+        str(plan["plan_id"]),
+        branch,
+        worktree,
+    )
+    validate_managed_worktree(repo_path, worktree, branch)
+    return plan
+
+
+def record_remote_publication_branch(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    state_dir: Path,
+    repo: str,
+    branch: str,
+    worktree: Path,
+    remote_oid: str | None,
+) -> None:
+    """Remember only a remote branch proven to be this managed branch."""
+
+    if remote_oid is None:
+        return
+    plan = _owned_publication_plan(
+        connection, repo_path, state_dir, repo, branch, worktree
+    )
+    local_oid = git(worktree, "rev-parse", "HEAD").stdout.strip()
+    recorded_oid = str(plan["publication_remote_oid"] or "")
+    if remote_oid == local_oid:
+        if recorded_oid != remote_oid:
+            update_project(
+                connection,
+                repo,
+                publication_remote_oid=remote_oid,
+            )
+        return
+    if recorded_oid == remote_oid:
+        return
+    raise PublicationSafetyError(
+        "PR이 없는 원격 branch가 현재 관리 HEAD 또는 저장된 게시 OID와 "
+        f"일치하지 않아 갱신을 거부합니다: {branch}"
+    )
+
+
+def push_managed_publication_branch(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    state_dir: Path,
+    repo: str,
+    branch: str,
+    worktree: Path,
+) -> str:
+    """Push idempotently, using an explicit lease only for owned PR-less recovery."""
+
+    plan = _owned_publication_plan(
+        connection, repo_path, state_dir, repo, branch, worktree
+    )
+    local_oid = git(worktree, "rev-parse", "HEAD").stdout.strip()
+    remote_oid = remote_branch_oid(repo_path, branch)
+    record_remote_publication_branch(
+        connection,
+        repo_path,
+        state_dir,
+        repo,
+        branch,
+        worktree,
+        remote_oid,
+    )
+    if remote_oid == local_oid:
+        return local_oid
+
+    push_arguments = [
+        "push",
+        "-u",
+        "origin",
+        f"HEAD:refs/heads/{branch}",
+    ]
+    if remote_oid is not None:
+        recorded_oid = str(plan["publication_remote_oid"] or "")
+        if recorded_oid != remote_oid:
+            refreshed = active_execplan(connection, repo)
+            recorded_oid = str(
+                refreshed["publication_remote_oid"] if refreshed else ""
+            )
+        if recorded_oid != remote_oid:
+            raise PublicationSafetyError(
+                "저장된 원격 branch OID와 fetch 결과가 달라 강제 갱신을 거부합니다."
+            )
+        push_arguments.insert(
+            1,
+            f"--force-with-lease=refs/heads/{branch}:{remote_oid}",
+        )
+
+    pushed = git(worktree, *push_arguments, check=False)
+    if pushed.returncode:
+        raise RuntimeError(f"publication branch push 실패:\n{pushed.stdout[-8000:]}")
+
+    git(
+        repo_path,
+        "fetch",
+        "origin",
+        f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+    )
+    confirmed_oid = remote_branch_oid(repo_path, branch)
+    if confirmed_oid != local_oid:
+        raise RuntimeError(
+            "publication branch push 결과를 원격에서 확인할 수 없습니다."
+        )
+    update_project(
+        connection,
+        repo,
+        publication_remote_oid=local_oid,
+    )
+    return local_oid
 
 
 def _canonical_path(path: Path) -> Path:
@@ -3631,12 +3816,15 @@ def _clear_active_values(
 ) -> dict[str, object]:
     values: dict[str, object] = {
         "active_sha": None,
+        "validated_base_sha": None,
+        "publication_remote_oid": None,
         "plan_sha": None,
         "phase": None,
         "branch": None,
         "worktree": None,
         "plan_path": None,
         "pr_url": None,
+        "pr_head_oid": None,
         "last_error": None,
         "planning_attempt_fingerprint": None,
         "planning_workspace_owned": 0,
@@ -4022,6 +4210,7 @@ def transition_validation_failure(
 
     execplan_assignments = [
         f"{history_column} = ?",
+        "validated_base_sha = NULL",
         "status = ?",
         "last_error = ?",
     ]
@@ -4030,7 +4219,9 @@ def transition_validation_failure(
         "BLOCKED" if blocked else "IMPLEMENTING",
         error,
     ]
-    project_assignments = ["phase = ?", "last_error = ?"]
+    project_assignments = [
+        "validated_base_sha = NULL", "phase = ?", "last_error = ?"
+    ]
     project_values: list[object] = ["BLOCKED" if blocked else "WORKING", error]
     if stage == "verify":
         execplan_assignments.append("verify_result = ?")
@@ -5618,6 +5809,8 @@ def _requeue_blocked_execplan(
                 last_error = NULL, worker_session_id = NULL,
                 reviewer_session_id = NULL, worker_result = NULL,
                 verify_result = NULL, review_result = NULL,
+                validated_base_sha = NULL, publication_remote_oid = NULL,
+                pr_url = NULL, pr_head_oid = NULL,
                 verify_failure_history = '{}', review_failure_history = '{}'
             WHERE repo = ? AND plan_id = ?
             """,
@@ -5914,6 +6107,153 @@ def complete_merged_worktree(
             [*values.values(), repo],
         )
     return assessment
+
+
+def reconcile_existing_pull_request(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    state_dir: Path,
+    repo: str,
+    project: sqlite3.Row,
+    pull_request: Mapping[str, object],
+) -> int:
+    """Attach one existing head-branch PR and apply its durable state."""
+
+    branch = str(project["branch"] or "")
+    url = str(pull_request.get("url") or project["pr_url"] or "")
+    if not url:
+        raise RuntimeError("기존 PR URL을 확인할 수 없습니다.")
+    head_name = pull_request.get("headRefName")
+    if head_name and str(head_name) != branch:
+        raise PublicationSafetyError(
+            f"기존 PR head branch가 관리 branch와 다릅니다: {head_name}"
+        )
+    head_value = pull_request.get("headRefOid")
+    head_oid = str(head_value) if head_value else project["pr_head_oid"]
+    update_project(
+        connection,
+        repo,
+        pr_url=url,
+        pr_head_oid=head_oid,
+    )
+    state = str(pull_request.get("state") or "OPEN").upper()
+
+    if state == "OPEN":
+        plan_id = _plan_id_from_path(str(project["plan_path"] or ""))
+        worktree = Path(str(project["worktree"] or ""))
+        try:
+            if plan_id is None:
+                raise WorkspaceOwnershipError(
+                    "PR_OPEN ExecPlan ID를 확인할 수 없습니다."
+                )
+            plan = active_execplan(connection, repo)
+            if (
+                plan is None
+                or plan["plan_id"] != plan_id
+                or int(plan["workspace_owned"]) != WORKSPACE_OWNED
+            ):
+                raise WorkspaceOwnershipError(
+                    "PR_OPEN workspace의 Loop Manager 소유권이 확인되지 않았습니다."
+                )
+            validate_execplan_workspace_identity(
+                state_dir,
+                repo,
+                plan_id,
+                branch,
+                worktree,
+            )
+            make_worktree(
+                repo_path,
+                worktree,
+                branch,
+                str(project["base_branch"]),
+                allow_create_branch=False,
+                allow_recovery=True,
+                allow_existing=True,
+            )
+        except (RuntimeError, WorkspaceOwnershipError) as error:
+            workspace_error = (
+                f"PR_OPEN workspace 소유권/복구 검증 실패: {error}"
+            )
+            block_active_execplan_from_revision(
+                connection,
+                repo_path,
+                repo,
+                f"refs/remotes/origin/{project['base_branch']}",
+                workspace_error,
+            )
+            operation_print(workspace_error, file=sys.stderr)
+            return 1
+        update_project(
+            connection,
+            repo,
+            phase="PR_OPEN",
+            pr_url=url,
+            pr_head_oid=head_oid,
+            last_error=None,
+        )
+        operation_print(f"Merge 대기 중: {url}")
+        return 0
+
+    if state == "MERGED" or pull_request.get("mergedAt"):
+        git(repo_path, "fetch", "origin")
+        persisted = connection.execute(
+            "SELECT pr_head_oid FROM projects WHERE repo = ?",
+            (repo,),
+        ).fetchone()
+        stored_head_oid = (
+            str(persisted["pr_head_oid"])
+            if persisted and persisted["pr_head_oid"]
+            else None
+        )
+        worktree = Path(str(project["worktree"] or ""))
+        try:
+            assessment = complete_merged_worktree(
+                connection,
+                repo_path,
+                repo,
+                state_dir,
+                worktree,
+                url,
+                stored_head_oid,
+            )
+        except (RuntimeError, WorkspaceOwnershipError) as error:
+            workspace_error = (
+                f"Merge cleanup workspace 소유권 검증 실패: {error}"
+            )
+            block_active_execplan_from_revision(
+                connection,
+                repo_path,
+                repo,
+                f"refs/remotes/origin/{project['base_branch']}",
+                workspace_error,
+            )
+            operation_print(workspace_error, file=sys.stderr)
+            return 1
+        if assessment.status in {"safe", "missing"}:
+            operation_print(f"Merge 확인 및 worktree 정리 완료: {url}")
+        else:
+            operation_print(
+                f"Merge 확인 완료; worktree 보존: {worktree} "
+                f"({assessment.reason or assessment.status})",
+                file=sys.stderr,
+            )
+        return PROJECT_STEP_PLANNING_PENDING
+
+    if state == "CLOSED":
+        error = "PR이 Merge 없이 닫혔습니다."
+        update_project(
+            connection,
+            repo,
+            phase="BLOCKED",
+            pr_url=url,
+            pr_head_oid=head_oid,
+            last_error=error,
+        )
+        operation_print(f"닫힌 PR을 다시 열어야 합니다: {url}", file=sys.stderr)
+        return 1
+
+    raise RuntimeError(f"지원하지 않는 GitHub PR 상태입니다: {state}")
 
 
 def planner_prompt(error: str | None, compact_catalog: str = "[]") -> str:
@@ -6391,96 +6731,27 @@ def _run_project_step(
     if row and row["branch"]:
         existing_pr = pr_for_branch(repo_path, row["branch"], row["pr_url"])
         if existing_pr:
-            update_project(connection, repo, pr_url=existing_pr["url"])
-            if existing_pr["state"] == "OPEN":
-                open_plan_id = _plan_id_from_path(str(row["plan_path"] or ""))
-                open_worktree = Path(str(row["worktree"] or ""))
-                open_branch = str(row["branch"])
-                try:
-                    if open_plan_id is None:
-                        raise WorkspaceOwnershipError(
-                            "PR_OPEN ExecPlan ID를 확인할 수 없습니다."
-                        )
-                    open_plan = active_execplan(connection, repo)
-                    if (
-                        open_plan is None
-                        or open_plan["plan_id"] != open_plan_id
-                        or int(open_plan["workspace_owned"]) != WORKSPACE_OWNED
-                    ):
-                        raise WorkspaceOwnershipError(
-                            "PR_OPEN workspace의 Loop Manager 소유권이 확인되지 않았습니다."
-                        )
-                    validate_execplan_workspace_identity(
-                        state_dir,
-                        repo,
-                        open_plan_id,
-                        open_branch,
-                        open_worktree,
-                    )
-                    make_worktree(
-                        repo_path,
-                        open_worktree,
-                        open_branch,
-                        str(row["base_branch"]),
-                        allow_create_branch=False,
-                        allow_recovery=True,
-                        allow_existing=True,
-                    )
-                except (RuntimeError, WorkspaceOwnershipError) as error:
-                    workspace_error = (
-                        f"PR_OPEN workspace 소유권/복구 검증 실패: {error}"
-                    )
-                    block_active_execplan_from_revision(
-                        connection,
-                        repo_path,
-                        repo,
-                        f"refs/remotes/origin/{row['base_branch']}",
-                        workspace_error,
-                    )
-                    operation_print(workspace_error, file=sys.stderr)
-                    return 1
-                operation_print(f"Merge 대기 중: {existing_pr['url']}")
-                return 0
-            if existing_pr["state"] == "MERGED" or existing_pr.get("mergedAt"):
-                git(repo_path, "fetch", "origin")
-                worktree = Path(row["worktree"])
-                head_value = existing_pr.get("headRefOid")
-                pr_head_oid = str(head_value) if head_value else None
-                try:
-                    assessment = complete_merged_worktree(
-                        connection,
-                        repo_path,
-                        repo,
-                        state_dir,
-                        worktree,
-                        str(existing_pr["url"]),
-                        pr_head_oid,
-                    )
-                except (RuntimeError, WorkspaceOwnershipError) as error:
-                    workspace_error = (
-                        f"Merge cleanup workspace 소유권 검증 실패: {error}"
-                    )
-                    block_active_execplan_from_revision(
-                        connection,
-                        repo_path,
-                        repo,
-                        f"refs/remotes/origin/{row['base_branch']}",
-                        workspace_error,
-                    )
-                    operation_print(workspace_error, file=sys.stderr)
-                    return 1
-                if assessment.status in {"safe", "missing"}:
-                    operation_print(f"Merge 확인 및 worktree 정리 완료: {existing_pr['url']}")
-                else:
-                    operation_print(
-                        f"Merge 확인 완료; worktree 보존: {worktree} "
-                        f"({assessment.reason or assessment.status})",
-                        file=sys.stderr,
-                    )
-                return PROJECT_STEP_PLANNING_PENDING
-            update_project(connection, repo, phase="BLOCKED", last_error="PR이 Merge 없이 닫혔습니다.")
-            operation_print(f"닫힌 PR을 다시 열어야 합니다: {existing_pr['url']}", file=sys.stderr)
-            return 1
+            try:
+                return reconcile_existing_pull_request(
+                    connection,
+                    repo_path,
+                    state_dir,
+                    repo,
+                    row,
+                    existing_pr,
+                )
+            except PublicationSafetyError as error:
+                publication_error = f"기존 PR 복구 거부: {error}"
+                block_active_execplan_from_revision(
+                    connection,
+                    repo_path,
+                    repo,
+                    f"refs/remotes/origin/{row['base_branch']}",
+                    publication_error,
+                    str(row["verify_result"] or ""),
+                )
+                operation_print(publication_error, file=sys.stderr)
+                return 1
 
     if row and row["phase"] == "BLOCKED":
         git(repo_path, "fetch", "origin")
@@ -7250,14 +7521,25 @@ def _run_project_step(
 
         if code:
             worker_error = message or f"Codex 종료 코드 {code}"
+            result_kind = result.result_kind
             if resolving_rebase:
                 worker_error = REBASE_CONFLICT_PREFIX + worker_error
-            if result.result_kind is AgentResultKind.TRANSIENT_FAILURE:
+            if result_kind is AgentResultKind.TRANSIENT_FAILURE:
                 worker_error = f"{TRANSIENT_AGENT_ERROR_PREFIX} {worker_error}"
                 step_result = PROJECT_STEP_TRANSIENT_PAUSE
-            elif result.result_kind is AgentResultKind.USAGE_LIMIT:
+            elif result_kind is AgentResultKind.USAGE_LIMIT:
                 worker_error = f"{USAGE_LIMIT_ERROR_PREFIX} {worker_error}"
                 step_result = PROJECT_STEP_USAGE_PAUSE
+            elif resolving_rebase:
+                block_active_execplan(
+                    connection,
+                    repo,
+                    worktree,
+                    worker_error,
+                    str(row["verify_result"] or ""),
+                )
+                operation_print(worker_error, file=sys.stderr)
+                return 1
             else:
                 step_result = 1
             update_project(
@@ -7317,6 +7599,7 @@ def _run_project_step(
             connection,
             repo,
             phase="VERIFYING",
+            validated_base_sha=None,
             worker_result=message,
             verify_result=None,
             last_error=None,
@@ -7413,20 +7696,31 @@ def _run_project_step(
                 connection,
                 repo,
                 phase="WORKING",
+                validated_base_sha=None,
                 last_error=REBASE_IN_PROGRESS_ERROR,
             )
             rebased = git(worktree, "rebase", f"origin/{base}", check=False)
             if rebased.returncode:
                 if _rebase_in_progress_for_branch(worktree, branch):
                     rebase_failure = REBASE_CONFLICT_PREFIX + rebased.stdout[-8000:]
+                    update_project(
+                        connection,
+                        repo,
+                        phase="WORKING",
+                        validated_base_sha=None,
+                        last_error=rebase_failure,
+                    )
                 else:
                     rebase_failure = f"rebase 실패:\n{rebased.stdout[-8000:]}"
-                update_project(
-                    connection, repo, phase="WORKING", last_error=rebase_failure
-                )
+                    block_active_execplan(
+                        connection,
+                        repo,
+                        worktree,
+                        rebase_failure,
+                        output,
+                    )
                 operation_print(rebased.stdout, file=sys.stderr)
                 return 1
-            # The rebase completed even if its follow-up verify later fails.
             # Persist the new base now so recovery does not repeat that rebase.
             update_project(connection, repo, active_sha=latest_sha)
             operation_log(f"전체 verify 시작: {plan['id']} {plan['title']} (rebase 후)")
@@ -7482,9 +7776,20 @@ def _run_project_step(
                     catalog_plan,
                 )
                 git(worktree, "commit", "-m", worker_publication.commit_title)
-            update_project(connection, repo, active_sha=latest_sha, verify_result=output)
+            update_project(
+                connection,
+                repo,
+                active_sha=latest_sha,
+                validated_base_sha=latest_sha,
+                verify_result=output,
+            )
         else:
-            update_project(connection, repo, verify_result=output)
+            update_project(
+                connection,
+                repo,
+                validated_base_sha=str(row["active_sha"] or ""),
+                verify_result=output,
+            )
         try:
             plan = validate_active_execplan_metadata(
                 repo_path,
@@ -7643,50 +7948,258 @@ def _run_project_step(
     row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
     if row["phase"] == "PUBLISHING":
         existing_pr = pr_for_branch(repo_path, branch)
-        if not existing_pr:
-            plan_sha = str(row["plan_sha"] or "")
-            if not plan_sha:
-                update_project(connection, repo, phase="BLOCKED", last_error="계획 commit SHA가 없습니다.")
-                return 1
-            plan_text = git(worktree, "show", f"{plan_sha}:{row['plan_path']}").stdout
-            plan = published_execplan(str(row["plan_path"]), plan_text)
+        if existing_pr:
             try:
-                worker_publication = parse_worker_result(str(row["worker_result"] or ""), plan)
-            except WorkerResultError as error:
-                validation_error = f"Worker 결과 검증 실패:\n{error}"
-                update_project(connection, repo, phase="WORKING", last_error=validation_error)
-                operation_print(validation_error, file=sys.stderr)
+                return reconcile_existing_pull_request(
+                    connection,
+                    repo_path,
+                    state_dir,
+                    repo,
+                    row,
+                    existing_pr,
+                )
+            except PublicationSafetyError as error:
+                publication_error = f"기존 PR 복구 거부: {error}"
+                block_active_execplan(
+                    connection,
+                    repo,
+                    worktree,
+                    publication_error,
+                    str(row["verify_result"] or ""),
+                )
+                operation_print(publication_error, file=sys.stderr)
                 return 1
-            origin_url = git(worktree, "remote", "get-url", "origin").stdout.strip()
-            body = build_pr_body(
-                worker_publication,
-                plan,
-                str(row["plan_path"]),
-                plan_text,
-                origin_url, plan_sha,
+
+        git(repo_path, "fetch", "origin")
+        latest_sha = git(
+            repo_path, "rev-parse", f"origin/{base}"
+        ).stdout.strip()
+        remote_oid = remote_branch_oid(repo_path, branch)
+        try:
+            record_remote_publication_branch(
+                connection,
+                repo_path,
+                state_dir,
+                repo,
+                branch,
+                worktree,
+                remote_oid,
             )
-            git(worktree, "push", "-u", "origin", branch)
-            title = f"Implement {plan['id']}: {plan['title']}"
-            created = command(
-                [
-                    "gh",
-                    "pr",
-                    "create",
-                    "--base",
-                    base,
-                    "--head",
-                    branch,
-                    "--title",
-                    title,
-                    "--body",
-                    body,
-                ],
-                cwd=worktree,
+        except PublicationSafetyError as error:
+            publication_error = str(error)
+            block_active_execplan(
+                connection,
+                repo,
+                worktree,
+                publication_error,
+                str(row["verify_result"] or ""),
             )
-            url = created.stdout.strip().splitlines()[-1]
-        else:
-            url = str(existing_pr["url"])
-        update_project(connection, repo, phase="PR_OPEN", pr_url=url, last_error=None)
+            operation_print(publication_error, file=sys.stderr)
+            return 1
+
+        if latest_sha != row["validated_base_sha"]:
+            if latest_sha != row["active_sha"]:
+                update_project(
+                    connection,
+                    repo,
+                    phase="WORKING",
+                    validated_base_sha=None,
+                    last_error=REBASE_IN_PROGRESS_ERROR,
+                )
+                rebased = git(
+                    worktree, "rebase", f"origin/{base}", check=False
+                )
+                if rebased.returncode:
+                    if _rebase_in_progress_for_branch(worktree, branch):
+                        rebase_failure = (
+                            REBASE_CONFLICT_PREFIX + rebased.stdout[-8000:]
+                        )
+                        update_project(
+                            connection,
+                            repo,
+                            phase="WORKING",
+                            validated_base_sha=None,
+                            last_error=rebase_failure,
+                        )
+                    else:
+                        rebase_failure = (
+                            f"게시 직전 rebase 실패:\n{rebased.stdout[-8000:]}"
+                        )
+                        block_active_execplan(
+                            connection,
+                            repo,
+                            worktree,
+                            rebase_failure,
+                            str(row["verify_result"] or ""),
+                        )
+                    operation_print(rebase_failure, file=sys.stderr)
+                    return 1
+                if not branch_has_changes(worktree, base):
+                    no_change_error = (
+                        "게시 직전 rebase 후 Worker 변경이 남지 않아 PR을 "
+                        "생성할 수 없습니다."
+                    )
+                    block_active_execplan(
+                        connection,
+                        repo,
+                        worktree,
+                        no_change_error,
+                        str(row["verify_result"] or ""),
+                    )
+                    operation_print(no_change_error, file=sys.stderr)
+                    return 1
+                update_project(
+                    connection,
+                    repo,
+                    active_sha=latest_sha,
+                    validated_base_sha=None,
+                    phase="VERIFYING",
+                    verify_result=None,
+                    review_result=None,
+                    last_error=None,
+                )
+            else:
+                update_project(
+                    connection,
+                    repo,
+                    validated_base_sha=None,
+                    phase="VERIFYING",
+                    verify_result=None,
+                    review_result=None,
+                    last_error=None,
+                )
+            operation_print(
+                "게시 직전 base가 변경되어 전체 verify와 Review를 다시 수행합니다.",
+                file=sys.stderr,
+            )
+            return PROJECT_STEP_RETRY
+
+        if row["active_sha"] != latest_sha:
+            publication_error = (
+                "검증 base와 관리 branch의 반영 base가 일치하지 않습니다."
+            )
+            block_active_execplan(
+                connection,
+                repo,
+                worktree,
+                publication_error,
+                str(row["verify_result"] or ""),
+            )
+            operation_print(publication_error, file=sys.stderr)
+            return 1
+        if not branch_has_changes(worktree, base):
+            no_change_error = (
+                "게시할 Worker 변경이 남지 않아 PR을 생성할 수 없습니다."
+            )
+            block_active_execplan(
+                connection,
+                repo,
+                worktree,
+                no_change_error,
+                str(row["verify_result"] or ""),
+            )
+            operation_print(no_change_error, file=sys.stderr)
+            return 1
+
+        plan_sha = str(row["plan_sha"] or "")
+        if not plan_sha:
+            plan_error = "계획 commit SHA가 없습니다."
+            block_active_execplan(
+                connection,
+                repo,
+                worktree,
+                plan_error,
+                str(row["verify_result"] or ""),
+            )
+            operation_print(plan_error, file=sys.stderr)
+            return 1
+        plan_text = git(
+            worktree, "show", f"{plan_sha}:{row['plan_path']}"
+        ).stdout
+        plan = published_execplan(str(row["plan_path"]), plan_text)
+        try:
+            worker_publication = parse_worker_result(
+                str(row["worker_result"] or ""), plan
+            )
+        except WorkerResultError as error:
+            validation_error = f"Worker 결과 검증 실패:\n{error}"
+            update_project(
+                connection,
+                repo,
+                phase="WORKING",
+                validated_base_sha=None,
+                last_error=validation_error,
+            )
+            operation_print(validation_error, file=sys.stderr)
+            return 1
+        origin_url = git(
+            worktree, "remote", "get-url", "origin"
+        ).stdout.strip()
+        body = build_pr_body(
+            worker_publication,
+            plan,
+            str(row["plan_path"]),
+            plan_text,
+            origin_url,
+            plan_sha,
+        )
+        try:
+            head_oid = push_managed_publication_branch(
+                connection,
+                repo_path,
+                state_dir,
+                repo,
+                branch,
+                worktree,
+            )
+        except PublicationSafetyError as error:
+            publication_error = str(error)
+            block_active_execplan(
+                connection,
+                repo,
+                worktree,
+                publication_error,
+                str(row["verify_result"] or ""),
+            )
+            operation_print(publication_error, file=sys.stderr)
+            return 1
+        except RuntimeError as error:
+            publication_error = str(error)
+            update_project(
+                connection,
+                repo,
+                phase="PUBLISHING",
+                last_error=publication_error,
+            )
+            operation_print(publication_error, file=sys.stderr)
+            return 1
+
+        title = f"Implement {plan['id']}: {plan['title']}"
+        created = command(
+            [
+                "gh",
+                "pr",
+                "create",
+                "--base",
+                base,
+                "--head",
+                branch,
+                "--title",
+                title,
+                "--body",
+                body,
+            ],
+            cwd=worktree,
+        )
+        url = created.stdout.strip().splitlines()[-1]
+        update_project(
+            connection,
+            repo,
+            phase="PR_OPEN",
+            pr_url=url,
+            pr_head_oid=head_oid,
+            last_error=None,
+        )
         operation_print(f"PR 생성 완료: {url}")
     return 0
 
