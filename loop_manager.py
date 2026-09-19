@@ -28,6 +28,9 @@ FIELDS = {
     "planning_attempt_fingerprint",
     "planning_retry_count",
     "planner_session_id",
+    "worker_session_id",
+    "worker_result",
+    "verify_result",
     "planning_validation_error",
     "planning_result_pending_validation",
     "planning_result_completed",
@@ -51,6 +54,9 @@ CREATE TABLE IF NOT EXISTS projects (
     planning_attempt_fingerprint TEXT,
     planning_retry_count INTEGER NOT NULL DEFAULT 0,
     planner_session_id TEXT,
+    worker_session_id TEXT,
+    worker_result TEXT,
+    verify_result TEXT,
     planning_validation_error TEXT,
     planning_result_pending_validation INTEGER NOT NULL DEFAULT 0,
     planning_result_completed INTEGER NOT NULL DEFAULT 0,
@@ -146,6 +152,9 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
         "planning_attempt_fingerprint": "TEXT",
         "planning_retry_count": "INTEGER NOT NULL DEFAULT 0",
         "planner_session_id": "TEXT",
+        "worker_session_id": "TEXT",
+        "worker_result": "TEXT",
+        "verify_result": "TEXT",
         "planning_validation_error": "TEXT",
         "planning_result_pending_validation": "INTEGER NOT NULL DEFAULT 0",
         "planning_result_completed": "INTEGER NOT NULL DEFAULT 0",
@@ -773,7 +782,7 @@ def run_codex(
         if returncode == 0:
             return CodexResult(
                 1,
-                "Planner 실행 결과에서 세션 ID를 확인할 수 없습니다.",
+                f"Codex {role_name} 실행 결과에서 세션 ID를 확인할 수 없습니다.",
             )
     if persist_session or session_id:
         return CodexResult(returncode, message.strip(), resolved_session_id)
@@ -913,6 +922,9 @@ def clear_planning_validation_state(
         planning_attempt_fingerprint=None,
         planning_retry_count=0,
         planner_session_id=None,
+        worker_session_id=None,
+        worker_result=None,
+        verify_result=None,
         planning_validation_error=None,
         planning_result_pending_validation=0,
         planning_result_completed=0,
@@ -940,6 +952,9 @@ def clear_active(
         "planning_attempt_fingerprint": None,
         "planning_retry_count": 0,
         "planner_session_id": None,
+        "worker_session_id": None,
+        "worker_result": None,
+        "verify_result": None,
         "planning_validation_error": None,
         "planning_result_pending_validation": 0,
         "planning_result_completed": 0,
@@ -972,14 +987,30 @@ def worker_prompt(plan_path: str, error: str | None) -> str:
 AGENTS.md와 {plan_path}를 읽고 해당 ExecPlan 하나만 구현하라.
 관련 targeted test를 작성하되 commit, push, PR 생성과 scripts/verify 실행은 하지 마라.
 docs/plans에 새 ExecPlan을 만들지 말고 불필요한 후속 기능도 구현하지 마라.
+구현과 관련 unit test를 작성하거나 갱신한 뒤, 수정한 코드와 새로 작성하거나 변경한 테스트를 직접 검증하는 최소 범위의 targeted unit test만 실행하라. 개별 test case, test class, test module 또는 이에 준하는 좁은 단위만 허용된다.
+targeted unit test가 실패하면 같은 세션에서 원인을 수정하고 같은 targeted test를 다시 실행하라. 문서·설정 전용 변경이거나 실행 가능한 관련 unit test가 없으면 테스트 범위를 확대하지 말고, 실행하지 못한 구체적인 사유를 최종 결과에 남겨라.
+전체 test suite, integration test, end-to-end test, 프로젝트 전체 lint·build·type check 및 scripts/verify 실행은 절대 실행하지 마라. 전체 verify는 Worker 종료 뒤 Loop Manager가 실행하며, 실패한 경우에만 이 세션으로 진단을 전달한다.
 {failure}
 """.strip()
 
 
-def reviewer_prompt(base: str) -> str:
+def reviewer_prompt(
+    base: str,
+    worker_result: str | None = None,
+    verify_result: str | None = None,
+) -> str:
+    worker_evidence = (worker_result or "Worker가 targeted unit test 결과 또는 미실행 사유를 보고하지 않았습니다.")[-6000:]
+    verify_evidence = (verify_result or "Loop Manager 전체 verify가 성공했습니다(출력 없음).")[-6000:]
     return f"""
 origin/{base}와 현재 HEAD의 차이를 읽기 전용으로 검토하라.
 AGENTS.md, 근거 PRODUCT/Requirement, ARCHITECTURE와 ExecPlan을 기준으로 correctness, 회귀, 테스트 누락, verify 약화를 확인하라.
+Worker가 보고한 targeted unit test 결과 또는 미실행 사유:
+{worker_evidence}
+
+Loop Manager가 실행한 전체 verify 결과:
+{verify_evidence}
+
+테스트 command와 scripts/verify를 실행하지 말고, 코드·테스트·verify 스크립트의 diff 및 위 결과만으로 판단하라.
 blocking issue가 있으면 간결히 설명하고 마지막 줄을 `VERDICT: FAIL`로 끝내라.
 blocking issue가 없으면 마지막 줄을 `VERDICT: PASS`로 끝내라. 파일은 수정하지 마라.
 """.strip()
@@ -1092,6 +1123,9 @@ def run_project(
             planning_attempt_fingerprint=current_fingerprint,
             planning_retry_count=0,
             planner_session_id=None,
+            worker_session_id=None,
+            worker_result=None,
+            verify_result=None,
             planning_validation_error=None,
             planning_result_pending_validation=0,
             planning_result_completed=0,
@@ -1301,7 +1335,7 @@ def run_project(
     if row["phase"] in {"WORKING", "BLOCKED"}:
         plan = validate_execplan(worktree, row["plan_path"])
         level = worker_level(plan)
-        code, message = run_codex(
+        result = run_codex(
             worktree,
             state_dir,
             config_path,
@@ -1309,18 +1343,43 @@ def run_project(
             worker_prompt(row["plan_path"], row["last_error"]),
             read_only=False,
             level=level,
+            persist_session=True,
+            session_id=row["worker_session_id"],
+            on_session_started=lambda started_session_id: update_project(
+                connection,
+                repo,
+                worker_session_id=started_session_id,
+            ),
         )
+        code, message = result
+        result_session_id = getattr(result, "session_id", None)
+        if result_session_id:
+            update_project(connection, repo, worker_session_id=result_session_id)
+
         if code:
             update_project(connection, repo, phase="WORKING", last_error=message or f"Codex 종료 코드 {code}")
             print(message or "Codex 실행에 실패했습니다.", file=sys.stderr)
             return 1
-        update_project(connection, repo, phase="VERIFYING", last_error=None)
+        update_project(
+            connection,
+            repo,
+            phase="VERIFYING",
+            worker_result=message,
+            verify_result=None,
+            last_error=None,
+        )
 
     row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
     if row["phase"] == "VERIFYING":
         passed, output = verify(worktree)
         if not passed:
-            update_project(connection, repo, phase="WORKING", last_error=f"전체 검증 실패:\n{output}")
+            update_project(
+                connection,
+                repo,
+                phase="WORKING",
+                verify_result=None,
+                last_error=f"전체 검증 실패:\n{output}",
+            )
             print(output, file=sys.stderr)
             return 1
 
@@ -1346,10 +1405,18 @@ def run_project(
                 return 1
             passed, output = verify(worktree)
             if not passed:
-                update_project(connection, repo, phase="WORKING", last_error=f"rebase 후 전체 검증 실패:\n{output}")
+                update_project(
+                    connection,
+                    repo,
+                    phase="WORKING",
+                    verify_result=None,
+                    last_error=f"rebase 후 전체 검증 실패:\n{output}",
+                )
                 print(output, file=sys.stderr)
                 return 1
-            update_project(connection, repo, active_sha=latest_sha)
+            update_project(connection, repo, active_sha=latest_sha, verify_result=output)
+        else:
+            update_project(connection, repo, verify_result=output)
         update_project(connection, repo, phase="REVIEWING", last_error=None)
 
     row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
@@ -1359,7 +1426,7 @@ def run_project(
             state_dir,
             config_path,
             "reviewer",
-            reviewer_prompt(base),
+            reviewer_prompt(base, row["worker_result"], row["verify_result"]),
             read_only=True,
         )
         passed = code == 0 and re.search(r"(?mi)^VERDICT:\s*PASS\s*$", review) and not re.search(
