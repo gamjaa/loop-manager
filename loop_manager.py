@@ -121,6 +121,7 @@ CREATE TABLE IF NOT EXISTS exec_plans (
     worker_session_id TEXT,
     worker_result TEXT,
     verify_result TEXT,
+    workspace_owned INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (repo, plan_id),
     UNIQUE (repo, path),
     FOREIGN KEY (repo) REFERENCES projects(repo)
@@ -313,6 +314,11 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
     columns = {row[1] for row in connection.execute("PRAGMA table_info(exec_plans)")}
     if "blocked_fingerprint" not in columns:
         connection.execute("ALTER TABLE exec_plans ADD COLUMN blocked_fingerprint TEXT")
+    if "workspace_owned" not in columns:
+        connection.execute(
+            "ALTER TABLE exec_plans ADD COLUMN workspace_owned "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
     connection.execute(EXEC_PLANS_ACTIVE_INDEX)
 
 
@@ -980,8 +986,9 @@ def migrate_legacy_execplans(
                     INSERT INTO exec_plans (
                         repo, plan_id, path, title, sources, depends_on, priority,
                         content_hash, status, plan_sha, active_sha, branch, worktree,
-                        pr_url, last_error, worker_session_id, worker_result, verify_result
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        pr_url, last_error, worker_session_id, worker_result, verify_result,
+                        workspace_owned
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         project["repo"],
@@ -1004,6 +1011,7 @@ def migrate_legacy_execplans(
                         project["worker_session_id"] if is_active else None,
                         project["worker_result"] if is_active else None,
                         project["verify_result"] if is_active else None,
+                        1 if is_active else 0,
                     ),
                 )
 
@@ -1015,6 +1023,21 @@ def active_execplan(connection: sqlite3.Connection, repo: str) -> sqlite3.Row | 
         f"SELECT * FROM exec_plans WHERE repo = ? AND status IN ({placeholders})",
         (repo, *sorted(ACTIVE_EXECPLAN_STATUSES)),
     ).fetchone()
+
+
+def mark_execplan_workspace_owned(
+    connection: sqlite3.Connection,
+    repo: str,
+    plan_id: str,
+) -> None:
+    with connection:
+        changed = connection.execute(
+            "UPDATE exec_plans SET workspace_owned = 1 "
+            "WHERE repo = ? AND plan_id = ?",
+            (repo, plan_id),
+        )
+        if changed.rowcount != 1:
+            raise RuntimeError("workspace 소유권을 기록할 ExecPlan을 찾을 수 없습니다.")
 
 
 def compact_execplan_catalog(connection: sqlite3.Connection, repo: str) -> str:
@@ -1622,6 +1645,8 @@ def make_worktree(
     branch: str,
     base: str,
     *,
+    allow_recovery: bool = True,
+    allow_existing: bool = True,
     allow_create_branch: bool = True,
 ) -> str:
     """Create, recover, or validate one owned ExecPlan worktree."""
@@ -1631,6 +1656,11 @@ def make_worktree(
             f"관리 worktree 경로가 디렉터리가 아닙니다: {worktree}"
         )
     if worktree.is_dir():
+        if not allow_existing:
+            raise WorkspaceOwnershipError(
+                f"새 ExecPlan의 관리 worktree가 이미 존재해 소유권을 증명할 수 없습니다: "
+                f"{worktree}"
+            )
         validate_managed_worktree(repo, worktree, branch)
         return "existing"
 
@@ -1648,7 +1678,7 @@ def make_worktree(
         == 0
     )
     if branch_exists:
-        if allow_create_branch:
+        if allow_create_branch or not allow_recovery:
             raise WorkspaceOwnershipError(
                 f"새 ExecPlan의 관리 branch가 이미 존재해 소유권을 증명할 수 없습니다: "
                 f"{branch}"
@@ -1836,7 +1866,6 @@ def capture_git_snapshot(worktree: Path) -> GitSnapshot:
                 worktree,
                 "ls-files",
                 "--others",
-                "--exclude-standard",
                 "-z",
             ),
         ),
@@ -2250,19 +2279,29 @@ def preserve_planning_diagnostics(
         or ""
     )
     diff = ""
-    sensitive_scope_failure = (
-        "Git 범위 위반" in str(error)
-        or "workspace 소유권 검증 실패" in str(error)
-    )
-    if worktree and worktree.is_dir() and not sensitive_scope_failure:
+    if worktree and worktree.is_dir():
         try:
-            # Compare with the planning base rather than HEAD so an invalid
-            # Planner commit remains in the diagnostic when this worktree is
-            # forcibly removed after its input changes. Intent-to-add makes
-            # untracked output visible as well.
-            git(worktree, "add", "--intent-to-add", "-A")
             base_revision = row["active_sha"] or "HEAD"
             diff = git(worktree, "diff", "--binary", base_revision).stdout
+            for relative_path in _nul_git_paths(
+                worktree, "ls-files", "--others", "-z"
+            ):
+                untracked = git(
+                    worktree,
+                    "diff",
+                    "--binary",
+                    "--no-index",
+                    "--",
+                    os.devnull,
+                    relative_path,
+                    check=False,
+                )
+                if untracked.returncode not in {0, 1}:
+                    raise RuntimeError(
+                        f"untracked diff 생성 실패 ({relative_path}): "
+                        f"git 종료 코드 {untracked.returncode}"
+                    )
+                diff += untracked.stdout
         except RuntimeError as diff_error:
             diff = f"diff 보존 실패: {diff_error}"
     diagnostic = planning_diagnostics_path(state_dir, repo, fingerprint)
@@ -2558,6 +2597,10 @@ def resume_blocked_execplan_if_inputs_changed(
     worktree = Path(str(plan["worktree"]))
     branch = str(plan["branch"] or "")
     try:
+        if not bool(plan["workspace_owned"]):
+            raise WorkspaceOwnershipError(
+                "BLOCKED workspace의 Loop Manager 소유권이 확인되지 않았습니다."
+            )
         validate_execplan_workspace_identity(
             state_dir,
             repo,
@@ -2571,6 +2614,8 @@ def resume_blocked_execplan_if_inputs_changed(
             branch,
             base,
             allow_create_branch=False,
+            allow_recovery=True,
+            allow_existing=True,
         )
     except (RuntimeError, WorkspaceOwnershipError) as error:
         message = f"BLOCKED worktree 복구 실패:\n{error}"
@@ -2929,6 +2974,15 @@ def run_project(
                         raise WorkspaceOwnershipError(
                             "PR_OPEN ExecPlan ID를 확인할 수 없습니다."
                         )
+                    open_plan = active_execplan(connection, repo)
+                    if (
+                        open_plan is None
+                        or open_plan["plan_id"] != open_plan_id
+                        or not bool(open_plan["workspace_owned"])
+                    ):
+                        raise WorkspaceOwnershipError(
+                            "PR_OPEN workspace의 Loop Manager 소유권이 확인되지 않았습니다."
+                        )
                     validate_execplan_workspace_identity(
                         state_dir,
                         repo,
@@ -2942,6 +2996,8 @@ def run_project(
                         open_branch,
                         str(row["base_branch"]),
                         allow_create_branch=False,
+                        allow_recovery=True,
+                        allow_existing=True,
                     )
                 except (RuntimeError, WorkspaceOwnershipError) as error:
                     workspace_error = (
@@ -3509,10 +3565,18 @@ def run_project(
     branch = str(row["branch"] or "")
     worktree = Path(str(row["worktree"] or ""))
     plan_id = _plan_id_from_path(str(row["plan_path"] or ""))
+    catalog_plan = active_execplan(connection, repo)
+    workspace_owned = bool(
+        catalog_plan is not None and catalog_plan["workspace_owned"]
+    )
     try:
         if plan_id is None:
             raise WorkspaceOwnershipError(
                 "활성 ExecPlan 경로에서 ID를 확인할 수 없습니다."
+            )
+        if catalog_plan is None or catalog_plan["plan_id"] != plan_id:
+            raise WorkspaceOwnershipError(
+                "활성 ExecPlan의 catalog 상태를 확인할 수 없습니다."
             )
         validate_execplan_workspace_identity(
             state_dir,
@@ -3526,8 +3590,11 @@ def run_project(
             worktree,
             branch,
             base,
-            allow_create_branch=newly_activated,
+            allow_create_branch=newly_activated and not workspace_owned,
+            allow_recovery=workspace_owned,
+            allow_existing=workspace_owned,
         )
+        mark_execplan_workspace_owned(connection, repo, plan_id)
     except (RuntimeError, WorkspaceOwnershipError) as error:
         workspace_error = f"관리 workspace 소유권/복구 검증 실패: {error}"
         block_active_execplan_from_revision(

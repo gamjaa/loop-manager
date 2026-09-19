@@ -1571,7 +1571,7 @@ class LoopManagerTest(unittest.TestCase):
             diagnostic_text = diagnostic.read_text(encoding="utf-8")
             self.assertIn(blocked["planning_error"], diagnostic_text)
             self.assertIn("unexpected.txt", diagnostic_text)
-            self.assertNotIn("+invalid 4", diagnostic_text)
+            self.assertIn("+invalid 4", diagnostic_text)
 
     def test_planning_error_gate_precedes_dirty_base_worktree_check(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -3322,6 +3322,38 @@ class AgentScopeValidatorTest(unittest.TestCase):
                         selected_plan_path=selected_plan,
                     )
 
+    def test_ignored_untracked_creation_and_change_are_rejected(self):
+        scenarios = (
+            ("planner", None, "created by planner\n"),
+            ("reviewer", "before review\n", "changed by reviewer\n"),
+        )
+        for role_name, before_contents, after_contents in scenarios:
+            with self.subTest(role=role_name), tempfile.TemporaryDirectory() as directory:
+                repo, _plan_path = self._repository_with_plan(directory)
+                (repo / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+                commit_and_push(repo, "Ignore diagnostic fixture")
+                ignored = repo / "ignored.txt"
+                if before_contents is not None:
+                    ignored.write_text(before_contents, encoding="utf-8")
+                before = loop_manager.capture_git_snapshot(repo)
+
+                ignored.write_text(after_contents, encoding="utf-8")
+                after = loop_manager.capture_git_snapshot(repo)
+
+                self.assertIn("ignored.txt", after.dirty)
+                if before_contents is not None:
+                    self.assertIn("ignored.txt", before.dirty)
+                with self.assertRaisesRegex(
+                    loop_manager.AgentScopeError,
+                    "ignored.txt",
+                ):
+                    loop_manager.validate_agent_scope(
+                        role_name,
+                        repo,
+                        before,
+                        after,
+                    )
+
     def test_planner_new_plan_and_worker_selected_plan_are_allowed(self):
         for role_name in ("planner", "worker"):
             with self.subTest(role=role_name), tempfile.TemporaryDirectory() as directory:
@@ -3540,6 +3572,35 @@ class WorkspaceRecoveryTest(unittest.TestCase):
         )
         return repo, state_dir, connection, plan, plan_sha, branch, worktree
 
+    def test_existing_catalog_does_not_infer_workspace_ownership(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute(
+            """
+            CREATE TABLE exec_plans (
+                repo TEXT NOT NULL,
+                plan_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                branch TEXT,
+                worktree TEXT,
+                blocked_fingerprint TEXT
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO exec_plans "
+            "(repo, plan_id, status, branch, worktree, blocked_fingerprint) "
+            "VALUES ('repo', 'G-012', 'BLOCKED', 'loop-manager/G-012', "
+            "'managed', 'fingerprint')"
+        )
+
+        loop_manager._ensure_execplans_schema(connection)
+
+        row = connection.execute(
+            "SELECT workspace_owned FROM exec_plans WHERE repo = 'repo'"
+        ).fetchone()
+        self.assertEqual(row["workspace_owned"], 0)
+
     def test_missing_worktree_is_recovered_from_owned_branch(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, _state_dir, branch, worktree = self._workspace(directory)
@@ -3654,6 +3715,31 @@ class WorkspaceRecoveryTest(unittest.TestCase):
             run_agent.assert_not_called()
 
 
+    def test_new_workspace_rejects_preexisting_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, _state_dir, _connection, _plan, _plan_sha, branch, worktree = (
+                self._ready_execplan(directory)
+            )
+            worktree.mkdir(parents=True)
+            marker = worktree / "unrelated.txt"
+            marker.write_text("preserve me\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                loop_manager.WorkspaceOwnershipError,
+                "worktree가 이미 존재",
+            ):
+                loop_manager.make_worktree(
+                    repo,
+                    worktree,
+                    branch,
+                    "main",
+                    allow_create_branch=True,
+                    allow_recovery=False,
+                    allow_existing=False,
+                )
+
+            self.assertEqual(marker.read_text(encoding="utf-8"), "preserve me\n")
+
     def test_new_activation_rejects_preexisting_branch_without_agent(self):
         with tempfile.TemporaryDirectory() as directory:
             (
@@ -3702,6 +3788,51 @@ class WorkspaceRecoveryTest(unittest.TestCase):
             self.assertEqual(git_command(repo, "rev-parse", branch), branch_head)
             self.assertFalse(worktree.exists())
             run_agent.assert_not_called()
+
+            ownership = connection.execute(
+                "SELECT workspace_owned FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-012'",
+                (str(repo),),
+            ).fetchone()["workspace_owned"]
+            self.assertEqual(ownership, 0)
+
+            (repo / "docs/PRODUCT.md").write_text(
+                "# Resolve blocked input\n",
+                encoding="utf-8",
+            )
+            commit_and_push(repo, "Change blocked plan input")
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as resumed_agent:
+                resumed_result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            resumed_project = connection.execute(
+                "SELECT phase, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            resumed_plan = connection.execute(
+                "SELECT status, workspace_owned FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-012'",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(resumed_result, 1)
+            self.assertEqual(resumed_project["phase"], "BLOCKED")
+            self.assertIn("소유권이 확인되지 않았습니다", resumed_project["last_error"])
+            self.assertEqual(tuple(resumed_plan), ("BLOCKED", 0))
+            self.assertEqual(git_command(repo, "rev-parse", branch), branch_head)
+            self.assertFalse(worktree.exists())
+            resumed_agent.assert_not_called()
 
     def test_started_planning_worktree_is_not_recreated_from_origin(self):
         with tempfile.TemporaryDirectory() as directory:
