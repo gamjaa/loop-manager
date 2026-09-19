@@ -1,5 +1,6 @@
 import json
 import io
+import os
 import datetime
 import sqlite3
 import subprocess
@@ -323,6 +324,9 @@ class LoopManagerTest(unittest.TestCase):
             connection = sqlite3.connect(":memory:")
             connection.row_factory = sqlite3.Row
             connection.execute(loop_manager.SCHEMA)
+            logs = []
+
+            connection.execute(loop_manager.SCHEMA)
 
             with mock.patch(
                 "loop_manager.validate_repository", return_value=repo
@@ -332,7 +336,7 @@ class LoopManagerTest(unittest.TestCase):
                 "loop_manager.ensure_safe_base_worktree"
             ), mock.patch(
                 "loop_manager.run_codex", return_value=(0, "")
-            ) as planner:
+            ) as planner, mock.patch("loop_manager.operation_log", side_effect=lambda message, **kwargs: logs.append((message, kwargs))):
                 self.assertEqual(
                     loop_manager.run_project(
                         connection, state_dir, str(repo), Path("unused.ini"), "main", False
@@ -344,6 +348,7 @@ class LoopManagerTest(unittest.TestCase):
                 ).fetchone()["planning_fingerprint"]
                 self.assertIsNotNone(first)
                 self.assertEqual(planner.call_count, 1)
+                self.assertEqual(logs[0], ("Planner 시작: 다음 ExecPlan 계획을 생성합니다.", {}))
 
                 planner.reset_mock()
                 self.assertEqual(
@@ -2704,7 +2709,33 @@ class TimestampedExecutionProgressLogsTest(unittest.TestCase):
                 with self.assertRaises(OSError) as raised:
                     with loop_manager.process_lock(Path(directory)):
                         pass
+
         self.assertEqual(raised.exception.errno, loop_manager.errno.ENOLCK)
+
+    def test_bash_launcher_preserves_git_output_exit_code_and_run_arguments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            launcher = root / "run.sh"
+            launcher.write_text((loop_manager.ROOT / "run.sh").read_text(encoding="utf-8"), encoding="utf-8")
+            python = root / ".venv/bin/python"
+            python.parent.mkdir(parents=True)
+            python.write_text("#!/usr/bin/env bash\nprintf 'python:%s\\n' \"$*\"\n", encoding="utf-8")
+            python.chmod(0o755)
+            git = root / "bin/git"
+            git.parent.mkdir()
+            git.write_text("#!/usr/bin/env bash\nprintf '%s\\n' \"${GIT_OUTPUT:-Already up to date.}\"\nexit \"${GIT_EXIT:-0}\"\n", encoding="utf-8")
+            git.chmod(0o755)
+            env = {**os.environ, "PATH": f"{git.parent}:{os.environ['PATH']}", "GIT_OUTPUT": "Updated"}
+            completed = subprocess.run(["bash", str(launcher), "target-repo"], cwd=root, env=env, text=True, capture_output=True)
+            self.assertEqual(completed.returncode, 0)
+            self.assertIn("Updated", completed.stdout)
+            self.assertIn("python:-u", completed.stdout)
+            self.assertIn("run target-repo", completed.stdout)
+            failed = subprocess.run(["bash", str(launcher), "target-repo"], cwd=root, env={**env, "GIT_OUTPUT": "pull failed", "GIT_EXIT": "2"}, text=True, capture_output=True)
+            self.assertEqual(failed.returncode, 1)
+            self.assertIn("pull failed", failed.stdout)
+            self.assertNotIn("python:", failed.stdout)
+
 
     def test_launchers_have_no_timestamp_banner_and_scheduler_option_is_documented(self):
         self.assertNotIn("Get-Date -Format", (loop_manager.ROOT / "run.ps1").read_text(encoding="utf-8"))
