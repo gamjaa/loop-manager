@@ -1991,6 +1991,36 @@ risk: medium
                 ],
             )
 
+    def test_rebase_verify_failure_returns_to_worker_with_identifying_logs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state_dir, connection = self._make_active_worker_project(directory)
+            logs = []
+            original_git = loop_manager.git
+            origin_reads = 0
+
+            def git_after_base_advance(path, *arguments, **kwargs):
+                nonlocal origin_reads
+                if arguments == ("rev-parse", "origin/main"):
+                    origin_reads += 1
+                    if origin_reads > 1:
+                        return subprocess.CompletedProcess(["git", *arguments], 0, stdout="f" * 40 + "\n")
+                if arguments == ("rebase", "origin/main"):
+                    return subprocess.CompletedProcess(["git", *arguments], 0, stdout="")
+                return original_git(path, *arguments, **kwargs)
+
+            def worker(worktree, _state, _config, _role, _prompt, **_kwargs):
+                (worktree / "src/app.py").write_text("VALUE = 2\n", encoding="utf-8")
+                return loop_manager.CodexResult(0, worker_result("Rebase failure context"), "worker-session")
+
+            with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch("loop_manager.remote_base", return_value="main"), mock.patch("loop_manager.ensure_safe_base_worktree"), mock.patch("loop_manager.pr_for_branch", return_value=None), mock.patch("loop_manager.run_codex", side_effect=worker), mock.patch("loop_manager.verify", side_effect=[(True, "first verify"), (False, "rebased verify failed")]) as verify, mock.patch("loop_manager.git", side_effect=git_after_base_advance), mock.patch("loop_manager.operation_log", side_effect=lambda message, **kwargs: logs.append((message, kwargs))):
+                self.assertEqual(loop_manager.run_project(connection, state_dir, str(repo), Path("unused.ini"), "main", False), 1)
+
+            row = connection.execute("SELECT phase, last_error FROM projects WHERE repo = ?", (str(repo),)).fetchone()
+            self.assertEqual(row["phase"], "WORKING")
+            self.assertIn("rebase 후 전체 검증 실패:\nrebased verify failed", row["last_error"])
+            self.assertEqual(verify.call_count, 2)
+            self.assertEqual(logs, [("Worker 시작: G-001 Worker Boundary", {}), ("전체 verify 시작: G-001 Worker Boundary", {}), ("전체 verify 시작: G-001 Worker Boundary (rebase 후)", {}), ("Worker 반환: G-001 Worker Boundary (rebase 후 전체 verify 실패)", {"error": True}), ("rebased verify failed", {"error": True})])
+
     def test_verify_success_passes_worker_and_verify_results_to_reviewer(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, state_dir, connection = self._make_active_worker_project(directory)
