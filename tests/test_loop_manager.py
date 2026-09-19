@@ -1003,8 +1003,6 @@ class LoopManagerTest(unittest.TestCase):
                         "Generated",
                         depends_on=("G-999",),
                     )
-                    git_command(worktree, "add", "-A")
-                    git_command(worktree, "commit", "-m", "Invalid Planner output")
                 else:
                     write_execplan(worktree, "G-001", "Generated")
                 return loop_manager.CodexResult(0, "", "planner-session")
@@ -1569,7 +1567,7 @@ class LoopManagerTest(unittest.TestCase):
             diagnostic_text = diagnostic.read_text(encoding="utf-8")
             self.assertIn(blocked["planning_error"], diagnostic_text)
             self.assertIn("unexpected.txt", diagnostic_text)
-            self.assertIn("+invalid 4", diagnostic_text)
+            self.assertNotIn("+invalid 4", diagnostic_text)
 
     def test_planning_error_gate_precedes_dirty_base_worktree_check(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2362,19 +2360,28 @@ risk: medium
         state_dir.mkdir()
         (repo / "docs/plans").mkdir()
         plan = write_execplan(repo, "G-001", "Worker Boundary")
+        commit_and_push(repo, "Add worker plan")
+        plan_sha = git_command(repo, "rev-parse", "origin/main")
+        branch, worktree = loop_manager.expected_execplan_workspace(
+            state_dir, str(repo), "G-001"
+        )
+        loop_manager.make_worktree(repo, worktree, branch, "main")
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row
         connection.execute(loop_manager.SCHEMA)
         connection.execute(
             """
             INSERT INTO projects (
-                repo, base_branch, active_sha, phase, branch, worktree, plan_path
-            ) VALUES (?, 'main', ?, 'WORKING', 'loop-manager/G-001', ?, ?)
+                repo, base_branch, active_sha, plan_sha, phase, branch,
+                worktree, plan_path
+            ) VALUES (?, 'main', ?, ?, 'WORKING', ?, ?, ?)
             """,
             (
                 str(repo),
-                git_command(repo, "rev-parse", "origin/main"),
-                str(repo),
+                plan_sha,
+                plan_sha,
+                branch,
+                str(worktree),
                 plan.relative_to(repo).as_posix(),
             ),
         )
@@ -2384,17 +2391,12 @@ risk: medium
     def test_worker_without_diff_requeues_after_source_change(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, state_dir, connection = self._make_active_worker_project(directory)
-            commit_and_push(repo, "Add worker plan")
-            plan_sha = git_command(repo, "rev-parse", "HEAD")
-            managed = Path(directory) / "managed"
-            git_command(
-                repo,
-                "worktree",
-                "add",
-                "-b",
-                "loop-manager/G-001",
-                str(managed),
-                plan_sha,
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
+            managed = Path(
+                connection.execute(
+                    "SELECT worktree FROM projects WHERE repo = ?",
+                    (str(repo),),
+                ).fetchone()["worktree"]
             )
             planning_fingerprint = loop_manager.planning_input_fingerprint(repo, "main")
             connection.execute(
@@ -2576,17 +2578,12 @@ risk: medium
     def test_rebase_that_drops_worker_patch_blocks_before_review(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, state_dir, connection = self._make_active_worker_project(directory)
-            commit_and_push(repo, "Add worker plan")
-            plan_sha = git_command(repo, "rev-parse", "HEAD")
-            managed = Path(directory) / "managed"
-            git_command(
-                repo,
-                "worktree",
-                "add",
-                "-b",
-                "loop-manager/G-001",
-                str(managed),
-                plan_sha,
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
+            managed = Path(
+                connection.execute(
+                    "SELECT worktree FROM projects WHERE repo = ?",
+                    (str(repo),),
+                ).fetchone()["worktree"]
             )
             connection.execute(
                 """
@@ -2824,10 +2821,6 @@ risk: medium
                 verify.assert_called_once()
 
             self.assertEqual(logs[:3], [("Worker 시작: G-001 Worker Boundary", {}), ("전체 verify 시작: G-001 Worker Boundary", {}), ("Reviewer 시작: G-001 Worker Boundary", {})])
-            self.assertEqual(
-                git_command(repo, "log", "-1", "--pretty=%s"),
-                "Persist worker change",
-            )
             self.assertEqual([role for role, _prompt, _kwargs in calls], ["worker", "reviewer"])
             reviewer_prompt = calls[1][1]
             self.assertIn("targeted test: PASS", reviewer_prompt)
@@ -2837,6 +2830,14 @@ risk: medium
             row = connection.execute(
                 "SELECT * FROM projects WHERE repo = ?", (str(repo),)
             ).fetchone()
+            self.assertEqual(
+                git_command(Path(row["worktree"]), "log", "-1", "--pretty=%s"),
+                "Persist worker change",
+            )
+            self.assertEqual(
+                git_command(repo, "log", "-1", "--pretty=%s"),
+                "Add worker plan",
+            )
             self.assertEqual(row["phase"], "PR_OPEN")
             self.assertEqual(row["worker_session_id"], "worker-session")
             self.assertEqual(row["verify_result"], "verify: PASS")
@@ -3004,7 +3005,10 @@ class WorkerPublicationTest(unittest.TestCase):
             git_command(repo, "commit", "-m", "Add ExecPlan G-001: Worker Boundary")
             git_command(repo, "push", "origin", "main")
             plan_sha = git_command(repo, "rev-parse", "origin/main")
-            worktree = state_dir / "worktrees" / "G-001"
+            branch, worktree = loop_manager.expected_execplan_workspace(
+                state_dir, str(repo), "G-001"
+            )
+            loop_manager.make_worktree(repo, worktree, branch, "main")
             base_file = (repo / "src/app.py").read_text(encoding="utf-8")
             base_index = git_command(repo, "diff", "--cached")
             base_head = git_command(repo, "rev-parse", "HEAD")
@@ -3119,6 +3123,12 @@ class WorkerPublicationTest(unittest.TestCase):
             state_dir.mkdir()
             (repo / "docs/plans").mkdir()
             plan = write_execplan(repo, "G-001", "Worker Boundary")
+            commit_and_push(repo, "Add worker plan")
+            branch, worktree = loop_manager.expected_execplan_workspace(
+                state_dir, str(repo), "G-001"
+            )
+            loop_manager.make_worktree(repo, worktree, branch, "main")
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
             connection = sqlite3.connect(":memory:")
             connection.row_factory = sqlite3.Row
             connection.execute(loop_manager.SCHEMA)
@@ -3130,9 +3140,9 @@ class WorkerPublicationTest(unittest.TestCase):
                 """,
                 (
                     str(repo),
-                    git_command(repo, "rev-parse", "origin/main"),
-                    git_command(repo, "rev-parse", "origin/main"),
-                    str(repo),
+                    plan_sha,
+                    plan_sha,
+                    str(worktree),
                     plan.relative_to(repo).as_posix(),
                 ),
             )
@@ -3244,6 +3254,416 @@ risk: medium
         self.assertIn("Keep review context stable.", body)
         self.assertIn(f"/blob/{sha}/docs/plans/%5BG-008%5D%20Descriptive%20Worker%20Commits.md", body)
         self.assertIn("%5BR-004%5D%20%ED%95%9C%EA%B8%80%20%EC%9A%94%EA%B5%AC%EC%82%AC%ED%95%AD.md", body)
+
+class AgentScopeValidatorTest(unittest.TestCase):
+    def _repository_with_plan(self, directory: str) -> tuple[Path, str]:
+        repo = make_remote_repository(directory)
+        (repo / "docs/plans").mkdir()
+        plan = write_execplan(repo, "G-001", "Scope Safety")
+        commit_and_push(repo, "Add scope safety plan")
+        return repo, plan.relative_to(repo).as_posix()
+
+    def test_role_boundaries_reject_protected_and_read_only_changes(self):
+        scenarios = (
+            (
+                "planner-existing-plan",
+                "planner",
+                lambda repo, _plan: (repo / _plan).write_text(
+                    "changed\n", encoding="utf-8"
+                ),
+                None,
+                "docs/plans/[G-001] Scope Safety.md",
+            ),
+            (
+                "worker-requirement",
+                "worker",
+                lambda repo, _plan: (
+                    repo / "docs/requirements/Active.md"
+                ).write_text("# changed\n", encoding="utf-8"),
+                "docs/plans/[G-001] Scope Safety.md",
+                "docs/requirements/Active.md",
+            ),
+            (
+                "reviewer-staged-and-untracked",
+                "reviewer",
+                lambda repo, _plan: (
+                    (repo / "src/app.py").write_text(
+                        "VALUE = 2\n", encoding="utf-8"
+                    ),
+                    git_command(repo, "add", "src/app.py"),
+                    (repo / "review.txt").write_text(
+                        "unexpected\n", encoding="utf-8"
+                    ),
+                ),
+                None,
+                "review.txt",
+            ),
+        )
+        for name, role_name, mutate, selected_plan, expected in scenarios:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                repo, plan_path = self._repository_with_plan(directory)
+                before = loop_manager.capture_git_snapshot(repo)
+                mutate(repo, plan_path)
+                after = loop_manager.capture_git_snapshot(repo)
+
+                with self.assertRaisesRegex(
+                    loop_manager.AgentScopeError,
+                    expected.replace("[", r"\[").replace("]", r"\]"),
+                ):
+                    loop_manager.validate_agent_scope(
+                        role_name,
+                        repo,
+                        before,
+                        after,
+                        selected_plan_path=selected_plan,
+                    )
+
+    def test_planner_new_plan_and_worker_selected_plan_are_allowed(self):
+        for role_name in ("planner", "worker"):
+            with self.subTest(role=role_name), tempfile.TemporaryDirectory() as directory:
+                repo, plan_path = self._repository_with_plan(directory)
+                before = loop_manager.capture_git_snapshot(repo)
+                selected = plan_path
+                if role_name == "planner":
+                    write_execplan(repo, "G-002", "New Plan")
+                    selected = None
+                else:
+                    (repo / plan_path).write_text(
+                        (repo / plan_path).read_text(encoding="utf-8")
+                        + "\n## Progress\n\n- [x] complete\n",
+                        encoding="utf-8",
+                    )
+                after = loop_manager.capture_git_snapshot(repo)
+
+                loop_manager.validate_agent_scope(
+                    role_name,
+                    repo,
+                    before,
+                    after,
+                    selected_plan_path=selected,
+                )
+
+    def test_agent_commit_and_branch_switch_are_rejected(self):
+        mutations = (
+            (
+                "commit",
+                lambda repo: (
+                    (repo / "src/app.py").write_text(
+                        "VALUE = 2\n", encoding="utf-8"
+                    ),
+                    git_command(repo, "add", "src/app.py"),
+                    git_command(repo, "commit", "-m", "Agent commit"),
+                ),
+                "HEAD 변경",
+            ),
+            (
+                "branch",
+                lambda repo: git_command(repo, "switch", "-c", "agent-branch"),
+                "branch 전환",
+            ),
+        )
+        for name, mutate, expected in mutations:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                repo, plan_path = self._repository_with_plan(directory)
+                before = loop_manager.capture_git_snapshot(repo)
+                mutate(repo)
+                after = loop_manager.capture_git_snapshot(repo)
+
+                with self.assertRaisesRegex(
+                    loop_manager.AgentScopeError, expected
+                ):
+                    loop_manager.validate_agent_scope(
+                        "worker",
+                        repo,
+                        before,
+                        after,
+                        selected_plan_path=plan_path,
+                    )
+
+    def test_existing_database_adds_persistent_agent_scope_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            database = sqlite3.connect(state_dir / "loop-manager.db")
+            database.execute(
+                """
+                CREATE TABLE projects (
+                    repo TEXT PRIMARY KEY,
+                    base_branch TEXT NOT NULL,
+                    phase TEXT
+                )
+                """
+            )
+            database.execute(
+                "INSERT INTO projects (repo, base_branch) VALUES ('repo', 'main')"
+            )
+            database.commit()
+            database.close()
+
+            with loop_manager.connect_database(state_dir) as connection:
+                columns = {
+                    row[1]
+                    for row in connection.execute("PRAGMA table_info(projects)")
+                }
+                row = connection.execute(
+                    "SELECT agent_role, agent_snapshot FROM projects "
+                    "WHERE repo = 'repo'"
+                ).fetchone()
+
+            self.assertTrue({"agent_role", "agent_snapshot"} <= columns)
+            self.assertEqual(tuple(row), (None, None))
+
+    def test_reviewer_mutation_blocks_even_when_verdict_passes(self):
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, plan_path = self._repository_with_plan(directory)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            branch, worktree = loop_manager.expected_execplan_workspace(
+                state_dir, str(repo), "G-001"
+            )
+            loop_manager.make_worktree(repo, worktree, branch, "main")
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                """
+                INSERT INTO projects (
+                    repo, base_branch, active_sha, plan_sha, phase, branch,
+                    worktree, plan_path, worker_result, verify_result
+                ) VALUES (?, 'main', ?, ?, 'REVIEWING', ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(repo),
+                    plan_sha,
+                    plan_sha,
+                    branch,
+                    str(worktree),
+                    plan_path,
+                    worker_result(),
+                    "verify: PASS",
+                ),
+            )
+            connection.commit()
+
+            def reviewer(agent_worktree, *_args, **_kwargs):
+                (agent_worktree / "reviewer.txt").write_text(
+                    "keep for diagnosis\n", encoding="utf-8"
+                )
+                return 0, "VERDICT: PASS"
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.run_codex", side_effect=reviewer
+            ):
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, last_error, agent_role, agent_snapshot "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            plan = connection.execute(
+                "SELECT status, blocked_fingerprint FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(result, 1)
+            self.assertEqual(project["phase"], "BLOCKED")
+            self.assertIn("reviewer Git 범위 위반", project["last_error"])
+            self.assertEqual(plan["status"], "BLOCKED")
+            self.assertEqual(project["agent_role"], "reviewer")
+            self.assertIsNotNone(project["agent_snapshot"])
+            self.assertNotIn("keep for diagnosis", project["agent_snapshot"])
+            self.assertIsNotNone(plan["blocked_fingerprint"])
+            self.assertTrue((worktree / "reviewer.txt").is_file())
+
+
+class WorkspaceRecoveryTest(unittest.TestCase):
+    def _workspace(
+        self, directory: str
+    ) -> tuple[Path, Path, str, Path]:
+        root = Path(directory)
+        repo = make_remote_repository(directory)
+        state_dir = root / "state"
+        branch, worktree = loop_manager.expected_execplan_workspace(
+            state_dir, str(repo), "G-012"
+        )
+        loop_manager.make_worktree(repo, worktree, branch, "main")
+        return repo, state_dir, branch, worktree
+
+    def test_missing_worktree_is_recovered_from_owned_branch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, _state_dir, branch, worktree = self._workspace(directory)
+            original_head = git_command(worktree, "rev-parse", "HEAD")
+            git_command(repo, "worktree", "remove", str(worktree))
+
+            outcome = loop_manager.make_worktree(
+                repo,
+                worktree,
+                branch,
+                "main",
+                allow_create_branch=False,
+            )
+
+            self.assertEqual(outcome, "recovered")
+            self.assertEqual(git_command(worktree, "rev-parse", "HEAD"), original_head)
+            loop_manager.validate_managed_worktree(repo, worktree, branch)
+
+    def test_missing_worktree_and_branch_blocks_without_recreation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state_dir, branch, worktree = self._workspace(directory)
+            git_command(repo, "worktree", "remove", str(worktree))
+            git_command(repo, "branch", "-D", branch)
+
+            with self.assertRaisesRegex(
+                loop_manager.WorkspaceOwnershipError,
+                "모두 복구할 수 없습니다",
+            ):
+                loop_manager.make_worktree(
+                    repo,
+                    worktree,
+                    branch,
+                    "main",
+                    allow_create_branch=False,
+                )
+
+            self.assertFalse(worktree.exists())
+            self.assertNotEqual(
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(repo),
+                        "show-ref",
+                        "--verify",
+                        "--quiet",
+                        f"refs/heads/{branch}",
+                    ]
+                ).returncode,
+                0,
+            )
+
+            (repo / "docs/plans").mkdir()
+            plan = write_execplan(repo, "G-012", "Recovery Safety")
+            commit_and_push(repo, "Add recovery safety plan")
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                """
+                INSERT INTO projects (
+                    repo, base_branch, active_sha, plan_sha, phase, branch,
+                    worktree, plan_path
+                ) VALUES (?, 'main', ?, ?, 'WORKING', ?, ?, ?)
+                """,
+                (
+                    str(repo),
+                    plan_sha,
+                    plan_sha,
+                    branch,
+                    str(worktree),
+                    plan.relative_to(repo).as_posix(),
+                ),
+            )
+            connection.commit()
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as run_agent:
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            blocked = connection.execute(
+                "SELECT phase, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+
+    def test_started_planning_worktree_is_not_recreated_from_origin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = make_remote_repository(directory)
+            missing = root / "state/worktrees/project/planning/fingerprint"
+
+            with self.assertRaisesRegex(
+                loop_manager.WorkspaceOwnershipError,
+                "복구할 branch가 없습니다",
+            ):
+                loop_manager.make_planning_worktree(
+                    repo,
+                    missing,
+                    "main",
+                    allow_create=False,
+                )
+
+            self.assertFalse(missing.exists())
+
+
+    def test_wrong_branch_and_wrong_deterministic_path_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = make_remote_repository(directory)
+            state_dir = root / "state"
+            branch, worktree = loop_manager.expected_execplan_workspace(
+                state_dir, str(repo), "G-012"
+            )
+            git_command(
+                repo,
+                "worktree",
+                "add",
+                "-b",
+                "loop-manager/other",
+                str(worktree),
+                "origin/main",
+            )
+
+            with self.assertRaisesRegex(
+                loop_manager.WorkspaceOwnershipError,
+                "branch 불일치",
+            ):
+                loop_manager.make_worktree(repo, worktree, branch, "main")
+            with self.assertRaisesRegex(
+                loop_manager.WorkspaceOwnershipError,
+                "결정적 소유 경계",
+            ):
+                loop_manager.validate_execplan_workspace_identity(
+                    state_dir,
+                    str(repo),
+                    "G-012",
+                    branch,
+                    root / "elsewhere",
+                )
+
 
 class MergeIndependentWorktreeCleanupTest(unittest.TestCase):
     def _managed_worktree(self, root: Path, name: str = "managed"):

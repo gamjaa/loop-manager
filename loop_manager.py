@@ -52,6 +52,8 @@ FIELDS = {
     "plan_path",
     "pr_url",
     "last_error",
+    "agent_role",
+    "agent_snapshot",
 }
 
 SCHEMA = """
@@ -78,7 +80,9 @@ CREATE TABLE IF NOT EXISTS projects (
     worktree TEXT,
     plan_path TEXT,
     pr_url TEXT,
-    last_error TEXT
+    last_error TEXT,
+    agent_role TEXT,
+    agent_snapshot TEXT
 )
 """
 
@@ -154,6 +158,68 @@ class WorkerPublication:
     commit_title: str
     summary: str
     test_evidence: str
+
+@dataclass(frozen=True)
+class GitSnapshot:
+    """Content-free Git state captured across one Agent invocation."""
+
+    head: str
+    branch: str | None
+    index: dict[str, tuple[str, ...]]
+    dirty: dict[str, tuple[tuple[str, ...], str]]
+
+    def serialize(self) -> str:
+        return json.dumps(
+            {
+                "version": 1,
+                "head": self.head,
+                "branch": self.branch,
+                "index": {path: list(entries) for path, entries in self.index.items()},
+                "dirty": {
+                    path: [list(kinds), signature]
+                    for path, (kinds, signature) in self.dirty.items()
+                },
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    @classmethod
+    def deserialize(cls, value: str) -> GitSnapshot:
+        parsed = json.loads(value)
+        if parsed.get("version") != 1:
+            raise RuntimeError("저장된 Agent Git snapshot 형식을 지원하지 않습니다.")
+        return cls(
+            head=str(parsed["head"]),
+            branch=(str(parsed["branch"]) if parsed["branch"] is not None else None),
+            index={
+                str(path): tuple(str(entry) for entry in entries)
+                for path, entries in parsed["index"].items()
+            },
+            dirty={
+                str(path): (
+                    tuple(str(kind) for kind in state[0]),
+                    str(state[1]),
+                )
+                for path, state in parsed["dirty"].items()
+            },
+        )
+
+
+@dataclass(frozen=True)
+class AgentChange:
+    path: str
+    kinds: tuple[str, ...]
+
+
+class AgentScopeError(RuntimeError):
+    """An Agent changed Git state outside its role boundary."""
+
+
+class WorkspaceOwnershipError(RuntimeError):
+    """A managed worktree cannot be proven to belong to its saved task."""
+
 
 class WorkerResultError(RuntimeError):
     """A Worker final response cannot safely be published."""
@@ -283,6 +349,8 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
         "planning_result_completed": "INTEGER NOT NULL DEFAULT 0",
         "planning_error": "TEXT",
         "planning_error_fingerprint": "TEXT",
+        "agent_role": "TEXT",
+        "agent_snapshot": "TEXT",
     }
     for column, definition in migrations.items():
         if column not in columns:
@@ -1464,23 +1532,465 @@ def pr_for_branch(repo: Path, branch: str, url: str | None = None) -> dict[str, 
     return rows[0] if rows else None
 
 
-def make_worktree(repo: Path, worktree: Path, branch: str, base: str) -> None:
+def _canonical_path(path: Path) -> Path:
+    return path.expanduser().resolve(strict=False)
+
+
+
+def _validate_managed_path_boundary(
+    state_dir: Path,
+    worktree: Path,
+    expected: Path,
+    label: str,
+) -> None:
+    lexical_worktree = os.path.normcase(
+        os.path.abspath(worktree.expanduser())
+    )
+    lexical_expected = os.path.normcase(
+        os.path.abspath(expected.expanduser())
+    )
+    if lexical_worktree != lexical_expected:
+        raise WorkspaceOwnershipError(
+            f"{label} 경로가 결정적 소유 경계와 다릅니다: "
+            f"{worktree} (expected {expected})"
+        )
+    state_root = _canonical_path(state_dir)
+    resolved = _canonical_path(worktree)
+    try:
+        resolved.relative_to(state_root)
+    except ValueError as error:
+        raise WorkspaceOwnershipError(
+            f"{label} 경로가 Loop Manager 상태 디렉터리 밖을 가리킵니다: "
+            f"{worktree}"
+        ) from error
+
+def _worktree_catalog(repo: Path) -> list[dict[str, str | bool]]:
+    records: list[dict[str, str | bool]] = []
+    current: dict[str, str | bool] = {}
+    for line in git(repo, "worktree", "list", "--porcelain").stdout.splitlines():
+        if not line:
+            if current:
+                records.append(current)
+                current = {}
+            continue
+        key, _, value = line.partition(" ")
+        current[key] = value if value else True
+    if current:
+        records.append(current)
+    return records
+
+
+def validate_managed_worktree(
+    repo: Path,
+    worktree: Path,
+    branch: str | None,
+) -> None:
+    """Prove that a path is registered to this repository and expected branch."""
+
+    if not worktree.is_dir():
+        raise WorkspaceOwnershipError(f"관리 worktree 경로가 없습니다: {worktree}")
+    expected_path = _canonical_path(worktree)
+    record = next(
+        (
+            item
+            for item in _worktree_catalog(repo)
+            if _canonical_path(Path(str(item.get("worktree", "")))) == expected_path
+        ),
+        None,
+    )
+    if record is None:
+        raise WorkspaceOwnershipError(
+            f"Git에 등록되지 않은 관리 worktree입니다: {worktree}"
+        )
+    actual_branch = record.get("branch")
+    if branch is None:
+        if "detached" not in record:
+            raise WorkspaceOwnershipError(
+                f"planning worktree가 detached HEAD가 아닙니다: {worktree}"
+            )
+    elif actual_branch != f"refs/heads/{branch}":
+        rendered = actual_branch or "detached"
+        raise WorkspaceOwnershipError(
+            f"관리 worktree branch 불일치: {worktree} "
+            f"(expected refs/heads/{branch}, actual {rendered})"
+        )
+
+
+def make_worktree(
+    repo: Path,
+    worktree: Path,
+    branch: str,
+    base: str,
+    *,
+    allow_create_branch: bool = True,
+) -> str:
+    """Create, recover, or validate one owned ExecPlan worktree."""
+
+    if worktree.exists() and not worktree.is_dir():
+        raise WorkspaceOwnershipError(
+            f"관리 worktree 경로가 디렉터리가 아닙니다: {worktree}"
+        )
     if worktree.is_dir():
-        return
+        validate_managed_worktree(repo, worktree, branch)
+        return "existing"
+
     worktree.parent.mkdir(parents=True, exist_ok=True)
     git(repo, "worktree", "prune", "--expire", "now")
-    branch_exists = git(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}", check=False).returncode == 0
+    branch_exists = (
+        git(
+            repo,
+            "show-ref",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{branch}",
+            check=False,
+        ).returncode
+        == 0
+    )
     if branch_exists:
+        for record in _worktree_catalog(repo):
+            if record.get("branch") == f"refs/heads/{branch}":
+                owner = Path(str(record["worktree"]))
+                raise WorkspaceOwnershipError(
+                    f"관리 branch가 다른 worktree에 연결되어 있습니다: "
+                    f"{branch} ({owner})"
+                )
         git(repo, "worktree", "add", str(worktree), branch)
-    else:
+        outcome = "recovered"
+    elif allow_create_branch:
         git(repo, "worktree", "add", "-b", branch, str(worktree), f"origin/{base}")
+        outcome = "created"
+    else:
+        raise WorkspaceOwnershipError(
+            f"저장된 worktree와 관리 branch를 모두 복구할 수 없습니다: "
+            f"{worktree} ({branch})"
+        )
+    validate_managed_worktree(repo, worktree, branch)
+    return outcome
 
 
-def make_planning_worktree(repo: Path, worktree: Path, base: str) -> None:
+def make_planning_worktree(
+    repo: Path,
+    worktree: Path,
+    base: str,
+    *,
+    allow_create: bool = True,
+) -> str:
+    if worktree.exists() and not worktree.is_dir():
+        raise WorkspaceOwnershipError(
+            f"planning worktree 경로가 디렉터리가 아닙니다: {worktree}"
+        )
     if worktree.is_dir():
-        return
+        validate_managed_worktree(repo, worktree, None)
+        return "existing"
+    if not allow_create:
+        raise WorkspaceOwnershipError(
+            f"보존된 planning worktree를 복구할 branch가 없습니다: "
+            f"{worktree}"
+        )
     worktree.parent.mkdir(parents=True, exist_ok=True)
     git(repo, "worktree", "add", "--detach", str(worktree), f"origin/{base}")
+    validate_managed_worktree(repo, worktree, None)
+    return "created"
+
+
+def expected_execplan_workspace(
+    state_dir: Path,
+    repo: str,
+    plan_id: str,
+) -> tuple[str, Path]:
+    project_id = hashlib.sha256(repo.encode()).hexdigest()[:16]
+    return (
+        f"loop-manager/{plan_id}",
+        state_dir / "worktrees" / project_id / plan_id,
+    )
+
+
+def validate_execplan_workspace_identity(
+    state_dir: Path,
+    repo: str,
+    plan_id: str,
+    branch: str,
+    worktree: Path,
+) -> None:
+    expected_branch, expected_worktree = expected_execplan_workspace(
+        state_dir, repo, plan_id
+    )
+    if branch != expected_branch:
+        raise WorkspaceOwnershipError(
+            f"ExecPlan 관리 branch가 결정적 소유 경계와 다릅니다: "
+            f"{branch} (expected {expected_branch})"
+        )
+    _validate_managed_path_boundary(
+        state_dir,
+        worktree,
+        expected_worktree,
+        "ExecPlan worktree",
+    )
+
+
+def _nul_git_paths(repo: Path, *arguments: str) -> list[str]:
+    return [
+        os.fsdecode(record)
+        for record in git_bytes(repo, *arguments).split(b"\0")
+        if record
+    ]
+
+
+def _index_entries(worktree: Path) -> dict[str, tuple[str, ...]]:
+    entries: dict[str, list[str]] = {}
+    for record in git_bytes(worktree, "ls-files", "--stage", "-z").split(b"\0"):
+        if not record:
+            continue
+        metadata, separator, raw_path = record.partition(b"\t")
+        if not separator:
+            raise RuntimeError("Git index snapshot을 해석할 수 없습니다.")
+        entries.setdefault(os.fsdecode(raw_path), []).append(
+            metadata.decode("ascii", errors="replace")
+        )
+    return {
+        path: tuple(sorted(metadata))
+        for path, metadata in entries.items()
+    }
+
+
+def _path_signature(worktree: Path, relative_path: str) -> str:
+    path = worktree / relative_path
+    try:
+        stat = path.lstat()
+    except FileNotFoundError:
+        return "missing"
+    digest = hashlib.sha256()
+    digest.update(str(stat.st_mode).encode("ascii"))
+    digest.update(b"\0")
+    try:
+        if path.is_symlink():
+            digest.update(os.fsencode(os.readlink(path)))
+        elif path.is_file():
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        elif path.is_dir():
+            head = git(path, "rev-parse", "--verify", "HEAD", check=False)
+            status = git(
+                path,
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                check=False,
+            )
+            digest.update(head.stdout.encode("utf-8", errors="replace"))
+            digest.update(b"\0")
+            digest.update(status.stdout.encode("utf-8", errors="replace"))
+        else:
+            digest.update(f"special:{stat.st_size}".encode("ascii"))
+    except OSError as error:
+        digest.update(f"unreadable:{type(error).__name__}".encode("ascii"))
+    return digest.hexdigest()
+
+
+def capture_git_snapshot(worktree: Path) -> GitSnapshot:
+    """Capture HEAD, index, and dirty path state without staging any content."""
+
+    head = git(worktree, "rev-parse", "--verify", "HEAD").stdout.strip()
+    branch_result = git(
+        worktree,
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        "HEAD",
+        check=False,
+    )
+    branch = branch_result.stdout.strip() if branch_result.returncode == 0 else None
+    path_kinds: dict[str, set[str]] = {}
+    path_groups = (
+        (
+            "unstaged",
+            _nul_git_paths(
+                worktree,
+                "diff",
+                "--name-only",
+                "-z",
+                "--ignore-submodules=none",
+            ),
+        ),
+        (
+            "staged",
+            _nul_git_paths(
+                worktree,
+                "diff",
+                "--cached",
+                "--name-only",
+                "-z",
+                "--ignore-submodules=none",
+            ),
+        ),
+        (
+            "untracked",
+            _nul_git_paths(
+                worktree,
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+            ),
+        ),
+    )
+    for kind, paths in path_groups:
+        for relative_path in paths:
+            path_kinds.setdefault(relative_path, set()).add(kind)
+    dirty = {
+        path: (tuple(sorted(kinds)), _path_signature(worktree, path))
+        for path, kinds in sorted(path_kinds.items())
+    }
+    return GitSnapshot(head, branch, _index_entries(worktree), dirty)
+
+
+def agent_snapshot_changes(
+    worktree: Path,
+    before: GitSnapshot,
+    after: GitSnapshot,
+) -> list[AgentChange]:
+    changes: dict[str, set[str]] = {}
+    for path in set(before.index) | set(after.index):
+        if before.index.get(path) != after.index.get(path):
+            changes.setdefault(path, set()).add("index")
+    for path in set(before.dirty) | set(after.dirty):
+        if before.dirty.get(path) != after.dirty.get(path):
+            before_kinds = before.dirty.get(path, ((), ""))[0]
+            after_kinds = after.dirty.get(path, ((), ""))[0]
+            changes.setdefault(path, set()).update(before_kinds)
+            changes[path].update(after_kinds)
+            changes[path].add("worktree")
+    if before.head != after.head:
+        for path in _nul_git_paths(
+            worktree,
+            "diff",
+            "--name-only",
+            "-z",
+            before.head,
+            after.head,
+        ):
+            changes.setdefault(path, set()).add("HEAD")
+    return [
+        AgentChange(path, tuple(sorted(kinds)))
+        for path, kinds in sorted(changes.items())
+    ]
+
+
+def _worker_path_allowed(path: str, selected_plan_path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    lowered = normalized.casefold()
+    if normalized == selected_plan_path:
+        return True
+    if lowered in {"docs/product.md", "docs/future_ideas.md"}:
+        return True
+    if Path(normalized).name.casefold() == "agents.md":
+        return False
+    if lowered in {"docs/architecture.md", "docs/plans.md"}:
+        return False
+    if lowered.startswith("docs/requirements/"):
+        return False
+    if re.fullmatch(r"docs/plans/[^/]+\.md", normalized):
+        return False
+    return True
+
+
+def validate_agent_scope(
+    role_name: str,
+    worktree: Path,
+    before: GitSnapshot,
+    after: GitSnapshot,
+    *,
+    selected_plan_path: str | None = None,
+) -> None:
+    """Validate the net Git mutation made by one Agent role."""
+
+    changes = agent_snapshot_changes(worktree, before, after)
+    violations: list[str] = []
+    if before.head != after.head:
+        violations.append(f"HEAD 변경 ({before.head} -> {after.head})")
+    if before.branch != after.branch:
+        violations.append(
+            f"branch 전환 ({before.branch or 'detached'} -> "
+            f"{after.branch or 'detached'})"
+        )
+
+    for change in changes:
+        allowed = False
+        if role_name == "planner":
+            allowed = bool(
+                re.fullmatch(r"docs/plans/[^/]+\.md", change.path)
+                and change.path not in before.index
+            )
+        elif role_name == "worker":
+            if selected_plan_path is None:
+                raise ValueError("Worker scope 검증에 선택된 ExecPlan 경로가 없습니다.")
+            allowed = _worker_path_allowed(change.path, selected_plan_path)
+        elif role_name == "reviewer":
+            allowed = False
+        else:
+            raise ValueError(f"알 수 없는 Agent 역할입니다: {role_name}")
+        if not allowed:
+            violations.append(
+                f"{change.path} ({', '.join(change.kinds) or 'Git 상태'})"
+            )
+
+    if violations:
+        raise AgentScopeError(
+            f"{role_name} Git 범위 위반: " + "; ".join(violations)
+        )
+
+
+def begin_agent_scope(
+    connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+    role_name: str,
+) -> GitSnapshot:
+    row = connection.execute(
+        "SELECT agent_role, agent_snapshot FROM projects WHERE repo = ?",
+        (repo,),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("Agent scope를 저장할 프로젝트가 없습니다.")
+    if row["agent_snapshot"]:
+        if row["agent_role"] != role_name:
+            raise RuntimeError(
+                f"저장된 Agent 역할이 현재 역할과 다릅니다: "
+                f"{row['agent_role']} -> {role_name}"
+            )
+        return GitSnapshot.deserialize(str(row["agent_snapshot"]))
+    snapshot = capture_git_snapshot(worktree)
+    update_project(
+        connection,
+        repo,
+        agent_role=role_name,
+        agent_snapshot=snapshot.serialize(),
+    )
+    return snapshot
+
+
+def clear_agent_scope(connection: sqlite3.Connection, repo: str) -> None:
+    update_project(connection, repo, agent_role=None, agent_snapshot=None)
+
+
+def validate_planning_workspace_identity(
+    state_dir: Path,
+    repo: str,
+    fingerprint: str,
+    worktree: Path,
+) -> None:
+    project_id = hashlib.sha256(repo.encode()).hexdigest()[:16]
+    expected = (
+        state_dir / "worktrees" / project_id / "planning" / fingerprint
+    )
+    _validate_managed_path_boundary(
+        state_dir,
+        worktree,
+        expected,
+        "planning worktree",
+    )
 
 
 def changed_files(worktree: Path, since: str | None = None) -> list[str]:
@@ -1650,8 +2160,18 @@ def preserve_planning_diagnostics(
     if not fingerprint:
         fingerprint = row["planning_error_fingerprint"] or "unknown"
     worktree = Path(row["worktree"]) if row["worktree"] else None
+    error = (
+        row["planning_error"]
+        or row["planning_validation_error"]
+        or row["last_error"]
+        or ""
+    )
     diff = ""
-    if worktree and worktree.is_dir():
+    sensitive_scope_failure = (
+        "Git 범위 위반" in str(error)
+        or "workspace 소유권 검증 실패" in str(error)
+    )
+    if worktree and worktree.is_dir() and not sensitive_scope_failure:
         try:
             # Compare with the planning base rather than HEAD so an invalid
             # Planner commit remains in the diagnostic when this worktree is
@@ -1660,16 +2180,10 @@ def preserve_planning_diagnostics(
             git(worktree, "add", "--intent-to-add", "-A")
             base_revision = row["active_sha"] or "HEAD"
             diff = git(worktree, "diff", "--binary", base_revision).stdout
-        except RuntimeError as error:
-            diff = f"diff 보존 실패: {error}"
+        except RuntimeError as diff_error:
+            diff = f"diff 보존 실패: {diff_error}"
     diagnostic = planning_diagnostics_path(state_dir, repo, fingerprint)
     diagnostic.parent.mkdir(parents=True, exist_ok=True)
-    error = (
-        row["planning_error"]
-        or row["planning_validation_error"]
-        or row["last_error"]
-        or ""
-    )
     diagnostic.write_text(
         "\n".join(
             [
@@ -1709,6 +2223,8 @@ def clear_planning_validation_state(
         planning_error=None,
         planning_error_fingerprint=None,
         last_error=None,
+        agent_role=None,
+        agent_snapshot=None,
     )
 
 
@@ -1737,6 +2253,8 @@ def _clear_active_values(
         "planning_result_completed": 0,
         "planning_error": None,
         "planning_error_fingerprint": None,
+        "agent_role": None,
+        "agent_snapshot": None,
     }
     if processed_sha is not None:
         values["processed_sha"] = processed_sha
@@ -1909,37 +2427,72 @@ def block_active_execplan(
         )
 
 
+def block_active_execplan_from_revision(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    repo: str,
+    revision: str,
+    error: str,
+    verify_result: str = "",
+) -> None:
+    """Block an active plan when its saved worktree is not safe to read."""
+
+    plan = active_execplan(connection, repo)
+    if plan is None:
+        raise RuntimeError("차단할 활성 ExecPlan을 찾을 수 없습니다.")
+    fingerprint = _revision_execplan_input_fingerprint(repo_path, revision, plan)
+    with connection:
+        connection.execute(
+            """
+            UPDATE exec_plans
+            SET status = 'BLOCKED', blocked_fingerprint = ?, last_error = ?,
+                verify_result = ?
+            WHERE repo = ? AND plan_id = ?
+            """,
+            (fingerprint, error, verify_result, repo, plan["plan_id"]),
+        )
+        connection.execute(
+            """
+            UPDATE projects
+            SET phase = 'BLOCKED', last_error = ?, verify_result = ?
+            WHERE repo = ?
+            """,
+            (error, verify_result, repo),
+        )
+
+
 def resume_blocked_execplan_if_inputs_changed(
     connection: sqlite3.Connection,
     repo_path: Path,
     repo: str,
     base: str,
+    state_dir: Path,
 ) -> bool:
     plan = active_execplan(connection, repo)
     if plan is None or plan["status"] != "BLOCKED" or not plan["blocked_fingerprint"]:
         return False
     stored = str(plan["blocked_fingerprint"])
     worktree = Path(str(plan["worktree"]))
-    if not worktree.is_dir():
-        branch = str(plan["branch"] or "")
-        branch_exists = bool(branch) and git(
+    branch = str(plan["branch"] or "")
+    try:
+        validate_execplan_workspace_identity(
+            state_dir,
+            repo,
+            str(plan["plan_id"]),
+            branch,
+            worktree,
+        )
+        make_worktree(
             repo_path,
-            "show-ref",
-            "--verify",
-            "--quiet",
-            f"refs/heads/{branch}",
-            check=False,
-        ).returncode == 0
-        if not branch_exists:
-            error = "BLOCKED worktree를 복구할 로컬 branch가 없습니다."
-            _update_blocked_error(connection, repo, str(plan["plan_id"]), error)
-            return False
-        try:
-            make_worktree(repo_path, worktree, branch, base)
-        except RuntimeError as error:
-            message = f"BLOCKED worktree 복구 실패:\n{error}"
-            _update_blocked_error(connection, repo, str(plan["plan_id"]), message)
-            return False
+            worktree,
+            branch,
+            base,
+            allow_create_branch=False,
+        )
+    except (RuntimeError, WorkspaceOwnershipError) as error:
+        message = f"BLOCKED worktree 복구 실패:\n{error}"
+        _update_blocked_error(connection, repo, str(plan["plan_id"]), message)
+        return False
     worktree_changed = (
         worktree.is_dir()
         and _worktree_execplan_input_fingerprint(worktree, plan) != stored
@@ -2268,6 +2821,41 @@ def run_project(
         if existing_pr:
             update_project(connection, repo, pr_url=existing_pr["url"])
             if existing_pr["state"] == "OPEN":
+                open_plan_id = _plan_id_from_path(str(row["plan_path"] or ""))
+                open_worktree = Path(str(row["worktree"] or ""))
+                open_branch = str(row["branch"])
+                try:
+                    if open_plan_id is None:
+                        raise WorkspaceOwnershipError(
+                            "PR_OPEN ExecPlan ID를 확인할 수 없습니다."
+                        )
+                    validate_execplan_workspace_identity(
+                        state_dir,
+                        repo,
+                        open_plan_id,
+                        open_branch,
+                        open_worktree,
+                    )
+                    make_worktree(
+                        repo_path,
+                        open_worktree,
+                        open_branch,
+                        str(row["base_branch"]),
+                        allow_create_branch=False,
+                    )
+                except (RuntimeError, WorkspaceOwnershipError) as error:
+                    workspace_error = (
+                        f"PR_OPEN workspace 소유권/복구 검증 실패: {error}"
+                    )
+                    block_active_execplan_from_revision(
+                        connection,
+                        repo_path,
+                        repo,
+                        f"refs/remotes/origin/{row['base_branch']}",
+                        workspace_error,
+                    )
+                    operation_print(workspace_error, file=sys.stderr)
+                    return 1
                 operation_print(f"Merge 대기 중: {existing_pr['url']}")
                 return 0
             if existing_pr["state"] == "MERGED" or existing_pr.get("mergedAt"):
@@ -2303,6 +2891,7 @@ def run_project(
             repo_path,
             repo,
             str(row["base_branch"]),
+            state_dir,
         ):
             row = connection.execute(
                 "SELECT * FROM projects WHERE repo = ?", (repo,)
@@ -2417,7 +3006,39 @@ def run_project(
     project_id = hashlib.sha256(repo.encode()).hexdigest()[:16]
     if row["phase"] == "PLANNING":
         planning_worktree = Path(row["worktree"])
-        make_planning_worktree(repo_path, planning_worktree, base)
+        try:
+            validate_planning_workspace_identity(
+                state_dir,
+                repo,
+                str(row["planning_attempt_fingerprint"]),
+                planning_worktree,
+            )
+            planning_started = bool(
+                row["planner_session_id"]
+                or row["agent_snapshot"]
+                or row["planning_result_pending_validation"]
+                or row["planning_result_completed"]
+                or row["planning_validation_error"]
+                or row["planning_retry_count"]
+                or row["last_error"]
+            )
+            make_planning_worktree(
+                repo_path,
+                planning_worktree,
+                base,
+                allow_create=not planning_started,
+            )
+        except WorkspaceOwnershipError as error:
+            validation_error = f"planning workspace 소유권 검증 실패: {error}"
+            update_project(
+                connection,
+                repo,
+                planning_error=validation_error,
+                planning_error_fingerprint=current_fingerprint,
+                last_error=validation_error,
+            )
+            operation_print(validation_error, file=sys.stderr)
+            return 1
         head = git(planning_worktree, "rev-parse", "HEAD").stdout.strip()
         dirty_files = changed_files(planning_worktree)
         if row["planning_validation_error"] and head != row["active_sha"]:
@@ -2431,6 +3052,7 @@ def run_project(
             row["planning_result_pending_validation"]
             and not row["planning_result_completed"]
         )
+        planner_scope_error: PlannerValidationError | None = None
         if planner_result_in_flight or (
             head == row["active_sha"]
             and (
@@ -2461,6 +3083,12 @@ def run_project(
                 row = connection.execute(
                     "SELECT * FROM projects WHERE repo = ?", (repo,)
                 ).fetchone()
+            planner_scope_before = begin_agent_scope(
+                connection,
+                repo,
+                planning_worktree,
+                "planner",
+            )
             result = run_codex(
                 planning_worktree,
                 state_dir,
@@ -2487,6 +3115,20 @@ def run_project(
                     repo,
                     planner_session_id=result_session_id,
                 )
+            try:
+                planner_scope_after = capture_git_snapshot(planning_worktree)
+                validate_agent_scope(
+                    "planner",
+                    planning_worktree,
+                    planner_scope_before,
+                    planner_scope_after,
+                )
+                validate_managed_worktree(repo_path, planning_worktree, None)
+            except (AgentScopeError, WorkspaceOwnershipError, RuntimeError) as error:
+                planner_scope_error = PlannerValidationError(str(error))
+            else:
+                clear_agent_scope(connection, repo)
+
             if code:
                 update_project(
                     connection,
@@ -2508,7 +3150,41 @@ def run_project(
             ).fetchone()
             dirty_files = changed_files(planning_worktree)
 
+        if planner_scope_error is None:
+            scope_row = connection.execute(
+                "SELECT agent_role, agent_snapshot FROM projects WHERE repo = ?",
+                (repo,),
+            ).fetchone()
+            if scope_row["agent_snapshot"]:
+                try:
+                    if scope_row["agent_role"] != "planner":
+                        raise AgentScopeError(
+                            "저장된 Agent 역할이 Planner와 다릅니다."
+                        )
+                    persisted_before = GitSnapshot.deserialize(
+                        str(scope_row["agent_snapshot"])
+                    )
+                    persisted_after = capture_git_snapshot(planning_worktree)
+                    validate_agent_scope(
+                        "planner",
+                        planning_worktree,
+                        persisted_before,
+                        persisted_after,
+                    )
+                    validate_managed_worktree(repo_path, planning_worktree, None)
+                except (
+                    AgentScopeError,
+                    WorkspaceOwnershipError,
+                    RuntimeError,
+                ) as error:
+                    planner_scope_error = PlannerValidationError(str(error))
+                else:
+                    clear_agent_scope(connection, repo)
+
+
         try:
+            if planner_scope_error is not None:
+                raise planner_scope_error
             validated_result = validate_planner_result(
                 planning_worktree, str(row["active_sha"]), dirty_files
             )
@@ -2619,6 +3295,7 @@ def run_project(
             base_sha = latest_sha
             row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
 
+    newly_activated = False
     if not row["phase"]:
         git(repo_path, "fetch", "origin")
         latest_selection_sha = git(
@@ -2637,14 +3314,52 @@ def run_project(
             operation_print("실행 가능한 READY ExecPlan이 없습니다.")
             return 0
         row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
-    branch = row["branch"]
-    worktree = Path(row["worktree"])
-    make_worktree(repo_path, worktree, branch, base)
+        newly_activated = True
+    branch = str(row["branch"] or "")
+    worktree = Path(str(row["worktree"] or ""))
+    plan_id = _plan_id_from_path(str(row["plan_path"] or ""))
+    try:
+        if plan_id is None:
+            raise WorkspaceOwnershipError(
+                "활성 ExecPlan 경로에서 ID를 확인할 수 없습니다."
+            )
+        validate_execplan_workspace_identity(
+            state_dir,
+            repo,
+            plan_id,
+            branch,
+            worktree,
+        )
+        make_worktree(
+            repo_path,
+            worktree,
+            branch,
+            base,
+            allow_create_branch=newly_activated,
+        )
+    except (RuntimeError, WorkspaceOwnershipError) as error:
+        workspace_error = f"관리 workspace 소유권/복구 검증 실패: {error}"
+        block_active_execplan_from_revision(
+            connection,
+            repo_path,
+            repo,
+            f"refs/remotes/origin/{base}",
+            workspace_error,
+            str(row["verify_result"] or ""),
+        )
+        operation_print(workspace_error, file=sys.stderr)
+        return 1
 
     if row["phase"] == "WORKING":
         plan = validate_execplan(worktree, row["plan_path"])
         operation_log(f"Worker 시작: {plan['id']} {plan['title']}")
         level = worker_level(plan)
+        worker_scope_before = begin_agent_scope(
+            connection,
+            repo,
+            worktree,
+            "worker",
+        )
         result = run_codex(
             worktree,
             state_dir,
@@ -2665,6 +3380,30 @@ def run_project(
         result_session_id = getattr(result, "session_id", None)
         if result_session_id:
             update_project(connection, repo, worker_session_id=result_session_id)
+
+        try:
+            worker_scope_after = capture_git_snapshot(worktree)
+            validate_agent_scope(
+                "worker",
+                worktree,
+                worker_scope_before,
+                worker_scope_after,
+                selected_plan_path=str(row["plan_path"]),
+            )
+            validate_managed_worktree(repo_path, worktree, branch)
+        except (AgentScopeError, WorkspaceOwnershipError, RuntimeError) as error:
+            scope_error = str(error)
+            block_active_execplan(
+                connection,
+                repo,
+                worktree,
+                scope_error,
+                str(row["verify_result"] or ""),
+            )
+            operation_print(scope_error, file=sys.stderr)
+            return 1
+        clear_agent_scope(connection, repo)
+
 
         if code:
             update_project(connection, repo, phase="WORKING", last_error=message or f"Codex 종료 코드 {code}")
@@ -2780,6 +3519,13 @@ def run_project(
     if row["phase"] == "REVIEWING":
         plan = validate_execplan(worktree, row["plan_path"])
         operation_log(f"Reviewer 시작: {plan['id']} {plan['title']}")
+        reviewer_scope_before = begin_agent_scope(
+            connection,
+            repo,
+            worktree,
+            "reviewer",
+        )
+
         code, review = run_codex(
             worktree,
             state_dir,
@@ -2788,8 +3534,33 @@ def run_project(
             reviewer_prompt(base, row["worker_result"], row["verify_result"]),
             read_only=True,
         )
-        passed = code == 0 and re.search(r"(?mi)^VERDICT:\s*PASS\s*$", review) and not re.search(
-            r"(?mi)^VERDICT:\s*FAIL\s*$", review
+        try:
+            reviewer_scope_after = capture_git_snapshot(worktree)
+            validate_agent_scope(
+                "reviewer",
+                worktree,
+                reviewer_scope_before,
+                reviewer_scope_after,
+            )
+            validate_managed_worktree(repo_path, worktree, branch)
+        except (AgentScopeError, WorkspaceOwnershipError, RuntimeError) as error:
+            scope_error = str(error)
+            block_active_execplan(
+                connection,
+                repo,
+                worktree,
+                scope_error,
+                str(row["verify_result"] or ""),
+            )
+            operation_print(scope_error, file=sys.stderr)
+            return 1
+        clear_agent_scope(connection, repo)
+
+
+        passed = (
+            code == 0
+            and re.search(r"(?mi)^VERDICT:\s*PASS\s*$", review)
+            and not re.search(r"(?mi)^VERDICT:\s*FAIL\s*$", review)
         )
         if not passed:
             operation_log(f"Worker 반환: {plan['id']} {plan['title']} (Review 실패)", error=True)
