@@ -5421,7 +5421,7 @@ class WorkspaceRecoveryTest(unittest.TestCase):
             )
             resumed_agent.assert_not_called()
 
-    def test_planning_reservation_rejects_path_inserted_before_create(self):
+    def test_planning_reservation_preserves_clean_external_path_on_input_change(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = make_remote_repository(directory)
             state_dir = Path(directory) / "state"
@@ -5483,10 +5483,15 @@ class WorkspaceRecoveryTest(unittest.TestCase):
                 str(planning_worktree),
                 reserved["active_sha"],
             )
-            (planning_worktree / "external.txt").write_text(
-                "not owned by Loop Manager\n",
+            self.assertEqual(
+                git_command(planning_worktree, "status", "--porcelain"),
+                "",
+            )
+            (repo / "docs/PRODUCT.md").write_text(
+                "# changed after planning reservation\n",
                 encoding="utf-8",
             )
+            commit_and_push(repo, "Change input after planning reservation")
 
             with mock.patch(
                 "loop_manager.validate_repository", return_value=repo
@@ -5522,11 +5527,11 @@ class WorkspaceRecoveryTest(unittest.TestCase):
             self.assertEqual((first_result, second_result), (1, 1))
             self.assertEqual(preserved["phase"], "PLANNING")
             self.assertIn(
-                "planning workspace 소유권 검증 실패",
+                "planning workspace cleanup 소유권 검증 실패",
                 preserved["planning_error"],
             )
             self.assertIn(
-                "예약 workspace가 저장된 생성 기준과 다릅니다",
+                "planning worktree의 Loop Manager 소유권이 확인되지 않았습니다",
                 preserved["planning_error"],
             )
             self.assertEqual(
@@ -5535,10 +5540,12 @@ class WorkspaceRecoveryTest(unittest.TestCase):
             )
             self.assertTrue(planning_worktree.is_dir())
             self.assertEqual(
-                (planning_worktree / "external.txt").read_text(
-                    encoding="utf-8"
-                ),
-                "not owned by Loop Manager\n",
+                git_command(planning_worktree, "rev-parse", "HEAD"),
+                reserved["active_sha"],
+            )
+            self.assertEqual(
+                git_command(planning_worktree, "status", "--porcelain"),
+                "",
             )
             resumed_agent.assert_not_called()
 

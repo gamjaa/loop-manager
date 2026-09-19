@@ -2549,17 +2549,15 @@ def validate_planning_worktree_ownership(
     fingerprint: str,
     worktree: Path,
 ) -> None:
-    """Validate a saved planning path before reading, changing, or removing it."""
+    """Require confirmed Manager ownership before removing a planning worktree."""
 
     project = connection.execute(
-        "SELECT active_sha, worktree, planning_workspace_owned "
-        "FROM projects WHERE repo = ?",
+        "SELECT worktree, planning_workspace_owned FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
     if worktree.exists() and (
         project is None
-        or int(project["planning_workspace_owned"])
-        not in {WORKSPACE_OWNED, WORKSPACE_RESERVED}
+        or int(project["planning_workspace_owned"]) != WORKSPACE_OWNED
         or Path(str(project["worktree"] or "")) != worktree
     ):
         raise WorkspaceOwnershipError(
@@ -2578,15 +2576,7 @@ def validate_planning_worktree_ownership(
         worktree,
     )
     if worktree.exists():
-        if int(project["planning_workspace_owned"]) == WORKSPACE_RESERVED:
-            validate_reserved_worktree(
-                repo_path,
-                worktree,
-                None,
-                str(project["active_sha"] or ""),
-            )
-        else:
-            validate_managed_worktree(repo_path, worktree, None)
+        validate_managed_worktree(repo_path, worktree, None)
 
 
 def changed_files(worktree: Path, since: str | None = None) -> list[str]:
