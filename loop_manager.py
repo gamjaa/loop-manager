@@ -3540,7 +3540,10 @@ def run_project(
     requested_base: str | None,
     allow_agents_mismatch: bool,
 ) -> int:
-    repo_path = validate_repository(Path(repo_arg), allow_agents_mismatch=allow_agents_mismatch)
+    # Resolve the persisted project key without consulting repository config.
+    # An interrupted Agent may have changed origin or hooksPath, so the saved
+    # snapshot must be checked before normal repository validation reads it.
+    repo_path = Path(repo_arg).expanduser().resolve()
     repo = str(repo_path)
     _ensure_execplans_schema(connection)
     row = connection.execute(
@@ -3612,6 +3615,10 @@ def run_project(
                     )
             operation_print(message, file=sys.stderr)
             return 1
+    repo_path = validate_repository(
+        repo_path,
+        allow_agents_mismatch=allow_agents_mismatch,
+    )
     backfill_plan_shas(connection, target_repo=repo)
     migrate_legacy_execplans(
         connection,

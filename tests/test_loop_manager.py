@@ -3717,9 +3717,6 @@ class AgentScopeValidatorTest(unittest.TestCase):
                         "main",
                     ],
                 ), mock.patch(
-                    "loop_manager.validate_repository",
-                    return_value=repo,
-                ), mock.patch(
                     "loop_manager.git",
                     side_effect=AssertionError(
                         "unsafe Git command before config validation"
