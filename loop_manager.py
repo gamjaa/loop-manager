@@ -22,6 +22,7 @@ from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parent
 MAX_PLANNER_VALIDATION_RETRIES = 3
+PLAN_SHA_BACKFILL_ERROR = "계획 commit SHA를 기존 작업에서 안전하게 복구할 수 없습니다."
 FIELDS = {
     "base_branch",
     "processed_sha",
@@ -264,7 +265,7 @@ def backfill_plan_shas(connection: sqlite3.Connection) -> None:
         FROM projects
         WHERE plan_sha IS NULL
           AND plan_path IS NOT NULL
-          AND phase IN ('WORKING', 'VERIFYING', 'REVIEWING', 'PUBLISHING', 'BLOCKED')
+          AND phase IN ('WORKING', 'VERIFYING', 'REVIEWING', 'PUBLISHING')
         """
     ).fetchall()
     for row in rows:
@@ -292,7 +293,7 @@ def backfill_plan_shas(connection: sqlite3.Connection) -> None:
             connection.execute(
                 "UPDATE projects SET phase = 'BLOCKED', last_error = ? WHERE repo = ?",
                 (
-                    "계획 commit SHA를 기존 작업에서 안전하게 복구할 수 없습니다.",
+                    PLAN_SHA_BACKFILL_ERROR,
                     row["repo"],
                 ),
             )
@@ -1286,13 +1287,13 @@ def parse_worker_result(message: str, plan: dict[str, object]) -> WorkerPublicat
 
     plan_id = str(plan["id"])
     plan_title = str(plan["title"])
-    normalized = " ".join(title.split()).casefold()
+    normalized = " ".join(title.split()).casefold().rstrip(" .,:;!?…")
     generic_titles = {
         "implement", "implementation", "changes", "change", "code changes",
         "update", "updates", "update code", "fix", "fixes", "변경", "변경 사항", "구현",
     }
     prohibited = {
-        " ".join(plan_title.split()).casefold(),
+        " ".join(plan_title.split()).casefold().rstrip(" .,:;!?…"),
         f"implement {plan_id}".casefold(),
         f"implement {plan_id}: {plan_title}".casefold(),
         f"implement {plan_title}".casefold(),
@@ -1452,6 +1453,13 @@ def run_project(
             update_project(connection, repo, phase="BLOCKED", last_error="PR이 Merge 없이 닫혔습니다.")
             print(f"닫힌 PR을 다시 열어야 합니다: {existing_pr['url']}", file=sys.stderr)
             return 1
+
+    if row and row["phase"] == "BLOCKED":
+        print(
+            f"작업이 차단되어 있습니다: {row['last_error'] or '사용자 조치가 필요합니다.'}",
+            file=sys.stderr,
+        )
+        return 1
 
     base = remote_base(repo_path, requested_base or (row["base_branch"] if row else None))
     base_sha = git(repo_path, "rev-parse", f"origin/{base}").stdout.strip()
@@ -1736,7 +1744,7 @@ def run_project(
     worktree = Path(row["worktree"])
     make_worktree(repo_path, worktree, branch, base)
 
-    if row["phase"] in {"WORKING", "BLOCKED"}:
+    if row["phase"] == "WORKING":
         plan = validate_execplan(worktree, row["plan_path"])
         level = worker_level(plan)
         result = run_codex(

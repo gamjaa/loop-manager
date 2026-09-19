@@ -2037,6 +2037,9 @@ class WorkerPublicationTest(unittest.TestCase):
             worker_result("Implement G-008: Descriptive Worker Commits", "Summary", "test: PASS"),
             worker_result("Update", "Summary", "test: PASS"),
             worker_result("Implement G-008 worker metadata", "Summary", "test: PASS"),
+            worker_result("Update.", "Summary", "test: PASS"),
+            worker_result("Fix!", "Summary", "test: PASS"),
+            worker_result("Descriptive Worker Commits.", "Summary", "test: PASS"),
         )
         for result in invalid_results:
             with self.subTest(result=result):
@@ -2088,6 +2091,162 @@ class WorkerPublicationTest(unittest.TestCase):
         self.assertEqual(row["plan_sha"], plan_sha)
         self.assertEqual(row["phase"], "WORKING")
         self.assertIsNone(cleared["plan_sha"])
+
+    def test_unrecoverable_plan_sha_migration_stays_blocked_without_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            (repo / "docs/plans").mkdir()
+            plan = write_execplan(repo, "G-001", "Worker Boundary")
+            state_dir = Path(directory) / "state"
+            state_dir.mkdir()
+            database = sqlite3.connect(state_dir / "loop-manager.db")
+            database.execute(loop_manager.SCHEMA.replace("    plan_sha TEXT,\n", ""))
+            database.execute(
+                "INSERT INTO projects (repo, base_branch, active_sha, phase, plan_path) "
+                "VALUES (?, 'main', 'rebased', 'WORKING', ?)",
+                (str(repo), plan.relative_to(repo).as_posix()),
+            )
+            database.commit()
+            database.close()
+
+            with loop_manager.connect_database(state_dir) as connection:
+                blocked = connection.execute(
+                    "SELECT phase, last_error FROM projects WHERE repo = ?", (str(repo),)
+                ).fetchone()
+                with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
+                    "loop_manager.run_codex"
+                ) as run:
+                    self.assertEqual(
+                        loop_manager.run_project(
+                            connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                        ),
+                        1,
+                    )
+                retained = connection.execute(
+                    "SELECT phase, last_error FROM projects WHERE repo = ?", (str(repo),)
+                ).fetchone()
+
+        self.assertEqual(blocked["phase"], "BLOCKED")
+        self.assertEqual(blocked["last_error"], loop_manager.PLAN_SHA_BACKFILL_ERROR)
+        self.assertEqual(retained["phase"], "BLOCKED")
+        self.assertEqual(retained["last_error"], loop_manager.PLAN_SHA_BACKFILL_ERROR)
+        run.assert_not_called()
+
+    def test_base_worktree_failure_preserves_file_index_and_head(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            state_dir = Path(directory) / "state"
+            state_dir.mkdir()
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(loop_manager.CLEANUP_PENDING_SCHEMA)
+            (repo / "src/app.py").write_text("VALUE = 99\n", encoding="utf-8")
+            git_command(repo, "add", "src/app.py")
+            head_before = git_command(repo, "rev-parse", "HEAD")
+            index_before = git_command(repo, "diff", "--cached", "--", "src/app.py")
+
+            with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch("loop_manager.run_codex") as run, mock.patch(
+                "loop_manager.make_worktree"
+            ) as make_worktree:
+                with self.assertRaisesRegex(RuntimeError, "기본 worktree가 dirty"):
+                    loop_manager.run_project(
+                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                    )
+
+            self.assertEqual((repo / "src/app.py").read_text(encoding="utf-8"), "VALUE = 99\n")
+            self.assertEqual(
+                git_command(repo, "diff", "--cached", "--", "src/app.py"), index_before
+            )
+            self.assertEqual(git_command(repo, "rev-parse", "HEAD"), head_before)
+            run.assert_not_called()
+            make_worktree.assert_not_called()
+
+    def test_verify_and_review_retries_keep_latest_worker_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            state_dir = Path(directory) / "state"
+            state_dir.mkdir()
+            (repo / "docs/plans").mkdir()
+            plan = write_execplan(repo, "G-001", "Worker Boundary")
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                """INSERT INTO projects (
+                    repo, base_branch, active_sha, plan_sha, phase, branch, worktree, plan_path
+                ) VALUES (?, 'main', ?, ?, 'WORKING', 'loop-manager/G-001', ?, ?)""",
+                (
+                    str(repo),
+                    git_command(repo, "rev-parse", "origin/main"),
+                    git_command(repo, "rev-parse", "origin/main"),
+                    str(repo),
+                    plan.relative_to(repo).as_posix(),
+                ),
+            )
+            connection.commit()
+            worker_messages = iter(
+                (
+                    worker_result("Record initial context", "Initial summary", "test: PASS"),
+                    worker_result("Refresh verified context", "Verified summary", "test: PASS"),
+                    worker_result("Publish reviewed context", "Final summary", "test: PASS"),
+                )
+            )
+            versions = iter((2, 3, 4))
+            review_messages = iter(("VERDICT: FAIL", "VERDICT: PASS"))
+            reviewer_prompts = []
+
+            def agent(worktree, _state, _config, role_name, prompt, **_kwargs):
+                if role_name == "worker":
+                    version = next(versions)
+                    (worktree / "src/app.py").write_text(
+                        f"VALUE = {version}\n", encoding="utf-8"
+                    )
+                    return loop_manager.CodexResult(0, next(worker_messages), "worker-session")
+                reviewer_prompts.append(prompt)
+                return 0, next(review_messages)
+
+            with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch("loop_manager.ensure_safe_base_worktree"), mock.patch(
+                "loop_manager.pr_for_branch",
+                side_effect=[None, None, None, {"url": "https://example.test/pr/1"}],
+            ), mock.patch("loop_manager.run_codex", side_effect=agent), mock.patch(
+                "loop_manager.verify",
+                side_effect=[(False, "verify failed"), (True, "verify: PASS"), (True, "verify: PASS")],
+            ):
+                for expected in (1, 1, 0):
+                    self.assertEqual(
+                        loop_manager.run_project(
+                            connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                        ),
+                        expected,
+                    )
+                row = connection.execute(
+                    "SELECT worker_result, phase FROM projects WHERE repo = ?", (str(repo),)
+                ).fetchone()
+
+                latest_title = git_command(repo, "log", "-1", "--pretty=%s")
+                latest_body = loop_manager.build_pr_body(
+                    loop_manager.parse_worker_result(row["worker_result"], self.plan),
+                    {**self.plan, "sources": ["docs/requirements/Active.md"]},
+                    "docs/plans/[G-001] Worker Boundary.md",
+                    "## Purpose\n\nPreserve immutable context.\n",
+                    "git@github.com:octo/loop-manager.git",
+                    "a" * 40,
+                )
+
+        self.assertEqual(latest_title, "Publish reviewed context")
+        self.assertEqual(
+            row["worker_result"],
+            worker_result("Publish reviewed context", "Final summary", "test: PASS"),
+        )
+        self.assertIn("Publish reviewed context", reviewer_prompts[-1])
+        self.assertIn("Final summary", reviewer_prompts[-1])
+        self.assertNotIn("Initial summary", reviewer_prompts[-1])
+        self.assertIn("Final summary", latest_body)
 
     def test_invalid_worker_result_resumes_same_session_without_verify(self):
         with tempfile.TemporaryDirectory() as directory:
