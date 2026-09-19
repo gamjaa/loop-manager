@@ -3051,6 +3051,100 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         connection.commit()
         return repo, state_dir, connection
 
+    def _run_review_sequence(
+        self,
+        directory: str,
+        review_messages: tuple[str, ...],
+        *,
+        publish: bool,
+    ) -> dict[str, object]:
+        repo, state_dir, connection = self._active_worker_project(directory)
+        roles = []
+        reviewer_sessions = []
+        worker_version = 1
+        transitions = []
+        original_transition = loop_manager.transition_validation_failure
+
+        def record_transition(*args, **kwargs):
+            decision = original_transition(*args, **kwargs)
+            transitions.append(
+                (
+                    decision.stage,
+                    decision.fingerprint,
+                    decision.occurrences,
+                    decision.blocked,
+                )
+            )
+            return decision
+
+        def agent(worktree, _state, _config, role_name, _prompt, **kwargs):
+            nonlocal worker_version
+            roles.append(role_name)
+            if role_name == "worker":
+                worker_version += 1
+                (worktree / "src/app.py").write_text(
+                    f"VALUE = {worker_version}\n", encoding="utf-8"
+                )
+                return loop_manager.CodexResult(
+                    0,
+                    worker_result(f"Record review sequence {worker_version}"),
+                    "worker-session",
+                )
+            reviewer_sessions.append(kwargs["session_id"])
+            return loop_manager.CodexResult(
+                0, next(responses), "reviewer-session"
+            )
+
+        responses = iter(review_messages)
+        pr_results: list[dict[str, str] | None] = [None] * len(review_messages)
+        if publish:
+            pr_results.append({"url": "https://example.test/pr/13"})
+
+        with mock.patch(
+            "loop_manager.validate_repository", return_value=repo
+        ), mock.patch(
+            "loop_manager.remote_base", return_value="main"
+        ), mock.patch(
+            "loop_manager.ensure_safe_base_worktree"
+        ), mock.patch(
+            "loop_manager.pr_for_branch", side_effect=pr_results
+        ), mock.patch(
+            "loop_manager.run_codex", side_effect=agent
+        ), mock.patch(
+            "loop_manager.verify", return_value=(True, "verify: PASS")
+        ) as verify, mock.patch(
+            "loop_manager.transition_validation_failure",
+            side_effect=record_transition,
+        ):
+            result = loop_manager.run_project_result(
+                connection,
+                state_dir,
+                str(repo),
+                Path("unused.ini"),
+                "main",
+                False,
+            )
+
+        project = connection.execute(
+            "SELECT phase, worker_session_id, reviewer_session_id "
+            "FROM projects WHERE repo = ?",
+            (str(repo),),
+        ).fetchone()
+        plan = connection.execute(
+            "SELECT status, review_failure_history "
+            "FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+            (str(repo),),
+        ).fetchone()
+        return {
+            "result": result,
+            "roles": roles,
+            "reviewer_sessions": reviewer_sessions,
+            "transitions": transitions,
+            "project": project,
+            "plan": plan,
+            "verify_calls": verify.call_count,
+        }
+
     def test_failure_fingerprints_normalize_noise_and_preserve_issue_identity(self):
         first_root = Path("/tmp/run-one/worktree")
         second_root = Path("/tmp/run-two/worktree")
@@ -3104,6 +3198,12 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         extensionless_file_second, _ = loop_manager.validation_failure_fingerprint(
             "verify", "FAIL /tmp/inputB"
         )
+        prefixed_file_first, _ = loop_manager.validation_failure_fingerprint(
+            "verify", "FAIL /tmp/tmpInputA"
+        )
+        prefixed_file_second, _ = loop_manager.validation_failure_fingerprint(
+            "verify", "FAIL /tmp/tmpInputB"
+        )
 
         self.assertEqual(first_normalized, second_normalized)
         self.assertEqual(first_fingerprint, second_fingerprint)
@@ -3113,6 +3213,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         self.assertNotEqual(same_temp_first, different_temp_file)
         self.assertEqual(temp_directory_first, temp_directory_second)
         self.assertNotEqual(extensionless_file_first, extensionless_file_second)
+        self.assertNotEqual(prefixed_file_first, prefixed_file_second)
 
     def test_review_fingerprints_use_stable_issue_ids_not_explanatory_prose(self):
         first = "\n".join(
@@ -3543,6 +3644,102 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         self.assertEqual(project["reviewer_session_id"], "reviewer-session")
         self.assertEqual(json.loads(plan["verify_failure_history"]), {})
         self.assertEqual(json.loads(plan["review_failure_history"]), {})
+
+    def test_distinct_review_issues_continue_past_four_failures(self):
+        messages = (
+            "ISSUE_ID: app.py::issue-a::blocking\nissue A\nVERDICT: FAIL",
+            "ISSUE_ID: app.py::issue-b::blocking\nissue B\nVERDICT: FAIL",
+            "ISSUE_ID: app.py::issue-c::blocking\nissue C\nVERDICT: FAIL",
+            "ISSUE_ID: app.py::issue-d::blocking\nissue D\nVERDICT: FAIL",
+            "VERDICT: PASS",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            data = self._run_review_sequence(
+                directory, messages, publish=True
+            )
+
+        result = data["result"]
+        transitions = data["transitions"]
+        project = data["project"]
+        plan = data["plan"]
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(data["verify_calls"], 5)
+        self.assertEqual(data["roles"], ["worker", "reviewer"] * 5)
+        self.assertEqual(
+            data["reviewer_sessions"],
+            [None] + ["reviewer-session"] * 4,
+        )
+        self.assertEqual(
+            [
+                (stage, occurrences, blocked)
+                for stage, _fingerprint, occurrences, blocked in transitions
+            ],
+            [("review", 1, False)] * 4,
+        )
+        self.assertEqual(
+            len(
+                {
+                    fingerprint
+                    for _stage, fingerprint, _occurrences, _blocked in transitions
+                }
+            ),
+            4,
+        )
+        self.assertEqual(project["phase"], "PR_OPEN")
+        self.assertEqual(plan["status"], "PR_OPEN")
+        self.assertEqual(json.loads(plan["review_failure_history"]), {})
+
+    def test_same_review_issue_blocks_exactly_on_fourth_occurrence(self):
+        failure = (
+            "ISSUE_ID: app.py::same-issue::blocking\n"
+            "same blocking issue\nVERDICT: FAIL"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            data = self._run_review_sequence(
+                directory, (failure,) * 4, publish=False
+            )
+
+        result = data["result"]
+        transitions = data["transitions"]
+        project = data["project"]
+        plan = data["plan"]
+        history = json.loads(plan["review_failure_history"])
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.BLOCKED)
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(data["verify_calls"], 4)
+        self.assertEqual(data["roles"], ["worker", "reviewer"] * 4)
+        self.assertEqual(
+            data["reviewer_sessions"],
+            [None] + ["reviewer-session"] * 3,
+        )
+        self.assertEqual(
+            [
+                (stage, occurrences, blocked)
+                for stage, _fingerprint, occurrences, blocked in transitions
+            ],
+            [
+                ("review", 1, False),
+                ("review", 2, False),
+                ("review", 3, False),
+                ("review", 4, True),
+            ],
+        )
+        self.assertEqual(
+            len(
+                {
+                    fingerprint
+                    for _stage, fingerprint, _occurrences, _blocked in transitions
+                }
+            ),
+            1,
+        )
+        self.assertEqual(project["phase"], "BLOCKED")
+        self.assertEqual(plan["status"], "BLOCKED")
+        self.assertEqual(
+            [record["occurrences"] for record in history.values()],
+            [4],
+        )
 
     def test_review_failure_then_verify_failure_keeps_stage_counts_independent(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -8106,14 +8303,32 @@ class WorkspaceRecoveryTest(unittest.TestCase):
                 "headRefOid": pr_head,
             }
 
+            def planner(_worktree, _state, _config, role_name, _prompt, **_kwargs):
+                self.assertEqual(role_name, "planner")
+                return loop_manager.CodexResult(0, "", "planner-session")
+
             with mock.patch(
                 "loop_manager.validate_repository", return_value=repo
             ), mock.patch(
                 "loop_manager.pr_for_branch", return_value=merged_pr
             ), mock.patch(
-                "loop_manager.run_codex"
+                "loop_manager.run_codex", side_effect=planner
             ) as run_agent:
-                result = loop_manager.run_project(
+                merge_result = loop_manager.run_project_result(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+                after_merge = connection.execute(
+                    "SELECT phase, planning_fingerprint, processed_sha "
+                    "FROM projects WHERE repo = ?",
+                    (str(repo),),
+                ).fetchone()
+                run_agent.assert_not_called()
+                completion_result = loop_manager.run_project_result(
                     connection,
                     state_dir,
                     str(repo),
@@ -8135,7 +8350,14 @@ class WorkspaceRecoveryTest(unittest.TestCase):
                 "SELECT workspace_owned, reason FROM cleanup_pending WHERE repo = ?",
                 (str(repo),),
             ).fetchone()
-            self.assertEqual(result, 0)
+            self.assertEqual(merge_result.kind, loop_manager.ProjectRunKind.WAITING)
+            self.assertEqual(merge_result.exit_code, 0)
+            self.assertEqual(
+                completion_result.kind,
+                loop_manager.ProjectRunKind.COMPLETED,
+            )
+            self.assertEqual(completion_result.exit_code, 0)
+            self.assertEqual(tuple(after_merge), (None, None, None))
             self.assertEqual(tuple(project), (None, None))
             self.assertEqual(tuple(plan_status), ("MERGED", 0))
             self.assertEqual(pending["workspace_owned"], 0)
@@ -8145,7 +8367,7 @@ class WorkspaceRecoveryTest(unittest.TestCase):
             )
             self.assertTrue(worktree.is_dir())
             self.assertEqual(git_command(worktree, "rev-parse", "HEAD"), pr_head)
-            run_agent.assert_not_called()
+            run_agent.assert_called_once()
 
     def test_merge_cleanup_preserves_unowned_saved_path_as_nonblocking_pending(self):
         with tempfile.TemporaryDirectory() as directory:

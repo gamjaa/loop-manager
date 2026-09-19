@@ -35,6 +35,7 @@ AGENT_CLI_TIMEOUT_SECONDS = 3600
 PROJECT_STEP_RETRY = 2
 PROJECT_STEP_TRANSIENT_PAUSE = 3
 PROJECT_STEP_USAGE_PAUSE = 4
+PROJECT_STEP_PLANNING_PENDING = 5
 TRANSIENT_AGENT_ERROR_PREFIX = "일시적 Agent 실패 (상태 보존):"
 USAGE_LIMIT_ERROR_PREFIX = "AI 사용 한도 소진 (상태 보존):"
 PLAN_SHA_BACKFILL_ERROR = "계획 commit SHA를 기존 작업에서 안전하게 복구할 수 없습니다."
@@ -1928,8 +1929,9 @@ _TEMP_PATH_NOISE = re.compile(
     r"(?P<root>[a-z]:[\\/][^\r\n]*?[\\/]temp|/(?:private/)?(?:var/)?tmp)"
     r"(?P<tail>[\\/][^\s:]+)"
 )
-_GENERATED_TEMP_COMPONENT = re.compile(
-    r"(?i)^(?:tmp[._a-z0-9-]*|pytest(?:[-_].*)?)$"
+_TEMP_DIRECTORY_CONTEXT = re.compile(
+    r"(?i)(?:\b(?:temporary\s+directory|directory|workspace|worktree)\b"
+    r"|디렉터리|작업\s*공간)"
 )
 
 
@@ -1963,7 +1965,9 @@ def _normalize_temp_path(match: re.Match[str]) -> str:
     tail = match.group("tail").strip("\\/")
     components = [part for part in re.split(r"[\\/]", tail) if part]
     leaf = components[-1]
-    if _GENERATED_TEMP_COMPONENT.fullmatch(leaf):
+    line_start = match.string.rfind("\n", 0, match.start()) + 1
+    prefix = match.string[line_start:match.start()]
+    if len(components) == 1 and _TEMP_DIRECTORY_CONTEXT.search(prefix):
         return "<TEMP_PATH>"
     return f"<TEMP_PATH>/{leaf}"
 
@@ -5778,7 +5782,6 @@ def complete_merged_worktree(
             assessment = assess_cleanup(worktree, pr_head_oid)
             assessment = remove_cleanup_worktree(repo_path, worktree, assessment)
     values = _clear_active_values()
-    assignments = ", ".join(f"{name} = ?" for name in values)
     with connection:
         _ensure_execplans_schema(connection)
         _ensure_cleanup_pending_schema(connection)
@@ -5802,6 +5805,15 @@ def complete_merged_worktree(
                 "UPDATE exec_plans SET status = 'MERGED', last_error = NULL WHERE repo = ? AND plan_id = ?",
                 (repo, plan_id),
             )
+        unfinished = connection.execute(
+            "SELECT 1 FROM exec_plans "
+            "WHERE repo = ? AND status != 'MERGED' LIMIT 1",
+            (repo,),
+        ).fetchone()
+        if unfinished is None:
+            values["processed_sha"] = None
+            values["planning_fingerprint"] = None
+        assignments = ", ".join(f"{name} = ?" for name in values)
         connection.execute(
             f"UPDATE projects SET {assignments} WHERE repo = ?",
             [*values.values(), repo],
@@ -6359,7 +6371,7 @@ def _run_project_step(
                         f"({assessment.reason or assessment.status})",
                         file=sys.stderr,
                     )
-                return 0
+                return PROJECT_STEP_PLANNING_PENDING
             update_project(connection, repo, phase="BLOCKED", last_error="PR이 Merge 없이 닫혔습니다.")
             operation_print(f"닫힌 PR을 다시 열어야 합니다: {existing_pr['url']}", file=sys.stderr)
             return 1
@@ -7596,6 +7608,8 @@ def run_project_result(
         return ProjectRunResult(ProjectRunKind.TRANSIENT_PAUSE, 0, detail)
     if step_result == PROJECT_STEP_USAGE_PAUSE:
         return ProjectRunResult(ProjectRunKind.USAGE_LIMIT_PAUSE, 0, detail)
+    if step_result == PROJECT_STEP_PLANNING_PENDING:
+        return ProjectRunResult(ProjectRunKind.WAITING, 0, detail)
     if row is not None and row["phase"] == "BLOCKED":
         return ProjectRunResult(ProjectRunKind.BLOCKED, 1, detail)
     if step_result != 0:
