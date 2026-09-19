@@ -18,8 +18,10 @@ from pathlib import Path
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
+import tempfile
 from urllib.parse import quote
 
 
@@ -62,6 +64,7 @@ FIELDS = {
     "agent_role",
     "agent_snapshot",
     "agent_input_fingerprint",
+    "agent_baseline",
     "agent_recovery",
     "agent_input_plan",
     "agent_result_plan",
@@ -98,6 +101,7 @@ CREATE TABLE IF NOT EXISTS projects (
     agent_role TEXT,
     agent_snapshot TEXT,
     agent_input_fingerprint TEXT,
+    agent_baseline TEXT,
     agent_recovery TEXT,
     agent_input_plan TEXT,
     agent_result_plan TEXT,
@@ -455,6 +459,7 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
         "agent_role": "TEXT",
         "agent_snapshot": "TEXT",
         "agent_input_fingerprint": "TEXT",
+        "agent_baseline": "TEXT",
         "agent_recovery": "TEXT",
         "agent_input_plan": "TEXT",
         "agent_result_plan": "TEXT",
@@ -2487,6 +2492,203 @@ def validate_agent_scope(
         )
 
 
+def _same_local_snapshot(left: GitSnapshot, right: GitSnapshot) -> bool:
+    return (
+        left.head == right.head
+        and left.branch == right.branch
+        and left.index == right.index
+        and left.dirty == right.dirty
+        and left.operations == right.operations
+    )
+
+
+def _git_with_index(
+    worktree: Path,
+    index_path: Path,
+    *arguments: str,
+) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment["GIT_INDEX_FILE"] = str(index_path)
+    return command(
+        ["git", "-C", str(worktree), *arguments],
+        env=environment,
+    )
+
+
+def _hash_git_blob(worktree: Path, contents: bytes) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(worktree), "hash-object", "-w", "--stdin"],
+        input=contents,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    if result.returncode:
+        output = result.stdout[-6000:].decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"Agent 시작 파일 보존 실패:\n{output}")
+    return result.stdout.decode("ascii").strip()
+
+
+def _agent_worktree_tree(
+    worktree: Path,
+    snapshot: GitSnapshot,
+    index_tree: str,
+) -> str:
+    """Write the exact dirty worktree state through an isolated index."""
+
+    with tempfile.TemporaryDirectory(prefix="loop-manager-index-") as directory:
+        temporary_index = Path(directory) / "index"
+        _git_with_index(worktree, temporary_index, "read-tree", index_tree)
+        for relative_path in sorted(snapshot.dirty):
+            target = worktree / relative_path
+            try:
+                target_stat = target.lstat()
+            except FileNotFoundError:
+                _git_with_index(
+                    worktree,
+                    temporary_index,
+                    "update-index",
+                    "--force-remove",
+                    "--",
+                    relative_path,
+                )
+                continue
+
+            if stat.S_ISREG(target_stat.st_mode):
+                mode = "100755" if target_stat.st_mode & 0o111 else "100644"
+                object_id = _hash_git_blob(worktree, target.read_bytes())
+            elif stat.S_ISLNK(target_stat.st_mode):
+                mode = "120000"
+                object_id = _hash_git_blob(
+                    worktree,
+                    os.fsencode(os.readlink(target)),
+                )
+            elif stat.S_ISDIR(target_stat.st_mode):
+                nested_head = git(
+                    target,
+                    "rev-parse",
+                    "--verify",
+                    "HEAD",
+                    check=False,
+                )
+                if nested_head.returncode:
+                    raise RuntimeError(
+                        "Agent 시작 시점의 directory 변경을 안전하게 "
+                        f"보존할 수 없습니다: {relative_path}"
+                    )
+                mode = "160000"
+                object_id = nested_head.stdout.strip()
+            else:
+                raise RuntimeError(
+                    "Agent 시작 시점의 특수 파일을 안전하게 보존할 수 "
+                    f"없습니다: {relative_path}"
+                )
+            _git_with_index(
+                worktree,
+                temporary_index,
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                mode,
+                object_id,
+                relative_path,
+            )
+        return _git_with_index(
+            worktree,
+            temporary_index,
+            "write-tree",
+        ).stdout.strip()
+
+
+def _commit_tree(
+    worktree: Path,
+    tree: str,
+    parent: str,
+    message: str,
+) -> str:
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "GIT_AUTHOR_NAME": "Loop Manager",
+            "GIT_AUTHOR_EMAIL": "loop-manager@localhost",
+            "GIT_AUTHOR_DATE": "2000-01-01T00:00:00 +0000",
+            "GIT_COMMITTER_NAME": "Loop Manager",
+            "GIT_COMMITTER_EMAIL": "loop-manager@localhost",
+            "GIT_COMMITTER_DATE": "2000-01-01T00:00:00 +0000",
+        }
+    )
+    return command(
+        [
+            "git",
+            "-C",
+            str(worktree),
+            "commit-tree",
+            tree,
+            "-p",
+            parent,
+            "-m",
+            message,
+        ],
+        env=environment,
+    ).stdout.strip()
+
+
+def _capture_agent_baseline(
+    repo: str,
+    worktree: Path,
+    snapshot: GitSnapshot,
+) -> str | None:
+    if not snapshot.dirty:
+        return None
+    if snapshot.operations:
+        # Rebase-conflict resolution intentionally starts inside a Git
+        # operation. Its scope is still validated, but it cannot use the
+        # ordinary HEAD/index tree recovery representation.
+        return None
+    index_tree = git(worktree, "write-tree").stdout.strip()
+    worktree_tree = _agent_worktree_tree(worktree, snapshot, index_tree)
+    baseline_id = hashlib.sha256(
+        f"{snapshot.head}\0{index_tree}\0{worktree_tree}".encode("ascii")
+    ).hexdigest()
+    project_id = hashlib.sha256(repo.encode()).hexdigest()[:16]
+    refname = f"refs/loop-manager/baselines/{project_id}/{baseline_id}"
+    index_commit = _commit_tree(
+        worktree,
+        index_tree,
+        snapshot.head,
+        f"Loop Manager baseline index {baseline_id}",
+    )
+    worktree_commit = _commit_tree(
+        worktree,
+        worktree_tree,
+        index_commit,
+        f"Loop Manager baseline worktree {baseline_id}",
+    )
+    existing = git(
+        worktree,
+        "rev-parse",
+        "--verify",
+        refname,
+        check=False,
+    )
+    if existing.returncode == 0:
+        if existing.stdout.strip() != worktree_commit:
+            raise RuntimeError(f"Agent 시작 상태 보존 ref 충돌: {refname}")
+    else:
+        git(worktree, "update-ref", refname, worktree_commit)
+    return json.dumps(
+        {
+            "version": 1,
+            "ref": refname,
+            "ref_target": worktree_commit,
+            "index_tree": index_tree,
+            "worktree_tree": worktree_tree,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
 def begin_agent_scope(
     connection: sqlite3.Connection,
     repo: str,
@@ -2509,7 +2711,19 @@ def begin_agent_scope(
                 f"{row['agent_role']} -> {role_name}"
             )
         return GitSnapshot.deserialize(str(row["agent_snapshot"]))
-    snapshot = capture_git_snapshot(worktree)
+    preliminary_snapshot = capture_git_snapshot(worktree)
+    agent_baseline = _capture_agent_baseline(
+        repo,
+        worktree,
+        preliminary_snapshot,
+    )
+    snapshot = (
+        capture_git_snapshot(worktree)
+        if agent_baseline is not None
+        else preliminary_snapshot
+    )
+    if not _same_local_snapshot(preliminary_snapshot, snapshot):
+        raise RuntimeError("Agent 시작 상태를 보존하는 동안 worktree가 변경됐습니다.")
     plan_path = str(row["plan_path"] or "")
     plan_file = worktree / plan_path
     agent_input_plan = (
@@ -2523,6 +2737,7 @@ def begin_agent_scope(
         agent_role=role_name,
         agent_snapshot=snapshot.serialize(),
         agent_input_fingerprint=input_fingerprint,
+        agent_baseline=agent_baseline,
         agent_recovery=None,
         agent_input_plan=agent_input_plan,
         agent_result_plan=None,
@@ -2538,6 +2753,7 @@ def clear_agent_scope(connection: sqlite3.Connection, repo: str) -> None:
         repo,
         agent_role=None,
         agent_snapshot=None,
+        agent_baseline=None,
         agent_recovery=None,
         agent_input_plan=None,
         agent_result_plan=None,
@@ -2901,6 +3117,7 @@ def clear_planning_validation_state(
         agent_role=None,
         agent_snapshot=None,
         agent_input_fingerprint=None,
+        agent_baseline=None,
         agent_recovery=None,
         agent_input_plan=None,
         agent_result_plan=None,
@@ -2937,6 +3154,7 @@ def _clear_active_values(
         "planning_error_fingerprint": None,
         "agent_role": None,
         "agent_snapshot": None,
+        "agent_baseline": None,
         "agent_recovery": None,
         "agent_input_plan": None,
         "agent_result_plan": None,
@@ -4041,13 +4259,25 @@ def _deserialize_blocked_agent_recovery(value: str) -> dict[str, object]:
     if (
         not isinstance(parsed, dict)
         or parsed.get("version") != 1
-        or parsed.get("state") not in {"prepared", "stashed"}
+        or parsed.get("state") not in {"prepared", "stashed", "isolated"}
         or not isinstance(parsed.get("source_snapshot"), str)
         or not isinstance(parsed.get("original_head"), str)
         or not isinstance(parsed.get("violation_head"), str)
         or not isinstance(parsed.get("branch"), str)
         or not isinstance(parsed.get("stash_marker"), str)
         or not isinstance(parsed.get("violation_ref"), str)
+        or (
+            parsed.get("plan_temp_path") is not None
+            and not isinstance(parsed.get("plan_temp_path"), str)
+        )
+        or (
+            parsed.get("plan_mode") is not None
+            and not isinstance(parsed.get("plan_mode"), int)
+        )
+        or (
+            parsed.get("baseline_snapshot") is not None
+            and not isinstance(parsed.get("baseline_snapshot"), str)
+        )
         or (
             parsed.get("plan_path") is not None
             and not isinstance(parsed.get("plan_path"), str)
@@ -4059,6 +4289,170 @@ def _deserialize_blocked_agent_recovery(value: str) -> dict[str, object]:
     ):
         raise AgentScopeError("저장된 BLOCKED Agent 복구 상태 형식을 지원하지 않습니다.")
     return parsed
+
+
+def _deserialize_agent_baseline(value: str) -> dict[str, str]:
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError) as error:
+        raise AgentScopeError(
+            f"저장된 Agent 시작 상태가 유효하지 않습니다: {error}"
+        ) from error
+    required = ("ref", "ref_target", "index_tree", "worktree_tree")
+    if (
+        not isinstance(parsed, dict)
+        or parsed.get("version") != 1
+        or any(not isinstance(parsed.get(key), str) for key in required)
+    ):
+        raise AgentScopeError("저장된 Agent 시작 상태 형식을 지원하지 않습니다.")
+    return {key: str(parsed[key]) for key in required}
+
+
+def _restore_agent_index_flags(
+    worktree: Path,
+    entries: Mapping[str, tuple[str, ...]],
+) -> None:
+    for relative_path, states in sorted(entries.items()):
+        tags = {state.split(" ", 1)[0] for state in states}
+        if any(tag.lower() == "s" for tag in tags):
+            git(worktree, "update-index", "--skip-worktree", "--", relative_path)
+        if any(tag.islower() for tag in tags):
+            git(worktree, "update-index", "--assume-unchanged", "--", relative_path)
+
+
+def _restore_agent_staged_entries(
+    worktree: Path,
+    before: GitSnapshot,
+) -> None:
+    """Restore the pre-Agent stage-0 entries after rebase autostash."""
+
+    for relative_path, (kinds, _signature) in sorted(before.dirty.items()):
+        if "staged" not in kinds:
+            continue
+        stage_zero: tuple[str, str] | None = None
+        for entry in before.index.get(relative_path, ()):
+            fields = entry.split()
+            if len(fields) != 4:
+                raise AgentScopeError(
+                    f"저장된 Agent index 항목이 유효하지 않습니다: {relative_path}"
+                )
+            _tag, mode, object_id, stage = fields
+            if stage == "0":
+                stage_zero = (mode, object_id)
+        if stage_zero is None:
+            git(worktree, "update-index", "--force-remove", "--", relative_path)
+        else:
+            mode, object_id = stage_zero
+            git(
+                worktree,
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                mode,
+                object_id,
+                relative_path,
+            )
+    _restore_agent_index_flags(worktree, before.index)
+
+
+def _restore_agent_baseline(
+    worktree: Path,
+    before: GitSnapshot,
+    serialized: str | None,
+) -> None:
+    if not before.dirty:
+        return
+    if serialized is None:
+        raise AgentScopeError(
+            "dirty Agent 시작 상태를 복원할 보존 tree가 없습니다."
+        )
+    baseline = _deserialize_agent_baseline(serialized)
+    ref_target = git(
+        worktree,
+        "rev-parse",
+        "--verify",
+        baseline["ref"],
+        check=False,
+    )
+    if ref_target.returncode or ref_target.stdout.strip() != baseline["ref_target"]:
+        raise AgentScopeError("Agent 시작 상태 보존 ref가 변경되거나 사라졌습니다.")
+    worktree_tree = git(
+        worktree,
+        "rev-parse",
+        baseline["ref_target"] + "^{tree}",
+    ).stdout.strip()
+    index_tree = git(
+        worktree,
+        "rev-parse",
+        baseline["ref_target"] + "^1^{tree}",
+    ).stdout.strip()
+    if (
+        worktree_tree != baseline["worktree_tree"]
+        or index_tree != baseline["index_tree"]
+    ):
+        raise AgentScopeError("Agent 시작 상태 보존 tree가 저장된 값과 다릅니다.")
+
+    git(worktree, "read-tree", "--reset", "-u", worktree_tree)
+    git(worktree, "read-tree", index_tree)
+    _restore_agent_index_flags(worktree, before.index)
+    restored = capture_git_snapshot(worktree)
+    if not _same_local_snapshot(before, restored):
+        raise AgentScopeError("Agent 시작 시점의 기존 변경을 정확히 복원하지 못했습니다.")
+
+
+def _worktree_relative_target(worktree: Path, relative_path: str) -> Path:
+    candidate = Path(relative_path)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise AgentScopeError(f"복구 경로가 worktree 밖을 가리킵니다: {relative_path}")
+    target = worktree / candidate
+    try:
+        target.parent.resolve().relative_to(worktree.resolve())
+    except ValueError as error:
+        raise AgentScopeError(
+            f"복구 경로의 상위 디렉터리가 worktree 밖을 가리킵니다: {relative_path}"
+        ) from error
+    return target
+
+
+def _remove_interrupted_recovery_temp(
+    worktree: Path,
+    relative_path: str | None,
+) -> None:
+    if relative_path is None:
+        return
+    target = _worktree_relative_target(worktree, relative_path)
+    if target.is_dir() and not target.is_symlink():
+        raise AgentScopeError(f"복구 임시 경로가 디렉터리입니다: {relative_path}")
+    if target.exists() or target.is_symlink():
+        target.unlink()
+
+
+def _atomic_restore_file(
+    worktree: Path,
+    relative_path: str,
+    temp_relative_path: str,
+    contents: str,
+    mode: int,
+) -> None:
+    target = _worktree_relative_target(worktree, relative_path)
+    temporary = _worktree_relative_target(worktree, temp_relative_path)
+    _remove_interrupted_recovery_temp(worktree, temp_relative_path)
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(contents.encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, target)
+        directory_fd = os.open(target.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError as error:
+        raise AgentScopeError(
+            f"BLOCKED ExecPlan 사용자 변경 원자적 복원 실패: {error}"
+        ) from error
 
 
 def _serialize_blocked_agent_recovery(recovery: Mapping[str, object]) -> str:
@@ -4093,20 +4487,91 @@ def _restore_blocked_agent_recovery_plan(
     worktree: Path,
     plan_path: str | None,
     plan_contents: str | None,
+    plan_temp_path: str | None,
+    plan_mode: int | None,
 ) -> None:
     if plan_path is None:
         return
-    target = worktree / plan_path
+    target = _worktree_relative_target(worktree, plan_path)
     try:
         if plan_contents is None:
             if target.exists() or target.is_symlink():
                 target.unlink()
         else:
-            target.write_text(plan_contents, encoding="utf-8")
+            if plan_temp_path is None or plan_mode is None:
+                raise AgentScopeError(
+                    "BLOCKED ExecPlan 원자적 복원 정보가 없습니다."
+                )
+            _atomic_restore_file(
+                worktree,
+                plan_path,
+                plan_temp_path,
+                plan_contents,
+                plan_mode,
+            )
     except OSError as error:
         raise AgentScopeError(
             f"BLOCKED ExecPlan 사용자 변경 복원 실패: {error}"
         ) from error
+
+
+def _recovered_agent_local_state_matches(
+    worktree: Path,
+    before: GitSnapshot,
+    current: GitSnapshot,
+    plan_path: str | None,
+    plan_contents: str | None,
+    plan_mode: int | None,
+) -> bool:
+    if (
+        current.head != before.head
+        or current.branch != before.branch
+        or current.index != before.index
+        or current.operations != before.operations
+    ):
+        return False
+    current_dirty = dict(current.dirty)
+    before_dirty = dict(before.dirty)
+    if plan_path is None:
+        return current_dirty == before_dirty
+    current_dirty.pop(plan_path, None)
+    before_dirty.pop(plan_path, None)
+    if current_dirty != before_dirty:
+        return False
+    target = _worktree_relative_target(worktree, plan_path)
+    if plan_contents is None:
+        return not target.exists() and not target.is_symlink()
+    try:
+        target_stat = target.lstat()
+    except FileNotFoundError:
+        return False
+    return (
+        stat.S_ISREG(target_stat.st_mode)
+        and stat.S_IMODE(target_stat.st_mode) == plan_mode
+        and target.read_text(encoding="utf-8") == plan_contents
+    )
+
+
+def _mark_blocked_agent_isolated(
+    connection: sqlite3.Connection,
+    repo: str,
+    recovery: dict[str, object],
+    before: GitSnapshot,
+) -> None:
+    recovery["state"] = "isolated"
+    recovery["baseline_snapshot"] = before.serialize()
+    update_project(
+        connection,
+        repo,
+        agent_role=None,
+        agent_snapshot=None,
+        agent_input_fingerprint=None,
+        agent_recovery=_serialize_blocked_agent_recovery(recovery),
+        agent_input_plan=None,
+        agent_result_plan=None,
+        agent_result_snapshot=None,
+        agent_manager_snapshot=None,
+    )
 
 
 def _complete_blocked_agent_recovery(
@@ -4115,7 +4580,8 @@ def _complete_blocked_agent_recovery(
     worktree: Path,
 ) -> None:
     project = connection.execute(
-        "SELECT agent_snapshot, agent_recovery FROM projects WHERE repo = ?",
+        "SELECT agent_snapshot, agent_baseline, agent_recovery "
+        "FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
     if project is None or not project["agent_recovery"]:
@@ -4169,7 +4635,6 @@ def _complete_blocked_agent_recovery(
             agent_recovery=_serialize_blocked_agent_recovery(recovery),
         )
 
-    current = capture_git_snapshot(worktree)
     branch = str(recovery["branch"])
     original_head = str(recovery["original_head"])
     violation_head = str(recovery["violation_head"])
@@ -4179,6 +4644,14 @@ def _complete_blocked_agent_recovery(
     plan_contents = (
         str(plan_contents_value) if plan_contents_value is not None else None
     )
+    plan_temp_value = recovery.get("plan_temp_path")
+    plan_temp_path = (
+        str(plan_temp_value) if plan_temp_value is not None else None
+    )
+    plan_mode_value = recovery.get("plan_mode")
+    plan_mode = int(plan_mode_value) if plan_mode_value is not None else None
+    _remove_interrupted_recovery_temp(worktree, plan_temp_path)
+    current = capture_git_snapshot(worktree)
     if current.branch != branch:
         raise AgentScopeError(
             "BLOCKED Agent 복구 worktree branch가 저장된 branch와 다릅니다."
@@ -4187,10 +4660,21 @@ def _complete_blocked_agent_recovery(
         raise AgentScopeError(
             "BLOCKED Agent 복구 worktree에 Git operation이 남아 있습니다."
         )
-    if before.dirty:
+    if before.operations:
         raise AgentScopeError(
-            "Agent 실행 전 변경이 있는 worktree는 자동 commit 복구할 수 없습니다."
+            "Agent 실행 전 Git operation이 있는 worktree는 자동 복구할 수 없습니다."
         )
+
+    if _recovered_agent_local_state_matches(
+        worktree,
+        before,
+        current,
+        plan_path,
+        plan_contents,
+        plan_mode,
+    ):
+        _mark_blocked_agent_isolated(connection, repo, recovery, before)
+        return
 
     if current.head == violation_head and violation_head != original_head:
         if current.dirty:
@@ -4219,48 +4703,40 @@ def _complete_blocked_agent_recovery(
             "BLOCKED Agent 복구 HEAD가 저장된 Agent 결과 또는 시작 commit과 다릅니다."
         )
 
-    if current.dirty:
-        if (
-            plan_path is None
-            or set(current.dirty) != {plan_path}
-            or (
-                plan_contents is None
-                and (
-                    (worktree / plan_path).exists()
-                    or (worktree / plan_path).is_symlink()
-                )
-            )
-            or (
-                plan_contents is not None
-                and (
-                    not (worktree / plan_path).is_file()
-                    or (worktree / plan_path).read_text(encoding="utf-8")
-                    != plan_contents
-                )
-            )
-        ):
+    if not _same_local_snapshot(before, current):
+        if current.dirty:
             raise AgentScopeError(
-                "BLOCKED Agent 복구 중 사용자 변경 외의 새 worktree 변경이 생겼습니다."
+                "BLOCKED Agent 복구 중 예상하지 못한 새 worktree 변경이 생겼습니다."
             )
-    else:
-        _restore_blocked_agent_recovery_plan(
+        _restore_agent_baseline(
             worktree,
-            plan_path,
-            plan_contents,
+            before,
+            (
+                str(project["agent_baseline"])
+                if project["agent_baseline"] is not None
+                else None
+            ),
         )
 
+    _restore_blocked_agent_recovery_plan(
+        worktree,
+        plan_path,
+        plan_contents,
+        plan_temp_path,
+        plan_mode,
+    )
+
     restored = capture_git_snapshot(worktree)
-    if restored.head != original_head or restored.branch != branch:
-        raise AgentScopeError("BLOCKED Agent 복구 후 HEAD 또는 branch가 일치하지 않습니다.")
-    unexpected_paths = set(restored.dirty)
-    if plan_path is not None:
-        unexpected_paths.discard(plan_path)
-    if unexpected_paths:
-        raise AgentScopeError(
-            "BLOCKED Agent 복구 후 예상하지 못한 변경이 남았습니다: "
-            + ", ".join(sorted(unexpected_paths))
-        )
-    clear_agent_scope(connection, repo)
+    if not _recovered_agent_local_state_matches(
+        worktree,
+        before,
+        restored,
+        plan_path,
+        plan_contents,
+        plan_mode,
+    ):
+        raise AgentScopeError("BLOCKED Agent 복구 후 저장된 변경 상태와 일치하지 않습니다.")
+    _mark_blocked_agent_isolated(connection, repo, recovery, before)
 
 
 def preserve_blocked_agent_changes(
@@ -4270,7 +4746,7 @@ def preserve_blocked_agent_changes(
     plan_id: str,
     *,
     preserved_input_path: str | None = None,
-) -> None:
+) -> GitSnapshot | None:
     """Persist and isolate a diagnosed scope violation crash-safely."""
 
     project = connection.execute(
@@ -4282,10 +4758,26 @@ def preserve_blocked_agent_changes(
     if project is None:
         raise AgentScopeError("보존할 BLOCKED Agent 프로젝트가 없습니다.")
     if project["agent_recovery"]:
+        recovery = _deserialize_blocked_agent_recovery(
+            str(project["agent_recovery"])
+        )
+        if recovery["state"] == "isolated":
+            baseline_snapshot = recovery.get("baseline_snapshot")
+            if not isinstance(baseline_snapshot, str):
+                raise AgentScopeError("격리된 Agent 시작 snapshot이 없습니다.")
+            try:
+                return GitSnapshot.deserialize(baseline_snapshot)
+            except (KeyError, TypeError, ValueError, RuntimeError) as error:
+                raise AgentScopeError(
+                    f"격리된 Agent 시작 snapshot이 유효하지 않습니다: {error}"
+                ) from error
+        if not project["agent_snapshot"]:
+            raise AgentScopeError("복구 중인 BLOCKED Agent 시작 snapshot이 없습니다.")
+        before = GitSnapshot.deserialize(str(project["agent_snapshot"]))
         _complete_blocked_agent_recovery(connection, repo, worktree)
-        return
+        return before
     if not project["agent_snapshot"] or not project["agent_result_snapshot"]:
-        return
+        return None
     try:
         before = GitSnapshot.deserialize(str(project["agent_snapshot"]))
         result = GitSnapshot.deserialize(str(project["agent_result_snapshot"]))
@@ -4293,10 +4785,9 @@ def preserve_blocked_agent_changes(
         raise AgentScopeError(
             f"보존할 BLOCKED Agent snapshot이 유효하지 않습니다: {error}"
         ) from error
-    if before.dirty or before.operations:
+    if before.operations:
         raise AgentScopeError(
-            "Agent 실행 전 변경 또는 Git operation이 있는 worktree는 "
-            "자동 격리할 수 없습니다."
+            "Agent 실행 전 Git operation이 있는 worktree는 자동 격리할 수 없습니다."
         )
     current = capture_git_snapshot(worktree)
     if current.branch != before.branch or current.head not in {
@@ -4326,6 +4817,7 @@ def preserve_blocked_agent_changes(
     )
     plan_path: str | None = None
     plan_contents: str | None = None
+    plan_mode: int | None = None
     if preserved_paths:
         if len(preserved_paths) != 1:
             raise AgentScopeError(
@@ -4339,6 +4831,11 @@ def preserve_blocked_agent_changes(
             )
         plan_contents = (
             plan_file.read_text(encoding="utf-8")
+            if plan_file.is_file()
+            else None
+        )
+        plan_mode = (
+            stat.S_IMODE(plan_file.lstat().st_mode)
             if plan_file.is_file()
             else None
         )
@@ -4382,6 +4879,13 @@ def preserve_blocked_agent_changes(
         ).encode("utf-8")
     ).hexdigest()[:24]
     project_id = hashlib.sha256(repo.encode()).hexdigest()[:16]
+    plan_temp_path: str | None = None
+    if plan_path is not None and plan_contents is not None:
+        plan_relative = Path(plan_path)
+        plan_temp_path = str(
+            plan_relative.parent
+            / f".{plan_relative.name}.loop-manager-recovery-{recovery_id}.tmp"
+        )
     recovery: dict[str, object] = {
         "version": 1,
         "state": "prepared",
@@ -4395,6 +4899,8 @@ def preserve_blocked_agent_changes(
         ),
         "plan_path": plan_path,
         "plan_contents": plan_contents,
+        "plan_temp_path": plan_temp_path,
+        "plan_mode": plan_mode,
         "stash_oid": None,
     }
     update_project(
@@ -4403,6 +4909,7 @@ def preserve_blocked_agent_changes(
         agent_recovery=_serialize_blocked_agent_recovery(recovery),
     )
     _complete_blocked_agent_recovery(connection, repo, worktree)
+    return before
 
 
 def resume_interrupted_blocked_agent_recovery(
@@ -4420,12 +4927,20 @@ def resume_interrupted_blocked_agent_recovery(
     ).fetchone()
     if project is None or not project["agent_recovery"]:
         return False
-    if project["phase"] != "BLOCKED" or not project["agent_snapshot"]:
+    recovery = _deserialize_blocked_agent_recovery(
+        str(project["agent_recovery"])
+    )
+    if project["phase"] != "BLOCKED":
         raise AgentScopeError(
             "BLOCKED Agent 복구 상태가 활성 BLOCKED 작업과 일치하지 않습니다."
         )
+    serialized_before = project["agent_snapshot"]
+    if recovery["state"] == "isolated":
+        serialized_before = recovery.get("baseline_snapshot")
+    if not isinstance(serialized_before, str):
+        raise AgentScopeError("BLOCKED Agent 복구 시작 snapshot이 없습니다.")
     try:
-        before = GitSnapshot.deserialize(str(project["agent_snapshot"]))
+        before = GitSnapshot.deserialize(serialized_before)
     except (KeyError, TypeError, ValueError, RuntimeError) as error:
         raise AgentScopeError(
             f"BLOCKED Agent 복구 시작 snapshot이 유효하지 않습니다: {error}"
@@ -4463,13 +4978,18 @@ def resume_interrupted_blocked_agent_recovery(
             allow_create_branch=False,
             allow_recovery=True,
             allow_existing=True,
+            allow_rebase=(
+                recovery["state"] == "isolated"
+                and _rebase_in_progress_for_branch(worktree, branch)
+            ),
         )
     except WorkspaceOwnershipError as error:
         raise AgentScopeError(
             f"BLOCKED Agent 복구 workspace 검증 실패: {error}"
         ) from error
 
-    _complete_blocked_agent_recovery(connection, repo, worktree)
+    if recovery["state"] != "isolated":
+        _complete_blocked_agent_recovery(connection, repo, worktree)
     return True
 
 
@@ -4617,7 +5137,7 @@ def resume_blocked_execplan_if_inputs_changed(
     if not worktree_changed and not remote_changed:
         return False
     try:
-        preserve_blocked_agent_changes(
+        preserved_before = preserve_blocked_agent_changes(
             connection,
             repo,
             worktree,
@@ -4632,6 +5152,7 @@ def resume_blocked_execplan_if_inputs_changed(
         rebased = git(
             worktree,
             "rebase",
+            "--autostash",
             f"origin/{base}",
             check=False,
         )
@@ -4639,6 +5160,18 @@ def resume_blocked_execplan_if_inputs_changed(
             error = f"BLOCKED 해제 전 rebase 실패:\n{rebased.stdout[-8000:]}"
             _update_blocked_error(connection, repo, str(plan["plan_id"]), error)
             return False
+        if preserved_before is not None:
+            try:
+                _restore_agent_staged_entries(worktree, preserved_before)
+            except (AgentScopeError, RuntimeError) as error:
+                restore_error = f"BLOCKED 해제 후 index 복원 실패:\n{error}"
+                _update_blocked_error(
+                    connection,
+                    repo,
+                    str(plan["plan_id"]),
+                    restore_error,
+                )
+                return False
     if worktree.is_dir():
         metadata_error = _blocked_execplan_metadata_error(repo_path, worktree, plan)
         if metadata_error:
@@ -4650,6 +5183,7 @@ def resume_blocked_execplan_if_inputs_changed(
             )
             return False
 
+    clear_agent_scope(connection, repo)
     _requeue_blocked_execplan(connection, repo, str(plan["plan_id"]))
     return True
 

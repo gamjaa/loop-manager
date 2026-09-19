@@ -4580,12 +4580,67 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 worktree,
                 plan,
             )
-            before = loop_manager.capture_git_snapshot(worktree)
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE exec_plans
+                    SET status = ?, active_sha = ?, branch = ?,
+                        worktree = ?, workspace_owned = 1
+                    WHERE repo = ? AND plan_id = ?
+                    """,
+                    (
+                        "IMPLEMENTING",
+                        plan_sha,
+                        branch,
+                        str(worktree),
+                        str(repo),
+                        "G-001",
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE projects
+                    SET active_sha = ?, plan_sha = ?, phase = ?,
+                        branch = ?, worktree = ?, plan_path = ?
+                    WHERE repo = ?
+                    """,
+                    (
+                        plan_sha,
+                        plan_sha,
+                        "WORKING",
+                        branch,
+                        str(worktree),
+                        plan_path,
+                        str(repo),
+                    ),
+                )
             (worktree / "src/app.py").write_text(
                 "VALUE = 2\n",
                 encoding="utf-8",
             )
             git_command(worktree, "add", "src/app.py")
+            (worktree / "README.md").write_text(
+                "# preserved unstaged Worker change\n",
+                encoding="utf-8",
+            )
+            (worktree / "tests/evidence.txt").write_text(
+                "targeted tests passed\n",
+                encoding="utf-8",
+            )
+            before = loop_manager.begin_agent_scope(
+                connection,
+                str(repo),
+                worktree,
+                "worker",
+                input_fingerprint=blocked_fingerprint,
+            )
+            self.assertTrue(before.dirty)
+            self.assertIn("staged", before.dirty["src/app.py"][0])
+            (worktree / "docs/requirements/Active.md").write_text(
+                "# changed by committing Agent\n",
+                encoding="utf-8",
+            )
+            git_command(worktree, "add", "-A")
             git_command(worktree, "commit", "-m", "Agent commit")
             agent_commit = git_command(worktree, "rev-parse", "HEAD")
             blocked_result = loop_manager.capture_git_snapshot(worktree)
@@ -4637,6 +4692,20 @@ class AgentScopeValidatorTest(unittest.TestCase):
             )
             commit_and_push(repo, "Change source after blocked Agent commit")
 
+            def stop_after_isolation(*_args, **_kwargs):
+                restored = loop_manager.capture_git_snapshot(worktree)
+                self.assertIn("staged", restored.dirty["src/app.py"][0])
+                self.assertIn("unstaged", restored.dirty["README.md"][0])
+                self.assertIn(
+                    "untracked",
+                    restored.dirty["tests/evidence.txt"][0],
+                )
+                return loop_manager.CodexResult(
+                    1,
+                    "stop after automatic commit isolation",
+                    "planner-session",
+                )
+
             with mock.patch(
                 "loop_manager.validate_repository", return_value=repo
             ), mock.patch(
@@ -4647,11 +4716,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "loop_manager.pr_for_branch", return_value=None
             ), mock.patch(
                 "loop_manager.run_codex",
-                return_value=loop_manager.CodexResult(
-                    1,
-                    "stop after automatic commit isolation",
-                    "planner-session",
-                ),
+                side_effect=stop_after_isolation,
             ) as resumed_agent:
                 result = loop_manager.run_project(
                     connection,
@@ -4691,7 +4756,25 @@ class AgentScopeValidatorTest(unittest.TestCase):
             self.assertIn(agent_commit, diagnostic_refs)
             self.assertEqual(
                 (worktree / "src/app.py").read_text(encoding="utf-8"),
-                "VALUE = 1\n",
+                "VALUE = 2\n",
+            )
+            self.assertEqual(
+                (worktree / "tests/evidence.txt").read_text(encoding="utf-8"),
+                "targeted tests passed\n",
+            )
+            restored = loop_manager.capture_git_snapshot(worktree)
+            self.assertIn("staged", restored.dirty["src/app.py"][0])
+            self.assertIn("unstaged", restored.dirty["README.md"][0])
+            self.assertIn("untracked", restored.dirty["tests/evidence.txt"][0])
+            self.assertEqual(
+                (worktree / "README.md").read_text(encoding="utf-8"),
+                "# preserved unstaged Worker change\n",
+            )
+            self.assertEqual(
+                (worktree / "docs/requirements/Active.md").read_text(
+                    encoding="utf-8"
+                ),
+                "# Active\n",
             )
             resumed_agent.assert_called_once()
             self.assertEqual(resumed_agent.call_args.args[3], "planner")
@@ -5376,7 +5459,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
             ), mock.patch(
                 "loop_manager.pr_for_branch", return_value=None
             ), mock.patch(
-                "loop_manager._restore_blocked_agent_recovery_plan",
+                "loop_manager.os.replace",
                 side_effect=KeyboardInterrupt,
             ), self.assertRaises(KeyboardInterrupt):
                 loop_manager.run_project(
@@ -5394,10 +5477,14 @@ class AgentScopeValidatorTest(unittest.TestCase):
             ).fetchone()
             self.assertEqual(interrupted["phase"], "BLOCKED")
             self.assertIsNotNone(interrupted["agent_recovery"])
+            recovery = json.loads(interrupted["agent_recovery"])
+            recovery_temp = worktree / recovery["plan_temp_path"]
             self.assertEqual(
                 plan_file.read_text(encoding="utf-8"),
                 original_plan_text,
             )
+            self.assertTrue(recovery_temp.is_file())
+            recovery_temp.write_bytes(b"partial interrupted contents")
             self.assertFalse((worktree / "reviewer.txt").exists())
 
             def resumed_worker(agent_worktree, *_args, **_kwargs):
