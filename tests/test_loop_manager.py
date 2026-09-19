@@ -151,6 +151,7 @@ class AutomationFirstCatalogTest(unittest.TestCase):
         depends_on: tuple[str, ...] = (),
         repo: str = "repo",
         title: str | None = None,
+        plan_sha: str = "plan-sha",
     ) -> None:
         title = title or f"Plan {plan_id}"
         connection.execute(
@@ -170,7 +171,7 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                 priority,
                 f"hash-{plan_id}",
                 status,
-                "plan-sha",
+                plan_sha,
             ),
         )
         connection.commit()
@@ -584,7 +585,15 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                 commit_and_push(repo, "Add queued plan")
                 state_dir = Path(directory) / "state"
                 connection = self._connection(str(repo))
-                self._insert_plan(connection, "G-001", "READY", priority="high", repo=str(repo), title="Queued")
+                self._insert_plan(
+                    connection,
+                    "G-001",
+                    "READY",
+                    priority="high",
+                    repo=str(repo),
+                    title="Queued",
+                    plan_sha=git_command(repo, "rev-parse", "origin/main"),
+                )
                 fingerprint = loop_manager.planning_input_fingerprint(repo, "main")
                 connection.execute(
                     """
@@ -3526,7 +3535,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     "HEAD",
                 ),
                 "worktrees",
-                r"Git worktree 등록 변경 .*agent-worktree",
+                r"Git worktree 등록·HEAD·index·파일 상태 변경 .*agent-worktree",
             ),
         )
         for name, mutate, state_field, expected in scenarios:
@@ -3557,6 +3566,140 @@ class AgentScopeValidatorTest(unittest.TestCase):
                         after,
                         selected_plan_path=plan_path,
                     )
+
+    def test_changes_in_another_registered_worktree_are_rejected(self):
+        for mutation in ("file", "index"):
+            with self.subTest(mutation=mutation):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    repo, plan_path = self._repository_with_plan(directory)
+                    managed = root / "managed"
+                    loop_manager.make_worktree(
+                        repo,
+                        managed,
+                        "loop-manager/G-099",
+                        "main",
+                    )
+                    before = loop_manager.capture_git_snapshot(managed)
+
+                    if mutation == "file":
+                        (repo / "src/app.py").write_text(
+                            "VALUE = 2\n",
+                            encoding="utf-8",
+                        )
+                    else:
+                        git_command(
+                            repo,
+                            "update-index",
+                            "--assume-unchanged",
+                            "--",
+                            "src/app.py",
+                        )
+                    after = loop_manager.capture_git_snapshot(managed)
+
+                    external_path = str(repo.resolve())
+                    self.assertNotEqual(
+                        before.worktrees[external_path],
+                        after.worktrees[external_path],
+                    )
+                    with self.assertRaises(
+                        loop_manager.AgentScopeError
+                    ) as raised:
+                        loop_manager.validate_agent_scope(
+                            "worker",
+                            managed,
+                            before,
+                            after,
+                            selected_plan_path=plan_path,
+                        )
+                    self.assertIn(external_path, str(raised.exception))
+
+    def test_active_execplan_fixed_metadata_must_match_published_plan(self):
+        replacements = (
+            (
+                "sources",
+                "sources:\n  - docs/PRODUCT.md",
+                "sources:\n  - docs/requirements/Active.md",
+                True,
+            ),
+            (
+                "depends_on",
+                "depends_on: []",
+                "depends_on:\n  - G-002",
+                True,
+            ),
+            ("complexity", "complexity: low", "complexity: medium", True),
+            ("risk", "risk: low", "risk: high", True),
+            ("priority", "priority: normal", "priority: critical", True),
+            ("body", "Test plan.", "Updated implementation progress.", False),
+        )
+        for name, original, replacement, rejected in replacements:
+            with self.subTest(field=name):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo, plan_path = self._repository_with_plan(directory)
+                    write_execplan(repo, "G-002", "Dependency")
+                    commit_and_push(repo, "Add dependency plan")
+                    plan_sha = git_command(repo, "rev-parse", "origin/main")
+                    connection = sqlite3.connect(":memory:")
+                    connection.row_factory = sqlite3.Row
+                    connection.execute(loop_manager.SCHEMA)
+                    connection.execute(
+                        "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+                        (str(repo),),
+                    )
+                    parsed = loop_manager._parse_execplan(
+                        repo,
+                        repo / plan_path,
+                    )
+                    loop_manager.register_execplans(
+                        connection,
+                        str(repo),
+                        repo,
+                        [(plan_path, parsed)],
+                        plan_sha,
+                        loop_manager.planning_input_fingerprint(repo, "main"),
+                    )
+                    connection.execute(
+                        "UPDATE exec_plans SET status = 'IMPLEMENTING' "
+                        "WHERE repo = ? AND plan_id = 'G-001'",
+                        (str(repo),),
+                    )
+                    connection.commit()
+                    stored = loop_manager.active_execplan(
+                        connection,
+                        str(repo),
+                    )
+                    self.assertIsNotNone(stored)
+                    assert stored is not None
+
+                    plan_file = repo / plan_path
+                    plan_file.write_text(
+                        plan_file.read_text(encoding="utf-8").replace(
+                            original,
+                            replacement,
+                        ),
+                        encoding="utf-8",
+                    )
+
+                    if rejected:
+                        with self.assertRaisesRegex(
+                            RuntimeError,
+                            "고정 메타데이터는 변경할 수 없습니다",
+                        ):
+                            loop_manager.validate_active_execplan_metadata(
+                                repo,
+                                repo,
+                                plan_path,
+                                stored,
+                            )
+                    else:
+                        current = loop_manager.validate_active_execplan_metadata(
+                            repo,
+                            repo,
+                            plan_path,
+                            stored,
+                        )
+                        self.assertEqual(current["id"], "G-001")
 
     def test_git_config_changes_are_rejected_without_leaking_values(self):
         scenarios = (
@@ -4278,7 +4421,10 @@ class AgentScopeValidatorTest(unittest.TestCase):
             )
             self.assertIn("reviewer.txt", resumed_project["last_error"])
             self.assertNotIn("공유 Git refs 변경", resumed_project["last_error"])
-            self.assertNotIn("Git worktree 등록 변경", resumed_project["last_error"])
+            self.assertNotIn(
+                "Git worktree 등록·HEAD·index·파일 상태 변경",
+                resumed_project["last_error"],
+            )
             self.assertEqual(resumed_project["agent_role"], "reviewer")
             self.assertIsNotNone(resumed_project["agent_snapshot"])
             self.assertEqual(resumed_plan["status"], "BLOCKED")

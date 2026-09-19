@@ -1866,6 +1866,7 @@ def _registered_worktree_entries(
     worktree: Path,
 ) -> dict[str, tuple[str, ...]]:
     entries: dict[str, tuple[str, ...]] = {}
+    active_path = _canonical_path(worktree)
     for record in _worktree_catalog(worktree):
         raw_path = record.get("worktree")
         if not isinstance(raw_path, str) or not raw_path:
@@ -1875,13 +1876,12 @@ def _registered_worktree_entries(
             raise RuntimeError(
                 f"Git worktree snapshot에 중복 경로가 있습니다: {path}"
             )
-        entries[path] = tuple(
-            sorted(
-                f"{key}={value}"
-                for key, value in record.items()
-                if key != "worktree"
-            )
-        )
+        state = [
+            f"{key}={value}" for key, value in record.items() if key != "worktree"
+        ]
+        if _canonical_path(Path(raw_path)) != active_path:
+            state.append(f"state={_worktree_state_signature(Path(raw_path))}")
+        entries[path] = tuple(sorted(state))
     return entries
 
 
@@ -1975,8 +1975,15 @@ def _path_signature(worktree: Path, relative_path: str) -> str:
     return digest.hexdigest()
 
 
-def capture_git_snapshot(worktree: Path) -> GitSnapshot:
-    """Capture worktree and shared Git state without staging any content."""
+def _capture_local_worktree_state(
+    worktree: Path,
+) -> tuple[
+    str,
+    str | None,
+    dict[str, tuple[str, ...]],
+    dict[str, tuple[tuple[str, ...], str]],
+]:
+    """Capture one worktree's HEAD, branch, index and file state."""
 
     head = git(worktree, "rev-parse", "--verify", "HEAD").stdout.strip()
     branch_result = git(
@@ -2032,6 +2039,31 @@ def capture_git_snapshot(worktree: Path) -> GitSnapshot:
         path: (tuple(sorted(kinds)), _path_signature(worktree, path))
         for path, kinds in sorted(path_kinds.items())
     }
+    return head, branch, index, dirty
+
+
+def _worktree_state_signature(worktree: Path) -> str:
+    if not worktree.is_dir():
+        return "missing"
+    head, branch, index, dirty = _capture_local_worktree_state(worktree)
+    encoded = json.dumps(
+        {
+            "head": head,
+            "branch": branch,
+            "index": index,
+            "dirty": dirty,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def capture_git_snapshot(worktree: Path) -> GitSnapshot:
+    """Capture local and repository-wide Git state without staging content."""
+
+    head, branch, index, dirty = _capture_local_worktree_state(worktree)
     return GitSnapshot(
         head=head,
         branch=branch,
@@ -2132,7 +2164,7 @@ def validate_agent_scope(
                 allowed_ref_changes,
             ),
             (
-                "Git worktree 등록",
+                "Git worktree 등록·HEAD·index·파일 상태",
                 before.worktrees,
                 after.worktrees,
                 allowed_worktree_changes,
@@ -2683,21 +2715,22 @@ def _revision_execplan_input_fingerprint(
     return _execplan_input_fingerprint(entries)
 
 
-def _blocked_execplan_metadata_identity_error(
+def _execplan_metadata_identity_error(
     repo_path: Path,
     current: dict[str, object],
     plan: sqlite3.Row,
+    subject: str,
 ) -> str | None:
     path = str(plan["path"])
     plan_sha = str(plan["plan_sha"] or "")
     if plan_sha:
         shown = git(repo_path, "show", f"{plan_sha}:{path}", check=False)
         if shown.returncode:
-            return "BLOCKED ExecPlan의 게시 메타데이터를 확인할 수 없습니다."
+            return f"{subject}의 게시 메타데이터를 확인할 수 없습니다."
         try:
             published = published_execplan(path, shown.stdout)
         except RuntimeError as error:
-            return f"BLOCKED ExecPlan의 게시 메타데이터가 유효하지 않습니다: {error}"
+            return f"{subject}의 게시 메타데이터가 유효하지 않습니다: {error}"
         metadata_fields = (
             "id",
             "title",
@@ -2708,7 +2741,7 @@ def _blocked_execplan_metadata_identity_error(
             "priority",
         )
         if any(current[field] != published[field] for field in metadata_fields):
-            return "BLOCKED ExecPlan의 고정 메타데이터는 변경할 수 없습니다."
+            return f"{subject}의 고정 메타데이터는 변경할 수 없습니다."
         return None
 
     sources, dependencies, priority = _execplan_metadata(current)
@@ -2719,8 +2752,39 @@ def _blocked_execplan_metadata_identity_error(
         or dependencies != plan["depends_on"]
         or priority != plan["priority"]
     ):
-        return "BLOCKED ExecPlan의 SQLite 메타데이터와 현재 파일이 일치하지 않습니다."
+        return f"{subject}의 SQLite 메타데이터와 현재 파일이 일치하지 않습니다."
     return None
+
+
+def _blocked_execplan_metadata_identity_error(
+    repo_path: Path,
+    current: dict[str, object],
+    plan: sqlite3.Row,
+) -> str | None:
+    return _execplan_metadata_identity_error(
+        repo_path,
+        current,
+        plan,
+        "BLOCKED ExecPlan",
+    )
+
+
+def validate_active_execplan_metadata(
+    repo_path: Path,
+    worktree: Path,
+    relative_path: str,
+    plan: sqlite3.Row,
+) -> dict[str, object]:
+    current = validate_execplan(worktree, relative_path)
+    error = _execplan_metadata_identity_error(
+        repo_path,
+        current,
+        plan,
+        "활성 ExecPlan",
+    )
+    if error is not None:
+        raise RuntimeError(error)
+    return current
 
 
 def _blocked_execplan_metadata_error(
@@ -4505,8 +4569,27 @@ def run_project(
         operation_print(workspace_error, file=sys.stderr)
         return 1
 
+    assert catalog_plan is not None
+    try:
+        plan = validate_active_execplan_metadata(
+            repo_path,
+            worktree,
+            str(row["plan_path"]),
+            catalog_plan,
+        )
+    except RuntimeError as error:
+        metadata_error = str(error)
+        block_active_execplan(
+            connection,
+            repo,
+            worktree,
+            metadata_error,
+            str(row["verify_result"] or ""),
+        )
+        operation_print(metadata_error, file=sys.stderr)
+        return 1
+
     if row["phase"] == "WORKING":
-        plan = validate_execplan(worktree, row["plan_path"])
         operation_log(f"Worker 시작: {plan['id']} {plan['title']}")
         level = worker_level(plan)
         worker_scope_before = begin_agent_scope(
@@ -4544,6 +4627,12 @@ def run_project(
                 worker_scope_before,
                 worker_scope_after,
                 selected_plan_path=str(row["plan_path"]),
+            )
+            plan = validate_active_execplan_metadata(
+                repo_path,
+                worktree,
+                str(row["plan_path"]),
+                catalog_plan,
             )
             validate_managed_worktree(repo_path, worktree, branch)
         except (AgentScopeError, WorkspaceOwnershipError, RuntimeError) as error:
@@ -4587,7 +4676,6 @@ def run_project(
 
     row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
     if row["phase"] == "VERIFYING":
-        plan = validate_execplan(worktree, row["plan_path"])
         operation_log(f"전체 verify 시작: {plan['id']} {plan['title']}")
         try:
             worker_publication = parse_worker_result(str(row["worker_result"] or ""), plan)
@@ -4627,7 +4715,12 @@ def run_project(
             return 1
         if dirty:
             git(worktree, "add", "-A")
-            plan = validate_execplan(worktree, row["plan_path"])
+            plan = validate_active_execplan_metadata(
+                repo_path,
+                worktree,
+                str(row["plan_path"]),
+                catalog_plan,
+            )
             git(worktree, "commit", "-m", worker_publication.commit_title)
 
         git(repo_path, "fetch", "origin")
@@ -4654,6 +4747,25 @@ def run_project(
             update_project(connection, repo, active_sha=latest_sha, verify_result=output)
         else:
             update_project(connection, repo, verify_result=output)
+        try:
+            plan = validate_active_execplan_metadata(
+                repo_path,
+                worktree,
+                str(row["plan_path"]),
+                catalog_plan,
+            )
+        except RuntimeError as error:
+            metadata_error = str(error)
+            block_active_execplan(
+                connection,
+                repo,
+                worktree,
+                metadata_error,
+                output,
+            )
+            operation_print(metadata_error, file=sys.stderr)
+            return 1
+
         if not branch_has_changes(worktree, base):
             no_change_error = (
                 "rebase 후 Worker 변경이 남지 않아 PR을 생성할 수 없습니다. "
@@ -4672,7 +4784,6 @@ def run_project(
 
     row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
     if row["phase"] == "REVIEWING":
-        plan = validate_execplan(worktree, row["plan_path"])
         operation_log(f"Reviewer 시작: {plan['id']} {plan['title']}")
         reviewer_scope_before = begin_agent_scope(
             connection,
