@@ -25,6 +25,9 @@ from urllib.parse import quote
 ROOT = Path(__file__).resolve().parent
 MAX_PLANNER_VALIDATION_RETRIES = 3
 PLAN_SHA_BACKFILL_ERROR = "계획 commit SHA를 기존 작업에서 안전하게 복구할 수 없습니다."
+WORKSPACE_UNOWNED = 0
+WORKSPACE_OWNED = 1
+WORKSPACE_RESERVED = 2
 PRIORITY_ORDER = {"critical": 0, "high": 1, "normal": 2, "low": 3}
 ACTIVE_EXECPLAN_STATUSES = frozenset(
     {"IMPLEMENTING", "VERIFYING", "REVIEWING", "PUBLISHING", "PR_OPEN", "BLOCKED"}
@@ -245,6 +248,14 @@ class AgentChange:
 
 class AgentScopeError(RuntimeError):
     """An Agent changed Git state outside its role boundary."""
+
+    def __init__(
+        self,
+        message: str,
+        result_snapshot: GitSnapshot | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.result_snapshot = result_snapshot
 
 
 class WorkspaceOwnershipError(RuntimeError):
@@ -1077,6 +1088,27 @@ def mark_execplan_workspace_owned(
             raise RuntimeError("workspace 소유권을 기록할 ExecPlan을 찾을 수 없습니다.")
 
 
+def reserve_execplan_workspace(
+    connection: sqlite3.Connection,
+    repo: str,
+    plan_id: str,
+) -> None:
+    with connection:
+        changed = connection.execute(
+            "UPDATE exec_plans SET workspace_owned = ? "
+            "WHERE repo = ? AND plan_id = ? AND workspace_owned IN (?, ?)",
+            (
+                WORKSPACE_RESERVED,
+                repo,
+                plan_id,
+                WORKSPACE_UNOWNED,
+                WORKSPACE_RESERVED,
+            ),
+        )
+        if changed.rowcount != 1:
+            raise RuntimeError("workspace 생성을 예약할 ExecPlan을 찾을 수 없습니다.")
+
+
 def compact_execplan_catalog(connection: sqlite3.Connection, repo: str) -> str:
     """Serialize only non-terminal plan metadata, never plan bodies."""
 
@@ -1685,6 +1717,8 @@ def make_worktree(
     allow_recovery: bool = True,
     allow_existing: bool = True,
     allow_create_branch: bool = True,
+    ownership_reserved: bool = False,
+    before_create: Callable[[], None] | None = None,
 ) -> str:
     """Create, recover, or validate one owned ExecPlan worktree."""
 
@@ -1715,7 +1749,7 @@ def make_worktree(
         == 0
     )
     if branch_exists:
-        if allow_create_branch or not allow_recovery:
+        if (allow_create_branch and not ownership_reserved) or not allow_recovery:
             raise WorkspaceOwnershipError(
                 f"새 ExecPlan의 관리 branch가 이미 존재해 소유권을 증명할 수 없습니다: "
                 f"{branch}"
@@ -1729,7 +1763,9 @@ def make_worktree(
                 )
         git(repo, "worktree", "add", str(worktree), branch)
         outcome = "recovered"
-    elif allow_create_branch:
+    elif allow_create_branch or ownership_reserved:
+        if before_create is not None:
+            before_create()
         git(repo, "worktree", "add", "-b", branch, str(worktree), f"origin/{base}")
         outcome = "created"
     else:
@@ -1747,6 +1783,7 @@ def make_planning_worktree(
     base: str,
     *,
     allow_create: bool = True,
+    before_create: Callable[[], None] | None = None,
     allow_existing: bool = True,
 ) -> str:
     if worktree.exists() and not worktree.is_dir():
@@ -1767,6 +1804,8 @@ def make_planning_worktree(
             f"{worktree}"
         )
     worktree.parent.mkdir(parents=True, exist_ok=True)
+    if before_create is not None:
+        before_create()
     git(repo, "worktree", "add", "--detach", str(worktree), f"origin/{base}")
     validate_managed_worktree(repo, worktree, None)
     return "created"
@@ -2217,7 +2256,8 @@ def validate_agent_scope(
 
     if violations:
         raise AgentScopeError(
-            f"{role_name} Git 범위 위반: " + "; ".join(violations)
+            f"{role_name} Git 범위 위반: " + "; ".join(violations),
+            result_snapshot=after,
         )
 
 
@@ -2929,10 +2969,16 @@ def block_persisted_agent_scope_violation(
     repo: str,
     row: sqlite3.Row,
     detail: str,
+    result_snapshot: GitSnapshot | None = None,
 ) -> str:
     """Persist a pre-resume scope violation without discarding Agent state."""
 
     message = f"Agent 범위 선검증 실패:\n{detail}"
+    preserved_snapshot = (
+        result_snapshot.serialize()
+        if result_snapshot is not None
+        else str(row["agent_snapshot"])
+    )
     plan = active_execplan(connection, repo)
     if plan is None:
         if row["phase"] == "PLANNING":
@@ -2941,7 +2987,7 @@ def block_persisted_agent_scope_violation(
                 repo,
                 planning_validation_error=detail,
                 last_error=message,
-                agent_result_snapshot=str(row["agent_snapshot"]),
+                agent_result_snapshot=preserved_snapshot,
             )
         else:
             update_project(
@@ -2949,12 +2995,11 @@ def block_persisted_agent_scope_violation(
                 repo,
                 phase="BLOCKED",
                 last_error=message,
-                agent_result_snapshot=str(row["agent_snapshot"]),
+                agent_result_snapshot=preserved_snapshot,
             )
         return message
 
     saved_worktree = Path(str(row["worktree"] or ""))
-    preserved_snapshot = str(row["agent_snapshot"])
     if saved_worktree.is_dir():
         block_active_execplan(
             connection,
@@ -3819,10 +3864,13 @@ def run_project(
             )
         except AgentScopeError as error:
             detail = str(error)
+            scope_result_snapshot = error.result_snapshot
         except RuntimeError:
             detail = "저장된 Agent Git 상태를 안전하게 읽을 수 없습니다."
+            scope_result_snapshot = None
         else:
             detail = None
+            scope_result_snapshot = None
             if (
                 row["phase"] == "BLOCKED"
                 or (row["agent_result_snapshot"] and not planner_correction)
@@ -3835,6 +3883,7 @@ def run_project(
                 repo,
                 row,
                 detail,
+                result_snapshot=scope_result_snapshot,
             )
             operation_print(message, file=sys.stderr)
             return 1
@@ -4188,16 +4237,32 @@ def run_project(
                 or row["last_error"]
             )
             planning_workspace_owned = bool(row["planning_workspace_owned"])
+            planning_workspace_reserved = (
+                row["planning_workspace_owned"] == WORKSPACE_RESERVED
+            )
             make_planning_worktree(
                 repo_path,
                 planning_worktree,
                 base,
                 allow_create=(
-                    not planning_started and not planning_workspace_owned
+                    not planning_started
+                    and (
+                        not planning_workspace_owned
+                        or planning_workspace_reserved
+                    )
                 ),
                 allow_existing=planning_workspace_owned,
+                before_create=lambda: update_project(
+                    connection,
+                    repo,
+                    planning_workspace_owned=WORKSPACE_RESERVED,
+                ),
             )
-            update_project(connection, repo, planning_workspace_owned=1)
+            update_project(
+                connection,
+                repo,
+                planning_workspace_owned=WORKSPACE_OWNED,
+            )
         except WorkspaceOwnershipError as error:
             validation_error = f"planning workspace 소유권 검증 실패: {error}"
             update_project(
@@ -4527,9 +4592,9 @@ def run_project(
     worktree = Path(str(row["worktree"] or ""))
     plan_id = _plan_id_from_path(str(row["plan_path"] or ""))
     catalog_plan = active_execplan(connection, repo)
-    workspace_owned = bool(
-        catalog_plan is not None and catalog_plan["workspace_owned"]
-    )
+    workspace_ownership = int(catalog_plan["workspace_owned"] if catalog_plan else 0)
+    workspace_owned = workspace_ownership != WORKSPACE_UNOWNED
+    workspace_reserved = workspace_ownership == WORKSPACE_RESERVED
     try:
         if plan_id is None:
             raise WorkspaceOwnershipError(
@@ -4554,6 +4619,12 @@ def run_project(
             allow_create_branch=newly_activated and not workspace_owned,
             allow_recovery=workspace_owned,
             allow_existing=workspace_owned,
+            ownership_reserved=workspace_reserved,
+            before_create=lambda: reserve_execplan_workspace(
+                connection,
+                repo,
+                plan_id,
+            ),
         )
         mark_execplan_workspace_owned(connection, repo, plan_id)
     except (RuntimeError, WorkspaceOwnershipError) as error:

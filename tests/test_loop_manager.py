@@ -3359,6 +3359,111 @@ class AgentScopeValidatorTest(unittest.TestCase):
             )
         database.close()
 
+    def test_interrupted_planner_scope_violation_resumes_correction_from_result_snapshot(self):
+        planner_sessions = []
+
+        def agent(worktree, _state, _config, role_name, _prompt, **kwargs):
+            if role_name != "planner":
+                return loop_manager.CodexResult(
+                    1,
+                    "stop after corrected planning",
+                    "worker-session",
+                )
+            planner_sessions.append(kwargs["session_id"])
+            unexpected = worktree / "unexpected.txt"
+            if len(planner_sessions) == 1:
+                kwargs["on_session_started"]("planner-session")
+                unexpected.write_text("invalid\n", encoding="utf-8")
+                raise RuntimeError("process interrupted after invalid Planner edit")
+            self.assertEqual(kwargs["session_id"], "planner-session")
+            unexpected.unlink()
+            (worktree / "docs/plans").mkdir(parents=True, exist_ok=True)
+            write_execplan(worktree, "G-001", "Recovered")
+            return loop_manager.CodexResult(0, "", "planner-session")
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            state_dir = Path(directory) / "state"
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+
+            with mock.patch(
+                "loop_manager.validate_repository",
+                return_value=repo,
+            ), mock.patch(
+                "loop_manager.remote_base",
+                return_value="main",
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.run_codex",
+                side_effect=agent,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "process interrupted",
+                ):
+                    loop_manager.run_project(
+                        connection,
+                        state_dir,
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
+                    )
+
+                self.assertEqual(
+                    loop_manager.run_project(
+                        connection,
+                        state_dir,
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
+                    ),
+                    1,
+                )
+                blocked = connection.execute(
+                    "SELECT * FROM projects WHERE repo = ?",
+                    (str(repo),),
+                ).fetchone()
+                self.assertIn(
+                    "unexpected.txt",
+                    blocked["planning_validation_error"],
+                )
+                self.assertEqual(planner_sessions, [None])
+                start_snapshot = loop_manager.GitSnapshot.deserialize(
+                    blocked["agent_snapshot"]
+                )
+                result_snapshot = loop_manager.GitSnapshot.deserialize(
+                    blocked["agent_result_snapshot"]
+                )
+                self.assertNotEqual(start_snapshot, result_snapshot)
+                self.assertIn("unexpected.txt", result_snapshot.dirty)
+
+                self.assertEqual(
+                    loop_manager.run_project(
+                        connection,
+                        state_dir,
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
+                    ),
+                    1,
+                )
+
+            resumed = connection.execute(
+                "SELECT phase, planning_retry_count, planning_error "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(planner_sessions, [None, "planner-session"])
+            self.assertEqual(resumed["phase"], "WORKING")
+            self.assertEqual(resumed["planning_retry_count"], 0)
+            self.assertIsNone(resumed["planning_error"])
+
     def test_role_boundaries_reject_protected_and_read_only_changes(self):
         scenarios = (
             (
@@ -4474,6 +4579,210 @@ class WorkspaceRecoveryTest(unittest.TestCase):
             state_dir, str(repo), "G-012"
         )
         return repo, state_dir, connection, plan, plan_sha, branch, worktree
+
+    def test_planning_workspace_reservation_survives_post_create_interruption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            state_dir = Path(directory) / "state"
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            real_make_planning_worktree = loop_manager.make_planning_worktree
+
+            def interrupt_after_create(*args, **kwargs):
+                real_make_planning_worktree(*args, **kwargs)
+                raise KeyboardInterrupt("interrupt after planning worktree creation")
+
+            with mock.patch(
+                "loop_manager.validate_repository",
+                return_value=repo,
+            ), mock.patch(
+                "loop_manager.remote_base",
+                return_value="main",
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.make_planning_worktree",
+                side_effect=interrupt_after_create,
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as interrupted_agent:
+                with self.assertRaisesRegex(
+                    KeyboardInterrupt,
+                    "planning worktree creation",
+                ):
+                    loop_manager.run_project(
+                        connection,
+                        state_dir,
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
+                    )
+
+            interrupted = connection.execute(
+                "SELECT phase, worktree, planning_workspace_owned "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(interrupted["phase"], "PLANNING")
+            self.assertEqual(
+                interrupted["planning_workspace_owned"],
+                loop_manager.WORKSPACE_RESERVED,
+            )
+            self.assertTrue(Path(interrupted["worktree"]).is_dir())
+            interrupted_agent.assert_not_called()
+
+            with mock.patch(
+                "loop_manager.validate_repository",
+                return_value=repo,
+            ), mock.patch(
+                "loop_manager.remote_base",
+                return_value="main",
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.run_codex",
+                return_value=loop_manager.CodexResult(
+                    1,
+                    "stop after planning reservation recovery",
+                    "planner-session",
+                ),
+            ) as resumed_agent:
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            resumed = connection.execute(
+                "SELECT phase, planning_error, planning_workspace_owned "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(result, 1)
+            self.assertEqual(resumed["phase"], "PLANNING")
+            self.assertIsNone(resumed["planning_error"])
+            self.assertEqual(
+                resumed["planning_workspace_owned"],
+                loop_manager.WORKSPACE_OWNED,
+            )
+            resumed_agent.assert_called_once()
+            self.assertEqual(resumed_agent.call_args.args[3], "planner")
+
+    def test_execplan_workspace_reservation_survives_post_create_interruption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                repo,
+                state_dir,
+                connection,
+                _plan,
+                _plan_sha,
+                _branch,
+                worktree,
+            ) = self._ready_execplan(directory)
+            real_make_worktree = loop_manager.make_worktree
+
+            def interrupt_after_create(*args, **kwargs):
+                real_make_worktree(*args, **kwargs)
+                raise KeyboardInterrupt("interrupt after ExecPlan worktree creation")
+
+            with mock.patch(
+                "loop_manager.validate_repository",
+                return_value=repo,
+            ), mock.patch(
+                "loop_manager.remote_base",
+                return_value="main",
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.make_worktree",
+                side_effect=interrupt_after_create,
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as interrupted_agent:
+                with self.assertRaisesRegex(
+                    KeyboardInterrupt,
+                    "ExecPlan worktree creation",
+                ):
+                    loop_manager.run_project(
+                        connection,
+                        state_dir,
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
+                    )
+
+            interrupted = connection.execute(
+                "SELECT phase FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            interrupted_plan = connection.execute(
+                "SELECT status, workspace_owned FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-012'",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(interrupted["phase"], "WORKING")
+            self.assertEqual(
+                tuple(interrupted_plan),
+                ("IMPLEMENTING", loop_manager.WORKSPACE_RESERVED),
+            )
+            self.assertTrue(worktree.is_dir())
+            interrupted_agent.assert_not_called()
+
+            with mock.patch(
+                "loop_manager.validate_repository",
+                return_value=repo,
+            ), mock.patch(
+                "loop_manager.remote_base",
+                return_value="main",
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch",
+                return_value=None,
+            ), mock.patch(
+                "loop_manager.run_codex",
+                return_value=loop_manager.CodexResult(
+                    1,
+                    "stop after ExecPlan reservation recovery",
+                    "worker-session",
+                ),
+            ) as resumed_agent:
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            resumed = connection.execute(
+                "SELECT phase, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            resumed_plan = connection.execute(
+                "SELECT status, workspace_owned FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-012'",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(result, 1)
+            self.assertEqual(resumed["phase"], "WORKING")
+            self.assertEqual(
+                resumed["last_error"],
+                "stop after ExecPlan reservation recovery",
+            )
+            self.assertEqual(
+                tuple(resumed_plan),
+                ("IMPLEMENTING", loop_manager.WORKSPACE_OWNED),
+            )
+            resumed_agent.assert_called_once()
+            self.assertEqual(resumed_agent.call_args.args[3], "worker")
 
     def test_existing_catalog_does_not_infer_workspace_ownership(self):
         connection = sqlite3.connect(":memory:")
