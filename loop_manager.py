@@ -72,6 +72,19 @@ CREATE TABLE IF NOT EXISTS projects (
 )
 """
 
+CLEANUP_PENDING_SCHEMA = """
+CREATE TABLE IF NOT EXISTS cleanup_pending (
+    repo TEXT NOT NULL,
+    worktree TEXT NOT NULL,
+    pr_url TEXT NOT NULL,
+    pr_head_oid TEXT,
+    reason TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (repo, worktree),
+    FOREIGN KEY (repo) REFERENCES projects(repo)
+)
+"""
+
 
 @dataclass(frozen=True)
 class CodexResult:
@@ -82,6 +95,12 @@ class CodexResult:
     def __iter__(self):
         # Keep two-value unpacking compatible with callers that do not manage sessions.
         return iter((self.code, self.message))
+
+
+@dataclass(frozen=True)
+class CleanupAssessment:
+    status: str
+    reason: str | None = None
 
 
 def state_directory(value: str | None = None) -> Path:
@@ -138,6 +157,7 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
     connection.row_factory = sqlite3.Row
     if create:
         connection.execute(SCHEMA)
+        connection.execute(CLEANUP_PENDING_SCHEMA)
         connection.commit()
     else:
         try:
@@ -166,6 +186,8 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
             connection.execute(f"ALTER TABLE projects ADD COLUMN {column} {definition}")
     if not migrations.keys() <= columns:
         connection.commit()
+    connection.execute(CLEANUP_PENDING_SCHEMA)
+    connection.commit()
     return connection
 
 
@@ -804,11 +826,12 @@ def verify(worktree: Path) -> tuple[bool, str]:
 
 
 def pr_for_branch(repo: Path, branch: str, url: str | None = None) -> dict[str, object] | None:
+    fields = "url,state,mergedAt,headRefOid"
     if url:
-        result = command(["gh", "pr", "view", url, "--json", "url,state,mergedAt"], cwd=repo)
+        result = command(["gh", "pr", "view", url, "--json", fields], cwd=repo)
         return json.loads(result.stdout)
     result = command(
-        ["gh", "pr", "list", "--head", branch, "--state", "all", "--limit", "1", "--json", "url,state,mergedAt"],
+        ["gh", "pr", "list", "--head", branch, "--state", "all", "--limit", "1", "--json", fields],
         cwd=repo,
     )
     rows = json.loads(result.stdout)
@@ -843,15 +866,128 @@ def changed_files(worktree: Path, since: str | None = None) -> list[str]:
     return sorted(set(unstaged + staged + untracked))
 
 
-def clean_worktree(repo: Path, worktree: Path, base: str) -> bool:
+def assess_cleanup(worktree: Path, pr_head_oid: str | None) -> CleanupAssessment:
+    """Classify a managed worktree without changing it or shared Git state."""
     if not worktree.exists():
-        return True
-    if git(worktree, "status", "--porcelain").stdout.strip():
-        return False
-    if git(worktree, "merge-base", "--is-ancestor", "HEAD", f"origin/{base}", check=False).returncode:
-        return False
-    git(repo, "worktree", "remove", str(worktree))
-    return True
+        return CleanupAssessment("missing")
+    try:
+        status_lines = git(
+            worktree, "status", "--porcelain=v1", "--untracked-files=all"
+        ).stdout.splitlines()
+    except RuntimeError as error:
+        return CleanupAssessment("unverifiable", f"worktree 상태 확인 실패: {error}")
+
+    dirty_kinds: list[str] = []
+    if any(line.startswith("??") for line in status_lines):
+        dirty_kinds.append("untracked 파일")
+    if any(len(line) >= 2 and line[0] not in {" ", "?"} for line in status_lines):
+        dirty_kinds.append("staged 변경")
+    if any(len(line) >= 2 and line[1] not in {" ", "?"} for line in status_lines):
+        dirty_kinds.append("tracked 파일 수정")
+    if dirty_kinds:
+        return CleanupAssessment("dirty", ", ".join(dirty_kinds))
+
+    if not pr_head_oid:
+        return CleanupAssessment("unverifiable", "PR head commit 정보가 없습니다.")
+    if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", pr_head_oid) is None:
+        return CleanupAssessment("unverifiable", "PR head commit OID 형식이 유효하지 않습니다.")
+    try:
+        local_head = git(worktree, "rev-parse", "--verify", "HEAD^{commit}").stdout.strip()
+        head_object = git(
+            worktree, "cat-file", "-e", f"{pr_head_oid}^{{commit}}", check=False
+        )
+        if head_object.returncode:
+            return CleanupAssessment(
+                "unverifiable", f"PR head commit object를 찾을 수 없습니다: {pr_head_oid}"
+            )
+        relation = git(
+            worktree,
+            "merge-base",
+            "--is-ancestor",
+            local_head,
+            pr_head_oid,
+            check=False,
+        )
+    except RuntimeError as error:
+        return CleanupAssessment("unverifiable", f"commit 관계 확인 실패: {error}")
+    if relation.returncode == 0:
+        return CleanupAssessment("safe")
+    if relation.returncode == 1:
+        return CleanupAssessment(
+            "local-only commits", "로컬 HEAD에 PR head에 포함되지 않은 commit이 있습니다."
+        )
+    return CleanupAssessment(
+        "unverifiable", f"commit 관계 확인 실패 (git 종료 코드 {relation.returncode})"
+    )
+
+
+def remove_cleanup_worktree(
+    repo: Path, worktree: Path, assessment: CleanupAssessment
+) -> CleanupAssessment:
+    if assessment.status != "safe":
+        return assessment
+    try:
+        git(repo, "worktree", "remove", str(worktree))
+    except RuntimeError as error:
+        return CleanupAssessment("unverifiable", f"worktree 제거 실패: {error}")
+    return assessment
+
+
+def _ensure_cleanup_pending_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(CLEANUP_PENDING_SCHEMA)
+
+
+def _store_cleanup_pending(
+    connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+    pr_url: str,
+    pr_head_oid: str | None,
+    reason: str,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO cleanup_pending (repo, worktree, pr_url, pr_head_oid, reason)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(repo, worktree) DO UPDATE SET
+            pr_url = excluded.pr_url,
+            pr_head_oid = excluded.pr_head_oid,
+            reason = excluded.reason,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (repo, str(worktree), pr_url, pr_head_oid, reason),
+    )
+
+
+def recheck_cleanup_pending(
+    connection: sqlite3.Connection, repo_path: Path, repo: str
+) -> list[sqlite3.Row]:
+    _ensure_cleanup_pending_schema(connection)
+    pending = connection.execute(
+        "SELECT * FROM cleanup_pending WHERE repo = ? ORDER BY worktree", (repo,)
+    ).fetchall()
+    for item in pending:
+        worktree = Path(item["worktree"])
+        assessment = assess_cleanup(worktree, item["pr_head_oid"])
+        assessment = remove_cleanup_worktree(repo_path, worktree, assessment)
+        if assessment.status in {"safe", "missing"}:
+            connection.execute(
+                "DELETE FROM cleanup_pending WHERE repo = ? AND worktree = ?",
+                (repo, str(worktree)),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE cleanup_pending
+                SET reason = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE repo = ? AND worktree = ?
+                """,
+                (assessment.reason or assessment.status, repo, str(worktree)),
+            )
+    connection.commit()
+    return connection.execute(
+        "SELECT * FROM cleanup_pending WHERE repo = ? ORDER BY worktree", (repo,)
+    ).fetchall()
 
 
 def planning_diagnostics_path(
@@ -934,13 +1070,11 @@ def clear_planning_validation_state(
     )
 
 
-def clear_active(
-    connection: sqlite3.Connection,
-    repo: str,
+def _clear_active_values(
     *,
     processed_sha: str | None = None,
     planning_fingerprint: str | None = None,
-) -> None:
+) -> dict[str, object]:
     values: dict[str, object] = {
         "active_sha": None,
         "phase": None,
@@ -965,7 +1099,59 @@ def clear_active(
         values["processed_sha"] = processed_sha
     if planning_fingerprint is not None:
         values["planning_fingerprint"] = planning_fingerprint
-    update_project(connection, repo, **values)
+    return values
+
+
+def clear_active(
+    connection: sqlite3.Connection,
+    repo: str,
+    *,
+    processed_sha: str | None = None,
+    planning_fingerprint: str | None = None,
+) -> None:
+    update_project(
+        connection,
+        repo,
+        **_clear_active_values(
+            processed_sha=processed_sha,
+            planning_fingerprint=planning_fingerprint,
+        ),
+    )
+
+
+def complete_merged_worktree(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    repo: str,
+    worktree: Path,
+    pr_url: str,
+    pr_head_oid: str | None,
+) -> CleanupAssessment:
+    assessment = assess_cleanup(worktree, pr_head_oid)
+    assessment = remove_cleanup_worktree(repo_path, worktree, assessment)
+    values = _clear_active_values()
+    assignments = ", ".join(f"{name} = ?" for name in values)
+    with connection:
+        _ensure_cleanup_pending_schema(connection)
+        if assessment.status in {"safe", "missing"}:
+            connection.execute(
+                "DELETE FROM cleanup_pending WHERE repo = ? AND worktree = ?",
+                (repo, str(worktree)),
+            )
+        else:
+            _store_cleanup_pending(
+                connection,
+                repo,
+                worktree,
+                pr_url,
+                pr_head_oid,
+                assessment.reason or assessment.status,
+            )
+        connection.execute(
+            f"UPDATE projects SET {assignments} WHERE repo = ?",
+            [*values.values(), repo],
+        )
+    return assessment
 
 
 def planner_prompt(error: str | None) -> str:
@@ -1029,6 +1215,13 @@ def run_project(
     row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
     base = row["base_branch"] if row else requested_base
 
+    cleanup_pending = recheck_cleanup_pending(connection, repo_path, repo)
+    for pending in cleanup_pending:
+        print(
+            f"보존된 worktree: {pending['worktree']} ({pending['reason']})",
+            file=sys.stderr,
+        )
+
     if row and row["branch"]:
         existing_pr = pr_for_branch(repo_path, row["branch"], row["pr_url"])
         if existing_pr:
@@ -1039,13 +1232,24 @@ def run_project(
             if existing_pr["state"] == "MERGED" or existing_pr.get("mergedAt"):
                 git(repo_path, "fetch", "origin")
                 worktree = Path(row["worktree"])
-                if not clean_worktree(repo_path, worktree, base):
-                    # ponytail: 부트스트랩은 안전하게 멈춘다. 후속 구현에서 cleanup_pending 큐로 분리한다.
-                    update_project(connection, repo, last_error="Merge된 worktree에 미커밋 또는 미푸시 변경이 남아 있습니다.")
-                    print(f"보존된 worktree를 확인하세요: {worktree}", file=sys.stderr)
-                    return 1
-                clear_active(connection, repo)
-                print(f"Merge 확인 및 worktree 정리 완료: {existing_pr['url']}")
+                head_value = existing_pr.get("headRefOid")
+                pr_head_oid = str(head_value) if head_value else None
+                assessment = complete_merged_worktree(
+                    connection,
+                    repo_path,
+                    repo,
+                    worktree,
+                    str(existing_pr["url"]),
+                    pr_head_oid,
+                )
+                if assessment.status in {"safe", "missing"}:
+                    print(f"Merge 확인 및 worktree 정리 완료: {existing_pr['url']}")
+                else:
+                    print(
+                        f"Merge 확인 완료; worktree 보존: {worktree} "
+                        f"({assessment.reason or assessment.status})",
+                        file=sys.stderr,
+                    )
                 return 0
             update_project(connection, repo, phase="BLOCKED", last_error="PR이 Merge 없이 닫혔습니다.")
             print(f"닫힌 PR을 다시 열어야 합니다: {existing_pr['url']}", file=sys.stderr)
