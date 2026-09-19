@@ -1119,43 +1119,39 @@ def run_project(
             git(planning_worktree, "reset", "--mixed", str(row["active_sha"]))
             head = git(planning_worktree, "rev-parse", "HEAD").stdout.strip()
             dirty_files = changed_files(planning_worktree)
-        if (
+        planner_result_in_flight = bool(
             row["planning_result_pending_validation"]
             and not row["planning_result_completed"]
-        ):
-            # A Planner CLI interruption has not reached a validation boundary,
-            # even when the previous invalid result remains in the worktree.
-            # Resume its saved session before considering that old diff again.
-            update_project(
-                connection,
-                repo,
-                planning_result_pending_validation=0,
-                planning_result_completed=0,
+        )
+        if planner_result_in_flight or (
+            head == row["active_sha"]
+            and (
+                not dirty_files
+                or row["planning_validation_error"]
+                or row["last_error"]
             )
-            row = connection.execute(
-                "SELECT * FROM projects WHERE repo = ?", (repo,)
-            ).fetchone()
-
-        if head == row["active_sha"] and (
-            not dirty_files or row["planning_validation_error"] or row["last_error"]
-        ) and not row["planning_result_pending_validation"] and not (
-            row["planning_validation_error"]
-            and row["planning_retry_count"] >= MAX_PLANNER_VALIDATION_RETRIES
+            and not row["planning_result_pending_validation"]
+            and not (
+                row["planning_validation_error"]
+                and row["planning_retry_count"] >= MAX_PLANNER_VALIDATION_RETRIES
+            )
         ):
             # A Planner can modify the worktree before its CLI invocation
             # returns. Persist this boundary first so an interrupted process
-            # validates that exact output on restart instead of asking the
-            # same session for another correction.
-            update_project(
-                connection,
-                repo,
-                last_error=None,
-                planning_result_pending_validation=1,
-                planning_result_completed=0,
-            )
-            row = connection.execute(
-                "SELECT * FROM projects WHERE repo = ?", (repo,)
-            ).fetchone()
+            # resumes that same session before validating its partial output.
+            # A completed result is the only pending result that may be
+            # validated after an interruption.
+            if not planner_result_in_flight:
+                update_project(
+                    connection,
+                    repo,
+                    last_error=None,
+                    planning_result_pending_validation=1,
+                    planning_result_completed=0,
+                )
+                row = connection.execute(
+                    "SELECT * FROM projects WHERE repo = ?", (repo,)
+                ).fetchone()
             result = run_codex(
                 planning_worktree,
                 state_dir,

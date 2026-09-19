@@ -686,6 +686,82 @@ class LoopManagerTest(unittest.TestCase):
             self.assertIsNone(resumed["planning_validation_error"])
             self.assertIsNone(resumed["planning_error"])
 
+    def test_interrupted_first_planner_with_result_resumes_before_validation(self):
+        planner_sessions = []
+        planner_calls = 0
+
+        def agent(worktree, _state, _config, role_name, _prompt, **kwargs):
+            nonlocal planner_calls
+            if role_name != "planner":
+                return loop_manager.CodexResult(1, "stop after planning")
+            planner_calls += 1
+            planner_sessions.append(kwargs["session_id"])
+            (worktree / "docs/plans").mkdir(parents=True, exist_ok=True)
+            write_execplan(worktree, "G-001", "Generated")
+            if planner_calls == 1:
+                # The CLI starts a session and changes the worktree, then the
+                # process dies before it can report a completed result.
+                loop_manager.update_project(
+                    connection,
+                    str(repo),
+                    planner_session_id="planner-session",
+                )
+                raise RuntimeError("process interrupted after Planner edit")
+            return loop_manager.CodexResult(0, "", "planner-session")
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            state_dir = Path(directory) / "state"
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch("loop_manager.run_codex", side_effect=agent):
+                with self.assertRaisesRegex(RuntimeError, "process interrupted"):
+                    loop_manager.run_project(
+                        connection,
+                        state_dir,
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
+                    )
+
+                interrupted = connection.execute(
+                    "SELECT * FROM projects WHERE repo = ?", (str(repo),)
+                ).fetchone()
+                self.assertEqual(interrupted["planning_result_pending_validation"], 1)
+                self.assertEqual(interrupted["planning_result_completed"], 0)
+                self.assertEqual(interrupted["planner_session_id"], "planner-session")
+                self.assertTrue(
+                    (Path(interrupted["worktree"]) / "docs/plans/[G-001] Generated.md").is_file()
+                )
+
+                self.assertEqual(
+                    loop_manager.run_project(
+                        connection,
+                        state_dir,
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
+                    ),
+                    1,
+                )
+
+            resumed = connection.execute(
+                "SELECT * FROM projects WHERE repo = ?", (str(repo),)
+            ).fetchone()
+            self.assertEqual(planner_sessions, [None, "planner-session"])
+            self.assertEqual(resumed["phase"], "WORKING")
+
+
 
     def test_interrupted_planner_correction_before_edit_resumes_with_invalid_diff(self):
         planner_calls = 0
