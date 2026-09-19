@@ -5369,6 +5369,15 @@ def run_project(
                 )
                 operation_print(output, file=sys.stderr)
                 return 1
+            if git(worktree, "status", "--porcelain").stdout.strip():
+                git(worktree, "add", "-A")
+                plan = validate_active_execplan_metadata(
+                    repo_path,
+                    worktree,
+                    str(row["plan_path"]),
+                    catalog_plan,
+                )
+                git(worktree, "commit", "-m", worker_publication.commit_title)
             update_project(connection, repo, active_sha=latest_sha, verify_result=output)
         else:
             update_project(connection, repo, verify_result=output)

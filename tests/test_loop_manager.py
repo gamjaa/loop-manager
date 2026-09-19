@@ -5115,6 +5115,132 @@ class AgentScopeValidatorTest(unittest.TestCase):
             verify.assert_called_once_with(worktree)
             agent.assert_not_called()
 
+    def test_rebase_verify_allowed_change_is_committed_before_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, plan_path = self._repository_with_plan(directory)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            branch, worktree = loop_manager.expected_execplan_workspace(
+                state_dir, str(repo), "G-001"
+            )
+            loop_manager.make_worktree(repo, worktree, branch, "main")
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                """
+                INSERT INTO projects (
+                    repo, base_branch, active_sha, plan_sha, phase, branch,
+                    worktree, plan_path
+                ) VALUES (?, 'main', ?, ?, 'WORKING', ?, ?, ?)
+                """,
+                (
+                    str(repo),
+                    plan_sha,
+                    plan_sha,
+                    branch,
+                    str(worktree),
+                    plan_path,
+                ),
+            )
+            connection.commit()
+
+            (repo / "README.md").write_text(
+                "# base advanced\n",
+                encoding="utf-8",
+            )
+            commit_and_push(repo, "Advance base before worker publication")
+            roles = []
+            verify_calls = []
+
+            def agent(agent_worktree, _state, _config, role_name, _prompt, **_kwargs):
+                roles.append(role_name)
+                if role_name == "worker":
+                    (agent_worktree / "src/app.py").write_text(
+                        "VALUE = 2\n",
+                        encoding="utf-8",
+                    )
+                    return loop_manager.CodexResult(
+                        0,
+                        worker_result("Persist rebased verify output"),
+                        "worker-session",
+                    )
+                self.assertEqual(role_name, "reviewer")
+                self.assertEqual(
+                    git_command(agent_worktree, "status", "--porcelain"),
+                    "",
+                )
+                self.assertEqual(
+                    git_command(
+                        agent_worktree,
+                        "show",
+                        "HEAD:verify-output.txt",
+                    ),
+                    "created after rebase",
+                )
+                return 1, "VERDICT: FAIL\nstop after publication check"
+
+            def verify_after_rebase(agent_worktree):
+                verify_calls.append(agent_worktree)
+                if len(verify_calls) == 2:
+                    (agent_worktree / "verify-output.txt").write_text(
+                        "created after rebase\n",
+                        encoding="utf-8",
+                    )
+                return True, f"verify pass {len(verify_calls)}"
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.run_codex", side_effect=agent
+            ), mock.patch(
+                "loop_manager.verify", side_effect=verify_after_rebase
+            ):
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            published_paths = git_command(
+                worktree,
+                "diff",
+                "--name-only",
+                "origin/main...HEAD",
+            ).splitlines()
+
+            self.assertEqual(result, 1)
+            self.assertEqual(roles, ["worker", "reviewer"])
+            self.assertEqual(len(verify_calls), 2)
+            self.assertEqual(project["phase"], "WORKING")
+            self.assertIn("Review 실패", project["last_error"])
+            self.assertIn("src/app.py", published_paths)
+            self.assertIn("verify-output.txt", published_paths)
+            self.assertEqual(
+                git_command(worktree, "status", "--porcelain"),
+                "",
+            )
+            self.assertEqual(
+                git_command(worktree, "log", "-1", "--pretty=%s"),
+                "Persist rebased verify output",
+            )
+
+
 
 class WorkspaceRecoveryTest(unittest.TestCase):
     def _workspace(
