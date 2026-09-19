@@ -5,6 +5,8 @@
 - `sources`에는 이 계획의 근거가 된 PRODUCT 또는 Requirement 경로를 기록한다.
 - `depends_on`에는 이 계획보다 먼저 PR이 Merge돼야 하는 ExecPlan ID를 기록하며, 선행 작업이 없으면 빈 목록으로 둔다.
 - Planner는 작업 범위와 구현 난이도로 `complexity`를, 실패 가능성과 변경 영향으로 `risk`를 작성한다.
+- Planner는 `priority`를 `critical`, `high`, `normal`, `low` 중 하나로 기록한다. 안전한 무인 실행을 막는 작업부터 핵심 자동화, 일반 필수 작업, 선택적 편의 순으로 분류한다.
+- 새 ExecPlan에는 `priority`가 필수이며, 이 형식 도입 전에 작성돼 값이 없는 기존 ExecPlan은 `normal`로 해석한다.
 - Loop Manager는 frontmatter를 코드로 파싱하고 검증한 뒤 실행 상태를 SQLite에 `READY`로 등록한다.
 - 실행 상태는 파일에 기록하지 않는다. 같은 프로젝트를 직렬로 실행하더라도 모든 `depends_on`이 SQLite에서 `MERGED`가 되기 전에는 Worker를 시작하지 않는다.
 - Loop Manager는 존재하지 않는 ID, 자기 자신에 대한 의존성과 순환 의존성을 코드로 거부한다.
@@ -23,6 +25,7 @@ depends_on:
   - G-001
 complexity: low|medium|high
 risk: low|medium|high|critical
+priority: critical|high|normal|low
 ---
 
 ## Purpose
