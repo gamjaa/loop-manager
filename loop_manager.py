@@ -7,6 +7,7 @@ import argparse
 from collections.abc import Callable
 import configparser
 import contextlib
+import errno
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
@@ -159,6 +160,14 @@ def state_directory(value: str | None = None) -> Path:
     return parent / "loop-manager"
 
 
+def is_lock_contention(error: OSError) -> bool:
+    """Return whether a non-blocking lock failure means another process holds it."""
+
+    return error.errno in {errno.EACCES, errno.EAGAIN} or (
+        os.name == "nt" and error.winerror in {32, 33}
+    )
+
+
 @contextlib.contextmanager
 def process_lock(state_dir: Path):
     # ponytail: 부트스트랩은 전역 직렬화한다. 실제 병렬 처리 도입 시 프로젝트별 잠금으로 교체한다.
@@ -181,7 +190,9 @@ def process_lock(state_dir: Path):
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as error:
         handle.close()
-        raise ProcessLockBusyError("다른 Loop Manager 프로세스가 실행 중입니다.") from error
+        if is_lock_contention(error):
+            raise ProcessLockBusyError("다른 Loop Manager 프로세스가 실행 중입니다.") from error
+        raise
     try:
         yield
     finally:

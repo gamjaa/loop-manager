@@ -2675,6 +2675,18 @@ class TimestampedExecutionProgressLogsTest(unittest.TestCase):
             self.assertEqual(loop_manager.main(), 1)
         self.assertTrue(output.called)
 
+    def test_process_lock_only_classifies_contention_errnos_as_busy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch("fcntl.flock", side_effect=OSError(loop_manager.errno.EAGAIN, "busy")):
+                with self.assertRaises(loop_manager.ProcessLockBusyError):
+                    with loop_manager.process_lock(Path(directory)):
+                        pass
+            with mock.patch("fcntl.flock", side_effect=OSError(loop_manager.errno.ENOLCK, "lock system failure")):
+                with self.assertRaises(OSError) as raised:
+                    with loop_manager.process_lock(Path(directory)):
+                        pass
+        self.assertEqual(raised.exception.errno, loop_manager.errno.ENOLCK)
+
     def test_launchers_have_no_timestamp_banner_and_scheduler_option_is_documented(self):
         self.assertNotIn("Get-Date -Format", (loop_manager.ROOT / "run.ps1").read_text(encoding="utf-8"))
         self.assertNotIn("date ", (loop_manager.ROOT / "run.sh").read_text(encoding="utf-8"))
