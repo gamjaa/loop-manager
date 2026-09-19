@@ -2039,6 +2039,9 @@ class WorkerPublicationTest(unittest.TestCase):
             worker_result("Implement G-008 worker metadata", "Summary", "test: PASS"),
             worker_result("Update.", "Summary", "test: PASS"),
             worker_result("Implement changes", "Summary", "test: PASS"),
+            worker_result("Implement code changes", "Summary", "test: PASS"),
+            worker_result("Update implementation", "Summary", "test: PASS"),
+            worker_result("Implement the changes", "Summary", "test: PASS"),
             worker_result("Fix!", "Summary", "test: PASS"),
             worker_result("Descriptive Worker Commits.", "Summary", "test: PASS"),
         )

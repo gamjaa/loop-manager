@@ -1288,9 +1288,10 @@ def parse_worker_result(message: str, plan: dict[str, object]) -> WorkerPublicat
     plan_id = str(plan["id"])
     plan_title = str(plan["title"])
     normalized = " ".join(title.split()).casefold().rstrip(" .,:;!?…")
-    generic_titles = {
-        "implement", "implementation", "implement changes", "changes", "change", "code changes",
-        "update", "updates", "update code", "fix", "fixes", "변경", "변경 사항", "구현",
+    generic_title_words = {
+        "implement", "implementation", "implementations", "change", "changes", "code",
+        "update", "updates", "fix", "fixes", "the", "work", "feature", "features",
+        "변경", "사항", "구현",
     }
     prohibited = {
         " ".join(plan_title.split()).casefold().rstrip(" .,:;!?…"),
@@ -1299,7 +1300,7 @@ def parse_worker_result(message: str, plan: dict[str, object]) -> WorkerPublicat
         f"implement {plan_title}".casefold(),
     }
     if (
-        normalized in generic_titles
+        (bool(normalized.split()) and set(normalized.split()) <= generic_title_words)
         or normalized in prohibited
         or re.match(rf"implement\s+(?:execplan\s+)?{re.escape(plan_id.casefold())}\b", normalized)
     ):
