@@ -11,6 +11,7 @@ token =
 chat_id =
 
 [codex.models]
+frontier = gpt-6-astra
 strong = gpt-5.6-sol
 balanced = gpt-5.6-terra
 fast = gpt-5.6-luna
@@ -27,6 +28,7 @@ level4 = balanced,high
 level5 = strong,medium
 level6 = strong,high
 level7 = strong,xhigh
+level8 = frontier,low
 
 [claude.models]
 strong = claude-opus-5
@@ -45,3 +47,4 @@ level4 = balanced,high
 level5 = strong,medium
 level6 = strong,high
 level7 = strong,xhigh
+level8 = strong,max
