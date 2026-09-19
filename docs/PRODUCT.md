@@ -258,7 +258,8 @@ BLOCKED → PR_OPEN (같은 PR을 사용자가 다시 열음)
 - `docs/requirements/` 바로 아래의 모든 `*.md`를 Planner 입력으로 사용한다
 - `docs/REQUIREMENT.template.md`와 `docs/requirements/archive/`는 Planner 입력에서 제외한다
 - ExecPlan의 `sources`에는 근거가 된 PRODUCT 또는 Requirement 경로가 있어야 한다
-- 계획 입력이 변경되면 Planner는 실행 중인 작업이 없는 다음 선택 시점에 READY ExecPlan의 존재와 관계없이 전체 카탈로그를 확인하고, 현재 식별 가능한 미충족 작업을 한 번에 모두 계획한다
+- 계획 입력이 변경되면 Planner는 실행 중인 작업이 없는 다음 선택 시점에 READY ExecPlan의 존재와 관계없이 비종료 ExecPlan compact catalog를 확인하고, 현재 코드·테스트와 활성 제품 입력에서 식별 가능한 미충족 작업을 한 번에 모두 계획한다
+- MERGED ExecPlan은 Planner 입력에서 제외하며 프로그램만 ID 고유성, 의존성 충족과 감사 이력을 위해 관리한다
 - ExecPlan의 `depends_on`은 선행 ExecPlan ID 목록이며, 모든 선행 상태가 MERGED여야 Worker를 시작할 수 있다
 - Worker는 장기 제품 규칙이 바뀌는 경우에만 코드와 같은 PR에서 `PRODUCT.md`를 갱신한다
 

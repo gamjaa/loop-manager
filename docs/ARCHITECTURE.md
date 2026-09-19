@@ -125,7 +125,7 @@ Loop Manager는 등록 프로젝트 기본 worktree의 파일, index와 HEAD를 
 ExecPlan 하나의 실행 흐름은 다음과 같다.
 
 1. 실행 중인 작업이 없고 계획 입력이 변경됐으면 READY ExecPlan의 존재와 관계없이 `<state-dir>/worktrees/<project-id>/planning/<input-fingerprint>/`에 `origin/<base-branch>` 기준의 detached planning worktree를 만든다
-2. Planner가 기존 ExecPlan 카탈로그와 현재 입력을 대조하고 식별 가능한 미충족 작업 전체를 독립적인 ExecPlan으로 나누어 priority와 `depends_on`을 포함해 일괄 작성한다
+2. 프로그램이 비종료 ExecPlan의 compact catalog를 만들고, Planner가 이를 현재 입력 및 관련 코드·테스트와 대조해 식별 가능한 미충족 작업 전체를 독립적인 ExecPlan으로 나누어 priority와 `depends_on`을 포함해 일괄 작성한다
 3. 프로그램이 Planner의 변경 범위, ExecPlan 메타데이터와 의존성 그래프를 코드로 검증한다
 4. 검증에 실패하면 오류를 같은 Planner 세션에 전달하고 최대 3회까지 수정과 재검증을 수행한다
 5. 계속 실패하면 원인과 계획 입력 지문을 프로젝트의 `planning_error`에 저장하고 planning worktree와 세션을 보존한 뒤 처리를 중단한다
@@ -170,7 +170,9 @@ ExecPlan 파일은 구현 PR에 처음 포함하지 않는다. Planner 단계에
 
 - Planner, Worker와 Reviewer prompt는 Loop Manager에 내장한다
 - 프로젝트별 prompt 재정의는 지원하지 않는다
-- Planner는 PRODUCT, 활성 Requirement, ARCHITECTURE, 현재 코드와 완료되거나 대기 중인 ExecPlan을 읽고 현재 식별 가능한 미충족 작업 전체를 한 계획 주기에 작성한다
+- 프로그램은 전체 ExecPlan을 코드로 파싱하되 Planner에게는 비종료 계획의 ID, 제목, 상태, sources, depends_on과 priority만 compact catalog로 전달한다
+- Planner는 PRODUCT, 활성 Requirement, ARCHITECTURE, 관련 코드·테스트와 비종료 ExecPlan compact catalog를 읽고 현재 식별 가능한 미충족 작업 전체를 한 계획 주기에 작성한다
+- Planner는 MERGED ExecPlan 메타데이터와 본문을 기본 입력으로 받거나 읽지 않는다. 프로그램만 ID 고유성, 번호 할당, 의존성 충족과 감사 이력을 위해 이를 유지한다
 - Planner는 안전한 무인 실행 차단과 반복적인 사용자 복구 제거를 최우선으로 priority를 정하고, 정상 경로 자동화, 그 밖의 Current Goal, 선택적 편의와 최적화 순으로 계획한다
 - Planner는 `docs/plans/*.md`만 생성하거나 수정할 수 있으며 프로그램이 실행 전후 diff로 범위를 검증한다
 - Worker는 ExecPlan을 구현하고 관련 unit test와 전체 검증 스크립트를 작성하거나 갱신한다. 장기 제품 규칙이 바뀔 때만 PRODUCT를, 진행 기록이 필요할 때만 선택된 ExecPlan을 수정할 수 있으며 범위 밖 아이디어는 FUTURE_IDEAS에 기록할 수 있다
