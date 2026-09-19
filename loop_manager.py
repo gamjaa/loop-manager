@@ -1021,9 +1021,21 @@ def run_project(
             return 1
 
     base = remote_base(repo_path, requested_base or (row["base_branch"] if row else None))
-    ensure_safe_base_worktree(repo_path, base)
     base_sha = git(repo_path, "rev-parse", f"origin/{base}").stdout.strip()
     current_fingerprint = planning_input_fingerprint(repo_path, base)
+
+    # A fixed planning error must remain reportable even when the user's base
+    # worktree later becomes unsafe. The fingerprint reads origin directly,
+    # so this check neither reads nor alters the user's local changes.
+    if row and row["planning_error"] and row["planning_error_fingerprint"] == current_fingerprint:
+        print(
+            f"계획 오류가 해결되지 않았습니다: {row['planning_error']}\n"
+            f"보존된 planning worktree: {row['worktree']}",
+            file=sys.stderr,
+        )
+        return 1
+
+    ensure_safe_base_worktree(repo_path, base)
 
     if not row:
         connection.execute("INSERT INTO projects (repo, base_branch) VALUES (?, ?)", (repo, base))
@@ -1034,13 +1046,6 @@ def run_project(
         row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
 
     if row["planning_error"]:
-        if row["planning_error_fingerprint"] == current_fingerprint:
-            print(
-                f"계획 오류가 해결되지 않았습니다: {row['planning_error']}\n"
-                f"보존된 planning worktree: {row['worktree']}",
-                file=sys.stderr,
-            )
-            return 1
         preserve_planning_diagnostics(state_dir, repo, row)
         stale_worktree = Path(row["worktree"]) if row["worktree"] else None
         if stale_worktree and stale_worktree.exists():

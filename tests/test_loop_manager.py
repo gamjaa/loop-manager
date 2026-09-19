@@ -1,8 +1,10 @@
 import json
+import io
 import sqlite3
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 
@@ -899,8 +901,6 @@ class LoopManagerTest(unittest.TestCase):
             ), mock.patch(
                 "loop_manager.remote_base", return_value="main"
             ), mock.patch(
-                "loop_manager.ensure_safe_base_worktree"
-            ), mock.patch(
                 "loop_manager.run_codex", side_effect=invalid_planner
             ) as planner:
                 for _attempt in range(4):
@@ -975,6 +975,46 @@ class LoopManagerTest(unittest.TestCase):
             self.assertIn(blocked["planning_error"], diagnostic_text)
             self.assertIn("unexpected.txt", diagnostic_text)
             self.assertIn("+invalid 4", diagnostic_text)
+
+    def test_planning_error_gate_precedes_dirty_base_worktree_check(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            state_dir = Path(directory) / "state"
+            preserved_worktree = state_dir / "preserved-planning-worktree"
+            preserved_worktree.mkdir(parents=True)
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            error = "Planner는 docs/plans의 ExecPlan 하나만 변경해야 합니다."
+            fingerprint = loop_manager.planning_input_fingerprint(repo, "main")
+            connection.execute(
+                """
+                INSERT INTO projects (
+                    repo, base_branch, planning_error, planning_error_fingerprint,
+                    phase, worktree
+                ) VALUES (?, 'main', ?, ?, 'PLANNING', ?)
+                """,
+                (str(repo), error, fingerprint, str(preserved_worktree)),
+            )
+            connection.commit()
+            (repo / "local-uncommitted-change.txt").write_text("dirty\n", encoding="utf-8")
+            stderr = io.StringIO()
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch("loop_manager.run_codex") as planner, redirect_stderr(stderr):
+                self.assertEqual(
+                    loop_manager.run_project(
+                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                    ),
+                    1,
+                )
+
+            self.assertIn(error, stderr.getvalue())
+            self.assertIn(str(preserved_worktree), stderr.getvalue())
+            planner.assert_not_called()
 
     def test_changed_remote_input_restarts_failed_planning_from_latest_origin(self):
         seen_source_contents = []
