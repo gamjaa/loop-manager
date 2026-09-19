@@ -1932,6 +1932,7 @@ risk: medium
             repo, state_dir, connection = self._make_active_worker_project(directory)
             sessions = []
             prompts = []
+            logs = []
 
             def worker(_worktree, _state, _config, role_name, prompt, **kwargs):
                 self.assertEqual(role_name, "worker")
@@ -1945,7 +1946,7 @@ risk: medium
                 "loop_manager.pr_for_branch", return_value=None
             ), mock.patch("loop_manager.run_codex", side_effect=worker), mock.patch(
                 "loop_manager.verify", return_value=(False, "verify failed")
-            ) as verify:
+            ) as verify, mock.patch("loop_manager.operation_log", side_effect=lambda message, **kwargs: logs.append((message, kwargs))):
                 self.assertEqual(
                     loop_manager.run_project(
                         connection, state_dir, str(repo), Path("unused.ini"), "main", False
@@ -1971,11 +1972,25 @@ risk: medium
 
             self.assertEqual(sessions, [None, "worker-session"])
             self.assertIn("전체 검증 실패:\nverify failed", prompts[1])
+            self.assertEqual(
+                logs,
+                [
+                    ("Worker 시작: G-001 Worker Boundary", {}),
+                    ("전체 verify 시작: G-001 Worker Boundary", {}),
+                    ("Worker 반환: G-001 Worker Boundary (전체 verify 실패)", {"error": True}),
+                    ("verify failed", {"error": True}),
+                    ("Worker 시작: G-001 Worker Boundary", {}),
+                    ("전체 verify 시작: G-001 Worker Boundary", {}),
+                    ("Worker 반환: G-001 Worker Boundary (전체 verify 실패)", {"error": True}),
+                    ("verify failed", {"error": True}),
+                ],
+            )
 
     def test_verify_success_passes_worker_and_verify_results_to_reviewer(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, state_dir, connection = self._make_active_worker_project(directory)
             calls = []
+            logs = []
 
             def agent(worktree, _state, _config, role_name, prompt, **kwargs):
                 calls.append((role_name, prompt, kwargs))
@@ -1991,7 +2006,7 @@ risk: medium
                 "loop_manager.pr_for_branch", side_effect=[None, {"url": "https://example.test/pr/1"}]
             ), mock.patch("loop_manager.run_codex", side_effect=agent), mock.patch(
                 "loop_manager.verify", return_value=(True, "verify: PASS")
-            ) as verify:
+            ) as verify, mock.patch("loop_manager.operation_log", side_effect=lambda message, **kwargs: logs.append((message, kwargs))):
                 self.assertEqual(
                     loop_manager.run_project(
                         connection, state_dir, str(repo), Path("unused.ini"), "main", False
@@ -2000,6 +2015,7 @@ risk: medium
                 )
                 verify.assert_called_once()
 
+            self.assertEqual(logs[:3], [("Worker 시작: G-001 Worker Boundary", {}), ("전체 verify 시작: G-001 Worker Boundary", {}), ("Reviewer 시작: G-001 Worker Boundary", {})])
             self.assertEqual(
                 git_command(repo, "log", "-1", "--pretty=%s"),
                 "Persist worker change",
@@ -2210,6 +2226,7 @@ class WorkerPublicationTest(unittest.TestCase):
             versions = iter((2, 3, 4))
             review_messages = iter(("VERDICT: FAIL", "VERDICT: PASS"))
             reviewer_prompts = []
+            logs = []
 
             def agent(worktree, _state, _config, role_name, prompt, **_kwargs):
                 if role_name == "worker":
@@ -2240,7 +2257,7 @@ class WorkerPublicationTest(unittest.TestCase):
             ), mock.patch("loop_manager.run_codex", side_effect=agent), mock.patch(
                 "loop_manager.verify",
                 side_effect=[(False, "verify failed"), (True, "verify: PASS"), (True, "verify: PASS")],
-            ), mock.patch("loop_manager.command", side_effect=command_stub):
+            ), mock.patch("loop_manager.command", side_effect=command_stub), mock.patch("loop_manager.operation_log", side_effect=lambda message, **kwargs: logs.append((message, kwargs))):
                 for expected in (1, 1, 0):
                     self.assertEqual(
                         loop_manager.run_project(
@@ -2283,6 +2300,8 @@ class WorkerPublicationTest(unittest.TestCase):
         pr_title = gh_commands[0][gh_commands[0].index("--title") + 1]
         self.assertEqual(pr_title, "Implement G-001: Worker Boundary")
         self.assertNotEqual(pr_title, "Publish reviewed context")
+        self.assertIn(("Reviewer 시작: G-001 Worker Boundary", {}), logs)
+        self.assertIn(("Worker 반환: G-001 Worker Boundary (Review 실패)", {"error": True}), logs)
 
 
     def test_invalid_worker_result_resumes_same_session_without_verify(self):
