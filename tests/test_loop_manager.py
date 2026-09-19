@@ -5284,6 +5284,265 @@ class WorkspaceRecoveryTest(unittest.TestCase):
         )
         return repo, state_dir, connection, plan, plan_sha, branch, worktree
 
+    def test_execplan_reservation_rejects_branch_inserted_before_create(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                repo,
+                state_dir,
+                connection,
+                _plan,
+                plan_sha,
+                branch,
+                worktree,
+            ) = self._ready_execplan(directory)
+            real_git = loop_manager.git
+
+            def interrupt_before_worktree_add(target, *arguments, **kwargs):
+                if arguments[:3] == ("worktree", "add", "-b"):
+                    raise KeyboardInterrupt(
+                        "interrupt before ExecPlan worktree creation"
+                    )
+                return real_git(target, *arguments, **kwargs)
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.git", side_effect=interrupt_before_worktree_add
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as interrupted_agent:
+                with self.assertRaisesRegex(
+                    KeyboardInterrupt,
+                    "before ExecPlan worktree creation",
+                ):
+                    loop_manager.run_project(
+                        connection,
+                        state_dir,
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
+                    )
+
+            reserved = connection.execute(
+                "SELECT workspace_owned FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-012'",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(
+                reserved["workspace_owned"],
+                loop_manager.WORKSPACE_RESERVED,
+            )
+            self.assertFalse(worktree.exists())
+            self.assertEqual(
+                loop_manager.git(
+                    repo,
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    f"refs/heads/{branch}",
+                    check=False,
+                ).returncode,
+                1,
+            )
+            interrupted_agent.assert_not_called()
+
+            git_command(
+                repo,
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                str(worktree),
+                "origin/main",
+            )
+            (worktree / "external.txt").write_text(
+                "not owned by Loop Manager\n",
+                encoding="utf-8",
+            )
+            git_command(worktree, "add", "external.txt")
+            git_command(worktree, "commit", "-m", "Create external branch state")
+            external_head = git_command(worktree, "rev-parse", "HEAD")
+            git_command(repo, "worktree", "remove", str(worktree))
+            self.assertFalse(worktree.exists())
+            self.assertNotEqual(external_head, plan_sha)
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as resumed_agent:
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            blocked = connection.execute(
+                "SELECT status, workspace_owned FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-012'",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(result, 1)
+            self.assertEqual(project["phase"], "BLOCKED")
+            self.assertIn(
+                "예약 ExecPlan branch가 저장된 기준 commit과 다릅니다",
+                project["last_error"],
+            )
+            self.assertEqual(
+                tuple(blocked),
+                ("BLOCKED", loop_manager.WORKSPACE_RESERVED),
+            )
+            self.assertFalse(worktree.exists())
+            self.assertEqual(
+                git_command(repo, "rev-parse", f"refs/heads/{branch}"),
+                external_head,
+            )
+            self.assertEqual(
+                git_command(repo, "show", f"{branch}:external.txt"),
+                "not owned by Loop Manager",
+            )
+            resumed_agent.assert_not_called()
+
+    def test_planning_reservation_rejects_path_inserted_before_create(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            state_dir = Path(directory) / "state"
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            real_git = loop_manager.git
+
+            def interrupt_before_worktree_add(target, *arguments, **kwargs):
+                if arguments[:3] == ("worktree", "add", "--detach"):
+                    raise KeyboardInterrupt(
+                        "interrupt before planning worktree creation"
+                    )
+                return real_git(target, *arguments, **kwargs)
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.git", side_effect=interrupt_before_worktree_add
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as interrupted_agent:
+                with self.assertRaisesRegex(
+                    KeyboardInterrupt,
+                    "before planning worktree creation",
+                ):
+                    loop_manager.run_project(
+                        connection,
+                        state_dir,
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
+                    )
+
+            reserved = connection.execute(
+                "SELECT active_sha, phase, worktree, planning_workspace_owned "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            planning_worktree = Path(reserved["worktree"])
+            self.assertEqual(reserved["phase"], "PLANNING")
+            self.assertEqual(
+                reserved["planning_workspace_owned"],
+                loop_manager.WORKSPACE_RESERVED,
+            )
+            self.assertFalse(planning_worktree.exists())
+            interrupted_agent.assert_not_called()
+
+            git_command(
+                repo,
+                "worktree",
+                "add",
+                "--detach",
+                str(planning_worktree),
+                reserved["active_sha"],
+            )
+            (planning_worktree / "external.txt").write_text(
+                "not owned by Loop Manager\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as resumed_agent:
+                first_result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+                second_result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            preserved = connection.execute(
+                "SELECT phase, planning_error, planning_workspace_owned "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual((first_result, second_result), (1, 1))
+            self.assertEqual(preserved["phase"], "PLANNING")
+            self.assertIn(
+                "planning workspace 소유권 검증 실패",
+                preserved["planning_error"],
+            )
+            self.assertIn(
+                "예약 workspace가 저장된 생성 기준과 다릅니다",
+                preserved["planning_error"],
+            )
+            self.assertEqual(
+                preserved["planning_workspace_owned"],
+                loop_manager.WORKSPACE_RESERVED,
+            )
+            self.assertTrue(planning_worktree.is_dir())
+            self.assertEqual(
+                (planning_worktree / "external.txt").read_text(
+                    encoding="utf-8"
+                ),
+                "not owned by Loop Manager\n",
+            )
+            resumed_agent.assert_not_called()
+
+
     def test_planning_workspace_reservation_survives_post_create_interruption(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = make_remote_repository(directory)

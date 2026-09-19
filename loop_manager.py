@@ -1783,6 +1783,38 @@ def validate_managed_worktree(
             f"(expected refs/heads/{branch}, actual {rendered})"
         )
 
+def validate_reserved_worktree(
+    repo: Path,
+    worktree: Path,
+    branch: str | None,
+    expected_head: str,
+) -> None:
+    """Prove that a reserved path is the clean worktree Manager intended."""
+
+    if not expected_head:
+        raise WorkspaceOwnershipError(
+            "예약 workspace의 기준 commit SHA가 저장되지 않았습니다."
+        )
+    validate_managed_worktree(repo, worktree, branch)
+    snapshot = capture_git_snapshot(worktree)
+    violations: list[str] = []
+    if snapshot.head != expected_head:
+        violations.append(
+            f"HEAD {snapshot.head} (expected {expected_head})"
+        )
+    if snapshot.dirty:
+        paths = ", ".join(sorted(snapshot.dirty)[:8])
+        violations.append(f"변경 파일 {paths}")
+    if snapshot.operations:
+        operations = ", ".join(sorted(snapshot.operations))
+        violations.append(f"Git operation {operations}")
+    if violations:
+        raise WorkspaceOwnershipError(
+            "예약 workspace가 저장된 생성 기준과 다릅니다: "
+            + "; ".join(violations)
+        )
+
+
 
 def make_worktree(
     repo: Path,
@@ -1795,10 +1827,15 @@ def make_worktree(
     allow_rebase: bool = False,
     allow_create_branch: bool = True,
     ownership_reserved: bool = False,
+    expected_head: str | None = None,
     before_create: Callable[[], None] | None = None,
 ) -> str:
     """Create, recover, or validate one owned ExecPlan worktree."""
 
+    if ownership_reserved and not expected_head:
+        raise WorkspaceOwnershipError(
+            "예약 ExecPlan workspace의 기준 commit SHA가 없습니다."
+        )
     if worktree.exists() and not worktree.is_dir():
         raise WorkspaceOwnershipError(
             f"관리 worktree 경로가 디렉터리가 아닙니다: {worktree}"
@@ -1809,7 +1846,12 @@ def make_worktree(
                 f"새 ExecPlan의 관리 worktree가 이미 존재해 소유권을 증명할 수 없습니다: "
                 f"{worktree}"
             )
-        validate_managed_worktree(repo, worktree, branch, allow_rebase=allow_rebase)
+        if ownership_reserved:
+            validate_reserved_worktree(repo, worktree, branch, str(expected_head))
+        else:
+            validate_managed_worktree(
+                repo, worktree, branch, allow_rebase=allow_rebase
+            )
         return "existing"
 
     worktree.parent.mkdir(parents=True, exist_ok=True)
@@ -1838,19 +1880,35 @@ def make_worktree(
                     f"관리 branch가 다른 worktree에 연결되어 있습니다: "
                     f"{branch} ({owner})"
                 )
+        if ownership_reserved:
+            branch_head = git(
+                repo,
+                "rev-parse",
+                "--verify",
+                f"refs/heads/{branch}",
+            ).stdout.strip()
+            if branch_head != expected_head:
+                raise WorkspaceOwnershipError(
+                    "예약 ExecPlan branch가 저장된 기준 commit과 다릅니다: "
+                    f"{branch} ({branch_head}, expected {expected_head})"
+                )
         git(repo, "worktree", "add", str(worktree), branch)
         outcome = "recovered"
     elif allow_create_branch or ownership_reserved:
         if before_create is not None:
             before_create()
-        git(repo, "worktree", "add", "-b", branch, str(worktree), f"origin/{base}")
+        start_point = expected_head or f"origin/{base}"
+        git(repo, "worktree", "add", "-b", branch, str(worktree), start_point)
         outcome = "created"
     else:
         raise WorkspaceOwnershipError(
             f"저장된 worktree와 관리 branch를 모두 복구할 수 없습니다: "
             f"{worktree} ({branch})"
         )
-    validate_managed_worktree(repo, worktree, branch, allow_rebase=allow_rebase)
+    if ownership_reserved:
+        validate_reserved_worktree(repo, worktree, branch, str(expected_head))
+    else:
+        validate_managed_worktree(repo, worktree, branch, allow_rebase=allow_rebase)
     return outcome
 
 
@@ -1862,7 +1920,13 @@ def make_planning_worktree(
     allow_create: bool = True,
     before_create: Callable[[], None] | None = None,
     allow_existing: bool = True,
+    ownership_reserved: bool = False,
+    expected_head: str | None = None,
 ) -> str:
+    if ownership_reserved and not expected_head:
+        raise WorkspaceOwnershipError(
+            "예약 planning workspace의 기준 commit SHA가 없습니다."
+        )
     if worktree.exists() and not worktree.is_dir():
         raise WorkspaceOwnershipError(
             f"planning worktree 경로가 디렉터리가 아닙니다: {worktree}"
@@ -1873,7 +1937,10 @@ def make_planning_worktree(
                 "새 planning worktree 경로가 이미 존재해 소유권을 증명할 수 "
                 f"없습니다: {worktree}"
             )
-        validate_managed_worktree(repo, worktree, None)
+        if ownership_reserved:
+            validate_reserved_worktree(repo, worktree, None, str(expected_head))
+        else:
+            validate_managed_worktree(repo, worktree, None)
         return "existing"
     if not allow_create:
         raise WorkspaceOwnershipError(
@@ -1883,8 +1950,12 @@ def make_planning_worktree(
     worktree.parent.mkdir(parents=True, exist_ok=True)
     if before_create is not None:
         before_create()
-    git(repo, "worktree", "add", "--detach", str(worktree), f"origin/{base}")
-    validate_managed_worktree(repo, worktree, None)
+    start_point = expected_head or f"origin/{base}"
+    git(repo, "worktree", "add", "--detach", str(worktree), start_point)
+    if ownership_reserved:
+        validate_reserved_worktree(repo, worktree, None, str(expected_head))
+    else:
+        validate_managed_worktree(repo, worktree, None)
     return "created"
 
 
@@ -2481,12 +2552,14 @@ def validate_planning_worktree_ownership(
     """Validate a saved planning path before reading, changing, or removing it."""
 
     project = connection.execute(
-        "SELECT worktree, planning_workspace_owned FROM projects WHERE repo = ?",
+        "SELECT active_sha, worktree, planning_workspace_owned "
+        "FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
     if worktree.exists() and (
         project is None
-        or not bool(project["planning_workspace_owned"])
+        or int(project["planning_workspace_owned"])
+        not in {WORKSPACE_OWNED, WORKSPACE_RESERVED}
         or Path(str(project["worktree"] or "")) != worktree
     ):
         raise WorkspaceOwnershipError(
@@ -2505,7 +2578,15 @@ def validate_planning_worktree_ownership(
         worktree,
     )
     if worktree.exists():
-        validate_managed_worktree(repo_path, worktree, None)
+        if int(project["planning_workspace_owned"]) == WORKSPACE_RESERVED:
+            validate_reserved_worktree(
+                repo_path,
+                worktree,
+                None,
+                str(project["active_sha"] or ""),
+            )
+        else:
+            validate_managed_worktree(repo_path, worktree, None)
 
 
 def changed_files(worktree: Path, since: str | None = None) -> list[str]:
@@ -3255,7 +3336,7 @@ def recover_persisted_agent_worktree(
         or plan_id is None
         or plan is None
         or plan["plan_id"] != plan_id
-        or not bool(plan["workspace_owned"])
+        or int(plan["workspace_owned"]) != WORKSPACE_OWNED
         or not branch
         or str(plan["branch"] or "") != branch
         or Path(str(plan["worktree"] or "")) != worktree
@@ -3828,7 +3909,7 @@ def resume_blocked_execplan_if_inputs_changed(
     remote_changed = (
         _revision_execplan_input_fingerprint(repo_path, revision, plan) != stored
     )
-    if not bool(plan["workspace_owned"]):
+    if int(plan["workspace_owned"]) != WORKSPACE_OWNED:
         if not remote_changed:
             return False
         try:
@@ -3991,7 +4072,7 @@ def complete_merged_worktree(
     ).fetchone()
     if worktree.exists() and (
         plan is None
-        or not bool(plan["workspace_owned"])
+        or int(plan["workspace_owned"]) != WORKSPACE_OWNED
         or str(plan["branch"] or "") != branch
         or Path(str(plan["worktree"] or "")) != worktree
     ):
@@ -4362,7 +4443,7 @@ def run_project(
                     if (
                         open_plan is None
                         or open_plan["plan_id"] != open_plan_id
-                        or not bool(open_plan["workspace_owned"])
+                        or int(open_plan["workspace_owned"]) != WORKSPACE_OWNED
                     ):
                         raise WorkspaceOwnershipError(
                             "PR_OPEN workspace의 Loop Manager 소유권이 확인되지 않았습니다."
@@ -4658,7 +4739,9 @@ def run_project(
                 or row["planning_retry_count"]
                 or row["last_error"]
             )
-            planning_workspace_owned = bool(row["planning_workspace_owned"])
+            planning_workspace_owned = (
+                row["planning_workspace_owned"] == WORKSPACE_OWNED
+            )
             planning_workspace_reserved = (
                 row["planning_workspace_owned"] == WORKSPACE_RESERVED
             )
@@ -4673,7 +4756,11 @@ def run_project(
                         or planning_workspace_reserved
                     )
                 ),
-                allow_existing=planning_workspace_owned,
+                allow_existing=(
+                    planning_workspace_owned or planning_workspace_reserved
+                ),
+                ownership_reserved=planning_workspace_reserved,
+                expected_head=str(row["active_sha"] or ""),
                 before_create=lambda: update_project(
                     connection,
                     repo,
@@ -5015,7 +5102,7 @@ def run_project(
     plan_id = _plan_id_from_path(str(row["plan_path"] or ""))
     catalog_plan = active_execplan(connection, repo)
     workspace_ownership = int(catalog_plan["workspace_owned"] if catalog_plan else 0)
-    workspace_owned = workspace_ownership != WORKSPACE_UNOWNED
+    workspace_owned = workspace_ownership == WORKSPACE_OWNED
     workspace_reserved = workspace_ownership == WORKSPACE_RESERVED
     rebase_error = str(row["last_error"] or "")
     rebase_recovery = bool(
@@ -5051,10 +5138,15 @@ def run_project(
             worktree,
             branch,
             base,
-            allow_create_branch=newly_activated and not workspace_owned,
-            allow_recovery=workspace_owned,
-            allow_existing=workspace_owned,
+            allow_create_branch=(
+                newly_activated
+                and not workspace_owned
+                and not workspace_reserved
+            ),
+            allow_recovery=workspace_owned or workspace_reserved,
+            allow_existing=workspace_owned or workspace_reserved,
             ownership_reserved=workspace_reserved,
+            expected_head=str(row["active_sha"] or ""),
             before_create=lambda: reserve_execplan_workspace(
                 connection,
                 repo,
