@@ -7220,18 +7220,23 @@ class WorkspaceRecoveryTest(unittest.TestCase):
                 "WHERE repo = ? AND plan_id = 'G-012'",
                 (str(repo),),
             ).fetchone()
-            self.assertEqual(result, 1)
-            self.assertEqual(project["phase"], "BLOCKED")
+            pending = connection.execute(
+                "SELECT workspace_owned, reason FROM cleanup_pending WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(result, 0)
+            self.assertEqual(tuple(project), (None, None))
+            self.assertEqual(tuple(plan_status), ("MERGED", 0))
+            self.assertEqual(pending["workspace_owned"], 0)
             self.assertIn(
                 "Merge cleanup worktree의 Loop Manager 소유권이 확인되지 않았습니다",
-                project["last_error"],
+                pending["reason"],
             )
-            self.assertEqual(tuple(plan_status), ("BLOCKED", 0))
             self.assertTrue(worktree.is_dir())
             self.assertEqual(git_command(worktree, "rev-parse", "HEAD"), pr_head)
             run_agent.assert_not_called()
 
-    def test_merge_cleanup_preserves_unowned_saved_path_and_blocks(self):
+    def test_merge_cleanup_preserves_unowned_saved_path_as_nonblocking_pending(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (
@@ -7318,19 +7323,19 @@ class WorkspaceRecoveryTest(unittest.TestCase):
                 "SELECT status FROM exec_plans WHERE repo = ? AND plan_id = 'G-012'",
                 (str(repo),),
             ).fetchone()["status"]
-            pending_count = connection.execute(
-                "SELECT COUNT(*) FROM cleanup_pending WHERE repo = ?",
+            pending = connection.execute(
+                "SELECT workspace_owned, reason FROM cleanup_pending WHERE repo = ?",
                 (str(repo),),
-            ).fetchone()[0]
+            ).fetchone()
 
-            self.assertEqual(result, 1)
-            self.assertEqual(project["phase"], "BLOCKED")
+            self.assertEqual(result, 0)
+            self.assertEqual(tuple(project), (None, None))
+            self.assertEqual(plan_status, "MERGED")
+            self.assertEqual(pending["workspace_owned"], 0)
             self.assertIn(
-                "Merge cleanup workspace 소유권 검증 실패",
-                project["last_error"],
+                "Merge cleanup worktree의 Loop Manager 소유권이 확인되지 않았습니다",
+                pending["reason"],
             )
-            self.assertEqual(plan_status, "BLOCKED")
-            self.assertEqual(pending_count, 0)
             self.assertTrue(marker.is_file())
             self.assertEqual(git_command(victim, "rev-parse", "HEAD"), victim_head)
             loop_manager.validate_managed_worktree(repo, victim, victim_branch)
@@ -7465,6 +7470,46 @@ class MergeIndependentWorktreeCleanupTest(unittest.TestCase):
             self.assertIsNotNone(table)
             self.assertEqual(tuple(row), ("repo", "main", "PR_OPEN"))
 
+    def test_existing_cleanup_records_default_to_owned_during_migration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            database = sqlite3.connect(state_dir / "loop-manager.db")
+            database.execute(
+                "CREATE TABLE projects (repo TEXT PRIMARY KEY, base_branch TEXT NOT NULL, phase TEXT)"
+            )
+            database.execute(
+                "INSERT INTO projects (repo, base_branch, phase) VALUES ('repo', 'main', 'PR_OPEN')"
+            )
+            database.execute(
+                """
+                CREATE TABLE cleanup_pending (
+                    repo TEXT NOT NULL,
+                    worktree TEXT NOT NULL,
+                    pr_url TEXT NOT NULL,
+                    pr_head_oid TEXT,
+                    reason TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (repo, worktree)
+                )
+                """
+            )
+            database.execute(
+                """
+                INSERT INTO cleanup_pending (
+                    repo, worktree, pr_url, pr_head_oid, reason
+                ) VALUES ('repo', '/tmp/managed', 'https://example.test/pr/1', NULL, 'dirty')
+                """
+            )
+            database.commit()
+            database.close()
+
+            with loop_manager.connect_database(state_dir) as connection:
+                pending = connection.execute(
+                    "SELECT reason, workspace_owned FROM cleanup_pending WHERE repo = 'repo'"
+                ).fetchone()
+
+            self.assertEqual(tuple(pending), ("dirty", loop_manager.WORKSPACE_OWNED))
+
     def test_pending_recheck_removes_safe_worktree_and_missing_record(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -7497,6 +7542,47 @@ class MergeIndependentWorktreeCleanupTest(unittest.TestCase):
 
             self.assertEqual(remaining, [])
             self.assertFalse(worktree.exists())
+
+    def test_unowned_pending_is_not_inspected_and_clears_only_when_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = make_remote_repository(directory)
+            state_dir = root / "state"
+            victim = root / "user-worktree"
+            victim.mkdir()
+            marker = victim / "keep.txt"
+            marker.write_text("keep\n", encoding="utf-8")
+            connection = self._memory_connection(repo)
+            loop_manager._store_cleanup_pending(
+                connection,
+                str(repo),
+                victim,
+                "https://example.test/pr/1",
+                None,
+                "ownership unverified",
+                workspace_owned=0,
+            )
+            connection.commit()
+
+            with mock.patch(
+                "loop_manager.validate_pending_cleanup_worktree"
+            ) as validate, mock.patch(
+                "loop_manager.remove_cleanup_worktree"
+            ) as remove:
+                remaining = loop_manager.recheck_cleanup_pending(
+                    connection, repo, str(repo), state_dir
+                )
+                marker.unlink()
+                victim.rmdir()
+                cleared = loop_manager.recheck_cleanup_pending(
+                    connection, repo, str(repo), state_dir
+                )
+
+            self.assertEqual(len(remaining), 1)
+            self.assertEqual(remaining[0]["workspace_owned"], 0)
+            self.assertEqual(cleared, [])
+            validate.assert_not_called()
+            remove.assert_not_called()
 
     def test_merged_dirty_worktree_becomes_nonblocking_pending(self):
         with tempfile.TemporaryDirectory() as directory:

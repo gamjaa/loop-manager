@@ -117,6 +117,7 @@ CREATE TABLE IF NOT EXISTS cleanup_pending (
     pr_url TEXT NOT NULL,
     pr_head_oid TEXT,
     reason TEXT NOT NULL,
+    workspace_owned INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (repo, worktree),
     FOREIGN KEY (repo) REFERENCES projects(repo)
@@ -431,7 +432,7 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
     if create:
         connection.execute(SCHEMA)
         _ensure_execplans_schema(connection)
-        connection.execute(CLEANUP_PENDING_SCHEMA)
+        _ensure_cleanup_pending_schema(connection)
         connection.commit()
     else:
         try:
@@ -472,7 +473,7 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
     if not migrations.keys() <= columns:
         connection.commit()
     _ensure_execplans_schema(connection)
-    connection.execute(CLEANUP_PENDING_SCHEMA)
+    _ensure_cleanup_pending_schema(connection)
     connection.commit()
     # Repository-aware migrations belong in run_project, after persisted Agent
     # config has been checked against its pre-invocation snapshot.
@@ -2952,6 +2953,14 @@ def remove_cleanup_worktree(
 
 def _ensure_cleanup_pending_schema(connection: sqlite3.Connection) -> None:
     connection.execute(CLEANUP_PENDING_SCHEMA)
+    columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(cleanup_pending)")
+    }
+    if "workspace_owned" not in columns:
+        connection.execute(
+            "ALTER TABLE cleanup_pending ADD COLUMN workspace_owned "
+            "INTEGER NOT NULL DEFAULT 1"
+        )
 
 
 def _store_cleanup_pending(
@@ -2961,18 +2970,23 @@ def _store_cleanup_pending(
     pr_url: str,
     pr_head_oid: str | None,
     reason: str,
+    *,
+    workspace_owned: int = WORKSPACE_OWNED,
 ) -> None:
     connection.execute(
         """
-        INSERT INTO cleanup_pending (repo, worktree, pr_url, pr_head_oid, reason)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO cleanup_pending (
+            repo, worktree, pr_url, pr_head_oid, reason, workspace_owned
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(repo, worktree) DO UPDATE SET
             pr_url = excluded.pr_url,
             pr_head_oid = excluded.pr_head_oid,
             reason = excluded.reason,
+            workspace_owned = excluded.workspace_owned,
             updated_at = CURRENT_TIMESTAMP
         """,
-        (repo, str(worktree), pr_url, pr_head_oid, reason),
+        (repo, str(worktree), pr_url, pr_head_oid, reason, workspace_owned),
     )
 
 
@@ -2988,6 +3002,13 @@ def recheck_cleanup_pending(
     ).fetchall()
     for item in pending:
         worktree = Path(item["worktree"])
+        if int(item["workspace_owned"]) != WORKSPACE_OWNED:
+            if not worktree.exists() and not worktree.is_symlink():
+                connection.execute(
+                    "DELETE FROM cleanup_pending WHERE repo = ? AND worktree = ?",
+                    (repo, str(worktree)),
+                )
+            continue
         try:
             validate_pending_cleanup_worktree(
                 repo_path,
@@ -5227,27 +5248,44 @@ def complete_merged_worktree(
         "WHERE repo = ? AND plan_id = ?",
         (repo, plan_id),
     ).fetchone()
-    if worktree.exists() and (
-        plan is None
-        or int(plan["workspace_owned"]) != WORKSPACE_OWNED
+    if plan is None:
+        raise WorkspaceOwnershipError(
+            f"Merge cleanup ExecPlan을 찾을 수 없습니다: {plan_id}"
+        )
+    workspace_owned = WORKSPACE_OWNED
+    worktree_present = worktree.exists() or worktree.is_symlink()
+    if not worktree_present:
+        assessment = CleanupAssessment("missing")
+    elif (
+        int(plan["workspace_owned"]) != WORKSPACE_OWNED
         or str(plan["branch"] or "") != branch
         or Path(str(plan["worktree"] or "")) != worktree
     ):
-        raise WorkspaceOwnershipError(
+        workspace_owned = 0
+        assessment = CleanupAssessment(
+            "unverifiable",
             "Merge cleanup worktree의 Loop Manager 소유권이 확인되지 않았습니다: "
-            f"{worktree}"
+            f"{worktree}",
         )
-    validate_execplan_workspace_identity(
-        state_dir,
-        repo,
-        plan_id,
-        branch,
-        worktree,
-    )
-    if worktree.exists():
-        validate_managed_worktree(repo_path, worktree, branch)
-    assessment = assess_cleanup(worktree, pr_head_oid)
-    assessment = remove_cleanup_worktree(repo_path, worktree, assessment)
+    else:
+        try:
+            validate_execplan_workspace_identity(
+                state_dir,
+                repo,
+                plan_id,
+                branch,
+                worktree,
+            )
+            validate_managed_worktree(repo_path, worktree, branch)
+        except (RuntimeError, WorkspaceOwnershipError) as error:
+            workspace_owned = 0
+            assessment = CleanupAssessment(
+                "unverifiable",
+                f"Merge cleanup workspace 소유권 검증 실패: {error}",
+            )
+        else:
+            assessment = assess_cleanup(worktree, pr_head_oid)
+            assessment = remove_cleanup_worktree(repo_path, worktree, assessment)
     values = _clear_active_values()
     assignments = ", ".join(f"{name} = ?" for name in values)
     with connection:
@@ -5266,6 +5304,7 @@ def complete_merged_worktree(
                 pr_url,
                 pr_head_oid,
                 assessment.reason or assessment.status,
+                workspace_owned=workspace_owned,
             )
         if plan_id:
             connection.execute(
@@ -5495,7 +5534,9 @@ def run_project(
     cleanup_candidates = frozenset(
         str(_canonical_path(Path(item["worktree"])))
         for item in connection.execute(
-            "SELECT worktree FROM cleanup_pending WHERE repo = ?", (repo,)
+            "SELECT worktree FROM cleanup_pending "
+            "WHERE repo = ? AND workspace_owned = ?",
+            (repo, WORKSPACE_OWNED),
         ).fetchall()
     )
     checkpoint_cleanup_candidates = cleanup_candidates
@@ -5592,7 +5633,9 @@ def run_project(
     cleanup_candidates = frozenset(
         str(_canonical_path(Path(item["worktree"])))
         for item in connection.execute(
-            "SELECT worktree FROM cleanup_pending WHERE repo = ?", (repo,)
+            "SELECT worktree FROM cleanup_pending "
+            "WHERE repo = ? AND workspace_owned = ?",
+            (repo, WORKSPACE_OWNED),
         ).fetchall()
     )
     cleanup_pending = recheck_cleanup_pending(
