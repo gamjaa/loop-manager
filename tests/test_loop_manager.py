@@ -3126,8 +3126,8 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             )
 
         project = connection.execute(
-            "SELECT phase, worker_session_id, reviewer_session_id "
-            "FROM projects WHERE repo = ?",
+            "SELECT phase, worker_session_id, reviewer_session_id, "
+            "last_error, review_result FROM projects WHERE repo = ?",
             (str(repo),),
         ).fetchone()
         plan = connection.execute(
@@ -3175,7 +3175,9 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             second_root,
         )
         review_fingerprint, _ = loop_manager.validation_failure_fingerprint(
-            "review", second + "\nVERDICT: FAIL", second_root
+            "review",
+            "ISSUE_ID: tests/test_a.py::test-a::blocking\nVERDICT: FAIL",
+            second_root,
         )
         same_temp_first, _ = loop_manager.validation_failure_fingerprint(
             "verify", "FAIL /tmp/run-one/test_same.py:42"
@@ -3236,53 +3238,56 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         )
         changed = reworded.replace("SESSION-RECOVERY", "USAGE-LIMIT")
 
-        first_fingerprint, first_normalized = (
-            loop_manager.validation_failure_fingerprint("review", first)
+        first_fingerprints = loop_manager.validation_failure_fingerprints(
+            "review", first
         )
-        reworded_fingerprint, reworded_normalized = (
-            loop_manager.validation_failure_fingerprint("review", reworded)
+        reworded_fingerprints = loop_manager.validation_failure_fingerprints(
+            "review", reworded
         )
-        changed_fingerprint, _ = loop_manager.validation_failure_fingerprint(
+        changed_fingerprints = loop_manager.validation_failure_fingerprints(
             "review", changed
         )
-
-        missing_first, missing_normalized = (
-            loop_manager.validation_failure_fingerprint(
+        with self.assertRaisesRegex(
+            loop_manager.ReviewerProtocolError, "유효한 ISSUE_ID가 없습니다"
+        ):
+            loop_manager.validation_failure_fingerprints(
                 "review", "first free-form explanation\nVERDICT: FAIL"
             )
-        )
-        missing_second, _ = loop_manager.validation_failure_fingerprint(
-            "review", "entirely reworded explanation\nVERDICT: FAIL"
-        )
-        invalid_first, invalid_normalized = (
-            loop_manager.validation_failure_fingerprint(
+        with self.assertRaisesRegex(
+            loop_manager.ReviewerProtocolError, "형식이 유효하지 않습니다"
+        ):
+            loop_manager.validation_failure_fingerprints(
                 "review", "ISSUE_ID: app.py:10 prose\nVERDICT: FAIL"
             )
-        )
-        invalid_second, _ = loop_manager.validation_failure_fingerprint(
-            "review", "ISSUE_ID: app.py:99 other prose\nVERDICT: FAIL"
-        )
 
-        self.assertEqual(first_fingerprint, reworded_fingerprint)
-        self.assertEqual(first_normalized, reworded_normalized)
+        self.assertEqual(first_fingerprints, reworded_fingerprints)
         self.assertEqual(
-            first_normalized,
-            "\n".join(
-                (
-                    "ISSUE_ID:loop_manager.py::run_project::session-recovery",
-                    "ISSUE_ID:tests/test_loop_manager.py::retry-case::missing-coverage",
-                )
+            tuple(normalized for _fingerprint, normalized in first_fingerprints),
+            (
+                "ISSUE_ID:loop_manager.py::run_project::session-recovery",
+                "ISSUE_ID:tests/test_loop_manager.py::retry-case::missing-coverage",
             ),
         )
-        self.assertEqual(missing_first, missing_second)
+        first_by_issue = {
+            normalized: fingerprint
+            for fingerprint, normalized in first_fingerprints
+        }
+        changed_by_issue = {
+            normalized: fingerprint
+            for fingerprint, normalized in changed_fingerprints
+        }
         self.assertEqual(
-            missing_normalized, "REVIEW_PROTOCOL_ERROR:MISSING_ISSUE_ID"
+            first_by_issue[
+                "ISSUE_ID:tests/test_loop_manager.py::retry-case::missing-coverage"
+            ],
+            changed_by_issue[
+                "ISSUE_ID:tests/test_loop_manager.py::retry-case::missing-coverage"
+            ],
         )
-        self.assertEqual(invalid_first, invalid_second)
         self.assertEqual(
-            invalid_normalized, "REVIEW_PROTOCOL_ERROR:INVALID_ISSUE_ID"
+            set(first_by_issue) & set(changed_by_issue),
+            {"ISSUE_ID:tests/test_loop_manager.py::retry-case::missing-coverage"},
         )
-        self.assertNotEqual(first_fingerprint, changed_fingerprint)
 
     def test_verify_fingerprint_uses_full_output_before_feedback_truncation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -3690,14 +3695,20 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         self.assertEqual(plan["status"], "PR_OPEN")
         self.assertEqual(json.loads(plan["review_failure_history"]), {})
 
-    def test_same_review_issue_blocks_exactly_on_fourth_occurrence(self):
-        failure = (
-            "ISSUE_ID: app.py::same-issue::blocking\n"
-            "same blocking issue\nVERDICT: FAIL"
+    def test_review_issue_in_changing_sets_blocks_exactly_on_fourth_occurrence(self):
+        messages = (
+            "ISSUE_ID: app.py::a-shared-issue::blocking\n"
+            "ISSUE_ID: app.py::z-extra-a::blocking\nVERDICT: FAIL",
+            "ISSUE_ID: app.py::a-shared-issue::blocking\n"
+            "ISSUE_ID: app.py::z-extra-b::blocking\nVERDICT: FAIL",
+            "ISSUE_ID: app.py::a-shared-issue::blocking\n"
+            "ISSUE_ID: app.py::z-extra-c::blocking\nVERDICT: FAIL",
+            "ISSUE_ID: app.py::a-shared-issue::blocking\n"
+            "ISSUE_ID: app.py::z-extra-d::blocking\nVERDICT: FAIL",
         )
         with tempfile.TemporaryDirectory() as directory:
             data = self._run_review_sequence(
-                directory, (failure,) * 4, publish=False
+                directory, messages, publish=False
             )
 
         result = data["result"]
@@ -3737,9 +3748,37 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         self.assertEqual(project["phase"], "BLOCKED")
         self.assertEqual(plan["status"], "BLOCKED")
         self.assertEqual(
-            [record["occurrences"] for record in history.values()],
-            [4],
+            sorted(record["occurrences"] for record in history.values()),
+            [1, 1, 1, 1, 4],
         )
+
+    def test_review_protocol_errors_do_not_retry_worker_or_consume_history(self):
+        invalid_reviews = (
+            "blocking issue without an identifier\nVERDICT: FAIL",
+            "ISSUE_ID: app.py:42 prose\nblocking issue\nVERDICT: FAIL",
+        )
+        for review in invalid_reviews:
+            with self.subTest(review=review), tempfile.TemporaryDirectory() as directory:
+                data = self._run_review_sequence(
+                    directory, (review,), publish=False
+                )
+
+            result = data["result"]
+            project = data["project"]
+            plan = data["plan"]
+            self.assertEqual(
+                result.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR
+            )
+            self.assertEqual(result.exit_code, 1)
+            self.assertEqual(data["roles"], ["worker", "reviewer"])
+            self.assertEqual(data["reviewer_sessions"], [None])
+            self.assertEqual(data["verify_calls"], 1)
+            self.assertEqual(data["transitions"], [])
+            self.assertEqual(project["phase"], "REVIEWING")
+            self.assertIn("Reviewer 결과 프로토콜 오류", project["last_error"])
+            self.assertEqual(project["review_result"], review)
+            self.assertEqual(plan["status"], "REVIEWING")
+            self.assertEqual(json.loads(plan["review_failure_history"]), {})
 
     def test_review_failure_then_verify_failure_keeps_stage_counts_independent(self):
         with tempfile.TemporaryDirectory() as directory:

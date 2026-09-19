@@ -378,6 +378,10 @@ class WorkerResultError(RuntimeError):
     """A Worker final response cannot safely be published."""
 
 
+class ReviewerProtocolError(RuntimeError):
+    """A failed Reviewer response does not identify actionable issues."""
+
+
 class ProcessLockBusyError(RuntimeError):
     """The single Loop Manager process lock is already held."""
 
@@ -1944,21 +1948,25 @@ _REVIEW_ISSUE_IDENTIFIER = re.compile(
 )
 
 
-def _normalize_review_issue_ids(output: str) -> str:
+def _normalize_review_issue_ids(output: str) -> tuple[str, ...]:
     raw_identifiers = [
         " ".join(match.group("identifier").split()).casefold()
         for match in _REVIEW_ISSUE_ID.finditer(output)
         if match.group("identifier").strip()
     ]
     if not raw_identifiers:
-        return "REVIEW_PROTOCOL_ERROR:MISSING_ISSUE_ID"
+        raise ReviewerProtocolError(
+            "Reviewer FAIL 결과에 유효한 ISSUE_ID가 없습니다."
+        )
     if any(
         _REVIEW_ISSUE_IDENTIFIER.fullmatch(identifier) is None
         for identifier in raw_identifiers
     ):
-        return "REVIEW_PROTOCOL_ERROR:INVALID_ISSUE_ID"
+        raise ReviewerProtocolError(
+            "Reviewer FAIL 결과의 ISSUE_ID 형식이 유효하지 않습니다."
+        )
     identifiers = set(raw_identifiers)
-    return "\n".join(f"ISSUE_ID:{identifier}" for identifier in sorted(identifiers))
+    return tuple(f"ISSUE_ID:{identifier}" for identifier in sorted(identifiers))
 
 
 def _normalize_temp_path(match: re.Match[str]) -> str:
@@ -2005,7 +2013,7 @@ def normalize_validation_failure(
     normalized = _TIMESTAMP_NOISE.sub("<TIMESTAMP>", normalized)
     normalized = _DURATION_NOISE.sub("<DURATION>", normalized)
     if stage == "review":
-        return _normalize_review_issue_ids(normalized)
+        return "\n".join(_normalize_review_issue_ids(normalized))
     lines = []
     for line in normalized.splitlines():
         line = " ".join(line.split())
@@ -2015,18 +2023,35 @@ def normalize_validation_failure(
     return "\n".join(sorted(lines))
 
 
+def validation_failure_fingerprints(
+    stage: str,
+    output: str,
+    worktree: Path | None = None,
+) -> tuple[tuple[str, str], ...]:
+    normalized = normalize_validation_failure(stage, output, worktree)
+    failures = normalized.splitlines() if stage == "review" else [normalized]
+    fingerprints = []
+    for failure in failures:
+        digest = hashlib.sha256()
+        digest.update(b"loop-manager-validation-failure-v1\0")
+        digest.update(stage.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(failure.encode("utf-8"))
+        fingerprints.append((digest.hexdigest(), failure))
+    return tuple(fingerprints)
+
+
 def validation_failure_fingerprint(
     stage: str,
     output: str,
     worktree: Path | None = None,
 ) -> tuple[str, str]:
-    normalized = normalize_validation_failure(stage, output, worktree)
-    digest = hashlib.sha256()
-    digest.update(b"loop-manager-validation-failure-v1\0")
-    digest.update(stage.encode("utf-8"))
-    digest.update(b"\0")
-    digest.update(normalized.encode("utf-8"))
-    return digest.hexdigest(), normalized
+    fingerprints = validation_failure_fingerprints(stage, output, worktree)
+    if len(fingerprints) != 1:
+        raise ValueError(
+            "복수 Review issue는 validation_failure_fingerprints()로 처리해야 합니다."
+        )
+    return fingerprints[0]
 
 
 def _deserialize_failure_history(value: object) -> dict[str, dict[str, object]]:
@@ -3883,7 +3908,7 @@ def transition_validation_failure(
     stage: str,
     output: str,
 ) -> ValidationFailureDecision:
-    """Persist one stage-local fingerprint and own its retry/BLOCKED transition."""
+    """Persist stage-local failures and own their retry/BLOCKED transition."""
 
     columns = {
         "verify": "verify_failure_history",
@@ -3896,23 +3921,36 @@ def transition_validation_failure(
     plan = active_execplan(connection, repo)
     if plan is None:
         raise RuntimeError("검증 실패를 기록할 활성 ExecPlan을 찾을 수 없습니다.")
-    fingerprint, normalized = validation_failure_fingerprint(
-        stage, output, worktree
-    )
+    failures = validation_failure_fingerprints(stage, output, worktree)
     history = _deserialize_failure_history(plan[history_column])
-    previous = history.get(fingerprint, {"occurrences": 0})
-    occurrences = int(previous["occurrences"]) + 1
-    history[fingerprint] = {
-        "occurrences": occurrences,
-        "sample": normalized[-2000:],
-    }
+    recorded_failures = []
+    for fingerprint, normalized in failures:
+        previous = history.get(fingerprint, {"occurrences": 0})
+        occurrences = int(previous["occurrences"]) + 1
+        history[fingerprint] = {
+            "occurrences": occurrences,
+            "sample": normalized[-2000:],
+        }
+        recorded_failures.append((fingerprint, normalized, occurrences))
+    blocking_failure = next(
+        (
+            failure
+            for failure in recorded_failures
+            if failure[2] > MAX_VALIDATION_FINGERPRINT_REPEATS
+        ),
+        None,
+    )
+    fingerprint, normalized, occurrences = blocking_failure or max(
+        recorded_failures,
+        key=lambda failure: failure[2],
+    )
     serialized_history = json.dumps(
         history,
         ensure_ascii=True,
         separators=(",", ":"),
         sort_keys=True,
     )
-    blocked = occurrences > MAX_VALIDATION_FINGERPRINT_REPEATS
+    blocked = blocking_failure is not None
     if blocked:
         error = (
             f"{labels[stage]} 동일 실패가 Worker 수정 후 "
@@ -7506,14 +7544,26 @@ def _run_project_step(
             and not re.search(r"(?mi)^VERDICT:\s*FAIL\s*$", review)
         )
         if not passed:
+            try:
+                decision = transition_validation_failure(
+                    connection,
+                    repo,
+                    worktree,
+                    "review",
+                    review,
+                )
+            except ReviewerProtocolError as error:
+                reviewer_error = f"Reviewer 결과 프로토콜 오류: {error}"
+                update_project(
+                    connection,
+                    repo,
+                    phase="REVIEWING",
+                    last_error=reviewer_error,
+                    review_result=review,
+                )
+                operation_print(reviewer_error, file=sys.stderr)
+                return 1
             operation_log(f"Worker 반환: {plan['id']} {plan['title']} (Review 실패)", error=True)
-            decision = transition_validation_failure(
-                connection,
-                repo,
-                worktree,
-                "review",
-                review,
-            )
             operation_print(review or "Reviewer 결과가 유효하지 않습니다.", file=sys.stderr)
             return 1 if decision.blocked else PROJECT_STEP_RETRY
         clear_validation_failure_history(connection, repo, "review")
