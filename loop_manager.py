@@ -1885,6 +1885,15 @@ def _registered_worktree_entries(
     return entries
 
 
+def _normalized_config_origin(worktree: Path, raw_origin: bytes) -> bytes:
+    if not raw_origin.startswith(b"file:"):
+        return raw_origin
+    origin_path = Path(os.fsdecode(raw_origin.removeprefix(b"file:")))
+    if not origin_path.is_absolute():
+        origin_path = worktree / origin_path
+    return b"file:" + os.fsencode(_canonical_path(origin_path))
+
+
 def _config_entries(worktree: Path) -> dict[str, tuple[str, ...]]:
     records = git_bytes(
         worktree,
@@ -1908,7 +1917,8 @@ def _config_entries(worktree: Path) -> dict[str, tuple[str, ...]]:
             raise RuntimeError("Git config snapshot을 해석할 수 없습니다.")
         scope = raw_scope.decode("ascii", errors="replace")
         name = raw_name.decode("utf-8", errors="replace")
-        digest = hashlib.sha256(raw_origin + b"\0" + raw_value).hexdigest()
+        origin = _normalized_config_origin(worktree, raw_origin)
+        digest = hashlib.sha256(origin + b"\0" + raw_value).hexdigest()
         entries.setdefault(f"{scope}:{name}", []).append(digest)
     return {
         key: tuple(sorted(values))
@@ -2904,9 +2914,60 @@ def block_persisted_agent_scope_violation(
     return message
 
 
+def recover_persisted_agent_worktree(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    state_dir: Path,
+    repo: str,
+    project: sqlite3.Row,
+) -> None:
+    """Recover a missing Agent worktree only from its proven owned branch."""
+
+    worktree = Path(str(project["worktree"] or ""))
+    plan_id = _plan_id_from_path(str(project["plan_path"] or ""))
+    plan = active_execplan(connection, repo)
+    branch = str(project["branch"] or "")
+    if (
+        project["phase"] == "PLANNING"
+        or plan_id is None
+        or plan is None
+        or plan["plan_id"] != plan_id
+        or not bool(plan["workspace_owned"])
+        or not branch
+        or str(plan["branch"] or "") != branch
+        or Path(str(plan["worktree"] or "")) != worktree
+    ):
+        raise AgentScopeError(
+            "저장된 Agent worktree의 Loop Manager 소유권을 증명할 수 없습니다: "
+            f"{worktree}"
+        )
+    try:
+        validate_execplan_workspace_identity(
+            state_dir,
+            repo,
+            plan_id,
+            branch,
+            worktree,
+        )
+        make_worktree(
+            repo_path,
+            worktree,
+            branch,
+            str(project["base_branch"]),
+            allow_create_branch=False,
+            allow_recovery=True,
+            allow_existing=True,
+        )
+    except WorkspaceOwnershipError as error:
+        raise AgentScopeError(
+            f"저장된 Agent worktree 복구 실패: {error}"
+        ) from error
+
+
 def validate_persisted_agent_scope(
     connection: sqlite3.Connection,
     repo_path: Path,
+    state_dir: Path,
     repo: str,
     *,
     allow_planner_worktree_correction: bool = False,
@@ -2914,7 +2975,7 @@ def validate_persisted_agent_scope(
     """Validate persisted Agent output before repository-aware Git work."""
 
     project = connection.execute(
-        "SELECT phase, base_branch, worktree, agent_role, agent_snapshot, "
+        "SELECT phase, base_branch, branch, worktree, agent_role, agent_snapshot, "
         "agent_result_snapshot, plan_path FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
@@ -2952,8 +3013,8 @@ def validate_persisted_agent_scope(
     if role_name == "worker" and not selected_plan_path:
         raise AgentScopeError("저장된 Worker ExecPlan 경로가 없습니다.")
     if not saved_worktree.is_dir():
-        raise AgentScopeError(
-            f"저장된 Agent worktree를 확인할 수 없습니다: {saved_worktree}"
+        recover_persisted_agent_worktree(
+            connection, repo_path, state_dir, repo, project
         )
 
     current = capture_git_snapshot(saved_worktree)
@@ -3087,6 +3148,7 @@ def refresh_persisted_agent_scope_after_manager_git(
     connection: sqlite3.Connection,
     repo: str,
     validated: GitSnapshot,
+    manager_worktree_changes: frozenset[str],
 ) -> GitSnapshot:
     """Merge trusted Manager refs into an interrupted Agent's start snapshot."""
 
@@ -3120,18 +3182,26 @@ def refresh_persisted_agent_scope_after_manager_git(
             validated,
             current,
             allowed_ref_changes=manager_refs,
+            allowed_worktree_changes=manager_worktree_changes,
         )
     except AgentScopeError as error:
         raise AgentScopeError(
             f"Manager Git 작업 후 Agent scope 갱신 실패: {error}"
         ) from error
+    refreshed_worktrees = dict(stored.worktrees)
+    for path in manager_worktree_changes:
+        registration = current.worktrees.get(path)
+        if registration is None:
+            refreshed_worktrees.pop(path, None)
+        else:
+            refreshed_worktrees[path] = registration
     refreshed = GitSnapshot(
         head=stored.head,
         branch=stored.branch,
         index=stored.index,
         dirty=stored.dirty,
         refs=current.refs,
-        worktrees=stored.worktrees,
+        worktrees=refreshed_worktrees,
         config=stored.config,
     )
     update_project(connection, repo, agent_snapshot=refreshed.serialize())
@@ -3675,6 +3745,7 @@ def run_project(
             validated_agent_scope = validate_persisted_agent_scope(
                 connection,
                 repo_path,
+                state_dir,
                 repo,
                 allow_planner_worktree_correction=planner_correction,
             )
@@ -3685,9 +3756,8 @@ def run_project(
         else:
             detail = None
             if (
-                planner_correction
-                or row["phase"] == "BLOCKED"
-                or row["agent_result_snapshot"]
+                row["phase"] == "BLOCKED"
+                or (row["agent_result_snapshot"] and not planner_correction)
             ):
                 validated_agent_scope = None
         if detail is not None:
@@ -3716,9 +3786,21 @@ def run_project(
         row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
     base = row["base_branch"] if row else requested_base
 
+    _ensure_cleanup_pending_schema(connection)
+    cleanup_candidates = frozenset(
+        str(_canonical_path(Path(item["worktree"])))
+        for item in connection.execute(
+            "SELECT worktree FROM cleanup_pending WHERE repo = ?", (repo,)
+        ).fetchall()
+    )
     cleanup_pending = recheck_cleanup_pending(
         connection, repo_path, repo, state_dir
     )
+    remaining_cleanup = frozenset(
+        str(_canonical_path(Path(item["worktree"])))
+        for item in cleanup_pending
+    )
+    manager_worktree_changes = cleanup_candidates - remaining_cleanup
     for pending in cleanup_pending:
         operation_print(
             f"보존된 worktree: {pending['worktree']} ({pending['reason']})",
@@ -3848,6 +3930,7 @@ def run_project(
                 connection,
                 repo,
                 validated_agent_scope,
+                manager_worktree_changes,
             )
         except (AgentScopeError, RuntimeError) as error:
             row = connection.execute(
