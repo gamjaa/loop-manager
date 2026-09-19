@@ -7522,8 +7522,6 @@ def _run_project_step(
         if code:
             worker_error = message or f"Codex 종료 코드 {code}"
             result_kind = result.result_kind
-            if resolving_rebase:
-                worker_error = REBASE_CONFLICT_PREFIX + worker_error
             if result_kind is AgentResultKind.TRANSIENT_FAILURE:
                 worker_error = f"{TRANSIENT_AGENT_ERROR_PREFIX} {worker_error}"
                 step_result = PROJECT_STEP_TRANSIENT_PAUSE
@@ -7531,6 +7529,7 @@ def _run_project_step(
                 worker_error = f"{USAGE_LIMIT_ERROR_PREFIX} {worker_error}"
                 step_result = PROJECT_STEP_USAGE_PAUSE
             elif resolving_rebase:
+                worker_error = REBASE_CONFLICT_PREFIX + worker_error
                 block_active_execplan(
                     connection,
                     repo,
@@ -7542,6 +7541,8 @@ def _run_project_step(
                 return 1
             else:
                 step_result = 1
+            if resolving_rebase:
+                worker_error = REBASE_CONFLICT_PREFIX + worker_error
             update_project(
                 connection, repo, phase="WORKING", last_error=worker_error
             )
@@ -7561,16 +7562,47 @@ def _run_project_step(
             return 1
         if resolving_rebase:
             git(worktree, "add", "-A")
-            continued = git(
+            staged = git(
                 worktree,
-                "-c",
-                "core.editor=true",
-                "rebase",
-                "--continue",
+                "diff",
+                "--cached",
+                "--quiet",
                 check=False,
             )
+            if staged.returncode not in {0, 1}:
+                staging_error = (
+                    "rebase 충돌 해결 결과 확인 실패 "
+                    f"(git 종료 코드 {staged.returncode})."
+                )
+                block_active_execplan(
+                    connection,
+                    repo,
+                    worktree,
+                    staging_error,
+                    str(row["verify_result"] or ""),
+                )
+                operation_print(staging_error, file=sys.stderr)
+                return 1
+            if staged.returncode == 0:
+                continued = git(
+                    worktree,
+                    "rebase",
+                    "--skip",
+                    check=False,
+                )
+            else:
+                continued = git(
+                    worktree,
+                    "-c",
+                    "core.editor=true",
+                    "rebase",
+                    "--continue",
+                    check=False,
+                )
             if continued.returncode:
-                continuation_error = REBASE_CONFLICT_PREFIX + continued.stdout[-8000:]
+                continuation_error = (
+                    REBASE_CONFLICT_PREFIX + continued.stdout[-8000:]
+                )
                 if not _rebase_in_progress_for_branch(worktree, branch):
                     block_active_execplan(
                         connection,
@@ -7588,13 +7620,26 @@ def _run_project_step(
                     )
                 operation_print(continuation_error, file=sys.stderr)
                 return 1
+            if not branch_has_changes(worktree, base):
+                no_change_error = (
+                    "rebase 충돌 해결 후 Worker 변경이 남지 않아 PR을 "
+                    "생성할 수 없습니다."
+                )
+                block_active_execplan(
+                    connection,
+                    repo,
+                    worktree,
+                    no_change_error,
+                    str(row["verify_result"] or ""),
+                )
+                operation_print(no_change_error, file=sys.stderr)
+                return 1
             latest_sha = git(
                 worktree,
                 "rev-parse",
                 f"origin/{base}",
             ).stdout.strip()
             update_project(connection, repo, active_sha=latest_sha)
-
         update_project(
             connection,
             repo,
