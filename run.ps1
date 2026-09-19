@@ -5,8 +5,6 @@ $ScriptDir = $PSScriptRoot
 
 Set-Location $ScriptDir
 
-Write-Output "===== $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ====="
-
 $gitOutput = @(& git pull --ff-only 2>&1)
 $gitExitCode = $LASTEXITCODE
 

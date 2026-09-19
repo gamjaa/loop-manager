@@ -1,5 +1,7 @@
 import json
 import io
+import os
+import datetime
 import sqlite3
 import subprocess
 import tempfile
@@ -322,6 +324,9 @@ class LoopManagerTest(unittest.TestCase):
             connection = sqlite3.connect(":memory:")
             connection.row_factory = sqlite3.Row
             connection.execute(loop_manager.SCHEMA)
+            logs = []
+
+            connection.execute(loop_manager.SCHEMA)
 
             with mock.patch(
                 "loop_manager.validate_repository", return_value=repo
@@ -331,7 +336,7 @@ class LoopManagerTest(unittest.TestCase):
                 "loop_manager.ensure_safe_base_worktree"
             ), mock.patch(
                 "loop_manager.run_codex", return_value=(0, "")
-            ) as planner:
+            ) as planner, mock.patch("loop_manager.operation_log", side_effect=lambda message, **kwargs: logs.append((message, kwargs))):
                 self.assertEqual(
                     loop_manager.run_project(
                         connection, state_dir, str(repo), Path("unused.ini"), "main", False
@@ -343,6 +348,7 @@ class LoopManagerTest(unittest.TestCase):
                 ).fetchone()["planning_fingerprint"]
                 self.assertIsNotNone(first)
                 self.assertEqual(planner.call_count, 1)
+                self.assertEqual(logs[0], ("Planner 시작: 다음 ExecPlan 계획을 생성합니다.", {}))
 
                 planner.reset_mock()
                 self.assertEqual(
@@ -1931,6 +1937,7 @@ risk: medium
             repo, state_dir, connection = self._make_active_worker_project(directory)
             sessions = []
             prompts = []
+            logs = []
 
             def worker(_worktree, _state, _config, role_name, prompt, **kwargs):
                 self.assertEqual(role_name, "worker")
@@ -1944,7 +1951,7 @@ risk: medium
                 "loop_manager.pr_for_branch", return_value=None
             ), mock.patch("loop_manager.run_codex", side_effect=worker), mock.patch(
                 "loop_manager.verify", return_value=(False, "verify failed")
-            ) as verify:
+            ) as verify, mock.patch("loop_manager.operation_log", side_effect=lambda message, **kwargs: logs.append((message, kwargs))):
                 self.assertEqual(
                     loop_manager.run_project(
                         connection, state_dir, str(repo), Path("unused.ini"), "main", False
@@ -1970,11 +1977,55 @@ risk: medium
 
             self.assertEqual(sessions, [None, "worker-session"])
             self.assertIn("전체 검증 실패:\nverify failed", prompts[1])
+            self.assertEqual(
+                logs,
+                [
+                    ("Worker 시작: G-001 Worker Boundary", {}),
+                    ("전체 verify 시작: G-001 Worker Boundary", {}),
+                    ("Worker 반환: G-001 Worker Boundary (전체 verify 실패)", {"error": True}),
+                    ("verify failed", {"error": True}),
+                    ("Worker 시작: G-001 Worker Boundary", {}),
+                    ("전체 verify 시작: G-001 Worker Boundary", {}),
+                    ("Worker 반환: G-001 Worker Boundary (전체 verify 실패)", {"error": True}),
+                    ("verify failed", {"error": True}),
+                ],
+            )
+
+    def test_rebase_verify_failure_returns_to_worker_with_identifying_logs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state_dir, connection = self._make_active_worker_project(directory)
+            logs = []
+            original_git = loop_manager.git
+            origin_reads = 0
+
+            def git_after_base_advance(path, *arguments, **kwargs):
+                nonlocal origin_reads
+                if arguments == ("rev-parse", "origin/main"):
+                    origin_reads += 1
+                    if origin_reads > 1:
+                        return subprocess.CompletedProcess(["git", *arguments], 0, stdout="f" * 40 + "\n")
+                if arguments == ("rebase", "origin/main"):
+                    return subprocess.CompletedProcess(["git", *arguments], 0, stdout="")
+                return original_git(path, *arguments, **kwargs)
+
+            def worker(worktree, _state, _config, _role, _prompt, **_kwargs):
+                (worktree / "src/app.py").write_text("VALUE = 2\n", encoding="utf-8")
+                return loop_manager.CodexResult(0, worker_result("Rebase failure context"), "worker-session")
+
+            with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch("loop_manager.remote_base", return_value="main"), mock.patch("loop_manager.ensure_safe_base_worktree"), mock.patch("loop_manager.pr_for_branch", return_value=None), mock.patch("loop_manager.run_codex", side_effect=worker), mock.patch("loop_manager.verify", side_effect=[(True, "first verify"), (False, "rebased verify failed")]) as verify, mock.patch("loop_manager.git", side_effect=git_after_base_advance), mock.patch("loop_manager.operation_log", side_effect=lambda message, **kwargs: logs.append((message, kwargs))):
+                self.assertEqual(loop_manager.run_project(connection, state_dir, str(repo), Path("unused.ini"), "main", False), 1)
+
+            row = connection.execute("SELECT phase, last_error FROM projects WHERE repo = ?", (str(repo),)).fetchone()
+            self.assertEqual(row["phase"], "WORKING")
+            self.assertIn("rebase 후 전체 검증 실패:\nrebased verify failed", row["last_error"])
+            self.assertEqual(verify.call_count, 2)
+            self.assertEqual(logs, [("Worker 시작: G-001 Worker Boundary", {}), ("전체 verify 시작: G-001 Worker Boundary", {}), ("전체 verify 시작: G-001 Worker Boundary (rebase 후)", {}), ("Worker 반환: G-001 Worker Boundary (rebase 후 전체 verify 실패)", {"error": True}), ("rebased verify failed", {"error": True})])
 
     def test_verify_success_passes_worker_and_verify_results_to_reviewer(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, state_dir, connection = self._make_active_worker_project(directory)
             calls = []
+            logs = []
 
             def agent(worktree, _state, _config, role_name, prompt, **kwargs):
                 calls.append((role_name, prompt, kwargs))
@@ -1990,7 +2041,7 @@ risk: medium
                 "loop_manager.pr_for_branch", side_effect=[None, {"url": "https://example.test/pr/1"}]
             ), mock.patch("loop_manager.run_codex", side_effect=agent), mock.patch(
                 "loop_manager.verify", return_value=(True, "verify: PASS")
-            ) as verify:
+            ) as verify, mock.patch("loop_manager.operation_log", side_effect=lambda message, **kwargs: logs.append((message, kwargs))):
                 self.assertEqual(
                     loop_manager.run_project(
                         connection, state_dir, str(repo), Path("unused.ini"), "main", False
@@ -1999,6 +2050,7 @@ risk: medium
                 )
                 verify.assert_called_once()
 
+            self.assertEqual(logs[:3], [("Worker 시작: G-001 Worker Boundary", {}), ("전체 verify 시작: G-001 Worker Boundary", {}), ("Reviewer 시작: G-001 Worker Boundary", {})])
             self.assertEqual(
                 git_command(repo, "log", "-1", "--pretty=%s"),
                 "Persist worker change",
@@ -2209,6 +2261,7 @@ class WorkerPublicationTest(unittest.TestCase):
             versions = iter((2, 3, 4))
             review_messages = iter(("VERDICT: FAIL", "VERDICT: PASS"))
             reviewer_prompts = []
+            logs = []
 
             def agent(worktree, _state, _config, role_name, prompt, **_kwargs):
                 if role_name == "worker":
@@ -2239,7 +2292,7 @@ class WorkerPublicationTest(unittest.TestCase):
             ), mock.patch("loop_manager.run_codex", side_effect=agent), mock.patch(
                 "loop_manager.verify",
                 side_effect=[(False, "verify failed"), (True, "verify: PASS"), (True, "verify: PASS")],
-            ), mock.patch("loop_manager.command", side_effect=command_stub):
+            ), mock.patch("loop_manager.command", side_effect=command_stub), mock.patch("loop_manager.operation_log", side_effect=lambda message, **kwargs: logs.append((message, kwargs))):
                 for expected in (1, 1, 0):
                     self.assertEqual(
                         loop_manager.run_project(
@@ -2282,6 +2335,8 @@ class WorkerPublicationTest(unittest.TestCase):
         pr_title = gh_commands[0][gh_commands[0].index("--title") + 1]
         self.assertEqual(pr_title, "Implement G-001: Worker Boundary")
         self.assertNotEqual(pr_title, "Publish reviewed context")
+        self.assertIn(("Reviewer 시작: G-001 Worker Boundary", {}), logs)
+        self.assertIn(("Worker 반환: G-001 Worker Boundary (Review 실패)", {"error": True}), logs)
 
 
     def test_invalid_worker_result_resumes_same_session_without_verify(self):
@@ -2650,6 +2705,72 @@ class MergeIndependentWorktreeCleanupTest(unittest.TestCase):
 
         process_lock.assert_called_once_with(state_dir)
         connect_database.assert_called_once_with(state_dir, create=True)
+
+
+class TimestampedExecutionProgressLogsTest(unittest.TestCase):
+    def test_operation_log_uses_fixed_local_timestamp_for_both_streams(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch("loop_manager.local_now", return_value=datetime.datetime(2026, 9, 19, 8, 7, 6)), mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
+            loop_manager.operation_log("started")
+            loop_manager.operation_log("failed", error=True)
+        self.assertEqual(stdout.getvalue(), "2026-09-19 08:07:06 started\n")
+        self.assertEqual(stderr.getvalue(), "2026-09-19 08:07:06 failed\n")
+
+    def test_skip_if_running_only_silences_lock_contention(self):
+        state_dir = Path("state")
+        with mock.patch("sys.argv", ["loop_manager.py", "run", "repo", "--skip-if-running"]), mock.patch("loop_manager.state_directory", return_value=state_dir), mock.patch("loop_manager.process_lock", side_effect=loop_manager.ProcessLockBusyError("busy")), mock.patch("builtins.print") as output:
+            self.assertEqual(loop_manager.main(), 0)
+        output.assert_not_called()
+        with mock.patch("sys.argv", ["loop_manager.py", "run", "repo"]), mock.patch("loop_manager.state_directory", return_value=state_dir), mock.patch("loop_manager.process_lock", side_effect=loop_manager.ProcessLockBusyError("busy")), mock.patch("builtins.print") as output:
+            self.assertEqual(loop_manager.main(), 1)
+        self.assertTrue(output.called)
+        with mock.patch("sys.argv", ["loop_manager.py", "run", "repo", "--skip-if-running"]), mock.patch("loop_manager.state_directory", return_value=state_dir), mock.patch("loop_manager.process_lock", side_effect=RuntimeError("broken")), mock.patch("builtins.print") as output:
+            self.assertEqual(loop_manager.main(), 1)
+        self.assertTrue(output.called)
+
+    def test_process_lock_only_classifies_contention_errnos_as_busy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch("fcntl.flock", side_effect=OSError(loop_manager.errno.EAGAIN, "busy")):
+                with self.assertRaises(loop_manager.ProcessLockBusyError):
+                    with loop_manager.process_lock(Path(directory)):
+                        pass
+            with mock.patch("fcntl.flock", side_effect=OSError(loop_manager.errno.ENOLCK, "lock system failure")):
+                with self.assertRaises(OSError) as raised:
+                    with loop_manager.process_lock(Path(directory)):
+                        pass
+
+        self.assertEqual(raised.exception.errno, loop_manager.errno.ENOLCK)
+
+    def test_bash_launcher_preserves_git_output_exit_code_and_run_arguments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            launcher = root / "run.sh"
+            launcher.write_text((loop_manager.ROOT / "run.sh").read_text(encoding="utf-8"), encoding="utf-8")
+            python = root / ".venv/bin/python"
+            python.parent.mkdir(parents=True)
+            python.write_text("#!/usr/bin/env bash\nprintf 'python:%s\\n' \"$*\"\n", encoding="utf-8")
+            python.chmod(0o755)
+            git = root / "bin/git"
+            git.parent.mkdir()
+            git.write_text("#!/usr/bin/env bash\nprintf '%s\\n' \"${GIT_OUTPUT:-Already up to date.}\"\nexit \"${GIT_EXIT:-0}\"\n", encoding="utf-8")
+            git.chmod(0o755)
+            env = {**os.environ, "PATH": f"{git.parent}:{os.environ['PATH']}", "GIT_OUTPUT": "Updated"}
+            completed = subprocess.run(["bash", str(launcher), "target-repo"], cwd=root, env=env, text=True, capture_output=True)
+            self.assertEqual(completed.returncode, 0)
+            self.assertIn("Updated", completed.stdout)
+            self.assertIn("python:-u", completed.stdout)
+            self.assertIn("run target-repo", completed.stdout)
+            failed = subprocess.run(["bash", str(launcher), "target-repo"], cwd=root, env={**env, "GIT_OUTPUT": "pull failed", "GIT_EXIT": "2"}, text=True, capture_output=True)
+            self.assertEqual(failed.returncode, 1)
+            self.assertIn("pull failed", failed.stdout)
+            self.assertNotIn("python:", failed.stdout)
+
+
+    def test_launchers_have_no_timestamp_banner_and_scheduler_option_is_documented(self):
+        self.assertNotIn("Get-Date -Format", (loop_manager.ROOT / "run.ps1").read_text(encoding="utf-8"))
+        self.assertNotIn("date ", (loop_manager.ROOT / "run.sh").read_text(encoding="utf-8"))
+        self.assertIn("--skip-if-running", (loop_manager.ROOT / "README.md").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

@@ -7,7 +7,9 @@ import argparse
 from collections.abc import Callable
 import configparser
 import contextlib
+import errno
 from dataclasses import dataclass
+from datetime import datetime
 import hashlib
 import json
 import os
@@ -118,6 +120,33 @@ class WorkerPublication:
 class WorkerResultError(RuntimeError):
     """A Worker final response cannot safely be published."""
 
+
+class ProcessLockBusyError(RuntimeError):
+    """The single Loop Manager process lock is already held."""
+
+
+def local_now() -> datetime:
+    """Return the local clock through a patchable boundary for operation logs."""
+
+    return datetime.now()
+
+
+def operation_log(message: str, *, error: bool = False) -> None:
+    """Write timestamped operational output without adding persistent state."""
+
+    prefix = local_now().strftime("%Y-%m-%d %H:%M:%S")
+    output = sys.stderr if error else sys.stdout
+    for line in str(message).splitlines() or [""]:
+        __import__("builtins").print(f"{prefix} {line}", file=output)
+
+
+def operation_print(*values: object, **kwargs: object) -> None:
+    """Route legacy operational output through the shared timestamped boundary."""
+
+    output = kwargs.get("file", sys.stdout)
+    separator = str(kwargs.get("sep", " "))
+    operation_log(separator.join(str(value) for value in values), error=output is sys.stderr)
+
 def state_directory(value: str | None = None) -> Path:
 
     if value:
@@ -129,6 +158,14 @@ def state_directory(value: str | None = None) -> Path:
     else:
         parent = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
     return parent / "loop-manager"
+
+
+def is_lock_contention(error: OSError) -> bool:
+    """Return whether a non-blocking lock failure means another process holds it."""
+
+    return error.errno in {errno.EACCES, errno.EAGAIN} or (
+        os.name == "nt" and error.winerror in {32, 33}
+    )
 
 
 @contextlib.contextmanager
@@ -153,7 +190,9 @@ def process_lock(state_dir: Path):
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as error:
         handle.close()
-        raise RuntimeError("다른 Loop Manager 프로세스가 실행 중입니다.") from error
+        if is_lock_contention(error):
+            raise ProcessLockBusyError("다른 Loop Manager 프로세스가 실행 중입니다.") from error
+        raise
     try:
         yield
     finally:
@@ -1417,7 +1456,7 @@ def run_project(
 
     cleanup_pending = recheck_cleanup_pending(connection, repo_path, repo)
     for pending in cleanup_pending:
-        print(
+        operation_print(
             f"보존된 worktree: {pending['worktree']} ({pending['reason']})",
             file=sys.stderr,
         )
@@ -1427,7 +1466,7 @@ def run_project(
         if existing_pr:
             update_project(connection, repo, pr_url=existing_pr["url"])
             if existing_pr["state"] == "OPEN":
-                print(f"Merge 대기 중: {existing_pr['url']}")
+                operation_print(f"Merge 대기 중: {existing_pr['url']}")
                 return 0
             if existing_pr["state"] == "MERGED" or existing_pr.get("mergedAt"):
                 git(repo_path, "fetch", "origin")
@@ -1443,20 +1482,20 @@ def run_project(
                     pr_head_oid,
                 )
                 if assessment.status in {"safe", "missing"}:
-                    print(f"Merge 확인 및 worktree 정리 완료: {existing_pr['url']}")
+                    operation_print(f"Merge 확인 및 worktree 정리 완료: {existing_pr['url']}")
                 else:
-                    print(
+                    operation_print(
                         f"Merge 확인 완료; worktree 보존: {worktree} "
                         f"({assessment.reason or assessment.status})",
                         file=sys.stderr,
                     )
                 return 0
             update_project(connection, repo, phase="BLOCKED", last_error="PR이 Merge 없이 닫혔습니다.")
-            print(f"닫힌 PR을 다시 열어야 합니다: {existing_pr['url']}", file=sys.stderr)
+            operation_print(f"닫힌 PR을 다시 열어야 합니다: {existing_pr['url']}", file=sys.stderr)
             return 1
 
     if row and row["phase"] == "BLOCKED":
-        print(
+        operation_print(
             f"작업이 차단되어 있습니다: {row['last_error'] or '사용자 조치가 필요합니다.'}",
             file=sys.stderr,
         )
@@ -1470,7 +1509,7 @@ def run_project(
     # worktree later becomes unsafe. The fingerprint reads origin directly,
     # so this check neither reads nor alters the user's local changes.
     if row and row["planning_error"] and row["planning_error_fingerprint"] == current_fingerprint:
-        print(
+        operation_print(
             f"계획 오류가 해결되지 않았습니다: {row['planning_error']}\n"
             f"보존된 planning worktree: {row['worktree']}",
             file=sys.stderr,
@@ -1510,18 +1549,18 @@ def run_project(
 
     if not row["phase"] and row["planning_fingerprint"] == current_fingerprint:
         update_project(connection, repo, processed_sha=base_sha)
-        print("계획 입력이 바뀌지 않아 Codex를 실행하지 않습니다.")
+        operation_print("계획 입력이 바뀌지 않아 Codex를 실행하지 않습니다.")
         return 0
 
     if not row["phase"] and row["planning_fingerprint"] and row["processed_sha"]:
         processed_fingerprint = _planning_input_fingerprint(repo_path, row["processed_sha"])
         if processed_fingerprint == current_fingerprint:
             update_project(connection, repo, processed_sha=base_sha)
-            print("계획 입력이 바뀌지 않아 Codex를 실행하지 않습니다.")
+            operation_print("계획 입력이 바뀌지 않아 Codex를 실행하지 않습니다.")
             return 0
         if _is_requirement_archive_only_change(repo_path, row["processed_sha"], base_sha):
             update_project(connection, repo, processed_sha=base_sha)
-            print("Requirement archive 이동 외의 계획 입력이 바뀌지 않아 Codex를 실행하지 않습니다.")
+            operation_print("Requirement archive 이동 외의 계획 입력이 바뀌지 않아 Codex를 실행하지 않습니다.")
             return 0
 
     if not row["phase"]:
@@ -1582,6 +1621,7 @@ def run_project(
                 and row["planning_retry_count"] >= MAX_PLANNER_VALIDATION_RETRIES
             )
         ):
+            operation_log("Planner 시작: 다음 ExecPlan 계획을 생성합니다.")
             # A Planner can modify the worktree before its CLI invocation
             # returns. Persist this boundary first so an interrupted process
             # resumes that same session before validating its partial output.
@@ -1629,7 +1669,7 @@ def run_project(
                     planning_result_pending_validation=0,
                     planning_result_completed=0,
                 )
-                print(message or "Planner 실행에 실패했습니다.", file=sys.stderr)
+                operation_print(message or "Planner 실행에 실패했습니다.", file=sys.stderr)
                 return 1
             update_project(
                 connection,
@@ -1664,7 +1704,7 @@ def run_project(
                     planning_error_fingerprint=current_fingerprint,
                 )
             update_project(connection, repo, **values)
-            print(str(error), file=sys.stderr)
+            operation_print(str(error), file=sys.stderr)
             return 1
 
         if validated_result is None:
@@ -1676,7 +1716,7 @@ def run_project(
                 processed_sha=row["active_sha"],
                 planning_fingerprint=completed_fingerprint,
             )
-            print("추가로 계획할 작업이 없습니다.")
+            operation_print("추가로 계획할 작업이 없습니다.")
             return 0
 
         plan_path, plan = validated_result
@@ -1702,7 +1742,7 @@ def run_project(
             if not published:
                 git(repo_path, "worktree", "remove", str(planning_worktree))
                 clear_active(connection, repo)
-                print("계획 중 base가 변경되어 최신 기준으로 다시 계획합니다.", file=sys.stderr)
+                operation_print("계획 중 base가 변경되어 최신 기준으로 다시 계획합니다.", file=sys.stderr)
                 return 1
         if latest_sha != plan_commit:
             if latest_sha == row["active_sha"]:
@@ -1715,13 +1755,13 @@ def run_project(
                 )
                 if pushed.returncode:
                     update_project(connection, repo, last_error=f"ExecPlan push 실패:\n{pushed.stdout[-8000:]}")
-                    print(pushed.stdout, file=sys.stderr)
+                    operation_print(pushed.stdout, file=sys.stderr)
                     return 1
                 git(repo_path, "fetch", "origin")
                 latest_sha = git(repo_path, "rev-parse", f"origin/{base}").stdout.strip()
                 if latest_sha != plan_commit:
                     update_project(connection, repo, last_error="ExecPlan push 결과를 origin/base에서 확인할 수 없습니다.")
-                    print("ExecPlan push 결과 확인에 실패했습니다.", file=sys.stderr)
+                    operation_print("ExecPlan push 결과 확인에 실패했습니다.", file=sys.stderr)
                     return 1
 
         git(repo_path, "worktree", "remove", str(planning_worktree))
@@ -1747,6 +1787,7 @@ def run_project(
 
     if row["phase"] == "WORKING":
         plan = validate_execplan(worktree, row["plan_path"])
+        operation_log(f"Worker 시작: {plan['id']} {plan['title']}")
         level = worker_level(plan)
         result = run_codex(
             worktree,
@@ -1771,7 +1812,7 @@ def run_project(
 
         if code:
             update_project(connection, repo, phase="WORKING", last_error=message or f"Codex 종료 코드 {code}")
-            print(message or "Codex 실행에 실패했습니다.", file=sys.stderr)
+            operation_print(message or "Codex 실행에 실패했습니다.", file=sys.stderr)
             return 1
         try:
             parse_worker_result(message, plan)
@@ -1783,7 +1824,7 @@ def run_project(
                 phase="WORKING",
                 last_error=validation_error,
             )
-            print(validation_error, file=sys.stderr)
+            operation_print(validation_error, file=sys.stderr)
             return 1
         update_project(
             connection,
@@ -1797,16 +1838,18 @@ def run_project(
     row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
     if row["phase"] == "VERIFYING":
         plan = validate_execplan(worktree, row["plan_path"])
+        operation_log(f"전체 verify 시작: {plan['id']} {plan['title']}")
         try:
             worker_publication = parse_worker_result(str(row["worker_result"] or ""), plan)
         except WorkerResultError as error:
             validation_error = f"Worker 결과 검증 실패:\n{error}"
             update_project(connection, repo, phase="WORKING", last_error=validation_error)
-            print(validation_error, file=sys.stderr)
+            operation_print(validation_error, file=sys.stderr)
             return 1
 
         passed, output = verify(worktree)
         if not passed:
+            operation_log(f"Worker 반환: {plan['id']} {plan['title']} (전체 verify 실패)", error=True)
             update_project(
                 connection,
                 repo,
@@ -1814,7 +1857,7 @@ def run_project(
                 verify_result=None,
                 last_error=f"전체 검증 실패:\n{output}",
             )
-            print(output, file=sys.stderr)
+            operation_print(output, file=sys.stderr)
             return 1
 
         dirty = bool(git(worktree, "status", "--porcelain").stdout.strip())
@@ -1822,7 +1865,7 @@ def run_project(
         if not dirty and not ahead:
             git(repo_path, "worktree", "remove", str(worktree))
             clear_active(connection, repo)
-            print("추가로 구현할 작업이 없습니다.")
+            operation_print("추가로 구현할 작업이 없습니다.")
             return 0
         if dirty:
             git(worktree, "add", "-A")
@@ -1835,10 +1878,12 @@ def run_project(
             rebased = git(worktree, "rebase", f"origin/{base}", check=False)
             if rebased.returncode:
                 update_project(connection, repo, phase="WORKING", last_error=f"rebase 실패:\n{rebased.stdout[-8000:]}")
-                print(rebased.stdout, file=sys.stderr)
+                operation_print(rebased.stdout, file=sys.stderr)
                 return 1
+            operation_log(f"전체 verify 시작: {plan['id']} {plan['title']} (rebase 후)")
             passed, output = verify(worktree)
             if not passed:
+                operation_log(f"Worker 반환: {plan['id']} {plan['title']} (rebase 후 전체 verify 실패)", error=True)
                 update_project(
                     connection,
                     repo,
@@ -1846,7 +1891,7 @@ def run_project(
                     verify_result=None,
                     last_error=f"rebase 후 전체 검증 실패:\n{output}",
                 )
-                print(output, file=sys.stderr)
+                operation_print(output, file=sys.stderr)
                 return 1
             update_project(connection, repo, active_sha=latest_sha, verify_result=output)
         else:
@@ -1855,6 +1900,8 @@ def run_project(
 
     row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
     if row["phase"] == "REVIEWING":
+        plan = validate_execplan(worktree, row["plan_path"])
+        operation_log(f"Reviewer 시작: {plan['id']} {plan['title']}")
         code, review = run_codex(
             worktree,
             state_dir,
@@ -1867,8 +1914,9 @@ def run_project(
             r"(?mi)^VERDICT:\s*FAIL\s*$", review
         )
         if not passed:
+            operation_log(f"Worker 반환: {plan['id']} {plan['title']} (Review 실패)", error=True)
             update_project(connection, repo, phase="WORKING", last_error=f"Review 실패:\n{review[-8000:]}")
-            print(review or "Reviewer 실행에 실패했습니다.", file=sys.stderr)
+            operation_print(review or "Reviewer 실행에 실패했습니다.", file=sys.stderr)
             return 1
         update_project(connection, repo, phase="PUBLISHING", last_error=None)
 
@@ -1887,7 +1935,7 @@ def run_project(
             except WorkerResultError as error:
                 validation_error = f"Worker 결과 검증 실패:\n{error}"
                 update_project(connection, repo, phase="WORKING", last_error=validation_error)
-                print(validation_error, file=sys.stderr)
+                operation_print(validation_error, file=sys.stderr)
                 return 1
             origin_url = git(worktree, "remote", "get-url", "origin").stdout.strip()
             body = build_pr_body(
@@ -1919,7 +1967,7 @@ def run_project(
         else:
             url = str(existing_pr["url"])
         update_project(connection, repo, phase="PR_OPEN", pr_url=url, last_error=None)
-        print(f"PR 생성 완료: {url}")
+        operation_print(f"PR 생성 완료: {url}")
     return 0
 
 
@@ -1937,6 +1985,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="공통 AGENTS.md가 포함되지 않은 프로젝트를 확인 후 강제 실행",
     )
+    run.add_argument(
+        "--skip-if-running",
+        action="store_true",
+        help="다른 Loop Manager가 실행 중이면 스케줄러용으로 조용히 성공 종료",
+    )
     return parser
 
 
@@ -1948,7 +2001,7 @@ def main() -> int:
             if args.command == "init":
                 with connect_database(state_dir, create=True):
                     pass
-                print(f"상태 DB 초기화 완료: {state_dir / 'loop-manager.db'}")
+                operation_print(f"상태 DB 초기화 완료: {state_dir / 'loop-manager.db'}")
                 return 0
             with connect_database(state_dir) as connection:
                 return run_project(
@@ -1959,8 +2012,13 @@ def main() -> int:
                     args.base,
                     args.allow_agents_mismatch,
                 )
+    except ProcessLockBusyError as error:
+        if args.command == "run" and args.skip_if_running:
+            return 0
+        operation_log(f"오류: {error}", error=True)
+        return 1
     except (RuntimeError, OSError, sqlite3.DatabaseError, json.JSONDecodeError) as error:
-        print(f"오류: {error}", file=sys.stderr)
+        operation_log(f"오류: {error}", error=True)
         return 1
 
 

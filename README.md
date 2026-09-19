@@ -110,7 +110,7 @@ Planner가 만든 ExecPlan은 검증 후 대상 저장소의 base branch에 fast
 
 실행기는 한 번에 한 프로젝트의 작은 작업 하나만 별도 worktree에서 처리한다. PR을 생성하면 Merge될 때까지 새 작업을 시작하지 않으며, 현재 기준 commit에서 할 일이 없다고 판단한 뒤에는 commit이 바뀔 때까지 Codex를 다시 호출하지 않는다. 서버에는 Python 3, Git, GitHub CLI와 인증된 Codex CLI가 필요하다.
 
-cron에는 같은 `run` 명령을 등록한다. 동시 실행은 전역 잠금으로 거부하므로 여러 프로젝트 병렬 처리나 같은 실행에서의 프로젝트 순회는 후속 구현에서 추가한다.
+cron 또는 작업 스케줄러에는 정상적인 중복 실행을 조용히 건너뛰도록 `--skip-if-running`을 붙인 같은 `run` 명령을 등록한다. 예를 들어 `.venv/bin/python loop_manager.py run --skip-if-running /path/to/project`처럼 실행한다. 이 옵션이 없으면 전역 잠금 충돌은 시각이 포함된 오류와 종료 코드 1로 보고된다. 잠금 이외의 오류는 이 옵션을 써도 그대로 보고된다. 동시 실행은 전역 잠금으로 거부하므로 여러 프로젝트 병렬 처리나 같은 실행에서의 프로젝트 순회는 후속 구현에서 추가한다.
 
 ### 5. Pull Request 검토
 

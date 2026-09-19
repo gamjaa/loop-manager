@@ -6,8 +6,6 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 cd "$SCRIPT_DIR"
 
-echo "===== $(date '+%Y-%m-%d %H:%M:%S') ====="
-
 if git_output=$(git pull --ff-only 2>&1); then
     if [[ "$git_output" != "Already up to date." ]]; then
         printf '%s\n' "$git_output"
