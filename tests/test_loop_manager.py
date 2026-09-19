@@ -1789,6 +1789,163 @@ risk: medium
                     )
             run.assert_not_called()
 
+    def _make_active_worker_project(self, directory: str):
+        repo = make_remote_repository(directory)
+        state_dir = Path(directory) / "state"
+        state_dir.mkdir()
+        (repo / "docs/plans").mkdir()
+        plan = write_execplan(repo, "G-001", "Worker Boundary")
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute(loop_manager.SCHEMA)
+        connection.execute(
+            """
+            INSERT INTO projects (
+                repo, base_branch, active_sha, phase, branch, worktree, plan_path
+            ) VALUES (?, 'main', ?, 'WORKING', 'loop-manager/G-001', ?, ?)
+            """,
+            (
+                str(repo),
+                git_command(repo, "rev-parse", "origin/main"),
+                str(repo),
+                plan.relative_to(repo).as_posix(),
+            ),
+        )
+        connection.commit()
+        return repo, state_dir, connection
+
+    def test_worker_and_reviewer_prompts_define_test_execution_boundary(self):
+        worker = loop_manager.worker_prompt("docs/plans/[G-001] Worker Boundary.md", None)
+        reviewer = loop_manager.reviewer_prompt("main", "targeted: PASS", "verify: PASS")
+
+        for phrase in (
+            "최소 범위의 targeted unit test만 실행",
+            "개별 test case, test class, test module",
+            "같은 세션에서 원인을 수정하고 같은 targeted test를 다시 실행",
+            "실행하지 못한 구체적인 사유를 최종 결과에 남겨라",
+            "전체 test suite, integration test, end-to-end test",
+            "프로젝트 전체 lint·build·type check",
+            "scripts/verify 실행은 절대 실행하지 마라",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, worker)
+        self.assertIn("targeted: PASS", reviewer)
+        self.assertIn("verify: PASS", reviewer)
+        self.assertIn("테스트 command와 scripts/verify를 실행하지 말고", reviewer)
+
+    def test_existing_database_adds_worker_session_and_result_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            database = sqlite3.connect(state_dir / "loop-manager.db")
+            database.execute(
+                """
+                CREATE TABLE projects (
+                    repo TEXT PRIMARY KEY,
+                    base_branch TEXT NOT NULL,
+                    phase TEXT
+                )
+                """
+            )
+            database.execute(
+                "INSERT INTO projects (repo, base_branch, phase) VALUES ('repo', 'main', 'WORKING')"
+            )
+            database.commit()
+            database.close()
+
+            with loop_manager.connect_database(state_dir) as connection:
+                columns = {row[1] for row in connection.execute("PRAGMA table_info(projects)")}
+                row = connection.execute("SELECT * FROM projects WHERE repo = 'repo'").fetchone()
+
+        self.assertTrue({"worker_session_id", "worker_result", "verify_result"} <= columns)
+        self.assertIsNone(row["worker_session_id"])
+        self.assertIsNone(row["worker_result"])
+        self.assertIsNone(row["verify_result"])
+
+    def test_verify_failure_resumes_same_worker_session_without_reviewer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state_dir, connection = self._make_active_worker_project(directory)
+            sessions = []
+            prompts = []
+
+            def worker(_worktree, _state, _config, role_name, prompt, **kwargs):
+                self.assertEqual(role_name, "worker")
+                sessions.append(kwargs["session_id"])
+                prompts.append(prompt)
+                return loop_manager.CodexResult(0, "targeted test: PASS", "worker-session")
+
+            with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch("loop_manager.ensure_safe_base_worktree"), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch("loop_manager.run_codex", side_effect=worker), mock.patch(
+                "loop_manager.verify", return_value=(False, "verify failed")
+            ) as verify:
+                self.assertEqual(
+                    loop_manager.run_project(
+                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                    ),
+                    1,
+                )
+                row = connection.execute(
+                    "SELECT * FROM projects WHERE repo = ?", (str(repo),)
+                ).fetchone()
+                self.assertEqual(row["phase"], "WORKING")
+                self.assertEqual(row["worker_session_id"], "worker-session")
+                self.assertEqual(row["worker_result"], "targeted test: PASS")
+                self.assertIsNone(row["verify_result"])
+                self.assertIn("전체 검증 실패:\nverify failed", row["last_error"])
+                verify.assert_called_once()
+
+                self.assertEqual(
+                    loop_manager.run_project(
+                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                    ),
+                    1,
+                )
+
+            self.assertEqual(sessions, [None, "worker-session"])
+            self.assertIn("전체 검증 실패:\nverify failed", prompts[1])
+
+    def test_verify_success_passes_worker_and_verify_results_to_reviewer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state_dir, connection = self._make_active_worker_project(directory)
+            calls = []
+
+            def agent(worktree, _state, _config, role_name, prompt, **kwargs):
+                calls.append((role_name, prompt, kwargs))
+                if role_name == "worker":
+                    (worktree / "src/app.py").write_text("VALUE = 2\n", encoding="utf-8")
+                    return loop_manager.CodexResult(0, "targeted test: PASS", "worker-session")
+                self.assertEqual(role_name, "reviewer")
+                return 0, "VERDICT: PASS"
+
+            with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch("loop_manager.ensure_safe_base_worktree"), mock.patch(
+                "loop_manager.pr_for_branch", side_effect=[None, {"url": "https://example.test/pr/1"}]
+            ), mock.patch("loop_manager.run_codex", side_effect=agent), mock.patch(
+                "loop_manager.verify", return_value=(True, "verify: PASS")
+            ) as verify:
+                self.assertEqual(
+                    loop_manager.run_project(
+                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                    ),
+                    0,
+                )
+                verify.assert_called_once()
+
+            self.assertEqual([role for role, _prompt, _kwargs in calls], ["worker", "reviewer"])
+            reviewer_prompt = calls[1][1]
+            self.assertIn("targeted test: PASS", reviewer_prompt)
+            self.assertIn("verify: PASS", reviewer_prompt)
+            self.assertIn("테스트 command와 scripts/verify를 실행하지 말고", reviewer_prompt)
+
+            row = connection.execute(
+                "SELECT * FROM projects WHERE repo = ?", (str(repo),)
+            ).fetchone()
+            self.assertEqual(row["phase"], "PR_OPEN")
+            self.assertEqual(row["worker_session_id"], "worker-session")
+            self.assertEqual(row["verify_result"], "verify: PASS")
 
 if __name__ == "__main__":
     unittest.main()
