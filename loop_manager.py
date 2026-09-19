@@ -1965,9 +1965,7 @@ def _normalize_temp_path(match: re.Match[str]) -> str:
     leaf = components[-1]
     if _GENERATED_TEMP_COMPONENT.fullmatch(leaf):
         return "<TEMP_PATH>"
-    if len(components) > 1 or "." in leaf:
-        return f"<TEMP_PATH>/{leaf}"
-    return "<TEMP_PATH>"
+    return f"<TEMP_PATH>/{leaf}"
 
 
 def normalize_validation_failure(
@@ -5949,6 +5947,8 @@ def _has_unresolved_targeted_test_failure(evidence: str) -> bool:
         recovery_rerun = rerun
 
     if recovery_rerun is None:
+        return True
+    if commands[-1].start() != recovery_rerun.start():
         return True
     return (
         _TARGETED_TEST_SUCCESS.search(evidence, recovery_rerun.end())

@@ -3098,6 +3098,12 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         temp_directory_second, _ = loop_manager.validation_failure_fingerprint(
             "verify", "workspace cleanup failed: /tmp/tmpXYZ"
         )
+        extensionless_file_first, _ = loop_manager.validation_failure_fingerprint(
+            "verify", "FAIL /tmp/inputA"
+        )
+        extensionless_file_second, _ = loop_manager.validation_failure_fingerprint(
+            "verify", "FAIL /tmp/inputB"
+        )
 
         self.assertEqual(first_normalized, second_normalized)
         self.assertEqual(first_fingerprint, second_fingerprint)
@@ -3106,6 +3112,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         self.assertEqual(same_temp_first, same_temp_second)
         self.assertNotEqual(same_temp_first, different_temp_file)
         self.assertEqual(temp_directory_first, temp_directory_second)
+        self.assertNotEqual(extensionless_file_first, extensionless_file_second)
 
     def test_review_fingerprints_use_stable_issue_ids_not_explanatory_prose(self):
         first = "\n".join(
@@ -3782,6 +3789,13 @@ class WorkerPublicationTest(unittest.TestCase):
                 "FAILED_COMMAND: python3 -m unittest tests.test_a\n"
                 "test_a: FAIL\n"
                 "RERUN: python3 -m unittest tests.test_b\nPASS"
+            ),
+            (
+                "FAILED_COMMAND: python3 -m unittest tests.test_a\n"
+                "test_a: FAIL\n"
+                "RERUN: python3 -m unittest tests.test_a\n"
+                "FAILED_COMMAND: python3 -m unittest tests.test_b\n"
+                "test_b OK"
             ),
         )
         for evidence in invalid_evidence:
