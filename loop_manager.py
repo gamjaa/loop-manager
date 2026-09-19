@@ -112,6 +112,7 @@ CREATE TABLE IF NOT EXISTS exec_plans (
     worktree TEXT,
     pr_url TEXT,
     last_error TEXT,
+    blocked_fingerprint TEXT,
     retry_count INTEGER NOT NULL DEFAULT 0,
     worker_session_id TEXT,
     worker_result TEXT,
@@ -243,6 +244,9 @@ def process_lock(state_dir: Path):
 
 def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
     connection.execute(EXEC_PLANS_SCHEMA)
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(exec_plans)")}
+    if "blocked_fingerprint" not in columns:
+        connection.execute("ALTER TABLE exec_plans ADD COLUMN blocked_fingerprint TEXT")
     connection.execute(EXEC_PLANS_ACTIVE_INDEX)
 
 
@@ -842,10 +846,6 @@ def migrate_legacy_execplans(
                 git(root, "fetch", "origin")
             active_path = str(project["plan_path"] or "")
             documents: dict[str, str] = {}
-            plans_directory = root / "docs/plans"
-            if plans_directory.is_dir():
-                for path in sorted(plans_directory.glob("*.md"), key=lambda item: item.name):
-                    documents[path.relative_to(root).as_posix()] = path.read_text(encoding="utf-8")
 
             revision = f"refs/remotes/origin/{project['base_branch']}"
             listed = git(
@@ -1014,8 +1014,12 @@ def activate_ready_execplan(
     if selected is None:
         return None
     project_id = hashlib.sha256(repo.encode()).hexdigest()[:16]
-    branch = f"loop-manager/{selected['plan_id']}"
-    worktree = state_dir / "worktrees" / project_id / str(selected["plan_id"])
+    branch = str(selected["branch"] or f"loop-manager/{selected['plan_id']}")
+    worktree = (
+        Path(str(selected["worktree"]))
+        if selected["worktree"]
+        else state_dir / "worktrees" / project_id / str(selected["plan_id"])
+    )
     with connection:
         changed = connection.execute(
             """
@@ -1483,6 +1487,21 @@ def changed_files(worktree: Path, since: str | None = None) -> list[str]:
     return sorted(set(unstaged + staged + untracked))
 
 
+def branch_has_changes(worktree: Path, base: str) -> bool:
+    result = git(
+        worktree,
+        "diff",
+        "--quiet",
+        f"origin/{base}...HEAD",
+        check=False,
+    )
+    if result.returncode not in {0, 1}:
+        raise RuntimeError(
+            f"관리 branch 변경 확인에 실패했습니다 (git 종료 코드 {result.returncode})."
+        )
+    return result.returncode == 1
+
+
 def assess_cleanup(worktree: Path, pr_head_oid: str | None) -> CleanupAssessment:
     """Classify a managed worktree without changing it or shared Git state."""
     if not worktree.exists():
@@ -1735,6 +1754,159 @@ def clear_active(
             planning_fingerprint=planning_fingerprint,
         ),
     )
+
+
+def _execplan_input_paths(plan: sqlite3.Row) -> list[str]:
+    sources = json.loads(plan["sources"])
+    return [str(plan["path"]), *(str(source) for source in sources)]
+
+
+def _execplan_input_fingerprint(entries: list[tuple[str, str | None]]) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"loop-manager-blocked-input-v1\0")
+    for relative_path, contents in entries:
+        path_bytes = relative_path.encode("utf-8")
+        digest.update(len(path_bytes).to_bytes(8, "big"))
+        digest.update(path_bytes)
+        if contents is None:
+            digest.update(b"\0")
+            continue
+        normalized = contents.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
+        digest.update(b"\1")
+        digest.update(len(normalized).to_bytes(8, "big"))
+        digest.update(normalized)
+    return digest.hexdigest()
+
+
+def _worktree_execplan_input_fingerprint(worktree: Path, plan: sqlite3.Row) -> str:
+    entries = []
+    for relative_path in _execplan_input_paths(plan):
+        path = worktree / relative_path
+        contents = path.read_text(encoding="utf-8") if path.is_file() else None
+        entries.append((relative_path, contents))
+    return _execplan_input_fingerprint(entries)
+
+
+def _revision_execplan_input_fingerprint(
+    repo_path: Path,
+    revision: str,
+    plan: sqlite3.Row,
+) -> str:
+    entries = []
+    for relative_path in _execplan_input_paths(plan):
+        shown = git(repo_path, "show", f"{revision}:{relative_path}", check=False)
+        entries.append((relative_path, shown.stdout if shown.returncode == 0 else None))
+    return _execplan_input_fingerprint(entries)
+
+
+def block_active_execplan(
+    connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+    error: str,
+    verify_result: str,
+) -> None:
+    project = connection.execute(
+        "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
+    ).fetchone()
+    plan_id = _plan_id_from_path(str(project["plan_path"] or "")) if project else None
+    plan = (
+        connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+            (repo, plan_id),
+        ).fetchone()
+        if plan_id
+        else None
+    )
+    if plan is None:
+        raise RuntimeError("차단할 활성 ExecPlan을 찾을 수 없습니다.")
+    fingerprint = _worktree_execplan_input_fingerprint(worktree, plan)
+    with connection:
+        connection.execute(
+            """
+            UPDATE exec_plans
+            SET status = 'BLOCKED', blocked_fingerprint = ?, last_error = ?,
+                verify_result = ?
+            WHERE repo = ? AND plan_id = ?
+            """,
+            (fingerprint, error, verify_result, repo, plan_id),
+        )
+        connection.execute(
+            """
+            UPDATE projects
+            SET phase = 'BLOCKED', last_error = ?, verify_result = ?
+            WHERE repo = ?
+            """,
+            (error, verify_result, repo),
+        )
+
+
+def resume_blocked_execplan_if_inputs_changed(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    repo: str,
+    base: str,
+) -> bool:
+    plan = active_execplan(connection, repo)
+    if plan is None or plan["status"] != "BLOCKED" or not plan["blocked_fingerprint"]:
+        return False
+    stored = str(plan["blocked_fingerprint"])
+    worktree = Path(str(plan["worktree"]))
+    worktree_changed = (
+        worktree.is_dir()
+        and _worktree_execplan_input_fingerprint(worktree, plan) != stored
+    )
+    remote_changed = (
+        _revision_execplan_input_fingerprint(
+            repo_path,
+            f"refs/remotes/origin/{base}",
+            plan,
+        )
+        != stored
+    )
+    if not worktree_changed and not remote_changed:
+        return False
+    if remote_changed and not worktree_changed and worktree.is_dir():
+        rebased = git(
+            worktree,
+            "rebase",
+            f"origin/{base}",
+            check=False,
+        )
+        if rebased.returncode:
+            error = f"BLOCKED 해제 전 rebase 실패:\n{rebased.stdout[-8000:]}"
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE exec_plans SET last_error = ?
+                    WHERE repo = ? AND plan_id = ?
+                    """,
+                    (error, repo, plan["plan_id"]),
+                )
+                connection.execute(
+                    "UPDATE projects SET last_error = ? WHERE repo = ?",
+                    (error, repo),
+                )
+            return False
+
+    values = _clear_active_values()
+    assignments = ", ".join(f"{name} = ?" for name in values)
+    with connection:
+        connection.execute(
+            """
+            UPDATE exec_plans
+            SET status = 'READY', blocked_fingerprint = NULL, retry_count = 0,
+                last_error = NULL, worker_session_id = NULL, worker_result = NULL,
+                verify_result = NULL
+            WHERE repo = ? AND plan_id = ?
+            """,
+            (repo, plan["plan_id"]),
+        )
+        connection.execute(
+            f"UPDATE projects SET {assignments} WHERE repo = ?",
+            (*values.values(), repo),
+        )
+    return True
 
 
 def complete_merged_worktree(
@@ -2039,11 +2211,22 @@ def run_project(
             return 1
 
     if row and row["phase"] == "BLOCKED":
-        operation_print(
-            f"작업이 차단되어 있습니다: {row['last_error'] or '사용자 조치가 필요합니다.'}",
-            file=sys.stderr,
-        )
-        return 1
+        git(repo_path, "fetch", "origin")
+        if resume_blocked_execplan_if_inputs_changed(
+            connection,
+            repo_path,
+            repo,
+            str(row["base_branch"]),
+        ):
+            row = connection.execute(
+                "SELECT * FROM projects WHERE repo = ?", (repo,)
+            ).fetchone()
+        else:
+            operation_print(
+                f"작업이 차단되어 있습니다: {row['last_error'] or '사용자 조치가 필요합니다.'}",
+                file=sys.stderr,
+            )
+            return 1
 
     base = remote_base(repo_path, requested_base or (row["base_branch"] if row else None))
     base_sha = git(repo_path, "rev-parse", f"origin/{base}").stdout.strip()
@@ -2433,18 +2616,17 @@ def run_project(
             return 1
 
         dirty = bool(git(worktree, "status", "--porcelain").stdout.strip())
-        ahead = int(git(worktree, "rev-list", "--count", f"origin/{base}..HEAD").stdout)
-        if not dirty and not ahead:
+        if not dirty and not branch_has_changes(worktree, base):
             no_change_error = (
                 "Worker가 변경을 만들지 않아 PR을 생성할 수 없습니다. "
                 "ExecPlan은 연결된 PR의 Merge가 확인된 경우에만 MERGED가 됩니다."
             )
-            update_project(
+            block_active_execplan(
                 connection,
                 repo,
-                phase="BLOCKED",
-                verify_result=output,
-                last_error=no_change_error,
+                worktree,
+                no_change_error,
+                output,
             )
             operation_print(no_change_error, file=sys.stderr)
             return 1
@@ -2477,6 +2659,20 @@ def run_project(
             update_project(connection, repo, active_sha=latest_sha, verify_result=output)
         else:
             update_project(connection, repo, verify_result=output)
+        if not branch_has_changes(worktree, base):
+            no_change_error = (
+                "rebase 후 Worker 변경이 남지 않아 PR을 생성할 수 없습니다. "
+                "ExecPlan은 연결된 PR의 Merge가 확인된 경우에만 MERGED가 됩니다."
+            )
+            block_active_execplan(
+                connection,
+                repo,
+                worktree,
+                no_change_error,
+                output,
+            )
+            operation_print(no_change_error, file=sys.stderr)
+            return 1
         update_project(connection, repo, phase="REVIEWING", last_error=None)
 
     row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
