@@ -1,5 +1,6 @@
 import json
 import io
+import datetime
 import sqlite3
 import subprocess
 import tempfile
@@ -2650,6 +2651,34 @@ class MergeIndependentWorktreeCleanupTest(unittest.TestCase):
 
         process_lock.assert_called_once_with(state_dir)
         connect_database.assert_called_once_with(state_dir, create=True)
+
+
+class TimestampedExecutionProgressLogsTest(unittest.TestCase):
+    def test_operation_log_uses_fixed_local_timestamp_for_both_streams(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch("loop_manager.local_now", return_value=datetime.datetime(2026, 9, 19, 8, 7, 6)), mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
+            loop_manager.operation_log("started")
+            loop_manager.operation_log("failed", error=True)
+        self.assertEqual(stdout.getvalue(), "2026-09-19 08:07:06 started\n")
+        self.assertEqual(stderr.getvalue(), "2026-09-19 08:07:06 failed\n")
+
+    def test_skip_if_running_only_silences_lock_contention(self):
+        state_dir = Path("state")
+        with mock.patch("sys.argv", ["loop_manager.py", "run", "repo", "--skip-if-running"]), mock.patch("loop_manager.state_directory", return_value=state_dir), mock.patch("loop_manager.process_lock", side_effect=loop_manager.ProcessLockBusyError("busy")), mock.patch("builtins.print") as output:
+            self.assertEqual(loop_manager.main(), 0)
+        output.assert_not_called()
+        with mock.patch("sys.argv", ["loop_manager.py", "run", "repo"]), mock.patch("loop_manager.state_directory", return_value=state_dir), mock.patch("loop_manager.process_lock", side_effect=loop_manager.ProcessLockBusyError("busy")), mock.patch("builtins.print") as output:
+            self.assertEqual(loop_manager.main(), 1)
+        self.assertTrue(output.called)
+        with mock.patch("sys.argv", ["loop_manager.py", "run", "repo", "--skip-if-running"]), mock.patch("loop_manager.state_directory", return_value=state_dir), mock.patch("loop_manager.process_lock", side_effect=RuntimeError("broken")), mock.patch("builtins.print") as output:
+            self.assertEqual(loop_manager.main(), 1)
+        self.assertTrue(output.called)
+
+    def test_launchers_have_no_timestamp_banner_and_scheduler_option_is_documented(self):
+        self.assertNotIn("Get-Date -Format", (loop_manager.ROOT / "run.ps1").read_text(encoding="utf-8"))
+        self.assertNotIn("date ", (loop_manager.ROOT / "run.sh").read_text(encoding="utf-8"))
+        self.assertIn("--skip-if-running", (loop_manager.ROOT / "README.md").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
