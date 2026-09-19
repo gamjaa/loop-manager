@@ -25,6 +25,10 @@ from urllib.parse import quote
 ROOT = Path(__file__).resolve().parent
 MAX_PLANNER_VALIDATION_RETRIES = 3
 PLAN_SHA_BACKFILL_ERROR = "계획 commit SHA를 기존 작업에서 안전하게 복구할 수 없습니다."
+PRIORITY_ORDER = {"critical": 0, "high": 1, "normal": 2, "low": 3}
+ACTIVE_EXECPLAN_STATUSES = frozenset(
+    {"IMPLEMENTING", "VERIFYING", "REVIEWING", "PUBLISHING", "PR_OPEN", "BLOCKED"}
+)
 FIELDS = {
     "base_branch",
     "processed_sha",
@@ -89,6 +93,39 @@ CREATE TABLE IF NOT EXISTS cleanup_pending (
     PRIMARY KEY (repo, worktree),
     FOREIGN KEY (repo) REFERENCES projects(repo)
 )
+"""
+
+EXEC_PLANS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS exec_plans (
+    repo TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    title TEXT NOT NULL,
+    sources TEXT NOT NULL,
+    depends_on TEXT NOT NULL,
+    priority TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    status TEXT NOT NULL,
+    plan_sha TEXT,
+    active_sha TEXT,
+    branch TEXT,
+    worktree TEXT,
+    pr_url TEXT,
+    last_error TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    worker_session_id TEXT,
+    worker_result TEXT,
+    verify_result TEXT,
+    PRIMARY KEY (repo, plan_id),
+    UNIQUE (repo, path),
+    FOREIGN KEY (repo) REFERENCES projects(repo)
+)
+"""
+
+EXEC_PLANS_ACTIVE_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_execplan_per_project
+ON exec_plans(repo)
+WHERE status IN ('IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING', 'PR_OPEN', 'BLOCKED')
 """
 
 
@@ -204,6 +241,11 @@ def process_lock(state_dir: Path):
         handle.close()
 
 
+def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(EXEC_PLANS_SCHEMA)
+    connection.execute(EXEC_PLANS_ACTIVE_INDEX)
+
+
 def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connection:
     database = state_dir / "loop-manager.db"
     if not create and not database.is_file():
@@ -212,6 +254,7 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
     connection.row_factory = sqlite3.Row
     if create:
         connection.execute(SCHEMA)
+        _ensure_execplans_schema(connection)
         connection.execute(CLEANUP_PENDING_SCHEMA)
         connection.commit()
     else:
@@ -242,20 +285,26 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
             connection.execute(f"ALTER TABLE projects ADD COLUMN {column} {definition}")
     if not migrations.keys() <= columns:
         connection.commit()
+    _ensure_execplans_schema(connection)
     connection.execute(CLEANUP_PENDING_SCHEMA)
     connection.commit()
     backfill_plan_shas(connection)
+    migrate_legacy_execplans(connection)
     return connection
 
 
 def update_project(connection: sqlite3.Connection, repo: str, **values: object) -> None:
     if not values or not set(values).issubset(FIELDS):
         raise ValueError("유효하지 않은 프로젝트 상태 필드입니다.")
+    current = connection.execute(
+        "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
+    ).fetchone()
     assignments = ", ".join(f"{name} = ?" for name in values)
     connection.execute(
         f"UPDATE projects SET {assignments} WHERE repo = ?",
         [*values.values(), repo],
     )
+    _mirror_project_update_to_execplan(connection, repo, current, values)
     connection.commit()
 
 
@@ -484,11 +533,22 @@ def parse_frontmatter(text: str) -> dict[str, object]:
     return values
 
 
-def _parse_execplan(worktree: Path, path: Path) -> dict[str, object]:
-    allowed = {"id", "title", "sources", "depends_on", "complexity", "risk"}
+def _parse_execplan(
+    worktree: Path,
+    path: Path,
+    *,
+    require_priority: bool = False,
+    validate_sources: bool = True,
+) -> dict[str, object]:
+    legacy = {"id", "title", "sources", "depends_on", "complexity", "risk"}
+    allowed = legacy | {"priority"}
     values = parse_frontmatter(path.read_text(encoding="utf-8"))
-    if set(values) != allowed:
+    if set(values) not in {frozenset(legacy), frozenset(allowed)}:
         raise RuntimeError("ExecPlan frontmatter key가 docs/PLANS.md 형식과 다릅니다.")
+    if "priority" not in values:
+        if require_priority:
+            raise RuntimeError("새 ExecPlan에는 priority가 필요합니다.")
+        values["priority"] = "normal"
     plan_id = values["id"]
     title = values["title"]
     if not isinstance(plan_id, str) or not re.fullmatch(r"G-\d{3,}", plan_id):
@@ -507,7 +567,7 @@ def _parse_execplan(worktree: Path, path: Path) -> dict[str, object]:
             or re.fullmatch(r"docs/requirements/[^/\\]+\.md", source)
         ):
             raise RuntimeError(f"허용되지 않는 ExecPlan source입니다: {source}")
-        if not (worktree / source).is_file():
+        if validate_sources and not (worktree / source).is_file():
             raise RuntimeError(f"존재하지 않는 ExecPlan source입니다: {source}")
     for dependency in dependencies:
         if not isinstance(dependency, str) or not re.fullmatch(r"G-\d{3,}", dependency):
@@ -516,6 +576,8 @@ def _parse_execplan(worktree: Path, path: Path) -> dict[str, object]:
         raise RuntimeError("ExecPlan complexity가 유효하지 않습니다.")
     if values["risk"] not in {"low", "medium", "high", "critical"}:
         raise RuntimeError("ExecPlan risk가 유효하지 않습니다.")
+    if values["priority"] not in PRIORITY_ORDER:
+        raise RuntimeError("ExecPlan priority가 유효하지 않습니다.")
     return values
 
 
@@ -553,7 +615,7 @@ def _validate_dependency_graph(catalog: dict[str, dict[str, object]]) -> None:
             visit(plan_id)
 
 
-def load_execplan_catalog(worktree: Path) -> dict[str, dict[str, object]]:
+def load_execplan_catalog(worktree: Path, *, validate_sources: bool = True) -> dict[str, dict[str, object]]:
     entries: list[tuple[str, dict[str, object]]] = []
     plans_directory = worktree / "docs/plans"
     plan_paths = sorted(
@@ -561,7 +623,7 @@ def load_execplan_catalog(worktree: Path) -> dict[str, dict[str, object]]:
         key=lambda path: path.name,
     )
     for path in plan_paths:
-        plan = _parse_execplan(worktree, path)
+        plan = _parse_execplan(worktree, path, validate_sources=validate_sources)
         plan_id = plan["id"]
         assert isinstance(plan_id, str)
         entries.append((plan_id, plan))
@@ -596,29 +658,417 @@ def validate_planner_result(
     worktree: Path,
     active_sha: str,
     dirty_files: list[str],
-) -> tuple[str, dict[str, object]] | None:
-    """Validate only the Planner-owned output, leaving Git publication outside.
+) -> list[tuple[str, dict[str, object]]] | None:
+    """Validate a batch of new Planner-owned ExecPlans before publication.
 
     Scope and ExecPlan catalog errors are deliberately translated to a
     dedicated exception. Operational Git failures must retain their normal
     recovery boundary and never consume the Planner validation retry budget.
     """
-    if dirty_files:
-        if len(dirty_files) != 1 or not re.fullmatch(r"docs/plans/[^/]+\.md", dirty_files[0]):
-            raise PlannerValidationError("Planner는 docs/plans의 ExecPlan 하나만 변경해야 합니다.")
-        plan_path = dirty_files[0]
-    else:
-        planned_files = changed_files(worktree, active_sha)
-        if not planned_files:
-            return None
-        if len(planned_files) != 1 or not re.fullmatch(r"docs/plans/[^/]+\.md", planned_files[0]):
-            raise PlannerValidationError("Planner commit에는 ExecPlan 하나만 있어야 합니다.")
-        plan_path = planned_files[0]
+    planned_files = sorted(set(dirty_files) | set(changed_files(worktree, active_sha)))
+    if not planned_files:
+        return None
+    for plan_path in planned_files:
+        if not re.fullmatch(r"docs/plans/[^/]+\.md", plan_path):
+            raise PlannerValidationError("Planner는 docs/plans의 새 ExecPlan만 작성해야 합니다.")
+        if not (worktree / plan_path).is_file():
+            raise PlannerValidationError("Planner는 기존 ExecPlan을 삭제할 수 없습니다.")
+        existed = git(
+            worktree,
+            "cat-file",
+            "-e",
+            f"{active_sha}:{plan_path}",
+            check=False,
+        ).returncode == 0
+        if existed:
+            raise PlannerValidationError(f"Planner는 기존 ExecPlan을 수정할 수 없습니다: {plan_path}")
 
     try:
-        return plan_path, validate_execplan(worktree, plan_path)
+        catalog = load_execplan_catalog(worktree, validate_sources=False)
+        plans: list[tuple[str, dict[str, object]]] = []
+        for plan_path in planned_files:
+            parsed = _parse_execplan(worktree, worktree / plan_path, require_priority=True)
+            plans.append((plan_path, parsed))
+        new_ids = {str(plan["id"]) for _, plan in plans}
+        existing_ids = [int(plan_id[2:]) for plan_id in catalog if plan_id not in new_ids]
+        first_id = max(existing_ids, default=0) + 1
+        expected = list(range(first_id, first_id + len(plans)))
+        actual = sorted(int(str(plan["id"])[2:]) for _, plan in plans)
+        if actual != expected:
+            raise RuntimeError("새 ExecPlan ID는 기존 최대 번호 다음부터 연속적이어야 합니다.")
+        return sorted(plans, key=lambda item: int(str(item[1]["id"])[2:]))
     except RuntimeError as error:
         raise PlannerValidationError(str(error)) from error
+
+
+def _plan_id_from_path(path: str) -> str | None:
+    match = re.fullmatch(r"docs/plans/\[(G-\d{3,})\] [^/]+\.md", path)
+    return match.group(1) if match else None
+
+
+def _execplan_metadata(plan: dict[str, object]) -> tuple[str, str, str]:
+    return (
+        json.dumps(plan["sources"], ensure_ascii=False, separators=(",", ":")),
+        json.dumps(plan["depends_on"], ensure_ascii=False, separators=(",", ":")),
+        str(plan["priority"]),
+    )
+
+
+def register_execplans(
+    connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+    plans: list[tuple[str, dict[str, object]]],
+    plan_commit: str,
+    planning_fingerprint: str,
+) -> None:
+    """Register one published Planner batch atomically and idempotently."""
+
+    with connection:
+        _ensure_execplans_schema(connection)
+        for path, plan in plans:
+            plan_id = str(plan["id"])
+            sources, dependencies, priority = _execplan_metadata(plan)
+            content_hash = file_hash(worktree / path)
+            existing = connection.execute(
+                "SELECT * FROM exec_plans WHERE repo = ? AND (plan_id = ? OR path = ?)",
+                (repo, plan_id, path),
+            ).fetchone()
+            if existing:
+                immutable = (
+                    existing["plan_id"],
+                    existing["path"],
+                    existing["title"],
+                    existing["sources"],
+                    existing["depends_on"],
+                    existing["priority"],
+                    existing["content_hash"],
+                    existing["plan_sha"],
+                )
+                expected = (
+                    plan_id,
+                    path,
+                    str(plan["title"]),
+                    sources,
+                    dependencies,
+                    priority,
+                    content_hash,
+                    plan_commit,
+                )
+                if immutable != expected:
+                    raise RuntimeError(f"게시된 ExecPlan 등록 정보가 충돌합니다: {plan_id}")
+                continue
+            connection.execute(
+                """
+                INSERT INTO exec_plans (
+                    repo, plan_id, path, title, sources, depends_on, priority,
+                    content_hash, status, plan_sha
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'READY', ?)
+                """,
+                (
+                    repo,
+                    plan_id,
+                    path,
+                    str(plan["title"]),
+                    sources,
+                    dependencies,
+                    priority,
+                    content_hash,
+                    plan_commit,
+                ),
+            )
+        values = _clear_active_values(
+            processed_sha=plan_commit,
+            planning_fingerprint=planning_fingerprint,
+        )
+        assignments = ", ".join(f"{name} = ?" for name in values)
+        connection.execute(
+            f"UPDATE projects SET {assignments} WHERE repo = ?", (*values.values(), repo)
+        )
+
+
+def migrate_legacy_execplans(connection: sqlite3.Connection) -> None:
+    """Conservatively move legacy project-owned execution state into the catalog."""
+
+    _ensure_execplans_schema(connection)
+    phase_status = {
+        "WORKING": "IMPLEMENTING",
+        "VERIFYING": "VERIFYING",
+        "REVIEWING": "REVIEWING",
+        "PUBLISHING": "PUBLISHING",
+        "PR_OPEN": "PR_OPEN",
+        "BLOCKED": "BLOCKED",
+    }
+    projects = connection.execute("SELECT * FROM projects ORDER BY repo").fetchall()
+    with connection:
+        for project in projects:
+            if project["phase"] == "PLANNING":
+                continue
+            root = Path(project["repo"])
+            active_path = str(project["plan_path"] or "")
+            documents: dict[str, str] = {}
+            plans_directory = root / "docs/plans"
+            if plans_directory.is_dir():
+                for path in sorted(plans_directory.glob("*.md"), key=lambda item: item.name):
+                    documents[path.relative_to(root).as_posix()] = path.read_text(encoding="utf-8")
+
+            revision = f"refs/remotes/origin/{project['base_branch']}"
+            listed = git(
+                root,
+                "ls-tree",
+                "-r",
+                "--name-only",
+                revision,
+                "--",
+                "docs/plans",
+                check=False,
+            )
+            if listed.returncode == 0:
+                for relative_path in listed.stdout.splitlines():
+                    if not re.fullmatch(r"docs/plans/[^/]+\.md", relative_path):
+                        continue
+                    shown = git(root, "show", f"{revision}:{relative_path}", check=False)
+                    if shown.returncode == 0:
+                        documents[relative_path] = shown.stdout
+
+            if active_path and active_path not in documents and project["plan_sha"]:
+                shown = git(
+                    root,
+                    "show",
+                    f"{project['plan_sha']}:{active_path}",
+                    check=False,
+                )
+                if shown.returncode == 0:
+                    documents[active_path] = shown.stdout
+
+            for relative_path, plan_text in sorted(documents.items()):
+                try:
+                    plan = published_execplan(relative_path, plan_text)
+                except RuntimeError:
+                    continue
+                plan_id = str(plan["id"])
+                if connection.execute(
+                    "SELECT 1 FROM exec_plans WHERE repo = ? AND plan_id = ?",
+                    (project["repo"], plan_id),
+                ).fetchone():
+                    continue
+                is_active = relative_path == active_path and project["phase"] in phase_status
+                status = phase_status[str(project["phase"])] if is_active else "MERGED"
+                sources, dependencies, priority = _execplan_metadata(plan)
+                connection.execute(
+                    """
+                    INSERT INTO exec_plans (
+                        repo, plan_id, path, title, sources, depends_on, priority,
+                        content_hash, status, plan_sha, active_sha, branch, worktree,
+                        pr_url, last_error, worker_session_id, worker_result, verify_result
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        project["repo"],
+                        plan_id,
+                        relative_path,
+                        str(plan["title"]),
+                        sources,
+                        dependencies,
+                        priority,
+                        hashlib.sha256(plan_text.encode("utf-8")).hexdigest(),
+                        status,
+                        project["plan_sha"] if is_active else None,
+                        project["active_sha"] if is_active else None,
+                        project["branch"] if is_active else None,
+                        project["worktree"] if is_active else None,
+                        project["pr_url"] if is_active else None,
+                        project["last_error"] if is_active else None,
+                        project["worker_session_id"] if is_active else None,
+                        project["worker_result"] if is_active else None,
+                        project["verify_result"] if is_active else None,
+                    ),
+                )
+
+
+def active_execplan(connection: sqlite3.Connection, repo: str) -> sqlite3.Row | None:
+    _ensure_execplans_schema(connection)
+    placeholders = ", ".join("?" for _ in ACTIVE_EXECPLAN_STATUSES)
+    return connection.execute(
+        f"SELECT * FROM exec_plans WHERE repo = ? AND status IN ({placeholders})",
+        (repo, *sorted(ACTIVE_EXECPLAN_STATUSES)),
+    ).fetchone()
+
+
+def compact_execplan_catalog(connection: sqlite3.Connection, repo: str) -> str:
+    """Serialize only non-terminal plan metadata, never plan bodies."""
+
+    _ensure_execplans_schema(connection)
+    rows = connection.execute(
+        "SELECT * FROM exec_plans WHERE repo = ? AND status != 'MERGED'",
+        (repo,),
+    ).fetchall()
+    rows = sorted(rows, key=lambda row: int(str(row["plan_id"])[2:]))
+    catalog = [
+        {
+            "id": row["plan_id"],
+            "title": row["title"],
+            "status": row["status"],
+            "sources": json.loads(row["sources"]),
+            "depends_on": json.loads(row["depends_on"]),
+            "priority": row["priority"],
+        }
+        for row in rows
+    ]
+    return json.dumps(catalog, ensure_ascii=False, indent=2)
+
+
+def select_ready_execplan(connection: sqlite3.Connection, repo: str) -> sqlite3.Row | None:
+    """Apply the dependency gate before deterministic priority/ID ordering."""
+
+    _ensure_execplans_schema(connection)
+    if active_execplan(connection, repo):
+        return None
+    statuses = {
+        row["plan_id"]: row["status"]
+        for row in connection.execute(
+            "SELECT plan_id, status FROM exec_plans WHERE repo = ?",
+            (repo,),
+        )
+    }
+    candidates = []
+    for row in connection.execute(
+        "SELECT * FROM exec_plans WHERE repo = ? AND status = 'READY'",
+        (repo,),
+    ):
+        dependencies = json.loads(row["depends_on"])
+        if all(statuses.get(dependency) == "MERGED" for dependency in dependencies):
+            candidates.append(row)
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda row: (
+            PRIORITY_ORDER[str(row["priority"])],
+            int(str(row["plan_id"])[2:]),
+        ),
+    )
+
+
+def activate_ready_execplan(
+    connection: sqlite3.Connection,
+    repo: str,
+    state_dir: Path,
+    base_sha: str,
+) -> sqlite3.Row | None:
+    selected = select_ready_execplan(connection, repo)
+    if selected is None:
+        return None
+    project_id = hashlib.sha256(repo.encode()).hexdigest()[:16]
+    branch = f"loop-manager/{selected['plan_id']}"
+    worktree = state_dir / "worktrees" / project_id / str(selected["plan_id"])
+    with connection:
+        changed = connection.execute(
+            """
+            UPDATE exec_plans
+            SET status = 'IMPLEMENTING', active_sha = ?, branch = ?, worktree = ?,
+                last_error = NULL
+            WHERE repo = ? AND plan_id = ? AND status = 'READY'
+            """,
+            (base_sha, branch, str(worktree), repo, selected["plan_id"]),
+        )
+        if changed.rowcount != 1:
+            raise RuntimeError("READY ExecPlan 선택 상태가 변경되었습니다.")
+        connection.execute(
+            """
+            UPDATE projects
+            SET active_sha = ?, plan_sha = ?, phase = 'WORKING', branch = ?,
+                worktree = ?, plan_path = ?, pr_url = NULL, last_error = NULL,
+                worker_session_id = NULL, worker_result = NULL, verify_result = NULL
+            WHERE repo = ?
+            """,
+            (
+                base_sha,
+                selected["plan_sha"],
+                branch,
+                str(worktree),
+                selected["path"],
+                repo,
+            ),
+        )
+    return connection.execute(
+        "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+        (repo, selected["plan_id"]),
+    ).fetchone()
+
+
+def hydrate_active_project(connection: sqlite3.Connection, repo: str) -> None:
+    """Refresh the legacy execution mirror from the plan-state source of truth."""
+
+    plan = active_execplan(connection, repo)
+    if plan is None:
+        return
+    phase = "WORKING" if plan["status"] == "IMPLEMENTING" else plan["status"]
+    connection.execute(
+        """
+        UPDATE projects
+        SET active_sha = ?, plan_sha = ?, phase = ?, branch = ?, worktree = ?,
+            plan_path = ?, pr_url = ?, last_error = ?, worker_session_id = ?,
+            worker_result = ?, verify_result = ?
+        WHERE repo = ?
+        """,
+        (
+            plan["active_sha"],
+            plan["plan_sha"],
+            phase,
+            plan["branch"],
+            plan["worktree"],
+            plan["path"],
+            plan["pr_url"],
+            plan["last_error"],
+            plan["worker_session_id"],
+            plan["worker_result"],
+            plan["verify_result"],
+            repo,
+        ),
+    )
+    connection.commit()
+
+
+def _mirror_project_update_to_execplan(
+    connection: sqlite3.Connection,
+    repo: str,
+    current: sqlite3.Row | None,
+    values: dict[str, object],
+) -> None:
+    if current is None or not current["plan_path"]:
+        return
+    if "phase" in values and values["phase"] is None:
+        return
+    plan_id = _plan_id_from_path(str(current["plan_path"]))
+    if plan_id is None:
+        return
+    _ensure_execplans_schema(connection)
+    translated: dict[str, object] = {}
+    for field in (
+        "active_sha",
+        "plan_sha",
+        "branch",
+        "worktree",
+        "pr_url",
+        "last_error",
+        "worker_session_id",
+        "worker_result",
+        "verify_result",
+    ):
+        if field in values:
+            translated[field] = values[field]
+    if "phase" in values:
+        status = "IMPLEMENTING" if values["phase"] == "WORKING" else values["phase"]
+        if status != "PLANNING":
+            translated["status"] = status
+    if not translated:
+        return
+    assignments = ", ".join(f"{name} = ?" for name in translated)
+    connection.execute(
+        f"UPDATE exec_plans SET {assignments} WHERE repo = ? AND plan_id = ?",
+        (*translated.values(), repo, plan_id),
+    )
 
 
 def validate_repository(path: Path, *, allow_agents_mismatch: bool) -> Path:
@@ -1244,8 +1694,13 @@ def complete_merged_worktree(
     assessment = assess_cleanup(worktree, pr_head_oid)
     assessment = remove_cleanup_worktree(repo_path, worktree, assessment)
     values = _clear_active_values()
+    project = connection.execute(
+        "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
+    ).fetchone()
+    plan_id = _plan_id_from_path(str(project["plan_path"] or "")) if project else None
     assignments = ", ".join(f"{name} = ?" for name in values)
     with connection:
+        _ensure_execplans_schema(connection)
         _ensure_cleanup_pending_schema(connection)
         if assessment.status in {"safe", "missing"}:
             connection.execute(
@@ -1261,6 +1716,11 @@ def complete_merged_worktree(
                 pr_head_oid,
                 assessment.reason or assessment.status,
             )
+        if plan_id:
+            connection.execute(
+                "UPDATE exec_plans SET status = 'MERGED', last_error = NULL WHERE repo = ? AND plan_id = ?",
+                (repo, plan_id),
+            )
         connection.execute(
             f"UPDATE projects SET {assignments} WHERE repo = ?",
             [*values.values(), repo],
@@ -1268,14 +1728,19 @@ def complete_merged_worktree(
     return assessment
 
 
-def planner_prompt(error: str | None) -> str:
+def planner_prompt(error: str | None, compact_catalog: str = "[]") -> str:
     failure = f"\n이전 실행에서 다음 문제가 발생했다. 원인을 해결하라:\n{error[-6000:]}\n" if error else ""
     return f"""
 당신은 Loop Manager의 Planner다.
-AGENTS.md, docs/PRODUCT.md, docs/ARCHITECTURE.md, docs/PLANS.md와 기존 docs/plans를 먼저 읽어라.
-현재 미구현 목표 중 가장 작고 독립적인 한 단계가 있으면 docs/PLANS.md 형식의 ExecPlan 하나만 docs/plans에 작성하라.
-docs/plans 아래의 해당 파일 외에는 수정하지 마라. 구현, 테스트, commit, push와 PR 생성은 하지 마라.
-추가 계획이 필요 없으면 파일을 변경하지 마라.
+AGENTS.md, 활성 PRODUCT와 Requirement, docs/ARCHITECTURE.md, docs/PLANS.md 및 현재 코드·테스트를 읽어라.
+아래 compact catalog는 SQLite의 비종료 ExecPlan만 코드로 직렬화한 것이다. MERGED 계획은 제외됐다.
+{compact_catalog}
+
+현재 입력에서 식별 가능한 미충족 작업 전체를 독립적으로 검증·Merge 가능한 ExecPlan들로 나누어 한 번에 작성하라.
+catalog가 이미 충족하는 작업이나 코드·테스트에 이미 구현된 작업은 중복 계획하지 마라.
+catalog에서 현재 입력과 겹치는 비종료 계획만 필요할 때 전문을 읽고, 기존 docs/plans 전체를 기본 입력으로 읽지 마라.
+새 ExecPlan마다 priority를 기록하고, 기존 파일을 수정하지 말며 docs/plans 바로 아래에 새 파일만 작성하라.
+구현, 테스트, commit, push와 PR 생성은 하지 마라. 추가 계획이 필요 없으면 파일을 변경하지 마라.
 {failure}
 """.strip()
 
@@ -1368,8 +1833,12 @@ def published_execplan(plan_path: str, plan_text: str) -> dict[str, object]:
     """Read metadata from the immutable ExecPlan commit without live source checks."""
     plan = parse_frontmatter(plan_text)
     required = {"id", "title", "sources", "depends_on", "complexity", "risk"}
-    if set(plan) != required:
+    if set(plan) not in {frozenset(required), frozenset(required | {"priority"})}:
         raise RuntimeError("게시된 ExecPlan frontmatter가 올바르지 않습니다.")
+    if "priority" not in plan:
+        plan["priority"] = "normal"
+    if plan["priority"] not in PRIORITY_ORDER:
+        raise RuntimeError("게시된 ExecPlan priority가 유효하지 않습니다.")
     plan_id = plan["id"]
     title = plan["title"]
     if not isinstance(plan_id, str) or not isinstance(title, str):
@@ -1385,6 +1854,18 @@ def published_execplan(plan_path: str, plan_text: str) -> dict[str, object]:
             or re.fullmatch(r"docs/requirements/[^/\\]+\.md", source)
         ):
             raise RuntimeError(f"게시된 ExecPlan source가 유효하지 않습니다: {source}")
+    dependencies = plan["depends_on"]
+    if not isinstance(dependencies, list):
+        raise RuntimeError("게시된 ExecPlan depends_on이 유효하지 않습니다.")
+    if any(
+        not isinstance(dependency, str) or not re.fullmatch(r"G-\d{3,}", dependency)
+        for dependency in dependencies
+    ):
+        raise RuntimeError("게시된 ExecPlan depends_on ID가 유효하지 않습니다.")
+    if plan["complexity"] not in {"low", "medium", "high"}:
+        raise RuntimeError("게시된 ExecPlan complexity가 유효하지 않습니다.")
+    if plan["risk"] not in {"low", "medium", "high", "critical"}:
+        raise RuntimeError("게시된 ExecPlan risk가 유효하지 않습니다.")
     return plan
 
 
@@ -1451,7 +1932,12 @@ def run_project(
 ) -> int:
     repo_path = validate_repository(Path(repo_arg), allow_agents_mismatch=allow_agents_mismatch)
     repo = str(repo_path)
+    _ensure_execplans_schema(connection)
+    migrate_legacy_execplans(connection)
     row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
+    if row:
+        hydrate_active_project(connection, repo)
+        row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
     base = row["base_branch"] if row else requested_base
 
     cleanup_pending = recheck_cleanup_pending(connection, repo_path, repo)
@@ -1521,6 +2007,7 @@ def run_project(
     if not row:
         connection.execute("INSERT INTO projects (repo, base_branch) VALUES (?, ?)", (repo, base))
         connection.commit()
+        migrate_legacy_execplans(connection)
         row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
     elif not row["phase"]:
         update_project(connection, repo, base_branch=base)
@@ -1547,23 +2034,25 @@ def run_project(
             clear_active(connection, repo)
             row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
 
+    planning_required = not row["phase"]
+
     if not row["phase"] and row["planning_fingerprint"] == current_fingerprint:
         update_project(connection, repo, processed_sha=base_sha)
         operation_print("계획 입력이 바뀌지 않아 Codex를 실행하지 않습니다.")
-        return 0
+        planning_required = False
 
-    if not row["phase"] and row["planning_fingerprint"] and row["processed_sha"]:
+    if planning_required and row["planning_fingerprint"] and row["processed_sha"]:
         processed_fingerprint = _planning_input_fingerprint(repo_path, row["processed_sha"])
         if processed_fingerprint == current_fingerprint:
             update_project(connection, repo, processed_sha=base_sha)
             operation_print("계획 입력이 바뀌지 않아 Codex를 실행하지 않습니다.")
-            return 0
-        if _is_requirement_archive_only_change(repo_path, row["processed_sha"], base_sha):
+            planning_required = False
+        elif _is_requirement_archive_only_change(repo_path, row["processed_sha"], base_sha):
             update_project(connection, repo, processed_sha=base_sha)
             operation_print("Requirement archive 이동 외의 계획 입력이 바뀌지 않아 Codex를 실행하지 않습니다.")
-            return 0
+            planning_required = False
 
-    if not row["phase"]:
+    if planning_required:
         project_id = hashlib.sha256(repo.encode()).hexdigest()[:16]
         worktree = state_dir / "worktrees" / project_id / "planning" / current_fingerprint
         update_project(
@@ -1643,7 +2132,10 @@ def run_project(
                 state_dir,
                 config_path,
                 "planner",
-                planner_prompt(row["planning_validation_error"] or row["last_error"]),
+                planner_prompt(
+                    row["planning_validation_error"] or row["last_error"],
+                    compact_execplan_catalog(connection, repo),
+                ),
                 read_only=False,
                 persist_session=True,
                 session_id=row["planner_session_id"],
@@ -1717,35 +2209,44 @@ def run_project(
                 planning_fingerprint=completed_fingerprint,
             )
             operation_print("추가로 계획할 작업이 없습니다.")
-            return 0
+            row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
+        else:
+            plans = validated_result
+            if dirty_files:
+                # Publishing failures are operational failures, not Planner
+                # validation failures. Leave the validated result for retry.
+                plan_paths = [path for path, _plan in plans]
+                git(planning_worktree, "add", "--", *plan_paths)
+                first = plans[0][1]
+                last = plans[-1][1]
+                if len(plans) == 1:
+                    message = f"Add ExecPlan {first['id']}: {first['title']}"
+                else:
+                    message = f"Add ExecPlans {first['id']}-{last['id']}"
+                git(planning_worktree, "commit", "-m", message)
 
-        plan_path, plan = validated_result
-        if dirty_files:
-            # Publishing failures are operational failures, not Planner
-            # validation failures. Leave the validated result for retry.
-            git(planning_worktree, "add", "--", plan_path)
-            git(planning_worktree, "commit", "-m", f"Add ExecPlan {plan['id']}: {plan['title']}")
-
-        clear_planning_validation_state(connection, repo)
-        plan_commit = git(planning_worktree, "rev-parse", "HEAD").stdout.strip()
-        git(repo_path, "fetch", "origin")
-        latest_sha = git(repo_path, "rev-parse", f"origin/{base}").stdout.strip()
-        if latest_sha not in {row["active_sha"], plan_commit}:
-            published = git(
-                planning_worktree,
-                "merge-base",
-                "--is-ancestor",
-                plan_commit,
-                f"origin/{base}",
-                check=False,
-            ).returncode == 0
-            if not published:
-                git(repo_path, "worktree", "remove", str(planning_worktree))
-                clear_active(connection, repo)
-                operation_print("계획 중 base가 변경되어 최신 기준으로 다시 계획합니다.", file=sys.stderr)
-                return 1
-        if latest_sha != plan_commit:
-            if latest_sha == row["active_sha"]:
+            clear_planning_validation_state(connection, repo)
+            plan_commit = git(planning_worktree, "rev-parse", "HEAD").stdout.strip()
+            git(repo_path, "fetch", "origin")
+            latest_sha = git(repo_path, "rev-parse", f"origin/{base}").stdout.strip()
+            if latest_sha not in {row["active_sha"], plan_commit}:
+                published = git(
+                    planning_worktree,
+                    "merge-base",
+                    "--is-ancestor",
+                    plan_commit,
+                    f"origin/{base}",
+                    check=False,
+                ).returncode == 0
+                if not published:
+                    git(repo_path, "worktree", "remove", str(planning_worktree))
+                    clear_active(connection, repo)
+                    operation_print(
+                        "계획 중 base가 변경되어 최신 기준으로 다시 계획합니다.",
+                        file=sys.stderr,
+                    )
+                    return 1
+            if latest_sha != plan_commit and latest_sha == row["active_sha"]:
                 pushed = git(
                     planning_worktree,
                     "push",
@@ -1754,33 +2255,42 @@ def run_project(
                     check=False,
                 )
                 if pushed.returncode:
-                    update_project(connection, repo, last_error=f"ExecPlan push 실패:\n{pushed.stdout[-8000:]}")
+                    update_project(
+                        connection,
+                        repo,
+                        last_error=f"ExecPlan push 실패:\n{pushed.stdout[-8000:]}",
+                    )
                     operation_print(pushed.stdout, file=sys.stderr)
                     return 1
                 git(repo_path, "fetch", "origin")
                 latest_sha = git(repo_path, "rev-parse", f"origin/{base}").stdout.strip()
                 if latest_sha != plan_commit:
-                    update_project(connection, repo, last_error="ExecPlan push 결과를 origin/base에서 확인할 수 없습니다.")
+                    update_project(
+                        connection,
+                        repo,
+                        last_error="ExecPlan push 결과를 origin/base에서 확인할 수 없습니다.",
+                    )
                     operation_print("ExecPlan push 결과 확인에 실패했습니다.", file=sys.stderr)
                     return 1
 
-        git(repo_path, "worktree", "remove", str(planning_worktree))
-        branch = f"loop-manager/{plan['id']}"
-        worktree = state_dir / "worktrees" / project_id / str(plan["id"])
-        update_project(
-            connection,
-            repo,
-            active_sha=latest_sha,
-            plan_sha=plan_commit,
-            phase="WORKING",
-            branch=branch,
-            worktree=str(worktree),
-            plan_path=plan_path,
-            last_error=None,
-        )
-        base_sha = latest_sha
-        row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
+            register_execplans(
+                connection,
+                repo,
+                planning_worktree,
+                plans,
+                plan_commit,
+                current_fingerprint,
+            )
+            git(repo_path, "worktree", "remove", str(planning_worktree))
+            base_sha = latest_sha
+            row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
 
+    if not row["phase"]:
+        selected = activate_ready_execplan(connection, repo, state_dir, base_sha)
+        if selected is None:
+            operation_print("실행 가능한 READY ExecPlan이 없습니다.")
+            return 0
+        row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
     branch = row["branch"]
     worktree = Path(row["worktree"])
     make_worktree(repo_path, worktree, branch, base)
@@ -1864,6 +2374,13 @@ def run_project(
         ahead = int(git(worktree, "rev-list", "--count", f"origin/{base}..HEAD").stdout)
         if not dirty and not ahead:
             git(repo_path, "worktree", "remove", str(worktree))
+            plan_id = _plan_id_from_path(str(row["plan_path"]))
+            if plan_id:
+                connection.execute(
+                    "UPDATE exec_plans SET status = 'MERGED' WHERE repo = ? AND plan_id = ?",
+                    (repo, plan_id),
+                )
+                connection.commit()
             clear_active(connection, repo)
             operation_print("추가로 구현할 작업이 없습니다.")
             return 0
