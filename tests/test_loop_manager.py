@@ -4544,6 +4544,158 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     plan_path,
                 )
 
+    def test_agent_commit_isolated_automatically_after_blocked_input_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, plan_path = self._repository_with_plan(directory)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            branch, worktree = loop_manager.expected_execplan_workspace(
+                state_dir,
+                str(repo),
+                "G-001",
+            )
+            loop_manager.make_worktree(repo, worktree, branch, "main")
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+                (str(repo),),
+            )
+            loop_manager.register_execplans(
+                connection,
+                str(repo),
+                repo,
+                [(plan_path, loop_manager._parse_execplan(repo, repo / plan_path))],
+                plan_sha,
+                loop_manager.planning_input_fingerprint(repo, "main"),
+            )
+            plan = connection.execute(
+                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            blocked_fingerprint = loop_manager._worktree_execplan_input_fingerprint(
+                worktree,
+                plan,
+            )
+            before = loop_manager.capture_git_snapshot(worktree)
+            (worktree / "src/app.py").write_text(
+                "VALUE = 2\n",
+                encoding="utf-8",
+            )
+            git_command(worktree, "add", "src/app.py")
+            git_command(worktree, "commit", "-m", "Agent commit")
+            agent_commit = git_command(worktree, "rev-parse", "HEAD")
+            blocked_result = loop_manager.capture_git_snapshot(worktree)
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE exec_plans
+                    SET status = 'BLOCKED', active_sha = ?, branch = ?,
+                        worktree = ?, workspace_owned = 1,
+                        blocked_fingerprint = ?,
+                        blocked_worktree_fingerprint = ?
+                    WHERE repo = ? AND plan_id = 'G-001'
+                    """,
+                    (
+                        plan_sha,
+                        branch,
+                        str(worktree),
+                        blocked_fingerprint,
+                        blocked_fingerprint,
+                        str(repo),
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE projects
+                    SET active_sha = ?, plan_sha = ?, phase = 'BLOCKED',
+                        branch = ?, worktree = ?, plan_path = ?,
+                        agent_role = 'worker', agent_snapshot = ?,
+                        agent_input_fingerprint = ?,
+                        agent_result_snapshot = ?
+                    WHERE repo = ?
+                    """,
+                    (
+                        plan_sha,
+                        plan_sha,
+                        branch,
+                        str(worktree),
+                        plan_path,
+                        before.serialize(),
+                        blocked_fingerprint,
+                        blocked_result.serialize(),
+                        str(repo),
+                    ),
+                )
+
+            (repo / "docs/PRODUCT.md").write_text(
+                "# Product changed after blocked Agent commit\n",
+                encoding="utf-8",
+            )
+            commit_and_push(repo, "Change source after blocked Agent commit")
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.run_codex",
+                return_value=loop_manager.CodexResult(
+                    1,
+                    "stop after automatic commit isolation",
+                    "planner-session",
+                ),
+            ) as resumed_agent:
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, last_error, agent_snapshot, agent_recovery "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            resumed_plan = connection.execute(
+                "SELECT status, blocked_fingerprint FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            diagnostic_refs = git_command(
+                worktree,
+                "for-each-ref",
+                "--format=%(objectname)",
+                "refs/loop-manager/violations/",
+            ).splitlines()
+            self.assertEqual(result, 1)
+            self.assertEqual(project["phase"], "PLANNING")
+            self.assertEqual(
+                project["last_error"],
+                "stop after automatic commit isolation",
+            )
+            self.assertIsNone(project["agent_snapshot"])
+            self.assertIsNone(project["agent_recovery"])
+            self.assertEqual(resumed_plan["status"], "READY")
+            self.assertIsNone(resumed_plan["blocked_fingerprint"])
+            self.assertIn(agent_commit, diagnostic_refs)
+            self.assertEqual(
+                (worktree / "src/app.py").read_text(encoding="utf-8"),
+                "VALUE = 1\n",
+            )
+            resumed_agent.assert_called_once()
+            self.assertEqual(resumed_agent.call_args.args[3], "planner")
+
     def test_restored_worker_git_metadata_allows_changed_input_to_requeue(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -5214,6 +5366,39 @@ class AgentScopeValidatorTest(unittest.TestCase):
             )
             plan_file.write_text(user_mixed_plan_text, encoding="utf-8")
             user_plan_text = original_plan_text + "\nUser clarification after scope block.\n"
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager._restore_blocked_agent_recovery_plan",
+                side_effect=KeyboardInterrupt,
+            ), self.assertRaises(KeyboardInterrupt):
+                loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            interrupted = connection.execute(
+                "SELECT phase, agent_recovery FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(interrupted["phase"], "BLOCKED")
+            self.assertIsNotNone(interrupted["agent_recovery"])
+            self.assertEqual(
+                plan_file.read_text(encoding="utf-8"),
+                original_plan_text,
+            )
+            self.assertFalse((worktree / "reviewer.txt").exists())
 
             def resumed_worker(agent_worktree, *_args, **_kwargs):
                 self.assertEqual(_args[2], "worker")

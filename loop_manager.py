@@ -62,6 +62,7 @@ FIELDS = {
     "agent_role",
     "agent_snapshot",
     "agent_input_fingerprint",
+    "agent_recovery",
     "agent_input_plan",
     "agent_result_plan",
     "agent_result_snapshot",
@@ -97,6 +98,7 @@ CREATE TABLE IF NOT EXISTS projects (
     agent_role TEXT,
     agent_snapshot TEXT,
     agent_input_fingerprint TEXT,
+    agent_recovery TEXT,
     agent_input_plan TEXT,
     agent_result_plan TEXT,
     agent_result_snapshot TEXT,
@@ -453,6 +455,7 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
         "agent_role": "TEXT",
         "agent_snapshot": "TEXT",
         "agent_input_fingerprint": "TEXT",
+        "agent_recovery": "TEXT",
         "agent_input_plan": "TEXT",
         "agent_result_plan": "TEXT",
         "agent_result_snapshot": "TEXT",
@@ -2520,6 +2523,7 @@ def begin_agent_scope(
         agent_role=role_name,
         agent_snapshot=snapshot.serialize(),
         agent_input_fingerprint=input_fingerprint,
+        agent_recovery=None,
         agent_input_plan=agent_input_plan,
         agent_result_plan=None,
         agent_result_snapshot=None,
@@ -2534,6 +2538,7 @@ def clear_agent_scope(connection: sqlite3.Connection, repo: str) -> None:
         repo,
         agent_role=None,
         agent_snapshot=None,
+        agent_recovery=None,
         agent_input_plan=None,
         agent_result_plan=None,
         agent_input_fingerprint=None,
@@ -2896,6 +2901,7 @@ def clear_planning_validation_state(
         agent_role=None,
         agent_snapshot=None,
         agent_input_fingerprint=None,
+        agent_recovery=None,
         agent_input_plan=None,
         agent_result_plan=None,
         agent_result_snapshot=None,
@@ -2931,6 +2937,7 @@ def _clear_active_values(
         "planning_error_fingerprint": None,
         "agent_role": None,
         "agent_snapshot": None,
+        "agent_recovery": None,
         "agent_input_plan": None,
         "agent_result_plan": None,
         "agent_input_fingerprint": None,
@@ -3445,6 +3452,58 @@ def _blocked_agent_local_baseline(
     )
 
 
+def _diagnosed_blocked_commit_allowances(
+    before: GitSnapshot,
+    blocked_result: GitSnapshot,
+    current: GitSnapshot,
+    worktree: Path,
+    scope_before: GitSnapshot,
+) -> tuple[GitSnapshot, frozenset[str], frozenset[str]]:
+    """Allow only the exact diagnosed commit while it awaits isolation."""
+
+    if blocked_result.head == before.head:
+        return scope_before, frozenset(), frozenset()
+    if (
+        before.branch is None
+        or blocked_result.branch != before.branch
+        or current.branch != before.branch
+        or current.head != blocked_result.head
+    ):
+        return scope_before, frozenset(), frozenset()
+
+    branch_ref = f"refs/heads/{before.branch}"
+    result_branch_ref = blocked_result.refs.get(branch_ref)
+    if (
+        result_branch_ref is None
+        or result_branch_ref[0] != blocked_result.head
+        or current.refs.get(branch_ref) != result_branch_ref
+    ):
+        return scope_before, frozenset(), frozenset()
+
+    worktree_key = str(_canonical_path(worktree))
+    result_registration = blocked_result.worktrees.get(worktree_key)
+    if (
+        result_registration is None
+        or current.worktrees.get(worktree_key) != result_registration
+    ):
+        return scope_before, frozenset(), frozenset()
+
+    return (
+        GitSnapshot(
+            head=current.head,
+            branch=scope_before.branch,
+            index=scope_before.index,
+            dirty=scope_before.dirty,
+            refs=scope_before.refs,
+            worktrees=scope_before.worktrees,
+            config=scope_before.config,
+            operations=scope_before.operations,
+        ),
+        frozenset((branch_ref,)),
+        frozenset((worktree_key,)),
+    )
+
+
 def validate_persisted_agent_scope(
     connection: sqlite3.Connection,
     repo_path: Path,
@@ -3664,6 +3723,17 @@ def validate_persisted_agent_scope(
                     else frozenset()
                 ),
             )
+            (
+                scope_before,
+                commit_ref_changes,
+                commit_worktree_changes,
+            ) = _diagnosed_blocked_commit_allowances(
+                before,
+                blocked_result,
+                current,
+                saved_worktree,
+                scope_before,
+            )
             base = str(project["base_branch"])
             manager_ref_candidates = frozenset(
                 {f"refs/heads/{base}"}
@@ -3686,6 +3756,8 @@ def validate_persisted_agent_scope(
                 current.worktrees,
                 frozenset((str(_canonical_path(repo_path)),)),
             )
+            allowed_ref_changes |= commit_ref_changes
+            allowed_worktree_changes |= commit_worktree_changes
 
     validate_agent_scope(
         role_name,
@@ -3838,6 +3910,17 @@ def validate_blocked_agent_scope(
                 worktree,
                 allowed_dirty_paths=frozenset((selected_plan_path,)),
             )
+            (
+                scope_before,
+                commit_ref_changes,
+                commit_worktree_changes,
+            ) = _diagnosed_blocked_commit_allowances(
+                before,
+                blocked_result,
+                current,
+                worktree,
+                scope_before,
+            )
             manager_ref_candidates = frozenset(
                 {f"refs/heads/{base}"}
                 | {
@@ -3860,6 +3943,8 @@ def validate_blocked_agent_scope(
                 current.worktrees,
                 frozenset((primary_worktree,)),
             )
+            allowed_ref_changes |= commit_ref_changes
+            allowed_worktree_changes |= commit_worktree_changes
 
     validate_agent_scope(
         role_name,
@@ -3946,6 +4031,238 @@ def _reconcile_blocked_reviewer_plan(
     return "".join(current_lines)
 
 
+def _deserialize_blocked_agent_recovery(value: str) -> dict[str, object]:
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError) as error:
+        raise AgentScopeError(
+            f"저장된 BLOCKED Agent 복구 상태가 유효하지 않습니다: {error}"
+        ) from error
+    if (
+        not isinstance(parsed, dict)
+        or parsed.get("version") != 1
+        or parsed.get("state") not in {"prepared", "stashed"}
+        or not isinstance(parsed.get("source_snapshot"), str)
+        or not isinstance(parsed.get("original_head"), str)
+        or not isinstance(parsed.get("violation_head"), str)
+        or not isinstance(parsed.get("branch"), str)
+        or not isinstance(parsed.get("stash_marker"), str)
+        or not isinstance(parsed.get("violation_ref"), str)
+        or (
+            parsed.get("plan_path") is not None
+            and not isinstance(parsed.get("plan_path"), str)
+        )
+        or (
+            parsed.get("plan_contents") is not None
+            and not isinstance(parsed.get("plan_contents"), str)
+        )
+    ):
+        raise AgentScopeError("저장된 BLOCKED Agent 복구 상태 형식을 지원하지 않습니다.")
+    return parsed
+
+
+def _serialize_blocked_agent_recovery(recovery: Mapping[str, object]) -> str:
+    return json.dumps(
+        recovery,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _blocked_recovery_stash_oid(worktree: Path, marker: str) -> str | None:
+    listed = git(
+        worktree,
+        "stash",
+        "list",
+        "--format=%H%x00%gs",
+        check=False,
+    )
+    if listed.returncode:
+        raise AgentScopeError(
+            f"BLOCKED Agent stash 확인 실패:\n{listed.stdout[-8000:]}"
+        )
+    for line in listed.stdout.splitlines():
+        oid, separator, subject = line.partition("\0")
+        if separator and subject.endswith(marker):
+            return oid
+    return None
+
+
+def _restore_blocked_agent_recovery_plan(
+    worktree: Path,
+    plan_path: str | None,
+    plan_contents: str | None,
+) -> None:
+    if plan_path is None:
+        return
+    target = worktree / plan_path
+    try:
+        if plan_contents is None:
+            if target.exists() or target.is_symlink():
+                target.unlink()
+        else:
+            target.write_text(plan_contents, encoding="utf-8")
+    except OSError as error:
+        raise AgentScopeError(
+            f"BLOCKED ExecPlan 사용자 변경 복원 실패: {error}"
+        ) from error
+
+
+def _complete_blocked_agent_recovery(
+    connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+) -> None:
+    project = connection.execute(
+        "SELECT agent_snapshot, agent_recovery FROM projects WHERE repo = ?",
+        (repo,),
+    ).fetchone()
+    if project is None or not project["agent_recovery"]:
+        return
+    if not project["agent_snapshot"]:
+        raise AgentScopeError("BLOCKED Agent 복구에 시작 snapshot이 없습니다.")
+
+    recovery = _deserialize_blocked_agent_recovery(
+        str(project["agent_recovery"])
+    )
+    try:
+        before = GitSnapshot.deserialize(str(project["agent_snapshot"]))
+        source = GitSnapshot.deserialize(str(recovery["source_snapshot"]))
+    except (KeyError, TypeError, ValueError, RuntimeError) as error:
+        raise AgentScopeError(
+            f"BLOCKED Agent 복구 snapshot이 유효하지 않습니다: {error}"
+        ) from error
+
+    current_config = _config_entries(worktree)
+    if current_config != before.config:
+        raise AgentScopeError("BLOCKED Agent 복구 전 Git config가 변경됐습니다.")
+
+    marker = str(recovery["stash_marker"])
+    stash_oid = _blocked_recovery_stash_oid(worktree, marker)
+    if recovery["state"] == "prepared":
+        if stash_oid is None:
+            current = capture_git_snapshot(worktree)
+            if current.serialize() != source.serialize():
+                raise AgentScopeError(
+                    "BLOCKED Agent 복구 준비 후 worktree 상태가 추가로 변경됐습니다."
+                )
+            stashed = git(
+                worktree,
+                "stash",
+                "push",
+                "--all",
+                "-m",
+                marker,
+                check=False,
+            )
+            if stashed.returncode:
+                raise AgentScopeError(
+                    f"BLOCKED Agent 변경 보존 실패:\n{stashed.stdout[-8000:]}"
+                )
+            stash_oid = _blocked_recovery_stash_oid(worktree, marker)
+        recovery["state"] = "stashed"
+        recovery["stash_oid"] = stash_oid
+        update_project(
+            connection,
+            repo,
+            agent_recovery=_serialize_blocked_agent_recovery(recovery),
+        )
+
+    current = capture_git_snapshot(worktree)
+    branch = str(recovery["branch"])
+    original_head = str(recovery["original_head"])
+    violation_head = str(recovery["violation_head"])
+    plan_path_value = recovery.get("plan_path")
+    plan_path = str(plan_path_value) if plan_path_value is not None else None
+    plan_contents_value = recovery.get("plan_contents")
+    plan_contents = (
+        str(plan_contents_value) if plan_contents_value is not None else None
+    )
+    if current.branch != branch:
+        raise AgentScopeError(
+            "BLOCKED Agent 복구 worktree branch가 저장된 branch와 다릅니다."
+        )
+    if current.operations:
+        raise AgentScopeError(
+            "BLOCKED Agent 복구 worktree에 Git operation이 남아 있습니다."
+        )
+    if before.dirty:
+        raise AgentScopeError(
+            "Agent 실행 전 변경이 있는 worktree는 자동 commit 복구할 수 없습니다."
+        )
+
+    if current.head == violation_head and violation_head != original_head:
+        if current.dirty:
+            raise AgentScopeError(
+                "BLOCKED Agent stash 후 worktree에 새 변경이 생겼습니다."
+            )
+        violation_ref = str(recovery["violation_ref"])
+        existing_ref = git(
+            worktree,
+            "rev-parse",
+            "--verify",
+            violation_ref,
+            check=False,
+        )
+        if existing_ref.returncode == 0:
+            if existing_ref.stdout.strip() != violation_head:
+                raise AgentScopeError(
+                    f"BLOCKED Agent 진단 ref 충돌: {violation_ref}"
+                )
+        else:
+            git(worktree, "update-ref", violation_ref, violation_head)
+        git(worktree, "reset", "--hard", original_head)
+        current = capture_git_snapshot(worktree)
+    elif current.head != original_head:
+        raise AgentScopeError(
+            "BLOCKED Agent 복구 HEAD가 저장된 Agent 결과 또는 시작 commit과 다릅니다."
+        )
+
+    if current.dirty:
+        if (
+            plan_path is None
+            or set(current.dirty) != {plan_path}
+            or (
+                plan_contents is None
+                and (
+                    (worktree / plan_path).exists()
+                    or (worktree / plan_path).is_symlink()
+                )
+            )
+            or (
+                plan_contents is not None
+                and (
+                    not (worktree / plan_path).is_file()
+                    or (worktree / plan_path).read_text(encoding="utf-8")
+                    != plan_contents
+                )
+            )
+        ):
+            raise AgentScopeError(
+                "BLOCKED Agent 복구 중 사용자 변경 외의 새 worktree 변경이 생겼습니다."
+            )
+    else:
+        _restore_blocked_agent_recovery_plan(
+            worktree,
+            plan_path,
+            plan_contents,
+        )
+
+    restored = capture_git_snapshot(worktree)
+    if restored.head != original_head or restored.branch != branch:
+        raise AgentScopeError("BLOCKED Agent 복구 후 HEAD 또는 branch가 일치하지 않습니다.")
+    unexpected_paths = set(restored.dirty)
+    if plan_path is not None:
+        unexpected_paths.discard(plan_path)
+    if unexpected_paths:
+        raise AgentScopeError(
+            "BLOCKED Agent 복구 후 예상하지 못한 변경이 남았습니다: "
+            + ", ".join(sorted(unexpected_paths))
+        )
+    clear_agent_scope(connection, repo)
+
+
 def preserve_blocked_agent_changes(
     connection: sqlite3.Connection,
     repo: str,
@@ -3954,19 +4271,20 @@ def preserve_blocked_agent_changes(
     *,
     preserved_input_path: str | None = None,
 ) -> None:
-    """Move a diagnosed scope violation out of the publishable worktree."""
+    """Persist and isolate a diagnosed scope violation crash-safely."""
 
     project = connection.execute(
         "SELECT agent_role, agent_snapshot, agent_result_snapshot, "
-        "agent_input_plan, agent_result_plan "
+        "agent_recovery, agent_input_plan, agent_result_plan "
         "FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
-    if (
-        project is None
-        or not project["agent_snapshot"]
-        or not project["agent_result_snapshot"]
-    ):
+    if project is None:
+        raise AgentScopeError("보존할 BLOCKED Agent 프로젝트가 없습니다.")
+    if project["agent_recovery"]:
+        _complete_blocked_agent_recovery(connection, repo, worktree)
+        return
+    if not project["agent_snapshot"] or not project["agent_result_snapshot"]:
         return
     try:
         before = GitSnapshot.deserialize(str(project["agent_snapshot"]))
@@ -3975,7 +4293,19 @@ def preserve_blocked_agent_changes(
         raise AgentScopeError(
             f"보존할 BLOCKED Agent snapshot이 유효하지 않습니다: {error}"
         ) from error
+    if before.dirty or before.operations:
+        raise AgentScopeError(
+            "Agent 실행 전 변경 또는 Git operation이 있는 worktree는 "
+            "자동 격리할 수 없습니다."
+        )
     current = capture_git_snapshot(worktree)
+    if current.branch != before.branch or current.head not in {
+        before.head,
+        result.head,
+    }:
+        raise AgentScopeError(
+            "BLOCKED 이후 HEAD 또는 branch가 추가로 변경되어 자동 보존할 수 없습니다."
+        )
     allowed_dirty_paths = (
         frozenset((preserved_input_path,))
         if preserved_input_path is not None
@@ -3994,65 +4324,153 @@ def preserve_blocked_agent_changes(
         if current.dirty.get(path)
         not in (before.dirty.get(path), result.dirty.get(path))
     )
-    excluded_paths = set(preserved_paths)
-    reconciled_paths: dict[str, str] = {}
-    if project["agent_role"] == "reviewer":
-        for path in preserved_paths:
+    plan_path: str | None = None
+    plan_contents: str | None = None
+    if preserved_paths:
+        if len(preserved_paths) != 1:
+            raise AgentScopeError(
+                "사용자가 수정한 BLOCKED 입력 경로를 하나로 결정할 수 없습니다."
+            )
+        plan_path = next(iter(preserved_paths))
+        plan_file = worktree / plan_path
+        if plan_file.is_symlink() or (plan_file.exists() and not plan_file.is_file()):
+            raise AgentScopeError(
+                f"사용자가 수정한 BLOCKED ExecPlan 형식이 안전하지 않습니다: {plan_path}"
+            )
+        plan_contents = (
+            plan_file.read_text(encoding="utf-8")
+            if plan_file.is_file()
+            else None
+        )
+        if project["agent_role"] == "reviewer":
             before_text = project["agent_input_plan"]
             result_text = project["agent_result_plan"]
-            agent_changed_path = before.dirty.get(path) != result.dirty.get(path)
+            agent_changed_path = (
+                before.dirty.get(plan_path) != result.dirty.get(plan_path)
+            )
             if before_text is None or result_text is None:
                 if agent_changed_path:
                     raise AgentScopeError(
                         "BLOCKED ExecPlan의 Reviewer 변경을 분리할 "
-                        f"본문 기준이 없습니다: {path}"
+                        f"본문 기준이 없습니다: {plan_path}"
                     )
-                continue
-            if str(before_text) == str(result_text):
-                continue
-            plan_file = worktree / path
-            if not plan_file.is_file():
-                raise AgentScopeError(
-                    f"사용자가 수정한 BLOCKED ExecPlan을 읽을 수 없습니다: {path}"
+            elif str(before_text) != str(result_text):
+                if plan_contents is None:
+                    raise AgentScopeError(
+                        f"사용자가 수정한 BLOCKED ExecPlan을 읽을 수 없습니다: {plan_path}"
+                    )
+                plan_contents = _reconcile_blocked_reviewer_plan(
+                    plan_path,
+                    str(before_text),
+                    str(result_text),
+                    plan_contents,
                 )
-            reconciled_paths[path] = _reconcile_blocked_reviewer_plan(
-                path,
-                str(before_text),
-                str(result_text),
-                plan_file.read_text(encoding="utf-8"),
-            )
-            excluded_paths.discard(path)
 
-    stash_arguments = [
-        "stash",
-        "push",
-        "--all",
-        "-m",
-        f"loop-manager scope violation {plan_id}",
-    ]
-    if excluded_paths:
-        stash_arguments.extend(
-            [
-                "--",
-                ".",
-                *(
-                    f":(top,literal,exclude){path}"
-                    for path in sorted(excluded_paths)
-                ),
-            ]
-        )
-    stashed = git(worktree, *stash_arguments, check=False)
-    if stashed.returncode:
+    source_serialized = current.serialize()
+    recovery_id = hashlib.sha256(
+        json.dumps(
+            {
+                "repo": repo,
+                "plan_id": plan_id,
+                "source": source_serialized,
+                "plan_path": plan_path,
+                "plan_contents": plan_contents,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()[:24]
+    project_id = hashlib.sha256(repo.encode()).hexdigest()[:16]
+    recovery: dict[str, object] = {
+        "version": 1,
+        "state": "prepared",
+        "source_snapshot": source_serialized,
+        "original_head": before.head,
+        "violation_head": result.head,
+        "branch": str(before.branch or ""),
+        "stash_marker": f"loop-manager scope violation {plan_id} {recovery_id}",
+        "violation_ref": (
+            f"refs/loop-manager/violations/{project_id}/{plan_id}/{recovery_id}"
+        ),
+        "plan_path": plan_path,
+        "plan_contents": plan_contents,
+        "stash_oid": None,
+    }
+    update_project(
+        connection,
+        repo,
+        agent_recovery=_serialize_blocked_agent_recovery(recovery),
+    )
+    _complete_blocked_agent_recovery(connection, repo, worktree)
+
+
+def resume_interrupted_blocked_agent_recovery(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    state_dir: Path,
+    repo: str,
+) -> bool:
+    """Finish a persisted violation isolation before normal repository work."""
+
+    project = connection.execute(
+        "SELECT phase, base_branch, branch, worktree, agent_snapshot, "
+        "agent_recovery FROM projects WHERE repo = ?",
+        (repo,),
+    ).fetchone()
+    if project is None or not project["agent_recovery"]:
+        return False
+    if project["phase"] != "BLOCKED" or not project["agent_snapshot"]:
         raise AgentScopeError(
-            f"BLOCKED Agent 변경 보존 실패:\n{stashed.stdout[-8000:]}"
+            "BLOCKED Agent 복구 상태가 활성 BLOCKED 작업과 일치하지 않습니다."
         )
     try:
-        for path, contents in reconciled_paths.items():
-            (worktree / path).write_text(contents, encoding="utf-8")
-    except OSError as error:
+        before = GitSnapshot.deserialize(str(project["agent_snapshot"]))
+    except (KeyError, TypeError, ValueError, RuntimeError) as error:
         raise AgentScopeError(
-            f"BLOCKED ExecPlan 사용자 변경 복원 실패: {error}"
+            f"BLOCKED Agent 복구 시작 snapshot이 유효하지 않습니다: {error}"
         ) from error
+
+    worktree = Path(str(project["worktree"] or ""))
+    branch = str(project["branch"] or "")
+    config_context = worktree if worktree.is_dir() else repo_path
+    if _config_entries(config_context) != before.config:
+        raise AgentScopeError("BLOCKED Agent 복구 전 Git config가 변경됐습니다.")
+
+    plan = active_execplan(connection, repo)
+    if (
+        plan is None
+        or int(plan["workspace_owned"]) != WORKSPACE_OWNED
+        or str(plan["branch"] or "") != branch
+        or Path(str(plan["worktree"] or "")) != worktree
+    ):
+        raise AgentScopeError(
+            "BLOCKED Agent 복구 workspace의 Loop Manager 소유권을 증명할 수 없습니다."
+        )
+    try:
+        validate_execplan_workspace_identity(
+            state_dir,
+            repo,
+            str(plan["plan_id"]),
+            branch,
+            worktree,
+        )
+        make_worktree(
+            repo_path,
+            worktree,
+            branch,
+            str(project["base_branch"]),
+            allow_create_branch=False,
+            allow_recovery=True,
+            allow_existing=True,
+        )
+    except WorkspaceOwnershipError as error:
+        raise AgentScopeError(
+            f"BLOCKED Agent 복구 workspace 검증 실패: {error}"
+        ) from error
+
+    _complete_blocked_agent_recovery(connection, repo, worktree)
+    return True
 
 
 def _requeue_blocked_execplan(
@@ -4532,6 +4950,32 @@ def run_project(
         ).fetchall()
     )
     checkpoint_cleanup_candidates = cleanup_candidates
+    if row and row["agent_recovery"]:
+        try:
+            resume_interrupted_blocked_agent_recovery(
+                connection,
+                repo_path,
+                state_dir,
+                repo,
+            )
+        except (AgentScopeError, RuntimeError) as error:
+            recovery_error = f"BLOCKED Agent 중단 복구 실패:\n{error}"
+            plan = active_execplan(connection, repo)
+            if plan is not None:
+                _update_blocked_error(
+                    connection,
+                    repo,
+                    str(plan["plan_id"]),
+                    recovery_error,
+                )
+            else:
+                update_project(connection, repo, last_error=recovery_error)
+            operation_print(recovery_error, file=sys.stderr)
+            return 1
+        row = connection.execute(
+            "SELECT * FROM projects WHERE repo = ?",
+            (repo,),
+        ).fetchone()
     validated_agent_scope: GitSnapshot | None = None
     if row and row["agent_snapshot"]:
         planner_correction = bool(
