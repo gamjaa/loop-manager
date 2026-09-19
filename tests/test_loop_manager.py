@@ -1583,6 +1583,7 @@ risk: medium
     def test_planner_codex_persists_thread_id_and_resumes_exact_session(self):
         config = loop_manager.ROOT / "config/config.ini.example"
         calls = []
+        call_options = []
 
         thread_event = (
             json.dumps(
@@ -1602,8 +1603,9 @@ risk: medium
                 pass
 
         class StartedProcess:
-            def __init__(self, arguments, **_kwargs):
+            def __init__(self, arguments, **kwargs):
                 calls.append(arguments)
+                call_options.append(kwargs)
                 self.stdin = mock.Mock()
                 self.stdout = StartedOutput()
 
@@ -1613,8 +1615,9 @@ risk: medium
             def kill(self):
                 raise AssertionError("completed Planner process must not be killed")
 
-        def codex_run(arguments, **_kwargs):
+        def codex_run(arguments, **kwargs):
             calls.append(arguments)
+            call_options.append(kwargs)
             return subprocess.CompletedProcess(arguments, 0)
 
         with tempfile.TemporaryDirectory() as directory:
@@ -1655,8 +1658,56 @@ risk: medium
         self.assertEqual(resumed.session_id, started.session_id)
         self.assertEqual(calls[0][:3], ["codex", "exec", "--json"])
         self.assertNotIn("--ephemeral", calls[0])
-        self.assertEqual(calls[1][:4], ["codex", "exec", "resume", "--json"])
+        self.assertEqual(
+            calls[1][:6],
+            ["codex", "exec", "--approve-for-me", "-C", str(worktree), "resume"],
+        )
+        self.assertIn("--json", calls[1])
         self.assertIn(started.session_id, calls[1])
+        self.assertEqual(call_options[0]["cwd"], worktree)
+        self.assertEqual(call_options[1]["cwd"], worktree)
+
+    def test_resumed_read_only_codex_keeps_managed_worktree_boundary(self):
+        session_id = "0199a213-81c0-7800-8aa1-bbab2a035a53"
+        observed = {}
+
+        def resumed(arguments, **kwargs):
+            observed["arguments"] = arguments
+            observed["cwd"] = kwargs["cwd"]
+            (kwargs["cwd"] / "resume-output.txt").write_text("managed\n", encoding="utf-8")
+            return subprocess.CompletedProcess(arguments, 0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = root / "base"
+            base.mkdir()
+            worktree = root / "managed"
+            worktree.mkdir()
+            state_dir = root / "state"
+            with mock.patch(
+                "loop_manager.role", return_value=("gpt-5.6-sol", "high")
+            ), mock.patch("loop_manager.subprocess.run", side_effect=resumed):
+                result = loop_manager.run_codex(
+                    worktree,
+                    state_dir,
+                    root / "unused.ini",
+                    "reviewer",
+                    "review",
+                    read_only=True,
+                    session_id=session_id,
+                )
+
+            self.assertEqual(result.code, 0)
+            self.assertEqual(observed["cwd"], worktree)
+            self.assertTrue((worktree / "resume-output.txt").is_file())
+            self.assertFalse((base / "resume-output.txt").exists())
+
+        arguments = observed["arguments"]
+        self.assertEqual(
+            arguments[:7],
+            ["codex", "exec", "--sandbox", "read-only", "-C", str(worktree), "resume"],
+        )
+        self.assertIn(session_id, arguments)
 
     def test_interrupted_planner_persists_started_session_and_resumes(self):
         session_id = "0199a213-81c0-7800-8aa1-bbab2a035a53"

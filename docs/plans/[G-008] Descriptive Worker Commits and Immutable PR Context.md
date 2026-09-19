@@ -11,7 +11,7 @@ risk: medium
 
 ## Purpose
 
-Worker의 최종 결과에서 실제 변경을 설명하는 commit 제목과 요약을 받아 검증하고, 계획 당시 commit에 고정된 ExecPlan·source 링크와 함께 PR에 기록해 Git 이력과 Review 문맥을 장기적으로 추적할 수 있게 한다.
+Worker의 최종 결과에서 실제 변경을 설명하는 commit 제목과 요약을 받아 검증하고, 계획 당시 commit에 고정된 ExecPlan·source 링크와 함께 PR에 기록해 Git 이력과 Review 문맥을 장기적으로 추적할 수 있게 한다. 검증 또는 Review 실패 뒤 같은 Codex 세션을 재개할 때도 Agent의 실행 경계를 해당 ExecPlan 전용 worktree로 고정해 대상 프로젝트의 기본 worktree를 수정하지 않는다.
 
 ## Acceptance Criteria
 
@@ -24,6 +24,9 @@ Worker의 최종 결과에서 실제 변경을 설명하는 commit 제목과 요
 - GitHub blob 링크의 경로는 공백, 대괄호와 비 ASCII 문자를 포함해 UTF-8 percent-encoding하며 저장소 경로 구분자는 유지한다.
 - Requirement가 이후 archive로 이동하거나 base branch의 파일 경로가 바뀌어도 이미 생성된 PR의 계획 및 source 링크는 계획 당시 내용을 계속 가리킨다.
 - 기존 branch의 PR을 복구하는 흐름은 중복 PR을 만들거나 본문을 임의로 덮어쓰지 않고 현재 동작을 유지한다.
+- 최초 Codex 실행과 저장된 세션 재개는 역할과 무관하게 subprocess의 실제 working directory를 전달받은 관리 worktree로 명시하며, Loop Manager 프로세스를 시작한 경로나 Codex가 저장한 이전 cwd에 의존하지 않는다.
+- Worker 결과 검증 실패, 전체 verify 실패와 Reviewer 수정 요청으로 같은 Worker 세션을 재개해도 모든 상대 경로 읽기·쓰기와 Git 명령은 해당 ExecPlan 전용 worktree에서 실행된다.
+- 세션 재개 전후에 대상 프로젝트의 기본 worktree 파일, index와 HEAD는 변경되지 않으며, 기본 worktree가 Loop Manager 실행 경로인 경우에도 같은 조건을 만족한다.
 
 ## Implementation
 
@@ -33,6 +36,8 @@ Worker의 최종 결과에서 실제 변경을 설명하는 commit 제목과 요
 - 계획이 base에 게시돼 Worker 작업이 시작될 때의 commit SHA를 프로젝트 작업 상태에 별도 저장하는 호환 가능한 SQLite migration을 추가하고, 이후 base rebase로 `active_sha`가 바뀌어도 이 값은 유지하다가 활성 작업 정리 시 함께 비운다.
 - GitHub origin에서 저장소 식별자를 정규화하고 계획 commit SHA 및 percent-encoding된 프로젝트 상대 경로로 immutable blob URL을 만드는 부작용 없는 helper를 추가한다.
 - 검증된 ExecPlan 본문에서 `Purpose`를 읽고 Worker Summary, 계획 정보와 `sources` 목록을 조합하는 PR 본문 생성 함수를 분리한 뒤 기존 `gh pr create --body`의 정적 문구를 이 결과로 교체한다.
+- Codex subprocess 실행 경계를 하나의 helper로 모으고 최초 실행과 `exec resume` 모두에 관리 worktree를 OS process cwd로 명시한다. Codex 상위 `exec` 명령의 `-C`도 `resume` 앞에 전달해 CLI workspace root와 process cwd를 함께 고정하며, 호출자 프로세스 cwd 상속을 실행 경계로 사용하지 않는다.
+- 저장된 세션을 재개할 때도 Worker와 읽기 전용 역할에 맞는 sandbox 인자를 명시적으로 적용하고, 새 세션과 재개 세션이 동일한 관리 worktree 및 권한 경계를 사용하게 한다.
 
 ## Validation
 
@@ -41,6 +46,9 @@ Worker의 최종 결과에서 실제 변경을 설명하는 commit 제목과 요
 - Worker 제목을 commit에 사용하면서 Planner 계획 commit 제목은 유지하는 targeted unit test
 - 계획 SHA가 base rebase 뒤에도 유지되고 기존 SQLite DB migration 및 활성 작업 정리에서 올바르게 저장·해제되는 targeted unit test
 - 공백, 대괄호와 비 ASCII 경로의 immutable GitHub URL 및 Worker Summary·ExecPlan Purpose·전체 source 링크를 포함하는 PR 본문 targeted unit test
+- Loop Manager를 기본 worktree에서 실행한 조건에서 새 Codex 세션과 `exec resume` subprocess가 모두 관리 worktree를 process cwd로 받는지 검증하는 targeted unit test
+- Worker 결과 검증 실패, 전체 verify 실패와 Reviewer 수정 요청 뒤 같은 세션을 재개해 상대 경로 파일을 수정해도 전용 worktree만 바뀌고 기본 worktree의 파일, index와 HEAD가 그대로인지 검증하는 회귀 테스트
+- Planner와 Reviewer를 포함한 읽기 전용 재개가 관리 worktree cwd와 읽기 전용 sandbox 경계를 유지하는지 검증하는 targeted unit test
 - 전체 verify에서 기존 Worker→VERIFYING→REVIEWING→PR 생성 순서, 기존 PR 복구와 Planner 게시 흐름이 회귀하지 않는지 확인
 
 ## Progress
@@ -49,10 +57,12 @@ Worker의 최종 결과에서 실제 변경을 설명하는 commit 제목과 요
 - [ ] 검증된 Worker 제목을 commit 생성에 연결
 - [ ] 계획 commit SHA 영속화와 immutable GitHub 링크 생성
 - [ ] 실제 변경·ExecPlan·source 문맥을 포함한 PR 본문 생성
+- [ ] 최초·재개 Codex subprocess의 관리 worktree cwd와 역할별 sandbox 경계 고정
 - [ ] 결과 검증, 상태 전이, migration, URL과 PR 본문 단위 테스트 추가
 
 ## Decision Log
 
 - G-006에서 도입한 Worker 세션과 결과 저장을 재사용해 commit 제목 검증 실패도 코드 변경을 잃지 않고 같은 세션에서 교정한다.
+- `codex exec resume` 하위 명령에는 `-C`가 없지만 상위 `codex exec`의 `-C`를 `resume` 앞에 전달할 수 있다. 이 CLI workspace root와 subprocess cwd를 모두 관리 worktree로 고정하고, 세션에 저장된 cwd나 Loop Manager 호출 위치는 안전 경계로 간주하지 않는다.
 - 링크 기준은 PR 생성 시점의 base가 아니라 ExecPlan이 계획된 commit으로 고정해 Requirement archive와 후속 경로 변경의 영향을 받지 않게 한다.
 - commit 제목과 PR Summary는 같은 최종 Worker 결과에서 받되 각각의 사용 목적에 맞게 검증하고, 유효하지 않을 때 ExecPlan 제목이나 정적 문구로 fallback하지 않는다.

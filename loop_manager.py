@@ -714,6 +714,9 @@ def run_codex(
         arguments = [
             "codex",
             "exec",
+            *codex_sandbox_arguments(read_only),
+            "-C",
+            str(worktree),
             "resume",
             "--json",
             "-m",
@@ -753,6 +756,7 @@ def run_codex(
                 encoding="utf-8",
                 errors="replace",
                 env=agent_environment(),
+                cwd=worktree,
             )
             assert process.stdin is not None
             assert process.stdout is not None
@@ -795,6 +799,7 @@ def run_codex(
                 stdout=output,
                 stderr=subprocess.STDOUT,
                 env=agent_environment(),
+                cwd=worktree,
             )
         returncode = result.returncode
     message = last_message.read_text(encoding="utf-8") if last_message.is_file() else ""
