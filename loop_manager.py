@@ -182,12 +182,13 @@ class GitSnapshot:
     refs: dict[str, tuple[str, str]]
     worktrees: dict[str, tuple[str, ...]]
     config: dict[str, tuple[str, ...]]
+    operations: dict[str, str]
     shared_metadata_complete: bool = True
 
     def serialize(self) -> str:
         return json.dumps(
             {
-                "version": 3,
+                "version": 4,
                 "head": self.head,
                 "branch": self.branch,
                 "index": {path: list(entries) for path, entries in self.index.items()},
@@ -202,6 +203,7 @@ class GitSnapshot:
                 "config": {
                     key: list(values) for key, values in self.config.items()
                 },
+                "operations": self.operations,
             },
             ensure_ascii=True,
             separators=(",", ":"),
@@ -212,7 +214,7 @@ class GitSnapshot:
     def deserialize(cls, value: str) -> GitSnapshot:
         parsed = json.loads(value)
         version = parsed.get("version")
-        if version not in {1, 2, 3}:
+        if version not in {1, 2, 3, 4}:
             raise RuntimeError("저장된 Agent Git snapshot 형식을 지원하지 않습니다.")
         return cls(
             head=str(parsed["head"]),
@@ -240,7 +242,11 @@ class GitSnapshot:
                 str(key): tuple(str(value) for value in values)
                 for key, values in parsed.get("config", {}).items()
             },
-            shared_metadata_complete=version == 3,
+            operations={
+                str(name): str(signature)
+                for name, signature in parsed.get("operations", {}).items()
+            },
+            shared_metadata_complete=version == 4,
         )
 
 
@@ -2028,6 +2034,67 @@ def _config_entries(worktree: Path) -> dict[str, tuple[str, ...]]:
     }
 
 
+_GIT_OPERATION_PATHS = (
+    "MERGE_HEAD",
+    "MERGE_MODE",
+    "MERGE_MSG",
+    "AUTO_MERGE",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "REBASE_HEAD",
+    "rebase-merge",
+    "rebase-apply",
+    "sequencer",
+    "BISECT_HEAD",
+    "BISECT_LOG",
+    "BISECT_START",
+    "BISECT_TERMS",
+)
+
+
+def _git_operation_path_signature(path: Path) -> str:
+    digest = hashlib.sha256()
+
+    def include(candidate: Path, relative: str) -> None:
+        stat = candidate.lstat()
+        digest.update(relative.encode("utf-8", errors="surrogateescape"))
+        digest.update(b"\0")
+        digest.update(str(stat.st_mode).encode("ascii"))
+        digest.update(b"\0")
+        if candidate.is_symlink():
+            digest.update(os.fsencode(os.readlink(candidate)))
+        elif candidate.is_file():
+            with candidate.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+
+    include(path, ".")
+    if path.is_dir() and not path.is_symlink():
+        for candidate in sorted(
+            path.rglob("*"),
+            key=lambda entry: entry.relative_to(path).as_posix(),
+        ):
+            include(candidate, candidate.relative_to(path).as_posix())
+    return digest.hexdigest()
+
+
+def _git_operation_entries(worktree: Path) -> dict[str, str]:
+    entries: dict[str, str] = {}
+    for name in _GIT_OPERATION_PATHS:
+        resolved = git(
+            worktree,
+            "rev-parse",
+            "--git-path",
+            name,
+        ).stdout.strip()
+        path = Path(resolved)
+        if not path.is_absolute():
+            path = worktree / path
+        if path.exists() or path.is_symlink():
+            entries[name] = _git_operation_path_signature(path)
+    return entries
+
+
 def _metadata_changes_after_block(
     before: Mapping[str, object],
     blocked: Mapping[str, object],
@@ -2174,6 +2241,7 @@ def capture_git_snapshot(worktree: Path) -> GitSnapshot:
         refs=_shared_ref_entries(worktree),
         worktrees=_registered_worktree_entries(worktree),
         config=_config_entries(worktree),
+        operations=_git_operation_entries(worktree),
     )
 
 
@@ -2275,6 +2343,12 @@ def validate_agent_scope(
                 "Git config",
                 before.config,
                 after.config,
+                frozenset(),
+            ),
+            (
+                "Git operation 상태",
+                before.operations,
+                after.operations,
                 frozenset(),
             ),
         )
@@ -3147,56 +3221,49 @@ def recover_persisted_agent_worktree(
 def _blocked_agent_local_baseline(
     before: GitSnapshot,
     result: GitSnapshot,
+    current: GitSnapshot,
     worktree: Path,
 ) -> GitSnapshot:
-    """Accept only the already-diagnosed local file/index result."""
+    """Accept only a diagnosed local result that has not changed again."""
 
-    if not before.shared_metadata_complete or not result.shared_metadata_complete:
+    if (
+        not before.shared_metadata_complete
+        or not result.shared_metadata_complete
+        or not current.shared_metadata_complete
+    ):
         raise AgentScopeError("저장된 BLOCKED Agent Git metadata 기준 snapshot이 없습니다.")
-    if before.head != result.head or before.branch != result.branch:
-        raise AgentScopeError("BLOCKED Agent가 변경한 HEAD 또는 branch를 자동 복구할 수 없습니다.")
-    if before.refs != result.refs:
-        changed_refs = sorted(
-            refname
-            for refname in set(before.refs) | set(result.refs)
-            if before.refs.get(refname) != result.refs.get(refname)
-        )
+
+    new_local_changes: set[str] = set()
+    for before_state, result_state, current_state in (
+        (before.index, result.index, current.index),
+        (before.dirty, result.dirty, current.dirty),
+    ):
+        for path in set(before_state) | set(result_state) | set(current_state):
+            value = current_state.get(path)
+            if value not in (before_state.get(path), result_state.get(path)):
+                new_local_changes.add(path)
+    if new_local_changes:
+        displayed = ", ".join(sorted(new_local_changes)[:8])
+        remainder = len(new_local_changes) - 8
+        if remainder > 0:
+            displayed += f", 외 {remainder}개"
         raise AgentScopeError(
-            "BLOCKED Agent가 변경한 공유 Git refs를 자동 복구할 수 없습니다: "
-            + ", ".join(changed_refs)
-        )
-    if before.config != result.config:
-        changed_config = sorted(
-            key
-            for key in set(before.config) | set(result.config)
-            if before.config.get(key) != result.config.get(key)
-        )
-        raise AgentScopeError(
-            "BLOCKED Agent가 변경한 Git config를 자동 복구할 수 없습니다: "
-            + ", ".join(changed_config)
+            "BLOCKED 이후 새 파일 또는 index 변경을 자동 보존할 수 없습니다: "
+            + displayed
         )
 
     worktree_key = str(_canonical_path(worktree))
-    changed_worktrees = {
-        path
-        for path in set(before.worktrees) | set(result.worktrees)
-        if before.worktrees.get(path) != result.worktrees.get(path)
-    }
-    if changed_worktrees - {worktree_key}:
-        raise AgentScopeError("BLOCKED Agent가 변경한 다른 worktree 등록을 자동 복구할 수 없습니다.")
-    result_registration = result.worktrees.get(worktree_key)
-    if result_registration is None:
+    if current.worktrees.get(worktree_key) is None:
         raise AgentScopeError("BLOCKED Agent 결과에 관리 worktree 등록이 없습니다.")
-    worktrees = dict(before.worktrees)
-    worktrees[worktree_key] = result_registration
     return GitSnapshot(
         head=before.head,
         branch=before.branch,
-        index=result.index,
-        dirty=result.dirty,
+        index=current.index,
+        dirty=current.dirty,
         refs=before.refs,
-        worktrees=worktrees,
+        worktrees=before.worktrees,
         config=before.config,
+        operations=before.operations,
     )
 
 
@@ -3324,6 +3391,7 @@ def validate_persisted_agent_scope(
             refs=before.refs,
             worktrees=correction_worktrees,
             config=before.config,
+            operations=before.operations,
         )
         validate_agent_scope(
             "planner",
@@ -3394,6 +3462,7 @@ def validate_persisted_agent_scope(
             scope_before = _blocked_agent_local_baseline(
                 before,
                 blocked_result,
+                current,
                 saved_worktree,
             )
             base = str(project["base_branch"])
@@ -3493,6 +3562,7 @@ def refresh_persisted_agent_scope_after_manager_git(
         refs=current.refs,
         worktrees=refreshed_worktrees,
         config=stored.config,
+        operations=stored.operations,
     )
     update_project(
         connection,
@@ -3555,6 +3625,7 @@ def validate_blocked_agent_scope(
             scope_before = _blocked_agent_local_baseline(
                 before,
                 blocked_result,
+                current,
                 worktree,
             )
             manager_ref_candidates = frozenset(
@@ -3614,7 +3685,8 @@ def preserve_blocked_agent_changes(
         raise AgentScopeError(
             f"보존할 BLOCKED Agent snapshot이 유효하지 않습니다: {error}"
         ) from error
-    _blocked_agent_local_baseline(before, result, worktree)
+    current = capture_git_snapshot(worktree)
+    _blocked_agent_local_baseline(before, result, current, worktree)
     stashed = git(
         worktree,
         "stash",

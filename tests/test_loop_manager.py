@@ -3613,6 +3613,42 @@ class AgentScopeValidatorTest(unittest.TestCase):
                         selected_plan_path=plan_path,
                     )
 
+    def test_unfinished_merge_is_rejected_even_for_worker_allowed_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, plan_path = self._repository_with_plan(directory)
+            git_command(repo, "switch", "-c", "merge-source")
+            (repo / "src/app.py").write_text(
+                "VALUE = 2\n",
+                encoding="utf-8",
+            )
+            git_command(repo, "add", "src/app.py")
+            git_command(repo, "commit", "-m", "Prepare merge source")
+            git_command(repo, "switch", "main")
+            before = loop_manager.capture_git_snapshot(repo)
+
+            git_command(
+                repo,
+                "merge",
+                "--no-ff",
+                "--no-commit",
+                "merge-source",
+            )
+            after = loop_manager.capture_git_snapshot(repo)
+
+            self.assertNotIn("MERGE_HEAD", before.operations)
+            self.assertIn("MERGE_HEAD", after.operations)
+            with self.assertRaisesRegex(
+                loop_manager.AgentScopeError,
+                r"Git operation 상태 변경 .*MERGE_HEAD",
+            ):
+                loop_manager.validate_agent_scope(
+                    "worker",
+                    repo,
+                    before,
+                    after,
+                    selected_plan_path=plan_path,
+                )
+
     def test_shared_git_metadata_changes_are_rejected(self):
         scenarios = (
             (
@@ -4314,6 +4350,156 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     worktree,
                     plan_path,
                 )
+
+    def test_restored_worker_git_metadata_allows_changed_input_to_requeue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, plan_path = self._repository_with_plan(directory)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            branch, worktree = loop_manager.expected_execplan_workspace(
+                state_dir,
+                str(repo),
+                "G-001",
+            )
+            loop_manager.make_worktree(repo, worktree, branch, "main")
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+                (str(repo),),
+            )
+            loop_manager.register_execplans(
+                connection,
+                str(repo),
+                repo,
+                [(plan_path, loop_manager._parse_execplan(repo, repo / plan_path))],
+                plan_sha,
+                loop_manager.planning_input_fingerprint(repo, "main"),
+            )
+            plan = connection.execute(
+                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            blocked_fingerprint = loop_manager._worktree_execplan_input_fingerprint(
+                worktree,
+                plan,
+            )
+            before = loop_manager.capture_git_snapshot(worktree)
+
+            (worktree / "src/app.py").write_text(
+                "VALUE = 2\n",
+                encoding="utf-8",
+            )
+            git_command(worktree, "add", "src/app.py")
+            git_command(worktree, "commit", "-m", "Agent commit")
+            git_command(worktree, "switch", "-c", "agent-branch")
+            git_command(
+                worktree,
+                "update-ref",
+                "refs/tags/agent-tag",
+                "HEAD",
+            )
+            git_command(worktree, "config", "core.hooksPath", ".agent-hooks")
+            blocked_result = loop_manager.capture_git_snapshot(worktree)
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE exec_plans
+                    SET status = 'BLOCKED', active_sha = ?, branch = ?,
+                        worktree = ?, workspace_owned = 1,
+                        blocked_fingerprint = ?
+                    WHERE repo = ? AND plan_id = 'G-001'
+                    """,
+                    (
+                        plan_sha,
+                        branch,
+                        str(worktree),
+                        blocked_fingerprint,
+                        str(repo),
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE projects
+                    SET active_sha = ?, plan_sha = ?, phase = 'BLOCKED',
+                        branch = ?, worktree = ?, plan_path = ?,
+                        agent_role = 'worker', agent_snapshot = ?,
+                        agent_result_snapshot = ?
+                    WHERE repo = ?
+                    """,
+                    (
+                        plan_sha,
+                        plan_sha,
+                        branch,
+                        str(worktree),
+                        plan_path,
+                        before.serialize(),
+                        blocked_result.serialize(),
+                        str(repo),
+                    ),
+                )
+
+            git_command(worktree, "config", "--unset", "core.hooksPath")
+            git_command(worktree, "switch", branch)
+            git_command(worktree, "reset", "--hard", plan_sha)
+            git_command(worktree, "branch", "-D", "agent-branch")
+            git_command(worktree, "update-ref", "-d", "refs/tags/agent-tag")
+            (repo / "docs/PRODUCT.md").write_text(
+                "# Product changed after Git recovery\n",
+                encoding="utf-8",
+            )
+            commit_and_push(repo, "Change source after Git recovery")
+
+            with mock.patch(
+                "loop_manager.validate_repository",
+                return_value=repo,
+            ), mock.patch(
+                "loop_manager.remote_base",
+                return_value="main",
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch",
+                return_value=None,
+            ), mock.patch(
+                "loop_manager.run_codex",
+                return_value=loop_manager.CodexResult(
+                    1,
+                    "stop after restored metadata",
+                    "planner-session",
+                ),
+            ) as resumed_agent:
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, last_error, agent_snapshot, agent_result_snapshot "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            plan = connection.execute(
+                "SELECT status, blocked_fingerprint FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(result, 1)
+            self.assertEqual(project["phase"], "PLANNING")
+            self.assertEqual(project["last_error"], "stop after restored metadata")
+            self.assertIsNone(project["agent_snapshot"])
+            self.assertIsNone(project["agent_result_snapshot"])
+            self.assertEqual(plan["status"], "READY")
+            self.assertIsNone(plan["blocked_fingerprint"])
+            resumed_agent.assert_called_once()
+            self.assertEqual(resumed_agent.call_args.args[3], "planner")
 
     def test_index_flags_are_rejected_for_worker_allowed_path(self):
         for option in ("--skip-worktree", "--assume-unchanged"):
