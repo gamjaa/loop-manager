@@ -5015,6 +5015,73 @@ class AgentScopeValidatorTest(unittest.TestCase):
             self.assertEqual(resumed_agent.call_args.args[3], "planner")
 
 
+    def test_reviewer_scope_block_records_execplan_body_boundaries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, plan_path = self._repository_with_plan(directory)
+            worktree = root / "managed"
+            loop_manager.make_worktree(
+                repo,
+                worktree,
+                "loop-manager/G-001",
+                "main",
+            )
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                """
+                INSERT INTO projects (repo, base_branch, plan_path)
+                VALUES (?, 'main', ?)
+                """,
+                (str(repo), plan_path),
+            )
+            loop_manager.register_execplans(
+                connection,
+                str(repo),
+                repo,
+                [(plan_path, loop_manager._parse_execplan(repo, repo / plan_path))],
+                plan_sha,
+                loop_manager.planning_input_fingerprint(repo, "main"),
+            )
+            loop_manager.update_project(connection, str(repo), plan_path=plan_path)
+            plan = connection.execute(
+                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            input_fingerprint = loop_manager._worktree_execplan_input_fingerprint(
+                worktree,
+                plan,
+            )
+            plan_file = worktree / plan_path
+            input_plan = plan_file.read_text(encoding="utf-8")
+            loop_manager.begin_agent_scope(
+                connection,
+                str(repo),
+                worktree,
+                "reviewer",
+                input_fingerprint=input_fingerprint,
+            )
+            result_plan = input_plan.replace("Test plan.", "Reviewer mutation.")
+            plan_file.write_text(result_plan, encoding="utf-8")
+
+            loop_manager.block_active_execplan(
+                connection,
+                str(repo),
+                worktree,
+                "reviewer scope violation",
+                "",
+            )
+
+            project = connection.execute(
+                "SELECT agent_input_plan, agent_result_plan "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(project["agent_input_plan"], input_plan)
+            self.assertEqual(project["agent_result_plan"], result_plan)
+
     def test_blocked_scope_resume_accepts_direct_execplan_edit(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -5051,7 +5118,16 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 worktree,
                 plan,
             )
+            plan_file = worktree / plan_path
+            original_plan_text = plan_file.read_text(encoding="utf-8")
             before = loop_manager.capture_git_snapshot(worktree)
+            reviewer_plan_text = original_plan_text.replace(
+                "Test plan.", "Reviewer mutation."
+            )
+            plan_file.write_text(reviewer_plan_text, encoding="utf-8")
+            blocked_worktree_fingerprint = (
+                loop_manager._worktree_execplan_input_fingerprint(worktree, plan)
+            )
             (worktree / "reviewer.txt").write_text(
                 "preserve violation\n",
                 encoding="utf-8",
@@ -5073,7 +5149,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                         branch,
                         str(worktree),
                         input_fingerprint,
-                        input_fingerprint,
+                        blocked_worktree_fingerprint,
                         str(repo),
                     ),
                 )
@@ -5084,7 +5160,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
                         branch = ?, worktree = ?, plan_path = ?,
                         last_error = 'scope blocked', agent_role = 'reviewer',
                         agent_snapshot = ?, agent_input_fingerprint = ?,
-                        agent_result_snapshot = ?
+                        agent_result_snapshot = ?, agent_input_plan = ?,
+                        agent_result_plan = ?
                     WHERE repo = ?
                     """,
                     (
@@ -5096,6 +5173,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
                         before.serialize(),
                         input_fingerprint,
                         blocked_result.serialize(),
+                        original_plan_text,
+                        reviewer_plan_text,
                         str(repo),
                     ),
                 )
@@ -5130,17 +5209,21 @@ class AgentScopeValidatorTest(unittest.TestCase):
             self.assertIsNotNone(persisted_block["agent_manager_snapshot"])
             blocked_agent.assert_not_called()
 
-            plan_file = worktree / plan_path
-            user_plan_text = plan_file.read_text(encoding="utf-8") + (
+            user_mixed_plan_text = plan_file.read_text(encoding="utf-8") + (
                 "\nUser clarification after scope block.\n"
             )
-            plan_file.write_text(user_plan_text, encoding="utf-8")
+            plan_file.write_text(user_mixed_plan_text, encoding="utf-8")
+            user_plan_text = original_plan_text + "\nUser clarification after scope block.\n"
 
             def resumed_worker(agent_worktree, *_args, **_kwargs):
                 self.assertEqual(_args[2], "worker")
                 self.assertEqual(
                     (agent_worktree / plan_path).read_text(encoding="utf-8"),
                     user_plan_text,
+                )
+                self.assertNotIn(
+                    "Reviewer mutation.",
+                    (agent_worktree / plan_path).read_text(encoding="utf-8"),
                 )
                 self.assertFalse((agent_worktree / "reviewer.txt").exists())
                 return loop_manager.CodexResult(
@@ -5195,6 +5278,10 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "loop-manager scope violation G-001",
                 git_command(worktree, "stash", "list"),
             )
+            stashed_plan = git_command(
+                worktree, "show", f"stash@{{0}}:{plan_path}"
+            )
+            self.assertIn("Reviewer mutation.", stashed_plan)
             resumed_agent.assert_called_once()
 
     def test_verify_mutation_of_worker_protected_file_blocks_before_commit(self):

@@ -7,6 +7,7 @@ import argparse
 from collections.abc import Callable, Mapping
 import configparser
 import contextlib
+import difflib
 import errno
 from dataclasses import dataclass
 from datetime import datetime
@@ -61,6 +62,8 @@ FIELDS = {
     "agent_role",
     "agent_snapshot",
     "agent_input_fingerprint",
+    "agent_input_plan",
+    "agent_result_plan",
     "agent_result_snapshot",
     "agent_manager_snapshot",
 }
@@ -94,6 +97,8 @@ CREATE TABLE IF NOT EXISTS projects (
     agent_role TEXT,
     agent_snapshot TEXT,
     agent_input_fingerprint TEXT,
+    agent_input_plan TEXT,
+    agent_result_plan TEXT,
     agent_result_snapshot TEXT,
     agent_manager_snapshot TEXT
 )
@@ -448,6 +453,8 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
         "agent_role": "TEXT",
         "agent_snapshot": "TEXT",
         "agent_input_fingerprint": "TEXT",
+        "agent_input_plan": "TEXT",
+        "agent_result_plan": "TEXT",
         "agent_result_snapshot": "TEXT",
         "agent_manager_snapshot": "TEXT",
     }
@@ -2486,7 +2493,8 @@ def begin_agent_scope(
     input_fingerprint: str | None = None,
 ) -> GitSnapshot:
     row = connection.execute(
-        "SELECT agent_role, agent_snapshot FROM projects WHERE repo = ?",
+        "SELECT agent_role, agent_snapshot, plan_path "
+        "FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
     if row is None:
@@ -2499,12 +2507,21 @@ def begin_agent_scope(
             )
         return GitSnapshot.deserialize(str(row["agent_snapshot"]))
     snapshot = capture_git_snapshot(worktree)
+    plan_path = str(row["plan_path"] or "")
+    plan_file = worktree / plan_path
+    agent_input_plan = (
+        plan_file.read_text(encoding="utf-8")
+        if role_name == "reviewer" and plan_path and plan_file.is_file()
+        else None
+    )
     update_project(
         connection,
         repo,
         agent_role=role_name,
         agent_snapshot=snapshot.serialize(),
         agent_input_fingerprint=input_fingerprint,
+        agent_input_plan=agent_input_plan,
+        agent_result_plan=None,
         agent_result_snapshot=None,
         agent_manager_snapshot=None,
     )
@@ -2517,6 +2534,8 @@ def clear_agent_scope(connection: sqlite3.Connection, repo: str) -> None:
         repo,
         agent_role=None,
         agent_snapshot=None,
+        agent_input_plan=None,
+        agent_result_plan=None,
         agent_input_fingerprint=None,
         agent_result_snapshot=None,
         agent_manager_snapshot=None,
@@ -2877,6 +2896,8 @@ def clear_planning_validation_state(
         agent_role=None,
         agent_snapshot=None,
         agent_input_fingerprint=None,
+        agent_input_plan=None,
+        agent_result_plan=None,
         agent_result_snapshot=None,
         agent_manager_snapshot=None,
     )
@@ -2910,6 +2931,8 @@ def _clear_active_values(
         "planning_error_fingerprint": None,
         "agent_role": None,
         "agent_snapshot": None,
+        "agent_input_plan": None,
+        "agent_result_plan": None,
         "agent_input_fingerprint": None,
         "agent_result_snapshot": None,
         "agent_manager_snapshot": None,
@@ -3145,7 +3168,8 @@ def block_active_execplan(
     preserved_agent_result_snapshot: str | None = None,
 ) -> None:
     project = connection.execute(
-        "SELECT plan_path, agent_snapshot, agent_input_fingerprint "
+        "SELECT plan_path, agent_role, agent_snapshot, agent_input_fingerprint, "
+        "agent_input_plan "
         "FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
@@ -3172,6 +3196,14 @@ def block_active_execplan(
             agent_result_snapshot = capture_git_snapshot(worktree).serialize()
         except RuntimeError:
             pass
+    agent_result_plan = None
+    if (
+        project["agent_role"] == "reviewer"
+        and project["agent_input_plan"] is not None
+    ):
+        plan_file = worktree / str(plan["path"])
+        if plan_file.is_file():
+            agent_result_plan = plan_file.read_text(encoding="utf-8")
     with connection:
         connection.execute(
             """
@@ -3193,10 +3225,11 @@ def block_active_execplan(
             """
             UPDATE projects
             SET phase = 'BLOCKED', last_error = ?, verify_result = ?,
-                agent_result_snapshot = ?, agent_manager_snapshot = NULL
+                agent_result_snapshot = ?, agent_result_plan = ?,
+                agent_manager_snapshot = NULL
             WHERE repo = ?
             """,
-            (error, verify_result, agent_result_snapshot, repo),
+            (error, verify_result, agent_result_snapshot, agent_result_plan, repo),
         )
 
 
@@ -3841,6 +3874,78 @@ def validate_blocked_agent_scope(
     )
 
 
+def _reconcile_blocked_reviewer_plan(
+    relative_path: str,
+    before_text: str,
+    result_text: str,
+    current_text: str,
+) -> str:
+    """Remove Reviewer edits while retaining separable user edits."""
+
+    if before_text == result_text:
+        return current_text
+
+    before_lines = before_text.splitlines(keepends=True)
+    result_lines = result_text.splitlines(keepends=True)
+    current_lines = current_text.splitlines(keepends=True)
+    user_equal_blocks = [
+        (result_start, result_end, current_start, current_end)
+        for tag, result_start, result_end, current_start, current_end in (
+            difflib.SequenceMatcher(
+                None,
+                result_lines,
+                current_lines,
+                autojunk=False,
+            ).get_opcodes()
+        )
+        if tag == "equal"
+    ]
+    reverse_edits: list[tuple[int, int, list[str]]] = []
+    agent_edits = difflib.SequenceMatcher(
+        None,
+        result_lines,
+        before_lines,
+        autojunk=False,
+    ).get_opcodes()
+    for tag, result_start, result_end, before_start, before_end in agent_edits:
+        if tag == "equal":
+            continue
+        if result_start == result_end:
+            positions = {
+                current_start + result_start - equal_start
+                for equal_start, equal_end, current_start, _ in user_equal_blocks
+                if equal_start <= result_start <= equal_end
+            }
+            if len(positions) != 1:
+                raise AgentScopeError(
+                    "BLOCKED ExecPlan의 Reviewer 변경과 사용자 변경을 "
+                    f"안전하게 분리할 수 없습니다: {relative_path}"
+                )
+            current_start = current_end = positions.pop()
+        else:
+            ranges = {
+                (
+                    current_start + result_start - equal_start,
+                    current_start + result_end - equal_start,
+                )
+                for equal_start, equal_end, current_start, _ in user_equal_blocks
+                if equal_start <= result_start and result_end <= equal_end
+            }
+            if len(ranges) != 1:
+                raise AgentScopeError(
+                    "BLOCKED ExecPlan의 Reviewer 변경과 사용자 변경을 "
+                    f"안전하게 분리할 수 없습니다: {relative_path}"
+                )
+            current_start, current_end = ranges.pop()
+        reverse_edits.append(
+            (current_start, current_end, before_lines[before_start:before_end])
+        )
+
+    for current_start, current_end, replacement in reversed(reverse_edits):
+        current_lines[current_start:current_end] = replacement
+    return "".join(current_lines)
+
+
 def preserve_blocked_agent_changes(
     connection: sqlite3.Connection,
     repo: str,
@@ -3852,10 +3957,16 @@ def preserve_blocked_agent_changes(
     """Move a diagnosed scope violation out of the publishable worktree."""
 
     project = connection.execute(
-        "SELECT agent_snapshot, agent_result_snapshot FROM projects WHERE repo = ?",
+        "SELECT agent_role, agent_snapshot, agent_result_snapshot, "
+        "agent_input_plan, agent_result_plan "
+        "FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
-    if project is None or not project["agent_snapshot"] or not project["agent_result_snapshot"]:
+    if (
+        project is None
+        or not project["agent_snapshot"]
+        or not project["agent_result_snapshot"]
+    ):
         return
     try:
         before = GitSnapshot.deserialize(str(project["agent_snapshot"]))
@@ -3883,6 +3994,35 @@ def preserve_blocked_agent_changes(
         if current.dirty.get(path)
         not in (before.dirty.get(path), result.dirty.get(path))
     )
+    excluded_paths = set(preserved_paths)
+    reconciled_paths: dict[str, str] = {}
+    if project["agent_role"] == "reviewer":
+        for path in preserved_paths:
+            before_text = project["agent_input_plan"]
+            result_text = project["agent_result_plan"]
+            agent_changed_path = before.dirty.get(path) != result.dirty.get(path)
+            if before_text is None or result_text is None:
+                if agent_changed_path:
+                    raise AgentScopeError(
+                        "BLOCKED ExecPlan의 Reviewer 변경을 분리할 "
+                        f"본문 기준이 없습니다: {path}"
+                    )
+                continue
+            if str(before_text) == str(result_text):
+                continue
+            plan_file = worktree / path
+            if not plan_file.is_file():
+                raise AgentScopeError(
+                    f"사용자가 수정한 BLOCKED ExecPlan을 읽을 수 없습니다: {path}"
+                )
+            reconciled_paths[path] = _reconcile_blocked_reviewer_plan(
+                path,
+                str(before_text),
+                str(result_text),
+                plan_file.read_text(encoding="utf-8"),
+            )
+            excluded_paths.discard(path)
+
     stash_arguments = [
         "stash",
         "push",
@@ -3890,17 +4030,29 @@ def preserve_blocked_agent_changes(
         "-m",
         f"loop-manager scope violation {plan_id}",
     ]
-    if preserved_paths:
+    if excluded_paths:
         stash_arguments.extend(
             [
                 "--",
                 ".",
-                *(f":(top,literal,exclude){path}" for path in sorted(preserved_paths)),
+                *(
+                    f":(top,literal,exclude){path}"
+                    for path in sorted(excluded_paths)
+                ),
             ]
         )
     stashed = git(worktree, *stash_arguments, check=False)
     if stashed.returncode:
-        raise AgentScopeError(f"BLOCKED Agent 변경 보존 실패:\n{stashed.stdout[-8000:]}")
+        raise AgentScopeError(
+            f"BLOCKED Agent 변경 보존 실패:\n{stashed.stdout[-8000:]}"
+        )
+    try:
+        for path, contents in reconciled_paths.items():
+            (worktree / path).write_text(contents, encoding="utf-8")
+    except OSError as error:
+        raise AgentScopeError(
+            f"BLOCKED ExecPlan 사용자 변경 복원 실패: {error}"
+        ) from error
 
 
 def _requeue_blocked_execplan(
@@ -4046,18 +4198,6 @@ def resume_blocked_execplan_if_inputs_changed(
     )
     if not worktree_changed and not remote_changed:
         return False
-    metadata_validated = False
-    if worktree_changed:
-        metadata_error = _blocked_execplan_metadata_error(repo_path, worktree, plan)
-        if metadata_error:
-            _update_blocked_error(
-                connection,
-                repo,
-                str(plan["plan_id"]),
-                metadata_error,
-            )
-            return False
-        metadata_validated = True
     try:
         preserve_blocked_agent_changes(
             connection,
@@ -4081,7 +4221,7 @@ def resume_blocked_execplan_if_inputs_changed(
             error = f"BLOCKED 해제 전 rebase 실패:\n{rebased.stdout[-8000:]}"
             _update_blocked_error(connection, repo, str(plan["plan_id"]), error)
             return False
-    if not metadata_validated:
+    if worktree.is_dir():
         metadata_error = _blocked_execplan_metadata_error(repo_path, worktree, plan)
         if metadata_error:
             _update_blocked_error(
