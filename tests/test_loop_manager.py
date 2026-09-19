@@ -3537,6 +3537,85 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     )
                 self.assertNotIn(sensitive_value, str(violation.exception))
 
+    def test_blocked_config_change_stops_before_git_reentry(self):
+        scenarios = (
+            (
+                "remote-url",
+                ("remote", "set-url", "origin"),
+                "https://secret@attacker.invalid/repo.git",
+                "local:remote.origin.url",
+            ),
+            (
+                "hooks-path",
+                ("config", "core.hooksPath"),
+                "agent-hooks",
+                "local:core.hookspath",
+            ),
+        )
+        for name, arguments, configured_value, expected_key in scenarios:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, _plan_path = self._repository_with_plan(directory)
+                before = loop_manager.capture_git_snapshot(repo)
+                sensitive_value = (
+                    str(root / configured_value)
+                    if name == "hooks-path"
+                    else configured_value
+                )
+                git_command(repo, *arguments, sensitive_value)
+                blocked_result = loop_manager.capture_git_snapshot(repo)
+                connection = sqlite3.connect(":memory:")
+                connection.row_factory = sqlite3.Row
+                connection.execute(loop_manager.SCHEMA)
+                connection.execute(
+                    """
+                    INSERT INTO projects (
+                        repo, base_branch, phase, worktree, agent_role,
+                        agent_snapshot, agent_result_snapshot
+                    ) VALUES (?, 'main', 'BLOCKED', ?, 'worker', ?, ?)
+                    """,
+                    (
+                        str(repo),
+                        str(repo),
+                        before.serialize(),
+                        blocked_result.serialize(),
+                    ),
+                )
+                connection.commit()
+
+                with mock.patch(
+                    "loop_manager.validate_repository",
+                    return_value=repo,
+                ), mock.patch(
+                    "loop_manager.migrate_legacy_execplans"
+                ) as migration, mock.patch(
+                    "loop_manager.git",
+                    side_effect=AssertionError("unsafe Git command before config validation"),
+                ) as unsafe_git, mock.patch(
+                    "loop_manager.run_codex"
+                ) as agent:
+                    result = loop_manager.run_project(
+                        connection,
+                        root / "state",
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
+                    )
+
+                project = connection.execute(
+                    "SELECT phase, last_error FROM projects WHERE repo = ?",
+                    (str(repo),),
+                ).fetchone()
+                self.assertEqual(result, 1)
+                self.assertEqual(project["phase"], "BLOCKED")
+                self.assertIn("config 선검증 실패", project["last_error"])
+                self.assertIn(expected_key, project["last_error"])
+                self.assertNotIn(sensitive_value, project["last_error"])
+                migration.assert_not_called()
+                unsafe_git.assert_not_called()
+                agent.assert_not_called()
+
     def test_blocked_resume_does_not_excuse_agent_base_ref_change(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -2809,6 +2809,49 @@ def block_active_execplan_from_revision(
         )
 
 
+def validate_blocked_agent_config(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    repo: str,
+) -> None:
+    """Check persisted Agent config state before any remote or hook-capable Git work."""
+
+    project = connection.execute(
+        "SELECT phase, worktree, agent_snapshot FROM projects WHERE repo = ?",
+        (repo,),
+    ).fetchone()
+    if (
+        project is None
+        or project["phase"] != "BLOCKED"
+        or not project["agent_snapshot"]
+    ):
+        return
+    try:
+        before = GitSnapshot.deserialize(str(project["agent_snapshot"]))
+    except (KeyError, TypeError, ValueError, RuntimeError) as error:
+        raise AgentScopeError(
+            f"저장된 BLOCKED Agent Git snapshot이 유효하지 않습니다: {error}"
+        ) from error
+    if not before.shared_metadata_complete:
+        raise AgentScopeError("BLOCKED Agent Git config 기준 snapshot이 없습니다.")
+
+    saved_worktree = Path(str(project["worktree"] or ""))
+    config_context = saved_worktree if saved_worktree.is_dir() else repo_path
+    current_config = _config_entries(config_context)
+    changed_keys = sorted(
+        key
+        for key in set(before.config) | set(current_config)
+        if before.config.get(key) != current_config.get(key)
+    )
+    if not changed_keys:
+        return
+    displayed = ", ".join(changed_keys[:8])
+    remainder = len(changed_keys) - 8
+    if remainder > 0:
+        displayed += f", 외 {remainder}개"
+    raise AgentScopeError(f"BLOCKED Agent Git config 변경 ({displayed})")
+
+
 def validate_blocked_agent_scope(
     connection: sqlite3.Connection,
     repo_path: Path,
@@ -3276,6 +3319,24 @@ def run_project(
     repo_path = validate_repository(Path(repo_arg), allow_agents_mismatch=allow_agents_mismatch)
     repo = str(repo_path)
     _ensure_execplans_schema(connection)
+    row = connection.execute(
+        "SELECT * FROM projects WHERE repo = ?",
+        (repo,),
+    ).fetchone()
+    if row and row["phase"] == "BLOCKED":
+        try:
+            validate_blocked_agent_config(connection, repo_path, repo)
+        except AgentScopeError as error:
+            detail = str(error)
+        except RuntimeError:
+            detail = "BLOCKED Agent Git config를 안전하게 읽을 수 없습니다."
+        else:
+            detail = None
+        if detail is not None:
+            message = f"BLOCKED Agent config 선검증 실패:\n{detail}"
+            update_project(connection, repo, last_error=message)
+            operation_print(message, file=sys.stderr)
+            return 1
     migrate_legacy_execplans(
         connection,
         reconcile_history=True,
