@@ -4010,6 +4010,11 @@ class WorkerPublicationTest(unittest.TestCase):
                 "first run: 1 failed, 2 passed\n"
                 "RERUN: python3 -m  unittest tests.test_case\n3 passed"
             ),
+            (
+                "FAILED_COMMAND: python3 -m unittest tests.test_syntax\n"
+                "first run: SyntaxError 발생\n"
+                "RERUN: python3 -m unittest tests.test_syntax\n1 passed"
+            ),
         )
         for evidence in valid_evidence:
             with self.subTest(evidence=evidence):
@@ -4025,6 +4030,8 @@ class WorkerPublicationTest(unittest.TestCase):
             "pytest: 1 failed, 2 passed",
             "unittest: 1 error, 2 passed",
             "RERUN: pytest: 1 failed, 2 passed",
+            "SyntaxError 발생, 수정 후 통과",
+            "targeted test raised AssertionError: mismatch; then passed",
             "targeted test: FAIL\nunable to run the rerun",
             (
                 "FAILED_COMMAND: python3 -m unittest tests.test_a\n"

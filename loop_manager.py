@@ -5979,6 +5979,10 @@ TARGETED_TESTS:
 _TARGETED_TEST_FAILURE = re.compile(
     r"(?i)(?<![\w])(?:FAIL(?:ED|URES?)?|ERRORS?|실패)(?![\w])"
 )
+_TARGETED_TEST_EXCEPTION_FAILURE = re.compile(
+    r"(?m)(?<![\w])[A-Z][A-Za-z0-9_]*(?:Error|Exception)"
+    r"(?=[ \t]*(?::|발생|occurred\b|(?:was[ \t]+)?raised\b|$))"
+)
 _TARGETED_TEST_SUCCESS = re.compile(
     r"(?i)(?<![\w])(?:PASS(?:ED)?|SUCCESS|OK|성공|통과)(?![\w])"
 )
@@ -5994,7 +5998,14 @@ def _targeted_test_failure_matches(evidence: str) -> list[re.Match[str]]:
         (match.start(), match.end())
         for match in _TARGETED_TEST_COMMAND.finditer(evidence)
     ]
-    for match in _TARGETED_TEST_FAILURE.finditer(evidence):
+    candidates = sorted(
+        (
+            *_TARGETED_TEST_FAILURE.finditer(evidence),
+            *_TARGETED_TEST_EXCEPTION_FAILURE.finditer(evidence),
+        ),
+        key=lambda match: (match.start(), match.end()),
+    )
+    for match in candidates:
         if any(start <= match.start() < end for start, end in command_spans):
             continue
         prefix = evidence[max(0, match.start() - 32):match.start()]
