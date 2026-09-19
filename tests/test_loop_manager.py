@@ -3822,6 +3822,123 @@ class AgentScopeValidatorTest(unittest.TestCase):
             )
             agent.assert_not_called()
 
+    def test_interrupted_worker_resume_accepts_manager_fetched_remote_ref(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, plan_path = self._repository_with_plan(directory)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
+            branch, worktree = loop_manager.expected_execplan_workspace(
+                state_dir, str(repo), "G-001"
+            )
+            loop_manager.make_worktree(repo, worktree, branch, "main")
+
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+                (str(repo),),
+            )
+            loop_manager.register_execplans(
+                connection,
+                str(repo),
+                repo,
+                [(plan_path, loop_manager._parse_execplan(repo, repo / plan_path))],
+                plan_sha,
+                loop_manager.planning_input_fingerprint(repo, "main"),
+            )
+            before = loop_manager.capture_git_snapshot(worktree)
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE exec_plans
+                    SET status = 'IMPLEMENTING', active_sha = ?, branch = ?,
+                        worktree = ?, workspace_owned = 1,
+                        worker_session_id = 'worker-session'
+                    WHERE repo = ? AND plan_id = 'G-001'
+                    """,
+                    (plan_sha, branch, str(worktree), str(repo)),
+                )
+                connection.execute(
+                    """
+                    UPDATE projects
+                    SET active_sha = ?, plan_sha = ?, phase = 'WORKING',
+                        branch = ?, worktree = ?, plan_path = ?,
+                        worker_session_id = 'worker-session',
+                        agent_role = 'worker', agent_snapshot = ?
+                    WHERE repo = ?
+                    """,
+                    (
+                        plan_sha,
+                        plan_sha,
+                        branch,
+                        str(worktree),
+                        plan_path,
+                        before.serialize(),
+                        str(repo),
+                    ),
+                )
+
+            (worktree / "src/app.py").write_text(
+                "VALUE = 2\n",
+                encoding="utf-8",
+            )
+
+            remote = root / "remote.git"
+            git_command(
+                remote,
+                "update-ref",
+                "refs/heads/manager-update",
+                plan_sha,
+            )
+            sessions = []
+
+            def resumed_worker(_worktree, _state, _config, role_name, _prompt, **kwargs):
+                self.assertEqual(role_name, "worker")
+                sessions.append(kwargs["session_id"])
+                return loop_manager.CodexResult(
+                    1, "stop after resumed worker", "worker-session"
+                )
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.run_codex", side_effect=resumed_worker
+            ):
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT phase, last_error, agent_snapshot FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            plan_status = connection.execute(
+                "SELECT status FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()["status"]
+
+            self.assertEqual(result, 1)
+            self.assertEqual(sessions, ["worker-session"])
+            self.assertEqual(project["phase"], "WORKING")
+            self.assertEqual(plan_status, "IMPLEMENTING")
+            self.assertEqual(project["last_error"], "stop after resumed worker")
+            self.assertIsNone(project["agent_snapshot"])
+            self.assertEqual(
+                git_command(repo, "rev-parse", "refs/remotes/origin/manager-update"),
+                plan_sha,
+            )
+
     def test_blocked_resume_does_not_excuse_agent_base_ref_change(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

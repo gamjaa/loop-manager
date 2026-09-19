@@ -2845,13 +2845,72 @@ def block_active_execplan_from_revision(
         )
 
 
+def block_persisted_agent_scope_violation(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    repo: str,
+    row: sqlite3.Row,
+    detail: str,
+) -> str:
+    """Persist a pre-resume scope violation without discarding Agent state."""
+
+    message = f"Agent 범위 선검증 실패:\n{detail}"
+    plan = active_execplan(connection, repo)
+    if plan is None:
+        if row["phase"] == "PLANNING":
+            update_project(
+                connection,
+                repo,
+                planning_validation_error=detail,
+                last_error=message,
+                agent_result_snapshot=str(row["agent_snapshot"]),
+            )
+        else:
+            update_project(
+                connection,
+                repo,
+                phase="BLOCKED",
+                last_error=message,
+                agent_result_snapshot=str(row["agent_snapshot"]),
+            )
+        return message
+
+    saved_worktree = Path(str(row["worktree"] or ""))
+    preserved_snapshot = str(row["agent_snapshot"])
+    if saved_worktree.is_dir():
+        block_active_execplan(
+            connection,
+            repo,
+            saved_worktree,
+            message,
+            str(row["verify_result"] or ""),
+            preserved_agent_result_snapshot=preserved_snapshot,
+        )
+    else:
+        revision = str(
+            plan["plan_sha"]
+            or row["active_sha"]
+            or f"refs/remotes/origin/{row['base_branch']}"
+        )
+        block_active_execplan_from_revision(
+            connection,
+            repo_path,
+            repo,
+            revision,
+            message,
+            str(row["verify_result"] or ""),
+            preserved_agent_result_snapshot=preserved_snapshot,
+        )
+    return message
+
+
 def validate_persisted_agent_scope(
     connection: sqlite3.Connection,
     repo_path: Path,
     repo: str,
     *,
     allow_planner_worktree_correction: bool = False,
-) -> None:
+) -> GitSnapshot | None:
     """Validate persisted Agent output before repository-aware Git work."""
 
     project = connection.execute(
@@ -2860,7 +2919,7 @@ def validate_persisted_agent_scope(
         (repo,),
     ).fetchone()
     if project is None or not project["agent_snapshot"]:
-        return
+        return None
     try:
         before = GitSnapshot.deserialize(str(project["agent_snapshot"]))
     except (KeyError, TypeError, ValueError, RuntimeError) as error:
@@ -2976,7 +3035,7 @@ def validate_persisted_agent_scope(
             allowed_ref_changes=allowed_ref_changes,
             allowed_worktree_changes=allowed_worktree_changes,
         )
-        return
+        return current
 
     allowed_ref_changes: frozenset[str] = frozenset()
     allowed_worktree_changes: frozenset[str] = frozenset()
@@ -3020,6 +3079,63 @@ def validate_persisted_agent_scope(
         allowed_ref_changes=allowed_ref_changes,
         allowed_worktree_changes=allowed_worktree_changes,
     )
+
+    return current
+
+
+def refresh_persisted_agent_scope_after_manager_git(
+    connection: sqlite3.Connection,
+    repo: str,
+    validated: GitSnapshot,
+) -> GitSnapshot:
+    """Merge trusted Manager refs into an interrupted Agent's start snapshot."""
+
+    project = connection.execute(
+        "SELECT worktree, agent_snapshot FROM projects WHERE repo = ?",
+        (repo,),
+    ).fetchone()
+    if project is None or not project["agent_snapshot"]:
+        raise AgentScopeError("갱신할 저장된 Agent Git snapshot이 없습니다.")
+    stored = GitSnapshot.deserialize(str(project["agent_snapshot"]))
+    worktree = Path(str(project["worktree"] or ""))
+    if not worktree.is_dir():
+        raise AgentScopeError(
+            f"저장된 Agent worktree를 확인할 수 없습니다: {worktree}"
+        )
+
+    current = capture_git_snapshot(worktree)
+    manager_refs = frozenset(
+        refname
+        for refname in set(validated.refs) | set(current.refs)
+        if validated.refs.get(refname) != current.refs.get(refname)
+        and (
+            refname.startswith("refs/remotes/origin/")
+            or refname.startswith("refs/tags/")
+        )
+    )
+    try:
+        validate_agent_scope(
+            "reviewer",
+            worktree,
+            validated,
+            current,
+            allowed_ref_changes=manager_refs,
+        )
+    except AgentScopeError as error:
+        raise AgentScopeError(
+            f"Manager Git 작업 후 Agent scope 갱신 실패: {error}"
+        ) from error
+    refreshed = GitSnapshot(
+        head=stored.head,
+        branch=stored.branch,
+        index=stored.index,
+        dirty=stored.dirty,
+        refs=current.refs,
+        worktrees=stored.worktrees,
+        config=stored.config,
+    )
+    update_project(connection, repo, agent_snapshot=refreshed.serialize())
+    return refreshed
 
 
 def validate_blocked_agent_scope(
@@ -3550,15 +3666,17 @@ def run_project(
         "SELECT * FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
+    validated_agent_scope: GitSnapshot | None = None
     if row and row["agent_snapshot"]:
+        planner_correction = bool(
+            row["phase"] == "PLANNING" and row["planning_validation_error"]
+        )
         try:
-            validate_persisted_agent_scope(
+            validated_agent_scope = validate_persisted_agent_scope(
                 connection,
                 repo_path,
                 repo,
-                allow_planner_worktree_correction=bool(
-                    row["phase"] == "PLANNING" and row["planning_validation_error"]
-                ),
+                allow_planner_worktree_correction=planner_correction,
             )
         except AgentScopeError as error:
             detail = str(error)
@@ -3566,53 +3684,20 @@ def run_project(
             detail = "저장된 Agent Git 상태를 안전하게 읽을 수 없습니다."
         else:
             detail = None
+            if (
+                planner_correction
+                or row["phase"] == "BLOCKED"
+                or row["agent_result_snapshot"]
+            ):
+                validated_agent_scope = None
         if detail is not None:
-            message = f"Agent 범위 선검증 실패:\n{detail}"
-            plan = active_execplan(connection, repo)
-            if plan is None:
-                if row["phase"] == "PLANNING":
-                    update_project(
-                        connection,
-                        repo,
-                        planning_validation_error=detail,
-                        last_error=message,
-                        agent_result_snapshot=str(row["agent_snapshot"]),
-                    )
-                else:
-                    update_project(
-                        connection,
-                        repo,
-                        phase="BLOCKED",
-                        last_error=message,
-                        agent_result_snapshot=str(row["agent_snapshot"]),
-                    )
-            else:
-                saved_worktree = Path(str(row["worktree"] or ""))
-                preserved_snapshot = str(row["agent_snapshot"])
-                if saved_worktree.is_dir():
-                    block_active_execplan(
-                        connection,
-                        repo,
-                        saved_worktree,
-                        message,
-                        str(row["verify_result"] or ""),
-                        preserved_agent_result_snapshot=preserved_snapshot,
-                    )
-                else:
-                    revision = str(
-                        plan["plan_sha"]
-                        or row["active_sha"]
-                        or f"refs/remotes/origin/{row['base_branch']}"
-                    )
-                    block_active_execplan_from_revision(
-                        connection,
-                        repo_path,
-                        repo,
-                        revision,
-                        message,
-                        str(row["verify_result"] or ""),
-                        preserved_agent_result_snapshot=preserved_snapshot,
-                    )
+            message = block_persisted_agent_scope_violation(
+                connection,
+                repo_path,
+                repo,
+                row,
+                detail,
+            )
             operation_print(message, file=sys.stderr)
             return 1
     repo_path = validate_repository(
@@ -3757,6 +3842,27 @@ def run_project(
             return 1
 
     base = remote_base(repo_path, requested_base or (row["base_branch"] if row else None))
+    if validated_agent_scope is not None:
+        try:
+            validated_agent_scope = refresh_persisted_agent_scope_after_manager_git(
+                connection,
+                repo,
+                validated_agent_scope,
+            )
+        except (AgentScopeError, RuntimeError) as error:
+            row = connection.execute(
+                "SELECT * FROM projects WHERE repo = ?", (repo,)
+            ).fetchone()
+            detail = str(error)
+            message = block_persisted_agent_scope_violation(
+                connection,
+                repo_path,
+                repo,
+                row,
+                detail,
+            )
+            operation_print(message, file=sys.stderr)
+            return 1
     base_sha = git(repo_path, "rev-parse", f"origin/{base}").stdout.strip()
     current_fingerprint = planning_input_fingerprint(repo_path, base)
 
