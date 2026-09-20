@@ -47,10 +47,10 @@ PR 생성, 사용자 조치가 필요한 차단과 프로젝트 작업 주기 �
 
 ## Progress
 
-- [ ] notification outbox와 완료 주기 schema 구현
-- [ ] 상태 전이별 event 생성과 고유 key 구현
-- [ ] Telegram dispatcher와 실패 재시도 구현
-- [ ] payload·중복·보안·완료 주기 테스트 추가
+- [x] notification outbox와 완료 주기 schema 구현
+- [x] 상태 전이별 event 생성과 고유 key 구현
+- [x] Telegram dispatcher와 실패 재시도 구현
+- [x] payload·중복·보안·완료 주기 테스트 추가
 
 ## Decision Log
 

@@ -5228,7 +5228,12 @@ class AgentScopeValidatorTest(unittest.TestCase):
     def test_planner_imports_do_not_leave_bytecode_or_hide_scope_violations(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, _plan_path = self._repository_with_plan(directory)
-            for module_name in ("loop_manager.py", "managed_config.py", "project_registry.py"):
+            for module_name in (
+                "loop_manager.py",
+                "managed_config.py",
+                "notifications.py",
+                "project_registry.py",
+            ):
                 shutil.copy(loop_manager.ROOT / module_name, repo / module_name)
             (repo / ".gitignore").write_text("__pycache__/\n", encoding="utf-8")
             commit_and_push(repo, "Add planner import fixtures")
