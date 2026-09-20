@@ -307,7 +307,7 @@ def dispatch_pending(
     ensure_schema(connection)
     rows = connection.execute(
         "SELECT event_key, event_type, payload FROM notification_outbox "
-        "WHERE sent_at IS NULL AND delivery_started_at IS NULL "
+        "WHERE sent_at IS NULL "
         "ORDER BY created_at, event_key"
     ).fetchall()
     sent = 0
@@ -317,8 +317,7 @@ def dispatch_pending(
                 "UPDATE notification_outbox "
                 "SET attempts = attempts + 1, last_error = NULL, "
                 "delivery_started_at = CURRENT_TIMESTAMP "
-                "WHERE event_key = ? AND sent_at IS NULL "
-                "AND delivery_started_at IS NULL",
+                "WHERE event_key = ? AND sent_at IS NULL",
                 (row[0],),
             ).rowcount
         if claimed != 1:

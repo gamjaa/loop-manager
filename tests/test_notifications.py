@@ -217,7 +217,7 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
         self.assertNotIn(token, delivered.call_args.args[2])
         self.assertNotIn(chat_id, delivered.call_args.args[2])
 
-    def test_interruption_after_delivery_claim_is_not_sent_again(self):
+    def test_ambiguous_interruption_stays_pending_and_retries_after_restart(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "state.db"
             connection = self.connection(database=database)
@@ -259,9 +259,12 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
                     "chat",
                     adapter=restarted_adapter,
                 ),
-                0,
+                1,
             )
-            restarted_adapter.assert_not_called()
+            restarted_adapter.assert_called_once()
+            retried = self.events(restarted)[0]
+            self.assertEqual(retried["attempts"], 2)
+            self.assertIsNotNone(retried["sent_at"])
             restarted.close()
         self.assertEqual(len(delivered), 1)
 
