@@ -1,5 +1,4 @@
 import json
-import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -104,7 +103,8 @@ class RequirementArchivingTest(unittest.TestCase):
 
     def worker_tree(self) -> Path:
         worker = Path(self.temporary.name) / "worker"
-        shutil.copytree(self.repo / "docs", worker / "docs")
+        git(self.repo, "worktree", "add", "--detach", str(worker), "HEAD")
+        (worker / "docs/requirements/archive").mkdir(parents=True, exist_ok=True)
         return worker
 
     def candidates(self, revision: str, current: str) -> tuple[str, ...]:
@@ -324,6 +324,93 @@ class RequirementArchivingTest(unittest.TestCase):
                 revision,
                 worker,
             )
+
+    def test_move_set_rejects_ignored_untracked_archive(self):
+        source = self.requirement("Ignored", "# Ignored\n")
+        self.plan("G-001", "Current", (source,), "IMPLEMENTING")
+        archived = loop_manager.requirement_archive_path(source)
+        (self.repo / ".gitignore").write_text(
+            f"/{archived}\n",
+            encoding="utf-8",
+        )
+        revision = self.commit()
+        worker = self.worker_tree()
+        (worker / source).rename(worker / archived)
+
+        with self.assertRaisesRegex(
+            loop_manager.RequirementArchiveError,
+            "Git ignore",
+        ):
+            loop_manager.requirement_archive_move_set(
+                self.repo,
+                revision,
+                worker,
+            )
+
+    def test_move_set_rejects_symlink_archive(self):
+        contents = "# Symlink\nOriginal content\n"
+        source = self.requirement("Symlink", contents)
+        self.plan("G-001", "Current", (source,), "IMPLEMENTING")
+        (self.repo / "docs/archive-target.md").write_text(
+            contents,
+            encoding="utf-8",
+        )
+        revision = self.commit()
+        worker = self.worker_tree()
+        archived = worker / loop_manager.requirement_archive_path(source)
+        (worker / source).unlink()
+        archived.symlink_to("../../archive-target.md")
+        self.assertTrue(archived.is_file())
+        self.assertEqual(archived.read_text(encoding="utf-8"), contents)
+
+        with self.assertRaisesRegex(
+            loop_manager.RequirementArchiveError,
+            "일반 파일이 아닙니다",
+        ):
+            loop_manager.requirement_archive_move_set(
+                self.repo,
+                revision,
+                worker,
+            )
+
+    def test_published_move_set_requires_tracked_regular_blob(self):
+        source = self.requirement("Tracked", "# Tracked\n")
+        self.plan("G-001", "Current", (source,), "IMPLEMENTING")
+        revision = self.commit()
+        worker = self.worker_tree()
+        archived = worker / loop_manager.requirement_archive_path(source)
+        (worker / source).rename(archived)
+
+        self.assertEqual(
+            loop_manager.requirement_archive_move_set(
+                self.repo,
+                revision,
+                worker,
+            ),
+            (source,),
+        )
+        with self.assertRaisesRegex(
+            loop_manager.RequirementArchiveError,
+            "일반 blob으로 추적되지 않았습니다",
+        ):
+            loop_manager.requirement_archive_move_set(
+                self.repo,
+                revision,
+                worker,
+                tracked_revision="HEAD",
+            )
+
+        git(worker, "add", "-A")
+        git(worker, "commit", "-m", "Archive requirement")
+        self.assertEqual(
+            loop_manager.requirement_archive_move_set(
+                self.repo,
+                revision,
+                worker,
+                tracked_revision="HEAD",
+            ),
+            (source,),
+        )
 
     def test_archived_source_fallback_does_not_allow_new_plan_sources(self):
         root = Path(self.temporary.name) / "catalog"

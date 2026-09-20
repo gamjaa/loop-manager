@@ -7105,10 +7105,54 @@ def requirement_archive_touched_sources(
     return tuple(touched)
 
 
+def _requirement_archive_blob(
+    repo: Path,
+    revision: str,
+    archived: str,
+) -> bytes:
+    try:
+        output = git_bytes(
+            repo,
+            "ls-tree",
+            "-z",
+            revision,
+            "--",
+            archived,
+        )
+    except RuntimeError as error:
+        raise RequirementArchiveError(
+            f"Requirement archive의 Git tree 상태를 확인할 수 없습니다: "
+            f"{archived} ({error})"
+        ) from error
+    records = [record for record in output.split(b"\0") if record]
+    expected_path = archived.encode("utf-8")
+    if len(records) == 1:
+        metadata, separator, actual_path = records[0].partition(b"\t")
+        parts = metadata.split()
+    else:
+        separator = b""
+        actual_path = b""
+        parts = []
+    if (
+        not separator
+        or actual_path != expected_path
+        or len(parts) != 3
+        or parts[0] not in {b"100644", b"100755"}
+        or parts[1] != b"blob"
+    ):
+        raise RequirementArchiveError(
+            f"Requirement archive가 {revision}에 일반 blob으로 추적되지 않았습니다: "
+            f"{archived}"
+        )
+    return parts[2]
+
+
 def requirement_archive_move_set(
     repo_path: Path,
     revision: str,
     worktree: Path,
+    *,
+    tracked_revision: str | None = None,
 ) -> tuple[str, ...]:
     """Return content-preserving Requirement moves relative to one base revision."""
 
@@ -7132,9 +7176,15 @@ def requirement_archive_move_set(
             raise RequirementArchiveError(
                 f"활성 Requirement와 기존 archive의 관계를 확정할 수 없습니다: {source}"
             )
-        if not archived_path.is_file():
+        try:
+            archived_mode = archived_path.lstat().st_mode
+        except FileNotFoundError as error:
             raise RequirementArchiveError(
                 f"Requirement 원본과 archive 대상이 모두 없습니다: {source}"
+            ) from error
+        if not stat.S_ISREG(archived_mode):
+            raise RequirementArchiveError(
+                f"Requirement archive 대상이 일반 파일이 아닙니다: {archived}"
             )
         if object_type != b"blob":
             raise RequirementArchiveError(
@@ -7150,9 +7200,43 @@ def requirement_archive_move_set(
             raise RequirementArchiveError(
                 f"Requirement archive 이동 중 내용이 변경됐습니다: {source}"
             )
+        if tracked_revision is None:
+            ignored = git(
+                worktree,
+                "check-ignore",
+                "--quiet",
+                "--",
+                archived,
+                check=False,
+            )
+            if ignored.returncode == 0:
+                raise RequirementArchiveError(
+                    f"Requirement archive 대상이 Git ignore 규칙으로 제외됩니다: "
+                    f"{archived}"
+                )
+            if ignored.returncode != 1:
+                raise RequirementArchiveError(
+                    f"Requirement archive 대상의 Git 추적 가능 여부를 확인할 수 "
+                    f"없습니다: {archived} ({ignored.stdout[-2000:]})"
+                )
+        else:
+            archived_object_id = _requirement_archive_blob(
+                worktree,
+                tracked_revision,
+                archived,
+            )
+            tracked_contents = git_bytes(
+                worktree,
+                "cat-file",
+                "blob",
+                archived_object_id.decode("ascii"),
+            )
+            if tracked_contents != original:
+                raise RequirementArchiveError(
+                    f"Requirement archive의 게시 내용이 원본과 다릅니다: {source}"
+                )
         moved.append(source)
     return tuple(moved)
-
 
 def requirement_archive_reconciliation_error(
     expected: tuple[str, ...],
@@ -8888,6 +8972,7 @@ def _run_project_step(
                     repo_path,
                     latest_sha,
                     worktree,
+                    tracked_revision="HEAD",
                 )
             except RequirementArchiveError as error:
                 archive_error = f"게시 직전 Requirement archive 확인 실패: {error}"
