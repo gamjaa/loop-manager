@@ -57,3 +57,4 @@ Requirement의 마지막 관련 구현 PR에 완료된 문서의 archive 이동�
 - Requirement 경로는 안정적 식별자로 유지하고 기존 ExecPlan frontmatter를 다시 쓰지 않는다.
 - 게시 직전 base 동기화가 보장된 뒤 archive 조건을 확정해야 하므로 G-014에 의존한다.
 - 2026-09-20 사용자 결정: 기존 런타임이 Requirement 변경을 모두 Worker 범위 위반으로 차단하므로, G-011은 기능만 병합하고 실제 R-003/R-005 이동은 새 런타임에서 실행되는 의존 후속 ExecPlan으로 분리한다.
+- 2026-09-20 운영 복구: Worker 실행 중 별도 launcher의 `git pull --ff-only`가 사용자 기본 worktree와 `refs/heads/main`을 변경해 G-011이 범위 위반으로 차단됐다. 관리 worktree의 구현 변경은 보존했으며, `ec1be4e`에서 launcher의 Git 갱신을 제거한 뒤 이 기록 변경을 정상 BLOCKED 재평가 신호로 사용한다.

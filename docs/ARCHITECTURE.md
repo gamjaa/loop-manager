@@ -13,6 +13,9 @@ Loop Manager는 Windows와 Linux에서 동작하는 Python 3 프로그램이다.
 - Python 3 venv를 만들 수 있어야 한다
 - Windows와 Linux용 실행 진입점을 제공한다
 - 같은 사용자 상태 디렉터리를 사용하는 중복 실행은 `<state-dir>/loop-manager.lock`으로 차단한다
+- `run.sh`와 `run.ps1`은 Git을 실행하지 않고 source checkout의 Python 부트스트랩만 시작한다
+- 부트스트랩은 다른 Git 작업 전에 process lock을 획득하고, Loop Manager 저장소의 `origin/main`을 fetch해 exact SHA의 detached runtime worktree를 선택한 뒤 같은 lock을 유지한 채 runtime 자식을 실행한다
+- runtime worktree는 source checkout의 object database를 공유하며 사용자 `main`의 파일, index, HEAD와 로컬 전용 commit을 사용하지 않는다. push된 새 SHA는 다음 실행에서만 선택한다
 - `config/config.ini`가 없거나 유효하지 않으면 설정 방법을 안내하고 작업을 시작하지 않는다
 - 최초 설정은 사용자가 설정 모드를 명시적으로 실행해 SQLite를 생성한다
 - 일반 Loop 모드에서 SQLite가 없거나 손상됐으면 자동으로 초기화하지 않고 복원 또는 명시적 재설정을 안내한 뒤 중단한다
@@ -36,7 +39,7 @@ Python 표준 라이브러리 `configparser`로 `config/config.ini`를 읽는다
 - Windows: `%LOCALAPPDATA%\loop-manager\`
 - Linux: `${XDG_STATE_HOME:-~/.local/state}/loop-manager/`
 
-SQLite, 관리 worktree, 로그, 임시 파일과 프로세스 lock은 모두 이 경로 아래에 둔다.
+SQLite, manager runtime worktree, 프로젝트 관리 worktree, 로그, 임시 파일과 프로세스 lock은 모두 이 경로 아래에 둔다.
 
 SQLite 손실이나 손상에서의 자동 상태 재구성은 지원하지 않는다. 사용자는 상태 디렉터리를 백업하고, 문제 발생 시 백업을 복원하거나 명시적 재설정 후 프로젝트를 다시 등록한다.
 
@@ -115,12 +118,23 @@ Planner가 추가 ExecPlan이 필요 없다고 판단하면 현재 지문을 저
 
 Loop Manager는 등록 프로젝트 기본 worktree의 파일, index와 HEAD를 수정하지 않는다. 자동 작업의 기준은 `git fetch`로 갱신한 `origin/<base-branch>`다. `git fetch`와 `git worktree add/remove`가 공유 Git metadata를 변경하는 것은 허용하지만 기본 worktree에서 checkout, pull, reset, stash, clean, commit 또는 파일 생성을 수행하지 않는다.
 
+Loop Manager 프로그램 자체의 실행 revision은 다음 순서로 고정한다.
+
+1. source checkout의 좁은 Python 부트스트랩이 `<state-dir>/loop-manager.lock`을 획득한다
+2. lock을 보유한 부모만 source checkout을 anchor로 `git fetch origin`을 실행한다
+3. fetch된 `origin/main`을 immutable commit SHA로 resolve한다
+4. `<state-dir>/runtimes/<repository-id>/<sha>/`의 linked worktree가 같은 repository, clean detached HEAD와 exact SHA인지 검증하고, 없을 때만 `git worktree add --detach`로 만든다
+5. 부모가 현재 Python interpreter로 runtime worktree의 `loop_manager.py`를 자식 실행하고 종료 코드를 전달한다
+6. 부모는 자식 종료 뒤 lock을 해제한다. 실행 중인 runtime worktree를 이동하거나 사용자 `main`을 갱신하지 않는다
+
+runtime 경로가 존재하지만 소유권, repository, detached HEAD, SHA 또는 clean 상태를 증명할 수 없으면 reset, clean, 제거 또는 덮어쓰기 없이 중단한다. 별도 clone은 만들지 않으며 SHA별 runtime 정리는 활성 실행과 분리된 검증된 관리 작업으로만 수행한다.
+
 기본 worktree의 상태는 다음과 같이 처리한다.
 
-- dirty이거나 원격보다 앞서 있거나 diverge됐으면 로컬 작업을 보존하기 위해 해당 프로젝트의 변경 작업을 건너뛴다
-- clean 상태에서 원격보다 뒤처진 것은 허용하며 자동 작업을 막지 않는다
+- dirty, staged, untracked이거나 원격보다 ahead, behind, diverged된 상태와 checkout branch는 자동 작업을 막지 않는다
 - 로컬에만 있는 문서와 commit은 자동 작업 입력으로 사용하지 않으며 사용자가 commit하고 push해야 반영한다
 - GitHub PR 상태 동기화와 알림 같은 읽기 전용 처리는 기본 worktree 상태와 관계없이 수행한다
+- Worker 실행 중 사용자가 기본 worktree의 파일, index, HEAD와 로컬 base ref를 변경해도 관리 worktree와 Loop Manager 소유 branch가 그대로면 Agent 범위 위반으로 귀속하지 않는다
 
 ExecPlan 하나의 실행 흐름은 다음과 같다.
 
@@ -183,6 +197,7 @@ ExecPlan 파일은 구현 PR에 처음 포함하지 않는다. Planner 단계에
 - Worker와 Reviewer는 ExecPlan이 PR 생성 준비를 마칠 때까지 각자의 세션을 재사용한다
 - 세션을 재개할 수 없으면 같은 worktree, ExecPlan과 저장된 실패 내용을 전달해 새 세션을 시작한다
 - 상태 분류, 설정 검증, Git/GitHub 명령과 verify 실행은 프로그램 코드가 담당한다
+- Worker는 commit, fetch, pull, rebase, push, worktree 등록과 PR 생성을 수행하지 않는다. Worker 반환 뒤의 모든 Git 쓰기는 Agent 호출 밖의 프로그램 코드가 소유한다
 - AI Agent와 verify subprocess에는 역할 수행에 필요한 환경 변수만 전달하고 Telegram token을 포함한 Loop Manager 비밀값을 상속하지 않는다
 
 ### AGENTS.md 변경 제안과 승인
