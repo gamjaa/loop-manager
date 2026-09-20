@@ -5685,7 +5685,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     )
 
                 project = connection.execute(
-                    "SELECT phase, last_error FROM projects WHERE repo = ?",
+                    "SELECT phase, last_error, agent_result_snapshot "
+                    "FROM projects WHERE repo = ?",
                     (str(repo),),
                 ).fetchone()
                 self.assertEqual(result, 1)
@@ -5693,6 +5694,10 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 self.assertIn("범위 선검증 실패", project["last_error"])
                 self.assertIn(expected_key, project["last_error"])
                 self.assertNotIn(sensitive_value, project["last_error"])
+                self.assertEqual(
+                    project["agent_result_snapshot"],
+                    blocked_result.serialize(),
+                )
                 migration.assert_not_called()
                 unsafe_git.assert_not_called()
                 agent.assert_not_called()
