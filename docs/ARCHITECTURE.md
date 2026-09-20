@@ -120,7 +120,7 @@ Planner가 추가 ExecPlan이 필요 없다고 판단하면 현재 지문을 저
 
 ## Git과 worktree 실행 모델
 
-Loop Manager는 등록 프로젝트 기본 worktree의 파일, index와 HEAD를 수정하지 않는다. 자동 작업의 기준은 `git fetch`로 갱신한 `origin/<base-branch>`다. `git fetch`와 `git worktree add/remove`가 공유 Git metadata를 변경하는 것은 허용하지만 기본 worktree에서 checkout, pull, reset, stash, clean, commit 또는 파일 생성을 수행하지 않는다.
+Loop Manager 자동 작업의 기준은 `git fetch`로 갱신한 `origin/<base-branch>`이며 등록 프로젝트 기본 worktree의 내용은 입력으로 사용하지 않는다. fetch 직후 기본 worktree에 tracked·staged·non-ignored untracked 변경이 없고 저장된 base branch를 checkout했으며 로컬 base가 원격 base와 같거나 그 조상인 경우에만, 이미 fetch한 ref에 대해 `git merge --ff-only origin/<base-branch>`와 동등한 update를 수행한다. 이는 중복 fetch 없이 `git pull --ff-only`와 같은 최종 checkout을 만든다. ignored 파일은 원격 변경 경로와 겹치지 않을 때만 보존한 채 허용한다. 그 밖에는 기본 worktree에서 checkout, pull, rebase, reset, stash, clean, commit 또는 파일 생성을 수행하지 않는다.
 
 Loop Manager 프로그램 자체의 실행 revision은 다음 순서로 고정한다.
 
@@ -129,13 +129,17 @@ Loop Manager 프로그램 자체의 실행 revision은 다음 순서로 고정�
 3. fetch된 `origin/main`을 immutable commit SHA로 resolve한다
 4. `<state-dir>/runtimes/<repository-id>/<sha>/`의 linked worktree가 같은 repository, clean detached HEAD와 exact SHA인지 검증하고, 없을 때만 `git worktree add --detach`로 만든다
 5. 부모가 source checkout 기준의 절대 config 경로와 내부 runtime 표식을 전달하고, 현재 Python interpreter로 runtime worktree의 `loop_manager.py`를 자식 실행해 종료 코드를 전달한다
-6. 부모는 자식 종료 뒤 lock을 해제한다. 실행 중인 runtime worktree를 이동하거나 사용자 `main`을 갱신하지 않는다
+6. 부모는 자식 종료 뒤 lock을 해제한다. bootstrap은 실행 중인 runtime worktree를 이동하거나 사용자 `main`을 갱신하지 않는다. 다만 runtime 자식이 Loop Manager 저장소 자체를 등록 프로젝트로 처리하면 아래의 일반 safe fast-forward 조건을 적용할 수 있다
 
 runtime 경로가 존재하지만 소유권, repository, detached HEAD, SHA 또는 clean 상태를 증명할 수 없으면 reset, clean, 제거 또는 덮어쓰기 없이 중단한다. 별도 clone은 만들지 않으며 SHA별 runtime 정리는 활성 실행과 분리된 검증된 관리 작업으로만 수행한다.
 
 기본 worktree의 상태는 다음과 같이 처리한다.
 
-- dirty, staged, untracked이거나 원격보다 ahead, behind, diverged된 상태와 checkout branch는 자동 작업을 막지 않는다
+- tracked·staged·non-ignored untracked 변경이 없는 저장 base branch가 원격과 같으면 동기화는 no-op이며, behind-only이면 HEAD, index와 tracked 파일을 원격 base로 fast-forward한다
+- tracked 수정, staged, non-ignored untracked, 다른 branch, detached HEAD, ahead, diverged 또는 진행 중인 Git operation이면 동기화를 건너뛰고 기존 checkout을 보존한다
+- ignored 파일은 원격이 변경할 tracked 경로와 같거나 부모·자식으로 겹칠 때만 동기화를 건너뛰며 그 밖에는 그대로 유지한다
+- eligibility 확인 뒤 동시 사용자 변경, Git lock 또는 fast-forward 실패가 발생하면 reset·clean·stash·강제 checkout이나 잠금 제거 없이 skip 이유를 기록한다
+- 동기화 수행·skip·failure와 관계없이 자동 작업은 fetch된 원격 SHA를 사용해 계속하며 기본 worktree 상태를 실행 게이트나 입력으로 사용하지 않는다
 - 로컬에만 있는 문서와 commit은 자동 작업 입력으로 사용하지 않으며 사용자가 commit하고 push해야 반영한다
 - GitHub PR 상태 동기화와 알림 같은 읽기 전용 처리는 기본 worktree 상태와 관계없이 수행한다
 - Worker 실행 중 사용자가 기본 worktree의 파일, index, HEAD와 로컬 base ref를 변경해도 관리 worktree와 Loop Manager 소유 branch가 그대로면 Agent 범위 위반으로 귀속하지 않는다
@@ -168,7 +172,7 @@ ExecPlan 하나의 실행 흐름은 다음과 같다.
 
 ExecPlan 파일은 구현 PR에 처음 포함하지 않는다. Planner 단계에서 먼저 base branch에 게시되며, 각 구현 branch는 해당 ExecPlan이 포함된 원격 기준에서 시작한다.
 
-사용자가 BLOCKED의 근거 PRODUCT/Requirement를 기본 branch에서 수정한 경우 변경을 commit하고 push해야 한다. Loop Manager는 변경된 `origin/<base-branch>`를 관리 branch에 rebase한 뒤 재개한다. 이 과정에서도 기본 worktree의 파일, index와 HEAD는 바꾸지 않는다. 사용자는 안내된 관리 worktree의 ExecPlan을 직접 수정할 수도 있다.
+사용자가 BLOCKED의 근거 PRODUCT/Requirement를 기본 branch에서 수정한 경우 변경을 commit하고 push해야 한다. Loop Manager는 변경된 `origin/<base-branch>`를 관리 branch에 rebase한 뒤 재개한다. rebase는 관리 worktree에서만 수행하며, 등록 프로젝트 동기화가 별도로 safe fast-forward 조건을 만족하지 않는 한 기본 worktree의 파일, index와 HEAD는 바꾸지 않는다. 사용자는 안내된 관리 worktree의 ExecPlan을 직접 수정할 수도 있다.
 
 ## 동시 실행
 
@@ -309,15 +313,15 @@ Telegram token과 chat ID가 모두 설정된 경우에만 알림 이벤트와 �
 
 ## Repository Safety and Security
 
-- 등록 프로젝트의 기본 worktree가 dirty하거나 원격보다 앞서 있거나 diverge됐으면 자동 변경을 시작하지 않는다. 원격보다 뒤처진 상태는 허용한다
+- 등록 프로젝트 기본 worktree의 로컬 변경, ahead·diverged 이력과 checkout branch는 원격 SHA 기반 자동 작업을 막지 않는다. safe fast-forward 조건을 만족하지 않으면 기본 worktree 동기화만 건너뛴다
 - 사용자 파일 삭제, reset, 일반적인 강제 push와 자동 Merge를 수행하지 않는다
 - 계획 commit의 base branch 직접 push는 fast-forward만 허용한다. branch protection 등으로 거부되면 우회하지 않고 계획 오류로 보존한다
-- 기본 worktree에서는 파일 쓰기, checkout, pull, reset, stash, clean과 commit을 수행하지 않는다
+- 기본 worktree에서는 검증된 `git merge --ff-only origin/<base-branch>` 외의 파일 쓰기, checkout, pull, rebase, reset, stash, clean과 commit을 수행하지 않는다
 - 관리 worktree, SQLite, 임시 파일, 로그와 lock은 source checkout 밖의 `<state-dir>`에만 만든다
 - 모든 계획과 구현 변경은 Loop Manager가 만든 관리 worktree 안에서만 수행한다
 - AI Agent가 접근하고 수정할 수 있는 경로를 해당 관리 worktree로 제한한다
 - Worker가 제안한 `AGENTS.md` 변경은 승인 전 실제 파일에 적용하지 않으며, 승인 후에도 사용자 결정에 결합된 대상과 patch만 허용한다
-- `git fetch`와 `git worktree add/remove`는 공유 Git metadata만 변경하며 기본 worktree의 파일, index와 HEAD는 변경하지 않아야 한다
+- `git fetch`와 `git worktree add/remove`는 공유 Git metadata만 변경한다. 기본 worktree의 파일, index와 HEAD 변경은 검증된 safe fast-forward synchronizer만 수행한다
 - 관리 worktree는 미커밋 변경과 PR head에 없는 로컬 commit이 없다고 확인된 때만 강제 옵션 없이 제거한다. base branch ancestry나 GitHub Merge 방식은 push 여부 판정에 사용하지 않는다
 - PR head 정보나 commit 관계를 확인할 수 없으면 worktree를 보존하고 `cleanup_pending`으로 기록한다
 - `cleanup_pending` worktree가 이후 clean해지거나 경로가 사라지면 기록을 지우고 강제 옵션 없이 정리한다
