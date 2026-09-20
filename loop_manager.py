@@ -4199,6 +4199,8 @@ def validate_agent_scope(
     allowed_requirement_archives: tuple[str, ...] = (),
     allowed_ref_changes: frozenset[str] = frozenset(),
     allowed_worktree_changes: frozenset[str] = frozenset(),
+    external_worktree: Path | None = None,
+    base_branch: str | None = None,
 ) -> None:
     """Validate the net Git mutation made by one Agent role."""
 
@@ -4215,18 +4217,45 @@ def validate_agent_scope(
     if not before.shared_metadata_complete or not after.shared_metadata_complete:
         violations.append("공유 Git metadata 기준 snapshot 누락")
     else:
+        # Codex owns these ephemeral refs and may create or prune them while an
+        # Agent is running. Filter both sides during comparison so snapshots
+        # persisted by older versions remain compatible with this boundary.
+        compared_before_refs = {
+            key: value
+            for key, value in before.refs.items()
+            if not key.startswith("refs/codex/turn-diffs/")
+        }
+        compared_after_refs = {
+            key: value
+            for key, value in after.refs.items()
+            if not key.startswith("refs/codex/turn-diffs/")
+        }
+        external_ref_changes = frozenset()
+        external_worktree_changes = frozenset()
+        if external_worktree is not None:
+            external_worktree_changes = frozenset(
+                (str(_canonical_path(external_worktree)),)
+            )
+            if base_branch:
+                external_ref_changes = frozenset(
+                    (
+                        f"refs/heads/{base_branch}",
+                        f"refs/remotes/origin/{base_branch}",
+                        "refs/remotes/origin/HEAD",
+                    )
+                )
         metadata_states = (
             (
                 "공유 Git refs",
-                before.refs,
-                after.refs,
-                allowed_ref_changes,
+                compared_before_refs,
+                compared_after_refs,
+                allowed_ref_changes | external_ref_changes,
             ),
             (
                 "Git worktree 등록·HEAD·index·파일 상태",
                 before.worktrees,
                 after.worktrees,
-                allowed_worktree_changes,
+                allowed_worktree_changes | external_worktree_changes,
             ),
             (
                 "Git config",
@@ -5131,6 +5160,7 @@ def validate_worker_workspace_scope(
     repo_path: Path,
     worktree: Path,
     branch: str,
+    base_branch: str,
     selected_plan_path: str,
     catalog_plan: sqlite3.Row,
     before: GitSnapshot,
@@ -5148,6 +5178,8 @@ def validate_worker_workspace_scope(
         after,
         selected_plan_path=selected_plan_path,
         allowed_requirement_archives=allowed_requirement_archives,
+        external_worktree=repo_path,
+        base_branch=base_branch,
     )
     plan = validate_active_execplan_metadata(
         repo_path,
@@ -5816,6 +5848,8 @@ def validate_persisted_agent_scope(
             current,
             allowed_ref_changes=allowed_ref_changes,
             allowed_worktree_changes=allowed_worktree_changes,
+            external_worktree=repo_path,
+            base_branch=str(project["base_branch"]),
         )
         return current
 
@@ -5837,6 +5871,8 @@ def validate_persisted_agent_scope(
                 selected_plan_path=(
                     selected_plan_path if role_name == "worker" else None
                 ),
+                external_worktree=repo_path,
+                base_branch=str(project["base_branch"]),
             )
         checkpoint_scope_before = checkpoint.snapshot
         if project["phase"] == "BLOCKED" and selected_plan_path:
@@ -5871,6 +5907,8 @@ def validate_persisted_agent_scope(
                 current,
                 allowed_ref_changes=manager_refs,
                 allowed_worktree_changes=allowed_cleanup,
+                external_worktree=repo_path,
+                base_branch=str(project["base_branch"]),
             )
         except AgentScopeError as error:
             raise AgentScopeError(
@@ -5948,6 +5986,8 @@ def validate_persisted_agent_scope(
         ),
         allowed_ref_changes=allowed_ref_changes,
         allowed_worktree_changes=allowed_worktree_changes,
+        external_worktree=repo_path,
+        base_branch=str(project["base_branch"]),
     )
 
     return current
@@ -5962,7 +6002,7 @@ def refresh_persisted_agent_scope_after_manager_git(
     """Merge trusted Manager refs into an interrupted Agent's start snapshot."""
 
     project = connection.execute(
-        "SELECT worktree, agent_snapshot FROM projects WHERE repo = ?",
+        "SELECT base_branch, worktree, agent_snapshot FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
     if project is None or not project["agent_snapshot"]:
@@ -5992,6 +6032,8 @@ def refresh_persisted_agent_scope_after_manager_git(
             current,
             allowed_ref_changes=manager_refs,
             allowed_worktree_changes=manager_worktree_changes,
+            external_worktree=Path(repo),
+            base_branch=str(project["base_branch"]),
         )
     except AgentScopeError as error:
         raise AgentScopeError(
@@ -6135,6 +6177,8 @@ def validate_blocked_agent_scope(
         ),
         allowed_ref_changes=allowed_ref_changes,
         allowed_worktree_changes=allowed_worktree_changes,
+        external_worktree=repo_path,
+        base_branch=base,
     )
 
 
@@ -8723,6 +8767,8 @@ def _run_project_step(
                     planning_worktree,
                     planner_scope_before,
                     planner_scope_after,
+                    external_worktree=repo_path,
+                    base_branch=base,
                 )
                 validate_managed_worktree(repo_path, planning_worktree, None)
             except (AgentScopeError, WorkspaceOwnershipError, RuntimeError) as error:
@@ -8787,6 +8833,8 @@ def _run_project_step(
                         planning_worktree,
                         persisted_before,
                         persisted_after,
+                        external_worktree=repo_path,
+                        base_branch=base,
                     )
                     validate_managed_worktree(repo_path, planning_worktree, None)
                 except (
@@ -9170,6 +9218,7 @@ def _run_project_step(
                 repo_path,
                 worktree,
                 branch,
+                base,
                 str(row["plan_path"]),
                 catalog_plan,
                 worker_scope_before,
@@ -9393,6 +9442,7 @@ def _run_project_step(
                 repo_path,
                 worktree,
                 branch,
+                base,
                 str(row["plan_path"]),
                 catalog_plan,
                 verify_scope_before,
@@ -9501,6 +9551,7 @@ def _run_project_step(
                     repo_path,
                     worktree,
                     branch,
+                    base,
                     str(row["plan_path"]),
                     catalog_plan,
                     verify_scope_before,
@@ -9639,6 +9690,8 @@ def _run_project_step(
                 worktree,
                 reviewer_scope_before,
                 reviewer_scope_after,
+                external_worktree=repo_path,
+                base_branch=base,
             )
             validate_managed_worktree(repo_path, worktree, branch)
         except (AgentScopeError, WorkspaceOwnershipError, RuntimeError) as error:
