@@ -528,23 +528,19 @@ Test fallback.
         third = loop_manager._worktree_execplan_input_fingerprint(worker, row)
         self.assertNotEqual(second, third)
 
-    def test_g011_keeps_bootstrap_requirements_active(self):
-        active = (
+    def test_shared_specification_skill_describes_automatic_archive_contract(self):
+        skill = (
             loop_manager.ROOT
-            / "docs/requirements/[R-003] Targeted Worker Unit Tests.md",
-            loop_manager.ROOT
-            / "docs/requirements/[R-005] Automatic Requirement Archiving.md",
-        )
-        for path in active:
-            with self.subTest(path=path.name):
-                self.assertTrue(path.is_file())
-                self.assertFalse(
-                    (
-                        loop_manager.ROOT
-                        / "docs/requirements/archive"
-                        / path.name
-                    ).exists()
-                )
+            / ".agents/skills/specification-docs/SKILL.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("마지막 관련 ExecPlan의 구현 PR", skill)
+        self.assertIn("Loop Manager가 eligibility를 다시 확인", skill)
+        self.assertIn("내용 변경 없이 `docs/requirements/archive/`로 자동 이동", skill)
+        self.assertIn("archive PR이 Merge되기 전에는 활성 Requirement", skill)
+        self.assertIn("관련 비종료 ExecPlan이 남아 있거나 archive 충돌 또는 source 관계의 불확실성", skill)
+        self.assertIn("eligibility를 우회해 Requirement를 이동하지 않는다", skill)
+        self.assertNotIn("archive 이동은 사용자가 수행", skill)
 
 
 if __name__ == "__main__":

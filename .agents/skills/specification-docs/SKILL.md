@@ -53,7 +53,9 @@ description: Create, review, and refine PRODUCT.md, ARCHITECTURE.md, requirement
 
 ## Requirement Lifecycle
 
-Requirement는 frontmatter나 별도 상태 없이 제품에 원하는 변화와 Acceptance Criteria를 기록하는 순수 문서다. `docs/requirements/` 바로 아래의 모든 Requirement가 Planner 입력이 되므로, 사용자 결정이 필요한 항목을 해소하고 Ready Check를 통과한 뒤 해당 위치에 저장한다. 파일 경로를 안정적인 식별자로 사용하며 완료 후 archive 이동은 사용자가 수행한다.
+Requirement는 frontmatter나 별도 상태 없이 제품에 원하는 변화와 Acceptance Criteria를 기록하는 순수 문서다. `docs/requirements/` 바로 아래의 모든 Requirement가 Planner 입력이 되므로, 사용자 결정이 필요한 항목을 해소하고 Ready Check를 통과한 뒤 해당 위치에 저장한다. 파일 경로는 안정적인 식별자로 유지한다.
+
+완료된 Requirement는 사용자가 직접 archive하지 않는다. 마지막 관련 ExecPlan의 구현 PR에서 Loop Manager가 eligibility를 다시 확인한 뒤 내용 변경 없이 `docs/requirements/archive/`로 자동 이동한다. archive PR이 Merge되기 전에는 활성 Requirement로서 Planner 입력에 남는다. 관련 비종료 ExecPlan이 남아 있거나 archive 충돌 또는 source 관계의 불확실성이 있으면 자동 이동하지 않고 활성 위치에 보존한다. 대화형 문서 작성 과정에서도 이 eligibility를 우회해 Requirement를 이동하지 않는다.
 
 ## Ready Check
 
