@@ -5357,6 +5357,31 @@ class AgentScopeValidatorTest(unittest.TestCase):
                         selected_plan_path=plan_path,
                     )
 
+    def test_codex_turn_diff_refs_are_ignored_for_persisted_snapshots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, plan_path = self._repository_with_plan(directory)
+            head = git_command(repo, "rev-parse", "HEAD")
+            old_ref = "refs/codex/turn-diffs/captures/old/session/base"
+            new_ref = "refs/codex/turn-diffs/captures/new/session/base"
+            git_command(repo, "update-ref", old_ref, head)
+            before = loop_manager.capture_git_snapshot(repo)
+
+            git_command(repo, "update-ref", "-d", old_ref)
+            git_command(repo, "update-ref", new_ref, head)
+            after = loop_manager.capture_git_snapshot(repo)
+
+            self.assertIn(old_ref, before.refs)
+            self.assertNotIn(old_ref, after.refs)
+            self.assertNotIn(new_ref, before.refs)
+            self.assertIn(new_ref, after.refs)
+            loop_manager.validate_agent_scope(
+                "worker",
+                repo,
+                before,
+                after,
+                selected_plan_path=plan_path,
+            )
+
     def test_changes_in_another_registered_worktree_are_rejected(self):
         for mutation in ("file", "index"):
             with self.subTest(mutation=mutation):
@@ -5403,6 +5428,58 @@ class AgentScopeValidatorTest(unittest.TestCase):
                             selected_plan_path=plan_path,
                         )
                     self.assertIn(external_path, str(raised.exception))
+
+    def test_primary_worktree_and_base_refs_can_change_during_managed_agent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, plan_path = self._repository_with_plan(directory)
+            git_command(
+                repo,
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            )
+            managed = root / "managed"
+            loop_manager.make_worktree(
+                repo,
+                managed,
+                "loop-manager/G-099",
+                "main",
+            )
+            before = loop_manager.capture_git_snapshot(managed)
+
+            (repo / "src/app.py").write_text("VALUE = 2\n", encoding="utf-8")
+            commit_and_push(repo, "Update primary worktree")
+            after = loop_manager.capture_git_snapshot(managed)
+
+            primary_path = str(repo.resolve())
+            self.assertNotEqual(
+                before.worktrees[primary_path],
+                after.worktrees[primary_path],
+            )
+            for refname in (
+                "refs/heads/main",
+                "refs/remotes/origin/main",
+                "refs/remotes/origin/HEAD",
+            ):
+                self.assertNotEqual(before.refs[refname], after.refs[refname])
+            with self.assertRaises(loop_manager.AgentScopeError):
+                loop_manager.validate_agent_scope(
+                    "worker",
+                    managed,
+                    before,
+                    after,
+                    selected_plan_path=plan_path,
+                )
+            loop_manager.validate_agent_scope(
+                "worker",
+                managed,
+                before,
+                after,
+                selected_plan_path=plan_path,
+                external_worktree=repo,
+                base_branch="main",
+            )
 
     def test_active_execplan_fixed_metadata_must_match_published_plan(self):
         replacements = (
@@ -5693,7 +5770,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 unsafe_git.assert_not_called()
                 agent.assert_not_called()
 
-    def test_interrupted_ref_change_blocks_before_migration_fetch(self):
+    def test_interrupted_non_base_ref_change_blocks_before_migration_fetch(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo, plan_path = self._repository_with_plan(directory)
@@ -5704,7 +5781,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
             git_command(
                 repo,
                 "update-ref",
-                "refs/remotes/origin/main",
+                "refs/heads/agent-created",
                 changed_ref,
             )
             real_git = loop_manager.git
@@ -5756,9 +5833,9 @@ class AgentScopeValidatorTest(unittest.TestCase):
             self.assertEqual(plan["status"], "BLOCKED")
             self.assertIsNotNone(plan["blocked_fingerprint"])
             self.assertIn("공유 Git refs 변경", project["last_error"])
-            self.assertIn("refs/remotes/origin/main", project["last_error"])
+            self.assertIn("refs/heads/agent-created", project["last_error"])
             self.assertEqual(
-                git_command(repo, "rev-parse", "refs/remotes/origin/main"),
+                git_command(repo, "rev-parse", "refs/heads/agent-created"),
                 changed_ref,
             )
             self.assertFalse(
@@ -6135,10 +6212,11 @@ class AgentScopeValidatorTest(unittest.TestCase):
             resumed_agent.assert_called_once()
             self.assertEqual(resumed_agent.call_args.args[3], "planner")
 
-    def test_blocked_resume_does_not_excuse_agent_base_ref_change(self):
+    def test_blocked_resume_does_not_excuse_agent_owned_ref_change(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo, plan_path = self._repository_with_plan(directory)
+            git_command(repo, "branch", "loop-manager/G-099", "HEAD")
             worktree = root / "managed"
             loop_manager.make_worktree(
                 repo,
@@ -6150,7 +6228,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
             git_command(
                 worktree,
                 "update-ref",
-                "refs/remotes/origin/main",
+                "refs/heads/loop-manager/G-099",
                 "HEAD^",
             )
             blocked_result = loop_manager.capture_git_snapshot(worktree)
@@ -6180,7 +6258,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 loop_manager.AgentScopeError,
-                r"refs/remotes/origin/main",
+                r"refs/heads/loop-manager/G-099",
             ):
                 loop_manager.validate_blocked_agent_scope(
                     connection,
