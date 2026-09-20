@@ -1839,18 +1839,42 @@ def _mirror_project_update_to_execplan(
     )
 
 
+def validate_runtime_prerequisites(
+    path: Path,
+    *,
+    provider: str,
+    config_path: Path | None,
+) -> None:
+    """Validate executable, authentication, and profile prerequisites only."""
+
+    if not shutil.which("git") or not shutil.which("gh"):
+        raise RuntimeError("git과 gh CLI가 PATH에 있어야 합니다.")
+    if provider not in AGENT_PROVIDERS:
+        raise RuntimeError(f"지원하지 않는 Agent provider입니다: {provider}")
+    if config_path is not None:
+        validate_provider_runtime(config_path, provider, path)
+    elif not shutil.which(provider):
+        raise RuntimeError(
+            f"선택한 {provider.capitalize()} CLI가 PATH에 설치되어 있지 않습니다."
+        )
+
+
 def validate_repository(
     path: Path,
     *,
     allow_agents_mismatch: bool,
     provider: str = "codex",
     config_path: Path | None = None,
+    registration_checks: bool = True,
 ) -> Path:
-    if not shutil.which("git") or not shutil.which("gh"):
-        raise RuntimeError("git과 gh CLI가 PATH에 있어야 합니다.")
-    if provider not in AGENT_PROVIDERS:
-        raise RuntimeError(f"지원하지 않는 Agent provider입니다: {provider}")
     path = path.expanduser().resolve()
+    validate_runtime_prerequisites(
+        path,
+        provider=provider,
+        config_path=config_path,
+    )
+    if not registration_checks:
+        return path
     root = Path(git(path, "rev-parse", "--show-toplevel").stdout.strip()).resolve()
     if root != path:
         raise RuntimeError(f"저장소 루트 경로를 지정하세요: {root}")
@@ -1870,12 +1894,6 @@ def validate_repository(
         raise RuntimeError(
             "AGENTS.md에 공통 규칙이 없습니다. 명시적인 `config add "
             "--approve-agents-mismatch`에서 승인하세요."
-        )
-    if config_path is not None:
-        validate_provider_runtime(config_path, provider, root)
-    elif not shutil.which(provider):
-        raise RuntimeError(
-            f"선택한 {provider.capitalize()} CLI가 PATH에 설치되어 있지 않습니다."
         )
     return root
 
@@ -1949,11 +1967,12 @@ def inspect_project_registration(
 ) -> ProjectRegistrationInspection:
     """Validate one project completely before its registry row is changed."""
 
-    if not shutil.which("git") or not shutil.which("gh"):
-        raise RuntimeError("git과 gh CLI가 PATH에 있어야 합니다.")
-    if provider not in AGENT_PROVIDERS:
-        raise RuntimeError(f"지원하지 않는 Agent provider입니다: {provider}")
     path = path.expanduser().resolve()
+    validate_runtime_prerequisites(
+        path,
+        provider=provider,
+        config_path=config_path,
+    )
     root = Path(git(path, "rev-parse", "--show-toplevel").stdout.strip()).resolve()
     if root != path:
         raise RuntimeError(f"저장소 루트 경로를 지정하세요: {root}")
@@ -1963,7 +1982,6 @@ def inspect_project_registration(
         approve_agents_mismatch=approve_agents_mismatch,
     )
     base_branch = remote_base(root, requested_base)
-    validate_provider_runtime(config_path, provider, root)
     return ProjectRegistrationInspection(
         root=root,
         base_branch=base_branch,
@@ -8264,7 +8282,15 @@ def _run_project_step(
                     checkpoint_cleanup_candidates,
                 ).serialize(),
             )
-    if row is None:
+    if row is not None:
+        repo_path = validate_repository(
+            repo_path,
+            allow_agents_mismatch=False,
+            provider=provider,
+            config_path=config_path,
+            registration_checks=False,
+        )
+    else:
         repo_path = validate_repository(
             repo_path,
             allow_agents_mismatch=allow_agents_mismatch,
@@ -10166,7 +10192,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    args, _ = build_parser().parse_known_args()
+    args = build_parser().parse_args()
     state_dir = state_directory(args.state_dir)
     config_path = Path(args.config).expanduser().resolve()
     try:

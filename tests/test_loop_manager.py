@@ -9338,7 +9338,7 @@ class MergeIndependentWorktreeCleanupTest(unittest.TestCase):
         self.assertEqual(row["headRefOid"], "abc")
         self.assertIn("headRefOid", command.call_args.args[0][-1])
 
-    def test_main_ignores_unknown_options(self):
+    def test_main_rejects_unknown_options_before_state_creation(self):
         state_dir = Path("state")
         with mock.patch(
             "sys.argv",
@@ -9349,13 +9349,18 @@ class MergeIndependentWorktreeCleanupTest(unittest.TestCase):
             ],
         ), mock.patch(
             "loop_manager.state_directory", return_value=state_dir
-        ), mock.patch("loop_manager.process_lock") as process_lock, mock.patch(
+        ) as state_directory, mock.patch(
+            "loop_manager.process_lock"
+        ) as process_lock, mock.patch(
             "loop_manager.connect_database"
-        ) as connect_database, mock.patch("builtins.print"):
-            self.assertEqual(loop_manager.main(), 0)
+        ) as connect_database, redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                loop_manager.main()
 
-        process_lock.assert_called_once_with(state_dir)
-        connect_database.assert_called_once_with(state_dir, create=True)
+        self.assertEqual(raised.exception.code, 2)
+        state_directory.assert_not_called()
+        process_lock.assert_not_called()
+        connect_database.assert_not_called()
 
 
 class LatestBasePublicationTest(unittest.TestCase):
@@ -10367,14 +10372,14 @@ class TimestampedExecutionProgressLogsTest(unittest.TestCase):
 
     def test_skip_if_running_only_silences_lock_contention(self):
         state_dir = Path("state")
-        with mock.patch("sys.argv", ["loop_manager.py", "run", "repo", "--skip-if-running"]), mock.patch("loop_manager.state_directory", return_value=state_dir), mock.patch("loop_manager.process_lock", side_effect=loop_manager.ProcessLockBusyError("busy")), mock.patch("loop_manager.update_source_checkout_after_success") as update, mock.patch("builtins.print") as output:
+        with mock.patch("sys.argv", ["loop_manager.py", "run", "--skip-if-running"]), mock.patch("loop_manager.state_directory", return_value=state_dir), mock.patch("loop_manager.process_lock", side_effect=loop_manager.ProcessLockBusyError("busy")), mock.patch("loop_manager.update_source_checkout_after_success") as update, mock.patch("builtins.print") as output:
             self.assertEqual(loop_manager.main(), 0)
         update.assert_not_called()
         output.assert_not_called()
-        with mock.patch("sys.argv", ["loop_manager.py", "run", "repo"]), mock.patch("loop_manager.state_directory", return_value=state_dir), mock.patch("loop_manager.process_lock", side_effect=loop_manager.ProcessLockBusyError("busy")), mock.patch("builtins.print") as output:
+        with mock.patch("sys.argv", ["loop_manager.py", "run"]), mock.patch("loop_manager.state_directory", return_value=state_dir), mock.patch("loop_manager.process_lock", side_effect=loop_manager.ProcessLockBusyError("busy")), mock.patch("builtins.print") as output:
             self.assertEqual(loop_manager.main(), 1)
         self.assertTrue(output.called)
-        with mock.patch("sys.argv", ["loop_manager.py", "run", "repo", "--skip-if-running"]), mock.patch("loop_manager.state_directory", return_value=state_dir), mock.patch("loop_manager.process_lock", side_effect=RuntimeError("broken")), mock.patch("builtins.print") as output:
+        with mock.patch("sys.argv", ["loop_manager.py", "run", "--skip-if-running"]), mock.patch("loop_manager.state_directory", return_value=state_dir), mock.patch("loop_manager.process_lock", side_effect=RuntimeError("broken")), mock.patch("builtins.print") as output:
             self.assertEqual(loop_manager.main(), 1)
         self.assertTrue(output.called)
 
@@ -10411,15 +10416,17 @@ class TimestampedExecutionProgressLogsTest(unittest.TestCase):
                 events.append("database-closed")
 
         with mock.patch(
-            "sys.argv", ["loop_manager.py", "run", "repo"]
+            "sys.argv", ["loop_manager.py", "run"]
         ), mock.patch(
             "loop_manager.state_directory", return_value=Path("state")
+        ), mock.patch(
+            "loop_manager.load_managed_config", return_value=mock.sentinel.config
         ), mock.patch(
             "loop_manager.process_lock", return_value=locked()
         ), mock.patch(
             "loop_manager.connect_database", return_value=database()
         ), mock.patch(
-            "loop_manager.run_project", return_value=0
+            "loop_manager.run_registered_projects", return_value=0
         ), mock.patch(
             "loop_manager.update_source_checkout_after_success",
             side_effect=lambda: events.append("update"),
@@ -10434,15 +10441,17 @@ class TimestampedExecutionProgressLogsTest(unittest.TestCase):
 
     def test_failed_run_does_not_update_source(self):
         with mock.patch(
-            "sys.argv", ["loop_manager.py", "run", "repo"]
+            "sys.argv", ["loop_manager.py", "run"]
         ), mock.patch(
             "loop_manager.state_directory", return_value=Path("state")
+        ), mock.patch(
+            "loop_manager.load_managed_config", return_value=mock.sentinel.config
         ), mock.patch(
             "loop_manager.process_lock"
         ), mock.patch(
             "loop_manager.connect_database"
         ), mock.patch(
-            "loop_manager.run_project", return_value=1
+            "loop_manager.run_registered_projects", return_value=1
         ), mock.patch(
             "loop_manager.update_source_checkout_after_success"
         ) as update:
@@ -10452,15 +10461,17 @@ class TimestampedExecutionProgressLogsTest(unittest.TestCase):
 
     def test_source_update_failure_changes_successful_run_exit_code(self):
         with mock.patch(
-            "sys.argv", ["loop_manager.py", "run", "repo"]
+            "sys.argv", ["loop_manager.py", "run"]
         ), mock.patch(
             "loop_manager.state_directory", return_value=Path("state")
+        ), mock.patch(
+            "loop_manager.load_managed_config", return_value=mock.sentinel.config
         ), mock.patch(
             "loop_manager.process_lock"
         ), mock.patch(
             "loop_manager.connect_database"
         ), mock.patch(
-            "loop_manager.run_project", return_value=0
+            "loop_manager.run_registered_projects", return_value=0
         ), mock.patch(
             "loop_manager.update_source_checkout_after_success",
             side_effect=RuntimeError("fetch failed"),

@@ -241,6 +241,46 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
 
         self.assertEqual(project_registry.list_projects(connection), ())
 
+    def test_registered_runtime_preflight_fails_before_project_state_transition(self):
+        connection = self._connection()
+        root = Path("/repo").resolve()
+        project_registry.add_project(connection, self._record(repo=str(root)))
+
+        with mock.patch(
+            "loop_manager.shutil.which", return_value="/bin/tool"
+        ), mock.patch(
+            "loop_manager.validate_provider_runtime",
+            side_effect=RuntimeError("Codex CLI가 인증되어 있지 않습니다."),
+        ) as provider_runtime, mock.patch(
+            "loop_manager.inspect_registration_files"
+        ) as registration_files, mock.patch(
+            "loop_manager.git"
+        ) as git:
+            with self.assertRaisesRegex(RuntimeError, "인증"):
+                loop_manager.run_project(
+                    connection,
+                    Path("/state"),
+                    str(root),
+                    Path("config.ini"),
+                    None,
+                    False,
+                    registered_only=True,
+                )
+
+        project = connection.execute(
+            "SELECT phase, worktree FROM projects WHERE repo = ?", (str(root),)
+        ).fetchone()
+        plan_count = connection.execute(
+            "SELECT COUNT(*) FROM exec_plans WHERE repo = ?", (str(root),)
+        ).fetchone()[0]
+        self.assertEqual(tuple(project), (None, None))
+        self.assertEqual(plan_count, 0)
+        provider_runtime.assert_called_once_with(
+            Path("config.ini"), "codex", root
+        )
+        registration_files.assert_not_called()
+        git.assert_not_called()
+
     def test_legacy_registry_migration_preserves_codex_project(self):
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
@@ -266,6 +306,24 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
         self.assertFalse(hasattr(args, "repository"))
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             loop_manager.build_parser().parse_args(["run", "/repo"])
+
+        state_dir = Path("/state")
+        with mock.patch.object(
+            loop_manager.sys,
+            "argv",
+            ["loop_manager.py", "run", "/repo", "--allow-agents-mismatch"],
+        ), mock.patch(
+            "loop_manager.state_directory", return_value=state_dir
+        ) as state_directory, mock.patch(
+            "loop_manager.process_lock"
+        ) as process_lock, redirect_stderr(io.StringIO()) as stderr:
+            with self.assertRaises(SystemExit) as raised:
+                loop_manager.main()
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("unrecognized arguments", stderr.getvalue())
+        state_directory.assert_not_called()
+        process_lock.assert_not_called()
 
 
 if __name__ == "__main__":
