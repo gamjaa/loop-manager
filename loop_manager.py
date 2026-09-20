@@ -2456,7 +2456,10 @@ def claude_worker_profile(
     )
 
 
-def agent_environment(provider: str = "codex") -> dict[str, str]:
+def agent_environment(
+    provider: str = "codex", role_name: str | None = None
+) -> dict[str, str]:
+    """Return the filtered environment for one Agent subprocess role."""
     allowed = {
         "APPDATA",
         "COMSPEC",
@@ -2491,7 +2494,16 @@ def agent_environment(provider: str = "codex") -> dict[str, str]:
         raise RuntimeError(f"지원하지 않는 Agent provider입니다: {provider}")
     allowed.update(provider_allowed[provider])
 
-    return {key: value for key, value in os.environ.items() if key.upper() in allowed}
+    environment = {
+        key: value for key, value in os.environ.items() if key.upper() in allowed
+    }
+    if role_name == "planner":
+        # A Planner often imports project modules while inspecting a planning
+        # worktree. The scope snapshot deliberately includes ignored files,
+        # so prevent Python's automatic cache writes at this subprocess
+        # boundary rather than weakening that validation.
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    return environment
 
 
 def codex_sandbox_arguments(read_only: bool) -> list[str]:
@@ -2570,7 +2582,7 @@ def run_codex(
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                env=agent_environment("codex"),
+                env=agent_environment("codex", role_name),
                 cwd=worktree,
             )
             assert process.stdin is not None
@@ -2628,7 +2640,7 @@ def run_codex(
                 errors="replace",
                 stdout=output,
                 stderr=subprocess.STDOUT,
-                env=agent_environment("codex"),
+                env=agent_environment("codex", role_name),
                 cwd=worktree,
                 timeout=AGENT_CLI_TIMEOUT_SECONDS,
             )
@@ -2843,7 +2855,7 @@ def run_claude(
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                env=agent_environment("claude"),
+                env=agent_environment("claude", role_name),
                 cwd=worktree,
             )
             assert process.stdin is not None
@@ -2920,7 +2932,7 @@ def run_claude(
             errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            env=agent_environment("claude"),
+            env=agent_environment("claude", role_name),
             cwd=worktree,
             timeout=AGENT_CLI_TIMEOUT_SECONDS,
         )
