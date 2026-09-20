@@ -175,6 +175,9 @@ CREATE TABLE IF NOT EXISTS exec_plans (
     review_result TEXT,
     verify_failure_history TEXT NOT NULL DEFAULT '{}',
     review_failure_history TEXT NOT NULL DEFAULT '{}',
+    initial_worker_level INTEGER,
+    effective_worker_level INTEGER,
+    review_level_history TEXT NOT NULL DEFAULT '{}',
     workspace_owned INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (repo, plan_id),
     UNIQUE (repo, path),
@@ -234,6 +237,17 @@ class ValidationFailureDecision:
     fingerprint: str
     occurrences: int
     blocked: bool
+
+
+@dataclass(frozen=True)
+class WorkerLevelDecision:
+    previous_level: int
+    effective_level: int
+    review_history: dict[str, dict[str, int]]
+
+    @property
+    def escalated(self) -> bool:
+        return self.effective_level > self.previous_level
 
 
 @dataclass(frozen=True)
@@ -623,6 +637,9 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
         "pr_head_oid": "TEXT",
         "verify_failure_history": "TEXT NOT NULL DEFAULT '{}'",
         "review_failure_history": "TEXT NOT NULL DEFAULT '{}'",
+        "initial_worker_level": "INTEGER",
+        "effective_worker_level": "INTEGER",
+        "review_level_history": "TEXT NOT NULL DEFAULT '{}'",
     }
     for column, definition in migrations.items():
         if column not in columns:
@@ -1137,6 +1154,7 @@ def register_execplans(
             plan_id = str(plan["id"])
             sources, dependencies, priority = _execplan_metadata(plan)
             content_hash = file_hash(worktree / path)
+            initial_level = worker_level(plan)
             existing = connection.execute(
                 "SELECT * FROM exec_plans WHERE repo = ? AND (plan_id = ? OR path = ?)",
                 (repo, plan_id, path),
@@ -1164,13 +1182,20 @@ def register_execplans(
                 )
                 if immutable != expected:
                     raise RuntimeError(f"게시된 ExecPlan 등록 정보가 충돌합니다: {plan_id}")
+                if existing["initial_worker_level"] is None:
+                    connection.execute(
+                        "UPDATE exec_plans SET initial_worker_level = ?, "
+                        "effective_worker_level = ? WHERE repo = ? AND plan_id = ?",
+                        (initial_level, initial_level, repo, plan_id),
+                    )
                 continue
             connection.execute(
                 """
                 INSERT INTO exec_plans (
                     repo, plan_id, path, title, sources, depends_on, priority,
-                    content_hash, status, plan_sha
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'READY', ?)
+                    content_hash, status, plan_sha, initial_worker_level,
+                    effective_worker_level
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'READY', ?, ?, ?)
                 """,
                 (
                     repo,
@@ -1182,6 +1207,8 @@ def register_execplans(
                     priority,
                     content_hash,
                     plan_commit,
+                    initial_level,
+                    initial_level,
                 ),
             )
         values = _clear_active_values(
@@ -1310,14 +1337,16 @@ def migrate_legacy_execplans(
                         )
                     plan_sha = _legacy_plan_sha(root, revision, relative_path)
                 sources, dependencies, priority = _execplan_metadata(plan)
+                initial_level = worker_level(plan)
                 connection.execute(
                     """
                     INSERT INTO exec_plans (
                         repo, plan_id, path, title, sources, depends_on, priority,
                         content_hash, status, plan_sha, active_sha, branch, worktree,
                         pr_url, last_error, worker_session_id, worker_result, verify_result,
-                        workspace_owned
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        initial_worker_level, effective_worker_level, workspace_owned
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                              ?, ?)
                     """,
                     (
                         project["repo"],
@@ -1340,6 +1369,8 @@ def migrate_legacy_execplans(
                         project["worker_session_id"] if is_active else None,
                         project["worker_result"] if is_active else None,
                         project["verify_result"] if is_active else None,
+                        initial_level,
+                        initial_level,
                         1 if is_active else 0,
                     ),
                 )
@@ -1645,6 +1676,118 @@ def worker_level(plan: dict[str, object]) -> int:
     return min(complexity + risk, 7)
 
 
+def _deserialize_review_level_history(
+    value: object,
+) -> dict[str, dict[str, int]]:
+    if value in {None, ""}:
+        return {}
+    parsed = json.loads(str(value))
+    if not isinstance(parsed, dict):
+        raise RuntimeError("저장된 level별 Review 승격 이력이 유효하지 않습니다.")
+    history: dict[str, dict[str, int]] = {}
+    for level, records in parsed.items():
+        if (
+            not isinstance(level, str)
+            or not level.isdigit()
+            or not 1 <= int(level) <= 8
+            or not isinstance(records, dict)
+        ):
+            raise RuntimeError("저장된 level별 Review 승격 이력이 유효하지 않습니다.")
+        normalized_records: dict[str, int] = {}
+        for fingerprint, occurrences in records.items():
+            if (
+                not isinstance(fingerprint, str)
+                or not fingerprint
+                or type(occurrences) is not int
+                or occurrences < 1
+            ):
+                raise RuntimeError("저장된 level별 Review 승격 이력이 유효하지 않습니다.")
+            normalized_records[fingerprint] = occurrences
+        history[level] = normalized_records
+    return history
+
+
+def evaluate_review_worker_level(
+    effective_level: int,
+    review_history: dict[str, dict[str, int]],
+    fingerprints: tuple[str, ...],
+) -> WorkerLevelDecision:
+    """Return the monotonic level transition for one valid Reviewer FAIL."""
+
+    if type(effective_level) is not int or not 1 <= effective_level <= 8:
+        raise ValueError(f"effective Worker level이 유효하지 않습니다: {effective_level}")
+    if not fingerprints or any(not fingerprint for fingerprint in fingerprints):
+        raise ValueError("Review 승격 평가에는 실패 지문이 하나 이상 필요합니다.")
+
+    history = {
+        level: dict(records)
+        for level, records in review_history.items()
+    }
+    current = history.setdefault(str(effective_level), {})
+    for fingerprint in sorted(set(fingerprints)):
+        current[fingerprint] = current.get(fingerprint, 0) + 1
+
+    should_escalate = (
+        any(occurrences >= 2 for occurrences in current.values())
+        or len(current) >= 3
+    )
+    next_level = (
+        effective_level + 1
+        if should_escalate and effective_level < 8
+        else effective_level
+    )
+    return WorkerLevelDecision(effective_level, next_level, history)
+
+
+def ensure_worker_level_state(
+    connection: sqlite3.Connection,
+    repo: str,
+    plan: dict[str, object],
+) -> int:
+    """Backfill and validate the persisted initial/effective Worker levels."""
+
+    catalog_plan = active_execplan(connection, repo)
+    if catalog_plan is None:
+        raise RuntimeError("Worker level을 저장할 활성 ExecPlan을 찾을 수 없습니다.")
+    calculated_initial = worker_level(plan)
+    initial = catalog_plan["initial_worker_level"]
+    effective = catalog_plan["effective_worker_level"]
+    if initial is None and effective is None:
+        with connection:
+            connection.execute(
+                """
+                UPDATE exec_plans
+                SET initial_worker_level = ?, effective_worker_level = ?,
+                    review_level_history = '{}'
+                WHERE repo = ? AND plan_id = ?
+                """,
+                (
+                    calculated_initial,
+                    calculated_initial,
+                    repo,
+                    catalog_plan["plan_id"],
+                ),
+            )
+        return calculated_initial
+    if initial is None or effective is None:
+        raise RuntimeError("저장된 Worker level 상태가 완전하지 않습니다.")
+    if (
+        type(initial) is not int
+        or initial != calculated_initial
+        or not 1 <= initial <= 7
+        or type(effective) is not int
+        or not initial <= effective <= 8
+    ):
+        raise RuntimeError("저장된 Worker level 상태가 ExecPlan과 일치하지 않습니다.")
+    review_history = _deserialize_review_level_history(
+        catalog_plan["review_level_history"]
+    )
+    if any(not initial <= int(level) <= effective for level in review_history):
+        raise RuntimeError("저장된 Review 승격 이력이 Worker level과 일치하지 않습니다.")
+
+    return effective
+
+
 def codex_model_efforts(worktree: Path | None = None) -> dict[str, frozenset[str]]:
     try:
         catalog = json.loads(
@@ -1663,18 +1806,27 @@ def codex_model_efforts(worktree: Path | None = None) -> dict[str, frozenset[str
         raise RuntimeError("Codex CLI model catalog 형식이 올바르지 않습니다.") from error
 
 
-def codex_profile(
+def provider_profile(
     config_path: Path,
+    provider: str,
     section: str,
     name: str,
     label: str,
-    worktree: Path | None = None,
+    model_efforts: Mapping[str, frozenset[str]],
 ) -> tuple[str, str]:
+    """Resolve and validate one provider profile without invoking its CLI."""
+
+    provider_labels = {"codex": "Codex", "claude": "Claude"}
+    provider_label = provider_labels.get(provider)
+    if provider_label is None or not section.startswith(f"{provider}."):
+        raise RuntimeError(f"지원하지 않는 Agent provider입니다: {provider}")
     parser = configparser.ConfigParser()
     try:
         loaded = parser.read(config_path, encoding="utf-8")
     except configparser.Error as error:
-        raise RuntimeError(f"Codex 설정 파일 형식이 올바르지 않습니다: {config_path}") from error
+        raise RuntimeError(
+            f"{provider_label} 설정 파일 형식이 올바르지 않습니다: {config_path}"
+        ) from error
     if not loaded:
         raise RuntimeError(f"설정 파일이 없습니다: {config_path}")
     if section not in parser:
@@ -1698,26 +1850,92 @@ def codex_profile(
         raise RuntimeError(f"{label} Model alias 설정이 비어 있습니다.")
     if not effort:
         raise RuntimeError(f"{label} Effort 설정이 비어 있습니다.")
-    if "codex.models" not in parser:
-        raise RuntimeError(f"{label} Model alias section [codex.models]가 없습니다.")
-    if alias not in parser["codex.models"]:
-        raise RuntimeError(f"{label} Model alias가 [codex.models]에 없습니다: {alias}")
+    models_section = f"{provider}.models"
+    if models_section not in parser:
+        raise RuntimeError(
+            f"{label} Model alias section [{models_section}]가 없습니다."
+        )
+    if alias not in parser[models_section]:
+        raise RuntimeError(
+            f"{label} Model alias가 [{models_section}]에 없습니다: {alias}"
+        )
     try:
-        model = parser["codex.models"][alias].strip()
+        model = parser[models_section][alias].strip()
     except configparser.InterpolationError as error:
         raise RuntimeError(
-            f"{label} 설정 값 형식이 올바르지 않습니다: [codex.models] {alias}"
+            f"{label} 설정 값 형식이 올바르지 않습니다: "
+            f"[{models_section}] {alias}"
         ) from error
     if not model:
-        raise RuntimeError(f"{label} Model 설정이 비어 있습니다: [codex.models] {alias}")
-    supported = codex_model_efforts(worktree).get(model)
+        raise RuntimeError(
+            f"{label} Model 설정이 비어 있습니다: [{models_section}] {alias}"
+        )
+
+    if section == f"{provider}.worker" and name == "level8":
+        expected_alias, expected_effort = {
+            "codex": ("frontier", "low"),
+            "claude": ("strong", "max"),
+        }[provider]
+        if (alias, effort) != (expected_alias, expected_effort):
+            raise RuntimeError(
+                f"{label}은 {expected_alias},{expected_effort} 설정이어야 합니다."
+            )
+        if provider == "codex" and model != "gpt-6-astra":
+            raise RuntimeError(f"{label} Model은 gpt-6-astra여야 합니다: {model}")
+        if provider == "claude" and not re.fullmatch(
+            r"claude-opus-5(?:[-.].*)?", model
+        ):
+            raise RuntimeError(
+                f"{label} Model은 claude-opus-5 계열이어야 합니다: {model}"
+            )
+
+    supported = model_efforts.get(model)
     if supported is None:
-        raise RuntimeError(f"{label} Model을 Codex CLI가 지원하지 않습니다: {model}")
+        raise RuntimeError(
+            f"{label} Model을 {provider_label} CLI가 지원하지 않습니다: {model}"
+        )
     if effort not in supported:
         raise RuntimeError(
-            f"{label} Model/Effort 조합을 Codex CLI가 지원하지 않습니다: {model},{effort}"
+            f"{label} Model/Effort 조합을 {provider_label} CLI가 지원하지 않습니다: "
+            f"{model},{effort}"
         )
     return model, effort
+
+
+def provider_worker_profile(
+    config_path: Path,
+    provider: str,
+    level: int,
+    model_efforts: Mapping[str, frozenset[str]],
+) -> tuple[str, str]:
+    if type(level) is not int or not 1 <= level <= 8:
+        raise RuntimeError(f"{provider.capitalize()} Worker level이 유효하지 않습니다: {level}")
+    name = f"level{level}"
+    return provider_profile(
+        config_path,
+        provider,
+        f"{provider}.worker",
+        name,
+        f"{provider.capitalize()} Worker {name}",
+        model_efforts,
+    )
+
+
+def codex_profile(
+    config_path: Path,
+    section: str,
+    name: str,
+    label: str,
+    worktree: Path | None = None,
+) -> tuple[str, str]:
+    return provider_profile(
+        config_path,
+        "codex",
+        section,
+        name,
+        label,
+        codex_model_efforts(worktree),
+    )
 
 
 def role(config_path: Path, name: str, worktree: Path | None = None) -> tuple[str, str]:
@@ -1729,10 +1947,15 @@ def worker_profile(
     level: int,
     worktree: Path | None = None,
 ) -> tuple[str, str]:
-    if type(level) is not int or not 1 <= level <= 7:
+    if type(level) is not int or not 1 <= level <= 8:
         raise RuntimeError(f"Codex Worker level이 유효하지 않습니다: {level}")
-    name = f"level{level}"
-    return codex_profile(config_path, "codex.worker", name, f"Codex Worker {name}", worktree)
+    return provider_worker_profile(
+        config_path,
+        "codex",
+        level,
+        codex_model_efforts(worktree),
+    )
+
 
 
 def agent_environment() -> dict[str, str]:
@@ -4195,6 +4418,20 @@ def transition_validation_failure(
         separators=(",", ":"),
         sort_keys=True,
     )
+    level_decision: WorkerLevelDecision | None = None
+    serialized_level_history: str | None = None
+    if stage == "review" and plan["effective_worker_level"] is not None:
+        level_decision = evaluate_review_worker_level(
+            plan["effective_worker_level"],
+            _deserialize_review_level_history(plan["review_level_history"]),
+            tuple(failure[0] for failure in recorded_failures),
+        )
+        serialized_level_history = json.dumps(
+            level_decision.review_history,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
     blocked = blocking_failure is not None
     if blocked:
         error = (
@@ -4233,6 +4470,13 @@ def transition_validation_failure(
         execplan_values.append(output)
         project_assignments.append("review_result = ?")
         project_values.append(output)
+        if level_decision is not None:
+            execplan_assignments.extend(
+                ["effective_worker_level = ?", "review_level_history = ?"]
+            )
+            execplan_values.extend(
+                [level_decision.effective_level, serialized_level_history]
+            )
     if blocked:
         execplan_assignments.extend(
             ["blocked_fingerprint = ?", "blocked_worktree_fingerprint = ?"]
@@ -5811,7 +6055,9 @@ def _requeue_blocked_execplan(
                 verify_result = NULL, review_result = NULL,
                 validated_base_sha = NULL, publication_remote_oid = NULL,
                 pr_url = NULL, pr_head_oid = NULL,
-                verify_failure_history = '{}', review_failure_history = '{}'
+                verify_failure_history = '{}', review_failure_history = '{}',
+                effective_worker_level = initial_worker_level,
+                review_level_history = '{}'
             WHERE repo = ? AND plan_id = ?
             """,
             (repo, plan_id),
@@ -7429,6 +7675,7 @@ def _run_project_step(
             str(row["plan_path"]),
             catalog_plan,
         )
+        level = ensure_worker_level_state(connection, repo, plan)
     except RuntimeError as error:
         metadata_error = str(error)
         block_active_execplan(
@@ -7443,7 +7690,6 @@ def _run_project_step(
 
     if row["phase"] == "WORKING":
         operation_log(f"Worker 시작: {plan['id']} {plan['title']}")
-        level = worker_level(plan)
         worker_scope_before = begin_agent_scope(
             connection,
             repo,

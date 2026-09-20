@@ -1959,7 +1959,7 @@ risk: medium
     def test_worker_profile_rejects_invalid_level(self):
         config = loop_manager.ROOT / "config/config.ini.example"
 
-        for level in (0, 8, True):
+        for level in (0, 9, True):
             with self.subTest(level=level):
                 with self.assertRaisesRegex(RuntimeError, "Worker level"):
                     loop_manager.worker_profile(config, level)
@@ -3903,6 +3903,9 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                 "    review_result TEXT,\n",
                 "    verify_failure_history TEXT NOT NULL DEFAULT '{}',\n",
                 "    review_failure_history TEXT NOT NULL DEFAULT '{}',\n",
+                "    initial_worker_level INTEGER,\n",
+                "    effective_worker_level INTEGER,\n",
+                "    review_level_history TEXT NOT NULL DEFAULT '{}',\n",
             ):
                 legacy_execplans = legacy_execplans.replace(line, "")
             database.execute(legacy_projects)
@@ -3932,7 +3935,8 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                 }
                 row = migrated.execute(
                     "SELECT retry_count, verify_failure_history, "
-                    "review_failure_history FROM exec_plans"
+                    "review_failure_history, initial_worker_level, "
+                    "effective_worker_level, review_level_history FROM exec_plans"
                 ).fetchone()
 
         self.assertTrue(
@@ -3944,12 +3948,503 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                 "review_result",
                 "verify_failure_history",
                 "review_failure_history",
+                "initial_worker_level",
+                "effective_worker_level",
+                "review_level_history",
             }
             <= plan_columns
         )
         self.assertEqual(row["retry_count"], 2)
         self.assertEqual(json.loads(row["verify_failure_history"]), {})
         self.assertEqual(json.loads(row["review_failure_history"]), {})
+        self.assertIsNone(row["initial_worker_level"])
+        self.assertIsNone(row["effective_worker_level"])
+        self.assertEqual(json.loads(row["review_level_history"]), {})
+
+
+class ReviewDrivenWorkerProfileEscalationTest(unittest.TestCase):
+    def _level_state(
+        self,
+        directory: str,
+        *,
+        initial_level: int,
+    ) -> tuple[Path, Path, sqlite3.Connection]:
+        root = make_catalog_root(str(Path(directory) / "catalog"))
+        plan = write_execplan(root, "G-019", "Review Escalation")
+        state_dir = Path(directory) / "state"
+        state_dir.mkdir()
+        connection = loop_manager.connect_database(state_dir, create=True)
+        connection.execute(
+            """
+            INSERT INTO projects (repo, base_branch, phase, plan_path, worktree)
+            VALUES (?, 'main', 'REVIEWING', ?, ?)
+            """,
+            (str(root), plan.relative_to(root).as_posix(), str(root)),
+        )
+        connection.execute(
+            """
+            INSERT INTO exec_plans (
+                repo, plan_id, path, title, sources, depends_on, priority,
+                content_hash, status, worktree, initial_worker_level,
+                effective_worker_level
+            ) VALUES (?, 'G-019', ?, 'Review Escalation', ?, '[]', 'critical',
+                      'hash', 'REVIEWING', ?, ?, ?)
+            """,
+            (
+                str(root),
+                plan.relative_to(root).as_posix(),
+                json.dumps(["docs/PRODUCT.md"]),
+                str(root),
+                initial_level,
+                initial_level,
+            ),
+        )
+        connection.commit()
+        return root, state_dir, connection
+
+    def _active_worker_project(
+        self,
+        directory: str,
+    ) -> tuple[Path, Path, sqlite3.Connection]:
+        repo = make_remote_repository(directory)
+        state_dir = Path(directory) / "state"
+        state_dir.mkdir()
+        (repo / "docs/plans").mkdir()
+        plan = write_execplan(repo, "G-019", "Review Escalation")
+        commit_and_push(repo, "Add escalation plan")
+        plan_sha = git_command(repo, "rev-parse", "origin/main")
+        branch, worktree = loop_manager.expected_execplan_workspace(
+            state_dir, str(repo), "G-019"
+        )
+        loop_manager.make_worktree(repo, worktree, branch, "main")
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute(loop_manager.SCHEMA)
+        connection.execute(
+            """
+            INSERT INTO projects (
+                repo, base_branch, active_sha, plan_sha, phase, branch,
+                worktree, plan_path
+            ) VALUES (?, 'main', ?, ?, 'WORKING', ?, ?, ?)
+            """,
+            (
+                str(repo),
+                plan_sha,
+                plan_sha,
+                branch,
+                str(worktree),
+                plan.relative_to(repo).as_posix(),
+            ),
+        )
+        connection.commit()
+        return repo, state_dir, connection
+
+    def _run_reviews(
+        self,
+        directory: str,
+        reviewer_results: tuple[loop_manager.CodexResult, ...],
+        *,
+        publish: bool,
+    ) -> tuple[
+        loop_manager.ProjectRunResult,
+        list[int],
+        sqlite3.Row,
+    ]:
+        repo, state_dir, connection = self._active_worker_project(directory)
+        worker_levels: list[int] = []
+        worker_version = 1
+        responses = iter(reviewer_results)
+
+        def agent(worktree, _state, _config, role_name, _prompt, **kwargs):
+            nonlocal worker_version
+            if role_name == "worker":
+                worker_levels.append(kwargs["level"])
+                worker_version += 1
+                (worktree / "src/app.py").write_text(
+                    f"VALUE = {worker_version}\n", encoding="utf-8"
+                )
+                return loop_manager.CodexResult(
+                    0,
+                    worker_result(f"Record escalation {worker_version}"),
+                    "worker-session",
+                )
+            return next(responses)
+
+        pr_results: list[dict[str, str] | None] = [None] * len(reviewer_results)
+        if publish:
+            pr_results.append({"url": "https://example.test/pr/19"})
+        else:
+            pr_results.extend((None, None))
+
+        with mock.patch(
+            "loop_manager.validate_repository", return_value=repo
+        ), mock.patch(
+            "loop_manager.remote_base", return_value="main"
+        ), mock.patch(
+            "loop_manager.ensure_safe_base_worktree"
+        ), mock.patch(
+            "loop_manager.pr_for_branch", side_effect=pr_results
+        ), mock.patch(
+            "loop_manager.run_codex", side_effect=agent
+        ), mock.patch(
+            "loop_manager.verify", return_value=(True, "verify: PASS")
+        ):
+            result = loop_manager.run_project_result(
+                connection,
+                state_dir,
+                str(repo),
+                Path("unused.ini"),
+                "main",
+                False,
+            )
+
+        plan = connection.execute(
+            """
+            SELECT status, review_failure_history, initial_worker_level,
+                   effective_worker_level, review_level_history
+            FROM exec_plans
+            WHERE repo = ? AND plan_id = 'G-019'
+            """,
+            (str(repo),),
+        ).fetchone()
+        connection.close()
+        return result, worker_levels, plan
+
+    def test_new_execplan_stores_capped_initial_and_effective_level(self):
+        cases = (
+            ("low", "low", 1),
+            ("low", "critical", 4),
+            ("medium", "critical", 6),
+            ("high", "high", 7),
+            ("high", "critical", 7),
+        )
+        for complexity, risk, expected in cases:
+            with self.subTest(complexity=complexity, risk=risk):
+                self.assertEqual(
+                    loop_manager.worker_level(
+                        {"complexity": complexity, "risk": risk}
+                    ),
+                    expected,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_catalog_root(directory)
+            plan_path = write_execplan(
+                root,
+                "G-019",
+                "Review Escalation",
+                complexity="high",
+                risk="critical",
+            )
+            plan = loop_manager.validate_execplan(
+                root, plan_path.relative_to(root).as_posix()
+            )
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            loop_manager._ensure_execplans_schema(connection)
+            connection.execute(
+                "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+                (str(root),),
+            )
+            loop_manager.register_execplans(
+                connection,
+                str(root),
+                root,
+                [(plan_path.relative_to(root).as_posix(), plan)],
+                "plan-sha",
+                "planning-fingerprint",
+            )
+            stored = connection.execute(
+                """
+                SELECT initial_worker_level, effective_worker_level,
+                       review_level_history
+                FROM exec_plans WHERE repo = ? AND plan_id = 'G-019'
+                """,
+                (str(root),),
+            ).fetchone()
+            connection.close()
+
+        self.assertEqual(stored["initial_worker_level"], 7)
+        self.assertEqual(stored["effective_worker_level"], 7)
+        self.assertEqual(json.loads(stored["review_level_history"]), {})
+
+    def test_review_state_transition_escalates_one_level_and_caps_at_eight(self):
+        history: dict[str, dict[str, int]] = {}
+        effective_level = 1
+
+        for expected_level in range(2, 9):
+            fingerprint = f"same-at-{effective_level}"
+            first = loop_manager.evaluate_review_worker_level(
+                effective_level, history, (fingerprint,)
+            )
+            self.assertFalse(first.escalated)
+            second = loop_manager.evaluate_review_worker_level(
+                effective_level, first.review_history, (fingerprint,)
+            )
+            self.assertTrue(second.escalated)
+            self.assertEqual(second.effective_level, expected_level)
+            history = second.review_history
+            effective_level = second.effective_level
+
+        capped = loop_manager.evaluate_review_worker_level(
+            8, history, ("distinct-a", "distinct-b", "distinct-c")
+        )
+        self.assertFalse(capped.escalated)
+        self.assertEqual(capped.effective_level, 8)
+
+        distinct = loop_manager.evaluate_review_worker_level(
+            4, {}, ("issue-a", "issue-b", "issue-c")
+        )
+        self.assertTrue(distinct.escalated)
+        self.assertEqual(distinct.effective_level, 5)
+
+    def test_review_level_persists_with_global_history_and_blocked_reset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, state_dir, connection = self._level_state(
+                directory, initial_level=7
+            )
+            output = (
+                "ISSUE_ID: app.py::same-issue::blocking\n"
+                "Actionable issue\nVERDICT: FAIL"
+            )
+            first = loop_manager.transition_validation_failure(
+                connection, str(root), root, "review", output
+            )
+            connection.close()
+
+            reopened = loop_manager.connect_database(state_dir)
+            before = reopened.execute(
+                """
+                SELECT effective_worker_level, review_level_history
+                FROM exec_plans WHERE repo = ? AND plan_id = 'G-019'
+                """,
+                (str(root),),
+            ).fetchone()
+            self.assertEqual(before["effective_worker_level"], 7)
+            self.assertEqual(
+                json.loads(before["review_level_history"])["7"][first.fingerprint],
+                1,
+            )
+
+            second = loop_manager.transition_validation_failure(
+                reopened, str(root), root, "review", output
+            )
+            escalated = reopened.execute(
+                """
+                SELECT effective_worker_level, review_level_history,
+                       review_failure_history
+                FROM exec_plans WHERE repo = ? AND plan_id = 'G-019'
+                """,
+                (str(root),),
+            ).fetchone()
+            self.assertEqual(escalated["effective_worker_level"], 8)
+            self.assertEqual(
+                json.loads(escalated["review_level_history"])["7"][second.fingerprint],
+                2,
+            )
+            self.assertEqual(
+                json.loads(escalated["review_failure_history"])[second.fingerprint][
+                    "occurrences"
+                ],
+                2,
+            )
+
+            reopened.execute(
+                "UPDATE exec_plans SET status = 'BLOCKED' "
+                "WHERE repo = ? AND plan_id = 'G-019'",
+                (str(root),),
+            )
+            reopened.execute(
+                "UPDATE projects SET phase = 'BLOCKED' WHERE repo = ?",
+                (str(root),),
+            )
+            reopened.commit()
+            loop_manager._requeue_blocked_execplan(
+                reopened, str(root), "G-019"
+            )
+            reset = reopened.execute(
+                """
+                SELECT initial_worker_level, effective_worker_level,
+                       review_level_history, review_failure_history
+                FROM exec_plans WHERE repo = ? AND plan_id = 'G-019'
+                """,
+                (str(root),),
+            ).fetchone()
+            reopened.close()
+
+        self.assertEqual(reset["initial_worker_level"], 7)
+        self.assertEqual(reset["effective_worker_level"], 7)
+        self.assertEqual(json.loads(reset["review_level_history"]), {})
+        self.assertEqual(json.loads(reset["review_failure_history"]), {})
+
+    def test_verify_and_invalid_review_do_not_change_escalation_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, _state_dir, connection = self._level_state(
+                directory, initial_level=4
+            )
+            review = (
+                "ISSUE_ID: app.py::review-only::blocking\n"
+                "Actionable issue\nVERDICT: FAIL"
+            )
+            loop_manager.transition_validation_failure(
+                connection, str(root), root, "review", review
+            )
+            before = connection.execute(
+                """
+                SELECT effective_worker_level, review_level_history
+                FROM exec_plans WHERE repo = ? AND plan_id = 'G-019'
+                """,
+                (str(root),),
+            ).fetchone()
+
+            loop_manager.transition_validation_failure(
+                connection, str(root), root, "verify", "unit failure"
+            )
+            with self.assertRaises(loop_manager.ReviewerProtocolError):
+                loop_manager.transition_validation_failure(
+                    connection,
+                    str(root),
+                    root,
+                    "review",
+                    "VERDICT: FAIL",
+                )
+            after = connection.execute(
+                """
+                SELECT effective_worker_level, review_level_history
+                FROM exec_plans WHERE repo = ? AND plan_id = 'G-019'
+                """,
+                (str(root),),
+            ).fetchone()
+            connection.close()
+
+        self.assertEqual(before["effective_worker_level"], 4)
+        self.assertEqual(after["effective_worker_level"], 4)
+        self.assertEqual(after["review_level_history"], before["review_level_history"])
+
+    def test_worker_uses_escalated_level_only_after_second_matching_review(self):
+        issue = (
+            "ISSUE_ID: app.py::persistent-issue::blocking\n"
+            "Actionable issue\nVERDICT: FAIL"
+        )
+        reviews = (
+            loop_manager.CodexResult(0, issue, "reviewer-session"),
+            loop_manager.CodexResult(0, issue, "reviewer-session"),
+            loop_manager.CodexResult(0, "VERDICT: PASS", "reviewer-session"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result, worker_levels, plan = self._run_reviews(
+                directory, reviews, publish=True
+            )
+
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
+        self.assertEqual(worker_levels, [1, 1, 2])
+        self.assertEqual(plan["initial_worker_level"], 1)
+        self.assertEqual(plan["effective_worker_level"], 2)
+        self.assertEqual(json.loads(plan["review_failure_history"]), {})
+        level_history = json.loads(plan["review_level_history"])
+        self.assertEqual(sorted(level_history["1"].values()), [2])
+
+    def test_reviewer_cli_failure_does_not_escalate_worker(self):
+        reviews = (
+            loop_manager.CodexResult(
+                1,
+                "configuration failed",
+                "reviewer-session",
+                loop_manager.AgentResultKind.PERMANENT_CONFIGURATION,
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result, worker_levels, plan = self._run_reviews(
+                directory, reviews, publish=False
+            )
+
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
+        self.assertEqual(worker_levels, [1])
+        self.assertEqual(plan["effective_worker_level"], 1)
+        self.assertEqual(json.loads(plan["review_level_history"]), {})
+        self.assertEqual(json.loads(plan["review_failure_history"]), {})
+
+    def test_codex_and_claude_level_eight_profiles_share_validation_boundary(self):
+        config = loop_manager.ROOT / "config/config.ini.example"
+        with mock.patch(
+            "loop_manager.codex_model_efforts",
+            return_value={"gpt-6-astra": frozenset({"low"})},
+        ):
+            self.assertEqual(
+                loop_manager.worker_profile(config, 8),
+                ("gpt-6-astra", "low"),
+            )
+        self.assertEqual(
+            loop_manager.provider_worker_profile(
+                config,
+                "claude",
+                8,
+                {"claude-opus-5": frozenset({"max"})},
+            ),
+            ("claude-opus-5", "max"),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch(
+                "loop_manager.codex_model_efforts",
+                return_value={"gpt-6-astra": frozenset({"medium"})},
+            ), mock.patch("loop_manager.subprocess.run") as subprocess_run:
+                with self.assertRaisesRegex(RuntimeError, "지원하지 않습니다"):
+                    loop_manager.run_codex(
+                        Path(directory) / "worktree",
+                        Path(directory) / "state",
+                        config,
+                        "worker",
+                        "prompt",
+                        read_only=False,
+                        level=8,
+                    )
+            subprocess_run.assert_not_called()
+
+        invalid_profiles = (
+            (
+                "codex-alias",
+                "[codex.models]\nfrontier = gpt-6-astra\nstrong = gpt-5.6-sol\n"
+                "[codex.worker]\nlevel8 = strong,low\n",
+                "codex",
+                {"gpt-5.6-sol": frozenset({"low"})},
+                "frontier,low",
+            ),
+            (
+                "claude-alias",
+                "[claude.models]\nstrong = claude-opus-5\nfast = claude-haiku\n"
+                "[claude.worker]\nlevel8 = fast,max\n",
+                "claude",
+                {"claude-haiku": frozenset({"max"})},
+                "strong,max",
+            ),
+            (
+                "claude-family",
+                "[claude.models]\nstrong = claude-fable-5\n"
+                "[claude.worker]\nlevel8 = strong,max\n",
+                "claude",
+                {"claude-fable-5": frozenset({"max"})},
+                "claude-opus-5",
+            ),
+            (
+                "unsupported-effort",
+                "[codex.models]\nfrontier = gpt-6-astra\n"
+                "[codex.worker]\nlevel8 = frontier,low\n",
+                "codex",
+                {"gpt-6-astra": frozenset({"medium"})},
+                "지원하지 않습니다",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            for name, contents, provider, catalog, message in invalid_profiles:
+                with self.subTest(name=name):
+                    profile_config = Path(directory) / f"{name}.ini"
+                    profile_config.write_text(contents, encoding="utf-8")
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        loop_manager.provider_worker_profile(
+                            profile_config, provider, 8, catalog
+                        )
 
 
 class WorkerPublicationTest(unittest.TestCase):

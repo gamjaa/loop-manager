@@ -136,7 +136,7 @@
 15. push된 commit을 확인한 뒤에만 각 ExecPlan을 SQLite에 READY 상태로 등록하고 planning worktree와 기존 `planning_error`를 정리한다
 16. 모든 `depends_on`이 MERGED인 READY ExecPlan 중 제품 우선순위가 가장 높은 계획 하나를 결정적으로 선택한다
 17. 갱신된 `origin/<base-branch>`에서 해당 ExecPlan 전용 branch와 worktree를 생성하거나 기존 작업 공간을 복구한다
-18. 프로그램이 complexity와 risk를 Worker level로 환산해 Model과 Effort를 결정한다
+18. 프로그램이 complexity와 risk로 최초 Worker level 1~7을 계산하고 저장된 effective level의 Model과 Effort를 선택한다
 19. Worker가 구현, 관련 테스트와 전체 검증 스크립트를 작성하거나 갱신한다
 20. Requirement 구현으로 장기 제품 규칙이 바뀌면 Worker가 같은 PR의 `PRODUCT.md`를 갱신한다
 21. 프로그램이 최신 원격 기준 branch를 rebase로 반영한다
@@ -165,7 +165,9 @@ ExecPlan 게시 실패:
 3. 전체 검증과 Review 출력을 결정적으로 정규화해 단계별 실패 지문과 발생 횟수를 SQLite에 저장한다
 4. 새로운 실패 지문이 나타나는 동안에는 총 실패 횟수와 관계없이 같은 프로그램 실행에서 Worker 수정, 전체 검증과 Review를 계속한다
 5. 같은 지문이 Worker 수정 후 세 번 다시 발생하면 원인과 지문을 기록하고 ExecPlan을 BLOCKED로 변경하며, 중간에 다른 지문이 발생해도 이전 이력을 유지한다
-6. 전체 검증 성공은 verify 지문 이력만, Review 성공은 Review 지문 이력만 초기화한다
+6. 유효한 Review FAIL이 같은 effective level에서 동일 지문으로 두 번 확인되거나 서로 다른 지문 세 개로 확인되면 다음 Worker 수정부터 level을 한 단계 올리며 level 8을 상한으로 한다
+7. 전체 verify 실패, Worker 결과 형식 오류, Reviewer 실행 오류와 유효한 FAIL이 없는 결과는 effective level과 Review 승격 이력을 변경하지 않는다
+8. 전체 검증 성공은 verify 지문 이력만, Review 성공은 Review 지문 이력만 초기화하며 effective level과 level별 승격 이력은 유지한다
 
 외부 CLI 실패:
 - 실행 실패, timeout 또는 일시적 외부 오류는 현재 프로그램 실행에서 최대 3회까지 재시도한다
@@ -182,7 +184,7 @@ ExecPlan 게시 실패:
 1. BLOCKED 알림에 원인, ExecPlan 경로와 근거 문서 경로를 포함한다
 2. 사용자가 ExecPlan 또는 근거가 된 PRODUCT/Requirement를 수정한다
 3. 프로그램이 저장된 내용 해시와 현재 내용을 비교한다
-4. 내용이 변경됐으면 재시도 횟수와 verify·Review 실패 지문 이력을 초기화하고 ExecPlan을 READY로 변경한다
+4. 내용이 변경됐으면 재시도 횟수와 verify·Review 실패 지문 이력을 초기화하고 effective Worker level과 승격 이력을 최초 level로 되돌린 뒤 ExecPlan을 READY로 변경한다
 5. 내용이 바뀌지 않았으면 BLOCKED 상태를 유지한다
 
 ### 사용자 승인 및 완료
@@ -299,6 +301,10 @@ BLOCKED → PR_OPEN (같은 PR을 사용자가 다시 열음)
 - 프로그램은 risk를 low=0, medium=1, high=2, critical=3으로 환산한다
 - 두 점수의 합을 최대 7로 제한해 `level1`부터 `level7`까지의 Worker level로 사용한다
 - 정확한 Model 이름과 Effort는 `config/config.ini`에서 관리한다
+- 최초 Worker level 계산은 level 8을 반환하지 않는다
+- 유효한 Review FAIL의 저장된 반복 진행만 effective level을 한 단계씩 올릴 수 있으며 한 ExecPlan 안에서는 level을 낮추지 않는다
+- Codex level 8은 `gpt-6-astra,low`, Claude level 8은 Opus strong alias의 `max`를 사용하고 level 8보다 높은 자동 profile은 없다
+- effective level과 level별 Review 승격 이력은 SQLite에 저장하고 새 ExecPlan 또는 정상적인 BLOCKED 해제에서 최초 level로 초기화한다
 
 ### PR 생성 조건
 
