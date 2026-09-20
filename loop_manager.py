@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 import configparser
 import contextlib
 import difflib
@@ -217,6 +218,7 @@ class ProjectRunKind(str, Enum):
     BLOCKED = "blocked"
     TRANSIENT_PAUSE = "transient_pause"
     USAGE_LIMIT_PAUSE = "usage_limit_pause"
+    CONFIGURATION_ERROR = "configuration_error"
     OPERATIONAL_ERROR = "operational_error"
 
 
@@ -225,6 +227,12 @@ class ProjectRunResult:
     kind: ProjectRunKind
     exit_code: int
     detail: str | None = None
+
+
+@dataclass(frozen=True)
+class ScheduledProjectResult:
+    repo: str
+    result: ProjectRunResult
 
 
 @dataclass(frozen=True)
@@ -827,8 +835,9 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
         raise RuntimeError(
             "상태 DB가 없습니다. 먼저 `loop_manager.py config init`을 실행하세요."
         )
-    connection = sqlite3.connect(database)
+    connection = sqlite3.connect(database, timeout=30.0)
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout = 30000")
     if create:
         connection.execute(SCHEMA)
         project_registry.ensure_registry_schema(connection)
@@ -8172,6 +8181,7 @@ def _run_project_step(
     allow_agents_mismatch: bool,
     requested_provider: str | None = None,
     registered_only: bool = False,
+    planner_mutex: threading.Lock | None = None,
 ) -> int:
     # Resolve the persisted project key without consulting repository config.
     # An interrupted Agent may have changed origin or hooksPath, so the saved
@@ -8673,28 +8683,30 @@ def _run_project_step(
                 planning_worktree,
                 "planner",
             )
-            result = run_agent_with_retries(
-                lambda current_session_id, _session_recovery: run_agent(
-                    provider,
-                    planning_worktree,
-                    state_dir,
-                    config_path,
-                    "planner",
-                    planner_prompt(
-                        row["planning_validation_error"] or row["last_error"],
-                        compact_execplan_catalog(connection, repo),
+            planner_guard = planner_mutex or contextlib.nullcontext()
+            with planner_guard:
+                result = run_agent_with_retries(
+                    lambda current_session_id, _session_recovery: run_agent(
+                        provider,
+                        planning_worktree,
+                        state_dir,
+                        config_path,
+                        "planner",
+                        planner_prompt(
+                            row["planning_validation_error"] or row["last_error"],
+                            compact_execplan_catalog(connection, repo),
+                        ),
+                        read_only=False,
+                        persist_session=True,
+                        session_id=current_session_id,
+                        on_session_started=lambda started_session_id: update_project(
+                            connection,
+                            repo,
+                            planner_session_id=started_session_id,
+                        ),
                     ),
-                    read_only=False,
-                    persist_session=True,
-                    session_id=current_session_id,
-                    on_session_started=lambda started_session_id: update_project(
-                        connection,
-                        repo,
-                        planner_session_id=started_session_id,
-                    ),
-                ),
-                session_id=row["planner_session_id"],
-            )
+                    session_id=row["planner_session_id"],
+                )
             code, message = result
             result_session_id = getattr(result, "session_id", None)
             if result_session_id:
@@ -10007,6 +10019,7 @@ def run_project_result(
     requested_provider: str | None = None,
     *,
     registered_only: bool = False,
+    planner_mutex: threading.Lock | None = None,
 ) -> ProjectRunResult:
     """Run retryable validation progress to a stable project-level outcome."""
 
@@ -10020,6 +10033,7 @@ def run_project_result(
             allow_agents_mismatch,
             requested_provider,
             registered_only,
+            planner_mutex,
         )
         if step_result != PROJECT_STEP_RETRY:
             break
@@ -10061,6 +10075,7 @@ def run_project(
     requested_provider: str | None = None,
     *,
     registered_only: bool = False,
+    planner_mutex: threading.Lock | None = None,
 ) -> int:
     """CLI-compatible adapter for the reusable structured project result."""
 
@@ -10073,7 +10088,81 @@ def run_project(
         allow_agents_mismatch,
         requested_provider,
         registered_only=registered_only,
+        planner_mutex=planner_mutex,
     ).exit_code
+
+
+def _run_registered_project(
+    project: project_registry.RegisteredProject,
+    state_dir: Path,
+    config_path: Path,
+    planner_mutex: threading.Lock,
+) -> ScheduledProjectResult:
+    """Run one registry row with state isolated to this worker connection."""
+
+    try:
+        with connect_database(state_dir) as connection:
+            result = run_project_result(
+                connection,
+                state_dir,
+                project.repo,
+                config_path,
+                None,
+                False,
+                registered_only=True,
+                planner_mutex=planner_mutex,
+            )
+    except (ManagedConfigError, project_registry.ProjectRegistryError) as error:
+        result = ProjectRunResult(
+            ProjectRunKind.CONFIGURATION_ERROR,
+            1,
+            str(error),
+        )
+        operation_log(
+            f"프로젝트 설정 실패 ({project.repo}): {error}",
+            error=True,
+        )
+    except Exception as error:
+        result = ProjectRunResult(
+            ProjectRunKind.OPERATIONAL_ERROR,
+            1,
+            str(error),
+        )
+        operation_log(
+            f"프로젝트 처리 실패 ({project.repo}): {error}",
+            error=True,
+        )
+    return ScheduledProjectResult(project.repo, result)
+
+
+def schedule_registered_projects(
+    connection: sqlite3.Connection,
+    state_dir: Path,
+    config: ManagedConfig,
+) -> tuple[ScheduledProjectResult, ...]:
+    """Run each registered project once with bounded cross-project concurrency."""
+
+    projects = project_registry.list_projects(connection)
+    if not projects:
+        return ()
+
+    planner_mutex = threading.Lock()
+    worker_count = min(config.max_workers, len(projects))
+    with ThreadPoolExecutor(
+        max_workers=worker_count,
+        thread_name_prefix="loop-project",
+    ) as pool:
+        futures = tuple(
+            pool.submit(
+                _run_registered_project,
+                project,
+                state_dir,
+                config.path,
+                planner_mutex,
+            )
+            for project in projects
+        )
+        return tuple(future.result() for future in futures)
 
 
 def run_registered_projects(
@@ -10081,26 +10170,10 @@ def run_registered_projects(
     state_dir: Path,
     config: ManagedConfig,
 ) -> int:
-    """Run registered projects serially until the concurrent scheduler is added."""
+    """Run all registered projects and aggregate outcomes after every worker exits."""
 
-    projects = project_registry.list_projects(connection)
-    if not projects:
-        raise RuntimeError(
-            "등록된 프로젝트가 없습니다. `loop_manager.py config add <path>`로 등록하세요."
-        )
-    for project in projects:
-        result = run_project(
-            connection,
-            state_dir,
-            project.repo,
-            config.path,
-            None,
-            False,
-            registered_only=True,
-        )
-        if result:
-            return result
-    return 0
+    results = schedule_registered_projects(connection, state_dir, config)
+    return 1 if any(item.result.exit_code for item in results) else 0
 
 
 def configure_registry(
