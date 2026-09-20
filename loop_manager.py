@@ -5258,6 +5258,7 @@ def _update_blocked_error(
             "UPDATE projects SET last_error = ? WHERE repo = ?",
             (error, repo),
         )
+        notifications.enqueue_current_project_events(connection, repo)
 
 
 def block_active_execplan(

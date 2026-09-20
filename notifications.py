@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS notification_outbox (
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    delivery_started_at TEXT,
     sent_at TEXT,
     FOREIGN KEY (repo) REFERENCES projects(repo)
 )
@@ -38,6 +39,14 @@ CREATE TABLE IF NOT EXISTS project_completion_cycles (
 
 def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.execute(OUTBOX_SCHEMA)
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(notification_outbox)")
+    }
+    if "delivery_started_at" not in columns:
+        connection.execute(
+            "ALTER TABLE notification_outbox ADD COLUMN delivery_started_at TEXT"
+        )
     connection.execute(COMPLETION_SCHEMA)
 
 
@@ -298,26 +307,38 @@ def dispatch_pending(
     ensure_schema(connection)
     rows = connection.execute(
         "SELECT event_key, event_type, payload FROM notification_outbox "
-        "WHERE sent_at IS NULL ORDER BY created_at, event_key"
+        "WHERE sent_at IS NULL AND delivery_started_at IS NULL "
+        "ORDER BY created_at, event_key"
     ).fetchall()
     sent = 0
     for row in rows:
+        with connection:
+            claimed = connection.execute(
+                "UPDATE notification_outbox "
+                "SET attempts = attempts + 1, last_error = NULL, "
+                "delivery_started_at = CURRENT_TIMESTAMP "
+                "WHERE event_key = ? AND sent_at IS NULL "
+                "AND delivery_started_at IS NULL",
+                (row[0],),
+            ).rowcount
+        if claimed != 1:
+            continue
         try:
             adapter(token, chat_id, _message(str(row[1]), json.loads(str(row[2]))))
         except Exception as error:
             failure = f"Telegram delivery failed ({type(error).__name__})"
             with connection:
                 connection.execute(
-                    "UPDATE notification_outbox SET attempts = attempts + 1, "
+                    "UPDATE notification_outbox SET delivery_started_at = NULL, "
                     "last_error = ? WHERE event_key = ? AND sent_at IS NULL",
                     (failure, row[0]),
                 )
             continue
         with connection:
             connection.execute(
-                "UPDATE notification_outbox SET attempts = attempts + 1, "
-                "last_error = NULL, sent_at = CURRENT_TIMESTAMP "
-                "WHERE event_key = ? AND sent_at IS NULL",
+                "UPDATE notification_outbox SET last_error = NULL, "
+                "sent_at = CURRENT_TIMESTAMP WHERE event_key = ? "
+                "AND sent_at IS NULL AND delivery_started_at IS NOT NULL",
                 (row[0],),
             )
         sent += 1

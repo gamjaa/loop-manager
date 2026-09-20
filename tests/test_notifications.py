@@ -11,8 +11,13 @@ import notifications
 
 
 class NotificationFixture:
-    def connection(self, *, enabled: bool = True) -> sqlite3.Connection:
-        connection = sqlite3.connect(":memory:")
+    def connection(
+        self,
+        *,
+        enabled: bool = True,
+        database: str | Path = ":memory:",
+    ) -> sqlite3.Connection:
+        connection = sqlite3.connect(database)
         connection.row_factory = sqlite3.Row
         connection.execute(loop_manager.SCHEMA)
         loop_manager._ensure_execplans_schema(connection)
@@ -115,6 +120,42 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
             [path, "docs/PRODUCT.md"],
         )
 
+    def test_blocked_error_update_enqueues_each_new_cause_once(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        path = "docs/plans/[G-018] Reliable notices.md"
+        loop_manager.update_project(
+            connection,
+            repo,
+            phase="BLOCKED",
+            plan_path=path,
+            last_error="Initial user action",
+        )
+
+        loop_manager._update_blocked_error(
+            connection,
+            repo,
+            "G-018",
+            "Different recovery action",
+        )
+        loop_manager._update_blocked_error(
+            connection,
+            repo,
+            "G-018",
+            "Different recovery action",
+        )
+
+        causes = {
+            json.loads(row["payload"])["cause"]
+            for row in self.events(connection)
+            if row["event_type"] == "blocked"
+        }
+        self.assertEqual(
+            causes,
+            {"Initial user action", "Different recovery action"},
+        )
+
+
     def test_planning_blocked_payload_lists_basis_documents(self):
         connection = self.connection()
         loop_manager.update_project(
@@ -154,6 +195,7 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
         )
         pending = self.events(connection)[0]
         self.assertIsNone(pending["sent_at"])
+        self.assertIsNone(pending["delivery_started_at"])
         self.assertEqual(pending["attempts"], 1)
         self.assertNotIn(token, pending["last_error"])
         self.assertNotIn(chat_id, pending["last_error"])
@@ -174,6 +216,54 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
         delivered.assert_called_once()
         self.assertNotIn(token, delivered.call_args.args[2])
         self.assertNotIn(chat_id, delivered.call_args.args[2])
+
+    def test_interruption_after_delivery_claim_is_not_sent_again(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "state.db"
+            connection = self.connection(database=database)
+            loop_manager.update_project(
+                connection,
+                "/projects/alpha",
+                phase="PR_OPEN",
+                plan_path="docs/plans/[G-018] Reliable notices.md",
+                pr_url="https://example.test/pr/18",
+            )
+            delivered = []
+
+            def deliver_then_interrupt(_token, _chat_id, text):
+                delivered.append(text)
+                raise KeyboardInterrupt("process interrupted after delivery")
+
+            with self.assertRaisesRegex(KeyboardInterrupt, "process interrupted"):
+                notifications.dispatch_pending(
+                    connection,
+                    "token",
+                    "chat",
+                    adapter=deliver_then_interrupt,
+                )
+            connection.close()
+
+            restarted = sqlite3.connect(database)
+            restarted.row_factory = sqlite3.Row
+            notifications.ensure_schema(restarted)
+            claimed = self.events(restarted)[0]
+            self.assertEqual(claimed["attempts"], 1)
+            self.assertIsNotNone(claimed["delivery_started_at"])
+            self.assertIsNone(claimed["sent_at"])
+
+            restarted_adapter = mock.Mock()
+            self.assertEqual(
+                notifications.dispatch_pending(
+                    restarted,
+                    "token",
+                    "chat",
+                    adapter=restarted_adapter,
+                ),
+                0,
+            )
+            restarted_adapter.assert_not_called()
+            restarted.close()
+        self.assertEqual(len(delivered), 1)
 
     def test_scheduler_retries_pending_when_project_processing_is_skipped(self):
         connection = self.connection()
