@@ -29,6 +29,7 @@ from typing import Protocol
 from urllib.parse import quote
 
 from managed_config import ManagedConfig, ManagedConfigError, load_managed_config
+import notifications
 import project_registry
 
 
@@ -843,6 +844,7 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
         project_registry.ensure_registry_schema(connection)
         _ensure_execplans_schema(connection)
         _ensure_cleanup_pending_schema(connection)
+        notifications.ensure_schema(connection)
         connection.commit()
     else:
         try:
@@ -891,6 +893,7 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
     project_registry.ensure_registry_schema(connection)
     _ensure_execplans_schema(connection)
     _ensure_cleanup_pending_schema(connection)
+    notifications.ensure_schema(connection)
     connection.commit()
     # Repository-aware migrations belong in run_project, after persisted Agent
     # config has been checked against its pre-invocation snapshot.
@@ -909,6 +912,7 @@ def update_project(connection: sqlite3.Connection, repo: str, **values: object) 
         [*values.values(), repo],
     )
     _mirror_project_update_to_execplan(connection, repo, current, values)
+    notifications.enqueue_current_project_events(connection, repo)
     connection.commit()
 
 
@@ -995,6 +999,7 @@ def backfill_plan_shas(
                     row["repo"],
                 ),
             )
+            notifications.enqueue_current_project_events(connection, str(row["repo"]))
     connection.commit()
 
 
@@ -5328,6 +5333,7 @@ def block_active_execplan(
             """,
             (error, verify_result, agent_result_snapshot, agent_result_plan, repo),
         )
+        notifications.enqueue_current_project_events(connection, repo)
 
 
 def transition_validation_failure(
@@ -5455,6 +5461,8 @@ def transition_validation_failure(
             f"UPDATE projects SET {', '.join(project_assignments)} WHERE repo = ?",
             (*project_values, repo),
         )
+        if blocked:
+            notifications.enqueue_current_project_events(connection, repo)
     return ValidationFailureDecision(
         stage,
         fingerprint,
@@ -5506,6 +5514,7 @@ def block_active_execplan_from_revision(
             (error, verify_result, preserved_agent_result_snapshot, repo),
         )
 
+        notifications.enqueue_current_project_events(connection, repo)
 
 def block_persisted_agent_scope_violation(
     connection: sqlite3.Connection,
@@ -7247,7 +7256,7 @@ def complete_merged_worktree(
     branch = str(project["branch"] or "")
     _ensure_execplans_schema(connection)
     plan = connection.execute(
-        "SELECT branch, worktree, workspace_owned FROM exec_plans "
+        "SELECT branch, worktree, workspace_owned, title FROM exec_plans "
         "WHERE repo = ? AND plan_id = ?",
         (repo, plan_id),
     ).fetchone()
@@ -7313,6 +7322,7 @@ def complete_merged_worktree(
                 "UPDATE exec_plans SET status = 'MERGED', last_error = NULL WHERE repo = ? AND plan_id = ?",
                 (repo, plan_id),
             )
+            notifications.record_merged_plan(connection, repo, plan_id, str(plan["title"]))
         unfinished = connection.execute(
             "SELECT 1 FROM exec_plans "
             "WHERE repo = ? AND status != 'MERGED' LIMIT 1",
@@ -10128,6 +10138,7 @@ def run_project_result(
     ).fetchone()
     if unfinished is not None:
         return ProjectRunResult(ProjectRunKind.WAITING, 0, detail)
+    notifications.enqueue_completion_if_ready(connection, repo)
     return ProjectRunResult(ProjectRunKind.COMPLETED, 0, detail)
 
 
@@ -10162,12 +10173,16 @@ def _run_registered_project(
     project: project_registry.RegisteredProject,
     state_dir: Path,
     config_path: Path,
+    notifications_enabled: bool,
     planner_mutex: threading.Lock,
 ) -> ScheduledProjectResult:
     """Run one registry row with state isolated to this worker connection."""
 
     try:
         with connect_database(state_dir) as connection:
+            notifications.configure_session(
+                connection, enabled=notifications_enabled
+            )
             result = run_project_result(
                 connection,
                 state_dir,
@@ -10224,6 +10239,7 @@ def schedule_registered_projects(
                 project,
                 state_dir,
                 config.path,
+                config.telegram_enabled,
                 planner_mutex,
             )
             for project in projects
@@ -10238,7 +10254,23 @@ def run_registered_projects(
 ) -> int:
     """Run all registered projects and aggregate outcomes after every worker exits."""
 
+    try:
+        notifications.dispatch_pending(
+            connection, config.telegram_token, config.telegram_chat_id
+        )
+    except Exception as error:
+        operation_log(
+            f"알림 재시도 실패 ({type(error).__name__})", error=True
+        )
     results = schedule_registered_projects(connection, state_dir, config)
+    try:
+        notifications.dispatch_pending(
+            connection, config.telegram_token, config.telegram_chat_id
+        )
+    except Exception as error:
+        operation_log(
+            f"알림 재시도 실패 ({type(error).__name__})", error=True
+        )
     return 1 if any(item.result.exit_code for item in results) else 0
 
 
