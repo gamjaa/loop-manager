@@ -3,6 +3,7 @@ import json
 import io
 import os
 import datetime
+import contextlib
 import shutil
 import sqlite3
 import subprocess
@@ -10368,8 +10369,9 @@ class TimestampedExecutionProgressLogsTest(unittest.TestCase):
 
     def test_skip_if_running_only_silences_lock_contention(self):
         state_dir = Path("state")
-        with mock.patch("sys.argv", ["loop_manager.py", "run", "repo", "--skip-if-running"]), mock.patch("loop_manager.state_directory", return_value=state_dir), mock.patch("loop_manager.process_lock", side_effect=loop_manager.ProcessLockBusyError("busy")), mock.patch("builtins.print") as output:
+        with mock.patch("sys.argv", ["loop_manager.py", "run", "repo", "--skip-if-running"]), mock.patch("loop_manager.state_directory", return_value=state_dir), mock.patch("loop_manager.process_lock", side_effect=loop_manager.ProcessLockBusyError("busy")), mock.patch("loop_manager.update_source_checkout_after_success") as update, mock.patch("builtins.print") as output:
             self.assertEqual(loop_manager.main(), 0)
+        update.assert_not_called()
         output.assert_not_called()
         with mock.patch("sys.argv", ["loop_manager.py", "run", "repo"]), mock.patch("loop_manager.state_directory", return_value=state_dir), mock.patch("loop_manager.process_lock", side_effect=loop_manager.ProcessLockBusyError("busy")), mock.patch("builtins.print") as output:
             self.assertEqual(loop_manager.main(), 1)
@@ -10390,6 +10392,116 @@ class TimestampedExecutionProgressLogsTest(unittest.TestCase):
                         pass
 
         self.assertEqual(raised.exception.errno, loop_manager.errno.ENOLCK)
+
+    def test_successful_run_updates_source_before_releasing_process_lock(self):
+        events = []
+
+        @contextlib.contextmanager
+        def locked():
+            events.append("lock")
+            try:
+                yield
+            finally:
+                events.append("unlock")
+
+        @contextlib.contextmanager
+        def database():
+            events.append("database")
+            try:
+                yield object()
+            finally:
+                events.append("database-closed")
+
+        with mock.patch(
+            "sys.argv", ["loop_manager.py", "run", "repo"]
+        ), mock.patch(
+            "loop_manager.state_directory", return_value=Path("state")
+        ), mock.patch(
+            "loop_manager.process_lock", return_value=locked()
+        ), mock.patch(
+            "loop_manager.connect_database", return_value=database()
+        ), mock.patch(
+            "loop_manager.run_project", return_value=0
+        ), mock.patch(
+            "loop_manager.update_source_checkout_after_success",
+            side_effect=lambda: events.append("update"),
+        ) as update:
+            self.assertEqual(loop_manager.main(), 0)
+
+        update.assert_called_once_with()
+        self.assertEqual(
+            events,
+            ["lock", "database", "database-closed", "update", "unlock"],
+        )
+
+    def test_failed_run_does_not_update_source(self):
+        with mock.patch(
+            "sys.argv", ["loop_manager.py", "run", "repo"]
+        ), mock.patch(
+            "loop_manager.state_directory", return_value=Path("state")
+        ), mock.patch(
+            "loop_manager.process_lock"
+        ), mock.patch(
+            "loop_manager.connect_database"
+        ), mock.patch(
+            "loop_manager.run_project", return_value=1
+        ), mock.patch(
+            "loop_manager.update_source_checkout_after_success"
+        ) as update:
+            self.assertEqual(loop_manager.main(), 1)
+
+        update.assert_not_called()
+
+    def test_source_update_failure_changes_successful_run_exit_code(self):
+        with mock.patch(
+            "sys.argv", ["loop_manager.py", "run", "repo"]
+        ), mock.patch(
+            "loop_manager.state_directory", return_value=Path("state")
+        ), mock.patch(
+            "loop_manager.process_lock"
+        ), mock.patch(
+            "loop_manager.connect_database"
+        ), mock.patch(
+            "loop_manager.run_project", return_value=0
+        ), mock.patch(
+            "loop_manager.update_source_checkout_after_success",
+            side_effect=RuntimeError("fetch failed"),
+        ), mock.patch("loop_manager.operation_log") as output:
+            self.assertEqual(loop_manager.main(), 1)
+
+        output.assert_called_once_with("오류: fetch failed", error=True)
+
+    def test_source_update_fast_forwards_only_clean_main(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = make_remote_repository(directory)
+            writer = root / "writer"
+            git_command(root, "clone", str(root / "remote.git"), str(writer))
+            git_command(writer, "config", "user.email", "writer@example.com")
+            git_command(writer, "config", "user.name", "Writer")
+            (writer / "src/app.py").write_text("VALUE = 2\n", encoding="utf-8")
+            commit_and_push(writer, "Advance origin")
+            expected = git_command(writer, "rev-parse", "HEAD")
+
+            with mock.patch("loop_manager.operation_print") as output:
+                self.assertTrue(
+                    loop_manager.update_source_checkout_after_success(source)
+                )
+                output.assert_called_once_with(
+                    f"Loop Manager 업데이트 완료: {expected}"
+                )
+
+                (writer / "src/app.py").write_text(
+                    "VALUE = 3\n", encoding="utf-8"
+                )
+                commit_and_push(writer, "Advance origin again")
+                (source / "local.txt").write_text("keep\n", encoding="utf-8")
+                self.assertFalse(
+                    loop_manager.update_source_checkout_after_success(source)
+                )
+
+            self.assertEqual(git_command(source, "rev-parse", "HEAD"), expected)
+            self.assertEqual((source / "local.txt").read_text(), "keep\n")
 
     def test_bash_launcher_skips_git_and_preserves_run_arguments(self):
         with tempfile.TemporaryDirectory() as directory:

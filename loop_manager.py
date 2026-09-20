@@ -664,6 +664,114 @@ def process_lock(state_dir: Path):
         handle.close()
 
 
+def update_source_checkout_after_success(source: Path = ROOT) -> bool:
+    """Fast-forward a clean source main after a successful locked run."""
+
+    branch = git(
+        source,
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        "HEAD",
+        check=False,
+    )
+    if branch.returncode != 0 or branch.stdout.strip() != "main":
+        return False
+    status = git(
+        source,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        check=False,
+    )
+    if status.returncode:
+        raise RuntimeError(
+            "Loop Manager source checkout 상태 확인 실패:\n"
+            f"{status.stdout[-8000:]}"
+        )
+    if status.stdout.strip():
+        return False
+
+    local_before = git(source, "rev-parse", "refs/heads/main").stdout.strip()
+    fetched = git(source, "fetch", "origin", check=False)
+    if fetched.returncode:
+        raise RuntimeError(
+            "Loop Manager source checkout fetch 실패:\n"
+            f"{fetched.stdout[-8000:]}"
+        )
+
+    branch_after = git(
+        source,
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        "HEAD",
+        check=False,
+    )
+    status_after = git(
+        source,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        check=False,
+    )
+    local_after = git(source, "rev-parse", "refs/heads/main").stdout.strip()
+    if status_after.returncode:
+        raise RuntimeError(
+            "Loop Manager source checkout fetch 후 상태 확인 실패:\n"
+            f"{status_after.stdout[-8000:]}"
+        )
+    if (
+        branch_after.returncode != 0
+        or branch_after.stdout.strip() != "main"
+        or status_after.stdout.strip()
+        or local_after != local_before
+    ):
+        return False
+
+    remote = git(
+        source,
+        "rev-parse",
+        "refs/remotes/origin/main",
+    ).stdout.strip()
+    if local_after == remote:
+        return False
+    ancestor = git(
+        source,
+        "merge-base",
+        "--is-ancestor",
+        local_after,
+        remote,
+        check=False,
+    )
+    if ancestor.returncode == 1:
+        return False
+    if ancestor.returncode:
+        raise RuntimeError(
+            "Loop Manager source checkout fast-forward 가능 여부 확인 실패:\n"
+            f"{ancestor.stdout[-8000:]}"
+        )
+
+    updated = git(
+        source,
+        "merge",
+        "--ff-only",
+        remote,
+        check=False,
+    )
+    if updated.returncode:
+        raise RuntimeError(
+            "Loop Manager source checkout fast-forward 실패:\n"
+            f"{updated.stdout[-8000:]}"
+        )
+    if git(source, "rev-parse", "HEAD").stdout.strip() != remote:
+        raise RuntimeError(
+            "Loop Manager source checkout fast-forward 결과를 확인할 수 없습니다."
+        )
+    operation_print(f"Loop Manager 업데이트 완료: {remote}")
+    return True
+
+
 def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
     connection.execute(EXEC_PLANS_SCHEMA)
     columns = {row[1] for row in connection.execute("PRAGMA table_info(exec_plans)")}
@@ -9838,7 +9946,7 @@ def main() -> int:
                 operation_print(f"상태 DB 초기화 완료: {state_dir / 'loop-manager.db'}")
                 return 0
             with connect_database(state_dir) as connection:
-                return run_project(
+                result = run_project(
                     connection,
                     state_dir,
                     args.repository,
@@ -9847,6 +9955,9 @@ def main() -> int:
                     args.allow_agents_mismatch,
                     args.provider,
                 )
+            if result == 0:
+                update_source_checkout_after_success()
+            return result
     except ProcessLockBusyError as error:
         if args.command == "run" and args.skip_if_running:
             return 0
