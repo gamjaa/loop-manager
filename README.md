@@ -112,7 +112,7 @@ Planner가 만든 ExecPlan은 검증 후 대상 저장소의 base branch에 fast
 
 진행 중인 ExecPlan이나 해결되지 않은 `planning_error`가 없는 프로젝트는 `config remove <path>`로 등록만 해제할 수 있다. 프로젝트 파일, branch, worktree, PR과 MERGED 감사 이력은 삭제하지 않는다.
 
-그다음 저장소 인자 없이 반복 실행한다. 실행기는 registry에 저장된 프로젝트를 결정적 순서로 처리한다.
+그다음 저장소 인자 없이 반복 실행한다. 실행기는 registry에 저장된 프로젝트를 결정적 순서로 제출하고 `max_workers` 한도에서 서로 다른 프로젝트를 병렬 처리한다. 프로젝트마다 독립된 SQLite 연결을 사용하며, 같은 프로젝트의 작업은 하나만 진행하고 Planner 호출은 전체 프로세스에서 하나씩 실행한다. 한 프로젝트가 차단되거나 일시 실패해도 나머지 프로젝트 처리는 계속된다.
 
 ```powershell
 & .\.venv\Scripts\python.exe loop_manager.py run

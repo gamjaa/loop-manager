@@ -8,6 +8,8 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
@@ -10358,6 +10360,331 @@ class LatestBasePublicationTest(unittest.TestCase):
                     self.assertEqual(outcome, 0)
                     self.assertEqual(plan["status"], "MERGED")
                     self.assertFalse(worktree.exists())
+
+
+class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
+    def _scheduler_state(
+        self,
+        directory: str,
+        project_names: tuple[str, ...],
+        *,
+        max_workers: int,
+    ) -> tuple[Path, sqlite3.Connection, loop_manager.ManagedConfig, tuple[str, ...]]:
+        state_dir = Path(directory) / "state"
+        state_dir.mkdir()
+        connection = loop_manager.connect_database(state_dir, create=True)
+        repos = tuple(
+            str((Path(directory) / project_name).resolve())
+            for project_name in project_names
+        )
+        connection.executemany(
+            "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+            ((repo,) for repo in repos),
+        )
+        connection.commit()
+        config = loop_manager.ManagedConfig(
+            path=Path(directory) / "config.ini",
+            max_workers=max_workers,
+            telegram_token="",
+            telegram_chat_id="",
+        )
+        return state_dir, connection, config, repos
+
+    def test_worker_pool_bounds_parallel_projects_and_isolates_connections(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir, connection, config, repos = self._scheduler_state(
+                directory,
+                ("repo-0", "repo-1", "repo-2", "repo-3"),
+                max_workers=2,
+            )
+            guard = threading.Lock()
+            both_workers_started = threading.Event()
+            connections: list[sqlite3.Connection] = []
+            thread_ids: set[int] = set()
+            planner_mutex_ids: set[int] = set()
+            active_workers = 0
+            maximum_workers = 0
+            active_planners = 0
+            maximum_planners = 0
+
+            def run_one(
+                worker_connection,
+                _state_dir,
+                repo,
+                _config_path,
+                _requested_base,
+                _allow_agents_mismatch,
+                *,
+                registered_only,
+                planner_mutex,
+            ):
+                nonlocal active_workers, maximum_workers
+                nonlocal active_planners, maximum_planners
+                self.assertTrue(registered_only)
+                with guard:
+                    connections.append(worker_connection)
+                    thread_ids.add(threading.get_ident())
+                    planner_mutex_ids.add(id(planner_mutex))
+                    active_workers += 1
+                    maximum_workers = max(maximum_workers, active_workers)
+                    if active_workers == config.max_workers:
+                        both_workers_started.set()
+                self.assertTrue(both_workers_started.wait(timeout=1))
+                with planner_mutex:
+                    with guard:
+                        active_planners += 1
+                        maximum_planners = max(
+                            maximum_planners, active_planners
+                        )
+                    time.sleep(0.02)
+                    with guard:
+                        active_planners -= 1
+                worker_connection.execute(
+                    "UPDATE projects SET last_error = ? WHERE repo = ?",
+                    (Path(repo).name, repo),
+                )
+                worker_connection.commit()
+                with guard:
+                    active_workers -= 1
+                return loop_manager.ProjectRunResult(
+                    loop_manager.ProjectRunKind.WAITING,
+                    0,
+                )
+
+            try:
+                with mock.patch(
+                    "loop_manager.run_project_result",
+                    side_effect=run_one,
+                ):
+                    outcomes = loop_manager.schedule_registered_projects(
+                        connection,
+                        state_dir,
+                        config,
+                    )
+                stored = dict(
+                    connection.execute(
+                        "SELECT repo, last_error FROM projects ORDER BY repo"
+                    ).fetchall()
+                )
+            finally:
+                connection.close()
+
+        self.assertEqual(tuple(item.repo for item in outcomes), repos)
+        self.assertEqual(maximum_workers, config.max_workers)
+        self.assertGreaterEqual(len(thread_ids), 2)
+        self.assertEqual(maximum_planners, 1)
+        self.assertEqual(len(planner_mutex_ids), 1)
+        self.assertEqual(len({id(item) for item in connections}), len(repos))
+        self.assertNotIn(id(connection), {id(item) for item in connections})
+        self.assertEqual(
+            stored,
+            {repo: Path(repo).name for repo in repos},
+        )
+
+    def test_project_failures_are_classified_without_cancelling_peers(self):
+        names = (
+            "blocked",
+            "quota",
+            "transient",
+            "configuration",
+            "dirty",
+            "healthy",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir, connection, config, repos = self._scheduler_state(
+                directory,
+                names,
+                max_workers=3,
+            )
+            calls: list[str] = []
+            guard = threading.Lock()
+
+            def run_one(
+                _connection,
+                _state_dir,
+                repo,
+                _config_path,
+                _requested_base,
+                _allow_agents_mismatch,
+                **_kwargs,
+            ):
+                name = Path(repo).name
+                with guard:
+                    calls.append(name)
+                if name == "dirty":
+                    raise RuntimeError("unsafe base worktree")
+                if name == "configuration":
+                    raise loop_manager.ManagedConfigError("invalid managed config")
+                results = {
+                    "blocked": loop_manager.ProjectRunResult(
+                        loop_manager.ProjectRunKind.BLOCKED, 1, "blocked"
+                    ),
+                    "quota": loop_manager.ProjectRunResult(
+                        loop_manager.ProjectRunKind.USAGE_LIMIT_PAUSE, 0, "quota"
+                    ),
+                    "transient": loop_manager.ProjectRunResult(
+                        loop_manager.ProjectRunKind.TRANSIENT_PAUSE, 0, "retry"
+                    ),
+                    "healthy": loop_manager.ProjectRunResult(
+                        loop_manager.ProjectRunKind.COMPLETED, 0
+                    ),
+                }
+                return results[name]
+
+            try:
+                with mock.patch(
+                    "loop_manager.run_project_result",
+                    side_effect=run_one,
+                ), mock.patch("loop_manager.operation_log"):
+                    outcomes = loop_manager.schedule_registered_projects(
+                        connection,
+                        state_dir,
+                        config,
+                    )
+                by_name = {
+                    Path(item.repo).name: item.result.kind for item in outcomes
+                }
+                with mock.patch(
+                    "loop_manager.schedule_registered_projects",
+                    return_value=outcomes,
+                ):
+                    exit_code = loop_manager.run_registered_projects(
+                        connection,
+                        state_dir,
+                        config,
+                    )
+            finally:
+                connection.close()
+
+        self.assertEqual(set(calls), set(names))
+        self.assertEqual(
+            by_name,
+            {
+                "blocked": loop_manager.ProjectRunKind.BLOCKED,
+                "quota": loop_manager.ProjectRunKind.USAGE_LIMIT_PAUSE,
+                "transient": loop_manager.ProjectRunKind.TRANSIENT_PAUSE,
+                "configuration": loop_manager.ProjectRunKind.CONFIGURATION_ERROR,
+                "dirty": loop_manager.ProjectRunKind.OPERATIONAL_ERROR,
+                "healthy": loop_manager.ProjectRunKind.COMPLETED,
+            },
+        )
+        self.assertEqual(exit_code, 1)
+
+    def test_zero_one_and_nonfatal_project_sets_exit_successfully(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir, connection, config, _repos = self._scheduler_state(
+                directory,
+                (),
+                max_workers=3,
+            )
+            try:
+                self.assertEqual(
+                    loop_manager.schedule_registered_projects(
+                        connection, state_dir, config
+                    ),
+                    (),
+                )
+                self.assertEqual(
+                    loop_manager.run_registered_projects(
+                        connection, state_dir, config
+                    ),
+                    0,
+                )
+                single_repo = str((Path(directory) / "single").resolve())
+                connection.execute(
+                    "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+                    (single_repo,),
+                )
+                connection.commit()
+                with mock.patch(
+                    "loop_manager.run_project_result",
+                    return_value=loop_manager.ProjectRunResult(
+                        loop_manager.ProjectRunKind.WAITING, 0
+                    ),
+                ):
+                    single = loop_manager.schedule_registered_projects(
+                        connection, state_dir, config
+                    )
+                self.assertEqual(tuple(item.repo for item in single), (single_repo,))
+
+                pauses = (
+                    loop_manager.ScheduledProjectResult(
+                        "quota",
+                        loop_manager.ProjectRunResult(
+                            loop_manager.ProjectRunKind.USAGE_LIMIT_PAUSE, 0
+                        ),
+                    ),
+                    loop_manager.ScheduledProjectResult(
+                        "waiting",
+                        loop_manager.ProjectRunResult(
+                            loop_manager.ProjectRunKind.WAITING, 0
+                        ),
+                    ),
+                )
+                with mock.patch(
+                    "loop_manager.schedule_registered_projects",
+                    return_value=pauses,
+                ):
+                    self.assertEqual(
+                        loop_manager.run_registered_projects(
+                            connection, state_dir, config
+                        ),
+                        0,
+                    )
+            finally:
+                connection.close()
+
+
+    def test_one_project_selects_only_the_ready_dependency_priority_winner(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute(loop_manager.SCHEMA)
+        loop_manager._ensure_execplans_schema(connection)
+        connection.execute(
+            "INSERT INTO projects (repo, base_branch) VALUES ('repo', 'main')"
+        )
+        plans = (
+            ("G-001", "normal", ()),
+            ("G-002", "critical", ("G-099",)),
+            ("G-003", "high", ()),
+            ("G-004", "high", ()),
+            ("G-099", "low", ()),
+        )
+        connection.executemany(
+            """
+            INSERT INTO exec_plans (
+                repo, plan_id, path, title, sources, depends_on, priority,
+                content_hash, status
+            ) VALUES ('repo', ?, ?, ?, '["docs/PRODUCT.md"]', ?, ?, 'hash', 'READY')
+            """,
+            (
+                (
+                    plan_id,
+                    f"docs/plans/[{plan_id}] Plan.md",
+                    plan_id,
+                    json.dumps(depends_on),
+                    priority,
+                )
+                for plan_id, priority, depends_on in plans
+            ),
+        )
+        connection.commit()
+
+        selected = loop_manager.select_ready_execplan(connection, "repo")
+        self.assertEqual(selected["plan_id"], "G-003")
+        connection.execute(
+            "UPDATE exec_plans SET status = 'IMPLEMENTING' "
+            "WHERE repo = 'repo' AND plan_id = 'G-003'"
+        )
+        connection.commit()
+        self.assertIsNone(loop_manager.select_ready_execplan(connection, "repo"))
+        with self.assertRaises(sqlite3.IntegrityError):
+            with connection:
+                connection.execute(
+                    "UPDATE exec_plans SET status = 'IMPLEMENTING' "
+                    "WHERE repo = 'repo' AND plan_id = 'G-004'"
+                )
+        connection.close()
 
 
 class TimestampedExecutionProgressLogsTest(unittest.TestCase):
