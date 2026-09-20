@@ -10461,8 +10461,20 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
         }
 
         loop_manager.validate_provider_profiles(config, "codex", codex_models)
-        claude_models = loop_manager.claude_model_efforts(config)
+        supported = subprocess.CompletedProcess(
+            ["claude", "--init-only"], 0, stdout=""
+        )
+        with mock.patch(
+            "loop_manager.command", return_value=supported
+        ) as capability_command:
+            claude_models = loop_manager.claude_model_efforts(config)
         loop_manager.validate_provider_profiles(config, "claude", claude_models)
+        self.assertTrue(
+            any(
+                "--init-only" in call.args[0]
+                for call in capability_command.call_args_list
+            )
+        )
 
         self.assertEqual(
             loop_manager.provider_worker_profile(
@@ -10511,6 +10523,52 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
 
         run.assert_not_called()
 
+    def test_claude_catalog_rejects_cli_unsupported_model_and_effort(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.ini"
+            config.write_text(
+                "[claude.models]\nstrong = claude-opus-999\n"
+                "[claude.roles]\nplanner = strong,high\n",
+                encoding="utf-8",
+            )
+
+            def reject_model(arguments, **_kwargs):
+                return subprocess.CompletedProcess(
+                    arguments,
+                    1 if "claude-opus-999" in arguments else 0,
+                    stdout="Unknown model",
+                )
+
+            with mock.patch(
+                "loop_manager.command", side_effect=reject_model
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "Model.*claude-opus-999"
+                ):
+                    loop_manager.claude_model_efforts(config, root)
+
+            config.write_text(
+                "[claude.models]\nstrong = claude-opus-5\n"
+                "[claude.roles]\nplanner = strong,max\n",
+                encoding="utf-8",
+            )
+
+            def reject_effort(arguments, **_kwargs):
+                return subprocess.CompletedProcess(
+                    arguments,
+                    1 if "--effort" in arguments else 0,
+                    stdout="Effort max is unavailable for this model",
+                )
+
+            with mock.patch(
+                "loop_manager.command", side_effect=reject_effort
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "Model/Effort.*claude-opus-5,max"
+                ):
+                    loop_manager.claude_model_efforts(config, root)
+
     def test_runtime_validation_rejects_missing_and_unauthenticated_cli(self):
         config = loop_manager.ROOT / "config/config.ini.example"
         with mock.patch("loop_manager.shutil.which", return_value=None), mock.patch(
@@ -10543,8 +10601,14 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
         ) as auth_command:
             loop_manager.validate_provider_runtime(config, "claude")
         self.assertEqual(
-            auth_command.call_args.args[0],
+            auth_command.call_args_list[0].args[0],
             ["claude", "auth", "status"],
+        )
+        self.assertTrue(
+            any(
+                "--init-only" in call.args[0]
+                for call in auth_command.call_args_list[1:]
+            )
         )
 
     def test_claude_starts_resumes_and_applies_role_permissions(self):
@@ -10706,6 +10770,109 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
         self.assertEqual(
             timed_out.result_kind,
             loop_manager.AgentResultKind.TRANSIENT_FAILURE,
+        )
+
+    def test_claude_stream_errors_preserve_output_for_classification_and_retry(self):
+        config = loop_manager.ROOT / "config/config.ini.example"
+
+        class StreamOutput:
+            def __init__(self, raw_output):
+                self.raw_output = raw_output
+
+            def __iter__(self):
+                return iter(self.raw_output.splitlines(keepends=True))
+
+            def close(self):
+                pass
+
+        class StreamProcess:
+            def __init__(self, raw_output, returncode):
+                self.stdin = mock.Mock()
+                self.stdout = StreamOutput(raw_output)
+                self.returncode = returncode
+
+            def wait(self):
+                return self.returncode
+
+            def kill(self):
+                raise AssertionError("completed Claude process must not be killed")
+
+        success_stream = (
+            json.dumps({"type": "system", "session_id": "fresh-session"})
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "result",
+                    "session_id": "fresh-session",
+                    "result": worker_result("Recovered after transient error"),
+                    "is_error": False,
+                }
+            )
+            + "\n"
+        )
+        process_results = iter(
+            [
+                ("service unavailable\n", 1),
+                (success_stream, 0),
+            ]
+        )
+
+        def start_process(*_args, **_kwargs):
+            raw_output, returncode = next(process_results)
+            return StreamProcess(raw_output, returncode)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worktree = root / "worktree"
+            worktree.mkdir()
+            state_dir = root / "state"
+            with mock.patch(
+                "loop_manager.claude_worker_profile",
+                return_value=("claude-sonnet-5", "high"),
+            ), mock.patch(
+                "loop_manager.subprocess.Popen", side_effect=start_process
+            ) as popen:
+
+                def invoke(_session_id, _fallback):
+                    return loop_manager.run_claude(
+                        worktree,
+                        state_dir,
+                        config,
+                        "worker",
+                        "prompt",
+                        read_only=False,
+                        level=5,
+                        persist_session=True,
+                    )
+
+                recovered = loop_manager.run_agent_with_retries(
+                    invoke, session_id=None
+                )
+
+                malformed = '{"type": BROKEN "usage limit reached"\n'
+                with mock.patch(
+                    "loop_manager.subprocess.Popen",
+                    return_value=StreamProcess(malformed, 1),
+                ):
+                    limited = loop_manager.run_claude(
+                        worktree,
+                        state_dir,
+                        config,
+                        "worker",
+                        "prompt",
+                        read_only=False,
+                        level=5,
+                        persist_session=True,
+                    )
+
+        self.assertEqual(popen.call_count, 2)
+        self.assertEqual(recovered.session_id, "fresh-session")
+        self.assertEqual(
+            limited.message, '{"type": BROKEN "usage limit reached"'
+        )
+        self.assertEqual(
+            limited.result_kind,
+            loop_manager.AgentResultKind.USAGE_LIMIT,
         )
 
     def test_provider_dispatch_and_environment_strip_manager_secrets(self):

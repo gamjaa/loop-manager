@@ -2063,8 +2063,11 @@ def worker_profile(
     )
 
 
-def claude_model_efforts(config_path: Path) -> dict[str, frozenset[str]]:
-    """Build the locally valid Claude model catalog from configured aliases."""
+def claude_model_efforts(
+    config_path: Path,
+    worktree: Path | None = None,
+) -> dict[str, frozenset[str]]:
+    """Build a catalog from configured profiles that the Claude CLI accepts."""
 
     parser = configparser.ConfigParser()
     try:
@@ -2078,20 +2081,93 @@ def claude_model_efforts(config_path: Path) -> dict[str, frozenset[str]]:
     if "claude.models" not in parser:
         raise RuntimeError("Claude Model alias section [claude.models]가 없습니다.")
 
-    catalog: dict[str, frozenset[str]] = {}
-    for model in parser["claude.models"].values():
-        resolved = model.strip()
-        if not re.fullmatch(r"claude-(?:opus|sonnet|haiku)-[a-z0-9.-]+", resolved):
+    aliases: dict[str, str] = {}
+    try:
+        configured_models = parser["claude.models"].items()
+        for alias, model in configured_models:
+            resolved = model.strip()
+            if not re.fullmatch(
+                r"claude-(?:opus|sonnet|haiku)-[a-z0-9.-]+", resolved
+            ):
+                raise RuntimeError(
+                    "Claude CLI가 지원하는 Model 이름 형식이 아닙니다: "
+                    f"{resolved or '<empty>'}"
+                )
+            aliases[alias] = resolved
+    except configparser.InterpolationError as error:
+        raise RuntimeError("Claude Model alias 설정 값 형식이 올바르지 않습니다.") from error
+
+    configured_pairs: set[tuple[str, str]] = set()
+    for section in ("claude.roles", "claude.worker"):
+        if section not in parser:
+            continue
+        for name in parser[section]:
+            try:
+                parts = [
+                    part.strip() for part in parser[section][name].split(",")
+                ]
+            except configparser.InterpolationError as error:
+                raise RuntimeError(
+                    f"Claude 설정 값 형식이 올바르지 않습니다: [{section}] {name}"
+                ) from error
+            if len(parts) != 2:
+                continue
+            alias, effort = parts
+            model = aliases.get(alias)
+            if model is None or not effort:
+                continue
+            if effort not in CLAUDE_EFFORTS:
+                raise RuntimeError(
+                    "Claude Model/Effort 조합을 Claude CLI가 지원하지 않습니다: "
+                    f"{model},{effort}"
+                )
+            configured_pairs.add((model, effort))
+
+    environment = agent_environment("claude")
+    for model in sorted(set(aliases.values())):
+        result = command(
+            ["claude", "--bare", "--init-only", "--model", model],
+            cwd=worktree,
+            check=False,
+            env=environment,
+        )
+        if result.returncode:
+            raise RuntimeError(f"Claude CLI가 Model을 지원하지 않습니다: {model}")
+
+    catalog: dict[str, set[str]] = {
+        model: set() for model in set(aliases.values())
+    }
+    for model, effort in sorted(configured_pairs):
+        result = command(
+            [
+                "claude",
+                "--bare",
+                "--init-only",
+                "--model",
+                model,
+                "--effort",
+                effort,
+            ],
+            cwd=worktree,
+            check=False,
+            env=environment,
+        )
+        if result.returncode:
             raise RuntimeError(
-                f"Claude CLI가 지원하는 Model 이름 형식이 아닙니다: {resolved or '<empty>'}"
+                "Claude CLI가 Model/Effort 조합을 지원하지 않습니다: "
+                f"{model},{effort}"
             )
-        catalog[resolved] = CLAUDE_EFFORTS
-    return catalog
+        catalog[model].add(effort)
+
+    return {
+        model: frozenset(efforts) for model, efforts in catalog.items()
+    }
 
 
 def claude_role(
     config_path: Path,
     name: str,
+    worktree: Path | None = None,
 ) -> tuple[str, str]:
     return provider_profile(
         config_path,
@@ -2099,19 +2175,20 @@ def claude_role(
         "claude.roles",
         name,
         f"Claude {name}",
-        claude_model_efforts(config_path),
+        claude_model_efforts(config_path, worktree),
     )
 
 
 def claude_worker_profile(
     config_path: Path,
     level: int,
+    worktree: Path | None = None,
 ) -> tuple[str, str]:
     return provider_worker_profile(
         config_path,
         "claude",
         level,
-        claude_model_efforts(config_path),
+        claude_model_efforts(config_path, worktree),
     )
 
 
@@ -2330,7 +2407,9 @@ def _agent_profile(
         if provider == "codex":
             return AgentProfile(*worker_profile(config_path, level, worktree))
         if provider == "claude":
-            return AgentProfile(*claude_worker_profile(config_path, level))
+            return AgentProfile(
+                *claude_worker_profile(config_path, level, worktree)
+            )
     elif level is not None:
         raise RuntimeError(
             f"{provider.capitalize()} {role_name}에 Worker level을 지정할 수 없습니다."
@@ -2338,7 +2417,7 @@ def _agent_profile(
     elif provider == "codex":
         return AgentProfile(*role(config_path, role_name, worktree))
     elif provider == "claude":
-        return AgentProfile(*claude_role(config_path, role_name))
+        return AgentProfile(*claude_role(config_path, role_name, worktree))
     raise RuntimeError(f"지원하지 않는 Agent provider입니다: {provider}")
 
 
@@ -2397,7 +2476,7 @@ def validate_provider_runtime(
         model_efforts = (
             codex_model_efforts(worktree)
             if provider == "codex"
-            else claude_model_efforts(config_path)
+            else claude_model_efforts(config_path, worktree)
         )
         validate_provider_profiles(config_path, provider, model_efforts)
     except RuntimeError as error:
@@ -2432,6 +2511,11 @@ def _claude_result_message(event: Mapping[str, object]) -> str:
                 for block in content
                 if isinstance(block, Mapping) and block.get("type") == "text"
             )
+    error = event.get("error")
+    if isinstance(error, str):
+        return error
+    if isinstance(error, Mapping) and isinstance(error.get("message"), str):
+        return str(error["message"])
     return ""
 
 
@@ -2483,6 +2567,8 @@ def run_claude(
 
     if streaming:
         final_event: Mapping[str, object] = {}
+        stream_error_message = ""
+        diagnostic_tail = ""
         with log.open("w", encoding="utf-8") as output:
             process = subprocess.Popen(
                 arguments,
@@ -2520,9 +2606,19 @@ def run_claude(
                     try:
                         event = json.loads(line)
                     except json.JSONDecodeError:
+                        diagnostic_tail = (diagnostic_tail + line)[-6000:]
                         continue
                     if not isinstance(event, dict):
                         continue
+                    if event.get("is_error") or event.get("type") == "error":
+                        candidate = _claude_result_message(event)
+                        if candidate:
+                            stream_error_message = candidate
+                    if event.get("is_error") or event.get("type") in {
+                        "error",
+                        "result",
+                    }:
+                        diagnostic_tail = (diagnostic_tail + line)[-6000:]
                     event_session = event.get("session_id")
                     if (
                         resolved_session_id is None
@@ -2545,9 +2641,11 @@ def run_claude(
             finally:
                 timeout.cancel()
                 process.stdout.close()
-        message = _claude_result_message(final_event)
+        message = _claude_result_message(final_event) or stream_error_message
         if final_event.get("is_error") and returncode == 0:
             returncode = 1
+        if returncode and not message:
+            message = diagnostic_tail
     else:
         result = subprocess.run(
             arguments,
