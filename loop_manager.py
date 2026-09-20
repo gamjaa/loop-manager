@@ -5506,11 +5506,12 @@ def block_persisted_agent_scope_violation(
     """Persist a pre-resume scope violation without discarding Agent state."""
 
     message = f"Agent 범위 선검증 실패:\n{detail}"
-    preserved_snapshot = (
-        result_snapshot.serialize()
-        if result_snapshot is not None
-        else str(row["agent_snapshot"])
-    )
+    if result_snapshot is not None:
+        preserved_snapshot = result_snapshot.serialize()
+    elif row["agent_result_snapshot"]:
+        preserved_snapshot = str(row["agent_result_snapshot"])
+    else:
+        preserved_snapshot = str(row["agent_snapshot"])
     plan = active_execplan(connection, repo)
     if plan is None:
         if row["phase"] == "PLANNING":

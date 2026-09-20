@@ -86,3 +86,4 @@ Loop Manager의 시작, 프로젝트 등록과 자동 실행을 immutable `origi
 - launcher pull 제거는 반복 차단을 즉시 멈추는 안전 hotfix로 먼저 적용했다. runtime bootstrap과 origin-only 프로젝트 실행은 G-016이 MERGED된 뒤 이 계획의 나머지 범위에서 구현한다.
 - 2026-09-20 사용자 결정: pinned runtime Merge 전에는 lock을 실제 획득해 정상 종료한 실행만 lock 해제 직전에 clean source `main`을 fast-forward하는 임시 updater를 허용한다. G-022는 아직 `READY`이고 구현 branch가 없으므로, 최종 runtime 전환에서 이 임시 경로를 제거하는 조건을 본 계획에 추가한다.
 - 2026-09-20 운영 hotfix: Agent 실행 중 사용자 기본 worktree와 base refs의 독립 변경을 허용하되 관리 worktree와 Loop Manager 소유 branch 검사는 유지한다. Codex가 자체 생성·정리하는 `refs/codex/turn-diffs/`는 과거에 저장된 snapshot에도 적용되도록 비교 단계에서 제외한다.
+- 같은 BLOCKED Agent를 선검증하다 새 결과 snapshot을 만들지 못한 경우에는 이미 저장된 Agent 결과를 유지한다. 시작 snapshot으로 대체해 보존된 Worker 변경의 귀속을 잃지 않는다.
