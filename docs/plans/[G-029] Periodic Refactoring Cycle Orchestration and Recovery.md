@@ -17,7 +17,7 @@ G-027의 주기 상태와 G-028의 제한된 plan revision/publication 경계를
 
 ## Acceptance Criteria
 
-- 프로젝트에 IMPLEMENTING, VERIFYING, REVIEWING, PUBLISHING, PR_OPEN 또는 BLOCKED ExecPlan이 있으면 유지보수 평가나 다른 Worker를 시작하지 않고 기존 상태를 먼저 처리·대기·복구한다.
+- 이 계획이 도입되는 단계에서는 프로젝트에 IMPLEMENTING, VERIFYING, REVIEWING, PUBLISHING, PR_OPEN 또는 BLOCKED ExecPlan이 있으면 유지보수 평가나 다른 Worker를 시작하지 않고 기존 상태를 먼저 처리·대기·복구한다. G-031이 Merge된 뒤에는 안정된 `PR_OPEN`이 유지보수 평가는 계속 막되 독립 READY Worker의 실행 자리는 점유하지 않는다.
 - 활성 작업이 없는 선택 경계에서 G-027이 최초 평가 또는 interval 도래를 판정하면 READY 존재와 동일 계획 입력 지문에 관계없이 일반 READY 선택 전에 유지보수 Planner를 정확히 한 주기 실행한다.
 - 주기 미도달이면 G-024의 READY 소진 우선 및 planning fingerprint gate가 그대로 적용되고 유지보수만을 위한 Planner 호출을 만들지 않는다.
 - READY가 남은 유지보수 호출은 구조 평가, 기존 비종료 계획과의 중복 확인, prerequisite 집합 결정 또는 리팩터링 장벽 구성만 수행하며 새 일반 기능 계획을 만들거나 기존 계획의 제품 목표·sources·ID를 바꾸지 않는다.
@@ -76,3 +76,4 @@ G-027의 주기 상태와 G-028의 제한된 plan revision/publication 경계를
 - 리팩터링 즉시 실행은 priority 값을 왜곡하지 않고 활성 유지보수 주기의 explicit selection override로 구현한다.
 - prerequisite 집합과 refactoring DAG는 서로 다른 단계다. 전자는 최신 코드 확보 전 임시 실행 gate이고 후자는 구체적인 구조 문제가 최신 코드에서 확정된 뒤에만 게시한다.
 - 사후 재검증 성공 전에는 장벽 뒤 계획이 최신 구조를 안전하게 반영했다고 볼 수 없으므로 프로젝트 완료와 Worker activation을 모두 막는다.
+- R-001의 Merge 대기 비점유 정책은 G-026 충돌 복구와 이 계획의 최종 scheduler 경계가 준비된 뒤 G-031에서 활성화한다. 이 계획만으로 여러 Open PR을 허용하지 않는다.

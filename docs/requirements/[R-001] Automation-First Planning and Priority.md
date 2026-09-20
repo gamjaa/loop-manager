@@ -10,9 +10,11 @@ Planner가 중복을 피하기 위해 누적된 모든 ExecPlan 본문을 매번
 
 ## Requirement
 
-Loop Manager는 진행 중인 ExecPlan이 있으면 해당 상태를 먼저 이어서 처리해야 한다. 진행 중인 작업이 없으면 의존성을 충족한 READY ExecPlan을 선택해 실행하고, 남아 있는 READY ExecPlan이 하나도 없을 때만 Planner를 한 번 실행해야 한다. READY ExecPlan이 남아 있는 동안에는 계획 입력이 변경됐더라도 Planner를 먼저 실행하지 않는다.
+Loop Manager는 저장소를 변경하는 실행 단계의 ExecPlan이 있으면 해당 상태를 먼저 이어서 처리해야 한다. Merge만 기다리는 안정된 `PR_OPEN` ExecPlan은 완료되지 않은 계획으로 유지하되 프로젝트의 실행 자리를 점유하지 않는다. 모든 Open PR의 상태를 먼저 동기화한 뒤 충돌 복구가 필요하지 않고 실행 중인 변경 작업도 없으면, Open PR에 직접 또는 간접 의존하지 않는 READY ExecPlan을 선택해 실행한다. 같은 프로젝트에서 Worker·verify·Review·게시 또는 PR 충돌 복구는 항상 하나만 실행하지만, Merge를 기다리는 PR은 여러 개 존재할 수 있다.
 
-예외적으로 주기적 리팩터링 평가가 도래한 프로젝트는 진행 중인 작업이 끝난 다음 READY 선택 전에 유지보수 Planner를 실행할 수 있다. 이 호출은 현재 구조에서 리팩터링 필요성을 확인하고 아직 시작하지 않은 READY 계획 사이에 dependency 장벽을 구성하거나, 리팩터링 Merge 뒤 장벽 뒤 계획을 최신 구조에 맞게 재검증하는 범위로 제한한다. 일반적인 새 제품 입력을 계획하거나 활성·Merge 대기·BLOCKED 계획을 수정하기 위한 우회로 사용하지 않는다.
+진행 중인 변경 작업이 없으면 의존성을 충족한 READY ExecPlan을 선택해 실행하고, 남아 있는 READY ExecPlan과 `PR_OPEN` ExecPlan이 모두 없을 때만 Planner를 한 번 실행해야 한다. READY 또는 `PR_OPEN` ExecPlan이 남아 있는 동안에는 계획 입력이 변경됐더라도 Planner를 먼저 실행하지 않는다. `PR_OPEN`에 의존하는 READY 계획은 선행 PR의 Merge가 확인될 때까지 선택하지 않는다.
+
+예외적으로 주기적 리팩터링 평가가 도래한 프로젝트는 진행 중인 작업이 끝나고 `PR_OPEN`, `PLAN_BLOCKED`와 `PROJECT_BLOCKED`가 없을 때 READY 선택 전에 유지보수 Planner를 실행할 수 있다. 이 호출은 현재 구조에서 리팩터링 필요성을 확인하고 아직 시작하지 않은 READY 계획 사이에 dependency 장벽을 구성하거나, 리팩터링 Merge 뒤 장벽 뒤 계획을 최신 구조에 맞게 재검증하는 범위로 제한한다. 일반적인 새 제품 입력을 계획하거나 활성·Merge 대기·차단 계획을 수정하기 위한 우회로 사용하지 않는다.
 
 Planner는 기존 카탈로그와 현재 입력을 대조해 현재 식별 가능한 모든 미충족 작업을 독립적으로 검증하고 Merge할 수 있는 ExecPlan으로 일괄 작성해야 한다. 유효한 계획을 만들거나 추가 계획이 없다는 정상 결과로 종료하면 해당 원격 저장소 입력 지문을 저장한다. 이후 같은 입력 지문에서는 READY 계획이 없어도 Planner를 다시 호출하지 않으며, 계획 입력에 해당하는 원격 저장소 내용이 바뀐 경우에만 새 계획 주기를 허용한다. 주기적 유지보수 Planner가 기존 READY 카탈로그 앞에 리팩터링 장벽을 삽입하는 경우에는 새 일반 기능 계획을 같은 batch에 추가하지 않고, 리팩터링과 사후 READY 재검증이 끝난 뒤 최신 코드에서 일반 계획 주기를 다시 판단한다.
 
@@ -29,17 +31,20 @@ Loop Manager 코드는 AI를 사용하지 않고 ExecPlan frontmatter와 SQLite 
 
 ## Acceptance Criteria
 
-- IMPLEMENTING, VERIFYING, REVIEWING, PUBLISHING, PR_OPEN 또는 BLOCKED 상태의 현재 ExecPlan이 있으면 새 Planner나 다른 Worker를 시작하지 않고 해당 상태의 처리·대기·복구를 먼저 이어간다.
-- 현재 ExecPlan이 없고 의존성을 충족한 READY ExecPlan이 있으면 주기적 유지보수 평가 또는 사후 재검증이 도래한 경우를 제외하고 Planner보다 해당 계획을 먼저 선택해 Worker를 시작한다.
+- IMPLEMENTING, VERIFYING, REVIEWING, PUBLISHING 또는 PR 충돌 복구 상태의 현재 ExecPlan이 있으면 새 Planner나 다른 Worker를 시작하지 않고 해당 상태의 처리·복구를 먼저 이어간다.
+- 다음 Worker를 선택하기 전에 모든 `PR_OPEN` ExecPlan을 조회해 Merge, Close와 충돌 여부를 동기화한다. Merge된 계획은 MERGED로 전이하고, Merge 없이 닫힌 계획과 충돌 복구가 필요한 계획은 해당 계획의 상태 전이 및 복구를 먼저 처리한다.
+- Merge만 기다리는 `PR_OPEN` ExecPlan은 프로젝트의 실행 자리를 점유하지 않는다. 실행 중인 변경 단계나 복구가 없으면 직접·간접 dependency에 MERGED가 아닌 계획을 포함하지 않는 READY ExecPlan 하나를 기존 우선순위로 실행한다.
+- 같은 프로젝트에서는 Worker·verify·Review·게시 및 PR 충돌 복구를 합쳐 한 번에 하나만 실행한다. 이 단일 실행 규칙을 유지하면서 여러 ExecPlan이 동시에 안정된 `PR_OPEN` 상태로 Merge를 기다릴 수 있다.
+- 현재 변경 실행이 없고 의존성을 충족한 READY ExecPlan이 있으면 주기적 유지보수 평가 또는 사후 재검증이 도래한 경우를 제외하고 Planner보다 해당 계획을 먼저 선택해 Worker를 시작한다.
 - 남아 있는 READY ExecPlan이 하나라도 있으면 일반 계획 입력 변경만을 이유로 Planner를 실행하지 않는다.
-- READY ExecPlan은 남아 있지만 모두 `depends_on`을 충족하지 못한 경우 이를 READY가 없는 상태로 취급하지 않으며, 도래한 유지보수 평가·재검증 외의 Planner를 실행하지 않는다.
-- 주기적 리팩터링 평가가 도래하고 현재 ExecPlan이 없으면 READY 존재 여부와 관계없이 다음 Worker 선택 전에 유지보수 Planner를 한 번 실행한다.
+- READY ExecPlan은 남아 있지만 모두 `depends_on`을 충족하지 못한 경우 이를 READY가 없는 상태로 취급하지 않으며 일반 Planner를 실행하지 않는다. `PR_OPEN`, `PLAN_BLOCKED` 또는 `PROJECT_BLOCKED`가 함께 있으면 유지보수 Planner도 실행하지 않는다.
+- 주기적 리팩터링 평가가 도래하고 현재 변경 실행, `PR_OPEN`, `PLAN_BLOCKED`와 `PROJECT_BLOCKED`가 모두 없으면 READY 존재 여부와 관계없이 다음 Worker 선택 전에 유지보수 Planner를 한 번 실행한다.
 - 유지보수 Planner는 branch, worktree, Agent 세션과 PR이 없는 READY 계획만 R-012의 dependency 장벽 구성 또는 사후 구조 재검증 범위에서 수정할 수 있다.
 - 리팩터링 전에 기존 READY 구현이 필요하면 최소 dependency-closed 선행 집합만 처리한 뒤 최신 코드에서 다시 평가하고, 리팩터링 계획을 미리 확정하지 않는다.
 - 새 리팩터링 계획과 READY dependency 변경은 전체 카탈로그를 검증한 하나의 계획 commit으로 게시하고, 원격 확인 뒤 SQLite catalog를 원자적으로 갱신한다.
 - 확정된 리팩터링 장벽 뒤의 기존 READY 계획은 리팩터링 DAG의 말단 계획에 의존하며, 장벽의 다음 실행 순서는 일반 priority 정렬보다 먼저 적용한다.
 - 마지막 리팩터링 Merge 뒤에는 장벽 뒤 READY Worker를 시작하기 전에 해당 계획을 최신 원격 코드 기준으로 재검증하고, 안전한 개정·게시·catalog 갱신을 완료하거나 planning error로 중단한다.
-- 현재 ExecPlan과 READY ExecPlan이 모두 없을 때만 현재 원격 계획 입력 지문을 기준으로 Planner 실행 여부를 판단한다.
+- 현재 실행 중인 ExecPlan, READY ExecPlan과 `PR_OPEN` ExecPlan이 모두 없을 때만 현재 원격 계획 입력 지문을 기준으로 Planner 실행 여부를 판단한다.
 - 현재 입력 지문에 대해 완료된 Planner 실행 이력이 없으면 Planner를 한 번 실행한다.
 - Planner가 유효한 ExecPlan 집합을 만들거나 추가 계획이 없다는 정상 결과로 종료하면 해당 입력 지문을 완료된 계획 주기로 저장한다.
 - 완료된 계획 주기와 입력 지문이 같으면 이후 스케줄러 실행에서도 Planner를 다시 호출하지 않는다.
@@ -55,7 +60,7 @@ Loop Manager 코드는 AI를 사용하지 않고 ExecPlan frontmatter와 SQLite 
 - ExecPlan의 priority는 `critical`, `high`, `normal`, `low` 중 하나이며 공통 형식과 코드 파서가 검증하고 SQLite에 등록한다. 기능 도입 전에 작성된 ExecPlan에는 `normal`을 적용한다.
 - 실행 가능한 READY 계획은 dependency gate를 먼저 적용한 뒤 `critical`, `high`, `normal`, `low` 순서와 숫자 ID 오름차순으로 결정적으로 선택된다.
 - 안전한 무인 실행 차단 또는 반복적인 사용자 복구를 제거하는 계획이 편의 기능이나 선택적 최적화보다 먼저 선택된다.
-- 새 입력은 실행 중이거나 Merge 대기 중인 작업을 중단하지 않으며, 남은 READY 계획까지 모두 소진된 다음 계획 주기에 반영된다. 주기적 유지보수 평가는 새 입력 처리와 분리된 R-012의 좁은 예외다.
+- 새 입력은 실행 중이거나 Merge 대기 중인 작업을 중단·수정하지 않는다. 안정된 `PR_OPEN`이 있어도 이미 계획된 독립 READY 작업은 계속 처리하지만, 새 일반 계획과 주기적 유지보수 평가는 모든 `PR_OPEN`이 종료되고 남은 READY 계획까지 소진된 다음 선택 경계까지 보류한다.
 - 입력이 변경되지 않으면 READY 계획을 모두 소진한 뒤에도 Planner를 불필요하게 다시 호출하지 않는다.
 - priority 추가와 선택 순서, 기존 계획 호환성, compact catalog 내용, MERGED 계획의 Planner 입력 제외, 진행 중 작업 재개, 일반 READY 우선 선택, 유지보수 장벽 예외, READY 소진 후 단일 Planner 실행 및 동일 입력 재실행 방지를 자동 테스트로 검증한다.
 
@@ -69,11 +74,13 @@ Loop Manager 코드는 AI를 사용하지 않고 ExecPlan frontmatter와 SQLite 
 
 ## Non-Goals
 
-- 실행 중인 Worker, PR_OPEN 또는 해결되지 않은 BLOCKED 작업을 중단하거나 우회하지 않는다.
+- 실행 중인 Worker, PR 충돌 복구 또는 해결되지 않은 프로젝트 범위 차단을 중단하거나 우회하지 않는다.
+- Merge 대기 중인 PR을 자동 Merge·Close하거나 단순히 최신 base보다 뒤처졌다는 이유로 다시 게시하지 않는다.
 - READY 계획이 남아 있는 동안 새 입력만을 이유로 Planner를 선행 실행하지 않는다.
 - 의존성을 아직 충족하지 못한 READY 계획을 숨기거나 삭제해 Planner 실행 조건을 만들지 않는다.
 - 주기적 유지보수 예외를 기존 READY 계획의 제품 목표, sources 또는 식별자를 다른 작업으로 바꾸는 데 사용하지 않는다.
-- 같은 프로젝트의 ExecPlan을 병렬 실행하지 않는다.
+- 같은 프로젝트에서 둘 이상의 Worker·verify·Review·게시 또는 PR 충돌 복구를 병렬 실행하지 않는다.
+- MERGED가 아닌 dependency를 건너뛰거나 Open PR의 변경을 후속 계획 branch에 암묵적으로 포함하지 않는다.
 - 제품 문서에 없는 작업을 자동으로 추가하지 않는다.
 - 의미 검색을 위한 embedding, vector database 또는 AI 요약 cache를 도입하지 않는다.
 

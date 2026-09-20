@@ -16,7 +16,7 @@ priority: high
 
 ## Acceptance Criteria
 
-- `IMPLEMENTING`, `VERIFYING`, `REVIEWING`, `PUBLISHING`, `PR_OPEN` 또는 `BLOCKED` ExecPlan이 있는 프로젝트는 기존처럼 해당 작업의 처리·대기·복구를 먼저 수행하고 Planner나 다른 Worker를 시작하지 않는다.
+- 이 계획이 도입되는 단계에서는 `IMPLEMENTING`, `VERIFYING`, `REVIEWING`, `PUBLISHING`, `PR_OPEN` 또는 `BLOCKED` ExecPlan이 있는 프로젝트는 기존처럼 해당 작업의 처리·대기·복구를 먼저 수행하고 Planner나 다른 Worker를 시작하지 않는다. 여러 Merge 대기 PR과 독립 READY 진행은 G-026과 G-029 뒤의 G-031에서 활성화한다.
 - 활성 작업이 없고 `READY` ExecPlan이 하나라도 있으면 현재 `origin/<base-branch>`의 계획 입력이 저장된 지문과 달라도 Planner와 planning worktree를 시작하지 않는다.
 - 의존성을 충족한 `READY` 계획이 있으면 기존 dependency gate를 적용한 뒤 `critical`, `high`, `normal`, `low`와 숫자 ID 순서로 하나를 선택해 Worker를 시작한다.
 - `READY` 계획은 남아 있지만 모두 `depends_on`을 충족하지 못한 프로젝트는 READY가 없는 것으로 취급하지 않고, 새 Planner를 실행하거나 새 ExecPlan을 만들어 우회하지 않은 채 대기 상태를 반환한다.
@@ -59,3 +59,4 @@ priority: high
 - R-001은 현재 코드와 PRODUCT에 구현된 입력 변경 우선 정책을 READY 카탈로그 소진 우선 정책으로 바꾸는 활성 Requirement다. 기존 동작을 구현한 계획을 다시 작성하지 않고 남은 정책 차이만 다룬다.
 - G-017은 현재 PRODUCT 정책으로 다중 프로젝트 scheduling 경계를 도입하므로 기존 계획 파일을 수정하지 않고, 해당 경계가 Merge된 뒤 이 계획에서 R-001 정책을 적용한다.
 - dependency를 충족하지 못한 READY도 계획된 작업이므로 Planner 실행 조건을 만들기 위해 숨기거나 삭제하지 않는다.
+- R-001의 최종 Merge 대기 비점유 정책은 다중 PR 동기화와 충돌 복구가 준비되기 전 부분 활성화하지 않는다. G-024는 READY 소진 순서만 먼저 도입하고, G-031이 이 계획의 scheduler 경계를 확장해 안정된 `PR_OPEN`과 독립적인 READY 실행을 허용한다.
