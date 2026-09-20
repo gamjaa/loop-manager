@@ -7,6 +7,7 @@ import contextlib
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -2237,6 +2238,30 @@ risk: medium
         self.assertIn(started.session_id, calls[1])
         self.assertEqual(call_options[0]["cwd"], worktree)
         self.assertEqual(call_options[1]["cwd"], worktree)
+        self.assertEqual(
+            call_options[0]["env"]["PYTHONDONTWRITEBYTECODE"], "1"
+        )
+        self.assertEqual(
+            call_options[1]["env"]["PYTHONDONTWRITEBYTECODE"], "1"
+        )
+
+    def test_planner_environment_forces_bytecode_disable_without_mutating_parent(self):
+        parent_environment = {
+            "HOME": "/home/test",
+            "PATH": "/bin",
+            "PYTHONDONTWRITEBYTECODE": "0",
+            "PYTHONPYCACHEPREFIX": "/parent-cache",
+        }
+        with mock.patch.dict(os.environ, parent_environment, clear=True):
+            planner_codex = loop_manager.agent_environment("codex", "planner")
+            planner_claude = loop_manager.agent_environment("claude", "planner")
+            worker_codex = loop_manager.agent_environment("codex", "worker")
+            self.assertEqual(os.environ["PYTHONDONTWRITEBYTECODE"], "0")
+
+        self.assertEqual(planner_codex["PYTHONDONTWRITEBYTECODE"], "1")
+        self.assertEqual(planner_claude["PYTHONDONTWRITEBYTECODE"], "1")
+        self.assertNotIn("PYTHONPYCACHEPREFIX", planner_codex)
+        self.assertNotIn("PYTHONDONTWRITEBYTECODE", worker_codex)
 
     def test_resumed_read_only_codex_keeps_managed_worktree_boundary(self):
         session_id = "0199a213-81c0-7800-8aa1-bbab2a035a53"
@@ -5199,6 +5224,52 @@ class AgentScopeValidatorTest(unittest.TestCase):
                         before,
                         after,
                     )
+
+    def test_planner_imports_do_not_leave_bytecode_or_hide_scope_violations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, _plan_path = self._repository_with_plan(directory)
+            for module_name in ("loop_manager.py", "managed_config.py", "project_registry.py"):
+                shutil.copy(loop_manager.ROOT / module_name, repo / module_name)
+            (repo / ".gitignore").write_text("__pycache__/\n", encoding="utf-8")
+            commit_and_push(repo, "Add planner import fixtures")
+
+            planner_environment = loop_manager.agent_environment("codex", "planner")
+            subprocess.run(
+                [sys.executable, "-c", "import loop_manager, managed_config, project_registry"],
+                cwd=repo,
+                env=planner_environment,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertFalse(any(repo.rglob("*.pyc")))
+
+            existing_cache = repo / "__pycache__" / "preserved.pyc"
+            existing_cache.parent.mkdir()
+            existing_cache.write_bytes(b"existing cache")
+            before = loop_manager.capture_git_snapshot(repo)
+            subprocess.run(
+                [sys.executable, "-c", "import loop_manager, managed_config, project_registry"],
+                cwd=repo,
+                env=planner_environment,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(existing_cache.read_bytes(), b"existing cache")
+            write_execplan(repo, "G-002", "Imported Without Bytecode")
+            after = loop_manager.capture_git_snapshot(repo)
+            loop_manager.validate_agent_scope("planner", repo, before, after)
+
+            explicit_cache = repo / "__pycache__" / "explicit.pyc"
+            explicit_cache.write_bytes(b"explicit cache")
+            explicit_after = loop_manager.capture_git_snapshot(repo)
+            with self.assertRaisesRegex(loop_manager.AgentScopeError, "explicit.pyc"):
+                loop_manager.validate_agent_scope(
+                    "planner", repo, after, explicit_after
+                )
 
     def test_planner_new_plan_and_worker_selected_plan_are_allowed(self):
         for role_name in ("planner", "worker"):
@@ -11256,6 +11327,61 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
         )
         self.assertIn("--disallowedTools", resume_arguments)
         self.assertEqual(resume_options["cwd"], worktree)
+
+    def test_claude_planner_processes_force_bytecode_isolation(self):
+        config = loop_manager.ROOT / "config/config.ini.example"
+        session_id = "claude-planner-session"
+        stream = (
+            json.dumps({"type": "system", "session_id": session_id}) + "\n"
+            + json.dumps({"type": "result", "session_id": session_id, "result": "planned"})
+            + "\n"
+        )
+
+        def started_process(*_arguments, **_kwargs):
+            process = mock.Mock()
+            process.stdin = mock.Mock()
+            process.stdout = io.StringIO(stream)
+            process.wait.return_value = 0
+            return process
+
+        def resumed_process(arguments, **_kwargs):
+            return subprocess.CompletedProcess(
+                arguments,
+                0,
+                stdout=json.dumps({"type": "result", "session_id": session_id, "result": "repaired"}),
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worktree = root / "worktree"
+            worktree.mkdir()
+            with mock.patch.dict(
+                os.environ, {"PYTHONDONTWRITEBYTECODE": "0"}, clear=False
+            ), mock.patch(
+                "loop_manager.claude_role", return_value=("claude-opus-5", "high")
+            ), mock.patch(
+                "loop_manager.subprocess.Popen", side_effect=started_process
+            ) as popen, mock.patch(
+                "loop_manager.subprocess.run", side_effect=resumed_process
+            ) as run:
+                started = loop_manager.run_claude(
+                    worktree, root / "state", config, "planner", "plan",
+                    read_only=False, persist_session=True,
+                )
+                resumed = loop_manager.run_claude(
+                    worktree, root / "state", config, "planner", "repair",
+                    read_only=False, persist_session=True, session_id=started.session_id,
+                )
+                self.assertEqual(os.environ["PYTHONDONTWRITEBYTECODE"], "0")
+
+        self.assertEqual(started.session_id, session_id)
+        self.assertEqual(resumed.session_id, session_id)
+        self.assertEqual(
+            popen.call_args.kwargs["env"]["PYTHONDONTWRITEBYTECODE"], "1"
+        )
+        self.assertEqual(
+            run.call_args.kwargs["env"]["PYTHONDONTWRITEBYTECODE"], "1"
+        )
 
     def test_session_fallback_and_provider_errors_use_common_contract(self):
         sessions: list[tuple[str | None, bool]] = []
