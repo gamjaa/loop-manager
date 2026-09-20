@@ -14,7 +14,7 @@ Requirement를 완료하는 마지막 ExecPlan의 Worker는 해당 Requirement�
 
 Loop Manager는 Requirement를 source로 사용하는 다른 ExecPlan이 모두 MERGED이고 현재 ExecPlan이 마지막 미완료 계획일 때만 archive 이동을 허용해야 한다. 기존 ExecPlan frontmatter의 source 경로는 수정하지 않으며, 활성 경로에 파일이 없으면 같은 파일명의 archive 경로에서 완료된 source를 조회해야 한다.
 
-기능 도입 시에는 Git과 GitHub 이력을 기준으로 이미 완료된 Requirement도 같은 PR에서 archive해야 한다.
+자동 archive 기능 자체를 처음 도입하는 ExecPlan은 기존 런타임의 Worker 범위 검사 아래에서 실행되므로, 그 도입 PR에서는 Requirement를 이동하지 않는다. 기능 코드가 Merge된 뒤 Planner가 같은 Requirement를 근거로 후속 ExecPlan을 만들고, 새 런타임에서 실행되는 후속 Worker가 Git, GitHub와 SQLite 이력을 다시 확인해 이미 완료된 Requirement와 기능 도입 Requirement를 archive한다.
 
 ## Acceptance Criteria
 
@@ -29,9 +29,11 @@ Loop Manager는 Requirement를 source로 사용하는 다른 ExecPlan이 모두 
 - ExecPlan source 검증과 조회는 원래 경로가 없을 때 동일 파일명의 `docs/requirements/archive/` 경로를 사용한다.
 - BLOCKED 해제를 위한 내용 해시는 활성 Requirement에만 적용하며, MERGED ExecPlan의 archived source는 재실행 입력으로 사용하지 않는다.
 - archive 이동만으로 새로운 계획 주기나 프로젝트 완료 알림을 만들지 않는다.
-- 기능 도입 PR은 구현 시점의 이력을 다시 확인해 이미 완료된 Requirement를 함께 archive하며, 현재 확인된 R-003이 여전히 활성 경로에 있으면 이동한다.
+- 기능 도입 ExecPlan G-011의 PR은 archive eligibility, Worker 범위 허용, 이동 검증과 archived source fallback만 구현하며 어떤 Requirement도 이동하지 않는다.
+- G-011이 Merge되면 R-005를 활성 Planner 입력으로 유지하고, Planner는 G-011에 의존하는 후속 ExecPlan을 만들어 새 런타임에서 bootstrap archive 정리를 수행한다.
+- bootstrap 후속 ExecPlan의 Worker는 실행 시점의 Git, GitHub와 SQLite 이력을 일반 eligibility 규칙으로 다시 계산하고, 여전히 대상인 R-003과 R-005를 같은 PR에서 archive한다. 특정 Requirement ID를 코드에 특별 처리하지 않는다.
 - R-001, R-002와 R-004는 각각의 관련 ExecPlan 완료 조건을 만족하기 전에는 이동하지 않는다.
-- 단일·복수 Requirement, 남은 관련 계획, PR 미Merge, rebase 중 새 계획 추가, archive 충돌, 기존 archived source 조회와 과거 완료 Requirement 정리를 자동 테스트로 검증한다.
+- 단일·복수 Requirement, 남은 관련 계획, PR 미Merge, rebase 중 새 계획 추가, archive 충돌, 기존 archived source 조회, 과거 완료 Requirement 후보 계산과 2단계 bootstrap 경계를 자동 테스트로 검증한다.
 
 ## Product Impact
 
