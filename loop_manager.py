@@ -48,6 +48,7 @@ PRIORITY_ORDER = {"critical": 0, "high": 1, "normal": 2, "low": 3}
 ACTIVE_EXECPLAN_STATUSES = frozenset(
     {"IMPLEMENTING", "VERIFYING", "REVIEWING", "PUBLISHING", "PR_OPEN", "BLOCKED"}
 )
+KNOWN_EXECPLAN_STATUSES = ACTIVE_EXECPLAN_STATUSES | {"READY", "MERGED"}
 FIELDS = {
     "base_branch",
     "processed_sha",
@@ -263,6 +264,11 @@ class WorkerPublication:
     commit_title: str
     summary: str
     test_evidence: str
+
+
+class RequirementArchiveError(RuntimeError):
+    """Requirement archive eligibility or movement cannot be proven safe."""
+
 
 @dataclass(frozen=True)
 class GitSnapshot:
@@ -925,6 +931,28 @@ def normalized_text(path: Path) -> str:
     return path.read_text(encoding="utf-8").replace("\r\n", "\n")
 
 
+def requirement_archive_path(source: str) -> str:
+    match = re.fullmatch(r"docs/requirements/([^/\\]+\.md)", source)
+    if match is None:
+        raise ValueError(f"활성 Requirement 경로가 아닙니다: {source}")
+    return f"docs/requirements/archive/{match.group(1)}"
+
+
+def _execplan_source_exists(
+    worktree: Path,
+    source: str,
+    *,
+    allow_archive_fallback: bool,
+) -> bool:
+    if (worktree / source).is_file():
+        return True
+    return bool(
+        allow_archive_fallback
+        and source != "docs/PRODUCT.md"
+        and (worktree / requirement_archive_path(source)).is_file()
+    )
+
+
 def parse_frontmatter(text: str) -> dict[str, object]:
     lines = text.replace("\r\n", "\n").splitlines()
     if not lines or lines[0] != "---":
@@ -963,6 +991,7 @@ def _parse_execplan(
     *,
     require_priority: bool = False,
     validate_sources: bool = True,
+    allow_archive_fallback: bool = True,
 ) -> dict[str, object]:
     legacy = {"id", "title", "sources", "depends_on", "complexity", "risk"}
     allowed = legacy | {"priority"}
@@ -991,7 +1020,11 @@ def _parse_execplan(
             or re.fullmatch(r"docs/requirements/[^/\\]+\.md", source)
         ):
             raise RuntimeError(f"허용되지 않는 ExecPlan source입니다: {source}")
-        if validate_sources and not (worktree / source).is_file():
+        if validate_sources and not _execplan_source_exists(
+            worktree,
+            source,
+            allow_archive_fallback=allow_archive_fallback,
+        ):
             raise RuntimeError(f"존재하지 않는 ExecPlan source입니다: {source}")
     for dependency in dependencies:
         if not isinstance(dependency, str) or not re.fullmatch(r"G-\d{3,}", dependency):
@@ -1039,7 +1072,12 @@ def _validate_dependency_graph(catalog: dict[str, dict[str, object]]) -> None:
             visit(plan_id)
 
 
-def load_execplan_catalog(worktree: Path, *, validate_sources: bool = True) -> dict[str, dict[str, object]]:
+def load_execplan_catalog(
+    worktree: Path,
+    *,
+    validate_sources: bool = True,
+    allow_archive_fallback: bool = True,
+) -> dict[str, dict[str, object]]:
     entries: list[tuple[str, dict[str, object]]] = []
     plans_directory = worktree / "docs/plans"
     plan_paths = sorted(
@@ -1047,7 +1085,12 @@ def load_execplan_catalog(worktree: Path, *, validate_sources: bool = True) -> d
         key=lambda path: path.name,
     )
     for path in plan_paths:
-        plan = _parse_execplan(worktree, path, validate_sources=validate_sources)
+        plan = _parse_execplan(
+            worktree,
+            path,
+            validate_sources=validate_sources,
+            allow_archive_fallback=allow_archive_fallback,
+        )
         plan_id = plan["id"]
         assert isinstance(plan_id, str)
         entries.append((plan_id, plan))
@@ -1111,7 +1154,12 @@ def validate_planner_result(
         catalog = load_execplan_catalog(worktree, validate_sources=False)
         plans: list[tuple[str, dict[str, object]]] = []
         for plan_path in planned_files:
-            parsed = _parse_execplan(worktree, worktree / plan_path, require_priority=True)
+            parsed = _parse_execplan(
+                worktree,
+                worktree / plan_path,
+                require_priority=True,
+                allow_archive_fallback=False,
+            )
             plans.append((plan_path, parsed))
         new_ids = {str(plan["id"]) for _, plan in plans}
         existing_ids = [int(plan_id[2:]) for plan_id in catalog if plan_id not in new_ids]
@@ -3261,7 +3309,11 @@ def agent_snapshot_changes(
     ]
 
 
-def _worker_path_allowed(path: str, selected_plan_path: str) -> bool:
+def _worker_path_allowed(
+    path: str,
+    selected_plan_path: str,
+    allowed_requirement_archives: tuple[str, ...] = (),
+) -> bool:
     normalized = path.replace("\\", "/")
     lowered = normalized.casefold()
     if normalized == selected_plan_path:
@@ -3273,7 +3325,12 @@ def _worker_path_allowed(path: str, selected_plan_path: str) -> bool:
     if lowered in {"docs/architecture.md", "docs/plans.md"}:
         return False
     if lowered.startswith("docs/requirements/"):
-        return False
+        allowed_paths = {
+            candidate
+            for source in allowed_requirement_archives
+            for candidate in (source, requirement_archive_path(source))
+        }
+        return normalized in allowed_paths
     if re.fullmatch(r"docs/plans/[^/]+\.md", normalized):
         return False
     return True
@@ -3286,6 +3343,7 @@ def validate_agent_scope(
     after: GitSnapshot,
     *,
     selected_plan_path: str | None = None,
+    allowed_requirement_archives: tuple[str, ...] = (),
     allowed_ref_changes: frozenset[str] = frozenset(),
     allowed_worktree_changes: frozenset[str] = frozenset(),
 ) -> None:
@@ -3359,7 +3417,11 @@ def validate_agent_scope(
         elif role_name == "worker":
             if selected_plan_path is None:
                 raise ValueError("Worker scope 검증에 선택된 ExecPlan 경로가 없습니다.")
-            allowed = _worker_path_allowed(change.path, selected_plan_path)
+            allowed = _worker_path_allowed(
+                change.path,
+                selected_plan_path,
+                allowed_requirement_archives,
+            )
         elif role_name == "reviewer":
             allowed = False
         else:
@@ -4221,6 +4283,7 @@ def validate_worker_workspace_scope(
     before: GitSnapshot,
     *,
     allow_rebase: bool = False,
+    allowed_requirement_archives: tuple[str, ...] = (),
 ) -> dict[str, object]:
     """Validate one Worker-controlled operation before Manager Git writes."""
 
@@ -4231,6 +4294,7 @@ def validate_worker_workspace_scope(
         before,
         after,
         selected_plan_path=selected_plan_path,
+        allowed_requirement_archives=allowed_requirement_archives,
     )
     plan = validate_active_execplan_metadata(
         repo_path,
@@ -6525,6 +6589,7 @@ def worker_prompt(
     previous_result: str | None = None,
     validation_feedback: str | None = None,
     *,
+    archive_candidates: tuple[str, ...] = (),
     session_recovery: bool = False,
 ) -> str:
     failure = f"\n이전 실행에서 다음 문제가 발생했다. 원인을 해결하라:\n{error[-6000:]}\n" if error else ""
@@ -6534,6 +6599,17 @@ def worker_prompt(
         if validation_feedback
         else ""
     )
+    if archive_candidates:
+        archive_instruction = (
+            "\n다음 Requirement만 내용 변경 없이 같은 파일명으로 "
+            "docs/requirements/archive/에 이동하라:\n"
+            f"{json.dumps(archive_candidates, ensure_ascii=False)}\n"
+        )
+    else:
+        archive_instruction = (
+            "\n계산된 Requirement archive 후보가 없다. "
+            "docs/requirements/ 아래 파일을 수정하거나 이동하지 마라.\n"
+        )
     recovery = ""
     if session_recovery:
         recovery = (
@@ -6555,6 +6631,7 @@ COMMIT_TITLE: 한 줄의 구체적인 변경 제목
 PR_SUMMARY: 실제 변경을 간결히 설명하는 Summary
 TARGETED_TESTS:
 실행한 최소 범위 targeted unit test와 결과, 또는 실행하지 못한 구체적인 사유
+{archive_instruction}
 {recovery}
 {saved_feedback}
 {failure}
@@ -6766,6 +6843,330 @@ def published_execplan(plan_path: str, plan_text: str) -> dict[str, object]:
     if plan["risk"] not in {"low", "medium", "high", "critical"}:
         raise RuntimeError("게시된 ExecPlan risk가 유효하지 않습니다.")
     return plan
+
+
+def _requirement_archive_tree(
+    repo_path: Path,
+    revision: str,
+) -> dict[bytes, tuple[bytes, bytes]]:
+    try:
+        return _git_tree_entries(repo_path, revision)
+    except RuntimeError as error:
+        raise RequirementArchiveError(
+            f"Git revision의 Requirement/ExecPlan 이력을 확인할 수 없습니다: "
+            f"{revision} ({error})"
+        ) from error
+
+
+def _stored_requirement_sources(rows: list[sqlite3.Row]) -> tuple[str, ...]:
+    sources: set[str] = set()
+    for row in rows:
+        plan_id = str(row["plan_id"])
+        try:
+            stored_sources = json.loads(str(row["sources"]))
+        except json.JSONDecodeError as error:
+            raise RequirementArchiveError(
+                f"ExecPlan {plan_id}의 SQLite source를 해석할 수 없습니다."
+            ) from error
+        if not isinstance(stored_sources, list) or any(
+            not isinstance(source, str) for source in stored_sources
+        ):
+            raise RequirementArchiveError(
+                f"ExecPlan {plan_id}의 SQLite source를 해석할 수 없습니다."
+            )
+        for source in stored_sources:
+            if source == "docs/PRODUCT.md":
+                continue
+            if re.fullmatch(r"docs/requirements/[^/\\]+\.md", source) is None:
+                raise RequirementArchiveError(
+                    f"ExecPlan {plan_id}의 SQLite source가 유효하지 않습니다: {source}"
+                )
+            sources.add(source)
+    return tuple(sorted(sources))
+
+
+def requirement_archive_sources(
+    connection: sqlite3.Connection,
+    repo: str,
+) -> tuple[str, ...]:
+    rows = connection.execute(
+        "SELECT plan_id, sources FROM exec_plans WHERE repo = ?",
+        (repo,),
+    ).fetchall()
+    return _stored_requirement_sources(rows)
+
+
+def _later_published_execplan(
+    repo_path: Path,
+    revision: str,
+    row: sqlite3.Row,
+) -> dict[str, object] | None:
+    plan_id = str(row["plan_id"])
+    plan_sha = str(row["plan_sha"] or "")
+    if not plan_sha:
+        return None
+    ancestry = git(
+        repo_path,
+        "merge-base",
+        "--is-ancestor",
+        revision,
+        plan_sha,
+        check=False,
+    )
+    if ancestry.returncode == 1:
+        return None
+    if ancestry.returncode != 0:
+        raise RequirementArchiveError(
+            f"ExecPlan {plan_id}의 게시 이력을 확정할 수 없습니다: "
+            f"{ancestry.stdout[-2000:]}"
+        )
+    path = str(row["path"])
+    try:
+        plan_text = git_bytes(
+            repo_path,
+            "show",
+            f"{plan_sha}:{path}",
+        ).decode("utf-8")
+        plan = published_execplan(path, plan_text)
+    except (UnicodeDecodeError, RuntimeError) as error:
+        raise RequirementArchiveError(
+            f"ExecPlan {plan_id}의 게시 이력을 확정할 수 없습니다: {error}"
+        ) from error
+    if plan["id"] != plan_id:
+        raise RequirementArchiveError(
+            f"ExecPlan {plan_id}의 게시 이력을 확정할 수 없습니다: ID 불일치"
+        )
+    return plan
+
+
+def _revision_execplan_catalog(
+    repo_path: Path,
+    revision: str,
+) -> dict[str, dict[str, object]]:
+    catalog: dict[str, dict[str, object]] = {}
+    tree_entries = sorted(_requirement_archive_tree(repo_path, revision).items())
+    for path, (object_type, object_id) in tree_entries:
+        if re.fullmatch(rb"docs/plans/[^/]+\.md", path) is None:
+            continue
+        if object_type != b"blob":
+            raise RequirementArchiveError(
+                f"ExecPlan source 관계를 확정할 수 없습니다: {path.decode('utf-8', errors='replace')}"
+            )
+        try:
+            relative_path = path.decode("utf-8")
+            plan_text = git_bytes(
+                repo_path,
+                "cat-file",
+                "blob",
+                object_id.decode("ascii"),
+            ).decode("utf-8")
+            plan = published_execplan(relative_path, plan_text)
+        except (UnicodeDecodeError, RuntimeError) as error:
+            raise RequirementArchiveError(
+                f"ExecPlan source 관계를 확정할 수 없습니다: "
+                f"{path.decode('utf-8', errors='replace')} ({error})"
+            ) from error
+        plan_id = str(plan["id"])
+        if plan_id in catalog:
+            raise RequirementArchiveError(
+                f"ExecPlan source 관계를 확정할 수 없습니다: 중복 ID {plan_id}"
+            )
+        catalog[plan_id] = plan
+    try:
+        _validate_dependency_graph(catalog)
+    except RuntimeError as error:
+        raise RequirementArchiveError(
+            f"ExecPlan source 관계를 확정할 수 없습니다: {error}"
+        ) from error
+    return catalog
+
+
+def requirement_archive_candidates(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    repo: str,
+    revision: str,
+    current_plan_id: str,
+) -> tuple[str, ...]:
+    """Return active Requirements safe to move in the current implementation PR."""
+
+    rows = connection.execute(
+        "SELECT plan_id, path, sources, status, plan_sha "
+        "FROM exec_plans WHERE repo = ?",
+        (repo,),
+    ).fetchall()
+    states = {str(row["plan_id"]): row for row in rows}
+    if current_plan_id not in states:
+        raise RequirementArchiveError(
+            f"현재 ExecPlan의 SQLite 상태 없음: {current_plan_id}"
+        )
+    for plan_id, row in states.items():
+        if str(row["status"]) not in KNOWN_EXECPLAN_STATUSES:
+            raise RequirementArchiveError(
+                f"ExecPlan {plan_id}의 source 관계 또는 상태를 확정할 수 없습니다."
+            )
+    if not _stored_requirement_sources(rows):
+        return ()
+
+    catalog = _revision_execplan_catalog(repo_path, revision)
+    state_ids = set(states)
+    for plan_id in sorted(state_ids - set(catalog)):
+        later_plan = _later_published_execplan(
+            repo_path,
+            revision,
+            states[plan_id],
+        )
+        if later_plan is not None:
+            catalog[plan_id] = later_plan
+    try:
+        _validate_dependency_graph(catalog)
+    except RuntimeError as error:
+        raise RequirementArchiveError(
+            f"ExecPlan source 관계를 확정할 수 없습니다: {error}"
+        ) from error
+
+    catalog_ids = set(catalog)
+    if catalog_ids != state_ids:
+        missing_states = sorted(catalog_ids - state_ids)
+        missing_plans = sorted(state_ids - catalog_ids)
+        details = []
+        if missing_states:
+            details.append("SQLite 상태 없음: " + ", ".join(missing_states))
+        if missing_plans:
+            details.append("Git ExecPlan 없음: " + ", ".join(missing_plans))
+        raise RequirementArchiveError(
+            "ExecPlan source 관계 또는 상태를 확정할 수 없습니다 ("
+            + "; ".join(details)
+            + ")."
+        )
+
+    for plan_id, plan in catalog.items():
+        row = states[plan_id]
+        try:
+            stored_sources = json.loads(str(row["sources"]))
+        except json.JSONDecodeError as error:
+            raise RequirementArchiveError(
+                f"ExecPlan {plan_id}의 SQLite source를 해석할 수 없습니다."
+            ) from error
+        if (
+            str(row["path"]) != f"docs/plans/[{plan_id}] {plan['title']}.md"
+            or stored_sources != plan["sources"]
+        ):
+            raise RequirementArchiveError(
+                f"ExecPlan {plan_id}의 source 관계 또는 상태를 확정할 수 없습니다."
+            )
+
+    tree = _requirement_archive_tree(repo_path, revision)
+    candidates: list[str] = []
+    for path in sorted(tree):
+        if not _is_active_requirement(path):
+            continue
+        source = path.decode("utf-8")
+        related = [
+            plan_id
+            for plan_id, plan in catalog.items()
+            if source in plan["sources"]
+        ]
+        if not related:
+            continue
+        if any(
+            plan_id != current_plan_id
+            and str(states[plan_id]["status"]) != "MERGED"
+            for plan_id in related
+        ):
+            continue
+        archived = requirement_archive_path(source).encode("utf-8")
+        if archived in tree:
+            raise RequirementArchiveError(
+                f"Requirement archive 대상이 이미 존재합니다: "
+                f"{requirement_archive_path(source)}"
+            )
+        candidates.append(source)
+    return tuple(candidates)
+
+def requirement_archive_touched_sources(
+    repo_path: Path,
+    revision: str,
+    worktree: Path,
+) -> tuple[str, ...]:
+    """Find active Requirement paths whose move pair differs from the base tree."""
+
+    tree = _requirement_archive_tree(repo_path, revision)
+    touched = []
+    for path in sorted(tree):
+        if not _is_active_requirement(path):
+            continue
+        source = path.decode("utf-8")
+        archived = requirement_archive_path(source)
+        if archived.encode("utf-8") in tree:
+            continue
+        if not (worktree / source).is_file() or (worktree / archived).exists():
+            touched.append(source)
+    return tuple(touched)
+
+
+def requirement_archive_move_set(
+    repo_path: Path,
+    revision: str,
+    worktree: Path,
+) -> tuple[str, ...]:
+    """Return content-preserving Requirement moves relative to one base revision."""
+
+    tree = _requirement_archive_tree(repo_path, revision)
+    moved: list[str] = []
+    for path, (object_type, object_id) in sorted(tree.items()):
+        if not _is_active_requirement(path):
+            continue
+        source = path.decode("utf-8")
+        archived = requirement_archive_path(source)
+        source_path = worktree / source
+        archived_path = worktree / archived
+        archived_in_base = archived.encode("utf-8") in tree
+        if source_path.is_file():
+            if not archived_in_base and archived_path.exists():
+                raise RequirementArchiveError(
+                    f"Requirement archive 대상이 이미 존재합니다: {archived}"
+                )
+            continue
+        if archived_in_base:
+            raise RequirementArchiveError(
+                f"활성 Requirement와 기존 archive의 관계를 확정할 수 없습니다: {source}"
+            )
+        if not archived_path.is_file():
+            raise RequirementArchiveError(
+                f"Requirement 원본과 archive 대상이 모두 없습니다: {source}"
+            )
+        if object_type != b"blob":
+            raise RequirementArchiveError(
+                f"Requirement 원본 내용을 확인할 수 없습니다: {source}"
+            )
+        original = git_bytes(
+            repo_path,
+            "cat-file",
+            "blob",
+            object_id.decode("ascii"),
+        )
+        if archived_path.read_bytes() != original:
+            raise RequirementArchiveError(
+                f"Requirement archive 이동 중 내용이 변경됐습니다: {source}"
+            )
+        moved.append(source)
+    return tuple(moved)
+
+
+def requirement_archive_reconciliation_error(
+    expected: tuple[str, ...],
+    actual: tuple[str, ...],
+) -> str | None:
+    if expected == actual:
+        return None
+    return (
+        "Requirement archive 이동 집합이 최신 eligibility와 다릅니다.\n"
+        f"기대: {json.dumps(expected, ensure_ascii=False)}\n"
+        f"현재: {json.dumps(actual, ensure_ascii=False)}\n"
+        "기대 집합만 내용 변경 없이 docs/requirements/archive/로 이동하라."
+    )
+
 
 
 def build_pr_body(
@@ -7687,6 +8088,54 @@ def _run_project_step(
         )
         operation_print(metadata_error, file=sys.stderr)
         return 1
+    try:
+        archive_sources = requirement_archive_sources(connection, repo)
+    except RequirementArchiveError as error:
+        archive_error = f"Requirement archive source 확인 실패: {error}"
+        block_active_execplan(
+            connection,
+            repo,
+            worktree,
+            archive_error,
+            str(row["verify_result"] or ""),
+        )
+        operation_print(archive_error, file=sys.stderr)
+        return 1
+    archive_candidates: tuple[str, ...] = ()
+    archive_scope_sources: tuple[str, ...] = ()
+    if row["phase"] == "WORKING" and archive_sources:
+        archive_revision = str(row["active_sha"] or "")
+        try:
+            archive_candidates = requirement_archive_candidates(
+                connection,
+                repo_path,
+                repo,
+                archive_revision,
+                str(plan["id"]),
+            )
+            archive_scope_sources = tuple(
+                sorted(
+                    set(archive_candidates)
+                    | set(
+                        requirement_archive_touched_sources(
+                            repo_path,
+                            archive_revision,
+                            worktree,
+                        )
+                    )
+                )
+            )
+        except RequirementArchiveError as error:
+            archive_error = f"Requirement archive eligibility 확인 실패: {error}"
+            block_active_execplan(
+                connection,
+                repo,
+                worktree,
+                archive_error,
+                str(row["verify_result"] or ""),
+            )
+            operation_print(archive_error, file=sys.stderr)
+            return 1
 
     if row["phase"] == "WORKING":
         operation_log(f"Worker 시작: {plan['id']} {plan['title']}")
@@ -7722,6 +8171,7 @@ def _run_project_step(
                     row["last_error"],
                     row["worker_result"],
                     validation_feedback,
+                    archive_candidates=archive_candidates,
                     session_recovery=session_recovery,
                 ),
                 read_only=False,
@@ -7750,6 +8200,7 @@ def _run_project_step(
                 catalog_plan,
                 worker_scope_before,
                 allow_rebase=resolving_rebase,
+                allowed_requirement_archives=archive_scope_sources,
             )
         except (AgentScopeError, WorkspaceOwnershipError, RuntimeError) as error:
             scope_error = str(error)
@@ -7763,7 +8214,6 @@ def _run_project_step(
             operation_print(scope_error, file=sys.stderr)
             return 1
         clear_agent_scope(connection, repo)
-
 
         if code:
             worker_error = message or f"Codex 종료 코드 {code}"
@@ -7888,6 +8338,51 @@ def _run_project_step(
                 f"origin/{base}",
             ).stdout.strip()
             update_project(connection, repo, active_sha=latest_sha)
+        if archive_sources:
+            post_worker_revision = (
+                latest_sha if resolving_rebase else str(row["active_sha"] or "")
+            )
+            try:
+                expected_archives = requirement_archive_candidates(
+                    connection,
+                    repo_path,
+                    repo,
+                    post_worker_revision,
+                    str(plan["id"]),
+                )
+                actual_archives = requirement_archive_move_set(
+                    repo_path,
+                    post_worker_revision,
+                    worktree,
+                )
+            except RequirementArchiveError as error:
+                archive_error = f"Requirement archive 이동 검증 실패: {error}"
+                block_active_execplan(
+                    connection,
+                    repo,
+                    worktree,
+                    archive_error,
+                    str(row["verify_result"] or ""),
+                )
+                operation_print(archive_error, file=sys.stderr)
+                return 1
+            archive_error = requirement_archive_reconciliation_error(
+                expected_archives,
+                actual_archives,
+            )
+            if archive_error is not None:
+                update_project(
+                    connection,
+                    repo,
+                    phase="WORKING",
+                    validated_base_sha=None,
+                    worker_result=message,
+                    verify_result=None,
+                    review_result=None,
+                    last_error=archive_error,
+                )
+                operation_print(archive_error, file=sys.stderr)
+                return PROJECT_STEP_RETRY
         update_project(
             connection,
             repo,
@@ -8380,6 +8875,47 @@ def _run_project_step(
             )
             operation_print(publication_error, file=sys.stderr)
             return 1
+        if archive_sources:
+            try:
+                final_archive_candidates = requirement_archive_candidates(
+                    connection,
+                    repo_path,
+                    repo,
+                    latest_sha,
+                    str(plan["id"]),
+                )
+                final_archive_moves = requirement_archive_move_set(
+                    repo_path,
+                    latest_sha,
+                    worktree,
+                )
+            except RequirementArchiveError as error:
+                archive_error = f"게시 직전 Requirement archive 확인 실패: {error}"
+                block_active_execplan(
+                    connection,
+                    repo,
+                    worktree,
+                    archive_error,
+                    str(row["verify_result"] or ""),
+                )
+                operation_print(archive_error, file=sys.stderr)
+                return 1
+            archive_error = requirement_archive_reconciliation_error(
+                final_archive_candidates,
+                final_archive_moves,
+            )
+            if archive_error is not None:
+                update_project(
+                    connection,
+                    repo,
+                    phase="WORKING",
+                    validated_base_sha=None,
+                    verify_result=None,
+                    review_result=None,
+                    last_error=archive_error,
+                )
+                operation_print(archive_error, file=sys.stderr)
+                return PROJECT_STEP_RETRY
         if not branch_has_changes(worktree, base):
             no_change_error = (
                 "게시할 Worker 변경이 남지 않아 PR을 생성할 수 없습니다."

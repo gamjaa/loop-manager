@@ -25,6 +25,7 @@
 - ExecPlan의 고정 메타데이터와 의존성을 코드로 파싱해 실행 가능 여부, Model과 Effort를 결정할 수 있다
 - ExecPlan 실행 상태, 재시도 횟수, AI Agent 세션과 작업 공간을 SQLite로 관리할 수 있다
 - Worker가 구현, 관련 테스트와 프로젝트별 전체 검증 스크립트를 작성할 수 있다
+- 마지막 관련 ExecPlan의 구현 PR에서 완료된 Requirement를 자동으로 archive할 수 있다
 - 전체 검증과 독립 Review를 자동으로 수행하고 실패 시 기존 작업을 이어서 수정할 수 있다
 - 검증이 완료된 작업으로 GitHub PR을 생성할 수 있다
 - 같은 프로젝트의 작업은 직렬로, 서로 다른 프로젝트는 설정된 동시 실행 수 안에서 병렬로 처리할 수 있다
@@ -57,6 +58,7 @@
 - 서로 다른 프로젝트의 동시 실행 수는 `max_workers`를 넘지 않는다
 - 전체 검증 실패 또는 Reviewer의 blocking issue가 있는 작업으로 PR을 생성하지 않는다
 - 전체 검증은 Worker가 아니라 Loop Manager 코드가 실행하며 실패한 경우에만 Worker에게 결과를 전달한다
+- Requirement는 다른 모든 관련 ExecPlan이 MERGED인 마지막 구현 PR에서만 자동 archive한다
 - ExecPlan은 연결된 PR이 실제로 Merge된 경우에만 MERGED 상태가 된다
 - 자동 작업의 Git 기준은 최신 `origin/<base-branch>`다
 - Loop Manager는 대상 프로젝트 기본 worktree의 파일, index와 HEAD를 수정하지 않는다
@@ -86,7 +88,7 @@
 규칙:
 - Requirement에는 frontmatter, 상태, complexity와 risk를 기록하지 않는다
 - `docs/requirements/` 바로 아래에 저장된 모든 Requirement는 활성 Planner 입력이다
-- 완료된 Requirement는 사용자가 `docs/requirements/archive/`로 옮긴다
+- 완료된 Requirement는 마지막 관련 ExecPlan의 구현 PR에서 `docs/requirements/archive/`로 자동 이동한다
 
 ### 프로그램 설정
 
@@ -137,13 +139,16 @@
 16. 모든 `depends_on`이 MERGED인 READY ExecPlan 중 제품 우선순위가 가장 높은 계획 하나를 결정적으로 선택한다
 17. 갱신된 `origin/<base-branch>`에서 해당 ExecPlan 전용 branch와 worktree를 생성하거나 기존 작업 공간을 복구한다
 18. 프로그램이 complexity와 risk로 최초 Worker level 1~7을 계산하고 저장된 effective level의 Model과 Effort를 선택한다
-19. Worker가 구현, 관련 테스트와 전체 검증 스크립트를 작성하거나 갱신한다
-20. Requirement 구현으로 장기 제품 규칙이 바뀌면 Worker가 같은 PR의 `PRODUCT.md`를 갱신한다
-21. 프로그램이 최신 원격 기준 branch를 rebase로 반영한다
-22. 프로그램이 전체 검증 스크립트를 실행하고, 실패한 경우에만 출력 내용을 같은 Worker 세션에 전달한다
-23. 검증이 성공하면 읽기 전용 Reviewer를 실행한다
-24. 프로그램이 같은 branch의 기존 PR을 확인하고, 없을 때만 새 PR을 생성한 뒤 SQLite 상태를 PR_OPEN으로 변경한다
-25. 해당 프로젝트는 PR이 Merge되거나 BLOCKED가 해제될 때까지 다른 ExecPlan을 시작하지 않는다
+19. 프로그램이 활성 Requirement의 관련 ExecPlan source와 SQLite 상태를 결합해 archive 후보를 계산한다
+20. Worker가 구현, 관련 테스트와 전체 검증 스크립트를 작성하거나 갱신하고 계산된 Requirement를 내용 변경 없이 archive로 이동한다
+21. Requirement 구현으로 장기 제품 규칙이 바뀌면 Worker가 같은 PR의 `PRODUCT.md`를 갱신한다
+22. 프로그램이 Worker 결과의 실제 archive 이동 집합을 다시 검증한다
+23. 프로그램이 최신 원격 기준 branch를 rebase로 반영한다
+24. 프로그램이 전체 검증 스크립트를 실행하고, 실패한 경우에만 출력 내용을 같은 Worker 세션에 전달한다
+25. 검증이 성공하면 읽기 전용 Reviewer를 실행한다
+26. 게시 직전에 최신 base에서 archive 후보를 다시 계산하고 이동 집합이 달라지면 같은 Worker 세션에서 수정한 뒤 검증과 Review를 반복한다
+27. 프로그램이 같은 branch의 기존 PR을 확인하고, 없을 때만 새 PR을 생성한 뒤 SQLite 상태를 PR_OPEN으로 변경한다
+28. 해당 프로젝트는 PR이 Merge되거나 BLOCKED가 해제될 때까지 다른 ExecPlan을 시작하지 않는다
 
 ### 실패와 재시도
 
@@ -201,7 +206,7 @@ ExecPlan 게시 실패:
 6. 의존성이 충족된 다음 READY ExecPlan이 있으면 새 관리 worktree에서 처리한다
 7. 대기 중인 ExecPlan이 없으면 Planner가 추가 ExecPlan이 필요한지 다시 확인한다
 8. 추가 작업이 없으면 프로젝트 완료 이벤트를 전송한다
-9. 완료된 Requirement는 사용자가 archive로 옮긴다
+9. Merge된 PR에 archive 이동이 포함된 Requirement는 활성 Planner 입력에서 제외된다
 
 실패:
 - PR이 Merge되지 않은 동안 완료 처리하지 않는다
@@ -256,6 +261,11 @@ BLOCKED → PR_OPEN (같은 PR을 사용자가 다시 열음)
 
 - `PRODUCT.md`는 현재 Merge된 제품 동작, 경계와 장기 규칙의 기준이다
 - Requirement는 제품에 원하는 변화, 이유와 Acceptance Criteria를 기록한다
+- 기존 ExecPlan의 활성 Requirement source가 없으면 동일 파일명의 `docs/requirements/archive/` 문서를 조회하되 원래 source 경로는 바꾸지 않는다
+- 새 ExecPlan의 source와 Planner 입력은 활성 PRODUCT 또는 `docs/requirements/` 바로 아래 문서로 제한한다
+- 현재 ExecPlan을 제외한 모든 관련 ExecPlan이 MERGED인 Requirement만 archive 후보이며, 이미 모든 관련 계획이 MERGED인 과거 Requirement도 후보에 포함한다
+- archive 대상 충돌이나 source 관계·상태 불확실성은 덮어쓰기 없이 현재 ExecPlan을 BLOCKED로 만든다
+- BLOCKED 해제 지문은 원래 활성 Requirement 경로만 사용하고 archive 변경에는 반응하지 않는다
 - Requirement는 PRODUCT의 변경 요청이며 ExecPlan의 구현 상세나 실행 상태를 포함하지 않는다
 - Requirement 파일 경로를 안정적인 식별자로 사용한다
 - `docs/requirements/` 바로 아래의 모든 `*.md`를 Planner 입력으로 사용한다
@@ -311,6 +321,7 @@ BLOCKED → PR_OPEN (같은 PR을 사용자가 다시 열음)
 - Worker가 현재 환경에 맞는 전체 검증 스크립트를 생성하거나 갱신해야 한다
 - Worker는 전체 검증 스크립트를 직접 실행하지 않으며 Loop Manager 코드가 실행한다
 - PR 생성 직전에 최신 `origin/<base-branch>`를 rebase로 반영하고 전체 검증과 Review를 다시 통과해야 한다
+- 게시 직전 archive eligibility가 검증된 이동 집합과 다르면 같은 Worker 세션으로 돌아가 전체 검증과 Review를 다시 수행한다
 - 관련 테스트와 전체 검증이 통과해야 한다
 - Reviewer의 blocking issue가 없어야 한다
 - 같은 ExecPlan branch에 기존 PR이 있으면 이를 복구해 사용하고 중복 PR을 생성하지 않는다
