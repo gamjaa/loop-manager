@@ -10875,6 +10875,70 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
             loop_manager.AgentResultKind.USAGE_LIMIT,
         )
 
+    def test_claude_zero_exit_stream_error_remains_failure(self):
+        config = loop_manager.ROOT / "config/config.ini.example"
+        cases = (
+            ({"type": "error", "error": {"message": "usage limit reached"}},
+             "usage limit reached", loop_manager.AgentResultKind.USAGE_LIMIT, 1),
+            ({"type": "error", "message": "service unavailable"},
+             "service unavailable", loop_manager.AgentResultKind.TRANSIENT_FAILURE,
+             loop_manager.MAX_TRANSIENT_AGENT_RETRIES + 1),
+            ({"type": "error"}, '"type": "error"',
+             loop_manager.AgentResultKind.PERMANENT_CONFIGURATION, 1),
+            ({"type": "result", "is_error": True, "result": "usage limit reached"},
+             "usage limit reached", loop_manager.AgentResultKind.USAGE_LIMIT, 1),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for session_id in (None, "stream-session"):
+                for trailing_result in (False, True):
+                    for error, expected_message, kind, attempts in cases:
+                        with self.subTest(
+                            session_id=session_id, trailing_result=trailing_result,
+                            error=error,
+                        ):
+                            events = []
+                            if session_id:
+                                events.append({"type": "system", "session_id": session_id})
+                            events.append(error)
+                            if trailing_result:
+                                events.append({"type": "result", "result": "done"})
+                            stream = "\n".join(json.dumps(event) for event in events)
+
+                            def start(*_args, **_kwargs):
+                                process = mock.Mock()
+                                process.stdout = io.StringIO(stream)
+                                process.wait.return_value = 0
+                                return process
+
+                            with mock.patch(
+                                "loop_manager.claude_worker_profile",
+                                return_value=("claude-sonnet-5", "high"),
+                            ), mock.patch(
+                                "loop_manager.subprocess.Popen", side_effect=start
+                            ):
+                                result = loop_manager.run_claude(
+                                    root, root / "state", config, "worker", "prompt",
+                                    read_only=False, level=5, persist_session=True,
+                                )
+
+                            self.assertEqual(result.code, 1)
+                            self.assertEqual(result.session_id, session_id)
+                            self.assertIn(expected_message, result.message)
+                            self.assertNotIn("세션 ID를 확인", result.message)
+                            self.assertEqual(result.result_kind, kind)
+                            invoke = mock.Mock(return_value=result)
+                            retried = loop_manager.run_agent_with_retries(
+                                invoke, session_id=None
+                            )
+                            self.assertEqual(invoke.call_count, attempts)
+                            self.assertEqual(retried.result_kind, kind)
+                            if session_id and attempts > 1:
+                                self.assertEqual(
+                                    invoke.call_args_list[1],
+                                    mock.call(session_id, False),
+                                )
+
     def test_provider_dispatch_and_environment_strip_manager_secrets(self):
         result = loop_manager.AgentResult(0, "ok", "session")
         with mock.patch(

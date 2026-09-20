@@ -2567,6 +2567,7 @@ def run_claude(
 
     if streaming:
         final_event: Mapping[str, object] = {}
+        stream_error_seen = False
         stream_error_message = ""
         diagnostic_tail = ""
         with log.open("w", encoding="utf-8") as output:
@@ -2611,9 +2612,9 @@ def run_claude(
                     if not isinstance(event, dict):
                         continue
                     if event.get("is_error") or event.get("type") == "error":
+                        stream_error_seen = True
                         candidate = _claude_result_message(event)
-                        if candidate:
-                            stream_error_message = candidate
+                        stream_error_message = candidate or line.strip()[-6000:]
                     if event.get("is_error") or event.get("type") in {
                         "error",
                         "result",
@@ -2641,8 +2642,8 @@ def run_claude(
             finally:
                 timeout.cancel()
                 process.stdout.close()
-        message = _claude_result_message(final_event) or stream_error_message
-        if final_event.get("is_error") and returncode == 0:
+        message = stream_error_message or _claude_result_message(final_event)
+        if stream_error_seen and returncode == 0:
             returncode = 1
         if returncode and not message:
             message = diagnostic_tail
