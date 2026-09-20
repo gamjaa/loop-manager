@@ -10391,7 +10391,7 @@ class TimestampedExecutionProgressLogsTest(unittest.TestCase):
 
         self.assertEqual(raised.exception.errno, loop_manager.errno.ENOLCK)
 
-    def test_bash_launcher_preserves_git_output_exit_code_and_run_arguments(self):
+    def test_bash_launcher_skips_git_and_preserves_run_arguments(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             launcher = root / "run.sh"
@@ -10402,23 +10402,23 @@ class TimestampedExecutionProgressLogsTest(unittest.TestCase):
             python.chmod(0o755)
             git = root / "bin/git"
             git.parent.mkdir()
-            git.write_text("#!/usr/bin/env bash\nprintf '%s\\n' \"${GIT_OUTPUT:-Already up to date.}\"\nexit \"${GIT_EXIT:-0}\"\n", encoding="utf-8")
+            git.write_text("#!/usr/bin/env bash\nprintf 'git-called:%s\\n' \"$*\"\nexit 99\n", encoding="utf-8")
             git.chmod(0o755)
-            env = {**os.environ, "PATH": f"{git.parent}:{os.environ['PATH']}", "GIT_OUTPUT": "Updated"}
+            env = {**os.environ, "PATH": f"{git.parent}:{os.environ['PATH']}"}
             completed = subprocess.run(["bash", str(launcher), "target-repo"], cwd=root, env=env, text=True, capture_output=True)
             self.assertEqual(completed.returncode, 0)
-            self.assertIn("Updated", completed.stdout)
+            self.assertNotIn("git-called:", completed.stdout)
             self.assertIn("python:-u", completed.stdout)
             self.assertIn("run target-repo", completed.stdout)
-            failed = subprocess.run(["bash", str(launcher), "target-repo"], cwd=root, env={**env, "GIT_OUTPUT": "pull failed", "GIT_EXIT": "2"}, text=True, capture_output=True)
-            self.assertEqual(failed.returncode, 1)
-            self.assertIn("pull failed", failed.stdout)
-            self.assertNotIn("python:", failed.stdout)
 
 
     def test_launchers_have_no_timestamp_banner_and_scheduler_option_is_documented(self):
-        self.assertNotIn("Get-Date -Format", (loop_manager.ROOT / "run.ps1").read_text(encoding="utf-8"))
-        self.assertNotIn("date ", (loop_manager.ROOT / "run.sh").read_text(encoding="utf-8"))
+        powershell = (loop_manager.ROOT / "run.ps1").read_text(encoding="utf-8")
+        bash = (loop_manager.ROOT / "run.sh").read_text(encoding="utf-8")
+        self.assertNotIn("Get-Date -Format", powershell)
+        self.assertNotIn("date ", bash)
+        self.assertNotIn("git ", powershell.casefold())
+        self.assertNotIn("git ", bash.casefold())
         self.assertIn("--skip-if-running", (loop_manager.ROOT / "README.md").read_text(encoding="utf-8"))
 
 
