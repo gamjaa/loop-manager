@@ -359,7 +359,10 @@ class RequirementArchivingTest(unittest.TestCase):
         worker = self.worker_tree()
         archived = worker / loop_manager.requirement_archive_path(source)
         (worker / source).unlink()
-        archived.symlink_to("../../archive-target.md")
+        try:
+            archived.symlink_to("../../archive-target.md")
+        except (NotImplementedError, OSError) as error:
+            self.skipTest(f"symlink creation is unavailable: {error}")
         self.assertTrue(archived.is_file())
         self.assertEqual(archived.read_text(encoding="utf-8"), contents)
 
