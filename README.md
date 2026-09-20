@@ -68,7 +68,7 @@ bash scripts/setup.sh
 
 현재 최소 실행기는 외부 Python 패키지를 사용하지 않으므로 `requirements.txt`에는 의존성이 없다. 이후 패키지가 추가돼도 같은 스크립트를 다시 실행하면 된다.
 
-`config/config.ini.example`을 `config/config.ini`로 복사한 뒤 사용할 AI Agent 모델, Telegram 설정과 동시 실행 수를 입력한다. `max_workers` 기본값은 3이다.
+`config/config.ini.example`을 `config/config.ini`로 복사한 뒤 Codex와 Claude Code의 AI Agent 모델, Telegram 설정과 동시 실행 수를 입력한다. `max_workers` 기본값은 3이다.
 
 ```powershell
 Copy-Item -LiteralPath config/config.ini.example -Destination config/config.ini
@@ -108,7 +108,9 @@ Planner가 만든 ExecPlan은 검증 후 대상 저장소의 base branch에 fast
 .venv/bin/python loop_manager.py run /path/to/project
 ```
 
-실행기는 한 번에 한 프로젝트의 작은 작업 하나만 별도 worktree에서 처리한다. PR을 생성하면 Merge될 때까지 새 작업을 시작하지 않으며, 현재 기준 commit에서 할 일이 없다고 판단한 뒤에는 commit이 바뀔 때까지 Codex를 다시 호출하지 않는다. 서버에는 Python 3, Git, GitHub CLI와 인증된 Codex CLI가 필요하다.
+최초 실행에서 provider를 생략하면 `codex`로 등록된다. Claude Code를 사용할 프로젝트는 최초 실행에 `--provider claude`를 지정한다. 선택한 provider는 SQLite에 저장되며 이후 실행에서 다른 값으로 암묵적으로 바뀌지 않는다.
+
+실행기는 한 번에 한 프로젝트의 작은 작업 하나만 별도 worktree에서 처리한다. PR을 생성하면 Merge될 때까지 새 작업을 시작하지 않으며, 현재 기준 commit에서 할 일이 없다고 판단한 뒤에는 commit이 바뀔 때까지 Agent를 다시 호출하지 않는다. 서버에는 Python 3, Git, GitHub CLI와 프로젝트에서 선택한 인증된 Codex 또는 Claude Code CLI가 필요하다.
 
 cron 또는 작업 스케줄러에는 정상적인 중복 실행을 조용히 건너뛰도록 `--skip-if-running`을 붙인 같은 `run` 명령을 등록한다. 예를 들어 `.venv/bin/python loop_manager.py run --skip-if-running /path/to/project`처럼 실행한다. 이 옵션이 없으면 전역 잠금 충돌은 시각이 포함된 오류와 종료 코드 1로 보고된다. 잠금 이외의 오류는 이 옵션을 써도 그대로 보고된다. 동시 실행은 전역 잠금으로 거부하므로 여러 프로젝트 병렬 처리나 같은 실행에서의 프로젝트 순회는 후속 구현에서 추가한다.
 

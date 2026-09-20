@@ -10422,5 +10422,340 @@ class TimestampedExecutionProgressLogsTest(unittest.TestCase):
         self.assertIn("--skip-if-running", (loop_manager.ROOT / "README.md").read_text(encoding="utf-8"))
 
 
+class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
+    def test_legacy_project_migration_defaults_provider_to_codex(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            database = state_dir / "loop-manager.db"
+            legacy = sqlite3.connect(database)
+            legacy.execute(
+                "CREATE TABLE projects (repo TEXT PRIMARY KEY, base_branch TEXT NOT NULL)"
+            )
+            legacy.execute(
+                "INSERT INTO projects (repo, base_branch) VALUES ('repo', 'main')"
+            )
+            legacy.commit()
+            legacy.close()
+
+            with loop_manager.connect_database(state_dir) as migrated:
+                columns = {
+                    row[1] for row in migrated.execute("PRAGMA table_info(projects)")
+                }
+                row = migrated.execute(
+                    "SELECT provider FROM projects WHERE repo = 'repo'"
+                ).fetchone()
+
+        self.assertIn("provider", columns)
+        self.assertEqual(row["provider"], "codex")
+
+    def test_codex_and_claude_profiles_validate_every_role_and_level(self):
+        config = loop_manager.ROOT / "config/config.ini.example"
+        all_efforts = frozenset(
+            {"low", "medium", "high", "xhigh", "max", "ultra"}
+        )
+        codex_models = {
+            "gpt-6-astra": all_efforts,
+            "gpt-5.6-sol": all_efforts,
+            "gpt-5.6-terra": all_efforts,
+            "gpt-5.6-luna": all_efforts,
+        }
+
+        loop_manager.validate_provider_profiles(config, "codex", codex_models)
+        claude_models = loop_manager.claude_model_efforts(config)
+        loop_manager.validate_provider_profiles(config, "claude", claude_models)
+
+        self.assertEqual(
+            loop_manager.provider_worker_profile(
+                config, "codex", 7, codex_models
+            ),
+            ("gpt-5.6-sol", "xhigh"),
+        )
+        self.assertEqual(
+            loop_manager.provider_worker_profile(
+                config, "claude", 1, claude_models
+            ),
+            ("claude-haiku-4-5-20251001", "medium"),
+        )
+        self.assertEqual(
+            loop_manager.provider_profile(
+                config,
+                "claude",
+                "claude.roles",
+                "reviewer",
+                "Claude reviewer",
+                claude_models,
+            ),
+            ("claude-opus-5", "high"),
+        )
+
+    def test_invalid_claude_profile_stops_before_cli_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.ini"
+            config.write_text(
+                "[claude.models]\nfast = claude-haiku-4-5-20251001\n"
+                "[claude.worker]\nlevel1 = fast,minimal\n",
+                encoding="utf-8",
+            )
+            with mock.patch("loop_manager.subprocess.run") as run:
+                with self.assertRaisesRegex(RuntimeError, "Model/Effort 조합"):
+                    loop_manager.run_claude(
+                        root / "worktree",
+                        root / "state",
+                        config,
+                        "worker",
+                        "prompt",
+                        read_only=False,
+                        level=1,
+                    )
+
+        run.assert_not_called()
+
+    def test_runtime_validation_rejects_missing_and_unauthenticated_cli(self):
+        config = loop_manager.ROOT / "config/config.ini.example"
+        with mock.patch("loop_manager.shutil.which", return_value=None), mock.patch(
+            "loop_manager.command"
+        ) as command:
+            with self.assertRaisesRegex(RuntimeError, "설치되어 있지 않습니다"):
+                loop_manager.validate_provider_runtime(config, "claude")
+        command.assert_not_called()
+
+        unauthenticated = subprocess.CompletedProcess(
+            ["claude", "auth", "status"], 1, stdout="not logged in"
+        )
+        with mock.patch(
+            "loop_manager.shutil.which", return_value="/bin/claude"
+        ), mock.patch(
+            "loop_manager.command", return_value=unauthenticated
+        ), mock.patch(
+            "loop_manager.claude_model_efforts"
+        ) as model_efforts:
+            with self.assertRaisesRegex(RuntimeError, "인증되어 있지 않습니다"):
+                loop_manager.validate_provider_runtime(config, "claude")
+        model_efforts.assert_not_called()
+        authenticated = subprocess.CompletedProcess(
+            ["claude", "auth", "status"], 0, stdout='{"loggedIn":true}'
+        )
+        with mock.patch(
+            "loop_manager.shutil.which", return_value="/bin/claude"
+        ), mock.patch(
+            "loop_manager.command", return_value=authenticated
+        ) as auth_command:
+            loop_manager.validate_provider_runtime(config, "claude")
+        self.assertEqual(
+            auth_command.call_args.args[0],
+            ["claude", "auth", "status"],
+        )
+
+    def test_claude_starts_resumes_and_applies_role_permissions(self):
+        config = loop_manager.ROOT / "config/config.ini.example"
+        session_id = "claude-session"
+        calls: list[tuple[list[str], dict[str, object]]] = []
+        stream = (
+            json.dumps({"type": "system", "session_id": session_id})
+            + "\n"
+            + json.dumps(
+                {
+                    "type": "result",
+                    "session_id": session_id,
+                    "result": worker_result("Implement Claude adapter"),
+                    "is_error": False,
+                }
+            )
+            + "\n"
+        )
+
+        class StartedOutput:
+            def __iter__(self):
+                return iter(stream.splitlines(keepends=True))
+
+            def close(self):
+                pass
+
+        class StartedProcess:
+            def __init__(self, arguments, **kwargs):
+                calls.append((arguments, kwargs))
+                self.stdin = mock.Mock()
+                self.stdout = StartedOutput()
+
+            def wait(self):
+                return 0
+
+            def kill(self):
+                raise AssertionError("completed Claude process must not be killed")
+
+        resumed_payload = json.dumps(
+            {
+                "type": "result",
+                "session_id": session_id,
+                "result": "VERDICT: PASS",
+                "is_error": False,
+            }
+        )
+
+        def resumed(arguments, **kwargs):
+            calls.append((arguments, kwargs))
+            return subprocess.CompletedProcess(arguments, 0, stdout=resumed_payload)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worktree = root / "worktree"
+            worktree.mkdir()
+            state_dir = root / "state"
+            started_sessions: list[str] = []
+            with mock.patch(
+                "loop_manager.claude_worker_profile",
+                return_value=("claude-sonnet-5", "high"),
+            ), mock.patch(
+                "loop_manager.claude_role",
+                return_value=("claude-opus-5", "high"),
+            ), mock.patch(
+                "loop_manager.subprocess.Popen", side_effect=StartedProcess
+            ), mock.patch(
+                "loop_manager.subprocess.run", side_effect=resumed
+            ):
+                started = loop_manager.run_claude(
+                    worktree,
+                    state_dir,
+                    config,
+                    "worker",
+                    "worker prompt",
+                    read_only=False,
+                    level=5,
+                    persist_session=True,
+                    on_session_started=started_sessions.append,
+                )
+                resumed_result = loop_manager.run_claude(
+                    worktree,
+                    state_dir,
+                    config,
+                    "reviewer",
+                    "review prompt",
+                    read_only=True,
+                    persist_session=True,
+                    session_id=session_id,
+                )
+
+        self.assertEqual(started.session_id, session_id)
+        self.assertIn("COMMIT_TITLE:", started.message)
+        self.assertEqual(started_sessions, [session_id])
+        self.assertEqual(resumed_result.message, "VERDICT: PASS")
+        start_arguments, start_options = calls[0]
+        resume_arguments, resume_options = calls[1]
+        self.assertIn("stream-json", start_arguments)
+        self.assertEqual(
+            start_arguments[
+                start_arguments.index("--permission-mode") + 1
+            ],
+            "acceptEdits",
+        )
+        self.assertNotIn("worker prompt", start_arguments)
+        self.assertEqual(start_options["cwd"], worktree)
+        self.assertIn("--resume", resume_arguments)
+        self.assertIn(session_id, resume_arguments)
+        self.assertEqual(
+            resume_arguments[
+                resume_arguments.index("--permission-mode") + 1
+            ],
+            "plan",
+        )
+        self.assertIn("--disallowedTools", resume_arguments)
+        self.assertEqual(resume_options["cwd"], worktree)
+
+    def test_session_fallback_and_provider_errors_use_common_contract(self):
+        sessions: list[tuple[str | None, bool]] = []
+
+        def invoke(
+            session_id: str | None, fallback: bool
+        ) -> loop_manager.AgentResult:
+            sessions.append((session_id, fallback))
+            if session_id:
+                return loop_manager.AgentResult(
+                    1, "session was not found", session_id
+                )
+            return loop_manager.AgentResult(0, "fresh", "fresh-session")
+
+        result = loop_manager.run_agent_with_retries(
+            invoke, session_id="expired-session"
+        )
+        self.assertEqual(
+            sessions,
+            [("expired-session", False), (None, True)],
+        )
+        self.assertEqual(result.session_id, "fresh-session")
+        self.assertEqual(
+            loop_manager.classify_agent_result(1, "You've hit your limit"),
+            loop_manager.AgentResultKind.USAGE_LIMIT,
+        )
+        self.assertEqual(
+            loop_manager.classify_agent_result(1, "service unavailable"),
+            loop_manager.AgentResultKind.TRANSIENT_FAILURE,
+        )
+
+        attempts = 0
+
+        def timeout(
+            _session_id: str | None, _fallback: bool
+        ) -> loop_manager.AgentResult:
+            nonlocal attempts
+            attempts += 1
+            raise subprocess.TimeoutExpired(["claude"], 30)
+
+        timed_out = loop_manager.run_agent_with_retries(timeout, session_id=None)
+        self.assertEqual(attempts, loop_manager.MAX_TRANSIENT_AGENT_RETRIES + 1)
+        self.assertEqual(
+            timed_out.result_kind,
+            loop_manager.AgentResultKind.TRANSIENT_FAILURE,
+        )
+
+    def test_provider_dispatch_and_environment_strip_manager_secrets(self):
+        result = loop_manager.AgentResult(0, "ok", "session")
+        with mock.patch(
+            "loop_manager.run_codex", return_value=result
+        ) as codex, mock.patch(
+            "loop_manager.run_claude", return_value=result
+        ) as claude:
+            loop_manager.run_agent(
+                "codex", Path("worktree"), Path("state"), Path("config"), "planner", "p",
+                read_only=False,
+            )
+            loop_manager.run_agent(
+                "claude", Path("worktree"), Path("state"), Path("config"), "reviewer", "p",
+                read_only=True,
+            )
+        codex.assert_called_once()
+        claude.assert_called_once()
+
+        environment = {
+            "HOME": "/home/test",
+            "PATH": "/bin",
+            "ANTHROPIC_API_KEY": "provider-secret",
+            "TELEGRAM_TOKEN": "manager-secret",
+            "LOOP_MANAGER_SECRET": "manager-secret",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            claude_environment = loop_manager.agent_environment("claude")
+            codex_environment = loop_manager.agent_environment("codex")
+
+        self.assertEqual(
+            claude_environment["ANTHROPIC_API_KEY"], "provider-secret"
+        )
+        self.assertNotIn("TELEGRAM_TOKEN", claude_environment)
+        self.assertNotIn("LOOP_MANAGER_SECRET", claude_environment)
+        self.assertNotIn("ANTHROPIC_API_KEY", codex_environment)
+
+    def test_cli_accepts_provider_only_as_registration_choice(self):
+        args = loop_manager.build_parser().parse_args(
+            ["run", "repo", "--provider", "claude"]
+        )
+        self.assertEqual(args.provider, "claude")
+        with redirect_stderr(io.StringIO()), self.assertRaises(
+            SystemExit
+        ):
+            loop_manager.build_parser().parse_args(
+                ["run", "repo", "--provider", "unknown"]
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

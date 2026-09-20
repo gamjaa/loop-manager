@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Codex가 Loop Manager의 다음 PR을 만들게 하는 최소 부트스트랩 실행기."""
+"""AI Agent가 Loop Manager의 다음 PR을 만들게 하는 부트스트랩 실행기."""
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from typing import Protocol
 from urllib.parse import quote
 
 
@@ -38,6 +39,8 @@ PROJECT_STEP_USAGE_PAUSE = 4
 PROJECT_STEP_PLANNING_PENDING = 5
 TRANSIENT_AGENT_ERROR_PREFIX = "일시적 Agent 실패 (상태 보존):"
 USAGE_LIMIT_ERROR_PREFIX = "AI 사용 한도 소진 (상태 보존):"
+AGENT_PROVIDERS = frozenset({"codex", "claude"})
+CLAUDE_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 PLAN_SHA_BACKFILL_ERROR = "계획 commit SHA를 기존 작업에서 안전하게 복구할 수 없습니다."
 WORKSPACE_UNOWNED = 0
 WORKSPACE_OWNED = 1
@@ -51,6 +54,7 @@ ACTIVE_EXECPLAN_STATUSES = frozenset(
 KNOWN_EXECPLAN_STATUSES = ACTIVE_EXECPLAN_STATUSES | {"READY", "MERGED"}
 FIELDS = {
     "base_branch",
+    "provider",
     "processed_sha",
     "planning_fingerprint",
     "planning_attempt_fingerprint",
@@ -94,6 +98,7 @@ CREATE TABLE IF NOT EXISTS projects (
     repo TEXT PRIMARY KEY,
     base_branch TEXT NOT NULL,
     processed_sha TEXT,
+    provider TEXT NOT NULL DEFAULT 'codex',
     planning_fingerprint TEXT,
     planning_attempt_fingerprint TEXT,
     planning_workspace_owned INTEGER NOT NULL DEFAULT 0,
@@ -217,7 +222,7 @@ class ProjectRunResult:
 
 
 @dataclass(frozen=True)
-class CodexResult:
+class AgentResult:
     code: int
     message: str
     session_id: str | None = None
@@ -231,6 +236,39 @@ class CodexResult:
     def result_kind(self) -> AgentResultKind:
         return self.kind or classify_agent_result(self.code, self.message)
 
+
+@dataclass(frozen=True)
+class AgentProfile:
+    model: str
+    effort: str
+
+
+@dataclass(frozen=True)
+class AgentRequest:
+    worktree: Path
+    state_dir: Path
+    config_path: Path
+    role_name: str
+    prompt: str
+    read_only: bool
+    level: int | None = None
+    persist_session: bool = False
+    session_id: str | None = None
+    on_session_started: Callable[[str], None] | None = None
+
+
+# Public compatibility name for integrations written before provider-neutral
+# execution was introduced.
+CodexResult = AgentResult
+
+
+class AgentProvider(Protocol):
+    """Provider boundary consumed by orchestration state transitions."""
+
+    name: str
+
+    def run(self, request: AgentRequest) -> tuple[int, str] | AgentResult:
+        ...
 
 @dataclass(frozen=True)
 class ValidationFailureDecision:
@@ -433,6 +471,9 @@ def classify_agent_result(code: int, message: str) -> AgentResultKind:
             "quota exceeded",
             "insufficient_quota",
             "credit balance",
+            "usage limit reached",
+            "hit your limit",
+            "out of extra usage",
         )
     ):
         return AgentResultKind.USAGE_LIMIT
@@ -441,6 +482,8 @@ def classify_agent_result(code: int, message: str) -> AgentResultKind:
         for phrase in (
             "timed out",
             "timeout",
+            "overloaded",
+            "rate limit exceeded",
             "temporarily unavailable",
             "service unavailable",
             "connection reset",
@@ -481,21 +524,21 @@ def session_resume_unavailable(message: str) -> bool:
     )
 
 
-def _coerce_codex_result(
-    result: tuple[int, str] | CodexResult,
+def _coerce_agent_result(
+    result: tuple[int, str] | AgentResult,
     session_id: str | None,
-) -> CodexResult:
-    if isinstance(result, CodexResult):
+) -> AgentResult:
+    if isinstance(result, AgentResult):
         return result
     code, message = result
-    return CodexResult(code, message, session_id)
+    return AgentResult(code, message, session_id)
 
 
 def run_agent_with_retries(
-    invoke: Callable[[str | None, bool], tuple[int, str] | CodexResult],
+    invoke: Callable[[str | None, bool], tuple[int, str] | AgentResult],
     *,
     session_id: str | None,
-) -> CodexResult:
+) -> AgentResult:
     """Retry transient CLI failures and replace an unavailable saved session once."""
 
     active_session_id = session_id
@@ -504,16 +547,16 @@ def run_agent_with_retries(
     while True:
         try:
             raw_result = invoke(active_session_id, session_fallback)
-            result = _coerce_codex_result(raw_result, active_session_id)
+            result = _coerce_agent_result(raw_result, active_session_id)
         except subprocess.TimeoutExpired as error:
-            result = CodexResult(
+            result = AgentResult(
                 1,
                 f"Agent CLI timeout: {error}",
                 active_session_id,
                 AgentResultKind.TRANSIENT_FAILURE,
             )
         except OSError as error:
-            result = CodexResult(
+            result = AgentResult(
                 1,
                 f"Agent CLI 실행 실패: {error}",
                 active_session_id,
@@ -674,6 +717,7 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
             raise RuntimeError("상태 DB를 읽을 수 없습니다. 백업을 복원하거나 다시 초기화하세요.") from error
     columns = {row[1] for row in connection.execute("PRAGMA table_info(projects)")}
     migrations = {
+        "provider": "TEXT NOT NULL DEFAULT 'codex'",
         "plan_path": "TEXT",
         "planning_fingerprint": "TEXT",
         "planning_attempt_fingerprint": "TEXT",
@@ -1668,9 +1712,17 @@ def _mirror_project_update_to_execplan(
     )
 
 
-def validate_repository(path: Path, *, allow_agents_mismatch: bool) -> Path:
-    if not shutil.which("git") or not shutil.which("gh") or not shutil.which("codex"):
-        raise RuntimeError("git, gh와 codex CLI가 PATH에 있어야 합니다.")
+def validate_repository(
+    path: Path,
+    *,
+    allow_agents_mismatch: bool,
+    provider: str = "codex",
+    config_path: Path | None = None,
+) -> Path:
+    if not shutil.which("git") or not shutil.which("gh"):
+        raise RuntimeError("git과 gh CLI가 PATH에 있어야 합니다.")
+    if provider not in AGENT_PROVIDERS:
+        raise RuntimeError(f"지원하지 않는 Agent provider입니다: {provider}")
     path = path.expanduser().resolve()
     root = Path(git(path, "rev-parse", "--show-toplevel").stdout.strip()).resolve()
     if root != path:
@@ -1690,6 +1742,12 @@ def validate_repository(path: Path, *, allow_agents_mismatch: bool) -> Path:
     if common_agents not in target_agents and not allow_agents_mismatch:
         raise RuntimeError(
             "AGENTS.md에 공통 규칙이 없습니다. 확인 후 --allow-agents-mismatch로 강제 실행하세요."
+        )
+    if config_path is not None:
+        validate_provider_runtime(config_path, provider, root)
+    elif not shutil.which(provider):
+        raise RuntimeError(
+            f"선택한 {provider.capitalize()} CLI가 PATH에 설치되어 있지 않습니다."
         )
     return root
 
@@ -2005,11 +2063,61 @@ def worker_profile(
     )
 
 
+def claude_model_efforts(config_path: Path) -> dict[str, frozenset[str]]:
+    """Build the locally valid Claude model catalog from configured aliases."""
 
-def agent_environment() -> dict[str, str]:
+    parser = configparser.ConfigParser()
+    try:
+        loaded = parser.read(config_path, encoding="utf-8")
+    except configparser.Error as error:
+        raise RuntimeError(
+            f"Claude 설정 파일 형식이 올바르지 않습니다: {config_path}"
+        ) from error
+    if not loaded:
+        raise RuntimeError(f"설정 파일이 없습니다: {config_path}")
+    if "claude.models" not in parser:
+        raise RuntimeError("Claude Model alias section [claude.models]가 없습니다.")
+
+    catalog: dict[str, frozenset[str]] = {}
+    for model in parser["claude.models"].values():
+        resolved = model.strip()
+        if not re.fullmatch(r"claude-(?:opus|sonnet|haiku)-[a-z0-9.-]+", resolved):
+            raise RuntimeError(
+                f"Claude CLI가 지원하는 Model 이름 형식이 아닙니다: {resolved or '<empty>'}"
+            )
+        catalog[resolved] = CLAUDE_EFFORTS
+    return catalog
+
+
+def claude_role(
+    config_path: Path,
+    name: str,
+) -> tuple[str, str]:
+    return provider_profile(
+        config_path,
+        "claude",
+        "claude.roles",
+        name,
+        f"Claude {name}",
+        claude_model_efforts(config_path),
+    )
+
+
+def claude_worker_profile(
+    config_path: Path,
+    level: int,
+) -> tuple[str, str]:
+    return provider_worker_profile(
+        config_path,
+        "claude",
+        level,
+        claude_model_efforts(config_path),
+    )
+
+
+def agent_environment(provider: str = "codex") -> dict[str, str]:
     allowed = {
         "APPDATA",
-        "CODEX_HOME",
         "COMSPEC",
         "HOME",
         "LANG",
@@ -2024,6 +2132,24 @@ def agent_environment() -> dict[str, str]:
         "USERPROFILE",
         "WINDIR",
     }
+    provider_allowed = {
+        "codex": {
+            "CODEX_ACCESS_TOKEN",
+            "CODEX_CA_CERTIFICATE",
+            "CODEX_HOME",
+            "OPENAI_API_KEY",
+        },
+        "claude": {
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CONFIG_DIR",
+        },
+    }
+    if provider not in provider_allowed:
+        raise RuntimeError(f"지원하지 않는 Agent provider입니다: {provider}")
+    allowed.update(provider_allowed[provider])
+
     return {key: value for key, value in os.environ.items() if key.upper() in allowed}
 
 
@@ -2103,7 +2229,7 @@ def run_codex(
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                env=agent_environment(),
+                env=agent_environment("codex"),
                 cwd=worktree,
             )
             assert process.stdin is not None
@@ -2161,7 +2287,7 @@ def run_codex(
                 errors="replace",
                 stdout=output,
                 stderr=subprocess.STDOUT,
-                env=agent_environment(),
+                env=agent_environment("codex"),
                 cwd=worktree,
                 timeout=AGENT_CLI_TIMEOUT_SECONDS,
             )
@@ -2189,6 +2315,370 @@ def run_codex(
             ),
         )
     return returncode, message.strip()
+
+
+def _agent_profile(
+    config_path: Path,
+    provider: str,
+    role_name: str,
+    level: int | None,
+    worktree: Path,
+) -> AgentProfile:
+    if role_name == "worker":
+        if level is None:
+            raise RuntimeError(f"{provider.capitalize()} Worker level이 없습니다.")
+        if provider == "codex":
+            return AgentProfile(*worker_profile(config_path, level, worktree))
+        if provider == "claude":
+            return AgentProfile(*claude_worker_profile(config_path, level))
+    elif level is not None:
+        raise RuntimeError(
+            f"{provider.capitalize()} {role_name}에 Worker level을 지정할 수 없습니다."
+        )
+    elif provider == "codex":
+        return AgentProfile(*role(config_path, role_name, worktree))
+    elif provider == "claude":
+        return AgentProfile(*claude_role(config_path, role_name))
+    raise RuntimeError(f"지원하지 않는 Agent provider입니다: {provider}")
+
+
+def validate_provider_profiles(
+    config_path: Path,
+    provider: str,
+    model_efforts: Mapping[str, frozenset[str]],
+) -> None:
+    """Validate every configured role before an Agent state transition."""
+
+    for role_name in ("planner", "reviewer"):
+        provider_profile(
+            config_path,
+            provider,
+            f"{provider}.roles",
+            role_name,
+            f"{provider.capitalize()} {role_name}",
+            model_efforts,
+        )
+    for level in range(1, 9):
+        provider_worker_profile(config_path, provider, level, model_efforts)
+
+
+def validate_provider_runtime(
+    config_path: Path,
+    provider: str,
+    worktree: Path | None = None,
+) -> None:
+    """Fail fast when the selected CLI, auth, or profiles are unavailable."""
+
+    if provider not in AGENT_PROVIDERS:
+        raise RuntimeError(f"지원하지 않는 Agent provider입니다: {provider}")
+    executable = "codex" if provider == "codex" else "claude"
+    label = "Codex" if provider == "codex" else "Claude"
+    if not shutil.which(executable):
+        raise RuntimeError(f"선택한 {label} CLI가 PATH에 설치되어 있지 않습니다.")
+
+    auth_arguments = (
+        ["codex", "login", "status"]
+        if provider == "codex"
+        else ["claude", "auth", "status"]
+    )
+    auth = command(
+        auth_arguments,
+        cwd=worktree,
+        check=False,
+        env=agent_environment(provider),
+    )
+    if auth.returncode:
+        login = "codex login" if provider == "codex" else "claude auth login"
+        raise RuntimeError(
+            f"선택한 {label} CLI가 인증되어 있지 않습니다. {login}을 실행하세요."
+        )
+
+    try:
+        model_efforts = (
+            codex_model_efforts(worktree)
+            if provider == "codex"
+            else claude_model_efforts(config_path)
+        )
+        validate_provider_profiles(config_path, provider, model_efforts)
+    except RuntimeError as error:
+        raise RuntimeError(f"{label} profile 설정 오류: {error}") from error
+
+
+def claude_permission_arguments(read_only: bool) -> list[str]:
+    if read_only:
+        return [
+            "--permission-mode",
+            "plan",
+            "--disallowedTools",
+            "Edit",
+            "Write",
+            "NotebookEdit",
+        ]
+    return ["--permission-mode", "acceptEdits"]
+
+
+def _claude_result_message(event: Mapping[str, object]) -> str:
+    result = event.get("result")
+    if isinstance(result, str):
+        return result
+    message = event.get("message")
+    if isinstance(message, str):
+        return message
+    if isinstance(message, Mapping):
+        content = message.get("content")
+        if isinstance(content, list):
+            return "".join(
+                str(block.get("text", ""))
+                for block in content
+                if isinstance(block, Mapping) and block.get("type") == "text"
+            )
+    return ""
+
+
+def run_claude(
+    worktree: Path,
+    state_dir: Path,
+    config_path: Path,
+    role_name: str,
+    prompt: str,
+    *,
+    read_only: bool,
+    level: int | None = None,
+    persist_session: bool = False,
+    session_id: str | None = None,
+    on_session_started: Callable[[str], None] | None = None,
+) -> tuple[int, str] | AgentResult:
+    profile = _agent_profile(
+        config_path, "claude", role_name, level, worktree
+    )
+    model, effort = profile.model, profile.effort
+    project_dir = (
+        state_dir
+        / "logs"
+        / hashlib.sha256(str(worktree).encode()).hexdigest()[:16]
+    )
+    project_dir.mkdir(parents=True, exist_ok=True)
+    log = project_dir / f"claude-{role_name}.log"
+    last_message = project_dir / f"claude-{role_name}-last.txt"
+    last_message.unlink(missing_ok=True)
+
+    streaming = persist_session and session_id is None
+    arguments = [
+        "claude",
+        "--print",
+        "--output-format",
+        "stream-json" if streaming else "json",
+        *(["--verbose"] if streaming else []),
+        "--model",
+        model,
+        "--effort",
+        effort,
+        *claude_permission_arguments(read_only),
+        *(["--resume", session_id] if session_id else []),
+    ]
+    resolved_session_id = session_id
+    message = ""
+    returncode = 0
+    timeout_triggered = threading.Event()
+
+    if streaming:
+        final_event: Mapping[str, object] = {}
+        with log.open("w", encoding="utf-8") as output:
+            process = subprocess.Popen(
+                arguments,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=agent_environment("claude"),
+                cwd=worktree,
+            )
+            assert process.stdin is not None
+            assert process.stdout is not None
+
+            def terminate_on_timeout() -> None:
+                timeout_triggered.set()
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+
+            timeout = threading.Timer(
+                AGENT_CLI_TIMEOUT_SECONDS,
+                terminate_on_timeout,
+            )
+            timeout.daemon = True
+            timeout.start()
+            try:
+                process.stdin.write(prompt)
+                process.stdin.close()
+                for line in process.stdout:
+                    output.write(line)
+                    output.flush()
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    event_session = event.get("session_id")
+                    if (
+                        resolved_session_id is None
+                        and isinstance(event_session, str)
+                        and event_session
+                    ):
+                        resolved_session_id = event_session
+                        if on_session_started:
+                            on_session_started(resolved_session_id)
+                    if event.get("type") == "result":
+                        final_event = event
+                returncode = process.wait()
+            except BaseException:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+                process.wait()
+                raise
+            finally:
+                timeout.cancel()
+                process.stdout.close()
+        message = _claude_result_message(final_event)
+        if final_event.get("is_error") and returncode == 0:
+            returncode = 1
+    else:
+        result = subprocess.run(
+            arguments,
+            input=prompt,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=agent_environment("claude"),
+            cwd=worktree,
+            timeout=AGENT_CLI_TIMEOUT_SECONDS,
+        )
+        returncode = result.returncode
+        raw_output = result.stdout or ""
+        log.write_text(raw_output, encoding="utf-8")
+        try:
+            event = json.loads(raw_output)
+        except json.JSONDecodeError:
+            event = {}
+        if isinstance(event, dict):
+            message = _claude_result_message(event)
+            event_session = event.get("session_id")
+            if isinstance(event_session, str) and event_session:
+                resolved_session_id = event_session
+            if event.get("is_error") and returncode == 0:
+                returncode = 1
+        if not message and returncode:
+            message = raw_output[-6000:]
+
+    if timeout_triggered.is_set():
+        message = f"Claude {role_name} 실행 timeout ({AGENT_CLI_TIMEOUT_SECONDS}초)"
+    if message:
+        last_message.write_text(message, encoding="utf-8")
+    if persist_session and not resolved_session_id and returncode == 0:
+        return AgentResult(
+            1,
+            f"Claude {role_name} 실행 결과에서 세션 ID를 확인할 수 없습니다.",
+        )
+    if persist_session or session_id:
+        return AgentResult(
+            returncode,
+            message.strip(),
+            resolved_session_id,
+            (
+                AgentResultKind.TRANSIENT_FAILURE
+                if timeout_triggered.is_set()
+                else None
+            ),
+        )
+    return returncode, message.strip()
+
+
+class CodexAgentAdapter:
+    name = "codex"
+
+    def run(self, request: AgentRequest) -> tuple[int, str] | AgentResult:
+        return run_codex(
+            request.worktree,
+            request.state_dir,
+            request.config_path,
+            request.role_name,
+            request.prompt,
+            read_only=request.read_only,
+            level=request.level,
+            persist_session=request.persist_session,
+            session_id=request.session_id,
+            on_session_started=request.on_session_started,
+        )
+
+
+class ClaudeAgentAdapter:
+    name = "claude"
+
+    def run(self, request: AgentRequest) -> tuple[int, str] | AgentResult:
+        return run_claude(
+            request.worktree,
+            request.state_dir,
+            request.config_path,
+            request.role_name,
+            request.prompt,
+            read_only=request.read_only,
+            level=request.level,
+            persist_session=request.persist_session,
+            session_id=request.session_id,
+            on_session_started=request.on_session_started,
+        )
+
+
+_AGENT_ADAPTERS: dict[str, AgentProvider] = {
+    "codex": CodexAgentAdapter(),
+    "claude": ClaudeAgentAdapter(),
+}
+
+
+def agent_provider(name: str) -> AgentProvider:
+    try:
+        return _AGENT_ADAPTERS[name]
+    except KeyError as error:
+        raise RuntimeError(f"지원하지 않는 Agent provider입니다: {name}") from error
+
+
+def run_agent(
+    provider: str,
+    worktree: Path,
+    state_dir: Path,
+    config_path: Path,
+    role_name: str,
+    prompt: str,
+    *,
+    read_only: bool,
+    level: int | None = None,
+    persist_session: bool = False,
+    session_id: str | None = None,
+    on_session_started: Callable[[str], None] | None = None,
+) -> tuple[int, str] | AgentResult:
+    """Execute one provider-neutral Agent request."""
+
+    request = AgentRequest(
+        worktree=worktree,
+        state_dir=state_dir,
+        config_path=config_path,
+        role_name=role_name,
+        prompt=prompt,
+        read_only=read_only,
+        level=level,
+        persist_session=persist_session,
+        session_id=session_id,
+        on_session_started=on_session_started,
+    )
+    return agent_provider(provider).run(request)
 
 
 class VerifyOutput(str):
@@ -7326,6 +7816,7 @@ def _run_project_step(
     config_path: Path,
     requested_base: str | None,
     allow_agents_mismatch: bool,
+    requested_provider: str | None = None,
 ) -> int:
     # Resolve the persisted project key without consulting repository config.
     # An interrupted Agent may have changed origin or hooksPath, so the saved
@@ -7337,6 +7828,17 @@ def _run_project_step(
         "SELECT * FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
+    provider = str(row["provider"]) if row else (requested_provider or "codex")
+    if provider not in AGENT_PROVIDERS:
+        raise RuntimeError(f"지원하지 않는 Agent provider입니다: {provider}")
+    if (
+        row is not None
+        and requested_provider is not None
+        and requested_provider != provider
+    ):
+        raise RuntimeError(
+            f"등록된 provider는 {provider}이며 {requested_provider}로 변경할 수 없습니다."
+        )
     _ensure_cleanup_pending_schema(connection)
     cleanup_candidates = frozenset(
         str(_canonical_path(Path(item["worktree"])))
@@ -7423,6 +7925,8 @@ def _run_project_step(
     repo_path = validate_repository(
         repo_path,
         allow_agents_mismatch=allow_agents_mismatch,
+        provider=provider,
+        config_path=config_path,
     )
     backfill_plan_shas(connection, target_repo=repo)
     migrate_legacy_execplans(
@@ -7547,7 +8051,10 @@ def _run_project_step(
     ensure_safe_base_worktree(repo_path, base)
 
     if not row:
-        connection.execute("INSERT INTO projects (repo, base_branch) VALUES (?, ?)", (repo, base))
+        connection.execute(
+            "INSERT INTO projects (repo, base_branch, provider) VALUES (?, ?, ?)",
+            (repo, base, provider),
+        )
         connection.commit()
         migrate_legacy_execplans(
             connection,
@@ -7641,18 +8148,18 @@ def _run_project_step(
 
     if not row["phase"] and row["planning_fingerprint"] == current_fingerprint:
         update_project(connection, repo, processed_sha=base_sha)
-        operation_print("계획 입력이 바뀌지 않아 Codex를 실행하지 않습니다.")
+        operation_print("계획 입력이 바뀌지 않아 Agent를 실행하지 않습니다.")
         planning_required = False
 
     if planning_required and row["planning_fingerprint"] and row["processed_sha"]:
         processed_fingerprint = _planning_input_fingerprint(repo_path, row["processed_sha"])
         if processed_fingerprint == current_fingerprint:
             update_project(connection, repo, processed_sha=base_sha)
-            operation_print("계획 입력이 바뀌지 않아 Codex를 실행하지 않습니다.")
+            operation_print("계획 입력이 바뀌지 않아 Agent를 실행하지 않습니다.")
             planning_required = False
         elif _is_requirement_archive_only_change(repo_path, row["processed_sha"], base_sha):
             update_project(connection, repo, processed_sha=base_sha)
-            operation_print("Requirement archive 이동 외의 계획 입력이 바뀌지 않아 Codex를 실행하지 않습니다.")
+            operation_print("Requirement archive 이동 외의 계획 입력이 바뀌지 않아 Agent를 실행하지 않습니다.")
             planning_required = False
 
     if planning_required:
@@ -7798,7 +8305,8 @@ def _run_project_step(
                 "planner",
             )
             result = run_agent_with_retries(
-                lambda current_session_id, _session_recovery: run_codex(
+                lambda current_session_id, _session_recovery: run_agent(
+                    provider,
                     planning_worktree,
                     state_dir,
                     config_path,
@@ -8245,7 +8753,8 @@ def _run_project_step(
             feedback for feedback in persisted_validation_feedback if feedback
         )
         result = run_agent_with_retries(
-            lambda current_session_id, session_recovery: run_codex(
+            lambda current_session_id, session_recovery: run_agent(
+                provider,
                 worktree,
                 state_dir,
                 config_path,
@@ -8300,7 +8809,7 @@ def _run_project_step(
         clear_agent_scope(connection, repo)
 
         if code:
-            worker_error = message or f"Codex 종료 코드 {code}"
+            worker_error = message or f"Agent 종료 코드 {code}"
             result_kind = result.result_kind
             if result_kind is AgentResultKind.TRANSIENT_FAILURE:
                 worker_error = f"{TRANSIENT_AGENT_ERROR_PREFIX} {worker_error}"
@@ -8711,7 +9220,8 @@ def _run_project_step(
         )
 
         review_result = run_agent_with_retries(
-            lambda current_session_id, session_recovery: run_codex(
+            lambda current_session_id, session_recovery: run_agent(
+                provider,
                 worktree,
                 state_dir,
                 config_path,
@@ -9125,6 +9635,7 @@ def run_project_result(
     config_path: Path,
     requested_base: str | None,
     allow_agents_mismatch: bool,
+    requested_provider: str | None = None,
 ) -> ProjectRunResult:
     """Run retryable validation progress to a stable project-level outcome."""
 
@@ -9136,6 +9647,7 @@ def run_project_result(
             config_path,
             requested_base,
             allow_agents_mismatch,
+            requested_provider,
         )
         if step_result != PROJECT_STEP_RETRY:
             break
@@ -9174,6 +9686,7 @@ def run_project(
     config_path: Path,
     requested_base: str | None,
     allow_agents_mismatch: bool,
+    requested_provider: str | None = None,
 ) -> int:
     """CLI-compatible adapter for the reusable structured project result."""
 
@@ -9184,6 +9697,7 @@ def run_project(
         config_path,
         requested_base,
         allow_agents_mismatch,
+        requested_provider,
     ).exit_code
 
 
@@ -9196,6 +9710,11 @@ def build_parser() -> argparse.ArgumentParser:
     run = subcommands.add_parser("run", help="프로젝트에서 다음 최소 작업 하나를 처리")
     run.add_argument("repository", help="대상 Git 저장소 루트")
     run.add_argument("--base", help="기준 branch. 생략하면 origin/HEAD 사용")
+    run.add_argument(
+        "--provider",
+        choices=sorted(AGENT_PROVIDERS),
+        help="최초 등록 시 사용할 Agent provider (기본값: codex)",
+    )
     run.add_argument(
         "--allow-agents-mismatch",
         action="store_true",
@@ -9227,6 +9746,7 @@ def main() -> int:
                     Path(args.config).expanduser().resolve(),
                     args.base,
                     args.allow_agents_mismatch,
+                    args.provider,
                 )
     except ProcessLockBusyError as error:
         if args.command == "run" and args.skip_if_running:
