@@ -27,6 +27,9 @@ import threading
 from typing import Protocol
 from urllib.parse import quote
 
+from managed_config import ManagedConfig, ManagedConfigError, load_managed_config
+import project_registry
+
 
 ROOT = Path(__file__).resolve().parent
 MAX_PLANNER_VALIDATION_RETRIES = 3
@@ -99,6 +102,9 @@ CREATE TABLE IF NOT EXISTS projects (
     base_branch TEXT NOT NULL,
     processed_sha TEXT,
     provider TEXT NOT NULL DEFAULT 'codex',
+    registered INTEGER NOT NULL DEFAULT 1,
+    agents_hash TEXT,
+    agents_approved INTEGER NOT NULL DEFAULT 0,
     planning_fingerprint TEXT,
     planning_attempt_fingerprint TEXT,
     planning_workspace_owned INTEGER NOT NULL DEFAULT 0,
@@ -241,6 +247,15 @@ class AgentResult:
 class AgentProfile:
     model: str
     effort: str
+
+
+@dataclass(frozen=True)
+class ProjectRegistrationInspection:
+    root: Path
+    base_branch: str
+    provider: str
+    agents_hash: str
+    agents_approved: bool
 
 
 @dataclass(frozen=True)
@@ -809,11 +824,14 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
 def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connection:
     database = state_dir / "loop-manager.db"
     if not create and not database.is_file():
-        raise RuntimeError("상태 DB가 없습니다. 먼저 `loop_manager.py init`을 실행하세요.")
+        raise RuntimeError(
+            "상태 DB가 없습니다. 먼저 `loop_manager.py config init`을 실행하세요."
+        )
     connection = sqlite3.connect(database)
     connection.row_factory = sqlite3.Row
     if create:
         connection.execute(SCHEMA)
+        project_registry.ensure_registry_schema(connection)
         _ensure_execplans_schema(connection)
         _ensure_cleanup_pending_schema(connection)
         connection.commit()
@@ -861,6 +879,7 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
             connection.execute(f"ALTER TABLE projects ADD COLUMN {column} {definition}")
     if not migrations.keys() <= columns:
         connection.commit()
+    project_registry.ensure_registry_schema(connection)
     _ensure_execplans_schema(connection)
     _ensure_cleanup_pending_schema(connection)
     connection.commit()
@@ -1820,18 +1839,42 @@ def _mirror_project_update_to_execplan(
     )
 
 
+def validate_runtime_prerequisites(
+    path: Path,
+    *,
+    provider: str,
+    config_path: Path | None,
+) -> None:
+    """Validate executable, authentication, and profile prerequisites only."""
+
+    if not shutil.which("git") or not shutil.which("gh"):
+        raise RuntimeError("git과 gh CLI가 PATH에 있어야 합니다.")
+    if provider not in AGENT_PROVIDERS:
+        raise RuntimeError(f"지원하지 않는 Agent provider입니다: {provider}")
+    if config_path is not None:
+        validate_provider_runtime(config_path, provider, path)
+    elif not shutil.which(provider):
+        raise RuntimeError(
+            f"선택한 {provider.capitalize()} CLI가 PATH에 설치되어 있지 않습니다."
+        )
+
+
 def validate_repository(
     path: Path,
     *,
     allow_agents_mismatch: bool,
     provider: str = "codex",
     config_path: Path | None = None,
+    registration_checks: bool = True,
 ) -> Path:
-    if not shutil.which("git") or not shutil.which("gh"):
-        raise RuntimeError("git과 gh CLI가 PATH에 있어야 합니다.")
-    if provider not in AGENT_PROVIDERS:
-        raise RuntimeError(f"지원하지 않는 Agent provider입니다: {provider}")
     path = path.expanduser().resolve()
+    validate_runtime_prerequisites(
+        path,
+        provider=provider,
+        config_path=config_path,
+    )
+    if not registration_checks:
+        return path
     root = Path(git(path, "rev-parse", "--show-toplevel").stdout.strip()).resolve()
     if root != path:
         raise RuntimeError(f"저장소 루트 경로를 지정하세요: {root}")
@@ -1849,13 +1892,8 @@ def validate_repository(
     target_agents = normalized_text(root / "AGENTS.md")
     if common_agents not in target_agents and not allow_agents_mismatch:
         raise RuntimeError(
-            "AGENTS.md에 공통 규칙이 없습니다. 확인 후 --allow-agents-mismatch로 강제 실행하세요."
-        )
-    if config_path is not None:
-        validate_provider_runtime(config_path, provider, root)
-    elif not shutil.which(provider):
-        raise RuntimeError(
-            f"선택한 {provider.capitalize()} CLI가 PATH에 설치되어 있지 않습니다."
+            "AGENTS.md에 공통 규칙이 없습니다. 명시적인 `config add "
+            "--approve-agents-mismatch`에서 승인하세요."
         )
     return root
 
@@ -1869,6 +1907,115 @@ def remote_base(repo: Path, requested: str | None) -> str:
         base = reference.removeprefix("origin/")
     git(repo, "rev-parse", "--verify", f"origin/{base}")
     return base
+
+
+def inspect_registration_files(
+    root: Path,
+    *,
+    approve_agents_mismatch: bool,
+) -> tuple[str, bool]:
+    """Validate registration documents without invoking Git or an Agent CLI."""
+
+    required = [
+        root / "AGENTS.md",
+        root / "docs/PLANS.md",
+        root / "docs/ARCHITECTURE.md",
+    ]
+    missing = [str(item.relative_to(root)) for item in required if not item.is_file()]
+    requirements = root / "docs/requirements"
+    active_requirements = tuple(requirements.glob("*.md"))
+    product = root / "docs/PRODUCT.md"
+    if not product.is_file() and not active_requirements:
+        missing.append("docs/PRODUCT.md 또는 docs/requirements/*.md")
+    if missing:
+        raise RuntimeError("필수 파일이 없습니다: " + ", ".join(missing))
+
+    if file_hash(root / "docs/PLANS.md") != file_hash(ROOT / "docs/PLANS.md"):
+        raise RuntimeError("docs/PLANS.md가 Loop Manager 기준 파일과 다릅니다.")
+    if file_hash(root / "docs/ARCHITECTURE.md") == file_hash(
+        ROOT / "docs/ARCHITECTURE.template.md"
+    ):
+        raise RuntimeError(
+            "docs/ARCHITECTURE.md가 변경되지 않은 템플릿이라 등록할 수 없습니다."
+        )
+    if product.is_file() and file_hash(product) == file_hash(
+        ROOT / "docs/PRODUCT.template.md"
+    ):
+        raise RuntimeError(
+            "docs/PRODUCT.md가 변경되지 않은 템플릿이라 등록할 수 없습니다."
+        )
+
+    common_agents = normalized_text(ROOT / "AGENTS.md")
+    target_agents = normalized_text(root / "AGENTS.md")
+    agents_hash = file_hash(root / "AGENTS.md")
+    mismatch = common_agents not in target_agents
+    if mismatch and not approve_agents_mismatch:
+        raise RuntimeError(
+            "AGENTS.md에 공통 규칙이 없습니다. 내용을 확인한 뒤 "
+            "`config add --approve-agents-mismatch`로 승인하세요."
+        )
+    return agents_hash, mismatch
+
+
+def inspect_project_registration(
+    path: Path,
+    *,
+    config_path: Path,
+    provider: str,
+    requested_base: str | None,
+    approve_agents_mismatch: bool,
+) -> ProjectRegistrationInspection:
+    """Validate one project completely before its registry row is changed."""
+
+    path = path.expanduser().resolve()
+    validate_runtime_prerequisites(
+        path,
+        provider=provider,
+        config_path=config_path,
+    )
+    root = Path(git(path, "rev-parse", "--show-toplevel").stdout.strip()).resolve()
+    if root != path:
+        raise RuntimeError(f"저장소 루트 경로를 지정하세요: {root}")
+    github_repository(git(root, "remote", "get-url", "origin").stdout)
+    agents_hash, agents_approved = inspect_registration_files(
+        root,
+        approve_agents_mismatch=approve_agents_mismatch,
+    )
+    base_branch = remote_base(root, requested_base)
+    return ProjectRegistrationInspection(
+        root=root,
+        base_branch=base_branch,
+        provider=provider,
+        agents_hash=agents_hash,
+        agents_approved=agents_approved,
+    )
+
+
+def add_registered_project(
+    connection: sqlite3.Connection,
+    path: Path,
+    *,
+    config_path: Path,
+    provider: str,
+    requested_base: str | None,
+    approve_agents_mismatch: bool,
+) -> project_registry.RegisteredProject:
+    inspection = inspect_project_registration(
+        path,
+        config_path=config_path,
+        provider=provider,
+        requested_base=requested_base,
+        approve_agents_mismatch=approve_agents_mismatch,
+    )
+    project = project_registry.RegisteredProject(
+        repo=str(inspection.root),
+        base_branch=inspection.base_branch,
+        provider=inspection.provider,
+        agents_hash=inspection.agents_hash,
+        agents_approved=inspection.agents_approved,
+    )
+    project_registry.add_project(connection, project)
+    return project
 
 
 def ensure_safe_base_worktree(repo: Path, base: str) -> None:
@@ -8024,17 +8171,23 @@ def _run_project_step(
     requested_base: str | None,
     allow_agents_mismatch: bool,
     requested_provider: str | None = None,
+    registered_only: bool = False,
 ) -> int:
     # Resolve the persisted project key without consulting repository config.
     # An interrupted Agent may have changed origin or hooksPath, so the saved
     # snapshot must be checked before normal repository validation reads it.
     repo_path = Path(repo_arg).expanduser().resolve()
     repo = str(repo_path)
+    project_registry.ensure_registry_schema(connection)
     _ensure_execplans_schema(connection)
     row = connection.execute(
         "SELECT * FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
+    if row is not None and int(row["registered"]) != 1:
+        raise RuntimeError(f"등록되지 않은 프로젝트입니다: {repo}")
+    if row is None and registered_only:
+        raise RuntimeError(f"등록되지 않은 프로젝트입니다: {repo}")
     provider = str(row["provider"]) if row else (requested_provider or "codex")
     if provider not in AGENT_PROVIDERS:
         raise RuntimeError(f"지원하지 않는 Agent provider입니다: {provider}")
@@ -8129,12 +8282,21 @@ def _run_project_step(
                     checkpoint_cleanup_candidates,
                 ).serialize(),
             )
-    repo_path = validate_repository(
-        repo_path,
-        allow_agents_mismatch=allow_agents_mismatch,
-        provider=provider,
-        config_path=config_path,
-    )
+    if row is not None:
+        repo_path = validate_repository(
+            repo_path,
+            allow_agents_mismatch=False,
+            provider=provider,
+            config_path=config_path,
+            registration_checks=False,
+        )
+    else:
+        repo_path = validate_repository(
+            repo_path,
+            allow_agents_mismatch=allow_agents_mismatch,
+            provider=provider,
+            config_path=config_path,
+        )
     backfill_plan_shas(connection, target_repo=repo)
     migrate_legacy_execplans(
         connection,
@@ -9843,6 +10005,8 @@ def run_project_result(
     requested_base: str | None,
     allow_agents_mismatch: bool,
     requested_provider: str | None = None,
+    *,
+    registered_only: bool = False,
 ) -> ProjectRunResult:
     """Run retryable validation progress to a stable project-level outcome."""
 
@@ -9855,6 +10019,7 @@ def run_project_result(
             requested_base,
             allow_agents_mismatch,
             requested_provider,
+            registered_only,
         )
         if step_result != PROJECT_STEP_RETRY:
             break
@@ -9894,6 +10059,8 @@ def run_project(
     requested_base: str | None,
     allow_agents_mismatch: bool,
     requested_provider: str | None = None,
+    *,
+    registered_only: bool = False,
 ) -> int:
     """CLI-compatible adapter for the reusable structured project result."""
 
@@ -9905,7 +10072,82 @@ def run_project(
         requested_base,
         allow_agents_mismatch,
         requested_provider,
+        registered_only=registered_only,
     ).exit_code
+
+
+def run_registered_projects(
+    connection: sqlite3.Connection,
+    state_dir: Path,
+    config: ManagedConfig,
+) -> int:
+    """Run registered projects serially until the concurrent scheduler is added."""
+
+    projects = project_registry.list_projects(connection)
+    if not projects:
+        raise RuntimeError(
+            "등록된 프로젝트가 없습니다. `loop_manager.py config add <path>`로 등록하세요."
+        )
+    for project in projects:
+        result = run_project(
+            connection,
+            state_dir,
+            project.repo,
+            config.path,
+            None,
+            False,
+            registered_only=True,
+        )
+        if result:
+            return result
+    return 0
+
+
+def configure_registry(
+    args: argparse.Namespace,
+    state_dir: Path,
+    config_path: Path,
+) -> int:
+    if args.config_command == "init":
+        load_managed_config(config_path)
+        with connect_database(state_dir, create=True):
+            pass
+        operation_print(f"상태 DB 초기화 완료: {state_dir / 'loop-manager.db'}")
+        return 0
+
+    with connect_database(state_dir) as connection:
+        if args.config_command == "list":
+            projects = project_registry.list_projects(connection)
+            if not projects:
+                operation_print("등록된 프로젝트가 없습니다.")
+            for project in projects:
+                approval = "approved" if project.agents_approved else "common"
+                operation_print(
+                    f"{project.repo}\t{project.base_branch}\t"
+                    f"{project.provider}\tAGENTS:{approval}"
+                )
+            return 0
+        if args.config_command == "add":
+            config = load_managed_config(config_path)
+            project = add_registered_project(
+                connection,
+                Path(args.repository),
+                config_path=config.path,
+                provider=args.provider,
+                requested_base=args.base,
+                approve_agents_mismatch=args.approve_agents_mismatch,
+            )
+            approval = " (AGENTS.md 불일치 승인 저장)" if project.agents_approved else ""
+            operation_print(
+                f"프로젝트 등록 완료: {project.repo} "
+                f"({project.base_branch}, {project.provider}){approval}"
+            )
+            return 0
+        repo = str(Path(args.repository).expanduser().resolve())
+        project_registry.remove_project(connection, repo)
+        operation_print(f"프로젝트 등록 해제 완료: {repo}")
+        return 0
+
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -9913,20 +10155,34 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-dir", help="기본 운영체제 상태 디렉터리 대신 사용할 경로")
     parser.add_argument("--config", default=str(ROOT / "config/config.ini"), help="config.ini 경로")
     subcommands = parser.add_subparsers(dest="command", required=True)
-    subcommands.add_parser("init", help="상태 디렉터리와 SQLite를 초기화")
-    run = subcommands.add_parser("run", help="프로젝트에서 다음 최소 작업 하나를 처리")
-    run.add_argument("repository", help="대상 Git 저장소 루트")
-    run.add_argument("--base", help="기준 branch. 생략하면 origin/HEAD 사용")
-    run.add_argument(
+    subcommands.add_parser("init", help=argparse.SUPPRESS)
+
+    configuration = subcommands.add_parser(
+        "config", help="상태 DB와 프로젝트 registry를 명시적으로 관리"
+    )
+    config_commands = configuration.add_subparsers(
+        dest="config_command", required=True
+    )
+    config_commands.add_parser("init", help="상태 DB 초기화")
+    config_commands.add_parser("list", help="등록 프로젝트 목록 조회")
+    add = config_commands.add_parser("add", help="프로젝트 검증 및 등록")
+    add.add_argument("repository", help="대상 Git 저장소 루트")
+    add.add_argument("--base", help="기준 branch. 생략하면 origin/HEAD 사용")
+    add.add_argument(
         "--provider",
         choices=sorted(AGENT_PROVIDERS),
-        help="최초 등록 시 사용할 Agent provider (기본값: codex)",
+        default="codex",
+        help="프로젝트 Agent provider (기본값: codex)",
     )
-    run.add_argument(
-        "--allow-agents-mismatch",
+    add.add_argument(
+        "--approve-agents-mismatch",
         action="store_true",
-        help="공통 AGENTS.md가 포함되지 않은 프로젝트를 확인 후 강제 실행",
+        help="현재 AGENTS.md 해시에 결합해 공통 규칙 불일치를 승인",
     )
+    remove = config_commands.add_parser("remove", help="프로젝트 등록 해제")
+    remove.add_argument("repository", help="등록 해제할 저장소 루트")
+
+    run = subcommands.add_parser("run", help="등록 프로젝트의 다음 작업을 처리")
     run.add_argument(
         "--skip-if-running",
         action="store_true",
@@ -9936,8 +10192,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    args, _ = build_parser().parse_known_args()
+    args = build_parser().parse_args()
     state_dir = state_directory(args.state_dir)
+    config_path = Path(args.config).expanduser().resolve()
     try:
         with process_lock(state_dir):
             if args.command == "init":
@@ -9945,25 +10202,27 @@ def main() -> int:
                     pass
                 operation_print(f"상태 DB 초기화 완료: {state_dir / 'loop-manager.db'}")
                 return 0
+            if args.command == "config":
+                return configure_registry(args, state_dir, config_path)
+            config = load_managed_config(config_path)
             with connect_database(state_dir) as connection:
-                result = run_project(
-                    connection,
-                    state_dir,
-                    args.repository,
-                    Path(args.config).expanduser().resolve(),
-                    args.base,
-                    args.allow_agents_mismatch,
-                    args.provider,
-                )
+                result = run_registered_projects(connection, state_dir, config)
             if result == 0:
                 update_source_checkout_after_success()
             return result
     except ProcessLockBusyError as error:
-        if args.command == "run" and args.skip_if_running:
+        if args.command == "run" and getattr(args, "skip_if_running", False):
             return 0
         operation_log(f"오류: {error}", error=True)
         return 1
-    except (RuntimeError, OSError, sqlite3.DatabaseError, json.JSONDecodeError) as error:
+    except (
+        ManagedConfigError,
+        project_registry.ProjectRegistryError,
+        RuntimeError,
+        OSError,
+        sqlite3.DatabaseError,
+        json.JSONDecodeError,
+    ) as error:
         operation_log(f"오류: {error}", error=True)
         return 1
 

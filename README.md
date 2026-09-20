@@ -80,39 +80,51 @@ cp config/config.ini.example config/config.ini
 
 실제 `config.ini`는 향후 Telegram token을 포함할 수 있으므로 Git에 커밋하지 않는다. 작업 상태와 PR 정보는 source checkout 밖의 운영체제 사용자 상태 디렉터리에 있는 SQLite에 저장한다.
 
-일반 실행 중 SQLite가 없거나 손상되면 자동으로 새 상태를 만들지 않고 중단한다. 상태 디렉터리를 백업해두고, 필요할 때 백업을 복원하거나 손상된 DB를 별도로 보관한 뒤 `init`으로 다시 만든다.
+일반 실행 중 SQLite가 없거나 손상되면 자동으로 새 상태를 만들지 않고 중단한다. 상태 디렉터리를 백업해두고, 필요할 때 백업을 복원하거나 손상된 DB를 별도로 보관한 뒤 `config init`으로 다시 만든다.
 
 ### 4. 초기화 및 반복 실행 설정
 
-최소 실행기는 별도 프로젝트 등록 명령 없이 `run`에 전달된 저장소 하나를 처리한다. 공통 `AGENTS.md`가 포함되지 않은 저장소는 거부하며, 내용을 확인한 경우에만 `--allow-agents-mismatch`로 실행할 수 있다.
+상태 DB 초기화와 프로젝트 등록은 명시적인 `config` 하위 명령에서만 수행한다. 프로젝트 추가 시 GitHub origin, 기준 branch, 선택 provider, 필수 문서와 공통 파일을 검증한다. 공통 `AGENTS.md`가 포함되지 않은 저장소는 거부하며, 현재 파일을 확인한 경우에만 `--approve-agents-mismatch`로 그 파일 해시에 결합된 승인을 저장할 수 있다.
 
 Planner가 만든 ExecPlan은 검증 후 대상 저장소의 base branch에 fast-forward push된다. 따라서 해당 branch는 Loop Manager 계정의 직접 push를 허용해야 한다. 이후 구현은 `loop-manager/<execplan-id>` branch에서 진행되고 PR로 제출된다.
 
 상태 DB를 한 번 초기화한다.
 
 ```powershell
-& .\.venv\Scripts\python.exe loop_manager.py init
+& .\.venv\Scripts\python.exe loop_manager.py config init
 ```
 
 ```sh
-.venv/bin/python loop_manager.py init
+.venv/bin/python loop_manager.py config init
 ```
 
-그다음 cron에서 대상 저장소를 지정해 반복 실행한다.
+대상 프로젝트를 등록하고 필요하면 목록을 확인한다. provider를 생략하면 `codex`를 사용한다.
 
 ```powershell
-& .\.venv\Scripts\python.exe loop_manager.py run D:\repo\my-project
+& .\.venv\Scripts\python.exe loop_manager.py config add D:\repo\my-project --provider claude
+& .\.venv\Scripts\python.exe loop_manager.py config list
 ```
 
 ```sh
-.venv/bin/python loop_manager.py run /path/to/project
+.venv/bin/python loop_manager.py config add /path/to/project
+.venv/bin/python loop_manager.py config list
 ```
 
-최초 실행에서 provider를 생략하면 `codex`로 등록된다. Claude Code를 사용할 프로젝트는 최초 실행에 `--provider claude`를 지정한다. 선택한 provider는 SQLite에 저장되며 이후 실행에서 다른 값으로 암묵적으로 바뀌지 않는다.
+진행 중인 ExecPlan이나 해결되지 않은 `planning_error`가 없는 프로젝트는 `config remove <path>`로 등록만 해제할 수 있다. 프로젝트 파일, branch, worktree, PR과 MERGED 감사 이력은 삭제하지 않는다.
 
-실행기는 한 번에 한 프로젝트의 작은 작업 하나만 별도 worktree에서 처리한다. PR을 생성하면 Merge될 때까지 새 작업을 시작하지 않으며, 현재 기준 commit에서 할 일이 없다고 판단한 뒤에는 commit이 바뀔 때까지 Agent를 다시 호출하지 않는다. 서버에는 Python 3, Git, GitHub CLI와 프로젝트에서 선택한 인증된 Codex 또는 Claude Code CLI가 필요하다.
+그다음 저장소 인자 없이 반복 실행한다. 실행기는 registry에 저장된 프로젝트를 결정적 순서로 처리한다.
 
-cron 또는 작업 스케줄러에는 정상적인 중복 실행을 조용히 건너뛰도록 `--skip-if-running`을 붙인 같은 `run` 명령을 등록한다. 예를 들어 `.venv/bin/python loop_manager.py run --skip-if-running /path/to/project`처럼 실행한다. 이 옵션이 없으면 전역 잠금 충돌은 시각이 포함된 오류와 종료 코드 1로 보고된다. 잠금 이외의 오류는 이 옵션을 써도 그대로 보고된다. 동시 실행은 전역 잠금으로 거부하므로 여러 프로젝트 병렬 처리나 같은 실행에서의 프로젝트 순회는 후속 구현에서 추가한다.
+```powershell
+& .\.venv\Scripts\python.exe loop_manager.py run
+```
+
+```sh
+.venv/bin/python loop_manager.py run
+```
+
+PR을 생성하면 Merge될 때까지 같은 프로젝트의 새 작업을 시작하지 않으며, 현재 기준 commit에서 할 일이 없다고 판단한 뒤에는 입력이 바뀔 때까지 Agent를 다시 호출하지 않는다. 서버에는 Python 3, Git, GitHub CLI와 프로젝트에서 선택한 인증된 Codex 또는 Claude Code CLI가 필요하다.
+
+cron 또는 작업 스케줄러에는 정상적인 중복 실행을 조용히 건너뛰도록 `.venv/bin/python loop_manager.py run --skip-if-running`을 등록한다. 이 옵션이 없으면 전역 잠금 충돌은 시각이 포함된 오류와 종료 코드 1로 보고된다. 잠금 이외의 오류는 이 옵션을 써도 그대로 보고된다.
 
 ### 5. Pull Request 검토
 
