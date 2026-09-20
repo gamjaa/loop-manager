@@ -528,19 +528,24 @@ Test fallback.
         third = loop_manager._worktree_execplan_input_fingerprint(worker, row)
         self.assertNotEqual(second, third)
 
-    def test_shared_specification_skill_describes_automatic_archive_contract(self):
+    def test_shared_guidance_describes_automatic_archive_contract(self):
         skill = (
             loop_manager.ROOT
             / ".agents/skills/specification-docs/SKILL.md"
         ).read_text(encoding="utf-8")
+        agents = (loop_manager.ROOT / "AGENTS.md").read_text(encoding="utf-8")
 
-        self.assertIn("마지막 관련 ExecPlan의 구현 PR", skill)
-        self.assertIn("Loop Manager가 eligibility를 다시 확인", skill)
-        self.assertIn("내용 변경 없이 `docs/requirements/archive/`로 자동 이동", skill)
-        self.assertIn("archive PR이 Merge되기 전에는 활성 Requirement", skill)
-        self.assertIn("관련 비종료 ExecPlan이 남아 있거나 archive 충돌 또는 source 관계의 불확실성", skill)
+        for guidance in (skill, agents):
+            with self.subTest(guidance=guidance):
+                self.assertIn("마지막 관련 ExecPlan의 구현 PR", guidance)
+                self.assertIn("Loop Manager가 eligibility를 다시 확인", guidance)
+                self.assertIn("내용 변경 없이 `docs/requirements/archive/`로 자동 이동", guidance)
+                self.assertIn("archive PR이 Merge되기 전에는 활성", guidance)
+                self.assertIn("archive 충돌 또는 source 관계", guidance)
+
         self.assertIn("eligibility를 우회해 Requirement를 이동하지 않는다", skill)
         self.assertNotIn("archive 이동은 사용자가 수행", skill)
+        self.assertNotIn("완료된 Requirement는 사용자가 `docs/requirements/archive/`로 옮긴다", agents)
 
 
 if __name__ == "__main__":
