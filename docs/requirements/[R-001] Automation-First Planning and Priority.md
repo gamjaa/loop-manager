@@ -2,7 +2,7 @@
 
 ## Context
 
-현재 Planner는 하나 이상의 ExecPlan을 만들 수 있지만 현재 입력에서 식별 가능한 작업 전체를 한 번에 계획해야 한다는 보장이 없다. READY 계획이 하나라도 있으면 새 계획 입력도 다음 계획 주기까지 반영되지 않고, 실행 순서는 숫자 ID만 사용하므로 사용자의 반복 개입을 줄이는 자동화 기반 작업보다 다른 기능이 먼저 실행될 수 있다.
+현재 Planner는 하나 이상의 ExecPlan을 만들 수 있지만 현재 입력에서 식별 가능한 작업 전체를 한 번에 계획해야 한다는 보장이 없다. 반대로 실행 중이거나 READY인 계획이 있는데 저장소 입력이 바뀔 때마다 Planner를 먼저 호출하면 이미 준비된 작업의 진행이 지연되고 불필요한 AI 호출이 반복될 수 있다. 실행 순서도 숫자 ID만 사용하므로 사용자의 반복 개입을 줄이는 자동화 기반 작업보다 다른 기능이 먼저 실행될 수 있다.
 
 Loop Manager의 목적은 안전을 유지하면서 계획, 구현, 검증, 복구와 다음 작업 선택을 사용자의 개입 없이 최대한 계속하는 것이다. 따라서 다음 Worker를 시작하기 전에 전체 작업 카탈로그와 자동화 중심 우선순위를 확보해야 한다.
 
@@ -10,7 +10,9 @@ Planner가 중복을 피하기 위해 누적된 모든 ExecPlan 본문을 매번
 
 ## Requirement
 
-계획 입력이 변경되고 실행 중인 작업이 없으면 Loop Manager는 기존 READY ExecPlan의 존재와 관계없이 Planner를 먼저 실행해야 한다. Planner는 기존 카탈로그와 현재 입력을 대조해 현재 식별 가능한 모든 미충족 작업을 독립적으로 검증하고 Merge할 수 있는 ExecPlan으로 일괄 작성해야 한다.
+Loop Manager는 진행 중인 ExecPlan이 있으면 해당 상태를 먼저 이어서 처리해야 한다. 진행 중인 작업이 없으면 의존성을 충족한 READY ExecPlan을 선택해 실행하고, 남아 있는 READY ExecPlan이 하나도 없을 때만 Planner를 한 번 실행해야 한다. READY ExecPlan이 남아 있는 동안에는 계획 입력이 변경됐더라도 Planner를 먼저 실행하지 않는다.
+
+Planner는 기존 카탈로그와 현재 입력을 대조해 현재 식별 가능한 모든 미충족 작업을 독립적으로 검증하고 Merge할 수 있는 ExecPlan으로 일괄 작성해야 한다. 유효한 계획을 만들거나 추가 계획이 없다는 정상 결과로 종료하면 해당 원격 저장소 입력 지문을 저장한다. 이후 같은 입력 지문에서는 READY 계획이 없어도 Planner를 다시 호출하지 않으며, 계획 입력에 해당하는 원격 저장소 내용이 바뀐 경우에만 새 계획 주기를 허용한다.
 
 Loop Manager 코드는 AI를 사용하지 않고 ExecPlan frontmatter와 SQLite 상태를 조합해 비종료 ExecPlan의 compact catalog를 만든다. Planner는 활성 PRODUCT와 Requirement, ARCHITECTURE, 최신 코드·테스트 및 이 compact catalog를 기준으로 계획한다. MERGED ExecPlan은 Planner prompt와 기본 읽기 대상에서 제외하며, 프로그램만 ID 고유성, 의존성 검증과 감사 이력을 위해 유지한다.
 
@@ -25,7 +27,17 @@ Loop Manager 코드는 AI를 사용하지 않고 ExecPlan frontmatter와 SQLite 
 
 ## Acceptance Criteria
 
-- 계획 입력이 변경되고 IMPLEMENTING, VERIFYING, REVIEWING, PR_OPEN 또는 BLOCKED 작업이 없으면 READY ExecPlan이 남아 있어도 다음 Worker보다 Planner가 먼저 실행된다.
+- IMPLEMENTING, VERIFYING, REVIEWING, PUBLISHING, PR_OPEN 또는 BLOCKED 상태의 현재 ExecPlan이 있으면 새 Planner나 다른 Worker를 시작하지 않고 해당 상태의 처리·대기·복구를 먼저 이어간다.
+- 현재 ExecPlan이 없고 의존성을 충족한 READY ExecPlan이 있으면 Planner보다 해당 계획을 먼저 선택해 Worker를 시작한다.
+- 남아 있는 READY ExecPlan이 하나라도 있으면 계획 입력 변경 여부와 관계없이 Planner를 실행하지 않는다.
+- READY ExecPlan은 남아 있지만 모두 `depends_on`을 충족하지 못한 경우 이를 READY가 없는 상태로 취급하지 않으며 Planner를 실행하지 않는다.
+- 현재 ExecPlan과 READY ExecPlan이 모두 없을 때만 현재 원격 계획 입력 지문을 기준으로 Planner 실행 여부를 판단한다.
+- 현재 입력 지문에 대해 완료된 Planner 실행 이력이 없으면 Planner를 한 번 실행한다.
+- Planner가 유효한 ExecPlan 집합을 만들거나 추가 계획이 없다는 정상 결과로 종료하면 해당 입력 지문을 완료된 계획 주기로 저장한다.
+- 완료된 계획 주기와 입력 지문이 같으면 이후 스케줄러 실행에서도 Planner를 다시 호출하지 않는다.
+- PRODUCT, 활성 Requirement, ARCHITECTURE, AGENTS, 관련 코드·테스트 등 계획 입력에 포함되는 `origin/<base-branch>` 내용이 바뀌면 새 입력 지문으로 Planner를 다시 한 번 실행할 수 있다.
+- 로컬 미commit 변경과 MERGED ExecPlan 본문처럼 계획 입력에 포함되지 않는 변경은 Planner 재실행 조건으로 사용하지 않는다.
+- Planner CLI 실패, 결과 검증 실패와 게시 실패는 정상적으로 완료된 계획 주기로 저장하지 않으며 기존의 제한된 재시도와 planning error 정책을 따른다.
 - Planner는 현재 입력에서 식별 가능한 미충족 작업을 하나만 작성하고 종료하지 않고, 독립적으로 검증·Merge 가능한 전체 ExecPlan 집합과 의존성 그래프를 한 계획 commit에 작성한다.
 - 최신 코드·테스트에 이미 구현됐거나 비종료 ExecPlan이 충족하는 작업을 중복 계획하지 않는다.
 - compact catalog에는 비종료 ExecPlan의 ID, 제목, SQLite 상태, sources, depends_on과 priority만 포함하며 AI로 별도 요약하지 않는다.
@@ -35,20 +47,23 @@ Loop Manager 코드는 AI를 사용하지 않고 ExecPlan frontmatter와 SQLite 
 - ExecPlan의 priority는 `critical`, `high`, `normal`, `low` 중 하나이며 공통 형식과 코드 파서가 검증하고 SQLite에 등록한다. 기능 도입 전에 작성된 ExecPlan에는 `normal`을 적용한다.
 - 실행 가능한 READY 계획은 dependency gate를 먼저 적용한 뒤 `critical`, `high`, `normal`, `low` 순서와 숫자 ID 오름차순으로 결정적으로 선택된다.
 - 안전한 무인 실행 차단 또는 반복적인 사용자 복구를 제거하는 계획이 편의 기능이나 선택적 최적화보다 먼저 선택된다.
-- 새 입력은 실행 중이거나 Merge 대기 중인 작업을 중단하지 않으며, 해당 작업이 끝난 다음 Worker 선택 전에 반영된다.
-- 입력이 변경되지 않고 기존 카탈로그가 현재 요구사항을 모두 포함하면 Planner를 불필요하게 다시 호출하지 않는다.
-- priority 추가와 선택 순서, 기존 계획 호환성, compact catalog 내용, MERGED 계획의 Planner 입력 제외 및 변경된 입력이 READY 계획보다 먼저 재계획되는 경계를 자동 테스트로 검증한다.
+- 새 입력은 실행 중이거나 Merge 대기 중인 작업을 중단하지 않으며, 남은 READY 계획까지 모두 소진된 다음 계획 주기에 반영된다.
+- 입력이 변경되지 않으면 READY 계획을 모두 소진한 뒤에도 Planner를 불필요하게 다시 호출하지 않는다.
+- priority 추가와 선택 순서, 기존 계획 호환성, compact catalog 내용, MERGED 계획의 Planner 입력 제외, 진행 중 작업 재개, READY 우선 선택, READY 소진 후 단일 Planner 실행 및 동일 입력 재실행 방지를 자동 테스트로 검증한다.
 
 ## Product Impact
 
-- 현재 입력에서 식별 가능한 작업은 다음 구현 시작 전에 한 번에 ExecPlan 카탈로그로 작성된다.
+- Planner가 실행될 때 현재 입력에서 식별 가능한 작업은 한 번에 ExecPlan 카탈로그로 작성된다.
 - 작업 순서는 숫자 ID만이 아니라 안전한 무인 자동화라는 제품 목적을 우선한다.
-- 실행 중인 작업은 선점하지 않으며 같은 우선순위에서는 결정적인 순서를 유지한다.
+- 실행 중인 작업과 기존 READY 계획을 먼저 처리하며 같은 우선순위에서는 결정적인 순서를 유지한다.
 - 완료된 계획 수가 늘어나도 Planner 입력은 활성 문서와 비종료 계획 중심으로 유지된다.
+- 변경되지 않은 저장소를 반복 실행해도 Planner 호출이 반복되지 않는다.
 
 ## Non-Goals
 
 - 실행 중인 Worker, PR_OPEN 또는 해결되지 않은 BLOCKED 작업을 중단하거나 우회하지 않는다.
+- READY 계획이 남아 있는 동안 새 입력을 이유로 Planner를 선행 실행하지 않는다.
+- 의존성을 아직 충족하지 못한 READY 계획을 숨기거나 삭제해 Planner 실행 조건을 만들지 않는다.
 - 같은 프로젝트의 ExecPlan을 병렬 실행하지 않는다.
 - 제품 문서에 없는 작업을 자동으로 추가하지 않는다.
 - 의미 검색을 위한 embedding, vector database 또는 AI 요약 cache를 도입하지 않는다.
