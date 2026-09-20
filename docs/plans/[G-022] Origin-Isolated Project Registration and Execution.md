@@ -21,6 +21,8 @@ Loop Manager의 시작, 프로젝트 등록과 자동 실행을 immutable `origi
 - `run.sh`와 `run.ps1`은 Loop Manager checkout에서 Git이나 다른 자동 갱신을 실행하지 않고 현재 설치된 Python 부트스트랩만 시작하며 모든 사용자 인자를 그대로 전달한다.
 - 부트스트랩은 Git fetch나 worktree 등록보다 먼저 `<state-dir>/loop-manager.lock`을 획득하고 runtime 자식이 끝날 때까지 보유한다. `--skip-if-running`의 기존 조용한 종료 계약도 유지한다.
 - 부트스트랩은 Loop Manager 저장소의 `origin/main`을 fetch해 exact commit SHA를 확정하고, 로컬 object database를 공유하는 `<state-dir>` 아래의 clean detached runtime worktree를 생성하거나 검증해 그 SHA의 `loop_manager.py`를 자식으로 실행한다. 독립 clone은 만들지 않는다.
+- bootstrap은 Git에서 제외된 기존 source checkout의 `config/config.ini`를 이동·복사·symlink하지 않고 기본 설정 경로로 사용한다. 명시적인 `--config` 상대 경로도 source checkout 기준으로 절대화해 runtime 자식에 전달하며, 자식은 runtime `ROOT`를 기준으로 설정 경로를 다시 계산하지 않는다.
+- runtime 준비는 ignored 파일 전체를 복제하지 않는다. `.venv`는 launcher가 선택한 동일 Python interpreter를 자식 실행에도 사용하고, `__pycache__`, 도구 cache와 그 밖의 ignored 파일은 runtime worktree로 전달하지 않는다.
 - 로컬 `main`의 미commit 변경과 로컬 전용 commit은 runtime에 포함하지 않는다. push된 새 `origin/main` SHA는 다음 실행에서 새 runtime으로 선택하고 실행 중인 runtime HEAD는 바꾸지 않는다.
 - 기존 runtime 경로의 소유권, detached HEAD, expected SHA 또는 clean 상태를 확인할 수 없으면 reset·clean·덮어쓰기 없이 실패한다.
 - pinned runtime 이전에 도입된 정상 종료 후 source `main` fast-forward updater가 있으면 이 계획의 구현에서 완전히 제거한다. 완료 상태에는 launcher, bootstrap과 orchestration 어디에도 source checkout을 pull하거나 local `main`을 이동하는 경로가 남지 않는다.
@@ -42,6 +44,8 @@ Loop Manager의 시작, 프로젝트 등록과 자동 실행을 immutable `origi
 - G-016이 분리한 설정·registry 경계에 revision tree reader를 두고, repository root와 GitHub origin을 확인한 뒤 base ref를 fetch·resolve해 등록용 파일 존재, 내용, 해시와 template 비교를 blob에서 수행한다. 경로 탐색에 기본 worktree를 사용할 수는 있지만 제품 입력 내용은 읽지 않는다.
 - per-project orchestration에서 `ensure_safe_base_worktree`와 로컬 `HEAD...origin/<base>` 차이를 실행 게이트로 사용하는 경로를 제거한다. 새 workspace 예약과 생성에는 검증된 원격 commit SHA를 명시적으로 전달하고, 재개 경로에는 저장된 소유 branch/worktree identity를 사용한다.
 - launcher를 현재 checkout의 가상환경과 bootstrap `loop_manager.py` 실행만 담당하도록 단순화한다. bootstrap 경로는 process lock 안에서 fetch, exact `origin/main` SHA resolve, SHA별 deterministic runtime 경로 검증 또는 detached `git worktree add`, 같은 Python interpreter를 사용한 runtime 자식 실행을 담당한다.
+- bootstrap이 인자 파싱 시 기본 `config/config.ini`와 명시적인 `--config`를 source checkout 기준의 canonical absolute path로 확정하고 내부 runtime 표식과 함께 자식에 전달한다. 설정 파일의 내용은 복사하거나 명령행, 로그와 오류에 노출하지 않으며 기존 설정 loader가 자식 시작 시 한 번 읽는다.
+- runtime 생성 경계는 tracked revision 파일만 `git worktree add`로 구성한다. ignored 파일을 열거·복사하는 일반 경로를 두지 않고, source `.venv`는 interpreter 경로 재사용으로만 연결하며 cache는 runtime 입력에서 제외한다.
 - runtime 자식만 내부 실행 표식을 받아 lock을 중복 획득하지 않게 하고, 부모는 자식 종료 코드를 그대로 반환한다. 내부 표식 없이 시작한 모든 일반 실행은 반드시 bootstrap과 lock을 거친다.
 - bootstrap 전환과 함께 임시 post-run updater, 관련 조건 분기와 테스트를 제거한다. pinned runtime 선택 자체가 최신 코드 반영 경계이며 source checkout 갱신을 fallback으로 남기지 않는다.
 - runtime worktree 등록은 Agent 시작 전에 끝내고 실행 중에는 고정한다. Agent scope는 활성 관리 worktree와 Loop Manager 소유 branch의 mutation을 계속 차단하되 사용자 기본 worktree와 그 로컬 base ref의 독립 변경은 허용한다.
@@ -57,6 +61,8 @@ Loop Manager의 시작, 프로젝트 등록과 자동 실행을 immutable `origi
 - 기존 활성 ExecPlan 재개, 새 detached planning worktree와 새 구현 branch가 로컬 HEAD가 아니라 저장된 workspace 또는 `origin/<base-branch>` SHA를 사용하는지 검증한다.
 - Linux와 PowerShell launcher에 Git 명령이 없고 Python bootstrap 실행 인자를 그대로 전달하는지 검증한다.
 - fetch보다 process lock이 먼저 획득되고 runtime 자식 종료 뒤 해제되는지, 중복 실행이 runtime Git metadata를 바꾸기 전에 종료되는지 검증한다.
+- 기본 설정과 상대·절대 `--config`가 source bootstrap에서 기대한 절대 경로로 자식에 전달되고, runtime `ROOT/config/config.ini`의 존재 여부와 무관하게 기존 설정을 읽는지 검증한다. 설정 내용과 비밀값이 자식 명령행, 로그와 오류에 포함되지 않는지도 확인한다.
+- source checkout에 `config/config.ini`, `.venv`, cache와 임의의 ignored 파일이 있을 때 config는 외부 경로로 읽고 interpreter만 재사용하며, ignored 파일 어느 것도 runtime worktree에 복사·symlink되지 않는지 검증한다.
 - local `main`이 dirty, ahead 또는 다른 commit으로 이동해도 runtime이 exact `origin/main` SHA의 detached HEAD이고, 실행 중 origin이 바뀌어도 현재 runtime이 움직이지 않으며 다음 실행에서만 새 SHA를 선택하는지 검증한다.
 - 기존 runtime 경로가 dirty하거나 다른 SHA·branch·repository를 가리키면 보존한 채 실패하고, 정상 SHA별 runtime은 재사용하는지 검증한다.
 - 기존 임시 updater 테스트를 pinned runtime 계약으로 교체하고, 정상·오류·중복 실행 모두 source checkout의 파일, index, HEAD와 local `main`을 변경하지 않는지 검증한다.
@@ -87,3 +93,4 @@ Loop Manager의 시작, 프로젝트 등록과 자동 실행을 immutable `origi
 - 2026-09-20 사용자 결정: pinned runtime Merge 전에는 lock을 실제 획득해 정상 종료한 실행만 lock 해제 직전에 clean source `main`을 fast-forward하는 임시 updater를 허용한다. G-022는 아직 `READY`이고 구현 branch가 없으므로, 최종 runtime 전환에서 이 임시 경로를 제거하는 조건을 본 계획에 추가한다.
 - 2026-09-20 운영 hotfix: Agent 실행 중 사용자 기본 worktree와 base refs의 독립 변경을 허용하되 관리 worktree와 Loop Manager 소유 branch 검사는 유지한다. Codex가 자체 생성·정리하는 `refs/codex/turn-diffs/`는 과거에 저장된 snapshot에도 적용되도록 비교 단계에서 제외한다.
 - 같은 BLOCKED Agent를 선검증하다 새 결과 snapshot을 만들지 못한 경우에는 이미 저장된 Agent 결과를 유지한다. 시작 snapshot으로 대체해 보존된 Worker 변경의 귀속을 잃지 않는다.
+- 2026-09-20 사용자 결정: Git에서 제외된 기존 `config/config.ini`는 runtime worktree로 이전하지 않고 source bootstrap이 절대 경로로 전달한다. ignored 파일은 일괄 복제하지 않으며 source `.venv`는 동일 interpreter 경로로만 재사용하고 cache는 전달하지 않는다.

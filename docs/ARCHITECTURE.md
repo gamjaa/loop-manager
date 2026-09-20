@@ -16,6 +16,8 @@ Loop Manager는 Windows와 Linux에서 동작하는 Python 3 프로그램이다.
 - `run.sh`와 `run.ps1`은 Git을 실행하지 않고 source checkout의 Python 부트스트랩만 시작한다
 - 부트스트랩은 다른 Git 작업 전에 process lock을 획득하고, Loop Manager 저장소의 `origin/main`을 fetch해 exact SHA의 detached runtime worktree를 선택한 뒤 같은 lock을 유지한 채 runtime 자식을 실행한다
 - runtime worktree는 source checkout의 object database를 공유하며 사용자 `main`의 파일, index, HEAD와 로컬 전용 commit을 사용하지 않는다. push된 새 SHA는 다음 실행에서만 선택한다
+- source checkout의 bootstrap은 기존 `config/config.ini` 또는 명시된 `--config`를 source checkout 기준의 절대 경로로 확정해 runtime 자식에 전달하며 설정 파일을 runtime worktree에 복사·이동·symlink하지 않는다
+- launcher가 선택한 source checkout의 Python interpreter를 runtime 자식도 사용한다. 그 밖의 ignored 파일과 cache는 runtime worktree로 전달하지 않는다
 - `config/config.ini`가 없거나 유효하지 않으면 설정 방법을 안내하고 작업을 시작하지 않는다
 - 최초 설정은 사용자가 설정 모드를 명시적으로 실행해 SQLite를 생성한다
 - 일반 Loop 모드에서 SQLite가 없거나 손상됐으면 자동으로 초기화하지 않고 복원 또는 명시적 재설정을 안내한 뒤 중단한다
@@ -32,7 +34,9 @@ Python 표준 라이브러리 `configparser`로 `config/config.ini`를 읽는다
 - Worker `level1`부터 `level7`까지의 Model과 Effort
 - Telegram Bot token과 chat ID
 
-실제 `config/config.ini`는 Git에서 제외하고 현재 사용자만 읽을 수 있도록 권장한다. Telegram token과 chat ID가 모두 비어 있으면 알림을 비활성화하고, 하나만 설정돼 있으면 설정 오류로 처리한다. 비밀값은 로그, AI Agent prompt와 오류 메시지에 포함하지 않는다.
+실제 `config/config.ini`는 Git에서 제외하고 현재 사용자만 읽을 수 있도록 권장한다. 기본 설정 파일은 source checkout에 그대로 두며 bootstrap이 해당 경로를 runtime 자식에 명시적으로 전달한다. 사용자가 `--config`를 지정하면 bootstrap은 상대 경로를 source checkout 기준으로 절대화한 뒤 전달한다. runtime은 전달된 파일을 시작 시 한 번 읽고 runtime `ROOT`를 기준으로 기본 경로를 다시 계산하지 않는다. 설정 파일을 SHA별 runtime에 복제하지 않으며 Telegram token과 chat ID가 모두 비어 있으면 알림을 비활성화하고, 하나만 설정돼 있으면 설정 오류로 처리한다. 비밀값은 자식 명령행, 로그, AI Agent prompt와 오류 메시지에 포함하지 않는다.
+
+ignored 상태는 runtime 전달 근거가 아니다. `.venv`는 launcher가 선택한 interpreter의 절대 경로를 자식 프로세스에도 사용해 재사용하고, `__pycache__`와 도구 cache 같은 파생 파일은 전달하지 않는다. 다른 ignored 파일이 필수 운영 입력이 되면 파일별 외부 경로, 소유권, 권한과 전달 방식을 Architecture에 먼저 정의하며 일반 복사나 runtime clean 검증 예외를 추가하지 않는다.
 
 런타임 상태 디렉터리는 source checkout 밖의 운영체제 사용자 상태 경로를 사용한다.
 
@@ -124,7 +128,7 @@ Loop Manager 프로그램 자체의 실행 revision은 다음 순서로 고정�
 2. lock을 보유한 부모만 source checkout을 anchor로 `git fetch origin`을 실행한다
 3. fetch된 `origin/main`을 immutable commit SHA로 resolve한다
 4. `<state-dir>/runtimes/<repository-id>/<sha>/`의 linked worktree가 같은 repository, clean detached HEAD와 exact SHA인지 검증하고, 없을 때만 `git worktree add --detach`로 만든다
-5. 부모가 현재 Python interpreter로 runtime worktree의 `loop_manager.py`를 자식 실행하고 종료 코드를 전달한다
+5. 부모가 source checkout 기준의 절대 config 경로와 내부 runtime 표식을 전달하고, 현재 Python interpreter로 runtime worktree의 `loop_manager.py`를 자식 실행해 종료 코드를 전달한다
 6. 부모는 자식 종료 뒤 lock을 해제한다. 실행 중인 runtime worktree를 이동하거나 사용자 `main`을 갱신하지 않는다
 
 runtime 경로가 존재하지만 소유권, repository, detached HEAD, SHA 또는 clean 상태를 증명할 수 없으면 reset, clean, 제거 또는 덮어쓰기 없이 중단한다. 별도 clone은 만들지 않으며 SHA별 runtime 정리는 활성 실행과 분리된 검증된 관리 작업으로만 수행한다.
