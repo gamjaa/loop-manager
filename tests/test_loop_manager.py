@@ -5655,10 +5655,9 @@ class AgentScopeValidatorTest(unittest.TestCase):
                         "loop_manager.py",
                         "--state-dir",
                         str(state_dir),
+                        "--config",
+                        str(loop_manager.ROOT / "config/config.ini.example"),
                         "run",
-                        str(repo),
-                        "--base",
-                        "main",
                     ],
                 ), mock.patch(
                     "loop_manager.git",
@@ -5722,10 +5721,9 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     "loop_manager.py",
                     "--state-dir",
                     str(state_dir),
+                    "--config",
+                    str(loop_manager.ROOT / "config/config.ini.example"),
                     "run",
-                    str(repo),
-                    "--base",
-                    "main",
                 ],
             ), mock.patch(
                 "loop_manager.validate_repository",
@@ -11089,14 +11087,16 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
 
     def test_cli_accepts_provider_only_as_registration_choice(self):
         args = loop_manager.build_parser().parse_args(
-            ["run", "repo", "--provider", "claude"]
+            ["config", "add", "repo", "--provider", "claude"]
         )
         self.assertEqual(args.provider, "claude")
+        run = loop_manager.build_parser().parse_args(["run"])
+        self.assertFalse(hasattr(run, "provider"))
         with redirect_stderr(io.StringIO()), self.assertRaises(
             SystemExit
         ):
             loop_manager.build_parser().parse_args(
-                ["run", "repo", "--provider", "unknown"]
+                ["run", "--provider", "claude"]
             )
 
 
