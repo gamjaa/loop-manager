@@ -286,6 +286,80 @@ class MaintenancePlanningTest(unittest.TestCase):
                 self.connection, str(self.repo), self.repo, self.base_sha
             )
 
+    def test_ready_snapshot_rejects_all_ownership_nonready_and_hash_drift(self):
+        maintenance_state.MaintenanceRepository(
+            self.connection
+        ).begin_assessment_if_due(str(self.repo), 5, self.base_sha)
+
+        ownership_cases = (
+            ("branch", "loop-manager/G-001"),
+            ("worktree", "/tmp/managed-G-001"),
+            ("workspace_owned", 2),
+            ("worker_session_id", "worker-session"),
+            ("reviewer_session_id", "reviewer-session"),
+            ("pr_url", "https://example.test/pull/1"),
+        )
+        for field, value in ownership_cases:
+            with self.subTest(field=field):
+                self.connection.execute(
+                    f"UPDATE exec_plans SET {field} = ? "
+                    "WHERE repo = ? AND plan_id = 'G-001'",
+                    (value, str(self.repo)),
+                )
+                self.connection.commit()
+                with self.assertRaisesRegex(
+                    loop_manager.MaintenancePlanningError, "무소유 READY"
+                ):
+                    loop_manager.prepare_maintenance_planning_context(
+                        self.connection, str(self.repo), self.repo, self.base_sha
+                    )
+                reset = 0 if field == "workspace_owned" else None
+                self.connection.execute(
+                    f"UPDATE exec_plans SET {field} = ? "
+                    "WHERE repo = ? AND plan_id = 'G-001'",
+                    (reset, str(self.repo)),
+                )
+                self.connection.commit()
+
+        self.connection.execute(
+            "UPDATE exec_plans SET content_hash = 'catalog-drift' "
+            "WHERE repo = ? AND plan_id = 'G-001'",
+            (str(self.repo),),
+        )
+        self.connection.commit()
+        with self.assertRaisesRegex(
+            loop_manager.MaintenancePlanningError, "content hash"
+        ):
+            loop_manager.prepare_maintenance_planning_context(
+                self.connection, str(self.repo), self.repo, self.base_sha
+            )
+        self.connection.execute(
+            "UPDATE exec_plans SET content_hash = ? "
+            "WHERE repo = ? AND plan_id = 'G-001'",
+            (loop_manager.file_hash(self.ready_path), str(self.repo)),
+        )
+        self.connection.execute(
+            "UPDATE exec_plans SET status = 'IMPLEMENTING' "
+            "WHERE repo = ? AND plan_id = 'G-001'",
+            (str(self.repo),),
+        )
+        self.connection.commit()
+        context = loop_manager.prepare_maintenance_planning_context(
+            self.connection, str(self.repo), self.repo, self.base_sha
+        )
+        self._write_plan(
+            "G-001", "Ready Feature", depends_on=("G-000", "G-099")
+        )
+        with self.assertRaisesRegex(
+            loop_manager.PlannerValidationError, "SQLite snapshot에 없는"
+        ):
+            loop_manager.validate_maintenance_planner_result(
+                self.connection,
+                context,
+                self.repo,
+                loop_manager.changed_files(self.repo),
+            )
+
     def test_barrier_adds_every_dag_terminal_and_rejects_body_or_priority_drift(self):
         context = self._begin_barrier()
         self._write_barrier_batch()
@@ -698,6 +772,84 @@ class MaintenancePlanningTest(unittest.TestCase):
             str(self.repo)
         )
         self.assertIsNone(cycle.publication_stage)
+
+    def test_publication_rolls_back_new_and_revised_rows_if_cycle_update_fails(self):
+        context = self._begin_barrier()
+        self._write_barrier_batch()
+        result = self._validate_barrier(context)
+        git(self.repo, "add", "docs/plans")
+        git(self.repo, "commit", "-m", "Prepare atomic maintenance batch")
+        plan_commit = git(self.repo, "rev-parse", "HEAD")
+        intent = loop_manager.record_maintenance_publication_intent(
+            self.connection,
+            str(self.repo),
+            self.repo,
+            "main",
+            result,
+            plan_commit,
+        )
+        git(self.repo, "push", "origin", "HEAD:main")
+        git(self.repo, "fetch", "origin")
+        before = tuple(
+            self.connection.execute(
+                "SELECT depends_on, content_hash, plan_sha FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-001'",
+                (str(self.repo),),
+            ).fetchone()
+        )
+
+        with mock.patch.object(
+            maintenance_state.MaintenanceRepository,
+            "transition",
+            side_effect=maintenance_state.MaintenanceStateError(
+                "injected cycle update failure"
+            ),
+        ):
+            with self.assertRaisesRegex(
+                maintenance_state.MaintenanceStateError, "injected"
+            ):
+                loop_manager.publish_maintenance_planning_batch(
+                    self.connection,
+                    str(self.repo),
+                    self.repo,
+                    "main",
+                    result,
+                    plan_commit,
+                )
+
+        self.assertIsNone(
+            self.connection.execute(
+                "SELECT 1 FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-002'",
+                (str(self.repo),),
+            ).fetchone()
+        )
+        after = tuple(
+            self.connection.execute(
+                "SELECT depends_on, content_hash, plan_sha FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-001'",
+                (str(self.repo),),
+            ).fetchone()
+        )
+        self.assertEqual(after, before)
+        self.assertEqual(
+            maintenance_state.MaintenanceRepository(self.connection).get(
+                str(self.repo)
+            ),
+            intent,
+        )
+
+        completed = loop_manager.publish_maintenance_planning_batch(
+            self.connection,
+            str(self.repo),
+            self.repo,
+            "main",
+            result,
+            plan_commit,
+        )
+        self.assertEqual(
+            completed.phase, maintenance_state.MaintenancePhase.REFACTORING
+        )
 
     def test_pushed_batch_recovers_from_durable_intent_after_restart(self):
         context = self._begin_barrier()
