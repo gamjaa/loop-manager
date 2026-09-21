@@ -9,6 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import loop_manager
+import maintenance_planning
 import maintenance_state
 
 
@@ -298,6 +299,7 @@ class MaintenancePlanningTest(unittest.TestCase):
             ("worker_session_id", "worker-session"),
             ("reviewer_session_id", "reviewer-session"),
             ("pr_url", "https://example.test/pull/1"),
+            ("pr_head_oid", "a" * 40),
         )
         for field, value in ownership_cases:
             with self.subTest(field=field):
@@ -405,7 +407,14 @@ class MaintenancePlanningTest(unittest.TestCase):
             "G-001", "Ready Feature", depends_on=("G-003",)
         )
         with self.assertRaisesRegex(
-            loop_manager.PlannerValidationError, "기존 dependency를 제거"
+            loop_manager.PlannerValidationError, "기존 dependency의 값과 순서"
+        ):
+            self._validate_barrier(context)
+        self._write_plan(
+            "G-001", "Ready Feature", depends_on=("G-003", "G-000")
+        )
+        with self.assertRaisesRegex(
+            loop_manager.PlannerValidationError, "기존 dependency의 값과 순서"
         ):
             self._validate_barrier(context)
 
@@ -515,6 +524,23 @@ class MaintenancePlanningTest(unittest.TestCase):
                 snapshot.path,
                 metadata,
                 revised,
+            )
+
+        implementation = maintenance_planning.markdown_sections(snapshot.text).values[
+            "Implementation"
+        ]
+        without_implementation = snapshot.text.replace(
+            f"## Implementation\n\n{implementation}\n\n",
+            "",
+        )
+        with self.assertRaisesRegex(
+            loop_manager.MaintenancePlanningError, "section을 추가·삭제·재배치"
+        ):
+            loop_manager.validate_revalidation_revision(
+                snapshot,
+                snapshot.path,
+                metadata,
+                without_implementation,
             )
 
     def test_revalidation_preserves_goal_and_allows_only_current_structure_sections(self):
@@ -707,6 +733,36 @@ class MaintenancePlanningTest(unittest.TestCase):
         )
         self.connection.execute(
             "UPDATE exec_plans SET workspace_owned = 0 "
+            "WHERE repo = ? AND plan_id = 'G-001'",
+            (str(self.repo),),
+        )
+        self.connection.commit()
+
+        self.connection.execute(
+            "UPDATE exec_plans SET pr_head_oid = ? "
+            "WHERE repo = ? AND plan_id = 'G-001'",
+            ("b" * 40, str(self.repo)),
+        )
+        self.connection.commit()
+        with self.assertRaisesRegex(
+            loop_manager.MaintenancePlanningError, "snapshot"
+        ):
+            loop_manager.publish_maintenance_planning_batch(
+                self.connection,
+                str(self.repo),
+                self.repo,
+                "main",
+                result,
+                plan_commit,
+            )
+        self.assertIsNone(
+            self.connection.execute(
+                "SELECT 1 FROM exec_plans WHERE repo = ? AND plan_id = 'G-002'",
+                (str(self.repo),),
+            ).fetchone()
+        )
+        self.connection.execute(
+            "UPDATE exec_plans SET pr_head_oid = NULL "
             "WHERE repo = ? AND plan_id = 'G-001'",
             (str(self.repo),),
         )

@@ -262,15 +262,16 @@ def validate_barrier_revision(
         raise MaintenancePlanningError(
             f"barrier mode는 depends_on 이외 본문을 변경할 수 없습니다: {path}"
         )
-    old_dependencies = set(snapshot.depends_on)
     new_dependencies = tuple(str(item) for item in plan["depends_on"])
-    if not old_dependencies.issubset(new_dependencies):
+    old_dependency_count = len(snapshot.depends_on)
+    if new_dependencies[:old_dependency_count] != snapshot.depends_on:
         raise MaintenancePlanningError(
-            f"barrier mode는 기존 dependency를 제거할 수 없습니다: {path}"
+            "barrier mode는 기존 dependency의 값과 순서를 보존해야 합니다: "
+            f"{path}"
         )
-    additions = set(new_dependencies) - old_dependencies
+    additions = new_dependencies[old_dependency_count:]
     expected = set(terminal_plan_ids)
-    if additions != expected or len(new_dependencies) != len(set(new_dependencies)):
+    if set(additions) != expected or len(new_dependencies) != len(set(new_dependencies)):
         raise MaintenancePlanningError(
             "barrier mode는 검증된 리팩터링 DAG 말단 전체만 "
             f"depends_on에 추가해야 합니다: {path}"
@@ -295,6 +296,11 @@ def validate_revalidation_revision(
     if _body_preamble(snapshot.text) != _body_preamble(text):
         raise MaintenancePlanningError(
             "revalidation mode는 허용된 section 밖의 본문을 변경할 수 "
+            f"없습니다: {path}"
+        )
+    if previous.order != revised.order:
+        raise MaintenancePlanningError(
+            "revalidation mode는 기존 section을 추가·삭제·재배치할 수 "
             f"없습니다: {path}"
         )
     if previous.values.get("Purpose") != revised.values.get("Purpose"):

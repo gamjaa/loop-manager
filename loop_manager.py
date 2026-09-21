@@ -1730,7 +1730,7 @@ def _ready_plan_snapshot_from_contents(
         "workspace reservation": int(row["workspace_owned"] or 0),
         "Worker session": row["worker_session_id"],
         "Reviewer session": row["reviewer_session_id"],
-        "PR": row["pr_url"],
+        "PR": row["pr_url"] or row["pr_head_oid"],
     }
     owned = [name for name, value in ownership.items() if value not in {None, "", 0}]
     if str(row["status"]) != "READY" or owned:
@@ -1989,6 +1989,7 @@ def _assert_maintenance_context_current(
             row["worker_session_id"],
             row["reviewer_session_id"],
             row["pr_url"],
+            row["pr_head_oid"],
         )
         current = (
             str(row["status"]),
@@ -2010,7 +2011,7 @@ def _assert_maintenance_context_current(
             snapshot.priority,
             snapshot.content_hash,
             snapshot.plan_sha,
-            (None, None, 0, None, None, None),
+            (None, None, 0, None, None, None, None),
         )
         if current != expected:
             raise MaintenancePlanningError(
@@ -2701,6 +2702,7 @@ def _apply_maintenance_planning_batch(
                   AND workspace_owned = 0
                   AND worker_session_id IS NULL
                   AND reviewer_session_id IS NULL AND pr_url IS NULL
+                  AND pr_head_oid IS NULL
                 """,
                 (
                     dependencies,
