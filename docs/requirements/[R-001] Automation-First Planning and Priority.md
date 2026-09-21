@@ -10,6 +10,8 @@ Planner가 중복을 피하기 위해 누적된 모든 ExecPlan 본문을 매번
 
 ## Requirement
 
+이 Requirement는 현재 PRODUCT와 ARCHITECTURE에 기록된 “계획 입력이 변경되면 READY ExecPlan보다 Planner를 먼저 실행한다”는 계약을 의도적으로 변경한다. 사용자는 실행 중인 변경 작업이 없는 선택 경계에서 일반 Planner보다 기존 READY 카탈로그를 먼저 처리하고, dependency를 충족하지 못한 READY만 남은 경우에도 Planner로 우회하지 않는 READY-first 정책을 승인한다. G-024의 구현 PR은 이 정책을 코드에 적용하는 것과 동시에 PRODUCT 및 ARCHITECTURE의 Planner-first 문구를 READY-first 계약으로 갱신해 문서와 구현 사이의 충돌을 남기지 않아야 한다. 이 승인은 G-024 범위의 READY 소진 순서에 한정하며, 안정된 `PR_OPEN`과 독립 READY의 동시 진행은 G-031 범위로 유지한다.
+
 Loop Manager는 저장소를 변경하는 실행 단계의 ExecPlan이 있으면 해당 상태를 먼저 이어서 처리해야 한다. Merge만 기다리는 안정된 `PR_OPEN` ExecPlan은 완료되지 않은 계획으로 유지하되 프로젝트의 실행 자리를 점유하지 않는다. 모든 Open PR의 상태를 먼저 동기화한 뒤 충돌 복구가 필요하지 않고 실행 중인 변경 작업도 없으면, Open PR에 직접 또는 간접 의존하지 않는 READY ExecPlan을 선택해 실행한다. 같은 프로젝트에서 Worker·verify·Review·게시 또는 PR 충돌 복구는 항상 하나만 실행하지만, Merge를 기다리는 PR은 여러 개 존재할 수 있다.
 
 진행 중인 변경 작업이 없으면 의존성을 충족한 READY ExecPlan을 선택해 실행하고, 남아 있는 READY ExecPlan과 `PR_OPEN` ExecPlan이 모두 없을 때만 Planner를 한 번 실행해야 한다. READY 또는 `PR_OPEN` ExecPlan이 남아 있는 동안에는 계획 입력이 변경됐더라도 Planner를 먼저 실행하지 않는다. `PR_OPEN`에 의존하는 READY 계획은 선행 PR의 Merge가 확인될 때까지 선택하지 않는다.
@@ -38,6 +40,7 @@ Loop Manager 코드는 AI를 사용하지 않고 ExecPlan frontmatter와 SQLite 
 - 현재 변경 실행이 없고 의존성을 충족한 READY ExecPlan이 있으면 주기적 유지보수 평가 또는 사후 재검증이 도래한 경우를 제외하고 Planner보다 해당 계획을 먼저 선택해 Worker를 시작한다.
 - 남아 있는 READY ExecPlan이 하나라도 있으면 일반 계획 입력 변경만을 이유로 Planner를 실행하지 않는다.
 - READY ExecPlan은 남아 있지만 모두 `depends_on`을 충족하지 못한 경우 이를 READY가 없는 상태로 취급하지 않으며 일반 Planner를 실행하지 않는다. `PR_OPEN`, `PLAN_BLOCKED` 또는 `PROJECT_BLOCKED`가 함께 있으면 유지보수 Planner도 실행하지 않는다.
+- G-024의 구현 PR은 현재 PRODUCT의 Product Invariants·핵심 실행 흐름·Business Rules와 ARCHITECTURE의 ExecPlan 실행 흐름·동시 실행 계약에서 “입력 변경 시 READY보다 Planner 우선”인 문구를 “READY 카탈로그 소진 후 Planner 판단”으로 함께 바꾸며, 코드·PRODUCT·Requirement·ARCHITECTURE 사이에 상반된 선택 순서를 남기지 않는다.
 - 주기적 리팩터링 평가가 도래하고 현재 변경 실행, `PR_OPEN`, `PLAN_BLOCKED`와 `PROJECT_BLOCKED`가 모두 없으면 READY 존재 여부와 관계없이 다음 Worker 선택 전에 유지보수 Planner를 한 번 실행한다.
 - 유지보수 Planner는 branch, worktree, Agent 세션과 PR이 없는 READY 계획만 R-012의 dependency 장벽 구성 또는 사후 구조 재검증 범위에서 수정할 수 있다.
 - 리팩터링 전에 기존 READY 구현이 필요하면 최소 dependency-closed 선행 집합만 처리한 뒤 최신 코드에서 다시 평가하고, 리팩터링 계획을 미리 확정하지 않는다.
@@ -62,6 +65,7 @@ Loop Manager 코드는 AI를 사용하지 않고 ExecPlan frontmatter와 SQLite 
 - 안전한 무인 실행 차단 또는 반복적인 사용자 복구를 제거하는 계획이 편의 기능이나 선택적 최적화보다 먼저 선택된다.
 - 새 입력은 실행 중이거나 Merge 대기 중인 작업을 중단·수정하지 않는다. 안정된 `PR_OPEN`이 있어도 이미 계획된 독립 READY 작업은 계속 처리하지만, 새 일반 계획과 주기적 유지보수 평가는 모든 `PR_OPEN`이 종료되고 남은 READY 계획까지 소진된 다음 선택 경계까지 보류한다.
 - 입력이 변경되지 않으면 READY 계획을 모두 소진한 뒤에도 Planner를 불필요하게 다시 호출하지 않는다.
+- `tests/test_loop_manager.py`의 `AutomationFirstCatalogTest.test_dependency_blocked_ready_is_not_an_empty_catalog`는 의존성을 충족하지 못한 READY와 변경된 원격 입력을 가진 프로젝트를 실제 `run_project_result` 및 등록 프로젝트 scheduler 경로로 실행한다. 이 테스트는 해당 프로젝트에서 Planner·Worker Agent가 한 번도 호출되지 않고 `ProjectRunKind.WAITING`이 반환되며, READY catalog 행과 기존 `projects.planning_fingerprint`가 그대로 보존되고, 같은 scheduler 실행의 다른 실행 가능한 프로젝트는 계속 진행하는지를 함께 검증한다. scheduler의 프로젝트별 결정 경로를 `run_project_result` mock으로 대체해서는 이 기준을 충족한 것으로 보지 않는다.
 - priority 추가와 선택 순서, 기존 계획 호환성, compact catalog 내용, MERGED 계획의 Planner 입력 제외, 진행 중 작업 재개, 일반 READY 우선 선택, 유지보수 장벽 예외, READY 소진 후 단일 Planner 실행 및 동일 입력 재실행 방지를 자동 테스트로 검증한다.
 
 ## Product Impact
