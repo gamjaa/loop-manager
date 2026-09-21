@@ -433,10 +433,13 @@ class OriginIsolatedRegistrationAndExecutionTest(unittest.TestCase):
             outside = root / "outside"
             state_dir.mkdir()
             outside.mkdir()
-            (state_dir / "runtimes").symlink_to(
-                outside,
-                target_is_directory=True,
-            )
+            try:
+                (state_dir / "runtimes").symlink_to(
+                    outside,
+                    target_is_directory=True,
+                )
+            except (NotImplementedError, OSError) as error:
+                self.skipTest(f"symlink creation is unavailable: {error}")
 
             with mock.patch(
                 "loop_manager.github_repository", return_value="owner/repo"
