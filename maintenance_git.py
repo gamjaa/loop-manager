@@ -5,12 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 import subprocess
-import tempfile
+import threading
 
 
 MAX_CHANGE_COMMITS = 50
 MAX_CHANGE_CONTEXT_BYTES = 32_768
 MAX_COMMIT_SUBJECT_BYTES = 512
+MAX_GIT_ERROR_BYTES = 4_096
+GIT_PIPE_READ_BYTES = 8_192
 
 
 @dataclass(frozen=True)
@@ -49,25 +51,69 @@ def _bounded_git_output(
     repo: Path, limit: int, *arguments: str
 ) -> tuple[subprocess.CompletedProcess[str], bool]:
     command = ["git", "-C", str(repo), *arguments]
-    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
-        completed = subprocess.run(
+    try:
+        process = subprocess.Popen(
             command,
-            check=False,
-            stdout=stdout_file,
-            stderr=stderr_file,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
-        stdout_file.seek(0)
-        raw_output = stdout_file.read(limit + 1)
-        stderr_file.seek(0)
-        raw_error = stderr_file.read(MAX_CHANGE_CONTEXT_BYTES + 1)
-    overflow = len(raw_output) > limit
-    output = raw_output[:limit].decode("utf-8", errors="replace")
-    error = raw_error[:MAX_CHANGE_CONTEXT_BYTES].decode(
-        "utf-8", errors="replace"
+    except OSError:
+        return (
+            subprocess.CompletedProcess(
+                command,
+                127,
+                "",
+                "Git 명령을 시작할 수 없습니다.",
+            ),
+            False,
+        )
+    assert process.stdout is not None
+    assert process.stderr is not None
+    captured = {"stdout": bytearray(), "stderr": bytearray()}
+    stdout_overflow = threading.Event()
+    read_failed = threading.Event()
+
+    def drain(name: str, stream: object, capture_limit: int) -> None:
+        try:
+            while True:
+                chunk = stream.read(GIT_PIPE_READ_BYTES)
+                if not chunk:
+                    break
+                remaining = capture_limit - len(captured[name])
+                if remaining > 0:
+                    captured[name].extend(chunk[:remaining])
+                if name == "stdout" and len(chunk) > max(remaining, 0):
+                    stdout_overflow.set()
+        except OSError:
+            read_failed.set()
+        finally:
+            stream.close()
+
+    stdout_thread = threading.Thread(
+        target=drain,
+        args=("stdout", process.stdout, limit),
+        name="maintenance-git-stdout",
     )
+    stderr_thread = threading.Thread(
+        target=drain,
+        args=("stderr", process.stderr, MAX_GIT_ERROR_BYTES),
+        name="maintenance-git-stderr",
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+    returncode = process.wait()
+    stdout_thread.join()
+    stderr_thread.join()
+    if read_failed.is_set() and returncode == 0:
+        returncode = 1
+        captured["stderr"] = bytearray(
+            "Git 출력 스트림을 안전하게 읽을 수 없습니다.".encode("utf-8")
+        )
+    output = bytes(captured["stdout"]).decode("utf-8", errors="ignore")
+    error = bytes(captured["stderr"]).decode("utf-8", errors="ignore")
     return (
-        subprocess.CompletedProcess(command, completed.returncode, output, error),
-        overflow,
+        subprocess.CompletedProcess(command, returncode, output, error),
+        stdout_overflow.is_set(),
     )
 
 

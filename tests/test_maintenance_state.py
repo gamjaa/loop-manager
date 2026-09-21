@@ -338,6 +338,53 @@ class BoundedGitChangeContextTest(unittest.TestCase):
             self.assertFalse(context.truncated)
             self.assertIn("안전하게", context.error or "")
 
+    def test_git_capture_bounds_actual_stdout_and_stderr_without_temp_spooling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            self._git(repo, "init", "-b", "main")
+            self._git(repo, "config", "user.email", "test@example.com")
+            self._git(repo, "config", "user.name", "Test")
+            baseline = self._commit(repo, "tracked.txt", "value\n", "baseline")
+            tree = self._git(repo, "write-tree")
+            huge_subject = "s" * (maintenance_git.MAX_COMMIT_SUBJECT_BYTES * 8)
+            created = subprocess.run(
+                ["git", "-C", str(repo), "commit-tree", tree, "-p", baseline],
+                input=huge_subject,
+                check=True,
+                text=True,
+                encoding="utf-8",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            current = created.stdout.strip()
+            self._git(repo, "update-ref", "refs/remotes/origin/main", current)
+
+            context = maintenance_git.bounded_remote_change_context(
+                repo, "main", baseline, current
+            )
+            self.assertTrue(context.ok)
+            self.assertTrue(context.truncated)
+            self.assertLessEqual(
+                len(context.commits[0].subject.encode("utf-8")),
+                maintenance_git.MAX_COMMIT_SUBJECT_BYTES,
+            )
+
+            invalid_object = "missing-" + (
+                "x" * (maintenance_git.MAX_GIT_ERROR_BYTES * 2)
+            )
+            failed, output_overflow = maintenance_git._bounded_git_output(
+                repo, 16, "show", invalid_object
+            )
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertFalse(output_overflow)
+            self.assertLessEqual(
+                len(failed.stdout.encode("utf-8")), 16
+            )
+            self.assertLessEqual(
+                len(failed.stderr.encode("utf-8")),
+                maintenance_git.MAX_GIT_ERROR_BYTES,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
