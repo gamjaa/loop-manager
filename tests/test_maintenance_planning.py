@@ -397,6 +397,10 @@ class MaintenancePlanningTest(unittest.TestCase):
         path = "docs/plans/[G-002] Extract Boundary.md"
         for priority in ("high", "critical"):
             for reason in (
+                "The security risk no longer exists.",
+                "The security risk is no longer present.",
+                "Data loss no longer occurs.",
+                "Repeated manual recovery is no longer required.",
                 "The security risk has been eliminated.",
                 "The security risk has been resolved.",
                 "The security risk has already been fully mitigated.",

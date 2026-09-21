@@ -94,7 +94,7 @@ _HIGH_PRIORITY_NEGATION_INSIDE = re.compile(
 _HIGH_PRIORITY_NEGATION_AFTER = re.compile(
     r"^(?:\s+(?:risk|issue|threat|exposure|problem|danger|possibility))?"
     r"\s*(?:(?:does|do|is|are|was|were|will|can|could|would|has|have)\s+)?"
-    r"(?:not|never|none|zero|absent|unlikely|impossible|nonexistent|free|"
+    r"(?:no\s+longer|not|never|none|zero|absent|unlikely|impossible|nonexistent|free|"
     r"cannot|can't|doesn't|isn't|aren't|won't)\b|"
     r"^[^.!?;\n]{0,24}(?:없|아니|되지\s*않|하지\s*않)",
     re.IGNORECASE,
