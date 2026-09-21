@@ -1536,6 +1536,7 @@ class ValidatedPlanningResult:
 
     plans: tuple[tuple[str, dict[str, object]], ...]
     publication_paths: tuple[str, ...]
+    publication_hashes: tuple[tuple[str, str], ...] = ()
     revisions: tuple[PlanRevision, ...] = ()
     maintenance_context: MaintenancePlanningContext | None = None
 
@@ -1692,6 +1693,9 @@ def validate_planner_result(
                 sorted(plans, key=lambda item: int(str(item[1]["id"])[2:]))
             ),
             publication_paths=tuple(planned_files),
+            publication_hashes=tuple(
+                (path, file_hash(worktree / path)) for path in planned_files
+            ),
         )
     except RuntimeError as error:
         raise PlannerValidationError(str(error)) from error
@@ -2027,6 +2031,7 @@ def validate_maintenance_planner_result(
         if not planned_files:
             return None
         eligible = context.eligible_by_path
+        planned_contents: dict[str, tuple[bytes, str]] = {}
         new_paths: list[str] = []
         revised_paths: list[str] = []
         for path in planned_files:
@@ -2038,7 +2043,9 @@ def validate_maintenance_planner_result(
                 raise MaintenancePlanningError(
                     f"유지보수 Planner는 ExecPlan을 삭제·rename할 수 없습니다: {path}"
                 )
-            text = (worktree / path).read_text(encoding="utf-8")
+            contents = (worktree / path).read_bytes()
+            text = contents.decode("utf-8")
+            planned_contents[path] = (contents, text)
             if contains_guidance_sections(text):
                 raise MaintenancePlanningError(
                     "유지보수 Planner는 AGENTS.md guidance를 제안할 수 없습니다."
@@ -2072,10 +2079,18 @@ def validate_maintenance_planner_result(
                 )
             except RuntimeError as error:
                 raise MaintenancePlanningError(str(error)) from error
+            try:
+                validated_plan = published_execplan(path, planned_contents[path][1])
+            except RuntimeError as error:
+                raise MaintenancePlanningError(str(error)) from error
+            if validated_plan != plan:
+                raise MaintenancePlanningError(
+                    f"검증 중 maintenance ExecPlan이 변경됐습니다: {path}"
+                )
             validate_refactoring_plan(
-                path, plan, (worktree / path).read_text(encoding="utf-8")
+                path, validated_plan, planned_contents[path][1]
             )
-            new_plans.append((path, plan))
+            new_plans.append((path, validated_plan))
         new_ids = {str(plan["id"]) for _, plan in new_plans}
         existing_ids = [int(plan_id[2:]) for plan_id in catalog if plan_id not in new_ids]
         first_id = max(existing_ids, default=0) + 1
@@ -2103,21 +2118,35 @@ def validate_maintenance_planner_result(
         for path in revised_paths:
             snapshot = eligible[path]
             plan = catalog[snapshot.plan_id]
-            text = (worktree / path).read_text(encoding="utf-8")
+            text = planned_contents[path][1]
+            try:
+                validated_plan = published_execplan(path, text)
+            except RuntimeError as error:
+                raise MaintenancePlanningError(str(error)) from error
+            if validated_plan != plan:
+                raise MaintenancePlanningError(
+                    f"검증 중 maintenance ExecPlan이 변경됐습니다: {path}"
+                )
             if context.mode is MaintenancePlanMode.BARRIER:
-                validate_barrier_revision(snapshot, path, plan, text, terminals)
+                validate_barrier_revision(
+                    snapshot, path, validated_plan, text, terminals
+                )
             else:
                 validate_revalidation_revision(
-                    snapshot, path, plan, text,
+                    snapshot, path, validated_plan, text,
                     path_moves=path_moves_by_sha[snapshot.plan_sha],
                 )
-            revisions.append(PlanRevision(path, plan, snapshot))
+            revisions.append(PlanRevision(path, validated_plan, snapshot))
 
         return ValidatedPlanningResult(
             plans=tuple(
                 sorted(new_plans, key=lambda item: int(str(item[1]["id"])[2:]))
             ),
             publication_paths=tuple(planned_files),
+            publication_hashes=tuple(
+                (path, hashlib.sha256(planned_contents[path][0]).hexdigest())
+                for path in planned_files
+            ),
             revisions=tuple(
                 sorted(revisions, key=lambda item: int(item.snapshot.plan_id[2:]))
             ),
@@ -2290,6 +2319,14 @@ def _validate_maintenance_planning_commit(
         raise MaintenancePlanningError(
             "maintenance planning commit에 검증 batch 밖의 변경이 있습니다."
         )
+    validated_hashes = dict(result.publication_hashes)
+    if (
+        len(validated_hashes) != len(result.publication_hashes)
+        or set(validated_hashes) != set(result.publication_paths)
+    ):
+        raise MaintenancePlanningError(
+            "maintenance planning 결과의 검증된 file hash가 불완전합니다."
+        )
     expected = {
         path: plan for path, plan in result.plans
     }
@@ -2298,9 +2335,14 @@ def _validate_maintenance_planning_commit(
     for path in result.publication_paths:
         local_contents = (repository / path).read_bytes()
         remote_contents = git_bytes(repository, "show", f"{plan_commit}:{path}")
-        if local_contents != remote_contents:
+        expected_hash = validated_hashes[path]
+        if (
+            hashlib.sha256(local_contents).hexdigest() != expected_hash
+            or hashlib.sha256(remote_contents).hexdigest() != expected_hash
+        ):
             raise MaintenancePlanningError(
-                f"원격 maintenance batch와 planning worktree가 다릅니다: {path}"
+                "maintenance ExecPlan이 Planner 결과 검증 후 "
+                f"변경됐습니다: {path}"
             )
         parsed = _parse_execplan(repository, repository / path, validate_sources=False)
         if parsed != expected[path]:

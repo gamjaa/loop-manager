@@ -538,6 +538,38 @@ class MaintenancePlanningTest(unittest.TestCase):
         self.assertEqual(json.loads(rows[1]["depends_on"]), ["G-000", "G-003"])
         self.assertTrue(all(row["plan_sha"] == plan_commit for row in rows[1:]))
 
+    def test_publication_rejects_body_drift_after_result_validation(self):
+        context = self._begin_barrier()
+        self._write_barrier_batch()
+        result = self._validate_barrier(context)
+        validated = self.ready_path.read_text(encoding="utf-8")
+        self.ready_path.write_text(
+            validated.replace(
+                "A concrete structural responsibility problem",
+                "A tampered product goal",
+            ),
+            encoding="utf-8",
+        )
+        git(self.repo, "add", "docs/plans")
+        git(self.repo, "commit", "-m", "Tamper with validated plan body")
+        plan_commit = git(self.repo, "rev-parse", "HEAD")
+
+        with self.assertRaisesRegex(
+            loop_manager.MaintenancePlanningError, "결과 검증 후 변경"
+        ):
+            loop_manager.record_maintenance_publication_intent(
+                self.connection,
+                str(self.repo),
+                self.repo,
+                "main",
+                result,
+                plan_commit,
+            )
+        cycle = maintenance_state.MaintenanceRepository(self.connection).get(
+            str(self.repo)
+        )
+        self.assertIsNone(cycle.publication_stage)
+
     def test_pushed_batch_recovers_from_durable_intent_after_restart(self):
         context = self._begin_barrier()
         self._write_barrier_batch()
