@@ -212,7 +212,8 @@ ExecPlan 파일은 구현 PR에 처음 포함하지 않는다. Planner 단계에
 ### AGENTS.md 변경 제안과 승인
 
 - Worker는 현재 ExecPlan에 필요한 `AGENTS.md` 변경을 발견해도 파일을 직접 수정하지 않고 선택된 ExecPlan의 `Decision Log`에 대상 경로, 프로젝트 전용·공통 범위, 이유, 영향과 정확한 patch를 기록한다
-- 현재 프로젝트의 `AGENTS.md`는 해당 프로젝트 Worker가 제안할 수 있다. 향후 프로젝트 설정에 사용하는 기준 `AGENTS.md`의 공통 규칙은 Loop Manager 자체 저장소의 Worker만 제안할 수 있다
+- 일반 등록 프로젝트의 Worker는 현재 프로젝트에만 적용되는 `AGENTS.md` 변경을 `project` scope로 제안할 수 있다
+- Loop Manager 자체 저장소의 루트 `AGENTS.md`는 향후 프로젝트 설정에 사용하는 공통 원본이므로 Loop Manager Worker는 `common` scope만 제안할 수 있고 `project` scope 제안은 거부한다. Loop Manager에만 적용되는 제품 동작, 정책과 기술 설계는 `docs/PRODUCT.md`, 활성 Requirement와 `docs/ARCHITECTURE.md`에 기록하며 `AGENTS.md`에 기록하지 않는다
 - 프로그램은 Worker 결과와 ExecPlan diff에서 완전한 제안을 확인한 뒤 제안이 포함된 ExecPlan 및 기존 구현 변경을 보존하고, commit과 검증 전에 ExecPlan을 BLOCKED로 전환한다
 - AGENTS 변경 승인 BLOCKED에는 일반적인 source 내용 해시 해제를 적용하지 않는다. 사용자는 보존된 관리 worktree의 같은 ExecPlan에서 해당 제안의 `User Decision`만 수정해 승인, 거절 또는 정확한 대체 patch를 기록한다
 - 프로그램은 결정이 참조하는 제안, 대상 경로와 확정 patch를 정규화해 hash하고 SQLite 승인 기록과 결합한다. 결정란 밖의 문서 변경은 승인으로 해석하지 않는다
