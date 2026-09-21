@@ -7017,6 +7017,8 @@ def block_active_execplan(
             """
             UPDATE exec_plans
             SET status = 'BLOCKED', blocked_fingerprint = ?,
+                blocked_reason = CASE WHEN blocked_reason = 'pull-request-closed'
+                    THEN NULL ELSE blocked_reason END,
                 blocked_worktree_fingerprint = ?, last_error = ?, verify_result = ?
             WHERE repo = ? AND plan_id = ?
             """,
@@ -7205,6 +7207,8 @@ def block_active_execplan_from_revision(
             """
             UPDATE exec_plans
             SET status = 'BLOCKED', blocked_fingerprint = ?,
+                blocked_reason = CASE WHEN blocked_reason = 'pull-request-closed'
+                    THEN NULL ELSE blocked_reason END,
                 blocked_worktree_fingerprint = NULL, last_error = ?, verify_result = ?
             WHERE repo = ? AND plan_id = ?
             """,
@@ -9222,7 +9226,12 @@ def reconcile_existing_pull_request(
         and blocked_plan is not None
         and blocked_plan["blocked_reason"] == PR_CLOSED_BLOCK_REASON
     )
-    if state == "OPEN" and project["phase"] == "BLOCKED" and not reopening_closed_pr:
+    if (
+        state in {"OPEN", "CLOSED"}
+        and project["phase"] == "BLOCKED"
+        and blocked_plan is not None
+        and blocked_plan["blocked_reason"] != PR_CLOSED_BLOCK_REASON
+    ):
         operation_print(
             "PR 충돌 복구 차단 상태를 유지합니다: "
             + str(project["last_error"] or "사용자 조치가 필요합니다."),
@@ -9570,6 +9579,8 @@ def resume_pr_conflict_rebase(
         return 1
 
     rebased = git(worktree, "rebase", target_base, check=False)
+    if rebased.returncode and is_git_lock_failure(rebased.stdout):
+        raise GitLockError(rebased.stdout[-8000:])
     if rebased.returncode == 0:
         update_project(
             connection,

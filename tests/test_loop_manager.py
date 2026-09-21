@@ -12230,6 +12230,152 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                     )
                     self.assertEqual(tuple(stored), ("MERGED", 0))
                     self.assertFalse(worktree.exists())
+
+    def test_reopened_head_safety_failure_cannot_resume_when_head_is_restored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state_dir, connection, branch, worktree, url, head = (
+                self._pr_open_state(directory)
+            )
+            base = git_command(repo, "rev-parse", "origin/main")
+            loop_manager.update_project(
+                connection, str(repo), phase="PUBLISHING",
+                pr_conflict_recovery=1, pr_conflict_head_oid=head,
+                pr_conflict_base_oid=base,
+            )
+            closed = self._pull_request(branch, url, head, "CONFLICTING", state="CLOSED")
+            project = connection.execute(
+                "SELECT * FROM projects WHERE repo = ?", (str(repo),)
+            ).fetchone()
+            self.assertEqual(loop_manager.reconcile_existing_pull_request(
+                connection, repo, state_dir, str(repo), project, closed
+            ), 1)
+
+            with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
+                "loop_manager.run_codex"
+            ) as agent, mock.patch("loop_manager.push_owned_pr_conflict_recovery") as push:
+                for observed, state in (
+                    (base, "OPEN"), (head, "CLOSED"), (head, "OPEN"), (head, "OPEN")
+                ):
+                    with mock.patch("loop_manager.pr_for_branch", return_value=
+                                    self._pull_request(
+                                        branch, url, observed, "CONFLICTING", state=state
+                                    )):
+                        result = loop_manager.run_project_result(
+                            connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                        )
+                    self.assertEqual(result.kind, loop_manager.ProjectRunKind.BLOCKED)
+                    stored = loop_manager.active_execplan(connection, str(repo))
+                    self.assertEqual(stored["status"], "BLOCKED")
+                    self.assertIsNone(stored["blocked_reason"])
+                    self.assertEqual(stored["pr_conflict_head_oid"], head)
+                    self.assertEqual(stored["pr_conflict_recovery"], 1)
+                    self.assertEqual(git_command(worktree, "rev-parse", "HEAD"), head)
+                agent.assert_not_called()
+                push.assert_not_called()
+
+    def test_external_command_interruptions_preserve_recovery_and_resume(self):
+        for stage in ("github", "fetch", "rebase", "push"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as directory:
+                repo, state_dir, connection, branch, worktree, url, head = (
+                    self._pr_open_state(directory)
+                )
+                self._make_source_checkout_dirty_and_ahead(repo)
+                base = self._advance_base(
+                    directory, repo, "docs/notes.md", "# New remote base\n",
+                    "Advance before interruption",
+                )
+                pull_request = self._pull_request(branch, url, head, "CONFLICTING")
+                project = connection.execute(
+                    "SELECT * FROM projects WHERE repo = ?", (str(repo),)
+                ).fetchone()
+                self.assertIsNone(loop_manager.reconcile_existing_pull_request(
+                    connection, repo, state_dir, str(repo), project, pull_request
+                ))
+                source_before = self._source_checkout_snapshot(repo)
+                original_command = loop_manager.command
+                injected = False
+                rebases = []
+                pushes = []
+
+                def interrupted_command(arguments, **kwargs):
+                    nonlocal injected
+                    operation = arguments[3] if arguments[:2] == ["git", "-C"] else None
+                    is_query = arguments[:3] == ["gh", "pr", "view"]
+                    matches = {
+                        "github": is_query,
+                        "fetch": operation == "fetch" and
+                            f"+refs/heads/{branch}:refs/remotes/origin/{branch}" in arguments,
+                        "rebase": operation == "rebase",
+                        "push": operation == "push",
+                    }
+                    if not injected and matches[stage]:
+                        injected = True
+                        if stage == "github":
+                            raise RuntimeError("GitHub HTTP 503 Service Unavailable")
+                        output = (
+                            "fatal: Unable to create index.lock: File exists"
+                            if stage == "rebase"
+                            else "fatal: unable to access origin: Connection timed out"
+                        )
+                        return subprocess.CompletedProcess(arguments, 128, stdout=output)
+                    if is_query:
+                        return subprocess.CompletedProcess(
+                            arguments, 0, stdout=json.dumps(pull_request)
+                        )
+                    result = original_command(arguments, **kwargs)
+                    if operation == "rebase" and result.returncode == 0:
+                        rebases.append(arguments)
+                    if operation == "push":
+                        pushes.append(arguments)
+                    return result
+
+                with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
+                    "loop_manager.command", side_effect=interrupted_command
+                ), mock.patch("loop_manager.verify", return_value=(True, "verify: PASS")), mock.patch(
+                    "loop_manager.run_codex",
+                    return_value=loop_manager.CodexResult(
+                        0, "VERDICT: PASS", "reviewer-existing"
+                    ),
+                ):
+                    if stage in ("github", "fetch"):
+                        with self.assertRaises(RuntimeError):
+                            loop_manager.run_project_result(
+                                connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                            )
+                    else:
+                        paused = loop_manager.run_project_result(
+                            connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                        )
+                        self.assertEqual(paused.kind,
+                            loop_manager.ProjectRunKind.TRANSIENT_PAUSE if stage == "rebase"
+                            else loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
+                    self.assertTrue(injected)
+                    stored = loop_manager.active_execplan(connection, str(repo))
+                    self.assertEqual(
+                        stored["status"], "PUBLISHING" if stage == "push" else "IMPLEMENTING"
+                    )
+                    self.assertEqual(stored["pr_conflict_recovery"], 1)
+                    self.assertEqual(stored["pr_conflict_head_oid"], head)
+                    self.assertEqual(stored["pr_conflict_base_oid"], base)
+                    self.assertEqual(stored["worker_session_id"], "worker-existing")
+                    self.assertEqual(stored["reviewer_session_id"], "reviewer-existing")
+                    self.assertEqual(self._source_checkout_snapshot(repo), source_before)
+                    self.assertTrue(worktree.is_dir())
+                    self.assertEqual(pushes, [])
+
+                    resumed = loop_manager.run_project_result(
+                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                    )
+                self.assertEqual(resumed.kind, loop_manager.ProjectRunKind.WAITING)
+                final = loop_manager.active_execplan(connection, str(repo))
+                self.assertEqual(final["status"], "PR_OPEN")
+                self.assertEqual(final["pr_conflict_recovery"], 0)
+                self.assertEqual(final["pr_url"], url)
+                self.assertEqual(len(rebases), 1)
+                self.assertEqual(len(pushes), 1)
+                self.assertIn(f"--force-with-lease=refs/heads/{branch}:{head}", pushes[0])
+                self.assertEqual(self._source_checkout_snapshot(repo), source_before)
+
 class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
     def _scheduler_state(
         self,
