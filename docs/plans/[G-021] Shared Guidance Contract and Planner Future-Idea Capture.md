@@ -54,3 +54,34 @@ G-020의 승인 흐름을 사용해 공통 Agent 지침과 제안 형식을 사�
 
 - 공통 지침을 먼저 바꾸면 현재 Worker가 승인되지 않은 규칙의 영향을 받으므로, G-020 Merge 후 같은 ExecPlan에서 정확한 patch 승인을 받는 순서를 강제한다.
 - FUTURE_IDEAS는 계획 입력이나 실행 상태가 아니며, 현재 범위의 ExecPlan을 대체하거나 자동 승격하는 저장소로 사용하지 않는다.
+
+### Agent Guidance Proposal: shared-guidance-future-ideas
+Target: `AGENTS.md`
+Scope: `common`
+Reason: 현재 ExecPlan은 Planner가 새 ExecPlan과 함께 범위 밖 아이디어를 `docs/FUTURE_IDEAS.md`에 분리해 보존하도록 허용하면서도, Planner와 Reviewer의 `AGENTS.md` 변경 및 승인 전 Worker의 직접 변경을 공통 지침에서 명시적으로 금지해야 한다.
+Impact: 적용하지 않으면 Planner의 FUTURE_IDEAS 변경이 현재 공통 역할 범위를 위반하고, AGENTS 변경 제안·승인 경계가 후속 Agent 실행에 일관되게 적용되지 않아 현재 ExecPlan의 Planner scope와 보호 조건을 구현할 수 없다.
+Patch:
+```diff
+diff --git a/AGENTS.md b/AGENTS.md
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -30,5 +30,8 @@
+ 구현 전 관련 문서를 확인한다.
+-
+-Planner는 `docs/plans/*.md`만 생성하거나 수정한다.
+-
++
++Planner는 새 `docs/plans/*.md`를 생성하고, 현재 PRODUCT/Requirement 범위 밖이지만 보존 가치가 있는 아이디어만 `docs/FUTURE_IDEAS.md`에 생성하거나 수정할 수 있다. 기존 ExecPlan을 수정·삭제하거나 그 밖의 파일을 변경하지 않는다.
++Planner는 `docs/FUTURE_IDEAS.md`의 항목을 같은 계획 주기의 ExecPlan 범위나 현재 미충족 작업의 근거로 사용하지 않는다.
++Planner와 Reviewer는 `AGENTS.md` 변경을 제안하거나 적용하지 않는다.
++Worker는 현재 ExecPlan에 꼭 필요한 `AGENTS.md` 규칙 변경을 발견해도 승인 전에 파일을 직접 수정하지 않고, 선택된 ExecPlan의 `Decision Log`에 `docs/PLANS.md`가 정한 제안과 빈 `User Decision`을 기록한 뒤 작업을 중단한다.
++
+ Worker는 구현, 관련 targeted unit test 작성·실행과 전체 검증 스크립트 생성을 담당한다.
+```
+
+### Agent Guidance User Decision: shared-guidance-future-ideas
+Decision: `approve`
+Revision: `user-approval-2026-09-21-v1`
+Patch:
+```diff
+```

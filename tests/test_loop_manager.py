@@ -318,7 +318,7 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                 ],
             )
 
-            self.assertEqual([plan["id"] for _path, plan in plans or []], ["G-002", "G-003"])
+            self.assertEqual([plan["id"] for _path, plan in plans.plans], ["G-002", "G-003"])
 
         with tempfile.TemporaryDirectory() as directory:
             repo = make_remote_repository(directory)
@@ -650,6 +650,241 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                         ),
                     )
 
+
+
+class PlannerFutureIdeasTest(unittest.TestCase):
+    def test_prompt_separates_future_ideas_from_current_execplans(self):
+        prompt = loop_manager.planner_prompt(None)
+
+        self.assertIn("docs/FUTURE_IDEAS.md", prompt)
+        self.assertIn("같은 계획 주기의 ExecPlan 범위나 미충족 작업의 근거로 사용하지 말고", prompt)
+        self.assertIn("기존 ExecPlan을 수정·삭제하지 말며", prompt)
+        plans_contract = (loop_manager.ROOT / "docs/PLANS.md").read_text(encoding="utf-8")
+        self.assertIn("### Agent Guidance Proposal: guidance-example", plans_contract)
+        self.assertIn("### Agent Guidance User Decision: guidance-example", plans_contract)
+        self.assertIn("`approve`", plans_contract)
+        self.assertIn("`reject`", plans_contract)
+        self.assertIn("`replace`", plans_contract)
+
+    def test_validation_and_scope_separate_future_ideas_from_new_plans(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            (repo / "docs/plans").mkdir()
+            write_execplan(repo, "G-001", "Existing")
+            future_ideas = repo / "docs/FUTURE_IDEAS.md"
+            future_ideas.write_text("# Future Ideas\n", encoding="utf-8")
+            commit_and_push(repo, "Add planning fixtures")
+            active_sha = git_command(repo, "rev-parse", "HEAD")
+            before = loop_manager.capture_git_snapshot(repo)
+
+            future_ideas.write_text(
+                "# Future Ideas\n\n- Deferred idea\n",
+                encoding="utf-8",
+            )
+            second = write_execplan(repo, "G-002", "Current Work")
+            after = loop_manager.capture_git_snapshot(repo)
+
+            loop_manager.validate_agent_scope("planner", repo, before, after)
+            result = loop_manager.validate_planner_result(
+                repo,
+                active_sha,
+                [
+                    future_ideas.relative_to(repo).as_posix(),
+                    second.relative_to(repo).as_posix(),
+                ],
+            )
+
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertEqual(
+                [plan["id"] for _path, plan in result.plans],
+                ["G-002"],
+            )
+            self.assertEqual(
+                result.publication_paths,
+                ("docs/FUTURE_IDEAS.md", "docs/plans/[G-002] Current Work.md"),
+            )
+
+            second.unlink()
+            future_only = loop_manager.validate_planner_result(
+                repo,
+                active_sha,
+                ["docs/FUTURE_IDEAS.md"],
+            )
+            self.assertIsNotNone(future_only)
+            assert future_only is not None
+            self.assertEqual(future_only.plans, ())
+
+    def test_validation_rejects_protected_files_and_existing_plan_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            (repo / "docs/plans").mkdir()
+            existing = write_execplan(repo, "G-001", "Existing")
+            commit_and_push(repo, "Add existing plan")
+            active_sha = git_command(repo, "rev-parse", "HEAD")
+
+            notes = repo / "docs/notes.md"
+            notes.write_text("# Planner changed protected notes\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                loop_manager.PlannerValidationError,
+                "FUTURE_IDEAS",
+            ):
+                loop_manager.validate_planner_result(
+                    repo,
+                    active_sha,
+                    ["docs/notes.md"],
+                )
+
+            notes.write_text("# Notes\n", encoding="utf-8")
+            existing.write_text(
+                existing.read_text(encoding="utf-8") + "\nchanged\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                loop_manager.PlannerValidationError,
+                "기존 ExecPlan을 수정",
+            ):
+                loop_manager.validate_planner_result(
+                    repo,
+                    active_sha,
+                    [existing.relative_to(repo).as_posix()],
+                )
+
+    def test_validation_rejects_future_idea_promoted_to_new_execplan(self):
+        for future_idea_state in ("new", "existing", "removed"):
+            with self.subTest(
+                future_idea_state=future_idea_state
+            ), tempfile.TemporaryDirectory() as directory:
+                repo = make_remote_repository(directory)
+                (repo / "docs/plans").mkdir()
+                future_ideas = repo / "docs/FUTURE_IDEAS.md"
+                if future_idea_state in {"existing", "removed"}:
+                    future_ideas.write_text(
+                        "# Future Ideas\n\n- Speculative deployment dashboard\n",
+                        encoding="utf-8",
+                    )
+                    commit_and_push(repo, "Add deferred idea")
+                active_sha = git_command(repo, "rev-parse", "HEAD")
+                if future_idea_state == "new":
+                    future_ideas.write_text(
+                        "# Future Ideas\n\n- Speculative deployment dashboard\n",
+                        encoding="utf-8",
+                    )
+                elif future_idea_state == "removed":
+                    future_ideas.write_text("# Future Ideas\n", encoding="utf-8")
+                plan = write_execplan(
+                    repo,
+                    "G-001",
+                    "Speculative deployment dashboard",
+                )
+                changed = [plan.relative_to(repo).as_posix()]
+                if future_idea_state != "existing":
+                    changed.append(future_ideas.relative_to(repo).as_posix())
+
+                with self.assertRaisesRegex(
+                    loop_manager.PlannerValidationError,
+                    "FUTURE_IDEAS.*같은 계획 주기",
+                ):
+                    loop_manager.validate_planner_result(
+                        repo,
+                        active_sha,
+                        changed,
+                    )
+
+    def test_validation_uses_token_boundaries_for_future_ideas(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            (repo / "docs/plans").mkdir()
+            future_ideas = repo / "docs/FUTURE_IDEAS.md"
+            future_ideas.write_text("# Future Ideas\n\n- CI\n", encoding="utf-8")
+            plan = write_execplan(repo, "G-001", "Decision Log Cleanup")
+            active_sha = git_command(repo, "rev-parse", "HEAD")
+
+            result = loop_manager.validate_planner_result(
+                repo,
+                active_sha,
+                [
+                    future_ideas.relative_to(repo).as_posix(),
+                    plan.relative_to(repo).as_posix(),
+                ],
+            )
+
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertEqual([item[1]["id"] for item in result.plans], ["G-001"])
+
+    def test_future_ideas_publish_with_and_without_execplans(self):
+        for with_plan in (False, True):
+            with self.subTest(with_plan=with_plan), tempfile.TemporaryDirectory() as directory:
+                repo = make_remote_repository(directory)
+                state_dir = Path(directory) / "state"
+                connection = sqlite3.connect(":memory:")
+                connection.row_factory = sqlite3.Row
+                connection.execute(loop_manager.SCHEMA)
+                original_fingerprint = loop_manager.planning_input_fingerprint(repo, "main")
+
+                def agent(worktree, _state, _config, role_name, _prompt, **_kwargs):
+                    if role_name == "planner":
+                        (worktree / "docs/FUTURE_IDEAS.md").write_text(
+                            "# Future Ideas\n\n- Deferred idea\n",
+                            encoding="utf-8",
+                        )
+                        if with_plan:
+                            (worktree / "docs/plans").mkdir(parents=True, exist_ok=True)
+                            write_execplan(worktree, "G-001", "Current Work")
+                        return loop_manager.CodexResult(0, "", "planner-session")
+                    return loop_manager.CodexResult(1, "stop after planning", "worker-session")
+
+                with mock.patch(
+                    "loop_manager.validate_repository",
+                    return_value=repo,
+                ), mock.patch(
+                    "loop_manager.remote_base",
+                    return_value="main",
+                ), mock.patch(
+                    "loop_manager.ensure_safe_base_worktree"
+                ), mock.patch(
+                    "loop_manager.run_codex",
+                    side_effect=agent,
+                ):
+                    result = loop_manager.run_project(
+                        connection,
+                        state_dir,
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
+                    )
+
+                self.assertEqual(result, 1 if with_plan else 0)
+                self.assertEqual(
+                    git_command(repo, "show", "origin/main:docs/FUTURE_IDEAS.md"),
+                    "# Future Ideas\n\n- Deferred idea",
+                )
+                plans = connection.execute(
+                    "SELECT plan_id, plan_sha FROM exec_plans ORDER BY plan_id"
+                ).fetchall()
+                if with_plan:
+                    self.assertEqual(
+                        [tuple(row) for row in plans],
+                        [("G-001", git_command(repo, "rev-parse", "origin/main"))],
+                    )
+                    self.assertEqual(
+                        git_command(
+                            repo,
+                            "show",
+                            "origin/main:docs/plans/[G-001] Current Work.md",
+                        ).splitlines()[1],
+                        "id: G-001",
+                    )
+                else:
+                    self.assertEqual(plans, [])
+                    project = connection.execute(
+                        "SELECT phase, planning_fingerprint FROM projects WHERE repo = ?",
+                        (str(repo),),
+                    ).fetchone()
+                    self.assertIsNone(project["phase"])
+                    self.assertEqual(project["planning_fingerprint"], original_fingerprint)
 
 
 class LoopManagerTest(unittest.TestCase):
@@ -5374,6 +5609,32 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     after,
                     selected_plan_path=plan_path,
                 )
+
+    def test_auto_merge_tree_ref_alone_is_not_an_active_operation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, plan_path = self._repository_with_plan(directory)
+            before = loop_manager.capture_git_snapshot(repo)
+            auto_merge = Path(
+                git_command(repo, "rev-parse", "--git-path", "AUTO_MERGE")
+            )
+            if not auto_merge.is_absolute():
+                auto_merge = repo / auto_merge
+            auto_merge.write_text(
+                git_command(repo, "write-tree") + "\n",
+                encoding="ascii",
+            )
+
+            after = loop_manager.capture_git_snapshot(repo)
+
+            self.assertTrue(auto_merge.is_file())
+            self.assertNotIn("AUTO_MERGE", after.operations)
+            loop_manager.validate_agent_scope(
+                "worker",
+                repo,
+                before,
+                after,
+                selected_plan_path=plan_path,
+            )
 
     def test_shared_git_metadata_changes_are_rejected(self):
         scenarios = (

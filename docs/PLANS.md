@@ -14,6 +14,42 @@
 - `Validation`에는 Worker가 실행할 계획별 targeted unit test, 추가할 테스트 시나리오와 전체 verify가 확인해야 할 계획 고유의 회귀 조건만 기록한다.
 - Loop Manager가 현재 운영체제의 전체 verify 스크립트를 항상 실행하므로 `scripts/verify.ps1`과 `scripts/verify.sh` 경로를 ExecPlan마다 반복하지 않는다.
 
+## Agent guidance 변경 제안과 사용자 결정
+
+Worker가 현재 ExecPlan 달성에 꼭 필요한 `AGENTS.md` 규칙 변경을 발견하면 파일을 직접 수정하지 않고 해당 ExecPlan의 `Decision Log` 끝에 아래 제안과 빈 사용자 결정을 한 쌍으로 추가한 뒤 작업을 중단한다. proposal ID는 ExecPlan 안에서 고유한 소문자·숫자·하이픈 값이어야 한다. `Target`은 저장소 루트의 `AGENTS.md`만 허용하며, `Scope`는 현재 프로젝트 전용이면 `project`, Loop Manager 기준 원본의 공통 규칙이면 `common`이다. 공통 제안은 Loop Manager 자체 저장소의 Worker만 작성할 수 있다. Planner와 Reviewer는 제안하거나 적용하지 않는다.
+
+````markdown
+### Agent Guidance Proposal: guidance-example
+Target: `AGENTS.md`
+Scope: `project`
+Reason: 현재 ExecPlan에 이 규칙이 필요한 구체적인 이유
+Impact: 적용하지 않으면 현재 구현에 생기는 구체적인 영향
+Patch:
+```diff
+diff --git a/AGENTS.md b/AGENTS.md
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -1,1 +1,2 @@
+ 기존 줄
++추가할 정확한 줄
+```
+
+### Agent Guidance User Decision: guidance-example
+Decision: `pending`
+Revision: ``
+Patch:
+```diff
+```
+````
+
+사용자는 제안 본문을 바꾸지 않고 같은 ID의 `User Decision`만 다음과 같이 편집한다.
+
+- 승인: `Decision`을 `approve`로, `Revision`을 비어 있지 않은 결정 식별자로 작성하고 `Patch`는 비워 둔다. Worker는 Proposal의 patch만 적용한다.
+- 거절: `Decision`을 `reject`로, `Revision`을 비어 있지 않은 결정 식별자로 작성하고 `Patch`는 비워 둔다. Worker는 대상 파일을 변경하지 않는다.
+- 대체: `Decision`을 `replace`로, `Revision`을 비어 있지 않은 결정 식별자로 작성하고 `Patch`에 사용자가 확정한 전체 대체 diff를 기록한다. Worker는 대체 patch만 적용한다.
+
+`pending`의 `Revision`과 `Patch`는 모두 비어 있어야 한다. 제안과 결정은 순서대로 인접해야 하며 기존 제안·결정을 수정하거나 삭제하지 않는다. Loop Manager는 결정, revision, 대상 경로와 확정 patch의 hash를 결합해 승인 상태를 판정한다. `User Decision` 밖의 ExecPlan 내용이나 근거 PRODUCT/Requirement 변경만으로는 승인 대기 `BLOCKED`를 해제하지 않는다. 승인 또는 대체 patch와 실제 `AGENTS.md` diff가 정확히 일치하지 않으면 새 제안과 결정을 받아야 한다.
+
 ```markdown
 ---
 id: G-002

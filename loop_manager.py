@@ -1352,12 +1352,102 @@ class PlannerValidationError(RuntimeError):
     """A Planner output error that is eligible for a correction attempt."""
 
 
+@dataclass(frozen=True)
+class ValidatedPlanningResult:
+    """Validated files to publish, separated from executable plans."""
+
+    plans: tuple[tuple[str, dict[str, object]], ...]
+    publication_paths: tuple[str, ...]
+
+
+_FUTURE_IDEA_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.+?)\s*$")
+
+
+def _idea_tokens(text: str) -> tuple[str, ...]:
+    return tuple(re.findall(r"[0-9a-zA-Z가-힣]+", text.casefold()))
+
+
+def _future_idea_items_from_text(text: str) -> tuple[tuple[str, ...], ...]:
+    items: list[tuple[str, ...]] = []
+    for line in text.splitlines():
+        match = _FUTURE_IDEA_ITEM.fullmatch(line)
+        if match is None:
+            continue
+        item = re.sub(r"^\[[ xX]\]\s*", "", match.group(1)).strip()
+        tokens = _idea_tokens(item)
+        if tokens:
+            items.append(tokens)
+    return tuple(items)
+
+
+def _future_idea_items(
+    worktree: Path,
+    active_sha: str,
+) -> tuple[tuple[str, ...], ...]:
+    path = worktree / "docs/FUTURE_IDEAS.md"
+    current_text = ""
+    if path.is_file():
+        try:
+            current_text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise RuntimeError("Planner FUTURE_IDEAS를 읽을 수 없습니다.") from error
+
+    previous = git(
+        worktree,
+        "show",
+        f"{active_sha}:docs/FUTURE_IDEAS.md",
+        check=False,
+    )
+    previous_text = previous.stdout if previous.returncode == 0 else ""
+    return tuple(
+        dict.fromkeys(
+            _future_idea_items_from_text(previous_text)
+            + _future_idea_items_from_text(current_text)
+        )
+    )
+
+
+def _contains_token_sequence(
+    tokens: tuple[str, ...],
+    candidate: tuple[str, ...],
+) -> bool:
+    width = len(candidate)
+    return any(
+        tokens[offset : offset + width] == candidate
+        for offset in range(len(tokens) - width + 1)
+    )
+
+
+def _validate_future_idea_separation(
+    worktree: Path,
+    active_sha: str,
+    plan_paths: list[str],
+) -> None:
+    future_ideas = _future_idea_items(worktree, active_sha)
+    if not future_ideas:
+        return
+    for plan_path in plan_paths:
+        try:
+            plan_text = (worktree / plan_path).read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise RuntimeError(f"Planner ExecPlan을 읽을 수 없습니다: {plan_path}") from error
+        plan_tokens = _idea_tokens(plan_text)
+        if any(
+            _contains_token_sequence(plan_tokens, idea)
+            for idea in future_ideas
+        ):
+            raise RuntimeError(
+                "docs/FUTURE_IDEAS.md 항목을 같은 계획 주기의 새 ExecPlan에 "
+                f"포함할 수 없습니다: {plan_path}"
+            )
+
+
 def validate_planner_result(
     worktree: Path,
     active_sha: str,
     dirty_files: list[str],
-) -> list[tuple[str, dict[str, object]]] | None:
-    """Validate a batch of new Planner-owned ExecPlans before publication.
+) -> ValidatedPlanningResult | None:
+    """Validate new ExecPlans and the optional future-idea document.
 
     Scope and ExecPlan catalog errors are deliberately translated to a
     dedicated exception. Operational Git failures must retain their normal
@@ -1366,9 +1456,19 @@ def validate_planner_result(
     planned_files = sorted(set(dirty_files) | set(changed_files(worktree, active_sha)))
     if not planned_files:
         return None
+    plan_paths: list[str] = []
     for plan_path in planned_files:
+        if plan_path == "docs/FUTURE_IDEAS.md":
+            if not (worktree / plan_path).is_file():
+                raise PlannerValidationError(
+                    "Planner는 docs/FUTURE_IDEAS.md를 삭제할 수 없습니다."
+                )
+            continue
         if not re.fullmatch(r"docs/plans/[^/]+\.md", plan_path):
-            raise PlannerValidationError("Planner는 docs/plans의 새 ExecPlan만 작성해야 합니다.")
+            raise PlannerValidationError(
+                "Planner는 docs/plans의 새 ExecPlan과 docs/FUTURE_IDEAS.md만 "
+                "작성할 수 있습니다."
+            )
         if not (worktree / plan_path).is_file():
             raise PlannerValidationError("Planner는 기존 ExecPlan을 삭제할 수 없습니다.")
         try:
@@ -1386,11 +1486,12 @@ def validate_planner_result(
         ).returncode == 0
         if existed:
             raise PlannerValidationError(f"Planner는 기존 ExecPlan을 수정할 수 없습니다: {plan_path}")
+        plan_paths.append(plan_path)
 
     try:
         catalog = load_execplan_catalog(worktree, validate_sources=False)
         plans: list[tuple[str, dict[str, object]]] = []
-        for plan_path in planned_files:
+        for plan_path in plan_paths:
             parsed = _parse_execplan(
                 worktree,
                 worktree / plan_path,
@@ -1398,6 +1499,7 @@ def validate_planner_result(
                 allow_archive_fallback=False,
             )
             plans.append((plan_path, parsed))
+        _validate_future_idea_separation(worktree, active_sha, plan_paths)
         new_ids = {str(plan["id"]) for _, plan in plans}
         existing_ids = [int(plan_id[2:]) for plan_id in catalog if plan_id not in new_ids]
         first_id = max(existing_ids, default=0) + 1
@@ -1405,7 +1507,12 @@ def validate_planner_result(
         actual = sorted(int(str(plan["id"])[2:]) for _, plan in plans)
         if actual != expected:
             raise RuntimeError("새 ExecPlan ID는 기존 최대 번호 다음부터 연속적이어야 합니다.")
-        return sorted(plans, key=lambda item: int(str(item[1]["id"])[2:]))
+        return ValidatedPlanningResult(
+            plans=tuple(
+                sorted(plans, key=lambda item: int(str(item[1]["id"])[2:]))
+            ),
+            publication_paths=tuple(planned_files),
+        )
     except RuntimeError as error:
         raise PlannerValidationError(str(error)) from error
 
@@ -3982,11 +4089,14 @@ def _config_entries(worktree: Path) -> dict[str, tuple[str, ...]]:
     }
 
 
+# AUTO_MERGE is deliberately excluded. The ort strategy may leave this
+# auxiliary tree ref behind after a conflicted operation has completed, so it
+# does not prove that a Git operation is still active. Controlling markers such
+# as MERGE_HEAD and the rebase directories remain protected below.
 _GIT_OPERATION_PATHS = (
     "MERGE_HEAD",
     "MERGE_MODE",
     "MERGE_MSG",
-    "AUTO_MERGE",
     "CHERRY_PICK_HEAD",
     "REVERT_HEAD",
     "REBASE_HEAD",
@@ -4370,8 +4480,11 @@ def validate_agent_scope(
         allowed = False
         if role_name == "planner":
             allowed = bool(
-                re.fullmatch(r"docs/plans/[^/]+\.md", change.path)
-                and change.path not in before.index
+                change.path == "docs/FUTURE_IDEAS.md"
+                or (
+                    re.fullmatch(r"docs/plans/[^/]+\.md", change.path)
+                    and change.path not in before.index
+                )
             )
         elif role_name == "worker":
             if selected_plan_path is None:
@@ -8362,7 +8475,10 @@ AGENTS.md, 활성 PRODUCT와 Requirement, docs/ARCHITECTURE.md, docs/PLANS.md �
 현재 입력에서 식별 가능한 미충족 작업 전체를 독립적으로 검증·Merge 가능한 ExecPlan들로 나누어 한 번에 작성하라.
 catalog가 이미 충족하는 작업이나 코드·테스트에 이미 구현된 작업은 중복 계획하지 마라.
 catalog에서 현재 입력과 겹치는 비종료 계획만 필요할 때 전문을 읽고, 기존 docs/plans 전체를 기본 입력으로 읽지 마라.
-새 ExecPlan마다 priority를 기록하고, 기존 파일을 수정하지 말며 docs/plans 바로 아래에 새 파일만 작성하라.
+새 ExecPlan마다 priority를 기록하고, 기존 ExecPlan을 수정·삭제하지 말며 docs/plans 바로 아래에 새 파일만 작성하라.
+현재 PRODUCT/Requirement 범위 밖이지만 보존 가치가 있는 아이디어는 같은 계획 주기의 ExecPlan 범위나 미충족 작업의 근거로 사용하지 말고 docs/FUTURE_IDEAS.md에만 분리해 기록하라.
+docs/FUTURE_IDEAS.md의 목록 항목과 같은 내용을 새 ExecPlan의 제목이나 본문에 반복하지 마라.
+docs/FUTURE_IDEAS.md는 새 ExecPlan과 함께 생성·수정할 수 있지만, 그 밖의 기존 파일은 수정하지 마라.
 구현, 테스트, commit, push와 PR 생성은 하지 마라. 추가 계획이 필요 없으면 파일을 변경하지 마라.
 {failure}
 """.strip()
@@ -9848,18 +9964,25 @@ def _run_project_step(
             operation_print("추가로 계획할 작업이 없습니다.")
             row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
         else:
-            plans = validated_result
+            plans = list(validated_result.plans)
             if dirty_files:
                 # Publishing failures are operational failures, not Planner
                 # validation failures. Leave the validated result for retry.
-                plan_paths = [path for path, _plan in plans]
-                git(planning_worktree, "add", "--", *plan_paths)
-                first = plans[0][1]
-                last = plans[-1][1]
-                if len(plans) == 1:
-                    message = f"Add ExecPlan {first['id']}: {first['title']}"
+                git(
+                    planning_worktree,
+                    "add",
+                    "--",
+                    *validated_result.publication_paths,
+                )
+                if not plans:
+                    message = "Update future ideas from planning"
                 else:
-                    message = f"Add ExecPlans {first['id']}-{last['id']}"
+                    first = plans[0][1]
+                    last = plans[-1][1]
+                    if len(plans) == 1:
+                        message = f"Add ExecPlan {first['id']}: {first['title']}"
+                    else:
+                        message = f"Add ExecPlans {first['id']}-{last['id']}"
                 git(planning_worktree, "commit", "-m", message)
 
             clear_planning_validation_state(connection, repo)
