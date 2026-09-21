@@ -52,3 +52,4 @@ G-011이 Merge한 일반 archive eligibility와 archived-source 조회 경계를
 - 2026-09-20 R-005와 G-011의 사용자 결정에 따라 기능 도입 PR과 실제 archive 이동을 분리하며, 이 계획은 반드시 새 G-011 런타임에서 실행한다.
 - 이 계획의 두 Requirement source 자체가 일반 eligibility 관계를 형성하므로 런타임에 Requirement ID별 특별 처리를 추가하지 않는다.
 - 다른 활성 Requirement의 완료 여부는 이 bootstrap 범위에서 임의로 판단하거나 함께 이동하지 않는다.
+- 2026-09-21 PR #27의 원격 head와 관리 worktree가 같은 commit의 clean 상태이고 PR이 mergeable임을 재확인했으므로, Requirement 원문을 변경하지 않고 이 계획을 재시도한다.
