@@ -751,32 +751,34 @@ class PlannerFutureIdeasTest(unittest.TestCase):
                 )
 
     def test_validation_rejects_future_idea_promoted_to_new_execplan(self):
-        for existing_future_idea in (False, True):
+        for future_idea_state in ("new", "existing", "removed"):
             with self.subTest(
-                existing_future_idea=existing_future_idea
+                future_idea_state=future_idea_state
             ), tempfile.TemporaryDirectory() as directory:
                 repo = make_remote_repository(directory)
                 (repo / "docs/plans").mkdir()
                 future_ideas = repo / "docs/FUTURE_IDEAS.md"
-                if existing_future_idea:
+                if future_idea_state in {"existing", "removed"}:
                     future_ideas.write_text(
                         "# Future Ideas\n\n- Speculative deployment dashboard\n",
                         encoding="utf-8",
                     )
                     commit_and_push(repo, "Add deferred idea")
                 active_sha = git_command(repo, "rev-parse", "HEAD")
-                if not existing_future_idea:
+                if future_idea_state == "new":
                     future_ideas.write_text(
                         "# Future Ideas\n\n- Speculative deployment dashboard\n",
                         encoding="utf-8",
                     )
+                elif future_idea_state == "removed":
+                    future_ideas.write_text("# Future Ideas\n", encoding="utf-8")
                 plan = write_execplan(
                     repo,
                     "G-001",
                     "Speculative deployment dashboard",
                 )
                 changed = [plan.relative_to(repo).as_posix()]
-                if not existing_future_idea:
+                if future_idea_state != "existing":
                     changed.append(future_ideas.relative_to(repo).as_posix())
 
                 with self.assertRaisesRegex(
@@ -788,6 +790,28 @@ class PlannerFutureIdeasTest(unittest.TestCase):
                         active_sha,
                         changed,
                     )
+
+    def test_validation_uses_token_boundaries_for_future_ideas(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            (repo / "docs/plans").mkdir()
+            future_ideas = repo / "docs/FUTURE_IDEAS.md"
+            future_ideas.write_text("# Future Ideas\n\n- CI\n", encoding="utf-8")
+            plan = write_execplan(repo, "G-001", "Decision Log Cleanup")
+            active_sha = git_command(repo, "rev-parse", "HEAD")
+
+            result = loop_manager.validate_planner_result(
+                repo,
+                active_sha,
+                [
+                    future_ideas.relative_to(repo).as_posix(),
+                    plan.relative_to(repo).as_posix(),
+                ],
+            )
+
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertEqual([item[1]["id"] for item in result.plans], ["G-001"])
 
     def test_future_ideas_publish_with_and_without_execplans(self):
         for with_plan in (False, True):

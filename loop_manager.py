@@ -1363,36 +1363,67 @@ class ValidatedPlanningResult:
 _FUTURE_IDEA_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.+?)\s*$")
 
 
-def _normalized_idea_text(text: str) -> str:
-    return " ".join(re.findall(r"[0-9a-zA-Z가-힣]+", text.casefold()))
+def _idea_tokens(text: str) -> tuple[str, ...]:
+    return tuple(re.findall(r"[0-9a-zA-Z가-힣]+", text.casefold()))
 
 
-def _future_idea_items(worktree: Path) -> tuple[str, ...]:
-    path = worktree / "docs/FUTURE_IDEAS.md"
-    if not path.is_file():
-        return ()
-    try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as error:
-        raise RuntimeError("Planner FUTURE_IDEAS를 읽을 수 없습니다.") from error
-
-    items: list[str] = []
+def _future_idea_items_from_text(text: str) -> tuple[tuple[str, ...], ...]:
+    items: list[tuple[str, ...]] = []
     for line in text.splitlines():
         match = _FUTURE_IDEA_ITEM.fullmatch(line)
         if match is None:
             continue
         item = re.sub(r"^\[[ xX]\]\s*", "", match.group(1)).strip()
-        normalized = _normalized_idea_text(item)
-        if normalized:
-            items.append(normalized)
+        tokens = _idea_tokens(item)
+        if tokens:
+            items.append(tokens)
     return tuple(items)
+
+
+def _future_idea_items(
+    worktree: Path,
+    active_sha: str,
+) -> tuple[tuple[str, ...], ...]:
+    path = worktree / "docs/FUTURE_IDEAS.md"
+    current_text = ""
+    if path.is_file():
+        try:
+            current_text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise RuntimeError("Planner FUTURE_IDEAS를 읽을 수 없습니다.") from error
+
+    previous = git(
+        worktree,
+        "show",
+        f"{active_sha}:docs/FUTURE_IDEAS.md",
+        check=False,
+    )
+    previous_text = previous.stdout if previous.returncode == 0 else ""
+    return tuple(
+        dict.fromkeys(
+            _future_idea_items_from_text(previous_text)
+            + _future_idea_items_from_text(current_text)
+        )
+    )
+
+
+def _contains_token_sequence(
+    tokens: tuple[str, ...],
+    candidate: tuple[str, ...],
+) -> bool:
+    width = len(candidate)
+    return any(
+        tokens[offset : offset + width] == candidate
+        for offset in range(len(tokens) - width + 1)
+    )
 
 
 def _validate_future_idea_separation(
     worktree: Path,
+    active_sha: str,
     plan_paths: list[str],
 ) -> None:
-    future_ideas = _future_idea_items(worktree)
+    future_ideas = _future_idea_items(worktree, active_sha)
     if not future_ideas:
         return
     for plan_path in plan_paths:
@@ -1400,8 +1431,11 @@ def _validate_future_idea_separation(
             plan_text = (worktree / plan_path).read_text(encoding="utf-8")
         except (OSError, UnicodeError) as error:
             raise RuntimeError(f"Planner ExecPlan을 읽을 수 없습니다: {plan_path}") from error
-        normalized_plan = _normalized_idea_text(plan_text)
-        if any(idea in normalized_plan for idea in future_ideas):
+        plan_tokens = _idea_tokens(plan_text)
+        if any(
+            _contains_token_sequence(plan_tokens, idea)
+            for idea in future_ideas
+        ):
             raise RuntimeError(
                 "docs/FUTURE_IDEAS.md 항목을 같은 계획 주기의 새 ExecPlan에 "
                 f"포함할 수 없습니다: {plan_path}"
@@ -1465,7 +1499,7 @@ def validate_planner_result(
                 allow_archive_fallback=False,
             )
             plans.append((plan_path, parsed))
-        _validate_future_idea_separation(worktree, plan_paths)
+        _validate_future_idea_separation(worktree, active_sha, plan_paths)
         new_ids = {str(plan["id"]) for _, plan in plans}
         existing_ids = [int(plan_id[2:]) for plan_id in catalog if plan_id not in new_ids]
         first_id = max(existing_ids, default=0) + 1
