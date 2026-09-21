@@ -6079,6 +6079,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "guidance_approval.py",
                 "managed_config.py",
                 "maintenance_git.py",
+                "maintenance_planning.py",
                 "maintenance_state.py",
                 "notifications.py",
                 "project_registry.py",
@@ -6093,7 +6094,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     sys.executable,
                     "-c",
                     "import loop_manager, managed_config, maintenance_git, "
-                    "maintenance_state, project_registry",
+                    "maintenance_planning, maintenance_state, project_registry",
                 ],
                 cwd=repo,
                 env=planner_environment,
@@ -6113,7 +6114,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     sys.executable,
                     "-c",
                     "import loop_manager, managed_config, maintenance_git, "
-                    "maintenance_state, project_registry",
+                    "maintenance_planning, maintenance_state, project_registry",
                 ],
                 cwd=repo,
                 env=planner_environment,
