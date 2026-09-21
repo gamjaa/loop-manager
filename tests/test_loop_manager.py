@@ -3607,6 +3607,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         repo, state_dir, connection = self._active_worker_project(directory)
         roles = []
         reviewer_sessions = []
+        reviewer_prompts = []
         worker_version = 1
         transitions = []
         original_transition = loop_manager.transition_validation_failure
@@ -3637,14 +3638,20 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                     "worker-session",
                 )
             reviewer_sessions.append(kwargs["session_id"])
+            reviewer_prompts.append(_prompt)
             return loop_manager.CodexResult(
                 0, next(responses), "reviewer-session"
             )
 
         responses = iter(review_messages)
-        pr_results: list[dict[str, str] | None] = [None] * len(review_messages)
-        if publish:
-            pr_results.append({"url": "https://example.test/pr/13"})
+
+        def existing_pr(*_args, **_kwargs):
+            phase = connection.execute(
+                "SELECT phase FROM projects WHERE repo = ?", (str(repo),)
+            ).fetchone()["phase"]
+            if publish and phase == "PUBLISHING":
+                return {"url": "https://example.test/pr/13"}
+            return None
 
         with mock.patch(
             "loop_manager.validate_repository", return_value=repo
@@ -3653,7 +3660,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         ), mock.patch(
             "loop_manager.ensure_safe_base_worktree"
         ), mock.patch(
-            "loop_manager.pr_for_branch", side_effect=pr_results
+            "loop_manager.pr_for_branch", side_effect=existing_pr
         ), mock.patch(
             "loop_manager.run_codex", side_effect=agent
         ), mock.patch(
@@ -3677,7 +3684,8 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             (str(repo),),
         ).fetchone()
         plan = connection.execute(
-            "SELECT status, review_failure_history "
+            "SELECT status, review_failure_history, review_level_history, "
+            "effective_worker_level "
             "FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
             (str(repo),),
         ).fetchone()
@@ -3685,6 +3693,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             "result": result,
             "roles": roles,
             "reviewer_sessions": reviewer_sessions,
+            "reviewer_prompts": reviewer_prompts,
             "transitions": transitions,
             "project": project,
             "plan": plan,
@@ -3834,6 +3843,48 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             set(first_by_issue) & set(changed_by_issue),
             {"ISSUE_ID:tests/test_loop_manager.py::retry-case::missing-coverage"},
         )
+
+    def test_review_issue_id_accepts_actual_execplan_path(self):
+        review = (
+            "ISSUE_ID: docs/plans/[G-025] Bootstrap Remaining Completed "
+            "Requirement Archive.md::Decision-Log::archive-eligibility-evidence\n"
+            "eligibility evidence does not match the source plans\n"
+            "VERDICT: FAIL"
+        )
+
+        verdict, issue_ids = loop_manager.parse_reviewer_result(review)
+
+        self.assertEqual(verdict, "FAIL")
+        self.assertEqual(
+            issue_ids,
+            (
+                "ISSUE_ID:docs/plans/[g-025] bootstrap remaining completed "
+                "requirement archive.md::decision-log::archive-eligibility-evidence",
+            ),
+        )
+
+    def test_review_issue_id_rejects_unsafe_repo_relative_paths(self):
+        invalid_paths = (
+            "/docs/plans/plan.md",
+            "docs/../plan.md",
+            "docs/./plan.md",
+            "docs//plan.md",
+            "docs\\plans\\plan.md",
+            "c:/repo/plan.md",
+            "docs/plans/control\x01.md",
+            "docs/ plan.md",
+            "docs/plans/plan.md ",
+        )
+        for path in invalid_paths:
+            review = (
+                f"ISSUE_ID: {path}::stable-symbol::blocking\n"
+                "VERDICT: FAIL"
+            )
+            with self.subTest(path=path), self.assertRaisesRegex(
+                loop_manager.ReviewerProtocolError,
+                "ISSUE_ID 형식이 유효하지 않습니다",
+            ):
+                loop_manager.parse_reviewer_result(review)
 
     def test_verify_fingerprint_uses_full_output_before_feedback_truncation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -4311,25 +4362,97 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         for review in invalid_reviews:
             with self.subTest(review=review), tempfile.TemporaryDirectory() as directory:
                 data = self._run_review_sequence(
-                    directory, (review,), publish=False
+                    directory,
+                    (review,) * loop_manager.MAX_REVIEWER_PROTOCOL_ATTEMPTS,
+                    publish=False,
                 )
 
             result = data["result"]
             project = data["project"]
             plan = data["plan"]
-            self.assertEqual(
-                result.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR
-            )
+            self.assertEqual(result.kind, loop_manager.ProjectRunKind.BLOCKED)
             self.assertEqual(result.exit_code, 1)
-            self.assertEqual(data["roles"], ["worker", "reviewer"])
-            self.assertEqual(data["reviewer_sessions"], [None])
+            self.assertEqual(
+                data["roles"],
+                ["worker"]
+                + ["reviewer"] * loop_manager.MAX_REVIEWER_PROTOCOL_ATTEMPTS,
+            )
+            self.assertEqual(
+                data["reviewer_sessions"],
+                [None]
+                + ["reviewer-session"]
+                * (loop_manager.MAX_REVIEWER_PROTOCOL_ATTEMPTS - 1),
+            )
             self.assertEqual(data["verify_calls"], 1)
             self.assertEqual(data["transitions"], [])
-            self.assertEqual(project["phase"], "REVIEWING")
+            self.assertEqual(project["phase"], "BLOCKED")
             self.assertIn("Reviewer 결과 프로토콜 오류", project["last_error"])
+            self.assertIn("프로토콜 교정 3회 실패", project["last_error"])
             self.assertEqual(project["review_result"], review)
-            self.assertEqual(plan["status"], "REVIEWING")
+            self.assertEqual(plan["status"], "BLOCKED")
             self.assertEqual(json.loads(plan["review_failure_history"]), {})
+            self.assertEqual(json.loads(plan["review_level_history"]), {})
+            self.assertEqual(plan["effective_worker_level"], 1)
+            for prompt in data["reviewer_prompts"][1:]:
+                self.assertIn("직전 Reviewer 결과가 아래 프로토콜 검증에 실패", prompt)
+                self.assertIn(review, prompt)
+
+    def test_review_protocol_error_is_corrected_to_pass_in_same_session(self):
+        invalid = "blocking issue without an identifier\nVERDICT: FAIL"
+        with tempfile.TemporaryDirectory() as directory:
+            data = self._run_review_sequence(
+                directory,
+                (invalid, "VERDICT: PASS"),
+                publish=True,
+            )
+
+        self.assertEqual(data["result"].kind, loop_manager.ProjectRunKind.WAITING)
+        self.assertEqual(data["result"].exit_code, 0)
+        self.assertEqual(data["roles"], ["worker", "reviewer", "reviewer"])
+        self.assertEqual(data["reviewer_sessions"], [None, "reviewer-session"])
+        self.assertEqual(data["verify_calls"], 1)
+        self.assertEqual(data["transitions"], [])
+        self.assertEqual(data["project"]["phase"], "PR_OPEN")
+        self.assertEqual(data["plan"]["status"], "PR_OPEN")
+        self.assertIsNone(data["project"]["last_error"])
+        self.assertIn(
+            "Reviewer FAIL 결과에 유효한 ISSUE_ID가 없습니다",
+            data["reviewer_prompts"][1],
+        )
+        self.assertIn(invalid, data["reviewer_prompts"][1])
+
+    def test_review_protocol_error_is_corrected_to_fail_without_worker_retry(self):
+        invalid = "blocking issue without an identifier\nVERDICT: FAIL"
+        valid_fail = (
+            "ISSUE_ID: src/app.py::value::incorrect\n"
+            "value remains incorrect\nVERDICT: FAIL"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            data = self._run_review_sequence(
+                directory,
+                (invalid, valid_fail, "VERDICT: PASS"),
+                publish=True,
+            )
+
+        self.assertEqual(data["result"].kind, loop_manager.ProjectRunKind.WAITING)
+        self.assertEqual(data["result"].exit_code, 0)
+        self.assertEqual(
+            data["roles"],
+            ["worker", "reviewer", "reviewer", "worker", "reviewer"],
+        )
+        self.assertEqual(data["verify_calls"], 2)
+        self.assertEqual(
+            [
+                (stage, occurrences, blocked)
+                for stage, _fingerprint, occurrences, blocked in data["transitions"]
+            ],
+            [("review", 1, False)],
+        )
+        self.assertIn(invalid, data["reviewer_prompts"][1])
+        self.assertNotIn(
+            "직전 Reviewer 결과가 아래 프로토콜 검증에 실패",
+            data["reviewer_prompts"][2],
+        )
 
     def test_review_failure_then_verify_failure_keeps_stage_counts_independent(self):
         with tempfile.TemporaryDirectory() as directory:

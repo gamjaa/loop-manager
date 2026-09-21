@@ -42,13 +42,14 @@ priority: critical
 
 ## Progress
 
-- [ ] 안전한 repo-relative ISSUE_ID path 검증 구현
-- [ ] 같은-session Reviewer 프로토콜 교정과 최대 시도 구현
-- [ ] prompt 계약과 parser 회귀 테스트 추가
-- [ ] 교정 성공·지속 실패 상태 전이 테스트 추가
+- [x] 안전한 repo-relative ISSUE_ID path 검증 구현
+- [x] 같은-session Reviewer 프로토콜 교정과 최대 시도 구현
+- [x] prompt 계약과 parser 회귀 테스트 추가
+- [x] 교정 성공·지속 실패 상태 전이 테스트 추가
 
 ## Decision Log
 
 - Reviewer가 반환한 G-025 issue는 실제 ExecPlan 경로를 사용했지만 기존 parser가 파일명 형식에 필수인 공백과 대괄호를 허용하지 않아 거부했다.
 - 프로토콜 오류는 actionable Review FAIL이 아니므로 R-008의 `review_failure_history`와 Worker level 승격 입력에 합산하지 않는다.
 - 외부 scheduler 실행마다 오류를 다시 호출하는 방식은 무제한 Agent 호출을 허용하므로 한 Review 단계 안에서 세 번의 같은-session 교정 후 명시적으로 차단한다.
+- 2026-09-21 targeted validation: `BoundedExecutionRecoveryTest` 17개와 Reviewer prompt 경계 단일 테스트가 통과했다. 전체 verify는 Loop Manager가 Agent 밖에서 실행하도록 직접 실행하지 않았다.
