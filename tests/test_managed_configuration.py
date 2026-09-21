@@ -158,6 +158,21 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
                 self.assertEqual(loop_manager.main(), 1)
             self.assertFalse((state_dir / "loop-manager.db").exists())
 
+    def test_invalid_refactoring_interval_stops_top_level_init_before_database_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            invalid = root / "invalid.ini"
+            invalid.write_text(
+                "[loop]\nrefactoring_review_interval = 0\n", encoding="utf-8"
+            )
+            args = loop_manager.build_parser().parse_args(["init"])
+
+            with self.assertRaises(ManagedConfigError):
+                loop_manager.execute_runtime_command(args, state_dir, invalid)
+
+            self.assertFalse((state_dir / "loop-manager.db").exists())
+
     def test_invalid_refactoring_interval_prevents_registry_state_change(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

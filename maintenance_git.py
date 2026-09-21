@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 import subprocess
+import tempfile
 
 
 MAX_CHANGE_COMMITS = 50
@@ -48,22 +49,26 @@ def _bounded_git_output(
     repo: Path, limit: int, *arguments: str
 ) -> tuple[subprocess.CompletedProcess[str], bool]:
     command = ["git", "-C", str(repo), *arguments]
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        completed = subprocess.run(
+            command,
+            check=False,
+            stdout=stdout_file,
+            stderr=stderr_file,
+        )
+        stdout_file.seek(0)
+        raw_output = stdout_file.read(limit + 1)
+        stderr_file.seek(0)
+        raw_error = stderr_file.read(MAX_CHANGE_CONTEXT_BYTES + 1)
+    overflow = len(raw_output) > limit
+    output = raw_output[:limit].decode("utf-8", errors="replace")
+    error = raw_error[:MAX_CHANGE_CONTEXT_BYTES].decode(
+        "utf-8", errors="replace"
     )
-    assert process.stdout is not None
-    try:
-        raw = process.stdout.read(limit + 1)
-    finally:
-        process.stdout.close()
-    overflow = len(raw) > limit
-    if overflow:
-        process.kill()
-    returncode = process.wait()
-    output = raw[:limit].decode("utf-8", errors="replace")
-    return subprocess.CompletedProcess(command, returncode, output), overflow
+    return (
+        subprocess.CompletedProcess(command, completed.returncode, output, error),
+        overflow,
+    )
 
 
 def _context_error(
@@ -161,8 +166,10 @@ def bounded_remote_change_context(
             sha,
         )
         if (
-            (subject_result.returncode and not subject_overflow)
-            or (paths_result.returncode and not paths_overflow)
+            subject_result.returncode
+            or paths_result.returncode
+            or subject_result.stderr.strip()
+            or paths_result.stderr.strip()
         ):
             return _context_error(
                 baseline_commit,

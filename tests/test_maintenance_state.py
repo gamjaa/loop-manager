@@ -310,6 +310,34 @@ class BoundedGitChangeContextTest(unittest.TestCase):
             self.assertIn("이력", missing.error or "")
             self.assertEqual(self._git(repo, "status", "--porcelain=v1"), before)
 
+    def test_oversized_git_failure_is_not_misreported_as_truncation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            self._git(repo, "init", "-b", "main")
+            self._git(repo, "config", "user.email", "test@example.com")
+            self._git(repo, "config", "user.name", "Test")
+            baseline = self._commit(repo, "one.txt", "one\n", "baseline")
+            current = self._commit(repo, "two.txt", "two\n", "current")
+            self._git(repo, "update-ref", "refs/remotes/origin/main", current)
+            failed = subprocess.CompletedProcess(
+                ["git"],
+                1,
+                stdout="x" * 100,
+                stderr="fatal: simulated Git failure",
+            )
+
+            with mock.patch(
+                "maintenance_git._bounded_git_output",
+                return_value=(failed, True),
+            ):
+                context = maintenance_git.bounded_remote_change_context(
+                    repo, "main", baseline, current
+                )
+
+            self.assertFalse(context.ok)
+            self.assertFalse(context.truncated)
+            self.assertIn("안전하게", context.error or "")
+
 
 if __name__ == "__main__":
     unittest.main()

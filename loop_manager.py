@@ -12947,15 +12947,14 @@ def execute_runtime_command(
     state_dir: Path,
     config_path: Path,
 ) -> int:
+    config = load_managed_config(config_path)
     if args.command == "init":
         with connect_database(state_dir, create=True):
             pass
         operation_print(f"상태 DB 초기화 완료: {state_dir / 'loop-manager.db'}")
         return 0
     if args.command == "config":
-        load_managed_config(config_path)
         return configure_registry(args, state_dir, config_path)
-    config = load_managed_config(config_path)
     with connect_database(state_dir) as connection:
         return run_registered_projects(connection, state_dir, config)
 
