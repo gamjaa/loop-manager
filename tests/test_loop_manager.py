@@ -650,6 +650,124 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                         ),
                     )
 
+    def test_planning_and_ready_selection_pin_fingerprint_to_resolved_sha(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            (repo / "docs/plans").mkdir()
+            write_execplan(repo, "G-001", "Queued", priority="high")
+            commit_and_push(repo, "Add queued plan")
+            selected_sha = git_command(repo, "rev-parse", "origin/main")
+            selected_fingerprint = loop_manager._planning_input_fingerprint(
+                repo,
+                selected_sha,
+            )
+
+            state_dir = Path(directory) / "state"
+            connection = self._connection(str(repo))
+            self._insert_plan(
+                connection,
+                "G-001",
+                "READY",
+                priority="high",
+                repo=str(repo),
+                title="Queued",
+                plan_sha=selected_sha,
+            )
+            connection.execute(
+                """
+                UPDATE projects
+                SET planning_fingerprint = ?, processed_sha = ?
+                WHERE repo = ?
+                """,
+                (selected_fingerprint, selected_sha, str(repo)),
+            )
+            connection.commit()
+
+            (repo / "docs/PRODUCT.md").write_text(
+                "# Product moved after SHA resolve\n",
+                encoding="utf-8",
+            )
+            git_command(repo, "add", "docs/PRODUCT.md")
+            git_command(repo, "commit", "-m", "Move planning input locally")
+            moved_sha = git_command(repo, "rev-parse", "HEAD")
+
+            real_git = loop_manager.git
+            real_fingerprint = loop_manager._planning_input_fingerprint
+            exact_reads = 0
+            fingerprint_revisions = []
+
+            def move_ref_after_resolve(path, *arguments, **kwargs):
+                nonlocal exact_reads
+                result = real_git(path, *arguments, **kwargs)
+                if arguments in {
+                    (
+                        "rev-parse",
+                        "refs/remotes/origin/main^{commit}",
+                    ),
+                    (
+                        "rev-parse",
+                        "--verify",
+                        "refs/remotes/origin/main^{commit}",
+                    ),
+                }:
+                    exact_reads += 1
+                    git_command(
+                        repo,
+                        "update-ref",
+                        "refs/remotes/origin/main",
+                        moved_sha,
+                    )
+                return result
+
+            def record_fingerprint(path, revision):
+                fingerprint_revisions.append(revision)
+                return real_fingerprint(path, revision)
+
+            roles = []
+
+            def agent(_worktree, _state, _config, role_name, _prompt, **_kwargs):
+                roles.append(role_name)
+                return loop_manager.CodexResult(1, "stop", "worker-session")
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.git", side_effect=move_ref_after_resolve
+            ), mock.patch(
+                "loop_manager._planning_input_fingerprint",
+                side_effect=record_fingerprint,
+            ), mock.patch("loop_manager.run_codex", side_effect=agent):
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT active_sha, worktree FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(result, 1)
+            self.assertEqual(roles, ["worker"])
+            self.assertGreaterEqual(exact_reads, 2)
+            self.assertGreaterEqual(fingerprint_revisions.count(selected_sha), 2)
+            self.assertEqual(project["active_sha"], selected_sha)
+            self.assertEqual(
+                git_command(Path(project["worktree"]), "rev-parse", "HEAD"),
+                selected_sha,
+            )
+            self.assertEqual(
+                git_command(repo, "rev-parse", "refs/remotes/origin/main"),
+                moved_sha,
+            )
+
 
 
 class PlannerFutureIdeasTest(unittest.TestCase):
@@ -3094,6 +3212,17 @@ risk: medium
             loop_manager.migrate_legacy_execplans(
                 connection, target_repo=str(repo)
             )
+            origin_sha = git_command(repo, "rev-parse", "origin/main")
+            origin_tree = git_command(repo, "rev-parse", "origin/main^{tree}")
+            advanced_sha = git_command(
+                repo,
+                "commit-tree",
+                origin_tree,
+                "-p",
+                origin_sha,
+                "-m",
+                "Advance base for rebase verification",
+            )
             managed = Path(
                 connection.execute(
                     "SELECT worktree FROM projects WHERE repo = ?", (str(repo),)
@@ -3113,7 +3242,7 @@ risk: medium
                     origin_reads += 1
                     if origin_reads > 1:
                         return subprocess.CompletedProcess(
-                            ["git", *arguments], 0, stdout="f" * 40 + "\n"
+                            ["git", *arguments], 0, stdout=advanced_sha + "\n"
                         )
                 if arguments == ("rebase", "origin/main"):
                     return subprocess.CompletedProcess(

@@ -425,6 +425,34 @@ class OriginIsolatedRegistrationAndExecutionTest(unittest.TestCase):
                     loop_manager.prepare_runtime_worktree(source, state_dir)
             self.assertEqual(git(second.path, "branch", "--show-current"), "runtime-topic")
 
+    def test_runtime_rejects_symlink_escape_before_worktree_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _remote, source, _writer = remote_fixture(directory)
+            state_dir = root / "state"
+            outside = root / "outside"
+            state_dir.mkdir()
+            outside.mkdir()
+            (state_dir / "runtimes").symlink_to(
+                outside,
+                target_is_directory=True,
+            )
+
+            with mock.patch(
+                "loop_manager.github_repository", return_value="owner/repo"
+            ):
+                with self.assertRaisesRegex(
+                    loop_manager.WorkspaceOwnershipError,
+                    "상태 디렉터리 밖",
+                ):
+                    loop_manager.prepare_runtime_worktree(source, state_dir)
+
+            self.assertEqual(tuple(outside.iterdir()), ())
+            self.assertNotIn(
+                str(outside),
+                git(source, "worktree", "list", "--porcelain"),
+            )
+
     def test_bootstrap_holds_lock_around_runtime_and_normalizes_external_config(self):
         events: list[str] = []
         state_dir = Path("/state").resolve()

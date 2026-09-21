@@ -819,6 +819,12 @@ def prepare_runtime_worktree(source: Path, state_dir: Path) -> RuntimeWorktree:
         "refs/remotes/origin/main^{commit}",
     ).stdout.strip()
     runtime = expected_runtime_worktree(state_dir, source, commit_sha)
+    _validate_managed_path_boundary(
+        state_dir,
+        runtime,
+        runtime,
+        "runtime worktree",
+    )
     try:
         _canonical_path(runtime).relative_to(source)
     except ValueError:
@@ -9910,10 +9916,10 @@ def _run_project_step(
             operation_print(message, file=sys.stderr)
             return 1
 
-    current_fingerprint = planning_input_fingerprint(repo_path, base)
+    current_fingerprint = _planning_input_fingerprint(repo_path, base_sha)
 
     # A fixed planning error must remain reportable even when the user's base
-    # worktree later becomes unsafe. The fingerprint reads origin directly,
+    # worktree later becomes unsafe. The fingerprint reads the selected SHA,
     # so this check neither reads nor alters the user's local changes.
     if row and row["planning_error"] and row["planning_error_fingerprint"] == current_fingerprint:
         operation_print(
@@ -10452,9 +10458,14 @@ def _run_project_step(
     if not row["phase"]:
         git(repo_path, "fetch", "origin")
         latest_selection_sha = git(
-            repo_path, "rev-parse", f"origin/{base}"
+            repo_path,
+            "rev-parse",
+            "--verify",
+            f"refs/remotes/origin/{base}^{{commit}}",
         ).stdout.strip()
-        latest_selection_fingerprint = planning_input_fingerprint(repo_path, base)
+        latest_selection_fingerprint = _planning_input_fingerprint(
+            repo_path, latest_selection_sha
+        )
         if latest_selection_fingerprint != current_fingerprint:
             operation_print(
                 "계획 중 입력이 변경되어 READY Worker보다 재계획을 우선합니다.",
