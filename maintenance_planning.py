@@ -71,7 +71,7 @@ class MarkdownSections:
 _SECTION = re.compile(r"^##[ \t]+(.+?)[ \t]*$", re.MULTILINE)
 _INLINE_CODE = re.compile(r"`([^`\r\n]+)`")
 _PATH_EXPRESSION = re.compile(
-    r"(?:[^/\\\s`]+[/\\])+[^\s`]+|[^/\\\s`]+\.[A-Za-z0-9]+(?:::[^\s`]+)?"
+    r"(?:[^/\\\s`]+[/\\])+[^\s`]+"
 )
 _HIGH_PRIORITY_JUSTIFICATION = re.compile(
     r"(?:data[ -]?loss|security|automatic execution.{0,40}(?:block|stop)|"

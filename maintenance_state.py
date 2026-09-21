@@ -403,6 +403,50 @@ class MaintenanceRepository:
                 )
             return self.get(repo)
 
+    def restart_unpublished_batch(
+        self,
+        repo: str,
+        *,
+        expected: MaintenanceCycle,
+        new_base_sha: str,
+    ) -> MaintenanceCycle:
+        """Invalidate one unpushed intent while retaining its maintenance phase.
+
+        The caller must first prove from Git that the remote advanced without
+        publishing this batch. Revision comparison invalidates old contexts.
+        """
+        if (
+            expected.repo != repo
+            or expected.phase not in {
+                MaintenancePhase.ASSESSMENT,
+                MaintenancePhase.POST_REFACTOR_REVALIDATION,
+            }
+            or expected.publication_stage != "prepared"
+            or not expected.publication_base_sha
+            or not expected.publication_commit_sha
+            or expected.publication_remote_oid is not None
+            or re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", new_base_sha) is None
+            or new_base_sha in {
+                expected.publication_base_sha, expected.publication_commit_sha
+            }
+        ):
+            raise MaintenanceStateError("재시작할 미게시 publication intent가 유효하지 않습니다.")
+        with _transaction(self.connection):
+            if self.get(repo) != expected:
+                raise MaintenanceStateError("유지보수 주기 단계 또는 revision이 변경됐습니다.")
+            self.connection.execute(
+                """
+                UPDATE maintenance_cycles
+                SET cycle_base_sha = ?, publication_stage = NULL,
+                    publication_base_sha = NULL, publication_commit_sha = NULL,
+                    publication_remote_oid = NULL, revision = revision + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE repo = ? AND phase = ? AND revision = ?
+                """,
+                (new_base_sha, repo, expected.phase.value, expected.revision),
+            )
+            return self.get(repo)
+
     def transition(
         self,
         repo: str,

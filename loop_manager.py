@@ -1989,13 +1989,17 @@ def validate_maintenance_planner_result(
     worktree: Path,
     dirty_files: list[str],
 ) -> ValidatedPlanningResult | None:
-    """Validate a barrier or revalidation result under persisted authority."""
+    """Validate output without consuming correction retries on Git failures."""
 
+    # Read Git outside the output-validation boundary. A tree query distinguishes
+    # absent paths from an unreadable repository without interpreting cat-file's
+    # nonzero status as proof that a path is new.
+    planned_files = sorted(
+        set(dirty_files) | set(changed_files(worktree, context.active_sha))
+    )
+    base_paths = _git_tree_entries(worktree, context.active_sha)
     try:
         _assert_maintenance_context_current(connection, context)
-        planned_files = sorted(
-            set(dirty_files) | set(changed_files(worktree, context.active_sha))
-        )
         if not planned_files:
             return None
         eligible = context.eligible_by_path
@@ -2015,13 +2019,7 @@ def validate_maintenance_planner_result(
                 raise MaintenancePlanningError(
                     "유지보수 Planner는 AGENTS.md guidance를 제안할 수 없습니다."
                 )
-            existed = git(
-                worktree,
-                "cat-file",
-                "-e",
-                f"{context.active_sha}:{path}",
-                check=False,
-            ).returncode == 0
+            existed = path.encode("utf-8") in base_paths
             if existed:
                 if path not in eligible:
                     raise MaintenancePlanningError(
@@ -2035,15 +2033,21 @@ def validate_maintenance_planner_result(
                     )
                 new_paths.append(path)
 
-        catalog = load_execplan_catalog(worktree, validate_sources=False)
+        try:
+            catalog = load_execplan_catalog(worktree, validate_sources=False)
+        except RuntimeError as error:
+            raise MaintenancePlanningError(str(error)) from error
         new_plans: list[tuple[str, dict[str, object]]] = []
         for path in new_paths:
-            plan = _parse_execplan(
-                worktree,
-                worktree / path,
-                require_priority=True,
-                allow_archive_fallback=False,
-            )
+            try:
+                plan = _parse_execplan(
+                    worktree,
+                    worktree / path,
+                    require_priority=True,
+                    allow_archive_fallback=False,
+                )
+            except RuntimeError as error:
+                raise MaintenancePlanningError(str(error)) from error
             validate_refactoring_plan(
                 path, plan, (worktree / path).read_text(encoding="utf-8")
             )
@@ -2094,9 +2098,7 @@ def validate_maintenance_planner_result(
         )
     except MaintenancePlanningError as error:
         raise PlannerValidationError(str(error)) from error
-    except (OSError, UnicodeError, RuntimeError) as error:
-        if isinstance(error, PlannerValidationError):
-            raise
+    except (OSError, UnicodeError) as error:
         raise PlannerValidationError(str(error)) from error
 
 
@@ -2560,6 +2562,59 @@ def publish_maintenance_planning_batch(
         )
 
 
+def restart_stale_maintenance_publication(
+    connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+    base_branch: str,
+) -> maintenance_state.MaintenanceCycle:
+    """Restart a batch proven absent from the newly fetched remote base.
+
+    Git files and refs remain intact. The caller creates a fresh planning
+    worktree at cycle_base_sha and obtains a new context after this returns.
+    """
+    repository = maintenance_state.MaintenanceRepository(connection)
+    cycle = repository.get(repo)
+    if (
+        cycle.publication_stage != "prepared"
+        or not cycle.publication_base_sha
+        or not cycle.publication_commit_sha
+        or cycle.publication_remote_oid is not None
+    ):
+        raise MaintenancePlanningError("재시작할 prepared publication intent가 없습니다.")
+    remote = git(
+        worktree, "rev-parse", "--verify",
+        f"refs/remotes/origin/{base_branch}^{{commit}}",
+    ).stdout.strip()
+    base = cycle.publication_base_sha
+    commit = cycle.publication_commit_sha
+    if remote in {base, commit}:
+        raise MaintenancePlanningError("게시 기준이 이동하지 않았거나 batch가 이미 게시됐습니다.")
+
+    def is_ancestor(older: str, newer: str) -> bool:
+        result = git(
+            worktree, "merge-base", "--is-ancestor", older, newer, check=False
+        )
+        if result.returncode not in {0, 1}:
+            raise RuntimeError("maintenance publication Git ancestry 확인 실패.")
+        return result.returncode == 0
+
+    if not is_ancestor(base, remote) or is_ancestor(commit, remote):
+        raise MaintenancePlanningError("미게시 batch임을 확정할 수 없어 재시작할 수 없습니다.")
+    base_tree = _git_tree_entries(worktree, base)
+    commit_tree = _git_tree_entries(worktree, commit)
+    remote_tree = _git_tree_entries(worktree, remote)
+    batch_paths = {
+        path for path in base_tree.keys() | commit_tree.keys()
+        if base_tree.get(path) != commit_tree.get(path)
+    }
+    if any(base_tree.get(path) != remote_tree.get(path) for path in batch_paths):
+        raise MaintenancePlanningError("원격 파일이 보존된 batch와 겹쳐 재시작할 수 없습니다.")
+    return repository.restart_unpublished_batch(
+        repo, expected=cycle, new_base_sha=remote
+    )
+
+
 def recover_maintenance_planning_batch(
     connection: sqlite3.Connection,
     repo: str,
@@ -2604,8 +2659,8 @@ def recover_maintenance_planning_batch(
             raise MaintenancePlanningError(
                 "보존된 maintenance planning commit의 push가 아직 확인되지 않았습니다."
             )
-        raise MaintenancePlanningError(
-            "origin/base가 보존된 maintenance publication batch와 다릅니다."
+        return restart_stale_maintenance_publication(
+            connection, repo, worktree, base_branch
         )
     context = _maintenance_context_at_revision(
         connection, repo, worktree, base_sha, cycle

@@ -4,6 +4,7 @@ import sqlite3
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from dataclasses import replace
 from pathlib import Path
 
@@ -603,6 +604,179 @@ class MaintenancePlanningTest(unittest.TestCase):
             ["G-000", "G-001", "G-002", "G-003"],
         )
         self.assertEqual(json.loads(rows[1]["depends_on"]), ["G-000", "G-003"])
+
+    def test_revalidation_rejects_dotted_api_and_setting_identifiers(self):
+        context = self._begin_barrier()
+        snapshot = context.eligible_plans[0]
+        metadata = loop_manager.published_execplan(snapshot.path, snapshot.text)
+        for old, new in (
+            ("api.v1", "api.v2"),
+            ("feature.enabled", "feature.disabled"),
+            ("config.json", "different.json"),
+        ):
+            with self.subTest(identifier=old):
+                original = snapshot.text.replace("legacy/module.py", old)
+                revised = original.replace(old, new)
+                with self.assertRaisesRegex(
+                    loop_manager.MaintenancePlanningError, "Acceptance Criteria"
+                ):
+                    loop_manager.validate_revalidation_revision(
+                        replace(snapshot, text=original),
+                        snapshot.path, metadata, revised,
+                    )
+        loop_manager.validate_revalidation_revision(
+            snapshot, snapshot.path, metadata,
+            snapshot.text.replace("legacy/module.py", "refactored/adapter.py"),
+        )
+
+    def test_git_operational_failures_do_not_become_planner_errors(self):
+        context = self._begin_barrier()
+        self._write_barrier_batch()
+        for boundary in ("changed_files", "_git_tree_entries"):
+            with self.subTest(boundary=boundary):
+                failure = loop_manager.GitLockError("repository locked")
+                with mock.patch.object(loop_manager, boundary, side_effect=failure):
+                    with self.assertRaises(loop_manager.GitLockError) as caught:
+                        self._validate_barrier(context)
+                self.assertIs(caught.exception, failure)
+        with self.assertRaises(RuntimeError) as caught:
+            self._validate_barrier(replace(context, active_sha="0" * 40))
+        self.assertNotIsInstance(caught.exception, loop_manager.PlannerValidationError)
+        # A genuine catalog error still belongs to the correction boundary.
+        self._write_plan("G-002", "Extract Boundary", depends_on=("G-099",))
+        with self.assertRaises(loop_manager.PlannerValidationError):
+            self._validate_barrier(context)
+
+    def _assert_prepared_batch_restarts(self, revalidation=False):
+        repository = maintenance_state.MaintenanceRepository(self.connection)
+        context = self._begin_barrier()
+        if revalidation:
+            cycle = repository.transition(
+                str(self.repo),
+                expected_phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+                expected_revision=context.cycle_revision,
+                next_phase=maintenance_state.MaintenancePhase.REFACTORING,
+                refactoring_plan_ids=("G-000",),
+                revalidation_plan_ids=("G-001",),
+            )
+            repository.transition(
+                str(self.repo),
+                expected_phase=cycle.phase,
+                expected_revision=cycle.revision,
+                next_phase=maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+            )
+            context = loop_manager.prepare_maintenance_planning_context(
+                self.connection, str(self.repo), self.repo, self.base_sha
+            )
+            self._write_plan(
+                "G-001", "Ready Feature", depends_on=("G-000",),
+                implementation="Use the extracted adapter module.",
+            )
+        else:
+            self._write_barrier_batch()
+        result = self._validate_barrier(context)
+        git(self.repo, "add", "docs/plans")
+        git(self.repo, "commit", "-m", "Prepare local maintenance batch")
+        commit = git(self.repo, "rev-parse", "HEAD")
+        intent = loop_manager.record_maintenance_publication_intent(
+            self.connection, str(self.repo), self.repo, "main", result, commit
+        )
+        before_rows = [tuple(row) for row in self.connection.execute(
+            "SELECT * FROM exec_plans ORDER BY plan_id"
+        )]
+        other = Path(self.temporary.name) / "advanced-base"
+        git(self.repo, "worktree", "add", "--detach", str(other), self.base_sha)
+        git(other, "commit", "--allow-empty", "-m", "Concurrent base update")
+        git(other, "push", "origin", "HEAD:main")
+        latest = git(other, "rev-parse", "HEAD")
+        rejected = loop_manager.git(
+            self.repo, "push", "origin", "HEAD:main", check=False
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        git(self.repo, "fetch", "origin")
+        restarted = loop_manager.recover_maintenance_planning_batch(
+            self.connection, str(self.repo), self.repo, "main"
+        )
+        self.assertEqual(restarted.phase, intent.phase)
+        self.assertEqual(restarted.revision, intent.revision + 1)
+        self.assertEqual(restarted.cycle_base_sha, latest)
+        self.assertIsNone(restarted.publication_stage)
+        self.assertIsNone(restarted.publication_commit_sha)
+        self.assertEqual(restarted.last_success_commit, intent.last_success_commit)
+        self.assertEqual(
+            restarted.last_success_merged_count, intent.last_success_merged_count
+        )
+        self.assertEqual(restarted.revalidation_plan_ids, intent.revalidation_plan_ids)
+        self.assertEqual(restarted.refactoring_plan_ids, intent.refactoring_plan_ids)
+        self.assertEqual(
+            before_rows,
+            [tuple(row) for row in self.connection.execute(
+                "SELECT * FROM exec_plans ORDER BY plan_id"
+            )],
+        )
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), commit)
+        with self.assertRaises(maintenance_state.MaintenanceStateError):
+            repository.restart_unpublished_batch(
+                str(self.repo), expected=intent, new_base_sha=latest
+            )
+        with self.assertRaises(loop_manager.PlannerValidationError):
+            self._validate_barrier(context)
+        fresh = loop_manager.prepare_maintenance_planning_context(
+            self.connection, str(self.repo), other, latest
+        )
+        self.assertEqual(fresh.active_sha, latest)
+        # A new publication intent can be recorded in the same phase.
+        (other / self.ready_path.relative_to(self.repo)).write_bytes(
+            self.ready_path.read_bytes()
+        )
+        if not revalidation:
+            for plan_id, title in (
+                ("G-002", "Extract Boundary"), ("G-003", "Separate Adapter")
+            ):
+                source = self._path(plan_id, title)
+                (other / source.relative_to(self.repo)).write_bytes(source.read_bytes())
+        fresh_result = loop_manager.validate_maintenance_planner_result(
+            self.connection, fresh, other, loop_manager.changed_files(other)
+        )
+        git(other, "add", "docs/plans")
+        git(other, "commit", "-m", "Replan maintenance at latest base")
+        new_intent = loop_manager.record_maintenance_publication_intent(
+            self.connection, str(self.repo), other, "main",
+            fresh_result, git(other, "rev-parse", "HEAD"),
+        )
+        self.assertEqual(new_intent.publication_base_sha, latest)
+        self.assertEqual(new_intent.publication_stage, "prepared")
+
+    def test_prepared_barrier_restarts_after_remote_wins_push_race(self):
+        self._assert_prepared_batch_restarts()
+
+    def test_prepared_revalidation_restarts_in_same_phase(self):
+        self._assert_prepared_batch_restarts(revalidation=True)
+
+    def test_restart_never_discards_a_published_batch(self):
+        context = self._begin_barrier()
+        self._write_barrier_batch()
+        result = self._validate_barrier(context)
+        git(self.repo, "add", "docs/plans")
+        git(self.repo, "commit", "-m", "Prepare batch")
+        intent = loop_manager.record_maintenance_publication_intent(
+            self.connection, str(self.repo), self.repo, "main",
+            result, git(self.repo, "rev-parse", "HEAD"),
+        )
+        git(self.repo, "push", "origin", "HEAD:main")
+        git(self.repo, "commit", "--allow-empty", "-m", "Advance after publication")
+        git(self.repo, "push", "origin", "HEAD:main")
+        git(self.repo, "fetch", "origin")
+        with self.assertRaisesRegex(
+            loop_manager.MaintenancePlanningError, "미게시"
+        ):
+            loop_manager.recover_maintenance_planning_batch(
+                self.connection, str(self.repo), self.repo, "main"
+            )
+        self.assertEqual(
+            maintenance_state.MaintenanceRepository(self.connection).get(str(self.repo)),
+            intent,
+        )
 
     def test_publication_preflight_restarts_when_origin_base_moves(self):
         context = self._begin_barrier()
