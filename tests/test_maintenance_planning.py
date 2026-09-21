@@ -33,6 +33,10 @@ def plan_text(
         "A concrete structural responsibility problem crosses the module boundary. "
         "Preserve user behavior, the public contract, and storage format."
     ),
+    acceptance_criteria: str = (
+        "Preserve user behavior, the public API contract, and storage format "
+        "for `legacy/module.py`."
+    ),
     implementation: str = "Separate the responsibility into a testable module boundary.",
 ) -> str:
     dependencies = "depends_on: []"
@@ -57,7 +61,7 @@ priority: {priority}
 
 ## Acceptance Criteria
 
-- Preserve user behavior, the public API contract, and storage format.
+{acceptance_criteria}
 
 ## Implementation
 
@@ -136,6 +140,10 @@ class MaintenancePlanningTest(unittest.TestCase):
             "A concrete structural responsibility problem crosses the module boundary. "
             "Preserve user behavior, the public contract, and storage format."
         ),
+        acceptance_criteria: str = (
+            "Preserve user behavior, the public API contract, and storage format "
+            "for `legacy/module.py`."
+        ),
         implementation: str = "Separate the responsibility into a testable module boundary.",
     ) -> Path:
         path = self._path(plan_id, title)
@@ -146,6 +154,7 @@ class MaintenancePlanningTest(unittest.TestCase):
                 depends_on=depends_on,
                 priority=priority,
                 purpose=purpose,
+                acceptance_criteria=acceptance_criteria,
                 implementation=implementation,
             ),
             encoding="utf-8",
@@ -352,6 +361,29 @@ class MaintenancePlanningTest(unittest.TestCase):
             "G-001",
             "Ready Feature",
             purpose=original_purpose,
+            acceptance_criteria=(
+                "Add a billing workflow for `refactored/adapter.py`."
+            ),
+            implementation="Use the refactored adapter module boundary.",
+        )
+        with self.assertRaisesRegex(
+            loop_manager.PlannerValidationError, "Acceptance Criteria"
+        ):
+            loop_manager.validate_maintenance_planner_result(
+                self.connection,
+                context,
+                self.repo,
+                loop_manager.changed_files(self.repo),
+            )
+
+        self._write_plan(
+            "G-001",
+            "Ready Feature",
+            purpose=original_purpose,
+            acceptance_criteria=(
+                "Preserve user behavior, the public API contract, and storage format "
+                "for `refactored/adapter.py`."
+            ),
             implementation="Use the refactored adapter module boundary.",
         )
         result = loop_manager.validate_maintenance_planner_result(
@@ -370,6 +402,15 @@ class MaintenancePlanningTest(unittest.TestCase):
         git(self.repo, "add", "docs/plans/[G-001] Ready Feature.md")
         git(self.repo, "commit", "-m", "Publish revalidated plan")
         plan_commit = git(self.repo, "rev-parse", "HEAD")
+        intent = loop_manager.record_maintenance_publication_intent(
+            self.connection,
+            str(self.repo),
+            self.repo,
+            "main",
+            result,
+            plan_commit,
+        )
+        self.assertEqual(intent.publication_stage, "prepared")
         git(self.repo, "push", "origin", "HEAD:main")
         git(self.repo, "fetch", "origin")
         completed = loop_manager.publish_maintenance_planning_batch(
@@ -409,6 +450,15 @@ class MaintenancePlanningTest(unittest.TestCase):
         git(self.repo, "add", "docs/plans")
         git(self.repo, "commit", "-m", "Publish maintenance batch")
         plan_commit = git(self.repo, "rev-parse", "HEAD")
+        intent = loop_manager.record_maintenance_publication_intent(
+            self.connection,
+            str(self.repo),
+            self.repo,
+            "main",
+            result,
+            plan_commit,
+        )
+        self.assertEqual(intent.publication_commit_sha, plan_commit)
 
         with self.assertRaisesRegex(
             loop_manager.MaintenancePlanningError, "fast-forward push"
@@ -482,6 +532,77 @@ class MaintenancePlanningTest(unittest.TestCase):
         self.assertEqual(cycle.revalidation_plan_ids, ("G-001",))
         self.assertEqual(json.loads(rows[1]["depends_on"]), ["G-000", "G-003"])
         self.assertTrue(all(row["plan_sha"] == plan_commit for row in rows[1:]))
+
+    def test_pushed_batch_recovers_from_durable_intent_after_restart(self):
+        context = self._begin_barrier()
+        self._write_barrier_batch()
+        result = self._validate_barrier(context)
+        git(self.repo, "add", "docs/plans")
+        git(self.repo, "commit", "-m", "Prepare recoverable maintenance batch")
+        plan_commit = git(self.repo, "rev-parse", "HEAD")
+        loop_manager.record_maintenance_publication_intent(
+            self.connection,
+            str(self.repo),
+            self.repo,
+            "main",
+            result,
+            plan_commit,
+        )
+        git(self.repo, "push", "origin", "HEAD:main")
+        git(self.repo, "fetch", "origin")
+
+        row = self.connection.execute(
+            "SELECT content_hash FROM exec_plans "
+            "WHERE repo = ? AND plan_id = 'G-001'",
+            (str(self.repo),),
+        ).fetchone()
+        expected_hash = str(row["content_hash"])
+        self.connection.execute(
+            "UPDATE exec_plans SET content_hash = 'catalog-drift' "
+            "WHERE repo = ? AND plan_id = 'G-001'",
+            (str(self.repo),),
+        )
+        self.connection.commit()
+        with self.assertRaisesRegex(
+            loop_manager.MaintenancePlanningError, "content hash"
+        ):
+            loop_manager.recover_maintenance_planning_batch(
+                self.connection, str(self.repo), self.repo, "main"
+            )
+        self.assertIsNone(
+            self.connection.execute(
+                "SELECT 1 FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-002'",
+                (str(self.repo),),
+            ).fetchone()
+        )
+
+        self.connection.execute(
+            "UPDATE exec_plans SET content_hash = ? "
+            "WHERE repo = ? AND plan_id = 'G-001'",
+            (expected_hash, str(self.repo)),
+        )
+        self.connection.commit()
+        recovered = loop_manager.recover_maintenance_planning_batch(
+            self.connection, str(self.repo), self.repo, "main"
+        )
+        repeated = loop_manager.recover_maintenance_planning_batch(
+            self.connection, str(self.repo), self.repo, "main"
+        )
+        rows = self.connection.execute(
+            "SELECT plan_id, depends_on FROM exec_plans "
+            "WHERE repo = ? ORDER BY plan_id",
+            (str(self.repo),),
+        ).fetchall()
+        self.assertEqual(
+            recovered.phase, maintenance_state.MaintenancePhase.REFACTORING
+        )
+        self.assertEqual(repeated, recovered)
+        self.assertEqual(
+            [row["plan_id"] for row in rows],
+            ["G-000", "G-001", "G-002", "G-003"],
+        )
+        self.assertEqual(json.loads(rows[1]["depends_on"]), ["G-000", "G-003"])
 
     def test_publication_preflight_restarts_when_origin_base_moves(self):
         context = self._begin_barrier()

@@ -69,6 +69,10 @@ class MarkdownSections:
 
 
 _SECTION = re.compile(r"^##[ \t]+(.+?)[ \t]*$", re.MULTILINE)
+_INLINE_CODE = re.compile(r"`([^`\r\n]+)`")
+_PATH_EXPRESSION = re.compile(
+    r"(?:[^/\\\s`]+[/\\])+[^\s`]+|[^/\\\s`]+\.[A-Za-z0-9]+(?:::[^\s`]+)?"
+)
 _HIGH_PRIORITY_JUSTIFICATION = re.compile(
     r"(?:data[ -]?loss|security|automatic execution.{0,40}(?:block|stop)|"
     r"repeated manual recovery|데이터\s*손실|보안|자동\s*실행.{0,20}(?:차단|중단)|"
@@ -149,6 +153,18 @@ def _snapshot_metadata(snapshot: ReadyPlanSnapshot) -> tuple[object, ...]:
     )
 
 
+def _acceptance_criteria_path_shape(text: str) -> str:
+    """Erase only repository-path code spans from acceptance criteria."""
+
+    def replace(match: re.Match[str]) -> str:
+        expression = match.group(1).strip()
+        if _PATH_EXPRESSION.fullmatch(expression):
+            return "`<repository-path>`"
+        return match.group(0)
+
+    return _INLINE_CODE.sub(replace, text)
+
+
 def validate_barrier_revision(
     snapshot: ReadyPlanSnapshot,
     path: str,
@@ -197,6 +213,20 @@ def validate_revalidation_revision(
     if previous.values.get("Purpose") != revised.values.get("Purpose"):
         raise MaintenancePlanningError(
             f"revalidation mode는 원래 Purpose를 변경할 수 없습니다: {path}"
+        )
+    previous_criteria = previous.values.get("Acceptance Criteria")
+    revised_criteria = revised.values.get("Acceptance Criteria")
+    if previous_criteria is None or revised_criteria is None:
+        raise MaintenancePlanningError(
+            "revalidation mode는 Acceptance Criteria section을 제거하거나 "
+            f"새로 만들 수 없습니다: {path}"
+        )
+    if _acceptance_criteria_path_shape(
+        previous_criteria
+    ) != _acceptance_criteria_path_shape(revised_criteria):
+        raise MaintenancePlanningError(
+            "revalidation mode는 Acceptance Criteria의 경로 표현 이외 의미를 "
+            f"변경할 수 없습니다: {path}"
         )
     allowed = {
         "Acceptance Criteria",

@@ -334,6 +334,75 @@ class MaintenanceRepository:
             )
             return self.get(repo), True
 
+    def record_publication_intent(
+        self,
+        repo: str,
+        *,
+        expected_phase: MaintenancePhase,
+        expected_revision: int,
+        base_sha: str,
+        commit_sha: str,
+    ) -> MaintenanceCycle:
+        """Persist a recoverable local batch before its remote push."""
+
+        if (
+            re.fullmatch(r"[0-9a-fA-F]{7,64}", base_sha) is None
+            or re.fullmatch(r"[0-9a-fA-F]{7,64}", commit_sha) is None
+            or base_sha == commit_sha
+        ):
+            raise MaintenanceStateError(
+                "유지보수 publication 기준과 commit SHA가 유효하지 않습니다."
+            )
+        expected = ("prepared", base_sha, commit_sha, None)
+        with _transaction(self.connection):
+            state = self.get(repo)
+            if (
+                state.phase is not expected_phase
+                or state.revision != expected_revision
+            ):
+                raise MaintenanceStateError(
+                    "유지보수 주기 단계 또는 revision이 변경됐습니다."
+                )
+            current = (
+                state.publication_stage,
+                state.publication_base_sha,
+                state.publication_commit_sha,
+                state.publication_remote_oid,
+            )
+            if current == expected:
+                return state
+            if any(value is not None for value in current):
+                raise MaintenanceStateError(
+                    "다른 유지보수 publication batch가 이미 보존돼 있습니다."
+                )
+            cursor = self.connection.execute(
+                """
+                UPDATE maintenance_cycles
+                SET publication_stage = 'prepared',
+                    publication_base_sha = ?,
+                    publication_commit_sha = ?,
+                    publication_remote_oid = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE repo = ? AND phase = ? AND revision = ?
+                  AND publication_stage IS NULL
+                  AND publication_base_sha IS NULL
+                  AND publication_commit_sha IS NULL
+                  AND publication_remote_oid IS NULL
+                """,
+                (
+                    base_sha,
+                    commit_sha,
+                    repo,
+                    expected_phase.value,
+                    expected_revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise MaintenanceStateError(
+                    "유지보수 publication intent를 보존할 수 없습니다."
+                )
+            return self.get(repo)
+
     def transition(
         self,
         repo: str,
