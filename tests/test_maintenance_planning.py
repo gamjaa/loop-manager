@@ -1363,6 +1363,68 @@ class MaintenancePlanningTest(unittest.TestCase):
             ).fetchone()
         )
 
+    def _assert_published_batch_recovery_rejects_catalog_drift(
+        self, drift: str
+    ) -> None:
+        context = self._begin_barrier()
+        self._write_barrier_batch()
+        result = self._validate_barrier(context)
+        git(self.repo, "add", "docs/plans")
+        git(self.repo, "commit", "-m", "Prepare batch")
+        plan_commit = git(self.repo, "rev-parse", "HEAD")
+        intent = loop_manager.record_maintenance_publication_intent(
+            self.connection, str(self.repo), self.repo, "main",
+            result, plan_commit,
+        )
+        git(self.repo, "push", "origin", "HEAD:main")
+        other = Path(self.temporary.name) / f"catalog-{drift}"
+        git(self.repo, "worktree", "add", "--detach", str(other), plan_commit)
+        if drift == "addition":
+            changed_plan = (
+                other / "docs/plans/[G-004] Out Of Batch Plan.md"
+            )
+            changed_plan.write_text(
+                plan_text("G-004", "Out Of Batch Plan"), encoding="utf-8"
+            )
+        elif drift == "modification":
+            changed_plan = other / self._path(
+                "G-000", "Merged Foundation"
+            ).relative_to(self.repo)
+            changed_plan.write_text(
+                changed_plan.read_text(encoding="utf-8") + "\nOut-of-batch edit.\n",
+                encoding="utf-8",
+            )
+        else:
+            self.fail(f"unknown catalog drift fixture: {drift}")
+        git(other, "add", changed_plan.relative_to(other).as_posix())
+        git(other, "commit", "-m", f"Catalog {drift} after publication")
+        git(other, "push", "origin", "HEAD:main")
+        git(self.repo, "fetch", "origin")
+
+        with self.assertRaisesRegex(
+            loop_manager.MaintenancePlanningError, "ExecPlan catalog"
+        ):
+            loop_manager.recover_maintenance_planning_batch(
+                self.connection, str(self.repo), self.repo, "main"
+            )
+        self.assertEqual(
+            maintenance_state.MaintenanceRepository(self.connection).get(str(self.repo)),
+            intent,
+        )
+        self.assertIsNone(
+            self.connection.execute(
+                "SELECT 1 FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-002'",
+                (str(self.repo),),
+            ).fetchone()
+        )
+
+    def test_published_batch_recovery_rejects_added_catalog_plan(self):
+        self._assert_published_batch_recovery_rejects_catalog_drift("addition")
+
+    def test_published_batch_recovery_rejects_modified_catalog_plan(self):
+        self._assert_published_batch_recovery_rejects_catalog_drift("modification")
+
     def test_publication_preflight_restarts_when_origin_base_moves(self):
         context = self._begin_barrier()
         before = maintenance_state.MaintenanceRepository(self.connection).get(

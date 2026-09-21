@@ -2458,6 +2458,8 @@ def _assert_remote_preserves_maintenance_batch(
     base_sha: str,
     plan_commit: str,
     remote_sha: str,
+    *,
+    reject_catalog_drift: bool = False,
 ) -> None:
     """Confirm a published batch remains byte-identical at a newer remote tip."""
 
@@ -2484,6 +2486,27 @@ def _assert_remote_preserves_maintenance_batch(
         )
         raise MaintenancePlanningError(
             "게시된 maintenance batch 경로가 후속 원격 commit에서 변경됐습니다: "
+            f"{rendered}"
+        )
+
+    if not reject_catalog_drift:
+        return
+
+    plans_prefix = b"docs/plans/"
+    catalog_changes = sorted(
+        path
+        for path in plan_tree.keys() | remote_tree.keys()
+        if path.startswith(plans_prefix)
+        and path.endswith(b".md")
+        and b"/" not in path[len(plans_prefix) :]
+        and plan_tree.get(path) != remote_tree.get(path)
+    )
+    if catalog_changes:
+        rendered = ", ".join(
+            path.decode("utf-8", errors="replace") for path in catalog_changes
+        )
+        raise MaintenancePlanningError(
+            "게시 뒤 원격 ExecPlan catalog가 후속 commit에서 변경됐습니다: "
             f"{rendered}"
         )
 
@@ -2880,7 +2903,8 @@ def recover_maintenance_planning_batch(
             )
         if _git_commit_is_ancestor(worktree, plan_commit, current_remote):
             _assert_remote_preserves_maintenance_batch(
-                worktree, base_sha, plan_commit, current_remote
+                worktree, base_sha, plan_commit, current_remote,
+                reject_catalog_drift=True,
             )
             remote_advanced_after_publication = True
         else:
@@ -7512,8 +7536,8 @@ def _published_plan_allows_common_plans(
     return bool(
         acceptance
         and re.search(
-            r"(?im)^-\s+(?:공통\s+)?`docs/PLANS\.md`(?:에|를|을|의|\s)"
-            r".*(?:변경|문서화|갱신|수정|change|update|document)",
+            r"(?im)^-\s+(?:공통\s+)?`docs/PLANS\.md`(?:에|를|을|의|와|과|\s)"
+            r".*(?:변경|문서화|갱신|수정|설명|change|update|document|describe)",
             acceptance.group(1),
         )
     )
