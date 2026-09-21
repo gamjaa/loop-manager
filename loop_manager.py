@@ -5316,6 +5316,11 @@ def _validate_guidance_proposal_scope(
     common_allowed: bool,
 ) -> None:
     for proposal in proposals:
+        if common_allowed and proposal.scope == "project":
+            raise AgentScopeError(
+                "Loop Manager 루트 AGENTS.md는 공통 원본이므로 "
+                "Scope common으로 명시적으로 승인해야 합니다."
+            )
         if proposal.scope == "common" and not common_allowed:
             raise AgentScopeError(
                 "공통 AGENTS.md guidance는 Loop Manager 자체 저장소의 "
@@ -5396,7 +5401,9 @@ def _guidance_target_state(
         raise GuidanceFormatError(
             f"guidance 대상은 일반 파일이어야 합니다: {target}"
         )
-    return path.read_bytes(), stat.S_IMODE(target_stat.st_mode)
+    # Git records executable permission, not local umask/group write bits.
+    git_mode = 0o755 if target_stat.st_mode & stat.S_IXUSR else 0o644
+    return path.read_bytes(), git_mode
 
 
 def _guidance_block_message(
@@ -5915,6 +5922,91 @@ def inspect_worker_guidance_result(
             (document.structure_hash, repo, plan["plan_id"]),
         )
     return False
+
+
+def validate_guidance_publication(
+    connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+    plan: sqlite3.Row,
+    worker_result: str,
+    *,
+    previous_base: str | None = None,
+    latest_base: str | None = None,
+) -> bool:
+    """Revalidate the latest approval per target, including after Manager rebase."""
+
+    rows = tuple(connection.execute(
+        "SELECT * FROM guidance_approvals WHERE repo = ? AND plan_id = ? "
+        "ORDER BY rowid",
+        (repo, plan["plan_id"]),
+    ).fetchall())
+    if not rows:
+        return False
+    document = _guidance_document(worktree, str(plan["path"]))
+    if document is None:
+        raise AgentScopeError("게시할 ExecPlan에 guidance 결정이 없습니다.")
+    proposals, new = _guidance_document_matches_rows(
+        document, rows, require_decisions=True
+    )
+    if new:
+        raise AgentScopeError("게시 전에 승인되지 않은 guidance 제안이 있습니다.")
+    latest_batches = {str(row["target_path"]): str(row["batch_id"]) for row in rows}
+    selected = tuple(
+        row for row in rows
+        if str(row["batch_id"]) == latest_batches[str(row["target_path"])]
+    )
+    mismatched = []
+    new_baselines: dict[str, tuple[bytes, int]] = {}
+    for target in latest_batches:
+        target_rows = tuple(row for row in selected if row["target_path"] == target)
+        last = target_rows[-1]
+        try:
+            contents, mode = _guidance_target_state(worktree, target)
+            exact = (
+                all(int(row["applied"]) for row in target_rows)
+                and guidance_content_hash(contents) == last["expected_content_hash"]
+                and mode == int(last["baseline_mode"])
+            )
+        except GuidanceFormatError:
+            exact = False
+        if previous_base and latest_base:
+            old = git(worktree, "rev-parse", f"{previous_base}:{target}", check=False)
+            new_blob = git(worktree, "rev-parse", f"{latest_base}:{target}", check=False)
+            old_mode = git(worktree, "ls-tree", previous_base, "--", target).stdout
+            new_mode = git(worktree, "ls-tree", latest_base, "--", target).stdout
+            if old.returncode or new_blob.returncode or old_mode != new_mode:
+                exact = False
+                # A new decision must apply to the new base, not silently reuse
+                # the pre-rebase baseline. Removed/nonregular targets stay blocked.
+                shown = subprocess.run(
+                    ["git", "show", f"{latest_base}:{target}"],
+                    cwd=worktree, check=False, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                if shown.returncode == 0 and new_mode.startswith(("100644 ", "100755 ")):
+                    new_baselines[target] = (
+                        shown.stdout,
+                        0o755 if new_mode.startswith("100755 ") else 0o644,
+                    )
+        if not exact:
+            mismatched.extend(proposals[str(row["proposal_id"])] for row in target_rows)
+    if not mismatched:
+        return False
+    _invalidate_guidance_approval(
+        connection, repo, worktree, plan, document, tuple(mismatched),
+        worker_result,
+        "최신 base 또는 게시할 AGENTS.md가 승인 기준과 다릅니다. "
+        "새 기준에 적용할 정확한 대체 patch와 User Decision Revision이 필요합니다.",
+    )
+    with connection:
+        for target, (contents, mode) in new_baselines.items():
+            connection.execute(
+                "UPDATE guidance_approvals SET baseline_content = ?, baseline_mode = ? "
+                "WHERE repo = ? AND plan_id = ? AND target_path = ? AND batch_id = ?",
+                (contents, mode, repo, plan["plan_id"], target, latest_batches[target]),
+            )
+    return True
 
 
 def guidance_resume_context(
@@ -8292,7 +8384,7 @@ def worker_prompt(
             f"{(previous_result or '이전 Worker 결과 없음')[-6000:]}\n"
         )
     common_scope = (
-        "이 저장소는 Loop Manager 자체 저장소이므로 필요한 경우 Scope를 `common`으로 제안할 수 있다."
+        "이 저장소의 루트 AGENTS.md는 공통 원본이므로 Scope는 반드시 `common`이어야 한다."
         if guidance_common_allowed
         else "이 저장소에서는 Scope `project`만 허용되며 `common` 제안은 범위 위반이다."
     )
@@ -8319,7 +8411,7 @@ Worker는 User Decision을 반드시 pending/빈 Revision/빈 Patch로 작성해
 
 ### Agent Guidance Proposal: guidance-example
 Target: `AGENTS.md`
-Scope: `project`
+Scope: `{"common" if guidance_common_allowed else "project"}`
 Reason: 현재 ExecPlan에 이 규칙이 필요한 구체적인 이유
 Impact: 적용하지 않으면 현재 구현에 생기는 구체적인 영향
 Patch:
@@ -10221,6 +10313,11 @@ def _run_project_step(
                 f"origin/{base}",
             ).stdout.strip()
             update_project(connection, repo, active_sha=latest_sha)
+            if validate_guidance_publication(
+                connection, repo, worktree, catalog_plan, message,
+                previous_base=str(row["active_sha"]), latest_base=latest_sha,
+            ):
+                return 1
         if archive_sources:
             post_worker_revision = (
                 latest_sha if resolving_rebase else str(row["active_sha"] or "")
@@ -10278,6 +10375,10 @@ def _run_project_step(
 
     row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
     if row["phase"] == "VERIFYING":
+        if validate_guidance_publication(
+            connection, repo, worktree, catalog_plan, str(row["worker_result"] or "")
+        ):
+            return 1
         operation_log(f"전체 verify 시작: {plan['id']} {plan['title']}")
         try:
             worker_publication = parse_worker_result(str(row["worker_result"] or ""), plan)
@@ -10395,6 +10496,12 @@ def _run_project_step(
                 return 1
             # Persist the new base now so recovery does not repeat that rebase.
             update_project(connection, repo, active_sha=latest_sha)
+            if validate_guidance_publication(
+                connection, repo, worktree, catalog_plan,
+                str(row["worker_result"] or ""),
+                previous_base=str(row["active_sha"]), latest_base=latest_sha,
+            ):
+                return 1
             operation_log(f"전체 verify 시작: {plan['id']} {plan['title']} (rebase 후)")
             verify_scope_before = begin_agent_scope(
                 connection,
@@ -10710,6 +10817,13 @@ def _run_project_step(
                         )
                     operation_print(rebase_failure, file=sys.stderr)
                     return 1
+                update_project(connection, repo, active_sha=latest_sha)
+                if validate_guidance_publication(
+                    connection, repo, worktree, catalog_plan,
+                    str(row["worker_result"] or ""),
+                    previous_base=str(row["active_sha"]), latest_base=latest_sha,
+                ):
+                    return 1
                 if not branch_has_changes(worktree, base):
                     no_change_error = (
                         "게시 직전 rebase 후 Worker 변경이 남지 않아 PR을 "
@@ -10805,6 +10919,10 @@ def _run_project_step(
                 )
                 operation_print(archive_error, file=sys.stderr)
                 return PROJECT_STEP_RETRY
+        if validate_guidance_publication(
+            connection, repo, worktree, catalog_plan, str(row["worker_result"] or "")
+        ):
+            return 1
         if not branch_has_changes(worktree, base):
             no_change_error = (
                 "게시할 Worker 변경이 남지 않아 PR을 생성할 수 없습니다."
