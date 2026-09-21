@@ -49,11 +49,11 @@ priority: normal
 
 ## Progress
 
-- [ ] 공통 refactoring review interval 설정과 검증 추가
-- [ ] 프로젝트별 유지보수 주기 schema 및 repository 구현
-- [ ] MERGED 기준선과 due 계산 구현
-- [ ] bounded 원격 Git 변경 문맥 구현
-- [ ] 비활성 foundation 및 migration 회귀 테스트 추가
+- [x] 공통 refactoring review interval 설정과 검증 추가
+- [x] 프로젝트별 유지보수 주기 schema 및 repository 구현
+- [x] MERGED 기준선과 due 계산 구현
+- [x] bounded 원격 Git 변경 문맥 구현
+- [x] 비활성 foundation 및 migration 회귀 테스트 추가
 
 ## Decision Log
 

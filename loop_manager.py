@@ -42,6 +42,7 @@ from guidance_approval import (
 from managed_config import ManagedConfig, ManagedConfigError, load_managed_config
 import notifications
 import project_registry
+import maintenance_state
 
 
 ROOT = Path(__file__).resolve().parent
@@ -1020,6 +1021,7 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
         project_registry.ensure_registry_schema(connection)
         _ensure_execplans_schema(connection)
         _ensure_cleanup_pending_schema(connection)
+        maintenance_state.ensure_schema(connection)
         notifications.ensure_schema(connection)
         connection.commit()
     else:
@@ -1072,6 +1074,7 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
     project_registry.ensure_registry_schema(connection)
     _ensure_execplans_schema(connection)
     _ensure_cleanup_pending_schema(connection)
+    maintenance_state.ensure_schema(connection)
     notifications.ensure_schema(connection)
     connection.commit()
     # Repository-aware migrations belong in run_project, after persisted Agent
@@ -12944,6 +12947,7 @@ def execute_runtime_command(
     state_dir: Path,
     config_path: Path,
 ) -> int:
+    config = load_managed_config(config_path)
     if args.command == "init":
         with connect_database(state_dir, create=True):
             pass
@@ -12951,7 +12955,6 @@ def execute_runtime_command(
         return 0
     if args.command == "config":
         return configure_registry(args, state_dir, config_path)
-    config = load_managed_config(config_path)
     with connect_database(state_dir) as connection:
         return run_registered_projects(connection, state_dir, config)
 

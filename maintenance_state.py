@@ -1,0 +1,451 @@
+"""Durable state and bounded Git context for maintenance review cycles."""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+from dataclasses import dataclass
+from enum import Enum
+import json
+import re
+import sqlite3
+from typing import Iterator, Sequence
+from uuid import uuid4
+
+
+class MaintenanceStateError(RuntimeError):
+    """Raised when persisted maintenance state cannot be used safely."""
+
+
+class MaintenancePhase(str, Enum):
+    IDLE = "idle"
+    ASSESSMENT = "assessment"
+    PREREQUISITE_WAIT = "prerequisite_wait"
+    REFACTORING = "refactoring"
+    POST_REFACTOR_REVALIDATION = "post_refactor_revalidation"
+
+
+MAINTENANCE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS maintenance_cycles (
+    repo TEXT PRIMARY KEY,
+    last_success_commit TEXT,
+    last_success_merged_count INTEGER,
+    phase TEXT NOT NULL DEFAULT 'idle',
+    cycle_base_sha TEXT,
+    cycle_start_merged_count INTEGER,
+    prerequisite_plan_ids TEXT NOT NULL DEFAULT '[]',
+    refactoring_plan_ids TEXT NOT NULL DEFAULT '[]',
+    revalidation_plan_ids TEXT NOT NULL DEFAULT '[]',
+    publication_stage TEXT,
+    publication_base_sha TEXT,
+    publication_commit_sha TEXT,
+    publication_remote_oid TEXT,
+    revision INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (repo) REFERENCES projects(repo)
+)
+"""
+
+
+@dataclass(frozen=True)
+class MaintenanceCycle:
+    repo: str
+    last_success_commit: str | None
+    last_success_merged_count: int | None
+    phase: MaintenancePhase
+    cycle_base_sha: str | None
+    cycle_start_merged_count: int | None
+    prerequisite_plan_ids: tuple[str, ...]
+    refactoring_plan_ids: tuple[str, ...]
+    revalidation_plan_ids: tuple[str, ...]
+    publication_stage: str | None
+    publication_base_sha: str | None
+    publication_commit_sha: str | None
+    publication_remote_oid: str | None
+    revision: int
+
+
+@dataclass(frozen=True)
+class ReviewDue:
+    required: bool
+    reason: str
+    merged_since_baseline: int
+    active_phase: MaintenancePhase
+
+
+def ensure_schema(connection: sqlite3.Connection) -> None:
+    """Create the additive maintenance table without rewriting audit data."""
+
+    connection.execute(MAINTENANCE_SCHEMA)
+
+
+def calculate_review_due(
+    last_success_merged_count: int | None,
+    current_merged_count: int,
+    interval: int,
+    phase: MaintenancePhase = MaintenancePhase.IDLE,
+) -> ReviewDue:
+    """Decide review eligibility solely from durable audit values."""
+
+    if interval <= 0:
+        raise ValueError("refactoring review interval must be positive")
+    if current_merged_count < 0:
+        raise MaintenanceStateError("MERGED ExecPlan 수가 음수입니다.")
+    if phase is not MaintenancePhase.IDLE:
+        return ReviewDue(False, "active_cycle", 0, phase)
+    if last_success_merged_count is None:
+        return ReviewDue(True, "no_successful_assessment", 0, phase)
+    if last_success_merged_count < 0 or current_merged_count < last_success_merged_count:
+        raise MaintenanceStateError("MERGED ExecPlan 감사 기준값이 현재 이력보다 큽니다.")
+    merged_since_baseline = current_merged_count - last_success_merged_count
+    required = merged_since_baseline >= interval
+    return ReviewDue(
+        required,
+        "interval_reached" if required else "interval_pending",
+        merged_since_baseline,
+        phase,
+    )
+
+
+def _plan_sort_key(plan_id: str) -> tuple[int, int | str, str]:
+    match = re.fullmatch(r"G-(\d+)", plan_id)
+    if match:
+        return (0, int(match.group(1)), plan_id)
+    return (1, plan_id, plan_id)
+
+
+def _decode_plan_ids(raw: object, field: str) -> tuple[str, ...]:
+    try:
+        values = json.loads(str(raw))
+    except (TypeError, json.JSONDecodeError) as error:
+        raise MaintenanceStateError(
+            f"{field} 저장값이 올바른 JSON 배열이 아닙니다."
+        ) from error
+    if not isinstance(values, list) or any(
+        not isinstance(item, str) for item in values
+    ):
+        raise MaintenanceStateError(
+            f"{field}에는 문자열 plan ID 배열만 저장할 수 있습니다."
+        )
+    if len(values) != len(set(values)):
+        raise MaintenanceStateError(f"{field}에 중복 plan ID가 있습니다.")
+    return tuple(sorted(values, key=_plan_sort_key))
+
+
+@contextmanager
+def _transaction(connection: sqlite3.Connection) -> Iterator[None]:
+    savepoint = f"maintenance_{uuid4().hex}"
+    connection.execute(f"SAVEPOINT {savepoint}")
+    try:
+        yield
+    except BaseException:
+        connection.execute(f"ROLLBACK TO {savepoint}")
+        connection.execute(f"RELEASE {savepoint}")
+        raise
+    else:
+        connection.execute(f"RELEASE {savepoint}")
+
+
+class MaintenanceRepository:
+    """Transactional persistence boundary for per-project maintenance cycles."""
+
+    def __init__(self, connection: sqlite3.Connection):
+        self.connection = connection
+        ensure_schema(connection)
+
+    def _merged_count(self, repo: str) -> int:
+        return int(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM exec_plans "
+                "WHERE repo = ? AND status = 'MERGED'",
+                (repo,),
+            ).fetchone()[0]
+        )
+
+    @staticmethod
+    def _empty(repo: str) -> MaintenanceCycle:
+        return MaintenanceCycle(
+            repo=repo,
+            last_success_commit=None,
+            last_success_merged_count=None,
+            phase=MaintenancePhase.IDLE,
+            cycle_base_sha=None,
+            cycle_start_merged_count=None,
+            prerequisite_plan_ids=(),
+            refactoring_plan_ids=(),
+            revalidation_plan_ids=(),
+            publication_stage=None,
+            publication_base_sha=None,
+            publication_commit_sha=None,
+            publication_remote_oid=None,
+            revision=0,
+        )
+
+    def get(self, repo: str) -> MaintenanceCycle:
+        row = self.connection.execute(
+            "SELECT * FROM maintenance_cycles WHERE repo = ?", (repo,)
+        ).fetchone()
+        if row is None:
+            return self._empty(repo)
+        try:
+            phase = MaintenancePhase(str(row["phase"]))
+        except ValueError as error:
+            raise MaintenanceStateError(
+                "알 수 없는 유지보수 주기 단계입니다."
+            ) from error
+        known_plan_ids = {
+            str(item[0])
+            for item in self.connection.execute(
+                "SELECT plan_id FROM exec_plans WHERE repo = ?", (repo,)
+            )
+        }
+
+        def stored_plan_ids(field: str) -> tuple[str, ...]:
+            plan_ids = _decode_plan_ids(row[field], field)
+            unknown = sorted(set(plan_ids) - known_plan_ids, key=_plan_sort_key)
+            if unknown:
+                raise MaintenanceStateError(
+                    f"{field}에 알 수 없는 plan ID가 있습니다: {', '.join(unknown)}"
+                )
+            return plan_ids
+
+        return MaintenanceCycle(
+            repo=str(row["repo"]),
+            last_success_commit=(
+                str(row["last_success_commit"])
+                if row["last_success_commit"] is not None
+                else None
+            ),
+            last_success_merged_count=(
+                int(row["last_success_merged_count"])
+                if row["last_success_merged_count"] is not None
+                else None
+            ),
+            phase=phase,
+            cycle_base_sha=(
+                str(row["cycle_base_sha"])
+                if row["cycle_base_sha"] is not None
+                else None
+            ),
+            cycle_start_merged_count=(
+                int(row["cycle_start_merged_count"])
+                if row["cycle_start_merged_count"] is not None
+                else None
+            ),
+            prerequisite_plan_ids=stored_plan_ids("prerequisite_plan_ids"),
+            refactoring_plan_ids=stored_plan_ids("refactoring_plan_ids"),
+            revalidation_plan_ids=stored_plan_ids("revalidation_plan_ids"),
+            publication_stage=(
+                str(row["publication_stage"])
+                if row["publication_stage"] is not None
+                else None
+            ),
+            publication_base_sha=(
+                str(row["publication_base_sha"])
+                if row["publication_base_sha"] is not None
+                else None
+            ),
+            publication_commit_sha=(
+                str(row["publication_commit_sha"])
+                if row["publication_commit_sha"] is not None
+                else None
+            ),
+            publication_remote_oid=(
+                str(row["publication_remote_oid"])
+                if row["publication_remote_oid"] is not None
+                else None
+            ),
+            revision=int(row["revision"]),
+        )
+
+    def due(self, repo: str, interval: int) -> ReviewDue:
+        state = self.get(repo)
+        return calculate_review_due(
+            state.last_success_merged_count,
+            self._merged_count(repo),
+            interval,
+            state.phase,
+        )
+
+    def _serialize_plan_ids(
+        self, repo: str, values: Sequence[str], field: str
+    ) -> str:
+        if isinstance(values, (str, bytes)) or any(
+            not isinstance(item, str) for item in values
+        ):
+            raise MaintenanceStateError(
+                f"{field}에는 문자열 plan ID만 사용할 수 있습니다."
+            )
+        if len(values) != len(set(values)):
+            raise MaintenanceStateError(f"{field}에 중복 plan ID가 있습니다.")
+        known = {
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT plan_id FROM exec_plans WHERE repo = ?", (repo,)
+            )
+        }
+        unknown = sorted(set(values) - known, key=_plan_sort_key)
+        if unknown:
+            raise MaintenanceStateError(
+                f"{field}에 알 수 없는 plan ID가 있습니다: {', '.join(unknown)}"
+            )
+        return json.dumps(
+            sorted(values, key=_plan_sort_key), separators=(",", ":")
+        )
+
+    def begin_assessment_if_due(
+        self, repo: str, interval: int, base_sha: str
+    ) -> tuple[MaintenanceCycle, bool]:
+        """Create one assessment cycle, or return the already-active cycle."""
+
+        with _transaction(self.connection):
+            state = self.get(repo)
+            if state.phase is not MaintenancePhase.IDLE:
+                return state, False
+            merged_count = self._merged_count(repo)
+            decision = calculate_review_due(
+                state.last_success_merged_count,
+                merged_count,
+                interval,
+                state.phase,
+            )
+            if not decision.required:
+                return state, False
+            self.connection.execute(
+                """
+                INSERT INTO maintenance_cycles (
+                    repo, phase, cycle_base_sha,
+                    cycle_start_merged_count, revision
+                ) VALUES (?, 'assessment', ?, ?, 1)
+                ON CONFLICT(repo) DO UPDATE SET
+                    phase = 'assessment',
+                    cycle_base_sha = excluded.cycle_base_sha,
+                    cycle_start_merged_count = excluded.cycle_start_merged_count,
+                    prerequisite_plan_ids = '[]',
+                    refactoring_plan_ids = '[]',
+                    revalidation_plan_ids = '[]',
+                    publication_stage = NULL,
+                    publication_base_sha = NULL,
+                    publication_commit_sha = NULL,
+                    publication_remote_oid = NULL,
+                    revision = maintenance_cycles.revision + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (repo, base_sha, merged_count),
+            )
+            return self.get(repo), True
+
+    def transition(
+        self,
+        repo: str,
+        *,
+        expected_phase: MaintenancePhase,
+        expected_revision: int,
+        next_phase: MaintenancePhase,
+        prerequisite_plan_ids: Sequence[str] | None = None,
+        refactoring_plan_ids: Sequence[str] | None = None,
+        revalidation_plan_ids: Sequence[str] | None = None,
+        publication_stage: str | None = None,
+        publication_base_sha: str | None = None,
+        publication_commit_sha: str | None = None,
+        publication_remote_oid: str | None = None,
+    ) -> MaintenanceCycle:
+        allowed = {
+            MaintenancePhase.ASSESSMENT: {
+                MaintenancePhase.PREREQUISITE_WAIT,
+                MaintenancePhase.REFACTORING,
+            },
+            MaintenancePhase.PREREQUISITE_WAIT: {
+                MaintenancePhase.ASSESSMENT
+            },
+            MaintenancePhase.REFACTORING: {
+                MaintenancePhase.POST_REFACTOR_REVALIDATION
+            },
+        }
+        if next_phase not in allowed.get(expected_phase, set()):
+            raise MaintenanceStateError(
+                "허용되지 않는 유지보수 단계 전이입니다: "
+                f"{expected_phase.value} -> {next_phase.value}"
+            )
+        updates: dict[str, object] = {
+            "phase": next_phase.value,
+            "publication_stage": publication_stage,
+            "publication_base_sha": publication_base_sha,
+            "publication_commit_sha": publication_commit_sha,
+            "publication_remote_oid": publication_remote_oid,
+        }
+        with _transaction(self.connection):
+            if prerequisite_plan_ids is not None:
+                updates["prerequisite_plan_ids"] = self._serialize_plan_ids(
+                    repo, prerequisite_plan_ids, "prerequisite_plan_ids"
+                )
+            if refactoring_plan_ids is not None:
+                updates["refactoring_plan_ids"] = self._serialize_plan_ids(
+                    repo, refactoring_plan_ids, "refactoring_plan_ids"
+                )
+            if revalidation_plan_ids is not None:
+                updates["revalidation_plan_ids"] = self._serialize_plan_ids(
+                    repo, revalidation_plan_ids, "revalidation_plan_ids"
+                )
+            assignments = ", ".join(f"{name} = ?" for name in updates)
+            cursor = self.connection.execute(
+                f"""
+                UPDATE maintenance_cycles
+                SET {assignments}, revision = revision + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE repo = ? AND phase = ? AND revision = ?
+                """,
+                (*updates.values(), repo, expected_phase.value, expected_revision),
+            )
+            if cursor.rowcount != 1:
+                raise MaintenanceStateError(
+                    "유지보수 주기 단계 또는 revision이 변경됐습니다."
+                )
+            return self.get(repo)
+
+    def advance_success_baseline(
+        self,
+        repo: str,
+        *,
+        expected_phase: MaintenancePhase,
+        expected_revision: int,
+        remote_commit: str,
+    ) -> MaintenanceCycle:
+        if expected_phase not in {
+            MaintenancePhase.ASSESSMENT,
+            MaintenancePhase.POST_REFACTOR_REVALIDATION,
+        }:
+            raise MaintenanceStateError(
+                "이 단계에서는 성공 기준선을 전진시킬 수 없습니다."
+            )
+        with _transaction(self.connection):
+            merged_count = self._merged_count(repo)
+            cursor = self.connection.execute(
+                """
+                UPDATE maintenance_cycles
+                SET last_success_commit = ?, last_success_merged_count = ?,
+                    phase = 'idle', cycle_base_sha = NULL,
+                    cycle_start_merged_count = NULL,
+                    prerequisite_plan_ids = '[]',
+                    refactoring_plan_ids = '[]',
+                    revalidation_plan_ids = '[]',
+                    publication_stage = NULL,
+                    publication_base_sha = NULL,
+                    publication_commit_sha = NULL,
+                    publication_remote_oid = NULL,
+                    revision = revision + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE repo = ? AND phase = ? AND revision = ?
+                """,
+                (
+                    remote_commit,
+                    merged_count,
+                    repo,
+                    expected_phase.value,
+                    expected_revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise MaintenanceStateError(
+                    "유지보수 주기 단계 또는 revision이 변경됐습니다."
+                )
+            return self.get(repo)

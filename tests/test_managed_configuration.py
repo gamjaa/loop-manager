@@ -93,6 +93,112 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
                 load_managed_config(partial)
             self.assertNotIn(secret, str(raised.exception))
 
+    def test_refactoring_review_interval_defaults_and_rejects_invalid_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            default_config = root / "default.ini"
+            default_config.write_text("[loop]\nmax_workers = 2\n", encoding="utf-8")
+            self.assertEqual(
+                load_managed_config(default_config).refactoring_review_interval,
+                5,
+            )
+
+            configured = root / "configured.ini"
+            configured.write_text(
+                "[loop]\nrefactoring_review_interval = 9\n", encoding="utf-8"
+            )
+            self.assertEqual(
+                load_managed_config(configured).refactoring_review_interval,
+                9,
+            )
+
+            for value in ("0", "-1", "1.5"):
+                with self.subTest(value=value):
+                    invalid = root / f"invalid-{value}.ini"
+                    invalid.write_text(
+                        "[loop]\n"
+                        f"refactoring_review_interval = {value}\n"
+                        "[telegram]\n"
+                        "token = do-not-leak\n"
+                        "chat_id = paired\n",
+                        encoding="utf-8",
+                    )
+                    with self.assertRaises(ManagedConfigError) as raised:
+                        load_managed_config(invalid)
+                    self.assertIn("refactoring_review_interval", str(raised.exception))
+                    self.assertNotIn("do-not-leak", str(raised.exception))
+
+    def test_invalid_refactoring_interval_stops_before_database_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            invalid = root / "invalid.ini"
+            invalid.write_text(
+                "[loop]\nrefactoring_review_interval = nope\n", encoding="utf-8"
+            )
+            with mock.patch.object(
+                loop_manager.sys,
+                "argv",
+                [
+                    "loop_manager.py",
+                    "--runtime-child",
+                    "--runtime-source",
+                    str(loop_manager.ROOT),
+                    "--runtime-sha",
+                    "a" * 40,
+                    "--state-dir",
+                    str(state_dir),
+                    "--config",
+                    str(invalid),
+                    "run",
+                ],
+            ), mock.patch("loop_manager.validate_runtime_child"), mock.patch(
+                "builtins.print"
+            ):
+                self.assertEqual(loop_manager.main(), 1)
+            self.assertFalse((state_dir / "loop-manager.db").exists())
+
+    def test_invalid_refactoring_interval_stops_top_level_init_before_database_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            invalid = root / "invalid.ini"
+            invalid.write_text(
+                "[loop]\nrefactoring_review_interval = 0\n", encoding="utf-8"
+            )
+            args = loop_manager.build_parser().parse_args(["init"])
+
+            with self.assertRaises(ManagedConfigError):
+                loop_manager.execute_runtime_command(args, state_dir, invalid)
+
+            self.assertFalse((state_dir / "loop-manager.db").exists())
+
+    def test_invalid_refactoring_interval_prevents_registry_state_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            invalid = root / "invalid.ini"
+            invalid.write_text(
+                "[loop]\nrefactoring_review_interval = 0\n", encoding="utf-8"
+            )
+            with loop_manager.connect_database(state_dir, create=True) as connection:
+                project_registry.add_project(connection, self._record())
+            args = loop_manager.build_parser().parse_args(
+                ["config", "remove", "/repo"]
+            )
+
+            with self.assertRaises(ManagedConfigError):
+                loop_manager.execute_runtime_command(
+                    args, state_dir, invalid
+                )
+
+            with loop_manager.connect_database(state_dir) as connection:
+                self.assertEqual(
+                    tuple(project.repo for project in project_registry.list_projects(connection)),
+                    ("/repo",),
+                )
+
     def test_missing_config_stops_run_before_database_creation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
