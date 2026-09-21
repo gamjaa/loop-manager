@@ -393,6 +393,32 @@ class MaintenancePlanningTest(unittest.TestCase):
             body_reason,
         )
 
+    def test_priority_rejects_resolved_risks_but_accepts_current_evidence(self):
+        path = "docs/plans/[G-002] Extract Boundary.md"
+        for priority in ("high", "critical"):
+            for reason in (
+                "The security risk has been eliminated.",
+                "The security risk has been resolved.",
+                "The security risk has already been fully mitigated.",
+                "We resolved the security risk.",
+                "Data loss was fixed.",
+                "Repeated manual recovery was eliminated.",
+                "보안 위험을 제거했다.",
+                "보안 위험이 해결되었다.",
+                "데이터 손실 위험을 완화했다.",
+            ):
+                with self.subTest(priority=priority, reason=reason):
+                    text = plan_text("G-002", "Extract Boundary", priority=priority)
+                    text += "\n" + reason + "\n"
+                    parsed = loop_manager.published_execplan(path, text)
+                    with self.assertRaisesRegex(
+                        loop_manager.MaintenancePlanningError, "상향된.*priority"
+                    ):
+                        loop_manager.validate_refactoring_plan(path, parsed, text)
+                    # Historical evidence must not hide a separate current issue.
+                    text += "Repeated manual recovery is required after each restart.\n"
+                    loop_manager.validate_refactoring_plan(path, parsed, text)
+
     def test_revalidation_rejects_unsectioned_body_changes(self):
         context = self._begin_barrier()
         snapshot = context.eligible_plans[0]

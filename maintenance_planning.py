@@ -101,10 +101,24 @@ _HIGH_PRIORITY_NEGATION_AFTER = re.compile(
 )
 
 
+_RESOLVED_PRIORITY_RISK = re.compile(
+    r"\b(?:eliminated|resolved|mitigated|remediated|fixed|removed|addressed)\b|"
+    r"(?:제거|해결|완화|해소|조치)(?:했|하였|됐|되었|된|한|됨|함)",
+    re.IGNORECASE,
+)
+
+
 def _has_high_priority_justification(text: str) -> bool:
     """Return whether the body affirmatively states an allowed priority risk."""
 
     for match in _HIGH_PRIORITY_JUSTIFICATION.finditer(text):
+        # Resolved risks are historical evidence. Reject ambiguous mixed claims
+        # in one sentence; a separate current-risk sentence can still qualify.
+        start = max(text.rfind(mark, 0, match.start()) for mark in ".!?;\n") + 1
+        ends = [text.find(mark, match.end()) for mark in ".!?;\n"]
+        end = min((position for position in ends if position >= 0), default=len(text))
+        if _RESOLVED_PRIORITY_RISK.search(text[start:end]):
+            continue
         before = text[max(0, match.start() - 48) : match.start()]
         after = text[match.end() : match.end() + 48]
         if (
