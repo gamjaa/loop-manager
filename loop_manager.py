@@ -1730,9 +1730,17 @@ def _ready_plan_snapshot_from_contents(
         "workspace reservation": int(row["workspace_owned"] or 0),
         "Worker session": row["worker_session_id"],
         "Reviewer session": row["reviewer_session_id"],
-        "PR": row["pr_url"] or row["pr_head_oid"],
+        "PR URL": row["pr_url"],
+        "PR head": row["pr_head_oid"],
+        "PR conflict recovery": int(row["pr_conflict_recovery"] or 0),
+        "PR conflict head": row["pr_conflict_head_oid"],
+        "PR conflict base": row["pr_conflict_base_oid"],
     }
-    owned = [name for name, value in ownership.items() if value not in {None, "", 0}]
+    owned = [
+        name
+        for name, value in ownership.items()
+        if value is not None and value != 0
+    ]
     if str(row["status"]) != "READY" or owned:
         detail = ", ".join(owned) if owned else str(row["status"])
         raise MaintenancePlanningError(
@@ -1990,6 +1998,9 @@ def _assert_maintenance_context_current(
             row["reviewer_session_id"],
             row["pr_url"],
             row["pr_head_oid"],
+            int(row["pr_conflict_recovery"] or 0),
+            row["pr_conflict_head_oid"],
+            row["pr_conflict_base_oid"],
         )
         current = (
             str(row["status"]),
@@ -2011,7 +2022,7 @@ def _assert_maintenance_context_current(
             snapshot.priority,
             snapshot.content_hash,
             snapshot.plan_sha,
-            (None, None, 0, None, None, None, None),
+            (None, None, 0, None, None, None, None, 0, None, None),
         )
         if current != expected:
             raise MaintenancePlanningError(
@@ -2703,6 +2714,9 @@ def _apply_maintenance_planning_batch(
                   AND worker_session_id IS NULL
                   AND reviewer_session_id IS NULL AND pr_url IS NULL
                   AND pr_head_oid IS NULL
+                  AND pr_conflict_recovery = 0
+                  AND pr_conflict_head_oid IS NULL
+                  AND pr_conflict_base_oid IS NULL
                 """,
                 (
                     dependencies,
@@ -10990,6 +11004,7 @@ bounded 변경 문맥:
 {mode_contract}
 기존 파일을 삭제·rename하지 말고 docs/FUTURE_IDEAS.md나 다른 파일을 변경하지 마라.
 구현, 테스트, commit, push와 PR 생성은 하지 마라. 이 권한은 활성 SQLite 유지보수 단계와 위 target snapshot에만 한정된다.
+사용자가 BLOCKED 해제를 위해 ExecPlan을 직접 편집하는 별도 흐름과 이 권한을 혼동하지 말고, 이 호출로 사용자 편집을 대행하거나 권한 범위를 넓히지 마라.
 {failure}
 """.strip()
 

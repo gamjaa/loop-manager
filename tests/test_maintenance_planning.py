@@ -294,12 +294,17 @@ class MaintenancePlanningTest(unittest.TestCase):
 
         ownership_cases = (
             ("branch", "loop-manager/G-001"),
+            ("branch", ""),
             ("worktree", "/tmp/managed-G-001"),
             ("workspace_owned", 2),
             ("worker_session_id", "worker-session"),
             ("reviewer_session_id", "reviewer-session"),
             ("pr_url", "https://example.test/pull/1"),
+            ("pr_url", ""),
             ("pr_head_oid", "a" * 40),
+            ("pr_conflict_recovery", 1),
+            ("pr_conflict_head_oid", "b" * 40),
+            ("pr_conflict_base_oid", "c" * 40),
         )
         for field, value in ownership_cases:
             with self.subTest(field=field):
@@ -315,7 +320,9 @@ class MaintenancePlanningTest(unittest.TestCase):
                     loop_manager.prepare_maintenance_planning_context(
                         self.connection, str(self.repo), self.repo, self.base_sha
                     )
-                reset = 0 if field == "workspace_owned" else None
+                reset = 0 if field in {
+                    "workspace_owned", "pr_conflict_recovery"
+                } else None
                 self.connection.execute(
                     f"UPDATE exec_plans SET {field} = ? "
                     "WHERE repo = ? AND plan_id = 'G-001'",
@@ -383,6 +390,7 @@ class MaintenancePlanningTest(unittest.TestCase):
         self.assertIn("maintenance barrier", prompt)
         self.assertIn("G-001", prompt)
         self.assertIn("docs/FUTURE_IDEAS.md", prompt)
+        self.assertIn("사용자 편집을 대행", prompt)
         self.assertEqual(
             [plan["id"] for _path, plan in result.plans],
             ["G-002", "G-003"],
@@ -763,6 +771,38 @@ class MaintenancePlanningTest(unittest.TestCase):
         )
         self.connection.execute(
             "UPDATE exec_plans SET pr_head_oid = NULL "
+            "WHERE repo = ? AND plan_id = 'G-001'",
+            (str(self.repo),),
+        )
+        self.connection.commit()
+
+        self.connection.execute(
+            "UPDATE exec_plans SET pr_conflict_recovery = 1, "
+            "pr_conflict_head_oid = ?, pr_conflict_base_oid = ? "
+            "WHERE repo = ? AND plan_id = 'G-001'",
+            ("c" * 40, "d" * 40, str(self.repo)),
+        )
+        self.connection.commit()
+        with self.assertRaisesRegex(
+            loop_manager.MaintenancePlanningError, "snapshot"
+        ):
+            loop_manager.publish_maintenance_planning_batch(
+                self.connection,
+                str(self.repo),
+                self.repo,
+                "main",
+                result,
+                plan_commit,
+            )
+        self.assertIsNone(
+            self.connection.execute(
+                "SELECT 1 FROM exec_plans WHERE repo = ? AND plan_id = 'G-002'",
+                (str(self.repo),),
+            ).fetchone()
+        )
+        self.connection.execute(
+            "UPDATE exec_plans SET pr_conflict_recovery = 0, "
+            "pr_conflict_head_oid = NULL, pr_conflict_base_oid = NULL "
             "WHERE repo = ? AND plan_id = 'G-001'",
             (str(self.repo),),
         )
