@@ -344,6 +344,56 @@ class MaintenancePlanningTest(unittest.TestCase):
         ):
             self._validate_barrier(context)
 
+    def test_refactoring_priority_justification_must_be_in_body(self):
+        frontmatter_only_reason = plan_text(
+            "G-002", "Extract Boundary", priority="high"
+        ).replace(
+            "docs/PRODUCT.md",
+            "docs/requirements/[R-999] Security.md",
+        )
+        parsed = loop_manager.published_execplan(
+            "docs/plans/[G-002] Extract Boundary.md",
+            frontmatter_only_reason,
+        )
+        with self.assertRaisesRegex(
+            loop_manager.MaintenancePlanningError, "상향된.*priority"
+        ):
+            loop_manager.validate_refactoring_plan(
+                "docs/plans/[G-002] Extract Boundary.md",
+                parsed,
+                frontmatter_only_reason,
+            )
+
+        body_reason = frontmatter_only_reason.replace(
+            "A concrete structural responsibility problem",
+            "Repeated manual recovery reveals a structural responsibility problem",
+        )
+        loop_manager.validate_refactoring_plan(
+            "docs/plans/[G-002] Extract Boundary.md",
+            parsed,
+            body_reason,
+        )
+
+    def test_revalidation_rejects_unsectioned_body_changes(self):
+        context = self._begin_barrier()
+        snapshot = context.eligible_plans[0]
+        metadata = loop_manager.published_execplan(
+            snapshot.path, snapshot.text
+        )
+        revised = snapshot.text.replace(
+            "\n## Purpose",
+            "\nUnsectioned product scope expansion.\n\n## Purpose",
+        )
+        with self.assertRaisesRegex(
+            loop_manager.MaintenancePlanningError, "section 밖의 본문"
+        ):
+            loop_manager.validate_revalidation_revision(
+                snapshot,
+                snapshot.path,
+                metadata,
+                revised,
+            )
+
     def test_revalidation_preserves_goal_and_allows_only_current_structure_sections(self):
         repository = maintenance_state.MaintenanceRepository(self.connection)
         cycle, _created = repository.begin_assessment_if_due(

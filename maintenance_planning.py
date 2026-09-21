@@ -99,6 +99,22 @@ def markdown_sections(text: str) -> MarkdownSections:
     return MarkdownSections(tuple(order), values)
 
 
+def _body_preamble(text: str) -> str:
+    """Return content between frontmatter and the first level-two section."""
+
+    normalized = text.replace("\r\n", "\n")
+    lines = normalized.splitlines(keepends=True)
+    if not lines or lines[0].rstrip("\n") != "---":
+        raise MaintenancePlanningError("ExecPlan frontmatter가 없습니다.")
+    for index, line in enumerate(lines[1:], start=1):
+        if line.rstrip("\n") != "---":
+            continue
+        body = "".join(lines[index + 1 :])
+        first_section = _SECTION.search(body)
+        return body[: first_section.start() if first_section else None].strip()
+    raise MaintenancePlanningError("ExecPlan frontmatter 종료 구분자가 없습니다.")
+
+
 def _frontmatter_without_dependencies(text: str) -> str:
     """Remove only the depends_on entry so barrier diffs stay mechanical."""
 
@@ -212,6 +228,11 @@ def validate_revalidation_revision(
         )
     previous = markdown_sections(snapshot.text)
     revised = markdown_sections(text)
+    if _body_preamble(snapshot.text) != _body_preamble(text):
+        raise MaintenancePlanningError(
+            "revalidation mode는 허용된 section 밖의 본문을 변경할 수 "
+            f"없습니다: {path}"
+        )
     if previous.values.get("Purpose") != revised.values.get("Purpose"):
         raise MaintenancePlanningError(
             f"revalidation mode는 원래 Purpose를 변경할 수 없습니다: {path}"
@@ -310,7 +331,11 @@ def validate_refactoring_plan(
         raise MaintenancePlanningError(
             f"리팩터링 ExecPlan의 기본 priority는 normal입니다: {path}"
         )
-    if priority in {"high", "critical"} and _HIGH_PRIORITY_JUSTIFICATION.search(text) is None:
+    body = "\n".join(sections.values.values())
+    if (
+        priority in {"high", "critical"}
+        and _HIGH_PRIORITY_JUSTIFICATION.search(body) is None
+    ):
         raise MaintenancePlanningError(
             f"상향된 리팩터링 priority의 구체적인 근거가 없습니다: {path}"
         )
