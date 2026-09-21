@@ -430,28 +430,150 @@ class AutomationFirstCatalogTest(unittest.TestCase):
         self.assertIsNone(decision.runnable_ready)
 
     def test_dependency_blocked_ready_is_not_an_empty_catalog(self):
-        connection = self._connection()
-        self._insert_plan(
-            connection,
-            "G-010",
-            "READY",
-            priority="critical",
-            depends_on=("G-009",),
-        )
-        connection.execute(
-            "UPDATE projects SET planning_fingerprint = 'preserved' WHERE repo = 'repo'"
-        )
-        connection.commit()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            blocked_parent = root / "blocked"
+            runnable_parent = root / "runnable"
+            blocked_parent.mkdir()
+            runnable_parent.mkdir()
+            blocked_repo = make_remote_repository(str(blocked_parent))
+            runnable_repo = make_remote_repository(str(runnable_parent))
+            (blocked_repo / "docs/plans").mkdir()
+            (runnable_repo / "docs/plans").mkdir()
 
-        decision = loop_manager.catalog_schedule_decision(connection, "repo")
-        project = connection.execute(
-            "SELECT planning_fingerprint, phase FROM projects WHERE repo = 'repo'"
-        ).fetchone()
+            blocked_plan = write_execplan(
+                blocked_repo,
+                "G-010",
+                "Dependency Blocked",
+                depends_on=("G-009",),
+                priority="critical",
+            )
+            runnable_plan = write_execplan(
+                runnable_repo,
+                "G-001",
+                "Runnable",
+                priority="high",
+            )
+            commit_and_push(blocked_repo, "Add dependency-blocked plan")
+            commit_and_push(runnable_repo, "Add runnable plan")
+            blocked_plan_sha = git_command(blocked_repo, "rev-parse", "origin/main")
+            runnable_plan_sha = git_command(runnable_repo, "rev-parse", "origin/main")
+            preserved_fingerprint = loop_manager.planning_input_fingerprint(
+                blocked_repo, "main"
+            )
 
-        self.assertIsNone(decision.active)
-        self.assertTrue(decision.has_ready)
-        self.assertIsNone(decision.runnable_ready)
-        self.assertEqual(tuple(project), ("preserved", None))
+            (blocked_repo / "docs/PRODUCT.md").write_text(
+                "# Changed product input\n",
+                encoding="utf-8",
+            )
+            commit_and_push(blocked_repo, "Change blocked project input")
+
+            state_dir = root / "state"
+            state_dir.mkdir()
+            connection = loop_manager.connect_database(state_dir, create=True)
+            connection.executemany(
+                "INSERT INTO projects (repo, base_branch, planning_fingerprint) "
+                "VALUES (?, 'main', ?)",
+                (
+                    (str(blocked_repo), preserved_fingerprint),
+                    (str(runnable_repo), "older-input"),
+                ),
+            )
+            for repo, plan_id, plan_path, title, dependencies, plan_sha in (
+                (
+                    blocked_repo,
+                    "G-010",
+                    blocked_plan,
+                    "Dependency Blocked",
+                    ("G-009",),
+                    blocked_plan_sha,
+                ),
+                (
+                    runnable_repo,
+                    "G-001",
+                    runnable_plan,
+                    "Runnable",
+                    (),
+                    runnable_plan_sha,
+                ),
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO exec_plans (
+                        repo, plan_id, path, title, sources, depends_on, priority,
+                        content_hash, status, plan_sha
+                    ) VALUES (?, ?, ?, ?, '["docs/PRODUCT.md"]', ?, 'high',
+                              ?, 'READY', ?)
+                    """,
+                    (
+                        str(repo),
+                        plan_id,
+                        plan_path.relative_to(repo).as_posix(),
+                        title,
+                        json.dumps(dependencies),
+                        loop_manager.file_hash(plan_path),
+                        plan_sha,
+                    ),
+                )
+            connection.commit()
+            config = loop_manager.ManagedConfig(
+                path=root / "unused.ini",
+                max_workers=2,
+                telegram_token="",
+                telegram_chat_id="",
+            )
+            roles: list[str] = []
+
+            def agent(_worktree, _state, _config, role_name, _prompt, **_kwargs):
+                roles.append(role_name)
+                return loop_manager.CodexResult(
+                    1, "stop runnable worker", "worker-session"
+                )
+
+            try:
+                with mock.patch(
+                    "loop_manager.validate_repository",
+                    side_effect=lambda path, **_kwargs: Path(path).resolve(),
+                ), mock.patch(
+                    "loop_manager.run_codex",
+                    side_effect=agent,
+                ):
+                    outcomes = loop_manager.schedule_registered_projects(
+                        connection,
+                        state_dir,
+                        config,
+                    )
+                blocked_project = connection.execute(
+                    "SELECT phase, planning_fingerprint FROM projects WHERE repo = ?",
+                    (str(blocked_repo),),
+                ).fetchone()
+                blocked_catalog = connection.execute(
+                    "SELECT plan_id, status FROM exec_plans WHERE repo = ?",
+                    (str(blocked_repo),),
+                ).fetchall()
+                runnable_status = connection.execute(
+                    "SELECT status FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+                    (str(runnable_repo),),
+                ).fetchone()["status"]
+            finally:
+                connection.close()
+
+        results = {item.repo: item.result.kind for item in outcomes}
+        self.assertEqual(
+            results[str(blocked_repo)],
+            loop_manager.ProjectRunKind.WAITING,
+        )
+        self.assertEqual(
+            results[str(runnable_repo)],
+            loop_manager.ProjectRunKind.OPERATIONAL_ERROR,
+        )
+        self.assertEqual(roles, ["worker"])
+        self.assertEqual(tuple(blocked_project), (None, preserved_fingerprint))
+        self.assertEqual(
+            [tuple(row) for row in blocked_catalog],
+            [("G-010", "READY")],
+        )
+        self.assertEqual(runnable_status, "IMPLEMENTING")
 
 
     def test_merge_marks_only_current_plan_and_unlocks_next_dependency(self):
