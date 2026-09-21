@@ -4292,6 +4292,15 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             legacy_projects = loop_manager.SCHEMA.replace(
                 "    reviewer_session_id TEXT,\n", ""
             ).replace("    review_result TEXT,\n", "")
+            for line in (
+                "    pr_conflict_recovery INTEGER NOT NULL DEFAULT 0,\n",
+                "    pr_conflict_head_oid TEXT,\n",
+                "    pr_conflict_base_oid TEXT,\n",
+            ):
+                legacy_projects = legacy_projects.replace(line, "")
+                "    pr_conflict_recovery INTEGER NOT NULL DEFAULT 0,\n",
+                "    pr_conflict_head_oid TEXT,\n",
+                "    pr_conflict_base_oid TEXT,\n",
             legacy_execplans = loop_manager.EXEC_PLANS_SCHEMA
             for line in (
                 "    reviewer_session_id TEXT,\n",
@@ -4335,7 +4344,13 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                 ).fetchone()
 
         self.assertTrue(
-            {"reviewer_session_id", "review_result"} <= project_columns
+            {
+                "reviewer_session_id",
+                "review_result",
+                "pr_conflict_recovery",
+                "pr_conflict_head_oid",
+                "pr_conflict_base_oid",
+            } <= project_columns
         )
         self.assertTrue(
             {
@@ -4343,6 +4358,9 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                 "review_result",
                 "verify_failure_history",
                 "review_failure_history",
+                "pr_conflict_recovery",
+                "pr_conflict_head_oid",
+                "pr_conflict_base_oid",
                 "initial_worker_level",
                 "effective_worker_level",
                 "review_level_history",
@@ -9896,6 +9914,7 @@ class MergeIndependentWorktreeCleanupTest(unittest.TestCase):
 
         self.assertEqual(row["headRefOid"], "abc")
         self.assertIn("headRefOid", command.call_args.args[0][-1])
+        self.assertIn("mergeable", command.call_args.args[0][-1])
 
     def test_main_rejects_unknown_options_before_state_creation(self):
         state_dir = Path("state")
@@ -10919,6 +10938,620 @@ class LatestBasePublicationTest(unittest.TestCase):
                     self.assertFalse(worktree.exists())
 
 
+class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
+    def _pr_open_state(self, directory: str):
+        repo = make_remote_repository(directory)
+        state_dir = Path(directory) / "state"
+        state_dir.mkdir()
+        (repo / "docs/plans").mkdir()
+        plan = write_execplan(
+            repo,
+            "G-026",
+            "Automatic Owned PR Conflict Recovery",
+            complexity="high",
+            risk="critical",
+            priority="critical",
+        )
+        commit_and_push(repo, "Add conflict recovery plan")
+        plan_sha = git_command(repo, "rev-parse", "origin/main")
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute(loop_manager.SCHEMA)
+        connection.execute(
+            "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+            (str(repo),),
+        )
+        connection.commit()
+        relative_plan = plan.relative_to(repo).as_posix()
+        loop_manager.register_execplans(
+            connection,
+            str(repo),
+            repo,
+            [(relative_plan, loop_manager._parse_execplan(repo, plan))],
+            plan_sha,
+            loop_manager.planning_input_fingerprint(repo, "main"),
+        )
+        branch, worktree = loop_manager.expected_execplan_workspace(
+            state_dir, str(repo), "G-026"
+        )
+        loop_manager.make_worktree(repo, worktree, branch, "main")
+        (worktree / "src/app.py").write_text("VALUE = 2\n", encoding="utf-8")
+        git_command(worktree, "add", "src/app.py")
+        git_command(worktree, "commit", "-m", "Implement owned PR")
+        git_command(
+            worktree,
+            "push",
+            "-u",
+            "origin",
+            f"HEAD:refs/heads/{branch}",
+        )
+        head_oid = git_command(worktree, "rev-parse", "HEAD")
+        pr_url = "https://example.test/pr/26"
+        with connection:
+            connection.execute(
+                """
+                UPDATE exec_plans
+                SET status = 'PR_OPEN', active_sha = ?,
+                    validated_base_sha = ?, publication_remote_oid = ?,
+                    branch = ?, worktree = ?, workspace_owned = 1,
+                    pr_url = ?, pr_head_oid = ?,
+                    worker_session_id = 'worker-existing',
+                    reviewer_session_id = 'reviewer-existing',
+                    worker_result = ?, verify_result = 'verify: PASS',
+                    review_result = 'VERDICT: PASS'
+                WHERE repo = ? AND plan_id = 'G-026'
+                """,
+                (
+                    plan_sha,
+                    plan_sha,
+                    head_oid,
+                    branch,
+                    str(worktree),
+                    pr_url,
+                    head_oid,
+                    worker_result(
+                        "Implement owned PR",
+                        "Creates the owned PR fixture.",
+                        "AutomaticOwnedPrConflictRecoveryTest: PASS",
+                    ),
+                    str(repo),
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE projects
+                SET active_sha = ?, validated_base_sha = ?,
+                    publication_remote_oid = ?, plan_sha = ?,
+                    phase = 'PR_OPEN', branch = ?, worktree = ?,
+                    plan_path = ?, pr_url = ?, pr_head_oid = ?,
+                    worker_session_id = 'worker-existing',
+                    reviewer_session_id = 'reviewer-existing',
+                    worker_result = ?, verify_result = 'verify: PASS',
+                    review_result = 'VERDICT: PASS'
+                WHERE repo = ?
+                """,
+                (
+                    plan_sha,
+                    plan_sha,
+                    head_oid,
+                    plan_sha,
+                    branch,
+                    str(worktree),
+                    relative_plan,
+                    pr_url,
+                    head_oid,
+                    worker_result(
+                        "Implement owned PR",
+                        "Creates the owned PR fixture.",
+                        "AutomaticOwnedPrConflictRecoveryTest: PASS",
+                    ),
+                    str(repo),
+                ),
+            )
+        return (
+            repo,
+            state_dir,
+            connection,
+            branch,
+            worktree,
+            pr_url,
+            head_oid,
+        )
+
+    def _advance_base(
+        self,
+        directory: str,
+        repo: Path,
+        relative_path: str,
+        contents: str,
+        message: str,
+    ) -> str:
+        upstream = Path(directory) / f"upstream-{message.replace(' ', '-')}"
+        git_command(Path(directory), "clone", str(repo.parent / "remote.git"), str(upstream))
+        git_command(upstream, "config", "user.email", "upstream@example.com")
+        git_command(upstream, "config", "user.name", "Upstream Test")
+        target = upstream / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(contents, encoding="utf-8")
+        git_command(upstream, "add", "-A")
+        git_command(upstream, "commit", "-m", message)
+        git_command(upstream, "push", "origin", "HEAD:main")
+        return git_command(upstream, "rev-parse", "HEAD")
+
+    def _pull_request(
+        self,
+        branch: str,
+        pr_url: str,
+        head_oid: str,
+        mergeable: str,
+        *,
+        state: str = "OPEN",
+    ) -> dict[str, object]:
+        return {
+            "url": pr_url,
+            "state": state,
+            "mergedAt": None,
+            "headRefOid": head_oid,
+            "headRefName": branch,
+            "mergeable": mergeable,
+        }
+
+    def test_unknown_and_mergeable_prs_do_not_rebase_run_agents_or_push(self):
+        for mergeable, advance_base in (("UNKNOWN", False), ("MERGEABLE", True)):
+            with self.subTest(mergeable=mergeable), tempfile.TemporaryDirectory() as directory:
+                (
+                    repo,
+                    state_dir,
+                    connection,
+                    branch,
+                    _worktree,
+                    pr_url,
+                    head_oid,
+                ) = self._pr_open_state(directory)
+                if advance_base:
+                    self._advance_base(
+                        directory,
+                        repo,
+                        "docs/notes.md",
+                        "# Behind only\n",
+                        "Advance nonconflicting base",
+                    )
+                git_calls = []
+                original_git = loop_manager.git
+
+                def recording_git(path, *arguments, **kwargs):
+                    if arguments and arguments[0] in {"rebase", "push"}:
+                        git_calls.append(arguments)
+                    return original_git(path, *arguments, **kwargs)
+
+                pull_request = self._pull_request(
+                    branch, pr_url, head_oid, mergeable
+                )
+                with mock.patch(
+                    "loop_manager.validate_repository", return_value=repo
+                ), mock.patch(
+                    "loop_manager.ensure_safe_base_worktree"
+                ) as synchronize, mock.patch(
+                    "loop_manager.pr_for_branch", return_value=pull_request
+                ), mock.patch(
+                    "loop_manager.run_codex"
+                ) as agent, mock.patch(
+                    "loop_manager.verify"
+                ) as verify, mock.patch(
+                    "loop_manager.git", side_effect=recording_git
+                ):
+                    result = loop_manager.run_project(
+                        connection,
+                        state_dir,
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
+                    )
+
+                stored = connection.execute(
+                    "SELECT phase, pr_conflict_recovery FROM projects "
+                    "WHERE repo = ?",
+                    (str(repo),),
+                ).fetchone()
+                self.assertEqual(result, 0)
+                self.assertEqual(tuple(stored), ("PR_OPEN", 0))
+                self.assertEqual(git_calls, [])
+                synchronize.assert_not_called()
+                agent.assert_not_called()
+                verify.assert_not_called()
+
+    def test_conflicting_pr_reuses_sessions_revalidates_new_base_and_leases_push(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                repo,
+                state_dir,
+                connection,
+                branch,
+                worktree,
+                pr_url,
+                head_oid,
+            ) = self._pr_open_state(directory)
+            self._advance_base(
+                directory,
+                repo,
+                "src/app.py",
+                "VALUE = 3\n",
+                "Create PR conflict",
+            )
+            source_before = (
+                git_command(repo, "rev-parse", "HEAD"),
+                git_command(repo, "symbolic-ref", "--short", "HEAD"),
+                git_command(repo, "rev-parse", "refs/heads/main"),
+                git_command(repo, "status", "--porcelain"),
+            )
+            pull_request = self._pull_request(
+                branch, pr_url, head_oid, "CONFLICTING"
+            )
+            project = connection.execute(
+                "SELECT * FROM projects WHERE repo = ?", (str(repo),)
+            ).fetchone()
+            started = loop_manager.reconcile_existing_pull_request(
+                connection,
+                repo,
+                state_dir,
+                str(repo),
+                project,
+                pull_request,
+            )
+            durable = connection.execute(
+                """
+                SELECT status, pr_conflict_recovery, pr_conflict_head_oid,
+                       pr_conflict_base_oid, worker_session_id,
+                       reviewer_session_id
+                FROM exec_plans WHERE repo = ? AND plan_id = 'G-026'
+                """,
+                (str(repo),),
+            ).fetchone()
+            self.assertIsNone(started)
+            self.assertEqual(durable["status"], "IMPLEMENTING")
+            self.assertEqual(durable["pr_conflict_recovery"], 1)
+            self.assertEqual(durable["pr_conflict_head_oid"], head_oid)
+            self.assertEqual(
+                durable["pr_conflict_base_oid"],
+                git_command(repo, "rev-parse", "origin/main"),
+            )
+            self.assertEqual(durable["worker_session_id"], "worker-existing")
+            self.assertEqual(
+                durable["reviewer_session_id"], "reviewer-existing"
+            )
+            self.assertFalse(
+                loop_manager._rebase_in_progress_for_branch(worktree, branch)
+            )
+
+            roles = []
+            session_ids = []
+            review_count = 0
+            pushes = []
+            created = []
+            original_git = loop_manager.git
+            original_command = loop_manager.command
+
+            def agent_runner(
+                agent_worktree,
+                _state,
+                _config,
+                role_name,
+                _prompt,
+                **kwargs,
+            ):
+                nonlocal review_count
+                roles.append(role_name)
+                session_ids.append(kwargs["session_id"])
+                if role_name == "worker":
+                    (agent_worktree / "src/app.py").write_text(
+                        "VALUE = 4\n", encoding="utf-8"
+                    )
+                    return loop_manager.CodexResult(
+                        0,
+                        worker_result(
+                            "Resolve owned PR conflict",
+                            "Rebases and resolves the existing owned PR.",
+                            "AutomaticOwnedPrConflictRecoveryTest: PASS",
+                        ),
+                        "worker-existing",
+                    )
+                review_count += 1
+                if review_count == 1:
+                    self._advance_base(
+                        directory,
+                        repo,
+                        "docs/notes.md",
+                        "# Base moved during review\n",
+                        "Advance base during recovery review",
+                    )
+                return loop_manager.CodexResult(
+                    0, "VERDICT: PASS", "reviewer-existing"
+                )
+
+            def recording_git(path, *arguments, **kwargs):
+                if arguments and arguments[0] == "push":
+                    pushes.append(arguments)
+                return original_git(path, *arguments, **kwargs)
+
+            def recording_command(arguments, **kwargs):
+                if arguments[:3] == ["gh", "pr", "create"]:
+                    created.append(arguments)
+                    raise AssertionError("conflict recovery must not create a PR")
+                return original_command(arguments, **kwargs)
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ) as synchronize, mock.patch(
+                "loop_manager.pr_for_branch", return_value=pull_request
+            ), mock.patch(
+                "loop_manager.verify", return_value=(True, "verify: PASS")
+            ) as verify, mock.patch(
+                "loop_manager.run_codex", side_effect=agent_runner
+            ), mock.patch(
+                "loop_manager.git", side_effect=recording_git
+            ), mock.patch(
+                "loop_manager.command", side_effect=recording_command
+            ):
+                outcome = loop_manager.run_project_result(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            stored = connection.execute(
+                """
+                SELECT phase, validated_base_sha, publication_remote_oid,
+                       pr_url, pr_head_oid, pr_conflict_recovery,
+                       pr_conflict_head_oid, pr_conflict_base_oid,
+                       worker_session_id, reviewer_session_id
+                FROM projects WHERE repo = ?
+                """,
+                (str(repo),),
+            ).fetchone()
+            final_head = git_command(worktree, "rev-parse", "HEAD")
+            source_after = (
+                git_command(repo, "rev-parse", "HEAD"),
+                git_command(repo, "symbolic-ref", "--short", "HEAD"),
+                git_command(repo, "rev-parse", "refs/heads/main"),
+                git_command(repo, "status", "--porcelain"),
+            )
+            lease = f"--force-with-lease=refs/heads/{branch}:{head_oid}"
+
+            self.assertEqual(outcome.kind, loop_manager.ProjectRunKind.WAITING)
+            self.assertEqual(stored["phase"], "PR_OPEN")
+            self.assertEqual(stored["publication_remote_oid"], final_head)
+            self.assertEqual(stored["pr_head_oid"], final_head)
+            self.assertEqual(stored["pr_url"], pr_url)
+            self.assertEqual(stored["pr_conflict_recovery"], 0)
+            self.assertIsNone(stored["pr_conflict_head_oid"])
+            self.assertIsNone(stored["pr_conflict_base_oid"])
+            self.assertEqual(stored["worker_session_id"], "worker-existing")
+            self.assertEqual(stored["reviewer_session_id"], "reviewer-existing")
+            self.assertEqual(roles, ["worker", "reviewer", "reviewer"])
+            self.assertEqual(
+                session_ids,
+                ["worker-existing", "reviewer-existing", "reviewer-existing"],
+            )
+            self.assertEqual(verify.call_count, 2)
+            self.assertEqual(len(pushes), 1)
+            self.assertIn(lease, pushes[0])
+            self.assertNotIn("--force", pushes[0])
+            self.assertEqual(created, [])
+            self.assertEqual(source_after, source_before)
+            synchronize.assert_not_called()
+
+    def test_external_remote_head_change_blocks_without_push(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                repo,
+                state_dir,
+                connection,
+                branch,
+                _worktree,
+                pr_url,
+                head_oid,
+            ) = self._pr_open_state(directory)
+            upstream = Path(directory) / "external-head"
+            git_command(Path(directory), "clone", str(repo.parent / "remote.git"), str(upstream))
+            external_head = git_command(upstream, "rev-parse", "HEAD")
+            git_command(
+                upstream,
+                "push",
+                "--force",
+                "origin",
+                f"HEAD:refs/heads/{branch}",
+            )
+            pushes = []
+            original_git = loop_manager.git
+
+            def recording_git(path, *arguments, **kwargs):
+                if arguments and arguments[0] == "push":
+                    pushes.append(arguments)
+                return original_git(path, *arguments, **kwargs)
+
+            pull_request = self._pull_request(
+                branch, pr_url, external_head, "CONFLICTING"
+            )
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=pull_request
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as agent, mock.patch(
+                "loop_manager.git", side_effect=recording_git
+            ):
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            stored = connection.execute(
+                "SELECT phase, pr_conflict_recovery, last_error "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertNotEqual(external_head, head_oid)
+            self.assertEqual(result, 1)
+            self.assertEqual(stored["phase"], "BLOCKED")
+            self.assertEqual(stored["pr_conflict_recovery"], 0)
+            self.assertIn("head OID", stored["last_error"])
+            self.assertEqual(pushes, [])
+            agent.assert_not_called()
+
+    def test_post_push_interruption_confirms_local_head_without_repush(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                repo,
+                state_dir,
+                connection,
+                branch,
+                worktree,
+                pr_url,
+                observed_head,
+            ) = self._pr_open_state(directory)
+            (worktree / "docs/notes.md").write_text(
+                "# Recovered push\n", encoding="utf-8"
+            )
+            git_command(worktree, "add", "docs/notes.md")
+            git_command(worktree, "commit", "-m", "Prepare recovered PR head")
+            local_head = git_command(worktree, "rev-parse", "HEAD")
+            git_command(
+                worktree,
+                "push",
+                "--force-with-lease",
+                "origin",
+                f"HEAD:refs/heads/{branch}",
+            )
+            base_oid = git_command(repo, "rev-parse", "origin/main")
+            loop_manager.update_project(
+                connection,
+                str(repo),
+                phase="PUBLISHING",
+                active_sha=base_oid,
+                validated_base_sha=base_oid,
+                pr_conflict_recovery=1,
+                pr_conflict_head_oid=observed_head,
+                pr_conflict_base_oid=base_oid,
+            )
+            project = connection.execute(
+                "SELECT * FROM projects WHERE repo = ?", (str(repo),)
+            ).fetchone()
+            pull_request = self._pull_request(
+                branch, pr_url, local_head, "MERGEABLE"
+            )
+            pushes = []
+            original_git = loop_manager.git
+
+            def recording_git(path, *arguments, **kwargs):
+                if arguments and arguments[0] == "push":
+                    pushes.append(arguments)
+                return original_git(path, *arguments, **kwargs)
+
+            with mock.patch("loop_manager.git", side_effect=recording_git):
+                result = loop_manager.reconcile_existing_pull_request(
+                    connection,
+                    repo,
+                    state_dir,
+                    str(repo),
+                    project,
+                    pull_request,
+                )
+
+            stored = connection.execute(
+                """
+                SELECT status, publication_remote_oid, pr_head_oid,
+                       pr_conflict_recovery, pr_conflict_head_oid,
+                       pr_conflict_base_oid
+                FROM exec_plans WHERE repo = ? AND plan_id = 'G-026'
+                """,
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(result, 0)
+            self.assertEqual(stored["status"], "PR_OPEN")
+            self.assertEqual(stored["publication_remote_oid"], local_head)
+            self.assertEqual(stored["pr_head_oid"], local_head)
+            self.assertEqual(stored["pr_conflict_recovery"], 0)
+            self.assertIsNone(stored["pr_conflict_head_oid"])
+            self.assertIsNone(stored["pr_conflict_base_oid"])
+            self.assertEqual(pushes, [])
+    def test_recovery_merge_and_close_races_never_push(self):
+        for state in ("CLOSED", "MERGED"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                (
+                    repo,
+                    state_dir,
+                    connection,
+                    branch,
+                    worktree,
+                    pr_url,
+                    head_oid,
+                ) = self._pr_open_state(directory)
+                base_oid = git_command(repo, "rev-parse", "origin/main")
+                loop_manager.update_project(
+                    connection,
+                    str(repo),
+                    phase="PUBLISHING",
+                    active_sha=base_oid,
+                    validated_base_sha=base_oid,
+                    pr_conflict_recovery=1,
+                    pr_conflict_head_oid=head_oid,
+                    pr_conflict_base_oid=base_oid,
+                )
+                project = connection.execute(
+                    "SELECT * FROM projects WHERE repo = ?", (str(repo),)
+                ).fetchone()
+                pull_request = self._pull_request(
+                    branch, pr_url, head_oid, "CONFLICTING", state=state
+                )
+                if state == "MERGED":
+                    pull_request["mergedAt"] = "2026-09-21T00:00:00Z"
+                pushes = []
+                original_git = loop_manager.git
+
+                def recording_git(path, *arguments, **kwargs):
+                    if arguments and arguments[0] == "push":
+                        pushes.append(arguments)
+                    return original_git(path, *arguments, **kwargs)
+
+                with mock.patch(
+                    "loop_manager.git", side_effect=recording_git
+                ):
+                    result = loop_manager.reconcile_existing_pull_request(
+                        connection,
+                        repo,
+                        state_dir,
+                        str(repo),
+                        project,
+                        pull_request,
+                    )
+
+                stored = connection.execute(
+                    "SELECT status, pr_conflict_recovery FROM exec_plans "
+                    "WHERE repo = ? AND plan_id = 'G-026'",
+                    (str(repo),),
+                ).fetchone()
+                self.assertEqual(pushes, [])
+                if state == "CLOSED":
+                    self.assertEqual(result, 1)
+                    self.assertEqual(tuple(stored), ("BLOCKED", 1))
+                    self.assertTrue(worktree.is_dir())
+                else:
+                    self.assertEqual(
+                        result, loop_manager.PROJECT_STEP_PLANNING_PENDING
+                    )
+                    self.assertEqual(tuple(stored), ("MERGED", 0))
+                    self.assertFalse(worktree.exists())
 class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
     def _scheduler_state(
         self,

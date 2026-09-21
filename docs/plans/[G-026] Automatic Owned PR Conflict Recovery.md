@@ -57,11 +57,11 @@ Merge를 기다리는 Loop Manager 소유 PR이 최신 원격 base와 충돌하�
 
 ## Progress
 
-- [ ] PR mergeability 분류와 durable conflict-recovery 상태 추가
-- [ ] 소유권 검증 후 동일 worktree·세션 rebase 복구 구현
-- [ ] 최신 base 고정 verify·Review 반복과 Merge/Close race 처리 구현
-- [ ] 기존 PR branch 전용 lease push와 원격 확인 구현
-- [ ] 중단 재개, 외부 head 변경과 source checkout 불변 회귀 테스트 추가
+- [x] PR mergeability 분류와 durable conflict-recovery 상태 추가
+- [x] 소유권 검증 후 동일 worktree·세션 rebase 복구 구현
+- [x] 최신 base 고정 verify·Review 반복과 Merge/Close race 처리 구현
+- [x] 기존 PR branch 전용 lease push와 원격 확인 구현
+- [x] 중단 재개, 외부 head 변경과 source checkout 불변 회귀 테스트 추가
 
 ## Decision Log
 
