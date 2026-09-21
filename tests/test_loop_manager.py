@@ -750,6 +750,45 @@ class PlannerFutureIdeasTest(unittest.TestCase):
                     [existing.relative_to(repo).as_posix()],
                 )
 
+    def test_validation_rejects_future_idea_promoted_to_new_execplan(self):
+        for existing_future_idea in (False, True):
+            with self.subTest(
+                existing_future_idea=existing_future_idea
+            ), tempfile.TemporaryDirectory() as directory:
+                repo = make_remote_repository(directory)
+                (repo / "docs/plans").mkdir()
+                future_ideas = repo / "docs/FUTURE_IDEAS.md"
+                if existing_future_idea:
+                    future_ideas.write_text(
+                        "# Future Ideas\n\n- Speculative deployment dashboard\n",
+                        encoding="utf-8",
+                    )
+                    commit_and_push(repo, "Add deferred idea")
+                active_sha = git_command(repo, "rev-parse", "HEAD")
+                if not existing_future_idea:
+                    future_ideas.write_text(
+                        "# Future Ideas\n\n- Speculative deployment dashboard\n",
+                        encoding="utf-8",
+                    )
+                plan = write_execplan(
+                    repo,
+                    "G-001",
+                    "Speculative deployment dashboard",
+                )
+                changed = [plan.relative_to(repo).as_posix()]
+                if not existing_future_idea:
+                    changed.append(future_ideas.relative_to(repo).as_posix())
+
+                with self.assertRaisesRegex(
+                    loop_manager.PlannerValidationError,
+                    "FUTURE_IDEAS.*같은 계획 주기",
+                ):
+                    loop_manager.validate_planner_result(
+                        repo,
+                        active_sha,
+                        changed,
+                    )
+
     def test_future_ideas_publish_with_and_without_execplans(self):
         for with_plan in (False, True):
             with self.subTest(with_plan=with_plan), tempfile.TemporaryDirectory() as directory:

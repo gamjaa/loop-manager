@@ -1360,6 +1360,54 @@ class ValidatedPlanningResult:
     publication_paths: tuple[str, ...]
 
 
+_FUTURE_IDEA_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.+?)\s*$")
+
+
+def _normalized_idea_text(text: str) -> str:
+    return " ".join(re.findall(r"[0-9a-zA-Z가-힣]+", text.casefold()))
+
+
+def _future_idea_items(worktree: Path) -> tuple[str, ...]:
+    path = worktree / "docs/FUTURE_IDEAS.md"
+    if not path.is_file():
+        return ()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise RuntimeError("Planner FUTURE_IDEAS를 읽을 수 없습니다.") from error
+
+    items: list[str] = []
+    for line in text.splitlines():
+        match = _FUTURE_IDEA_ITEM.fullmatch(line)
+        if match is None:
+            continue
+        item = re.sub(r"^\[[ xX]\]\s*", "", match.group(1)).strip()
+        normalized = _normalized_idea_text(item)
+        if normalized:
+            items.append(normalized)
+    return tuple(items)
+
+
+def _validate_future_idea_separation(
+    worktree: Path,
+    plan_paths: list[str],
+) -> None:
+    future_ideas = _future_idea_items(worktree)
+    if not future_ideas:
+        return
+    for plan_path in plan_paths:
+        try:
+            plan_text = (worktree / plan_path).read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise RuntimeError(f"Planner ExecPlan을 읽을 수 없습니다: {plan_path}") from error
+        normalized_plan = _normalized_idea_text(plan_text)
+        if any(idea in normalized_plan for idea in future_ideas):
+            raise RuntimeError(
+                "docs/FUTURE_IDEAS.md 항목을 같은 계획 주기의 새 ExecPlan에 "
+                f"포함할 수 없습니다: {plan_path}"
+            )
+
+
 def validate_planner_result(
     worktree: Path,
     active_sha: str,
@@ -1417,6 +1465,7 @@ def validate_planner_result(
                 allow_archive_fallback=False,
             )
             plans.append((plan_path, parsed))
+        _validate_future_idea_separation(worktree, plan_paths)
         new_ids = {str(plan["id"]) for _, plan in plans}
         existing_ids = [int(plan_id[2:]) for plan_id in catalog if plan_id not in new_ids]
         first_id = max(existing_ids, default=0) + 1
@@ -8394,6 +8443,7 @@ catalog가 이미 충족하는 작업이나 코드·테스트에 이미 구현�
 catalog에서 현재 입력과 겹치는 비종료 계획만 필요할 때 전문을 읽고, 기존 docs/plans 전체를 기본 입력으로 읽지 마라.
 새 ExecPlan마다 priority를 기록하고, 기존 ExecPlan을 수정·삭제하지 말며 docs/plans 바로 아래에 새 파일만 작성하라.
 현재 PRODUCT/Requirement 범위 밖이지만 보존 가치가 있는 아이디어는 같은 계획 주기의 ExecPlan 범위나 미충족 작업의 근거로 사용하지 말고 docs/FUTURE_IDEAS.md에만 분리해 기록하라.
+docs/FUTURE_IDEAS.md의 목록 항목과 같은 내용을 새 ExecPlan의 제목이나 본문에 반복하지 마라.
 docs/FUTURE_IDEAS.md는 새 ExecPlan과 함께 생성·수정할 수 있지만, 그 밖의 기존 파일은 수정하지 마라.
 구현, 테스트, commit, push와 PR 생성은 하지 마라. 추가 계획이 필요 없으면 파일을 변경하지 마라.
 {failure}
