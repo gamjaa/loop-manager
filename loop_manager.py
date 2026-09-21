@@ -48,6 +48,7 @@ ROOT = Path(__file__).resolve().parent
 MAX_PLANNER_VALIDATION_RETRIES = 3
 MAX_VALIDATION_FINGERPRINT_REPEATS = 3
 MAX_TRANSIENT_AGENT_RETRIES = 3
+MAX_REVIEWER_PROTOCOL_ATTEMPTS = 3
 AGENT_CLI_TIMEOUT_SECONDS = 3600
 PROJECT_STEP_RETRY = 2
 PROJECT_STEP_TRANSIENT_PAUSE = 3
@@ -3679,12 +3680,39 @@ _REVIEW_ISSUE_ID = re.compile(
     r"(?mi)^[ \t]*ISSUE_ID:[ \t]*(?P<identifier>[^\r\n]+?)[ \t]*$"
 )
 _REVIEW_ISSUE_DECLARATION = re.compile(r"(?i)^[ \t]*ISSUE_ID\b")
-_REVIEW_ISSUE_IDENTIFIER = re.compile(
-    r"(?i)^(?!/)(?!.*(?:^|/)\.\.(?:/|$))"
-    r"[a-z0-9_.\-/]+::[a-z0-9_.<>/-]+::[a-z0-9][a-z0-9-]*$"
-)
+_REVIEW_ISSUE_SYMBOL = re.compile(r"(?i)^[a-z0-9_.<>/-]+$")
+_REVIEW_ISSUE_CATEGORY = re.compile(r"(?i)^[a-z0-9][a-z0-9-]*$")
 _REVIEW_VERDICT_DECLARATION = re.compile(r"(?i)^[ \t]*VERDICT\b")
 _REVIEW_VERDICT = re.compile(r"(?i)^[ \t]*VERDICT:[ \t]*(PASS|FAIL)[ \t]*$")
+
+
+def _valid_review_issue_path(path: str) -> bool:
+    if (
+        not path
+        or path != path.strip()
+        or path.startswith("/")
+        or "\\" in path
+        or ":" in path
+        or not path.isprintable()
+    ):
+        return False
+    parts = path.split("/")
+    return all(
+        part and part == part.strip() and part not in {".", ".."}
+        for part in parts
+    )
+
+
+def _valid_review_issue_identifier(identifier: str) -> bool:
+    components = identifier.split("::")
+    if len(components) != 3:
+        return False
+    path, symbol, category = components
+    return (
+        _valid_review_issue_path(path)
+        and _REVIEW_ISSUE_SYMBOL.fullmatch(symbol) is not None
+        and _REVIEW_ISSUE_CATEGORY.fullmatch(category) is not None
+    )
 
 
 def _normalize_review_issue_ids(output: str) -> tuple[str, ...]:
@@ -3704,11 +3732,11 @@ def _normalize_review_issue_ids(output: str) -> tuple[str, ...]:
             "Reviewer FAIL 결과의 ISSUE_ID 형식이 유효하지 않습니다."
         )
     raw_identifiers = [
-        " ".join(match.group("identifier").split()).casefold()
+        match.group("identifier").strip().casefold()
         for match in matches
     ]
     if any(
-        _REVIEW_ISSUE_IDENTIFIER.fullmatch(identifier) is None
+        not _valid_review_issue_identifier(identifier)
         for identifier in raw_identifiers
     ):
         raise ReviewerProtocolError(
@@ -10414,6 +10442,7 @@ def reviewer_prompt(
     review_result: str | None = None,
     *,
     session_recovery: bool = False,
+    protocol_error: str | None = None,
 ) -> str:
     worker_evidence = (worker_result or "Worker가 targeted unit test 결과 또는 미실행 사유를 보고하지 않았습니다.")[-6000:]
     verify_evidence = (verify_result or "Loop Manager 전체 verify가 성공했습니다(출력 없음).")[-6000:]
@@ -10424,6 +10453,15 @@ def reviewer_prompt(
             "아래 이전 Review 결과를 포함해 현재 diff를 다시 검토하라:\n"
             f"{(review_result or '이전 Review 결과 없음')[-6000:]}\n"
         )
+    correction = ""
+    if protocol_error:
+        correction = (
+            "\n직전 Reviewer 결과가 아래 프로토콜 검증에 실패했다:\n"
+            f"{protocol_error}\n"
+            "직전 결과:\n"
+            f"{(review_result or '직전 Review 결과 없음')[-6000:]}\n"
+            "검토 판단은 유지하되 아래 출력 계약에 맞춘 전체 결과만 다시 응답하라.\n"
+        )
     return f"""
 origin/{base}와 현재 HEAD의 차이를 읽기 전용으로 검토하라.
 AGENTS.md, 근거 PRODUCT/Requirement, ARCHITECTURE와 ExecPlan을 기준으로 correctness, 회귀, 테스트 누락, verify 약화를 확인하라.
@@ -10433,8 +10471,10 @@ Worker가 보고한 targeted unit test 결과 또는 미실행 사유:
 Loop Manager가 실행한 전체 verify 결과:
 {verify_evidence}
 {recovery}
+{correction}
 테스트 command와 scripts/verify를 실행하지 말고, 코드·테스트·verify 스크립트의 diff 및 위 결과만으로 판단하라.
 blocking issue마다 설명 직전에 `ISSUE_ID: relative/path::stable-symbol-or-test::category-slug`를 한 줄로 기록하라.
+relative/path는 `/`로 구분한 실제 저장소 상대 경로이며 공백과 대괄호를 허용하지만, 절대 경로·빈 구성요소·`.`·`..`·역슬래시·colon·제어문자는 허용하지 않는다.
 ISSUE_ID에는 줄 번호나 자연어 설명을 넣지 말고, 같은 issue가 재발하면 위치·표현이 바뀌어도 이전과 정확히 같은 ID를 사용하라.
 `VERDICT: FAIL`은 하나 이상의 ISSUE_ID가 있어야 하며, 서로 다른 issue는 서로 다른 ID를 사용하라.
 blocking issue가 있으면 간결히 설명하고 마지막 줄을 `VERDICT: FAIL`로 끝내라.
@@ -12041,107 +12081,139 @@ def _run_project_step(
 
     row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
     if row["phase"] == "REVIEWING":
-        operation_log(f"Reviewer 시작: {plan['id']} {plan['title']}")
-        reviewer_scope_before = begin_agent_scope(
-            connection,
-            repo,
-            worktree,
-            "reviewer",
-            input_fingerprint=_worktree_execplan_input_fingerprint(
-                worktree, catalog_plan
-            ),
-        )
-
-        review_result = run_agent_with_retries(
-            lambda current_session_id, session_recovery: run_agent(
-                provider,
+        protocol_error: str | None = None
+        verdict: str | None = None
+        review = ""
+        for protocol_attempt in range(1, MAX_REVIEWER_PROTOCOL_ATTEMPTS + 1):
+            if protocol_attempt == 1:
+                operation_log(f"Reviewer 시작: {plan['id']} {plan['title']}")
+            else:
+                operation_log(
+                    f"Reviewer 프로토콜 교정 재시도: {plan['id']} "
+                    f"{plan['title']} ({protocol_attempt}/"
+                    f"{MAX_REVIEWER_PROTOCOL_ATTEMPTS})"
+                )
+            reviewer_scope_before = begin_agent_scope(
+                connection,
+                repo,
                 worktree,
-                state_dir,
-                config_path,
                 "reviewer",
-                reviewer_prompt(
-                    base,
-                    row["worker_result"],
-                    row["verify_result"],
-                    row["review_result"],
-                    session_recovery=session_recovery,
+                input_fingerprint=_worktree_execplan_input_fingerprint(
+                    worktree, catalog_plan
                 ),
-                read_only=True,
-                persist_session=True,
-                session_id=current_session_id,
-                on_session_started=lambda started_session_id: update_project(
+            )
+
+            review_result = run_agent_with_retries(
+                lambda current_session_id, session_recovery: run_agent(
+                    provider,
+                    worktree,
+                    state_dir,
+                    config_path,
+                    "reviewer",
+                    reviewer_prompt(
+                        base,
+                        row["worker_result"],
+                        row["verify_result"],
+                        row["review_result"],
+                        session_recovery=session_recovery,
+                        protocol_error=protocol_error,
+                    ),
+                    read_only=True,
+                    persist_session=True,
+                    session_id=current_session_id,
+                    on_session_started=lambda started_session_id: update_project(
+                        connection,
+                        repo,
+                        reviewer_session_id=started_session_id,
+                    ),
+                ),
+                session_id=row["reviewer_session_id"],
+            )
+            code, review = review_result
+            if review_result.session_id:
+                update_project(
                     connection,
                     repo,
-                    reviewer_session_id=started_session_id,
-                ),
-            ),
-            session_id=row["reviewer_session_id"],
-        )
-        code, review = review_result
-        if review_result.session_id:
-            update_project(
-                connection,
-                repo,
-                reviewer_session_id=review_result.session_id,
-            )
-        try:
-            reviewer_scope_after = capture_git_snapshot(worktree)
-            validate_agent_scope(
-                "reviewer",
-                worktree,
-                reviewer_scope_before,
-                reviewer_scope_after,
-                external_worktree=repo_path,
-                base_branch=base,
-            )
-            validate_managed_worktree(repo_path, worktree, branch)
-        except (AgentScopeError, WorkspaceOwnershipError, RuntimeError) as error:
-            scope_error = str(error)
-            block_active_execplan(
-                connection,
-                repo,
-                worktree,
-                scope_error,
-                str(row["verify_result"] or ""),
-            )
-            operation_print(scope_error, file=sys.stderr)
-            return 1
-        clear_agent_scope(connection, repo)
+                    reviewer_session_id=review_result.session_id,
+                )
+            try:
+                reviewer_scope_after = capture_git_snapshot(worktree)
+                validate_agent_scope(
+                    "reviewer",
+                    worktree,
+                    reviewer_scope_before,
+                    reviewer_scope_after,
+                    external_worktree=repo_path,
+                    base_branch=base,
+                )
+                validate_managed_worktree(repo_path, worktree, branch)
+            except (AgentScopeError, WorkspaceOwnershipError, RuntimeError) as error:
+                scope_error = str(error)
+                block_active_execplan(
+                    connection,
+                    repo,
+                    worktree,
+                    scope_error,
+                    str(row["verify_result"] or ""),
+                )
+                operation_print(scope_error, file=sys.stderr)
+                return 1
+            clear_agent_scope(connection, repo)
 
-        if code:
-            reviewer_error = review or f"Reviewer 종료 코드 {code}"
-            if review_result.result_kind is AgentResultKind.TRANSIENT_FAILURE:
-                reviewer_error = f"{TRANSIENT_AGENT_ERROR_PREFIX} {reviewer_error}"
-                step_result = PROJECT_STEP_TRANSIENT_PAUSE
-            elif review_result.result_kind is AgentResultKind.USAGE_LIMIT:
-                reviewer_error = f"{USAGE_LIMIT_ERROR_PREFIX} {reviewer_error}"
-                step_result = PROJECT_STEP_USAGE_PAUSE
-            else:
-                step_result = 1
-            update_project(
-                connection,
-                repo,
-                phase="REVIEWING",
-                last_error=reviewer_error,
-                review_result=review,
-            )
-            operation_print(reviewer_error, file=sys.stderr)
-            return step_result
+            if code:
+                reviewer_error = review or f"Reviewer 종료 코드 {code}"
+                if review_result.result_kind is AgentResultKind.TRANSIENT_FAILURE:
+                    reviewer_error = f"{TRANSIENT_AGENT_ERROR_PREFIX} {reviewer_error}"
+                    step_result = PROJECT_STEP_TRANSIENT_PAUSE
+                elif review_result.result_kind is AgentResultKind.USAGE_LIMIT:
+                    reviewer_error = f"{USAGE_LIMIT_ERROR_PREFIX} {reviewer_error}"
+                    step_result = PROJECT_STEP_USAGE_PAUSE
+                else:
+                    step_result = 1
+                update_project(
+                    connection,
+                    repo,
+                    phase="REVIEWING",
+                    last_error=reviewer_error,
+                    review_result=review,
+                )
+                operation_print(reviewer_error, file=sys.stderr)
+                return step_result
 
-        try:
-            verdict, _issue_ids = parse_reviewer_result(review)
-        except ReviewerProtocolError as error:
-            reviewer_error = f"Reviewer 결과 프로토콜 오류: {error}"
-            update_project(
-                connection,
-                repo,
-                phase="REVIEWING",
-                last_error=reviewer_error,
-                review_result=review,
-            )
-            operation_print(reviewer_error, file=sys.stderr)
-            return 1
+            try:
+                verdict, _issue_ids = parse_reviewer_result(review)
+            except ReviewerProtocolError as error:
+                protocol_error = str(error)
+                reviewer_error = f"Reviewer 결과 프로토콜 오류: {protocol_error}"
+                update_project(
+                    connection,
+                    repo,
+                    phase="REVIEWING",
+                    last_error=reviewer_error,
+                    review_result=review,
+                )
+                if protocol_attempt == MAX_REVIEWER_PROTOCOL_ATTEMPTS:
+                    exhausted_error = (
+                        f"{reviewer_error} "
+                        f"(프로토콜 교정 {MAX_REVIEWER_PROTOCOL_ATTEMPTS}회 실패)"
+                    )
+                    block_active_execplan(
+                        connection,
+                        repo,
+                        worktree,
+                        exhausted_error,
+                        str(row["verify_result"] or ""),
+                    )
+                    operation_print(exhausted_error, file=sys.stderr)
+                    return 1
+                operation_print(reviewer_error, file=sys.stderr)
+                row = connection.execute(
+                    "SELECT * FROM projects WHERE repo = ?", (repo,)
+                ).fetchone()
+                continue
+            break
 
+        assert verdict is not None
         if verdict == "FAIL":
             decision = transition_validation_failure(
                 connection,
