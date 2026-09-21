@@ -5547,6 +5547,32 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     selected_plan_path=plan_path,
                 )
 
+    def test_auto_merge_tree_ref_alone_is_not_an_active_operation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, plan_path = self._repository_with_plan(directory)
+            before = loop_manager.capture_git_snapshot(repo)
+            auto_merge = Path(
+                git_command(repo, "rev-parse", "--git-path", "AUTO_MERGE")
+            )
+            if not auto_merge.is_absolute():
+                auto_merge = repo / auto_merge
+            auto_merge.write_text(
+                git_command(repo, "write-tree") + "\n",
+                encoding="ascii",
+            )
+
+            after = loop_manager.capture_git_snapshot(repo)
+
+            self.assertTrue(auto_merge.is_file())
+            self.assertNotIn("AUTO_MERGE", after.operations)
+            loop_manager.validate_agent_scope(
+                "worker",
+                repo,
+                before,
+                after,
+                selected_plan_path=plan_path,
+            )
+
     def test_shared_git_metadata_changes_are_rejected(self):
         scenarios = (
             (

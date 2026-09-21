@@ -4006,11 +4006,14 @@ def _config_entries(worktree: Path) -> dict[str, tuple[str, ...]]:
     }
 
 
+# AUTO_MERGE is deliberately excluded. The ort strategy may leave this
+# auxiliary tree ref behind after a conflicted operation has completed, so it
+# does not prove that a Git operation is still active. Controlling markers such
+# as MERGE_HEAD and the rebase directories remain protected below.
 _GIT_OPERATION_PATHS = (
     "MERGE_HEAD",
     "MERGE_MODE",
     "MERGE_MSG",
-    "AUTO_MERGE",
     "CHERRY_PICK_HEAD",
     "REVERT_HEAD",
     "REBASE_HEAD",

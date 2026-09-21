@@ -70,6 +70,7 @@ SQLite 손실이나 손상에서의 자동 상태 재구성은 지원하지 않�
 - `docs/ARCHITECTURE.md`: 제품 동작을 보장하는 프로젝트별 기술 설계
 - `docs/PLANS.md`: 모든 프로젝트가 공유하는 ExecPlan 형식
 - `docs/plans/*.md`: Planner가 작성한 구현 계획
+- `docs/FUTURE_IDEAS.md`: 현재 PRODUCT/Requirement 범위 밖이지만 보존 가치가 있는 아이디어. Planner 입력이나 실행 상태로 사용하지 않는다
 - `.agents/skills/specification-docs/SKILL.md`: 자동 Loop와 분리된 대화형 문서 작성 도구
 
 Requirement는 frontmatter나 상태 없이 순수 Markdown 문서로 유지한다. `docs/requirements/` 바로 아래의 모든 `*.md`를 활성 Planner 입력으로 사용하고 `archive/`는 읽지 않는다. 파일의 프로젝트 상대 경로를 Requirement 식별자로 사용한다.
@@ -114,7 +115,7 @@ SQLite에는 등록 프로젝트, 기준 branch, 선택한 provider, 등록 시 
 - `docs/PRODUCT.md`
 - `docs/requirements/` 바로 아래의 `*.md`
 - `docs/ARCHITECTURE.md`
-- archive와 `docs/plans/`를 제외한 소스, 테스트와 설정 파일
+- archive, `docs/plans/`와 `docs/FUTURE_IDEAS.md`를 제외한 소스, 테스트와 설정 파일
 
 Planner가 추가 ExecPlan이 필요 없다고 판단하면 현재 지문을 저장한다. 지문이 같고 새로 MERGED된 ExecPlan도 없으면 Planner를 다시 실행하지 않는다. Requirement archive 이동만으로는 새 작업 주기나 프로젝트 완료 알림을 활성화하지 않는다.
 
@@ -147,16 +148,16 @@ runtime 경로가 존재하지만 소유권, repository, detached HEAD, SHA 또�
 ExecPlan 하나의 실행 흐름은 다음과 같다.
 
 1. 실행 중인 작업이 없고 계획 입력이 변경됐으면 READY ExecPlan의 존재와 관계없이 `<state-dir>/worktrees/<project-id>/planning/<input-fingerprint>/`에 `origin/<base-branch>` 기준의 detached planning worktree를 만든다
-2. 프로그램이 비종료 ExecPlan의 compact catalog를 만들고, Planner가 이를 현재 입력 및 관련 코드·테스트와 대조해 식별 가능한 미충족 작업 전체를 독립적인 ExecPlan으로 나누어 priority와 `depends_on`을 포함해 일괄 작성한다
-3. 프로그램이 Planner의 변경 범위, ExecPlan 메타데이터와 의존성 그래프를 코드로 검증한다
+2. 프로그램이 비종료 ExecPlan의 compact catalog를 만들고, Planner가 이를 현재 입력 및 관련 코드·테스트와 대조해 식별 가능한 미충족 작업 전체를 독립적인 새 ExecPlan으로 나누어 priority와 `depends_on`을 포함해 일괄 작성한다. 현재 범위 밖의 보존 가치가 있는 아이디어는 같은 계획 주기의 ExecPlan으로 만들지 않고 `docs/FUTURE_IDEAS.md`에 분리할 수 있다
+3. 프로그램이 Planner 변경을 새 ExecPlan과 선택적인 `docs/FUTURE_IDEAS.md` 변경으로 분리한다. 다른 경로, 기존 ExecPlan 변경·삭제 또는 범위 밖 아이디어를 현재 ExecPlan에 포함한 결과는 거부하고, 새 ExecPlan만 메타데이터와 의존성 그래프 검증 및 SQLite 등록 대상으로 사용한다
 4. 검증에 실패하면 오류를 같은 Planner 세션에 전달하고 최대 3회까지 수정과 재검증을 수행한다
 5. 계속 실패하면 원인과 계획 입력 지문을 프로젝트의 `planning_error`에 저장하고 planning worktree와 세션을 보존한 뒤 처리를 중단한다
 6. 같은 지문에서는 Planner를 다시 실행하지 않는다. 계획 입력 지문이 바뀌면 검증 오류와 diff를 로그에 보존하고, Planner만 수정할 수 있었던 이전 planning worktree를 제거한 뒤 `planning_error`를 지우고 새 지문의 planning worktree에서 다시 시작한다
-7. 추가 계획이 없으면 `planning_error`를 지우고 입력 지문을 저장한 뒤 planning worktree를 제거한다
-8. 유효한 ExecPlan을 planning worktree에서 하나의 계획 commit으로 만든다
+7. 새 ExecPlan과 `docs/FUTURE_IDEAS.md` 변경이 모두 없으면 `planning_error`를 지우고 입력 지문을 저장한 뒤 planning worktree를 제거한다
+8. 유효한 새 ExecPlan과 `docs/FUTURE_IDEAS.md` 변경을 planning worktree에서 하나의 planning commit으로 만든다. FUTURE_IDEAS만 변경된 결과는 ExecPlan이나 SQLite 실행 상태를 만들지 않는다
 9. `git fetch` 후 `origin/<base-branch>`가 planning worktree의 시작 commit과 다르면 계획 commit을 rebase하지 않고 planning worktree를 정리한 뒤 최신 기준으로 다시 계획한다
 10. 기준이 그대로면 계획 commit을 `origin/<base-branch>`에 fast-forward push한다. force push는 사용하지 않는다
-11. push된 commit을 원격에서 확인한 뒤에만 각 ExecPlan을 SQLite에 READY 상태로 등록하고 `planning_error`를 지운다. push 후 SQLite 기록 전에 중단된 경우 원격의 ExecPlan을 다시 파싱해 복구한다
+11. push된 commit을 원격에서 확인한 뒤에만 새 ExecPlan을 SQLite에 READY 상태로 등록하고 `planning_error`를 지운다. `docs/FUTURE_IDEAS.md`는 등록·파싱 대상에서 제외한다. push 후 SQLite 기록 전에 중단된 경우 원격의 새 ExecPlan을 다시 파싱해 복구한다
 12. planning worktree를 제거한다
 13. 모든 `depends_on`이 MERGED인 READY ExecPlan 중 priority가 가장 높은 계획을 선택하고, 같은 priority에서는 숫자 ID가 가장 작은 계획을 선택한다
 14. 갱신된 `origin/<base-branch>`에서 `loop-manager/<execplan-id>` branch와 `<state-dir>/worktrees/<project-id>/<execplan-id>/` worktree를 만든다
@@ -193,10 +194,10 @@ ExecPlan 파일은 구현 PR에 처음 포함하지 않는다. Planner 단계에
 - Planner, Worker와 Reviewer prompt는 Loop Manager에 내장한다
 - 프로젝트별 prompt 재정의는 지원하지 않는다
 - 프로그램은 전체 ExecPlan을 코드로 파싱하되 Planner에게는 비종료 계획의 ID, 제목, 상태, sources, depends_on과 priority만 compact catalog로 전달한다
-- Planner는 PRODUCT, 활성 Requirement, ARCHITECTURE, 관련 코드·테스트와 비종료 ExecPlan compact catalog를 읽고 현재 식별 가능한 미충족 작업 전체를 한 계획 주기에 작성한다
+- Planner는 PRODUCT, 활성 Requirement, ARCHITECTURE, 관련 코드·테스트와 비종료 ExecPlan compact catalog를 읽고 현재 식별 가능한 미충족 작업 전체를 한 계획 주기에 새 ExecPlan으로 작성하며, 범위 밖의 보존 가치가 있는 아이디어는 `docs/FUTURE_IDEAS.md`에 분리한다
 - Planner는 MERGED ExecPlan 메타데이터와 본문을 기본 입력으로 받거나 읽지 않는다. 프로그램만 ID 고유성, 번호 할당, 의존성 충족과 감사 이력을 위해 이를 유지한다
 - Planner는 안전한 무인 실행 차단과 반복적인 사용자 복구 제거를 최우선으로 priority를 정하고, 정상 경로 자동화, 그 밖의 Current Goal, 선택적 편의와 최적화 순으로 계획한다
-- Planner는 `docs/plans/*.md`만 생성하거나 수정할 수 있으며 프로그램이 실행 전후 diff로 범위를 검증한다
+- Planner는 새 `docs/plans/*.md`를 생성하고 `docs/FUTURE_IDEAS.md`를 생성하거나 수정할 수 있다. 기존 ExecPlan과 그 밖의 파일은 변경할 수 없으며 프로그램이 실행 전후 diff로 범위를 검증한다
 - Worker는 ExecPlan을 구현하고 관련 unit test와 전체 검증 스크립트를 작성하거나 갱신한다. 장기 제품 규칙이 바뀔 때만 PRODUCT를, 진행 기록이 필요할 때만 선택된 ExecPlan을 수정할 수 있으며 범위 밖 아이디어는 FUTURE_IDEAS에 기록할 수 있다
 - Worker는 수정한 코드와 새로 작성하거나 변경한 테스트를 직접 검증하는 최소 범위의 targeted unit test만 실행한다. 실패하면 같은 세션에서 수정하고 해당 테스트를 다시 실행하며, 실행 가능한 관련 unit test가 없으면 그 사유를 결과에 포함한다
 - Worker는 전체 test suite, integration test, end-to-end test, 프로젝트 전체 lint·build·type check와 전체 검증 스크립트를 직접 실행하지 않는다
@@ -285,7 +286,7 @@ BLOCKED → PR_OPEN
 ## GitHub와 PR
 
 - branch, commit, push와 PR 생성은 프로그램 코드가 수행한다
-- Planner의 검증된 계획 commit은 `origin/<base-branch>`에 fast-forward push하며 별도 PR을 만들지 않는다
+- Planner의 검증된 새 ExecPlan과 `docs/FUTURE_IDEAS.md` 변경은 하나의 planning commit으로 `origin/<base-branch>`에 fast-forward push하며 별도 PR을 만들지 않는다
 - 하나의 ExecPlan에는 하나의 결정적 branch와 하나의 PR만 연결한다
 - PR 생성 전 같은 head branch의 Open, Closed 또는 Merged PR을 조회하고 기존 PR이 있으면 SQLite에 연결한다
 - PR 생성 직후 SQLite 기록 전에 중단돼도 다음 실행에서 기존 PR을 찾아 복구하며 중복 PR을 만들지 않는다

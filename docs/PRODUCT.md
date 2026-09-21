@@ -50,8 +50,9 @@
 - 미충족 PRODUCT 또는 Requirement에 근거해서만 ExecPlan을 작성한다
 - 계획 입력이 변경되면 다음 Worker를 시작하기 전에 현재 입력에서 식별 가능한 모든 미충족 작업을 하나의 계획 주기에 ExecPlan으로 작성한다
 - 실행 중인 작업은 새 계획으로 선점하지 않으며, 실행 가능한 READY ExecPlan은 안전한 무인 자동화를 막는 작업을 우선하는 결정적 순서로 선택한다
-- Planner는 최신 `origin/<base-branch>` 기준의 detached planning worktree에서 ExecPlan만 작성한다
-- 검증된 ExecPlan은 구현을 시작하기 전에 commit하고 `origin/<base-branch>`에 fast-forward push한다
+- Planner는 최신 `origin/<base-branch>` 기준의 detached planning worktree에서 새 ExecPlan을 작성하고, 현재 PRODUCT/Requirement 범위 밖이지만 보존 가치가 있는 아이디어만 `docs/FUTURE_IDEAS.md`에 생성하거나 수정한다. 기존 ExecPlan과 그 밖의 파일은 변경하지 않는다
+- `docs/FUTURE_IDEAS.md`는 Planner 입력이나 실행 상태가 아니며, 항목을 같은 계획 주기의 ExecPlan 범위로 사용하거나 Requirement·ExecPlan으로 자동 승격하지 않는다
+- 검증된 새 ExecPlan과 `docs/FUTURE_IDEAS.md` 변경은 하나의 planning commit으로 만들고 `origin/<base-branch>`에 fast-forward push한다. FUTURE_IDEAS만 변경된 결과는 ExecPlan이나 SQLite 실행 상태를 만들지 않는다
 - 같은 프로젝트에는 여러 READY ExecPlan을 등록할 수 있지만 동시에 하나의 ExecPlan만 실행한다
 - ExecPlan은 모든 `depends_on`의 PR이 실제로 Merge된 뒤에만 시작한다
 - 각 ExecPlan은 하나의 결정적 branch, 별도 worktree와 하나의 PR을 사용한다
@@ -127,15 +128,15 @@
 4. 실행 중인 작업이 없고 계획 입력이 변경됐으면 READY ExecPlan의 존재와 관계없이 최신 원격 기준 branch에서 임시 planning worktree를 만든다
 5. 계획 입력이 변경되지 않았고 대기 중인 READY ExecPlan이 있으면 계획 생성을 건너뛰고 실행 가능한 계획 선택으로 이동한다
 6. Planner가 PRODUCT, Requirement, ARCHITECTURE, 현재 코드와 기존 ExecPlan을 확인한다
-7. 추가 작업이 없으면 계획 입력 지문을 저장하고 planning worktree를 정리한 뒤 프로젝트 완료 여부를 확인한다
-8. 작업이 필요하면 Planner가 현재 입력에서 식별 가능한 미충족 작업 전체를 독립적으로 검증·Merge할 수 있는 ExecPlan으로 나누어 planning worktree의 `docs/plans/`에 일괄 작성하고, 의존성과 제품 우선순위를 기록한다
-9. 프로그램이 Planner의 변경 범위, ExecPlan 메타데이터와 `depends_on`을 코드로 검증한다
+7. 새 ExecPlan과 `docs/FUTURE_IDEAS.md` 변경이 모두 없으면 계획 입력 지문을 저장하고 planning worktree를 정리한 뒤 프로젝트 완료 여부를 확인한다
+8. 작업이 필요하면 Planner가 현재 입력에서 식별 가능한 미충족 작업 전체를 독립적으로 검증·Merge할 수 있는 새 ExecPlan으로 나누어 planning worktree의 `docs/plans/`에 일괄 작성하고, 의존성과 제품 우선순위를 기록한다. 현재 범위 밖의 보존 가치가 있는 아이디어는 같은 계획 주기의 ExecPlan으로 만들지 않고 `docs/FUTURE_IDEAS.md`에 분리한다
+9. 프로그램이 Planner의 변경 범위와 FUTURE_IDEAS 분리 여부를 검증하고, 새 ExecPlan만 메타데이터와 `depends_on` 검증 대상으로 사용한다
 10. 검증 실패 내용을 같은 Planner 세션에 전달하고 최대 3회까지 수정을 요청한다
 11. 3회 후에도 유효하지 않으면 프로젝트의 `planning_error`에 원인과 계획 입력 지문을 저장하고 처리를 중단한다
-12. 유효한 ExecPlan을 planning worktree에서 commit한다
+12. 유효한 새 ExecPlan과 `docs/FUTURE_IDEAS.md` 변경을 planning worktree에서 하나의 planning commit으로 만든다
 13. 계획 commit이 아직 원격에 없는데 `origin/<base-branch>`가 계획 기준 이후 바뀌었으면 planning worktree를 정리하고 최신 기준으로 다시 계획한다
 14. 기준이 그대로면 계획 commit을 `origin/<base-branch>`에 fast-forward push한다
-15. push된 commit을 확인한 뒤에만 각 ExecPlan을 SQLite에 READY 상태로 등록하고 planning worktree와 기존 `planning_error`를 정리한다
+15. push된 commit을 확인한 뒤에만 새 ExecPlan을 SQLite에 READY 상태로 등록하고 planning worktree와 기존 `planning_error`를 정리한다. FUTURE_IDEAS 변경만으로는 실행 상태를 만들지 않는다
 16. 모든 `depends_on`이 MERGED인 READY ExecPlan 중 제품 우선순위가 가장 높은 계획 하나를 결정적으로 선택한다
 17. 갱신된 `origin/<base-branch>`에서 해당 ExecPlan 전용 branch와 worktree를 생성하거나 기존 작업 공간을 복구한다
 18. 프로그램이 complexity와 risk로 최초 Worker level 1~7을 계산하고 저장된 effective level의 Model과 Effort를 선택한다
@@ -272,6 +273,7 @@ BLOCKED → PR_OPEN (같은 PR을 사용자가 다시 열음)
 - `docs/REQUIREMENT.template.md`와 `docs/requirements/archive/`는 Planner 입력에서 제외한다
 - ExecPlan의 `sources`에는 근거가 된 PRODUCT 또는 Requirement 경로가 있어야 한다
 - 계획 입력이 변경되면 Planner는 실행 중인 작업이 없는 다음 선택 시점에 READY ExecPlan의 존재와 관계없이 비종료 ExecPlan compact catalog를 확인하고, 현재 코드·테스트와 활성 제품 입력에서 식별 가능한 미충족 작업을 한 번에 모두 계획한다
+- `docs/FUTURE_IDEAS.md`는 계획 입력 지문, 활성 Requirement와 프로젝트 완료 판정에서 제외하며 그 항목을 자동으로 Requirement 또는 ExecPlan으로 승격하지 않는다
 - MERGED ExecPlan은 Planner 입력에서 제외하며 프로그램만 ID 고유성, 의존성 충족과 감사 이력을 위해 관리한다
 - ExecPlan의 `depends_on`은 선행 ExecPlan ID 목록이며, 모든 선행 상태가 MERGED여야 Worker를 시작할 수 있다
 - Worker는 장기 제품 규칙이 바뀌는 경우에만 코드와 같은 PR에서 `PRODUCT.md`를 갱신한다
