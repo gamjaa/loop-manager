@@ -364,6 +364,25 @@ class MaintenancePlanningTest(unittest.TestCase):
                 frontmatter_only_reason,
             )
 
+        for negated_reason in (
+            "There is no security risk and automatic execution is not blocked.",
+            "security risk가 없고 automatic execution도 blocked되지 않는다.",
+            "Repeated manual recovery is not required and data loss is impossible.",
+            "Automatic execution remains unblocked with zero data loss.",
+            "The security risk is nonexistent.",
+        ):
+            with self.subTest(reason=negated_reason), self.assertRaisesRegex(
+                loop_manager.MaintenancePlanningError, "상향된.*priority"
+            ):
+                loop_manager.validate_refactoring_plan(
+                    "docs/plans/[G-002] Extract Boundary.md",
+                    parsed,
+                    frontmatter_only_reason.replace(
+                        "- Keep the change structural.",
+                        f"- {negated_reason}",
+                    ),
+                )
+
         body_reason = frontmatter_only_reason.replace(
             "A concrete structural responsibility problem",
             "Repeated manual recovery reveals a structural responsibility problem",

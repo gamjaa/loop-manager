@@ -72,11 +72,49 @@ _SECTION = re.compile(r"^##[ \t]+(.+?)[ \t]*$", re.MULTILINE)
 _INLINE_CODE = re.compile(r"`([^`\r\n]+)`")
 # Path evidence comes from immutable Git trees, not punctuation or extensions.
 _HIGH_PRIORITY_JUSTIFICATION = re.compile(
-    r"(?:data[ -]?loss|security|automatic execution.{0,40}(?:block|stop)|"
-    r"repeated manual recovery|데이터\s*손실|보안|자동\s*실행.{0,20}(?:차단|중단)|"
-    r"반복(?:적인)?\s*수동\s*복구)",
+    r"(?:data[ -]?loss|security\s+(?:risk|vulnerabilit(?:y|ies)|breach|"
+    r"exposure|flaw|incident)|automatic execution.{0,40}"
+    r"\b(?:block(?:ed|ing|s)?|stop(?:ped|ping|s)?)\b|repeated manual recovery|"
+    r"데이터\s*손실|보안\s*(?:위험|취약점?|노출|침해|문제)|"
+    r"자동\s*실행.{0,20}(?:차단|중단)|반복(?:적인)?\s*수동\s*복구)",
     re.IGNORECASE | re.DOTALL,
 )
+_HIGH_PRIORITY_NEGATION_BEFORE = re.compile(
+    r"(?:\b(?:no|not|never|without|zero|cannot|can't|doesn't|isn't|aren't|won't)\b|"
+    r"\bfree\s+of\b|"
+    r"\b(?:does|is|are|will|can)\s+not\b|(?:없는|아닌|않는))"
+    r"[^.!?;\n]{0,48}$",
+    re.IGNORECASE,
+)
+_HIGH_PRIORITY_NEGATION_INSIDE = re.compile(
+    r"\b(?:no|not|never|without|cannot|can't|doesn't|isn't|aren't|won't)\b|"
+    r"(?:없|아니|되지\s*않|하지\s*않)",
+    re.IGNORECASE,
+)
+_HIGH_PRIORITY_NEGATION_AFTER = re.compile(
+    r"^(?:\s+(?:risk|issue|threat|exposure|problem|danger|possibility))?"
+    r"\s*(?:(?:does|do|is|are|was|were|will|can|could|would|has|have)\s+)?"
+    r"(?:not|never|none|zero|absent|unlikely|impossible|nonexistent|free|"
+    r"cannot|can't|doesn't|isn't|aren't|won't)\b|"
+    r"^[^.!?;\n]{0,24}(?:없|아니|되지\s*않|하지\s*않)",
+    re.IGNORECASE,
+)
+
+
+def _has_high_priority_justification(text: str) -> bool:
+    """Return whether the body affirmatively states an allowed priority risk."""
+
+    for match in _HIGH_PRIORITY_JUSTIFICATION.finditer(text):
+        before = text[max(0, match.start() - 48) : match.start()]
+        after = text[match.end() : match.end() + 48]
+        if (
+            _HIGH_PRIORITY_NEGATION_BEFORE.search(before)
+            or _HIGH_PRIORITY_NEGATION_INSIDE.search(match.group(0))
+            or _HIGH_PRIORITY_NEGATION_AFTER.search(after)
+        ):
+            continue
+        return True
+    return False
 
 
 def markdown_sections(text: str) -> MarkdownSections:
@@ -334,7 +372,7 @@ def validate_refactoring_plan(
     body = "\n".join(sections.values.values())
     if (
         priority in {"high", "critical"}
-        and _HIGH_PRIORITY_JUSTIFICATION.search(body) is None
+        and not _has_high_priority_justification(body)
     ):
         raise MaintenancePlanningError(
             f"상향된 리팩터링 priority의 구체적인 근거가 없습니다: {path}"
