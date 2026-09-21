@@ -63,6 +63,7 @@ WORKSPACE_OWNED = 1
 WORKSPACE_RESERVED = 2
 REBASE_IN_PROGRESS_ERROR = "Manager rebase 진행 중"
 REBASE_CONFLICT_PREFIX = "rebase 충돌 해결 필요:\n"
+PR_CLOSED_BLOCK_REASON = "pull-request-closed"
 PRIORITY_ORDER = {"critical": 0, "high": 1, "normal": 2, "low": 3}
 ACTIVE_EXECPLAN_STATUSES = frozenset(
     {"IMPLEMENTING", "VERIFYING", "REVIEWING", "PUBLISHING", "PR_OPEN", "BLOCKED"}
@@ -9100,6 +9101,95 @@ def complete_merged_worktree(
     return assessment
 
 
+def _block_closed_pull_request(
+    connection: sqlite3.Connection,
+    repo: str,
+    plan: sqlite3.Row,
+    url: str,
+    head_oid: object,
+) -> None:
+    error = "PR이 Merge 없이 닫혔습니다."
+    with connection:
+        connection.execute(
+            """
+            UPDATE exec_plans
+            SET status = 'BLOCKED', blocked_reason = ?,
+                pr_url = ?, pr_head_oid = ?, last_error = ?
+            WHERE repo = ? AND plan_id = ?
+            """,
+            (
+                PR_CLOSED_BLOCK_REASON,
+                url,
+                head_oid,
+                error,
+                repo,
+                plan["plan_id"],
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE projects
+            SET phase = 'BLOCKED', pr_url = ?, pr_head_oid = ?,
+                last_error = ?
+            WHERE repo = ?
+            """,
+            (url, head_oid, error, repo),
+        )
+        notifications.enqueue_current_project_events(connection, repo)
+
+
+def _resume_reopened_pull_request(
+    connection: sqlite3.Connection,
+    repo: str,
+    plan: sqlite3.Row,
+    url: str,
+    head_oid: object,
+    *,
+    recovery: bool,
+) -> None:
+    phase = "WORKING" if recovery else "PR_OPEN"
+    status = "IMPLEMENTING" if recovery else "PR_OPEN"
+    last_error = REBASE_IN_PROGRESS_ERROR if recovery else None
+    execplan_values: dict[str, object] = {
+        "status": status,
+        "blocked_reason": None,
+        "blocked_fingerprint": None,
+        "blocked_worktree_fingerprint": None,
+        "pr_url": url,
+        "pr_head_oid": head_oid,
+        "last_error": last_error,
+    }
+    project_values: dict[str, object] = {
+        "phase": phase,
+        "pr_url": url,
+        "pr_head_oid": head_oid,
+        "last_error": last_error,
+    }
+    if recovery:
+        for values in (execplan_values, project_values):
+            values.update(
+                validated_base_sha=None,
+                verify_result=None,
+                review_result=None,
+            )
+    execplan_assignments = ", ".join(
+        f"{name} = ?" for name in execplan_values
+    )
+    project_assignments = ", ".join(
+        f"{name} = ?" for name in project_values
+    )
+    with connection:
+        connection.execute(
+            f"UPDATE exec_plans SET {execplan_assignments} "
+            "WHERE repo = ? AND plan_id = ?",
+            (*execplan_values.values(), repo, plan["plan_id"]),
+        )
+        connection.execute(
+            f"UPDATE projects SET {project_assignments} WHERE repo = ?",
+            (*project_values.values(), repo),
+        )
+        notifications.enqueue_current_project_events(connection, repo)
+
 def reconcile_existing_pull_request(
     connection: sqlite3.Connection,
     repo_path: Path,
@@ -9122,6 +9212,23 @@ def reconcile_existing_pull_request(
     head_value = pull_request.get("headRefOid")
     head_oid = str(head_value) if head_value else project["pr_head_oid"]
     state = str(pull_request.get("state") or "OPEN").upper()
+    blocked_plan = (
+        active_execplan(connection, repo)
+        if project["phase"] == "BLOCKED"
+        else None
+    )
+    reopening_closed_pr = bool(
+        state == "OPEN"
+        and blocked_plan is not None
+        and blocked_plan["blocked_reason"] == PR_CLOSED_BLOCK_REASON
+    )
+    if state == "OPEN" and project["phase"] == "BLOCKED" and not reopening_closed_pr:
+        operation_print(
+            "PR 충돌 복구 차단 상태를 유지합니다: "
+            + str(project["last_error"] or "사용자 조치가 필요합니다."),
+            file=sys.stderr,
+        )
+        return 1
     if state != "OPEN" or (
         project["phase"] != "PR_OPEN"
         and not int(project["pr_conflict_recovery"])
@@ -9172,15 +9279,26 @@ def reconcile_existing_pull_request(
                 operation_print(recovery_error, file=sys.stderr)
                 return 1
             if project["phase"] in {"PR_OPEN", "BLOCKED"}:
-                update_project(
-                    connection,
-                    repo,
-                    phase="WORKING",
-                    validated_base_sha=None,
-                    verify_result=None,
-                    review_result=None,
-                    last_error=REBASE_IN_PROGRESS_ERROR,
-                )
+                if reopening_closed_pr:
+                    assert blocked_plan is not None
+                    _resume_reopened_pull_request(
+                        connection,
+                        repo,
+                        blocked_plan,
+                        url,
+                        head_oid,
+                        recovery=True,
+                    )
+                else:
+                    update_project(
+                        connection,
+                        repo,
+                        phase="WORKING",
+                        validated_base_sha=None,
+                        verify_result=None,
+                        review_result=None,
+                        last_error=REBASE_IN_PROGRESS_ERROR,
+                    )
             return None
 
         if project["phase"] == "PR_OPEN":
@@ -9287,14 +9405,25 @@ def reconcile_existing_pull_request(
             )
             operation_print(workspace_error, file=sys.stderr)
             return 1
-        update_project(
-            connection,
-            repo,
-            phase="PR_OPEN",
-            pr_url=url,
-            pr_head_oid=head_oid,
-            last_error=None,
-        )
+        if reopening_closed_pr:
+            assert blocked_plan is not None
+            _resume_reopened_pull_request(
+                connection,
+                repo,
+                blocked_plan,
+                url,
+                head_oid,
+                recovery=False,
+            )
+        else:
+            update_project(
+                connection,
+                repo,
+                phase="PR_OPEN",
+                pr_url=url,
+                pr_head_oid=head_oid,
+                last_error=None,
+            )
         operation_print(f"Merge 대기 중: {url}")
         return 0
 
@@ -9344,15 +9473,10 @@ def reconcile_existing_pull_request(
         return PROJECT_STEP_PLANNING_PENDING
 
     if state == "CLOSED":
-        error = "PR이 Merge 없이 닫혔습니다."
-        update_project(
-            connection,
-            repo,
-            phase="BLOCKED",
-            pr_url=url,
-            pr_head_oid=head_oid,
-            last_error=error,
-        )
+        plan = active_execplan(connection, repo)
+        if plan is None:
+            raise RuntimeError("닫힌 PR과 연결된 활성 ExecPlan을 찾을 수 없습니다.")
+        _block_closed_pull_request(connection, repo, plan, url, head_oid)
         operation_print(f"닫힌 PR을 다시 열어야 합니다: {url}", file=sys.stderr)
         return 1
 
