@@ -12090,6 +12090,82 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             self.assertIsNone(stored["pr_conflict_head_oid"])
             self.assertIsNone(stored["pr_conflict_base_oid"])
             self.assertEqual(pushes, [])
+
+    def test_post_push_ownership_failure_blocks_and_preserves_recovery(self):
+        for damage in ("missing-worktree", "wrong-branch"):
+            with self.subTest(damage=damage), tempfile.TemporaryDirectory() as directory:
+                repo, state_dir, connection, branch, worktree, url, observed_head = (
+                    self._pr_open_state(directory)
+                )
+                (worktree / "docs/notes.md").write_text("# Recovered head\n", encoding="utf-8")
+                git_command(worktree, "add", "docs/notes.md")
+                git_command(worktree, "commit", "-m", "Prepare interrupted push")
+                local_head = git_command(worktree, "rev-parse", "HEAD")
+                git_command(
+                    worktree, "push",
+                    f"--force-with-lease=refs/heads/{branch}:{observed_head}",
+                    "origin", f"HEAD:refs/heads/{branch}",
+                )
+                base = git_command(repo, "rev-parse", "origin/main")
+                loop_manager.update_project(
+                    connection, str(repo), phase="PUBLISHING",
+                    active_sha=base, validated_base_sha=base,
+                    pr_conflict_recovery=1, pr_conflict_head_oid=observed_head,
+                    pr_conflict_base_oid=base,
+                )
+                self._make_source_checkout_dirty_and_ahead(repo)
+                source_before = self._source_checkout_snapshot(repo)
+                if damage == "missing-worktree":
+                    preserved = worktree.with_name("preserved-worktree")
+                    worktree.rename(preserved)
+                else:
+                    preserved = worktree
+                    git_command(worktree, "checkout", "-b", "user-owned-branch")
+                evidence = preserved / "keep-untracked.txt"
+                evidence.write_text("preserve this evidence\n", encoding="utf-8")
+                original_git = loop_manager.git
+                writes = []
+
+                def recording_git(path, *arguments, **kwargs):
+                    if arguments and arguments[0] in {"push", "rebase", "reset", "clean"}:
+                        writes.append(arguments)
+                    return original_git(path, *arguments, **kwargs)
+
+                pull_request = self._pull_request(branch, url, local_head, "MERGEABLE")
+                with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
+                    "loop_manager.pr_for_branch", return_value=pull_request
+                ), mock.patch("loop_manager.git", side_effect=recording_git), mock.patch(
+                    "loop_manager.run_codex"
+                ) as agent:
+                    for _attempt in range(2):
+                        result = loop_manager.run_project_result(
+                            connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                        )
+                        self.assertEqual(result.kind, loop_manager.ProjectRunKind.BLOCKED)
+                        plan = loop_manager.active_execplan(connection, str(repo))
+                        self.assertEqual(plan["status"], "BLOCKED")
+                        self.assertIn("안전 검증 실패", plan["last_error"])
+                        self.assertEqual(plan["pr_conflict_recovery"], 1)
+                        self.assertEqual(plan["pr_conflict_head_oid"], observed_head)
+                        self.assertEqual(plan["pr_conflict_base_oid"], base)
+                        self.assertEqual(plan["pr_head_oid"], observed_head)
+                        self.assertEqual(plan["worker_session_id"], "worker-existing")
+                        self.assertEqual(plan["reviewer_session_id"], "reviewer-existing")
+                        project = connection.execute(
+                            "SELECT phase FROM projects WHERE repo = ?", (str(repo),)
+                        ).fetchone()
+                        self.assertEqual(project["phase"], "BLOCKED")
+                    agent.assert_not_called()
+                self.assertEqual(writes, [])
+                self.assertEqual(self._source_checkout_snapshot(repo), source_before)
+                self.assertEqual(evidence.read_text(encoding="utf-8"), "preserve this evidence\n")
+                self.assertEqual((preserved / "docs/notes.md").read_text(
+                    encoding="utf-8"), "# Recovered head\n")
+                self.assertEqual(git_command(repo, "rev-parse", f"refs/heads/{branch}"), local_head)
+                self.assertEqual(git_command(
+                    repo.parent / "remote.git", "rev-parse", f"refs/heads/{branch}"
+                ), local_head)
+
     def test_only_closed_pr_block_resumes_when_pr_reopens(self):
         with tempfile.TemporaryDirectory() as directory:
             (

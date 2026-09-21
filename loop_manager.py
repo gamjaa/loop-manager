@@ -9251,19 +9251,19 @@ def reconcile_existing_pull_request(
 
     if state == "OPEN":
         if int(project["pr_conflict_recovery"]):
-            if recover_confirmed_pr_conflict_push(
-                connection,
-                repo_path,
-                state_dir,
-                repo,
-                project,
-                pull_request,
-            ):
-                operation_print(
-                    f"기존 PR 충돌 복구 push 확인 완료: {url}"
-                )
-                return 0
             try:
+                if recover_confirmed_pr_conflict_push(
+                    connection,
+                    repo_path,
+                    state_dir,
+                    repo,
+                    project,
+                    pull_request,
+                ):
+                    operation_print(
+                        f"기존 PR 충돌 복구 push 확인 완료: {url}"
+                    )
+                    return 0
                 _validate_active_pr_conflict_recovery(
                     connection,
                     repo_path,
