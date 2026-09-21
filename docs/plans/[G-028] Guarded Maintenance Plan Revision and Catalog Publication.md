@@ -31,7 +31,7 @@ priority: normal
 - fast-forward push를 원격에서 확인한 뒤 하나의 SQLite transaction으로 새 계획을 등록하고 개정 계획의 `depends_on`, content hash와 plan revision SHA를 갱신하며 G-027의 유지보수 주기 revision도 함께 기록할 수 있다.
 - push 뒤 SQLite transaction 전 중단된 경우 원격 commit과 보존된 주기 정보를 대조해 동일 batch를 idempotent하게 등록·갱신한다. 원격 파일이나 기존 DB metadata가 기대 batch와 다르면 덮어쓰지 않고 planning error로 중단한다.
 - 새 계획만 있는 일반 Planner publication, FUTURE_IDEAS 보조 변경, 계획 없음 결과와 기존 correction retry 동작은 유지된다.
-- 공통 `docs/PLANS.md`와 Planner prompt는 일반 계획에서 기존 파일 수정 금지, 유지보수 mode의 제한된 장벽·재검증 예외 및 사용자 편집과 구분되는 검증 규칙을 설명한다.
+- 공통 `docs/PLANS.md`에 일반 계획의 기존 파일 수정 금지, 유지보수 mode의 제한된 장벽·재검증 예외 및 사용자 편집과 구분되는 검증 규칙을 문서화하고, Planner prompt에도 같은 계약을 반영한다.
 - 이 계획이 Merge된 뒤에도 유지보수 due 판단이 scheduler를 선점하지 않으며 G-029가 전체 수명주기를 연결하기 전에는 새 권한과 publication API를 자동 호출하지 않는다.
 
 ## Implementation
