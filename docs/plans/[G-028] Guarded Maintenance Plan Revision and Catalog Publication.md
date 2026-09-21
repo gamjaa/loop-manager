@@ -73,6 +73,7 @@ priority: normal
 
 - prepared intent 뒤 원격 base가 이동한 경우 Git ancestry와 batch 경로를 대조해 미게시를 확인하고, 같은 유지보수 단계를 유지한 채 intent 해제와 revision 증가를 transaction으로 수행한다. 기존 planning worktree는 보존하고 최신 cycle_base_sha에서 새 context를 생성한다.
 - Acceptance Criteria의 경로는 정규식 대신 계획의 게시 revision과 현재 평가 기준 revision의 Git 파일 목록으로 확인한다. `loop_manager.py`, `managed_config.py`, `config.json` 같은 루트 파일의 이동도 허용하며, Git 파일로 확인되지 않는 `api.v1`, `feature.enabled` 같은 의미 식별자 변경과 untracked 파일로 만든 경로 증거는 거부한다. Git 조회는 Planner 결과 오류 변환 범위 밖에서 수행해 운영 오류가 correction retry를 소비하지 않도록 한다.
+- 경로 존재만으로 의미 보존을 인정하지 않는다. 이전·현재 Git tree에서 유일한 동일 blob의 삭제→추가 쌍만 이동 근거로 사용하고, 새 경로를 해당 원래 경로로 되돌려 Acceptance Criteria 전체를 비교한다. 무관한 기존 `auth.py`→`billing.py` 교체 및 서로 다른 이동 대상 간 교체를 거부하는 회귀 검증을 추가했다. 내용 변경·중복 blob 등으로 이동을 확정할 수 없는 경우에는 자동 개정을 거부한다.
 - targeted 검증: `python3 -m unittest tests.test_maintenance_planning` — 12 tests, OK.
 - 미해결 Review 항목: `docs/PLANS.md::maintenance-planner-contract::missing-required-documentation`. 이번 Worker 지시가 docs/PLANS.md 수정을 명시적으로 금지하므로 해당 파일은 보존했다. 공통 계약에 일반 Planner의 기존 파일 수정 금지, SQLite 단계·snapshot에 한정된 maintenance barrier/revalidation 예외와 사용자 직접 편집과의 구분을 추가할 권한이 필요하다. 이 항목과 전체 verify/Review가 해결되기 전에는 ExecPlan 완료로 처리하지 않는다.
 

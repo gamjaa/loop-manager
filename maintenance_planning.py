@@ -152,14 +152,14 @@ def _snapshot_metadata(snapshot: ReadyPlanSnapshot) -> tuple[object, ...]:
 
 
 def _acceptance_criteria_path_shape(
-    text: str, repository_paths: frozenset[str],
+    text: str, path_moves: Mapping[str, str],
 ) -> str:
-    """Erase only code spans proven to be paths in the corresponding Git tree."""
+    """Rewrite old paths only through independently verified file moves."""
 
     def replace(match: re.Match[str]) -> str:
         expression = match.group(1)
-        if expression in repository_paths:
-            return "`<repository-path>`"
+        if expression in path_moves:
+            return f"`{path_moves[expression]}`"
         return match.group(0)
 
     return _INLINE_CODE.sub(replace, text)
@@ -203,8 +203,7 @@ def validate_revalidation_revision(
     plan: Mapping[str, object],
     text: str,
     *,
-    previous_paths: frozenset[str] = frozenset(),
-    current_paths: frozenset[str] = frozenset(),
+    path_moves: Mapping[str, str] | None = None,
 ) -> None:
     if path != snapshot.path or _metadata_tuple(plan) != _snapshot_metadata(snapshot):
         raise MaintenancePlanningError(
@@ -224,9 +223,9 @@ def validate_revalidation_revision(
             "revalidation mode는 Acceptance Criteria section을 제거하거나 "
             f"새로 만들 수 없습니다: {path}"
         )
-    if _acceptance_criteria_path_shape(
-        previous_criteria, previous_paths
-    ) != _acceptance_criteria_path_shape(revised_criteria, current_paths):
+    if previous_criteria != _acceptance_criteria_path_shape(
+        revised_criteria, {new: old for old, new in (path_moves or {}).items()}
+    ):
         raise MaintenancePlanningError(
             "revalidation mode는 Acceptance Criteria의 경로 표현 이외 의미를 "
             f"변경할 수 없습니다: {path}"

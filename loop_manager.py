@@ -1998,21 +1998,30 @@ def validate_maintenance_planner_result(
         set(dirty_files) | set(changed_files(worktree, context.active_sha))
     )
     base_paths = _git_tree_entries(worktree, context.active_sha)
-    current_paths = frozenset(
-        path.decode("utf-8") for path, (kind, _oid) in base_paths.items()
-        if kind == b"blob"
-    )
-    previous_paths_by_sha: dict[str, frozenset[str]] = {}
+    path_moves_by_sha: dict[str, dict[str, str]] = {}
     if context.mode is MaintenancePlanMode.REVALIDATION:
         for snapshot in context.eligible_plans:
             if snapshot.path not in planned_files:
                 continue
-            if snapshot.plan_sha not in previous_paths_by_sha:
+            if snapshot.plan_sha not in path_moves_by_sha:
                 tree = _git_tree_entries(worktree, snapshot.plan_sha)
-                previous_paths_by_sha[snapshot.plan_sha] = frozenset(
-                    path.decode("utf-8") for path, (kind, _oid) in tree.items()
-                    if kind == b"blob"
-                )
+                # Only unique, byte-identical deleted -> added files establish
+                # a move. Similarity, copies and ambiguous replacements cannot
+                # prove preservation of the original acceptance criterion.
+                old_blobs: dict[bytes, list[bytes]] = {}
+                new_blobs: dict[bytes, list[bytes]] = {}
+                for entries, grouped in ((tree, old_blobs), (base_paths, new_blobs)):
+                    for name, (kind, oid) in entries.items():
+                        if kind == b"blob":
+                            grouped.setdefault(oid, []).append(name)
+                moves = {}
+                for oid, old_names in old_blobs.items():
+                    new_names = new_blobs.get(oid, [])
+                    if len(old_names) == len(new_names) == 1:
+                        old, new = old_names[0], new_names[0]
+                        if old not in base_paths and new not in tree:
+                            moves[old.decode("utf-8")] = new.decode("utf-8")
+                path_moves_by_sha[snapshot.plan_sha] = moves
     try:
         _assert_maintenance_context_current(connection, context)
         if not planned_files:
@@ -2100,8 +2109,7 @@ def validate_maintenance_planner_result(
             else:
                 validate_revalidation_revision(
                     snapshot, path, plan, text,
-                    previous_paths=previous_paths_by_sha[snapshot.plan_sha],
-                    current_paths=current_paths,
+                    path_moves=path_moves_by_sha[snapshot.plan_sha],
                 )
             revisions.append(PlanRevision(path, plan, snapshot))
 

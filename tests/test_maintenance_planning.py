@@ -387,7 +387,7 @@ class MaintenancePlanningTest(unittest.TestCase):
             purpose=original_purpose,
             acceptance_criteria=(
                 "Preserve user behavior, the public API contract, and storage format "
-                "for `refactored/adapter.py`."
+                "for `legacy/module.py`."
             ),
             implementation="Use the refactored adapter module boundary.",
         )
@@ -630,16 +630,18 @@ class MaintenancePlanningTest(unittest.TestCase):
         loop_manager.validate_revalidation_revision(
             snapshot, snapshot.path, metadata,
             snapshot.text.replace("legacy/module.py", "refactored/adapter.py"),
-            previous_paths=frozenset({"legacy/module.py"}),
-            current_paths=frozenset({"refactored/adapter.py"}),
+            path_moves={"legacy/module.py": "refactored/adapter.py"},
         )
 
     def test_revalidation_uses_git_evidence_for_root_file_moves(self):
         names = ("loop_manager.py", "managed_config.py", "config.json")
         criteria = "Use " + ", ".join(f"`{name}`" for name in names)
         criteria += " while preserving `api.v1` and `feature.enabled`."
+        criteria += " Keep authorization in `auth.py`."
+        (self.repo / "auth.py").write_text("# authorization\n", encoding="utf-8")
+        (self.repo / "billing.py").write_text("# billing\n", encoding="utf-8")
         for name in names:
-            (self.repo / name).write_text("# original file\n", encoding="utf-8")
+            (self.repo / name).write_text(f"# original {name}\n", encoding="utf-8")
         self._write_plan(
             "G-001", "Ready Feature", depends_on=("G-000",),
             acceptance_criteria=criteria,
@@ -693,6 +695,16 @@ class MaintenancePlanningTest(unittest.TestCase):
 
         result = validate(revised_criteria)
         self.assertEqual(len(result.revisions), 1)
+        # Both paths exist in both revisions, but they are unrelated.
+        with self.assertRaisesRegex(
+            loop_manager.PlannerValidationError, "Acceptance Criteria"
+        ):
+            validate(revised_criteria.replace("auth.py", "billing.py"))
+        # Verified moves are paired, not interchangeable path placeholders.
+        with self.assertRaisesRegex(
+            loop_manager.PlannerValidationError, "Acceptance Criteria"
+        ):
+            validate(revised_criteria.replace("settings.py", "settings.json"))
         for old, new in (
             ("api.v1", "api.v2"),
             ("feature.enabled", "feature.disabled"),
