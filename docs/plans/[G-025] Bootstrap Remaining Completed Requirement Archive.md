@@ -46,12 +46,14 @@ G-011보다 먼저 Merge돼 구현과 회귀 테스트가 이미 존재하지만
 
 ## Progress
 
-- [ ] 실행 시점의 다섯 Requirement archive eligibility 재확인
-- [ ] eligible Requirement를 archive로 이동하고 내용 보존 확인
-- [ ] 게시 직전 후보 재검증과 archived source fallback 확인
+- [x] 실행 시점의 다섯 Requirement archive eligibility 재확인
+- [x] eligible Requirement를 archive로 이동하고 내용 보존 확인
+- [x] 게시 직전 후보 재검증과 archived source fallback 확인
 
 ## Decision Log
 
 - G-007, G-008, G-009, G-013과 G-019의 구현은 자동 archive 런타임 G-011보다 먼저 Merge됐으므로 당시 Worker가 완료 Requirement를 이동할 수 없었다.
 - G-023은 R-005의 명시된 bootstrap 경계에 따라 R-003과 R-005만 처리하고 다른 활성 Requirement의 완료 여부를 범위에서 제외하므로, 이 계획이 나머지 선행 완료 문서를 별도로 정리한다.
 - 완료 여부와 이동 가능성은 실행 시점의 일반 eligibility 계산을 원본으로 삼으며 특정 Requirement에 대한 런타임 예외를 만들지 않는다.
+- 2026-09-21 실행 시점 재확인: Git `origin/main`과 현재 `HEAD`는 `3b282a4`로 일치했고, GitHub에서 G-011 PR #14의 `MERGED`를 확인했다. SQLite의 G-002, G-004, G-006, G-008, G-009, G-011은 모두 `MERGED`이며 G-025만 `IMPLEMENTING`이었다. 일반 eligibility 계산 결과는 이 계획의 다섯 source 경로와 정확히 일치했고 archive 충돌은 없었다.
+- 2026-09-21 게시 직전 재확인: Git `HEAD`와 `origin/main`은 계속 `3b282a4`로 일치했고 G-011 PR #14는 `MERGED`였다. 최신 SQLite eligibility와 실제 이동 집합은 동일했으며, `load_execplan_catalog`의 archived source fallback도 기존 G-025 source 경로를 유지한 채 성공했다.
