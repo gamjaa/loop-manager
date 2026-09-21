@@ -33,12 +33,14 @@ planning 결과가 게시됐거나 작업 없음으로 확정된 planning worktr
 
 이전 정책으로 저장된 Agent snapshot 또는 범위 오류도 같은 분류로 재평가한다. 저장된 기준과 현재 상태의 차이가 ignored-only 파일뿐이고 `HEAD`, branch, index, tracked·non-ignored untracked 상태와 공유 Git metadata가 모두 기존 기대값과 일치하면, ignored 경로를 snapshot 기준으로 복사하거나 삭제하지 않고 비권위 차이로 제외해 기존 세션, worktree, 검증 결과와 작업 단계를 멱등하게 재개한다. 권위 있는 변경이 하나라도 함께 있거나 시작 ignore 규칙을 재구성할 수 없으면 snapshot을 재설정하거나 전체 상태를 신뢰하지 않고 기존 차단을 유지한다.
 
-R-016의 Planner bytecode 예방 설정은 기존 동작으로 남을 수 있지만 범위 안전성의 필수 조건으로 사용하지 않는다. Worker·Reviewer·Manager 진단과 프로젝트 전체에 `PYTHONDONTWRITEBYTECODE`를 확대하는 것은 이 Requirement의 완료 조건이 아니다.
+R-016이 추가한 Planner 전용 `PYTHONDONTWRITEBYTECODE=1` 강제 설정은 ignored artifact를 범위 위반으로 보던 이전 정책의 역할별 우회책이므로 제거한다. Codex와 Claude의 Planner 최초 호출 및 세션 재개에 더 이상 역할 전용 bytecode 환경값을 삽입하지 않고, bytecode 미생성을 요구하던 테스트는 ignored-only artifact 허용과 권위 있는 변경 차단을 검증하는 테스트로 대체한다. Worker·Reviewer·Manager 진단이나 프로젝트 전체에 같은 설정을 확대하지 않으며, 완료된 R-016 Requirement와 ExecPlan은 역사 기록으로 수정하지 않는다.
 
 ## Acceptance Criteria
 
 - Planner의 새 ExecPlan·허용된 FUTURE_IDEAS 변경과 Worker의 현재 구현 범위 안에 있는 tracked·non-ignored 파일 생성·수정·삭제는 기존 역할별 검사 후 정상 결과로 commit할 수 있다.
 - Planner가 Python 모듈을 import해 ignored `__pycache__` 또는 `.pyc`를 생성·수정해도 유효한 새 ExecPlan과 `docs/FUTURE_IDEAS.md` 변경만 역할별 결과로 남으면 범위 위반이나 `planning_error`가 발생하지 않는다.
+- Codex와 Claude의 Planner 최초 호출 및 저장된 세션 재개 환경은 Planner 역할만을 위한 `PYTHONDONTWRITEBYTECODE` 값을 강제로 추가하거나 부모 값을 덮어쓰지 않는다.
+- Planner import 뒤 bytecode가 생성되지 않아야 한다는 기존 테스트는 제거하고, 실제 ignored bytecode 생성 뒤에도 계획 결과를 허용하면서 staged·tracked·non-ignored 변경은 계속 거부하는 회귀 테스트로 대체한다.
 - Planner와 Worker가 역할 수행 중 임의의 ignored 파일을 생성·수정·삭제하고 복원하지 않아도 ignored-only 차이만으로 결과를 거부하지 않는다.
 - Worker의 targeted test와 Loop Manager의 전체 verify가 ignored bytecode, test cache, coverage cache, log 또는 build artifact를 생성·수정·삭제해도 권위 있는 Git 상태가 유효하면 기존 구현·검증 흐름을 계속한다.
 - Reviewer의 조사 명령이 ignored artifact만 남겨도 읽기 전용 검토 결과를 거부하거나 ExecPlan을 BLOCKED로 전환하지 않는다.
@@ -62,6 +64,7 @@ R-016의 Planner bytecode 예방 설정은 기존 동작으로 남을 수 있지
 - 저장소와 PR에 반영될 수 있는 변경 및 공유 Git 상태는 기존과 같이 엄격하게 검사한다.
 - 기존 ignored-only snapshot 차단은 사용자 cache 삭제나 DB 수정 없이 안전 조건을 확인한 뒤 재개할 수 있다.
 - 역할과 도구마다 bytecode·cache 예방 환경을 추가하지 않아도 같은 정책을 일관되게 적용한다.
+- Planner 환경의 obsolete한 역할별 bytecode 예외와 전용 테스트를 제거해 Agent 실행 환경 계약을 단순화한다.
 - 정상 종료된 Manager 소유 worktree는 ignored artifact 때문에 불필요하게 보존되지 않는다.
 
 ## Non-Goals
@@ -72,7 +75,7 @@ R-016의 Planner bytecode 예방 설정은 기존 동작으로 남을 수 있지
 - tracked·staged·non-ignored untracked 변경과 shared Git metadata의 역할별 허용 범위를 완화하지 않는다.
 - ignored 상태를 격리하기 위한 별도 검증 worktree, 복제 checkout 또는 hermetic 실행 환경을 도입하지 않는다.
 - 등록 프로젝트의 기본 worktree나 소유권이 불명확한 경로를 ignored-only 정리 대상으로 취급하지 않는다.
-- 프로젝트 전체 Python bytecode 생성을 비활성화하거나 기존 R-016 역사 문서를 수정하지 않는다.
+- Worker·Reviewer·Manager 진단이나 프로젝트 전체 Python bytecode 생성을 비활성화하지 않고, 기존 R-016 역사 문서를 수정하지 않는다.
 
 ## Open Questions
 
