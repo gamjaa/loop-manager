@@ -5636,6 +5636,7 @@ def resume_guidance_approval_if_decided(
         return False
     worktree = Path(str(plan["worktree"] or ""))
     branch = str(plan["branch"] or "")
+    resuming_rebase = _rebase_in_progress_for_branch(worktree, branch)
     try:
         validate_execplan_workspace_identity(
             state_dir,
@@ -5652,6 +5653,7 @@ def resume_guidance_approval_if_decided(
             allow_create_branch=False,
             allow_recovery=True,
             allow_existing=True,
+            allow_rebase=resuming_rebase,
         )
         validate_blocked_agent_scope(
             connection,
@@ -5767,6 +5769,11 @@ def resume_guidance_approval_if_decided(
                 "WHERE repo = ?",
                 (repo,),
             )
+        if resuming_rebase:
+            update_project(
+                connection, repo, last_error=REBASE_IN_PROGRESS_ERROR,
+                validated_base_sha=None,
+            )
         clear_agent_scope(connection, repo)
         return True
     except (AgentScopeError, GuidanceFormatError, RuntimeError) as error:
@@ -5830,6 +5837,15 @@ def _invalidate_guidance_approval(
             WHERE repo = ?
             """,
             (message, worker_result, result_snapshot, repo),
+        )
+        # Manager rebase/verify may already have cleared the Agent scope.
+        # Freeze the diagnosed state so only the User Decision can change.
+        connection.execute(
+            "UPDATE projects SET agent_role = 'worker', agent_snapshot = ?, "
+            "agent_baseline = NULL, agent_recovery = NULL, "
+            "agent_input_plan = NULL, agent_result_plan = NULL, "
+            "agent_input_fingerprint = NULL WHERE repo = ?",
+            (result_snapshot, repo),
         )
         notifications.enqueue_current_project_events(connection, repo)
 
@@ -5976,9 +5992,9 @@ def validate_guidance_publication(
             old_mode = git(worktree, "ls-tree", previous_base, "--", target).stdout
             new_mode = git(worktree, "ls-tree", latest_base, "--", target).stdout
             if old.returncode or new_blob.returncode or old_mode != new_mode:
-                exact = False
-                # A new decision must apply to the new base, not silently reuse
-                # the pre-rebase baseline. Removed/nonregular targets stay blocked.
+                # Reapproval during a paused rebase already binds the decision
+                # to this base. Do not invalidate it again after --continue.
+                base_approved = False
                 shown = subprocess.run(
                     ["git", "show", f"{latest_base}:{target}"],
                     cwd=worktree, check=False, stdout=subprocess.PIPE,
@@ -5989,6 +6005,12 @@ def validate_guidance_publication(
                         shown.stdout,
                         0o755 if new_mode.startswith("100755 ") else 0o644,
                     )
+                    base_approved = all(
+                        bytes(item["baseline_content"]) == shown.stdout
+                        and int(item["baseline_mode"]) == new_baselines[target][1]
+                        for item in target_rows
+                    )
+                exact = exact and base_approved
         if not exact:
             mismatched.extend(proposals[str(row["proposal_id"])] for row in target_rows)
     if not mismatched:
@@ -10475,6 +10497,12 @@ def _run_project_step(
             rebased = git(worktree, "rebase", f"origin/{base}", check=False)
             if rebased.returncode:
                 if _rebase_in_progress_for_branch(worktree, branch):
+                    if validate_guidance_publication(
+                        connection, repo, worktree, catalog_plan,
+                        str(row["worker_result"] or ""),
+                        previous_base=str(row["active_sha"]), latest_base=latest_sha,
+                    ):
+                        return 1
                     rebase_failure = REBASE_CONFLICT_PREFIX + rebased.stdout[-8000:]
                     update_project(
                         connection,
@@ -10794,6 +10822,12 @@ def _run_project_step(
                 )
                 if rebased.returncode:
                     if _rebase_in_progress_for_branch(worktree, branch):
+                        if validate_guidance_publication(
+                            connection, repo, worktree, catalog_plan,
+                            str(row["worker_result"] or ""),
+                            previous_base=str(row["active_sha"]), latest_base=latest_sha,
+                        ):
+                            return 1
                         rebase_failure = (
                             REBASE_CONFLICT_PREFIX + rebased.stdout[-8000:]
                         )

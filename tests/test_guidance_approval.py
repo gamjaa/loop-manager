@@ -839,6 +839,23 @@ Patch:
                     row = connection.execute("SELECT * FROM guidance_approvals").fetchone()
                     self.assertEqual(row["applied"], 0 if blocked else 1)
                     if blocked:
+                        snapshot = connection.execute(
+                            "SELECT agent_snapshot FROM projects WHERE repo = ?", (str(repo),)
+                        ).fetchone()[0]
+                        self.assertTrue(snapshot)
+                        (repo / "unexpected.py").write_text("unapproved user edit\n")
+                        with self.assertRaises(loop_manager.AgentScopeError):
+                            loop_manager.validate_blocked_agent_scope(
+                                connection, repo, str(repo), "main", repo, path
+                            )
+                        with self.assertRaises(loop_manager.AgentScopeError):
+                            loop_manager.validate_persisted_agent_scope(
+                                connection, repo, Path(directory), str(repo)
+                            )
+                        (repo / "unexpected.py").unlink()
+                        loop_manager.validate_blocked_agent_scope(
+                            connection, repo, str(repo), "main", repo, path
+                        )
                         self.assertTrue(row["invalidated_decision_hash"])
                         self.assertEqual(
                             loop_manager.active_execplan(connection, str(repo))["status"],
@@ -866,6 +883,87 @@ Patch:
                             connection, str(repo), repo, resumed, "new decision",
                             previous_base=new_base, latest_base=new_base,
                         ))
+
+    def test_rebase_conflict_requires_reapproval_before_worker_resolution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, path = repository(Path(directory))
+            connection = active_connection(repo, path)
+            old_base = git(repo, "rev-parse", "HEAD")
+            plan = loop_manager.active_execplan(connection, str(repo))
+            document = guidance_approval.parse_guidance_document(guidance_plan())
+            loop_manager._block_for_new_guidance(
+                connection, repo, str(repo), repo, plan, document,
+                document.proposals, "proposal",
+            )
+            (repo / path).write_text(guidance_plan(decision="approve", revision="1"))
+            with mock.patch("loop_manager.validate_execplan_workspace_identity"):
+                self.assertTrue(loop_manager.resume_guidance_approval_if_decided(
+                    connection, repo, str(repo), "main", Path(directory)
+                ))
+            (repo / "AGENTS.md").write_text("# Agents\nApproved rule\n")
+            plan = loop_manager.active_execplan(connection, str(repo))
+            self.assertFalse(loop_manager.inspect_worker_guidance_result(
+                connection, repo, str(repo), repo, plan, "applied"
+            ))
+            git(repo, "add", "-A")
+            git(repo, "commit", "-m", "Approved worker guidance")
+            git(repo, "checkout", "-b", "upstream", old_base)
+            (repo / "AGENTS.md").write_text("# Agents\nRemote rule\n")
+            git(repo, "add", "AGENTS.md")
+            git(repo, "commit", "-m", "Remote guidance")
+            new_base = git(repo, "rev-parse", "HEAD")
+            git(repo, "checkout", "main")
+            result = subprocess.run(
+                ["git", "-C", str(repo), "rebase", "upstream"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(loop_manager._rebase_in_progress_for_branch(repo, "main"))
+            loop_manager.clear_agent_scope(connection, str(repo))
+            self.assertTrue(loop_manager.validate_guidance_publication(
+                connection, str(repo), repo, plan, "applied",
+                previous_base=old_base, latest_base=new_base,
+            ))
+            replacement = (
+                "diff --git a/AGENTS.md b/AGENTS.md\n"
+                "--- a/AGENTS.md\n+++ b/AGENTS.md\n"
+                "@@ -1,2 +1,3 @@\n # Agents\n Remote rule\n+Approved rule\n"
+            )
+            (repo / path).write_text(guidance_plan(
+                decision="replace", revision="2", patch=replacement
+            ))
+            loop_manager.validate_persisted_agent_scope(
+                connection, repo, Path(directory), str(repo)
+            )
+            with mock.patch("loop_manager.validate_execplan_workspace_identity"):
+                self.assertTrue(loop_manager.resume_guidance_approval_if_decided(
+                    connection, repo, str(repo), "main", Path(directory)
+                ))
+            project = connection.execute(
+                "SELECT * FROM projects WHERE repo = ?", (str(repo),)
+            ).fetchone()
+            self.assertEqual(project["worker_session_id"], "worker-session")
+            self.assertEqual(project["last_error"], loop_manager.REBASE_IN_PROGRESS_ERROR)
+            before = loop_manager.begin_agent_scope(connection, str(repo), repo, "worker")
+            (repo / "AGENTS.md").write_text("# Agents\nRemote rule\nApproved rule\n")
+            loop_manager.validate_agent_scope(
+                "worker", repo, before, loop_manager.capture_git_snapshot(repo),
+                selected_plan_path=path,
+                allowed_guidance_targets=loop_manager._guidance_worker_targets(
+                    connection, str(repo), "G-020"
+                ),
+            )
+            plan = loop_manager.active_execplan(connection, str(repo))
+            self.assertFalse(loop_manager.inspect_worker_guidance_result(
+                connection, repo, str(repo), repo, plan, "resolved"
+            ))
+            loop_manager.clear_agent_scope(connection, str(repo))
+            git(repo, "add", "-A")
+            git(repo, "-c", "core.editor=true", "rebase", "--continue")
+            self.assertFalse(loop_manager.validate_guidance_publication(
+                connection, str(repo), repo, plan, "resolved",
+                previous_base=old_base, latest_base=new_base,
+            ))
 
     def test_schema_migration_and_prompt_preserve_guidance_contract(self):
         connection = sqlite3.connect(":memory:")
