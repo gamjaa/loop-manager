@@ -10,7 +10,7 @@ Planner가 중복을 피하기 위해 누적된 모든 ExecPlan 본문을 매번
 
 ## Requirement
 
-이 Requirement는 현재 PRODUCT와 ARCHITECTURE에 기록된 “계획 입력이 변경되면 READY ExecPlan보다 Planner를 먼저 실행한다”는 계약을 의도적으로 변경한다. 사용자는 실행 중인 변경 작업이 없는 선택 경계에서 일반 Planner보다 기존 READY 카탈로그를 먼저 처리하고, dependency를 충족하지 못한 READY만 남은 경우에도 Planner로 우회하지 않는 READY-first 정책을 승인한다. G-024의 구현 PR은 이 정책을 코드에 적용하는 것과 동시에 PRODUCT 및 ARCHITECTURE의 Planner-first 문구를 READY-first 계약으로 갱신해 문서와 구현 사이의 충돌을 남기지 않아야 한다. 이 승인은 G-024 범위의 READY 소진 순서에 한정하며, 안정된 `PR_OPEN`과 독립 READY의 동시 진행은 G-031 범위로 유지한다.
+이 Requirement는 현재 PRODUCT와 ARCHITECTURE에 기록된 “계획 입력이 변경되면 READY ExecPlan보다 Planner를 먼저 실행한다”는 계약을 의도적으로 변경한다. 사용자는 실행 중인 변경 작업이 없는 선택 경계에서 일반 Planner보다 기존 READY 카탈로그를 먼저 처리하고, dependency를 충족하지 못한 READY만 남은 경우에도 Planner로 우회하지 않는 READY-first 정책을 승인한다. 본 명세 변경에서 사용자가 ARCHITECTURE의 Planner-first 문구를 READY-first 계약으로 갱신해 `origin/main`에 먼저 게시하며, G-024 Worker는 갱신된 ARCHITECTURE를 읽기 전용 입력으로 사용하고 코드와 PRODUCT만 구현 PR에서 전환한다. 이 승인은 G-024 범위의 READY 소진 순서에 한정하며, 안정된 `PR_OPEN`과 독립 READY의 동시 진행은 G-031 범위로 유지한다.
 
 Loop Manager는 저장소를 변경하는 실행 단계의 ExecPlan이 있으면 해당 상태를 먼저 이어서 처리해야 한다. Merge만 기다리는 안정된 `PR_OPEN` ExecPlan은 완료되지 않은 계획으로 유지하되 프로젝트의 실행 자리를 점유하지 않는다. 모든 Open PR의 상태를 먼저 동기화한 뒤 충돌 복구가 필요하지 않고 실행 중인 변경 작업도 없으면, Open PR에 직접 또는 간접 의존하지 않는 READY ExecPlan을 선택해 실행한다. 같은 프로젝트에서 Worker·verify·Review·게시 또는 PR 충돌 복구는 항상 하나만 실행하지만, Merge를 기다리는 PR은 여러 개 존재할 수 있다.
 
@@ -40,7 +40,7 @@ Loop Manager 코드는 AI를 사용하지 않고 ExecPlan frontmatter와 SQLite 
 - 현재 변경 실행이 없고 의존성을 충족한 READY ExecPlan이 있으면 주기적 유지보수 평가 또는 사후 재검증이 도래한 경우를 제외하고 Planner보다 해당 계획을 먼저 선택해 Worker를 시작한다.
 - 남아 있는 READY ExecPlan이 하나라도 있으면 일반 계획 입력 변경만을 이유로 Planner를 실행하지 않는다.
 - READY ExecPlan은 남아 있지만 모두 `depends_on`을 충족하지 못한 경우 이를 READY가 없는 상태로 취급하지 않으며 일반 Planner를 실행하지 않는다. `PR_OPEN`, `PLAN_BLOCKED` 또는 `PROJECT_BLOCKED`가 함께 있으면 유지보수 Planner도 실행하지 않는다.
-- G-024의 구현 PR은 현재 PRODUCT의 Product Invariants·핵심 실행 흐름·Business Rules와 ARCHITECTURE의 ExecPlan 실행 흐름·동시 실행 계약에서 “입력 변경 시 READY보다 Planner 우선”인 문구를 “READY 카탈로그 소진 후 Planner 판단”으로 함께 바꾸며, 코드·PRODUCT·Requirement·ARCHITECTURE 사이에 상반된 선택 순서를 남기지 않는다.
+- 사용자 소유 명세 변경은 G-024 재개 전에 ARCHITECTURE의 ExecPlan 실행 흐름·동시 실행 계약에서 “입력 변경 시 READY보다 Planner 우선”인 문구를 “READY 카탈로그 소진 후 Planner 판단”으로 바꿔 `origin/main`에 게시한다. G-024 구현 PR은 현재 PRODUCT의 Product Invariants·핵심 실행 흐름·Business Rules와 코드를 같은 정책으로 바꾸되 Worker가 ARCHITECTURE를 수정하지 않으며, 완료 시 코드·PRODUCT·Requirement·ARCHITECTURE 사이에 상반된 선택 순서를 남기지 않는다.
 - 주기적 리팩터링 평가가 도래하고 현재 변경 실행, `PR_OPEN`, `PLAN_BLOCKED`와 `PROJECT_BLOCKED`가 모두 없으면 READY 존재 여부와 관계없이 다음 Worker 선택 전에 유지보수 Planner를 한 번 실행한다.
 - 유지보수 Planner는 branch, worktree, Agent 세션과 PR이 없는 READY 계획만 R-012의 dependency 장벽 구성 또는 사후 구조 재검증 범위에서 수정할 수 있다.
 - 리팩터링 전에 기존 READY 구현이 필요하면 최소 dependency-closed 선행 집합만 처리한 뒤 최신 코드에서 다시 평가하고, 리팩터링 계획을 미리 확정하지 않는다.

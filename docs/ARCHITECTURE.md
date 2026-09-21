@@ -147,7 +147,7 @@ runtime 경로가 존재하지만 소유권, repository, detached HEAD, SHA 또�
 
 ExecPlan 하나의 실행 흐름은 다음과 같다.
 
-1. 실행 중인 작업이 없고 계획 입력이 변경됐으면 READY ExecPlan의 존재와 관계없이 `<state-dir>/worktrees/<project-id>/planning/<input-fingerprint>/`에 `origin/<base-branch>` 기준의 detached planning worktree를 만든다
+1. 실행 중인 작업이 없고 READY ExecPlan이 하나라도 있으면 계획 입력 지문 검사를 건너뛰고, 모든 `depends_on`이 MERGED인 READY 계획을 선택하거나 실행 가능한 READY가 없으면 대기한다. 실행 중인 작업과 READY ExecPlan이 모두 없을 때만 최신 `origin/<base-branch>`의 계획 입력 지문을 계산하고, 마지막으로 완료한 계획 주기와 다르면 `<state-dir>/worktrees/<project-id>/planning/<input-fingerprint>/`에 해당 원격 SHA 기준의 detached planning worktree를 만든다
 2. 프로그램이 비종료 ExecPlan의 compact catalog를 만들고, Planner가 이를 현재 입력 및 관련 코드·테스트와 대조해 식별 가능한 미충족 작업 전체를 독립적인 새 ExecPlan으로 나누어 priority와 `depends_on`을 포함해 일괄 작성한다. 현재 범위 밖의 보존 가치가 있는 아이디어는 같은 계획 주기의 ExecPlan으로 만들지 않고 `docs/FUTURE_IDEAS.md`에 분리할 수 있다
 3. 프로그램이 Planner 변경을 새 ExecPlan과 선택적인 `docs/FUTURE_IDEAS.md` 변경으로 분리한다. 다른 경로, 기존 ExecPlan 변경·삭제 또는 범위 밖 아이디어를 현재 ExecPlan에 포함한 결과는 거부하고, 새 ExecPlan만 메타데이터와 의존성 그래프 검증 및 SQLite 등록 대상으로 사용한다
 4. 검증에 실패하면 오류를 같은 Planner 세션에 전달하고 최대 3회까지 수정과 재검증을 수행한다
@@ -178,8 +178,9 @@ ExecPlan 파일은 구현 PR에 처음 포함하지 않는다. Planner 단계에
 ## 동시 실행
 
 - 하나의 프로젝트에는 여러 READY ExecPlan이 존재할 수 있지만 활성 ExecPlan, branch, worktree와 Worker는 하나만 존재한다
-- 계획 입력이 변경되면 활성 작업을 선점하지 않으며, 다음 Worker 선택 전에 기존 READY 계획을 포함한 전체 카탈로그를 갱신한다
+- 새 계획 입력은 활성 작업과 남아 있는 READY 카탈로그를 선점하지 않으며, 마지막 READY가 종료된 뒤의 선택 시점에 최신 원격 지문으로 한 번 평가한다
 - READY ExecPlan은 모든 `depends_on`이 MERGED일 때만 실행 후보가 된다
+- dependency를 충족하지 못한 READY만 남아도 빈 카탈로그로 취급하지 않고 Planner를 시작하지 않으며, 해당 프로젝트만 대기한다
 - 실행 가능한 READY ExecPlan이 여럿이면 priority가 높은 계획을 먼저 선택하고 같은 priority에서는 숫자 ExecPlan ID가 가장 작은 계획을 선택한다
 - 각 ExecPlan은 `loop-manager/<execplan-id>` 형식의 고유한 branch와 별도 관리 worktree를 사용한다
 - PR_OPEN 또는 BLOCKED 프로젝트에서는 다른 ExecPlan을 시작하거나 Planner를 다시 실행하지 않는다
