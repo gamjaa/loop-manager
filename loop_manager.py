@@ -63,6 +63,7 @@ WORKSPACE_OWNED = 1
 WORKSPACE_RESERVED = 2
 REBASE_IN_PROGRESS_ERROR = "Manager rebase 진행 중"
 REBASE_CONFLICT_PREFIX = "rebase 충돌 해결 필요:\n"
+PR_CLOSED_BLOCK_REASON = "pull-request-closed"
 PRIORITY_ORDER = {"critical": 0, "high": 1, "normal": 2, "low": 3}
 ACTIVE_EXECPLAN_STATUSES = frozenset(
     {"IMPLEMENTING", "VERIFYING", "REVIEWING", "PUBLISHING", "PR_OPEN", "BLOCKED"}
@@ -90,6 +91,9 @@ FIELDS = {
     "active_sha",
     "validated_base_sha",
     "publication_remote_oid",
+    "pr_conflict_recovery",
+    "pr_conflict_head_oid",
+    "pr_conflict_base_oid",
     "plan_sha",
     "phase",
     "branch",
@@ -137,6 +141,9 @@ CREATE TABLE IF NOT EXISTS projects (
     active_sha TEXT,
     validated_base_sha TEXT,
     publication_remote_oid TEXT,
+    pr_conflict_recovery INTEGER NOT NULL DEFAULT 0,
+    pr_conflict_head_oid TEXT,
+    pr_conflict_base_oid TEXT,
     plan_sha TEXT,
     phase TEXT,
     branch TEXT,
@@ -186,6 +193,9 @@ CREATE TABLE IF NOT EXISTS exec_plans (
     active_sha TEXT,
     validated_base_sha TEXT,
     publication_remote_oid TEXT,
+    pr_conflict_recovery INTEGER NOT NULL DEFAULT 0,
+    pr_conflict_head_oid TEXT,
+    pr_conflict_base_oid TEXT,
     branch TEXT,
     worktree TEXT,
     pr_url TEXT,
@@ -967,6 +977,9 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
         "review_result": "TEXT",
         "validated_base_sha": "TEXT",
         "publication_remote_oid": "TEXT",
+        "pr_conflict_recovery": "INTEGER NOT NULL DEFAULT 0",
+        "pr_conflict_head_oid": "TEXT",
+        "pr_conflict_base_oid": "TEXT",
         "pr_head_oid": "TEXT",
         "verify_failure_history": "TEXT NOT NULL DEFAULT '{}'",
         "review_failure_history": "TEXT NOT NULL DEFAULT '{}'",
@@ -1029,6 +1042,9 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
         "planning_error_fingerprint": "TEXT",
         "validated_base_sha": "TEXT",
         "publication_remote_oid": "TEXT",
+        "pr_conflict_recovery": "INTEGER NOT NULL DEFAULT 0",
+        "pr_conflict_head_oid": "TEXT",
+        "pr_conflict_base_oid": "TEXT",
         "pr_head_oid": "TEXT",
         "agent_role": "TEXT",
         "agent_snapshot": "TEXT",
@@ -2040,7 +2056,9 @@ def activate_ready_execplan(
             """
             UPDATE projects
             SET active_sha = ?, validated_base_sha = NULL,
-                publication_remote_oid = NULL, plan_sha = ?, phase = 'WORKING',
+                publication_remote_oid = NULL, pr_conflict_recovery = 0,
+                pr_conflict_head_oid = NULL, pr_conflict_base_oid = NULL,
+                plan_sha = ?, phase = 'WORKING',
                 branch = ?, worktree = ?, plan_path = ?, pr_url = NULL,
                 pr_head_oid = NULL, last_error = NULL,
                 worker_session_id = NULL, reviewer_session_id = NULL,
@@ -2073,7 +2091,9 @@ def hydrate_active_project(connection: sqlite3.Connection, repo: str) -> None:
         """
         UPDATE projects
         SET active_sha = ?, validated_base_sha = ?, publication_remote_oid = ?,
-            plan_sha = ?, phase = ?, branch = ?, worktree = ?, plan_path = ?,
+            pr_conflict_recovery = ?, pr_conflict_head_oid = ?,
+            pr_conflict_base_oid = ?, plan_sha = ?, phase = ?, branch = ?,
+            worktree = ?, plan_path = ?,
             pr_url = ?, pr_head_oid = ?, last_error = ?, worker_session_id = ?,
             reviewer_session_id = ?, worker_result = ?, verify_result = ?, review_result = ?
         WHERE repo = ?
@@ -2082,6 +2102,9 @@ def hydrate_active_project(connection: sqlite3.Connection, repo: str) -> None:
             plan["active_sha"],
             plan["validated_base_sha"],
             plan["publication_remote_oid"],
+            plan["pr_conflict_recovery"],
+            plan["pr_conflict_head_oid"],
+            plan["pr_conflict_base_oid"],
             plan["plan_sha"],
             phase,
             plan["branch"],
@@ -2120,6 +2143,9 @@ def _mirror_project_update_to_execplan(
         "active_sha",
         "validated_base_sha",
         "publication_remote_oid",
+        "pr_conflict_recovery",
+        "pr_conflict_head_oid",
+        "pr_conflict_base_oid",
         "plan_sha",
         "branch",
         "worktree",
@@ -3843,7 +3869,7 @@ def clear_validation_failure_history(
 
 
 def pr_for_branch(repo: Path, branch: str, url: str | None = None) -> dict[str, object] | None:
-    fields = "url,state,mergedAt,headRefOid,headRefName"
+    fields = "url,state,mergedAt,headRefOid,headRefName,mergeable"
     if url:
         result = command(["gh", "pr", "view", url, "--json", fields], cwd=repo)
         return json.loads(result.stdout)
@@ -3854,6 +3880,175 @@ def pr_for_branch(repo: Path, branch: str, url: str | None = None) -> dict[str, 
     rows = json.loads(result.stdout)
     return rows[0] if rows else None
 
+
+def classify_pull_request_mergeability(
+    pull_request: Mapping[str, object],
+) -> str:
+    """Normalize GitHub's asynchronous mergeability result."""
+
+    value = str(pull_request.get("mergeable") or "UNKNOWN").upper()
+    if value == "CONFLICTING":
+        return "conflicting"
+    if value == "MERGEABLE":
+        return "mergeable"
+    return "unknown"
+
+
+def _fetch_pr_conflict_recovery_refs(
+    repo_path: Path,
+    base: str,
+    branch: str,
+) -> None:
+    fetched = git(
+        repo_path,
+        "fetch",
+        "origin",
+        f"+refs/heads/{base}:refs/remotes/origin/{base}",
+        f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+        check=False,
+    )
+    if fetched.returncode:
+        raise RuntimeError(
+            "PR 충돌 복구에 필요한 원격 base/head ref를 가져올 수 없습니다:\n"
+            + fetched.stdout[-8000:]
+        )
+
+
+def _validate_pr_conflict_recovery_ownership(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    state_dir: Path,
+    repo: str,
+    project: sqlite3.Row,
+    pull_request: Mapping[str, object],
+) -> tuple[sqlite3.Row, Path, str, str, str]:
+    """Prove the saved URL, branch, workspace, and observed remote head."""
+
+    plan = active_execplan(connection, repo)
+    plan_id = _plan_id_from_path(str(project["plan_path"] or ""))
+    branch = str(project["branch"] or "")
+    worktree = Path(str(project["worktree"] or ""))
+    url = str(pull_request.get("url") or "")
+    head_name = str(pull_request.get("headRefName") or "")
+    head_oid = str(pull_request.get("headRefOid") or "")
+    stored_url = str(project["pr_url"] or "")
+    stored_head = str(project["pr_head_oid"] or "")
+    if (
+        plan is None
+        or plan["status"] != "PR_OPEN"
+        or plan_id is None
+        or str(plan["plan_id"]) != plan_id
+        or int(plan["workspace_owned"]) != WORKSPACE_OWNED
+        or str(plan["branch"] or "") != branch
+        or Path(str(plan["worktree"] or "")) != worktree
+    ):
+        raise PublicationSafetyError(
+            "PR 충돌 복구 workspace의 SQLite 소유권을 확인할 수 없습니다."
+        )
+    if not stored_url or url != stored_url:
+        raise PublicationSafetyError(
+            "PR 충돌 복구 URL이 저장된 소유 PR과 일치하지 않습니다."
+        )
+    if not branch or head_name != branch:
+        raise PublicationSafetyError(
+            "PR 충돌 복구 head branch가 관리 branch와 일치하지 않습니다."
+        )
+    if (
+        not head_oid
+        or re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", head_oid) is None
+        or not stored_head
+        or head_oid != stored_head
+    ):
+        raise PublicationSafetyError(
+            "PR 충돌 복구 head OID가 저장된 PR head와 일치하지 않습니다."
+        )
+    validate_execplan_workspace_identity(
+        state_dir, repo, plan_id, branch, worktree
+    )
+    make_worktree(
+        repo_path,
+        worktree,
+        branch,
+        str(project["base_branch"]),
+        allow_create_branch=False,
+        allow_recovery=True,
+        allow_existing=True,
+    )
+    snapshot = capture_git_snapshot(worktree)
+    if snapshot.head != head_oid or snapshot.dirty or snapshot.operations:
+        raise PublicationSafetyError(
+            "PR 충돌 복구 시작 전 관리 worktree가 관측한 원격 head의 "
+            "clean 상태와 일치하지 않습니다."
+        )
+    remote_oid = remote_branch_oid(repo_path, branch)
+    if remote_oid != head_oid:
+        raise PublicationSafetyError(
+            "PR 충돌 복구 시작 전 원격 branch가 관측한 PR head와 "
+            "일치하지 않습니다."
+        )
+    base_oid = git(
+        repo_path,
+        "rev-parse",
+        f"refs/remotes/origin/{project['base_branch']}^{{commit}}",
+    ).stdout.strip()
+    return plan, worktree, branch, head_oid, base_oid
+
+
+def _validate_active_pr_conflict_recovery(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    state_dir: Path,
+    repo: str,
+    project: sqlite3.Row,
+    pull_request: Mapping[str, object],
+) -> None:
+    """Revalidate races without resetting an in-progress recovery stage."""
+
+    plan = active_execplan(connection, repo)
+    branch = str(project["branch"] or "")
+    worktree = Path(str(project["worktree"] or ""))
+    observed_head = str(project["pr_conflict_head_oid"] or "")
+    if (
+        plan is None
+        or not int(plan["pr_conflict_recovery"])
+        or int(plan["workspace_owned"]) != WORKSPACE_OWNED
+        or str(plan["branch"] or "") != branch
+        or Path(str(plan["worktree"] or "")) != worktree
+    ):
+        raise PublicationSafetyError(
+            "진행 중인 PR 충돌 복구의 SQLite 소유권을 확인할 수 없습니다."
+        )
+    if (
+        str(pull_request.get("url") or "") != str(project["pr_url"] or "")
+        or str(pull_request.get("headRefName") or "") != branch
+        or not observed_head
+        or str(pull_request.get("headRefOid") or "") != observed_head
+    ):
+        raise PublicationSafetyError(
+            "진행 중인 PR의 URL, head branch 또는 head OID가 복구 시작 시 "
+            "관측값과 달라졌습니다."
+        )
+    _fetch_pr_conflict_recovery_refs(
+        repo_path, str(project["base_branch"]), branch
+    )
+    if remote_branch_oid(repo_path, branch) != observed_head:
+        raise PublicationSafetyError(
+            "진행 중인 PR의 원격 head가 복구 시작 시 관측값과 달라졌습니다."
+        )
+    validate_execplan_workspace_identity(
+        state_dir, repo, str(plan["plan_id"]), branch, worktree
+    )
+    make_worktree(
+        repo_path,
+        worktree,
+        branch,
+        str(project["base_branch"]),
+        allow_create_branch=False,
+        allow_recovery=True,
+        allow_existing=True,
+        allow_rebase=_rebase_in_progress_for_branch(worktree, branch),
+
+    )
 
 def remote_branch_oid(repo: Path, branch: str) -> str | None:
     """Return the fetched remote branch OID without consulting local branch names."""
@@ -4013,8 +4208,193 @@ def push_managed_publication_branch(
     return local_oid
 
 
+def push_owned_pr_conflict_recovery(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    state_dir: Path,
+    repo: str,
+    branch: str,
+    worktree: Path,
+    pull_request: Mapping[str, object],
+) -> str:
+    """Rewrite only the proven owned PR head with its observed explicit lease."""
+
+    plan = active_execplan(connection, repo)
+    project = connection.execute(
+        "SELECT base_branch FROM projects WHERE repo = ?", (repo,)
+    ).fetchone()
+    if (
+        project is None
+        or plan is None
+        or plan["status"] != "PUBLISHING"
+        or not int(plan["pr_conflict_recovery"])
+        or int(plan["workspace_owned"]) != WORKSPACE_OWNED
+        or str(plan["branch"] or "") != branch
+        or Path(str(plan["worktree"] or "")) != worktree
+    ):
+        raise PublicationSafetyError(
+            "기존 PR 충돌 복구 게시 소유권을 SQLite에서 확인할 수 없습니다."
+        )
+    url = str(plan["pr_url"] or "")
+    observed_head = str(plan["pr_conflict_head_oid"] or "")
+    target_base = str(plan["pr_conflict_base_oid"] or "")
+    if (
+        str(pull_request.get("state") or "").upper() != "OPEN"
+        or str(pull_request.get("url") or "") != url
+        or str(pull_request.get("headRefName") or "") != branch
+        or str(pull_request.get("headRefOid") or "") != observed_head
+    ):
+        raise PublicationSafetyError(
+            "게시 직전 PR URL, state, head branch 또는 head OID가 복구 "
+            "시작 시 관측값과 다릅니다."
+        )
+    if (
+        not observed_head
+        or not target_base
+        or str(plan["active_sha"] or "") != target_base
+        or str(plan["validated_base_sha"] or "") != target_base
+    ):
+        raise PublicationSafetyError(
+            "기존 PR 충돌 복구의 lease OID와 검증 base가 완전하지 않습니다."
+        )
+    validate_execplan_workspace_identity(
+        state_dir, repo, str(plan["plan_id"]), branch, worktree
+    )
+    validate_managed_worktree(repo_path, worktree, branch)
+    local_oid = git(worktree, "rev-parse", "HEAD").stdout.strip()
+    contains_base = git(
+        worktree,
+        "merge-base",
+        "--is-ancestor",
+        target_base,
+        local_oid,
+        check=False,
+    )
+    if contains_base.returncode != 0:
+        raise PublicationSafetyError(
+            "검증된 base OID가 게시할 관리 HEAD의 조상이 아닙니다."
+        )
+
+    _fetch_pr_conflict_recovery_refs(
+        repo_path,
+        str(project["base_branch"]),
+        branch,
+    )
+    remote_oid = remote_branch_oid(repo_path, branch)
+    if remote_oid != observed_head:
+        raise PublicationSafetyError(
+            "게시 직전 원격 PR head가 복구 시작 시 관측값과 달라졌습니다."
+        )
+    lease = f"--force-with-lease=refs/heads/{branch}:{observed_head}"
+    pushed = git(
+        worktree,
+        "push",
+        lease,
+        "-u",
+        "origin",
+        f"HEAD:refs/heads/{branch}",
+        check=False,
+    )
+    if pushed.returncode:
+        normalized = pushed.stdout.casefold()
+        if any(
+            marker in normalized
+            for marker in ("stale info", "fetch first", "rejected", "lease")
+        ):
+            raise PublicationSafetyError(
+                "기존 PR branch lease가 거부되어 원격 변경을 덮어쓰지 않았습니다:\n"
+                + pushed.stdout[-8000:]
+            )
+        raise RuntimeError(
+            f"기존 PR 충돌 복구 push 실패:\n{pushed.stdout[-8000:]}"
+        )
+
+    git(
+        repo_path,
+        "fetch",
+        "origin",
+        f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+    )
+    if remote_branch_oid(repo_path, branch) != local_oid:
+        raise RuntimeError(
+            "기존 PR 충돌 복구 push 결과를 원격에서 확인할 수 없습니다."
+        )
+    return local_oid
+
+def recover_confirmed_pr_conflict_push(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    state_dir: Path,
+    repo: str,
+    project: sqlite3.Row,
+    pull_request: Mapping[str, object],
+) -> bool:
+    """Recover only a previously pushed local HEAD, never an arbitrary remote head."""
+
+    if (
+        project["phase"] != "PUBLISHING"
+        or not int(project["pr_conflict_recovery"])
+    ):
+        return False
+    plan = active_execplan(connection, repo)
+    branch = str(project["branch"] or "")
+    worktree = Path(str(project["worktree"] or ""))
+    remote_head = str(pull_request.get("headRefOid") or "")
+    observed_head = str(project["pr_conflict_head_oid"] or "")
+    target_base = str(project["pr_conflict_base_oid"] or "")
+    if (
+        plan is None
+        or plan["status"] != "PUBLISHING"
+        or not int(plan["pr_conflict_recovery"])
+        or int(plan["workspace_owned"]) != WORKSPACE_OWNED
+        or str(pull_request.get("state") or "").upper() != "OPEN"
+        or str(pull_request.get("url") or "") != str(project["pr_url"] or "")
+        or str(pull_request.get("headRefName") or "") != branch
+        or not remote_head
+        or remote_head == observed_head
+        or not target_base
+        or str(project["active_sha"] or "") != target_base
+        or str(project["validated_base_sha"] or "") != target_base
+    ):
+        return False
+    validate_execplan_workspace_identity(
+        state_dir, repo, str(plan["plan_id"]), branch, worktree
+    )
+    validate_managed_worktree(repo_path, worktree, branch)
+    local_oid = git(worktree, "rev-parse", "HEAD").stdout.strip()
+    if remote_head != local_oid:
+        return False
+    contains_base = git(
+        worktree,
+        "merge-base",
+        "--is-ancestor",
+        target_base,
+        local_oid,
+        check=False,
+    )
+    if contains_base.returncode != 0:
+        return False
+    _fetch_pr_conflict_recovery_refs(
+        repo_path, str(project["base_branch"]), branch
+    )
+    if remote_branch_oid(repo_path, branch) != local_oid:
+        return False
+    update_project(
+        connection,
+        repo,
+        phase="PR_OPEN",
+        publication_remote_oid=local_oid,
+        pr_head_oid=local_oid,
+        pr_conflict_recovery=0,
+        pr_conflict_head_oid=None,
+        pr_conflict_base_oid=None,
+        last_error=None,
+    )
+    return True
+
 def _canonical_path(path: Path) -> Path:
     return path.expanduser().resolve(strict=False)
+
 
 
 
@@ -5539,6 +5919,9 @@ def _clear_active_values(
         "active_sha": None,
         "validated_base_sha": None,
         "publication_remote_oid": None,
+        "pr_conflict_recovery": 0,
+        "pr_conflict_head_oid": None,
+        "pr_conflict_base_oid": None,
         "plan_sha": None,
         "phase": None,
         "branch": None,
@@ -6634,6 +7017,8 @@ def block_active_execplan(
             """
             UPDATE exec_plans
             SET status = 'BLOCKED', blocked_fingerprint = ?,
+                blocked_reason = CASE WHEN blocked_reason = 'pull-request-closed'
+                    THEN NULL ELSE blocked_reason END,
                 blocked_worktree_fingerprint = ?, last_error = ?, verify_result = ?
             WHERE repo = ? AND plan_id = ?
             """,
@@ -6822,6 +7207,8 @@ def block_active_execplan_from_revision(
             """
             UPDATE exec_plans
             SET status = 'BLOCKED', blocked_fingerprint = ?,
+                blocked_reason = CASE WHEN blocked_reason = 'pull-request-closed'
+                    THEN NULL ELSE blocked_reason END,
                 blocked_worktree_fingerprint = NULL, last_error = ?, verify_result = ?
             WHERE repo = ? AND plan_id = ?
             """,
@@ -8364,6 +8751,43 @@ def _requeue_blocked_execplan(
     repo: str,
     plan_id: str,
 ) -> None:
+    plan = connection.execute(
+        "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+        (repo, plan_id),
+    ).fetchone()
+    if plan is not None and int(plan["pr_conflict_recovery"]):
+        with connection:
+            connection.execute(
+                """
+                UPDATE exec_plans
+                SET status = 'IMPLEMENTING', blocked_fingerprint = NULL,
+                    blocked_worktree_fingerprint = NULL, retry_count = 0,
+                    blocked_reason = NULL, guidance_plan_hash = NULL,
+                    validated_base_sha = NULL, verify_result = NULL,
+                    review_result = NULL, last_error = ?,
+                    verify_failure_history = '{}',
+                    review_failure_history = '{}',
+                    effective_worker_level = initial_worker_level,
+                    review_level_history = '{}'
+                WHERE repo = ? AND plan_id = ?
+                """,
+                (REBASE_IN_PROGRESS_ERROR, repo, plan_id),
+            )
+            connection.execute(
+                """
+                UPDATE projects
+                SET phase = 'WORKING', validated_base_sha = NULL,
+                    verify_result = NULL, review_result = NULL, last_error = ?,
+                    agent_role = NULL, agent_snapshot = NULL,
+                    agent_input_fingerprint = NULL, agent_baseline = NULL,
+                    agent_recovery = NULL, agent_input_plan = NULL,
+                    agent_result_plan = NULL, agent_result_snapshot = NULL,
+                    agent_manager_snapshot = NULL
+                WHERE repo = ?
+                """,
+                (REBASE_IN_PROGRESS_ERROR, repo),
+            )
+        return
     values = _clear_active_values()
     assignments = ", ".join(f"{name} = ?" for name in values)
     with connection:
@@ -8659,7 +9083,9 @@ def complete_merged_worktree(
             )
         if plan_id:
             connection.execute(
-                "UPDATE exec_plans SET status = 'MERGED', last_error = NULL WHERE repo = ? AND plan_id = ?",
+                "UPDATE exec_plans SET status = 'MERGED', last_error = NULL, "
+                "pr_conflict_recovery = 0, pr_conflict_head_oid = NULL, "
+                "pr_conflict_base_oid = NULL WHERE repo = ? AND plan_id = ?",
                 (repo, plan_id),
             )
             notifications.record_merged_plan(connection, repo, plan_id, str(plan["title"]))
@@ -8679,6 +9105,95 @@ def complete_merged_worktree(
     return assessment
 
 
+def _block_closed_pull_request(
+    connection: sqlite3.Connection,
+    repo: str,
+    plan: sqlite3.Row,
+    url: str,
+    head_oid: object,
+) -> None:
+    error = "PR이 Merge 없이 닫혔습니다."
+    with connection:
+        connection.execute(
+            """
+            UPDATE exec_plans
+            SET status = 'BLOCKED', blocked_reason = ?,
+                pr_url = ?, pr_head_oid = ?, last_error = ?
+            WHERE repo = ? AND plan_id = ?
+            """,
+            (
+                PR_CLOSED_BLOCK_REASON,
+                url,
+                head_oid,
+                error,
+                repo,
+                plan["plan_id"],
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE projects
+            SET phase = 'BLOCKED', pr_url = ?, pr_head_oid = ?,
+                last_error = ?
+            WHERE repo = ?
+            """,
+            (url, head_oid, error, repo),
+        )
+        notifications.enqueue_current_project_events(connection, repo)
+
+
+def _resume_reopened_pull_request(
+    connection: sqlite3.Connection,
+    repo: str,
+    plan: sqlite3.Row,
+    url: str,
+    head_oid: object,
+    *,
+    recovery: bool,
+) -> None:
+    phase = "WORKING" if recovery else "PR_OPEN"
+    status = "IMPLEMENTING" if recovery else "PR_OPEN"
+    last_error = REBASE_IN_PROGRESS_ERROR if recovery else None
+    execplan_values: dict[str, object] = {
+        "status": status,
+        "blocked_reason": None,
+        "blocked_fingerprint": None,
+        "blocked_worktree_fingerprint": None,
+        "pr_url": url,
+        "pr_head_oid": head_oid,
+        "last_error": last_error,
+    }
+    project_values: dict[str, object] = {
+        "phase": phase,
+        "pr_url": url,
+        "pr_head_oid": head_oid,
+        "last_error": last_error,
+    }
+    if recovery:
+        for values in (execplan_values, project_values):
+            values.update(
+                validated_base_sha=None,
+                verify_result=None,
+                review_result=None,
+            )
+    execplan_assignments = ", ".join(
+        f"{name} = ?" for name in execplan_values
+    )
+    project_assignments = ", ".join(
+        f"{name} = ?" for name in project_values
+    )
+    with connection:
+        connection.execute(
+            f"UPDATE exec_plans SET {execplan_assignments} "
+            "WHERE repo = ? AND plan_id = ?",
+            (*execplan_values.values(), repo, plan["plan_id"]),
+        )
+        connection.execute(
+            f"UPDATE projects SET {project_assignments} WHERE repo = ?",
+            (*project_values.values(), repo),
+        )
+        notifications.enqueue_current_project_events(connection, repo)
+
 def reconcile_existing_pull_request(
     connection: sqlite3.Connection,
     repo_path: Path,
@@ -8686,7 +9201,7 @@ def reconcile_existing_pull_request(
     repo: str,
     project: sqlite3.Row,
     pull_request: Mapping[str, object],
-) -> int:
+) -> int | None:
     """Attach one existing head-branch PR and apply its durable state."""
 
     branch = str(project["branch"] or "")
@@ -8700,15 +9215,160 @@ def reconcile_existing_pull_request(
         )
     head_value = pull_request.get("headRefOid")
     head_oid = str(head_value) if head_value else project["pr_head_oid"]
-    update_project(
-        connection,
-        repo,
-        pr_url=url,
-        pr_head_oid=head_oid,
-    )
     state = str(pull_request.get("state") or "OPEN").upper()
+    blocked_plan = (
+        active_execplan(connection, repo)
+        if project["phase"] == "BLOCKED"
+        else None
+    )
+    reopening_closed_pr = bool(
+        state == "OPEN"
+        and blocked_plan is not None
+        and blocked_plan["blocked_reason"] == PR_CLOSED_BLOCK_REASON
+    )
+    if (
+        state in {"OPEN", "CLOSED"}
+        and project["phase"] == "BLOCKED"
+        and blocked_plan is not None
+        and blocked_plan["blocked_reason"] != PR_CLOSED_BLOCK_REASON
+    ):
+        operation_print(
+            "PR 충돌 복구 차단 상태를 유지합니다: "
+            + str(project["last_error"] or "사용자 조치가 필요합니다."),
+            file=sys.stderr,
+        )
+        return 1
+    if state != "OPEN" or (
+        project["phase"] != "PR_OPEN"
+        and not int(project["pr_conflict_recovery"])
+    ):
+        update_project(
+            connection,
+            repo,
+            pr_url=url,
+            pr_head_oid=head_oid,
+        )
 
     if state == "OPEN":
+        if int(project["pr_conflict_recovery"]):
+            try:
+                if recover_confirmed_pr_conflict_push(
+                    connection,
+                    repo_path,
+                    state_dir,
+                    repo,
+                    project,
+                    pull_request,
+                ):
+                    operation_print(
+                        f"기존 PR 충돌 복구 push 확인 완료: {url}"
+                    )
+                    return 0
+                _validate_active_pr_conflict_recovery(
+                    connection,
+                    repo_path,
+                    state_dir,
+                    repo,
+                    project,
+                    pull_request,
+                )
+            except (
+                PublicationSafetyError,
+                WorkspaceOwnershipError,
+            ) as error:
+                recovery_error = f"PR 충돌 복구 안전 검증 실패: {error}"
+                block_active_execplan_from_revision(
+                    connection,
+                    repo_path,
+                    repo,
+                    f"refs/remotes/origin/{project['base_branch']}",
+                    recovery_error,
+                    str(project["verify_result"] or ""),
+                )
+                operation_print(recovery_error, file=sys.stderr)
+                return 1
+            if project["phase"] in {"PR_OPEN", "BLOCKED"}:
+                if reopening_closed_pr:
+                    assert blocked_plan is not None
+                    _resume_reopened_pull_request(
+                        connection,
+                        repo,
+                        blocked_plan,
+                        url,
+                        head_oid,
+                        recovery=True,
+                    )
+                else:
+                    update_project(
+                        connection,
+                        repo,
+                        phase="WORKING",
+                        validated_base_sha=None,
+                        verify_result=None,
+                        review_result=None,
+                        last_error=REBASE_IN_PROGRESS_ERROR,
+                    )
+            return None
+
+        if project["phase"] == "PR_OPEN":
+            try:
+                _fetch_pr_conflict_recovery_refs(
+                    repo_path, str(project["base_branch"]), branch
+                )
+                (
+                    _plan,
+                    _worktree,
+                    _branch,
+                    observed_head,
+                    base_oid,
+                ) = _validate_pr_conflict_recovery_ownership(
+                    connection,
+                    repo_path,
+                    state_dir,
+                    repo,
+                    project,
+                    pull_request,
+                )
+            except (
+                PublicationSafetyError,
+                WorkspaceOwnershipError,
+            ) as error:
+                recovery_error = f"PR_OPEN 충돌 복구 소유권 검증 실패: {error}"
+                block_active_execplan_from_revision(
+                    connection,
+                    repo_path,
+                    repo,
+                    f"refs/remotes/origin/{project['base_branch']}",
+                    recovery_error,
+                    str(project["verify_result"] or ""),
+                )
+                operation_print(recovery_error, file=sys.stderr)
+                return 1
+
+            mergeability = classify_pull_request_mergeability(pull_request)
+            if mergeability != "conflicting":
+                if mergeability == "unknown":
+                    operation_print(
+                        f"PR mergeability 계산 대기 중: {url}"
+                    )
+                else:
+                    operation_print(f"Merge 대기 중: {url}")
+                return 0
+
+            update_project(
+                connection,
+                repo,
+                phase="WORKING",
+                validated_base_sha=None,
+                pr_conflict_recovery=1,
+                pr_conflict_head_oid=observed_head,
+                pr_conflict_base_oid=base_oid,
+                verify_result=None,
+                review_result=None,
+                last_error=REBASE_IN_PROGRESS_ERROR,
+            )
+            operation_print(f"PR 충돌 자동 복구 시작: {url}")
+            return None
         plan_id = _plan_id_from_path(str(project["plan_path"] or ""))
         worktree = Path(str(project["worktree"] or ""))
         try:
@@ -8754,14 +9414,25 @@ def reconcile_existing_pull_request(
             )
             operation_print(workspace_error, file=sys.stderr)
             return 1
-        update_project(
-            connection,
-            repo,
-            phase="PR_OPEN",
-            pr_url=url,
-            pr_head_oid=head_oid,
-            last_error=None,
-        )
+        if reopening_closed_pr:
+            assert blocked_plan is not None
+            _resume_reopened_pull_request(
+                connection,
+                repo,
+                blocked_plan,
+                url,
+                head_oid,
+                recovery=False,
+            )
+        else:
+            update_project(
+                connection,
+                repo,
+                phase="PR_OPEN",
+                pr_url=url,
+                pr_head_oid=head_oid,
+                last_error=None,
+            )
         operation_print(f"Merge 대기 중: {url}")
         return 0
 
@@ -8811,20 +9482,134 @@ def reconcile_existing_pull_request(
         return PROJECT_STEP_PLANNING_PENDING
 
     if state == "CLOSED":
-        error = "PR이 Merge 없이 닫혔습니다."
-        update_project(
-            connection,
-            repo,
-            phase="BLOCKED",
-            pr_url=url,
-            pr_head_oid=head_oid,
-            last_error=error,
-        )
+        plan = active_execplan(connection, repo)
+        if plan is None:
+            raise RuntimeError("닫힌 PR과 연결된 활성 ExecPlan을 찾을 수 없습니다.")
+        _block_closed_pull_request(connection, repo, plan, url, head_oid)
         operation_print(f"닫힌 PR을 다시 열어야 합니다: {url}", file=sys.stderr)
         return 1
 
     raise RuntimeError(f"지원하지 않는 GitHub PR 상태입니다: {state}")
 
+
+def resume_pr_conflict_rebase(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    repo: str,
+    project: sqlite3.Row,
+    worktree: Path,
+    branch: str,
+) -> int | None:
+    """Resume the Manager-owned rebase only after its intent is durable."""
+
+    if (
+        not int(project["pr_conflict_recovery"])
+        or project["phase"] != "WORKING"
+        or project["last_error"] != REBASE_IN_PROGRESS_ERROR
+        or _rebase_in_progress_for_branch(worktree, branch)
+    ):
+        return None
+    plan = active_execplan(connection, repo)
+    target_base = str(project["pr_conflict_base_oid"] or "")
+    observed_head = str(project["pr_conflict_head_oid"] or "")
+    if (
+        plan is None
+        or not int(plan["pr_conflict_recovery"])
+        or not target_base
+        or not observed_head
+    ):
+        error = "PR 충돌 복구 rebase marker 또는 관측 OID가 유효하지 않습니다."
+        block_active_execplan(
+            connection,
+            repo,
+            worktree,
+            error,
+            str(project["verify_result"] or ""),
+        )
+        operation_print(error, file=sys.stderr)
+        return 1
+
+    latest_base = git(
+        repo_path,
+        "rev-parse",
+        f"refs/remotes/origin/{project['base_branch']}^{{commit}}",
+    ).stdout.strip()
+    if latest_base != target_base:
+        target_base = latest_base
+        update_project(
+            connection,
+            repo,
+            pr_conflict_base_oid=target_base,
+            validated_base_sha=None,
+            verify_result=None,
+            review_result=None,
+            last_error=REBASE_IN_PROGRESS_ERROR,
+        )
+
+    ancestry = git(
+        worktree,
+        "merge-base",
+        "--is-ancestor",
+        target_base,
+        "HEAD",
+        check=False,
+    )
+    if ancestry.returncode == 0:
+        update_project(
+            connection,
+            repo,
+            active_sha=target_base,
+            phase="VERIFYING",
+            last_error=None,
+        )
+        return 0
+    if ancestry.returncode != 1:
+        error = (
+            "PR 충돌 복구 base ancestry 확인 실패:\n"
+            + ancestry.stdout[-8000:]
+        )
+        block_active_execplan(
+            connection,
+            repo,
+            worktree,
+            error,
+            str(project["verify_result"] or ""),
+        )
+        operation_print(error, file=sys.stderr)
+        return 1
+
+    rebased = git(worktree, "rebase", target_base, check=False)
+    if rebased.returncode and is_git_lock_failure(rebased.stdout):
+        raise GitLockError(rebased.stdout[-8000:])
+    if rebased.returncode == 0:
+        update_project(
+            connection,
+            repo,
+            active_sha=target_base,
+            phase="VERIFYING",
+            last_error=None,
+        )
+        return 0
+    if _rebase_in_progress_for_branch(worktree, branch):
+        update_project(
+            connection,
+            repo,
+            phase="WORKING",
+            validated_base_sha=None,
+            last_error=REBASE_CONFLICT_PREFIX + rebased.stdout[-8000:],
+        )
+        return 0
+
+    error = f"PR 충돌 복구 rebase 실패:\n{rebased.stdout[-8000:]}"
+    block_active_execplan(
+        connection,
+        repo,
+        worktree,
+        error,
+        str(project["verify_result"] or ""),
+    )
+    operation_print(error, file=sys.stderr)
+    return 1
 
 def planner_prompt(error: str | None, compact_catalog: str = "[]") -> str:
     failure = f"\n이전 실행에서 다음 문제가 발생했다. 원인을 해결하라:\n{error[-6000:]}\n" if error else ""
@@ -9800,11 +10585,20 @@ def _run_project_step(
         "rev-parse",
         f"refs/remotes/origin/{base}^{{commit}}",
     ).stdout.strip()
-    sync_result = ensure_safe_base_worktree(
-        repo_path,
-        base,
-        remote_sha=base_sha,
-    )
+    if row is not None and (
+        row["phase"] == "PR_OPEN" or int(row["pr_conflict_recovery"])
+    ):
+        sync_result = BaseWorktreeSyncResult(
+            "skipped",
+            "PR 충돌 감지/복구 중 source checkout 보존",
+            base_sha,
+        )
+    else:
+        sync_result = ensure_safe_base_worktree(
+            repo_path,
+            base,
+            remote_sha=base_sha,
+        )
     if isinstance(sync_result, BaseWorktreeSyncResult):
         log_base_worktree_sync(repo_path, sync_result)
 
@@ -9845,7 +10639,7 @@ def _run_project_step(
         existing_pr = pr_for_branch(repo_path, row["branch"], row["pr_url"])
         if existing_pr:
             try:
-                return reconcile_existing_pull_request(
+                reconciliation = reconcile_existing_pull_request(
                     connection,
                     repo_path,
                     state_dir,
@@ -9853,6 +10647,11 @@ def _run_project_step(
                     row,
                     existing_pr,
                 )
+                if reconciliation is not None:
+                    return reconciliation
+                row = connection.execute(
+                    "SELECT * FROM projects WHERE repo = ?", (repo,)
+                ).fetchone()
             except PublicationSafetyError as error:
                 publication_error = f"기존 PR 복구 거부: {error}"
                 block_active_execplan_from_revision(
@@ -10550,14 +11349,40 @@ def _run_project_step(
         operation_print(workspace_error, file=sys.stderr)
         return 1
 
-    if rebase_recovery and not resolving_rebase:
-        update_project(
+    if int(row["pr_conflict_recovery"]):
+        recovery_rebase = resume_pr_conflict_rebase(
             connection,
+            repo_path,
             repo,
-            phase="VERIFYING",
-            last_error=None,
+            row,
+            worktree,
+            branch,
         )
-        row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
+        if recovery_rebase == 1:
+            return 1
+        row = connection.execute(
+            "SELECT * FROM projects WHERE repo = ?", (repo,)
+        ).fetchone()
+        rebase_error = str(row["last_error"] or "")
+        rebase_recovery = bool(
+            row["phase"] == "WORKING"
+            and (
+                rebase_error == REBASE_IN_PROGRESS_ERROR
+                or rebase_error.startswith(REBASE_CONFLICT_PREFIX)
+            )
+        )
+        resolving_rebase = bool(
+            rebase_recovery
+            and _rebase_in_progress_for_branch(worktree, branch)
+        )
+
+    if rebase_recovery and not resolving_rebase and not int(row["pr_conflict_recovery"]):
+        update_project(
+            connection, repo, phase="VERIFYING", last_error=None
+        )
+        row = connection.execute(
+            "SELECT * FROM projects WHERE repo = ?", (repo,)
+        ).fetchone()
     assert catalog_plan is not None
     try:
         plan = validate_active_execplan_metadata(
@@ -10850,11 +11675,13 @@ def _run_project_step(
                 )
                 operation_print(no_change_error, file=sys.stderr)
                 return 1
-            latest_sha = git(
-                worktree,
-                "rev-parse",
-                f"origin/{base}",
-            ).stdout.strip()
+            latest_sha = (
+                str(row["pr_conflict_base_oid"])
+                if int(row["pr_conflict_recovery"])
+                else git(
+                    worktree, "rev-parse", f"origin/{base}"
+                ).stdout.strip()
+            )
             update_project(connection, repo, active_sha=latest_sha)
             if validate_guidance_publication(
                 connection, repo, worktree, catalog_plan, message,
@@ -11013,9 +11840,13 @@ def _run_project_step(
                 repo,
                 phase="WORKING",
                 validated_base_sha=None,
+                pr_conflict_base_oid=(
+                    latest_sha if int(row["pr_conflict_recovery"])
+                    else row["pr_conflict_base_oid"]
+                ),
                 last_error=REBASE_IN_PROGRESS_ERROR,
             )
-            rebased = git(worktree, "rebase", f"origin/{base}", check=False)
+            rebased = git(worktree, "rebase", latest_sha, check=False)
             if rebased.returncode:
                 if _rebase_in_progress_for_branch(worktree, branch):
                     if validate_guidance_publication(
@@ -11279,10 +12110,14 @@ def _run_project_step(
 
     row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
     if row["phase"] == "PUBLISHING":
-        existing_pr = pr_for_branch(repo_path, branch)
+        existing_pr = pr_for_branch(
+            repo_path,
+            branch,
+            str(row["pr_url"]) if int(row["pr_conflict_recovery"]) else None,
+        )
         if existing_pr:
             try:
-                return reconcile_existing_pull_request(
+                reconciliation = reconcile_existing_pull_request(
                     connection,
                     repo_path,
                     state_dir,
@@ -11290,6 +12125,11 @@ def _run_project_step(
                     row,
                     existing_pr,
                 )
+                if reconciliation is not None:
+                    return reconciliation
+                row = connection.execute(
+                    "SELECT * FROM projects WHERE repo = ?", (repo,)
+                ).fetchone()
             except PublicationSafetyError as error:
                 publication_error = f"기존 PR 복구 거부: {error}"
                 block_active_execplan(
@@ -11306,17 +12146,22 @@ def _run_project_step(
         latest_sha = git(
             repo_path, "rev-parse", f"origin/{base}"
         ).stdout.strip()
-        remote_oid = remote_branch_oid(repo_path, branch)
+        remote_oid = (
+            None
+            if int(row["pr_conflict_recovery"])
+            else remote_branch_oid(repo_path, branch)
+        )
         try:
-            record_remote_publication_branch(
-                connection,
-                repo_path,
-                state_dir,
-                repo,
-                branch,
-                worktree,
-                remote_oid,
-            )
+            if not int(row["pr_conflict_recovery"]):
+                record_remote_publication_branch(
+                    connection,
+                    repo_path,
+                    state_dir,
+                    repo,
+                    branch,
+                    worktree,
+                    remote_oid,
+                )
         except PublicationSafetyError as error:
             publication_error = str(error)
             block_active_execplan(
@@ -11336,10 +12181,14 @@ def _run_project_step(
                     repo,
                     phase="WORKING",
                     validated_base_sha=None,
+                    pr_conflict_base_oid=(
+                        latest_sha if int(row["pr_conflict_recovery"])
+                        else row["pr_conflict_base_oid"]
+                    ),
                     last_error=REBASE_IN_PROGRESS_ERROR,
                 )
                 rebased = git(
-                    worktree, "rebase", f"origin/{base}", check=False
+                    worktree, "rebase", latest_sha, check=False
                 )
                 if rebased.returncode:
                     if _rebase_in_progress_for_branch(worktree, branch):
@@ -11492,6 +12341,80 @@ def _run_project_step(
             operation_print(no_change_error, file=sys.stderr)
             return 1
 
+        if int(row["pr_conflict_recovery"]):
+            current_pr = pr_for_branch(
+                repo_path, branch, str(row["pr_url"] or "")
+            )
+            if current_pr is None:
+                publication_error = (
+                    "게시 직전 저장된 기존 PR을 다시 조회할 수 없습니다."
+                )
+                block_active_execplan(
+                    connection,
+                    repo,
+                    worktree,
+                    publication_error,
+                    str(row["verify_result"] or ""),
+                )
+                operation_print(publication_error, file=sys.stderr)
+                return 1
+            reconciliation = reconcile_existing_pull_request(
+                connection,
+                repo_path,
+                state_dir,
+                repo,
+                row,
+                current_pr,
+            )
+            if reconciliation is not None:
+                return reconciliation
+            row = connection.execute(
+                "SELECT * FROM projects WHERE repo = ?", (repo,)
+            ).fetchone()
+            try:
+                head_oid = push_owned_pr_conflict_recovery(
+                    connection,
+                    repo_path,
+                    state_dir,
+                    repo,
+                    branch,
+                    worktree,
+                    current_pr,
+                )
+            except PublicationSafetyError as error:
+                publication_error = str(error)
+                block_active_execplan(
+                    connection,
+                    repo,
+                    worktree,
+                    publication_error,
+                    str(row["verify_result"] or ""),
+                )
+                operation_print(publication_error, file=sys.stderr)
+                return 1
+            except RuntimeError as error:
+                publication_error = str(error)
+                update_project(
+                    connection,
+                    repo,
+                    phase="PUBLISHING",
+                    last_error=publication_error,
+                )
+                operation_print(publication_error, file=sys.stderr)
+                return 1
+            update_project(
+                connection,
+                repo,
+                phase="PR_OPEN",
+                publication_remote_oid=head_oid,
+                pr_head_oid=head_oid,
+                pr_conflict_recovery=0,
+                pr_conflict_head_oid=None,
+                pr_conflict_base_oid=None,
+                last_error=None,
+            )
+            operation_print(f"기존 PR 충돌 복구 게시 완료: {row['pr_url']}")
+            return 0
         plan_sha = str(row["plan_sha"] or "")
         if not plan_sha:
             plan_error = "계획 commit SHA가 없습니다."
