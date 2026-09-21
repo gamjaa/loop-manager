@@ -871,22 +871,73 @@ class MaintenancePlanningTest(unittest.TestCase):
     def test_prepared_revalidation_restarts_in_same_phase(self):
         self._assert_prepared_batch_restarts(revalidation=True)
 
-    def test_restart_never_discards_a_published_batch(self):
+    def test_published_batch_recovers_after_remote_tip_advances(self):
         context = self._begin_barrier()
         self._write_barrier_batch()
         result = self._validate_barrier(context)
         git(self.repo, "add", "docs/plans")
         git(self.repo, "commit", "-m", "Prepare batch")
+        plan_commit = git(self.repo, "rev-parse", "HEAD")
         intent = loop_manager.record_maintenance_publication_intent(
             self.connection, str(self.repo), self.repo, "main",
-            result, git(self.repo, "rev-parse", "HEAD"),
+            result, plan_commit,
         )
         git(self.repo, "push", "origin", "HEAD:main")
-        git(self.repo, "commit", "--allow-empty", "-m", "Advance after publication")
-        git(self.repo, "push", "origin", "HEAD:main")
+        other = Path(self.temporary.name) / "published-descendant"
+        git(self.repo, "worktree", "add", "--detach", str(other), plan_commit)
+        git(other, "commit", "--allow-empty", "-m", "Advance after publication")
+        git(other, "push", "origin", "HEAD:main")
         git(self.repo, "fetch", "origin")
+
+        recovered = loop_manager.recover_maintenance_planning_batch(
+            self.connection, str(self.repo), self.repo, "main"
+        )
+        repeated = loop_manager.recover_maintenance_planning_batch(
+            self.connection, str(self.repo), self.repo, "main"
+        )
+        rows = self.connection.execute(
+            "SELECT plan_id FROM exec_plans WHERE repo = ? ORDER BY plan_id",
+            (str(self.repo),),
+        ).fetchall()
+
+        self.assertEqual(
+            recovered.phase, maintenance_state.MaintenancePhase.REFACTORING
+        )
+        self.assertEqual(repeated, recovered)
+        self.assertEqual(recovered.publication_commit_sha, plan_commit)
+        self.assertEqual(recovered.publication_remote_oid, plan_commit)
+        self.assertEqual(
+            [row["plan_id"] for row in rows],
+            ["G-000", "G-001", "G-002", "G-003"],
+        )
+        self.assertNotEqual(recovered, intent)
+
+    def test_published_batch_recovery_rejects_changed_batch_path(self):
+        context = self._begin_barrier()
+        self._write_barrier_batch()
+        result = self._validate_barrier(context)
+        git(self.repo, "add", "docs/plans")
+        git(self.repo, "commit", "-m", "Prepare batch")
+        plan_commit = git(self.repo, "rev-parse", "HEAD")
+        intent = loop_manager.record_maintenance_publication_intent(
+            self.connection, str(self.repo), self.repo, "main",
+            result, plan_commit,
+        )
+        git(self.repo, "push", "origin", "HEAD:main")
+        other = Path(self.temporary.name) / "changed-published-batch"
+        git(self.repo, "worktree", "add", "--detach", str(other), plan_commit)
+        changed_plan = other / self.ready_path.relative_to(self.repo)
+        changed_plan.write_text(
+            changed_plan.read_text(encoding="utf-8") + "\nRemote edit.\n",
+            encoding="utf-8",
+        )
+        git(other, "add", changed_plan.relative_to(other).as_posix())
+        git(other, "commit", "-m", "Change a published batch path")
+        git(other, "push", "origin", "HEAD:main")
+        git(self.repo, "fetch", "origin")
+
         with self.assertRaisesRegex(
-            loop_manager.MaintenancePlanningError, "미게시"
+            loop_manager.MaintenancePlanningError, "batch 경로"
         ):
             loop_manager.recover_maintenance_planning_batch(
                 self.connection, str(self.repo), self.repo, "main"
@@ -894,6 +945,13 @@ class MaintenancePlanningTest(unittest.TestCase):
         self.assertEqual(
             maintenance_state.MaintenanceRepository(self.connection).get(str(self.repo)),
             intent,
+        )
+        self.assertIsNone(
+            self.connection.execute(
+                "SELECT 1 FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-002'",
+                (str(self.repo),),
+            ).fetchone()
         )
 
     def test_publication_preflight_restarts_when_origin_base_moves(self):

@@ -2246,13 +2246,10 @@ def validate_maintenance_publication_base(
         )
 
 
-def _validate_maintenance_publication_commit(
+def _validate_maintenance_planning_commit(
     repository: Path,
-    base_branch: str,
     result: ValidatedPlanningResult,
     plan_commit: str,
-    *,
-    require_remote_confirmation: bool = True,
 ) -> None:
     context = result.maintenance_context
     if context is None:
@@ -2260,24 +2257,9 @@ def _validate_maintenance_publication_commit(
             "일반 Planner 결과를 maintenance publication API에 전달할 수 없습니다."
         )
     head = git(repository, "rev-parse", "HEAD").stdout.strip()
-    remote = git(
-        repository,
-        "rev-parse",
-        "--verify",
-        f"refs/remotes/origin/{base_branch}^{{commit}}",
-    ).stdout.strip()
     if head != plan_commit:
         raise MaintenancePlanningError(
             "maintenance planning worktree HEAD가 보존할 commit과 다릅니다."
-        )
-    expected_remote = (
-        plan_commit if require_remote_confirmation else context.active_sha
-    )
-    if remote != expected_remote:
-        detail = "fast-forward push" if require_remote_confirmation else "평가 기준"
-        raise MaintenancePlanningError(
-            f"maintenance planning commit의 {detail}을 origin/base에서 "
-            "확인할 수 없습니다."
         )
     ancestry = git(
         repository,
@@ -2325,6 +2307,85 @@ def _validate_maintenance_publication_commit(
             raise MaintenancePlanningError(
                 f"검증 뒤 maintenance ExecPlan metadata가 변경됐습니다: {path}"
             )
+
+
+def _validate_maintenance_publication_commit(
+    repository: Path,
+    base_branch: str,
+    result: ValidatedPlanningResult,
+    plan_commit: str,
+    *,
+    require_remote_confirmation: bool = True,
+) -> None:
+    context = result.maintenance_context
+    if context is None:
+        raise MaintenancePlanningError(
+            "일반 Planner 결과를 maintenance publication API에 전달할 수 없습니다."
+        )
+    remote = git(
+        repository,
+        "rev-parse",
+        "--verify",
+        f"refs/remotes/origin/{base_branch}^{{commit}}",
+    ).stdout.strip()
+    expected_remote = (
+        plan_commit if require_remote_confirmation else context.active_sha
+    )
+    if remote != expected_remote:
+        detail = "fast-forward push" if require_remote_confirmation else "평가 기준"
+        raise MaintenancePlanningError(
+            f"maintenance planning commit의 {detail}을 origin/base에서 "
+            "확인할 수 없습니다."
+        )
+    _validate_maintenance_planning_commit(repository, result, plan_commit)
+
+
+def _git_commit_is_ancestor(
+    repository: Path,
+    older: str,
+    newer: str,
+) -> bool:
+    result = git(
+        repository, "merge-base", "--is-ancestor", older, newer, check=False
+    )
+    if result.returncode not in {0, 1}:
+        raise RuntimeError("maintenance publication Git ancestry 확인 실패.")
+    return result.returncode == 0
+
+
+def _assert_remote_preserves_maintenance_batch(
+    repository: Path,
+    base_sha: str,
+    plan_commit: str,
+    remote_sha: str,
+) -> None:
+    """Confirm a published batch remains byte-identical at a newer remote tip."""
+
+    if not _git_commit_is_ancestor(repository, plan_commit, remote_sha):
+        raise MaintenancePlanningError(
+            "보존된 maintenance planning commit이 origin/base 이력에 없습니다."
+        )
+    base_tree = _git_tree_entries(repository, base_sha)
+    plan_tree = _git_tree_entries(repository, plan_commit)
+    remote_tree = _git_tree_entries(repository, remote_sha)
+    batch_paths = {
+        path
+        for path in base_tree.keys() | plan_tree.keys()
+        if base_tree.get(path) != plan_tree.get(path)
+    }
+    changed_paths = sorted(
+        path
+        for path in batch_paths
+        if plan_tree.get(path) != remote_tree.get(path)
+    )
+    if changed_paths:
+        rendered = ", ".join(
+            path.decode("utf-8", errors="replace") for path in changed_paths
+        )
+        raise MaintenancePlanningError(
+            "게시된 maintenance batch 경로가 후속 원격 commit에서 변경됐습니다: "
+            f"{rendered}"
+        )
 
 
 def record_maintenance_publication_intent(
@@ -2504,6 +2565,25 @@ def publish_maintenance_planning_batch(
     _validate_maintenance_publication_commit(
         worktree, base_branch, result, plan_commit
     )
+    return _apply_maintenance_planning_batch(
+        connection, repo, worktree, result, plan_commit
+    )
+
+
+def _apply_maintenance_planning_batch(
+    connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+    result: ValidatedPlanningResult,
+    plan_commit: str,
+) -> maintenance_state.MaintenanceCycle:
+    """Apply one already-confirmed maintenance batch in a SQLite transaction."""
+
+    context = result.maintenance_context
+    if context is None or context.repo != repo:
+        raise MaintenancePlanningError(
+            "SQLite-bound maintenance context가 publication 대상과 일치하지 않습니다."
+        )
     with connection:
         if _maintenance_publication_already_applied(
             connection, repo, worktree, result, plan_commit
@@ -2618,15 +2698,10 @@ def restart_stale_maintenance_publication(
     if remote in {base, commit}:
         raise MaintenancePlanningError("게시 기준이 이동하지 않았거나 batch가 이미 게시됐습니다.")
 
-    def is_ancestor(older: str, newer: str) -> bool:
-        result = git(
-            worktree, "merge-base", "--is-ancestor", older, newer, check=False
-        )
-        if result.returncode not in {0, 1}:
-            raise RuntimeError("maintenance publication Git ancestry 확인 실패.")
-        return result.returncode == 0
-
-    if not is_ancestor(base, remote) or is_ancestor(commit, remote):
+    if (
+        not _git_commit_is_ancestor(worktree, base, remote)
+        or _git_commit_is_ancestor(worktree, commit, remote)
+    ):
         raise MaintenancePlanningError("미게시 batch임을 확정할 수 없어 재시작할 수 없습니다.")
     base_tree = _git_tree_entries(worktree, base)
     commit_tree = _git_tree_entries(worktree, commit)
@@ -2661,9 +2736,21 @@ def recover_maintenance_planning_batch(
         ).stdout.strip()
         if remote_oid and current_remote == remote_oid:
             return cycle
-        raise MaintenancePlanningError(
-            "적용된 maintenance publication 기록과 origin/base가 다릅니다."
+        if (
+            not remote_oid
+            or not cycle.publication_base_sha
+            or cycle.publication_commit_sha != remote_oid
+        ):
+            raise MaintenancePlanningError(
+                "적용된 maintenance publication 기록이 완전하지 않습니다."
+            )
+        _assert_remote_preserves_maintenance_batch(
+            worktree,
+            cycle.publication_base_sha,
+            remote_oid,
+            current_remote,
         )
+        return cycle
     if (
         cycle.publication_stage != "prepared"
         or cycle.publication_base_sha is None
@@ -2681,14 +2768,21 @@ def recover_maintenance_planning_batch(
         "--verify",
         f"refs/remotes/origin/{base_branch}^{{commit}}",
     ).stdout.strip()
+    remote_advanced_after_publication = False
     if current_remote != plan_commit:
         if current_remote == base_sha:
             raise MaintenancePlanningError(
                 "보존된 maintenance planning commit의 push가 아직 확인되지 않았습니다."
             )
-        return restart_stale_maintenance_publication(
-            connection, repo, worktree, base_branch
-        )
+        if _git_commit_is_ancestor(worktree, plan_commit, current_remote):
+            _assert_remote_preserves_maintenance_batch(
+                worktree, base_sha, plan_commit, current_remote
+            )
+            remote_advanced_after_publication = True
+        else:
+            return restart_stale_maintenance_publication(
+                connection, repo, worktree, base_branch
+            )
     context = _maintenance_context_at_revision(
         connection, repo, worktree, base_sha, cycle
     )
@@ -2703,6 +2797,11 @@ def recover_maintenance_planning_batch(
     if result is None:
         raise MaintenancePlanningError(
             "보존된 maintenance publication commit에 검증할 batch가 없습니다."
+        )
+    if remote_advanced_after_publication:
+        _validate_maintenance_planning_commit(worktree, result, plan_commit)
+        return _apply_maintenance_planning_batch(
+            connection, repo, worktree, result, plan_commit
         )
     return publish_maintenance_planning_batch(
         connection,
