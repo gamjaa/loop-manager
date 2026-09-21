@@ -5881,6 +5881,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "loop_manager.py",
                 "guidance_approval.py",
                 "managed_config.py",
+                "maintenance_git.py",
+                "maintenance_state.py",
                 "notifications.py",
                 "project_registry.py",
             ):
@@ -5890,7 +5892,12 @@ class AgentScopeValidatorTest(unittest.TestCase):
 
             planner_environment = loop_manager.agent_environment("codex", "planner")
             subprocess.run(
-                [sys.executable, "-c", "import loop_manager, managed_config, project_registry"],
+                [
+                    sys.executable,
+                    "-c",
+                    "import loop_manager, managed_config, maintenance_git, "
+                    "maintenance_state, project_registry",
+                ],
                 cwd=repo,
                 env=planner_environment,
                 check=True,
@@ -5905,7 +5912,12 @@ class AgentScopeValidatorTest(unittest.TestCase):
             existing_cache.write_bytes(b"existing cache")
             before = loop_manager.capture_git_snapshot(repo)
             subprocess.run(
-                [sys.executable, "-c", "import loop_manager, managed_config, project_registry"],
+                [
+                    sys.executable,
+                    "-c",
+                    "import loop_manager, managed_config, maintenance_git, "
+                    "maintenance_state, project_registry",
+                ],
                 cwd=repo,
                 env=planner_environment,
                 check=True,

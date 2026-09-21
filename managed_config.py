@@ -17,6 +17,7 @@ class ManagedConfig:
     max_workers: int
     telegram_token: str
     telegram_chat_id: str
+    refactoring_review_interval: int = 5
 
     @property
     def telegram_enabled(self) -> bool:
@@ -70,6 +71,23 @@ def load_managed_config(path: Path) -> ManagedConfig:
     if max_workers <= 0:
         raise ManagedConfigError("[loop] max_workers는 양의 정수여야 합니다.")
 
+    raw_refactoring_review_interval = _setting(
+        parser,
+        "loop",
+        "refactoring_review_interval",
+        fallback="5",
+    )
+    try:
+        refactoring_review_interval = int(raw_refactoring_review_interval)
+    except ValueError as error:
+        raise ManagedConfigError(
+            "[loop] refactoring_review_interval은 양의 정수여야 합니다."
+        ) from error
+    if refactoring_review_interval <= 0:
+        raise ManagedConfigError(
+            "[loop] refactoring_review_interval은 양의 정수여야 합니다."
+        )
+
     telegram_token = _setting(
         parser,
         "telegram",
@@ -92,4 +110,5 @@ def load_managed_config(path: Path) -> ManagedConfig:
         max_workers=max_workers,
         telegram_token=telegram_token,
         telegram_chat_id=telegram_chat_id,
+        refactoring_review_interval=refactoring_review_interval,
     )

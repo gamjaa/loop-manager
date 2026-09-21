@@ -3,6 +3,8 @@
 
 [loop]
 max_workers = 3
+; 성공한 구조 평가 뒤 이 수만큼 ExecPlan Merge가 확인되면 다시 평가한다.
+refactoring_review_interval = 5
 
 [telegram]
 ; token과 chat_id가 모두 비어 있으면 알림을 사용하지 않는다.
