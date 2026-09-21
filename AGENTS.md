@@ -29,7 +29,10 @@ ExecPlan의 실행 상태, 재시도 횟수, 세션과 작업 공간 정보는 L
 
 구현 전 관련 문서를 확인한다.
 
-Planner는 `docs/plans/*.md`만 생성하거나 수정한다.
+Planner는 새 `docs/plans/*.md`를 생성하고, 현재 PRODUCT/Requirement 범위 밖이지만 보존 가치가 있는 아이디어만 `docs/FUTURE_IDEAS.md`에 생성하거나 수정할 수 있다. 기존 ExecPlan을 수정·삭제하거나 그 밖의 파일을 변경하지 않는다.
+Planner는 `docs/FUTURE_IDEAS.md`의 항목을 같은 계획 주기의 ExecPlan 범위나 현재 미충족 작업의 근거로 사용하지 않는다.
+Planner와 Reviewer는 `AGENTS.md` 변경을 제안하거나 적용하지 않는다.
+Worker는 현재 ExecPlan에 꼭 필요한 `AGENTS.md` 규칙 변경을 발견해도 승인 전에 파일을 직접 수정하지 않고, 선택된 ExecPlan의 `Decision Log`에 `docs/PLANS.md`가 정한 제안과 빈 `User Decision`을 기록한 뒤 작업을 중단한다.
 
 Worker는 구현, 관련 targeted unit test 작성·실행과 전체 검증 스크립트 생성을 담당한다.
 
