@@ -28,6 +28,17 @@ import threading
 from typing import Protocol
 from urllib.parse import quote
 
+from guidance_approval import (
+    GuidanceDocument,
+    GuidanceFormatError,
+    GuidanceProposal,
+    apply_patch_to_content,
+    contains_guidance_sections,
+    content_hash as guidance_content_hash,
+    finalized_patch,
+    guidance_patch_hash,
+    parse_guidance_document,
+)
 from managed_config import ManagedConfig, ManagedConfigError, load_managed_config
 import notifications
 import project_registry
@@ -192,10 +203,42 @@ CREATE TABLE IF NOT EXISTS exec_plans (
     initial_worker_level INTEGER,
     effective_worker_level INTEGER,
     review_level_history TEXT NOT NULL DEFAULT '{}',
+    blocked_reason TEXT,
+    guidance_plan_hash TEXT,
     workspace_owned INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (repo, plan_id),
     UNIQUE (repo, path),
     FOREIGN KEY (repo) REFERENCES projects(repo)
+)
+"""
+
+GUIDANCE_APPROVALS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS guidance_approvals (
+    repo TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    proposal_id TEXT NOT NULL,
+    proposal_hash TEXT NOT NULL,
+    target_path TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    proposal_patch TEXT NOT NULL,
+    proposal_patch_hash TEXT NOT NULL,
+    proposal_line INTEGER NOT NULL,
+    decision_line INTEGER NOT NULL,
+    batch_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    decision TEXT NOT NULL DEFAULT 'pending',
+    decision_revision TEXT NOT NULL DEFAULT '',
+    decision_hash TEXT,
+    approved_patch TEXT,
+    approved_patch_hash TEXT,
+    baseline_content BLOB NOT NULL,
+    baseline_mode INTEGER NOT NULL,
+    expected_content_hash TEXT,
+    applied INTEGER NOT NULL DEFAULT 0,
+    invalidated_decision_hash TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (repo, plan_id, proposal_id),
+    FOREIGN KEY (repo, plan_id) REFERENCES exec_plans(repo, plan_id)
 )
 """
 
@@ -821,12 +864,15 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
         "initial_worker_level": "INTEGER",
         "effective_worker_level": "INTEGER",
         "review_level_history": "TEXT NOT NULL DEFAULT '{}'",
+        "blocked_reason": "TEXT",
+        "guidance_plan_hash": "TEXT",
     }
     for column, definition in migrations.items():
         if column not in columns:
             connection.execute(
                 f"ALTER TABLE exec_plans ADD COLUMN {column} {definition}"
             )
+    connection.execute(GUIDANCE_APPROVALS_SCHEMA)
     connection.execute(EXEC_PLANS_ACTIVE_INDEX)
 
 
@@ -1325,6 +1371,12 @@ def validate_planner_result(
             raise PlannerValidationError("Planner는 docs/plans의 새 ExecPlan만 작성해야 합니다.")
         if not (worktree / plan_path).is_file():
             raise PlannerValidationError("Planner는 기존 ExecPlan을 삭제할 수 없습니다.")
+        try:
+            planner_text = (worktree / plan_path).read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise PlannerValidationError(f"Planner ExecPlan을 읽을 수 없습니다: {plan_path}") from error
+        if contains_guidance_sections(planner_text):
+            raise PlannerValidationError("Planner는 AGENTS.md guidance를 제안할 수 없습니다.")
         existed = git(
             worktree,
             "cat-file",
@@ -4183,16 +4235,22 @@ def _worker_path_allowed(
     path: str,
     selected_plan_path: str,
     allowed_requirement_archives: tuple[str, ...] = (),
+    allowed_guidance_targets: tuple[str, ...] = (),
+    allow_common_plans: bool = False,
 ) -> bool:
     normalized = path.replace("\\", "/")
     lowered = normalized.casefold()
     if normalized == selected_plan_path:
         return True
+    if normalized in allowed_guidance_targets:
+        return True
     if lowered in {"docs/product.md", "docs/future_ideas.md"}:
         return True
     if Path(normalized).name.casefold() == "agents.md":
         return False
-    if lowered in {"docs/architecture.md", "docs/plans.md"}:
+    if lowered == "docs/plans.md":
+        return allow_common_plans
+    if lowered == "docs/architecture.md":
         return False
     if lowered.startswith("docs/requirements/"):
         allowed_paths = {
@@ -4214,6 +4272,8 @@ def validate_agent_scope(
     *,
     selected_plan_path: str | None = None,
     allowed_requirement_archives: tuple[str, ...] = (),
+    allowed_guidance_targets: tuple[str, ...] = (),
+    allow_common_plans: bool = False,
     allowed_ref_changes: frozenset[str] = frozenset(),
     allowed_worktree_changes: frozenset[str] = frozenset(),
     external_worktree: Path | None = None,
@@ -4320,6 +4380,8 @@ def validate_agent_scope(
                 change.path,
                 selected_plan_path,
                 allowed_requirement_archives,
+                allowed_guidance_targets,
+                allow_common_plans,
             )
         elif role_name == "reviewer":
             allowed = False
@@ -5184,6 +5246,8 @@ def validate_worker_workspace_scope(
     *,
     allow_rebase: bool = False,
     allowed_requirement_archives: tuple[str, ...] = (),
+    allowed_guidance_targets: tuple[str, ...] = (),
+    allow_common_plans: bool = False,
 ) -> dict[str, object]:
     """Validate one Worker-controlled operation before Manager Git writes."""
 
@@ -5195,6 +5259,8 @@ def validate_worker_workspace_scope(
         after,
         selected_plan_path=selected_plan_path,
         allowed_requirement_archives=allowed_requirement_archives,
+        allowed_guidance_targets=allowed_guidance_targets,
+        allow_common_plans=allow_common_plans,
         external_worktree=repo_path,
         base_branch=base_branch,
     )
@@ -5211,6 +5277,787 @@ def validate_worker_workspace_scope(
         allow_rebase=allow_rebase,
     )
     return plan
+
+
+GUIDANCE_BLOCK_REASON = "guidance_approval"
+
+
+def _guidance_document(worktree: Path, plan_path: str) -> GuidanceDocument | None:
+    try:
+        contents = (worktree / plan_path).read_text(encoding="utf-8")
+        return parse_guidance_document(contents)
+    except (OSError, GuidanceFormatError) as error:
+        raise AgentScopeError(f"Worker guidance 제안 형식 위반: {error}") from error
+
+
+def _git_common_directory(repository: Path) -> Path:
+    value = git(
+        repository,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+    ).stdout.strip()
+    path = Path(value)
+    return _canonical_path(path if path.is_absolute() else repository / path)
+
+
+def is_loop_manager_repository(repository: Path) -> bool:
+    """Identify the registered Loop Manager source across its managed worktrees."""
+
+    try:
+        return _git_common_directory(repository) == _git_common_directory(ROOT)
+    except RuntimeError:
+        return _canonical_path(repository) == _canonical_path(ROOT)
+
+
+def _validate_guidance_proposal_scope(
+    proposals: tuple[GuidanceProposal, ...],
+    *,
+    common_allowed: bool,
+) -> None:
+    for proposal in proposals:
+        if common_allowed and proposal.scope == "project":
+            raise AgentScopeError(
+                "Loop Manager 루트 AGENTS.md는 공통 원본이므로 "
+                "Scope common으로 명시적으로 승인해야 합니다."
+            )
+        if proposal.scope == "common" and not common_allowed:
+            raise AgentScopeError(
+                "공통 AGENTS.md guidance는 Loop Manager 자체 저장소의 "
+                f"Worker만 제안할 수 있습니다: {proposal.proposal_id}"
+            )
+
+
+def _guidance_rows(
+    connection: sqlite3.Connection,
+    repo: str,
+    plan_id: str,
+) -> tuple[sqlite3.Row, ...]:
+    _ensure_execplans_schema(connection)
+    return tuple(
+        connection.execute(
+            "SELECT * FROM guidance_approvals "
+            "WHERE repo = ? AND plan_id = ? ORDER BY batch_id, sequence, proposal_id",
+            (repo, plan_id),
+        ).fetchall()
+    )
+
+
+def _guidance_worker_targets(
+    connection: sqlite3.Connection,
+    repo: str,
+    plan_id: str,
+) -> tuple[str, ...]:
+    rows = connection.execute(
+        "SELECT DISTINCT target_path FROM guidance_approvals "
+        "WHERE repo = ? AND plan_id = ? AND applied = 0 "
+        "AND decision != 'pending' ORDER BY target_path",
+        (repo, plan_id),
+    ).fetchall()
+    return tuple(str(row[0]) for row in rows)
+
+
+def _published_plan_allows_common_plans(
+    repo_path: Path,
+    catalog_plan: sqlite3.Row,
+) -> bool:
+    if not is_loop_manager_repository(repo_path):
+        return False
+    plan_sha = str(catalog_plan["plan_sha"] or "")
+    if not plan_sha:
+        return False
+    shown = git(
+        repo_path,
+        "show",
+        f"{plan_sha}:{catalog_plan['path']}",
+        check=False,
+    )
+    if shown.returncode:
+        return False
+    acceptance = re.search(
+        r"(?ms)^## Acceptance Criteria\s*\n+(.*?)(?=^## |\Z)",
+        shown.stdout,
+    )
+    return bool(
+        acceptance
+        and re.search(
+            r"(?im)^-\s+(?:공통\s+)?`docs/PLANS\.md`(?:에|를|을|의|\s)"
+            r".*(?:변경|문서화|갱신|수정|change|update|document)",
+            acceptance.group(1),
+        )
+    )
+
+
+def _guidance_target_state(
+    worktree: Path,
+    target: str,
+) -> tuple[bytes, int]:
+    path = worktree / target
+    try:
+        target_stat = path.lstat()
+    except FileNotFoundError as error:
+        raise GuidanceFormatError(f"guidance 대상 파일이 없습니다: {target}") from error
+    if path.is_symlink() or not path.is_file():
+        raise GuidanceFormatError(
+            f"guidance 대상은 일반 파일이어야 합니다: {target}"
+        )
+    # Git records executable permission, not local umask/group write bits.
+    git_mode = 0o755 if target_stat.st_mode & stat.S_IXUSR else 0o644
+    return path.read_bytes(), git_mode
+
+
+def _guidance_block_message(
+    plan: sqlite3.Row,
+    proposals: tuple[GuidanceProposal, ...],
+    detail: str,
+) -> str:
+    locations = []
+    for proposal in proposals:
+        locations.append(
+            f"제안 {proposal.proposal_id}: {plan['path']}:{proposal.line}; "
+            f"User Decision: {plan['path']}:{proposal.decision.line}"
+        )
+    return (
+        f"AGENTS.md guidance 사용자 결정 대기 ({plan['plan_id']}).\n"
+        f"ExecPlan: {plan['path']}\n{detail}\n" + "\n".join(locations)
+    )
+
+
+def _guidance_batch_id(
+    repo: str,
+    plan_id: str,
+    document: GuidanceDocument,
+    proposals: tuple[GuidanceProposal, ...],
+) -> str:
+    encoded = json.dumps(
+        {
+            "repo": repo,
+            "plan_id": plan_id,
+            "structure": document.structure_hash,
+            "proposals": [proposal.identity for proposal in proposals],
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _block_for_new_guidance(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    repo: str,
+    worktree: Path,
+    plan: sqlite3.Row,
+    document: GuidanceDocument,
+    new_proposals: tuple[GuidanceProposal, ...],
+    worker_result: str,
+) -> None:
+    if not new_proposals:
+        raise RuntimeError("차단할 새 guidance 제안이 없습니다.")
+    _validate_guidance_proposal_scope(
+        new_proposals,
+        common_allowed=is_loop_manager_repository(repo_path),
+    )
+    for proposal in new_proposals:
+        if proposal.decision.decision != "pending":
+            raise AgentScopeError(
+                "Worker가 새 guidance 제안의 User Decision을 미리 확정할 수 없습니다: "
+                f"{proposal.proposal_id}"
+            )
+
+    batch_id = _guidance_batch_id(
+        repo,
+        str(plan["plan_id"]),
+        document,
+        new_proposals,
+    )
+    baselines: dict[str, tuple[bytes, int]] = {}
+    for proposal in new_proposals:
+        if proposal.target not in baselines:
+            baselines[proposal.target] = _guidance_target_state(
+                worktree,
+                proposal.target,
+            )
+    for proposal in new_proposals:
+        baseline, _baseline_mode = baselines[proposal.target]
+        apply_patch_to_content(
+            baseline,
+            proposal.target,
+            proposal.patch,
+        )
+    message = _guidance_block_message(
+        plan,
+        new_proposals,
+        "각 User Decision의 Decision과 Revision을 사용자가 직접 확정해야 합니다.",
+    )
+    result_snapshot = capture_git_snapshot(worktree).serialize()
+    with connection:
+        for sequence, proposal in enumerate(new_proposals):
+            baseline, baseline_mode = baselines[proposal.target]
+            connection.execute(
+                """
+                INSERT INTO guidance_approvals (
+                    repo, plan_id, proposal_id, proposal_hash, target_path,
+                    scope, proposal_patch, proposal_patch_hash,
+                    proposal_line, decision_line, batch_id, sequence,
+                    baseline_content, baseline_mode
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    repo,
+                    plan["plan_id"],
+                    proposal.proposal_id,
+                    proposal.identity,
+                    proposal.target,
+                    proposal.scope,
+                    proposal.patch,
+                    guidance_patch_hash(proposal.target, proposal.patch),
+                    proposal.line,
+                    proposal.decision.line,
+                    batch_id,
+                    sequence,
+                    baseline,
+                    baseline_mode,
+                ),
+            )
+        connection.execute(
+            """
+            UPDATE exec_plans
+            SET status = 'BLOCKED', blocked_reason = ?,
+                blocked_fingerprint = NULL,
+                blocked_worktree_fingerprint = NULL,
+                guidance_plan_hash = ?, last_error = ?, worker_result = ?
+            WHERE repo = ? AND plan_id = ?
+            """,
+            (
+                GUIDANCE_BLOCK_REASON,
+                document.structure_hash,
+                message,
+                worker_result,
+                repo,
+                plan["plan_id"],
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE projects
+            SET phase = 'BLOCKED', last_error = ?, worker_result = ?,
+                agent_result_snapshot = ?, agent_manager_snapshot = NULL
+            WHERE repo = ?
+            """,
+            (message, worker_result, result_snapshot, repo),
+        )
+        notifications.enqueue_current_project_events(connection, repo)
+
+
+def _guidance_document_matches_rows(
+    document: GuidanceDocument,
+    rows: tuple[sqlite3.Row, ...],
+    *,
+    require_decisions: bool,
+) -> tuple[dict[str, GuidanceProposal], tuple[GuidanceProposal, ...]]:
+    proposals = {proposal.proposal_id: proposal for proposal in document.proposals}
+    stored = {str(row["proposal_id"]): row for row in rows}
+    missing = sorted(set(stored) - set(proposals))
+    if missing:
+        raise AgentScopeError(
+            "기존 guidance 제안은 삭제할 수 없습니다: " + ", ".join(missing)
+        )
+    for proposal_id, row in stored.items():
+        proposal = proposals[proposal_id]
+        if proposal.identity != str(row["proposal_hash"]):
+            raise AgentScopeError(
+                f"기존 guidance 제안은 수정할 수 없습니다: {proposal_id}"
+            )
+        decision_is_immutable = require_decisions or bool(row["applied"])
+        if decision_is_immutable and row["decision_hash"]:
+            if proposal.decision.identity != str(row["decision_hash"]):
+                raise AgentScopeError(
+                    "Worker는 확정된 guidance User Decision을 수정할 수 없습니다: "
+                    f"{proposal_id}"
+                )
+    new = tuple(
+        proposal
+        for proposal in document.proposals
+        if proposal.proposal_id not in stored
+    )
+    return proposals, new
+
+
+def _guidance_final_expected(
+    rows: tuple[sqlite3.Row, ...],
+    proposals: Mapping[str, GuidanceProposal],
+) -> tuple[
+    dict[tuple[str, str], tuple[bytes, int]],
+    dict[str, str],
+]:
+    grouped: dict[tuple[str, str], list[sqlite3.Row]] = {}
+    for row in rows:
+        grouped.setdefault(
+            (str(row["batch_id"]), str(row["target_path"])),
+            [],
+        ).append(row)
+    expected: dict[tuple[str, str], tuple[bytes, int]] = {}
+    final_hashes: dict[str, str] = {}
+    for key, group in grouped.items():
+        ordered = sorted(group, key=lambda row: int(row["sequence"]))
+        contents = bytes(ordered[0]["baseline_content"])
+        mode = int(ordered[0]["baseline_mode"])
+        for row in ordered:
+            proposal = proposals[str(row["proposal_id"])]
+            patch = finalized_patch(proposal)
+            if patch is not None:
+                contents = apply_patch_to_content(
+                    contents,
+                    proposal.target,
+                    patch,
+                )
+        expected[key] = (contents, mode)
+        final_hash = guidance_content_hash(contents)
+        for row in ordered:
+            final_hashes[str(row["proposal_id"])] = final_hash
+    return expected, final_hashes
+
+
+def resume_guidance_approval_if_decided(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    repo: str,
+    base: str,
+    state_dir: Path,
+) -> bool:
+    plan = active_execplan(connection, repo)
+    if (
+        plan is None
+        or plan["status"] != "BLOCKED"
+        or plan["blocked_reason"] != GUIDANCE_BLOCK_REASON
+    ):
+        return False
+    worktree = Path(str(plan["worktree"] or ""))
+    branch = str(plan["branch"] or "")
+    resuming_rebase = _rebase_in_progress_for_branch(worktree, branch)
+    try:
+        validate_execplan_workspace_identity(
+            state_dir,
+            repo,
+            str(plan["plan_id"]),
+            branch,
+            worktree,
+        )
+        make_worktree(
+            repo_path,
+            worktree,
+            branch,
+            base,
+            allow_create_branch=False,
+            allow_recovery=True,
+            allow_existing=True,
+            allow_rebase=resuming_rebase,
+        )
+        validate_blocked_agent_scope(
+            connection,
+            repo_path,
+            repo,
+            base,
+            worktree,
+            str(plan["path"]),
+        )
+        document = _guidance_document(worktree, str(plan["path"]))
+        if document is None:
+            raise AgentScopeError("저장된 guidance 제안이 ExecPlan에서 사라졌습니다.")
+        if document.structure_hash != str(plan["guidance_plan_hash"] or ""):
+            raise AgentScopeError(
+                "User Decision 이외의 ExecPlan 변경으로 guidance 승인을 해제할 수 없습니다."
+            )
+        rows = _guidance_rows(connection, repo, str(plan["plan_id"]))
+        proposals, new = _guidance_document_matches_rows(
+            document,
+            rows,
+            require_decisions=False,
+        )
+        if new:
+            raise AgentScopeError(
+                "사용자 결정 대기 중 새 guidance 제안을 추가할 수 없습니다."
+            )
+        _validate_guidance_proposal_scope(
+            document.proposals,
+            common_allowed=is_loop_manager_repository(repo_path),
+        )
+        pending_rows = tuple(row for row in rows if not int(row["applied"]))
+        for row in pending_rows:
+            proposal = proposals[str(row["proposal_id"])]
+            if proposal.decision.decision == "pending":
+                return False
+            invalidated = str(row["invalidated_decision_hash"] or "")
+            if invalidated and proposal.decision.identity == invalidated:
+                _update_blocked_error(
+                    connection,
+                    repo,
+                    str(plan["plan_id"]),
+                    _guidance_block_message(
+                        plan,
+                        (proposal,),
+                        "무효화된 결정과 다른 Revision 또는 대체 patch가 필요합니다.",
+                    ),
+                )
+                return False
+        _expected, final_hashes = _guidance_final_expected(
+            pending_rows,
+            proposals,
+        )
+        checked_targets: set[str] = set()
+        for row in pending_rows:
+            target = str(row["target_path"])
+            if target in checked_targets:
+                continue
+            checked_targets.add(target)
+            try:
+                current_contents, current_mode = _guidance_target_state(worktree, target)
+            except GuidanceFormatError:
+                if row["invalidated_decision_hash"]:
+                    continue
+                raise
+            if (
+                not row["invalidated_decision_hash"]
+                and (
+                    current_contents != bytes(row["baseline_content"])
+                    or current_mode != int(row["baseline_mode"])
+                )
+            ):
+                raise AgentScopeError(
+                    f"승인 전 guidance 대상이 변경됐습니다: {target}"
+                )
+        with connection:
+            for row in pending_rows:
+                proposal = proposals[str(row["proposal_id"])]
+                patch = finalized_patch(proposal)
+                connection.execute(
+                    """
+                    UPDATE guidance_approvals
+                    SET decision = ?, decision_revision = ?,
+                        decision_hash = ?, approved_patch = ?,
+                        approved_patch_hash = ?, expected_content_hash = ?,
+                        invalidated_decision_hash = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE repo = ? AND plan_id = ? AND proposal_id = ?
+                    """,
+                    (
+                        proposal.decision.decision,
+                        proposal.decision.revision,
+                        proposal.decision.identity,
+                        patch,
+                        guidance_patch_hash(proposal.target, patch or ""),
+                        final_hashes[proposal.proposal_id],
+                        repo,
+                        plan["plan_id"],
+                        proposal.proposal_id,
+                    ),
+                )
+            connection.execute(
+                """
+                UPDATE exec_plans
+                SET status = 'IMPLEMENTING', blocked_reason = NULL,
+                    blocked_fingerprint = NULL,
+                    blocked_worktree_fingerprint = NULL, last_error = NULL
+                WHERE repo = ? AND plan_id = ?
+                """,
+                (repo, plan["plan_id"]),
+            )
+            connection.execute(
+                "UPDATE projects SET phase = 'WORKING', last_error = NULL "
+                "WHERE repo = ?",
+                (repo,),
+            )
+        if resuming_rebase:
+            update_project(
+                connection, repo, last_error=REBASE_IN_PROGRESS_ERROR,
+                validated_base_sha=None,
+            )
+        clear_agent_scope(connection, repo)
+        return True
+    except (AgentScopeError, GuidanceFormatError, RuntimeError) as error:
+        _update_blocked_error(
+            connection,
+            repo,
+            str(plan["plan_id"]),
+            f"guidance 승인 해제 실패:\n{error}",
+        )
+        return False
+
+
+def _invalidate_guidance_approval(
+    connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+    plan: sqlite3.Row,
+    document: GuidanceDocument,
+    proposals: tuple[GuidanceProposal, ...],
+    worker_result: str,
+    detail: str,
+) -> None:
+    message = _guidance_block_message(plan, proposals, detail)
+    result_snapshot = capture_git_snapshot(worktree).serialize()
+    proposal_ids = tuple(proposal.proposal_id for proposal in proposals)
+    placeholders = ", ".join("?" for _ in proposal_ids)
+    with connection:
+        connection.execute(
+            f"""
+            UPDATE guidance_approvals
+            SET invalidated_decision_hash = decision_hash,
+                applied = 0, updated_at = CURRENT_TIMESTAMP
+            WHERE repo = ? AND plan_id = ?
+              AND proposal_id IN ({placeholders})
+            """,
+            (repo, plan["plan_id"], *proposal_ids),
+        )
+        connection.execute(
+            """
+            UPDATE exec_plans
+            SET status = 'BLOCKED', blocked_reason = ?,
+                blocked_fingerprint = NULL,
+                blocked_worktree_fingerprint = NULL,
+                guidance_plan_hash = ?, last_error = ?, worker_result = ?
+            WHERE repo = ? AND plan_id = ?
+            """,
+            (
+                GUIDANCE_BLOCK_REASON,
+                document.structure_hash,
+                message,
+                worker_result,
+                repo,
+                plan["plan_id"],
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE projects
+            SET phase = 'BLOCKED', last_error = ?, worker_result = ?,
+                agent_result_snapshot = ?, agent_manager_snapshot = NULL
+            WHERE repo = ?
+            """,
+            (message, worker_result, result_snapshot, repo),
+        )
+        # Manager rebase/verify may already have cleared the Agent scope.
+        # Freeze the diagnosed state so only the User Decision can change.
+        connection.execute(
+            "UPDATE projects SET agent_role = 'worker', agent_snapshot = ?, "
+            "agent_baseline = NULL, agent_recovery = NULL, "
+            "agent_input_plan = NULL, agent_result_plan = NULL, "
+            "agent_input_fingerprint = NULL WHERE repo = ?",
+            (result_snapshot, repo),
+        )
+        notifications.enqueue_current_project_events(connection, repo)
+
+
+def inspect_worker_guidance_result(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    repo: str,
+    worktree: Path,
+    plan: sqlite3.Row,
+    worker_result: str,
+) -> bool:
+    """Validate approved targets, then block on any newly proposed guidance."""
+
+    document = _guidance_document(worktree, str(plan["path"]))
+    rows = _guidance_rows(connection, repo, str(plan["plan_id"]))
+    if document is None:
+        if rows:
+            raise AgentScopeError("기존 guidance 제안이 ExecPlan에서 사라졌습니다.")
+        return False
+    _validate_guidance_proposal_scope(
+        document.proposals,
+        common_allowed=is_loop_manager_repository(repo_path),
+    )
+    proposals, new = _guidance_document_matches_rows(
+        document,
+        rows,
+        require_decisions=True,
+    )
+    unapplied = tuple(row for row in rows if not int(row["applied"]))
+    if unapplied:
+        expected, _final_hashes = _guidance_final_expected(
+            unapplied,
+            proposals,
+        )
+        mismatched: list[GuidanceProposal] = []
+        for (_batch_id, target), (expected_contents, expected_mode) in expected.items():
+            try:
+                actual_contents, actual_mode = _guidance_target_state(worktree, target)
+                exact = actual_contents == expected_contents and actual_mode == expected_mode
+            except GuidanceFormatError:
+                exact = False
+            if not exact:
+                mismatched.extend(
+                    proposals[str(row["proposal_id"])]
+                    for row in unapplied
+                    if str(row["target_path"]) == target
+                )
+        if mismatched:
+            _invalidate_guidance_approval(
+                connection,
+                repo,
+                worktree,
+                plan,
+                document,
+                tuple(mismatched),
+                worker_result,
+                "실제 AGENTS.md 결과가 승인된 patch 결과와 다릅니다. "
+                "User Decision Revision을 갱신해 다시 결정해야 합니다.",
+            )
+            return True
+        with connection:
+            connection.executemany(
+                """
+                UPDATE guidance_approvals
+                SET applied = 1, updated_at = CURRENT_TIMESTAMP
+                WHERE repo = ? AND plan_id = ? AND proposal_id = ?
+                """,
+                (
+                    (repo, plan["plan_id"], str(row["proposal_id"]))
+                    for row in unapplied
+                ),
+            )
+    if new:
+        _block_for_new_guidance(
+            connection,
+            repo_path,
+            repo,
+            worktree,
+            plan,
+            document,
+            new,
+            worker_result,
+        )
+        return True
+    with connection:
+        connection.execute(
+            "UPDATE exec_plans SET guidance_plan_hash = ? "
+            "WHERE repo = ? AND plan_id = ?",
+            (document.structure_hash, repo, plan["plan_id"]),
+        )
+    return False
+
+
+def validate_guidance_publication(
+    connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+    plan: sqlite3.Row,
+    worker_result: str,
+    *,
+    previous_base: str | None = None,
+    latest_base: str | None = None,
+) -> bool:
+    """Revalidate the latest approval per target, including after Manager rebase."""
+
+    rows = tuple(connection.execute(
+        "SELECT * FROM guidance_approvals WHERE repo = ? AND plan_id = ? "
+        "ORDER BY rowid",
+        (repo, plan["plan_id"]),
+    ).fetchall())
+    if not rows:
+        return False
+    document = _guidance_document(worktree, str(plan["path"]))
+    if document is None:
+        raise AgentScopeError("게시할 ExecPlan에 guidance 결정이 없습니다.")
+    proposals, new = _guidance_document_matches_rows(
+        document, rows, require_decisions=True
+    )
+    if new:
+        raise AgentScopeError("게시 전에 승인되지 않은 guidance 제안이 있습니다.")
+    latest_batches = {str(row["target_path"]): str(row["batch_id"]) for row in rows}
+    selected = tuple(
+        row for row in rows
+        if str(row["batch_id"]) == latest_batches[str(row["target_path"])]
+    )
+    mismatched = []
+    new_baselines: dict[str, tuple[bytes, int]] = {}
+    for target in latest_batches:
+        target_rows = tuple(row for row in selected if row["target_path"] == target)
+        last = target_rows[-1]
+        try:
+            contents, mode = _guidance_target_state(worktree, target)
+            exact = (
+                all(int(row["applied"]) for row in target_rows)
+                and guidance_content_hash(contents) == last["expected_content_hash"]
+                and mode == int(last["baseline_mode"])
+            )
+        except GuidanceFormatError:
+            exact = False
+        if previous_base and latest_base:
+            old = git(worktree, "rev-parse", f"{previous_base}:{target}", check=False)
+            new_blob = git(worktree, "rev-parse", f"{latest_base}:{target}", check=False)
+            old_mode = git(worktree, "ls-tree", previous_base, "--", target).stdout
+            new_mode = git(worktree, "ls-tree", latest_base, "--", target).stdout
+            if old.returncode or new_blob.returncode or old_mode != new_mode:
+                # Reapproval during a paused rebase already binds the decision
+                # to this base. Do not invalidate it again after --continue.
+                base_approved = False
+                shown = subprocess.run(
+                    ["git", "show", f"{latest_base}:{target}"],
+                    cwd=worktree, check=False, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                if shown.returncode == 0 and new_mode.startswith(("100644 ", "100755 ")):
+                    new_baselines[target] = (
+                        shown.stdout,
+                        0o755 if new_mode.startswith("100755 ") else 0o644,
+                    )
+                    base_approved = all(
+                        bytes(item["baseline_content"]) == shown.stdout
+                        and int(item["baseline_mode"]) == new_baselines[target][1]
+                        for item in target_rows
+                    )
+                exact = exact and base_approved
+        if not exact:
+            mismatched.extend(proposals[str(row["proposal_id"])] for row in target_rows)
+    if not mismatched:
+        return False
+    _invalidate_guidance_approval(
+        connection, repo, worktree, plan, document, tuple(mismatched),
+        worker_result,
+        "최신 base 또는 게시할 AGENTS.md가 승인 기준과 다릅니다. "
+        "새 기준에 적용할 정확한 대체 patch와 User Decision Revision이 필요합니다.",
+    )
+    with connection:
+        for target, (contents, mode) in new_baselines.items():
+            connection.execute(
+                "UPDATE guidance_approvals SET baseline_content = ?, baseline_mode = ? "
+                "WHERE repo = ? AND plan_id = ? AND target_path = ? AND batch_id = ?",
+                (contents, mode, repo, plan["plan_id"], target, latest_batches[target]),
+            )
+    return True
+
+
+def guidance_resume_context(
+    connection: sqlite3.Connection,
+    repo: str,
+    plan_id: str,
+) -> str:
+    rows = tuple(
+        row
+        for row in _guidance_rows(connection, repo, plan_id)
+        if not int(row["applied"])
+    )
+    if not rows:
+        return ""
+    payload = [
+        {
+            "proposal_id": str(row["proposal_id"]),
+            "target": str(row["target_path"]),
+            "scope": str(row["scope"]),
+            "decision": str(row["decision"]),
+            "revision": str(row["decision_revision"]),
+            "patch": str(row["approved_patch"] or ""),
+            "patch_hash": str(row["approved_patch_hash"] or ""),
+            "expected_content_hash": str(row["expected_content_hash"] or ""),
+        }
+        for row in rows
+    ]
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
 
 
 def _blocked_execplan_metadata_error(
@@ -5787,6 +6634,18 @@ def validate_persisted_agent_scope(
     selected_plan_path = str(project["plan_path"] or "")
     if role_name == "worker" and not selected_plan_path:
         raise AgentScopeError("저장된 Worker ExecPlan 경로가 없습니다.")
+    guidance_targets: tuple[str, ...] = ()
+    allow_common_plans = False
+    if role_name == "worker":
+        active_plan = active_execplan(connection, repo)
+        if active_plan is None:
+            raise AgentScopeError("저장된 Worker ExecPlan 상태가 없습니다.")
+        guidance_targets = _guidance_worker_targets(
+            connection, repo, str(active_plan["plan_id"])
+        )
+        allow_common_plans = _published_plan_allows_common_plans(
+            repo_path, active_plan
+        )
     if not saved_worktree.is_dir():
         recover_persisted_agent_worktree(
             connection, repo_path, state_dir, repo, project
@@ -5894,6 +6753,8 @@ def validate_persisted_agent_scope(
                 selected_plan_path=(
                     selected_plan_path if role_name == "worker" else None
                 ),
+                allowed_guidance_targets=guidance_targets,
+                allow_common_plans=allow_common_plans,
                 external_worktree=repo_path,
                 base_branch=str(project["base_branch"]),
             )
@@ -6007,6 +6868,8 @@ def validate_persisted_agent_scope(
         selected_plan_path=(
             selected_plan_path if role_name == "worker" else None
         ),
+        allowed_guidance_targets=guidance_targets,
+        allow_common_plans=allow_common_plans,
         allowed_ref_changes=allowed_ref_changes,
         allowed_worktree_changes=allowed_worktree_changes,
         external_worktree=repo_path,
@@ -7034,6 +7897,7 @@ def _requeue_blocked_execplan(
             UPDATE exec_plans
             SET status = 'READY', blocked_fingerprint = NULL,
                 blocked_worktree_fingerprint = NULL, retry_count = 0,
+                blocked_reason = NULL, guidance_plan_hash = NULL,
                 last_error = NULL, worker_session_id = NULL,
                 reviewer_session_id = NULL, worker_result = NULL,
                 verify_result = NULL, review_result = NULL,
@@ -7512,6 +8376,9 @@ def worker_prompt(
     *,
     archive_candidates: tuple[str, ...] = (),
     session_recovery: bool = False,
+    guidance_common_allowed: bool = False,
+    guidance_context: str = "",
+    allow_common_plans: bool = False,
 ) -> str:
     failure = f"\n이전 실행에서 다음 문제가 발생했다. 원인을 해결하라:\n{error[-6000:]}\n" if error else ""
     saved_feedback = (
@@ -7538,11 +8405,62 @@ def worker_prompt(
             "현재 worktree와 아래 이전 Worker 결과 및 실패 내용을 기준으로 계속하라:\n"
             f"{(previous_result or '이전 Worker 결과 없음')[-6000:]}\n"
         )
+    common_scope = (
+        "이 저장소의 루트 AGENTS.md는 공통 원본이므로 Scope는 반드시 `common`이어야 한다."
+        if guidance_common_allowed
+        else "이 저장소에서는 Scope `project`만 허용되며 `common` 제안은 범위 위반이다."
+    )
+    plans_scope = (
+        "게시된 ExecPlan이 공통 docs/PLANS.md 변경을 명시했으므로 그 파일 변경도 허용된다."
+        if allow_common_plans
+        else "docs/PLANS.md는 이번 Worker 변경 범위가 아니다."
+    )
+    if guidance_context:
+        guidance_instruction = (
+            "\nSQLite에 사용자 결정과 결합되어 승인된 guidance가 있다. "
+            "아래 approve/replace patch만 해당 Target에 적용하고 reject 대상은 원래 baseline으로 유지하라. "
+            "이전 불일치가 남아 있으면 expected_content_hash가 되도록 복원하라. "
+            "User Decision은 수정하지 말며, 최종 대상 내용은 expected_content_hash와 일치해야 한다:\n"
+            f"{guidance_context}\n"
+        )
+    else:
+        guidance_instruction = f"""
+현재 ExecPlan 달성에 꼭 필요한 AGENTS.md 규칙 변경을 발견하면 AGENTS.md를 직접 수정하지 마라.
+대신 {plan_path}의 ## Decision Log 끝에 아래 형식을 추가하고 Worker 실행을 끝내 사용자 결정을 기다려라.
+proposal ID는 이 ExecPlan 안에서 고유한 소문자·숫자·하이픈 값이어야 하고 Target은 저장소 루트의 `AGENTS.md`만 허용된다.
+{common_scope}
+Worker는 User Decision을 반드시 pending/빈 Revision/빈 Patch로 작성해야 하며 기존 제안·결정을 수정하거나 삭제하지 마라.
+
+### Agent Guidance Proposal: guidance-example
+Target: `AGENTS.md`
+Scope: `{"common" if guidance_common_allowed else "project"}`
+Reason: 현재 ExecPlan에 이 규칙이 필요한 구체적인 이유
+Impact: 적용하지 않으면 현재 구현에 생기는 구체적인 영향
+Patch:
+```diff
+diff --git a/AGENTS.md b/AGENTS.md
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -1,1 +1,2 @@
+ 기존 줄
++추가할 정확한 줄
+```
+
+### Agent Guidance User Decision: guidance-example
+Decision: `pending`
+Revision: ``
+Patch:
+```diff
+```
+"""
+
     return f"""
 당신은 Loop Manager의 Worker다.
 AGENTS.md와 {plan_path}를 읽고 해당 ExecPlan 하나만 구현하라.
 관련 targeted test를 작성하되 commit, push, PR 생성과 scripts/verify 실행은 하지 마라.
 docs/plans에 새 ExecPlan을 만들지 말고 불필요한 후속 기능도 구현하지 마라.
+{plans_scope}
+{guidance_instruction}
 구현과 관련 unit test를 작성하거나 갱신한 뒤, 수정한 코드와 새로 작성하거나 변경한 테스트를 직접 검증하는 최소 범위의 targeted unit test만 실행하라. 개별 test case, test class, test module 또는 이에 준하는 좁은 단위만 허용된다.
 targeted unit test가 실패하면 같은 세션에서 원인을 수정하고 같은 targeted test를 다시 실행하라. 문서·설정 전용 변경이거나 실행 가능한 관련 unit test가 없으면 테스트 범위를 확대하지 말고, 실행하지 못한 구체적인 사유를 최종 결과에 남겨라.
 실패 이력을 보고할 때는 실패한 명령만 적은 `FAILED_COMMAND:` 줄과 수정 후 동일 명령만 적은 `RERUN:` 줄을 각각 두고, 재실행의 실패가 없는 최종 결과를 그 뒤에 명시하라. 두 명령은 공백을 정규화한 뒤 정확히 같아야 하며 하나의 실행에서 성공·실패가 섞인 요약은 통과로 보고하지 마라.
@@ -8437,7 +9355,13 @@ def _run_project_step(
 
     if row and row["phase"] == "BLOCKED":
         git(repo_path, "fetch", "origin")
-        if resume_blocked_execplan_if_inputs_changed(
+        blocked_plan = active_execplan(connection, repo)
+        resume_blocked = (
+            resume_guidance_approval_if_decided
+            if blocked_plan and blocked_plan["blocked_reason"] == GUIDANCE_BLOCK_REASON
+            else resume_blocked_execplan_if_inputs_changed
+        )
+        if resume_blocked(
             connection,
             repo_path,
             repo,
@@ -9205,6 +10129,15 @@ def _run_project_step(
         validation_feedback = "\n\n".join(
             feedback for feedback in persisted_validation_feedback if feedback
         )
+        guidance_targets = _guidance_worker_targets(
+            connection, repo, str(catalog_plan["plan_id"])
+        )
+        guidance_context = guidance_resume_context(
+            connection, repo, str(catalog_plan["plan_id"])
+        )
+        allow_common_plans = _published_plan_allows_common_plans(
+            repo_path, catalog_plan
+        )
         result = run_agent_with_retries(
             lambda current_session_id, session_recovery: run_agent(
                 provider,
@@ -9219,6 +10152,9 @@ def _run_project_step(
                     validation_feedback,
                     archive_candidates=archive_candidates,
                     session_recovery=session_recovery,
+                    guidance_common_allowed=is_loop_manager_repository(repo_path),
+                    guidance_context=guidance_context,
+                    allow_common_plans=allow_common_plans,
                 ),
                 read_only=False,
                 level=level,
@@ -9248,6 +10184,16 @@ def _run_project_step(
                 worker_scope_before,
                 allow_rebase=resolving_rebase,
                 allowed_requirement_archives=archive_scope_sources,
+                allowed_guidance_targets=guidance_targets,
+                allow_common_plans=allow_common_plans,
+            )
+            guidance_blocked = inspect_worker_guidance_result(
+                connection,
+                repo_path,
+                repo,
+                worktree,
+                catalog_plan,
+                message,
             )
         except (AgentScopeError, WorkspaceOwnershipError, RuntimeError) as error:
             scope_error = str(error)
@@ -9259,6 +10205,10 @@ def _run_project_step(
                 str(row["verify_result"] or ""),
             )
             operation_print(scope_error, file=sys.stderr)
+            return 1
+        if guidance_blocked:
+            blocked = active_execplan(connection, repo)
+            operation_print(str(blocked["last_error"]), file=sys.stderr)
             return 1
         clear_agent_scope(connection, repo)
 
@@ -9385,6 +10335,11 @@ def _run_project_step(
                 f"origin/{base}",
             ).stdout.strip()
             update_project(connection, repo, active_sha=latest_sha)
+            if validate_guidance_publication(
+                connection, repo, worktree, catalog_plan, message,
+                previous_base=str(row["active_sha"]), latest_base=latest_sha,
+            ):
+                return 1
         if archive_sources:
             post_worker_revision = (
                 latest_sha if resolving_rebase else str(row["active_sha"] or "")
@@ -9442,6 +10397,10 @@ def _run_project_step(
 
     row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
     if row["phase"] == "VERIFYING":
+        if validate_guidance_publication(
+            connection, repo, worktree, catalog_plan, str(row["worker_result"] or "")
+        ):
+            return 1
         operation_log(f"전체 verify 시작: {plan['id']} {plan['title']}")
         try:
             worker_publication = parse_worker_result(str(row["worker_result"] or ""), plan)
@@ -9538,6 +10497,12 @@ def _run_project_step(
             rebased = git(worktree, "rebase", f"origin/{base}", check=False)
             if rebased.returncode:
                 if _rebase_in_progress_for_branch(worktree, branch):
+                    if validate_guidance_publication(
+                        connection, repo, worktree, catalog_plan,
+                        str(row["worker_result"] or ""),
+                        previous_base=str(row["active_sha"]), latest_base=latest_sha,
+                    ):
+                        return 1
                     rebase_failure = REBASE_CONFLICT_PREFIX + rebased.stdout[-8000:]
                     update_project(
                         connection,
@@ -9559,6 +10524,12 @@ def _run_project_step(
                 return 1
             # Persist the new base now so recovery does not repeat that rebase.
             update_project(connection, repo, active_sha=latest_sha)
+            if validate_guidance_publication(
+                connection, repo, worktree, catalog_plan,
+                str(row["worker_result"] or ""),
+                previous_base=str(row["active_sha"]), latest_base=latest_sha,
+            ):
+                return 1
             operation_log(f"전체 verify 시작: {plan['id']} {plan['title']} (rebase 후)")
             verify_scope_before = begin_agent_scope(
                 connection,
@@ -9851,6 +10822,12 @@ def _run_project_step(
                 )
                 if rebased.returncode:
                     if _rebase_in_progress_for_branch(worktree, branch):
+                        if validate_guidance_publication(
+                            connection, repo, worktree, catalog_plan,
+                            str(row["worker_result"] or ""),
+                            previous_base=str(row["active_sha"]), latest_base=latest_sha,
+                        ):
+                            return 1
                         rebase_failure = (
                             REBASE_CONFLICT_PREFIX + rebased.stdout[-8000:]
                         )
@@ -9873,6 +10850,13 @@ def _run_project_step(
                             str(row["verify_result"] or ""),
                         )
                     operation_print(rebase_failure, file=sys.stderr)
+                    return 1
+                update_project(connection, repo, active_sha=latest_sha)
+                if validate_guidance_publication(
+                    connection, repo, worktree, catalog_plan,
+                    str(row["worker_result"] or ""),
+                    previous_base=str(row["active_sha"]), latest_base=latest_sha,
+                ):
                     return 1
                 if not branch_has_changes(worktree, base):
                     no_change_error = (
@@ -9969,6 +10953,10 @@ def _run_project_step(
                 )
                 operation_print(archive_error, file=sys.stderr)
                 return PROJECT_STEP_RETRY
+        if validate_guidance_publication(
+            connection, repo, worktree, catalog_plan, str(row["worker_result"] or "")
+        ):
+            return 1
         if not branch_has_changes(worktree, base):
             no_change_error = (
                 "게시할 Worker 변경이 남지 않아 PR을 생성할 수 없습니다."

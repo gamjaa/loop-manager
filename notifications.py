@@ -131,7 +131,7 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
     if not cause:
         return
     plan = connection.execute(
-        "SELECT plan_id, title, path, sources FROM exec_plans "
+        "SELECT plan_id, title, path, sources, blocked_reason FROM exec_plans "
         "WHERE repo = ? AND path = ?",
         (repo, project[1]),
     ).fetchone()
@@ -144,9 +144,31 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
         plan_id = str(plan[0])
         plan_title = str(plan[1])
         paths = [str(plan[2]), *(str(item) for item in sources)]
+        guidance_locations = []
+        if plan[4] == "guidance_approval":
+            rows = connection.execute(
+                "SELECT proposal_id, proposal_line, decision_line "
+                "FROM guidance_approvals WHERE repo = ? AND plan_id = ? "
+                "AND applied = 0 ORDER BY sequence, proposal_id",
+                (repo, plan_id),
+            ).fetchall()
+            guidance_locations = [
+                {
+                    "proposal_id": str(row[0]),
+                    "proposal": f"{plan[2]}:{row[1]}",
+                    "user_decision": f"{plan[2]}:{row[2]}",
+                }
+                for row in rows
+            ]
+            paths.extend(
+                location
+                for item in guidance_locations
+                for location in (item["proposal"], item["user_decision"])
+            )
     else:
         stage = "planning"
         plan_id = plan_title = None
+        guidance_locations = []
         paths = [
             "docs/PRODUCT.md",
             "docs/requirements/*.md",
@@ -164,6 +186,7 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
             "execplan_title": plan_title,
             "cause": str(cause),
             "paths": paths,
+            "guidance_locations": guidance_locations,
         },
     )
 
