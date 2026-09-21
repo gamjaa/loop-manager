@@ -1,0 +1,814 @@
+import sqlite3
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import guidance_approval
+import loop_manager
+
+
+PATCH = """diff --git a/AGENTS.md b/AGENTS.md
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -1 +1,2 @@
+ # Agents
++Approved rule
+"""
+
+
+def guidance_plan(*, decision: str = "pending", revision: str = "", patch: str = "") -> str:
+    return f"""---
+id: G-020
+title: Guidance
+sources:
+  - docs/PRODUCT.md
+depends_on: []
+complexity: high
+risk: critical
+priority: high
+---
+
+## Purpose
+
+Test.
+
+## Decision Log
+
+### Agent Guidance Proposal: worker-rule
+Target: `AGENTS.md`
+Scope: `project`
+Reason: The current plan needs this rule.
+Impact: The Worker cannot finish safely without it.
+Patch:
+```diff
+{PATCH}```
+
+### Agent Guidance User Decision: worker-rule
+Decision: `{decision}`
+Revision: `{revision}`
+Patch:
+```diff
+{patch}```
+"""
+
+
+def git(repo: Path, *arguments: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo), *arguments],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    return result.stdout.strip()
+
+
+def repository(root: Path) -> tuple[Path, str]:
+    repo = root / "repo"
+    repo.mkdir()
+    git(repo, "init", "--initial-branch=main")
+    git(repo, "config", "user.email", "loop@example.com")
+    git(repo, "config", "user.name", "Loop Test")
+    files = {
+        "AGENTS.md": "# Agents\n",
+        "docs/PRODUCT.md": "# Product\n",
+        "docs/ARCHITECTURE.md": "# Architecture\n",
+        "docs/PLANS.md": "# Plans\n",
+        "docs/plans/[G-020] Guidance.md": guidance_plan(),
+    }
+    for relative, contents in files.items():
+        path = repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents, encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-m", "Initial")
+    return repo, "docs/plans/[G-020] Guidance.md"
+
+
+def active_connection(
+    repo: Path,
+    plan_path: str,
+    database: str | Path = ":memory:",
+) -> sqlite3.Connection:
+    connection = sqlite3.connect(database)
+    connection.row_factory = sqlite3.Row
+    connection.execute(loop_manager.SCHEMA)
+    loop_manager._ensure_execplans_schema(connection)
+    head = git(repo, "rev-parse", "HEAD")
+    connection.execute(
+        "INSERT INTO projects (repo, base_branch, phase, branch, worktree, plan_path, "
+        "active_sha, plan_sha, worker_session_id) "
+        "VALUES (?, 'main', 'WORKING', 'main', ?, ?, ?, ?, 'worker-session')",
+        (str(repo), str(repo), plan_path, head, head),
+    )
+    connection.execute(
+        """
+        INSERT INTO exec_plans (
+            repo, plan_id, path, title, sources, depends_on, priority,
+            content_hash, status, plan_sha, active_sha, branch, worktree,
+            worker_session_id, workspace_owned
+        ) VALUES (?, 'G-020', ?, 'Guidance', '["docs/PRODUCT.md"]', '[]',
+                  'high', 'hash', 'IMPLEMENTING', ?, ?, 'main', ?,
+                  'worker-session', 1)
+        """,
+        (str(repo), plan_path, head, head, str(repo)),
+    )
+    connection.commit()
+    return connection
+
+
+class GuidanceFormatTest(unittest.TestCase):
+    def test_parser_binds_target_patch_and_decision_deterministically(self):
+        pending = guidance_approval.parse_guidance_document(guidance_plan())
+        approved = guidance_approval.parse_guidance_document(
+            guidance_plan(decision="approve", revision="1")
+        )
+
+        self.assertEqual(pending.structure_hash, approved.structure_hash)
+        self.assertEqual(pending.proposals[0].identity, approved.proposals[0].identity)
+        self.assertNotEqual(
+            pending.proposals[0].decision.identity,
+            approved.proposals[0].decision.identity,
+        )
+        self.assertEqual(
+            guidance_approval.apply_patch_to_content(
+                b"# Agents\n", "AGENTS.md", approved.proposals[0].patch
+            ),
+            b"# Agents\nApproved rule\n",
+        )
+        self.assertEqual(
+            guidance_approval.guidance_patch_hash("AGENTS.md", PATCH),
+            guidance_approval.guidance_patch_hash("AGENTS.md", PATCH.replace("\n", "\r\n")),
+        )
+
+    def test_parser_rejects_incomplete_ambiguous_and_out_of_scope_patches(self):
+        cases = (
+            guidance_plan().replace("Impact: The Worker cannot finish safely without it.\n", ""),
+            guidance_plan().replace("Decision: `pending`", "Decision: `approve`"),
+            guidance_plan().replace("b/AGENTS.md", "b/docs/PLANS.md"),
+            guidance_plan() + "\n### Agent Guidance User Decision: worker-rule\n",
+        )
+        for value in cases:
+            with self.subTest(value=value[-80:]), self.assertRaises(
+                guidance_approval.GuidanceFormatError
+            ):
+                guidance_approval.parse_guidance_document(value)
+
+
+class GuidanceRuntimeTest(unittest.TestCase):
+    def test_proposal_blocks_until_only_user_decision_changes_then_preserves_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, plan_path = repository(Path(directory))
+            connection = active_connection(repo, plan_path)
+            loop_manager.notifications.configure_session(connection, enabled=True)
+            plan = loop_manager.active_execplan(connection, str(repo))
+            document = guidance_approval.parse_guidance_document(
+                (repo / plan_path).read_text(encoding="utf-8")
+            )
+            original_head = git(repo, "rev-parse", "HEAD")
+            implementation = repo / "implementation.py"
+            implementation.write_text("work in progress\n", encoding="utf-8")
+
+            with mock.patch("loop_manager.is_loop_manager_repository", return_value=False):
+                loop_manager._block_for_new_guidance(
+                    connection,
+                    repo,
+                    str(repo),
+                    repo,
+                    plan,
+                    document,
+                    document.proposals,
+                    "proposal recorded",
+                )
+
+            blocked = loop_manager.active_execplan(connection, str(repo))
+            self.assertEqual(
+                (blocked["status"], blocked["blocked_reason"]),
+                ("BLOCKED", "guidance_approval"),
+            )
+            self.assertEqual(blocked["worker_session_id"], "worker-session")
+            self.assertIsNone(blocked["blocked_fingerprint"])
+            self.assertEqual((repo / "AGENTS.md").read_text(), "# Agents\n")
+            self.assertEqual(git(repo, "rev-parse", "HEAD"), original_head)
+            self.assertEqual(implementation.read_text(), "work in progress\n")
+            payload = connection.execute(
+                "SELECT payload FROM notification_outbox WHERE event_type = 'blocked'"
+            ).fetchone()[0]
+            self.assertIn('"execplan_id": "G-020"', payload)
+            self.assertIn(
+                '"proposal": "docs/plans/[G-020] Guidance.md:', payload
+            )
+            self.assertIn(
+                '"user_decision": "docs/plans/[G-020] Guidance.md:', payload
+            )
+
+            unrelated = (repo / plan_path).read_text().replace(
+                "Test.", "Changed outside decision."
+            )
+            (repo / plan_path).write_text(unrelated, encoding="utf-8")
+            with mock.patch("loop_manager.validate_execplan_workspace_identity"), mock.patch(
+                "loop_manager.make_worktree"
+            ), mock.patch("loop_manager.validate_blocked_agent_scope"):
+                self.assertFalse(
+                    loop_manager.resume_guidance_approval_if_decided(
+                        connection, repo, str(repo), "main", Path(directory)
+                    )
+                )
+            self.assertEqual(
+                loop_manager.active_execplan(connection, str(repo))["status"], "BLOCKED"
+            )
+
+            approved = guidance_plan(decision="approve", revision="decision-1")
+            (repo / plan_path).write_text(approved, encoding="utf-8")
+            with mock.patch("loop_manager.validate_execplan_workspace_identity"), mock.patch(
+                "loop_manager.make_worktree"
+            ), mock.patch("loop_manager.validate_blocked_agent_scope"):
+                self.assertTrue(
+                    loop_manager.resume_guidance_approval_if_decided(
+                        connection, repo, str(repo), "main", Path(directory)
+                    )
+                )
+
+            resumed = loop_manager.active_execplan(connection, str(repo))
+            project = connection.execute(
+                "SELECT phase, worker_session_id FROM projects WHERE repo = ?", (str(repo),)
+            ).fetchone()
+            self.assertEqual(
+                (resumed["status"], project["phase"]),
+                ("IMPLEMENTING", "WORKING"),
+            )
+            self.assertEqual(
+                (resumed["worker_session_id"], project["worker_session_id"]),
+                ("worker-session", "worker-session"),
+            )
+            self.assertEqual(implementation.read_text(), "work in progress\n")
+            self.assertEqual(
+                loop_manager._guidance_worker_targets(connection, str(repo), "G-020"),
+                ("AGENTS.md",),
+            )
+
+            (repo / "AGENTS.md").write_text("# Agents\nApproved rule\n", encoding="utf-8")
+            self.assertFalse(
+                loop_manager.inspect_worker_guidance_result(
+                    connection,
+                    repo,
+                    str(repo),
+                    repo,
+                    resumed,
+                    "approved patch applied",
+                )
+            )
+            approval = connection.execute(
+                "SELECT decision, approved_patch_hash, applied FROM guidance_approvals"
+            ).fetchone()
+            self.assertEqual((approval["decision"], approval["applied"]), ("approve", 1))
+            self.assertEqual(
+                approval["approved_patch_hash"],
+                guidance_approval.guidance_patch_hash("AGENTS.md", PATCH),
+            )
+
+            tampered = guidance_approval.parse_guidance_document(
+                guidance_plan(decision="approve", revision="changed-after-apply")
+            )
+            with self.assertRaisesRegex(
+                loop_manager.AgentScopeError,
+                "확정된 guidance User Decision",
+            ):
+                loop_manager._guidance_document_matches_rows(
+                    tampered,
+                    loop_manager._guidance_rows(connection, str(repo), "G-020"),
+                    require_decisions=False,
+                )
+
+    def test_reject_and_replacement_decisions_resume_without_expanding_scope(self):
+        replacement = PATCH.replace("Approved rule", "Replacement rule")
+        scenarios = (
+            ("reject", "reject-1", "", "# Agents\n", ("AGENTS.md",)),
+            (
+                "replace",
+                "replace-1",
+                replacement,
+                "# Agents\nReplacement rule\n",
+                ("AGENTS.md",),
+            ),
+        )
+        for decision, revision, decision_patch, expected, targets in scenarios:
+            with self.subTest(decision=decision), tempfile.TemporaryDirectory() as directory:
+                repo, plan_path = repository(Path(directory))
+                connection = active_connection(repo, plan_path)
+                plan = loop_manager.active_execplan(connection, str(repo))
+                document = guidance_approval.parse_guidance_document(
+                    (repo / plan_path).read_text(encoding="utf-8")
+                )
+                with mock.patch("loop_manager.is_loop_manager_repository", return_value=False):
+                    loop_manager._block_for_new_guidance(
+                        connection,
+                        repo,
+                        str(repo),
+                        repo,
+                        plan,
+                        document,
+                        document.proposals,
+                        "proposal",
+                    )
+                (repo / plan_path).write_text(
+                    guidance_plan(
+                        decision=decision,
+                        revision=revision,
+                        patch=decision_patch,
+                    ),
+                    encoding="utf-8",
+                )
+                with mock.patch("loop_manager.validate_execplan_workspace_identity"), mock.patch(
+                    "loop_manager.make_worktree"
+                ), mock.patch("loop_manager.validate_blocked_agent_scope"):
+                    self.assertTrue(
+                        loop_manager.resume_guidance_approval_if_decided(
+                            connection, repo, str(repo), "main", Path(directory)
+                        )
+                    )
+                self.assertEqual(
+                    loop_manager._guidance_worker_targets(connection, str(repo), "G-020"),
+                    targets,
+                )
+                (repo / "AGENTS.md").write_text(expected, encoding="utf-8")
+                active = loop_manager.active_execplan(connection, str(repo))
+                self.assertFalse(
+                    loop_manager.inspect_worker_guidance_result(
+                        connection, repo, str(repo), repo, active, "continued"
+                    )
+                )
+                row = connection.execute(
+                    "SELECT decision, applied FROM guidance_approvals"
+                ).fetchone()
+                self.assertEqual((row["decision"], row["applied"]), (decision, 1))
+
+    def test_rejected_rule_can_be_followed_by_a_new_pending_proposal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, plan_path = repository(Path(directory))
+            connection = active_connection(repo, plan_path)
+            plan = loop_manager.active_execplan(connection, str(repo))
+            document = guidance_approval.parse_guidance_document(
+                (repo / plan_path).read_text(encoding="utf-8")
+            )
+            with mock.patch("loop_manager.is_loop_manager_repository", return_value=False):
+                loop_manager._block_for_new_guidance(
+                    connection,
+                    repo,
+                    str(repo),
+                    repo,
+                    plan,
+                    document,
+                    document.proposals,
+                    "first proposal",
+                )
+            rejected = guidance_plan(decision="reject", revision="reject-1")
+            (repo / plan_path).write_text(rejected, encoding="utf-8")
+            with mock.patch("loop_manager.validate_execplan_workspace_identity"), mock.patch(
+                "loop_manager.make_worktree"
+            ), mock.patch("loop_manager.validate_blocked_agent_scope"):
+                self.assertTrue(
+                    loop_manager.resume_guidance_approval_if_decided(
+                        connection, repo, str(repo), "main", Path(directory)
+                    )
+                )
+            active = loop_manager.active_execplan(connection, str(repo))
+            self.assertFalse(
+                loop_manager.inspect_worker_guidance_result(
+                    connection, repo, str(repo), repo, active, "rejected"
+                )
+            )
+
+            second = rejected.rstrip() + """
+            
+### Agent Guidance Proposal: alternative-rule
+Target: `AGENTS.md`
+Scope: `project`
+Reason: The rejected rule cannot satisfy the plan.
+Impact: An alternative exact rule is required.
+Patch:
+```diff
+diff --git a/AGENTS.md b/AGENTS.md
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -1 +1,2 @@
+ # Agents
++Alternative rule
+```
+
+### Agent Guidance User Decision: alternative-rule
+Decision: `pending`
+Revision: ``
+Patch:
+```diff
+```
+"""
+            (repo / plan_path).write_text(second, encoding="utf-8")
+            active = loop_manager.active_execplan(connection, str(repo))
+            self.assertTrue(
+                loop_manager.inspect_worker_guidance_result(
+                    connection,
+                    repo,
+                    str(repo),
+                    repo,
+                    active,
+                    "alternative proposed",
+                )
+            )
+
+            rows = connection.execute(
+                "SELECT proposal_id, decision, applied FROM guidance_approvals "
+                "ORDER BY proposal_id"
+            ).fetchall()
+            self.assertEqual(
+                [tuple(row) for row in rows],
+                [
+                    ("alternative-rule", "pending", 0),
+                    ("worker-rule", "reject", 1),
+                ],
+            )
+            blocked = loop_manager.active_execplan(connection, str(repo))
+            self.assertEqual(
+                (blocked["status"], blocked["worker_session_id"]),
+                ("BLOCKED", "worker-session"),
+            )
+
+    def test_unappliable_proposal_does_not_enter_blocked_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, plan_path = repository(Path(directory))
+            invalid = guidance_plan().replace("# Agents", "# Missing", 1)
+            (repo / plan_path).write_text(invalid, encoding="utf-8")
+            connection = active_connection(repo, plan_path)
+            plan = loop_manager.active_execplan(connection, str(repo))
+            document = guidance_approval.parse_guidance_document(invalid)
+
+            with mock.patch(
+                "loop_manager.is_loop_manager_repository",
+                return_value=False,
+            ), self.assertRaises(guidance_approval.GuidanceFormatError):
+                loop_manager._block_for_new_guidance(
+                    connection,
+                    repo,
+                    str(repo),
+                    repo,
+                    plan,
+                    document,
+                    document.proposals,
+                    "invalid proposal",
+                )
+
+            current = loop_manager.active_execplan(connection, str(repo))
+            self.assertEqual(current["status"], "IMPLEMENTING")
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM guidance_approvals").fetchone()[0],
+                0,
+            )
+
+    def test_exact_result_mismatch_requires_a_new_decision_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, plan_path = repository(Path(directory))
+            connection = active_connection(repo, plan_path)
+            plan = loop_manager.active_execplan(connection, str(repo))
+            document = guidance_approval.parse_guidance_document(
+                (repo / plan_path).read_text(encoding="utf-8")
+            )
+            with mock.patch("loop_manager.is_loop_manager_repository", return_value=False):
+                loop_manager._block_for_new_guidance(
+                    connection,
+                    repo,
+                    str(repo),
+                    repo,
+                    plan,
+                    document,
+                    document.proposals,
+                    "proposal",
+                )
+            (repo / plan_path).write_text(
+                guidance_plan(decision="approve", revision="decision-1"),
+                encoding="utf-8",
+            )
+            with mock.patch("loop_manager.validate_execplan_workspace_identity"), mock.patch(
+                "loop_manager.make_worktree"
+            ), mock.patch("loop_manager.validate_blocked_agent_scope"):
+                self.assertTrue(
+                    loop_manager.resume_guidance_approval_if_decided(
+                        connection, repo, str(repo), "main", Path(directory)
+                    )
+                )
+
+            (repo / "AGENTS.md").write_text(
+                "# Agents\nApproved rule\nUnapproved extra\n",
+                encoding="utf-8",
+            )
+            active = loop_manager.active_execplan(connection, str(repo))
+            self.assertTrue(
+                loop_manager.inspect_worker_guidance_result(
+                    connection, repo, str(repo), repo, active, "bad result"
+                )
+            )
+            invalidated = connection.execute(
+                "SELECT invalidated_decision_hash, applied FROM guidance_approvals"
+            ).fetchone()
+            self.assertTrue(invalidated["invalidated_decision_hash"])
+            self.assertEqual(invalidated["applied"], 0)
+
+            with mock.patch("loop_manager.validate_execplan_workspace_identity"), mock.patch(
+                "loop_manager.make_worktree"
+            ), mock.patch("loop_manager.validate_blocked_agent_scope"):
+                self.assertFalse(
+                    loop_manager.resume_guidance_approval_if_decided(
+                        connection, repo, str(repo), "main", Path(directory)
+                    )
+                )
+            (repo / plan_path).write_text(
+                guidance_plan(decision="approve", revision="decision-2"),
+                encoding="utf-8",
+            )
+            with mock.patch("loop_manager.validate_execplan_workspace_identity"), mock.patch(
+                "loop_manager.make_worktree"
+            ), mock.patch("loop_manager.validate_blocked_agent_scope"):
+                self.assertTrue(
+                    loop_manager.resume_guidance_approval_if_decided(
+                        connection, repo, str(repo), "main", Path(directory)
+                    )
+                )
+            (repo / "AGENTS.md").write_text(
+                "# Agents\nApproved rule\n",
+                encoding="utf-8",
+            )
+            active = loop_manager.active_execplan(connection, str(repo))
+            self.assertFalse(
+                loop_manager.inspect_worker_guidance_result(
+                    connection, repo, str(repo), repo, active, "corrected result"
+                )
+            )
+            self.assertEqual(
+                connection.execute("SELECT applied FROM guidance_approvals").fetchone()[0],
+                1,
+            )
+
+
+
+    def test_persisted_scope_accepts_only_the_decision_edit_after_worker_proposal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, plan_path = repository(Path(directory))
+            plain = guidance_plan().split(
+                "### Agent Guidance Proposal: worker-rule", 1
+            )[0]
+            (repo / plan_path).write_text(plain, encoding="utf-8")
+            git(repo, "add", plan_path)
+            git(repo, "commit", "-m", "Store plan without guidance")
+            connection = active_connection(repo, plan_path)
+            before = loop_manager.begin_agent_scope(
+                connection,
+                str(repo),
+                repo,
+                "worker",
+                input_fingerprint="input",
+            )
+            (repo / plan_path).write_text(guidance_plan(), encoding="utf-8")
+            after = loop_manager.capture_git_snapshot(repo)
+            loop_manager.validate_agent_scope(
+                "worker",
+                repo,
+                before,
+                after,
+                selected_plan_path=plan_path,
+            )
+            plan = loop_manager.active_execplan(connection, str(repo))
+            document = guidance_approval.parse_guidance_document(
+                (repo / plan_path).read_text(encoding="utf-8")
+            )
+            with mock.patch("loop_manager.is_loop_manager_repository", return_value=False):
+                loop_manager._block_for_new_guidance(
+                    connection,
+                    repo,
+                    str(repo),
+                    repo,
+                    plan,
+                    document,
+                    document.proposals,
+                    "proposal",
+                )
+            (repo / plan_path).write_text(
+                guidance_plan(decision="approve", revision="decision-1"),
+                encoding="utf-8",
+            )
+
+            persisted = loop_manager.validate_persisted_agent_scope(
+                connection,
+                repo,
+                Path(directory),
+                str(repo),
+            )
+            self.assertIsNotNone(persisted)
+            loop_manager.validate_blocked_agent_scope(
+                connection,
+                repo,
+                str(repo),
+                "main",
+                repo,
+                plan_path,
+            )
+
+    def test_approval_state_survives_database_reopen(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, plan_path = repository(root)
+            database = root / "state.db"
+            connection = active_connection(repo, plan_path, database)
+            plan = loop_manager.active_execplan(connection, str(repo))
+            document = guidance_approval.parse_guidance_document(
+                (repo / plan_path).read_text(encoding="utf-8")
+            )
+            with mock.patch("loop_manager.is_loop_manager_repository", return_value=False):
+                loop_manager._block_for_new_guidance(
+                    connection,
+                    repo,
+                    str(repo),
+                    repo,
+                    plan,
+                    document,
+                    document.proposals,
+                    "proposal",
+                )
+            connection.close()
+
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            (repo / plan_path).write_text(
+                guidance_plan(decision="approve", revision="after-restart"),
+                encoding="utf-8",
+            )
+            with mock.patch("loop_manager.validate_execplan_workspace_identity"), mock.patch(
+                "loop_manager.make_worktree"
+            ), mock.patch("loop_manager.validate_blocked_agent_scope"):
+                self.assertTrue(
+                    loop_manager.resume_guidance_approval_if_decided(
+                        connection,
+                        repo,
+                        str(repo),
+                        "main",
+                        root,
+                    )
+                )
+
+            approval = connection.execute(
+                "SELECT decision, decision_revision, applied "
+                "FROM guidance_approvals"
+            ).fetchone()
+            self.assertEqual(
+                tuple(approval),
+                ("approve", "after-restart", 0),
+            )
+            resumed = loop_manager.active_execplan(connection, str(repo))
+            self.assertEqual(resumed["worker_session_id"], "worker-session")
+
+    def test_planner_guidance_proposal_is_rejected_before_catalog_publication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, _plan_path = repository(Path(directory))
+            active_sha = git(repo, "rev-parse", "HEAD")
+            planner_path = "docs/plans/[G-021] Planned Guidance.md"
+            (repo / planner_path).write_text(
+                guidance_plan()
+                .replace("id: G-020", "id: G-021")
+                .replace("title: Guidance", "title: Planned Guidance"),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                loop_manager.PlannerValidationError,
+                "guidance",
+            ):
+                loop_manager.validate_planner_result(
+                    repo,
+                    active_sha,
+                    [planner_path],
+                )
+
+
+    def test_scope_and_role_boundaries_require_exact_approval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, plan_path = repository(Path(directory))
+            before = loop_manager.capture_git_snapshot(repo)
+            (repo / "AGENTS.md").write_text("# Changed directly\n", encoding="utf-8")
+            after = loop_manager.capture_git_snapshot(repo)
+            with self.assertRaises(loop_manager.AgentScopeError):
+                loop_manager.validate_agent_scope(
+                    "worker", repo, before, after, selected_plan_path=plan_path
+                )
+            loop_manager.validate_agent_scope(
+                "worker",
+                repo,
+                before,
+                after,
+                selected_plan_path=plan_path,
+                allowed_guidance_targets=("AGENTS.md",),
+            )
+            with self.assertRaises(loop_manager.AgentScopeError):
+                loop_manager.validate_agent_scope(
+                    "reviewer",
+                    repo,
+                    before,
+                    after,
+                )
+
+            with self.assertRaisesRegex(loop_manager.AgentScopeError, "자체 저장소"):
+                loop_manager._validate_guidance_proposal_scope(
+                    (
+                        guidance_approval.parse_guidance_document(
+                            guidance_plan().replace("Scope: `project`", "Scope: `common`")
+                        ).proposals[0],
+                    ),
+                    common_allowed=False,
+                )
+
+            loop_manager._validate_guidance_proposal_scope(
+                (
+                    guidance_approval.parse_guidance_document(
+                        guidance_plan().replace("Scope: `project`", "Scope: `common`")
+                    ).proposals[0],
+                ),
+                common_allowed=True,
+            )
+            self.assertFalse(
+                loop_manager._worker_path_allowed(
+                    "docs/PLANS.md", plan_path
+                )
+            )
+            self.assertTrue(
+                loop_manager._worker_path_allowed(
+                    "docs/PLANS.md", plan_path, allow_common_plans=True
+                )
+            )
+
+    def test_common_plans_scope_requires_direct_acceptance_criterion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, _plan_path = repository(Path(directory))
+            incidental_path = "docs/plans/[G-030] Boundary.md"
+            explicit_path = "docs/plans/[G-031] Contract.md"
+            (repo / incidental_path).write_text(
+                "## Acceptance Criteria\n\n"
+                "- 후속 계획의 공통 `docs/PLANS.md` 변경을 구분하는 경계를 제공한다.\n",
+                encoding="utf-8",
+            )
+            (repo / explicit_path).write_text(
+                "## Acceptance Criteria\n\n"
+                "- 공통 `docs/PLANS.md`에 guidance 계약을 문서화한다.\n",
+                encoding="utf-8",
+            )
+            git(repo, "add", incidental_path, explicit_path)
+            git(repo, "commit", "-m", "Add plan scope fixtures")
+            plan_sha = git(repo, "rev-parse", "HEAD")
+
+            with mock.patch("loop_manager.is_loop_manager_repository", return_value=True):
+                self.assertFalse(
+                    loop_manager._published_plan_allows_common_plans(
+                        repo,
+                        {"plan_sha": plan_sha, "path": incidental_path},
+                    )
+                )
+                self.assertTrue(
+                    loop_manager._published_plan_allows_common_plans(
+                        repo,
+                        {"plan_sha": plan_sha, "path": explicit_path},
+                    )
+                )
+            with mock.patch("loop_manager.is_loop_manager_repository", return_value=False):
+                self.assertFalse(
+                    loop_manager._published_plan_allows_common_plans(
+                        repo,
+                        {"plan_sha": plan_sha, "path": explicit_path},
+                    )
+                )
+
+    def test_schema_migration_and_prompt_preserve_guidance_contract(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute(loop_manager.SCHEMA)
+        loop_manager._ensure_execplans_schema(connection)
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(exec_plans)")
+        }
+        self.assertIn("blocked_reason", columns)
+        self.assertIn("guidance_plan_hash", columns)
+        self.assertIsNotNone(
+            connection.execute(
+                "SELECT name FROM sqlite_master WHERE name = 'guidance_approvals'"
+            ).fetchone()
+        )
+
+        prompt = loop_manager.worker_prompt(
+            "docs/plans/[G-020] Guidance.md",
+            None,
+            guidance_common_allowed=False,
+        )
+        self.assertIn("### Agent Guidance Proposal: guidance-example", prompt)
+        self.assertIn("### Agent Guidance User Decision: guidance-example", prompt)
+        self.assertIn("Scope `project`만 허용", prompt)
+        self.assertIn("AGENTS.md를 직접 수정하지 마라", prompt)
+
+
+if __name__ == "__main__":
+    unittest.main()
