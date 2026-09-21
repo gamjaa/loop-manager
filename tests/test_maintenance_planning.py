@@ -256,6 +256,36 @@ class MaintenancePlanningTest(unittest.TestCase):
                 self.connection, str(self.repo), self.repo, self.base_sha
             )
 
+    def test_ready_snapshot_rejects_mismatched_plan_revision(self):
+        original = self.ready_path.read_text(encoding="utf-8")
+        self.ready_path.write_text(
+            original.replace(
+                "Separate the responsibility into a testable module boundary.",
+                "Publish a different implementation boundary.",
+            ),
+            encoding="utf-8",
+        )
+        git(self.repo, "add", self.ready_path.relative_to(self.repo).as_posix())
+        git(self.repo, "commit", "-m", "Publish a different plan revision")
+        mismatched_revision = git(self.repo, "rev-parse", "HEAD")
+        self.ready_path.write_text(original, encoding="utf-8")
+        self.connection.execute(
+            "UPDATE exec_plans SET plan_sha = ? "
+            "WHERE repo = ? AND plan_id = 'G-001'",
+            (mismatched_revision, str(self.repo)),
+        )
+        self.connection.commit()
+        maintenance_state.MaintenanceRepository(
+            self.connection
+        ).begin_assessment_if_due(str(self.repo), 5, self.base_sha)
+
+        with self.assertRaisesRegex(
+            loop_manager.MaintenancePlanningError, "plan revision SHA"
+        ):
+            loop_manager.prepare_maintenance_planning_context(
+                self.connection, str(self.repo), self.repo, self.base_sha
+            )
+
     def test_barrier_adds_every_dag_terminal_and_rejects_body_or_priority_drift(self):
         context = self._begin_barrier()
         self._write_barrier_batch()

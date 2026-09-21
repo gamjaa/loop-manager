@@ -1738,7 +1738,7 @@ def _ready_plan_snapshot_from_contents(
             f"유지보수 개정 대상은 무소유 READY 계획이어야 합니다: {plan_id} ({detail})"
         )
     plan_sha = str(row["plan_sha"] or "")
-    if not plan_sha:
+    if re.fullmatch(r"[0-9a-fA-F]{7,64}", plan_sha) is None:
         raise MaintenancePlanningError(
             f"계획 revision SHA를 확인할 수 없습니다: {plan_id}"
         )
@@ -1780,6 +1780,33 @@ def _ready_plan_snapshot_from_contents(
     )
 
 
+def _assert_ready_plan_revision(
+    repository: Path,
+    active_revision: str,
+    snapshot: ReadyPlanSnapshot,
+    contents: bytes,
+) -> None:
+    """Bind a READY row to the Git revision that published its exact body."""
+
+    try:
+        is_ancestor = _git_commit_is_ancestor(
+            repository, snapshot.plan_sha, active_revision
+        )
+        revision_contents = git_bytes(
+            repository, "show", f"{snapshot.plan_sha}:{snapshot.path}"
+        )
+    except RuntimeError as error:
+        raise MaintenancePlanningError(
+            "READY ExecPlan plan revision SHA를 확인할 수 없습니다: "
+            f"{snapshot.plan_id}"
+        ) from error
+    if not is_ancestor or revision_contents != contents:
+        raise MaintenancePlanningError(
+            "READY ExecPlan plan revision SHA가 현재 catalog 본문과 "
+            f"일치하지 않습니다: {snapshot.plan_id}"
+        )
+
+
 def _ready_plan_snapshot(
     worktree: Path,
     active_sha: str,
@@ -1802,7 +1829,9 @@ def _ready_plan_snapshot(
         raise MaintenancePlanningError(
             f"READY ExecPlan 파일이 평가 기준 revision과 다릅니다: {path}"
         )
-    return _ready_plan_snapshot_from_contents(row, contents)
+    snapshot = _ready_plan_snapshot_from_contents(row, contents)
+    _assert_ready_plan_revision(worktree, active_sha, snapshot, contents)
+    return snapshot
 
 
 def _ready_plan_snapshot_at_revision(
@@ -1817,7 +1846,9 @@ def _ready_plan_snapshot_at_revision(
         raise MaintenancePlanningError(
             f"보존된 publication 기준에서 READY ExecPlan을 확인할 수 없습니다: {path}"
         ) from error
-    return _ready_plan_snapshot_from_contents(row, contents)
+    snapshot = _ready_plan_snapshot_from_contents(row, contents)
+    _assert_ready_plan_revision(repository, revision, snapshot, contents)
+    return snapshot
 
 
 def _maintenance_mode_and_rows(
