@@ -410,7 +410,10 @@ class AutomationFirstCatalogTest(unittest.TestCase):
         self._insert_plan(connection, "G-004", "READY", priority="high")
         self._insert_plan(connection, "G-005", "READY", priority="high")
 
-        self.assertEqual(loop_manager.select_ready_execplan(connection, "repo")["plan_id"], "G-004")
+        decision = loop_manager.catalog_schedule_decision(connection, "repo")
+        self.assertIsNone(decision.active)
+        self.assertTrue(decision.has_ready)
+        self.assertEqual(decision.runnable_ready["plan_id"], "G-004")
         connection.execute(
             "UPDATE exec_plans SET status = 'MERGED' WHERE repo = 'repo' AND plan_id = 'G-004'"
         )
@@ -421,7 +424,34 @@ class AutomationFirstCatalogTest(unittest.TestCase):
             "UPDATE exec_plans SET status = 'IMPLEMENTING' WHERE repo = 'repo' AND plan_id = 'G-005'"
         )
         connection.commit()
-        self.assertIsNone(loop_manager.select_ready_execplan(connection, "repo"))
+        decision = loop_manager.catalog_schedule_decision(connection, "repo")
+        self.assertEqual(decision.active["plan_id"], "G-005")
+        self.assertTrue(decision.has_ready)
+        self.assertIsNone(decision.runnable_ready)
+
+    def test_dependency_blocked_ready_is_not_an_empty_catalog(self):
+        connection = self._connection()
+        self._insert_plan(
+            connection,
+            "G-010",
+            "READY",
+            priority="critical",
+            depends_on=("G-009",),
+        )
+        connection.execute(
+            "UPDATE projects SET planning_fingerprint = 'preserved' WHERE repo = 'repo'"
+        )
+        connection.commit()
+
+        decision = loop_manager.catalog_schedule_decision(connection, "repo")
+        project = connection.execute(
+            "SELECT planning_fingerprint, phase FROM projects WHERE repo = 'repo'"
+        ).fetchone()
+
+        self.assertIsNone(decision.active)
+        self.assertTrue(decision.has_ready)
+        self.assertIsNone(decision.runnable_ready)
+        self.assertEqual(tuple(project), ("preserved", None))
 
 
     def test_merge_marks_only_current_plan_and_unlocks_next_dependency(self):
@@ -472,7 +502,7 @@ class AutomationFirstCatalogTest(unittest.TestCase):
         self.assertEqual(statuses, {"G-001": "MERGED", "G-002": "READY"})
         self.assertEqual(selected["plan_id"], "G-002")
 
-    def test_remote_input_change_after_planner_prevents_ready_worker(self):
+    def test_remote_input_change_after_planner_yields_to_published_ready_worker(self):
         for publishes_plan in (False, True):
             with self.subTest(publishes_plan=publishes_plan), tempfile.TemporaryDirectory() as directory:
                 repo = make_remote_repository(directory)
@@ -493,10 +523,11 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                 self._insert_plan(
                     connection,
                     "G-001",
-                    "READY",
+                    "MERGED",
                     priority="high",
                     repo=str(repo),
                     title="Queued",
+                    plan_sha=git_command(repo, "rev-parse", "origin/main"),
                 )
                 started_fingerprint = loop_manager.planning_input_fingerprint(repo, "main")
                 roles = []
@@ -567,8 +598,14 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                 ).fetchall()
 
                 self.assertEqual(result, 1)
-                self.assertEqual(roles, ["planner"])
-                self.assertIsNone(project["phase"])
+                self.assertEqual(
+                    roles,
+                    ["planner", "worker"] if publishes_plan else ["planner"],
+                )
+                self.assertEqual(
+                    project["phase"],
+                    "WORKING" if publishes_plan else None,
+                )
                 self.assertEqual(project["planning_fingerprint"], started_fingerprint)
                 self.assertNotEqual(
                     loop_manager.planning_input_fingerprint(repo, "main"),
@@ -576,12 +613,12 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                 )
                 self.assertEqual(
                     [tuple(plan) for plan in plans],
-                    [("G-001", "READY")]
-                    + ([("G-002", "READY")] if publishes_plan else []),
+                    [("G-001", "MERGED")]
+                    + ([('G-002', 'IMPLEMENTING')] if publishes_plan else []),
                 )
 
-    def test_changed_input_plans_before_ready_while_unchanged_input_selects_worker(self):
-        for changed, expected_role in ((True, "planner"), (False, "worker")):
+    def test_ready_worker_precedes_planning_for_changed_and_unchanged_input(self):
+        for changed in (True, False):
             with self.subTest(changed=changed), tempfile.TemporaryDirectory() as directory:
                 repo = make_remote_repository(directory)
                 (repo / "docs/plans").mkdir()
@@ -640,15 +677,7 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                     )
 
                 self.assertEqual(result, 1)
-                self.assertEqual(roles, [expected_role])
-                if changed:
-                    self.assertIn(
-                        '"id": "G-001"',
-                        loop_manager.planner_prompt(
-                            None,
-                            loop_manager.compact_execplan_catalog(connection, str(repo)),
-                        ),
-                    )
+                self.assertEqual(roles, ["worker"])
 
     def test_planning_and_ready_selection_pin_fingerprint_to_resolved_sha(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -757,7 +786,7 @@ class AutomationFirstCatalogTest(unittest.TestCase):
             self.assertEqual(result, 1)
             self.assertEqual(roles, ["worker"])
             self.assertGreaterEqual(exact_reads, 2)
-            self.assertGreaterEqual(fingerprint_revisions.count(selected_sha), 2)
+            self.assertEqual(fingerprint_revisions, [])
             self.assertEqual(project["active_sha"], selected_sha)
             self.assertEqual(
                 git_command(Path(project["worktree"]), "rev-parse", "HEAD"),
@@ -2985,7 +3014,7 @@ risk: medium
             (blocked_result, unchanged_result, metadata_result, resumed_result),
             (1, 1, 1, 1),
         )
-        self.assertEqual(roles, ["worker", "planner", "worker"])
+        self.assertEqual(roles, ["worker", "worker"])
         verify.assert_called_once()
         self.assertEqual(blocked_project["phase"], "BLOCKED")
         self.assertEqual(blocked_project["verify_result"], "verify: PASS")
@@ -3004,7 +3033,7 @@ risk: medium
         self.assertEqual(resumed_project["phase"], "WORKING")
         self.assertEqual(resumed_project["last_error"], "stop after source change")
         self.assertEqual(resumed_project["active_sha"], managed_head)
-        self.assertNotEqual(resumed_project["active_sha"], origin_head)
+        self.assertEqual(resumed_project["active_sha"], origin_head)
         self.assertEqual(resumed_plan["status"], "IMPLEMENTING")
         self.assertIsNone(resumed_plan["blocked_fingerprint"])
         self.assertEqual(resumed_plan["retry_count"], 0)
@@ -6696,18 +6725,18 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 (str(repo),),
             ).fetchone()
             self.assertEqual(resumed_run, 1)
-            self.assertEqual(resumed_project["phase"], "PLANNING")
+            self.assertEqual(resumed_project["phase"], "WORKING")
             self.assertEqual(
                 resumed_project["last_error"],
                 "stop after cleanup recovery",
             )
             self.assertIsNone(resumed_project["agent_snapshot"])
             self.assertIsNone(resumed_project["agent_manager_snapshot"])
-            self.assertEqual(resumed_plan["status"], "READY")
+            self.assertEqual(resumed_plan["status"], "IMPLEMENTING")
             self.assertIsNone(resumed_plan["blocked_fingerprint"])
             self.assertIsNone(resumed_plan["blocked_worktree_fingerprint"])
             resumed_agent.assert_called_once()
-            self.assertEqual(resumed_agent.call_args.args[3], "planner")
+            self.assertEqual(resumed_agent.call_args.args[3], "worker")
 
     def test_blocked_resume_does_not_excuse_agent_owned_ref_change(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -6966,14 +6995,14 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "refs/loop-manager/violations/",
             ).splitlines()
             self.assertEqual(result, 1)
-            self.assertEqual(project["phase"], "PLANNING")
+            self.assertEqual(project["phase"], "WORKING")
             self.assertEqual(
                 project["last_error"],
                 "stop after automatic commit isolation",
             )
             self.assertIsNone(project["agent_snapshot"])
             self.assertIsNone(project["agent_recovery"])
-            self.assertEqual(resumed_plan["status"], "READY")
+            self.assertEqual(resumed_plan["status"], "IMPLEMENTING")
             self.assertIsNone(resumed_plan["blocked_fingerprint"])
             self.assertIn(agent_commit, diagnostic_refs)
             self.assertEqual(
@@ -6999,7 +7028,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "# Active\n",
             )
             resumed_agent.assert_called_once()
-            self.assertEqual(resumed_agent.call_args.args[3], "planner")
+            self.assertEqual(resumed_agent.call_args.args[3], "worker")
 
     def test_restored_worker_git_metadata_allows_changed_input_to_requeue(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -7142,14 +7171,14 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 (str(repo),),
             ).fetchone()
             self.assertEqual(result, 1)
-            self.assertEqual(project["phase"], "PLANNING")
+            self.assertEqual(project["phase"], "WORKING")
             self.assertEqual(project["last_error"], "stop after restored metadata")
             self.assertIsNone(project["agent_snapshot"])
             self.assertIsNone(project["agent_result_snapshot"])
-            self.assertEqual(plan["status"], "READY")
+            self.assertEqual(plan["status"], "IMPLEMENTING")
             self.assertIsNone(plan["blocked_fingerprint"])
             resumed_agent.assert_called_once()
-            self.assertEqual(resumed_agent.call_args.args[3], "planner")
+            self.assertEqual(resumed_agent.call_args.args[3], "worker")
 
     def test_index_flags_are_rejected_for_worker_allowed_path(self):
         for option in ("--skip-worktree", "--assume-unchanged"):
@@ -7453,7 +7482,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 (str(repo),),
             ).fetchone()
             self.assertEqual(resumed_result, 1)
-            self.assertEqual(resumed_project["phase"], "PLANNING")
+            self.assertEqual(resumed_project["phase"], "WORKING")
             self.assertEqual(
                 resumed_project["last_error"],
                 "stop after scope unblock",
@@ -7461,7 +7490,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
             self.assertIsNone(resumed_project["agent_role"])
             self.assertIsNone(resumed_project["agent_snapshot"])
             self.assertIsNone(resumed_project["agent_result_snapshot"])
-            self.assertEqual(resumed_plan["status"], "READY")
+            self.assertEqual(resumed_plan["status"], "IMPLEMENTING")
             self.assertIsNone(resumed_plan["blocked_fingerprint"])
             self.assertFalse((worktree / "reviewer.txt").exists())
             self.assertIn(
@@ -7469,7 +7498,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 git_command(worktree, "stash", "list"),
             )
             resumed_agent.assert_called_once()
-            self.assertEqual(resumed_agent.call_args.args[3], "planner")
+            self.assertEqual(resumed_agent.call_args.args[3], "worker")
 
 
     def test_reviewer_scope_block_records_execplan_body_boundaries(self):
@@ -9115,14 +9144,14 @@ class WorkspaceRecoveryTest(unittest.TestCase):
                 (str(repo),),
             ).fetchone()
             self.assertEqual(recovered_result, 1)
-            self.assertEqual(recovered_project["phase"], "PLANNING")
-            self.assertIsNone(recovered_project["branch"])
+            self.assertEqual(recovered_project["phase"], "WORKING")
+            self.assertEqual(recovered_project["branch"], branch)
             self.assertEqual(
                 recovered_project["last_error"],
                 "stop after ownership recovery",
             )
-            self.assertEqual(tuple(recovered_plan), ("READY", 0))
-            self.assertFalse(worktree.exists())
+            self.assertEqual(tuple(recovered_plan), ("IMPLEMENTING", 1))
+            self.assertTrue(worktree.exists())
             self.assertEqual(
                 loop_manager.git(
                     repo,
@@ -9132,10 +9161,10 @@ class WorkspaceRecoveryTest(unittest.TestCase):
                     f"refs/heads/{branch}",
                     check=False,
                 ).returncode,
-                1,
+                0,
             )
             recovered_agent.assert_called_once()
-            self.assertEqual(recovered_agent.call_args.args[3], "planner")
+            self.assertEqual(recovered_agent.call_args.args[3], "worker")
 
     def test_new_planning_rejects_preexisting_detached_worktree(self):
         with tempfile.TemporaryDirectory() as directory:

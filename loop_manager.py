@@ -291,6 +291,13 @@ class ScheduledProjectResult:
 
 
 @dataclass(frozen=True)
+class CatalogScheduleDecision:
+    active: sqlite3.Row | None
+    has_ready: bool
+    runnable_ready: sqlite3.Row | None
+
+
+@dataclass(frozen=True)
 class AgentResult:
     code: int
     message: str
@@ -1987,12 +1994,14 @@ def compact_execplan_catalog(connection: sqlite3.Connection, repo: str) -> str:
     return json.dumps(catalog, ensure_ascii=False, indent=2)
 
 
-def select_ready_execplan(connection: sqlite3.Connection, repo: str) -> sqlite3.Row | None:
-    """Apply the dependency gate before deterministic priority/ID ordering."""
+def catalog_schedule_decision(
+    connection: sqlite3.Connection,
+    repo: str,
+) -> CatalogScheduleDecision:
+    """Separate active work, READY presence, and dependency-gated selection."""
 
     _ensure_execplans_schema(connection)
-    if active_execplan(connection, repo):
-        return None
+    active = active_execplan(connection, repo)
     statuses = {
         row["plan_id"]: row["status"]
         for row in connection.execute(
@@ -2000,23 +2009,35 @@ def select_ready_execplan(connection: sqlite3.Connection, repo: str) -> sqlite3.
             (repo,),
         )
     }
-    candidates = []
-    for row in connection.execute(
+    ready = connection.execute(
         "SELECT * FROM exec_plans WHERE repo = ? AND status = 'READY'",
         (repo,),
-    ):
+    ).fetchall()
+    candidates = []
+    for row in ready:
         dependencies = json.loads(row["depends_on"])
         if all(statuses.get(dependency) == "MERGED" for dependency in dependencies):
             candidates.append(row)
-    if not candidates:
-        return None
-    return min(
-        candidates,
-        key=lambda row: (
-            PRIORITY_ORDER[str(row["priority"])],
-            int(str(row["plan_id"])[2:]),
-        ),
+    selected = None
+    if active is None and candidates:
+        selected = min(
+            candidates,
+            key=lambda row: (
+                PRIORITY_ORDER[str(row["priority"])],
+                int(str(row["plan_id"])[2:]),
+            ),
+        )
+    return CatalogScheduleDecision(
+        active=active,
+        has_ready=bool(ready),
+        runnable_ready=selected,
     )
+
+
+def select_ready_execplan(connection: sqlite3.Connection, repo: str) -> sqlite3.Row | None:
+    """Apply the dependency gate before deterministic priority/ID ordering."""
+
+    return catalog_schedule_decision(connection, repo).runnable_ready
 
 
 def activate_ready_execplan(
@@ -10715,7 +10736,32 @@ def _run_project_step(
             operation_print(message, file=sys.stderr)
             return 1
 
-    current_fingerprint = _planning_input_fingerprint(repo_path, base_sha)
+    ready_activated_before_planning = False
+    catalog_decision = catalog_schedule_decision(connection, repo)
+    if row is not None and not row["phase"] and catalog_decision.has_ready:
+        if catalog_decision.runnable_ready is None:
+            operation_print(
+                "READY ExecPlan이 남아 있지만 dependency가 충족되지 않아 대기합니다."
+            )
+            return 0
+        git(repo_path, "fetch", "origin")
+        base_sha = git(
+            repo_path,
+            "rev-parse",
+            "--verify",
+            f"refs/remotes/origin/{base}^{{commit}}",
+        ).stdout.strip()
+        activate_ready_execplan(connection, repo, state_dir, base_sha)
+        row = connection.execute(
+            "SELECT * FROM projects WHERE repo = ?", (repo,)
+        ).fetchone()
+        ready_activated_before_planning = True
+
+    current_fingerprint = (
+        _planning_input_fingerprint(repo_path, base_sha)
+        if row is None or not row["phase"] or row["phase"] == "PLANNING"
+        else None
+    )
 
     # A fixed planning error must remain reportable even when the user's base
     # worktree later becomes unsafe. The fingerprint reads the selected SHA,
@@ -10842,6 +10888,7 @@ def _run_project_step(
             planning_required = False
 
     if planning_required:
+        assert current_fingerprint is not None
         project_id = hashlib.sha256(repo.encode()).hexdigest()[:16]
         worktree = state_dir / "worktrees" / project_id / "planning" / current_fingerprint
         update_project(
@@ -11253,7 +11300,7 @@ def _run_project_step(
             base_sha = latest_sha
             row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
 
-    newly_activated = False
+    newly_activated = ready_activated_before_planning
     if not row["phase"]:
         git(repo_path, "fetch", "origin")
         latest_selection_sha = git(
@@ -11262,15 +11309,22 @@ def _run_project_step(
             "--verify",
             f"refs/remotes/origin/{base}^{{commit}}",
         ).stdout.strip()
-        latest_selection_fingerprint = _planning_input_fingerprint(
-            repo_path, latest_selection_sha
-        )
-        if latest_selection_fingerprint != current_fingerprint:
-            operation_print(
-                "계획 중 입력이 변경되어 READY Worker보다 재계획을 우선합니다.",
-                file=sys.stderr,
+        catalog_decision = catalog_schedule_decision(connection, repo)
+        if not catalog_decision.has_ready:
+            latest_selection_fingerprint = _planning_input_fingerprint(
+                repo_path, latest_selection_sha
             )
-            return 1
+            if latest_selection_fingerprint != current_fingerprint:
+                operation_print(
+                    "계획 중 입력이 변경되어 최신 기준으로 다시 계획합니다.",
+                    file=sys.stderr,
+                )
+                return 1
+        elif catalog_decision.runnable_ready is None:
+            operation_print(
+                "READY ExecPlan이 남아 있지만 dependency가 충족되지 않아 대기합니다."
+            )
+            return 0
         base_sha = latest_selection_sha
         selected = activate_ready_execplan(connection, repo, state_dir, base_sha)
         if selected is None:
