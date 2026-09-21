@@ -115,6 +115,7 @@ CREATE TABLE IF NOT EXISTS projects (
     base_branch TEXT NOT NULL,
     processed_sha TEXT,
     provider TEXT NOT NULL DEFAULT 'codex',
+    origin TEXT,
     registered INTEGER NOT NULL DEFAULT 1,
     agents_hash TEXT,
     agents_approved INTEGER NOT NULL DEFAULT 0,
@@ -308,6 +309,28 @@ class ProjectRegistrationInspection:
     provider: str
     agents_hash: str
     agents_approved: bool
+    origin: str | None = None
+
+
+@dataclass(frozen=True)
+class BaseWorktreeSyncResult:
+    """A best-effort primary-worktree update that never gates remote work."""
+
+    status: str
+    reason: str
+    remote_sha: str
+
+
+@dataclass(frozen=True)
+class RuntimeWorktree:
+    """The immutable Loop Manager revision selected by the source bootstrap."""
+
+    path: Path
+    commit_sha: str
+
+
+class GitLockError(RuntimeError):
+    """A concurrent Git process owns a repository lock."""
 
 
 @dataclass(frozen=True)
@@ -731,113 +754,199 @@ def process_lock(state_dir: Path):
         handle.close()
 
 
-def update_source_checkout_after_success(source: Path = ROOT) -> bool:
-    """Fast-forward a clean source main after a successful locked run."""
+def runtime_repository_id(source: Path) -> str:
+    return hashlib.sha256(str(_canonical_path(source)).encode()).hexdigest()[:16]
 
-    branch = git(
-        source,
-        "symbolic-ref",
-        "--quiet",
-        "--short",
-        "HEAD",
-        check=False,
-    )
-    if branch.returncode != 0 or branch.stdout.strip() != "main":
-        return False
+
+def expected_runtime_worktree(
+    state_dir: Path,
+    source: Path,
+    commit_sha: str,
+) -> Path:
+    return state_dir / "runtimes" / runtime_repository_id(source) / commit_sha
+
+
+def validate_runtime_worktree(
+    source: Path,
+    state_dir: Path,
+    runtime: Path,
+    commit_sha: str,
+) -> None:
+    """Prove that an existing runtime is the clean detached worktree we own."""
+
+    expected = expected_runtime_worktree(state_dir, source, commit_sha)
+    _validate_managed_path_boundary(state_dir, runtime, expected, "runtime worktree")
+    validate_managed_worktree(source, runtime, None)
+    head = git(runtime, "rev-parse", "HEAD").stdout.strip()
+    if head != commit_sha:
+        raise WorkspaceOwnershipError(
+            f"runtime HEAD가 선택한 origin/main과 다릅니다: {head} "
+            f"(expected {commit_sha})"
+        )
     status = git(
-        source,
+        runtime,
         "status",
         "--porcelain=v1",
         "--untracked-files=all",
-        check=False,
-    )
-    if status.returncode:
-        raise RuntimeError(
-            "Loop Manager source checkout 상태 확인 실패:\n"
-            f"{status.stdout[-8000:]}"
+    ).stdout
+    if status.strip():
+        raise WorkspaceOwnershipError(
+            f"기존 runtime worktree가 clean 상태가 아닙니다: {runtime}"
         )
-    if status.stdout.strip():
-        return False
-
-    local_before = git(source, "rev-parse", "refs/heads/main").stdout.strip()
-    fetched = git(source, "fetch", "origin", check=False)
-    if fetched.returncode:
-        raise RuntimeError(
-            "Loop Manager source checkout fetch 실패:\n"
-            f"{fetched.stdout[-8000:]}"
+    operations = _git_operation_entries(runtime)
+    if operations:
+        raise WorkspaceOwnershipError(
+            "기존 runtime worktree에 Git operation이 진행 중입니다: "
+            + ", ".join(sorted(operations))
         )
 
-    branch_after = git(
-        source,
-        "symbolic-ref",
-        "--quiet",
-        "--short",
-        "HEAD",
-        check=False,
-    )
-    status_after = git(
-        source,
-        "status",
-        "--porcelain=v1",
-        "--untracked-files=all",
-        check=False,
-    )
-    local_after = git(source, "rev-parse", "refs/heads/main").stdout.strip()
-    if status_after.returncode:
-        raise RuntimeError(
-            "Loop Manager source checkout fetch 후 상태 확인 실패:\n"
-            f"{status_after.stdout[-8000:]}"
-        )
-    if (
-        branch_after.returncode != 0
-        or branch_after.stdout.strip() != "main"
-        or status_after.stdout.strip()
-        or local_after != local_before
-    ):
-        return False
 
-    remote = git(
+def prepare_runtime_worktree(source: Path, state_dir: Path) -> RuntimeWorktree:
+    """Fetch origin/main and select an immutable linked runtime worktree."""
+
+    source = _canonical_path(source)
+    root = _canonical_path(
+        Path(git(source, "rev-parse", "--show-toplevel").stdout.strip())
+    )
+    if root != source:
+        raise RuntimeError(f"Loop Manager source 저장소 루트가 아닙니다: {source}")
+    github_repository(git(source, "remote", "get-url", "origin").stdout)
+    git(source, "fetch", "origin")
+    commit_sha = git(
         source,
         "rev-parse",
-        "refs/remotes/origin/main",
+        "--verify",
+        "refs/remotes/origin/main^{commit}",
     ).stdout.strip()
-    if local_after == remote:
-        return False
-    ancestor = git(
-        source,
-        "merge-base",
-        "--is-ancestor",
-        local_after,
-        remote,
+    runtime = expected_runtime_worktree(state_dir, source, commit_sha)
+    _validate_managed_path_boundary(
+        state_dir,
+        runtime,
+        runtime,
+        "runtime worktree",
+    )
+    try:
+        _canonical_path(runtime).relative_to(source)
+    except ValueError:
+        pass
+    else:
+        raise WorkspaceOwnershipError(
+            f"runtime 경로가 source checkout 내부에 있습니다: {runtime}"
+        )
+    if runtime.exists() or runtime.is_symlink():
+        if not runtime.is_dir():
+            raise WorkspaceOwnershipError(
+                f"runtime 경로가 디렉터리가 아닙니다: {runtime}"
+            )
+        validate_runtime_worktree(source, state_dir, runtime, commit_sha)
+        return RuntimeWorktree(runtime, commit_sha)
+
+    expected_path = _canonical_path(runtime)
+    registered = next(
+        (
+            record
+            for record in _worktree_catalog(source)
+            if _canonical_path(Path(str(record.get("worktree", ""))))
+            == expected_path
+        ),
+        None,
+    )
+    if registered is not None:
+        raise WorkspaceOwnershipError(
+            f"runtime 경로가 없지만 Git worktree 등록이 남아 있습니다: {runtime}"
+        )
+    runtime.parent.mkdir(parents=True, exist_ok=True)
+    git(source, "worktree", "add", "--detach", str(runtime), commit_sha)
+    validate_runtime_worktree(source, state_dir, runtime, commit_sha)
+    return RuntimeWorktree(runtime, commit_sha)
+
+
+def source_config_path(source: Path, value: str) -> Path:
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        candidate = source / candidate
+    return candidate.resolve()
+
+
+def runtime_child_arguments(
+    arguments: list[str],
+    *,
+    source: Path,
+    state_dir: Path,
+    config_path: Path,
+    runtime: RuntimeWorktree,
+) -> list[str]:
+    """Preserve user CLI semantics while pinning external path inputs."""
+
+    stripped: list[str] = []
+    skip_value = False
+    value_options = {
+        "--state-dir",
+        "--config",
+        "--runtime-source",
+        "--runtime-sha",
+    }
+    for argument in arguments:
+        if skip_value:
+            skip_value = False
+            continue
+        if argument in value_options:
+            skip_value = True
+            continue
+        if any(argument.startswith(option + "=") for option in value_options):
+            continue
+        if argument == "--runtime-child":
+            continue
+        stripped.append(argument)
+    if skip_value:
+        raise RuntimeError("경로 옵션 값이 없습니다.")
+    return [
+        "--runtime-child",
+        "--runtime-source",
+        str(source),
+        "--runtime-sha",
+        runtime.commit_sha,
+        "--state-dir",
+        str(state_dir),
+        "--config",
+        str(config_path),
+        *stripped,
+    ]
+
+
+def run_runtime_child(
+    source: Path,
+    state_dir: Path,
+    config_path: Path,
+    runtime: RuntimeWorktree,
+    arguments: list[str],
+) -> int:
+    child_arguments = runtime_child_arguments(
+        arguments,
+        source=source,
+        state_dir=state_dir,
+        config_path=config_path,
+        runtime=runtime,
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-u",
+            str(runtime.path / "loop_manager.py"),
+            *child_arguments,
+        ],
+        cwd=runtime.path,
         check=False,
     )
-    if ancestor.returncode == 1:
-        return False
-    if ancestor.returncode:
-        raise RuntimeError(
-            "Loop Manager source checkout fast-forward 가능 여부 확인 실패:\n"
-            f"{ancestor.stdout[-8000:]}"
-        )
+    return completed.returncode
 
-    updated = git(
-        source,
-        "merge",
-        "--ff-only",
-        remote,
-        check=False,
-    )
-    if updated.returncode:
-        raise RuntimeError(
-            "Loop Manager source checkout fast-forward 실패:\n"
-            f"{updated.stdout[-8000:]}"
-        )
-    if git(source, "rev-parse", "HEAD").stdout.strip() != remote:
-        raise RuntimeError(
-            "Loop Manager source checkout fast-forward 결과를 확인할 수 없습니다."
-        )
-    operation_print(f"Loop Manager 업데이트 완료: {remote}")
-    return True
 
+def validate_runtime_child(
+    source: Path,
+    state_dir: Path,
+    commit_sha: str,
+) -> None:
+    validate_runtime_worktree(source, state_dir, ROOT, commit_sha)
 
 def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
     connection.execute(EXEC_PLANS_SCHEMA)
@@ -985,8 +1094,31 @@ def command(
     return result
 
 
+def is_git_lock_failure(output: str) -> bool:
+    normalized = " ".join(output.casefold().split())
+    return any(
+        marker in normalized
+        for marker in (
+            "another git process",
+            "index.lock': file exists",
+            "index.lock: file exists",
+            "cannot lock ref",
+            "could not lock",
+            "failed to lock",
+            "unable to create",
+        )
+    ) and ("lock" in normalized or ".lock" in normalized)
+
+
 def git(repo: Path, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return command(["git", "-C", str(repo), *arguments], check=check)
+    result = command(["git", "-C", str(repo), *arguments], check=False)
+    if check and result.returncode:
+        output = result.stdout[-6000:].strip()
+        message = f"명령 실패 (git -C {repo}):\n{output}"
+        if is_git_lock_failure(output):
+            raise GitLockError(message)
+        raise RuntimeError(message)
+    return result
 
 
 def github_repository(origin_url: str) -> str:
@@ -1057,7 +1189,10 @@ def git_bytes(repo: Path, *arguments: str) -> bytes:
     )
     if result.returncode:
         output = result.stdout[-6000:].decode("utf-8", errors="replace").strip()
-        raise RuntimeError(f"명령 실패 (git -C {repo}):\n{output}")
+        message = f"명령 실패 (git -C {repo}):\n{output}"
+        if is_git_lock_failure(output):
+            raise GitLockError(message)
+        raise RuntimeError(message)
     return result.stdout
 
 
@@ -2032,6 +2167,10 @@ def validate_runtime_prerequisites(
         )
 
 
+def repository_origin(root: Path) -> str:
+    return github_repository(git(root, "remote", "get-url", "origin").stdout)
+
+
 def validate_repository(
     path: Path,
     *,
@@ -2039,34 +2178,28 @@ def validate_repository(
     provider: str = "codex",
     config_path: Path | None = None,
     registration_checks: bool = True,
+    expected_origin: str | None = None,
+    origin_result: list[str] | None = None,
 ) -> Path:
+    """Validate runtime prerequisites and stable repository identity only."""
+
+    del allow_agents_mismatch, registration_checks
     path = path.expanduser().resolve()
     validate_runtime_prerequisites(
         path,
         provider=provider,
         config_path=config_path,
     )
-    if not registration_checks:
-        return path
     root = Path(git(path, "rev-parse", "--show-toplevel").stdout.strip()).resolve()
     if root != path:
         raise RuntimeError(f"저장소 루트 경로를 지정하세요: {root}")
-    github_repository(git(root, "remote", "get-url", "origin").stdout)
-    required = [root / "AGENTS.md", root / "docs/PLANS.md", root / "docs/ARCHITECTURE.md"]
-    missing = [str(item.relative_to(root)) for item in required if not item.is_file()]
-    requirements = root / "docs/requirements"
-    if not (root / "docs/PRODUCT.md").is_file() and not any(requirements.glob("*.md")):
-        missing.append("docs/PRODUCT.md 또는 docs/requirements/*.md")
-    if missing:
-        raise RuntimeError("필수 파일이 없습니다: " + ", ".join(missing))
-    if file_hash(root / "docs/PLANS.md") != file_hash(ROOT / "docs/PLANS.md"):
-        raise RuntimeError("docs/PLANS.md가 Loop Manager 기준 파일과 다릅니다.")
-    common_agents = normalized_text(ROOT / "AGENTS.md")
-    target_agents = normalized_text(root / "AGENTS.md")
-    if common_agents not in target_agents and not allow_agents_mismatch:
+    current_origin = repository_origin(root)
+    if origin_result is not None:
+        origin_result.append(current_origin)
+    if expected_origin is not None and current_origin != expected_origin:
         raise RuntimeError(
-            "AGENTS.md에 공통 규칙이 없습니다. 명시적인 `config add "
-            "--approve-agents-mismatch`에서 승인하세요."
+            "등록된 GitHub origin과 현재 origin이 다릅니다: "
+            f"{current_origin} (expected {expected_origin})"
         )
     return root
 
@@ -2076,51 +2209,80 @@ def remote_base(repo: Path, requested: str | None) -> str:
     if requested:
         base = requested
     else:
-        reference = git(repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD").stdout.strip()
+        reference = git(
+            repo,
+            "symbolic-ref",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ).stdout.strip()
         base = reference.removeprefix("origin/")
-    git(repo, "rev-parse", "--verify", f"origin/{base}")
+    git(repo, "rev-parse", "--verify", f"refs/remotes/origin/{base}^{{commit}}")
     return base
+
+
+def _revision_blob(
+    root: Path,
+    entries: Mapping[bytes, tuple[bytes, bytes]],
+    relative_path: str,
+) -> bytes | None:
+    entry = entries.get(os.fsencode(relative_path))
+    if entry is None:
+        return None
+    object_type, object_id = entry
+    if object_type != b"blob":
+        raise RuntimeError(f"등록 파일이 blob이 아닙니다: {relative_path}")
+    return git_bytes(root, "cat-file", "blob", object_id.decode("ascii"))
 
 
 def inspect_registration_files(
     root: Path,
+    revision: str,
     *,
     approve_agents_mismatch: bool,
 ) -> tuple[str, bool]:
-    """Validate registration documents without invoking Git or an Agent CLI."""
+    """Validate registration documents from one immutable commit tree."""
 
-    required = [
-        root / "AGENTS.md",
-        root / "docs/PLANS.md",
-        root / "docs/ARCHITECTURE.md",
-    ]
-    missing = [str(item.relative_to(root)) for item in required if not item.is_file()]
-    requirements = root / "docs/requirements"
-    active_requirements = tuple(requirements.glob("*.md"))
-    product = root / "docs/PRODUCT.md"
-    if not product.is_file() and not active_requirements:
+    entries = _git_tree_entries(root, revision)
+    required_paths = ("AGENTS.md", "docs/PLANS.md", "docs/ARCHITECTURE.md")
+    blobs = {
+        relative_path: _revision_blob(root, entries, relative_path)
+        for relative_path in required_paths
+    }
+    missing = [path for path, contents in blobs.items() if contents is None]
+    product = _revision_blob(root, entries, "docs/PRODUCT.md")
+    active_requirements = tuple(
+        path for path in entries if _is_active_requirement(path)
+    )
+    if product is None and not active_requirements:
         missing.append("docs/PRODUCT.md 또는 docs/requirements/*.md")
     if missing:
         raise RuntimeError("필수 파일이 없습니다: " + ", ".join(missing))
 
-    if file_hash(root / "docs/PLANS.md") != file_hash(ROOT / "docs/PLANS.md"):
+    plans = blobs["docs/PLANS.md"]
+    architecture = blobs["docs/ARCHITECTURE.md"]
+    agents = blobs["AGENTS.md"]
+    assert plans is not None and architecture is not None and agents is not None
+    if hashlib.sha256(plans).hexdigest() != file_hash(ROOT / "docs/PLANS.md"):
         raise RuntimeError("docs/PLANS.md가 Loop Manager 기준 파일과 다릅니다.")
-    if file_hash(root / "docs/ARCHITECTURE.md") == file_hash(
+    if hashlib.sha256(architecture).hexdigest() == file_hash(
         ROOT / "docs/ARCHITECTURE.template.md"
     ):
         raise RuntimeError(
             "docs/ARCHITECTURE.md가 변경되지 않은 템플릿이라 등록할 수 없습니다."
         )
-    if product.is_file() and file_hash(product) == file_hash(
+    if product is not None and hashlib.sha256(product).hexdigest() == file_hash(
         ROOT / "docs/PRODUCT.template.md"
     ):
         raise RuntimeError(
             "docs/PRODUCT.md가 변경되지 않은 템플릿이라 등록할 수 없습니다."
         )
 
+    try:
+        target_agents = agents.decode("utf-8").replace("\r\n", "\n")
+    except UnicodeDecodeError as error:
+        raise RuntimeError("origin의 AGENTS.md가 UTF-8이 아닙니다.") from error
     common_agents = normalized_text(ROOT / "AGENTS.md")
-    target_agents = normalized_text(root / "AGENTS.md")
-    agents_hash = file_hash(root / "AGENTS.md")
+    agents_hash = hashlib.sha256(agents).hexdigest()
     mismatch = common_agents not in target_agents
     if mismatch and not approve_agents_mismatch:
         raise RuntimeError(
@@ -2138,29 +2300,39 @@ def inspect_project_registration(
     requested_base: str | None,
     approve_agents_mismatch: bool,
 ) -> ProjectRegistrationInspection:
-    """Validate one project completely before its registry row is changed."""
+    """Validate one project from its fetched origin revision before registry writes."""
 
-    path = path.expanduser().resolve()
-    validate_runtime_prerequisites(
+    origins: list[str] = []
+    root = validate_repository(
         path,
+        allow_agents_mismatch=approve_agents_mismatch,
         provider=provider,
         config_path=config_path,
+        registration_checks=False,
+        origin_result=origins,
     )
-    root = Path(git(path, "rev-parse", "--show-toplevel").stdout.strip()).resolve()
-    if root != path:
-        raise RuntimeError(f"저장소 루트 경로를 지정하세요: {root}")
-    github_repository(git(root, "remote", "get-url", "origin").stdout)
+    if not origins:
+        raise RuntimeError("검증한 GitHub origin을 확인할 수 없습니다.")
+    origin = origins[0]
+    base_branch = remote_base(root, requested_base)
+    revision = git(
+        root,
+        "rev-parse",
+        "--verify",
+        f"refs/remotes/origin/{base_branch}^{{commit}}",
+    ).stdout.strip()
     agents_hash, agents_approved = inspect_registration_files(
         root,
+        revision,
         approve_agents_mismatch=approve_agents_mismatch,
     )
-    base_branch = remote_base(root, requested_base)
     return ProjectRegistrationInspection(
         root=root,
         base_branch=base_branch,
         provider=provider,
         agents_hash=agents_hash,
         agents_approved=agents_approved,
+        origin=origin,
     )
 
 
@@ -2186,18 +2358,208 @@ def add_registered_project(
         provider=inspection.provider,
         agents_hash=inspection.agents_hash,
         agents_approved=inspection.agents_approved,
+        origin=inspection.origin,
     )
     project_registry.add_project(connection, project)
     return project
 
 
-def ensure_safe_base_worktree(repo: Path, base: str) -> None:
-    if git(repo, "status", "--porcelain").stdout.strip():
-        raise RuntimeError("기본 worktree가 dirty 상태라서 작업을 시작하지 않습니다.")
-    counts = git(repo, "rev-list", "--left-right", "--count", f"HEAD...origin/{base}").stdout.split()
-    if int(counts[0]):
-        raise RuntimeError("기본 worktree가 원격보다 앞서 있거나 diverge되어 작업을 시작하지 않습니다.")
+def _base_worktree_status(repo: Path) -> str:
+    return git(
+        repo,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+    ).stdout
 
+
+def _ignored_worktree_paths(repo: Path) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            _nul_git_paths(
+                repo,
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "-z",
+            )
+        )
+    )
+
+
+def _paths_overlap(left: str, right: str) -> bool:
+    left_parts = tuple(part for part in left.replace("\\", "/").split("/") if part)
+    right_parts = tuple(part for part in right.replace("\\", "/").split("/") if part)
+    shorter = min(len(left_parts), len(right_parts))
+    return left_parts[:shorter] == right_parts[:shorter]
+
+
+def _base_worktree_snapshot(
+    repo: Path,
+) -> tuple[str | None, str, str, tuple[tuple[str, str], ...], tuple[str, ...]]:
+    branch_result = git(
+        repo,
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        "HEAD",
+        check=False,
+    )
+    branch = branch_result.stdout.strip() if branch_result.returncode == 0 else None
+    head = git(repo, "rev-parse", "HEAD").stdout.strip()
+    return (
+        branch,
+        head,
+        _base_worktree_status(repo),
+        tuple(sorted(_git_operation_entries(repo).items())),
+        _ignored_worktree_paths(repo),
+    )
+
+
+def synchronize_base_worktree(
+    repo: Path,
+    base: str,
+    *,
+    remote_sha: str | None = None,
+) -> BaseWorktreeSyncResult:
+    """Best-effort fast-forward of an eligible primary checkout."""
+
+    try:
+        selected_remote = remote_sha or git(
+            repo,
+            "rev-parse",
+            "--verify",
+            f"refs/remotes/origin/{base}^{{commit}}",
+        ).stdout.strip()
+        before = _base_worktree_snapshot(repo)
+        branch, local_sha, status, operations, ignored = before
+        if branch is None:
+            return BaseWorktreeSyncResult("skipped", "detached HEAD", selected_remote)
+        if branch != base:
+            return BaseWorktreeSyncResult(
+                "skipped",
+                f"다른 branch checkout: {branch}",
+                selected_remote,
+            )
+        if operations:
+            return BaseWorktreeSyncResult(
+                "skipped",
+                "진행 중 Git operation: " + ", ".join(name for name, _ in operations),
+                selected_remote,
+            )
+        if status:
+            return BaseWorktreeSyncResult(
+                "skipped",
+                "tracked, staged 또는 non-ignored untracked 변경",
+                selected_remote,
+            )
+        if local_sha == selected_remote:
+            return BaseWorktreeSyncResult("equal", "이미 원격 base와 같음", selected_remote)
+
+        behind = git(
+            repo,
+            "merge-base",
+            "--is-ancestor",
+            local_sha,
+            selected_remote,
+            check=False,
+        )
+        if behind.returncode not in {0, 1}:
+            return BaseWorktreeSyncResult(
+                "failed",
+                "local/remote ancestry 확인 실패: " + behind.stdout[-2000:].strip(),
+                selected_remote,
+            )
+        if behind.returncode == 1:
+            ahead = git(
+                repo,
+                "merge-base",
+                "--is-ancestor",
+                selected_remote,
+                local_sha,
+                check=False,
+            )
+            if ahead.returncode not in {0, 1}:
+                return BaseWorktreeSyncResult(
+                    "failed",
+                    "local/remote ancestry 확인 실패: "
+                    + ahead.stdout[-2000:].strip(),
+                    selected_remote,
+                )
+            reason = "ahead" if ahead.returncode == 0 else "diverged"
+            return BaseWorktreeSyncResult("skipped", reason, selected_remote)
+
+        changed_paths = tuple(
+            _nul_git_paths(
+                repo,
+                "diff",
+                "--name-only",
+                "-z",
+                local_sha,
+                selected_remote,
+            )
+        )
+        overlaps = sorted(
+            ignored_path
+            for ignored_path in ignored
+            if any(
+                _paths_overlap(ignored_path, changed_path)
+                for changed_path in changed_paths
+            )
+        )
+        if overlaps:
+            return BaseWorktreeSyncResult(
+                "skipped",
+                "원격 변경과 겹치는 ignored 경로: " + ", ".join(overlaps[:8]),
+                selected_remote,
+            )
+
+        rechecked = _base_worktree_snapshot(repo)
+        if rechecked != before:
+            return BaseWorktreeSyncResult(
+                "skipped",
+                "eligibility 확인 뒤 기본 worktree 상태가 변경됨",
+                selected_remote,
+            )
+        updated = git(repo, "merge", "--ff-only", selected_remote, check=False)
+        if updated.returncode:
+            output = updated.stdout[-2000:].strip()
+            reason = "Git lock 충돌" if is_git_lock_failure(output) else "fast-forward 실패"
+            if output:
+                reason += f": {output}"
+            return BaseWorktreeSyncResult("failed", reason, selected_remote)
+        final_head = git(repo, "rev-parse", "HEAD").stdout.strip()
+        if final_head != selected_remote:
+            return BaseWorktreeSyncResult(
+                "failed",
+                f"fast-forward 결과 HEAD 불일치: {final_head}",
+                selected_remote,
+            )
+        return BaseWorktreeSyncResult("updated", "원격 base로 fast-forward", selected_remote)
+    except (GitLockError, RuntimeError, OSError) as error:
+        return BaseWorktreeSyncResult("failed", str(error), remote_sha or "")
+
+
+def ensure_safe_base_worktree(
+    repo: Path,
+    base: str,
+    *,
+    remote_sha: str | None = None,
+) -> BaseWorktreeSyncResult:
+    """Compatibility entry point for the non-blocking worktree synchronizer."""
+
+    return synchronize_base_worktree(repo, base, remote_sha=remote_sha)
+
+
+def log_base_worktree_sync(repo: Path, result: BaseWorktreeSyncResult) -> None:
+    if result.status == "equal":
+        return
+    operation_log(
+        f"기본 worktree 동기화 {result.status} ({repo}): {result.reason}",
+        error=result.status in {"skipped", "failed"},
+    )
 
 def worker_level(plan: dict[str, object]) -> int:
     complexity_scores = {"low": 1, "medium": 3, "high": 5}
@@ -9394,6 +9756,7 @@ def _run_project_step(
                     checkpoint_cleanup_candidates,
                 ).serialize(),
             )
+    validated_origins: list[str] = []
     if row is not None:
         repo_path = validate_repository(
             repo_path,
@@ -9401,14 +9764,50 @@ def _run_project_step(
             provider=provider,
             config_path=config_path,
             registration_checks=False,
+            expected_origin=(str(row["origin"]) if row["origin"] else None),
+            origin_result=validated_origins,
         )
+        current_origin = (
+            str(row["origin"])
+            if row["origin"]
+            else (validated_origins[0] if validated_origins else None)
+        )
+        if row["origin"] is None and current_origin is not None:
+            with connection:
+                connection.execute(
+                    "UPDATE projects SET origin = ? WHERE repo = ?",
+                    (current_origin, repo),
+                )
+            row = connection.execute(
+                "SELECT * FROM projects WHERE repo = ?", (repo,)
+            ).fetchone()
     else:
         repo_path = validate_repository(
             repo_path,
             allow_agents_mismatch=allow_agents_mismatch,
             provider=provider,
             config_path=config_path,
+            origin_result=validated_origins,
         )
+        current_origin = validated_origins[0] if validated_origins else None
+
+    base = remote_base(
+        repo_path,
+        requested_base or (row["base_branch"] if row else None),
+    )
+    base_sha = git(
+        repo_path,
+        "rev-parse",
+        f"refs/remotes/origin/{base}^{{commit}}",
+    ).stdout.strip()
+    sync_result = ensure_safe_base_worktree(
+        repo_path,
+        base,
+        remote_sha=base_sha,
+    )
+    if isinstance(sync_result, BaseWorktreeSyncResult):
+        log_base_worktree_sync(repo_path, sync_result)
+
     backfill_plan_shas(connection, target_repo=repo)
     migrate_legacy_execplans(
         connection,
@@ -9419,8 +9818,6 @@ def _run_project_step(
     if row:
         hydrate_active_project(connection, repo)
         row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
-    base = row["base_branch"] if row else requested_base
-
     _ensure_cleanup_pending_schema(connection)
     cleanup_candidates = frozenset(
         str(_canonical_path(Path(item["worktree"])))
@@ -9470,7 +9867,6 @@ def _run_project_step(
                 return 1
 
     if row and row["phase"] == "BLOCKED":
-        git(repo_path, "fetch", "origin")
         blocked_plan = active_execplan(connection, repo)
         resume_blocked = (
             resume_guidance_approval_if_decided
@@ -9498,7 +9894,6 @@ def _run_project_step(
             )
             return 1
 
-    base = remote_base(repo_path, requested_base or (row["base_branch"] if row else None))
     if validated_agent_scope is not None:
         try:
             validated_agent_scope = refresh_persisted_agent_scope_after_manager_git(
@@ -9511,21 +9906,20 @@ def _run_project_step(
             row = connection.execute(
                 "SELECT * FROM projects WHERE repo = ?", (repo,)
             ).fetchone()
-            detail = str(error)
             message = block_persisted_agent_scope_violation(
                 connection,
                 repo_path,
                 repo,
                 row,
-                detail,
+                str(error),
             )
             operation_print(message, file=sys.stderr)
             return 1
-    base_sha = git(repo_path, "rev-parse", f"origin/{base}").stdout.strip()
-    current_fingerprint = planning_input_fingerprint(repo_path, base)
+
+    current_fingerprint = _planning_input_fingerprint(repo_path, base_sha)
 
     # A fixed planning error must remain reportable even when the user's base
-    # worktree later becomes unsafe. The fingerprint reads origin directly,
+    # worktree later becomes unsafe. The fingerprint reads the selected SHA,
     # so this check neither reads nor alters the user's local changes.
     if row and row["planning_error"] and row["planning_error_fingerprint"] == current_fingerprint:
         operation_print(
@@ -9535,12 +9929,11 @@ def _run_project_step(
         )
         return 1
 
-    ensure_safe_base_worktree(repo_path, base)
-
     if not row:
         connection.execute(
-            "INSERT INTO projects (repo, base_branch, provider) VALUES (?, ?, ?)",
-            (repo, base, provider),
+            "INSERT INTO projects (repo, base_branch, provider, origin) "
+            "VALUES (?, ?, ?, ?)",
+            (repo, base, provider, current_origin),
         )
         connection.commit()
         migrate_legacy_execplans(
@@ -10065,9 +10458,14 @@ def _run_project_step(
     if not row["phase"]:
         git(repo_path, "fetch", "origin")
         latest_selection_sha = git(
-            repo_path, "rev-parse", f"origin/{base}"
+            repo_path,
+            "rev-parse",
+            "--verify",
+            f"refs/remotes/origin/{base}^{{commit}}",
         ).stdout.strip()
-        latest_selection_fingerprint = planning_input_fingerprint(repo_path, base)
+        latest_selection_fingerprint = _planning_input_fingerprint(
+            repo_path, latest_selection_sha
+        )
         if latest_selection_fingerprint != current_fingerprint:
             operation_print(
                 "계획 중 입력이 변경되어 READY Worker보다 재계획을 우선합니다.",
@@ -11212,17 +11610,28 @@ def run_project_result(
     """Run retryable validation progress to a stable project-level outcome."""
 
     while True:
-        step_result = _run_project_step(
-            connection,
-            state_dir,
-            repo_arg,
-            config_path,
-            requested_base,
-            allow_agents_mismatch,
-            requested_provider,
-            registered_only,
-            planner_mutex,
-        )
+        try:
+            step_result = _run_project_step(
+                connection,
+                state_dir,
+                repo_arg,
+                config_path,
+                requested_base,
+                allow_agents_mismatch,
+                requested_provider,
+                registered_only,
+                planner_mutex,
+            )
+        except GitLockError as error:
+            operation_log(
+                f"일시적 Git lock 충돌 ({repo_arg}): {error}",
+                error=True,
+            )
+            return ProjectRunResult(
+                ProjectRunKind.TRANSIENT_PAUSE,
+                0,
+                str(error),
+            )
         if step_result != PROJECT_STEP_RETRY:
             break
 
@@ -11437,6 +11846,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-dir", help="기본 운영체제 상태 디렉터리 대신 사용할 경로")
     parser.add_argument("--config", default=str(ROOT / "config/config.ini"), help="config.ini 경로")
+    parser.add_argument(
+        "--runtime-child",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--runtime-source", help=argparse.SUPPRESS)
+    parser.add_argument("--runtime-sha", help=argparse.SUPPRESS)
     subcommands = parser.add_subparsers(dest="command", required=True)
     subcommands.add_parser("init", help=argparse.SUPPRESS)
 
@@ -11474,25 +11890,46 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def execute_runtime_command(
+    args: argparse.Namespace,
+    state_dir: Path,
+    config_path: Path,
+) -> int:
+    if args.command == "init":
+        with connect_database(state_dir, create=True):
+            pass
+        operation_print(f"상태 DB 초기화 완료: {state_dir / 'loop-manager.db'}")
+        return 0
+    if args.command == "config":
+        return configure_registry(args, state_dir, config_path)
+    config = load_managed_config(config_path)
+    with connect_database(state_dir) as connection:
+        return run_registered_projects(connection, state_dir, config)
+
+
 def main() -> int:
-    args = build_parser().parse_args()
+    raw_arguments = sys.argv[1:]
+    args = build_parser().parse_args(raw_arguments)
     state_dir = state_directory(args.state_dir)
-    config_path = Path(args.config).expanduser().resolve()
+    config_path = source_config_path(ROOT, args.config)
     try:
+        if args.runtime_child:
+            if not args.runtime_source or not args.runtime_sha:
+                raise RuntimeError("runtime 자식 소유권 정보가 없습니다.")
+            source = Path(args.runtime_source).expanduser().resolve()
+            validate_runtime_child(source, state_dir, str(args.runtime_sha))
+            return execute_runtime_command(args, state_dir, config_path)
+
+        source = ROOT
         with process_lock(state_dir):
-            if args.command == "init":
-                with connect_database(state_dir, create=True):
-                    pass
-                operation_print(f"상태 DB 초기화 완료: {state_dir / 'loop-manager.db'}")
-                return 0
-            if args.command == "config":
-                return configure_registry(args, state_dir, config_path)
-            config = load_managed_config(config_path)
-            with connect_database(state_dir) as connection:
-                result = run_registered_projects(connection, state_dir, config)
-            if result == 0:
-                update_source_checkout_after_success()
-            return result
+            runtime = prepare_runtime_worktree(source, state_dir)
+            return run_runtime_child(
+                source,
+                state_dir,
+                config_path,
+                runtime,
+                raw_arguments,
+            )
     except ProcessLockBusyError as error:
         if args.command == "run" and getattr(args, "skip_if_running", False):
             return 0

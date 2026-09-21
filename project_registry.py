@@ -28,6 +28,7 @@ class RegisteredProject:
     provider: str
     agents_hash: str | None
     agents_approved: bool
+    origin: str | None = None
 
 
 def ensure_registry_schema(connection: sqlite3.Connection) -> None:
@@ -38,6 +39,7 @@ def ensure_registry_schema(connection: sqlite3.Connection) -> None:
         "registered": "INTEGER NOT NULL DEFAULT 1",
         "agents_hash": "TEXT",
         "agents_approved": "INTEGER NOT NULL DEFAULT 0",
+        "origin": "TEXT",
     }
     changed = False
     for column, definition in migrations.items():
@@ -54,7 +56,7 @@ def list_projects(connection: sqlite3.Connection) -> tuple[RegisteredProject, ..
     ensure_registry_schema(connection)
     rows = connection.execute(
         """
-        SELECT repo, base_branch, provider, agents_hash, agents_approved
+        SELECT repo, base_branch, provider, agents_hash, agents_approved, origin
         FROM projects
         WHERE registered = 1
         ORDER BY repo
@@ -69,6 +71,7 @@ def list_projects(connection: sqlite3.Connection) -> tuple[RegisteredProject, ..
                 str(row["agents_hash"]) if row["agents_hash"] is not None else None
             ),
             agents_approved=bool(row["agents_approved"]),
+            origin=(str(row["origin"]) if row["origin"] is not None else None),
         )
         for row in rows
     )
@@ -89,8 +92,8 @@ def add_project(connection: sqlite3.Connection, project: RegisteredProject) -> N
                 """
                 INSERT INTO projects (
                     repo, base_branch, provider, registered,
-                    agents_hash, agents_approved
-                ) VALUES (?, ?, ?, 1, ?, ?)
+                    agents_hash, agents_approved, origin
+                ) VALUES (?, ?, ?, 1, ?, ?, ?)
                 """,
                 (
                     project.repo,
@@ -98,6 +101,7 @@ def add_project(connection: sqlite3.Connection, project: RegisteredProject) -> N
                     project.provider,
                     project.agents_hash,
                     int(project.agents_approved),
+                    project.origin,
                 ),
             )
         else:
@@ -105,7 +109,7 @@ def add_project(connection: sqlite3.Connection, project: RegisteredProject) -> N
                 """
                 UPDATE projects
                 SET base_branch = ?, provider = ?, registered = 1,
-                    agents_hash = ?, agents_approved = ?
+                    agents_hash = ?, agents_approved = ?, origin = ?
                 WHERE repo = ?
                 """,
                 (
@@ -113,6 +117,7 @@ def add_project(connection: sqlite3.Connection, project: RegisteredProject) -> N
                     project.provider,
                     project.agents_hash,
                     int(project.agents_approved),
+                    project.origin,
                     project.repo,
                 ),
             )

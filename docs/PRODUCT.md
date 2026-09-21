@@ -61,8 +61,8 @@
 - 전체 검증은 Worker가 아니라 Loop Manager 코드가 실행하며 실패한 경우에만 Worker에게 결과를 전달한다
 - Requirement는 다른 모든 관련 ExecPlan이 MERGED인 마지막 구현 PR에서만 자동 archive한다
 - ExecPlan은 연결된 PR이 실제로 Merge된 경우에만 MERGED 상태가 된다
-- 자동 작업의 Git 기준은 최신 `origin/<base-branch>`다
-- Loop Manager는 대상 프로젝트 기본 worktree의 파일, index와 HEAD를 수정하지 않는다
+- 자동 작업의 Git 기준은 최신 `origin/<base-branch>`이며 로컬 base ref, 기본 worktree 파일과 로컬 전용 commit을 입력으로 사용하지 않는다
+- Loop Manager는 등록 프로젝트 기본 worktree가 safe fast-forward 조건을 만족할 때만 HEAD, index와 tracked 파일을 fetch된 원격 base로 전진시키며, 그 밖의 로컬 상태는 보존한다
 - SQLite, 관리 worktree, 로그, 임시 파일과 lock은 source checkout 밖의 사용자 상태 디렉터리에 저장한다
 - 대상 프로젝트의 기존 변경을 사용자 승인 없이 삭제하거나 덮어쓰지 않는다
 - 동일한 사용자 상태 디렉터리를 사용하는 Loop Manager가 동시에 둘 이상 작업하지 않는다
@@ -122,7 +122,7 @@
 - 기존 ExecPlan 작업을 이어서 처리할 수 있다
 
 흐름:
-1. 프로그램이 GitHub PR 상태와 SQLite의 ExecPlan 상태를 동기화한다
+1. 프로그램이 각 등록 프로젝트를 fetch하고 eligible 기본 worktree만 원격 base로 safe fast-forward한 뒤 GitHub PR 상태와 SQLite의 ExecPlan 상태를 동기화한다
 2. BLOCKED ExecPlan과 `planning_error`의 근거 입력 변경 여부를 확인한다
 3. 동시에 처리할 프로젝트를 `max_workers` 범위에서 선택한다
 4. 실행 중인 작업이 없고 계획 입력이 변경됐으면 READY ExecPlan의 존재와 관계없이 최신 원격 기준 branch에서 임시 planning worktree를 만든다
@@ -218,7 +218,7 @@ ExecPlan 게시 실패:
 
 1. 같은 사용자 상태 디렉터리의 다른 Loop Manager가 실행 중이면 상태를 바꾸지 않고 종료한다
 2. 각 프로젝트의 PR, worktree와 저장된 실행 상태를 외부 상태와 대조한다
-3. 기본 worktree가 dirty하거나 원격보다 앞서 있거나 diverge된 프로젝트는 변경 작업만 건너뛴다. 원격보다 뒤처진 상태는 허용하며 PR 상태 동기화와 알림은 계속한다
+3. 기본 worktree의 dirty, staged, untracked, ahead, diverged, detached 또는 다른 branch 상태는 원격 SHA 기반 작업을 막지 않는다. safe fast-forward 조건을 만족하지 않으면 기본 worktree 동기화만 건너뛴다
 4. 프로젝트별로 하나의 작업만 선택하고 전체 동시 실행 수를 `max_workers`로 제한한다
 5. 처리 중인 상태, 세션과 작업 공간을 SQLite에 저장한다
 6. 중단된 작업은 다음 실행에서 저장된 상태부터 재개한다
@@ -281,17 +281,17 @@ BLOCKED → PR_OPEN (같은 PR을 사용자가 다시 열음)
 ### 프로젝트 등록 및 실행 조건
 
 - 대상 경로는 origin이 GitHub 저장소인 Git 프로젝트여야 한다
-- `AGENTS.md`, `docs/PLANS.md`, `docs/ARCHITECTURE.md`가 있어야 한다
-- `docs/PRODUCT.md` 또는 `docs/requirements/` 바로 아래 Requirement가 하나 이상 있어야 한다
+- fetch된 `origin/<base-branch>` tree에 `AGENTS.md`, `docs/PLANS.md`, `docs/ARCHITECTURE.md`가 있어야 한다
+- fetch된 `origin/<base-branch>` tree에 `docs/PRODUCT.md` 또는 `docs/requirements/` 바로 아래 Requirement가 하나 이상 있어야 한다
 - 변경되지 않은 PRODUCT/ARCHITECTURE 템플릿만 있는 프로젝트는 작업 가능 상태로 등록하지 않는다
 - `docs/PLANS.md`는 Loop Manager 기준 파일과 SHA-256 해시가 같아야 한다
 - 공통 내용이 없는 `AGENTS.md`는 사용자 확인 후 강제 등록할 수 있다
-- `AGENTS.md` 포함 검사와 `docs/PLANS.md` 해시 검사는 프로젝트 등록 시에만 수행한다
+- `AGENTS.md` 포함 검사와 `docs/PLANS.md` 해시 검사는 프로젝트 등록 시 선택한 원격 commit blob에만 수행하며 자동 Loop에서는 반복하지 않는다
 - 자동 작업의 기준은 `origin/<base-branch>`다
-- 기본 worktree가 dirty하거나 원격보다 앞서 있거나 diverge됐으면 해당 프로젝트를 건너뛴다
-- 기본 worktree가 원격보다 뒤처진 상태는 허용하며 자동 작업을 막지 않는다
+- 기본 worktree의 로컬 변경, checkout branch와 ahead·diverged 이력은 자동 작업을 막지 않으며 local-only 내용은 자동 입력에 포함하지 않는다
+- 기본 worktree가 clean한 저장 base branch이고 원격과 equal 또는 behind-only이면 fetch한 원격 ref로 no-op 또는 fast-forward하고, 그 밖의 상태나 ignored 경로 충돌은 이유를 기록한 뒤 보존한다
 - Loop Manager가 만드는 계획과 구현 변경은 대상 프로젝트 밖의 Loop Manager 관리 경로에 만든 별도 worktree와 branch에만 기록한다
-- 자동 실행 중 기본 worktree에서는 checkout, pull, reset, stash, clean, commit과 파일 생성을 수행하지 않는다
+- 자동 실행 중 기본 worktree에서는 검증된 `git merge --ff-only` 상당의 safe fast-forward 외에 checkout, pull, reset, stash, clean, commit과 파일 생성을 수행하지 않는다
 
 ### 작업 선택과 동시 실행
 

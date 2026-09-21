@@ -13,6 +13,18 @@ import project_registry
 
 
 class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
+    def _git(self, root: Path, *arguments: str) -> None:
+        subprocess.run(
+            ["git", "-C", str(root), *arguments],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+
+    def _commit(self, root: Path, message: str) -> None:
+        self._git(root, "add", "-A")
+        self._git(root, "commit", "-m", message)
+
     def _connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row
@@ -21,6 +33,9 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
         return connection
 
     def _project_files(self, root: Path, *, common_agents: bool = True) -> None:
+        self._git(root, "init", "-b", "main")
+        self._git(root, "config", "user.email", "registry@example.com")
+        self._git(root, "config", "user.name", "Registry Test")
         (root / "docs/requirements").mkdir(parents=True)
         agents = (
             (loop_manager.ROOT / "AGENTS.md").read_text(encoding="utf-8")
@@ -37,6 +52,7 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
         (root / "docs/PRODUCT.md").write_text(
             "# Project Product\n\nActive behavior.\n", encoding="utf-8"
         )
+        self._commit(root, "Registration files")
 
     def _record(
         self,
@@ -87,13 +103,18 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
                 "argv",
                 [
                     "loop_manager.py",
+                    "--runtime-child",
+                    "--runtime-source",
+                    str(loop_manager.ROOT),
+                    "--runtime-sha",
+                    "a" * 40,
                     "--state-dir",
                     str(state_dir),
                     "--config",
                     str(missing),
                     "run",
                 ],
-            ), mock.patch("builtins.print"):
+            ), mock.patch("loop_manager.validate_runtime_child"), mock.patch("builtins.print"):
                 self.assertEqual(loop_manager.main(), 1)
             self.assertFalse((state_dir / "loop-manager.db").exists())
 
@@ -104,18 +125,19 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "승인"):
                 loop_manager.inspect_registration_files(
-                    root, approve_agents_mismatch=False
+                    root, "HEAD", approve_agents_mismatch=False
                 )
             agents_hash, approved = loop_manager.inspect_registration_files(
-                root, approve_agents_mismatch=True
+                root, "HEAD", approve_agents_mismatch=True
             )
             self.assertTrue(approved)
             self.assertEqual(agents_hash, loop_manager.file_hash(root / "AGENTS.md"))
 
             (root / "docs/PLANS.md").write_text("different\n", encoding="utf-8")
+            self._commit(root, "Change plans")
             with self.assertRaisesRegex(RuntimeError, "PLANS.md"):
                 loop_manager.inspect_registration_files(
-                    root, approve_agents_mismatch=True
+                    root, "HEAD", approve_agents_mismatch=True
                 )
 
     def test_registration_rejects_unchanged_product_and_architecture_templates(self):
@@ -129,9 +151,10 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
                 (root / f"docs/{filename}.md").write_bytes(
                     (loop_manager.ROOT / f"docs/{filename}.template.md").read_bytes()
                 )
+                self._commit(root, f"Use {filename} template")
                 with self.assertRaisesRegex(RuntimeError, expected):
                     loop_manager.inspect_registration_files(
-                        root, approve_agents_mismatch=False
+                        root, "HEAD", approve_agents_mismatch=False
                     )
 
     def test_add_list_and_remove_preserve_merged_audit_history(self):

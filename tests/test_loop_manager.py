@@ -650,6 +650,124 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                         ),
                     )
 
+    def test_planning_and_ready_selection_pin_fingerprint_to_resolved_sha(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            (repo / "docs/plans").mkdir()
+            write_execplan(repo, "G-001", "Queued", priority="high")
+            commit_and_push(repo, "Add queued plan")
+            selected_sha = git_command(repo, "rev-parse", "origin/main")
+            selected_fingerprint = loop_manager._planning_input_fingerprint(
+                repo,
+                selected_sha,
+            )
+
+            state_dir = Path(directory) / "state"
+            connection = self._connection(str(repo))
+            self._insert_plan(
+                connection,
+                "G-001",
+                "READY",
+                priority="high",
+                repo=str(repo),
+                title="Queued",
+                plan_sha=selected_sha,
+            )
+            connection.execute(
+                """
+                UPDATE projects
+                SET planning_fingerprint = ?, processed_sha = ?
+                WHERE repo = ?
+                """,
+                (selected_fingerprint, selected_sha, str(repo)),
+            )
+            connection.commit()
+
+            (repo / "docs/PRODUCT.md").write_text(
+                "# Product moved after SHA resolve\n",
+                encoding="utf-8",
+            )
+            git_command(repo, "add", "docs/PRODUCT.md")
+            git_command(repo, "commit", "-m", "Move planning input locally")
+            moved_sha = git_command(repo, "rev-parse", "HEAD")
+
+            real_git = loop_manager.git
+            real_fingerprint = loop_manager._planning_input_fingerprint
+            exact_reads = 0
+            fingerprint_revisions = []
+
+            def move_ref_after_resolve(path, *arguments, **kwargs):
+                nonlocal exact_reads
+                result = real_git(path, *arguments, **kwargs)
+                if arguments in {
+                    (
+                        "rev-parse",
+                        "refs/remotes/origin/main^{commit}",
+                    ),
+                    (
+                        "rev-parse",
+                        "--verify",
+                        "refs/remotes/origin/main^{commit}",
+                    ),
+                }:
+                    exact_reads += 1
+                    git_command(
+                        repo,
+                        "update-ref",
+                        "refs/remotes/origin/main",
+                        moved_sha,
+                    )
+                return result
+
+            def record_fingerprint(path, revision):
+                fingerprint_revisions.append(revision)
+                return real_fingerprint(path, revision)
+
+            roles = []
+
+            def agent(_worktree, _state, _config, role_name, _prompt, **_kwargs):
+                roles.append(role_name)
+                return loop_manager.CodexResult(1, "stop", "worker-session")
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.git", side_effect=move_ref_after_resolve
+            ), mock.patch(
+                "loop_manager._planning_input_fingerprint",
+                side_effect=record_fingerprint,
+            ), mock.patch("loop_manager.run_codex", side_effect=agent):
+                result = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            project = connection.execute(
+                "SELECT active_sha, worktree FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(result, 1)
+            self.assertEqual(roles, ["worker"])
+            self.assertGreaterEqual(exact_reads, 2)
+            self.assertGreaterEqual(fingerprint_revisions.count(selected_sha), 2)
+            self.assertEqual(project["active_sha"], selected_sha)
+            self.assertEqual(
+                git_command(Path(project["worktree"]), "rev-parse", "HEAD"),
+                selected_sha,
+            )
+            self.assertEqual(
+                git_command(repo, "rev-parse", "refs/remotes/origin/main"),
+                moved_sha,
+            )
+
 
 
 class PlannerFutureIdeasTest(unittest.TestCase):
@@ -3094,6 +3212,17 @@ risk: medium
             loop_manager.migrate_legacy_execplans(
                 connection, target_repo=str(repo)
             )
+            origin_sha = git_command(repo, "rev-parse", "origin/main")
+            origin_tree = git_command(repo, "rev-parse", "origin/main^{tree}")
+            advanced_sha = git_command(
+                repo,
+                "commit-tree",
+                origin_tree,
+                "-p",
+                origin_sha,
+                "-m",
+                "Advance base for rebase verification",
+            )
             managed = Path(
                 connection.execute(
                     "SELECT worktree FROM projects WHERE repo = ?", (str(repo),)
@@ -3106,11 +3235,14 @@ risk: medium
 
             def git_after_base_advance(path, *arguments, **kwargs):
                 nonlocal origin_reads
-                if arguments == ("rev-parse", "origin/main"):
+                if arguments in {
+                    ("rev-parse", "refs/remotes/origin/main^{commit}"),
+                    ("rev-parse", "origin/main"),
+                }:
                     origin_reads += 1
                     if origin_reads > 1:
                         return subprocess.CompletedProcess(
-                            ["git", *arguments], 0, stdout="f" * 40 + "\n"
+                            ["git", *arguments], 0, stdout=advanced_sha + "\n"
                         )
                 if arguments == ("rebase", "origin/main"):
                     return subprocess.CompletedProcess(
@@ -4902,37 +5034,27 @@ class WorkerPublicationTest(unittest.TestCase):
         self.assertEqual(retained["last_error"], loop_manager.PLAN_SHA_BACKFILL_ERROR)
         run.assert_not_called()
 
-    def test_base_worktree_failure_preserves_file_index_and_head(self):
+    def test_dirty_base_worktree_sync_preserves_file_index_and_head(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = make_remote_repository(directory)
-            state_dir = Path(directory) / "state"
-            state_dir.mkdir()
-            connection = sqlite3.connect(":memory:")
-            connection.row_factory = sqlite3.Row
-            connection.execute(loop_manager.SCHEMA)
-            connection.execute(loop_manager.CLEANUP_PENDING_SCHEMA)
             (repo / "src/app.py").write_text("VALUE = 99\n", encoding="utf-8")
             git_command(repo, "add", "src/app.py")
             head_before = git_command(repo, "rev-parse", "HEAD")
             index_before = git_command(repo, "diff", "--cached", "--", "src/app.py")
 
-            with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
-                "loop_manager.remote_base", return_value="main"
-            ), mock.patch("loop_manager.run_codex") as run, mock.patch(
-                "loop_manager.make_worktree"
-            ) as make_worktree:
-                with self.assertRaisesRegex(RuntimeError, "기본 worktree가 dirty"):
-                    loop_manager.run_project(
-                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
-                    )
+            result = loop_manager.synchronize_base_worktree(repo, "main")
 
-            self.assertEqual((repo / "src/app.py").read_text(encoding="utf-8"), "VALUE = 99\n")
+            self.assertEqual(result.status, "skipped")
+            self.assertIn("staged", result.reason)
             self.assertEqual(
-                git_command(repo, "diff", "--cached", "--", "src/app.py"), index_before
+                (repo / "src/app.py").read_text(encoding="utf-8"),
+                "VALUE = 99\n",
+            )
+            self.assertEqual(
+                git_command(repo, "diff", "--cached", "--", "src/app.py"),
+                index_before,
             )
             self.assertEqual(git_command(repo, "rev-parse", "HEAD"), head_before)
-            run.assert_not_called()
-            make_worktree.assert_not_called()
 
     def test_verify_and_review_retries_keep_latest_worker_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -6075,12 +6197,19 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     "argv",
                     [
                         "loop_manager.py",
+                        "--runtime-child",
+                        "--runtime-source",
+                        str(loop_manager.ROOT),
+                        "--runtime-sha",
+                        "a" * 40,
                         "--state-dir",
                         str(state_dir),
                         "--config",
                         str(loop_manager.ROOT / "config/config.ini.example"),
                         "run",
                     ],
+                ), mock.patch(
+                    "loop_manager.validate_runtime_child"
                 ), mock.patch(
                     "loop_manager.git",
                     side_effect=AssertionError(
@@ -6141,12 +6270,19 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "argv",
                 [
                     "loop_manager.py",
+                    "--runtime-child",
+                    "--runtime-source",
+                    str(loop_manager.ROOT),
+                    "--runtime-sha",
+                    "a" * 40,
                     "--state-dir",
                     str(state_dir),
                     "--config",
                     str(loop_manager.ROOT / "config/config.ini.example"),
                     "run",
                 ],
+            ), mock.patch(
+                "loop_manager.validate_runtime_child"
             ), mock.patch(
                 "loop_manager.validate_repository",
                 return_value=repo,
@@ -11120,14 +11256,33 @@ class TimestampedExecutionProgressLogsTest(unittest.TestCase):
 
     def test_skip_if_running_only_silences_lock_contention(self):
         state_dir = Path("state")
-        with mock.patch("sys.argv", ["loop_manager.py", "run", "--skip-if-running"]), mock.patch("loop_manager.state_directory", return_value=state_dir), mock.patch("loop_manager.process_lock", side_effect=loop_manager.ProcessLockBusyError("busy")), mock.patch("loop_manager.update_source_checkout_after_success") as update, mock.patch("builtins.print") as output:
+        with mock.patch(
+            "sys.argv", ["loop_manager.py", "run", "--skip-if-running"]
+        ), mock.patch(
+            "loop_manager.state_directory", return_value=state_dir
+        ), mock.patch(
+            "loop_manager.process_lock",
+            side_effect=loop_manager.ProcessLockBusyError("busy"),
+        ), mock.patch("builtins.print") as output:
             self.assertEqual(loop_manager.main(), 0)
-        update.assert_not_called()
         output.assert_not_called()
-        with mock.patch("sys.argv", ["loop_manager.py", "run"]), mock.patch("loop_manager.state_directory", return_value=state_dir), mock.patch("loop_manager.process_lock", side_effect=loop_manager.ProcessLockBusyError("busy")), mock.patch("builtins.print") as output:
+        with mock.patch(
+            "sys.argv", ["loop_manager.py", "run"]
+        ), mock.patch(
+            "loop_manager.state_directory", return_value=state_dir
+        ), mock.patch(
+            "loop_manager.process_lock",
+            side_effect=loop_manager.ProcessLockBusyError("busy"),
+        ), mock.patch("builtins.print") as output:
             self.assertEqual(loop_manager.main(), 1)
         self.assertTrue(output.called)
-        with mock.patch("sys.argv", ["loop_manager.py", "run", "--skip-if-running"]), mock.patch("loop_manager.state_directory", return_value=state_dir), mock.patch("loop_manager.process_lock", side_effect=RuntimeError("broken")), mock.patch("builtins.print") as output:
+        with mock.patch(
+            "sys.argv", ["loop_manager.py", "run", "--skip-if-running"]
+        ), mock.patch(
+            "loop_manager.state_directory", return_value=state_dir
+        ), mock.patch(
+            "loop_manager.process_lock", side_effect=RuntimeError("broken")
+        ), mock.patch("builtins.print") as output:
             self.assertEqual(loop_manager.main(), 1)
         self.assertTrue(output.called)
 
@@ -11143,122 +11298,6 @@ class TimestampedExecutionProgressLogsTest(unittest.TestCase):
                         pass
 
         self.assertEqual(raised.exception.errno, loop_manager.errno.ENOLCK)
-
-    def test_successful_run_updates_source_before_releasing_process_lock(self):
-        events = []
-
-        @contextlib.contextmanager
-        def locked():
-            events.append("lock")
-            try:
-                yield
-            finally:
-                events.append("unlock")
-
-        @contextlib.contextmanager
-        def database():
-            events.append("database")
-            try:
-                yield object()
-            finally:
-                events.append("database-closed")
-
-        with mock.patch(
-            "sys.argv", ["loop_manager.py", "run"]
-        ), mock.patch(
-            "loop_manager.state_directory", return_value=Path("state")
-        ), mock.patch(
-            "loop_manager.load_managed_config", return_value=mock.sentinel.config
-        ), mock.patch(
-            "loop_manager.process_lock", return_value=locked()
-        ), mock.patch(
-            "loop_manager.connect_database", return_value=database()
-        ), mock.patch(
-            "loop_manager.run_registered_projects", return_value=0
-        ), mock.patch(
-            "loop_manager.update_source_checkout_after_success",
-            side_effect=lambda: events.append("update"),
-        ) as update:
-            self.assertEqual(loop_manager.main(), 0)
-
-        update.assert_called_once_with()
-        self.assertEqual(
-            events,
-            ["lock", "database", "database-closed", "update", "unlock"],
-        )
-
-    def test_failed_run_does_not_update_source(self):
-        with mock.patch(
-            "sys.argv", ["loop_manager.py", "run"]
-        ), mock.patch(
-            "loop_manager.state_directory", return_value=Path("state")
-        ), mock.patch(
-            "loop_manager.load_managed_config", return_value=mock.sentinel.config
-        ), mock.patch(
-            "loop_manager.process_lock"
-        ), mock.patch(
-            "loop_manager.connect_database"
-        ), mock.patch(
-            "loop_manager.run_registered_projects", return_value=1
-        ), mock.patch(
-            "loop_manager.update_source_checkout_after_success"
-        ) as update:
-            self.assertEqual(loop_manager.main(), 1)
-
-        update.assert_not_called()
-
-    def test_source_update_failure_changes_successful_run_exit_code(self):
-        with mock.patch(
-            "sys.argv", ["loop_manager.py", "run"]
-        ), mock.patch(
-            "loop_manager.state_directory", return_value=Path("state")
-        ), mock.patch(
-            "loop_manager.load_managed_config", return_value=mock.sentinel.config
-        ), mock.patch(
-            "loop_manager.process_lock"
-        ), mock.patch(
-            "loop_manager.connect_database"
-        ), mock.patch(
-            "loop_manager.run_registered_projects", return_value=0
-        ), mock.patch(
-            "loop_manager.update_source_checkout_after_success",
-            side_effect=RuntimeError("fetch failed"),
-        ), mock.patch("loop_manager.operation_log") as output:
-            self.assertEqual(loop_manager.main(), 1)
-
-        output.assert_called_once_with("오류: fetch failed", error=True)
-
-    def test_source_update_fast_forwards_only_clean_main(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            source = make_remote_repository(directory)
-            writer = root / "writer"
-            git_command(root, "clone", str(root / "remote.git"), str(writer))
-            git_command(writer, "config", "user.email", "writer@example.com")
-            git_command(writer, "config", "user.name", "Writer")
-            (writer / "src/app.py").write_text("VALUE = 2\n", encoding="utf-8")
-            commit_and_push(writer, "Advance origin")
-            expected = git_command(writer, "rev-parse", "HEAD")
-
-            with mock.patch("loop_manager.operation_print") as output:
-                self.assertTrue(
-                    loop_manager.update_source_checkout_after_success(source)
-                )
-                output.assert_called_once_with(
-                    f"Loop Manager 업데이트 완료: {expected}"
-                )
-
-                (writer / "src/app.py").write_text(
-                    "VALUE = 3\n", encoding="utf-8"
-                )
-                commit_and_push(writer, "Advance origin again")
-                (source / "local.txt").write_text("keep\n", encoding="utf-8")
-                self.assertFalse(
-                    loop_manager.update_source_checkout_after_success(source)
-                )
-
-            self.assertEqual(git_command(source, "rev-parse", "HEAD"), expected)
-            self.assertEqual((source / "local.txt").read_text(), "keep\n")
 
     def test_bash_launcher_skips_git_and_preserves_run_arguments(self):
         with tempfile.TemporaryDirectory() as directory:

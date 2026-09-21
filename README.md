@@ -52,7 +52,7 @@ bash scripts/copy-project-files.sh /path/to/my-project
 
 Specification Skill을 사용하면 템플릿을 바탕으로 초안을 작성하고 누락된 흐름이나 조건을 함께 확인할 수 있다.
 
-문서 작성이 끝나면 변경사항을 commit하고 push한다. Loop Manager는 최신 원격 branch를 자동 작업의 기준으로 사용하며 기본 worktree의 파일, index와 HEAD를 수정하지 않는다. 기본 worktree가 원격보다 뒤처진 상태는 허용하지만 dirty하거나 원격보다 앞선 변경은 자동 작업에 포함되지 않으므로 해당 프로젝트를 건너뛴다.
+문서 작성이 끝나면 변경사항을 commit하고 push한다. Loop Manager는 최신 원격 branch만 자동 작업의 입력으로 사용하므로 local-only 파일과 commit은 그대로 보존되지만 계획과 구현에는 포함되지 않는다. 기본 worktree가 clean한 저장 base branch이고 원격과 같거나 behind-only이면 fetch 직후 안전하게 fast-forward하며, dirty·staged·untracked, ahead·diverged, detached, 다른 branch, 진행 중 Git operation 또는 ignored 경로 충돌이면 동기화만 건너뛰고 원격 SHA 기반 작업은 계속한다.
 
 ### 3. 실행 환경과 Loop Manager 설정
 
@@ -84,7 +84,7 @@ cp config/config.ini.example config/config.ini
 
 ### 4. 초기화 및 반복 실행 설정
 
-상태 DB 초기화와 프로젝트 등록은 명시적인 `config` 하위 명령에서만 수행한다. 프로젝트 추가 시 GitHub origin, 기준 branch, 선택 provider, 필수 문서와 공통 파일을 검증한다. 공통 `AGENTS.md`가 포함되지 않은 저장소는 거부하며, 현재 파일을 확인한 경우에만 `--approve-agents-mismatch`로 그 파일 해시에 결합된 승인을 저장할 수 있다.
+상태 DB 초기화와 프로젝트 등록은 명시적인 `config` 하위 명령에서만 수행한다. 프로젝트 추가 시 GitHub origin과 기준 branch를 fetch한 뒤 해당 원격 commit tree의 필수 문서와 공통 파일, 선택 provider를 검증한다. 기본 worktree에서만 추가·수정·삭제한 파일은 등록 결과에 영향을 주지 않는다. 공통 `AGENTS.md`가 포함되지 않은 원격 blob은 거부하며, 내용을 확인한 경우에만 `--approve-agents-mismatch`로 그 blob 해시에 결합된 승인을 저장할 수 있다.
 
 Planner가 만든 ExecPlan은 검증 후 대상 저장소의 base branch에 fast-forward push된다. 따라서 해당 branch는 Loop Manager 계정의 직접 push를 허용해야 한다. 이후 구현은 `loop-manager/<execplan-id>` branch에서 진행되고 PR로 제출된다.
 
@@ -124,7 +124,7 @@ Planner가 만든 ExecPlan은 검증 후 대상 저장소의 base branch에 fast
 
 PR을 생성하면 Merge될 때까지 같은 프로젝트의 새 작업을 시작하지 않으며, 현재 기준 commit에서 할 일이 없다고 판단한 뒤에는 입력이 바뀔 때까지 Agent를 다시 호출하지 않는다. 서버에는 Python 3, Git, GitHub CLI와 프로젝트에서 선택한 인증된 Codex 또는 Claude Code CLI가 필요하다.
 
-cron 또는 작업 스케줄러에는 정상적인 중복 실행을 조용히 건너뛰도록 `.venv/bin/python loop_manager.py run --skip-if-running`을 등록한다. 이 옵션이 없으면 전역 잠금 충돌은 시각이 포함된 오류와 종료 코드 1로 보고된다. 잠금 이외의 오류는 이 옵션을 써도 그대로 보고된다.
+cron 또는 작업 스케줄러에는 정상적인 중복 실행을 조용히 건너뛰도록 `.venv/bin/python loop_manager.py run --skip-if-running`을 등록한다. source checkout의 Python bootstrap이 먼저 전역 잠금을 획득하고 `origin/main`의 exact SHA를 `<state-dir>` 아래 detached runtime worktree로 선택한 뒤, 같은 Python interpreter와 source 기준의 절대 config 경로로 runtime 자식을 실행한다. source checkout의 local `main`, 미commit 변경과 local-only commit은 실행 revision에 포함하거나 자동 갱신하지 않는다. 이 옵션이 없으면 전역 잠금 충돌은 시각이 포함된 오류와 종료 코드 1로 보고되며 잠금 이외의 오류는 그대로 보고된다.
 
 ### 5. Pull Request 검토
 
