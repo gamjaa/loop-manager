@@ -1998,6 +1998,21 @@ def validate_maintenance_planner_result(
         set(dirty_files) | set(changed_files(worktree, context.active_sha))
     )
     base_paths = _git_tree_entries(worktree, context.active_sha)
+    current_paths = frozenset(
+        path.decode("utf-8") for path, (kind, _oid) in base_paths.items()
+        if kind == b"blob"
+    )
+    previous_paths_by_sha: dict[str, frozenset[str]] = {}
+    if context.mode is MaintenancePlanMode.REVALIDATION:
+        for snapshot in context.eligible_plans:
+            if snapshot.path not in planned_files:
+                continue
+            if snapshot.plan_sha not in previous_paths_by_sha:
+                tree = _git_tree_entries(worktree, snapshot.plan_sha)
+                previous_paths_by_sha[snapshot.plan_sha] = frozenset(
+                    path.decode("utf-8") for path, (kind, _oid) in tree.items()
+                    if kind == b"blob"
+                )
     try:
         _assert_maintenance_context_current(connection, context)
         if not planned_files:
@@ -2083,7 +2098,11 @@ def validate_maintenance_planner_result(
             if context.mode is MaintenancePlanMode.BARRIER:
                 validate_barrier_revision(snapshot, path, plan, text, terminals)
             else:
-                validate_revalidation_revision(snapshot, path, plan, text)
+                validate_revalidation_revision(
+                    snapshot, path, plan, text,
+                    previous_paths=previous_paths_by_sha[snapshot.plan_sha],
+                    current_paths=current_paths,
+                )
             revisions.append(PlanRevision(path, plan, snapshot))
 
         return ValidatedPlanningResult(

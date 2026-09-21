@@ -70,9 +70,7 @@ class MarkdownSections:
 
 _SECTION = re.compile(r"^##[ \t]+(.+?)[ \t]*$", re.MULTILINE)
 _INLINE_CODE = re.compile(r"`([^`\r\n]+)`")
-_PATH_EXPRESSION = re.compile(
-    r"(?:[^/\\\s`]+[/\\])+[^\s`]+"
-)
+# Path evidence comes from immutable Git trees, not punctuation or extensions.
 _HIGH_PRIORITY_JUSTIFICATION = re.compile(
     r"(?:data[ -]?loss|security|automatic execution.{0,40}(?:block|stop)|"
     r"repeated manual recovery|데이터\s*손실|보안|자동\s*실행.{0,20}(?:차단|중단)|"
@@ -153,12 +151,14 @@ def _snapshot_metadata(snapshot: ReadyPlanSnapshot) -> tuple[object, ...]:
     )
 
 
-def _acceptance_criteria_path_shape(text: str) -> str:
-    """Erase only repository-path code spans from acceptance criteria."""
+def _acceptance_criteria_path_shape(
+    text: str, repository_paths: frozenset[str],
+) -> str:
+    """Erase only code spans proven to be paths in the corresponding Git tree."""
 
     def replace(match: re.Match[str]) -> str:
-        expression = match.group(1).strip()
-        if _PATH_EXPRESSION.fullmatch(expression):
+        expression = match.group(1)
+        if expression in repository_paths:
             return "`<repository-path>`"
         return match.group(0)
 
@@ -202,6 +202,9 @@ def validate_revalidation_revision(
     path: str,
     plan: Mapping[str, object],
     text: str,
+    *,
+    previous_paths: frozenset[str] = frozenset(),
+    current_paths: frozenset[str] = frozenset(),
 ) -> None:
     if path != snapshot.path or _metadata_tuple(plan) != _snapshot_metadata(snapshot):
         raise MaintenancePlanningError(
@@ -222,8 +225,8 @@ def validate_revalidation_revision(
             f"새로 만들 수 없습니다: {path}"
         )
     if _acceptance_criteria_path_shape(
-        previous_criteria
-    ) != _acceptance_criteria_path_shape(revised_criteria):
+        previous_criteria, previous_paths
+    ) != _acceptance_criteria_path_shape(revised_criteria, current_paths):
         raise MaintenancePlanningError(
             "revalidation mode는 Acceptance Criteria의 경로 표현 이외 의미를 "
             f"변경할 수 없습니다: {path}"

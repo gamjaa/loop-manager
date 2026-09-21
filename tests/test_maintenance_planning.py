@@ -102,6 +102,10 @@ class MaintenancePlanningTest(unittest.TestCase):
         git(self.repo, "remote", "add", "origin", str(self.remote))
         (self.repo / "docs/plans").mkdir(parents=True)
         (self.repo / "docs/PRODUCT.md").write_text("# Product\n", encoding="utf-8")
+        for name in ("legacy/module.py", "refactored/adapter.py"):
+            source = self.repo / name
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text("# tracked module\n", encoding="utf-8")
         self._write_plan("G-000", "Merged Foundation")
         self.ready_path = self._write_plan(
             "G-001", "Ready Feature", depends_on=("G-000",)
@@ -612,7 +616,6 @@ class MaintenancePlanningTest(unittest.TestCase):
         for old, new in (
             ("api.v1", "api.v2"),
             ("feature.enabled", "feature.disabled"),
-            ("config.json", "different.json"),
         ):
             with self.subTest(identifier=old):
                 original = snapshot.text.replace("legacy/module.py", old)
@@ -627,7 +630,110 @@ class MaintenancePlanningTest(unittest.TestCase):
         loop_manager.validate_revalidation_revision(
             snapshot, snapshot.path, metadata,
             snapshot.text.replace("legacy/module.py", "refactored/adapter.py"),
+            previous_paths=frozenset({"legacy/module.py"}),
+            current_paths=frozenset({"refactored/adapter.py"}),
         )
+
+    def test_revalidation_uses_git_evidence_for_root_file_moves(self):
+        names = ("loop_manager.py", "managed_config.py", "config.json")
+        criteria = "Use " + ", ".join(f"`{name}`" for name in names)
+        criteria += " while preserving `api.v1` and `feature.enabled`."
+        for name in names:
+            (self.repo / name).write_text("# original file\n", encoding="utf-8")
+        self._write_plan(
+            "G-001", "Ready Feature", depends_on=("G-000",),
+            acceptance_criteria=criteria,
+        )
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "Record root modules before refactoring")
+        old_sha = git(self.repo, "rev-parse", "HEAD")
+        self.connection.execute(
+            "UPDATE exec_plans SET content_hash = ?, plan_sha = ? "
+            "WHERE repo = ? AND plan_id = 'G-001'",
+            (loop_manager.file_hash(self.ready_path), old_sha, str(self.repo)),
+        )
+        self.connection.commit()
+        repository = maintenance_state.MaintenanceRepository(self.connection)
+        cycle, _ = repository.begin_assessment_if_due(str(self.repo), 5, old_sha)
+        cycle = repository.transition(
+            str(self.repo), expected_phase=cycle.phase,
+            expected_revision=cycle.revision,
+            next_phase=maintenance_state.MaintenancePhase.REFACTORING,
+            refactoring_plan_ids=("G-000",), revalidation_plan_ids=("G-001",),
+        )
+        repository.transition(
+            str(self.repo), expected_phase=cycle.phase,
+            expected_revision=cycle.revision,
+            next_phase=maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+        )
+        # The old paths are absent from the current tree; evidence must be read
+        # from the plan's original publication revision, not the working files.
+        (self.repo / "modules").mkdir()
+        destinations = ("modules/loop_manager.py", "settings.py", "settings.json")
+        for old, new in zip(names, destinations):
+            git(self.repo, "mv", old, new)
+        git(self.repo, "commit", "-m", "Move modules and config")
+        latest = git(self.repo, "rev-parse", "HEAD")
+        context = loop_manager.prepare_maintenance_planning_context(
+            self.connection, str(self.repo), self.repo, latest
+        )
+        revised_criteria = criteria
+        for old, new in zip(names, destinations):
+            revised_criteria = revised_criteria.replace(f"`{old}`", f"`{new}`")
+
+        def validate(criteria_text):
+            self._write_plan(
+                "G-001", "Ready Feature", depends_on=("G-000",),
+                acceptance_criteria=criteria_text,
+            )
+            return loop_manager.validate_maintenance_planner_result(
+                self.connection, context, self.repo,
+                loop_manager.changed_files(self.repo),
+            )
+
+        result = validate(revised_criteria)
+        self.assertEqual(len(result.revisions), 1)
+        for old, new in (
+            ("api.v1", "api.v2"),
+            ("feature.enabled", "feature.disabled"),
+        ):
+            with self.subTest(identifier=old):
+                with self.assertRaisesRegex(
+                    loop_manager.PlannerValidationError, "Acceptance Criteria"
+                ):
+                    validate(revised_criteria.replace(old, new))
+        # A local untracked file cannot manufacture immutable path evidence.
+        (self.repo / "invented.json").write_text("{}", encoding="utf-8")
+        self._write_plan(
+            "G-001", "Ready Feature", depends_on=("G-000",),
+            acceptance_criteria=revised_criteria.replace("settings.json", "invented.json"),
+        )
+        with self.assertRaisesRegex(
+            loop_manager.PlannerValidationError, "Acceptance Criteria"
+        ):
+            loop_manager.validate_maintenance_planner_result(
+                self.connection, context, self.repo,
+                [self.ready_path.relative_to(self.repo).as_posix()],
+            )
+        self.ready_path.write_text(
+            context.eligible_plans[0].text.replace(criteria, revised_criteria),
+            encoding="utf-8",
+        )
+        real_tree_reader = loop_manager._git_tree_entries
+
+        def unavailable_history(repo, revision):
+            if revision == old_sha:
+                raise loop_manager.GitLockError("historical tree unavailable")
+            return real_tree_reader(repo, revision)
+
+        with mock.patch.object(
+            loop_manager, "_git_tree_entries", side_effect=unavailable_history
+        ):
+            with self.assertRaises(loop_manager.GitLockError):
+                loop_manager.validate_maintenance_planner_result(
+                    self.connection, context, self.repo,
+                    [self.ready_path.relative_to(self.repo).as_posix()],
+                )
 
     def test_git_operational_failures_do_not_become_planner_errors(self):
         context = self._begin_barrier()
