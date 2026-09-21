@@ -17,6 +17,18 @@ class MaintenancePlanningError(RuntimeError):
     """Raised when a maintenance Planner result is unsafe to publish."""
 
 
+class MaintenancePlanningRestart(MaintenancePlanningError):
+    """Signal that a stale planning result was discarded at a newer base."""
+
+    def __init__(self, new_base_sha: str, cycle_revision: int):
+        self.new_base_sha = new_base_sha
+        self.cycle_revision = cycle_revision
+        super().__init__(
+            "origin/base가 이동해 유지보수 planning을 최신 기준에서 "
+            "같은 단계로 다시 시작해야 합니다."
+        )
+
+
 class MaintenancePlanMode(str, Enum):
     BARRIER = "maintenance_barrier"
     REVALIDATION = "maintenance_revalidation"

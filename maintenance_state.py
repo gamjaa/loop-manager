@@ -447,6 +447,63 @@ class MaintenanceRepository:
             )
             return self.get(repo)
 
+    def restart_stale_planning_context(
+        self,
+        repo: str,
+        *,
+        expected: MaintenanceCycle,
+        new_base_sha: str,
+    ) -> MaintenanceCycle:
+        """Move an intent-free planning stage to a newer remote base.
+
+        Incrementing the revision invalidates every context created from the
+        stale base. The active phase and its recorded plan sets are preserved
+        so the caller can create a fresh planning worktree for the same stage.
+        """
+
+        publication = (
+            expected.publication_stage,
+            expected.publication_base_sha,
+            expected.publication_commit_sha,
+            expected.publication_remote_oid,
+        )
+        if (
+            expected.repo != repo
+            or expected.phase not in {
+                MaintenancePhase.ASSESSMENT,
+                MaintenancePhase.POST_REFACTOR_REVALIDATION,
+            }
+            or any(value is not None for value in publication)
+            or re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", new_base_sha)
+            is None
+        ):
+            raise MaintenanceStateError(
+                "재시작할 intent-free 유지보수 planning context가 유효하지 않습니다."
+            )
+        with _transaction(self.connection):
+            if self.get(repo) != expected:
+                raise MaintenanceStateError(
+                    "유지보수 주기 단계 또는 revision이 변경됐습니다."
+                )
+            cursor = self.connection.execute(
+                """
+                UPDATE maintenance_cycles
+                SET cycle_base_sha = ?, revision = revision + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE repo = ? AND phase = ? AND revision = ?
+                  AND publication_stage IS NULL
+                  AND publication_base_sha IS NULL
+                  AND publication_commit_sha IS NULL
+                  AND publication_remote_oid IS NULL
+                """,
+                (new_base_sha, repo, expected.phase.value, expected.revision),
+            )
+            if cursor.rowcount != 1:
+                raise MaintenanceStateError(
+                    "stale 유지보수 planning context를 재시작할 수 없습니다."
+                )
+            return self.get(repo)
+
     def transition(
         self,
         repo: str,

@@ -46,6 +46,7 @@ from maintenance_planning import (
     MaintenancePlanMode,
     MaintenancePlanningContext,
     MaintenancePlanningError,
+    MaintenancePlanningRestart,
     PlanRevision,
     ReadyPlanSnapshot,
     terminal_new_plan_ids,
@@ -2287,11 +2288,18 @@ def register_execplans(
 
 
 def validate_maintenance_publication_base(
+    connection: sqlite3.Connection,
+    repo: str,
     repository: Path,
     base_branch: str,
     context: MaintenancePlanningContext,
 ) -> None:
-    """Reject a stale maintenance result before commit or push."""
+    """Invalidate and restart a stale maintenance result before publication."""
+
+    if context.repo != repo:
+        raise MaintenancePlanningError(
+            "SQLite-bound maintenance context가 publication 대상과 일치하지 않습니다."
+        )
 
     current = git(
         repository,
@@ -2299,11 +2307,18 @@ def validate_maintenance_publication_base(
         "--verify",
         f"refs/remotes/origin/{base_branch}^{{commit}}",
     ).stdout.strip()
-    if current != context.active_sha:
-        raise MaintenancePlanningError(
-            "유지보수 평가 기준 뒤 origin/base가 변경되어 같은 단계를 최신 기준에서 "
-            "다시 시작해야 합니다."
-        )
+    if current == context.active_sha:
+        return
+
+    cycle_repository = maintenance_state.MaintenanceRepository(connection)
+    expected_cycle = cycle_repository.get(repo)
+    _assert_maintenance_context_current(connection, context)
+    restarted = cycle_repository.restart_stale_planning_context(
+        repo,
+        expected=expected_cycle,
+        new_base_sha=current,
+    )
+    raise MaintenancePlanningRestart(current, restarted.revision)
 
 
 def _validate_maintenance_planning_commit(

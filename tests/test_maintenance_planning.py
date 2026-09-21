@@ -653,7 +653,7 @@ class MaintenancePlanningTest(unittest.TestCase):
         self._write_barrier_batch()
         result = self._validate_barrier(context)
         loop_manager.validate_maintenance_publication_base(
-            self.repo, "main", context
+            self.connection, str(self.repo), self.repo, "main", context
         )
         git(self.repo, "add", "docs/plans")
         git(self.repo, "commit", "-m", "Publish maintenance batch")
@@ -1269,16 +1269,90 @@ class MaintenancePlanningTest(unittest.TestCase):
 
     def test_publication_preflight_restarts_when_origin_base_moves(self):
         context = self._begin_barrier()
+        before = maintenance_state.MaintenanceRepository(self.connection).get(
+            str(self.repo)
+        )
         git(self.repo, "commit", "--allow-empty", "-m", "External base move")
         git(self.repo, "push", "origin", "HEAD:main")
         git(self.repo, "fetch", "origin")
+        latest = git(self.repo, "rev-parse", "HEAD")
 
+        with self.assertRaises(loop_manager.MaintenancePlanningRestart) as caught:
+            loop_manager.validate_maintenance_publication_base(
+                self.connection, str(self.repo), self.repo, "main", context
+            )
+        restarted = maintenance_state.MaintenanceRepository(self.connection).get(
+            str(self.repo)
+        )
+        self.assertEqual(caught.exception.new_base_sha, latest)
+        self.assertEqual(caught.exception.cycle_revision, restarted.revision)
+        self.assertEqual(restarted.phase, before.phase)
+        self.assertEqual(restarted.revision, before.revision + 1)
+        self.assertEqual(restarted.cycle_base_sha, latest)
+        self.assertEqual(restarted.refactoring_plan_ids, before.refactoring_plan_ids)
+        self.assertEqual(restarted.revalidation_plan_ids, before.revalidation_plan_ids)
+        self.assertIsNone(restarted.publication_stage)
         with self.assertRaisesRegex(
-            loop_manager.MaintenancePlanningError, "최신 기준"
+            loop_manager.MaintenancePlanningError, "단계 또는 revision"
         ):
             loop_manager.validate_maintenance_publication_base(
-                self.repo, "main", context
+                self.connection, str(self.repo), self.repo, "main", context
             )
+        fresh = loop_manager.prepare_maintenance_planning_context(
+            self.connection, str(self.repo), self.repo, latest
+        )
+        self.assertEqual(fresh.active_sha, latest)
+        self.assertEqual(fresh.cycle_revision, restarted.revision)
+        loop_manager.validate_maintenance_publication_base(
+            self.connection, str(self.repo), self.repo, "main", fresh
+        )
+
+    def test_revalidation_preflight_restarts_in_same_phase(self):
+        repository = maintenance_state.MaintenanceRepository(self.connection)
+        assessment, _created = repository.begin_assessment_if_due(
+            str(self.repo), 5, self.base_sha
+        )
+        refactoring = repository.transition(
+            str(self.repo),
+            expected_phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+            expected_revision=assessment.revision,
+            next_phase=maintenance_state.MaintenancePhase.REFACTORING,
+            refactoring_plan_ids=("G-000",),
+            revalidation_plan_ids=("G-001",),
+        )
+        before = repository.transition(
+            str(self.repo),
+            expected_phase=maintenance_state.MaintenancePhase.REFACTORING,
+            expected_revision=refactoring.revision,
+            next_phase=maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+        )
+        context = loop_manager.prepare_maintenance_planning_context(
+            self.connection, str(self.repo), self.repo, self.base_sha
+        )
+        git(self.repo, "commit", "--allow-empty", "-m", "Later refactoring base")
+        git(self.repo, "push", "origin", "HEAD:main")
+        git(self.repo, "fetch", "origin")
+        latest = git(self.repo, "rev-parse", "HEAD")
+
+        with self.assertRaises(loop_manager.MaintenancePlanningRestart):
+            loop_manager.validate_maintenance_publication_base(
+                self.connection, str(self.repo), self.repo, "main", context
+            )
+
+        restarted = repository.get(str(self.repo))
+        self.assertEqual(
+            restarted.phase,
+            maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+        )
+        self.assertEqual(restarted.revision, before.revision + 1)
+        self.assertEqual(restarted.cycle_base_sha, latest)
+        self.assertEqual(restarted.refactoring_plan_ids, ("G-000",))
+        self.assertEqual(restarted.revalidation_plan_ids, ("G-001",))
+        fresh = loop_manager.prepare_maintenance_planning_context(
+            self.connection, str(self.repo), self.repo, latest
+        )
+        self.assertEqual(fresh.mode, loop_manager.MaintenancePlanMode.REVALIDATION)
+        self.assertEqual(fresh.cycle_revision, restarted.revision)
 
 
 if __name__ == "__main__":
