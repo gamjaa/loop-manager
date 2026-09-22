@@ -7,10 +7,14 @@ apply confirmed recovery decisions through the runtime-state boundary.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
+import hashlib
+import json
 import sqlite3
-from typing import Mapping, Protocol
+from typing import Callable, Iterator, Mapping, Protocol
+from uuid import uuid4
 
 from execplan_catalog import ExecPlanCatalogEntry, ExecPlanCatalogSnapshot
 
@@ -46,6 +50,15 @@ CREATE TABLE IF NOT EXISTS execplan_catalog_diagnostics (
     message TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (repo, plan_id, code)
+)
+"""
+
+CATALOG_REVISIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS execplan_catalog_revisions (
+    repo TEXT PRIMARY KEY,
+    revision_sha TEXT NOT NULL,
+    catalog_fingerprint TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 )
 """
 
@@ -109,6 +122,7 @@ class CatalogRecoveryResult:
 def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.execute(HISTORICAL_CATALOG_SCHEMA)
     connection.execute(CATALOG_DIAGNOSTICS_SCHEMA)
+    connection.execute(CATALOG_REVISIONS_SCHEMA)
     columns = {
         str(row[1])
         for row in connection.execute(
@@ -124,6 +138,609 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
         connection.execute(
             "ALTER TABLE execplan_catalog_history "
             "ADD COLUMN currently_archived INTEGER NOT NULL DEFAULT 1"
+        )
+
+
+class ReconciliationKind(str, Enum):
+    RECONCILED = "reconciled"
+    STALE = "stale"
+    INVALID_CATALOG = "invalid-catalog"
+
+
+@dataclass(frozen=True)
+class PublicationAudit:
+    plan_id: str
+    path: str
+    content_hash: str
+    revision_sha: str | None
+
+
+@dataclass(frozen=True)
+class CurrentPlanDefinition:
+    plan_id: str
+    path: str
+    title: str
+    sources: tuple[str, ...]
+    depends_on: tuple[str, ...]
+    complexity: str | None
+    risk: str | None
+    priority: str
+    content_hash: str
+    revision_sha: str | None
+
+    def metadata(self) -> dict[str, object]:
+        return {
+            "id": self.plan_id,
+            "title": self.title,
+            "sources": list(self.sources),
+            "depends_on": list(self.depends_on),
+            "complexity": self.complexity,
+            "risk": self.risk,
+            "priority": self.priority,
+        }
+
+
+@dataclass(frozen=True)
+class CatalogRowVersion:
+    """Declaration plus state/ownership values protected by reconciliation CAS."""
+
+    plan_id: str
+    values: tuple[object, ...]
+
+
+@dataclass(frozen=True)
+class CatalogStateSnapshot:
+    rows: tuple[CatalogRowVersion, ...]
+    project_values: tuple[object, ...] | None
+
+    @property
+    def plan_ids(self) -> frozenset[str]:
+        return frozenset(row.plan_id for row in self.rows)
+
+
+@dataclass(frozen=True)
+class PinnedCatalog:
+    revision_sha: str
+    snapshot: ExecPlanCatalogSnapshot
+
+
+@dataclass(frozen=True)
+class ReconciliationDiagnostic:
+    revision_sha: str
+    code: str
+    message: str
+    path: str | None
+    source: str | None
+    fingerprint: str
+    related_paths: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CatalogReconciliationResult:
+    kind: ReconciliationKind
+    revision_sha: str | None = None
+    changed_plan_ids: tuple[str, ...] = ()
+    diagnostic: ReconciliationDiagnostic | None = None
+
+
+class InvalidPinnedCatalog(RuntimeError):
+    """Typed failure returned by a revision-pinned catalog input port."""
+
+    def __init__(self, diagnostic: ReconciliationDiagnostic):
+        super().__init__(diagnostic.message)
+        self.diagnostic = diagnostic
+
+
+class CatalogDefinitionPort(Protocol):
+    def load(self) -> PinnedCatalog: ...
+
+    def current_revision(self) -> str: ...
+
+
+_ROW_VERSION_FIELDS = (
+    "plan_id",
+    "path",
+    "title",
+    "sources",
+    "depends_on",
+    "priority",
+    "content_hash",
+    "current_complexity",
+    "current_risk",
+    "current_revision_sha",
+    "catalog_generation",
+    "status",
+    "retry_count",
+    "verify_failure_history",
+    "review_failure_history",
+    "initial_worker_level",
+    "effective_worker_level",
+    "review_level_history",
+    "blocked_reason",
+    "blocked_fingerprint",
+    "blocked_worktree_fingerprint",
+    "blocked_review_fingerprint",
+    "worker_session_id",
+    "reviewer_session_id",
+    "worker_result",
+    "verify_result",
+    "review_result",
+    "branch",
+    "worktree",
+    "workspace_owned",
+    "pr_url",
+    "pr_head_oid",
+    "publication_remote_oid",
+    "pr_conflict_recovery",
+    "pr_conflict_head_oid",
+    "pr_conflict_base_oid",
+    "agent_role",
+    "agent_snapshot",
+    "agent_input_fingerprint",
+    "agent_baseline",
+    "agent_recovery",
+    "agent_input_plan",
+    "agent_result_plan",
+    "agent_result_snapshot",
+    "agent_manager_snapshot",
+    "active_sha",
+    "validated_base_sha",
+)
+
+_PROJECT_VERSION_FIELDS = (
+    "phase",
+    "plan_path",
+    "branch",
+    "worktree",
+    "worker_session_id",
+    "reviewer_session_id",
+    "worker_result",
+    "verify_result",
+    "review_result",
+    "pr_url",
+    "pr_head_oid",
+    "publication_remote_oid",
+    "pr_conflict_recovery",
+    "pr_conflict_head_oid",
+    "pr_conflict_base_oid",
+    "agent_role",
+    "agent_snapshot",
+    "agent_input_fingerprint",
+    "agent_baseline",
+    "agent_recovery",
+    "agent_input_plan",
+    "agent_result_plan",
+    "agent_result_snapshot",
+    "agent_manager_snapshot",
+    "active_sha",
+    "validated_base_sha",
+)
+
+
+def _decode_list(value: object, field: str, plan_id: str) -> tuple[str, ...]:
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"ExecPlan {plan_id}의 {field} cache가 유효하지 않습니다."
+        ) from error
+    if not isinstance(parsed, list) or any(
+        not isinstance(item, str) for item in parsed
+    ):
+        raise RuntimeError(
+            f"ExecPlan {plan_id}의 {field} cache가 유효하지 않습니다."
+        )
+    return tuple(parsed)
+
+
+def _worker_level(complexity: str, risk: str) -> int:
+    return min(
+        {"low": 1, "medium": 3, "high": 5}[complexity]
+        + {"low": 0, "medium": 1, "high": 2, "critical": 3}[risk],
+        7,
+    )
+
+
+def _catalog_fingerprint(snapshot: ExecPlanCatalogSnapshot) -> str:
+    digest = hashlib.sha256(b"loop-manager-execplan-catalog-v1\0")
+    for plan_id, entry in snapshot.all.items():
+        for value in (plan_id, entry.path, entry.content_hash):
+            encoded = value.encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+    return digest.hexdigest()
+
+
+def diagnostic_fingerprint(
+    revision_sha: str,
+    code: str,
+    message: str,
+    paths: tuple[str, ...],
+) -> str:
+    digest = hashlib.sha256(b"loop-manager-invalid-catalog-v1\0")
+    for value in (revision_sha, code, message, *sorted(paths)):
+        encoded = value.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+@contextmanager
+def _transaction(connection: sqlite3.Connection) -> Iterator[None]:
+    if not connection.in_transaction:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        return
+    savepoint = f"catalog_reconciliation_{uuid4().hex}"
+    connection.execute(f"SAVEPOINT {savepoint}")
+    try:
+        yield
+    except BaseException:
+        connection.execute(f"ROLLBACK TO {savepoint}")
+        connection.execute(f"RELEASE {savepoint}")
+        raise
+    else:
+        connection.execute(f"RELEASE {savepoint}")
+
+
+class _StaleCatalogSnapshot(RuntimeError):
+    pass
+
+
+class DefinitionStateRepository:
+    """Own immutable publication audit and the mutable declaration cache."""
+
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        fault_hook: Callable[[str], None] | None = None,
+    ):
+        self.connection = connection
+        self._fault_hook = fault_hook
+
+    def _fault(self, stage: str) -> None:
+        if self._fault_hook is not None:
+            self._fault_hook(stage)
+
+    def capture(self, repo: str) -> CatalogStateSnapshot:
+        fields = ", ".join(_ROW_VERSION_FIELDS)
+        rows = self.connection.execute(
+            f"SELECT {fields} FROM exec_plans WHERE repo = ? ORDER BY plan_id",
+            (repo,),
+        ).fetchall()
+        project = self.connection.execute(
+            "SELECT " + ", ".join(_PROJECT_VERSION_FIELDS)
+            + " FROM projects WHERE repo = ?",
+            (repo,),
+        ).fetchone()
+        return CatalogStateSnapshot(
+            rows=tuple(
+                CatalogRowVersion(
+                    str(row["plan_id"]),
+                    tuple(row[field] for field in _ROW_VERSION_FIELDS),
+                )
+                for row in rows
+            ),
+            project_values=(
+                tuple(project[field] for field in _PROJECT_VERSION_FIELDS)
+                if project is not None
+                else None
+            ),
+        )
+
+    def publication_audit(self, repo: str, plan_id: str) -> PublicationAudit:
+        row = self.connection.execute(
+            "SELECT path, content_hash, plan_sha, publication_path, "
+            "publication_content_hash, publication_sha "
+            "FROM exec_plans WHERE repo = ? AND plan_id = ?",
+            (repo, plan_id),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(f"ExecPlan publication audit가 없습니다: {plan_id}")
+        return PublicationAudit(
+            plan_id,
+            str(row["publication_path"] or row["path"]),
+            str(row["publication_content_hash"] or row["content_hash"]),
+            (
+                str(row["publication_sha"] or row["plan_sha"])
+                if row["publication_sha"] or row["plan_sha"]
+                else None
+            ),
+        )
+
+    def current_definition(
+        self, repo: str, plan_id: str
+    ) -> CurrentPlanDefinition:
+        row = self.connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+            (repo, plan_id),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(f"ExecPlan current definition이 없습니다: {plan_id}")
+        return CurrentPlanDefinition(
+            plan_id=plan_id,
+            path=str(row["path"]),
+            title=str(row["title"]),
+            sources=_decode_list(row["sources"], "sources", plan_id),
+            depends_on=_decode_list(row["depends_on"], "depends_on", plan_id),
+            complexity=(
+                str(row["current_complexity"])
+                if row["current_complexity"] is not None
+                else None
+            ),
+            risk=(
+                str(row["current_risk"])
+                if row["current_risk"] is not None
+                else None
+            ),
+            priority=str(row["priority"]),
+            content_hash=str(row["content_hash"]),
+            revision_sha=(
+                str(row["current_revision_sha"])
+                if row["current_revision_sha"]
+                else None
+            ),
+        )
+
+    def historical_ids(self, repo: str) -> frozenset[str]:
+        return frozenset(
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT plan_id FROM execplan_catalog_history WHERE repo = ?",
+                (repo,),
+            )
+        )
+
+    @staticmethod
+    def _has_execution_history(row: sqlite3.Row) -> bool:
+        return bool(
+            str(row["status"]) != "READY"
+            or int(row["retry_count"] or 0)
+            or row["worker_session_id"]
+            or row["reviewer_session_id"]
+            or row["branch"]
+            or row["worktree"]
+            or row["pr_url"]
+            or str(row["verify_failure_history"] or "{}") != "{}"
+            or str(row["review_failure_history"] or "{}") != "{}"
+            or str(row["review_level_history"] or "{}") != "{}"
+        )
+
+    def apply(
+        self,
+        repo: str,
+        pinned: PinnedCatalog,
+        expected: CatalogStateSnapshot,
+        *,
+        revision_is_current: Callable[[], bool],
+    ) -> tuple[str, ...] | None:
+        """CAS all declaration deltas, rolling back on either stale boundary."""
+
+        changed: list[str] = []
+        try:
+            with _transaction(self.connection):
+                if self.capture(repo) != expected or not revision_is_current():
+                    raise _StaleCatalogSnapshot
+                project = self.connection.execute(
+                    "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
+                ).fetchone()
+                projected_path = str(project["plan_path"] or "") if project else ""
+                for plan_id, entry in pinned.snapshot.all.items():
+                    row = self.connection.execute(
+                        "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+                        (repo, plan_id),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    sources = json.dumps(
+                        entry.sources, ensure_ascii=False, separators=(",", ":")
+                    )
+                    dependencies = json.dumps(
+                        entry.depends_on,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    initial_level = _worker_level(entry.complexity, entry.risk)
+                    old_initial = row["initial_worker_level"]
+                    old_effective = row["effective_worker_level"]
+                    if self._has_execution_history(row):
+                        effective_level = max(
+                            initial_level,
+                            int(old_effective or old_initial or initial_level),
+                        )
+                    else:
+                        effective_level = initial_level
+                    declaration = (
+                        str(row["path"]),
+                        str(row["title"]),
+                        str(row["sources"]),
+                        str(row["depends_on"]),
+                        str(row["priority"]),
+                        str(row["content_hash"]),
+                        row["current_complexity"],
+                        row["current_risk"],
+                        row["current_revision_sha"],
+                        row["initial_worker_level"],
+                        row["effective_worker_level"],
+                    )
+                    target = (
+                        entry.path,
+                        entry.title,
+                        sources,
+                        dependencies,
+                        entry.priority,
+                        entry.content_hash,
+                        entry.complexity,
+                        entry.risk,
+                        pinned.revision_sha,
+                        initial_level,
+                        effective_level,
+                    )
+                    if declaration == target:
+                        continue
+                    self.connection.execute(
+                        """
+                        UPDATE exec_plans
+                        SET path = ?, title = ?, sources = ?, depends_on = ?,
+                            priority = ?, content_hash = ?,
+                            current_complexity = ?, current_risk = ?,
+                            current_revision_sha = ?, initial_worker_level = ?,
+                            effective_worker_level = ?,
+                            catalog_generation = catalog_generation + 1
+                        WHERE repo = ? AND plan_id = ?
+                        """,
+                        (*target, repo, plan_id),
+                    )
+                    if projected_path == str(row["path"]):
+                        self.connection.execute(
+                            "UPDATE projects SET plan_path = ? WHERE repo = ?",
+                            (entry.path, repo),
+                        )
+                        projected_path = entry.path
+                    changed.append(plan_id)
+                    self._fault(f"after-plan:{plan_id}")
+                self.connection.execute(
+                    """
+                    INSERT INTO execplan_catalog_revisions (
+                        repo, revision_sha, catalog_fingerprint
+                    ) VALUES (?, ?, ?)
+                    ON CONFLICT(repo) DO UPDATE SET
+                        revision_sha = excluded.revision_sha,
+                        catalog_fingerprint = excluded.catalog_fingerprint,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (
+                        repo,
+                        pinned.revision_sha,
+                        _catalog_fingerprint(pinned.snapshot),
+                    ),
+                )
+                self._fault("before-revision-recheck")
+                if not revision_is_current():
+                    raise _StaleCatalogSnapshot
+        except _StaleCatalogSnapshot:
+            return None
+        return tuple(changed)
+
+
+class CatalogReconciliationService:
+    """Validate identity mapping and converge a pinned catalog atomically."""
+
+    def __init__(
+        self,
+        repository: DefinitionStateRepository,
+        catalog: CatalogDefinitionPort,
+    ):
+        self.repository = repository
+        self.catalog = catalog
+
+    @staticmethod
+    def _invalid(
+        revision_sha: str,
+        code: str,
+        message: str,
+        *,
+        path: str | None = None,
+        source: str | None = None,
+        related_paths: tuple[str, ...] = (),
+    ) -> CatalogReconciliationResult:
+        paths = tuple(
+            item
+            for item in (path, source, *related_paths)
+            if item is not None
+        )
+        diagnostic = ReconciliationDiagnostic(
+            revision_sha=revision_sha,
+            code=code,
+            message=message,
+            path=path,
+            source=source,
+            related_paths=related_paths,
+            fingerprint=diagnostic_fingerprint(
+                revision_sha, code, message, paths
+            ),
+        )
+        return CatalogReconciliationResult(
+            ReconciliationKind.INVALID_CATALOG,
+            revision_sha=revision_sha,
+            diagnostic=diagnostic,
+        )
+
+    def reconcile(self, repo: str) -> CatalogReconciliationResult:
+        try:
+            pinned = self.catalog.load()
+        except InvalidPinnedCatalog as error:
+            return CatalogReconciliationResult(
+                ReconciliationKind.INVALID_CATALOG,
+                revision_sha=error.diagnostic.revision_sha,
+                diagnostic=error.diagnostic,
+            )
+        expected = self.repository.capture(repo)
+        stored_ids = expected.plan_ids
+        catalog_ids = frozenset(pinned.snapshot.all)
+        missing_files = sorted(stored_ids - catalog_ids)
+        historical_ids = self.repository.historical_ids(repo)
+        unknown_active = sorted(set(pinned.snapshot.active) - stored_ids)
+        unknown_archived = sorted(
+            set(pinned.snapshot.archived) - stored_ids - historical_ids
+        )
+        unknown = [*unknown_active, *unknown_archived]
+        if missing_files and unknown:
+            old = self.repository.current_definition(repo, missing_files[0])
+            entry = pinned.snapshot.all[unknown[0]]
+            return self._invalid(
+                pinned.revision_sha,
+                "ambiguous-id-change",
+                "원격 ExecPlan ID 변경을 기존 실행 이력과 하나로 대응할 수 "
+                f"없습니다: {missing_files[0]} -> {unknown[0]}",
+                path=entry.path,
+                related_paths=(old.path,),
+            )
+        if missing_files:
+            plan_id = missing_files[0]
+            current = self.repository.current_definition(repo, plan_id)
+            return self._invalid(
+                pinned.revision_sha,
+                "missing-plan",
+                f"SQLite ExecPlan에 대응하는 원격 파일이 없습니다: {plan_id}",
+                path=current.path,
+            )
+        if unknown:
+            plan_id = unknown[0]
+            entry = pinned.snapshot.all[plan_id]
+            return self._invalid(
+                pinned.revision_sha,
+                "unknown-plan-id",
+                f"원격 ExecPlan ID를 SQLite 실행 이력과 대응할 수 없습니다: "
+                f"{plan_id}",
+                path=entry.path,
+            )
+        if self.catalog.current_revision() != pinned.revision_sha:
+            return CatalogReconciliationResult(
+                ReconciliationKind.STALE, revision_sha=pinned.revision_sha
+            )
+        changed = self.repository.apply(
+            repo,
+            pinned,
+            expected,
+            revision_is_current=(
+                lambda: self.catalog.current_revision() == pinned.revision_sha
+            ),
+        )
+        if changed is None:
+            return CatalogReconciliationResult(
+                ReconciliationKind.STALE, revision_sha=pinned.revision_sha
+            )
+        return CatalogReconciliationResult(
+            ReconciliationKind.RECONCILED,
+            revision_sha=pinned.revision_sha,
+            changed_plan_ids=changed,
         )
 
 
@@ -313,7 +930,10 @@ class CatalogRecoveryService:
         for plan_id, entry in snapshot.archived.items():
             identity = stored.get(plan_id)
             audit = self.repository.historical_row(repo, plan_id)
-            trusted_identity = identity is not None and audit is None
+            trusted_identity = bool(
+                identity is not None
+                or (audit is not None and audit["identity_verified"])
+            )
             if identity is not None:
                 original_path = identity.path
                 original_hash = identity.content_hash
@@ -332,19 +952,12 @@ class CatalogRecoveryService:
             proof = MergeProof(False)
             diagnostic: CatalogDiagnostic | None = None
 
-            if original_path != entry.active_path:
+            if not trusted_identity and original_path != entry.active_path:
                 diagnostic = self._diagnostic(
                     entry,
                     "stable-identity-mismatch",
                     "archived ExecPlan의 최초 active 경로가 저장 identity와 다릅니다: "
                     f"{original_path} != {entry.active_path}",
-                )
-            elif trusted_identity and original_hash != entry.content_hash:
-                diagnostic = self._diagnostic(
-                    entry,
-                    "archived-content-hash-mismatch",
-                    "archived ExecPlan byte hash가 저장된 원본 content hash와 다릅니다: "
-                    f"{entry.path}",
                 )
             else:
                 try:
@@ -383,8 +996,11 @@ class CatalogRecoveryService:
                             original_hash = proof.publication_content_hash
                         if (
                             proof.publication_content_hash != original_hash
-                            or proof.publication_content_hash
-                            != entry.content_hash
+                            or (
+                                not trusted_identity
+                                and proof.publication_content_hash
+                                != entry.content_hash
+                            )
                         ):
                             diagnostic = self._diagnostic(
                                 entry,

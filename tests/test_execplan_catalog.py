@@ -121,6 +121,50 @@ class ExecPlanCatalogSnapshotTest(unittest.TestCase):
         ):
             execplan_catalog.load_execplan_snapshot(self.root)
 
+    def test_revision_pinned_snapshot_reports_missing_source_and_nonregular_plan(self):
+        relative_path = "docs/plans/[G-001] Active.md"
+        text = plan_text("G-001", "Active").replace(
+            "docs/PRODUCT.md", "docs/requirements/Missing.md"
+        )
+        with self.assertRaises(execplan_catalog.ExecPlanCatalogError) as caught:
+            execplan_catalog.snapshot_from_documents(
+                {relative_path: text},
+                validate_sources=True,
+                available_regular_paths=frozenset({relative_path}),
+                revision_sha="a" * 40,
+            )
+        self.assertEqual(caught.exception.code, "missing-source")
+        self.assertEqual(caught.exception.path, relative_path)
+        self.assertEqual(
+            caught.exception.source, "docs/requirements/Missing.md"
+        )
+
+        with self.assertRaises(execplan_catalog.ExecPlanCatalogError) as caught:
+            execplan_catalog.snapshot_from_documents(
+                {},
+                invalid_plan_entries={relative_path: "symlink"},
+                revision_sha="b" * 40,
+            )
+        self.assertEqual(caught.exception.code, "non-regular-plan")
+        self.assertEqual(caught.exception.path, relative_path)
+
+    def test_revision_pinned_definitions_share_one_revision_token(self):
+        documents = {
+            "docs/plans/[G-001] First.md": plan_text("G-001", "First"),
+            "docs/plans/[G-002] Second.md": plan_text(
+                "G-002", "Second", depends_on=("G-001",)
+            ),
+        }
+        snapshot = execplan_catalog.snapshot_from_documents(
+            documents, revision_sha="c" * 40
+        )
+
+        definitions = snapshot.definitions()
+
+        self.assertEqual(tuple(definitions), ("G-001", "G-002"))
+        self.assertEqual(definitions["G-002"].revision_sha, "c" * 40)
+        self.assertEqual(definitions["G-002"].depends_on, ("G-001",))
+
 
 if __name__ == "__main__":
     unittest.main()

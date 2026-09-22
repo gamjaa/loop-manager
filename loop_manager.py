@@ -208,6 +208,13 @@ CREATE TABLE IF NOT EXISTS exec_plans (
     depends_on TEXT NOT NULL,
     priority TEXT NOT NULL,
     content_hash TEXT NOT NULL,
+    current_complexity TEXT,
+    current_risk TEXT,
+    current_revision_sha TEXT,
+    catalog_generation INTEGER NOT NULL DEFAULT 0,
+    publication_path TEXT,
+    publication_content_hash TEXT,
+    publication_sha TEXT,
     status TEXT NOT NULL,
     plan_sha TEXT,
     active_sha TEXT,
@@ -1063,12 +1070,48 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
         "agent_result_plan": "TEXT",
         "agent_result_snapshot": "TEXT",
         "agent_manager_snapshot": "TEXT",
+        "current_complexity": "TEXT",
+        "current_risk": "TEXT",
+        "current_revision_sha": "TEXT",
+        "catalog_generation": "INTEGER NOT NULL DEFAULT 0",
+        "publication_path": "TEXT",
+        "publication_content_hash": "TEXT",
+        "publication_sha": "TEXT",
     }
+    publication_migration_required = any(
+        column not in columns
+        for column in (
+            "current_revision_sha",
+            "publication_path",
+            "publication_content_hash",
+            "publication_sha",
+        )
+    )
     for column, definition in migrations.items():
         if column not in columns:
             connection.execute(
                 f"ALTER TABLE exec_plans ADD COLUMN {column} {definition}"
             )
+    if publication_migration_required and {
+        "path",
+        "content_hash",
+        "plan_sha",
+    }.issubset(columns):
+        connection.execute(
+            """
+            UPDATE exec_plans
+            SET publication_path = COALESCE(publication_path, path),
+                publication_content_hash = COALESCE(
+                    publication_content_hash, content_hash
+                ),
+                publication_sha = COALESCE(publication_sha, plan_sha),
+                current_revision_sha = COALESCE(current_revision_sha, plan_sha)
+            WHERE publication_path IS NULL
+               OR publication_content_hash IS NULL
+               OR (publication_sha IS NULL AND plan_sha IS NOT NULL)
+               OR (current_revision_sha IS NULL AND plan_sha IS NOT NULL)
+            """
+        )
     connection.execute(GUIDANCE_APPROVALS_SCHEMA)
     scoped_blocking.ensure_schema(connection)
     blocked_checkpoint_state.ensure_schema(connection)
@@ -1336,10 +1379,15 @@ def revision_execplan_snapshot(
     repo: Path,
     revision: str,
 ) -> execplan_catalog.ExecPlanCatalogSnapshot:
-    """Read regular top-level active/archive plans from an immutable Git tree."""
+    """Read and fully validate active/archive plans from one immutable tree."""
 
-    tree = git_bytes(repo, "ls-tree", "-r", "-z", "--full-tree", revision)
+    revision_sha = git(
+        repo, "rev-parse", "--verify", f"{revision}^{{commit}}"
+    ).stdout.strip()
+    tree = git_bytes(repo, "ls-tree", "-r", "-z", "--full-tree", revision_sha)
     documents: dict[str, bytes] = {}
+    regular_paths: set[str] = set()
+    invalid_plan_entries: dict[str, str] = {}
     for record in tree.split(b"\0"):
         if not record:
             continue
@@ -1348,27 +1396,149 @@ def revision_execplan_snapshot(
         if not separator or len(parts) != 3:
             raise RuntimeError("Git tree 항목 형식이 올바르지 않습니다.")
         mode, object_type, object_id = parts
-        if (
-            object_type != b"blob"
-            or mode not in {b"100644", b"100755"}
-            or (
-                re.fullmatch(rb"docs/plans/[^/]+\.md", raw_path) is None
-                and re.fullmatch(
-                    rb"docs/plans/archive/[^/]+\.md", raw_path
-                ) is None
-            )
-        ):
-            continue
         try:
             relative_path = raw_path.decode("utf-8")
         except UnicodeDecodeError as error:
-            raise RuntimeError(
-                "ExecPlan Git 경로가 UTF-8이 아닙니다."
-            ) from error
+            if raw_path.startswith(b"docs/plans/"):
+                raise execplan_catalog.ExecPlanCatalogError(
+                    "ExecPlan Git 경로가 UTF-8이 아닙니다.",
+                    code="invalid-path-encoding",
+                ) from error
+            continue
+        regular = object_type == b"blob" and mode in {b"100644", b"100755"}
+        if regular:
+            regular_paths.add(relative_path)
+        plan_candidate = bool(
+            re.fullmatch(r"docs/plans/[^/]+\.md", relative_path)
+            or re.fullmatch(
+                r"docs/plans/archive/[^/]+\.md", relative_path
+            )
+        )
+        if not plan_candidate:
+            continue
+        if not regular:
+            invalid_plan_entries[relative_path] = (
+                "symlink" if mode == b"120000" else mode.decode("ascii")
+            )
+            continue
         documents[relative_path] = git_bytes(
             repo, "cat-file", "blob", object_id.decode("ascii")
         )
-    return execplan_catalog.snapshot_from_documents(documents)
+    return execplan_catalog.snapshot_from_documents(
+        documents,
+        validate_sources=True,
+        available_regular_paths=frozenset(regular_paths),
+        invalid_plan_entries=invalid_plan_entries,
+        revision_sha=revision_sha,
+    )
+
+
+class _GitCatalogDefinitionPort:
+    """Pin catalog reads to a fetched remote ref without consulting worktrees."""
+
+    def __init__(self, repo: Path, remote_ref: str):
+        self.repo = repo
+        self.remote_ref = remote_ref
+
+    def current_revision(self) -> str:
+        return git(
+            self.repo,
+            "rev-parse",
+            "--verify",
+            f"{self.remote_ref}^{{commit}}",
+        ).stdout.strip()
+
+    def load(self) -> execplan_catalog_state.PinnedCatalog:
+        revision_sha = self.current_revision()
+        try:
+            snapshot = revision_execplan_snapshot(self.repo, revision_sha)
+        except execplan_catalog.ExecPlanCatalogError as error:
+            tree = _git_tree_entries(self.repo, revision_sha)
+            evidence = []
+            for path in error.related_paths:
+                entry = tree.get(path.encode("utf-8"))
+                if entry is not None:
+                    evidence.append(
+                        f"{path}:{entry[0].decode('ascii')}:"
+                        f"{entry[1].decode('ascii')}"
+                    )
+                else:
+                    evidence.append(f"{path}:missing")
+            diagnostic = execplan_catalog_state.ReconciliationDiagnostic(
+                revision_sha=revision_sha,
+                code=error.code,
+                message=str(error),
+                path=error.path,
+                source=error.source,
+                related_paths=error.related_paths,
+                fingerprint=execplan_catalog_state.diagnostic_fingerprint(
+                    revision_sha,
+                    error.code,
+                    str(error),
+                    tuple(evidence),
+                ),
+            )
+            raise execplan_catalog_state.InvalidPinnedCatalog(
+                diagnostic
+            ) from error
+        return execplan_catalog_state.PinnedCatalog(revision_sha, snapshot)
+
+
+def reconcile_execplan_catalog(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    repo: str,
+    base_branch: str,
+) -> execplan_catalog_state.CatalogReconciliationResult:
+    """Converge declaration cache or persist a recoverable project diagnostic."""
+
+    port = _GitCatalogDefinitionPort(
+        repo_path, f"refs/remotes/origin/{base_branch}"
+    )
+    result = execplan_catalog_state.CatalogReconciliationService(
+        execplan_catalog_state.DefinitionStateRepository(connection),
+        port,
+    ).reconcile(repo)
+    catalog_reason = BlockReasonCode.EXECPLAN_CATALOG_INVALID.value
+    existing_block = scoped_blocking.project_block(connection, repo)
+    if result.kind is execplan_catalog_state.ReconciliationKind.INVALID_CATALOG:
+        diagnostic = result.diagnostic
+        assert diagnostic is not None
+        location = diagnostic.path or "(catalog)"
+        source = f"; source={diagnostic.source}" if diagnostic.source else ""
+        evidence = (
+            "원격 ExecPlan catalog가 유효하지 않습니다: "
+            f"revision={diagnostic.revision_sha}; path={location}{source}; "
+            f"code={diagnostic.code}; {diagnostic.message}"
+        )
+        project = connection.execute(
+            "SELECT phase FROM projects WHERE repo = ?", (repo,)
+        ).fetchone()
+        plan_id = _plan_id_from_path(diagnostic.path or "")
+        with connection:
+            scoped_blocking.record_project_block(
+                connection,
+                repo,
+                BlockReasonCode.EXECPLAN_CATALOG_INVALID,
+                evidence,
+                diagnostic.fingerprint,
+                plan_id=plan_id,
+                previous_phase=(
+                    str(project["phase"])
+                    if project is not None and project["phase"]
+                    else None
+                ),
+            )
+            notifications.enqueue_current_project_events(connection, repo)
+        return result
+    if (
+        result.kind is execplan_catalog_state.ReconciliationKind.RECONCILED
+        and existing_block is not None
+        and existing_block["reason_code"] == catalog_reason
+    ):
+        with connection:
+            scoped_blocking.clear_project_block(connection, repo)
+    return result
 
 
 def _is_active_requirement(path: bytes) -> bool:
@@ -1749,7 +1919,7 @@ def _ready_plan_snapshot_from_contents(
         raise MaintenancePlanningError(
             f"유지보수 개정 대상은 무소유 READY 계획이어야 합니다: {plan_id} ({detail})"
         )
-    plan_sha = str(row["plan_sha"] or "")
+    plan_sha = str(row["current_revision_sha"] or row["plan_sha"] or "")
     if re.fullmatch(r"[0-9a-fA-F]{7,64}", plan_sha) is None:
         raise MaintenancePlanningError(
             f"계획 revision SHA를 확인할 수 없습니다: {plan_id}"
@@ -2025,7 +2195,7 @@ def _assert_maintenance_context_current(
             _stored_string_list(row["depends_on"], "depends_on"),
             str(row["priority"]),
             str(row["content_hash"]),
-            str(row["plan_sha"] or ""),
+            str(row["current_revision_sha"] or row["plan_sha"] or ""),
             ownership_values,
         )
         expected = (
@@ -2356,9 +2526,13 @@ def _register_execplan_rows(
             """
             INSERT INTO exec_plans (
                 repo, plan_id, path, title, sources, depends_on, priority,
-                content_hash, status, plan_sha, initial_worker_level,
+                content_hash, current_complexity, current_risk,
+                current_revision_sha, publication_path,
+                publication_content_hash, publication_sha,
+                status, plan_sha, initial_worker_level,
                 effective_worker_level
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'READY', ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      'READY', ?, ?, ?)
             """,
             (
                 repo,
@@ -2369,6 +2543,12 @@ def _register_execplan_rows(
                 dependencies,
                 priority,
                 content_hash,
+                str(plan["complexity"]),
+                str(plan["risk"]),
+                plan_commit,
+                path,
+                content_hash,
+                plan_commit,
                 plan_commit,
                 initial_level,
                 initial_level,
@@ -2673,7 +2853,7 @@ def _maintenance_rows_match_published_batch(
             str(row["depends_on"]),
             str(row["priority"]),
             str(row["content_hash"]),
-            str(row["plan_sha"] or ""),
+            str(row["current_revision_sha"] or row["plan_sha"] or ""),
             str(row["status"]),
         ) != (
             path,
@@ -2699,7 +2879,7 @@ def _maintenance_rows_match_published_batch(
             str(row["depends_on"]),
             str(row["priority"]),
             str(row["content_hash"]),
-            str(row["plan_sha"] or ""),
+            str(row["current_revision_sha"] or row["plan_sha"] or ""),
             str(row["status"]),
         ) != (
             revision.path,
@@ -2836,11 +3016,14 @@ def _apply_maintenance_planning_batch(
             cursor = connection.execute(
                 """
                 UPDATE exec_plans
-                SET depends_on = ?, content_hash = ?, plan_sha = ?
+                SET depends_on = ?, content_hash = ?, plan_sha = ?,
+                    current_revision_sha = ?, current_complexity = ?, current_risk = ?,
+                    catalog_generation = catalog_generation + 1
                 WHERE repo = ? AND plan_id = ? AND status = 'READY'
                   AND path = ? AND title = ? AND sources = ?
                   AND depends_on = ? AND priority = ?
-                  AND content_hash = ? AND plan_sha = ?
+                  AND content_hash = ?
+                  AND COALESCE(current_revision_sha, plan_sha) = ?
                   AND branch IS NULL AND worktree IS NULL
                   AND workspace_owned = 0
                   AND worker_session_id IS NULL
@@ -2854,6 +3037,9 @@ def _apply_maintenance_planning_batch(
                     dependencies,
                     file_hash(worktree / revision.path),
                     plan_commit,
+                    plan_commit,
+                    str(revision.plan["complexity"]),
+                    str(revision.plan["risk"]),
                     repo,
                     snapshot.plan_id,
                     snapshot.path,
@@ -3246,12 +3432,15 @@ def _insert_recovered_execplan(
     ).fetchone()
     if existing is not None:
         if (
-            str(existing["path"]) != path
-            or str(existing["content_hash"]) != content_hash
+            str(existing["publication_path"] or existing["path"]) != path
+            or str(
+                existing["publication_content_hash"] or existing["content_hash"]
+            ) != content_hash
             or (
-                existing["plan_sha"]
+                (existing["publication_sha"] or existing["plan_sha"])
                 and plan_sha
-                and str(existing["plan_sha"]) != plan_sha
+                and str(existing["publication_sha"] or existing["plan_sha"])
+                != plan_sha
             )
         ):
             raise RuntimeError(
@@ -3274,10 +3463,14 @@ def _insert_recovered_execplan(
         """
         INSERT INTO exec_plans (
             repo, plan_id, path, title, sources, depends_on, priority,
-            content_hash, status, plan_sha, active_sha, branch, worktree,
+            content_hash, current_complexity, current_risk,
+            current_revision_sha, publication_path,
+            publication_content_hash, publication_sha,
+            status, plan_sha, active_sha, branch, worktree,
             pr_url, last_error, worker_session_id, worker_result, verify_result,
             initial_worker_level, effective_worker_level, workspace_owned
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                  ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             repo,
@@ -3288,6 +3481,12 @@ def _insert_recovered_execplan(
             dependencies,
             priority,
             content_hash,
+            entry.complexity,
+            entry.risk,
+            plan_sha,
+            path,
+            content_hash,
+            plan_sha,
             status,
             plan_sha,
             project["active_sha"] if is_active else None,
@@ -3378,28 +3577,46 @@ def _migrate_execplan_catalog(
             if project["phase"] == "PLANNING":
                 continue
             root = Path(str(project["repo"]))
-            if reconcile_history:
-                git(root, "fetch", "origin")
             revision = f"refs/remotes/origin/{project['base_branch']}"
             snapshot = revision_execplan_snapshot(root, revision)
             active_path = str(project["plan_path"] or "")
             rows = connection.execute(
-                "SELECT plan_id, path, content_hash, plan_sha, status "
+                "SELECT plan_id, path, content_hash, plan_sha, status, "
+                "publication_path, publication_content_hash, publication_sha "
                 "FROM exec_plans WHERE repo = ?",
                 (project["repo"],),
             ).fetchall()
             stored = {
                 str(row["plan_id"]): execplan_catalog_state.StoredPlanIdentity(
                     plan_id=str(row["plan_id"]),
-                    path=str(row["path"]),
-                    content_hash=str(row["content_hash"]),
+                    path=str(row["publication_path"] or row["path"]),
+                    content_hash=str(
+                        row["publication_content_hash"] or row["content_hash"]
+                    ),
                     plan_sha=(
-                        str(row["plan_sha"]) if row["plan_sha"] else None
+                        str(row["publication_sha"] or row["plan_sha"])
+                        if row["publication_sha"] or row["plan_sha"]
+                        else None
                     ),
                     status=str(row["status"]),
                 )
                 for row in rows
             }
+            historical_ids = {
+                str(row["plan_id"])
+                for row in connection.execute(
+                    "SELECT plan_id FROM execplan_catalog_history WHERE repo = ?",
+                    (project["repo"],),
+                )
+            }
+            catalog_initialized = connection.execute(
+                "SELECT 1 FROM execplan_catalog_revisions WHERE repo = ?",
+                (project["repo"],),
+            ).fetchone() is not None
+            missing_stored_ids = set(stored) - set(snapshot.all)
+            legacy_backfill_allowed = (
+                not catalog_initialized and not missing_stored_ids
+            )
             catalog_repository = execplan_catalog_state.CatalogStateRepository(
                 connection, ensure=False
             )
@@ -3438,11 +3655,13 @@ def _migrate_execplan_catalog(
                     continue
                 identity = stored.get(entry.plan_id)
                 if identity is not None:
-                    if identity.path != entry.active_path:
-                        raise RuntimeError(
-                            "기존 active ExecPlan의 stable path가 원격 catalog와 "
-                            f"충돌합니다: {entry.plan_id}"
-                        )
+                    continue
+                if (
+                    not legacy_backfill_allowed
+                    and entry.plan_id not in historical_ids
+                ):
+                    # A newly observed ID is a reconciliation diagnostic, not
+                    # legacy state that may be registered ahead of validation.
                     continue
                 pull_request = None
                 if is_active:
@@ -3478,10 +3697,21 @@ def _migrate_execplan_catalog(
 
             if not reconcile_history:
                 continue
+            recovery_snapshot = execplan_catalog.ExecPlanCatalogSnapshot(
+                active=snapshot.active,
+                archived={
+                    plan_id: entry
+                    for plan_id, entry in snapshot.archived.items()
+                    if legacy_backfill_allowed
+                    or plan_id in stored
+                    or plan_id in historical_ids
+                },
+                revision_sha=snapshot.revision_sha,
+            )
             recovery = execplan_catalog_state.CatalogRecoveryService(
                 catalog_repository,
                 _LegacyCatalogMergeProof(root, revision, stored),
-            ).reconcile(str(project["repo"]), snapshot, stored)
+            ).reconcile(str(project["repo"]), recovery_snapshot, stored)
             _quarantine_unverified_historical_runtime(
                 connection, str(project["repo"]), recovery
             )
@@ -4452,7 +4682,7 @@ def ensure_worker_level_state(
     review_history = _deserialize_review_level_history(
         catalog_plan["review_level_history"]
     )
-    if any(not initial <= int(level) <= effective for level in review_history):
+    if any(not 1 <= int(level) <= effective for level in review_history):
         raise RuntimeError("저장된 Review 승격 이력이 Worker level과 일치하지 않습니다.")
 
     return effective
@@ -7956,6 +8186,7 @@ def _blocked_validation_base_revision(
     return str(
         (project["active_sha"] if project else None)
         or plan["active_sha"]
+        or plan["current_revision_sha"]
         or plan["plan_sha"]
         or ""
     )
@@ -7995,39 +8226,40 @@ def _execplan_metadata_identity_error(
     plan: sqlite3.Row,
     subject: str,
 ) -> str | None:
-    path = str(plan["path"])
-    plan_sha = str(plan["plan_sha"] or "")
-    if plan_sha:
-        shown = git(repo_path, "show", f"{plan_sha}:{path}", check=False)
-        if shown.returncode:
-            return f"{subject}의 게시 메타데이터를 확인할 수 없습니다."
-        try:
-            published = published_execplan(path, shown.stdout)
-        except RuntimeError as error:
-            return f"{subject}의 게시 메타데이터가 유효하지 않습니다: {error}"
-        metadata_fields = (
-            "id",
-            "title",
-            "sources",
-            "depends_on",
-            "complexity",
-            "risk",
-            "priority",
-        )
-        if any(current[field] != published[field] for field in metadata_fields):
-            return f"{subject}의 고정 메타데이터는 변경할 수 없습니다."
-        return None
-
-    sources, dependencies, priority = _execplan_metadata(current)
-    if (
-        current["id"] != plan["plan_id"]
-        or current["title"] != plan["title"]
-        or sources != plan["sources"]
-        or dependencies != plan["depends_on"]
-        or priority != plan["priority"]
-    ):
-        return f"{subject}의 SQLite 메타데이터와 현재 파일이 일치하지 않습니다."
+    del repo_path
+    if current["id"] != plan["plan_id"]:
+        return f"{subject}의 ID가 reconciled catalog identity와 다릅니다."
+    reconciled = _current_execplan_metadata(plan, current)
+    metadata_fields = (
+        "title",
+        "sources",
+        "depends_on",
+        "complexity",
+        "risk",
+        "priority",
+    )
+    if any(current[field] != reconciled[field] for field in metadata_fields):
+        return f"{subject} metadata가 reconciled catalog와 다릅니다."
     return None
+
+
+def _current_execplan_metadata(
+    plan: sqlite3.Row,
+    fallback: Mapping[str, object],
+) -> dict[str, object]:
+    """Expose the reconciled declaration cache without publication-audit fields."""
+
+    complexity = plan["current_complexity"] or fallback.get("complexity")
+    risk = plan["current_risk"] or fallback.get("risk")
+    return {
+        "id": str(plan["plan_id"]),
+        "title": str(plan["title"]),
+        "sources": list(json.loads(str(plan["sources"]))),
+        "depends_on": list(json.loads(str(plan["depends_on"]))),
+        "complexity": str(complexity),
+        "risk": str(risk),
+        "priority": str(plan["priority"]),
+    }
 
 
 def _blocked_execplan_metadata_identity_error(
@@ -8058,7 +8290,9 @@ def validate_active_execplan_metadata(
     )
     if error is not None:
         raise RuntimeError(error)
-    return current
+    if relative_path != str(plan["path"]):
+        raise RuntimeError("활성 ExecPlan 경로가 reconciled catalog와 다릅니다.")
+    return _current_execplan_metadata(plan, current)
 
 
 def validate_worker_workspace_scope(
@@ -8185,11 +8419,18 @@ def _guidance_worker_targets(
 
 def _published_plan_allows_common_plans(
     repo_path: Path,
-    catalog_plan: sqlite3.Row,
+    catalog_plan: Mapping[str, object],
 ) -> bool:
     if not is_loop_manager_repository(repo_path):
         return False
-    plan_sha = str(catalog_plan["plan_sha"] or "")
+    current_revision_sha = (
+        catalog_plan["current_revision_sha"]
+        if "current_revision_sha" in catalog_plan.keys()
+        else None
+    )
+    plan_sha = str(
+        current_revision_sha or catalog_plan["plan_sha"] or ""
+    )
     if not plan_sha:
         return False
     shown = git(
@@ -9351,7 +9592,8 @@ def block_persisted_agent_scope_violation(
         )
     else:
         revision = str(
-            plan["plan_sha"]
+            plan["current_revision_sha"]
+            or plan["plan_sha"]
             or row["active_sha"]
             or f"refs/remotes/origin/{row['base_branch']}"
         )
@@ -10944,7 +11186,12 @@ def resume_blocked_execplan_if_inputs_changed(
             stored_review_fingerprint
         )
     else:
-        blocked_revision = str(plan["active_sha"] or plan["plan_sha"] or "")
+        blocked_revision = str(
+            plan["active_sha"]
+            or plan["current_revision_sha"]
+            or plan["plan_sha"]
+            or ""
+        )
         blocked_review_fingerprint = (
             _revision_review_issue_fingerprint(
                 repo_path, blocked_revision, plan["review_result"]
@@ -12765,7 +13012,7 @@ def _later_published_execplan(
     row: sqlite3.Row,
 ) -> dict[str, object] | None:
     plan_id = str(row["plan_id"])
-    plan_sha = str(row["plan_sha"] or "")
+    plan_sha = str(row["publication_sha"] or row["plan_sha"] or "")
     if not plan_sha:
         return None
     ancestry = git(
@@ -12783,7 +13030,7 @@ def _later_published_execplan(
             f"ExecPlan {plan_id}의 게시 이력을 확정할 수 없습니다: "
             f"{ancestry.stdout[-2000:]}"
         )
-    path = str(row["path"])
+    path = str(row["publication_path"] or row["path"])
     try:
         plan_text = git_bytes(
             repo_path,
@@ -12828,7 +13075,8 @@ def requirement_archive_candidates(
     """Return active Requirements safe to move in the current implementation PR."""
 
     rows = connection.execute(
-        "SELECT plan_id, path, sources, status, plan_sha "
+        "SELECT plan_id, path, sources, status, plan_sha, "
+        "publication_path, publication_sha "
         "FROM exec_plans WHERE repo = ?",
         (repo,),
     ).fetchall()
@@ -12890,23 +13138,23 @@ def requirement_archive_candidates(
             + ")."
         )
 
-    for plan_id, plan in catalog.items():
-        if plan_id in unverified_historical_ids and plan_id not in states:
-            continue
-        row = states[plan_id]
+    # Reconciliation has already validated the remote snapshot and atomically
+    # installed these current source relations.  Archive eligibility consumes
+    # that cache instead of treating a valid declaration delta as an error.
+    for plan_id, row in states.items():
         try:
-            stored_sources = json.loads(str(row["sources"]))
+            current_sources = json.loads(str(row["sources"]))
         except json.JSONDecodeError as error:
             raise RequirementArchiveError(
                 f"ExecPlan {plan_id}의 SQLite source를 해석할 수 없습니다."
             ) from error
-        if (
-            str(row["path"]) != f"docs/plans/[{plan_id}] {plan['title']}.md"
-            or stored_sources != plan["sources"]
+        if not isinstance(current_sources, list) or any(
+            not isinstance(source, str) for source in current_sources
         ):
             raise RequirementArchiveError(
-                f"ExecPlan {plan_id}의 source 관계 또는 상태를 확정할 수 없습니다."
+                f"ExecPlan {plan_id}의 SQLite source를 해석할 수 없습니다."
             )
+        catalog[plan_id]["sources"] = current_sources
 
     tree = _requirement_archive_tree(repo_path, revision)
     candidates: list[str] = []
@@ -13793,7 +14041,15 @@ def _run_project_step(
             f"등록된 provider는 {provider}이며 {requested_provider}로 변경할 수 없습니다."
         )
     _ensure_cleanup_pending_schema(connection)
-    if row is not None and scoped_blocking.project_block(connection, repo) is not None:
+    initial_project_block = (
+        scoped_blocking.project_block(connection, repo) if row is not None else None
+    )
+    if (
+        row is not None
+        and initial_project_block is not None
+        and initial_project_block["reason_code"]
+        != BlockReasonCode.EXECPLAN_CATALOG_INVALID.value
+    ):
         synchronize_waiting_pull_requests(connection, repo_path, state_dir, repo)
         resume_project_block_if_safe(connection, repo_path, state_dir, repo)
         project_block = scoped_blocking.project_block(connection, repo)
@@ -13955,12 +14211,17 @@ def _run_project_step(
         log_base_worktree_sync(repo_path, sync_result)
 
     backfill_plan_shas(connection, target_repo=repo)
-    migrate_legacy_execplans(
-        connection,
-        reconcile_history=True,
-        target_repo=repo,
-        ensure_schema=not registered_only,
-    )
+    try:
+        migrate_legacy_execplans(
+            connection,
+            reconcile_history=True,
+            target_repo=repo,
+            ensure_schema=not registered_only,
+        )
+    except execplan_catalog.ExecPlanCatalogError:
+        # The typed reconciliation boundary below records invalid remote input
+        # after PR synchronization without mutating declaration cache rows.
+        pass
     row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
     if row:
         hydrate_active_project(connection, repo)
@@ -14002,6 +14263,35 @@ def _run_project_step(
     row = connection.execute(
         "SELECT * FROM projects WHERE repo = ?", (repo,)
     ).fetchone()
+    if row is not None and row["phase"] != "PLANNING":
+        catalog_result = reconcile_execplan_catalog(
+            connection, repo_path, repo, base
+        )
+        if (
+            catalog_result.kind
+            is execplan_catalog_state.ReconciliationKind.STALE
+        ):
+            return PROJECT_STEP_RETRY
+        if (
+            catalog_result.kind
+            is execplan_catalog_state.ReconciliationKind.INVALID_CATALOG
+        ):
+            assert catalog_result.diagnostic is not None
+            operation_print(
+                catalog_result.diagnostic.message,
+                file=sys.stderr,
+            )
+            return 1
+        base_sha = str(catalog_result.revision_sha or base_sha)
+        migrate_legacy_execplans(
+            connection,
+            reconcile_history=True,
+            target_repo=repo,
+            ensure_schema=False,
+        )
+        row = connection.execute(
+            "SELECT * FROM projects WHERE repo = ?", (repo,)
+        ).fetchone()
     project_block = scoped_blocking.project_block(connection, repo)
     if project_block is not None:
         resume_project_block_if_safe(

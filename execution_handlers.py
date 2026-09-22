@@ -141,6 +141,18 @@ class ExecutionHandlers:
                 path=str(row['plan_path']),
                 plan_sha=str(row['plan_sha']) if row['plan_sha'] is not None else None,
                 sources=tuple((str(item) for item in self.plan.get('sources', ()))),
+                definition_revision_sha=(
+                    str(self.catalog_plan['current_revision_sha'])
+                    if self.catalog_plan['current_revision_sha'] is not None
+                    else None
+                ),
+                content_hash=str(self.catalog_plan['content_hash']),
+                depends_on=tuple(
+                    str(item) for item in self.plan.get('depends_on', ())
+                ),
+                complexity=str(self.plan.get('complexity')),
+                risk=str(self.plan.get('risk')),
+                priority=str(self.plan.get('priority')),
             ),
             phase=phase,
             branch=str(row['branch'] or ''),
@@ -1178,7 +1190,16 @@ class ExecutionHandlers:
 
     def _publish_new_pull_request(self, context, row):
         assert self.plan is not None
-        plan_sha = str(row['plan_sha'] or '')
+        assert self.catalog_plan is not None
+        plan_sha = str(
+            self.catalog_plan['publication_sha']
+            or self.catalog_plan['plan_sha']
+            or ''
+        )
+        publication_path = str(
+            self.catalog_plan['publication_path']
+            or self.catalog_plan['path']
+        )
         if not plan_sha:
             plan_error = '계획 commit SHA가 없습니다.'
             self.effects.blocking.block_active_execplan(
@@ -1190,8 +1211,10 @@ class ExecutionHandlers:
             )
             self.effects.events.operation_print(plan_error, file=sys.stderr)
             return self._final(plan_error)
-        plan_text = self.effects.workspace.git(context.worktree, 'show', f"{plan_sha}:{row['plan_path']}").stdout
-        self.plan = self.effects.publication.published_execplan(str(row['plan_path']), plan_text)
+        plan_text = self.effects.workspace.git(
+            context.worktree, 'show', f"{plan_sha}:{publication_path}"
+        ).stdout
+        self.effects.publication.published_execplan(publication_path, plan_text)
         try:
             worker_publication = self.effects.validation.parse_worker_result(str(row['worker_result'] or ''), self.plan)
         except self.effects.contract.WorkerResultError as error:
@@ -1208,7 +1231,7 @@ class ExecutionHandlers:
         body = self.effects.publication.build_pr_body(
             worker_publication,
             self.plan,
-            str(row['plan_path']),
+            publication_path,
             plan_text,
             origin_url,
             plan_sha,

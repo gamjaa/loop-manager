@@ -45,7 +45,10 @@
 - `docs/requirements/` 바로 아래의 Requirement는 별도 상태 없이 모두 Planner 입력이다
 - Requirement는 제품 변화와 Acceptance Criteria를 기록하며 구현 계획이나 실행 상태를 포함하지 않는다
 - ExecPlan 파일은 계획의 고정 메타데이터와 내용을 기록하며 실행 상태를 포함하지 않는다
+- 최신으로 검증한 `origin/<base-branch>`의 active 및 archived ExecPlan 파일은 ID를 제외한 현재 계획 선언의 원본이다. SQLite는 최초 게시 path·hash·SHA를 불변 감사 정보로 보존하고 현재 path·title·sources·depends_on·complexity·risk·priority·hash·revision을 별도 cache로 동기화한다
 - ExecPlan 실행 상태의 유일한 원본은 Loop Manager의 SQLite다
+- 유효한 ExecPlan 선언 변경은 계획 또는 프로젝트 차단 사유가 아니며, catalog 전체가 유효하고 원격 revision과 SQLite 상태·소유권 snapshot이 그대로일 때만 모든 현재 cache delta를 한 transaction으로 반영한다
+- 원격 ExecPlan catalog가 누락 파일, 잘못된 형식·source·ID 또는 dependency graph 때문에 유효하지 않으면 다른 ExecPlan 상태를 바꾸지 않고 실제 원인 파일을 포함한 프로젝트 범위 진단으로 격리한다
 - ExecPlan 생성 전 Planner 실패는 프로젝트의 `planning_error`로 SQLite에 저장하며 ExecPlan BLOCKED 상태를 만들지 않는다
 - 미충족 PRODUCT 또는 Requirement에 근거해서만 ExecPlan을 작성한다
 - 실행 중인 작업과 남아 있는 READY ExecPlan은 새 계획 입력으로 선점하지 않으며, READY 카탈로그를 소진한 뒤에만 최신 입력에서 식별 가능한 모든 미충족 작업을 하나의 계획 주기에 ExecPlan으로 작성한다. 단, due 유지보수 평가는 활성 작업이 없는 선택 경계에서 일반 READY보다 먼저 수행한다
@@ -126,35 +129,36 @@
 - 기존 ExecPlan 작업을 이어서 처리할 수 있다
 
 흐름:
-1. 프로그램이 모든 `PR_OPEN`의 Merge·Close·충돌 상태를 대상 ExecPlan별로 동기화하고 `PROJECT_BLOCKED`의 저장소 안전을 먼저 확인한다. 프로젝트 안전이 증명되지 않으면 fetch, 기본 worktree 동기화와 저장소 변경 단계를 실행하지 않는다
+1. 프로그램이 모든 `PR_OPEN`의 Merge·Close·충돌 상태를 대상 ExecPlan별로 동기화하고 `PROJECT_BLOCKED`의 저장소 안전을 먼저 확인한다. 프로젝트 안전이 증명되지 않으면 fetch, 기본 worktree 동기화와 저장소 변경 단계를 실행하지 않는다. 단, 원격 ExecPlan catalog 오류 차단은 원인 push를 fetch하고 재검증해야 하므로 이 저장소 안전 gate와 별도로 처리한다
 2. 프로젝트 안전 gate가 열려 있으면 fetch하고 eligible 기본 worktree만 원격 base로 safe fast-forward한 뒤 각 `PLAN_BLOCKED`의 계획별 해제 조건 및 `planning_error`의 근거 입력 변경 여부를 독립적으로 확인한다
-3. 동시에 처리할 프로젝트를 `max_workers` 범위에서 선택한다
-4. 실행 중인 변경 단계가 없으면 dependency를 충족한 확정 PR 충돌 복구 하나를 먼저 선택하고, 없으면 프로젝트별 유지보수 평가 주기를 확인한다. `PLAN_BLOCKED` 또는 `PR_OPEN`이 있으면 유지보수 평가는 보류하고 독립 READY 선택으로 이동한다
-5. due 유지보수 cycle이 prerequisite 또는 리팩터링 계획을 기록했으면 그 집합의 dependency 충족 계획만 선택하고, 사후 재검증 단계면 장벽 뒤 Worker보다 유지보수 Planner를 먼저 실행한다
-6. 유지보수 cycle이 없고 READY ExecPlan이 모두 dependency를 충족하지 못하거나 독립 READY가 없고 `PLAN_BLOCKED`·`PR_OPEN`만 남으면 Planner나 Worker를 시작하지 않고 대기한다. 실행 중인 작업, READY, `PLAN_BLOCKED`와 `PR_OPEN` ExecPlan이 모두 없을 때만 최신 원격 계획 입력 지문으로 일반 Planner 필요 여부를 확인한다
-7. Planner가 PRODUCT, Requirement, ARCHITECTURE, 현재 코드와 기존 ExecPlan을 확인한다
-8. 새 ExecPlan과 `docs/FUTURE_IDEAS.md` 변경이 모두 없으면 계획 입력 지문을 저장하고 planning worktree를 정리한 뒤 프로젝트 완료 여부를 확인한다
-9. 작업이 필요하면 Planner가 현재 입력에서 식별 가능한 미충족 작업 전체를 독립적으로 검증·Merge할 수 있는 새 ExecPlan으로 나누어 planning worktree의 `docs/plans/`에 일괄 작성하고, 의존성과 제품 우선순위를 기록한다. 현재 범위 밖의 보존 가치가 있는 아이디어는 같은 계획 주기의 ExecPlan으로 만들지 않고 `docs/FUTURE_IDEAS.md`에 분리한다
-10. 프로그램이 Planner의 변경 범위와 FUTURE_IDEAS 분리 여부를 검증하고, 새 ExecPlan만 메타데이터와 `depends_on` 검증 대상으로 사용한다
-11. 검증 실패 내용을 같은 Planner 세션에 전달하고 최대 3회까지 수정을 요청한다
-12. 3회 후에도 유효하지 않으면 프로젝트의 `planning_error`에 원인과 계획 입력 지문을 저장하고 처리를 중단한다
-13. 유효한 새 ExecPlan과 `docs/FUTURE_IDEAS.md` 변경을 planning worktree에서 하나의 planning commit으로 만든다
-14. 계획 commit이 아직 원격에 없는데 `origin/<base-branch>`가 계획 기준 이후 바뀌었으면 planning worktree를 정리하고 최신 기준으로 다시 계획한다
-15. 기준이 그대로면 계획 commit을 `origin/<base-branch>`에 fast-forward push한다
-16. push된 commit을 확인한 뒤에만 새 ExecPlan을 SQLite에 READY 상태로 등록하고 planning worktree와 기존 `planning_error`를 정리한다. FUTURE_IDEAS 변경만으로는 실행 상태를 만들지 않는다
-17. 모든 `depends_on`이 MERGED인 READY ExecPlan 중 제품 우선순위가 가장 높은 계획 하나를 결정적으로 선택한다
-18. 갱신된 `origin/<base-branch>`에서 해당 ExecPlan 전용 branch와 worktree를 생성하거나 기존 작업 공간을 복구한다
-19. 프로그램이 complexity와 risk로 최초 Worker level 1~7을 계산하고 저장된 effective level의 Model과 Effort를 선택한다
-20. 프로그램이 활성 Requirement의 관련 ExecPlan source와 SQLite 상태를 결합해 archive 후보를 계산한다
-21. Worker가 구현, 관련 테스트와 전체 검증 스크립트를 작성하거나 갱신하고 계산된 Requirement를 내용 변경 없이 archive로 이동한다
-22. Requirement 구현으로 장기 제품 규칙이 바뀌면 Worker가 같은 PR의 `PRODUCT.md`를 갱신한다
-23. 프로그램이 Worker 결과의 실제 archive 이동 집합을 다시 검증한다
-24. 프로그램이 최신 원격 기준 branch를 rebase로 반영한다
-25. 프로그램이 전체 검증 스크립트를 실행하고, 실패한 경우에만 출력 내용을 같은 Worker 세션에 전달한다
-26. 검증이 성공하면 읽기 전용 Reviewer를 실행한다
-27. 게시 직전에 최신 base에서 archive 후보를 다시 계산하고 이동 집합이 달라지면 같은 Worker 세션에서 수정한 뒤 검증과 Review를 반복한다
-28. 프로그램이 같은 branch의 기존 PR을 확인하고, 없을 때만 새 PR을 생성한 뒤 SQLite 상태를 PR_OPEN으로 변경한다
-29. 안정된 `PR_OPEN`은 실행 자리를 비우며, 프로그램은 해당 계획에 직접·간접 의존하지 않는 다음 READY를 최신 `origin/<base-branch>`에서 순차적으로 시작한다
+3. PR 상태 동기화 뒤 하나의 고정된 원격 base revision에서 active 및 archived ExecPlan catalog 전체를 검증하고 현재 선언 cache를 원자적으로 reconciliation한다. 원격 또는 SQLite snapshot이 바뀌면 일부 값을 적용하지 않고 최신 기준으로 다시 시도한다
+4. 동시에 처리할 프로젝트를 `max_workers` 범위에서 선택한다
+5. 실행 중인 변경 단계가 없으면 dependency를 충족한 확정 PR 충돌 복구 하나를 먼저 선택하고, 없으면 프로젝트별 유지보수 평가 주기를 확인한다. `PLAN_BLOCKED` 또는 `PR_OPEN`이 있으면 유지보수 평가는 보류하고 독립 READY 선택으로 이동한다
+6. due 유지보수 cycle이 prerequisite 또는 리팩터링 계획을 기록했으면 그 집합의 dependency 충족 계획만 선택하고, 사후 재검증 단계면 장벽 뒤 Worker보다 유지보수 Planner를 먼저 실행한다
+7. 유지보수 cycle이 없고 READY ExecPlan이 모두 dependency를 충족하지 못하거나 독립 READY가 없고 `PLAN_BLOCKED`·`PR_OPEN`만 남으면 Planner나 Worker를 시작하지 않고 대기한다. 실행 중인 작업, READY, `PLAN_BLOCKED`와 `PR_OPEN` ExecPlan이 모두 없을 때만 최신 원격 계획 입력 지문으로 일반 Planner 필요 여부를 확인한다
+8. Planner가 PRODUCT, Requirement, ARCHITECTURE, 현재 코드와 기존 ExecPlan을 확인한다
+9. 새 ExecPlan과 `docs/FUTURE_IDEAS.md` 변경이 모두 없으면 계획 입력 지문을 저장하고 planning worktree를 정리한 뒤 프로젝트 완료 여부를 확인한다
+10. 작업이 필요하면 Planner가 현재 입력에서 식별 가능한 미충족 작업 전체를 독립적으로 검증·Merge할 수 있는 새 ExecPlan으로 나누어 planning worktree의 `docs/plans/`에 일괄 작성하고, 의존성과 제품 우선순위를 기록한다. 현재 범위 밖의 보존 가치가 있는 아이디어는 같은 계획 주기의 ExecPlan으로 만들지 않고 `docs/FUTURE_IDEAS.md`에 분리한다
+11. 프로그램이 Planner의 변경 범위와 FUTURE_IDEAS 분리 여부를 검증하고, 새 ExecPlan만 메타데이터와 `depends_on` 검증 대상으로 사용한다
+12. 검증 실패 내용을 같은 Planner 세션에 전달하고 최대 3회까지 수정을 요청한다
+13. 3회 후에도 유효하지 않으면 프로젝트의 `planning_error`에 원인과 계획 입력 지문을 저장하고 처리를 중단한다
+14. 유효한 새 ExecPlan과 `docs/FUTURE_IDEAS.md` 변경을 planning worktree에서 하나의 planning commit으로 만든다
+15. 계획 commit이 아직 원격에 없는데 `origin/<base-branch>`가 계획 기준 이후 바뀌었으면 planning worktree를 정리하고 최신 기준으로 다시 계획한다
+16. 기준이 그대로면 계획 commit을 `origin/<base-branch>`에 fast-forward push한다
+17. push된 commit을 확인한 뒤에만 새 ExecPlan을 SQLite에 READY 상태로 등록하고 planning worktree와 기존 `planning_error`를 정리한다. FUTURE_IDEAS 변경만으로는 실행 상태를 만들지 않는다
+18. 모든 `depends_on`이 MERGED인 READY ExecPlan 중 제품 우선순위가 가장 높은 계획 하나를 결정적으로 선택한다
+19. 갱신된 `origin/<base-branch>`에서 해당 ExecPlan 전용 branch와 worktree를 생성하거나 기존 작업 공간을 복구한다
+20. 프로그램이 complexity와 risk로 최초 Worker level 1~7을 계산하고 저장된 effective level의 Model과 Effort를 선택한다
+21. 프로그램이 활성 Requirement의 관련 ExecPlan source와 SQLite 상태를 결합해 archive 후보를 계산한다
+22. Worker가 구현, 관련 테스트와 전체 검증 스크립트를 작성하거나 갱신하고 계산된 Requirement를 내용 변경 없이 archive로 이동한다
+23. Requirement 구현으로 장기 제품 규칙이 바뀌면 Worker가 같은 PR의 `PRODUCT.md`를 갱신한다
+24. 프로그램이 Worker 결과의 실제 archive 이동 집합을 다시 검증한다
+25. 프로그램이 최신 원격 기준 branch를 rebase로 반영한다
+26. 프로그램이 전체 검증 스크립트를 실행하고, 실패한 경우에만 출력 내용을 같은 Worker 세션에 전달한다
+27. 검증이 성공하면 읽기 전용 Reviewer를 실행한다
+28. 게시 직전에 최신 base에서 archive 후보를 다시 계산하고 이동 집합이 달라지면 같은 Worker 세션에서 수정한 뒤 검증과 Review를 반복한다
+29. 프로그램이 같은 branch의 기존 PR을 확인하고, 없을 때만 새 PR을 생성한 뒤 SQLite 상태를 PR_OPEN으로 변경한다
+30. 안정된 `PR_OPEN`은 실행 자리를 비우며, 프로그램은 해당 계획에 직접·간접 의존하지 않는 다음 READY를 최신 `origin/<base-branch>`에서 순차적으로 시작한다
 
 ### 실패와 재시도
 
@@ -294,6 +298,9 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 - `docs/requirements/` 바로 아래의 모든 `*.md`를 Planner 입력으로 사용한다
 - `docs/REQUIREMENT.template.md`와 `docs/requirements/archive/`는 Planner 입력에서 제외한다
 - ExecPlan의 `sources`에는 근거가 된 PRODUCT 또는 Requirement 경로가 있어야 한다
+- ExecPlan ID만 Git 선언과 SQLite 실행 이력을 잇는 안정적인 identity다. 같은 ID의 유효한 원격 파일에서 path·title·sources·depends_on·complexity·risk·priority 또는 본문이 바뀌면 현재 cache를 갱신하고 상태·실패 이력·Agent session·branch·worktree·workspace·PR 연결은 보존한다
+- source와 dependency 변경은 같은 reconciliation 결과를 다음 archive 후보·입력 지문·READY 선택에 사용하고 priority 변경은 다음 선택부터 반영한다. complexity·risk 변경은 최초 Worker level을 다시 계산하되 실행 이력이 있는 계획의 effective level과 Review 승격 이력을 낮추지 않는다
+- 현재 path와 title은 compact catalog, 로그·알림과 이후 파일 조회에 사용하지만 기존 PR의 ExecPlan 링크는 최초 게시 SHA와 최초 active path를 계속 사용한다
 - 일반 Planner는 실행 중인 작업과 READY ExecPlan이 모두 없는 선택 시점에만 최신 계획 입력 지문과 비종료 ExecPlan compact catalog를 확인하고, 현재 코드·테스트와 활성 제품 입력에서 식별 가능한 미충족 작업을 한 번에 모두 계획한다. due 유지보수 평가는 같은 입력 지문이어도 활성 작업이 없는 경계에서 먼저 실행한다
 - `docs/FUTURE_IDEAS.md`는 계획 입력 지문, 활성 Requirement와 프로젝트 완료 판정에서 제외하며 그 항목을 자동으로 Requirement 또는 ExecPlan으로 승격하지 않는다
 - MERGED ExecPlan은 Planner 입력에서 제외하며 프로그램만 ID 고유성, 의존성 충족과 감사 이력을 위해 관리한다

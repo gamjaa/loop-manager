@@ -172,22 +172,32 @@ class MaintenancePlanningTest(unittest.TestCase):
     def _insert_plan(self, plan_id: str, title: str, status: str) -> None:
         path = self._path(plan_id, title)
         parsed = loop_manager._parse_execplan(self.repo, path)
+        relative_path = path.relative_to(self.repo).as_posix()
+        content_hash = hashlib.sha256(path.read_bytes()).hexdigest()
         self.connection.execute(
             """
             INSERT INTO exec_plans (
                 repo, plan_id, path, title, sources, depends_on, priority,
-                content_hash, status, plan_sha
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                content_hash, current_complexity, current_risk,
+                current_revision_sha, publication_path,
+                publication_content_hash, publication_sha, status, plan_sha
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(self.repo),
                 plan_id,
-                path.relative_to(self.repo).as_posix(),
+                relative_path,
                 title,
                 json.dumps(parsed["sources"], separators=(",", ":")),
                 json.dumps(parsed["depends_on"], separators=(",", ":")),
                 parsed["priority"],
-                hashlib.sha256(path.read_bytes()).hexdigest(),
+                content_hash,
+                parsed["complexity"],
+                parsed["risk"],
+                self.base_sha,
+                relative_path,
+                content_hash,
+                self.base_sha,
                 status,
                 self.base_sha,
             ),
@@ -310,9 +320,9 @@ class MaintenancePlanningTest(unittest.TestCase):
         mismatched_revision = git(self.repo, "rev-parse", "HEAD")
         self.ready_path.write_text(original, encoding="utf-8")
         self.connection.execute(
-            "UPDATE exec_plans SET plan_sha = ? "
+            "UPDATE exec_plans SET plan_sha = ?, current_revision_sha = ? "
             "WHERE repo = ? AND plan_id = 'G-001'",
-            (mismatched_revision, str(self.repo)),
+            (mismatched_revision, mismatched_revision, str(self.repo)),
         )
         self.connection.commit()
         maintenance_state.MaintenanceRepository(
@@ -711,7 +721,8 @@ class MaintenancePlanningTest(unittest.TestCase):
             plan_commit,
         )
         row = self.connection.execute(
-            "SELECT depends_on, plan_sha FROM exec_plans "
+            "SELECT depends_on, plan_sha, current_revision_sha, publication_sha "
+            "FROM exec_plans "
             "WHERE repo = ? AND plan_id = 'G-001'",
             (str(self.repo),),
         ).fetchone()
@@ -720,6 +731,8 @@ class MaintenancePlanningTest(unittest.TestCase):
         self.assertEqual(repeated, completed)
         self.assertEqual(json.loads(row["depends_on"]), [])
         self.assertEqual(row["plan_sha"], plan_commit)
+        self.assertEqual(row["current_revision_sha"], plan_commit)
+        self.assertEqual(row["publication_sha"], self.base_sha)
 
     def test_publication_requires_latest_single_commit_and_is_atomic_and_idempotent(self):
         context = self._begin_barrier()
@@ -864,7 +877,8 @@ class MaintenancePlanningTest(unittest.TestCase):
             plan_commit,
         )
         rows = self.connection.execute(
-            "SELECT plan_id, depends_on, plan_sha FROM exec_plans "
+            "SELECT plan_id, depends_on, plan_sha, current_revision_sha, "
+            "publication_sha FROM exec_plans "
             "WHERE repo = ? ORDER BY plan_id",
             (str(self.repo),),
         ).fetchall()
@@ -875,6 +889,13 @@ class MaintenancePlanningTest(unittest.TestCase):
         self.assertEqual(cycle.revalidation_plan_ids, ("G-001",))
         self.assertEqual(json.loads(rows[1]["depends_on"]), ["G-000", "G-003"])
         self.assertTrue(all(row["plan_sha"] == plan_commit for row in rows[1:]))
+        self.assertTrue(
+            all(row["current_revision_sha"] == plan_commit for row in rows[1:])
+        )
+        self.assertEqual(rows[1]["publication_sha"], self.base_sha)
+        self.assertTrue(
+            all(row["publication_sha"] == plan_commit for row in rows[2:])
+        )
 
     def test_publication_rejects_body_drift_after_result_validation(self):
         context = self._begin_barrier()
@@ -1098,9 +1119,15 @@ class MaintenancePlanningTest(unittest.TestCase):
         git(self.repo, "commit", "-m", "Record root modules before refactoring")
         old_sha = git(self.repo, "rev-parse", "HEAD")
         self.connection.execute(
-            "UPDATE exec_plans SET content_hash = ?, plan_sha = ? "
+            "UPDATE exec_plans SET content_hash = ?, plan_sha = ?, "
+            "current_revision_sha = ? "
             "WHERE repo = ? AND plan_id = 'G-001'",
-            (loop_manager.file_hash(self.ready_path), old_sha, str(self.repo)),
+            (
+                loop_manager.file_hash(self.ready_path),
+                old_sha,
+                old_sha,
+                str(self.repo),
+            ),
         )
         self.connection.commit()
         repository = maintenance_state.MaintenanceRepository(self.connection)

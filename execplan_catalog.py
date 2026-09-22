@@ -13,7 +13,7 @@ from pathlib import Path, PurePosixPath
 import re
 import stat
 from types import MappingProxyType
-from typing import Mapping
+from typing import AbstractSet, Mapping
 
 
 PRIORITIES = frozenset({"critical", "high", "normal", "low"})
@@ -22,6 +22,31 @@ _ACTIVE_PATH = re.compile(r"docs/plans/\[(G-\d{3,})\] [^/]+\.md")
 _ARCHIVED_PATH = re.compile(
     r"docs/plans/archive/\[(G-\d{3,})\] [^/]+\.md"
 )
+
+
+class ExecPlanCatalogError(RuntimeError):
+    """A catalog validation error tied to the remote file that caused it."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        path: str | None = None,
+        source: str | None = None,
+        related_paths: tuple[str, ...] = (),
+    ):
+        super().__init__(message)
+        self.code = code
+        self.path = path
+        self.source = source
+        self.related_paths = tuple(
+            dict.fromkeys(
+                item
+                for item in (path, source, *related_paths)
+                if item is not None
+            )
+        )
 
 
 def parse_frontmatter(text: str) -> dict[str, object]:
@@ -183,11 +208,40 @@ class ExecPlanCatalogEntry:
 
 
 @dataclass(frozen=True)
+class ExecPlanDefinition:
+    """One validated definition pinned to an immutable base revision."""
+
+    entry: ExecPlanCatalogEntry
+    revision_sha: str
+
+    @property
+    def plan_id(self) -> str:
+        return self.entry.plan_id
+
+    @property
+    def path(self) -> str:
+        return self.entry.path
+
+    @property
+    def title(self) -> str:
+        return self.entry.title
+
+    @property
+    def sources(self) -> tuple[str, ...]:
+        return self.entry.sources
+
+    @property
+    def depends_on(self) -> tuple[str, ...]:
+        return self.entry.depends_on
+
+
+@dataclass(frozen=True)
 class ExecPlanCatalogSnapshot:
     """A full identity graph with separate executable and historical views."""
 
     active: Mapping[str, ExecPlanCatalogEntry]
     archived: Mapping[str, ExecPlanCatalogEntry]
+    revision_sha: str | None = None
 
     @property
     def historical(self) -> Mapping[str, ExecPlanCatalogEntry]:
@@ -212,6 +266,16 @@ class ExecPlanCatalogSnapshot:
         return {
             plan_id: entry.metadata() for plan_id, entry in self.active.items()
         }
+
+    def definitions(self) -> Mapping[str, ExecPlanDefinition]:
+        if self.revision_sha is None:
+            raise RuntimeError("ExecPlan catalog snapshot에 revision SHA가 없습니다.")
+        return MappingProxyType(
+            {
+                plan_id: ExecPlanDefinition(entry, self.revision_sha)
+                for plan_id, entry in self.all.items()
+            }
+        )
 
 
 def _entry(relative_path: str, text: str, values: Mapping[str, object]) -> ExecPlanCatalogEntry:
@@ -274,12 +338,25 @@ def snapshot_from_documents(
     root: Path | None = None,
     validate_sources: bool = False,
     allow_archive_fallback: bool = True,
+    available_regular_paths: AbstractSet[str] | None = None,
+    invalid_plan_entries: Mapping[str, str] | None = None,
+    revision_sha: str | None = None,
 ) -> ExecPlanCatalogSnapshot:
     """Build a snapshot from already-read regular-file documents.
 
     Callers that read Git trees can use this API without making the parser
     aware of Git.  Nested paths are ignored by the exact path expressions.
     """
+
+    if invalid_plan_entries:
+        relative_path = sorted(invalid_plan_entries)[0]
+        kind = invalid_plan_entries[relative_path]
+        raise ExecPlanCatalogError(
+            f"ExecPlan은 원격 revision의 일반 파일이어야 합니다: "
+            f"{relative_path} ({kind})",
+            code="non-regular-plan",
+            path=relative_path,
+        )
 
     active: dict[str, ExecPlanCatalogEntry] = {}
     archived: dict[str, ExecPlanCatalogEntry] = {}
@@ -297,36 +374,97 @@ def snapshot_from_documents(
         try:
             text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
         except UnicodeDecodeError as error:
-            raise RuntimeError(
-                f"ExecPlan 파일이 UTF-8이 아닙니다: {relative_path}"
+            raise ExecPlanCatalogError(
+                f"ExecPlan 파일이 UTF-8이 아닙니다: {relative_path}",
+                code="invalid-encoding",
+                path=relative_path,
             ) from error
-        values = parse_execplan_text(
-            relative_path,
-            text,
-            root=root,
-            validate_sources=validate_sources,
-            allow_archive_fallback=allow_archive_fallback,
-        )
+        try:
+            values = parse_execplan_text(
+                relative_path,
+                text,
+                root=root,
+                validate_sources=(
+                    validate_sources and available_regular_paths is None
+                ),
+                allow_archive_fallback=allow_archive_fallback,
+            )
+        except RuntimeError as error:
+            raise ExecPlanCatalogError(
+                f"ExecPlan 파일이 유효하지 않습니다: {relative_path} ({error})",
+                code="invalid-plan",
+                path=relative_path,
+            ) from error
         entry = _entry(relative_path, text, values)
+        if validate_sources and available_regular_paths is not None:
+            for source in entry.sources:
+                exists = source in available_regular_paths
+                archived_source = None
+                if source != "docs/PRODUCT.md":
+                    archived_source = requirement_archive_path(source)
+                    exists = exists or bool(
+                        allow_archive_fallback
+                        and archived_source in available_regular_paths
+                    )
+                if not exists:
+                    raise ExecPlanCatalogError(
+                        "존재하지 않는 ExecPlan source입니다: "
+                        f"{source} ({relative_path})",
+                        code="missing-source",
+                        path=relative_path,
+                        source=source,
+                        related_paths=(
+                            (archived_source,) if archived_source else ()
+                        ),
+                    )
         all_entries = {**active, **archived}
         if entry.plan_id in all_entries:
-            raise RuntimeError(f"중복 ExecPlan id입니다: {entry.plan_id}")
+            other = all_entries[entry.plan_id]
+            raise ExecPlanCatalogError(
+                f"중복 ExecPlan id입니다: {entry.plan_id} "
+                f"({other.path}, {relative_path})",
+                code="duplicate-id",
+                path=relative_path,
+                related_paths=(other.path,),
+            )
         filename = PurePosixPath(relative_path).name
         if filename in filenames:
-            raise RuntimeError(
+            raise ExecPlanCatalogError(
                 "중복 ExecPlan 파일명입니다: "
-                f"{filename} ({filenames[filename]}, {relative_path})"
+                f"{filename} ({filenames[filename]}, {relative_path})",
+                code="duplicate-path",
+                path=relative_path,
+                related_paths=(filenames[filename],),
             )
         filenames[filename] = relative_path
         (archived if entry.archived else active)[entry.plan_id] = entry
 
     combined = {**active, **archived}
     combined = dict(sorted(combined.items(), key=lambda item: int(item[0][2:])))
-    _validate_full_graph(combined)
+    try:
+        _validate_full_graph(combined)
+    except RuntimeError as error:
+        message = str(error)
+        mentioned = tuple(
+            entry.path
+            for plan_id, entry in combined.items()
+            if plan_id in message
+        )
+        raise ExecPlanCatalogError(
+            message,
+            code=(
+                "dependency-cycle"
+                if "순환" in message
+                else "missing-dependency"
+            ),
+            path=(mentioned[0] if mentioned else None),
+            related_paths=mentioned[1:],
+        ) from error
     sort_key = lambda item: int(item[0][2:])
     return ExecPlanCatalogSnapshot(
         active=MappingProxyType(dict(sorted(active.items(), key=sort_key))),
         archived=MappingProxyType(dict(sorted(archived.items(), key=sort_key))),
+        revision_sha=revision_sha,
     )
 
 
