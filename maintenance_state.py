@@ -188,10 +188,23 @@ class MaintenanceRepository:
         ensure_schema(connection)
 
     def _merged_count(self, repo: str) -> int:
+        history_exists = self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'execplan_catalog_history'"
+        ).fetchone()
+        history_gate = ""
+        if history_exists is not None:
+            history_gate = (
+                " AND NOT EXISTS ("
+                "SELECT 1 FROM execplan_catalog_history h "
+                "WHERE h.repo = exec_plans.repo "
+                "AND h.plan_id = exec_plans.plan_id "
+                "AND h.merge_confirmed = 0)"
+            )
         return int(
             self.connection.execute(
                 "SELECT COUNT(*) FROM exec_plans "
-                "WHERE repo = ? AND status = 'MERGED'",
+                "WHERE repo = ? AND status = 'MERGED'" + history_gate,
                 (repo,),
             ).fetchone()[0]
         )
