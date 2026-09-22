@@ -334,6 +334,176 @@ class MaintenanceRepository:
             )
             return self.get(repo), True
 
+    def record_publication_intent(
+        self,
+        repo: str,
+        *,
+        expected_phase: MaintenancePhase,
+        expected_revision: int,
+        base_sha: str,
+        commit_sha: str,
+    ) -> MaintenanceCycle:
+        """Persist a recoverable local batch before its remote push."""
+
+        if (
+            re.fullmatch(r"[0-9a-fA-F]{7,64}", base_sha) is None
+            or re.fullmatch(r"[0-9a-fA-F]{7,64}", commit_sha) is None
+            or base_sha == commit_sha
+        ):
+            raise MaintenanceStateError(
+                "유지보수 publication 기준과 commit SHA가 유효하지 않습니다."
+            )
+        expected = ("prepared", base_sha, commit_sha, None)
+        with _transaction(self.connection):
+            state = self.get(repo)
+            if (
+                state.phase is not expected_phase
+                or state.revision != expected_revision
+            ):
+                raise MaintenanceStateError(
+                    "유지보수 주기 단계 또는 revision이 변경됐습니다."
+                )
+            current = (
+                state.publication_stage,
+                state.publication_base_sha,
+                state.publication_commit_sha,
+                state.publication_remote_oid,
+            )
+            if current == expected:
+                return state
+            if any(value is not None for value in current):
+                raise MaintenanceStateError(
+                    "다른 유지보수 publication batch가 이미 보존돼 있습니다."
+                )
+            cursor = self.connection.execute(
+                """
+                UPDATE maintenance_cycles
+                SET publication_stage = 'prepared',
+                    publication_base_sha = ?,
+                    publication_commit_sha = ?,
+                    publication_remote_oid = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE repo = ? AND phase = ? AND revision = ?
+                  AND publication_stage IS NULL
+                  AND publication_base_sha IS NULL
+                  AND publication_commit_sha IS NULL
+                  AND publication_remote_oid IS NULL
+                """,
+                (
+                    base_sha,
+                    commit_sha,
+                    repo,
+                    expected_phase.value,
+                    expected_revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise MaintenanceStateError(
+                    "유지보수 publication intent를 보존할 수 없습니다."
+                )
+            return self.get(repo)
+
+    def restart_unpublished_batch(
+        self,
+        repo: str,
+        *,
+        expected: MaintenanceCycle,
+        new_base_sha: str,
+    ) -> MaintenanceCycle:
+        """Invalidate one unpushed intent while retaining its maintenance phase.
+
+        The caller must first prove from Git that the remote advanced without
+        publishing this batch. Revision comparison invalidates old contexts.
+        """
+        if (
+            expected.repo != repo
+            or expected.phase not in {
+                MaintenancePhase.ASSESSMENT,
+                MaintenancePhase.POST_REFACTOR_REVALIDATION,
+            }
+            or expected.publication_stage != "prepared"
+            or not expected.publication_base_sha
+            or not expected.publication_commit_sha
+            or expected.publication_remote_oid is not None
+            or re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", new_base_sha) is None
+            or new_base_sha in {
+                expected.publication_base_sha, expected.publication_commit_sha
+            }
+        ):
+            raise MaintenanceStateError("재시작할 미게시 publication intent가 유효하지 않습니다.")
+        with _transaction(self.connection):
+            if self.get(repo) != expected:
+                raise MaintenanceStateError("유지보수 주기 단계 또는 revision이 변경됐습니다.")
+            self.connection.execute(
+                """
+                UPDATE maintenance_cycles
+                SET cycle_base_sha = ?, publication_stage = NULL,
+                    publication_base_sha = NULL, publication_commit_sha = NULL,
+                    publication_remote_oid = NULL, revision = revision + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE repo = ? AND phase = ? AND revision = ?
+                """,
+                (new_base_sha, repo, expected.phase.value, expected.revision),
+            )
+            return self.get(repo)
+
+    def restart_stale_planning_context(
+        self,
+        repo: str,
+        *,
+        expected: MaintenanceCycle,
+        new_base_sha: str,
+    ) -> MaintenanceCycle:
+        """Move an intent-free planning stage to a newer remote base.
+
+        Incrementing the revision invalidates every context created from the
+        stale base. The active phase and its recorded plan sets are preserved
+        so the caller can create a fresh planning worktree for the same stage.
+        """
+
+        publication = (
+            expected.publication_stage,
+            expected.publication_base_sha,
+            expected.publication_commit_sha,
+            expected.publication_remote_oid,
+        )
+        if (
+            expected.repo != repo
+            or expected.phase not in {
+                MaintenancePhase.ASSESSMENT,
+                MaintenancePhase.POST_REFACTOR_REVALIDATION,
+            }
+            or any(value is not None for value in publication)
+            or re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", new_base_sha)
+            is None
+        ):
+            raise MaintenanceStateError(
+                "재시작할 intent-free 유지보수 planning context가 유효하지 않습니다."
+            )
+        with _transaction(self.connection):
+            if self.get(repo) != expected:
+                raise MaintenanceStateError(
+                    "유지보수 주기 단계 또는 revision이 변경됐습니다."
+                )
+            cursor = self.connection.execute(
+                """
+                UPDATE maintenance_cycles
+                SET cycle_base_sha = ?, revision = revision + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE repo = ? AND phase = ? AND revision = ?
+                  AND publication_stage IS NULL
+                  AND publication_base_sha IS NULL
+                  AND publication_commit_sha IS NULL
+                  AND publication_remote_oid IS NULL
+                """,
+                (new_base_sha, repo, expected.phase.value, expected.revision),
+            )
+            if cursor.rowcount != 1:
+                raise MaintenanceStateError(
+                    "stale 유지보수 planning context를 재시작할 수 없습니다."
+                )
+            return self.get(repo)
+
     def transition(
         self,
         repo: str,

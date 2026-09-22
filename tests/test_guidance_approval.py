@@ -748,6 +748,7 @@ Patch:
             repo, _plan_path = repository(Path(directory))
             incidental_path = "docs/plans/[G-030] Boundary.md"
             explicit_path = "docs/plans/[G-031] Contract.md"
+            conjunctive_path = "docs/plans/[G-032] Maintenance Contract.md"
             (repo / incidental_path).write_text(
                 "## Acceptance Criteria\n\n"
                 "- 후속 계획의 공통 `docs/PLANS.md` 변경을 구분하는 경계를 제공한다.\n",
@@ -758,7 +759,12 @@ Patch:
                 "- 공통 `docs/PLANS.md`에 guidance 계약을 문서화한다.\n",
                 encoding="utf-8",
             )
-            git(repo, "add", incidental_path, explicit_path)
+            (repo / conjunctive_path).write_text(
+                "## Acceptance Criteria\n\n"
+                "- 공통 `docs/PLANS.md`와 Planner prompt는 유지보수 예외를 설명한다.\n",
+                encoding="utf-8",
+            )
+            git(repo, "add", incidental_path, explicit_path, conjunctive_path)
             git(repo, "commit", "-m", "Add plan scope fixtures")
             plan_sha = git(repo, "rev-parse", "HEAD")
 
@@ -773,6 +779,12 @@ Patch:
                     loop_manager._published_plan_allows_common_plans(
                         repo,
                         {"plan_sha": plan_sha, "path": explicit_path},
+                    )
+                )
+                self.assertTrue(
+                    loop_manager._published_plan_allows_common_plans(
+                        repo,
+                        {"plan_sha": plan_sha, "path": conjunctive_path},
                     )
                 )
             with mock.patch("loop_manager.is_loop_manager_repository", return_value=False):

@@ -68,3 +68,37 @@ priority: normal
 - barrier mode는 기계적으로 dependency 추가만 허용하고, 더 넓은 본문 개정은 실제 리팩터링 Merge 뒤 revalidation mode에서만 허용한다.
 - base push와 SQLite 사이 중단이 기존 계획 파일과 catalog row를 어긋나게 만들 수 있으므로 새 계획 등록과 개정 계획 갱신을 하나의 복구 가능한 publication 단위로 취급한다.
 - origin-only planning 및 사용자 기본 worktree 비간섭 경계를 재사용하기 위해 G-022 뒤에 구현한다.
+
+### Review follow-up: publication recovery and validation boundaries
+
+- prepared intent 뒤 원격 base가 이동한 경우 Git ancestry와 batch 경로를 대조해 미게시를 확인하고, 같은 유지보수 단계를 유지한 채 intent 해제와 revision 증가를 transaction으로 수행한다. 기존 planning worktree는 보존하고 최신 cycle_base_sha에서 새 context를 생성한다.
+- Acceptance Criteria의 경로는 정규식 대신 계획의 게시 revision과 현재 평가 기준 revision의 Git 파일 목록으로 확인한다. `loop_manager.py`, `managed_config.py`, `config.json` 같은 루트 파일의 이동도 허용하며, Git 파일로 확인되지 않는 `api.v1`, `feature.enabled` 같은 의미 식별자 변경과 untracked 파일로 만든 경로 증거는 거부한다. Git 조회는 Planner 결과 오류 변환 범위 밖에서 수행해 운영 오류가 correction retry를 소비하지 않도록 한다.
+- 경로 존재만으로 의미 보존을 인정하지 않는다. 이전·현재 Git tree에서 유일한 동일 blob의 삭제→추가 쌍만 이동 근거로 사용하고, 새 경로를 해당 원래 경로로 되돌려 Acceptance Criteria 전체를 비교한다. 무관한 기존 `auth.py`→`billing.py` 교체 및 서로 다른 이동 대상 간 교체를 거부하는 회귀 검증을 추가했다. 내용 변경·중복 blob 등으로 이동을 확정할 수 없는 경우에는 자동 개정을 거부한다.
+- targeted 검증: `python3 -m unittest tests.test_maintenance_planning` — 12 tests, OK.
+- 미해결 Review 항목: `docs/PLANS.md::maintenance-planner-contract::missing-required-documentation`. 이번 Worker 지시가 docs/PLANS.md 수정을 명시적으로 금지하므로 해당 파일은 보존했다. 공통 계약에 일반 Planner의 기존 파일 수정 금지, SQLite 단계·snapshot에 한정된 maintenance barrier/revalidation 예외와 사용자 직접 편집과의 구분을 추가할 권한이 필요하다. 이 항목과 전체 verify/Review가 해결되기 전에는 ExecPlan 완료로 처리하지 않는다.
+
+### Agent Guidance Proposal: maintenance-ready-revision-scope
+Target: `AGENTS.md`
+Scope: `common`
+Reason: G-028의 maintenance barrier와 post-refactor revalidation은 기존 READY ExecPlan의 제한된 개정을 요구하지만 공통 Planner 규칙은 기존 ExecPlan 수정을 예외 없이 금지한다. 실제 Planner scope 검증과 Agent 지시가 같은 권한 경계를 갖도록 공통 규칙에 명시적인 예외가 필요하다.
+Impact: 적용하지 않으면 유지보수 Planner가 AGENTS.md를 준수하면서 장벽 dependency 또는 사후 구조 개정을 작성할 수 없으며, 코드의 scope 예외만 추가해도 공통 지시와 런타임 권한이 충돌한다. 승인 대기 중에는 Review의 scope, 영속 publication 복구와 재검증 의미 보존 지적을 해결한 것으로 처리하지 않는다. docs/PLANS.md 계약 추가도 이번 Worker 수정 범위에서 제외됐으므로 별도 사용자 정리가 필요하며 이 제안은 그 파일의 수정 권한을 요청하지 않는다.
+Patch:
+```diff
+diff --git a/AGENTS.md b/AGENTS.md
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -31,3 +31,5 @@
+ 
+-Planner는 새 `docs/plans/*.md`를 생성하고, 현재 PRODUCT/Requirement 범위 밖이지만 보존 가치가 있는 아이디어만 `docs/FUTURE_IDEAS.md`에 생성하거나 수정할 수 있다. 기존 ExecPlan을 수정·삭제하거나 그 밖의 파일을 변경하지 않는다.
++일반 Planner는 새 `docs/plans/*.md`를 생성하고, 현재 PRODUCT/Requirement 범위 밖이지만 보존 가치가 있는 아이디어만 `docs/FUTURE_IDEAS.md`에 생성하거나 수정할 수 있다. 기존 ExecPlan을 수정·삭제하거나 그 밖의 파일을 변경하지 않는다.
++예외적으로 프로그램이 SQLite의 활성 유지보수 단계에서 명시한 barrier 또는 post-refactor revalidation mode와 대상 snapshot을 제공한 경우에만, 유지보수 Planner는 상태가 READY이고 branch, worktree, workspace reservation, Worker·Reviewer session과 PR이 없는 기존 ExecPlan을 개정할 수 있다. barrier mode는 기존 metadata·본문·dependency를 보존하고 검증된 리팩터링 DAG의 모든 말단 ID만 depends_on에 추가한다. revalidation mode는 ID·경로·title·sources·Purpose와 원래 제품 목표 및 범위를 보존하면서 최신 구조에 필요한 Acceptance Criteria의 경로 표현, Implementation, Validation, Progress, Decision Log와 dependency만 개정하며 목표 보존을 확정할 수 없는 변경은 거부한다.
++유지보수 Planner도 기존 파일의 삭제·이름 변경, 대상 snapshot 밖 계획의 수정 및 AGENTS.md 변경을 할 수 없다. 이 예외는 일반 Planner 권한이나 사용자의 직접 문서 편집 규칙을 변경하지 않는다.
+ Planner는 `docs/FUTURE_IDEAS.md`의 항목을 같은 계획 주기의 ExecPlan 범위나 현재 미충족 작업의 근거로 사용하지 않는다.
+```
+
+### Agent Guidance User Decision: maintenance-ready-revision-scope
+Decision: `approve`
+Revision: `user-approved-2026-09-21-01`
+Patch:
+```diff
+```

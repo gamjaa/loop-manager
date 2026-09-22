@@ -42,6 +42,18 @@ from guidance_approval import (
 from managed_config import ManagedConfig, ManagedConfigError, load_managed_config
 import notifications
 import project_registry
+from maintenance_planning import (
+    MaintenancePlanMode,
+    MaintenancePlanningContext,
+    MaintenancePlanningError,
+    MaintenancePlanningRestart,
+    PlanRevision,
+    ReadyPlanSnapshot,
+    terminal_new_plan_ids,
+    validate_barrier_revision,
+    validate_refactoring_plan,
+    validate_revalidation_revision,
+)
 import maintenance_state
 
 
@@ -1527,6 +1539,9 @@ class ValidatedPlanningResult:
 
     plans: tuple[tuple[str, dict[str, object]], ...]
     publication_paths: tuple[str, ...]
+    publication_hashes: tuple[tuple[str, str], ...] = ()
+    revisions: tuple[PlanRevision, ...] = ()
+    maintenance_context: MaintenancePlanningContext | None = None
 
 
 _FUTURE_IDEA_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.+?)\s*$")
@@ -1681,8 +1696,511 @@ def validate_planner_result(
                 sorted(plans, key=lambda item: int(str(item[1]["id"])[2:]))
             ),
             publication_paths=tuple(planned_files),
+            publication_hashes=tuple(
+                (path, file_hash(worktree / path)) for path in planned_files
+            ),
         )
     except RuntimeError as error:
+        raise PlannerValidationError(str(error)) from error
+
+
+def _stored_string_list(value: object, field: str) -> tuple[str, ...]:
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, json.JSONDecodeError) as error:
+        raise MaintenancePlanningError(
+            f"{field} catalog 값이 올바른 JSON 배열이 아닙니다."
+        ) from error
+    if not isinstance(parsed, list) or any(
+        not isinstance(item, str) for item in parsed
+    ):
+        raise MaintenancePlanningError(
+            f"{field} catalog 값에는 문자열 배열이 필요합니다."
+        )
+    return tuple(parsed)
+
+
+def _ready_plan_snapshot_from_contents(
+    row: sqlite3.Row,
+    contents: bytes,
+) -> ReadyPlanSnapshot:
+    plan_id = str(row["plan_id"])
+    path = str(row["path"])
+    ownership = {
+        "branch": row["branch"],
+        "worktree": row["worktree"],
+        "workspace reservation": int(row["workspace_owned"] or 0),
+        "Worker session": row["worker_session_id"],
+        "Reviewer session": row["reviewer_session_id"],
+        "PR URL": row["pr_url"],
+        "PR head": row["pr_head_oid"],
+        "PR conflict recovery": int(row["pr_conflict_recovery"] or 0),
+        "PR conflict head": row["pr_conflict_head_oid"],
+        "PR conflict base": row["pr_conflict_base_oid"],
+    }
+    owned = [
+        name
+        for name, value in ownership.items()
+        if value is not None and value != 0
+    ]
+    if str(row["status"]) != "READY" or owned:
+        detail = ", ".join(owned) if owned else str(row["status"])
+        raise MaintenancePlanningError(
+            f"유지보수 개정 대상은 무소유 READY 계획이어야 합니다: {plan_id} ({detail})"
+        )
+    plan_sha = str(row["plan_sha"] or "")
+    if re.fullmatch(r"[0-9a-fA-F]{7,64}", plan_sha) is None:
+        raise MaintenancePlanningError(
+            f"계획 revision SHA를 확인할 수 없습니다: {plan_id}"
+        )
+    content_hash = hashlib.sha256(contents).hexdigest()
+    if content_hash != str(row["content_hash"]):
+        raise MaintenancePlanningError(
+            f"READY ExecPlan content hash가 catalog와 다릅니다: {path}"
+        )
+    try:
+        text = contents.decode("utf-8")
+        plan = published_execplan(path, text)
+    except (RuntimeError, UnicodeError) as error:
+        raise MaintenancePlanningError(str(error)) from error
+    sources = _stored_string_list(row["sources"], "sources")
+    dependencies = _stored_string_list(row["depends_on"], "depends_on")
+    if (
+        re.fullmatch(r"G-\d{3,}", str(plan["id"])) is None
+        or str(plan["id"]) != plan_id
+        or str(plan["title"]) != str(row["title"])
+        or tuple(str(item) for item in plan["sources"]) != sources
+        or tuple(str(item) for item in plan["depends_on"]) != dependencies
+        or str(plan["priority"]) != str(row["priority"])
+    ):
+        raise MaintenancePlanningError(
+            f"READY ExecPlan metadata가 catalog와 다릅니다: {path}"
+        )
+    return ReadyPlanSnapshot(
+        plan_id=plan_id,
+        path=path,
+        title=str(plan["title"]),
+        sources=sources,
+        depends_on=dependencies,
+        complexity=str(plan["complexity"]),
+        risk=str(plan["risk"]),
+        priority=str(plan["priority"]),
+        content_hash=content_hash,
+        plan_sha=plan_sha,
+        text=text,
+    )
+
+
+def _assert_ready_plan_revision(
+    repository: Path,
+    active_revision: str,
+    snapshot: ReadyPlanSnapshot,
+    contents: bytes,
+) -> None:
+    """Bind a READY row to the Git revision that published its exact body."""
+
+    try:
+        is_ancestor = _git_commit_is_ancestor(
+            repository, snapshot.plan_sha, active_revision
+        )
+        revision_contents = git_bytes(
+            repository, "show", f"{snapshot.plan_sha}:{snapshot.path}"
+        )
+    except RuntimeError as error:
+        raise MaintenancePlanningError(
+            "READY ExecPlan plan revision SHA를 확인할 수 없습니다: "
+            f"{snapshot.plan_id}"
+        ) from error
+    if not is_ancestor or revision_contents != contents:
+        raise MaintenancePlanningError(
+            "READY ExecPlan plan revision SHA가 현재 catalog 본문과 "
+            f"일치하지 않습니다: {snapshot.plan_id}"
+        )
+
+
+def _ready_plan_snapshot(
+    worktree: Path,
+    active_sha: str,
+    row: sqlite3.Row,
+) -> ReadyPlanSnapshot:
+    path = str(row["path"])
+    target = worktree / path
+    if not target.is_file():
+        raise MaintenancePlanningError(
+            f"READY ExecPlan 파일을 확인할 수 없습니다: {path}"
+        )
+    contents = target.read_bytes()
+    try:
+        base_contents = git_bytes(worktree, "show", f"{active_sha}:{path}")
+    except RuntimeError as error:
+        raise MaintenancePlanningError(
+            f"평가 기준 revision에서 READY ExecPlan을 확인할 수 없습니다: {path}"
+        ) from error
+    if contents != base_contents:
+        raise MaintenancePlanningError(
+            f"READY ExecPlan 파일이 평가 기준 revision과 다릅니다: {path}"
+        )
+    snapshot = _ready_plan_snapshot_from_contents(row, contents)
+    _assert_ready_plan_revision(worktree, active_sha, snapshot, contents)
+    return snapshot
+
+
+def _ready_plan_snapshot_at_revision(
+    repository: Path,
+    revision: str,
+    row: sqlite3.Row,
+) -> ReadyPlanSnapshot:
+    path = str(row["path"])
+    try:
+        contents = git_bytes(repository, "show", f"{revision}:{path}")
+    except RuntimeError as error:
+        raise MaintenancePlanningError(
+            f"보존된 publication 기준에서 READY ExecPlan을 확인할 수 없습니다: {path}"
+        ) from error
+    snapshot = _ready_plan_snapshot_from_contents(row, contents)
+    _assert_ready_plan_revision(repository, revision, snapshot, contents)
+    return snapshot
+
+
+def _maintenance_mode_and_rows(
+    connection: sqlite3.Connection,
+    repo: str,
+    cycle: maintenance_state.MaintenanceCycle,
+    active_sha: str,
+) -> tuple[MaintenancePlanMode, list[sqlite3.Row]]:
+    if cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT:
+        if cycle.cycle_base_sha != active_sha:
+            raise MaintenancePlanningError(
+                "유지보수 assessment 기준 SHA가 planning worktree 기준과 "
+                "일치하지 않습니다."
+            )
+        rows = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND status = 'READY' "
+            "ORDER BY plan_id",
+            (repo,),
+        ).fetchall()
+        return MaintenancePlanMode.BARRIER, list(rows)
+    if cycle.phase is maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION:
+        rows = []
+        for plan_id in cycle.revalidation_plan_ids:
+            row = connection.execute(
+                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+                (repo, plan_id),
+            ).fetchone()
+            if row is None:
+                raise MaintenancePlanningError(
+                    f"재검증 대상 계획이 catalog에 없습니다: {plan_id}"
+                )
+            rows.append(row)
+        return MaintenancePlanMode.REVALIDATION, rows
+    raise MaintenancePlanningError(
+        "활성 유지보수 assessment 또는 post-refactor revalidation 단계가 "
+        "없어 기존 ExecPlan 수정 권한을 열 수 없습니다."
+    )
+
+
+def _maintenance_context(
+    repo: str,
+    active_sha: str,
+    cycle: maintenance_state.MaintenanceCycle,
+    mode: MaintenancePlanMode,
+    snapshots: tuple[ReadyPlanSnapshot, ...],
+) -> MaintenancePlanningContext:
+    return MaintenancePlanningContext(
+        repo=repo,
+        mode=mode,
+        active_sha=active_sha,
+        cycle_revision=cycle.revision,
+        cycle_phase=cycle.phase.value,
+        eligible_plans=snapshots,
+    )
+
+
+def prepare_maintenance_planning_context(
+    connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+    active_sha: str,
+) -> MaintenancePlanningContext:
+    """Bind guarded Planner authority to one active SQLite cycle revision."""
+
+    cycle = maintenance_state.MaintenanceRepository(connection).get(repo)
+    mode, rows = _maintenance_mode_and_rows(
+        connection, repo, cycle, active_sha
+    )
+    snapshots = tuple(
+        _ready_plan_snapshot(worktree, active_sha, row) for row in rows
+    )
+    return _maintenance_context(repo, active_sha, cycle, mode, snapshots)
+
+
+def _maintenance_context_at_revision(
+    connection: sqlite3.Connection,
+    repo: str,
+    repository: Path,
+    active_sha: str,
+    cycle: maintenance_state.MaintenanceCycle,
+) -> MaintenancePlanningContext:
+    mode, rows = _maintenance_mode_and_rows(
+        connection, repo, cycle, active_sha
+    )
+    snapshots = tuple(
+        _ready_plan_snapshot_at_revision(repository, active_sha, row)
+        for row in rows
+    )
+    return _maintenance_context(repo, active_sha, cycle, mode, snapshots)
+
+
+def _assert_maintenance_context_current(
+    connection: sqlite3.Connection,
+    context: MaintenancePlanningContext,
+) -> None:
+    cycle = maintenance_state.MaintenanceRepository(connection).get(context.repo)
+    if cycle.phase.value != context.cycle_phase or cycle.revision != context.cycle_revision:
+        raise MaintenancePlanningError(
+            "유지보수 주기 단계 또는 revision이 Planner 실행 뒤 변경됐습니다."
+        )
+    if cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT:
+        expected_mode = MaintenancePlanMode.BARRIER
+        expected_plan_ids = tuple(
+            str(row[0])
+            for row in connection.execute(
+                "SELECT plan_id FROM exec_plans "
+                "WHERE repo = ? AND status = 'READY' ORDER BY plan_id",
+                (context.repo,),
+            )
+        )
+    elif cycle.phase is maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION:
+        expected_mode = MaintenancePlanMode.REVALIDATION
+        expected_plan_ids = cycle.revalidation_plan_ids
+    else:
+        raise MaintenancePlanningError(
+            "현재 유지보수 단계에는 기존 ExecPlan 수정 권한이 없습니다."
+        )
+    context_plan_ids = tuple(plan.plan_id for plan in context.eligible_plans)
+    if context.mode is not expected_mode or context_plan_ids != expected_plan_ids:
+        raise MaintenancePlanningError(
+            "maintenance mode 또는 eligible READY snapshot이 SQLite 단계와 "
+            "일치하지 않습니다."
+        )
+    for snapshot in context.eligible_plans:
+        row = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+            (context.repo, snapshot.plan_id),
+        ).fetchone()
+        if row is None:
+            raise MaintenancePlanningError(
+                f"READY snapshot 계획이 catalog에서 사라졌습니다: {snapshot.plan_id}"
+            )
+        ownership_values = (
+            row["branch"],
+            row["worktree"],
+            int(row["workspace_owned"] or 0),
+            row["worker_session_id"],
+            row["reviewer_session_id"],
+            row["pr_url"],
+            row["pr_head_oid"],
+            int(row["pr_conflict_recovery"] or 0),
+            row["pr_conflict_head_oid"],
+            row["pr_conflict_base_oid"],
+        )
+        current = (
+            str(row["status"]),
+            str(row["path"]),
+            str(row["title"]),
+            _stored_string_list(row["sources"], "sources"),
+            _stored_string_list(row["depends_on"], "depends_on"),
+            str(row["priority"]),
+            str(row["content_hash"]),
+            str(row["plan_sha"] or ""),
+            ownership_values,
+        )
+        expected = (
+            "READY",
+            snapshot.path,
+            snapshot.title,
+            snapshot.sources,
+            snapshot.depends_on,
+            snapshot.priority,
+            snapshot.content_hash,
+            snapshot.plan_sha,
+            (None, None, 0, None, None, None, None, 0, None, None),
+        )
+        if current != expected:
+            raise MaintenancePlanningError(
+                "READY snapshot의 상태, metadata 또는 소유권이 변경됐습니다: "
+                f"{snapshot.plan_id}"
+            )
+
+
+def validate_maintenance_planner_result(
+    connection: sqlite3.Connection,
+    context: MaintenancePlanningContext,
+    worktree: Path,
+    dirty_files: list[str],
+) -> ValidatedPlanningResult | None:
+    """Validate output without consuming correction retries on Git failures."""
+
+    # Read Git outside the output-validation boundary. A tree query distinguishes
+    # absent paths from an unreadable repository without interpreting cat-file's
+    # nonzero status as proof that a path is new.
+    planned_files = sorted(
+        set(dirty_files) | set(changed_files(worktree, context.active_sha))
+    )
+    base_paths = _git_tree_entries(worktree, context.active_sha)
+    path_moves_by_sha: dict[str, dict[str, str]] = {}
+    if context.mode is MaintenancePlanMode.REVALIDATION:
+        for snapshot in context.eligible_plans:
+            if snapshot.path not in planned_files:
+                continue
+            if snapshot.plan_sha not in path_moves_by_sha:
+                tree = _git_tree_entries(worktree, snapshot.plan_sha)
+                # Only unique, byte-identical deleted -> added files establish
+                # a move. Similarity, copies and ambiguous replacements cannot
+                # prove preservation of the original acceptance criterion.
+                old_blobs: dict[bytes, list[bytes]] = {}
+                new_blobs: dict[bytes, list[bytes]] = {}
+                for entries, grouped in ((tree, old_blobs), (base_paths, new_blobs)):
+                    for name, (kind, oid) in entries.items():
+                        if kind == b"blob":
+                            grouped.setdefault(oid, []).append(name)
+                moves = {}
+                for oid, old_names in old_blobs.items():
+                    new_names = new_blobs.get(oid, [])
+                    if len(old_names) == len(new_names) == 1:
+                        old, new = old_names[0], new_names[0]
+                        if old not in base_paths and new not in tree:
+                            moves[old.decode("utf-8")] = new.decode("utf-8")
+                path_moves_by_sha[snapshot.plan_sha] = moves
+    try:
+        _assert_maintenance_context_current(connection, context)
+        if not planned_files:
+            return None
+        eligible = context.eligible_by_path
+        planned_contents: dict[str, tuple[bytes, str]] = {}
+        new_paths: list[str] = []
+        revised_paths: list[str] = []
+        for path in planned_files:
+            if not re.fullmatch(r"docs/plans/[^/]+\.md", path):
+                raise MaintenancePlanningError(
+                    "유지보수 Planner는 검증된 docs/plans batch만 변경할 수 있습니다."
+                )
+            if not (worktree / path).is_file():
+                raise MaintenancePlanningError(
+                    f"유지보수 Planner는 ExecPlan을 삭제·rename할 수 없습니다: {path}"
+                )
+            contents = (worktree / path).read_bytes()
+            text = contents.decode("utf-8")
+            planned_contents[path] = (contents, text)
+            if contains_guidance_sections(text):
+                raise MaintenancePlanningError(
+                    "유지보수 Planner는 AGENTS.md guidance를 제안할 수 없습니다."
+                )
+            existed = path.encode("utf-8") in base_paths
+            if existed:
+                if path not in eligible:
+                    raise MaintenancePlanningError(
+                        f"SQLite snapshot에 없는 기존 ExecPlan은 수정할 수 없습니다: {path}"
+                    )
+                revised_paths.append(path)
+            else:
+                if context.mode is not MaintenancePlanMode.BARRIER:
+                    raise MaintenancePlanningError(
+                        "post-refactor revalidation은 새 ExecPlan을 만들 수 없습니다."
+                    )
+                new_paths.append(path)
+
+        try:
+            catalog = load_execplan_catalog(worktree, validate_sources=False)
+        except RuntimeError as error:
+            raise MaintenancePlanningError(str(error)) from error
+        new_plans: list[tuple[str, dict[str, object]]] = []
+        for path in new_paths:
+            try:
+                plan = _parse_execplan(
+                    worktree,
+                    worktree / path,
+                    require_priority=True,
+                    allow_archive_fallback=False,
+                )
+            except RuntimeError as error:
+                raise MaintenancePlanningError(str(error)) from error
+            try:
+                validated_plan = published_execplan(path, planned_contents[path][1])
+            except RuntimeError as error:
+                raise MaintenancePlanningError(str(error)) from error
+            if validated_plan != plan:
+                raise MaintenancePlanningError(
+                    f"검증 중 maintenance ExecPlan이 변경됐습니다: {path}"
+                )
+            validate_refactoring_plan(
+                path, validated_plan, planned_contents[path][1]
+            )
+            new_plans.append((path, validated_plan))
+        new_ids = {str(plan["id"]) for _, plan in new_plans}
+        existing_ids = [int(plan_id[2:]) for plan_id in catalog if plan_id not in new_ids]
+        first_id = max(existing_ids, default=0) + 1
+        expected_ids = list(range(first_id, first_id + len(new_plans)))
+        actual_ids = sorted(int(str(plan["id"])[2:]) for _, plan in new_plans)
+        if actual_ids != expected_ids:
+            raise MaintenancePlanningError(
+                "새 리팩터링 ExecPlan ID는 기존 최대 번호 다음부터 연속적이어야 합니다."
+            )
+
+        terminals = terminal_new_plan_ids(new_plans)
+        if context.mode is MaintenancePlanMode.BARRIER:
+            if not new_plans:
+                raise MaintenancePlanningError(
+                    "barrier mode의 변경 batch에는 새 리팩터링 ExecPlan이 필요합니다."
+                )
+            if set(revised_paths) != set(eligible):
+                missing = sorted(set(eligible) - set(revised_paths))
+                raise MaintenancePlanningError(
+                    "barrier mode는 모든 eligible READY 계획에 말단 dependency를 "
+                    f"추가해야 합니다: {', '.join(missing)}"
+                )
+
+        revisions: list[PlanRevision] = []
+        for path in revised_paths:
+            snapshot = eligible[path]
+            plan = catalog[snapshot.plan_id]
+            text = planned_contents[path][1]
+            try:
+                validated_plan = published_execplan(path, text)
+            except RuntimeError as error:
+                raise MaintenancePlanningError(str(error)) from error
+            if validated_plan != plan:
+                raise MaintenancePlanningError(
+                    f"검증 중 maintenance ExecPlan이 변경됐습니다: {path}"
+                )
+            if context.mode is MaintenancePlanMode.BARRIER:
+                validate_barrier_revision(
+                    snapshot, path, validated_plan, text, terminals
+                )
+            else:
+                validate_revalidation_revision(
+                    snapshot, path, validated_plan, text,
+                    path_moves=path_moves_by_sha[snapshot.plan_sha],
+                )
+            revisions.append(PlanRevision(path, validated_plan, snapshot))
+
+        return ValidatedPlanningResult(
+            plans=tuple(
+                sorted(new_plans, key=lambda item: int(str(item[1]["id"])[2:]))
+            ),
+            publication_paths=tuple(planned_files),
+            publication_hashes=tuple(
+                (path, hashlib.sha256(planned_contents[path][0]).hexdigest())
+                for path in planned_files
+            ),
+            revisions=tuple(
+                sorted(revisions, key=lambda item: int(item.snapshot.plan_id[2:]))
+            ),
+            maintenance_context=context,
+        )
+    except MaintenancePlanningError as error:
+        raise PlannerValidationError(str(error)) from error
+    except (OSError, UnicodeError) as error:
         raise PlannerValidationError(str(error)) from error
 
 
@@ -1699,6 +2217,68 @@ def _execplan_metadata(plan: dict[str, object]) -> tuple[str, str, str]:
     )
 
 
+def _register_execplan_rows(
+    connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+    plans: list[tuple[str, dict[str, object]]],
+    plan_commit: str,
+) -> None:
+    """Apply the new-row part shared by normal and maintenance batches."""
+
+    _ensure_execplans_schema(connection)
+    for path, plan in plans:
+        plan_id = str(plan["id"])
+        sources, dependencies, priority = _execplan_metadata(plan)
+        content_hash = file_hash(worktree / path)
+        initial_level = worker_level(plan)
+        existing = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND (plan_id = ? OR path = ?)",
+            (repo, plan_id, path),
+        ).fetchone()
+        if existing:
+            immutable = (
+                existing["plan_id"], existing["path"], existing["title"],
+                existing["sources"], existing["depends_on"], existing["priority"],
+                existing["content_hash"], existing["plan_sha"],
+            )
+            expected = (
+                plan_id, path, str(plan["title"]), sources, dependencies,
+                priority, content_hash, plan_commit,
+            )
+            if immutable != expected:
+                raise RuntimeError(f"게시된 ExecPlan 등록 정보가 충돌합니다: {plan_id}")
+            if existing["initial_worker_level"] is None:
+                connection.execute(
+                    "UPDATE exec_plans SET initial_worker_level = ?, "
+                    "effective_worker_level = ? WHERE repo = ? AND plan_id = ?",
+                    (initial_level, initial_level, repo, plan_id),
+                )
+            continue
+        connection.execute(
+            """
+            INSERT INTO exec_plans (
+                repo, plan_id, path, title, sources, depends_on, priority,
+                content_hash, status, plan_sha, initial_worker_level,
+                effective_worker_level
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'READY', ?, ?, ?)
+            """,
+            (
+                repo,
+                plan_id,
+                path,
+                str(plan["title"]),
+                sources,
+                dependencies,
+                priority,
+                content_hash,
+                plan_commit,
+                initial_level,
+                initial_level,
+            ),
+        )
+
+
 def register_execplans(
     connection: sqlite3.Connection,
     repo: str,
@@ -1710,68 +2290,7 @@ def register_execplans(
     """Register one published Planner batch atomically and idempotently."""
 
     with connection:
-        _ensure_execplans_schema(connection)
-        for path, plan in plans:
-            plan_id = str(plan["id"])
-            sources, dependencies, priority = _execplan_metadata(plan)
-            content_hash = file_hash(worktree / path)
-            initial_level = worker_level(plan)
-            existing = connection.execute(
-                "SELECT * FROM exec_plans WHERE repo = ? AND (plan_id = ? OR path = ?)",
-                (repo, plan_id, path),
-            ).fetchone()
-            if existing:
-                immutable = (
-                    existing["plan_id"],
-                    existing["path"],
-                    existing["title"],
-                    existing["sources"],
-                    existing["depends_on"],
-                    existing["priority"],
-                    existing["content_hash"],
-                    existing["plan_sha"],
-                )
-                expected = (
-                    plan_id,
-                    path,
-                    str(plan["title"]),
-                    sources,
-                    dependencies,
-                    priority,
-                    content_hash,
-                    plan_commit,
-                )
-                if immutable != expected:
-                    raise RuntimeError(f"게시된 ExecPlan 등록 정보가 충돌합니다: {plan_id}")
-                if existing["initial_worker_level"] is None:
-                    connection.execute(
-                        "UPDATE exec_plans SET initial_worker_level = ?, "
-                        "effective_worker_level = ? WHERE repo = ? AND plan_id = ?",
-                        (initial_level, initial_level, repo, plan_id),
-                    )
-                continue
-            connection.execute(
-                """
-                INSERT INTO exec_plans (
-                    repo, plan_id, path, title, sources, depends_on, priority,
-                    content_hash, status, plan_sha, initial_worker_level,
-                    effective_worker_level
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'READY', ?, ?, ?)
-                """,
-                (
-                    repo,
-                    plan_id,
-                    path,
-                    str(plan["title"]),
-                    sources,
-                    dependencies,
-                    priority,
-                    content_hash,
-                    plan_commit,
-                    initial_level,
-                    initial_level,
-                ),
-            )
+        _register_execplan_rows(connection, repo, worktree, plans, plan_commit)
         values = _clear_active_values(
             processed_sha=plan_commit,
             planning_fingerprint=planning_fingerprint,
@@ -1780,6 +2299,648 @@ def register_execplans(
         connection.execute(
             f"UPDATE projects SET {assignments} WHERE repo = ?", (*values.values(), repo)
         )
+
+
+def validate_maintenance_publication_base(
+    connection: sqlite3.Connection,
+    repo: str,
+    repository: Path,
+    base_branch: str,
+    context: MaintenancePlanningContext,
+) -> None:
+    """Invalidate and restart a stale maintenance result before publication."""
+
+    if context.repo != repo:
+        raise MaintenancePlanningError(
+            "SQLite-bound maintenance context가 publication 대상과 일치하지 않습니다."
+        )
+
+    current = git(
+        repository,
+        "rev-parse",
+        "--verify",
+        f"refs/remotes/origin/{base_branch}^{{commit}}",
+    ).stdout.strip()
+    if current == context.active_sha:
+        return
+
+    cycle_repository = maintenance_state.MaintenanceRepository(connection)
+    expected_cycle = cycle_repository.get(repo)
+    _assert_maintenance_context_current(connection, context)
+    restarted = cycle_repository.restart_stale_planning_context(
+        repo,
+        expected=expected_cycle,
+        new_base_sha=current,
+    )
+    raise MaintenancePlanningRestart(current, restarted.revision)
+
+
+def _validate_maintenance_planning_commit(
+    repository: Path,
+    result: ValidatedPlanningResult,
+    plan_commit: str,
+) -> None:
+    context = result.maintenance_context
+    if context is None:
+        raise MaintenancePlanningError(
+            "일반 Planner 결과를 maintenance publication API에 전달할 수 없습니다."
+        )
+    head = git(repository, "rev-parse", "HEAD").stdout.strip()
+    if head != plan_commit:
+        raise MaintenancePlanningError(
+            "maintenance planning worktree HEAD가 보존할 commit과 다릅니다."
+        )
+    ancestry = git(
+        repository,
+        "rev-list",
+        "--parents",
+        "-n",
+        "1",
+        plan_commit,
+    ).stdout.split()
+    if len(ancestry) != 2 or ancestry[1] != context.active_sha:
+        raise MaintenancePlanningError(
+            "maintenance batch는 평가 기준 바로 다음의 단일 planning commit이어야 합니다."
+        )
+    committed_paths = tuple(
+        sorted(
+            line
+            for line in git(
+                repository,
+                "diff",
+                "--name-only",
+                context.active_sha,
+                plan_commit,
+            ).stdout.splitlines()
+            if line
+        )
+    )
+    if committed_paths != tuple(sorted(result.publication_paths)):
+        raise MaintenancePlanningError(
+            "maintenance planning commit에 검증 batch 밖의 변경이 있습니다."
+        )
+    validated_hashes = dict(result.publication_hashes)
+    if (
+        len(validated_hashes) != len(result.publication_hashes)
+        or set(validated_hashes) != set(result.publication_paths)
+    ):
+        raise MaintenancePlanningError(
+            "maintenance planning 결과의 검증된 file hash가 불완전합니다."
+        )
+    expected = {
+        path: plan for path, plan in result.plans
+    }
+    expected.update({revision.path: revision.plan for revision in result.revisions})
+    load_execplan_catalog(repository, validate_sources=False)
+    for path in result.publication_paths:
+        local_contents = (repository / path).read_bytes()
+        remote_contents = git_bytes(repository, "show", f"{plan_commit}:{path}")
+        expected_hash = validated_hashes[path]
+        if (
+            hashlib.sha256(local_contents).hexdigest() != expected_hash
+            or hashlib.sha256(remote_contents).hexdigest() != expected_hash
+        ):
+            raise MaintenancePlanningError(
+                "maintenance ExecPlan이 Planner 결과 검증 후 "
+                f"변경됐습니다: {path}"
+            )
+        parsed = _parse_execplan(repository, repository / path, validate_sources=False)
+        if parsed != expected[path]:
+            raise MaintenancePlanningError(
+                f"검증 뒤 maintenance ExecPlan metadata가 변경됐습니다: {path}"
+            )
+
+
+def _validate_maintenance_publication_commit(
+    repository: Path,
+    base_branch: str,
+    result: ValidatedPlanningResult,
+    plan_commit: str,
+    *,
+    require_remote_confirmation: bool = True,
+) -> None:
+    context = result.maintenance_context
+    if context is None:
+        raise MaintenancePlanningError(
+            "일반 Planner 결과를 maintenance publication API에 전달할 수 없습니다."
+        )
+    remote = git(
+        repository,
+        "rev-parse",
+        "--verify",
+        f"refs/remotes/origin/{base_branch}^{{commit}}",
+    ).stdout.strip()
+    expected_remote = (
+        plan_commit if require_remote_confirmation else context.active_sha
+    )
+    if remote != expected_remote:
+        detail = "fast-forward push" if require_remote_confirmation else "평가 기준"
+        raise MaintenancePlanningError(
+            f"maintenance planning commit의 {detail}을 origin/base에서 "
+            "확인할 수 없습니다."
+        )
+    _validate_maintenance_planning_commit(repository, result, plan_commit)
+
+
+def _git_commit_is_ancestor(
+    repository: Path,
+    older: str,
+    newer: str,
+) -> bool:
+    result = git(
+        repository, "merge-base", "--is-ancestor", older, newer, check=False
+    )
+    if result.returncode not in {0, 1}:
+        raise RuntimeError("maintenance publication Git ancestry 확인 실패.")
+    return result.returncode == 0
+
+
+def _assert_remote_preserves_maintenance_batch(
+    repository: Path,
+    base_sha: str,
+    plan_commit: str,
+    remote_sha: str,
+    *,
+    reject_catalog_drift: bool = False,
+) -> None:
+    """Confirm a published batch remains byte-identical at a newer remote tip."""
+
+    if not _git_commit_is_ancestor(repository, plan_commit, remote_sha):
+        raise MaintenancePlanningError(
+            "보존된 maintenance planning commit이 origin/base 이력에 없습니다."
+        )
+    base_tree = _git_tree_entries(repository, base_sha)
+    plan_tree = _git_tree_entries(repository, plan_commit)
+    remote_tree = _git_tree_entries(repository, remote_sha)
+    batch_paths = {
+        path
+        for path in base_tree.keys() | plan_tree.keys()
+        if base_tree.get(path) != plan_tree.get(path)
+    }
+    changed_paths = sorted(
+        path
+        for path in batch_paths
+        if plan_tree.get(path) != remote_tree.get(path)
+    )
+    if changed_paths:
+        rendered = ", ".join(
+            path.decode("utf-8", errors="replace") for path in changed_paths
+        )
+        raise MaintenancePlanningError(
+            "게시된 maintenance batch 경로가 후속 원격 commit에서 변경됐습니다: "
+            f"{rendered}"
+        )
+
+    if not reject_catalog_drift:
+        return
+
+    plans_prefix = b"docs/plans/"
+    catalog_changes = sorted(
+        path
+        for path in plan_tree.keys() | remote_tree.keys()
+        if path.startswith(plans_prefix)
+        and path.endswith(b".md")
+        and b"/" not in path[len(plans_prefix) :]
+        and plan_tree.get(path) != remote_tree.get(path)
+    )
+    if catalog_changes:
+        rendered = ", ".join(
+            path.decode("utf-8", errors="replace") for path in catalog_changes
+        )
+        raise MaintenancePlanningError(
+            "게시 뒤 원격 ExecPlan catalog가 후속 commit에서 변경됐습니다: "
+            f"{rendered}"
+        )
+
+
+def record_maintenance_publication_intent(
+    connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+    base_branch: str,
+    result: ValidatedPlanningResult,
+    plan_commit: str,
+) -> maintenance_state.MaintenanceCycle:
+    """Persist a validated local batch before attempting its remote push."""
+
+    context = result.maintenance_context
+    if context is None or context.repo != repo:
+        raise MaintenancePlanningError(
+            "SQLite-bound maintenance context가 publication 대상과 일치하지 않습니다."
+        )
+    _assert_maintenance_context_current(connection, context)
+    _validate_maintenance_publication_commit(
+        worktree,
+        base_branch,
+        result,
+        plan_commit,
+        require_remote_confirmation=False,
+    )
+    expected_phase = (
+        maintenance_state.MaintenancePhase.ASSESSMENT
+        if context.mode is MaintenancePlanMode.BARRIER
+        else maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION
+    )
+    return maintenance_state.MaintenanceRepository(
+        connection
+    ).record_publication_intent(
+        repo,
+        expected_phase=expected_phase,
+        expected_revision=context.cycle_revision,
+        base_sha=context.active_sha,
+        commit_sha=plan_commit,
+    )
+
+
+def _maintenance_rows_match_published_batch(
+    connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+    result: ValidatedPlanningResult,
+    plan_commit: str,
+) -> bool:
+    for path, plan in result.plans:
+        row = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+            (repo, str(plan["id"])),
+        ).fetchone()
+        sources, dependencies, priority = _execplan_metadata(plan)
+        if row is None or (
+            str(row["path"]),
+            str(row["title"]),
+            str(row["sources"]),
+            str(row["depends_on"]),
+            str(row["priority"]),
+            str(row["content_hash"]),
+            str(row["plan_sha"] or ""),
+            str(row["status"]),
+        ) != (
+            path,
+            str(plan["title"]),
+            sources,
+            dependencies,
+            priority,
+            file_hash(worktree / path),
+            plan_commit,
+            "READY",
+        ):
+            return False
+    for revision in result.revisions:
+        row = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+            (repo, revision.snapshot.plan_id),
+        ).fetchone()
+        sources, dependencies, priority = _execplan_metadata(dict(revision.plan))
+        if row is None or (
+            str(row["path"]),
+            str(row["title"]),
+            str(row["sources"]),
+            str(row["depends_on"]),
+            str(row["priority"]),
+            str(row["content_hash"]),
+            str(row["plan_sha"] or ""),
+            str(row["status"]),
+        ) != (
+            revision.path,
+            revision.snapshot.title,
+            sources,
+            dependencies,
+            priority,
+            file_hash(worktree / revision.path),
+            plan_commit,
+            "READY",
+        ):
+            return False
+    return True
+
+
+def _assert_maintenance_publication_intent(
+    connection: sqlite3.Connection,
+    repo: str,
+    context: MaintenancePlanningContext,
+    plan_commit: str,
+) -> None:
+    cycle = maintenance_state.MaintenanceRepository(connection).get(repo)
+    current = (
+        cycle.publication_stage,
+        cycle.publication_base_sha,
+        cycle.publication_commit_sha,
+        cycle.publication_remote_oid,
+    )
+    expected = ("prepared", context.active_sha, plan_commit, None)
+    if current != expected:
+        raise MaintenancePlanningError(
+            "원격 push 전에 보존한 maintenance publication intent가 "
+            "현재 batch와 일치하지 않습니다."
+        )
+
+
+def _maintenance_publication_already_applied(
+    connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+    result: ValidatedPlanningResult,
+    plan_commit: str,
+) -> bool:
+    context = result.maintenance_context
+    assert context is not None
+    cycle = maintenance_state.MaintenanceRepository(connection).get(repo)
+    if context.mode is MaintenancePlanMode.BARRIER:
+        cycle_matches = (
+            cycle.phase is maintenance_state.MaintenancePhase.REFACTORING
+            and cycle.revision == context.cycle_revision + 1
+            and cycle.refactoring_plan_ids
+            == tuple(str(plan["id"]) for _, plan in result.plans)
+            and cycle.revalidation_plan_ids
+            == tuple(revision.snapshot.plan_id for revision in result.revisions)
+            and cycle.publication_base_sha == context.active_sha
+            and cycle.publication_commit_sha == plan_commit
+            and cycle.publication_remote_oid == plan_commit
+        )
+    else:
+        cycle_matches = (
+            cycle.phase is maintenance_state.MaintenancePhase.IDLE
+            and cycle.revision == context.cycle_revision + 1
+            and cycle.last_success_commit == plan_commit
+        )
+    return cycle_matches and _maintenance_rows_match_published_batch(
+        connection, repo, worktree, result, plan_commit
+    )
+
+
+def publish_maintenance_planning_batch(
+    connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+    base_branch: str,
+    result: ValidatedPlanningResult,
+    plan_commit: str,
+) -> maintenance_state.MaintenanceCycle:
+    """Atomically publish catalog revisions after a confirmed remote push.
+
+    Calling this again after a process interruption is idempotent when the
+    remote commit, catalog rows, and persisted cycle describe the same batch.
+    """
+
+    context = result.maintenance_context
+    if context is None or context.repo != repo:
+        raise MaintenancePlanningError(
+            "SQLite-bound maintenance context가 publication 대상과 일치하지 않습니다."
+        )
+    _validate_maintenance_publication_commit(
+        worktree, base_branch, result, plan_commit
+    )
+    return _apply_maintenance_planning_batch(
+        connection, repo, worktree, result, plan_commit
+    )
+
+
+def _apply_maintenance_planning_batch(
+    connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+    result: ValidatedPlanningResult,
+    plan_commit: str,
+) -> maintenance_state.MaintenanceCycle:
+    """Apply one already-confirmed maintenance batch in a SQLite transaction."""
+
+    context = result.maintenance_context
+    if context is None or context.repo != repo:
+        raise MaintenancePlanningError(
+            "SQLite-bound maintenance context가 publication 대상과 일치하지 않습니다."
+        )
+    with connection:
+        if _maintenance_publication_already_applied(
+            connection, repo, worktree, result, plan_commit
+        ):
+            return maintenance_state.MaintenanceRepository(connection).get(repo)
+        _assert_maintenance_publication_intent(
+            connection, repo, context, plan_commit
+        )
+        _assert_maintenance_context_current(connection, context)
+        _register_execplan_rows(
+            connection, repo, worktree, list(result.plans), plan_commit
+        )
+        for revision in result.revisions:
+            snapshot = revision.snapshot
+            _sources, dependencies, _priority = _execplan_metadata(
+                dict(revision.plan)
+            )
+            cursor = connection.execute(
+                """
+                UPDATE exec_plans
+                SET depends_on = ?, content_hash = ?, plan_sha = ?
+                WHERE repo = ? AND plan_id = ? AND status = 'READY'
+                  AND path = ? AND title = ? AND sources = ?
+                  AND depends_on = ? AND priority = ?
+                  AND content_hash = ? AND plan_sha = ?
+                  AND branch IS NULL AND worktree IS NULL
+                  AND workspace_owned = 0
+                  AND worker_session_id IS NULL
+                  AND reviewer_session_id IS NULL AND pr_url IS NULL
+                  AND pr_head_oid IS NULL
+                  AND pr_conflict_recovery = 0
+                  AND pr_conflict_head_oid IS NULL
+                  AND pr_conflict_base_oid IS NULL
+                """,
+                (
+                    dependencies,
+                    file_hash(worktree / revision.path),
+                    plan_commit,
+                    repo,
+                    snapshot.plan_id,
+                    snapshot.path,
+                    snapshot.title,
+                    json.dumps(
+                        snapshot.sources,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    json.dumps(
+                        snapshot.depends_on,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    snapshot.priority,
+                    snapshot.content_hash,
+                    snapshot.plan_sha,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise MaintenancePlanningError(
+                    "publication 직전 READY snapshot이 변경됐습니다: "
+                    f"{snapshot.plan_id}"
+                )
+
+        repository = maintenance_state.MaintenanceRepository(connection)
+        if context.mode is MaintenancePlanMode.BARRIER:
+            return repository.transition(
+                repo,
+                expected_phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+                expected_revision=context.cycle_revision,
+                next_phase=maintenance_state.MaintenancePhase.REFACTORING,
+                refactoring_plan_ids=tuple(
+                    str(plan["id"]) for _, plan in result.plans
+                ),
+                revalidation_plan_ids=tuple(
+                    revision.snapshot.plan_id for revision in result.revisions
+                ),
+                publication_stage="remote_confirmed",
+                publication_base_sha=context.active_sha,
+                publication_commit_sha=plan_commit,
+                publication_remote_oid=plan_commit,
+            )
+        return repository.advance_success_baseline(
+            repo,
+            expected_phase=maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+            expected_revision=context.cycle_revision,
+            remote_commit=plan_commit,
+        )
+
+
+def restart_stale_maintenance_publication(
+    connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+    base_branch: str,
+) -> maintenance_state.MaintenanceCycle:
+    """Restart a batch proven absent from the newly fetched remote base.
+
+    Git files and refs remain intact. The caller creates a fresh planning
+    worktree at cycle_base_sha and obtains a new context after this returns.
+    """
+    repository = maintenance_state.MaintenanceRepository(connection)
+    cycle = repository.get(repo)
+    if (
+        cycle.publication_stage != "prepared"
+        or not cycle.publication_base_sha
+        or not cycle.publication_commit_sha
+        or cycle.publication_remote_oid is not None
+    ):
+        raise MaintenancePlanningError("재시작할 prepared publication intent가 없습니다.")
+    remote = git(
+        worktree, "rev-parse", "--verify",
+        f"refs/remotes/origin/{base_branch}^{{commit}}",
+    ).stdout.strip()
+    base = cycle.publication_base_sha
+    commit = cycle.publication_commit_sha
+    if remote in {base, commit}:
+        raise MaintenancePlanningError("게시 기준이 이동하지 않았거나 batch가 이미 게시됐습니다.")
+
+    if (
+        not _git_commit_is_ancestor(worktree, base, remote)
+        or _git_commit_is_ancestor(worktree, commit, remote)
+    ):
+        raise MaintenancePlanningError("미게시 batch임을 확정할 수 없어 재시작할 수 없습니다.")
+    base_tree = _git_tree_entries(worktree, base)
+    commit_tree = _git_tree_entries(worktree, commit)
+    remote_tree = _git_tree_entries(worktree, remote)
+    batch_paths = {
+        path for path in base_tree.keys() | commit_tree.keys()
+        if base_tree.get(path) != commit_tree.get(path)
+    }
+    if any(base_tree.get(path) != remote_tree.get(path) for path in batch_paths):
+        raise MaintenancePlanningError("원격 파일이 보존된 batch와 겹쳐 재시작할 수 없습니다.")
+    return repository.restart_unpublished_batch(
+        repo, expected=cycle, new_base_sha=remote
+    )
+
+
+def recover_maintenance_planning_batch(
+    connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+    base_branch: str,
+) -> maintenance_state.MaintenanceCycle:
+    """Recover a pushed batch from its SQLite intent and remote commit."""
+
+    cycle = maintenance_state.MaintenanceRepository(connection).get(repo)
+    if cycle.publication_stage == "remote_confirmed":
+        remote_oid = cycle.publication_remote_oid
+        current_remote = git(
+            worktree,
+            "rev-parse",
+            "--verify",
+            f"refs/remotes/origin/{base_branch}^{{commit}}",
+        ).stdout.strip()
+        if remote_oid and current_remote == remote_oid:
+            return cycle
+        if (
+            not remote_oid
+            or not cycle.publication_base_sha
+            or cycle.publication_commit_sha != remote_oid
+        ):
+            raise MaintenancePlanningError(
+                "적용된 maintenance publication 기록이 완전하지 않습니다."
+            )
+        _assert_remote_preserves_maintenance_batch(
+            worktree,
+            cycle.publication_base_sha,
+            remote_oid,
+            current_remote,
+        )
+        return cycle
+    if (
+        cycle.publication_stage != "prepared"
+        or cycle.publication_base_sha is None
+        or cycle.publication_commit_sha is None
+        or cycle.publication_remote_oid is not None
+    ):
+        raise MaintenancePlanningError(
+            "복구할 maintenance publication intent가 없습니다."
+        )
+    base_sha = cycle.publication_base_sha
+    plan_commit = cycle.publication_commit_sha
+    current_remote = git(
+        worktree,
+        "rev-parse",
+        "--verify",
+        f"refs/remotes/origin/{base_branch}^{{commit}}",
+    ).stdout.strip()
+    remote_advanced_after_publication = False
+    if current_remote != plan_commit:
+        if current_remote == base_sha:
+            raise MaintenancePlanningError(
+                "보존된 maintenance planning commit의 push가 아직 확인되지 않았습니다."
+            )
+        if _git_commit_is_ancestor(worktree, plan_commit, current_remote):
+            _assert_remote_preserves_maintenance_batch(
+                worktree, base_sha, plan_commit, current_remote,
+                reject_catalog_drift=True,
+            )
+            remote_advanced_after_publication = True
+        else:
+            return restart_stale_maintenance_publication(
+                connection, repo, worktree, base_branch
+            )
+    context = _maintenance_context_at_revision(
+        connection, repo, worktree, base_sha, cycle
+    )
+    try:
+        result = validate_maintenance_planner_result(
+            connection, context, worktree, changed_files(worktree)
+        )
+    except PlannerValidationError as error:
+        raise MaintenancePlanningError(
+            f"보존된 maintenance publication batch가 유효하지 않습니다: {error}"
+        ) from error
+    if result is None:
+        raise MaintenancePlanningError(
+            "보존된 maintenance publication commit에 검증할 batch가 없습니다."
+        )
+    if remote_advanced_after_publication:
+        _validate_maintenance_planning_commit(worktree, result, plan_commit)
+        return _apply_maintenance_planning_batch(
+            connection, repo, worktree, result, plan_commit
+        )
+    return publish_maintenance_planning_batch(
+        connection,
+        repo,
+        worktree,
+        base_branch,
+        result,
+        plan_commit,
+    )
 
 
 def _legacy_plan_sha(root: Path, revision: str, relative_path: str) -> str:
@@ -6431,8 +7592,8 @@ def _published_plan_allows_common_plans(
     return bool(
         acceptance
         and re.search(
-            r"(?im)^-\s+(?:공통\s+)?`docs/PLANS\.md`(?:에|를|을|의|\s)"
-            r".*(?:변경|문서화|갱신|수정|change|update|document)",
+            r"(?im)^-\s+(?:공통\s+)?`docs/PLANS\.md`(?:에|를|을|의|와|과|\s)"
+            r".*(?:변경|문서화|갱신|수정|설명|change|update|document|describe)",
             acceptance.group(1),
         )
     )
@@ -9954,6 +11115,58 @@ catalog에서 현재 입력과 겹치는 비종료 계획만 필요할 때 전�
 docs/FUTURE_IDEAS.md의 목록 항목과 같은 내용을 새 ExecPlan의 제목이나 본문에 반복하지 마라.
 docs/FUTURE_IDEAS.md는 새 ExecPlan과 함께 생성·수정할 수 있지만, 그 밖의 기존 파일은 수정하지 마라.
 구현, 테스트, commit, push와 PR 생성은 하지 마라. 추가 계획이 필요 없으면 파일을 변경하지 마라.
+{failure}
+""".strip()
+
+
+def maintenance_planner_prompt(
+    context: MaintenancePlanningContext,
+    compact_catalog: str,
+    change_context: str,
+    error: str | None = None,
+) -> str:
+    """Return the dormant, mode-specific maintenance Planner contract."""
+
+    failure = (
+        "\n이전 실행에서 다음 검증 문제가 발생했다. 같은 허용 범위 안에서 "
+        f"원인을 해결하라:\n{error[-6000:]}\n"
+        if error
+        else ""
+    )
+    targets = json.dumps(
+        [plan.plan_id for plan in context.eligible_plans],
+        ensure_ascii=False,
+    )
+    if context.mode is MaintenancePlanMode.BARRIER:
+        mode_contract = f"""
+현재 mode는 maintenance barrier다. 구체적인 구조 문제와 대상 책임 경계를 코드에서 확인한 경우에만 새 리팩터링 ExecPlan을 작성하라.
+각 새 계획은 사용자 동작·공개 계약·저장 형식 보존 조건, targeted unit test와 전체 verify 회귀 조건을 명시하고 독립적으로 검증·Merge 가능한 DAG로 나눠라.
+기본 priority는 normal이며 데이터 손실·보안·자동 실행 차단·반복 수동 복구의 구체적 근거가 본문에 있을 때만 상향하라.
+새 DAG의 모든 말단 ID를 다음 eligible READY 계획의 기존 depends_on 뒤에 추가하라: {targets}
+eligible 계획은 ID, 파일 경로, title, sources, complexity, risk, priority, 본문과 기존 depends_on을 그대로 보존하고 dependency 추가 외에는 수정하지 마라.
+리팩터링이 필요 없으면 어떤 파일도 변경하지 마라.
+"""
+    else:
+        mode_contract = f"""
+현재 mode는 post-refactor revalidation이다. 다음 eligible READY 계획만 최신 구조에 맞게 재검증하라: {targets}
+새 ExecPlan을 만들지 마라. 기존 ID, 파일 경로, title, sources, complexity, risk, priority와 Purpose의 원래 제품 목표를 보존하라.
+Acceptance Criteria의 경로 표현, Implementation, Validation, Progress, Decision Log와 depends_on만 최신 구조에 필요한 범위에서 개정할 수 있다.
+같은 제품 목표와 범위를 보존했다고 확정할 수 없으면 파일을 변경하지 말고 그 사실을 결과에 보고하라.
+"""
+    return f"""
+당신은 Loop Manager의 유지보수 Planner다.
+AGENTS.md, 활성 PRODUCT와 Requirement, docs/ARCHITECTURE.md, docs/PLANS.md, 현재 코드·테스트 및 아래 compact catalog와 bounded 변경 문맥을 읽어라.
+
+compact catalog:
+{compact_catalog}
+
+bounded 변경 문맥:
+{change_context}
+
+{mode_contract}
+기존 파일을 삭제·rename하지 말고 docs/FUTURE_IDEAS.md나 다른 파일을 변경하지 마라.
+구현, 테스트, commit, push와 PR 생성은 하지 마라. 이 권한은 활성 SQLite 유지보수 단계와 위 target snapshot에만 한정된다.
+사용자가 BLOCKED 해제를 위해 ExecPlan을 직접 편집하는 별도 흐름과 이 권한을 혼동하지 말고, 이 호출로 사용자 편집을 대행하거나 권한 범위를 넓히지 마라.
 {failure}
 """.strip()
 
