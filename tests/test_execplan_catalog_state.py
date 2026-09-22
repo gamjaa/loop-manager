@@ -74,6 +74,7 @@ class ExecPlanCatalogStateTest(unittest.TestCase):
             True,
             kind=execplan_catalog_state.MergeProofKind.GITHUB_PR,
             plan_sha="a" * 40,
+            publication_content_hash=entry.content_hash,
             revision="b" * 40,
             pr_url="https://example.test/pr/1",
         )
@@ -149,16 +150,43 @@ class ExecPlanCatalogStateTest(unittest.TestCase):
                 True,
                 kind=execplan_catalog_state.MergeProofKind.GITHUB_PR,
                 plan_sha="a" * 40,
+                publication_content_hash=original.content_hash,
             ),
         )
 
-        self.assertEqual(port.calls, [])
+        self.assertEqual(port.calls, ["G-001"])
         self.assertEqual(
             second.diagnostics[0].code, "archived-content-hash-mismatch"
         )
         row = self.repository.historical_row("/repo", "G-001")
         self.assertEqual(row["original_content_hash"], original.content_hash)
         self.assertEqual(row["final_content_hash"], changed.content_hash)
+        self.assertEqual(row["identity_verified"], 1)
+
+    def test_fresh_recovery_rejects_archive_changed_before_first_observation(self):
+        published = archived_entry()
+        tampered = archived_entry(text_suffix=" changed before recovery")
+
+        result, port = self._recover(
+            tampered,
+            execplan_catalog_state.MergeProof(
+                True,
+                kind=execplan_catalog_state.MergeProofKind.GITHUB_PR,
+                plan_sha="a" * 40,
+                publication_content_hash=published.content_hash,
+            ),
+        )
+
+        self.assertEqual(port.calls, ["G-001"])
+        self.assertEqual(result.merged, ())
+        self.assertEqual(
+            result.diagnostics[0].code, "archived-content-hash-mismatch"
+        )
+        row = self.repository.historical_row("/repo", "G-001")
+        self.assertEqual(row["original_content_hash"], published.content_hash)
+        self.assertEqual(row["final_content_hash"], tampered.content_hash)
+        self.assertEqual(row["identity_verified"], 1)
+        self.assertEqual(row["merge_confirmed"], 0)
 
 
 class ArchivedDependencySelectionTest(unittest.TestCase):
@@ -218,6 +246,7 @@ class ArchivedDependencySelectionTest(unittest.TestCase):
                     plan_id, entry.path, "merge-proof-missing", "missing"
                 )
             ),
+            identity_verified=True,
         )
 
     def test_confirmed_archived_merged_row_satisfies_active_dependency(self):

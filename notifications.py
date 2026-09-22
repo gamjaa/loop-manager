@@ -316,7 +316,8 @@ def enqueue_completion_if_ready(connection: sqlite3.Connection, repo: str) -> bo
     unfinished_query = (
         "SELECT 1 FROM exec_plans WHERE repo = ? AND status != 'MERGED' "
         "AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h "
-        "WHERE h.repo = exec_plans.repo AND h.plan_id = exec_plans.plan_id) LIMIT 1"
+        "WHERE h.repo = exec_plans.repo AND h.currently_archived = 1 "
+        "AND h.plan_id = exec_plans.plan_id) LIMIT 1"
         if has_historical_catalog
         else "SELECT 1 FROM exec_plans WHERE repo = ? AND status != 'MERGED' LIMIT 1"
     )

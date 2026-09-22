@@ -198,6 +198,7 @@ class MaintenanceRepository:
                 " AND NOT EXISTS ("
                 "SELECT 1 FROM execplan_catalog_history h "
                 "WHERE h.repo = exec_plans.repo "
+                "AND h.currently_archived = 1 "
                 "AND h.plan_id = exec_plans.plan_id "
                 "AND h.merge_confirmed = 0)"
             )

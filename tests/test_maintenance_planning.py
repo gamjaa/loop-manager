@@ -247,6 +247,7 @@ class MaintenancePlanningTest(unittest.TestCase):
                 "merge-proof-missing",
                 "missing",
             ),
+            identity_verified=True,
         )
         self.connection.commit()
 

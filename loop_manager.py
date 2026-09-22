@@ -1878,6 +1878,7 @@ def _maintenance_mode_and_rows(
             "SELECT * FROM exec_plans WHERE repo = ? AND status = 'READY' "
             "AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h "
             "WHERE h.repo = exec_plans.repo "
+            "AND h.currently_archived = 1 "
             "AND h.plan_id = exec_plans.plan_id) "
             "ORDER BY plan_id",
             (repo,),
@@ -1890,6 +1891,7 @@ def _maintenance_mode_and_rows(
                 "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ? "
                 "AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h "
                 "WHERE h.repo = exec_plans.repo "
+                "AND h.currently_archived = 1 "
                 "AND h.plan_id = exec_plans.plan_id)",
                 (repo, plan_id),
             ).fetchone()
@@ -1975,6 +1977,7 @@ def _assert_maintenance_context_current(
                 "WHERE repo = ? AND status = 'READY' "
                 "AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h "
                 "WHERE h.repo = exec_plans.repo "
+                "AND h.currently_archived = 1 "
                 "AND h.plan_id = exec_plans.plan_id) ORDER BY plan_id",
                 (context.repo,),
             )
@@ -3092,6 +3095,39 @@ def _legacy_plan_sha(root: Path, revision: str, relative_path: str) -> str:
     return commits[0]
 
 
+def _current_execplan_sha(
+    root: Path,
+    revision: str,
+    entry: execplan_catalog.ExecPlanCatalogEntry,
+) -> str:
+    """Find the oldest revision that contains the current active plan bytes."""
+
+    result = git(
+        root,
+        "log",
+        revision,
+        "--format=%H",
+        "--",
+        entry.active_path,
+        check=False,
+    )
+    for commit in reversed(result.stdout.splitlines()):
+        if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", commit):
+            continue
+        try:
+            content = git_bytes(
+                root, "show", f"{commit}:{entry.active_path}"
+            )
+        except RuntimeError:
+            continue
+        if hashlib.sha256(content).hexdigest() == entry.content_hash:
+            return commit
+    raise RuntimeError(
+        "현재 active ExecPlan 본문의 게시 commit을 안전하게 확인할 수 없습니다: "
+        f"{entry.active_path}"
+    )
+
+
 class _LegacyCatalogMergeProof:
     """GitHub/Git adapter kept outside the parser and catalog repository."""
 
@@ -3129,15 +3165,14 @@ class _LegacyCatalogMergeProof:
             )
         except RuntimeError as error:
             return execplan_catalog_state.MergeProof(False, detail=str(error))
-        if (
-            not ancestor
-            or hashlib.sha256(published).hexdigest() != identity.content_hash
-        ):
+        published_hash = hashlib.sha256(published).hexdigest()
+        if not ancestor or published_hash != identity.content_hash:
             return execplan_catalog_state.MergeProof(False)
         return execplan_catalog_state.MergeProof(
             True,
             kind=execplan_catalog_state.MergeProofKind.STORED_AND_GIT,
             plan_sha=identity.plan_sha,
+            publication_content_hash=published_hash,
             revision=revision_sha,
         )
 
@@ -3158,12 +3193,17 @@ class _LegacyCatalogMergeProof:
                 pr_url=str(pull_request.get("url") or "") or None,
                 detail=str(pull_request.get("state") or "unknown"),
             )
+        plan_sha = _legacy_plan_sha(
+            self.root, self.revision, entry.active_path
+        )
+        published_hash = hashlib.sha256(
+            git_bytes(self.root, "show", f"{plan_sha}:{entry.active_path}")
+        ).hexdigest()
         return execplan_catalog_state.MergeProof(
             True,
             kind=execplan_catalog_state.MergeProofKind.GITHUB_PR,
-            plan_sha=_legacy_plan_sha(
-                self.root, self.revision, entry.active_path
-            ),
+            plan_sha=plan_sha,
+            publication_content_hash=published_hash,
             revision=(
                 str(
                     (pull_request.get("mergeCommit") or {}).get("oid")
@@ -3345,6 +3385,10 @@ def _migrate_execplan_catalog(
                 )
                 for row in rows
             }
+            catalog_repository = execplan_catalog_state.CatalogStateRepository(
+                connection, ensure=False
+            )
+            catalog_repository.mark_active(str(project["repo"]), snapshot.active)
 
             for entry in snapshot.active.values():
                 is_active = (
@@ -3378,7 +3422,9 @@ def _migrate_execplan_catalog(
                             "Legacy ExecPlan의 PR 상태를 자동 이관할 수 없습니다: "
                             f"{entry.plan_id} ({pull_request['state']})"
                         )
-                    plan_sha = _legacy_plan_sha(root, revision, entry.active_path)
+                    plan_sha = _current_execplan_sha(
+                        root, revision, entry
+                    )
                 _insert_recovered_execplan(
                     connection,
                     str(project["repo"]),
@@ -3394,9 +3440,7 @@ def _migrate_execplan_catalog(
             if not reconcile_history:
                 continue
             recovery = execplan_catalog_state.CatalogRecoveryService(
-                execplan_catalog_state.CatalogStateRepository(
-                    connection, ensure=False
-                ),
+                catalog_repository,
                 _LegacyCatalogMergeProof(root, revision, stored),
             ).reconcile(str(project["repo"]), snapshot, stored)
             _quarantine_unverified_historical_runtime(
@@ -3459,6 +3503,7 @@ def plan_blocked_execplans(
             "SELECT * FROM exec_plans WHERE repo = ? AND status = 'PLAN_BLOCKED' "
             "AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h "
             "WHERE h.repo = exec_plans.repo "
+            "AND h.currently_archived = 1 "
             "AND h.plan_id = exec_plans.plan_id) "
             "ORDER BY plan_id",
             (repo,),
@@ -3475,6 +3520,7 @@ def merge_wait_execplans(
             "SELECT * FROM exec_plans WHERE repo = ? AND status = 'PR_OPEN' "
             "AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h "
             "WHERE h.repo = exec_plans.repo "
+            "AND h.currently_archived = 1 "
             "AND h.plan_id = exec_plans.plan_id) "
             "ORDER BY plan_id",
             (repo,),
@@ -3528,6 +3574,7 @@ def compact_execplan_catalog(connection: sqlite3.Connection, repo: str) -> str:
         "SELECT * FROM exec_plans WHERE repo = ? AND status != 'MERGED' "
         "AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h "
         "WHERE h.repo = exec_plans.repo "
+        "AND h.currently_archived = 1 "
         "AND h.plan_id = exec_plans.plan_id)",
         (repo,),
     ).fetchall()
@@ -3564,6 +3611,7 @@ def catalog_schedule_decision(
             SELECT plan_id, merge_confirmed
             FROM execplan_catalog_history
             WHERE repo = ?
+              AND currently_archived = 1
             """,
             (repo,),
         ).fetchall()
@@ -3704,6 +3752,7 @@ def _advance_maintenance_cycle_after_merges(
         "SELECT * FROM exec_plans WHERE repo = ? "
         "AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h "
         "WHERE h.repo = exec_plans.repo "
+        "AND h.currently_archived = 1 "
         "AND h.plan_id = exec_plans.plan_id "
         "AND h.merge_confirmed = 0)",
         (repo,),
@@ -11122,6 +11171,7 @@ def complete_merged_worktree(
             "WHERE repo = ? AND plan_id != ? AND status != 'MERGED' "
             "AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h "
             "WHERE h.repo = exec_plans.repo "
+            "AND h.currently_archived = 1 "
             "AND h.plan_id = exec_plans.plan_id) LIMIT 1",
             (repo, plan_id),
         ).fetchone()
@@ -11208,6 +11258,7 @@ def complete_merged_execplan_worktree(
             "WHERE repo = ? AND plan_id != ? AND status != 'MERGED' "
             "AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h "
             "WHERE h.repo = exec_plans.repo "
+            "AND h.currently_archived = 1 "
             "AND h.plan_id = exec_plans.plan_id) LIMIT 1",
             (repo, plan_id),
         ).fetchone()
@@ -12758,7 +12809,7 @@ def requirement_archive_candidates(
     catalog = _revision_execplan_catalog(repo_path, revision)
     historical_rows = connection.execute(
         "SELECT plan_id, merge_confirmed FROM execplan_catalog_history "
-        "WHERE repo = ?",
+        "WHERE repo = ? AND currently_archived = 1",
         (repo,),
     ).fetchall()
     unverified_historical_ids = {
@@ -13216,6 +13267,7 @@ class _PlanningStatePorts:
             "SELECT * FROM exec_plans WHERE repo = ? "
             "AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h "
             "WHERE h.repo = exec_plans.repo "
+            "AND h.currently_archived = 1 "
             "AND h.plan_id = exec_plans.plan_id)",
             (repo,),
         ).fetchall()
@@ -14225,6 +14277,7 @@ def run_project_result(
         "SELECT 1 FROM exec_plans WHERE repo = ? AND status != 'MERGED' "
         "AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h "
         "WHERE h.repo = exec_plans.repo "
+        "AND h.currently_archived = 1 "
         "AND h.plan_id = exec_plans.plan_id) LIMIT 1",
         (repo,),
     ).fetchone()

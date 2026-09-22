@@ -25,6 +25,8 @@ CREATE TABLE IF NOT EXISTS execplan_catalog_history (
     final_content_hash TEXT NOT NULL,
     plan_sha TEXT,
     merge_confirmed INTEGER NOT NULL DEFAULT 0,
+    identity_verified INTEGER NOT NULL DEFAULT 0,
+    currently_archived INTEGER NOT NULL DEFAULT 1,
     proof_kind TEXT,
     proof_revision TEXT,
     pr_url TEXT,
@@ -60,6 +62,7 @@ class MergeProof:
     merged: bool
     kind: MergeProofKind = MergeProofKind.NONE
     plan_sha: str | None = None
+    publication_content_hash: str | None = None
     revision: str | None = None
     pr_url: str | None = None
     detail: str | None = None
@@ -106,6 +109,22 @@ class CatalogRecoveryResult:
 def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.execute(HISTORICAL_CATALOG_SCHEMA)
     connection.execute(CATALOG_DIAGNOSTICS_SCHEMA)
+    columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(execplan_catalog_history)"
+        )
+    }
+    if "identity_verified" not in columns:
+        connection.execute(
+            "ALTER TABLE execplan_catalog_history "
+            "ADD COLUMN identity_verified INTEGER NOT NULL DEFAULT 0"
+        )
+    if "currently_archived" not in columns:
+        connection.execute(
+            "ALTER TABLE execplan_catalog_history "
+            "ADD COLUMN currently_archived INTEGER NOT NULL DEFAULT 1"
+        )
 
 
 class CatalogStateRepository:
@@ -131,22 +150,46 @@ class CatalogStateRepository:
         plan_sha: str | None,
         proof: MergeProof,
         diagnostic: CatalogDiagnostic | None,
+        identity_verified: bool,
     ) -> None:
-        """Upsert observations without replacing the first stable identity."""
+        """Promote observations only when publication evidence verifies identity."""
 
         self.connection.execute(
             """
             INSERT INTO execplan_catalog_history (
                 repo, plan_id, original_path, observed_path,
                 original_content_hash, final_content_hash, plan_sha,
-                merge_confirmed, proof_kind, proof_revision, pr_url,
+                merge_confirmed, identity_verified, currently_archived,
+                proof_kind, proof_revision, pr_url,
                 diagnostic_code, diagnostic_message
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
             ON CONFLICT(repo, plan_id) DO UPDATE SET
+                original_path = CASE
+                    WHEN execplan_catalog_history.identity_verified = 0
+                     AND excluded.identity_verified = 1
+                    THEN excluded.original_path
+                    ELSE execplan_catalog_history.original_path
+                END,
+                original_content_hash = CASE
+                    WHEN execplan_catalog_history.identity_verified = 0
+                     AND excluded.identity_verified = 1
+                    THEN excluded.original_content_hash
+                    ELSE execplan_catalog_history.original_content_hash
+                END,
                 observed_path = excluded.observed_path,
                 final_content_hash = excluded.final_content_hash,
-                plan_sha = COALESCE(execplan_catalog_history.plan_sha, excluded.plan_sha),
+                plan_sha = CASE
+                    WHEN execplan_catalog_history.identity_verified = 0
+                     AND excluded.identity_verified = 1
+                    THEN excluded.plan_sha
+                    ELSE COALESCE(execplan_catalog_history.plan_sha, excluded.plan_sha)
+                END,
                 merge_confirmed = excluded.merge_confirmed,
+                identity_verified = MAX(
+                    execplan_catalog_history.identity_verified,
+                    excluded.identity_verified
+                ),
+                currently_archived = 1,
                 proof_kind = excluded.proof_kind,
                 proof_revision = excluded.proof_revision,
                 pr_url = COALESCE(execplan_catalog_history.pr_url, excluded.pr_url),
@@ -163,6 +206,7 @@ class CatalogStateRepository:
                 entry.content_hash,
                 plan_sha,
                 1 if proof.merged and diagnostic is None else 0,
+                1 if identity_verified else 0,
                 proof.kind.value,
                 proof.revision,
                 proof.pr_url,
@@ -204,11 +248,38 @@ class CatalogStateRepository:
     def diagnostics(self, repo: str) -> tuple[sqlite3.Row, ...]:
         return tuple(
             self.connection.execute(
-                "SELECT * FROM execplan_catalog_diagnostics WHERE repo = ? "
-                "ORDER BY plan_id, code",
+                "SELECT d.* FROM execplan_catalog_diagnostics d "
+                "JOIN execplan_catalog_history h "
+                "ON h.repo = d.repo AND h.plan_id = d.plan_id "
+                "WHERE d.repo = ? AND h.currently_archived = 1 "
+                "ORDER BY d.plan_id, d.code",
                 (repo,),
             ).fetchall()
         )
+
+    def mark_active(
+        self,
+        repo: str,
+        entries: Mapping[str, ExecPlanCatalogEntry],
+    ) -> None:
+        """Preserve historical audit while ending current archive exclusion."""
+
+        for entry in entries.values():
+            self.connection.execute(
+                """
+                UPDATE execplan_catalog_history
+                SET observed_path = ?, currently_archived = 0,
+                    diagnostic_code = NULL, diagnostic_message = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE repo = ? AND plan_id = ?
+                """,
+                (entry.path, repo, entry.plan_id),
+            )
+            self.connection.execute(
+                "DELETE FROM execplan_catalog_diagnostics "
+                "WHERE repo = ? AND plan_id = ?",
+                (repo, entry.plan_id),
+            )
 
 
 class CatalogRecoveryService:
@@ -242,6 +313,7 @@ class CatalogRecoveryService:
         for plan_id, entry in snapshot.archived.items():
             identity = stored.get(plan_id)
             audit = self.repository.historical_row(repo, plan_id)
+            trusted_identity = identity is not None and audit is None
             if identity is not None:
                 original_path = identity.path
                 original_hash = identity.content_hash
@@ -252,6 +324,7 @@ class CatalogRecoveryService:
                 stable_plan_sha = (
                     str(audit["plan_sha"]) if audit["plan_sha"] else None
                 )
+                trusted_identity = bool(audit["identity_verified"])
             else:
                 original_path = entry.active_path
                 original_hash = entry.content_hash
@@ -266,7 +339,7 @@ class CatalogRecoveryService:
                     "archived ExecPlan의 최초 active 경로가 저장 identity와 다릅니다: "
                     f"{original_path} != {entry.active_path}",
                 )
-            elif original_hash != entry.content_hash:
+            elif trusted_identity and original_hash != entry.content_hash:
                 diagnostic = self._diagnostic(
                     entry,
                     "archived-content-hash-mismatch",
@@ -298,6 +371,28 @@ class CatalogRecoveryService:
                             "archived ExecPlan의 최초 게시 revision을 확인할 수 없습니다: "
                             f"{entry.path}",
                         )
+                    elif not proof.publication_content_hash:
+                        diagnostic = self._diagnostic(
+                            entry,
+                            "publication-content-proof-missing",
+                            "archived ExecPlan의 게시 본문 hash를 확인할 수 없습니다: "
+                            f"{entry.path}",
+                        )
+                    else:
+                        if not trusted_identity:
+                            original_hash = proof.publication_content_hash
+                        if (
+                            proof.publication_content_hash != original_hash
+                            or proof.publication_content_hash
+                            != entry.content_hash
+                        ):
+                            diagnostic = self._diagnostic(
+                                entry,
+                                "archived-content-hash-mismatch",
+                                "archived ExecPlan byte hash가 게시 revision의 "
+                                "본문 hash와 다릅니다: "
+                                f"{entry.path}",
+                            )
 
             self.repository.record(
                 repo,
@@ -307,6 +402,14 @@ class CatalogRecoveryService:
                 plan_sha=stable_plan_sha,
                 proof=proof,
                 diagnostic=diagnostic,
+                identity_verified=bool(
+                    trusted_identity
+                    or (
+                        proof.merged
+                        and stable_plan_sha
+                        and proof.publication_content_hash
+                    )
+                ),
             )
             if diagnostic is not None:
                 diagnostics.append(diagnostic)
