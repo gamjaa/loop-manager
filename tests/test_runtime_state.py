@@ -274,6 +274,7 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
 
         self.assertEqual(snapshot.repo, "repo")
         self.assertEqual(snapshot.planning_fingerprint, "planning-kept")
+        self.assertIsNone(snapshot.specification_fingerprint)
         self.assertEqual(
             snapshot.planning_attempt_fingerprint, "planning-cleared"
         )
@@ -294,6 +295,7 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
         )
         self.assertEqual(activated.status, "IMPLEMENTING")
         self.assertEqual(activated.phase, "WORKING")
+        self.assertTrue(activated.ever_started)
         with self.assertRaises(dataclasses.FrozenInstanceError):
             activated.status = "VERIFYING"
 
@@ -518,7 +520,7 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
             (None, None, "merged-sha", "merged-cycle"),
         )
 
-    def test_expected_status_mismatch_and_between_row_failure_roll_back(self):
+    def test_activation_rollback_restores_both_source_and_projection(self):
         for stage in ("after_execplan_update", "after_project_update"):
             with self.subTest(stage=stage):
                 connection = self._connection()
@@ -539,14 +541,14 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
                         worktree="/state/G-047",
                     )
                 plan = connection.execute(
-                    "SELECT status, active_sha FROM exec_plans "
+                    "SELECT status, active_sha, ever_started FROM exec_plans "
                     "WHERE repo = 'repo' AND plan_id = 'G-047'"
                 ).fetchone()
                 project = connection.execute(
                     "SELECT phase, active_sha, plan_path FROM projects "
                     "WHERE repo = 'repo'"
                 ).fetchone()
-                self.assertEqual(tuple(plan), ("READY", None))
+                self.assertEqual(tuple(plan), ("READY", None, 0))
                 self.assertEqual(tuple(project), (None, None, None))
 
                 activated = runtime_state.RuntimeStateRepository(
@@ -560,6 +562,7 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
                 )
                 self.assertEqual(activated.status, "IMPLEMENTING")
 
+    def test_expected_status_mismatch_rejects_second_activation(self):
         connection = self._connection()
         repository = runtime_state.RuntimeStateRepository(connection)
         repository.activate(

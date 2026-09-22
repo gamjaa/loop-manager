@@ -71,6 +71,7 @@ PROJECT_ONLY_FIELDS = frozenset(
         "base_branch",
         "provider",
         "processed_sha",
+        "specification_fingerprint",
         "planning_fingerprint",
         "planning_attempt_fingerprint",
         "planning_workspace_owned",
@@ -105,6 +106,7 @@ EXECPLAN_RUNTIME_FIELDS = frozenset(MIRRORED_FIELDS) | {
     "blocked_reason",
     "guidance_plan_hash",
     "workspace_owned",
+    "ever_started",
 }
 
 PLANNING_CLEAR_VALUES: Mapping[str, object] = {
@@ -187,6 +189,7 @@ class PlanningSnapshot:
     repo: str
     phase: str | None
     processed_sha: str | None
+    specification_fingerprint: str | None
     planning_fingerprint: str | None
     planning_attempt_fingerprint: str | None
     planning_workspace_owned: int
@@ -218,6 +221,9 @@ class PlanningSnapshot:
             repo=str(row["repo"]),
             phase=_text(row, "phase"),
             processed_sha=_text(row, "processed_sha"),
+            specification_fingerprint=_text(
+                row, "specification_fingerprint"
+            ),
             planning_fingerprint=_text(row, "planning_fingerprint"),
             planning_attempt_fingerprint=_text(
                 row, "planning_attempt_fingerprint"
@@ -247,6 +253,7 @@ class PlanningSnapshot:
 def clear_project_values(
     *,
     processed_sha: str | None = None,
+    specification_fingerprint: str | None = None,
     planning_fingerprint: str | None = None,
 ) -> dict[str, object]:
     """Return the legacy full clear while keeping field ownership explicit."""
@@ -254,6 +261,8 @@ def clear_project_values(
     values = {**EXECUTION_CLEAR_VALUES, **PLANNING_CLEAR_VALUES}
     if processed_sha is not None:
         values["processed_sha"] = processed_sha
+    if specification_fingerprint is not None:
+        values["specification_fingerprint"] = specification_fingerprint
     if planning_fingerprint is not None:
         values["planning_fingerprint"] = planning_fingerprint
     return values
@@ -301,6 +310,7 @@ class ExecutionSnapshot:
     publication_token: str | None
     revision_resume_status: str | None
     workspace_owned: int
+    ever_started: bool
     agent_role: str | None
     agent_snapshot: str | None
     agent_input_fingerprint: str | None
@@ -351,6 +361,7 @@ class ExecutionSnapshot:
             publication_token=_text(row, "publication_token"),
             revision_resume_status=_text(row, "revision_resume_status"),
             workspace_owned=int(row["workspace_owned"]),
+            ever_started=bool(row["ever_started"]),
             agent_role=_text(row, "agent_role"),
             agent_snapshot=_text(row, "agent_snapshot"),
             agent_input_fingerprint=_text(row, "agent_input_fingerprint"),
@@ -785,6 +796,7 @@ class RuntimeStateRepository:
             expected_status="READY",
             plan_values={
                 "status": "IMPLEMENTING",
+                "ever_started": 1,
                 "active_sha": activation_sha,
                 "branch": branch,
                 "worktree": worktree,
@@ -852,11 +864,13 @@ class RuntimeStateRepository:
         repo: str,
         *,
         processed_sha: str | None = None,
+        specification_fingerprint: str | None = None,
         planning_fingerprint: str | None = None,
         enqueue: bool = False,
     ) -> None:
         values = clear_project_values(
             processed_sha=processed_sha,
+            specification_fingerprint=specification_fingerprint,
             planning_fingerprint=planning_fingerprint,
         )
         with _transaction(self.connection):

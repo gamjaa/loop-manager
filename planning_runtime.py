@@ -9,6 +9,8 @@ import hashlib
 from pathlib import Path
 from typing import Any, Callable, Protocol, Sequence
 
+from planning_catalog import MutableReadySnapshot
+
 from maintenance_orchestration import (
     MaintenanceOrchestrationError,
     MaintenanceOutcome,
@@ -68,6 +70,47 @@ class PlanningAgentResultKind(str, Enum):
     TRANSIENT_FAILURE = "transient_failure"
     USAGE_LIMIT = "usage_limit"
     PERMANENT_CONFIGURATION = "permanent_configuration"
+
+
+class PlanningDecisionKind(str, Enum):
+    """One safe-boundary scheduling choice, before effects are performed."""
+
+    RESUME_ACTIVE = "resume_active"
+    RUN_SPECIFICATION_PLANNING = "run_specification_planning"
+    ACTIVATE_READY = "activate_ready"
+    RUN_FALLBACK_PLANNING = "run_fallback_planning"
+    STABLE_WAIT = "stable_wait"
+    COMPLETE = "complete"
+
+
+@dataclass(frozen=True)
+class PlanningDecision:
+    kind: PlanningDecisionKind
+
+
+def choose_planning_decision(
+    *,
+    has_active: bool,
+    specification_changed: bool,
+    runnable_ready: bool,
+    planning_input_changed: bool,
+    has_waiting_catalog: bool,
+) -> PlanningDecision:
+    """Apply the R-024 priority order without repository side effects."""
+
+    if has_active:
+        kind = PlanningDecisionKind.RESUME_ACTIVE
+    elif specification_changed:
+        kind = PlanningDecisionKind.RUN_SPECIFICATION_PLANNING
+    elif runnable_ready:
+        kind = PlanningDecisionKind.ACTIVATE_READY
+    elif planning_input_changed:
+        kind = PlanningDecisionKind.RUN_FALLBACK_PLANNING
+    elif has_waiting_catalog:
+        kind = PlanningDecisionKind.STABLE_WAIT
+    else:
+        kind = PlanningDecisionKind.COMPLETE
+    return PlanningDecision(kind)
 
 
 class PlanningResultInvalid(RuntimeError):
@@ -164,6 +207,7 @@ class PlanningStatePort(Protocol):
         repo: str,
         *,
         processed_sha: object = None,
+        specification_fingerprint: object = None,
         planning_fingerprint: object = None,
     ) -> None: ...
 
@@ -172,6 +216,7 @@ class PlanningStatePort(Protocol):
         repo: str,
         *,
         processed_sha: object = None,
+        specification_fingerprint: object = None,
         planning_fingerprint: object = None,
     ) -> None: ...
 
@@ -232,6 +277,33 @@ class PlanningStatePort(Protocol):
         fingerprint: str,
     ) -> None: ...
 
+    def general_publication(self, repo: str) -> Any | None: ...
+
+    def recover_general_batch(
+        self, repo: str, worktree: Path, base: str
+    ) -> str: ...
+
+    def record_general_intent(
+        self,
+        repo: str,
+        worktree: Path,
+        validated_result: Any,
+        plan_commit: str,
+        specification_fingerprint: str,
+        planning_fingerprint: str,
+    ) -> Any: ...
+
+    def publish_general_batch(
+        self,
+        repo: str,
+        worktree: Path,
+        base: str,
+        validated_result: Any,
+        plan_commit: str,
+        specification_fingerprint: str,
+        planning_fingerprint: str,
+    ) -> None: ...
+
 
 class PlanningGitPort(Protocol):
     """Git and managed planning-worktree boundary."""
@@ -241,6 +313,8 @@ class PlanningGitPort(Protocol):
     ) -> Any: ...
 
     def input_fingerprint(self, repo_path: Path, sha: str) -> str: ...
+
+    def specification_fingerprint(self, repo_path: Path, sha: str) -> str: ...
 
     def requirement_archive_only(
         self, repo_path: Path, old_sha: str, new_sha: str
@@ -320,7 +394,16 @@ class PlanningValidationPort(Protocol):
         cycle: maintenance_state.MaintenanceCycle,
     ) -> str: ...
 
-    def planner_prompt(self, error: str | None, catalog: str) -> str: ...
+    def prepare_general_context(
+        self, repo: str, worktree: Path, active_sha: str
+    ) -> MutableReadySnapshot: ...
+
+    def planner_prompt(
+        self,
+        error: str | None,
+        catalog: str,
+        mutable_snapshot: MutableReadySnapshot,
+    ) -> str: ...
 
     def maintenance_prompt(
         self,
@@ -333,7 +416,12 @@ class PlanningValidationPort(Protocol):
     ) -> str: ...
 
     def validate_general_result(
-        self, worktree: Path, active_sha: str, dirty_files: Sequence[str]
+        self,
+        repo: str,
+        worktree: Path,
+        active_sha: str,
+        dirty_files: Sequence[str],
+        mutable_snapshot: MutableReadySnapshot,
     ) -> Any: ...
 
     def validate_maintenance_result(
@@ -382,11 +470,14 @@ class _PlanningRun:
     maintenance_planning: bool
     ready_activated_before_planning: bool = False
     general_fingerprint: str | None = None
+    specification_fingerprint: str | None = None
     current_fingerprint: str | None = None
+    selection: PlanningDecision | None = None
     fingerprint_skipped: bool = False
     published_refactoring: bool = False
     planning_worktree: Path | None = None
     maintenance_context: MaintenancePlanningContext | None = None
+    mutable_ready_snapshot: MutableReadySnapshot | None = None
     maintenance_change_context: str = ""
     dirty_files: list[str] | None = None
     planner_scope_error: str | None = None
@@ -447,6 +538,44 @@ class PlanningLifecycleCoordinator:
         context = run.context
         cycle = run.maintenance_cycle
         row = run.row
+        general_intent = self._ports.state.general_publication(context.repo)
+        if general_intent is not None and row.phase == "PLANNING":
+            worktree = Path(str(row.worktree or ""))
+            fingerprint = str(row.planning_attempt_fingerprint or "")
+            try:
+                self._ports.git.validate_worktree_ownership(
+                    context.repo, fingerprint, worktree
+                )
+                self._ports.git.run(context.repo_path, "fetch", "origin")
+                recovery = self._ports.state.recover_general_batch(
+                    context.repo, worktree, context.base_branch
+                )
+            except RuntimeError as error:
+                message = str(error)
+                self._ports.state.update(
+                    context.repo,
+                    planning_error=message,
+                    planning_error_fingerprint=fingerprint,
+                    last_error=message,
+                )
+                self._ports.events.error(message)
+                return self._operational_error()
+            if recovery == "pending":
+                return None
+            if worktree.exists():
+                self._ports.git.run(
+                    context.repo_path,
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(worktree),
+                )
+            self._ports.events.info(
+                "게시된 일반 planning batch를 복구했습니다."
+                if recovery == "applied"
+                else "원격 변경에 맞춰 일반 planning batch를 다시 시작합니다."
+            )
+            return PlanningOutcome(PlanningOutcomeKind.PUBLICATION_RECOVERY)
         if not (
             run.maintenance_planning
             and cycle.publication_stage == "prepared"
@@ -587,19 +716,49 @@ class PlanningLifecycleCoordinator:
             run.ready_activated_before_planning = True
         else:
             decision = self._ports.state.schedule(context.repo)
-            if decision.has_ready:
-                if decision.runnable_ready is None:
-                    self._ports.events.info(
-                        "READY ExecPlan이 남아 있지만 dependency가 충족되지 않아 대기합니다."
-                    )
-                    return PlanningOutcome(PlanningOutcomeKind.WAITING)
+            if getattr(decision, "project_blocked", False):
+                self._ports.events.info(
+                    "PROJECT_BLOCKED 해제 전에는 새 Planner나 Worker를 시작하지 않습니다."
+                )
+                return PlanningOutcome(PlanningOutcomeKind.WAITING)
+            run.general_fingerprint = self._ports.git.input_fingerprint(
+                context.repo_path, run.base_sha
+            )
+            run.specification_fingerprint = (
+                self._ports.git.specification_fingerprint(
+                    context.repo_path, run.base_sha
+                )
+            )
+            specification_changed = self._specification_planning_required(
+                row,
+                context,
+                run.base_sha,
+                run.specification_fingerprint,
+                run.general_fingerprint,
+            )
+            planning_input_changed = self._general_planning_required(
+                row,
+                context,
+                run.base_sha,
+                run.general_fingerprint,
+            )
+            run.selection = choose_planning_decision(
+                has_active=getattr(decision, "active", None) is not None,
+                specification_changed=specification_changed,
+                runnable_ready=decision.runnable_ready is not None,
+                planning_input_changed=planning_input_changed,
+                has_waiting_catalog=bool(
+                    decision.has_ready or decision.has_waiting
+                ),
+            )
+            if run.selection.kind is PlanningDecisionKind.ACTIVATE_READY:
                 run.base_sha = self._fetch_remote_head(context)
                 self._ports.state.activate_ready(context.repo, run.base_sha)
                 row = self._ports.state.planning(context.repo)
                 run.ready_activated_before_planning = True
-            elif decision.has_waiting:
+            elif run.selection.kind is PlanningDecisionKind.STABLE_WAIT:
                 self._ports.events.info(
-                    "독립 READY가 없어 PLAN_BLOCKED 또는 PR_OPEN 종료를 기다립니다."
+                    "계획 입력이 안정적이며 실행 가능한 READY가 없어 대기합니다."
                 )
                 return PlanningOutcome(PlanningOutcomeKind.WAITING)
         run.row = row
@@ -617,6 +776,38 @@ class PlanningLifecycleCoordinator:
             return False
         if row.planning_fingerprint and row.processed_sha:
             processed = self._ports.git.input_fingerprint(
+                context.repo_path, row.processed_sha
+            )
+            if processed == current_fingerprint:
+                return False
+            if self._ports.git.requirement_archive_only(
+                context.repo_path, row.processed_sha, base_sha
+            ):
+                return False
+        return True
+
+    def _specification_planning_required(
+        self,
+        row: runtime_state.PlanningSnapshot,
+        context: PlanningContext,
+        base_sha: str,
+        current_fingerprint: str,
+        current_general_fingerprint: str,
+    ) -> bool:
+        baseline = row.specification_fingerprint
+        if baseline is None and row.planning_fingerprint == current_general_fingerprint:
+            # Existing databases already have a successful full-input marker.
+            # Treat an identical full input as the corresponding specification
+            # baseline and persist the explicit value at the next success.
+            return False
+        if baseline is None and row.planning_fingerprint and row.processed_sha:
+            baseline = self._ports.git.specification_fingerprint(
+                context.repo_path, row.processed_sha
+            )
+        if baseline == current_fingerprint:
+            return False
+        if row.processed_sha:
+            processed = self._ports.git.specification_fingerprint(
                 context.repo_path, row.processed_sha
             )
             if processed == current_fingerprint:
@@ -667,6 +858,12 @@ class PlanningLifecycleCoordinator:
             run.general_fingerprint = self._ports.git.input_fingerprint(
                 context.repo_path, run.base_sha
             )
+        if fingerprint_required and run.specification_fingerprint is None:
+            run.specification_fingerprint = (
+                self._ports.git.specification_fingerprint(
+                    context.repo_path, run.base_sha
+                )
+            )
         run.current_fingerprint = (
             maintenance_planning_fingerprint(
                 cycle, run.general_fingerprint or ""
@@ -714,12 +911,25 @@ class PlanningLifecycleCoordinator:
                 row = self._ports.state.planning(context.repo)
 
         planning_required = not row.phase
+        forced_general_planning = bool(
+            run.selection
+            and run.selection.kind
+            in {
+                PlanningDecisionKind.RUN_SPECIFICATION_PLANNING,
+                PlanningDecisionKind.RUN_FALLBACK_PLANNING,
+            }
+        )
         if (
             not run.maintenance_planning
             and not row.phase
             and row.planning_fingerprint == run.current_fingerprint
+            and not forced_general_planning
         ):
-            self._ports.state.update(context.repo, processed_sha=run.base_sha)
+            self._ports.state.update(
+                context.repo,
+                processed_sha=run.base_sha,
+                specification_fingerprint=run.specification_fingerprint,
+            )
             self._ports.events.info(
                 "계획 입력이 바뀌지 않아 Agent를 실행하지 않습니다."
             )
@@ -731,12 +941,17 @@ class PlanningLifecycleCoordinator:
             and not run.maintenance_planning
             and row.planning_fingerprint
             and row.processed_sha
+            and not forced_general_planning
         ):
             processed = self._ports.git.input_fingerprint(
                 context.repo_path, row.processed_sha
             )
             if processed == run.current_fingerprint:
-                self._ports.state.update(context.repo, processed_sha=run.base_sha)
+                self._ports.state.update(
+                    context.repo,
+                    processed_sha=run.base_sha,
+                    specification_fingerprint=run.specification_fingerprint,
+                )
                 self._ports.events.info(
                     "계획 입력이 바뀌지 않아 Agent를 실행하지 않습니다."
                 )
@@ -745,7 +960,10 @@ class PlanningLifecycleCoordinator:
             elif self._ports.git.requirement_archive_only(
                 context.repo_path, row.processed_sha, run.base_sha
             ):
-                self._ports.state.update(context.repo, processed_sha=run.base_sha)
+                self._ports.state.update(
+                    context.repo,
+                    processed_sha=run.base_sha,
+                )
                 self._ports.events.info(
                     "Requirement archive 이동 외의 계획 입력이 바뀌지 않아 Agent를 실행하지 않습니다."
                 )
@@ -938,6 +1156,25 @@ class PlanningLifecycleCoordinator:
             run.maintenance_cycle = cycle
             run.maintenance_context = maintenance_context
             run.maintenance_change_context = change_context
+        else:
+            try:
+                run.mutable_ready_snapshot = (
+                    self._ports.validation.prepare_general_context(
+                        context.repo,
+                        worktree,
+                        str(row.active_sha or ""),
+                    )
+                )
+            except PlanningResultInvalid as error:
+                message = str(error)
+                self._ports.state.update(
+                    context.repo,
+                    planning_error=message,
+                    planning_error_fingerprint=run.current_fingerprint,
+                    last_error=message,
+                )
+                self._ports.events.error(message)
+                return self._operational_error()
         run.planning_worktree = worktree
         return None
 
@@ -1003,9 +1240,11 @@ class PlanningLifecycleCoordinator:
                     ),
                 )
             else:
+                assert run.mutable_ready_snapshot is not None
                 prompt = self._ports.validation.planner_prompt(
                     row.planning_validation_error or row.last_error,
                     self._ports.state.compact_catalog(context.repo),
+                    run.mutable_ready_snapshot,
                 )
             before = self._ports.agent.begin_scope(role, worktree)
             result = self._ports.agent.run_planner(
@@ -1163,10 +1402,13 @@ class PlanningLifecycleCoordinator:
                             "refactoring 결과에는 검증 가능한 planning batch가 필요합니다."
                         )
             else:
+                assert run.mutable_ready_snapshot is not None
                 validated_result = self._ports.validation.validate_general_result(
+                    context.repo,
                     worktree,
                     str(row.active_sha or ""),
                     dirty_files,
+                    run.mutable_ready_snapshot,
                 )
         except PlanningResultInvalid as error:
             message = str(error)
@@ -1261,6 +1503,11 @@ class PlanningLifecycleCoordinator:
             completed_fingerprint = self._ports.git.input_fingerprint(
                 context.repo_path, str(row.active_sha or "")
             )
+            completed_specification_fingerprint = (
+                self._ports.git.specification_fingerprint(
+                    context.repo_path, str(row.active_sha or "")
+                )
+            )
             self._ports.git.validate_worktree_ownership(
                 context.repo,
                 str(run.current_fingerprint or ""),
@@ -1315,6 +1562,11 @@ class PlanningLifecycleCoordinator:
                             if run.maintenance_cycle.include_general_planning
                             else None
                         ),
+                        specification_fingerprint=(
+                            completed_specification_fingerprint
+                            if run.maintenance_cycle.include_general_planning
+                            else None
+                        ),
                         planning_fingerprint=(
                             completed_fingerprint
                             if run.maintenance_cycle.include_general_planning
@@ -1325,6 +1577,9 @@ class PlanningLifecycleCoordinator:
                 self._ports.state.clear_active(
                     context.repo,
                     processed_sha=row.active_sha,
+                    specification_fingerprint=(
+                        completed_specification_fingerprint
+                    ),
                     planning_fingerprint=completed_fingerprint,
                 )
             self._ports.git.run(
@@ -1351,8 +1606,12 @@ class PlanningLifecycleCoordinator:
             )
             if run.maintenance_planning:
                 message = "Update periodic maintenance planning batch"
-            elif not plans:
+            elif not plans and not (
+                validated_result.revisions or validated_result.deletions
+            ):
                 message = "Update future ideas from planning"
+            elif validated_result.revisions or validated_result.deletions:
+                message = "Update mutable READY planning batch"
             else:
                 first = plans[0][1]
                 last = plans[-1][1]
@@ -1421,12 +1680,75 @@ class PlanningLifecycleCoordinator:
                 self._ports.events.error(message)
                 return self._operational_error()
 
+        if not run.maintenance_planning:
+            assert run.specification_fingerprint is not None
+            assert run.general_fingerprint is not None
+            try:
+                self._ports.git.validate_worktree_ownership(
+                    context.repo,
+                    str(run.current_fingerprint or ""),
+                    worktree,
+                )
+                self._ports.state.record_general_intent(
+                    context.repo,
+                    worktree,
+                    validated_result,
+                    plan_commit,
+                    run.specification_fingerprint,
+                    run.general_fingerprint,
+                )
+            except RuntimeError as error:
+                message = str(error)
+                self._ports.state.update(
+                    context.repo,
+                    planning_error=message,
+                    planning_error_fingerprint=run.current_fingerprint,
+                    last_error=message,
+                )
+                self._ports.events.error(message)
+                return self._operational_error()
+
         self._ports.git.run(context.repo_path, "fetch", "origin")
         latest_sha = self._ports.git.run(
             context.repo_path,
             "rev-parse",
             f"origin/{context.base_branch}",
         ).stdout.strip()
+        if (
+            not run.maintenance_planning
+            and latest_sha not in {row.active_sha, plan_commit}
+        ):
+            try:
+                recovery = self._ports.state.recover_general_batch(
+                    context.repo, worktree, context.base_branch
+                )
+            except RuntimeError as error:
+                message = str(error)
+                self._ports.state.update(
+                    context.repo,
+                    planning_error=message,
+                    planning_error_fingerprint=run.current_fingerprint,
+                    last_error=message,
+                )
+                self._ports.events.error(message)
+                return self._operational_error()
+            if recovery == "pending":
+                raise RuntimeError(
+                    "원격 base가 이동했지만 publication recovery가 pending을 반환했습니다."
+                )
+            self._ports.git.run(
+                context.repo_path,
+                "worktree",
+                "remove",
+                "--force",
+                str(worktree),
+            )
+            self._ports.events.info(
+                "게시된 일반 planning batch를 복구했습니다."
+                if recovery == "applied"
+                else "원격 변경에 맞춰 일반 planning batch를 다시 시작합니다."
+            )
+            return PlanningOutcome(PlanningOutcomeKind.PUBLICATION_RECOVERY)
         if run.maintenance_planning and latest_sha not in {
             row.active_sha,
             plan_commit,
@@ -1462,6 +1784,32 @@ class PlanningLifecycleCoordinator:
             else:
                 self._ports.events.info("게시된 유지보수 batch를 복구했습니다.")
             return PlanningOutcome(PlanningOutcomeKind.PUBLICATION_RECOVERY)
+
+        if not run.maintenance_planning:
+            assert run.specification_fingerprint is not None
+            assert run.general_fingerprint is not None
+            try:
+                # The first call durably records the intent. Repeating the
+                # idempotent operation after fetch closes the activation race
+                # between validation and the fast-forward push.
+                self._ports.state.record_general_intent(
+                    context.repo,
+                    worktree,
+                    validated_result,
+                    plan_commit,
+                    run.specification_fingerprint,
+                    run.general_fingerprint,
+                )
+            except RuntimeError as error:
+                message = str(error)
+                self._ports.state.update(
+                    context.repo,
+                    planning_error=message,
+                    planning_error_fingerprint=run.current_fingerprint,
+                    last_error=message,
+                )
+                self._ports.events.error(message)
+                return self._operational_error()
 
         if latest_sha not in {row.active_sha, plan_commit}:
             published = (
@@ -1550,12 +1898,16 @@ class PlanningLifecycleCoordinator:
                 str(run.current_fingerprint or ""),
                 worktree,
             )
-            self._ports.state.register_execplans(
+            assert run.specification_fingerprint is not None
+            assert run.general_fingerprint is not None
+            self._ports.state.publish_general_batch(
                 context.repo,
                 worktree,
-                plans,
+                context.base_branch,
+                validated_result,
                 plan_commit,
-                str(run.current_fingerprint or ""),
+                run.specification_fingerprint,
+                run.general_fingerprint,
             )
         self._ports.git.run(
             context.repo_path,

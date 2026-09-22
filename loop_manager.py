@@ -60,6 +60,13 @@ import requirement_archive
 import requirement_archive_state
 import execplan_catalog
 import execplan_catalog_state
+from planning_catalog import (
+    MutableReadySnapshot,
+    PlanDeletion,
+    mutable_snapshot_token,
+    snapshot_from_dict,
+    snapshot_to_dict,
+)
 from planning_runtime import (
     MAX_PLANNER_VALIDATION_RETRIES,
     PlanningAgentResult,
@@ -158,6 +165,7 @@ CREATE TABLE IF NOT EXISTS projects (
     registered INTEGER NOT NULL DEFAULT 1,
     agents_hash TEXT,
     agents_approved INTEGER NOT NULL DEFAULT 0,
+    specification_fingerprint TEXT,
     planning_fingerprint TEXT,
     planning_attempt_fingerprint TEXT,
     planning_workspace_owned INTEGER NOT NULL DEFAULT 0,
@@ -279,6 +287,7 @@ CREATE TABLE IF NOT EXISTS exec_plans (
     blocked_reason TEXT,
     guidance_plan_hash TEXT,
     workspace_owned INTEGER NOT NULL DEFAULT 0,
+    ever_started INTEGER NOT NULL DEFAULT 0,
     agent_role TEXT,
     agent_snapshot TEXT,
     agent_input_fingerprint TEXT,
@@ -328,6 +337,42 @@ EXEC_PLANS_ACTIVE_INDEX = """
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_execplan_per_project
 ON exec_plans(repo)
 WHERE status IN ('IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING')
+"""
+
+EXECPLAN_CANCELLATIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS execplan_cancellations (
+    repo TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    title TEXT NOT NULL,
+    sources TEXT NOT NULL,
+    depends_on TEXT NOT NULL,
+    complexity TEXT NOT NULL,
+    risk TEXT NOT NULL,
+    priority TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    plan_sha TEXT NOT NULL,
+    deletion_commit TEXT NOT NULL,
+    cancelled_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (repo, plan_id),
+    FOREIGN KEY (repo) REFERENCES projects(repo)
+)
+"""
+
+GENERAL_PLANNING_PUBLICATIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS general_planning_publications (
+    repo TEXT PRIMARY KEY,
+    stage TEXT NOT NULL,
+    base_sha TEXT NOT NULL,
+    commit_sha TEXT NOT NULL,
+    snapshot_token TEXT NOT NULL,
+    specification_fingerprint TEXT NOT NULL,
+    planning_fingerprint TEXT NOT NULL,
+    manifest TEXT NOT NULL,
+    manifest_hash TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (repo) REFERENCES projects(repo)
+)
 """
 
 
@@ -1046,6 +1091,7 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
         "review_token": "TEXT",
         "publication_token": "TEXT",
         "revision_resume_status": "TEXT",
+        "ever_started": "INTEGER NOT NULL DEFAULT 0",
     }
     for column, definition in migrations.items():
         if column not in columns:
@@ -1082,7 +1128,69 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
             raise
         else:
             connection.execute("RELEASE publication_backfill")
+    if "ever_started" not in columns:
+        migrated_columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(exec_plans)")
+        }
+        evidence = []
+        if "status" in migrated_columns:
+            evidence.append("status != 'READY'")
+        for field in (
+            "active_sha",
+            "validated_base_sha",
+            "publication_remote_oid",
+            "pr_conflict_head_oid",
+            "pr_conflict_base_oid",
+            "branch",
+            "worktree",
+            "pr_url",
+            "pr_head_oid",
+            "last_error",
+            "blocked_fingerprint",
+            "blocked_worktree_fingerprint",
+            "blocked_review_fingerprint",
+            "worker_session_id",
+            "reviewer_session_id",
+            "worker_result",
+            "verify_result",
+            "review_result",
+            "blocked_reason",
+            "guidance_plan_hash",
+            "agent_role",
+            "agent_snapshot",
+            "agent_input_fingerprint",
+            "agent_baseline",
+            "agent_recovery",
+            "agent_input_plan",
+            "agent_result_plan",
+            "agent_result_snapshot",
+            "agent_manager_snapshot",
+        ):
+            if field in migrated_columns:
+                evidence.append(f"{field} IS NOT NULL")
+        for field in (
+            "pr_conflict_recovery",
+            "retry_count",
+            "workspace_owned",
+        ):
+            if field in migrated_columns:
+                evidence.append(f"{field} != 0")
+        for field in (
+            "verify_failure_history",
+            "review_failure_history",
+            "review_level_history",
+        ):
+            if field in migrated_columns:
+                evidence.append(f"{field} != '{{}}'")
+        if evidence:
+            connection.execute(
+                "UPDATE exec_plans SET ever_started = 1 WHERE "
+                + " OR ".join(evidence)
+            )
     connection.execute(GUIDANCE_APPROVALS_SCHEMA)
+    connection.execute(EXECPLAN_CANCELLATIONS_SCHEMA)
+    connection.execute(GENERAL_PLANNING_PUBLICATIONS_SCHEMA)
     agent_invocation_state.ensure_schema(connection)
     validation_feedback_state.ensure_schema(connection)
     validation_feedback_state.ValidationFeedbackRepository(connection).migrate_legacy()
@@ -1133,6 +1241,7 @@ def connect_database(
     columns = {row[1] for row in connection.execute("PRAGMA table_info(projects)")}
     migrations = {
         "provider": "TEXT NOT NULL DEFAULT 'codex'",
+        "specification_fingerprint": "TEXT",
         "plan_path": "TEXT",
         "planning_fingerprint": "TEXT",
         "planning_attempt_fingerprint": "TEXT",
@@ -1582,9 +1691,30 @@ def _is_planning_input(path: bytes) -> bool:
     return not path.startswith(b"docs/")
 
 
+def _is_specification_input(path: bytes) -> bool:
+    return path in {b"docs/PRODUCT.md", b"docs/ARCHITECTURE.md"} or (
+        _is_active_requirement(path)
+    )
+
+
 def _planning_input_digest(entries: list[tuple[bytes, bytes, bytes]]) -> str:
     digest = hashlib.sha256()
     digest.update(b"loop-manager-planning-input-v2\0")
+    for path, object_type, contents in sorted(entries, key=lambda entry: entry[0]):
+        digest.update(len(path).to_bytes(8, "big"))
+        digest.update(path)
+        digest.update(len(object_type).to_bytes(8, "big"))
+        digest.update(object_type)
+        digest.update(len(contents).to_bytes(8, "big"))
+        digest.update(contents)
+    return digest.hexdigest()
+
+
+def _specification_input_digest(
+    entries: list[tuple[bytes, bytes, bytes]],
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"loop-manager-specification-input-v1\0")
     for path, object_type, contents in sorted(entries, key=lambda entry: entry[0]):
         digest.update(len(path).to_bytes(8, "big"))
         digest.update(path)
@@ -1609,6 +1739,24 @@ def _planning_input_fingerprint(repo: Path, revision: str) -> str:
 
 def planning_input_fingerprint(repo: Path, base: str) -> str:
     return _planning_input_fingerprint(repo, f"origin/{base}")
+
+
+def _specification_input_fingerprint(repo: Path, revision: str) -> str:
+    entries: list[tuple[bytes, bytes, bytes]] = []
+    for path, (object_type, object_id) in _git_tree_entries(repo, revision).items():
+        if not _is_specification_input(path):
+            continue
+        contents = (
+            git_bytes(repo, "cat-file", "blob", object_id.decode("ascii"))
+            if object_type == b"blob"
+            else object_id
+        )
+        entries.append((path, object_type, contents))
+    return _specification_input_digest(entries)
+
+
+def specification_input_fingerprint(repo: Path, base: str) -> str:
+    return _specification_input_fingerprint(repo, f"origin/{base}")
 
 
 def _is_requirement_archive_only_change(
@@ -1727,6 +1875,8 @@ class ValidatedPlanningResult:
     publication_paths: tuple[str, ...]
     publication_hashes: tuple[tuple[str, str], ...] = ()
     revisions: tuple[PlanRevision, ...] = ()
+    deletions: tuple[PlanDeletion, ...] = ()
+    mutable_snapshot: MutableReadySnapshot | None = None
     maintenance_context: MaintenancePlanningContext | None = None
     refactoring_plan_ids: tuple[str, ...] = ()
     revalidation_plan_ids: tuple[str, ...] = ()
@@ -1818,8 +1968,12 @@ def validate_planner_result(
     worktree: Path,
     active_sha: str,
     dirty_files: list[str],
+    *,
+    connection: sqlite3.Connection | None = None,
+    repo: str | None = None,
+    mutable_snapshot: MutableReadySnapshot | None = None,
 ) -> ValidatedPlanningResult | None:
-    """Validate new ExecPlans and the optional future-idea document.
+    """Validate one create/revise/rename/delete planning batch.
 
     Scope and ExecPlan catalog errors are deliberately translated to a
     dedicated exception. Operational Git failures must retain their normal
@@ -1828,56 +1982,154 @@ def validate_planner_result(
     planned_files = sorted(set(dirty_files) | set(changed_files(worktree, active_sha)))
     if not planned_files:
         return None
+    snapshot = mutable_snapshot or MutableReadySnapshot(
+        repo=repo or "",
+        active_sha=active_sha,
+        plans=(),
+        token=mutable_snapshot_token(repo or "", active_sha, ()),
+    )
+    if snapshot.active_sha != active_sha or (repo is not None and snapshot.repo != repo):
+        raise PlannerValidationError("mutable READY snapshot이 planning 기준과 다릅니다.")
+
     plan_paths: list[str] = []
-    for plan_path in planned_files:
-        if plan_path == "docs/FUTURE_IDEAS.md":
-            if not (worktree / plan_path).is_file():
+    base_paths: set[str] = set()
+    current_plans: dict[str, dict[str, object]] = {}
+    for changed_path in planned_files:
+        if changed_path == "docs/FUTURE_IDEAS.md":
+            if not (worktree / changed_path).is_file():
                 raise PlannerValidationError(
                     "Planner는 docs/FUTURE_IDEAS.md를 삭제할 수 없습니다."
                 )
             continue
-        if not re.fullmatch(r"docs/plans/[^/]+\.md", plan_path):
+        if not re.fullmatch(r"docs/plans/[^/]+\.md", changed_path):
             raise PlannerValidationError(
-                "Planner는 docs/plans의 새 ExecPlan과 docs/FUTURE_IDEAS.md만 "
-                "작성할 수 있습니다."
+                "Planner는 docs/plans의 새 계획, mutable READY와 "
+                "docs/FUTURE_IDEAS.md만 변경할 수 있습니다."
             )
-        if not (worktree / plan_path).is_file():
-            raise PlannerValidationError("Planner는 기존 ExecPlan을 삭제할 수 없습니다.")
-        try:
-            planner_text = (worktree / plan_path).read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as error:
-            raise PlannerValidationError(f"Planner ExecPlan을 읽을 수 없습니다: {plan_path}") from error
-        if contains_guidance_sections(planner_text):
-            raise PlannerValidationError("Planner는 AGENTS.md guidance를 제안할 수 없습니다.")
         existed = git(
             worktree,
             "cat-file",
             "-e",
-            f"{active_sha}:{plan_path}",
+            f"{active_sha}:{changed_path}",
             check=False,
         ).returncode == 0
         if existed:
-            raise PlannerValidationError(f"Planner는 기존 ExecPlan을 수정할 수 없습니다: {plan_path}")
-        plan_paths.append(plan_path)
-
-    try:
-        snapshot = load_execplan_snapshot(worktree, validate_sources=False)
-        plans: list[tuple[str, dict[str, object]]] = []
-        for plan_path in plan_paths:
+            if changed_path not in snapshot.by_path:
+                if mutable_snapshot is None:
+                    raise PlannerValidationError(
+                        "Planner는 기존 ExecPlan을 수정·삭제할 수 없습니다: "
+                        f"{changed_path}"
+                    )
+                raise PlannerValidationError(
+                    "Planner는 snapshot 밖 ExecPlan을 변경할 수 없습니다: "
+                    f"{changed_path}"
+                )
+            base_paths.add(changed_path)
+        if not (worktree / changed_path).is_file():
+            plan_paths.append(changed_path)
+            continue
+        try:
+            planner_text = (worktree / changed_path).read_text(encoding="utf-8")
             parsed = _parse_execplan(
                 worktree,
-                worktree / plan_path,
-                require_priority=True,
+                worktree / changed_path,
+                require_priority=not existed,
                 allow_archive_fallback=False,
             )
-            plans.append((plan_path, parsed))
-        _validate_future_idea_separation(worktree, active_sha, plan_paths)
+        except (OSError, UnicodeError, RuntimeError) as error:
+            raise PlannerValidationError(
+                f"Planner ExecPlan을 읽을 수 없습니다: {changed_path} ({error})"
+            ) from error
+        if contains_guidance_sections(planner_text):
+            raise PlannerValidationError("Planner는 AGENTS.md guidance를 제안할 수 없습니다.")
+        current_plans[changed_path] = parsed
+        plan_paths.append(changed_path)
+
+    try:
+        catalog = load_execplan_catalog(worktree)
+        plans: list[tuple[str, dict[str, object]]] = []
+        revisions: list[PlanRevision] = []
+        deletions: list[PlanDeletion] = []
+        renamed_ids: set[str] = set()
+        displaced_paths: set[str] = set()
+        for path in base_paths:
+            original = snapshot.by_path.get(path)
+            if original is None:
+                raise RuntimeError(
+                    f"Planner는 snapshot 밖 ExecPlan을 변경할 수 없습니다: {path}"
+                )
+            current = current_plans.get(path)
+            if current is None or str(current["id"]) != original.plan_id:
+                displaced_paths.add(path)
+
+        for path, parsed in current_plans.items():
+            plan_id = str(parsed["id"])
+            path_identity = snapshot.by_path.get(path)
+            if path_identity is not None and plan_id == path_identity.plan_id:
+                revisions.append(PlanRevision(path, parsed, path_identity))
+                continue
+            original = snapshot.by_id.get(plan_id)
+            if original is not None:
+                if original.path not in displaced_paths or plan_id in renamed_ids:
+                    raise RuntimeError(
+                        f"ExecPlan rename identity가 모호합니다: {plan_id}"
+                    )
+                revisions.append(PlanRevision(path, parsed, original))
+                renamed_ids.add(plan_id)
+            else:
+                plans.append((path, parsed))
+
+        for path in sorted(displaced_paths):
+            original = snapshot.by_path[path]
+            if original.plan_id not in renamed_ids:
+                deletions.append(PlanDeletion(original))
+
+        if connection is not None and repo is not None and deletions:
+            deleted_ids = {item.snapshot.plan_id for item in deletions}
+            revised_ids = {item.snapshot.plan_id for item in revisions}
+            for row in connection.execute(
+                "SELECT plan_id, depends_on FROM exec_plans WHERE repo = ?",
+                (repo,),
+            ):
+                plan_id = str(row["plan_id"])
+                if plan_id in deleted_ids or plan_id in revised_ids:
+                    continue
+                dependencies = set(
+                    _stored_string_list(row["depends_on"], "depends_on")
+                )
+                blocked = sorted(dependencies & deleted_ids)
+                if blocked:
+                    raise RuntimeError(
+                        "삭제 계획을 snapshot 밖 실행 catalog가 참조합니다: "
+                        f"{plan_id} -> {', '.join(blocked)}"
+                    )
+
+        new_plan_paths = [path for path, _plan in plans]
+        _validate_future_idea_separation(worktree, active_sha, new_plan_paths)
         new_ids = {str(plan["id"]) for _, plan in plans}
-        existing_ids = [
-            int(plan_id[2:])
-            for plan_id in snapshot.all
-            if plan_id not in new_ids
-        ]
+        reserved_ids = set(catalog) - new_ids
+        reserved_ids.update(plan.plan_id for plan in snapshot.plans)
+        if connection is not None and repo is not None:
+            reserved_ids.update(
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT plan_id FROM exec_plans WHERE repo = ? "
+                    "UNION SELECT plan_id FROM execplan_cancellations WHERE repo = ?",
+                    (repo, repo),
+                )
+            )
+        archived_directory = worktree / "docs/plans/archive"
+        if archived_directory.is_dir():
+            for archived in archived_directory.glob("*.md"):
+                match = re.match(r"\[(G-\d{3,})\]", archived.name)
+                if match is not None:
+                    reserved_ids.add(match.group(1))
+        if new_ids & reserved_ids:
+            raise RuntimeError(
+                "새 ExecPlan ID가 기존 또는 취소된 ID를 재사용합니다: "
+                + ", ".join(sorted(new_ids & reserved_ids))
+            )
+        existing_ids = [int(plan_id[2:]) for plan_id in reserved_ids]
         first_id = max(existing_ids, default=0) + 1
         expected = list(range(first_id, first_id + len(plans)))
         actual = sorted(int(str(plan["id"])[2:]) for _, plan in plans)
@@ -1889,8 +2141,17 @@ def validate_planner_result(
             ),
             publication_paths=tuple(planned_files),
             publication_hashes=tuple(
-                (path, file_hash(worktree / path)) for path in planned_files
+                (path, file_hash(worktree / path))
+                for path in planned_files
+                if (worktree / path).is_file()
             ),
+            revisions=tuple(
+                sorted(revisions, key=lambda item: int(item.snapshot.plan_id[2:]))
+            ),
+            deletions=tuple(
+                sorted(deletions, key=lambda item: int(item.snapshot.plan_id[2:]))
+            ),
+            mutable_snapshot=snapshot,
         )
     except RuntimeError as error:
         raise PlannerValidationError(str(error)) from error
@@ -2052,6 +2313,155 @@ def _ready_plan_snapshot_at_revision(
     snapshot = _ready_plan_snapshot_from_contents(row, contents)
     _assert_ready_plan_revision(repository, revision, snapshot, contents)
     return snapshot
+
+
+_MUTABLE_READY_EVIDENCE_FIELDS = (
+    "active_sha",
+    "validated_base_sha",
+    "publication_remote_oid",
+    "branch",
+    "worktree",
+    "pr_url",
+    "pr_head_oid",
+    "last_error",
+    "blocked_fingerprint",
+    "blocked_worktree_fingerprint",
+    "blocked_review_fingerprint",
+    "worker_session_id",
+    "reviewer_session_id",
+    "worker_result",
+    "verify_result",
+    "review_result",
+    "blocked_reason",
+    "guidance_plan_hash",
+    "agent_role",
+    "agent_snapshot",
+    "agent_input_fingerprint",
+    "agent_baseline",
+    "agent_recovery",
+    "agent_input_plan",
+    "agent_result_plan",
+    "agent_result_snapshot",
+    "agent_manager_snapshot",
+)
+
+
+def _row_is_mutable_ready(row: sqlite3.Row) -> bool:
+    """Keep the general Planner boundary conservative and evidence based."""
+
+    if str(row["status"]) != "READY" or bool(row["ever_started"]):
+        return False
+    if any(row[field] is not None for field in _MUTABLE_READY_EVIDENCE_FIELDS):
+        return False
+    if any(
+        int(row[field] or 0) != 0
+        for field in (
+            "workspace_owned",
+            "retry_count",
+            "pr_conflict_recovery",
+        )
+    ):
+        return False
+    return all(
+        str(row[field] or "{}") == "{}"
+        for field in (
+            "verify_failure_history",
+            "review_failure_history",
+            "review_level_history",
+        )
+    )
+
+
+def mutable_ready_snapshot(
+    connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+    active_sha: str,
+) -> MutableReadySnapshot:
+    """Bind every never-started READY declaration to Git and SQLite bytes."""
+
+    _ensure_execplans_schema(connection)
+    cycle = maintenance_state.MaintenanceRepository(connection).get(repo)
+    if cycle.phase is not maintenance_state.MaintenancePhase.IDLE:
+        raise PlannerValidationError(
+            "활성 maintenance cycle 중에는 일반 mutable READY snapshot을 만들 수 없습니다."
+        )
+    rows = connection.execute(
+        "SELECT * FROM exec_plans WHERE repo = ? AND status = 'READY' "
+        "ORDER BY plan_id",
+        (repo,),
+    ).fetchall()
+    plans: list[ReadyPlanSnapshot] = []
+    for row in rows:
+        if not _row_is_mutable_ready(row):
+            continue
+        try:
+            plans.append(
+                _ready_plan_snapshot_at_revision(
+                    worktree, active_sha, row
+                )
+            )
+        except MaintenancePlanningError as error:
+            raise PlannerValidationError(str(error)) from error
+    ordered = tuple(sorted(plans, key=lambda item: int(item.plan_id[2:])))
+    return MutableReadySnapshot(
+        repo=repo,
+        active_sha=active_sha,
+        plans=ordered,
+        token=mutable_snapshot_token(repo, active_sha, ordered),
+    )
+
+
+def _assert_mutable_ready_snapshot_current(
+    connection: sqlite3.Connection,
+    snapshot: MutableReadySnapshot,
+) -> None:
+    """Compare-and-snapshot guard used immediately before publication."""
+
+    if maintenance_state.MaintenanceRepository(connection).get(
+        snapshot.repo
+    ).phase is not maintenance_state.MaintenancePhase.IDLE:
+        raise PlannerValidationError(
+            "mutable READY snapshot 이후 maintenance cycle이 시작됐습니다."
+        )
+    for plan in snapshot.plans:
+        row = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+            (snapshot.repo, plan.plan_id),
+        ).fetchone()
+        if row is None or not _row_is_mutable_ready(row):
+            raise PlannerValidationError(
+                f"mutable READY snapshot 이후 실행 상태가 변경됐습니다: {plan.plan_id}"
+            )
+        sources, dependencies, priority = _execplan_metadata(
+            {
+                "sources": list(plan.sources),
+                "depends_on": list(plan.depends_on),
+                "priority": plan.priority,
+            }
+        )
+        current = (
+            str(row["path"]),
+            str(row["title"]),
+            str(row["sources"]),
+            str(row["depends_on"]),
+            str(row["priority"]),
+            str(row["content_hash"]),
+            str(row["current_revision_sha"] or row["plan_sha"] or ""),
+        )
+        expected = (
+            plan.path,
+            plan.title,
+            sources,
+            dependencies,
+            priority,
+            plan.content_hash,
+            plan.plan_sha,
+        )
+        if current != expected:
+            raise PlannerValidationError(
+                f"mutable READY snapshot metadata가 변경됐습니다: {plan.plan_id}"
+            )
 
 
 def _maintenance_mode_and_rows(
@@ -2597,6 +3007,687 @@ def register_execplans(
         )
 
 
+@dataclass(frozen=True)
+class GeneralPlanningPublication:
+    repo: str
+    stage: str
+    base_sha: str
+    commit_sha: str
+    snapshot_token: str
+    specification_fingerprint: str
+    planning_fingerprint: str
+    manifest: str
+    manifest_hash: str
+
+
+def _planning_result_manifest(result: ValidatedPlanningResult) -> str:
+    snapshot = result.mutable_snapshot
+    if snapshot is None:
+        raise PlannerValidationError(
+            "일반 planning batch에 mutable READY snapshot이 없습니다."
+        )
+    payload = {
+        "version": 1,
+        "publication_paths": list(result.publication_paths),
+        "publication_hashes": dict(result.publication_hashes),
+        "plans": [[path, plan] for path, plan in result.plans],
+        "revisions": [
+            {
+                "path": revision.path,
+                "plan": dict(revision.plan),
+                "snapshot": snapshot_to_dict(revision.snapshot),
+            }
+            for revision in result.revisions
+        ],
+        "deletions": [
+            snapshot_to_dict(deletion.snapshot)
+            for deletion in result.deletions
+        ],
+        "mutable_snapshot": {
+            "repo": snapshot.repo,
+            "active_sha": snapshot.active_sha,
+            "token": snapshot.token,
+            "plans": [snapshot_to_dict(plan) for plan in snapshot.plans],
+        },
+    }
+    return json.dumps(
+        payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _planning_result_from_manifest(manifest: str) -> ValidatedPlanningResult:
+    try:
+        payload = json.loads(manifest)
+        if payload.get("version") != 1:
+            raise ValueError("unsupported version")
+        snapshot_value = payload["mutable_snapshot"]
+        snapshot_plans = tuple(
+            snapshot_from_dict(item) for item in snapshot_value["plans"]
+        )
+        snapshot = MutableReadySnapshot(
+            repo=str(snapshot_value["repo"]),
+            active_sha=str(snapshot_value["active_sha"]),
+            plans=snapshot_plans,
+            token=str(snapshot_value["token"]),
+        )
+        expected_token = mutable_snapshot_token(
+            snapshot.repo, snapshot.active_sha, snapshot.plans
+        )
+        if snapshot.token != expected_token:
+            raise ValueError("snapshot token mismatch")
+        plans = tuple(
+            (str(item[0]), dict(item[1])) for item in payload["plans"]
+        )
+        revisions = tuple(
+            PlanRevision(
+                str(item["path"]),
+                dict(item["plan"]),
+                snapshot_from_dict(item["snapshot"]),
+            )
+            for item in payload["revisions"]
+        )
+        deletions = tuple(
+            PlanDeletion(snapshot_from_dict(item))
+            for item in payload["deletions"]
+        )
+        publication_hashes = tuple(
+            sorted(
+                (str(path), str(value))
+                for path, value in payload["publication_hashes"].items()
+            )
+        )
+        return ValidatedPlanningResult(
+            plans=plans,
+            publication_paths=tuple(
+                str(path) for path in payload["publication_paths"]
+            ),
+            publication_hashes=publication_hashes,
+            revisions=revisions,
+            deletions=deletions,
+            mutable_snapshot=snapshot,
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise PlannerValidationError(
+            "보존된 general planning publication manifest가 유효하지 않습니다."
+        ) from error
+
+
+def general_planning_publication(
+    connection: sqlite3.Connection, repo: str
+) -> GeneralPlanningPublication | None:
+    row = connection.execute(
+        "SELECT * FROM general_planning_publications WHERE repo = ?", (repo,)
+    ).fetchone()
+    if row is None:
+        return None
+    publication = GeneralPlanningPublication(
+        repo=str(row["repo"]),
+        stage=str(row["stage"]),
+        base_sha=str(row["base_sha"]),
+        commit_sha=str(row["commit_sha"]),
+        snapshot_token=str(row["snapshot_token"]),
+        specification_fingerprint=str(row["specification_fingerprint"]),
+        planning_fingerprint=str(row["planning_fingerprint"]),
+        manifest=str(row["manifest"]),
+        manifest_hash=str(row["manifest_hash"]),
+    )
+    if hashlib.sha256(publication.manifest.encode("utf-8")).hexdigest() != (
+        publication.manifest_hash
+    ):
+        raise PlannerValidationError(
+            "보존된 general planning publication manifest hash가 다릅니다."
+        )
+    return publication
+
+
+def _validate_general_planning_commit(
+    worktree: Path,
+    result: ValidatedPlanningResult,
+    plan_commit: str,
+) -> None:
+    snapshot = result.mutable_snapshot
+    if snapshot is None:
+        raise PlannerValidationError("일반 planning snapshot이 없습니다.")
+    head = git(worktree, "rev-parse", "HEAD").stdout.strip()
+    if head != plan_commit:
+        raise PlannerValidationError(
+            "general planning worktree HEAD가 보존할 commit과 다릅니다."
+        )
+    ancestry = git(
+        worktree, "rev-list", "--parents", "-n", "1", plan_commit
+    ).stdout.split()
+    if len(ancestry) != 2 or ancestry[1] != snapshot.active_sha:
+        raise PlannerValidationError(
+            "general planning batch는 시작 기준 바로 다음 단일 commit이어야 합니다."
+        )
+    committed_paths = tuple(
+        sorted(
+            path
+            for path in git(
+                worktree,
+                "diff",
+                "--no-renames",
+                "--name-only",
+                snapshot.active_sha,
+                plan_commit,
+            ).stdout.splitlines()
+            if path
+        )
+    )
+    if committed_paths != tuple(sorted(result.publication_paths)):
+        raise PlannerValidationError(
+            "general planning commit에 검증 batch 밖의 변경이 있습니다."
+        )
+    hashes = dict(result.publication_hashes)
+    if len(hashes) != len(result.publication_hashes):
+        raise PlannerValidationError("general planning file hash가 중복됐습니다.")
+    expected_existing = {
+        path
+        for path in result.publication_paths
+        if git(
+            worktree,
+            "cat-file",
+            "-e",
+            f"{plan_commit}:{path}",
+            check=False,
+        ).returncode
+        == 0
+    }
+    if set(hashes) != expected_existing:
+        raise PlannerValidationError(
+            "general planning 결과의 file hash 또는 삭제 manifest가 불완전합니다."
+        )
+    for path, expected_hash in hashes.items():
+        contents = git_bytes(worktree, "show", f"{plan_commit}:{path}")
+        if hashlib.sha256(contents).hexdigest() != expected_hash:
+            raise PlannerValidationError(
+                f"general planning 파일이 검증 후 변경됐습니다: {path}"
+            )
+    for path in set(result.publication_paths) - expected_existing:
+        if git(
+            worktree, "cat-file", "-e", f"{plan_commit}:{path}", check=False
+        ).returncode == 0:
+            raise PlannerValidationError(
+                f"삭제 manifest 경로가 planning commit에 남아 있습니다: {path}"
+            )
+
+
+def record_general_planning_publication_intent(
+    connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+    result: ValidatedPlanningResult,
+    plan_commit: str,
+    specification_fingerprint: str,
+    planning_fingerprint: str,
+) -> GeneralPlanningPublication:
+    snapshot = result.mutable_snapshot
+    if snapshot is None or snapshot.repo != repo:
+        raise PlannerValidationError(
+            "SQLite-bound mutable READY snapshot이 publication 대상과 다릅니다."
+        )
+    _assert_mutable_ready_snapshot_current(connection, snapshot)
+    _validate_general_planning_commit(worktree, result, plan_commit)
+    manifest = _planning_result_manifest(result)
+    manifest_hash = hashlib.sha256(manifest.encode("utf-8")).hexdigest()
+    expected = (
+        "prepared",
+        snapshot.active_sha,
+        plan_commit,
+        snapshot.token,
+        specification_fingerprint,
+        planning_fingerprint,
+        manifest_hash,
+    )
+    with connection:
+        current = general_planning_publication(connection, repo)
+        if current is not None:
+            actual = (
+                current.stage,
+                current.base_sha,
+                current.commit_sha,
+                current.snapshot_token,
+                current.specification_fingerprint,
+                current.planning_fingerprint,
+                current.manifest_hash,
+            )
+            if actual != expected:
+                raise PlannerValidationError(
+                    "다른 general planning publication intent가 이미 있습니다."
+                )
+            return current
+        connection.execute(
+            """
+            INSERT INTO general_planning_publications (
+                repo, stage, base_sha, commit_sha, snapshot_token,
+                specification_fingerprint, planning_fingerprint,
+                manifest, manifest_hash
+            ) VALUES (?, 'prepared', ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                repo,
+                snapshot.active_sha,
+                plan_commit,
+                snapshot.token,
+                specification_fingerprint,
+                planning_fingerprint,
+                manifest,
+                manifest_hash,
+            ),
+        )
+    publication = general_planning_publication(connection, repo)
+    assert publication is not None
+    return publication
+
+
+def _mutable_ready_cas_where() -> str:
+    null_fields = " AND ".join(
+        f"{field} IS NULL" for field in _MUTABLE_READY_EVIDENCE_FIELDS
+    )
+    return (
+        "status = 'READY' AND ever_started = 0 "
+        "AND workspace_owned = 0 AND retry_count = 0 "
+        "AND pr_conflict_recovery = 0 "
+        "AND verify_failure_history = '{}' "
+        "AND review_failure_history = '{}' "
+        "AND review_level_history = '{}' AND "
+        + null_fields
+    )
+
+
+def _general_planning_batch_already_applied(
+    connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+    result: ValidatedPlanningResult,
+    plan_commit: str,
+    specification_fingerprint: str,
+    planning_fingerprint: str,
+) -> bool:
+    project = connection.execute(
+        "SELECT processed_sha, specification_fingerprint, planning_fingerprint "
+        "FROM projects WHERE repo = ?",
+        (repo,),
+    ).fetchone()
+    if project is None or tuple(project) != (
+        plan_commit,
+        specification_fingerprint,
+        planning_fingerprint,
+    ):
+        return False
+    for path, plan in result.plans:
+        row = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+            (repo, str(plan["id"])),
+        ).fetchone()
+        sources, dependencies, priority = _execplan_metadata(plan)
+        if row is None or (
+            str(row["path"]),
+            str(row["title"]),
+            str(row["sources"]),
+            str(row["depends_on"]),
+            str(row["priority"]),
+            str(row["content_hash"]),
+            str(row["current_revision_sha"] or row["plan_sha"] or ""),
+        ) != (
+            path,
+            str(plan["title"]),
+            sources,
+            dependencies,
+            priority,
+            file_hash(worktree / path),
+            plan_commit,
+        ):
+            return False
+    for revision in result.revisions:
+        plan = dict(revision.plan)
+        row = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+            (repo, revision.snapshot.plan_id),
+        ).fetchone()
+        sources, dependencies, priority = _execplan_metadata(plan)
+        if row is None or (
+            str(row["path"]),
+            str(row["title"]),
+            str(row["sources"]),
+            str(row["depends_on"]),
+            str(row["priority"]),
+            str(row["content_hash"]),
+            str(row["current_revision_sha"] or row["plan_sha"] or ""),
+            str(row["status"]),
+            bool(row["ever_started"]),
+        ) != (
+            revision.path,
+            str(plan["title"]),
+            sources,
+            dependencies,
+            priority,
+            file_hash(worktree / revision.path),
+            plan_commit,
+            "READY",
+            False,
+        ):
+            return False
+    for deletion in result.deletions:
+        original = deletion.snapshot
+        row = connection.execute(
+            "SELECT * FROM execplan_cancellations "
+            "WHERE repo = ? AND plan_id = ?",
+            (repo, original.plan_id),
+        ).fetchone()
+        if row is None or (
+            str(row["path"]),
+            str(row["content_hash"]),
+            str(row["plan_sha"]),
+            str(row["deletion_commit"]),
+        ) != (
+            original.path,
+            original.content_hash,
+            original.plan_sha,
+            plan_commit,
+        ):
+            return False
+        if connection.execute(
+            "SELECT 1 FROM exec_plans WHERE repo = ? AND plan_id = ?",
+            (repo, original.plan_id),
+        ).fetchone() is not None:
+            return False
+    return True
+
+
+def _apply_general_planning_batch(
+    connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+    result: ValidatedPlanningResult,
+    plan_commit: str,
+    specification_fingerprint: str,
+    planning_fingerprint: str,
+) -> None:
+    snapshot = result.mutable_snapshot
+    if snapshot is None or snapshot.repo != repo:
+        raise PlannerValidationError("general planning snapshot 대상이 다릅니다.")
+    with connection:
+        intent = general_planning_publication(connection, repo)
+        if intent is None:
+            if _general_planning_batch_already_applied(
+                connection,
+                repo,
+                worktree,
+                result,
+                plan_commit,
+                specification_fingerprint,
+                planning_fingerprint,
+            ):
+                return
+            raise PlannerValidationError(
+                "보존된 general planning publication intent가 없습니다."
+            )
+        if (
+            intent.stage,
+            intent.base_sha,
+            intent.commit_sha,
+            intent.snapshot_token,
+            intent.specification_fingerprint,
+            intent.planning_fingerprint,
+        ) != (
+            "prepared",
+            snapshot.active_sha,
+            plan_commit,
+            snapshot.token,
+            specification_fingerprint,
+            planning_fingerprint,
+        ):
+            raise PlannerValidationError(
+                "보존된 general planning publication intent가 batch와 다릅니다."
+            )
+        _assert_mutable_ready_snapshot_current(connection, snapshot)
+        cas = _mutable_ready_cas_where()
+        for deletion in result.deletions:
+            original = deletion.snapshot
+            changed = connection.execute(
+                f"""
+                DELETE FROM exec_plans
+                WHERE repo = ? AND plan_id = ? AND path = ? AND title = ?
+                  AND sources = ? AND depends_on = ? AND priority = ?
+                  AND content_hash = ?
+                  AND COALESCE(current_revision_sha, plan_sha) = ? AND {cas}
+                """,
+                (
+                    repo,
+                    original.plan_id,
+                    original.path,
+                    original.title,
+                    json.dumps(original.sources, ensure_ascii=False, separators=(",", ":")),
+                    json.dumps(original.depends_on, ensure_ascii=False, separators=(",", ":")),
+                    original.priority,
+                    original.content_hash,
+                    original.plan_sha,
+                ),
+            )
+            if changed.rowcount != 1:
+                raise PlannerValidationError(
+                    "publication 직전 mutable READY deletion이 변경됐습니다: "
+                    f"{original.plan_id}"
+                )
+            connection.execute(
+                """
+                INSERT INTO execplan_cancellations (
+                    repo, plan_id, path, title, sources, depends_on,
+                    complexity, risk, priority, content_hash, plan_sha,
+                    deletion_commit
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    repo,
+                    original.plan_id,
+                    original.path,
+                    original.title,
+                    json.dumps(original.sources, ensure_ascii=False, separators=(",", ":")),
+                    json.dumps(original.depends_on, ensure_ascii=False, separators=(",", ":")),
+                    original.complexity,
+                    original.risk,
+                    original.priority,
+                    original.content_hash,
+                    original.plan_sha,
+                    plan_commit,
+                ),
+            )
+
+        staged_paths: dict[str, str] = {}
+        for revision in result.revisions:
+            original = revision.snapshot
+            if revision.path == original.path:
+                continue
+            staged = (
+                f"docs/plans/.planning-{snapshot.token[:12]}-"
+                f"{original.plan_id}.md"
+            )
+            changed = connection.execute(
+                f"""
+                UPDATE exec_plans SET path = ?
+                WHERE repo = ? AND plan_id = ? AND path = ? AND title = ?
+                  AND sources = ? AND depends_on = ? AND priority = ?
+                  AND content_hash = ?
+                  AND COALESCE(current_revision_sha, plan_sha) = ? AND {cas}
+                """,
+                (
+                    staged,
+                    repo,
+                    original.plan_id,
+                    original.path,
+                    original.title,
+                    json.dumps(original.sources, ensure_ascii=False, separators=(",", ":")),
+                    json.dumps(original.depends_on, ensure_ascii=False, separators=(",", ":")),
+                    original.priority,
+                    original.content_hash,
+                    original.plan_sha,
+                ),
+            )
+            if changed.rowcount != 1:
+                raise PlannerValidationError(
+                    "publication 직전 mutable READY rename이 변경됐습니다: "
+                    f"{original.plan_id}"
+                )
+            staged_paths[original.plan_id] = staged
+
+        for revision in result.revisions:
+            original = revision.snapshot
+            plan = dict(revision.plan)
+            sources, dependencies, priority = _execplan_metadata(plan)
+            initial_level = worker_level(plan)
+            expected_path = staged_paths.get(original.plan_id, original.path)
+            changed = connection.execute(
+                f"""
+                UPDATE exec_plans
+                SET path = ?, title = ?, sources = ?, depends_on = ?,
+                    priority = ?, content_hash = ?, current_revision_sha = ?,
+                    current_complexity = ?, current_risk = ?,
+                    initial_worker_level = ?, effective_worker_level = ?
+                WHERE repo = ? AND plan_id = ? AND path = ? AND title = ?
+                  AND sources = ? AND depends_on = ? AND priority = ?
+                  AND content_hash = ?
+                  AND COALESCE(current_revision_sha, plan_sha) = ? AND {cas}
+                """,
+                (
+                    revision.path,
+                    str(plan["title"]),
+                    sources,
+                    dependencies,
+                    priority,
+                    file_hash(worktree / revision.path),
+                    plan_commit,
+                    str(plan["complexity"]),
+                    str(plan["risk"]),
+                    initial_level,
+                    initial_level,
+                    repo,
+                    original.plan_id,
+                    expected_path,
+                    original.title,
+                    json.dumps(original.sources, ensure_ascii=False, separators=(",", ":")),
+                    json.dumps(original.depends_on, ensure_ascii=False, separators=(",", ":")),
+                    original.priority,
+                    original.content_hash,
+                    original.plan_sha,
+                ),
+            )
+            if changed.rowcount != 1:
+                raise PlannerValidationError(
+                    "publication 직전 mutable READY revision이 변경됐습니다: "
+                    f"{original.plan_id}"
+                )
+
+        _register_execplan_rows(
+            connection, repo, worktree, list(result.plans), plan_commit
+        )
+        _clear_active_in_current_transaction(
+            connection,
+            repo,
+            processed_sha=plan_commit,
+            specification_fingerprint=specification_fingerprint,
+            planning_fingerprint=planning_fingerprint,
+        )
+        connection.execute(
+            "DELETE FROM general_planning_publications WHERE repo = ?", (repo,)
+        )
+
+
+def publish_general_planning_batch(
+    connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+    base_branch: str,
+    result: ValidatedPlanningResult,
+    plan_commit: str,
+    specification_fingerprint: str,
+    planning_fingerprint: str,
+) -> None:
+    remote = git(
+        worktree,
+        "rev-parse",
+        "--verify",
+        f"refs/remotes/origin/{base_branch}^{{commit}}",
+    ).stdout.strip()
+    if remote != plan_commit:
+        raise PlannerValidationError(
+            "general planning commit의 fast-forward push를 origin/base에서 확인할 수 없습니다."
+        )
+    _validate_general_planning_commit(worktree, result, plan_commit)
+    _apply_general_planning_batch(
+        connection,
+        repo,
+        worktree,
+        result,
+        plan_commit,
+        specification_fingerprint,
+        planning_fingerprint,
+    )
+
+
+def recover_general_planning_batch(
+    connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+    base_branch: str,
+) -> str:
+    """Return pending, applied, or restart for one durable general intent."""
+
+    intent = general_planning_publication(connection, repo)
+    if intent is None:
+        raise PlannerValidationError(
+            "복구할 general planning publication intent가 없습니다."
+        )
+    result = _planning_result_from_manifest(intent.manifest)
+    if result.mutable_snapshot is None or (
+        result.mutable_snapshot.token != intent.snapshot_token
+    ):
+        raise PlannerValidationError(
+            "publication intent와 mutable READY snapshot token이 다릅니다."
+        )
+    _validate_general_planning_commit(worktree, result, intent.commit_sha)
+    remote = git(
+        worktree,
+        "rev-parse",
+        "--verify",
+        f"refs/remotes/origin/{base_branch}^{{commit}}",
+    ).stdout.strip()
+    if remote == intent.base_sha:
+        return "pending"
+    if _git_commit_is_ancestor(worktree, intent.commit_sha, remote):
+        if remote != intent.commit_sha:
+            _assert_remote_preserves_maintenance_batch(
+                worktree,
+                intent.base_sha,
+                intent.commit_sha,
+                remote,
+                reject_catalog_drift=True,
+            )
+        _apply_general_planning_batch(
+            connection,
+            repo,
+            worktree,
+            result,
+            intent.commit_sha,
+            intent.specification_fingerprint,
+            intent.planning_fingerprint,
+        )
+        return "applied"
+    if not _git_commit_is_ancestor(worktree, intent.base_sha, remote):
+        raise PlannerValidationError(
+            "general planning publication base가 origin/base 이력에 없습니다."
+        )
+    with connection:
+        connection.execute(
+            "DELETE FROM general_planning_publications WHERE repo = ?", (repo,)
+        )
+        _clear_active_in_current_transaction(connection, repo)
+    return "restart"
+
+
 def validate_maintenance_publication_base(
     connection: sqlite3.Connection,
     repo: str,
@@ -3118,6 +4209,11 @@ def _apply_maintenance_planning_batch(
             connection,
             repo,
             processed_sha=plan_commit if include_general_planning else None,
+            specification_fingerprint=(
+                _specification_input_fingerprint(worktree, plan_commit)
+                if include_general_planning
+                else None
+            ),
             planning_fingerprint=(
                 _planning_input_fingerprint(worktree, plan_commit)
                 if include_general_planning
@@ -7524,10 +8620,7 @@ def validate_agent_scope(
         if role_name == "planner":
             allowed = bool(
                 change.path == "docs/FUTURE_IDEAS.md"
-                or (
-                    re.fullmatch(r"docs/plans/[^/]+\.md", change.path)
-                    and change.path not in before.index
-                )
+                or re.fullmatch(r"docs/plans/[^/]+\.md", change.path)
             )
         elif role_name == "maintenance_planner":
             allowed = bool(
@@ -8229,10 +9322,12 @@ def clear_planning_validation_state(
 def _clear_active_values(
     *,
     processed_sha: str | None = None,
+    specification_fingerprint: str | None = None,
     planning_fingerprint: str | None = None,
 ) -> dict[str, object]:
     return runtime_state.clear_project_values(
         processed_sha=processed_sha,
+        specification_fingerprint=specification_fingerprint,
         planning_fingerprint=planning_fingerprint,
     )
 
@@ -8242,12 +9337,14 @@ def _clear_active_in_current_transaction(
     repo: str,
     *,
     processed_sha: str | None = None,
+    specification_fingerprint: str | None = None,
     planning_fingerprint: str | None = None,
 ) -> None:
     try:
         runtime_state.RuntimeStateRepository(connection).clear(
             repo,
             processed_sha=processed_sha,
+            specification_fingerprint=specification_fingerprint,
             planning_fingerprint=planning_fingerprint,
             enqueue=False,
         )
@@ -8262,6 +9359,7 @@ def clear_active(
     repo: str,
     *,
     processed_sha: str | None = None,
+    specification_fingerprint: str | None = None,
     planning_fingerprint: str | None = None,
 ) -> None:
     if connection.execute(
@@ -8272,6 +9370,7 @@ def clear_active(
     runtime_state.RuntimeStateRepository(connection).clear(
         repo,
         processed_sha=processed_sha,
+        specification_fingerprint=specification_fingerprint,
         planning_fingerprint=planning_fingerprint,
         enqueue=True,
     )
@@ -12948,21 +14047,35 @@ def resume_pr_conflict_rebase(
     operation_print(error, file=sys.stderr)
     return PROJECT_STEP_RETRY
 
-def planner_prompt(error: str | None, compact_catalog: str = "[]") -> str:
+def planner_prompt(
+    error: str | None,
+    compact_catalog: str = "[]",
+    mutable_snapshot: MutableReadySnapshot | None = None,
+) -> str:
     failure = f"\n이전 실행에서 다음 문제가 발생했다. 원인을 해결하라:\n{error[-6000:]}\n" if error else ""
+    snapshot = mutable_snapshot or MutableReadySnapshot(
+        repo="",
+        active_sha="",
+        plans=(),
+        token=mutable_snapshot_token("", "", ()),
+    )
     return f"""
 당신은 Loop Manager의 Planner다.
 AGENTS.md, 활성 PRODUCT와 Requirement, docs/ARCHITECTURE.md, docs/PLANS.md 및 현재 코드·테스트를 읽어라.
 아래 compact catalog는 SQLite의 비종료 ExecPlan만 코드로 직렬화한 것이다. MERGED 계획은 제외됐다.
 {compact_catalog}
 
+아래 mutable READY snapshot은 SQLite와 planning 기준 commit에 결합돼 있다. token과 각 ID/path/revision을 변경 권한의 경계로 사용하라.
+{snapshot.prompt_payload()}
+
 현재 입력에서 식별 가능한 미충족 작업 전체를 독립적으로 검증·Merge 가능한 ExecPlan들로 나누어 한 번에 작성하라.
 catalog가 이미 충족하는 작업이나 코드·테스트에 이미 구현된 작업은 중복 계획하지 마라.
 catalog에서 현재 입력과 겹치는 비종료 계획만 필요할 때 전문을 읽고, 기존 docs/plans 전체를 기본 입력으로 읽지 마라.
-새 ExecPlan마다 priority를 기록하고, 기존 ExecPlan을 수정·삭제하지 말며 docs/plans 바로 아래에 새 파일만 작성하라.
+새 ExecPlan마다 priority를 기록하라. mutable READY snapshot의 계획은 같은 ID를 보존한 채 필요하면 본문·metadata를 수정하거나 title에 맞게 rename하거나 삭제할 수 있다.
+snapshot 밖의 기존 ExecPlan, 실행된 계획, MERGED·archive 계획은 수정·rename·삭제하지 마라. 삭제한 ID를 새 계획에 재사용하지 마라.
 현재 PRODUCT/Requirement 범위 밖이지만 보존 가치가 있는 아이디어는 같은 계획 주기의 ExecPlan 범위나 미충족 작업의 근거로 사용하지 말고 docs/FUTURE_IDEAS.md에만 분리해 기록하라.
 docs/FUTURE_IDEAS.md의 목록 항목과 같은 내용을 새 ExecPlan의 제목이나 본문에 반복하지 마라.
-docs/FUTURE_IDEAS.md는 새 ExecPlan과 함께 생성·수정할 수 있지만, 그 밖의 기존 파일은 수정하지 마라.
+docs/FUTURE_IDEAS.md는 planning batch와 함께 생성·수정할 수 있지만, 위에서 허용한 mutable READY 외의 기존 파일은 수정하지 마라.
 구현, 테스트, commit, push와 PR 생성은 하지 마라. 추가 계획이 필요 없으면 파일을 변경하지 마라.
 {failure}
 """.strip()
@@ -13888,12 +15001,14 @@ class _PlanningStatePorts:
         repo: str,
         *,
         processed_sha: object = None,
+        specification_fingerprint: object = None,
         planning_fingerprint: object = None,
     ) -> None:
         clear_active(
             self._connection,
             repo,
             processed_sha=processed_sha,
+            specification_fingerprint=specification_fingerprint,
             planning_fingerprint=planning_fingerprint,
         )
 
@@ -13902,12 +15017,14 @@ class _PlanningStatePorts:
         repo: str,
         *,
         processed_sha: object = None,
+        specification_fingerprint: object = None,
         planning_fingerprint: object = None,
     ) -> None:
         _clear_active_in_current_transaction(
             self._connection,
             repo,
             processed_sha=processed_sha,
+            specification_fingerprint=specification_fingerprint,
             planning_fingerprint=planning_fingerprint,
         )
 
@@ -14019,6 +15136,58 @@ class _PlanningStatePorts:
             fingerprint,
         )
 
+    def general_publication(
+        self, repo: str
+    ) -> GeneralPlanningPublication | None:
+        return general_planning_publication(self._connection, repo)
+
+    def recover_general_batch(
+        self, repo: str, worktree: Path, base: str
+    ) -> str:
+        return recover_general_planning_batch(
+            self._connection, repo, worktree, base
+        )
+
+    def record_general_intent(
+        self,
+        repo: str,
+        worktree: Path,
+        validated_result: ValidatedPlanningResult,
+        plan_commit: str,
+        specification_fingerprint: str,
+        planning_fingerprint: str,
+    ) -> GeneralPlanningPublication:
+        return record_general_planning_publication_intent(
+            self._connection,
+            repo,
+            worktree,
+            validated_result,
+            plan_commit,
+            specification_fingerprint,
+            planning_fingerprint,
+        )
+
+    def publish_general_batch(
+        self,
+        repo: str,
+        worktree: Path,
+        base: str,
+        validated_result: ValidatedPlanningResult,
+        plan_commit: str,
+        specification_fingerprint: str,
+        planning_fingerprint: str,
+    ) -> None:
+        publish_general_planning_batch(
+            self._connection,
+            repo,
+            worktree,
+            base,
+            validated_result,
+            plan_commit,
+            specification_fingerprint,
+            planning_fingerprint,
+        )
+
 
 class _PlanningGitPorts:
     """Bind coordinator Git operations to the managed-worktree helpers."""
@@ -14040,6 +15209,9 @@ class _PlanningGitPorts:
 
     def input_fingerprint(self, repo_path: Path, sha: str) -> str:
         return _planning_input_fingerprint(repo_path, sha)
+
+    def specification_fingerprint(self, repo_path: Path, sha: str) -> str:
+        return _specification_input_fingerprint(repo_path, sha)
 
     def requirement_archive_only(
         self, repo_path: Path, old_sha: str, new_sha: str
@@ -14789,8 +15961,20 @@ class _PlanningValidationPorts:
     ) -> str:
         return _maintenance_change_context_text(repo_path, base, cycle)
 
-    def planner_prompt(self, error: str | None, catalog: str) -> str:
-        return planner_prompt(error, catalog)
+    def prepare_general_context(
+        self, repo: str, worktree: Path, active_sha: str
+    ) -> MutableReadySnapshot:
+        return mutable_ready_snapshot(
+            self._connection, repo, worktree, active_sha
+        )
+
+    def planner_prompt(
+        self,
+        error: str | None,
+        catalog: str,
+        mutable_snapshot: MutableReadySnapshot,
+    ) -> str:
+        return planner_prompt(error, catalog, mutable_snapshot)
 
     def maintenance_prompt(
         self,
@@ -14810,9 +15994,21 @@ class _PlanningValidationPorts:
         )
 
     def validate_general_result(
-        self, worktree: Path, active_sha: str, dirty_files: list[str]
+        self,
+        repo: str,
+        worktree: Path,
+        active_sha: str,
+        dirty_files: list[str],
+        mutable_snapshot: MutableReadySnapshot,
     ) -> ValidatedPlanningResult | None:
-        return validate_planner_result(worktree, active_sha, dirty_files)
+        return validate_planner_result(
+            worktree,
+            active_sha,
+            dirty_files,
+            connection=self._connection,
+            repo=repo,
+            mutable_snapshot=mutable_snapshot,
+        )
 
     def validate_maintenance_result(
         self,
