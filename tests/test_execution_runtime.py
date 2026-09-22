@@ -109,6 +109,21 @@ class FakePorts:
         self.validation = FakeValidationPort()
         self.publication = FakePublicationPort()
 
+    def prepare(self):
+        return self.workspace.prepare()
+
+    def run(self, context):
+        return self.worker.run(context)
+
+    def verify(self, context, latest_base):
+        return self.validation.verify(context, self.latest_base)
+
+    def review(self, context):
+        return self.validation.review(context)
+
+    def publish(self, context, latest_base):
+        return self.publication.publish(context, self.latest_base)
+
 
 class ExecutionPhaseCoordinatorTests(unittest.TestCase):
     def test_context_is_immutable_and_keeps_resume_identity(self):

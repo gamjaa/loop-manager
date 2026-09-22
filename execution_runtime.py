@@ -141,12 +141,12 @@ class ExecutionPublicationPort(Protocol):
     ) -> ExecutionOutcome: ...
 
 
-class ExecutionLifecyclePorts(Protocol):
-    workspace: ExecutionWorkspacePort
-    worker: ExecutionWorkerPort
-    validation: ExecutionValidationPort
-    latest_base: LatestBasePort
-    publication: ExecutionPublicationPort
+class ExecutionLifecyclePorts(
+    ExecutionWorkspacePort, ExecutionWorkerPort, ExecutionValidationPort,
+    ExecutionPublicationPort, LatestBasePort, Protocol,
+):
+    """Phase policy interface; concrete handlers receive granular effect ports."""
+
 
 
 class ExecutionPhaseCoordinator:
@@ -156,7 +156,7 @@ class ExecutionPhaseCoordinator:
         self._ports = ports
 
     def prepare(self) -> ExecutionContext | ExecutionOutcome:
-        return self._ports.workspace.prepare()
+        return self._ports.prepare()
 
     def dispatch(self, context: ExecutionContext) -> ExecutionOutcome:
         handlers = {
@@ -168,13 +168,13 @@ class ExecutionPhaseCoordinator:
         return handlers[context.phase](context)
 
     def _run_worker(self, context: ExecutionContext) -> ExecutionOutcome:
-        return self._ports.worker.run(context)
+        return self._ports.run(context)
 
     def _run_verify(self, context: ExecutionContext) -> ExecutionOutcome:
-        return self._ports.validation.verify(context, self._ports.latest_base)
+        return self._ports.verify(context, self._ports)
 
     def _run_review(self, context: ExecutionContext) -> ExecutionOutcome:
-        return self._ports.validation.review(context)
+        return self._ports.review(context)
 
     def _run_publication(self, context: ExecutionContext) -> ExecutionOutcome:
-        return self._ports.publication.publish(context, self._ports.latest_base)
+        return self._ports.publish(context, self._ports)

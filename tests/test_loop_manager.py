@@ -6106,6 +6106,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
             for module_name in (
                 "loop_manager.py",
                 "execution_runtime.py",
+                "execution_handlers.py",
+                "execution_state.py",
                 "guidance_approval.py",
                 "managed_config.py",
                 "maintenance_git.py",
