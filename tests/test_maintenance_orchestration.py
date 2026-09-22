@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,7 +16,12 @@ from maintenance_orchestration import (
 )
 from maintenance_planning import MaintenancePlanMode, MaintenancePlanningContext
 import maintenance_state
-from tests.test_loop_manager import make_remote_repository
+from tests.test_loop_manager import (
+    commit_and_push,
+    git_command,
+    make_remote_repository,
+)
+from tests.test_maintenance_planning import plan_text
 
 
 class MaintenanceOrchestrationTest(unittest.TestCase):
@@ -59,6 +65,175 @@ class MaintenanceOrchestrationTest(unittest.TestCase):
                 status,
                 "a" * 40,
             ),
+        )
+
+    def _integration_project(
+        self,
+        directory: str,
+        plans: tuple[
+            tuple[str, str, str, tuple[str, ...], str], ...
+        ],
+    ) -> tuple[Path, Path, sqlite3.Connection, str]:
+        root = Path(directory)
+        repo_path = make_remote_repository(str(root / "project"))
+        plans_dir = repo_path / "docs/plans"
+        plans_dir.mkdir()
+        paths: list[Path] = []
+        for plan_id, title, _status, dependencies, priority in plans:
+            path = plans_dir / f"[{plan_id}] {title}.md"
+            path.write_text(
+                plan_text(
+                    plan_id,
+                    title,
+                    depends_on=dependencies,
+                    priority=priority,
+                ),
+                encoding="utf-8",
+            )
+            paths.append(path)
+        commit_and_push(repo_path, "Add maintenance integration catalog")
+        plan_sha = git_command(repo_path, "rev-parse", "origin/main")
+        state_dir = root / "state"
+        state_dir.mkdir()
+        connection = loop_manager.connect_database(state_dir, create=True)
+        repo = str(repo_path)
+        connection.execute(
+            "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+            (repo,),
+        )
+        parsed = [
+            (
+                path.relative_to(repo_path).as_posix(),
+                loop_manager._parse_execplan(repo_path, path),
+            )
+            for path in paths
+        ]
+        loop_manager._register_execplan_rows(
+            connection, repo, repo_path, parsed, plan_sha
+        )
+        for plan_id, _title, status, _dependencies, _priority in plans:
+            connection.execute(
+                "UPDATE exec_plans SET status = ? "
+                "WHERE repo = ? AND plan_id = ?",
+                (status, repo, plan_id),
+            )
+        connection.commit()
+        return repo_path, state_dir, connection, repo
+
+    def _run_registered(
+        self,
+        connection: sqlite3.Connection,
+        state_dir: Path,
+        repo_path: Path,
+        agent,
+    ) -> loop_manager.ProjectRunResult:
+        with mock.patch(
+            "loop_manager.validate_repository", return_value=repo_path
+        ), mock.patch(
+            "loop_manager.validate_provider_runtime"
+        ), mock.patch(
+            "loop_manager.ensure_safe_base_worktree"
+        ), mock.patch(
+            "loop_manager.run_codex", side_effect=agent
+        ):
+            return loop_manager.run_project_result(
+                connection,
+                state_dir,
+                str(repo_path),
+                Path("unused.ini"),
+                "main",
+                False,
+                registered_only=True,
+            )
+
+    def _active_plan_id(
+        self, connection: sqlite3.Connection, repo: str
+    ) -> str | None:
+        row = connection.execute(
+            "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
+        ).fetchone()
+        return loop_manager._plan_id_from_path(str(row["plan_path"] or ""))
+
+    def _mark_active_merged(
+        self,
+        connection: sqlite3.Connection,
+        repo_path: Path,
+        repo: str,
+        plan_id: str,
+    ) -> None:
+        project = connection.execute(
+            "SELECT worktree FROM projects WHERE repo = ?", (repo,)
+        ).fetchone()
+        worktree = Path(str(project["worktree"] or ""))
+        if worktree.is_dir():
+            git_command(
+                repo_path, "worktree", "remove", "--force", str(worktree)
+            )
+        with connection:
+            connection.execute(
+                """
+                UPDATE exec_plans
+                SET status = 'MERGED', branch = NULL, worktree = NULL,
+                    workspace_owned = 0, worker_session_id = NULL,
+                    reviewer_session_id = NULL, pr_url = NULL,
+                    pr_head_oid = NULL
+                WHERE repo = ? AND plan_id = ?
+                """,
+                (repo, plan_id),
+            )
+            loop_manager._clear_active_in_current_transaction(connection, repo)
+
+    def _advance_remote(self, repo_path: Path, marker: str) -> str:
+        git_command(repo_path, "fetch", "origin")
+        git_command(repo_path, "merge", "--ff-only", "origin/main")
+        (repo_path / "src/app.py").write_text(
+            f"VALUE = {marker!r}\n", encoding="utf-8"
+        )
+        commit_and_push(repo_path, f"Merge maintenance worker {marker}")
+        return git_command(repo_path, "rev-parse", "origin/main")
+
+    def _write_refactoring_batch(
+        self, worktree: Path, *, ready_priority: str = "critical"
+    ) -> None:
+        plans_dir = worktree / "docs/plans"
+        (plans_dir / "[G-002] Extract Boundary.md").write_text(
+            plan_text("G-002", "Extract Boundary"),
+            encoding="utf-8",
+        )
+        (plans_dir / "[G-001] Ready Feature.md").write_text(
+            plan_text(
+                "G-001",
+                "Ready Feature",
+                depends_on=("G-002",),
+                priority=ready_priority,
+            ),
+            encoding="utf-8",
+        )
+
+    def _enter_revalidation(
+        self,
+        connection: sqlite3.Connection,
+        repo: str,
+        base_sha: str,
+    ) -> maintenance_state.MaintenanceCycle:
+        repository = maintenance_state.MaintenanceRepository(connection)
+        cycle, _ = repository.begin_assessment_if_due(repo, 5, base_sha)
+        refactoring = repository.transition(
+            repo,
+            expected_phase=cycle.phase,
+            expected_revision=cycle.revision,
+            next_phase=maintenance_state.MaintenancePhase.REFACTORING,
+            refactoring_plan_ids=("G-000",),
+            revalidation_plan_ids=("G-001",),
+        )
+        return repository.transition(
+            repo,
+            expected_phase=refactoring.phase,
+            expected_revision=refactoring.revision,
+            next_phase=(
+                maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION
+            ),
+            cycle_base_sha=base_sha,
         )
 
     def test_protocol_is_phase_specific_and_requires_exact_fields(self):
@@ -355,6 +530,489 @@ class MaintenanceOrchestrationTest(unittest.TestCase):
         self.assertIsNone(project["phase"])
         self.assertIsNotNone(project["planning_fingerprint"])
         enqueue.assert_called_once_with(mock.ANY, repo)
+
+    def test_due_assessment_runs_before_existing_ready_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo_path, state_dir, connection, repo = self._integration_project(
+                directory,
+                (("G-001", "Ready Feature", "READY", (), "critical"),),
+            )
+            roles: list[str] = []
+            prompts: list[str] = []
+            selected: list[str | None] = []
+
+            def agent(
+                _worktree, _state, _config, role_name, prompt, **_kwargs
+            ):
+                roles.append(role_name)
+                prompts.append(prompt)
+                if role_name == "planner":
+                    return loop_manager.CodexResult(
+                        0,
+                        'MAINTENANCE_RESULT: {"outcome":"no_change"}',
+                        "maintenance-session",
+                    )
+                selected.append(self._active_plan_id(connection, repo))
+                return loop_manager.CodexResult(1, "stop worker", "worker-session")
+
+            try:
+                result = self._run_registered(
+                    connection, state_dir, repo_path, agent
+                )
+                cycle = maintenance_state.MaintenanceRepository(connection).get(repo)
+                plan = connection.execute(
+                    "SELECT status FROM exec_plans "
+                    "WHERE repo = ? AND plan_id = 'G-001'",
+                    (repo,),
+                ).fetchone()
+            finally:
+                connection.close()
+
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
+        self.assertEqual(roles, ["planner", "worker"])
+        self.assertEqual(selected, ["G-001"])
+        self.assertNotIn("현재 미충족 일반 PRODUCT/Requirement 작업도", prompts[0])
+        self.assertEqual(cycle.phase, maintenance_state.MaintenancePhase.IDLE)
+        self.assertIsNotNone(cycle.last_success_commit)
+        self.assertEqual(plan["status"], "IMPLEMENTING")
+
+    def test_prerequisite_merge_reassesses_before_outside_ready_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo_path, state_dir, connection, repo = self._integration_project(
+                directory,
+                (
+                    ("G-001", "Required First", "READY", (), "normal"),
+                    ("G-002", "Outside Cycle", "READY", (), "critical"),
+                ),
+            )
+            planner_calls = 0
+            roles: list[str] = []
+            selected: list[str | None] = []
+
+            def agent(
+                _worktree, _state, _config, role_name, _prompt, **_kwargs
+            ):
+                nonlocal planner_calls
+                roles.append(role_name)
+                if role_name == "planner":
+                    planner_calls += 1
+                    outcome = (
+                        '{"outcome":"prerequisites","plan_ids":["G-001"]}'
+                        if planner_calls == 1
+                        else '{"outcome":"no_change"}'
+                    )
+                    return loop_manager.CodexResult(
+                        0, f"MAINTENANCE_RESULT: {outcome}",
+                        f"maintenance-session-{planner_calls}",
+                    )
+                selected.append(self._active_plan_id(connection, repo))
+                return loop_manager.CodexResult(1, "stop worker", "worker-session")
+
+            try:
+                first = self._run_registered(
+                    connection, state_dir, repo_path, agent
+                )
+                waiting = maintenance_state.MaintenanceRepository(connection).get(
+                    repo
+                )
+                self.assertEqual(
+                    waiting.phase,
+                    maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
+                )
+                self.assertEqual(waiting.prerequisite_plan_ids, ("G-001",))
+                self.assertEqual(selected, ["G-001"])
+
+                self._mark_active_merged(
+                    connection, repo_path, repo, "G-001"
+                )
+                latest = self._advance_remote(repo_path, "prerequisite")
+                second = self._run_registered(
+                    connection, state_dir, repo_path, agent
+                )
+                completed = maintenance_state.MaintenanceRepository(connection).get(
+                    repo
+                )
+            finally:
+                connection.close()
+
+        self.assertEqual(first.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
+        self.assertEqual(second.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
+        self.assertEqual(
+            roles, ["planner", "worker", "planner", "worker"]
+        )
+        self.assertEqual(selected, ["G-001", "G-002"])
+        self.assertEqual(completed.phase, maintenance_state.MaintenancePhase.IDLE)
+        self.assertEqual(completed.last_success_commit, latest)
+
+    def test_refactoring_batch_selects_immediately_then_revalidates_before_ready(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo_path, state_dir, connection, repo = self._integration_project(
+                directory,
+                (("G-001", "Ready Feature", "READY", (), "critical"),),
+            )
+            roles: list[str] = []
+            prompts: list[str] = []
+            selected: list[str | None] = []
+
+            def agent(
+                worktree, _state, _config, role_name, prompt, **_kwargs
+            ):
+                roles.append(role_name)
+                prompts.append(prompt)
+                if role_name == "planner":
+                    if "post-refactor revalidation" in prompt:
+                        return loop_manager.CodexResult(
+                            0,
+                            'MAINTENANCE_RESULT: {"outcome":"revalidated"}',
+                            "revalidation-session",
+                        )
+                    self._write_refactoring_batch(worktree)
+                    return loop_manager.CodexResult(
+                        0,
+                        'MAINTENANCE_RESULT: {"outcome":"refactoring",'
+                        '"plan_ids":["G-002"]}',
+                        "assessment-session",
+                    )
+                selected.append(self._active_plan_id(connection, repo))
+                return loop_manager.CodexResult(1, "stop worker", "worker-session")
+
+            try:
+                first = self._run_registered(
+                    connection, state_dir, repo_path, agent
+                )
+                refactoring = maintenance_state.MaintenanceRepository(
+                    connection
+                ).get(repo)
+                barrier = connection.execute(
+                    "SELECT depends_on FROM exec_plans "
+                    "WHERE repo = ? AND plan_id = 'G-001'",
+                    (repo,),
+                ).fetchone()
+                self.assertEqual(
+                    refactoring.phase,
+                    maintenance_state.MaintenancePhase.REFACTORING,
+                )
+                self.assertEqual(refactoring.refactoring_plan_ids, ("G-002",))
+                self.assertEqual(json.loads(barrier["depends_on"]), ["G-002"])
+                self.assertEqual(selected, ["G-002"])
+
+                self._mark_active_merged(
+                    connection, repo_path, repo, "G-002"
+                )
+                latest = self._advance_remote(repo_path, "refactoring")
+                second = self._run_registered(
+                    connection, state_dir, repo_path, agent
+                )
+                completed = maintenance_state.MaintenanceRepository(connection).get(
+                    repo
+                )
+            finally:
+                connection.close()
+
+        self.assertEqual(first.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
+        self.assertEqual(second.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
+        self.assertEqual(
+            roles, ["planner", "worker", "planner", "worker"]
+        )
+        self.assertIn("post-refactor revalidation", prompts[2])
+        self.assertEqual(selected, ["G-002", "G-001"])
+        self.assertEqual(completed.phase, maintenance_state.MaintenancePhase.IDLE)
+        self.assertEqual(completed.last_success_commit, latest)
+
+    def test_unsafe_revalidation_preserves_cycle_and_blocks_ready_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo_path, state_dir, connection, repo = self._integration_project(
+                directory,
+                (
+                    ("G-000", "Merged Foundation", "MERGED", (), "normal"),
+                    (
+                        "G-001",
+                        "Ready Feature",
+                        "READY",
+                        ("G-000",),
+                        "critical",
+                    ),
+                ),
+            )
+            base_sha = git_command(repo_path, "rev-parse", "origin/main")
+            self._enter_revalidation(connection, repo, base_sha)
+            roles: list[str] = []
+
+            def agent(
+                _worktree, _state, _config, role_name, _prompt, **_kwargs
+            ):
+                roles.append(role_name)
+                return loop_manager.CodexResult(
+                    0,
+                    'MAINTENANCE_RESULT: {"outcome":"unsafe",'
+                    '"reason":"goal preservation is uncertain"}',
+                    "unsafe-session",
+                )
+
+            try:
+                result = self._run_registered(
+                    connection, state_dir, repo_path, agent
+                )
+                cycle = maintenance_state.MaintenanceRepository(connection).get(repo)
+                project = connection.execute(
+                    "SELECT phase, planning_error FROM projects WHERE repo = ?",
+                    (repo,),
+                ).fetchone()
+                plan = connection.execute(
+                    "SELECT status FROM exec_plans "
+                    "WHERE repo = ? AND plan_id = 'G-001'",
+                    (repo,),
+                ).fetchone()
+            finally:
+                connection.close()
+
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
+        self.assertEqual(roles, ["planner"])
+        self.assertEqual(
+            cycle.phase,
+            maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+        )
+        self.assertEqual(project["phase"], "PLANNING")
+        self.assertIn("goal preservation is uncertain", project["planning_error"])
+        self.assertEqual(plan["status"], "READY")
+
+    def test_stale_revalidation_snapshot_rejects_result_before_ready_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo_path, state_dir, connection, repo = self._integration_project(
+                directory,
+                (
+                    ("G-000", "Merged Foundation", "MERGED", (), "normal"),
+                    (
+                        "G-001",
+                        "Ready Feature",
+                        "READY",
+                        ("G-000",),
+                        "critical",
+                    ),
+                ),
+            )
+            base_sha = git_command(repo_path, "rev-parse", "origin/main")
+            self._enter_revalidation(connection, repo, base_sha)
+            roles: list[str] = []
+
+            def agent(
+                _worktree, _state, _config, role_name, _prompt, **_kwargs
+            ):
+                roles.append(role_name)
+                connection.execute(
+                    "UPDATE exec_plans SET workspace_owned = 2 "
+                    "WHERE repo = ? AND plan_id = 'G-001'",
+                    (repo,),
+                )
+                connection.commit()
+                return loop_manager.CodexResult(
+                    0,
+                    'MAINTENANCE_RESULT: {"outcome":"revalidated"}',
+                    "stale-session",
+                )
+
+            try:
+                result = self._run_registered(
+                    connection, state_dir, repo_path, agent
+                )
+                cycle = maintenance_state.MaintenanceRepository(connection).get(repo)
+                project = connection.execute(
+                    "SELECT phase, planning_validation_error "
+                    "FROM projects WHERE repo = ?",
+                    (repo,),
+                ).fetchone()
+            finally:
+                connection.close()
+
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
+        self.assertEqual(roles, ["planner"])
+        self.assertEqual(
+            cycle.phase,
+            maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+        )
+        self.assertEqual(project["phase"], "PLANNING")
+        self.assertIn("READY snapshot", project["planning_validation_error"])
+
+    def test_failed_maintenance_push_resumes_saved_result_without_replanning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo_path, state_dir, connection, repo = self._integration_project(
+                directory,
+                (("G-001", "Ready Feature", "READY", (), "critical"),),
+            )
+            planner_calls = 0
+            selected: list[str | None] = []
+
+            def agent(
+                worktree, _state, _config, role_name, _prompt, **_kwargs
+            ):
+                nonlocal planner_calls
+                if role_name == "planner":
+                    planner_calls += 1
+                    self.assertEqual(planner_calls, 1)
+                    self._write_refactoring_batch(worktree)
+                    return loop_manager.CodexResult(
+                        0,
+                        'MAINTENANCE_RESULT: {"outcome":"refactoring",'
+                        '"plan_ids":["G-002"]}',
+                        "assessment-session",
+                    )
+                selected.append(self._active_plan_id(connection, repo))
+                return loop_manager.CodexResult(1, "stop worker", "worker-session")
+
+            real_git = loop_manager.git
+            failed_pushes = 0
+
+            def fail_first_maintenance_push(path, *arguments, **kwargs):
+                nonlocal failed_pushes
+                if arguments[:2] == ("push", "origin") and arguments[2:] == (
+                    "HEAD:refs/heads/main",
+                ):
+                    failed_pushes += 1
+                    return subprocess.CompletedProcess(
+                        ["git"], 1, "injected maintenance push failure"
+                    )
+                return real_git(path, *arguments, **kwargs)
+
+            try:
+                with mock.patch(
+                    "loop_manager.git", side_effect=fail_first_maintenance_push
+                ):
+                    first = self._run_registered(
+                        connection, state_dir, repo_path, agent
+                    )
+                prepared = maintenance_state.MaintenanceRepository(connection).get(
+                    repo
+                )
+                project = connection.execute(
+                    "SELECT phase, last_error, planning_result "
+                    "FROM projects WHERE repo = ?",
+                    (repo,),
+                ).fetchone()
+                self.assertEqual(prepared.publication_stage, "prepared")
+                self.assertEqual(project["phase"], "PLANNING")
+                self.assertIn("push 실패", project["last_error"])
+                self.assertIn("refactoring", project["planning_result"])
+
+                second = self._run_registered(
+                    connection, state_dir, repo_path, agent
+                )
+                recovered = maintenance_state.MaintenanceRepository(connection).get(
+                    repo
+                )
+            finally:
+                connection.close()
+
+        self.assertEqual(first.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
+        self.assertEqual(second.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
+        self.assertEqual(failed_pushes, 1)
+        self.assertEqual(planner_calls, 1)
+        self.assertEqual(selected, ["G-002"])
+        self.assertEqual(
+            recovered.phase, maintenance_state.MaintenancePhase.REFACTORING
+        )
+
+    def test_post_push_sqlite_failure_recovers_prepared_intent_without_repush(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo_path, state_dir, connection, repo = self._integration_project(
+                directory,
+                (("G-001", "Ready Feature", "READY", (), "critical"),),
+            )
+            planner_calls = 0
+            selected: list[str | None] = []
+
+            def agent(
+                worktree, _state, _config, role_name, _prompt, **_kwargs
+            ):
+                nonlocal planner_calls
+                if role_name == "planner":
+                    planner_calls += 1
+                    self.assertEqual(planner_calls, 1)
+                    self._write_refactoring_batch(worktree)
+                    return loop_manager.CodexResult(
+                        0,
+                        'MAINTENANCE_RESULT: {"outcome":"refactoring",'
+                        '"plan_ids":["G-002"]}',
+                        "assessment-session",
+                    )
+                selected.append(self._active_plan_id(connection, repo))
+                return loop_manager.CodexResult(1, "stop worker", "worker-session")
+
+            real_transition = maintenance_state.MaintenanceRepository.transition
+
+            def fail_refactoring_transition(
+                repository, repo_arg, *arguments, **kwargs
+            ):
+                if (
+                    kwargs.get("next_phase")
+                    is maintenance_state.MaintenancePhase.REFACTORING
+                ):
+                    raise maintenance_state.MaintenanceStateError(
+                        "injected post-push SQLite failure"
+                    )
+                return real_transition(
+                    repository, repo_arg, *arguments, **kwargs
+                )
+
+            try:
+                with mock.patch.object(
+                    maintenance_state.MaintenanceRepository,
+                    "transition",
+                    autospec=True,
+                    side_effect=fail_refactoring_transition,
+                ):
+                    first = self._run_registered(
+                        connection, state_dir, repo_path, agent
+                    )
+                prepared = maintenance_state.MaintenanceRepository(connection).get(
+                    repo
+                )
+                project = connection.execute(
+                    "SELECT phase, planning_error FROM projects WHERE repo = ?",
+                    (repo,),
+                ).fetchone()
+                missing = connection.execute(
+                    "SELECT 1 FROM exec_plans "
+                    "WHERE repo = ? AND plan_id = 'G-002'",
+                    (repo,),
+                ).fetchone()
+                self.assertEqual(prepared.publication_stage, "prepared")
+                self.assertEqual(project["phase"], "PLANNING")
+                self.assertIn("injected post-push", project["planning_error"])
+                self.assertIsNone(missing)
+
+                real_git = loop_manager.git
+                recovery_pushes: list[tuple[str, ...]] = []
+
+                def record_recovery_git(path, *arguments, **kwargs):
+                    if arguments and arguments[0] == "push":
+                        recovery_pushes.append(arguments)
+                    return real_git(path, *arguments, **kwargs)
+
+                with mock.patch(
+                    "loop_manager.git", side_effect=record_recovery_git
+                ):
+                    second = self._run_registered(
+                        connection, state_dir, repo_path, agent
+                    )
+                recovered = maintenance_state.MaintenanceRepository(connection).get(
+                    repo
+                )
+                project = connection.execute(
+                    "SELECT planning_error FROM projects WHERE repo = ?",
+                    (repo,),
+                ).fetchone()
+            finally:
+                connection.close()
+
+        self.assertEqual(first.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
+        self.assertEqual(second.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
+        self.assertEqual(recovery_pushes, [])
+        self.assertEqual(planner_calls, 1)
+        self.assertEqual(selected, ["G-002"])
+        self.assertEqual(
+            recovered.phase, maintenance_state.MaintenancePhase.REFACTORING
+        )
+        self.assertIsNone(project["planning_error"])
 
     def test_active_or_due_cycle_blocks_project_completion_notification(self):
         connection = self._connection()

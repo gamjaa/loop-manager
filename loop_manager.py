@@ -12699,11 +12699,21 @@ def _run_project_step(
         if fingerprint_required
         else None
     )
+    recoverable_maintenance_publication = bool(
+        maintenance_planning
+        and row["phase"] == "PLANNING"
+        and maintenance_cycle.publication_stage == "prepared"
+    )
 
     # A fixed planning error must remain reportable even when the user base
     # worktree later becomes unsafe. The fingerprint reads the selected SHA,
     # so this check neither reads nor alters local changes.
-    if row and row["planning_error"] and row["planning_error_fingerprint"] == current_fingerprint:
+    if (
+        row
+        and row["planning_error"]
+        and row["planning_error_fingerprint"] == current_fingerprint
+        and not recoverable_maintenance_publication
+    ):
         operation_print(
             f"계획 오류가 해결되지 않았습니다: {row['planning_error']}\n"
             f"보존된 planning worktree: {row['worktree']}",
@@ -12711,7 +12721,7 @@ def _run_project_step(
         )
         return 1
 
-    if row["planning_error"]:
+    if row["planning_error"] and not recoverable_maintenance_publication:
         stale_worktree = Path(row["worktree"]) if row["worktree"] else None
         stored_fingerprint = str(
             row["planning_attempt_fingerprint"]
@@ -12915,10 +12925,21 @@ def _run_project_step(
         if maintenance_planning:
             try:
                 maintenance_cycle = maintenance_repository.get(repo)
-                maintenance_context = prepare_maintenance_planning_context(
-                    connection, repo, planning_worktree, str(row["active_sha"])
-                )
-                if maintenance_cycle.publication_stage is None:
+                if maintenance_cycle.publication_stage == "prepared":
+                    maintenance_context = _maintenance_context_at_revision(
+                        connection,
+                        repo,
+                        planning_worktree,
+                        str(row["active_sha"]),
+                        maintenance_cycle,
+                    )
+                else:
+                    maintenance_context = prepare_maintenance_planning_context(
+                        connection,
+                        repo,
+                        planning_worktree,
+                        str(row["active_sha"]),
+                    )
                     maintenance_change_context = _maintenance_change_context_text(
                         repo_path, base, maintenance_cycle
                     )
