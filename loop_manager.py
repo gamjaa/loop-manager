@@ -10,7 +10,7 @@ import configparser
 import contextlib
 import difflib
 import errno
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
 import hashlib
@@ -42,6 +42,7 @@ from guidance_approval import (
 from managed_config import ManagedConfig, ManagedConfigError, load_managed_config
 import notifications
 import project_registry
+import runtime_state
 from maintenance_planning import (
     MaintenancePlanMode,
     MaintenancePlanningContext,
@@ -95,58 +96,13 @@ PR_CLOSED_BLOCK_REASON = BlockReasonCode.PULL_REQUEST_CLOSED.value
 PR_CONFLICT_PREFLIGHT_BLOCK_REASON = "pr-conflict-preflight"
 PR_CONFLICT_PREFLIGHT_ERROR_PREFIX = "PR_OPEN 충돌 복구 소유권 검증 실패:"
 PRIORITY_ORDER = {"critical": 0, "high": 1, "normal": 2, "low": 3}
-ACTIVE_EXECPLAN_STATUSES = frozenset(
-    {"IMPLEMENTING", "VERIFYING", "REVIEWING", "PUBLISHING"}
-)
+ACTIVE_EXECPLAN_STATUSES = runtime_state.ACTIVE_STATUSES
 WAITING_EXECPLAN_STATUSES = frozenset({"PR_OPEN", "PLAN_BLOCKED"})
 KNOWN_EXECPLAN_STATUSES = ACTIVE_EXECPLAN_STATUSES | WAITING_EXECPLAN_STATUSES | {
     "READY",
     "MERGED",
 }
-FIELDS = {
-    "base_branch",
-    "provider",
-    "processed_sha",
-    "planning_fingerprint",
-    "planning_attempt_fingerprint",
-    "planning_workspace_owned",
-    "planning_retry_count",
-    "planner_session_id",
-    "worker_session_id",
-    "reviewer_session_id",
-    "worker_result",
-    "verify_result",
-    "review_result",
-    "planning_validation_error",
-    "planning_result_pending_validation",
-    "planning_result_completed",
-    "planning_result",
-    "planning_error",
-    "planning_error_fingerprint",
-    "active_sha",
-    "validated_base_sha",
-    "publication_remote_oid",
-    "pr_conflict_recovery",
-    "pr_conflict_head_oid",
-    "pr_conflict_base_oid",
-    "plan_sha",
-    "phase",
-    "branch",
-    "worktree",
-    "plan_path",
-    "pr_url",
-    "pr_head_oid",
-    "last_error",
-    "agent_role",
-    "agent_snapshot",
-    "agent_input_fingerprint",
-    "agent_baseline",
-    "agent_recovery",
-    "agent_input_plan",
-    "agent_result_plan",
-    "agent_result_snapshot",
-    "agent_manager_snapshot",
-}
+FIELDS = runtime_state.PROJECT_UPDATE_FIELDS
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -1183,13 +1139,16 @@ def update_project(connection: sqlite3.Connection, repo: str, **values: object) 
     current = connection.execute(
         "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
     ).fetchone()
-    assignments = ", ".join(f"{name} = ?" for name in values)
-    connection.execute(
-        f"UPDATE projects SET {assignments} WHERE repo = ?",
-        [*values.values(), repo],
-    )
-    _mirror_project_update_to_execplan(connection, repo, current, values)
-    notifications.enqueue_current_project_events(connection, repo)
+    if current is None:
+        notifications.enqueue_current_project_events(connection, repo)
+        connection.commit()
+        return
+    if (
+        current["plan_path"]
+        and not ("phase" in values and values["phase"] is None)
+    ):
+        _ensure_execplans_schema(connection)
+    runtime_state.RuntimeStateRepository(connection).update_project(repo, values)
     connection.commit()
 
 
@@ -2441,13 +2400,11 @@ def register_execplans(
 
     with connection:
         _register_execplan_rows(connection, repo, worktree, plans, plan_commit)
-        values = _clear_active_values(
+        runtime_state.RuntimeStateRepository(connection).clear(
+            repo,
             processed_sha=plan_commit,
             planning_fingerprint=planning_fingerprint,
-        )
-        assignments = ", ".join(f"{name} = ?" for name in values)
-        connection.execute(
-            f"UPDATE projects SET {assignments} WHERE repo = ?", (*values.values(), repo)
+            enqueue=False,
         )
 
 
@@ -3290,25 +3247,13 @@ def active_execplan(connection: sqlite3.Connection, repo: str) -> sqlite3.Row | 
     """Return the only plan currently occupying the repository mutation slot."""
 
     _ensure_execplans_schema(connection)
-    placeholders = ", ".join("?" for _ in ACTIVE_EXECPLAN_STATUSES)
-    return connection.execute(
-        f"SELECT * FROM exec_plans WHERE repo = ? AND status IN ({placeholders})",
-        (repo, *sorted(ACTIVE_EXECPLAN_STATUSES)),
-    ).fetchone()
+    return runtime_state.RuntimeStateRepository(connection).active_row(repo)
 
 
 def project_execplan(connection: sqlite3.Connection, repo: str) -> sqlite3.Row | None:
     """Return the plan explicitly mirrored by ``projects``, regardless of status."""
 
-    row = connection.execute(
-        "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
-    ).fetchone()
-    if row is None or not row["plan_path"]:
-        return None
-    return connection.execute(
-        "SELECT * FROM exec_plans WHERE repo = ? AND path = ?",
-        (repo, row["plan_path"]),
-    ).fetchone()
+    return runtime_state.RuntimeStateRepository(connection).projected_row(repo)
 
 
 def plan_blocked_execplans(
@@ -3343,13 +3288,17 @@ def mark_execplan_workspace_owned(
     plan_id: str,
 ) -> None:
     with connection:
-        changed = connection.execute(
-            "UPDATE exec_plans SET workspace_owned = 1 "
-            "WHERE repo = ? AND plan_id = ?",
-            (repo, plan_id),
-        )
-        if changed.rowcount != 1:
-            raise RuntimeError("workspace 소유권을 기록할 ExecPlan을 찾을 수 없습니다.")
+        try:
+            runtime_state.RuntimeStateRepository(connection).update_plan(
+                repo,
+                plan_id,
+                plan_values={"workspace_owned": WORKSPACE_OWNED},
+                enqueue=False,
+            )
+        except runtime_state.RuntimeStateError as error:
+            raise RuntimeError(
+                "workspace 소유권을 기록할 ExecPlan을 찾을 수 없습니다."
+            ) from error
 
 
 def reserve_execplan_workspace(
@@ -3358,19 +3307,17 @@ def reserve_execplan_workspace(
     plan_id: str,
 ) -> None:
     with connection:
-        changed = connection.execute(
-            "UPDATE exec_plans SET workspace_owned = ? "
-            "WHERE repo = ? AND plan_id = ? AND workspace_owned IN (?, ?)",
-            (
-                WORKSPACE_RESERVED,
+        try:
+            runtime_state.RuntimeStateRepository(connection).reserve_workspace(
                 repo,
                 plan_id,
-                WORKSPACE_UNOWNED,
-                WORKSPACE_RESERVED,
-            ),
-        )
-        if changed.rowcount != 1:
-            raise RuntimeError("workspace 생성을 예약할 ExecPlan을 찾을 수 없습니다.")
+                reserved_value=WORKSPACE_RESERVED,
+                allowed_values=(WORKSPACE_UNOWNED, WORKSPACE_RESERVED),
+            )
+        except runtime_state.RuntimeStateError as error:
+            raise RuntimeError(
+                "workspace 생성을 예약할 ExecPlan을 찾을 수 없습니다."
+            ) from error
 
 
 def compact_execplan_catalog(connection: sqlite3.Connection, repo: str) -> str:
@@ -3566,40 +3513,19 @@ def activate_ready_execplan(
         if worktree.is_dir()
         else base_sha
     )
-    with connection:
-        changed = connection.execute(
-            """
-            UPDATE exec_plans
-            SET status = 'IMPLEMENTING', active_sha = ?, branch = ?, worktree = ?,
-                last_error = NULL
-            WHERE repo = ? AND plan_id = ? AND status = 'READY'
-            """,
-            (activation_sha, branch, str(worktree), repo, selected["plan_id"]),
+    try:
+        runtime_state.RuntimeStateRepository(connection).activate(
+            repo,
+            str(selected["plan_id"]),
+            activation_sha=activation_sha,
+            branch=branch,
+            worktree=str(worktree),
         )
-        if changed.rowcount != 1:
-            raise RuntimeError("READY ExecPlan 선택 상태가 변경되었습니다.")
-        connection.execute(
-            """
-            UPDATE projects
-            SET active_sha = ?, validated_base_sha = NULL,
-                publication_remote_oid = NULL, pr_conflict_recovery = 0,
-                pr_conflict_head_oid = NULL, pr_conflict_base_oid = NULL,
-                plan_sha = ?, phase = 'WORKING',
-                branch = ?, worktree = ?, plan_path = ?, pr_url = NULL,
-                pr_head_oid = NULL, last_error = NULL,
-                worker_session_id = NULL, reviewer_session_id = NULL,
-                worker_result = NULL, verify_result = NULL, review_result = NULL
-            WHERE repo = ?
-            """,
-            (
-                activation_sha,
-                selected["plan_sha"],
-                branch,
-                str(worktree),
-                selected["path"],
-                repo,
-            ),
-        )
+    except runtime_state.RuntimeStateError as error:
+        raise RuntimeError(
+            "READY ExecPlan 선택 상태가 변경되었습니다."
+        ) from error
+    connection.commit()
     return connection.execute(
         "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
         (repo, selected["plan_id"]),
@@ -3622,52 +3548,16 @@ def hydrate_execplan_project(
 ) -> None:
     """Hydrate one explicitly selected plan into the compatibility mirror."""
 
-    phase = "WORKING" if plan["status"] == "IMPLEMENTING" else plan["status"]
-    connection.execute(
-        """
-        UPDATE projects
-        SET active_sha = ?, validated_base_sha = ?, publication_remote_oid = ?,
-            pr_conflict_recovery = ?, pr_conflict_head_oid = ?,
-            pr_conflict_base_oid = ?, plan_sha = ?, phase = ?, branch = ?,
-            worktree = ?, plan_path = ?,
-            pr_url = ?, pr_head_oid = ?, last_error = ?, worker_session_id = ?,
-            reviewer_session_id = ?, worker_result = ?, verify_result = ?, review_result = ?
-            , agent_role = ?, agent_snapshot = ?, agent_input_fingerprint = ?,
-            agent_baseline = ?, agent_recovery = ?, agent_input_plan = ?,
-            agent_result_plan = ?, agent_result_snapshot = ?, agent_manager_snapshot = ?
-        WHERE repo = ?
-        """,
-        (
-            plan["active_sha"],
-            plan["validated_base_sha"],
-            plan["publication_remote_oid"],
-            plan["pr_conflict_recovery"],
-            plan["pr_conflict_head_oid"],
-            plan["pr_conflict_base_oid"],
-            plan["plan_sha"],
-            phase,
-            plan["branch"],
-            plan["worktree"],
-            plan["path"],
-            plan["pr_url"],
-            plan["pr_head_oid"],
-            plan["last_error"],
-            plan["worker_session_id"],
-            plan["reviewer_session_id"],
-            plan["worker_result"],
-            plan["verify_result"],
-            plan["review_result"],
-            plan["agent_role"],
-            plan["agent_snapshot"],
-            plan["agent_input_fingerprint"],
-            plan["agent_baseline"],
-            plan["agent_recovery"],
-            plan["agent_input_plan"],
-            plan["agent_result_plan"],
-            plan["agent_result_snapshot"],
-            plan["agent_manager_snapshot"],
-            repo,
-        ),
+    if connection.execute(
+        "SELECT 1 FROM projects WHERE repo = ?", (repo,)
+    ).fetchone() is None:
+        connection.commit()
+        return
+    snapshot = runtime_state.ExecutionSnapshot.from_row(plan)
+    if snapshot.repo != repo:
+        snapshot = replace(snapshot, repo=repo)
+    runtime_state.RuntimeStateRepository(connection).hydrate_snapshot(
+        repo, snapshot
     )
     connection.commit()
 
@@ -3678,55 +3568,20 @@ def _mirror_project_update_to_execplan(
     current: sqlite3.Row | None,
     values: dict[str, object],
 ) -> None:
-    if current is None or not current["plan_path"]:
+    plan_path = (
+        str(current["plan_path"])
+        if current is not None and current["plan_path"]
+        else None
+    )
+    compatible_values = {
+        field: value for field, value in values.items() if field in FIELDS
+    }
+    if not compatible_values:
         return
-    if "phase" in values and values["phase"] is None:
-        return
-    plan_id = _plan_id_from_path(str(current["plan_path"]))
-    if plan_id is None:
-        return
-    _ensure_execplans_schema(connection)
-    translated: dict[str, object] = {}
-    for field in (
-        "active_sha",
-        "validated_base_sha",
-        "publication_remote_oid",
-        "pr_conflict_recovery",
-        "pr_conflict_head_oid",
-        "pr_conflict_base_oid",
-        "plan_sha",
-        "branch",
-        "worktree",
-        "pr_url",
-        "pr_head_oid",
-        "last_error",
-        "worker_session_id",
-        "reviewer_session_id",
-        "worker_result",
-        "verify_result",
-        "review_result",
-        "agent_role",
-        "agent_snapshot",
-        "agent_input_fingerprint",
-        "agent_baseline",
-        "agent_recovery",
-        "agent_input_plan",
-        "agent_result_plan",
-        "agent_result_snapshot",
-        "agent_manager_snapshot",
-    ):
-        if field in values:
-            translated[field] = values[field]
-    if "phase" in values:
-        status = "IMPLEMENTING" if values["phase"] == "WORKING" else values["phase"]
-        if status != "PLANNING":
-            translated["status"] = status
-    if not translated:
-        return
-    assignments = ", ".join(f"{name} = ?" for name in translated)
-    connection.execute(
-        f"UPDATE exec_plans SET {assignments} WHERE repo = ? AND plan_id = ?",
-        (*translated.values(), repo, plan_id),
+    if plan_path and not ("phase" in values and values["phase"] is None):
+        _ensure_execplans_schema(connection)
+    runtime_state.RuntimeStateRepository(connection).mirror_project_values(
+        repo, plan_path, compatible_values
     )
 
 
@@ -4233,19 +4088,15 @@ def ensure_worker_level_state(
     effective = catalog_plan["effective_worker_level"]
     if initial is None and effective is None:
         with connection:
-            connection.execute(
-                """
-                UPDATE exec_plans
-                SET initial_worker_level = ?, effective_worker_level = ?,
-                    review_level_history = '{}'
-                WHERE repo = ? AND plan_id = ?
-                """,
-                (
-                    calculated_initial,
-                    calculated_initial,
-                    repo,
-                    catalog_plan["plan_id"],
-                ),
+            runtime_state.RuntimeStateRepository(connection).update_plan(
+                repo,
+                str(catalog_plan["plan_id"]),
+                plan_values={
+                    "initial_worker_level": calculated_initial,
+                    "effective_worker_level": calculated_initial,
+                    "review_level_history": "{}",
+                },
+                enqueue=False,
             )
         return calculated_initial
     if initial is None or effective is None:
@@ -5462,10 +5313,11 @@ def clear_validation_failure_history(
     if plan is None:
         raise RuntimeError("지문 이력을 초기화할 활성 ExecPlan을 찾을 수 없습니다.")
     with connection:
-        connection.execute(
-            f"UPDATE exec_plans SET {column} = '{{}}' "
-            "WHERE repo = ? AND plan_id = ?",
-            (repo, plan["plan_id"]),
+        runtime_state.RuntimeStateRepository(connection).update_plan(
+            repo,
+            str(plan["plan_id"]),
+            plan_values={column: "{}"},
+            enqueue=False,
         )
 
 
@@ -6034,18 +5886,14 @@ def recover_confirmed_pr_conflict_push(
     )
     if remote_branch_oid(repo_path, branch) != local_oid:
         return False
-    update_project(
-        connection,
+    runtime_state.RuntimeStateRepository(connection).open_pull_request(
         repo,
-        phase="PR_OPEN",
         publication_remote_oid=local_oid,
         pr_head_oid=local_oid,
         pr_conflict_recovery=0,
         pr_conflict_head_oid=None,
         pr_conflict_base_oid=None,
-        last_error=None,
     )
-    clear_active(connection, repo)
     return True
 
 def _canonical_path(path: Path) -> Path:
@@ -7604,51 +7452,10 @@ def _clear_active_values(
     processed_sha: str | None = None,
     planning_fingerprint: str | None = None,
 ) -> dict[str, object]:
-    values: dict[str, object] = {
-        "active_sha": None,
-        "validated_base_sha": None,
-        "publication_remote_oid": None,
-        "pr_conflict_recovery": 0,
-        "pr_conflict_head_oid": None,
-        "pr_conflict_base_oid": None,
-        "plan_sha": None,
-        "phase": None,
-        "branch": None,
-        "worktree": None,
-        "plan_path": None,
-        "pr_url": None,
-        "pr_head_oid": None,
-        "last_error": None,
-        "planning_attempt_fingerprint": None,
-        "planning_workspace_owned": 0,
-        "planning_retry_count": 0,
-        "planner_session_id": None,
-        "worker_session_id": None,
-        "reviewer_session_id": None,
-        "worker_result": None,
-        "verify_result": None,
-        "review_result": None,
-        "planning_validation_error": None,
-        "planning_result_pending_validation": 0,
-        "planning_result_completed": 0,
-        "planning_result": None,
-        "planning_error": None,
-        "planning_error_fingerprint": None,
-        "agent_role": None,
-        "agent_snapshot": None,
-        "agent_baseline": None,
-        "agent_recovery": None,
-        "agent_input_plan": None,
-        "agent_result_plan": None,
-        "agent_input_fingerprint": None,
-        "agent_result_snapshot": None,
-        "agent_manager_snapshot": None,
-    }
-    if processed_sha is not None:
-        values["processed_sha"] = processed_sha
-    if planning_fingerprint is not None:
-        values["planning_fingerprint"] = planning_fingerprint
-    return values
+    return runtime_state.clear_project_values(
+        processed_sha=processed_sha,
+        planning_fingerprint=planning_fingerprint,
+    )
 
 
 def _clear_active_in_current_transaction(
@@ -7658,17 +7465,17 @@ def _clear_active_in_current_transaction(
     processed_sha: str | None = None,
     planning_fingerprint: str | None = None,
 ) -> None:
-    values = _clear_active_values(
-        processed_sha=processed_sha,
-        planning_fingerprint=planning_fingerprint,
-    )
-    assignments = ", ".join(f"{name} = ?" for name in values)
-    cursor = connection.execute(
-        f"UPDATE projects SET {assignments} WHERE repo = ?",
-        (*values.values(), repo),
-    )
-    if cursor.rowcount != 1:
-        raise RuntimeError("project planning 상태를 원자적으로 정리할 수 없습니다.")
+    try:
+        runtime_state.RuntimeStateRepository(connection).clear(
+            repo,
+            processed_sha=processed_sha,
+            planning_fingerprint=planning_fingerprint,
+            enqueue=False,
+        )
+    except runtime_state.RuntimeStateError as error:
+        raise RuntimeError(
+            "project planning 상태를 원자적으로 정리할 수 없습니다."
+        ) from error
 
 
 def clear_active(
@@ -7678,14 +7485,18 @@ def clear_active(
     processed_sha: str | None = None,
     planning_fingerprint: str | None = None,
 ) -> None:
-    update_project(
-        connection,
+    if connection.execute(
+        "SELECT 1 FROM projects WHERE repo = ?", (repo,)
+    ).fetchone() is None:
+        connection.commit()
+        return
+    runtime_state.RuntimeStateRepository(connection).clear(
         repo,
-        **_clear_active_values(
-            processed_sha=processed_sha,
-            planning_fingerprint=planning_fingerprint,
-        ),
+        processed_sha=processed_sha,
+        planning_fingerprint=planning_fingerprint,
+        enqueue=True,
     )
+    connection.commit()
 
 
 def _execplan_input_paths(plan: sqlite3.Row) -> list[str]:
@@ -8151,44 +7962,28 @@ def _block_for_new_guidance(
                     baseline_mode,
                 ),
             )
-        connection.execute(
-            """
-            UPDATE exec_plans
-            SET status = 'PLAN_BLOCKED', blocked_reason = ?,
-                blocked_fingerprint = NULL,
-                blocked_worktree_fingerprint = NULL,
-                guidance_plan_hash = ?, last_error = ?, worker_result = ?,
-                agent_result_snapshot = ?, agent_manager_snapshot = NULL
-            WHERE repo = ? AND plan_id = ?
-            """,
-            (
-                GUIDANCE_BLOCK_REASON,
-                document.structure_hash,
-                message,
-                worker_result,
-                result_snapshot,
-                repo,
-                plan["plan_id"],
-            ),
-        )
-        scoped_blocking.record_plan_block(
-            connection,
+        runtime_state.RuntimeStateRepository(connection).block_plan(
             repo,
             str(plan["plan_id"]),
-            BlockReasonCode.GUIDANCE_APPROVAL_REQUIRED,
-            message,
-            document.structure_hash,
+            reason_code=GUIDANCE_BLOCK_REASON,
+            evidence=message,
+            release_fingerprint=document.structure_hash,
+            plan_values={
+                "blocked_fingerprint": None,
+                "blocked_worktree_fingerprint": None,
+                "guidance_plan_hash": document.structure_hash,
+                "worker_result": worker_result,
+                "agent_result_snapshot": result_snapshot,
+                "agent_manager_snapshot": None,
+            },
+            project_values={
+                "phase": "PLAN_BLOCKED",
+                "last_error": message,
+                "worker_result": worker_result,
+                "agent_result_snapshot": result_snapshot,
+                "agent_manager_snapshot": None,
+            },
         )
-        connection.execute(
-            """
-            UPDATE projects
-            SET phase = 'PLAN_BLOCKED', last_error = ?, worker_result = ?,
-                agent_result_snapshot = ?, agent_manager_snapshot = NULL
-            WHERE repo = ?
-            """,
-            (message, worker_result, result_snapshot, repo),
-        )
-        notifications.enqueue_current_project_events(connection, repo)
 
 
 def _guidance_document_matches_rows(
@@ -8431,23 +8226,24 @@ def resume_guidance_approval_if_decided(
                         proposal.proposal_id,
                     ),
                 )
-            connection.execute(
-                """
-                UPDATE exec_plans
-                SET status = 'IMPLEMENTING', blocked_reason = NULL,
-                    blocked_fingerprint = NULL,
-                    blocked_worktree_fingerprint = NULL, last_error = NULL
-                WHERE repo = ? AND plan_id = ?
-                """,
-                (repo, plan["plan_id"]),
+            runtime_state.RuntimeStateRepository(connection).transition(
+                repo,
+                str(plan["plan_id"]),
+                plan_values={
+                    "status": "IMPLEMENTING",
+                    "blocked_reason": None,
+                    "blocked_fingerprint": None,
+                    "blocked_worktree_fingerprint": None,
+                    "last_error": None,
+                },
+                project_values={
+                    "phase": "WORKING",
+                    "last_error": None,
+                },
+                enqueue=False,
             )
             scoped_blocking.clear_plan_block(
                 connection, repo, str(plan["plan_id"])
-            )
-            connection.execute(
-                "UPDATE projects SET phase = 'WORKING', last_error = NULL "
-                "WHERE repo = ?",
-                (repo,),
             )
         if resuming_rebase:
             update_project(
@@ -8491,45 +8287,31 @@ def _invalidate_guidance_approval(
             """,
             (repo, plan["plan_id"], *proposal_ids),
         )
-        connection.execute(
-            """
-            UPDATE exec_plans
-            SET status = 'PLAN_BLOCKED', blocked_reason = ?,
-                blocked_fingerprint = NULL,
-                blocked_worktree_fingerprint = NULL,
-                guidance_plan_hash = ?, last_error = ?, worker_result = ?,
-                agent_result_snapshot = ?, agent_manager_snapshot = NULL
-            WHERE repo = ? AND plan_id = ?
-            """,
-            (
-                GUIDANCE_BLOCK_REASON,
-                document.structure_hash,
-                message,
-                worker_result,
-                result_snapshot,
-                repo,
-                plan["plan_id"],
-            ),
-        )
-        scoped_blocking.record_plan_block(
-            connection,
-            repo,
-            str(plan["plan_id"]),
-            BlockReasonCode.GUIDANCE_APPROVAL_REQUIRED,
-            message,
-            document.structure_hash,
-        )
-        _clear_active_in_current_transaction(connection, repo)
         # Manager rebase/verify may already have cleared the Agent scope.
         # Freeze the diagnosed state so only the User Decision can change.
-        connection.execute(
-            "UPDATE exec_plans SET agent_role = 'worker', agent_snapshot = ?, "
-            "agent_baseline = NULL, agent_recovery = NULL, "
-            "agent_input_plan = NULL, agent_result_plan = NULL, "
-            "agent_input_fingerprint = NULL WHERE repo = ? AND plan_id = ?",
-            (result_snapshot, repo, plan["plan_id"]),
+        runtime_state.RuntimeStateRepository(connection).block_plan(
+            repo,
+            str(plan["plan_id"]),
+            reason_code=GUIDANCE_BLOCK_REASON,
+            evidence=message,
+            release_fingerprint=document.structure_hash,
+            plan_values={
+                "blocked_fingerprint": None,
+                "blocked_worktree_fingerprint": None,
+                "guidance_plan_hash": document.structure_hash,
+                "worker_result": worker_result,
+                "agent_result_snapshot": result_snapshot,
+                "agent_manager_snapshot": None,
+                "agent_role": "worker",
+                "agent_snapshot": result_snapshot,
+                "agent_baseline": None,
+                "agent_recovery": None,
+                "agent_input_plan": None,
+                "agent_result_plan": None,
+                "agent_input_fingerprint": None,
+            },
+            clear_projection=True,
         )
-        notifications.enqueue_current_project_events(connection, repo)
 
 
 def inspect_worker_guidance_result(
@@ -8613,12 +8395,12 @@ def inspect_worker_guidance_result(
             worker_result,
         )
         return True
-    with connection:
-        connection.execute(
-            "UPDATE exec_plans SET guidance_plan_hash = ? "
-            "WHERE repo = ? AND plan_id = ?",
-            (document.structure_hash, repo, plan["plan_id"]),
-        )
+    runtime_state.RuntimeStateRepository(connection).update_plan(
+        repo,
+        str(plan["plan_id"]),
+        plan_values={"guidance_plan_hash": document.structure_hash},
+        enqueue=False,
+    )
     return False
 
 
@@ -8779,18 +8561,17 @@ def _update_blocked_error(
     error: str,
 ) -> None:
     with connection:
-        connection.execute(
-            "UPDATE exec_plans SET last_error = ? WHERE repo = ? AND plan_id = ?",
-            (error, repo, plan_id),
+        runtime_state.RuntimeStateRepository(connection).transition(
+            repo,
+            plan_id,
+            plan_values={"last_error": error},
+            project_values={"last_error": error},
+            enqueue=False,
         )
         connection.execute(
             "UPDATE execplan_blocks SET evidence = ?, updated_at = CURRENT_TIMESTAMP "
             "WHERE repo = ? AND plan_id = ?",
             (error, repo, plan_id),
-        )
-        connection.execute(
-            "UPDATE projects SET last_error = ? WHERE repo = ?",
-            (error, repo),
         )
         notifications.enqueue_current_project_events(connection, repo)
 
@@ -8844,48 +8625,51 @@ def block_active_execplan(
         plan_file = worktree / str(plan["path"])
         if plan_file.is_file():
             agent_result_plan = plan_file.read_text(encoding="utf-8")
-    with connection:
-        connection.execute(
-            """
-            UPDATE exec_plans
-            SET blocked_fingerprint = ?,
-                blocked_worktree_fingerprint = ?, blocked_review_fingerprint = NULL,
-                last_error = ?, verify_result = ?, agent_result_snapshot = ?,
-                agent_result_plan = ?, agent_manager_snapshot = NULL
-            WHERE repo = ? AND plan_id = ?
-            """,
-            (
-                fingerprint,
-                blocked_worktree_fingerprint,
-                error,
-                verify_result,
-                agent_result_snapshot,
-                agent_result_plan,
+    plan_values = {
+        "blocked_fingerprint": fingerprint,
+        "blocked_worktree_fingerprint": blocked_worktree_fingerprint,
+        "blocked_review_fingerprint": None,
+        "last_error": error,
+        "verify_result": verify_result,
+        "agent_result_snapshot": agent_result_snapshot,
+        "agent_result_plan": agent_result_plan,
+        "agent_manager_snapshot": None,
+    }
+    plan_id = str(plan["plan_id"])
+    if scoped_blocking.reason_scope(reason) is BlockScope.PLAN:
+        runtime_state.RuntimeStateRepository(connection).block_plan(
+            repo,
+            plan_id,
+            reason_code=reason.value,
+            evidence=error,
+            release_fingerprint=fingerprint,
+            plan_values=plan_values,
+            clear_projection=True,
+        )
+    else:
+        with connection:
+            runtime_state.RuntimeStateRepository(connection).transition(
                 repo,
                 plan_id,
-            ),
-        )
-        if scoped_blocking.reason_scope(reason) is BlockScope.PLAN:
-            scoped_blocking.record_plan_block(
-                connection, repo, str(plan_id), reason, error, fingerprint
+                plan_values=plan_values,
+                project_values={
+                    "verify_result": verify_result,
+                    "agent_result_snapshot": agent_result_snapshot,
+                    "agent_result_plan": agent_result_plan,
+                    "agent_manager_snapshot": None,
+                },
+                enqueue=False,
             )
-            _clear_active_in_current_transaction(connection, repo)
-        else:
             scoped_blocking.record_project_block(
                 connection,
                 repo,
                 reason,
                 error,
                 fingerprint,
-                plan_id=str(plan_id),
+                plan_id=plan_id,
                 previous_phase=str(project["phase"] or "") or None,
             )
-            connection.execute(
-                "UPDATE projects SET verify_result = ?, agent_result_snapshot = ?, "
-                "agent_result_plan = ?, agent_manager_snapshot = NULL WHERE repo = ?",
-                (verify_result, agent_result_snapshot, agent_result_plan, repo),
-            )
-        notifications.enqueue_current_project_events(connection, repo)
+            notifications.enqueue_current_project_events(connection, repo)
 
 
 def transition_validation_failure(
@@ -8983,78 +8767,54 @@ def transition_validation_failure(
         blocked_worktree_input = None
         blocked_review_input = None
 
-    execplan_assignments = [
-        f"{history_column} = ?",
-        "validated_base_sha = NULL",
-        "status = ?",
-        "last_error = ?",
-    ]
-    execplan_values: list[object] = [
-        serialized_history,
-        "PLAN_BLOCKED" if blocked else "IMPLEMENTING",
-        error,
-    ]
-    project_assignments = [
-        "validated_base_sha = NULL", "phase = ?", "last_error = ?"
-    ]
-    project_values: list[object] = ["WORKING", error]
+    plan_values: dict[str, object] = {
+        history_column: serialized_history,
+        "validated_base_sha": None,
+        "status": "PLAN_BLOCKED" if blocked else "IMPLEMENTING",
+        "last_error": error,
+    }
+    project_values: dict[str, object] = {
+        "validated_base_sha": None,
+        "phase": "WORKING",
+        "last_error": error,
+    }
     if stage == "verify":
-        execplan_assignments.append("verify_result = ?")
-        execplan_values.append(output)
-        project_assignments.append("verify_result = ?")
-        project_values.append(output)
+        plan_values["verify_result"] = output
+        project_values["verify_result"] = output
     else:
-        execplan_assignments.append("review_result = ?")
-        execplan_values.append(output)
-        project_assignments.append("review_result = ?")
-        project_values.append(output)
+        plan_values["review_result"] = output
+        project_values["review_result"] = output
         if level_decision is not None:
-            execplan_assignments.extend(
-                ["effective_worker_level = ?", "review_level_history = ?"]
-            )
-            execplan_values.extend(
-                [level_decision.effective_level, serialized_level_history]
-            )
+            plan_values["effective_worker_level"] = level_decision.effective_level
+            plan_values["review_level_history"] = serialized_level_history
     if blocked:
-        execplan_assignments.extend(
-            [
-                "blocked_fingerprint = ?",
-                "blocked_worktree_fingerprint = ?",
-                "blocked_review_fingerprint = ?",
-            ]
+        plan_values.update(
+            blocked_fingerprint=blocked_input,
+            blocked_worktree_fingerprint=blocked_worktree_input,
+            blocked_review_fingerprint=blocked_review_input,
         )
-        execplan_values.extend(
-            [blocked_input, blocked_worktree_input, blocked_review_input]
+        reason = (
+            BlockReasonCode.VERIFY_RETRY_EXHAUSTED
+            if stage == "verify"
+            else BlockReasonCode.REVIEW_RETRY_EXHAUSTED
         )
-        project_assignments.append("agent_manager_snapshot = NULL")
-
-    with connection:
-        connection.execute(
-            f"UPDATE exec_plans SET {', '.join(execplan_assignments)} "
-            "WHERE repo = ? AND plan_id = ?",
-            (*execplan_values, repo, plan["plan_id"]),
+        runtime_state.RuntimeStateRepository(connection).block_plan(
+            repo,
+            str(plan["plan_id"]),
+            reason_code=reason.value,
+            evidence=error,
+            release_fingerprint=blocked_input,
+            plan_values=plan_values,
+            clear_projection=True,
         )
-        if blocked:
-            reason = (
-                BlockReasonCode.VERIFY_RETRY_EXHAUSTED
-                if stage == "verify"
-                else BlockReasonCode.REVIEW_RETRY_EXHAUSTED
-            )
-            scoped_blocking.record_plan_block(
-                connection,
-                repo,
-                str(plan["plan_id"]),
-                reason,
-                error,
-                blocked_input,
-            )
-            _clear_active_in_current_transaction(connection, repo)
-            notifications.enqueue_current_project_events(connection, repo)
-        else:
-            connection.execute(
-                f"UPDATE projects SET {', '.join(project_assignments)} WHERE repo = ?",
-                (*project_values, repo),
-            )
+    else:
+        runtime_state.RuntimeStateRepository(connection).transition(
+            repo,
+            str(plan["plan_id"]),
+            plan_values=plan_values,
+            project_values=project_values,
+            enqueue=False,
+        )
     return ValidationFailureDecision(
         stage,
         fingerprint,
@@ -9081,67 +8841,60 @@ def block_active_execplan_from_revision(
     if plan is None:
         raise RuntimeError("차단할 활성 ExecPlan을 찾을 수 없습니다.")
     project = connection.execute(
-        "SELECT agent_input_fingerprint FROM projects WHERE repo = ?",
+        "SELECT phase, agent_input_fingerprint FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
     fingerprint = str(
         (project["agent_input_fingerprint"] if project else None)
         or _revision_execplan_input_fingerprint(repo_path, revision, plan)
     )
-    with connection:
-        connection.execute(
-            """
-            UPDATE exec_plans
-            SET blocked_fingerprint = ?,
-                blocked_reason = CASE WHEN ? IS NOT NULL THEN ? ELSE blocked_reason END,
-                blocked_worktree_fingerprint = NULL,
-                blocked_review_fingerprint = NULL, last_error = ?, verify_result = ?,
-                agent_result_snapshot = ?, agent_manager_snapshot = NULL
-            WHERE repo = ? AND plan_id = ?
-            """,
-            (
-                fingerprint,
-                blocked_reason,
-                blocked_reason,
-                error,
-                verify_result,
-                preserved_agent_result_snapshot,
-                repo,
-                plan["plan_id"],
-            ),
+    plan_values: dict[str, object] = {
+        "blocked_fingerprint": fingerprint,
+        "blocked_worktree_fingerprint": None,
+        "blocked_review_fingerprint": None,
+        "last_error": error,
+        "verify_result": verify_result,
+        "agent_result_snapshot": preserved_agent_result_snapshot,
+        "agent_manager_snapshot": None,
+    }
+    if blocked_reason is not None:
+        plan_values["blocked_reason"] = blocked_reason
+    plan_id = str(plan["plan_id"])
+    if scoped_blocking.reason_scope(reason) is BlockScope.PLAN:
+        runtime_state.RuntimeStateRepository(connection).block_plan(
+            repo,
+            plan_id,
+            reason_code=reason.value,
+            evidence=error,
+            release_fingerprint=fingerprint,
+            plan_values=plan_values,
+            clear_projection=True,
         )
-        project = connection.execute(
-            "SELECT phase FROM projects WHERE repo = ?", (repo,)
-        ).fetchone()
-        if scoped_blocking.reason_scope(reason) is BlockScope.PLAN:
-            scoped_blocking.record_plan_block(
-                connection,
+    else:
+        with connection:
+            runtime_state.RuntimeStateRepository(connection).transition(
                 repo,
-                str(plan["plan_id"]),
-                reason,
-                error,
-                fingerprint,
+                plan_id,
+                plan_values=plan_values,
+                project_values={
+                    "verify_result": verify_result,
+                    "agent_result_snapshot": preserved_agent_result_snapshot,
+                    "agent_manager_snapshot": None,
+                },
+                enqueue=False,
             )
-            _clear_active_in_current_transaction(connection, repo)
-        else:
             scoped_blocking.record_project_block(
                 connection,
                 repo,
                 reason,
                 error,
                 fingerprint,
-                plan_id=str(plan["plan_id"]),
+                plan_id=plan_id,
                 previous_phase=(
                     str(project["phase"] or "") or None if project else None
                 ),
             )
-            connection.execute(
-                "UPDATE projects SET verify_result = ?, agent_result_snapshot = ?, "
-                "agent_manager_snapshot = NULL WHERE repo = ?",
-                (verify_result, preserved_agent_result_snapshot, repo),
-            )
-
-        notifications.enqueue_current_project_events(connection, repo)
+            notifications.enqueue_current_project_events(connection, repo)
 
 def block_persisted_agent_scope_violation(
     connection: sqlite3.Connection,
@@ -9187,9 +8940,10 @@ def block_persisted_agent_scope_violation(
                     plan_id=None,
                     previous_phase=str(row["phase"] or "") or None,
                 )
-                connection.execute(
-                    "UPDATE projects SET agent_result_snapshot = ? WHERE repo = ?",
-                    (preserved_snapshot, repo),
+                runtime_state.RuntimeStateRepository(connection).update_project(
+                    repo,
+                    {"agent_result_snapshot": preserved_snapshot},
+                    enqueue=False,
                 )
                 notifications.enqueue_current_project_events(connection, repo)
         return message
@@ -10695,66 +10449,77 @@ def _requeue_blocked_execplan(
     ).fetchone()
     if plan is not None and int(plan["pr_conflict_recovery"]):
         with connection:
-            connection.execute(
-                """
-                UPDATE exec_plans
-                SET status = 'IMPLEMENTING', blocked_fingerprint = NULL,
-                    blocked_worktree_fingerprint = NULL,
-                    blocked_review_fingerprint = NULL, retry_count = 0,
-                    blocked_reason = NULL, guidance_plan_hash = NULL,
-                    validated_base_sha = NULL, verify_result = NULL,
-                    review_result = NULL, last_error = ?,
-                    verify_failure_history = '{}',
-                    review_failure_history = '{}',
-                    effective_worker_level = initial_worker_level,
-                    review_level_history = '{}'
-                WHERE repo = ? AND plan_id = ?
-                """,
-                (REBASE_IN_PROGRESS_ERROR, repo, plan_id),
-            )
-            connection.execute(
-                """
-                UPDATE projects
-                SET phase = 'WORKING', validated_base_sha = NULL,
-                    verify_result = NULL, review_result = NULL, last_error = ?,
-                    agent_role = NULL, agent_snapshot = NULL,
-                    agent_input_fingerprint = NULL, agent_baseline = NULL,
-                    agent_recovery = NULL, agent_input_plan = NULL,
-                    agent_result_plan = NULL, agent_result_snapshot = NULL,
-                    agent_manager_snapshot = NULL
-                WHERE repo = ?
-                """,
-                (REBASE_IN_PROGRESS_ERROR, repo),
+            runtime_state.RuntimeStateRepository(connection).transition(
+                repo,
+                plan_id,
+                plan_values={
+                    "status": "IMPLEMENTING",
+                    "blocked_fingerprint": None,
+                    "blocked_worktree_fingerprint": None,
+                    "blocked_review_fingerprint": None,
+                    "retry_count": 0,
+                    "blocked_reason": None,
+                    "guidance_plan_hash": None,
+                    "validated_base_sha": None,
+                    "verify_result": None,
+                    "review_result": None,
+                    "last_error": REBASE_IN_PROGRESS_ERROR,
+                    "verify_failure_history": "{}",
+                    "review_failure_history": "{}",
+                    "effective_worker_level": plan["initial_worker_level"],
+                    "review_level_history": "{}",
+                },
+                project_values={
+                    "phase": "WORKING",
+                    "validated_base_sha": None,
+                    "verify_result": None,
+                    "review_result": None,
+                    "last_error": REBASE_IN_PROGRESS_ERROR,
+                    "agent_role": None,
+                    "agent_snapshot": None,
+                    "agent_input_fingerprint": None,
+                    "agent_baseline": None,
+                    "agent_recovery": None,
+                    "agent_input_plan": None,
+                    "agent_result_plan": None,
+                    "agent_result_snapshot": None,
+                    "agent_manager_snapshot": None,
+                },
+                enqueue=False,
             )
             scoped_blocking.clear_plan_block(connection, repo, plan_id)
         return
-    values = _clear_active_values()
-    assignments = ", ".join(f"{name} = ?" for name in values)
     with connection:
-        connection.execute(
-            """
-            UPDATE exec_plans
-            SET status = 'READY', blocked_fingerprint = NULL,
-                blocked_worktree_fingerprint = NULL,
-                blocked_review_fingerprint = NULL, retry_count = 0,
-                blocked_reason = NULL, guidance_plan_hash = NULL,
-                last_error = NULL, worker_session_id = NULL,
-                reviewer_session_id = NULL, worker_result = NULL,
-                verify_result = NULL, review_result = NULL,
-                validated_base_sha = NULL, publication_remote_oid = NULL,
-                pr_url = NULL, pr_head_oid = NULL,
-                verify_failure_history = '{}', review_failure_history = '{}',
-                effective_worker_level = initial_worker_level,
-                review_level_history = '{}'
-            WHERE repo = ? AND plan_id = ?
-            """,
-            (repo, plan_id),
+        runtime_state.RuntimeStateRepository(connection).transition(
+            repo,
+            plan_id,
+            plan_values={
+                "status": "READY",
+                "blocked_fingerprint": None,
+                "blocked_worktree_fingerprint": None,
+                "blocked_review_fingerprint": None,
+                "retry_count": 0,
+                "blocked_reason": None,
+                "guidance_plan_hash": None,
+                "last_error": None,
+                "worker_session_id": None,
+                "reviewer_session_id": None,
+                "worker_result": None,
+                "verify_result": None,
+                "review_result": None,
+                "validated_base_sha": None,
+                "publication_remote_oid": None,
+                "pr_url": None,
+                "pr_head_oid": None,
+                "verify_failure_history": "{}",
+                "review_failure_history": "{}",
+                "effective_worker_level": plan["initial_worker_level"],
+                "review_level_history": "{}",
+            },
+            project_values=_clear_active_values(),
+            enqueue=False,
         )
         scoped_blocking.clear_plan_block(connection, repo, plan_id)
-        connection.execute(
-            f"UPDATE projects SET {assignments} WHERE repo = ?",
-            (*values.values(), repo),
-        )
 
 
 def resume_blocked_execplan_if_inputs_changed(
@@ -11032,7 +10797,6 @@ def complete_merged_worktree(
         else:
             assessment = assess_cleanup(worktree, pr_head_oid)
             assessment = remove_cleanup_worktree(repo_path, worktree, assessment)
-    values = _clear_active_values()
     with connection:
         _ensure_execplans_schema(connection)
         _ensure_cleanup_pending_schema(connection)
@@ -11051,27 +10815,22 @@ def complete_merged_worktree(
                 assessment.reason or assessment.status,
                 workspace_owned=workspace_owned,
             )
-        if plan_id:
-            connection.execute(
-                "UPDATE exec_plans SET status = 'MERGED', last_error = NULL, "
-                "pr_conflict_recovery = 0, pr_conflict_head_oid = NULL, "
-                "pr_conflict_base_oid = NULL WHERE repo = ? AND plan_id = ?",
-                (repo, plan_id),
-            )
-            notifications.record_merged_plan(connection, repo, plan_id, str(plan["title"]))
         unfinished = connection.execute(
             "SELECT 1 FROM exec_plans "
-            "WHERE repo = ? AND status != 'MERGED' LIMIT 1",
-            (repo,),
+            "WHERE repo = ? AND plan_id != ? AND status != 'MERGED' LIMIT 1",
+            (repo, plan_id),
         ).fetchone()
+        project_values = _clear_active_values()
         if unfinished is None:
-            values["processed_sha"] = None
-            values["planning_fingerprint"] = None
-        assignments = ", ".join(f"{name} = ?" for name in values)
-        connection.execute(
-            f"UPDATE projects SET {assignments} WHERE repo = ?",
-            [*values.values(), repo],
+            project_values["processed_sha"] = None
+            project_values["planning_fingerprint"] = None
+        runtime_state.RuntimeStateRepository(connection).mark_merged(
+            repo,
+            plan_id,
+            project_values=project_values,
+            enqueue=False,
         )
+        notifications.record_merged_plan(connection, repo, plan_id, str(plan["title"]))
     return assessment
 
 
@@ -11138,31 +10897,31 @@ def complete_merged_execplan_worktree(
                 assessment.reason or assessment.status,
                 workspace_owned=workspace_owned,
             )
-        connection.execute(
-            "UPDATE exec_plans SET status = 'MERGED', last_error = NULL, "
-            "pr_conflict_recovery = 0, pr_conflict_head_oid = NULL, "
-            "pr_conflict_base_oid = NULL WHERE repo = ? AND plan_id = ?",
-            (repo, plan["plan_id"]),
+        plan_id = str(plan["plan_id"])
+        unfinished = connection.execute(
+            "SELECT 1 FROM exec_plans "
+            "WHERE repo = ? AND plan_id != ? AND status != 'MERGED' LIMIT 1",
+            (repo, plan_id),
+        ).fetchone()
+        mirrored = connection.execute(
+            "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
+        ).fetchone()
+        project_values: dict[str, object] = {}
+        if mirrored and mirrored["plan_path"] == plan["path"]:
+            project_values.update(_clear_active_values())
+        if unfinished is None:
+            project_values["processed_sha"] = None
+            project_values["planning_fingerprint"] = None
+        runtime_state.RuntimeStateRepository(connection).mark_merged(
+            repo,
+            plan_id,
+            project_values=project_values,
+            enqueue=False,
         )
         scoped_blocking.clear_plan_block(connection, repo, str(plan["plan_id"]))
         notifications.record_merged_plan(
             connection, repo, str(plan["plan_id"]), str(plan["title"])
         )
-        mirrored = connection.execute(
-            "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
-        ).fetchone()
-        if mirrored and mirrored["plan_path"] == plan["path"]:
-            _clear_active_in_current_transaction(connection, repo)
-        unfinished = connection.execute(
-            "SELECT 1 FROM exec_plans WHERE repo = ? AND status != 'MERGED' LIMIT 1",
-            (repo,),
-        ).fetchone()
-        if unfinished is None:
-            connection.execute(
-                "UPDATE projects SET processed_sha = NULL, planning_fingerprint = NULL "
-                "WHERE repo = ?",
-                (repo,),
-            )
         if assessment.status == "unverifiable":
             scoped_blocking.record_project_block(
                 connection,
@@ -11282,10 +11041,11 @@ def synchronize_waiting_pull_requests(
                 (repo, stored["plan_id"]),
             ).fetchone()
         with connection:
-            connection.execute(
-                "UPDATE exec_plans SET pr_url = ?, pr_head_oid = ? "
-                "WHERE repo = ? AND plan_id = ?",
-                (url, head_oid, repo, stored["plan_id"]),
+            runtime_state.RuntimeStateRepository(connection).update_plan(
+                repo,
+                str(stored["plan_id"]),
+                plan_values={"pr_url": url, "pr_head_oid": head_oid},
+                enqueue=False,
             )
             notifications.enqueue_current_project_events(connection, repo)
         if classify_pull_request_mergeability(pull_request) == "conflicting":
@@ -11515,26 +11275,24 @@ def _block_closed_pull_request(
     head_oid: object,
 ) -> None:
     error = "PR이 Merge 없이 닫혔습니다."
-    with connection:
-        connection.execute(
-            "UPDATE exec_plans SET pr_url = ?, pr_head_oid = ?, last_error = ? "
-            "WHERE repo = ? AND plan_id = ?",
-            (url, head_oid, error, repo, plan["plan_id"]),
-        )
-        scoped_blocking.record_plan_block(
-            connection,
-            repo,
-            str(plan["plan_id"]),
-            BlockReasonCode.PULL_REQUEST_CLOSED,
-            error,
-            str(head_oid or "") or None,
-        )
-        mirrored = connection.execute(
-            "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
-        ).fetchone()
-        if mirrored and mirrored["plan_path"] == plan["path"]:
-            _clear_active_in_current_transaction(connection, repo)
-        notifications.enqueue_current_project_events(connection, repo)
+    mirrored = connection.execute(
+        "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
+    ).fetchone()
+    clear_projection = bool(
+        mirrored and mirrored["plan_path"] == plan["path"]
+    )
+    runtime_state.RuntimeStateRepository(connection).block_plan(
+        repo,
+        str(plan["plan_id"]),
+        reason_code=BlockReasonCode.PULL_REQUEST_CLOSED.value,
+        evidence=error,
+        release_fingerprint=str(head_oid or "") or None,
+        plan_values={
+            "pr_url": url,
+            "pr_head_oid": head_oid,
+        },
+        clear_projection=clear_projection,
+    )
 
 
 def _resume_reopened_pull_request(
@@ -11572,32 +11330,30 @@ def _resume_reopened_pull_request(
                 verify_result=None,
                 review_result=None,
             )
-    execplan_assignments = ", ".join(
-        f"{name} = ?" for name in execplan_values
-    )
-    project_assignments = ", ".join(
-        f"{name} = ?" for name in project_values
-    )
     with connection:
-        connection.execute(
-            f"UPDATE exec_plans SET {execplan_assignments} "
-            "WHERE repo = ? AND plan_id = ?",
-            (*execplan_values.values(), repo, plan["plan_id"]),
-        )
-        scoped_blocking.clear_plan_block(
-            connection, repo, str(plan["plan_id"])
-        )
         mirrored = connection.execute(
             "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
         ).fetchone()
+        repository = runtime_state.RuntimeStateRepository(connection)
         if mirrored and mirrored["plan_path"] == plan["path"]:
-            if recovery:
-                connection.execute(
-                    f"UPDATE projects SET {project_assignments} WHERE repo = ?",
-                    (*project_values.values(), repo),
-                )
-            else:
-                _clear_active_in_current_transaction(connection, repo)
+            projection = project_values if recovery else _clear_active_values()
+            repository.transition(
+                repo,
+                str(plan["plan_id"]),
+                plan_values=execplan_values,
+                project_values=projection,
+                enqueue=False,
+            )
+        else:
+            repository.update_plan(
+                repo,
+                str(plan["plan_id"]),
+                plan_values=execplan_values,
+                enqueue=False,
+            )
+        scoped_blocking.clear_plan_block(
+            connection, repo, str(plan["plan_id"])
+        )
         notifications.enqueue_current_project_events(connection, repo)
 
 def reconcile_existing_pull_request(
@@ -11919,15 +11675,11 @@ def reconcile_existing_pull_request(
                 recovery=False,
             )
         else:
-            update_project(
-                connection,
+            runtime_state.RuntimeStateRepository(connection).open_pull_request(
                 repo,
-                phase="PR_OPEN",
                 pr_url=url,
                 pr_head_oid=head_oid,
-                last_error=None,
             )
-            clear_active(connection, repo)
         operation_print(f"Merge 대기 중: {url}")
         return 0
 
@@ -15709,18 +15461,14 @@ def _run_project_step(
                 )
                 operation_print(publication_error, file=sys.stderr)
                 return 1
-            update_project(
-                connection,
+            runtime_state.RuntimeStateRepository(connection).open_pull_request(
                 repo,
-                phase="PR_OPEN",
                 publication_remote_oid=head_oid,
                 pr_head_oid=head_oid,
                 pr_conflict_recovery=0,
                 pr_conflict_head_oid=None,
                 pr_conflict_base_oid=None,
-                last_error=None,
             )
-            clear_active(connection, repo)
             operation_print(f"기존 PR 충돌 복구 게시 완료: {row['pr_url']}")
             return 0
         plan_sha = str(row["plan_sha"] or "")
@@ -15816,15 +15564,11 @@ def _run_project_step(
             cwd=worktree,
         )
         url = created.stdout.strip().splitlines()[-1]
-        update_project(
-            connection,
+        runtime_state.RuntimeStateRepository(connection).open_pull_request(
             repo,
-            phase="PR_OPEN",
             pr_url=url,
             pr_head_oid=head_oid,
-            last_error=None,
         )
-        clear_active(connection, repo)
         operation_print(f"PR 생성 완료: {url}")
     return 0
 
@@ -15969,6 +15713,10 @@ def _run_registered_project(
             notifications.configure_session(
                 connection, enabled=notifications_enabled
             )
+            # TEMP session setup opens a SQLite transaction. Close it before
+            # runtime-state repository operations so each lifecycle change
+            # owns and durably commits its intended transaction boundary.
+            connection.commit()
             result = run_project_result(
                 connection,
                 state_dir,

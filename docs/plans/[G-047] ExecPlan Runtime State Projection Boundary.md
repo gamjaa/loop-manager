@@ -45,10 +45,10 @@ priority: normal
 
 ## Progress
 
-- [ ] runtime snapshot·phase mapping과 repository 모듈 추가
-- [ ] lifecycle dual-write·hydrate·clear 경로 이관
-- [ ] compatibility wrapper와 project-only field 분리
-- [ ] transaction rollback·migration·resume 회귀 테스트 추가
+- [x] runtime snapshot·phase mapping과 repository 모듈 추가
+- [x] lifecycle dual-write·hydrate·clear 경로 이관
+- [x] compatibility wrapper와 project-only field 분리
+- [x] transaction rollback·migration·resume 회귀 테스트 추가
 
 ## Decision Log
 
