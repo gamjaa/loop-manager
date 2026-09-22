@@ -6368,17 +6368,12 @@ class AgentScopeValidatorTest(unittest.TestCase):
             self.assertNotIn(old_ref, after.refs)
             self.assertNotIn(new_ref, before.refs)
             self.assertIn(new_ref, after.refs)
-            with self.assertRaises(loop_manager.AgentScopeError) as raised:
-                loop_manager.validate_agent_scope(
-                    "worker",
-                    repo,
-                    before,
-                    after,
-                    selected_plan_path=plan_path,
-                )
-            self.assertEqual(
-                raised.exception.reason_code,
-                loop_manager.BlockReasonCode.TURN_DIFF_REF_MUTATION,
+            loop_manager.validate_agent_scope(
+                "worker",
+                repo,
+                before,
+                after,
+                selected_plan_path=plan_path,
             )
 
     def test_changes_in_another_registered_worktree_are_rejected(self):

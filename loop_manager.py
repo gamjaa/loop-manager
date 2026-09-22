@@ -6685,11 +6685,25 @@ def validate_agent_scope(
             BlockReasonCode.REPOSITORY_STATE_UNSAFE,
         )
     else:
+        # Codex owns this ephemeral namespace for turn capture/checkpoint
+        # bookkeeping. It never identifies a published branch or a managed
+        # workspace, so normalize both sides for current and persisted scope
+        # snapshots while keeping every other repository ref protected.
+        before_scope_refs = {
+            key: value
+            for key, value in before.refs.items()
+            if not key.startswith("refs/codex/turn-diffs/")
+        }
+        after_scope_refs = {
+            key: value
+            for key, value in after.refs.items()
+            if not key.startswith("refs/codex/turn-diffs/")
+        }
         metadata_states = (
             (
                 "공유 Git refs",
-                before.refs,
-                after.refs,
+                before_scope_refs,
+                after_scope_refs,
                 allowed_ref_changes,
                 BlockReasonCode.SHARED_REF_MUTATION,
             ),
@@ -6751,12 +6765,7 @@ def validate_agent_scope(
                     unowned_changes = [
                         key for key in changed_keys if key != owned_branch_ref
                     ]
-                    if any(
-                        key.startswith("refs/codex/turn-diffs/")
-                        for key in unowned_changes
-                    ):
-                        reason = BlockReasonCode.TURN_DIFF_REF_MUTATION
-                    elif unowned_changes:
+                    if unowned_changes:
                         reason = BlockReasonCode.SHARED_REF_MUTATION
                     else:
                         reason = BlockReasonCode.MANAGED_WORKTREE_SCOPE_VIOLATION

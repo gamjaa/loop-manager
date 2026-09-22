@@ -51,7 +51,7 @@ planning lifecycle을 명시적인 coordinator 모듈과 주입 가능한 저장
 - [ ] planning context·port·outcome 계약 추가
 - [ ] 일반 및 maintenance planning phase handler 추출
 - [ ] top-level dispatch와 compatibility adapter 연결
-- [ ] Codex turn-diff ref 정규화와 공유 ref 보호 회귀 테스트 추가
+- [x] Codex turn-diff ref 정규화와 공유 ref 보호 회귀 테스트 추가
 - [ ] base race·validation·publication 중단 회귀 테스트 추가
 
 ## Decision Log

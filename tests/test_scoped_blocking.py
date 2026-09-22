@@ -287,7 +287,7 @@ class ScopedBlockingTest(unittest.TestCase):
         self.assertTrue(blocked_decision.project_blocked)
         self.assertIsNone(blocked_decision.runnable_ready)
 
-    def test_agent_scope_reason_is_structured_by_actual_boundary(self):
+    def test_agent_scope_ignores_codex_turn_refs_but_structures_real_boundaries(self):
         baseline = loop_manager.GitSnapshot(
             head="a" * 40,
             branch="loop-manager/G-001",
@@ -304,13 +304,23 @@ class ScopedBlockingTest(unittest.TestCase):
                 "refs": {"refs/codex/turn-diffs/1": ("b" * 40, "")},
             }
         )
+        loop_manager.validate_agent_scope(
+            "reviewer", Path(self.repo), baseline, turn_ref
+        )
+
+        shared_ref = loop_manager.GitSnapshot(
+            **{
+                **baseline.__dict__,
+                "refs": {"refs/tags/agent-created": ("b" * 40, "")},
+            }
+        )
         with self.assertRaises(loop_manager.AgentScopeError) as raised:
             loop_manager.validate_agent_scope(
-                "reviewer", Path(self.repo), baseline, turn_ref
+                "reviewer", Path(self.repo), baseline, shared_ref
             )
         self.assertEqual(
             raised.exception.reason_code,
-            BlockReasonCode.TURN_DIFF_REF_MUTATION,
+            BlockReasonCode.SHARED_REF_MUTATION,
         )
         self.assertIs(
             scoped_blocking.reason_scope(raised.exception.reason_code),
@@ -331,6 +341,74 @@ class ScopedBlockingTest(unittest.TestCase):
             raised.exception.reason_code,
             BlockReasonCode.MANAGED_WORKTREE_SCOPE_VIOLATION,
         )
+
+    def test_existing_turn_diff_project_block_releases_automatically(self):
+        baseline = loop_manager.GitSnapshot(
+            head="a" * 40,
+            branch="loop-manager/G-001",
+            index={},
+            dirty={},
+            refs={},
+            worktrees={},
+            config={},
+            operations={},
+        )
+        current = loop_manager.GitSnapshot(
+            **{
+                **baseline.__dict__,
+                "refs": {
+                    "refs/codex/turn-diffs/captures/1/session/base": (
+                        "b" * 40,
+                        "",
+                    )
+                },
+            }
+        )
+        self.plan(
+            "G-001",
+            "IMPLEMENTING",
+            branch="loop-manager/G-001",
+        )
+        with self.connection:
+            self.connection.execute(
+                "UPDATE exec_plans SET worktree = '/state/G-001', "
+                "agent_role = 'worker', agent_snapshot = ? "
+                "WHERE repo = ? AND plan_id = 'G-001'",
+                (baseline.serialize(), self.repo),
+            )
+            self.connection.execute(
+                "UPDATE projects SET phase = 'WORKING', "
+                "plan_path = 'docs/plans/[G-001] Work.md' WHERE repo = ?",
+                (self.repo,),
+            )
+            scoped_blocking.record_project_block(
+                self.connection,
+                self.repo,
+                BlockReasonCode.TURN_DIFF_REF_MUTATION,
+                "worker Git 범위 위반: Codex turn ref changed",
+                "repository-fingerprint",
+                plan_id="G-001",
+                previous_phase="WORKING",
+            )
+
+        with mock.patch(
+            "loop_manager.validate_execplan_workspace_identity"
+        ), mock.patch("loop_manager.validate_managed_worktree"), mock.patch(
+            "loop_manager.capture_git_snapshot", return_value=current
+        ):
+            released = loop_manager.resume_project_block_if_safe(
+                self.connection,
+                Path(self.repo),
+                Path("/state"),
+                self.repo,
+            )
+
+        self.assertTrue(released)
+        self.assertIsNone(scoped_blocking.project_block(self.connection, self.repo))
+        project = self.connection.execute(
+            "SELECT phase FROM projects WHERE repo = ?", (self.repo,)
+        ).fetchone()
+        self.assertEqual(project["phase"], "WORKING")
 
     def test_all_open_prs_are_read_before_one_conflict_is_selected(self):
         self.plan(
