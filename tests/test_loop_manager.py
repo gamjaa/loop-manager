@@ -3065,12 +3065,13 @@ risk: medium
                 ).fetchone()
                 blocked_plan = connection.execute(
                     """
-                    SELECT status, pr_url, last_error, blocked_fingerprint
+                    SELECT status, worktree, pr_url, last_error, verify_result,
+                           blocked_fingerprint
                     FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'
                     """,
                     (str(repo),),
                 ).fetchone()
-                worktree_preserved = Path(blocked_project["worktree"]).exists()
+                worktree_preserved = Path(blocked_plan["worktree"]).exists()
                 connection.execute(
                     "UPDATE exec_plans SET retry_count = 2 WHERE repo = ? AND plan_id = 'G-001'",
                     (str(repo),),
@@ -3150,20 +3151,20 @@ risk: medium
 
         self.assertEqual(
             (blocked_result, unchanged_result, metadata_result, resumed_result),
-            (1, 1, 1, 1),
+            (0, 0, 0, 1),
         )
         self.assertEqual(roles, ["worker", "worker"])
         verify.assert_called_once()
-        self.assertEqual(blocked_project["phase"], "BLOCKED")
-        self.assertEqual(blocked_project["verify_result"], "verify: PASS")
+        self.assertIsNone(blocked_project["phase"])
+        self.assertEqual(blocked_plan["verify_result"], "verify: PASS")
         self.assertIsNone(blocked_project["pr_url"])
         self.assertTrue(worktree_preserved)
-        self.assertIn("PR을 생성할 수 없습니다", blocked_project["last_error"])
-        self.assertEqual(blocked_plan["status"], "BLOCKED")
+        self.assertIn("PR을 생성할 수 없습니다", blocked_plan["last_error"])
+        self.assertEqual(blocked_plan["status"], "PLAN_BLOCKED")
         self.assertIsNotNone(blocked_plan["blocked_fingerprint"])
-        self.assertEqual(tuple(unchanged_plan), ("BLOCKED", 2))
+        self.assertEqual(tuple(unchanged_plan), ("PLAN_BLOCKED", 2))
         self.assertTrue(worktree_restored)
-        self.assertEqual(rejected_metadata["status"], "BLOCKED")
+        self.assertEqual(rejected_metadata["status"], "PLAN_BLOCKED")
         self.assertEqual(rejected_metadata["priority"], "normal")
         self.assertEqual(rejected_metadata["depends_on"], "[]")
         self.assertIn("고정 메타데이터는 변경할 수 없습니다", rejected_metadata["last_error"])
@@ -3238,20 +3239,20 @@ risk: medium
             ).fetchone()
             plan = connection.execute(
                 """
-                SELECT status, blocked_fingerprint
+                SELECT status, last_error, blocked_fingerprint
                 FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'
                 """,
                 (str(repo),),
             ).fetchone()
             ahead = git_command(managed, "rev-list", "--count", "origin/main..HEAD")
 
-        self.assertEqual(result, 1)
+        self.assertEqual(result, 0)
         self.assertEqual(roles, ["worker"])
         self.assertEqual(verify.call_count, 2)
         self.assertEqual(ahead, "0")
-        self.assertEqual(project["phase"], "BLOCKED")
-        self.assertIn("rebase 후 Worker 변경이 남지 않아", project["last_error"])
-        self.assertEqual(plan["status"], "BLOCKED")
+        self.assertIsNone(project["phase"])
+        self.assertIn("rebase 후 Worker 변경이 남지 않아", plan["last_error"])
+        self.assertEqual(plan["status"], "PLAN_BLOCKED")
         self.assertIsNotNone(plan["blocked_fingerprint"])
 
     def test_worker_and_reviewer_prompts_define_test_execution_boundary(self):
@@ -3346,7 +3347,7 @@ risk: medium
                         "main",
                         False,
                     ),
-                    1,
+                    0,
                 )
 
             row = connection.execute(
@@ -3358,11 +3359,12 @@ risk: medium
             ).fetchone()
             history = json.loads(plan["verify_failure_history"])
 
-        self.assertEqual(row["phase"], "BLOCKED")
-        self.assertEqual(row["worker_session_id"], "worker-session")
-        self.assertEqual(row["worker_result"], worker_result())
-        self.assertEqual(row["verify_result"], "verify failed")
-        self.assertIn("실패 지문:", row["last_error"])
+        self.assertIsNone(row["phase"])
+        self.assertEqual(plan["status"], "PLAN_BLOCKED")
+        self.assertEqual(plan["worker_session_id"], "worker-session")
+        self.assertEqual(plan["worker_result"], worker_result())
+        self.assertEqual(plan["verify_result"], "verify failed")
+        self.assertIn("실패 지문:", plan["last_error"])
         self.assertEqual(sessions, [None] + ["worker-session"] * 3)
         self.assertIn("전체 검증 실패:\nverify failed", prompts[1])
         self.assertEqual(verify.call_count, 4)
@@ -3473,12 +3475,13 @@ risk: medium
                 (str(repo),),
             ).fetchone()
             plan = connection.execute(
-                "SELECT verify_failure_history FROM exec_plans "
+                "SELECT status, last_error, verify_failure_history FROM exec_plans "
                 "WHERE repo = ? AND plan_id = 'G-001'", (str(repo),)
             ).fetchone()
 
-        self.assertEqual(row["phase"], "PR_OPEN")
-        self.assertIsNone(row["last_error"])
+        self.assertIsNone(row["phase"])
+        self.assertEqual(plan["status"], "PR_OPEN")
+        self.assertIsNone(plan["last_error"])
         self.assertEqual(json.loads(plan["verify_failure_history"]), {})
         self.assertEqual(verify.call_count, 3)
         self.assertEqual(sessions, [None, "worker-session"])
@@ -3522,17 +3525,22 @@ risk: medium
             row = connection.execute(
                 "SELECT * FROM projects WHERE repo = ?", (str(repo),)
             ).fetchone()
+            plan = connection.execute(
+                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
             self.assertEqual(
-                git_command(Path(row["worktree"]), "log", "-1", "--pretty=%s"),
+                git_command(Path(plan["worktree"]), "log", "-1", "--pretty=%s"),
                 "Persist worker change",
             )
             self.assertEqual(
                 git_command(repo, "log", "-1", "--pretty=%s"),
                 "Add worker plan",
             )
-            self.assertEqual(row["phase"], "PR_OPEN")
-            self.assertEqual(row["worker_session_id"], "worker-session")
-            self.assertEqual(row["verify_result"], "verify: PASS")
+            self.assertIsNone(row["phase"])
+            self.assertEqual(plan["status"], "PR_OPEN")
+            self.assertEqual(plan["worker_session_id"], "worker-session")
+            self.assertEqual(plan["verify_result"], "verify: PASS")
 
 
 
@@ -3700,8 +3708,8 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             (str(repo),),
         ).fetchone()
         plan = connection.execute(
-            "SELECT status, review_failure_history, review_level_history, "
-            "effective_worker_level "
+            "SELECT status, last_error, review_result, review_failure_history, "
+            "review_level_history, effective_worker_level "
             "FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
             (str(repo),),
         ).fetchone()
@@ -3968,7 +3976,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         self.assertFalse(review.blocked)
         self.assertTrue(final.blocked)
         self.assertEqual(final.occurrences, 4)
-        self.assertEqual(row["status"], "BLOCKED")
+        self.assertEqual(row["status"], "PLAN_BLOCKED")
         self.assertIn(final.fingerprint, row["last_error"])
         self.assertEqual(verify_history[final.fingerprint]["occurrences"], 4)
         self.assertEqual(review_history[review.fingerprint]["occurrences"], 1)
@@ -4074,7 +4082,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                 "FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
                 (str(repo),),
             ).fetchone()
-            self.assertEqual(unchanged["status"], "BLOCKED")
+            self.assertEqual(unchanged["status"], "PLAN_BLOCKED")
             self.assertEqual(
                 next(iter(json.loads(unchanged["review_failure_history"]).values()))[
                     "occurrences"
@@ -4349,7 +4357,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                     loop_manager.ProjectRunKind.USAGE_LIMIT_PAUSE,
                     0,
                 ),
-                (1, "BLOCKED", loop_manager.ProjectRunKind.BLOCKED, 1),
+                (1, "PROJECT_BLOCKED", loop_manager.ProjectRunKind.BLOCKED, 1),
                 (
                     1,
                     "WORKING",
@@ -4441,7 +4449,8 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                 (str(repo),),
             ).fetchone()
             plan = connection.execute(
-                "SELECT verify_failure_history, review_failure_history "
+                "SELECT status, worker_session_id, reviewer_session_id, "
+                "verify_failure_history, review_failure_history "
                 "FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
                 (str(repo),),
             ).fetchone()
@@ -4452,9 +4461,10 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         self.assertEqual(roles, ["worker"] * 5 + ["reviewer"])
         self.assertEqual(worker_sessions, [None] + ["worker-session"] * 4)
         self.assertEqual(reviewer_sessions, [None])
-        self.assertEqual(project["phase"], "PR_OPEN")
-        self.assertEqual(project["worker_session_id"], "worker-session")
-        self.assertEqual(project["reviewer_session_id"], "reviewer-session")
+        self.assertIsNone(project["phase"])
+        self.assertEqual(plan["status"], "PR_OPEN")
+        self.assertEqual(plan["worker_session_id"], "worker-session")
+        self.assertEqual(plan["reviewer_session_id"], "reviewer-session")
         self.assertEqual(json.loads(plan["verify_failure_history"]), {})
         self.assertEqual(json.loads(plan["review_failure_history"]), {})
 
@@ -4499,7 +4509,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             ),
             4,
         )
-        self.assertEqual(project["phase"], "PR_OPEN")
+        self.assertIsNone(project["phase"])
         self.assertEqual(plan["status"], "PR_OPEN")
         self.assertEqual(json.loads(plan["review_failure_history"]), {})
 
@@ -4524,8 +4534,8 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         project = data["project"]
         plan = data["plan"]
         history = json.loads(plan["review_failure_history"])
-        self.assertEqual(result.kind, loop_manager.ProjectRunKind.BLOCKED)
-        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
+        self.assertEqual(result.exit_code, 0)
         self.assertEqual(data["verify_calls"], 4)
         self.assertEqual(data["roles"], ["worker", "reviewer"] * 4)
         self.assertEqual(
@@ -4553,8 +4563,8 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             ),
             1,
         )
-        self.assertEqual(project["phase"], "BLOCKED")
-        self.assertEqual(plan["status"], "BLOCKED")
+        self.assertIsNone(project["phase"])
+        self.assertEqual(plan["status"], "PLAN_BLOCKED")
         self.assertEqual(
             sorted(record["occurrences"] for record in history.values()),
             [1, 1, 1, 1, 4],
@@ -4581,8 +4591,8 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             result = data["result"]
             project = data["project"]
             plan = data["plan"]
-            self.assertEqual(result.kind, loop_manager.ProjectRunKind.BLOCKED)
-            self.assertEqual(result.exit_code, 1)
+            self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
+            self.assertEqual(result.exit_code, 0)
             self.assertEqual(
                 data["roles"],
                 ["worker"]
@@ -4596,11 +4606,11 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             )
             self.assertEqual(data["verify_calls"], 1)
             self.assertEqual(data["transitions"], [])
-            self.assertEqual(project["phase"], "BLOCKED")
-            self.assertIn("Reviewer 결과 프로토콜 오류", project["last_error"])
-            self.assertIn("프로토콜 교정 3회 실패", project["last_error"])
-            self.assertEqual(project["review_result"], review)
-            self.assertEqual(plan["status"], "BLOCKED")
+            self.assertIsNone(project["phase"])
+            self.assertIn("Reviewer 결과 프로토콜 오류", plan["last_error"])
+            self.assertIn("프로토콜 교정 3회 실패", plan["last_error"])
+            self.assertEqual(plan["review_result"], review)
+            self.assertEqual(plan["status"], "PLAN_BLOCKED")
             self.assertEqual(json.loads(plan["review_failure_history"]), {})
             self.assertEqual(json.loads(plan["review_level_history"]), {})
             self.assertEqual(plan["effective_worker_level"], 1)
@@ -4623,9 +4633,9 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         self.assertEqual(data["reviewer_sessions"], [None, "reviewer-session"])
         self.assertEqual(data["verify_calls"], 1)
         self.assertEqual(data["transitions"], [])
-        self.assertEqual(data["project"]["phase"], "PR_OPEN")
+        self.assertIsNone(data["project"]["phase"])
         self.assertEqual(data["plan"]["status"], "PR_OPEN")
-        self.assertIsNone(data["project"]["last_error"])
+        self.assertIsNone(data["plan"]["last_error"])
         self.assertIn(
             "Reviewer FAIL 결과에 유효한 ISSUE_ID가 없습니다",
             data["reviewer_prompts"][1],
@@ -4745,7 +4755,8 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                 (str(repo),),
             ).fetchone()
             plan = connection.execute(
-                "SELECT verify_failure_history, review_failure_history "
+                "SELECT status, reviewer_session_id, verify_failure_history, "
+                "review_failure_history "
                 "FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
                 (str(repo),),
             ).fetchone()
@@ -4765,8 +4776,9 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             [(stage, occurrences) for stage, _fingerprint, occurrences in transitions],
             [("review", 1), ("verify", 1)],
         )
-        self.assertEqual(row["phase"], "PR_OPEN")
-        self.assertEqual(row["reviewer_session_id"], "reviewer-session")
+        self.assertIsNone(row["phase"])
+        self.assertEqual(plan["status"], "PR_OPEN")
+        self.assertEqual(plan["reviewer_session_id"], "reviewer-session")
         self.assertEqual(json.loads(plan["verify_failure_history"]), {})
         self.assertEqual(json.loads(plan["review_failure_history"]), {})
 
@@ -5533,9 +5545,9 @@ class WorkerPublicationTest(unittest.TestCase):
                     "SELECT phase, last_error FROM projects WHERE repo = ?", (str(repo),)
                 ).fetchone()
 
-        self.assertEqual(blocked["phase"], "BLOCKED")
+        self.assertEqual(blocked["phase"], "PROJECT_BLOCKED")
         self.assertEqual(blocked["last_error"], loop_manager.PLAN_SHA_BACKFILL_ERROR)
-        self.assertEqual(retained["phase"], "BLOCKED")
+        self.assertEqual(retained["phase"], "PROJECT_BLOCKED")
         self.assertEqual(retained["last_error"], loop_manager.PLAN_SHA_BACKFILL_ERROR)
         run.assert_not_called()
 
@@ -5644,7 +5656,8 @@ class WorkerPublicationTest(unittest.TestCase):
                     0,
                 )
                 row = connection.execute(
-                    "SELECT worker_result, phase FROM projects WHERE repo = ?", (str(repo),)
+                    "SELECT worker_result, status FROM exec_plans "
+                    "WHERE repo = ? AND plan_id = 'G-001'", (str(repo),)
                 ).fetchone()
 
                 latest_title = git_command(worktree, "log", "-1", "--pretty=%s")
@@ -5669,7 +5682,7 @@ class WorkerPublicationTest(unittest.TestCase):
         self.assertIn("Final summary", reviewer_prompts[-1])
         self.assertNotIn("Initial summary", reviewer_prompts[-1])
         self.assertIn("Final summary", latest_body)
-        self.assertEqual(row["phase"], "PR_OPEN")
+        self.assertEqual(row["status"], "PR_OPEN")
         self.assertNotEqual(worktree, repo)
         self.assertEqual(base_file_after, base_file)
         self.assertEqual(base_index_after, base_index)
@@ -6100,6 +6113,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "maintenance_state.py",
                 "notifications.py",
                 "project_registry.py",
+                "scoped_blocking.py",
             ):
                 shutil.copy(loop_manager.ROOT / module_name, repo / module_name)
             (repo / ".gitignore").write_text("__pycache__/\n", encoding="utf-8")
@@ -6353,12 +6367,17 @@ class AgentScopeValidatorTest(unittest.TestCase):
             self.assertNotIn(old_ref, after.refs)
             self.assertNotIn(new_ref, before.refs)
             self.assertIn(new_ref, after.refs)
-            loop_manager.validate_agent_scope(
-                "worker",
-                repo,
-                before,
-                after,
-                selected_plan_path=plan_path,
+            with self.assertRaises(loop_manager.AgentScopeError) as raised:
+                loop_manager.validate_agent_scope(
+                    "worker",
+                    repo,
+                    before,
+                    after,
+                    selected_plan_path=plan_path,
+                )
+            self.assertEqual(
+                raised.exception.reason_code,
+                loop_manager.BlockReasonCode.TURN_DIFF_REF_MUTATION,
             )
 
     def test_changes_in_another_registered_worktree_are_rejected(self):
@@ -6450,14 +6469,19 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     after,
                     selected_plan_path=plan_path,
                 )
-            loop_manager.validate_agent_scope(
-                "worker",
-                managed,
-                before,
-                after,
-                selected_plan_path=plan_path,
-                external_worktree=repo,
-                base_branch="main",
+            with self.assertRaises(loop_manager.AgentScopeError) as raised:
+                loop_manager.validate_agent_scope(
+                    "worker",
+                    managed,
+                    before,
+                    after,
+                    selected_plan_path=plan_path,
+                    external_worktree=repo,
+                    base_branch="main",
+                )
+            self.assertEqual(
+                raised.exception.reason_code,
+                loop_manager.BlockReasonCode.DEFAULT_WORKTREE_MUTATION,
             )
 
     def test_active_execplan_fixed_metadata_must_match_published_plan(self):
@@ -6669,7 +6693,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     (str(repo),),
                 ).fetchone()
                 self.assertEqual(result, 1)
-                self.assertEqual(project["phase"], "BLOCKED")
+                self.assertEqual(project["phase"], "PROJECT_BLOCKED")
                 self.assertIn("범위 선검증 실패", project["last_error"])
                 self.assertIn(expected_key, project["last_error"])
                 self.assertNotIn(sensitive_value, project["last_error"])
@@ -6752,8 +6776,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     database.close()
 
                 self.assertEqual(result, 1)
-                self.assertEqual(project["phase"], "BLOCKED")
-                self.assertEqual(plan["status"], "BLOCKED")
+                self.assertEqual(project["phase"], "PROJECT_BLOCKED")
+                self.assertEqual(plan["status"], "IMPLEMENTING")
                 self.assertIsNotNone(plan["blocked_fingerprint"])
                 self.assertIn("범위 선검증 실패", project["last_error"])
                 self.assertIn(expected_key, project["last_error"])
@@ -6827,8 +6851,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
             database.close()
 
             self.assertEqual(result, 1)
-            self.assertEqual(project["phase"], "BLOCKED")
-            self.assertEqual(plan["status"], "BLOCKED")
+            self.assertEqual(project["phase"], "PROJECT_BLOCKED")
+            self.assertEqual(plan["status"], "IMPLEMENTING")
             self.assertIsNotNone(plan["blocked_fingerprint"])
             self.assertIn("공유 Git refs 변경", project["last_error"])
             self.assertIn("refs/heads/agent-created", project["last_error"])
@@ -7142,10 +7166,16 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "FROM projects WHERE repo = ?",
                 (str(repo),),
             ).fetchone()
-            self.assertEqual(blocked_run, 1)
-            self.assertEqual(blocked_project["phase"], "BLOCKED")
-            self.assertEqual(blocked_project["last_error"], "scope blocked")
-            self.assertIsNotNone(blocked_project["agent_manager_snapshot"])
+            blocked_plan = connection.execute(
+                "SELECT status, last_error, agent_snapshot "
+                "FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(blocked_run, 0)
+            self.assertIsNone(blocked_project["phase"])
+            self.assertEqual(blocked_plan["status"], "PLAN_BLOCKED")
+            self.assertEqual(blocked_plan["last_error"], "scope blocked")
+            self.assertIsNotNone(blocked_plan["agent_snapshot"])
             self.assertFalse(cleanup_worktree.exists())
             self.assertEqual(
                 connection.execute(
@@ -7849,14 +7879,14 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "WHERE repo = ? AND plan_id = 'G-001'",
                 (str(repo),),
             ).fetchone()
-            self.assertEqual(result, 1)
-            self.assertEqual(project["phase"], "BLOCKED")
-            self.assertIn("reviewer Git 범위 위반", project["last_error"])
-            self.assertEqual(plan["status"], "BLOCKED")
-            self.assertEqual(project["agent_role"], "reviewer")
-            self.assertIsNotNone(project["agent_snapshot"])
-            self.assertIsNotNone(project["agent_result_snapshot"])
-            self.assertNotIn("keep for diagnosis", project["agent_snapshot"])
+            self.assertEqual(result, 0)
+            self.assertIsNone(project["phase"])
+            self.assertIn("reviewer Git 범위 위반", plan["last_error"])
+            self.assertEqual(plan["status"], "PLAN_BLOCKED")
+            self.assertEqual(plan["agent_role"], "reviewer")
+            self.assertIsNotNone(plan["agent_snapshot"])
+            self.assertIsNotNone(plan["agent_result_snapshot"])
+            self.assertNotIn("keep for diagnosis", plan["agent_snapshot"])
             self.assertIsNotNone(plan["blocked_fingerprint"])
             self.assertEqual(
                 plan["blocked_fingerprint"],
@@ -7870,7 +7900,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
             )
             self.assertTrue((worktree / "reviewer.txt").is_file())
 
-            blocked_error = project["last_error"]
+            blocked_error = plan["last_error"]
             with mock.patch(
                 "loop_manager.validate_repository", return_value=repo
             ), mock.patch(
@@ -7896,14 +7926,14 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 (str(repo),),
             ).fetchone()
             unchanged_plan = connection.execute(
-                "SELECT status, blocked_fingerprint FROM exec_plans "
+                "SELECT status, last_error, blocked_fingerprint FROM exec_plans "
                 "WHERE repo = ? AND plan_id = 'G-001'",
                 (str(repo),),
             ).fetchone()
-            self.assertEqual(unchanged_result, 1)
-            self.assertEqual(unchanged_project["phase"], "BLOCKED")
-            self.assertEqual(unchanged_project["last_error"], blocked_error)
-            self.assertEqual(unchanged_plan["status"], "BLOCKED")
+            self.assertEqual(unchanged_result, 0)
+            self.assertIsNone(unchanged_project["phase"])
+            self.assertEqual(unchanged_plan["last_error"], blocked_error)
+            self.assertEqual(unchanged_plan["status"], "PLAN_BLOCKED")
             self.assertEqual(
                 unchanged_plan["blocked_fingerprint"],
                 plan["blocked_fingerprint"],
@@ -8032,13 +8062,13 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "",
             )
 
-            project = connection.execute(
+            plan = connection.execute(
                 "SELECT agent_input_plan, agent_result_plan "
-                "FROM projects WHERE repo = ?",
+                "FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
                 (str(repo),),
             ).fetchone()
-            self.assertEqual(project["agent_input_plan"], input_plan)
-            self.assertEqual(project["agent_result_plan"], result_plan)
+            self.assertEqual(plan["agent_input_plan"], input_plan)
+            self.assertEqual(plan["agent_result_plan"], result_plan)
 
     def test_blocked_scope_resume_rebases_non_source_remote_and_direct_execplan_edit(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -8162,9 +8192,15 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "FROM projects WHERE repo = ?",
                 (str(repo),),
             ).fetchone()
-            self.assertEqual(unchanged_run, 1)
-            self.assertEqual(persisted_block["phase"], "BLOCKED")
-            self.assertIsNotNone(persisted_block["agent_manager_snapshot"])
+            persisted_plan = connection.execute(
+                "SELECT status, agent_snapshot FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(unchanged_run, 0)
+            self.assertIsNone(persisted_block["phase"])
+            self.assertEqual(persisted_plan["status"], "PLAN_BLOCKED")
+            self.assertIsNotNone(persisted_plan["agent_snapshot"])
             blocked_agent.assert_not_called()
 
             (repo / "docs/notes.md").write_text(
@@ -8213,7 +8249,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "SELECT phase, agent_recovery FROM projects WHERE repo = ?",
                 (str(repo),),
             ).fetchone()
-            self.assertEqual(interrupted["phase"], "BLOCKED")
+            self.assertEqual(interrupted["phase"], "PLAN_BLOCKED")
             self.assertIsNotNone(interrupted["agent_recovery"])
             recovery = json.loads(interrupted["agent_recovery"])
             recovery_temp = worktree / recovery["plan_temp_path"]
@@ -8381,23 +8417,24 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 (str(repo),),
             ).fetchone()
             plan = connection.execute(
-                "SELECT status FROM exec_plans "
+                "SELECT status, last_error, verify_result, agent_role, "
+                "agent_snapshot, agent_result_snapshot FROM exec_plans "
                 "WHERE repo = ? AND plan_id = 'G-001'",
                 (str(repo),),
             ).fetchone()
 
-            self.assertEqual(result, 1)
-            self.assertEqual(project["phase"], "BLOCKED")
-            self.assertIn("worker Git 범위 위반", project["last_error"])
+            self.assertEqual(result, 0)
+            self.assertIsNone(project["phase"])
+            self.assertIn("worker Git 범위 위반", plan["last_error"])
             self.assertIn(
                 "docs/requirements/Active.md",
-                project["last_error"],
+                plan["last_error"],
             )
-            self.assertEqual(project["verify_result"], "verify: PASS")
-            self.assertEqual(project["agent_role"], "worker")
-            self.assertIsNotNone(project["agent_snapshot"])
-            self.assertIsNotNone(project["agent_result_snapshot"])
-            self.assertEqual(plan["status"], "BLOCKED")
+            self.assertEqual(plan["verify_result"], "verify: PASS")
+            self.assertEqual(plan["agent_role"], "worker")
+            self.assertIsNotNone(plan["agent_snapshot"])
+            self.assertIsNotNone(plan["agent_result_snapshot"])
+            self.assertEqual(plan["status"], "PLAN_BLOCKED")
             self.assertEqual(
                 git_command(worktree, "rev-parse", "HEAD"),
                 initial_head,
@@ -8697,14 +8734,14 @@ class WorkspaceRecoveryTest(unittest.TestCase):
                 (str(repo),),
             ).fetchone()
             self.assertEqual(result, 1)
-            self.assertEqual(project["phase"], "BLOCKED")
+            self.assertEqual(project["phase"], "PROJECT_BLOCKED")
             self.assertIn(
                 "예약 ExecPlan branch가 저장된 기준 commit과 다릅니다",
                 project["last_error"],
             )
             self.assertEqual(
                 tuple(blocked),
-                ("BLOCKED", loop_manager.WORKSPACE_RESERVED),
+                ("IMPLEMENTING", loop_manager.WORKSPACE_RESERVED),
             )
             self.assertFalse(worktree.exists())
             self.assertEqual(
@@ -9117,10 +9154,17 @@ class WorkspaceRecoveryTest(unittest.TestCase):
                     UPDATE exec_plans
                     SET status = 'IMPLEMENTING', active_sha = ?, branch = ?,
                         worktree = ?, workspace_owned = 1,
-                        worker_session_id = 'worker-session'
+                        worker_session_id = 'worker-session',
+                        agent_role = 'worker', agent_snapshot = ?
                     WHERE repo = ? AND plan_id = 'G-012'
                     """,
-                    (plan_sha, branch, str(worktree), str(repo)),
+                    (
+                        plan_sha,
+                        branch,
+                        str(worktree),
+                        before.serialize(),
+                        str(repo),
+                    ),
                 )
                 connection.execute(
                     """
@@ -9454,9 +9498,9 @@ class WorkspaceRecoveryTest(unittest.TestCase):
             ).fetchone()["status"]
 
             self.assertEqual(result, 1)
-            self.assertEqual(blocked["phase"], "BLOCKED")
+            self.assertEqual(blocked["phase"], "PROJECT_BLOCKED")
             self.assertIn("모두 복구할 수 없습니다", blocked["last_error"])
-            self.assertEqual(plan_status, "BLOCKED")
+            self.assertEqual(plan_status, "IMPLEMENTING")
             run_agent.assert_not_called()
 
 
@@ -9527,9 +9571,9 @@ class WorkspaceRecoveryTest(unittest.TestCase):
             ).fetchone()["status"]
 
             self.assertEqual(result, 1)
-            self.assertEqual(project["phase"], "BLOCKED")
+            self.assertEqual(project["phase"], "PROJECT_BLOCKED")
             self.assertIn("이미 존재해 소유권을 증명할 수 없습니다", project["last_error"])
-            self.assertEqual(plan_status, "BLOCKED")
+            self.assertEqual(plan_status, "IMPLEMENTING")
             self.assertEqual(git_command(repo, "rev-parse", branch), branch_head)
             self.assertFalse(worktree.exists())
             run_agent.assert_not_called()
@@ -9572,9 +9616,12 @@ class WorkspaceRecoveryTest(unittest.TestCase):
                 (str(repo),),
             ).fetchone()
             self.assertEqual(resumed_result, 1)
-            self.assertEqual(resumed_project["phase"], "BLOCKED")
-            self.assertIn("충돌이 해소되지 않았습니다", resumed_project["last_error"])
-            self.assertEqual(tuple(resumed_plan), ("BLOCKED", 0))
+            self.assertEqual(resumed_project["phase"], "PROJECT_BLOCKED")
+            self.assertIn(
+                "이미 존재해 소유권을 증명할 수 없습니다",
+                resumed_project["last_error"],
+            )
+            self.assertEqual(tuple(resumed_plan), ("IMPLEMENTING", 0))
             self.assertEqual(git_command(repo, "rev-parse", branch), branch_head)
             self.assertFalse(worktree.exists())
             resumed_agent.assert_not_called()
@@ -9973,15 +10020,19 @@ class WorkspaceRecoveryTest(unittest.TestCase):
                 "SELECT workspace_owned, reason FROM cleanup_pending WHERE repo = ?",
                 (str(repo),),
             ).fetchone()
-            self.assertEqual(merge_result.kind, loop_manager.ProjectRunKind.WAITING)
-            self.assertEqual(merge_result.exit_code, 0)
+            self.assertEqual(merge_result.kind, loop_manager.ProjectRunKind.BLOCKED)
+            self.assertEqual(merge_result.exit_code, 1)
             self.assertEqual(
                 completion_result.kind,
-                loop_manager.ProjectRunKind.COMPLETED,
+                loop_manager.ProjectRunKind.BLOCKED,
             )
-            self.assertEqual(completion_result.exit_code, 0)
-            self.assertEqual(tuple(after_merge), (None, None, None))
-            self.assertEqual(tuple(project), (None, None))
+            self.assertEqual(completion_result.exit_code, 1)
+            self.assertEqual(tuple(after_merge), ("PROJECT_BLOCKED", None, None))
+            self.assertEqual(project["phase"], "PROJECT_BLOCKED")
+            self.assertIn(
+                "소유권이 확인되지 않았습니다",
+                project["last_error"],
+            )
             self.assertEqual(tuple(plan_status), ("MERGED", 0))
             self.assertEqual(pending["workspace_owned"], 0)
             self.assertIn(
@@ -9990,7 +10041,7 @@ class WorkspaceRecoveryTest(unittest.TestCase):
             )
             self.assertTrue(worktree.is_dir())
             self.assertEqual(git_command(worktree, "rev-parse", "HEAD"), pr_head)
-            run_agent.assert_called_once()
+            run_agent.assert_not_called()
 
     def test_merge_cleanup_preserves_unowned_saved_path_as_nonblocking_pending(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -10084,8 +10135,12 @@ class WorkspaceRecoveryTest(unittest.TestCase):
                 (str(repo),),
             ).fetchone()
 
-            self.assertEqual(result, 0)
-            self.assertEqual(tuple(project), (None, None))
+            self.assertEqual(result, 1)
+            self.assertEqual(project["phase"], "PROJECT_BLOCKED")
+            self.assertIn(
+                "소유권이 확인되지 않았습니다",
+                project["last_error"],
+            )
             self.assertEqual(plan_status, "MERGED")
             self.assertEqual(pending["workspace_owned"], 0)
             self.assertIn(
@@ -10623,13 +10678,19 @@ class LatestBasePublicationTest(unittest.TestCase):
                 "FROM projects WHERE repo = ?",
                 (str(repo),),
             ).fetchone()
+            plan = connection.execute(
+                "SELECT status, active_sha, validated_base_sha, pr_head_oid "
+                "FROM exec_plans WHERE repo = ? AND plan_id = 'G-014'",
+                (str(repo),),
+            ).fetchone()
             latest_base = git_command(repo, "rev-parse", "origin/main")
 
         self.assertEqual(outcome.kind, loop_manager.ProjectRunKind.WAITING)
-        self.assertEqual(project["phase"], "PR_OPEN")
-        self.assertEqual(project["active_sha"], latest_base)
-        self.assertEqual(project["validated_base_sha"], latest_base)
-        self.assertIsNotNone(project["pr_head_oid"])
+        self.assertIsNone(project["phase"])
+        self.assertEqual(plan["status"], "PR_OPEN")
+        self.assertEqual(plan["active_sha"], latest_base)
+        self.assertEqual(plan["validated_base_sha"], latest_base)
+        self.assertIsNotNone(plan["pr_head_oid"])
         self.assertEqual(verify.call_count, 2)
         self.assertEqual(reviews, ["reviewer", "reviewer"])
         self.assertEqual(len(created), 1)
@@ -10711,15 +10772,15 @@ class LatestBasePublicationTest(unittest.TestCase):
                 (str(repo),),
             ).fetchone()
             plan = connection.execute(
-                "SELECT status FROM exec_plans "
+                "SELECT status, last_error FROM exec_plans "
                 "WHERE repo = ? AND plan_id = 'G-014'",
                 (str(repo),),
             ).fetchone()
 
-        self.assertEqual(second, 1)
-        self.assertEqual(blocked["phase"], "BLOCKED")
-        self.assertIn("cannot resolve conflict", blocked["last_error"])
-        self.assertEqual(plan["status"], "BLOCKED")
+        self.assertEqual(second, 0)
+        self.assertIsNone(blocked["phase"])
+        self.assertIn("cannot resolve conflict", plan["last_error"])
+        self.assertEqual(plan["status"], "PLAN_BLOCKED")
 
     def test_rebase_recovery_marker_survives_agent_pause(self):
         cases = (
@@ -10870,8 +10931,14 @@ class LatestBasePublicationTest(unittest.TestCase):
                     "SELECT phase FROM projects WHERE repo = ?",
                     (str(repo),),
                 ).fetchone()
-                self.assertEqual(resumed, 1)
-                self.assertEqual(blocked["phase"], "BLOCKED")
+                plan_status = connection.execute(
+                    "SELECT status FROM exec_plans "
+                    "WHERE repo = ? AND plan_id = 'G-014'",
+                    (str(repo),),
+                ).fetchone()["status"]
+                self.assertEqual(resumed, 0)
+                self.assertIsNone(blocked["phase"])
+                self.assertEqual(plan_status, "PLAN_BLOCKED")
                 resumed_agent.assert_called_once()
 
     def test_rebase_recovery_marker_survives_worker_result_validation_failure(
@@ -11006,9 +11073,15 @@ class LatestBasePublicationTest(unittest.TestCase):
                 "SELECT phase FROM projects WHERE repo = ?",
                 (str(repo),),
             ).fetchone()
+            plan_status = connection.execute(
+                "SELECT status FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-014'",
+                (str(repo),),
+            ).fetchone()["status"]
 
-        self.assertEqual(resumed, 1)
-        self.assertEqual(blocked["phase"], "BLOCKED")
+        self.assertEqual(resumed, 0)
+        self.assertIsNone(blocked["phase"])
+        self.assertEqual(plan_status, "PLAN_BLOCKED")
         resumed_agent.assert_called_once()
 
     def test_empty_conflict_resolution_blocks_instead_of_reinvoking_worker(self):
@@ -11102,7 +11175,7 @@ class LatestBasePublicationTest(unittest.TestCase):
                 (str(repo),),
             ).fetchone()
             plan = connection.execute(
-                "SELECT status FROM exec_plans "
+                "SELECT status, last_error FROM exec_plans "
                 "WHERE repo = ? AND plan_id = 'G-014'",
                 (str(repo),),
             ).fetchone()
@@ -11110,13 +11183,13 @@ class LatestBasePublicationTest(unittest.TestCase):
                 worktree, branch
             )
 
-        self.assertEqual(second, 1)
-        self.assertEqual(blocked["phase"], "BLOCKED")
+        self.assertEqual(second, 0)
+        self.assertIsNone(blocked["phase"])
         self.assertIn(
             "rebase 충돌 해결 후 Worker 변경이 남지 않아",
-            blocked["last_error"],
+            plan["last_error"],
         )
-        self.assertEqual(plan["status"], "BLOCKED")
+        self.assertEqual(plan["status"], "PLAN_BLOCKED")
         self.assertFalse(
             loop_manager._rebase_in_progress_for_branch(worktree, branch)
         )
@@ -11162,10 +11235,16 @@ class LatestBasePublicationTest(unittest.TestCase):
                 "SELECT phase, last_error FROM projects WHERE repo = ?",
                 (str(repo),),
             ).fetchone()
+            plan = connection.execute(
+                "SELECT status, last_error FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-014'",
+                (str(repo),),
+            ).fetchone()
 
-        self.assertEqual(outcome, 1)
-        self.assertEqual(blocked["phase"], "BLOCKED")
-        self.assertIn("rebase 후 Worker 변경이 남지 않아", blocked["last_error"])
+        self.assertEqual(outcome, 0)
+        self.assertIsNone(blocked["phase"])
+        self.assertEqual(plan["status"], "PLAN_BLOCKED")
+        self.assertIn("rebase 후 Worker 변경이 남지 않아", plan["last_error"])
         agent.assert_not_called()
         verify.assert_not_called()
 
@@ -11224,12 +11303,18 @@ class LatestBasePublicationTest(unittest.TestCase):
                 "FROM projects WHERE repo = ?",
                 (str(repo),),
             ).fetchone()
+            plan = connection.execute(
+                "SELECT status, publication_remote_oid, pr_head_oid "
+                "FROM exec_plans WHERE repo = ? AND plan_id = 'G-014'",
+                (str(repo),),
+            ).fetchone()
             local_head = git_command(worktree, "rev-parse", "HEAD")
 
         self.assertEqual(outcome, 0)
-        self.assertEqual(project["phase"], "PR_OPEN")
-        self.assertEqual(project["publication_remote_oid"], local_head)
-        self.assertEqual(project["pr_head_oid"], local_head)
+        self.assertIsNone(project["phase"])
+        self.assertEqual(plan["status"], "PR_OPEN")
+        self.assertEqual(plan["publication_remote_oid"], local_head)
+        self.assertEqual(plan["pr_head_oid"], local_head)
         self.assertEqual(git_calls, [])
         self.assertEqual(len(created), 1)
 
@@ -11355,7 +11440,7 @@ class LatestBasePublicationTest(unittest.TestCase):
             ).fetchone()
 
         self.assertEqual(outcome, 1)
-        self.assertEqual(blocked["phase"], "BLOCKED")
+        self.assertEqual(blocked["phase"], "PROJECT_BLOCKED")
         self.assertIn("갱신을 거부", blocked["last_error"])
         self.assertEqual(pushes, [])
 
@@ -11407,8 +11492,8 @@ class LatestBasePublicationTest(unittest.TestCase):
                     self.assertEqual(plan["status"], "PR_OPEN")
                     self.assertEqual(plan["pr_head_oid"], head)
                 elif initial_state == "CLOSED":
-                    self.assertEqual(outcome, 1)
-                    self.assertEqual(plan["status"], "BLOCKED")
+                    self.assertEqual(outcome, 0)
+                    self.assertEqual(plan["status"], "PLAN_BLOCKED")
                     reopened = {**pull_request, "state": "OPEN"}
                     with mock.patch(
                         "loop_manager.validate_repository", return_value=repo
@@ -11709,8 +11794,8 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                     )
 
                 stored = connection.execute(
-                    "SELECT phase, pr_conflict_recovery FROM projects "
-                    "WHERE repo = ?",
+                    "SELECT status, pr_conflict_recovery FROM exec_plans "
+                    "WHERE repo = ? AND plan_id = 'G-026'",
                     (str(repo),),
                 ).fetchone()
                 self.assertEqual(result, 0)
@@ -11746,6 +11831,13 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                 "refs/remotes/origin/main",
                 error,
                 "verify: PASS",
+            )
+            blocked = connection.execute(
+                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-026'",
+                (str(repo),),
+            ).fetchone()
+            loop_manager.hydrate_execplan_project(
+                connection, str(repo), blocked
             )
             project = connection.execute(
                 "SELECT * FROM projects WHERE repo = ?",
@@ -11819,10 +11911,10 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             ).fetchone()
 
         self.assertEqual(result, 1)
-        self.assertEqual(stored["status"], "BLOCKED")
+        self.assertEqual(stored["status"], "PLAN_BLOCKED")
         self.assertEqual(
             stored["blocked_reason"],
-            loop_manager.PR_CONFLICT_PREFLIGHT_BLOCK_REASON,
+            loop_manager.BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value,
         )
         self.assertIn("unexpected.txt", stored["last_error"])
 
@@ -11973,11 +12065,11 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
 
             stored = connection.execute(
                 """
-                SELECT phase, validated_base_sha, publication_remote_oid,
+                SELECT status, validated_base_sha, publication_remote_oid,
                        pr_url, pr_head_oid, pr_conflict_recovery,
                        pr_conflict_head_oid, pr_conflict_base_oid,
                        worker_session_id, reviewer_session_id
-                FROM projects WHERE repo = ?
+                FROM exec_plans WHERE repo = ? AND plan_id = 'G-026'
                 """,
                 (str(repo),),
             ).fetchone()
@@ -11991,7 +12083,7 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             lease = f"--force-with-lease=refs/heads/{branch}:{head_oid}"
 
             self.assertEqual(outcome.kind, loop_manager.ProjectRunKind.WAITING)
-            self.assertEqual(stored["phase"], "PR_OPEN")
+            self.assertEqual(stored["status"], "PR_OPEN")
             self.assertEqual(stored["publication_remote_oid"], final_head)
             self.assertEqual(stored["pr_head_oid"], final_head)
             self.assertEqual(stored["pr_url"], pr_url)
@@ -12084,8 +12176,8 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                 )
 
             stored = connection.execute(
-                "SELECT phase, pr_conflict_recovery FROM projects "
-                "WHERE repo = ?",
+                "SELECT status, pr_conflict_recovery FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-026'",
                 (str(repo),),
             ).fetchone()
             self.assertEqual(outcome.kind, loop_manager.ProjectRunKind.WAITING)
@@ -12185,9 +12277,13 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             ).fetchone()
             self.assertNotEqual(external_head, observed_head)
             self.assertEqual((first, second), (1, 1))
-            self.assertEqual(stored["status"], "BLOCKED")
+            self.assertEqual(stored["status"], "IMPLEMENTING")
             self.assertEqual(stored["pr_conflict_recovery"], 1)
             self.assertEqual(stored["pr_conflict_head_oid"], observed_head)
+            project = connection.execute(
+                "SELECT phase FROM projects WHERE repo = ?", (str(repo),)
+            ).fetchone()
+            self.assertEqual(project["phase"], "PROJECT_BLOCKED")
             self.assertEqual(stored["worker_session_id"], "worker-existing")
             self.assertEqual(stored["reviewer_session_id"], "reviewer-existing")
             self.assertEqual(self._source_checkout_snapshot(repo), source_before)
@@ -12251,7 +12347,7 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             ).fetchone()
             self.assertNotEqual(external_head, head_oid)
             self.assertEqual(result, 1)
-            self.assertEqual(stored["phase"], "BLOCKED")
+            self.assertEqual(stored["phase"], "PROJECT_BLOCKED")
             self.assertEqual(stored["pr_conflict_recovery"], 0)
             self.assertIn("head OID", stored["last_error"])
             self.assertEqual(pushes, [])
@@ -12317,9 +12413,9 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                 """,
                 (str(repo),),
             ).fetchone()
-            self.assertEqual(first.kind, loop_manager.ProjectRunKind.BLOCKED)
-            self.assertEqual(second.kind, loop_manager.ProjectRunKind.BLOCKED)
-            self.assertEqual(stored["status"], "BLOCKED")
+            self.assertEqual(first.kind, loop_manager.ProjectRunKind.WAITING)
+            self.assertEqual(second.kind, loop_manager.ProjectRunKind.WAITING)
+            self.assertEqual(stored["status"], "PLAN_BLOCKED")
             self.assertEqual(stored["pr_conflict_recovery"], 1)
             self.assertEqual(stored["pr_conflict_head_oid"], head_oid)
             self.assertEqual(stored["worker_session_id"], "worker-existing")
@@ -12372,6 +12468,13 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                     )
                 )
 
+            blocked_plan = connection.execute(
+                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-026'",
+                (str(repo),),
+            ).fetchone()
+            loop_manager.hydrate_execplan_project(
+                connection, str(repo), blocked_plan
+            )
             blocked_project = connection.execute(
                 "SELECT * FROM projects WHERE repo = ?", (str(repo),)
             ).fetchone()
@@ -12397,7 +12500,7 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             history = json.loads(stored["verify_failure_history"])
             self.assertFalse(any(item.blocked for item in decisions[:-1]))
             self.assertTrue(decisions[-1].blocked)
-            self.assertEqual(stored["status"], "BLOCKED")
+            self.assertEqual(stored["status"], "PLAN_BLOCKED")
             self.assertEqual(stored["pr_conflict_recovery"], 1)
             self.assertEqual(stored["pr_conflict_head_oid"], head_oid)
             self.assertEqual(
@@ -12530,8 +12633,8 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                     )
 
                 final = connection.execute(
-                    "SELECT phase, pr_conflict_recovery FROM projects "
-                    "WHERE repo = ?",
+                    "SELECT status, pr_conflict_recovery FROM exec_plans "
+                    "WHERE repo = ? AND plan_id = 'G-026'",
                     (str(repo),),
                 ).fetchone()
                 self.assertEqual(resumed.kind, loop_manager.ProjectRunKind.WAITING)
@@ -12632,7 +12735,7 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                 (str(repo),),
             ).fetchone()
             self.assertEqual(outcome.kind, loop_manager.ProjectRunKind.BLOCKED)
-            self.assertEqual(stored["status"], "BLOCKED")
+            self.assertEqual(stored["status"], "PUBLISHING")
             self.assertEqual(stored["pr_conflict_recovery"], 1)
             self.assertEqual(stored["pr_conflict_head_oid"], observed_head)
             self.assertEqual(
@@ -12774,8 +12877,12 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                             connection, state_dir, str(repo), Path("unused.ini"), "main", False
                         )
                         self.assertEqual(result.kind, loop_manager.ProjectRunKind.BLOCKED)
-                        plan = loop_manager.active_execplan(connection, str(repo))
-                        self.assertEqual(plan["status"], "BLOCKED")
+                        plan = connection.execute(
+                            "SELECT * FROM exec_plans "
+                            "WHERE repo = ? AND plan_id = 'G-026'",
+                            (str(repo),),
+                        ).fetchone()
+                        self.assertEqual(plan["status"], "PUBLISHING")
                         self.assertIn("안전 검증 실패", plan["last_error"])
                         self.assertEqual(plan["pr_conflict_recovery"], 1)
                         self.assertEqual(plan["pr_conflict_head_oid"], observed_head)
@@ -12786,7 +12893,7 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                         project = connection.execute(
                             "SELECT phase FROM projects WHERE repo = ?", (str(repo),)
                         ).fetchone()
-                        self.assertEqual(project["phase"], "BLOCKED")
+                        self.assertEqual(project["phase"], "PROJECT_BLOCKED")
                     agent.assert_not_called()
                 self.assertEqual(writes, [])
                 self.assertEqual(self._source_checkout_snapshot(repo), source_before)
@@ -12836,12 +12943,15 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                 "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-026'",
                 (str(repo),),
             ).fetchone()
-            self.assertEqual(blocked["status"], "BLOCKED")
+            self.assertEqual(blocked["status"], "PLAN_BLOCKED")
             self.assertEqual(
                 blocked["blocked_reason"],
                 loop_manager.PR_CLOSED_BLOCK_REASON,
             )
 
+            loop_manager.hydrate_execplan_project(
+                connection, str(repo), blocked
+            )
             blocked_project = connection.execute(
                 "SELECT * FROM projects WHERE repo = ?", (str(repo),)
             ).fetchone()
@@ -12930,7 +13040,7 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                 self.assertEqual(pushes, [])
                 if state == "CLOSED":
                     self.assertEqual(result, 1)
-                    self.assertEqual(tuple(stored), ("BLOCKED", 1))
+                    self.assertEqual(tuple(stored), ("PLAN_BLOCKED", 1))
                     self.assertTrue(worktree.is_dir())
                 else:
                     self.assertEqual(
@@ -12961,9 +13071,13 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
                 "loop_manager.run_codex"
             ) as agent, mock.patch("loop_manager.push_owned_pr_conflict_recovery") as push:
-                for observed, state in (
-                    (base, "OPEN"), (head, "CLOSED"), (head, "OPEN"), (head, "OPEN")
-                ):
+                scenarios = (
+                    (base, "OPEN", "PLAN_BLOCKED"),
+                    (head, "CLOSED", "PLAN_BLOCKED"),
+                    (head, "OPEN", "PR_OPEN"),
+                    (head, "OPEN", "PR_OPEN"),
+                )
+                for observed, state, expected_status in scenarios:
                     with mock.patch("loop_manager.pr_for_branch", return_value=
                                     self._pull_request(
                                         branch, url, observed, "CONFLICTING", state=state
@@ -12972,11 +13086,25 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                             connection, state_dir, str(repo), Path("unused.ini"), "main", False
                         )
                     self.assertEqual(result.kind, loop_manager.ProjectRunKind.BLOCKED)
-                    stored = loop_manager.active_execplan(connection, str(repo))
-                    self.assertEqual(stored["status"], "BLOCKED")
-                    self.assertIsNone(stored["blocked_reason"])
+                    stored = connection.execute(
+                        "SELECT * FROM exec_plans "
+                        "WHERE repo = ? AND plan_id = 'G-026'",
+                        (str(repo),),
+                    ).fetchone()
+                    self.assertEqual(stored["status"], expected_status)
+                    self.assertEqual(
+                        stored["blocked_reason"],
+                        loop_manager.PR_CLOSED_BLOCK_REASON
+                        if expected_status == "PLAN_BLOCKED"
+                        else None,
+                    )
                     self.assertEqual(stored["pr_conflict_head_oid"], head)
                     self.assertEqual(stored["pr_conflict_recovery"], 1)
+                    blocked_project = connection.execute(
+                        "SELECT phase FROM projects WHERE repo = ?",
+                        (str(repo),),
+                    ).fetchone()
+                    self.assertEqual(blocked_project["phase"], "PROJECT_BLOCKED")
                     self.assertEqual(git_command(worktree, "rev-parse", "HEAD"), head)
                 agent.assert_not_called()
                 push.assert_not_called()
@@ -13075,7 +13203,11 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                         connection, state_dir, str(repo), Path("unused.ini"), "main", False
                     )
                 self.assertEqual(resumed.kind, loop_manager.ProjectRunKind.WAITING)
-                final = loop_manager.active_execplan(connection, str(repo))
+                final = connection.execute(
+                    "SELECT * FROM exec_plans "
+                    "WHERE repo = ? AND plan_id = 'G-026'",
+                    (str(repo),),
+                ).fetchone()
                 self.assertEqual(final["status"], "PR_OPEN")
                 self.assertEqual(final["pr_conflict_recovery"], 0)
                 self.assertEqual(final["pr_url"], url)

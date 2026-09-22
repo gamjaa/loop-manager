@@ -67,6 +67,8 @@ from maintenance_orchestration import (
 )
 import maintenance_git
 import maintenance_state
+import scoped_blocking
+from scoped_blocking import BlockReasonCode, BlockScope
 
 
 ROOT = Path(__file__).resolve().parent
@@ -89,14 +91,18 @@ WORKSPACE_OWNED = 1
 WORKSPACE_RESERVED = 2
 REBASE_IN_PROGRESS_ERROR = "Manager rebase 진행 중"
 REBASE_CONFLICT_PREFIX = "rebase 충돌 해결 필요:\n"
-PR_CLOSED_BLOCK_REASON = "pull-request-closed"
+PR_CLOSED_BLOCK_REASON = BlockReasonCode.PULL_REQUEST_CLOSED.value
 PR_CONFLICT_PREFLIGHT_BLOCK_REASON = "pr-conflict-preflight"
 PR_CONFLICT_PREFLIGHT_ERROR_PREFIX = "PR_OPEN 충돌 복구 소유권 검증 실패:"
 PRIORITY_ORDER = {"critical": 0, "high": 1, "normal": 2, "low": 3}
 ACTIVE_EXECPLAN_STATUSES = frozenset(
-    {"IMPLEMENTING", "VERIFYING", "REVIEWING", "PUBLISHING", "PR_OPEN", "BLOCKED"}
+    {"IMPLEMENTING", "VERIFYING", "REVIEWING", "PUBLISHING"}
 )
-KNOWN_EXECPLAN_STATUSES = ACTIVE_EXECPLAN_STATUSES | {"READY", "MERGED"}
+WAITING_EXECPLAN_STATUSES = frozenset({"PR_OPEN", "PLAN_BLOCKED"})
+KNOWN_EXECPLAN_STATUSES = ACTIVE_EXECPLAN_STATUSES | WAITING_EXECPLAN_STATUSES | {
+    "READY",
+    "MERGED",
+}
 FIELDS = {
     "base_branch",
     "provider",
@@ -248,6 +254,15 @@ CREATE TABLE IF NOT EXISTS exec_plans (
     blocked_reason TEXT,
     guidance_plan_hash TEXT,
     workspace_owned INTEGER NOT NULL DEFAULT 0,
+    agent_role TEXT,
+    agent_snapshot TEXT,
+    agent_input_fingerprint TEXT,
+    agent_baseline TEXT,
+    agent_recovery TEXT,
+    agent_input_plan TEXT,
+    agent_result_plan TEXT,
+    agent_result_snapshot TEXT,
+    agent_manager_snapshot TEXT,
     PRIMARY KEY (repo, plan_id),
     UNIQUE (repo, path),
     FOREIGN KEY (repo) REFERENCES projects(repo)
@@ -287,7 +302,7 @@ CREATE TABLE IF NOT EXISTS guidance_approvals (
 EXEC_PLANS_ACTIVE_INDEX = """
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_execplan_per_project
 ON exec_plans(repo)
-WHERE status IN ('IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING', 'PR_OPEN', 'BLOCKED')
+WHERE status IN ('IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING')
 """
 
 
@@ -326,6 +341,13 @@ class CatalogScheduleDecision:
     active: sqlite3.Row | None
     has_ready: bool
     runnable_ready: sqlite3.Row | None
+    has_plan_blocked: bool = False
+    has_pr_open: bool = False
+    project_blocked: bool = False
+
+    @property
+    def has_waiting(self) -> bool:
+        return self.has_plan_blocked or self.has_pr_open or self.project_blocked
 
 
 @dataclass(frozen=True)
@@ -570,9 +592,13 @@ class AgentScopeError(RuntimeError):
         self,
         message: str,
         result_snapshot: GitSnapshot | None = None,
+        reason_code: BlockReasonCode = (
+            BlockReasonCode.MANAGED_WORKTREE_SCOPE_VIOLATION
+        ),
     ) -> None:
         super().__init__(message)
         self.result_snapshot = result_snapshot
+        self.reason_code = reason_code
 
 
 class WorkspaceOwnershipError(RuntimeError):
@@ -589,6 +615,10 @@ class ReviewerProtocolError(RuntimeError):
 
 class PublicationSafetyError(RuntimeError):
     """A remote publication branch cannot be proven safe to update."""
+
+
+class ManagedWorktreeConflictError(PublicationSafetyError):
+    """A managed worktree has plan-local state that prevents publication."""
 
 
 class ProcessLockBusyError(RuntimeError):
@@ -1030,6 +1060,15 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
         "review_level_history": "TEXT NOT NULL DEFAULT '{}'",
         "blocked_reason": "TEXT",
         "guidance_plan_hash": "TEXT",
+        "agent_role": "TEXT",
+        "agent_snapshot": "TEXT",
+        "agent_input_fingerprint": "TEXT",
+        "agent_baseline": "TEXT",
+        "agent_recovery": "TEXT",
+        "agent_input_plan": "TEXT",
+        "agent_result_plan": "TEXT",
+        "agent_result_snapshot": "TEXT",
+        "agent_manager_snapshot": "TEXT",
     }
     for column, definition in migrations.items():
         if column not in columns:
@@ -1037,10 +1076,18 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
                 f"ALTER TABLE exec_plans ADD COLUMN {column} {definition}"
             )
     connection.execute(GUIDANCE_APPROVALS_SCHEMA)
+    scoped_blocking.ensure_schema(connection)
+    connection.execute("DROP INDEX IF EXISTS one_active_execplan_per_project")
     connection.execute(EXEC_PLANS_ACTIVE_INDEX)
+    scoped_blocking.migrate_legacy_blocks(connection)
 
 
-def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connection:
+def connect_database(
+    state_dir: Path,
+    *,
+    create: bool = False,
+    run_migrations: bool = True,
+) -> sqlite3.Connection:
     database = state_dir / "loop-manager.db"
     if not create and not database.is_file():
         raise RuntimeError(
@@ -1063,6 +1110,8 @@ def connect_database(state_dir: Path, *, create: bool = False) -> sqlite3.Connec
         except sqlite3.DatabaseError as error:
             connection.close()
             raise RuntimeError("상태 DB를 읽을 수 없습니다. 백업을 복원하거나 다시 초기화하세요.") from error
+    if not run_migrations:
+        return connection
     columns = {row[1] for row in connection.execute("PRAGMA table_info(projects)")}
     migrations = {
         "provider": "TEXT NOT NULL DEFAULT 'codex'",
@@ -1231,12 +1280,17 @@ def backfill_plan_shas(
                 (commits[0], row["repo"]),
             )
         else:
-            connection.execute(
-                "UPDATE projects SET phase = 'BLOCKED', last_error = ? WHERE repo = ?",
-                (
-                    PLAN_SHA_BACKFILL_ERROR,
-                    row["repo"],
-                ),
+            project = connection.execute(
+                "SELECT phase FROM projects WHERE repo = ?", (row["repo"],)
+            ).fetchone()
+            scoped_blocking.record_project_block(
+                connection,
+                str(row["repo"]),
+                BlockReasonCode.REPOSITORY_STATE_UNSAFE,
+                PLAN_SHA_BACKFILL_ERROR,
+                None,
+                plan_id=_plan_id_from_path(str(row["plan_path"] or "")),
+                previous_phase=(str(project["phase"] or "") or None),
             )
             notifications.enqueue_current_project_events(connection, str(row["repo"]))
     connection.commit()
@@ -3090,10 +3144,12 @@ def migrate_legacy_execplans(
     *,
     reconcile_history: bool = False,
     target_repo: str | None = None,
+    ensure_schema: bool = True,
 ) -> None:
     """Conservatively move legacy project-owned execution state into the catalog."""
 
-    _ensure_execplans_schema(connection)
+    if ensure_schema:
+        _ensure_execplans_schema(connection)
     phase_status = {
         "WORKING": "IMPLEMENTING",
         "VERIFYING": "VERIFYING",
@@ -3215,15 +3271,58 @@ def migrate_legacy_execplans(
                         1 if is_active else 0,
                     ),
                 )
+        scoped_blocking.migrate_legacy_blocks(connection)
 
 
 def active_execplan(connection: sqlite3.Connection, repo: str) -> sqlite3.Row | None:
+    """Return the only plan currently occupying the repository mutation slot."""
+
     _ensure_execplans_schema(connection)
     placeholders = ", ".join("?" for _ in ACTIVE_EXECPLAN_STATUSES)
     return connection.execute(
         f"SELECT * FROM exec_plans WHERE repo = ? AND status IN ({placeholders})",
         (repo, *sorted(ACTIVE_EXECPLAN_STATUSES)),
     ).fetchone()
+
+
+def project_execplan(connection: sqlite3.Connection, repo: str) -> sqlite3.Row | None:
+    """Return the plan explicitly mirrored by ``projects``, regardless of status."""
+
+    row = connection.execute(
+        "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
+    ).fetchone()
+    if row is None or not row["plan_path"]:
+        return None
+    return connection.execute(
+        "SELECT * FROM exec_plans WHERE repo = ? AND path = ?",
+        (repo, row["plan_path"]),
+    ).fetchone()
+
+
+def plan_blocked_execplans(
+    connection: sqlite3.Connection, repo: str
+) -> tuple[sqlite3.Row, ...]:
+    _ensure_execplans_schema(connection)
+    return tuple(
+        connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND status = 'PLAN_BLOCKED' "
+            "ORDER BY plan_id",
+            (repo,),
+        ).fetchall()
+    )
+
+
+def merge_wait_execplans(
+    connection: sqlite3.Connection, repo: str
+) -> tuple[sqlite3.Row, ...]:
+    _ensure_execplans_schema(connection)
+    return tuple(
+        connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND status = 'PR_OPEN' "
+            "ORDER BY plan_id",
+            (repo,),
+        ).fetchall()
+    )
 
 
 def mark_execplan_workspace_owned(
@@ -3296,6 +3395,7 @@ def catalog_schedule_decision(
     rows = connection.execute(
         "SELECT * FROM exec_plans WHERE repo = ?", (repo,)
     ).fetchall()
+    project_is_blocked = scoped_blocking.project_block(connection, repo) is not None
     statuses = {row["plan_id"]: row["status"] for row in rows}
     ready = [row for row in rows if row["status"] == "READY"]
     candidates = []
@@ -3305,12 +3405,17 @@ def catalog_schedule_decision(
             candidates.append(row)
     selected = None
     cycle = maintenance_state.MaintenanceRepository(connection).get(repo)
-    if active is None and cycle.phase in {
+    if active is None and not project_is_blocked and cycle.phase in {
         maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
         maintenance_state.MaintenancePhase.REFACTORING,
     }:
         selected = select_cycle_ready_execplan(rows, cycle)
-    elif active is None and cycle.phase is maintenance_state.MaintenancePhase.IDLE and candidates:
+    elif (
+        active is None
+        and not project_is_blocked
+        and cycle.phase is maintenance_state.MaintenancePhase.IDLE
+        and candidates
+    ):
         selected = min(
             candidates,
             key=lambda row: (
@@ -3322,6 +3427,9 @@ def catalog_schedule_decision(
         active=active,
         has_ready=bool(ready),
         runnable_ready=selected,
+        has_plan_blocked=any(row["status"] == "PLAN_BLOCKED" for row in rows),
+        has_pr_open=any(row["status"] == "PR_OPEN" for row in rows),
+        project_blocked=project_is_blocked,
     )
 
 
@@ -3492,6 +3600,16 @@ def hydrate_active_project(connection: sqlite3.Connection, repo: str) -> None:
     plan = active_execplan(connection, repo)
     if plan is None:
         return
+    hydrate_execplan_project(connection, repo, plan)
+
+
+def hydrate_execplan_project(
+    connection: sqlite3.Connection,
+    repo: str,
+    plan: sqlite3.Row,
+) -> None:
+    """Hydrate one explicitly selected plan into the compatibility mirror."""
+
     phase = "WORKING" if plan["status"] == "IMPLEMENTING" else plan["status"]
     connection.execute(
         """
@@ -3502,6 +3620,9 @@ def hydrate_active_project(connection: sqlite3.Connection, repo: str) -> None:
             worktree = ?, plan_path = ?,
             pr_url = ?, pr_head_oid = ?, last_error = ?, worker_session_id = ?,
             reviewer_session_id = ?, worker_result = ?, verify_result = ?, review_result = ?
+            , agent_role = ?, agent_snapshot = ?, agent_input_fingerprint = ?,
+            agent_baseline = ?, agent_recovery = ?, agent_input_plan = ?,
+            agent_result_plan = ?, agent_result_snapshot = ?, agent_manager_snapshot = ?
         WHERE repo = ?
         """,
         (
@@ -3524,6 +3645,15 @@ def hydrate_active_project(connection: sqlite3.Connection, repo: str) -> None:
             plan["worker_result"],
             plan["verify_result"],
             plan["review_result"],
+            plan["agent_role"],
+            plan["agent_snapshot"],
+            plan["agent_input_fingerprint"],
+            plan["agent_baseline"],
+            plan["agent_recovery"],
+            plan["agent_input_plan"],
+            plan["agent_result_plan"],
+            plan["agent_result_snapshot"],
+            plan["agent_manager_snapshot"],
             repo,
         ),
     )
@@ -3563,6 +3693,15 @@ def _mirror_project_update_to_execplan(
         "worker_result",
         "verify_result",
         "review_result",
+        "agent_role",
+        "agent_snapshot",
+        "agent_input_fingerprint",
+        "agent_baseline",
+        "agent_recovery",
+        "agent_input_plan",
+        "agent_result_plan",
+        "agent_result_snapshot",
+        "agent_manager_snapshot",
     ):
         if field in values:
             translated[field] = values[field]
@@ -5372,7 +5511,7 @@ def _validate_pr_conflict_recovery_identity(
     *,
     expected_status: str,
 ) -> tuple[sqlite3.Row, Path, str, str]:
-    plan = active_execplan(connection, repo)
+    plan = project_execplan(connection, repo)
     plan_id = _plan_id_from_path(str(project["plan_path"] or ""))
     branch = str(project["branch"] or "")
     worktree = Path(str(project["worktree"] or ""))
@@ -5466,7 +5605,7 @@ def _validate_pr_conflict_recovery_ownership(
             details.append(
                 "Git operation " + ", ".join(sorted(snapshot.operations))
             )
-        raise PublicationSafetyError(
+        raise ManagedWorktreeConflictError(
             "PR 충돌 복구 시작 전 관리 worktree가 관측한 원격 head의 "
             "clean 상태와 일치하지 않습니다: " + "; ".join(details)
         )
@@ -5894,6 +6033,7 @@ def recover_confirmed_pr_conflict_push(
         pr_conflict_base_oid=None,
         last_error=None,
     )
+    clear_active(connection, repo)
     return True
 
 def _canonical_path(path: Path) -> Path:
@@ -6639,71 +6779,63 @@ def validate_agent_scope(
 
     changes = agent_snapshot_changes(worktree, before, after)
     violations: list[str] = []
+    violation_reason = BlockReasonCode.MANAGED_WORKTREE_SCOPE_VIOLATION
+
+    def add_violation(message: str, reason: BlockReasonCode) -> None:
+        nonlocal violation_reason
+        violations.append(message)
+        if scoped_blocking.reason_scope(reason) is BlockScope.PROJECT:
+            violation_reason = reason
+
     if before.head != after.head:
-        violations.append(f"HEAD 변경 ({before.head} -> {after.head})")
+        add_violation(
+            f"HEAD 변경 ({before.head} -> {after.head})",
+            BlockReasonCode.MANAGED_WORKTREE_SCOPE_VIOLATION,
+        )
     if before.branch != after.branch:
-        violations.append(
+        add_violation(
             f"branch 전환 ({before.branch or 'detached'} -> "
-            f"{after.branch or 'detached'})"
+            f"{after.branch or 'detached'})",
+            BlockReasonCode.MANAGED_WORKTREE_SCOPE_VIOLATION,
         )
 
     if not before.shared_metadata_complete or not after.shared_metadata_complete:
-        violations.append("공유 Git metadata 기준 snapshot 누락")
+        add_violation(
+            "공유 Git metadata 기준 snapshot 누락",
+            BlockReasonCode.REPOSITORY_STATE_UNSAFE,
+        )
     else:
-        # Codex owns these ephemeral refs and may create or prune them while an
-        # Agent is running. Filter both sides during comparison so snapshots
-        # persisted by older versions remain compatible with this boundary.
-        compared_before_refs = {
-            key: value
-            for key, value in before.refs.items()
-            if not key.startswith("refs/codex/turn-diffs/")
-        }
-        compared_after_refs = {
-            key: value
-            for key, value in after.refs.items()
-            if not key.startswith("refs/codex/turn-diffs/")
-        }
-        external_ref_changes = frozenset()
-        external_worktree_changes = frozenset()
-        if external_worktree is not None:
-            external_worktree_changes = frozenset(
-                (str(_canonical_path(external_worktree)),)
-            )
-            if base_branch:
-                external_ref_changes = frozenset(
-                    (
-                        f"refs/heads/{base_branch}",
-                        f"refs/remotes/origin/{base_branch}",
-                        "refs/remotes/origin/HEAD",
-                    )
-                )
         metadata_states = (
             (
                 "공유 Git refs",
-                compared_before_refs,
-                compared_after_refs,
-                allowed_ref_changes | external_ref_changes,
+                before.refs,
+                after.refs,
+                allowed_ref_changes,
+                BlockReasonCode.SHARED_REF_MUTATION,
             ),
             (
                 "Git worktree 등록·HEAD·index·파일 상태",
                 before.worktrees,
                 after.worktrees,
-                allowed_worktree_changes | external_worktree_changes,
+                allowed_worktree_changes,
+                BlockReasonCode.OUTSIDE_MANAGED_WORKTREE_MUTATION,
             ),
             (
                 "Git config",
                 before.config,
                 after.config,
                 frozenset(),
+                BlockReasonCode.SHARED_GIT_CONFIG_MUTATION,
             ),
             (
                 "Git operation 상태",
                 before.operations,
                 after.operations,
                 frozenset(),
+                BlockReasonCode.REPOSITORY_STATE_UNSAFE,
             ),
         )
-        for label, before_state, after_state, allowed_changes in metadata_states:
+        for label, before_state, after_state, allowed_changes, reason in metadata_states:
             changed_keys = sorted(
                 key
                 for key in set(before_state) | set(after_state)
@@ -6711,16 +6843,49 @@ def validate_agent_scope(
                 and key not in allowed_changes
             )
             if changed_keys:
+                if label == "공유 Git refs":
+                    owned_branch_ref = (
+                        f"refs/heads/{before.branch}" if before.branch else None
+                    )
+                    unowned_changes = [
+                        key for key in changed_keys if key != owned_branch_ref
+                    ]
+                    if any(
+                        key.startswith("refs/codex/turn-diffs/")
+                        for key in unowned_changes
+                    ):
+                        reason = BlockReasonCode.TURN_DIFF_REF_MUTATION
+                    elif unowned_changes:
+                        reason = BlockReasonCode.SHARED_REF_MUTATION
+                    else:
+                        reason = BlockReasonCode.MANAGED_WORKTREE_SCOPE_VIOLATION
+                elif label == "Git worktree 등록·HEAD·index·파일 상태":
+                    managed_worktree = str(_canonical_path(worktree))
+                    external_key = (
+                        str(_canonical_path(external_worktree))
+                        if external_worktree is not None
+                        else None
+                    )
+                    unowned_changes = [
+                        key for key in changed_keys if key != managed_worktree
+                    ]
+                    if external_key is not None and external_key in unowned_changes:
+                        reason = BlockReasonCode.DEFAULT_WORKTREE_MUTATION
+                    elif unowned_changes:
+                        reason = BlockReasonCode.OUTSIDE_MANAGED_WORKTREE_MUTATION
+                    else:
+                        reason = BlockReasonCode.MANAGED_WORKTREE_SCOPE_VIOLATION
                 displayed = ", ".join(changed_keys[:8])
                 remainder = len(changed_keys) - 8
                 if remainder > 0:
                     displayed += f", 외 {remainder}개"
-                violations.append(f"{label} 변경 ({displayed})")
+                add_violation(f"{label} 변경 ({displayed})", reason)
 
     for change in changes:
         if "index flags" in change.kinds:
-            violations.append(
-                f"{change.path} ({', '.join(change.kinds)})"
+            add_violation(
+                f"{change.path} ({', '.join(change.kinds)})",
+                BlockReasonCode.MANAGED_WORKTREE_SCOPE_VIOLATION,
             )
             continue
         allowed = False
@@ -6752,14 +6917,16 @@ def validate_agent_scope(
         else:
             raise ValueError(f"알 수 없는 Agent 역할입니다: {role_name}")
         if not allowed:
-            violations.append(
-                f"{change.path} ({', '.join(change.kinds) or 'Git 상태'})"
+            add_violation(
+                f"{change.path} ({', '.join(change.kinds) or 'Git 상태'})",
+                BlockReasonCode.MANAGED_WORKTREE_SCOPE_VIOLATION,
             )
 
     if violations:
         raise AgentScopeError(
             f"{role_name} Git 범위 위반: " + "; ".join(violations),
             result_snapshot=after,
+            reason_code=violation_reason,
         )
 
 
@@ -7730,7 +7897,7 @@ def validate_worker_workspace_scope(
     return plan
 
 
-GUIDANCE_BLOCK_REASON = "guidance_approval"
+GUIDANCE_BLOCK_REASON = BlockReasonCode.GUIDANCE_APPROVAL_REQUIRED.value
 
 
 def _guidance_document(worktree: Path, plan_path: str) -> GuidanceDocument | None:
@@ -7975,10 +8142,11 @@ def _block_for_new_guidance(
         connection.execute(
             """
             UPDATE exec_plans
-            SET status = 'BLOCKED', blocked_reason = ?,
+            SET status = 'PLAN_BLOCKED', blocked_reason = ?,
                 blocked_fingerprint = NULL,
                 blocked_worktree_fingerprint = NULL,
-                guidance_plan_hash = ?, last_error = ?, worker_result = ?
+                guidance_plan_hash = ?, last_error = ?, worker_result = ?,
+                agent_result_snapshot = ?, agent_manager_snapshot = NULL
             WHERE repo = ? AND plan_id = ?
             """,
             (
@@ -7986,14 +8154,23 @@ def _block_for_new_guidance(
                 document.structure_hash,
                 message,
                 worker_result,
+                result_snapshot,
                 repo,
                 plan["plan_id"],
             ),
         )
+        scoped_blocking.record_plan_block(
+            connection,
+            repo,
+            str(plan["plan_id"]),
+            BlockReasonCode.GUIDANCE_APPROVAL_REQUIRED,
+            message,
+            document.structure_hash,
+        )
         connection.execute(
             """
             UPDATE projects
-            SET phase = 'BLOCKED', last_error = ?, worker_result = ?,
+            SET phase = 'PLAN_BLOCKED', last_error = ?, worker_result = ?,
                 agent_result_snapshot = ?, agent_manager_snapshot = NULL
             WHERE repo = ?
             """,
@@ -8071,6 +8248,43 @@ def _guidance_final_expected(
     return expected, final_hashes
 
 
+def _plan_block_selected_for_release(
+    connection: sqlite3.Connection,
+    repo: str,
+    *,
+    blocked_reason: str | None = None,
+    require_fingerprint: bool = False,
+) -> sqlite3.Row | None:
+    """Return the mirrored block, or hydrate one uniquely matching block."""
+
+    def matches(candidate: sqlite3.Row | None) -> bool:
+        return bool(
+            candidate is not None
+            and candidate["status"] == "PLAN_BLOCKED"
+            and (blocked_reason is None or candidate["blocked_reason"] == blocked_reason)
+            and (not require_fingerprint or candidate["blocked_fingerprint"])
+        )
+
+    plan = project_execplan(connection, repo)
+    if matches(plan):
+        return plan
+    clauses = ["repo = ?", "status = 'PLAN_BLOCKED'"]
+    parameters: list[object] = [repo]
+    if blocked_reason is not None:
+        clauses.append("blocked_reason = ?")
+        parameters.append(blocked_reason)
+    if require_fingerprint:
+        clauses.append("blocked_fingerprint IS NOT NULL")
+    rows = connection.execute(
+        "SELECT * FROM exec_plans WHERE " + " AND ".join(clauses) + " ORDER BY plan_id",
+        parameters,
+    ).fetchall()
+    if len(rows) != 1:
+        return None
+    hydrate_execplan_project(connection, repo, rows[0])
+    return rows[0]
+
+
 def resume_guidance_approval_if_decided(
     connection: sqlite3.Connection,
     repo_path: Path,
@@ -8078,12 +8292,12 @@ def resume_guidance_approval_if_decided(
     base: str,
     state_dir: Path,
 ) -> bool:
-    plan = active_execplan(connection, repo)
-    if (
-        plan is None
-        or plan["status"] != "BLOCKED"
-        or plan["blocked_reason"] != GUIDANCE_BLOCK_REASON
-    ):
+    plan = _plan_block_selected_for_release(
+        connection,
+        repo,
+        blocked_reason=GUIDANCE_BLOCK_REASON,
+    )
+    if plan is None:
         return False
     worktree = Path(str(plan["worktree"] or ""))
     branch = str(plan["branch"] or "")
@@ -8215,6 +8429,9 @@ def resume_guidance_approval_if_decided(
                 """,
                 (repo, plan["plan_id"]),
             )
+            scoped_blocking.clear_plan_block(
+                connection, repo, str(plan["plan_id"])
+            )
             connection.execute(
                 "UPDATE projects SET phase = 'WORKING', last_error = NULL "
                 "WHERE repo = ?",
@@ -8265,10 +8482,11 @@ def _invalidate_guidance_approval(
         connection.execute(
             """
             UPDATE exec_plans
-            SET status = 'BLOCKED', blocked_reason = ?,
+            SET status = 'PLAN_BLOCKED', blocked_reason = ?,
                 blocked_fingerprint = NULL,
                 blocked_worktree_fingerprint = NULL,
-                guidance_plan_hash = ?, last_error = ?, worker_result = ?
+                guidance_plan_hash = ?, last_error = ?, worker_result = ?,
+                agent_result_snapshot = ?, agent_manager_snapshot = NULL
             WHERE repo = ? AND plan_id = ?
             """,
             (
@@ -8276,27 +8494,28 @@ def _invalidate_guidance_approval(
                 document.structure_hash,
                 message,
                 worker_result,
+                result_snapshot,
                 repo,
                 plan["plan_id"],
             ),
         )
-        connection.execute(
-            """
-            UPDATE projects
-            SET phase = 'BLOCKED', last_error = ?, worker_result = ?,
-                agent_result_snapshot = ?, agent_manager_snapshot = NULL
-            WHERE repo = ?
-            """,
-            (message, worker_result, result_snapshot, repo),
+        scoped_blocking.record_plan_block(
+            connection,
+            repo,
+            str(plan["plan_id"]),
+            BlockReasonCode.GUIDANCE_APPROVAL_REQUIRED,
+            message,
+            document.structure_hash,
         )
+        _clear_active_in_current_transaction(connection, repo)
         # Manager rebase/verify may already have cleared the Agent scope.
         # Freeze the diagnosed state so only the User Decision can change.
         connection.execute(
-            "UPDATE projects SET agent_role = 'worker', agent_snapshot = ?, "
+            "UPDATE exec_plans SET agent_role = 'worker', agent_snapshot = ?, "
             "agent_baseline = NULL, agent_recovery = NULL, "
             "agent_input_plan = NULL, agent_result_plan = NULL, "
-            "agent_input_fingerprint = NULL WHERE repo = ?",
-            (result_snapshot, repo),
+            "agent_input_fingerprint = NULL WHERE repo = ? AND plan_id = ?",
+            (result_snapshot, repo, plan["plan_id"]),
         )
         notifications.enqueue_current_project_events(connection, repo)
 
@@ -8553,6 +8772,11 @@ def _update_blocked_error(
             (error, repo, plan_id),
         )
         connection.execute(
+            "UPDATE execplan_blocks SET evidence = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE repo = ? AND plan_id = ?",
+            (error, repo, plan_id),
+        )
+        connection.execute(
             "UPDATE projects SET last_error = ? WHERE repo = ?",
             (error, repo),
         )
@@ -8566,10 +8790,11 @@ def block_active_execplan(
     error: str,
     verify_result: str,
     *,
+    reason: BlockReasonCode = BlockReasonCode.PLAN_INPUT_INVALID,
     preserved_agent_result_snapshot: str | None = None,
 ) -> None:
     project = connection.execute(
-        "SELECT plan_path, agent_role, agent_snapshot, agent_input_fingerprint, "
+        "SELECT plan_path, phase, agent_role, agent_snapshot, agent_input_fingerprint, "
         "agent_input_plan "
         "FROM projects WHERE repo = ?",
         (repo,),
@@ -8583,6 +8808,8 @@ def block_active_execplan(
         if plan_id
         else None
     )
+    if plan is None:
+        plan = project_execplan(connection, repo)
     if plan is None:
         raise RuntimeError("차단할 활성 ExecPlan을 찾을 수 없습니다.")
     blocked_worktree_fingerprint = _worktree_execplan_input_fingerprint(
@@ -8609,11 +8836,10 @@ def block_active_execplan(
         connection.execute(
             """
             UPDATE exec_plans
-            SET status = 'BLOCKED', blocked_fingerprint = ?,
-                blocked_reason = CASE WHEN blocked_reason = 'pull-request-closed'
-                    THEN NULL ELSE blocked_reason END,
+            SET blocked_fingerprint = ?,
                 blocked_worktree_fingerprint = ?, blocked_review_fingerprint = NULL,
-                last_error = ?, verify_result = ?
+                last_error = ?, verify_result = ?, agent_result_snapshot = ?,
+                agent_result_plan = ?, agent_manager_snapshot = NULL
             WHERE repo = ? AND plan_id = ?
             """,
             (
@@ -8621,20 +8847,32 @@ def block_active_execplan(
                 blocked_worktree_fingerprint,
                 error,
                 verify_result,
+                agent_result_snapshot,
+                agent_result_plan,
                 repo,
                 plan_id,
             ),
         )
-        connection.execute(
-            """
-            UPDATE projects
-            SET phase = 'BLOCKED', last_error = ?, verify_result = ?,
-                agent_result_snapshot = ?, agent_result_plan = ?,
-                agent_manager_snapshot = NULL
-            WHERE repo = ?
-            """,
-            (error, verify_result, agent_result_snapshot, agent_result_plan, repo),
-        )
+        if scoped_blocking.reason_scope(reason) is BlockScope.PLAN:
+            scoped_blocking.record_plan_block(
+                connection, repo, str(plan_id), reason, error, fingerprint
+            )
+            _clear_active_in_current_transaction(connection, repo)
+        else:
+            scoped_blocking.record_project_block(
+                connection,
+                repo,
+                reason,
+                error,
+                fingerprint,
+                plan_id=str(plan_id),
+                previous_phase=str(project["phase"] or "") or None,
+            )
+            connection.execute(
+                "UPDATE projects SET verify_result = ?, agent_result_snapshot = ?, "
+                "agent_result_plan = ?, agent_manager_snapshot = NULL WHERE repo = ?",
+                (verify_result, agent_result_snapshot, agent_result_plan, repo),
+            )
         notifications.enqueue_current_project_events(connection, repo)
 
 
@@ -8741,13 +8979,13 @@ def transition_validation_failure(
     ]
     execplan_values: list[object] = [
         serialized_history,
-        "BLOCKED" if blocked else "IMPLEMENTING",
+        "PLAN_BLOCKED" if blocked else "IMPLEMENTING",
         error,
     ]
     project_assignments = [
         "validated_base_sha = NULL", "phase = ?", "last_error = ?"
     ]
-    project_values: list[object] = ["BLOCKED" if blocked else "WORKING", error]
+    project_values: list[object] = ["WORKING", error]
     if stage == "verify":
         execplan_assignments.append("verify_result = ?")
         execplan_values.append(output)
@@ -8784,12 +9022,27 @@ def transition_validation_failure(
             "WHERE repo = ? AND plan_id = ?",
             (*execplan_values, repo, plan["plan_id"]),
         )
-        connection.execute(
-            f"UPDATE projects SET {', '.join(project_assignments)} WHERE repo = ?",
-            (*project_values, repo),
-        )
         if blocked:
+            reason = (
+                BlockReasonCode.VERIFY_RETRY_EXHAUSTED
+                if stage == "verify"
+                else BlockReasonCode.REVIEW_RETRY_EXHAUSTED
+            )
+            scoped_blocking.record_plan_block(
+                connection,
+                repo,
+                str(plan["plan_id"]),
+                reason,
+                error,
+                blocked_input,
+            )
+            _clear_active_in_current_transaction(connection, repo)
             notifications.enqueue_current_project_events(connection, repo)
+        else:
+            connection.execute(
+                f"UPDATE projects SET {', '.join(project_assignments)} WHERE repo = ?",
+                (*project_values, repo),
+            )
     return ValidationFailureDecision(
         stage,
         fingerprint,
@@ -8806,12 +9059,13 @@ def block_active_execplan_from_revision(
     error: str,
     verify_result: str = "",
     *,
+    reason: BlockReasonCode = BlockReasonCode.PLAN_INPUT_INVALID,
     preserved_agent_result_snapshot: str | None = None,
     blocked_reason: str | None = None,
 ) -> None:
     """Block an active plan when its saved worktree is not safe to read."""
 
-    plan = active_execplan(connection, repo)
+    plan = active_execplan(connection, repo) or project_execplan(connection, repo)
     if plan is None:
         raise RuntimeError("차단할 활성 ExecPlan을 찾을 수 없습니다.")
     project = connection.execute(
@@ -8826,13 +9080,11 @@ def block_active_execplan_from_revision(
         connection.execute(
             """
             UPDATE exec_plans
-            SET status = 'BLOCKED', blocked_fingerprint = ?,
-                blocked_reason = CASE
-                    WHEN ? IS NOT NULL THEN ?
-                    WHEN blocked_reason = 'pull-request-closed' THEN NULL
-                    ELSE blocked_reason END,
+            SET blocked_fingerprint = ?,
+                blocked_reason = CASE WHEN ? IS NOT NULL THEN ? ELSE blocked_reason END,
                 blocked_worktree_fingerprint = NULL,
-                blocked_review_fingerprint = NULL, last_error = ?, verify_result = ?
+                blocked_review_fingerprint = NULL, last_error = ?, verify_result = ?,
+                agent_result_snapshot = ?, agent_manager_snapshot = NULL
             WHERE repo = ? AND plan_id = ?
             """,
             (
@@ -8841,19 +9093,41 @@ def block_active_execplan_from_revision(
                 blocked_reason,
                 error,
                 verify_result,
+                preserved_agent_result_snapshot,
                 repo,
                 plan["plan_id"],
             ),
         )
-        connection.execute(
-            """
-            UPDATE projects
-            SET phase = 'BLOCKED', last_error = ?, verify_result = ?,
-                agent_result_snapshot = ?, agent_manager_snapshot = NULL
-            WHERE repo = ?
-            """,
-            (error, verify_result, preserved_agent_result_snapshot, repo),
-        )
+        project = connection.execute(
+            "SELECT phase FROM projects WHERE repo = ?", (repo,)
+        ).fetchone()
+        if scoped_blocking.reason_scope(reason) is BlockScope.PLAN:
+            scoped_blocking.record_plan_block(
+                connection,
+                repo,
+                str(plan["plan_id"]),
+                reason,
+                error,
+                fingerprint,
+            )
+            _clear_active_in_current_transaction(connection, repo)
+        else:
+            scoped_blocking.record_project_block(
+                connection,
+                repo,
+                reason,
+                error,
+                fingerprint,
+                plan_id=str(plan["plan_id"]),
+                previous_phase=(
+                    str(project["phase"] or "") or None if project else None
+                ),
+            )
+            connection.execute(
+                "UPDATE projects SET verify_result = ?, agent_result_snapshot = ?, "
+                "agent_manager_snapshot = NULL WHERE repo = ?",
+                (verify_result, preserved_agent_result_snapshot, repo),
+            )
 
         notifications.enqueue_current_project_events(connection, repo)
 
@@ -8864,6 +9138,7 @@ def block_persisted_agent_scope_violation(
     row: sqlite3.Row,
     detail: str,
     result_snapshot: GitSnapshot | None = None,
+    reason: BlockReasonCode = BlockReasonCode.REPOSITORY_STATE_UNSAFE,
 ) -> str:
     """Persist a pre-resume scope violation without discarding Agent state."""
 
@@ -8874,9 +9149,12 @@ def block_persisted_agent_scope_violation(
         preserved_snapshot = str(row["agent_result_snapshot"])
     else:
         preserved_snapshot = str(row["agent_snapshot"])
-    plan = active_execplan(connection, repo)
+    plan = active_execplan(connection, repo) or project_execplan(connection, repo)
     if plan is None:
-        if row["phase"] == "PLANNING":
+        if (
+            row["phase"] == "PLANNING"
+            and scoped_blocking.reason_scope(reason) is BlockScope.PLAN
+        ):
             update_project(
                 connection,
                 repo,
@@ -8885,13 +9163,23 @@ def block_persisted_agent_scope_violation(
                 agent_result_snapshot=preserved_snapshot,
             )
         else:
-            update_project(
-                connection,
-                repo,
-                phase="BLOCKED",
-                last_error=message,
-                agent_result_snapshot=preserved_snapshot,
-            )
+            if scoped_blocking.reason_scope(reason) is BlockScope.PLAN:
+                reason = BlockReasonCode.REPOSITORY_STATE_UNSAFE
+            with connection:
+                scoped_blocking.record_project_block(
+                    connection,
+                    repo,
+                    reason,
+                    message,
+                    None,
+                    plan_id=None,
+                    previous_phase=str(row["phase"] or "") or None,
+                )
+                connection.execute(
+                    "UPDATE projects SET agent_result_snapshot = ? WHERE repo = ?",
+                    (preserved_snapshot, repo),
+                )
+                notifications.enqueue_current_project_events(connection, repo)
         return message
 
     saved_worktree = Path(str(row["worktree"] or ""))
@@ -8902,6 +9190,7 @@ def block_persisted_agent_scope_violation(
             saved_worktree,
             message,
             str(row["verify_result"] or ""),
+            reason=reason,
             preserved_agent_result_snapshot=preserved_snapshot,
         )
     else:
@@ -8917,6 +9206,7 @@ def block_persisted_agent_scope_violation(
             revision,
             message,
             str(row["verify_result"] or ""),
+            reason=reason,
             preserved_agent_result_snapshot=preserved_snapshot,
         )
     return message
@@ -9118,7 +9408,10 @@ def validate_persisted_agent_scope(
         remainder = len(changed_keys) - 8
         if remainder > 0:
             displayed += f", 외 {remainder}개"
-        raise AgentScopeError(f"저장된 Agent Git config 변경 ({displayed})")
+        raise AgentScopeError(
+            f"저장된 Agent Git config 변경 ({displayed})",
+            reason_code=BlockReasonCode.SHARED_GIT_CONFIG_MUTATION,
+        )
     role_name = str(project["agent_role"] or "")
     if role_name not in {"planner", "maintenance_planner", "worker", "reviewer"}:
         raise AgentScopeError(
@@ -9130,7 +9423,9 @@ def validate_persisted_agent_scope(
     guidance_targets: tuple[str, ...] = ()
     allow_common_plans = False
     if role_name == "worker":
-        active_plan = active_execplan(connection, repo)
+        active_plan = active_execplan(connection, repo) or project_execplan(
+            connection, repo
+        )
         if active_plan is None:
             raise AgentScopeError("저장된 Worker ExecPlan 상태가 없습니다.")
         guidance_targets = _guidance_worker_targets(
@@ -9237,7 +9532,7 @@ def validate_persisted_agent_scope(
             raise AgentScopeError(
                 f"저장된 Manager Git checkpoint가 유효하지 않습니다: {error}"
             ) from error
-        if project["phase"] != "BLOCKED":
+        if project["phase"] != "PLAN_BLOCKED":
             validate_agent_scope(
                 role_name,
                 saved_worktree,
@@ -9252,7 +9547,7 @@ def validate_persisted_agent_scope(
                 base_branch=str(project["base_branch"]),
             )
         checkpoint_scope_before = checkpoint.snapshot
-        if project["phase"] == "BLOCKED" and selected_plan_path:
+        if project["phase"] == "PLAN_BLOCKED" and selected_plan_path:
             checkpoint_scope_before = _blocked_agent_local_baseline(
                 checkpoint.snapshot,
                 checkpoint.snapshot,
@@ -9268,13 +9563,13 @@ def validate_persisted_agent_scope(
                 refname.startswith("refs/remotes/origin/")
                 or refname.startswith("refs/tags/")
                 or (
-                    project["phase"] == "BLOCKED"
+                    project["phase"] == "PLAN_BLOCKED"
                     and refname == f"refs/heads/{project['base_branch']}"
                 )
             )
         )
         allowed_cleanup = checkpoint.cleanup_worktrees | manager_cleanup_worktrees
-        if project["phase"] == "BLOCKED":
+        if project["phase"] == "PLAN_BLOCKED":
             allowed_cleanup |= frozenset((str(_canonical_path(repo_path)),))
         try:
             validate_agent_scope(
@@ -9296,7 +9591,7 @@ def validate_persisted_agent_scope(
     scope_before = before
     allowed_ref_changes: frozenset[str] = frozenset()
     allowed_worktree_changes: frozenset[str] = frozenset()
-    if project["phase"] == "BLOCKED" and project["agent_result_snapshot"]:
+    if project["phase"] == "PLAN_BLOCKED" and project["agent_result_snapshot"]:
         try:
             blocked_result = GitSnapshot.deserialize(
                 str(project["agent_result_snapshot"])
@@ -10314,7 +10609,7 @@ def resume_interrupted_blocked_agent_recovery(
     recovery = _deserialize_blocked_agent_recovery(
         str(project["agent_recovery"])
     )
-    if project["phase"] != "BLOCKED":
+    if project["phase"] != "PLAN_BLOCKED":
         raise AgentScopeError(
             "BLOCKED Agent 복구 상태가 활성 BLOCKED 작업과 일치하지 않습니다."
         )
@@ -10336,7 +10631,7 @@ def resume_interrupted_blocked_agent_recovery(
     if _config_entries(config_context) != before.config:
         raise AgentScopeError("BLOCKED Agent 복구 전 Git config가 변경됐습니다.")
 
-    plan = active_execplan(connection, repo)
+    plan = project_execplan(connection, repo)
     if (
         plan is None
         or int(plan["workspace_owned"]) != WORKSPACE_OWNED
@@ -10419,6 +10714,7 @@ def _requeue_blocked_execplan(
                 """,
                 (REBASE_IN_PROGRESS_ERROR, repo),
             )
+            scoped_blocking.clear_plan_block(connection, repo, plan_id)
         return
     values = _clear_active_values()
     assignments = ", ".join(f"{name} = ?" for name in values)
@@ -10442,6 +10738,7 @@ def _requeue_blocked_execplan(
             """,
             (repo, plan_id),
         )
+        scoped_blocking.clear_plan_block(connection, repo, plan_id)
         connection.execute(
             f"UPDATE projects SET {assignments} WHERE repo = ?",
             (*values.values(), repo),
@@ -10455,8 +10752,12 @@ def resume_blocked_execplan_if_inputs_changed(
     base: str,
     state_dir: Path,
 ) -> bool:
-    plan = active_execplan(connection, repo)
-    if plan is None or plan["status"] != "BLOCKED" or not plan["blocked_fingerprint"]:
+    plan = _plan_block_selected_for_release(
+        connection,
+        repo,
+        require_fingerprint=True,
+    )
+    if plan is None:
         return False
     stored = str(plan["blocked_fingerprint"])
     worktree = Path(str(plan["worktree"]))
@@ -10762,6 +11063,438 @@ def complete_merged_worktree(
     return assessment
 
 
+def complete_merged_execplan_worktree(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    repo: str,
+    state_dir: Path,
+    plan: sqlite3.Row,
+    pr_url: str,
+    pr_head_oid: str | None,
+) -> CleanupAssessment:
+    """Complete exactly one merge-wait plan without hydrating another plan."""
+
+    _ensure_cleanup_pending_schema(connection)
+    branch = str(plan["branch"] or "")
+    worktree = Path(str(plan["worktree"] or ""))
+    workspace_owned = WORKSPACE_OWNED
+    if not (worktree.exists() or worktree.is_symlink()):
+        assessment = CleanupAssessment("missing")
+    elif int(plan["workspace_owned"]) != WORKSPACE_OWNED:
+        workspace_owned = WORKSPACE_UNOWNED
+        assessment = CleanupAssessment(
+            "unverifiable",
+            "Merge cleanup worktree의 Loop Manager 소유권이 확인되지 않았습니다: "
+            f"{worktree}",
+        )
+    else:
+        try:
+            validate_execplan_workspace_identity(
+                state_dir,
+                repo,
+                str(plan["plan_id"]),
+                branch,
+                worktree,
+            )
+            validate_managed_worktree(repo_path, worktree, branch)
+        except (RuntimeError, WorkspaceOwnershipError) as error:
+            workspace_owned = WORKSPACE_UNOWNED
+            assessment = CleanupAssessment(
+                "unverifiable",
+                f"Merge cleanup workspace 소유권 검증 실패: {error}",
+            )
+        else:
+            assessment = remove_cleanup_worktree(
+                repo_path,
+                worktree,
+                assess_cleanup(worktree, pr_head_oid),
+            )
+
+    with connection:
+        if assessment.status in {"safe", "missing"}:
+            connection.execute(
+                "DELETE FROM cleanup_pending WHERE repo = ? AND worktree = ?",
+                (repo, str(worktree)),
+            )
+        else:
+            _store_cleanup_pending(
+                connection,
+                repo,
+                worktree,
+                pr_url,
+                pr_head_oid,
+                assessment.reason or assessment.status,
+                workspace_owned=workspace_owned,
+            )
+        connection.execute(
+            "UPDATE exec_plans SET status = 'MERGED', last_error = NULL, "
+            "pr_conflict_recovery = 0, pr_conflict_head_oid = NULL, "
+            "pr_conflict_base_oid = NULL WHERE repo = ? AND plan_id = ?",
+            (repo, plan["plan_id"]),
+        )
+        scoped_blocking.clear_plan_block(connection, repo, str(plan["plan_id"]))
+        notifications.record_merged_plan(
+            connection, repo, str(plan["plan_id"]), str(plan["title"])
+        )
+        mirrored = connection.execute(
+            "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
+        ).fetchone()
+        if mirrored and mirrored["plan_path"] == plan["path"]:
+            _clear_active_in_current_transaction(connection, repo)
+        unfinished = connection.execute(
+            "SELECT 1 FROM exec_plans WHERE repo = ? AND status != 'MERGED' LIMIT 1",
+            (repo,),
+        ).fetchone()
+        if unfinished is None:
+            connection.execute(
+                "UPDATE projects SET processed_sha = NULL, planning_fingerprint = NULL "
+                "WHERE repo = ?",
+                (repo,),
+            )
+        if assessment.status == "unverifiable":
+            scoped_blocking.record_project_block(
+                connection,
+                repo,
+                BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN,
+                str(assessment.reason or assessment.status),
+                None,
+                plan_id=str(plan["plan_id"]),
+                previous_phase=None,
+            )
+        notifications.enqueue_current_project_events(connection, repo)
+    return assessment
+
+
+@dataclass(frozen=True)
+class PullRequestSyncResult:
+    step_result: int | None = None
+    conflict_started: bool = False
+    merged: bool = False
+
+
+def synchronize_waiting_pull_requests(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    state_dir: Path,
+    repo: str,
+) -> PullRequestSyncResult:
+    """Synchronize every merge-wait row, then select at most one conflict."""
+
+    rows = connection.execute(
+        "SELECT * FROM exec_plans WHERE repo = ? AND "
+        "(status = 'PR_OPEN' OR (status = 'PLAN_BLOCKED' AND blocked_reason = ?)) "
+        "ORDER BY plan_id",
+        (repo, PR_CLOSED_BLOCK_REASON),
+    ).fetchall()
+    project_blocked_at_start = (
+        scoped_blocking.project_block(connection, repo) is not None
+    )
+    conflicts: list[tuple[sqlite3.Row, Mapping[str, object]]] = []
+    fetched_after_merge = False
+    merged = False
+    for stored in rows:
+        branch = str(stored["branch"] or "")
+        if not branch:
+            continue
+        pull_request = pr_for_branch(
+            repo_path,
+            branch,
+            str(stored["pr_url"] or "") or None,
+        )
+        if pull_request is None:
+            continue
+        url = str(pull_request.get("url") or stored["pr_url"] or "")
+        head_value = pull_request.get("headRefOid")
+        head_oid = str(head_value) if head_value else stored["pr_head_oid"]
+        state = str(pull_request.get("state") or "OPEN").upper()
+        if state == "MERGED" or pull_request.get("mergedAt"):
+            if project_blocked_at_start:
+                continue
+            if not fetched_after_merge:
+                git(repo_path, "fetch", "origin")
+                fetched_after_merge = True
+            assessment = complete_merged_execplan_worktree(
+                connection,
+                repo_path,
+                repo,
+                state_dir,
+                stored,
+                url,
+                str(head_oid) if head_oid else None,
+            )
+            merged = True
+            if assessment.status in {"safe", "missing"}:
+                operation_print(f"Merge 확인 및 worktree 정리 완료: {url}")
+            else:
+                operation_print(
+                    f"Merge 확인 완료; worktree 보존: {stored['worktree']} "
+                    f"({assessment.reason or assessment.status})",
+                    file=sys.stderr,
+                )
+            continue
+        if state == "CLOSED":
+            if stored["status"] == "PR_OPEN":
+                _block_closed_pull_request(connection, repo, stored, url, head_oid)
+            continue
+        if state != "OPEN":
+            raise RuntimeError(f"지원하지 않는 GitHub PR 상태입니다: {state}")
+        if (
+            stored["status"] == "PLAN_BLOCKED"
+            and stored["blocked_reason"] == PR_CLOSED_BLOCK_REASON
+        ):
+            expected_head = str(stored["pr_head_oid"] or "")
+            if expected_head and head_oid and str(head_oid) != expected_head:
+                error = (
+                    "다시 열린 PR head OID가 저장된 관리 head와 다릅니다: "
+                    f"expected {expected_head}, actual {head_oid}"
+                )
+                with connection:
+                    scoped_blocking.record_project_block(
+                        connection,
+                        repo,
+                        BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
+                        error,
+                        expected_head,
+                        plan_id=str(stored["plan_id"]),
+                        previous_phase=None,
+                    )
+                    notifications.enqueue_current_project_events(connection, repo)
+                continue
+            _resume_reopened_pull_request(
+                connection,
+                repo,
+                stored,
+                url,
+                head_oid,
+                recovery=False,
+            )
+            continue
+        with connection:
+            connection.execute(
+                "UPDATE exec_plans SET pr_url = ?, pr_head_oid = ? "
+                "WHERE repo = ? AND plan_id = ?",
+                (url, head_oid, repo, stored["plan_id"]),
+            )
+            notifications.enqueue_current_project_events(connection, repo)
+        if classify_pull_request_mergeability(pull_request) == "conflicting":
+            conflicts.append((stored, pull_request))
+
+    if active_execplan(connection, repo) is not None:
+        return PullRequestSyncResult(merged=merged)
+    if scoped_blocking.project_block(connection, repo) is not None:
+        return PullRequestSyncResult(merged=merged)
+    statuses = {
+        str(row["plan_id"]): str(row["status"])
+        for row in connection.execute(
+            "SELECT plan_id, status FROM exec_plans WHERE repo = ?", (repo,)
+        )
+    }
+    eligible = [
+        item
+        for item in conflicts
+        if all(
+            statuses.get(str(dependency)) == "MERGED"
+            for dependency in json.loads(str(item[0]["depends_on"]))
+        )
+    ]
+    if not eligible:
+        return PullRequestSyncResult(merged=merged)
+    plan, pull_request = min(
+        eligible,
+        key=lambda item: (
+            PRIORITY_ORDER[str(item[0]["priority"])],
+            int(str(item[0]["plan_id"])[2:]),
+        ),
+    )
+    hydrate_execplan_project(connection, repo, plan)
+    project = connection.execute(
+        "SELECT * FROM projects WHERE repo = ?", (repo,)
+    ).fetchone()
+    assert project is not None
+    result = reconcile_existing_pull_request(
+        connection,
+        repo_path,
+        state_dir,
+        repo,
+        project,
+        pull_request,
+    )
+    return PullRequestSyncResult(result, result is None, merged)
+
+
+def resume_project_block_if_safe(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    state_dir: Path,
+    repo: str,
+) -> bool:
+    """Release only a project block whose original safety boundary is restored."""
+
+    block = scoped_blocking.project_block(connection, repo)
+    if block is None:
+        return False
+    if block["reason_code"] in {
+        BlockReasonCode.LEGACY_UNSCOPED_BLOCK.value,
+        BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value,
+    }:
+        return False
+    plan_id = str(block["plan_id"] or "")
+    project = connection.execute(
+        "SELECT * FROM projects WHERE repo = ?", (repo,)
+    ).fetchone()
+    if project is None:
+        return False
+    if not plan_id:
+        try:
+            if block["reason_code"] == BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value:
+                worktree = Path(str(project["worktree"] or ""))
+                fingerprint = str(project["planning_attempt_fingerprint"] or "")
+                if not fingerprint:
+                    return False
+                validate_planning_worktree_ownership(
+                    connection,
+                    repo_path,
+                    state_dir,
+                    repo,
+                    fingerprint,
+                    worktree,
+                )
+            elif project["agent_snapshot"]:
+                before = GitSnapshot.deserialize(str(project["agent_snapshot"]))
+                worktree = Path(str(project["worktree"] or repo_path))
+                after = capture_git_snapshot(worktree)
+                validate_agent_scope(
+                    str(project["agent_role"] or "planner"),
+                    worktree,
+                    before,
+                    after,
+                    external_worktree=repo_path,
+                    base_branch=str(project["base_branch"]),
+                )
+            else:
+                return False
+        except (AgentScopeError, RuntimeError, WorkspaceOwnershipError, ValueError):
+            return False
+        with connection:
+            scoped_blocking.clear_project_block(connection, repo)
+        return True
+    plan = connection.execute(
+        "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+        (repo, plan_id),
+    ).fetchone()
+    if plan is None:
+        return False
+    if (
+        block["reason_code"]
+        == BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value
+        and int(plan["workspace_owned"])
+        in {WORKSPACE_UNOWNED, WORKSPACE_RESERVED}
+    ):
+        worktree = Path(str(plan["worktree"] or ""))
+        branch = str(plan["branch"] or "")
+        try:
+            validate_execplan_workspace_identity(
+                state_dir, repo, plan_id, branch, worktree
+            )
+        except WorkspaceOwnershipError:
+            return False
+        branch_state = git(
+            repo_path,
+            "show-ref",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{branch}",
+            check=False,
+        )
+        if (
+            worktree.exists()
+            or worktree.is_symlink()
+            or branch_state.returncode != 1
+        ):
+            return False
+        status = str(plan["status"])
+        with connection:
+            scoped_blocking.clear_project_block(connection, repo)
+        if status in ACTIVE_EXECPLAN_STATUSES:
+            _requeue_blocked_execplan(connection, repo, plan_id)
+        else:
+            with connection:
+                _clear_active_in_current_transaction(connection, repo)
+        return True
+    if int(plan["workspace_owned"]) != WORKSPACE_OWNED:
+        return False
+    worktree = Path(str(plan["worktree"] or ""))
+    branch = str(plan["branch"] or "")
+    try:
+        validate_execplan_workspace_identity(
+            state_dir, repo, plan_id, branch, worktree
+        )
+        validate_managed_worktree(
+            repo_path,
+            worktree,
+            branch,
+            allow_rebase=_rebase_in_progress_for_branch(worktree, branch),
+        )
+        if plan["agent_snapshot"]:
+            before = GitSnapshot.deserialize(str(plan["agent_snapshot"]))
+            after = capture_git_snapshot(worktree)
+            role_name = str(plan["agent_role"] or "worker")
+            validate_agent_scope(
+                role_name,
+                worktree,
+                before,
+                after,
+                selected_plan_path=(
+                    str(plan["path"]) if role_name == "worker" else None
+                ),
+                external_worktree=repo_path,
+                base_branch=str(project["base_branch"]),
+            )
+    except (AgentScopeError, RuntimeError, WorkspaceOwnershipError, ValueError):
+        return False
+    with connection:
+        scoped_blocking.clear_project_block(connection, repo)
+        if str(plan["status"]) in ACTIVE_EXECPLAN_STATUSES:
+            hydrate_execplan_project(connection, repo, plan)
+        else:
+            _clear_active_in_current_transaction(connection, repo)
+    return True
+
+
+def resume_plan_blocks(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    state_dir: Path,
+    repo: str,
+    base: str,
+) -> bool:
+    """Reevaluate each plan block without letting one overwrite another."""
+
+    if active_execplan(connection, repo) is not None:
+        return False
+    for blocked in plan_blocked_execplans(connection, repo):
+        if blocked["blocked_reason"] == PR_CLOSED_BLOCK_REASON:
+            continue
+        hydrate_execplan_project(connection, repo, blocked)
+        resume = (
+            resume_guidance_approval_if_decided
+            if blocked["blocked_reason"] == GUIDANCE_BLOCK_REASON
+            else resume_blocked_execplan_if_inputs_changed
+        )
+        resumed = resume(connection, repo_path, repo, base, state_dir)
+        refreshed = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+            (repo, blocked["plan_id"]),
+        ).fetchone()
+        if resumed and refreshed and refreshed["status"] in ACTIVE_EXECPLAN_STATUSES:
+            hydrate_execplan_project(connection, repo, refreshed)
+            return True
+        if active_execplan(connection, repo) is None:
+            with connection:
+                _clear_active_in_current_transaction(connection, repo)
+    return False
+
+
 def _block_closed_pull_request(
     connection: sqlite3.Connection,
     repo: str,
@@ -10772,30 +11505,23 @@ def _block_closed_pull_request(
     error = "PR이 Merge 없이 닫혔습니다."
     with connection:
         connection.execute(
-            """
-            UPDATE exec_plans
-            SET status = 'BLOCKED', blocked_reason = ?,
-                pr_url = ?, pr_head_oid = ?, last_error = ?
-            WHERE repo = ? AND plan_id = ?
-            """,
-            (
-                PR_CLOSED_BLOCK_REASON,
-                url,
-                head_oid,
-                error,
-                repo,
-                plan["plan_id"],
-            ),
+            "UPDATE exec_plans SET pr_url = ?, pr_head_oid = ?, last_error = ? "
+            "WHERE repo = ? AND plan_id = ?",
+            (url, head_oid, error, repo, plan["plan_id"]),
         )
-        connection.execute(
-            """
-            UPDATE projects
-            SET phase = 'BLOCKED', pr_url = ?, pr_head_oid = ?,
-                last_error = ?
-            WHERE repo = ?
-            """,
-            (url, head_oid, error, repo),
+        scoped_blocking.record_plan_block(
+            connection,
+            repo,
+            str(plan["plan_id"]),
+            BlockReasonCode.PULL_REQUEST_CLOSED,
+            error,
+            str(head_oid or "") or None,
         )
+        mirrored = connection.execute(
+            "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
+        ).fetchone()
+        if mirrored and mirrored["plan_path"] == plan["path"]:
+            _clear_active_in_current_transaction(connection, repo)
         notifications.enqueue_current_project_events(connection, repo)
 
 
@@ -10846,10 +11572,20 @@ def _resume_reopened_pull_request(
             "WHERE repo = ? AND plan_id = ?",
             (*execplan_values.values(), repo, plan["plan_id"]),
         )
-        connection.execute(
-            f"UPDATE projects SET {project_assignments} WHERE repo = ?",
-            (*project_values.values(), repo),
+        scoped_blocking.clear_plan_block(
+            connection, repo, str(plan["plan_id"])
         )
+        mirrored = connection.execute(
+            "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
+        ).fetchone()
+        if mirrored and mirrored["plan_path"] == plan["path"]:
+            if recovery:
+                connection.execute(
+                    f"UPDATE projects SET {project_assignments} WHERE repo = ?",
+                    (*project_values.values(), repo),
+                )
+            else:
+                _clear_active_in_current_transaction(connection, repo)
         notifications.enqueue_current_project_events(connection, repo)
 
 def reconcile_existing_pull_request(
@@ -10874,11 +11610,9 @@ def reconcile_existing_pull_request(
     head_value = pull_request.get("headRefOid")
     head_oid = str(head_value) if head_value else project["pr_head_oid"]
     state = str(pull_request.get("state") or "OPEN").upper()
-    blocked_plan = (
-        active_execplan(connection, repo)
-        if project["phase"] == "BLOCKED"
-        else None
-    )
+    blocked_plan = project_execplan(connection, repo)
+    if blocked_plan is not None and blocked_plan["status"] != "PLAN_BLOCKED":
+        blocked_plan = None
     reopening_closed_pr = bool(
         state == "OPEN"
         and blocked_plan is not None
@@ -10886,12 +11620,12 @@ def reconcile_existing_pull_request(
     )
     recovering_preflight_block = bool(
         state == "OPEN"
-        and project["phase"] == "BLOCKED"
+        and project["phase"] == "PLAN_BLOCKED"
         and _is_pr_conflict_preflight_block(project, blocked_plan)
     )
     if (
         state in {"OPEN", "CLOSED"}
-        and project["phase"] == "BLOCKED"
+        and project["phase"] == "PLAN_BLOCKED"
         and blocked_plan is not None
         and blocked_plan["blocked_reason"] != PR_CLOSED_BLOCK_REASON
         and not recovering_preflight_block
@@ -10927,7 +11661,7 @@ def reconcile_existing_pull_request(
                     repo,
                     project,
                     pull_request,
-                    expected_status="BLOCKED",
+                    expected_status="PLAN_BLOCKED",
                 )
             except (
                 PublicationSafetyError,
@@ -10969,14 +11703,25 @@ def reconcile_existing_pull_request(
                         f"기존 PR 충돌 복구 push 확인 완료: {url}"
                     )
                     return 0
-                _validate_active_pr_conflict_recovery(
-                    connection,
-                    repo_path,
-                    state_dir,
-                    repo,
-                    project,
-                    pull_request,
-                )
+                if reopening_closed_pr:
+                    _validate_pr_conflict_recovery_ownership(
+                        connection,
+                        repo_path,
+                        state_dir,
+                        repo,
+                        project,
+                        pull_request,
+                        expected_status="PLAN_BLOCKED",
+                    )
+                else:
+                    _validate_active_pr_conflict_recovery(
+                        connection,
+                        repo_path,
+                        state_dir,
+                        repo,
+                        project,
+                        pull_request,
+                    )
             except (
                 PublicationSafetyError,
                 WorkspaceOwnershipError,
@@ -10989,10 +11734,11 @@ def reconcile_existing_pull_request(
                     f"refs/remotes/origin/{project['base_branch']}",
                     recovery_error,
                     str(project["verify_result"] or ""),
+                    reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
                 )
                 operation_print(recovery_error, file=sys.stderr)
                 return 1
-            if project["phase"] in {"PR_OPEN", "BLOCKED"}:
+            if project["phase"] in {"PR_OPEN", "PLAN_BLOCKED"}:
                 if reopening_closed_pr:
                     assert blocked_plan is not None
                     _resume_reopened_pull_request(
@@ -11035,6 +11781,7 @@ def reconcile_existing_pull_request(
                     f"refs/remotes/origin/{project['base_branch']}",
                     recovery_error,
                     str(project["verify_result"] or ""),
+                    reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
                     blocked_reason=PR_CONFLICT_PREFLIGHT_BLOCK_REASON,
                 )
                 operation_print(recovery_error, file=sys.stderr)
@@ -11071,6 +11818,11 @@ def reconcile_existing_pull_request(
                 WorkspaceOwnershipError,
             ) as error:
                 recovery_error = f"PR_OPEN 충돌 복구 소유권 검증 실패: {error}"
+                reason = (
+                    BlockReasonCode.MANAGED_WORKTREE_CONFLICT
+                    if isinstance(error, ManagedWorktreeConflictError)
+                    else BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN
+                )
                 block_active_execplan_from_revision(
                     connection,
                     repo_path,
@@ -11078,6 +11830,7 @@ def reconcile_existing_pull_request(
                     f"refs/remotes/origin/{project['base_branch']}",
                     recovery_error,
                     str(project["verify_result"] or ""),
+                    reason=reason,
                     blocked_reason=PR_CONFLICT_PREFLIGHT_BLOCK_REASON,
                 )
                 operation_print(recovery_error, file=sys.stderr)
@@ -11104,7 +11857,7 @@ def reconcile_existing_pull_request(
                 raise WorkspaceOwnershipError(
                     "PR_OPEN ExecPlan ID를 확인할 수 없습니다."
                 )
-            plan = active_execplan(connection, repo)
+            plan = project_execplan(connection, repo)
             if (
                 plan is None
                 or plan["plan_id"] != plan_id
@@ -11139,6 +11892,7 @@ def reconcile_existing_pull_request(
                 repo,
                 f"refs/remotes/origin/{project['base_branch']}",
                 workspace_error,
+                reason=BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN,
             )
             operation_print(workspace_error, file=sys.stderr)
             return 1
@@ -11161,6 +11915,7 @@ def reconcile_existing_pull_request(
                 pr_head_oid=head_oid,
                 last_error=None,
             )
+            clear_active(connection, repo)
         operation_print(f"Merge 대기 중: {url}")
         return 0
 
@@ -11175,14 +11930,17 @@ def reconcile_existing_pull_request(
             if persisted and persisted["pr_head_oid"]
             else None
         )
-        worktree = Path(str(project["worktree"] or ""))
+        plan = project_execplan(connection, repo)
+        if plan is None:
+            raise RuntimeError("병합된 PR과 연결된 ExecPlan을 찾을 수 없습니다.")
+        worktree = Path(str(plan["worktree"] or ""))
         try:
-            assessment = complete_merged_worktree(
+            assessment = complete_merged_execplan_worktree(
                 connection,
                 repo_path,
                 repo,
                 state_dir,
-                worktree,
+                plan,
                 url,
                 stored_head_oid,
             )
@@ -11196,6 +11954,7 @@ def reconcile_existing_pull_request(
                 repo,
                 f"refs/remotes/origin/{project['base_branch']}",
                 workspace_error,
+                reason=BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN,
             )
             operation_print(workspace_error, file=sys.stderr)
             return 1
@@ -11210,7 +11969,7 @@ def reconcile_existing_pull_request(
         return PROJECT_STEP_PLANNING_PENDING
 
     if state == "CLOSED":
-        plan = active_execplan(connection, repo)
+        plan = project_execplan(connection, repo)
         if plan is None:
             raise RuntimeError("닫힌 PR과 연결된 활성 ExecPlan을 찾을 수 없습니다.")
         _block_closed_pull_request(connection, repo, plan, url, head_oid)
@@ -11253,6 +12012,7 @@ def resume_pr_conflict_rebase(
             worktree,
             error,
             str(project["verify_result"] or ""),
+            reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
         )
         operation_print(error, file=sys.stderr)
         return 1
@@ -11302,6 +12062,7 @@ def resume_pr_conflict_rebase(
             worktree,
             error,
             str(project["verify_result"] or ""),
+            reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE,
         )
         operation_print(error, file=sys.stderr)
         return 1
@@ -11335,6 +12096,7 @@ def resume_pr_conflict_rebase(
         worktree,
         error,
         str(project["verify_result"] or ""),
+        reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
     )
     operation_print(error, file=sys.stderr)
     return 1
@@ -12250,8 +13012,9 @@ def _run_project_step(
     # snapshot must be checked before normal repository validation reads it.
     repo_path = Path(repo_arg).expanduser().resolve()
     repo = str(repo_path)
-    project_registry.ensure_registry_schema(connection)
-    _ensure_execplans_schema(connection)
+    if not registered_only:
+        project_registry.ensure_registry_schema(connection)
+        _ensure_execplans_schema(connection)
     row = connection.execute(
         "SELECT * FROM projects WHERE repo = ?",
         (repo,),
@@ -12272,6 +13035,20 @@ def _run_project_step(
             f"등록된 provider는 {provider}이며 {requested_provider}로 변경할 수 없습니다."
         )
     _ensure_cleanup_pending_schema(connection)
+    if row is not None and scoped_blocking.project_block(connection, repo) is not None:
+        synchronize_waiting_pull_requests(connection, repo_path, state_dir, repo)
+        resume_project_block_if_safe(connection, repo_path, state_dir, repo)
+        project_block = scoped_blocking.project_block(connection, repo)
+        if project_block is not None:
+            operation_print(
+                "프로젝트 안전 차단 상태입니다: "
+                + str(project_block["evidence"]),
+                file=sys.stderr,
+            )
+            return 1
+        row = connection.execute(
+            "SELECT * FROM projects WHERE repo = ?", (repo,)
+        ).fetchone()
     cleanup_candidates = frozenset(
         str(_canonical_path(Path(item["worktree"])))
         for item in connection.execute(
@@ -12324,12 +13101,15 @@ def _run_project_step(
         except AgentScopeError as error:
             detail = str(error)
             scope_result_snapshot = error.result_snapshot
+            scope_reason = error.reason_code
         except RuntimeError:
             detail = "저장된 Agent Git 상태를 안전하게 읽을 수 없습니다."
             scope_result_snapshot = None
+            scope_reason = BlockReasonCode.REPOSITORY_STATE_UNSAFE
         else:
             detail = None
             scope_result_snapshot = None
+            scope_reason = BlockReasonCode.MANAGED_WORKTREE_SCOPE_VIOLATION
         if detail is not None:
             message = block_persisted_agent_scope_violation(
                 connection,
@@ -12338,6 +13118,7 @@ def _run_project_step(
                 row,
                 detail,
                 result_snapshot=scope_result_snapshot,
+                reason=scope_reason,
             )
             operation_print(message, file=sys.stderr)
             return 1
@@ -12420,10 +13201,19 @@ def _run_project_step(
         connection,
         reconcile_history=True,
         target_repo=repo,
+        ensure_schema=not registered_only,
     )
     row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
     if row:
         hydrate_active_project(connection, repo)
+        if (
+            active_execplan(connection, repo) is None
+            and row["phase"] in {"PR_OPEN", "PLAN_BLOCKED", "BLOCKED"}
+            and scoped_blocking.project_block(connection, repo) is None
+            and validated_agent_scope is None
+        ):
+            with connection:
+                _clear_active_in_current_transaction(connection, repo)
         row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
     _ensure_cleanup_pending_schema(connection)
     cleanup_candidates = frozenset(
@@ -12447,6 +13237,60 @@ def _run_project_step(
             f"보존된 worktree: {pending['worktree']} ({pending['reason']})",
             file=sys.stderr,
         )
+
+    pr_sync = synchronize_waiting_pull_requests(
+        connection, repo_path, state_dir, repo
+    )
+    row = connection.execute(
+        "SELECT * FROM projects WHERE repo = ?", (repo,)
+    ).fetchone()
+    project_block = scoped_blocking.project_block(connection, repo)
+    if project_block is not None:
+        resume_project_block_if_safe(
+            connection, repo_path, state_dir, repo
+        )
+        project_block = scoped_blocking.project_block(connection, repo)
+    if project_block is not None:
+        operation_print(
+            "프로젝트 안전 차단 상태입니다: "
+            + str(project_block["evidence"]),
+            file=sys.stderr,
+        )
+        return 1
+    if pr_sync.step_result not in {None, 0}:
+        return pr_sync.step_result
+    if pr_sync.merged and not catalog_schedule_decision(connection, repo).has_ready:
+        return 0
+    if validated_agent_scope is not None:
+        try:
+            validated_agent_scope = refresh_persisted_agent_scope_after_manager_git(
+                connection,
+                repo,
+                validated_agent_scope,
+                manager_worktree_changes,
+            )
+        except (AgentScopeError, RuntimeError) as error:
+            row = connection.execute(
+                "SELECT * FROM projects WHERE repo = ?", (repo,)
+            ).fetchone()
+            message = block_persisted_agent_scope_violation(
+                connection,
+                repo_path,
+                repo,
+                row,
+                str(error),
+                reason=getattr(
+                    error,
+                    "reason_code",
+                    BlockReasonCode.REPOSITORY_STATE_UNSAFE,
+                ),
+            )
+            operation_print(message, file=sys.stderr)
+            return 1
+    resume_plan_blocks(connection, repo_path, state_dir, repo, base)
+    row = connection.execute(
+        "SELECT * FROM projects WHERE repo = ?", (repo,)
+    ).fetchone()
 
     if row and row["branch"]:
         existing_pr = pr_for_branch(repo_path, row["branch"], row["pr_url"])
@@ -12474,59 +13318,10 @@ def _run_project_step(
                     f"refs/remotes/origin/{row['base_branch']}",
                     publication_error,
                     str(row["verify_result"] or ""),
+                    reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
                 )
                 operation_print(publication_error, file=sys.stderr)
                 return 1
-
-    if row and row["phase"] == "BLOCKED":
-        blocked_plan = active_execplan(connection, repo)
-        resume_blocked = (
-            resume_guidance_approval_if_decided
-            if blocked_plan and blocked_plan["blocked_reason"] == GUIDANCE_BLOCK_REASON
-            else resume_blocked_execplan_if_inputs_changed
-        )
-        if resume_blocked(
-            connection,
-            repo_path,
-            repo,
-            str(row["base_branch"]),
-            state_dir,
-        ):
-            validated_agent_scope = None
-            row = connection.execute(
-                "SELECT * FROM projects WHERE repo = ?", (repo,)
-            ).fetchone()
-        else:
-            row = connection.execute(
-                "SELECT * FROM projects WHERE repo = ?", (repo,)
-            ).fetchone()
-            operation_print(
-                f"작업이 차단되어 있습니다: {row['last_error'] or '사용자 조치가 필요합니다.'}",
-                file=sys.stderr,
-            )
-            return 1
-
-    if validated_agent_scope is not None:
-        try:
-            validated_agent_scope = refresh_persisted_agent_scope_after_manager_git(
-                connection,
-                repo,
-                validated_agent_scope,
-                manager_worktree_changes,
-            )
-        except (AgentScopeError, RuntimeError) as error:
-            row = connection.execute(
-                "SELECT * FROM projects WHERE repo = ?", (repo,)
-            ).fetchone()
-            message = block_persisted_agent_scope_violation(
-                connection,
-                repo_path,
-                repo,
-                row,
-                str(error),
-            )
-            operation_print(message, file=sys.stderr)
-            return 1
 
     ready_activated_before_planning = False
     general_fingerprint: str | None = None
@@ -12538,7 +13333,10 @@ def _run_project_step(
         )
         connection.commit()
         migrate_legacy_execplans(
-            connection, reconcile_history=True, target_repo=repo
+            connection,
+            reconcile_history=True,
+            target_repo=repo,
+            ensure_schema=not registered_only,
         )
         row = connection.execute(
             "SELECT * FROM projects WHERE repo = ?", (repo,)
@@ -12651,6 +13449,7 @@ def _run_project_step(
         if (
             registered_only
             and maintenance_cycle.phase is maintenance_state.MaintenancePhase.IDLE
+            and not catalog_decision.has_waiting
         ):
             due = maintenance_repository.due(repo, refactoring_review_interval)
             if due.required:
@@ -12670,6 +13469,17 @@ def _run_project_step(
                         include_general_planning=include_general,
                     )
                 )
+        if (
+            catalog_decision.has_waiting
+            and maintenance_cycle.phase in {
+                maintenance_state.MaintenancePhase.ASSESSMENT,
+                maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+            }
+        ):
+            operation_print(
+                "PLAN_BLOCKED 또는 PR_OPEN 종료 전 유지보수 평가를 보류합니다."
+            )
+            return 0
         if maintenance_cycle.phase in {
             maintenance_state.MaintenancePhase.ASSESSMENT,
             maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
@@ -12717,6 +13527,11 @@ def _run_project_step(
                     "SELECT * FROM projects WHERE repo = ?", (repo,)
                 ).fetchone()
                 ready_activated_before_planning = True
+            elif catalog_decision.has_waiting:
+                operation_print(
+                    "독립 READY가 없어 PLAN_BLOCKED 또는 PR_OPEN 종료를 기다립니다."
+                )
+                return 0
 
     if (
         maintenance_planning
@@ -13646,6 +14461,11 @@ def _run_project_step(
             f"refs/remotes/origin/{base}^{{commit}}",
         ).stdout.strip()
         catalog_decision = catalog_schedule_decision(connection, repo)
+        if not catalog_decision.has_ready and catalog_decision.has_waiting:
+            operation_print(
+                "독립 READY가 없어 PLAN_BLOCKED 또는 PR_OPEN 종료를 기다립니다."
+            )
+            return 0
         if not catalog_decision.has_ready:
             latest_selection_fingerprint = _planning_input_fingerprint(
                 repo_path, latest_selection_sha
@@ -13739,6 +14559,7 @@ def _run_project_step(
             f"refs/remotes/origin/{base}",
             workspace_error,
             str(row["verify_result"] or ""),
+            reason=BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN,
         )
         operation_print(workspace_error, file=sys.stderr)
         return 1
@@ -13794,6 +14615,7 @@ def _run_project_step(
             worktree,
             metadata_error,
             str(row["verify_result"] or ""),
+            reason=BlockReasonCode.PLAN_INPUT_INVALID,
         )
         operation_print(metadata_error, file=sys.stderr)
         return 1
@@ -13807,6 +14629,7 @@ def _run_project_step(
             worktree,
             archive_error,
             str(row["verify_result"] or ""),
+            reason=BlockReasonCode.PLAN_INPUT_INVALID,
         )
         operation_print(archive_error, file=sys.stderr)
         return 1
@@ -13842,6 +14665,7 @@ def _run_project_step(
                 worktree,
                 archive_error,
                 str(row["verify_result"] or ""),
+                reason=BlockReasonCode.PLAN_INPUT_INVALID,
             )
             operation_print(archive_error, file=sys.stderr)
             return 1
@@ -13943,12 +14767,23 @@ def _run_project_step(
                 worktree,
                 scope_error,
                 str(row["verify_result"] or ""),
+                reason=getattr(
+                    error,
+                    "reason_code",
+                    BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN,
+                ),
             )
             operation_print(scope_error, file=sys.stderr)
             return 1
         if guidance_blocked:
-            blocked = active_execplan(connection, repo)
-            operation_print(str(blocked["last_error"]), file=sys.stderr)
+            blocked = connection.execute(
+                "SELECT last_error FROM exec_plans WHERE repo = ? AND plan_id = ?",
+                (repo, catalog_plan["plan_id"]),
+            ).fetchone()
+            operation_print(
+                str(blocked["last_error"] if blocked else "guidance 승인 대기"),
+                file=sys.stderr,
+            )
             return 1
         clear_agent_scope(connection, repo)
 
@@ -13969,6 +14804,7 @@ def _run_project_step(
                     worktree,
                     worker_error,
                     str(row["verify_result"] or ""),
+                    reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
                 )
                 operation_print(worker_error, file=sys.stderr)
                 return 1
@@ -14015,6 +14851,7 @@ def _run_project_step(
                     worktree,
                     staging_error,
                     str(row["verify_result"] or ""),
+                    reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE,
                 )
                 operation_print(staging_error, file=sys.stderr)
                 return 1
@@ -14045,6 +14882,7 @@ def _run_project_step(
                         worktree,
                         continuation_error,
                         str(row["verify_result"] or ""),
+                        reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
                     )
                 else:
                     update_project(
@@ -14066,6 +14904,7 @@ def _run_project_step(
                     worktree,
                     no_change_error,
                     str(row["verify_result"] or ""),
+                    reason=BlockReasonCode.PLAN_INPUT_INVALID,
                 )
                 operation_print(no_change_error, file=sys.stderr)
                 return 1
@@ -14107,6 +14946,7 @@ def _run_project_step(
                     worktree,
                     archive_error,
                     str(row["verify_result"] or ""),
+                    reason=BlockReasonCode.PLAN_INPUT_INVALID,
                 )
                 operation_print(archive_error, file=sys.stderr)
                 return 1
@@ -14180,6 +15020,11 @@ def _run_project_step(
                 worktree,
                 scope_error,
                 output,
+                reason=getattr(
+                    error,
+                    "reason_code",
+                    BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN,
+                ),
             )
             operation_print(scope_error, file=sys.stderr)
             return 1
@@ -14213,6 +15058,7 @@ def _run_project_step(
                 worktree,
                 no_change_error,
                 output,
+                reason=BlockReasonCode.PLAN_INPUT_INVALID,
             )
             operation_print(no_change_error, file=sys.stderr)
             return 1
@@ -14265,6 +15111,7 @@ def _run_project_step(
                         worktree,
                         rebase_failure,
                         output,
+                        reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
                     )
                 operation_print(rebased.stdout, file=sys.stderr)
                 return 1
@@ -14305,6 +15152,11 @@ def _run_project_step(
                     worktree,
                     scope_error,
                     output,
+                    reason=getattr(
+                        error,
+                        "reason_code",
+                        BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN,
+                    ),
                 )
                 operation_print(scope_error, file=sys.stderr)
                 return 1
@@ -14359,6 +15211,7 @@ def _run_project_step(
                 worktree,
                 metadata_error,
                 output,
+                reason=BlockReasonCode.PLAN_INPUT_INVALID,
             )
             operation_print(metadata_error, file=sys.stderr)
             return 1
@@ -14374,6 +15227,7 @@ def _run_project_step(
                 worktree,
                 no_change_error,
                 output,
+                reason=BlockReasonCode.PLAN_INPUT_INVALID,
             )
             operation_print(no_change_error, file=sys.stderr)
             return 1
@@ -14455,6 +15309,11 @@ def _run_project_step(
                     worktree,
                     scope_error,
                     str(row["verify_result"] or ""),
+                    reason=getattr(
+                        error,
+                        "reason_code",
+                        BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN,
+                    ),
                 )
                 operation_print(scope_error, file=sys.stderr)
                 return 1
@@ -14503,6 +15362,7 @@ def _run_project_step(
                         worktree,
                         exhausted_error,
                         str(row["verify_result"] or ""),
+                        reason=BlockReasonCode.REVIEW_PROTOCOL_EXHAUSTED,
                     )
                     operation_print(exhausted_error, file=sys.stderr)
                     return 1
@@ -14564,6 +15424,7 @@ def _run_project_step(
                     worktree,
                     publication_error,
                     str(row["verify_result"] or ""),
+                    reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
                 )
                 operation_print(publication_error, file=sys.stderr)
                 return 1
@@ -14596,6 +15457,7 @@ def _run_project_step(
                 worktree,
                 publication_error,
                 str(row["verify_result"] or ""),
+                reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
             )
             operation_print(publication_error, file=sys.stderr)
             return 1
@@ -14644,6 +15506,7 @@ def _run_project_step(
                             worktree,
                             rebase_failure,
                             str(row["verify_result"] or ""),
+                            reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
                         )
                     operation_print(rebase_failure, file=sys.stderr)
                     return 1
@@ -14665,6 +15528,7 @@ def _run_project_step(
                         worktree,
                         no_change_error,
                         str(row["verify_result"] or ""),
+                        reason=BlockReasonCode.PLAN_INPUT_INVALID,
                     )
                     operation_print(no_change_error, file=sys.stderr)
                     return 1
@@ -14704,6 +15568,7 @@ def _run_project_step(
                 worktree,
                 publication_error,
                 str(row["verify_result"] or ""),
+                reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE,
             )
             operation_print(publication_error, file=sys.stderr)
             return 1
@@ -14730,6 +15595,7 @@ def _run_project_step(
                     worktree,
                     archive_error,
                     str(row["verify_result"] or ""),
+                    reason=BlockReasonCode.PLAN_INPUT_INVALID,
                 )
                 operation_print(archive_error, file=sys.stderr)
                 return 1
@@ -14763,6 +15629,7 @@ def _run_project_step(
                 worktree,
                 no_change_error,
                 str(row["verify_result"] or ""),
+                reason=BlockReasonCode.PLAN_INPUT_INVALID,
             )
             operation_print(no_change_error, file=sys.stderr)
             return 1
@@ -14781,6 +15648,7 @@ def _run_project_step(
                     worktree,
                     publication_error,
                     str(row["verify_result"] or ""),
+                    reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
                 )
                 operation_print(publication_error, file=sys.stderr)
                 return 1
@@ -14815,6 +15683,7 @@ def _run_project_step(
                     worktree,
                     publication_error,
                     str(row["verify_result"] or ""),
+                    reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
                 )
                 operation_print(publication_error, file=sys.stderr)
                 return 1
@@ -14839,6 +15708,7 @@ def _run_project_step(
                 pr_conflict_base_oid=None,
                 last_error=None,
             )
+            clear_active(connection, repo)
             operation_print(f"기존 PR 충돌 복구 게시 완료: {row['pr_url']}")
             return 0
         plan_sha = str(row["plan_sha"] or "")
@@ -14850,6 +15720,7 @@ def _run_project_step(
                 worktree,
                 plan_error,
                 str(row["verify_result"] or ""),
+                reason=BlockReasonCode.PLAN_INPUT_INVALID,
             )
             operation_print(plan_error, file=sys.stderr)
             return 1
@@ -14900,6 +15771,7 @@ def _run_project_step(
                 worktree,
                 publication_error,
                 str(row["verify_result"] or ""),
+                reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
             )
             operation_print(publication_error, file=sys.stderr)
             return 1
@@ -14940,6 +15812,7 @@ def _run_project_step(
             pr_head_oid=head_oid,
             last_error=None,
         )
+        clear_active(connection, repo)
         operation_print(f"PR 생성 완료: {url}")
     return 0
 
@@ -14998,8 +15871,19 @@ def run_project_result(
         return ProjectRunResult(ProjectRunKind.USAGE_LIMIT_PAUSE, 0, detail)
     if step_result == PROJECT_STEP_PLANNING_PENDING:
         return ProjectRunResult(ProjectRunKind.WAITING, 0, detail)
-    if row is not None and row["phase"] == "BLOCKED":
+    if row is not None and row["phase"] == "PROJECT_BLOCKED":
         return ProjectRunResult(ProjectRunKind.BLOCKED, 1, detail)
+    plan_block = connection.execute(
+        "SELECT evidence FROM execplan_blocks WHERE repo = ? "
+        "ORDER BY updated_at DESC, plan_id LIMIT 1",
+        (repo,),
+    ).fetchone()
+    if step_result != 0 and plan_block is not None:
+        return ProjectRunResult(
+            ProjectRunKind.WAITING,
+            0,
+            str(plan_block["evidence"]),
+        )
     if step_result != 0:
         return ProjectRunResult(ProjectRunKind.OPERATIONAL_ERROR, 1, detail)
     if row is not None and row["phase"] is not None:
@@ -15066,7 +15950,10 @@ def _run_registered_project(
     """Run one registry row with state isolated to this worker connection."""
 
     try:
-        with connect_database(state_dir) as connection:
+        # The scheduler connection completed migrations before starting any
+        # project threads. Repeating DDL here races with another project's
+        # state transaction and can fail with SQLITE_BUSY.
+        with connect_database(state_dir, run_migrations=False) as connection:
             notifications.configure_session(
                 connection, enabled=notifications_enabled
             )

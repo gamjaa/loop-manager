@@ -20,7 +20,7 @@ def git(repo: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
-class RequirementArchivingTest(unittest.TestCase):
+class RequirementArchiveEligibilityTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -149,7 +149,7 @@ class RequirementArchivingTest(unittest.TestCase):
             "REVIEWING",
             "PUBLISHING",
             "PR_OPEN",
-            "BLOCKED",
+            "PLAN_BLOCKED",
         )
         for status in blocking_statuses:
             with self.subTest(status=status):
@@ -550,4 +550,3 @@ Test fallback.
 
 if __name__ == "__main__":
     unittest.main()
-

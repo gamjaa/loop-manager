@@ -8,6 +8,7 @@ from unittest import mock
 import loop_manager
 from managed_config import ManagedConfigError, load_managed_config
 import notifications
+import scoped_blocking
 
 
 class NotificationFixture:
@@ -39,6 +40,10 @@ class NotificationFixture:
                 "docs/plans/[G-018] Reliable notices.md",
                 '["docs/PRODUCT.md"]',
             ),
+        )
+        connection.execute(
+            "UPDATE projects SET plan_path = ? WHERE repo = ?",
+            ("docs/plans/[G-018] Reliable notices.md", "/projects/alpha"),
         )
         connection.commit()
         return connection
@@ -85,18 +90,17 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
             pr_url="https://example.test/pr/18",
         )
         loop_manager.update_project(connection, repo, phase="PR_OPEN")
-        loop_manager.update_project(
-            connection,
-            repo,
-            phase="BLOCKED",
-            last_error="User decision required",
-        )
-        loop_manager.update_project(
-            connection,
-            repo,
-            phase="BLOCKED",
-            last_error="User decision required",
-        )
+        with connection:
+            scoped_blocking.record_plan_block(
+                connection,
+                repo,
+                "G-018",
+                scoped_blocking.BlockReasonCode.USER_DECISION_REQUIRED,
+                "User decision required",
+                "decision-fingerprint",
+            )
+            notifications.enqueue_current_project_events(connection, repo)
+            notifications.enqueue_current_project_events(connection, repo)
 
         events = self.events(connection)
         self.assertEqual(len(events), 2)
@@ -114,23 +118,28 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
         )
         blocked = payloads["blocked"]
         self.assertEqual(blocked["stage"], "ExecPlan")
+        self.assertEqual(blocked["scope"], "plan")
+        self.assertEqual(blocked["reason_code"], "user_decision_required")
         self.assertEqual(blocked["cause"], "User decision required")
         self.assertEqual(
             blocked["paths"],
             [path, "docs/PRODUCT.md"],
         )
 
-    def test_blocked_error_update_enqueues_each_new_cause_once(self):
+    def test_blocked_error_update_keeps_one_identity_event(self):
         connection = self.connection()
         repo = "/projects/alpha"
         path = "docs/plans/[G-018] Reliable notices.md"
-        loop_manager.update_project(
-            connection,
-            repo,
-            phase="BLOCKED",
-            plan_path=path,
-            last_error="Initial user action",
-        )
+        with connection:
+            scoped_blocking.record_plan_block(
+                connection,
+                repo,
+                "G-018",
+                scoped_blocking.BlockReasonCode.PLAN_INPUT_INVALID,
+                "Initial user action",
+                "input-fingerprint",
+            )
+            notifications.enqueue_current_project_events(connection, repo)
 
         loop_manager._update_blocked_error(
             connection,
@@ -152,7 +161,7 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
         }
         self.assertEqual(
             causes,
-            {"Initial user action", "Different recovery action"},
+            {"Initial user action"},
         )
 
 
@@ -392,4 +401,3 @@ class CompletionCycleTest(NotificationFixture, unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

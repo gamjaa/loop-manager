@@ -94,7 +94,7 @@ def _insert(
 
 
 def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) -> None:
-    """Enqueue PR/BLOCKED state after its owning update and before commit."""
+    """Enqueue all plan/project events after their owning update and before commit."""
 
     if not _enabled(connection):
         return
@@ -108,34 +108,31 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
         return
     name = Path(repo).name or repo
 
-    if project[0] == "PR_OPEN" and project[2]:
-        plan = connection.execute(
-            "SELECT plan_id, title FROM exec_plans WHERE repo = ? AND path = ?",
-            (repo, project[1]),
-        ).fetchone()
-        if plan:
-            _insert(
-                connection,
-                _key("pr", repo, str(project[2])),
-                repo,
-                "pr_created",
-                {
-                    "project": name,
-                    "execplan_id": str(plan[0]),
-                    "execplan_title": str(plan[1]),
-                    "pr_url": str(project[2]),
-                },
-            )
+    for plan in connection.execute(
+        "SELECT plan_id, title, pr_url FROM exec_plans "
+        "WHERE repo = ? AND status = 'PR_OPEN' AND pr_url IS NOT NULL",
+        (repo,),
+    ).fetchall():
+        _insert(
+            connection,
+            _key("pr", repo, str(plan[2])),
+            repo,
+            "pr_created",
+            {
+                "project": name,
+                "execplan_id": str(plan[0]),
+                "execplan_title": str(plan[1]),
+                "pr_url": str(plan[2]),
+            },
+        )
 
-    cause = project[4] or (project[3] if project[0] == "BLOCKED" else None)
-    if not cause:
-        return
-    plan = connection.execute(
-        "SELECT plan_id, title, path, sources, blocked_reason FROM exec_plans "
-        "WHERE repo = ? AND path = ?",
-        (repo, project[1]),
-    ).fetchone()
-    if plan:
+    plan_blocks = connection.execute(
+        "SELECT p.plan_id, p.title, p.path, p.sources, b.reason_code, b.evidence "
+        "FROM execplan_blocks AS b JOIN exec_plans AS p USING (repo, plan_id) "
+        "WHERE b.repo = ? ORDER BY p.plan_id",
+        (repo,),
+    ).fetchall()
+    for plan in plan_blocks:
         try:
             sources = json.loads(str(plan[3]))
         except (TypeError, ValueError):
@@ -145,7 +142,7 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
         plan_title = str(plan[1])
         paths = [str(plan[2]), *(str(item) for item in sources)]
         guidance_locations = []
-        if plan[4] == "guidance_approval":
+        if plan[4] == "guidance_approval_required":
             rows = connection.execute(
                 "SELECT proposal_id, proposal_line, decision_line "
                 "FROM guidance_approvals WHERE repo = ? AND plan_id = ? "
@@ -165,30 +162,87 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
                 for item in guidance_locations
                 for location in (item["proposal"], item["user_decision"])
             )
-    else:
-        stage = "planning"
-        plan_id = plan_title = None
-        guidance_locations = []
-        paths = [
-            "docs/PRODUCT.md",
-            "docs/requirements/*.md",
-            "docs/ARCHITECTURE.md",
-        ]
-    _insert(
-        connection,
-        _key("blocked", repo, f"{stage}\0{plan_id or ''}\0{cause}"),
-        repo,
-        "blocked",
-        {
-            "project": name,
-            "stage": stage,
-            "execplan_id": plan_id,
-            "execplan_title": plan_title,
-            "cause": str(cause),
-            "paths": paths,
-            "guidance_locations": guidance_locations,
-        },
-    )
+        _insert(
+            connection,
+            _key("blocked", repo, f"plan\0{plan[4]}\0{plan_id}"),
+            repo,
+            "blocked",
+            {
+                "project": name,
+                "stage": stage,
+                "scope": "plan",
+                "reason_code": str(plan[4]),
+                "execplan_id": plan_id,
+                "execplan_title": plan_title,
+                "cause": str(plan[5]),
+                "paths": paths,
+                "guidance_locations": guidance_locations,
+            },
+        )
+
+    project_block = connection.execute(
+        "SELECT b.reason_code, b.plan_id, b.evidence, p.title, p.path, p.sources "
+        "FROM project_blocks AS b LEFT JOIN exec_plans AS p "
+        "ON p.repo = b.repo AND p.plan_id = b.plan_id WHERE b.repo = ?",
+        (repo,),
+    ).fetchone()
+    if project_block is not None:
+        try:
+            project_sources = json.loads(str(project_block[5])) if project_block[5] else []
+        except (TypeError, ValueError):
+            project_sources = []
+        project_paths = (
+            [
+                str(project_block[4]),
+                *(str(item) for item in project_sources),
+            ]
+            if project_block[4]
+            else []
+        )
+        _insert(
+            connection,
+            _key(
+                "blocked",
+                repo,
+                f"project\0{project_block[0]}\0{project_block[1] or ''}",
+            ),
+            repo,
+            "blocked",
+            {
+                "project": name,
+                "stage": "project",
+                "scope": "project",
+                "reason_code": str(project_block[0]),
+                "execplan_id": project_block[1],
+                "execplan_title": project_block[3],
+                "cause": str(project_block[2]),
+                "paths": project_paths,
+                "guidance_locations": [],
+            },
+        )
+
+    if project[4] and project_block is None:
+        _insert(
+            connection,
+            _key("blocked", repo, "project\0planning_error\0"),
+            repo,
+            "blocked",
+            {
+                "project": name,
+                "stage": "planning",
+                "scope": "project",
+                "reason_code": "planning_error",
+                "execplan_id": None,
+                "execplan_title": None,
+                "cause": str(project[4]),
+                "paths": [
+                    "docs/PRODUCT.md",
+                    "docs/requirements/*.md",
+                    "docs/ARCHITECTURE.md",
+                ],
+                "guidance_locations": [],
+            },
+        )
 
 
 def record_merged_plan(
@@ -293,8 +347,9 @@ def _message(kind: str, payload: dict[str, object]) -> str:
         subject = payload.get("execplan_id") or payload["stage"]
         paths = "\n".join(f"- {path}" for path in payload["paths"])
         return (
-            f"[{payload['project']}] BLOCKED ({subject})\n"
-            f"{payload['cause']}\nFiles to edit:\n{paths}"
+            f"[{payload['project']}] BLOCKED ({payload.get('scope')}: {subject})\n"
+            f"Reason: {payload.get('reason_code')}\n{payload['cause']}"
+            + (f"\nFiles to edit:\n{paths}" if paths else "")
         )
     return (
         f"[{payload['project']}] Project complete\nLast completed work: "
@@ -365,4 +420,3 @@ def dispatch_pending(
             )
         sent += 1
     return sent
-

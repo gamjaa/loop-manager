@@ -50,13 +50,13 @@
 - 미충족 PRODUCT 또는 Requirement에 근거해서만 ExecPlan을 작성한다
 - 실행 중인 작업과 남아 있는 READY ExecPlan은 새 계획 입력으로 선점하지 않으며, READY 카탈로그를 소진한 뒤에만 최신 입력에서 식별 가능한 모든 미충족 작업을 하나의 계획 주기에 ExecPlan으로 작성한다. 단, due 유지보수 평가는 활성 작업이 없는 선택 경계에서 일반 READY보다 먼저 수행한다
 - 프로젝트별 성공한 유지보수 평가 이후 새로 MERGED가 된 ExecPlan 수로 다음 평가 시점을 계산하며, 이력이 없으면 첫 선택 경계에서 평가한다. 공통 `refactoring_review_interval`은 양의 정수이고 기본값은 5다
-- 실행 가능한 READY ExecPlan은 안전한 무인 자동화를 막는 작업을 우선하는 결정적 순서로 선택하고, dependency를 충족하지 못한 READY만 남아 있어도 일반 Planner로 우회하지 않는다. 활성 유지보수 주기의 prerequisite 집합과 리팩터링 DAG만 이 순서보다 먼저 선택한다
+- 실행 가능한 READY ExecPlan은 안전한 무인 자동화를 막는 작업을 우선하는 결정적 순서로 선택하고, dependency를 충족하지 못한 READY나 `PLAN_BLOCKED`·`PR_OPEN`만 남아 있어도 일반 Planner로 우회하지 않는다. 활성 유지보수 주기의 prerequisite 집합과 리팩터링 DAG만 차단 또는 Merge 대기가 전혀 없을 때 이 순서보다 먼저 선택한다
 - Planner는 최신 `origin/<base-branch>` 기준의 detached planning worktree에서 새 ExecPlan을 작성하고, 현재 PRODUCT/Requirement 범위 밖이지만 보존 가치가 있는 아이디어만 `docs/FUTURE_IDEAS.md`에 생성하거나 수정한다. 기존 ExecPlan과 그 밖의 파일은 변경하지 않는다
 - 유지보수 Planner만 활성 cycle mode와 무소유 READY snapshot에 한정해 barrier dependency 또는 사후 구조 참조를 개정할 수 있다. READY가 없고 일반 계획 입력도 변경된 due 경계에서만 일반 계획과 유지보수 평가를 한 호출로 결합한다
 - 유지보수 planning batch는 원격 fast-forward가 확인된 뒤 catalog와 cycle 상태를 원자적으로 반영하며, 평가 없음 또는 사후 재검증 성공 전에는 평가 기준선을 전진시키지 않는다
 - `docs/FUTURE_IDEAS.md`는 Planner 입력이나 실행 상태가 아니며, 항목을 같은 계획 주기의 ExecPlan 범위로 사용하거나 Requirement·ExecPlan으로 자동 승격하지 않는다
 - 검증된 새 ExecPlan과 `docs/FUTURE_IDEAS.md` 변경은 하나의 planning commit으로 만들고 `origin/<base-branch>`에 fast-forward push한다. FUTURE_IDEAS만 변경된 결과는 ExecPlan이나 SQLite 실행 상태를 만들지 않는다
-- 같은 프로젝트에는 여러 READY ExecPlan을 등록할 수 있지만 동시에 하나의 ExecPlan만 실행한다
+- 같은 프로젝트에는 여러 READY, `PLAN_BLOCKED`, 안정된 `PR_OPEN` ExecPlan을 함께 보존할 수 있지만 IMPLEMENTING, VERIFYING, REVIEWING, PUBLISHING 또는 PR 충돌 복구로 저장소를 변경하는 실행은 동시에 하나만 둔다
 - ExecPlan은 모든 `depends_on`의 PR이 실제로 Merge된 뒤에만 시작한다
 - 각 ExecPlan은 하나의 결정적 branch, 별도 worktree와 하나의 PR을 사용한다
 - 서로 다른 프로젝트의 동시 실행 수는 `max_workers`를 넘지 않는다
@@ -72,7 +72,7 @@
 - 등록된 모든 프로젝트는 Loop Manager가 제공하는 동일한 `docs/PLANS.md`를 사용한다
 - ExecPlan 메타데이터 파싱과 Model/Effort 결정에는 AI를 사용하지 않는다
 - `PRODUCT.md`, Requirement와 `ARCHITECTURE.md`는 정해진 예외 외에는 자동 Loop가 수정하지 않는다
-- 동일한 PR, BLOCKED와 프로젝트 완료 이벤트를 중복 전송하지 않는다
+- 동일한 PR, 차단 scope·구조화 원인·관련 ExecPlan identity와 프로젝트 완료 이벤트를 중복 전송하지 않는다
 
 ## Product Flows
 
@@ -108,7 +108,7 @@
 6. `max_workers`를 포함한 유효한 설정을 저장한다
 
 규칙:
-- READY, IMPLEMENTING, VERIFYING, REVIEWING, PR_OPEN 또는 BLOCKED ExecPlan이 있거나 해결되지 않은 `planning_error`가 있는 프로젝트는 등록 해제할 수 없다
+- READY, IMPLEMENTING, VERIFYING, REVIEWING, PUBLISHING, PR_OPEN 또는 PLAN_BLOCKED ExecPlan, PROJECT_BLOCKED 레코드가 있거나 해결되지 않은 `planning_error`가 있는 프로젝트는 등록 해제할 수 없다
 - Telegram token과 chat ID가 모두 비어 있으면 알림 기능을 비활성화하고 전송을 시도하지 않는다
 - Telegram token과 chat ID 중 하나만 설정돼 있으면 설정 오류로 처리한다
 
@@ -125,12 +125,12 @@
 - 기존 ExecPlan 작업을 이어서 처리할 수 있다
 
 흐름:
-1. 프로그램이 각 등록 프로젝트를 fetch하고 eligible 기본 worktree만 원격 base로 safe fast-forward한 뒤 GitHub PR 상태와 SQLite의 ExecPlan 상태를 동기화한다
-2. BLOCKED ExecPlan과 `planning_error`의 근거 입력 변경 여부를 확인한다
+1. 프로그램이 모든 `PR_OPEN`의 Merge·Close·충돌 상태를 대상 ExecPlan별로 동기화하고 `PROJECT_BLOCKED`의 저장소 안전을 먼저 확인한다. 프로젝트 안전이 증명되지 않으면 fetch, 기본 worktree 동기화와 저장소 변경 단계를 실행하지 않는다
+2. 프로젝트 안전 gate가 열려 있으면 fetch하고 eligible 기본 worktree만 원격 base로 safe fast-forward한 뒤 각 `PLAN_BLOCKED`의 계획별 해제 조건 및 `planning_error`의 근거 입력 변경 여부를 독립적으로 확인한다
 3. 동시에 처리할 프로젝트를 `max_workers` 범위에서 선택한다
-4. 실행 중인 작업이 없으면 프로젝트별 유지보수 평가 주기를 먼저 확인하고, due가 아니면서 READY ExecPlan이 있으면 계획 입력 지문 검사를 건너뛰고 실행 가능한 계획 선택으로 이동한다
+4. 실행 중인 변경 단계가 없으면 dependency를 충족한 확정 PR 충돌 복구 하나를 먼저 선택하고, 없으면 프로젝트별 유지보수 평가 주기를 확인한다. `PLAN_BLOCKED` 또는 `PR_OPEN`이 있으면 유지보수 평가는 보류하고 독립 READY 선택으로 이동한다
 5. due 유지보수 cycle이 prerequisite 또는 리팩터링 계획을 기록했으면 그 집합의 dependency 충족 계획만 선택하고, 사후 재검증 단계면 장벽 뒤 Worker보다 유지보수 Planner를 먼저 실행한다
-6. 유지보수 cycle이 없고 READY ExecPlan이 모두 dependency를 충족하지 못하면 Planner나 Worker를 시작하지 않고 대기한다. 실행 중인 작업과 READY ExecPlan이 모두 없을 때만 최신 원격 계획 입력 지문으로 일반 Planner 필요 여부를 확인한다
+6. 유지보수 cycle이 없고 READY ExecPlan이 모두 dependency를 충족하지 못하거나 독립 READY가 없고 `PLAN_BLOCKED`·`PR_OPEN`만 남으면 Planner나 Worker를 시작하지 않고 대기한다. 실행 중인 작업, READY, `PLAN_BLOCKED`와 `PR_OPEN` ExecPlan이 모두 없을 때만 최신 원격 계획 입력 지문으로 일반 Planner 필요 여부를 확인한다
 7. Planner가 PRODUCT, Requirement, ARCHITECTURE, 현재 코드와 기존 ExecPlan을 확인한다
 8. 새 ExecPlan과 `docs/FUTURE_IDEAS.md` 변경이 모두 없으면 계획 입력 지문을 저장하고 planning worktree를 정리한 뒤 프로젝트 완료 여부를 확인한다
 9. 작업이 필요하면 Planner가 현재 입력에서 식별 가능한 미충족 작업 전체를 독립적으로 검증·Merge할 수 있는 새 ExecPlan으로 나누어 planning worktree의 `docs/plans/`에 일괄 작성하고, 의존성과 제품 우선순위를 기록한다. 현재 범위 밖의 보존 가치가 있는 아이디어는 같은 계획 주기의 ExecPlan으로 만들지 않고 `docs/FUTURE_IDEAS.md`에 분리한다
@@ -153,7 +153,7 @@
 26. 검증이 성공하면 읽기 전용 Reviewer를 실행한다
 27. 게시 직전에 최신 base에서 archive 후보를 다시 계산하고 이동 집합이 달라지면 같은 Worker 세션에서 수정한 뒤 검증과 Review를 반복한다
 28. 프로그램이 같은 branch의 기존 PR을 확인하고, 없을 때만 새 PR을 생성한 뒤 SQLite 상태를 PR_OPEN으로 변경한다
-29. 해당 프로젝트는 PR이 Merge되거나 BLOCKED가 해제될 때까지 다른 ExecPlan을 시작하지 않는다
+29. 안정된 `PR_OPEN`은 실행 자리를 비우며, 프로그램은 해당 계획에 직접·간접 의존하지 않는 다음 READY를 최신 `origin/<base-branch>`에서 순차적으로 시작한다
 
 ### 실패와 재시도
 
@@ -175,7 +175,7 @@ ExecPlan 게시 실패:
 2. 전체 검증 성공 출력은 Worker에게 전달하지 않는다
 3. 전체 검증과 Review 출력을 결정적으로 정규화해 단계별 실패 지문과 발생 횟수를 SQLite에 저장한다
 4. 새로운 실패 지문이 나타나는 동안에는 총 실패 횟수와 관계없이 같은 프로그램 실행에서 Worker 수정, 전체 검증과 Review를 계속한다
-5. 같은 지문이 Worker 수정 후 세 번 다시 발생하면 원인과 지문을 기록하고 ExecPlan을 BLOCKED로 변경하며, 중간에 다른 지문이 발생해도 이전 이력을 유지한다
+5. 같은 지문이 Worker 수정 후 세 번 다시 발생하면 구조화된 원인과 지문을 기록하고 ExecPlan을 `PLAN_BLOCKED`로 변경하며, 중간에 다른 지문이 발생해도 이전 이력을 유지한다
 6. 유효한 Review FAIL이 같은 effective level에서 동일 지문으로 두 번 확인되거나 서로 다른 지문 세 개로 확인되면 다음 Worker 수정부터 level을 한 단계 올리며 level 8을 상한으로 한다
 7. 전체 verify 실패, Worker 결과 형식 오류, Reviewer 실행 오류와 유효한 FAIL이 없는 결과는 effective level과 Review 승격 이력을 변경하지 않는다
 8. 전체 검증 성공은 verify 지문 이력만, Review 성공은 Review 지문 이력만 초기화하며 effective level과 level별 승격 이력은 유지한다
@@ -186,17 +186,17 @@ ExecPlan 게시 실패:
 - 다음 Loop Manager 실행에서 같은 상태부터 다시 시도한다
 - AI 사용 한도 소진이 확인되면 현재 실행에서는 재시도하지 않고 즉시 다음 프로젝트로 넘어간다
 
-### BLOCKED 해제
+### 계획 및 프로젝트 차단 해제
 
 시작 조건:
-- ExecPlan이 BLOCKED 상태다
+- ExecPlan이 `PLAN_BLOCKED`이거나 프로젝트에 `PROJECT_BLOCKED` 레코드가 있다
 
 흐름:
-1. BLOCKED 알림에 원인, ExecPlan 경로와 근거 문서 경로를 포함한다
-2. 사용자가 ExecPlan 또는 근거가 된 PRODUCT/Requirement를 수정한다
-3. 프로그램이 저장된 내용 해시와 현재 내용을 비교한다
-4. 내용이 변경됐으면 재시도 횟수와 verify·Review 실패 지문 이력을 초기화하고 effective Worker level과 승격 이력을 최초 level로 되돌린 뒤 ExecPlan을 READY로 변경한다
-5. 내용이 바뀌지 않았으면 BLOCKED 상태를 유지한다
+1. 차단 알림에 scope, 구조화 원인, 관련 ExecPlan과 판단 근거를 포함한다
+2. 계획별 입력 변경, guidance 결정 또는 닫힌 PR reopen 조건은 해당 `PLAN_BLOCKED`만 재평가한다
+3. 해제 조건이 충족된 계획은 재시도 횟수와 verify·Review 실패 지문 이력을 초기화하고 effective Worker level과 승격 이력을 최초 level로 되돌린 뒤 READY 또는 PR_OPEN으로 변경한다
+4. `PROJECT_BLOCKED`는 기본 worktree, 공유 ref, 외부 worktree와 workspace 소유권을 다시 검증해 프로젝트 안전이 증명된 경우에만 해제한다
+5. 프로젝트 차단이 해제돼도 별도 계획 원인이 남은 ExecPlan은 `PLAN_BLOCKED`를 유지하며, 다른 차단 계획의 fingerprint와 작업 공간은 변경하지 않는다
 
 ### 사용자 승인 및 완료
 
@@ -216,8 +216,8 @@ ExecPlan 게시 실패:
 
 실패:
 - PR이 Merge되지 않은 동안 완료 처리하지 않는다
-- PR이 Merge 없이 닫히면 ExecPlan을 BLOCKED로 변경한다
-- 닫힌 PR 때문에 BLOCKED가 된 경우에는 사용자가 같은 PR을 다시 열어야 하며, 문서 변경만으로 READY로 전환하지 않는다
+- PR이 Merge 없이 닫히면 해당 ExecPlan만 `PLAN_BLOCKED`로 변경한다
+- 닫힌 PR 때문에 `PLAN_BLOCKED`가 된 경우에는 사용자가 같은 PR을 다시 열어야 하며, 문서 변경만으로 READY로 전환하지 않는다
 
 ### 실행 종료 및 재개
 
@@ -231,7 +231,7 @@ ExecPlan 게시 실패:
 ### Telegram 알림
 
 - PR 생성: 프로젝트명, ExecPlan과 PR 링크
-- BLOCKED 발생: 프로젝트명, ExecPlan, 원인과 수정할 파일 경로
+- 차단 발생: 프로젝트명, scope, 구조화 원인, 관련 ExecPlan과 수정할 파일 경로
 - 프로젝트 완료: 프로젝트명과 마지막 완료 작업
 - 알림 실패는 작업 상태에 영향을 주지 않으며 다음 실행에서 다시 시도한다
 - 새 PRODUCT/Requirement 변경으로 새로운 작업 주기가 시작되면 해당 프로젝트의 완료 알림을 다시 보낼 수 있다
@@ -243,10 +243,10 @@ ExecPlan 실행 상태는 파일이 아니라 SQLite에만 저장한다.
 ```text
 READY → IMPLEMENTING → VERIFYING → REVIEWING → PR_OPEN → MERGED
 VERIFYING 또는 REVIEWING → IMPLEMENTING (재시도)
-READY, IMPLEMENTING, VERIFYING 또는 REVIEWING → BLOCKED
-BLOCKED → READY (ExecPlan 또는 근거 문서 변경)
-PR_OPEN → BLOCKED (Merge 없이 PR 종료)
-BLOCKED → PR_OPEN (같은 PR을 사용자가 다시 열음)
+READY, IMPLEMENTING, VERIFYING 또는 REVIEWING → PLAN_BLOCKED
+PLAN_BLOCKED → READY (계획별 해제 조건 충족)
+PR_OPEN → PLAN_BLOCKED (Merge 없이 PR 종료)
+PLAN_BLOCKED → PR_OPEN (같은 PR을 사용자가 다시 열음)
 ```
 
 - READY: 유효한 ExecPlan이 등록돼 프로젝트 실행 순서와 `depends_on` 충족을 대기
@@ -255,7 +255,9 @@ BLOCKED → PR_OPEN (같은 PR을 사용자가 다시 열음)
 - REVIEWING: Reviewer가 blocking issue를 확인 중
 - PR_OPEN: PR 생성 후 사용자 Merge 대기
 - MERGED: 연결된 PR의 Merge가 확인된 최종 상태
-- BLOCKED: 사용자 결정이나 문서 수정이 필요함
+- PLAN_BLOCKED: 특정 계획의 사용자 결정, 입력 변경, 검증 한도 또는 PR reopen을 기다림
+
+`PROJECT_BLOCKED`는 ExecPlan 상태가 아니라 프로젝트별 안전 gate다. 현재 실행 단계와 작업 공간을 보존한 채 Planner, maintenance Planner, Worker와 Git 쓰기를 중단하며, GitHub PR 상태 확인과 durable 알림 dispatch 같은 읽기·관리 작업만 계속한다. 차단 전이는 코드가 정의한 reason-to-scope mapping, 관련 ExecPlan, 판단 근거와 해제 fingerprint를 하나의 SQLite transaction에 저장한다. 범위를 증명할 수 없는 legacy `BLOCKED`는 보수적으로 `PROJECT_BLOCKED`로 이관한다.
 
 유지보수 cycle은 ExecPlan 상태와 별도로 프로젝트별 SQLite에 보존한다.
 
@@ -280,8 +282,8 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 - 기존 ExecPlan의 활성 Requirement source가 없으면 동일 파일명의 `docs/requirements/archive/` 문서를 조회하되 원래 source 경로는 바꾸지 않는다
 - 새 ExecPlan의 source와 Planner 입력은 활성 PRODUCT 또는 `docs/requirements/` 바로 아래 문서로 제한한다
 - 현재 ExecPlan을 제외한 모든 관련 ExecPlan이 MERGED인 Requirement만 archive 후보이며, 이미 모든 관련 계획이 MERGED인 과거 Requirement도 후보에 포함한다
-- archive 대상 충돌이나 source 관계·상태 불확실성은 덮어쓰기 없이 현재 ExecPlan을 BLOCKED로 만든다
-- BLOCKED 해제 지문은 원래 활성 Requirement 경로만 사용하고 archive 변경에는 반응하지 않는다
+- archive 대상 충돌이나 source 관계·상태 불확실성은 덮어쓰기 없이 현재 ExecPlan을 `PLAN_BLOCKED`로 만든다
+- `PLAN_BLOCKED` 해제 지문은 원래 활성 Requirement 경로만 사용하고 archive 변경에는 반응하지 않는다
 - Requirement는 PRODUCT의 변경 요청이며 ExecPlan의 구현 상세나 실행 상태를 포함하지 않는다
 - Requirement 파일 경로를 안정적인 식별자로 사용한다
 - `docs/requirements/` 바로 아래의 모든 `*.md`를 Planner 입력으로 사용한다
@@ -311,18 +313,19 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 ### 작업 선택과 동시 실행
 
 - 같은 프로젝트에 여러 READY ExecPlan이 대기할 수 있다
-- 같은 프로젝트에서는 IMPLEMENTING부터 PR_OPEN 또는 BLOCKED까지 하나의 ExecPlan만 현재 작업으로 둔다
+- 같은 프로젝트에서는 IMPLEMENTING, VERIFYING, REVIEWING, PUBLISHING 또는 PR 충돌 복구 중인 ExecPlan 하나만 현재 변경 실행으로 둔다. `PLAN_BLOCKED`와 충돌 복구 중이 아닌 `PR_OPEN`은 이 자리를 점유하지 않는다
 - 새 계획 입력은 실행 중인 작업과 남아 있는 READY ExecPlan을 선점하지 않으며 READY 카탈로그를 소진한 뒤 다음 계획 주기에 반영한다
 - READY ExecPlan은 모든 `depends_on`이 MERGED이고 다른 현재 작업이 없을 때만 시작한다
 - dependency를 충족하지 못한 READY만 남은 프로젝트는 Planner를 시작하지 않고 대기하며, 다른 프로젝트의 실행을 막지 않는다
 - 제품 우선순위는 안전한 무인 실행을 막거나 반복적인 사용자 복구를 요구하는 작업, 정상 경로의 사용자 개입을 제거하는 핵심 자동화, 그 밖의 Current Goal, 선택적 편의와 최적화 순이다
 - 실행 가능한 READY ExecPlan이 여럿이면 제품 우선순위가 높은 계획을 먼저 선택하고 같은 우선순위에서는 숫자 ExecPlan ID가 가장 작은 계획을 선택한다
-- 활성 유지보수 prerequisite 집합은 dependency gate 뒤 priority와 숫자 ID 순으로, 리팩터링 DAG는 dependency gate 뒤 숫자 ID 순으로 선택하며 집합 밖 READY는 cycle이 끝날 때까지 시작하지 않는다
+- 활성 유지보수 prerequisite 집합은 dependency gate 뒤 priority와 숫자 ID 순으로, 리팩터링 DAG는 dependency gate 뒤 숫자 ID 순으로 선택하며 집합 밖 READY는 cycle이 끝날 때까지 시작하지 않는다. 이때도 `PROJECT_BLOCKED`는 모든 실행을 막고, 다른 `PLAN_BLOCKED`·`PR_OPEN`과 dependency로 연결된 계획은 건너뛴다
 - 마지막 리팩터링 계획 Merge 뒤에는 최신 원격 기준 사후 재검증을 성공하고 계획 개정의 원격 게시와 catalog 반영을 마칠 때까지 장벽 뒤 READY를 시작하지 않는다
 - 각 ExecPlan은 고유하고 결정적인 이름의 branch와 별도 관리 worktree에서 작업한다
 - 서로 다른 프로젝트는 `max_workers` 범위에서 병렬로 처리한다
 - `max_workers` 기본값은 3이며 `config/config.ini`에서 변경할 수 있다
-- BLOCKED 또는 PR_OPEN 프로젝트에서는 다른 ExecPlan을 시작하거나 Planner를 다시 실행하지 않는다
+- `PLAN_BLOCKED` 또는 안정된 `PR_OPEN`이 있어도 직접·간접 dependency가 모두 MERGED인 독립 READY 하나를 기존 priority와 숫자 ID 순으로 시작한다. 독립 READY가 없으면 일반 Planner나 유지보수 Planner를 실행하지 않는다
+- `PROJECT_BLOCKED` 동안에는 새 Planner, maintenance Planner, Worker와 저장소 변경 단계를 시작하지 않는다
 
 ### Model과 Effort 선택
 
@@ -353,7 +356,7 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 ### 프로젝트 완료 조건
 
 - Planner가 현재 PRODUCT와 활성 Requirement에서 추가 ExecPlan이 필요 없다고 판단해야 한다
-- READY, IMPLEMENTING, VERIFYING, REVIEWING, PR_OPEN 또는 BLOCKED 상태의 ExecPlan이 없어야 한다
+- READY, IMPLEMENTING, VERIFYING, REVIEWING, PUBLISHING, PR_OPEN 또는 PLAN_BLOCKED 상태의 ExecPlan과 PROJECT_BLOCKED 레코드가 없어야 한다
 - due 또는 활성 유지보수 cycle과 해결되지 않은 유지보수 planning error가 없어야 하며, 성공 기준선이 최신 평가 또는 사후 재검증 결과까지 전진해야 한다
 - 해결되지 않은 `planning_error`가 없어야 한다
 - `cleanup_pending`은 프로젝트 완료를 막지 않는다
@@ -367,6 +370,7 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 - Telegram token과 chat ID가 모두 설정된 경우에만 알림을 생성하고 전송한다
 - 두 값이 모두 비어 있으면 알림을 비활성화하며 작업 흐름에는 영향을 주지 않는다
 - PR 생성 알림에는 PR 링크가 포함돼야 한다
-- BLOCKED 알림에는 ExecPlan 또는 계획 단계, 원인과 수정 가능한 파일 경로가 포함돼야 한다
+- 차단 알림에는 scope, 구조화 원인, 관련 ExecPlan과 수정 가능한 파일 경로가 포함돼야 한다
+- 차단 알림은 scope·원인·관련 ExecPlan identity가 같을 때만 같은 사건으로 중복 제거한다
 - 프로젝트 완료 알림은 해당 프로젝트의 현재 작업 주기가 완료됐을 때 전송한다
 - 동일한 이벤트는 한 번만 전송하며 실패한 알림만 다음 실행에서 재시도한다
