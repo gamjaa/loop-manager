@@ -393,7 +393,8 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                 (str(root),),
             ).fetchone()[0]
             with mock.patch(
-                "loop_manager._run_project_step", return_value=0
+                "loop_manager._run_project_step",
+                return_value=loop_manager.PROJECT_STEP_PLANNING_PENDING,
             ):
                 project_result = loop_manager.run_project_result(
                     connection,
