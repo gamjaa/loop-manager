@@ -96,6 +96,7 @@ def active_connection(
     connection.row_factory = sqlite3.Row
     connection.execute(loop_manager.SCHEMA)
     loop_manager._ensure_execplans_schema(connection)
+    loop_manager.notifications.ensure_schema(connection)
     head = git(repo, "rev-parse", "HEAD")
     connection.execute(
         "INSERT INTO projects (repo, base_branch, phase, branch, worktree, plan_path, "
@@ -193,6 +194,24 @@ class GuidanceRuntimeTest(unittest.TestCase):
             self.assertEqual((repo / "AGENTS.md").read_text(), "# Agents\n")
             self.assertEqual(git(repo, "rev-parse", "HEAD"), original_head)
             self.assertEqual(implementation.read_text(), "work in progress\n")
+            pending_payload = connection.execute(
+                "SELECT payload FROM notification_outbox WHERE event_type = 'blocked'"
+            ).fetchone()
+            self.assertIsNone(pending_payload)
+            checkpoint_repository = (
+                loop_manager.blocked_checkpoint_state.BlockedCheckpointRepository(
+                    connection
+                )
+            )
+            checkpoint_repository.finish_unpublished(
+                checkpoint_repository.get(str(repo), "G-020"),
+                "guidance approval remains local-only",
+                retryable=False,
+            )
+            with connection:
+                loop_manager.notifications.enqueue_current_project_events(
+                    connection, str(repo)
+                )
             payload = connection.execute(
                 "SELECT payload FROM notification_outbox WHERE event_type = 'blocked'"
             ).fetchone()[0]

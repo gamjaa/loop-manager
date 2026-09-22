@@ -193,11 +193,15 @@ ExecPlan 게시 실패:
 - ExecPlan이 `PLAN_BLOCKED`이거나 프로젝트에 `PROJECT_BLOCKED` 레코드가 있다
 
 흐름:
-1. 차단 알림에 scope, 구조화 원인, 관련 ExecPlan과 판단 근거를 포함한다
-2. 계획별 입력 변경, guidance 결정 또는 닫힌 PR reopen 조건은 해당 `PLAN_BLOCKED`만 재평가한다
-3. 해제 조건이 충족된 계획은 재시도 횟수와 verify·Review 실패 지문 이력을 초기화하고 effective Worker level과 승격 이력을 최초 level로 되돌린 뒤 READY 또는 PR_OPEN으로 변경한다
-4. `PROJECT_BLOCKED`는 기본 worktree, 허용되지 않은 공유 ref, 외부 worktree와 workspace 소유권을 다시 검증해 프로젝트 안전이 증명된 경우에만 해제한다. `refs/codex/turn-diffs/*`의 순변경은 해제 조건을 무효화하지 않는다
-5. 프로젝트 차단이 해제돼도 별도 계획 원인이 남은 ExecPlan은 `PLAN_BLOCKED`를 유지하며, 다른 차단 계획의 fingerprint와 작업 공간은 변경하지 않는다
+1. `PLAN_BLOCKED` 상태, scope, 구조화 원인과 판단 근거를 SQLite에 먼저 commit하고 PR이 없는 계획에 별도 durable checkpoint request를 기록한다
+2. 저장된 branch·결정적 worktree·workspace 소유권·HEAD와 Worker 허용 변경 범위가 모두 일치하고 미해결 Git operation, symlink, ignored 파일, 범위 밖 staged entry, index flag 또는 공유 metadata 불확실성이 없을 때만 검증된 pathspec으로 checkpoint commit을 만든다. 이미 commit된 변경이나 변경 없음에는 빈 commit을 만들지 않는다
+3. 같은 소유 branch의 원격이 없으면 생성하고, 저장된 expected OID와 일치하는 fast-forward만 갱신한다. PR 없는 기존 rebase 복구만 정확한 `--force-with-lease`를 사용할 수 있으며 예상하지 못한 원격 commit, branch protection과 권한 거부를 우회하지 않는다
+4. commit·push phase와 local/remote OID를 저장해 중단 후 같은 checkpoint를 재개하고, 일시적 push 실패는 실행당 제한 횟수만 재시도한 뒤 local commit과 worktree를 보존한다. checkpoint 결과와 무관하게 ExecPlan은 `PLAN_BLOCKED`로 남고 독립 READY 선택 자리를 점유하지 않는다
+5. `PROJECT_BLOCKED`, `planning_error`, 등록·branch 생성 전 실패, 기존 PR 또는 소유권을 증명할 수 없는 legacy 차단에는 원격 쓰기를 수행하지 않고 미게시 이유를 저장한다. 차단 알림은 checkpoint 결과 확정 뒤 성공 시 commit OID와 immutable branch link를, 미게시 시 local-only 이유를 포함한다
+6. 계획별 입력 변경, guidance 결정 또는 닫힌 PR reopen 조건은 해당 `PLAN_BLOCKED`만 재평가한다. 게시된 checkpoint branch가 외부에서 변경됐으면 자동 merge·rebase·덮어쓰기를 거부한다
+7. 해제 조건이 충족된 계획은 기존 branch와 worktree에서 재개하고 재시도 횟수와 verify·Review 실패 지문 이력을 초기화하며 effective Worker level과 승격 이력을 최초 level로 되돌린 뒤 READY 또는 PR_OPEN으로 변경한다. 같은 branch의 최초 PR은 최종 verify와 Review 성공 뒤에만 생성한다
+8. `PROJECT_BLOCKED`는 기본 worktree, 허용되지 않은 공유 ref, 외부 worktree와 workspace 소유권을 다시 검증해 프로젝트 안전이 증명된 경우에만 해제한다. `refs/codex/turn-diffs/*`의 순변경은 해제 조건을 무효화하지 않는다
+9. 프로젝트 차단이 해제돼도 별도 계획 원인이 남은 ExecPlan은 `PLAN_BLOCKED`를 유지하며, 다른 차단 계획의 fingerprint와 작업 공간은 변경하지 않는다
 
 ### 사용자 승인 및 완료
 
@@ -232,7 +236,7 @@ ExecPlan 게시 실패:
 ### Telegram 알림
 
 - PR 생성: 프로젝트명, ExecPlan과 PR 링크
-- 차단 발생: 프로젝트명, scope, 구조화 원인, 관련 ExecPlan과 수정할 파일 경로
+- 차단 발생: checkpoint 결과 확정 뒤 프로젝트명, scope, 구조화 원인, 관련 ExecPlan, 수정할 파일 경로와 원격 commit link 또는 local-only 보존 이유
 - 프로젝트 완료: 프로젝트명과 마지막 완료 작업
 - 알림 실패는 작업 상태에 영향을 주지 않으며 다음 실행에서 다시 시도한다
 - 새 PRODUCT/Requirement 변경으로 새로운 작업 주기가 시작되면 해당 프로젝트의 완료 알림을 다시 보낼 수 있다
@@ -371,7 +375,7 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 - Telegram token과 chat ID가 모두 설정된 경우에만 알림을 생성하고 전송한다
 - 두 값이 모두 비어 있으면 알림을 비활성화하며 작업 흐름에는 영향을 주지 않는다
 - PR 생성 알림에는 PR 링크가 포함돼야 한다
-- 차단 알림에는 scope, 구조화 원인, 관련 ExecPlan과 수정 가능한 파일 경로가 포함돼야 한다
+- 차단 알림에는 scope, 구조화 원인, 관련 ExecPlan, 수정 가능한 파일 경로와 checkpoint 성공 시 원격 commit link·OID 또는 미게시 시 local-only 보존 이유가 포함돼야 한다
 - 차단 알림은 scope·원인·관련 ExecPlan identity가 같을 때만 같은 사건으로 중복 제거한다
 - 프로젝트 완료 알림은 해당 프로젝트의 현재 작업 주기가 완료됐을 때 전송한다
 - 동일한 이벤트는 한 번만 전송하며 실패한 알림만 다음 실행에서 재시도한다

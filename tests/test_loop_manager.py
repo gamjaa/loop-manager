@@ -583,7 +583,7 @@ class AutomationFirstCatalogTest(unittest.TestCase):
             results[str(runnable_repo)],
             loop_manager.ProjectRunKind.OPERATIONAL_ERROR,
         )
-        self.assertEqual(roles, ["worker"])
+        self.assertEqual(roles, ["worker"], outcomes)
         self.assertEqual(tuple(blocked_project), (None, preserved_fingerprint))
         self.assertEqual(
             [tuple(row) for row in blocked_catalog],
@@ -6104,6 +6104,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repo, _plan_path = self._repository_with_plan(directory)
             for module_name in (
+                "blocked_checkpoint.py",
+                "blocked_checkpoint_state.py",
                 "loop_manager.py",
                 "execution_runtime.py",
                 "execution_handlers.py",

@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 import loop_manager
+import blocked_checkpoint_state
 import maintenance_state
 import notifications
 import project_registry
@@ -687,6 +688,16 @@ class ScopedBlockingTest(unittest.TestCase):
                 "first evidence",
                 "one",
             )
+            checkpoint_repository = (
+                blocked_checkpoint_state.BlockedCheckpointRepository(
+                    self.connection
+                )
+            )
+            checkpoint_repository.finish_unpublished(
+                checkpoint_repository.get(self.repo, "G-001"),
+                "first local-only result",
+                retryable=False,
+            )
             notifications.enqueue_current_project_events(
                 self.connection, self.repo
             )
@@ -697,6 +708,11 @@ class ScopedBlockingTest(unittest.TestCase):
                 BlockReasonCode.REVIEW_RETRY_EXHAUSTED,
                 "updated evidence",
                 "two",
+            )
+            checkpoint_repository.finish_unpublished(
+                checkpoint_repository.get(self.repo, "G-001"),
+                "updated local-only result",
+                retryable=False,
             )
             notifications.enqueue_current_project_events(
                 self.connection, self.repo
@@ -775,6 +791,104 @@ class ScopedBlockingTest(unittest.TestCase):
         )
         with self.assertRaises(project_registry.ProjectRegistryError):
             project_registry.remove_project(self.connection, self.repo)
+
+    def test_checkpoint_retry_does_not_occupy_independent_ready_slot(self):
+        self.plan("G-001", "IMPLEMENTING", priority="critical")
+        with self.connection:
+            scoped_blocking.record_plan_block(
+                self.connection,
+                self.repo,
+                "G-001",
+                BlockReasonCode.REVIEW_RETRY_EXHAUSTED,
+                "review failure",
+                "review-fingerprint",
+            )
+        self.plan("G-002", "READY", priority="normal")
+        steps = []
+
+        def project_step(*_args, **_kwargs):
+            steps.append(len(steps) + 1)
+            if len(steps) == 2:
+                self.connection.execute(
+                    "UPDATE exec_plans SET status = 'MERGED' "
+                    "WHERE repo = ? AND plan_id = 'G-002'",
+                    (self.repo,),
+                )
+                self.connection.commit()
+                return 0
+            return 1
+
+        with mock.patch(
+            "loop_manager.dispatch_blocked_checkpoints", return_value=0
+        ) as checkpoint, mock.patch(
+            "loop_manager._run_project_step", side_effect=project_step
+        ):
+            result = loop_manager.run_project_result(
+                self.connection,
+                Path("/state"),
+                self.repo,
+                Path("config.ini"),
+                None,
+                False,
+            )
+
+        self.assertEqual(steps, [1, 2])
+        checkpoint.assert_called_once()
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
+        blocked = self.connection.execute(
+            "SELECT status FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+            (self.repo,),
+        ).fetchone()
+        self.assertEqual(blocked["status"], "PLAN_BLOCKED")
+
+    def test_external_remote_checkpoint_change_prevents_plan_resume(self):
+        self.plan(
+            "G-001",
+            "IMPLEMENTING",
+            branch="loop-manager/G-001",
+        )
+        self.connection.execute(
+            "UPDATE exec_plans SET worktree = ? "
+            "WHERE repo = ? AND plan_id = 'G-001'",
+            ("/state/G-001", self.repo),
+        )
+        with self.connection:
+            scoped_blocking.record_plan_block(
+                self.connection,
+                self.repo,
+                "G-001",
+                BlockReasonCode.PLAN_INPUT_INVALID,
+                "input changed",
+                "old-input",
+            )
+        repository = blocked_checkpoint_state.BlockedCheckpointRepository(
+            self.connection
+        )
+        repository.finish_published(
+            repository.get(self.repo, "G-001"), "a" * 40
+        )
+
+        with mock.patch.object(
+            loop_manager._BlockedCheckpointAdapter,
+            "observe_remote",
+            return_value="b" * 40,
+        ):
+            resumed = loop_manager.resume_plan_blocks(
+                self.connection,
+                Path(self.repo),
+                Path("/state"),
+                self.repo,
+                "main",
+            )
+
+        self.assertFalse(resumed)
+        plan = self.connection.execute(
+            "SELECT status, last_error FROM exec_plans "
+            "WHERE repo = ? AND plan_id = 'G-001'",
+            (self.repo,),
+        ).fetchone()
+        self.assertEqual(plan["status"], "PLAN_BLOCKED")
+        self.assertIn("외부에서 변경", plan["last_error"])
 
     def test_legacy_unscoped_block_is_conservatively_project_blocked(self):
         self.plan("G-001", "READY")
