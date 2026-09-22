@@ -74,6 +74,10 @@ class PlanningResultInvalid(RuntimeError):
     """A Planner result that may be repaired in the same Agent session."""
 
 
+class PlanningWorkspaceOwnershipError(RuntimeError):
+    """A planning worktree cannot be proven to belong to this lifecycle."""
+
+
 @dataclass(frozen=True)
 class PlanningContext:
     """Prepared project identity and immutable inputs for one lifecycle run."""
@@ -882,7 +886,7 @@ class PlanningLifecycleCoordinator:
                 context.repo,
                 planning_workspace_owned=WORKSPACE_OWNED,
             )
-        except RuntimeError as error:
+        except PlanningWorkspaceOwnershipError as error:
             message = f"planning workspace 소유권 검증 실패: {error}"
             self._ports.state.update(
                 context.repo,

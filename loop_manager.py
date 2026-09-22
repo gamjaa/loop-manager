@@ -51,6 +51,7 @@ from planning_runtime import (
     PlanningOutcomeKind,
     PlanningResultInvalid,
     PlanningScopeResult,
+    PlanningWorkspaceOwnershipError,
 )
 import project_registry
 import runtime_state
@@ -13056,21 +13057,27 @@ class _PlanningGitPorts:
     def validate_workspace_identity(
         self, repo: str, fingerprint: str, worktree: Path
     ) -> None:
-        validate_planning_workspace_identity(
-            self._state_dir, repo, fingerprint, worktree
-        )
+        try:
+            validate_planning_workspace_identity(
+                self._state_dir, repo, fingerprint, worktree
+            )
+        except WorkspaceOwnershipError as error:
+            raise PlanningWorkspaceOwnershipError(str(error)) from error
 
     def validate_worktree_ownership(
         self, repo: str, fingerprint: str, worktree: Path
     ) -> None:
-        validate_planning_worktree_ownership(
-            self._connection,
-            self._repo_path,
-            self._state_dir,
-            repo,
-            fingerprint,
-            worktree,
-        )
+        try:
+            validate_planning_worktree_ownership(
+                self._connection,
+                self._repo_path,
+                self._state_dir,
+                repo,
+                fingerprint,
+                worktree,
+            )
+        except WorkspaceOwnershipError as error:
+            raise PlanningWorkspaceOwnershipError(str(error)) from error
 
     def make_planning_worktree(
         self,
@@ -13084,16 +13091,19 @@ class _PlanningGitPorts:
         expected_head: str,
         before_create: Callable[[], None],
     ) -> None:
-        make_planning_worktree(
-            repo_path,
-            worktree,
-            base,
-            allow_create=allow_create,
-            allow_existing=allow_existing,
-            ownership_reserved=ownership_reserved,
-            expected_head=expected_head,
-            before_create=before_create,
-        )
+        try:
+            make_planning_worktree(
+                repo_path,
+                worktree,
+                base,
+                allow_create=allow_create,
+                allow_existing=allow_existing,
+                ownership_reserved=ownership_reserved,
+                expected_head=expected_head,
+                before_create=before_create,
+            )
+        except WorkspaceOwnershipError as error:
+            raise PlanningWorkspaceOwnershipError(str(error)) from error
 
     def changed_files(
         self, worktree: Path, since: str | None = None

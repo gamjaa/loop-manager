@@ -8725,6 +8725,41 @@ class AgentScopeValidatorTest(unittest.TestCase):
 
 
 class WorkspaceRecoveryTest(unittest.TestCase):
+    def test_planning_git_port_only_translates_workspace_ownership_errors(self):
+        connection = sqlite3.connect(":memory:")
+        port = loop_manager._PlanningGitPorts(
+            connection,
+            Path("/repo"),
+            Path("/state"),
+        )
+        arguments = (
+            Path("/repo"),
+            Path("/planning"),
+            "main",
+        )
+        keywords = {
+            "allow_create": True,
+            "allow_existing": False,
+            "ownership_reserved": False,
+            "expected_head": "a" * 40,
+            "before_create": lambda: None,
+        }
+
+        with mock.patch(
+            "loop_manager.make_planning_worktree",
+            side_effect=loop_manager.GitLockError("index.lock exists"),
+        ), self.assertRaises(loop_manager.GitLockError):
+            port.make_planning_worktree(*arguments, **keywords)
+
+        with mock.patch(
+            "loop_manager.make_planning_worktree",
+            side_effect=loop_manager.WorkspaceOwnershipError("wrong owner"),
+        ), self.assertRaisesRegex(
+            loop_manager.PlanningWorkspaceOwnershipError,
+            "wrong owner",
+        ):
+            port.make_planning_worktree(*arguments, **keywords)
+
     def _workspace(
         self, directory: str
     ) -> tuple[Path, Path, str, Path]:

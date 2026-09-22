@@ -13,6 +13,7 @@ from planning_runtime import (
     PlanningOutcomeKind,
     PlanningResultInvalid,
     PlanningScopeResult,
+    PlanningWorkspaceOwnershipError,
 )
 from runtime_state import PlanningSnapshot
 
@@ -186,6 +187,7 @@ class FakeGitPort:
         self.ancestor = True
         self.calls = []
         self.ownership_checks = []
+        self.workspace_error = None
 
     def run(self, repo, *arguments, check=True):
         self.calls.append((str(repo), arguments, check))
@@ -214,7 +216,8 @@ class FakeGitPort:
         self.ownership_checks.append((repo, fingerprint, worktree))
 
     def make_planning_worktree(self, *_args, **_kwargs):
-        pass
+        if self.workspace_error is not None:
+            raise self.workspace_error
 
     def changed_files(self, _worktree, _since=None):
         return list(self.dirty_files)
@@ -367,6 +370,48 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         )
         self.assertFalse(
             ports.state.snapshot.planning_result_pending_validation
+        )
+
+    def test_transient_git_error_escapes_without_persisting_planning_error(self):
+        ports = FakePorts(
+            planning_snapshot(
+                phase="PLANNING",
+                active_sha="base",
+                worktree="/planning",
+                planning_attempt_fingerprint="fingerprint",
+                planning_workspace_owned=1,
+            )
+        )
+        ports.git.workspace_error = RuntimeError("index.lock exists")
+
+        with self.assertRaisesRegex(RuntimeError, "index.lock exists"):
+            PlanningLifecycleCoordinator(ports).run(self.context)
+
+        self.assertIsNone(ports.state.snapshot.planning_error)
+        self.assertFalse(
+            any("planning_error" in update for update in ports.state.updates)
+        )
+
+    def test_workspace_ownership_error_is_persisted_for_same_fingerprint(self):
+        ports = FakePorts(
+            planning_snapshot(
+                phase="PLANNING",
+                active_sha="base",
+                worktree="/planning",
+                planning_attempt_fingerprint="fingerprint",
+                planning_workspace_owned=1,
+            )
+        )
+        ports.git.workspace_error = PlanningWorkspaceOwnershipError(
+            "workspace belongs to another task"
+        )
+
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+        self.assertEqual(
+            ports.state.snapshot.planning_error,
+            "planning workspace 소유권 검증 실패: workspace belongs to another task",
         )
 
     def test_remote_base_race_discards_commit_before_push_or_registration(self):
