@@ -306,6 +306,93 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
             "MERGED",
         )
 
+    def test_registration_recovers_confirmed_archived_catalog_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            remote = parent / "remote.git"
+            root = parent / "repo"
+            subprocess.run(
+                ["git", "init", "--bare", "--initial-branch=main", str(remote)],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            root.mkdir()
+            self._project_files(root)
+            self._git(root, "remote", "add", "origin", str(remote))
+            self._git(root, "push", "-u", "origin", "main")
+            plans = root / "docs/plans"
+            plans.mkdir()
+            active = plans / "[G-001] Historical.md"
+            active.write_text(
+                """---
+id: G-001
+title: Historical
+sources:
+  - docs/PRODUCT.md
+depends_on: []
+complexity: low
+risk: low
+priority: normal
+---
+
+## Purpose
+
+Registration recovery fixture.
+""",
+                encoding="utf-8",
+            )
+            self._commit(root, "Add historical plan")
+            publication_sha = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "HEAD"],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.strip()
+            self._git(root, "push", "origin", "main")
+            archive = plans / "archive"
+            archive.mkdir()
+            active.rename(archive / active.name)
+            self._commit(root, "Archive historical plan")
+            self._git(root, "push", "origin", "main")
+            connection = self._connection()
+            inspection = loop_manager.ProjectRegistrationInspection(
+                root=root,
+                base_branch="main",
+                provider="codex",
+                agents_hash="agents-hash",
+                agents_approved=False,
+                origin=str(remote),
+            )
+            proof = {
+                "url": "https://pr/1",
+                "state": "MERGED",
+                "mergedAt": "2026-01-01T00:00:00Z",
+            }
+
+            with mock.patch(
+                "loop_manager.inspect_project_registration",
+                return_value=inspection,
+            ), mock.patch("loop_manager.pr_for_branch", return_value=proof):
+                loop_manager.add_registered_project(
+                    connection,
+                    root,
+                    config_path=Path("config.ini"),
+                    provider="codex",
+                    requested_base=None,
+                    approve_agents_mismatch=False,
+                )
+            row = connection.execute(
+                "SELECT path, status, plan_sha FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-001'",
+                (str(root),),
+            ).fetchone()
+            connection.close()
+
+        self.assertEqual(row["path"], "docs/plans/[G-001] Historical.md")
+        self.assertEqual(row["status"], "MERGED")
+        self.assertEqual(row["plan_sha"], publication_sha)
+
     def test_remove_refuses_active_execplans_and_planning_errors(self):
         connection = self._connection()
         project_registry.add_project(connection, self._record())

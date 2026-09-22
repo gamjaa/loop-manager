@@ -309,10 +309,19 @@ def enqueue_completion_if_ready(connection: sqlite3.Connection, repo: str) -> bo
         "FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
-    unfinished = connection.execute(
-        "SELECT 1 FROM exec_plans WHERE repo = ? AND status != 'MERGED' LIMIT 1",
-        (repo,),
+    has_historical_catalog = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'execplan_catalog_history'"
     ).fetchone()
+    unfinished_query = (
+        "SELECT 1 FROM exec_plans WHERE repo = ? AND status != 'MERGED' "
+        "AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h "
+        "WHERE h.repo = exec_plans.repo AND h.currently_archived = 1 "
+        "AND h.plan_id = exec_plans.plan_id) LIMIT 1"
+        if has_historical_catalog
+        else "SELECT 1 FROM exec_plans WHERE repo = ? AND status != 'MERGED' LIMIT 1"
+    )
+    unfinished = connection.execute(unfinished_query, (repo,)).fetchone()
     if (
         project is None
         or project[0] is not None

@@ -135,6 +135,48 @@ class RequirementArchiveEligibilityTest(unittest.TestCase):
             (current_only, historical, shared),
         )
 
+    def test_unverified_historical_plan_does_not_complete_or_block_unrelated_requirement(self):
+        historical_source = self.requirement("Historical Unknown")
+        current_source = self.requirement("Current Safe")
+        self.plan(
+            "G-001", "Historical Unknown", (historical_source,), "READY"
+        )
+        self.plan(
+            "G-002", "Current Safe", (current_source,), "IMPLEMENTING"
+        )
+        active_path = self.repo / "docs/plans/[G-001] Historical Unknown.md"
+        archived_path = (
+            self.repo / "docs/plans/archive/[G-001] Historical Unknown.md"
+        )
+        archived_path.parent.mkdir()
+        active_path.rename(archived_path)
+        self.connection.execute(
+            "DELETE FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+            (str(self.repo),),
+        )
+        self.connection.execute(
+            """
+            INSERT INTO execplan_catalog_history (
+                repo, plan_id, original_path, observed_path,
+                original_content_hash, final_content_hash,
+                merge_confirmed, diagnostic_code, diagnostic_message
+            ) VALUES (?, 'G-001', ?, ?, 'hash', 'hash', 0,
+                      'merge-proof-missing', 'missing')
+            """,
+            (
+                str(self.repo),
+                "docs/plans/[G-001] Historical Unknown.md",
+                "docs/plans/archive/[G-001] Historical Unknown.md",
+            ),
+        )
+        self.connection.commit()
+        revision = self.commit()
+
+        self.assertEqual(
+            self.candidates(revision, "G-002"),
+            (current_source,),
+        )
+
     def test_every_nonterminal_related_plan_prevents_archiving(self):
         source = self.requirement("Blocked")
         self.plan("G-001", "Merged Foundation", (source,), "MERGED")

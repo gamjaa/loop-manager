@@ -8,6 +8,8 @@ from unittest import mock
 from dataclasses import replace
 from pathlib import Path
 
+import execplan_catalog
+import execplan_catalog_state
 import loop_manager
 import maintenance_planning
 import maintenance_state
@@ -221,6 +223,43 @@ class MaintenancePlanningTest(unittest.TestCase):
         self.assertIsNotNone(result)
         assert result is not None
         return result
+
+    def test_maintenance_snapshot_excludes_historical_ready_identity(self):
+        text = self.ready_path.read_text(encoding="utf-8")
+        entry = execplan_catalog.snapshot_from_documents(
+            {
+                "docs/plans/archive/[G-000] Merged Foundation.md":
+                    self._path("G-000", "Merged Foundation").read_text(encoding="utf-8"),
+                "docs/plans/archive/[G-001] Ready Feature.md": text,
+            }
+        ).archived["G-001"]
+        content_hash = hashlib.sha256(self.ready_path.read_bytes()).hexdigest()
+        execplan_catalog_state.CatalogStateRepository(self.connection).record(
+            str(self.repo),
+            entry,
+            original_path="docs/plans/[G-001] Ready Feature.md",
+            original_content_hash=content_hash,
+            plan_sha=self.base_sha,
+            proof=execplan_catalog_state.MergeProof(False),
+            diagnostic=execplan_catalog_state.CatalogDiagnostic(
+                "G-001",
+                entry.path,
+                "merge-proof-missing",
+                "missing",
+            ),
+            identity_verified=True,
+        )
+        self.connection.commit()
+
+        context = self._begin_barrier()
+
+        self.assertEqual(context.eligible_plans, ())
+        self.assertEqual(
+            loop_manager.compact_execplan_catalog(
+                self.connection, str(self.repo)
+            ),
+            "[]",
+        )
 
     def test_authority_is_sqlite_bound_and_general_planner_remains_create_only(self):
         with self.assertRaisesRegex(
