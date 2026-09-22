@@ -6073,6 +6073,43 @@ def _revision_execplan_input_fingerprint(
     return _execplan_input_fingerprint(entries)
 
 
+def _blocked_validation_input_fingerprints(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    repo: str,
+    worktree: Path,
+    plan: sqlite3.Row,
+) -> tuple[str, str]:
+    """Capture comparable base and worktree inputs at the blocking boundary."""
+
+    worktree_fingerprint = _worktree_execplan_input_fingerprint(worktree, plan)
+    project = connection.execute(
+        "SELECT active_sha FROM projects WHERE repo = ?",
+        (repo,),
+    ).fetchone()
+    revision = str(
+        (project["active_sha"] if project else None)
+        or plan["active_sha"]
+        or plan["plan_sha"]
+        or ""
+    )
+    if not revision:
+        return worktree_fingerprint, worktree_fingerprint
+    resolved = git(
+        repo_path,
+        "rev-parse",
+        "--verify",
+        f"{revision}^{{commit}}",
+        check=False,
+    )
+    if resolved.returncode:
+        return worktree_fingerprint, worktree_fingerprint
+    return (
+        _revision_execplan_input_fingerprint(repo_path, revision, plan),
+        worktree_fingerprint,
+    )
+
+
 def _execplan_metadata_identity_error(
     repo_path: Path,
     current: dict[str, object],
@@ -7166,11 +7203,20 @@ def transition_validation_failure(
             f"{MAX_VALIDATION_FINGERPRINT_REPEATS}회 다시 발생했습니다.\n"
             f"실패 지문: {fingerprint}\n{output[-8000:]}"
         )
-        blocked_input = _worktree_execplan_input_fingerprint(worktree, plan)
+        blocked_input, blocked_worktree_input = (
+            _blocked_validation_input_fingerprints(
+                connection,
+                Path(repo),
+                repo,
+                worktree,
+                plan,
+            )
+        )
     else:
         prefix = "전체 검증 실패" if stage == "verify" else "Review 실패"
         error = f"{prefix}:\n{output[-8000:]}"
         blocked_input = None
+        blocked_worktree_input = None
 
     execplan_assignments = [
         f"{history_column} = ?",
@@ -7208,7 +7254,7 @@ def transition_validation_failure(
         execplan_assignments.extend(
             ["blocked_fingerprint = ?", "blocked_worktree_fingerprint = ?"]
         )
-        execplan_values.extend([blocked_input, blocked_input])
+        execplan_values.extend([blocked_input, blocked_worktree_input])
         project_assignments.append("agent_manager_snapshot = NULL")
 
     with connection:

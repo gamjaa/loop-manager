@@ -3961,6 +3961,177 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             [1, 1, 1, 4],
         )
 
+    def test_validation_block_uses_base_and_worktree_fingerprints_across_rebase(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state_dir, connection = self._active_worker_project(directory)
+            loop_manager.migrate_legacy_execplans(
+                connection, target_repo=str(repo)
+            )
+            project = connection.execute(
+                "SELECT * FROM projects WHERE repo = ?", (str(repo),)
+            ).fetchone()
+            plan = connection.execute(
+                "SELECT * FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            worktree = Path(project["worktree"])
+            plan_path = str(plan["path"])
+            plan_file = worktree / plan_path
+            plan_file.write_text(
+                plan_file.read_text(encoding="utf-8")
+                + "\n## Progress\n\n- [x] Worker checkpoint\n",
+                encoding="utf-8",
+            )
+            git_command(worktree, "add", plan_path)
+            git_command(worktree, "commit", "-m", "Record Worker checkpoint")
+            base_sha = str(project["active_sha"])
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE exec_plans
+                    SET status = 'REVIEWING', active_sha = ?, branch = ?,
+                        worktree = ?, workspace_owned = 1,
+                        reviewer_session_id = 'reviewer-session'
+                    WHERE repo = ? AND plan_id = 'G-001'
+                    """,
+                    (
+                        base_sha,
+                        str(project["branch"]),
+                        str(worktree),
+                        str(repo),
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE projects
+                    SET phase = 'REVIEWING', validated_base_sha = ?,
+                        reviewer_session_id = 'reviewer-session'
+                    WHERE repo = ?
+                    """,
+                    (base_sha, str(repo)),
+                )
+
+            output = (
+                "ISSUE_ID: docs/PLANS.md::stable-contract::blocking\n"
+                "Contract is still missing.\nVERDICT: FAIL"
+            )
+            for _ in range(4):
+                decision = loop_manager.transition_validation_failure(
+                    connection, str(repo), worktree, "review", output
+                )
+            self.assertTrue(decision.blocked)
+
+            blocked = connection.execute(
+                "SELECT * FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            base_fingerprint = loop_manager._revision_execplan_input_fingerprint(
+                repo, base_sha, blocked
+            )
+            worktree_fingerprint = (
+                loop_manager._worktree_execplan_input_fingerprint(
+                    worktree, blocked
+                )
+            )
+            self.assertEqual(blocked["blocked_fingerprint"], base_fingerprint)
+            self.assertEqual(
+                blocked["blocked_worktree_fingerprint"],
+                worktree_fingerprint,
+            )
+            self.assertNotEqual(base_fingerprint, worktree_fingerprint)
+
+            self.assertFalse(
+                loop_manager.resume_blocked_execplan_if_inputs_changed(
+                    connection, repo, str(repo), "main", state_dir
+                )
+            )
+            unchanged = connection.execute(
+                "SELECT status, review_failure_history, reviewer_session_id "
+                "FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(unchanged["status"], "BLOCKED")
+            self.assertEqual(
+                next(iter(json.loads(unchanged["review_failure_history"]).values()))[
+                    "occurrences"
+                ],
+                4,
+            )
+            self.assertEqual(
+                unchanged["reviewer_session_id"], "reviewer-session"
+            )
+
+            (repo / "docs/PRODUCT.md").write_text(
+                "# Product changed after validation block\n",
+                encoding="utf-8",
+            )
+            commit_and_push(repo, "Change blocked validation input")
+            latest_sha = git_command(repo, "rev-parse", "origin/main")
+            self.assertTrue(
+                loop_manager.resume_blocked_execplan_if_inputs_changed(
+                    connection, repo, str(repo), "main", state_dir
+                )
+            )
+            resumed = connection.execute(
+                "SELECT * FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(resumed["status"], "READY")
+            self.assertIsNone(resumed["blocked_fingerprint"])
+            self.assertIsNone(resumed["blocked_worktree_fingerprint"])
+            self.assertEqual(json.loads(resumed["review_failure_history"]), {})
+            self.assertEqual(
+                git_command(worktree, "merge-base", "--is-ancestor", latest_sha, "HEAD"),
+                "",
+            )
+
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE exec_plans
+                    SET status = 'REVIEWING', active_sha = ?,
+                        reviewer_session_id = 'reviewer-session'
+                    WHERE repo = ? AND plan_id = 'G-001'
+                    """,
+                    (latest_sha, str(repo)),
+                )
+                connection.execute(
+                    """
+                    UPDATE projects
+                    SET phase = 'REVIEWING', active_sha = ?,
+                        validated_base_sha = ?, branch = ?, worktree = ?,
+                        plan_path = ?, reviewer_session_id = 'reviewer-session'
+                    WHERE repo = ?
+                    """,
+                    (
+                        latest_sha,
+                        latest_sha,
+                        str(project["branch"]),
+                        str(worktree),
+                        plan_path,
+                        str(repo),
+                    ),
+                )
+            for _ in range(4):
+                loop_manager.transition_validation_failure(
+                    connection, str(repo), worktree, "review", output
+                )
+            refreshed = connection.execute(
+                "SELECT * FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(
+                refreshed["blocked_fingerprint"],
+                loop_manager._revision_execplan_input_fingerprint(
+                    repo, latest_sha, refreshed
+                ),
+            )
+            connection.close()
+
     def test_history_persists_and_stage_success_or_blocked_requeue_clears_it(self):
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory) / "state"
