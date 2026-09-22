@@ -294,4 +294,7 @@ class BlockedCheckpointRepository:
                 unpublished_reason=reason,
                 retryable=int(retryable),
             )
-            notifications.enqueue_current_project_events(self.connection, request.repo)
+            # RETRY_PENDING preserves local progress, not a final outcome.
+            # Reserving the event key now would hide a later published result.
+            if not retryable:
+                notifications.enqueue_current_project_events(self.connection, request.repo)

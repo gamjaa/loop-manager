@@ -151,7 +151,7 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
         "JOIN projects AS r ON r.repo = b.repo "
         "LEFT JOIN blocked_checkpoints AS c USING (repo, plan_id) "
         "WHERE b.repo = ? AND (c.repo IS NULL OR c.phase IN "
-        "('published', 'unpublished', 'retry_pending')) ORDER BY p.plan_id",
+        "('published', 'unpublished')) ORDER BY p.plan_id",
         (repo,),
     ).fetchall()
     for plan in plan_blocks:

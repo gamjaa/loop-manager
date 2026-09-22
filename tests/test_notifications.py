@@ -216,10 +216,37 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
             connection
         )
         oid = "a" * 40
+        repository.record_local(repository.get(repo, "G-018"), oid)
+        for _ in range(2):
+            # Recreate the repository as on a later dispatch. Neither the
+            # retry transition nor an unrelated outbox scan may finalize it.
+            repository = blocked_checkpoint_state.BlockedCheckpointRepository(
+                connection
+            )
+            with mock.patch.object(
+                notifications, "enqueue_current_project_events"
+            ) as enqueue:
+                repository.finish_unpublished(
+                    repository.get(repo, "G-018"),
+                    "temporary network outage",
+                    retryable=True,
+                )
+            enqueue.assert_not_called()
+            pending = repository.pending(repo)
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0].phase.value, "retry_pending")
+            self.assertEqual(pending[0].local_oid, oid)
+            with connection:
+                notifications.enqueue_current_project_events(connection, repo)
+            self.assertEqual(self.events(connection), [])
+        repository.finish_published(repository.get(repo, "G-018"), oid)
         repository.finish_published(repository.get(repo, "G-018"), oid)
         with connection:
             notifications.enqueue_current_project_events(connection, repo)
+        self.assertEqual(len(self.events(connection)), 1)
+        self.assertEqual(repository.pending(repo), ())
         payload = json.loads(self.events(connection)[0]["payload"])
+        self.assertEqual(payload["checkpoint"]["result"], "published")
         self.assertEqual(payload["checkpoint"]["commit_oid"], oid)
         self.assertEqual(
             payload["checkpoint"]["branch_url"],
