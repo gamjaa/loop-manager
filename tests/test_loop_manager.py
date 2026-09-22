@@ -11614,6 +11614,26 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             tuple((path, (repo / path).read_bytes()) for path in paths),
         )
 
+    def _add_ignored_cache(self, worktree: Path) -> Path:
+        exclude = Path(
+            git_command(worktree, "rev-parse", "--git-path", "info/exclude")
+        )
+        if not exclude.is_absolute():
+            exclude = worktree / exclude
+        exclude.write_text(
+            exclude.read_text(encoding="utf-8") + "\n__pycache__/\n",
+            encoding="utf-8",
+        )
+        cache = worktree / "__pycache__/verify.cpython-312.pyc"
+        cache.parent.mkdir()
+        cache.write_bytes(b"ignored verify artifact")
+        self.assertEqual(git_command(worktree, "status", "--porcelain"), "")
+        self.assertIn(
+            cache.relative_to(worktree).as_posix(),
+            loop_manager.capture_git_snapshot(worktree).dirty,
+        )
+        return cache
+
     def test_unknown_and_mergeable_prs_do_not_rebase_run_agents_or_push(self):
         for mergeable, advance_base in (("UNKNOWN", False), ("MERGEABLE", True)):
             with self.subTest(mergeable=mergeable), tempfile.TemporaryDirectory() as directory:
@@ -11622,10 +11642,11 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                     state_dir,
                     connection,
                     branch,
-                    _worktree,
+                    worktree,
                     pr_url,
                     head_oid,
                 ) = self._pr_open_state(directory)
+                cache = self._add_ignored_cache(worktree)
                 if advance_base:
                     self._advance_base(
                         directory,
@@ -11657,7 +11678,9 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                     "loop_manager.verify"
                 ) as verify, mock.patch(
                     "loop_manager.git", side_effect=recording_git
-                ):
+                ), mock.patch(
+                    "loop_manager._fetch_pr_conflict_recovery_refs"
+                ) as conflict_fetch:
                     result = loop_manager.run_project(
                         connection,
                         state_dir,
@@ -11675,9 +11698,115 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                 self.assertEqual(result, 0)
                 self.assertEqual(tuple(stored), ("PR_OPEN", 0))
                 self.assertEqual(git_calls, [])
+                self.assertTrue(cache.is_file())
+                conflict_fetch.assert_not_called()
                 synchronize.assert_not_called()
                 agent.assert_not_called()
                 verify.assert_not_called()
+
+    def test_legacy_ignored_only_preflight_block_recovers_to_pr_open(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                repo,
+                state_dir,
+                connection,
+                branch,
+                worktree,
+                pr_url,
+                head_oid,
+            ) = self._pr_open_state(directory)
+            cache = self._add_ignored_cache(worktree)
+            error = (
+                f"{loop_manager.PR_CONFLICT_PREFLIGHT_ERROR_PREFIX} "
+                "PR 충돌 복구 시작 전 관리 worktree가 관측한 원격 head의 "
+                "clean 상태와 일치하지 않습니다."
+            )
+            loop_manager.block_active_execplan_from_revision(
+                connection,
+                repo,
+                str(repo),
+                "refs/remotes/origin/main",
+                error,
+                "verify: PASS",
+            )
+            project = connection.execute(
+                "SELECT * FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            result = loop_manager.reconcile_existing_pull_request(
+                connection,
+                repo,
+                state_dir,
+                str(repo),
+                project,
+                self._pull_request(branch, pr_url, head_oid, "MERGEABLE"),
+            )
+            stored = connection.execute(
+                """
+                SELECT status, blocked_reason, blocked_fingerprint,
+                       blocked_worktree_fingerprint, last_error,
+                       worker_session_id, reviewer_session_id,
+                       verify_result, review_result
+                FROM exec_plans WHERE repo = ? AND plan_id = 'G-026'
+                """,
+                (str(repo),),
+            ).fetchone()
+            cache_preserved = cache.is_file()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(stored["status"], "PR_OPEN")
+        self.assertIsNone(stored["blocked_reason"])
+        self.assertIsNone(stored["blocked_fingerprint"])
+        self.assertIsNone(stored["blocked_worktree_fingerprint"])
+        self.assertIsNone(stored["last_error"])
+        self.assertEqual(stored["worker_session_id"], "worker-existing")
+        self.assertEqual(stored["reviewer_session_id"], "reviewer-existing")
+        self.assertEqual(stored["verify_result"], "verify: PASS")
+        self.assertEqual(stored["review_result"], "VERDICT: PASS")
+        self.assertTrue(cache_preserved)
+
+    def test_conflicting_pr_still_blocks_nonignored_untracked_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                repo,
+                state_dir,
+                connection,
+                branch,
+                worktree,
+                pr_url,
+                head_oid,
+            ) = self._pr_open_state(directory)
+            (worktree / "unexpected.txt").write_text(
+                "publishable local change\n",
+                encoding="utf-8",
+            )
+            project = connection.execute(
+                "SELECT * FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            result = loop_manager.reconcile_existing_pull_request(
+                connection,
+                repo,
+                state_dir,
+                str(repo),
+                project,
+                self._pull_request(branch, pr_url, head_oid, "CONFLICTING"),
+            )
+            stored = connection.execute(
+                """
+                SELECT status, blocked_reason, last_error
+                FROM exec_plans WHERE repo = ? AND plan_id = 'G-026'
+                """,
+                (str(repo),),
+            ).fetchone()
+
+        self.assertEqual(result, 1)
+        self.assertEqual(stored["status"], "BLOCKED")
+        self.assertEqual(
+            stored["blocked_reason"],
+            loop_manager.PR_CONFLICT_PREFLIGHT_BLOCK_REASON,
+        )
+        self.assertIn("unexpected.txt", stored["last_error"])
 
     def test_conflicting_pr_reuses_sessions_revalidates_new_base_and_leases_push(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -11690,6 +11819,7 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                 pr_url,
                 head_oid,
             ) = self._pr_open_state(directory)
+            cache = self._add_ignored_cache(worktree)
             self._advance_base(
                 directory,
                 repo,
@@ -11741,6 +11871,7 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             self.assertFalse(
                 loop_manager._rebase_in_progress_for_branch(worktree, branch)
             )
+            self.assertTrue(cache.is_file())
 
             roles = []
             session_ids = []

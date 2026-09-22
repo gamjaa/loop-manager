@@ -66,6 +66,8 @@ WORKSPACE_RESERVED = 2
 REBASE_IN_PROGRESS_ERROR = "Manager rebase 진행 중"
 REBASE_CONFLICT_PREFIX = "rebase 충돌 해결 필요:\n"
 PR_CLOSED_BLOCK_REASON = "pull-request-closed"
+PR_CONFLICT_PREFLIGHT_BLOCK_REASON = "pr-conflict-preflight"
+PR_CONFLICT_PREFLIGHT_ERROR_PREFIX = "PR_OPEN 충돌 복구 소유권 검증 실패:"
 PRIORITY_ORDER = {"critical": 0, "high": 1, "normal": 2, "low": 3}
 ACTIVE_EXECPLAN_STATUSES = frozenset(
     {"IMPLEMENTING", "VERIFYING", "REVIEWING", "PUBLISHING", "PR_OPEN", "BLOCKED"}
@@ -3988,16 +3990,14 @@ def _fetch_pr_conflict_recovery_refs(
         )
 
 
-def _validate_pr_conflict_recovery_ownership(
+def _validate_pr_conflict_recovery_identity(
     connection: sqlite3.Connection,
-    repo_path: Path,
-    state_dir: Path,
     repo: str,
     project: sqlite3.Row,
     pull_request: Mapping[str, object],
-) -> tuple[sqlite3.Row, Path, str, str, str]:
-    """Prove the saved URL, branch, workspace, and observed remote head."""
-
+    *,
+    expected_status: str,
+) -> tuple[sqlite3.Row, Path, str, str]:
     plan = active_execplan(connection, repo)
     plan_id = _plan_id_from_path(str(project["plan_path"] or ""))
     branch = str(project["branch"] or "")
@@ -4009,7 +4009,7 @@ def _validate_pr_conflict_recovery_ownership(
     stored_head = str(project["pr_head_oid"] or "")
     if (
         plan is None
-        or plan["status"] != "PR_OPEN"
+        or plan["status"] != expected_status
         or plan_id is None
         or str(plan["plan_id"]) != plan_id
         or int(plan["workspace_owned"]) != WORKSPACE_OWNED
@@ -4036,6 +4036,31 @@ def _validate_pr_conflict_recovery_ownership(
         raise PublicationSafetyError(
             "PR 충돌 복구 head OID가 저장된 PR head와 일치하지 않습니다."
         )
+    return plan, worktree, branch, head_oid
+
+
+def _validate_pr_conflict_recovery_ownership(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    state_dir: Path,
+    repo: str,
+    project: sqlite3.Row,
+    pull_request: Mapping[str, object],
+    *,
+    expected_status: str = "PR_OPEN",
+) -> tuple[sqlite3.Row, Path, str, str, str]:
+    """Prove the saved URL, branch, workspace, and observed remote head."""
+
+    plan, worktree, branch, head_oid = (
+        _validate_pr_conflict_recovery_identity(
+            connection,
+            repo,
+            project,
+            pull_request,
+            expected_status=expected_status,
+        )
+    )
+    plan_id = str(plan["plan_id"])
     validate_execplan_workspace_identity(
         state_dir, repo, plan_id, branch, worktree
     )
@@ -4049,10 +4074,27 @@ def _validate_pr_conflict_recovery_ownership(
         allow_existing=True,
     )
     snapshot = capture_git_snapshot(worktree)
-    if snapshot.head != head_oid or snapshot.dirty or snapshot.operations:
+    ignored_paths = frozenset(_ignored_worktree_paths(worktree))
+    publishable_dirty = {
+        path: state
+        for path, state in snapshot.dirty.items()
+        if path not in ignored_paths
+    }
+    if snapshot.head != head_oid or publishable_dirty or snapshot.operations:
+        details = []
+        if snapshot.head != head_oid:
+            details.append(f"HEAD {snapshot.head} (expected {head_oid})")
+        if publishable_dirty:
+            details.append(
+                "게시 가능 변경 " + ", ".join(sorted(publishable_dirty)[:8])
+            )
+        if snapshot.operations:
+            details.append(
+                "Git operation " + ", ".join(sorted(snapshot.operations))
+            )
         raise PublicationSafetyError(
             "PR 충돌 복구 시작 전 관리 worktree가 관측한 원격 head의 "
-            "clean 상태와 일치하지 않습니다."
+            "clean 상태와 일치하지 않습니다: " + "; ".join(details)
         )
     remote_oid = remote_branch_oid(repo_path, branch)
     if remote_oid != head_oid:
@@ -4066,6 +4108,20 @@ def _validate_pr_conflict_recovery_ownership(
         f"refs/remotes/origin/{project['base_branch']}^{{commit}}",
     ).stdout.strip()
     return plan, worktree, branch, head_oid, base_oid
+
+
+def _is_pr_conflict_preflight_block(
+    project: sqlite3.Row,
+    plan: sqlite3.Row | None,
+) -> bool:
+    if plan is None:
+        return False
+    return bool(
+        plan["blocked_reason"] == PR_CONFLICT_PREFLIGHT_BLOCK_REASON
+        or str(project["last_error"] or "").startswith(
+            PR_CONFLICT_PREFLIGHT_ERROR_PREFIX
+        )
+    )
 
 
 def _validate_active_pr_conflict_recovery(
@@ -7350,6 +7406,7 @@ def block_active_execplan_from_revision(
     verify_result: str = "",
     *,
     preserved_agent_result_snapshot: str | None = None,
+    blocked_reason: str | None = None,
 ) -> None:
     """Block an active plan when its saved worktree is not safe to read."""
 
@@ -7369,13 +7426,23 @@ def block_active_execplan_from_revision(
             """
             UPDATE exec_plans
             SET status = 'BLOCKED', blocked_fingerprint = ?,
-                blocked_reason = CASE WHEN blocked_reason = 'pull-request-closed'
-                    THEN NULL ELSE blocked_reason END,
+                blocked_reason = CASE
+                    WHEN ? IS NOT NULL THEN ?
+                    WHEN blocked_reason = 'pull-request-closed' THEN NULL
+                    ELSE blocked_reason END,
                 blocked_worktree_fingerprint = NULL,
                 blocked_review_fingerprint = NULL, last_error = ?, verify_result = ?
             WHERE repo = ? AND plan_id = ?
             """,
-            (fingerprint, error, verify_result, repo, plan["plan_id"]),
+            (
+                fingerprint,
+                blocked_reason,
+                blocked_reason,
+                error,
+                verify_result,
+                repo,
+                plan["plan_id"],
+            ),
         )
         connection.execute(
             """
@@ -9348,6 +9415,7 @@ def _resume_reopened_pull_request(
         "blocked_reason": None,
         "blocked_fingerprint": None,
         "blocked_worktree_fingerprint": None,
+        "blocked_review_fingerprint": None,
         "pr_url": url,
         "pr_head_oid": head_oid,
         "last_error": last_error,
@@ -9415,11 +9483,17 @@ def reconcile_existing_pull_request(
         and blocked_plan is not None
         and blocked_plan["blocked_reason"] == PR_CLOSED_BLOCK_REASON
     )
+    recovering_preflight_block = bool(
+        state == "OPEN"
+        and project["phase"] == "BLOCKED"
+        and _is_pr_conflict_preflight_block(project, blocked_plan)
+    )
     if (
         state in {"OPEN", "CLOSED"}
         and project["phase"] == "BLOCKED"
         and blocked_plan is not None
         and blocked_plan["blocked_reason"] != PR_CLOSED_BLOCK_REASON
+        and not recovering_preflight_block
     ):
         operation_print(
             "PR 충돌 복구 차단 상태를 유지합니다: "
@@ -9439,6 +9513,47 @@ def reconcile_existing_pull_request(
         )
 
     if state == "OPEN":
+        if recovering_preflight_block:
+            assert blocked_plan is not None
+            try:
+                _fetch_pr_conflict_recovery_refs(
+                    repo_path, str(project["base_branch"]), branch
+                )
+                _validate_pr_conflict_recovery_ownership(
+                    connection,
+                    repo_path,
+                    state_dir,
+                    repo,
+                    project,
+                    pull_request,
+                    expected_status="BLOCKED",
+                )
+            except (
+                PublicationSafetyError,
+                WorkspaceOwnershipError,
+            ) as error:
+                recovery_error = (
+                    f"{PR_CONFLICT_PREFLIGHT_ERROR_PREFIX} {error}"
+                )
+                _update_blocked_error(
+                    connection,
+                    repo,
+                    str(blocked_plan["plan_id"]),
+                    recovery_error,
+                )
+                operation_print(recovery_error, file=sys.stderr)
+                return 1
+            _resume_reopened_pull_request(
+                connection,
+                repo,
+                blocked_plan,
+                url,
+                head_oid,
+                recovery=False,
+            )
+            operation_print(f"PR_OPEN 충돌 복구 false positive 자동 해제: {url}")
+            return 0
+
         if int(project["pr_conflict_recovery"]):
             try:
                 if recover_confirmed_pr_conflict_push(
@@ -9501,6 +9616,38 @@ def reconcile_existing_pull_request(
 
         if project["phase"] == "PR_OPEN":
             try:
+                _validate_pr_conflict_recovery_identity(
+                    connection,
+                    repo,
+                    project,
+                    pull_request,
+                    expected_status="PR_OPEN",
+                )
+            except PublicationSafetyError as error:
+                recovery_error = (
+                    f"{PR_CONFLICT_PREFLIGHT_ERROR_PREFIX} {error}"
+                )
+                block_active_execplan_from_revision(
+                    connection,
+                    repo_path,
+                    repo,
+                    f"refs/remotes/origin/{project['base_branch']}",
+                    recovery_error,
+                    str(project["verify_result"] or ""),
+                    blocked_reason=PR_CONFLICT_PREFLIGHT_BLOCK_REASON,
+                )
+                operation_print(recovery_error, file=sys.stderr)
+                return 1
+            mergeability = classify_pull_request_mergeability(pull_request)
+            if mergeability != "conflicting":
+                if mergeability == "unknown":
+                    operation_print(
+                        f"PR mergeability 계산 대기 중: {url}"
+                    )
+                else:
+                    operation_print(f"Merge 대기 중: {url}")
+                return 0
+            try:
                 _fetch_pr_conflict_recovery_refs(
                     repo_path, str(project["base_branch"]), branch
                 )
@@ -9530,19 +9677,10 @@ def reconcile_existing_pull_request(
                     f"refs/remotes/origin/{project['base_branch']}",
                     recovery_error,
                     str(project["verify_result"] or ""),
+                    blocked_reason=PR_CONFLICT_PREFLIGHT_BLOCK_REASON,
                 )
                 operation_print(recovery_error, file=sys.stderr)
                 return 1
-
-            mergeability = classify_pull_request_mergeability(pull_request)
-            if mergeability != "conflicting":
-                if mergeability == "unknown":
-                    operation_print(
-                        f"PR mergeability 계산 대기 중: {url}"
-                    )
-                else:
-                    operation_print(f"Merge 대기 중: {url}")
-                return 0
 
             update_project(
                 connection,
