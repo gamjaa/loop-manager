@@ -82,6 +82,7 @@ PROJECT_UPDATE_FIELDS = frozenset(MIRRORED_FIELDS) | PROJECT_ONLY_FIELDS | {
 }
 
 EXECPLAN_RUNTIME_FIELDS = frozenset(MIRRORED_FIELDS) | {
+    "archive_resume_status",
     "status",
     "blocked_fingerprint",
     "blocked_worktree_fingerprint",

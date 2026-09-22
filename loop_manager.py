@@ -1038,6 +1038,7 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
             "INTEGER NOT NULL DEFAULT 0"
         )
     migrations = {
+        "archive_resume_status": "TEXT",
         "reviewer_session_id": "TEXT",
         "review_result": "TEXT",
         "validated_base_sha": "TEXT",
@@ -3193,9 +3194,20 @@ class _LegacyCatalogMergeProof:
                 pr_url=str(pull_request.get("url") or "") or None,
                 detail=str(pull_request.get("state") or "unknown"),
             )
-        plan_sha = _legacy_plan_sha(
-            self.root, self.revision, entry.active_path
-        )
+        identity = self.stored.get(entry.plan_id)
+        if identity is not None and identity.plan_sha:
+            plan_sha = identity.plan_sha
+        else:
+            # Use the latest active publication, including maintenance revisions.
+            # Matching archive bytes against any older revision would accept
+            # an archive reverted to an obsolete publication.
+            plan_sha = git(
+                self.root, "log", self.revision, "--no-renames",
+                "--diff-filter=AM", "--format=%H", "-1", "--",
+                entry.active_path,
+            ).stdout.strip()
+            if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", plan_sha):
+                raise RuntimeError("archived ExecPlan의 게시 revision이 없습니다.")
         published_hash = hashlib.sha256(
             git_bytes(self.root, "show", f"{plan_sha}:{entry.active_path}")
         ).hexdigest()
@@ -3315,7 +3327,10 @@ def _quarantine_unverified_historical_runtime(
         ).fetchone()
         if row is None or str(row["status"]) not in ACTIVE_EXECPLAN_STATUSES:
             continue
-        plan_values = {"status": "PLAN_BLOCKED"}
+        plan_values = {
+            "status": "PLAN_BLOCKED",
+            "archive_resume_status": str(row["status"]),
+        }
         if projected_path == str(row["path"]):
             repository.transition(
                 repo,
@@ -3388,6 +3403,30 @@ def _migrate_execplan_catalog(
             catalog_repository = execplan_catalog_state.CatalogStateRepository(
                 connection, ensure=False
             )
+            runtime_repository = runtime_state.RuntimeStateRepository(connection)
+            for entry in snapshot.active.values():
+                row = connection.execute(
+                    "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+                    (project["repo"], entry.plan_id),
+                ).fetchone()
+                if (
+                    row is not None
+                    and row["status"] == "PLAN_BLOCKED"
+                    and row["archive_resume_status"] in ACTIVE_EXECPLAN_STATUSES
+                    and row["path"] == entry.active_path
+                    and row["content_hash"] == entry.content_hash
+                    and project["phase"] is None
+                    and runtime_repository.active_row(str(project["repo"])) is None
+                ):
+                    runtime_repository.update_plan(
+                        str(project["repo"]), entry.plan_id,
+                        plan_values={
+                            "status": row["archive_resume_status"],
+                            "archive_resume_status": None,
+                        },
+                        expected_status="PLAN_BLOCKED", enqueue=False,
+                    )
+                    runtime_repository.hydrate(str(project["repo"]), entry.plan_id)
             catalog_repository.mark_active(str(project["repo"]), snapshot.active)
 
             for entry in snapshot.active.values():
