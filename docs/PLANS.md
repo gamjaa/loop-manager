@@ -14,6 +14,18 @@
 - `Validation`에는 Worker가 실행할 계획별 targeted unit test, 추가할 테스트 시나리오와 전체 verify가 확인해야 할 계획 고유의 회귀 조건만 기록한다.
 - Loop Manager가 현재 운영체제의 전체 verify 스크립트를 항상 실행하므로 `scripts/verify.ps1`과 `scripts/verify.sh` 경로를 ExecPlan마다 반복하지 않는다.
 
+## Planner 변경 범위
+
+일반 Planner는 새 `docs/plans/*.md`를 생성하고, 현재 PRODUCT/Requirement 범위 밖이지만 보존 가치가 있는 아이디어만 `docs/FUTURE_IDEAS.md`에 생성하거나 수정할 수 있다. 기존 ExecPlan을 수정·삭제·이름 변경하거나 그 밖의 파일을 변경하지 않는다.
+
+예외적으로 프로그램이 SQLite의 활성 유지보수 주기에서 현재 단계를 `barrier` 또는 `post-refactor revalidation` mode로 지정하고 대상 snapshot을 제공한 경우에만 유지보수 Planner가 기존 ExecPlan을 개정할 수 있다. 대상은 SQLite 상태가 `READY`이고 branch, worktree, workspace reservation, Worker·Reviewer session과 PR이 없는 계획으로 제한한다. 저장된 content hash, plan revision SHA 또는 소유 상태가 snapshot과 다르면 개정을 거부한다.
+
+- `barrier` mode는 기존 ID, 경로, title, sources, complexity, risk, priority, Purpose, Acceptance Criteria와 기존 `depends_on`을 보존하고, 검증된 리팩터링 DAG의 모든 말단 ID만 `depends_on`에 추가한다.
+- `post-refactor revalidation` mode는 ID, 경로, title, sources, Purpose와 원래 제품 목표·범위를 보존한다. 최신 구조에 필요한 Acceptance Criteria의 검증된 경로 표현, Implementation, Validation, Progress, Decision Log와 dependency만 개정할 수 있으며 목표와 범위 보존을 확정할 수 없으면 거부한다.
+- 유지보수 Planner도 기존 파일을 삭제·이름 변경하거나 대상 snapshot 밖의 계획과 `AGENTS.md`를 수정할 수 없다. 이 예외는 일반 Planner의 권한을 넓히지 않는다.
+
+사용자가 BLOCKED 해제나 명세 보완을 위해 기존 ExecPlan을 직접 편집한 결과는 유지보수 Planner의 개정 결과가 아니다. 저장소 파일이 변경됐다는 사실만으로 유지보수 예외를 부여하지 않으며, 프로그램이 선택한 mode, SQLite 대상 snapshot과 Agent 실행 전후 diff가 모두 일치할 때만 유지보수 Planner 결과로 검증·게시한다.
+
 ## Agent guidance 변경 제안과 사용자 결정
 
 Worker가 현재 ExecPlan 달성에 꼭 필요한 `AGENTS.md` 규칙 변경을 발견하면 파일을 직접 수정하지 않고 해당 ExecPlan의 `Decision Log` 끝에 아래 제안과 빈 사용자 결정을 한 쌍으로 추가한 뒤 작업을 중단한다. proposal ID는 ExecPlan 안에서 고유한 소문자·숫자·하이픈 값이어야 한다. `Target`은 저장소 루트의 `AGENTS.md`만 허용하며, `Scope`는 현재 프로젝트 전용이면 `project`, Loop Manager 기준 원본의 공통 규칙이면 `common`이다. 공통 제안은 Loop Manager 자체 저장소의 Worker만 작성할 수 있다. Planner와 Reviewer는 제안하거나 적용하지 않는다.
