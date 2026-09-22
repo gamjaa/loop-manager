@@ -48,9 +48,12 @@
 - ExecPlan 실행 상태의 유일한 원본은 Loop Manager의 SQLite다
 - ExecPlan 생성 전 Planner 실패는 프로젝트의 `planning_error`로 SQLite에 저장하며 ExecPlan BLOCKED 상태를 만들지 않는다
 - 미충족 PRODUCT 또는 Requirement에 근거해서만 ExecPlan을 작성한다
-- 실행 중인 작업과 남아 있는 READY ExecPlan은 새 계획 입력으로 선점하지 않으며, READY 카탈로그를 소진한 뒤에만 최신 입력에서 식별 가능한 모든 미충족 작업을 하나의 계획 주기에 ExecPlan으로 작성한다
-- 실행 가능한 READY ExecPlan은 안전한 무인 자동화를 막는 작업을 우선하는 결정적 순서로 선택하고, dependency를 충족하지 못한 READY만 남아 있어도 Planner로 우회하지 않는다
+- 실행 중인 작업과 남아 있는 READY ExecPlan은 새 계획 입력으로 선점하지 않으며, READY 카탈로그를 소진한 뒤에만 최신 입력에서 식별 가능한 모든 미충족 작업을 하나의 계획 주기에 ExecPlan으로 작성한다. 단, due 유지보수 평가는 활성 작업이 없는 선택 경계에서 일반 READY보다 먼저 수행한다
+- 프로젝트별 성공한 유지보수 평가 이후 새로 MERGED가 된 ExecPlan 수로 다음 평가 시점을 계산하며, 이력이 없으면 첫 선택 경계에서 평가한다. 공통 `refactoring_review_interval`은 양의 정수이고 기본값은 5다
+- 실행 가능한 READY ExecPlan은 안전한 무인 자동화를 막는 작업을 우선하는 결정적 순서로 선택하고, dependency를 충족하지 못한 READY만 남아 있어도 일반 Planner로 우회하지 않는다. 활성 유지보수 주기의 prerequisite 집합과 리팩터링 DAG만 이 순서보다 먼저 선택한다
 - Planner는 최신 `origin/<base-branch>` 기준의 detached planning worktree에서 새 ExecPlan을 작성하고, 현재 PRODUCT/Requirement 범위 밖이지만 보존 가치가 있는 아이디어만 `docs/FUTURE_IDEAS.md`에 생성하거나 수정한다. 기존 ExecPlan과 그 밖의 파일은 변경하지 않는다
+- 유지보수 Planner만 활성 cycle mode와 무소유 READY snapshot에 한정해 barrier dependency 또는 사후 구조 참조를 개정할 수 있다. READY가 없고 일반 계획 입력도 변경된 due 경계에서만 일반 계획과 유지보수 평가를 한 호출로 결합한다
+- 유지보수 planning batch는 원격 fast-forward가 확인된 뒤 catalog와 cycle 상태를 원자적으로 반영하며, 평가 없음 또는 사후 재검증 성공 전에는 평가 기준선을 전진시키지 않는다
 - `docs/FUTURE_IDEAS.md`는 Planner 입력이나 실행 상태가 아니며, 항목을 같은 계획 주기의 ExecPlan 범위로 사용하거나 Requirement·ExecPlan으로 자동 승격하지 않는다
 - 검증된 새 ExecPlan과 `docs/FUTURE_IDEAS.md` 변경은 하나의 planning commit으로 만들고 `origin/<base-branch>`에 fast-forward push한다. FUTURE_IDEAS만 변경된 결과는 ExecPlan이나 SQLite 실행 상태를 만들지 않는다
 - 같은 프로젝트에는 여러 READY ExecPlan을 등록할 수 있지만 동시에 하나의 ExecPlan만 실행한다
@@ -125,9 +128,9 @@
 1. 프로그램이 각 등록 프로젝트를 fetch하고 eligible 기본 worktree만 원격 base로 safe fast-forward한 뒤 GitHub PR 상태와 SQLite의 ExecPlan 상태를 동기화한다
 2. BLOCKED ExecPlan과 `planning_error`의 근거 입력 변경 여부를 확인한다
 3. 동시에 처리할 프로젝트를 `max_workers` 범위에서 선택한다
-4. 실행 중인 작업이 없고 READY ExecPlan이 하나라도 있으면 계획 입력 지문 검사를 건너뛰고 실행 가능한 계획 선택으로 이동한다
-5. READY ExecPlan이 모두 dependency를 충족하지 못하면 Planner나 Worker를 시작하지 않고 대기한다
-6. 실행 중인 작업과 READY ExecPlan이 모두 없을 때만 최신 원격 계획 입력 지문을 계산하고, 완료된 계획 주기와 다르면 planning worktree에서 Planner를 시작한다
+4. 실행 중인 작업이 없으면 프로젝트별 유지보수 평가 주기를 먼저 확인하고, due가 아니면서 READY ExecPlan이 있으면 계획 입력 지문 검사를 건너뛰고 실행 가능한 계획 선택으로 이동한다
+5. due 유지보수 cycle이 prerequisite 또는 리팩터링 계획을 기록했으면 그 집합의 dependency 충족 계획만 선택하고, 사후 재검증 단계면 장벽 뒤 Worker보다 유지보수 Planner를 먼저 실행한다
+6. 유지보수 cycle이 없고 READY ExecPlan이 모두 dependency를 충족하지 못하면 Planner나 Worker를 시작하지 않고 대기한다. 실행 중인 작업과 READY ExecPlan이 모두 없을 때만 최신 원격 계획 입력 지문으로 일반 Planner 필요 여부를 확인한다
 7. Planner가 PRODUCT, Requirement, ARCHITECTURE, 현재 코드와 기존 ExecPlan을 확인한다
 8. 새 ExecPlan과 `docs/FUTURE_IDEAS.md` 변경이 모두 없으면 계획 입력 지문을 저장하고 planning worktree를 정리한 뒤 프로젝트 완료 여부를 확인한다
 9. 작업이 필요하면 Planner가 현재 입력에서 식별 가능한 미충족 작업 전체를 독립적으로 검증·Merge할 수 있는 새 ExecPlan으로 나누어 planning worktree의 `docs/plans/`에 일괄 작성하고, 의존성과 제품 우선순위를 기록한다. 현재 범위 밖의 보존 가치가 있는 아이디어는 같은 계획 주기의 ExecPlan으로 만들지 않고 `docs/FUTURE_IDEAS.md`에 분리한다
@@ -165,6 +168,7 @@ ExecPlan 게시 실패:
 1. 계획 commit을 push하기 전에 `origin/<base-branch>`가 바뀌면 기존 계획 commit을 rebase하지 않고 폐기한 뒤 최신 기준으로 다시 계획한다
 2. fast-forward push가 거부되면 계획 commit과 오류를 보존하고 다음 실행에서 다시 시도한다
 3. push 성공을 원격에서 확인하기 전에는 ExecPlan을 READY로 등록하거나 Worker를 시작하지 않는다
+4. 유지보수 batch의 prepared intent와 planning worktree는 push·SQLite 적용 실패 뒤에도 같은 cycle 단계에 보존한다. 원격에 batch가 있으면 원자 적용을 재개하고, 없고 경로 충돌도 없을 때만 최신 base에서 같은 단계를 다시 평가한다
 
 전체 검증 또는 Review 실패:
 1. 프로그램이 전체 검증 실패 내용 또는 Reviewer의 blocking issue를 같은 Worker 세션에 전달하고 Reviewer도 저장된 세션을 재사용한다
@@ -253,6 +257,16 @@ BLOCKED → PR_OPEN (같은 PR을 사용자가 다시 열음)
 - MERGED: 연결된 PR의 Merge가 확인된 최종 상태
 - BLOCKED: 사용자 결정이나 문서 수정이 필요함
 
+유지보수 cycle은 ExecPlan 상태와 별도로 프로젝트별 SQLite에 보존한다.
+
+```text
+IDLE → ASSESSMENT → IDLE (평가 없음)
+ASSESSMENT → PREREQUISITE_WAIT → ASSESSMENT
+ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
+```
+
+활성 작업은 cycle 시작보다 우선하며, 각 cycle 전이는 기록된 계획 집합의 Merge 또는 검증된 Planner 결과로만 진행한다.
+
 외부 CLI의 일시적 실패와 사용 한도 소진은 별도 ExecPlan 상태를 만들지 않고 현재 상태를 보존한다.
 
 `planning_error`와 `cleanup_pending`은 ExecPlan 상태가 아니다. `planning_error`는 해당 프로젝트의 새 계획과 완료 처리를 막지만, `cleanup_pending`은 이미 Merge된 작업의 보존 경고이므로 다음 ExecPlan 실행과 프로젝트 완료를 막지 않는다.
@@ -273,7 +287,7 @@ BLOCKED → PR_OPEN (같은 PR을 사용자가 다시 열음)
 - `docs/requirements/` 바로 아래의 모든 `*.md`를 Planner 입력으로 사용한다
 - `docs/REQUIREMENT.template.md`와 `docs/requirements/archive/`는 Planner 입력에서 제외한다
 - ExecPlan의 `sources`에는 근거가 된 PRODUCT 또는 Requirement 경로가 있어야 한다
-- Planner는 실행 중인 작업과 READY ExecPlan이 모두 없는 선택 시점에만 최신 계획 입력 지문과 비종료 ExecPlan compact catalog를 확인하고, 현재 코드·테스트와 활성 제품 입력에서 식별 가능한 미충족 작업을 한 번에 모두 계획한다
+- 일반 Planner는 실행 중인 작업과 READY ExecPlan이 모두 없는 선택 시점에만 최신 계획 입력 지문과 비종료 ExecPlan compact catalog를 확인하고, 현재 코드·테스트와 활성 제품 입력에서 식별 가능한 미충족 작업을 한 번에 모두 계획한다. due 유지보수 평가는 같은 입력 지문이어도 활성 작업이 없는 경계에서 먼저 실행한다
 - `docs/FUTURE_IDEAS.md`는 계획 입력 지문, 활성 Requirement와 프로젝트 완료 판정에서 제외하며 그 항목을 자동으로 Requirement 또는 ExecPlan으로 승격하지 않는다
 - MERGED ExecPlan은 Planner 입력에서 제외하며 프로그램만 ID 고유성, 의존성 충족과 감사 이력을 위해 관리한다
 - ExecPlan의 `depends_on`은 선행 ExecPlan ID 목록이며, 모든 선행 상태가 MERGED여야 Worker를 시작할 수 있다
@@ -303,6 +317,8 @@ BLOCKED → PR_OPEN (같은 PR을 사용자가 다시 열음)
 - dependency를 충족하지 못한 READY만 남은 프로젝트는 Planner를 시작하지 않고 대기하며, 다른 프로젝트의 실행을 막지 않는다
 - 제품 우선순위는 안전한 무인 실행을 막거나 반복적인 사용자 복구를 요구하는 작업, 정상 경로의 사용자 개입을 제거하는 핵심 자동화, 그 밖의 Current Goal, 선택적 편의와 최적화 순이다
 - 실행 가능한 READY ExecPlan이 여럿이면 제품 우선순위가 높은 계획을 먼저 선택하고 같은 우선순위에서는 숫자 ExecPlan ID가 가장 작은 계획을 선택한다
+- 활성 유지보수 prerequisite 집합은 dependency gate 뒤 priority와 숫자 ID 순으로, 리팩터링 DAG는 dependency gate 뒤 숫자 ID 순으로 선택하며 집합 밖 READY는 cycle이 끝날 때까지 시작하지 않는다
+- 마지막 리팩터링 계획 Merge 뒤에는 최신 원격 기준 사후 재검증을 성공하고 계획 개정의 원격 게시와 catalog 반영을 마칠 때까지 장벽 뒤 READY를 시작하지 않는다
 - 각 ExecPlan은 고유하고 결정적인 이름의 branch와 별도 관리 worktree에서 작업한다
 - 서로 다른 프로젝트는 `max_workers` 범위에서 병렬로 처리한다
 - `max_workers` 기본값은 3이며 `config/config.ini`에서 변경할 수 있다
@@ -338,6 +354,7 @@ BLOCKED → PR_OPEN (같은 PR을 사용자가 다시 열음)
 
 - Planner가 현재 PRODUCT와 활성 Requirement에서 추가 ExecPlan이 필요 없다고 판단해야 한다
 - READY, IMPLEMENTING, VERIFYING, REVIEWING, PR_OPEN 또는 BLOCKED 상태의 ExecPlan이 없어야 한다
+- due 또는 활성 유지보수 cycle과 해결되지 않은 유지보수 planning error가 없어야 하며, 성공 기준선이 최신 평가 또는 사후 재검증 결과까지 전진해야 한다
 - 해결되지 않은 `planning_error`가 없어야 한다
 - `cleanup_pending`은 프로젝트 완료를 막지 않는다
 - Requirement와 ExecPlan에는 별도의 초안 상태를 두지 않는다
