@@ -39,6 +39,9 @@ CREATE TABLE IF NOT EXISTS maintenance_cycles (
     publication_base_sha TEXT,
     publication_commit_sha TEXT,
     publication_remote_oid TEXT,
+    publication_refactoring_plan_ids TEXT NOT NULL DEFAULT '[]',
+    publication_revalidation_plan_ids TEXT NOT NULL DEFAULT '[]',
+    include_general_planning INTEGER NOT NULL DEFAULT 0,
     revision INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (repo) REFERENCES projects(repo)
@@ -61,6 +64,9 @@ class MaintenanceCycle:
     publication_base_sha: str | None
     publication_commit_sha: str | None
     publication_remote_oid: str | None
+    publication_refactoring_plan_ids: tuple[str, ...]
+    publication_revalidation_plan_ids: tuple[str, ...]
+    include_general_planning: bool
     revision: int
 
 
@@ -76,6 +82,20 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
     """Create the additive maintenance table without rewriting audit data."""
 
     connection.execute(MAINTENANCE_SCHEMA)
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(maintenance_cycles)")
+    }
+    migrations = {
+        "include_general_planning": "INTEGER NOT NULL DEFAULT 0",
+        "publication_refactoring_plan_ids": "TEXT NOT NULL DEFAULT '[]'",
+        "publication_revalidation_plan_ids": "TEXT NOT NULL DEFAULT '[]'",
+    }
+    for column, definition in migrations.items():
+        if column not in columns:
+            connection.execute(
+                f"ALTER TABLE maintenance_cycles ADD COLUMN {column} {definition}"
+            )
 
 
 def calculate_review_due(
@@ -131,6 +151,21 @@ def _decode_plan_ids(raw: object, field: str) -> tuple[str, ...]:
     return tuple(sorted(values, key=_plan_sort_key))
 
 
+def _encode_publication_plan_ids(values: Sequence[str], field: str) -> str:
+    if isinstance(values, (str, bytes)) or any(
+        not isinstance(item, str) or re.fullmatch(r"G-\d{3,}", item) is None
+        for item in values
+    ):
+        raise MaintenanceStateError(
+            f"{field}에는 G-000 형식 문자열 plan ID만 사용할 수 있습니다."
+        )
+    if len(values) != len(set(values)):
+        raise MaintenanceStateError(f"{field}에 중복 plan ID가 있습니다.")
+    return json.dumps(
+        sorted(values, key=_plan_sort_key), separators=(",", ":")
+    )
+
+
 @contextmanager
 def _transaction(connection: sqlite3.Connection) -> Iterator[None]:
     savepoint = f"maintenance_{uuid4().hex}"
@@ -177,6 +212,9 @@ class MaintenanceRepository:
             publication_base_sha=None,
             publication_commit_sha=None,
             publication_remote_oid=None,
+            publication_refactoring_plan_ids=(),
+            publication_revalidation_plan_ids=(),
+            include_general_planning=False,
             revision=0,
         )
 
@@ -254,6 +292,15 @@ class MaintenanceRepository:
                 if row["publication_remote_oid"] is not None
                 else None
             ),
+            publication_refactoring_plan_ids=_decode_plan_ids(
+                row["publication_refactoring_plan_ids"],
+                "publication_refactoring_plan_ids",
+            ),
+            publication_revalidation_plan_ids=_decode_plan_ids(
+                row["publication_revalidation_plan_ids"],
+                "publication_revalidation_plan_ids",
+            ),
+            include_general_planning=bool(row["include_general_planning"]),
             revision=int(row["revision"]),
         )
 
@@ -293,7 +340,12 @@ class MaintenanceRepository:
         )
 
     def begin_assessment_if_due(
-        self, repo: str, interval: int, base_sha: str
+        self,
+        repo: str,
+        interval: int,
+        base_sha: str,
+        *,
+        include_general_planning: bool = False,
     ) -> tuple[MaintenanceCycle, bool]:
         """Create one assessment cycle, or return the already-active cycle."""
 
@@ -314,8 +366,8 @@ class MaintenanceRepository:
                 """
                 INSERT INTO maintenance_cycles (
                     repo, phase, cycle_base_sha,
-                    cycle_start_merged_count, revision
-                ) VALUES (?, 'assessment', ?, ?, 1)
+                    cycle_start_merged_count, include_general_planning, revision
+                ) VALUES (?, 'assessment', ?, ?, ?, 1)
                 ON CONFLICT(repo) DO UPDATE SET
                     phase = 'assessment',
                     cycle_base_sha = excluded.cycle_base_sha,
@@ -327,10 +379,13 @@ class MaintenanceRepository:
                     publication_base_sha = NULL,
                     publication_commit_sha = NULL,
                     publication_remote_oid = NULL,
+                    publication_refactoring_plan_ids = '[]',
+                    publication_revalidation_plan_ids = '[]',
+                    include_general_planning = excluded.include_general_planning,
                     revision = maintenance_cycles.revision + 1,
                     updated_at = CURRENT_TIMESTAMP
                 """,
-                (repo, base_sha, merged_count),
+                (repo, base_sha, merged_count, int(include_general_planning)),
             )
             return self.get(repo), True
 
@@ -342,6 +397,8 @@ class MaintenanceRepository:
         expected_revision: int,
         base_sha: str,
         commit_sha: str,
+        refactoring_plan_ids: Sequence[str] = (),
+        revalidation_plan_ids: Sequence[str] = (),
     ) -> MaintenanceCycle:
         """Persist a recoverable local batch before its remote push."""
 
@@ -370,11 +427,30 @@ class MaintenanceRepository:
                 state.publication_remote_oid,
             )
             if current == expected:
+                expected_refactoring = tuple(
+                    sorted(refactoring_plan_ids, key=_plan_sort_key)
+                )
+                expected_revalidation = tuple(
+                    sorted(revalidation_plan_ids, key=_plan_sort_key)
+                )
+                if (
+                    state.publication_refactoring_plan_ids != expected_refactoring
+                    or state.publication_revalidation_plan_ids != expected_revalidation
+                ):
+                    raise MaintenanceStateError(
+                        "보존된 publication plan 집합이 현재 batch와 다릅니다."
+                    )
                 return state
             if any(value is not None for value in current):
                 raise MaintenanceStateError(
                     "다른 유지보수 publication batch가 이미 보존돼 있습니다."
                 )
+            serialized_refactoring = _encode_publication_plan_ids(
+                refactoring_plan_ids, "refactoring_plan_ids"
+            )
+            serialized_revalidation = _encode_publication_plan_ids(
+                revalidation_plan_ids, "revalidation_plan_ids"
+            )
             cursor = self.connection.execute(
                 """
                 UPDATE maintenance_cycles
@@ -382,6 +458,8 @@ class MaintenanceRepository:
                     publication_base_sha = ?,
                     publication_commit_sha = ?,
                     publication_remote_oid = NULL,
+                    publication_refactoring_plan_ids = ?,
+                    publication_revalidation_plan_ids = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE repo = ? AND phase = ? AND revision = ?
                   AND publication_stage IS NULL
@@ -392,6 +470,8 @@ class MaintenanceRepository:
                 (
                     base_sha,
                     commit_sha,
+                    serialized_refactoring,
+                    serialized_revalidation,
                     repo,
                     expected_phase.value,
                     expected_revision,
@@ -439,7 +519,10 @@ class MaintenanceRepository:
                 UPDATE maintenance_cycles
                 SET cycle_base_sha = ?, publication_stage = NULL,
                     publication_base_sha = NULL, publication_commit_sha = NULL,
-                    publication_remote_oid = NULL, revision = revision + 1,
+                    publication_remote_oid = NULL,
+                    publication_refactoring_plan_ids = '[]',
+                    publication_revalidation_plan_ids = '[]',
+                    revision = revision + 1,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE repo = ? AND phase = ? AND revision = ?
                 """,
@@ -518,6 +601,8 @@ class MaintenanceRepository:
         publication_base_sha: str | None = None,
         publication_commit_sha: str | None = None,
         publication_remote_oid: str | None = None,
+        cycle_base_sha: str | None = None,
+        include_general_planning: bool | None = None,
     ) -> MaintenanceCycle:
         allowed = {
             MaintenancePhase.ASSESSMENT: {
@@ -543,6 +628,13 @@ class MaintenanceRepository:
             "publication_commit_sha": publication_commit_sha,
             "publication_remote_oid": publication_remote_oid,
         }
+        if cycle_base_sha is not None:
+            updates["cycle_base_sha"] = cycle_base_sha
+        if include_general_planning is not None:
+            updates["include_general_planning"] = int(include_general_planning)
+        if publication_stage is None:
+            updates["publication_refactoring_plan_ids"] = "[]"
+            updates["publication_revalidation_plan_ids"] = "[]"
         with _transaction(self.connection):
             if prerequisite_plan_ids is not None:
                 updates["prerequisite_plan_ids"] = self._serialize_plan_ids(
@@ -602,6 +694,9 @@ class MaintenanceRepository:
                     publication_base_sha = NULL,
                     publication_commit_sha = NULL,
                     publication_remote_oid = NULL,
+                    publication_refactoring_plan_ids = '[]',
+                    publication_revalidation_plan_ids = '[]',
+                    include_general_planning = 0,
                     revision = revision + 1,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE repo = ? AND phase = ? AND revision = ?

@@ -515,6 +515,22 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                         plan_sha,
                     ),
                 )
+            maintenance_repository = (
+                loop_manager.maintenance_state.MaintenanceRepository(connection)
+            )
+            for current_repo in (blocked_repo, runnable_repo):
+                current_sha = git_command(
+                    current_repo, "rev-parse", "origin/main"
+                )
+                cycle, _ = maintenance_repository.begin_assessment_if_due(
+                    str(current_repo), 5, current_sha
+                )
+                maintenance_repository.advance_success_baseline(
+                    str(current_repo),
+                    expected_phase=cycle.phase,
+                    expected_revision=cycle.revision,
+                    remote_commit=current_sha,
+                )
             connection.commit()
             config = loop_manager.ManagedConfig(
                 path=root / "unused.ini",
@@ -6079,6 +6095,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "guidance_approval.py",
                 "managed_config.py",
                 "maintenance_git.py",
+                "maintenance_orchestration.py",
                 "maintenance_planning.py",
                 "maintenance_state.py",
                 "notifications.py",
@@ -13122,10 +13139,15 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
                 *,
                 registered_only,
                 planner_mutex,
+                refactoring_review_interval,
             ):
                 nonlocal active_workers, maximum_workers
                 nonlocal active_planners, maximum_planners
                 self.assertTrue(registered_only)
+                self.assertEqual(
+                    refactoring_review_interval,
+                    config.refactoring_review_interval,
+                )
                 with guard:
                     connections.append(worker_connection)
                     thread_ids.add(threading.get_ident())
