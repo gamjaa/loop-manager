@@ -1,0 +1,180 @@
+"""ExecPlan execution phase coordination independent of process adapters."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from enum import Enum
+from pathlib import Path
+from typing import Protocol
+
+
+class ExecutionPhase(str, Enum):
+    """Durable execution phases dispatched by the coordinator."""
+
+    IMPLEMENTING = "IMPLEMENTING"
+    VERIFYING = "VERIFYING"
+    REVIEWING = "REVIEWING"
+    PUBLISHING = "PUBLISHING"
+
+
+class LatestBaseCheckpoint(str, Enum):
+    """Points that share the latest-base reconciliation boundary."""
+
+    AFTER_VERIFY = "after_verify"
+    BEFORE_PUBLICATION = "before_publication"
+
+
+class ExecutionOutcomeKind(str, Enum):
+    """Stable phase results interpreted by the process adapter."""
+
+    SUCCESS = "success"
+    PHASE_ADVANCED = "phase_advanced"
+    STABLE_WAIT = "stable_wait"
+    RETRY = "retry"
+    TRANSIENT_PAUSE = "transient_pause"
+    USAGE_PAUSE = "usage_pause"
+    FINAL_BLOCK = "final_block"
+
+
+@dataclass(frozen=True)
+class ExecutionPlanMetadata:
+    """Published plan identity needed throughout an execution turn."""
+
+    plan_id: str
+    title: str
+    path: str
+    plan_sha: str | None
+    sources: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ExecutionContext:
+    """Immutable execution identity, workspace, and validation markers."""
+
+    repo: str
+    repo_path: Path
+    state_dir: Path
+    base_branch: str
+    base_sha: str
+    provider: str
+    config_path: Path
+    plan: ExecutionPlanMetadata
+    phase: ExecutionPhase
+    branch: str
+    worktree: Path
+    active_sha: str
+    validated_base_sha: str | None
+    worker_session_id: str | None = None
+    reviewer_session_id: str | None = None
+    worker_result: str | None = None
+    verify_result: str | None = None
+    review_result: str | None = None
+    pr_url: str | None = None
+    pr_conflict_recovery: bool = False
+    pr_conflict_base_oid: str | None = None
+    resolving_rebase: bool = False
+    archive_sources: tuple[str, ...] = ()
+
+    def at_phase(
+        self, phase: ExecutionPhase, **changes: object
+    ) -> "ExecutionContext":
+        """Return the next immutable snapshot after a durable transition."""
+
+        return replace(self, phase=phase, **changes)
+
+
+@dataclass(frozen=True)
+class ExecutionOutcome:
+    """Typed phase result with an optional refreshed execution snapshot."""
+
+    kind: ExecutionOutcomeKind
+    context: ExecutionContext | None = None
+    detail: str | None = None
+    error: bool = False
+
+    @classmethod
+    def advanced(cls, context: ExecutionContext) -> "ExecutionOutcome":
+        return cls(ExecutionOutcomeKind.PHASE_ADVANCED, context=context)
+
+
+class ExecutionWorkspacePort(Protocol):
+    """Managed-worktree preparation and recovery boundary."""
+
+    def prepare(self) -> ExecutionContext | ExecutionOutcome: ...
+
+
+class ExecutionWorkerPort(Protocol):
+    """Worker Agent, scope, guidance, and archive boundary."""
+
+    def run(self, context: ExecutionContext) -> ExecutionOutcome: ...
+
+
+class LatestBasePort(Protocol):
+    """Shared rebase and validation-invalidation boundary."""
+
+    def reconcile(
+        self,
+        context: ExecutionContext,
+        checkpoint: LatestBaseCheckpoint,
+    ) -> ExecutionOutcome | None: ...
+
+
+class ExecutionValidationPort(Protocol):
+    """Full verify and read-only Reviewer boundary."""
+
+    def verify(
+        self,
+        context: ExecutionContext,
+        latest_base: LatestBasePort,
+    ) -> ExecutionOutcome: ...
+
+    def review(self, context: ExecutionContext) -> ExecutionOutcome: ...
+
+
+class ExecutionPublicationPort(Protocol):
+    """Publication preflight, push, and GitHub boundary."""
+
+    def publish(
+        self,
+        context: ExecutionContext,
+        latest_base: LatestBasePort,
+    ) -> ExecutionOutcome: ...
+
+
+class ExecutionLifecyclePorts(
+    ExecutionWorkspacePort, ExecutionWorkerPort, ExecutionValidationPort,
+    ExecutionPublicationPort, LatestBasePort, Protocol,
+):
+    """Phase policy interface; concrete handlers receive granular effect ports."""
+
+
+
+class ExecutionPhaseCoordinator:
+    """Prepare an execution once and dispatch exactly its current phase."""
+
+    def __init__(self, ports: ExecutionLifecyclePorts):
+        self._ports = ports
+
+    def prepare(self) -> ExecutionContext | ExecutionOutcome:
+        return self._ports.prepare()
+
+    def dispatch(self, context: ExecutionContext) -> ExecutionOutcome:
+        handlers = {
+            ExecutionPhase.IMPLEMENTING: self._run_worker,
+            ExecutionPhase.VERIFYING: self._run_verify,
+            ExecutionPhase.REVIEWING: self._run_review,
+            ExecutionPhase.PUBLISHING: self._run_publication,
+        }
+        return handlers[context.phase](context)
+
+    def _run_worker(self, context: ExecutionContext) -> ExecutionOutcome:
+        return self._ports.run(context)
+
+    def _run_verify(self, context: ExecutionContext) -> ExecutionOutcome:
+        return self._ports.verify(context, self._ports)
+
+    def _run_review(self, context: ExecutionContext) -> ExecutionOutcome:
+        return self._ports.review(context)
+
+    def _run_publication(self, context: ExecutionContext) -> ExecutionOutcome:
+        return self._ports.publish(context, self._ports)

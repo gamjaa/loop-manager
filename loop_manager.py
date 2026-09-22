@@ -39,6 +39,16 @@ from guidance_approval import (
     guidance_patch_hash,
     parse_guidance_document,
 )
+from execution_runtime import (
+    ExecutionContext,
+    ExecutionOutcome,
+    ExecutionOutcomeKind,
+    ExecutionPhase,
+    ExecutionPhaseCoordinator,
+    ExecutionPlanMetadata,
+    LatestBaseCheckpoint,
+    LatestBasePort,
+)
 from managed_config import ManagedConfig, ManagedConfigError, load_managed_config
 import notifications
 from planning_runtime import (
@@ -55,6 +65,9 @@ from planning_runtime import (
 )
 import project_registry
 import runtime_state
+import execution_handlers
+from execution_state import ExecutionStatePort as _ExecutionStatePort
+from types import SimpleNamespace
 from maintenance_planning import (
     MaintenancePlanMode,
     MaintenancePlanningContext,
@@ -13755,1326 +13768,32 @@ def _run_project_step(
         return planning_step_result
     base_sha = planning_outcome.base_sha or base_sha
     newly_activated = planning_outcome.newly_activated
-    row = connection.execute(
-        "SELECT * FROM projects WHERE repo = ?", (repo,)
-    ).fetchone()
-    assert row is not None
-    branch = str(row["branch"] or "")
-    worktree = Path(str(row["worktree"] or ""))
-    plan_id = _plan_id_from_path(str(row["plan_path"] or ""))
-    catalog_plan = active_execplan(connection, repo)
-    workspace_ownership = int(catalog_plan["workspace_owned"] if catalog_plan else 0)
-    workspace_owned = workspace_ownership == WORKSPACE_OWNED
-    workspace_reserved = workspace_ownership == WORKSPACE_RESERVED
-    rebase_error = str(row["last_error"] or "")
-    rebase_recovery = bool(
-        row["phase"] == "WORKING"
-        and (
-            rebase_error == REBASE_IN_PROGRESS_ERROR
-            or rebase_error.startswith(REBASE_CONFLICT_PREFIX)
-        )
+    execution_ports = _ExecutionLifecyclePorts(
+        connection,
+        runtime_repository,
+        repo=repo,
+        repo_path=repo_path,
+        state_dir=state_dir,
+        base=base,
+        base_sha=base_sha,
+        provider=provider,
+        config_path=config_path,
+        newly_activated=newly_activated,
     )
-    resolving_rebase = bool(
-        rebase_recovery
-        and worktree.is_dir()
-        and _rebase_in_progress_for_branch(worktree, branch)
-    )
-    try:
-        if plan_id is None:
-            raise WorkspaceOwnershipError(
-                "활성 ExecPlan 경로에서 ID를 확인할 수 없습니다."
-            )
-        if catalog_plan is None or catalog_plan["plan_id"] != plan_id:
-            raise WorkspaceOwnershipError(
-                "활성 ExecPlan의 catalog 상태를 확인할 수 없습니다."
-            )
-        validate_execplan_workspace_identity(
-            state_dir,
-            repo,
-            plan_id,
-            branch,
-            worktree,
-        )
-        make_worktree(
-            repo_path,
-            worktree,
-            branch,
-            base,
-            allow_create_branch=(
-                newly_activated
-                and not workspace_owned
-                and not workspace_reserved
-            ),
-            allow_recovery=workspace_owned or workspace_reserved,
-            allow_existing=workspace_owned or workspace_reserved,
-            ownership_reserved=workspace_reserved,
-            expected_head=str(row["active_sha"] or ""),
-            before_create=lambda: reserve_execplan_workspace(
-                connection,
-                repo,
-                plan_id,
-            ),
-            allow_rebase=resolving_rebase,
-        )
-        mark_execplan_workspace_owned(connection, repo, plan_id)
-    except (RuntimeError, WorkspaceOwnershipError) as error:
-        workspace_error = f"관리 workspace 소유권/복구 검증 실패: {error}"
-        block_active_execplan_from_revision(
-            connection,
-            repo_path,
-            repo,
-            f"refs/remotes/origin/{base}",
-            workspace_error,
-            str(row["verify_result"] or ""),
-            reason=BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN,
-        )
-        operation_print(workspace_error, file=sys.stderr)
-        return 1
-
-    if int(row["pr_conflict_recovery"]):
-        recovery_rebase = resume_pr_conflict_rebase(
-            connection,
-            repo_path,
-            repo,
-            row,
-            worktree,
-            branch,
-        )
-        if recovery_rebase == 1:
-            return 1
-        row = connection.execute(
-            "SELECT * FROM projects WHERE repo = ?", (repo,)
-        ).fetchone()
-        rebase_error = str(row["last_error"] or "")
-        rebase_recovery = bool(
-            row["phase"] == "WORKING"
-            and (
-                rebase_error == REBASE_IN_PROGRESS_ERROR
-                or rebase_error.startswith(REBASE_CONFLICT_PREFIX)
-            )
-        )
-        resolving_rebase = bool(
-            rebase_recovery
-            and _rebase_in_progress_for_branch(worktree, branch)
-        )
-
-    if rebase_recovery and not resolving_rebase and not int(row["pr_conflict_recovery"]):
-        update_project(
-            connection, repo, phase="VERIFYING", last_error=None
-        )
-        row = connection.execute(
-            "SELECT * FROM projects WHERE repo = ?", (repo,)
-        ).fetchone()
-    assert catalog_plan is not None
-    try:
-        plan = validate_active_execplan_metadata(
-            repo_path,
-            worktree,
-            str(row["plan_path"]),
-            catalog_plan,
-        )
-        level = ensure_worker_level_state(connection, repo, plan)
-    except RuntimeError as error:
-        metadata_error = str(error)
-        block_active_execplan(
-            connection,
-            repo,
-            worktree,
-            metadata_error,
-            str(row["verify_result"] or ""),
-            reason=BlockReasonCode.PLAN_INPUT_INVALID,
-        )
-        operation_print(metadata_error, file=sys.stderr)
-        return 1
-    try:
-        archive_sources = requirement_archive_sources(connection, repo)
-    except RequirementArchiveError as error:
-        archive_error = f"Requirement archive source 확인 실패: {error}"
-        block_active_execplan(
-            connection,
-            repo,
-            worktree,
-            archive_error,
-            str(row["verify_result"] or ""),
-            reason=BlockReasonCode.PLAN_INPUT_INVALID,
-        )
-        operation_print(archive_error, file=sys.stderr)
-        return 1
-    archive_candidates: tuple[str, ...] = ()
-    archive_scope_sources: tuple[str, ...] = ()
-    if row["phase"] == "WORKING" and archive_sources:
-        archive_revision = str(row["active_sha"] or "")
-        try:
-            archive_candidates = requirement_archive_candidates(
-                connection,
-                repo_path,
-                repo,
-                archive_revision,
-                str(plan["id"]),
-            )
-            archive_scope_sources = tuple(
-                sorted(
-                    set(archive_candidates)
-                    | set(
-                        requirement_archive_touched_sources(
-                            repo_path,
-                            archive_revision,
-                            worktree,
-                        )
-                    )
-                )
-            )
-        except RequirementArchiveError as error:
-            archive_error = f"Requirement archive eligibility 확인 실패: {error}"
-            block_active_execplan(
-                connection,
-                repo,
-                worktree,
-                archive_error,
-                str(row["verify_result"] or ""),
-                reason=BlockReasonCode.PLAN_INPUT_INVALID,
-            )
-            operation_print(archive_error, file=sys.stderr)
-            return 1
-
-    if row["phase"] == "WORKING":
-        operation_log(f"Worker 시작: {plan['id']} {plan['title']}")
-        worker_scope_before = begin_agent_scope(
-            connection,
-            repo,
-            worktree,
-            "worker",
-            input_fingerprint=_worktree_execplan_input_fingerprint(
-                worktree, catalog_plan
-            ),
-        )
-        persisted_validation_feedback = []
-        if _deserialize_failure_history(
-            catalog_plan["verify_failure_history"]
+    execution = ExecutionPhaseCoordinator(execution_ports)
+    prepared = execution.prepare()
+    if isinstance(prepared, ExecutionOutcome):
+        return _execution_outcome_step_result(prepared)
+    execution_context = prepared
+    while True:
+        execution_outcome = execution.dispatch(execution_context)
+        if (
+            execution_outcome.kind is ExecutionOutcomeKind.PHASE_ADVANCED
+            and execution_outcome.context is not None
         ):
-            persisted_validation_feedback.append(str(row["verify_result"] or ""))
-        if _deserialize_failure_history(
-            catalog_plan["review_failure_history"]
-        ):
-            persisted_validation_feedback.append(str(row["review_result"] or ""))
-        validation_feedback = "\n\n".join(
-            feedback for feedback in persisted_validation_feedback if feedback
-        )
-        guidance_targets = _guidance_worker_targets(
-            connection, repo, str(catalog_plan["plan_id"])
-        )
-        guidance_context = guidance_resume_context(
-            connection, repo, str(catalog_plan["plan_id"])
-        )
-        allow_common_plans = _published_plan_allows_common_plans(
-            repo_path, catalog_plan
-        )
-        result = run_agent_with_retries(
-            lambda current_session_id, session_recovery: run_agent(
-                provider,
-                worktree,
-                state_dir,
-                config_path,
-                "worker",
-                worker_prompt(
-                    row["plan_path"],
-                    row["last_error"],
-                    row["worker_result"],
-                    validation_feedback,
-                    archive_candidates=archive_candidates,
-                    session_recovery=session_recovery,
-                    guidance_common_allowed=is_loop_manager_repository(repo_path),
-                    guidance_context=guidance_context,
-                    allow_common_plans=allow_common_plans,
-                ),
-                read_only=False,
-                level=level,
-                persist_session=True,
-                session_id=current_session_id,
-                on_session_started=lambda started_session_id: update_project(
-                    connection,
-                    repo,
-                    worker_session_id=started_session_id,
-                ),
-            ),
-            session_id=row["worker_session_id"],
-        )
-        code, message = result
-        result_session_id = getattr(result, "session_id", None)
-        if result_session_id:
-            update_project(connection, repo, worker_session_id=result_session_id)
-
-        try:
-            plan = validate_worker_workspace_scope(
-                repo_path,
-                worktree,
-                branch,
-                base,
-                str(row["plan_path"]),
-                catalog_plan,
-                worker_scope_before,
-                allow_rebase=resolving_rebase,
-                allowed_requirement_archives=archive_scope_sources,
-                allowed_guidance_targets=guidance_targets,
-                allow_common_plans=allow_common_plans,
-            )
-            guidance_blocked = inspect_worker_guidance_result(
-                connection,
-                repo_path,
-                repo,
-                worktree,
-                catalog_plan,
-                message,
-            )
-        except (AgentScopeError, WorkspaceOwnershipError, RuntimeError) as error:
-            scope_error = str(error)
-            block_active_execplan(
-                connection,
-                repo,
-                worktree,
-                scope_error,
-                str(row["verify_result"] or ""),
-                reason=getattr(
-                    error,
-                    "reason_code",
-                    BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN,
-                ),
-            )
-            operation_print(scope_error, file=sys.stderr)
-            return 1
-        if guidance_blocked:
-            blocked = connection.execute(
-                "SELECT last_error FROM exec_plans WHERE repo = ? AND plan_id = ?",
-                (repo, catalog_plan["plan_id"]),
-            ).fetchone()
-            operation_print(
-                str(blocked["last_error"] if blocked else "guidance 승인 대기"),
-                file=sys.stderr,
-            )
-            return 1
-        clear_agent_scope(connection, repo)
-
-        if code:
-            worker_error = message or f"Agent 종료 코드 {code}"
-            result_kind = result.result_kind
-            if result_kind is AgentResultKind.TRANSIENT_FAILURE:
-                worker_error = f"{TRANSIENT_AGENT_ERROR_PREFIX} {worker_error}"
-                step_result = PROJECT_STEP_TRANSIENT_PAUSE
-            elif result_kind is AgentResultKind.USAGE_LIMIT:
-                worker_error = f"{USAGE_LIMIT_ERROR_PREFIX} {worker_error}"
-                step_result = PROJECT_STEP_USAGE_PAUSE
-            elif resolving_rebase:
-                worker_error = REBASE_CONFLICT_PREFIX + worker_error
-                block_active_execplan(
-                    connection,
-                    repo,
-                    worktree,
-                    worker_error,
-                    str(row["verify_result"] or ""),
-                    reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
-                )
-                operation_print(worker_error, file=sys.stderr)
-                return 1
-            else:
-                step_result = 1
-            if resolving_rebase:
-                worker_error = REBASE_CONFLICT_PREFIX + worker_error
-            update_project(
-                connection, repo, phase="WORKING", last_error=worker_error
-            )
-            operation_print(worker_error, file=sys.stderr)
-            return step_result
-        try:
-            parse_worker_result(message, plan)
-        except WorkerResultError as error:
-            validation_error = f"Worker 결과 검증 실패:\n{error}"
-            if resolving_rebase:
-                validation_error = REBASE_CONFLICT_PREFIX + validation_error
-            update_project(
-                connection,
-                repo,
-                phase="WORKING",
-                last_error=validation_error,
-            )
-            operation_print(validation_error, file=sys.stderr)
-            return 1
-        if resolving_rebase:
-            git(worktree, "add", "-A")
-            staged = git(
-                worktree,
-                "diff",
-                "--cached",
-                "--quiet",
-                check=False,
-            )
-            if staged.returncode not in {0, 1}:
-                staging_error = (
-                    "rebase 충돌 해결 결과 확인 실패 "
-                    f"(git 종료 코드 {staged.returncode})."
-                )
-                block_active_execplan(
-                    connection,
-                    repo,
-                    worktree,
-                    staging_error,
-                    str(row["verify_result"] or ""),
-                    reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE,
-                )
-                operation_print(staging_error, file=sys.stderr)
-                return 1
-            if staged.returncode == 0:
-                continued = git(
-                    worktree,
-                    "rebase",
-                    "--skip",
-                    check=False,
-                )
-            else:
-                continued = git(
-                    worktree,
-                    "-c",
-                    "core.editor=true",
-                    "rebase",
-                    "--continue",
-                    check=False,
-                )
-            if continued.returncode:
-                continuation_error = (
-                    REBASE_CONFLICT_PREFIX + continued.stdout[-8000:]
-                )
-                if not _rebase_in_progress_for_branch(worktree, branch):
-                    block_active_execplan(
-                        connection,
-                        repo,
-                        worktree,
-                        continuation_error,
-                        str(row["verify_result"] or ""),
-                        reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
-                    )
-                else:
-                    update_project(
-                        connection,
-                        repo,
-                        phase="WORKING",
-                        last_error=continuation_error,
-                    )
-                operation_print(continuation_error, file=sys.stderr)
-                return 1
-            if not branch_has_changes(worktree, base):
-                no_change_error = (
-                    "rebase 충돌 해결 후 Worker 변경이 남지 않아 PR을 "
-                    "생성할 수 없습니다."
-                )
-                block_active_execplan(
-                    connection,
-                    repo,
-                    worktree,
-                    no_change_error,
-                    str(row["verify_result"] or ""),
-                    reason=BlockReasonCode.PLAN_INPUT_INVALID,
-                )
-                operation_print(no_change_error, file=sys.stderr)
-                return 1
-            latest_sha = (
-                str(row["pr_conflict_base_oid"])
-                if int(row["pr_conflict_recovery"])
-                else git(
-                    worktree, "rev-parse", f"origin/{base}"
-                ).stdout.strip()
-            )
-            update_project(connection, repo, active_sha=latest_sha)
-            if validate_guidance_publication(
-                connection, repo, worktree, catalog_plan, message,
-                previous_base=str(row["active_sha"]), latest_base=latest_sha,
-            ):
-                return 1
-        if archive_sources:
-            post_worker_revision = (
-                latest_sha if resolving_rebase else str(row["active_sha"] or "")
-            )
-            try:
-                expected_archives = requirement_archive_candidates(
-                    connection,
-                    repo_path,
-                    repo,
-                    post_worker_revision,
-                    str(plan["id"]),
-                )
-                actual_archives = requirement_archive_move_set(
-                    repo_path,
-                    post_worker_revision,
-                    worktree,
-                )
-            except RequirementArchiveError as error:
-                archive_error = f"Requirement archive 이동 검증 실패: {error}"
-                block_active_execplan(
-                    connection,
-                    repo,
-                    worktree,
-                    archive_error,
-                    str(row["verify_result"] or ""),
-                    reason=BlockReasonCode.PLAN_INPUT_INVALID,
-                )
-                operation_print(archive_error, file=sys.stderr)
-                return 1
-            archive_error = requirement_archive_reconciliation_error(
-                expected_archives,
-                actual_archives,
-            )
-            if archive_error is not None:
-                update_project(
-                    connection,
-                    repo,
-                    phase="WORKING",
-                    validated_base_sha=None,
-                    worker_result=message,
-                    verify_result=None,
-                    review_result=None,
-                    last_error=archive_error,
-                )
-                operation_print(archive_error, file=sys.stderr)
-                return PROJECT_STEP_RETRY
-        update_project(
-            connection,
-            repo,
-            phase="VERIFYING",
-            validated_base_sha=None,
-            worker_result=message,
-            verify_result=None,
-            last_error=None,
-        )
-
-    row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
-    if row["phase"] == "VERIFYING":
-        if validate_guidance_publication(
-            connection, repo, worktree, catalog_plan, str(row["worker_result"] or "")
-        ):
-            return 1
-        operation_log(f"전체 verify 시작: {plan['id']} {plan['title']}")
-        try:
-            worker_publication = parse_worker_result(str(row["worker_result"] or ""), plan)
-        except WorkerResultError as error:
-            validation_error = f"Worker 결과 검증 실패:\n{error}"
-            update_project(connection, repo, phase="WORKING", last_error=validation_error)
-            operation_print(validation_error, file=sys.stderr)
-            return 1
-
-        verify_scope_before = begin_agent_scope(
-            connection,
-            repo,
-            worktree,
-            "worker",
-            input_fingerprint=_worktree_execplan_input_fingerprint(
-                worktree, catalog_plan
-            ),
-        )
-        passed, output = verify(worktree)
-        try:
-            plan = validate_worker_workspace_scope(
-                repo_path,
-                worktree,
-                branch,
-                base,
-                str(row["plan_path"]),
-                catalog_plan,
-                verify_scope_before,
-            )
-        except (AgentScopeError, WorkspaceOwnershipError, RuntimeError) as error:
-            scope_error = str(error)
-            block_active_execplan(
-                connection,
-                repo,
-                worktree,
-                scope_error,
-                output,
-                reason=getattr(
-                    error,
-                    "reason_code",
-                    BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN,
-                ),
-            )
-            operation_print(scope_error, file=sys.stderr)
-            return 1
-        clear_agent_scope(connection, repo)
-        if not passed:
-            operation_log(f"Worker 반환: {plan['id']} {plan['title']} (전체 verify 실패)", error=True)
-            decision = transition_validation_failure(
-                connection,
-                repo,
-                worktree,
-                "verify",
-                output,
-            )
-            operation_print(output, file=sys.stderr)
-            return 1 if decision.blocked else PROJECT_STEP_RETRY
-
-        # Every successful verify is a progress boundary. Clear its stage-local
-        # history before checking for a newer base or running a second verify
-        # after rebase, so later failures cannot inherit pre-success repeats.
-        clear_validation_failure_history(connection, repo, "verify")
-
-        dirty = bool(git(worktree, "status", "--porcelain").stdout.strip())
-        if not dirty and not branch_has_changes(worktree, base):
-            no_change_error = (
-                "Worker가 변경을 만들지 않아 PR을 생성할 수 없습니다. "
-                "ExecPlan은 연결된 PR의 Merge가 확인된 경우에만 MERGED가 됩니다."
-            )
-            block_active_execplan(
-                connection,
-                repo,
-                worktree,
-                no_change_error,
-                output,
-                reason=BlockReasonCode.PLAN_INPUT_INVALID,
-            )
-            operation_print(no_change_error, file=sys.stderr)
-            return 1
-        if dirty:
-            git(worktree, "add", "-A")
-            plan = validate_active_execplan_metadata(
-                repo_path,
-                worktree,
-                str(row["plan_path"]),
-                catalog_plan,
-            )
-            git(worktree, "commit", "-m", worker_publication.commit_title)
-
-        git(repo_path, "fetch", "origin")
-        latest_sha = git(repo_path, "rev-parse", f"origin/{base}").stdout.strip()
-        if latest_sha != row["active_sha"]:
-            update_project(
-                connection,
-                repo,
-                phase="WORKING",
-                validated_base_sha=None,
-                pr_conflict_base_oid=(
-                    latest_sha if int(row["pr_conflict_recovery"])
-                    else row["pr_conflict_base_oid"]
-                ),
-                last_error=REBASE_IN_PROGRESS_ERROR,
-            )
-            rebased = git(worktree, "rebase", latest_sha, check=False)
-            if rebased.returncode:
-                if _rebase_in_progress_for_branch(worktree, branch):
-                    if validate_guidance_publication(
-                        connection, repo, worktree, catalog_plan,
-                        str(row["worker_result"] or ""),
-                        previous_base=str(row["active_sha"]), latest_base=latest_sha,
-                    ):
-                        return 1
-                    rebase_failure = REBASE_CONFLICT_PREFIX + rebased.stdout[-8000:]
-                    update_project(
-                        connection,
-                        repo,
-                        phase="WORKING",
-                        validated_base_sha=None,
-                        last_error=rebase_failure,
-                    )
-                else:
-                    rebase_failure = f"rebase 실패:\n{rebased.stdout[-8000:]}"
-                    block_active_execplan(
-                        connection,
-                        repo,
-                        worktree,
-                        rebase_failure,
-                        output,
-                        reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
-                    )
-                operation_print(rebased.stdout, file=sys.stderr)
-                return 1
-            # Persist the new base now so recovery does not repeat that rebase.
-            update_project(connection, repo, active_sha=latest_sha)
-            if validate_guidance_publication(
-                connection, repo, worktree, catalog_plan,
-                str(row["worker_result"] or ""),
-                previous_base=str(row["active_sha"]), latest_base=latest_sha,
-            ):
-                return 1
-            operation_log(f"전체 verify 시작: {plan['id']} {plan['title']} (rebase 후)")
-            verify_scope_before = begin_agent_scope(
-                connection,
-                repo,
-                worktree,
-                "worker",
-                input_fingerprint=_worktree_execplan_input_fingerprint(
-                    worktree, catalog_plan
-                ),
-            )
-            passed, output = verify(worktree)
-            try:
-                plan = validate_worker_workspace_scope(
-                    repo_path,
-                    worktree,
-                    branch,
-                    base,
-                    str(row["plan_path"]),
-                    catalog_plan,
-                    verify_scope_before,
-                )
-            except (AgentScopeError, WorkspaceOwnershipError, RuntimeError) as error:
-                scope_error = str(error)
-                block_active_execplan(
-                    connection,
-                    repo,
-                    worktree,
-                    scope_error,
-                    output,
-                    reason=getattr(
-                        error,
-                        "reason_code",
-                        BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN,
-                    ),
-                )
-                operation_print(scope_error, file=sys.stderr)
-                return 1
-            clear_agent_scope(connection, repo)
-            if not passed:
-                operation_log(f"Worker 반환: {plan['id']} {plan['title']} (rebase 후 전체 verify 실패)", error=True)
-                decision = transition_validation_failure(
-                    connection,
-                    repo,
-                    worktree,
-                    "verify",
-                    output,
-                )
-                operation_print(output, file=sys.stderr)
-                return 1 if decision.blocked else PROJECT_STEP_RETRY
-            clear_validation_failure_history(connection, repo, "verify")
-            if git(worktree, "status", "--porcelain").stdout.strip():
-                git(worktree, "add", "-A")
-                plan = validate_active_execplan_metadata(
-                    repo_path,
-                    worktree,
-                    str(row["plan_path"]),
-                    catalog_plan,
-                )
-                git(worktree, "commit", "-m", worker_publication.commit_title)
-            update_project(
-                connection,
-                repo,
-                active_sha=latest_sha,
-                validated_base_sha=latest_sha,
-                verify_result=output,
-            )
-        else:
-            update_project(
-                connection,
-                repo,
-                validated_base_sha=str(row["active_sha"] or ""),
-                verify_result=output,
-            )
-        try:
-            plan = validate_active_execplan_metadata(
-                repo_path,
-                worktree,
-                str(row["plan_path"]),
-                catalog_plan,
-            )
-        except RuntimeError as error:
-            metadata_error = str(error)
-            block_active_execplan(
-                connection,
-                repo,
-                worktree,
-                metadata_error,
-                output,
-                reason=BlockReasonCode.PLAN_INPUT_INVALID,
-            )
-            operation_print(metadata_error, file=sys.stderr)
-            return 1
-
-        if not branch_has_changes(worktree, base):
-            no_change_error = (
-                "rebase 후 Worker 변경이 남지 않아 PR을 생성할 수 없습니다. "
-                "ExecPlan은 연결된 PR의 Merge가 확인된 경우에만 MERGED가 됩니다."
-            )
-            block_active_execplan(
-                connection,
-                repo,
-                worktree,
-                no_change_error,
-                output,
-                reason=BlockReasonCode.PLAN_INPUT_INVALID,
-            )
-            operation_print(no_change_error, file=sys.stderr)
-            return 1
-        update_project(connection, repo, phase="REVIEWING", last_error=None)
-
-    row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
-    if row["phase"] == "REVIEWING":
-        protocol_error: str | None = None
-        verdict: str | None = None
-        review = ""
-        for protocol_attempt in range(1, MAX_REVIEWER_PROTOCOL_ATTEMPTS + 1):
-            if protocol_attempt == 1:
-                operation_log(f"Reviewer 시작: {plan['id']} {plan['title']}")
-            else:
-                operation_log(
-                    f"Reviewer 프로토콜 교정 재시도: {plan['id']} "
-                    f"{plan['title']} ({protocol_attempt}/"
-                    f"{MAX_REVIEWER_PROTOCOL_ATTEMPTS})"
-                )
-            reviewer_scope_before = begin_agent_scope(
-                connection,
-                repo,
-                worktree,
-                "reviewer",
-                input_fingerprint=_worktree_execplan_input_fingerprint(
-                    worktree, catalog_plan
-                ),
-            )
-
-            review_result = run_agent_with_retries(
-                lambda current_session_id, session_recovery: run_agent(
-                    provider,
-                    worktree,
-                    state_dir,
-                    config_path,
-                    "reviewer",
-                    reviewer_prompt(
-                        base,
-                        row["worker_result"],
-                        row["verify_result"],
-                        row["review_result"],
-                        session_recovery=session_recovery,
-                        protocol_error=protocol_error,
-                    ),
-                    read_only=True,
-                    persist_session=True,
-                    session_id=current_session_id,
-                    on_session_started=lambda started_session_id: update_project(
-                        connection,
-                        repo,
-                        reviewer_session_id=started_session_id,
-                    ),
-                ),
-                session_id=row["reviewer_session_id"],
-            )
-            code, review = review_result
-            if review_result.session_id:
-                update_project(
-                    connection,
-                    repo,
-                    reviewer_session_id=review_result.session_id,
-                )
-            try:
-                reviewer_scope_after = capture_git_snapshot(worktree)
-                validate_agent_scope(
-                    "reviewer",
-                    worktree,
-                    reviewer_scope_before,
-                    reviewer_scope_after,
-                    external_worktree=repo_path,
-                    base_branch=base,
-                )
-                validate_managed_worktree(repo_path, worktree, branch)
-            except (AgentScopeError, WorkspaceOwnershipError, RuntimeError) as error:
-                scope_error = str(error)
-                block_active_execplan(
-                    connection,
-                    repo,
-                    worktree,
-                    scope_error,
-                    str(row["verify_result"] or ""),
-                    reason=getattr(
-                        error,
-                        "reason_code",
-                        BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN,
-                    ),
-                )
-                operation_print(scope_error, file=sys.stderr)
-                return 1
-            clear_agent_scope(connection, repo)
-
-            if code:
-                reviewer_error = review or f"Reviewer 종료 코드 {code}"
-                if review_result.result_kind is AgentResultKind.TRANSIENT_FAILURE:
-                    reviewer_error = f"{TRANSIENT_AGENT_ERROR_PREFIX} {reviewer_error}"
-                    step_result = PROJECT_STEP_TRANSIENT_PAUSE
-                elif review_result.result_kind is AgentResultKind.USAGE_LIMIT:
-                    reviewer_error = f"{USAGE_LIMIT_ERROR_PREFIX} {reviewer_error}"
-                    step_result = PROJECT_STEP_USAGE_PAUSE
-                else:
-                    step_result = 1
-                update_project(
-                    connection,
-                    repo,
-                    phase="REVIEWING",
-                    last_error=reviewer_error,
-                    review_result=review,
-                )
-                operation_print(reviewer_error, file=sys.stderr)
-                return step_result
-
-            try:
-                verdict, _issue_ids = parse_reviewer_result(review)
-            except ReviewerProtocolError as error:
-                protocol_error = str(error)
-                reviewer_error = f"Reviewer 결과 프로토콜 오류: {protocol_error}"
-                update_project(
-                    connection,
-                    repo,
-                    phase="REVIEWING",
-                    last_error=reviewer_error,
-                    review_result=review,
-                )
-                if protocol_attempt == MAX_REVIEWER_PROTOCOL_ATTEMPTS:
-                    exhausted_error = (
-                        f"{reviewer_error} "
-                        f"(프로토콜 교정 {MAX_REVIEWER_PROTOCOL_ATTEMPTS}회 실패)"
-                    )
-                    block_active_execplan(
-                        connection,
-                        repo,
-                        worktree,
-                        exhausted_error,
-                        str(row["verify_result"] or ""),
-                        reason=BlockReasonCode.REVIEW_PROTOCOL_EXHAUSTED,
-                    )
-                    operation_print(exhausted_error, file=sys.stderr)
-                    return 1
-                operation_print(reviewer_error, file=sys.stderr)
-                row = connection.execute(
-                    "SELECT * FROM projects WHERE repo = ?", (repo,)
-                ).fetchone()
-                continue
-            break
-
-        assert verdict is not None
-        if verdict == "FAIL":
-            decision = transition_validation_failure(
-                connection,
-                repo,
-                worktree,
-                "review",
-                review,
-            )
-            operation_log(f"Worker 반환: {plan['id']} {plan['title']} (Review 실패)", error=True)
-            operation_print(review or "Reviewer 결과가 유효하지 않습니다.", file=sys.stderr)
-            return 1 if decision.blocked else PROJECT_STEP_RETRY
-        clear_validation_failure_history(connection, repo, "review")
-        update_project(
-            connection,
-            repo,
-            phase="PUBLISHING",
-            last_error=None,
-            review_result=review,
-        )
-
-    row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
-    if row["phase"] == "PUBLISHING":
-        existing_pr = pr_for_branch(
-            repo_path,
-            branch,
-            str(row["pr_url"]) if int(row["pr_conflict_recovery"]) else None,
-        )
-        if existing_pr:
-            try:
-                reconciliation = reconcile_existing_pull_request(
-                    connection,
-                    repo_path,
-                    state_dir,
-                    repo,
-                    row,
-                    existing_pr,
-                )
-                if reconciliation is not None:
-                    return reconciliation
-                row = connection.execute(
-                    "SELECT * FROM projects WHERE repo = ?", (repo,)
-                ).fetchone()
-            except PublicationSafetyError as error:
-                publication_error = f"기존 PR 복구 거부: {error}"
-                block_active_execplan(
-                    connection,
-                    repo,
-                    worktree,
-                    publication_error,
-                    str(row["verify_result"] or ""),
-                    reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
-                )
-                operation_print(publication_error, file=sys.stderr)
-                return 1
-
-        git(repo_path, "fetch", "origin")
-        latest_sha = git(
-            repo_path, "rev-parse", f"origin/{base}"
-        ).stdout.strip()
-        remote_oid = (
-            None
-            if int(row["pr_conflict_recovery"])
-            else remote_branch_oid(repo_path, branch)
-        )
-        try:
-            if not int(row["pr_conflict_recovery"]):
-                record_remote_publication_branch(
-                    connection,
-                    repo_path,
-                    state_dir,
-                    repo,
-                    branch,
-                    worktree,
-                    remote_oid,
-                )
-        except PublicationSafetyError as error:
-            publication_error = str(error)
-            block_active_execplan(
-                connection,
-                repo,
-                worktree,
-                publication_error,
-                str(row["verify_result"] or ""),
-                reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
-            )
-            operation_print(publication_error, file=sys.stderr)
-            return 1
-
-        if latest_sha != row["validated_base_sha"]:
-            if latest_sha != row["active_sha"]:
-                update_project(
-                    connection,
-                    repo,
-                    phase="WORKING",
-                    validated_base_sha=None,
-                    pr_conflict_base_oid=(
-                        latest_sha if int(row["pr_conflict_recovery"])
-                        else row["pr_conflict_base_oid"]
-                    ),
-                    last_error=REBASE_IN_PROGRESS_ERROR,
-                )
-                rebased = git(
-                    worktree, "rebase", latest_sha, check=False
-                )
-                if rebased.returncode:
-                    if _rebase_in_progress_for_branch(worktree, branch):
-                        if validate_guidance_publication(
-                            connection, repo, worktree, catalog_plan,
-                            str(row["worker_result"] or ""),
-                            previous_base=str(row["active_sha"]), latest_base=latest_sha,
-                        ):
-                            return 1
-                        rebase_failure = (
-                            REBASE_CONFLICT_PREFIX + rebased.stdout[-8000:]
-                        )
-                        update_project(
-                            connection,
-                            repo,
-                            phase="WORKING",
-                            validated_base_sha=None,
-                            last_error=rebase_failure,
-                        )
-                    else:
-                        rebase_failure = (
-                            f"게시 직전 rebase 실패:\n{rebased.stdout[-8000:]}"
-                        )
-                        block_active_execplan(
-                            connection,
-                            repo,
-                            worktree,
-                            rebase_failure,
-                            str(row["verify_result"] or ""),
-                            reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
-                        )
-                    operation_print(rebase_failure, file=sys.stderr)
-                    return 1
-                update_project(connection, repo, active_sha=latest_sha)
-                if validate_guidance_publication(
-                    connection, repo, worktree, catalog_plan,
-                    str(row["worker_result"] or ""),
-                    previous_base=str(row["active_sha"]), latest_base=latest_sha,
-                ):
-                    return 1
-                if not branch_has_changes(worktree, base):
-                    no_change_error = (
-                        "게시 직전 rebase 후 Worker 변경이 남지 않아 PR을 "
-                        "생성할 수 없습니다."
-                    )
-                    block_active_execplan(
-                        connection,
-                        repo,
-                        worktree,
-                        no_change_error,
-                        str(row["verify_result"] or ""),
-                        reason=BlockReasonCode.PLAN_INPUT_INVALID,
-                    )
-                    operation_print(no_change_error, file=sys.stderr)
-                    return 1
-                update_project(
-                    connection,
-                    repo,
-                    active_sha=latest_sha,
-                    validated_base_sha=None,
-                    phase="VERIFYING",
-                    verify_result=None,
-                    review_result=None,
-                    last_error=None,
-                )
-            else:
-                update_project(
-                    connection,
-                    repo,
-                    validated_base_sha=None,
-                    phase="VERIFYING",
-                    verify_result=None,
-                    review_result=None,
-                    last_error=None,
-                )
-            operation_print(
-                "게시 직전 base가 변경되어 전체 verify와 Review를 다시 수행합니다.",
-                file=sys.stderr,
-            )
-            return PROJECT_STEP_RETRY
-
-        if row["active_sha"] != latest_sha:
-            publication_error = (
-                "검증 base와 관리 branch의 반영 base가 일치하지 않습니다."
-            )
-            block_active_execplan(
-                connection,
-                repo,
-                worktree,
-                publication_error,
-                str(row["verify_result"] or ""),
-                reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE,
-            )
-            operation_print(publication_error, file=sys.stderr)
-            return 1
-        if archive_sources:
-            try:
-                final_archive_candidates = requirement_archive_candidates(
-                    connection,
-                    repo_path,
-                    repo,
-                    latest_sha,
-                    str(plan["id"]),
-                )
-                final_archive_moves = requirement_archive_move_set(
-                    repo_path,
-                    latest_sha,
-                    worktree,
-                    tracked_revision="HEAD",
-                )
-            except RequirementArchiveError as error:
-                archive_error = f"게시 직전 Requirement archive 확인 실패: {error}"
-                block_active_execplan(
-                    connection,
-                    repo,
-                    worktree,
-                    archive_error,
-                    str(row["verify_result"] or ""),
-                    reason=BlockReasonCode.PLAN_INPUT_INVALID,
-                )
-                operation_print(archive_error, file=sys.stderr)
-                return 1
-            archive_error = requirement_archive_reconciliation_error(
-                final_archive_candidates,
-                final_archive_moves,
-            )
-            if archive_error is not None:
-                update_project(
-                    connection,
-                    repo,
-                    phase="WORKING",
-                    validated_base_sha=None,
-                    verify_result=None,
-                    review_result=None,
-                    last_error=archive_error,
-                )
-                operation_print(archive_error, file=sys.stderr)
-                return PROJECT_STEP_RETRY
-        if validate_guidance_publication(
-            connection, repo, worktree, catalog_plan, str(row["worker_result"] or "")
-        ):
-            return 1
-        if not branch_has_changes(worktree, base):
-            no_change_error = (
-                "게시할 Worker 변경이 남지 않아 PR을 생성할 수 없습니다."
-            )
-            block_active_execplan(
-                connection,
-                repo,
-                worktree,
-                no_change_error,
-                str(row["verify_result"] or ""),
-                reason=BlockReasonCode.PLAN_INPUT_INVALID,
-            )
-            operation_print(no_change_error, file=sys.stderr)
-            return 1
-
-        if int(row["pr_conflict_recovery"]):
-            current_pr = pr_for_branch(
-                repo_path, branch, str(row["pr_url"] or "")
-            )
-            if current_pr is None:
-                publication_error = (
-                    "게시 직전 저장된 기존 PR을 다시 조회할 수 없습니다."
-                )
-                block_active_execplan(
-                    connection,
-                    repo,
-                    worktree,
-                    publication_error,
-                    str(row["verify_result"] or ""),
-                    reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
-                )
-                operation_print(publication_error, file=sys.stderr)
-                return 1
-            reconciliation = reconcile_existing_pull_request(
-                connection,
-                repo_path,
-                state_dir,
-                repo,
-                row,
-                current_pr,
-            )
-            if reconciliation is not None:
-                return reconciliation
-            row = connection.execute(
-                "SELECT * FROM projects WHERE repo = ?", (repo,)
-            ).fetchone()
-            try:
-                head_oid = push_owned_pr_conflict_recovery(
-                    connection,
-                    repo_path,
-                    state_dir,
-                    repo,
-                    branch,
-                    worktree,
-                    current_pr,
-                )
-            except PublicationSafetyError as error:
-                publication_error = str(error)
-                block_active_execplan(
-                    connection,
-                    repo,
-                    worktree,
-                    publication_error,
-                    str(row["verify_result"] or ""),
-                    reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
-                )
-                operation_print(publication_error, file=sys.stderr)
-                return 1
-            except RuntimeError as error:
-                publication_error = str(error)
-                update_project(
-                    connection,
-                    repo,
-                    phase="PUBLISHING",
-                    last_error=publication_error,
-                )
-                operation_print(publication_error, file=sys.stderr)
-                return 1
-            runtime_state.RuntimeStateRepository(connection).open_pull_request(
-                repo,
-                publication_remote_oid=head_oid,
-                pr_head_oid=head_oid,
-                pr_conflict_recovery=0,
-                pr_conflict_head_oid=None,
-                pr_conflict_base_oid=None,
-            )
-            operation_print(f"기존 PR 충돌 복구 게시 완료: {row['pr_url']}")
-            return 0
-        plan_sha = str(row["plan_sha"] or "")
-        if not plan_sha:
-            plan_error = "계획 commit SHA가 없습니다."
-            block_active_execplan(
-                connection,
-                repo,
-                worktree,
-                plan_error,
-                str(row["verify_result"] or ""),
-                reason=BlockReasonCode.PLAN_INPUT_INVALID,
-            )
-            operation_print(plan_error, file=sys.stderr)
-            return 1
-        plan_text = git(
-            worktree, "show", f"{plan_sha}:{row['plan_path']}"
-        ).stdout
-        plan = published_execplan(str(row["plan_path"]), plan_text)
-        try:
-            worker_publication = parse_worker_result(
-                str(row["worker_result"] or ""), plan
-            )
-        except WorkerResultError as error:
-            validation_error = f"Worker 결과 검증 실패:\n{error}"
-            update_project(
-                connection,
-                repo,
-                phase="WORKING",
-                validated_base_sha=None,
-                last_error=validation_error,
-            )
-            operation_print(validation_error, file=sys.stderr)
-            return 1
-        origin_url = git(
-            worktree, "remote", "get-url", "origin"
-        ).stdout.strip()
-        body = build_pr_body(
-            worker_publication,
-            plan,
-            str(row["plan_path"]),
-            plan_text,
-            origin_url,
-            plan_sha,
-        )
-        try:
-            head_oid = push_managed_publication_branch(
-                connection,
-                repo_path,
-                state_dir,
-                repo,
-                branch,
-                worktree,
-            )
-        except PublicationSafetyError as error:
-            publication_error = str(error)
-            block_active_execplan(
-                connection,
-                repo,
-                worktree,
-                publication_error,
-                str(row["verify_result"] or ""),
-                reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
-            )
-            operation_print(publication_error, file=sys.stderr)
-            return 1
-        except RuntimeError as error:
-            publication_error = str(error)
-            update_project(
-                connection,
-                repo,
-                phase="PUBLISHING",
-                last_error=publication_error,
-            )
-            operation_print(publication_error, file=sys.stderr)
-            return 1
-
-        title = f"Implement {plan['id']}: {plan['title']}"
-        created = command(
-            [
-                "gh",
-                "pr",
-                "create",
-                "--base",
-                base,
-                "--head",
-                branch,
-                "--title",
-                title,
-                "--body",
-                body,
-            ],
-            cwd=worktree,
-        )
-        url = created.stdout.strip().splitlines()[-1]
-        runtime_state.RuntimeStateRepository(connection).open_pull_request(
-            repo,
-            pr_url=url,
-            pr_head_oid=head_oid,
-        )
-        operation_print(f"PR 생성 완료: {url}")
-    return 0
-
+            execution_context = execution_outcome.context
+            continue
+        return _execution_outcome_step_result(execution_outcome)
 
 def run_project_result(
     connection: sqlite3.Connection,
@@ -15463,6 +14182,104 @@ def main() -> int:
     ) as error:
         operation_log(f"오류: {error}", error=True)
         return 1
+
+
+
+def _execution_outcome_step_result(outcome: ExecutionOutcome) -> int:
+    """Translate a typed execution result at the process adapter boundary."""
+
+    if outcome.kind in {
+        ExecutionOutcomeKind.SUCCESS,
+        ExecutionOutcomeKind.STABLE_WAIT,
+    }:
+        return 0
+    if outcome.kind in {
+        ExecutionOutcomeKind.PHASE_ADVANCED,
+        ExecutionOutcomeKind.RETRY,
+    }:
+        return PROJECT_STEP_RETRY
+    if outcome.kind is ExecutionOutcomeKind.TRANSIENT_PAUSE:
+        return PROJECT_STEP_TRANSIENT_PAUSE
+    if outcome.kind is ExecutionOutcomeKind.USAGE_PAUSE:
+        return PROJECT_STEP_USAGE_PAUSE
+    return 1
+
+
+def _ExecutionLifecyclePorts(connection, runtime_repository, **identity):
+    """Bind named effects to legacy helpers, preserving their patch points."""
+    state = _ExecutionStatePort(connection, runtime_repository, identity["repo"])
+    effects = execution_handlers.ExecutionEffects(
+        state=state,
+        contract=SimpleNamespace(**{name: globals()[name] for name in ('AgentResultKind', 'AgentScopeError', 'MAX_REVIEWER_PROTOCOL_ATTEMPTS', 'PROJECT_STEP_RETRY', 'PROJECT_STEP_TRANSIENT_PAUSE', 'PROJECT_STEP_USAGE_PAUSE', 'PublicationSafetyError', 'REBASE_CONFLICT_PREFIX', 'REBASE_IN_PROGRESS_ERROR', 'RequirementArchiveError', 'ReviewerProtocolError', 'TRANSIENT_AGENT_ERROR_PREFIX', 'USAGE_LIMIT_ERROR_PREFIX', 'WORKSPACE_OWNED', 'WORKSPACE_RESERVED', 'WorkerResultError', 'WorkspaceOwnershipError')}),
+        workspace=execution_handlers.WorkspaceEffects(
+            is_directory=lambda path: path.is_dir(),
+            git=state.bind(git, name="git", connected=False, mutates=False),
+            make_worktree=state.bind(make_worktree, name="make_worktree", connected=False, mutates=False),
+            branch_has_changes=state.bind(branch_has_changes, name="branch_has_changes", connected=False, mutates=False),
+            remote_branch_oid=state.bind(remote_branch_oid, name="remote_branch_oid", connected=False, mutates=False),
+            _rebase_in_progress_for_branch=state.bind(_rebase_in_progress_for_branch, name="_rebase_in_progress_for_branch", connected=False, mutates=False),
+            validate_execplan_workspace_identity=state.bind(validate_execplan_workspace_identity, name="validate_execplan_workspace_identity", connected=False, mutates=False),
+            validate_managed_worktree=state.bind(validate_managed_worktree, name="validate_managed_worktree", connected=False, mutates=False),
+            _plan_id_from_path=state.bind(_plan_id_from_path, name="_plan_id_from_path", connected=False, mutates=False),
+            reserve_execplan_workspace=state.bind(reserve_execplan_workspace, name="reserve_execplan_workspace", connected=True, mutates=True),
+            mark_execplan_workspace_owned=state.bind(mark_execplan_workspace_owned, name="mark_execplan_workspace_owned", connected=True, mutates=True),
+            resume_pr_conflict_rebase=state.bind(resume_pr_conflict_rebase, name="resume_pr_conflict_rebase", connected=True, mutates=True),
+        ),
+        agent=execution_handlers.AgentEffects(
+            begin_agent_scope=state.bind(begin_agent_scope, name="begin_agent_scope", connected=True, mutates=True),
+            capture_git_snapshot=state.bind(capture_git_snapshot, name="capture_git_snapshot", connected=False, mutates=False),
+            clear_agent_scope=state.bind(clear_agent_scope, name="clear_agent_scope", connected=True, mutates=True),
+            validate_agent_scope=state.bind(validate_agent_scope, name="validate_agent_scope", connected=False, mutates=False),
+            validate_worker_workspace_scope=state.bind(validate_worker_workspace_scope, name="validate_worker_workspace_scope", connected=False, mutates=False),
+            _worktree_execplan_input_fingerprint=state.bind(_worktree_execplan_input_fingerprint, name="_worktree_execplan_input_fingerprint", connected=False, mutates=False),
+            _guidance_worker_targets=state.bind(_guidance_worker_targets, name="_guidance_worker_targets", connected=True, mutates=False),
+            guidance_resume_context=state.bind(guidance_resume_context, name="guidance_resume_context", connected=True, mutates=False),
+            _published_plan_allows_common_plans=state.bind(_published_plan_allows_common_plans, name="_published_plan_allows_common_plans", connected=False, mutates=False),
+            is_loop_manager_repository=state.bind(is_loop_manager_repository, name="is_loop_manager_repository", connected=False, mutates=False),
+            inspect_worker_guidance_result=state.bind(inspect_worker_guidance_result, name="inspect_worker_guidance_result", connected=True, mutates=True),
+            validate_guidance_publication=state.bind(validate_guidance_publication, name="validate_guidance_publication", connected=True, mutates=True),
+            run_agent=state.bind(run_agent, name="run_agent", connected=False, mutates=False),
+            run_agent_with_retries=state.bind(run_agent_with_retries, name="run_agent_with_retries", connected=False, mutates=False),
+            worker_prompt=state.bind(worker_prompt, name="worker_prompt", connected=False, mutates=False),
+            reviewer_prompt=state.bind(reviewer_prompt, name="reviewer_prompt", connected=False, mutates=False),
+        ),
+        validation=execution_handlers.ValidationEffects(
+            verify=state.bind(verify, name="verify", connected=False, mutates=False),
+            parse_worker_result=state.bind(parse_worker_result, name="parse_worker_result", connected=False, mutates=False),
+            parse_reviewer_result=state.bind(parse_reviewer_result, name="parse_reviewer_result", connected=False, mutates=False),
+            validate_active_execplan_metadata=state.bind(validate_active_execplan_metadata, name="validate_active_execplan_metadata", connected=False, mutates=False),
+            ensure_worker_level_state=state.bind(ensure_worker_level_state, name="ensure_worker_level_state", connected=True, mutates=True),
+            _deserialize_failure_history=state.bind(_deserialize_failure_history, name="_deserialize_failure_history", connected=False, mutates=False),
+            clear_validation_failure_history=state.bind(clear_validation_failure_history, name="clear_validation_failure_history", connected=True, mutates=True),
+            transition_validation_failure=state.bind(transition_validation_failure, name="transition_validation_failure", connected=True, mutates=True),
+        ),
+        archive=execution_handlers.ArchiveEffects(
+            requirement_archive_sources=state.bind(requirement_archive_sources, name="requirement_archive_sources", connected=True, mutates=False),
+            requirement_archive_candidates=state.bind(requirement_archive_candidates, name="requirement_archive_candidates", connected=True, mutates=False),
+            requirement_archive_move_set=state.bind(requirement_archive_move_set, name="requirement_archive_move_set", connected=False, mutates=False),
+            requirement_archive_reconciliation_error=state.bind(requirement_archive_reconciliation_error, name="requirement_archive_reconciliation_error", connected=False, mutates=False),
+            requirement_archive_touched_sources=state.bind(requirement_archive_touched_sources, name="requirement_archive_touched_sources", connected=False, mutates=False),
+        ),
+        publication=execution_handlers.PublicationEffects(
+            pr_for_branch=state.bind(pr_for_branch, name="pr_for_branch", connected=False, mutates=False),
+            reconcile_existing_pull_request=state.bind(reconcile_existing_pull_request, name="reconcile_existing_pull_request", connected=True, mutates=True),
+            record_remote_publication_branch=state.bind(record_remote_publication_branch, name="record_remote_publication_branch", connected=True, mutates=True),
+            push_managed_publication_branch=state.bind(push_managed_publication_branch, name="push_managed_publication_branch", connected=True, mutates=True),
+            push_owned_pr_conflict_recovery=state.bind(push_owned_pr_conflict_recovery, name="push_owned_pr_conflict_recovery", connected=True, mutates=True),
+            published_execplan=state.bind(published_execplan, name="published_execplan", connected=False, mutates=False),
+            build_pr_body=state.bind(build_pr_body, name="build_pr_body", connected=False, mutates=False),
+            command=state.bind(command, name="command", connected=False, mutates=False),
+        ),
+        blocking=execution_handlers.BlockingEffects(
+            block_active_execplan=state.bind(block_active_execplan, name="block_active_execplan", connected=True, mutates=True),
+            block_active_execplan_from_revision=state.bind(block_active_execplan_from_revision, name="block_active_execplan_from_revision", connected=True, mutates=True),
+        ),
+        events=execution_handlers.EventsEffects(
+            operation_log=state.bind(operation_log, name="operation_log", connected=False, mutates=False),
+            operation_print=state.bind(operation_print, name="operation_print", connected=False, mutates=False),
+        ),
+    )
+    return execution_handlers.ExecutionHandlers(effects, **identity)
 
 
 if __name__ == "__main__":

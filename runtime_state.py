@@ -631,6 +631,25 @@ class RuntimeStateRepository:
                 self._enqueue(repo)
             return self.get(repo, plan_id)
 
+    def transition_from_snapshot(
+        self,
+        expected: ExecutionSnapshot,
+        *,
+        plan_values: Mapping[str, object],
+        project_values: Mapping[str, object],
+    ) -> ExecutionSnapshot:
+        """Reject stale phase observations and switched project projections."""
+        with _transaction(self.connection):
+            if self.projected(expected.repo) != expected:
+                raise RuntimeStateError("execution snapshot이 변경되었습니다.")
+            return self.transition(
+                expected.repo,
+                expected.plan_id,
+                expected_status=expected.status,
+                plan_values=plan_values,
+                project_values=project_values,
+            )
+
     def activate(
         self,
         repo: str,
