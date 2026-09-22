@@ -6113,6 +6113,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "maintenance_state.py",
                 "notifications.py",
                 "project_registry.py",
+                "runtime_state.py",
                 "scoped_blocking.py",
             ):
                 shutil.copy(loop_manager.ROOT / module_name, repo / module_name)

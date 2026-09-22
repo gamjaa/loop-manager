@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from enum import Enum
 import sqlite3
 
+import runtime_state
+
 
 class BlockScope(str, Enum):
     PLAN = "plan"
@@ -141,27 +143,19 @@ def record_plan_block(
 ) -> None:
     if reason_scope(reason) is not BlockScope.PLAN:
         raise ValueError(f"프로젝트 범위 원인을 계획 차단에 사용할 수 없습니다: {reason.value}")
-    updated = connection.execute(
-        "UPDATE exec_plans SET status = 'PLAN_BLOCKED', blocked_reason = ?, "
-        "last_error = ? WHERE repo = ? AND plan_id = ?",
-        (reason.value, evidence, repo, plan_id),
-    )
-    if updated.rowcount != 1:
-        raise RuntimeError(f"차단할 ExecPlan을 찾을 수 없습니다: {plan_id}")
-    connection.execute(
-        """
-        INSERT INTO execplan_blocks (
-            repo, plan_id, scope, reason_code, evidence, release_fingerprint
-        ) VALUES (?, ?, 'plan', ?, ?, ?)
-        ON CONFLICT(repo, plan_id) DO UPDATE SET
-            scope = excluded.scope,
-            reason_code = excluded.reason_code,
-            evidence = excluded.evidence,
-            release_fingerprint = excluded.release_fingerprint,
-            updated_at = CURRENT_TIMESTAMP
-        """,
-        (repo, plan_id, reason.value, evidence, release_fingerprint),
-    )
+    try:
+        runtime_state.RuntimeStateRepository(connection).block_plan(
+            repo,
+            plan_id,
+            reason_code=reason.value,
+            evidence=evidence,
+            release_fingerprint=release_fingerprint,
+            enqueue=False,
+        )
+    except runtime_state.RuntimeStateError as error:
+        raise RuntimeError(
+            f"차단할 ExecPlan을 찾을 수 없습니다: {plan_id}"
+        ) from error
 
 
 def record_project_block(
