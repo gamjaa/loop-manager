@@ -1014,6 +1014,160 @@ class MaintenanceOrchestrationTest(unittest.TestCase):
         )
         self.assertIsNone(project["planning_error"])
 
+    def test_published_combined_batch_recovers_before_changed_fingerprint_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo_path, state_dir, connection, repo = self._integration_project(
+                directory,
+                (("G-000", "Merged Foundation", "MERGED", (), "normal"),),
+            )
+            planner_calls = 0
+            selected: list[str | None] = []
+
+            def agent(
+                worktree, _state, _config, role_name, _prompt, **_kwargs
+            ):
+                nonlocal planner_calls
+                if role_name == "planner":
+                    planner_calls += 1
+                    self.assertEqual(planner_calls, 1)
+                    plans_dir = worktree / "docs/plans"
+                    (plans_dir / "[G-001] Extract Boundary.md").write_text(
+                        plan_text(
+                            "G-001",
+                            "Extract Boundary",
+                            depends_on=("G-000",),
+                        ),
+                        encoding="utf-8",
+                    )
+                    (plans_dir / "[G-002] Pending Capability.md").write_text(
+                        plan_text(
+                            "G-002",
+                            "Pending Capability",
+                            depends_on=("G-001",),
+                            purpose=(
+                                "Deliver a pending product capability after the "
+                                "structural boundary is available."
+                            ),
+                            acceptance_criteria=(
+                                "Preserve the public API and expose the queued "
+                                "product behavior."
+                            ),
+                            implementation=(
+                                "Implement the product behavior on the extracted "
+                                "module boundary."
+                            ),
+                        ),
+                        encoding="utf-8",
+                    )
+                    return loop_manager.CodexResult(
+                        0,
+                        'MAINTENANCE_RESULT: {"outcome":"refactoring",'
+                        '"plan_ids":["G-001"]}',
+                        "combined-session",
+                    )
+                selected.append(self._active_plan_id(connection, repo))
+                return loop_manager.CodexResult(1, "stop worker", "worker-session")
+
+            real_transition = maintenance_state.MaintenanceRepository.transition
+
+            def fail_refactoring_transition(
+                repository, repo_arg, *arguments, **kwargs
+            ):
+                if (
+                    kwargs.get("next_phase")
+                    is maintenance_state.MaintenancePhase.REFACTORING
+                ):
+                    raise maintenance_state.MaintenanceStateError(
+                        "injected combined SQLite interruption"
+                    )
+                return real_transition(
+                    repository, repo_arg, *arguments, **kwargs
+                )
+
+            try:
+                with mock.patch.object(
+                    maintenance_state.MaintenanceRepository,
+                    "transition",
+                    autospec=True,
+                    side_effect=fail_refactoring_transition,
+                ):
+                    first = self._run_registered(
+                        connection, state_dir, repo_path, agent
+                    )
+                prepared = maintenance_state.MaintenanceRepository(connection).get(
+                    repo
+                )
+                project = connection.execute(
+                    "SELECT worktree, planning_attempt_fingerprint "
+                    "FROM projects WHERE repo = ?",
+                    (repo,),
+                ).fetchone()
+                prepared_worktree = Path(project["worktree"])
+                plan_commit = str(prepared.publication_commit_sha)
+                self.assertTrue(prepared.include_general_planning)
+                self.assertEqual(prepared.publication_stage, "prepared")
+                self.assertTrue(prepared_worktree.is_dir())
+
+                git_command(repo_path, "fetch", "origin")
+                git_command(repo_path, "merge", "--ff-only", "origin/main")
+                product = repo_path / "docs/PRODUCT.md"
+                product.write_text(
+                    product.read_text(encoding="utf-8")
+                    + "\nNew product input after publication.\n",
+                    encoding="utf-8",
+                )
+                commit_and_push(repo_path, "Advance combined planning input")
+                latest = git_command(repo_path, "rev-parse", "origin/main")
+                self.assertNotEqual(
+                    loop_manager._planning_input_fingerprint(repo_path, plan_commit),
+                    loop_manager._planning_input_fingerprint(repo_path, latest),
+                )
+
+                real_git = loop_manager.git
+                recovery_pushes: list[tuple[str, ...]] = []
+
+                def record_recovery_git(path, *arguments, **kwargs):
+                    if arguments and arguments[0] == "push":
+                        recovery_pushes.append(arguments)
+                    return real_git(path, *arguments, **kwargs)
+
+                with mock.patch(
+                    "loop_manager.git", side_effect=record_recovery_git
+                ):
+                    second = self._run_registered(
+                        connection, state_dir, repo_path, agent
+                    )
+                recovered = maintenance_state.MaintenanceRepository(connection).get(
+                    repo
+                )
+                project = connection.execute(
+                    "SELECT processed_sha, planning_fingerprint "
+                    "FROM projects WHERE repo = ?",
+                    (repo,),
+                ).fetchone()
+                general = connection.execute(
+                    "SELECT depends_on FROM exec_plans "
+                    "WHERE repo = ? AND plan_id = 'G-002'",
+                    (repo,),
+                ).fetchone()
+            finally:
+                connection.close()
+
+        self.assertEqual(first.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
+        self.assertEqual(second.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
+        self.assertEqual(planner_calls, 1)
+        self.assertEqual(recovery_pushes, [])
+        self.assertFalse(prepared_worktree.exists())
+        self.assertEqual(selected, ["G-001"])
+        self.assertEqual(
+            recovered.phase, maintenance_state.MaintenancePhase.REFACTORING
+        )
+        self.assertEqual(recovered.refactoring_plan_ids, ("G-001",))
+        self.assertEqual(recovered.revalidation_plan_ids, ("G-002",))
+        self.assertEqual(project["processed_sha"], plan_commit)
+        self.assertIsNotNone(project["planning_fingerprint"])
+        self.assertEqual(json.loads(general["depends_on"]), ["G-001"])
+
     def test_active_or_due_cycle_blocks_project_completion_notification(self):
         connection = self._connection()
         repository = maintenance_state.MaintenanceRepository(connection)

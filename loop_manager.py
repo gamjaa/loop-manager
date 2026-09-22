@@ -12558,6 +12558,64 @@ def _run_project_step(
             maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
         }
     )
+    if (
+        maintenance_planning
+        and maintenance_cycle.publication_stage == "prepared"
+        and row["phase"] == "PLANNING"
+    ):
+        prepared_worktree = Path(str(row["worktree"] or ""))
+        stored_fingerprint = str(row["planning_attempt_fingerprint"] or "")
+        try:
+            validate_planning_worktree_ownership(
+                connection,
+                repo_path,
+                state_dir,
+                repo,
+                stored_fingerprint,
+                prepared_worktree,
+            )
+            git(repo_path, "fetch", "origin")
+            prepared_remote_sha = git(
+                repo_path,
+                "rev-parse",
+                "--verify",
+                f"refs/remotes/origin/{base}^{{commit}}",
+            ).stdout.strip()
+            base_sha = prepared_remote_sha
+            recovered_cycle = None
+            if prepared_remote_sha != maintenance_cycle.publication_base_sha:
+                recovered_cycle = recover_maintenance_planning_batch(
+                    connection,
+                    repo,
+                    prepared_worktree,
+                    base,
+                )
+        except (MaintenancePlanningError, RuntimeError) as error:
+            recovery_error = str(error)
+            update_project(
+                connection,
+                repo,
+                planning_error=recovery_error,
+                planning_error_fingerprint=stored_fingerprint,
+                last_error=recovery_error,
+            )
+            operation_print(recovery_error, file=sys.stderr)
+            return 1
+        if recovered_cycle is not None:
+            if prepared_worktree.exists():
+                git(
+                    repo_path,
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(prepared_worktree),
+                )
+            operation_print(
+                "게시된 유지보수 batch를 fingerprint 정리 전에 복구했습니다."
+                if recovered_cycle.publication_stage == "remote_confirmed"
+                else "원격 변경에 맞춰 미게시 유지보수 batch를 다시 시작합니다."
+            )
+            return PROJECT_STEP_RETRY
     if not row["phase"]:
         try:
             maintenance_cycle = _advance_maintenance_cycle_after_merges(
