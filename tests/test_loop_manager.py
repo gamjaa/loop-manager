@@ -6105,6 +6105,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
             repo, _plan_path = self._repository_with_plan(directory)
             for module_name in (
                 "loop_manager.py",
+                "execution_runtime.py",
                 "guidance_approval.py",
                 "managed_config.py",
                 "maintenance_git.py",
