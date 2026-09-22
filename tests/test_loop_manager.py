@@ -4040,6 +4040,12 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                 blocked["blocked_worktree_fingerprint"],
                 worktree_fingerprint,
             )
+            self.assertEqual(
+                blocked["blocked_review_fingerprint"],
+                loop_manager._revision_review_issue_fingerprint(
+                    repo, base_sha, output
+                ),
+            )
             self.assertNotEqual(base_fingerprint, worktree_fingerprint)
 
             self.assertFalse(
@@ -4063,11 +4069,28 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                 unchanged["reviewer_session_id"], "reviewer-session"
             )
 
-            (repo / "docs/PRODUCT.md").write_text(
-                "# Product changed after validation block\n",
+            with connection:
+                connection.execute(
+                    "UPDATE exec_plans SET blocked_review_fingerprint = NULL "
+                    "WHERE repo = ? AND plan_id = 'G-001'",
+                    (str(repo),),
+                )
+            (repo / "README.md").write_text(
+                "# Unrelated remote change\n",
                 encoding="utf-8",
             )
-            commit_and_push(repo, "Change blocked validation input")
+            commit_and_push(repo, "Change unrelated remote input")
+            self.assertFalse(
+                loop_manager.resume_blocked_execplan_if_inputs_changed(
+                    connection, repo, str(repo), "main", state_dir
+                )
+            )
+
+            (repo / "docs/PLANS.md").write_text(
+                "# Plans\n\nDocument the missing maintenance contract.\n",
+                encoding="utf-8",
+            )
+            commit_and_push(repo, "Resolve structured review input")
             latest_sha = git_command(repo, "rev-parse", "origin/main")
             self.assertTrue(
                 loop_manager.resume_blocked_execplan_if_inputs_changed(
@@ -4082,6 +4105,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             self.assertEqual(resumed["status"], "READY")
             self.assertIsNone(resumed["blocked_fingerprint"])
             self.assertIsNone(resumed["blocked_worktree_fingerprint"])
+            self.assertIsNone(resumed["blocked_review_fingerprint"])
             self.assertEqual(json.loads(resumed["review_failure_history"]), {})
             self.assertEqual(
                 git_command(worktree, "merge-base", "--is-ancestor", latest_sha, "HEAD"),
@@ -4755,6 +4779,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                 "    initial_worker_level INTEGER,\n",
                 "    effective_worker_level INTEGER,\n",
                 "    review_level_history TEXT NOT NULL DEFAULT '{}',\n",
+                "    blocked_review_fingerprint TEXT,\n",
             ):
                 legacy_execplans = legacy_execplans.replace(line, "")
             database.execute(legacy_projects)
@@ -4809,6 +4834,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                 "initial_worker_level",
                 "effective_worker_level",
                 "review_level_history",
+                "blocked_review_fingerprint",
             }
             <= plan_columns
         )

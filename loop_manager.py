@@ -205,6 +205,7 @@ CREATE TABLE IF NOT EXISTS exec_plans (
     last_error TEXT,
     blocked_fingerprint TEXT,
     blocked_worktree_fingerprint TEXT,
+    blocked_review_fingerprint TEXT,
     retry_count INTEGER NOT NULL DEFAULT 0,
     worker_session_id TEXT,
     reviewer_session_id TEXT,
@@ -975,6 +976,10 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
     if "blocked_worktree_fingerprint" not in columns:
         connection.execute(
             "ALTER TABLE exec_plans ADD COLUMN blocked_worktree_fingerprint TEXT"
+        )
+    if "blocked_review_fingerprint" not in columns:
+        connection.execute(
+            "ALTER TABLE exec_plans ADD COLUMN blocked_review_fingerprint TEXT"
         )
     if "workspace_owned" not in columns:
         connection.execute(
@@ -3793,6 +3798,23 @@ def parse_reviewer_result(output: str) -> tuple[str, tuple[str, ...]]:
     return verdict, _normalize_review_issue_ids(output)
 
 
+def _review_issue_paths(output: object) -> list[str]:
+    if not isinstance(output, str) or not output.strip():
+        return []
+    try:
+        verdict, _issue_ids = parse_reviewer_result(output)
+    except ReviewerProtocolError:
+        return []
+    if verdict != "FAIL":
+        return []
+    return sorted(
+        {
+            match.group("identifier").strip().split("::", 1)[0]
+            for match in _REVIEW_ISSUE_ID.finditer(output)
+        }
+    )
+
+
 def _normalize_temp_path(match: re.Match[str]) -> str:
     tail = match.group("tail").strip("\\/")
     components = [part for part in re.split(r"[\\/]", tail) if part]
@@ -6073,6 +6095,40 @@ def _revision_execplan_input_fingerprint(
     return _execplan_input_fingerprint(entries)
 
 
+def _revision_review_issue_fingerprint(
+    repo_path: Path,
+    revision: str,
+    review_result: object,
+) -> str | None:
+    paths = _review_issue_paths(review_result)
+    if not paths:
+        return None
+    entries = []
+    for relative_path in paths:
+        shown = git(repo_path, "show", f"{revision}:{relative_path}", check=False)
+        entries.append(
+            (relative_path, shown.stdout if shown.returncode == 0 else None)
+        )
+    return _execplan_input_fingerprint(entries)
+
+
+def _blocked_validation_base_revision(
+    connection: sqlite3.Connection,
+    repo: str,
+    plan: sqlite3.Row,
+) -> str:
+    project = connection.execute(
+        "SELECT active_sha FROM projects WHERE repo = ?",
+        (repo,),
+    ).fetchone()
+    return str(
+        (project["active_sha"] if project else None)
+        or plan["active_sha"]
+        or plan["plan_sha"]
+        or ""
+    )
+
+
 def _blocked_validation_input_fingerprints(
     connection: sqlite3.Connection,
     repo_path: Path,
@@ -6083,16 +6139,7 @@ def _blocked_validation_input_fingerprints(
     """Capture comparable base and worktree inputs at the blocking boundary."""
 
     worktree_fingerprint = _worktree_execplan_input_fingerprint(worktree, plan)
-    project = connection.execute(
-        "SELECT active_sha FROM projects WHERE repo = ?",
-        (repo,),
-    ).fetchone()
-    revision = str(
-        (project["active_sha"] if project else None)
-        or plan["active_sha"]
-        or plan["plan_sha"]
-        or ""
-    )
+    revision = _blocked_validation_base_revision(connection, repo, plan)
     if not revision:
         return worktree_fingerprint, worktree_fingerprint
     resolved = git(
@@ -7108,7 +7155,8 @@ def block_active_execplan(
             SET status = 'BLOCKED', blocked_fingerprint = ?,
                 blocked_reason = CASE WHEN blocked_reason = 'pull-request-closed'
                     THEN NULL ELSE blocked_reason END,
-                blocked_worktree_fingerprint = ?, last_error = ?, verify_result = ?
+                blocked_worktree_fingerprint = ?, blocked_review_fingerprint = NULL,
+                last_error = ?, verify_result = ?
             WHERE repo = ? AND plan_id = ?
             """,
             (
@@ -7212,11 +7260,21 @@ def transition_validation_failure(
                 plan,
             )
         )
+        blocked_review_input = None
+        if stage == "review":
+            blocked_revision = _blocked_validation_base_revision(
+                connection, repo, plan
+            )
+            if blocked_revision:
+                blocked_review_input = _revision_review_issue_fingerprint(
+                    Path(repo), blocked_revision, output
+                )
     else:
         prefix = "전체 검증 실패" if stage == "verify" else "Review 실패"
         error = f"{prefix}:\n{output[-8000:]}"
         blocked_input = None
         blocked_worktree_input = None
+        blocked_review_input = None
 
     execplan_assignments = [
         f"{history_column} = ?",
@@ -7252,9 +7310,15 @@ def transition_validation_failure(
             )
     if blocked:
         execplan_assignments.extend(
-            ["blocked_fingerprint = ?", "blocked_worktree_fingerprint = ?"]
+            [
+                "blocked_fingerprint = ?",
+                "blocked_worktree_fingerprint = ?",
+                "blocked_review_fingerprint = ?",
+            ]
         )
-        execplan_values.extend([blocked_input, blocked_worktree_input])
+        execplan_values.extend(
+            [blocked_input, blocked_worktree_input, blocked_review_input]
+        )
         project_assignments.append("agent_manager_snapshot = NULL")
 
     with connection:
@@ -7307,7 +7371,8 @@ def block_active_execplan_from_revision(
             SET status = 'BLOCKED', blocked_fingerprint = ?,
                 blocked_reason = CASE WHEN blocked_reason = 'pull-request-closed'
                     THEN NULL ELSE blocked_reason END,
-                blocked_worktree_fingerprint = NULL, last_error = ?, verify_result = ?
+                blocked_worktree_fingerprint = NULL,
+                blocked_review_fingerprint = NULL, last_error = ?, verify_result = ?
             WHERE repo = ? AND plan_id = ?
             """,
             (fingerprint, error, verify_result, repo, plan["plan_id"]),
@@ -8859,7 +8924,8 @@ def _requeue_blocked_execplan(
                 """
                 UPDATE exec_plans
                 SET status = 'IMPLEMENTING', blocked_fingerprint = NULL,
-                    blocked_worktree_fingerprint = NULL, retry_count = 0,
+                    blocked_worktree_fingerprint = NULL,
+                    blocked_review_fingerprint = NULL, retry_count = 0,
                     blocked_reason = NULL, guidance_plan_hash = NULL,
                     validated_base_sha = NULL, verify_result = NULL,
                     review_result = NULL, last_error = ?,
@@ -8893,7 +8959,8 @@ def _requeue_blocked_execplan(
             """
             UPDATE exec_plans
             SET status = 'READY', blocked_fingerprint = NULL,
-                blocked_worktree_fingerprint = NULL, retry_count = 0,
+                blocked_worktree_fingerprint = NULL,
+                blocked_review_fingerprint = NULL, retry_count = 0,
                 blocked_reason = NULL, guidance_plan_hash = NULL,
                 last_error = NULL, worker_session_id = NULL,
                 reviewer_session_id = NULL, worker_result = NULL,
@@ -8927,9 +8994,33 @@ def resume_blocked_execplan_if_inputs_changed(
     worktree = Path(str(plan["worktree"]))
     branch = str(plan["branch"] or "")
     revision = f"refs/remotes/origin/{base}"
-    remote_input_changed = (
+    execplan_input_changed = (
         _revision_execplan_input_fingerprint(repo_path, revision, plan) != stored
     )
+    current_review_fingerprint = _revision_review_issue_fingerprint(
+        repo_path, revision, plan["review_result"]
+    )
+    stored_review_fingerprint = plan["blocked_review_fingerprint"]
+    if current_review_fingerprint is None:
+        review_input_changed = False
+    elif stored_review_fingerprint:
+        review_input_changed = current_review_fingerprint != str(
+            stored_review_fingerprint
+        )
+    else:
+        blocked_revision = str(plan["active_sha"] or plan["plan_sha"] or "")
+        blocked_review_fingerprint = (
+            _revision_review_issue_fingerprint(
+                repo_path, blocked_revision, plan["review_result"]
+            )
+            if blocked_revision
+            else None
+        )
+        review_input_changed = (
+            blocked_review_fingerprint is not None
+            and current_review_fingerprint != blocked_review_fingerprint
+        )
+    remote_input_changed = execplan_input_changed or review_input_changed
     if int(plan["workspace_owned"]) != WORKSPACE_OWNED:
         if not remote_input_changed:
             return False
