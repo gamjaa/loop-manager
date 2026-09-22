@@ -34,33 +34,34 @@ priority: critical
 
 ## Implementation
 
-- Requirement archive 계산을 고정 base OID, G-036 catalog revision과 ExecPlan state snapshot을 입력으로 받는 순수 eligibility 결과로 분리하고, 후보·관련 plan 상태·이동 집합 및 snapshot token을 함께 반환한다.
-- `RequirementArchiveError`를 latest-base/catalog lag, retryable remote observation, Agent-correctable move delta와 final invalid catalog/archive collision로 구분하는 typed result로 교체한다. G-042 dispatcher가 각 결과를 해당 recovery action에 연결하게 한다.
-- reconciliation service는 fetch 및 전체 Open PR 동기화, G-036 catalog reconciliation, current workspace ownership 검증, G-037 latest definition/worktree 반영, 동일 snapshot eligibility 재계산 순서를 명시적으로 실행한다.
-- 현재 Worker 입력, archive 후보, verify·Review와 publication preflight가 같은 snapshot token을 요구하게 하고 후보 변경 시 G-037의 stage invalidation과 기존 Worker session correction을 사용한다.
-- bounded remote-race attempt와 pending target snapshot을 durable하게 기록하고 compare-and-swap으로 완료해 fetch 후 중단, rebase 후 저장 전 중단과 최신 base 재변경에서 부분 cache나 낡은 이동을 게시하지 않는다.
+- `loop_manager.py`의 Requirement archive source/candidate/move 계산을 새 `requirement_archive.py`의 revision-pinned pure snapshot API로 옮긴다. base OID, G-036 catalog token과 ExecPlan state snapshot을 입력으로 candidate·related status·move set·snapshot token을 한 결과에 담는다.
+- 새 `requirement_archive_recovery.py` service가 fetch/PR observation, catalog reconciliation, workspace ownership, G-037 revision gate와 eligibility 재계산 순서를 조정하고 G-042 `RecoveryDecision`을 반환한다. Git·GitHub·Worker correction은 주입 port이며 service가 phase row나 subprocess를 직접 다루지 않는다.
+- G-049 `ArchiveEffects`를 snapshot/validate/reconcile port로 교체하고 `ExecutionContext`가 현재 archive snapshot token과 candidate scope를 보유하게 한다. prepare, Worker result, latest-base와 publication preflight는 같은 token을 요구하고 변경 시 handler가 지정된 predecessor phase로만 돌아간다.
+- 새 `requirement_archive_state.py` repository가 bounded remote-race attempt와 pending target snapshot을 저장하고 G-042 recovery record에는 그 identity와 disposition만 연결한다. `runtime_state.py` expected execution snapshot과 compare-and-swap으로 적용해 부분 catalog cache나 낡은 move set을 commit하지 않는다.
+- `RequirementArchiveError` compatibility wrapper는 typed lag/remote-retry/move-delta/final-invalid 결과로 변환하는 바깥 adapter에 한정하고, `execution_handlers.py` 안에서 즉시 `block_active_execplan`을 호출하는 분기를 제거한다.
 
 ## Validation
 
-- Worker는 archive eligibility snapshot/reconciliation과 publication preflight의 직접 관련 test class 또는 새 전용 test module만 targeted unit test로 실행한다.
-- stale 관리 branch에서 새 비관련 ExecPlan이 추가되면 최신 catalog를 동기화하고 기존 archive 후보를 유지한 채 차단 없이 진행하는지 검증한다.
-- 새 관련 ExecPlan이나 상태가 추가되면 후보를 제거하고 같은 Worker session에 최신 이동 집합을 전달한 뒤 verify·Review를 다시 수행하는지 검증한다.
-- SQLite의 path, title, sources, depends_on 또는 revision cache만 오래된 경우 G-036 값으로 원자 갱신하고 독립 계획을 차단하지 않는지 검증한다.
-- fetch/reconciliation/rebase 중 base가 한 번 또는 계속 변경되는 경우 낡은 eligibility를 쓰지 않으며 bounded 소진은 알림 없는 pause와 다음 실행 재개가 되는지 검증한다.
-- rebase·Worker correction·snapshot transaction 각 중단 지점에서 worktree, session, guidance 결정과 구현 diff가 보존되고 중복 동작 없이 재개되는지 검증한다.
-- 최신 원격에도 plan이 없거나 ID/source/dependency 대응이 불명확한 경우, archive 목적지 충돌과 invalid state만 최종 block이 되고 복구 시도 및 정확한 사용자 대상이 기록되는지 검증한다.
-- 전체 verify에서 G-005 Planner validation, G-036/G-037 catalog revision, Requirement archive 이동 검증과 latest-base publication 회귀가 없어야 한다.
+- Worker는 새 `tests/test_requirement_archive.py`, `tests/test_requirement_archive_recovery.py`와 `tests/test_execution_handlers.py`의 직접 관련 targeted case만 실행한다.
+- stale branch의 비관련 새 plan, 관련 새 plan과 cache-only path/title/sources/depends_on/revision delta를 고정 snapshot fake로 검증한다.
+- 후보 변경이 같은 Worker session의 typed correction과 stage invalidation을 만들고 최신 move set으로 verify·Review를 다시 통과하기 전 publication port를 호출하지 않는지 검증한다.
+- fetch/catalog/worktree/rebase 순서, 단일·연속 base race와 bounded pause가 stale token을 적용하지 않고 BLOCKED/checkpoint/outbox 없이 다음 실행에 재개되는지 repository CAS test로 검증한다.
+- rebase, Worker correction과 snapshot transaction 각 중단 지점에서 worktree, session, guidance와 diff가 보존되고 중복 rebase·Agent turn이 없는지 검증한다.
+- latest remote의 missing/ambiguous plan, invalid source/dependency/state와 archive collision만 final user action으로 승격하고 실제 plan/source/archive path를 보존하는지 검증한다.
+- G-036 definition token, G-037 invalidation gate와 archive move content-preservation 계약이 하나의 snapshot을 공유하는지 targeted integration case로 검증한다.
+- 전체 verify에서 Planner validation, catalog reconciliation, Requirement 이동 검증과 latest-base publication 회귀가 없어야 한다.
 
 ## Progress
 
-- [ ] revision-pinned archive eligibility snapshot과 typed 결과 구현
-- [ ] fetch·PR·catalog·workspace·latest-base reconciliation pipeline 구현
-- [ ] 후보 변경 Worker correction 및 verify·Review invalidation 연결
-- [ ] 원격 경쟁·중단 복구용 durable target snapshot과 CAS 적용
-- [ ] 비관련/관련 계획, stale cache, 경쟁과 최종 오류 테스트 추가
+- [ ] revision-pinned Requirement archive snapshot API 구현
+- [ ] typed reconciliation service와 target-snapshot repository 구현
+- [ ] ExecutionContext archive token과 handler phase invalidation 통합
+- [ ] durable target snapshot·remote race CAS 및 중단 복구 구현
+- [ ] 관련/비관련 plan·cache·collision targeted 회귀 테스트 추가
 
 ## Decision Log
 
 - archive 안전 조건을 완화하지 않는다. Git/SQLite 불일치를 무시하는 대신 최신 신뢰 원격과 G-036 cache를 먼저 일치시킨 뒤 같은 revision에서 다시 판정한다.
 - G-042 이후에 구현해 자동 복구 가능한 시차가 checkpoint나 알림을 만들지 않게 하고, G-037의 실행 revision gate를 재사용해 별도의 선언 동기화 경로를 만들지 않는다.
 - 최신 plan 존재와 저장된 게시 이력으로 시차를 증명할 수 있는 경우만 자동 rebase한다. catalog 자체가 invalid하거나 소유권이 불명확한 경우에는 이 계획이 원격 또는 worktree를 수정하지 않는다.
+- Post-refactor revalidation: Requirement archive 계산은 G-049 `ArchiveEffects` 뒤의 snapshot service로 추출하고 handler는 token 변화에 따른 phase outcome만 적용한다. catalog, Git reconciliation과 Worker correction 제어를 한 함수에 다시 섞지 않는다.

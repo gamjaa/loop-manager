@@ -31,32 +31,33 @@ Planner, Worker와 Reviewer의 실제 Agent CLI 호출을 역할, 선택된 prov
 
 ## Implementation
 
-- 현재 provider adapter가 profile을 내부에서 다시 해석하고 tuple/`AgentResult`를 혼용하는 경계를 provider-neutral invocation request/result로 정리한다. CLI 인자에 사용한 `AgentProfile`과 session event·usage metadata를 결과와 함께 반환하되 기존 성공·실패 분류 책임은 유지한다.
-- Codex JSONL과 Claude stream/json을 로그 파일에 계속 보존하면서 session 및 usage event를 누적하는 작은 parser 경계를 둔다. provider 원문 key는 adapter 안에서만 다루고 orchestration과 SQLite에는 정규화된 optional counter만 전달한다.
-- append 후 완료되는 invocation 저장소를 별도 책임으로 두고 Planner의 project-level 호출과 Worker·Reviewer의 ExecPlan-level 호출을 모두 수용한다. 시작 후 중단된 row를 단일 process lock 아래에서 복구하는 결정적 규칙을 포함한다.
-- `run_agent_with_retries`가 각 물리적 시도의 transition kind, 원인과 attempt를 저장소에 전달하게 하되 재시도 횟수, 사용 한도 중단과 session fallback의 기존 동작은 변경하지 않는다. 후속 G-041이 Model 교체 전이를 같은 계약으로 기록할 수 있게 enum과 저장 경계를 마련한다.
-- 비교 지표는 원본 counter와 duration에서 SQL 또는 읽기 helper가 계산하게 하고 가격표, 비용 추정 또는 추가 Agent 호출을 도입하지 않는다.
+- 새 `agent_invocation.py`에 provider-neutral resolved profile, invocation request/result, session transition과 nullable usage counter type을 정의하고, 새 `agent_invocation_state.py` repository가 physical process attempt의 시작·session observation·완료/interrupted 전이를 additive ledger에 저장한다.
+- Codex/Claude adapter는 CLI 인자에 사용한 동일 profile을 request에 받고 provider event를 typed session/usage observation으로 반환한다. provider 원문 key와 JSON tolerant parsing은 adapter 내부에 남기고 execution/planning coordinator에는 정규화된 result만 노출한다.
+- `run_agent_with_retries`를 invocation runner로 좁혀 각 transient retry와 session fallback 전에 ledger intent를 기록하고 결과 뒤 같은 identity를 완료한다. retry/usage-limit/timeout 정책은 유지하되 telemetry 저장 실패는 별도 collection status로 반환해 Agent 결과를 덮어쓰지 않는다.
+- `planning_runtime.py`의 Agent port와 G-049 `AgentEffects`가 동일 invocation runner interface를 사용하게 하고 role/plan/definition revision 및 transition cause를 호출 context에서 전달한다. 두 coordinator가 ledger SQL, provider usage parser 또는 profile alias 해석을 중복하지 않게 한다.
+- `loop_manager.py`에는 provider subprocess adapter와 repository wiring, process-lock 시작 시 unfinished invocation reconciliation만 남기고 profile/result dataclass와 usage 계산은 새 모듈로 이관한다. 비교 지표는 저장 counter를 읽는 query helper가 계산한다.
 
 ## Validation
 
-- Worker는 invocation 저장소와 provider usage parser에 직접 관련된 개별 test class 또는 새 전용 test module만 targeted unit test로 실행한다.
-- Planner, Worker와 Reviewer의 start/resume, transient retry, usage-limit, timeout, session fallback 호출이 각각 정확한 role·plan·profile·transition·result record를 남기는지 검증한다.
-- Codex와 Claude의 완전한 usage, 일부 필드만 있는 usage, cache read/write 구분, reasoning 미제공, 잘못된 JSON과 음수·비정수 값을 검증한다.
-- session 시작 직후와 invocation 완료 직전 중단을 재현해 시작 row와 session identity가 보존되고 다음 실행에서 중복 완료나 상태 차단 없이 복구되는지 검증한다.
-- legacy SQLite migration이 기존 실행 상태를 잃지 않고 새 원장을 만들며 반복 migration이 무해한지 검증한다.
-- usage parser 오류가 성공한 Agent 호출, Worker 결과와 ExecPlan 상태 전이를 바꾸지 않고 환경·prompt·record에 manager 비밀값이 남지 않는지 검증한다.
-- 전체 verify에서 기존 Codex·Claude 시작/재개, bounded retry, level profile 선택과 Planner/Worker/Reviewer 상태 전이가 유지돼야 한다.
+- Worker는 새 `tests/test_agent_invocation.py`, `tests/test_agent_invocation_state.py`와 provider adapter의 직접 관련 targeted case만 실행한다.
+- Planner, Worker와 Reviewer의 start/resume, transient retry, usage-limit, timeout과 session fallback이 physical attempt별 role·plan·resolved profile·transition·result row를 남기는지 검증한다.
+- Codex/Claude 완전·부분 usage, cache read/write 구분, reasoning 미제공, malformed JSON과 음수·비정수 값을 table test로 검증하고 누락값이 0으로 바뀌지 않는지 확인한다.
+- session event 직후와 invocation 완료 직전 중단에서 durable start/session identity를 보존하고 다음 process-lock 실행이 중복 완료 없이 interrupted/unknown으로 수렴하는지 repository test로 검증한다.
+- `tests/test_planning_runtime.py`와 `tests/test_execution_handlers.py`의 targeted fake-port case로 두 coordinator가 같은 resolved profile과 invocation identity를 전달하고 telemetry 오류가 phase outcome을 변경하지 않는지 검증한다.
+- legacy migration 반복, query helper의 역할/profile/transition별 retry·cache·latency 집계와 prompt/environment/record의 비밀값 비노출을 검증한다.
+- 전체 verify에서 기존 Codex·Claude start/resume, bounded retry, Worker level profile 선택과 Planner/Worker/Reviewer 상태 전이 회귀가 없어야 한다.
 
 ## Progress
 
-- [ ] provider-neutral profile·usage·invocation 결과 계약 추가
-- [ ] Codex·Claude usage parser 및 부분 형식 허용 구현
-- [ ] additive invocation 원장과 중단 복구 구현
-- [ ] 모든 역할과 실제 retry/fallback 호출 경계 연결
-- [ ] profile·transition·usage·migration 회귀 테스트 추가
+- [ ] provider-neutral invocation/profile/usage 계약 구현
+- [ ] tolerant Codex·Claude observation parser와 adapter 연결
+- [ ] additive invocation ledger 및 interrupted reconciliation 구현
+- [ ] planning/execution Agent port와 physical retry runner 통합
+- [ ] profile·transition·usage·migration targeted 회귀 테스트 추가
 
 ## Decision Log
 
 - 사용량 관측 실패는 제품 작업 실패와 분리한다. provider가 명시적으로 보고한 분류만 보존하고 누락값을 추정하지 않는다.
 - invocation은 상위 Worker turn이 아니라 실제 CLI process 시도 단위로 기록해 transient retry와 fallback 비용을 숨기지 않는다.
 - G-037 이후의 revision-aware Agent 호출 경계를 사용해 관련 ExecPlan과 입력 revision이 확정된 시점에 telemetry를 결합한다.
+- Post-refactor revalidation: invocation ledger는 planning/execution phase 상태가 아니라 공유 외부 호출 관측 경계다. 두 coordinator는 같은 Agent port를 사용하고 provider parsing·SQLite ledger를 `execution_handlers.py`나 `planning_runtime.py`에 내장하지 않는다.

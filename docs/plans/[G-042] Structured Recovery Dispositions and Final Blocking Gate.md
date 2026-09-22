@@ -38,33 +38,34 @@ G-031의 plan/project 차단 scope와 원인 code를 확장해 모든 사용자-
 
 ## Implementation
 
-- G-031의 구조화된 block reason 저장소 옆에 recovery disposition, reason code, plan/phase/revision snapshot, fingerprint, progress marker, attempt count와 마지막 결과를 저장하는 additive schema 및 repository API를 둔다. legacy 차단 상태의 의미를 소급 추정하거나 기존 실행 이력을 삭제하지 않는다.
-- Git, GitHub, Agent, archive, workspace, validation과 publication 경계가 공통 `RecoveryDecision` 계열 결과를 반환하게 하고, disposition-to-next-action 및 최종 reason-to-scope mapping을 한 orchestration 경계에서 검증한다.
-- 현재 `block_active_execplan*` 호출 지점을 전수 이관해 먼저 구조화 분류와 도메인 복구 가능 여부를 확인한다. 최종 차단 helper는 `USER_ACTION_REQUIRED` 결과만 받도록 만들어 우발적인 즉시 BLOCKED 전이를 코드로 거부한다.
-- retry/pause, state reconciliation, Agent correction과 final block dispatcher를 분리한다. 상태 저장과 외부 동작 순서를 transaction 및 expected revision/state 조건으로 보호해 중단 후 같은 recovery action을 멱등하게 재개한다.
-- G-018 알림 identity와 G-034 checkpoint payload가 최종 structured cause와 검증 revision을 사용하도록 연결하고, 운영 로그 renderer는 사용자 조치가 없는 disposition에 편집 경로를 출력하지 않는다.
+- 새 `recovery_runtime.py`에 disposition, reason code, revision/progress snapshot과 typed next action을 정의하고 문자열 예외 해석 없이 domain result를 `retry`, `reconcile`, `correct`, `pause`, `final-block`으로 매핑하는 순수 policy를 둔다.
+- 새 `recovery_state.py` repository가 attempt/progress/fingerprint와 pending action을 additive table에 저장한다. final PLAN_BLOCKED/PROJECT_BLOCKED 전이만 `runtime_state.py`와 `scoped_blocking.py` repository가 기존 원자적 projection/outbox 경계로 수행하고, 두 저장 책임은 같은 connection transaction에서 명시적으로 조합한다.
+- `execution_runtime.py`의 outcome에 recovery decision identity를 운반할 수 있는 typed field를 추가하고, `execution_handlers.py`의 Workspace·Agent·Archive·Validation·Publication effect가 자유 형식 `RuntimeError` 대신 domain result를 반환하도록 이관한다. coordinator는 phase를 dispatch하고 공통 recovery dispatcher가 next action을 적용한다.
+- 기존 `block_active_execplan*` 호출 지점을 전수 분류하되 최종 blocking port는 `USER_ACTION_REQUIRED` decision만 받도록 계약한다. retry/reconcile/correction은 해당 phase context와 runtime snapshot을 보존한 outcome으로 반환하고 G-034 checkpoint 및 notification port를 호출하지 않는다.
+- planning/project safety처럼 G-049 execution 밖의 차단 경로도 같은 recovery type과 reason-to-scope mapping을 사용하되 각 coordinator의 port adapter에서 적용한다. `loop_manager.py`에는 legacy exception adapter와 typed outcome-to-process-result wiring만 남긴다.
 
 ## Validation
 
-- Worker는 recovery classification/state repository와 block dispatcher의 직접 관련 test class 또는 새 전용 test module만 targeted unit test로 실행한다.
-- 각 disposition의 대표 원인과 같은 `RuntimeError` container 안의 서로 다른 원인이 문자열 추론 없이 올바른 next action을 선택하는지 검증한다.
-- transient retry 소진, 원격 경쟁 및 재시작이 phase·worktree·session·변경을 보존하고 BLOCKED 상태, checkpoint, 알림과 편집 경로를 만들지 않는지 검증한다.
-- 아직 재시도 가능한 Agent correction과 한도 소진 correction을 구분하고 fingerprint·occurrence·progress가 프로세스 중단 뒤 이어지는지 검증한다.
-- guidance 승인, 닫힌 PR, 소유권/범위 위반, 외부 원격 OID 불일치, 동일 verify·Review 반복과 무변경 결과가 최종 사용자 조치 대상으로 남는지 검증한다.
-- 동일 cause/fingerprint/revision의 최종 차단 재실행에서 checkpoint 및 알림 identity가 중복되지 않고, cause나 revision이 실제로 바뀌면 새 사건으로 구분되는지 검증한다.
-- legacy BLOCKED migration과 G-031의 여러 PLAN_BLOCKED/PR_OPEN scheduler, G-034 checkpoint 및 G-018 notification 회귀를 검증한다.
-- 전체 verify에서 외부 CLI pause, validation failure history, guidance approval, PR reopen과 project completion 동작이 약화되지 않아야 한다.
+- Worker는 새 `tests/test_recovery_runtime.py`, `tests/test_recovery_state.py`, `tests/test_execution_handlers.py`와 `tests/test_runtime_state.py`의 직접 관련 targeted case만 실행한다.
+- 각 disposition과 동일한 `RuntimeError` container 안의 서로 다른 operation cause가 문자열 검색 없이 다른 typed next action을 선택하는지 table test로 검증한다.
+- transient retry 소진, remote race와 재시작이 execution context·worktree·session·diff를 보존하고 FINAL_BLOCK, checkpoint, outbox와 edit path를 만들지 않는지 fake ports로 검증한다.
+- Agent correction의 fingerprint/occurrence/progress 및 한도 전후 전이를 repository CAS와 process interruption 시나리오로 검증한다.
+- guidance 승인, closed PR, ownership/scope 위반, remote OID 불일치, verify·Review 반복과 no-change가 `USER_ACTION_REQUIRED`에서만 runtime/scoped block transaction으로 들어가는지 검증한다.
+- 동일 cause/fingerprint/revision final block의 checkpoint/outbox identity 중복 방지와 실제 cause/revision 변경 시 새 사건 구분을 검증한다.
+- legacy block migration, 여러 PLAN_BLOCKED/PR_OPEN scheduling과 project completion이 typed recovery 도입 뒤 유지되는지 targeted integration case로 검증한다.
+- 전체 verify에서 external CLI pause, validation history, guidance approval, PR reopen과 notification 동작이 약화되지 않아야 한다.
 
 ## Progress
 
-- [ ] 구조화 recovery disposition·원인·진전 상태와 additive migration 구현
-- [ ] 기존 차단 후보 call site를 공통 분류 및 next-action gate로 이관
-- [ ] non-blocking retry/reconcile/correction pause와 최종 block dispatcher 구현
-- [ ] checkpoint·알림·운영 로그를 최종 structured cause에 연결
-- [ ] 분류, 재시작, 소진, 최종 차단과 중복 방지 회귀 테스트 추가
+- [ ] recovery decision/next-action pure policy와 typed outcome 계약 구현
+- [ ] recovery attempt repository 및 runtime/scoped-block transaction 조합 구현
+- [ ] execution/planning effect의 typed result와 공통 dispatcher 이관
+- [ ] USER_ACTION_REQUIRED 전용 final block·checkpoint·outbox gate 구현
+- [ ] 분류·중단·소진·중복 방지 targeted 회귀 테스트 추가
 
 ## Decision Log
 
 - R-019는 G-031의 차단 scope를 대체하지 않고, 차단 여부를 결정하기 전의 복구 가능성 축을 추가한다. scope와 disposition을 하나의 enum으로 합치면 같은 plan 원인도 일시 상태와 최종 사용자 조치를 구분할 수 없다.
 - G-034와 G-037이 Merge된 뒤 시작해 final block만 원격 checkpoint 대상이 되게 하고, 최신 선언 revision에 결합된 실행 상태를 분류 입력으로 사용한다.
 - 구체적인 archive, checkpoint와 rebase 복구 알고리즘은 후속 계획으로 나눈다. 이 계획은 모든 경로가 즉시 BLOCKED를 우회하지 못하게 하는 공통 상태·분류·알림 계약을 먼저 제공한다.
+- Post-refactor revalidation: recovery policy를 G-049 phase handler마다 복제하지 않는다. coordinator outcome, recovery repository와 final blocking port를 분리해 `execution_handlers.py`는 phase-local observation만 만들고 공통 dispatcher가 사용자-visible 차단을 결정한다.

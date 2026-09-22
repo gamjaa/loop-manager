@@ -32,33 +32,33 @@ priority: high
 
 ## Implementation
 
-- 현재 `load_execplan_catalog`의 호출 목적을 active execution catalog와 full historical validation catalog API로 분리한다. 두 위치의 regular-file 검사, 중복 ID/path 검증과 stable active-path 계산을 공통 parser 위에 둔다.
-- Planner batch validation과 maintenance revision publication은 새 파일의 연속 ID를 full catalog 최대값으로 검사하고, 수정 가능 대상은 active top-level READY snapshot으로 제한한다.
-- `migrate_legacy_execplans`와 project registration reconciliation에 archived entry를 위한 merge-proof adapter를 추가한다. GitHub PR 및 immutable plan commit 이력을 재사용하고 증명 실패를 실행 상태와 분리된 진단으로 기록한다.
-- ExecPlan row에는 필요할 경우 archive 관측 경로·검증 hash와 audit 상태를 additive column 또는 별도 table로 저장하되 `path`와 MERGED source of truth를 바꾸지 않는다.
-- dependency gate는 DB의 확인된 MERGED 상태를 사용하고 file location을 상태 판정에서 배제한다. compact catalog serializer와 Agent prompts에는 archive metadata를 추가하지 않는다.
+- `loop_manager.py`의 `_parse_execplan`, `load_execplan_catalog`와 dependency graph 검증을 새 `execplan_catalog.py`의 순수 parser/snapshot API로 옮긴다. active top-level entry와 archived historical entry를 서로 다른 typed collection으로 반환하고, 기존 함수는 호출자 이관 동안 얇은 compatibility wrapper로만 유지한다.
+- historical merge proof, 관측 경로·final hash와 복구 진단은 새 `execplan_catalog_state.py` repository가 소유한다. 실행 phase와 project compatibility projection은 계속 `runtime_state.py`가 소유하며 두 저장 책임을 한 repository나 raw SQL 호출에 섞지 않는다.
+- `planning_runtime.py`의 validation/publication port와 project registration·legacy migration adapter가 full snapshot을 사용하게 하고, 수정 가능한 READY snapshot과 Agent compact catalog는 active collection만 받게 한다. bootstrap wiring만 `loop_manager.py`에 남긴다.
+- GitHub PR 및 immutable plan commit 조회는 catalog recovery service에 주입하는 merge-proof port로 격리한다. parser와 repository는 Git, GitHub, Agent 또는 notification을 직접 호출하지 않고, 증명 실패를 실행 상태와 분리된 typed diagnostic으로 반환한다.
+- dependency selection은 확인된 SQLite MERGED 상태와 full snapshot의 identity graph를 결합하되 위치를 상태로 해석하지 않는다. 다음 ID, immutable PR link와 maintenance snapshot 호출자도 동일 snapshot API를 사용해 active/archive 규칙을 중복 구현하지 않는다.
 
 ## Validation
 
-- Worker는 새 ExecPlan archive-catalog test module 또는 parser/migration의 직접 관련 test class만 targeted unit test로 실행한다.
-- active+archive ID 중복, 다음 번호 연속성, archived dependency 존재와 cycle 검증 및 active-only AI 입력을 검증한다.
-- archived MERGED dependency 성공, archive 파일만 존재하는 미확인 dependency 대기와 hash 변조 진단을 검증한다.
-- Merge commit, Squash merge와 Rebase merge 이력을 이용한 기존 설치 및 새 등록 복구, Merge 증명 부재와 불일치 PR 이력을 검증한다.
-- stable active path, immutable PR 링크, archived 위치 관측과 compact catalog의 비노출을 검증한다.
-- maintenance barrier/revalidation이 archive를 수정하지 않고 historical dependency를 보존하는지 검증한다.
-- 이 계획 Merge만으로 파일 이동, archive commit·push, Agent 호출 또는 완료 알림이 발생하지 않는지 검증한다.
-- 전체 verify에서 기존 active catalog parsing, Planner batch publication, legacy ExecPlan migration, READY priority/dependency 선택과 Requirement archive가 유지돼야 한다.
+- Worker는 새 `tests/test_execplan_catalog.py`와 `tests/test_execplan_catalog_state.py`의 직접 관련 test class, 그리고 이관한 planning/registration adapter의 targeted case만 실행한다.
+- 순수 snapshot 테스트에서 active+archive ID 중복, regular-file/symlink 경계, 다음 번호 연속성, archived dependency 존재·cycle 및 active-only compact projection을 검증한다.
+- repository/merge-proof fake로 archived MERGED dependency 성공, 파일만 존재하는 미확인 dependency 대기, final hash 변조와 Merge commit·Squash·Rebase 이력 복구를 검증한다.
+- `tests/test_planning_runtime.py`의 targeted case로 maintenance barrier/revalidation과 일반 Planner가 historical identity를 보존하면서 archive를 수정 가능 READY나 Agent 입력으로 노출하지 않는지 검증한다.
+- `tests/test_execution_runtime.py` 또는 catalog selection adapter의 targeted case로 dependency gate가 file location이 아닌 확인된 상태를 사용하고 immutable PR link가 stable active path를 유지하는지 검증한다.
+- 이 계획 Merge만으로 archive dispatcher, 파일 이동, commit·push, Agent 호출 또는 완료 알림이 실행되지 않는지 port spy로 검증한다.
+- 전체 verify에서 기존 active catalog parsing, Planner batch publication, legacy migration, READY priority/dependency 선택과 Requirement archive 회귀가 없어야 한다.
 
 ## Progress
 
-- [ ] active와 historical ExecPlan catalog API 분리
-- [ ] 전체 ID·dependency·번호 검증과 stable path 계약 구현
-- [ ] archived Merge 증명 및 migration/recovery 진단 구현
-- [ ] maintenance·Planner·PR 링크 호출자 통합
-- [ ] archived catalog 호환성 테스트 추가
+- [ ] `execplan_catalog.py` active/historical snapshot과 compatibility wrapper 분리
+- [ ] `execplan_catalog_state.py` historical audit·merge-proof 진단 저장 경계 구현
+- [ ] planning·registration·migration·dependency adapter를 snapshot API로 이관
+- [ ] immutable link·stable path와 active-only compact projection 통합
+- [ ] catalog/state/coordinator adapter targeted 회귀 테스트 추가
 
 ## Decision Log
 
 - 실제 이동 전에 모든 실행·복구 경로가 archived 계획을 안전하게 이해해야 한다. 이 계획은 호환성만 Merge하고 archive 쓰기는 G-033이 원자적 정리 단계와 함께 활성화한다.
 - archive 파일은 감사 자료이지 상태 원본이 아니다. 완료 증명이 없으면 새 실행 상태를 발명하지 않고 실행 불가 historical entry와 진단으로 격리한다.
 - R-014의 “새 환경 복구”는 기존 제품의 명시적 DB 초기화·프로젝트 재등록 경계 안에서 이력을 재조정하는 것으로 구현하며 손상된 SQLite의 무인 자동 재생성 범위를 추가하지 않는다.
+- Post-refactor revalidation: G-048/G-049 이후 catalog parsing·복구는 planning/execution coordinator 내부에 다시 구현하지 않고 독립 snapshot과 repository port로 제공한다. `loop_manager.py`는 외부 효과 wiring과 호환 진입점만 유지한다.

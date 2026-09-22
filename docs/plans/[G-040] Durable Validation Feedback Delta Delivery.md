@@ -32,35 +32,33 @@ priority: low
 
 ## Implementation
 
-- verify/Review 실행 원문과 issue별 normalized feedback을 저장하는 validation result·feedback 저장소를 orchestration에서 분리한다. full raw output, fingerprint 계산용 normalized 값, bounded Worker diagnostic과 delivery metadata의 역할을 서로 구분한다.
-- Review protocol parser가 각 `ISSUE_ID`에 대응하는 actionable 설명 범위를 결정적으로 추출하게 하고, verify는 기존 full-output fingerprint를 유지하면서 Worker용 진단만 별도 크기 제한을 적용한다.
-- feedback 항목에 plan, stage, stable identity, occurrence, diagnostic hash/revision, 해결 여부와 전달을 시도·확정한 G-039 invocation identity를 기록한다. Agent 응답 경계의 불확실성에서는 at-least-once 전달을 허용하되 같은 revision임을 prompt에서 명확히 한다.
-- Worker prompt builder가 구조화 delta와 non-validation error를 별도 입력으로 받아 한 번만 렌더링하게 한다. `last_error` 문자열에서 validation 원문을 다시 추론하거나 failure history 전체를 매번 이어 붙이지 않는다.
-- 모든 새 Worker session recovery가 재사용할 compact recovery-context builder를 만들고 현재 session-unavailable fallback에 연결한다. G-041은 Model 교체 시 같은 builder를 사용한다.
-- verify/Review 성공은 active retry/blocking history를 기존 정책대로 정리하면서 unresolved feedback을 해결 상태로 전환한다. audit row와 전달 이력은 삭제하지 않는다.
+- 새 `validation_feedback.py`에 verify fingerprint와 Review `ISSUE_ID`별 normalized feedback, bounded diagnostic, revision/occurrence 및 deterministic delta/recovery-context builder를 정의한다. 원문 parsing과 prompt rendering을 분리해 같은 문자열을 여러 channel에서 재해석하지 않는다.
+- 새 `validation_feedback_state.py` repository가 immutable validation result/audit, issue별 feedback lifecycle과 pending/delivered invocation cursor를 저장한다. R-008 rolling failure history는 `runtime_state.py`의 기존 실행 정책으로 유지하고 audit/delivery row와 명시적으로 연결만 한다.
+- G-049 `ValidationEffects`를 raw verify/Review observation과 feedback repository port로 나눈다. `ExecutionHandlers.verify/review/run`은 typed result를 저장하고 Worker turn 전에 pending delta를 요청하며, 성공한 G-039 invocation identity에만 delivery cursor를 확정한다.
+- Worker prompt builder는 non-validation error와 structured feedback delta를 별도 인자로 받아 각각 한 번만 렌더링한다. session-unavailable recovery는 공통 compact context builder를 호출하고 전체 원문·과거 대화는 repository 밖으로 전달하지 않는다.
+- migration은 legacy `verify_result`, `review_result`, failure history와 Worker session을 read-only source로 사용해 안전한 initial cursor를 만들고, 해석 불가능한 과거 결과는 추정하지 않은 채 새 observation부터 기록한다.
 
 ## Validation
 
-- Worker는 validation feedback 저장소, delta builder와 Worker prompt에 직접 관련된 개별 test class 또는 새 전용 test module만 targeted unit test로 실행한다.
-- 첫 verify 실패가 fingerprint와 bounded 진단을 한 번 전달하고 같은 원문 반복은 identity·occurrence·revision만 전달하며, 진단 변화가 있을 때 변경분만 추가되는지 검증한다.
-- 여러 Review `ISSUE_ID`의 설명 분리, 일부 issue 해결·재발, 동일 ID 설명 변경과 issue 순서 변경을 검증한다.
-- 하나의 실패 원문이 Worker prompt의 `last_error`와 validation delta에 중복되지 않고 성공한 verify 출력이 전달되지 않는지 검증한다.
-- 성공한 Worker turn, Agent 실패, 응답 후 저장 전 중단과 프로세스 재실행에서 delivery cursor가 손실되지 않고 재전달 항목이 동일 revision으로 식별되는지 검증한다.
-- session-unavailable fallback context가 최신 plan/worktree 재확인, 이전 Worker 결과와 미해결 compact feedback만 포함하고 전체 대화·verify·Review 원문을 포함하지 않는지 검증한다.
-- full raw audit 보존과 R-008의 동일 fingerprint BLOCKED 횟수, A→B→A 탐지, stage별 성공 초기화가 함께 유지되는지 검증한다.
-- legacy migration과 부분 저장 상태에서 현재 worktree·session·failure history를 잃지 않고 다음 Worker 호출을 이어가는지 검증한다.
-- 전체 verify에서 Worker result validation, Review level 승격, rebase 복구와 Requirement archive 재검증의 기존 Worker 반환 흐름이 유지돼야 한다.
+- Worker는 새 `tests/test_validation_feedback.py`, `tests/test_validation_feedback_state.py`와 `tests/test_execution_handlers.py`의 직접 관련 targeted case만 실행한다.
+- 첫 verify 실패, 동일 fingerprint 반복, changed diagnostic과 여러 Review `ISSUE_ID`의 추가·해결·재발·순서 변경을 stable revision/occurrence table test로 검증한다.
+- Worker prompt에 하나의 원문이 `last_error`와 validation delta로 중복되지 않고 성공 verify 출력·해결된 feedback·전체 raw output이 포함되지 않는지 snapshot test로 검증한다.
+- Worker success, Agent failure, 응답 후 cursor 저장 전 중단과 재실행에서 pending/delivered CAS가 같은 revision의 at-least-once 전달을 보존하는지 repository test로 검증한다.
+- session-unavailable recovery context가 최신 plan/worktree 재확인, 이전 Worker 결과와 unresolved compact feedback만 포함하는지 fake invocation port로 검증한다.
+- immutable raw audit와 기존 동일-fingerprint block 횟수, A→B→A 및 stage별 성공 초기화가 서로 독립적으로 유지되고 legacy migration이 실행 상태를 잃지 않는지 검증한다.
+- 전체 verify에서 Worker result validation, Review level 승격, rebase correction과 Requirement archive correction의 기존 반환 흐름이 유지돼야 한다.
 
 ## Progress
 
-- [ ] 검증 원문 audit와 issue별 feedback 저장 경계 추가
-- [ ] stable feedback revision·occurrence 및 delivery cursor 구현
-- [ ] 중복 없는 Worker delta prompt builder 구현
-- [ ] 공통 compact recovery context와 fallback 연결
-- [ ] 중단·반복·해결·migration 회귀 테스트 추가
+- [ ] validation result audit와 feedback normalization 모듈 구현
+- [ ] feedback lifecycle·delivery cursor repository 및 migration 구현
+- [ ] execution Validation/Agent port와 중복 없는 delta prompt 통합
+- [ ] 공통 compact recovery context 및 invocation cursor 연결
+- [ ] 반복·중단·해결·legacy targeted 회귀 테스트 추가
 
 ## Decision Log
 
 - R-008의 반복 차단용 rolling history와 R-018의 감사·전달 원장을 분리해 성공 시 재시도 정책을 초기화하면서도 원문과 과거 identity를 보존한다.
 - 전달 여부가 불확실할 때 exactly-once를 추정하지 않는다. stable identity와 revision을 포함한 at-least-once 전달로 Worker가 같은 issue를 새 문제로 오인하지 않게 한다.
 - prompt에는 수정에 필요한 bounded 진단만 넣고 원문 보존은 SQLite audit 책임으로 둔다.
+- Post-refactor revalidation: validation feedback는 G-049 phase sequencing과 분리된 domain repository/port로 둔다. `ExecutionHandlers`는 raw 원문을 `last_error`와 prompt에 조합하지 않고 typed delta와 cursor만 소비한다.

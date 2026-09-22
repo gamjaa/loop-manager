@@ -37,36 +37,37 @@ PR이 없는 `PLAN_BLOCKED` ExecPlan의 관리 branch와 worktree가 Loop Manage
 
 ## Implementation
 
-- ExecPlan별 checkpoint phase, expected/local/remote OID, commit identity, push result와 미게시 reason을 additive SQLite migration으로 저장하고 PLAN_BLOCKED 전환 transaction 이후 dispatcher가 처리하게 한다.
-- G-012/G-031의 workspace identity와 persisted Agent snapshot 비교를 read-only safety assessor로 분리해 checkpoint 허용 path, Git operation, index flags, symlink/ignored 상태와 shared metadata를 결정적으로 반환하게 한다.
-- isolated index 또는 명시적인 pathspec으로 허용된 변경만 stage하고 tree를 사전 계산해, 저장된 checkpoint identity와 같은 tree·parent·message이면 기존 commit을 재사용한다. 사용자 index 상태를 임의로 넓히지 않는다.
-- G-014/G-026의 publication ownership과 remote OID helper를 재사용하되 checkpoint 전용 push policy를 별도 함수로 둔다. PR 없는 branch, fast-forward와 좁은 rebase lease 예외 외에는 기존 publication 권한을 확장하지 않는다.
-- 모든 PLAN_BLOCKED row의 pending checkpoint를 현재 실행 slot과 분리해 재시도하고 결과가 확정된 뒤 G-018 outbox event를 생성한다. 다음 독립 READY 선택은 checkpoint 네트워크 성공을 기다리지 않는다.
-- unblock/rebase/publication 진입 시 저장된 remote checkpoint OID와 실제 remote를 비교해 외부 mutation을 감지하고, 불일치하면 local 작업을 보존한 채 구조화된 block reason을 갱신한다.
+- 새 `blocked_checkpoint.py`에 read-only safety assessment, deterministic tree/commit identity와 checkpoint 전용 push policy를 두고, 새 `blocked_checkpoint_state.py` repository가 phase, expected/local/remote OID, commit identity, 결과와 미게시 reason을 additive하게 저장한다.
+- PLAN_BLOCKED 전이는 `runtime_state.py`와 `scoped_blocking.py`의 기존 원자적 경계를 사용하고, 같은 transaction 뒤 durable checkpoint request만 기록한다. checkpoint dispatcher는 active `ExecutionPhaseCoordinator`와 별도로 pending request를 처리해 네트워크 성공이 execution slot이나 독립 READY 선택을 점유하지 않게 한다.
+- G-012/G-031의 workspace identity 및 persisted Agent snapshot helper는 주입형 safety port adapter가 호출한다. domain assessor는 허용 path, Git operation, index flags, symlink/ignored 상태와 shared metadata를 typed verdict로 반환하고 raw SQLite나 자유 형식 오류를 읽지 않는다.
+- isolated index 또는 명시적 pathspec으로 검증된 변경만 stage하고 tree를 사전 계산한다. G-014/G-026 remote ownership helper는 별도 publication port로 감싸며 PR 없는 branch·fast-forward·기존 좁은 rebase lease 이외 권한은 공유하지 않는다.
+- checkpoint 결과 확정 뒤 notification outbox가 저장된 structured payload를 읽도록 연결한다. unblock과 G-049 publication preflight에는 remote checkpoint observation port만 추가해 외부 mutation을 검출하고 phase sequencing을 checkpoint 모듈에 복제하지 않는다.
+- `loop_manager.py`는 repository/Git/GitHub/outbox adapter wiring과 project-level dispatcher 호출만 소유하고 checkpoint commit 정책이나 상태 전이를 다시 구현하지 않는다.
 
 ## Validation
 
-- Worker는 새 blocked-checkpoint test module과 remote publication helper의 직접 관련 test case만 targeted unit test로 실행한다.
+- Worker는 새 `tests/test_blocked_checkpoint.py`, `tests/test_blocked_checkpoint_state.py`와 remote publication adapter의 직접 관련 targeted case만 실행한다.
 - 안전한 dirty 변경, 이미 commit된 변경과 변경 없음에서 정확한 tree/commit/OID가 기록되고 빈 commit이나 범위 밖 staging이 없는지 검증한다.
 - 신규 remote branch, 기존 fast-forward branch, 같은 OID 재실행, commit 후·push 후 중단과 transient push 재시도의 멱등성을 검증한다.
 - 예상하지 못한 remote commit, lease 실패, branch protection과 권한 거부가 force push나 원격 덮어쓰기 없이 local 작업을 보존하는지 검증한다.
 - 기존 Open/Draft/Closed/Merged PR이 있는 branch에는 checkpoint와 새 PR을 만들지 않는지 검증한다.
 - detached/wrong branch, 미해결 rebase·merge·cherry-pick·revert, symlink, ignored/unowned/staged 범위 위반, index flag와 shared ref mutation을 검증한다.
 - PROJECT_BLOCKED, planning_error, 등록·branch 생성 전 실패와 불명확 legacy block이 remote write를 수행하지 않는지 검증한다.
-- 성공·미게시 BLOCKED 알림 payload와 중복 방지, checkpoint 실패 중 독립 READY 진행을 검증한다.
-- 해제 뒤 같은 branch/worktree/session 재개, remote 외부 변경 거부와 verify·Review 뒤 최초 PR 생성까지 검증한다.
+- `tests/test_notifications.py`의 targeted case로 성공·미게시 payload와 중복 방지를, scheduler adapter case로 checkpoint 실패 중 독립 READY 진행과 execution slot 비점유를 검증한다.
+- `tests/test_execution_handlers.py`의 targeted case로 해제 뒤 같은 branch/worktree/session 재개, remote 외부 변경 거부와 verify·Review 뒤 최초 PR 생성까지 검증한다.
 - 전체 verify에서 G-014 PR 없는 publication recovery, G-018 outbox, G-020 승인 patch, G-026 PR conflict recovery와 G-031 scoped scheduling이 약화되지 않아야 한다.
 
 ## Progress
 
-- [ ] durable checkpoint state와 PLAN_BLOCKED dispatcher 구현
-- [ ] workspace·diff·Git operation safety assessor 구현
-- [ ] 결정적 checkpoint commit과 멱등한 remote push 구현
-- [ ] unblock/publication 및 알림 통합
-- [ ] checkpoint 안전·복구·회귀 테스트 추가
+- [ ] checkpoint domain assessor와 durable request/result repository 구현
+- [ ] workspace·diff·Git operation safety port 및 결정적 tree 구성 구현
+- [ ] checkpoint 전용 remote policy와 멱등 commit/push 구현
+- [ ] project dispatcher, unblock/publication observation과 outbox 통합
+- [ ] checkpoint state/domain/execution adapter targeted 회귀 테스트 추가
 
 ## Decision Log
 
 - 원격 checkpoint는 사용자 검토용 백업이며 품질 gate를 통과한 publication이 아니다. PR 생성과 PR_OPEN 전이는 기존 verify·Review 성공 경계에만 남긴다.
 - G-031이 plan/project scope와 다중 PLAN_BLOCKED를 확정한 뒤 활성화해 unsafe project block을 실수로 게시 대상에 포함하지 않는다.
 - 원격 branch가 이미 존재하는 경우의 권한은 일반 publication과 공유하지 않고 expected OID에 결합한다. rebase 복구의 기존 좁은 lease 예외만 재사용한다.
+- Post-refactor revalidation: checkpoint는 G-049 publication handler의 하위 단계가 아니라 최종 PLAN_BLOCKED 뒤의 별도 durable dispatcher다. active execution context에는 remote observation seam만 추가해 checkpoint 재시도와 phase 제어를 결합하지 않는다.

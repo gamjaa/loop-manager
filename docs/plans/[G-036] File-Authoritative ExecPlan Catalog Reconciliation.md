@@ -35,33 +35,34 @@ priority: critical
 
 ## Implementation
 
-- G-032의 active/historical catalog parser 위에 revision-pinned `ExecPlanDefinition` snapshot을 만들고 path, parsed metadata, normalized body/byte hash와 revision을 plan ID별로 결합한다. source 존재와 전체 dependency graph 검증이 끝난 snapshot만 reconciliation 입력으로 허용한다.
-- `exec_plans`에 최초 게시 정보와 최신 선언 cache를 구분하는 additive column 또는 정규화된 보조 table을 추가한다. 기존 `path`, `plan_sha`, `content_hash`의 의미를 암묵적으로 바꾸지 말고 migration 및 모든 repository accessor에서 immutable/current 역할을 명시한다.
-- row별 expected 상태·소유권 및 기존 current revision을 compare-and-swap 조건으로 검증한 뒤 catalog 전체 변경을 한 transaction으로 저장한다. 최신 source 관계, initial Worker level과 compact metadata를 같은 transaction 결과에서 읽게 한다.
-- 현재 `_execplan_metadata_identity_error`와 Requirement archive의 stored-vs-file equality 오류를 ID 대응 및 catalog 유효성 검사로 교체한다. 최초 게시 metadata는 현재 파일과의 동일성 검사가 아니라 immutable link/audit 생성에만 사용한다.
-- G-031 project-block repository에 catalog 오류 code와 원인 path/source fingerprint를 추가하고, 정상적인 declaration delta와 invalid catalog를 분리하는 결과 type을 둔다.
+- G-032의 `execplan_catalog.py` snapshot 위에 revision-pinned `ExecPlanDefinition`과 전체 catalog validation을 추가하고, 선언 cache 및 immutable publication audit은 `execplan_catalog_state.py` repository가 소유한다. 실행 phase projection을 맡는 `runtime_state.py`에 catalog 파싱이나 Git 조회를 넣지 않는다.
+- reconciliation service는 source 존재·dependency graph 검증이 끝난 snapshot과 expected row version/ownership만 입력받아 compare-and-swap transaction을 수행하고 typed `reconciled`, `stale`, `invalid-catalog` 결과를 반환한다. Git fetch와 revision 고정은 주입 port가 담당한다.
+- project runner는 PR 동기화 뒤 planning/READY 선택 전에 한 번 reconciliation을 수행한다. `planning_runtime.py`에는 current catalog snapshot port를, G-049 `ExecutionContext`에는 reconciled plan metadata와 definition revision token을 전달해 각 phase가 raw row나 원격 파일을 다시 해석하지 않게 한다.
+- `execution_handlers.py`의 prepare/archive preflight는 injected catalog port 결과만 소비하고, `_execplan_metadata_identity_error`와 stored-vs-file equality 경로는 ID 대응·snapshot validity로 대체한다. bootstrap wiring과 legacy compatibility wrapper만 `loop_manager.py`에 남긴다.
+- catalog/project 오류 record는 `scoped_blocking.py`의 project-scope 저장 경계와 결합하되 declaration delta와 invalid snapshot을 별도 result type으로 유지한다. initial Worker level cache 갱신은 catalog transaction에서 계산하고 effective execution level은 runtime-state repository 규칙으로 보존한다.
 
 ## Validation
 
-- Worker는 catalog parser/reconciliation repository와 Requirement archive source 관계의 직접 관련 test class 또는 새 reconciliation test module만 targeted unit test로 실행한다.
-- title, active/archived current path, sources, depends_on, complexity, risk, priority와 본문이 각각 바뀐 같은-ID 파일이 상태·세션·workspace·PR 이력을 보존하면서 한 transaction으로 cache를 갱신하는지 검증한다.
-- source 추가·제거에 따른 archive 후보 변화, dependency graph 재검증과 READY 선택, priority 다음 선택, 최초/effective Worker level의 비감소 규칙을 검증한다.
-- 최초 게시 SHA·경로·hash와 immutable PR 링크는 유지되고 compact catalog·로그용 metadata 및 현재 file lookup만 최신 선언을 쓰는지 검증한다.
-- 원격 base race, stale row snapshot과 transaction 중단에서 부분 갱신 없이 재시도하고 같은 revision의 반복 reconciliation이 멱등인지 검증한다.
-- 누락·invalid·symlink 계획, 중복·변경 ID, 없는 source/dependency와 cycle이 실제 파일을 가리키는 project/catalog 오류가 되며 원인 수정 뒤 자동 재검증되는지 확인한다.
-- G-031/G-035 source 불일치 회귀에서 독립 계획이 차단되지 않고 최신 관계로 archive eligibility 및 선택을 계속하는지 검증한다.
-- 전체 verify에서 Planner publication·maintenance revision, active/archived catalog 복구, scoped blocking, compact catalog와 Requirement archive 기존 동작이 약화되지 않아야 한다.
+- Worker는 `tests/test_execplan_catalog.py`, `tests/test_execplan_catalog_state.py`와 새 reconciliation service의 직접 관련 targeted case만 실행한다.
+- title, active/archived path, sources, depends_on, complexity, risk, priority와 본문 변경을 각각 snapshot delta로 만들고 상태·session·workspace·PR 이력을 보존한 원자 갱신을 검증한다.
+- source 관계와 archive 후보, dependency/priority 다음 선택, initial/effective Worker level 비감소를 repository 및 selection port fake로 검증한다.
+- `tests/test_execution_handlers.py`의 targeted case로 prepare가 reconciled metadata/token을 사용하고 최초 게시 SHA·path·hash와 immutable PR link는 최신 cache와 분리되는지 검증한다.
+- base race, stale row snapshot, transaction 중단과 반복 호출에서 부분 갱신 없이 `stale`로 재시도하고 같은 revision에 멱등하게 수렴하는지 검증한다.
+- 누락·invalid·symlink 계획, 중복·변경 ID, 없는 source/dependency와 cycle이 실제 파일을 가리키는 project/catalog 오류가 되며 원인 수정 뒤 자동 재검증되는지 검증한다.
+- G-031/G-035 source 불일치 회귀와 planning/execution 양쪽 snapshot 소비자가 독립 계획을 차단하지 않는지 검증한다.
+- 전체 verify에서 Planner/maintenance publication, active/archived recovery, scoped blocking, compact catalog와 Requirement archive 회귀가 없어야 한다.
 
 ## Progress
 
-- [ ] 고정 revision의 전체 선언 snapshot 및 catalog 검증 구현
-- [ ] 최초 게시 감사 정보와 현재 선언 cache schema·migration 분리
-- [ ] 원자적 reconciliation 및 stale snapshot 재시도 구현
-- [ ] archive·selection·compact catalog·차단 조회 경계 통합
-- [ ] project/catalog 오류 fingerprint와 G-031/G-035 회귀 테스트 추가
+- [ ] revision-pinned definition snapshot과 전체 catalog validation 구현
+- [ ] immutable audit/current cache repository 및 additive migration 구현
+- [ ] 원자 reconciliation service와 stale snapshot 재시도 구현
+- [ ] project runner·planning port·execution context 소비 경계 통합
+- [ ] catalog 오류 fingerprint와 G-031/G-035 targeted 회귀 테스트 추가
 
 ## Decision Log
 
 - G-028/G-029가 plan revision publication을, G-031이 plan/project 차단 범위를, G-032가 active/archive 전체 catalog를 제공한 뒤 하나의 reconciliation 경계로 통합한다.
 - ID만 실행 이력의 안정적인 identity로 사용한다. 다른 선언 필드는 최신 신뢰 원격 파일을 따르되, 최초 게시 정보는 기존 PR의 불변 링크와 감사 목적으로 별도 보존한다.
 - 실행 중 변경에 따른 단계별 무효화와 worktree 재개는 G-037로 분리해 이 계획의 catalog transaction과 오류 격리를 독립적으로 검증한다.
+- Post-refactor revalidation: G-049 handler가 원격 파일·SQLite cache·실행 상태를 동시에 조정하지 않게 한다. catalog reconciliation은 execution 이전의 독립 snapshot/repository 경계이고 phase coordinator에는 검증된 metadata와 revision token만 전달한다.

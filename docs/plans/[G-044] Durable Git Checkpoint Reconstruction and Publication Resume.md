@@ -34,33 +34,34 @@ priority: critical
 
 ## Implementation
 
-- orchestration의 저장 phase를 Git/GitHub observation과 직접 비교하는 checkpoint assessor를 만들고, 가능한 다음 단계·무효화할 산출물·필요한 명령 또는 ambiguity reason을 typed result로 반환한다.
-- ExecPlan row에 checkpoint generation, 관측 base/local/remote/PR OID, 적용 phase와 pending operation identity를 additive하게 저장한다. 각 외부 명령 전 의도와 expected state를 기록하고 명령 뒤 실제 상태 확인으로 완료한다.
-- Git command wrapper가 operation 종류와 결과를 G-042 reason code로 변환하되 출력 문자열만으로 소유권/안전 위반을 추론하지 않게 한다. transient 결과는 재관측 loop로, 확정된 safety 결과는 final block gate로 보낸다.
-- G-014의 remote publication 기록과 G-026의 PR lookup을 공통 resume service에 연결해 push/PR create 전후 어느 지점에서도 remote branch와 기존 PR을 먼저 확인하도록 한다.
-- G-043 eligibility snapshot 및 G-037 stage revision token을 checkpoint 결과와 결합해 base/definition 보정 뒤 archive·verify·Review를 필요한 가장 이른 안전 단계부터 다시 수행한다.
+- 새 `execution_checkpoint.py`에 Git/GitHub observation snapshot과 가능한 next phase·artifact invalidation·pending operation 또는 ambiguity를 산출하는 pure assessor를 정의하고, 새 `execution_checkpoint_state.py` repository가 generation, observed OID, intent와 completion을 저장한다.
+- `execution_runtime.py`에 preparation용 `ExecutionRecoveryPort`를 추가하고 `ExecutionPhaseCoordinator.prepare`가 phase dispatch 전에 assessor result를 적용하게 한다. `runtime_state.py`는 expected execution snapshot에 결합한 phase/SHA correction만 원자적으로 수행하고 Git 상태를 추론하지 않는다.
+- Git status/operation, worktree recovery, stage/rebase와 remote/PR observation은 granular effect port로 분리한다. command 전 durable intent와 expected state, command 뒤 재관측 결과를 repository CAS로 연결하고 transient failure는 G-042 decision으로 반환한다.
+- G-014 remote publication record와 G-026 PR lookup을 새 `publication_resume.py` service가 공유하게 하고, G-049 PublicationEffects는 push/PR 전 이 service를 호출한다. 기존 PR 발견·push 완료·PR create interruption을 handler별 중복 분기로 유지하지 않는다.
+- G-043 archive token과 G-037 stage token을 checkpoint snapshot에 포함해 correction 뒤 필요한 가장 이른 phase만 다시 수행한다. `loop_manager.py`에는 Git/GitHub concrete adapter와 compatibility helper wiring만 남긴다.
 
 ## Validation
 
-- Worker는 checkpoint assessor, Git operation retry와 publication resume의 직접 관련 test class 또는 새 전용 test module만 targeted unit test로 실행한다.
-- `active_sha`, `validated_base_sha`와 phase가 각각 stale인 owned worktree를 actual HEAD/base ancestry로 보정하고 필요한 verify·Review만 다시 실행하는지 검증한다.
-- rebase 시작·완료, fetch, phase 저장과 stage/continue 경계의 프로세스 중단을 재현해 다음 실행이 실제 state를 읽고 중복 명령 없이 재개하는지 검증한다.
-- Git lock, timeout과 일시적인 fetch/status/worktree recovery 실패가 bounded retry 뒤 pause되며 상태·session·diff를 보존하고 BLOCKED 알림을 만들지 않는지 검증한다.
-- push 전·후, remote 확인 전·후와 PR create 응답 전·후 중단에서 중복 push, force push와 중복 PR이 없는지 검증한다.
-- continuous base/remote 경쟁에서 stale checkpoint를 적용하지 않고 다음 실행으로 미루며, 안정된 뒤 같은 recovery identity로 완료하는지 검증한다.
-- 외부 remote head 변경, 닫힌 PR, ownership 불명과 둘 이상의 가능한 phase는 원격을 덮어쓰지 않고 정확한 최종 사용자 조치로 전환되는지 검증한다.
-- dirty·ahead·diverged 기본 checkout에서도 모든 성공·pause·block 경로가 source checkout을 보존하고 G-014/G-026 lease 규칙을 유지하는지 검증한다.
+- Worker는 새 `tests/test_execution_checkpoint.py`, `tests/test_execution_checkpoint_state.py`, `tests/test_publication_resume.py`와 coordinator adapter의 직접 관련 targeted case만 실행한다.
+- stale `active_sha`, `validated_base_sha`와 phase 조합을 pure assessor table로 검증하고 owned state에서 필요한 artifact/phase만 보정하는지 runtime repository test로 확인한다.
+- rebase/fetch/phase 저장과 stage/continue 전후 중단에서 durable intent와 actual observation이 중복 command 없이 완료·재개되는지 fake Git port로 검증한다.
+- Git lock, timeout과 transient status/worktree failure가 bounded retry 뒤 pause되고 execution context·session·diff를 보존하며 final block/outbox를 만들지 않는지 검증한다.
+- push·remote observation·PR create 전후 중단과 기존 Open/Closed/Merged PR에서 publication resume service가 중복 push·force push·PR을 만들지 않는지 검증한다.
+- continuous base/remote/row-version race는 stale correction을 거부하고 안정 snapshot 뒤 같은 identity로 완료하는지 CAS test로 검증한다.
+- external remote mutation, closed PR, ownership ambiguity와 여러 가능한 phase만 final structured cause로 전환하고 source checkout 불변 및 기존 lease를 유지하는지 검증한다.
+- 전체 verify에서 latest-base archive/revision gate, PR conflict recovery와 publication ordering 회귀가 없어야 한다.
 
 ## Progress
 
-- [ ] Git/GitHub checkpoint snapshot·assessor 및 durable generation 구현
-- [ ] phase/SHA 보정과 stage 산출물 무효화·재개 연결
-- [ ] transient Git 재관측 및 다음 실행 pause 정책 구현
-- [ ] remote push·PR create 경계의 멱등 resume service 통합
-- [ ] marker 불일치, 명령 실패, 중단, 경쟁과 ambiguity 테스트 추가
+- [ ] execution checkpoint snapshot·pure assessor 구현
+- [ ] durable operation intent/generation repository와 runtime correction CAS 구현
+- [ ] coordinator preparation recovery port 및 transient 재관측 통합
+- [ ] shared publication resume service와 Git/GitHub adapter 이관
+- [ ] marker·중단·race·ambiguity targeted 회귀 테스트 추가
 
 ## Decision Log
 
 - SQLite marker를 무조건 Git에 맞추지 않고, G-031/G-034가 확정한 workspace ownership과 expected remote OID가 있는 경우에만 actual state를 복구 원본으로 사용한다.
 - G-043 뒤에 실행해 archive eligibility와 catalog가 최신 snapshot을 사용하는 상태에서 일반 phase checkpoint를 보정한다. 보정으로 base가 달라지면 G-043/G-037 gate를 다시 거친다.
 - 기존 publication interruption 복구는 유지하되 전체 phase·SHA 재구성 경계에 편입한다. push 권한이나 PR 생성 조건을 넓히는 계획이 아니다.
+- Post-refactor revalidation: checkpoint reconstruction은 G-049 `prepare` 앞의 recovery port와 shared publication resume service로 구현한다. phase handlers가 저장 marker, Git command와 PR 조회를 각각 재구현하지 않게 한다.

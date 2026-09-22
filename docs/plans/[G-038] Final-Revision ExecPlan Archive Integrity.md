@@ -31,29 +31,31 @@ G-033의 MERGED ExecPlan 정리 경계를 G-036의 최초 게시 감사 정보�
 
 ## Implementation
 
-- G-033 candidate와 operation identity를 G-036 reconciled definition snapshot의 current path/hash/revision에 결합하고 immutable publication fields 사용을 PR link/audit adapter로 한정한다.
-- active-to-archive rename 검증과 G-032 historical catalog integrity API가 동일한 final declaration hash를 사용하도록 통합하되, `exec_plans`의 최초 게시 감사 column은 변경하지 않는다.
-- archive dispatcher의 pre-commit 및 pre-push compare-and-swap에 remote base와 current plan revision을 함께 검사하고, stale operation은 삭제나 덮어쓰기 없이 superseded 진단으로 재계산한다.
-- 이미 이동된 원격 tree 복구는 archive blob의 ID/frontmatter와 final hash를 모두 확인한 뒤 operation row만 완료 처리한다.
+- G-033의 `execplan_archive.py` candidate/operation identity가 G-036 `ExecPlanDefinition`의 current path/hash/revision을 필수 입력으로 받게 하고, immutable publication fields는 PR link/audit adapter만 접근하게 한다.
+- final declaration integrity와 already-moved tree 판정은 G-032 `execplan_catalog.py`의 historical snapshot validator와 하나의 pure hash/frontmatter API를 공유한다. archive dispatcher나 execution handler가 서로 다른 hash 규칙을 다시 구현하지 않는다.
+- `execplan_archive_state.py` repository의 compare-and-swap key에 remote base와 current definition revision을 포함하고, stale operation은 삭제·덮어쓰기 대신 typed `superseded` 결과와 새 candidate identity로 전환한다.
+- pre-commit/pre-push revision check와 원격 tree 복구는 G-033의 project-level housekeeping Git port에서 수행한다. active `ExecutionPhaseCoordinator`, `runtime_state.py`의 phase projection과 Worker publication 경계는 변경하지 않는다.
 
 ## Validation
 
-- Worker는 ExecPlan archive candidate/operation과 historical catalog integrity의 직접 관련 test class 또는 새 final-revision archive test module만 targeted unit test로 실행한다.
-- 최초 게시 뒤 title·body·metadata가 변경된 MERGED 계획을 final hash로 archive하고 최초 hash·path·PR 링크는 유지하는지 검증한다.
-- 최초 hash와 current hash가 다른 정상 개정, current source 변조, destination 충돌과 최초 hash만 일치하는 archive를 구분하는지 검증한다.
-- candidate 계산 뒤 plan revision 변경, commit 전·push 전 base race와 stale operation recovery가 낡은 파일을 이동하지 않고 최신 후보로 재계산되는지 검증한다.
-- push 후 DB 중단, 이미 이동된 동일 final blob, source와 destination 공존 및 여러 후보 중 일부 실패가 멱등하고 격리되는지 검증한다.
-- 전체 verify에서 G-032 ID/dependency recovery, G-033 rename-only publication, immutable PR links, archive-only fingerprint와 scheduler 비차단 동작이 유지돼야 한다.
+- Worker는 `tests/test_execplan_archive.py`, `tests/test_execplan_archive_state.py`와 `tests/test_execplan_catalog.py`의 final-revision 직접 관련 targeted case만 실행한다.
+- 최초 게시 뒤 title·body·metadata가 변경된 MERGED 계획을 current definition hash로 archive하고 최초 SHA·path·hash 및 PR link가 repository round trip에서 유지되는지 검증한다.
+- 최초/current hash 차이, current source 변조, destination 충돌과 최초 hash만 일치하는 archive를 shared integrity API가 구분하는지 table test로 검증한다.
+- candidate 뒤 revision 변경, commit·push 전 base race와 stale operation이 `superseded`로 수렴해 낡은 파일을 stage/push하지 않는지 fake Git port로 검증한다.
+- push 후 DB 중단, 이미 이동된 동일 final blob, source/destination 공존과 여러 후보 일부 실패가 중복 commit·force push 없이 격리되는지 검증한다.
+- 전체 verify에서 G-032 recovery, G-033 rename-only housekeeping, immutable PR links, archive-only fingerprint와 scheduler 비차단 회귀가 없어야 한다.
 
 ## Progress
 
-- [ ] archive 후보와 operation identity를 current revision/hash에 결합
-- [ ] final hash 기반 rename 및 historical integrity 검증 구현
-- [ ] stale revision/base 경쟁과 이미 이동된 tree 복구 구현
-- [ ] 최초 감사 정보·PR 링크 불변 회귀 테스트 추가
+- [ ] archive candidate/operation identity를 current definition token에 결합
+- [ ] shared final-hash·historical integrity API 구현
+- [ ] repository CAS와 superseded operation 재계산 구현
+- [ ] project housekeeping pre-commit/pre-push 및 remote-tree 복구 통합
+- [ ] immutable audit·final revision targeted 회귀 테스트 추가
 
 ## Decision Log
 
 - G-033은 자동 이동과 비차단 재시도 경계를 제공하고, 이 계획은 R-017이 바꾼 hash 권위만 독립적으로 보강한다.
 - 최초 게시 hash는 감사 정보이고 archive 대상의 최종 내용 증명이 아니다. final declaration hash와 최초 감사 hash를 별도 필드와 API로 유지한다.
 - active 실행 재개 규칙은 G-037에 두어 archive housekeeping의 후보 검증과 게시 경쟁을 좁은 범위에서 검토할 수 있게 한다.
+- Post-refactor revalidation: final archive integrity는 active execution lifecycle에 새 분기를 만들지 않는다. G-036 snapshot과 G-033 housekeeping repository/Git port 사이의 token 계약으로 제한해 `execution_handlers.py` 충돌을 피한다.
