@@ -5,6 +5,7 @@ sources:
   - docs/requirements/[R-014] Automatic Completed ExecPlan Archiving.md
 depends_on:
   - G-029
+  - G-049
 complexity: high
 risk: high
 priority: high

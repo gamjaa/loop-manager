@@ -5,6 +5,7 @@ sources:
   - docs/requirements/[R-018] Cache-Efficient Worker Session Continuity.md
 depends_on:
   - G-039
+  - G-049
 complexity: high
 risk: high
 priority: low

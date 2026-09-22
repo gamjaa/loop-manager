@@ -5,6 +5,7 @@ sources:
   - docs/requirements/[R-015] Remote Checkpoint for Safely Blocked ExecPlans.md
 depends_on:
   - G-031
+  - G-049
 complexity: high
 risk: critical
 priority: critical

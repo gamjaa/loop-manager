@@ -5,6 +5,7 @@ sources:
   - docs/requirements/[R-017] File-Authoritative ExecPlan Source Reconciliation.md
 depends_on:
   - G-036
+  - G-049
 complexity: high
 risk: critical
 priority: critical

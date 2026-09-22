@@ -6,6 +6,7 @@ sources:
 depends_on:
   - G-018
   - G-032
+  - G-049
 complexity: high
 risk: critical
 priority: high

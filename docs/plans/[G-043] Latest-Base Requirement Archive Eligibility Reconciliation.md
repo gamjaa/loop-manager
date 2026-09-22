@@ -5,6 +5,7 @@ sources:
   - docs/requirements/[R-019] Automatic Archive Eligibility Recovery Before Blocking.md
 depends_on:
   - G-042
+  - G-049
 complexity: high
 risk: critical
 priority: critical

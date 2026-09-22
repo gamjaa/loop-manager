@@ -6,6 +6,7 @@ sources:
 depends_on:
   - G-033
   - G-036
+  - G-049
 complexity: medium
 risk: high
 priority: critical
