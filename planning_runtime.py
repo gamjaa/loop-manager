@@ -1,0 +1,1625 @@
+"""Planning lifecycle state machine independent of the CLI bootstrap."""
+
+from __future__ import annotations
+
+from contextlib import AbstractContextManager
+from dataclasses import dataclass
+from enum import Enum
+import hashlib
+from pathlib import Path
+from typing import Any, Callable, Protocol, Sequence
+
+from maintenance_orchestration import (
+    MaintenanceOrchestrationError,
+    MaintenanceOutcome,
+    MaintenancePlannerDecision,
+    maintenance_planning_fingerprint,
+    parse_maintenance_planner_decision,
+    validate_prerequisite_plan_ids,
+)
+from maintenance_planning import (
+    MaintenancePlanningContext,
+    MaintenancePlanningError,
+    MaintenancePlanningRestart,
+)
+import maintenance_state
+import runtime_state
+
+
+MAX_PLANNER_VALIDATION_RETRIES = 3
+WORKSPACE_OWNED = 1
+WORKSPACE_RESERVED = 2
+
+
+class PlanningPhase(str, Enum):
+    """Ordered planning lifecycle phases owned by the coordinator."""
+
+    RECOVERY = "recovery"
+    SELECTION = "selection"
+    INPUTS = "inputs"
+    WORKSPACE = "workspace"
+    AGENT = "agent"
+    VALIDATION = "validation"
+    PUBLICATION = "publication"
+    ACTIVATION = "activation"
+
+
+class PlanningOutcomeKind(str, Enum):
+    """Stable coordinator results interpreted by the process adapter."""
+
+    EXECUTION_READY = "execution_ready"
+    FINGERPRINT_SKIPPED = "fingerprint_skipped"
+    PREREQUISITE_WAIT = "prerequisite_wait"
+    NO_CHANGE = "no_change"
+    REFACTORING = "refactoring"
+    WAITING = "waiting"
+    UNSAFE_REVALIDATION = "unsafe_revalidation"
+    VALIDATION_RETRY = "validation_retry"
+    REMOTE_BASE_RESTART = "remote_base_restart"
+    REMOTE_BASE_RESTART_DEFERRED = "remote_base_restart_deferred"
+    TRANSIENT_PAUSE = "transient_pause"
+    USAGE_LIMIT_PAUSE = "usage_limit_pause"
+    PUBLICATION_RECOVERY = "publication_recovery"
+    OPERATIONAL_ERROR = "operational_error"
+
+
+class PlanningAgentResultKind(str, Enum):
+    SUCCESS = "success"
+    TRANSIENT_FAILURE = "transient_failure"
+    USAGE_LIMIT = "usage_limit"
+    PERMANENT_CONFIGURATION = "permanent_configuration"
+
+
+class PlanningResultInvalid(RuntimeError):
+    """A Planner result that may be repaired in the same Agent session."""
+
+
+class PlanningWorkspaceOwnershipError(RuntimeError):
+    """A planning worktree cannot be proven to belong to this lifecycle."""
+
+
+@dataclass(frozen=True)
+class PlanningContext:
+    """Prepared project identity and immutable inputs for one lifecycle run."""
+
+    repo: str
+    repo_path: Path
+    state_dir: Path
+    base_branch: str
+    base_sha: str
+    provider: str
+    config_path: Path
+    registered_only: bool
+    refactoring_review_interval: int
+
+
+@dataclass(frozen=True)
+class PlanningOutcome:
+    """A typed next action with process details kept out of the coordinator."""
+
+    kind: PlanningOutcomeKind
+    detail: str | None = None
+    error: bool = False
+    base_sha: str | None = None
+    newly_activated: bool = False
+
+
+@dataclass(frozen=True)
+class PlanningAgentResult:
+    code: int
+    message: str
+    session_id: str | None
+    kind: PlanningAgentResultKind
+
+
+@dataclass(frozen=True)
+class PlanningScopeResult:
+    error: str | None = None
+    result_snapshot: str | None = None
+
+
+class PlanningStatePort(Protocol):
+    """Durable planning and maintenance repository boundary."""
+
+    def planning(self, repo: str) -> runtime_state.PlanningSnapshot: ...
+
+    def maintenance_cycle(self, repo: str) -> maintenance_state.MaintenanceCycle: ...
+
+    def update(self, repo: str, **values: object) -> None: ...
+
+    def transaction(self) -> AbstractContextManager[object]: ...
+
+    def advance_maintenance_cycle(
+        self, repo: str, base_sha: str
+    ) -> maintenance_state.MaintenanceCycle: ...
+
+    def schedule(self, repo: str) -> Any: ...
+
+    def maintenance_due(self, repo: str, interval: int) -> Any: ...
+
+    def begin_maintenance_assessment(
+        self,
+        repo: str,
+        interval: int,
+        base_sha: str,
+        *,
+        include_general_planning: bool,
+    ) -> tuple[maintenance_state.MaintenanceCycle, bool]: ...
+
+    def restart_stale_maintenance(
+        self,
+        repo: str,
+        expected: maintenance_state.MaintenanceCycle,
+        base_sha: str,
+    ) -> maintenance_state.MaintenanceCycle: ...
+
+    def activate_ready(self, repo: str, base_sha: str) -> Any | None: ...
+
+    def preserve_diagnostics(
+        self, repo: str, snapshot: runtime_state.PlanningSnapshot
+    ) -> None: ...
+
+    def clear_active(
+        self,
+        repo: str,
+        *,
+        processed_sha: object = None,
+        planning_fingerprint: object = None,
+    ) -> None: ...
+
+    def clear_active_in_transaction(
+        self,
+        repo: str,
+        *,
+        processed_sha: object = None,
+        planning_fingerprint: object = None,
+    ) -> None: ...
+
+    def clear_validation(self, repo: str) -> None: ...
+
+    def compact_catalog(self, repo: str) -> str: ...
+
+    def execplan_rows(self, repo: str) -> Sequence[Any]: ...
+
+    def transition_maintenance(
+        self,
+        repo: str,
+        *,
+        expected_phase: maintenance_state.MaintenancePhase,
+        expected_revision: int,
+        next_phase: maintenance_state.MaintenancePhase,
+        prerequisite_plan_ids: Sequence[str],
+        include_general_planning: bool,
+    ) -> maintenance_state.MaintenanceCycle: ...
+
+    def advance_success_baseline(
+        self,
+        repo: str,
+        *,
+        expected_phase: maintenance_state.MaintenancePhase,
+        expected_revision: int,
+        remote_commit: str,
+    ) -> maintenance_state.MaintenanceCycle: ...
+
+    def recover_maintenance_batch(
+        self, repo: str, worktree: Path, base: str
+    ) -> maintenance_state.MaintenanceCycle: ...
+
+    def record_maintenance_intent(
+        self,
+        repo: str,
+        worktree: Path,
+        base: str,
+        validated_result: Any,
+        plan_commit: str,
+    ) -> maintenance_state.MaintenanceCycle: ...
+
+    def publish_maintenance_batch(
+        self,
+        repo: str,
+        worktree: Path,
+        base: str,
+        validated_result: Any,
+        plan_commit: str,
+    ) -> maintenance_state.MaintenanceCycle: ...
+
+    def register_execplans(
+        self,
+        repo: str,
+        worktree: Path,
+        plans: Sequence[Any],
+        plan_commit: str,
+        fingerprint: str,
+    ) -> None: ...
+
+
+class PlanningGitPort(Protocol):
+    """Git and managed planning-worktree boundary."""
+
+    def run(
+        self, repo: Path, *arguments: str, check: bool = True
+    ) -> Any: ...
+
+    def input_fingerprint(self, repo_path: Path, sha: str) -> str: ...
+
+    def requirement_archive_only(
+        self, repo_path: Path, old_sha: str, new_sha: str
+    ) -> bool: ...
+
+    def validate_workspace_identity(
+        self, repo: str, fingerprint: str, worktree: Path
+    ) -> None: ...
+
+    def validate_worktree_ownership(
+        self, repo: str, fingerprint: str, worktree: Path
+    ) -> None: ...
+
+    def make_planning_worktree(
+        self,
+        repo_path: Path,
+        worktree: Path,
+        base: str,
+        *,
+        allow_create: bool,
+        allow_existing: bool,
+        ownership_reserved: bool,
+        expected_head: str,
+        before_create: Callable[[], None],
+    ) -> None: ...
+
+    def changed_files(
+        self, worktree: Path, since: str | None = None
+    ) -> list[str]: ...
+
+    def validate_managed_worktree(self, worktree: Path) -> None: ...
+
+
+class PlanningAgentPort(Protocol):
+    """Planner CLI and Agent scope boundary."""
+
+    def begin_scope(self, role: str, worktree: Path) -> Any: ...
+
+    def run_planner(
+        self,
+        worktree: Path,
+        prompt: str,
+        session_id: str | None,
+        on_session_started: Callable[[str], None],
+    ) -> PlanningAgentResult: ...
+
+    def finish_scope(
+        self, role: str, worktree: Path, before: Any
+    ) -> PlanningScopeResult: ...
+
+    def validate_saved_scope(
+        self, role: str, worktree: Path, snapshot: str
+    ) -> PlanningScopeResult: ...
+
+    def clear_scope(self, repo: str) -> None: ...
+
+
+class PlanningValidationPort(Protocol):
+    """Prompt, pure validation and maintenance context boundary."""
+
+    def maintenance_context_at_revision(
+        self,
+        repo: str,
+        worktree: Path,
+        active_sha: str,
+        cycle: maintenance_state.MaintenanceCycle,
+    ) -> MaintenancePlanningContext: ...
+
+    def prepare_maintenance_context(
+        self, repo: str, worktree: Path, active_sha: str
+    ) -> MaintenancePlanningContext: ...
+
+    def maintenance_change_context(
+        self,
+        repo_path: Path,
+        base: str,
+        cycle: maintenance_state.MaintenanceCycle,
+    ) -> str: ...
+
+    def planner_prompt(self, error: str | None, catalog: str) -> str: ...
+
+    def maintenance_prompt(
+        self,
+        context: MaintenancePlanningContext,
+        catalog: str,
+        change_context: str,
+        error: str | None,
+        *,
+        include_general_planning: bool,
+    ) -> str: ...
+
+    def validate_general_result(
+        self, worktree: Path, active_sha: str, dirty_files: Sequence[str]
+    ) -> Any: ...
+
+    def validate_maintenance_result(
+        self,
+        context: MaintenancePlanningContext,
+        worktree: Path,
+        dirty_files: Sequence[str],
+        *,
+        refactoring_plan_ids: Sequence[str],
+        allow_general_plans: bool,
+    ) -> Any: ...
+
+    def validate_publication_base(
+        self,
+        repo: str,
+        repo_path: Path,
+        base: str,
+        context: MaintenancePlanningContext,
+    ) -> None: ...
+
+
+class PlanningEventPort(Protocol):
+    """Clock-backed operational log boundary."""
+
+    def log(self, message: str) -> None: ...
+
+    def info(self, message: str) -> None: ...
+
+    def error(self, message: str) -> None: ...
+
+
+class PlanningLifecyclePorts(Protocol):
+    state: PlanningStatePort
+    git: PlanningGitPort
+    agent: PlanningAgentPort
+    validation: PlanningValidationPort
+    events: PlanningEventPort
+
+
+@dataclass
+class _PlanningRun:
+    context: PlanningContext
+    row: runtime_state.PlanningSnapshot
+    maintenance_cycle: maintenance_state.MaintenanceCycle
+    base_sha: str
+    maintenance_planning: bool
+    ready_activated_before_planning: bool = False
+    general_fingerprint: str | None = None
+    current_fingerprint: str | None = None
+    fingerprint_skipped: bool = False
+    published_refactoring: bool = False
+    planning_worktree: Path | None = None
+    maintenance_context: MaintenancePlanningContext | None = None
+    maintenance_change_context: str = ""
+    dirty_files: list[str] | None = None
+    planner_scope_error: str | None = None
+    maintenance_decision: MaintenancePlannerDecision | None = None
+    validated_result: Any = None
+
+
+class PlanningLifecycleCoordinator:
+    """Own planning transitions while delegating effects to explicit ports."""
+
+    def __init__(self, ports: PlanningLifecyclePorts):
+        self._ports = ports
+
+    @staticmethod
+    def _operational_error() -> PlanningOutcome:
+        return PlanningOutcome(PlanningOutcomeKind.OPERATIONAL_ERROR, error=True)
+
+    def _new_run(self, context: PlanningContext) -> _PlanningRun:
+        row = self._ports.state.planning(context.repo)
+        cycle = self._ports.state.maintenance_cycle(context.repo)
+        maintenance_planning = bool(
+            row.phase == "PLANNING"
+            and cycle.phase
+            in {
+                maintenance_state.MaintenancePhase.ASSESSMENT,
+                maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+            }
+        )
+        return _PlanningRun(
+            context=context,
+            row=row,
+            maintenance_cycle=cycle,
+            base_sha=context.base_sha,
+            maintenance_planning=maintenance_planning,
+        )
+
+    def run(self, context: PlanningContext) -> PlanningOutcome:
+        run = self._new_run(context)
+        handlers = (
+            self._recover_publication,
+            self._select_planning_work,
+            self._reconcile_inputs,
+            self._prepare_workspace,
+            self._run_planner_turn,
+            self._validate_planner_result,
+            self._publish_planner_result,
+            self._activate_next_execplan,
+        )
+        for handler in handlers:
+            outcome = handler(run)
+            if outcome is not None:
+                return outcome
+        raise RuntimeError("planning lifecycle ended without a typed outcome")
+
+    def _recover_publication(
+        self, run: _PlanningRun
+    ) -> PlanningOutcome | None:
+        context = run.context
+        cycle = run.maintenance_cycle
+        row = run.row
+        if not (
+            run.maintenance_planning
+            and cycle.publication_stage == "prepared"
+            and row.phase == "PLANNING"
+        ):
+            return None
+        worktree = Path(str(row.worktree or ""))
+        fingerprint = str(row.planning_attempt_fingerprint or "")
+        try:
+            self._ports.git.validate_worktree_ownership(
+                context.repo, fingerprint, worktree
+            )
+            self._ports.git.run(context.repo_path, "fetch", "origin")
+            remote_sha = self._ports.git.run(
+                context.repo_path,
+                "rev-parse",
+                "--verify",
+                f"refs/remotes/origin/{context.base_branch}^{{commit}}",
+            ).stdout.strip()
+            run.base_sha = remote_sha
+            recovered_cycle = None
+            if remote_sha != cycle.publication_base_sha:
+                recovered_cycle = self._ports.state.recover_maintenance_batch(
+                    context.repo, worktree, context.base_branch
+                )
+        except RuntimeError as error:
+            message = str(error)
+            self._ports.state.update(
+                context.repo,
+                planning_error=message,
+                planning_error_fingerprint=fingerprint,
+                last_error=message,
+            )
+            self._ports.events.error(message)
+            return self._operational_error()
+        if recovered_cycle is None:
+            return None
+        if worktree.exists():
+            self._ports.git.run(
+                context.repo_path,
+                "worktree",
+                "remove",
+                "--force",
+                str(worktree),
+            )
+        self._ports.events.info(
+            "게시된 유지보수 batch를 fingerprint 정리 전에 복구했습니다."
+            if recovered_cycle.publication_stage == "remote_confirmed"
+            else "원격 변경에 맞춰 미게시 유지보수 batch를 다시 시작합니다."
+        )
+        return PlanningOutcome(PlanningOutcomeKind.PUBLICATION_RECOVERY)
+
+    def _select_planning_work(
+        self, run: _PlanningRun
+    ) -> PlanningOutcome | None:
+        context = run.context
+        row = run.row
+        cycle = run.maintenance_cycle
+        if row.phase:
+            return None
+        try:
+            cycle = self._ports.state.advance_maintenance_cycle(
+                context.repo, run.base_sha
+            )
+        except MaintenancePlanningError as error:
+            message = str(error)
+            fingerprint = f"maintenance-cycle:{cycle.phase.value}:{cycle.revision}"
+            self._ports.state.update(
+                context.repo,
+                planning_error=message,
+                planning_error_fingerprint=fingerprint,
+                last_error=message,
+            )
+            self._ports.events.error(message)
+            return self._operational_error()
+        if row.planning_error and not row.worktree:
+            self._ports.state.update(
+                context.repo,
+                planning_error=None,
+                planning_error_fingerprint=None,
+                last_error=None,
+            )
+            row = self._ports.state.planning(context.repo)
+        decision = self._ports.state.schedule(context.repo)
+        if (
+            context.registered_only
+            and cycle.phase is maintenance_state.MaintenancePhase.IDLE
+            and not decision.has_waiting
+        ):
+            due = self._ports.state.maintenance_due(
+                context.repo, context.refactoring_review_interval
+            )
+            if due.required:
+                include_general = False
+                if not decision.has_ready:
+                    run.general_fingerprint = self._ports.git.input_fingerprint(
+                        context.repo_path, run.base_sha
+                    )
+                    include_general = self._general_planning_required(
+                        row, context, run.base_sha, run.general_fingerprint
+                    )
+                cycle, _started = self._ports.state.begin_maintenance_assessment(
+                    context.repo,
+                    context.refactoring_review_interval,
+                    run.base_sha,
+                    include_general_planning=include_general,
+                )
+        if (
+            decision.has_waiting
+            and cycle.phase
+            in {
+                maintenance_state.MaintenancePhase.ASSESSMENT,
+                maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+            }
+        ):
+            self._ports.events.info(
+                "PLAN_BLOCKED 또는 PR_OPEN 종료 전 유지보수 평가를 보류합니다."
+            )
+            return PlanningOutcome(PlanningOutcomeKind.WAITING)
+        if cycle.phase in {
+            maintenance_state.MaintenancePhase.ASSESSMENT,
+            maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+        }:
+            run.maintenance_planning = True
+        elif cycle.phase in {
+            maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
+            maintenance_state.MaintenancePhase.REFACTORING,
+        }:
+            decision = self._ports.state.schedule(context.repo)
+            if decision.runnable_ready is None:
+                self._ports.events.info(
+                    "활성 유지보수 주기의 dependency 충족을 기다립니다."
+                )
+                return PlanningOutcome(PlanningOutcomeKind.WAITING)
+            run.base_sha = self._fetch_remote_head(context)
+            self._ports.state.activate_ready(context.repo, run.base_sha)
+            row = self._ports.state.planning(context.repo)
+            run.ready_activated_before_planning = True
+        else:
+            decision = self._ports.state.schedule(context.repo)
+            if decision.has_ready:
+                if decision.runnable_ready is None:
+                    self._ports.events.info(
+                        "READY ExecPlan이 남아 있지만 dependency가 충족되지 않아 대기합니다."
+                    )
+                    return PlanningOutcome(PlanningOutcomeKind.WAITING)
+                run.base_sha = self._fetch_remote_head(context)
+                self._ports.state.activate_ready(context.repo, run.base_sha)
+                row = self._ports.state.planning(context.repo)
+                run.ready_activated_before_planning = True
+            elif decision.has_waiting:
+                self._ports.events.info(
+                    "독립 READY가 없어 PLAN_BLOCKED 또는 PR_OPEN 종료를 기다립니다."
+                )
+                return PlanningOutcome(PlanningOutcomeKind.WAITING)
+        run.row = row
+        run.maintenance_cycle = cycle
+        return None
+
+    def _general_planning_required(
+        self,
+        row: runtime_state.PlanningSnapshot,
+        context: PlanningContext,
+        base_sha: str,
+        current_fingerprint: str,
+    ) -> bool:
+        if row.planning_fingerprint == current_fingerprint:
+            return False
+        if row.planning_fingerprint and row.processed_sha:
+            processed = self._ports.git.input_fingerprint(
+                context.repo_path, row.processed_sha
+            )
+            if processed == current_fingerprint:
+                return False
+            if self._ports.git.requirement_archive_only(
+                context.repo_path, row.processed_sha, base_sha
+            ):
+                return False
+        return True
+
+    def _reconcile_inputs(
+        self, run: _PlanningRun
+    ) -> PlanningOutcome | None:
+        context = run.context
+        row = run.row
+        cycle = run.maintenance_cycle
+        if (
+            run.maintenance_planning
+            and cycle.cycle_base_sha != run.base_sha
+            and cycle.publication_stage is None
+            and row.phase == "PLANNING"
+        ):
+            stale_worktree = Path(str(row.worktree or ""))
+            stored_fingerprint = str(row.planning_attempt_fingerprint or "")
+            self._ports.git.validate_worktree_ownership(
+                context.repo, stored_fingerprint, stale_worktree
+            )
+            self._ports.state.preserve_diagnostics(context.repo, row)
+            with self._ports.state.transaction():
+                cycle = self._ports.state.restart_stale_maintenance(
+                    context.repo, cycle, run.base_sha
+                )
+                self._ports.state.clear_active_in_transaction(context.repo)
+            if stale_worktree.exists():
+                self._ports.git.run(
+                    context.repo_path,
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(stale_worktree),
+                )
+            row = self._ports.state.planning(context.repo)
+
+        fingerprint_required = bool(
+            run.maintenance_planning or not row.phase or row.phase == "PLANNING"
+        )
+        if fingerprint_required and run.general_fingerprint is None:
+            run.general_fingerprint = self._ports.git.input_fingerprint(
+                context.repo_path, run.base_sha
+            )
+        run.current_fingerprint = (
+            maintenance_planning_fingerprint(
+                cycle, run.general_fingerprint or ""
+            )
+            if run.maintenance_planning
+            else run.general_fingerprint
+            if fingerprint_required
+            else None
+        )
+        recoverable_publication = bool(
+            run.maintenance_planning
+            and row.phase == "PLANNING"
+            and cycle.publication_stage == "prepared"
+        )
+        if (
+            row.planning_error
+            and row.planning_error_fingerprint == run.current_fingerprint
+            and not recoverable_publication
+        ):
+            self._ports.events.error(
+                f"계획 오류가 해결되지 않았습니다: {row.planning_error}\n"
+                f"보존된 planning worktree: {row.worktree}"
+            )
+            return self._operational_error()
+
+        if row.planning_error and not recoverable_publication:
+            outcome = self._discard_stale_planning(run, row)
+            if outcome is not None:
+                return outcome
+            row = self._ports.state.planning(context.repo)
+
+        if row.phase == "PLANNING":
+            started_fingerprint = (
+                row.planning_attempt_fingerprint or run.current_fingerprint
+            )
+            if started_fingerprint != run.current_fingerprint:
+                outcome = self._discard_stale_planning(
+                    run,
+                    row,
+                    fingerprint=str(started_fingerprint or ""),
+                    preserve=bool(row.planning_validation_error),
+                )
+                if outcome is not None:
+                    return outcome
+                row = self._ports.state.planning(context.repo)
+
+        planning_required = not row.phase
+        if (
+            not run.maintenance_planning
+            and not row.phase
+            and row.planning_fingerprint == run.current_fingerprint
+        ):
+            self._ports.state.update(context.repo, processed_sha=run.base_sha)
+            self._ports.events.info(
+                "계획 입력이 바뀌지 않아 Agent를 실행하지 않습니다."
+            )
+            planning_required = False
+            run.fingerprint_skipped = True
+
+        if (
+            planning_required
+            and not run.maintenance_planning
+            and row.planning_fingerprint
+            and row.processed_sha
+        ):
+            processed = self._ports.git.input_fingerprint(
+                context.repo_path, row.processed_sha
+            )
+            if processed == run.current_fingerprint:
+                self._ports.state.update(context.repo, processed_sha=run.base_sha)
+                self._ports.events.info(
+                    "계획 입력이 바뀌지 않아 Agent를 실행하지 않습니다."
+                )
+                planning_required = False
+                run.fingerprint_skipped = True
+            elif self._ports.git.requirement_archive_only(
+                context.repo_path, row.processed_sha, run.base_sha
+            ):
+                self._ports.state.update(context.repo, processed_sha=run.base_sha)
+                self._ports.events.info(
+                    "Requirement archive 이동 외의 계획 입력이 바뀌지 않아 Agent를 실행하지 않습니다."
+                )
+                planning_required = False
+                run.fingerprint_skipped = True
+
+        if planning_required:
+            assert run.current_fingerprint is not None
+            project_id = hashlib.sha256(context.repo.encode()).hexdigest()[:16]
+            worktree = (
+                context.state_dir
+                / "worktrees"
+                / project_id
+                / "planning"
+                / run.current_fingerprint
+            )
+            self._ports.state.update(
+                context.repo,
+                active_sha=run.base_sha,
+                plan_sha=None,
+                planning_attempt_fingerprint=run.current_fingerprint,
+                planning_workspace_owned=0,
+                planning_retry_count=0,
+                planner_session_id=None,
+                worker_session_id=None,
+                worker_result=None,
+                verify_result=None,
+                planning_validation_error=None,
+                planning_result_pending_validation=0,
+                planning_result_completed=0,
+                planning_result=None,
+                planning_error=None,
+                planning_error_fingerprint=None,
+                phase="PLANNING",
+                branch=None,
+                worktree=str(worktree),
+                plan_path=None,
+                pr_url=None,
+                last_error=None,
+            )
+            row = self._ports.state.planning(context.repo)
+        run.row = row
+        run.maintenance_cycle = cycle
+        return None
+
+    def _discard_stale_planning(
+        self,
+        run: _PlanningRun,
+        row: runtime_state.PlanningSnapshot,
+        *,
+        fingerprint: str | None = None,
+        preserve: bool = True,
+    ) -> PlanningOutcome | None:
+        context = run.context
+        worktree = Path(row.worktree) if row.worktree else None
+        stored_fingerprint = fingerprint or str(
+            row.planning_attempt_fingerprint
+            or row.planning_error_fingerprint
+            or ""
+        )
+        try:
+            if worktree is None:
+                raise RuntimeError("planning worktree 경로가 저장되지 않았습니다.")
+            self._ports.git.validate_worktree_ownership(
+                context.repo, stored_fingerprint, worktree
+            )
+        except RuntimeError as error:
+            message = f"planning workspace cleanup 소유권 검증 실패: {error}"
+            self._ports.state.update(
+                context.repo,
+                planning_error=message,
+                planning_error_fingerprint=run.current_fingerprint,
+                last_error=message,
+            )
+            self._ports.events.error(message)
+            return self._operational_error()
+        if preserve:
+            self._ports.state.preserve_diagnostics(context.repo, row)
+        if worktree.exists():
+            self._ports.git.run(
+                context.repo_path,
+                "worktree",
+                "remove",
+                "--force",
+                str(worktree),
+            )
+        self._ports.state.clear_active(context.repo)
+        return None
+
+    def _fetch_remote_head(self, context: PlanningContext) -> str:
+        self._ports.git.run(context.repo_path, "fetch", "origin")
+        return self._ports.git.run(
+            context.repo_path,
+            "rev-parse",
+            "--verify",
+            f"refs/remotes/origin/{context.base_branch}^{{commit}}",
+        ).stdout.strip()
+
+    def _prepare_workspace(
+        self, run: _PlanningRun
+    ) -> PlanningOutcome | None:
+        row = run.row
+        if row.phase != "PLANNING":
+            return None
+        context = run.context
+        worktree = Path(str(row.worktree or ""))
+        try:
+            self._ports.git.validate_workspace_identity(
+                context.repo,
+                str(row.planning_attempt_fingerprint or ""),
+                worktree,
+            )
+            planning_started = bool(
+                row.planner_session_id
+                or row.agent_snapshot
+                or row.planning_result_pending_validation
+                or row.planning_result_completed
+                or row.planning_validation_error
+                or row.planning_retry_count
+                or row.last_error
+            )
+            owned = row.planning_workspace_owned == WORKSPACE_OWNED
+            reserved = row.planning_workspace_owned == WORKSPACE_RESERVED
+            self._ports.git.make_planning_worktree(
+                context.repo_path,
+                worktree,
+                context.base_branch,
+                allow_create=not planning_started and (not owned or reserved),
+                allow_existing=owned or reserved,
+                ownership_reserved=reserved,
+                expected_head=str(row.active_sha or ""),
+                before_create=lambda: self._ports.state.update(
+                    context.repo,
+                    planning_workspace_owned=WORKSPACE_RESERVED,
+                ),
+            )
+            self._ports.state.update(
+                context.repo,
+                planning_workspace_owned=WORKSPACE_OWNED,
+            )
+        except PlanningWorkspaceOwnershipError as error:
+            message = f"planning workspace 소유권 검증 실패: {error}"
+            self._ports.state.update(
+                context.repo,
+                planning_error=message,
+                planning_error_fingerprint=run.current_fingerprint,
+                last_error=message,
+            )
+            self._ports.events.error(message)
+            return self._operational_error()
+
+        if run.maintenance_planning:
+            try:
+                cycle = self._ports.state.maintenance_cycle(context.repo)
+                if cycle.publication_stage == "prepared":
+                    maintenance_context = (
+                        self._ports.validation.maintenance_context_at_revision(
+                            context.repo,
+                            worktree,
+                            str(row.active_sha or ""),
+                            cycle,
+                        )
+                    )
+                    change_context = ""
+                else:
+                    maintenance_context = (
+                        self._ports.validation.prepare_maintenance_context(
+                            context.repo,
+                            worktree,
+                            str(row.active_sha or ""),
+                        )
+                    )
+                    change_context = (
+                        self._ports.validation.maintenance_change_context(
+                            context.repo_path,
+                            context.base_branch,
+                            cycle,
+                        )
+                    )
+            except (MaintenancePlanningError, MaintenanceOrchestrationError) as error:
+                message = str(error)
+                self._ports.state.update(
+                    context.repo,
+                    planning_error=message,
+                    planning_error_fingerprint=run.current_fingerprint,
+                    last_error=message,
+                )
+                self._ports.events.error(message)
+                return self._operational_error()
+            run.maintenance_cycle = cycle
+            run.maintenance_context = maintenance_context
+            run.maintenance_change_context = change_context
+        run.planning_worktree = worktree
+        return None
+
+    def _run_planner_turn(
+        self, run: _PlanningRun
+    ) -> PlanningOutcome | None:
+        row = run.row
+        if row.phase != "PLANNING":
+            return None
+        context = run.context
+        worktree = run.planning_worktree
+        assert worktree is not None
+        head = self._ports.git.run(worktree, "rev-parse", "HEAD").stdout.strip()
+        dirty_files = self._ports.git.changed_files(worktree)
+        if row.planning_validation_error and head != row.active_sha:
+            self._ports.git.run(
+                worktree, "reset", "--mixed", str(row.active_sha)
+            )
+            head = self._ports.git.run(
+                worktree, "rev-parse", "HEAD"
+            ).stdout.strip()
+            dirty_files = self._ports.git.changed_files(worktree)
+
+        result_in_flight = bool(
+            row.planning_result_pending_validation
+            and not row.planning_result_completed
+        )
+        scope_error: str | None = None
+        should_run = result_in_flight or (
+            head == row.active_sha
+            and (
+                not dirty_files
+                or row.planning_validation_error
+                or row.last_error
+            )
+            and not row.planning_result_pending_validation
+            and not (
+                row.planning_validation_error
+                and row.planning_retry_count >= MAX_PLANNER_VALIDATION_RETRIES
+            )
+        )
+        if should_run:
+            self._ports.events.log("Planner 시작: 다음 ExecPlan 계획을 생성합니다.")
+            if not result_in_flight:
+                self._ports.state.update(
+                    context.repo,
+                    last_error=None,
+                    planning_result_pending_validation=1,
+                    planning_result_completed=0,
+                    planning_result=None,
+                )
+                row = self._ports.state.planning(context.repo)
+            role = "maintenance_planner" if run.maintenance_planning else "planner"
+            if run.maintenance_planning:
+                assert run.maintenance_context is not None
+                prompt = self._ports.validation.maintenance_prompt(
+                    run.maintenance_context,
+                    self._ports.state.compact_catalog(context.repo),
+                    run.maintenance_change_context,
+                    row.planning_validation_error or row.last_error,
+                    include_general_planning=(
+                        run.maintenance_cycle.include_general_planning
+                    ),
+                )
+            else:
+                prompt = self._ports.validation.planner_prompt(
+                    row.planning_validation_error or row.last_error,
+                    self._ports.state.compact_catalog(context.repo),
+                )
+            before = self._ports.agent.begin_scope(role, worktree)
+            result = self._ports.agent.run_planner(
+                worktree,
+                prompt,
+                row.planner_session_id,
+                lambda session_id: self._ports.state.update(
+                    context.repo, planner_session_id=session_id
+                ),
+            )
+            if result.session_id:
+                self._ports.state.update(
+                    context.repo, planner_session_id=result.session_id
+                )
+            scope_result = self._ports.agent.finish_scope(role, worktree, before)
+            if scope_result.error:
+                scope_error = scope_result.error
+                if scope_result.result_snapshot is not None:
+                    self._ports.state.update(
+                        context.repo,
+                        agent_result_snapshot=scope_result.result_snapshot,
+                    )
+            else:
+                self._ports.agent.clear_scope(context.repo)
+
+            if result.code:
+                message = result.message or f"Planner 종료 코드 {result.code}"
+                if result.kind is PlanningAgentResultKind.TRANSIENT_FAILURE:
+                    outcome = PlanningOutcomeKind.TRANSIENT_PAUSE
+                elif result.kind is PlanningAgentResultKind.USAGE_LIMIT:
+                    outcome = PlanningOutcomeKind.USAGE_LIMIT_PAUSE
+                else:
+                    outcome = PlanningOutcomeKind.OPERATIONAL_ERROR
+                self._ports.state.update(
+                    context.repo,
+                    last_error=message,
+                    planning_result_pending_validation=0,
+                    planning_result_completed=0,
+                    planning_result=None,
+                )
+                self._ports.events.error(message)
+                return PlanningOutcome(outcome, error=True)
+            self._ports.state.update(
+                context.repo,
+                last_error=None,
+                planning_result_completed=1,
+                planning_result=result.message,
+            )
+            row = self._ports.state.planning(context.repo)
+            dirty_files = self._ports.git.changed_files(worktree)
+
+        if scope_error is None:
+            scope_row = self._ports.state.planning(context.repo)
+            if scope_row.agent_snapshot:
+                expected_role = (
+                    "maintenance_planner" if run.maintenance_planning else "planner"
+                )
+                if scope_row.agent_role != expected_role:
+                    scope_error = "저장된 Agent 역할이 Planner와 다릅니다."
+                else:
+                    scope_result = self._ports.agent.validate_saved_scope(
+                        expected_role,
+                        worktree,
+                        scope_row.agent_snapshot,
+                    )
+                    scope_error = scope_result.error
+                    if scope_result.error and scope_result.result_snapshot is not None:
+                        self._ports.state.update(
+                            context.repo,
+                            agent_result_snapshot=scope_result.result_snapshot,
+                        )
+                    elif not scope_result.error:
+                        self._ports.agent.clear_scope(context.repo)
+        run.row = row
+        run.dirty_files = dirty_files
+        run.planner_scope_error = scope_error
+        return None
+
+    def _validate_planner_result(
+        self, run: _PlanningRun
+    ) -> PlanningOutcome | None:
+        row = run.row
+        if row.phase != "PLANNING":
+            return None
+        context = run.context
+        worktree = run.planning_worktree
+        assert worktree is not None
+        dirty_files = run.dirty_files or []
+        decision: MaintenancePlannerDecision | None = None
+        try:
+            if run.planner_scope_error is not None:
+                raise PlanningResultInvalid(run.planner_scope_error)
+            if run.maintenance_planning:
+                assert run.maintenance_context is not None
+                try:
+                    decision = parse_maintenance_planner_decision(
+                        str(row.planning_result or ""),
+                        run.maintenance_cycle.phase,
+                    )
+                except MaintenanceOrchestrationError as error:
+                    raise PlanningResultInvalid(str(error)) from error
+                changed = sorted(
+                    set(dirty_files)
+                    | set(
+                        self._ports.git.changed_files(
+                            worktree, str(row.active_sha or "")
+                        )
+                    )
+                )
+                if decision.outcome is MaintenanceOutcome.PREREQUISITES:
+                    if run.maintenance_cycle.include_general_planning:
+                        raise PlanningResultInvalid(
+                            "combined planning에는 prerequisite 결과를 사용할 수 없습니다."
+                        )
+                    if changed:
+                        raise PlanningResultInvalid(
+                            "prerequisites 결과는 planning 파일을 변경할 수 없습니다."
+                        )
+                    try:
+                        validate_prerequisite_plan_ids(
+                            self._ports.state.execplan_rows(context.repo),
+                            decision.plan_ids,
+                        )
+                    except MaintenanceOrchestrationError as error:
+                        raise PlanningResultInvalid(str(error)) from error
+                    validated_result = None
+                elif decision.outcome is MaintenanceOutcome.UNSAFE:
+                    if changed:
+                        raise PlanningResultInvalid(
+                            "unsafe revalidation 결과는 계획 파일을 변경할 수 없습니다."
+                        )
+                    validated_result = None
+                else:
+                    refactoring_ids = (
+                        decision.plan_ids
+                        if decision.outcome is MaintenanceOutcome.REFACTORING
+                        else ()
+                    )
+                    validated_result = (
+                        self._ports.validation.validate_maintenance_result(
+                            run.maintenance_context,
+                            worktree,
+                            dirty_files,
+                            refactoring_plan_ids=refactoring_ids,
+                            allow_general_plans=(
+                                run.maintenance_cycle.include_general_planning
+                            ),
+                        )
+                    )
+                    if (
+                        decision.outcome is MaintenanceOutcome.REFACTORING
+                        and validated_result is None
+                    ):
+                        raise PlanningResultInvalid(
+                            "refactoring 결과에는 검증 가능한 planning batch가 필요합니다."
+                        )
+            else:
+                validated_result = self._ports.validation.validate_general_result(
+                    worktree,
+                    str(row.active_sha or ""),
+                    dirty_files,
+                )
+        except PlanningResultInvalid as error:
+            message = str(error)
+            retry_count = row.planning_retry_count
+            if (
+                row.planning_result_pending_validation
+                and row.planning_validation_error
+            ):
+                retry_count += 1
+            values: dict[str, object] = {
+                "planning_validation_error": message,
+                "planning_result_pending_validation": 0,
+                "planning_result_completed": 0,
+                "last_error": None,
+                "planning_retry_count": retry_count,
+            }
+            if retry_count >= MAX_PLANNER_VALIDATION_RETRIES:
+                values.update(
+                    planning_error=message,
+                    planning_error_fingerprint=run.current_fingerprint,
+                )
+            self._ports.state.update(context.repo, **values)
+            self._ports.events.error(message)
+            return PlanningOutcome(
+                PlanningOutcomeKind.VALIDATION_RETRY, error=True
+            )
+
+        if (
+            decision is not None
+            and decision.outcome is MaintenanceOutcome.PREREQUISITES
+        ):
+            self._ports.git.validate_worktree_ownership(
+                context.repo,
+                str(run.current_fingerprint or ""),
+                worktree,
+            )
+            with self._ports.state.transaction():
+                self._ports.state.transition_maintenance(
+                    context.repo,
+                    expected_phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+                    expected_revision=run.maintenance_cycle.revision,
+                    next_phase=(
+                        maintenance_state.MaintenancePhase.PREREQUISITE_WAIT
+                    ),
+                    prerequisite_plan_ids=decision.plan_ids,
+                    include_general_planning=False,
+                )
+                self._ports.state.clear_active_in_transaction(context.repo)
+            self._ports.git.run(
+                context.repo_path,
+                "worktree",
+                "remove",
+                str(worktree),
+            )
+            return PlanningOutcome(PlanningOutcomeKind.PREREQUISITE_WAIT)
+
+        if decision is not None and decision.outcome is MaintenanceOutcome.UNSAFE:
+            message = (
+                "post-refactor revalidation이 제품 목표 보존을 확정하지 못했습니다: "
+                + str(decision.reason)
+            )
+            self._ports.state.update(
+                context.repo,
+                planning_error=message,
+                planning_error_fingerprint=run.current_fingerprint,
+                last_error=message,
+            )
+            self._ports.events.error(message)
+            return PlanningOutcome(
+                PlanningOutcomeKind.UNSAFE_REVALIDATION, error=True
+            )
+
+        run.published_refactoring = bool(
+            decision is not None
+            and decision.outcome is MaintenanceOutcome.REFACTORING
+        )
+        run.maintenance_decision = decision
+        run.validated_result = validated_result
+        return None
+
+    def _publish_planner_result(
+        self, run: _PlanningRun
+    ) -> PlanningOutcome | None:
+        row = run.row
+        if row.phase != "PLANNING":
+            return None
+        context = run.context
+        worktree = run.planning_worktree
+        assert worktree is not None
+        validated_result = run.validated_result
+        if validated_result is None:
+            completed_fingerprint = self._ports.git.input_fingerprint(
+                context.repo_path, str(row.active_sha or "")
+            )
+            self._ports.git.validate_worktree_ownership(
+                context.repo,
+                str(run.current_fingerprint or ""),
+                worktree,
+            )
+            if run.maintenance_planning:
+                assert run.maintenance_context is not None
+                try:
+                    self._ports.git.run(context.repo_path, "fetch", "origin")
+                    self._ports.validation.validate_publication_base(
+                        context.repo,
+                        context.repo_path,
+                        context.base_branch,
+                        run.maintenance_context,
+                    )
+                except MaintenancePlanningRestart:
+                    self._ports.git.run(
+                        context.repo_path,
+                        "worktree",
+                        "remove",
+                        "--force",
+                        str(worktree),
+                    )
+                    self._ports.events.error(
+                        "유지보수 평가 중 base가 변경되어 최신 기준으로 다시 평가합니다."
+                    )
+                    return PlanningOutcome(
+                        PlanningOutcomeKind.REMOTE_BASE_RESTART,
+                        error=True,
+                    )
+                except RuntimeError as error:
+                    message = str(error)
+                    self._ports.state.update(
+                        context.repo,
+                        planning_error=message,
+                        planning_error_fingerprint=run.current_fingerprint,
+                        last_error=message,
+                    )
+                    self._ports.events.error(message)
+                    return self._operational_error()
+                with self._ports.state.transaction():
+                    self._ports.state.advance_success_baseline(
+                        context.repo,
+                        expected_phase=run.maintenance_cycle.phase,
+                        expected_revision=run.maintenance_cycle.revision,
+                        remote_commit=str(row.active_sha or ""),
+                    )
+                    self._ports.state.clear_active_in_transaction(
+                        context.repo,
+                        processed_sha=(
+                            str(row.active_sha or "")
+                            if run.maintenance_cycle.include_general_planning
+                            else None
+                        ),
+                        planning_fingerprint=(
+                            completed_fingerprint
+                            if run.maintenance_cycle.include_general_planning
+                            else None
+                        ),
+                    )
+            else:
+                self._ports.state.clear_active(
+                    context.repo,
+                    processed_sha=row.active_sha,
+                    planning_fingerprint=completed_fingerprint,
+                )
+            self._ports.git.run(
+                context.repo_path,
+                "worktree",
+                "remove",
+                str(worktree),
+            )
+            self._ports.events.info(
+                "유지보수 평가와 재검증을 완료했습니다."
+                if run.maintenance_planning
+                else "추가로 계획할 작업이 없습니다."
+            )
+            run.row = self._ports.state.planning(context.repo)
+            return None
+
+        plans = list(validated_result.plans)
+        if run.dirty_files:
+            self._ports.git.run(
+                worktree,
+                "add",
+                "--",
+                *validated_result.publication_paths,
+            )
+            if run.maintenance_planning:
+                message = "Update periodic maintenance planning batch"
+            elif not plans:
+                message = "Update future ideas from planning"
+            else:
+                first = plans[0][1]
+                last = plans[-1][1]
+                message = (
+                    f"Add ExecPlan {first['id']}: {first['title']}"
+                    if len(plans) == 1
+                    else f"Add ExecPlans {first['id']}-{last['id']}"
+                )
+            self._ports.git.run(worktree, "commit", "-m", message)
+
+        if not run.maintenance_planning:
+            self._ports.state.clear_validation(context.repo)
+        plan_commit = self._ports.git.run(
+            worktree, "rev-parse", "HEAD"
+        ).stdout.strip()
+        if run.maintenance_planning:
+            assert run.maintenance_context is not None
+            try:
+                self._ports.git.validate_worktree_ownership(
+                    context.repo,
+                    str(run.current_fingerprint or ""),
+                    worktree,
+                )
+                if run.maintenance_cycle.publication_stage is None:
+                    self._ports.validation.validate_publication_base(
+                        context.repo,
+                        context.repo_path,
+                        context.base_branch,
+                        run.maintenance_context,
+                    )
+                    run.maintenance_cycle = (
+                        self._ports.state.record_maintenance_intent(
+                            context.repo,
+                            worktree,
+                            context.base_branch,
+                            validated_result,
+                            plan_commit,
+                        )
+                    )
+                elif run.maintenance_cycle.publication_stage != "prepared":
+                    raise MaintenancePlanningError(
+                        "복구할 수 없는 maintenance publication 단계입니다."
+                    )
+            except MaintenancePlanningRestart:
+                self._ports.git.run(
+                    context.repo_path,
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(worktree),
+                )
+                self._ports.events.error(
+                    "유지보수 계획 중 base가 변경되어 최신 기준으로 다시 평가합니다."
+                )
+                return PlanningOutcome(
+                    PlanningOutcomeKind.REMOTE_BASE_RESTART, error=True
+                )
+            except RuntimeError as error:
+                message = str(error)
+                self._ports.state.update(
+                    context.repo,
+                    planning_error=message,
+                    planning_error_fingerprint=run.current_fingerprint,
+                    last_error=message,
+                )
+                self._ports.events.error(message)
+                return self._operational_error()
+
+        self._ports.git.run(context.repo_path, "fetch", "origin")
+        latest_sha = self._ports.git.run(
+            context.repo_path,
+            "rev-parse",
+            f"origin/{context.base_branch}",
+        ).stdout.strip()
+        if run.maintenance_planning and latest_sha not in {
+            row.active_sha,
+            plan_commit,
+        }:
+            try:
+                recovered_cycle = self._ports.state.recover_maintenance_batch(
+                    context.repo, worktree, context.base_branch
+                )
+            except RuntimeError as error:
+                message = str(error)
+                self._ports.state.update(
+                    context.repo,
+                    planning_error=message,
+                    planning_error_fingerprint=run.current_fingerprint,
+                    last_error=message,
+                )
+                self._ports.events.error(message)
+                return self._operational_error()
+            self._ports.git.run(
+                context.repo_path,
+                "worktree",
+                "remove",
+                "--force",
+                str(worktree),
+            )
+            if recovered_cycle.phase in {
+                maintenance_state.MaintenancePhase.ASSESSMENT,
+                maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+            }:
+                self._ports.events.info(
+                    "미게시 유지보수 batch를 폐기하고 최신 기준으로 다시 평가합니다."
+                )
+            else:
+                self._ports.events.info("게시된 유지보수 batch를 복구했습니다.")
+            return PlanningOutcome(PlanningOutcomeKind.PUBLICATION_RECOVERY)
+
+        if latest_sha not in {row.active_sha, plan_commit}:
+            published = (
+                self._ports.git.run(
+                    worktree,
+                    "merge-base",
+                    "--is-ancestor",
+                    plan_commit,
+                    f"origin/{context.base_branch}",
+                    check=False,
+                ).returncode
+                == 0
+            )
+            if not published:
+                self._ports.git.validate_worktree_ownership(
+                    context.repo,
+                    str(run.current_fingerprint or ""),
+                    worktree,
+                )
+                self._ports.git.run(
+                    context.repo_path,
+                    "worktree",
+                    "remove",
+                    str(worktree),
+                )
+                self._ports.state.clear_active(context.repo)
+                self._ports.events.error(
+                    "계획 중 base가 변경되어 최신 기준으로 다시 계획합니다."
+                )
+                return PlanningOutcome(
+                    PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED,
+                    error=True,
+                )
+
+        if latest_sha != plan_commit and latest_sha == row.active_sha:
+            pushed = self._ports.git.run(
+                worktree,
+                "push",
+                "origin",
+                f"HEAD:refs/heads/{context.base_branch}",
+                check=False,
+            )
+            if pushed.returncode:
+                message = f"ExecPlan push 실패:\n{pushed.stdout[-8000:]}"
+                self._ports.state.update(context.repo, last_error=message)
+                self._ports.events.error(pushed.stdout)
+                return self._operational_error()
+            self._ports.git.run(context.repo_path, "fetch", "origin")
+            latest_sha = self._ports.git.run(
+                context.repo_path,
+                "rev-parse",
+                f"origin/{context.base_branch}",
+            ).stdout.strip()
+            if latest_sha != plan_commit:
+                message = (
+                    "ExecPlan push 결과를 origin/base에서 확인할 수 없습니다."
+                )
+                self._ports.state.update(context.repo, last_error=message)
+                self._ports.events.error(
+                    "ExecPlan push 결과 확인에 실패했습니다."
+                )
+                return self._operational_error()
+
+        if run.maintenance_planning:
+            try:
+                self._ports.state.publish_maintenance_batch(
+                    context.repo,
+                    worktree,
+                    context.base_branch,
+                    validated_result,
+                    plan_commit,
+                )
+            except RuntimeError as error:
+                message = str(error)
+                self._ports.state.update(
+                    context.repo,
+                    planning_error=message,
+                    planning_error_fingerprint=run.current_fingerprint,
+                    last_error=message,
+                )
+                self._ports.events.error(message)
+                return self._operational_error()
+        else:
+            self._ports.git.validate_worktree_ownership(
+                context.repo,
+                str(run.current_fingerprint or ""),
+                worktree,
+            )
+            self._ports.state.register_execplans(
+                context.repo,
+                worktree,
+                plans,
+                plan_commit,
+                str(run.current_fingerprint or ""),
+            )
+        self._ports.git.run(
+            context.repo_path,
+            "worktree",
+            "remove",
+            str(worktree),
+        )
+        run.base_sha = latest_sha
+        run.row = self._ports.state.planning(context.repo)
+        return None
+
+    def _activate_next_execplan(
+        self, run: _PlanningRun
+    ) -> PlanningOutcome:
+        context = run.context
+        row = run.row
+        newly_activated = run.ready_activated_before_planning
+        if not row.phase:
+            latest_sha = self._fetch_remote_head(context)
+            decision = self._ports.state.schedule(context.repo)
+            if not decision.has_ready and decision.has_waiting:
+                self._ports.events.info(
+                    "독립 READY가 없어 PLAN_BLOCKED 또는 PR_OPEN 종료를 기다립니다."
+                )
+                return PlanningOutcome(PlanningOutcomeKind.WAITING)
+            if not decision.has_ready:
+                latest_fingerprint = self._ports.git.input_fingerprint(
+                    context.repo_path, latest_sha
+                )
+                expected_fingerprint = (
+                    run.general_fingerprint
+                    if run.maintenance_planning
+                    else run.current_fingerprint
+                )
+                assert expected_fingerprint is not None
+                if latest_fingerprint != expected_fingerprint:
+                    self._ports.events.error(
+                        "계획 중 입력이 변경되어 최신 기준으로 다시 계획합니다."
+                    )
+                    return PlanningOutcome(
+                        PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED,
+                        error=True,
+                    )
+            elif decision.runnable_ready is None:
+                self._ports.events.info(
+                    "READY ExecPlan이 남아 있지만 dependency가 충족되지 않아 대기합니다."
+                )
+                return PlanningOutcome(PlanningOutcomeKind.WAITING)
+            run.base_sha = latest_sha
+            selected = self._ports.state.activate_ready(
+                context.repo, run.base_sha
+            )
+            if selected is None:
+                self._ports.events.info("실행 가능한 READY ExecPlan이 없습니다.")
+                return PlanningOutcome(
+                    PlanningOutcomeKind.FINGERPRINT_SKIPPED
+                    if run.fingerprint_skipped
+                    else PlanningOutcomeKind.NO_CHANGE
+                )
+            newly_activated = True
+        return PlanningOutcome(
+            PlanningOutcomeKind.REFACTORING
+            if run.published_refactoring
+            else PlanningOutcomeKind.EXECUTION_READY,
+            base_sha=run.base_sha,
+            newly_activated=newly_activated,
+        )
