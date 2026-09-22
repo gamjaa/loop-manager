@@ -6640,6 +6640,26 @@ def validate_agent_scope(
     changes = agent_snapshot_changes(worktree, before, after)
     violations: list[str] = []
     violation_reason = BlockReasonCode.MANAGED_WORKTREE_SCOPE_VIOLATION
+    external_key = (
+        str(_canonical_path(external_worktree))
+        if external_worktree is not None
+        else None
+    )
+    external_registration_preserved = bool(
+        external_key is not None
+        and external_key in before.worktrees
+        and external_key in after.worktrees
+    )
+    external_base_ref = f"refs/heads/{base_branch}" if base_branch else None
+    external_base_ref_owned = bool(
+        external_registration_preserved
+        and external_key is not None
+        and external_base_ref is not None
+        and any(
+            f"branch={external_base_ref}" in snapshot.worktrees[external_key]
+            for snapshot in (before, after)
+        )
+    )
 
     def add_violation(message: str, reason: BlockReasonCode) -> None:
         nonlocal violation_reason
@@ -6696,11 +6716,32 @@ def validate_agent_scope(
             ),
         )
         for label, before_state, after_state, allowed_changes, reason in metadata_states:
+            effective_allowed_changes = allowed_changes
+            if (
+                label == "Git worktree 등록·HEAD·index·파일 상태"
+                and external_registration_preserved
+            ):
+                # The registered project's primary checkout is not owned by the
+                # managed Agent. Its local HEAD, branch, index and files are
+                # evaluated by the source freshness/safe-fast-forward gates.
+                # Requiring the entry on both sides still protects worktree
+                # registration additions and removals.
+                effective_allowed_changes |= frozenset((external_key,))
+            elif (
+                label == "공유 Git refs"
+                and external_base_ref_owned
+            ):
+                # Moving the primary checkout on its configured base branch
+                # necessarily moves this local ref. Other local branches,
+                # remote refs and tags remain repository-wide protected state.
+                effective_allowed_changes |= frozenset(
+                    (external_base_ref,)
+                )
             changed_keys = sorted(
                 key
                 for key in set(before_state) | set(after_state)
                 if before_state.get(key) != after_state.get(key)
-                and key not in allowed_changes
+                and key not in effective_allowed_changes
             )
             if changed_keys:
                 if label == "공유 Git refs":
@@ -6721,11 +6762,6 @@ def validate_agent_scope(
                         reason = BlockReasonCode.MANAGED_WORKTREE_SCOPE_VIOLATION
                 elif label == "Git worktree 등록·HEAD·index·파일 상태":
                     managed_worktree = str(_canonical_path(worktree))
-                    external_key = (
-                        str(_canonical_path(external_worktree))
-                        if external_worktree is not None
-                        else None
-                    )
                     unowned_changes = [
                         key for key in changed_keys if key != managed_worktree
                     ]

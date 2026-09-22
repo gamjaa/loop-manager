@@ -6432,12 +6432,6 @@ class AgentScopeValidatorTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo, plan_path = self._repository_with_plan(directory)
-            git_command(
-                repo,
-                "symbolic-ref",
-                "refs/remotes/origin/HEAD",
-                "refs/remotes/origin/main",
-            )
             managed = root / "managed"
             loop_manager.make_worktree(
                 repo,
@@ -6448,7 +6442,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
             before = loop_manager.capture_git_snapshot(managed)
 
             (repo / "src/app.py").write_text("VALUE = 2\n", encoding="utf-8")
-            commit_and_push(repo, "Update primary worktree")
+            git_command(repo, "add", "src/app.py")
+            git_command(repo, "commit", "-m", "Update primary worktree")
             after = loop_manager.capture_git_snapshot(managed)
 
             primary_path = str(repo.resolve())
@@ -6456,12 +6451,10 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 before.worktrees[primary_path],
                 after.worktrees[primary_path],
             )
-            for refname in (
-                "refs/heads/main",
-                "refs/remotes/origin/main",
-                "refs/remotes/origin/HEAD",
-            ):
-                self.assertNotEqual(before.refs[refname], after.refs[refname])
+            self.assertNotEqual(
+                before.refs["refs/heads/main"],
+                after.refs["refs/heads/main"],
+            )
             with self.assertRaises(loop_manager.AgentScopeError):
                 loop_manager.validate_agent_scope(
                     "worker",
@@ -6470,6 +6463,42 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     after,
                     selected_plan_path=plan_path,
                 )
+            loop_manager.validate_agent_scope(
+                "worker",
+                managed,
+                before,
+                after,
+                selected_plan_path=plan_path,
+                external_worktree=repo,
+                base_branch="main",
+            )
+
+    def test_primary_worktree_registration_removal_is_still_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, plan_path = self._repository_with_plan(directory)
+            managed = root / "managed"
+            loop_manager.make_worktree(
+                repo,
+                managed,
+                "loop-manager/G-099",
+                "main",
+            )
+            before = loop_manager.capture_git_snapshot(managed)
+            primary_path = str(repo.resolve())
+            remaining_worktrees = dict(before.worktrees)
+            del remaining_worktrees[primary_path]
+            after = loop_manager.GitSnapshot(
+                head=before.head,
+                branch=before.branch,
+                index=before.index,
+                dirty=before.dirty,
+                refs=before.refs,
+                worktrees=remaining_worktrees,
+                config=before.config,
+                operations=before.operations,
+            )
+
             with self.assertRaises(loop_manager.AgentScopeError) as raised:
                 loop_manager.validate_agent_scope(
                     "worker",
@@ -6480,10 +6509,133 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     external_worktree=repo,
                     base_branch="main",
                 )
+
             self.assertEqual(
                 raised.exception.reason_code,
                 loop_manager.BlockReasonCode.DEFAULT_WORKTREE_MUTATION,
             )
+
+    def test_default_worktree_project_block_releases_without_source_revert(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, plan_path = self._repository_with_plan(directory)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            branch, worktree = loop_manager.expected_execplan_workspace(
+                state_dir,
+                str(repo),
+                "G-001",
+            )
+            loop_manager.make_worktree(repo, worktree, branch, "main")
+            plan_sha = git_command(repo, "rev-parse", "origin/main")
+
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+                (str(repo),),
+            )
+            loop_manager.register_execplans(
+                connection,
+                str(repo),
+                repo,
+                [(plan_path, loop_manager._parse_execplan(repo, repo / plan_path))],
+                plan_sha,
+                loop_manager.planning_input_fingerprint(repo, "main"),
+            )
+            loop_manager.scoped_blocking.ensure_schema(connection)
+
+            before = loop_manager.capture_git_snapshot(worktree)
+            (worktree / "src/app.py").write_text(
+                "VALUE = 2\n",
+                encoding="utf-8",
+            )
+            source_note = repo / "source-note.txt"
+            source_note.write_text("preserve me\n", encoding="utf-8")
+            after = loop_manager.capture_git_snapshot(worktree)
+            self.assertNotEqual(
+                before.worktrees[str(repo.resolve())],
+                after.worktrees[str(repo.resolve())],
+            )
+
+            session_id = "preserved-worker-session"
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE exec_plans
+                    SET status = 'IMPLEMENTING', active_sha = ?, branch = ?,
+                        worktree = ?, workspace_owned = 1,
+                        worker_session_id = ?, agent_role = 'worker',
+                        agent_snapshot = ?, agent_result_snapshot = ?
+                    WHERE repo = ? AND plan_id = 'G-001'
+                    """,
+                    (
+                        plan_sha,
+                        branch,
+                        str(worktree),
+                        session_id,
+                        before.serialize(),
+                        after.serialize(),
+                        str(repo),
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE projects
+                    SET active_sha = ?, plan_sha = ?, phase = 'WORKING',
+                        branch = ?, worktree = ?, plan_path = ?,
+                        worker_session_id = ?, agent_role = 'worker',
+                        agent_snapshot = ?, agent_result_snapshot = ?
+                    WHERE repo = ?
+                    """,
+                    (
+                        plan_sha,
+                        plan_sha,
+                        branch,
+                        str(worktree),
+                        plan_path,
+                        session_id,
+                        before.serialize(),
+                        after.serialize(),
+                        str(repo),
+                    ),
+                )
+                loop_manager.scoped_blocking.record_project_block(
+                    connection,
+                    str(repo),
+                    loop_manager.BlockReasonCode.DEFAULT_WORKTREE_MUTATION,
+                    "worker Git 범위 위반: primary checkout changed",
+                    "blocked-fingerprint",
+                    plan_id="G-001",
+                    previous_phase="WORKING",
+                )
+
+            self.assertTrue(
+                loop_manager.resume_project_block_if_safe(
+                    connection,
+                    repo,
+                    state_dir,
+                    str(repo),
+                )
+            )
+
+            project = connection.execute(
+                "SELECT phase, worker_session_id, last_error FROM projects "
+                "WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            plan = connection.execute(
+                "SELECT status, worker_session_id FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-001'",
+                (str(repo),),
+            ).fetchone()
+            self.assertIsNone(
+                loop_manager.scoped_blocking.project_block(connection, str(repo))
+            )
+            self.assertEqual(tuple(project), ("WORKING", session_id, None))
+            self.assertEqual(tuple(plan), ("IMPLEMENTING", session_id))
+            self.assertEqual(source_note.read_text(encoding="utf-8"), "preserve me\n")
 
     def test_active_execplan_fixed_metadata_must_match_published_plan(self):
         replacements = (
