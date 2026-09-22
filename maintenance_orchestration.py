@@ -324,7 +324,7 @@ def cycle_plan_status_error(
         if row is None:
             return f"활성 유지보수 주기의 {label} 계획이 catalog에 없습니다: {plan_id}"
         status = str(row["status"])
-        if status not in {"READY", "MERGED"}:
+        if status not in {"READY", "MERGED", "PR_OPEN", "PLAN_BLOCKED"}:
             return f"활성 유지보수 주기의 {label} 계획 상태가 유효하지 않습니다: {plan_id} ({status})"
     return None
 

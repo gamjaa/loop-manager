@@ -13,6 +13,7 @@ BLOCKING_STATUSES = (
     "REVIEWING",
     "PUBLISHING",
     "PR_OPEN",
+    "PLAN_BLOCKED",
     "BLOCKED",
 )
 
@@ -151,7 +152,25 @@ def remove_project(connection: sqlite3.Connection, repo: str) -> None:
             "진행 중인 ExecPlan이 있어 프로젝트를 제거할 수 없습니다: "
             f"{blocking['plan_id']} ({blocking['status']})"
         )
-    if legacy_phase in BLOCKING_STATUSES or legacy_phase == "WORKING":
+    has_project_blocks = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'project_blocks'"
+    ).fetchone()
+    project_block = (
+        connection.execute(
+            "SELECT reason_code FROM project_blocks WHERE repo = ?", (repo,)
+        ).fetchone()
+        if has_project_blocks
+        else None
+    )
+    if project_block is not None:
+        raise ProjectRegistryError(
+            "PROJECT_BLOCKED 상태가 있어 프로젝트를 제거할 수 없습니다: "
+            f"{project_block['reason_code']}"
+        )
+    if legacy_phase in BLOCKING_STATUSES or legacy_phase in {
+        "WORKING",
+        "PROJECT_BLOCKED",
+    }:
         raise ProjectRegistryError(
             "진행 중인 기존 프로젝트 상태가 있어 제거할 수 없습니다: "
             f"{legacy_phase}"

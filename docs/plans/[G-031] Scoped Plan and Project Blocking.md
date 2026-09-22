@@ -64,11 +64,11 @@ priority: high
 
 ## Progress
 
-- [ ] 구조화된 차단 원인·scope schema와 legacy migration 구현
-- [ ] 모든 차단 call site의 결정적 분류와 plan/project 전이 구현
-- [ ] 다중 PLAN_BLOCKED·PR_OPEN 저장·복구와 독립 READY scheduler 구현
-- [ ] 전체 Open PR 동기화·충돌 복구 및 maintenance·registry·완료·알림 경계 통합
-- [ ] scoped blocking 및 회귀 테스트 추가
+- [x] 구조화된 차단 원인·scope schema와 legacy migration 구현
+- [x] 모든 차단 call site의 결정적 분류와 plan/project 전이 구현
+- [x] 다중 PLAN_BLOCKED·PR_OPEN 저장·복구와 독립 READY scheduler 구현
+- [x] 전체 Open PR 동기화·충돌 복구 및 maintenance·registry·완료·알림 경계 통합
+- [x] scoped blocking 및 회귀 테스트 추가
 
 ## Decision Log
 

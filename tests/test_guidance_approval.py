@@ -183,10 +183,10 @@ class GuidanceRuntimeTest(unittest.TestCase):
                     "proposal recorded",
                 )
 
-            blocked = loop_manager.active_execplan(connection, str(repo))
+            blocked = loop_manager.plan_blocked_execplans(connection, str(repo))[0]
             self.assertEqual(
                 (blocked["status"], blocked["blocked_reason"]),
-                ("BLOCKED", "guidance_approval"),
+                ("PLAN_BLOCKED", "guidance_approval_required"),
             )
             self.assertEqual(blocked["worker_session_id"], "worker-session")
             self.assertIsNone(blocked["blocked_fingerprint"])
@@ -217,7 +217,8 @@ class GuidanceRuntimeTest(unittest.TestCase):
                     )
                 )
             self.assertEqual(
-                loop_manager.active_execplan(connection, str(repo))["status"], "BLOCKED"
+                loop_manager.plan_blocked_execplans(connection, str(repo))[0]["status"],
+                "PLAN_BLOCKED",
             )
 
             approved = guidance_plan(decision="approve", revision="decision-1")
@@ -429,10 +430,10 @@ Patch:
                     ("worker-rule", "reject", 1),
                 ],
             )
-            blocked = loop_manager.active_execplan(connection, str(repo))
+            blocked = loop_manager.plan_blocked_execplans(connection, str(repo))[0]
             self.assertEqual(
                 (blocked["status"], blocked["worker_session_id"]),
-                ("BLOCKED", "worker-session"),
+                ("PLAN_BLOCKED", "worker-session"),
             )
 
     def test_unappliable_proposal_does_not_enter_blocked_state(self):
@@ -851,10 +852,14 @@ Patch:
                     row = connection.execute("SELECT * FROM guidance_approvals").fetchone()
                     self.assertEqual(row["applied"], 0 if blocked else 1)
                     if blocked:
-                        snapshot = connection.execute(
-                            "SELECT agent_snapshot FROM projects WHERE repo = ?", (str(repo),)
-                        ).fetchone()[0]
+                        blocked_plan = loop_manager.plan_blocked_execplans(
+                            connection, str(repo)
+                        )[0]
+                        snapshot = blocked_plan["agent_result_snapshot"]
                         self.assertTrue(snapshot)
+                        loop_manager.hydrate_execplan_project(
+                            connection, str(repo), blocked_plan
+                        )
                         (repo / "unexpected.py").write_text("unapproved user edit\n")
                         with self.assertRaises(loop_manager.AgentScopeError):
                             loop_manager.validate_blocked_agent_scope(
@@ -870,8 +875,10 @@ Patch:
                         )
                         self.assertTrue(row["invalidated_decision_hash"])
                         self.assertEqual(
-                            loop_manager.active_execplan(connection, str(repo))["status"],
-                            "BLOCKED",
+                            loop_manager.plan_blocked_execplans(
+                                connection, str(repo)
+                            )[0]["status"],
+                            "PLAN_BLOCKED",
                         )
                     if changed_base:
                         self.assertEqual(row["baseline_content"], b"# Agents\r\nRemote rule\r\n")
