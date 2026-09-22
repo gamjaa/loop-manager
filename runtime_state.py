@@ -361,6 +361,19 @@ FaultHook = Callable[[str], None]
 def _transaction(connection: sqlite3.Connection) -> Iterator[None]:
     """Nest safely inside caller transactions without an intermediate commit."""
 
+    if not connection.in_transaction:
+        # Reserve the writer before reading state. Two project workers using
+        # deferred read transactions cannot both upgrade to a write lock;
+        # SQLite rejects one immediately even with a busy timeout configured.
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        return
+
     savepoint = f"runtime_state_{uuid4().hex}"
     connection.execute(f"SAVEPOINT {savepoint}")
     try:

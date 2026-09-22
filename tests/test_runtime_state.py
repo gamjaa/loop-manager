@@ -10,6 +10,35 @@ import runtime_state
 
 
 class RuntimeStateRepositoryTest(unittest.TestCase):
+    def test_transaction_reserves_writer_before_read_and_preserves_nesting(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute("CREATE TABLE state (value INTEGER)")
+        statements = []
+        connection.set_trace_callback(statements.append)
+        with runtime_state._transaction(connection):
+            connection.execute("SELECT * FROM state").fetchall()
+            connection.execute("INSERT INTO state VALUES (1)")
+        self.assertEqual(statements[0], "BEGIN IMMEDIATE")
+        self.assertFalse(connection.in_transaction)
+        with self.assertRaises(KeyboardInterrupt):
+            with runtime_state._transaction(connection):
+                connection.execute("INSERT INTO state VALUES (2)")
+                raise KeyboardInterrupt()
+        self.assertFalse(connection.in_transaction)
+        connection.execute("BEGIN")
+        connection.execute("INSERT INTO state VALUES (3)")
+        with self.assertRaises(ValueError):
+            with runtime_state._transaction(connection):
+                connection.execute("INSERT INTO state VALUES (4)")
+                raise ValueError("rollback nested write")
+        with runtime_state._transaction(connection):
+            connection.execute("INSERT INTO state VALUES (5)")
+        self.assertTrue(connection.in_transaction)
+        self.assertEqual(connection.execute("SELECT value FROM state").fetchall(), [(1,), (3,), (5,)])
+        connection.rollback()
+        self.assertEqual(connection.execute("SELECT value FROM state").fetchall(), [(1,)])
+
     def _connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row

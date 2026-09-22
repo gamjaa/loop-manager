@@ -483,6 +483,114 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
                 self.assertIn("symlink", verdict.detail)
                 self.assertEqual(before, loop_manager.capture_git_snapshot(self.worktree))
 
+    def prepare_guidance_block(self):
+        from tests.test_guidance_approval import guidance_plan
+
+        repo = str(self.repo.resolve())
+        plan_path = "docs/plans/[G-034] Checkpoint.md"
+        (self.worktree / "AGENTS.md").write_text("# Agents\n")
+        self.run_git(self.worktree, "add", "AGENTS.md")
+        self.run_git(self.worktree, "commit", "-m", "guidance baseline")
+        plan = self.connection.execute("SELECT * FROM exec_plans").fetchone()
+        loop_manager.hydrate_execplan_project(self.connection, repo, plan)
+        loop_manager.update_project(self.connection, repo, worker_session_id="guidance-session")
+        before = loop_manager.begin_agent_scope(self.connection, repo, self.worktree, "worker")
+        text = guidance_plan().replace("G-020", "G-034").replace("title: Guidance", "title: Checkpoint")
+        (self.worktree / plan_path).write_text(text)
+        (self.worktree / "code.py").write_text("safe implementation\n")
+        loop_manager.validate_agent_scope(
+            "worker", self.worktree, before, loop_manager.capture_git_snapshot(self.worktree),
+            selected_plan_path=plan_path,
+        )
+        document = loop_manager._guidance_document(self.worktree, plan_path)
+        with mock.patch("loop_manager.is_loop_manager_repository", return_value=False):
+            loop_manager._block_for_new_guidance(
+                self.connection, self.repo, repo, self.worktree, plan,
+                document, document.proposals, "proposal recorded",
+            )
+        return repo, plan_path, text
+
+    def test_validated_guidance_dispatches_checkpoint_then_resumes_session(self):
+        repo, plan_path, text = self.prepare_guidance_block()
+        with mock.patch("loop_manager.pr_for_branch", return_value=None):
+            self.assertEqual(loop_manager.dispatch_blocked_checkpoints(
+                self.connection, self.repo, self.state_dir, repo
+            ), 1)
+        checkpoint = self.connection.execute("SELECT * FROM blocked_checkpoints").fetchone()
+        self.assertEqual(checkpoint["phase"], "published", checkpoint["unpublished_reason"])
+        head = self.run_git(self.worktree, "rev-parse", "HEAD")
+        self.assertEqual(checkpoint["remote_oid"], head)
+        plan = self.connection.execute("SELECT * FROM exec_plans").fetchone()
+        self.assertEqual(plan["status"], "PLAN_BLOCKED")
+        self.assertEqual(plan["worker_session_id"], "guidance-session")
+        self.assertEqual(loop_manager.GitSnapshot.deserialize(plan["agent_snapshot"]).head, head)
+        self.assertIsNone(self.connection.execute("SELECT * FROM project_blocks").fetchone())
+        (self.worktree / plan_path).write_text(
+            text.replace("Decision: `pending`", "Decision: `reject`").replace("Revision: ``", "Revision: `user-1`")
+        )
+        with mock.patch("loop_manager.is_loop_manager_repository", return_value=False):
+            self.assertTrue(loop_manager.resume_guidance_approval_if_decided(
+                self.connection, self.repo, repo, "main", self.state_dir
+            ))
+        resumed = self.connection.execute("SELECT * FROM exec_plans").fetchone()
+        self.assertEqual(resumed["status"], "IMPLEMENTING")
+        self.assertEqual(resumed["worker_session_id"], "guidance-session")
+        self.assertEqual(resumed["worktree"], str(self.worktree))
+
+    def test_invalidated_guidance_is_not_published(self):
+        repo, _, _ = self.prepare_guidance_block()
+        self.connection.execute("UPDATE guidance_approvals SET invalidated_decision_hash = 'invalid'")
+        self.connection.commit()
+        with mock.patch("loop_manager.pr_for_branch") as query:
+            loop_manager.dispatch_blocked_checkpoints(self.connection, self.repo, self.state_dir, repo)
+        query.assert_not_called()
+        row = self.connection.execute("SELECT phase FROM blocked_checkpoints").fetchone()
+        self.assertEqual(row["phase"], "unpublished")
+
+    def test_guidance_commit_interruption_resumes_without_duplicate_commit(self):
+        repo, _, _ = self.prepare_guidance_block()
+        with mock.patch("loop_manager.pr_for_branch", return_value=None), mock.patch.object(
+            loop_manager._BlockedCheckpointAdapter,
+            "_record_guidance_checkpoint_scope", side_effect=KeyboardInterrupt,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                loop_manager.dispatch_blocked_checkpoints(self.connection, self.repo, self.state_dir, repo)
+        committed = self.run_git(self.worktree, "rev-parse", "HEAD")
+        self.assertEqual(self.connection.execute("SELECT phase FROM blocked_checkpoints").fetchone()[0], "prepared")
+        with mock.patch("loop_manager.pr_for_branch", return_value=None):
+            loop_manager.dispatch_blocked_checkpoints(self.connection, self.repo, self.state_dir, repo)
+        checkpoint = self.connection.execute("SELECT * FROM blocked_checkpoints").fetchone()
+        self.assertEqual(checkpoint["phase"], "published", checkpoint["unpublished_reason"])
+        self.assertEqual(checkpoint["remote_oid"], committed)
+        self.assertEqual(self.run_git(self.worktree, "rev-parse", "HEAD"), committed)
+        plan = self.connection.execute("SELECT * FROM exec_plans").fetchone()
+        self.assertEqual(loop_manager.GitSnapshot.deserialize(plan["agent_snapshot"]).head, committed)
+
+    def test_closed_pr_without_agent_snapshot_stays_plan_blocked_and_reopens(self):
+        repo = str(self.repo.resolve())
+        plan = self.connection.execute("SELECT * FROM exec_plans").fetchone()
+        loop_manager.hydrate_execplan_project(self.connection, repo, plan)
+        loop_manager.clear_agent_scope(self.connection, repo)
+        runtime_state.RuntimeStateRepository(self.connection).open_pull_request(
+            repo, pr_url="https://github.com/example/project/pull/1", pr_head_oid=self.base_oid
+        )
+        plan = self.connection.execute("SELECT * FROM exec_plans").fetchone()
+        self.assertIsNone(plan["agent_snapshot"])
+        self.assertIsNone(plan["agent_result_snapshot"])
+        loop_manager._block_closed_pull_request(self.connection, repo, plan, plan["pr_url"], self.base_oid)
+        with mock.patch("loop_manager.pr_for_branch") as query:
+            loop_manager.dispatch_blocked_checkpoints(self.connection, self.repo, self.state_dir, repo)
+        query.assert_not_called()
+        self.assertIsNone(self.connection.execute("SELECT * FROM project_blocks").fetchone())
+        blocked = self.connection.execute("SELECT * FROM exec_plans").fetchone()
+        self.assertEqual(blocked["status"], "PLAN_BLOCKED")
+        self.assertEqual(blocked["blocked_reason"], "pull_request_closed")
+        self.assertEqual(self.run_git(self.worktree, "rev-parse", "HEAD"), self.base_oid)
+        loop_manager._resume_reopened_pull_request(
+            self.connection, repo, blocked, blocked["pr_url"], self.base_oid, recovery=False
+        )
+        self.assertEqual(self.connection.execute("SELECT status FROM exec_plans").fetchone()[0], "PR_OPEN")
+
     def test_validation_block_preserves_snapshot_before_later_config_mutation(self):
         repo = str(self.repo.resolve())
         loop_manager.hydrate_execplan_project(

@@ -583,7 +583,7 @@ class AutomationFirstCatalogTest(unittest.TestCase):
             results[str(runnable_repo)],
             loop_manager.ProjectRunKind.OPERATIONAL_ERROR,
         )
-        self.assertEqual(roles, ["worker"])
+        self.assertEqual(roles, ["worker"], outcomes)
         self.assertEqual(tuple(blocked_project), (None, preserved_fingerprint))
         self.assertEqual(
             [tuple(row) for row in blocked_catalog],
