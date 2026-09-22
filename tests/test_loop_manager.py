@@ -6112,6 +6112,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "maintenance_planning.py",
                 "maintenance_state.py",
                 "notifications.py",
+                "planning_runtime.py",
                 "project_registry.py",
                 "runtime_state.py",
                 "scoped_blocking.py",

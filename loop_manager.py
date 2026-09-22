@@ -25,7 +25,7 @@ import subprocess
 import sys
 import tempfile
 import threading
-from typing import Protocol
+from typing import Generator, Protocol
 from urllib.parse import quote
 
 from guidance_approval import (
@@ -41,6 +41,14 @@ from guidance_approval import (
 )
 from managed_config import ManagedConfig, ManagedConfigError, load_managed_config
 import notifications
+from planning_runtime import (
+    PlanningContext,
+    PlanningLifecycleCoordinator,
+    PlanningOutcome,
+    PlanningOutcomeKind,
+    PlanningPhase,
+    PlanningPhaseResult,
+)
 import project_registry
 import runtime_state
 from maintenance_planning import (
@@ -12804,6 +12812,1290 @@ blocking issue가 없으면 마지막 줄을 `VERDICT: PASS`로 끝내라. 파�
 """.strip()
 
 
+def _planning_lifecycle_driver(
+    connection: sqlite3.Connection,
+    runtime_repository: runtime_state.RuntimeStateRepository,
+    maintenance_repository: maintenance_state.MaintenanceRepository,
+    context: PlanningContext,
+    row: runtime_state.PlanningSnapshot,
+    planner_mutex: threading.Lock | None,
+) -> Generator[PlanningPhase, None, PlanningOutcome]:
+    """Compatibility adapter for the extracted typed planning coordinator."""
+
+    repo = context.repo
+    repo_path = context.repo_path
+    state_dir = context.state_dir
+    base = context.base_branch
+    base_sha = context.base_sha
+    provider = context.provider
+    config_path = context.config_path
+    registered_only = context.registered_only
+    refactoring_review_interval = context.refactoring_review_interval
+    ready_activated_before_planning = False
+    general_fingerprint: str | None = None
+    fingerprint_skipped = False
+    published_refactoring = False
+    maintenance_cycle = maintenance_repository.get(repo)
+    maintenance_planning = bool(
+        row["phase"] == "PLANNING"
+        and maintenance_cycle.phase in {
+            maintenance_state.MaintenancePhase.ASSESSMENT,
+            maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+        }
+    )
+    if (
+        maintenance_planning
+        and maintenance_cycle.publication_stage == "prepared"
+        and row["phase"] == "PLANNING"
+    ):
+        prepared_worktree = Path(str(row["worktree"] or ""))
+        stored_fingerprint = str(row["planning_attempt_fingerprint"] or "")
+        try:
+            validate_planning_worktree_ownership(
+                connection,
+                repo_path,
+                state_dir,
+                repo,
+                stored_fingerprint,
+                prepared_worktree,
+            )
+            git(repo_path, "fetch", "origin")
+            prepared_remote_sha = git(
+                repo_path,
+                "rev-parse",
+                "--verify",
+                f"refs/remotes/origin/{base}^{{commit}}",
+            ).stdout.strip()
+            base_sha = prepared_remote_sha
+            recovered_cycle = None
+            if prepared_remote_sha != maintenance_cycle.publication_base_sha:
+                recovered_cycle = recover_maintenance_planning_batch(
+                    connection,
+                    repo,
+                    prepared_worktree,
+                    base,
+                )
+        except (MaintenancePlanningError, RuntimeError) as error:
+            recovery_error = str(error)
+            update_project(
+                connection,
+                repo,
+                planning_error=recovery_error,
+                planning_error_fingerprint=stored_fingerprint,
+                last_error=recovery_error,
+            )
+            operation_print(recovery_error, file=sys.stderr)
+            return PlanningOutcome(PlanningOutcomeKind.OPERATIONAL_ERROR, error=True)
+        if recovered_cycle is not None:
+            if prepared_worktree.exists():
+                git(
+                    repo_path,
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(prepared_worktree),
+                )
+            operation_print(
+                "게시된 유지보수 batch를 fingerprint 정리 전에 복구했습니다."
+                if recovered_cycle.publication_stage == "remote_confirmed"
+                else "원격 변경에 맞춰 미게시 유지보수 batch를 다시 시작합니다."
+            )
+            return PlanningOutcome(PlanningOutcomeKind.PUBLICATION_RECOVERY)
+    yield PlanningPhase.RECOVERY
+    if not row["phase"]:
+        try:
+            maintenance_cycle = _advance_maintenance_cycle_after_merges(
+                connection, repo, base_sha
+            )
+        except MaintenancePlanningError as error:
+            cycle_error = str(error)
+            error_fingerprint = (
+                f"maintenance-cycle:{maintenance_cycle.phase.value}:"
+                f"{maintenance_cycle.revision}"
+            )
+            update_project(
+                connection,
+                repo,
+                planning_error=cycle_error,
+                planning_error_fingerprint=error_fingerprint,
+                last_error=cycle_error,
+            )
+            operation_print(cycle_error, file=sys.stderr)
+            return PlanningOutcome(PlanningOutcomeKind.OPERATIONAL_ERROR, error=True)
+        if row["planning_error"] and not row["worktree"]:
+            update_project(
+                connection,
+                repo,
+                planning_error=None,
+                planning_error_fingerprint=None,
+                last_error=None,
+            )
+            row = runtime_repository.planning(repo)
+        catalog_decision = catalog_schedule_decision(connection, repo)
+        if (
+            registered_only
+            and maintenance_cycle.phase is maintenance_state.MaintenancePhase.IDLE
+            and not catalog_decision.has_waiting
+        ):
+            due = maintenance_repository.due(repo, refactoring_review_interval)
+            if due.required:
+                include_general = False
+                if not catalog_decision.has_ready:
+                    general_fingerprint = _planning_input_fingerprint(
+                        repo_path, base_sha
+                    )
+                    include_general = _general_planning_required(
+                        row, repo_path, base_sha, general_fingerprint
+                    )
+                maintenance_cycle, _started = (
+                    maintenance_repository.begin_assessment_if_due(
+                        repo,
+                        refactoring_review_interval,
+                        base_sha,
+                        include_general_planning=include_general,
+                    )
+                )
+        if (
+            catalog_decision.has_waiting
+            and maintenance_cycle.phase in {
+                maintenance_state.MaintenancePhase.ASSESSMENT,
+                maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+            }
+        ):
+            operation_print(
+                "PLAN_BLOCKED 또는 PR_OPEN 종료 전 유지보수 평가를 보류합니다."
+            )
+            return PlanningOutcome(PlanningOutcomeKind.WAITING)
+        if maintenance_cycle.phase in {
+            maintenance_state.MaintenancePhase.ASSESSMENT,
+            maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+        }:
+            maintenance_planning = True
+        elif maintenance_cycle.phase in {
+            maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
+            maintenance_state.MaintenancePhase.REFACTORING,
+        }:
+            catalog_decision = catalog_schedule_decision(connection, repo)
+            if catalog_decision.runnable_ready is None:
+                operation_print(
+                    "활성 유지보수 주기의 dependency 충족을 기다립니다."
+                )
+                return PlanningOutcome(PlanningOutcomeKind.WAITING)
+            git(repo_path, "fetch", "origin")
+            base_sha = git(
+                repo_path,
+                "rev-parse",
+                "--verify",
+                f"refs/remotes/origin/{base}^{{commit}}",
+            ).stdout.strip()
+            activate_ready_execplan(connection, repo, state_dir, base_sha)
+            row = runtime_repository.planning(repo)
+            ready_activated_before_planning = True
+        else:
+            catalog_decision = catalog_schedule_decision(connection, repo)
+            if catalog_decision.has_ready:
+                if catalog_decision.runnable_ready is None:
+                    operation_print(
+                        "READY ExecPlan이 남아 있지만 dependency가 충족되지 않아 대기합니다."
+                    )
+                    return PlanningOutcome(PlanningOutcomeKind.WAITING)
+                git(repo_path, "fetch", "origin")
+                base_sha = git(
+                    repo_path,
+                    "rev-parse",
+                    "--verify",
+                    f"refs/remotes/origin/{base}^{{commit}}",
+                ).stdout.strip()
+                activate_ready_execplan(connection, repo, state_dir, base_sha)
+                row = runtime_repository.planning(repo)
+                ready_activated_before_planning = True
+            elif catalog_decision.has_waiting:
+                operation_print(
+                    "독립 READY가 없어 PLAN_BLOCKED 또는 PR_OPEN 종료를 기다립니다."
+                )
+                return PlanningOutcome(PlanningOutcomeKind.WAITING)
+
+    yield PlanningPhase.SELECTION
+    if (
+        maintenance_planning
+        and maintenance_cycle.cycle_base_sha != base_sha
+        and maintenance_cycle.publication_stage is None
+        and row["phase"] == "PLANNING"
+    ):
+        stale_worktree = Path(str(row["worktree"] or ""))
+        stored_fingerprint = str(row["planning_attempt_fingerprint"] or "")
+        validate_planning_worktree_ownership(
+            connection, repo_path, state_dir, repo, stored_fingerprint, stale_worktree
+        )
+        preserve_planning_diagnostics(state_dir, repo, row)
+        with connection:
+            maintenance_cycle = maintenance_repository.restart_stale_planning_context(
+                repo, expected=maintenance_cycle, new_base_sha=base_sha
+            )
+            _clear_active_in_current_transaction(connection, repo)
+        if stale_worktree.exists():
+            git(repo_path, "worktree", "remove", "--force", str(stale_worktree))
+        row = runtime_repository.planning(repo)
+
+    fingerprint_required = bool(
+        maintenance_planning
+        or not row["phase"]
+        or row["phase"] == "PLANNING"
+    )
+    if fingerprint_required and general_fingerprint is None:
+        general_fingerprint = _planning_input_fingerprint(repo_path, base_sha)
+    current_fingerprint = (
+        maintenance_planning_fingerprint(
+            maintenance_cycle, general_fingerprint or ""
+        )
+        if maintenance_planning
+        else general_fingerprint
+        if fingerprint_required
+        else None
+    )
+    recoverable_maintenance_publication = bool(
+        maintenance_planning
+        and row["phase"] == "PLANNING"
+        and maintenance_cycle.publication_stage == "prepared"
+    )
+
+    # A fixed planning error must remain reportable even when the user base
+    # worktree later becomes unsafe. The fingerprint reads the selected SHA,
+    # so this check neither reads nor alters local changes.
+    if (
+        row
+        and row["planning_error"]
+        and row["planning_error_fingerprint"] == current_fingerprint
+        and not recoverable_maintenance_publication
+    ):
+        operation_print(
+            f"계획 오류가 해결되지 않았습니다: {row['planning_error']}\n"
+            f"보존된 planning worktree: {row['worktree']}",
+            file=sys.stderr,
+        )
+        return PlanningOutcome(PlanningOutcomeKind.OPERATIONAL_ERROR, error=True)
+
+    if row["planning_error"] and not recoverable_maintenance_publication:
+        stale_worktree = Path(row["worktree"]) if row["worktree"] else None
+        stored_fingerprint = str(
+            row["planning_attempt_fingerprint"]
+            or row["planning_error_fingerprint"]
+            or ""
+        )
+        try:
+            if stale_worktree is None:
+                raise WorkspaceOwnershipError(
+                    "planning worktree 경로가 저장되지 않았습니다."
+                )
+            validate_planning_worktree_ownership(
+                connection,
+                repo_path,
+                state_dir,
+                repo,
+                stored_fingerprint,
+                stale_worktree,
+            )
+        except (RuntimeError, WorkspaceOwnershipError) as error:
+            cleanup_error = (
+                f"planning workspace cleanup 소유권 검증 실패: {error}"
+            )
+            update_project(
+                connection,
+                repo,
+                planning_error=cleanup_error,
+                planning_error_fingerprint=current_fingerprint,
+                last_error=cleanup_error,
+            )
+            operation_print(cleanup_error, file=sys.stderr)
+            return PlanningOutcome(PlanningOutcomeKind.OPERATIONAL_ERROR, error=True)
+        preserve_planning_diagnostics(state_dir, repo, row)
+        if stale_worktree.exists():
+            git(repo_path, "worktree", "remove", "--force", str(stale_worktree))
+        clear_active(connection, repo)
+        row = runtime_repository.planning(repo)
+
+    if row["phase"] == "PLANNING":
+        started_fingerprint = row["planning_attempt_fingerprint"]
+        if not started_fingerprint:
+            started_fingerprint = current_fingerprint
+        if started_fingerprint != current_fingerprint:
+            stale_worktree = Path(row["worktree"]) if row["worktree"] else None
+            try:
+                if stale_worktree is None:
+                    raise WorkspaceOwnershipError(
+                        "planning worktree 경로가 저장되지 않았습니다."
+                    )
+                validate_planning_worktree_ownership(
+                    connection,
+                    repo_path,
+                    state_dir,
+                    repo,
+                    str(started_fingerprint),
+                    stale_worktree,
+                )
+            except (RuntimeError, WorkspaceOwnershipError) as error:
+                cleanup_error = (
+                    f"planning workspace cleanup 소유권 검증 실패: {error}"
+                )
+                update_project(
+                    connection,
+                    repo,
+                    planning_error=cleanup_error,
+                    planning_error_fingerprint=current_fingerprint,
+                    last_error=cleanup_error,
+                )
+                operation_print(cleanup_error, file=sys.stderr)
+                return PlanningOutcome(PlanningOutcomeKind.OPERATIONAL_ERROR, error=True)
+            if row["planning_validation_error"]:
+                preserve_planning_diagnostics(state_dir, repo, row)
+            if stale_worktree.exists():
+                git(repo_path, "worktree", "remove", "--force", str(stale_worktree))
+            clear_active(connection, repo)
+            row = runtime_repository.planning(repo)
+
+    planning_required = not row["phase"]
+
+    if (
+        not maintenance_planning
+        and not row["phase"]
+        and row["planning_fingerprint"] == current_fingerprint
+    ):
+        update_project(connection, repo, processed_sha=base_sha)
+        operation_print("계획 입력이 바뀌지 않아 Agent를 실행하지 않습니다.")
+        planning_required = False
+        fingerprint_skipped = True
+
+    if (
+        planning_required
+        and not maintenance_planning
+        and row["planning_fingerprint"]
+        and row["processed_sha"]
+    ):
+        processed_fingerprint = _planning_input_fingerprint(repo_path, row["processed_sha"])
+        if processed_fingerprint == current_fingerprint:
+            update_project(connection, repo, processed_sha=base_sha)
+            operation_print("계획 입력이 바뀌지 않아 Agent를 실행하지 않습니다.")
+            planning_required = False
+            fingerprint_skipped = True
+        elif _is_requirement_archive_only_change(repo_path, row["processed_sha"], base_sha):
+            update_project(connection, repo, processed_sha=base_sha)
+            operation_print("Requirement archive 이동 외의 계획 입력이 바뀌지 않아 Agent를 실행하지 않습니다.")
+            planning_required = False
+            fingerprint_skipped = True
+
+    if planning_required:
+        assert current_fingerprint is not None
+        project_id = hashlib.sha256(repo.encode()).hexdigest()[:16]
+        worktree = state_dir / "worktrees" / project_id / "planning" / current_fingerprint
+        update_project(
+            connection,
+            repo,
+            active_sha=base_sha,
+            plan_sha=None,
+            planning_attempt_fingerprint=current_fingerprint,
+            planning_workspace_owned=0,
+            planning_retry_count=0,
+            planner_session_id=None,
+            worker_session_id=None,
+            worker_result=None,
+            verify_result=None,
+            planning_validation_error=None,
+            planning_result_pending_validation=0,
+            planning_result_completed=0,
+            planning_result=None,
+            planning_error=None,
+            planning_error_fingerprint=None,
+            phase="PLANNING",
+            branch=None,
+            worktree=str(worktree),
+            plan_path=None,
+            pr_url=None,
+            last_error=None,
+        )
+        row = runtime_repository.planning(repo)
+
+    yield PlanningPhase.INPUTS
+    project_id = hashlib.sha256(repo.encode()).hexdigest()[:16]
+    if row["phase"] == "PLANNING":
+        planning_worktree = Path(row["worktree"])
+        try:
+            validate_planning_workspace_identity(
+                state_dir,
+                repo,
+                str(row["planning_attempt_fingerprint"]),
+                planning_worktree,
+            )
+            planning_started = bool(
+                row["planner_session_id"]
+                or row["agent_snapshot"]
+                or row["planning_result_pending_validation"]
+                or row["planning_result_completed"]
+                or row["planning_validation_error"]
+                or row["planning_retry_count"]
+                or row["last_error"]
+            )
+            planning_workspace_owned = (
+                row["planning_workspace_owned"] == WORKSPACE_OWNED
+            )
+            planning_workspace_reserved = (
+                row["planning_workspace_owned"] == WORKSPACE_RESERVED
+            )
+            make_planning_worktree(
+                repo_path,
+                planning_worktree,
+                base,
+                allow_create=(
+                    not planning_started
+                    and (
+                        not planning_workspace_owned
+                        or planning_workspace_reserved
+                    )
+                ),
+                allow_existing=(
+                    planning_workspace_owned or planning_workspace_reserved
+                ),
+                ownership_reserved=planning_workspace_reserved,
+                expected_head=str(row["active_sha"] or ""),
+                before_create=lambda: update_project(
+                    connection,
+                    repo,
+                    planning_workspace_owned=WORKSPACE_RESERVED,
+                ),
+            )
+            update_project(
+                connection,
+                repo,
+                planning_workspace_owned=WORKSPACE_OWNED,
+            )
+        except WorkspaceOwnershipError as error:
+            validation_error = f"planning workspace 소유권 검증 실패: {error}"
+            update_project(
+                connection,
+                repo,
+                planning_error=validation_error,
+                planning_error_fingerprint=current_fingerprint,
+                last_error=validation_error,
+            )
+            operation_print(validation_error, file=sys.stderr)
+            return PlanningOutcome(PlanningOutcomeKind.OPERATIONAL_ERROR, error=True)
+        maintenance_context: MaintenancePlanningContext | None = None
+        maintenance_change_context = ""
+        if maintenance_planning:
+            try:
+                maintenance_cycle = maintenance_repository.get(repo)
+                if maintenance_cycle.publication_stage == "prepared":
+                    maintenance_context = _maintenance_context_at_revision(
+                        connection,
+                        repo,
+                        planning_worktree,
+                        str(row["active_sha"]),
+                        maintenance_cycle,
+                    )
+                else:
+                    maintenance_context = prepare_maintenance_planning_context(
+                        connection,
+                        repo,
+                        planning_worktree,
+                        str(row["active_sha"]),
+                    )
+                    maintenance_change_context = _maintenance_change_context_text(
+                        repo_path, base, maintenance_cycle
+                    )
+            except (MaintenancePlanningError, MaintenanceOrchestrationError) as error:
+                context_error = str(error)
+                update_project(
+                    connection,
+                    repo,
+                    planning_error=context_error,
+                    planning_error_fingerprint=current_fingerprint,
+                    last_error=context_error,
+                )
+                operation_print(context_error, file=sys.stderr)
+                return PlanningOutcome(PlanningOutcomeKind.OPERATIONAL_ERROR, error=True)
+
+        yield PlanningPhase.WORKSPACE
+        head = git(planning_worktree, "rev-parse", "HEAD").stdout.strip()
+        dirty_files = changed_files(planning_worktree)
+        if row["planning_validation_error"] and head != row["active_sha"]:
+            # The Planner is not allowed to commit. Turn an invalid Planner
+            # commit back into a worktree change so the persisted validation
+            # error can be repaired in the same session on the next run.
+            git(planning_worktree, "reset", "--mixed", str(row["active_sha"]))
+            head = git(planning_worktree, "rev-parse", "HEAD").stdout.strip()
+            dirty_files = changed_files(planning_worktree)
+        planner_result_in_flight = bool(
+            row["planning_result_pending_validation"]
+            and not row["planning_result_completed"]
+        )
+        planner_scope_error: PlannerValidationError | None = None
+        if planner_result_in_flight or (
+            head == row["active_sha"]
+            and (
+                not dirty_files
+                or row["planning_validation_error"]
+                or row["last_error"]
+            )
+            and not row["planning_result_pending_validation"]
+            and not (
+                row["planning_validation_error"]
+                and row["planning_retry_count"] >= MAX_PLANNER_VALIDATION_RETRIES
+            )
+        ):
+            operation_log("Planner 시작: 다음 ExecPlan 계획을 생성합니다.")
+            # A Planner can modify the worktree before its CLI invocation
+            # returns. Persist this boundary first so an interrupted process
+            # resumes that same session before validating its partial output.
+            # A completed result is the only pending result that may be
+            # validated after an interruption.
+            if not planner_result_in_flight:
+                update_project(
+                    connection,
+                    repo,
+                    last_error=None,
+                    planning_result_pending_validation=1,
+                    planning_result_completed=0,
+                    planning_result=None,
+                )
+                row = runtime_repository.planning(repo)
+            planner_scope_role = (
+                "maintenance_planner" if maintenance_planning else "planner"
+            )
+            if maintenance_planning:
+                assert maintenance_context is not None
+                prompt = maintenance_planner_prompt(
+                    maintenance_context,
+                    compact_execplan_catalog(connection, repo),
+                    maintenance_change_context,
+                    row["planning_validation_error"] or row["last_error"],
+                    include_general_planning=maintenance_cycle.include_general_planning,
+                )
+            else:
+                prompt = planner_prompt(
+                    row["planning_validation_error"] or row["last_error"],
+                    compact_execplan_catalog(connection, repo),
+                )
+            planner_scope_before = begin_agent_scope(
+                connection, repo, planning_worktree, planner_scope_role
+            )
+            planner_guard = planner_mutex or contextlib.nullcontext()
+            with planner_guard:
+                result = run_agent_with_retries(
+                    lambda current_session_id, _session_recovery: run_agent(
+                        provider,
+                        planning_worktree,
+                        state_dir,
+                        config_path,
+                        "planner",
+                        prompt,
+                        read_only=False,
+                        persist_session=True,
+                        session_id=current_session_id,
+                        on_session_started=lambda started_session_id: update_project(
+                            connection,
+                            repo,
+                            planner_session_id=started_session_id,
+                        ),
+                    ),
+                    session_id=row["planner_session_id"],
+                )
+            code, message = result
+            result_session_id = getattr(result, "session_id", None)
+            if result_session_id:
+                update_project(
+                    connection,
+                    repo,
+                    planner_session_id=result_session_id,
+                )
+            planner_scope_after: GitSnapshot | None = None
+            try:
+                planner_scope_after = capture_git_snapshot(planning_worktree)
+                validate_agent_scope(
+                    planner_scope_role,
+                    planning_worktree,
+                    planner_scope_before,
+                    planner_scope_after,
+                    external_worktree=repo_path,
+                    base_branch=base,
+                )
+                validate_managed_worktree(repo_path, planning_worktree, None)
+            except (AgentScopeError, WorkspaceOwnershipError, RuntimeError) as error:
+                planner_scope_error = PlannerValidationError(str(error))
+                if planner_scope_after is not None:
+                    update_project(
+                        connection,
+                        repo,
+                        agent_result_snapshot=planner_scope_after.serialize(),
+                    )
+            else:
+                clear_agent_scope(connection, repo)
+
+            if code:
+                agent_error = message or f"Planner 종료 코드 {code}"
+                if result.result_kind is AgentResultKind.TRANSIENT_FAILURE:
+                    agent_error = f"{TRANSIENT_AGENT_ERROR_PREFIX} {agent_error}"
+                    step_result = PROJECT_STEP_TRANSIENT_PAUSE
+                elif result.result_kind is AgentResultKind.USAGE_LIMIT:
+                    agent_error = f"{USAGE_LIMIT_ERROR_PREFIX} {agent_error}"
+                    step_result = PROJECT_STEP_USAGE_PAUSE
+                else:
+                    step_result = 1
+                update_project(
+                    connection,
+                    repo,
+                    last_error=agent_error,
+                    planning_result_pending_validation=0,
+                    planning_result_completed=0,
+                    planning_result=None,
+                )
+                operation_print(agent_error, file=sys.stderr)
+                outcome_kind = {
+                    PROJECT_STEP_TRANSIENT_PAUSE: PlanningOutcomeKind.TRANSIENT_PAUSE,
+                    PROJECT_STEP_USAGE_PAUSE: PlanningOutcomeKind.USAGE_LIMIT_PAUSE,
+                }.get(step_result, PlanningOutcomeKind.OPERATIONAL_ERROR)
+                return PlanningOutcome(outcome_kind, error=True)
+            update_project(
+                connection,
+                repo,
+                last_error=None,
+                planning_result_completed=1,
+                planning_result=message,
+            )
+            row = runtime_repository.planning(repo)
+            dirty_files = changed_files(planning_worktree)
+
+        if planner_scope_error is None:
+            scope_row = runtime_repository.planning(repo)
+            if scope_row["agent_snapshot"]:
+                persisted_after: GitSnapshot | None = None
+                try:
+                    expected_scope_role = (
+                        "maintenance_planner" if maintenance_planning else "planner"
+                    )
+                    if scope_row["agent_role"] != expected_scope_role:
+                        raise AgentScopeError(
+                            "저장된 Agent 역할이 Planner와 다릅니다."
+                        )
+                    persisted_before = GitSnapshot.deserialize(
+                        str(scope_row["agent_snapshot"])
+                    )
+                    persisted_after = capture_git_snapshot(planning_worktree)
+                    validate_agent_scope(
+                        expected_scope_role,
+                        planning_worktree,
+                        persisted_before,
+                        persisted_after,
+                        external_worktree=repo_path,
+                        base_branch=base,
+                    )
+                    validate_managed_worktree(repo_path, planning_worktree, None)
+                except (
+                    AgentScopeError,
+                    WorkspaceOwnershipError,
+                    RuntimeError,
+                ) as error:
+                    planner_scope_error = PlannerValidationError(str(error))
+                    if persisted_after is not None:
+                        update_project(
+                            connection,
+                            repo,
+                            agent_result_snapshot=persisted_after.serialize(),
+                        )
+                else:
+                    clear_agent_scope(connection, repo)
+        yield PlanningPhase.AGENT
+        maintenance_decision: MaintenancePlannerDecision | None = None
+        try:
+            if planner_scope_error is not None:
+                raise planner_scope_error
+            if maintenance_planning:
+                assert maintenance_context is not None
+                try:
+                    maintenance_decision = parse_maintenance_planner_decision(
+                        str(row["planning_result"] or ""),
+                        maintenance_cycle.phase,
+                    )
+                except MaintenanceOrchestrationError as error:
+                    raise PlannerValidationError(str(error)) from error
+                changed = sorted(
+                    set(dirty_files)
+                    | set(changed_files(planning_worktree, str(row["active_sha"])))
+                )
+                if maintenance_decision.outcome is MaintenanceOutcome.PREREQUISITES:
+                    if maintenance_cycle.include_general_planning:
+                        raise PlannerValidationError(
+                            "combined planning에는 prerequisite 결과를 사용할 수 없습니다."
+                        )
+                    if changed:
+                        raise PlannerValidationError(
+                            "prerequisites 결과는 planning 파일을 변경할 수 없습니다."
+                        )
+                    rows = connection.execute(
+                        "SELECT * FROM exec_plans WHERE repo = ?", (repo,)
+                    ).fetchall()
+                    try:
+                        validate_prerequisite_plan_ids(
+                            rows, maintenance_decision.plan_ids
+                        )
+                    except MaintenanceOrchestrationError as error:
+                        raise PlannerValidationError(str(error)) from error
+                    validated_result = None
+                elif maintenance_decision.outcome is MaintenanceOutcome.UNSAFE:
+                    if changed:
+                        raise PlannerValidationError(
+                            "unsafe revalidation 결과는 계획 파일을 변경할 수 없습니다."
+                        )
+                    validated_result = None
+                else:
+                    refactoring_ids = (
+                        maintenance_decision.plan_ids
+                        if maintenance_decision.outcome is MaintenanceOutcome.REFACTORING
+                        else ()
+                    )
+                    validated_result = validate_maintenance_planner_result(
+                        connection,
+                        maintenance_context,
+                        planning_worktree,
+                        dirty_files,
+                        refactoring_plan_ids=refactoring_ids,
+                        allow_general_plans=maintenance_cycle.include_general_planning,
+                    )
+                    if (
+                        maintenance_decision.outcome is MaintenanceOutcome.REFACTORING
+                        and validated_result is None
+                    ):
+                        raise PlannerValidationError(
+                            "refactoring 결과에는 검증 가능한 planning batch가 필요합니다."
+                        )
+            else:
+                validated_result = validate_planner_result(
+                    planning_worktree, str(row["active_sha"]), dirty_files
+                )
+        except PlannerValidationError as error:
+            validation_error = str(error)
+            retry_count = row["planning_retry_count"]
+            if row["planning_result_pending_validation"] and row["planning_validation_error"]:
+                retry_count += 1
+            values = {
+                "planning_validation_error": validation_error,
+                "planning_result_pending_validation": 0,
+                "planning_result_completed": 0,
+                "last_error": None,
+                "planning_retry_count": retry_count,
+            }
+            if retry_count >= MAX_PLANNER_VALIDATION_RETRIES:
+                values.update(
+                    planning_error=validation_error,
+                    planning_error_fingerprint=current_fingerprint,
+                )
+            update_project(connection, repo, **values)
+            operation_print(str(error), file=sys.stderr)
+            return PlanningOutcome(PlanningOutcomeKind.VALIDATION_RETRY, error=True)
+
+        if (
+            maintenance_decision is not None
+            and maintenance_decision.outcome is MaintenanceOutcome.PREREQUISITES
+        ):
+            validate_planning_worktree_ownership(
+                connection,
+                repo_path,
+                state_dir,
+                repo,
+                current_fingerprint,
+                planning_worktree,
+            )
+            with connection:
+                maintenance_repository.transition(
+                    repo,
+                    expected_phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+                    expected_revision=maintenance_cycle.revision,
+                    next_phase=maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
+                    prerequisite_plan_ids=maintenance_decision.plan_ids,
+                    include_general_planning=False,
+                )
+                _clear_active_in_current_transaction(connection, repo)
+            git(repo_path, "worktree", "remove", str(planning_worktree))
+            return PlanningOutcome(PlanningOutcomeKind.PREREQUISITE_WAIT)
+
+        if (
+            maintenance_decision is not None
+            and maintenance_decision.outcome is MaintenanceOutcome.UNSAFE
+        ):
+            planning_error = (
+                "post-refactor revalidation이 제품 목표 보존을 확정하지 못했습니다: "
+                + str(maintenance_decision.reason)
+            )
+            update_project(
+                connection,
+                repo,
+                planning_error=planning_error,
+                planning_error_fingerprint=current_fingerprint,
+                last_error=planning_error,
+            )
+            operation_print(planning_error, file=sys.stderr)
+            return PlanningOutcome(PlanningOutcomeKind.UNSAFE_REVALIDATION, error=True)
+
+        published_refactoring = bool(
+            maintenance_decision is not None
+            and maintenance_decision.outcome is MaintenanceOutcome.REFACTORING
+        )
+        yield PlanningPhase.VALIDATION
+        if validated_result is None:
+            completed_fingerprint = _planning_input_fingerprint(
+                repo_path, str(row["active_sha"])
+            )
+            validate_planning_worktree_ownership(
+                connection,
+                repo_path,
+                state_dir,
+                repo,
+                current_fingerprint,
+                planning_worktree,
+            )
+            if maintenance_planning:
+                assert maintenance_context is not None
+                try:
+                    git(repo_path, "fetch", "origin")
+                    validate_maintenance_publication_base(
+                        connection,
+                        repo,
+                        repo_path,
+                        base,
+                        maintenance_context,
+                    )
+                except MaintenancePlanningRestart:
+                    git(
+                        repo_path,
+                        "worktree",
+                        "remove",
+                        "--force",
+                        str(planning_worktree),
+                    )
+                    operation_print(
+                        "유지보수 평가 중 base가 변경되어 최신 기준으로 다시 평가합니다.",
+                        file=sys.stderr,
+                    )
+                    return PlanningOutcome(
+                        PlanningOutcomeKind.REMOTE_BASE_RESTART,
+                        error=True,
+                    )
+                except (MaintenancePlanningError, RuntimeError) as error:
+                    baseline_error = str(error)
+                    update_project(
+                        connection,
+                        repo,
+                        planning_error=baseline_error,
+                        planning_error_fingerprint=current_fingerprint,
+                        last_error=baseline_error,
+                    )
+                    operation_print(baseline_error, file=sys.stderr)
+                    return PlanningOutcome(PlanningOutcomeKind.OPERATIONAL_ERROR, error=True)
+                with connection:
+                    maintenance_repository.advance_success_baseline(
+                        repo,
+                        expected_phase=maintenance_cycle.phase,
+                        expected_revision=maintenance_cycle.revision,
+                        remote_commit=str(row["active_sha"]),
+                    )
+                    _clear_active_in_current_transaction(
+                        connection,
+                        repo,
+                        processed_sha=(
+                            str(row["active_sha"])
+                            if maintenance_cycle.include_general_planning
+                            else None
+                        ),
+                        planning_fingerprint=(
+                            completed_fingerprint
+                            if maintenance_cycle.include_general_planning
+                            else None
+                        ),
+                    )
+            else:
+                clear_active(
+                    connection,
+                    repo,
+                    processed_sha=row["active_sha"],
+                    planning_fingerprint=completed_fingerprint,
+                )
+            git(repo_path, "worktree", "remove", str(planning_worktree))
+            operation_print(
+                "유지보수 평가와 재검증을 완료했습니다."
+                if maintenance_planning
+                else "추가로 계획할 작업이 없습니다."
+            )
+            row = runtime_repository.planning(repo)
+        else:
+            plans = list(validated_result.plans)
+            if dirty_files:
+                # Publishing failures are operational failures, not Planner
+                # validation failures. Leave the validated result for retry.
+                git(
+                    planning_worktree,
+                    "add",
+                    "--",
+                    *validated_result.publication_paths,
+                )
+                if maintenance_planning:
+                    message = "Update periodic maintenance planning batch"
+                elif not plans:
+                    message = "Update future ideas from planning"
+                else:
+                    first = plans[0][1]
+                    last = plans[-1][1]
+                    if len(plans) == 1:
+                        message = f"Add ExecPlan {first['id']}: {first['title']}"
+                    else:
+                        message = f"Add ExecPlans {first['id']}-{last['id']}"
+                git(planning_worktree, "commit", "-m", message)
+
+            if not maintenance_planning:
+                clear_planning_validation_state(connection, repo)
+            plan_commit = git(planning_worktree, "rev-parse", "HEAD").stdout.strip()
+            if maintenance_planning:
+                assert validated_result is not None
+                assert maintenance_context is not None
+                try:
+                    validate_planning_worktree_ownership(
+                        connection,
+                        repo_path,
+                        state_dir,
+                        repo,
+                        current_fingerprint,
+                        planning_worktree,
+                    )
+                    if maintenance_cycle.publication_stage is None:
+                        validate_maintenance_publication_base(
+                            connection,
+                            repo,
+                            repo_path,
+                            base,
+                            maintenance_context,
+                        )
+                        maintenance_cycle = record_maintenance_publication_intent(
+                            connection,
+                            repo,
+                            planning_worktree,
+                            base,
+                            validated_result,
+                            plan_commit,
+                        )
+                    elif maintenance_cycle.publication_stage != "prepared":
+                        raise MaintenancePlanningError(
+                            "복구할 수 없는 maintenance publication 단계입니다."
+                        )
+                except MaintenancePlanningRestart:
+                    git(
+                        repo_path,
+                        "worktree",
+                        "remove",
+                        "--force",
+                        str(planning_worktree),
+                    )
+                    operation_print(
+                        "유지보수 계획 중 base가 변경되어 최신 기준으로 다시 평가합니다.",
+                        file=sys.stderr,
+                    )
+                    return PlanningOutcome(PlanningOutcomeKind.REMOTE_BASE_RESTART, error=True)
+                except (MaintenancePlanningError, RuntimeError) as error:
+                    publication_error = str(error)
+                    update_project(
+                        connection,
+                        repo,
+                        planning_error=publication_error,
+                        planning_error_fingerprint=current_fingerprint,
+                        last_error=publication_error,
+                    )
+                    operation_print(publication_error, file=sys.stderr)
+                    return PlanningOutcome(PlanningOutcomeKind.OPERATIONAL_ERROR, error=True)
+            git(repo_path, "fetch", "origin")
+            latest_sha = git(repo_path, "rev-parse", f"origin/{base}").stdout.strip()
+            if maintenance_planning and latest_sha not in {
+                row["active_sha"],
+                plan_commit,
+            }:
+                try:
+                    recovered_cycle = recover_maintenance_planning_batch(
+                        connection, repo, planning_worktree, base
+                    )
+                except (MaintenancePlanningError, RuntimeError) as error:
+                    recovery_error = str(error)
+                    update_project(
+                        connection,
+                        repo,
+                        planning_error=recovery_error,
+                        planning_error_fingerprint=current_fingerprint,
+                        last_error=recovery_error,
+                    )
+                    operation_print(recovery_error, file=sys.stderr)
+                    return PlanningOutcome(PlanningOutcomeKind.OPERATIONAL_ERROR, error=True)
+                git(
+                    repo_path,
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(planning_worktree),
+                )
+                if recovered_cycle.phase in {
+                    maintenance_state.MaintenancePhase.ASSESSMENT,
+                    maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+                }:
+                    operation_print(
+                        "미게시 유지보수 batch를 폐기하고 최신 기준으로 다시 평가합니다."
+                    )
+                else:
+                    operation_print("게시된 유지보수 batch를 복구했습니다.")
+                return PlanningOutcome(PlanningOutcomeKind.PUBLICATION_RECOVERY)
+            if latest_sha not in {row["active_sha"], plan_commit}:
+                published = git(
+                    planning_worktree,
+                    "merge-base",
+                    "--is-ancestor",
+                    plan_commit,
+                    f"origin/{base}",
+                    check=False,
+                ).returncode == 0
+                if not published:
+                    validate_planning_worktree_ownership(
+                        connection,
+                        repo_path,
+                        state_dir,
+                        repo,
+                        current_fingerprint,
+                        planning_worktree,
+                    )
+                    git(repo_path, "worktree", "remove", str(planning_worktree))
+                    clear_active(connection, repo)
+                    operation_print(
+                        "계획 중 base가 변경되어 최신 기준으로 다시 계획합니다.",
+                        file=sys.stderr,
+                    )
+                    return PlanningOutcome(
+                        PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED,
+                        error=True,
+                    )
+            if latest_sha != plan_commit and latest_sha == row["active_sha"]:
+                pushed = git(
+                    planning_worktree,
+                    "push",
+                    "origin",
+                    f"HEAD:refs/heads/{base}",
+                    check=False,
+                )
+                if pushed.returncode:
+                    update_project(
+                        connection,
+                        repo,
+                        last_error=f"ExecPlan push 실패:\n{pushed.stdout[-8000:]}",
+                    )
+                    operation_print(pushed.stdout, file=sys.stderr)
+                    return PlanningOutcome(PlanningOutcomeKind.OPERATIONAL_ERROR, error=True)
+                git(repo_path, "fetch", "origin")
+                latest_sha = git(repo_path, "rev-parse", f"origin/{base}").stdout.strip()
+                if latest_sha != plan_commit:
+                    update_project(
+                        connection,
+                        repo,
+                        last_error="ExecPlan push 결과를 origin/base에서 확인할 수 없습니다.",
+                    )
+                    operation_print("ExecPlan push 결과 확인에 실패했습니다.", file=sys.stderr)
+                    return PlanningOutcome(PlanningOutcomeKind.OPERATIONAL_ERROR, error=True)
+
+            if maintenance_planning:
+                try:
+                    publish_maintenance_planning_batch(
+                        connection,
+                        repo,
+                        planning_worktree,
+                        base,
+                        validated_result,
+                        plan_commit,
+                    )
+                except (MaintenancePlanningError, RuntimeError) as error:
+                    publication_error = str(error)
+                    update_project(
+                        connection,
+                        repo,
+                        planning_error=publication_error,
+                        planning_error_fingerprint=current_fingerprint,
+                        last_error=publication_error,
+                    )
+                    operation_print(publication_error, file=sys.stderr)
+                    return PlanningOutcome(PlanningOutcomeKind.OPERATIONAL_ERROR, error=True)
+            else:
+                validate_planning_worktree_ownership(
+                    connection,
+                    repo_path,
+                    state_dir,
+                    repo,
+                    current_fingerprint,
+                    planning_worktree,
+                )
+                register_execplans(
+                    connection,
+                    repo,
+                    planning_worktree,
+                    plans,
+                    plan_commit,
+                    current_fingerprint,
+                )
+            git(repo_path, "worktree", "remove", str(planning_worktree))
+            base_sha = latest_sha
+            row = runtime_repository.planning(repo)
+
+    yield PlanningPhase.PUBLICATION
+    newly_activated = ready_activated_before_planning
+    if not row["phase"]:
+        git(repo_path, "fetch", "origin")
+        latest_selection_sha = git(
+            repo_path,
+            "rev-parse",
+            "--verify",
+            f"refs/remotes/origin/{base}^{{commit}}",
+        ).stdout.strip()
+        catalog_decision = catalog_schedule_decision(connection, repo)
+        if not catalog_decision.has_ready and catalog_decision.has_waiting:
+            operation_print(
+                "독립 READY가 없어 PLAN_BLOCKED 또는 PR_OPEN 종료를 기다립니다."
+            )
+            return PlanningOutcome(PlanningOutcomeKind.WAITING)
+        if not catalog_decision.has_ready:
+            latest_selection_fingerprint = _planning_input_fingerprint(
+                repo_path, latest_selection_sha
+            )
+            expected_selection_fingerprint = (
+                general_fingerprint if maintenance_planning else current_fingerprint
+            )
+            assert expected_selection_fingerprint is not None
+            if latest_selection_fingerprint != expected_selection_fingerprint:
+                operation_print(
+                    "계획 중 입력이 변경되어 최신 기준으로 다시 계획합니다.",
+                    file=sys.stderr,
+                )
+                return PlanningOutcome(
+                    PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED,
+                    error=True,
+                )
+        elif catalog_decision.runnable_ready is None:
+            operation_print(
+                "READY ExecPlan이 남아 있지만 dependency가 충족되지 않아 대기합니다."
+            )
+            return PlanningOutcome(PlanningOutcomeKind.WAITING)
+        base_sha = latest_selection_sha
+        selected = activate_ready_execplan(connection, repo, state_dir, base_sha)
+        if selected is None:
+            operation_print("실행 가능한 READY ExecPlan이 없습니다.")
+            return PlanningOutcome(
+                PlanningOutcomeKind.FINGERPRINT_SKIPPED
+                if fingerprint_skipped
+                else PlanningOutcomeKind.NO_CHANGE
+            )
+        row = runtime_repository.planning(repo)
+        newly_activated = True
+    return PlanningOutcome(
+        PlanningOutcomeKind.REFACTORING
+        if published_refactoring
+        else PlanningOutcomeKind.EXECUTION_READY,
+        base_sha=base_sha,
+        newly_activated=newly_activated,
+    )
+
+
+class _PlanningLifecyclePorts:
+    """Bind the coordinator ports to existing Git, Agent and validation adapters."""
+
+    _ORDER = {phase: index for index, phase in enumerate(PlanningPhase)}
+
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        runtime_repository: runtime_state.RuntimeStateRepository,
+        maintenance_repository: maintenance_state.MaintenanceRepository,
+        context: PlanningContext,
+        row: runtime_state.PlanningSnapshot,
+        planner_mutex: threading.Lock | None,
+    ):
+        self._driver = _planning_lifecycle_driver(
+            connection,
+            runtime_repository,
+            maintenance_repository,
+            context,
+            row,
+            planner_mutex,
+        )
+        self._pending_phase: PlanningPhase | None = None
+
+    def _advance(self, expected: PlanningPhase) -> PlanningPhaseResult:
+        yielded = self._pending_phase
+        if yielded is None:
+            try:
+                yielded = next(self._driver)
+            except StopIteration as stopped:
+                outcome = stopped.value
+                if not isinstance(outcome, PlanningOutcome):
+                    raise RuntimeError("planning lifecycle returned no typed outcome")
+                return PlanningPhaseResult.finish(expected, outcome)
+        if self._ORDER[yielded] < self._ORDER[expected]:
+            raise RuntimeError(
+                f"planning lifecycle repeated phase {yielded.value}"
+            )
+        if yielded is expected:
+            self._pending_phase = None
+        else:
+            self._pending_phase = yielded
+        return PlanningPhaseResult.advance(expected)
+
+    def recover_publication(self, _context: PlanningContext) -> PlanningPhaseResult:
+        return self._advance(PlanningPhase.RECOVERY)
+
+    def select_planning_work(self, _context: PlanningContext) -> PlanningPhaseResult:
+        return self._advance(PlanningPhase.SELECTION)
+
+    def reconcile_inputs(self, _context: PlanningContext) -> PlanningPhaseResult:
+        return self._advance(PlanningPhase.INPUTS)
+
+    def prepare_workspace(self, _context: PlanningContext) -> PlanningPhaseResult:
+        return self._advance(PlanningPhase.WORKSPACE)
+
+    def run_planner_turn(self, _context: PlanningContext) -> PlanningPhaseResult:
+        return self._advance(PlanningPhase.AGENT)
+
+    def validate_planner_result(self, _context: PlanningContext) -> PlanningPhaseResult:
+        return self._advance(PlanningPhase.VALIDATION)
+
+    def publish_planner_result(self, _context: PlanningContext) -> PlanningPhaseResult:
+        return self._advance(PlanningPhase.PUBLICATION)
+
+    def activate_next_execplan(self, _context: PlanningContext) -> PlanningPhaseResult:
+        return self._advance(PlanningPhase.ACTIVATION)
+
+
+def _planning_outcome_step_result(outcome: PlanningOutcome) -> int | None:
+    """Translate a typed coordinator result at the process adapter boundary."""
+
+    if outcome.kind in {
+        PlanningOutcomeKind.EXECUTION_READY,
+        PlanningOutcomeKind.REFACTORING,
+    }:
+        return None
+    if outcome.kind in {
+        PlanningOutcomeKind.FINGERPRINT_SKIPPED,
+        PlanningOutcomeKind.NO_CHANGE,
+        PlanningOutcomeKind.WAITING,
+    }:
+        return 0
+    if outcome.kind in {
+        PlanningOutcomeKind.PREREQUISITE_WAIT,
+        PlanningOutcomeKind.REMOTE_BASE_RESTART,
+        PlanningOutcomeKind.PUBLICATION_RECOVERY,
+    }:
+        return PROJECT_STEP_RETRY
+    if outcome.kind is PlanningOutcomeKind.TRANSIENT_PAUSE:
+        return PROJECT_STEP_TRANSIENT_PAUSE
+    if outcome.kind is PlanningOutcomeKind.USAGE_LIMIT_PAUSE:
+        return PROJECT_STEP_USAGE_PAUSE
+    return 1
+
+
 def _run_project_step(
     connection: sqlite3.Connection,
     state_dir: Path,
@@ -13132,8 +14424,6 @@ def _run_project_step(
                 operation_print(publication_error, file=sys.stderr)
                 return 1
 
-    ready_activated_before_planning = False
-    general_fingerprint: str | None = None
     if not row:
         connection.execute(
             "INSERT INTO projects (repo, base_branch, provider, origin) "
@@ -13156,1151 +14446,40 @@ def _run_project_step(
             "SELECT * FROM projects WHERE repo = ?", (repo,)
         ).fetchone()
 
+    assert row is not None
+    runtime_repository = runtime_state.RuntimeStateRepository(connection)
+    planning_row = runtime_repository.planning(repo)
     maintenance_repository = maintenance_state.MaintenanceRepository(connection)
-    maintenance_cycle = maintenance_repository.get(repo)
-    maintenance_planning = bool(
-        row["phase"] == "PLANNING"
-        and maintenance_cycle.phase in {
-            maintenance_state.MaintenancePhase.ASSESSMENT,
-            maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
-        }
+    planning_context = PlanningContext(
+        repo=repo,
+        repo_path=repo_path,
+        state_dir=state_dir,
+        base_branch=base,
+        base_sha=base_sha,
+        provider=provider,
+        config_path=config_path,
+        registered_only=registered_only,
+        refactoring_review_interval=refactoring_review_interval,
     )
-    if (
-        maintenance_planning
-        and maintenance_cycle.publication_stage == "prepared"
-        and row["phase"] == "PLANNING"
-    ):
-        prepared_worktree = Path(str(row["worktree"] or ""))
-        stored_fingerprint = str(row["planning_attempt_fingerprint"] or "")
-        try:
-            validate_planning_worktree_ownership(
-                connection,
-                repo_path,
-                state_dir,
-                repo,
-                stored_fingerprint,
-                prepared_worktree,
-            )
-            git(repo_path, "fetch", "origin")
-            prepared_remote_sha = git(
-                repo_path,
-                "rev-parse",
-                "--verify",
-                f"refs/remotes/origin/{base}^{{commit}}",
-            ).stdout.strip()
-            base_sha = prepared_remote_sha
-            recovered_cycle = None
-            if prepared_remote_sha != maintenance_cycle.publication_base_sha:
-                recovered_cycle = recover_maintenance_planning_batch(
-                    connection,
-                    repo,
-                    prepared_worktree,
-                    base,
-                )
-        except (MaintenancePlanningError, RuntimeError) as error:
-            recovery_error = str(error)
-            update_project(
-                connection,
-                repo,
-                planning_error=recovery_error,
-                planning_error_fingerprint=stored_fingerprint,
-                last_error=recovery_error,
-            )
-            operation_print(recovery_error, file=sys.stderr)
-            return 1
-        if recovered_cycle is not None:
-            if prepared_worktree.exists():
-                git(
-                    repo_path,
-                    "worktree",
-                    "remove",
-                    "--force",
-                    str(prepared_worktree),
-                )
-            operation_print(
-                "게시된 유지보수 batch를 fingerprint 정리 전에 복구했습니다."
-                if recovered_cycle.publication_stage == "remote_confirmed"
-                else "원격 변경에 맞춰 미게시 유지보수 batch를 다시 시작합니다."
-            )
-            return PROJECT_STEP_RETRY
-    if not row["phase"]:
-        try:
-            maintenance_cycle = _advance_maintenance_cycle_after_merges(
-                connection, repo, base_sha
-            )
-        except MaintenancePlanningError as error:
-            cycle_error = str(error)
-            error_fingerprint = (
-                f"maintenance-cycle:{maintenance_cycle.phase.value}:"
-                f"{maintenance_cycle.revision}"
-            )
-            update_project(
-                connection,
-                repo,
-                planning_error=cycle_error,
-                planning_error_fingerprint=error_fingerprint,
-                last_error=cycle_error,
-            )
-            operation_print(cycle_error, file=sys.stderr)
-            return 1
-        if row["planning_error"] and not row["worktree"]:
-            update_project(
-                connection,
-                repo,
-                planning_error=None,
-                planning_error_fingerprint=None,
-                last_error=None,
-            )
-            row = connection.execute(
-                "SELECT * FROM projects WHERE repo = ?", (repo,)
-            ).fetchone()
-        catalog_decision = catalog_schedule_decision(connection, repo)
-        if (
-            registered_only
-            and maintenance_cycle.phase is maintenance_state.MaintenancePhase.IDLE
-            and not catalog_decision.has_waiting
-        ):
-            due = maintenance_repository.due(repo, refactoring_review_interval)
-            if due.required:
-                include_general = False
-                if not catalog_decision.has_ready:
-                    general_fingerprint = _planning_input_fingerprint(
-                        repo_path, base_sha
-                    )
-                    include_general = _general_planning_required(
-                        row, repo_path, base_sha, general_fingerprint
-                    )
-                maintenance_cycle, _started = (
-                    maintenance_repository.begin_assessment_if_due(
-                        repo,
-                        refactoring_review_interval,
-                        base_sha,
-                        include_general_planning=include_general,
-                    )
-                )
-        if (
-            catalog_decision.has_waiting
-            and maintenance_cycle.phase in {
-                maintenance_state.MaintenancePhase.ASSESSMENT,
-                maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
-            }
-        ):
-            operation_print(
-                "PLAN_BLOCKED 또는 PR_OPEN 종료 전 유지보수 평가를 보류합니다."
-            )
-            return 0
-        if maintenance_cycle.phase in {
-            maintenance_state.MaintenancePhase.ASSESSMENT,
-            maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
-        }:
-            maintenance_planning = True
-        elif maintenance_cycle.phase in {
-            maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
-            maintenance_state.MaintenancePhase.REFACTORING,
-        }:
-            catalog_decision = catalog_schedule_decision(connection, repo)
-            if catalog_decision.runnable_ready is None:
-                operation_print(
-                    "활성 유지보수 주기의 dependency 충족을 기다립니다."
-                )
-                return 0
-            git(repo_path, "fetch", "origin")
-            base_sha = git(
-                repo_path,
-                "rev-parse",
-                "--verify",
-                f"refs/remotes/origin/{base}^{{commit}}",
-            ).stdout.strip()
-            activate_ready_execplan(connection, repo, state_dir, base_sha)
-            row = connection.execute(
-                "SELECT * FROM projects WHERE repo = ?", (repo,)
-            ).fetchone()
-            ready_activated_before_planning = True
-        else:
-            catalog_decision = catalog_schedule_decision(connection, repo)
-            if catalog_decision.has_ready:
-                if catalog_decision.runnable_ready is None:
-                    operation_print(
-                        "READY ExecPlan이 남아 있지만 dependency가 충족되지 않아 대기합니다."
-                    )
-                    return 0
-                git(repo_path, "fetch", "origin")
-                base_sha = git(
-                    repo_path,
-                    "rev-parse",
-                    "--verify",
-                    f"refs/remotes/origin/{base}^{{commit}}",
-                ).stdout.strip()
-                activate_ready_execplan(connection, repo, state_dir, base_sha)
-                row = connection.execute(
-                    "SELECT * FROM projects WHERE repo = ?", (repo,)
-                ).fetchone()
-                ready_activated_before_planning = True
-            elif catalog_decision.has_waiting:
-                operation_print(
-                    "독립 READY가 없어 PLAN_BLOCKED 또는 PR_OPEN 종료를 기다립니다."
-                )
-                return 0
-
-    if (
-        maintenance_planning
-        and maintenance_cycle.cycle_base_sha != base_sha
-        and maintenance_cycle.publication_stage is None
-        and row["phase"] == "PLANNING"
-    ):
-        stale_worktree = Path(str(row["worktree"] or ""))
-        stored_fingerprint = str(row["planning_attempt_fingerprint"] or "")
-        validate_planning_worktree_ownership(
-            connection, repo_path, state_dir, repo, stored_fingerprint, stale_worktree
-        )
-        preserve_planning_diagnostics(state_dir, repo, row)
-        with connection:
-            maintenance_cycle = maintenance_repository.restart_stale_planning_context(
-                repo, expected=maintenance_cycle, new_base_sha=base_sha
-            )
-            _clear_active_in_current_transaction(connection, repo)
-        if stale_worktree.exists():
-            git(repo_path, "worktree", "remove", "--force", str(stale_worktree))
-        row = connection.execute(
-            "SELECT * FROM projects WHERE repo = ?", (repo,)
-        ).fetchone()
-
-    fingerprint_required = bool(
-        maintenance_planning
-        or not row["phase"]
-        or row["phase"] == "PLANNING"
-    )
-    if fingerprint_required and general_fingerprint is None:
-        general_fingerprint = _planning_input_fingerprint(repo_path, base_sha)
-    current_fingerprint = (
-        maintenance_planning_fingerprint(
-            maintenance_cycle, general_fingerprint or ""
-        )
-        if maintenance_planning
-        else general_fingerprint
-        if fingerprint_required
-        else None
-    )
-    recoverable_maintenance_publication = bool(
-        maintenance_planning
-        and row["phase"] == "PLANNING"
-        and maintenance_cycle.publication_stage == "prepared"
-    )
-
-    # A fixed planning error must remain reportable even when the user base
-    # worktree later becomes unsafe. The fingerprint reads the selected SHA,
-    # so this check neither reads nor alters local changes.
-    if (
-        row
-        and row["planning_error"]
-        and row["planning_error_fingerprint"] == current_fingerprint
-        and not recoverable_maintenance_publication
-    ):
-        operation_print(
-            f"계획 오류가 해결되지 않았습니다: {row['planning_error']}\n"
-            f"보존된 planning worktree: {row['worktree']}",
-            file=sys.stderr,
-        )
-        return 1
-
-    if row["planning_error"] and not recoverable_maintenance_publication:
-        stale_worktree = Path(row["worktree"]) if row["worktree"] else None
-        stored_fingerprint = str(
-            row["planning_attempt_fingerprint"]
-            or row["planning_error_fingerprint"]
-            or ""
-        )
-        try:
-            if stale_worktree is None:
-                raise WorkspaceOwnershipError(
-                    "planning worktree 경로가 저장되지 않았습니다."
-                )
-            validate_planning_worktree_ownership(
-                connection,
-                repo_path,
-                state_dir,
-                repo,
-                stored_fingerprint,
-                stale_worktree,
-            )
-        except (RuntimeError, WorkspaceOwnershipError) as error:
-            cleanup_error = (
-                f"planning workspace cleanup 소유권 검증 실패: {error}"
-            )
-            update_project(
-                connection,
-                repo,
-                planning_error=cleanup_error,
-                planning_error_fingerprint=current_fingerprint,
-                last_error=cleanup_error,
-            )
-            operation_print(cleanup_error, file=sys.stderr)
-            return 1
-        preserve_planning_diagnostics(state_dir, repo, row)
-        if stale_worktree.exists():
-            git(repo_path, "worktree", "remove", "--force", str(stale_worktree))
-        clear_active(connection, repo)
-        row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
-
-    if row["phase"] == "PLANNING":
-        started_fingerprint = row["planning_attempt_fingerprint"]
-        if not started_fingerprint:
-            started_fingerprint = current_fingerprint
-        if started_fingerprint != current_fingerprint:
-            stale_worktree = Path(row["worktree"]) if row["worktree"] else None
-            try:
-                if stale_worktree is None:
-                    raise WorkspaceOwnershipError(
-                        "planning worktree 경로가 저장되지 않았습니다."
-                    )
-                validate_planning_worktree_ownership(
-                    connection,
-                    repo_path,
-                    state_dir,
-                    repo,
-                    str(started_fingerprint),
-                    stale_worktree,
-                )
-            except (RuntimeError, WorkspaceOwnershipError) as error:
-                cleanup_error = (
-                    f"planning workspace cleanup 소유권 검증 실패: {error}"
-                )
-                update_project(
-                    connection,
-                    repo,
-                    planning_error=cleanup_error,
-                    planning_error_fingerprint=current_fingerprint,
-                    last_error=cleanup_error,
-                )
-                operation_print(cleanup_error, file=sys.stderr)
-                return 1
-            if row["planning_validation_error"]:
-                preserve_planning_diagnostics(state_dir, repo, row)
-            if stale_worktree.exists():
-                git(repo_path, "worktree", "remove", "--force", str(stale_worktree))
-            clear_active(connection, repo)
-            row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
-
-    planning_required = not row["phase"]
-
-    if (
-        not maintenance_planning
-        and not row["phase"]
-        and row["planning_fingerprint"] == current_fingerprint
-    ):
-        update_project(connection, repo, processed_sha=base_sha)
-        operation_print("계획 입력이 바뀌지 않아 Agent를 실행하지 않습니다.")
-        planning_required = False
-
-    if (
-        planning_required
-        and not maintenance_planning
-        and row["planning_fingerprint"]
-        and row["processed_sha"]
-    ):
-        processed_fingerprint = _planning_input_fingerprint(repo_path, row["processed_sha"])
-        if processed_fingerprint == current_fingerprint:
-            update_project(connection, repo, processed_sha=base_sha)
-            operation_print("계획 입력이 바뀌지 않아 Agent를 실행하지 않습니다.")
-            planning_required = False
-        elif _is_requirement_archive_only_change(repo_path, row["processed_sha"], base_sha):
-            update_project(connection, repo, processed_sha=base_sha)
-            operation_print("Requirement archive 이동 외의 계획 입력이 바뀌지 않아 Agent를 실행하지 않습니다.")
-            planning_required = False
-
-    if planning_required:
-        assert current_fingerprint is not None
-        project_id = hashlib.sha256(repo.encode()).hexdigest()[:16]
-        worktree = state_dir / "worktrees" / project_id / "planning" / current_fingerprint
-        update_project(
+    planning_outcome = PlanningLifecycleCoordinator(
+        _PlanningLifecyclePorts(
             connection,
-            repo,
-            active_sha=base_sha,
-            plan_sha=None,
-            planning_attempt_fingerprint=current_fingerprint,
-            planning_workspace_owned=0,
-            planning_retry_count=0,
-            planner_session_id=None,
-            worker_session_id=None,
-            worker_result=None,
-            verify_result=None,
-            planning_validation_error=None,
-            planning_result_pending_validation=0,
-            planning_result_completed=0,
-            planning_result=None,
-            planning_error=None,
-            planning_error_fingerprint=None,
-            phase="PLANNING",
-            branch=None,
-            worktree=str(worktree),
-            plan_path=None,
-            pr_url=None,
-            last_error=None,
+            runtime_repository,
+            maintenance_repository,
+            planning_context,
+            planning_row,
+            planner_mutex,
         )
-        row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
-
-    project_id = hashlib.sha256(repo.encode()).hexdigest()[:16]
-    if row["phase"] == "PLANNING":
-        planning_worktree = Path(row["worktree"])
-        try:
-            validate_planning_workspace_identity(
-                state_dir,
-                repo,
-                str(row["planning_attempt_fingerprint"]),
-                planning_worktree,
-            )
-            planning_started = bool(
-                row["planner_session_id"]
-                or row["agent_snapshot"]
-                or row["planning_result_pending_validation"]
-                or row["planning_result_completed"]
-                or row["planning_validation_error"]
-                or row["planning_retry_count"]
-                or row["last_error"]
-            )
-            planning_workspace_owned = (
-                row["planning_workspace_owned"] == WORKSPACE_OWNED
-            )
-            planning_workspace_reserved = (
-                row["planning_workspace_owned"] == WORKSPACE_RESERVED
-            )
-            make_planning_worktree(
-                repo_path,
-                planning_worktree,
-                base,
-                allow_create=(
-                    not planning_started
-                    and (
-                        not planning_workspace_owned
-                        or planning_workspace_reserved
-                    )
-                ),
-                allow_existing=(
-                    planning_workspace_owned or planning_workspace_reserved
-                ),
-                ownership_reserved=planning_workspace_reserved,
-                expected_head=str(row["active_sha"] or ""),
-                before_create=lambda: update_project(
-                    connection,
-                    repo,
-                    planning_workspace_owned=WORKSPACE_RESERVED,
-                ),
-            )
-            update_project(
-                connection,
-                repo,
-                planning_workspace_owned=WORKSPACE_OWNED,
-            )
-        except WorkspaceOwnershipError as error:
-            validation_error = f"planning workspace 소유권 검증 실패: {error}"
-            update_project(
-                connection,
-                repo,
-                planning_error=validation_error,
-                planning_error_fingerprint=current_fingerprint,
-                last_error=validation_error,
-            )
-            operation_print(validation_error, file=sys.stderr)
-            return 1
-        maintenance_context: MaintenancePlanningContext | None = None
-        maintenance_change_context = ""
-        if maintenance_planning:
-            try:
-                maintenance_cycle = maintenance_repository.get(repo)
-                if maintenance_cycle.publication_stage == "prepared":
-                    maintenance_context = _maintenance_context_at_revision(
-                        connection,
-                        repo,
-                        planning_worktree,
-                        str(row["active_sha"]),
-                        maintenance_cycle,
-                    )
-                else:
-                    maintenance_context = prepare_maintenance_planning_context(
-                        connection,
-                        repo,
-                        planning_worktree,
-                        str(row["active_sha"]),
-                    )
-                    maintenance_change_context = _maintenance_change_context_text(
-                        repo_path, base, maintenance_cycle
-                    )
-            except (MaintenancePlanningError, MaintenanceOrchestrationError) as error:
-                context_error = str(error)
-                update_project(
-                    connection,
-                    repo,
-                    planning_error=context_error,
-                    planning_error_fingerprint=current_fingerprint,
-                    last_error=context_error,
-                )
-                operation_print(context_error, file=sys.stderr)
-                return 1
-
-        head = git(planning_worktree, "rev-parse", "HEAD").stdout.strip()
-        dirty_files = changed_files(planning_worktree)
-        if row["planning_validation_error"] and head != row["active_sha"]:
-            # The Planner is not allowed to commit. Turn an invalid Planner
-            # commit back into a worktree change so the persisted validation
-            # error can be repaired in the same session on the next run.
-            git(planning_worktree, "reset", "--mixed", str(row["active_sha"]))
-            head = git(planning_worktree, "rev-parse", "HEAD").stdout.strip()
-            dirty_files = changed_files(planning_worktree)
-        planner_result_in_flight = bool(
-            row["planning_result_pending_validation"]
-            and not row["planning_result_completed"]
-        )
-        planner_scope_error: PlannerValidationError | None = None
-        if planner_result_in_flight or (
-            head == row["active_sha"]
-            and (
-                not dirty_files
-                or row["planning_validation_error"]
-                or row["last_error"]
-            )
-            and not row["planning_result_pending_validation"]
-            and not (
-                row["planning_validation_error"]
-                and row["planning_retry_count"] >= MAX_PLANNER_VALIDATION_RETRIES
-            )
-        ):
-            operation_log("Planner 시작: 다음 ExecPlan 계획을 생성합니다.")
-            # A Planner can modify the worktree before its CLI invocation
-            # returns. Persist this boundary first so an interrupted process
-            # resumes that same session before validating its partial output.
-            # A completed result is the only pending result that may be
-            # validated after an interruption.
-            if not planner_result_in_flight:
-                update_project(
-                    connection,
-                    repo,
-                    last_error=None,
-                    planning_result_pending_validation=1,
-                    planning_result_completed=0,
-                    planning_result=None,
-                )
-                row = connection.execute(
-                    "SELECT * FROM projects WHERE repo = ?", (repo,)
-                ).fetchone()
-            planner_scope_role = (
-                "maintenance_planner" if maintenance_planning else "planner"
-            )
-            if maintenance_planning:
-                assert maintenance_context is not None
-                prompt = maintenance_planner_prompt(
-                    maintenance_context,
-                    compact_execplan_catalog(connection, repo),
-                    maintenance_change_context,
-                    row["planning_validation_error"] or row["last_error"],
-                    include_general_planning=maintenance_cycle.include_general_planning,
-                )
-            else:
-                prompt = planner_prompt(
-                    row["planning_validation_error"] or row["last_error"],
-                    compact_execplan_catalog(connection, repo),
-                )
-            planner_scope_before = begin_agent_scope(
-                connection, repo, planning_worktree, planner_scope_role
-            )
-            planner_guard = planner_mutex or contextlib.nullcontext()
-            with planner_guard:
-                result = run_agent_with_retries(
-                    lambda current_session_id, _session_recovery: run_agent(
-                        provider,
-                        planning_worktree,
-                        state_dir,
-                        config_path,
-                        "planner",
-                        prompt,
-                        read_only=False,
-                        persist_session=True,
-                        session_id=current_session_id,
-                        on_session_started=lambda started_session_id: update_project(
-                            connection,
-                            repo,
-                            planner_session_id=started_session_id,
-                        ),
-                    ),
-                    session_id=row["planner_session_id"],
-                )
-            code, message = result
-            result_session_id = getattr(result, "session_id", None)
-            if result_session_id:
-                update_project(
-                    connection,
-                    repo,
-                    planner_session_id=result_session_id,
-                )
-            planner_scope_after: GitSnapshot | None = None
-            try:
-                planner_scope_after = capture_git_snapshot(planning_worktree)
-                validate_agent_scope(
-                    planner_scope_role,
-                    planning_worktree,
-                    planner_scope_before,
-                    planner_scope_after,
-                    external_worktree=repo_path,
-                    base_branch=base,
-                )
-                validate_managed_worktree(repo_path, planning_worktree, None)
-            except (AgentScopeError, WorkspaceOwnershipError, RuntimeError) as error:
-                planner_scope_error = PlannerValidationError(str(error))
-                if planner_scope_after is not None:
-                    update_project(
-                        connection,
-                        repo,
-                        agent_result_snapshot=planner_scope_after.serialize(),
-                    )
-            else:
-                clear_agent_scope(connection, repo)
-
-            if code:
-                agent_error = message or f"Planner 종료 코드 {code}"
-                if result.result_kind is AgentResultKind.TRANSIENT_FAILURE:
-                    agent_error = f"{TRANSIENT_AGENT_ERROR_PREFIX} {agent_error}"
-                    step_result = PROJECT_STEP_TRANSIENT_PAUSE
-                elif result.result_kind is AgentResultKind.USAGE_LIMIT:
-                    agent_error = f"{USAGE_LIMIT_ERROR_PREFIX} {agent_error}"
-                    step_result = PROJECT_STEP_USAGE_PAUSE
-                else:
-                    step_result = 1
-                update_project(
-                    connection,
-                    repo,
-                    last_error=agent_error,
-                    planning_result_pending_validation=0,
-                    planning_result_completed=0,
-                    planning_result=None,
-                )
-                operation_print(agent_error, file=sys.stderr)
-                return step_result
-            update_project(
-                connection,
-                repo,
-                last_error=None,
-                planning_result_completed=1,
-                planning_result=message,
-            )
-            row = connection.execute(
-                "SELECT * FROM projects WHERE repo = ?", (repo,)
-            ).fetchone()
-            dirty_files = changed_files(planning_worktree)
-
-        if planner_scope_error is None:
-            scope_row = connection.execute(
-                "SELECT agent_role, agent_snapshot FROM projects WHERE repo = ?",
-                (repo,),
-            ).fetchone()
-            if scope_row["agent_snapshot"]:
-                persisted_after: GitSnapshot | None = None
-                try:
-                    expected_scope_role = (
-                        "maintenance_planner" if maintenance_planning else "planner"
-                    )
-                    if scope_row["agent_role"] != expected_scope_role:
-                        raise AgentScopeError(
-                            "저장된 Agent 역할이 Planner와 다릅니다."
-                        )
-                    persisted_before = GitSnapshot.deserialize(
-                        str(scope_row["agent_snapshot"])
-                    )
-                    persisted_after = capture_git_snapshot(planning_worktree)
-                    validate_agent_scope(
-                        expected_scope_role,
-                        planning_worktree,
-                        persisted_before,
-                        persisted_after,
-                        external_worktree=repo_path,
-                        base_branch=base,
-                    )
-                    validate_managed_worktree(repo_path, planning_worktree, None)
-                except (
-                    AgentScopeError,
-                    WorkspaceOwnershipError,
-                    RuntimeError,
-                ) as error:
-                    planner_scope_error = PlannerValidationError(str(error))
-                    if persisted_after is not None:
-                        update_project(
-                            connection,
-                            repo,
-                            agent_result_snapshot=persisted_after.serialize(),
-                        )
-                else:
-                    clear_agent_scope(connection, repo)
-
-
-        maintenance_decision: MaintenancePlannerDecision | None = None
-        try:
-            if planner_scope_error is not None:
-                raise planner_scope_error
-            if maintenance_planning:
-                assert maintenance_context is not None
-                try:
-                    maintenance_decision = parse_maintenance_planner_decision(
-                        str(row["planning_result"] or ""),
-                        maintenance_cycle.phase,
-                    )
-                except MaintenanceOrchestrationError as error:
-                    raise PlannerValidationError(str(error)) from error
-                changed = sorted(
-                    set(dirty_files)
-                    | set(changed_files(planning_worktree, str(row["active_sha"])))
-                )
-                if maintenance_decision.outcome is MaintenanceOutcome.PREREQUISITES:
-                    if maintenance_cycle.include_general_planning:
-                        raise PlannerValidationError(
-                            "combined planning에는 prerequisite 결과를 사용할 수 없습니다."
-                        )
-                    if changed:
-                        raise PlannerValidationError(
-                            "prerequisites 결과는 planning 파일을 변경할 수 없습니다."
-                        )
-                    rows = connection.execute(
-                        "SELECT * FROM exec_plans WHERE repo = ?", (repo,)
-                    ).fetchall()
-                    try:
-                        validate_prerequisite_plan_ids(
-                            rows, maintenance_decision.plan_ids
-                        )
-                    except MaintenanceOrchestrationError as error:
-                        raise PlannerValidationError(str(error)) from error
-                    validated_result = None
-                elif maintenance_decision.outcome is MaintenanceOutcome.UNSAFE:
-                    if changed:
-                        raise PlannerValidationError(
-                            "unsafe revalidation 결과는 계획 파일을 변경할 수 없습니다."
-                        )
-                    validated_result = None
-                else:
-                    refactoring_ids = (
-                        maintenance_decision.plan_ids
-                        if maintenance_decision.outcome is MaintenanceOutcome.REFACTORING
-                        else ()
-                    )
-                    validated_result = validate_maintenance_planner_result(
-                        connection,
-                        maintenance_context,
-                        planning_worktree,
-                        dirty_files,
-                        refactoring_plan_ids=refactoring_ids,
-                        allow_general_plans=maintenance_cycle.include_general_planning,
-                    )
-                    if (
-                        maintenance_decision.outcome is MaintenanceOutcome.REFACTORING
-                        and validated_result is None
-                    ):
-                        raise PlannerValidationError(
-                            "refactoring 결과에는 검증 가능한 planning batch가 필요합니다."
-                        )
-            else:
-                validated_result = validate_planner_result(
-                    planning_worktree, str(row["active_sha"]), dirty_files
-                )
-        except PlannerValidationError as error:
-            validation_error = str(error)
-            retry_count = row["planning_retry_count"]
-            if row["planning_result_pending_validation"] and row["planning_validation_error"]:
-                retry_count += 1
-            values = {
-                "planning_validation_error": validation_error,
-                "planning_result_pending_validation": 0,
-                "planning_result_completed": 0,
-                "last_error": None,
-                "planning_retry_count": retry_count,
-            }
-            if retry_count >= MAX_PLANNER_VALIDATION_RETRIES:
-                values.update(
-                    planning_error=validation_error,
-                    planning_error_fingerprint=current_fingerprint,
-                )
-            update_project(connection, repo, **values)
-            operation_print(str(error), file=sys.stderr)
-            return 1
-
-        if (
-            maintenance_decision is not None
-            and maintenance_decision.outcome is MaintenanceOutcome.PREREQUISITES
-        ):
-            validate_planning_worktree_ownership(
-                connection,
-                repo_path,
-                state_dir,
-                repo,
-                current_fingerprint,
-                planning_worktree,
-            )
-            with connection:
-                maintenance_repository.transition(
-                    repo,
-                    expected_phase=maintenance_state.MaintenancePhase.ASSESSMENT,
-                    expected_revision=maintenance_cycle.revision,
-                    next_phase=maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
-                    prerequisite_plan_ids=maintenance_decision.plan_ids,
-                    include_general_planning=False,
-                )
-                _clear_active_in_current_transaction(connection, repo)
-            git(repo_path, "worktree", "remove", str(planning_worktree))
-            return PROJECT_STEP_RETRY
-
-        if (
-            maintenance_decision is not None
-            and maintenance_decision.outcome is MaintenanceOutcome.UNSAFE
-        ):
-            planning_error = (
-                "post-refactor revalidation이 제품 목표 보존을 확정하지 못했습니다: "
-                + str(maintenance_decision.reason)
-            )
-            update_project(
-                connection,
-                repo,
-                planning_error=planning_error,
-                planning_error_fingerprint=current_fingerprint,
-                last_error=planning_error,
-            )
-            operation_print(planning_error, file=sys.stderr)
-            return 1
-
-        if validated_result is None:
-            completed_fingerprint = _planning_input_fingerprint(
-                repo_path, str(row["active_sha"])
-            )
-            validate_planning_worktree_ownership(
-                connection,
-                repo_path,
-                state_dir,
-                repo,
-                current_fingerprint,
-                planning_worktree,
-            )
-            if maintenance_planning:
-                assert maintenance_context is not None
-                try:
-                    git(repo_path, "fetch", "origin")
-                    validate_maintenance_publication_base(
-                        connection,
-                        repo,
-                        repo_path,
-                        base,
-                        maintenance_context,
-                    )
-                except MaintenancePlanningRestart:
-                    git(
-                        repo_path,
-                        "worktree",
-                        "remove",
-                        "--force",
-                        str(planning_worktree),
-                    )
-                    operation_print(
-                        "유지보수 평가 중 base가 변경되어 최신 기준으로 다시 평가합니다.",
-                        file=sys.stderr,
-                    )
-                    return PROJECT_STEP_RETRY
-                except (MaintenancePlanningError, RuntimeError) as error:
-                    baseline_error = str(error)
-                    update_project(
-                        connection,
-                        repo,
-                        planning_error=baseline_error,
-                        planning_error_fingerprint=current_fingerprint,
-                        last_error=baseline_error,
-                    )
-                    operation_print(baseline_error, file=sys.stderr)
-                    return 1
-                with connection:
-                    maintenance_repository.advance_success_baseline(
-                        repo,
-                        expected_phase=maintenance_cycle.phase,
-                        expected_revision=maintenance_cycle.revision,
-                        remote_commit=str(row["active_sha"]),
-                    )
-                    _clear_active_in_current_transaction(
-                        connection,
-                        repo,
-                        processed_sha=(
-                            str(row["active_sha"])
-                            if maintenance_cycle.include_general_planning
-                            else None
-                        ),
-                        planning_fingerprint=(
-                            completed_fingerprint
-                            if maintenance_cycle.include_general_planning
-                            else None
-                        ),
-                    )
-            else:
-                clear_active(
-                    connection,
-                    repo,
-                    processed_sha=row["active_sha"],
-                    planning_fingerprint=completed_fingerprint,
-                )
-            git(repo_path, "worktree", "remove", str(planning_worktree))
-            operation_print(
-                "유지보수 평가와 재검증을 완료했습니다."
-                if maintenance_planning
-                else "추가로 계획할 작업이 없습니다."
-            )
-            row = connection.execute(
-                "SELECT * FROM projects WHERE repo = ?", (repo,)
-            ).fetchone()
-        else:
-            plans = list(validated_result.plans)
-            if dirty_files:
-                # Publishing failures are operational failures, not Planner
-                # validation failures. Leave the validated result for retry.
-                git(
-                    planning_worktree,
-                    "add",
-                    "--",
-                    *validated_result.publication_paths,
-                )
-                if maintenance_planning:
-                    message = "Update periodic maintenance planning batch"
-                elif not plans:
-                    message = "Update future ideas from planning"
-                else:
-                    first = plans[0][1]
-                    last = plans[-1][1]
-                    if len(plans) == 1:
-                        message = f"Add ExecPlan {first['id']}: {first['title']}"
-                    else:
-                        message = f"Add ExecPlans {first['id']}-{last['id']}"
-                git(planning_worktree, "commit", "-m", message)
-
-            if not maintenance_planning:
-                clear_planning_validation_state(connection, repo)
-            plan_commit = git(planning_worktree, "rev-parse", "HEAD").stdout.strip()
-            if maintenance_planning:
-                assert validated_result is not None
-                assert maintenance_context is not None
-                try:
-                    validate_planning_worktree_ownership(
-                        connection,
-                        repo_path,
-                        state_dir,
-                        repo,
-                        current_fingerprint,
-                        planning_worktree,
-                    )
-                    if maintenance_cycle.publication_stage is None:
-                        validate_maintenance_publication_base(
-                            connection,
-                            repo,
-                            repo_path,
-                            base,
-                            maintenance_context,
-                        )
-                        maintenance_cycle = record_maintenance_publication_intent(
-                            connection,
-                            repo,
-                            planning_worktree,
-                            base,
-                            validated_result,
-                            plan_commit,
-                        )
-                    elif maintenance_cycle.publication_stage != "prepared":
-                        raise MaintenancePlanningError(
-                            "복구할 수 없는 maintenance publication 단계입니다."
-                        )
-                except MaintenancePlanningRestart:
-                    git(
-                        repo_path,
-                        "worktree",
-                        "remove",
-                        "--force",
-                        str(planning_worktree),
-                    )
-                    operation_print(
-                        "유지보수 계획 중 base가 변경되어 최신 기준으로 다시 평가합니다.",
-                        file=sys.stderr,
-                    )
-                    return PROJECT_STEP_RETRY
-                except (MaintenancePlanningError, RuntimeError) as error:
-                    publication_error = str(error)
-                    update_project(
-                        connection,
-                        repo,
-                        planning_error=publication_error,
-                        planning_error_fingerprint=current_fingerprint,
-                        last_error=publication_error,
-                    )
-                    operation_print(publication_error, file=sys.stderr)
-                    return 1
-            git(repo_path, "fetch", "origin")
-            latest_sha = git(repo_path, "rev-parse", f"origin/{base}").stdout.strip()
-            if maintenance_planning and latest_sha not in {
-                row["active_sha"],
-                plan_commit,
-            }:
-                try:
-                    recovered_cycle = recover_maintenance_planning_batch(
-                        connection, repo, planning_worktree, base
-                    )
-                except (MaintenancePlanningError, RuntimeError) as error:
-                    recovery_error = str(error)
-                    update_project(
-                        connection,
-                        repo,
-                        planning_error=recovery_error,
-                        planning_error_fingerprint=current_fingerprint,
-                        last_error=recovery_error,
-                    )
-                    operation_print(recovery_error, file=sys.stderr)
-                    return 1
-                git(
-                    repo_path,
-                    "worktree",
-                    "remove",
-                    "--force",
-                    str(planning_worktree),
-                )
-                if recovered_cycle.phase in {
-                    maintenance_state.MaintenancePhase.ASSESSMENT,
-                    maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
-                }:
-                    operation_print(
-                        "미게시 유지보수 batch를 폐기하고 최신 기준으로 다시 평가합니다."
-                    )
-                else:
-                    operation_print("게시된 유지보수 batch를 복구했습니다.")
-                return PROJECT_STEP_RETRY
-            if latest_sha not in {row["active_sha"], plan_commit}:
-                published = git(
-                    planning_worktree,
-                    "merge-base",
-                    "--is-ancestor",
-                    plan_commit,
-                    f"origin/{base}",
-                    check=False,
-                ).returncode == 0
-                if not published:
-                    validate_planning_worktree_ownership(
-                        connection,
-                        repo_path,
-                        state_dir,
-                        repo,
-                        current_fingerprint,
-                        planning_worktree,
-                    )
-                    git(repo_path, "worktree", "remove", str(planning_worktree))
-                    clear_active(connection, repo)
-                    operation_print(
-                        "계획 중 base가 변경되어 최신 기준으로 다시 계획합니다.",
-                        file=sys.stderr,
-                    )
-                    return 1
-            if latest_sha != plan_commit and latest_sha == row["active_sha"]:
-                pushed = git(
-                    planning_worktree,
-                    "push",
-                    "origin",
-                    f"HEAD:refs/heads/{base}",
-                    check=False,
-                )
-                if pushed.returncode:
-                    update_project(
-                        connection,
-                        repo,
-                        last_error=f"ExecPlan push 실패:\n{pushed.stdout[-8000:]}",
-                    )
-                    operation_print(pushed.stdout, file=sys.stderr)
-                    return 1
-                git(repo_path, "fetch", "origin")
-                latest_sha = git(repo_path, "rev-parse", f"origin/{base}").stdout.strip()
-                if latest_sha != plan_commit:
-                    update_project(
-                        connection,
-                        repo,
-                        last_error="ExecPlan push 결과를 origin/base에서 확인할 수 없습니다.",
-                    )
-                    operation_print("ExecPlan push 결과 확인에 실패했습니다.", file=sys.stderr)
-                    return 1
-
-            if maintenance_planning:
-                try:
-                    publish_maintenance_planning_batch(
-                        connection,
-                        repo,
-                        planning_worktree,
-                        base,
-                        validated_result,
-                        plan_commit,
-                    )
-                except (MaintenancePlanningError, RuntimeError) as error:
-                    publication_error = str(error)
-                    update_project(
-                        connection,
-                        repo,
-                        planning_error=publication_error,
-                        planning_error_fingerprint=current_fingerprint,
-                        last_error=publication_error,
-                    )
-                    operation_print(publication_error, file=sys.stderr)
-                    return 1
-            else:
-                validate_planning_worktree_ownership(
-                    connection,
-                    repo_path,
-                    state_dir,
-                    repo,
-                    current_fingerprint,
-                    planning_worktree,
-                )
-                register_execplans(
-                    connection,
-                    repo,
-                    planning_worktree,
-                    plans,
-                    plan_commit,
-                    current_fingerprint,
-                )
-            git(repo_path, "worktree", "remove", str(planning_worktree))
-            base_sha = latest_sha
-            row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
-
-    newly_activated = ready_activated_before_planning
-    if not row["phase"]:
-        git(repo_path, "fetch", "origin")
-        latest_selection_sha = git(
-            repo_path,
-            "rev-parse",
-            "--verify",
-            f"refs/remotes/origin/{base}^{{commit}}",
-        ).stdout.strip()
-        catalog_decision = catalog_schedule_decision(connection, repo)
-        if not catalog_decision.has_ready and catalog_decision.has_waiting:
-            operation_print(
-                "독립 READY가 없어 PLAN_BLOCKED 또는 PR_OPEN 종료를 기다립니다."
-            )
-            return 0
-        if not catalog_decision.has_ready:
-            latest_selection_fingerprint = _planning_input_fingerprint(
-                repo_path, latest_selection_sha
-            )
-            expected_selection_fingerprint = (
-                general_fingerprint if maintenance_planning else current_fingerprint
-            )
-            assert expected_selection_fingerprint is not None
-            if latest_selection_fingerprint != expected_selection_fingerprint:
-                operation_print(
-                    "계획 중 입력이 변경되어 최신 기준으로 다시 계획합니다.",
-                    file=sys.stderr,
-                )
-                return 1
-        elif catalog_decision.runnable_ready is None:
-            operation_print(
-                "READY ExecPlan이 남아 있지만 dependency가 충족되지 않아 대기합니다."
-            )
-            return 0
-        base_sha = latest_selection_sha
-        selected = activate_ready_execplan(connection, repo, state_dir, base_sha)
-        if selected is None:
-            operation_print("실행 가능한 READY ExecPlan이 없습니다.")
-            return 0
-        row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
-        newly_activated = True
+    ).run(planning_context)
+    planning_step_result = _planning_outcome_step_result(planning_outcome)
+    if planning_step_result is not None:
+        return planning_step_result
+    base_sha = planning_outcome.base_sha or base_sha
+    newly_activated = planning_outcome.newly_activated
+    row = connection.execute(
+        "SELECT * FROM projects WHERE repo = ?", (repo,)
+    ).fetchone()
+    assert row is not None
     branch = str(row["branch"] or "")
     worktree = Path(str(row["worktree"] or ""))
     plan_id = _plan_id_from_path(str(row["plan_path"] or ""))

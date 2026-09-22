@@ -71,6 +71,21 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
         )
         self.assertEqual(loop_manager.FIELDS, runtime_state.PROJECT_UPDATE_FIELDS)
 
+    def test_planning_snapshot_is_typed_and_keeps_project_only_state(self):
+        connection = self._connection()
+        repository = runtime_state.RuntimeStateRepository(connection)
+
+        snapshot = repository.planning("repo")
+
+        self.assertEqual(snapshot.repo, "repo")
+        self.assertEqual(snapshot.planning_fingerprint, "planning-kept")
+        self.assertEqual(
+            snapshot.planning_attempt_fingerprint, "planning-cleared"
+        )
+        self.assertIsNone(snapshot.phase)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            snapshot.phase = "PLANNING"
+
     def test_activation_update_hydrate_and_clear_round_trip_runtime_fields(self):
         connection = self._connection()
         repository = runtime_state.RuntimeStateRepository(connection)

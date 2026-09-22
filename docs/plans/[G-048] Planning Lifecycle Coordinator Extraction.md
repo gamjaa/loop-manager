@@ -48,14 +48,15 @@ planning lifecycle을 명시적인 coordinator 모듈과 주입 가능한 저장
 
 ## Progress
 
-- [ ] planning context·port·outcome 계약 추가
-- [ ] 일반 및 maintenance planning phase handler 추출
-- [ ] top-level dispatch와 compatibility adapter 연결
+- [x] planning context·port·outcome 계약 추가
+- [x] 일반 및 maintenance planning phase handler 추출
+- [x] top-level dispatch와 compatibility adapter 연결
 - [x] Codex turn-diff ref 정규화와 공유 ref 보호 회귀 테스트 추가
-- [ ] base race·validation·publication 중단 회귀 테스트 추가
+- [x] base race·validation·publication 중단 회귀 테스트 추가
 
 ## Decision Log
 
 - planning validation 규칙과 maintenance state machine은 이미 분리돼 있으므로 다시 작성하지 않고, 이 계획은 그 경계를 호출하는 orchestration 책임만 이동한다.
 - runtime-state 저장 경계를 먼저 G-047에서 고정해 coordinator 추출 중 기존 dual-write 규칙을 복제하지 않는다.
 - 2026-09-22 사용자 차단 해제 결정: Codex Agent 실행 중 provider가 자동 생성한 `refs/codex/turn-diffs/captures/*`를 Worker의 공유 Git ref 변경으로 잘못 귀속해 `turn_diff_ref_mutation` 프로젝트 차단이 발생했다. `refs/codex/turn-diffs/*`는 Agent 결과와 게시 의미가 없는 provider 임시 ref로 분류해 scope 비교에서 제외하되, 다른 공유 Git 상태 보호는 완화하지 않는다.
+- coordinator는 bootstrap 모듈을 import하지 않는 phase pipeline과 typed outcome을 소유하고, 기존 Git·Agent·validation helper는 generator 기반 port adapter로 연결해 publication 순서와 중단 복구 의미를 보존한다.

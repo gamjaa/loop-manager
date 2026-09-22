@@ -160,6 +160,70 @@ def execplan_status_for_phase(phase: object) -> str | None:
     return COMPATIBILITY_STATUS_BY_PHASE.get(normalized, normalized)
 
 
+@dataclass(frozen=True)
+class PlanningSnapshot:
+    """Typed view of the project-owned planning lifecycle fields."""
+
+    repo: str
+    phase: str | None
+    processed_sha: str | None
+    planning_fingerprint: str | None
+    planning_attempt_fingerprint: str | None
+    planning_workspace_owned: int
+    planning_retry_count: int
+    planner_session_id: str | None
+    planning_validation_error: str | None
+    planning_result_pending_validation: bool
+    planning_result_completed: bool
+    planning_result: str | None
+    planning_error: str | None
+    planning_error_fingerprint: str | None
+    active_sha: str | None
+    worktree: str | None
+    last_error: str | None
+    agent_role: str | None
+    agent_snapshot: str | None
+    agent_result_snapshot: str | None
+
+    def __getitem__(self, field: str) -> object:
+        """Support the narrow compatibility helpers during coordinator extraction."""
+
+        if field not in self.__dataclass_fields__:
+            raise KeyError(field)
+        return getattr(self, field)
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "PlanningSnapshot":
+        return cls(
+            repo=str(row["repo"]),
+            phase=_text(row, "phase"),
+            processed_sha=_text(row, "processed_sha"),
+            planning_fingerprint=_text(row, "planning_fingerprint"),
+            planning_attempt_fingerprint=_text(
+                row, "planning_attempt_fingerprint"
+            ),
+            planning_workspace_owned=int(row["planning_workspace_owned"]),
+            planning_retry_count=int(row["planning_retry_count"]),
+            planner_session_id=_text(row, "planner_session_id"),
+            planning_validation_error=_text(row, "planning_validation_error"),
+            planning_result_pending_validation=bool(
+                row["planning_result_pending_validation"]
+            ),
+            planning_result_completed=bool(row["planning_result_completed"]),
+            planning_result=_text(row, "planning_result"),
+            planning_error=_text(row, "planning_error"),
+            planning_error_fingerprint=_text(
+                row, "planning_error_fingerprint"
+            ),
+            active_sha=_text(row, "active_sha"),
+            worktree=_text(row, "worktree"),
+            last_error=_text(row, "last_error"),
+            agent_role=_text(row, "agent_role"),
+            agent_snapshot=_text(row, "agent_snapshot"),
+            agent_result_snapshot=_text(row, "agent_result_snapshot"),
+        )
+
+
 def clear_project_values(
     *,
     processed_sha: str | None = None,
@@ -340,6 +404,16 @@ class RuntimeStateRepository:
 
     def get(self, repo: str, plan_id: str) -> ExecutionSnapshot:
         return ExecutionSnapshot.from_row(self._plan_row(repo, plan_id))
+
+    def planning(self, repo: str) -> PlanningSnapshot:
+        """Read project planning state without exposing a mutable SQLite row."""
+
+        row = self.connection.execute(
+            "SELECT * FROM projects WHERE repo = ?", (repo,)
+        ).fetchone()
+        if row is None:
+            raise RuntimeStateError("planning 상태를 읽을 프로젝트가 없습니다.")
+        return PlanningSnapshot.from_row(row)
 
     def active_row(self, repo: str) -> sqlite3.Row | None:
         placeholders = ", ".join("?" for _ in ACTIVE_STATUSES)
