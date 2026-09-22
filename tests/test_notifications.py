@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest import mock
 
 import loop_manager
+import blocked_checkpoint_state
 from managed_config import ManagedConfigError, load_managed_config
 import notifications
 import scoped_blocking
@@ -99,6 +100,14 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
                 "User decision required",
                 "decision-fingerprint",
             )
+            checkpoint_repository = (
+                blocked_checkpoint_state.BlockedCheckpointRepository(connection)
+            )
+            checkpoint_repository.finish_unpublished(
+                checkpoint_repository.get(repo, "G-018"),
+                "workspace가 아직 생성되지 않았습니다.",
+                retryable=False,
+            )
             notifications.enqueue_current_project_events(connection, repo)
             notifications.enqueue_current_project_events(connection, repo)
 
@@ -125,6 +134,13 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
             blocked["paths"],
             [path, "docs/PRODUCT.md"],
         )
+        self.assertEqual(
+            blocked["checkpoint"],
+            {
+                "result": "local_only",
+                "reason": "workspace가 아직 생성되지 않았습니다.",
+            },
+        )
 
     def test_blocked_error_update_keeps_one_identity_event(self):
         connection = self.connection()
@@ -138,6 +154,14 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
                 scoped_blocking.BlockReasonCode.PLAN_INPUT_INVALID,
                 "Initial user action",
                 "input-fingerprint",
+            )
+            checkpoint_repository = (
+                blocked_checkpoint_state.BlockedCheckpointRepository(connection)
+            )
+            checkpoint_repository.finish_unpublished(
+                checkpoint_repository.get(repo, "G-018"),
+                "local-only",
+                retryable=False,
             )
             notifications.enqueue_current_project_events(connection, repo)
 
@@ -162,6 +186,44 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
         self.assertEqual(
             causes,
             {"Initial user action"},
+        )
+
+    def test_blocked_event_waits_for_checkpoint_and_includes_published_commit(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        connection.execute(
+            "UPDATE projects SET origin = ? WHERE repo = ?",
+            ("git@github.com:example/alpha.git", repo),
+        )
+        connection.execute(
+            "UPDATE exec_plans SET branch = ?, worktree = ?, workspace_owned = 1 "
+            "WHERE repo = ? AND plan_id = 'G-018'",
+            ("loop-manager/G-018", "/state/G-018", repo),
+        )
+        with connection:
+            scoped_blocking.record_plan_block(
+                connection,
+                repo,
+                "G-018",
+                scoped_blocking.BlockReasonCode.USER_DECISION_REQUIRED,
+                "User decision required",
+                "decision-fingerprint",
+            )
+            notifications.enqueue_current_project_events(connection, repo)
+        self.assertEqual(self.events(connection), [])
+
+        repository = blocked_checkpoint_state.BlockedCheckpointRepository(
+            connection
+        )
+        oid = "a" * 40
+        repository.finish_published(repository.get(repo, "G-018"), oid)
+        with connection:
+            notifications.enqueue_current_project_events(connection, repo)
+        payload = json.loads(self.events(connection)[0]["payload"])
+        self.assertEqual(payload["checkpoint"]["commit_oid"], oid)
+        self.assertEqual(
+            payload["checkpoint"]["branch_url"],
+            f"https://github.com/example/alpha/tree/{oid}",
         )
 
 

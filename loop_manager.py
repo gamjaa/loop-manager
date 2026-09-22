@@ -51,6 +51,8 @@ from execution_runtime import (
 )
 from managed_config import ManagedConfig, ManagedConfigError, load_managed_config
 import notifications
+import blocked_checkpoint
+import blocked_checkpoint_state
 from planning_runtime import (
     MAX_PLANNER_VALIDATION_RETRIES,
     PlanningAgentResult,
@@ -1065,6 +1067,7 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
             )
     connection.execute(GUIDANCE_APPROVALS_SCHEMA)
     scoped_blocking.ensure_schema(connection)
+    blocked_checkpoint_state.ensure_schema(connection)
     connection.execute("DROP INDEX IF EXISTS one_active_execplan_per_project")
     connection.execute(EXEC_PLANS_ACTIVE_INDEX)
     scoped_blocking.migrate_legacy_blocks(connection)
@@ -1093,6 +1096,7 @@ def connect_database(
         _ensure_cleanup_pending_schema(connection)
         maintenance_state.ensure_schema(connection)
         notifications.ensure_schema(connection)
+        blocked_checkpoint_state.ensure_schema(connection)
         connection.commit()
     else:
         try:
@@ -1151,6 +1155,7 @@ def connect_database(
     _ensure_cleanup_pending_schema(connection)
     maintenance_state.ensure_schema(connection)
     notifications.ensure_schema(connection)
+    blocked_checkpoint_state.ensure_schema(connection)
     connection.commit()
     # Repository-aware migrations belong in run_project, after persisted Agent
     # config has been checked against its pre-invocation snapshot.
@@ -11316,6 +11321,43 @@ def resume_plan_blocks(
     for blocked in plan_blocked_execplans(connection, repo):
         if blocked["blocked_reason"] == PR_CLOSED_BLOCK_REASON:
             continue
+        checkpoint_row = connection.execute(
+            "SELECT phase, remote_oid FROM blocked_checkpoints "
+            "WHERE repo = ? AND plan_id = ?",
+            (repo, blocked["plan_id"]),
+        ).fetchone()
+        if (
+            checkpoint_row is not None
+            and checkpoint_row["phase"] == "published"
+            and checkpoint_row["remote_oid"]
+        ):
+            checkpoint_repository = (
+                blocked_checkpoint_state.BlockedCheckpointRepository(connection)
+            )
+            checkpoint_request = checkpoint_repository.get(
+                repo, str(blocked["plan_id"])
+            )
+            try:
+                observed_remote = _BlockedCheckpointAdapter(
+                    connection, repo_path, state_dir, repo
+                ).observe_remote(checkpoint_request)
+            except (OSError, RuntimeError) as error:
+                _update_blocked_error(
+                    connection,
+                    repo,
+                    str(blocked["plan_id"]),
+                    f"원격 checkpoint를 재검증할 수 없습니다: {error}",
+                )
+                continue
+            if observed_remote != str(checkpoint_row["remote_oid"]):
+                _update_blocked_error(
+                    connection,
+                    repo,
+                    str(blocked["plan_id"]),
+                    "원격 checkpoint branch가 게시 뒤 외부에서 변경됐습니다. "
+                    "자동 merge, rebase 또는 덮어쓰기를 거부합니다.",
+                )
+                continue
         hydrate_execplan_project(connection, repo, blocked)
         resume = (
             resume_guidance_approval_if_decided
@@ -13795,6 +13837,24 @@ def _run_project_step(
             continue
         return _execution_outcome_step_result(execution_outcome)
 
+def _checkpoint_dispatch_ready(
+    connection: sqlite3.Connection,
+    repo: str,
+) -> bool:
+    tables = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name IN ('projects', 'blocked_checkpoints')"
+        )
+    }
+    if tables != {"projects", "blocked_checkpoints"}:
+        return False
+    return connection.execute(
+        "SELECT 1 FROM projects WHERE repo = ?", (repo,)
+    ).fetchone() is not None
+
+
 def run_project_result(
     connection: sqlite3.Connection,
     state_dir: Path,
@@ -13810,7 +13870,29 @@ def run_project_result(
 ) -> ProjectRunResult:
     """Run retryable validation progress to a stable project-level outcome."""
 
+    repo = str(Path(repo_arg).expanduser().resolve())
+    checkpoint_attempts: set[str] = set()
     while True:
+        if _checkpoint_dispatch_ready(connection, repo):
+            pending_before = (
+                blocked_checkpoint_state.BlockedCheckpointRepository(
+                    connection
+                ).pending(repo)
+            )
+            if any(
+                request.request_identity not in checkpoint_attempts
+                for request in pending_before
+            ):
+                dispatch_blocked_checkpoints(
+                    connection,
+                    Path(repo),
+                    state_dir,
+                    repo,
+                    skip_identities=frozenset(checkpoint_attempts),
+                )
+                checkpoint_attempts.update(
+                    request.request_identity for request in pending_before
+                )
         try:
             step_result = _run_project_step(
                 connection,
@@ -13834,10 +13916,41 @@ def run_project_result(
                 0,
                 str(error),
             )
+        if _checkpoint_dispatch_ready(connection, repo):
+            pending_after = (
+                blocked_checkpoint_state.BlockedCheckpointRepository(
+                    connection
+                ).pending(repo)
+            )
+            if any(
+                request.request_identity not in checkpoint_attempts
+                for request in pending_after
+            ):
+                dispatch_blocked_checkpoints(
+                    connection,
+                    Path(repo),
+                    state_dir,
+                    repo,
+                    skip_identities=frozenset(checkpoint_attempts),
+                )
+                checkpoint_attempts.update(
+                    request.request_identity for request in pending_after
+                )
+            schedule = catalog_schedule_decision(connection, repo)
+            if (
+                step_result not in {
+                    PROJECT_STEP_TRANSIENT_PAUSE,
+                    PROJECT_STEP_USAGE_PAUSE,
+                    PROJECT_STEP_PLANNING_PENDING,
+                }
+                and schedule.active is None
+                and schedule.runnable_ready is not None
+                and not schedule.project_blocked
+            ):
+                step_result = PROJECT_STEP_RETRY
         if step_result != PROJECT_STEP_RETRY:
             break
 
-    repo = str(Path(repo_arg).expanduser().resolve())
     row = connection.execute(
         "SELECT phase, last_error FROM projects WHERE repo = ?",
         (repo,),
@@ -14182,6 +14295,543 @@ def main() -> int:
     ) as error:
         operation_log(f"오류: {error}", error=True)
         return 1
+
+
+class _BlockedCheckpointAdapter:
+    """Git/GitHub safety and publication adapter for one registered project."""
+
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        repo_path: Path,
+        state_dir: Path,
+        repo: str,
+    ):
+        self.connection = connection
+        self.repo_path = repo_path
+        self.state_dir = state_dir
+        self.repo = repo
+
+    def _plan(self, request: blocked_checkpoint.CheckpointRequest) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT p.*, b.reason_code AS checkpoint_reason, "
+            "b.evidence AS checkpoint_evidence "
+            "FROM exec_plans AS p JOIN execplan_blocks AS b "
+            "USING (repo, plan_id) WHERE p.repo = ? AND p.plan_id = ?",
+            (request.repo, request.plan_id),
+        ).fetchone()
+        if (
+            row is None
+            or row["status"] != "PLAN_BLOCKED"
+            or row["checkpoint_reason"] != request.reason_code
+            or row["checkpoint_evidence"] != request.evidence
+        ):
+            raise RuntimeError("checkpoint 대상 PLAN_BLOCKED identity가 변경됐습니다.")
+        return row
+
+    def _approved_guidance_targets(self, request: blocked_checkpoint.CheckpointRequest) -> tuple[str, ...]:
+        targets = []
+        for row in self.connection.execute(
+            "SELECT target_path, expected_content_hash FROM guidance_approvals "
+            "WHERE repo = ? AND plan_id = ? AND applied = 1 "
+            "AND expected_content_hash IS NOT NULL ORDER BY target_path",
+            (request.repo, request.plan_id),
+        ):
+            target = str(row["target_path"])
+            path = Path(str(request.worktree or "")) / target
+            try:
+                matches = (
+                    path.is_file()
+                    and not path.is_symlink()
+                    and guidance_content_hash(path.read_bytes())
+                    == str(row["expected_content_hash"])
+                )
+            except OSError:
+                matches = False
+            if matches:
+                targets.append(target)
+        return tuple(targets)
+
+    def assess(
+        self, request: blocked_checkpoint.CheckpointRequest
+    ) -> blocked_checkpoint.SafetyVerdict:
+        try:
+            plan = self._plan(request)
+        except RuntimeError as error:
+            return blocked_checkpoint.SafetyVerdict(
+                False,
+                blocked_checkpoint.SafetyScope.PLAN,
+                "checkpoint_identity_changed",
+                str(error),
+                None,
+                (),
+            )
+        if not request.branch or not request.worktree:
+            return blocked_checkpoint.SafetyVerdict(
+                False,
+                blocked_checkpoint.SafetyScope.PLAN,
+                "managed_workspace_not_created",
+                "관리 branch 또는 worktree 생성 전에 차단되어 local-only로 보존합니다.",
+                None,
+                (),
+            )
+        project_blocked = scoped_blocking.project_block(
+            self.connection, request.repo
+        ) is not None
+        branch = str(plan["branch"] or "")
+        worktree = Path(str(plan["worktree"] or ""))
+        identity_matches = bool(
+            request.branch
+            and request.worktree
+            and request.branch == branch
+            and Path(request.worktree) == worktree
+        )
+        snapshot = None
+        try:
+            validate_execplan_workspace_identity(
+                self.state_dir,
+                request.repo,
+                request.plan_id,
+                branch,
+                worktree,
+            )
+            validate_managed_worktree(
+                self.repo_path,
+                worktree,
+                branch,
+                allow_rebase=_rebase_in_progress_for_branch(worktree, branch),
+            )
+            snapshot = capture_git_snapshot(worktree)
+        except (OSError, RuntimeError, WorkspaceOwnershipError):
+            identity_matches = False
+
+        if (
+            snapshot is not None
+            and identity_matches
+            and not project_blocked
+            and snapshot.operations
+        ):
+            operations = tuple(sorted(snapshot.operations))
+            return blocked_checkpoint.SafetyVerdict(
+                False,
+                blocked_checkpoint.SafetyScope.PLAN,
+                "git_operation_in_progress",
+                "미해결 Git operation: " + ", ".join(operations),
+                snapshot.head,
+                (),
+            )
+
+        dirty_paths: list[blocked_checkpoint.DirtyPath] = []
+        shared_metadata_owned = False
+        head_oid = snapshot.head if snapshot is not None else None
+        actual_branch = snapshot.branch if snapshot is not None else None
+        operations = tuple(sorted(snapshot.operations)) if snapshot is not None else ()
+        if snapshot is not None:
+            active_key = str(_canonical_path(worktree))
+            worktree_entry = snapshot.worktrees.get(active_key, ())
+            branch_ref = f"refs/heads/{branch}"
+            shared_metadata_owned = bool(
+                snapshot.shared_metadata_complete
+                and f"branch={branch_ref}" in worktree_entry
+                and snapshot.refs.get(branch_ref, (None, None))[0] == snapshot.head
+            )
+            try:
+                sources = tuple(str(item) for item in json.loads(str(plan["sources"])))
+            except (TypeError, ValueError):
+                sources = ()
+            archive_sources = tuple(
+                source
+                for source in sources
+                if source.startswith("docs/requirements/")
+                and "/archive/" not in source
+            )
+            guidance_targets = self._approved_guidance_targets(request)
+            allow_common_plans = _published_plan_allows_common_plans(
+                self.repo_path, plan
+            )
+            for path, (kinds, _) in sorted(snapshot.dirty.items()):
+                target = worktree / path
+                try:
+                    symlink = target.is_symlink()
+                    external_worktree = bool(
+                        target.exists()
+                        and not target.is_file()
+                        and not symlink
+                    )
+                except OSError:
+                    symlink = True
+                    external_worktree = True
+                ignored_result = git(
+                    worktree,
+                    "check-ignore",
+                    "--no-index",
+                    "--quiet",
+                    "--",
+                    path,
+                    check=False,
+                )
+                ignored = ignored_result.returncode == 0
+                if ignored_result.returncode not in {0, 1}:
+                    ignored = True
+                entries = snapshot.index.get(path, ())
+                dirty_paths.append(
+                    blocked_checkpoint.DirtyPath(
+                        path=path,
+                        kinds=kinds,
+                        allowed=_worker_path_allowed(
+                            path,
+                            str(plan["path"]),
+                            archive_sources,
+                            guidance_targets,
+                            allow_common_plans,
+                        ),
+                        symlink=symlink,
+                        ignored=ignored,
+                        index_flags=_non_default_index_flags(entries),
+                        external_worktree=external_worktree,
+                    )
+                )
+        observation = blocked_checkpoint.SafetyObservation(
+            workspace_identity_matches=identity_matches,
+            workspace_owned=int(plan["workspace_owned"] or 0) == WORKSPACE_OWNED,
+            head_oid=head_oid,
+            actual_branch=actual_branch,
+            expected_branch=branch,
+            operations=operations,
+            dirty_paths=tuple(dirty_paths),
+            shared_metadata_owned=shared_metadata_owned,
+            project_blocked=project_blocked,
+            legacy_scope_uncertain=(
+                request.reason_code
+                == BlockReasonCode.LEGACY_UNSCOPED_BLOCK.value
+            ),
+            agent_scope_recovery_pending=bool(
+                plan["agent_snapshot"] or plan["agent_recovery"]
+            ),
+        )
+        return blocked_checkpoint.assess_safety(observation)
+
+    def existing_pull_request(
+        self, request: blocked_checkpoint.CheckpointRequest
+    ) -> object | None:
+        if not request.branch:
+            return None
+        try:
+            return pr_for_branch(self.repo_path, request.branch)
+        except RuntimeError as error:
+            raise blocked_checkpoint.CheckpointPushError(
+                f"checkpoint PR 조회 실패: {error}", retryable=True
+            ) from error
+
+    def _tree_for_paths(
+        self, worktree: Path, paths: tuple[str, ...]
+    ) -> str:
+        with tempfile.TemporaryDirectory(
+            prefix="loop-manager-checkpoint-index-"
+        ) as directory:
+            temporary_index = Path(directory) / "index"
+            _git_with_index(worktree, temporary_index, "read-tree", "HEAD")
+            if paths:
+                _git_with_index(
+                    worktree,
+                    temporary_index,
+                    "add",
+                    "--all",
+                    "--",
+                    *paths,
+                )
+            return _git_with_index(
+                worktree, temporary_index, "write-tree"
+            ).stdout.strip()
+
+    def prepare(
+        self,
+        request: blocked_checkpoint.CheckpointRequest,
+        verdict: blocked_checkpoint.SafetyVerdict,
+    ) -> blocked_checkpoint.PreparedCheckpoint:
+        if not verdict.safe or verdict.head_oid is None or request.worktree is None:
+            raise RuntimeError("안전하지 않은 checkpoint를 준비할 수 없습니다.")
+        worktree = Path(request.worktree)
+        tree_oid = self._tree_for_paths(worktree, verdict.included_paths)
+        identity = blocked_checkpoint.checkpoint_identity(
+            plan_id=request.plan_id,
+            reason_code=request.reason_code,
+            evidence=request.evidence,
+            parent_oid=verdict.head_oid,
+            tree_oid=tree_oid,
+            included_paths=verdict.included_paths,
+        )
+        return blocked_checkpoint.PreparedCheckpoint(
+            parent_oid=verdict.head_oid,
+            tree_oid=tree_oid,
+            commit_identity=identity,
+            message=blocked_checkpoint.checkpoint_message(
+                plan_id=request.plan_id,
+                reason_code=request.reason_code,
+                evidence=request.evidence,
+                identity=identity,
+                included_paths=verdict.included_paths,
+            ),
+            included_paths=verdict.included_paths,
+        )
+
+    def ensure_local_commit(
+        self,
+        request: blocked_checkpoint.CheckpointRequest,
+        prepared: blocked_checkpoint.PreparedCheckpoint,
+    ) -> str:
+        if request.worktree is None:
+            raise RuntimeError("checkpoint worktree가 저장되지 않았습니다.")
+        worktree = Path(request.worktree)
+        current_head = git(worktree, "rev-parse", "HEAD^{commit}").stdout.strip()
+        if current_head != prepared.parent_oid:
+            current_tree = git(
+                worktree, "rev-parse", "HEAD^{tree}"
+            ).stdout.strip()
+            current_message = git(
+                worktree, "show", "-s", "--format=%B", "HEAD"
+            ).stdout
+            if (
+                current_tree == prepared.tree_oid
+                and f"Checkpoint-Identity: {prepared.commit_identity}"
+                in current_message
+            ):
+                return current_head
+            raise RuntimeError(
+                "checkpoint 준비 뒤 관리 branch HEAD가 예상하지 못하게 변경됐습니다."
+            )
+        if not prepared.included_paths:
+            head_tree = git(
+                worktree, "rev-parse", "HEAD^{tree}"
+            ).stdout.strip()
+            if head_tree != prepared.tree_oid:
+                raise RuntimeError("clean checkpoint tree가 현재 HEAD와 다릅니다.")
+            return current_head
+
+        git(
+            worktree,
+            "add",
+            "--all",
+            "--",
+            *prepared.included_paths,
+        )
+        actual_tree = git(worktree, "write-tree").stdout.strip()
+        if actual_tree != prepared.tree_oid:
+            raise RuntimeError(
+                "checkpoint stage 결과가 사전 검증한 tree와 다릅니다."
+            )
+        with tempfile.TemporaryDirectory(
+            prefix="loop-manager-checkpoint-message-"
+        ) as directory:
+            message_path = Path(directory) / "message"
+            message_path.write_text(prepared.message, encoding="utf-8")
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "GIT_AUTHOR_NAME": "Loop Manager",
+                    "GIT_AUTHOR_EMAIL": "loop-manager@localhost",
+                    "GIT_COMMITTER_NAME": "Loop Manager",
+                    "GIT_COMMITTER_EMAIL": "loop-manager@localhost",
+                }
+            )
+            committed = command(
+                [
+                    "git",
+                    "-c",
+                    f"core.hooksPath={directory}",
+                    "-c",
+                    "commit.gpgSign=false",
+                    "-C",
+                    str(worktree),
+                    "commit",
+                    "--file",
+                    str(message_path),
+                ],
+                check=False,
+                env=environment,
+            )
+        if committed.returncode:
+            raise RuntimeError(
+                "checkpoint commit 실패:\n" + committed.stdout[-8000:]
+            )
+        local_oid = git(
+            worktree, "rev-parse", "HEAD^{commit}"
+        ).stdout.strip()
+        if git(worktree, "rev-parse", "HEAD^{tree}").stdout.strip() != prepared.tree_oid:
+            raise RuntimeError("checkpoint commit tree 검증에 실패했습니다.")
+        return local_oid
+
+    def observe_remote(
+        self, request: blocked_checkpoint.CheckpointRequest
+    ) -> str | None:
+        if not request.branch:
+            raise RuntimeError("checkpoint branch가 저장되지 않았습니다.")
+        result = git(
+            self.repo_path,
+            "ls-remote",
+            "--heads",
+            "origin",
+            f"refs/heads/{request.branch}",
+            check=False,
+        )
+        if result.returncode:
+            raise blocked_checkpoint.CheckpointPushError(
+                "checkpoint 원격 branch 조회 실패:\n" + result.stdout[-8000:],
+                retryable=True,
+            )
+        rows = [line.split() for line in result.stdout.splitlines() if line.strip()]
+        if not rows:
+            return None
+        if len(rows) != 1 or len(rows[0]) != 2:
+            raise RuntimeError("checkpoint 원격 branch 응답이 유일하지 않습니다.")
+        oid = rows[0][0]
+        if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", oid) is None:
+            raise RuntimeError("checkpoint 원격 branch OID가 유효하지 않습니다.")
+        return oid
+
+    def is_fast_forward(self, remote_oid: str, local_oid: str) -> bool:
+        result = git(
+            self.repo_path,
+            "merge-base",
+            "--is-ancestor",
+            remote_oid,
+            local_oid,
+            check=False,
+        )
+        if result.returncode not in {0, 1}:
+            raise RuntimeError("checkpoint fast-forward 관계를 확인할 수 없습니다.")
+        return result.returncode == 0
+
+    def push(
+        self,
+        request: blocked_checkpoint.CheckpointRequest,
+        local_oid: str,
+        decision: blocked_checkpoint.PushDecision,
+    ) -> None:
+        if not request.branch or not request.worktree:
+            raise blocked_checkpoint.CheckpointPushError(
+                "checkpoint branch/worktree가 저장되지 않았습니다.",
+                retryable=False,
+            )
+        arguments = [
+            "push",
+            "origin",
+            f"{local_oid}:refs/heads/{request.branch}",
+        ]
+        if decision.mode is blocked_checkpoint.PushMode.REBASE_LEASE:
+            if not request.expected_remote_oid:
+                raise blocked_checkpoint.CheckpointPushError(
+                    "rebase checkpoint lease OID가 없습니다.", retryable=False
+                )
+            arguments.insert(
+                1,
+                "--force-with-lease="
+                f"refs/heads/{request.branch}:{request.expected_remote_oid}",
+            )
+        pushed = git(Path(request.worktree), *arguments, check=False)
+        if pushed.returncode:
+            normalized = " ".join(pushed.stdout.casefold().split())
+            permanent = any(
+                marker in normalized
+                for marker in (
+                    "protected branch",
+                    "permission denied",
+                    "not permitted",
+                    "authentication failed",
+                    "authorization failed",
+                    "http 403",
+                    "stale info",
+                    "fetch first",
+                    "non-fast-forward",
+                )
+            )
+            raise blocked_checkpoint.CheckpointPushError(
+                "checkpoint push 실패:\n" + pushed.stdout[-8000:],
+                retryable=not permanent,
+            )
+
+
+class _BlockedCheckpointResults:
+    def __init__(self, connection: sqlite3.Connection):
+        self.connection = connection
+
+    def promote_project_block(
+        self,
+        request: blocked_checkpoint.CheckpointRequest,
+        verdict: blocked_checkpoint.SafetyVerdict,
+    ) -> None:
+        reason = {
+            "shared_ref_mutation": BlockReasonCode.SHARED_REF_MUTATION,
+            "workspace_ownership_uncertain": (
+                BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN
+            ),
+        }.get(
+            str(verdict.reason_code),
+            BlockReasonCode.REPOSITORY_STATE_UNSAFE,
+        )
+        with self.connection:
+            scoped_blocking.record_project_block(
+                self.connection,
+                request.repo,
+                reason,
+                verdict.detail or "checkpoint project safety violation",
+                request.request_identity,
+                plan_id=request.plan_id,
+                previous_phase=None,
+            )
+
+    def finalized(self, request: blocked_checkpoint.CheckpointRequest) -> None:
+        with self.connection:
+            notifications.enqueue_current_project_events(
+                self.connection, request.repo
+            )
+
+
+def dispatch_blocked_checkpoints(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    state_dir: Path,
+    repo: str,
+    *,
+    skip_identities: frozenset[str] = frozenset(),
+) -> int:
+    """Commit prior block state, then process its network-independent request."""
+
+    connection.commit()
+    repository = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
+    adapter = _BlockedCheckpointAdapter(
+        connection, repo_path, state_dir, repo
+    )
+    results = _BlockedCheckpointResults(connection)
+    dispatcher = blocked_checkpoint.BlockedCheckpointDispatcher(
+        repository,
+        adapter,
+        adapter,
+        results,
+        max_push_attempts=MAX_TRANSIENT_AGENT_RETRIES,
+    )
+    try:
+        return dispatcher.dispatch(repo, skip_identities=skip_identities)
+    except blocked_checkpoint.CheckpointPushError as error:
+        for request in repository.pending(repo):
+            if request.request_identity in skip_identities:
+                continue
+            repository.finish_unpublished(
+                request, str(error), retryable=error.retryable
+            )
+            results.finalized(request)
+        return 0
+    except (OSError, RuntimeError) as error:
+        for request in repository.pending(repo):
+            if request.request_identity in skip_identities:
+                continue
+            repository.finish_unpublished(
+                request,
+                f"checkpoint 처리 실패: {error}",
+                retryable=True,
+            )
+            results.finalized(request)
+        return 0
 
 
 

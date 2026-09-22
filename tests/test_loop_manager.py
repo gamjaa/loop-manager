@@ -6104,6 +6104,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repo, _plan_path = self._repository_with_plan(directory)
             for module_name in (
+                "blocked_checkpoint.py",
+                "blocked_checkpoint_state.py",
                 "loop_manager.py",
                 "execution_runtime.py",
                 "execution_handlers.py",

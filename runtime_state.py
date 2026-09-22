@@ -10,6 +10,7 @@ from typing import Callable, Iterator, Mapping
 from uuid import uuid4
 
 import notifications
+import blocked_checkpoint_state
 
 
 ACTIVE_STATUSES = frozenset(
@@ -848,12 +849,31 @@ class RuntimeStateRepository:
                 """,
                 (repo, plan_id, reason_code, evidence, release_fingerprint),
             )
+            checkpoint_plan = self._plan_row(repo, plan_id)
+            blocked_checkpoint_state.BlockedCheckpointRepository(
+                self.connection
+            ).request(
+                repo=repo,
+                plan_id=plan_id,
+                reason_code=reason_code,
+                evidence=evidence,
+                branch=_text(checkpoint_plan, "branch"),
+                worktree=_text(checkpoint_plan, "worktree"),
+                expected_remote_oid=_text(
+                    checkpoint_plan, "publication_remote_oid"
+                ),
+                rebase_recovery=bool(
+                    checkpoint_plan["publication_remote_oid"]
+                    and not checkpoint_plan["pr_url"]
+                ),
+                release_fingerprint=release_fingerprint,
+            )
             projection = (
                 clear_project_values() if clear_projection else project_values
             )
             if projection is not None:
                 self._update_project_row(repo, projection)
                 self._fault("after_project_update")
-            if enqueue:
-                self._enqueue(repo)
+            # PLAN_BLOCKED notification is intentionally delayed until the
+            # durable checkpoint dispatcher records published/local-only.
             return self.get(repo, plan_id)

@@ -93,6 +93,21 @@ def _insert(
     )
 
 
+def _checkpoint_link(origin: object, oid: object) -> str | None:
+    if not origin or not oid:
+        return None
+    value = str(origin)
+    if value.startswith("git@github.com:"):
+        value = "https://github.com/" + value.removeprefix("git@github.com:")
+    elif value.startswith("ssh://git@github.com/"):
+        value = "https://github.com/" + value.removeprefix(
+            "ssh://git@github.com/"
+        )
+    if not value.startswith("https://github.com/"):
+        return None
+    return value.removesuffix(".git") + "/tree/" + str(oid)
+
+
 def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) -> None:
     """Enqueue all plan/project events after their owning update and before commit."""
 
@@ -127,9 +142,13 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
         )
 
     plan_blocks = connection.execute(
-        "SELECT p.plan_id, p.title, p.path, p.sources, b.reason_code, b.evidence "
+        "SELECT p.plan_id, p.title, p.path, p.sources, b.reason_code, b.evidence, "
+        "c.result, c.remote_oid, c.unpublished_reason, c.branch, r.origin "
         "FROM execplan_blocks AS b JOIN exec_plans AS p USING (repo, plan_id) "
-        "WHERE b.repo = ? ORDER BY p.plan_id",
+        "JOIN projects AS r ON r.repo = b.repo "
+        "LEFT JOIN blocked_checkpoints AS c USING (repo, plan_id) "
+        "WHERE b.repo = ? AND (c.repo IS NULL OR c.phase IN "
+        "('published', 'unpublished', 'retry_pending')) ORDER BY p.plan_id",
         (repo,),
     ).fetchall()
     for plan in plan_blocks:
@@ -141,6 +160,19 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
         plan_id = str(plan[0])
         plan_title = str(plan[1])
         paths = [str(plan[2]), *(str(item) for item in sources)]
+        checkpoint = None
+        if plan[6] == "published":
+            checkpoint = {
+                "result": "published",
+                "branch": plan[9],
+                "branch_url": _checkpoint_link(plan[10], plan[7]),
+                "commit_oid": plan[7],
+            }
+        elif plan[6] == "local_only":
+            checkpoint = {
+                "result": "local_only",
+                "reason": str(plan[8] or "checkpoint를 게시하지 않았습니다."),
+            }
         guidance_locations = []
         if plan[4] == "guidance_approval_required":
             rows = connection.execute(
@@ -177,6 +209,7 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
                 "cause": str(plan[5]),
                 "paths": paths,
                 "guidance_locations": guidance_locations,
+                "checkpoint": checkpoint,
             },
         )
 
@@ -346,10 +379,25 @@ def _message(kind: str, payload: dict[str, object]) -> str:
     if kind == "blocked":
         subject = payload.get("execplan_id") or payload["stage"]
         paths = "\n".join(f"- {path}" for path in payload["paths"])
+        checkpoint = payload.get("checkpoint")
+        checkpoint_text = ""
+        if isinstance(checkpoint, dict):
+            if checkpoint.get("result") == "published":
+                checkpoint_text = (
+                    "\nCheckpoint: "
+                    + str(checkpoint.get("branch_url") or checkpoint.get("branch"))
+                    + "\nCommit: "
+                    + str(checkpoint.get("commit_oid"))
+                )
+            else:
+                checkpoint_text = "\nCheckpoint: local only (" + str(
+                    checkpoint.get("reason")
+                ) + ")"
         return (
             f"[{payload['project']}] BLOCKED ({payload.get('scope')}: {subject})\n"
             f"Reason: {payload.get('reason_code')}\n{payload['cause']}"
             + (f"\nFiles to edit:\n{paths}" if paths else "")
+            + checkpoint_text
         )
     return (
         f"[{payload['project']}] Project complete\nLast completed work: "

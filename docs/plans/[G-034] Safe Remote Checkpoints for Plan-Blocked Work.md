@@ -59,11 +59,11 @@ PR이 없는 `PLAN_BLOCKED` ExecPlan의 관리 branch와 worktree가 Loop Manage
 
 ## Progress
 
-- [ ] checkpoint domain assessor와 durable request/result repository 구현
-- [ ] workspace·diff·Git operation safety port 및 결정적 tree 구성 구현
-- [ ] checkpoint 전용 remote policy와 멱등 commit/push 구현
-- [ ] project dispatcher, unblock/publication observation과 outbox 통합
-- [ ] checkpoint state/domain/execution adapter targeted 회귀 테스트 추가
+- [x] checkpoint domain assessor와 durable request/result repository 구현
+- [x] workspace·diff·Git operation safety port 및 결정적 tree 구성 구현
+- [x] checkpoint 전용 remote policy와 멱등 commit/push 구현
+- [x] project dispatcher, unblock/publication observation과 outbox 통합
+- [x] checkpoint state/domain/execution adapter targeted 회귀 테스트 추가
 
 ## Decision Log
 
