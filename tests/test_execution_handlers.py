@@ -237,3 +237,48 @@ class ExecutionHandlerTests(TestCase):
         self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
         self.effects.blocking.block_active_execplan_from_revision.assert_called_once()
         self.assertEqual(self.calls, [])
+
+    def test_guidance_mismatch_reads_blocked_plan_after_projection_release(self):
+        self.connection.execute(lm.GUIDANCE_APPROVALS_SCHEMA)
+        proposal = SimpleNamespace(
+            proposal_id='guidance-change', line=10,
+            decision=SimpleNamespace(line=20),
+        )
+        document = SimpleNamespace(proposals=(proposal,), structure_hash='structure')
+        approval = {'applied': 0, 'proposal_id': proposal.proposal_id,
+                    'target_path': 'AGENTS.md'}
+        self.effects.agent.inspect_worker_guidance_result.side_effect = self.state.bind(
+            lm.inspect_worker_guidance_result, connected=True, mutates=True,
+        )
+        context = self.context()
+        with (
+            mock.patch.object(lm, '_guidance_document', return_value=document),
+            mock.patch.object(lm, '_guidance_rows', return_value=(approval,)),
+            mock.patch.object(lm, '_validate_guidance_proposal_scope'),
+            mock.patch.object(lm, 'is_loop_manager_repository', return_value=True),
+            mock.patch.object(lm, '_guidance_document_matches_rows',
+                              return_value=({proposal.proposal_id: proposal}, ())),
+            mock.patch.object(lm, '_guidance_final_expected',
+                              return_value=({('batch', 'AGENTS.md'): (b'approved', 0o100644)}, {})),
+            mock.patch.object(lm, '_guidance_target_state',
+                              return_value=(b'mismatched', 0o100644)),
+            mock.patch.object(lm, 'capture_git_snapshot') as snapshot,
+        ):
+            snapshot.return_value.serialize.return_value = '{}'
+            result = self.handler.run(context)
+
+        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertIsNone(self.repository.projected('repo'))
+        self.assertIsNone(self.state.expected)
+        blocked = self.repository.get('repo', 'G-047')
+        self.assertEqual(blocked.status, 'PLAN_BLOCKED')
+        self.assertIn('실제 AGENTS.md 결과가 승인된 patch 결과와 다릅니다.', blocked.last_error)
+        self.assertEqual(self.state.blocked()['last_error'], blocked.last_error)
+        self.assertEqual(
+            self.effects.events.operation_print.call_args.args[0], blocked.last_error,
+        )
+        self.effects.validation.verify.assert_not_called()
+        self.effects.publication.push_managed_publication_branch.assert_not_called()
+        self.effects.publication.command.assert_not_called()
+        with self.assertRaises(runtime_state.RuntimeStateError):
+            self.handler.run(context)

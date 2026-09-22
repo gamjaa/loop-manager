@@ -16,6 +16,8 @@ class ExecutionStatePort:
         self.expected = repository.projected(repo)
         if self.expected is None:
             raise runtime_state.RuntimeStateError("활성 execution snapshot이 없습니다.")
+        # Terminal blocking can clear the projection, but not the selected identity.
+        self.plan_id = self.expected.plan_id
 
     def check(self):
         current = self.repository.projected(self.repo)
@@ -53,7 +55,7 @@ class ExecutionStatePort:
         return self.repository.active_row(repo)
 
     def blocked(self):
-        row = self.repository.get(self.repo, self.expected.plan_id)
+        row = self.repository.get(self.repo, self.plan_id)
         return {"last_error": row.last_error}
 
     def update_project(self, repo, **values):
