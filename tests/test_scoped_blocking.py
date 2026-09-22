@@ -1,5 +1,7 @@
 import json
 import sqlite3
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -62,6 +64,78 @@ class ScopedBlockingTest(unittest.TestCase):
             "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
             (self.repo, plan_id),
         ).fetchone()
+
+    def test_initialized_worker_queries_do_not_reenter_schema_ddl(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            parent = loop_manager.connect_database(state, create=True)
+            self.addCleanup(parent.close)
+            parent.execute("BEGIN IMMEDIATE")
+
+            def query_worker(repo):
+                connection = loop_manager.connect_database(state, run_migrations=False)
+                try:
+                    connection.execute("PRAGMA busy_timeout = 100")
+                    statements = []
+                    connection.set_trace_callback(statements.append)
+                    self.assertIsNone(loop_manager.active_execplan(connection, repo))
+                    self.assertEqual(loop_manager.plan_blocked_execplans(connection, repo), ())
+                    self.assertEqual(loop_manager.merge_wait_execplans(connection, repo), ())
+                    self.assertEqual(loop_manager.compact_execplan_catalog(connection, repo), "[]")
+                    self.assertIsNone(loop_manager.catalog_schedule_decision(connection, repo).active)
+                    self.assertFalse(any(
+                        sql.lstrip().upper().startswith(("CREATE", "DROP", "ALTER"))
+                        and any(name in sql.lower() for name in (
+                            "exec_plans", "one_active_execplan_per_project",
+                            "execplan_blocks", "project_blocks", "guidance_approvals",
+                        ))
+                        for sql in statements
+                    ), statements)
+                finally:
+                    connection.close()
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                list(pool.map(query_worker, ("repo-a", "repo-b")))
+            parent.rollback()
+
+    def test_reopened_conflict_precedes_independent_ready(self):
+        plan = self.plan("G-001", "PR_OPEN", branch="loop-manager/G-001")
+        self.plan("G-002", priority="critical")
+        loop_manager._block_closed_pull_request(self.connection, self.repo, plan, "https://pr/1", "a" * 40)
+        opened = {"state": "OPEN", "url": "https://pr/1", "headRefOid": "a" * 40, "mergeable": "CONFLICTING"}
+
+        def start_recovery(connection, _root, _state, repo, project, _pr):
+            self.assertIn("[G-001]", project["plan_path"])
+            self.assertEqual(loop_manager.project_execplan(connection, repo)["status"], "PR_OPEN")
+            loop_manager.update_project(connection, repo, phase="WORKING", pr_conflict_recovery=1)
+
+        with mock.patch("loop_manager.pr_for_branch", return_value=opened), mock.patch(
+            "loop_manager.reconcile_existing_pull_request", side_effect=start_recovery
+        ) as recover:
+            result = loop_manager.synchronize_waiting_pull_requests(self.connection, Path(self.repo), Path("/state"), self.repo)
+        recover.assert_called_once()
+        self.assertTrue(result.conflict_started)
+        decision = loop_manager.catalog_schedule_decision(self.connection, self.repo)
+        self.assertEqual(decision.active["plan_id"], "G-001")
+        self.assertIsNone(decision.runnable_ready)
+
+    def test_cleanup_project_block_stops_later_merge_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for plan_id in ("G-001", "G-002"):
+                self.plan(plan_id, "PR_OPEN", branch=f"loop-manager/{plan_id}")
+            self.connection.execute("UPDATE exec_plans SET workspace_owned = 0, worktree = ?", (directory,))
+            self.connection.commit()
+            merged = {"state": "MERGED", "url": "https://pr/1", "headRefOid": "a" * 40}
+            with mock.patch("loop_manager.pr_for_branch", return_value=merged) as read, mock.patch("loop_manager.git") as git, mock.patch(
+                "loop_manager.complete_merged_execplan_worktree", wraps=loop_manager.complete_merged_execplan_worktree
+            ) as cleanup:
+                loop_manager.synchronize_waiting_pull_requests(self.connection, Path(self.repo), Path(directory), self.repo)
+            self.assertEqual(read.call_count, 2)
+            cleanup.assert_called_once()
+            git.assert_called_once_with(Path(self.repo), "fetch", "origin")
+            self.assertIsNotNone(scoped_blocking.project_block(self.connection, self.repo))
+            statuses = dict(self.connection.execute("SELECT plan_id, status FROM exec_plans"))
+            self.assertEqual(statuses, {"G-001": "MERGED", "G-002": "PR_OPEN"})
 
     def test_reason_mapping_and_atomic_plan_project_records(self):
         self.plan("G-001", "IMPLEMENTING")

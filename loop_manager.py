@@ -1026,7 +1026,15 @@ def validate_runtime_child(
 ) -> None:
     validate_runtime_worktree(source, state_dir, ROOT, commit_sha)
 
+class StateConnection(sqlite3.Connection):
+    """Keep completed schema initialization local to one database connection."""
+
+    execplans_schema_ready = False
+
+
 def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
+    if isinstance(connection, StateConnection) and connection.execplans_schema_ready:
+        return
     connection.execute(EXEC_PLANS_SCHEMA)
     columns = {row[1] for row in connection.execute("PRAGMA table_info(exec_plans)")}
     if "blocked_fingerprint" not in columns:
@@ -1080,6 +1088,8 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
     connection.execute("DROP INDEX IF EXISTS one_active_execplan_per_project")
     connection.execute(EXEC_PLANS_ACTIVE_INDEX)
     scoped_blocking.migrate_legacy_blocks(connection)
+    if isinstance(connection, StateConnection):
+        connection.execplans_schema_ready = True
 
 
 def connect_database(
@@ -1093,7 +1103,7 @@ def connect_database(
         raise RuntimeError(
             "상태 DB가 없습니다. 먼저 `loop_manager.py config init`을 실행하세요."
         )
-    connection = sqlite3.connect(database, timeout=30.0)
+    connection = sqlite3.connect(database, timeout=30.0, factory=StateConnection)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA busy_timeout = 30000")
     if create:
@@ -1111,6 +1121,8 @@ def connect_database(
             connection.close()
             raise RuntimeError("상태 DB를 읽을 수 없습니다. 백업을 복원하거나 다시 초기화하세요.") from error
     if not run_migrations:
+        # Scheduler workers inherit the schema initialized by the parent.
+        connection.execplans_schema_ready = True
         return connection
     columns = {row[1] for row in connection.execute("PRAGMA table_info(projects)")}
     migrations = {
@@ -11186,9 +11198,6 @@ def synchronize_waiting_pull_requests(
         "ORDER BY plan_id",
         (repo, PR_CLOSED_BLOCK_REASON),
     ).fetchall()
-    project_blocked_at_start = (
-        scoped_blocking.project_block(connection, repo) is not None
-    )
     conflicts: list[tuple[sqlite3.Row, Mapping[str, object]]] = []
     fetched_after_merge = False
     merged = False
@@ -11208,7 +11217,7 @@ def synchronize_waiting_pull_requests(
         head_oid = str(head_value) if head_value else stored["pr_head_oid"]
         state = str(pull_request.get("state") or "OPEN").upper()
         if state == "MERGED" or pull_request.get("mergedAt"):
-            if project_blocked_at_start:
+            if scoped_blocking.project_block(connection, repo) is not None:
                 continue
             if not fetched_after_merge:
                 git(repo_path, "fetch", "origin")
@@ -11268,7 +11277,10 @@ def synchronize_waiting_pull_requests(
                 head_oid,
                 recovery=False,
             )
-            continue
+            stored = connection.execute(
+                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+                (repo, stored["plan_id"]),
+            ).fetchone()
         with connection:
             connection.execute(
                 "UPDATE exec_plans SET pr_url = ?, pr_head_oid = ? "
