@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 import hashlib
 import sqlite3
+import notifications
 
 from blocked_checkpoint import (
     CheckpointPhase,
@@ -271,6 +272,7 @@ class BlockedCheckpointRepository:
                 "WHERE repo = ? AND plan_id = ?",
                 (remote_oid, request.repo, request.plan_id),
             )
+            notifications.enqueue_current_project_events(self.connection, request.repo)
 
     def finish_unpublished(
         self,
@@ -292,3 +294,4 @@ class BlockedCheckpointRepository:
                 unpublished_reason=reason,
                 retryable=int(retryable),
             )
+            notifications.enqueue_current_project_events(self.connection, request.repo)

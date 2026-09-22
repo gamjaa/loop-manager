@@ -193,7 +193,7 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
         repo = "/projects/alpha"
         connection.execute(
             "UPDATE projects SET origin = ? WHERE repo = ?",
-            ("git@github.com:example/alpha.git", repo),
+            ("example/alpha", repo),
         )
         connection.execute(
             "UPDATE exec_plans SET branch = ?, worktree = ?, workspace_owned = 1 "

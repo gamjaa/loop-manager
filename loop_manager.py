@@ -8686,7 +8686,7 @@ def block_active_execplan(
         project["agent_input_fingerprint"] or blocked_worktree_fingerprint
     )
     agent_result_snapshot = preserved_agent_result_snapshot
-    if agent_result_snapshot is None and project["agent_snapshot"]:
+    if agent_result_snapshot is None:
         try:
             agent_result_snapshot = capture_git_snapshot(worktree).serialize()
         except RuntimeError:
@@ -8867,6 +8867,11 @@ def transition_validation_failure(
             blocked_worktree_fingerprint=blocked_worktree_input,
             blocked_review_fingerprint=blocked_review_input,
         )
+        try:
+            plan_values["agent_result_snapshot"] = capture_git_snapshot(worktree).serialize()
+        except (OSError, RuntimeError):
+            # Missing evidence must fail closed in the checkpoint assessor.
+            plan_values["agent_result_snapshot"] = None
         reason = (
             BlockReasonCode.VERIFY_RETRY_EXHAUSTED
             if stage == "verify"
@@ -14427,6 +14432,9 @@ class _BlockedCheckpointAdapter:
         actual_branch = snapshot.branch if snapshot is not None else None
         operations = tuple(sorted(snapshot.operations)) if snapshot is not None else ()
         if snapshot is not None:
+            metadata_error = self._shared_safety_error(request, plan, snapshot)
+            if metadata_error is not None:
+                return metadata_error
             active_key = str(_canonical_path(worktree))
             worktree_entry = snapshot.worktrees.get(active_key, ())
             branch_ref = f"refs/heads/{branch}"
@@ -14452,7 +14460,15 @@ class _BlockedCheckpointAdapter:
             for path, (kinds, _) in sorted(snapshot.dirty.items()):
                 target = worktree / path
                 try:
-                    symlink = target.is_symlink()
+                    tree_entry = git(worktree, "ls-tree", "HEAD", "--", path).stdout
+                    symlink = (
+                        target.is_symlink()
+                        or tree_entry.startswith("120000 ")
+                        or any(
+                            entry.split()[1:2] == ["120000"]
+                            for entry in snapshot.index.get(path, ())
+                        )
+                    )
                     external_worktree = bool(
                         target.exists()
                         and not target.is_file()
@@ -14510,6 +14526,67 @@ class _BlockedCheckpointAdapter:
             ),
         )
         return blocked_checkpoint.assess_safety(observation)
+
+    def _shared_safety_error(
+        self,
+        request: blocked_checkpoint.CheckpointRequest,
+        plan: sqlite3.Row,
+        current: GitSnapshot,
+    ) -> blocked_checkpoint.SafetyVerdict | None:
+        """Check persisted ownership before any GitHub or remote operation."""
+        def reject(reason, detail):
+            return blocked_checkpoint.SafetyVerdict(
+                False, blocked_checkpoint.SafetyScope.PROJECT,
+                reason, detail, current.head, (),
+            )
+
+        project = self.connection.execute(
+            "SELECT origin FROM projects WHERE repo = ?", (request.repo,)
+        ).fetchone()
+        try:
+            expected = str(project["origin"] or "") if project else ""
+            if not expected:
+                return blocked_checkpoint.SafetyVerdict(
+                    False, blocked_checkpoint.SafetyScope.PLAN,
+                    "registered_origin_missing",
+                    "등록 origin이 없어 checkpoint를 local-only로 보존합니다.",
+                    current.head, (),
+                )
+            for context in (self.repo_path, Path(request.worktree)):
+                for arguments in (("remote", "get-url", "--all", "origin"),
+                                  ("remote", "get-url", "--push", "--all", "origin")):
+                    urls = git(context, *arguments).stdout.splitlines()
+                    if len(urls) != 1 or github_repository(urls[0]) != expected:
+                        raise RuntimeError("등록 origin과 fetch/push 대상이 다릅니다.")
+        except RuntimeError as error:
+            return reject("shared_git_config_mutation", str(error))
+
+        serialized = plan["agent_snapshot"] or plan["agent_result_snapshot"]
+        try:
+            if not serialized:
+                raise ValueError("persisted Git snapshot이 없습니다.")
+            before = GitSnapshot.deserialize(str(serialized))
+            if not before.shared_metadata_complete:
+                raise ValueError("persisted shared metadata가 없습니다.")
+        except (ValueError, TypeError, KeyError, RuntimeError) as error:
+            return reject("workspace_ownership_uncertain", str(error))
+        if before.config != current.config:
+            return reject("shared_git_config_mutation", "checkpoint Git config가 저장된 snapshot과 다릅니다.")
+        own_ref = f"refs/heads/{request.branch}"
+        remote_ref = f"refs/remotes/origin/{request.branch}"
+        for name in before.refs.keys() | current.refs.keys():
+            if name == own_ref or name.startswith("refs/codex/turn-diffs/"):
+                continue
+            if before.refs.get(name) == current.refs.get(name):
+                continue
+            if name == remote_ref and request.local_oid and current.refs.get(name) == (request.local_oid, ""):
+                continue
+            return reject("shared_ref_mutation", f"checkpoint 공유 ref 변경: {name}")
+        own_path = str(_canonical_path(Path(request.worktree)))
+        for path in before.worktrees.keys() | current.worktrees.keys():
+            if path != own_path and before.worktrees.get(path) != current.worktrees.get(path):
+                return reject("outside_managed_worktree_mutation", f"checkpoint 외부 worktree 변경: {path}")
+        return None
 
     def existing_pull_request(
         self, request: blocked_checkpoint.CheckpointRequest
@@ -14762,6 +14839,8 @@ class _BlockedCheckpointResults:
     ) -> None:
         reason = {
             "shared_ref_mutation": BlockReasonCode.SHARED_REF_MUTATION,
+            "shared_git_config_mutation": BlockReasonCode.SHARED_GIT_CONFIG_MUTATION,
+            "outside_managed_worktree_mutation": BlockReasonCode.OUTSIDE_MANAGED_WORKTREE_MUTATION,
             "workspace_ownership_uncertain": (
                 BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN
             ),
@@ -14781,10 +14860,9 @@ class _BlockedCheckpointResults:
             )
 
     def finalized(self, request: blocked_checkpoint.CheckpointRequest) -> None:
-        with self.connection:
-            notifications.enqueue_current_project_events(
-                self.connection, request.repo
-            )
+        # The repository commits the result and outbox together. There must be
+        # no separate, crash-sensitive notification transaction here.
+        pass
 
 
 def dispatch_blocked_checkpoints(

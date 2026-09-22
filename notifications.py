@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 import hashlib
 import json
+import re
 from pathlib import Path
 import sqlite3
 from urllib.parse import quote
@@ -97,6 +98,8 @@ def _checkpoint_link(origin: object, oid: object) -> str | None:
     if not origin or not oid:
         return None
     value = str(origin)
+    if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", value):
+        return "https://github.com/" + value + "/tree/" + str(oid)
     if value.startswith("git@github.com:"):
         value = "https://github.com/" + value.removeprefix("git@github.com:")
     elif value.startswith("ssh://git@github.com/"):

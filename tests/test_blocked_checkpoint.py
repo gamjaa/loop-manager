@@ -332,6 +332,15 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
             ),
         )
         self.connection.commit()
+        normalize = loop_manager.github_repository
+        normalizer = mock.patch(
+            "loop_manager.github_repository",
+            side_effect=lambda url: "example/project" if url == str(self.remote) else normalize(url),
+        )
+        normalizer.start()
+        self.addCleanup(normalizer.stop)
+        self.connection.execute("UPDATE projects SET origin = 'example/project'")
+        self.connection.commit()
 
     def tearDown(self):
         self.connection.close()
@@ -339,6 +348,10 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
 
     def block(self):
         with self.connection:
+            self.connection.execute(
+                "UPDATE exec_plans SET agent_result_snapshot = ?",
+                (loop_manager.capture_git_snapshot(self.worktree).serialize(),),
+            )
             runtime_state.RuntimeStateRepository(self.connection).block_plan(
                 str(self.repo.resolve()),
                 "G-034",
@@ -379,6 +392,7 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
             blocked_checkpoint.PushDecision(blocked_checkpoint.PushMode.CREATE),
         )
         self.assertEqual(adapter.observe_remote(request), local_oid)
+        request = replace(request, local_oid=local_oid)
 
         clean_verdict = adapter.assess(request)
         clean_prepared = adapter.prepare(request, clean_verdict)
@@ -426,7 +440,7 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
         self.assertIn("ignored.txt", verdict.detail)
         self.assertIn("link.py", verdict.detail)
 
-    def test_existing_pr_short_circuits_dispatch_before_safety_or_push(self):
+    def test_existing_pr_short_circuits_dispatch_after_safety_before_push(self):
         request = self.block()
         repository = blocked_checkpoint_state.BlockedCheckpointRepository(
             self.connection
@@ -440,10 +454,97 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
         )
 
         self.assertEqual(dispatcher.dispatch(request.repo), 1)
-        safety.assess.assert_not_called()
+        safety.assess.assert_called_once_with(request)
         publication.push.assert_not_called()
         row = self.connection.execute(
             "SELECT phase, unpublished_reason FROM blocked_checkpoints"
         ).fetchone()
         self.assertEqual(row["phase"], "unpublished")
         self.assertIn("기존 PR", row["unpublished_reason"])
+
+    def test_deleted_tracked_symlink_is_rejected_staged_or_unstaged(self):
+        link = self.worktree / "link.py"
+        link.symlink_to("code.py")
+        self.run_git(self.worktree, "add", "link.py")
+        self.run_git(self.worktree, "commit", "-m", "symlink fixture")
+        link.unlink()
+        for staged in (False, True):
+            with self.subTest(staged=staged):
+                if staged:
+                    self.run_git(self.worktree, "add", "link.py")
+                request = self.block()
+                adapter = loop_manager._BlockedCheckpointAdapter(
+                    self.connection, self.repo, self.state_dir, request.repo
+                )
+                before = loop_manager.capture_git_snapshot(self.worktree)
+                verdict = adapter.assess(request)
+                self.assertFalse(verdict.safe)
+                self.assertEqual(verdict.reason_code, "dirty_scope_violation")
+                self.assertIn("symlink", verdict.detail)
+                self.assertEqual(before, loop_manager.capture_git_snapshot(self.worktree))
+
+    def test_validation_block_preserves_snapshot_before_later_config_mutation(self):
+        repo = str(self.repo.resolve())
+        loop_manager.hydrate_execplan_project(
+            self.connection, repo,
+            self.connection.execute("SELECT * FROM exec_plans").fetchone(),
+        )
+        with mock.patch("loop_manager._blocked_validation_input_fingerprints", return_value=("input", "worktree")):
+            for _ in range(loop_manager.MAX_VALIDATION_FINGERPRINT_REPEATS + 1):
+                decision = loop_manager.transition_validation_failure(
+                    self.connection, repo, self.worktree, "verify", "same failure"
+                )
+        self.assertTrue(decision.blocked)
+        request = blocked_checkpoint_state.BlockedCheckpointRepository(self.connection).get(repo, "G-034")
+        adapter = loop_manager._BlockedCheckpointAdapter(self.connection, self.repo, self.state_dir, repo)
+        self.assertTrue(adapter.assess(request).safe)
+        self.run_git(self.repo, "config", "core.hooksPath", "/tmp/changed-after-block")
+        verdict = adapter.assess(request)
+        self.assertFalse(verdict.safe)
+        self.assertEqual(verdict.reason_code, "shared_git_config_mutation")
+
+    def test_shared_mutations_block_before_any_remote_access(self):
+        cases = ("origin", "pushurl", "config", "ref", "external")
+        for mutation in cases:
+            with self.subTest(mutation=mutation):
+                request = self.block()
+                if mutation == "origin":
+                    self.run_git(self.repo, "remote", "set-url", "origin", "https://github.com/other/repo.git")
+                elif mutation == "pushurl":
+                    self.run_git(self.repo, "config", "remote.origin.pushurl", "https://github.com/other/repo.git")
+                elif mutation == "config":
+                    self.run_git(self.repo, "config", "core.hooksPath", "/tmp/untrusted")
+                elif mutation == "ref":
+                    self.run_git(self.repo, "update-ref", "refs/heads/foreign", self.base_oid)
+                else:
+                    (self.repo / "code.py").write_text("external change\n")
+                adapter = loop_manager._BlockedCheckpointAdapter(
+                    self.connection, self.repo, self.state_dir, request.repo
+                )
+                publication = mock.Mock()
+                results = loop_manager._BlockedCheckpointResults(self.connection)
+                repository = blocked_checkpoint_state.BlockedCheckpointRepository(self.connection)
+                blocked_checkpoint.BlockedCheckpointDispatcher(repository, adapter, publication, results).dispatch(request.repo)
+                publication.existing_pull_request.assert_not_called()
+                publication.push.assert_not_called()
+                stored = self.connection.execute(
+                    "SELECT scope, reason_code FROM project_blocks"
+                ).fetchone()
+                self.assertEqual(stored["scope"], "project")
+                self.assertEqual(stored["reason_code"], {
+                    "origin": "shared_git_config_mutation",
+                    "pushurl": "shared_git_config_mutation",
+                    "config": "shared_git_config_mutation",
+                    "ref": "shared_ref_mutation",
+                    "external": "outside_managed_worktree_mutation",
+                }[mutation])
+                self.run_git(self.repo, "remote", "set-url", "origin", str(self.remote))
+                if mutation == "pushurl":
+                    self.run_git(self.repo, "config", "--unset", "remote.origin.pushurl")
+                if mutation == "config":
+                    self.run_git(self.repo, "config", "--unset", "core.hooksPath")
+                # Give each subcase a fresh durable request after restoration.
+                self.connection.execute("DELETE FROM blocked_checkpoints")
+                self.connection.execute("DELETE FROM project_blocks")
+                self.connection.execute("UPDATE projects SET phase = NULL")
+                self.connection.commit()

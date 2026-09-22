@@ -360,15 +360,6 @@ class BlockedCheckpointDispatcher:
         return completed
 
     def _dispatch_one(self, request: CheckpointRequest) -> bool:
-        if self._publication.existing_pull_request(request) is not None:
-            self._state.finish_unpublished(
-                request,
-                "동일 head branch에 기존 PR이 있어 checkpoint 게시 대상이 아닙니다.",
-                retryable=False,
-            )
-            self._results.finalized(request)
-            return True
-
         verdict = self._safety.assess(request)
         if not verdict.safe:
             if (
@@ -379,6 +370,15 @@ class BlockedCheckpointDispatcher:
             self._state.finish_unpublished(
                 request,
                 verdict.detail or "checkpoint 안전성을 증명할 수 없습니다.",
+                retryable=False,
+            )
+            self._results.finalized(request)
+            return True
+
+        if self._publication.existing_pull_request(request) is not None:
+            self._state.finish_unpublished(
+                request,
+                "동일 head branch에 기존 PR이 있어 checkpoint 게시 대상이 아닙니다.",
                 retryable=False,
             )
             self._results.finalized(request)

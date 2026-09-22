@@ -1,5 +1,7 @@
 import sqlite3
 import unittest
+from unittest import mock
+import notifications
 
 import blocked_checkpoint
 import blocked_checkpoint_state
@@ -33,6 +35,40 @@ class BlockedCheckpointRepositoryTest(unittest.TestCase):
 
     def tearDown(self):
         self.connection.close()
+
+    def test_terminal_result_and_outbox_rollback_and_retry_together(self):
+        notifications.configure_session(self.connection, enabled=True)
+        notifications.ensure_schema(self.connection)
+        for published in (True, False):
+            with self.subTest(published=published):
+                request = self.request(evidence=str(published))
+                self.connection.execute(
+                    "INSERT OR REPLACE INTO execplan_blocks "
+                    "(repo, plan_id, scope, reason_code, evidence) "
+                    "VALUES ('repo', 'G-034', 'plan', 'verify_retry_exhausted', ?)",
+                    (str(published),),
+                )
+                self.connection.execute("DELETE FROM notification_outbox")
+                self.connection.commit()
+                def finish():
+                    if published:
+                        self.repository.finish_published(request, "a" * 40)
+                    else:
+                        self.repository.finish_unpublished(request, "local only", retryable=False)
+                enqueue = notifications.enqueue_current_project_events
+                def interrupted(connection, repo):
+                    enqueue(connection, repo)
+                    raise KeyboardInterrupt()
+                with mock.patch.object(notifications, "enqueue_current_project_events", side_effect=interrupted):
+                    with self.assertRaises(KeyboardInterrupt):
+                        finish()
+                self.assertEqual(len(self.repository.pending("repo")), 1)
+                self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0], 0)
+                finish()
+                self.assertEqual(self.repository.pending("repo"), ())
+                self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0], 1)
+                finish()
+                self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0], 1)
 
     def request(self, evidence="failure", release_fingerprint=None):
         return self.repository.request(
