@@ -8,6 +8,25 @@ from agent_invocation_state import InvocationRepository, ensure_schema
 
 
 class InvocationRepositoryTests(TestCase):
+    def test_replacement_ledger_links_transition_and_profiles(self):
+        context = InvocationContext(
+            'repo', 'G-041', transition='replacement', transition_cause='model_changed',
+            transition_id='transition-one', previous_provider='codex',
+            previous_model='old', previous_effort='low',
+            previous_session_id='old-session',
+        )
+        identity = self.repository.start(context, 'worker', 'codex',
+                                         ResolvedProfile('new', 'high'), None)
+        self.repository.observe_session(identity, 'new-session')
+        row = self.connection.execute(
+            'SELECT * FROM agent_invocations WHERE invocation_id = ?', (identity,),
+        ).fetchone()
+        self.assertEqual((row['transition'], row['transition_cause'],
+                          row['transition_id'], row['previous_model'],
+                          row['previous_session_id'], row['model'], row['session_id']),
+                         ('replacement', 'model_changed', 'transition-one', 'old',
+                          'old-session', 'new', 'new-session'))
+
     def setUp(self):
         self.connection = sqlite3.connect(":memory:")
         self.connection.row_factory = sqlite3.Row

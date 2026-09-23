@@ -110,6 +110,11 @@ class InvocationContext:
     transition: str | None = None
     transition_cause: str | None = None
     attempt: int = 1
+    transition_id: str | None = None
+    previous_provider: str | None = None
+    previous_model: str | None = None
+    previous_effort: str | None = None
+    previous_session_id: str | None = None
 
 
 class AttemptSequence:

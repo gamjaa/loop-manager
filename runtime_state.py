@@ -40,6 +40,8 @@ MIRRORED_FIELDS = (
     "pr_head_oid",
     "last_error",
     "worker_session_id",
+    "worker_session_binding",
+    "worker_session_transition",
     "reviewer_session_id",
     "worker_result",
     "verify_result",
@@ -134,6 +136,8 @@ EXECUTION_CLEAR_VALUES: Mapping[str, object] = {
     "pr_head_oid": None,
     "last_error": None,
     "worker_session_id": None,
+    "worker_session_binding": None,
+    "worker_session_transition": None,
     "reviewer_session_id": None,
     "worker_result": None,
     "verify_result": None,
@@ -283,6 +287,8 @@ class ExecutionSnapshot:
     pr_head_oid: str | None
     last_error: str | None
     worker_session_id: str | None
+    worker_session_binding: str | None
+    worker_session_transition: str | None
     reviewer_session_id: str | None
     worker_result: str | None
     verify_result: str | None
@@ -331,6 +337,8 @@ class ExecutionSnapshot:
             pr_head_oid=_text(row, "pr_head_oid"),
             last_error=_text(row, "last_error"),
             worker_session_id=_text(row, "worker_session_id"),
+            worker_session_binding=_text(row, "worker_session_binding"),
+            worker_session_transition=_text(row, "worker_session_transition"),
             reviewer_session_id=_text(row, "reviewer_session_id"),
             worker_result=_text(row, "worker_result"),
             verify_result=_text(row, "verify_result"),
@@ -371,6 +379,8 @@ class ExecutionSnapshot:
             "pr_head_oid": self.pr_head_oid,
             "last_error": self.last_error,
             "worker_session_id": self.worker_session_id,
+            "worker_session_binding": self.worker_session_binding,
+            "worker_session_transition": self.worker_session_transition,
             "reviewer_session_id": self.reviewer_session_id,
             "worker_result": self.worker_result,
             "verify_result": self.verify_result,
@@ -704,6 +714,27 @@ class RuntimeStateRepository:
                 project_values=project_values,
             )
 
+    def observe_worker_session(
+        self, expected: ExecutionSnapshot, transition_id: str | None,
+        session_id: str, binding: str,
+    ) -> ExecutionSnapshot:
+        """Bind a provider observation to exactly the intended Worker transition."""
+        from worker_session import SessionTransition
+
+        pending = SessionTransition.deserialize(expected.worker_session_transition)
+        if (pending.identity if pending else None) != transition_id:
+            raise RuntimeStateError("Worker session transition identity가 변경되었습니다.")
+        if pending is not None and pending.target.serialize() != binding:
+            raise RuntimeStateError("Worker session 목표 profile이 변경되었습니다.")
+        values = {
+            "worker_session_id": session_id,
+            "worker_session_binding": binding,
+            "worker_session_transition": None,
+        }
+        return self.transition_from_snapshot(
+            expected, plan_values=values, project_values=values,
+        )
+
     def correct_checkpoint(
         self, expected: ExecutionSnapshot, *, phase: str,
         active_sha: str | None, validated_base_sha: str | None,
@@ -782,6 +813,8 @@ class RuntimeStateRepository:
                 "pr_head_oid": None,
                 "last_error": None,
                 "worker_session_id": None,
+                "worker_session_binding": None,
+                "worker_session_transition": None,
                 "reviewer_session_id": None,
                 "worker_result": None,
                 "verify_result": None,

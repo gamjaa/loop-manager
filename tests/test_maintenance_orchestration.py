@@ -17,6 +17,8 @@ from maintenance_orchestration import (
 from maintenance_planning import MaintenancePlanMode, MaintenancePlanningContext
 import maintenance_state
 from tests.test_loop_manager import (
+    _ports_with_bound_dummy_sessions,
+    _profile_for_dummy_worker_config,
     commit_and_push,
     git_command,
     make_remote_repository,
@@ -135,6 +137,12 @@ class MaintenanceOrchestrationTest(unittest.TestCase):
             "loop_manager.ensure_safe_base_worktree"
         ), mock.patch(
             "loop_manager.run_codex", side_effect=agent
+        ), mock.patch(
+            "loop_manager._agent_profile",
+            side_effect=_profile_for_dummy_worker_config,
+        ), mock.patch(
+            "loop_manager._ExecutionLifecyclePorts",
+            side_effect=_ports_with_bound_dummy_sessions,
         ):
             return loop_manager.run_project_result(
                 connection,

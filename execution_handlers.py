@@ -7,8 +7,13 @@ from dataclasses import asdict
 import hashlib
 import json
 import re
+import subprocess
 import sys
-from agent_invocation import AttemptSequence, TrackedAgentCall
+from uuid import uuid4
+from agent_invocation import (AgentResult, AgentResultKind, AttemptSequence,
+                              TrackedAgentCall, ResolvedProfile)
+from worker_session import (SessionBinding, SessionTransition, decide_session,
+                            unavailable_transition)
 from scoped_blocking import BlockReasonCode
 from recovery_runtime import (
     RecoveryAction, RecoveryObservation, RecoveryReason, RecoveryFailure,
@@ -70,6 +75,7 @@ class AgentEffects:
     run_agent_with_retries: Callable[..., Any]
     worker_prompt: Callable[..., Any]
     reviewer_prompt: Callable[..., Any]
+    resolve_worker_profile: Callable[..., ResolvedProfile]
 
 @dataclass(frozen=True)
 class ValidationEffects:
@@ -217,6 +223,8 @@ class ExecutionHandlers:
             active_sha=str(row['active_sha'] or ''),
             validated_base_sha=str(row['validated_base_sha']) if row['validated_base_sha'] is not None else None,
             worker_session_id=str(row['worker_session_id']) if row['worker_session_id'] is not None else None,
+            worker_session_binding=row['worker_session_binding'],
+            worker_session_transition=row['worker_session_transition'],
             reviewer_session_id=str(row['reviewer_session_id']) if row['reviewer_session_id'] is not None else None,
             worker_result=str(row['worker_result']) if row['worker_result'] is not None else None,
             verify_result=str(row['verify_result']) if row['verify_result'] is not None else None,
@@ -1951,6 +1959,25 @@ class ExecutionHandlers:
                     classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
                     str(error), context=context,
                 )
+        resolved = self.effects.agent.resolve_worker_profile(
+            self.config_path, self.provider, self.level, context.worktree,
+        )
+        decision = decide_session(
+            row['worker_session_id'],
+            SessionBinding.deserialize(row['worker_session_binding']),
+            SessionTransition.deserialize(row['worker_session_transition']),
+            self.provider, resolved, uuid4().hex,
+        )
+        active_transition = decision.transition
+        target = decision.target
+        if active_transition is not None and row['worker_session_transition'] is None:
+            self.effects.state.update_project(
+                self.repo, worker_session_id=None,
+                worker_session_transition=active_transition.serialize(),
+            )
+            row = self._row()
+        active_session_id = decision.session_id
+        observed_session_id = None
         worker_scope_before = self.effects.agent.begin_agent_scope(
             self.repo,
             context.worktree,
@@ -1960,15 +1987,43 @@ class ExecutionHandlers:
         feedback_repo = self.effects.feedback.repository if self.effects.feedback else None
         delivery = None
         def session_started(started_session_id):
+            nonlocal observed_session_id
+            if observed_session_id == started_session_id:
+                return
+            self.effects.state.observe_worker_session(
+                active_transition.identity if active_transition else None,
+                started_session_id, target.serialize(),
+            )
+            observed_session_id = started_session_id
             if feedback_repo is not None and delivery is not None:
                 feedback_repo.bind_session(delivery.attempt_id, started_session_id)
-            self.effects.state.update_project(
-                self.repo, worker_session_id=started_session_id,
-            )
         def worker_call(current_session_id, session_recovery, invocation):
-            nonlocal delivery
+            nonlocal delivery, active_transition
+            previous_session = observed_session_id or active_session_id
+            if (session_recovery and previous_session
+                    and (active_transition is None
+                         or self._row()['worker_session_transition'] is None)):
+                active_transition = unavailable_transition(
+                    str(previous_session),
+                    SessionBinding.deserialize(self._row()['worker_session_binding']),
+                    target, uuid4().hex,
+                )
+                self.effects.state.update_project(
+                    self.repo, worker_session_id=None,
+                    worker_session_transition=active_transition.serialize(),
+                )
+            previous = active_transition.previous_binding if active_transition else None
+            invocation = replace(
+                invocation,
+                transition_id=active_transition.identity if active_transition else None,
+                previous_provider=previous.provider if previous else None,
+                previous_model=previous.model if previous else None,
+                previous_effort=previous.effort if previous else None,
+                previous_session_id=(active_transition.previous_session
+                                     if active_transition else None),
+            )
             recovering = bool(session_recovery or (
-                row['worker_session_id'] and current_session_id is None
+                active_transition is not None and current_session_id is None
             ))
             if feedback_repo is not None:
                 delivery = feedback_repo.prepare(
@@ -1982,36 +2037,49 @@ class ExecutionHandlers:
             prompt_error = row['last_error']
             if is_validation_error(prompt_error, row['verify_result'], row['review_result']):
                 prompt_error = None
-            return self.effects.agent.run_agent(
-                self.provider, context.worktree, self.state_dir,
-                self.config_path, 'worker',
-                self.effects.agent.worker_prompt(
-                    row['plan_path'], prompt_error, row['worker_result'],
-                    validation_feedback,
-                    archive_candidates=self.archive_candidates,
-                    session_recovery=recovering,
-                    guidance_common_allowed=self.effects.agent.is_loop_manager_repository(self.repo_path),
-                    guidance_context=guidance_context,
-                    allow_common_plans=allow_common_plans,
-                ),
-                read_only=False, level=self.level, persist_session=True,
-                session_id=current_session_id,
-                on_session_started=session_started,
-                invocation=invocation,
-            )
+            try:
+                return self.effects.agent.run_agent(
+                    target.provider, context.worktree, self.state_dir,
+                    self.config_path, 'worker',
+                    self.effects.agent.worker_prompt(
+                        row['plan_path'], prompt_error, row['worker_result'],
+                        validation_feedback,
+                        archive_candidates=self.archive_candidates,
+                        session_recovery=recovering,
+                        guidance_common_allowed=self.effects.agent.is_loop_manager_repository(self.repo_path),
+                        guidance_context=guidance_context,
+                        allow_common_plans=allow_common_plans,
+                    ),
+                    read_only=False, level=self.level, persist_session=True,
+                    session_id=current_session_id,
+                    on_session_started=session_started,
+                    invocation=invocation,
+                    resolved_profile=ResolvedProfile(target.model, target.effort),
+                )
+            except (subprocess.TimeoutExpired, OSError) as error:
+                if observed_session_id is None:
+                    raise
+                detail = (f'Agent CLI timeout: {error}' if isinstance(error, subprocess.TimeoutExpired)
+                          else f'Agent CLI 실행 실패: {error}')
+                return AgentResult(1, detail, observed_session_id,
+                                   AgentResultKind.TRANSIENT_FAILURE)
         guidance_targets = self.effects.agent._guidance_worker_targets(self.repo, str(catalog_plan['plan_id']))
         guidance_context = self.effects.agent.guidance_resume_context(self.repo, str(catalog_plan['plan_id']))
         allow_common_plans = self.effects.agent._published_plan_allows_common_plans(self.repo_path, catalog_plan)
         result = self.effects.agent.run_agent_with_retries(
-            TrackedAgentCall(worker_call, AttemptSequence(self.repo, str(plan['id']),
-                               str(catalog_plan['current_revision_sha']) if catalog_plan['current_revision_sha'] is not None else None)),
-            session_id=row['worker_session_id'],
+            TrackedAgentCall(worker_call, AttemptSequence(
+                self.repo, str(plan['id']),
+                str(catalog_plan['current_revision_sha']) if catalog_plan['current_revision_sha'] is not None else None,
+                initial_transition=decision.kind,
+                initial_cause=decision.cause,
+            )),
+            session_id=active_session_id,
         )
         code, message = result
         if feedback_repo is not None and delivery is not None and result.session_id:
             feedback_repo.bind_session(delivery.attempt_id, result.session_id)
-        if result.session_id:
-            self.effects.state.update_project(self.repo, worker_session_id=result.session_id)
+        if result.session_id and observed_session_id != result.session_id:
+            session_started(result.session_id)
         try:
             self.plan = self.effects.agent.validate_worker_workspace_scope(
                 self.repo_path,

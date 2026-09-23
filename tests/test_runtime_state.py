@@ -12,6 +12,50 @@ from scoped_blocking import BlockReasonCode
 
 
 class RuntimeStateRepositoryTest(unittest.TestCase):
+    def test_worker_transition_cas_preserves_execution_evidence(self):
+        from worker_session import SessionBinding, decide_session
+        from agent_invocation import ResolvedProfile
+
+        connection = self._connection()
+        self.addCleanup(connection.close)
+        repository = runtime_state.RuntimeStateRepository(connection)
+        repository.activate('repo', 'G-047', activation_sha='base',
+                            branch='loop-manager/G-047', worktree='/state/G-047')
+        old = SessionBinding('codex', 'old', 'low')
+        repository.update_project('repo', {
+            'worker_session_id': 'old-session',
+            'worker_session_binding': old.serialize(),
+            'worker_result': 'saved work', 'verify_result': 'raw verify',
+            'review_result': 'raw review', 'publication_token': 'published',
+        })
+        before = repository.projected('repo')
+        pending = decide_session('old-session', old, None, 'codex',
+                                 ResolvedProfile('new', 'high'), 'change-one').transition
+        intent = repository.transition_from_snapshot(before,
+            plan_values={'worker_session_id': None,
+                         'worker_session_transition': pending.serialize()},
+            project_values={'worker_session_id': None,
+                            'worker_session_transition': pending.serialize()})
+        self.assertIsNone(intent.worker_session_id)
+        self.assertEqual(intent.worker_session_transition, pending.serialize())
+        self.assertEqual((intent.worker_result, intent.verify_result,
+                          intent.review_result, intent.publication_token),
+                         ('saved work', 'raw verify', 'raw review', 'published'))
+        with self.assertRaises(runtime_state.RuntimeStateError):
+            repository.observe_worker_session(before, pending.identity,
+                                              'new-session', pending.target.serialize())
+        with self.assertRaises(runtime_state.RuntimeStateError):
+            repository.observe_worker_session(intent, 'wrong',
+                                              'new-session', pending.target.serialize())
+        with self.assertRaises(runtime_state.RuntimeStateError):
+            repository.observe_worker_session(intent, pending.identity,
+                                              'new-session', old.serialize())
+        observed = repository.observe_worker_session(intent, pending.identity,
+            'new-session', pending.target.serialize())
+        self.assertEqual(observed.worker_session_id, 'new-session')
+        self.assertIsNone(observed.worker_session_transition)
+        self.assertEqual(observed.worker_session_binding, pending.target.serialize())
+
     def test_nonfinal_recovery_decision_cannot_enter_block_transaction(self):
         connection = self._connection()
         repository = runtime_state.RuntimeStateRepository(connection)

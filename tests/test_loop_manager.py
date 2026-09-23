@@ -17,6 +17,51 @@ from pathlib import Path
 from unittest import mock
 
 import loop_manager
+from worker_session import SessionBinding
+
+
+_real_agent_profile = loop_manager._agent_profile
+_real_execution_ports = loop_manager._ExecutionLifecyclePorts
+_dummy_profile_patch = None
+_saved_session_patch = None
+
+
+def _profile_for_dummy_worker_config(config_path, provider, role_name, level, worktree):
+    """Agent fakes use unused.ini; give their new preflight a resolved identity."""
+    if role_name == "worker" and Path(config_path).name == "unused.ini" and not Path(config_path).exists():
+        return loop_manager.AgentProfile("fixture-worker-model", "medium")
+    return _real_agent_profile(config_path, provider, role_name, level, worktree)
+
+
+def _ports_with_bound_dummy_sessions(connection, repository, **identity):
+    # Earlier runtime fixtures predate G-041 and store only the fake session
+    # ID. Bind that ID to the fake provider profile when exercising a resume.
+    if Path(identity["config_path"]).name == "unused.ini":
+        saved = repository.projected(identity["repo"])
+        if saved and saved.worker_session_id and saved.worker_session_binding is None:
+            repository.update_project(identity["repo"], {
+                "worker_session_binding": SessionBinding(
+                    identity["provider"], "fixture-worker-model", "medium",
+                ).serialize(),
+            }, enqueue=False)
+    return _real_execution_ports(connection, repository, **identity)
+
+
+def setUpModule():
+    global _dummy_profile_patch, _saved_session_patch
+    _dummy_profile_patch = mock.patch.object(
+        loop_manager, "_agent_profile", side_effect=_profile_for_dummy_worker_config,
+    )
+    _dummy_profile_patch.start()
+    _saved_session_patch = mock.patch.object(
+        loop_manager, "_ExecutionLifecyclePorts", side_effect=_ports_with_bound_dummy_sessions,
+    )
+    _saved_session_patch.start()
+
+
+def tearDownModule():
+    _saved_session_patch.stop()
+    _dummy_profile_patch.stop()
 
 
 def make_catalog_root(directory: str) -> Path:
@@ -6692,6 +6737,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "scoped_blocking.py",
                 "validation_feedback.py",
                 "validation_feedback_state.py",
+                "worker_session.py",
             ):
                 shutil.copy(loop_manager.ROOT / module_name, repo / module_name)
             (repo / ".gitignore").write_text("__pycache__/\n", encoding="utf-8")

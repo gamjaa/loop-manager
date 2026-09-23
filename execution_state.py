@@ -43,6 +43,9 @@ class ExecutionStatePort:
             or current.status != context.phase.value
             or current.active_sha != context.active_sha
             or current.worker_result != context.worker_result
+            or current.worker_session_id != context.worker_session_id
+            or current.worker_session_binding != context.worker_session_binding
+            or current.worker_session_transition != context.worker_session_transition
             or current.validated_base_sha != context.validated_base_sha
             or current.branch != context.branch
             or current.worktree != str(context.worktree)
@@ -89,6 +92,13 @@ class ExecutionStatePort:
             self.expected = self.repository.transition_from_snapshot(
                 expected,
                 plan_values=plan_values, project_values=values,
+            )
+
+    def observe_worker_session(self, transition_id, session_id, binding):
+        with self.connection:
+            expected = self.check()
+            self.expected = self.repository.observe_worker_session(
+                expected, transition_id, session_id, binding,
             )
 
     def correct_checkpoint(self, *, phase, active_sha, validated_base_sha,
