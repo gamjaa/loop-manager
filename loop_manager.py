@@ -1411,6 +1411,8 @@ def _git_tree_entries(repo: Path, revision: str) -> dict[bytes, tuple[bytes, byt
 def revision_execplan_snapshot(
     repo: Path,
     revision: str,
+    *,
+    archive_conflict_plan_ids: frozenset[str] = frozenset(),
 ) -> execplan_catalog.ExecPlanCatalogSnapshot:
     """Read and fully validate active/archive plans from one immutable tree."""
 
@@ -1463,15 +1465,34 @@ def revision_execplan_snapshot(
         available_regular_paths=frozenset(regular_paths),
         invalid_plan_entries=invalid_plan_entries,
         revision_sha=revision_sha,
+        archive_conflict_plan_ids=archive_conflict_plan_ids,
+    )
+
+
+def _merged_execplan_ids(
+    connection: sqlite3.Connection, repo: str
+) -> frozenset[str]:
+    return frozenset(
+        str(row[0])
+        for row in connection.execute(
+            "SELECT plan_id FROM exec_plans WHERE repo = ? AND status = 'MERGED'",
+            (repo,),
+        )
     )
 
 
 class _GitCatalogDefinitionPort:
     """Pin catalog reads to a fetched remote ref without consulting worktrees."""
 
-    def __init__(self, repo: Path, remote_ref: str):
+    def __init__(
+        self,
+        repo: Path,
+        remote_ref: str,
+        archive_conflict_plan_ids: Callable[[], frozenset[str]],
+    ):
         self.repo = repo
         self.remote_ref = remote_ref
+        self.archive_conflict_plan_ids = archive_conflict_plan_ids
 
     def current_revision(self) -> str:
         return git(
@@ -1484,7 +1505,11 @@ class _GitCatalogDefinitionPort:
     def load(self) -> execplan_catalog_state.PinnedCatalog:
         revision_sha = self.current_revision()
         try:
-            snapshot = revision_execplan_snapshot(self.repo, revision_sha)
+            snapshot = revision_execplan_snapshot(
+                self.repo,
+                revision_sha,
+                archive_conflict_plan_ids=self.archive_conflict_plan_ids(),
+            )
         except execplan_catalog.ExecPlanCatalogError as error:
             tree = _git_tree_entries(self.repo, revision_sha)
             evidence = []
@@ -1526,7 +1551,9 @@ def reconcile_execplan_catalog(
     """Converge declaration cache or persist a recoverable project diagnostic."""
 
     port = _GitCatalogDefinitionPort(
-        repo_path, f"refs/remotes/origin/{base_branch}"
+        repo_path,
+        f"refs/remotes/origin/{base_branch}",
+        lambda: _merged_execplan_ids(connection, repo),
     )
     result = execplan_catalog_state.CatalogReconciliationService(
         execplan_catalog_state.DefinitionStateRepository(connection),
@@ -3603,7 +3630,13 @@ def _migrate_execplan_catalog(
                 continue
             root = Path(str(project["repo"]))
             revision = f"refs/remotes/origin/{project['base_branch']}"
-            snapshot = revision_execplan_snapshot(root, revision)
+            snapshot = revision_execplan_snapshot(
+                root,
+                revision,
+                archive_conflict_plan_ids=_merged_execplan_ids(
+                    connection, str(project["repo"])
+                ),
+            )
             active_path = str(project["plan_path"] or "")
             rows = connection.execute(
                 "SELECT plan_id, path, content_hash, plan_sha, status, "
@@ -13248,9 +13281,15 @@ def _later_published_execplan(
 def _revision_execplan_catalog(
     repo_path: Path,
     revision: str,
+    *,
+    archive_conflict_plan_ids: frozenset[str] = frozenset(),
 ) -> dict[str, dict[str, object]]:
     try:
-        snapshot = revision_execplan_snapshot(repo_path, revision)
+        snapshot = revision_execplan_snapshot(
+            repo_path,
+            revision,
+            archive_conflict_plan_ids=archive_conflict_plan_ids,
+        )
     except RuntimeError as error:
         raise RequirementArchiveError(
             f"Git revision의 ExecPlan source 관계를 확정할 수 없습니다: {error}"
@@ -13289,7 +13328,14 @@ def requirement_archive_candidates(
     if not _stored_requirement_sources(rows):
         return ()
 
-    catalog = _revision_execplan_catalog(repo_path, revision)
+    catalog = _revision_execplan_catalog(
+        repo_path,
+        revision,
+        archive_conflict_plan_ids=frozenset(
+            plan_id for plan_id, row in states.items()
+            if str(row["status"]) == "MERGED"
+        ),
+    )
     historical_rows = connection.execute(
         "SELECT plan_id, merge_confirmed FROM execplan_catalog_history "
         "WHERE repo = ? AND currently_archived = 1",
@@ -14021,19 +14067,44 @@ class _ExecPlanArchiveGitPort:
             mode,
             object_type,
             object_id,
-            hashlib.sha256(contents).hexdigest(),
+            execplan_catalog.plan_content_hash(contents),
         )
+
+    def definitions_current(
+        self,
+        base_sha: str,
+        candidates: Sequence[execplan_archive_state.MergedArchiveCandidate],
+    ) -> bool:
+        for candidate in candidates:
+            source = self._entry(base_sha, candidate.active_path)
+            destination = self._entry(base_sha, candidate.archive_path)
+            observed = source if source is not None else destination
+            if observed is None or not observed.regular:
+                return False
+            if observed.content_hash != candidate.content_hash:
+                return False
+        return True
 
     def observe(
         self,
         revision: str,
         candidates: Sequence[execplan_archive_state.MergedArchiveCandidate],
     ) -> tuple[execplan_archive.ArchiveCandidateObservation, ...]:
+        conflicts = execplan_catalog.conflicting_archived_plan_paths(
+            self._manifest(revision)
+        )
         return tuple(
             execplan_archive.ArchiveCandidateObservation(
                 candidate,
                 self._entry(revision, candidate.active_path),
                 self._entry(revision, candidate.archive_path),
+                next(
+                    (
+                        path for path in conflicts.get(candidate.plan_id, ())
+                        if path != candidate.archive_path
+                    ),
+                    None,
+                ),
             )
             for candidate in candidates
         )
@@ -14372,9 +14443,22 @@ def dispatch_execplan_archive_housekeeping(
 ) -> execplan_archive.ArchiveDispatchOutcome:
     """Assemble the archive service and map its result to operator logging."""
 
+    def refresh_candidates(base_sha: str) -> bool:
+        result = reconcile_execplan_catalog(
+            connection, repo_path, repo, base_branch
+        )
+        if result.kind is not execplan_catalog_state.ReconciliationKind.RECONCILED:
+            return False
+        current = git(
+            repo_path, "rev-parse",
+            f"refs/remotes/origin/{base_branch}^{{commit}}",
+        ).stdout.strip()
+        return result.revision_sha == base_sha and current == base_sha
+
     outcome = execplan_archive.ExecPlanArchiveDispatcher(
         execplan_archive_state.ExecPlanArchiveRepository(connection),
         _ExecPlanArchiveGitPort(repo_path, state_dir, repo),
+        refresh_candidates=refresh_candidates,
     ).dispatch(repo, base_branch)
     if outcome.commit_oid:
         operation_print(

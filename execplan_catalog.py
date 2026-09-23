@@ -14,7 +14,7 @@ from pathlib import Path, PurePosixPath
 import re
 import stat
 from types import MappingProxyType
-from typing import AbstractSet, Mapping
+from typing import AbstractSet, Iterable, Mapping
 
 
 PRIORITIES = frozenset({"critical", "high", "normal", "low"})
@@ -24,6 +24,39 @@ _ARCHIVED_PATH = re.compile(
     r"docs/plans/archive/\[(G-\d{3,})\] [^/]+\.md"
 )
 _ACTIVE_REQUIREMENT_PATH = re.compile(r"docs/requirements/[^/]+\.md")
+
+
+def plan_content_hash(content: bytes | str) -> str:
+    """Hash the exact UTF-8 bytes of a validated ExecPlan document."""
+    if isinstance(content, str):
+        content = content.encode("utf-8")
+    return hashlib.sha256(content).hexdigest()
+
+
+def final_content_matches(observed_hash: str, current_hash: str) -> bool:
+    """Check final bytes independently of immutable publication audit bytes."""
+    return bool(current_hash) and observed_hash == current_hash
+
+
+def conflicting_archived_plan_paths(
+    paths: Iterable[str],
+) -> Mapping[str, tuple[str, ...]]:
+    """Find archived paths sharing an ID with an active plan in one tree."""
+    paths = tuple(paths)
+    active_ids = {
+        match.group(1)
+        for path in paths
+        if (match := _ACTIVE_PATH.fullmatch(path)) is not None
+    }
+    conflicts: dict[str, list[str]] = {}
+    for path in paths:
+        match = _ARCHIVED_PATH.fullmatch(path)
+        if match is not None and match.group(1) in active_ids:
+            conflicts.setdefault(match.group(1), []).append(path)
+    return {
+        plan_id: tuple(sorted(conflicts[plan_id]))
+        for plan_id in sorted(conflicts)
+    }
 
 
 class ArchiveDocumentKind(str, Enum):
@@ -389,7 +422,7 @@ def _entry(relative_path: str, text: str, values: Mapping[str, object]) -> ExecP
         complexity=str(values["complexity"]),
         risk=str(values["risk"]),
         priority=str(values["priority"]),
-        content_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        content_hash=plan_content_hash(text),
         text=text,
         archived=archived,
     )
@@ -438,6 +471,7 @@ def snapshot_from_documents(
     available_regular_paths: AbstractSet[str] | None = None,
     invalid_plan_entries: Mapping[str, str] | None = None,
     revision_sha: str | None = None,
+    archive_conflict_plan_ids: AbstractSet[str] = frozenset(),
 ) -> ExecPlanCatalogSnapshot:
     """Build a snapshot from already-read regular-file documents.
 
@@ -517,6 +551,14 @@ def snapshot_from_documents(
         all_entries = {**active, **archived}
         if entry.plan_id in all_entries:
             other = all_entries[entry.plan_id]
+            if (
+                entry.archived
+                and not other.archived
+                and entry.plan_id in archive_conflict_plan_ids
+            ):
+                # Only a validated copy of a SQLite-confirmed MERGED plan
+                # may be handled as an archive candidate path conflict.
+                continue
             raise ExecPlanCatalogError(
                 f"중복 ExecPlan id입니다: {entry.plan_id} "
                 f"({other.path}, {relative_path})",

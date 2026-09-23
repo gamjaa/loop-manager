@@ -16,7 +16,11 @@ import sqlite3
 from typing import Callable, Iterator, Mapping, Protocol
 from uuid import uuid4
 
-from execplan_catalog import ExecPlanCatalogEntry, ExecPlanCatalogSnapshot
+from execplan_catalog import (
+    ExecPlanCatalogEntry,
+    ExecPlanCatalogSnapshot,
+    final_content_matches,
+)
 
 
 HISTORICAL_CATALOG_SCHEMA = """
@@ -1020,11 +1024,10 @@ class CatalogRecoveryService:
                         publication_mismatch = (
                             proof.publication_content_hash != original_hash
                         )
-                        current_mismatch = (
-                            entry.content_hash != current_hash
-                            if trusted_identity
-                            else proof.publication_content_hash
-                            != entry.content_hash
+                        current_mismatch = not final_content_matches(
+                            entry.content_hash,
+                            current_hash if trusted_identity
+                            else proof.publication_content_hash,
                         )
                         if publication_mismatch or current_mismatch:
                             diagnostic = self._diagnostic(
