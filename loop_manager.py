@@ -14024,6 +14024,45 @@ class _ExecPlanArchiveGitPort:
         ]
         git(workspace, "add", "--", *destinations)
 
+    @staticmethod
+    def _commit_archive(workspace: Path, message: str) -> None:
+        """Create a Manager-owned commit without ambient identity or hooks."""
+
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "GIT_AUTHOR_NAME": "Loop Manager",
+                "GIT_AUTHOR_EMAIL": "loop-manager@localhost",
+                "GIT_COMMITTER_NAME": "Loop Manager",
+                "GIT_COMMITTER_EMAIL": "loop-manager@localhost",
+            }
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="loop-manager-execplan-archive-hooks-"
+        ) as hooks_directory:
+            committed = command(
+                [
+                    "git",
+                    "-c",
+                    f"core.hooksPath={hooks_directory}",
+                    "-c",
+                    "commit.gpgSign=false",
+                    "-C",
+                    str(workspace),
+                    "commit",
+                    "-m",
+                    message,
+                ],
+                check=False,
+                env=environment,
+            )
+        if committed.returncode:
+            output = committed.stdout[-6000:].strip()
+            detail = f"archive commit 실패:\n{output}"
+            if is_git_lock_failure(output):
+                raise GitLockError(detail)
+            raise RuntimeError(detail)
+
     def prepare_commit(
         self,
         base_sha: str,
@@ -14077,7 +14116,9 @@ class _ExecPlanArchiveGitPort:
                 "archive commit 직전 원격 base가 변경됐습니다."
             )
         plan_ids = ", ".join(sorted(move.plan_id for move in moves))
-        git(workspace, "commit", "-m", f"Archive merged ExecPlans: {plan_ids}")
+        self._commit_archive(
+            workspace, f"Archive merged ExecPlans: {plan_ids}"
+        )
         commit_oid = git(workspace, "rev-parse", "HEAD").stdout.strip()
         prepared = self._prepared_from_commit(
             base_sha, operation_id, commit_oid, moves

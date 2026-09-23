@@ -14939,6 +14939,51 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
 
 
 class ExecPlanArchiveHousekeepingAdapterTest(unittest.TestCase):
+    def test_archive_commit_ignores_ambient_identity_signing_and_hooks(self):
+        workspace = Path("/archive-worktree")
+        ambient = {
+            "GIT_AUTHOR_NAME": "Ambient Author",
+            "GIT_AUTHOR_EMAIL": "ambient-author@example.test",
+            "GIT_COMMITTER_NAME": "Ambient Committer",
+            "GIT_COMMITTER_EMAIL": "ambient-committer@example.test",
+        }
+        completed = subprocess.CompletedProcess(["git"], 0, "")
+
+        with mock.patch.dict(os.environ, ambient), mock.patch(
+            "loop_manager.command", return_value=completed
+        ) as command_mock:
+            loop_manager._ExecPlanArchiveGitPort._commit_archive(
+                workspace, "Archive merged ExecPlans: G-000"
+            )
+
+        arguments = command_mock.call_args.args[0]
+        environment = command_mock.call_args.kwargs["env"]
+        hooks_config = arguments[2]
+        self.assertEqual(arguments[0:2], ["git", "-c"])
+        self.assertTrue(hooks_config.startswith("core.hooksPath="))
+        self.assertEqual(
+            arguments[3:],
+            [
+                "-c",
+                "commit.gpgSign=false",
+                "-C",
+                str(workspace),
+                "commit",
+                "-m",
+                "Archive merged ExecPlans: G-000",
+            ],
+        )
+        self.assertFalse(Path(hooks_config.partition("=")[2]).exists())
+        self.assertFalse(command_mock.call_args.kwargs["check"])
+        self.assertEqual(environment["GIT_AUTHOR_NAME"], "Loop Manager")
+        self.assertEqual(
+            environment["GIT_AUTHOR_EMAIL"], "loop-manager@localhost"
+        )
+        self.assertEqual(environment["GIT_COMMITTER_NAME"], "Loop Manager")
+        self.assertEqual(
+            environment["GIT_COMMITTER_EMAIL"], "loop-manager@localhost"
+        )
+
     def test_archive_housekeeping_waits_for_due_or_active_maintenance_cycle(self):
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row
