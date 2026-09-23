@@ -27,6 +27,11 @@ from execution_checkpoint import CheckpointAction, assess, observe
 from execution_checkpoint_state import CheckpointRace
 from runtime_state import RuntimeStateError
 from publication_resume import PublicationNext, PublicationResume, assess_publication
+from rebase_correction import (
+    CorrectionAction, CorrectionSource, execute_git_step, next_action, observe_git,
+    stage_evidence_preserved,
+)
+from rebase_correction_state import CorrectionRace, RebaseCorrectionRepository
 
 @dataclass(frozen=True)
 class WorkspaceEffects:
@@ -48,6 +53,7 @@ class WorkspaceEffects:
 class AgentEffects:
     begin_agent_scope: Callable[..., Any]
     capture_git_snapshot: Callable[..., Any]
+    path_signature: Callable[..., str]
     clear_agent_scope: Callable[..., Any]
     validate_agent_scope: Callable[..., Any]
     validate_worker_workspace_scope: Callable[..., Any]
@@ -156,6 +162,7 @@ class ExecutionHandlers:
             effects.blocking.block_active_execplan,
             effects.blocking.block_active_execplan_from_revision,
         )
+        self.rebase_corrections = RebaseCorrectionRepository(effects.state.connection)
 
     def _row(self):
         return self.effects.state.row()
@@ -370,6 +377,101 @@ class ExecutionHandlers:
     def _unmerged_stages(self, worktree):
         return self.effects.workspace.git(worktree, 'ls-files', '-u', '-z').stdout
 
+    def _rebase_observation(self, context, *, target=None, stash_oid=None):
+        checkpoint = self.effects.checkpoint
+        intent = checkpoint.get(self.repo, context.plan.plan_id) if checkpoint else None
+        snapshot = (intent.snapshot or {}) if intent else {}
+        row = self._row()
+        in_progress = self.effects.workspace._rebase_in_progress_for_branch(
+            context.worktree, context.branch
+        )
+        return observe_git(
+            plan_revision=(f'{context.plan.definition_revision_sha}:'
+                           f'{context.plan.content_hash}'),
+            target_base=str(target or (intent.target_base_oid if intent else None)
+                            or row['pr_conflict_base_oid'] or row['active_sha'] or ''),
+            before_head=str((intent.expected_head if intent else None)
+                            or row['pr_conflict_head_oid'] or row['active_sha'] or ''),
+            source=(CorrectionSource.REBASE if in_progress
+                    else CorrectionSource.AUTOSTASH),
+            stash_oid=stash_oid or snapshot.get('stash_oid'), worktree=context.worktree,
+            git=self.effects.workspace.git,
+            capture_snapshot=self.effects.agent.capture_git_snapshot,
+        )
+
+    def _rebase_conflict(self, context, detail, *, corrected=False, worker_result=None,
+                         abnormal_result=False, target=None, stash_oid=None,
+                         recovery_reason=RecoveryReason.REBASE_CONFLICT):
+        """Track actual Git progress before considering the final safety gate."""
+        try:
+            observation = self._rebase_observation(
+                context, target=target, stash_oid=stash_oid,
+            )
+            if not observation.target_base or not observation.before_head:
+                return self._recover(
+                    RecoveryReason.OWNERSHIP_UNCERTAIN,
+                    'rebase intent cannot identify its original head and target base',
+                    context=context,
+                    final_block_reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE,
+                )
+            if observation.source is CorrectionSource.AUTOSTASH and not observation.stash_oid:
+                return self._recover(
+                    RecoveryReason.OWNERSHIP_UNCERTAIN, 'autostash_identity_unavailable',
+                    context=context,
+                    final_block_reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE,
+                )
+            current = self.rebase_corrections.get(self.repo, context.plan.plan_id)
+            saved = self.rebase_corrections.observe(
+                self.repo, context.plan.plan_id, observation,
+                corrected=corrected,
+                expected_generation=current.generation if current else None,
+                worker_session=self._row()['worker_session_id'],
+                worker_result=worker_result,
+                # This result has been consumed by the correction decision.
+                # Only finish_turn() may retain an unconsumed result for restart.
+                persist_worker_result=False,
+            )
+        except CorrectionRace:
+            return self._recover(RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                                 'rebase correction generation changed', context=context)
+        except (RuntimeError, OSError, ValueError) as error:
+            return self._recover(
+                classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
+                str(error), context=context,
+            )
+        # An abnormal Agent exit is the first failed correction. Block only
+        # after three further identical, progress-free results.
+        correction_limit = 4 if abnormal_result else 3
+        if saved.occurrence >= correction_limit:
+            attempts = [
+                {
+                    'occurrence': event['occurrence'],
+                    'fingerprint': event['fingerprint'],
+                    'progress': event['progress'],
+                    'worker_result': str(event.get('worker_result') or '')[-1000:],
+                }
+                for event in saved.audit if event['occurrence'] > 0
+            ][-3:]
+            detail = (
+                f'{detail}\n동일 충돌·진전 없는 Worker correction {saved.occurrence}회; '
+                f'마지막 Worker 결과: {worker_result or self._row()["worker_result"] or ""}; '
+                f'보존된 worktree: {context.worktree}; '
+                f'기존 HEAD: {saved.before_head}; 대상 base: {saved.target_base}; '
+                f'Worker session: {saved.worker_session}; '
+                f'fingerprint: {saved.fingerprint}; progress: {saved.progress}; '
+                f'수행한 correction: {json.dumps(attempts, ensure_ascii=False)}'
+            )
+            return self._recover(
+                RecoveryReason.REBASE_CONFLICT, detail, context=context,
+                fingerprint=saved.fingerprint, progress_marker=saved.progress,
+                correction_limit=1,
+            )
+        return self._recover(
+            recovery_reason, detail, context=context,
+            fingerprint=saved.fingerprint, progress_marker=saved.progress,
+            correction_limit=10**9,
+        )
+
     def _record_rebase_intent(self, context, target_oid):
         checkpoint = self.effects.checkpoint
         if checkpoint is None:
@@ -447,13 +549,54 @@ class ExecutionHandlers:
             'files': {path: signature for path, (_, signature) in observed.dirty.items()},
         }
 
-    def _post_rebase_observation(self, context, target_oid, output):
+    def _stage_rebase_correction(self, context):
+        """Stage only paths accepted by the Worker scope validator."""
+        checkpoint = self.effects.checkpoint
+        intent = checkpoint.get(self.repo, context.plan.plan_id) if checkpoint else None
+        accepted = (intent.snapshot or {}).get('stage_evidence') if intent else None
+        observed = self._rebase_stage_evidence(context)
+        tracked = self.effects.workspace.git(
+            context.worktree, 'ls-files', '--cached', '-z'
+        ).stdout
+        untracked = self.effects.workspace.git(
+            context.worktree, 'ls-files', '--others', '--exclude-standard', '-z'
+        ).stdout
+        tracked_paths = {path for path in tracked.split('\0') if path}
+        if accepted is not None and not self._stage_evidence_preserved(
+            context, accepted, observed, tracked_paths
+        ):
+            raise RecoveryFailure(
+                RecoveryReason.OWNERSHIP_UNCERTAIN,
+                'rebase correction changed after Worker scope validation',
+            )
+        stageable = tracked_paths | {path for path in untracked.split('\0') if path}
+        paths = set(observed['files']) & stageable
+        return execute_git_step(
+            CorrectionAction.STAGE, git=self.effects.workspace.git,
+            worktree=context.worktree, paths=tuple(sorted(paths)),
+        )
+
+    def _stage_evidence_preserved(self, context, accepted, observed, tracked_paths):
+        accepted_files = accepted.get('files') if isinstance(accepted, dict) else None
+        disappeared = (accepted_files.keys() - observed['files'].keys()
+                       if isinstance(accepted_files, dict) else set())
+        clean_signatures = {
+            path: self.effects.agent.path_signature(context.worktree, path)
+            for path in disappeared & tracked_paths
+        }
+        return stage_evidence_preserved(
+            accepted, observed, tracked_paths, clean_signatures,
+        )
+
+    def _post_rebase_observation(self, context, target_oid, output, *, corrected=False,
+                                 worker_result=None):
         """A successful exit may leave autostash conflicts without rebase metadata."""
         unmerged = self._unmerged_stages(context.worktree)
         in_progress = self.effects.workspace._rebase_in_progress_for_branch(
             context.worktree, context.branch
         )
         checkpoint = self.effects.checkpoint
+        stash_oid = None
         if checkpoint is not None and unmerged:
             current = checkpoint.get(self.repo, context.plan.plan_id)
             stash_match = re.search(r'Created autostash: ([0-9a-fA-F]{7,64})', output)
@@ -506,7 +649,11 @@ class ExecutionHandlers:
             self.repo, phase='WORKING', validated_base_sha=None,
             last_error=message,
         )
-        return self._recover(RecoveryReason.REBASE_CONFLICT, message, context=context)
+        return self._rebase_conflict(
+            context, message, corrected=corrected, worker_result=worker_result,
+            target=target_oid,
+            stash_oid=(stash_oid if unmerged and not in_progress else None),
+        )
 
     def _complete_rebase_intent(self, context):
         checkpoint = self.effects.checkpoint
@@ -727,8 +874,7 @@ class ExecutionHandlers:
             if (current.operation == 'rebase'
                     and decision.action not in {CheckpointAction.USER_ACTION, CheckpointAction.PAUSE}
                     and (current.snapshot or {}).get('pending') == 'stage'
-                    and (current.snapshot or {}).get('worker_result')
-                    and not snapshot.unmerged_stages):
+                    and (current.snapshot or {}).get('worker_result')):
                 saved_evidence = (current.snapshot or {}).get('stage_evidence')
                 observed_evidence = self._rebase_stage_evidence(context)
                 unstaged = self.effects.workspace.git(
@@ -737,7 +883,14 @@ class ExecutionHandlers:
                 if unstaged.returncode not in {0, 1}:
                     return self._recover(RecoveryReason.STATUS_FAILED,
                                          'stage resume worktree observation failed', context=context)
-                if saved_evidence != observed_evidence:
+                tracked_paths = {
+                    path for path in self.effects.workspace.git(
+                        context.worktree, 'ls-files', '--cached', '-z',
+                    ).stdout.split('\0') if path
+                }
+                if not self._stage_evidence_preserved(
+                    context, saved_evidence, observed_evidence, tracked_paths
+                ):
                     return self._recover(
                         RecoveryReason.OWNERSHIP_UNCERTAIN,
                         'staged rebase correction changed since Worker validation',
@@ -749,8 +902,17 @@ class ExecutionHandlers:
                 ).stdout
                 # The intent precedes staging. Identical accepted contents
                 # may still need staging, including accepted new files.
-                if unstaged.returncode == 1 or untracked:
-                    self.effects.workspace.git(context.worktree, 'add', '-A')
+                if unstaged.returncode == 1 or untracked or snapshot.unmerged_stages:
+                    try:
+                        stage = self._stage_rebase_correction(context)
+                    except (RuntimeError, OSError) as error:
+                        return self._recover(
+                            classify_exception(error, operation=RecoveryReason.STAGE_FAILED),
+                            str(error), context=context,
+                        )
+                    if stage.returncode:
+                        return self._recover(RecoveryReason.STAGE_FAILED,
+                                             stage.output[-8000:], context=context)
                 resumed = self._finish_worker(
                     replace(context, resolving_rebase=True), row,
                     current.snapshot['worker_result'], staged=True,
@@ -770,22 +932,31 @@ class ExecutionHandlers:
                     return self._recover(RecoveryReason.STAGE_FAILED,
                                          'staged rebase correction observation failed',
                                          context=context)
-                arguments = (
-                    ('rebase', '--skip') if staged.returncode == 0 else
-                    ('-c', 'core.editor=true', 'rebase', '--continue')
+                observation = self._rebase_observation(context)
+                action = next_action(
+                    observation, worker_result=True,
+                    staged=staged.returncode == 1,
                 )
-                continued = self.effects.workspace.git(
-                    context.worktree, *arguments, check=False
-                )
+                try:
+                    continued = execute_git_step(
+                        action, git=self.effects.workspace.git,
+                        worktree=context.worktree,
+                    )
+                except (RuntimeError, OSError) as error:
+                    return self._recover(
+                        classify_exception(error, operation=RecoveryReason.REBASE_CONTINUE_FAILED),
+                        str(error), context=context,
+                    )
                 conflict = self._post_rebase_observation(
                     context, str(current.target_base_oid or base_oid),
-                    continued.stdout,
+                    continued.output, corrected=True,
+                    worker_result=(current.snapshot or {}).get('worker_result'),
                 )
                 if conflict is not None:
                     return conflict
                 if continued.returncode:
                     return self._recover(RecoveryReason.REBASE_CONTINUE_FAILED,
-                                         continued.stdout[-8000:], context=context)
+                                         continued.output[-8000:], context=context)
                 self.effects.state.correct_checkpoint(
                     phase='VERIFYING',
                     active_sha=str(current.target_base_oid or base_oid),
@@ -1733,6 +1904,46 @@ class ExecutionHandlers:
         plan = self.plan
         assert catalog_plan is not None and plan is not None
         self.effects.events.operation_log(f"Worker 시작: {plan['id']} {plan['title']}")
+        correction_turn = None
+        if context.resolving_rebase:
+            try:
+                observation = self._rebase_observation(context)
+                current = self.rebase_corrections.get(self.repo, context.plan.plan_id)
+                if current is not None and current.worker_result is not None:
+                    return self._resume_saved_rebase_worker(
+                        context, current, observation,
+                    )
+                if current is not None and current.pending_turn:
+                    # Agent scope retains the pre-turn snapshot across a
+                    # process restart, including partial Worker file edits.
+                    if (observation.progress != current.progress
+                            and row['agent_snapshot'] is None):
+                        return self._recover(
+                            RecoveryReason.OWNERSHIP_UNCERTAIN,
+                            'pending rebase Worker changed files without its scope baseline',
+                            context=context,
+                            final_block_reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE,
+                        )
+                    correction_turn = current
+                else:
+                    current = self.rebase_corrections.observe(
+                        self.repo, context.plan.plan_id, observation,
+                        expected_generation=current.generation if current else None,
+                        worker_session=row['worker_session_id'],
+                    )
+                    correction_turn = self.rebase_corrections.begin_turn(
+                        self.repo, context.plan.plan_id,
+                        expected_generation=current.generation,
+                        session=row['worker_session_id'],
+                    )
+            except CorrectionRace:
+                return self._recover(RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                                     'rebase Worker turn changed', context=context)
+            except (RuntimeError, OSError, ValueError) as error:
+                return self._recover(
+                    classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
+                    str(error), context=context,
+                )
         worker_scope_before = self.effects.agent.begin_agent_scope(
             self.repo,
             context.worktree,
@@ -1814,6 +2025,25 @@ class ExecutionHandlers:
                 classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
                 detail, context=context,
             )
+        if correction_turn is not None:
+            try:
+                marker = self._rebase_observation(context).progress
+                self.rebase_corrections.finish_turn(
+                    self.repo, context.plan.plan_id,
+                    expected_generation=correction_turn.generation,
+                    turn=correction_turn.pending_turn,
+                    session=result.session_id or self._row()['worker_session_id'],
+                    result=message, scope_marker=marker, code=code,
+                    result_kind=result.result_kind.value,
+                )
+            except CorrectionRace:
+                return self._recover(RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                                     'rebase Worker result changed', context=context)
+            except (RuntimeError, OSError, ValueError) as error:
+                return self._recover(
+                    classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
+                    str(error), context=context,
+                )
         self.effects.agent.clear_agent_scope(self.repo)
         guarded = self._post_effect_guard(context)
         if isinstance(guarded, ExecutionOutcome):
@@ -1837,6 +2067,12 @@ class ExecutionHandlers:
             )
             return self._final()
         if code:
+            if context.resolving_rebase:
+                saved_turn = self.rebase_corrections.get(self.repo, context.plan.plan_id)
+                self.rebase_corrections.abandon_turn(
+                    self.repo, context.plan.plan_id,
+                    expected_generation=saved_turn.generation,
+                )
             worker_error = message or f"Agent 종료 코드 {code}"
             if result.result_kind is self.effects.contract.AgentResultKind.TRANSIENT_FAILURE:
                 worker_error = f"{self.effects.contract.TRANSIENT_AGENT_ERROR_PREFIX} {worker_error}"
@@ -1855,9 +2091,9 @@ class ExecutionHandlers:
                 worker_error = self.effects.contract.REBASE_CONFLICT_PREFIX + worker_error
                 self.effects.state.update_project(self.repo, phase='WORKING', last_error=worker_error)
                 self.effects.events.operation_print(worker_error, file=sys.stderr)
-                return self._recover(
-                    RecoveryReason.REBASE_CONFLICT, worker_error,
-                    context=context,
+                return self._rebase_conflict(
+                    context, worker_error, corrected=True, worker_result=message,
+                    abnormal_result=True,
                 )
             else:
                 outcome = ExecutionOutcomeKind.OPERATIONAL_ERROR
@@ -1874,11 +2110,73 @@ class ExecutionHandlers:
                 validation_error = self.effects.contract.REBASE_CONFLICT_PREFIX + validation_error
             self.effects.state.update_project(self.repo, phase='WORKING', last_error=validation_error)
             self.effects.events.operation_print(validation_error, file=sys.stderr)
+            if context.resolving_rebase:
+                return self._rebase_conflict(
+                    context, validation_error, corrected=True, worker_result=message,
+                    recovery_reason=RecoveryReason.WORKER_CORRECTION,
+                )
             return self._recover(
                 RecoveryReason.WORKER_CORRECTION, validation_error,
                 context=context,
             )
         return self._finish_worker(context, row, message)
+
+    def _resume_saved_rebase_worker(self, context, saved, observation):
+        """Consume a completed Agent turn after interruption without invoking it twice."""
+        checkpoint = self.effects.checkpoint
+        intent = checkpoint.get(self.repo, context.plan.plan_id) if checkpoint else None
+        if intent and (intent.snapshot or {}).get('pending') in {'stage', 'continue'}:
+            return self._retry('saved rebase Worker turn awaits Git recovery')
+        if observation.progress != saved.scope_marker:
+            return self._recover(
+                RecoveryReason.OWNERSHIP_UNCERTAIN,
+                'saved rebase Worker result no longer matches the accepted worktree',
+                context=context,
+                final_block_reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE,
+            )
+        if self._row()['agent_snapshot'] is not None:
+            self.effects.agent.clear_agent_scope(self.repo)
+        if saved.worker_code:
+            self.rebase_corrections.abandon_turn(
+                self.repo, context.plan.plan_id,
+                expected_generation=saved.generation,
+            )
+            detail = self.effects.contract.REBASE_CONFLICT_PREFIX + (
+                saved.worker_result or f'Agent 종료 코드 {saved.worker_code}'
+            )
+            self.effects.state.update_project(self.repo, phase='WORKING', last_error=detail)
+            if saved.result_kind == 'usage_limit':
+                return ExecutionOutcome(ExecutionOutcomeKind.USAGE_PAUSE,
+                                        detail=detail)
+            if saved.result_kind == 'transient_failure':
+                return self._recover(RecoveryReason.SERVICE_UNAVAILABLE, detail,
+                                     context=context, attempts=3)
+            return self._rebase_conflict(
+                context, detail, corrected=True, worker_result=saved.worker_result,
+                abnormal_result=True,
+            )
+        guarded = self._post_effect_guard(context)
+        if isinstance(guarded, ExecutionOutcome):
+            return guarded
+        context = guarded
+        if self.effects.agent.inspect_worker_guidance_result(
+            self.repo_path, self.repo, context.worktree, self.catalog_plan,
+            saved.worker_result,
+        ):
+            return self._final()
+        try:
+            self.effects.validation.parse_worker_result(saved.worker_result, self.plan)
+        except self.effects.contract.WorkerResultError as error:
+            detail = self.effects.contract.REBASE_CONFLICT_PREFIX + (
+                f'Worker 결과 검증 실패:\n{error}'
+            )
+            self.effects.state.update_project(self.repo, phase='WORKING', last_error=detail)
+            return self._rebase_conflict(
+                context, detail, corrected=True,
+                worker_result=saved.worker_result,
+                recovery_reason=RecoveryReason.WORKER_CORRECTION,
+            )
+        return self._finish_worker(context, self._row(), saved.worker_result)
 
     def _finish_worker(self, context, row, message, *, staged=False):
         assert self.catalog_plan is not None and self.plan is not None
@@ -1889,11 +2187,21 @@ class ExecutionHandlers:
                 self._record_rebase_suboperation(
                     context, 'stage', worker_result=message,
                 )
-                self.effects.workspace.git(context.worktree, 'add', '-A')
+                try:
+                    stage = self._stage_rebase_correction(context)
+                except (RuntimeError, OSError) as error:
+                    return self._recover(
+                        classify_exception(error, operation=RecoveryReason.STAGE_FAILED),
+                        str(error), context=context,
+                    )
+                if stage.returncode:
+                    return self._recover(RecoveryReason.STAGE_FAILED,
+                                         stage.output[-8000:], context=context)
             if self._unmerged_stages(context.worktree):
                 detail = self.effects.contract.REBASE_CONFLICT_PREFIX + 'unmerged index remains after Worker correction'
                 self.effects.state.update_project(self.repo, phase='WORKING', last_error=detail)
-                return self._recover(RecoveryReason.REBASE_CONFLICT, detail, context=context)
+                return self._rebase_conflict(context, detail, corrected=True,
+                                             worker_result=message)
             staged = self.effects.workspace.git(context.worktree, 'diff', '--cached', '--quiet', check=False)
             if staged.returncode not in {0, 1}:
                 staging_error = f"rebase 충돌 해결 결과 확인 실패 (git 종료 코드 {staged.returncode})."
@@ -1901,33 +2209,45 @@ class ExecutionHandlers:
                 return self._recover(RecoveryReason.STAGE_FAILED, staging_error,
                                      context=context)
             self._record_rebase_suboperation(context, 'continue')
-            rebase_metadata = self.effects.workspace._rebase_in_progress_for_branch(
-                context.worktree, context.branch
+            observation = self._rebase_observation(context)
+            action = next_action(
+                observation, worker_result=True, staged=staged.returncode == 1,
             )
-            if not rebase_metadata:
-                # Autostash application can conflict after Git has removed its
-                # rebase directory. The resolved index is the original patch.
-                continued = type('GitResult', (), {'returncode': 0, 'stdout': ''})()
-            elif staged.returncode == 0:
-                continued = self.effects.workspace.git(context.worktree, 'rebase', '--skip', check=False)
-            else:
-                continued = self.effects.workspace.git(
-                    context.worktree,
-                    '-c', 'core.editor=true', 'rebase', '--continue',
-                    check=False,
+            if action is CorrectionAction.USER_ACTION:
+                return self._recover(
+                    RecoveryReason.OWNERSHIP_UNCERTAIN,
+                    'autostash_identity_unavailable', context=context,
+                    final_block_reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE,
                 )
+            try:
+                continued = execute_git_step(
+                    action, git=self.effects.workspace.git, worktree=context.worktree,
+                )
+            except (RuntimeError, OSError) as error:
+                return self._recover(
+                    classify_exception(error, operation=RecoveryReason.REBASE_CONTINUE_FAILED),
+                    str(error), context=context,
+                )
+            if continued.returncode and not self._unmerged_stages(context.worktree):
+                if self.effects.workspace._rebase_in_progress_for_branch(
+                    context.worktree, context.branch
+                ):
+                    return self._recover(
+                        RecoveryReason.REBASE_CONTINUE_FAILED,
+                        continued.output[-8000:], context=context,
+                    )
             post_conflict = self._post_rebase_observation(
                 context, str(
                     (self.effects.checkpoint.get(self.repo, context.plan.plan_id).target_base_oid
                      if self.effects.checkpoint is not None else None)
                     or row['pr_conflict_base_oid'] or row['active_sha'] or ''
                 ),
-                continued.stdout,
+                continued.output, corrected=True, worker_result=message,
             )
             if post_conflict is not None:
                 return post_conflict
             if continued.returncode:
-                continuation_error = self.effects.contract.REBASE_CONFLICT_PREFIX + continued.stdout[-8000:]
+                continuation_error = self.effects.contract.REBASE_CONFLICT_PREFIX + continued.output[-8000:]
                 in_progress = self.effects.workspace._rebase_in_progress_for_branch(context.worktree, context.branch)
                 if in_progress:
                     self.effects.state.update_project(self.repo, phase='WORKING', last_error=continuation_error)

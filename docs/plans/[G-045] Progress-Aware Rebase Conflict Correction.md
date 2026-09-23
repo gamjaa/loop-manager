@@ -57,11 +57,11 @@ priority: critical
 
 ## Progress
 
-- [ ] conflict fingerprint/progress pure policy와 occurrence repository 구현
-- [ ] LatestBase/PR-conflict adapter의 공통 correction engine 통합
-- [ ] durable Worker turn identity와 no-progress CAS 적용
-- [ ] G-044 stage/continue operation 재관측 연결
-- [ ] 진전·순환·중단·최종 차단 targeted 회귀 테스트 추가
+- [x] conflict fingerprint/progress pure policy와 occurrence repository 구현
+- [x] LatestBase/PR-conflict adapter의 공통 correction engine 통합
+- [x] durable Worker turn identity와 no-progress CAS 적용
+- [x] G-044 stage/continue operation 재관측 연결
+- [x] 진전·순환·중단·최종 차단 targeted 회귀 테스트 추가
 
 ## Decision Log
 
