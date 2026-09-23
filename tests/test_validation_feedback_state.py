@@ -80,6 +80,43 @@ class ValidationFeedbackStateTests(unittest.TestCase):
         self.repo.delivered(first.attempt_id, "session")
         self.assertEqual([row["identity"] for row in self.pending().rows], ["verify:B"])
 
+    def test_resolved_undelivered_issue_keeps_diagnostic_on_recurrence(self):
+        issue = Feedback("verify", "verify:A", "fix A")
+        self.observe("verify", "A", (issue,))
+        self.pending()  # An interrupted invocation does not establish delivery.
+        self.observe("verify", "clear", passed=True)
+        empty = self.pending()
+        self.assertEqual(empty.rows, ())
+        self.repo.delivered(empty.attempt_id, "session")
+        self.observe("verify", "A returns", (issue,))
+        recurrence = self.pending()
+        self.assertEqual(recurrence.rows[0]["diagnostic"], "fix A")
+        self.assertEqual((recurrence.rows[0]["occurrence"],
+                          recurrence.rows[0]["revision"]), (2, 3))
+        self.repo.delivered(recurrence.attempt_id, "session")
+        self.observe("verify", "A repeats", (issue,))
+        self.assertEqual(self.pending().rows[0]["diagnostic"], "")
+
+    def test_ambiguous_legacy_verify_history_is_not_guessed(self):
+        self.connection.execute(
+            "CREATE TABLE exec_plans (repo TEXT,plan_id TEXT,current_revision_sha TEXT,"
+            "verify_result TEXT,review_result TEXT,verify_failure_history TEXT,"
+            "review_failure_history TEXT,worker_session_id TEXT)"
+        )
+        history = '{"A":{"occurrences":2},"B":{"occurrences":1}}'
+        legacy = ("repo", "G-040", "revision", "truncated B diagnostic", None,
+                  history, "{}", "session")
+        self.connection.execute("INSERT INTO exec_plans VALUES (?,?,?,?,?,?,?,?)", legacy)
+        self.repo.migrate_legacy()
+        self.repo.migrate_legacy()
+        self.assertEqual(self.pending().rows, ())
+        self.assertEqual(tuple(self.connection.execute(
+            "SELECT * FROM exec_plans").fetchone()), legacy)
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM validation_results").fetchone()[0], 0)
+        self.observe("verify", "new B", (Feedback("verify", "verify:B", "fix B"),))
+        self.assertEqual(self.pending().rows[0]["identity"], "verify:B")
+
     def test_legacy_migration_keeps_old_columns_and_seeds_parseable_failure(self):
         self.connection.execute(
             "CREATE TABLE exec_plans (repo TEXT,plan_id TEXT,current_revision_sha TEXT,"

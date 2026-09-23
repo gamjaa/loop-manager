@@ -79,6 +79,11 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
             plan_id TEXT NOT NULL,
             PRIMARY KEY (repo, plan_id)
         );
+        CREATE TABLE IF NOT EXISTS validation_delivery_items (
+            attempt_id TEXT NOT NULL REFERENCES validation_delivery_attempts(id),
+            sequence INTEGER NOT NULL REFERENCES validation_feedback_events(sequence),
+            PRIMARY KEY (attempt_id, sequence)
+        );
     """
     for statement in schema.split(";"):
         if statement.strip():
@@ -226,9 +231,10 @@ class ValidationFeedbackRepository:
             for row in rows:
                 prior = self.connection.execute(
                     "SELECT e.diagnostic FROM validation_feedback_events e "
-                    "JOIN validation_delivery_attempts a ON a.repo=e.repo "
+                    "JOIN validation_delivery_items i ON i.sequence=e.sequence "
+                    "JOIN validation_delivery_attempts a ON a.id=i.attempt_id AND a.repo=e.repo "
                     "AND a.plan_id=e.plan_id AND a.session_id=? AND a.status='delivered' "
-                    "AND e.sequence<=a.sequence WHERE e.repo=? AND e.plan_id=? "
+                    "WHERE e.repo=? AND e.plan_id=? "
                     "AND e.identity=? AND e.active=1 ORDER BY e.sequence DESC LIMIT 1",
                     (session_id, repo, plan_id, row["identity"]),
                 ).fetchone() if session_id and not recovery else None
@@ -247,6 +253,10 @@ class ValidationFeedbackRepository:
                 "VALUES (?,?,?,?,?,?,'pending',?)",
                 (attempt_id, repo, plan_id, session_id, maximum, int(recovery),
                  datetime.now(timezone.utc).isoformat()),
+            )
+            self.connection.executemany(
+                "INSERT INTO validation_delivery_items (attempt_id,sequence) VALUES (?,?)",
+                [(attempt_id, row["sequence"]) for row in rows],
             )
             return Delivery(attempt_id, tuple(rendered), recovery)
 
@@ -336,7 +346,11 @@ class ValidationFeedbackRepository:
                         if not raw or not isinstance(history, dict) or not history:
                             continue
                         if stage == "verify":
-                            fingerprint = sorted(history)[0]
+                            if len(history) != 1:
+                                # Rolling history has no latest-result link. A
+                                # truncated raw result cannot establish one.
+                                continue
+                            fingerprint = next(iter(history))
                             feedback = (Feedback(stage, "verify:" + fingerprint,
                                                  bounded_diagnostic(str(raw))),)
                         else:

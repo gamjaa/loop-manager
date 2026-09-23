@@ -257,6 +257,37 @@ class ExecutionHandlerTests(TestCase):
             "SELECT classification FROM validation_results ORDER BY id"
         ).fetchall()[0][0], 'failure')
 
+    def test_review_retry_audits_each_returned_attempt(self):
+        self._with_feedback(ValidationFeedbackRepository(self.connection))
+        self.effects.agent.run_agent_with_retries.side_effect = lm.run_agent_with_retries
+        self.effects.validation.parse_reviewer_result.side_effect = lm.parse_reviewer_result
+        raw = 'service unavailable: original reviewer output'
+        self.effects.agent.run_agent.side_effect = [
+            lm.AgentResult(1, raw, kind=lm.AgentResultKind.TRANSIENT_FAILURE),
+            lm.AgentResult(0, 'VERDICT: PASS'),
+        ]
+        self.handler.review(self.context('REVIEWING'))
+        audit = self.connection.execute(
+            "SELECT classification,raw_output FROM validation_results ORDER BY id"
+        ).fetchall()
+        self.assertEqual([tuple(row) for row in audit],
+                         [('transient_failure', raw), ('success', 'VERDICT: PASS')])
+
+    def test_review_retry_interruption_preserves_previous_raw_result(self):
+        self._with_feedback(ValidationFeedbackRepository(self.connection))
+        self.effects.agent.run_agent_with_retries.side_effect = lm.run_agent_with_retries
+        raw = 'service unavailable: retained before retry'
+        self.effects.agent.run_agent.side_effect = [
+            lm.AgentResult(1, raw, kind=lm.AgentResultKind.TRANSIENT_FAILURE),
+            KeyboardInterrupt(),
+        ]
+        with self.assertRaises(KeyboardInterrupt):
+            self.handler.review(self.context('REVIEWING'))
+        audit = self.connection.execute(
+            "SELECT classification,raw_output FROM validation_results ORDER BY id"
+        ).fetchall()
+        self.assertEqual([tuple(row) for row in audit], [('transient_failure', raw)])
+
     def test_invalid_worker_result_keeps_feedback_pending(self):
         feedback = ValidationFeedbackRepository(self.connection)
         self._with_feedback(feedback)

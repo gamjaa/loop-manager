@@ -2765,6 +2765,17 @@ class ExecutionHandlers:
         self.effects.state.update_project(self.repo, phase='REVIEWING', last_error=None)
         return self._advanced()
 
+    def _run_reviewer_attempt(self, context, *args, **kwargs):
+        """Persist returned provider failures before the retry runner advances."""
+        result = self.effects.agent.run_agent(*args, **kwargs)
+        code, raw = result
+        if code and self.effects.feedback is not None:
+            self.effects.feedback.repository.record_result(
+                self.repo, context.plan.plan_id, context.plan.definition_revision_sha,
+                'review', getattr(result, 'ledger_kind', 'agent_failure'), raw,
+            )
+        return result
+
     def review(self, context):
         self.effects.state.check_context(context)
         row = self._row()
@@ -2786,7 +2797,8 @@ class ExecutionHandlers:
                 input_fingerprint=self.effects.agent._worktree_execplan_input_fingerprint(context.worktree, self.catalog_plan),
             )
             review_result = self.effects.agent.run_agent_with_retries(
-                TrackedAgentCall(lambda current_session_id, session_recovery, invocation: self.effects.agent.run_agent(
+                TrackedAgentCall(lambda current_session_id, session_recovery, invocation: self._run_reviewer_attempt(
+                    context,
                     self.provider,
                     context.worktree,
                     self.state_dir,
@@ -2864,11 +2876,6 @@ class ExecutionHandlers:
             context = guarded
             row = self._row()
             if code:
-                if feedback_repo is not None:
-                    feedback_repo.record_result(
-                        self.repo, str(self.plan['id']), context.plan.definition_revision_sha,
-                        'review', 'agent_failure', review,
-                    )
                 reviewer_error = review or f"Reviewer 종료 코드 {code}"
                 if review_result.result_kind is self.effects.contract.AgentResultKind.TRANSIENT_FAILURE:
                     reviewer_error = f"{self.effects.contract.TRANSIENT_AGENT_ERROR_PREFIX} {reviewer_error}"
