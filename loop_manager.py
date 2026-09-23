@@ -77,6 +77,7 @@ import recovery_state
 import recovery_runtime
 import execution_handlers
 import execution_revision
+import execution_checkpoint_state
 from execution_state import ExecutionStatePort as _ExecutionStatePort
 from types import SimpleNamespace
 from maintenance_planning import (
@@ -7688,6 +7689,11 @@ def _capture_agent_baseline(
         # operation. Its scope is still validated, but it cannot use the
         # ordinary HEAD/index tree recovery representation.
         return None
+    if git(worktree, "ls-files", "-u", "-z").stdout:
+        # Autostash can leave an unmerged index after rebase metadata vanishes.
+        # Its stage OIDs are captured by the execution checkpoint, while this
+        # ordinary baseline cannot represent them with write-tree.
+        return None
     index_tree = git(worktree, "write-tree").stdout.strip()
     worktree_tree = _agent_worktree_tree(worktree, snapshot, index_tree)
     baseline_id = hashlib.sha256(
@@ -12801,6 +12807,12 @@ def resume_pr_conflict_rebase(
         or _rebase_in_progress_for_branch(worktree, branch)
     ):
         return None
+    if git(worktree, "ls-files", "-u", "-z").stdout:
+        update_project(
+            connection, repo, phase="WORKING", validated_base_sha=None,
+            last_error=REBASE_CONFLICT_PREFIX + "unmerged index after rebase/autostash",
+        )
+        return 0
     plan = active_execplan(connection, repo)
     target_base = str(project["pr_conflict_base_oid"] or "")
     observed_head = str(project["pr_conflict_head_oid"] or "")
@@ -12867,6 +12879,12 @@ def resume_pr_conflict_rebase(
     rebased = git(worktree, "rebase", target_base, check=False)
     if rebased.returncode and is_git_lock_failure(rebased.stdout):
         raise GitLockError(rebased.stdout[-8000:])
+    if git(worktree, "ls-files", "-u", "-z").stdout:
+        update_project(
+            connection, repo, phase="WORKING", validated_base_sha=None,
+            last_error=REBASE_CONFLICT_PREFIX + rebased.stdout[-8000:],
+        )
+        return 0
     if rebased.returncode == 0:
         update_project(
             connection,
@@ -16691,6 +16709,7 @@ def _ExecutionLifecyclePorts(connection, runtime_repository, **identity):
     state = _ExecutionStatePort(connection, runtime_repository, identity["repo"])
     effects = execution_handlers.ExecutionEffects(
         state=state,
+        checkpoint=execution_checkpoint_state.ExecutionCheckpointRepository(connection),
         contract=SimpleNamespace(**{name: globals()[name] for name in (
             'AgentResultKind', 'AgentScopeError', 'ExecPlanMetadataError',
             'GitLockError', 'MAX_REVIEWER_PROTOCOL_ATTEMPTS',
@@ -16716,6 +16735,7 @@ def _ExecutionLifecyclePorts(connection, runtime_repository, **identity):
             reserve_execplan_workspace=state.bind(reserve_execplan_workspace, name="reserve_execplan_workspace", connected=True, mutates=True),
             mark_execplan_workspace_owned=state.bind(mark_execplan_workspace_owned, name="mark_execplan_workspace_owned", connected=True, mutates=True),
             resume_pr_conflict_rebase=state.bind(resume_pr_conflict_rebase, name="resume_pr_conflict_rebase", connected=True, mutates=True),
+            git_operation_entries=state.bind(_git_operation_entries, name="git_operation_entries", connected=False, mutates=False),
         ),
         agent=execution_handlers.AgentEffects(
             begin_agent_scope=state.bind(begin_agent_scope, name="begin_agent_scope", connected=True, mutates=True),

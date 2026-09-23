@@ -87,6 +87,52 @@ def git_command(repo: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
+def matching_branch_pr_lookup(responses):
+    """Model a PR on the current branch when a publication fixture omits HEAD.
+
+    Resolve lazily: the Worker may commit or rebase before GitHub is queried.
+    Explicit head values remain untouched for stale/external-head scenarios.
+    """
+    iterator = None if callable(responses) else iter(responses)
+
+    def lookup(repo, branch, *args, **kwargs):
+        response = (responses(repo, branch, *args, **kwargs)
+                    if callable(responses) else next(iterator))
+        if response is None or 'headRefOid' in response:
+            return response
+        return {
+            **response,
+            'headRefName': response.get('headRefName', branch),
+            'headRefOid': git_command(repo, 'rev-parse', f'refs/heads/{branch}'),
+        }
+
+    return lookup
+
+
+class PublicationFixtureTest(unittest.TestCase):
+    def test_matching_pr_reads_head_only_when_queried(self):
+        with mock.patch(__name__ + '.git_command', side_effect=['first', 'rebased']) as git:
+            lookup = matching_branch_pr_lookup([None, {'url': 'pr'}, {'url': 'pr'}])
+            git.assert_not_called()
+            self.assertIsNone(lookup(Path('/repo'), 'feature'))
+            git.assert_not_called()
+            self.assertEqual(lookup(Path('/repo'), 'feature')['headRefOid'], 'first')
+            self.assertEqual(lookup(Path('/repo'), 'feature')['headRefOid'], 'rebased')
+            self.assertEqual(git.call_args_list, [
+                mock.call(Path('/repo'), 'rev-parse', 'refs/heads/feature'),
+                mock.call(Path('/repo'), 'rev-parse', 'refs/heads/feature'),
+            ])
+
+    def test_callable_fixture_preserves_explicit_stale_head(self):
+        response = {'url': 'pr', 'headRefName': 'other', 'headRefOid': 'stale'}
+        source = mock.Mock(return_value=response)
+        with mock.patch(__name__ + '.git_command') as git:
+            lookup = matching_branch_pr_lookup(source)
+            self.assertIs(lookup(Path('/repo'), 'feature', 'saved-url'), response)
+            source.assert_called_once_with(Path('/repo'), 'feature', 'saved-url')
+            git.assert_not_called()
+
+
 def make_remote_repository(directory: str) -> Path:
     parent = Path(directory)
     remote = parent / "remote.git"
@@ -3629,7 +3675,11 @@ risk: medium
             (blocked_result, unchanged_result, metadata_result, resumed_result),
             (0, 0, 0, 1),
         )
-        self.assertEqual(roles, ["worker", "worker"])
+        self.assertEqual(
+            roles, ["worker", "worker"],
+            (resumed_result, resumed_project["phase"], resumed_project["last_error"],
+             resumed_plan["status"], resumed_plan["last_error"]),
+        )
         verify.assert_called_once()
         self.assertIsNone(blocked_project["phase"])
         self.assertEqual(blocked_plan["verify_result"], "verify: PASS")
@@ -3926,10 +3976,10 @@ risk: medium
                 "loop_manager.ensure_safe_base_worktree"
             ), mock.patch(
                 "loop_manager.pr_for_branch",
-                side_effect=lambda *_args, **_kwargs: (
+                side_effect=matching_branch_pr_lookup(lambda *_args, **_kwargs: (
                     {"url": "https://example.test/pr/1"}
                     if reviewed else None
-                ),
+                )),
             ), mock.patch(
                 "loop_manager.run_codex", side_effect=worker
             ), mock.patch(
@@ -3987,7 +4037,9 @@ risk: medium
             with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
                 "loop_manager.remote_base", return_value="main"
             ), mock.patch("loop_manager.ensure_safe_base_worktree"), mock.patch(
-                "loop_manager.pr_for_branch", side_effect=[None, {"url": "https://example.test/pr/1"}]
+                "loop_manager.pr_for_branch", side_effect=matching_branch_pr_lookup(
+                    [None, {"url": "https://example.test/pr/1"}]
+                )
             ), mock.patch("loop_manager.run_codex", side_effect=agent), mock.patch(
                 "loop_manager.verify", return_value=(True, "verify: PASS")
             ) as verify, mock.patch("loop_manager.operation_log", side_effect=lambda message, **kwargs: logs.append((message, kwargs))):
@@ -4168,7 +4220,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         ), mock.patch(
             "loop_manager.ensure_safe_base_worktree"
         ), mock.patch(
-            "loop_manager.pr_for_branch", side_effect=existing_pr
+            "loop_manager.pr_for_branch", side_effect=matching_branch_pr_lookup(existing_pr)
         ), mock.patch(
             "loop_manager.run_codex", side_effect=agent
         ), mock.patch(
@@ -4912,7 +4964,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             ), mock.patch(
                 "loop_manager.ensure_safe_base_worktree"
             ), mock.patch(
-                "loop_manager.pr_for_branch", side_effect=pr_results
+                "loop_manager.pr_for_branch", side_effect=matching_branch_pr_lookup(pr_results)
             ), mock.patch(
                 "loop_manager.run_codex", side_effect=agent
             ), mock.patch(
@@ -5206,12 +5258,12 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                 "loop_manager.ensure_safe_base_worktree"
             ), mock.patch(
                 "loop_manager.pr_for_branch",
-                side_effect=[
+                side_effect=matching_branch_pr_lookup([
                     None,
                     None,
                     None,
                     {"url": "https://example.test/pr/13"},
-                ],
+                ]),
             ), mock.patch(
                 "loop_manager.run_codex", side_effect=agent
             ), mock.patch(
@@ -5479,7 +5531,7 @@ class ReviewDrivenWorkerProfileEscalationTest(unittest.TestCase):
         ), mock.patch(
             "loop_manager.ensure_safe_base_worktree"
         ), mock.patch(
-            "loop_manager.pr_for_branch", side_effect=pr_results
+            "loop_manager.pr_for_branch", side_effect=matching_branch_pr_lookup(pr_results)
         ), mock.patch(
             "loop_manager.run_codex", side_effect=agent
         ), mock.patch(
@@ -6127,8 +6179,7 @@ class WorkerPublicationTest(unittest.TestCase):
             with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
                 "loop_manager.remote_base", return_value="main"
             ), mock.patch("loop_manager.ensure_safe_base_worktree"), mock.patch(
-                "loop_manager.pr_for_branch",
-                side_effect=[None, None, None, None],
+                "loop_manager.pr_for_branch", return_value=None,
             ), mock.patch("loop_manager.run_codex", side_effect=agent), mock.patch(
                 "loop_manager.verify",
                 side_effect=[(False, "verify failed"), (True, "verify: PASS"), (True, "verify: PASS")],
@@ -6237,7 +6288,9 @@ class WorkerPublicationTest(unittest.TestCase):
                 "loop_manager.remote_base", return_value="main"
             ), mock.patch("loop_manager.ensure_safe_base_worktree"), mock.patch(
                 "loop_manager.pr_for_branch",
-                side_effect=[None, None, {"url": "https://example.test/pr/1"}],
+                side_effect=matching_branch_pr_lookup(
+                    [None, None, {"url": "https://example.test/pr/1"}]
+                ),
             ), mock.patch("loop_manager.run_codex", side_effect=worker), mock.patch(
                 "loop_manager.verify",
                 side_effect=lambda *_args: (
@@ -6595,6 +6648,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "blocked_checkpoint.py",
                 "blocked_checkpoint_state.py",
                 "loop_manager.py",
+                "execution_checkpoint.py",
+                "execution_checkpoint_state.py",
                 "execution_runtime.py",
                 "execution_handlers.py",
                 "execution_revision.py",
@@ -6611,6 +6666,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "maintenance_state.py",
                 "notifications.py",
                 "planning_runtime.py",
+                "publication_resume.py",
                 "project_registry.py",
                 "recovery_dispatcher.py",
                 "recovery_runtime.py",
@@ -10091,7 +10147,22 @@ class WorkspaceRecoveryTest(unittest.TestCase):
                 "SELECT phase, last_error FROM projects WHERE repo = ?",
                 (str(repo),),
             ).fetchone()
-            self.assertEqual(resumed_result, 1)
+            checkpoint = connection.execute(
+                "SELECT operation, snapshot FROM execution_checkpoints "
+                "WHERE repo = ? AND plan_id = 'G-012'",
+                (str(repo),),
+            ).fetchone()
+            recovery = connection.execute(
+                "SELECT subject, disposition, detail FROM recovery_records "
+                "WHERE repo = ? ORDER BY updated_at DESC LIMIT 1",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(
+                resumed_result, 1,
+                (sessions, resumed["phase"], resumed["last_error"],
+                 dict(checkpoint) if checkpoint else None,
+                 dict(recovery) if recovery else None),
+            )
             self.assertEqual(
                 sessions, ["worker-session", "worker-session"]
             )
@@ -13447,7 +13518,11 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                 """,
                 (str(repo),),
             ).fetchone()
-            self.assertEqual(outcome.kind, loop_manager.ProjectRunKind.BLOCKED)
+            self.assertEqual(
+                outcome.kind, loop_manager.ProjectRunKind.BLOCKED,
+                (outcome.detail, stored["status"],
+                 stored["pr_conflict_recovery"], pushes),
+            )
             self.assertEqual(stored["status"], "PUBLISHING")
             self.assertEqual(stored["pr_conflict_recovery"], 1)
             self.assertEqual(stored["pr_conflict_head_oid"], observed_head)

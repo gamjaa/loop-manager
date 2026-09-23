@@ -1,10 +1,12 @@
 """Execution handlers; all external operations arrive through effect ports."""
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Any
 from pathlib import Path
+from dataclasses import asdict
 import hashlib
 import json
+import re
 import sys
 from scoped_blocking import BlockReasonCode
 from recovery_runtime import (
@@ -21,6 +23,10 @@ from requirement_archive_state import ArchiveTargetRepository, ArchiveTargetConf
 from requirement_archive_recovery import (
     ArchiveRecoveryPorts, ArchiveRecoveryService,
 )
+from execution_checkpoint import CheckpointAction, assess, observe
+from execution_checkpoint_state import CheckpointRace
+from runtime_state import RuntimeStateError
+from publication_resume import PublicationNext, PublicationResume, assess_publication
 
 @dataclass(frozen=True)
 class WorkspaceEffects:
@@ -36,6 +42,7 @@ class WorkspaceEffects:
     reserve_execplan_workspace: Callable[..., Any]
     mark_execplan_workspace_owned: Callable[..., Any]
     resume_pr_conflict_rebase: Callable[..., Any]
+    git_operation_entries: Callable[..., Any] | None = None
 
 @dataclass(frozen=True)
 class AgentEffects:
@@ -118,6 +125,7 @@ class ExecutionEffects:
     blocking: BlockingEffects
     events: EventsEffects
     revision: RevisionEffects
+    checkpoint: Any = None
 
 
 class ExecutionHandlers:
@@ -346,9 +354,512 @@ class ExecutionHandlers:
             row['phase'] == 'WORKING' and (rebase_error == self.effects.contract.REBASE_IN_PROGRESS_ERROR or rebase_error.startswith(self.effects.contract.REBASE_CONFLICT_PREFIX)),
         )
         worktree = Path(str(row['worktree'] or ''))
+        if not rebase_recovery or not self.effects.workspace.is_directory(worktree):
+            return False
+        if self.effects.workspace._rebase_in_progress_for_branch(worktree, str(row['branch'] or '')):
+            return True
+        if int(row['pr_conflict_recovery']) and row['pr_conflict_base_oid']:
+            return bool(self._unmerged_stages(worktree))
+        checkpoint = self.effects.checkpoint
         return bool(
-            rebase_recovery and self.effects.workspace.is_directory(worktree) and self.effects.workspace._rebase_in_progress_for_branch(worktree, str(row['branch'] or '')),
+            checkpoint is not None
+            and checkpoint.get(self.repo, self.catalog_plan['plan_id']).operation == 'rebase'
+            and self._unmerged_stages(worktree)
+        ) if self.catalog_plan is not None else False
+
+    def _unmerged_stages(self, worktree):
+        return self.effects.workspace.git(worktree, 'ls-files', '-u', '-z').stdout
+
+    def _record_rebase_intent(self, context, target_oid):
+        checkpoint = self.effects.checkpoint
+        if checkpoint is None:
+            return
+        current = checkpoint.get(self.repo, context.plan.plan_id)
+        head = self.effects.workspace.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
+        checkpoint.record(
+            self.repo, context.plan.plan_id,
+            expected_generation=current.generation, operation='rebase',
+            expected_head=head, target_base_oid=target_oid,
+            observed_remote_oid=current.observed_remote_oid,
+            snapshot={
+                'before_head': head,
+                'target_base': target_oid,
+                'staged_paths': self.effects.workspace.git(
+                    context.worktree, 'diff', '--cached', '--name-only', '-z'
+                ).stdout.split('\0'),
+                'staged_blobs': self.effects.workspace.git(
+                    context.worktree, 'diff', '--cached', '--raw',
+                    '--no-abbrev', '-z',
+                ).stdout,
+                'worktree_status': self.effects.workspace.git(
+                    context.worktree, 'status', '--porcelain=v2', '-z'
+                ).stdout,
+            },
         )
+
+    def _workspace_boundary(self, plan_id, row, *, pending):
+        checkpoint = self.effects.checkpoint
+        if checkpoint is None:
+            return
+        current = checkpoint.get(self.repo, plan_id)
+        checkpoint.record(
+            self.repo, plan_id, expected_generation=current.generation,
+            operation=current.operation, expected_head=current.expected_head,
+            target_base_oid=current.target_base_oid,
+            observed_remote_oid=current.observed_remote_oid,
+            snapshot={
+                **(current.snapshot or {}),
+                'worktree_recovery_pending': pending,
+                'worktree': str(row['worktree'] or ''),
+                'branch': str(row['branch'] or ''),
+                'stored_active_sha': str(row['active_sha'] or ''),
+            },
+        )
+
+    def _record_rebase_suboperation(self, context, pending, *, worker_result=None):
+        checkpoint = self.effects.checkpoint
+        if checkpoint is None:
+            return
+        current = checkpoint.get(self.repo, context.plan.plan_id)
+        if current.operation != 'rebase':
+            return
+        stage_evidence = (
+            {'stage_evidence': self._rebase_stage_evidence(context)}
+            if pending == 'stage' else {}
+        )
+        checkpoint.record(
+            self.repo, context.plan.plan_id,
+            expected_generation=current.generation, operation='rebase',
+            expected_head=current.expected_head,
+            target_base_oid=current.target_base_oid,
+            observed_remote_oid=current.observed_remote_oid,
+            snapshot={
+                **(current.snapshot or {}), 'pending': pending,
+                'worker_result': worker_result or (current.snapshot or {}).get('worker_result'),
+                **stage_evidence,
+            },
+        )
+
+    def _rebase_stage_evidence(self, context):
+        observed = self.effects.agent.capture_git_snapshot(context.worktree)
+        return {
+            'head': observed.head, 'branch': observed.branch,
+            'files': {path: signature for path, (_, signature) in observed.dirty.items()},
+        }
+
+    def _post_rebase_observation(self, context, target_oid, output):
+        """A successful exit may leave autostash conflicts without rebase metadata."""
+        unmerged = self._unmerged_stages(context.worktree)
+        in_progress = self.effects.workspace._rebase_in_progress_for_branch(
+            context.worktree, context.branch
+        )
+        checkpoint = self.effects.checkpoint
+        if checkpoint is not None and unmerged:
+            current = checkpoint.get(self.repo, context.plan.plan_id)
+            stash_match = re.search(r'Created autostash: ([0-9a-fA-F]{7,64})', output)
+            stash_oid = None
+            if stash_match:
+                resolved = self.effects.workspace.git(
+                    context.worktree, 'rev-parse', '--verify',
+                    f'{stash_match.group(1)}^{{commit}}', check=False,
+                )
+                if resolved.returncode == 0:
+                    stash_oid = resolved.stdout.strip()
+            checkpoint.record(
+                self.repo, context.plan.plan_id,
+                expected_generation=current.generation, operation='rebase',
+                expected_head=current.expected_head,
+                target_base_oid=target_oid,
+                observed_remote_oid=current.observed_remote_oid,
+                snapshot={
+                    **(current.snapshot or {}),
+                    'after_head': self.effects.workspace.git(
+                        context.worktree, 'rev-parse', 'HEAD'
+                    ).stdout.strip(),
+                    'unmerged_index': unmerged,
+                    'stash_oid': stash_oid or (current.snapshot or {}).get('stash_oid'),
+                },
+            )
+            if not in_progress and not (stash_oid or (current.snapshot or {}).get('stash_oid')):
+                return self._recover(
+                    RecoveryReason.OWNERSHIP_UNCERTAIN, 'autostash_identity_unavailable',
+                    context=context,
+                    final_block_reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE,
+                )
+        if not unmerged and not in_progress:
+            if checkpoint is not None:
+                self.effects.workspace.validate_managed_worktree(
+                    self.repo_path, context.worktree, context.branch
+                )
+                ancestry = self.effects.workspace.git(
+                    context.worktree, 'merge-base', '--is-ancestor',
+                    target_oid, 'HEAD', check=False,
+                )
+                if ancestry.returncode != 0:
+                    raise RecoveryFailure(
+                        RecoveryReason.STATUS_FAILED,
+                        'rebase completed without expected target ancestry',
+                    )
+            return None
+        message = self.effects.contract.REBASE_CONFLICT_PREFIX + output[-8000:]
+        self.effects.state.update_project(
+            self.repo, phase='WORKING', validated_base_sha=None,
+            last_error=message,
+        )
+        return self._recover(RecoveryReason.REBASE_CONFLICT, message, context=context)
+
+    def _complete_rebase_intent(self, context):
+        checkpoint = self.effects.checkpoint
+        if checkpoint is None:
+            return
+        current = checkpoint.get(self.repo, context.plan.plan_id)
+        if current.operation != 'rebase':
+            return
+        head = self.effects.workspace.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
+        checkpoint.record(
+            self.repo, context.plan.plan_id,
+            expected_generation=current.generation, operation=None,
+            expected_head=head, target_base_oid=current.target_base_oid,
+            observed_remote_oid=current.observed_remote_oid,
+            snapshot=current.snapshot,
+        )
+
+    def _publication_intent(self, context, operation, remote_oid):
+        checkpoint = self.effects.checkpoint
+        if checkpoint is None:
+            return
+        current = checkpoint.get(self.repo, context.plan.plan_id)
+        head = self.effects.workspace.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
+        if current.operation == operation and current.expected_head == head:
+            return
+        checkpoint.record(
+            self.repo, context.plan.plan_id,
+            expected_generation=current.generation, operation=operation,
+            expected_head=head, target_base_oid=context.active_sha,
+            observed_remote_oid=remote_oid,
+            snapshot={'phase': 'PUBLISHING', 'head': head,
+                      'remote_before': remote_oid},
+        )
+
+    def _commit_owned(self, context, title):
+        checkpoint = self.effects.checkpoint
+        if checkpoint is not None:
+            current = checkpoint.get(self.repo, context.plan.plan_id)
+            before = self.effects.workspace.git(
+                context.worktree, 'rev-parse', 'HEAD'
+            ).stdout.strip()
+            checkpoint.record(
+                self.repo, context.plan.plan_id,
+                expected_generation=current.generation, operation='commit',
+                expected_head=before, target_base_oid=context.active_sha,
+                observed_remote_oid=current.observed_remote_oid,
+                snapshot={**(current.snapshot or {}),
+                          'commit_message': title, 'before_head': before},
+            )
+        result = self.effects.workspace.git(
+            context.worktree, 'commit', '-m', title,
+        )
+        if checkpoint is not None:
+            current = checkpoint.get(self.repo, context.plan.plan_id)
+            after = self.effects.workspace.git(
+                context.worktree, 'rev-parse', 'HEAD'
+            ).stdout.strip()
+            checkpoint.record(
+                self.repo, context.plan.plan_id,
+                expected_generation=current.generation, operation=None,
+                expected_head=after, target_base_oid=current.target_base_oid,
+                observed_remote_oid=current.observed_remote_oid,
+                snapshot={**(current.snapshot or {}), 'after_head': after},
+            )
+        return result
+
+    def _complete_publication_intent(self, context):
+        checkpoint = self.effects.checkpoint
+        if checkpoint is None:
+            return
+        current = checkpoint.get(self.repo, context.plan.plan_id)
+        if current.operation not in {'push', 'pr_create'}:
+            return
+        checkpoint.record(
+            self.repo, context.plan.plan_id,
+            expected_generation=current.generation, operation=None,
+            expected_head=current.expected_head,
+            target_base_oid=current.target_base_oid,
+            observed_remote_oid=current.observed_remote_oid,
+            snapshot=current.snapshot,
+        )
+
+    def recover(self, context):
+        """Observe owned Git and reconcile stale markers before phase dispatch."""
+        checkpoint = self.effects.checkpoint
+        if checkpoint is None:
+            return context
+        try:
+            self.effects.state.check_context(context)
+            row = self._row()
+            catalog = self.effects.state.active_execplan(self.repo)
+            catalog_marker = (
+                int(catalog['catalog_generation']),
+                str(catalog['current_revision_sha'])
+                if catalog['current_revision_sha'] is not None else None,
+            )
+            current = checkpoint.get(self.repo, context.plan.plan_id)
+            if self.newly_activated and current.operation is None and current.expected_head:
+                # A previously blocked plan can be requeued after its inputs
+                # change. Its old execution HEAD does not describe this new
+                # activation, whose owned workspace was just prepared.
+                current = checkpoint.record(
+                    self.repo, context.plan.plan_id,
+                    expected_generation=current.generation, operation=None,
+                    expected_head=None, target_base_oid=None,
+                    observed_remote_oid=None,
+                    snapshot={'reactivated_from_head': current.expected_head},
+                )
+            current = checkpoint.record(
+                self.repo, context.plan.plan_id,
+                expected_generation=current.generation,
+                operation=current.operation,
+                expected_head=current.expected_head,
+                target_base_oid=current.target_base_oid,
+                observed_remote_oid=current.observed_remote_oid,
+                snapshot={**(current.snapshot or {}), 'fetch_in_progress': True},
+            )
+            base_oid = self._fetch_latest_base()
+            current = checkpoint.record(
+                self.repo, context.plan.plan_id,
+                expected_generation=current.generation,
+                operation=current.operation,
+                expected_head=current.expected_head,
+                target_base_oid=current.target_base_oid,
+                observed_remote_oid=current.observed_remote_oid,
+                snapshot={**(current.snapshot or {}), 'fetch_in_progress': False,
+                          'fetched_base_oid': base_oid},
+            )
+            remote_oid = self.effects.workspace.remote_branch_oid(self.repo_path, context.branch)
+            # A PR needs a remote branch.  With neither a remote branch nor a
+            # recorded PR there is no publication state to reconcile here;
+            # the publication service will query again before creating one.
+            inspect_pr = remote_oid is not None or bool(row['pr_url'])
+            pull_request = (
+                self.effects.publication.pr_for_branch(
+                    self.repo_path, context.branch, str(row['pr_url'] or '') or None
+                ) if inspect_pr else None
+            )
+            snapshot = observe(
+                plan_id=context.plan.plan_id,
+                row={**row, 'phase': context.phase.value},
+                definition_revision=catalog_marker[1],
+                base_oid=base_oid, branch=context.branch,
+                worktree=context.worktree, owned=True,
+                git=self.effects.workspace.git,
+                rebase_in_progress=self.effects.workspace._rebase_in_progress_for_branch,
+                remote_oid=remote_oid, pull_request=pull_request,
+                rebase_intent=(
+                    current.operation == 'rebase'
+                    or bool(
+                        row['pr_conflict_recovery'] and row['pr_conflict_base_oid']
+                        and row['phase'] == 'WORKING'
+                        and (
+                            row['last_error'] == self.effects.contract.REBASE_IN_PROGRESS_ERROR
+                            or str(row['last_error'] or '').startswith(
+                                self.effects.contract.REBASE_CONFLICT_PREFIX
+                            )
+                        )
+                    )
+                ),
+                rebase_before_head=(current.expected_head or row['pr_conflict_head_oid']),
+                rebase_target_oid=(current.target_base_oid or row['pr_conflict_base_oid']),
+                stash_oid=(current.snapshot or {}).get('stash_oid'),
+                recorded_local_head=current.expected_head,
+                pending_operation=current.operation,
+                operation_markers=(
+                    self.effects.workspace.git_operation_entries(context.worktree)
+                    if self.effects.workspace.git_operation_entries else None
+                ),
+            )
+            stable_base = self.effects.workspace.git(
+                self.repo_path, 'rev-parse', f'origin/{self.base}'
+            ).stdout.strip()
+            stable_remote = self.effects.workspace.remote_branch_oid(
+                self.repo_path, context.branch
+            )
+            stable_pr = (
+                self.effects.publication.pr_for_branch(
+                    self.repo_path, context.branch, str(row['pr_url'] or '') or None
+                ) if inspect_pr else None
+            )
+            if (stable_base != base_oid or stable_remote != remote_oid
+                    or stable_pr != pull_request):
+                return self._recover(RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                                     'checkpoint observation changed', context=context)
+            current_catalog = self.effects.state.active_execplan(self.repo)
+            if (
+                int(current_catalog['catalog_generation']),
+                str(current_catalog['current_revision_sha'])
+                if current_catalog['current_revision_sha'] is not None else None,
+            ) != catalog_marker:
+                return self._recover(
+                    RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                    'checkpoint catalog revision changed', context=context,
+                )
+            self.effects.state.check_context(context)
+            if (current.operation == 'push' and remote_oid == snapshot.local_head
+                    or current.operation == 'pr_create' and pull_request is not None):
+                current = checkpoint.record(
+                    self.repo, context.plan.plan_id,
+                    expected_generation=current.generation, operation=None,
+                    expected_head=snapshot.local_head,
+                    target_base_oid=current.target_base_oid,
+                    observed_remote_oid=remote_oid,
+                    snapshot=current.snapshot,
+                )
+            current = checkpoint.record(
+                self.repo, context.plan.plan_id,
+                expected_generation=current.generation,
+                operation=current.operation,
+                expected_head=current.expected_head or snapshot.local_head,
+                target_base_oid=current.target_base_oid,
+                observed_remote_oid=remote_oid,
+                snapshot={**(current.snapshot or {}), **asdict(snapshot)},
+            )
+            self.effects.state.check_context(context)
+            decision = assess(snapshot)
+            if (current.operation == 'rebase'
+                    and decision.action not in {CheckpointAction.USER_ACTION, CheckpointAction.PAUSE}
+                    and (current.snapshot or {}).get('pending') == 'stage'
+                    and (current.snapshot or {}).get('worker_result')
+                    and not snapshot.unmerged_stages):
+                saved_evidence = (current.snapshot or {}).get('stage_evidence')
+                observed_evidence = self._rebase_stage_evidence(context)
+                unstaged = self.effects.workspace.git(
+                    context.worktree, 'diff', '--quiet', check=False,
+                )
+                if unstaged.returncode not in {0, 1}:
+                    return self._recover(RecoveryReason.STATUS_FAILED,
+                                         'stage resume worktree observation failed', context=context)
+                if saved_evidence != observed_evidence:
+                    return self._recover(
+                        RecoveryReason.OWNERSHIP_UNCERTAIN,
+                        'staged rebase correction changed since Worker validation',
+                        context=context,
+                        final_block_reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE,
+                    )
+                untracked = self.effects.workspace.git(
+                    context.worktree, 'ls-files', '--others', '--exclude-standard', '-z',
+                ).stdout
+                # The intent precedes staging. Identical accepted contents
+                # may still need staging, including accepted new files.
+                if unstaged.returncode == 1 or untracked:
+                    self.effects.workspace.git(context.worktree, 'add', '-A')
+                resumed = self._finish_worker(
+                    replace(context, resolving_rebase=True), row,
+                    current.snapshot['worker_result'], staged=True,
+                )
+                return (resumed.context
+                        if resumed.kind is ExecutionOutcomeKind.PHASE_ADVANCED
+                        else resumed)
+            if (current.operation == 'rebase'
+                    and decision.action not in {CheckpointAction.USER_ACTION, CheckpointAction.PAUSE}
+                    and (current.snapshot or {}).get('pending') == 'continue'
+                    and snapshot.git_operation == 'rebase'
+                    and not snapshot.unmerged_stages):
+                staged = self.effects.workspace.git(
+                    context.worktree, 'diff', '--cached', '--quiet', check=False
+                )
+                if staged.returncode not in {0, 1}:
+                    return self._recover(RecoveryReason.STAGE_FAILED,
+                                         'staged rebase correction observation failed',
+                                         context=context)
+                arguments = (
+                    ('rebase', '--skip') if staged.returncode == 0 else
+                    ('-c', 'core.editor=true', 'rebase', '--continue')
+                )
+                continued = self.effects.workspace.git(
+                    context.worktree, *arguments, check=False
+                )
+                conflict = self._post_rebase_observation(
+                    context, str(current.target_base_oid or base_oid),
+                    continued.stdout,
+                )
+                if conflict is not None:
+                    return conflict
+                if continued.returncode:
+                    return self._recover(RecoveryReason.REBASE_CONTINUE_FAILED,
+                                         continued.stdout[-8000:], context=context)
+                self.effects.state.correct_checkpoint(
+                    phase='VERIFYING',
+                    active_sha=str(current.target_base_oid or base_oid),
+                    validated_base_sha=None, invalidate_validation=True,
+                    expected_catalog=catalog_marker,
+                )
+                self._complete_rebase_intent(context)
+                return self._context()
+            if decision.action is CheckpointAction.CONTINUE:
+                return context
+            if decision.action is CheckpointAction.CONFLICT:
+                # A correction already in progress owns its diagnostic and
+                # Worker session.  Re-observation must not replace the
+                # actionable failure with a generic index description.
+                if context.resolving_rebase:
+                    return context
+                self.effects.state.update_project(
+                    self.repo, phase='WORKING', validated_base_sha=None,
+                    revision_resume_status='VERIFYING',
+                    last_error=self.effects.contract.REBASE_CONFLICT_PREFIX + decision.reason,
+                )
+                return self._context()
+            if decision.action is CheckpointAction.CORRECT:
+                self.effects.state.correct_checkpoint(
+                    phase=decision.phase, active_sha=decision.active_sha,
+                    validated_base_sha=decision.validated_base_sha,
+                    invalidate_validation=decision.invalidate_validation,
+                    expected_catalog=catalog_marker,
+                )
+                checkpoint.record(
+                    self.repo, context.plan.plan_id,
+                    expected_generation=current.generation, operation=None,
+                    expected_head=snapshot.local_head,
+                    target_base_oid=base_oid, observed_remote_oid=remote_oid,
+                    snapshot=asdict(snapshot),
+                )
+                return self._context()
+            if decision.action is CheckpointAction.REBASE:
+                # The revision gate decides which artifacts a changed base
+                # invalidates.  VERIFYING also owns its verify-before-rebase
+                # contract.  Starting rebase during preparation skips both.
+                return context
+            if decision.action is CheckpointAction.PAUSE:
+                return self._recover(RecoveryReason.STATUS_FAILED, decision.reason,
+                                     context=context, attempts=3)
+            if decision.reason in {'external_remote_oid', 'external_pr_head'}:
+                return self._recover(
+                    RecoveryReason.REMOTE_OID_UNCERTAIN,
+                    '관측하지 않은 원격 branch 또는 PR head 갱신을 거부합니다: '
+                    + decision.reason,
+                    context=context,
+                )
+            return self._recover(
+                RecoveryReason.OWNERSHIP_UNCERTAIN, decision.reason,
+                context=context,
+                final_block_reason=(BlockReasonCode.REPOSITORY_STATE_UNSAFE
+                                    if decision.reason == 'autostash_identity_unavailable'
+                                    else BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN),
+            )
+        except CheckpointRace:
+            return self._recover(RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                                 'checkpoint generation changed', context=context)
+        except RuntimeStateError as error:
+            return ExecutionOutcome(
+                ExecutionOutcomeKind.TRANSIENT_PAUSE,
+                detail=f'execution row changed during checkpoint observation: {error}',
+            )
+        except RecoveryFailure as error:
+            return self._recover(error.reason, str(error), context=context)
+        except (RuntimeError, OSError) as error:
+            return self._recover(
+                classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
+                str(error), context=context,
+            )
 
     @staticmethod
     def _cached_plan(catalog_plan):
@@ -368,10 +879,17 @@ class ExecutionHandlers:
         worktree = Path(str(row['worktree'] or ''))
         plan_id = self.effects.workspace._plan_id_from_path(str(row['plan_path'] or ''))
         catalog_plan = self.effects.state.active_execplan(self.repo)
+        self.catalog_plan = catalog_plan
         workspace_ownership = int(catalog_plan['workspace_owned'] if catalog_plan else 0)
         workspace_owned = workspace_ownership == self.effects.contract.WORKSPACE_OWNED
         workspace_reserved = workspace_ownership == self.effects.contract.WORKSPACE_RESERVED
-        resolving_rebase = self._resolving_rebase(row)
+        try:
+            resolving_rebase = self._resolving_rebase(row)
+        except (RecoveryFailure, RuntimeError, OSError) as error:
+            return self._recover(
+                classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
+                str(error),
+            )
         try:
             if plan_id is None:
                 raise self.effects.contract.WorkspaceOwnershipError('활성 ExecPlan 경로에서 ID를 확인할 수 없습니다.')
@@ -384,6 +902,7 @@ class ExecutionHandlers:
                 branch,
                 worktree,
             )
+            self._workspace_boundary(plan_id, row, pending=True)
             self.effects.workspace.make_worktree(
                 self.repo_path,
                 worktree,
@@ -398,6 +917,7 @@ class ExecutionHandlers:
                 allow_rebase=resolving_rebase,
             )
             self.effects.workspace.mark_execplan_workspace_owned(self.repo, plan_id)
+            self._workspace_boundary(plan_id, row, pending=False)
         except self.effects.contract.WorkspaceOwnershipError as error:
             workspace_error = f"관리 workspace 소유권/복구 검증 실패: {error}"
             outcome = self._recover(
@@ -406,6 +926,8 @@ class ExecutionHandlers:
             )
             self.effects.events.operation_print(workspace_error, file=sys.stderr)
             return outcome
+        except RecoveryFailure as error:
+            return self._recover(error.reason, str(error))
         except (RuntimeError, OSError) as error:
             detail = f"관리 workspace 복구 재시도: {error}"
             self.effects.events.operation_print(detail, file=sys.stderr)
@@ -605,12 +1127,7 @@ class ExecutionHandlers:
                 self.catalog_plan,
             )
             self.effects.workspace.git(context.worktree, 'add', '-A')
-            self.effects.workspace.git(
-                context.worktree,
-                'commit',
-                '-m',
-                worker_publication.commit_title,
-            )
+            self._commit_owned(context, worker_publication.commit_title)
         refresh_values = {
             'phase': 'WORKING',
             'validated_base_sha': None,
@@ -620,6 +1137,7 @@ class ExecutionHandlers:
         if int(row['pr_conflict_recovery']):
             refresh_values['pr_conflict_base_oid'] = latest_sha
         self.effects.state.update_project(self.repo, **refresh_values)
+        self._record_rebase_intent(context, latest_sha)
         rebased = self.effects.workspace.git(
             context.worktree,
             'rebase',
@@ -627,6 +1145,9 @@ class ExecutionHandlers:
             latest_sha,
             check=False,
         )
+        conflict = self._post_rebase_observation(context, latest_sha, rebased.stdout)
+        if conflict is not None:
+            return conflict
         if rebased.returncode:
             rebase_failure = self.effects.contract.REBASE_CONFLICT_PREFIX + rebased.stdout[-8000:]
             in_progress = self.effects.workspace._rebase_in_progress_for_branch(
@@ -645,6 +1166,7 @@ class ExecutionHandlers:
                 rebase_failure, context=context,
             )
         self.effects.state.update_project(self.repo, active_sha=latest_sha)
+        self._complete_rebase_intent(context)
         if (
             decision.phase != 'IMPLEMENTING'
             and not self.effects.workspace.branch_has_changes(
@@ -1358,28 +1880,52 @@ class ExecutionHandlers:
             )
         return self._finish_worker(context, row, message)
 
-    def _finish_worker(self, context, row, message):
+    def _finish_worker(self, context, row, message, *, staged=False):
         assert self.catalog_plan is not None and self.plan is not None
         latest_sha = str(row['active_sha'] or '')
         if context.resolving_rebase:
-            self.effects.workspace.git(context.worktree, 'add', '-A')
+            self.effects.state.update_project(self.repo, worker_result=message)
+            if not staged:
+                self._record_rebase_suboperation(
+                    context, 'stage', worker_result=message,
+                )
+                self.effects.workspace.git(context.worktree, 'add', '-A')
+            if self._unmerged_stages(context.worktree):
+                detail = self.effects.contract.REBASE_CONFLICT_PREFIX + 'unmerged index remains after Worker correction'
+                self.effects.state.update_project(self.repo, phase='WORKING', last_error=detail)
+                return self._recover(RecoveryReason.REBASE_CONFLICT, detail, context=context)
             staged = self.effects.workspace.git(context.worktree, 'diff', '--cached', '--quiet', check=False)
             if staged.returncode not in {0, 1}:
                 staging_error = f"rebase 충돌 해결 결과 확인 실패 (git 종료 코드 {staged.returncode})."
                 self.effects.events.operation_print(staging_error, file=sys.stderr)
                 return self._recover(RecoveryReason.STAGE_FAILED, staging_error,
                                      context=context)
-            if staged.returncode == 0:
+            self._record_rebase_suboperation(context, 'continue')
+            rebase_metadata = self.effects.workspace._rebase_in_progress_for_branch(
+                context.worktree, context.branch
+            )
+            if not rebase_metadata:
+                # Autostash application can conflict after Git has removed its
+                # rebase directory. The resolved index is the original patch.
+                continued = type('GitResult', (), {'returncode': 0, 'stdout': ''})()
+            elif staged.returncode == 0:
                 continued = self.effects.workspace.git(context.worktree, 'rebase', '--skip', check=False)
             else:
                 continued = self.effects.workspace.git(
                     context.worktree,
-                    '-c',
-                    'core.editor=true',
-                    'rebase',
-                    '--continue',
+                    '-c', 'core.editor=true', 'rebase', '--continue',
                     check=False,
                 )
+            post_conflict = self._post_rebase_observation(
+                context, str(
+                    (self.effects.checkpoint.get(self.repo, context.plan.plan_id).target_base_oid
+                     if self.effects.checkpoint is not None else None)
+                    or row['pr_conflict_base_oid'] or row['active_sha'] or ''
+                ),
+                continued.stdout,
+            )
+            if post_conflict is not None:
+                return post_conflict
             if continued.returncode:
                 continuation_error = self.effects.contract.REBASE_CONFLICT_PREFIX + continued.stdout[-8000:]
                 in_progress = self.effects.workspace._rebase_in_progress_for_branch(context.worktree, context.branch)
@@ -1408,9 +1954,14 @@ class ExecutionHandlers:
             latest_sha = (
                 str(row['pr_conflict_base_oid'])
                 if int(row['pr_conflict_recovery'])
-                else str(row['active_sha'] or '')
+                else str(
+                    (self.effects.checkpoint.get(self.repo, context.plan.plan_id).target_base_oid
+                     if self.effects.checkpoint is not None else None)
+                    or row['active_sha'] or ''
+                )
             )
             self.effects.state.update_project(self.repo, active_sha=latest_sha)
+            self._complete_rebase_intent(context)
             if self.effects.agent.validate_guidance_publication(
                 self.repo,
                 context.worktree,
@@ -1660,7 +2211,7 @@ class ExecutionHandlers:
                 context.plan.path,
                 self.catalog_plan,
             )
-            self.effects.workspace.git(context.worktree, 'commit', '-m', worker_publication.commit_title)
+            self._commit_owned(context, worker_publication.commit_title)
         guarded = self._post_effect_guard(context)
         if isinstance(guarded, ExecutionOutcome):
             return guarded
@@ -1699,7 +2250,11 @@ class ExecutionHandlers:
             pr_conflict_base_oid=latest_sha if int(row['pr_conflict_recovery']) else row['pr_conflict_base_oid'],
             last_error=self.effects.contract.REBASE_IN_PROGRESS_ERROR,
         )
+        self._record_rebase_intent(context, latest_sha)
         rebased = self.effects.workspace.git(context.worktree, 'rebase', latest_sha, check=False)
+        conflict = self._post_rebase_observation(context, latest_sha, rebased.stdout)
+        if conflict is not None:
+            return conflict
         if rebased.returncode:
             in_progress = self.effects.workspace._rebase_in_progress_for_branch(context.worktree, context.branch)
             if in_progress:
@@ -1735,6 +2290,7 @@ class ExecutionHandlers:
             phase='VERIFYING',
             revision_resume_status=None,
         )
+        self._complete_rebase_intent(context)
         if self.effects.agent.validate_guidance_publication(
             self.repo,
             context.worktree,
@@ -1768,7 +2324,7 @@ class ExecutionHandlers:
                     context.plan.path,
                     self.catalog_plan,
                 )
-                self.effects.workspace.git(context.worktree, 'commit', '-m', self._worker_publication.commit_title)
+                self._commit_owned(context, self._worker_publication.commit_title)
             self.effects.state.update_project(
                 self.repo,
                 active_sha=latest_sha,
@@ -2116,15 +2672,34 @@ class ExecutionHandlers:
             )
         return None
 
+    def _publication_resume(self):
+        return PublicationResume(
+            self.effects.publication.pr_for_branch,
+            self.effects.workspace.remote_branch_oid,
+            self.effects.workspace.git,
+        )
+
     def publish(self, context, latest_base):
         self.effects.state.check_context(context)
         row = self._row()
         assert self.catalog_plan is not None and self.plan is not None
-        existing_pr = self.effects.publication.pr_for_branch(
-            self.repo_path,
-            context.branch,
+        publication = self._publication_resume().observe(
+            self.repo_path, context.worktree, context.branch,
+            str(row['publication_remote_oid'] or '') or None,
             str(row['pr_url']) if int(row['pr_conflict_recovery']) else None,
         )
+        existing_pr = publication.pull_request
+        # Owned PR conflict recovery deliberately starts from its saved PR
+        # head; its existing lease gate authorizes the later rebased push.
+        attachment = (replace(publication, local_oid=str(row['pr_conflict_head_oid'] or ''))
+                      if int(row['pr_conflict_recovery']) else publication)
+        if assess_publication(attachment) is PublicationNext.USER_ACTION:
+            return self._block_final(
+                self.repo, context.worktree,
+                '원격 branch 또는 PR head가 관측한 소유 OID와 다릅니다.',
+                str(row['verify_result'] or ''),
+                reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
+            )
         if existing_pr:
             try:
                 reconciliation = self.effects.publication.reconcile_existing_pull_request(
@@ -2403,13 +2978,37 @@ class ExecutionHandlers:
             plan_sha,
         )
         try:
-            head_oid = self.effects.publication.push_managed_publication_branch(
-                self.repo_path,
-                self.state_dir,
-                self.repo,
-                context.branch,
-                context.worktree,
+            publication = self._publication_resume().observe(
+                self.repo_path, context.worktree, context.branch,
+                str(row['publication_remote_oid'] or '') or None,
             )
+            action = assess_publication(publication)
+            if action is PublicationNext.USER_ACTION:
+                raise self.effects.contract.PublicationSafetyError(
+                    '게시 직전 원격 branch 또는 PR head가 변경됐습니다.'
+                )
+            if action is PublicationNext.ATTACH_PR:
+                reconciliation = self.effects.publication.reconcile_existing_pull_request(
+                    self.repo_path, self.state_dir, self.repo, row,
+                    publication.pull_request,
+                )
+                return (self._step_outcome(reconciliation) if reconciliation is not None
+                        else self._retry('기존 PR을 연결했습니다.'))
+            if action is PublicationNext.CREATE_PR:
+                self.effects.publication.record_remote_publication_branch(
+                    self.repo_path, self.state_dir, self.repo,
+                    context.branch, context.worktree, publication.remote_oid,
+                )
+                head_oid = publication.local_oid
+            else:
+                self._publication_intent(
+                    context, 'push', publication.remote_oid,
+                )
+                head_oid = self.effects.publication.push_managed_publication_branch(
+                    self.repo_path, self.state_dir, self.repo,
+                    context.branch, context.worktree,
+                )
+                self._complete_publication_intent(context)
         except self.effects.contract.PublicationSafetyError as error:
             publication_error = str(error)
             self._block_final(
@@ -2433,8 +3032,28 @@ class ExecutionHandlers:
         if isinstance(guarded, ExecutionOutcome):
             return guarded
         context = guarded
+        after_push = self._publication_resume().observe(
+            self.repo_path, context.worktree, context.branch, head_oid,
+        )
+        existing_after_push = after_push.pull_request
+        if existing_after_push is not None:
+            if (after_push.local_oid != head_oid
+                    or assess_publication(after_push) is not PublicationNext.ATTACH_PR):
+                return self._block_final(
+                    self.repo, context.worktree,
+                    'push 뒤 PR head가 검증한 게시 commit과 다릅니다.',
+                    str(self._row()['verify_result'] or ''),
+                    reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
+                )
+            reconciliation = self.effects.publication.reconcile_existing_pull_request(
+                self.repo_path, self.state_dir, self.repo, self._row(),
+                existing_after_push,
+            )
+            return (self._step_outcome(reconciliation) if reconciliation is not None
+                    else self._retry('push 뒤 기존 PR을 연결했습니다.'))
         title = f"Implement {self.plan['id']}: {self.plan['title']}"
         try:
+            self._publication_intent(context, 'pr_create', head_oid)
             created = self.effects.publication.command(
                 ['gh', 'pr', 'create', '--base', self.base, '--head', context.branch, '--title', title, '--body', body],
                 cwd=context.worktree,
@@ -2451,5 +3070,6 @@ class ExecutionHandlers:
             )
         url = created.stdout.strip().splitlines()[-1]
         self.effects.state.open_pull_request(self.repo, pr_url=url, pr_head_oid=head_oid)
+        self._complete_publication_intent(context)
         self.effects.events.operation_print(f"PR 생성 완료: {url}")
         return ExecutionOutcome(ExecutionOutcomeKind.SUCCESS)

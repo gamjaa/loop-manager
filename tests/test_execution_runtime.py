@@ -133,6 +133,26 @@ class FakePorts:
         return self.publication.publish(context, self.latest_base)
 
 
+class CoordinatorRecoveryTests(unittest.TestCase):
+    def test_recovery_runs_once_before_revision_guard_and_dispatch(self):
+        context = execution_context(ExecutionPhase.PUBLISHING)
+        ports = FakePorts(context)
+        calls = []
+
+        def recover(prepared):
+            calls.append('recover')
+            return prepared.at_phase(ExecutionPhase.VERIFYING)
+
+        ports.recover = recover
+        coordinator = ExecutionPhaseCoordinator(ports)
+        prepared = coordinator.prepare()
+        self.assertEqual(calls, ['recover'])
+        self.assertEqual(prepared.phase, ExecutionPhase.VERIFYING)
+        coordinator.dispatch(prepared)
+        self.assertEqual(len(ports.validation.verify_calls), 1)
+        self.assertEqual(ports.publication.calls, [])
+
+
 class ExecutionPhaseCoordinatorTests(unittest.TestCase):
     def test_typed_git_failure_reaches_common_recovery_dispatcher(self):
         context = execution_context()
