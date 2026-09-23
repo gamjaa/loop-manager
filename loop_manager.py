@@ -8447,12 +8447,26 @@ def validate_active_execplan_metadata(
     worktree: Path,
     relative_path: str,
     plan: sqlite3.Row,
+    *,
+    rebase_definition: execution_revision.DefinitionSnapshot | None = None,
 ) -> dict[str, object]:
     current = validate_execplan(worktree, relative_path)
+    comparison_plan = plan
+    if rebase_definition is not None:
+        # A paused rebase still contains its applied declaration. Only these
+        # two fields may lag the reconciled catalog during conflict resolution;
+        # all other identity fields and all normal validation remain strict.
+        if rebase_definition.path != relative_path:
+            raise RuntimeError("rebase 기준 ExecPlan 경로가 현재 작업 경로와 다릅니다.")
+        comparison_plan = dict(plan)
+        if current['priority'] == rebase_definition.priority:
+            comparison_plan['priority'] = rebase_definition.priority
+        if tuple(current['depends_on']) == rebase_definition.depends_on:
+            comparison_plan['depends_on'] = json.dumps(rebase_definition.depends_on)
     error = _execplan_metadata_identity_error(
         repo_path,
         current,
-        plan,
+        comparison_plan,
         "활성 ExecPlan",
     )
     if error is not None:
@@ -8472,12 +8486,15 @@ def validate_worker_workspace_scope(
     before: GitSnapshot,
     *,
     allow_rebase: bool = False,
+    rebase_definition: execution_revision.DefinitionSnapshot | None = None,
     allowed_requirement_archives: tuple[str, ...] = (),
     allowed_guidance_targets: tuple[str, ...] = (),
     allow_common_plans: bool = False,
 ) -> dict[str, object]:
     """Validate one Worker-controlled operation before Manager Git writes."""
 
+    if rebase_definition is not None and not allow_rebase:
+        raise RuntimeError("rebase 기준 선언은 충돌 복구 중에만 사용할 수 있습니다.")
     after = capture_git_snapshot(worktree)
     validate_agent_scope(
         "worker",
@@ -8496,6 +8513,7 @@ def validate_worker_workspace_scope(
         worktree,
         selected_plan_path,
         catalog_plan,
+        **({'rebase_definition': rebase_definition} if allow_rebase else {}),
     )
     validate_managed_worktree(
         repo_path,

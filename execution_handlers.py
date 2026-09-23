@@ -6,7 +6,7 @@ from pathlib import Path
 import json
 import sys
 from scoped_blocking import BlockReasonCode
-from execution_revision import (DefinitionSnapshot, RevisionGateKind,
+from execution_revision import (DefinitionDelta, DefinitionSnapshot, RevisionGateKind,
     StageArtifacts, WORKER_INVALIDATING_DELTAS, decide_revision_gate)
 from execution_runtime import (ExecutionContext, ExecutionOutcome, ExecutionOutcomeKind,
     ExecutionPhase, ExecutionPlanMetadata, LatestBaseCheckpoint)
@@ -743,7 +743,9 @@ class ExecutionHandlers:
         if context.resolving_rebase:
             if (
                 (previous is None and not legacy_baseline)
-                or decision.deltas & WORKER_INVALIDATING_DELTAS
+                or decision.deltas & (
+                    WORKER_INVALIDATING_DELTAS - {DefinitionDelta.DEPENDENCIES}
+                )
             ):
                 detail = (
                     'rebase 충돌 복구 중 ExecPlan 구현 입력이 변경되어 기존 '
@@ -758,6 +760,22 @@ class ExecutionHandlers:
                 )
                 self.effects.events.operation_print(detail, file=sys.stderr)
                 return self._final(detail)
+            if DefinitionDelta.DEPENDENCIES in decision.deltas:
+                # Dependency readiness was checked above. Resolve the existing
+                # conflict first, but retain the applied definition so the next
+                # gate refreshes the worktree and reruns Worker on the new DAG.
+                self.effects.state.update_project(
+                    self.repo,
+                    validated_base_sha=None,
+                    worker_result=None,
+                    verify_result=None,
+                    review_result=None,
+                    worker_input_token=None,
+                    archive_token=None,
+                    verify_token=None,
+                    review_token=None,
+                    publication_token=None,
+                )
             # The ongoing Git rebase remains pinned to its original target.
             # Do not install the new stage state until it has been resolved.
             self._definition_snapshot = snapshot
@@ -876,6 +894,9 @@ class ExecutionHandlers:
                 catalog_plan,
                 worker_scope_before,
                 allow_rebase=context.resolving_rebase,
+                **({'rebase_definition': DefinitionSnapshot.deserialize(
+                    row['definition_snapshot']
+                )} if context.resolving_rebase else {}),
                 allowed_requirement_archives=self.archive_scope_sources,
                 allowed_guidance_targets=guidance_targets,
                 allow_common_plans=allow_common_plans,

@@ -240,8 +240,9 @@ class ExecutionHandlerTests(TestCase):
         self.assertIsNone(row['verify_result'])
         self.assertIsNone(row['worker_input_token'])
 
-    def test_conflicted_rebase_waits_for_new_dependency_before_worker(self):
+    def _conflict_revision_setup(self):
         self.handler.guard(self.context())
+        workspace_plan = self.handler._cached_plan(self.handler.catalog_plan)
         self.state.update_project(
             'repo',
             last_error=lm.REBASE_CONFLICT_PREFIX + 'conflict',
@@ -250,7 +251,51 @@ class ExecutionHandlerTests(TestCase):
         )
         self.effects.workspace.is_directory.return_value = True
         self.effects.workspace._rebase_in_progress_for_branch.return_value = True
-        self.effects.revision.unmet_dependencies.return_value = ('G-048',)
+        self.effects.agent.validate_worker_workspace_scope.side_effect = (
+            lm.validate_worker_workspace_scope
+        )
+        def resume_agent(*args, **kwargs):
+            self.calls.append(args[4])
+            session = kwargs['session_id'] or 'session'
+            kwargs['on_session_started'](session)
+            return lm.AgentResult(0, 'result', session_id=session)
+        self.effects.agent.run_agent.side_effect = resume_agent
+        return workspace_plan
+
+    def _dispatch_conflict_revision(self, workspace_plan):
+        # Exercise the real workspace metadata comparison, faking only Git and
+        # file parsing. A constant validator result would hide stale metadata.
+        with mock.patch('loop_manager.capture_git_snapshot'), mock.patch(
+            'loop_manager.validate_agent_scope'
+        ), mock.patch('loop_manager.validate_managed_worktree'), mock.patch(
+            'loop_manager.validate_execplan', return_value=workspace_plan
+        ):
+            return ExecutionPhaseCoordinator(self.handler).dispatch(
+                self.handler._context()
+            )
+
+    def test_conflict_revision_dependency_merge_resumes_worker(self):
+        workspace_plan = self._conflict_revision_setup()
+        applied = self.state.row()['definition_snapshot']
+        for plan_id, dependencies in (('G-048', '["G-050"]'), ('G-050', '[]')):
+            self.connection.execute(
+                "INSERT INTO exec_plans (repo, plan_id, path, title, sources, "
+                "depends_on, priority, content_hash, status) VALUES "
+                "('repo', ?, ?, 'Dependency', '[\"docs/PRODUCT.md\"]', ?, "
+                "'normal', 'hash', 'READY')",
+                (plan_id, f'docs/plans/[{plan_id}] Dependency.md', dependencies),
+            )
+        self.connection.execute(
+            "UPDATE exec_plans SET depends_on = '[\"G-048\"]' "
+            "WHERE repo = 'repo' AND plan_id = 'G-047'"
+        )
+        self.connection.commit()
+        self.remote = 'new-base'
+        self.effects.revision.unmet_dependencies.side_effect = (
+            lambda repo, plan_id: lm.unmet_execplan_dependencies(
+                self.connection, repo, plan_id
+            )
+        )
 
         outcome = ExecutionPhaseCoordinator(self.handler).dispatch(
             self.handler._context()
@@ -258,20 +303,126 @@ class ExecutionHandlerTests(TestCase):
 
         self.assertEqual(outcome.kind, ExecutionOutcomeKind.STABLE_WAIT)
         self.assertIn('G-048', outcome.detail)
+        self.assertIn('G-050', outcome.detail)
         self.effects.agent.run_agent.assert_not_called()
         self.assertNotIn('rebase', self.calls)
         row = self.state.row()
         self.assertEqual(row['worker_session_id'], 'worker-session')
         self.assertEqual(row['worker_result'], 'previous worker result')
         self.assertTrue(row['last_error'].startswith(lm.REBASE_CONFLICT_PREFIX))
-        self.effects.revision.unmet_dependencies.return_value = ()
-        worker_outcome = ExecutionOutcome(ExecutionOutcomeKind.RETRY)
-        with mock.patch.object(self.handler, 'run', return_value=worker_outcome) as worker:
-            resumed = ExecutionPhaseCoordinator(self.handler).dispatch(
-                self.handler._context()
+        self.connection.execute(
+            "UPDATE exec_plans SET status = 'MERGED' "
+            "WHERE repo = 'repo' AND plan_id IN ('G-048', 'G-050')"
+        )
+        self.connection.commit()
+        resumed = self._dispatch_conflict_revision(workspace_plan)
+        self.assertEqual(resumed.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
+        self.effects.blocking.block_active_execplan.assert_not_called()
+        self.assertEqual(
+            self.effects.agent.run_agent.call_args.kwargs['session_id'],
+            'worker-session',
+        )
+        self.assertIsNone(self.effects.agent.worker_prompt.call_args.args[2])
+        self.assertEqual(self.state.row()['definition_snapshot'], applied)
+        self.dirty = False
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = False
+        refreshed = self.handler.guard(self.handler._context())
+        self.assertEqual(refreshed.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(self.state.row()['phase'], 'WORKING')
+        self.assertIsNone(self.state.row()['worker_result'])
+        self.assertEqual(self.state.row()['branch'], 'loop-manager/G-047')
+        self.assertEqual(self.state.row()['worktree'], '/state/G-047')
+        self.effects.validation.verify.assert_not_called()
+        latest_plan = self.handler._cached_plan(self.handler.catalog_plan)
+        rerun = self._dispatch_conflict_revision(latest_plan)
+        self.assertEqual(rerun.context.phase, ExecutionPhase.VERIFYING)
+        self.assertEqual(self.state.row()['worker_session_id'], 'worker-session')
+        verified = self._dispatch_conflict_revision(latest_plan)
+        self.assertEqual(verified.context.phase, ExecutionPhase.REVIEWING)
+        reviewed = self._dispatch_conflict_revision(latest_plan)
+        self.assertEqual(reviewed.context.phase, ExecutionPhase.PUBLISHING)
+        self.assertEqual(
+            [call for call in self.calls if call in {'worker', 'verify', 'reviewer'}],
+            ['worker', 'worker', 'verify', 'reviewer'],
+        )
+
+    def test_conflict_revision_priority_change_allows_old_workspace_metadata(self):
+        workspace_plan = self._conflict_revision_setup()
+        self.connection.execute(
+            "UPDATE exec_plans SET priority = 'high' "
+            "WHERE repo = 'repo' AND plan_id = 'G-047'"
+        )
+        self.connection.commit()
+        self.remote = 'new-base'
+
+        outcome = self._dispatch_conflict_revision(workspace_plan)
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
+        self.effects.blocking.block_active_execplan.assert_not_called()
+        self.assertEqual(self.handler.plan['priority'], 'high')
+        self.assertEqual(
+            self.effects.agent.worker_prompt.call_args.args[2],
+            'previous worker result',
+        )
+        self.dirty = False
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = False
+        refreshed = self.handler.guard(self.handler._context())
+        self.assertEqual(refreshed.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(self.state.row()['phase'], 'VERIFYING')
+        self.assertEqual(self.state.row()['worker_result'], 'result')
+
+    def test_conflict_revision_scope_rejects_unapproved_metadata(self):
+        workspace_plan = self._conflict_revision_setup()
+        baseline = DefinitionSnapshot.deserialize(self.state.row()['definition_snapshot'])
+        self.connection.execute(
+            "UPDATE exec_plans SET priority = 'high', depends_on = '[\"G-048\"]' "
+            "WHERE repo = 'repo' AND plan_id = 'G-047'"
+        )
+        self.connection.commit()
+        catalog = self.repository.active_row('repo')
+        for field, value in (
+            ('priority', 'critical'), ('depends_on', ['G-099']),
+            ('title', 'Unauthorized'), ('sources', ['docs/OTHER.md']),
+        ):
+            with self.subTest(field=field), mock.patch(
+                'loop_manager.capture_git_snapshot'
+            ), mock.patch('loop_manager.validate_agent_scope'), mock.patch(
+                'loop_manager.validate_managed_worktree'
+            ), mock.patch('loop_manager.validate_execplan', return_value={
+                **workspace_plan, field: value,
+            }):
+                with self.assertRaisesRegex(RuntimeError, 'metadata'):
+                    lm.validate_worker_workspace_scope(
+                        Path('/repo'), Path('/state/G-047'), 'loop-manager/G-047',
+                        'main', catalog['path'], catalog, mock.Mock(),
+                        allow_rebase=True, rebase_definition=baseline,
+                    )
+        with mock.patch('loop_manager.capture_git_snapshot'), mock.patch(
+            'loop_manager.validate_agent_scope'
+        ), mock.patch('loop_manager.validate_managed_worktree'), mock.patch(
+            'loop_manager.validate_execplan', return_value=workspace_plan
+        ) as parsed:
+            with self.assertRaisesRegex(RuntimeError, 'metadata'):
+                lm.validate_worker_workspace_scope(
+                    Path('/repo'), Path('/state/G-047'), 'loop-manager/G-047',
+                    'main', catalog['path'], catalog, mock.Mock(),
+                )
+            parsed.return_value = {
+                **workspace_plan, 'priority': 'high', 'depends_on': ['G-048'],
+            }
+            current = lm.validate_worker_workspace_scope(
+                Path('/repo'), Path('/state/G-047'), 'loop-manager/G-047',
+                'main', catalog['path'], catalog, mock.Mock(),
+                allow_rebase=True, rebase_definition=baseline,
             )
-        self.assertIs(resumed, worker_outcome)
-        worker.assert_called_once()
+            self.assertEqual(current['priority'], 'high')
+            self.assertEqual(current['depends_on'], ['G-048'])
+        with self.assertRaisesRegex(RuntimeError, '충돌 복구'):
+            lm.validate_worker_workspace_scope(
+                Path('/repo'), Path('/state/G-047'), 'loop-manager/G-047',
+                'main', catalog['path'], catalog, mock.Mock(),
+                rebase_definition=baseline,
+            )
 
     def test_conflicted_rebase_blocks_new_worker_input_before_worker(self):
         self.handler.guard(self.context())
