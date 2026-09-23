@@ -1128,66 +1128,77 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
             raise
         else:
             connection.execute("RELEASE publication_backfill")
-    if "ever_started" not in columns:
-        migrated_columns = {
-            str(row[1])
-            for row in connection.execute("PRAGMA table_info(exec_plans)")
-        }
-        evidence = []
-        if "status" in migrated_columns:
-            evidence.append("status != 'READY'")
-        for field in (
-            "active_sha",
-            "validated_base_sha",
-            "publication_remote_oid",
-            "pr_conflict_head_oid",
-            "pr_conflict_base_oid",
-            "branch",
-            "worktree",
-            "pr_url",
-            "pr_head_oid",
-            "last_error",
-            "blocked_fingerprint",
-            "blocked_worktree_fingerprint",
-            "blocked_review_fingerprint",
-            "worker_session_id",
-            "reviewer_session_id",
-            "worker_result",
-            "verify_result",
-            "review_result",
-            "blocked_reason",
-            "guidance_plan_hash",
-            "agent_role",
-            "agent_snapshot",
-            "agent_input_fingerprint",
-            "agent_baseline",
-            "agent_recovery",
-            "agent_input_plan",
-            "agent_result_plan",
-            "agent_result_snapshot",
-            "agent_manager_snapshot",
-        ):
-            if field in migrated_columns:
-                evidence.append(f"{field} IS NOT NULL")
-        for field in (
-            "pr_conflict_recovery",
-            "retry_count",
-            "workspace_owned",
-        ):
-            if field in migrated_columns:
-                evidence.append(f"{field} != 0")
-        for field in (
-            "verify_failure_history",
-            "review_failure_history",
-            "review_level_history",
-        ):
-            if field in migrated_columns:
-                evidence.append(f"{field} != '{{}}'")
-        if evidence:
+    # A prior process may have committed the column before backfilling rows.
+    # Repeat the monotonic evidence check on every new connection.
+    migrated_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(exec_plans)")
+    }
+    evidence = []
+    if "status" in migrated_columns:
+        evidence.append("status != 'READY'")
+    for field in (
+        "active_sha",
+        "validated_base_sha",
+        "publication_remote_oid",
+        "pr_conflict_head_oid",
+        "pr_conflict_base_oid",
+        "branch",
+        "worktree",
+        "pr_url",
+        "pr_head_oid",
+        "last_error",
+        "blocked_fingerprint",
+        "blocked_worktree_fingerprint",
+        "blocked_review_fingerprint",
+        "worker_session_id",
+        "reviewer_session_id",
+        "worker_result",
+        "verify_result",
+        "review_result",
+        "blocked_reason",
+        "guidance_plan_hash",
+        "agent_role",
+        "agent_snapshot",
+        "agent_input_fingerprint",
+        "agent_baseline",
+        "agent_recovery",
+        "agent_input_plan",
+        "agent_result_plan",
+        "agent_result_snapshot",
+        "agent_manager_snapshot",
+    ):
+        if field in migrated_columns:
+            evidence.append(f"{field} IS NOT NULL")
+    for field in (
+        "pr_conflict_recovery",
+        "retry_count",
+        "workspace_owned",
+    ):
+        if field in migrated_columns:
+            evidence.append(f"{field} != 0")
+    for field in (
+        "verify_failure_history",
+        "review_failure_history",
+        "review_level_history",
+    ):
+        if field in migrated_columns:
+            evidence.append(f"{field} != '{{}}'")
+    if evidence:
+        # RELEASE commits a standalone repair without committing a caller's
+        # existing transaction, matching the publication backfill above.
+        connection.execute("SAVEPOINT ever_started_backfill")
+        try:
             connection.execute(
-                "UPDATE exec_plans SET ever_started = 1 WHERE "
-                + " OR ".join(evidence)
+                "UPDATE exec_plans SET ever_started = 1 WHERE ever_started = 0 "
+                "AND (" + " OR ".join(evidence) + ")"
             )
+        except BaseException:
+            connection.execute("ROLLBACK TO ever_started_backfill")
+            connection.execute("RELEASE ever_started_backfill")
+            raise
+        else:
+            connection.execute("RELEASE ever_started_backfill")
     connection.execute(GUIDANCE_APPROVALS_SCHEMA)
     connection.execute(EXECPLAN_CANCELLATIONS_SCHEMA)
     connection.execute(GENERAL_PLANNING_PUBLICATIONS_SCHEMA)
@@ -2241,6 +2252,9 @@ def _ready_plan_snapshot_from_contents(
         content_hash=content_hash,
         plan_sha=plan_sha,
         text=text,
+        current_complexity=row["current_complexity"],
+        current_risk=row["current_risk"],
+        current_metadata_recorded=True,
     )
 
 
@@ -2425,6 +2439,10 @@ def _assert_mutable_ready_snapshot_current(
             "mutable READY snapshot 이후 maintenance cycle이 시작됐습니다."
         )
     for plan in snapshot.plans:
+        if not plan.current_metadata_recorded:
+            raise PlannerValidationError(
+                f"mutable READY snapshot의 SQLite metadata 근거가 없습니다: {plan.plan_id}"
+            )
         row = connection.execute(
             "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
             (snapshot.repo, plan.plan_id),
@@ -2446,6 +2464,8 @@ def _assert_mutable_ready_snapshot_current(
             str(row["sources"]),
             str(row["depends_on"]),
             str(row["priority"]),
+            row["current_complexity"],
+            row["current_risk"],
             str(row["content_hash"]),
             str(row["current_revision_sha"] or row["plan_sha"] or ""),
         )
@@ -2455,6 +2475,8 @@ def _assert_mutable_ready_snapshot_current(
             sources,
             dependencies,
             priority,
+            plan.current_complexity,
+            plan.current_risk,
             plan.content_hash,
             plan.plan_sha,
         )
@@ -3453,6 +3475,7 @@ def _apply_general_planning_batch(
                 DELETE FROM exec_plans
                 WHERE repo = ? AND plan_id = ? AND path = ? AND title = ?
                   AND sources = ? AND depends_on = ? AND priority = ?
+                  AND current_complexity IS ? AND current_risk IS ?
                   AND content_hash = ?
                   AND COALESCE(current_revision_sha, plan_sha) = ? AND {cas}
                 """,
@@ -3464,6 +3487,8 @@ def _apply_general_planning_batch(
                     json.dumps(original.sources, ensure_ascii=False, separators=(",", ":")),
                     json.dumps(original.depends_on, ensure_ascii=False, separators=(",", ":")),
                     original.priority,
+                    original.current_complexity,
+                    original.current_risk,
                     original.content_hash,
                     original.plan_sha,
                 ),
@@ -3511,6 +3536,7 @@ def _apply_general_planning_batch(
                 UPDATE exec_plans SET path = ?
                 WHERE repo = ? AND plan_id = ? AND path = ? AND title = ?
                   AND sources = ? AND depends_on = ? AND priority = ?
+                  AND current_complexity IS ? AND current_risk IS ?
                   AND content_hash = ?
                   AND COALESCE(current_revision_sha, plan_sha) = ? AND {cas}
                 """,
@@ -3523,6 +3549,8 @@ def _apply_general_planning_batch(
                     json.dumps(original.sources, ensure_ascii=False, separators=(",", ":")),
                     json.dumps(original.depends_on, ensure_ascii=False, separators=(",", ":")),
                     original.priority,
+                    original.current_complexity,
+                    original.current_risk,
                     original.content_hash,
                     original.plan_sha,
                 ),
@@ -3549,6 +3577,7 @@ def _apply_general_planning_batch(
                     initial_worker_level = ?, effective_worker_level = ?
                 WHERE repo = ? AND plan_id = ? AND path = ? AND title = ?
                   AND sources = ? AND depends_on = ? AND priority = ?
+                  AND current_complexity IS ? AND current_risk IS ?
                   AND content_hash = ?
                   AND COALESCE(current_revision_sha, plan_sha) = ? AND {cas}
                 """,
@@ -3571,6 +3600,8 @@ def _apply_general_planning_batch(
                     json.dumps(original.sources, ensure_ascii=False, separators=(",", ":")),
                     json.dumps(original.depends_on, ensure_ascii=False, separators=(",", ":")),
                     original.priority,
+                    original.current_complexity,
+                    original.current_risk,
                     original.content_hash,
                     original.plan_sha,
                 ),

@@ -1,12 +1,16 @@
 import hashlib
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 import loop_manager
 import maintenance_state
+from maintenance_planning import PlanRevision, ReadyPlanSnapshot
+from planning_catalog import PlanDeletion, MutableReadySnapshot, mutable_snapshot_token
 
 
 def git(repo: Path, *arguments: str) -> str:
@@ -513,6 +517,186 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         )
 
 
+class MutableReadyMetadataCasTest(unittest.TestCase):
+    def setUp(self):
+        self.connection = sqlite3.connect(":memory:")
+        self.connection.row_factory = sqlite3.Row
+        self.addCleanup(self.connection.close)
+        self.connection.execute(loop_manager.SCHEMA)
+        self.connection.execute(loop_manager.EXEC_PLANS_SCHEMA)
+        self.connection.execute(loop_manager.EXECPLAN_CANCELLATIONS_SCHEMA)
+        maintenance_state.ensure_schema(self.connection)
+        self.connection.execute(
+            "INSERT INTO projects (repo, base_branch) VALUES ('repo', 'main')"
+        )
+        self.connection.execute(
+            """
+            INSERT INTO exec_plans (
+                repo, plan_id, path, title, sources, depends_on, priority,
+                content_hash, status, plan_sha
+            ) VALUES (
+                'repo', 'G-001', 'docs/plans/[G-001] Plan.md', 'Plan',
+                '["docs/PRODUCT.md"]', '[]', 'normal', 'hash', 'READY', 'base'
+            )
+            """
+        )
+        self.connection.commit()
+        plan = ReadyPlanSnapshot(
+            plan_id="G-001",
+            path="docs/plans/[G-001] Plan.md",
+            title="Plan",
+            sources=("docs/PRODUCT.md",),
+            depends_on=(),
+            complexity="low",
+            risk="low",
+            priority="normal",
+            content_hash="hash",
+            plan_sha="base",
+            text="plan body",
+            current_complexity=None,
+            current_risk=None,
+            current_metadata_recorded=True,
+        )
+        self.snapshot = MutableReadySnapshot(
+            repo="repo",
+            active_sha="base",
+            plans=(plan,),
+            token=mutable_snapshot_token("repo", "base", (plan,)),
+        )
+
+    def test_snapshot_reader_captures_sqlite_cache_values(self):
+        contents = plan_text("G-001", "Plan").encode("utf-8")
+        self.connection.execute(
+            "UPDATE exec_plans SET content_hash = ?, plan_sha = ?, "
+            "current_complexity = 'low', current_risk = 'high' "
+            "WHERE repo = 'repo'",
+            (hashlib.sha256(contents).hexdigest(), "a" * 40),
+        )
+        row = self.connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = 'repo'"
+        ).fetchone()
+
+        snapshot = loop_manager._ready_plan_snapshot_from_contents(row, contents)
+
+        self.assertEqual(snapshot.complexity, "low")
+        self.assertEqual(snapshot.risk, "low")
+        self.assertEqual(snapshot.current_complexity, "low")
+        self.assertEqual(snapshot.current_risk, "high")
+        self.assertTrue(snapshot.current_metadata_recorded)
+
+    def test_snapshot_rejects_exact_complexity_and_risk_cache_changes(self):
+        loop_manager._assert_mutable_ready_snapshot_current(
+            self.connection, self.snapshot
+        )
+        for field, value in (
+            ("current_complexity", "low"),
+            ("current_risk", "low"),
+        ):
+            with self.subTest(field=field):
+                self.connection.execute(
+                    f"UPDATE exec_plans SET {field} = ? WHERE repo = 'repo'",
+                    (value,),
+                )
+                with self.assertRaisesRegex(
+                    loop_manager.PlannerValidationError,
+                    "snapshot metadata가 변경",
+                ):
+                    loop_manager._assert_mutable_ready_snapshot_current(
+                        self.connection, self.snapshot
+                    )
+                self.connection.execute(
+                    f"UPDATE exec_plans SET {field} = NULL WHERE repo = 'repo'"
+                )
+
+    def test_publication_cas_rejects_cache_change_after_snapshot_guard(self):
+        original = self.snapshot.plans[0]
+        plan = {
+            "id": original.plan_id,
+            "title": original.title,
+            "sources": list(original.sources),
+            "depends_on": [],
+            "complexity": "low",
+            "risk": "low",
+            "priority": "normal",
+        }
+        publication = loop_manager.GeneralPlanningPublication(
+            "repo", "prepared", "base", "commit", self.snapshot.token,
+            "spec", "planning", "", "",
+        )
+        real_cas = loop_manager._mutable_ready_cas_where
+        for operation in ("delete", "revise", "rename"):
+            with self.subTest(operation=operation):
+                error_name = {
+                    "delete": "deletion",
+                    "revise": "revision",
+                    "rename": "rename",
+                }[operation]
+                self.connection.commit()
+                result = loop_manager.ValidatedPlanningResult(
+                    plans=(),
+                    publication_paths=(),
+                    deletions=(PlanDeletion(original),) if operation == "delete" else (),
+                    revisions=(
+                        PlanRevision(
+                            original.path if operation == "revise"
+                            else "docs/plans/[G-001] Renamed.md",
+                            plan,
+                            original,
+                        ),
+                    ) if operation != "delete" else (),
+                    mutable_snapshot=self.snapshot,
+                )
+
+                def change_cache_after_guard():
+                    self.connection.execute(
+                        "UPDATE exec_plans SET current_risk = 'high' "
+                        "WHERE repo = 'repo' AND plan_id = 'G-001'"
+                    )
+                    return real_cas()
+
+                with mock.patch.object(
+                    loop_manager, "general_planning_publication",
+                    return_value=publication,
+                ), mock.patch.object(
+                    loop_manager, "_mutable_ready_cas_where",
+                    side_effect=change_cache_after_guard,
+                ), mock.patch.object(loop_manager, "file_hash", return_value="newhash"):
+                    with self.assertRaisesRegex(
+                        loop_manager.PlannerValidationError,
+                        f"mutable READY {error_name}이 변경",
+                    ):
+                        loop_manager._apply_general_planning_batch(
+                            self.connection, "repo", Path("/unused"), result,
+                            "commit", "spec", "planning",
+                        )
+                row = self.connection.execute(
+                    "SELECT path, current_risk FROM exec_plans "
+                    "WHERE repo = 'repo' AND plan_id = 'G-001'"
+                ).fetchone()
+                self.assertEqual(tuple(row), (original.path, None))
+                self.assertEqual(
+                    self.connection.execute(
+                        "SELECT COUNT(*) FROM execplan_cancellations"
+                    ).fetchone()[0],
+                    0,
+                )
+
+    def test_manifest_round_trip_preserves_nullable_cache_snapshot(self):
+        result = loop_manager.ValidatedPlanningResult(
+            plans=(),
+            publication_paths=(),
+            deletions=(PlanDeletion(self.snapshot.plans[0]),),
+            mutable_snapshot=self.snapshot,
+        )
+
+        restored = loop_manager._planning_result_from_manifest(
+            loop_manager._planning_result_manifest(result)
+        )
+
+        self.assertEqual(restored.mutable_snapshot, self.snapshot)
+        self.assertEqual(restored.deletions, result.deletions)
+
+
 class EverStartedMigrationTest(unittest.TestCase):
     def test_existing_rows_are_backfilled_from_execution_evidence(self):
         connection = sqlite3.connect(":memory:")
@@ -554,6 +738,60 @@ class EverStartedMigrationTest(unittest.TestCase):
             [("G-001", 0), ("G-002", 1), ("G-003", 1)],
         )
         connection.close()
+
+    def test_existing_column_is_backfilled_after_interrupted_migration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "state.sqlite"
+            initial = sqlite3.connect(database)
+            initial.execute(loop_manager.SCHEMA)
+            initial.execute(loop_manager.EXEC_PLANS_SCHEMA)
+            for plan_id, status, branch, ever_started in (
+                ("G-001", "READY", None, 0),
+                ("G-002", "READY", "loop-manager/G-002", 0),
+                ("G-003", "MERGED", None, 0),
+                ("G-004", "READY", None, 1),
+            ):
+                initial.execute(
+                    """
+                    INSERT INTO exec_plans (
+                        repo, plan_id, path, title, sources, depends_on,
+                        priority, content_hash, status, plan_sha, branch,
+                        ever_started
+                    ) VALUES ('repo', ?, ?, ?, '["docs/PRODUCT.md"]', '[]',
+                              'normal', 'hash', ?, 'base', ?, ?)
+                    """,
+                    (
+                        plan_id,
+                        f"docs/plans/[{plan_id}] Plan.md",
+                        "Plan",
+                        status,
+                        branch,
+                        ever_started,
+                    ),
+                )
+            initial.commit()
+            initial.close()
+
+            with closing(sqlite3.connect(database)) as resumed:
+                resumed.row_factory = sqlite3.Row
+                loop_manager._ensure_execplans_schema(resumed)
+                self.assertFalse(resumed.in_transaction)
+                loop_manager._ensure_execplans_schema(resumed)
+                self.assertFalse(resumed.in_transaction)
+
+                rows = resumed.execute(
+                    "SELECT plan_id, status, branch, ever_started FROM exec_plans "
+                    "ORDER BY plan_id"
+                ).fetchall()
+                self.assertEqual(
+                    [tuple(row) for row in rows],
+                    [
+                        ("G-001", "READY", None, 0),
+                        ("G-002", "READY", "loop-manager/G-002", 1),
+                        ("G-003", "MERGED", None, 1),
+                        ("G-004", "READY", None, 1),
+                    ],
+                )
 
 
 if __name__ == "__main__":

@@ -88,7 +88,7 @@ def mutable_snapshot_token(
 
 
 def snapshot_to_dict(snapshot: ReadyPlanSnapshot) -> dict[str, object]:
-    return {
+    payload = {
         "plan_id": snapshot.plan_id,
         "path": snapshot.path,
         "title": snapshot.title,
@@ -101,10 +101,20 @@ def snapshot_to_dict(snapshot: ReadyPlanSnapshot) -> dict[str, object]:
         "plan_sha": snapshot.plan_sha,
         "text": snapshot.text,
     }
+    if snapshot.current_metadata_recorded:
+        payload["current_complexity"] = snapshot.current_complexity
+        payload["current_risk"] = snapshot.current_risk
+    return payload
 
 
 def snapshot_from_dict(value: Mapping[str, object]) -> ReadyPlanSnapshot:
     try:
+        cache_fields = {"current_complexity", "current_risk"}
+        recorded = cache_fields.issubset(value)
+        if cache_fields.intersection(value) and not recorded:
+            raise ValueError("incomplete current metadata")
+        current_complexity = value.get("current_complexity")
+        current_risk = value.get("current_risk")
         sources = tuple(str(item) for item in value["sources"])  # type: ignore[arg-type]
         depends_on = tuple(
             str(item) for item in value["depends_on"]  # type: ignore[arg-type]
@@ -121,6 +131,11 @@ def snapshot_from_dict(value: Mapping[str, object]) -> ReadyPlanSnapshot:
             content_hash=str(value["content_hash"]),
             plan_sha=str(value["plan_sha"]),
             text=str(value["text"]),
+            current_complexity=(
+                str(current_complexity) if current_complexity is not None else None
+            ),
+            current_risk=str(current_risk) if current_risk is not None else None,
+            current_metadata_recorded=recorded,
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("mutable READY snapshot manifest가 유효하지 않습니다.") from error
