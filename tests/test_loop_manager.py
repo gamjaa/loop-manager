@@ -6733,6 +6733,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repo, _plan_path = self._repository_with_plan(directory)
             for module_name in (
+                "agent_scope_decision.py",
                 "agent_invocation.py",
                 "agent_invocation_state.py",
                 "agent_provider_usage.py",
