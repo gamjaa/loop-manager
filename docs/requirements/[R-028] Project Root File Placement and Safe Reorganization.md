@@ -1,0 +1,43 @@
+# [R-028] Project Root File Placement and Safe Reorganization
+
+## Context
+
+Loop Manager가 관리하는 프로젝트에는 언어·도구별 필수 루트 파일이 다르다. 또한 Loop Manager는 루트의 `.agents/`, `docs/`와 `scripts/verify.ps1` 또는 `scripts/verify.sh` 같은 고정 경로를 사용한다. 현재 공통 지침에는 필수 폴더를 루트에 유지하면서 그 밖의 파일을 정리할 기준이 없다. 파일명만 보고 이동하면 import, build, 배포, 도구 탐색과 사용자 진입 경로도 깨질 수 있다.
+
+## Requirement
+
+Loop Manager가 사용하는 모든 프로젝트는 `.agents/`, `docs/`, `scripts/`와 그 밖에 Loop Manager가 고정 경로로 요구하는 폴더를 항상 저장소 루트에 둔다. `AGENTS.md`, `docs/PLANS.md`, `docs/ARCHITECTURE.md`, 존재하는 `docs/PRODUCT.md`와 `docs/requirements/*.md`, 현재 운영체제의 `scripts/verify.ps1` 또는 `scripts/verify.sh`도 각 지정된 경로를 유지한다. `scripts/`가 아직 없는 프로젝트는 검증 스크립트를 만들 때 루트에 생성한다. 필수 폴더나 파일을 루트 정리 대상으로 분류하지 않는다.
+
+그 밖의 루트 항목은 사용자 진입, 실행·빌드·배포 또는 도구의 필수 탐색에 필요한 것만 유지한다. 예를 들어 프로젝트에 실제로 필요한 `README`, 라이선스, 패키지 manifest, launcher와 루트 고정 설정은 유지한다. 내부 모듈, 보조 자료와 생성물은 프로젝트 관례에 맞는 하위 폴더에 둔다. 파일 확장자나 줄 수만으로 필수 여부를 판정하지 않는다.
+
+신규 Worker 변경과 Reviewer는 새 루트 파일의 필요성을 현재 프로젝트의 실행·도구 계약으로 확인한다. 기존 등록 프로젝트와 신규 프로젝트의 첫 구조 전수 평가에서는 루트 항목의 실제 참조와 사용자 이용 경로를 검사하고, 불필요한 배치가 확인된 항목만 R-027의 동작 보존 리팩터링 계획에 포함한다. 이동 후에는 import, 상대 경로, launcher, 설정 탐색, 문서 링크와 검증 스크립트가 유지돼야 한다. 소유권이나 참조 관계를 확인할 수 없는 파일은 자동 이동·삭제하지 않고 판단 근거를 사용자에게 제시한다.
+
+루트 정리는 파일 배치에 관한 공통 기준이며 제품 동작이나 문서 의미를 바꾸는 근거가 아니다. 모든 이동은 관리 worktree와 ExecPlan·PR 절차 안에서 수행하고 사용자 기본 worktree의 변경을 보존한다.
+
+## Acceptance Criteria
+
+- 신규 변경에서 루트에 놓이는 파일은 사용자 진입, 실행·빌드·배포 또는 필수 도구 탐색 중 하나의 구체적인 근거가 있다.
+- `.agents/`, `docs/`, `scripts/` 및 Loop Manager의 다른 고정 경로 폴더는 모든 대상 프로젝트에서 루트에 유지되고, 하위 경로로 이동하는 리팩터링 계획의 후보가 되지 않는다.
+- `AGENTS.md`, `docs/PLANS.md`, `docs/ARCHITECTURE.md`, 존재하는 PRODUCT·Requirement와 현재 운영체제의 `scripts/verify.ps1` 또는 `scripts/verify.sh`는 지정된 경로에서 읽히고 실행된다.
+- 루트 고정이 필요한 언어별 manifest, launcher와 설정은 프로젝트별 근거가 있으면 이동 대상으로 분류되지 않는다.
+- 기존 프로젝트의 첫 구조 평가에서 루트 파일 전체를 점검하고, 불필요한 파일이 확인되면 해당 파일의 참조·소유권과 안전한 목적지에 근거한 ExecPlan을 작성한다.
+- 위치만 바꾸는 계획은 import, 실행 명령, 빌드·배포, 설정 탐색, 상대 경로와 문서 링크의 동작 보존 조건을 기록한다.
+- 파일 이동 후 관련 targeted test, 전체 verify와 읽기 전용 Review를 통과해야 PR을 생성한다.
+- 소유권이나 참조 관계를 확인할 수 없거나 사용자 변경과 충돌하는 파일은 자동 이동·삭제하지 않는다.
+- 새 루트 파일의 필요성이 Reviewer에게 입증되지 않으면 현재 변경의 blocking issue로 보고할 수 있다.
+- 기존 전수 평가와 별도의 중복 전체 스캔을 강제하지 않는다.
+
+## Product Impact
+
+- 모든 관리 프로젝트의 루트에는 Loop Manager 필수 폴더와 실제 진입·운영·도구 계약에 필요한 파일이 남고 내부 파일은 적절한 하위 폴더에서 관리된다.
+
+## Non-Goals
+
+- 모든 프로젝트에 같은 폴더 구조나 루트 파일 수 상한을 강제하지 않는다.
+- Loop Manager가 사용하는 루트 고정 폴더를 다른 위치로 옮겨 루트를 비우지 않는다.
+- 필수 루트 파일 또는 참조 관계가 불명확한 파일을 형식적으로 이동하지 않는다.
+- 생성물 정리를 이유로 사용자 파일을 삭제하지 않는다.
+
+## Open Questions
+
+- 없음
