@@ -108,9 +108,14 @@ class FakePorts:
         self.latest_base = FakeLatestBasePort()
         self.validation = FakeValidationPort()
         self.publication = FakePublicationPort()
+        self.guard_calls = []
 
     def prepare(self):
         return self.workspace.prepare()
+
+    def guard(self, context):
+        self.guard_calls.append(context)
+        return context
 
     def run(self, context):
         return self.worker.run(context)
@@ -171,6 +176,27 @@ class ExecutionPhaseCoordinatorTests(unittest.TestCase):
         self.assertEqual(ports.validation.verify_calls, [(verifying, ports.latest_base)])
         self.assertEqual(ports.validation.review_calls, [reviewing])
         self.assertEqual(ports.publication.calls, [(publishing, ports.latest_base)])
+        self.assertEqual(
+            ports.guard_calls,
+            [implementing, verifying, reviewing, publishing],
+        )
+
+    def test_stable_dependency_wait_stops_before_every_phase_port(self):
+        implementing = execution_context()
+        ports = FakePorts(implementing)
+        ports.guard = lambda context: ExecutionOutcome(
+            ExecutionOutcomeKind.STABLE_WAIT,
+            context=context,
+            detail="G-036",
+        )
+
+        outcome = ExecutionPhaseCoordinator(ports).dispatch(implementing)
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.STABLE_WAIT)
+        self.assertEqual(ports.worker.calls, [])
+        self.assertEqual(ports.validation.verify_calls, [])
+        self.assertEqual(ports.validation.review_calls, [])
+        self.assertEqual(ports.publication.calls, [])
 
     def test_resume_dispatch_uses_persisted_phase_and_markers(self):
         context = execution_context(

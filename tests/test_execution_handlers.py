@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest import TestCase, mock
 
 import execution_handlers as handlers
+from execution_revision import DefinitionSnapshot
 import loop_manager as lm
 import runtime_state
 from execution_state import ExecutionStatePort
@@ -38,6 +39,7 @@ class ExecutionHandlerTests(TestCase):
             blocking=bundle(handlers.BlockingEffects),
             publication=bundle(handlers.PublicationEffects),
             events=bundle(handlers.EventsEffects),
+            revision=bundle(handlers.RevisionEffects),
         )
         self.effects.workspace.is_directory.return_value = False
         self.effects.workspace.branch_has_changes.return_value = True
@@ -53,6 +55,14 @@ class ExecutionHandlerTests(TestCase):
         self.effects.publication.published_execplan.return_value = self.plan
         self.effects.publication.push_managed_publication_branch.side_effect = lambda *a: self.calls.append('push') or 'head'
         self.effects.publication.command.side_effect = lambda *a, **k: self.calls.append('pr') or SimpleNamespace(stdout='https://example/pr/1')
+        self.effects.revision.reconcile_catalog.side_effect = lambda *_: SimpleNamespace(
+            kind=SimpleNamespace(value='reconciled'), revision_sha=self.remote
+        )
+        self.effects.revision.body_hash.return_value = 'body'
+        self.effects.revision.source_fingerprint.return_value = 'source'
+        self.effects.revision.changed_paths.return_value = ()
+        self.effects.revision.unmet_dependencies.return_value = ()
+        self.effects.archive.requirement_archive_sources.return_value = ()
         self.handler = handlers.ExecutionHandlers(
             self.effects, repo='repo', repo_path=Path('/repo'), state_dir=Path('/state'),
             base='main', base_sha='base', provider='codex', config_path=Path('/config'),
@@ -99,6 +109,25 @@ class ExecutionHandlerTests(TestCase):
         order = [c for c in self.calls if c in {'worker', 'verify', 'commit', 'reviewer', 'push', 'pr'}]
         self.assertEqual(order, ['worker', 'verify', 'commit', 'reviewer', 'push', 'pr'])
 
+    def test_revision_guard_tokens_follow_complete_phase_lifecycle(self):
+        context = self.handler.guard(self.context())
+        self.assertNotIsInstance(context, handlers.ExecutionOutcome)
+
+        for method in ('run', 'verify', 'review', 'publish'):
+            call = getattr(self.handler, method)
+            args = (context, self.handler) if method in {'verify', 'publish'} else (context,)
+            result = call(*args)
+            context = result.context
+
+        completed = self.repository.get('repo', 'G-047')
+        self.assertEqual(completed.status, 'PR_OPEN')
+        self.assertIsNotNone(completed.definition_snapshot)
+        self.assertIsNotNone(completed.worker_input_token)
+        self.assertIsNotNone(completed.archive_token)
+        self.assertIsNotNone(completed.verify_token)
+        self.assertIsNotNone(completed.review_token)
+        self.assertIsNotNone(completed.publication_token)
+
     def test_latest_base_uses_same_intent_and_rebase_for_both_checkpoints(self):
         for phase in ('VERIFYING', 'PUBLISHING'):
             with self.subTest(phase=phase):
@@ -127,6 +156,178 @@ class ExecutionHandlerTests(TestCase):
             self.handler.run(context)
         self.assertEqual(self.calls, [])
         self.assertIsNone(self.repository.get('repo', 'G-047').worker_session_id)
+
+    def test_source_revision_invalidates_artifacts_but_preserves_sessions_and_workspace(self):
+        guarded = self.handler.guard(self.context())
+        self.assertNotIsInstance(guarded, handlers.ExecutionOutcome)
+        snapshot = DefinitionSnapshot.deserialize(
+            self.state.row()['definition_snapshot']
+        )
+        assert snapshot is not None
+        self.state.update_project(
+            'repo',
+            phase='PUBLISHING',
+            validated_base_sha='base',
+            worker_session_id='worker-session',
+            reviewer_session_id='reviewer-session',
+            worker_result='worker-result',
+            verify_result='verify-result',
+            review_result='review-result',
+            worker_input_token=snapshot.worker_token,
+            archive_token=snapshot.archive_token,
+            verify_token=snapshot.verify_token('base'),
+            review_token=snapshot.review_token('base'),
+            publication_token=snapshot.publication_token('base'),
+        )
+        self.effects.revision.source_fingerprint.return_value = 'changed-source'
+
+        outcome = self.handler.guard(self.handler._context())
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+        row = self.state.row()
+        self.assertEqual(row['phase'], 'WORKING')
+        self.assertIsNone(row['worker_result'])
+        self.assertIsNone(row['verify_result'])
+        self.assertIsNone(row['review_result'])
+        self.assertEqual(row['worker_session_id'], 'worker-session')
+        self.assertEqual(row['reviewer_session_id'], 'reviewer-session')
+        self.assertEqual(row['branch'], 'loop-manager/G-047')
+        self.assertEqual(row['worktree'], '/state/G-047')
+
+    def test_revision_guard_adopts_legacy_phase_artifacts_without_worker_replay(self):
+        self.state.update_project(
+            'repo',
+            phase='PUBLISHING',
+            validated_base_sha='base',
+            worker_result='worker-result',
+            verify_result='verify-result',
+            review_result='review-result',
+            definition_snapshot=None,
+            worker_input_token=None,
+            archive_token=None,
+            verify_token=None,
+            review_token=None,
+            publication_token=None,
+        )
+
+        guarded = self.handler.guard(self.handler._context())
+
+        self.assertNotIsInstance(guarded, handlers.ExecutionOutcome)
+        row = self.state.row()
+        snapshot = DefinitionSnapshot.deserialize(row['definition_snapshot'])
+        assert snapshot is not None
+        self.assertEqual(row['phase'], 'PUBLISHING')
+        self.assertEqual(row['worker_result'], 'worker-result')
+        self.assertEqual(row['verify_result'], 'verify-result')
+        self.assertEqual(row['review_result'], 'review-result')
+        self.assertEqual(row['worker_input_token'], snapshot.worker_token)
+        self.assertEqual(row['archive_token'], snapshot.archive_token)
+        self.assertEqual(row['verify_token'], snapshot.verify_token('base'))
+        self.assertEqual(row['review_token'], snapshot.review_token('base'))
+
+    def test_revision_guard_retries_when_base_and_catalog_shas_disagree(self):
+        self.effects.revision.reconcile_catalog.side_effect = None
+        self.effects.revision.reconcile_catalog.return_value = SimpleNamespace(
+            kind=SimpleNamespace(value='reconciled'), revision_sha='other-base'
+        )
+
+        outcome = self.handler.guard(self.context())
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+        self.assertIsNone(self.state.row()['definition_snapshot'])
+        self.effects.revision.body_hash.assert_not_called()
+        self.effects.revision.source_fingerprint.assert_not_called()
+
+    def test_revision_guard_rejects_legacy_artifacts_after_source_change(self):
+        self.state.update_project(
+            'repo',
+            phase='PUBLISHING',
+            validated_base_sha='base',
+            worker_result='worker-result',
+            verify_result='verify-result',
+            review_result='review-result',
+            definition_snapshot=None,
+            worker_input_token=None,
+            archive_token=None,
+            verify_token=None,
+            review_token=None,
+            publication_token=None,
+        )
+        self.remote = 'new-base'
+        self.effects.revision.changed_paths.return_value = (
+            'docs/PRODUCT.md',
+        )
+
+        outcome = self.handler.guard(self.handler._context())
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+        row = self.state.row()
+        self.assertEqual(row['phase'], 'WORKING')
+        self.assertIsNone(row['worker_result'])
+        self.assertIsNone(row['verify_result'])
+        self.assertIsNone(row['review_result'])
+
+    def test_successful_revision_refresh_clears_rebase_recovery_marker(self):
+        guarded = self.handler.guard(self.context())
+        self.assertNotIsInstance(guarded, handlers.ExecutionOutcome)
+        self.remote = 'new-base'
+
+        outcome = self.handler.guard(guarded)
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+        row = self.state.row()
+        self.assertEqual(row['phase'], 'WORKING')
+        self.assertEqual(row['active_sha'], 'new-base')
+        self.assertIsNone(row['revision_resume_status'])
+        self.assertIsNone(row['last_error'])
+
+    def test_revision_refresh_checkpoints_dirty_verified_worker_patch_before_rebase(self):
+        self.state.update_project(
+            'repo', phase='VERIFYING', worker_result='worker-result'
+        )
+        self.remote = 'new-base'
+
+        outcome = self.handler.guard(self.handler._context())
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+        self.assertLess(self.calls.index('commit'), self.calls.index('rebase'))
+        self.assertEqual(self.state.row()['active_sha'], 'new-base')
+        self.assertEqual(self.state.row()['worker_result'], 'worker-result')
+
+    def test_dependency_gate_reports_unmerged_direct_and_indirect_plans(self):
+        for plan_id, dependencies in (
+            ('G-035', '[]'),
+            ('G-036', '["G-035"]'),
+        ):
+            self.connection.execute(
+                "INSERT INTO exec_plans (repo, plan_id, path, title, sources, "
+                "depends_on, priority, content_hash, status) VALUES "
+                "('repo', ?, ?, ?, '[\"docs/PRODUCT.md\"]', ?, 'normal', "
+                "'hash', 'READY')",
+                (plan_id, f'docs/plans/[{plan_id}] Plan.md', 'Plan', dependencies),
+            )
+        self.connection.execute(
+            "UPDATE exec_plans SET depends_on = '[\"G-036\"]' "
+            "WHERE repo = 'repo' AND plan_id = 'G-047'"
+        )
+        self.connection.commit()
+
+        self.assertEqual(
+            lm.unmet_execplan_dependencies(
+                self.connection, 'repo', 'G-047'
+            ),
+            ('G-035', 'G-036'),
+        )
+        self.connection.execute(
+            "UPDATE exec_plans SET status = 'MERGED' "
+            "WHERE repo = 'repo' AND plan_id IN ('G-035', 'G-036')"
+        )
+        self.assertEqual(
+            lm.unmet_execplan_dependencies(
+                self.connection, 'repo', 'G-047'
+            ),
+            (),
+        )
 
     def test_verify_interruption_resumes_without_duplicate_commit(self):
         context = self.context('VERIFYING')

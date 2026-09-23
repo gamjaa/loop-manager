@@ -44,6 +44,13 @@ MIRRORED_FIELDS = (
     "worker_result",
     "verify_result",
     "review_result",
+    "definition_snapshot",
+    "worker_input_token",
+    "archive_token",
+    "verify_token",
+    "review_token",
+    "publication_token",
+    "revision_resume_status",
     "agent_role",
     "agent_snapshot",
     "agent_input_fingerprint",
@@ -131,6 +138,13 @@ EXECUTION_CLEAR_VALUES: Mapping[str, object] = {
     "worker_result": None,
     "verify_result": None,
     "review_result": None,
+    "definition_snapshot": None,
+    "worker_input_token": None,
+    "archive_token": None,
+    "verify_token": None,
+    "review_token": None,
+    "publication_token": None,
+    "revision_resume_status": None,
     "agent_role": None,
     "agent_snapshot": None,
     "agent_baseline": None,
@@ -271,6 +285,13 @@ class ExecutionSnapshot:
     worker_result: str | None
     verify_result: str | None
     review_result: str | None
+    definition_snapshot: str | None
+    worker_input_token: str | None
+    archive_token: str | None
+    verify_token: str | None
+    review_token: str | None
+    publication_token: str | None
+    revision_resume_status: str | None
     workspace_owned: int
     agent_role: str | None
     agent_snapshot: str | None
@@ -310,6 +331,13 @@ class ExecutionSnapshot:
             worker_result=_text(row, "worker_result"),
             verify_result=_text(row, "verify_result"),
             review_result=_text(row, "review_result"),
+            definition_snapshot=_text(row, "definition_snapshot"),
+            worker_input_token=_text(row, "worker_input_token"),
+            archive_token=_text(row, "archive_token"),
+            verify_token=_text(row, "verify_token"),
+            review_token=_text(row, "review_token"),
+            publication_token=_text(row, "publication_token"),
+            revision_resume_status=_text(row, "revision_resume_status"),
             workspace_owned=int(row["workspace_owned"]),
             agent_role=_text(row, "agent_role"),
             agent_snapshot=_text(row, "agent_snapshot"),
@@ -343,6 +371,13 @@ class ExecutionSnapshot:
             "worker_result": self.worker_result,
             "verify_result": self.verify_result,
             "review_result": self.review_result,
+            "definition_snapshot": self.definition_snapshot,
+            "worker_input_token": self.worker_input_token,
+            "archive_token": self.archive_token,
+            "verify_token": self.verify_token,
+            "review_token": self.review_token,
+            "publication_token": self.publication_token,
+            "revision_resume_status": self.revision_resume_status,
             "agent_role": self.agent_role,
             "agent_snapshot": self.agent_snapshot,
             "agent_input_fingerprint": self.agent_input_fingerprint,
@@ -685,6 +720,13 @@ class RuntimeStateRepository:
                 "branch": branch,
                 "worktree": worktree,
                 "last_error": None,
+                "definition_snapshot": None,
+                "worker_input_token": None,
+                "archive_token": None,
+                "verify_token": None,
+                "review_token": None,
+                "publication_token": None,
+                "revision_resume_status": None,
             },
             project_values={
                 "active_sha": activation_sha,
@@ -706,6 +748,13 @@ class RuntimeStateRepository:
                 "worker_result": None,
                 "verify_result": None,
                 "review_result": None,
+                "definition_snapshot": None,
+                "worker_input_token": None,
+                "archive_token": None,
+                "verify_token": None,
+                "review_token": None,
+                "publication_token": None,
+                "revision_resume_status": None,
             },
             enqueue=False,
         )

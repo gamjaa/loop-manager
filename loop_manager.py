@@ -72,6 +72,7 @@ from planning_runtime import (
 import project_registry
 import runtime_state
 import execution_handlers
+import execution_revision
 from execution_state import ExecutionStatePort as _ExecutionStatePort
 from types import SimpleNamespace
 from maintenance_planning import (
@@ -154,6 +155,13 @@ CREATE TABLE IF NOT EXISTS projects (
     worker_result TEXT,
     verify_result TEXT,
     review_result TEXT,
+    definition_snapshot TEXT,
+    worker_input_token TEXT,
+    archive_token TEXT,
+    verify_token TEXT,
+    review_token TEXT,
+    publication_token TEXT,
+    revision_resume_status TEXT,
     planning_validation_error TEXT,
     planning_result_pending_validation INTEGER NOT NULL DEFAULT 0,
     planning_result_completed INTEGER NOT NULL DEFAULT 0,
@@ -239,6 +247,13 @@ CREATE TABLE IF NOT EXISTS exec_plans (
     worker_result TEXT,
     verify_result TEXT,
     review_result TEXT,
+    definition_snapshot TEXT,
+    worker_input_token TEXT,
+    archive_token TEXT,
+    verify_token TEXT,
+    review_token TEXT,
+    publication_token TEXT,
+    revision_resume_status TEXT,
     verify_failure_history TEXT NOT NULL DEFAULT '{}',
     review_failure_history TEXT NOT NULL DEFAULT '{}',
     initial_worker_level INTEGER,
@@ -1080,6 +1095,13 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
         "publication_path": "TEXT",
         "publication_content_hash": "TEXT",
         "publication_sha": "TEXT",
+        "definition_snapshot": "TEXT",
+        "worker_input_token": "TEXT",
+        "archive_token": "TEXT",
+        "verify_token": "TEXT",
+        "review_token": "TEXT",
+        "publication_token": "TEXT",
+        "revision_resume_status": "TEXT",
     }
     for column, definition in migrations.items():
         if column not in columns:
@@ -1195,6 +1217,13 @@ def connect_database(
         "agent_result_plan": "TEXT",
         "agent_result_snapshot": "TEXT",
         "agent_manager_snapshot": "TEXT",
+        "definition_snapshot": "TEXT",
+        "worker_input_token": "TEXT",
+        "archive_token": "TEXT",
+        "verify_token": "TEXT",
+        "review_token": "TEXT",
+        "publication_token": "TEXT",
+        "revision_resume_status": "TEXT",
     }
     for column, definition in migrations.items():
         if column not in columns:
@@ -8182,6 +8211,117 @@ def _revision_execplan_input_fingerprint(
         shown = git(repo_path, "show", f"{revision}:{relative_path}", check=False)
         entries.append((relative_path, shown.stdout if shown.returncode == 0 else None))
     return _execplan_input_fingerprint(entries)
+
+
+def _revision_execplan_source_fingerprint(
+    repo_path: Path,
+    revision: str,
+    plan: sqlite3.Row,
+) -> str:
+    """Fingerprint only current source documents; the plan body is classified separately."""
+
+    entries = []
+    for relative_path in json.loads(str(plan["sources"])):
+        shown = git(
+            repo_path,
+            "show",
+            f"{revision}:{relative_path}",
+            check=False,
+        )
+        if shown.returncode and relative_path != "docs/PRODUCT.md":
+            archive_path = execplan_catalog.requirement_archive_path(
+                str(relative_path)
+            )
+            shown = git(
+                repo_path,
+                "show",
+                f"{revision}:{archive_path}",
+                check=False,
+            )
+        entries.append(
+            (str(relative_path), shown.stdout if shown.returncode == 0 else None)
+        )
+    return _execplan_input_fingerprint(entries)
+
+
+def _revision_execplan_body_hash(
+    repo_path: Path,
+    revision: str,
+    path: str,
+) -> str:
+    shown = git(repo_path, "show", f"{revision}:{path}", check=False)
+    if shown.returncode:
+        raise RuntimeError(f"최신 ExecPlan 본문을 읽을 수 없습니다: {path}")
+    return execution_revision.execplan_body_hash(shown.stdout)
+
+
+def _revision_changed_paths(
+    repo_path: Path,
+    previous_revision: str,
+    current_revision: str,
+) -> tuple[str, ...]:
+    if not previous_revision or previous_revision == current_revision:
+        return ()
+    changed = git(
+        repo_path,
+        "diff",
+        "--name-only",
+        "--find-renames",
+        previous_revision,
+        current_revision,
+        "--",
+        check=False,
+    )
+    if changed.returncode:
+        raise RuntimeError("실행 base revision 차이를 확인할 수 없습니다.")
+    return tuple(
+        sorted(
+            {
+                line.strip()
+                for line in changed.stdout.splitlines()
+                if line.strip()
+            }
+        )
+    )
+
+
+def unmet_execplan_dependencies(
+    connection: sqlite3.Connection,
+    repo: str,
+    plan_id: str,
+) -> tuple[str, ...]:
+    """Return every direct or indirect dependency not confirmed MERGED."""
+
+    rows = connection.execute(
+        "SELECT plan_id, depends_on, status FROM exec_plans WHERE repo = ?",
+        (repo,),
+    ).fetchall()
+    graph = {
+        str(row["plan_id"]): (
+            tuple(str(item) for item in json.loads(str(row["depends_on"]))),
+            str(row["status"]),
+        )
+        for row in rows
+    }
+    if plan_id not in graph:
+        raise RuntimeError(f"dependency를 확인할 ExecPlan이 없습니다: {plan_id}")
+    unmet: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(current: str) -> None:
+        if current in visited:
+            return
+        visited.add(current)
+        dependencies, _status = graph[current]
+        for dependency in dependencies:
+            stored = graph.get(dependency)
+            if stored is None or stored[1] != "MERGED":
+                unmet.add(dependency)
+            if stored is not None:
+                visit(dependency)
+
+    visit(plan_id)
+    return tuple(sorted(unmet))
 
 
 def _revision_review_issue_fingerprint(
@@ -16274,6 +16414,13 @@ def _ExecutionLifecyclePorts(connection, runtime_repository, **identity):
         events=execution_handlers.EventsEffects(
             operation_log=state.bind(operation_log, name="operation_log", connected=False, mutates=False),
             operation_print=state.bind(operation_print, name="operation_print", connected=False, mutates=False),
+        ),
+        revision=execution_handlers.RevisionEffects(
+            reconcile_catalog=state.bind(reconcile_execplan_catalog, name="reconcile_execplan_catalog", connected=True, mutates=True),
+            source_fingerprint=state.bind(_revision_execplan_source_fingerprint, name="_revision_execplan_source_fingerprint", connected=False, mutates=False),
+            body_hash=state.bind(_revision_execplan_body_hash, name="_revision_execplan_body_hash", connected=False, mutates=False),
+            changed_paths=state.bind(_revision_changed_paths, name="_revision_changed_paths", connected=False, mutates=False),
+            unmet_dependencies=state.bind(unmet_execplan_dependencies, name="unmet_execplan_dependencies", connected=True, mutates=False),
         ),
     )
     return execution_handlers.ExecutionHandlers(effects, **identity)
