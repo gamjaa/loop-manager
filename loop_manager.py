@@ -13281,9 +13281,15 @@ def _later_published_execplan(
 def _revision_execplan_catalog(
     repo_path: Path,
     revision: str,
+    *,
+    archive_conflict_plan_ids: frozenset[str] = frozenset(),
 ) -> dict[str, dict[str, object]]:
     try:
-        snapshot = revision_execplan_snapshot(repo_path, revision)
+        snapshot = revision_execplan_snapshot(
+            repo_path,
+            revision,
+            archive_conflict_plan_ids=archive_conflict_plan_ids,
+        )
     except RuntimeError as error:
         raise RequirementArchiveError(
             f"Git revision의 ExecPlan source 관계를 확정할 수 없습니다: {error}"
@@ -13322,7 +13328,14 @@ def requirement_archive_candidates(
     if not _stored_requirement_sources(rows):
         return ()
 
-    catalog = _revision_execplan_catalog(repo_path, revision)
+    catalog = _revision_execplan_catalog(
+        repo_path,
+        revision,
+        archive_conflict_plan_ids=frozenset(
+            plan_id for plan_id, row in states.items()
+            if str(row["status"]) == "MERGED"
+        ),
+    )
     historical_rows = connection.execute(
         "SELECT plan_id, merge_confirmed FROM execplan_catalog_history "
         "WHERE repo = ? AND currently_archived = 1",

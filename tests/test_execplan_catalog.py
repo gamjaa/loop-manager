@@ -292,6 +292,65 @@ class ExecPlanCatalogSnapshotTest(unittest.TestCase):
         self.assertEqual(tuple(snapshot.active), ("G-001", "G-002"))
         self.assertEqual(tuple(snapshot.archived), ())
 
+    def test_requirement_archive_candidate_ignores_only_merged_plan_conflict(self):
+        source = "docs/requirements/Independent.md"
+        documents = {
+            "docs/plans/[G-001] Merged.md": plan_text("G-001", "Merged"),
+            "docs/plans/archive/[G-001] Merged.md": plan_text("G-001", "Merged"),
+            "docs/plans/[G-002] Current.md": plan_text(
+                "G-002", "Current"
+            ).replace("docs/PRODUCT.md", source),
+        }
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        connection.execute(
+            "CREATE TABLE exec_plans (repo TEXT, plan_id TEXT, path TEXT, "
+            "sources TEXT, status TEXT, plan_sha TEXT, "
+            "publication_path TEXT, publication_sha TEXT)"
+        )
+        connection.execute(
+            "CREATE TABLE execplan_catalog_history (repo TEXT, plan_id TEXT, "
+            "merge_confirmed INTEGER, currently_archived INTEGER)"
+        )
+        connection.executemany(
+            "INSERT INTO exec_plans VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL)",
+            (
+                ("/repo", "G-001", "docs/plans/[G-001] Merged.md",
+                 '["docs/PRODUCT.md"]', "MERGED"),
+                ("/repo", "G-002", "docs/plans/[G-002] Current.md",
+                 f'["{source}"]', "IMPLEMENTING"),
+            ),
+        )
+
+        def snapshot(_repo, _revision, *, archive_conflict_plan_ids):
+            return execplan_catalog.snapshot_from_documents(
+                documents,
+                archive_conflict_plan_ids=archive_conflict_plan_ids,
+            )
+
+        with mock.patch.object(
+            loop_manager, "revision_execplan_snapshot", side_effect=snapshot
+        ), mock.patch.object(
+            loop_manager, "_requirement_archive_tree",
+            return_value={source.encode(): ()},
+        ):
+            self.assertEqual(
+                loop_manager.requirement_archive_candidates(
+                    connection, Path("/repo"), "/repo", "base", "G-002"
+                ),
+                (source,),
+            )
+            connection.execute(
+                "UPDATE exec_plans SET status = 'READY' WHERE plan_id = 'G-001'"
+            )
+            with self.assertRaisesRegex(
+                loop_manager.RequirementArchiveError, "중복 ExecPlan id"
+            ):
+                loop_manager.requirement_archive_candidates(
+                    connection, Path("/repo"), "/repo", "base", "G-002"
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
