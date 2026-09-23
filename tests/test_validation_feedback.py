@@ -6,6 +6,19 @@ from validation_feedback import (MAX_DIAGNOSTIC, is_validation_error,
 
 
 class ValidationFeedbackTests(unittest.TestCase):
+    def test_duplicate_review_ids_combine_diagnostics_deterministically(self):
+        sections = ["ISSUE_ID: File.py::Func::Bug\nFix A.",
+                    "ISSUE_ID: file.py::func::bug\nFix B.",
+                    "ISSUE_ID: File.py::Func::Bug\nFix A."]
+        raw = "\n".join(sections) + "\nVERDICT: FAIL"
+        items = normalize_feedback("review", raw)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].identity, "review:file.py::func::bug")
+        self.assertEqual(items[0].diagnostic, "Fix A.\n\nFix B.")
+        self.assertEqual(items, normalize_feedback(
+            "review", "\n".join(reversed(sections)) + "\nVERDICT: FAIL"))
+        self.assertEqual(len(lm.validation_failure_fingerprints("review", raw)), 1)
+
     def test_review_issues_are_individually_bounded_and_sorted(self):
         raw = ("ISSUE_ID: z.py::thing::bug\nFix Z.\n"
                "ISSUE_ID: a.py::test::coverage\n" + "x" * 3000 +

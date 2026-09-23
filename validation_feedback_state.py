@@ -366,7 +366,7 @@ class ValidationFeedbackRepository:
                                 if stage == "verify":
                                     fingerprint = item.identity.split(":", 1)[1]
                                 else:
-                                    normalized = "ISSUE_ID:" + item.identity.split(":", 1)[1]
+                                    normalized = "ISSUE_ID:" + item.identity.split(":", 1)[1].casefold()
                                     digest = hashlib.sha256()
                                     digest.update(b"loop-manager-validation-failure-v1\0")
                                     digest.update(b"review\0")

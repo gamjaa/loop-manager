@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import unittest
 
@@ -18,6 +19,48 @@ class ValidationFeedbackStateTests(unittest.TestCase):
 
     def pending(self, session="session", recovery=False):
         return self.repo.prepare("repo", "G-040", session, recovery=recovery)
+
+    def test_duplicate_review_ids_increment_once_per_observation(self):
+        raw = ("ISSUE_ID: File.py::Func::Bug\nFix A\n"
+               "ISSUE_ID: file.py::func::bug\nFix B\nVERDICT: FAIL")
+        for occurrence in (1, 2):
+            self.observe("review", raw, normalize_feedback("review", raw))
+            delivery = self.pending()
+            self.assertEqual(len(delivery.rows), 1)
+            self.assertEqual((delivery.rows[0]["occurrence"],
+                              delivery.rows[0]["revision"]), (occurrence, occurrence))
+            self.repo.delivered(delivery.attempt_id, "session")
+        audit = self.connection.execute(
+            "SELECT raw_output,identities FROM validation_results ORDER BY id"
+        ).fetchall()
+        self.assertEqual([row["raw_output"] for row in audit], [raw, raw])
+        self.assertEqual([json.loads(row["identities"]) for row in audit],
+                         [["review:file.py::func::bug"]] * 2)
+
+    def test_legacy_review_casefold_preserves_occurrence(self):
+        from loop_manager import validation_failure_fingerprints
+
+        self.connection.execute(
+            "CREATE TABLE exec_plans (repo TEXT,plan_id TEXT,current_revision_sha TEXT,"
+            "verify_result TEXT,review_result TEXT,verify_failure_history TEXT,"
+            "review_failure_history TEXT,worker_session_id TEXT)"
+        )
+        raw = ("ISSUE_ID: File.py::Func::Bug\nFix A\n"
+               "ISSUE_ID: file.py::func::bug\nFix A\nVERDICT: FAIL")
+        fingerprint, _ = validation_failure_fingerprints("review", raw)[0]
+        history = json.dumps({fingerprint: {"occurrences": 4}})
+        legacy = ("repo", "G-040", "revision", None, raw, "{}", history, "session")
+        self.connection.execute("INSERT INTO exec_plans VALUES (?,?,?,?,?,?,?,?)", legacy)
+        self.repo.migrate_legacy()
+        self.repo.migrate_legacy()
+        rows = self.pending().rows
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["identity"], "review:file.py::func::bug")
+        self.assertEqual(rows[0]["occurrence"], 4)
+        self.assertEqual(tuple(self.connection.execute(
+            "SELECT * FROM exec_plans").fetchone()), legacy)
+        self.observe("review", raw, normalize_feedback("review", raw))
+        self.assertEqual(self.pending().rows[0]["occurrence"], 5)
 
     def test_repetition_changed_diagnostic_resolution_and_recurrence(self):
         first = Feedback("verify", "verify:A", "failure A")

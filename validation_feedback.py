@@ -46,13 +46,19 @@ def normalize_feedback(stage: str, raw: str, fingerprints=()) -> tuple[Feedback,
     if stage != "review":
         raise ValueError(f"unknown validation stage: {stage}")
     matches = list(_ISSUE.finditer(raw))
-    result = []
+    explanations: dict[str, set[str]] = {}
     for index, match in enumerate(matches):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(raw)
         explanation = _VERDICT.sub("", raw[match.end():end]).strip()
-        identifier = match.group("id").strip()
-        result.append(Feedback(stage, f"review:{identifier}", bounded_diagnostic(explanation)))
-    return tuple(sorted(result, key=lambda item: item.identity))
+        identifier = match.group("id").strip().casefold()
+        explanations.setdefault(identifier, set()).add(explanation)
+    # Match retry-policy identity semantics and count each issue once per Review.
+    # Preserve distinct explanations deterministically, even if declarations move.
+    return tuple(
+        Feedback(stage, f"review:{identifier}",
+                 bounded_diagnostic("\n\n".join(sorted(explanations[identifier]))))
+        for identifier in sorted(explanations)
+    )
 
 
 def render_delta(rows) -> str:
