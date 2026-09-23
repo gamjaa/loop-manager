@@ -371,17 +371,79 @@ class ExecutionHandlerTests(TestCase):
         self.assertEqual(self.state.row()['phase'], 'VERIFYING')
         self.assertEqual(self.state.row()['worker_result'], 'result')
 
+    def _assert_conflict_profile_resume(self, old_profile, new_profile, effective):
+        self.connection.execute(
+            "UPDATE exec_plans SET current_complexity = ?, current_risk = ? "
+            "WHERE repo = 'repo' AND plan_id = 'G-047'", old_profile,
+        )
+        self.connection.commit()
+        workspace_plan = self._conflict_revision_setup()
+        current_plan = dict(workspace_plan, complexity=new_profile[0], risk=new_profile[1])
+        initial = lm.worker_level(current_plan)
+        selected = max(initial, effective)
+        history = '{"1":{"prior-review":2}}'
+        # G-036 publishes the new profile and monotonic level in one update.
+        self.connection.execute(
+            "UPDATE exec_plans SET current_complexity = ?, current_risk = ?, "
+            "initial_worker_level = ?, effective_worker_level = ?, "
+            "review_level_history = ? WHERE repo = 'repo' AND plan_id = 'G-047'",
+            (*new_profile, initial, selected, history),
+        )
+        self.connection.commit()
+        self.remote = 'new-base'
+        self.effects.validation.ensure_worker_level_state.side_effect = (
+            lambda repo, plan: lm.ensure_worker_level_state(self.connection, repo, plan)
+        )
+        with mock.patch('loop_manager.validate_execplan', return_value=workspace_plan):
+            with self.assertRaisesRegex(RuntimeError, 'metadata'):
+                lm.validate_active_execplan_metadata(
+                    Path('/repo'), Path('/state/G-047'),
+                    self.state.row()['plan_path'], self.repository.active_row('repo'),
+                )
+
+        outcome = self._dispatch_conflict_revision(workspace_plan)
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
+        self.effects.blocking.block_active_execplan.assert_not_called()
+        call = self.effects.agent.run_agent.call_args
+        self.assertEqual(call.kwargs['session_id'], 'worker-session')
+        self.assertEqual(call.kwargs['level'], selected)
+        self.assertEqual(self.handler.plan['complexity'], new_profile[0])
+        self.assertEqual(self.handler.plan['risk'], new_profile[1])
+        self.assertEqual(self.effects.agent.worker_prompt.call_args.args[2],
+                         'previous worker result')
+        row = self.repository.active_row('repo')
+        self.assertEqual(row['initial_worker_level'], initial)
+        self.assertEqual(row['effective_worker_level'], selected)
+        self.assertEqual(row['review_level_history'], history)
+        self.dirty = False
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = False
+        self.handler.guard(self.handler._context())
+        self.assertEqual(self.state.row()['phase'], 'VERIFYING')
+        self.assertEqual(self.state.row()['worker_result'], 'result')
+
+    def test_conflict_profile_complexity_change_resumes_same_worker(self):
+        self._assert_conflict_profile_resume(('low', 'low'), ('high', 'low'), 1)
+
+    def test_conflict_profile_risk_change_resumes_same_worker(self):
+        self._assert_conflict_profile_resume(('low', 'low'), ('low', 'critical'), 1)
+
+    def test_conflict_profile_downgrade_preserves_escalated_level(self):
+        self._assert_conflict_profile_resume(('high', 'critical'), ('low', 'low'), 8)
+
     def test_conflict_revision_scope_rejects_unapproved_metadata(self):
         workspace_plan = self._conflict_revision_setup()
         baseline = DefinitionSnapshot.deserialize(self.state.row()['definition_snapshot'])
         self.connection.execute(
-            "UPDATE exec_plans SET priority = 'high', depends_on = '[\"G-048\"]' "
+            "UPDATE exec_plans SET priority = 'high', depends_on = '[\"G-048\"]', "
+            "current_complexity = 'medium', current_risk = 'medium' "
             "WHERE repo = 'repo' AND plan_id = 'G-047'"
         )
         self.connection.commit()
         catalog = self.repository.active_row('repo')
         for field, value in (
             ('priority', 'critical'), ('depends_on', ['G-099']),
+            ('complexity', 'high'), ('risk', 'high'),
             ('title', 'Unauthorized'), ('sources', ['docs/OTHER.md']),
         ):
             with self.subTest(field=field), mock.patch(
@@ -409,6 +471,7 @@ class ExecutionHandlerTests(TestCase):
                 )
             parsed.return_value = {
                 **workspace_plan, 'priority': 'high', 'depends_on': ['G-048'],
+                'complexity': 'medium', 'risk': 'medium',
             }
             current = lm.validate_worker_workspace_scope(
                 Path('/repo'), Path('/state/G-047'), 'loop-manager/G-047',
@@ -417,6 +480,8 @@ class ExecutionHandlerTests(TestCase):
             )
             self.assertEqual(current['priority'], 'high')
             self.assertEqual(current['depends_on'], ['G-048'])
+            self.assertEqual(current['complexity'], 'medium')
+            self.assertEqual(current['risk'], 'medium')
         with self.assertRaisesRegex(RuntimeError, '충돌 복구'):
             lm.validate_worker_workspace_scope(
                 Path('/repo'), Path('/state/G-047'), 'loop-manager/G-047',

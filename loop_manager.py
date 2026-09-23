@@ -8453,14 +8453,20 @@ def validate_active_execplan_metadata(
     current = validate_execplan(worktree, relative_path)
     comparison_plan = plan
     if rebase_definition is not None:
-        # A paused rebase still contains its applied declaration. Only these
-        # two fields may lag the reconciled catalog during conflict resolution;
+        # A paused rebase still contains its applied declaration. Scheduling,
+        # profile and dependency fields may lag during conflict resolution;
         # all other identity fields and all normal validation remain strict.
         if rebase_definition.path != relative_path:
             raise RuntimeError("rebase 기준 ExecPlan 경로가 현재 작업 경로와 다릅니다.")
         comparison_plan = dict(plan)
-        if current['priority'] == rebase_definition.priority:
-            comparison_plan['priority'] = rebase_definition.priority
+        for field, column in (
+            ('priority', 'priority'),
+            ('complexity', 'current_complexity'),
+            ('risk', 'current_risk'),
+        ):
+            applied = getattr(rebase_definition, field)
+            if current[field] == applied:
+                comparison_plan[column] = applied
         if tuple(current['depends_on']) == rebase_definition.depends_on:
             comparison_plan['depends_on'] = json.dumps(rebase_definition.depends_on)
     error = _execplan_metadata_identity_error(
