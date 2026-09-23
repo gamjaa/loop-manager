@@ -423,7 +423,17 @@ class ExecutionHandlerTests(TestCase):
     def test_staged_rebase_resume_rejects_added_files(self):
         self._assert_staged_rebase_resume(True, changed=True)
 
-    def _assert_staged_rebase_resume(self, rebase_metadata, *, changed=False):
+    def test_pending_stage_resumes_accepted_unstaged_changes(self):
+        self._assert_staged_rebase_resume(True, unstaged=True)
+
+    def test_pending_stage_resumes_accepted_untracked_files(self):
+        self._assert_staged_rebase_resume(True, untracked=True)
+
+    def test_pending_stage_rejects_changed_worktree_before_staging(self):
+        self._assert_staged_rebase_resume(True, changed=True, unstaged=True)
+
+    def _assert_staged_rebase_resume(self, rebase_metadata, *, changed=False,
+                                    unstaged=False, untracked=False):
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)
         self.handler.effects = self.effects
@@ -431,21 +441,35 @@ class ExecutionHandlerTests(TestCase):
             'repo', phase='WORKING', worker_session_id='saved-session',
             last_error=lm.REBASE_CONFLICT_PREFIX + 'conflict',
         )
+        accepted_files = {'app.py': 'accepted-content'}
+        dirty = {'app.py': (('staged',), 'accepted-content')}
+        if unstaged or untracked:
+            accepted_files['allowed.py'] = 'accepted-other'
+            dirty['allowed.py'] = (
+                ('untracked',) if untracked else ('unstaged',), 'accepted-other',
+            )
+        self.effects.agent.capture_git_snapshot.return_value = SimpleNamespace(
+            head='owned-head', branch='loop-manager/G-047', dirty=dirty,
+        )
         checkpoint.record(
             'repo', 'G-047', expected_generation=0, operation='rebase',
             expected_head='before-head', target_base_oid='base',
             observed_remote_oid=None,
             snapshot={'pending': 'stage', 'worker_result': 'saved correction',
                       'stage_evidence': {'head': 'owned-head', 'branch': 'loop-manager/G-047',
-                                         'files': {'app.py': 'accepted-content'}}},
+                                         'files': accepted_files}},
         )
         if changed:
             self.effects.agent.capture_git_snapshot.return_value = SimpleNamespace(
                 head='owned-head', branch='loop-manager/G-047',
-                dirty={'app.py': (('staged',), 'accepted-content'),
+                dirty={**dirty,
                        'extra.py': (('untracked',), 'unexpected-content')},
             )
         def staged_git(path, *args, **kwargs):
+            if args == ('diff', '--quiet'):
+                return SimpleNamespace(stdout='', returncode=int(unstaged))
+            if args == ('ls-files', '--others', '--exclude-standard', '-z'):
+                return SimpleNamespace(stdout='allowed.py\0' if untracked else '', returncode=0)
             if args == ('diff', '--cached', '--quiet'):
                 return SimpleNamespace(stdout='', returncode=1)
             return self.observed_git(path, *args, **kwargs)
@@ -453,8 +477,9 @@ class ExecutionHandlerTests(TestCase):
         self.effects.workspace._rebase_in_progress_for_branch.return_value = rebase_metadata
         result = self.handler.recover(self.context())
         self.effects.agent.run_agent.assert_not_called()
-        self.assertFalse(any(call.args[1:3] == ('add', '-A')
-                             for call in self.effects.workspace.git.call_args_list))
+        additions = [call for call in self.effects.workspace.git.call_args_list
+                     if call.args[1:3] == ('add', '-A')]
+        self.assertEqual(len(additions), int(not changed and (unstaged or untracked)))
         if changed:
             self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
             self.assertEqual(checkpoint.get('repo', 'G-047').operation, 'rebase')

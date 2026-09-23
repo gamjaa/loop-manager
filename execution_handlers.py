@@ -737,15 +737,20 @@ class ExecutionHandlers:
                 if unstaged.returncode not in {0, 1}:
                     return self._recover(RecoveryReason.STATUS_FAILED,
                                          'stage resume worktree observation failed', context=context)
-                if saved_evidence != observed_evidence or unstaged.returncode:
+                if saved_evidence != observed_evidence:
                     return self._recover(
                         RecoveryReason.OWNERSHIP_UNCERTAIN,
                         'staged rebase correction changed since Worker validation',
                         context=context,
                         final_block_reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE,
                     )
-                # The accepted contents are already staged. Never add files
-                # again when resuming this interrupted boundary.
+                untracked = self.effects.workspace.git(
+                    context.worktree, 'ls-files', '--others', '--exclude-standard', '-z',
+                ).stdout
+                # The intent precedes staging. Identical accepted contents
+                # may still need staging, including accepted new files.
+                if unstaged.returncode == 1 or untracked:
+                    self.effects.workspace.git(context.worktree, 'add', '-A')
                 resumed = self._finish_worker(
                     replace(context, resolving_rebase=True), row,
                     current.snapshot['worker_result'], staged=True,
