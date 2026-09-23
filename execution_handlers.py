@@ -398,7 +398,8 @@ class ExecutionHandlers:
         )
 
     def _rebase_conflict(self, context, detail, *, corrected=False, worker_result=None,
-                         abnormal_result=False, target=None, stash_oid=None):
+                         abnormal_result=False, target=None, stash_oid=None,
+                         recovery_reason=RecoveryReason.REBASE_CONFLICT):
         """Track actual Git progress before considering the final safety gate."""
         try:
             observation = self._rebase_observation(
@@ -464,7 +465,7 @@ class ExecutionHandlers:
                 correction_limit=1,
             )
         return self._recover(
-            RecoveryReason.REBASE_CONFLICT, detail, context=context,
+            recovery_reason, detail, context=context,
             fingerprint=saved.fingerprint, progress_marker=saved.progress,
             correction_limit=10**9,
         )
@@ -557,7 +558,15 @@ class ExecutionHandlers:
                 RecoveryReason.OWNERSHIP_UNCERTAIN,
                 'rebase correction changed after Worker scope validation',
             )
-        paths = set((accepted or observed)['files'])
+        tracked = self.effects.workspace.git(
+            context.worktree, 'ls-files', '--cached', '-z'
+        ).stdout
+        untracked = self.effects.workspace.git(
+            context.worktree, 'ls-files', '--others', '--exclude-standard', '-z'
+        ).stdout
+        stageable = {path for raw in (tracked, untracked)
+                     for path in raw.split('\0') if path}
+        paths = set((accepted or observed)['files']) & stageable
         return execute_git_step(
             CorrectionAction.STAGE, git=self.effects.workspace.git,
             worktree=context.worktree, paths=tuple(sorted(paths)),
@@ -2081,6 +2090,7 @@ class ExecutionHandlers:
             if context.resolving_rebase:
                 return self._rebase_conflict(
                     context, validation_error, corrected=True, worker_result=message,
+                    recovery_reason=RecoveryReason.WORKER_CORRECTION,
                 )
             return self._recover(
                 RecoveryReason.WORKER_CORRECTION, validation_error,
@@ -2141,6 +2151,7 @@ class ExecutionHandlers:
             return self._rebase_conflict(
                 context, detail, corrected=True,
                 worker_result=saved.worker_result,
+                recovery_reason=RecoveryReason.WORKER_CORRECTION,
             )
         return self._finish_worker(context, self._row(), saved.worker_result)
 

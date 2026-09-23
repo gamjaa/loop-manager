@@ -6668,6 +6668,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "planning_runtime.py",
                 "publication_resume.py",
                 "project_registry.py",
+                "rebase_correction.py",
+                "rebase_correction_state.py",
                 "recovery_dispatcher.py",
                 "recovery_runtime.py",
                 "recovery_state.py",
@@ -11865,8 +11867,10 @@ class LatestBasePublicationTest(unittest.TestCase):
         self.assertEqual(resumed, 0)
         self.assertIsNone(blocked["phase"])
         self.assertEqual(plan_status, "PLAN_BLOCKED")
-        self.assertEqual(resumed_agent.call_count, 4)
-        self.assertEqual(len(resumed_prompts), 4)
+        # The invalid result was already the first correction occurrence;
+        # three further abnormal results reach the no-progress safety gate.
+        self.assertEqual(resumed_agent.call_count, 3)
+        self.assertEqual(len(resumed_prompts), 3)
 
     def test_empty_conflict_resolution_blocks_instead_of_reinvoking_worker(self):
         with tempfile.TemporaryDirectory() as directory:
