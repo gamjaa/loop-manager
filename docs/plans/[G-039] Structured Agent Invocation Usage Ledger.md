@@ -49,11 +49,11 @@ Planner, Worker와 Reviewer의 실제 Agent CLI 호출을 역할, 선택된 prov
 
 ## Progress
 
-- [ ] provider-neutral invocation/profile/usage 계약 구현
-- [ ] tolerant Codex·Claude observation parser와 adapter 연결
-- [ ] additive invocation ledger 및 interrupted reconciliation 구현
-- [ ] planning/execution Agent port와 physical retry runner 통합
-- [ ] profile·transition·usage·migration targeted 회귀 테스트 추가
+- [x] provider-neutral invocation/profile/usage 계약 구현
+- [x] tolerant Codex·Claude observation parser와 adapter 연결
+- [x] additive invocation ledger 및 interrupted reconciliation 구현
+- [x] planning/execution Agent port와 physical retry runner 통합
+- [x] profile·transition·usage·migration targeted 회귀 테스트 추가
 
 ## Decision Log
 
@@ -61,3 +61,4 @@ Planner, Worker와 Reviewer의 실제 Agent CLI 호출을 역할, 선택된 prov
 - invocation은 상위 Worker turn이 아니라 실제 CLI process 시도 단위로 기록해 transient retry와 fallback 비용을 숨기지 않는다.
 - G-037 이후의 revision-aware Agent 호출 경계를 사용해 관련 ExecPlan과 입력 revision이 확정된 시점에 telemetry를 결합한다.
 - Post-refactor revalidation: invocation ledger는 planning/execution phase 상태가 아니라 공유 외부 호출 관측 경계다. 두 coordinator는 같은 Agent port를 사용하고 provider parsing·SQLite ledger를 `execution_handlers.py`나 `planning_runtime.py`에 내장하지 않는다.
+- Recovery (2026-09-23): 보존된 G-039 worktree에서 `python3 -m unittest tests.test_loop_manager.LoopManagerTest.test_verify_success_passes_worker_and_verify_results_to_reviewer`를 다시 실행해 1개 통과를 확인했다. 이전 Worker의 `TARGETED_TESTS` 요약은 결과 판독기가 0건 표현을 실패로 오인했으므로 다음 결과에는 `PASS (1 test)`처럼 최종 통과 결과만 명시한다.

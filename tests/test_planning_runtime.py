@@ -2,8 +2,11 @@ from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+import sqlite3
 import unittest
+from unittest import mock
 
+import loop_manager
 import maintenance_state
 from planning_runtime import (
     PlanningAgentResult,
@@ -371,6 +374,23 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         self.assertFalse(
             ports.state.snapshot.planning_result_pending_validation
         )
+
+    def test_planner_agent_port_passes_planless_invocation_and_ignores_telemetry_error(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        port = loop_manager._PlanningAgentPorts(connection, self.context, None)
+        reported = loop_manager.AgentResult(
+            0, "planned", "session", collection_status="error"
+        )
+
+        with mock.patch.object(loop_manager, "run_agent", return_value=reported) as run_agent:
+            result = port.run_planner(Path("/planning"), "prompt", None, lambda _: None)
+
+        self.assertEqual(result.kind, PlanningAgentResultKind.SUCCESS)
+        request = run_agent.call_args.kwargs["invocation"]
+        self.assertEqual((request.repo, request.plan_id, request.transition,
+                          request.attempt), ("/repo", None, "start", 1))
+        self.assertIs(run_agent.call_args.kwargs["connection"], connection)
 
     def test_transient_git_error_escapes_without_persisting_planning_error(self):
         ports = FakePorts(
