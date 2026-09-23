@@ -273,6 +273,40 @@ class ExecutionHandlerTests(TestCase):
         self.assertEqual([tuple(row) for row in audit],
                          [('transient_failure', raw), ('success', 'VERDICT: PASS')])
 
+    def test_review_post_call_rejections_audit_each_execution_once(self):
+        self._with_feedback(ValidationFeedbackRepository(self.connection))
+        for code in (0, 1):
+            for rejection in ('scope', 'ownership', 'snapshot', 'stale'):
+                with self.subTest(code=code, rejection=rejection):
+                    raw = f'reviewer output {code} {rejection}'
+                    result = lm.AgentResult(code, raw)
+                    self.effects.agent.run_agent.side_effect = lambda *a, **k: result
+                    self.effects.agent.validate_agent_scope.side_effect = (
+                        lm.AgentScopeError('scope') if rejection == 'scope' else None)
+                    self.effects.workspace.validate_managed_worktree.side_effect = (
+                        lm.WorkspaceOwnershipError('ownership')
+                        if rejection == 'ownership' else None)
+                    self.effects.agent.capture_git_snapshot.side_effect = (
+                        RuntimeError('snapshot') if rejection == 'snapshot' else None)
+                    context = self.context('REVIEWING')
+                    stale = ExecutionOutcome(ExecutionOutcomeKind.RETRY, detail='stale')
+                    with mock.patch.object(self.handler, '_block_final'), mock.patch.object(
+                        self.handler, '_post_effect_guard', return_value=stale,
+                    ):
+                        outcome = self.handler.review(context)
+                    if rejection == 'stale':
+                        self.assertIs(outcome, stale)
+                    audit = self.connection.execute(
+                        "SELECT classification FROM validation_results WHERE raw_output=?",
+                        (raw,),
+                    ).fetchall()
+                    expected = (result.ledger_kind if code else
+                                'stale_result' if rejection == 'stale' else 'scope_failure')
+                    self.assertEqual([row[0] for row in audit], [expected])
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM validation_feedback_events"
+        ).fetchone()[0], 0)
+
     def test_review_retry_interruption_preserves_previous_raw_result(self):
         self._with_feedback(ValidationFeedbackRepository(self.connection))
         self.effects.agent.run_agent_with_retries.side_effect = lm.run_agent_with_retries

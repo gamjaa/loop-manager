@@ -2822,6 +2822,8 @@ class ExecutionHandlers:
                 session_id=row['reviewer_session_id'],
             )
             code, review = review_result
+            # Nonzero returned attempts are already audited before retries;
+            # post-call rejection records classify only unaudited zero exits.
             feedback_repo = self.effects.feedback.repository if self.effects.feedback else None
             if review_result.session_id:
                 self.effects.state.update_project(self.repo, reviewer_session_id=review_result.session_id)
@@ -2837,7 +2839,7 @@ class ExecutionHandlers:
                 )
                 self.effects.workspace.validate_managed_worktree(self.repo_path, context.worktree, context.branch)
             except (self.effects.contract.AgentScopeError, self.effects.contract.WorkspaceOwnershipError) as error:
-                if feedback_repo is not None:
+                if feedback_repo is not None and not code:
                     feedback_repo.record_result(
                         self.repo, str(self.plan['id']), context.plan.definition_revision_sha,
                         'review', 'scope_failure', review,
@@ -2853,7 +2855,7 @@ class ExecutionHandlers:
                 self.effects.events.operation_print(scope_error, file=sys.stderr)
                 return self._final(scope_error)
             except RuntimeError as error:
-                if feedback_repo is not None:
+                if feedback_repo is not None and not code:
                     feedback_repo.record_result(
                         self.repo, str(self.plan['id']), context.plan.definition_revision_sha,
                         'review', 'scope_failure', review,
@@ -2867,7 +2869,7 @@ class ExecutionHandlers:
             self.effects.agent.clear_agent_scope(self.repo)
             guarded = self._post_effect_guard(context)
             if isinstance(guarded, ExecutionOutcome):
-                if feedback_repo is not None:
+                if feedback_repo is not None and not code:
                     feedback_repo.record_result(
                         self.repo, str(self.plan['id']), context.plan.definition_revision_sha,
                         'review', 'stale_result', review,
