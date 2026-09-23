@@ -5231,7 +5231,11 @@ def run_codex(
         message = f"Codex {role_name} 실행 timeout ({AGENT_CLI_TIMEOUT_SECONDS}초)"
     if returncode and not message:
         message = log.read_text(encoding="utf-8")[-6000:]
-    usage = codex_log_usage(log.read_text(encoding="utf-8"))
+    try:
+        usage = codex_log_usage(log.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError):
+        # Usage is observational; a failed log read cannot retry a completed CLI call.
+        usage = Usage(status="invalid")
     if persist_session and not resolved_session_id:
         if returncode == 0:
             return CodexResult(

@@ -100,6 +100,39 @@ class UsageTests(TestCase):
         self.assertEqual((result.code, result.session_id,
                           result.usage.cached_input_tokens), (0, "session", 4))
 
+    def test_codex_usage_log_read_failure_does_not_retry_successful_call(self):
+        class Process:
+            def __init__(self):
+                self.stdin = io.StringIO()
+                self.stdout = io.StringIO(
+                    '{"type":"thread.started","thread_id":"session"}\n'
+                )
+
+            def wait(self):
+                return 0
+
+        original_read_text = Path.read_text
+
+        def read_text(path, *args, **kwargs):
+            if path.name == "planner.log":
+                raise OSError("usage log unavailable")
+            return original_read_text(path, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(manager.subprocess, "Popen", side_effect=lambda *a, **k: Process()) as launch, \
+                 mock.patch.object(Path, "read_text", autospec=True, side_effect=read_text):
+                result = manager.run_agent_with_retries(
+                    lambda _session, _fallback: manager.run_codex(
+                        root, root, root / "config", "planner", "prompt",
+                        read_only=False, persist_session=True,
+                        resolved_profile=invocation.ResolvedProfile("model", "high")),
+                    session_id=None,
+                )
+        self.assertEqual((result.code, result.session_id, result.usage.status),
+                         (0, "session", "invalid"))
+        self.assertEqual(launch.call_count, 1)
+
 
 class RunnerTests(TestCase):
     def setUp(self):

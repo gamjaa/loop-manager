@@ -96,7 +96,15 @@ class InvocationRepository:
 
     def summary(self, repo: str) -> list[sqlite3.Row]:
         """Return comparable counters; unknown usage stays NULL."""
-        return self.connection.execute("""SELECT role, provider, model, effort, transition,
+        return self.connection.execute("""WITH observations AS (
+            SELECT *,
+                CASE WHEN input_tokens IS NOT NULL AND cached_input_tokens IS NOT NULL
+                     THEN input_tokens END AS paired_input_tokens,
+                CASE WHEN input_tokens IS NOT NULL AND cached_input_tokens IS NOT NULL
+                     THEN cached_input_tokens END AS paired_cached_input_tokens
+            FROM agent_invocations WHERE repo = ?
+        )
+        SELECT role, provider, model, effort, transition,
             COUNT(*) AS calls,
             SUM(CASE WHEN attempt > 1 THEN 1 ELSE 0 END) AS retries,
             SUM(input_tokens) AS input_tokens, SUM(cached_input_tokens) AS cached_input_tokens,
@@ -105,21 +113,14 @@ class InvocationRepository:
             SUM(CASE WHEN provider = 'claude' THEN input_tokens
                      WHEN input_tokens IS NOT NULL AND cached_input_tokens IS NOT NULL
                      THEN input_tokens - cached_input_tokens END) AS uncached_input_tokens,
-            CASE WHEN SUM(CASE WHEN cached_input_tokens IS NOT NULL
-                                    AND input_tokens IS NOT NULL
-                                    AND (provider != 'claude' OR cache_write_input_tokens IS NOT NULL)
-                               THEN 1 ELSE 0 END) = 0
-                 THEN NULL
-                 WHEN provider = 'claude' THEN
-                     1.0 * SUM(CASE WHEN input_tokens IS NOT NULL AND cached_input_tokens IS NOT NULL
-                                         AND cache_write_input_tokens IS NOT NULL
-                                    THEN cached_input_tokens END) /
-                     NULLIF(SUM(input_tokens + cached_input_tokens + cache_write_input_tokens), 0)
-                 ELSE 1.0 * SUM(CASE WHEN input_tokens IS NOT NULL AND cached_input_tokens IS NOT NULL
-                                     THEN cached_input_tokens END) /
-                      NULLIF(SUM(CASE WHEN cached_input_tokens IS NOT NULL
-                                       THEN input_tokens END), 0)
+            CASE WHEN provider = 'claude' THEN
+                     1.0 * SUM(CASE WHEN cache_write_input_tokens IS NOT NULL
+                                    THEN paired_cached_input_tokens END) /
+                     NULLIF(SUM(paired_input_tokens + paired_cached_input_tokens
+                                + cache_write_input_tokens), 0)
+                 ELSE 1.0 * SUM(paired_cached_input_tokens) /
+                      NULLIF(SUM(paired_input_tokens), 0)
             END AS cache_ratio,
             SUM(duration_ms) AS duration_ms
-            FROM agent_invocations WHERE repo = ?
+            FROM observations
             GROUP BY role, provider, model, effort, transition""", (repo,)).fetchall()

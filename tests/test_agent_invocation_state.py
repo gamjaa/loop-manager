@@ -46,3 +46,21 @@ class InvocationRepositoryTests(TestCase):
         self.assertIsNone(rows["codex"]["cache_write_input_tokens"])
         self.assertEqual((rows["codex"]["calls"], rows["codex"]["retries"],
                           rows["codex"]["duration_ms"]), (1, 1, 500))
+
+    def test_codex_cache_ratio_excludes_incomplete_usage_pairs(self):
+        context = InvocationContext("repo", "G-039")
+        profile = ResolvedProfile("model", "high")
+        for usage in (Usage(100, 40), Usage(None, 1000), Usage(200, None)):
+            identity = self.repository.start(context, "worker", "codex", profile, None)
+            self.repository.finish(identity, "success", 0, 10, None, usage)
+
+        row = self.repository.summary("repo")[0]
+        self.assertEqual((row["calls"], row["input_tokens"],
+                          row["cached_input_tokens"]), (3, 300, 1040))
+        self.assertAlmostEqual(row["cache_ratio"], 0.4)
+
+        unknown = self.repository.start(
+            context, "reviewer", "codex", profile, None)
+        self.repository.finish(unknown, "success", 0, 10, None, Usage(None, 5))
+        rows = {item["role"]: item for item in self.repository.summary("repo")}
+        self.assertIsNone(rows["reviewer"]["cache_ratio"])
