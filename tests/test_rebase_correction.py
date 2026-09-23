@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 from rebase_correction import (
     ConflictObservation, CorrectionAction, CorrectionSource, execute_git_step,
-    next_action,
+    next_action, stage_evidence_preserved,
     parse_unmerged,
 )
 
@@ -56,6 +56,31 @@ class RebaseCorrectionTests(TestCase):
         parsed = parse_unmerged('100644 blob-a 1\tapp.py\0'
                                 '100644 blob-b 2\tapp.py\0')
         self.assertEqual(parsed, (('app.py', 1, 'blob-a'), ('app.py', 2, 'blob-b')))
+
+    def test_completed_stage_accepts_only_disappeared_clean_tracked_paths(self):
+        accepted = {
+            'head': 'owned-head', 'branch': 'loop-manager/G-047',
+            'files': {'app.py': 'accepted-content', 'other.py': 'other-content'},
+        }
+        observed = {
+            'head': 'owned-head', 'branch': 'loop-manager/G-047',
+            'files': {'other.py': 'other-content'},
+        }
+        self.assertTrue(stage_evidence_preserved(accepted, observed, {'app.py'}))
+        self.assertFalse(stage_evidence_preserved(accepted, observed, set()))
+        self.assertFalse(stage_evidence_preserved(
+            accepted, {**observed, 'files': {'other.py': 'changed-content'}},
+            {'app.py'},
+        ))
+        self.assertFalse(stage_evidence_preserved(
+            accepted, {**observed, 'files': {'other.py': 'other-content',
+                                            'extra.py': 'new-content'}},
+            {'app.py'},
+        ))
+        self.assertFalse(stage_evidence_preserved(
+            accepted, {**observed, 'head': 'different-head'}, {'app.py'},
+        ))
+        self.assertFalse(stage_evidence_preserved(None, observed, {'app.py'}))
 
     def test_stage_and_continue_actions_use_narrow_git_operations(self):
         git = mock.Mock(return_value=SimpleNamespace(returncode=0, stdout='done'))

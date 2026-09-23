@@ -29,6 +29,7 @@ from runtime_state import RuntimeStateError
 from publication_resume import PublicationNext, PublicationResume, assess_publication
 from rebase_correction import (
     CorrectionAction, CorrectionSource, execute_git_step, next_action, observe_git,
+    stage_evidence_preserved,
 )
 from rebase_correction_state import CorrectionRace, RebaseCorrectionRepository
 
@@ -553,20 +554,22 @@ class ExecutionHandlers:
         intent = checkpoint.get(self.repo, context.plan.plan_id) if checkpoint else None
         accepted = (intent.snapshot or {}).get('stage_evidence') if intent else None
         observed = self._rebase_stage_evidence(context)
-        if accepted is not None and accepted != observed:
-            raise RecoveryFailure(
-                RecoveryReason.OWNERSHIP_UNCERTAIN,
-                'rebase correction changed after Worker scope validation',
-            )
         tracked = self.effects.workspace.git(
             context.worktree, 'ls-files', '--cached', '-z'
         ).stdout
         untracked = self.effects.workspace.git(
             context.worktree, 'ls-files', '--others', '--exclude-standard', '-z'
         ).stdout
-        stageable = {path for raw in (tracked, untracked)
-                     for path in raw.split('\0') if path}
-        paths = set((accepted or observed)['files']) & stageable
+        tracked_paths = {path for path in tracked.split('\0') if path}
+        if accepted is not None and not stage_evidence_preserved(
+            accepted, observed, tracked_paths
+        ):
+            raise RecoveryFailure(
+                RecoveryReason.OWNERSHIP_UNCERTAIN,
+                'rebase correction changed after Worker scope validation',
+            )
+        stageable = tracked_paths | {path for path in untracked.split('\0') if path}
+        paths = set(observed['files']) & stageable
         return execute_git_step(
             CorrectionAction.STAGE, git=self.effects.workspace.git,
             worktree=context.worktree, paths=tuple(sorted(paths)),
@@ -867,7 +870,14 @@ class ExecutionHandlers:
                 if unstaged.returncode not in {0, 1}:
                     return self._recover(RecoveryReason.STATUS_FAILED,
                                          'stage resume worktree observation failed', context=context)
-                if saved_evidence != observed_evidence:
+                tracked_paths = {
+                    path for path in self.effects.workspace.git(
+                        context.worktree, 'ls-files', '--cached', '-z',
+                    ).stdout.split('\0') if path
+                }
+                if not stage_evidence_preserved(
+                    saved_evidence, observed_evidence, tracked_paths
+                ):
                     return self._recover(
                         RecoveryReason.OWNERSHIP_UNCERTAIN,
                         'staged rebase correction changed since Worker validation',

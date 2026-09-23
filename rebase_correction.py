@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 import hashlib
 import json
+from typing import AbstractSet, Mapping
 
 
 class CorrectionSource(str, Enum):
@@ -36,6 +37,30 @@ def parse_unmerged(raw: str) -> tuple[tuple[str, int, str], ...]:
         _mode, oid, stage = metadata.split(" ")
         stages.append((path, int(stage), oid))
     return tuple(sorted(stages))
+
+
+def stage_evidence_preserved(
+    accepted: Mapping[str, object] | None,
+    observed: Mapping[str, object],
+    tracked_paths: AbstractSet[str],
+) -> bool:
+    """A staged path may disappear from dirty state only when Git now tracks it cleanly."""
+    if not isinstance(accepted, Mapping) or not isinstance(observed, Mapping):
+        return False
+    if accepted == observed:
+        return True
+    if (accepted.get('head') != observed.get('head')
+            or accepted.get('branch') != observed.get('branch')):
+        return False
+    accepted_files = accepted.get('files')
+    observed_files = observed.get('files')
+    if not isinstance(accepted_files, dict) or not isinstance(observed_files, dict):
+        return False
+    if any(path not in accepted_files or accepted_files[path] != signature
+           for path, signature in observed_files.items()):
+        return False
+    disappeared = accepted_files.keys() - observed_files.keys()
+    return bool(disappeared) and disappeared <= tracked_paths
 
 
 @dataclass(frozen=True)

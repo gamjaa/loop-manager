@@ -11560,6 +11560,146 @@ class LatestBasePublicationTest(unittest.TestCase):
         self.assertIn("cannot resolve conflict", plan["last_error"])
         self.assertEqual(plan["status"], "PLAN_BLOCKED")
 
+    def test_real_autostash_conflict_resumes_to_verified_pr_without_reapplying_stash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                repo, state_dir, connection, _plan, branch, worktree,
+            ) = self._publication_state(directory)
+            original_base = git_command(repo, "rev-parse", "origin/main")
+            git_command(worktree, "reset", "--hard", original_base)
+            (worktree / "src/feature.py").write_text(
+                "FEATURE = True\n", encoding="utf-8"
+            )
+            git_command(worktree, "add", "src/feature.py")
+            git_command(worktree, "commit", "-m", "Add independent feature")
+            (worktree / "src/app.py").write_text(
+                "VALUE = 'worker'\n", encoding="utf-8"
+            )
+            (repo / "src/app.py").write_text(
+                "VALUE = 'base'\n", encoding="utf-8"
+            )
+            commit_and_push(repo, "Change app on latest base")
+            original_git = loop_manager.git
+            rebase_results = []
+
+            def record_initial_git(path, *arguments, **kwargs):
+                result = original_git(path, *arguments, **kwargs)
+                if path == worktree and arguments[:2] == ("rebase", "--autostash"):
+                    rebase_results.append(result.returncode)
+                return result
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch("loop_manager.run_codex") as first_agent, mock.patch(
+                "loop_manager.git", side_effect=record_initial_git
+            ):
+                first = loop_manager.run_project(
+                    connection, state_dir, str(repo), Path("unused.ini"),
+                    "main", False,
+                )
+
+            self.assertEqual(first, 1)
+            self.assertEqual(rebase_results, [0])
+            first_agent.assert_not_called()
+            self.assertFalse(
+                loop_manager._rebase_in_progress_for_branch(worktree, branch)
+            )
+            self.assertTrue(git_command(worktree, "ls-files", "-u"))
+            saved = connection.execute(
+                "SELECT operation, snapshot FROM execution_checkpoints "
+                "WHERE repo = ? AND plan_id = 'G-014'", (str(repo),),
+            ).fetchone()
+            self.assertEqual(saved["operation"], "rebase")
+            self.assertTrue(json.loads(saved["snapshot"])["stash_oid"])
+
+            roles = []
+            git_steps = []
+            created = []
+
+            def record_git(path, *arguments, **kwargs):
+                if path == worktree and arguments and arguments[0] in {"rebase", "stash"}:
+                    git_steps.append(arguments)
+                return original_git(path, *arguments, **kwargs)
+
+            def agent(agent_worktree, _state, _config, role, _prompt, **_kwargs):
+                roles.append(role)
+                if role == "worker":
+                    self.assertTrue(git_command(worktree, "ls-files", "-u"))
+                    self.assertFalse(
+                        loop_manager._rebase_in_progress_for_branch(worktree, branch)
+                    )
+                    (agent_worktree / "src/app.py").write_text(
+                        "VALUE = 'resolved'\n", encoding="utf-8"
+                    )
+                    return loop_manager.CodexResult(
+                        0,
+                        worker_result(
+                            "Resolve autostash conflict",
+                            "Keeps the feature and resolves the saved app change.",
+                            "LatestBasePublicationTest: PASS",
+                        ),
+                        "worker-session",
+                    )
+                self.assertEqual(role, "reviewer")
+                return loop_manager.CodexResult(
+                    0, "VERDICT: PASS", "reviewer-session"
+                )
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.run_codex", side_effect=agent
+            ), mock.patch(
+                "loop_manager.verify", return_value=(True, "verify: PASS")
+            ) as verify, mock.patch(
+                "loop_manager.build_pr_body", return_value="body"
+            ), mock.patch(
+                "loop_manager.command", side_effect=self._command_stub(created)
+            ), mock.patch("loop_manager.git", side_effect=record_git):
+                resumed = loop_manager.run_project_result(
+                    connection, state_dir, str(repo), Path("unused.ini"),
+                    "main", False,
+                )
+
+            plan = connection.execute(
+                "SELECT status, active_sha, validated_base_sha "
+                "FROM exec_plans WHERE repo = ? AND plan_id = 'G-014'",
+                (str(repo),),
+            ).fetchone()
+            latest_base = git_command(repo, "rev-parse", "origin/main")
+            self.assertEqual(resumed.kind, loop_manager.ProjectRunKind.WAITING)
+            self.assertEqual(plan["status"], "PR_OPEN")
+            self.assertEqual(plan["active_sha"], latest_base)
+            self.assertEqual(plan["validated_base_sha"], latest_base)
+            self.assertFalse(git_command(worktree, "ls-files", "-u"))
+            self.assertFalse(
+                loop_manager._rebase_in_progress_for_branch(worktree, branch)
+            )
+            self.assertEqual(
+                (worktree / "src/feature.py").read_text(encoding="utf-8"),
+                "FEATURE = True\n",
+            )
+            self.assertEqual(
+                (worktree / "src/app.py").read_text(encoding="utf-8"),
+                "VALUE = 'resolved'\n",
+            )
+            self.assertEqual(roles, ["worker", "reviewer"])
+            verify.assert_called_once()
+            self.assertEqual(git_steps, [])
+            self.assertEqual(len(created), 1)
+
     def test_rebase_recovery_marker_survives_agent_pause(self):
         cases = (
             (
