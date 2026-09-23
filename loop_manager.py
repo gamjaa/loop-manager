@@ -121,6 +121,7 @@ from maintenance_orchestration import (
 import maintenance_git
 import maintenance_state
 import scoped_blocking
+import agent_scope_decision
 from scoped_blocking import BlockReasonCode, BlockScope
 
 
@@ -8259,11 +8260,9 @@ def _metadata_changes_after_block(
     current: Mapping[str, object],
     candidates: frozenset[str],
 ) -> frozenset[str]:
-    return frozenset(
-        key
-        for key in candidates
-        if before.get(key) == blocked.get(key)
-        and blocked.get(key) != current.get(key)
+    """Compatibility surface for callers of the persisted-scope policy."""
+    return agent_scope_decision.metadata_changes_after_block(
+        before, blocked, current, candidates
     )
 
 
@@ -11163,50 +11162,14 @@ def _blocked_agent_local_baseline(
     *,
     allowed_dirty_paths: frozenset[str] = frozenset(),
 ) -> GitSnapshot:
-    """Accept a diagnosed result plus explicit user-edited input files."""
-
-    if (
-        not before.shared_metadata_complete
-        or not result.shared_metadata_complete
-        or not current.shared_metadata_complete
-    ):
-        raise AgentScopeError("저장된 BLOCKED Agent Git metadata 기준 snapshot이 없습니다.")
-
-    new_local_changes: set[str] = set()
-    for state_name, before_state, result_state, current_state in (
-        ("index", before.index, result.index, current.index),
-        ("dirty", before.dirty, result.dirty, current.dirty),
-    ):
-        for path in set(before_state) | set(result_state) | set(current_state):
-            value = current_state.get(path)
-            if (
-                value not in (before_state.get(path), result_state.get(path))
-                and not (state_name == "dirty" and path in allowed_dirty_paths)
-            ):
-                new_local_changes.add(path)
-    if new_local_changes:
-        displayed = ", ".join(sorted(new_local_changes)[:8])
-        remainder = len(new_local_changes) - 8
-        if remainder > 0:
-            displayed += f", 외 {remainder}개"
-        raise AgentScopeError(
-            "BLOCKED 이후 새 파일 또는 index 변경을 자동 보존할 수 없습니다: "
-            + displayed
+    """Compatibility surface for the pure BLOCKED snapshot decision."""
+    try:
+        return agent_scope_decision.blocked_agent_local_baseline(
+            before, result, current, str(_canonical_path(worktree)),
+            allowed_dirty_paths=allowed_dirty_paths,
         )
-
-    worktree_key = str(_canonical_path(worktree))
-    if current.worktrees.get(worktree_key) is None:
-        raise AgentScopeError("BLOCKED Agent 결과에 관리 worktree 등록이 없습니다.")
-    return GitSnapshot(
-        head=before.head,
-        branch=before.branch,
-        index=current.index,
-        dirty=current.dirty,
-        refs=before.refs,
-        worktrees=before.worktrees,
-        config=before.config,
-        operations=before.operations,
-    )
+    except agent_scope_decision.ScopeDecisionError as error:
+        raise AgentScopeError(str(error)) from error
 
 
 def _diagnosed_blocked_commit_allowances(
@@ -11216,48 +11179,9 @@ def _diagnosed_blocked_commit_allowances(
     worktree: Path,
     scope_before: GitSnapshot,
 ) -> tuple[GitSnapshot, frozenset[str], frozenset[str]]:
-    """Allow only the exact diagnosed commit while it awaits isolation."""
-
-    if blocked_result.head == before.head:
-        return scope_before, frozenset(), frozenset()
-    if (
-        before.branch is None
-        or blocked_result.branch != before.branch
-        or current.branch != before.branch
-        or current.head != blocked_result.head
-    ):
-        return scope_before, frozenset(), frozenset()
-
-    branch_ref = f"refs/heads/{before.branch}"
-    result_branch_ref = blocked_result.refs.get(branch_ref)
-    if (
-        result_branch_ref is None
-        or result_branch_ref[0] != blocked_result.head
-        or current.refs.get(branch_ref) != result_branch_ref
-    ):
-        return scope_before, frozenset(), frozenset()
-
-    worktree_key = str(_canonical_path(worktree))
-    result_registration = blocked_result.worktrees.get(worktree_key)
-    if (
-        result_registration is None
-        or current.worktrees.get(worktree_key) != result_registration
-    ):
-        return scope_before, frozenset(), frozenset()
-
-    return (
-        GitSnapshot(
-            head=current.head,
-            branch=scope_before.branch,
-            index=scope_before.index,
-            dirty=scope_before.dirty,
-            refs=scope_before.refs,
-            worktrees=scope_before.worktrees,
-            config=scope_before.config,
-            operations=scope_before.operations,
-        ),
-        frozenset((branch_ref,)),
-        frozenset((worktree_key,)),
+    """Compatibility surface for the pure diagnosed-commit decision."""
+    return agent_scope_decision.diagnosed_blocked_commit_allowances(
+        before, blocked_result, current, str(_canonical_path(worktree)), scope_before
     )
 
 
@@ -11333,90 +11257,17 @@ def validate_persisted_agent_scope(
         )
 
     current = capture_git_snapshot(saved_worktree)
-    if allow_planner_worktree_correction:
-        # The existing invalid commit/file diff is handled by the Planner
-        # correction path below. Accept that already-diagnosed HEAD, index and
-        # worktree state here while still rejecting branch switches and every
-        # shared Git metadata mutation before Manager Git commands can run.
-        planner_result: GitSnapshot | None = None
-        correction_worktrees = dict(before.worktrees)
-        saved_worktree_key = str(_canonical_path(saved_worktree))
-        before_registration = before.worktrees.get(saved_worktree_key)
-        current_registration = current.worktrees.get(saved_worktree_key)
-        if (
-            before_registration is not None
-            and current_registration is not None
-            and tuple(
-                field
-                for field in before_registration
-                if not field.startswith("HEAD=")
-            )
-            == tuple(
-                field
-                for field in current_registration
-                if not field.startswith("HEAD=")
-            )
-        ):
-            correction_worktrees[saved_worktree_key] = current_registration
-        allowed_ref_changes: frozenset[str] = frozenset()
-        allowed_worktree_changes: frozenset[str] = frozenset()
-        if project["agent_result_snapshot"]:
-            try:
-                planner_result = GitSnapshot.deserialize(
-                    str(project["agent_result_snapshot"])
-                )
-            except (KeyError, TypeError, ValueError, RuntimeError) as error:
-                raise AgentScopeError(
-                    f"저장된 Planner 결과 snapshot이 유효하지 않습니다: {error}"
-                ) from error
-            if planner_result.shared_metadata_complete:
-                base = str(project["base_branch"])
-                allowed_ref_changes = _metadata_changes_after_block(
-                    before.refs,
-                    planner_result.refs,
-                    current.refs,
-                    frozenset(
-                        (
-                            f"refs/heads/{base}",
-                            f"refs/remotes/origin/{base}",
-                        )
-                    ),
-                )
-                allowed_worktree_changes = _metadata_changes_after_block(
-                    before.worktrees,
-                    planner_result.worktrees,
-                    current.worktrees,
-                    frozenset((str(_canonical_path(repo_path)),)),
-                )
-        if (
-            planner_result is not None
-            and planner_result.worktrees.get(saved_worktree_key) != current_registration
-        ):
-            correction_worktrees[saved_worktree_key] = before_registration
-        correction_result = planner_result or current
-        correction_before = GitSnapshot(
-            head=correction_result.head,
-            branch=before.branch,
-            index=correction_result.index,
-            dirty=correction_result.dirty,
-            refs=before.refs,
-            worktrees=correction_worktrees,
-            config=before.config,
-            operations=before.operations,
-        )
-        validate_agent_scope(
-            role_name,
-            saved_worktree,
-            correction_before,
-            current,
-            allowed_ref_changes=allowed_ref_changes,
-            allowed_worktree_changes=allowed_worktree_changes,
-            external_worktree=repo_path,
-            base_branch=str(project["base_branch"]),
-        )
-        return current
-
-    if project["agent_manager_snapshot"]:
+    phase = str(project["phase"] or "")
+    result: GitSnapshot | None = None
+    checkpoint: ManagerGitCheckpoint | None = None
+    if allow_planner_worktree_correction and project["agent_result_snapshot"]:
+        try:
+            result = GitSnapshot.deserialize(str(project["agent_result_snapshot"]))
+        except (KeyError, TypeError, ValueError, RuntimeError) as error:
+            raise AgentScopeError(
+                f"저장된 Planner 결과 snapshot이 유효하지 않습니다: {error}"
+            ) from error
+    elif project["agent_manager_snapshot"]:
         try:
             checkpoint = ManagerGitCheckpoint.deserialize(
                 str(project["agent_manager_snapshot"])
@@ -11425,138 +11276,58 @@ def validate_persisted_agent_scope(
             raise AgentScopeError(
                 f"저장된 Manager Git checkpoint가 유효하지 않습니다: {error}"
             ) from error
-        if project["phase"] != "PLAN_BLOCKED":
-            validate_agent_scope(
-                role_name,
-                saved_worktree,
-                before,
-                checkpoint.snapshot,
-                selected_plan_path=(
-                    selected_plan_path if role_name == "worker" else None
-                ),
-                allowed_guidance_targets=guidance_targets,
-                allow_common_plans=allow_common_plans,
-                external_worktree=repo_path,
-                base_branch=str(project["base_branch"]),
-            )
-        checkpoint_scope_before = checkpoint.snapshot
-        if project["phase"] == "PLAN_BLOCKED" and selected_plan_path:
-            checkpoint_scope_before = _blocked_agent_local_baseline(
-                checkpoint.snapshot,
-                checkpoint.snapshot,
-                current,
-                saved_worktree,
-                allowed_dirty_paths=frozenset((selected_plan_path,)),
-            )
-        manager_refs = frozenset(
-            refname
-            for refname in set(checkpoint.snapshot.refs) | set(current.refs)
-            if checkpoint.snapshot.refs.get(refname) != current.refs.get(refname)
-            and (
-                refname.startswith("refs/remotes/origin/")
-                or refname.startswith("refs/tags/")
-                or (
-                    project["phase"] == "PLAN_BLOCKED"
-                    and refname == f"refs/heads/{project['base_branch']}"
-                )
-            )
-        )
-        allowed_cleanup = checkpoint.cleanup_worktrees | manager_cleanup_worktrees
-        if project["phase"] == "PLAN_BLOCKED":
-            allowed_cleanup |= frozenset((str(_canonical_path(repo_path)),))
+    elif phase == "PLAN_BLOCKED" and project["agent_result_snapshot"]:
         try:
-            validate_agent_scope(
-                "reviewer",
-                saved_worktree,
-                checkpoint_scope_before,
-                current,
-                allowed_ref_changes=manager_refs,
-                allowed_worktree_changes=allowed_cleanup,
-                external_worktree=repo_path,
-                base_branch=str(project["base_branch"]),
-            )
-        except AgentScopeError as error:
-            raise AgentScopeError(
-                f"중단된 Manager Git 작업 후 Agent scope 검증 실패: {error}"
-            ) from error
-        return current
-
-    scope_before = before
-    allowed_ref_changes: frozenset[str] = frozenset()
-    allowed_worktree_changes: frozenset[str] = frozenset()
-    if project["phase"] == "PLAN_BLOCKED" and project["agent_result_snapshot"]:
-        try:
-            blocked_result = GitSnapshot.deserialize(
-                str(project["agent_result_snapshot"])
-            )
+            result = GitSnapshot.deserialize(str(project["agent_result_snapshot"]))
         except (KeyError, TypeError, ValueError, RuntimeError) as error:
             raise AgentScopeError(
                 f"저장된 BLOCKED Agent 결과 snapshot이 유효하지 않습니다: {error}"
             ) from error
-        if blocked_result.shared_metadata_complete:
-            scope_before = _blocked_agent_local_baseline(
-                before,
-                blocked_result,
-                current,
+
+    try:
+        decision = agent_scope_decision.decide_persisted_scope(
+            role=role_name,
+            phase=phase,
+            base_branch=str(project["base_branch"]),
+            selected_plan_path=selected_plan_path,
+            before=before,
+            current=current,
+            result=result,
+            checkpoint=checkpoint,
+            worktree_key=str(_canonical_path(saved_worktree)),
+            repo_key=str(_canonical_path(repo_path)),
+            planner_correction=allow_planner_worktree_correction,
+            manager_cleanup_worktrees=manager_cleanup_worktrees,
+        )
+    except agent_scope_decision.ScopeDecisionError as error:
+        raise AgentScopeError(str(error)) from error
+    for check in decision.checks:
+        try:
+            validate_agent_scope(
+                check.role,
                 saved_worktree,
-                allowed_dirty_paths=(
-                    frozenset((selected_plan_path,))
-                    if selected_plan_path
-                    else frozenset()
+                check.before,
+                check.after,
+                selected_plan_path=(
+                    selected_plan_path if check.role == "worker" else None
                 ),
+                allowed_guidance_targets=(
+                    guidance_targets if check.role == "worker" else ()
+                ),
+                allow_common_plans=(
+                    allow_common_plans if check.role == "worker" else False
+                ),
+                allowed_ref_changes=check.allowed_refs,
+                allowed_worktree_changes=check.allowed_worktrees,
+                external_worktree=repo_path,
+                base_branch=str(project["base_branch"]),
             )
-            (
-                scope_before,
-                commit_ref_changes,
-                commit_worktree_changes,
-            ) = _diagnosed_blocked_commit_allowances(
-                before,
-                blocked_result,
-                current,
-                saved_worktree,
-                scope_before,
-            )
-            base = str(project["base_branch"])
-            manager_ref_candidates = frozenset(
-                {f"refs/heads/{base}"}
-                | {
-                    refname
-                    for refname in set(before.refs) | set(current.refs)
-                    if refname.startswith("refs/remotes/origin/")
-                    or refname.startswith("refs/tags/")
-                }
-            )
-            allowed_ref_changes = _metadata_changes_after_block(
-                before.refs,
-                blocked_result.refs,
-                current.refs,
-                manager_ref_candidates,
-            )
-            allowed_worktree_changes = _metadata_changes_after_block(
-                before.worktrees,
-                blocked_result.worktrees,
-                current.worktrees,
-                frozenset((str(_canonical_path(repo_path)),)),
-            )
-            allowed_ref_changes |= commit_ref_changes
-            allowed_worktree_changes |= commit_worktree_changes
-
-    validate_agent_scope(
-        role_name,
-        saved_worktree,
-        scope_before,
-        current,
-        selected_plan_path=(
-            selected_plan_path if role_name == "worker" else None
-        ),
-        allowed_guidance_targets=guidance_targets,
-        allow_common_plans=allow_common_plans,
-        allowed_ref_changes=allowed_ref_changes,
-        allowed_worktree_changes=allowed_worktree_changes,
-        external_worktree=repo_path,
-        base_branch=str(project["base_branch"]),
-    )
-
+        except AgentScopeError as error:
+            if check.checkpoint_result:
+                raise AgentScopeError(
+                    f"중단된 Manager Git 작업 후 Agent scope 검증 실패: {error}"
+                ) from error
+            raise
     return current
 
 

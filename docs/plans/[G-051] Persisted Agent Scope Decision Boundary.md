@@ -36,8 +36,8 @@ priority: normal
 
 ## Progress
 
-- [ ] 저장된 상태 해석과 snapshot 판정 경계 분리
-- [ ] 기존 범위·복구 의미를 검증하는 targeted test 추가
+- [x] 저장된 상태 해석과 snapshot 판정 경계 분리
+- [x] 기존 범위·복구 의미를 검증하는 targeted test 추가
 
 ## Decision Log
 
