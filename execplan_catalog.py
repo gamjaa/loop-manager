@@ -26,6 +26,18 @@ _ARCHIVED_PATH = re.compile(
 _ACTIVE_REQUIREMENT_PATH = re.compile(r"docs/requirements/[^/]+\.md")
 
 
+def plan_content_hash(content: bytes | str) -> str:
+    """Hash the exact UTF-8 bytes of a validated ExecPlan document."""
+    if isinstance(content, str):
+        content = content.encode("utf-8")
+    return hashlib.sha256(content).hexdigest()
+
+
+def final_content_matches(observed_hash: str, current_hash: str) -> bool:
+    """Check final bytes independently of immutable publication audit bytes."""
+    return bool(current_hash) and observed_hash == current_hash
+
+
 class ArchiveDocumentKind(str, Enum):
     """Document families whose byte-preserving moves are lifecycle-neutral."""
 
@@ -389,7 +401,7 @@ def _entry(relative_path: str, text: str, values: Mapping[str, object]) -> ExecP
         complexity=str(values["complexity"]),
         risk=str(values["risk"]),
         priority=str(values["priority"]),
-        content_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        content_hash=plan_content_hash(text),
         text=text,
         archived=archived,
     )

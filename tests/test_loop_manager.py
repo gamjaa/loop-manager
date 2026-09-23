@@ -2780,12 +2780,15 @@ risk: medium
         self.assertEqual(values["depends_on"], ["G-001"])
 
     def test_current_execplan_is_valid(self):
-        values = loop_manager.validate_execplan(
-            loop_manager.ROOT,
-            "docs/plans/[G-001] Minimal Bootstrap Runner.md",
-        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_catalog_root(directory)
+            plan = write_execplan(root, "G-001", "Current Plan")
 
-        self.assertEqual(values["id"], "G-001")
+            values = loop_manager.validate_execplan(
+                root, plan.relative_to(root).as_posix()
+            )
+
+            self.assertEqual(values["id"], "G-001")
 
     def test_execplan_catalog_is_deterministic_and_indexed_by_id(self):
         with tempfile.TemporaryDirectory() as directory:

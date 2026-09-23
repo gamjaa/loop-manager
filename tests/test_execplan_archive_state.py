@@ -15,6 +15,10 @@ class ExecPlanArchiveStateTest(unittest.TestCase):
                 plan_id TEXT NOT NULL,
                 path TEXT NOT NULL,
                 content_hash TEXT NOT NULL,
+                current_revision_sha TEXT,
+                publication_path TEXT,
+                publication_content_hash TEXT,
+                publication_sha TEXT,
                 status TEXT NOT NULL,
                 PRIMARY KEY (repo, plan_id)
             )
@@ -30,8 +34,9 @@ class ExecPlanArchiveStateTest(unittest.TestCase):
     def _insert(self, plan_id, title, status="MERGED", *, path=None):
         active_path = path or f"docs/plans/[{plan_id}] {title}.md"
         self.connection.execute(
-            "INSERT INTO exec_plans VALUES (?, ?, ?, ?, ?)",
-            ("/repo", plan_id, active_path, f"hash-{plan_id}", status),
+            "INSERT INTO exec_plans VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("/repo", plan_id, active_path, f"hash-{plan_id}", "base",
+             active_path, f"initial-{plan_id}", "published", status),
         )
 
     def test_candidates_are_only_merged_rows_with_stable_active_paths(self):
@@ -106,6 +111,70 @@ class ExecPlanArchiveStateTest(unittest.TestCase):
         self.assertEqual(archived["pending_reason"], None)
         self.assertEqual(archived["archived"], 1)
         self.assertEqual(archived["final_hash"], "hash-G-001")
+
+    def test_revision_change_supersedes_old_candidate_and_preserves_audit(self):
+        self._insert("G-001", "Original")
+        old = self.repository.merged_candidates("/repo")[0]
+        self.repository.record_pending("/repo", old, reason="push_failed", base_sha="base")
+        self.connection.execute(
+            "UPDATE exec_plans SET path = ?, content_hash = ?, "
+            "current_revision_sha = ? WHERE repo = ? AND plan_id = ?",
+            ("docs/plans/[G-001] Revised.md", "final-hash", "new-base", "/repo", "G-001"),
+        )
+        new = self.repository.merged_candidates("/repo")[0]
+        self.assertEqual(new.archive_path, "docs/plans/archive/[G-001] Revised.md")
+        self.assertEqual(new.content_hash, "final-hash")
+        self.assertEqual(new.revision_sha, "new-base")
+        self.assertIs(
+            self.repository.record_operation_started("/repo", "old-op", "base", (old,)),
+            execplan_archive_state.ArchiveWriteResult.SUPERSEDED,
+        )
+        self.repository.record_pending("/repo", new, reason="source_hash_mismatch")
+        item = self.repository.item("/repo", "G-001")
+        self.assertEqual(item["expected_hash"], "final-hash")
+        self.assertEqual(item["current_revision_sha"], "new-base")
+        self.assertIsNone(item["base_sha"])
+        audit = self.connection.execute(
+            "SELECT publication_path, publication_content_hash, publication_sha "
+            "FROM exec_plans WHERE plan_id = 'G-001'"
+        ).fetchone()
+        self.assertEqual(tuple(audit),
+                         ("docs/plans/[G-001] Original.md", "initial-G-001", "published"))
+
+    def test_remote_move_after_push_recovers_pending_final_blob(self):
+        self._insert("G-001", "Original")
+        candidate = self.repository.merged_candidates("/repo")[0]
+        self.repository.record_operation_started("/repo", "operation", "base", (candidate,))
+        self.connection.execute(
+            "UPDATE exec_plans SET path = ?, current_revision_sha = ? "
+            "WHERE plan_id = 'G-001'",
+            (candidate.archive_path, "archive-commit"),
+        )
+        self.assertEqual(self.repository.merged_candidates("/repo"), (candidate,))
+        self.repository.record_success(
+            "/repo", (candidate,), base_sha="archive-commit",
+            operation_id=None, commit_oid=None, push_result="observed_remote",
+        )
+        self.assertEqual(self.repository.merged_candidates("/repo"), ())
+
+    def test_remote_archive_with_wrong_final_blob_keeps_pending_identity(self):
+        self._insert("G-001", "Original")
+        candidate = self.repository.merged_candidates("/repo")[0]
+        self.repository.record_operation_started("/repo", "operation", "base", (candidate,))
+        self.connection.execute(
+            "UPDATE exec_plans SET path = ?, content_hash = ?, "
+            "current_revision_sha = ? WHERE plan_id = 'G-001'",
+            (candidate.archive_path, "initial-G-001", "archive-commit"),
+        )
+        self.assertEqual(self.repository.merged_candidates("/repo"), (candidate,))
+        self.repository.record_pending(
+            "/repo", candidate, reason="archive_hash_mismatch",
+            base_sha="archive-commit",
+        )
+        self.assertEqual(
+            self.repository.item("/repo", "G-001")["pending_reason"],
+            "archive_hash_mismatch",
+        )
 
 
 if __name__ == "__main__":

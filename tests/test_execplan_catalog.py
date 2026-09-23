@@ -35,6 +35,17 @@ Catalog fixture.
 
 
 class ExecPlanCatalogSnapshotTest(unittest.TestCase):
+    def test_final_hash_compares_bytes_without_publication_hash(self):
+        final = execplan_catalog.plan_content_hash("revised body\n")
+        self.assertEqual(
+            final,
+            execplan_catalog.plan_content_hash(b"revised body\n"),
+        )
+        self.assertTrue(execplan_catalog.final_content_matches(final, final))
+        self.assertFalse(execplan_catalog.final_content_matches(
+            execplan_catalog.plan_content_hash(b"published body\n"), final,
+        ))
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)

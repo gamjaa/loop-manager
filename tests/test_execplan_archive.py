@@ -12,6 +12,7 @@ def candidate(plan_id: str) -> execplan_archive_state.MergedArchiveCandidate:
         f"docs/plans/[{plan_id}] {title}.md",
         f"docs/plans/archive/[{plan_id}] {title}.md",
         f"hash-{plan_id}",
+        "base",
     )
 
 
@@ -39,6 +40,9 @@ class FakeRepository:
 
     def merged_candidates(self, _repo):
         return self.candidates
+
+    def candidates_current(self, _repo, candidates):
+        return all(item in self.candidates for item in candidates)
 
     def record_pending(self, _repo, item, *, reason, **_kwargs):
         self.pending[item.plan_id] = reason
@@ -93,6 +97,7 @@ class FakeGit:
         )
         self.fetch_count = 0
         self.prepared = []
+        self.prepared_moves = []
         self.pushed = []
         self.match_count = 0
         self.cleaned = []
@@ -115,6 +120,7 @@ class FakeGit:
 
     def prepare_commit(self, base_sha, _base_branch, operation_id, moves):
         self.prepared.append((base_sha, tuple(move.plan_id for move in moves)))
+        self.prepared_moves.append(tuple(moves))
         return execplan_archive.PreparedArchive(
             operation_id, base_sha, f"tree-{base_sha}", f"commit-{base_sha}"
         )
@@ -172,6 +178,20 @@ class ExecPlanArchiveTest(unittest.TestCase):
         )
         self.assertEqual(safe, "safe")
         self.assertEqual(move.source, item.active_path)
+
+    def test_candidate_requires_reconciled_revision(self):
+        item = candidate("G-001")
+        missing = execplan_archive_state.MergedArchiveCandidate(
+            item.plan_id, item.active_path, item.archive_path,
+            item.content_hash, "",
+        )
+        status, move = execplan_archive.validate_candidate(
+            execplan_archive.ArchiveCandidateObservation(
+                missing, entry("G-001"), None,
+            )
+        )
+        self.assertEqual(status, "current_revision_missing")
+        self.assertIsNone(move)
 
     def test_safe_subset_is_published_while_bad_candidate_remains_pending(self):
         safe = candidate("G-001")
@@ -303,6 +323,47 @@ class ExecPlanArchiveTest(unittest.TestCase):
                 before, changed
             ).archive_only
         )
+
+    def test_operation_identity_changes_with_final_revision(self):
+        first = execplan_archive.ArchiveMove(
+            "G-001", "docs/plans/[G-001] Plan.md",
+            "docs/plans/archive/[G-001] Plan.md", "final-hash", "revision-1",
+        )
+        second = execplan_archive.ArchiveMove(
+            first.plan_id, first.source, first.destination,
+            first.content_hash, "revision-2",
+        )
+        self.assertNotEqual(
+            execplan_archive.archive_operation_id("base", (first,)),
+            execplan_archive.archive_operation_id("base", (second,)),
+        )
+
+    def test_revision_race_recalculates_candidate_before_commit(self):
+        first = candidate("G-001")
+        second = execplan_archive_state.MergedArchiveCandidate(
+            first.plan_id, "docs/plans/[G-001] Revised.md",
+            "docs/plans/archive/[G-001] Revised.md",
+            "new-final-hash", "base-2",
+        )
+        repository = FakeRepository((first,))
+        git = FakeGit({
+            "base": {"G-001": (entry("G-001"), None)},
+            "base-2": {"G-001": (
+                entry("G-001", content_hash="new-final-hash"), None)},
+        }, bases=["base", "base-2", "base-2", "base-2"])
+
+        def refresh(base):
+            if base == "base-2":
+                repository.candidates = (second,)
+            return True
+
+        outcome = execplan_archive.ExecPlanArchiveDispatcher(
+            repository, git, refresh_candidates=refresh,
+        ).dispatch("/repo", "main")
+        self.assertEqual(outcome.archived_plan_ids, ("G-001",))
+        self.assertEqual(git.prepared, [("base-2", ("G-001",))])
+        self.assertEqual(git.prepared_moves[0][0].source, second.active_path)
+        self.assertEqual(git.pushed, ["commit-base-2"])
 
 
 if __name__ == "__main__":

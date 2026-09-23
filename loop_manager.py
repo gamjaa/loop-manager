@@ -14021,8 +14021,23 @@ class _ExecPlanArchiveGitPort:
             mode,
             object_type,
             object_id,
-            hashlib.sha256(contents).hexdigest(),
+            execplan_catalog.plan_content_hash(contents),
         )
+
+    def definitions_current(
+        self,
+        base_sha: str,
+        candidates: Sequence[execplan_archive_state.MergedArchiveCandidate],
+    ) -> bool:
+        for candidate in candidates:
+            source = self._entry(base_sha, candidate.active_path)
+            destination = self._entry(base_sha, candidate.archive_path)
+            observed = source if source is not None else destination
+            if observed is None or not observed.regular:
+                return False
+            if observed.content_hash != candidate.content_hash:
+                return False
+        return True
 
     def observe(
         self,
@@ -14372,9 +14387,22 @@ def dispatch_execplan_archive_housekeeping(
 ) -> execplan_archive.ArchiveDispatchOutcome:
     """Assemble the archive service and map its result to operator logging."""
 
+    def refresh_candidates(base_sha: str) -> bool:
+        result = reconcile_execplan_catalog(
+            connection, repo_path, repo, base_branch
+        )
+        if result.kind is not execplan_catalog_state.ReconciliationKind.RECONCILED:
+            return False
+        current = git(
+            repo_path, "rev-parse",
+            f"refs/remotes/origin/{base_branch}^{{commit}}",
+        ).stdout.strip()
+        return result.revision_sha == base_sha and current == base_sha
+
     outcome = execplan_archive.ExecPlanArchiveDispatcher(
         execplan_archive_state.ExecPlanArchiveRepository(connection),
         _ExecPlanArchiveGitPort(repo_path, state_dir, repo),
+        refresh_candidates=refresh_candidates,
     ).dispatch(repo, base_branch)
     if outcome.commit_oid:
         operation_print(

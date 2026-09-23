@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import Enum
+import json
 from pathlib import PurePosixPath
 import re
 import sqlite3
@@ -17,6 +19,7 @@ CREATE TABLE IF NOT EXISTS execplan_archive_items (
     active_path TEXT NOT NULL,
     archive_path TEXT NOT NULL,
     expected_hash TEXT NOT NULL,
+    current_revision_sha TEXT,
     base_sha TEXT,
     final_hash TEXT,
     operation_id TEXT,
@@ -34,6 +37,7 @@ CREATE TABLE IF NOT EXISTS execplan_archive_operations (
     repo TEXT NOT NULL,
     operation_id TEXT NOT NULL,
     base_sha TEXT NOT NULL,
+    current_revisions TEXT,
     final_hash TEXT,
     commit_oid TEXT,
     push_result TEXT,
@@ -52,6 +56,7 @@ class MergedArchiveCandidate:
     active_path: str
     archive_path: str
     content_hash: str
+    revision_sha: str
 
 
 @dataclass(frozen=True)
@@ -62,9 +67,31 @@ class PreparedArchiveOperation:
     commit_oid: str
 
 
+class ArchiveWriteResult(str, Enum):
+    APPLIED = "applied"
+    SUPERSEDED = "superseded"
+
+
+def _revision_token(candidates: Sequence[MergedArchiveCandidate]) -> str:
+    return json.dumps(
+        [
+            (item.plan_id, item.revision_sha, item.content_hash)
+            for item in sorted(candidates, key=lambda item: item.plan_id)
+        ],
+        separators=(",", ":"),
+    )
+
+
 def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.execute(ARCHIVE_ITEMS_SCHEMA)
     connection.execute(ARCHIVE_OPERATIONS_SCHEMA)
+    for table, column, definition in (
+        ("execplan_archive_items", "current_revision_sha", "TEXT"),
+        ("execplan_archive_operations", "current_revisions", "TEXT"),
+    ):
+        columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 @contextmanager
@@ -96,7 +123,7 @@ class ExecPlanArchiveRepository:
     def merged_candidates(self, repo: str) -> tuple[MergedArchiveCandidate, ...]:
         candidates: list[MergedArchiveCandidate] = []
         rows = self.connection.execute(
-            "SELECT plan_id, path, content_hash FROM exec_plans "
+            "SELECT plan_id, path, content_hash, current_revision_sha FROM exec_plans "
             "WHERE repo = ? AND status = 'MERGED' ORDER BY plan_id",
             (repo,),
         ).fetchall()
@@ -113,9 +140,41 @@ class ExecPlanArchiveRepository:
                     active_path=active_path,
                     archive_path=f"docs/plans/archive/{filename}",
                     content_hash=str(row["content_hash"]),
+                    revision_sha=str(row["current_revision_sha"] or ""),
                 )
             )
+        # A push may have succeeded before SQLite recorded success. Reconcile
+        # then points the current definition at the archived file; retain the
+        # previous move identity only for this exact final blob.
+        recovered = self.connection.execute(
+            "SELECT i.plan_id, i.active_path, i.archive_path, i.expected_hash, "
+            "i.current_revision_sha, p.path, p.content_hash "
+            "FROM execplan_archive_items i JOIN exec_plans p "
+            "ON p.repo = i.repo AND p.plan_id = i.plan_id "
+            "WHERE i.repo = ? AND i.archived = 0 AND p.status = 'MERGED'",
+            (repo,),
+        ).fetchall()
+        for row in recovered:
+            if any(item.plan_id == row["plan_id"] for item in candidates):
+                continue
+            if row["path"] == row["archive_path"]:
+                candidates.append(
+                    MergedArchiveCandidate(
+                        str(row["plan_id"]),
+                        str(row["active_path"]),
+                        str(row["archive_path"]),
+                        str(row["expected_hash"]),
+                        str(row["current_revision_sha"] or ""),
+                    )
+                )
+        candidates.sort(key=lambda item: item.plan_id)
         return tuple(candidates)
+
+    def candidates_current(
+        self, repo: str, candidates: Sequence[MergedArchiveCandidate]
+    ) -> bool:
+        current = {item.plan_id: item for item in self.merged_candidates(repo)}
+        return all(current.get(item.plan_id) == item for item in candidates)
 
     def prepared_operation(
         self, repo: str, operation_id: str
@@ -167,15 +226,19 @@ class ExecPlanArchiveRepository:
         operation_id: str,
         base_sha: str,
         candidates: Sequence[MergedArchiveCandidate],
-    ) -> None:
+    ) -> ArchiveWriteResult:
         with _transaction(self.connection):
+            if not self.candidates_current(repo, candidates):
+                return ArchiveWriteResult.SUPERSEDED
             self.connection.execute(
                 """
                 INSERT INTO execplan_archive_operations (
-                    repo, operation_id, base_sha, push_result, pending_reason
-                ) VALUES (?, ?, ?, 'preparing', NULL)
+                    repo, operation_id, base_sha, current_revisions,
+                    push_result, pending_reason
+                ) VALUES (?, ?, ?, ?, 'preparing', NULL)
                 ON CONFLICT(repo, operation_id) DO UPDATE SET
                     base_sha = excluded.base_sha,
+                    current_revisions = excluded.current_revisions,
                     push_result = CASE
                         WHEN execplan_archive_operations.commit_oid IS NULL
                         THEN 'preparing'
@@ -184,7 +247,7 @@ class ExecPlanArchiveRepository:
                     pending_reason = NULL,
                     updated_at = CURRENT_TIMESTAMP
                 """,
-                (repo, operation_id, base_sha),
+                (repo, operation_id, base_sha, _revision_token(candidates)),
             )
             for candidate in candidates:
                 self._upsert_item(
@@ -196,6 +259,7 @@ class ExecPlanArchiveRepository:
                     pending_reason=None,
                     archived=False,
                 )
+        return ArchiveWriteResult.APPLIED
 
     def record_prepared(
         self,
@@ -205,23 +269,28 @@ class ExecPlanArchiveRepository:
         final_hash: str,
         commit_oid: str,
         candidates: Sequence[MergedArchiveCandidate],
-    ) -> None:
+    ) -> ArchiveWriteResult:
         with _transaction(self.connection):
+            if not self.candidates_current(repo, candidates):
+                return ArchiveWriteResult.SUPERSEDED
             self.connection.execute(
                 """
                 INSERT INTO execplan_archive_operations (
-                    repo, operation_id, base_sha, final_hash, commit_oid,
+                    repo, operation_id, base_sha, current_revisions,
+                    final_hash, commit_oid,
                     push_result, pending_reason
-                ) VALUES (?, ?, ?, ?, ?, 'prepared', NULL)
+                ) VALUES (?, ?, ?, ?, ?, ?, 'prepared', NULL)
                 ON CONFLICT(repo, operation_id) DO UPDATE SET
                     base_sha = excluded.base_sha,
+                    current_revisions = excluded.current_revisions,
                     final_hash = excluded.final_hash,
                     commit_oid = excluded.commit_oid,
                     push_result = 'prepared',
                     pending_reason = NULL,
                     updated_at = CURRENT_TIMESTAMP
                 """,
-                (repo, operation_id, base_sha, final_hash, commit_oid),
+                (repo, operation_id, base_sha, _revision_token(candidates),
+                 final_hash, commit_oid),
             )
             for candidate in candidates:
                 self._upsert_item(
@@ -235,6 +304,7 @@ class ExecPlanArchiveRepository:
                     pending_reason=None,
                     archived=False,
                 )
+        return ArchiveWriteResult.APPLIED
 
     def record_operation_pending(
         self,
@@ -247,14 +317,17 @@ class ExecPlanArchiveRepository:
         base_sha: str,
         commit_oid: str | None = None,
         final_hash: str | None = None,
-    ) -> None:
+    ) -> ArchiveWriteResult:
         with _transaction(self.connection):
+            if not self.candidates_current(repo, candidates):
+                return ArchiveWriteResult.SUPERSEDED
             self.connection.execute(
                 """
                 INSERT INTO execplan_archive_operations (
-                    repo, operation_id, base_sha, final_hash, commit_oid,
+                    repo, operation_id, base_sha, current_revisions,
+                    final_hash, commit_oid,
                     push_result, pending_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(repo, operation_id) DO UPDATE SET
                     final_hash = COALESCE(
                         excluded.final_hash,
@@ -272,6 +345,7 @@ class ExecPlanArchiveRepository:
                     repo,
                     operation_id,
                     base_sha,
+                    _revision_token(candidates),
                     final_hash,
                     commit_oid,
                     push_result,
@@ -290,6 +364,7 @@ class ExecPlanArchiveRepository:
                     pending_reason=reason,
                     archived=False,
                 )
+        return ArchiveWriteResult.APPLIED
 
     def record_success(
         self,
@@ -300,8 +375,10 @@ class ExecPlanArchiveRepository:
         operation_id: str | None,
         commit_oid: str | None,
         push_result: str,
-    ) -> None:
+    ) -> ArchiveWriteResult:
         with _transaction(self.connection):
+            if not self.candidates_current(repo, candidates):
+                return ArchiveWriteResult.SUPERSEDED
             if operation_id is not None:
                 self.connection.execute(
                     """
@@ -324,6 +401,7 @@ class ExecPlanArchiveRepository:
                     pending_reason=None,
                     archived=True,
                 )
+        return ArchiveWriteResult.APPLIED
 
     def item(self, repo: str, plan_id: str) -> sqlite3.Row | None:
         return self.connection.execute(
@@ -344,29 +422,25 @@ class ExecPlanArchiveRepository:
         pending_reason: str | None,
         archived: bool,
     ) -> None:
+        if not self.candidates_current(repo, (candidate,)):
+            return
         self.connection.execute(
             """
             INSERT INTO execplan_archive_items (
                 repo, plan_id, active_path, archive_path, expected_hash,
+                current_revision_sha,
                 base_sha, final_hash, operation_id, commit_oid, push_result,
                 pending_reason, archived
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(repo, plan_id) DO UPDATE SET
                 active_path = excluded.active_path,
                 archive_path = excluded.archive_path,
                 expected_hash = excluded.expected_hash,
-                base_sha = COALESCE(
-                    excluded.base_sha, execplan_archive_items.base_sha
-                ),
-                final_hash = COALESCE(
-                    excluded.final_hash, execplan_archive_items.final_hash
-                ),
-                operation_id = COALESCE(
-                    excluded.operation_id, execplan_archive_items.operation_id
-                ),
-                commit_oid = COALESCE(
-                    excluded.commit_oid, execplan_archive_items.commit_oid
-                ),
+                current_revision_sha = excluded.current_revision_sha,
+                base_sha = excluded.base_sha,
+                final_hash = excluded.final_hash,
+                operation_id = excluded.operation_id,
+                commit_oid = excluded.commit_oid,
                 push_result = excluded.push_result,
                 pending_reason = excluded.pending_reason,
                 archived = excluded.archived,
@@ -378,6 +452,7 @@ class ExecPlanArchiveRepository:
                 candidate.active_path,
                 candidate.archive_path,
                 candidate.content_hash,
+                candidate.revision_sha,
                 base_sha,
                 final_hash,
                 operation_id,
