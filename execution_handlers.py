@@ -1,6 +1,6 @@
 """Execution handlers; all external operations arrive through effect ports."""
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Any
 from pathlib import Path
 from dataclasses import asdict
@@ -468,6 +468,11 @@ class ExecutionHandlers:
                     'stash_oid': stash_oid or (current.snapshot or {}).get('stash_oid'),
                 },
             )
+            if not in_progress and not (stash_oid or (current.snapshot or {}).get('stash_oid')):
+                return self._recover(
+                    RecoveryReason.STATUS_FAILED, 'autostash_identity_unavailable',
+                    context=context, attempts=3,
+                )
         if not unmerged and not in_progress:
             if checkpoint is not None:
                 self.effects.workspace.validate_managed_worktree(
@@ -705,7 +710,24 @@ class ExecutionHandlers:
                 snapshot={**(current.snapshot or {}), **asdict(snapshot)},
             )
             self.effects.state.check_context(context)
+            decision = assess(snapshot)
             if (current.operation == 'rebase'
+                    and decision.action not in {CheckpointAction.USER_ACTION, CheckpointAction.PAUSE}
+                    and (current.snapshot or {}).get('pending') == 'stage'
+                    and (current.snapshot or {}).get('worker_result')
+                    and not snapshot.unmerged_stages):
+                # Staging may have completed before its completion marker was
+                # saved. Reuse the accepted correction instead of rerunning
+                # the Worker, including an autostash without rebase metadata.
+                resumed = self._finish_worker(
+                    replace(context, resolving_rebase=True), row,
+                    current.snapshot['worker_result'],
+                )
+                return (resumed.context
+                        if resumed.kind is ExecutionOutcomeKind.PHASE_ADVANCED
+                        else resumed)
+            if (current.operation == 'rebase'
+                    and decision.action not in {CheckpointAction.USER_ACTION, CheckpointAction.PAUSE}
                     and (current.snapshot or {}).get('pending') == 'continue'
                     and snapshot.git_operation == 'rebase'
                     and not snapshot.unmerged_stages):
@@ -740,7 +762,6 @@ class ExecutionHandlers:
                 )
                 self._complete_rebase_intent(context)
                 return self._context()
-            decision = assess(snapshot)
             if decision.action is CheckpointAction.CONTINUE:
                 return context
             if decision.action is CheckpointAction.CONFLICT:
@@ -2633,7 +2654,11 @@ class ExecutionHandlers:
             str(row['pr_url']) if int(row['pr_conflict_recovery']) else None,
         )
         existing_pr = publication.pull_request
-        if assess_publication(publication) is PublicationNext.USER_ACTION:
+        # Owned PR conflict recovery deliberately starts from its saved PR
+        # head; its existing lease gate authorizes the later rebased push.
+        attachment = (replace(publication, local_oid=str(row['pr_conflict_head_oid'] or ''))
+                      if int(row['pr_conflict_recovery']) else publication)
+        if assess_publication(attachment) is PublicationNext.USER_ACTION:
             return self._block_final(
                 self.repo, context.worktree,
                 '원격 branch 또는 PR head가 관측한 소유 OID와 다릅니다.',

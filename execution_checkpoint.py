@@ -82,7 +82,11 @@ def assess(snapshot: CheckpointSnapshot) -> CheckpointDecision:
     if snapshot.pr_head_oid and snapshot.recorded_pr_head_oid and snapshot.pr_head_oid != snapshot.recorded_pr_head_oid:
         return CheckpointDecision(CheckpointAction.USER_ACTION, reason="external_pr_head")
     if snapshot.unmerged_stages:
-        if snapshot.rebase_intent or snapshot.git_operation == "rebase":
+        if snapshot.git_operation == "rebase":
+            return CheckpointDecision(CheckpointAction.CONFLICT, phase="IMPLEMENTING", reason="rebase_index_conflict")
+        if snapshot.rebase_intent:
+            if not snapshot.stash_oid:
+                return CheckpointDecision(CheckpointAction.PAUSE, reason="autostash_identity_unavailable")
             return CheckpointDecision(CheckpointAction.CONFLICT, phase="IMPLEMENTING", reason="rebase_index_conflict")
         return CheckpointDecision(CheckpointAction.USER_ACTION, reason="unowned_index_conflict")
     if snapshot.git_operation == "rebase":

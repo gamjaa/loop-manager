@@ -30,6 +30,8 @@ def assess_publication(observation: PublicationObservation) -> PublicationNext:
         head_oid = pr.get("headRefOid")
         if head_name and head_name != observation.branch:
             return PublicationNext.USER_ACTION
+        if head_oid != observation.local_oid:
+            return PublicationNext.USER_ACTION
         if head_oid and observation.remote_oid and head_oid != observation.remote_oid:
             return PublicationNext.USER_ACTION
         return PublicationNext.ATTACH_PR

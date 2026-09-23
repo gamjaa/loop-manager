@@ -406,6 +406,81 @@ class ExecutionHandlerTests(TestCase):
                          'stop after same-run verify recovery')
         self.assertEqual(self.state.row()['worker_session_id'], 'worker-session')
 
+    def test_staged_rebase_resume_reuses_saved_worker_result(self):
+        self._assert_staged_rebase_resume(True)
+
+    def test_staged_autostash_resume_reuses_saved_worker_result(self):
+        self._assert_staged_rebase_resume(False)
+
+    def _assert_staged_rebase_resume(self, rebase_metadata):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        self.state.update_project(
+            'repo', phase='WORKING', worker_session_id='saved-session',
+            last_error=lm.REBASE_CONFLICT_PREFIX + 'conflict',
+        )
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0, operation='rebase',
+            expected_head='before-head', target_base_oid='base',
+            observed_remote_oid=None,
+            snapshot={'pending': 'stage', 'worker_result': 'saved correction'},
+        )
+        def staged_git(path, *args, **kwargs):
+            if args == ('diff', '--cached', '--quiet'):
+                return SimpleNamespace(stdout='', returncode=1)
+            return self.observed_git(path, *args, **kwargs)
+        self.effects.workspace.git.side_effect = staged_git
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = rebase_metadata
+        result = self.handler.recover(self.context())
+        self.assertEqual(result.phase, ExecutionPhase.VERIFYING)
+        self.assertEqual(self.state.row()['worker_result'], 'saved correction')
+        self.assertEqual(self.state.row()['worker_session_id'], 'saved-session')
+        self.assertIsNone(checkpoint.get('repo', 'G-047').operation)
+        self.effects.agent.run_agent.assert_not_called()
+        continuations = [call for call in self.effects.workspace.git.call_args_list
+                         if '--continue' in call.args]
+        self.assertEqual(len(continuations), int(rebase_metadata))
+
+    def test_autostash_without_identity_pauses_after_command_and_on_resume(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0, operation='rebase',
+            expected_head='before-head', target_base_oid='base',
+            observed_remote_oid=None, snapshot={},
+        )
+        def conflicted_git(path, *args, **kwargs):
+            if args[0] == 'ls-files':
+                return SimpleNamespace(stdout='100644 blob 1\tapp.py\0', returncode=0)
+            return self.observed_git(path, *args, **kwargs)
+        self.effects.workspace.git.side_effect = conflicted_git
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = False
+        context = self.context('VERIFYING')
+        for result in (
+            self.handler._post_rebase_observation(context, 'base', 'completed'),
+            self.handler.recover(context),
+        ):
+            self.assertEqual(result.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
+            self.assertEqual(result.detail, 'autostash_identity_unavailable')
+        self.effects.agent.run_agent.assert_not_called()
+        self.effects.validation.verify.assert_not_called()
+        self.effects.publication.push_managed_publication_branch.assert_not_called()
+        self.assertEqual(checkpoint.get('repo', 'G-047').operation, 'rebase')
+
+    def test_old_pr_head_after_rebase_cannot_attach_or_push(self):
+        self.effects.publication.pr_for_branch.return_value = {
+            'url': 'existing', 'headRefOid': 'old',
+            'headRefName': 'loop-manager/G-047', 'state': 'OPEN',
+        }
+        self.effects.workspace.remote_branch_oid.return_value = 'old'
+        result = self.handler.publish(self.context('PUBLISHING'), self.handler)
+        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.effects.publication.reconcile_existing_pull_request.assert_not_called()
+        self.effects.publication.push_managed_publication_branch.assert_not_called()
+        self.effects.publication.command.assert_not_called()
+
     def test_checkpoint_fetch_lock_preserves_intent_and_worker_session(self):
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)
@@ -1275,7 +1350,9 @@ class ExecutionHandlerTests(TestCase):
         self.effects.blocking.block_active_execplan.assert_not_called()
 
     def test_existing_pr_recovery_does_not_push_or_create(self):
-        self.effects.publication.pr_for_branch.return_value = {'url': 'existing'}
+        self.effects.publication.pr_for_branch.return_value = {
+            'url': 'existing', 'headRefOid': 'base',
+        }
         self.effects.publication.reconcile_existing_pull_request.return_value = 0
         result = self.handler.publish(self.context('PUBLISHING'), self.handler)
         self.assertEqual(result.kind, ExecutionOutcomeKind.SUCCESS)
@@ -1608,9 +1685,12 @@ class ExecutionHandlerTests(TestCase):
         paused = self.handler.publish(self.context('PUBLISHING'), self.handler)
         self.assertEqual(paused.kind, ExecutionOutcomeKind.RETRY)
         self.assertEqual(paused.recovery.observation.reason.value, 'publication_retry')
-        self.effects.publication.pr_for_branch.return_value = {'url': 'created'}
+        self.effects.publication.pr_for_branch.return_value = {
+            'url': 'created', 'headRefOid': 'base',
+        }
         self.effects.publication.reconcile_existing_pull_request.return_value = 0
-        self.handler.publish(self.context(), self.handler)
+        resumed = self.handler.publish(self.context(), self.handler)
+        self.assertEqual(resumed.kind, ExecutionOutcomeKind.SUCCESS)
         self.assertEqual(self.calls.count('push'), 1)
         self.assertEqual(self.effects.publication.command.call_count, 1)
 

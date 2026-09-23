@@ -92,7 +92,7 @@ class CheckpointAssessmentTests(unittest.TestCase):
 
     def test_autostash_unmerged_index_wins_over_successful_head_ancestry(self):
         actual = snapshot(
-            phase='IMPLEMENTING', rebase_intent=True,
+            phase='IMPLEMENTING', rebase_intent=True, stash_oid='stash-object',
             unmerged_stages=(('app.py', 1, 'a' * 40),
                              ('app.py', 2, 'b' * 40),
                              ('app.py', 3, 'c' * 40)),
@@ -100,6 +100,14 @@ class CheckpointAssessmentTests(unittest.TestCase):
         decision = assess(actual)
         self.assertEqual(decision.action, CheckpointAction.CONFLICT)
         self.assertEqual(decision.phase, 'IMPLEMENTING')
+
+    def test_autostash_without_identity_pauses_before_worker_correction(self):
+        actual = snapshot(rebase_intent=True,
+                          unmerged_stages=(('app.py', 1, 'blob'),))
+        self.assertEqual(assess(actual).action, CheckpointAction.PAUSE)
+        self.assertEqual(assess(actual).reason, 'autostash_identity_unavailable')
+        self.assertEqual(assess(replace(actual, git_operation='rebase')).action,
+                         CheckpointAction.CONFLICT)
 
     def test_unowned_or_external_remote_state_requires_user_action(self):
         for actual in (
@@ -193,7 +201,7 @@ class CheckpointAssessmentTests(unittest.TestCase):
             owned=True, git=git, rebase_in_progress=lambda *_: False,
             remote_oid=None, pull_request=None, rebase_intent=True,
             rebase_before_head='before', rebase_target_oid='new-base',
-            stash_oid=None,
+            stash_oid='stash-object',
         )
         self.assertEqual(actual.unmerged_stages, (
             ('app.py', 1, 'a' * 40), ('app.py', 2, 'b' * 40),

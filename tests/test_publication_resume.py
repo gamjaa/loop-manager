@@ -11,6 +11,23 @@ from publication_resume import (
 
 
 class PublicationResumeTests(unittest.TestCase):
+    def test_missing_pr_head_cannot_prove_safe_attachment(self):
+        observation = PublicationObservation(
+            'loop/G-044', 'head', 'head', 'head', {'url': 'existing'},
+        )
+        self.assertEqual(assess_publication(observation), PublicationNext.USER_ACTION)
+
+    def test_existing_pr_on_old_head_cannot_attach_after_local_rebase(self):
+        for state in ('OPEN', 'CLOSED', 'MERGED'):
+            with self.subTest(state=state):
+                observation = PublicationObservation(
+                    'loop/G-044', 'rebased', 'old', 'old',
+                    {'state': state, 'headRefName': 'loop/G-044',
+                     'headRefOid': 'old'},
+                )
+                self.assertEqual(assess_publication(observation),
+                                 PublicationNext.USER_ACTION)
+
     def test_remote_equal_local_skips_push_and_existing_pr_skips_create(self):
         observed = PublicationObservation('loop/G-044', 'head', 'head', None, None)
         self.assertEqual(assess_publication(observed), PublicationNext.CREATE_PR)

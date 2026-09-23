@@ -85,4 +85,5 @@ class AutostashCheckpointGitTests(unittest.TestCase):
                 rebase_target_oid=intent.target_base_oid, stash_oid=None,
             )
             self.assertTrue(actual.unmerged_stages)
-            self.assertEqual(assess(actual).action, CheckpointAction.CONFLICT)
+            self.assertEqual(assess(actual).action, CheckpointAction.PAUSE)
+            self.assertEqual(assess(actual).reason, 'autostash_identity_unavailable')

@@ -87,6 +87,52 @@ def git_command(repo: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
+def matching_branch_pr_lookup(responses):
+    """Model a PR on the current branch when a publication fixture omits HEAD.
+
+    Resolve lazily: the Worker may commit or rebase before GitHub is queried.
+    Explicit head values remain untouched for stale/external-head scenarios.
+    """
+    iterator = None if callable(responses) else iter(responses)
+
+    def lookup(repo, branch, *args, **kwargs):
+        response = (responses(repo, branch, *args, **kwargs)
+                    if callable(responses) else next(iterator))
+        if response is None or 'headRefOid' in response:
+            return response
+        return {
+            **response,
+            'headRefName': response.get('headRefName', branch),
+            'headRefOid': git_command(repo, 'rev-parse', f'refs/heads/{branch}'),
+        }
+
+    return lookup
+
+
+class PublicationFixtureTest(unittest.TestCase):
+    def test_matching_pr_reads_head_only_when_queried(self):
+        with mock.patch(__name__ + '.git_command', side_effect=['first', 'rebased']) as git:
+            lookup = matching_branch_pr_lookup([None, {'url': 'pr'}, {'url': 'pr'}])
+            git.assert_not_called()
+            self.assertIsNone(lookup(Path('/repo'), 'feature'))
+            git.assert_not_called()
+            self.assertEqual(lookup(Path('/repo'), 'feature')['headRefOid'], 'first')
+            self.assertEqual(lookup(Path('/repo'), 'feature')['headRefOid'], 'rebased')
+            self.assertEqual(git.call_args_list, [
+                mock.call(Path('/repo'), 'rev-parse', 'refs/heads/feature'),
+                mock.call(Path('/repo'), 'rev-parse', 'refs/heads/feature'),
+            ])
+
+    def test_callable_fixture_preserves_explicit_stale_head(self):
+        response = {'url': 'pr', 'headRefName': 'other', 'headRefOid': 'stale'}
+        source = mock.Mock(return_value=response)
+        with mock.patch(__name__ + '.git_command') as git:
+            lookup = matching_branch_pr_lookup(source)
+            self.assertIs(lookup(Path('/repo'), 'feature', 'saved-url'), response)
+            source.assert_called_once_with(Path('/repo'), 'feature', 'saved-url')
+            git.assert_not_called()
+
+
 def make_remote_repository(directory: str) -> Path:
     parent = Path(directory)
     remote = parent / "remote.git"
@@ -3930,10 +3976,10 @@ risk: medium
                 "loop_manager.ensure_safe_base_worktree"
             ), mock.patch(
                 "loop_manager.pr_for_branch",
-                side_effect=lambda *_args, **_kwargs: (
+                side_effect=matching_branch_pr_lookup(lambda *_args, **_kwargs: (
                     {"url": "https://example.test/pr/1"}
                     if reviewed else None
-                ),
+                )),
             ), mock.patch(
                 "loop_manager.run_codex", side_effect=worker
             ), mock.patch(
@@ -3991,7 +4037,9 @@ risk: medium
             with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
                 "loop_manager.remote_base", return_value="main"
             ), mock.patch("loop_manager.ensure_safe_base_worktree"), mock.patch(
-                "loop_manager.pr_for_branch", side_effect=[None, {"url": "https://example.test/pr/1"}]
+                "loop_manager.pr_for_branch", side_effect=matching_branch_pr_lookup(
+                    [None, {"url": "https://example.test/pr/1"}]
+                )
             ), mock.patch("loop_manager.run_codex", side_effect=agent), mock.patch(
                 "loop_manager.verify", return_value=(True, "verify: PASS")
             ) as verify, mock.patch("loop_manager.operation_log", side_effect=lambda message, **kwargs: logs.append((message, kwargs))):
@@ -4172,7 +4220,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         ), mock.patch(
             "loop_manager.ensure_safe_base_worktree"
         ), mock.patch(
-            "loop_manager.pr_for_branch", side_effect=existing_pr
+            "loop_manager.pr_for_branch", side_effect=matching_branch_pr_lookup(existing_pr)
         ), mock.patch(
             "loop_manager.run_codex", side_effect=agent
         ), mock.patch(
@@ -4916,7 +4964,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             ), mock.patch(
                 "loop_manager.ensure_safe_base_worktree"
             ), mock.patch(
-                "loop_manager.pr_for_branch", side_effect=pr_results
+                "loop_manager.pr_for_branch", side_effect=matching_branch_pr_lookup(pr_results)
             ), mock.patch(
                 "loop_manager.run_codex", side_effect=agent
             ), mock.patch(
@@ -5210,12 +5258,12 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                 "loop_manager.ensure_safe_base_worktree"
             ), mock.patch(
                 "loop_manager.pr_for_branch",
-                side_effect=[
+                side_effect=matching_branch_pr_lookup([
                     None,
                     None,
                     None,
                     {"url": "https://example.test/pr/13"},
-                ],
+                ]),
             ), mock.patch(
                 "loop_manager.run_codex", side_effect=agent
             ), mock.patch(
@@ -5483,7 +5531,7 @@ class ReviewDrivenWorkerProfileEscalationTest(unittest.TestCase):
         ), mock.patch(
             "loop_manager.ensure_safe_base_worktree"
         ), mock.patch(
-            "loop_manager.pr_for_branch", side_effect=pr_results
+            "loop_manager.pr_for_branch", side_effect=matching_branch_pr_lookup(pr_results)
         ), mock.patch(
             "loop_manager.run_codex", side_effect=agent
         ), mock.patch(
@@ -6240,7 +6288,9 @@ class WorkerPublicationTest(unittest.TestCase):
                 "loop_manager.remote_base", return_value="main"
             ), mock.patch("loop_manager.ensure_safe_base_worktree"), mock.patch(
                 "loop_manager.pr_for_branch",
-                side_effect=[None, None, {"url": "https://example.test/pr/1"}],
+                side_effect=matching_branch_pr_lookup(
+                    [None, None, {"url": "https://example.test/pr/1"}]
+                ),
             ), mock.patch("loop_manager.run_codex", side_effect=worker), mock.patch(
                 "loop_manager.verify",
                 side_effect=lambda *_args: (
