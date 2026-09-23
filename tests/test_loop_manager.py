@@ -13955,10 +13955,12 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
                 registered_only,
                 planner_mutex,
                 refactoring_review_interval,
+                on_step_completed,
             ):
                 nonlocal active_workers, maximum_workers
                 nonlocal active_planners, maximum_planners
                 self.assertTrue(registered_only)
+                self.assertTrue(callable(on_step_completed))
                 self.assertEqual(
                     refactoring_review_interval,
                     config.refactoring_review_interval,

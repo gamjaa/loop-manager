@@ -15039,6 +15039,7 @@ def run_project_result(
     registered_only: bool = False,
     planner_mutex: threading.Lock | None = None,
     refactoring_review_interval: int = 5,
+    on_step_completed: Callable[[], None] | None = None,
 ) -> ProjectRunResult:
     """Run retryable validation progress to a stable project-level outcome."""
 
@@ -15088,6 +15089,8 @@ def run_project_result(
                 0,
                 str(error),
             )
+        if on_step_completed is not None:
+            on_step_completed()
         if _checkpoint_dispatch_ready(connection, repo):
             pending_after = (
                 blocked_checkpoint_state.BlockedCheckpointRepository(
@@ -15210,7 +15213,8 @@ def _run_registered_project(
     project: project_registry.RegisteredProject,
     state_dir: Path,
     config_path: Path,
-    notifications_enabled: bool,
+    telegram_token: str,
+    telegram_chat_id: str,
     planner_mutex: threading.Lock,
     refactoring_review_interval: int,
 ) -> ScheduledProjectResult:
@@ -15222,12 +15226,27 @@ def _run_registered_project(
         # state transaction and can fail with SQLITE_BUSY.
         with connect_database(state_dir, run_migrations=False) as connection:
             notifications.configure_session(
-                connection, enabled=notifications_enabled
+                connection, enabled=bool(telegram_token and telegram_chat_id)
             )
             # TEMP session setup opens a SQLite transaction. Close it before
             # runtime-state repository operations so each lifecycle change
             # owns and durably commits its intended transaction boundary.
             connection.commit()
+
+            def deliver_new_pr_notifications() -> None:
+                try:
+                    notifications.dispatch_new_pr_notifications(
+                        connection,
+                        telegram_token,
+                        telegram_chat_id,
+                        project.repo,
+                    )
+                except Exception as error:
+                    operation_log(
+                        f"즉시 PR 알림 전송 실패 ({type(error).__name__})",
+                        error=True,
+                    )
+
             result = run_project_result(
                 connection,
                 state_dir,
@@ -15238,6 +15257,7 @@ def _run_registered_project(
                 registered_only=True,
                 planner_mutex=planner_mutex,
                 refactoring_review_interval=refactoring_review_interval,
+                on_step_completed=deliver_new_pr_notifications,
             )
     except (ManagedConfigError, project_registry.ProjectRegistryError) as error:
         result = ProjectRunResult(
@@ -15285,7 +15305,8 @@ def schedule_registered_projects(
                 project,
                 state_dir,
                 config.path,
-                config.telegram_enabled,
+                config.telegram_token,
+                config.telegram_chat_id,
                 planner_mutex,
                 config.refactoring_review_interval,
             )

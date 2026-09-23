@@ -9,6 +9,7 @@ import loop_manager
 import blocked_checkpoint_state
 from managed_config import ManagedConfigError, load_managed_config
 import notifications
+import project_registry
 import scoped_blocking
 
 
@@ -314,6 +315,195 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
         delivered.assert_called_once()
         self.assertNotIn(token, delivered.call_args.args[2])
         self.assertNotIn(chat_id, delivered.call_args.args[2])
+
+    def test_new_pr_delivery_is_scoped_and_fallback_keeps_pending_failure(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        other_repo = "/projects/beta"
+        connection.execute(
+            "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+            (other_repo,),
+        )
+        connection.execute(
+            """
+            INSERT INTO exec_plans (
+                repo, plan_id, path, title, sources, depends_on, priority,
+                content_hash, status, pr_url
+            ) VALUES (?, 'G-019', 'docs/plans/other.md', 'Other PR',
+                      '[]', '[]', 'normal', 'hash', 'PR_OPEN', ?)
+            """,
+            (other_repo, "https://example.test/pr/19"),
+        )
+        with connection:
+            loop_manager.update_project(
+                connection,
+                repo,
+                phase="PR_OPEN",
+                plan_path="docs/plans/[G-018] Reliable notices.md",
+                pr_url="https://example.test/pr/18",
+            )
+            notifications.enqueue_current_project_events(connection, other_repo)
+
+        failed = mock.Mock(side_effect=RuntimeError("network unavailable"))
+        self.assertEqual(
+            notifications.dispatch_new_pr_notifications(
+                connection, "token", "chat", repo, adapter=failed
+            ),
+            0,
+        )
+        failed.assert_called_once()
+        # A later project step does not immediately retry the failed event.
+        self.assertEqual(
+            notifications.dispatch_new_pr_notifications(
+                connection, "token", "chat", repo, adapter=mock.Mock()
+            ),
+            0,
+        )
+        pending = connection.execute(
+            "SELECT attempts, sent_at FROM notification_outbox WHERE repo = ?",
+            (repo,),
+        ).fetchone()
+        self.assertEqual(tuple(pending), (1, None))
+        other = connection.execute(
+            "SELECT attempts FROM notification_outbox WHERE repo = ?",
+            (other_repo,),
+        ).fetchone()
+        self.assertEqual(other[0], 0)
+
+        delivered = mock.Mock()
+        self.assertEqual(
+            notifications.dispatch_pending(
+                connection, "token", "chat", adapter=delivered
+            ),
+            2,
+        )
+        self.assertEqual(delivered.call_count, 2)
+        self.assertEqual(
+            notifications.dispatch_pending(
+                connection, "token", "chat", adapter=delivered
+            ),
+            0,
+        )
+
+    def test_pr_delivery_precedes_next_project_step(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        delivered = mock.Mock()
+        steps = []
+
+        def run_step(*_args, **_kwargs):
+            steps.append(len(steps) + 1)
+            if len(steps) == 1:
+                loop_manager.update_project(
+                    connection,
+                    repo,
+                    phase="PR_OPEN",
+                    plan_path="docs/plans/[G-018] Reliable notices.md",
+                    pr_url="https://example.test/pr/18",
+                )
+                self.assertIsNone(self.events(connection)[0]["sent_at"])
+                return loop_manager.PROJECT_STEP_RETRY
+            self.assertIsNotNone(self.events(connection)[0]["sent_at"])
+            delivered.assert_called_once()
+            return 0
+
+        def deliver():
+            notifications.dispatch_new_pr_notifications(
+                connection, "token", "chat", repo, adapter=delivered
+            )
+
+        with mock.patch(
+            "loop_manager._checkpoint_dispatch_ready", return_value=False
+        ), mock.patch("loop_manager._run_project_step", side_effect=run_step):
+            result = loop_manager.run_project_result(
+                connection,
+                Path("/state"),
+                repo,
+                Path("unused.ini"),
+                None,
+                False,
+                on_step_completed=deliver,
+            )
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
+        self.assertEqual(steps, [1, 2])
+        self.assertEqual(self.events(connection)[0]["attempts"], 1)
+        self.assertEqual(
+            notifications.dispatch_pending(
+                connection, "token", "chat", adapter=delivered
+            ),
+            0,
+        )
+        delivered.assert_called_once()
+
+    def test_registered_project_wires_immediate_delivery_after_commit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            connection = self.connection(database=state_dir / "loop-manager.db")
+            repo = "/projects/alpha"
+            project = project_registry.RegisteredProject(
+                repo, "main", "codex", None, False
+            )
+            delivered = mock.Mock()
+            original_dispatch = notifications.dispatch_new_pr_notifications
+
+            def send_now(worker_connection, token, chat_id, selected_repo):
+                return original_dispatch(
+                    worker_connection,
+                    token,
+                    chat_id,
+                    selected_repo,
+                    adapter=delivered,
+                )
+
+            def run_one(worker_connection, *_args, on_step_completed, **_kwargs):
+                with worker_connection:
+                    worker_connection.execute(
+                        "UPDATE exec_plans SET status = 'PR_OPEN', pr_url = ? "
+                        "WHERE repo = ? AND plan_id = 'G-018'",
+                        ("https://example.test/pr/18", repo),
+                    )
+                    notifications.enqueue_current_project_events(
+                        worker_connection, repo
+                    )
+                self.assertIsNone(
+                    worker_connection.execute(
+                        "SELECT sent_at FROM notification_outbox"
+                    ).fetchone()[0]
+                )
+                on_step_completed()
+                self.assertIsNotNone(
+                    worker_connection.execute(
+                        "SELECT sent_at FROM notification_outbox"
+                    ).fetchone()[0]
+                )
+                return loop_manager.ProjectRunResult(
+                    loop_manager.ProjectRunKind.WAITING, 0
+                )
+
+            with mock.patch(
+                "loop_manager.run_project_result", side_effect=run_one
+            ), mock.patch(
+                "loop_manager.notifications.dispatch_new_pr_notifications",
+                side_effect=send_now,
+            ):
+                result = loop_manager._run_registered_project(
+                    project,
+                    state_dir,
+                    Path("unused.ini"),
+                    "token",
+                    "chat",
+                    mock.Mock(),
+                    5,
+                )
+            self.assertEqual(result.result.kind, loop_manager.ProjectRunKind.WAITING)
+            delivered.assert_called_once()
+            self.assertEqual(
+                notifications.dispatch_pending(
+                    connection, "token", "chat", adapter=delivered
+                ),
+                0,
+            )
+            connection.close()
 
     def test_ambiguous_interruption_stays_pending_and_retries_after_restart(self):
         with tempfile.TemporaryDirectory() as directory:

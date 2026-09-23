@@ -448,6 +448,45 @@ def dispatch_pending(
         "WHERE sent_at IS NULL "
         "ORDER BY created_at, event_key"
     ).fetchall()
+    return _deliver_rows(connection, token, chat_id, rows, adapter)
+
+
+def dispatch_new_pr_notifications(
+    connection: sqlite3.Connection,
+    token: str,
+    chat_id: str,
+    repo: str,
+    *,
+    adapter: Callable[[str, str, str], None] = send_telegram,
+) -> int:
+    """Deliver newly committed PR events before this project's next step."""
+
+    if not token or not chat_id:
+        return 0
+    if connection.in_transaction:
+        # Never publish an event before its owning state change commits.
+        return 0
+    rows = connection.execute(
+        "SELECT event_key, event_type, payload FROM notification_outbox "
+        "WHERE repo = ? AND event_type = 'pr_created' "
+        "AND sent_at IS NULL AND attempts = 0 "
+        "ORDER BY created_at, event_key",
+        (repo,),
+    ).fetchall()
+    return _deliver_rows(
+        connection, token, chat_id, rows, adapter, first_attempt_only=True
+    )
+
+
+def _deliver_rows(
+    connection: sqlite3.Connection,
+    token: str,
+    chat_id: str,
+    rows: list[sqlite3.Row],
+    adapter: Callable[[str, str, str], None],
+    *,
+    first_attempt_only: bool = False,
+) -> int:
     sent = 0
     for row in rows:
         with connection:
@@ -455,7 +494,8 @@ def dispatch_pending(
                 "UPDATE notification_outbox "
                 "SET attempts = attempts + 1, last_error = NULL, "
                 "delivery_started_at = CURRENT_TIMESTAMP "
-                "WHERE event_key = ? AND sent_at IS NULL",
+                "WHERE event_key = ? AND sent_at IS NULL"
+                + (" AND attempts = 0" if first_attempt_only else ""),
                 (row[0],),
             ).rowcount
         if claimed != 1:
