@@ -8,6 +8,7 @@ import hashlib
 import json
 import re
 import sys
+from agent_invocation import AttemptSequence, TrackedAgentCall
 from scoped_blocking import BlockReasonCode
 from recovery_runtime import (
     RecoveryAction, RecoveryObservation, RecoveryReason, RecoveryFailure,
@@ -1960,7 +1961,7 @@ class ExecutionHandlers:
         guidance_context = self.effects.agent.guidance_resume_context(self.repo, str(catalog_plan['plan_id']))
         allow_common_plans = self.effects.agent._published_plan_allows_common_plans(self.repo_path, catalog_plan)
         result = self.effects.agent.run_agent_with_retries(
-            lambda current_session_id, session_recovery: self.effects.agent.run_agent(
+            TrackedAgentCall(lambda current_session_id, session_recovery, invocation: self.effects.agent.run_agent(
                 self.provider,
                 context.worktree,
                 self.state_dir,
@@ -1982,7 +1983,9 @@ class ExecutionHandlers:
                 persist_session=True,
                 session_id=current_session_id,
                 on_session_started=lambda started_session_id: self.effects.state.update_project(self.repo, worker_session_id=started_session_id),
-            ),
+                invocation=invocation,
+            ), AttemptSequence(self.repo, str(plan['id']),
+                               str(catalog_plan['current_revision_sha']) if catalog_plan['current_revision_sha'] is not None else None)),
             session_id=row['worker_session_id'],
         )
         code, message = result
@@ -2733,7 +2736,7 @@ class ExecutionHandlers:
                 input_fingerprint=self.effects.agent._worktree_execplan_input_fingerprint(context.worktree, self.catalog_plan),
             )
             review_result = self.effects.agent.run_agent_with_retries(
-                lambda current_session_id, session_recovery: self.effects.agent.run_agent(
+                TrackedAgentCall(lambda current_session_id, session_recovery, invocation: self.effects.agent.run_agent(
                     self.provider,
                     context.worktree,
                     self.state_dir,
@@ -2751,7 +2754,9 @@ class ExecutionHandlers:
                     persist_session=True,
                     session_id=current_session_id,
                     on_session_started=lambda started_session_id: self.effects.state.update_project(self.repo, reviewer_session_id=started_session_id),
-                ),
+                    invocation=invocation,
+                ), AttemptSequence(self.repo, str(self.plan['id']),
+                                   str(self.catalog_plan['current_revision_sha']) if self.catalog_plan['current_revision_sha'] is not None else None)),
                 session_id=row['reviewer_session_id'],
             )
             code, review = review_result

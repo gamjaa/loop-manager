@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from typing import Protocol
 from urllib.parse import quote
 
@@ -78,6 +79,11 @@ import recovery_runtime
 import execution_handlers
 import execution_revision
 import execution_checkpoint_state
+from agent_invocation import (AgentProfile, AgentRequest, AgentResult, AgentResultKind,
+                              AttemptSequence, InvocationContext, ResolvedProfile,
+                              TrackedAgentCall, Usage, classify_agent_result)
+from agent_provider_usage import claude_usage, codex_log_usage
+import agent_invocation_state
 from execution_state import ExecutionStatePort as _ExecutionStatePort
 from types import SimpleNamespace
 from maintenance_planning import (
@@ -319,13 +325,6 @@ WHERE status IN ('IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING')
 """
 
 
-class AgentResultKind(str, Enum):
-    SUCCESS = "success"
-    TRANSIENT_FAILURE = "transient_failure"
-    USAGE_LIMIT = "usage_limit"
-    PERMANENT_CONFIGURATION = "permanent_configuration"
-
-
 class ProjectRunKind(str, Enum):
     COMPLETED = "completed"
     WAITING = "waiting"
@@ -364,28 +363,6 @@ class CatalogScheduleDecision:
 
 
 @dataclass(frozen=True)
-class AgentResult:
-    code: int
-    message: str
-    session_id: str | None = None
-    kind: AgentResultKind | None = None
-
-    def __iter__(self):
-        # Keep two-value unpacking compatible with callers that do not manage sessions.
-        return iter((self.code, self.message))
-
-    @property
-    def result_kind(self) -> AgentResultKind:
-        return self.kind or classify_agent_result(self.code, self.message)
-
-
-@dataclass(frozen=True)
-class AgentProfile:
-    model: str
-    effort: str
-
-
-@dataclass(frozen=True)
 class ProjectRegistrationInspection:
     root: Path
     base_branch: str
@@ -414,20 +391,6 @@ class RuntimeWorktree:
 
 class GitLockError(RuntimeError):
     """A concurrent Git process owns a repository lock."""
-
-
-@dataclass(frozen=True)
-class AgentRequest:
-    worktree: Path
-    state_dir: Path
-    config_path: Path
-    role_name: str
-    prompt: str
-    read_only: bool
-    level: int | None = None
-    persist_session: bool = False
-    session_id: str | None = None
-    on_session_started: Callable[[str], None] | None = None
 
 
 # Public compatibility name for integrations written before provider-neutral
@@ -651,54 +614,6 @@ class ProcessLockBusyError(RuntimeError):
     """The single Loop Manager process lock is already held."""
 
 
-def classify_agent_result(code: int, message: str) -> AgentResultKind:
-    """Classify an Agent CLI result without another Agent call."""
-
-    if code == 0:
-        return AgentResultKind.SUCCESS
-    normalized = " ".join(message.casefold().split())
-    if any(
-        phrase in normalized
-        for phrase in (
-            "usage limit",
-            "usage cap",
-            "quota exceeded",
-            "insufficient_quota",
-            "credit balance",
-            "usage limit reached",
-            "hit your limit",
-            "out of extra usage",
-        )
-    ):
-        return AgentResultKind.USAGE_LIMIT
-    if any(
-        phrase in normalized
-        for phrase in (
-            "timed out",
-            "timeout",
-            "overloaded",
-            "rate limit exceeded",
-            "temporarily unavailable",
-            "service unavailable",
-            "connection reset",
-            "connection refused",
-            "network error",
-            "dns error",
-            "gateway timeout",
-            "internal server error",
-            "try again later",
-            "http 429",
-            "http 500",
-            "http 502",
-            "http 503",
-            "http 504",
-            "too many requests",
-        )
-    ):
-        return AgentResultKind.TRANSIENT_FAILURE
-    return AgentResultKind.PERMANENT_CONFIGURATION
-
-
 def session_resume_unavailable(message: str) -> bool:
     normalized = " ".join(message.casefold().split())
     return bool(
@@ -761,6 +676,8 @@ def run_agent_with_retries(
             active_session_id = result.session_id
         if result.result_kind is AgentResultKind.SUCCESS:
             return result
+        if isinstance(invoke, TrackedAgentCall):
+            invoke.attempts.previous_failure = result.ledger_kind
         if (
             result.result_kind is not AgentResultKind.USAGE_LIMIT
             and active_session_id is not None
@@ -1158,6 +1075,7 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
         else:
             connection.execute("RELEASE publication_backfill")
     connection.execute(GUIDANCE_APPROVALS_SCHEMA)
+    agent_invocation_state.ensure_schema(connection)
     scoped_blocking.ensure_schema(connection)
     if not getattr(connection, "execplans_schema_ready", False):
         recovery_state.ensure_schema(connection)
@@ -5180,8 +5098,11 @@ def run_codex(
     persist_session: bool = False,
     session_id: str | None = None,
     on_session_started: Callable[[str], None] | None = None,
+    resolved_profile: ResolvedProfile | None = None,
 ) -> tuple[int, str] | CodexResult:
-    if role_name == "worker":
+    if resolved_profile is not None:
+        model, effort = resolved_profile.model, resolved_profile.effort
+    elif role_name == "worker":
         if level is None:
             raise RuntimeError("Codex Worker level이 없습니다.")
         model, effort = worker_profile(config_path, level, worktree)
@@ -5269,7 +5190,9 @@ def run_codex(
                         continue
                     try:
                         event = json.loads(line)
-                    except json.JSONDecodeError:
+                    except (ValueError, RecursionError):
+                        continue
+                    if not isinstance(event, dict):
                         continue
                     if event.get("type") == "thread.started" and isinstance(
                         event.get("thread_id"), str
@@ -5308,11 +5231,17 @@ def run_codex(
         message = f"Codex {role_name} 실행 timeout ({AGENT_CLI_TIMEOUT_SECONDS}초)"
     if returncode and not message:
         message = log.read_text(encoding="utf-8")[-6000:]
+    try:
+        usage = codex_log_usage(log.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError):
+        # Usage is observational; a failed log read cannot retry a completed CLI call.
+        usage = Usage(status="invalid")
     if persist_session and not resolved_session_id:
         if returncode == 0:
             return CodexResult(
                 1,
                 f"Codex {role_name} 실행 결과에서 세션 ID를 확인할 수 없습니다.",
+                usage=usage,
             )
     if persist_session or session_id:
         return CodexResult(
@@ -5324,6 +5253,7 @@ def run_codex(
                 if timeout_triggered.is_set()
                 else None
             ),
+            usage,
         )
     return returncode, message.strip()
 
@@ -5465,8 +5395,9 @@ def run_claude(
     persist_session: bool = False,
     session_id: str | None = None,
     on_session_started: Callable[[str], None] | None = None,
+    resolved_profile: ResolvedProfile | None = None,
 ) -> tuple[int, str] | AgentResult:
-    profile = _agent_profile(
+    profile = resolved_profile or _agent_profile(
         config_path, "claude", role_name, level, worktree
     )
     model, effort = profile.model, profile.effort
@@ -5498,6 +5429,7 @@ def run_claude(
     message = ""
     returncode = 0
     timeout_triggered = threading.Event()
+    usage = Usage()
 
     if streaming:
         final_event: Mapping[str, object] = {}
@@ -5540,10 +5472,14 @@ def run_claude(
                     output.flush()
                     try:
                         event = json.loads(line)
-                    except json.JSONDecodeError:
+                    except (ValueError, RecursionError):
                         diagnostic_tail = (diagnostic_tail + line)[-6000:]
+                        if usage.status == "unknown":
+                            usage = Usage(status="invalid")
                         continue
                     if not isinstance(event, dict):
+                        if usage.status == "unknown":
+                            usage = Usage(status="invalid")
                         continue
                     if event.get("is_error") or event.get("type") == "error":
                         stream_error_seen = True
@@ -5565,6 +5501,9 @@ def run_claude(
                             on_session_started(resolved_session_id)
                     if event.get("type") == "result":
                         final_event = event
+                        parsed_usage = claude_usage(event)
+                        if parsed_usage.status != "unknown" or usage.status != "invalid":
+                            usage = parsed_usage
                 returncode = process.wait()
             except BaseException:
                 try:
@@ -5599,10 +5538,14 @@ def run_claude(
         log.write_text(raw_output, encoding="utf-8")
         try:
             event = json.loads(raw_output)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
             event = {}
+            usage = Usage(status="invalid")
         if isinstance(event, dict):
             message = _claude_result_message(event)
+            parsed_usage = claude_usage(event)
+            if parsed_usage.status != "unknown" or usage.status != "invalid":
+                usage = parsed_usage
             event_session = event.get("session_id")
             if isinstance(event_session, str) and event_session:
                 resolved_session_id = event_session
@@ -5619,6 +5562,7 @@ def run_claude(
         return AgentResult(
             1,
             f"Claude {role_name} 실행 결과에서 세션 ID를 확인할 수 없습니다.",
+            usage=usage,
         )
     if persist_session or session_id:
         return AgentResult(
@@ -5630,6 +5574,7 @@ def run_claude(
                 if timeout_triggered.is_set()
                 else None
             ),
+            usage,
         )
     return returncode, message.strip()
 
@@ -5649,6 +5594,7 @@ class CodexAgentAdapter:
             persist_session=request.persist_session,
             session_id=request.session_id,
             on_session_started=request.on_session_started,
+            resolved_profile=request.profile,
         )
 
 
@@ -5667,6 +5613,7 @@ class ClaudeAgentAdapter:
             persist_session=request.persist_session,
             session_id=request.session_id,
             on_session_started=request.on_session_started,
+            resolved_profile=request.profile,
         )
 
 
@@ -5696,8 +5643,38 @@ def run_agent(
     persist_session: bool = False,
     session_id: str | None = None,
     on_session_started: Callable[[str], None] | None = None,
+    connection: sqlite3.Connection | None = None,
+    invocation: InvocationContext | None = None,
 ) -> tuple[int, str] | AgentResult:
     """Execute one provider-neutral Agent request."""
+
+    resolved: ResolvedProfile | None = None
+    collection_status = "unknown"
+    if invocation is not None:
+        try:
+            resolved = _agent_profile(config_path, provider, role_name, level, worktree)
+        except (RuntimeError, OSError):
+            # Profile observation must not alter the provider's own result.
+            # A real adapter still resolves and validates before launching CLI.
+            collection_status = "error"
+    ledger = agent_invocation_state.InvocationRepository(connection) if connection is not None else None
+    identity: str | None = None
+    if ledger is not None and invocation is not None and resolved is not None:
+        try:
+            identity = ledger.start(invocation, role_name, provider, resolved, session_id)
+            collection_status = "pending"
+        except sqlite3.Error:
+            collection_status = "error"
+
+    def observe_session(started_session_id: str) -> None:
+        nonlocal collection_status
+        if ledger is not None and identity is not None:
+            try:
+                ledger.observe_session(identity, started_session_id)
+            except sqlite3.Error:
+                collection_status = "error"
+        if on_session_started is not None:
+            on_session_started(started_session_id)
 
     request = AgentRequest(
         worktree=worktree,
@@ -5709,9 +5686,45 @@ def run_agent(
         level=level,
         persist_session=persist_session,
         session_id=session_id,
-        on_session_started=on_session_started,
+        on_session_started=observe_session,
+        profile=resolved,
     )
-    return agent_provider(provider).run(request)
+    started = time.monotonic()
+    try:
+        raw = agent_provider(provider).run(request)
+    except BaseException as error:
+        if ledger is not None and identity is not None:
+            kind = ("interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else
+                    "timeout" if isinstance(error, subprocess.TimeoutExpired) else
+                    "transient_failure" if isinstance(error, OSError) else "exception")
+            try:
+                ledger.finish(identity, kind, None,
+                              max(0, int((time.monotonic() - started) * 1000)),
+                              None, Usage())
+            except sqlite3.Error:
+                pass
+        raise
+    result = _coerce_agent_result(raw, session_id)
+    if ledger is not None and identity is not None:
+        try:
+            ledger.finish(identity, result.ledger_kind, result.code,
+                          max(0, int((time.monotonic() - started) * 1000)),
+                          result.session_id, result.usage,
+                          "error" if collection_status == "error" else None)
+            if collection_status != "error":
+                collection_status = result.usage.status
+        except sqlite3.Error:
+            collection_status = "error"
+    if isinstance(raw, AgentResult):
+        return replace(raw, collection_status=collection_status)
+    return raw
+
+
+def _run_agent_with_connection(
+    connection: sqlite3.Connection, *args: object, **kwargs: object
+) -> tuple[int, str] | AgentResult:
+    """Keep execution coordinator unaware of the ledger connection."""
+    return run_agent(*args, connection=connection, **kwargs)
 
 
 class VerifyOutput(str):
@@ -14623,7 +14636,7 @@ class _PlanningAgentPorts:
         guard = self._planner_mutex or contextlib.nullcontext()
         with guard:
             result = run_agent_with_retries(
-                lambda current_session_id, _session_recovery: run_agent(
+                TrackedAgentCall(lambda current_session_id, _session_recovery, invocation: run_agent(
                     context.provider,
                     worktree,
                     context.state_dir,
@@ -14634,7 +14647,9 @@ class _PlanningAgentPorts:
                     persist_session=True,
                     session_id=current_session_id,
                     on_session_started=on_session_started,
-                ),
+                    connection=self._connection,
+                    invocation=invocation,
+                ), AttemptSequence(context.repo, None)),
                 session_id=session_id,
             )
         kind = {
@@ -15895,6 +15910,7 @@ def execute_runtime_command(
     if args.command == "config":
         return configure_registry(args, state_dir, config_path)
     with connect_database(state_dir) as connection:
+        agent_invocation_state.InvocationRepository(connection).reconcile_interrupted()
         return run_registered_projects(connection, state_dir, config)
 
 
@@ -16751,7 +16767,7 @@ def _ExecutionLifecyclePorts(connection, runtime_repository, **identity):
             is_loop_manager_repository=state.bind(is_loop_manager_repository, name="is_loop_manager_repository", connected=False, mutates=False),
             inspect_worker_guidance_result=state.bind(inspect_worker_guidance_result, name="inspect_worker_guidance_result", connected=True, mutates=True),
             validate_guidance_publication=state.bind(validate_guidance_publication, name="validate_guidance_publication", connected=True, mutates=True),
-            run_agent=state.bind(run_agent, name="run_agent", connected=False, mutates=False),
+            run_agent=state.bind(_run_agent_with_connection, name="run_agent", connected=True, mutates=False),
             run_agent_with_retries=state.bind(run_agent_with_retries, name="run_agent_with_retries", connected=False, mutates=False),
             worker_prompt=state.bind(worker_prompt, name="worker_prompt", connected=False, mutates=False),
             reviewer_prompt=state.bind(reviewer_prompt, name="reviewer_prompt", connected=False, mutates=False),

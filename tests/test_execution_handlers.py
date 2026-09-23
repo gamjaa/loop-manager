@@ -1192,6 +1192,27 @@ class ExecutionHandlerTests(TestCase):
         order = [c for c in self.calls if c in {'worker', 'verify', 'commit', 'reviewer', 'push', 'pr'}]
         self.assertEqual(order, ['worker', 'verify', 'commit', 'reviewer', 'push', 'pr'])
 
+    def test_worker_and_reviewer_keep_phase_outcome_after_telemetry_error(self):
+        def reported_agent(*args, **kwargs):
+            self.calls.append(args[4])
+            kwargs['on_session_started']('session')
+            return lm.AgentResult(0, 'result', session_id='session',
+                                  collection_status='error')
+
+        self.effects.agent.run_agent.side_effect = reported_agent
+        worker = self.handler.run(self.context())
+        verified = self.handler.verify(worker.context, self.handler)
+        reviewed = self.handler.review(verified.context)
+
+        self.assertEqual(reviewed.context.phase, ExecutionPhase.PUBLISHING)
+        calls = self.effects.agent.run_agent.call_args_list
+        self.assertEqual([call.args[4] for call in calls], ['worker', 'reviewer'])
+        for call in calls:
+            request = call.kwargs['invocation']
+            self.assertEqual((request.repo, request.plan_id, request.attempt),
+                             ('repo', 'G-047', 1))
+            self.assertNotIn('connection', call.kwargs)
+
     def test_revision_guard_tokens_follow_complete_phase_lifecycle(self):
         context = self.handler.guard(self.context())
         self.assertNotIsInstance(context, handlers.ExecutionOutcome)
