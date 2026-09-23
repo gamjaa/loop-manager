@@ -25,6 +25,8 @@ class CatalogCheckpointWiringTest(unittest.TestCase):
             "blocked_checkpoint.py", "blocked_checkpoint_state.py",
             "execplan_catalog.py", "execplan_catalog_state.py",
             "planning_runtime.py", "runtime_state.py",
+            "recovery_dispatcher.py", "recovery_runtime.py",
+            "recovery_state.py",
         }
         for name in ("verify.sh", "verify.ps1"):
             with self.subTest(script=name):

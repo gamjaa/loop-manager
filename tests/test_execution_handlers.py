@@ -97,6 +97,18 @@ class ExecutionHandlerTests(TestCase):
             self.state.update_project('repo', phase=phase)
         return self.handler._context()
 
+    def test_final_block_uses_current_verify_output_before_project_checkpoint(self):
+        result = self.handler._block_final(
+            'repo', Path('/state/G-047'), 'no publishable change',
+            'verify: PASS', reason=lm.BlockReasonCode.PLAN_INPUT_INVALID,
+            recovery_reason=handlers.RecoveryReason.NO_CHANGE,
+        )
+        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertEqual(
+            self.effects.blocking.block_active_execplan.call_args.args[3],
+            'verify: PASS',
+        )
+
     def test_real_handlers_complete_each_phase_and_reject_replay(self):
         context = self.context()
         for method in ('run', 'verify', 'review', 'publish'):
@@ -453,7 +465,7 @@ class ExecutionHandlerTests(TestCase):
             ), mock.patch('loop_manager.validate_execplan', return_value={
                 **workspace_plan, field: value,
             }):
-                with self.assertRaisesRegex(RuntimeError, 'metadata'):
+                with self.assertRaisesRegex(lm.ExecPlanMetadataError, 'metadata'):
                     lm.validate_worker_workspace_scope(
                         Path('/repo'), Path('/state/G-047'), 'loop-manager/G-047',
                         'main', catalog['path'], catalog, mock.Mock(),
@@ -464,7 +476,7 @@ class ExecutionHandlerTests(TestCase):
         ), mock.patch('loop_manager.validate_managed_worktree'), mock.patch(
             'loop_manager.validate_execplan', return_value=workspace_plan
         ) as parsed:
-            with self.assertRaisesRegex(RuntimeError, 'metadata'):
+            with self.assertRaisesRegex(lm.ExecPlanMetadataError, 'metadata'):
                 lm.validate_worker_workspace_scope(
                     Path('/repo'), Path('/state/G-047'), 'loop-manager/G-047',
                     'main', catalog['path'], catalog, mock.Mock(),
@@ -728,14 +740,122 @@ class ExecutionHandlerTests(TestCase):
                 else:
                     self.effects.agent.inspect_worker_guidance_result.return_value = True
                 result = self.handler.run(self.context())
-                self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+                self.assertEqual(
+                    result.kind,
+                    ExecutionOutcomeKind.RETRY if scenario == 'format'
+                    else ExecutionOutcomeKind.FINAL_BLOCK,
+                )
                 self.assertNotIn('verify', self.calls)
+
+    def test_worker_metadata_mismatch_corrects_then_final_blocks(self):
+        self.effects.agent.validate_worker_workspace_scope.side_effect = (
+            lm.ExecPlanMetadataError('catalog metadata mismatch')
+        )
+
+        outcomes = [self.handler.run(self.handler._context()) for _ in range(3)]
+
+        self.assertEqual([outcome.kind for outcome in outcomes], [
+            ExecutionOutcomeKind.RETRY, ExecutionOutcomeKind.RETRY,
+            ExecutionOutcomeKind.FINAL_BLOCK,
+        ])
+        self.assertEqual([outcome.recovery.occurrence for outcome in outcomes], [1, 2, 3])
+        self.assertEqual(outcomes[-1].recovery.block_reason, lm.BlockReasonCode.PLAN_INPUT_INVALID)
+        self.assertEqual(self.state.row()['worker_session_id'], 'session')
+        self.assertNotIn('verify', self.calls)
+        self.effects.blocking.block_active_execplan.assert_called_once()
+
+    def test_rebase_metadata_correction_preserves_resume_context(self):
+        self.state.update_project(
+            'repo', last_error=lm.REBASE_IN_PROGRESS_ERROR,
+            worker_session_id='worker-session', worker_result='saved result',
+        )
+        self.effects.workspace.is_directory.return_value = True
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        self.effects.agent.run_agent.side_effect = lambda *_args, **_kwargs: lm.AgentResult(
+            0, 'result', session_id='worker-session',
+        )
+        self.effects.agent.validate_worker_workspace_scope.side_effect = (
+            lm.ExecPlanMetadataError('catalog metadata mismatch')
+        )
+
+        for occurrence in (1, 2):
+            context = self.handler._context()
+            self.assertTrue(context.resolving_rebase)
+            outcome = self.handler.run(context)
+            self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+            self.assertEqual(outcome.recovery.occurrence, occurrence)
+            self.assertEqual(outcome.recovery.observation.reason.value, 'worker_correction')
+            self.assertTrue(self.state.row()['last_error'].startswith(lm.REBASE_CONFLICT_PREFIX))
+            self.assertIn('catalog metadata mismatch', self.state.row()['last_error'])
+            self.assertEqual(self.state.row()['worker_session_id'], 'worker-session')
+            self.assertEqual(self.state.row()['worker_result'], 'saved result')
+            self.assertTrue(
+                self.effects.agent.validate_worker_workspace_scope.call_args.kwargs['allow_rebase']
+            )
+            self.assertEqual(
+                self.effects.agent.run_agent.call_args.kwargs['session_id'], 'worker-session',
+            )
+
+        self.assertTrue(self.handler._context().resolving_rebase)
+        self.assertIn(
+            'catalog metadata mismatch', self.effects.agent.worker_prompt.call_args.args[1],
+        )
+        self.effects.blocking.block_active_execplan.assert_not_called()
+        self.assertNotIn('verify', self.calls)
+
+    def test_verify_metadata_mismatch_returns_to_worker_with_output(self):
+        self.effects.agent.validate_worker_workspace_scope.side_effect = (
+            lm.ExecPlanMetadataError('catalog metadata mismatch')
+        )
+        self.state.update_project('repo', phase='VERIFYING', worker_result='saved worker result')
+
+        outcome, output = self.handler._verify_once(self.handler._context())
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(outcome.recovery.observation.reason.value, 'worker_correction')
+        self.assertEqual(self.state.row()['phase'], 'WORKING')
+        self.assertEqual(self.state.row()['worker_result'], 'saved worker result')
+        self.assertEqual(self.state.row()['verify_result'], output)
+        self.effects.blocking.block_active_execplan.assert_not_called()
+
+    def test_repeated_worker_result_format_uses_same_session_before_final_gate(self):
+        self.effects.validation.parse_worker_result.side_effect = lm.WorkerResultError('bad format')
+        outcomes = [self.handler.run(self.context()) for _ in range(3)]
+
+        self.assertEqual([item.kind for item in outcomes], [
+            ExecutionOutcomeKind.RETRY, ExecutionOutcomeKind.RETRY,
+            ExecutionOutcomeKind.FINAL_BLOCK,
+        ])
+        self.assertEqual([item.recovery.occurrence for item in outcomes], [1, 2, 3])
+        self.assertEqual(self.state.row()['worker_session_id'], 'session')
+        self.effects.blocking.block_active_execplan.assert_called_once()
+
+    def test_rebase_worker_retry_prompt_uses_latest_failure(self):
+        prior_error = lm.REBASE_CONFLICT_PREFIX + 'Worker 결과 검증 실패:\ninvalid result'
+        self.state.update_project('repo', last_error=prior_error,
+                                  pr_conflict_recovery=1, worker_session_id='worker-session')
+        self.effects.workspace.is_directory.return_value = True
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        self.effects.agent.run_agent.side_effect = lambda *_args, **_kwargs: lm.AgentResult(
+            1, 'still conflicted', session_id='worker-session')
+
+        outcomes = [self.handler.run(self.handler._context()) for _ in range(2)]
+
+        self.assertEqual([outcome.kind for outcome in outcomes], [
+            ExecutionOutcomeKind.RETRY, ExecutionOutcomeKind.RETRY,
+        ])
+        prompts = [call.args[1] for call in self.effects.agent.worker_prompt.call_args_list]
+        self.assertEqual(prompts, [
+            prior_error, lm.REBASE_CONFLICT_PREFIX + 'still conflicted',
+        ])
+        self.assertEqual(self.state.row()['worker_session_id'], 'worker-session')
+        self.effects.blocking.block_active_execplan.assert_not_called()
 
     def test_validation_retry_and_final_block_remain_distinct(self):
         for stage in ('verify', 'review'):
             for blocked in (False, True):
                 with self.subTest(stage=stage, blocked=blocked):
-                    self.effects.validation.transition_validation_failure.return_value = SimpleNamespace(blocked=blocked)
+                    self.effects.validation.transition_validation_failure.return_value = SimpleNamespace(blocked=blocked, fingerprint='diagnostics')
                     self.effects.validation.verify.side_effect = lambda _: (False, 'diagnostics')
                     self.effects.validation.parse_reviewer_result.return_value = ('FAIL', ('issue',))
                     phase = 'VERIFYING' if stage == 'verify' else 'REVIEWING'
@@ -761,16 +881,147 @@ class ExecutionHandlerTests(TestCase):
                 context = self.context()
                 result = (self.handler.verify(context, self.handler) if phase == 'VERIFYING'
                           else self.handler.publish(context, self.handler))
-                self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+                self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+                self.assertEqual(result.recovery.disposition.value, 'agent_correction')
+                self.effects.blocking.block_active_execplan.assert_not_called()
                 self.assertEqual(self.state.row()['phase'], 'WORKING')
                 self.assertTrue(self.state.row()['last_error'].startswith(lm.REBASE_CONFLICT_PREFIX))
                 self.assertIsNone(self.state.row()['validated_base_sha'])
 
+    def test_workspace_runtime_failure_retries_without_blocking_or_losing_context(self):
+        self.effects.workspace._plan_id_from_path.return_value = 'G-047'
+        self.effects.workspace.make_worktree.side_effect = RuntimeError('temporary git failure')
+        self.state.update_project('repo', worker_session_id='worker-session',
+                                  worker_result='saved result')
+
+        result = self.handler.prepare()
+
+        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(result.recovery.observation.reason.value, 'worktree_recovery_failed')
+        row = self.state.row()
+        self.assertEqual(row['worker_session_id'], 'worker-session')
+        self.assertEqual(row['worker_result'], 'saved result')
+        self.assertEqual(row['worktree'], '/state/G-047')
+        self.effects.blocking.block_active_execplan_from_revision.assert_not_called()
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM blocked_checkpoints WHERE repo = 'repo'"
+        ).fetchone()[0], 0)
+
+    def test_exhausted_transient_agent_retries_pause_with_saved_session(self):
+        def transient_agent(*_args, **kwargs):
+            kwargs['on_session_started']('worker-session')
+            return lm.AgentResult(
+                1, 'service unavailable', session_id='worker-session',
+                kind=lm.AgentResultKind.TRANSIENT_FAILURE,
+            )
+
+        self.effects.agent.run_agent.side_effect = transient_agent
+        result = self.handler.run(self.context())
+
+        self.assertEqual(result.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
+        self.assertEqual(result.recovery.observation.reason.value, 'service_unavailable')
+        self.assertEqual(self.state.row()['worker_session_id'], 'worker-session')
+        self.effects.blocking.block_active_execplan.assert_not_called()
+
+    def test_transient_worker_pause_preserves_rebase_resume_marker(self):
+        self.state.update_project(
+            'repo', pr_conflict_recovery=1,
+            last_error=lm.REBASE_IN_PROGRESS_ERROR,
+        )
+        self.effects.workspace.is_directory.return_value = True
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        self.effects.agent.run_agent.side_effect = lambda *_args, **_kwargs: lm.AgentResult(
+            1, 'temporary provider failure', 'worker-session',
+            lm.AgentResultKind.TRANSIENT_FAILURE,
+        )
+
+        result = self.handler.run(self.handler._context())
+
+        self.assertEqual(result.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
+        self.assertTrue(
+            self.state.row()['last_error'].startswith(lm.REBASE_CONFLICT_PREFIX)
+        )
+        self.assertTrue(self.handler._context().resolving_rebase)
+
+    def test_pr_rebase_resume_operation_failure_retries_without_checkpoint(self):
+        self.effects.workspace._plan_id_from_path.return_value = 'G-047'
+        self.effects.workspace.resume_pr_conflict_rebase.return_value = lm.PROJECT_STEP_RETRY
+        self.state.update_project(
+            'repo', pr_conflict_recovery=1,
+            last_error=lm.REBASE_IN_PROGRESS_ERROR,
+            worker_session_id='worker-session',
+        )
+
+        result = self.handler.prepare()
+
+        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(result.recovery.observation.reason.value, 'rebase_continue_failed')
+        self.assertEqual(self.state.row()['worker_session_id'], 'worker-session')
+        self.effects.blocking.block_active_execplan.assert_not_called()
+
+    def test_publication_checkpoint_sha_lag_reconciles_from_owned_head(self):
+        self.state.update_project(
+            'repo', phase='PUBLISHING', active_sha='stale',
+            validated_base_sha='base', worker_session_id='worker-session',
+            verify_result='saved verify', review_result='saved review',
+        )
+
+        result = self.handler.publish(self.context(), self.handler)
+
+        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(result.recovery.observation.reason.value, 'checkpoint_stale')
+        self.assertEqual(self.state.row()['phase'], 'VERIFYING')
+        self.assertEqual(self.state.row()['active_sha'], 'base')
+        self.assertEqual(self.state.row()['worker_session_id'], 'worker-session')
+        self.assertIsNone(self.state.row()['verify_result'])
+        self.effects.blocking.block_active_execplan.assert_not_called()
+
+    def test_repeated_archive_mismatch_reaches_final_gate_only_at_limit(self):
+        self.handler.archive_sources = ('docs/requirements/source.md',)
+        self.state.update_project('repo', phase='PUBLISHING', validated_base_sha='base')
+        self.effects.archive.requirement_archive_candidates.return_value = ('source.md',)
+        self.effects.archive.requirement_archive_move_set.return_value = ()
+        self.effects.archive.requirement_archive_reconciliation_error.return_value = 'archive changed'
+
+        first = self.handler.publish(self.context(), self.handler)
+        self.assertEqual(first.recovery.occurrence, 1)
+        self.assertEqual(first.kind, ExecutionOutcomeKind.RETRY)
+        self.effects.blocking.block_active_execplan.assert_not_called()
+        second = self.handler._recover(first.recovery.observation.reason, 'archive changed',
+                                       fingerprint=first.recovery.observation.fingerprint)
+        self.assertEqual(second.recovery.occurrence, 2)
+        self.effects.blocking.block_active_execplan.assert_not_called()
+        third = self.handler._recover(first.recovery.observation.reason, 'archive changed',
+                                      fingerprint=first.recovery.observation.fingerprint)
+        self.assertEqual(third.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.effects.blocking.block_active_execplan.assert_called_once()
+
+    def test_archive_move_validation_error_returns_to_worker_without_block(self):
+        self.handler.archive_sources = ('docs/requirements/source.md',)
+        self.state.update_project(
+            'repo', phase='PUBLISHING', validated_base_sha='base',
+            worker_session_id='worker-session', verify_result='saved verify',
+            review_result='saved review',
+        )
+        self.effects.archive.requirement_archive_candidates.return_value = ('source.md',)
+        self.effects.archive.requirement_archive_move_set.side_effect = lm.RequirementArchiveError('move invalid')
+
+        result = self.handler.publish(self.context(), self.handler)
+
+        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(result.recovery.observation.reason.value, 'archive_move_mismatch')
+        self.assertEqual(self.state.row()['worker_session_id'], 'worker-session')
+        self.assertEqual(self.state.row()['phase'], 'WORKING')
+        self.assertEqual(self.state.row()['verify_result'], 'saved verify')
+        self.assertEqual(self.state.row()['review_result'], 'saved review')
+        self.effects.blocking.block_active_execplan.assert_not_called()
+
     def test_publication_interruption_recovers_existing_pr_without_repush(self):
         self.state.update_project('repo', validated_base_sha='base')
         self.effects.publication.command.side_effect = RuntimeError('interrupted response')
-        with self.assertRaisesRegex(RuntimeError, 'interrupted response'):
-            self.handler.publish(self.context('PUBLISHING'), self.handler)
+        paused = self.handler.publish(self.context('PUBLISHING'), self.handler)
+        self.assertEqual(paused.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(paused.recovery.observation.reason.value, 'publication_retry')
         self.effects.publication.pr_for_branch.return_value = {'url': 'created'}
         self.effects.publication.reconcile_existing_pull_request.return_value = 0
         self.handler.publish(self.context(), self.handler)

@@ -125,6 +125,20 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
     if project is None:
         return
     name = Path(repo).name or repo
+    recovery_available = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'recovery_records'"
+    ).fetchone() is not None
+
+    def final_recovery(subject: str) -> tuple[str | None, dict | None]:
+        if not recovery_available:
+            return None, None
+        row = connection.execute(
+            "SELECT identity, final_evidence FROM recovery_records "
+            "WHERE repo = ? AND subject = ?", (repo, subject),
+        ).fetchone()
+        if row is None or row[1] is None:
+            return None, None
+        return str(row[0]), json.loads(str(row[1]))
 
     for plan in connection.execute(
         "SELECT plan_id, title, pr_url FROM exec_plans "
@@ -162,7 +176,12 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
         stage = "ExecPlan"
         plan_id = str(plan[0])
         plan_title = str(plan[1])
-        paths = [str(plan[2]), *(str(item) for item in sources)]
+        recovery_identity, recovery_evidence = final_recovery(plan_id)
+        paths = (
+            list(recovery_evidence["user_targets"])
+            if recovery_evidence is not None
+            else [str(plan[2]), *(str(item) for item in sources)]
+        )
         checkpoint = None
         if plan[6] == "published":
             checkpoint = {
@@ -196,10 +215,12 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
                 location
                 for item in guidance_locations
                 for location in (item["proposal"], item["user_decision"])
+                if location not in paths
             )
         _insert(
             connection,
-            _key("blocked", repo, f"plan\0{plan[4]}\0{plan_id}"),
+            _key("blocked", repo, f"plan\0{plan[4]}\0{plan_id}" +
+                 (f"\0{recovery_identity}" if recovery_identity else "")),
             repo,
             "blocked",
             {
@@ -213,6 +234,7 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
                 "paths": paths,
                 "guidance_locations": guidance_locations,
                 "checkpoint": checkpoint,
+                "recovery": recovery_evidence,
             },
         )
 
@@ -223,6 +245,9 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
         (repo,),
     ).fetchone()
     if project_block is not None:
+        recovery_identity, recovery_evidence = final_recovery(
+            str(project_block[1] or "__project__")
+        )
         try:
             project_sources = json.loads(str(project_block[5])) if project_block[5] else []
         except (TypeError, ValueError):
@@ -235,12 +260,15 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
             if project_block[4]
             else []
         )
+        if recovery_evidence is not None:
+            project_paths = list(recovery_evidence["user_targets"])
         _insert(
             connection,
             _key(
                 "blocked",
                 repo,
-                f"project\0{project_block[0]}\0{project_block[1] or ''}",
+                f"project\0{project_block[0]}\0{project_block[1] or ''}" +
+                (f"\0{recovery_identity}" if recovery_identity else ""),
             ),
             repo,
             "blocked",
@@ -254,6 +282,7 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
                 "cause": str(project_block[2]),
                 "paths": project_paths,
                 "guidance_locations": [],
+                "recovery": recovery_evidence,
             },
         )
 
@@ -391,6 +420,18 @@ def _message(kind: str, payload: dict[str, object]) -> str:
     if kind == "blocked":
         subject = payload.get("execplan_id") or payload["stage"]
         paths = "\n".join(f"- {path}" for path in payload["paths"])
+        recovery = payload.get("recovery")
+        recovery_text = ""
+        if isinstance(recovery, dict):
+            counts = recovery.get("recovery_attempts")
+            if isinstance(counts, dict) and counts:
+                attempts = ", ".join(
+                    f"{reason}: {count}" for reason, count in sorted(counts.items())
+                )
+                recovery_text = f"\nRecovery attempts: {attempts}"
+            stable_revision = recovery.get("last_stable_revision")
+            if stable_revision:
+                recovery_text += f"\nLast stable revision: {stable_revision}"
         checkpoint = payload.get("checkpoint")
         checkpoint_text = ""
         if isinstance(checkpoint, dict):
@@ -408,6 +449,7 @@ def _message(kind: str, payload: dict[str, object]) -> str:
         return (
             f"[{payload['project']}] BLOCKED ({payload.get('scope')}: {subject})\n"
             f"Reason: {payload.get('reason_code')}\n{payload['cause']}"
+            + recovery_text
             + (f"\nFiles to edit:\n{paths}" if paths else "")
             + checkpoint_text
         )

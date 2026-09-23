@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import sqlite3
+import hashlib
 
 import runtime_state
 
@@ -144,15 +145,42 @@ def record_plan_block(
 ) -> None:
     if reason_scope(reason) is not BlockScope.PLAN:
         raise ValueError(f"프로젝트 범위 원인을 계획 차단에 사용할 수 없습니다: {reason.value}")
+    import recovery_runtime
+    import recovery_state
+
     try:
-        runtime_state.RuntimeStateRepository(connection).block_plan(
-            repo,
-            plan_id,
-            reason_code=reason.value,
-            evidence=evidence,
-            release_fingerprint=release_fingerprint,
-            enqueue=False,
-        )
+        with runtime_state._transaction(connection):
+            plan = connection.execute(
+                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+                (repo, plan_id),
+            ).fetchone()
+            if plan is None:
+                raise runtime_state.RuntimeStateError("plan missing")
+            observation = recovery_runtime.RecoveryObservation(
+                reason=recovery_runtime.reason_from_block(reason),
+                repo=repo, plan_id=plan_id, phase=str(plan["status"]),
+                plan_revision=str(plan["current_revision_sha"] or plan["plan_sha"] or ""),
+                base_revision=str(plan["active_sha"] or ""),
+                fingerprint=release_fingerprint or hashlib.sha256(
+                    f"{reason.value}|{plan_id}".encode()
+                ).hexdigest(),
+                progress_marker=str(plan["active_sha"] or ""), detail=evidence,
+                user_targets=recovery_state.block_user_targets(
+                    connection, repo, plan_id, reason, str(plan["path"]),
+                ),
+            )
+            decision = recovery_state.RecoveryRepository(connection).observe(
+                observation, final_block_reason=reason,
+            ).decision
+            recovery_runtime.require_final(decision)
+            runtime_state.RuntimeStateRepository(connection).block_plan(
+                repo,
+                plan_id,
+                reason_code=reason.value,
+                evidence=evidence,
+                release_fingerprint=release_fingerprint,
+                enqueue=False,
+            )
     except runtime_state.RuntimeStateError as error:
         raise RuntimeError(
             f"차단할 ExecPlan을 찾을 수 없습니다: {plan_id}"
@@ -168,6 +196,26 @@ def record_project_block(
     *,
     plan_id: str | None,
     previous_phase: str | None,
+    recovery_decision: object | None = None,
+) -> None:
+    with runtime_state._transaction(connection):
+        _record_project_block_in_transaction(
+            connection, repo, reason, evidence, release_fingerprint,
+            plan_id=plan_id, previous_phase=previous_phase,
+            recovery_decision=recovery_decision,
+        )
+
+
+def _record_project_block_in_transaction(
+    connection: sqlite3.Connection,
+    repo: str,
+    reason: BlockReasonCode,
+    evidence: str,
+    release_fingerprint: str | None,
+    *,
+    plan_id: str | None,
+    previous_phase: str | None,
+    recovery_decision: object | None = None,
 ) -> None:
     if reason_scope(reason) is not BlockScope.PROJECT:
         raise ValueError(f"계획 범위 원인을 프로젝트 차단에 사용할 수 없습니다: {reason.value}")
@@ -176,6 +224,37 @@ def record_project_block(
     ).fetchone()
     if project is None:
         raise RuntimeError(f"차단할 프로젝트를 찾을 수 없습니다: {repo}")
+    # Import locally: the recovery policy uses this module's scope mapping.
+    import recovery_runtime
+    import recovery_state
+
+    if recovery_decision is None:
+        project_state = connection.execute(
+            "SELECT phase, active_sha FROM projects WHERE repo = ?", (repo,)
+        ).fetchone()
+        plan = connection.execute(
+            "SELECT current_revision_sha, plan_sha FROM exec_plans "
+            "WHERE repo = ? AND plan_id = ?", (repo, plan_id),
+        ).fetchone() if plan_id is not None else None
+        fingerprint = release_fingerprint or hashlib.sha256(
+            f"{reason.value}|{plan_id}|{previous_phase}".encode()
+        ).hexdigest()
+        observation = recovery_runtime.RecoveryObservation(
+            reason=recovery_runtime.reason_from_block(reason), repo=repo,
+            plan_id=plan_id, phase=str(project_state["phase"] or ""),
+            plan_revision=(str(plan["current_revision_sha"] or plan["plan_sha"] or "")
+                           if plan is not None else None),
+            base_revision=str(project_state["active_sha"] or ""),
+            fingerprint=fingerprint,
+            progress_marker=str(project_state["active_sha"] or ""),
+            detail=evidence,
+        )
+        recovery_decision = recovery_state.RecoveryRepository(connection).observe(
+            observation, final_block_reason=reason,
+        ).decision
+    recovery_runtime.require_final(recovery_decision)
+    if recovery_decision.block_reason != reason or recovery_decision.observation.repo != repo or recovery_decision.observation.plan_id != plan_id:
+        raise ValueError("recovery decision and project block target disagree")
     connection.execute(
         """
         INSERT INTO project_blocks (

@@ -11,6 +11,8 @@ from managed_config import ManagedConfigError, load_managed_config
 import notifications
 import project_registry
 import scoped_blocking
+from recovery_runtime import RecoveryObservation, RecoveryReason
+from recovery_state import RecoveryRepository
 
 
 class NotificationFixture:
@@ -58,6 +60,48 @@ class NotificationFixture:
 
 
 class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
+    def test_guidance_block_reports_exact_decision_lines_and_recovery_attempts(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        path = "docs/plans/[G-018] Reliable notices.md"
+        with connection:
+            connection.execute(
+                "INSERT INTO guidance_approvals (repo, plan_id, proposal_id, "
+                "proposal_hash, target_path, scope, proposal_patch, "
+                "proposal_patch_hash, proposal_line, decision_line, batch_id, "
+                "sequence, baseline_content, baseline_mode) "
+                "VALUES (?, 'G-018', 'guidance-a', 'hash', 'AGENTS.md', "
+                "'common', 'patch', 'patch-hash', 15, 22, 'batch', 0, ?, 420)",
+                (repo, b""),
+            )
+            RecoveryRepository(connection).observe(RecoveryObservation(
+                RecoveryReason.GIT_LOCK, repo, "G-018", "IMPLEMENTING",
+                "plan-sha", "base-sha", "lock", "worker:head", "lock busy",
+            ))
+            scoped_blocking.record_plan_block(
+                connection, repo, "G-018",
+                scoped_blocking.BlockReasonCode.GUIDANCE_APPROVAL_REQUIRED,
+                "User Decision pending", "guidance-fingerprint",
+            )
+            checkpoint_repository = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
+            checkpoint_repository.finish_unpublished(
+                checkpoint_repository.get(repo, "G-018"),
+                "local-only", retryable=False,
+            )
+            notifications.enqueue_current_project_events(connection, repo)
+        blocked = next(
+            json.loads(row["payload"]) for row in self.events(connection)
+            if row["event_type"] == "blocked"
+        )
+        expected = [f"{path}:15", f"{path}:22"]
+        self.assertEqual(blocked["recovery"]["user_targets"], expected)
+        self.assertEqual(blocked["recovery"]["recovery_attempts"], {"git_lock": 1})
+        self.assertEqual(blocked["paths"], expected)
+        rendered = notifications._message("blocked", blocked)
+        self.assertIn("Recovery attempts: git_lock: 1", rendered)
+        self.assertEqual(rendered.count(expected[0]), 1)
+        self.assertEqual(rendered.count(expected[1]), 1)
+
     def test_disabled_and_partial_configuration_do_not_create_events(self):
         connection = self.connection(enabled=False)
         loop_manager.update_project(
@@ -133,8 +177,9 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
         self.assertEqual(blocked["cause"], "User decision required")
         self.assertEqual(
             blocked["paths"],
-            [path, "docs/PRODUCT.md"],
+            [],
         )
+        self.assertEqual(blocked["recovery"]["block_reason_code"], "user_decision_required")
         self.assertEqual(
             blocked["checkpoint"],
             {

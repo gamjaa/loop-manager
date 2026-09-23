@@ -71,6 +71,8 @@ from planning_runtime import (
 )
 import project_registry
 import runtime_state
+import recovery_state
+import recovery_runtime
 import execution_handlers
 import execution_revision
 from execution_state import ExecutionStatePort as _ExecutionStatePort
@@ -444,6 +446,7 @@ class ValidationFailureDecision:
     fingerprint: str
     occurrences: int
     blocked: bool
+    recovery: recovery_runtime.RecoveryDecision | None = None
 
 
 @dataclass(frozen=True)
@@ -615,6 +618,10 @@ class WorkspaceOwnershipError(RuntimeError):
 
 class WorkerResultError(RuntimeError):
     """A Worker final response cannot safely be published."""
+
+
+class ExecPlanMetadataError(RuntimeError):
+    """The selected ExecPlan declaration disagrees with the catalog."""
 
 
 class ReviewerProtocolError(RuntimeError):
@@ -1140,6 +1147,8 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
             connection.execute("RELEASE publication_backfill")
     connection.execute(GUIDANCE_APPROVALS_SCHEMA)
     scoped_blocking.ensure_schema(connection)
+    if not getattr(connection, "execplans_schema_ready", False):
+        recovery_state.ensure_schema(connection)
     blocked_checkpoint_state.ensure_schema(connection)
     connection.execute("DROP INDEX IF EXISTS one_active_execplan_per_project")
     connection.execute(EXEC_PLANS_ACTIVE_INDEX)
@@ -5971,12 +5980,16 @@ def clear_validation_failure_history(
     plan = active_execplan(connection, repo)
     if plan is None:
         raise RuntimeError("지문 이력을 초기화할 활성 ExecPlan을 찾을 수 없습니다.")
+    fingerprints = tuple(_deserialize_failure_history(plan[column]))
     with connection:
         runtime_state.RuntimeStateRepository(connection).update_plan(
             repo,
             str(plan["plan_id"]),
             plan_values={column: "{}"},
             enqueue=False,
+        )
+        recovery_state.RecoveryRepository(connection).clear_correction_occurrences(
+            repo, str(plan["plan_id"]), fingerprints,
         )
 
 
@@ -8483,14 +8496,17 @@ def validate_active_execplan_metadata(
     *,
     rebase_definition: execution_revision.DefinitionSnapshot | None = None,
 ) -> dict[str, object]:
-    current = validate_execplan(worktree, relative_path)
+    try:
+        current = validate_execplan(worktree, relative_path)
+    except RuntimeError as error:
+        raise ExecPlanMetadataError(str(error)) from error
     comparison_plan = plan
     if rebase_definition is not None:
         # A paused rebase still contains its applied declaration. Scheduling,
         # profile and dependency fields may lag during conflict resolution;
         # all other identity fields and all normal validation remain strict.
         if rebase_definition.path != relative_path:
-            raise RuntimeError("rebase 기준 ExecPlan 경로가 현재 작업 경로와 다릅니다.")
+            raise ExecPlanMetadataError("rebase 기준 ExecPlan 경로가 현재 작업 경로와 다릅니다.")
         comparison_plan = dict(plan)
         for field, column in (
             ('priority', 'priority'),
@@ -8509,9 +8525,9 @@ def validate_active_execplan_metadata(
         "활성 ExecPlan",
     )
     if error is not None:
-        raise RuntimeError(error)
+        raise ExecPlanMetadataError(error)
     if relative_path != str(plan["path"]):
-        raise RuntimeError("활성 ExecPlan 경로가 reconciled catalog와 다릅니다.")
+        raise ExecPlanMetadataError("활성 ExecPlan 경로가 reconciled catalog와 다릅니다.")
     return _current_execplan_metadata(plan, current)
 
 
@@ -8533,7 +8549,7 @@ def validate_worker_workspace_scope(
     """Validate one Worker-controlled operation before Manager Git writes."""
 
     if rebase_definition is not None and not allow_rebase:
-        raise RuntimeError("rebase 기준 선언은 충돌 복구 중에만 사용할 수 있습니다.")
+        raise ExecPlanMetadataError("rebase 기준 선언은 충돌 복구 중에만 사용할 수 있습니다.")
     after = capture_git_snapshot(worktree)
     validate_agent_scope(
         "worker",
@@ -8812,6 +8828,11 @@ def _block_for_new_guidance(
                     baseline_mode,
                 ),
             )
+        _final_block_recovery_decision(
+            connection, repo, plan, "WORKING",
+            BlockReasonCode.GUIDANCE_APPROVAL_REQUIRED, message,
+            document.structure_hash, None,
+        )
         runtime_state.RuntimeStateRepository(connection).block_plan(
             repo,
             str(plan["plan_id"]),
@@ -9139,6 +9160,11 @@ def _invalidate_guidance_approval(
         )
         # Manager rebase/verify may already have cleared the Agent scope.
         # Freeze the diagnosed state so only the User Decision can change.
+        _final_block_recovery_decision(
+            connection, repo, plan, "WORKING",
+            BlockReasonCode.GUIDANCE_APPROVAL_REQUIRED, message,
+            document.structure_hash, None,
+        )
         runtime_state.RuntimeStateRepository(connection).block_plan(
             repo,
             str(plan["plan_id"]),
@@ -9435,6 +9461,7 @@ def block_active_execplan(
     *,
     reason: BlockReasonCode = BlockReasonCode.PLAN_INPUT_INVALID,
     preserved_agent_result_snapshot: str | None = None,
+    recovery_decision: recovery_runtime.RecoveryDecision | None = None,
 ) -> None:
     project = connection.execute(
         "SELECT plan_path, phase, agent_role, agent_snapshot, agent_input_fingerprint, "
@@ -9486,18 +9513,22 @@ def block_active_execplan(
         "agent_manager_snapshot": None,
     }
     plan_id = str(plan["plan_id"])
-    if scoped_blocking.reason_scope(reason) is BlockScope.PLAN:
-        runtime_state.RuntimeStateRepository(connection).block_plan(
-            repo,
-            plan_id,
-            reason_code=reason.value,
-            evidence=error,
-            release_fingerprint=fingerprint,
-            plan_values=plan_values,
-            clear_projection=True,
+    with runtime_state._transaction(connection):
+        decision = _final_block_recovery_decision(
+            connection, repo, plan, str(project["phase"] or "") if project else "",
+            reason, error, fingerprint, recovery_decision,
         )
-    else:
-        with connection:
+        if scoped_blocking.reason_scope(reason) is BlockScope.PLAN:
+            runtime_state.RuntimeStateRepository(connection).block_plan(
+                repo,
+                plan_id,
+                reason_code=reason.value,
+                evidence=error,
+                release_fingerprint=fingerprint,
+                plan_values=plan_values,
+                clear_projection=True,
+            )
+        else:
             runtime_state.RuntimeStateRepository(connection).transition(
                 repo,
                 plan_id,
@@ -9518,8 +9549,43 @@ def block_active_execplan(
                 fingerprint,
                 plan_id=plan_id,
                 previous_phase=str(project["phase"] or "") or None,
+                recovery_decision=decision,
             )
             notifications.enqueue_current_project_events(connection, repo)
+
+
+def _final_block_recovery_decision(
+    connection: sqlite3.Connection,
+    repo: str,
+    plan: sqlite3.Row,
+    phase: str,
+    reason: BlockReasonCode,
+    error: str,
+    fingerprint: str,
+    decision: recovery_runtime.RecoveryDecision | None,
+) -> recovery_runtime.RecoveryDecision:
+    """Accept only a final typed decision in the blocking transaction."""
+
+    if decision is None:
+        observation = recovery_runtime.RecoveryObservation(
+            reason=recovery_runtime.reason_from_block(reason),
+            repo=repo, plan_id=str(plan["plan_id"]), phase=phase,
+            plan_revision=str(plan["current_revision_sha"] or plan["plan_sha"] or ""),
+            base_revision=str(plan["active_sha"] or ""),
+            fingerprint=fingerprint,
+            progress_marker=str(plan["active_sha"] or ""), detail=error,
+            user_targets=recovery_state.block_user_targets(
+                connection, repo, str(plan["plan_id"]), reason,
+                str(plan["path"]),
+            ),
+        )
+        decision = recovery_state.RecoveryRepository(connection).observe(
+            observation, final_block_reason=reason,
+        ).decision
+    recovery_runtime.require_final(decision)
+    if decision.block_reason != reason or decision.observation.repo != repo or decision.observation.plan_id != str(plan["plan_id"]):
+        raise ValueError("recovery decision and block target disagree")
+    return decision
 
 
 def transition_validation_failure(
@@ -9653,15 +9719,20 @@ def transition_validation_failure(
             if stage == "verify"
             else BlockReasonCode.REVIEW_RETRY_EXHAUSTED
         )
-        runtime_state.RuntimeStateRepository(connection).block_plan(
-            repo,
-            str(plan["plan_id"]),
-            reason_code=reason.value,
-            evidence=error,
-            release_fingerprint=blocked_input,
-            plan_values=plan_values,
-            clear_projection=True,
-        )
+        with runtime_state._transaction(connection):
+            recovery_decision = _final_block_recovery_decision(
+                connection, repo, plan, stage.upper(), reason, error,
+                fingerprint, None,
+            )
+            runtime_state.RuntimeStateRepository(connection).block_plan(
+                repo,
+                str(plan["plan_id"]),
+                reason_code=reason.value,
+                evidence=error,
+                release_fingerprint=blocked_input,
+                plan_values=plan_values,
+                clear_projection=True,
+            )
     else:
         runtime_state.RuntimeStateRepository(connection).transition(
             repo,
@@ -9675,6 +9746,7 @@ def transition_validation_failure(
         fingerprint,
         occurrences,
         blocked,
+        recovery_decision if blocked else None,
     )
 
 
@@ -9689,6 +9761,7 @@ def block_active_execplan_from_revision(
     reason: BlockReasonCode = BlockReasonCode.PLAN_INPUT_INVALID,
     preserved_agent_result_snapshot: str | None = None,
     blocked_reason: str | None = None,
+    recovery_decision: recovery_runtime.RecoveryDecision | None = None,
 ) -> None:
     """Block an active plan when its saved worktree is not safe to read."""
 
@@ -9715,18 +9788,23 @@ def block_active_execplan_from_revision(
     if blocked_reason is not None:
         plan_values["blocked_reason"] = blocked_reason
     plan_id = str(plan["plan_id"])
-    if scoped_blocking.reason_scope(reason) is BlockScope.PLAN:
-        runtime_state.RuntimeStateRepository(connection).block_plan(
-            repo,
-            plan_id,
-            reason_code=reason.value,
-            evidence=error,
-            release_fingerprint=fingerprint,
-            plan_values=plan_values,
-            clear_projection=True,
+    with runtime_state._transaction(connection):
+        decision = _final_block_recovery_decision(
+            connection, repo, plan,
+            str(project["phase"] or "") if project else "", reason, error,
+            fingerprint, recovery_decision,
         )
-    else:
-        with connection:
+        if scoped_blocking.reason_scope(reason) is BlockScope.PLAN:
+            runtime_state.RuntimeStateRepository(connection).block_plan(
+                repo,
+                plan_id,
+                reason_code=reason.value,
+                evidence=error,
+                release_fingerprint=fingerprint,
+                plan_values=plan_values,
+                clear_projection=True,
+            )
+        else:
             runtime_state.RuntimeStateRepository(connection).transition(
                 repo,
                 plan_id,
@@ -9748,6 +9826,7 @@ def block_active_execplan_from_revision(
                 previous_phase=(
                     str(project["phase"] or "") or None if project else None
                 ),
+                recovery_decision=decision,
             )
             notifications.enqueue_current_project_events(connection, repo)
 
@@ -12192,18 +12271,24 @@ def _block_closed_pull_request(
     clear_projection = bool(
         mirrored and mirrored["plan_path"] == plan["path"]
     )
-    runtime_state.RuntimeStateRepository(connection).block_plan(
-        repo,
-        str(plan["plan_id"]),
-        reason_code=BlockReasonCode.PULL_REQUEST_CLOSED.value,
-        evidence=error,
-        release_fingerprint=str(head_oid or "") or None,
-        plan_values={
-            "pr_url": url,
-            "pr_head_oid": head_oid,
-        },
-        clear_projection=clear_projection,
-    )
+    with runtime_state._transaction(connection):
+        _final_block_recovery_decision(
+            connection, repo, plan, "PR_OPEN",
+            BlockReasonCode.PULL_REQUEST_CLOSED, error,
+            str(head_oid or ""), None,
+        )
+        runtime_state.RuntimeStateRepository(connection).block_plan(
+            repo,
+            str(plan["plan_id"]),
+            reason_code=BlockReasonCode.PULL_REQUEST_CLOSED.value,
+            evidence=error,
+            release_fingerprint=str(head_oid or "") or None,
+            plan_values={
+                "pr_url": url,
+                "pr_head_oid": head_oid,
+            },
+            clear_projection=clear_projection,
+        )
 
 
 def _resume_reopened_pull_request(
@@ -12561,7 +12646,7 @@ def reconcile_existing_pull_request(
                 allow_recovery=True,
                 allow_existing=True,
             )
-        except (RuntimeError, WorkspaceOwnershipError) as error:
+        except WorkspaceOwnershipError as error:
             workspace_error = (
                 f"PR_OPEN workspace 소유권/복구 검증 실패: {error}"
             )
@@ -12575,6 +12660,14 @@ def reconcile_existing_pull_request(
             )
             operation_print(workspace_error, file=sys.stderr)
             return 1
+        except RuntimeError as error:
+            detail = f"PR_OPEN workspace 복구 재시도: {error}"
+            _record_project_recovery(
+                connection, repo, recovery_runtime.RecoveryReason.WORKTREE_RECOVERY_FAILED,
+                detail,
+            )
+            operation_print(detail, file=sys.stderr)
+            return PROJECT_STEP_RETRY
         if reopening_closed_pr:
             assert blocked_plan is not None
             _resume_reopened_pull_request(
@@ -12619,7 +12712,7 @@ def reconcile_existing_pull_request(
                 url,
                 stored_head_oid,
             )
-        except (RuntimeError, WorkspaceOwnershipError) as error:
+        except WorkspaceOwnershipError as error:
             workspace_error = (
                 f"Merge cleanup workspace 소유권 검증 실패: {error}"
             )
@@ -12633,6 +12726,14 @@ def reconcile_existing_pull_request(
             )
             operation_print(workspace_error, file=sys.stderr)
             return 1
+        except RuntimeError as error:
+            detail = f"Merge cleanup workspace 조회 재시도: {error}"
+            _record_project_recovery(
+                connection, repo, recovery_runtime.RecoveryReason.WORKTREE_RECOVERY_FAILED,
+                detail,
+            )
+            operation_print(detail, file=sys.stderr)
+            return PROJECT_STEP_RETRY
         if assessment.status in {"safe", "missing"}:
             operation_print(f"Merge 확인 및 worktree 정리 완료: {url}")
         else:
@@ -12731,16 +12832,8 @@ def resume_pr_conflict_rebase(
             "PR 충돌 복구 base ancestry 확인 실패:\n"
             + ancestry.stdout[-8000:]
         )
-        block_active_execplan(
-            connection,
-            repo,
-            worktree,
-            error,
-            str(project["verify_result"] or ""),
-            reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE,
-        )
         operation_print(error, file=sys.stderr)
-        return 1
+        return PROJECT_STEP_RETRY
 
     rebased = git(worktree, "rebase", target_base, check=False)
     if rebased.returncode and is_git_lock_failure(rebased.stdout):
@@ -12765,16 +12858,8 @@ def resume_pr_conflict_rebase(
         return 0
 
     error = f"PR 충돌 복구 rebase 실패:\n{rebased.stdout[-8000:]}"
-    block_active_execplan(
-        connection,
-        repo,
-        worktree,
-        error,
-        str(project["verify_result"] or ""),
-        reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
-    )
     operation_print(error, file=sys.stderr)
-    return 1
+    return PROJECT_STEP_RETRY
 
 def planner_prompt(error: str | None, compact_catalog: str = "[]") -> str:
     failure = f"\n이전 실행에서 다음 문제가 발생했다. 원인을 해결하라:\n{error[-6000:]}\n" if error else ""
@@ -14771,6 +14856,8 @@ def _planning_outcome_step_result(outcome: PlanningOutcome) -> int | None:
         return PROJECT_STEP_RETRY
     if outcome.kind is PlanningOutcomeKind.TRANSIENT_PAUSE:
         return PROJECT_STEP_TRANSIENT_PAUSE
+    if outcome.kind is PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED:
+        return PROJECT_STEP_TRANSIENT_PAUSE
     if outcome.kind is PlanningOutcomeKind.USAGE_LIMIT_PAUSE:
         return PROJECT_STEP_USAGE_PAUSE
     return 1
@@ -15064,6 +15151,8 @@ def _run_project_step(
         repo,
         after_reconciliation=archive_housekeeping,
     )
+    if pr_sync.step_result not in {None, 0}:
+        return pr_sync.step_result
     base_sha = git(
         repo_path,
         "rev-parse",
@@ -15080,6 +15169,12 @@ def _run_project_step(
             catalog_result.kind
             is execplan_catalog_state.ReconciliationKind.STALE
         ):
+            _record_project_recovery(
+                connection, repo,
+                recovery_runtime.RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                "ExecPlan catalog snapshot이 적용 전에 변경되어 다시 조회합니다: "
+                + str(catalog_result.revision_sha or ""),
+            )
             return PROJECT_STEP_RETRY
         if (
             catalog_result.kind
@@ -15225,6 +15320,28 @@ def _run_project_step(
             planner_mutex,
         )
     ).run(planning_context)
+    if planning_outcome.kind in {
+        PlanningOutcomeKind.REMOTE_BASE_RESTART,
+        PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED,
+        PlanningOutcomeKind.TRANSIENT_PAUSE,
+    }:
+        reason = (
+            recovery_runtime.RecoveryReason.SERVICE_UNAVAILABLE
+            if planning_outcome.kind is PlanningOutcomeKind.TRANSIENT_PAUSE
+            else recovery_runtime.RecoveryReason.REMOTE_SNAPSHOT_RACE
+            if planning_outcome.kind is PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED
+            else recovery_runtime.RecoveryReason.BASE_BEHIND
+        )
+        _record_project_recovery(
+            connection, repo, reason,
+            planning_outcome.detail or planning_outcome.kind.value,
+            attempts=(
+                3 if planning_outcome.kind in {
+                    PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED,
+                    PlanningOutcomeKind.TRANSIENT_PAUSE,
+                } else 0
+            ),
+        )
     planning_step_result = _planning_outcome_step_result(planning_outcome)
     if planning_step_result is not None:
         return planning_step_result
@@ -15275,6 +15392,52 @@ def _checkpoint_dispatch_ready(
     ).fetchone() is not None
 
 
+def _record_project_recovery(
+    connection: sqlite3.Connection,
+    repo: str,
+    reason: recovery_runtime.RecoveryReason,
+    detail: str,
+    *,
+    attempts: int = 0,
+) -> recovery_runtime.RecoveryDecision:
+    """Persist a project/PR operation failure without changing execution state."""
+
+    tables = {
+        str(row[0]) for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name IN ('projects', 'exec_plans')"
+        )
+    }
+    project = (
+        connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
+        if "projects" in tables else None
+    )
+    plan = (
+        project_execplan(connection, repo)
+        if project is not None and "exec_plans" in tables else None
+    )
+    phase = str(project["phase"] or "") if project is not None else ""
+    active_sha = str(project["active_sha"] or "") if project is not None else ""
+    branch = str(project["branch"] or "") if project is not None else ""
+    marker = f"{active_sha}|{branch}|{project['worker_session_id'] if project is not None else ''}"
+    fingerprint = hashlib.sha256(
+        f"{reason.value}|{phase}|{active_sha}|{branch}".encode()
+    ).hexdigest()
+    observation = recovery_runtime.RecoveryObservation(
+        reason=reason, repo=repo,
+        plan_id=str(plan["plan_id"]) if plan is not None else None,
+        phase=phase,
+        plan_revision=(str(plan["current_revision_sha"] or plan["plan_sha"] or "")
+                       if plan is not None else None),
+        base_revision=active_sha, fingerprint=fingerprint,
+        progress_marker=marker, detail=detail,
+    )
+    with runtime_state._transaction(connection):
+        return recovery_state.RecoveryRepository(connection).observe(
+            observation, attempts=attempts,
+        ).decision
+
+
 def run_project_result(
     connection: sqlite3.Connection,
     state_dir: Path,
@@ -15293,6 +15456,10 @@ def run_project_result(
 
     repo = str(Path(repo_arg).expanduser().resolve())
     checkpoint_attempts: set[str] = set()
+    if not getattr(connection, "execplans_schema_ready", False):
+        recovery_state.ensure_schema(connection)
+    recovery_attempts: dict[str, int] = {}
+    pause_detail: str | None = None
     while True:
         if _checkpoint_dispatch_ready(connection, repo):
             pending_before = (
@@ -15315,6 +15482,13 @@ def run_project_result(
                     request.request_identity for request in pending_before
                 )
         try:
+            recovery_before = {
+                str(record["subject"]): int(record["generation"])
+                for record in connection.execute(
+                    "SELECT subject, generation FROM recovery_records WHERE repo = ?",
+                    (repo,),
+                )
+            }
             step_result = _run_project_step(
                 connection,
                 state_dir,
@@ -15328,6 +15502,11 @@ def run_project_result(
                 refactoring_review_interval,
             )
         except GitLockError as error:
+            _record_project_recovery(
+                connection, repo, recovery_runtime.RecoveryReason.GIT_LOCK,
+                str(error),
+                attempts=3,
+            )
             operation_log(
                 f"일시적 Git lock 충돌 ({repo_arg}): {error}",
                 error=True,
@@ -15339,6 +15518,27 @@ def run_project_result(
             )
         if on_step_completed is not None:
             on_step_completed()
+        if step_result == PROJECT_STEP_RETRY:
+            for record in connection.execute(
+                "SELECT subject, generation, identity, disposition, detail "
+                "FROM recovery_records WHERE repo = ?", (repo,),
+            ):
+                if int(record["generation"]) <= recovery_before.get(str(record["subject"]), 0):
+                    continue
+                if record["disposition"] not in {"transient_retry", "state_reconcile"}:
+                    continue
+                identity = str(record["identity"])
+                run_key = f"{record['subject']}|{record['disposition']}"
+                recovery_attempts[run_key] = recovery_attempts.get(run_key, 0) + 1
+                if recovery_attempts[run_key] >= 3:
+                    with connection:
+                        recovery_state.RecoveryRepository(connection).mark_paused(
+                            repo, str(record["subject"]), identity,
+                            int(record["generation"]), recovery_attempts[run_key],
+                        )
+                    step_result = PROJECT_STEP_TRANSIENT_PAUSE
+                    pause_detail = str(record["detail"])
+                    break
         if _checkpoint_dispatch_ready(connection, repo):
             pending_after = (
                 blocked_checkpoint_state.BlockedCheckpointRepository(
@@ -15380,7 +15580,7 @@ def run_project_result(
     ).fetchone()
     detail = str(row["last_error"] or "") if row else None
     if step_result == PROJECT_STEP_TRANSIENT_PAUSE:
-        return ProjectRunResult(ProjectRunKind.TRANSIENT_PAUSE, 0, detail)
+        return ProjectRunResult(ProjectRunKind.TRANSIENT_PAUSE, 0, pause_detail or detail)
     if step_result == PROJECT_STEP_USAGE_PAUSE:
         return ProjectRunResult(ProjectRunKind.USAGE_LIMIT_PAUSE, 0, detail)
     if step_result == PROJECT_STEP_PLANNING_PENDING:
@@ -16433,6 +16633,20 @@ def dispatch_blocked_checkpoints(
 def _execution_outcome_step_result(outcome: ExecutionOutcome) -> int:
     """Translate a typed execution result at the process adapter boundary."""
 
+    if (outcome.recovery is not None
+            and outcome.recovery.action is recovery_runtime.RecoveryAction.CORRECT
+            and outcome.context is not None):
+        reason = outcome.recovery.observation.reason
+        if (
+            reason is recovery_runtime.RecoveryReason.WORKER_CORRECTION
+            and outcome.context.phase is ExecutionPhase.IMPLEMENTING
+        ) or (
+            reason is recovery_runtime.RecoveryReason.REBASE_CONFLICT
+            and outcome.context.phase is not ExecutionPhase.IMPLEMENTING
+        ):
+            # Stop after an initial Manager rebase conflict or a Worker output
+            # protocol error; the saved session receives that feedback next run.
+            return 1
     if outcome.kind in {
         ExecutionOutcomeKind.SUCCESS,
         ExecutionOutcomeKind.STABLE_WAIT,
@@ -16447,7 +16661,51 @@ def _execution_outcome_step_result(outcome: ExecutionOutcome) -> int:
         return PROJECT_STEP_TRANSIENT_PAUSE
     if outcome.kind is ExecutionOutcomeKind.USAGE_PAUSE:
         return PROJECT_STEP_USAGE_PAUSE
+    if outcome.kind is ExecutionOutcomeKind.PLANNING_PENDING:
+        return PROJECT_STEP_PLANNING_PENDING
     return 1
+
+
+def _typed_execution_git(path: Path, *arguments: str, **options: object):
+    """Keep Git operation identity when a shared subprocess helper fails."""
+
+    command = arguments[0] if arguments else ""
+    reason = {
+        "fetch": recovery_runtime.RecoveryReason.FETCH_FAILED,
+        "status": recovery_runtime.RecoveryReason.STATUS_FAILED,
+        "diff": recovery_runtime.RecoveryReason.STATUS_FAILED,
+        "rev-parse": recovery_runtime.RecoveryReason.STATUS_FAILED,
+        "merge-base": recovery_runtime.RecoveryReason.STATUS_FAILED,
+        "add": recovery_runtime.RecoveryReason.STAGE_FAILED,
+        "commit": recovery_runtime.RecoveryReason.STAGE_FAILED,
+        "rebase": recovery_runtime.RecoveryReason.REBASE_CONTINUE_FAILED,
+        "-c": recovery_runtime.RecoveryReason.REBASE_CONTINUE_FAILED,
+    }.get(command, recovery_runtime.RecoveryReason.WORKTREE_RECOVERY_FAILED)
+    try:
+        result = git(path, *arguments, **options)
+        if result.returncode and is_git_lock_failure(result.stdout):
+            raise recovery_runtime.RecoveryFailure(
+                recovery_runtime.RecoveryReason.GIT_LOCK,
+                result.stdout[-8000:],
+            )
+        return result
+    except recovery_runtime.RecoveryFailure:
+        raise
+    except GitLockError as error:
+        raise recovery_runtime.RecoveryFailure(
+            recovery_runtime.RecoveryReason.GIT_LOCK, str(error)
+        ) from error
+    except (RuntimeError, OSError) as error:
+        raise recovery_runtime.RecoveryFailure(reason, str(error)) from error
+
+
+def _typed_execution_command(*arguments: object, **options: object):
+    try:
+        return command(*arguments, **options)
+    except (RuntimeError, OSError) as error:
+        raise recovery_runtime.RecoveryFailure(
+            recovery_runtime.RecoveryReason.PUBLICATION_RETRY, str(error)
+        ) from error
 
 
 def _ExecutionLifecyclePorts(connection, runtime_repository, **identity):
@@ -16455,10 +16713,10 @@ def _ExecutionLifecyclePorts(connection, runtime_repository, **identity):
     state = _ExecutionStatePort(connection, runtime_repository, identity["repo"])
     effects = execution_handlers.ExecutionEffects(
         state=state,
-        contract=SimpleNamespace(**{name: globals()[name] for name in ('AgentResultKind', 'AgentScopeError', 'MAX_REVIEWER_PROTOCOL_ATTEMPTS', 'PROJECT_STEP_RETRY', 'PROJECT_STEP_TRANSIENT_PAUSE', 'PROJECT_STEP_USAGE_PAUSE', 'PublicationSafetyError', 'REBASE_CONFLICT_PREFIX', 'REBASE_IN_PROGRESS_ERROR', 'RequirementArchiveError', 'ReviewerProtocolError', 'TRANSIENT_AGENT_ERROR_PREFIX', 'USAGE_LIMIT_ERROR_PREFIX', 'WORKSPACE_OWNED', 'WORKSPACE_RESERVED', 'WorkerResultError', 'WorkspaceOwnershipError')}),
+        contract=SimpleNamespace(**{name: globals()[name] for name in ('AgentResultKind', 'AgentScopeError', 'ExecPlanMetadataError', 'MAX_REVIEWER_PROTOCOL_ATTEMPTS', 'MAX_VALIDATION_FINGERPRINT_REPEATS', 'PROJECT_STEP_RETRY', 'PROJECT_STEP_TRANSIENT_PAUSE', 'PROJECT_STEP_USAGE_PAUSE', 'PROJECT_STEP_PLANNING_PENDING', 'PublicationSafetyError', 'REBASE_CONFLICT_PREFIX', 'REBASE_IN_PROGRESS_ERROR', 'RequirementArchiveError', 'ReviewerProtocolError', 'TRANSIENT_AGENT_ERROR_PREFIX', 'USAGE_LIMIT_ERROR_PREFIX', 'WORKSPACE_OWNED', 'WORKSPACE_RESERVED', 'WorkerResultError', 'WorkspaceOwnershipError')}),
         workspace=execution_handlers.WorkspaceEffects(
             is_directory=lambda path: path.is_dir(),
-            git=state.bind(git, name="git", connected=False, mutates=False),
+            git=state.bind(_typed_execution_git, name="git", connected=False, mutates=False),
             make_worktree=state.bind(make_worktree, name="make_worktree", connected=False, mutates=False),
             branch_has_changes=state.bind(branch_has_changes, name="branch_has_changes", connected=False, mutates=False),
             remote_branch_oid=state.bind(remote_branch_oid, name="remote_branch_oid", connected=False, mutates=False),
@@ -16513,7 +16771,7 @@ def _ExecutionLifecyclePorts(connection, runtime_repository, **identity):
             push_owned_pr_conflict_recovery=state.bind(push_owned_pr_conflict_recovery, name="push_owned_pr_conflict_recovery", connected=True, mutates=True),
             published_execplan=state.bind(published_execplan, name="published_execplan", connected=False, mutates=False),
             build_pr_body=state.bind(build_pr_body, name="build_pr_body", connected=False, mutates=False),
-            command=state.bind(command, name="command", connected=False, mutates=False),
+            command=state.bind(_typed_execution_command, name="command", connected=False, mutates=False),
         ),
         blocking=execution_handlers.BlockingEffects(
             block_active_execplan=state.bind(block_active_execplan, name="block_active_execplan", connected=True, mutates=True),

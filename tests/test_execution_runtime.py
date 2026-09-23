@@ -11,6 +11,9 @@ from execution_runtime import (
     ExecutionPlanMetadata,
 )
 import loop_manager
+from recovery_runtime import (
+    RecoveryFailure, RecoveryObservation, RecoveryReason, decide,
+)
 
 
 def execution_context(phase=ExecutionPhase.IMPLEMENTING, **overrides):
@@ -131,6 +134,30 @@ class FakePorts:
 
 
 class ExecutionPhaseCoordinatorTests(unittest.TestCase):
+    def test_typed_git_failure_reaches_common_recovery_dispatcher(self):
+        context = execution_context()
+        ports = FakePorts(context)
+
+        def fail(_context):
+            raise RecoveryFailure(RecoveryReason.FETCH_FAILED, "same diagnostic")
+
+        ports.guard = fail
+        ports.recover_failure = lambda current, error: ExecutionOutcome(
+            ExecutionOutcomeKind.RETRY,
+            context=current,
+            recovery=decide(RecoveryObservation(
+                error.reason, current.repo, current.plan.plan_id,
+                current.phase.value, current.plan.plan_sha, current.base_sha,
+                "fetch", "worker-session", str(error),
+            ), attempts=3),
+        )
+
+        outcome = ExecutionPhaseCoordinator(ports).dispatch(context)
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
+        self.assertIs(outcome.context, context)
+        self.assertEqual(ports.worker.calls, [])
+
     def test_context_is_immutable_and_keeps_resume_identity(self):
         context = execution_context()
 
@@ -219,6 +246,31 @@ class ExecutionPhaseCoordinatorTests(unittest.TestCase):
 
 
 class ExecutionOutcomeAdapterTests(unittest.TestCase):
+    def test_agent_correction_defers_only_manager_rebase_and_worker_protocol(self):
+        cases = (
+            (RecoveryReason.REBASE_CONFLICT, ExecutionPhase.VERIFYING, 1),
+            (RecoveryReason.REBASE_CONFLICT, ExecutionPhase.IMPLEMENTING,
+             loop_manager.PROJECT_STEP_RETRY),
+            (RecoveryReason.WORKER_CORRECTION, ExecutionPhase.IMPLEMENTING, 1),
+            (RecoveryReason.WORKER_CORRECTION, ExecutionPhase.REVIEWING,
+             loop_manager.PROJECT_STEP_RETRY),
+        )
+        for reason, phase, expected in cases:
+            with self.subTest(reason=reason, phase=phase):
+                decision = decide(RecoveryObservation(
+                    reason, "/repo", "G-042", phase.value,
+                    "plan-sha", "base-sha", "fingerprint",
+                    "worker-session:head", "same failure",
+                ))
+                self.assertEqual(
+                    loop_manager._execution_outcome_step_result(ExecutionOutcome(
+                        ExecutionOutcomeKind.RETRY,
+                        context=execution_context(phase),
+                        recovery=decision,
+                    )),
+                    expected,
+                )
+
     def test_maps_all_typed_outcomes_to_existing_step_codes(self):
         expected = {
             ExecutionOutcomeKind.SUCCESS: 0,
@@ -229,6 +281,9 @@ class ExecutionOutcomeAdapterTests(unittest.TestCase):
                 loop_manager.PROJECT_STEP_TRANSIENT_PAUSE,
             ExecutionOutcomeKind.USAGE_PAUSE:
                 loop_manager.PROJECT_STEP_USAGE_PAUSE,
+            ExecutionOutcomeKind.PLANNING_PENDING:
+                loop_manager.PROJECT_STEP_PLANNING_PENDING,
+            ExecutionOutcomeKind.OPERATIONAL_ERROR: 1,
             ExecutionOutcomeKind.FINAL_BLOCK: 1,
         }
 

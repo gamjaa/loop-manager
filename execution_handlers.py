@@ -3,9 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Any
 from pathlib import Path
+import hashlib
 import json
 import sys
 from scoped_blocking import BlockReasonCode
+from recovery_runtime import (
+    RecoveryAction, RecoveryObservation, RecoveryReason, RecoveryFailure,
+    classify_exception,
+    TRANSIENT, RECONCILE, reason_from_block,
+)
+from recovery_dispatcher import RecoveryDispatcher
 from execution_revision import (DefinitionDelta, DefinitionSnapshot, RevisionGateKind,
     StageArtifacts, WORKER_INVALIDATING_DELTAS, decide_revision_gate)
 from execution_runtime import (ExecutionContext, ExecutionOutcome, ExecutionOutcomeKind,
@@ -130,9 +137,17 @@ class ExecutionHandlers:
         self._latest_verify_output = ''
         self._worker_publication = None
         self._definition_snapshot = None
+        self.recovery = RecoveryDispatcher(
+            effects.state.connection,
+            effects.blocking.block_active_execplan,
+            effects.blocking.block_active_execplan_from_revision,
+        )
 
     def _row(self):
         return self.effects.state.row()
+
+    def recover_failure(self, context, error):
+        return self._recover(error.reason, str(error), context=context)
 
     def _context(self):
         row = self._row()
@@ -219,12 +234,97 @@ class ExecutionHandlers:
     def _retry(detail=None):
         return ExecutionOutcome(ExecutionOutcomeKind.RETRY, detail=detail, error=detail is not None)
 
-    def _step_outcome(self, step_result):
-        kind = {0: ExecutionOutcomeKind.SUCCESS, self.effects.contract.PROJECT_STEP_RETRY: ExecutionOutcomeKind.RETRY, self.effects.contract.PROJECT_STEP_TRANSIENT_PAUSE: ExecutionOutcomeKind.TRANSIENT_PAUSE, self.effects.contract.PROJECT_STEP_USAGE_PAUSE: ExecutionOutcomeKind.USAGE_PAUSE}.get(
-            step_result,
-            ExecutionOutcomeKind.FINAL_BLOCK,
+    def _recover(self, reason, detail, *, context=None, fingerprint=None,
+                 progress_marker=None, final_block_reason=None,
+                 from_revision=False, correction_limit=None, attempts=0,
+                 user_targets=(), verify_result=None):
+        """Persist a typed decision and apply the final gate in one transaction."""
+
+        row = self._row()
+        plan_id = str(self.plan['id']) if self.plan is not None else self.effects.state.plan_id
+        base = str(row['active_sha'] or self.base_sha)
+        progress = progress_marker or '|'.join(str(row[key] or '') for key in (
+            'active_sha', 'worker_session_id', 'reviewer_session_id',
+            'worker_input_token', 'verify_token', 'review_token'))
+        fingerprint_input = (
+            f"{reason.value}|{row['phase']}|{base}"
+            if reason in TRANSIENT or reason in RECONCILE
+            else f"{reason.value}|{detail}"
         )
-        return ExecutionOutcome(kind, error=kind is ExecutionOutcomeKind.FINAL_BLOCK)
+        stable_fingerprint = fingerprint or hashlib.sha256(
+            fingerprint_input.encode()
+        ).hexdigest()
+        observation = RecoveryObservation(
+            reason=reason, repo=self.repo, plan_id=plan_id,
+            phase=str(row['phase'] or ''),
+            plan_revision=str(self.catalog_plan['current_revision_sha'] or '')
+            if self.catalog_plan is not None else None,
+            base_revision=base, fingerprint=stable_fingerprint,
+            progress_marker=progress, detail=detail,
+            user_targets=tuple(user_targets),
+        )
+        decision = self.recovery.apply(
+            observation,
+            worktree=Path(str(row['worktree'] or '')),
+            repo_path=self.repo_path,
+            revision=f"refs/remotes/origin/{self.base}",
+            verify_result=(str(row['verify_result'] or '')
+                           if verify_result is None else verify_result),
+            from_revision=from_revision,
+            correction_limit=correction_limit,
+            attempts=attempts,
+            final_block_reason=final_block_reason,
+        )
+        kind = {
+            RecoveryAction.RETRY: ExecutionOutcomeKind.RETRY,
+            RecoveryAction.RECONCILE: ExecutionOutcomeKind.RETRY,
+            RecoveryAction.CORRECT: ExecutionOutcomeKind.RETRY,
+            RecoveryAction.PAUSE: ExecutionOutcomeKind.TRANSIENT_PAUSE,
+            RecoveryAction.FINAL_BLOCK: ExecutionOutcomeKind.FINAL_BLOCK,
+        }[decision.action]
+        return ExecutionOutcome(kind, context=context, detail=detail,
+                                error=kind is ExecutionOutcomeKind.FINAL_BLOCK,
+                                recovery=decision)
+
+    def _block_final(self, repo, worktree, detail, verify_result, *, reason,
+                     recovery_reason=None, user_targets=()):
+        return self._recover(recovery_reason or reason_from_block(reason), detail,
+                             final_block_reason=reason,
+                             user_targets=user_targets,
+                             verify_result=verify_result)
+
+    def _metadata_correction(self, context, error, *, verify_result=None):
+        detail = f"ExecPlan metadata 검증 실패:\n{error}"
+        if context.resolving_rebase:
+            detail = self.effects.contract.REBASE_CONFLICT_PREFIX + detail
+        values = {'phase': 'WORKING', 'last_error': detail}
+        if verify_result is not None:
+            values['verify_result'] = verify_result
+        self.effects.state.update_project(self.repo, **values)
+        self.effects.events.operation_print(detail, file=sys.stderr)
+        return self._recover(
+            RecoveryReason.WORKER_CORRECTION, detail, context=context,
+            verify_result=verify_result,
+            final_block_reason=BlockReasonCode.PLAN_INPUT_INVALID,
+        )
+
+    def _block_from_revision_final(self, repo_path, repo, revision, detail,
+                                   verify_result='', *, reason):
+        return self._recover(
+            RecoveryReason.OWNERSHIP_UNCERTAIN, detail,
+            final_block_reason=reason, from_revision=True,
+            verify_result=verify_result,
+        )
+
+    def _step_outcome(self, step_result):
+        kind = {0: ExecutionOutcomeKind.SUCCESS, 1: ExecutionOutcomeKind.FINAL_BLOCK, self.effects.contract.PROJECT_STEP_RETRY: ExecutionOutcomeKind.RETRY, self.effects.contract.PROJECT_STEP_TRANSIENT_PAUSE: ExecutionOutcomeKind.TRANSIENT_PAUSE, self.effects.contract.PROJECT_STEP_USAGE_PAUSE: ExecutionOutcomeKind.USAGE_PAUSE, self.effects.contract.PROJECT_STEP_PLANNING_PENDING: ExecutionOutcomeKind.PLANNING_PENDING}.get(
+            step_result,
+            ExecutionOutcomeKind.OPERATIONAL_ERROR,
+        )
+        return ExecutionOutcome(kind, error=kind in {
+            ExecutionOutcomeKind.FINAL_BLOCK,
+            ExecutionOutcomeKind.OPERATIONAL_ERROR,
+        })
 
     def _advanced(self):
         return ExecutionOutcome.advanced(self._context())
@@ -287,22 +387,30 @@ class ExecutionHandlers:
                 allow_rebase=resolving_rebase,
             )
             self.effects.workspace.mark_execplan_workspace_owned(self.repo, plan_id)
-        except (RuntimeError, self.effects.contract.WorkspaceOwnershipError) as error:
+        except self.effects.contract.WorkspaceOwnershipError as error:
             workspace_error = f"관리 workspace 소유권/복구 검증 실패: {error}"
-            self.effects.blocking.block_active_execplan_from_revision(
-                self.repo_path,
-                self.repo,
-                f"refs/remotes/origin/{self.base}",
-                workspace_error,
-                str(row['verify_result'] or ''),
-                reason=BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN,
+            outcome = self._recover(
+                RecoveryReason.OWNERSHIP_UNCERTAIN, workspace_error,
+                from_revision=True,
             )
             self.effects.events.operation_print(workspace_error, file=sys.stderr)
-            return self._final(workspace_error)
+            return outcome
+        except (RuntimeError, OSError) as error:
+            detail = f"관리 workspace 복구 재시도: {error}"
+            self.effects.events.operation_print(detail, file=sys.stderr)
+            return self._recover(
+                classify_exception(error, operation=RecoveryReason.WORKTREE_RECOVERY_FAILED),
+                detail,
+            )
         if int(row['pr_conflict_recovery']):
             recovery_rebase = self.effects.workspace.resume_pr_conflict_rebase(self.repo_path, self.repo, row, worktree, branch)
             if recovery_rebase == 1:
                 return self._final()
+            if recovery_rebase == self.effects.contract.PROJECT_STEP_RETRY:
+                return self._recover(
+                    RecoveryReason.REBASE_CONTINUE_FAILED,
+                    str(self._row()['last_error'] or 'PR rebase 복구 재시도'),
+                )
             row = self._row()
             resolving_rebase = self._resolving_rebase(row)
         rebase_error = str(row['last_error'] or '')
@@ -455,7 +563,7 @@ class ExecutionHandlers:
                 )
             except self.effects.contract.PublicationSafetyError as error:
                 publication_error = str(error)
-                self.effects.blocking.block_active_execplan(
+                self._block_final(
                     self.repo,
                     context.worktree,
                     publication_error,
@@ -510,25 +618,21 @@ class ExecutionHandlers:
         )
         if rebased.returncode:
             rebase_failure = self.effects.contract.REBASE_CONFLICT_PREFIX + rebased.stdout[-8000:]
-            if self.effects.workspace._rebase_in_progress_for_branch(
+            in_progress = self.effects.workspace._rebase_in_progress_for_branch(
                 context.worktree, context.branch
-            ):
+            )
+            if in_progress:
                 self.effects.state.update_project(
                     self.repo,
                     phase='WORKING',
                     validated_base_sha=None,
                     last_error=rebase_failure,
                 )
-            else:
-                self.effects.blocking.block_active_execplan(
-                    self.repo,
-                    context.worktree,
-                    rebase_failure,
-                    str(row['verify_result'] or ''),
-                    reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
-                )
             self.effects.events.operation_print(rebase_failure, file=sys.stderr)
-            return self._final(rebase_failure)
+            return self._recover(
+                RecoveryReason.REBASE_CONFLICT if in_progress else RecoveryReason.WORKTREE_RECOVERY_FAILED,
+                rebase_failure, context=context,
+            )
         self.effects.state.update_project(self.repo, active_sha=latest_sha)
         if (
             decision.phase != 'IMPLEMENTING'
@@ -544,12 +648,13 @@ class ExecutionHandlers:
             no_change_error = (
                 f'{prefix}rebase 후 Worker 변경이 남지 않아 PR을 생성할 수 없습니다.'
             )
-            self.effects.blocking.block_active_execplan(
+            self._block_final(
                 self.repo,
                 context.worktree,
                 no_change_error,
                 str(row['verify_result'] or ''),
                 reason=BlockReasonCode.PLAN_INPUT_INVALID,
+                recovery_reason=RecoveryReason.NO_CHANGE,
             )
             self.effects.events.operation_print(no_change_error, file=sys.stderr)
             return self._final(no_change_error)
@@ -562,12 +667,13 @@ class ExecutionHandlers:
         return self._retry('최신 ExecPlan revision을 관리 worktree에 반영했습니다.')
 
     def _revision_error(self, context, detail):
-        self.effects.blocking.block_active_execplan(
+        self._block_final(
             self.repo,
             context.worktree,
             detail,
             str(self._row()['verify_result'] or ''),
             reason=BlockReasonCode.PLAN_INPUT_INVALID,
+            user_targets=(context.plan.path,),
         )
         self.effects.events.operation_print(detail, file=sys.stderr)
         return self._final(detail)
@@ -587,19 +693,29 @@ class ExecutionHandlers:
         )
         kind = getattr(getattr(result, 'kind', None), 'value', None)
         if kind == 'stale':
-            return self._retry('ExecPlan catalog revision이 변경되어 다시 평가합니다.')
+            return self._recover(
+                RecoveryReason.CATALOG_CACHE_STALE,
+                'ExecPlan catalog revision이 변경되어 다시 평가합니다.',
+                context=context,
+            )
         if kind == 'invalid-catalog':
             diagnostic = getattr(result, 'diagnostic', None)
             detail = str(getattr(diagnostic, 'message', None) or '원격 ExecPlan catalog가 유효하지 않습니다.')
             return self._final(detail)
         if str(getattr(result, 'revision_sha', '') or '') != latest_sha:
-            return self._retry(
-                '원격 base와 reconciled ExecPlan revision이 달라 다시 평가합니다.'
+            return self._recover(
+                RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                '원격 base와 reconciled ExecPlan revision이 달라 다시 평가합니다.',
+                context=context,
             )
 
         catalog_plan = self.effects.state.active_execplan(self.repo)
         if catalog_plan is None:
-            return self._final('revision gate에서 활성 ExecPlan을 찾을 수 없습니다.')
+            return ExecutionOutcome(
+                ExecutionOutcomeKind.OPERATIONAL_ERROR,
+                detail='revision gate에서 활성 ExecPlan을 찾을 수 없습니다.',
+                error=True,
+            )
         self.catalog_plan = catalog_plan
         self.plan = self._cached_plan(catalog_plan)
         try:
@@ -643,6 +759,8 @@ class ExecutionHandlers:
                 str(self._row()['active_sha'] or ''),
                 latest_sha,
             )
+        except RecoveryFailure:
+            raise
         except (RuntimeError, ValueError, self.effects.contract.RequirementArchiveError) as error:
             return self._revision_error(
                 context, f"ExecPlan revision gate 확인 실패: {error}"
@@ -751,7 +869,7 @@ class ExecutionHandlers:
                     'rebase 충돌 복구 중 ExecPlan 구현 입력이 변경되어 기존 '
                     'Worker 변경과 안전하게 결합할 수 없습니다.'
                 )
-                self.effects.blocking.block_active_execplan(
+                self._block_final(
                     self.repo,
                     context.worktree,
                     detail,
@@ -822,6 +940,8 @@ class ExecutionHandlers:
                         )
                     )
                 )
+        except RecoveryFailure:
+            raise
         except RuntimeError as error:
             return self._revision_error(context, str(error))
         return self._context()
@@ -901,9 +1021,9 @@ class ExecutionHandlers:
                 allowed_guidance_targets=guidance_targets,
                 allow_common_plans=allow_common_plans,
             )
-        except (self.effects.contract.AgentScopeError, self.effects.contract.WorkspaceOwnershipError, RuntimeError) as error:
+        except (self.effects.contract.AgentScopeError, self.effects.contract.WorkspaceOwnershipError) as error:
             scope_error = str(error)
-            self.effects.blocking.block_active_execplan(
+            self._block_final(
                 self.repo,
                 context.worktree,
                 scope_error,
@@ -912,6 +1032,15 @@ class ExecutionHandlers:
             )
             self.effects.events.operation_print(scope_error, file=sys.stderr)
             return self._final(scope_error)
+        except self.effects.contract.ExecPlanMetadataError as error:
+            return self._metadata_correction(context, error)
+        except RuntimeError as error:
+            detail = f"Worker workspace 상태 조회 재시도: {error}"
+            self.effects.events.operation_print(detail, file=sys.stderr)
+            return self._recover(
+                classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
+                detail, context=context,
+            )
         self.effects.agent.clear_agent_scope(self.repo)
         guarded = self._post_effect_guard(context)
         if isinstance(guarded, ExecutionOutcome):
@@ -938,23 +1067,27 @@ class ExecutionHandlers:
             worker_error = message or f"Agent 종료 코드 {code}"
             if result.result_kind is self.effects.contract.AgentResultKind.TRANSIENT_FAILURE:
                 worker_error = f"{self.effects.contract.TRANSIENT_AGENT_ERROR_PREFIX} {worker_error}"
-                outcome = ExecutionOutcomeKind.TRANSIENT_PAUSE
+                if context.resolving_rebase:
+                    worker_error = self.effects.contract.REBASE_CONFLICT_PREFIX + worker_error
+                self.effects.state.update_project(self.repo, phase='WORKING', last_error=worker_error)
+                self.effects.events.operation_print(worker_error, file=sys.stderr)
+                return self._recover(
+                    RecoveryReason.SERVICE_UNAVAILABLE, worker_error,
+                    context=context, attempts=3,
+                )
             elif result.result_kind is self.effects.contract.AgentResultKind.USAGE_LIMIT:
                 worker_error = f"{self.effects.contract.USAGE_LIMIT_ERROR_PREFIX} {worker_error}"
                 outcome = ExecutionOutcomeKind.USAGE_PAUSE
             elif context.resolving_rebase:
                 worker_error = self.effects.contract.REBASE_CONFLICT_PREFIX + worker_error
-                self.effects.blocking.block_active_execplan(
-                    self.repo,
-                    context.worktree,
-                    worker_error,
-                    str(row['verify_result'] or ''),
-                    reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
-                )
+                self.effects.state.update_project(self.repo, phase='WORKING', last_error=worker_error)
                 self.effects.events.operation_print(worker_error, file=sys.stderr)
-                return self._final(worker_error)
+                return self._recover(
+                    RecoveryReason.REBASE_CONFLICT, worker_error,
+                    context=context,
+                )
             else:
-                outcome = ExecutionOutcomeKind.FINAL_BLOCK
+                outcome = ExecutionOutcomeKind.OPERATIONAL_ERROR
             if context.resolving_rebase:
                 worker_error = self.effects.contract.REBASE_CONFLICT_PREFIX + worker_error
             self.effects.state.update_project(self.repo, phase='WORKING', last_error=worker_error)
@@ -968,7 +1101,10 @@ class ExecutionHandlers:
                 validation_error = self.effects.contract.REBASE_CONFLICT_PREFIX + validation_error
             self.effects.state.update_project(self.repo, phase='WORKING', last_error=validation_error)
             self.effects.events.operation_print(validation_error, file=sys.stderr)
-            return self._final(validation_error)
+            return self._recover(
+                RecoveryReason.WORKER_CORRECTION, validation_error,
+                context=context,
+            )
         return self._finish_worker(context, row, message)
 
     def _finish_worker(self, context, row, message):
@@ -979,15 +1115,9 @@ class ExecutionHandlers:
             staged = self.effects.workspace.git(context.worktree, 'diff', '--cached', '--quiet', check=False)
             if staged.returncode not in {0, 1}:
                 staging_error = f"rebase 충돌 해결 결과 확인 실패 (git 종료 코드 {staged.returncode})."
-                self.effects.blocking.block_active_execplan(
-                    self.repo,
-                    context.worktree,
-                    staging_error,
-                    str(row['verify_result'] or ''),
-                    reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE,
-                )
                 self.effects.events.operation_print(staging_error, file=sys.stderr)
-                return self._final(staging_error)
+                return self._recover(RecoveryReason.STAGE_FAILED, staging_error,
+                                     context=context)
             if staged.returncode == 0:
                 continued = self.effects.workspace.git(context.worktree, 'rebase', '--skip', check=False)
             else:
@@ -1001,26 +1131,23 @@ class ExecutionHandlers:
                 )
             if continued.returncode:
                 continuation_error = self.effects.contract.REBASE_CONFLICT_PREFIX + continued.stdout[-8000:]
-                if not self.effects.workspace._rebase_in_progress_for_branch(context.worktree, context.branch):
-                    self.effects.blocking.block_active_execplan(
-                        self.repo,
-                        context.worktree,
-                        continuation_error,
-                        str(row['verify_result'] or ''),
-                        reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
-                    )
-                else:
+                in_progress = self.effects.workspace._rebase_in_progress_for_branch(context.worktree, context.branch)
+                if in_progress:
                     self.effects.state.update_project(self.repo, phase='WORKING', last_error=continuation_error)
                 self.effects.events.operation_print(continuation_error, file=sys.stderr)
-                return self._final(continuation_error)
+                return self._recover(
+                    RecoveryReason.REBASE_CONFLICT if in_progress else RecoveryReason.REBASE_CONTINUE_FAILED,
+                    continuation_error, context=context,
+                )
             if not self.effects.workspace.branch_has_changes(context.worktree, self.base):
                 no_change_error = 'rebase 충돌 해결 후 Worker 변경이 남지 않아 PR을 생성할 수 없습니다.'
-                self.effects.blocking.block_active_execplan(
+                self._block_final(
                     self.repo,
                     context.worktree,
                     no_change_error,
                     str(row['verify_result'] or ''),
                     reason=BlockReasonCode.PLAN_INPUT_INVALID,
+                    recovery_reason=RecoveryReason.NO_CHANGE,
                 )
                 self.effects.events.operation_print(no_change_error, file=sys.stderr)
                 return self._final(no_change_error)
@@ -1051,6 +1178,16 @@ class ExecutionHandlers:
                     post_worker_revision,
                     str(self.plan['id']),
                 )
+            except self.effects.contract.RequirementArchiveError as error:
+                archive_error = f"Requirement archive eligibility 확인 실패: {error}"
+                self._block_final(
+                    self.repo, context.worktree, archive_error,
+                    str(row['verify_result'] or ''),
+                    reason=BlockReasonCode.PLAN_INPUT_INVALID,
+                )
+                self.effects.events.operation_print(archive_error, file=sys.stderr)
+                return self._final(archive_error)
+            try:
                 actual_archives = self.effects.archive.requirement_archive_move_set(
                     self.repo_path,
                     post_worker_revision,
@@ -1058,15 +1195,21 @@ class ExecutionHandlers:
                 )
             except self.effects.contract.RequirementArchiveError as error:
                 archive_error = f"Requirement archive 이동 검증 실패: {error}"
-                self.effects.blocking.block_active_execplan(
-                    self.repo,
-                    context.worktree,
-                    archive_error,
-                    str(row['verify_result'] or ''),
-                    reason=BlockReasonCode.PLAN_INPUT_INVALID,
+                self.effects.state.update_project(
+                    self.repo, phase='WORKING', validated_base_sha=None,
+                    worker_result=message,
+                    worker_input_token=None, archive_token=None,
+                    verify_token=None, review_token=None,
+                    publication_token=None, last_error=archive_error,
                 )
-                self.effects.events.operation_print(archive_error, file=sys.stderr)
-                return self._final(archive_error)
+                self.effects.events.operation_print(
+                    'Requirement archive 이동을 같은 Worker 세션에서 다시 확인합니다.',
+                    file=sys.stderr,
+                )
+                return self._recover(
+                    RecoveryReason.ARCHIVE_MOVE_MISMATCH,
+                    archive_error, context=context,
+                )
             archive_error = self.effects.archive.requirement_archive_reconciliation_error(expected_archives, actual_archives)
             if archive_error is not None:
                 self.effects.state.update_project(
@@ -1074,8 +1217,6 @@ class ExecutionHandlers:
                     phase='WORKING',
                     validated_base_sha=None,
                     worker_result=message,
-                    verify_result=None,
-                    review_result=None,
                     worker_input_token=None,
                     archive_token=None,
                     verify_token=None,
@@ -1083,8 +1224,17 @@ class ExecutionHandlers:
                     publication_token=None,
                     last_error=archive_error,
                 )
-                self.effects.events.operation_print(archive_error, file=sys.stderr)
-                return self._retry(archive_error)
+                self.effects.events.operation_print(
+                    'Requirement archive 이동 집합을 같은 Worker 세션에서 다시 맞춥니다.',
+                    file=sys.stderr,
+                )
+                return self._recover(
+                    RecoveryReason.ARCHIVE_MOVE_MISMATCH,
+                    archive_error, context=context,
+                    fingerprint=hashlib.sha256(
+                        json.dumps((sorted(expected_archives or ()), sorted(actual_archives or ()))).encode()
+                    ).hexdigest(),
+                )
         self.effects.state.update_project(
             self.repo,
             phase='VERIFYING',
@@ -1128,9 +1278,9 @@ class ExecutionHandlers:
                 self.catalog_plan,
                 verify_scope_before,
             )
-        except (self.effects.contract.AgentScopeError, self.effects.contract.WorkspaceOwnershipError, RuntimeError) as error:
+        except (self.effects.contract.AgentScopeError, self.effects.contract.WorkspaceOwnershipError) as error:
             scope_error = str(error)
-            self.effects.blocking.block_active_execplan(
+            self._block_final(
                 self.repo,
                 context.worktree,
                 scope_error,
@@ -1139,6 +1289,17 @@ class ExecutionHandlers:
             )
             self.effects.events.operation_print(scope_error, file=sys.stderr)
             return (self._final(scope_error), output)
+        except self.effects.contract.ExecPlanMetadataError as error:
+            return (self._metadata_correction(
+                context, error, verify_result=output,
+            ), output)
+        except RuntimeError as error:
+            detail = f"verify workspace 상태 조회 재시도: {error}"
+            self.effects.events.operation_print(detail, file=sys.stderr)
+            return (self._recover(
+                classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
+                detail, context=context,
+            ), output)
         self.effects.agent.clear_agent_scope(self.repo)
         guarded = self._post_effect_guard(context)
         if isinstance(guarded, ExecutionOutcome):
@@ -1158,8 +1319,15 @@ class ExecutionHandlers:
             )
             self.effects.events.operation_print(output, file=sys.stderr)
             if decision.blocked:
-                return (self._final(output), output)
-            return (self._retry(output), output)
+                return (ExecutionOutcome(
+                    ExecutionOutcomeKind.FINAL_BLOCK, detail=output, error=True,
+                    recovery=getattr(decision, 'recovery', None),
+                ), output)
+            return (self._recover(
+                RecoveryReason.WORKER_CORRECTION, output,
+                context=context, fingerprint=decision.fingerprint,
+                correction_limit=self.effects.contract.MAX_VALIDATION_FINGERPRINT_REPEATS + 1,
+            ), output)
         self.effects.validation.clear_validation_failure_history(self.repo, 'verify')
         return (None, output)
 
@@ -1180,19 +1348,23 @@ class ExecutionHandlers:
             validation_error = f"Worker 결과 검증 실패:\n{error}"
             self.effects.state.update_project(self.repo, phase='WORKING', last_error=validation_error)
             self.effects.events.operation_print(validation_error, file=sys.stderr)
-            return self._final(validation_error)
+            return self._recover(
+                RecoveryReason.WORKER_CORRECTION, validation_error,
+                context=context,
+            )
         outcome, output = self._verify_once(context)
         if outcome is not None:
             return outcome
         dirty = bool(self.effects.workspace.git(context.worktree, 'status', '--porcelain').stdout.strip())
         if not dirty and (not self.effects.workspace.branch_has_changes(context.worktree, self.base)):
             no_change_error = 'Worker가 변경을 만들지 않아 PR을 생성할 수 없습니다. ExecPlan은 연결된 PR의 Merge가 확인된 경우에만 MERGED가 됩니다.'
-            self.effects.blocking.block_active_execplan(
+            self._block_final(
                 self.repo,
                 context.worktree,
                 no_change_error,
                 output,
                 reason=BlockReasonCode.PLAN_INPUT_INVALID,
+                recovery_reason=RecoveryReason.NO_CHANGE,
             )
             self.effects.events.operation_print(no_change_error, file=sys.stderr)
             return self._final(no_change_error)
@@ -1239,7 +1411,8 @@ class ExecutionHandlers:
         )
         rebased = self.effects.workspace.git(context.worktree, 'rebase', latest_sha, check=False)
         if rebased.returncode:
-            if self.effects.workspace._rebase_in_progress_for_branch(context.worktree, context.branch):
+            in_progress = self.effects.workspace._rebase_in_progress_for_branch(context.worktree, context.branch)
+            if in_progress:
                 if self.effects.agent.validate_guidance_publication(
                     self.repo,
                     context.worktree,
@@ -1258,18 +1431,14 @@ class ExecutionHandlers:
                 )
             else:
                 rebase_failure = f"{prefix}rebase 실패:\n{rebased.stdout[-8000:]}"
-                self.effects.blocking.block_active_execplan(
-                    self.repo,
-                    context.worktree,
-                    rebase_failure,
-                    evidence,
-                    reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
-                )
             self.effects.events.operation_print(
                 rebase_failure if publishing else rebased.stdout,
                 file=sys.stderr,
             )
-            return self._final(rebase_failure)
+            return self._recover(
+                RecoveryReason.REBASE_CONFLICT if in_progress else RecoveryReason.WORKTREE_RECOVERY_FAILED,
+                rebase_failure, context=context,
+            )
         self.effects.state.update_project(
             self.repo,
             active_sha=latest_sha,
@@ -1349,9 +1518,11 @@ class ExecutionHandlers:
                 context.plan.path,
                 self.catalog_plan,
             )
+        except RecoveryFailure:
+            raise
         except RuntimeError as error:
             metadata_error = str(error)
-            self.effects.blocking.block_active_execplan(
+            self._block_final(
                 self.repo,
                 context.worktree,
                 metadata_error,
@@ -1362,12 +1533,13 @@ class ExecutionHandlers:
             return self._final(metadata_error)
         if not self.effects.workspace.branch_has_changes(context.worktree, self.base):
             no_change_error = 'rebase 후 Worker 변경이 남지 않아 PR을 생성할 수 없습니다. ExecPlan은 연결된 PR의 Merge가 확인된 경우에만 MERGED가 됩니다.'
-            self.effects.blocking.block_active_execplan(
+            self._block_final(
                 self.repo,
                 context.worktree,
                 no_change_error,
                 output,
                 reason=BlockReasonCode.PLAN_INPUT_INVALID,
+                recovery_reason=RecoveryReason.NO_CHANGE,
             )
             self.effects.events.operation_print(no_change_error, file=sys.stderr)
             return self._final(no_change_error)
@@ -1430,9 +1602,9 @@ class ExecutionHandlers:
                     base_branch=self.base,
                 )
                 self.effects.workspace.validate_managed_worktree(self.repo_path, context.worktree, context.branch)
-            except (self.effects.contract.AgentScopeError, self.effects.contract.WorkspaceOwnershipError, RuntimeError) as error:
+            except (self.effects.contract.AgentScopeError, self.effects.contract.WorkspaceOwnershipError) as error:
                 scope_error = str(error)
-                self.effects.blocking.block_active_execplan(
+                self._block_final(
                     self.repo,
                     context.worktree,
                     scope_error,
@@ -1441,6 +1613,13 @@ class ExecutionHandlers:
                 )
                 self.effects.events.operation_print(scope_error, file=sys.stderr)
                 return self._final(scope_error)
+            except RuntimeError as error:
+                detail = f"Reviewer workspace 상태 조회 재시도: {error}"
+                self.effects.events.operation_print(detail, file=sys.stderr)
+                return self._recover(
+                    classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
+                    detail, context=context,
+                )
             self.effects.agent.clear_agent_scope(self.repo)
             guarded = self._post_effect_guard(context)
             if isinstance(guarded, ExecutionOutcome):
@@ -1451,12 +1630,20 @@ class ExecutionHandlers:
                 reviewer_error = review or f"Reviewer 종료 코드 {code}"
                 if review_result.result_kind is self.effects.contract.AgentResultKind.TRANSIENT_FAILURE:
                     reviewer_error = f"{self.effects.contract.TRANSIENT_AGENT_ERROR_PREFIX} {reviewer_error}"
-                    outcome = ExecutionOutcomeKind.TRANSIENT_PAUSE
+                    self.effects.state.update_project(
+                        self.repo, phase='REVIEWING', last_error=reviewer_error,
+                        review_result=review,
+                    )
+                    self.effects.events.operation_print(reviewer_error, file=sys.stderr)
+                    return self._recover(
+                        RecoveryReason.SERVICE_UNAVAILABLE, reviewer_error,
+                        context=context, attempts=3,
+                    )
                 elif review_result.result_kind is self.effects.contract.AgentResultKind.USAGE_LIMIT:
                     reviewer_error = f"{self.effects.contract.USAGE_LIMIT_ERROR_PREFIX} {reviewer_error}"
                     outcome = ExecutionOutcomeKind.USAGE_PAUSE
                 else:
-                    outcome = ExecutionOutcomeKind.FINAL_BLOCK
+                    outcome = ExecutionOutcomeKind.OPERATIONAL_ERROR
                 self.effects.state.update_project(
                     self.repo,
                     phase='REVIEWING',
@@ -1478,7 +1665,7 @@ class ExecutionHandlers:
                 )
                 if protocol_attempt == self.effects.contract.MAX_REVIEWER_PROTOCOL_ATTEMPTS:
                     exhausted_error = f"{reviewer_error} (프로토콜 교정 {self.effects.contract.MAX_REVIEWER_PROTOCOL_ATTEMPTS}회 실패)"
-                    self.effects.blocking.block_active_execplan(
+                    self._block_final(
                         self.repo,
                         context.worktree,
                         exhausted_error,
@@ -1505,8 +1692,15 @@ class ExecutionHandlers:
             )
             self.effects.events.operation_print(review or 'Reviewer 결과가 유효하지 않습니다.', file=sys.stderr)
             if decision.blocked:
-                return self._final(review)
-            return self._retry(review)
+                return ExecutionOutcome(
+                    ExecutionOutcomeKind.FINAL_BLOCK, detail=review, error=True,
+                    recovery=getattr(decision, 'recovery', None),
+                )
+            return self._recover(
+                RecoveryReason.WORKER_CORRECTION, review,
+                context=context, fingerprint=decision.fingerprint,
+                correction_limit=self.effects.contract.MAX_VALIDATION_FINGERPRINT_REPEATS + 1,
+            )
         self.effects.validation.clear_validation_failure_history(self.repo, 'review')
         self.effects.state.update_project(
             self.repo,
@@ -1540,7 +1734,7 @@ class ExecutionHandlers:
                 )
         except self.effects.contract.PublicationSafetyError as error:
             publication_error = str(error)
-            self.effects.blocking.block_active_execplan(
+            self._block_final(
                 self.repo,
                 context.worktree,
                 publication_error,
@@ -1562,12 +1756,13 @@ class ExecutionHandlers:
                     return outcome
                 if not self.effects.workspace.branch_has_changes(context.worktree, self.base):
                     no_change_error = '게시 직전 rebase 후 Worker 변경이 남지 않아 PR을 생성할 수 없습니다.'
-                    self.effects.blocking.block_active_execplan(
+                    self._block_final(
                         self.repo,
                         context.worktree,
                         no_change_error,
                         str(row['verify_result'] or ''),
                         reason=BlockReasonCode.PLAN_INPUT_INVALID,
+                        recovery_reason=RecoveryReason.NO_CHANGE,
                     )
                     self.effects.events.operation_print(no_change_error, file=sys.stderr)
                     return self._final(no_change_error)
@@ -1601,16 +1796,34 @@ class ExecutionHandlers:
             )
             return self._retry()
         if row['active_sha'] != latest_sha:
-            publication_error = '검증 base와 관리 branch의 반영 base가 일치하지 않습니다.'
-            self.effects.blocking.block_active_execplan(
-                self.repo,
-                context.worktree,
-                publication_error,
-                str(row['verify_result'] or ''),
-                reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE,
+            ancestry = self.effects.workspace.git(
+                context.worktree, 'merge-base', '--is-ancestor',
+                latest_sha, 'HEAD', check=False,
             )
-            self.effects.events.operation_print(publication_error, file=sys.stderr)
-            return self._final(publication_error)
+            if ancestry.returncode not in {0, 1}:
+                return self._recover(
+                    RecoveryReason.STATUS_FAILED,
+                    f"게시 checkpoint ancestry 조회 실패: {ancestry.stdout[-8000:]}",
+                    context=context,
+                )
+            if ancestry.returncode == 1:
+                outcome = self._rebase_latest(
+                    context, row, latest_sha, publishing=True,
+                    evidence=str(row['verify_result'] or ''),
+                )
+                if outcome is not None:
+                    return outcome
+            self.effects.state.update_project(
+                self.repo, active_sha=latest_sha, validated_base_sha=None,
+                phase='VERIFYING', verify_result=None, review_result=None,
+                verify_token=None, review_token=None, publication_token=None,
+                last_error=None,
+            )
+            return self._recover(
+                RecoveryReason.CHECKPOINT_STALE,
+                '관리 branch의 실제 HEAD와 최신 base에서 게시 checkpoint를 재구성했습니다.',
+                context=context,
+            )
         return None
 
     def publish(self, context, latest_base):
@@ -1636,7 +1849,7 @@ class ExecutionHandlers:
                 row = self._row()
             except self.effects.contract.PublicationSafetyError as error:
                 publication_error = f"기존 PR 복구 거부: {error}"
-                self.effects.blocking.block_active_execplan(
+                self._block_final(
                     self.repo,
                     context.worktree,
                     publication_error,
@@ -1658,6 +1871,16 @@ class ExecutionHandlers:
                     latest_sha,
                     str(self.plan['id']),
                 )
+            except self.effects.contract.RequirementArchiveError as error:
+                archive_error = f"게시 직전 Requirement archive eligibility 확인 실패: {error}"
+                self._block_final(
+                    self.repo, context.worktree, archive_error,
+                    str(row['verify_result'] or ''),
+                    reason=BlockReasonCode.PLAN_INPUT_INVALID,
+                )
+                self.effects.events.operation_print(archive_error, file=sys.stderr)
+                return self._final(archive_error)
+            try:
                 final_archive_moves = self.effects.archive.requirement_archive_move_set(
                     self.repo_path,
                     latest_sha,
@@ -1666,15 +1889,20 @@ class ExecutionHandlers:
                 )
             except self.effects.contract.RequirementArchiveError as error:
                 archive_error = f"게시 직전 Requirement archive 확인 실패: {error}"
-                self.effects.blocking.block_active_execplan(
-                    self.repo,
-                    context.worktree,
-                    archive_error,
-                    str(row['verify_result'] or ''),
-                    reason=BlockReasonCode.PLAN_INPUT_INVALID,
+                self.effects.state.update_project(
+                    self.repo, phase='WORKING', validated_base_sha=None,
+                    worker_input_token=None, archive_token=None,
+                    verify_token=None, review_token=None,
+                    publication_token=None, last_error=archive_error,
                 )
-                self.effects.events.operation_print(archive_error, file=sys.stderr)
-                return self._final(archive_error)
+                self.effects.events.operation_print(
+                    '게시 직전 Requirement archive 이동을 다시 확인합니다.',
+                    file=sys.stderr,
+                )
+                return self._recover(
+                    RecoveryReason.ARCHIVE_MOVE_MISMATCH,
+                    archive_error, context=context,
+                )
             archive_error = self.effects.archive.requirement_archive_reconciliation_error(
                 final_archive_candidates,
                 final_archive_moves,
@@ -1684,8 +1912,6 @@ class ExecutionHandlers:
                     self.repo,
                     phase='WORKING',
                     validated_base_sha=None,
-                    verify_result=None,
-                    review_result=None,
                     worker_input_token=None,
                     archive_token=None,
                     verify_token=None,
@@ -1693,8 +1919,17 @@ class ExecutionHandlers:
                     publication_token=None,
                     last_error=archive_error,
                 )
-                self.effects.events.operation_print(archive_error, file=sys.stderr)
-                return self._retry(archive_error)
+                self.effects.events.operation_print(
+                    '게시 직전 Requirement archive 이동 집합을 다시 맞춥니다.',
+                    file=sys.stderr,
+                )
+                return self._recover(
+                    RecoveryReason.ARCHIVE_MOVE_MISMATCH,
+                    archive_error, context=context,
+                    fingerprint=hashlib.sha256(
+                        json.dumps((sorted(final_archive_candidates or ()), sorted(final_archive_moves or ()))).encode()
+                    ).hexdigest(),
+                )
         if self.effects.agent.validate_guidance_publication(
             self.repo,
             context.worktree,
@@ -1709,12 +1944,13 @@ class ExecutionHandlers:
         row = self._row()
         if not self.effects.workspace.branch_has_changes(context.worktree, self.base):
             no_change_error = '게시할 Worker 변경이 남지 않아 PR을 생성할 수 없습니다.'
-            self.effects.blocking.block_active_execplan(
+            self._block_final(
                 self.repo,
                 context.worktree,
                 no_change_error,
                 str(row['verify_result'] or ''),
                 reason=BlockReasonCode.PLAN_INPUT_INVALID,
+                recovery_reason=RecoveryReason.NO_CHANGE,
             )
             self.effects.events.operation_print(no_change_error, file=sys.stderr)
             return self._final(no_change_error)
@@ -1734,7 +1970,7 @@ class ExecutionHandlers:
         current_pr = self.effects.publication.pr_for_branch(self.repo_path, context.branch, str(row['pr_url'] or ''))
         if current_pr is None:
             publication_error = '게시 직전 저장된 기존 PR을 다시 조회할 수 없습니다.'
-            self.effects.blocking.block_active_execplan(
+            self._block_final(
                 self.repo,
                 context.worktree,
                 publication_error,
@@ -1764,7 +2000,7 @@ class ExecutionHandlers:
             )
         except self.effects.contract.PublicationSafetyError as error:
             publication_error = str(error)
-            self.effects.blocking.block_active_execplan(
+            self._block_final(
                 self.repo,
                 context.worktree,
                 publication_error,
@@ -1777,7 +2013,10 @@ class ExecutionHandlers:
             publication_error = str(error)
             self.effects.state.update_project(self.repo, phase='PUBLISHING', last_error=publication_error)
             self.effects.events.operation_print(publication_error, file=sys.stderr)
-            return self._final(publication_error)
+            return self._recover(
+                classify_exception(error, operation=RecoveryReason.PUBLICATION_RETRY),
+                publication_error, context=context,
+            )
         guarded = self._post_effect_guard(context)
         if isinstance(guarded, ExecutionOutcome):
             return guarded
@@ -1807,7 +2046,7 @@ class ExecutionHandlers:
         )
         if not plan_sha:
             plan_error = '계획 commit SHA가 없습니다.'
-            self.effects.blocking.block_active_execplan(
+            self._block_final(
                 self.repo,
                 context.worktree,
                 plan_error,
@@ -1831,7 +2070,10 @@ class ExecutionHandlers:
                 last_error=validation_error,
             )
             self.effects.events.operation_print(validation_error, file=sys.stderr)
-            return self._final(validation_error)
+            return self._recover(
+                RecoveryReason.WORKER_CORRECTION, validation_error,
+                context=context,
+            )
         origin_url = self.effects.workspace.git(context.worktree, 'remote', 'get-url', 'origin').stdout.strip()
         body = self.effects.publication.build_pr_body(
             worker_publication,
@@ -1851,7 +2093,7 @@ class ExecutionHandlers:
             )
         except self.effects.contract.PublicationSafetyError as error:
             publication_error = str(error)
-            self.effects.blocking.block_active_execplan(
+            self._block_final(
                 self.repo,
                 context.worktree,
                 publication_error,
@@ -1864,16 +2106,30 @@ class ExecutionHandlers:
             publication_error = str(error)
             self.effects.state.update_project(self.repo, phase='PUBLISHING', last_error=publication_error)
             self.effects.events.operation_print(publication_error, file=sys.stderr)
-            return self._final(publication_error)
+            return self._recover(
+                classify_exception(error, operation=RecoveryReason.PUBLICATION_RETRY),
+                publication_error, context=context,
+            )
         guarded = self._post_effect_guard(context)
         if isinstance(guarded, ExecutionOutcome):
             return guarded
         context = guarded
         title = f"Implement {self.plan['id']}: {self.plan['title']}"
-        created = self.effects.publication.command(
-            ['gh', 'pr', 'create', '--base', self.base, '--head', context.branch, '--title', title, '--body', body],
-            cwd=context.worktree,
-        )
+        try:
+            created = self.effects.publication.command(
+                ['gh', 'pr', 'create', '--base', self.base, '--head', context.branch, '--title', title, '--body', body],
+                cwd=context.worktree,
+            )
+        except RuntimeError as error:
+            publication_error = str(error)
+            self.effects.state.update_project(
+                self.repo, phase='PUBLISHING', last_error=publication_error,
+            )
+            self.effects.events.operation_print(publication_error, file=sys.stderr)
+            return self._recover(
+                classify_exception(error, operation=RecoveryReason.PUBLICATION_RETRY),
+                publication_error, context=context,
+            )
         url = created.stdout.strip().splitlines()[-1]
         self.effects.state.open_pull_request(self.repo, pr_url=url, pr_head_oid=head_oid)
         self.effects.events.operation_print(f"PR 생성 완료: {url}")

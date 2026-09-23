@@ -548,6 +548,14 @@ class OriginIsolatedRegistrationAndExecutionTest(unittest.TestCase):
             )
         self.assertEqual(result.kind, loop_manager.ProjectRunKind.TRANSIENT_PAUSE)
         self.assertEqual(result.exit_code, 0)
+        self.assertEqual(
+            connection.execute(
+                "SELECT reason_code, pending_action FROM recovery_records "
+                "WHERE repo = ? AND subject = '__project__'",
+                ("/repo",),
+            ).fetchone(),
+            ("git_lock", "pause"),
+        )
 
     def test_launchers_only_start_the_python_bootstrap(self):
         bash = (loop_manager.ROOT / "run.sh").read_text(encoding="utf-8")

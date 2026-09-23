@@ -296,7 +296,7 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 - 기존 ExecPlan의 활성 Requirement source가 없으면 동일 파일명의 `docs/requirements/archive/` 문서를 조회하되 원래 source 경로는 바꾸지 않는다
 - 새 ExecPlan의 source와 Planner 입력은 활성 PRODUCT 또는 `docs/requirements/` 바로 아래 문서로 제한한다
 - 현재 ExecPlan을 제외한 모든 관련 ExecPlan이 MERGED인 Requirement만 archive 후보이며, 이미 모든 관련 계획이 MERGED인 과거 Requirement도 후보에 포함한다
-- archive 대상 충돌이나 source 관계·상태 불확실성은 덮어쓰기 없이 현재 ExecPlan을 `PLAN_BLOCKED`로 만든다
+- archive 이동 집합의 결정적인 차이는 같은 Worker 문맥에서 한도 내 교정하고, 최신 base·catalog 시차는 신뢰할 수 있는 원본으로 재평가한다. 이동 목적지 충돌이나 source 관계·상태를 끝내 하나로 확정할 수 없을 때만 덮어쓰기 없이 현재 ExecPlan을 `PLAN_BLOCKED`로 만든다
 - `PLAN_BLOCKED` 해제 지문은 원래 활성 Requirement 경로만 사용하고 archive 변경에는 반응하지 않는다
 - Requirement는 PRODUCT의 변경 요청이며 ExecPlan의 구현 상세나 실행 상태를 포함하지 않는다
 - Requirement 파일 경로를 안정적인 식별자로 사용한다
@@ -346,6 +346,14 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 - `PLAN_BLOCKED` 또는 안정된 `PR_OPEN`이 있어도 직접·간접 dependency가 모두 MERGED인 독립 READY 하나를 기존 priority와 숫자 ID 순으로 시작한다. 독립 READY가 없으면 일반 Planner나 유지보수 Planner를 실행하지 않는다
 - `PROJECT_BLOCKED` 동안에는 새 Planner, maintenance Planner, Worker와 저장소 변경 단계를 시작하지 않는다
 
+### 복구 판단과 최종 차단
+
+- 차단 후보는 disposition, 안정적인 원인 code, plan ID, phase, plan/base revision, 진단 지문과 진전 marker로 기록한다. 복구 disposition과 `PLAN_BLOCKED`/`PROJECT_BLOCKED` scope는 별도 기준이며 최종 사용자 조치가 확정된 뒤에만 원인 code로 scope를 정한다
+- 일시적 Git·서비스 실패는 현재 실행을 보존해 다음 실행에서 재시도하고, 유효한 최신 base·catalog 및 실제 소유 Git 상태로 하나의 다음 단계를 확정할 수 있으면 상태를 재구성한다. archive 이동 집합과 rebase 충돌은 진전과 반복 한도를 기록하며 교정한다. Manager가 처음 rebase 충돌을 관측하거나 Worker 결과 형식 오류를 받으면 현재 실행을 끝내고 다음 실행에서 보존된 Worker 세션으로 재개한다. 진행 중인 Worker·검증·Review 교정은 같은 실행에서 이어갈 수 있다
+- 일시 재시도, 상태 재구성, 한도 내 Agent 교정은 현재 phase, branch, worktree, 소유권, Agent session, 승인, 변경, 검증 원문과 실패 이력을 보존하며 차단, 원격 checkpoint, BLOCKED 알림을 만들지 않는다. 한 실행에서 최신 원격 snapshot이 안정되지 않으면 같은 상태로 일시 중단하고 다음 실행에서 다시 판정한다
+- 승인·PR reopen·소유권·Agent 범위·원격 OID 불확실성, 안전한 원본으로 확정할 수 없는 손상, 반복 한도 소진과 의미를 확정할 수 없는 무변경 결과만 최종 사용자 조치로 차단한다. 최종 기록에는 복구 횟수, 마지막 안정 revision, 남은 불확실성과 실제 조치 대상을 포함한다
+- 최종 `PLAN_BLOCKED`만 안전한 원격 checkpoint 대상이다. BLOCKED 알림은 최종 차단 transaction과 checkpoint 결과 뒤에 생성하고 동일 plan/scope/reason/fingerprint/revision은 한 번만 알린다. 사용자 수정 경로는 원인이 실제 대상을 제공할 때만 표시한다
+
 ### Model과 Effort 선택
 
 - Planner가 ExecPlan의 complexity와 risk를 판단한다
@@ -389,7 +397,7 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 - Telegram token과 chat ID가 모두 설정된 경우에만 알림을 생성하고 전송한다
 - 두 값이 모두 비어 있으면 알림을 비활성화하며 작업 흐름에는 영향을 주지 않는다
 - PR 생성 알림에는 PR 링크가 포함돼야 한다
-- 차단 알림에는 scope, 구조화 원인, 관련 ExecPlan, 수정 가능한 파일 경로와 checkpoint 성공 시 원격 commit link·OID 또는 미게시 시 local-only 보존 이유가 포함돼야 한다
-- 차단 알림은 scope·원인·관련 ExecPlan identity가 같을 때만 같은 사건으로 중복 제거한다
+- 차단 알림에는 scope, 구조화 원인, 관련 ExecPlan, 실제 수정 대상이 확인된 경우에만 그 경로, checkpoint 성공 시 원격 commit link·OID 또는 미게시 시 local-only 보존 이유가 포함돼야 한다
+- 차단 알림은 plan·scope·원인·지문·revision이 같을 때 같은 사건으로 중복 제거한다
 - 프로젝트 완료 알림은 해당 프로젝트의 현재 작업 주기가 완료됐을 때 전송한다
 - 동일한 이벤트는 한 번만 전송하며 실패한 알림만 다음 실행에서 재시도한다
