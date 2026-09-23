@@ -695,6 +695,32 @@ class ExecutionHandlers:
             user_targets=(error.path,),
         )
 
+    def _archive_workspace_owned(self, context):
+        active = self.effects.state.active_execplan(self.repo)
+        if not (
+            active is not None
+            and str(active['plan_id']) == context.plan.plan_id
+            and int(active['workspace_owned']) == self.effects.contract.WORKSPACE_OWNED
+            and str(active['branch'] or '') == context.branch
+            and str(active['worktree'] or '') == str(context.worktree)
+            and context.plan.plan_sha
+        ):
+            return False
+        try:
+            self.effects.workspace.validate_managed_worktree(
+                self.repo_path, context.worktree, context.branch
+            )
+            return self.effects.workspace.git(
+                context.worktree, 'merge-base', '--is-ancestor',
+                context.plan.plan_sha, 'HEAD', check=False,
+            ).returncode == 0
+        except self.effects.contract.WorkspaceOwnershipError:
+            return False
+        except self.effects.contract.GitLockError as error:
+            raise RecoveryFailure(RecoveryReason.GIT_LOCK, str(error)) from error
+        except (RuntimeError, OSError) as error:
+            raise RecoveryFailure(RecoveryReason.STATUS_FAILED, str(error)) from error
+
     def guard(self, context):
         """Refresh and reconcile before any phase effect consumes its snapshot."""
 
@@ -947,6 +973,16 @@ class ExecutionHandlers:
             return self._context()
         if str(row['active_sha'] or '') != latest_sha:
             if self._archive_snapshot is not None:
+                try:
+                    workspace_owned = self._archive_workspace_owned(context)
+                except RecoveryFailure as error:
+                    return self._recover(error.reason, str(error), context=context)
+                if not workspace_owned:
+                    return self._recover(
+                        RecoveryReason.OWNERSHIP_UNCERTAIN,
+                        'Requirement archive 관리 worktree와 ExecPlan HEAD의 소유권을 확인할 수 없습니다.',
+                        context=context,
+                    )
                 repository = ArchiveTargetRepository(self.effects.state.connection)
                 previous_target = repository.get(self.repo, str(self.plan['id']))
                 try:
@@ -1026,36 +1062,6 @@ class ExecutionHandlers:
                     'Requirement archive 복구 중 새 원격 base를 관측했습니다.',
                 )
 
-            def workspace_owned():
-                active = self.effects.state.active_execplan(self.repo)
-                if not (
-                    active is not None
-                    and int(active['workspace_owned']) == self.effects.contract.WORKSPACE_OWNED
-                    and str(active['branch'] or '') == context.branch
-                    and str(active['worktree'] or '') == str(context.worktree)
-                    and context.plan.plan_sha
-                ):
-                    return False
-                try:
-                    self.effects.workspace.validate_managed_worktree(
-                        self.repo_path, context.worktree, context.branch
-                    )
-                except self.effects.contract.WorkspaceOwnershipError:
-                    return False
-                except self.effects.contract.GitLockError as error:
-                    raise RecoveryFailure(RecoveryReason.GIT_LOCK, str(error)) from error
-                except RuntimeError as error:
-                    raise RecoveryFailure(RecoveryReason.STATUS_FAILED, str(error)) from error
-                try:
-                    return self.effects.workspace.git(
-                        self.repo_path, 'merge-base', '--is-ancestor',
-                        context.plan.plan_sha, 'HEAD', check=False,
-                    ).returncode == 0
-                except self.effects.contract.GitLockError as error:
-                    raise RecoveryFailure(RecoveryReason.GIT_LOCK, str(error)) from error
-                except RuntimeError as error:
-                    raise RecoveryFailure(RecoveryReason.STATUS_FAILED, str(error)) from error
-
             def reconcile_catalog(_base):
                 try:
                     return self.effects.revision.reconcile_catalog(
@@ -1089,7 +1095,7 @@ class ExecutionHandlers:
                     self.repo_path, context.branch, context.pr_url or ''
                 ),
                 reconcile_catalog=reconcile_catalog,
-                workspace_owned=workspace_owned,
+                workspace_owned=lambda: self._archive_workspace_owned(context),
                 applied_base=applied_base,
                 refresh_worktree=require_next_guard,
                 calculate_snapshot=calculate_snapshot,

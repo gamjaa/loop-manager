@@ -821,16 +821,19 @@ class ExecutionHandlerTests(TestCase):
 
     def test_guard_refuses_archive_rebase_when_head_lacks_plan_ancestry(self):
         source = 'docs/requirements/source.md'
+        self.remote = 'base-2'
         self.effects.archive.requirement_archive_sources.return_value = (source,)
         self.effects.archive.requirement_archive_touched_sources.return_value = ()
         self.effects.archive.requirement_archive_snapshot.return_value = (
-            ArchiveSnapshot('base', 'catalog', 'states', 'G-047', (), ())
+            ArchiveSnapshot('base-2', 'catalog', 'states', 'G-047', (), ())
         )
         original_git = self.git
 
         def git(path, *args, **kwargs):
             if args[:2] == ('merge-base', '--is-ancestor'):
-                return SimpleNamespace(stdout='', returncode=1)
+                return SimpleNamespace(
+                    stdout='', returncode=1 if path == Path('/state/G-047') else 0
+                )
             return original_git(path, *args, **kwargs)
 
         self.effects.workspace.git.side_effect = git
@@ -841,6 +844,75 @@ class ExecutionHandlerTests(TestCase):
         self.assertEqual(result.recovery.observation.reason,
                          handlers.RecoveryReason.OWNERSHIP_UNCERTAIN)
         self.assertNotIn('rebase', self.calls)
+        self.assertIsNone(self.connection.execute(
+            "SELECT snapshot_token FROM requirement_archive_targets WHERE repo = 'repo'"
+        ).fetchone())
+
+    def test_guard_archive_rebase_checks_managed_head_not_base_checkout(self):
+        self.remote = 'base-2'
+        self.effects.archive.requirement_archive_sources.return_value = (
+            'docs/requirements/source.md',
+        )
+        self.effects.archive.requirement_archive_snapshot.return_value = (
+            ArchiveSnapshot('base-2', 'catalog', 'states', 'G-047', (), ())
+        )
+        original_git = self.git
+
+        def git(path, *args, **kwargs):
+            if args[:2] == ('merge-base', '--is-ancestor'):
+                return SimpleNamespace(
+                    stdout='', returncode=0 if path == Path('/state/G-047') else 1
+                )
+            return original_git(path, *args, **kwargs)
+
+        self.effects.workspace.git.side_effect = git
+        self.handler._refresh_revision_base = mock.Mock(
+            return_value=ExecutionOutcome(ExecutionOutcomeKind.RETRY)
+        )
+
+        result = self.handler.guard(self.context())
+
+        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+        self.handler._refresh_revision_base.assert_called_once()
+        ancestry_paths = [
+            call.args[0] for call in self.effects.workspace.git.call_args_list
+            if call.args[1:3] == ('merge-base', '--is-ancestor')
+        ]
+        self.assertEqual(ancestry_paths, [Path('/state/G-047')])
+        self.effects.workspace.validate_managed_worktree.assert_called_with(
+            Path('/repo'), Path('/state/G-047'), 'loop-manager/G-047'
+        )
+
+    def test_guard_archive_snapshot_ignores_base_checkout_head(self):
+        self.effects.archive.requirement_archive_sources.return_value = (
+            'docs/requirements/source.md',
+        )
+        self.effects.archive.requirement_archive_touched_sources.return_value = ()
+        self.effects.archive.requirement_archive_snapshot.return_value = (
+            ArchiveSnapshot('base', 'catalog', 'states', 'G-047', (), ())
+        )
+        original_git = self.git
+
+        def git(path, *args, **kwargs):
+            if args[:2] == ('merge-base', '--is-ancestor'):
+                return SimpleNamespace(
+                    stdout='', returncode=0 if path == Path('/state/G-047') else 1
+                )
+            if args[0] == 'merge-base':
+                return SimpleNamespace(stdout='base', returncode=0)
+            return original_git(path, *args, **kwargs)
+
+        self.effects.workspace.git.side_effect = git
+
+        result = self.handler.guard(self.context())
+
+        self.assertNotIsInstance(result, ExecutionOutcome)
+        ancestry_paths = [
+            call.args[0] for call in self.effects.workspace.git.call_args_list
+            if call.args[1:3] == ('merge-base', '--is-ancestor')
+        ]
+        self.assertEqual(ancestry_paths, [Path('/state/G-047')])
+        self.effects.blocking.block_active_execplan.assert_not_called()
 
     def test_existing_pr_recovery_does_not_push_or_create(self):
         self.effects.publication.pr_for_branch.return_value = {'url': 'existing'}
