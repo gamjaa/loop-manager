@@ -47,6 +47,9 @@ class ReadyPlanSnapshot:
     content_hash: str
     plan_sha: str
     text: str
+    current_complexity: str | None = None
+    current_risk: str | None = None
+    current_metadata_recorded: bool = False
 
 
 @dataclass(frozen=True)

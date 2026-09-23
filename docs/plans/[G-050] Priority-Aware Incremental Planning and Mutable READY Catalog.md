@@ -79,12 +79,12 @@ G-048의 planning lifecycle coordinator 경계에 명세 변경 우선 trigger�
 
 ## Progress
 
-- [ ] 명세·전체 입력 dual fingerprint와 typed scheduling decision 구현
-- [ ] durable never-started marker 및 mutable READY snapshot 구현
-- [ ] 일반 Planner create/update/rename/delete prompt·validation 구현
-- [ ] cancellation audit 및 recoverable publication manifest transaction 구현
-- [ ] single/multi-project scheduling·race·interruption 회귀 테스트 추가
-- [ ] PRODUCT 장기 규칙 갱신 및 사용자 승인 ARCHITECTURE 계약 준수
+- [x] 명세·전체 입력 dual fingerprint와 typed scheduling decision 구현
+- [x] durable never-started marker 및 mutable READY snapshot 구현
+- [x] 일반 Planner create/update/rename/delete prompt·validation 구현
+- [x] cancellation audit 및 recoverable publication manifest transaction 구현
+- [x] single/multi-project scheduling·race·interruption 회귀 테스트 추가
+- [x] PRODUCT 장기 규칙 갱신 및 사용자 승인 ARCHITECTURE 계약 준수
 
 ## Decision Log
 
@@ -95,3 +95,33 @@ G-048의 planning lifecycle coordinator 경계에 명세 변경 우선 trigger�
 - modification identity는 frontmatter ID 하나로 고정한다. rename은 ID가 같은 path 교체로만 인정하고 내용 유사도 추정은 사용하지 않는다.
 - User Decision (2026-09-22): 남은 READY 때문에 새 계획이 막히지 않도록 명세 변경을 마지막 Planner 이후 한 번 우선 반영하고, 그 밖에는 실행 가능한 READY를 priority 순으로 처리한 뒤 no-runnable 경계에서 변경된 입력만 한 번 재계획하도록 승인했다. 일반 Planner가 DB 안전성을 보장한 미착수 ExecPlan을 생성·수정·삭제하는 제품 정책도 승인했다.
 - Architecture Approval (2026-09-22): 사용자가 SQLite 상태·planning publication recovery 경계를 포함한 `docs/ARCHITECTURE.md` 갱신과 게시를 승인했다. G-050은 게시된 R-024와 ARCHITECTURE 계약을 구현하며 Worker branch에서는 ARCHITECTURE를 다시 수정하지 않는다.
+
+### Agent Guidance Proposal: guidance-mutable-ready-planner
+Target: `AGENTS.md`
+Scope: `common`
+Reason: G-050은 프로그램이 SQLite 상태와 Git revision에 결합해 제공한 mutable READY snapshot 안에서 일반 Planner가 미착수 ExecPlan을 수정·rename·삭제하도록 요구하지만, 현재 공통 지침은 모든 기존 ExecPlan 변경을 금지해 runtime 권한과 Agent 지침이 충돌한다.
+Impact: 적용하지 않으면 일반 Planner가 runtime이 명시적으로 허용한 mutable READY 개정·삭제를 지침 위반으로 회피하거나 Reviewer가 구현을 계약 불일치로 계속 차단하여 G-050을 완료할 수 없다.
+Patch:
+```diff
+diff --git a/AGENTS.md b/AGENTS.md
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -29,7 +29,9 @@ ExecPlan의 실행 상태, 재시도 횟수, 세션과 작업 공간 정보는 Loop
+ 
+ 구현 전 관련 문서를 확인한다.
+ 
+-일반 Planner는 새 `docs/plans/*.md`를 생성하고, 현재 PRODUCT/Requirement 범위 밖이지만 보존 가치가 있는 아이디어만 `docs/FUTURE_IDEAS.md`에 생성하거나 수정할 수 있다. 기존 ExecPlan을 수정·삭제하거나 그 밖의 파일을 변경하지 않는다.
++일반 Planner는 새 `docs/plans/*.md`를 생성하고, 현재 PRODUCT/Requirement 범위 밖이지만 보존 가치가 있는 아이디어만 `docs/FUTURE_IDEAS.md`에 생성하거나 수정할 수 있다.
++예외적으로 프로그램이 SQLite 상태와 Git revision에 결합된 mutable READY snapshot을 제공한 경우에만, 일반 Planner는 snapshot 안의 미착수 READY ExecPlan을 같은 ID로 수정·이름 변경·삭제할 수 있다.
++일반 Planner는 snapshot 밖의 기존 ExecPlan, 실행된 계획, MERGED·archive 계획 및 앞에서 허용한 파일 외의 파일을 수정·이름 변경·삭제할 수 없다.
+ 예외적으로 프로그램이 SQLite의 활성 유지보수 단계에서 명시한 barrier 또는 post-refactor revalidation mode와 대상 snapshot을 제공한 경우에만, 유지보수 Planner는 상태가 READY이고 branch, worktree, workspace reservation, Worker·Reviewer session과 PR이 없는 기존 ExecPlan을 개정할 수 있다. barrier mode는 기존 metadata·본문·dependency를 보존하고 검증된 리팩터링 DAG의 모든 말단 ID만 depends_on에 추가한다. revalidation mode는 ID·경로·title·sources·Purpose와 원래 제품 목표 및 범위를 보존하면서 최신 구조에 필요한 Acceptance Criteria의 경로 표현, Implementation, Validation, Progress, Decision Log와 dependency만 개정하며 목표 보존을 확정할 수 없는 변경은 거부한다.
+ 유지보수 Planner도 기존 파일의 삭제·이름 변경, 대상 snapshot 밖 계획의 수정 및 AGENTS.md 변경을 할 수 없다. 이 예외는 일반 Planner 권한이나 사용자의 직접 문서 편집 규칙을 변경하지 않는다.
+ Planner는 `docs/FUTURE_IDEAS.md`의 항목을 같은 계획 주기의 ExecPlan 범위나 현재 미충족 작업의 근거로 사용하지 않는다.
+```
+
+### Agent Guidance User Decision: guidance-mutable-ready-planner
+Decision: `approve`
+Revision: `user-approval-2026-09-22-v1`
+Patch:
+```diff
+```

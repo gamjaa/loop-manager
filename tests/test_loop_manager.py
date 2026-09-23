@@ -1022,6 +1022,11 @@ class AutomationFirstCatalogTest(unittest.TestCase):
             preserved_fingerprint = loop_manager.planning_input_fingerprint(
                 blocked_repo, "main"
             )
+            preserved_specification = (
+                loop_manager.specification_input_fingerprint(
+                    blocked_repo, "main"
+                )
+            )
 
             (blocked_repo / "docs/PRODUCT.md").write_text(
                 "# Changed product input\n",
@@ -1033,20 +1038,34 @@ class AutomationFirstCatalogTest(unittest.TestCase):
             state_dir.mkdir()
             connection = loop_manager.connect_database(state_dir, create=True)
             connection.executemany(
-                "INSERT INTO projects (repo, base_branch, planning_fingerprint) "
-                "VALUES (?, 'main', ?)",
+                "INSERT INTO projects (repo, base_branch, "
+                "specification_fingerprint, planning_fingerprint) "
+                "VALUES (?, 'main', ?, ?)",
                 (
-                    (str(blocked_repo), preserved_fingerprint),
-                    (str(runnable_repo), "older-input"),
+                    (
+                        str(blocked_repo),
+                        preserved_specification,
+                        preserved_fingerprint,
+                    ),
+                    (
+                        str(runnable_repo),
+                        loop_manager.specification_input_fingerprint(
+                            runnable_repo, "main"
+                        ),
+                        loop_manager.planning_input_fingerprint(
+                            runnable_repo, "main"
+                        ),
+                    ),
                 ),
             )
-            for repo, plan_id, plan_path, title, dependencies, plan_sha in (
+            for repo, plan_id, plan_path, title, dependencies, priority, plan_sha in (
                 (
                     blocked_repo,
                     "G-010",
                     blocked_plan,
                     "Dependency Blocked",
                     ("G-009",),
+                    "critical",
                     blocked_plan_sha,
                 ),
                 (
@@ -1055,6 +1074,7 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                     runnable_plan,
                     "Runnable",
                     (),
+                    "high",
                     runnable_plan_sha,
                 ),
             ):
@@ -1063,7 +1083,7 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                     INSERT INTO exec_plans (
                         repo, plan_id, path, title, sources, depends_on, priority,
                         content_hash, status, plan_sha
-                    ) VALUES (?, ?, ?, ?, '["docs/PRODUCT.md"]', ?, 'high',
+                    ) VALUES (?, ?, ?, ?, '["docs/PRODUCT.md"]', ?, ?,
                               ?, 'READY', ?)
                     """,
                     (
@@ -1072,6 +1092,7 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                         plan_path.relative_to(repo).as_posix(),
                         title,
                         json.dumps(dependencies),
+                        priority,
                         loop_manager.file_hash(plan_path),
                         plan_sha,
                     ),
@@ -1138,14 +1159,16 @@ class AutomationFirstCatalogTest(unittest.TestCase):
         results = {item.repo: item.result.kind for item in outcomes}
         self.assertEqual(
             results[str(blocked_repo)],
-            loop_manager.ProjectRunKind.WAITING,
+            loop_manager.ProjectRunKind.OPERATIONAL_ERROR,
         )
         self.assertEqual(
             results[str(runnable_repo)],
             loop_manager.ProjectRunKind.OPERATIONAL_ERROR,
         )
-        self.assertEqual(roles, ["worker"], outcomes)
-        self.assertEqual(tuple(blocked_project), (None, preserved_fingerprint))
+        self.assertCountEqual(roles, ["planner", "worker"])
+        self.assertEqual(
+            tuple(blocked_project), ("PLANNING", preserved_fingerprint)
+        )
         self.assertEqual(
             [tuple(row) for row in blocked_catalog],
             [("G-010", "READY")],
@@ -1255,10 +1278,10 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                         return loop_manager.CodexResult(0, "", "planner-session")
                     return loop_manager.CodexResult(1, "worker must not start", "worker-session")
 
-                original_register = loop_manager.register_execplans
+                original_publish = loop_manager.publish_general_planning_batch
 
-                def register(*args, **kwargs):
-                    original_register(*args, **kwargs)
+                def publish(*args, **kwargs):
+                    original_publish(*args, **kwargs)
                     if publishes_plan:
                         git_command(repo, "merge", "--ff-only", "origin/main")
                         advance_remote()
@@ -1275,8 +1298,8 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                     "loop_manager.run_codex",
                     side_effect=agent,
                 ), mock.patch(
-                    "loop_manager.register_execplans",
-                    side_effect=register,
+                    "loop_manager.publish_general_planning_batch",
+                    side_effect=publish,
                 ):
                     result = loop_manager.run_project(
                         connection,
@@ -1335,13 +1358,18 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                     plan_sha=git_command(repo, "rev-parse", "origin/main"),
                 )
                 fingerprint = loop_manager.planning_input_fingerprint(repo, "main")
+                specification = loop_manager.specification_input_fingerprint(
+                    repo, "main"
+                )
                 connection.execute(
                     """
                     UPDATE projects
-                    SET planning_fingerprint = ?, processed_sha = ?
+                    SET specification_fingerprint = ?, planning_fingerprint = ?,
+                        processed_sha = ?
                     WHERE repo = ?
                     """,
                     (
+                        specification,
                         "changed" if changed else fingerprint,
                         None if changed else git_command(repo, "rev-parse", "origin/main"),
                         str(repo),
@@ -1488,7 +1516,7 @@ class AutomationFirstCatalogTest(unittest.TestCase):
             self.assertEqual(result, 1)
             self.assertEqual(roles, ["worker"])
             self.assertGreaterEqual(exact_reads, 2)
-            self.assertEqual(fingerprint_revisions, [])
+            self.assertEqual(fingerprint_revisions, [selected_sha])
             self.assertEqual(project["active_sha"], selected_sha)
             self.assertEqual(
                 git_command(Path(project["worktree"]), "rev-parse", "HEAD"),
@@ -1507,7 +1535,15 @@ class PlannerFutureIdeasTest(unittest.TestCase):
 
         self.assertIn("docs/FUTURE_IDEAS.md", prompt)
         self.assertIn("같은 계획 주기의 ExecPlan 범위나 미충족 작업의 근거로 사용하지 말고", prompt)
-        self.assertIn("기존 ExecPlan을 수정·삭제하지 말며", prompt)
+        self.assertIn(
+            "mutable READY snapshot의 계획은 같은 ID를 보존한 채",
+            prompt,
+        )
+        self.assertIn(
+            "snapshot 밖의 기존 ExecPlan, 실행된 계획, MERGED·archive 계획은 "
+            "수정·rename·삭제하지 마라",
+            prompt,
+        )
         plans_contract = (loop_manager.ROOT / "docs/PLANS.md").read_text(encoding="utf-8")
         self.assertIn("### Agent Guidance Proposal: guidance-example", plans_contract)
         self.assertIn("### Agent Guidance User Decision: guidance-example", plans_contract)
@@ -1803,6 +1839,7 @@ class LoopManagerTest(unittest.TestCase):
                 ).fetchone()
 
         self.assertIn("plan_path", columns)
+        self.assertIn("specification_fingerprint", columns)
         self.assertIn("planning_fingerprint", columns)
         self.assertIn("planning_attempt_fingerprint", columns)
         self.assertIn("planning_retry_count", columns)
@@ -1813,6 +1850,7 @@ class LoopManagerTest(unittest.TestCase):
         self.assertIn("planning_result_completed", columns)
         self.assertIn("planning_error_fingerprint", columns)
         self.assertEqual((row["base_branch"], row["phase"]), ("main", "WORKING"))
+        self.assertIsNone(row["specification_fingerprint"])
         self.assertIsNone(row["planning_fingerprint"])
         self.assertEqual(row["planning_retry_count"], 0)
         self.assertEqual(row["planning_result_pending_validation"], 0)
@@ -3720,11 +3758,7 @@ risk: medium
             (blocked_result, unchanged_result, metadata_result, resumed_result),
             (0, 0, 0, 1),
         )
-        self.assertEqual(
-            roles, ["worker", "worker"],
-            (resumed_result, resumed_project["phase"], resumed_project["last_error"],
-             resumed_plan["status"], resumed_plan["last_error"]),
-        )
+        self.assertEqual(roles, ["worker", "planner", "worker"])
         verify.assert_called_once()
         self.assertIsNone(blocked_project["phase"])
         self.assertEqual(blocked_plan["verify_result"], "verify: PASS")
@@ -6611,13 +6645,13 @@ class AgentScopeValidatorTest(unittest.TestCase):
     def test_role_boundaries_reject_protected_and_read_only_changes(self):
         scenarios = (
             (
-                "planner-existing-plan",
+                "planner-product",
                 "planner",
-                lambda repo, _plan: (repo / _plan).write_text(
-                    "changed\n", encoding="utf-8"
+                lambda repo, _plan: (repo / "docs/PRODUCT.md").write_text(
+                    "# changed\n", encoding="utf-8"
                 ),
                 None,
-                "docs/plans/[G-001] Scope Safety.md",
+                "docs/PRODUCT.md",
             ),
             (
                 "worker-requirement",
@@ -6722,6 +6756,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "maintenance_planning.py",
                 "maintenance_state.py",
                 "notifications.py",
+                "planning_catalog.py",
                 "planning_runtime.py",
                 "publication_resume.py",
                 "project_registry.py",
@@ -6815,6 +6850,15 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     after,
                     selected_plan_path=selected,
                 )
+
+    def test_planner_existing_plan_change_reaches_snapshot_validator(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, plan_path = self._repository_with_plan(directory)
+            before = loop_manager.capture_git_snapshot(repo)
+            (repo / plan_path).write_text("changed\n", encoding="utf-8")
+            after = loop_manager.capture_git_snapshot(repo)
+
+            loop_manager.validate_agent_scope("planner", repo, before, after)
 
     def test_agent_commit_and_branch_switch_are_rejected(self):
         mutations = (
@@ -7979,6 +8023,15 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 encoding="utf-8",
             )
             commit_and_push(repo, "Change source after blocked cleanup")
+            with connection:
+                connection.execute(
+                    "UPDATE projects SET specification_fingerprint = ? "
+                    "WHERE repo = ?",
+                    (
+                        loop_manager.specification_input_fingerprint(repo, "main"),
+                        str(repo),
+                    ),
+                )
             with mock.patch(
                 "loop_manager.validate_repository", return_value=repo
             ), mock.patch(
@@ -8232,6 +8285,15 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 encoding="utf-8",
             )
             commit_and_push(repo, "Change source after blocked Agent commit")
+            with connection:
+                connection.execute(
+                    "UPDATE projects SET specification_fingerprint = ? "
+                    "WHERE repo = ?",
+                    (
+                        loop_manager.specification_input_fingerprint(repo, "main"),
+                        str(repo),
+                    ),
+                )
 
             def stop_after_isolation(*_args, **_kwargs):
                 restored = loop_manager.capture_git_snapshot(worktree)
@@ -8421,6 +8483,15 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 encoding="utf-8",
             )
             commit_and_push(repo, "Change source after Git recovery")
+            with connection:
+                connection.execute(
+                    "UPDATE projects SET specification_fingerprint = ? "
+                    "WHERE repo = ?",
+                    (
+                        loop_manager.specification_input_fingerprint(repo, "main"),
+                        str(repo),
+                    ),
+                )
 
             with mock.patch(
                 "loop_manager.validate_repository",
@@ -8626,6 +8697,19 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 ),
             )
             connection.commit()
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE projects
+                    SET planning_fingerprint = ?, specification_fingerprint = ?
+                    WHERE repo = ?
+                    """,
+                    (
+                        loop_manager.planning_input_fingerprint(repo, "main"),
+                        loop_manager.specification_input_fingerprint(repo, "main"),
+                        str(repo),
+                    ),
+                )
 
             def reviewer(agent_worktree, *_args, **_kwargs):
                 (agent_worktree / "reviewer.txt").write_text(
@@ -8737,6 +8821,15 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 encoding="utf-8",
             )
             commit_and_push(repo, "Change source after blocked review")
+            with connection:
+                connection.execute(
+                    "UPDATE projects SET specification_fingerprint = ? "
+                    "WHERE repo = ?",
+                    (
+                        loop_manager.specification_input_fingerprint(repo, "main"),
+                        str(repo),
+                    ),
+                )
             with mock.patch(
                 "loop_manager.validate_repository", return_value=repo
             ), mock.patch(
@@ -10428,6 +10521,15 @@ class WorkspaceRecoveryTest(unittest.TestCase):
                 encoding="utf-8",
             )
             commit_and_push(repo, "Change blocked plan input")
+            with connection:
+                connection.execute(
+                    "UPDATE projects SET specification_fingerprint = ? "
+                    "WHERE repo = ?",
+                    (
+                        loop_manager.specification_input_fingerprint(repo, "main"),
+                        str(repo),
+                    ),
+                )
             with mock.patch(
                 "loop_manager.validate_repository", return_value=repo
             ), mock.patch(
@@ -12532,8 +12634,12 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
         connection.row_factory = sqlite3.Row
         connection.execute(loop_manager.SCHEMA)
         connection.execute(
-            "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
-            (str(repo),),
+            "INSERT INTO projects (repo, base_branch, specification_fingerprint) "
+            "VALUES (?, 'main', ?)",
+            (
+                str(repo),
+                loop_manager.specification_input_fingerprint(repo, "main"),
+            ),
         )
         connection.commit()
         relative_plan = plan.relative_to(repo).as_posix()
@@ -13368,13 +13474,25 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                 "worker-existing",
                 loop_manager.AgentResultKind.PERMANENT_CONFIGURATION,
             )
+            roles = []
+
+            def failed_agent(
+                _worktree,
+                _state,
+                _config,
+                role_name,
+                _prompt,
+                **_kwargs,
+            ):
+                roles.append(role_name)
+                return failed_worker
 
             with mock.patch(
                 "loop_manager.validate_repository", return_value=repo
             ), mock.patch(
                 "loop_manager.pr_for_branch", return_value=pull_request
             ), mock.patch(
-                "loop_manager.run_codex", return_value=failed_worker
+                "loop_manager.run_codex", side_effect=failed_agent
             ) as agent:
                 first = loop_manager.run_project_result(
                     connection,
@@ -13411,7 +13529,8 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             self.assertTrue(
                 loop_manager._rebase_in_progress_for_branch(worktree, branch)
             )
-            self.assertEqual(agent.call_count, 4)
+            self.assertEqual(roles, ["worker", "worker", "worker", "worker", "planner"])
+            self.assertEqual(agent.call_count, 5)
 
     def test_repeated_verify_fingerprint_blocks_recovery_without_auto_resume(self):
         with tempfile.TemporaryDirectory() as directory:
