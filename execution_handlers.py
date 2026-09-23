@@ -33,6 +33,7 @@ from rebase_correction import (
     stage_evidence_preserved,
 )
 from rebase_correction_state import CorrectionRace, RebaseCorrectionRepository
+from validation_feedback import is_validation_error, normalize_feedback, render_delta
 
 @dataclass(frozen=True)
 class WorkspaceEffects:
@@ -77,9 +78,13 @@ class ValidationEffects:
     parse_reviewer_result: Callable[..., Any]
     validate_active_execplan_metadata: Callable[..., Any]
     ensure_worker_level_state: Callable[..., Any]
-    _deserialize_failure_history: Callable[..., Any]
     clear_validation_failure_history: Callable[..., Any]
     transition_validation_failure: Callable[..., Any]
+
+@dataclass(frozen=True)
+class FeedbackEffects:
+    repository: Any
+    fingerprints: Callable[..., Any]
 
 @dataclass(frozen=True)
 class ArchiveEffects:
@@ -133,6 +138,7 @@ class ExecutionEffects:
     events: EventsEffects
     revision: RevisionEffects
     checkpoint: Any = None
+    feedback: FeedbackEffects | None = None
 
 
 class ExecutionHandlers:
@@ -1951,44 +1957,59 @@ class ExecutionHandlers:
             'worker',
             input_fingerprint=self.effects.agent._worktree_execplan_input_fingerprint(context.worktree, catalog_plan),
         )
-        persisted_validation_feedback = []
-        if self.effects.validation._deserialize_failure_history(catalog_plan['verify_failure_history']):
-            persisted_validation_feedback.append(str(row['verify_result'] or ''))
-        if self.effects.validation._deserialize_failure_history(catalog_plan['review_failure_history']):
-            persisted_validation_feedback.append(str(row['review_result'] or ''))
-        validation_feedback = '\n\n'.join((feedback for feedback in persisted_validation_feedback if feedback))
-        guidance_targets = self.effects.agent._guidance_worker_targets(self.repo, str(catalog_plan['plan_id']))
-        guidance_context = self.effects.agent.guidance_resume_context(self.repo, str(catalog_plan['plan_id']))
-        allow_common_plans = self.effects.agent._published_plan_allows_common_plans(self.repo_path, catalog_plan)
-        result = self.effects.agent.run_agent_with_retries(
-            TrackedAgentCall(lambda current_session_id, session_recovery, invocation: self.effects.agent.run_agent(
-                self.provider,
-                context.worktree,
-                self.state_dir,
-                self.config_path,
-                'worker',
+        feedback_repo = self.effects.feedback.repository if self.effects.feedback else None
+        delivery = None
+        def session_started(started_session_id):
+            if feedback_repo is not None and delivery is not None:
+                feedback_repo.bind_session(delivery.attempt_id, started_session_id)
+            self.effects.state.update_project(
+                self.repo, worker_session_id=started_session_id,
+            )
+        def worker_call(current_session_id, session_recovery, invocation):
+            nonlocal delivery
+            recovering = bool(session_recovery or (
+                row['worker_session_id'] and current_session_id is None
+            ))
+            if feedback_repo is not None:
+                delivery = feedback_repo.prepare(
+                    self.repo, str(plan['id']), current_session_id,
+                    recovery=recovering,
+                )
+                recovering = delivery.recovery
+                validation_feedback = render_delta(delivery.rows)
+            else:
+                validation_feedback = ''
+            prompt_error = row['last_error']
+            if is_validation_error(prompt_error, row['verify_result'], row['review_result']):
+                prompt_error = None
+            return self.effects.agent.run_agent(
+                self.provider, context.worktree, self.state_dir,
+                self.config_path, 'worker',
                 self.effects.agent.worker_prompt(
-                    row['plan_path'],
-                    row['last_error'],
-                    row['worker_result'],
+                    row['plan_path'], prompt_error, row['worker_result'],
                     validation_feedback,
                     archive_candidates=self.archive_candidates,
-                    session_recovery=session_recovery,
+                    session_recovery=recovering,
                     guidance_common_allowed=self.effects.agent.is_loop_manager_repository(self.repo_path),
                     guidance_context=guidance_context,
                     allow_common_plans=allow_common_plans,
                 ),
-                read_only=False,
-                level=self.level,
-                persist_session=True,
+                read_only=False, level=self.level, persist_session=True,
                 session_id=current_session_id,
-                on_session_started=lambda started_session_id: self.effects.state.update_project(self.repo, worker_session_id=started_session_id),
+                on_session_started=session_started,
                 invocation=invocation,
-            ), AttemptSequence(self.repo, str(plan['id']),
+            )
+        guidance_targets = self.effects.agent._guidance_worker_targets(self.repo, str(catalog_plan['plan_id']))
+        guidance_context = self.effects.agent.guidance_resume_context(self.repo, str(catalog_plan['plan_id']))
+        allow_common_plans = self.effects.agent._published_plan_allows_common_plans(self.repo_path, catalog_plan)
+        result = self.effects.agent.run_agent_with_retries(
+            TrackedAgentCall(worker_call, AttemptSequence(self.repo, str(plan['id']),
                                str(catalog_plan['current_revision_sha']) if catalog_plan['current_revision_sha'] is not None else None)),
             session_id=row['worker_session_id'],
         )
         code, message = result
+        if feedback_repo is not None and delivery is not None and result.session_id:
+            feedback_repo.bind_session(delivery.attempt_id, result.session_id)
         if result.session_id:
             self.effects.state.update_project(self.repo, worker_session_id=result.session_id)
         try:
@@ -2122,6 +2143,9 @@ class ExecutionHandlers:
                 RecoveryReason.WORKER_CORRECTION, validation_error,
                 context=context,
             )
+        delivered_session = result.session_id or self._row()['worker_session_id']
+        if feedback_repo is not None and delivery is not None and delivered_session:
+            feedback_repo.delivered(delivery.attempt_id, str(delivered_session))
         return self._finish_worker(context, row, message)
 
     def _resume_saved_rebase_worker(self, context, saved, observation):
@@ -2426,6 +2450,19 @@ class ExecutionHandlers:
             input_fingerprint=self.effects.agent._worktree_execplan_input_fingerprint(context.worktree, self.catalog_plan),
         )
         passed, output = self.effects.validation.verify(context.worktree)
+        feedback_repo = self.effects.feedback.repository if self.effects.feedback else None
+        if feedback_repo is not None:
+            fingerprints = () if passed else self.effects.feedback.fingerprints(
+                'verify', output, context.worktree,
+            )
+            feedback_items = () if passed else normalize_feedback('verify', str(output), fingerprints)
+            raw_output = getattr(output, 'fingerprint_source', str(output))
+            def audit_rejected():
+                feedback_repo.record_result(
+                    self.repo, str(self.plan['id']), context.plan.definition_revision_sha,
+                    'verify', 'success' if passed else 'failure', raw_output,
+                    feedback_items,
+                )
         try:
             self.plan = self.effects.agent.validate_worker_workspace_scope(
                 self.repo_path,
@@ -2437,6 +2474,8 @@ class ExecutionHandlers:
                 verify_scope_before,
             )
         except (self.effects.contract.AgentScopeError, self.effects.contract.WorkspaceOwnershipError) as error:
+            if feedback_repo is not None:
+                audit_rejected()
             scope_error = str(error)
             self._block_final(
                 self.repo,
@@ -2448,10 +2487,14 @@ class ExecutionHandlers:
             self.effects.events.operation_print(scope_error, file=sys.stderr)
             return (self._final(scope_error), output)
         except self.effects.contract.ExecPlanMetadataError as error:
+            if feedback_repo is not None:
+                audit_rejected()
             return (self._metadata_correction(
                 context, error, verify_result=output,
             ), output)
         except RuntimeError as error:
+            if feedback_repo is not None:
+                audit_rejected()
             detail = f"verify workspace 상태 조회 재시도: {error}"
             self.effects.events.operation_print(detail, file=sys.stderr)
             return (self._recover(
@@ -2461,8 +2504,15 @@ class ExecutionHandlers:
         self.effects.agent.clear_agent_scope(self.repo)
         guarded = self._post_effect_guard(context)
         if isinstance(guarded, ExecutionOutcome):
+            if feedback_repo is not None:
+                audit_rejected()
             return (guarded, output)
         context = guarded
+        if feedback_repo is not None:
+            feedback_repo.observe(
+                self.repo, str(self.plan['id']), context.plan.definition_revision_sha,
+                'verify', passed, raw_output, feedback_items,
+            )
         if not passed:
             stage = 'rebase 후 전체 verify 실패' if after_rebase else '전체 verify 실패'
             self.effects.events.operation_log(
@@ -2715,6 +2765,17 @@ class ExecutionHandlers:
         self.effects.state.update_project(self.repo, phase='REVIEWING', last_error=None)
         return self._advanced()
 
+    def _run_reviewer_attempt(self, context, *args, **kwargs):
+        """Persist returned provider failures before the retry runner advances."""
+        result = self.effects.agent.run_agent(*args, **kwargs)
+        code, raw = result
+        if code and self.effects.feedback is not None:
+            self.effects.feedback.repository.record_result(
+                self.repo, context.plan.plan_id, context.plan.definition_revision_sha,
+                'review', getattr(result, 'ledger_kind', 'agent_failure'), raw,
+            )
+        return result
+
     def review(self, context):
         self.effects.state.check_context(context)
         row = self._row()
@@ -2736,7 +2797,8 @@ class ExecutionHandlers:
                 input_fingerprint=self.effects.agent._worktree_execplan_input_fingerprint(context.worktree, self.catalog_plan),
             )
             review_result = self.effects.agent.run_agent_with_retries(
-                TrackedAgentCall(lambda current_session_id, session_recovery, invocation: self.effects.agent.run_agent(
+                TrackedAgentCall(lambda current_session_id, session_recovery, invocation: self._run_reviewer_attempt(
+                    context,
                     self.provider,
                     context.worktree,
                     self.state_dir,
@@ -2760,6 +2822,9 @@ class ExecutionHandlers:
                 session_id=row['reviewer_session_id'],
             )
             code, review = review_result
+            # Nonzero returned attempts are already audited before retries;
+            # post-call rejection records classify only unaudited zero exits.
+            feedback_repo = self.effects.feedback.repository if self.effects.feedback else None
             if review_result.session_id:
                 self.effects.state.update_project(self.repo, reviewer_session_id=review_result.session_id)
             try:
@@ -2774,6 +2839,11 @@ class ExecutionHandlers:
                 )
                 self.effects.workspace.validate_managed_worktree(self.repo_path, context.worktree, context.branch)
             except (self.effects.contract.AgentScopeError, self.effects.contract.WorkspaceOwnershipError) as error:
+                if feedback_repo is not None and not code:
+                    feedback_repo.record_result(
+                        self.repo, str(self.plan['id']), context.plan.definition_revision_sha,
+                        'review', 'scope_failure', review,
+                    )
                 scope_error = str(error)
                 self._block_final(
                     self.repo,
@@ -2785,6 +2855,11 @@ class ExecutionHandlers:
                 self.effects.events.operation_print(scope_error, file=sys.stderr)
                 return self._final(scope_error)
             except RuntimeError as error:
+                if feedback_repo is not None and not code:
+                    feedback_repo.record_result(
+                        self.repo, str(self.plan['id']), context.plan.definition_revision_sha,
+                        'review', 'scope_failure', review,
+                    )
                 detail = f"Reviewer workspace 상태 조회 재시도: {error}"
                 self.effects.events.operation_print(detail, file=sys.stderr)
                 return self._recover(
@@ -2794,6 +2869,11 @@ class ExecutionHandlers:
             self.effects.agent.clear_agent_scope(self.repo)
             guarded = self._post_effect_guard(context)
             if isinstance(guarded, ExecutionOutcome):
+                if feedback_repo is not None and not code:
+                    feedback_repo.record_result(
+                        self.repo, str(self.plan['id']), context.plan.definition_revision_sha,
+                        'review', 'stale_result', review,
+                    )
                 return guarded
             context = guarded
             row = self._row()
@@ -2826,6 +2906,11 @@ class ExecutionHandlers:
             try:
                 verdict, _issue_ids = self.effects.validation.parse_reviewer_result(review)
             except self.effects.contract.ReviewerProtocolError as error:
+                if feedback_repo is not None:
+                    feedback_repo.record_result(
+                        self.repo, str(self.plan['id']), context.plan.definition_revision_sha,
+                        'review', 'protocol_failure', review,
+                    )
                 protocol_error = str(error)
                 reviewer_error = f"Reviewer 결과 프로토콜 오류: {protocol_error}"
                 self.effects.state.update_project(
@@ -2850,6 +2935,12 @@ class ExecutionHandlers:
                 continue
             break
         assert verdict is not None
+        if feedback_repo is not None:
+            feedback_repo.observe(
+                self.repo, str(self.plan['id']), context.plan.definition_revision_sha,
+                'review', verdict == 'PASS', review,
+                normalize_feedback('review', review) if verdict == 'FAIL' else (),
+            )
         if verdict == 'FAIL':
             decision = self.effects.validation.transition_validation_failure(
                 self.repo,

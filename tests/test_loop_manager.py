@@ -3897,7 +3897,16 @@ risk: medium
         self.assertEqual(plan["verify_result"], "verify failed")
         self.assertIn("실패 지문:", plan["last_error"])
         self.assertEqual(sessions, [None] + ["worker-session"] * 3)
-        self.assertIn("전체 검증 실패:\nverify failed", prompts[1])
+        fingerprint = next(iter(history))
+        self.assertIn(
+            f"verify:{fingerprint} occurrence=1 revision=1\nverify failed",
+            prompts[1],
+        )
+        self.assertNotIn("전체 검증 실패:\nverify failed", prompts[1])
+        self.assertIn(
+            f"verify:{fingerprint} occurrence=2 revision=2", prompts[2]
+        )
+        self.assertNotIn("verify failed", prompts[2])
         self.assertEqual(verify.call_count, 4)
         self.assertEqual(
             [record["occurrences"] for record in history.values()], [4]
@@ -6681,6 +6690,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "requirement_archive_state.py",
                 "runtime_state.py",
                 "scoped_blocking.py",
+                "validation_feedback.py",
+                "validation_feedback_state.py",
             ):
                 shutil.copy(loop_manager.ROOT / module_name, repo / module_name)
             (repo / ".gitignore").write_text("__pycache__/\n", encoding="utf-8")

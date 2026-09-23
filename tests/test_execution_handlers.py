@@ -8,6 +8,8 @@ import execution_handlers as handlers
 from execution_revision import DefinitionSnapshot
 import loop_manager as lm
 import runtime_state
+from validation_feedback import Feedback
+from validation_feedback_state import ValidationFeedbackRepository
 from execution_checkpoint_state import CheckpointRecord, ExecutionCheckpointRepository
 from requirement_archive import ArchiveSnapshot
 from execution_state import ExecutionStatePort
@@ -57,7 +59,6 @@ class ExecutionHandlerTests(TestCase):
             dirty={'app.py': (('staged',), 'accepted-content')},
         )
         self.effects.validation.validate_active_execplan_metadata.return_value = self.plan
-        self.effects.validation._deserialize_failure_history.return_value = {}
         self.effects.validation.parse_worker_result.return_value = SimpleNamespace(commit_title='Concrete change')
         self.effects.validation.verify.side_effect = lambda _: (self.calls.append('verify') or True, 'OK')
         self.effects.validation.parse_reviewer_result.return_value = ('PASS', ())
@@ -134,6 +135,250 @@ class ExecutionHandlerTests(TestCase):
         )
         self.effects = replace(self.effects, contract=runtime.effects.contract)
         self.handler.effects = self.effects
+
+    def _with_feedback(self, feedback):
+        self.effects = replace(
+            self.effects,
+            feedback=handlers.FeedbackEffects(
+                feedback, lm.validation_failure_fingerprints,
+            ),
+        )
+        self.handler.effects = self.effects
+
+    def test_worker_prompt_delivers_validation_once_and_keeps_other_errors(self):
+        feedback = ValidationFeedbackRepository(self.connection)
+        self._with_feedback(feedback)
+        feedback.observe(
+            'repo', 'G-047', 'revision', 'verify', False,
+            'private raw prelude\nfirst failure',
+            (Feedback('verify', 'verify:fingerprint', 'first failure'),),
+        )
+        self.state.update_project(
+            'repo', last_error='전체 검증 실패:\nprivate raw prelude\nfirst failure',
+            verify_result='private raw prelude\nfirst failure',
+            worker_result='previous result', worker_session_id='same-session',
+        )
+        self.effects.agent.worker_prompt.side_effect = lm.worker_prompt
+        self.effects.agent.run_agent.side_effect = lambda *_args, **_kwargs: lm.AgentResult(
+            0, 'valid result', session_id='same-session',
+        )
+        with mock.patch.object(self.handler, '_finish_worker', return_value=SimpleNamespace(kind='done')):
+            self.handler.run(self.context())
+            first_prompt = self.effects.agent.run_agent.call_args.args[5]
+            self.handler.run(self.context())
+            second_prompt = self.effects.agent.run_agent.call_args.args[5]
+        self.assertIn('verify:fingerprint occurrence=1 revision=1', first_prompt)
+        self.assertEqual(first_prompt.count('first failure'), 1)
+        self.assertNotIn('private raw prelude', first_prompt)
+        self.assertNotIn('first failure', second_prompt)
+        self.assertNotIn('verify:fingerprint', second_prompt)
+        self.state.update_project('repo', last_error='Worker 결과 검증 실패:\nbad format')
+        with mock.patch.object(self.handler, '_finish_worker', return_value=SimpleNamespace(kind='done')):
+            self.handler.run(self.context())
+        self.assertIn('bad format', self.effects.agent.run_agent.call_args.args[5])
+
+    def test_session_unavailable_rebuilds_compact_unresolved_feedback(self):
+        feedback = ValidationFeedbackRepository(self.connection)
+        self._with_feedback(feedback)
+        feedback.observe(
+            'repo', 'G-047', 'revision', 'review', False,
+            'raw Review detail omitted from prompt',
+            (Feedback('review', 'review:a.py::f::bug', 'Fix the assertion'),),
+        )
+        self.state.update_project(
+            'repo', worker_session_id='missing-session',
+            worker_result='previous result', review_result='raw Review detail omitted from prompt',
+            last_error='Review 실패:\nraw Review detail omitted from prompt',
+        )
+        self.effects.agent.worker_prompt.side_effect = lm.worker_prompt
+        self.effects.agent.run_agent_with_retries.side_effect = lm.run_agent_with_retries
+        prompts = []
+
+        def invoke(*args, **kwargs):
+            prompts.append(args[5])
+            if kwargs['session_id']:
+                return lm.AgentResult(1, 'unknown session', session_id='missing-session')
+            kwargs['on_session_started']('replacement')
+            return lm.AgentResult(0, 'valid result', session_id='replacement')
+
+        self.effects.agent.run_agent.side_effect = invoke
+        with mock.patch.object(self.handler, '_finish_worker', return_value=SimpleNamespace(kind='done')):
+            self.handler.run(self.context())
+        self.assertEqual(len(prompts), 2)
+        self.assertIn('AGENTS.md, 선택된 최신 ExecPlan과 현재 worktree', prompts[1])
+        self.assertIn('previous result', prompts[1])
+        self.assertIn('review:a.py::f::bug occurrence=1 revision=1', prompts[1])
+        self.assertIn('Fix the assertion', prompts[1])
+        self.assertNotIn('raw Review detail omitted from prompt', prompts[1])
+        self.assertEqual(feedback.prepare('repo', 'G-047', 'replacement').rows, ())
+
+    def test_verify_audit_keeps_full_raw_output_and_success_clears_feedback(self):
+        feedback = ValidationFeedbackRepository(self.connection)
+        self._with_feedback(feedback)
+        raw = 'beginning of raw output\n' + 'x' * 9000 + '\nFAIL'
+        self.effects.validation.verify.side_effect = [
+            (False, lm.VerifyOutput(raw)), (True, lm.VerifyOutput('SUCCESS output')),
+        ]
+        self.effects.validation.transition_validation_failure.return_value = SimpleNamespace(
+            blocked=False, fingerprint='fingerprint',
+        )
+
+        self.handler._verify_once(self.context('VERIFYING'))
+        self.assertEqual(feedback.prepare('repo', 'G-047', 'session').rows[0]['occurrence'], 1)
+        self.handler._verify_once(self.context('VERIFYING'))
+        audit = self.connection.execute(
+            "SELECT classification,raw_output FROM validation_results ORDER BY id"
+        ).fetchall()
+        self.assertEqual([(item['classification'], item['raw_output']) for item in audit],
+                         [('failure', raw), ('success', 'SUCCESS output')])
+        self.assertEqual(feedback.prepare('repo', 'G-047', 'session').rows, ())
+
+    def test_review_observation_tracks_each_issue_and_pass_resolves_them(self):
+        feedback = ValidationFeedbackRepository(self.connection)
+        self._with_feedback(feedback)
+        self.effects.validation.parse_reviewer_result.side_effect = lm.parse_reviewer_result
+        self.effects.validation.transition_validation_failure.return_value = SimpleNamespace(
+            blocked=False, fingerprint='fingerprint',
+        )
+        fail = ('ISSUE_ID: z.py::f::bug\nFix Z\n'
+                'ISSUE_ID: a.py::g::bug\nFix A\nVERDICT: FAIL')
+        self.effects.agent.run_agent.side_effect = [
+            lm.AgentResult(0, fail, session_id='review-session'),
+            lm.AgentResult(0, 'VERDICT: PASS', session_id='review-session'),
+        ]
+
+        self.handler.review(self.context('REVIEWING'))
+        self.assertEqual([row['identity'] for row in feedback.prepare(
+            'repo', 'G-047', 'worker-session',
+        ).rows], ['review:a.py::g::bug', 'review:z.py::f::bug'])
+        self.handler.review(self.context('REVIEWING'))
+        self.assertEqual(feedback.prepare('repo', 'G-047', 'worker-session').rows, ())
+        self.assertEqual(self.connection.execute(
+            "SELECT classification FROM validation_results ORDER BY id"
+        ).fetchall()[0][0], 'failure')
+
+    def test_review_retry_audits_each_returned_attempt(self):
+        self._with_feedback(ValidationFeedbackRepository(self.connection))
+        self.effects.agent.run_agent_with_retries.side_effect = lm.run_agent_with_retries
+        self.effects.validation.parse_reviewer_result.side_effect = lm.parse_reviewer_result
+        raw = 'service unavailable: original reviewer output'
+        self.effects.agent.run_agent.side_effect = [
+            lm.AgentResult(1, raw, kind=lm.AgentResultKind.TRANSIENT_FAILURE),
+            lm.AgentResult(0, 'VERDICT: PASS'),
+        ]
+        self.handler.review(self.context('REVIEWING'))
+        audit = self.connection.execute(
+            "SELECT classification,raw_output FROM validation_results ORDER BY id"
+        ).fetchall()
+        self.assertEqual([tuple(row) for row in audit],
+                         [('transient_failure', raw), ('success', 'VERDICT: PASS')])
+
+    def test_review_post_call_rejections_audit_each_execution_once(self):
+        self._with_feedback(ValidationFeedbackRepository(self.connection))
+        for code in (0, 1):
+            for rejection in ('scope', 'ownership', 'snapshot', 'stale'):
+                with self.subTest(code=code, rejection=rejection):
+                    raw = f'reviewer output {code} {rejection}'
+                    result = lm.AgentResult(code, raw)
+                    self.effects.agent.run_agent.side_effect = lambda *a, **k: result
+                    self.effects.agent.validate_agent_scope.side_effect = (
+                        lm.AgentScopeError('scope') if rejection == 'scope' else None)
+                    self.effects.workspace.validate_managed_worktree.side_effect = (
+                        lm.WorkspaceOwnershipError('ownership')
+                        if rejection == 'ownership' else None)
+                    self.effects.agent.capture_git_snapshot.side_effect = (
+                        RuntimeError('snapshot') if rejection == 'snapshot' else None)
+                    context = self.context('REVIEWING')
+                    stale = ExecutionOutcome(ExecutionOutcomeKind.RETRY, detail='stale')
+                    with mock.patch.object(self.handler, '_block_final'), mock.patch.object(
+                        self.handler, '_post_effect_guard', return_value=stale,
+                    ):
+                        outcome = self.handler.review(context)
+                    if rejection == 'stale':
+                        self.assertIs(outcome, stale)
+                    audit = self.connection.execute(
+                        "SELECT classification FROM validation_results WHERE raw_output=?",
+                        (raw,),
+                    ).fetchall()
+                    expected = (result.ledger_kind if code else
+                                'stale_result' if rejection == 'stale' else 'scope_failure')
+                    self.assertEqual([row[0] for row in audit], [expected])
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM validation_feedback_events"
+        ).fetchone()[0], 0)
+
+    def test_review_retry_interruption_preserves_previous_raw_result(self):
+        self._with_feedback(ValidationFeedbackRepository(self.connection))
+        self.effects.agent.run_agent_with_retries.side_effect = lm.run_agent_with_retries
+        raw = 'service unavailable: retained before retry'
+        self.effects.agent.run_agent.side_effect = [
+            lm.AgentResult(1, raw, kind=lm.AgentResultKind.TRANSIENT_FAILURE),
+            KeyboardInterrupt(),
+        ]
+        with self.assertRaises(KeyboardInterrupt):
+            self.handler.review(self.context('REVIEWING'))
+        audit = self.connection.execute(
+            "SELECT classification,raw_output FROM validation_results ORDER BY id"
+        ).fetchall()
+        self.assertEqual([tuple(row) for row in audit], [('transient_failure', raw)])
+
+    def test_invalid_worker_result_keeps_feedback_pending(self):
+        feedback = ValidationFeedbackRepository(self.connection)
+        self._with_feedback(feedback)
+        feedback.observe(
+            'repo', 'G-047', 'revision', 'verify', False, 'raw',
+            (Feedback('verify', 'verify:fingerprint', 'fix this'),),
+        )
+        self.state.update_project('repo', worker_session_id='same-session')
+        self.effects.agent.run_agent.side_effect = lambda *_args, **_kwargs: lm.AgentResult(
+            0, 'invalid format', session_id='same-session',
+        )
+        self.effects.validation.parse_worker_result.side_effect = lm.WorkerResultError('format')
+
+        result = self.handler.run(self.context())
+
+        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(feedback.prepare('repo', 'G-047', 'same-session').rows[0]['revision'], 1)
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM validation_delivery_attempts WHERE status='delivered'"
+        ).fetchone()[0], 0)
+
+    def test_failed_fallback_start_reuses_recovery_prompt_on_next_turn(self):
+        feedback = ValidationFeedbackRepository(self.connection)
+        self._with_feedback(feedback)
+        feedback.observe(
+            'repo', 'G-047', 'revision', 'verify', False, 'raw full failure',
+            (Feedback('verify', 'verify:fingerprint', 'fix this'),),
+        )
+        self.state.update_project(
+            'repo', worker_session_id='missing-session', worker_result='previous result',
+            verify_result='raw full failure', last_error='전체 검증 실패:\nraw full failure',
+        )
+        self.effects.agent.worker_prompt.side_effect = lm.worker_prompt
+        self.effects.agent.run_agent_with_retries.side_effect = lm.run_agent_with_retries
+        prompts = []
+
+        def failed_start(*args, **kwargs):
+            prompts.append(args[5])
+            if kwargs['session_id']:
+                return lm.AgentResult(1, 'unknown session', session_id='missing-session')
+            kwargs['on_session_started']('replacement')
+            return lm.AgentResult(1, 'provider rejected', session_id='replacement')
+
+        self.effects.agent.run_agent.side_effect = failed_start
+        self.assertEqual(self.handler.run(self.context()).kind,
+                         ExecutionOutcomeKind.OPERATIONAL_ERROR)
+        self.effects.agent.run_agent.side_effect = lambda *args, **kwargs: (
+            prompts.append(args[5]) or lm.AgentResult(
+                0, 'valid result', session_id='replacement',
+            )
+        )
+        with mock.patch.object(self.handler, '_finish_worker', return_value=SimpleNamespace(kind='done')):
+            self.handler.run(self.context())
+        self.assertIn('AGENTS.md, 선택된 최신 ExecPlan과 현재 worktree', prompts[-1])
+        self.assertIn('previous result', prompts[-1])
+        self.assertIn('verify:fingerprint occurrence=1 revision=1', prompts[-1])
+        self.assertNotIn('raw full failure', prompts[-1])
 
     def test_single_abnormal_rebase_worker_result_preserves_session_without_block(self):
         checkpoint = ExecutionCheckpointRepository(self.connection)
