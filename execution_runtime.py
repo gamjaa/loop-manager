@@ -129,6 +129,12 @@ class ExecutionRevisionPort(Protocol):
     def guard(self, context: ExecutionContext) -> ExecutionContext | ExecutionOutcome: ...
 
 
+class ExecutionRecoveryPort(Protocol):
+    """Observe actual Git and reconcile a durable checkpoint before dispatch."""
+
+    def recover(self, context: ExecutionContext) -> ExecutionContext | ExecutionOutcome: ...
+
+
 class ExecutionWorkerPort(Protocol):
     """Worker Agent, scope, guidance, and archive boundary."""
 
@@ -169,7 +175,7 @@ class ExecutionPublicationPort(Protocol):
 
 class ExecutionLifecyclePorts(
     ExecutionWorkspacePort, ExecutionRevisionPort, ExecutionWorkerPort, ExecutionValidationPort,
-    ExecutionPublicationPort, LatestBasePort, Protocol,
+    ExecutionPublicationPort, LatestBasePort, ExecutionRecoveryPort, Protocol,
 ):
     """Phase policy interface; concrete handlers receive granular effect ports."""
 
@@ -187,7 +193,15 @@ class ExecutionPhaseCoordinator:
 
     def prepare(self) -> ExecutionContext | ExecutionOutcome:
         try:
-            return self._ports.prepare()
+            prepared = self._ports.prepare()
+            if isinstance(prepared, ExecutionOutcome):
+                return self._recovery_outcome(prepared)
+            recovery = getattr(self._ports, "recover", None)
+            if recovery is None:
+                return prepared
+            recovered = recovery(prepared)
+            return (self._recovery_outcome(recovered)
+                    if isinstance(recovered, ExecutionOutcome) else recovered)
         except RecoveryFailure as error:
             return self._recovery_outcome(self._ports.recover_failure(None, error))
 

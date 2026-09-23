@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from functools import wraps
 from types import MappingProxyType
 
@@ -22,7 +23,17 @@ class ExecutionStatePort:
     def check(self):
         current = self.repository.projected(self.repo)
         if current != self.expected:
-            raise runtime_state.RuntimeStateError("execution snapshot이 변경되었습니다.")
+            # Catalog refresh can change definition metadata while the
+            # selected execution remains the same.  The revision guard owns
+            # that refresh; only checkpoint correction pins the catalog
+            # generation across its external observation.
+            if current is None or replace(
+                current,
+                catalog_generation=self.expected.catalog_generation,
+                current_revision_sha=self.expected.current_revision_sha,
+            ) != self.expected:
+                raise runtime_state.RuntimeStateError("execution snapshot이 변경되었습니다.")
+            self.expected = current
         return current
 
     def check_context(self, context):
@@ -78,6 +89,19 @@ class ExecutionStatePort:
             self.expected = self.repository.transition_from_snapshot(
                 expected,
                 plan_values=plan_values, project_values=values,
+            )
+
+    def correct_checkpoint(self, *, phase, active_sha, validated_base_sha,
+                           invalidate_validation, expected_catalog=None):
+        with self.connection:
+            expected = self.check()
+            if expected is None:
+                raise runtime_state.RuntimeStateError("execution projection이 없습니다.")
+            self.expected = self.repository.correct_checkpoint(
+                expected, phase=phase, active_sha=active_sha,
+                validated_base_sha=validated_base_sha,
+                invalidate_validation=invalidate_validation,
+                expected_catalog=expected_catalog,
             )
 
     def open_pull_request(self, repo, **values):

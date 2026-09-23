@@ -8,6 +8,7 @@ import execution_handlers as handlers
 from execution_revision import DefinitionSnapshot
 import loop_manager as lm
 import runtime_state
+from execution_checkpoint_state import CheckpointRecord, ExecutionCheckpointRepository
 from requirement_archive import ArchiveSnapshot
 from execution_state import ExecutionStatePort
 from execution_runtime import (
@@ -81,6 +82,10 @@ class ExecutionHandlerTests(TestCase):
         self.calls.append(args[0])
         if args[0] == 'rebase' and '--skip' not in args:
             self.assertEqual(self.state.row()['last_error'], lm.REBASE_IN_PROGRESS_ERROR)
+        if 'rebase' in args and ('--continue' in args or '--skip' in args):
+            # The fake command succeeds, so its operation metadata must be
+            # cleared just as a completed real rebase would be.
+            self.effects.workspace._rebase_in_progress_for_branch.return_value = False
         if args[0] == 'commit':
             self.dirty = False
         output = self.remote if args[0] == 'rev-parse' else ''
@@ -98,6 +103,19 @@ class ExecutionHandlerTests(TestCase):
             self.state.update_project('repo', phase=phase)
         return self.handler._context()
 
+    def observed_git(self, path, *args, **kwargs):
+        if args[0] == 'symbolic-ref':
+            return SimpleNamespace(stdout='loop-manager/G-047\n', returncode=0)
+        if args[0] == 'ls-files':
+            return SimpleNamespace(stdout='', returncode=0)
+        if args[:2] == ('diff', '--cached'):
+            return SimpleNamespace(stdout='', returncode=0)
+        if args[0] == 'merge-base':
+            return SimpleNamespace(stdout='', returncode=0)
+        if args == ('rev-parse', 'HEAD'):
+            return SimpleNamespace(stdout='owned-head\n', returncode=0)
+        return self.git(path, *args, **kwargs)
+
     def _use_runtime_contract(self):
         runtime = lm._ExecutionLifecyclePorts(
             self.connection, self.repository,
@@ -107,6 +125,338 @@ class ExecutionHandlerTests(TestCase):
         )
         self.effects = replace(self.effects, contract=runtime.effects.contract)
         self.handler.effects = self.effects
+
+    def test_zero_exit_rebase_with_unmerged_index_keeps_conflict_correction(self):
+        checkpoint = mock.Mock()
+        checkpoint.get.return_value = CheckpointRecord(
+            generation=1, operation='rebase', expected_head='before',
+            target_base_oid='new-base', snapshot={'staged_paths': ['app.py']},
+        )
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        original_git = self.git
+
+        def conflicted_git(path, *args, **kwargs):
+            if args[:2] == ('ls-files', '-u'):
+                return SimpleNamespace(
+                    stdout='100644 ' + 'a' * 40 + ' 1\tapp.py\0',
+                    returncode=0,
+                )
+            return original_git(path, *args, **kwargs)
+
+        self.effects.workspace.git.side_effect = conflicted_git
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = False
+        context = self.context('VERIFYING')
+        before = self.state.row()['active_sha']
+
+        result = self.handler._post_rebase_observation(
+            context, 'new-base', 'Created autostash: deadbee\nconflicts',
+        )
+
+        self.assertEqual(result.recovery.observation.reason.value, 'rebase_conflict')
+        self.assertEqual(self.state.row()['active_sha'], before)
+        self.assertEqual(self.state.row()['phase'], 'WORKING')
+        saved = checkpoint.record.call_args.kwargs['snapshot']
+        self.assertIn('100644 ' + 'a' * 40, saved['unmerged_index'])
+
+    def test_publication_intent_records_expected_head_and_completes(self):
+        checkpoint = mock.Mock()
+        checkpoint.get.side_effect = [
+            CheckpointRecord(generation=1),
+            CheckpointRecord(generation=2, operation='push',
+                             expected_head='base', target_base_oid='base',
+                             observed_remote_oid='old'),
+        ]
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        context = self.context('PUBLISHING')
+
+        self.handler._publication_intent(context, 'push', 'old')
+        self.assertEqual(checkpoint.record.call_args_list[0].kwargs['operation'], 'push')
+        self.assertEqual(checkpoint.record.call_args_list[0].kwargs['expected_head'], 'base')
+        self.handler._complete_publication_intent(context)
+        self.assertIsNone(checkpoint.record.call_args_list[1].kwargs['operation'])
+
+    def test_preparation_recovery_corrects_owned_stale_markers_before_verify(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        self.state.update_project(
+            'repo', phase='PUBLISHING', active_sha='old-base',
+            validated_base_sha='old-base', worker_session_id='worker-session',
+            verify_result='PASS', review_result='PASS',
+        )
+        self.remote = 'new-base'
+
+        def observed_git(path, *args, **kwargs):
+            if args[0] == 'symbolic-ref':
+                return SimpleNamespace(stdout='loop-manager/G-047\n', returncode=0)
+            if args[0] == 'ls-files':
+                return SimpleNamespace(stdout='', returncode=0)
+            if args[:2] == ('diff', '--cached'):
+                return SimpleNamespace(stdout='', returncode=0)
+            if args[0] == 'merge-base':
+                return SimpleNamespace(stdout='', returncode=0)
+            if args == ('rev-parse', 'HEAD'):
+                return SimpleNamespace(stdout='owned-head\n', returncode=0)
+            return self.git(path, *args, **kwargs)
+
+        self.effects.workspace.git.side_effect = observed_git
+        context = self.context()
+        recovered = self.handler.recover(context)
+
+        self.assertEqual(recovered.phase, ExecutionPhase.VERIFYING)
+        row = self.state.row()
+        self.assertEqual(row['active_sha'], 'new-base')
+        self.assertEqual(row['worker_session_id'], 'worker-session')
+        self.assertIsNone(row['verify_result'])
+        self.assertIsNone(row['review_result'])
+        self.effects.validation.verify.assert_not_called()
+
+    def test_preparation_leaves_new_rebase_to_verify_checkpoint(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        self.state.update_project(
+            'repo', phase='VERIFYING', worker_result='saved worker output',
+            worker_session_id='worker-session',
+        )
+        self.remote = 'new-base'
+
+        def stale_base_git(path, *args, **kwargs):
+            if args[0] == 'merge-base':
+                return SimpleNamespace(stdout='', returncode=1)
+            return self.observed_git(path, *args, **kwargs)
+
+        self.effects.workspace.git.side_effect = stale_base_git
+        recovered = self.handler.recover(self.context())
+
+        self.assertEqual(recovered.phase, ExecutionPhase.VERIFYING)
+        self.assertEqual(self.state.row()['worker_result'], 'saved worker output')
+        self.assertEqual(self.state.row()['worker_session_id'], 'worker-session')
+        self.assertEqual(self.state.row()['active_sha'], 'base')
+        self.assertNotIn('rebase', [call.args[1] for call in self.effects.workspace.git.call_args_list])
+        self.effects.publication.pr_for_branch.assert_not_called()
+
+    def test_preparation_preserves_existing_rebase_correction_diagnostic(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        message = lm.REBASE_CONFLICT_PREFIX + 'Worker 결과 검증 실패: actionable output'
+        self.state.update_project(
+            'repo', phase='WORKING', last_error=message,
+            worker_session_id='worker-session',
+        )
+        self.effects.workspace.is_directory.return_value = True
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        self.effects.workspace.git.side_effect = self.observed_git
+
+        recovered = self.handler.recover(self.context())
+
+        self.assertTrue(recovered.resolving_rebase)
+        self.assertEqual(self.state.row()['last_error'], message)
+        self.assertEqual(self.state.row()['worker_session_id'], 'worker-session')
+
+    def test_review_failure_checkpoint_resumes_worker_without_pr_lookup(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        self.state.update_project(
+            'repo', phase='WORKING', active_sha='base',
+            validated_base_sha=None, worker_session_id='worker-session',
+            worker_result='previous worker result',
+            review_result='VERDICT: FAIL', last_error='Review 실패: fix issue',
+        )
+        self.effects.workspace.git.side_effect = self.observed_git
+
+        recovered = self.handler.recover(self.context())
+
+        self.assertEqual(recovered.phase, ExecutionPhase.IMPLEMENTING)
+        self.assertEqual(self.state.row()['last_error'], 'Review 실패: fix issue')
+        self.assertEqual(self.state.row()['worker_result'], 'previous worker result')
+        self.effects.publication.pr_for_branch.assert_not_called()
+
+    def test_new_activation_drops_old_execution_head_checkpoint(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        self.handler.newly_activated = True
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0,
+            operation=None, expected_head='old-execution-head',
+            target_base_oid='old-base', observed_remote_oid=None,
+            snapshot={'old_phase': 'PUBLISHING'},
+        )
+        self.effects.workspace.git.side_effect = self.observed_git
+
+        recovered = self.handler.recover(self.context())
+
+        self.assertEqual(recovered.phase, ExecutionPhase.IMPLEMENTING)
+        saved = checkpoint.get('repo', 'G-047')
+        self.assertEqual(saved.expected_head, 'owned-head')
+        self.assertEqual(saved.snapshot['reactivated_from_head'],
+                         'old-execution-head')
+
+    def test_external_remote_checkpoint_uses_publication_ownership_cause(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        self.effects.workspace.git.side_effect = self.observed_git
+        self.effects.workspace.remote_branch_oid.return_value = 'external-head'
+
+        result = self.handler.recover(self.context('PUBLISHING'))
+
+        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertEqual(result.recovery.observation.reason,
+                         handlers.RecoveryReason.REMOTE_OID_UNCERTAIN)
+        self.assertIn('갱신을 거부', result.recovery.observation.detail)
+
+    def test_preparation_resumes_durable_rebase_continue_without_worker(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        self.state.update_project(
+            'repo', phase='WORKING', active_sha='old-base',
+            validated_base_sha=None, worker_result='saved correction',
+            last_error=lm.REBASE_CONFLICT_PREFIX + 'conflict',
+        )
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0, operation='rebase',
+            expected_head='old-head', target_base_oid='new-base',
+            observed_remote_oid=None,
+            snapshot={'pending': 'continue', 'worker_result': 'saved correction'},
+        )
+        self.remote = 'new-base'
+        operation = {'rebase': True}
+
+        def observed_git(path, *args, **kwargs):
+            if args[0] == 'symbolic-ref':
+                return SimpleNamespace(stdout='loop-manager/G-047\n', returncode=0)
+            if args[0] == 'ls-files':
+                return SimpleNamespace(stdout='', returncode=0)
+            if args[:2] == ('diff', '--cached'):
+                return SimpleNamespace(stdout='', returncode=0)
+            if args[0] == 'merge-base':
+                return SimpleNamespace(stdout='', returncode=0)
+            if args == ('rev-parse', 'HEAD'):
+                return SimpleNamespace(stdout='owned-head\n', returncode=0)
+            if args[:2] == ('rebase', '--skip'):
+                operation['rebase'] = False
+                return SimpleNamespace(stdout='completed', returncode=0)
+            return self.git(path, *args, **kwargs)
+
+        self.effects.workspace.git.side_effect = observed_git
+        self.effects.workspace._rebase_in_progress_for_branch.side_effect = (
+            lambda *_: operation['rebase']
+        )
+        context = self.context()
+
+        recovered = self.handler.recover(context)
+
+        self.assertEqual(recovered.phase, ExecutionPhase.VERIFYING)
+        self.assertEqual(self.state.row()['worker_result'], 'saved correction')
+        self.assertEqual(self.state.row()['active_sha'], 'new-base')
+        self.assertIsNone(checkpoint.get('repo', 'G-047').operation)
+        self.effects.agent.run_agent.assert_not_called()
+
+    def test_resolved_rebase_then_verify_failure_returns_to_same_worker(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        self.state.update_project(
+            'repo', phase='WORKING', active_sha='base',
+            last_error=lm.REBASE_CONFLICT_PREFIX + 'conflict',
+            worker_session_id='worker-session', worker_result='old result',
+        )
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0, operation='rebase',
+            expected_head='before-head', target_base_oid='base',
+            observed_remote_oid=None, snapshot={},
+        )
+        self.effects.workspace.is_directory.return_value = True
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        self.effects.workspace.git.side_effect = self.observed_git
+
+        first = self.handler.run(self.context())
+        self.assertEqual(first.context.phase, ExecutionPhase.VERIFYING)
+        self.assertIsNone(checkpoint.get('repo', 'G-047').operation)
+
+        self.effects.validation.verify.side_effect = lambda _: (False, 'verify failure')
+
+        def fail_verify(_repo, _worktree, _stage, output):
+            self.state.update_project(
+                'repo', phase='WORKING', validated_base_sha=None,
+                verify_result=output, last_error='전체 검증 실패: ' + output,
+            )
+            return SimpleNamespace(blocked=False, fingerprint='verify-failure')
+
+        self.effects.validation.transition_validation_failure.side_effect = fail_verify
+        verified = self.handler.verify(first.context, self.handler)
+        self.assertEqual(verified.kind, ExecutionOutcomeKind.RETRY)
+        self.effects.agent.run_agent.side_effect = lambda *_args, **_kwargs: lm.AgentResult(
+            1, 'stop after same-run verify recovery', session_id='worker-session',
+        )
+
+        recovered = self.handler.recover(self.handler._context())
+        self.assertEqual(recovered.phase, ExecutionPhase.IMPLEMENTING)
+        second = self.handler.run(recovered)
+
+        self.assertEqual(second.kind, ExecutionOutcomeKind.OPERATIONAL_ERROR)
+        self.assertEqual(self.state.row()['last_error'],
+                         'stop after same-run verify recovery')
+        self.assertEqual(self.state.row()['worker_session_id'], 'worker-session')
+
+    def test_checkpoint_fetch_lock_preserves_intent_and_worker_session(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        self.state.update_project('repo', worker_session_id='worker-session')
+        self.effects.workspace.git.side_effect = lm.GitLockError('index.lock')
+
+        result = self.handler.recover(self.context())
+
+        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(result.recovery.observation.reason.value, 'git_lock')
+        self.assertTrue(checkpoint.get('repo', 'G-047').snapshot['fetch_in_progress'])
+        self.assertEqual(self.state.row()['worker_session_id'], 'worker-session')
+        self.effects.blocking.block_active_execplan.assert_not_called()
+
+    def test_worktree_recovery_failure_keeps_durable_pending_boundary(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        self.effects.workspace._plan_id_from_path.return_value = 'G-047'
+        self.effects.workspace.make_worktree.side_effect = RuntimeError('temporary worktree failure')
+        self.state.update_project('repo', worker_session_id='worker-session')
+
+        result = self.handler.prepare()
+
+        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+        saved = checkpoint.get('repo', 'G-047').snapshot
+        self.assertTrue(saved['worktree_recovery_pending'])
+        self.assertEqual(saved['branch'], 'loop-manager/G-047')
+        self.assertEqual(self.state.row()['worker_session_id'], 'worker-session')
+        self.effects.blocking.block_active_execplan.assert_not_called()
+
+    def test_commit_command_failure_preserves_expected_head_intent(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+
+        def failing_git(path, *args, **kwargs):
+            if args == ('rev-parse', 'HEAD'):
+                return SimpleNamespace(stdout='before-head\n', returncode=0)
+            if args[0] == 'commit':
+                raise lm.GitLockError('index.lock')
+            return self.git(path, *args, **kwargs)
+
+        self.effects.workspace.git.side_effect = failing_git
+        with self.assertRaises(lm.GitLockError):
+            self.handler._commit_owned(self.context('VERIFYING'), 'change')
+        saved = checkpoint.get('repo', 'G-047')
+        self.assertEqual(saved.operation, 'commit')
+        self.assertEqual(saved.expected_head, 'before-head')
+        self.assertEqual(self.state.row()['phase'], 'VERIFYING')
 
     def test_final_block_uses_current_verify_output_before_project_checkpoint(self):
         result = self.handler._block_final(
@@ -929,7 +1279,7 @@ class ExecutionHandlerTests(TestCase):
         self.effects.publication.reconcile_existing_pull_request.return_value = 0
         result = self.handler.publish(self.context('PUBLISHING'), self.handler)
         self.assertEqual(result.kind, ExecutionOutcomeKind.SUCCESS)
-        self.assertEqual(self.calls, [])
+        self.assertEqual(self.calls, ['rev-parse'])
 
     def test_worker_format_scope_and_guidance_stop_before_verify(self):
         scenarios = ('format', 'scope', 'guidance')
@@ -1263,6 +1613,41 @@ class ExecutionHandlerTests(TestCase):
         self.handler.publish(self.context(), self.handler)
         self.assertEqual(self.calls.count('push'), 1)
         self.assertEqual(self.effects.publication.command.call_count, 1)
+
+    def test_pr_conflict_lease_rejection_blocks_without_opening_pr(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        self.state.update_project(
+            'repo', phase='PUBLISHING', active_sha='base',
+            validated_base_sha='base', publication_remote_oid='old-head',
+            pr_conflict_recovery=1, pr_conflict_head_oid='old-head',
+            pr_conflict_base_oid='base', pr_head_oid='old-head',
+            pr_url='https://example/pr/1',
+        )
+        self.effects.workspace.remote_branch_oid.return_value = 'old-head'
+        self.effects.workspace.git.side_effect = self.observed_git
+        self.effects.publication.pr_for_branch.return_value = {
+            'url': 'https://example/pr/1', 'state': 'OPEN',
+            'headRefName': 'loop-manager/G-047', 'headRefOid': 'old-head',
+        }
+        self.effects.publication.reconcile_existing_pull_request.return_value = None
+        self.effects.publication.push_owned_pr_conflict_recovery.side_effect = (
+            lm.PublicationSafetyError('lease rejected')
+        )
+
+        prepared = self.handler.recover(self.context())
+        self.assertEqual(prepared.phase, ExecutionPhase.PUBLISHING)
+        result = self.handler.publish(prepared, self.handler)
+
+        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertEqual(
+            self.effects.blocking.block_active_execplan.call_args.kwargs['reason'],
+            lm.BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
+        )
+        self.effects.publication.push_owned_pr_conflict_recovery.assert_called_once()
+        self.effects.state.check()
+        self.assertEqual(self.state.row()['phase'], 'PUBLISHING')
 
     def test_publication_uses_immutable_plan_link_with_reconciled_metadata(self):
         self.connection.execute(

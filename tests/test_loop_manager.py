@@ -3629,7 +3629,11 @@ risk: medium
             (blocked_result, unchanged_result, metadata_result, resumed_result),
             (0, 0, 0, 1),
         )
-        self.assertEqual(roles, ["worker", "worker"])
+        self.assertEqual(
+            roles, ["worker", "worker"],
+            (resumed_result, resumed_project["phase"], resumed_project["last_error"],
+             resumed_plan["status"], resumed_plan["last_error"]),
+        )
         verify.assert_called_once()
         self.assertIsNone(blocked_project["phase"])
         self.assertEqual(blocked_plan["verify_result"], "verify: PASS")
@@ -6127,8 +6131,7 @@ class WorkerPublicationTest(unittest.TestCase):
             with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
                 "loop_manager.remote_base", return_value="main"
             ), mock.patch("loop_manager.ensure_safe_base_worktree"), mock.patch(
-                "loop_manager.pr_for_branch",
-                side_effect=[None, None, None, None],
+                "loop_manager.pr_for_branch", return_value=None,
             ), mock.patch("loop_manager.run_codex", side_effect=agent), mock.patch(
                 "loop_manager.verify",
                 side_effect=[(False, "verify failed"), (True, "verify: PASS"), (True, "verify: PASS")],
@@ -6595,6 +6598,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "blocked_checkpoint.py",
                 "blocked_checkpoint_state.py",
                 "loop_manager.py",
+                "execution_checkpoint.py",
+                "execution_checkpoint_state.py",
                 "execution_runtime.py",
                 "execution_handlers.py",
                 "execution_revision.py",
@@ -6611,6 +6616,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "maintenance_state.py",
                 "notifications.py",
                 "planning_runtime.py",
+                "publication_resume.py",
                 "project_registry.py",
                 "recovery_dispatcher.py",
                 "recovery_runtime.py",
@@ -10091,7 +10097,22 @@ class WorkspaceRecoveryTest(unittest.TestCase):
                 "SELECT phase, last_error FROM projects WHERE repo = ?",
                 (str(repo),),
             ).fetchone()
-            self.assertEqual(resumed_result, 1)
+            checkpoint = connection.execute(
+                "SELECT operation, snapshot FROM execution_checkpoints "
+                "WHERE repo = ? AND plan_id = 'G-012'",
+                (str(repo),),
+            ).fetchone()
+            recovery = connection.execute(
+                "SELECT subject, disposition, detail FROM recovery_records "
+                "WHERE repo = ? ORDER BY updated_at DESC LIMIT 1",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(
+                resumed_result, 1,
+                (sessions, resumed["phase"], resumed["last_error"],
+                 dict(checkpoint) if checkpoint else None,
+                 dict(recovery) if recovery else None),
+            )
             self.assertEqual(
                 sessions, ["worker-session", "worker-session"]
             )
@@ -13447,7 +13468,11 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                 """,
                 (str(repo),),
             ).fetchone()
-            self.assertEqual(outcome.kind, loop_manager.ProjectRunKind.BLOCKED)
+            self.assertEqual(
+                outcome.kind, loop_manager.ProjectRunKind.BLOCKED,
+                (outcome.detail, stored["status"],
+                 stored["pr_conflict_recovery"], pushes),
+            )
             self.assertEqual(stored["status"], "PUBLISHING")
             self.assertEqual(stored["pr_conflict_recovery"], 1)
             self.assertEqual(stored["pr_conflict_head_oid"], observed_head)

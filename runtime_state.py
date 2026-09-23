@@ -268,6 +268,8 @@ class ExecutionSnapshot:
     plan_id: str
     path: str
     status: str
+    catalog_generation: int
+    current_revision_sha: str | None
     plan_sha: str | None
     active_sha: str | None
     validated_base_sha: str | None
@@ -314,6 +316,8 @@ class ExecutionSnapshot:
             plan_id=str(row["plan_id"]),
             path=str(row["path"]),
             status=str(row["status"]),
+            catalog_generation=int(row["catalog_generation"]),
+            current_revision_sha=_text(row, "current_revision_sha"),
             plan_sha=_text(row, "plan_sha"),
             active_sha=_text(row, "active_sha"),
             validated_base_sha=_text(row, "validated_base_sha"),
@@ -699,6 +703,40 @@ class RuntimeStateRepository:
                 plan_values=plan_values,
                 project_values=project_values,
             )
+
+    def correct_checkpoint(
+        self, expected: ExecutionSnapshot, *, phase: str,
+        active_sha: str | None, validated_base_sha: str | None,
+        invalidate_validation: bool,
+        expected_catalog: tuple[int, str | None] | None = None,
+    ) -> ExecutionSnapshot:
+        """Apply an already assessed correction against the complete row snapshot."""
+        if phase not in ACTIVE_STATUSES:
+            raise ValueError("invalid checkpoint phase")
+        if expected_catalog is not None and (
+            expected.catalog_generation, expected.current_revision_sha
+        ) != expected_catalog:
+            raise RuntimeStateError("checkpoint catalog revision이 변경되었습니다.")
+        values: dict[str, object] = {
+            "phase": project_phase_for_status(phase),
+            "active_sha": active_sha,
+            "validated_base_sha": validated_base_sha,
+            "last_error": None,
+            "revision_resume_status": None,
+        }
+        if invalidate_validation:
+            values.update(
+                verify_result=None, review_result=None, verify_token=None,
+                review_token=None, publication_token=None,
+            )
+        return self.transition_from_snapshot(
+            expected,
+            plan_values={
+                **{key: value for key, value in values.items() if key != "phase"},
+                "status": phase,
+            },
+            project_values=values,
+        )
 
     def activate(
         self,
