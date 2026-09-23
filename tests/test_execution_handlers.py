@@ -230,6 +230,45 @@ class ExecutionHandlerTests(TestCase):
         self.assertEqual(self.calls.count('push'), 1)
         self.assertEqual(self.effects.publication.command.call_count, 1)
 
+    def test_publication_uses_immutable_plan_link_with_reconciled_metadata(self):
+        self.connection.execute(
+            "UPDATE exec_plans SET title = 'Current Runtime', "
+            "publication_path = 'docs/plans/[G-047] Original Runtime.md', "
+            "publication_content_hash = 'original-hash', "
+            "publication_sha = ? WHERE repo = 'repo' AND plan_id = 'G-047'",
+            ("a" * 40,),
+        )
+        self.connection.commit()
+        self.plan = {
+            'id': 'G-047', 'title': 'Current Runtime',
+            'sources': ['docs/PRODUCT.md'], 'depends_on': [],
+            'complexity': 'low', 'risk': 'low', 'priority': 'normal',
+        }
+        self.handler.plan = self.plan
+        self.handler.catalog_plan = self.repository.active_row('repo')
+        self.effects.publication.published_execplan.return_value = {
+            **self.plan, 'title': 'Original Runtime',
+        }
+        self.state.update_project('repo', phase='PUBLISHING', validated_base_sha='base')
+
+        result = self.handler.publish(self.context(), self.handler)
+
+        self.assertEqual(result.kind, ExecutionOutcomeKind.SUCCESS)
+        show = [
+            call for call in self.effects.workspace.git.call_args_list
+            if len(call.args) >= 3 and call.args[1] == 'show'
+        ]
+        self.assertEqual(
+            show[-1].args[2],
+            f"{'a' * 40}:docs/plans/[G-047] Original Runtime.md",
+        )
+        build = self.effects.publication.build_pr_body.call_args.args
+        self.assertEqual(build[1]['title'], 'Current Runtime')
+        self.assertEqual(
+            build[2], 'docs/plans/[G-047] Original Runtime.md'
+        )
+        self.assertEqual(build[5], 'a' * 40)
+
     def test_workspace_violation_blocks_before_agent(self):
         self.effects.workspace._plan_id_from_path.return_value = 'G-047'
         self.effects.workspace.validate_execplan_workspace_identity.side_effect = lm.WorkspaceOwnershipError('ownership')

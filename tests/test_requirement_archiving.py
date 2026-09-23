@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 import loop_manager
+import execplan_catalog_state
 
 
 def git(repo: Path, *arguments: str) -> str:
@@ -266,6 +267,54 @@ class RequirementArchiveEligibilityTest(unittest.TestCase):
                 actual,
             ),
         )
+
+    def test_reconciled_source_removal_does_not_block_independent_current_plan(self):
+        source = self.requirement("G031 Source")
+        self.plan("G-031", "Changed Source", (source,), "READY")
+        self.plan(
+            "G-035", "Independent Current", ("docs/PRODUCT.md",),
+            "IMPLEMENTING",
+        )
+        self.commit("Initial catalog")
+        plan_path = self.repo / "docs/plans/[G-031] Changed Source.md"
+        plan_path.write_text(
+            plan_path.read_text(encoding="utf-8").replace(
+                f"  - {source}", "  - docs/PRODUCT.md"
+            ),
+            encoding="utf-8",
+        )
+        revision = self.commit("Remove stale source relation")
+        snapshot = loop_manager.revision_execplan_snapshot(self.repo, revision)
+        pinned = execplan_catalog_state.PinnedCatalog(revision, snapshot)
+
+        class Port:
+            def load(self):
+                return pinned
+
+            def current_revision(self):
+                return revision
+
+        result = execplan_catalog_state.CatalogReconciliationService(
+            execplan_catalog_state.DefinitionStateRepository(self.connection),
+            Port(),
+        ).reconcile(str(self.repo))
+
+        self.assertEqual(
+            result.kind, execplan_catalog_state.ReconciliationKind.RECONCILED
+        )
+        changed = self.connection.execute(
+            "SELECT sources, status FROM exec_plans WHERE repo = ? "
+            "AND plan_id = 'G-031'",
+            (str(self.repo),),
+        ).fetchone()
+        independent = self.connection.execute(
+            "SELECT status FROM exec_plans WHERE repo = ? AND plan_id = 'G-035'",
+            (str(self.repo),),
+        ).fetchone()
+        self.assertEqual(json.loads(changed["sources"]), ["docs/PRODUCT.md"])
+        self.assertEqual(changed["status"], "READY")
+        self.assertEqual(independent["status"], "IMPLEMENTING")
+        self.assertEqual(self.candidates(revision, "G-035"), ())
 
     def test_later_registered_plan_uses_immutable_plan_commit(self):
         source = self.requirement("Later Plan")

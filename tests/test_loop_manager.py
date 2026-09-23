@@ -365,6 +365,11 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                 ),
                 identity_verified=False,
             )
+            connection.execute(
+                "INSERT INTO execplan_catalog_revisions "
+                "(repo, revision_sha, catalog_fingerprint) VALUES (?, ?, ?)",
+                (str(root), publication_sha, "initialized-archive"),
+            )
             connection.commit()
 
             with mock.patch("loop_manager.pr_for_branch", return_value=None) as lookup:
@@ -566,12 +571,23 @@ class AutomationFirstCatalogTest(unittest.TestCase):
             active = write_execplan(root, "G-001", "Stored Merge")
             commit_and_push(root, "Add stored merge plan")
             publication_sha = git_command(root, "rev-parse", "HEAD")
+            publication_hash = hashlib.sha256(active.read_bytes()).hexdigest()
+            active.write_text(
+                active.read_text(encoding="utf-8")
+                + "\nReconciled before archive.\n",
+                encoding="utf-8",
+            )
+            commit_and_push(root, "Revise stored merge plan")
+            current_hash = hashlib.sha256(active.read_bytes()).hexdigest()
             archive = root / "docs/plans/archive"
             archive.mkdir()
             archived = archive / active.name
             active.rename(archived)
             commit_and_push(root, "Archive stored merge plan")
-            content_hash = hashlib.sha256(archived.read_bytes()).hexdigest()
+            self.assertEqual(
+                hashlib.sha256(archived.read_bytes()).hexdigest(),
+                current_hash,
+            )
 
             connection = sqlite3.connect(":memory:")
             connection.row_factory = sqlite3.Row
@@ -585,14 +601,20 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                 """
                 INSERT INTO exec_plans (
                     repo, plan_id, path, title, sources, depends_on, priority,
-                    content_hash, status, plan_sha
+                    content_hash, publication_path,
+                    publication_content_hash, publication_sha,
+                    status, plan_sha
                 ) VALUES (?, 'G-001', ?, 'Stored Merge',
-                          '["docs/PRODUCT.md"]', '[]', 'normal', ?, 'MERGED', ?)
+                          '["docs/PRODUCT.md"]', '[]', 'normal', ?, ?, ?, ?,
+                          'MERGED', ?)
                 """,
                 (
                     str(root),
                     "docs/plans/[G-001] Stored Merge.md",
-                    content_hash,
+                    current_hash,
+                    "docs/plans/[G-001] Stored Merge.md",
+                    publication_hash,
+                    publication_sha,
                     publication_sha,
                 ),
             )
@@ -3615,7 +3637,10 @@ risk: medium
         self.assertEqual(rejected_metadata["status"], "PLAN_BLOCKED")
         self.assertEqual(rejected_metadata["priority"], "normal")
         self.assertEqual(rejected_metadata["depends_on"], "[]")
-        self.assertIn("고정 메타데이터는 변경할 수 없습니다", rejected_metadata["last_error"])
+        self.assertIn(
+            "reconciled catalog와 다릅니다",
+            rejected_metadata["last_error"],
+        )
         self.assertEqual(rejected_metadata["retry_count"], 2)
         self.assertEqual(resumed_project["phase"], "WORKING")
         self.assertEqual(resumed_project["last_error"], "stop after source change")
@@ -7088,26 +7113,24 @@ class AgentScopeValidatorTest(unittest.TestCase):
             self.assertEqual(tuple(plan), ("IMPLEMENTING", session_id))
             self.assertEqual(source_note.read_text(encoding="utf-8"), "preserve me\n")
 
-    def test_active_execplan_fixed_metadata_must_match_published_plan(self):
+    def test_active_execplan_uses_reconciled_identity_not_publication_equality(self):
         replacements = (
             (
                 "sources",
                 "sources:\n  - docs/PRODUCT.md",
                 "sources:\n  - docs/requirements/Active.md",
-                True,
             ),
             (
                 "depends_on",
                 "depends_on: []",
                 "depends_on:\n  - G-002",
-                True,
             ),
-            ("complexity", "complexity: low", "complexity: medium", True),
-            ("risk", "risk: low", "risk: high", True),
-            ("priority", "priority: normal", "priority: critical", True),
-            ("body", "Test plan.", "Updated implementation progress.", False),
+            ("complexity", "complexity: low", "complexity: medium"),
+            ("risk", "risk: low", "risk: high"),
+            ("priority", "priority: normal", "priority: critical"),
+            ("body", "Test plan.", "Updated implementation progress."),
         )
-        for name, original, replacement, rejected in replacements:
+        for name, original, replacement in replacements:
             with self.subTest(field=name):
                 with tempfile.TemporaryDirectory() as directory:
                     repo, plan_path = self._repository_with_plan(directory)
@@ -7147,6 +7170,10 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     assert stored is not None
 
                     plan_file = repo / plan_path
+                    if name == "sources":
+                        requirement = repo / "docs/requirements/Active.md"
+                        requirement.parent.mkdir(parents=True, exist_ok=True)
+                        requirement.write_text("# Active\n", encoding="utf-8")
                     plan_file.write_text(
                         plan_file.read_text(encoding="utf-8").replace(
                             original,
@@ -7154,26 +7181,41 @@ class AgentScopeValidatorTest(unittest.TestCase):
                         ),
                         encoding="utf-8",
                     )
-
-                    if rejected:
-                        with self.assertRaisesRegex(
-                            RuntimeError,
-                            "고정 메타데이터는 변경할 수 없습니다",
-                        ):
-                            loop_manager.validate_active_execplan_metadata(
-                                repo,
-                                repo,
-                                plan_path,
-                                stored,
-                            )
-                    else:
-                        current = loop_manager.validate_active_execplan_metadata(
-                            repo,
-                            repo,
-                            plan_path,
-                            stored,
+                    if name != "body":
+                        revised = loop_manager.validate_execplan(repo, plan_path)
+                        sources, dependencies, priority = (
+                            loop_manager._execplan_metadata(revised)
                         )
-                        self.assertEqual(current["id"], "G-001")
+                        connection.execute(
+                            "UPDATE exec_plans SET sources = ?, depends_on = ?, "
+                            "priority = ?, content_hash = ?, "
+                            "current_complexity = ?, current_risk = ? "
+                            "WHERE repo = ? AND plan_id = 'G-001'",
+                            (
+                                sources,
+                                dependencies,
+                                priority,
+                                loop_manager.file_hash(plan_file),
+                                revised["complexity"],
+                                revised["risk"],
+                                str(repo),
+                            ),
+                        )
+                        connection.commit()
+                        stored = loop_manager.active_execplan(
+                            connection,
+                            str(repo),
+                        )
+                        self.assertIsNotNone(stored)
+                        assert stored is not None
+
+                    current = loop_manager.validate_active_execplan_metadata(
+                        repo,
+                        repo,
+                        plan_path,
+                        stored,
+                    )
+                    self.assertEqual(current["id"], "G-001")
 
     def test_git_config_changes_are_rejected_without_leaking_values(self):
         scenarios = (

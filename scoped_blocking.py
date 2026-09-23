@@ -36,6 +36,7 @@ class BlockReasonCode(str, Enum):
     REPOSITORY_STATE_UNSAFE = "repository_state_unsafe"
     WORKSPACE_OWNERSHIP_UNCERTAIN = "workspace_ownership_uncertain"
     PUBLICATION_OWNERSHIP_UNCERTAIN = "publication_ownership_uncertain"
+    EXECPLAN_CATALOG_INVALID = "execplan_catalog_invalid"
     LEGACY_UNSCOPED_BLOCK = "legacy_unscoped_block"
 
 

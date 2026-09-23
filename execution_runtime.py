@@ -45,6 +45,12 @@ class ExecutionPlanMetadata:
     path: str
     plan_sha: str | None
     sources: tuple[str, ...] = ()
+    definition_revision_sha: str | None = None
+    content_hash: str | None = None
+    depends_on: tuple[str, ...] = ()
+    complexity: str | None = None
+    risk: str | None = None
+    priority: str | None = None
 
 
 @dataclass(frozen=True)

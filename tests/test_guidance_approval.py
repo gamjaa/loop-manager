@@ -807,6 +807,16 @@ Patch:
                         {"plan_sha": plan_sha, "path": conjunctive_path},
                     )
                 )
+                self.assertTrue(
+                    loop_manager._published_plan_allows_common_plans(
+                        repo,
+                        {
+                            "current_revision_sha": plan_sha,
+                            "plan_sha": "0" * 40,
+                            "path": explicit_path,
+                        },
+                    )
+                )
             with mock.patch("loop_manager.is_loop_manager_repository", return_value=False):
                 self.assertFalse(
                     loop_manager._published_plan_allows_common_plans(
