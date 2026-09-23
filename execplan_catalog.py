@@ -8,6 +8,7 @@ plans while validating identity and dependencies across both collections.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 import hashlib
 from pathlib import Path, PurePosixPath
 import re
@@ -22,6 +23,102 @@ _ACTIVE_PATH = re.compile(r"docs/plans/\[(G-\d{3,})\] [^/]+\.md")
 _ARCHIVED_PATH = re.compile(
     r"docs/plans/archive/\[(G-\d{3,})\] [^/]+\.md"
 )
+_ACTIVE_REQUIREMENT_PATH = re.compile(r"docs/requirements/[^/]+\.md")
+
+
+class ArchiveDocumentKind(str, Enum):
+    """Document families whose byte-preserving moves are lifecycle-neutral."""
+
+    REQUIREMENT = "requirement"
+    EXECPLAN = "execplan"
+
+
+@dataclass(frozen=True)
+class CatalogArchiveMove:
+    kind: ArchiveDocumentKind
+    source: str
+    destination: str
+
+
+@dataclass(frozen=True)
+class ArchiveOnlyChange:
+    """Classification of a whole-tree change as content-preserving moves."""
+
+    moves: tuple[CatalogArchiveMove, ...] = ()
+
+    @property
+    def archive_only(self) -> bool:
+        return bool(self.moves)
+
+    @property
+    def requirement_only(self) -> bool:
+        return self.archive_only and all(
+            move.kind is ArchiveDocumentKind.REQUIREMENT for move in self.moves
+        )
+
+    @property
+    def execplan_only(self) -> bool:
+        return self.archive_only and all(
+            move.kind is ArchiveDocumentKind.EXECPLAN for move in self.moves
+        )
+
+
+def _archive_destination(path: str) -> tuple[ArchiveDocumentKind, str] | None:
+    if _ACTIVE_REQUIREMENT_PATH.fullmatch(path):
+        filename = path.removeprefix("docs/requirements/")
+        return (
+            ArchiveDocumentKind.REQUIREMENT,
+            f"docs/requirements/archive/{filename}",
+        )
+    if _ACTIVE_PATH.fullmatch(path):
+        filename = path.removeprefix("docs/plans/")
+        return (
+            ArchiveDocumentKind.EXECPLAN,
+            f"docs/plans/archive/{filename}",
+        )
+    return None
+
+
+def classify_archive_only_tree_change(
+    previous: Mapping[str, object],
+    current: Mapping[str, object],
+) -> ArchiveOnlyChange:
+    """Recognize only exact active-to-archive moves with identical tree entries.
+
+    Values are opaque but must compare equal for byte/mode identity.  Callers
+    can therefore supply Git ``(mode, type, object-id)`` tuples or test tokens
+    without coupling this pure catalog rule to Git subprocesses.
+    """
+
+    removed = set(previous) - set(current)
+    added = set(current) - set(previous)
+    changed = {
+        path
+        for path in set(previous) & set(current)
+        if previous[path] != current[path]
+    }
+    if not removed or changed:
+        return ArchiveOnlyChange()
+
+    moves: list[CatalogArchiveMove] = []
+    expected_added: set[str] = set()
+    for source in sorted(removed):
+        target = _archive_destination(source)
+        if target is None:
+            return ArchiveOnlyChange()
+        kind, destination = target
+        if (
+            destination in previous
+            or destination not in added
+            or current[destination] != previous[source]
+        ):
+            return ArchiveOnlyChange()
+        expected_added.add(destination)
+        moves.append(CatalogArchiveMove(kind, source, destination))
+
+    if added != expected_added:
+        return ArchiveOnlyChange()
+    return ArchiveOnlyChange(tuple(moves))
 
 
 class ExecPlanCatalogError(RuntimeError):

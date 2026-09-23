@@ -6584,6 +6584,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "execution_handlers.py",
                 "execution_state.py",
                 "guidance_approval.py",
+                "execplan_archive.py",
+                "execplan_archive_state.py",
                 "execplan_catalog.py",
                 "execplan_catalog_state.py",
                 "managed_config.py",
@@ -14934,6 +14936,162 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
             loop_manager.build_parser().parse_args(
                 ["run", "--provider", "claude"]
             )
+
+
+class ExecPlanArchiveHousekeepingAdapterTest(unittest.TestCase):
+    def test_archive_housekeeping_waits_for_due_or_active_maintenance_cycle(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute(loop_manager.SCHEMA)
+        loop_manager._ensure_execplans_schema(connection)
+        connection.execute(
+            "INSERT INTO projects (repo, base_branch) VALUES ('/repo', 'main')"
+        )
+        connection.commit()
+
+        self.assertTrue(
+            loop_manager._execplan_archive_housekeeping_safe(
+                connection,
+                "/repo",
+                None,
+                maintenance_assessment_enabled=False,
+                refactoring_review_interval=5,
+            )
+        )
+        self.assertFalse(
+            loop_manager._execplan_archive_housekeeping_safe(
+                connection,
+                "/repo",
+                None,
+                maintenance_assessment_enabled=True,
+                refactoring_review_interval=5,
+            )
+        )
+        repository = loop_manager.maintenance_state.MaintenanceRepository(
+            connection
+        )
+        cycle, started = repository.begin_assessment_if_due(
+            "/repo", 5, "a" * 40
+        )
+
+        self.assertTrue(started)
+        self.assertEqual(
+            cycle.phase,
+            loop_manager.maintenance_state.MaintenancePhase.ASSESSMENT,
+        )
+        self.assertFalse(
+            loop_manager._execplan_archive_housekeeping_safe(
+                connection,
+                "/repo",
+                None,
+                maintenance_assessment_enabled=True,
+                refactoring_review_interval=5,
+            )
+        )
+        idle = repository.advance_success_baseline(
+            "/repo",
+            expected_phase=cycle.phase,
+            expected_revision=cycle.revision,
+            remote_commit="b" * 40,
+        )
+        self.assertEqual(
+            idle.phase,
+            loop_manager.maintenance_state.MaintenancePhase.IDLE,
+        )
+        self.assertTrue(
+            loop_manager._execplan_archive_housekeeping_safe(
+                connection,
+                "/repo",
+                None,
+                maintenance_assessment_enabled=True,
+                refactoring_review_interval=5,
+            )
+        )
+        connection.close()
+
+    def test_archive_staging_does_not_add_the_deleted_source_pathspec(self):
+        workspace = Path("/archive-worktree")
+        move = loop_manager.execplan_archive.ArchiveMove(
+            "G-000",
+            "docs/plans/[G-000] Merged Foundation.md",
+            "docs/plans/archive/[G-000] Merged Foundation.md",
+            "content-hash",
+        )
+
+        with mock.patch("loop_manager.git") as git_mock:
+            loop_manager._ExecPlanArchiveGitPort._stage_archive_moves(
+                workspace, (move,)
+            )
+
+        self.assertEqual(
+            git_mock.call_args_list,
+            [
+                mock.call(
+                    workspace,
+                    "update-index",
+                    "--force-remove",
+                    "--",
+                    move.source,
+                ),
+                mock.call(
+                    workspace,
+                    "add",
+                    "--",
+                    f":(literal){move.destination}",
+                ),
+            ],
+        )
+
+    def test_planning_archive_classifier_delegates_exact_requirement_move(self):
+        source = b"docs/requirements/[R-001] Change.md"
+        destination = b"docs/requirements/archive/[R-001] Change.md"
+        value = (b"blob", b"object")
+        before = {source: value, b"src/app.py": value}
+        after = {destination: value, b"src/app.py": value}
+
+        with mock.patch(
+            "loop_manager._git_tree_entries", side_effect=(before, after)
+        ):
+            self.assertTrue(
+                loop_manager._is_requirement_archive_only_change(
+                    Path("/repo"), "old", "new"
+                )
+            )
+
+        changed = dict(after)
+        changed[b"src/app.py"] = (b"blob", b"changed")
+        with mock.patch(
+            "loop_manager._git_tree_entries", side_effect=(before, changed)
+        ):
+            self.assertFalse(
+                loop_manager._is_requirement_archive_only_change(
+                    Path("/repo"), "old", "new"
+                )
+            )
+
+    def test_pull_request_reconciliation_runs_housekeeping_before_selection(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute(loop_manager.SCHEMA)
+        loop_manager._ensure_execplans_schema(connection)
+        connection.execute(
+            "INSERT INTO projects (repo, base_branch) VALUES ('/repo', 'main')"
+        )
+        connection.commit()
+        calls = []
+
+        result = loop_manager.synchronize_waiting_pull_requests(
+            connection,
+            Path("/repo"),
+            Path("/state"),
+            "/repo",
+            after_reconciliation=lambda: calls.append("housekeeping"),
+        )
+
+        self.assertEqual(calls, ["housekeeping"])
+        self.assertIsNone(result.step_result)
+        self.assertFalse(result.conflict_started)
+        connection.close()
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@
 - ExecPlan 실행 상태, 재시도 횟수, AI Agent 세션과 작업 공간을 SQLite로 관리할 수 있다
 - Worker가 구현, 관련 테스트와 프로젝트별 전체 검증 스크립트를 작성할 수 있다
 - 마지막 관련 ExecPlan의 구현 PR에서 완료된 Requirement를 자동으로 archive할 수 있다
+- GitHub Merge가 확인된 MERGED ExecPlan을 구현 PR과 분리된 정리 commit으로 자동 archive할 수 있다
 - 전체 검증과 독립 Review를 자동으로 수행하고 실패 시 기존 작업을 이어서 수정할 수 있다
 - 검증이 완료된 작업으로 GitHub PR을 생성할 수 있다
 - 같은 프로젝트의 작업은 직렬로, 서로 다른 프로젝트는 설정된 동시 실행 수 안에서 병렬로 처리할 수 있다
@@ -66,6 +67,8 @@
 - 전체 검증 실패 또는 Reviewer의 blocking issue가 있는 작업으로 PR을 생성하지 않는다
 - 전체 검증은 Worker가 아니라 Loop Manager 코드가 실행하며 실패한 경우에만 Worker에게 결과를 전달한다
 - Requirement는 다른 모든 관련 ExecPlan이 MERGED인 마지막 구현 PR에서만 자동 archive한다
+- ExecPlan은 GitHub Merge 확인과 SQLite MERGED 전이 뒤에만 별도 정리 대상으로 삼고, 최신 원격 base의 detached 임시 worktree에서 내용 보존 rename-only commit으로 일괄 archive한다
+- ExecPlan archive는 원본 hash, regular-file source, 비어 있는 destination과 원격 base 불변성을 검증해 fast-forward로 직접 게시하며, 후보별 충돌·원격 경쟁·push 실패는 MERGED 상태와 다른 작업·완료 처리를 막지 않는 archive pending으로 재시도한다
 - ExecPlan은 연결된 PR이 실제로 Merge된 경우에만 MERGED 상태가 된다
 - 자동 작업의 Git 기준은 최신 `origin/<base-branch>`이며 로컬 base ref, 기본 worktree 파일과 로컬 전용 commit을 입력으로 사용하지 않는다
 - Codex가 Agent turn 추적을 위해 자동 생성·갱신·정리하는 `refs/codex/turn-diffs/*`는 게시 또는 workspace 소유권에 사용하지 않는 provider 소유의 비권위 임시 ref다. 그 namespace의 순변경만으로 Agent 범위 위반이나 `PROJECT_BLOCKED`를 만들지 않으며, 소유 branch, remote ref, tag와 그 밖의 공유 ref 변경은 계속 보호한다
@@ -218,10 +221,12 @@ ExecPlan 게시 실패:
 3. SQLite의 ExecPlan 상태를 MERGED로 변경한다
 4. PR Merge 방식과 관계없이 관리 worktree에 미커밋 변경이나 PR에 포함되지 않은 로컬 전용 commit이 없으면 정리한다
 5. 변경이 남아 있으면 worktree를 보존하고 `cleanup_pending`에 경로와 원인을 기록한다
-6. 의존성이 충족된 다음 READY ExecPlan이 있으면 새 관리 worktree에서 처리한다
-7. 대기 중인 ExecPlan이 없으면 Planner가 추가 ExecPlan이 필요한지 다시 확인한다
-8. 추가 작업이 없으면 프로젝트 완료 이벤트를 전송한다
-9. Merge된 PR에 archive 이동이 포함된 Requirement는 활성 Planner 입력에서 제외된다
+6. 최신 원격 base에서 안전한 MERGED ExecPlan을 `docs/plans/archive/`로 내용 변경 없이 일괄 이동하고 fast-forward로 직접 게시한다
+7. archive할 수 없는 후보는 원인과 operation identity를 저장하되 다음 READY·Planner·완료 처리를 계속한다
+8. 의존성이 충족된 다음 READY ExecPlan이 있으면 새 관리 worktree에서 처리한다
+9. 대기 중인 ExecPlan이 없으면 Planner가 추가 ExecPlan이 필요한지 다시 확인한다
+10. 추가 작업이 없으면 프로젝트 완료 이벤트를 전송한다
+11. Merge된 PR에 archive 이동이 포함된 Requirement는 활성 Planner 입력에서 제외된다
 
 실패:
 - PR이 Merge되지 않은 동안 완료 처리하지 않는다
@@ -280,7 +285,7 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 
 외부 CLI의 일시적 실패와 사용 한도 소진은 별도 ExecPlan 상태를 만들지 않고 현재 상태를 보존한다.
 
-`planning_error`와 `cleanup_pending`은 ExecPlan 상태가 아니다. `planning_error`는 해당 프로젝트의 새 계획과 완료 처리를 막지만, `cleanup_pending`은 이미 Merge된 작업의 보존 경고이므로 다음 ExecPlan 실행과 프로젝트 완료를 막지 않는다.
+`planning_error`, `cleanup_pending`과 ExecPlan archive pending은 ExecPlan 상태가 아니다. `planning_error`는 해당 프로젝트의 새 계획과 완료 처리를 막지만, `cleanup_pending`과 archive pending은 이미 Merge된 작업의 보존·재시도 정보이므로 다음 ExecPlan 실행과 프로젝트 완료를 막지 않는다.
 
 ## Business Rules
 
@@ -304,6 +309,8 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 - 일반 Planner는 실행 중인 작업과 READY ExecPlan이 모두 없는 선택 시점에만 최신 계획 입력 지문과 비종료 ExecPlan compact catalog를 확인하고, 현재 코드·테스트와 활성 제품 입력에서 식별 가능한 미충족 작업을 한 번에 모두 계획한다. due 유지보수 평가는 같은 입력 지문이어도 활성 작업이 없는 경계에서 먼저 실행한다
 - `docs/FUTURE_IDEAS.md`는 계획 입력 지문, 활성 Requirement와 프로젝트 완료 판정에서 제외하며 그 항목을 자동으로 Requirement 또는 ExecPlan으로 승격하지 않는다
 - MERGED ExecPlan은 Planner 입력에서 제외하며 프로그램만 ID 고유성, 의존성 충족과 감사 이력을 위해 관리한다
+- Planner와 Worker의 실행 후보는 `docs/plans/` 바로 아래의 active ExecPlan으로 제한하고, `docs/plans/archive/`는 ID 고유성, 다음 번호, dependency, 복구와 감사 검증에만 포함한다
+- ExecPlan archive-only 이동은 계획 입력 지문, 유지보수 Merge count, 프로젝트 완료 cycle을 바꾸지 않는다
 - ExecPlan의 `depends_on`은 선행 ExecPlan ID 목록이며, 모든 선행 상태가 MERGED여야 Worker를 시작할 수 있다
 - Worker는 장기 제품 규칙이 바뀌는 경우에만 코드와 같은 PR에서 `PRODUCT.md`를 갱신한다
 
