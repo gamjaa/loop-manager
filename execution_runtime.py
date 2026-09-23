@@ -75,6 +75,8 @@ class ExecutionContext:
     active_sha: str
     validated_base_sha: str | None
     worker_session_id: str | None = None
+    worker_session_binding: str | None = None
+    worker_session_transition: str | None = None
     reviewer_session_id: str | None = None
     worker_result: str | None = None
     verify_result: str | None = None

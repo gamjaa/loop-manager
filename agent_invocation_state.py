@@ -22,6 +22,11 @@ CREATE TABLE IF NOT EXISTS agent_invocations (
     session_id TEXT,
     transition TEXT NOT NULL,
     transition_cause TEXT,
+    transition_id TEXT,
+    previous_provider TEXT,
+    previous_model TEXT,
+    previous_effort TEXT,
+    previous_session_id TEXT,
     attempt INTEGER NOT NULL,
     started_at TEXT NOT NULL,
     finished_at TEXT,
@@ -40,6 +45,11 @@ CREATE TABLE IF NOT EXISTS agent_invocations (
 
 def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.execute(SCHEMA)
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(agent_invocations)")}
+    for field in ("transition_id", "previous_provider", "previous_model",
+                  "previous_effort", "previous_session_id"):
+        if field not in columns:
+            connection.execute(f"ALTER TABLE agent_invocations ADD COLUMN {field} TEXT")
     connection.execute("""CREATE INDEX IF NOT EXISTS agent_invocations_analysis
         ON agent_invocations(repo, role, provider, model, effort, transition, started_at)""")
 
@@ -58,12 +68,17 @@ class InvocationRepository:
         with self.connection:
             self.connection.execute("""INSERT INTO agent_invocations
                 (invocation_id, repo, plan_id, definition_revision, role, provider,
-                 model, effort, session_id, transition, transition_cause, attempt, started_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 model, effort, session_id, transition, transition_cause,
+                 transition_id, previous_provider, previous_model, previous_effort,
+                 previous_session_id, attempt, started_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (identity, context.repo, context.plan_id, context.definition_revision,
                  role, provider, profile.model, profile.effort, session_id,
                  context.transition or ("resume" if session_id else "start"),
-                 context.transition_cause, context.attempt, utc_now()))
+                 context.transition_cause, context.transition_id,
+                 context.previous_provider, context.previous_model,
+                 context.previous_effort, context.previous_session_id,
+                 context.attempt, utc_now()))
         return identity
 
     def observe_session(self, identity: str, session_id: str) -> None:

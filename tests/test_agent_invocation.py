@@ -147,6 +147,27 @@ class RunnerTests(TestCase):
         self.assertEqual(result.code, 0)
         self.assertIs(run.call_args.kwargs["connection"], self.connection)
 
+    def test_pre_resolved_worker_profile_is_shared_by_cli_and_ledger(self):
+        selected = invocation.ResolvedProfile('actual-model', 'high')
+        class Provider:
+            def run(self, request):
+                self_outer.assertEqual(request.profile, selected)
+                return manager.AgentResult(0, 'done', 'worker-session')
+        self_outer = self
+        with mock.patch.object(manager, '_agent_profile') as resolve, \
+             mock.patch.object(manager, 'agent_provider', return_value=Provider()):
+            result = manager.run_agent(
+                'codex', Path('/worktree'), Path('/state'), Path('/config'),
+                'worker', 'prompt', read_only=False, level=5,
+                connection=self.connection,
+                invocation=invocation.InvocationContext('repo', 'G-041'),
+                resolved_profile=selected,
+            )
+        self.assertEqual(result.code, 0)
+        resolve.assert_not_called()
+        row = self.connection.execute('SELECT model, effort FROM agent_invocations').fetchone()
+        self.assertEqual(tuple(row), ('actual-model', 'high'))
+
     def test_each_fallback_process_has_own_resolved_profile_and_session(self):
         seen = []
 

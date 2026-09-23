@@ -164,6 +164,8 @@ CREATE TABLE IF NOT EXISTS projects (
     planning_retry_count INTEGER NOT NULL DEFAULT 0,
     planner_session_id TEXT,
     worker_session_id TEXT,
+    worker_session_binding TEXT,
+    worker_session_transition TEXT,
     reviewer_session_id TEXT,
     worker_result TEXT,
     verify_result TEXT,
@@ -256,6 +258,8 @@ CREATE TABLE IF NOT EXISTS exec_plans (
     blocked_review_fingerprint TEXT,
     retry_count INTEGER NOT NULL DEFAULT 0,
     worker_session_id TEXT,
+    worker_session_binding TEXT,
+    worker_session_transition TEXT,
     reviewer_session_id TEXT,
     worker_result TEXT,
     verify_result TEXT,
@@ -1003,6 +1007,8 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
     migrations = {
         "archive_resume_status": "TEXT",
         "reviewer_session_id": "TEXT",
+        "worker_session_binding": "TEXT",
+        "worker_session_transition": "TEXT",
         "review_result": "TEXT",
         "validated_base_sha": "TEXT",
         "publication_remote_oid": "TEXT",
@@ -1135,6 +1141,8 @@ def connect_database(
         "planner_session_id": "TEXT",
         "plan_sha": "TEXT",
         "worker_session_id": "TEXT",
+        "worker_session_binding": "TEXT",
+        "worker_session_transition": "TEXT",
         "reviewer_session_id": "TEXT",
         "worker_result": "TEXT",
         "verify_result": "TEXT",
@@ -5649,12 +5657,13 @@ def run_agent(
     on_session_started: Callable[[str], None] | None = None,
     connection: sqlite3.Connection | None = None,
     invocation: InvocationContext | None = None,
+    resolved_profile: ResolvedProfile | None = None,
 ) -> tuple[int, str] | AgentResult:
     """Execute one provider-neutral Agent request."""
 
-    resolved: ResolvedProfile | None = None
+    resolved: ResolvedProfile | None = resolved_profile
     collection_status = "unknown"
-    if invocation is not None:
+    if invocation is not None and resolved is None:
         try:
             resolved = _agent_profile(config_path, provider, role_name, level, worktree)
         except (RuntimeError, OSError):
@@ -8192,6 +8201,8 @@ def clear_planning_validation_state(
         planning_retry_count=0,
         planner_session_id=None,
         worker_session_id=None,
+        worker_session_binding=None,
+        worker_session_transition=None,
         reviewer_session_id=None,
         worker_result=None,
         verify_result=None,
@@ -11454,6 +11465,11 @@ def _requeue_blocked_execplan(
                     "review_failure_history": "{}",
                     "effective_worker_level": plan["initial_worker_level"],
                     "review_level_history": "{}",
+                    "worker_session_transition": None,
+                    "worker_session_binding": (
+                        plan["worker_session_binding"]
+                        if plan["worker_session_id"] is not None else None
+                    ),
                 },
                 project_values={
                     "phase": "WORKING",
@@ -11470,6 +11486,12 @@ def _requeue_blocked_execplan(
                     "agent_result_plan": None,
                     "agent_result_snapshot": None,
                     "agent_manager_snapshot": None,
+                    "worker_session_id": plan["worker_session_id"],
+                    "worker_session_transition": None,
+                    "worker_session_binding": (
+                        plan["worker_session_binding"]
+                        if plan["worker_session_id"] is not None else None
+                    ),
                 },
                 enqueue=False,
             )
@@ -11489,6 +11511,8 @@ def _requeue_blocked_execplan(
                 "guidance_plan_hash": None,
                 "last_error": None,
                 "worker_session_id": None,
+                "worker_session_binding": None,
+                "worker_session_transition": None,
                 "reviewer_session_id": None,
                 "worker_result": None,
                 "verify_result": None,
@@ -16779,6 +16803,9 @@ def _ExecutionLifecyclePorts(connection, runtime_repository, **identity):
             run_agent_with_retries=state.bind(run_agent_with_retries, name="run_agent_with_retries", connected=False, mutates=False),
             worker_prompt=state.bind(worker_prompt, name="worker_prompt", connected=False, mutates=False),
             reviewer_prompt=state.bind(reviewer_prompt, name="reviewer_prompt", connected=False, mutates=False),
+            resolve_worker_profile=lambda config_path, provider, level, worktree: _agent_profile(
+                config_path, provider, "worker", level, worktree,
+            ),
         ),
         validation=execution_handlers.ValidationEffects(
             verify=state.bind(verify, name="verify", connected=False, mutates=False),
