@@ -7,6 +7,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Protocol
 
+from recovery_runtime import RecoveryAction, RecoveryDecision, RecoveryFailure
+
 
 class ExecutionPhase(str, Enum):
     """Durable execution phases dispatched by the coordinator."""
@@ -33,6 +35,8 @@ class ExecutionOutcomeKind(str, Enum):
     RETRY = "retry"
     TRANSIENT_PAUSE = "transient_pause"
     USAGE_PAUSE = "usage_pause"
+    PLANNING_PENDING = "planning_pending"
+    OPERATIONAL_ERROR = "operational_error"
     FINAL_BLOCK = "final_block"
 
 
@@ -104,6 +108,7 @@ class ExecutionOutcome:
     context: ExecutionContext | None = None
     detail: str | None = None
     error: bool = False
+    recovery: RecoveryDecision | None = None
 
     @classmethod
     def advanced(cls, context: ExecutionContext) -> "ExecutionOutcome":
@@ -166,6 +171,10 @@ class ExecutionLifecyclePorts(
 ):
     """Phase policy interface; concrete handlers receive granular effect ports."""
 
+    def recover_failure(
+        self, context: ExecutionContext | None, error: RecoveryFailure
+    ) -> ExecutionOutcome: ...
+
 
 
 class ExecutionPhaseCoordinator:
@@ -175,20 +184,41 @@ class ExecutionPhaseCoordinator:
         self._ports = ports
 
     def prepare(self) -> ExecutionContext | ExecutionOutcome:
-        return self._ports.prepare()
+        try:
+            return self._ports.prepare()
+        except RecoveryFailure as error:
+            return self._recovery_outcome(self._ports.recover_failure(None, error))
 
     def dispatch(self, context: ExecutionContext) -> ExecutionOutcome:
-        guarded = self._ports.guard(context)
-        if isinstance(guarded, ExecutionOutcome):
-            return guarded
-        context = guarded
-        handlers = {
-            ExecutionPhase.IMPLEMENTING: self._run_worker,
-            ExecutionPhase.VERIFYING: self._run_verify,
-            ExecutionPhase.REVIEWING: self._run_review,
-            ExecutionPhase.PUBLISHING: self._run_publication,
-        }
-        return handlers[context.phase](context)
+        try:
+            guarded = self._ports.guard(context)
+            if isinstance(guarded, ExecutionOutcome):
+                return self._recovery_outcome(guarded)
+            context = guarded
+            handlers = {
+                ExecutionPhase.IMPLEMENTING: self._run_worker,
+                ExecutionPhase.VERIFYING: self._run_verify,
+                ExecutionPhase.REVIEWING: self._run_review,
+                ExecutionPhase.PUBLISHING: self._run_publication,
+            }
+            return self._recovery_outcome(handlers[context.phase](context))
+        except RecoveryFailure as error:
+            return self._recovery_outcome(self._ports.recover_failure(context, error))
+
+    @staticmethod
+    def _recovery_outcome(outcome: ExecutionOutcome) -> ExecutionOutcome:
+        """Map a typed decision at the common dispatch boundary."""
+
+        if outcome.recovery is None:
+            return outcome
+        kind = {
+            RecoveryAction.RETRY: ExecutionOutcomeKind.RETRY,
+            RecoveryAction.RECONCILE: ExecutionOutcomeKind.RETRY,
+            RecoveryAction.CORRECT: ExecutionOutcomeKind.RETRY,
+            RecoveryAction.PAUSE: ExecutionOutcomeKind.TRANSIENT_PAUSE,
+            RecoveryAction.FINAL_BLOCK: ExecutionOutcomeKind.FINAL_BLOCK,
+        }[outcome.recovery.action]
+        return replace(outcome, kind=kind, error=kind is ExecutionOutcomeKind.FINAL_BLOCK)
 
     def _run_worker(self, context: ExecutionContext) -> ExecutionOutcome:
         return self._ports.run(context)

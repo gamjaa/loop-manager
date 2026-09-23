@@ -7,9 +7,42 @@ import unittest
 import loop_manager
 import notifications
 import runtime_state
+from recovery_runtime import RecoveryObservation, RecoveryReason, decide
+from scoped_blocking import BlockReasonCode
 
 
 class RuntimeStateRepositoryTest(unittest.TestCase):
+    def test_nonfinal_recovery_decision_cannot_enter_block_transaction(self):
+        connection = self._connection()
+        repository = runtime_state.RuntimeStateRepository(connection)
+        repository.activate(
+            'repo', 'G-047', activation_sha='base',
+            branch='loop-manager/G-047', worktree='/state/G-047',
+        )
+        connection.execute(
+            "UPDATE projects SET agent_input_fingerprint = 'saved-input' "
+            "WHERE repo = 'repo'"
+        )
+        connection.commit()
+        retry = decide(RecoveryObservation(
+            RecoveryReason.GIT_LOCK, 'repo', 'G-047', 'IMPLEMENTING',
+            'plan-sha', 'base', 'lock', 'worker-session', 'git busy',
+        ))
+
+        with self.assertRaises(ValueError):
+            loop_manager.block_active_execplan_from_revision(
+                connection, Path('/repo'), 'repo', 'base', 'git busy',
+                reason=BlockReasonCode.PLAN_INPUT_INVALID,
+                recovery_decision=retry,
+            )
+        self.assertEqual(repository.get('repo', 'G-047').status, 'IMPLEMENTING')
+        self.assertIsNone(connection.execute(
+            "SELECT * FROM recovery_records WHERE repo = 'repo'"
+        ).fetchone())
+        self.assertIsNone(connection.execute(
+            "SELECT * FROM execplan_blocks WHERE repo = 'repo'"
+        ).fetchone())
+
     def test_transaction_reserves_writer_before_read_and_preserves_nesting(self):
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)

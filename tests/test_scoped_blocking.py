@@ -676,7 +676,7 @@ class ScopedBlockingTest(unittest.TestCase):
         self.assertEqual(retained["status"], "PLAN_BLOCKED")
         self.assertIsNone(scoped_blocking.project_block(self.connection, self.repo))
 
-    def test_block_notifications_dedupe_by_scope_reason_and_plan(self):
+    def test_block_notifications_distinguish_new_fingerprint_and_scope(self):
         notifications.configure_session(self.connection, enabled=True)
         self.plan("G-001", "IMPLEMENTING")
         with self.connection:
@@ -720,7 +720,7 @@ class ScopedBlockingTest(unittest.TestCase):
         rows = self.connection.execute(
             "SELECT payload FROM notification_outbox WHERE event_type = 'blocked'"
         ).fetchall()
-        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(rows), 2)
         payload = json.loads(rows[0]["payload"])
         self.assertEqual(
             (payload["scope"], payload["reason_code"], payload["execplan_id"]),
@@ -762,7 +762,7 @@ class ScopedBlockingTest(unittest.TestCase):
         )
         self.assertEqual(
             project_payload["paths"],
-            ["docs/plans/[G-001] Work.md"],
+            [],
         )
 
     def test_plan_block_is_waiting_and_registry_removal_is_rejected(self):

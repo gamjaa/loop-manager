@@ -1205,7 +1205,7 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                     (str(repo),),
                 ).fetchall()
 
-                self.assertEqual(result, 1)
+                self.assertEqual(result, 1 if publishes_plan else 0)
                 self.assertEqual(
                     roles,
                     ["planner", "worker"] if publishes_plan else ["planner"],
@@ -6239,7 +6239,11 @@ class WorkerPublicationTest(unittest.TestCase):
                 "loop_manager.pr_for_branch",
                 side_effect=[None, None, {"url": "https://example.test/pr/1"}],
             ), mock.patch("loop_manager.run_codex", side_effect=worker), mock.patch(
-                "loop_manager.verify", return_value=(True, "verify: PASS")
+                "loop_manager.verify",
+                side_effect=lambda *_args: (
+                    self.assertEqual(len(sessions), 2) or True,
+                    "verify: PASS",
+                ),
             ) as verify:
                 self.assertEqual(
                     loop_manager.run_project(
@@ -6608,6 +6612,9 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "notifications.py",
                 "planning_runtime.py",
                 "project_registry.py",
+                "recovery_dispatcher.py",
+                "recovery_runtime.py",
+                "recovery_state.py",
                 "runtime_state.py",
                 "scoped_blocking.py",
             ):
@@ -11634,7 +11641,7 @@ class LatestBasePublicationTest(unittest.TestCase):
                 self.assertEqual(resumed, 0)
                 self.assertIsNone(blocked["phase"])
                 self.assertEqual(plan_status, "PLAN_BLOCKED")
-                resumed_agent.assert_called_once()
+                self.assertEqual(resumed_agent.call_count, 4)
 
     def test_rebase_recovery_marker_survives_worker_result_validation_failure(
         self,
@@ -11722,6 +11729,8 @@ class LatestBasePublicationTest(unittest.TestCase):
                 loop_manager._rebase_in_progress_for_branch(worktree, branch)
             )
 
+            resumed_prompts = []
+
             def resumed_worker(
                 _worktree,
                 _state,
@@ -11731,7 +11740,12 @@ class LatestBasePublicationTest(unittest.TestCase):
                 **kwargs,
             ):
                 self.assertEqual(role_name, "worker")
-                self.assertIn("Worker 결과 검증 실패", prompt)
+                resumed_prompts.append(prompt)
+                if len(resumed_prompts) == 1:
+                    self.assertIn("Worker 결과 검증 실패", prompt)
+                else:
+                    self.assertIn("rebase 충돌 해결 필요", prompt)
+                    self.assertIn("stop after recovery assertion", prompt)
                 self.assertEqual(kwargs["session_id"], "worker-session")
                 self.assertTrue(
                     loop_manager._rebase_in_progress_for_branch(
@@ -11777,7 +11791,8 @@ class LatestBasePublicationTest(unittest.TestCase):
         self.assertEqual(resumed, 0)
         self.assertIsNone(blocked["phase"])
         self.assertEqual(plan_status, "PLAN_BLOCKED")
-        resumed_agent.assert_called_once()
+        self.assertEqual(resumed_agent.call_count, 4)
+        self.assertEqual(len(resumed_prompts), 4)
 
     def test_empty_conflict_resolution_blocks_instead_of_reinvoking_worker(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -13048,7 +13063,7 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             self.assertEqual(pushes, [])
             agent.assert_not_called()
 
-    def test_worker_failure_blocks_recovery_and_stays_blocked(self):
+    def test_worker_failure_blocks_after_three_corrections_and_stays_blocked(self):
         with tempfile.TemporaryDirectory() as directory:
             (
                 repo,
@@ -13118,7 +13133,7 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             self.assertTrue(
                 loop_manager._rebase_in_progress_for_branch(worktree, branch)
             )
-            self.assertEqual(agent.call_count, 1)
+            self.assertEqual(agent.call_count, 4)
 
     def test_repeated_verify_fingerprint_blocks_recovery_without_auto_resume(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -13877,9 +13892,24 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                         paused = loop_manager.run_project_result(
                             connection, state_dir, str(repo), Path("unused.ini"), "main", False
                         )
-                        self.assertEqual(paused.kind,
-                            loop_manager.ProjectRunKind.TRANSIENT_PAUSE if stage == "rebase"
-                            else loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
+                        self.assertEqual(
+                            paused.kind,
+                            loop_manager.ProjectRunKind.WAITING if stage == "push"
+                            else loop_manager.ProjectRunKind.TRANSIENT_PAUSE,
+                        )
+                    if stage == "push":
+                        self.assertTrue(injected)
+                        final = connection.execute(
+                            "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-026'",
+                            (str(repo),),
+                        ).fetchone()
+                        self.assertEqual(final["status"], "PR_OPEN")
+                        self.assertEqual(final["pr_conflict_recovery"], 0)
+                        self.assertEqual(final["pr_url"], url)
+                        self.assertEqual(len(rebases), 1)
+                        self.assertEqual(len(pushes), 1)
+                        self.assertEqual(self._source_checkout_snapshot(repo), source_before)
+                        continue
                     self.assertTrue(injected)
                     stored = loop_manager.active_execplan(connection, str(repo))
                     self.assertEqual(
