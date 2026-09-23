@@ -11465,6 +11465,11 @@ def _requeue_blocked_execplan(
                     "review_failure_history": "{}",
                     "effective_worker_level": plan["initial_worker_level"],
                     "review_level_history": "{}",
+                    "worker_session_transition": None,
+                    "worker_session_binding": (
+                        plan["worker_session_binding"]
+                        if plan["worker_session_id"] is not None else None
+                    ),
                 },
                 project_values={
                     "phase": "WORKING",
@@ -11481,6 +11486,12 @@ def _requeue_blocked_execplan(
                     "agent_result_plan": None,
                     "agent_result_snapshot": None,
                     "agent_manager_snapshot": None,
+                    "worker_session_id": plan["worker_session_id"],
+                    "worker_session_transition": None,
+                    "worker_session_binding": (
+                        plan["worker_session_binding"]
+                        if plan["worker_session_id"] is not None else None
+                    ),
                 },
                 enqueue=False,
             )
@@ -11500,6 +11511,8 @@ def _requeue_blocked_execplan(
                 "guidance_plan_hash": None,
                 "last_error": None,
                 "worker_session_id": None,
+                "worker_session_binding": None,
+                "worker_session_transition": None,
                 "reviewer_session_id": None,
                 "worker_result": None,
                 "verify_result": None,

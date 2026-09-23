@@ -12,6 +12,95 @@ from scoped_blocking import BlockReasonCode
 
 
 class RuntimeStateRepositoryTest(unittest.TestCase):
+    def test_blocked_requeue_discards_stale_worker_profile_target(self):
+        from worker_session import SessionBinding, SessionTransition
+
+        connection = self._connection()
+        self.addCleanup(connection.close)
+        old = SessionBinding('codex', 'old', 'low')
+        target = SessionBinding('codex', 'escalated', 'high')
+        pending = SessionTransition('switch', 'replacement', 'model_changed',
+                                    'old-session', old, target).serialize()
+        connection.execute("""UPDATE exec_plans SET status = 'PLAN_BLOCKED',
+            initial_worker_level = 1, effective_worker_level = 4,
+            worker_session_binding = ?, worker_session_transition = ?
+            WHERE repo = 'repo' AND plan_id = 'G-047'""", (old.serialize(), pending))
+        connection.execute("""UPDATE projects SET phase = 'BLOCKED',
+            plan_path = 'docs/plans/[G-047] Runtime.md',
+            worker_session_binding = ?, worker_session_transition = ?
+            WHERE repo = 'repo'""", (old.serialize(), pending))
+        connection.commit()
+
+        loop_manager._requeue_blocked_execplan(connection, 'repo', 'G-047')
+
+        plan = connection.execute("SELECT * FROM exec_plans WHERE repo = 'repo'").fetchone()
+        project = connection.execute("SELECT * FROM projects WHERE repo = 'repo'").fetchone()
+        self.assertEqual((plan['status'], plan['effective_worker_level']), ('READY', 1))
+        for row in (plan, project):
+            self.assertIsNone(row['worker_session_id'])
+            self.assertIsNone(row['worker_session_binding'])
+            self.assertIsNone(row['worker_session_transition'])
+
+    def test_activation_clears_stale_ready_session_transition(self):
+        from worker_session import SessionBinding, SessionTransition
+
+        connection = self._connection()
+        self.addCleanup(connection.close)
+        old = SessionBinding('codex', 'old', 'low')
+        target = SessionBinding('codex', 'other', 'high')
+        pending = SessionTransition('switch', 'replacement', 'model_changed',
+                                    'old-session', old, target).serialize()
+        connection.execute("""UPDATE exec_plans SET worker_session_id = 'old-session',
+            worker_session_binding = ?, worker_session_transition = ?
+            WHERE repo = 'repo' AND plan_id = 'G-047'""", (old.serialize(), pending))
+        connection.commit()
+
+        activated = runtime_state.RuntimeStateRepository(connection).activate(
+            'repo', 'G-047', activation_sha='base',
+            branch='loop-manager/G-047', worktree='/state/G-047',
+        )
+
+        self.assertEqual(activated.status, 'IMPLEMENTING')
+        self.assertIsNone(activated.worker_session_id)
+        self.assertIsNone(activated.worker_session_binding)
+        self.assertIsNone(activated.worker_session_transition)
+        project = connection.execute("SELECT * FROM projects WHERE repo = 'repo'").fetchone()
+        self.assertIsNone(project['worker_session_id'])
+        self.assertIsNone(project['worker_session_binding'])
+        self.assertIsNone(project['worker_session_transition'])
+
+    def test_conflict_requeue_keeps_bound_session_but_drops_pending_target(self):
+        from worker_session import SessionBinding, SessionTransition
+
+        connection = self._connection()
+        self.addCleanup(connection.close)
+        old = SessionBinding('codex', 'old', 'low')
+        target = SessionBinding('codex', 'escalated', 'high')
+        pending = SessionTransition('switch', 'replacement', 'model_changed',
+                                    'old-session', old, target).serialize()
+        connection.execute("""UPDATE exec_plans SET status = 'PLAN_BLOCKED',
+            pr_conflict_recovery = 1, initial_worker_level = 1,
+            effective_worker_level = 4, worker_session_id = 'old-session',
+            worker_session_binding = ?, worker_session_transition = ?
+            WHERE repo = 'repo' AND plan_id = 'G-047'""", (old.serialize(), pending))
+        connection.execute("""UPDATE projects SET phase = 'BLOCKED',
+            plan_path = 'docs/plans/[G-047] Runtime.md',
+            worker_session_id = 'old-session', worker_session_binding = ?,
+            worker_session_transition = ? WHERE repo = 'repo'""",
+            (old.serialize(), pending))
+        connection.commit()
+
+        loop_manager._requeue_blocked_execplan(connection, 'repo', 'G-047')
+
+        plan = connection.execute("SELECT * FROM exec_plans WHERE repo = 'repo'").fetchone()
+        project = connection.execute("SELECT * FROM projects WHERE repo = 'repo'").fetchone()
+        self.assertEqual((plan['status'], plan['effective_worker_level'],
+                          plan['worker_session_id']), ('IMPLEMENTING', 1, 'old-session'))
+        for row in (plan, project):
+            self.assertEqual(row['worker_session_id'], 'old-session')
+            self.assertEqual(row['worker_session_binding'], old.serialize())
+            self.assertIsNone(row['worker_session_transition'])
+
     def test_worker_transition_cas_preserves_execution_evidence(self):
         from worker_session import SessionBinding, decide_session
         from agent_invocation import ResolvedProfile
