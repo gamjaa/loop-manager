@@ -764,6 +764,45 @@ class ExecutionHandlerTests(TestCase):
         self.assertNotIn('verify', self.calls)
         self.effects.blocking.block_active_execplan.assert_called_once()
 
+    def test_rebase_metadata_correction_preserves_resume_context(self):
+        self.state.update_project(
+            'repo', last_error=lm.REBASE_IN_PROGRESS_ERROR,
+            worker_session_id='worker-session', worker_result='saved result',
+        )
+        self.effects.workspace.is_directory.return_value = True
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        self.effects.agent.run_agent.side_effect = lambda *_args, **_kwargs: lm.AgentResult(
+            0, 'result', session_id='worker-session',
+        )
+        self.effects.agent.validate_worker_workspace_scope.side_effect = (
+            lm.ExecPlanMetadataError('catalog metadata mismatch')
+        )
+
+        for occurrence in (1, 2):
+            context = self.handler._context()
+            self.assertTrue(context.resolving_rebase)
+            outcome = self.handler.run(context)
+            self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+            self.assertEqual(outcome.recovery.occurrence, occurrence)
+            self.assertEqual(outcome.recovery.observation.reason.value, 'worker_correction')
+            self.assertTrue(self.state.row()['last_error'].startswith(lm.REBASE_CONFLICT_PREFIX))
+            self.assertIn('catalog metadata mismatch', self.state.row()['last_error'])
+            self.assertEqual(self.state.row()['worker_session_id'], 'worker-session')
+            self.assertEqual(self.state.row()['worker_result'], 'saved result')
+            self.assertTrue(
+                self.effects.agent.validate_worker_workspace_scope.call_args.kwargs['allow_rebase']
+            )
+            self.assertEqual(
+                self.effects.agent.run_agent.call_args.kwargs['session_id'], 'worker-session',
+            )
+
+        self.assertTrue(self.handler._context().resolving_rebase)
+        self.assertIn(
+            'catalog metadata mismatch', self.effects.agent.worker_prompt.call_args.args[1],
+        )
+        self.effects.blocking.block_active_execplan.assert_not_called()
+        self.assertNotIn('verify', self.calls)
+
     def test_verify_metadata_mismatch_returns_to_worker_with_output(self):
         self.effects.agent.validate_worker_workspace_scope.side_effect = (
             lm.ExecPlanMetadataError('catalog metadata mismatch')

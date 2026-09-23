@@ -295,6 +295,8 @@ class ExecutionHandlers:
 
     def _metadata_correction(self, context, error, *, verify_result=None):
         detail = f"ExecPlan metadata 검증 실패:\n{error}"
+        if context.resolving_rebase:
+            detail = self.effects.contract.REBASE_CONFLICT_PREFIX + detail
         values = {'phase': 'WORKING', 'last_error': detail}
         if verify_result is not None:
             values['verify_result'] = verify_result
