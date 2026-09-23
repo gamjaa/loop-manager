@@ -84,6 +84,8 @@ from agent_invocation import (AgentProfile, AgentRequest, AgentResult, AgentResu
                               TrackedAgentCall, Usage, classify_agent_result)
 from agent_provider_usage import claude_usage, codex_log_usage
 import agent_invocation_state
+import validation_feedback_state
+from validation_feedback import redact_secrets
 from execution_state import ExecutionStatePort as _ExecutionStatePort
 from types import SimpleNamespace
 from maintenance_planning import (
@@ -1076,6 +1078,8 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
             connection.execute("RELEASE publication_backfill")
     connection.execute(GUIDANCE_APPROVALS_SCHEMA)
     agent_invocation_state.ensure_schema(connection)
+    validation_feedback_state.ensure_schema(connection)
+    validation_feedback_state.ValidationFeedbackRepository(connection).migrate_legacy()
     scoped_blocking.ensure_schema(connection)
     if not getattr(connection, "execplans_schema_ready", False):
         recovery_state.ensure_schema(connection)
@@ -5733,9 +5737,8 @@ class VerifyOutput(str):
     fingerprint_source: str
 
     def __new__(cls, output: str) -> VerifyOutput:
-        fingerprint_source = output.strip()
-        instance = super().__new__(cls, fingerprint_source[-8000:])
-        instance.fingerprint_source = fingerprint_source
+        instance = super().__new__(cls, output.strip()[-8000:])
+        instance.fingerprint_source = output
         return instance
 
 
@@ -13025,10 +13028,14 @@ def worker_prompt(
     guidance_context: str = "",
     allow_common_plans: bool = False,
 ) -> str:
-    failure = f"\n이전 실행에서 다음 문제가 발생했다. 원인을 해결하라:\n{error[-6000:]}\n" if error else ""
+    failure = (
+        f"\n이전 실행에서 다음 문제가 발생했다. 원인을 해결하라:\n"
+        f"{redact_secrets(error)[-6000:]}\n"
+        if error else ""
+    )
     saved_feedback = (
-        "\nSQLite에 보존된 전체 verify 또는 Review 실패 피드백:\n"
-        f"{validation_feedback[-6000:]}\n"
+        "\n미해결 검증 피드백 delta (identity, occurrence, revision):\n"
+        f"{validation_feedback}\n"
         if validation_feedback
         else ""
     )
@@ -13047,8 +13054,9 @@ def worker_prompt(
     if session_recovery:
         recovery = (
             "\n저장된 Worker 세션을 재개할 수 없어 새 세션에서 이어간다. "
-            "현재 worktree와 아래 이전 Worker 결과 및 실패 내용을 기준으로 계속하라:\n"
-            f"{(previous_result or '이전 Worker 결과 없음')[-6000:]}\n"
+            "AGENTS.md, 선택된 최신 ExecPlan과 현재 worktree를 다시 확인하라. "
+            "아래 이전 Worker 결과와 미해결 검증 피드백을 기준으로 계속하라:\n"
+            f"{redact_secrets(previous_result or '이전 Worker 결과 없음')[-6000:]}\n"
         )
     common_scope = (
         "이 저장소의 루트 AGENTS.md는 공통 원본이므로 Scope는 반드시 `common`이어야 한다."
@@ -16778,9 +16786,12 @@ def _ExecutionLifecyclePorts(connection, runtime_repository, **identity):
             parse_reviewer_result=state.bind(parse_reviewer_result, name="parse_reviewer_result", connected=False, mutates=False),
             validate_active_execplan_metadata=state.bind(validate_active_execplan_metadata, name="validate_active_execplan_metadata", connected=False, mutates=False),
             ensure_worker_level_state=state.bind(ensure_worker_level_state, name="ensure_worker_level_state", connected=True, mutates=True),
-            _deserialize_failure_history=state.bind(_deserialize_failure_history, name="_deserialize_failure_history", connected=False, mutates=False),
             clear_validation_failure_history=state.bind(clear_validation_failure_history, name="clear_validation_failure_history", connected=True, mutates=True),
             transition_validation_failure=state.bind(transition_validation_failure, name="transition_validation_failure", connected=True, mutates=True),
+        ),
+        feedback=execution_handlers.FeedbackEffects(
+            repository=validation_feedback_state.ValidationFeedbackRepository(connection),
+            fingerprints=validation_failure_fingerprints,
         ),
         archive=execution_handlers.ArchiveEffects(
             requirement_archive_sources=state.bind(requirement_archive_sources, name="requirement_archive_sources", connected=True, mutates=False),
