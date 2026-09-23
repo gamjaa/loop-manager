@@ -26,7 +26,7 @@ priority: normal
 
 - `maintenance_state.py`와 유지보수 coordinator에 self 프로젝트 전용 일회성 marker 및 bounded 평가 결과를 기존 cycle 감사와 결합한다. 현재 assessment 결과가 있을 경우 중복 평가 대신 이어서 기록하도록 한다.
 - 대상 파일 inventory와 제외 기준을 결정적으로 산출하고 Planner의 결과를 source revision에 결합한다. 후속 계획 ID와 남은 검토 범위를 저장해 재시작 후에도 추적한다.
-- 현재 barrier assessment에서 확인된 Agent scope 혼합 문제와 G-051을 평가 결과의 첫 사례로 연결한다.
+- 완료된 G-051의 Agent scope 책임 분리 결과를 이미 처리한 발견으로 평가 이력에 연결한다. 최신 코드·테스트와 활성 문서에서 남은 문제를 다시 확인하고 같은 범위의 리팩터링을 중복 계획하지 않는다.
 
 ## Validation
 
@@ -42,3 +42,4 @@ priority: normal
 ## Decision Log
 
 - 이 계획은 R-027의 일회성 전수 평가 실행·추적을 담당한다. G-058은 공통 품질 지침에 한정한다.
+- G-051은 이번 재검증 이전에 Merge된 구조 변경이다. 전수 평가는 그 결과를 현재 기준선으로 사용한다.

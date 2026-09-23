@@ -33,7 +33,7 @@ priority: normal
 
 ## Implementation
 
-- G-059의 전수 inventory에 루트 파일별 참조, 소유권과 이동 목적지를 기록한다. `ROOT` 기반 resource lookup과 launcher가 요구하는 고정 파일을 식별한다.
+- G-059의 전수 inventory에 루트 파일별 참조, 소유권과 이동 목적지를 기록한다. G-051에서 추가된 `agent_scope_decision.py`와 `tests/test_agent_scope_decision.py`의 import·검증 참조도 포함하고, `ROOT` 기반 resource lookup과 launcher가 요구하는 고정 파일을 식별한다.
 - 필수 폴더·파일과 신규 루트 항목 판정 기준을 공통 provider-neutral prompt에 반영한다. 실제 내부 모듈 이동은 G-063에서 수행한다.
 - 기존 등록 프로젝트에도 적용되는 provider-neutral prompt에 필수 루트 경로와 안전한 파일 배치 기준을 반영한다.
 
@@ -51,3 +51,4 @@ priority: normal
 ## Decision Log
 
 - `loop_manager.py`는 현재 launcher가 직접 참조하므로 루트에 둔다. 이동 후보는 파일명이나 길이가 아니라 실행·도구 탐색 필요 여부로 판정한다.
+- G-051의 분리 모듈도 루트 inventory에 포함하되, 실제 이동 여부는 G-060의 동일한 참조·소유권 기준으로 판정한다.

@@ -24,13 +24,13 @@ G-060의 루트 inventory에서 내부 구현으로 확인한 모듈은 루트 �
 
 ## Implementation
 
-- import graph의 leaf부터 내부 모듈을 package namespace로 옮기고, `loop_manager.py`의 import와 필요한 공개 re-export만 보존한다. 모든 내부 모듈에 root wrapper를 남겨 루트 정리 목적을 무효화하지 않는다.
-- detached runtime child, 직접 실행 launcher, resource lookup, 테스트 patch target 및 Linux·Windows verify의 모듈 목록을 같은 변경에서 갱신한다.
+- G-060 inventory의 import graph에서 leaf부터 내부 모듈을 package namespace로 옮기고, `loop_manager.py`의 import와 필요한 공개 re-export만 보존한다. G-051의 `agent_scope_decision.py`는 `loop_manager.py` 자료형을 실행 시 import하지 않는 경계와 직접 테스트의 import 경로를 함께 점검한다. 모든 내부 모듈에 root wrapper를 남겨 루트 정리 목적을 무효화하지 않는다.
+- detached runtime child, 직접 실행 launcher, resource lookup, 테스트 patch target 및 Linux·Windows verify의 모듈 목록을 같은 변경에서 갱신한다. 현재 두 verify 스크립트의 모듈 목록 차이도 이동 대상의 검증 누락 없이 정리한다.
 - 파일 이동과 함께 관련 없는 책임 재설계나 storage migration을 수행하지 않는다.
 
 ## Validation
 
-- Worker는 이동한 모듈의 import·CLI·resource lookup targeted unit test와 `tests/test_origin_isolation.py`, `tests/test_managed_configuration.py`의 직접 관련 targeted unit test만 실행한다.
+- Worker는 이동한 모듈의 import·CLI·resource lookup targeted unit test와 `tests/test_agent_scope_decision.py`, `tests/test_origin_isolation.py`, `tests/test_managed_configuration.py`의 직접 관련 targeted unit test만 실행한다.
 - 동일 SHA runtime 자식의 import, launcher 경로, 공통 파일 복사, root resource lookup, 공개 helper와 테스트 patch target을 검증한다.
 - 전체 verify에서 모든 기존 테스트, Python module compile 및 Linux·Windows verify 스크립트의 새 모듈 목록이 통과해야 한다.
 
@@ -42,3 +42,4 @@ G-060의 루트 inventory에서 내부 구현으로 확인한 모듈은 루트 �
 ## Decision Log
 
 - 내부 모듈을 옮기는 순서는 의존성 graph를 따른다. 공개 launcher와 고정 문서 경로는 이동 대상이 아니다.
+- G-051은 `agent_scope_decision.py`를 새 루트 모듈로 추가했다. `loop_manager.py`와의 단방향 import 경계 및 테스트 fixture를 이동 영향 범위에 포함한다.

@@ -23,13 +23,13 @@ priority: critical
 
 ## Implementation
 
-- `prepare_runtime_worktree`, runtime child 인자와 저장된 scope 검증 호출 사이에 현재 lock 실행에 결합된 mutation 증거를 잇는다. 저장 전후 중단을 복구할 수 있는 최소 상태만 기록하고 실제 worktree catalog로 재검증한다.
-- G-051의 판정 경계에서 runtime 등록의 정확한 delta만 허용한 새 기준선을 계산한다. 저장된 false-positive 결과는 시작 snapshot부터 다시 증명한 경우에만 해소한다.
+- `loop_manager.py`의 `prepare_runtime_worktree`, runtime child 인자와 `validate_persisted_agent_scope`의 Git·SQLite 어댑터 사이에 현재 lock 실행에 결합된 mutation 증거를 잇는다. 저장 전후 중단을 복구할 수 있는 최소 상태만 기록하고 실제 worktree catalog로 재검증한다.
+- Git 검증을 마친 정확한 runtime delta만 `agent_scope_decision.py`의 `decide_persisted_scope` 판정에 전달해 새 기준선을 계산한다. 판정 모듈에 Git I/O나 SQLite 조회를 넣지 않고, 저장된 false-positive 결과는 시작 snapshot부터 다시 증명한 경우에만 해소한다.
 - 진단에는 허용한 path·SHA와 거부한 delta를 남기되 비밀값은 기록하지 않는다.
 
 ## Validation
 
-- Worker는 `tests/test_origin_isolation.py`와 `tests/test_loop_manager.py`의 runtime bootstrap·persisted scope 관련 targeted unit test만 실행한다.
+- Worker는 `tests/test_origin_isolation.py`, `tests/test_agent_scope_decision.py`와 `tests/test_loop_manager.py`의 runtime bootstrap·persisted scope 관련 targeted unit test만 실행한다.
 - 실제 동일 state directory에서 SHA A scope 저장 후 SHA B runtime 등록, 같은 SHA 재사용, 등록 직후 중단, 이전 false-positive 결과 복구를 검증한다. Planner·Worker·Reviewer 및 혼합 Git 변경·dirty·attached·wrong-SHA·wrong-repository 거부도 검증한다.
 - 전체 verify에서 Agent 범위 위반 차단, 기본 worktree 보존과 process lock 재개 동작이 유지돼야 한다.
 
@@ -41,3 +41,4 @@ priority: critical
 ## Decision Log
 
 - 이 계획은 현재 bootstrap이 소유한 등록의 귀속만 연결한다. 새 Agent Git 권한이나 임의 runtime 신뢰는 추가하지 않는다.
+- G-051 이후 저장된 scope의 정책 판정은 `agent_scope_decision.py`, 실제 Git·SQLite 검증과 예외 변환은 `loop_manager.py`에 있다. runtime 증거도 이 책임 경계를 따라 전달한다.
