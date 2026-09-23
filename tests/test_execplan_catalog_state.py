@@ -541,6 +541,36 @@ priority: {priority}
             ),
         )
 
+    def test_migration_resumes_backfill_after_columns_were_committed(self):
+        connection = self.connection
+        connection.execute(
+            "UPDATE exec_plans SET publication_path = NULL, "
+            "publication_content_hash = NULL, publication_sha = NULL, "
+            "current_revision_sha = NULL WHERE plan_id = 'G-001'"
+        )
+        connection.commit()
+        loop_manager._ensure_execplans_schema(connection)
+        self.assertFalse(connection.in_transaction)
+        audit = self.repository.publication_audit('/repo', 'G-001')
+        self.assertEqual(audit.path, 'docs/plans/[G-001] Old.md')
+        self.assertEqual(audit.content_hash, 'old-hash-G-001')
+        self.assertEqual(audit.revision_sha, 'a' * 40)
+        self.assertEqual(
+            self.repository.current_definition('/repo', 'G-001').revision_sha,
+            'a' * 40,
+        )
+        connection.execute(
+            "UPDATE exec_plans SET path = 'changed', content_hash = 'changed' "
+            "WHERE plan_id = 'G-001'"
+        )
+        loop_manager._ensure_execplans_schema(connection)
+        self.assertTrue(connection.in_transaction)
+        self.assertEqual(self.repository.publication_audit('/repo', 'G-001'), audit)
+        connection.rollback()
+        self.assertEqual(
+            self.repository.current_definition('/repo', 'G-001').path, audit.path
+        )
+
     def test_all_definition_deltas_update_atomically_without_runtime_loss(self):
         source = "docs/requirements/New Source.md"
         review_history = '{"2":{"review-fingerprint":1}}'

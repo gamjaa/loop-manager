@@ -1078,40 +1078,41 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
         "publication_content_hash": "TEXT",
         "publication_sha": "TEXT",
     }
-    publication_migration_required = any(
-        column not in columns
-        for column in (
-            "current_revision_sha",
-            "publication_path",
-            "publication_content_hash",
-            "publication_sha",
-        )
-    )
     for column, definition in migrations.items():
         if column not in columns:
             connection.execute(
                 f"ALTER TABLE exec_plans ADD COLUMN {column} {definition}"
             )
-    if publication_migration_required and {
+    if {
         "path",
         "content_hash",
         "plan_sha",
     }.issubset(columns):
-        connection.execute(
-            """
-            UPDATE exec_plans
-            SET publication_path = COALESCE(publication_path, path),
-                publication_content_hash = COALESCE(
-                    publication_content_hash, content_hash
-                ),
-                publication_sha = COALESCE(publication_sha, plan_sha),
-                current_revision_sha = COALESCE(current_revision_sha, plan_sha)
-            WHERE publication_path IS NULL
-               OR publication_content_hash IS NULL
-               OR (publication_sha IS NULL AND plan_sha IS NOT NULL)
-               OR (current_revision_sha IS NULL AND plan_sha IS NOT NULL)
-            """
-        )
+        # RELEASE commits a standalone backfill, but preserves an existing
+        # caller transaction. Re-run after interrupted column additions too.
+        connection.execute("SAVEPOINT publication_backfill")
+        try:
+            connection.execute(
+                """
+                UPDATE exec_plans
+                SET publication_path = COALESCE(publication_path, path),
+                    publication_content_hash = COALESCE(
+                        publication_content_hash, content_hash
+                    ),
+                    publication_sha = COALESCE(publication_sha, plan_sha),
+                    current_revision_sha = COALESCE(current_revision_sha, plan_sha)
+                WHERE publication_path IS NULL
+                   OR publication_content_hash IS NULL
+                   OR (publication_sha IS NULL AND plan_sha IS NOT NULL)
+                   OR (current_revision_sha IS NULL AND plan_sha IS NOT NULL)
+                """
+            )
+        except BaseException:
+            connection.execute("ROLLBACK TO publication_backfill")
+            connection.execute("RELEASE publication_backfill")
+            raise
+        else:
+            connection.execute("RELEASE publication_backfill")
     connection.execute(GUIDANCE_APPROVALS_SCHEMA)
     scoped_blocking.ensure_schema(connection)
     blocked_checkpoint_state.ensure_schema(connection)
@@ -3618,7 +3619,7 @@ def _migrate_execplan_catalog(
             legacy_backfill_allowed = (
                 not catalog_initialized and not missing_stored_ids
             )
-            unknown_active_ids = set(snapshot.active) - set(stored)
+            unknown_active_ids = set(snapshot.active) - set(stored) - historical_ids
             unknown_archived_ids = (
                 set(snapshot.archived) - set(stored) - historical_ids
             )

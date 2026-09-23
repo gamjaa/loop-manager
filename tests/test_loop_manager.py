@@ -365,6 +365,11 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                 ),
                 identity_verified=False,
             )
+            connection.execute(
+                "INSERT INTO execplan_catalog_revisions "
+                "(repo, revision_sha, catalog_fingerprint) VALUES (?, ?, ?)",
+                (str(root), publication_sha, "initialized-archive"),
+            )
             connection.commit()
 
             with mock.patch("loop_manager.pr_for_branch", return_value=None) as lookup:
