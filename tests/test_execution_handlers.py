@@ -130,6 +130,193 @@ class ExecutionHandlerTests(TestCase):
         self.effects = replace(self.effects, contract=runtime.effects.contract)
         self.handler.effects = self.effects
 
+    def test_single_abnormal_rebase_worker_result_preserves_session_without_block(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0, operation='rebase',
+            expected_head='before', target_base_oid='base',
+            observed_remote_oid=None, snapshot={},
+        )
+        self.state.update_project(
+            'repo', phase='WORKING', worker_session_id='same-session',
+            last_error=lm.REBASE_CONFLICT_PREFIX + 'conflict',
+        )
+        self.effects.workspace.is_directory.return_value = True
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        self.effects.workspace.git.side_effect = self.observed_git
+        self.effects.agent.run_agent.side_effect = lambda *_args, **_kwargs: lm.AgentResult(
+            1, 'abnormal exit', session_id='same-session',
+        )
+
+        result = self.handler.run(self.context())
+
+        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(self.state.row()['worker_session_id'], 'same-session')
+        self.assertEqual(self.repository.get('repo', 'G-047').status, 'IMPLEMENTING')
+        self.effects.blocking.block_active_execplan.assert_not_called()
+        correction = self.handler.rebase_corrections.get('repo', 'G-047')
+        self.assertEqual(correction.occurrence, 1)
+        self.assertIsNone(correction.worker_result)
+        self.assertEqual(correction.audit[-1]['worker_result'], 'abnormal exit')
+
+    def test_rebase_format_failure_starts_fresh_turn_until_no_progress_limit(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0, operation='rebase',
+            expected_head='before', target_base_oid='base',
+            observed_remote_oid=None, snapshot={},
+        )
+        self.state.update_project(
+            'repo', phase='WORKING', worker_session_id='same-session',
+            last_error=lm.REBASE_CONFLICT_PREFIX + 'conflict',
+        )
+        self.effects.workspace.is_directory.return_value = True
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        self.effects.workspace.git.side_effect = self.observed_git
+        self.effects.agent.run_agent.side_effect = lambda *_args, **_kwargs: lm.AgentResult(
+            0, 'invalid format', session_id='same-session',
+        )
+        self.effects.validation.parse_worker_result.side_effect = lm.WorkerResultError(
+            'invalid format'
+        )
+
+        outcomes = [self.handler.run(self.context()) for _ in range(3)]
+
+        self.assertEqual([outcome.kind for outcome in outcomes], [
+            ExecutionOutcomeKind.RETRY, ExecutionOutcomeKind.RETRY,
+            ExecutionOutcomeKind.FINAL_BLOCK,
+        ])
+        self.assertEqual(self.effects.agent.run_agent.call_count, 3)
+        self.assertEqual(self.handler.rebase_corrections.get('repo', 'G-047').occurrence, 3)
+
+    def test_owned_pr_conflict_uses_same_correction_history_without_publication(self):
+        self.state.update_project(
+            'repo', phase='WORKING', worker_session_id='pr-worker-session',
+            pr_conflict_recovery=1, pr_conflict_base_oid='base',
+            pr_conflict_head_oid='before',
+            last_error=lm.REBASE_CONFLICT_PREFIX + 'PR conflict',
+        )
+        self.effects.workspace.is_directory.return_value = True
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        self.effects.workspace.git.side_effect = self.observed_git
+        self.effects.agent.run_agent.side_effect = lambda *_args, **_kwargs: lm.AgentResult(
+            1, 'abnormal exit', session_id='pr-worker-session',
+        )
+
+        result = self.handler.run(self.context())
+
+        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+        saved = self.handler.rebase_corrections.get('repo', 'G-047')
+        self.assertEqual((saved.target_base, saved.before_head), ('base', 'before'))
+        self.assertEqual(saved.worker_session, 'pr-worker-session')
+        self.effects.publication.push_owned_pr_conflict_recovery.assert_not_called()
+
+    def test_rebase_correction_blocks_only_after_three_identical_worker_results(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0, operation='rebase',
+            expected_head='before', target_base_oid='base',
+            observed_remote_oid=None, snapshot={},
+        )
+        self.state.update_project(
+            'repo', phase='WORKING', worker_session_id='same-session',
+            last_error=lm.REBASE_CONFLICT_PREFIX + 'conflict',
+        )
+        self.effects.workspace.is_directory.return_value = True
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        self.effects.workspace.git.side_effect = self.observed_git
+        context = self.context()
+
+        first = self.handler._rebase_conflict(context, 'conflict')
+        self.assertEqual(first.kind, ExecutionOutcomeKind.RETRY)
+        for _ in range(2):
+            result = self.handler._rebase_conflict(
+                context, 'conflict', corrected=True, worker_result='same output',
+            )
+            self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+            self.assertEqual(self.repository.get('repo', 'G-047').status, 'IMPLEMENTING')
+            self.effects.blocking.block_active_execplan.assert_not_called()
+        final = self.handler._rebase_conflict(
+            context, 'conflict', corrected=True, worker_result='same output',
+        )
+        self.assertEqual(final.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertIn('same output', final.detail)
+        self.assertEqual(self.handler.rebase_corrections.get('repo', 'G-047').occurrence, 3)
+
+    def test_saved_worker_result_finishes_after_restart_without_second_agent_turn(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0, operation='rebase',
+            expected_head='before', target_base_oid='base',
+            observed_remote_oid=None, snapshot={},
+        )
+        self.state.update_project(
+            'repo', phase='WORKING', worker_session_id='same-session',
+            last_error=lm.REBASE_CONFLICT_PREFIX + 'conflict',
+        )
+        self.effects.workspace.is_directory.return_value = True
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        self.effects.workspace.git.side_effect = self.observed_git
+        context = self.context()
+        observation = self.handler._rebase_observation(context)
+        stored = self.handler.rebase_corrections.observe('repo', 'G-047', observation)
+        turn = self.handler.rebase_corrections.begin_turn(
+            'repo', 'G-047', expected_generation=stored.generation,
+            session='same-session',
+        )
+        self.handler.rebase_corrections.finish_turn(
+            'repo', 'G-047', expected_generation=turn.generation,
+            turn=turn.pending_turn, session='same-session', result='saved result',
+            scope_marker=observation.progress,
+        )
+
+        resumed = self.handler.run(context)
+
+        self.assertEqual(resumed.context.phase, ExecutionPhase.VERIFYING)
+        self.effects.agent.run_agent.assert_not_called()
+        self.assertEqual(self.state.row()['worker_result'], 'saved result')
+
+    def test_changed_pending_turn_without_scope_baseline_blocks_before_agent(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0, operation='rebase',
+            expected_head='before', target_base_oid='base',
+            observed_remote_oid=None, snapshot={},
+        )
+        self.state.update_project(
+            'repo', phase='WORKING', worker_session_id='same-session',
+            last_error=lm.REBASE_CONFLICT_PREFIX + 'conflict',
+        )
+        self.effects.workspace.is_directory.return_value = True
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        self.effects.workspace.git.side_effect = self.observed_git
+        context = self.context()
+        observation = self.handler._rebase_observation(context)
+        stored = self.handler.rebase_corrections.observe('repo', 'G-047', observation)
+        self.handler.rebase_corrections.begin_turn(
+            'repo', 'G-047', expected_generation=stored.generation,
+            session='same-session',
+        )
+        self.effects.agent.capture_git_snapshot.return_value = SimpleNamespace(
+            head='owned-head', branch='loop-manager/G-047',
+            dirty={'app.py': (('unstaged',), 'changed-content')},
+        )
+
+        result = self.handler.run(context)
+
+        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.effects.agent.run_agent.assert_not_called()
+
     def test_zero_exit_rebase_with_unmerged_index_keeps_conflict_correction(self):
         checkpoint = mock.Mock()
         checkpoint.get.return_value = CheckpointRecord(
@@ -429,6 +616,151 @@ class ExecutionHandlerTests(TestCase):
     def test_pending_stage_resumes_accepted_untracked_files(self):
         self._assert_staged_rebase_resume(True, untracked=True)
 
+    def test_pending_stage_with_unmerged_index_retries_only_accepted_paths(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        self.state.update_project(
+            'repo', phase='WORKING', worker_session_id='saved-session',
+            last_error=lm.REBASE_CONFLICT_PREFIX + 'conflict',
+        )
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0, operation='rebase',
+            expected_head='before', target_base_oid='base',
+            observed_remote_oid=None,
+            snapshot={
+                'pending': 'stage', 'worker_result': 'accepted correction',
+                'stage_evidence': {
+                    'head': 'owned-head', 'branch': 'loop-manager/G-047',
+                    'files': {'app.py': 'accepted-content'},
+                },
+            },
+        )
+        self.effects.workspace.is_directory.return_value = True
+        self.effects.agent.capture_git_snapshot.return_value = SimpleNamespace(
+            head='owned-head', branch='loop-manager/G-047',
+            dirty={'app.py': (('unstaged',), 'accepted-content')},
+        )
+        unresolved = {'value': True}
+
+        def observed_git(path, *args, **kwargs):
+            if args[:2] == ('ls-files', '-u'):
+                return SimpleNamespace(
+                    stdout=('100644 ' + 'a' * 40 + ' 1\tapp.py\0'
+                            if unresolved['value'] else ''), returncode=0,
+                )
+            if args[0] == 'add':
+                unresolved['value'] = False
+            if args == ('diff', '--quiet'):
+                return SimpleNamespace(stdout='', returncode=1)
+            if args == ('diff', '--cached', '--quiet'):
+                return SimpleNamespace(stdout='', returncode=1)
+            return self.observed_git(path, *args, **kwargs)
+
+        self.effects.workspace.git.side_effect = observed_git
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        result = self.handler.recover(self.context())
+
+        self.assertEqual(result.phase, ExecutionPhase.VERIFYING)
+        self.assertFalse(unresolved['value'])
+        self.effects.agent.run_agent.assert_not_called()
+        additions = [call for call in self.effects.workspace.git.call_args_list
+                     if call.args[1] == 'add']
+        self.assertEqual(len(additions), 1)
+        self.assertEqual(additions[0].args[1:], ('add', '-A', '--', 'app.py'))
+
+    def test_stage_lock_resume_uses_checkpoint_without_new_worker_turn(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0, operation='rebase',
+            expected_head='before', target_base_oid='base',
+            observed_remote_oid=None, snapshot={},
+        )
+        self.state.update_project(
+            'repo', phase='WORKING', worker_session_id='saved-session',
+            last_error=lm.REBASE_CONFLICT_PREFIX + 'conflict',
+        )
+        self.effects.workspace.is_directory.return_value = True
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        attempts = {'add': 0, 'unmerged': True}
+
+        def locked_git(path, *args, **kwargs):
+            if args[:2] == ('ls-files', '-u'):
+                return SimpleNamespace(
+                    stdout=('100644 ' + 'a' * 40 + ' 1\tapp.py\0'
+                            if attempts['unmerged'] else ''), returncode=0,
+                )
+            if args[0] == 'add':
+                attempts['add'] += 1
+                if attempts['add'] == 1:
+                    return SimpleNamespace(stdout='index.lock', returncode=1)
+                attempts['unmerged'] = False
+                return SimpleNamespace(stdout='', returncode=0)
+            if args == ('diff', '--quiet'):
+                return SimpleNamespace(stdout='', returncode=1)
+            if args == ('diff', '--cached', '--quiet'):
+                return SimpleNamespace(stdout='', returncode=1)
+            return self.observed_git(path, *args, **kwargs)
+
+        self.effects.workspace.git.side_effect = locked_git
+        context = self.context()
+        first = self.handler._finish_worker(context, self.state.row(), 'accepted correction')
+        self.assertEqual(first.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(checkpoint.get('repo', 'G-047').snapshot['pending'], 'stage')
+
+        resumed = self.handler.recover(self.context())
+        self.assertEqual(resumed.phase, ExecutionPhase.VERIFYING)
+        self.assertEqual(attempts['add'], 2)
+        self.effects.agent.run_agent.assert_not_called()
+
+    def test_continue_lock_resume_does_not_repeat_stage(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0, operation='rebase',
+            expected_head='before', target_base_oid='base',
+            observed_remote_oid=None, snapshot={},
+        )
+        self.state.update_project(
+            'repo', phase='WORKING', worker_session_id='saved-session',
+            last_error=lm.REBASE_CONFLICT_PREFIX + 'conflict',
+        )
+        self.effects.workspace.is_directory.return_value = True
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        attempts = {'add': 0, 'continue': 0}
+
+        def locked_git(path, *args, **kwargs):
+            if args[0] == 'add':
+                attempts['add'] += 1
+            if args == ('diff', '--cached', '--quiet'):
+                return SimpleNamespace(stdout='', returncode=1)
+            if args[-2:] == ('rebase', '--continue'):
+                attempts['continue'] += 1
+                if attempts['continue'] == 1:
+                    return SimpleNamespace(stdout='index.lock', returncode=1)
+            return self.observed_git(path, *args, **kwargs)
+
+        self.effects.workspace.git.side_effect = locked_git
+        context = self.context()
+        first = self.handler._finish_worker(context, self.state.row(), 'accepted correction')
+        self.assertEqual(first.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(checkpoint.get('repo', 'G-047').snapshot['pending'], 'continue')
+
+        def finished_git(path, *args, **kwargs):
+            result = locked_git(path, *args, **kwargs)
+            if args[-2:] == ('rebase', '--continue') and attempts['continue'] == 2:
+                self.effects.workspace._rebase_in_progress_for_branch.return_value = False
+            return result
+
+        self.effects.workspace.git.side_effect = finished_git
+        resumed = self.handler.recover(self.context())
+        self.assertEqual(resumed.phase, ExecutionPhase.VERIFYING)
+        self.assertEqual(attempts, {'add': 1, 'continue': 2})
+        self.effects.agent.run_agent.assert_not_called()
+
     def test_pending_stage_rejects_changed_worktree_before_staging(self):
         self._assert_staged_rebase_resume(True, changed=True, unstaged=True)
 
@@ -456,6 +788,7 @@ class ExecutionHandlerTests(TestCase):
             expected_head='before-head', target_base_oid='base',
             observed_remote_oid=None,
             snapshot={'pending': 'stage', 'worker_result': 'saved correction',
+                      **({'stash_oid': 'saved-stash-oid'} if not rebase_metadata else {}),
                       'stage_evidence': {'head': 'owned-head', 'branch': 'loop-manager/G-047',
                                          'files': accepted_files}},
         )
@@ -480,6 +813,9 @@ class ExecutionHandlerTests(TestCase):
         additions = [call for call in self.effects.workspace.git.call_args_list
                      if call.args[1:3] == ('add', '-A')]
         self.assertEqual(len(additions), int(not changed and (unstaged or untracked)))
+        for call in additions:
+            self.assertEqual(call.args[3], '--')
+            self.assertTrue(set(call.args[4:]).issubset({'app.py', 'allowed.py'}))
         if changed:
             self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
             self.assertEqual(checkpoint.get('repo', 'G-047').operation, 'rebase')
