@@ -1411,6 +1411,8 @@ def _git_tree_entries(repo: Path, revision: str) -> dict[bytes, tuple[bytes, byt
 def revision_execplan_snapshot(
     repo: Path,
     revision: str,
+    *,
+    archive_conflict_plan_ids: frozenset[str] = frozenset(),
 ) -> execplan_catalog.ExecPlanCatalogSnapshot:
     """Read and fully validate active/archive plans from one immutable tree."""
 
@@ -1463,18 +1465,34 @@ def revision_execplan_snapshot(
         available_regular_paths=frozenset(regular_paths),
         invalid_plan_entries=invalid_plan_entries,
         revision_sha=revision_sha,
-        # A same-ID archived copy is an archive path conflict. Keep the
-        # active declaration available to READY selection and housekeeping.
-        allow_active_archive_conflicts=True,
+        archive_conflict_plan_ids=archive_conflict_plan_ids,
+    )
+
+
+def _merged_execplan_ids(
+    connection: sqlite3.Connection, repo: str
+) -> frozenset[str]:
+    return frozenset(
+        str(row[0])
+        for row in connection.execute(
+            "SELECT plan_id FROM exec_plans WHERE repo = ? AND status = 'MERGED'",
+            (repo,),
+        )
     )
 
 
 class _GitCatalogDefinitionPort:
     """Pin catalog reads to a fetched remote ref without consulting worktrees."""
 
-    def __init__(self, repo: Path, remote_ref: str):
+    def __init__(
+        self,
+        repo: Path,
+        remote_ref: str,
+        archive_conflict_plan_ids: Callable[[], frozenset[str]],
+    ):
         self.repo = repo
         self.remote_ref = remote_ref
+        self.archive_conflict_plan_ids = archive_conflict_plan_ids
 
     def current_revision(self) -> str:
         return git(
@@ -1487,7 +1505,11 @@ class _GitCatalogDefinitionPort:
     def load(self) -> execplan_catalog_state.PinnedCatalog:
         revision_sha = self.current_revision()
         try:
-            snapshot = revision_execplan_snapshot(self.repo, revision_sha)
+            snapshot = revision_execplan_snapshot(
+                self.repo,
+                revision_sha,
+                archive_conflict_plan_ids=self.archive_conflict_plan_ids(),
+            )
         except execplan_catalog.ExecPlanCatalogError as error:
             tree = _git_tree_entries(self.repo, revision_sha)
             evidence = []
@@ -1529,7 +1551,9 @@ def reconcile_execplan_catalog(
     """Converge declaration cache or persist a recoverable project diagnostic."""
 
     port = _GitCatalogDefinitionPort(
-        repo_path, f"refs/remotes/origin/{base_branch}"
+        repo_path,
+        f"refs/remotes/origin/{base_branch}",
+        lambda: _merged_execplan_ids(connection, repo),
     )
     result = execplan_catalog_state.CatalogReconciliationService(
         execplan_catalog_state.DefinitionStateRepository(connection),
@@ -3606,7 +3630,13 @@ def _migrate_execplan_catalog(
                 continue
             root = Path(str(project["repo"]))
             revision = f"refs/remotes/origin/{project['base_branch']}"
-            snapshot = revision_execplan_snapshot(root, revision)
+            snapshot = revision_execplan_snapshot(
+                root,
+                revision,
+                archive_conflict_plan_ids=_merged_execplan_ids(
+                    connection, str(project["repo"])
+                ),
+            )
             active_path = str(project["plan_path"] or "")
             rows = connection.execute(
                 "SELECT plan_id, path, content_hash, plan_sha, status, "

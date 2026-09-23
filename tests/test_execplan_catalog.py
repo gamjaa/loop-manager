@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -38,6 +39,27 @@ Catalog fixture.
 
 
 class ExecPlanCatalogSnapshotTest(unittest.TestCase):
+    def test_archive_conflict_scope_uses_only_merged_sqlite_rows(self):
+        connection = sqlite3.connect(":memory:")
+        try:
+            connection.execute(
+                "CREATE TABLE exec_plans (repo TEXT, plan_id TEXT, status TEXT)"
+            )
+            connection.executemany(
+                "INSERT INTO exec_plans VALUES (?, ?, ?)",
+                (
+                    ("/repo", "G-001", "MERGED"),
+                    ("/repo", "G-002", "READY"),
+                    ("/other", "G-003", "MERGED"),
+                ),
+            )
+            self.assertEqual(
+                loop_manager._merged_execplan_ids(connection, "/repo"),
+                frozenset({"G-001"}),
+            )
+        finally:
+            connection.close()
+
     def test_final_hash_compares_bytes_without_publication_hash(self):
         final = execplan_catalog.plan_content_hash("revised body\n")
         self.assertEqual(
@@ -185,14 +207,14 @@ class ExecPlanCatalogSnapshotTest(unittest.TestCase):
         other = "docs/plans/[G-002] Independent.md"
         documents = {
             active: plan_text("G-001", "Revised"),
-            archived: b"invalid archived bytes: \xff",
+            archived: plan_text("G-001", "Old"),
             other: plan_text("G-002", "Independent"),
         }
 
         snapshot = execplan_catalog.snapshot_from_documents(
             documents,
             revision_sha="a" * 40,
-            allow_active_archive_conflicts=True,
+            archive_conflict_plan_ids=frozenset({"G-001"}),
         )
 
         self.assertEqual(tuple(snapshot.active), ("G-001", "G-002"))
@@ -201,14 +223,45 @@ class ExecPlanCatalogSnapshotTest(unittest.TestCase):
             execplan_catalog.conflicting_archived_plan_paths(documents),
             {"G-001": (archived,)},
         )
-        with self.assertRaises(execplan_catalog.ExecPlanCatalogError):
+        with self.assertRaisesRegex(execplan_catalog.ExecPlanCatalogError, "중복"):
             execplan_catalog.snapshot_from_documents(documents)
+
+    def test_archive_conflict_requires_merged_id_and_valid_archived_file(self):
+        active = "docs/plans/[G-001] Revised.md"
+        archived = "docs/plans/archive/[G-001] Old.md"
+        documents = {
+            active: plan_text("G-001", "Revised"),
+            archived: plan_text("G-001", "Old"),
+        }
+        with self.assertRaisesRegex(execplan_catalog.ExecPlanCatalogError, "중복"):
+            execplan_catalog.snapshot_from_documents(
+                documents,
+                archive_conflict_plan_ids=frozenset(),
+            )
+
+        invalid_cases = (
+            ({**documents, archived: b"invalid archived bytes: \xff"}, None, "UTF-8"),
+            ({**documents, archived: plan_text("G-002", "Old")}, None, "유효하지"),
+            ({active: documents[active]}, {archived: "symlink"}, "일반 파일"),
+        )
+        for invalid_documents, invalid_entries, expected in invalid_cases:
+            with self.subTest(expected=expected):
+                with self.assertRaisesRegex(
+                    execplan_catalog.ExecPlanCatalogError, expected
+                ):
+                    execplan_catalog.snapshot_from_documents(
+                        invalid_documents,
+                        invalid_plan_entries=invalid_entries,
+                        archive_conflict_plan_ids=frozenset({"G-001"}),
+                    )
 
     def test_remote_git_snapshot_keeps_other_plans_when_archive_id_conflicts(self):
         documents = {
             "docs/PRODUCT.md": b"# Product\n",
             "docs/plans/[G-001] Revised.md": plan_text("G-001", "Revised").encode(),
-            "docs/plans/archive/[G-001] Old.md": b"invalid archived bytes: \xff",
+            "docs/plans/archive/[G-001] Old.md": plan_text(
+                "G-001", "Old"
+            ).encode(),
             "docs/plans/[G-002] Independent.md": plan_text(
                 "G-002", "Independent"
             ).encode(),
@@ -228,8 +281,13 @@ class ExecPlanCatalogSnapshotTest(unittest.TestCase):
             loop_manager, "git", return_value=SimpleNamespace(stdout="a" * 40)
         ), mock.patch.object(loop_manager, "git_bytes", side_effect=git_bytes):
             snapshot = loop_manager.revision_execplan_snapshot(
-                Path("/unused"), "base"
+                Path("/unused"), "base",
+                archive_conflict_plan_ids=frozenset({"G-001"}),
             )
+            with self.assertRaisesRegex(
+                execplan_catalog.ExecPlanCatalogError, "중복"
+            ):
+                loop_manager.revision_execplan_snapshot(Path("/unused"), "base")
 
         self.assertEqual(tuple(snapshot.active), ("G-001", "G-002"))
         self.assertEqual(tuple(snapshot.archived), ())

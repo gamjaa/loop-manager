@@ -471,7 +471,7 @@ def snapshot_from_documents(
     available_regular_paths: AbstractSet[str] | None = None,
     invalid_plan_entries: Mapping[str, str] | None = None,
     revision_sha: str | None = None,
-    allow_active_archive_conflicts: bool = False,
+    archive_conflict_plan_ids: AbstractSet[str] = frozenset(),
 ) -> ExecPlanCatalogSnapshot:
     """Build a snapshot from already-read regular-file documents.
 
@@ -479,22 +479,8 @@ def snapshot_from_documents(
     aware of Git.  Nested paths are ignored by the exact path expressions.
     """
 
-    # The remote reconciliation boundary keeps the active declaration when an
-    # archive copy with the same path identity coexists. Archive housekeeping
-    # observes that second path separately and records a candidate-level
-    # pending reason. All other duplicate IDs remain catalog errors.
-    archive_conflicts = (
-        conflicting_archived_plan_paths(
-            set(documents) | set(invalid_plan_entries or ())
-        )
-        if allow_active_archive_conflicts else {}
-    )
-    conflicted_paths = {
-        path for paths in archive_conflicts.values() for path in paths
-    }
-    remaining_invalid = set(invalid_plan_entries or ()) - conflicted_paths
-    if remaining_invalid:
-        relative_path = sorted(remaining_invalid)[0]
+    if invalid_plan_entries:
+        relative_path = sorted(invalid_plan_entries)[0]
         kind = invalid_plan_entries[relative_path]
         raise ExecPlanCatalogError(
             f"ExecPlan은 원격 revision의 일반 파일이어야 합니다: "
@@ -507,8 +493,6 @@ def snapshot_from_documents(
     archived: dict[str, ExecPlanCatalogEntry] = {}
     filenames: dict[str, str] = {}
     for relative_path in sorted(documents):
-        if relative_path in conflicted_paths:
-            continue
         active_candidate = re.fullmatch(
             r"docs/plans/[^/]+\.md", relative_path
         )
@@ -567,6 +551,14 @@ def snapshot_from_documents(
         all_entries = {**active, **archived}
         if entry.plan_id in all_entries:
             other = all_entries[entry.plan_id]
+            if (
+                entry.archived
+                and not other.archived
+                and entry.plan_id in archive_conflict_plan_ids
+            ):
+                # Only a validated copy of a SQLite-confirmed MERGED plan
+                # may be handled as an archive candidate path conflict.
+                continue
             raise ExecPlanCatalogError(
                 f"중복 ExecPlan id입니다: {entry.plan_id} "
                 f"({other.path}, {relative_path})",
