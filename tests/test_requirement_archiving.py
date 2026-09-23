@@ -343,6 +343,52 @@ class RequirementArchiveEligibilityTest(unittest.TestCase):
             (source,),
         )
 
+    def test_pinned_snapshot_rejects_plan_only_published_later(self):
+        source = self.requirement("Pinned")
+        self.plan("G-001", "Current", (source,), "IMPLEMENTING")
+        old_revision = self.commit("Worker base")
+        self.plan("G-002", "Later", (source,), "READY")
+        latest = self.commit("Latest base")
+        self.connection.execute(
+            "UPDATE exec_plans SET plan_sha = ? "
+            "WHERE repo = ? AND plan_id = 'G-002'",
+            (latest, str(self.repo)),
+        )
+        self.connection.commit()
+
+        with self.assertRaisesRegex(
+            loop_manager.RequirementArchiveError, "Git ExecPlan 없음: G-002"
+        ):
+            loop_manager.requirement_archive_snapshot(
+                self.connection, self.repo, str(self.repo),
+                old_revision, "G-001",
+            )
+        self.assertEqual(
+            loop_manager.requirement_archive_snapshot(
+                self.connection, self.repo, str(self.repo), latest, "G-001"
+            ).candidates,
+            (),
+        )
+
+    def test_snapshot_token_tracks_validated_plan_content_hash(self):
+        source = self.requirement("Hash Input")
+        self.plan("G-001", "Current", (source,), "IMPLEMENTING")
+        original = self.commit("Initial")
+        first = loop_manager.requirement_archive_snapshot(
+            self.connection, self.repo, str(self.repo), original, "G-001"
+        )
+        plan_path = self.repo / "docs/plans/[G-001] Current.md"
+        plan_path.write_text(
+            plan_path.read_text(encoding="utf-8") + "\nAdditional validation.\n",
+            encoding="utf-8",
+        )
+        latest = self.commit("Changed plan body")
+        second = loop_manager.requirement_archive_snapshot(
+            self.connection, self.repo, str(self.repo), latest, "G-001"
+        )
+        self.assertEqual(first.candidates, second.candidates)
+        self.assertNotEqual(first.catalog_token, second.catalog_token)
+
     def test_product_only_plans_do_not_require_archive_revision(self):
         self.plan(
             "G-001",

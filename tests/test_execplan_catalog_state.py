@@ -929,6 +929,35 @@ priority: {priority}
             (1, "docs/plans/archive/[G-001] Old.md", "archived-hash"),
         )
 
+    def test_execution_catalog_invalid_is_returned_before_final_block_gate(self):
+        diagnostic = execplan_catalog_state.ReconciliationDiagnostic(
+            revision_sha="f" * 40,
+            code="missing-source",
+            message="missing source",
+            path="docs/plans/[G-001] Old.md",
+            source="docs/requirements/Missing.md",
+            related_paths=("docs/requirements/Missing.md",),
+            fingerprint="fingerprint",
+        )
+        with mock.patch.object(
+            loop_manager._GitCatalogDefinitionPort,
+            "load",
+            side_effect=execplan_catalog_state.InvalidPinnedCatalog(diagnostic),
+        ):
+            result = loop_manager.reconcile_execution_execplan_catalog(
+                self.connection, Path("/repo"), "/repo", "main"
+            )
+        self.assertEqual(
+            result.kind,
+            execplan_catalog_state.ReconciliationKind.INVALID_CATALOG,
+        )
+        self.assertIsNone(loop_manager.scoped_blocking.project_block(
+            self.connection, "/repo"
+        ))
+        self.assertEqual(self.connection.execute(
+            "SELECT status FROM exec_plans WHERE plan_id = 'G-001'"
+        ).fetchone()[0], "IMPLEMENTING")
+
     def test_invalid_catalog_uses_project_scope_and_fixed_input_auto_releases(self):
         diagnostic = execplan_catalog_state.ReconciliationDiagnostic(
             revision_sha="f" * 40,

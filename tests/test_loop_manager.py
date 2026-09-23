@@ -6615,6 +6615,9 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "recovery_dispatcher.py",
                 "recovery_runtime.py",
                 "recovery_state.py",
+                "requirement_archive.py",
+                "requirement_archive_recovery.py",
+                "requirement_archive_state.py",
                 "runtime_state.py",
                 "scoped_blocking.py",
             ):

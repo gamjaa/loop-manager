@@ -55,6 +55,8 @@ import blocked_checkpoint
 import blocked_checkpoint_state
 import execplan_archive
 import execplan_archive_state
+import requirement_archive
+import requirement_archive_state
 import execplan_catalog
 import execplan_catalog_state
 from planning_runtime import (
@@ -477,6 +479,14 @@ class WorkerPublication:
 
 class RequirementArchiveError(RuntimeError):
     """Requirement archive eligibility or movement cannot be proven safe."""
+
+
+class RequirementArchiveCollisionError(RequirementArchiveError):
+    """A Requirement archive destination is already occupied."""
+
+    def __init__(self, path: str):
+        self.path = path
+        super().__init__(f"Requirement archive 대상이 이미 존재합니다: {path}")
 
 
 @dataclass(frozen=True)
@@ -1053,6 +1063,7 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
     connection.execute(EXEC_PLANS_SCHEMA)
     execplan_catalog_state.ensure_schema(connection)
     execplan_archive_state.ensure_schema(connection)
+    requirement_archive_state.ensure_schema(connection)
     columns = {row[1] for row in connection.execute("PRAGMA table_info(exec_plans)")}
     if "blocked_fingerprint" not in columns:
         connection.execute("ALTER TABLE exec_plans ADD COLUMN blocked_fingerprint TEXT")
@@ -1556,6 +1567,8 @@ def reconcile_execplan_catalog(
     repo_path: Path,
     repo: str,
     base_branch: str,
+    *,
+    record_invalid: bool = True,
 ) -> execplan_catalog_state.CatalogReconciliationResult:
     """Converge declaration cache or persist a recoverable project diagnostic."""
 
@@ -1571,6 +1584,8 @@ def reconcile_execplan_catalog(
     catalog_reason = BlockReasonCode.EXECPLAN_CATALOG_INVALID.value
     existing_block = scoped_blocking.project_block(connection, repo)
     if result.kind is execplan_catalog_state.ReconciliationKind.INVALID_CATALOG:
+        if not record_invalid:
+            return result
         diagnostic = result.diagnostic
         assert diagnostic is not None
         location = diagnostic.path or "(catalog)"
@@ -1601,13 +1616,27 @@ def reconcile_execplan_catalog(
             notifications.enqueue_current_project_events(connection, repo)
         return result
     if (
-        result.kind is execplan_catalog_state.ReconciliationKind.RECONCILED
+        record_invalid
+        and result.kind is execplan_catalog_state.ReconciliationKind.RECONCILED
         and existing_block is not None
         and existing_block["reason_code"] == catalog_reason
     ):
         with connection:
             scoped_blocking.clear_project_block(connection, repo)
     return result
+
+
+def reconcile_execution_execplan_catalog(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    repo: str,
+    base_branch: str,
+) -> execplan_catalog_state.CatalogReconciliationResult:
+    """Let the execution recovery gate persist its own final decision."""
+
+    return reconcile_execplan_catalog(
+        connection, repo_path, repo, base_branch, record_invalid=False
+    )
 
 
 def _is_active_requirement(path: bytes) -> bool:
@@ -13275,6 +13304,8 @@ def _requirement_archive_tree(
 ) -> dict[bytes, tuple[bytes, bytes]]:
     try:
         return _git_tree_entries(repo_path, revision)
+    except GitLockError:
+        raise
     except RuntimeError as error:
         raise RequirementArchiveError(
             f"Git revision의 Requirement/ExecPlan 이력을 확인할 수 없습니다: "
@@ -13283,30 +13314,10 @@ def _requirement_archive_tree(
 
 
 def _stored_requirement_sources(rows: list[sqlite3.Row]) -> tuple[str, ...]:
-    sources: set[str] = set()
-    for row in rows:
-        plan_id = str(row["plan_id"])
-        try:
-            stored_sources = json.loads(str(row["sources"]))
-        except json.JSONDecodeError as error:
-            raise RequirementArchiveError(
-                f"ExecPlan {plan_id}의 SQLite source를 해석할 수 없습니다."
-            ) from error
-        if not isinstance(stored_sources, list) or any(
-            not isinstance(source, str) for source in stored_sources
-        ):
-            raise RequirementArchiveError(
-                f"ExecPlan {plan_id}의 SQLite source를 해석할 수 없습니다."
-            )
-        for source in stored_sources:
-            if source == "docs/PRODUCT.md":
-                continue
-            if re.fullmatch(r"docs/requirements/[^/\\]+\.md", source) is None:
-                raise RequirementArchiveError(
-                    f"ExecPlan {plan_id}의 SQLite source가 유효하지 않습니다: {source}"
-                )
-            sources.add(source)
-    return tuple(sorted(sources))
+    try:
+        return requirement_archive.stored_requirement_sources(rows)
+    except requirement_archive.ArchiveSnapshotError as error:
+        raise RequirementArchiveError(str(error)) from error
 
 
 def requirement_archive_sources(
@@ -13375,30 +13386,36 @@ def _revision_execplan_catalog(
             revision,
             archive_conflict_plan_ids=archive_conflict_plan_ids,
         )
+    except GitLockError:
+        raise
     except RuntimeError as error:
         raise RequirementArchiveError(
             f"Git revision의 ExecPlan source 관계를 확정할 수 없습니다: {error}"
         ) from error
     return {
-        plan_id: entry.metadata() for plan_id, entry in snapshot.all.items()
+        plan_id: {
+            **entry.metadata(),
+            "path": entry.path,
+            "content_hash": entry.content_hash,
+        }
+        for plan_id, entry in snapshot.all.items()
     }
 
 
 
-def requirement_archive_candidates(
+def requirement_archive_snapshot(
     connection: sqlite3.Connection,
     repo_path: Path,
     repo: str,
     revision: str,
     current_plan_id: str,
-) -> tuple[str, ...]:
-    """Return active Requirements safe to move in the current implementation PR."""
+    *,
+    allow_future_publication: bool = False,
+) -> requirement_archive.ArchiveSnapshot:
+    """Read candidate scope from one immutable Git and SQLite view."""
 
     rows = connection.execute(
-        "SELECT plan_id, path, sources, status, plan_sha, "
-        "publication_path, publication_sha "
-        "FROM exec_plans WHERE repo = ?",
-        (repo,),
+        "SELECT * FROM exec_plans WHERE repo = ?", (repo,)
     ).fetchall()
     states = {str(row["plan_id"]): row for row in rows}
     if current_plan_id not in states:
@@ -13410,9 +13427,6 @@ def requirement_archive_candidates(
             raise RequirementArchiveError(
                 f"ExecPlan {plan_id}의 source 관계 또는 상태를 확정할 수 없습니다."
             )
-    if not _stored_requirement_sources(rows):
-        return ()
-
     catalog = _revision_execplan_catalog(
         repo_path,
         revision,
@@ -13431,14 +13445,15 @@ def requirement_archive_candidates(
         for row in historical_rows if not int(row["merge_confirmed"])
     }
     state_ids = set(states)
-    for plan_id in sorted(state_ids - set(catalog)):
-        later_plan = _later_published_execplan(
-            repo_path,
-            revision,
-            states[plan_id],
-        )
-        if later_plan is not None:
-            catalog[plan_id] = later_plan
+    if allow_future_publication:
+        for plan_id in sorted(state_ids - set(catalog)):
+            later_plan = _later_published_execplan(
+                repo_path,
+                revision,
+                states[plan_id],
+            )
+            if later_plan is not None:
+                catalog[plan_id] = later_plan
     try:
         _validate_dependency_graph(catalog)
     except RuntimeError as error:
@@ -13465,54 +13480,71 @@ def requirement_archive_candidates(
             + ")."
         )
 
-    # Reconciliation has already validated the remote snapshot and atomically
-    # installed these current source relations.  Archive eligibility consumes
-    # that cache instead of treating a valid declaration delta as an error.
-    for plan_id, row in states.items():
-        try:
-            current_sources = json.loads(str(row["sources"]))
-        except json.JSONDecodeError as error:
-            raise RequirementArchiveError(
-                f"ExecPlan {plan_id}의 SQLite source를 해석할 수 없습니다."
-            ) from error
-        if not isinstance(current_sources, list) or any(
-            not isinstance(source, str) for source in current_sources
-        ):
-            raise RequirementArchiveError(
-                f"ExecPlan {plan_id}의 SQLite source를 해석할 수 없습니다."
-            )
-        catalog[plan_id]["sources"] = current_sources
-
     tree = _requirement_archive_tree(repo_path, revision)
-    candidates: list[str] = []
-    for path in sorted(tree):
-        if not _is_active_requirement(path):
-            continue
-        source = path.decode("utf-8")
-        related = [
-            plan_id
-            for plan_id, plan in catalog.items()
-            if source in plan["sources"]
-        ]
-        if not related:
-            continue
-        if any(
-            plan_id in unverified_historical_ids
-            or (
-                plan_id != current_plan_id
-                and str(states[plan_id]["status"]) != "MERGED"
-            )
-            for plan_id in related
-        ):
-            continue
-        archived = requirement_archive_path(source).encode("utf-8")
-        if archived in tree:
+    try:
+        snapshot = requirement_archive.calculate(
+            base_oid=revision,
+            catalog=catalog,
+            states={plan_id: str(row["status"]) for plan_id, row in states.items()},
+            active_requirements=tuple(
+                path.decode("utf-8") for path in tree if _is_active_requirement(path)
+            ),
+            archived_requirements=frozenset(
+                path.decode("utf-8") for path in tree
+                if path.startswith(b"docs/requirements/archive/")
+            ),
+            current_plan_id=current_plan_id,
+            unverified_historical_ids=frozenset(unverified_historical_ids),
+            known_statuses=frozenset(KNOWN_EXECPLAN_STATUSES),
+            cache_versions={
+                plan_id: tuple(
+                    row[field] if field in row.keys() else None
+                    for field in (
+                        "path", "title", "sources", "depends_on",
+                        "current_complexity", "current_risk", "priority",
+                        "content_hash", "current_revision_sha",
+                    )
+                )
+                for plan_id, row in states.items()
+            },
+        )
+    except requirement_archive.ArchiveCollisionError as error:
+        raise RequirementArchiveCollisionError(error.path) from error
+    except requirement_archive.ArchiveSnapshotError as error:
+        raise RequirementArchiveError(str(error)) from error
+    return snapshot
+
+
+def requirement_archive_candidates(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    repo: str,
+    revision: str,
+    current_plan_id: str,
+) -> tuple[str, ...]:
+    """Compatibility projection of a revision-pinned archive snapshot."""
+
+    states = {
+        str(row["plan_id"]): str(row["status"])
+        for row in connection.execute(
+            "SELECT plan_id, status FROM exec_plans WHERE repo = ?", (repo,)
+        )
+    }
+    if current_plan_id not in states:
+        raise RequirementArchiveError(
+            f"현재 ExecPlan의 SQLite 상태 없음: {current_plan_id}"
+        )
+    for plan_id, status in states.items():
+        if status not in KNOWN_EXECPLAN_STATUSES:
             raise RequirementArchiveError(
-                f"Requirement archive 대상이 이미 존재합니다: "
-                f"{requirement_archive_path(source)}"
+                f"ExecPlan {plan_id}의 source 관계 또는 상태를 확정할 수 없습니다."
             )
-        candidates.append(source)
-    return tuple(candidates)
+    if not requirement_archive_sources(connection, repo):
+        return ()
+    return requirement_archive_snapshot(
+        connection, repo_path, repo, revision, current_plan_id,
+        allow_future_publication=True,
+    ).candidates
 
 def requirement_archive_touched_sources(
     repo_path: Path,
@@ -13587,96 +13619,42 @@ def requirement_archive_move_set(
     """Return content-preserving Requirement moves relative to one base revision."""
 
     tree = _requirement_archive_tree(repo_path, revision)
-    moved: list[str] = []
-    for path, (object_type, object_id) in sorted(tree.items()):
-        if not _is_active_requirement(path):
-            continue
-        source = path.decode("utf-8")
-        archived = requirement_archive_path(source)
-        source_path = worktree / source
-        archived_path = worktree / archived
-        archived_in_base = archived.encode("utf-8") in tree
-        if source_path.is_file():
-            if not archived_in_base and archived_path.exists():
-                raise RequirementArchiveError(
-                    f"Requirement archive 대상이 이미 존재합니다: {archived}"
-                )
-            continue
-        if archived_in_base:
-            raise RequirementArchiveError(
-                f"활성 Requirement와 기존 archive의 관계를 확정할 수 없습니다: {source}"
-            )
-        try:
-            archived_mode = archived_path.lstat().st_mode
-        except FileNotFoundError as error:
-            raise RequirementArchiveError(
-                f"Requirement 원본과 archive 대상이 모두 없습니다: {source}"
-            ) from error
-        if not stat.S_ISREG(archived_mode):
-            raise RequirementArchiveError(
-                f"Requirement archive 대상이 일반 파일이 아닙니다: {archived}"
-            )
-        if object_type != b"blob":
-            raise RequirementArchiveError(
-                f"Requirement 원본 내용을 확인할 수 없습니다: {source}"
-            )
-        original = git_bytes(
-            repo_path,
-            "cat-file",
-            "blob",
-            object_id.decode("ascii"),
+    def ignore_status(path: str) -> tuple[int, str]:
+        result = git(
+            worktree, "check-ignore", "--quiet", "--", path, check=False
         )
-        if archived_path.read_bytes() != original:
-            raise RequirementArchiveError(
-                f"Requirement archive 이동 중 내용이 변경됐습니다: {source}"
-            )
-        if tracked_revision is None:
-            ignored = git(
-                worktree,
-                "check-ignore",
-                "--quiet",
-                "--",
-                archived,
-                check=False,
-            )
-            if ignored.returncode == 0:
-                raise RequirementArchiveError(
-                    f"Requirement archive 대상이 Git ignore 규칙으로 제외됩니다: "
-                    f"{archived}"
-                )
-            if ignored.returncode != 1:
-                raise RequirementArchiveError(
-                    f"Requirement archive 대상의 Git 추적 가능 여부를 확인할 수 "
-                    f"없습니다: {archived} ({ignored.stdout[-2000:]})"
-                )
-        else:
-            archived_object_id = _requirement_archive_blob(
-                worktree,
-                tracked_revision,
-                archived,
-            )
-            tracked_contents = git_bytes(
-                worktree,
-                "cat-file",
-                "blob",
-                archived_object_id.decode("ascii"),
-            )
-            if tracked_contents != original:
-                raise RequirementArchiveError(
-                    f"Requirement archive의 게시 내용이 원본과 다릅니다: {source}"
-                )
-        moved.append(source)
-    return tuple(moved)
+        return result.returncode, result.stdout
+
+    def tracked_contents(path: str) -> bytes:
+        object_id = _requirement_archive_blob(worktree, tracked_revision, path)
+        return git_bytes(worktree, "cat-file", "blob", object_id.decode("ascii"))
+
+    try:
+        return requirement_archive.validated_moves(
+            tree, worktree,
+            blob_contents=lambda object_id: git_bytes(
+                repo_path, "cat-file", "blob", object_id.decode("ascii")
+            ),
+            tracked_contents=tracked_contents if tracked_revision is not None else None,
+            ignore_status=ignore_status if tracked_revision is None else None,
+        )
+    except requirement_archive.ArchiveCollisionError as error:
+        raise RequirementArchiveCollisionError(error.path) from error
+    except requirement_archive.ArchiveMoveError as error:
+        raise RequirementArchiveError(str(error)) from error
 
 def requirement_archive_reconciliation_error(
     expected: tuple[str, ...],
     actual: tuple[str, ...],
+    *,
+    revision: str | None = None,
 ) -> str | None:
     if expected == actual:
         return None
     return (
         "Requirement archive 이동 집합이 최신 eligibility와 다릅니다.\n"
-        f"기대: {json.dumps(expected, ensure_ascii=False)}\n"
+        + (f"기준 revision: {revision}\n" if revision else "")
+        + f"기대: {json.dumps(expected, ensure_ascii=False)}\n"
         f"현재: {json.dumps(actual, ensure_ascii=False)}\n"
         "기대 집합만 내용 변경 없이 docs/requirements/archive/로 이동하라."
     )
@@ -16758,6 +16736,7 @@ def _ExecutionLifecyclePorts(connection, runtime_repository, **identity):
         ),
         archive=execution_handlers.ArchiveEffects(
             requirement_archive_sources=state.bind(requirement_archive_sources, name="requirement_archive_sources", connected=True, mutates=False),
+            requirement_archive_snapshot=state.bind(requirement_archive_snapshot, name="requirement_archive_snapshot", connected=True, mutates=False),
             requirement_archive_candidates=state.bind(requirement_archive_candidates, name="requirement_archive_candidates", connected=True, mutates=False),
             requirement_archive_move_set=state.bind(requirement_archive_move_set, name="requirement_archive_move_set", connected=False, mutates=False),
             requirement_archive_reconciliation_error=state.bind(requirement_archive_reconciliation_error, name="requirement_archive_reconciliation_error", connected=False, mutates=False),
@@ -16782,7 +16761,7 @@ def _ExecutionLifecyclePorts(connection, runtime_repository, **identity):
             operation_print=state.bind(operation_print, name="operation_print", connected=False, mutates=False),
         ),
         revision=execution_handlers.RevisionEffects(
-            reconcile_catalog=state.bind(reconcile_execplan_catalog, name="reconcile_execplan_catalog", connected=True, mutates=True),
+            reconcile_catalog=state.bind(reconcile_execution_execplan_catalog, name="reconcile_execplan_catalog", connected=True, mutates=True),
             source_fingerprint=state.bind(_revision_execplan_source_fingerprint, name="_revision_execplan_source_fingerprint", connected=False, mutates=False),
             body_hash=state.bind(_revision_execplan_body_hash, name="_revision_execplan_body_hash", connected=False, mutates=False),
             changed_paths=state.bind(_revision_changed_paths, name="_revision_changed_paths", connected=False, mutates=False),
