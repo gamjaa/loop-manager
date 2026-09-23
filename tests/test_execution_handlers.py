@@ -239,6 +239,12 @@ class ExecutionHandlerTests(TestCase):
         self.assertEqual(additions[0].args[1:], ('add', '-A', '--', 'app.py'))
 
     def test_partial_stage_resume_only_stages_remaining_dirty_path(self):
+        self._assert_partial_stage_resume(changed=False)
+
+    def test_partial_stage_resume_rejects_replaced_clean_resolution(self):
+        self._assert_partial_stage_resume(changed=True)
+
+    def _assert_partial_stage_resume(self, *, changed):
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)
         self.handler.effects = self.effects
@@ -262,6 +268,15 @@ class ExecutionHandlerTests(TestCase):
             return self.observed_git(path, *args, **kwargs)
 
         self.effects.workspace.git.side_effect = partially_staged_git
+        self.effects.agent.path_signature.return_value = (
+            'head-content' if changed else 'clean-content'
+        )
+        if changed:
+            with self.assertRaises(handlers.RecoveryFailure):
+                self.handler._stage_rebase_correction(self.context('WORKING'))
+            self.assertFalse(any(call.args[1] == 'add'
+                                 for call in self.effects.workspace.git.call_args_list))
+            return
         stage = self.handler._stage_rebase_correction(self.context('WORKING'))
 
         self.assertEqual(stage.returncode, 0)
@@ -776,6 +791,16 @@ class ExecutionHandlerTests(TestCase):
     def test_completed_autostash_stage_matching_head_resumes_without_rebase(self):
         self._assert_staged_rebase_resume(False, clean_after_stage=True)
 
+    def test_completed_stage_rejects_replaced_clean_resolution_before_skip(self):
+        self._assert_staged_rebase_resume(
+            True, clean_after_stage=True, replaced_resolution=True,
+        )
+
+    def test_completed_autostash_stage_rejects_replaced_clean_resolution(self):
+        self._assert_staged_rebase_resume(
+            False, clean_after_stage=True, replaced_resolution=True,
+        )
+
     def test_staged_rebase_resume_rejects_added_files(self):
         self._assert_staged_rebase_resume(True, changed=True)
 
@@ -935,7 +960,7 @@ class ExecutionHandlerTests(TestCase):
 
     def _assert_staged_rebase_resume(self, rebase_metadata, *, changed=False,
                                     unstaged=False, untracked=False,
-                                    clean_after_stage=False):
+                                    clean_after_stage=False, replaced_resolution=False):
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)
         self.handler.effects = self.effects
@@ -947,6 +972,9 @@ class ExecutionHandlerTests(TestCase):
         dirty = {'app.py': (('staged',), 'accepted-content')}
         if clean_after_stage:
             dirty = {}
+            self.effects.agent.path_signature.return_value = (
+                'head-content' if replaced_resolution else 'accepted-content'
+            )
         if unstaged or untracked:
             accepted_files['allowed.py'] = 'accepted-other'
             dirty['allowed.py'] = (
@@ -995,11 +1023,12 @@ class ExecutionHandlerTests(TestCase):
             self.assertEqual(set(call.args[4:]),
                              {'app.py', 'allowed.py'} if unstaged or untracked
                              else {'app.py'})
-        if changed:
+        if changed or replaced_resolution:
             self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
             self.assertEqual(checkpoint.get('repo', 'G-047').operation, 'rebase')
-            self.assertFalse(any('--continue' in call.args
+            self.assertFalse(any('--continue' in call.args or '--skip' in call.args
                                  for call in self.effects.workspace.git.call_args_list))
+            self.effects.validation.verify.assert_not_called()
             return
         self.assertEqual(result.phase, ExecutionPhase.VERIFYING)
         self.assertEqual(self.state.row()['worker_result'], 'saved correction')

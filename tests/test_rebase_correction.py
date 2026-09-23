@@ -66,21 +66,26 @@ class RebaseCorrectionTests(TestCase):
             'head': 'owned-head', 'branch': 'loop-manager/G-047',
             'files': {'other.py': 'other-content'},
         }
-        self.assertTrue(stage_evidence_preserved(accepted, observed, {'app.py'}))
-        self.assertFalse(stage_evidence_preserved(accepted, observed, set()))
+        clean = {'app.py': 'accepted-content'}
+        self.assertTrue(stage_evidence_preserved(accepted, observed, {'app.py'}, clean))
+        self.assertFalse(stage_evidence_preserved(accepted, observed, set(), clean))
+        self.assertFalse(stage_evidence_preserved(accepted, observed, {'app.py'}, {}))
+        self.assertFalse(stage_evidence_preserved(
+            accepted, observed, {'app.py'}, {'app.py': 'head-content'},
+        ))
         self.assertFalse(stage_evidence_preserved(
             accepted, {**observed, 'files': {'other.py': 'changed-content'}},
-            {'app.py'},
+            {'app.py'}, clean,
         ))
         self.assertFalse(stage_evidence_preserved(
             accepted, {**observed, 'files': {'other.py': 'other-content',
                                             'extra.py': 'new-content'}},
-            {'app.py'},
+            {'app.py'}, clean,
         ))
         self.assertFalse(stage_evidence_preserved(
-            accepted, {**observed, 'head': 'different-head'}, {'app.py'},
+            accepted, {**observed, 'head': 'different-head'}, {'app.py'}, clean,
         ))
-        self.assertFalse(stage_evidence_preserved(None, observed, {'app.py'}))
+        self.assertFalse(stage_evidence_preserved(None, observed, {'app.py'}, clean))
 
     def test_stage_and_continue_actions_use_narrow_git_operations(self):
         git = mock.Mock(return_value=SimpleNamespace(returncode=0, stdout='done'))

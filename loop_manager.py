@@ -16740,6 +16740,7 @@ def _ExecutionLifecyclePorts(connection, runtime_repository, **identity):
         agent=execution_handlers.AgentEffects(
             begin_agent_scope=state.bind(begin_agent_scope, name="begin_agent_scope", connected=True, mutates=True),
             capture_git_snapshot=state.bind(capture_git_snapshot, name="capture_git_snapshot", connected=False, mutates=False),
+            path_signature=state.bind(_path_signature, name="path_signature", connected=False, mutates=False),
             clear_agent_scope=state.bind(clear_agent_scope, name="clear_agent_scope", connected=True, mutates=True),
             validate_agent_scope=state.bind(validate_agent_scope, name="validate_agent_scope", connected=False, mutates=False),
             validate_worker_workspace_scope=state.bind(validate_worker_workspace_scope, name="validate_worker_workspace_scope", connected=False, mutates=False),

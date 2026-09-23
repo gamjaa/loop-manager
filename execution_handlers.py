@@ -53,6 +53,7 @@ class WorkspaceEffects:
 class AgentEffects:
     begin_agent_scope: Callable[..., Any]
     capture_git_snapshot: Callable[..., Any]
+    path_signature: Callable[..., str]
     clear_agent_scope: Callable[..., Any]
     validate_agent_scope: Callable[..., Any]
     validate_worker_workspace_scope: Callable[..., Any]
@@ -561,8 +562,8 @@ class ExecutionHandlers:
             context.worktree, 'ls-files', '--others', '--exclude-standard', '-z'
         ).stdout
         tracked_paths = {path for path in tracked.split('\0') if path}
-        if accepted is not None and not stage_evidence_preserved(
-            accepted, observed, tracked_paths
+        if accepted is not None and not self._stage_evidence_preserved(
+            context, accepted, observed, tracked_paths
         ):
             raise RecoveryFailure(
                 RecoveryReason.OWNERSHIP_UNCERTAIN,
@@ -573,6 +574,18 @@ class ExecutionHandlers:
         return execute_git_step(
             CorrectionAction.STAGE, git=self.effects.workspace.git,
             worktree=context.worktree, paths=tuple(sorted(paths)),
+        )
+
+    def _stage_evidence_preserved(self, context, accepted, observed, tracked_paths):
+        accepted_files = accepted.get('files') if isinstance(accepted, dict) else None
+        disappeared = (accepted_files.keys() - observed['files'].keys()
+                       if isinstance(accepted_files, dict) else set())
+        clean_signatures = {
+            path: self.effects.agent.path_signature(context.worktree, path)
+            for path in disappeared & tracked_paths
+        }
+        return stage_evidence_preserved(
+            accepted, observed, tracked_paths, clean_signatures,
         )
 
     def _post_rebase_observation(self, context, target_oid, output, *, corrected=False,
@@ -875,8 +888,8 @@ class ExecutionHandlers:
                         context.worktree, 'ls-files', '--cached', '-z',
                     ).stdout.split('\0') if path
                 }
-                if not stage_evidence_preserved(
-                    saved_evidence, observed_evidence, tracked_paths
+                if not self._stage_evidence_preserved(
+                    context, saved_evidence, observed_evidence, tracked_paths
                 ):
                     return self._recover(
                         RecoveryReason.OWNERSHIP_UNCERTAIN,

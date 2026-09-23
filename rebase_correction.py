@@ -43,8 +43,9 @@ def stage_evidence_preserved(
     accepted: Mapping[str, object] | None,
     observed: Mapping[str, object],
     tracked_paths: AbstractSet[str],
+    clean_signatures: Mapping[str, str],
 ) -> bool:
-    """A staged path may disappear from dirty state only when Git now tracks it cleanly."""
+    """Clean tracked paths must still contain the accepted resolution."""
     if not isinstance(accepted, Mapping) or not isinstance(observed, Mapping):
         return False
     if accepted == observed:
@@ -60,7 +61,10 @@ def stage_evidence_preserved(
            for path, signature in observed_files.items()):
         return False
     disappeared = accepted_files.keys() - observed_files.keys()
-    return bool(disappeared) and disappeared <= tracked_paths
+    return (bool(disappeared) and disappeared <= tracked_paths
+            and all(path in clean_signatures
+                    and clean_signatures[path] == accepted_files[path]
+                    for path in disappeared))
 
 
 @dataclass(frozen=True)
