@@ -94,6 +94,7 @@ class StoredPlanIdentity:
     content_hash: str
     plan_sha: str | None
     status: str | None = None
+    current_content_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -937,10 +938,17 @@ class CatalogRecoveryService:
             if identity is not None:
                 original_path = identity.path
                 original_hash = identity.content_hash
+                current_hash = (
+                    identity.current_content_hash or identity.content_hash
+                )
                 stable_plan_sha = identity.plan_sha
             elif audit is not None:
                 original_path = str(audit["original_path"])
                 original_hash = str(audit["original_content_hash"])
+                # An audit-only row has no synchronized declaration cache.
+                # Its last observation may be the rejected tampered bytes, so
+                # only the verified publication hash is safe as a baseline.
+                current_hash = original_hash
                 stable_plan_sha = (
                     str(audit["plan_sha"]) if audit["plan_sha"] else None
                 )
@@ -948,6 +956,7 @@ class CatalogRecoveryService:
             else:
                 original_path = entry.active_path
                 original_hash = entry.content_hash
+                current_hash = entry.content_hash
                 stable_plan_sha = None
             proof = MergeProof(False)
             diagnostic: CatalogDiagnostic | None = None
@@ -994,19 +1003,21 @@ class CatalogRecoveryService:
                     else:
                         if not trusted_identity:
                             original_hash = proof.publication_content_hash
-                        if (
+                        publication_mismatch = (
                             proof.publication_content_hash != original_hash
-                            or (
-                                not trusted_identity
-                                and proof.publication_content_hash
-                                != entry.content_hash
-                            )
-                        ):
+                        )
+                        current_mismatch = (
+                            entry.content_hash != current_hash
+                            if trusted_identity
+                            else proof.publication_content_hash
+                            != entry.content_hash
+                        )
+                        if publication_mismatch or current_mismatch:
                             diagnostic = self._diagnostic(
                                 entry,
                                 "archived-content-hash-mismatch",
-                                "archived ExecPlan byte hash가 게시 revision의 "
-                                "본문 hash와 다릅니다: "
+                                "archived ExecPlan byte hash가 게시 revision 또는 "
+                                "마지막 동기화 본문 hash와 다릅니다: "
                                 f"{entry.path}",
                             )
 

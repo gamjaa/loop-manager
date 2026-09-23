@@ -3599,6 +3599,7 @@ def _migrate_execplan_catalog(
                         else None
                     ),
                     status=str(row["status"]),
+                    current_content_hash=str(row["content_hash"]),
                 )
                 for row in rows
             }
@@ -3617,6 +3618,36 @@ def _migrate_execplan_catalog(
             legacy_backfill_allowed = (
                 not catalog_initialized and not missing_stored_ids
             )
+            unknown_active_ids = set(snapshot.active) - set(stored)
+            unknown_archived_ids = (
+                set(snapshot.archived) - set(stored) - historical_ids
+            )
+            unknown_ids = sorted(unknown_active_ids | unknown_archived_ids)
+            if missing_stored_ids:
+                missing_id = sorted(missing_stored_ids)[0]
+                if unknown_ids:
+                    replacement_id = unknown_ids[0]
+                    raise execplan_catalog.ExecPlanCatalogError(
+                        "원격 ExecPlan ID 변경을 기존 실행 이력과 하나로 "
+                        f"대응할 수 없습니다: {missing_id} -> {replacement_id}",
+                        code="ambiguous-id-change",
+                        path=snapshot.all[replacement_id].path,
+                        related_paths=(stored[missing_id].path,),
+                    )
+                raise execplan_catalog.ExecPlanCatalogError(
+                    "SQLite ExecPlan에 대응하는 원격 파일이 없습니다: "
+                    f"{missing_id}",
+                    code="missing-plan",
+                    path=stored[missing_id].path,
+                )
+            if catalog_initialized and unknown_ids:
+                unknown_id = unknown_ids[0]
+                raise execplan_catalog.ExecPlanCatalogError(
+                    "원격 ExecPlan ID를 SQLite 실행 이력과 대응할 수 없습니다: "
+                    f"{unknown_id}",
+                    code="unknown-plan-id",
+                    path=snapshot.all[unknown_id].path,
+                )
             catalog_repository = execplan_catalog_state.CatalogStateRepository(
                 connection, ensure=False
             )

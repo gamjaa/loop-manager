@@ -107,7 +107,7 @@ class ExecPlanCatalogStateTest(unittest.TestCase):
         self.assertEqual(row["merge_confirmed"], 0)
         self.assertEqual(row["diagnostic_code"], "merge-proof-missing")
 
-    def test_verified_id_accepts_file_authoritative_archive_delta(self):
+    def test_verified_id_rejects_archive_delta_from_current_cache(self):
         entry = archived_entry(text_suffix=" changed")
         published_hash = hashlib.sha256(b"original").hexdigest()
         stored = {
@@ -132,8 +132,10 @@ class ExecPlanCatalogStateTest(unittest.TestCase):
         )
 
         self.assertEqual(port.calls, ["G-001"])
-        self.assertEqual(len(result.merged), 1)
-        self.assertEqual(result.diagnostics, ())
+        self.assertEqual(result.merged, ())
+        self.assertEqual(
+            result.diagnostics[0].code, "archived-content-hash-mismatch"
+        )
         row = self.repository.historical_row("/repo", "G-001")
         self.assertEqual(row["original_path"], "docs/plans/[G-001] Original.md")
         self.assertEqual(row["observed_path"], entry.path)
@@ -201,6 +203,7 @@ class ExecPlanCatalogStateTest(unittest.TestCase):
                 content_hash=published.content_hash,
                 plan_sha="a" * 40,
                 status="MERGED",
+                current_content_hash=revised.content_hash,
             )
         }
 
@@ -834,7 +837,7 @@ priority: {priority}
         self.assertEqual(result.diagnostic.code, "unknown-plan-id")
         self.assertEqual(result.diagnostic.path, "docs/plans/[G-003] Unknown.md")
 
-    def test_legacy_backfill_does_not_register_replacement_id_before_reconciliation(self):
+    def test_legacy_backfill_rejects_replacement_before_any_history_mutation(self):
         replacement = active_snapshot(
             "f" * 40,
             {
@@ -845,10 +848,28 @@ priority: {priority}
             },
         ).snapshot
 
-        with mock.patch.object(
-            loop_manager,
-            "revision_execplan_snapshot",
-            return_value=replacement,
+        self.connection.execute(
+            """
+            INSERT INTO execplan_catalog_history (
+                repo, plan_id, original_path, observed_path,
+                original_content_hash, final_content_hash
+            ) VALUES ('/repo', 'G-001', 'docs/plans/[G-001] Old.md',
+                      'docs/plans/archive/[G-001] Old.md',
+                      'published-hash', 'archived-hash')
+            """
+        )
+        self.connection.commit()
+
+        with (
+            mock.patch.object(
+                loop_manager,
+                "revision_execplan_snapshot",
+                return_value=replacement,
+            ),
+            self.assertRaisesRegex(
+                execplan_catalog.ExecPlanCatalogError,
+                "ID 변경",
+            ),
         ):
             loop_manager.migrate_legacy_execplans(
                 self.connection,
@@ -857,12 +878,25 @@ priority: {priority}
                 ensure_schema=False,
             )
 
-        plan_ids = self.connection.execute(
-            "SELECT plan_id FROM exec_plans ORDER BY plan_id"
+        plans = self.connection.execute(
+            "SELECT plan_id, status, content_hash "
+            "FROM exec_plans ORDER BY plan_id"
         ).fetchall()
         self.assertEqual(
-            [str(row["plan_id"]) for row in plan_ids],
-            ["G-001", "G-002"],
+            [tuple(row) for row in plans],
+            [
+                ("G-001", "IMPLEMENTING", "old-hash-G-001"),
+                ("G-002", "MERGED", "old-hash-G-002"),
+            ],
+        )
+        history = self.connection.execute(
+            "SELECT currently_archived, observed_path, final_content_hash "
+            "FROM execplan_catalog_history "
+            "WHERE repo = '/repo' AND plan_id = 'G-001'"
+        ).fetchone()
+        self.assertEqual(
+            tuple(history),
+            (1, "docs/plans/archive/[G-001] Old.md", "archived-hash"),
         )
 
     def test_invalid_catalog_uses_project_scope_and_fixed_input_auto_releases(self):

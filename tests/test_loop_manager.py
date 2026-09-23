@@ -566,12 +566,23 @@ class AutomationFirstCatalogTest(unittest.TestCase):
             active = write_execplan(root, "G-001", "Stored Merge")
             commit_and_push(root, "Add stored merge plan")
             publication_sha = git_command(root, "rev-parse", "HEAD")
+            publication_hash = hashlib.sha256(active.read_bytes()).hexdigest()
+            active.write_text(
+                active.read_text(encoding="utf-8")
+                + "\nReconciled before archive.\n",
+                encoding="utf-8",
+            )
+            commit_and_push(root, "Revise stored merge plan")
+            current_hash = hashlib.sha256(active.read_bytes()).hexdigest()
             archive = root / "docs/plans/archive"
             archive.mkdir()
             archived = archive / active.name
             active.rename(archived)
             commit_and_push(root, "Archive stored merge plan")
-            content_hash = hashlib.sha256(archived.read_bytes()).hexdigest()
+            self.assertEqual(
+                hashlib.sha256(archived.read_bytes()).hexdigest(),
+                current_hash,
+            )
 
             connection = sqlite3.connect(":memory:")
             connection.row_factory = sqlite3.Row
@@ -585,14 +596,20 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                 """
                 INSERT INTO exec_plans (
                     repo, plan_id, path, title, sources, depends_on, priority,
-                    content_hash, status, plan_sha
+                    content_hash, publication_path,
+                    publication_content_hash, publication_sha,
+                    status, plan_sha
                 ) VALUES (?, 'G-001', ?, 'Stored Merge',
-                          '["docs/PRODUCT.md"]', '[]', 'normal', ?, 'MERGED', ?)
+                          '["docs/PRODUCT.md"]', '[]', 'normal', ?, ?, ?, ?,
+                          'MERGED', ?)
                 """,
                 (
                     str(root),
                     "docs/plans/[G-001] Stored Merge.md",
-                    content_hash,
+                    current_hash,
+                    "docs/plans/[G-001] Stored Merge.md",
+                    publication_hash,
+                    publication_sha,
                     publication_sha,
                 ),
             )
