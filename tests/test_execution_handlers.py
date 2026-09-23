@@ -5,10 +5,16 @@ from types import SimpleNamespace
 from unittest import TestCase, mock
 
 import execution_handlers as handlers
+from execution_revision import DefinitionSnapshot
 import loop_manager as lm
 import runtime_state
 from execution_state import ExecutionStatePort
-from execution_runtime import ExecutionPhase, ExecutionOutcomeKind
+from execution_runtime import (
+    ExecutionPhase,
+    ExecutionPhaseCoordinator,
+    ExecutionOutcome,
+    ExecutionOutcomeKind,
+)
 from tests import test_runtime_state
 
 
@@ -38,6 +44,7 @@ class ExecutionHandlerTests(TestCase):
             blocking=bundle(handlers.BlockingEffects),
             publication=bundle(handlers.PublicationEffects),
             events=bundle(handlers.EventsEffects),
+            revision=bundle(handlers.RevisionEffects),
         )
         self.effects.workspace.is_directory.return_value = False
         self.effects.workspace.branch_has_changes.return_value = True
@@ -53,6 +60,14 @@ class ExecutionHandlerTests(TestCase):
         self.effects.publication.published_execplan.return_value = self.plan
         self.effects.publication.push_managed_publication_branch.side_effect = lambda *a: self.calls.append('push') or 'head'
         self.effects.publication.command.side_effect = lambda *a, **k: self.calls.append('pr') or SimpleNamespace(stdout='https://example/pr/1')
+        self.effects.revision.reconcile_catalog.side_effect = lambda *_: SimpleNamespace(
+            kind=SimpleNamespace(value='reconciled'), revision_sha=self.remote
+        )
+        self.effects.revision.body_hash.return_value = 'body'
+        self.effects.revision.source_fingerprint.return_value = 'source'
+        self.effects.revision.changed_paths.return_value = ()
+        self.effects.revision.unmet_dependencies.return_value = ()
+        self.effects.archive.requirement_archive_sources.return_value = ()
         self.handler = handlers.ExecutionHandlers(
             self.effects, repo='repo', repo_path=Path('/repo'), state_dir=Path('/state'),
             base='main', base_sha='base', provider='codex', config_path=Path('/config'),
@@ -63,7 +78,7 @@ class ExecutionHandlerTests(TestCase):
 
     def git(self, path, *args, **kwargs):
         self.calls.append(args[0])
-        if args[0] == 'rebase':
+        if args[0] == 'rebase' and '--skip' not in args:
             self.assertEqual(self.state.row()['last_error'], lm.REBASE_IN_PROGRESS_ERROR)
         if args[0] == 'commit':
             self.dirty = False
@@ -99,6 +114,25 @@ class ExecutionHandlerTests(TestCase):
         order = [c for c in self.calls if c in {'worker', 'verify', 'commit', 'reviewer', 'push', 'pr'}]
         self.assertEqual(order, ['worker', 'verify', 'commit', 'reviewer', 'push', 'pr'])
 
+    def test_revision_guard_tokens_follow_complete_phase_lifecycle(self):
+        context = self.handler.guard(self.context())
+        self.assertNotIsInstance(context, handlers.ExecutionOutcome)
+
+        for method in ('run', 'verify', 'review', 'publish'):
+            call = getattr(self.handler, method)
+            args = (context, self.handler) if method in {'verify', 'publish'} else (context,)
+            result = call(*args)
+            context = result.context
+
+        completed = self.repository.get('repo', 'G-047')
+        self.assertEqual(completed.status, 'PR_OPEN')
+        self.assertIsNotNone(completed.definition_snapshot)
+        self.assertIsNotNone(completed.worker_input_token)
+        self.assertIsNotNone(completed.archive_token)
+        self.assertIsNotNone(completed.verify_token)
+        self.assertIsNotNone(completed.review_token)
+        self.assertIsNotNone(completed.publication_token)
+
     def test_latest_base_uses_same_intent_and_rebase_for_both_checkpoints(self):
         for phase in ('VERIFYING', 'PUBLISHING'):
             with self.subTest(phase=phase):
@@ -127,6 +161,519 @@ class ExecutionHandlerTests(TestCase):
             self.handler.run(context)
         self.assertEqual(self.calls, [])
         self.assertIsNone(self.repository.get('repo', 'G-047').worker_session_id)
+
+    def test_source_revision_invalidates_artifacts_but_preserves_sessions_and_workspace(self):
+        guarded = self.handler.guard(self.context())
+        self.assertNotIsInstance(guarded, handlers.ExecutionOutcome)
+        snapshot = DefinitionSnapshot.deserialize(
+            self.state.row()['definition_snapshot']
+        )
+        assert snapshot is not None
+        self.state.update_project(
+            'repo',
+            phase='PUBLISHING',
+            validated_base_sha='base',
+            worker_session_id='worker-session',
+            reviewer_session_id='reviewer-session',
+            worker_result='worker-result',
+            verify_result='verify-result',
+            review_result='review-result',
+            worker_input_token=snapshot.worker_token,
+            archive_token=snapshot.archive_token,
+            verify_token=snapshot.verify_token('base'),
+            review_token=snapshot.review_token('base'),
+            publication_token=snapshot.publication_token('base'),
+        )
+        self.effects.revision.source_fingerprint.return_value = 'changed-source'
+
+        outcome = self.handler.guard(self.handler._context())
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+        row = self.state.row()
+        self.assertEqual(row['phase'], 'WORKING')
+        self.assertIsNone(row['worker_result'])
+        self.assertIsNone(row['verify_result'])
+        self.assertIsNone(row['review_result'])
+        self.assertEqual(row['worker_session_id'], 'worker-session')
+        self.assertEqual(row['reviewer_session_id'], 'reviewer-session')
+        self.assertEqual(row['branch'], 'loop-manager/G-047')
+        self.assertEqual(row['worktree'], '/state/G-047')
+
+    def test_working_body_change_clears_retry_artifacts_before_worker(self):
+        self.handler.guard(self.context())
+        self.state.update_project(
+            'repo',
+            worker_session_id='worker-session',
+            worker_result='previous worker result',
+            verify_result='failed verify result',
+            review_result='previous review result',
+            validated_base_sha='base',
+        )
+        self.effects.revision.body_hash.return_value = 'revised-body'
+
+        guarded = self.handler.guard(self.handler._context())
+
+        self.assertNotIsInstance(guarded, ExecutionOutcome)
+        row = self.state.row()
+        self.assertEqual(row['phase'], 'WORKING')
+        self.assertIsNone(row['worker_result'])
+        self.assertIsNone(row['verify_result'])
+        self.assertIsNone(row['review_result'])
+        self.assertIsNone(row['validated_base_sha'])
+        self.assertEqual(row['worker_session_id'], 'worker-session')
+
+    def test_working_source_change_clears_retry_artifacts_before_worker(self):
+        self.handler.guard(self.context())
+        self.state.update_project(
+            'repo',
+            worker_result='previous worker result',
+            verify_result='failed verify result',
+            worker_input_token='stale-worker-token',
+        )
+        self.effects.revision.source_fingerprint.return_value = 'revised-source'
+
+        guarded = self.handler.guard(self.handler._context())
+
+        self.assertNotIsInstance(guarded, ExecutionOutcome)
+        row = self.state.row()
+        self.assertIsNone(row['worker_result'])
+        self.assertIsNone(row['verify_result'])
+        self.assertIsNone(row['worker_input_token'])
+
+    def _conflict_revision_setup(self):
+        self.handler.guard(self.context())
+        workspace_plan = self.handler._cached_plan(self.handler.catalog_plan)
+        self.state.update_project(
+            'repo',
+            last_error=lm.REBASE_CONFLICT_PREFIX + 'conflict',
+            worker_session_id='worker-session',
+            worker_result='previous worker result',
+        )
+        self.effects.workspace.is_directory.return_value = True
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        self.effects.agent.validate_worker_workspace_scope.side_effect = (
+            lm.validate_worker_workspace_scope
+        )
+        def resume_agent(*args, **kwargs):
+            self.calls.append(args[4])
+            session = kwargs['session_id'] or 'session'
+            kwargs['on_session_started'](session)
+            return lm.AgentResult(0, 'result', session_id=session)
+        self.effects.agent.run_agent.side_effect = resume_agent
+        return workspace_plan
+
+    def _dispatch_conflict_revision(self, workspace_plan):
+        # Exercise the real workspace metadata comparison, faking only Git and
+        # file parsing. A constant validator result would hide stale metadata.
+        with mock.patch('loop_manager.capture_git_snapshot'), mock.patch(
+            'loop_manager.validate_agent_scope'
+        ), mock.patch('loop_manager.validate_managed_worktree'), mock.patch(
+            'loop_manager.validate_execplan', return_value=workspace_plan
+        ):
+            return ExecutionPhaseCoordinator(self.handler).dispatch(
+                self.handler._context()
+            )
+
+    def test_conflict_revision_dependency_merge_resumes_worker(self):
+        workspace_plan = self._conflict_revision_setup()
+        applied = self.state.row()['definition_snapshot']
+        for plan_id, dependencies in (('G-048', '["G-050"]'), ('G-050', '[]')):
+            self.connection.execute(
+                "INSERT INTO exec_plans (repo, plan_id, path, title, sources, "
+                "depends_on, priority, content_hash, status) VALUES "
+                "('repo', ?, ?, 'Dependency', '[\"docs/PRODUCT.md\"]', ?, "
+                "'normal', 'hash', 'READY')",
+                (plan_id, f'docs/plans/[{plan_id}] Dependency.md', dependencies),
+            )
+        self.connection.execute(
+            "UPDATE exec_plans SET depends_on = '[\"G-048\"]' "
+            "WHERE repo = 'repo' AND plan_id = 'G-047'"
+        )
+        self.connection.commit()
+        self.remote = 'new-base'
+        self.effects.revision.unmet_dependencies.side_effect = (
+            lambda repo, plan_id: lm.unmet_execplan_dependencies(
+                self.connection, repo, plan_id
+            )
+        )
+
+        outcome = ExecutionPhaseCoordinator(self.handler).dispatch(
+            self.handler._context()
+        )
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.STABLE_WAIT)
+        self.assertIn('G-048', outcome.detail)
+        self.assertIn('G-050', outcome.detail)
+        self.effects.agent.run_agent.assert_not_called()
+        self.assertNotIn('rebase', self.calls)
+        row = self.state.row()
+        self.assertEqual(row['worker_session_id'], 'worker-session')
+        self.assertEqual(row['worker_result'], 'previous worker result')
+        self.assertTrue(row['last_error'].startswith(lm.REBASE_CONFLICT_PREFIX))
+        self.connection.execute(
+            "UPDATE exec_plans SET status = 'MERGED' "
+            "WHERE repo = 'repo' AND plan_id IN ('G-048', 'G-050')"
+        )
+        self.connection.commit()
+        resumed = self._dispatch_conflict_revision(workspace_plan)
+        self.assertEqual(resumed.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
+        self.effects.blocking.block_active_execplan.assert_not_called()
+        self.assertEqual(
+            self.effects.agent.run_agent.call_args.kwargs['session_id'],
+            'worker-session',
+        )
+        self.assertIsNone(self.effects.agent.worker_prompt.call_args.args[2])
+        self.assertEqual(self.state.row()['definition_snapshot'], applied)
+        self.dirty = False
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = False
+        refreshed = self.handler.guard(self.handler._context())
+        self.assertEqual(refreshed.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(self.state.row()['phase'], 'WORKING')
+        self.assertIsNone(self.state.row()['worker_result'])
+        self.assertEqual(self.state.row()['branch'], 'loop-manager/G-047')
+        self.assertEqual(self.state.row()['worktree'], '/state/G-047')
+        self.effects.validation.verify.assert_not_called()
+        latest_plan = self.handler._cached_plan(self.handler.catalog_plan)
+        rerun = self._dispatch_conflict_revision(latest_plan)
+        self.assertEqual(rerun.context.phase, ExecutionPhase.VERIFYING)
+        self.assertEqual(self.state.row()['worker_session_id'], 'worker-session')
+        verified = self._dispatch_conflict_revision(latest_plan)
+        self.assertEqual(verified.context.phase, ExecutionPhase.REVIEWING)
+        reviewed = self._dispatch_conflict_revision(latest_plan)
+        self.assertEqual(reviewed.context.phase, ExecutionPhase.PUBLISHING)
+        self.assertEqual(
+            [call for call in self.calls if call in {'worker', 'verify', 'reviewer'}],
+            ['worker', 'worker', 'verify', 'reviewer'],
+        )
+
+    def test_conflict_revision_priority_change_allows_old_workspace_metadata(self):
+        workspace_plan = self._conflict_revision_setup()
+        self.connection.execute(
+            "UPDATE exec_plans SET priority = 'high' "
+            "WHERE repo = 'repo' AND plan_id = 'G-047'"
+        )
+        self.connection.commit()
+        self.remote = 'new-base'
+
+        outcome = self._dispatch_conflict_revision(workspace_plan)
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
+        self.effects.blocking.block_active_execplan.assert_not_called()
+        self.assertEqual(self.handler.plan['priority'], 'high')
+        self.assertEqual(
+            self.effects.agent.worker_prompt.call_args.args[2],
+            'previous worker result',
+        )
+        self.dirty = False
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = False
+        refreshed = self.handler.guard(self.handler._context())
+        self.assertEqual(refreshed.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(self.state.row()['phase'], 'VERIFYING')
+        self.assertEqual(self.state.row()['worker_result'], 'result')
+
+    def _assert_conflict_profile_resume(self, old_profile, new_profile, effective):
+        self.connection.execute(
+            "UPDATE exec_plans SET current_complexity = ?, current_risk = ? "
+            "WHERE repo = 'repo' AND plan_id = 'G-047'", old_profile,
+        )
+        self.connection.commit()
+        workspace_plan = self._conflict_revision_setup()
+        current_plan = dict(workspace_plan, complexity=new_profile[0], risk=new_profile[1])
+        initial = lm.worker_level(current_plan)
+        selected = max(initial, effective)
+        history = '{"1":{"prior-review":2}}'
+        # G-036 publishes the new profile and monotonic level in one update.
+        self.connection.execute(
+            "UPDATE exec_plans SET current_complexity = ?, current_risk = ?, "
+            "initial_worker_level = ?, effective_worker_level = ?, "
+            "review_level_history = ? WHERE repo = 'repo' AND plan_id = 'G-047'",
+            (*new_profile, initial, selected, history),
+        )
+        self.connection.commit()
+        self.remote = 'new-base'
+        self.effects.validation.ensure_worker_level_state.side_effect = (
+            lambda repo, plan: lm.ensure_worker_level_state(self.connection, repo, plan)
+        )
+        with mock.patch('loop_manager.validate_execplan', return_value=workspace_plan):
+            with self.assertRaisesRegex(RuntimeError, 'metadata'):
+                lm.validate_active_execplan_metadata(
+                    Path('/repo'), Path('/state/G-047'),
+                    self.state.row()['plan_path'], self.repository.active_row('repo'),
+                )
+
+        outcome = self._dispatch_conflict_revision(workspace_plan)
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
+        self.effects.blocking.block_active_execplan.assert_not_called()
+        call = self.effects.agent.run_agent.call_args
+        self.assertEqual(call.kwargs['session_id'], 'worker-session')
+        self.assertEqual(call.kwargs['level'], selected)
+        self.assertEqual(self.handler.plan['complexity'], new_profile[0])
+        self.assertEqual(self.handler.plan['risk'], new_profile[1])
+        self.assertEqual(self.effects.agent.worker_prompt.call_args.args[2],
+                         'previous worker result')
+        row = self.repository.active_row('repo')
+        self.assertEqual(row['initial_worker_level'], initial)
+        self.assertEqual(row['effective_worker_level'], selected)
+        self.assertEqual(row['review_level_history'], history)
+        self.dirty = False
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = False
+        self.handler.guard(self.handler._context())
+        self.assertEqual(self.state.row()['phase'], 'VERIFYING')
+        self.assertEqual(self.state.row()['worker_result'], 'result')
+
+    def test_conflict_profile_complexity_change_resumes_same_worker(self):
+        self._assert_conflict_profile_resume(('low', 'low'), ('high', 'low'), 1)
+
+    def test_conflict_profile_risk_change_resumes_same_worker(self):
+        self._assert_conflict_profile_resume(('low', 'low'), ('low', 'critical'), 1)
+
+    def test_conflict_profile_downgrade_preserves_escalated_level(self):
+        self._assert_conflict_profile_resume(('high', 'critical'), ('low', 'low'), 8)
+
+    def test_conflict_revision_scope_rejects_unapproved_metadata(self):
+        workspace_plan = self._conflict_revision_setup()
+        baseline = DefinitionSnapshot.deserialize(self.state.row()['definition_snapshot'])
+        self.connection.execute(
+            "UPDATE exec_plans SET priority = 'high', depends_on = '[\"G-048\"]', "
+            "current_complexity = 'medium', current_risk = 'medium' "
+            "WHERE repo = 'repo' AND plan_id = 'G-047'"
+        )
+        self.connection.commit()
+        catalog = self.repository.active_row('repo')
+        for field, value in (
+            ('priority', 'critical'), ('depends_on', ['G-099']),
+            ('complexity', 'high'), ('risk', 'high'),
+            ('title', 'Unauthorized'), ('sources', ['docs/OTHER.md']),
+        ):
+            with self.subTest(field=field), mock.patch(
+                'loop_manager.capture_git_snapshot'
+            ), mock.patch('loop_manager.validate_agent_scope'), mock.patch(
+                'loop_manager.validate_managed_worktree'
+            ), mock.patch('loop_manager.validate_execplan', return_value={
+                **workspace_plan, field: value,
+            }):
+                with self.assertRaisesRegex(RuntimeError, 'metadata'):
+                    lm.validate_worker_workspace_scope(
+                        Path('/repo'), Path('/state/G-047'), 'loop-manager/G-047',
+                        'main', catalog['path'], catalog, mock.Mock(),
+                        allow_rebase=True, rebase_definition=baseline,
+                    )
+        with mock.patch('loop_manager.capture_git_snapshot'), mock.patch(
+            'loop_manager.validate_agent_scope'
+        ), mock.patch('loop_manager.validate_managed_worktree'), mock.patch(
+            'loop_manager.validate_execplan', return_value=workspace_plan
+        ) as parsed:
+            with self.assertRaisesRegex(RuntimeError, 'metadata'):
+                lm.validate_worker_workspace_scope(
+                    Path('/repo'), Path('/state/G-047'), 'loop-manager/G-047',
+                    'main', catalog['path'], catalog, mock.Mock(),
+                )
+            parsed.return_value = {
+                **workspace_plan, 'priority': 'high', 'depends_on': ['G-048'],
+                'complexity': 'medium', 'risk': 'medium',
+            }
+            current = lm.validate_worker_workspace_scope(
+                Path('/repo'), Path('/state/G-047'), 'loop-manager/G-047',
+                'main', catalog['path'], catalog, mock.Mock(),
+                allow_rebase=True, rebase_definition=baseline,
+            )
+            self.assertEqual(current['priority'], 'high')
+            self.assertEqual(current['depends_on'], ['G-048'])
+            self.assertEqual(current['complexity'], 'medium')
+            self.assertEqual(current['risk'], 'medium')
+        with self.assertRaisesRegex(RuntimeError, '충돌 복구'):
+            lm.validate_worker_workspace_scope(
+                Path('/repo'), Path('/state/G-047'), 'loop-manager/G-047',
+                'main', catalog['path'], catalog, mock.Mock(),
+                rebase_definition=baseline,
+            )
+
+    def test_conflicted_rebase_blocks_new_worker_input_before_worker(self):
+        self.handler.guard(self.context())
+        self.state.update_project(
+            'repo',
+            last_error=lm.REBASE_CONFLICT_PREFIX + 'conflict',
+            worker_session_id='worker-session',
+            worker_result='previous worker result',
+        )
+        self.effects.workspace.is_directory.return_value = True
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        self.effects.revision.body_hash.return_value = 'revised-body'
+
+        outcome = ExecutionPhaseCoordinator(self.handler).dispatch(
+            self.handler._context()
+        )
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.effects.agent.run_agent.assert_not_called()
+        self.effects.blocking.block_active_execplan.assert_called_once()
+        self.assertEqual(
+            self.effects.blocking.block_active_execplan.call_args.kwargs['reason'],
+            lm.BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
+        )
+
+    def test_conflict_resolution_rechecks_new_remote_base_before_verify(self):
+        self.handler.guard(self.context())
+        self.state.update_project(
+            'repo',
+            last_error=lm.REBASE_CONFLICT_PREFIX + 'conflict',
+            worker_session_id='worker-session',
+            worker_result='previous worker result',
+        )
+        self.effects.workspace.is_directory.return_value = True
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        self.remote = 'new-base'
+        guarded = self.handler.guard(self.handler._context())
+        self.assertNotIsInstance(guarded, ExecutionOutcome)
+
+        resolved = self.handler._finish_worker(
+            guarded, self.state.row(), 'resolved worker result'
+        )
+
+        self.assertEqual(resolved.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
+        self.assertEqual(self.state.row()['active_sha'], 'base')
+        self.dirty = False
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = False
+        refreshed = self.handler.guard(self.handler._context())
+        self.assertEqual(refreshed.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(self.state.row()['active_sha'], 'new-base')
+        self.assertEqual(self.calls.count('rebase'), 2)
+
+    def test_revision_guard_adopts_legacy_phase_artifacts_without_worker_replay(self):
+        self.state.update_project(
+            'repo',
+            phase='PUBLISHING',
+            validated_base_sha='base',
+            worker_result='worker-result',
+            verify_result='verify-result',
+            review_result='review-result',
+            definition_snapshot=None,
+            worker_input_token=None,
+            archive_token=None,
+            verify_token=None,
+            review_token=None,
+            publication_token=None,
+        )
+
+        guarded = self.handler.guard(self.handler._context())
+
+        self.assertNotIsInstance(guarded, handlers.ExecutionOutcome)
+        row = self.state.row()
+        snapshot = DefinitionSnapshot.deserialize(row['definition_snapshot'])
+        assert snapshot is not None
+        self.assertEqual(row['phase'], 'PUBLISHING')
+        self.assertEqual(row['worker_result'], 'worker-result')
+        self.assertEqual(row['verify_result'], 'verify-result')
+        self.assertEqual(row['review_result'], 'review-result')
+        self.assertEqual(row['worker_input_token'], snapshot.worker_token)
+        self.assertEqual(row['archive_token'], snapshot.archive_token)
+        self.assertEqual(row['verify_token'], snapshot.verify_token('base'))
+        self.assertEqual(row['review_token'], snapshot.review_token('base'))
+
+    def test_revision_guard_retries_when_base_and_catalog_shas_disagree(self):
+        self.effects.revision.reconcile_catalog.side_effect = None
+        self.effects.revision.reconcile_catalog.return_value = SimpleNamespace(
+            kind=SimpleNamespace(value='reconciled'), revision_sha='other-base'
+        )
+
+        outcome = self.handler.guard(self.context())
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+        self.assertIsNone(self.state.row()['definition_snapshot'])
+        self.effects.revision.body_hash.assert_not_called()
+        self.effects.revision.source_fingerprint.assert_not_called()
+
+    def test_revision_guard_rejects_legacy_artifacts_after_source_change(self):
+        self.state.update_project(
+            'repo',
+            phase='PUBLISHING',
+            validated_base_sha='base',
+            worker_result='worker-result',
+            verify_result='verify-result',
+            review_result='review-result',
+            definition_snapshot=None,
+            worker_input_token=None,
+            archive_token=None,
+            verify_token=None,
+            review_token=None,
+            publication_token=None,
+        )
+        self.remote = 'new-base'
+        self.effects.revision.changed_paths.return_value = (
+            'docs/PRODUCT.md',
+        )
+
+        outcome = self.handler.guard(self.handler._context())
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+        row = self.state.row()
+        self.assertEqual(row['phase'], 'WORKING')
+        self.assertIsNone(row['worker_result'])
+        self.assertIsNone(row['verify_result'])
+        self.assertIsNone(row['review_result'])
+
+    def test_successful_revision_refresh_clears_rebase_recovery_marker(self):
+        guarded = self.handler.guard(self.context())
+        self.assertNotIsInstance(guarded, handlers.ExecutionOutcome)
+        self.remote = 'new-base'
+
+        outcome = self.handler.guard(guarded)
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+        row = self.state.row()
+        self.assertEqual(row['phase'], 'WORKING')
+        self.assertEqual(row['active_sha'], 'new-base')
+        self.assertIsNone(row['revision_resume_status'])
+        self.assertIsNone(row['last_error'])
+
+    def test_revision_refresh_checkpoints_dirty_verified_worker_patch_before_rebase(self):
+        self.state.update_project(
+            'repo', phase='VERIFYING', worker_result='worker-result'
+        )
+        self.remote = 'new-base'
+
+        outcome = self.handler.guard(self.handler._context())
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+        self.assertLess(self.calls.index('commit'), self.calls.index('rebase'))
+        self.assertEqual(self.state.row()['active_sha'], 'new-base')
+        self.assertEqual(self.state.row()['worker_result'], 'worker-result')
+
+    def test_dependency_gate_reports_unmerged_direct_and_indirect_plans(self):
+        for plan_id, dependencies in (
+            ('G-035', '[]'),
+            ('G-036', '["G-035"]'),
+        ):
+            self.connection.execute(
+                "INSERT INTO exec_plans (repo, plan_id, path, title, sources, "
+                "depends_on, priority, content_hash, status) VALUES "
+                "('repo', ?, ?, ?, '[\"docs/PRODUCT.md\"]', ?, 'normal', "
+                "'hash', 'READY')",
+                (plan_id, f'docs/plans/[{plan_id}] Plan.md', 'Plan', dependencies),
+            )
+        self.connection.execute(
+            "UPDATE exec_plans SET depends_on = '[\"G-036\"]' "
+            "WHERE repo = 'repo' AND plan_id = 'G-047'"
+        )
+        self.connection.commit()
+
+        self.assertEqual(
+            lm.unmet_execplan_dependencies(
+                self.connection, 'repo', 'G-047'
+            ),
+            ('G-035', 'G-036'),
+        )
+        self.connection.execute(
+            "UPDATE exec_plans SET status = 'MERGED' "
+            "WHERE repo = 'repo' AND plan_id IN ('G-035', 'G-036')"
+        )
+        self.assertEqual(
+            lm.unmet_execplan_dependencies(
+                self.connection, 'repo', 'G-047'
+            ),
+            (),
+        )
 
     def test_verify_interruption_resumes_without_duplicate_commit(self):
         context = self.context('VERIFYING')

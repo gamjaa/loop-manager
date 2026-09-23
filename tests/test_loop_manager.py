@@ -1348,12 +1348,13 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                     ),
                 }:
                     exact_reads += 1
-                    git_command(
-                        repo,
-                        "update-ref",
-                        "refs/remotes/origin/main",
-                        moved_sha,
-                    )
+                    if exact_reads == 1:
+                        git_command(
+                            repo,
+                            "update-ref",
+                            "refs/remotes/origin/main",
+                            moved_sha,
+                        )
                 return result
 
             def record_fingerprint(path, revision):
@@ -1377,6 +1378,8 @@ class AutomationFirstCatalogTest(unittest.TestCase):
             ), mock.patch(
                 "loop_manager._planning_input_fingerprint",
                 side_effect=record_fingerprint,
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
             ), mock.patch("loop_manager.run_codex", side_effect=agent):
                 result = loop_manager.run_project(
                     connection,
@@ -1402,7 +1405,7 @@ class AutomationFirstCatalogTest(unittest.TestCase):
             )
             self.assertEqual(
                 git_command(repo, "rev-parse", "refs/remotes/origin/main"),
-                moved_sha,
+                selected_sha,
             )
 
 
@@ -3721,10 +3724,12 @@ risk: medium
 
         self.assertEqual(result, 0)
         self.assertEqual(roles, ["worker"])
-        self.assertEqual(verify.call_count, 2)
+        # The revision gate now refreshes the base before Worker dispatch, so
+        # it never validates the already-absorbed patch on the stale base.
+        verify.assert_called_once()
         self.assertEqual(ahead, "0")
         self.assertIsNone(project["phase"])
-        self.assertIn("rebase 후 Worker 변경이 남지 않아", plan["last_error"])
+        self.assertIn("Worker가 변경을 만들지 않아", plan["last_error"])
         self.assertEqual(plan["status"], "PLAN_BLOCKED")
         self.assertIsNotNone(plan["blocked_fingerprint"])
 
@@ -3848,9 +3853,8 @@ risk: medium
     def test_rebase_verify_failure_recovers_after_initial_success(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, state_dir, connection = self._make_active_worker_project(directory)
-            original_git = loop_manager.git
-            origin_reads = 0
             sessions = []
+            reviewed = False
             loop_manager.migrate_legacy_execplans(
                 connection, target_repo=str(repo)
             )
@@ -3865,6 +3869,7 @@ risk: medium
                 "-m",
                 "Advance base for rebase verification",
             )
+            git_command(repo, "push", "origin", f"{advanced_sha}:main")
             managed = Path(
                 connection.execute(
                     "SELECT worktree FROM projects WHERE repo = ?", (str(repo),)
@@ -3875,25 +3880,10 @@ risk: medium
                     connection, str(repo), managed, "verify", "rebased verify failed"
                 )
 
-            def git_after_base_advance(path, *arguments, **kwargs):
-                nonlocal origin_reads
-                if arguments in {
-                    ("rev-parse", "refs/remotes/origin/main^{commit}"),
-                    ("rev-parse", "origin/main"),
-                }:
-                    origin_reads += 1
-                    if origin_reads > 1:
-                        return subprocess.CompletedProcess(
-                            ["git", *arguments], 0, stdout=advanced_sha + "\n"
-                        )
-                if arguments == ("rebase", "origin/main"):
-                    return subprocess.CompletedProcess(
-                        ["git", *arguments], 0, stdout=""
-                    )
-                return original_git(path, *arguments, **kwargs)
-
             def worker(worktree, _state, _config, role_name, _prompt, **kwargs):
+                nonlocal reviewed
                 if role_name == "reviewer":
+                    reviewed = True
                     return loop_manager.CodexResult(
                         0, "VERDICT: PASS", "reviewer-session"
                     )
@@ -3908,11 +3898,23 @@ risk: medium
                     "worker-session",
                 )
 
-            verify_results = [
-                (True, "first verify"),
-                (False, "rebased verify failed"),
-                (True, "final verify"),
-            ]
+            verify_results = [(True, "first verify")]
+            clear_history = loop_manager.clear_validation_failure_history
+            cleared_histories = []
+
+            def track_clear_history(connection, project_repo, stage):
+                clear_history(connection, project_repo, stage)
+                if stage == "verify":
+                    cleared_histories.append(
+                        json.loads(
+                            connection.execute(
+                                "SELECT verify_failure_history FROM exec_plans "
+                                "WHERE repo = ? AND plan_id = 'G-001'",
+                                (project_repo,),
+                            ).fetchone()["verify_failure_history"]
+                        )
+                    )
+
             with mock.patch(
                 "loop_manager.validate_repository", return_value=repo
             ), mock.patch(
@@ -3921,15 +3923,17 @@ risk: medium
                 "loop_manager.ensure_safe_base_worktree"
             ), mock.patch(
                 "loop_manager.pr_for_branch",
-                side_effect=[
-                    None, None, {"url": "https://example.test/pr/1"}
-                ],
+                side_effect=lambda *_args, **_kwargs: (
+                    {"url": "https://example.test/pr/1"}
+                    if reviewed else None
+                ),
             ), mock.patch(
                 "loop_manager.run_codex", side_effect=worker
             ), mock.patch(
                 "loop_manager.verify", side_effect=verify_results
             ) as verify, mock.patch(
-                "loop_manager.git", side_effect=git_after_base_advance
+                "loop_manager.clear_validation_failure_history",
+                side_effect=track_clear_history,
             ):
                 self.assertEqual(
                     loop_manager.run_project(
@@ -3948,16 +3952,20 @@ risk: medium
                 (str(repo),),
             ).fetchone()
             plan = connection.execute(
-                "SELECT status, last_error, verify_failure_history FROM exec_plans "
+                "SELECT status, last_error, verify_result, verify_failure_history FROM exec_plans "
                 "WHERE repo = ? AND plan_id = 'G-001'", (str(repo),)
             ).fetchone()
 
         self.assertIsNone(row["phase"])
         self.assertEqual(plan["status"], "PR_OPEN")
         self.assertIsNone(plan["last_error"])
+        self.assertEqual(sessions, [None])
+        verify.assert_called_once()
+        self.assertEqual(plan["verify_result"], "first verify")
+        self.assertEqual(cleared_histories, [{}])
         self.assertEqual(json.loads(plan["verify_failure_history"]), {})
-        self.assertEqual(verify.call_count, 3)
-        self.assertEqual(sessions, [None, "worker-session"])
+        # The base advances at the pre-Worker gate, so neither a stale Worker
+        # result nor a stale verify result is produced or consumed.
 
     def test_verify_success_passes_worker_and_verify_results_to_reviewer(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -6582,6 +6590,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "loop_manager.py",
                 "execution_runtime.py",
                 "execution_handlers.py",
+                "execution_revision.py",
                 "execution_state.py",
                 "guidance_approval.py",
                 "execplan_archive.py",
@@ -9165,7 +9174,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
 
             def verify_after_rebase(agent_worktree):
                 verify_calls.append(agent_worktree)
-                if len(verify_calls) == 2:
+                if len(verify_calls) == 1:
                     (agent_worktree / "verify-output.txt").write_text(
                         "created after rebase\n",
                         encoding="utf-8",
@@ -9207,7 +9216,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
 
             self.assertEqual(result, 1)
             self.assertEqual(roles, ["worker", "reviewer"])
-            self.assertEqual(len(verify_calls), 2)
+            self.assertEqual(len(verify_calls), 1)
             self.assertEqual(project["phase"], "REVIEWING")
             self.assertIn("stop after publication check", project["last_error"])
             self.assertIn("src/app.py", published_paths)

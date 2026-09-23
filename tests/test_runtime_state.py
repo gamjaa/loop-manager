@@ -413,6 +413,48 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
             )
         self.assertEqual(repository.get("repo", "G-047").active_sha, "active-sha")
 
+    def test_stage_revision_tokens_are_snapshot_bound_and_projected_atomically(self):
+        connection = self._connection()
+        repository = runtime_state.RuntimeStateRepository(connection)
+        original = repository.activate(
+            "repo",
+            "G-047",
+            activation_sha="base",
+            branch="loop-manager/G-047",
+            worktree="/state/G-047",
+        )
+
+        revised = repository.transition_from_snapshot(
+            original,
+            plan_values={
+                "definition_snapshot": '{"revision":"new"}',
+                "worker_input_token": "worker-token",
+                "archive_token": "archive-token",
+            },
+            project_values={
+                "definition_snapshot": '{"revision":"new"}',
+                "worker_input_token": "worker-token",
+                "archive_token": "archive-token",
+            },
+        )
+
+        project = connection.execute(
+            "SELECT definition_snapshot, worker_input_token, archive_token "
+            "FROM projects WHERE repo = 'repo'"
+        ).fetchone()
+        self.assertEqual(
+            tuple(project),
+            ('{"revision":"new"}', "worker-token", "archive-token"),
+        )
+        self.assertEqual(revised.worker_input_token, "worker-token")
+        with self.assertRaises(runtime_state.RuntimeStateError):
+            repository.transition_from_snapshot(
+                original,
+                plan_values={"verify_token": "stale"},
+                project_values={"verify_token": "stale"},
+            )
+        self.assertIsNone(repository.get("repo", "G-047").verify_token)
+
     def test_outbox_failures_roll_back_source_projection_and_event(self):
         for stage in ("before_outbox_enqueue", "after_outbox_enqueue"):
             with self.subTest(stage=stage):

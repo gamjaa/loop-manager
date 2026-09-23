@@ -3,8 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Any
 from pathlib import Path
+import json
 import sys
 from scoped_blocking import BlockReasonCode
+from execution_revision import (DefinitionDelta, DefinitionSnapshot, RevisionGateKind,
+    StageArtifacts, WORKER_INVALIDATING_DELTAS, decide_revision_gate)
 from execution_runtime import (ExecutionContext, ExecutionOutcome, ExecutionOutcomeKind,
     ExecutionPhase, ExecutionPlanMetadata, LatestBaseCheckpoint)
 
@@ -82,6 +85,15 @@ class EventsEffects:
     operation_log: Callable[..., Any]
     operation_print: Callable[..., Any]
 
+
+@dataclass(frozen=True)
+class RevisionEffects:
+    reconcile_catalog: Callable[..., Any]
+    source_fingerprint: Callable[..., Any]
+    body_hash: Callable[..., Any]
+    changed_paths: Callable[..., Any]
+    unmet_dependencies: Callable[..., Any]
+
 @dataclass(frozen=True)
 class ExecutionEffects:
     state: Any
@@ -93,6 +105,7 @@ class ExecutionEffects:
     publication: PublicationEffects
     blocking: BlockingEffects
     events: EventsEffects
+    revision: RevisionEffects
 
 
 class ExecutionHandlers:
@@ -116,6 +129,7 @@ class ExecutionHandlers:
         self.archive_scope_sources = ()
         self._latest_verify_output = ''
         self._worker_publication = None
+        self._definition_snapshot = None
 
     def _row(self):
         return self.effects.state.row()
@@ -169,6 +183,32 @@ class ExecutionHandlers:
             pr_conflict_base_oid=str(row['pr_conflict_base_oid']) if row['pr_conflict_base_oid'] is not None else None,
             resolving_rebase=self._resolving_rebase(row),
             archive_sources=self.archive_sources,
+            current_definition_token=(
+                self._definition_snapshot.definition_token
+                if self._definition_snapshot is not None
+                else None
+            ),
+            current_base_token=str(row['active_sha'] or ''),
+            worker_input_token=(
+                str(row['worker_input_token'])
+                if row['worker_input_token'] is not None else None
+            ),
+            archive_token=(
+                str(row['archive_token'])
+                if row['archive_token'] is not None else None
+            ),
+            verify_token=(
+                str(row['verify_token'])
+                if row['verify_token'] is not None else None
+            ),
+            review_token=(
+                str(row['review_token'])
+                if row['review_token'] is not None else None
+            ),
+            publication_token=(
+                str(row['publication_token'])
+                if row['publication_token'] is not None else None
+            ),
         )
 
     @staticmethod
@@ -198,6 +238,18 @@ class ExecutionHandlers:
         return bool(
             rebase_recovery and self.effects.workspace.is_directory(worktree) and self.effects.workspace._rebase_in_progress_for_branch(worktree, str(row['branch'] or '')),
         )
+
+    @staticmethod
+    def _cached_plan(catalog_plan):
+        return {
+            'id': str(catalog_plan['plan_id']),
+            'title': str(catalog_plan['title']),
+            'sources': list(json.loads(str(catalog_plan['sources']))),
+            'depends_on': list(json.loads(str(catalog_plan['depends_on']))),
+            'complexity': str(catalog_plan['current_complexity'] or 'low'),
+            'risk': str(catalog_plan['current_risk'] or 'low'),
+            'priority': str(catalog_plan['priority']),
+        }
 
     def prepare(self):
         row = self._row()
@@ -258,77 +310,528 @@ class ExecutionHandlers:
             row['phase'] == 'WORKING' and (rebase_error == self.effects.contract.REBASE_IN_PROGRESS_ERROR or rebase_error.startswith(self.effects.contract.REBASE_CONFLICT_PREFIX)),
         )
         if rebase_recovery and (not resolving_rebase) and (not int(row['pr_conflict_recovery'])):
-            self.effects.state.update_project(self.repo, phase='VERIFYING', last_error=None)
+            resume_status = str(row['revision_resume_status'] or 'VERIFYING')
+            resume_phase = 'WORKING' if resume_status == 'IMPLEMENTING' else resume_status
+            self.effects.state.update_project(
+                self.repo,
+                phase=resume_phase,
+                revision_resume_status=None,
+                last_error=None,
+            )
             row = self._row()
         assert catalog_plan is not None
+        self.plan = self._cached_plan(catalog_plan)
+        self.level = self.effects.validation.ensure_worker_level_state(
+            self.repo, self.plan
+        )
+        self.catalog_plan = catalog_plan
+        return self._context()
+
+    @staticmethod
+    def _project_phase(status):
+        return 'WORKING' if status == 'IMPLEMENTING' else status
+
+    def _revision_state_values(
+        self, snapshot, decision, latest_sha, *, legacy_baseline=False
+    ):
+        row = self._row()
+        target = decision.phase
+        values = {
+            'definition_snapshot': snapshot.serialize(),
+            'phase': self._project_phase(target),
+            'revision_resume_status': None,
+        }
+        if decision.kind is RevisionGateKind.REFRESH_WORKTREE:
+            # The refresh intent marker is crash recovery state. Once rebase
+            # succeeds it must not be mistaken for an unfinished legacy
+            # latest-base rebase on the next process step.
+            values['last_error'] = None
+        if legacy_baseline:
+            artifact_base = str(
+                row['validated_base_sha'] or row['active_sha'] or latest_sha
+            )
+            if row['worker_result'] is not None:
+                values['worker_input_token'] = snapshot.worker_token
+                values['archive_token'] = snapshot.archive_token
+            if row['verify_result'] is not None:
+                values['verify_token'] = snapshot.verify_token(artifact_base)
+            if row['review_result'] is not None:
+                values['review_token'] = snapshot.review_token(artifact_base)
+            if row['publication_token'] is not None:
+                values['publication_token'] = snapshot.publication_token(
+                    artifact_base
+                )
+        if target == 'IMPLEMENTING' and (
+            decision.kind is RevisionGateKind.INVALIDATE_TO_PHASE
+            or str(row['phase']) != 'WORKING'
+            or bool(decision.deltas & WORKER_INVALIDATING_DELTAS)
+        ):
+            values.update(
+                validated_base_sha=None,
+                worker_result=None,
+                verify_result=None,
+                review_result=None,
+                worker_input_token=None,
+                archive_token=None,
+                verify_token=None,
+                review_token=None,
+                publication_token=None,
+                last_error=None,
+            )
+        elif target == 'VERIFYING' and (
+            decision.kind is RevisionGateKind.INVALIDATE_TO_PHASE
+            or str(row['phase']) not in {'WORKING', 'VERIFYING'}
+        ):
+            values.update(
+                validated_base_sha=None,
+                verify_result=None,
+                review_result=None,
+                verify_token=None,
+                review_token=None,
+                publication_token=None,
+                last_error=None,
+            )
+        elif target == 'REVIEWING' and (
+            decision.kind is RevisionGateKind.INVALIDATE_TO_PHASE
+            or str(row['phase']) == 'PUBLISHING'
+        ):
+            values.update(
+                review_result=None,
+                review_token=None,
+                publication_token=None,
+                last_error=None,
+            )
+        if decision.preserve_validation:
+            if row['verify_result'] is not None:
+                values['validated_base_sha'] = latest_sha
+                values['verify_token'] = snapshot.verify_token(latest_sha)
+            if row['review_result'] is not None:
+                values['review_token'] = snapshot.review_token(latest_sha)
+            if row['publication_token'] is not None:
+                values['publication_token'] = snapshot.publication_token(latest_sha)
+        return values
+
+    def _install_revision_state(
+        self, snapshot, decision, latest_sha, *, legacy_baseline=False
+    ):
+        self.effects.state.update_project(
+            self.repo,
+            **self._revision_state_values(
+                snapshot,
+                decision,
+                latest_sha,
+                legacy_baseline=legacy_baseline,
+            ),
+        )
+        self._definition_snapshot = snapshot
+        self.catalog_plan = self.effects.state.active_execplan(self.repo)
+        assert self.catalog_plan is not None
+        self.plan = self._cached_plan(self.catalog_plan)
+
+    def _refresh_revision_base(
+        self,
+        context,
+        snapshot,
+        decision,
+        latest_sha,
+        *,
+        legacy_baseline=False,
+    ):
+        row = self._row()
+        if context.phase is ExecutionPhase.PUBLISHING and not int(
+            row['pr_conflict_recovery']
+        ):
+            remote_oid = self.effects.workspace.remote_branch_oid(
+                self.repo_path, context.branch
+            )
+            try:
+                self.effects.publication.record_remote_publication_branch(
+                    self.repo_path,
+                    self.state_dir,
+                    self.repo,
+                    context.branch,
+                    context.worktree,
+                    remote_oid,
+                )
+            except self.effects.contract.PublicationSafetyError as error:
+                publication_error = str(error)
+                self.effects.blocking.block_active_execplan(
+                    self.repo,
+                    context.worktree,
+                    publication_error,
+                    str(row['verify_result'] or ''),
+                    reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
+                )
+                self.effects.events.operation_print(
+                    publication_error, file=sys.stderr
+                )
+                return self._final(publication_error)
+            row = self._row()
+        if (
+            context.phase is ExecutionPhase.VERIFYING
+            and decision.phase == 'VERIFYING'
+            and self.effects.workspace.git(
+                context.worktree, 'status', '--porcelain'
+            ).stdout.strip()
+        ):
+            # Preserve the uncommitted Worker patch as a local checkpoint so
+            # a conflicting base rebase remains a resumable Git operation.
+            worker_publication = self.effects.validation.parse_worker_result(
+                str(row['worker_result'] or ''), self.plan
+            )
+            self.plan = self.effects.validation.validate_active_execplan_metadata(
+                self.repo_path,
+                context.worktree,
+                context.plan.path,
+                self.catalog_plan,
+            )
+            self.effects.workspace.git(context.worktree, 'add', '-A')
+            self.effects.workspace.git(
+                context.worktree,
+                'commit',
+                '-m',
+                worker_publication.commit_title,
+            )
+        refresh_values = {
+            'phase': 'WORKING',
+            'validated_base_sha': None,
+            'revision_resume_status': decision.phase,
+            'last_error': self.effects.contract.REBASE_IN_PROGRESS_ERROR,
+        }
+        if int(row['pr_conflict_recovery']):
+            refresh_values['pr_conflict_base_oid'] = latest_sha
+        self.effects.state.update_project(self.repo, **refresh_values)
+        rebased = self.effects.workspace.git(
+            context.worktree,
+            'rebase',
+            '--autostash',
+            latest_sha,
+            check=False,
+        )
+        if rebased.returncode:
+            rebase_failure = self.effects.contract.REBASE_CONFLICT_PREFIX + rebased.stdout[-8000:]
+            if self.effects.workspace._rebase_in_progress_for_branch(
+                context.worktree, context.branch
+            ):
+                self.effects.state.update_project(
+                    self.repo,
+                    phase='WORKING',
+                    validated_base_sha=None,
+                    last_error=rebase_failure,
+                )
+            else:
+                self.effects.blocking.block_active_execplan(
+                    self.repo,
+                    context.worktree,
+                    rebase_failure,
+                    str(row['verify_result'] or ''),
+                    reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
+                )
+            self.effects.events.operation_print(rebase_failure, file=sys.stderr)
+            return self._final(rebase_failure)
+        self.effects.state.update_project(self.repo, active_sha=latest_sha)
+        if (
+            decision.phase != 'IMPLEMENTING'
+            and not self.effects.workspace.branch_has_changes(
+                context.worktree, self.base
+            )
+        ):
+            prefix = (
+                '게시 직전 '
+                if context.phase is ExecutionPhase.PUBLISHING
+                else ''
+            )
+            no_change_error = (
+                f'{prefix}rebase 후 Worker 변경이 남지 않아 PR을 생성할 수 없습니다.'
+            )
+            self.effects.blocking.block_active_execplan(
+                self.repo,
+                context.worktree,
+                no_change_error,
+                str(row['verify_result'] or ''),
+                reason=BlockReasonCode.PLAN_INPUT_INVALID,
+            )
+            self.effects.events.operation_print(no_change_error, file=sys.stderr)
+            return self._final(no_change_error)
+        self._install_revision_state(
+            snapshot,
+            decision,
+            latest_sha,
+            legacy_baseline=legacy_baseline,
+        )
+        return self._retry('최신 ExecPlan revision을 관리 worktree에 반영했습니다.')
+
+    def _revision_error(self, context, detail):
+        self.effects.blocking.block_active_execplan(
+            self.repo,
+            context.worktree,
+            detail,
+            str(self._row()['verify_result'] or ''),
+            reason=BlockReasonCode.PLAN_INPUT_INVALID,
+        )
+        self.effects.events.operation_print(detail, file=sys.stderr)
+        return self._final(detail)
+
+    def guard(self, context):
+        """Refresh and reconcile before any phase effect consumes its snapshot."""
+
+        self.effects.state.check_context(context)
+        self.effects.workspace.git(self.repo_path, 'fetch', 'origin')
+        latest_sha = self.effects.workspace.git(
+            self.repo_path,
+            'rev-parse',
+            f"origin/{self.base}",
+        ).stdout.strip()
+        result = self.effects.revision.reconcile_catalog(
+            self.repo_path, self.repo, self.base
+        )
+        kind = getattr(getattr(result, 'kind', None), 'value', None)
+        if kind == 'stale':
+            return self._retry('ExecPlan catalog revision이 변경되어 다시 평가합니다.')
+        if kind == 'invalid-catalog':
+            diagnostic = getattr(result, 'diagnostic', None)
+            detail = str(getattr(diagnostic, 'message', None) or '원격 ExecPlan catalog가 유효하지 않습니다.')
+            return self._final(detail)
+        if str(getattr(result, 'revision_sha', '') or '') != latest_sha:
+            return self._retry(
+                '원격 base와 reconciled ExecPlan revision이 달라 다시 평가합니다.'
+            )
+
+        catalog_plan = self.effects.state.active_execplan(self.repo)
+        if catalog_plan is None:
+            return self._final('revision gate에서 활성 ExecPlan을 찾을 수 없습니다.')
+        self.catalog_plan = catalog_plan
+        self.plan = self._cached_plan(catalog_plan)
+        try:
+            archive_sources = self.effects.archive.requirement_archive_sources(
+                self.repo
+            )
+            archive_candidates = (
+                self.effects.archive.requirement_archive_candidates(
+                    self.repo_path,
+                    self.repo,
+                    latest_sha,
+                    str(catalog_plan['plan_id']),
+                )
+                if archive_sources else ()
+            )
+            snapshot = DefinitionSnapshot(
+                revision_sha=latest_sha,
+                path=str(catalog_plan['path']),
+                title=str(catalog_plan['title']),
+                sources=tuple(json.loads(str(catalog_plan['sources']))),
+                depends_on=tuple(json.loads(str(catalog_plan['depends_on']))),
+                complexity=str(catalog_plan['current_complexity'] or self.plan['complexity']),
+                risk=str(catalog_plan['current_risk'] or self.plan['risk']),
+                priority=str(catalog_plan['priority']),
+                body_hash=self.effects.revision.body_hash(
+                    self.repo_path, latest_sha, str(catalog_plan['path'])
+                ),
+                source_fingerprint=self.effects.revision.source_fingerprint(
+                    self.repo_path, latest_sha, catalog_plan
+                ),
+                archive_candidates=tuple(sorted(archive_candidates)),
+            )
+            previous = DefinitionSnapshot.deserialize(
+                self._row()['definition_snapshot']
+            )
+            unmet = self.effects.revision.unmet_dependencies(
+                self.repo, str(catalog_plan['plan_id'])
+            )
+            changed_paths = self.effects.revision.changed_paths(
+                self.repo_path,
+                str(self._row()['active_sha'] or ''),
+                latest_sha,
+            )
+        except (RuntimeError, ValueError, self.effects.contract.RequirementArchiveError) as error:
+            return self._revision_error(
+                context, f"ExecPlan revision gate 확인 실패: {error}"
+            )
+
+        row = self._row()
+        base_requires_validation = any(
+            not path.startswith('docs/plans/') for path in changed_paths
+        )
+        active_sha = str(row['active_sha'] or '')
+        legacy_input_paths = {
+            str(catalog_plan['path']),
+            *(str(item) for item in json.loads(str(catalog_plan['sources']))),
+        }
+        legacy_definition_changed = any(
+            path in legacy_input_paths
+            or path.startswith('docs/plans/')
+            or (bool(archive_sources) and path.startswith('docs/requirements/'))
+            for path in changed_paths
+        )
+        legacy_baseline = bool(
+            previous is None
+            and active_sha
+            and not legacy_definition_changed
+        )
+        artifact_base = str(
+            row['validated_base_sha'] or row['active_sha'] or latest_sha
+        )
+        decision = decide_revision_gate(
+            phase=ExecutionPhase(str(catalog_plan['status'])).value,
+            # Rows created before G-037 have valid phase artifacts but no
+            # revision tokens. Adopt the reconciled definition as their
+            # baseline, then let real base and definition deltas invalidate
+            # only the stages that must run again.
+            previous=snapshot if legacy_baseline else previous,
+            current=snapshot,
+            active_base_token=active_sha,
+            current_base_token=latest_sha,
+            artifacts=StageArtifacts(
+                worker_result=row['worker_result'] is not None,
+                verify_result=row['verify_result'] is not None,
+                review_result=row['review_result'] is not None,
+                worker_input_token=(
+                    snapshot.worker_token
+                    if legacy_baseline and row['worker_result'] is not None
+                    else str(row['worker_input_token'])
+                    if row['worker_input_token'] is not None
+                    else None
+                ),
+                archive_token=(
+                    snapshot.archive_token
+                    if legacy_baseline and row['worker_result'] is not None
+                    else str(row['archive_token'])
+                    if row['archive_token'] is not None
+                    else None
+                ),
+                verify_token=(
+                    snapshot.verify_token(artifact_base)
+                    if legacy_baseline and row['verify_result'] is not None
+                    else str(row['verify_token'])
+                    if row['verify_token'] is not None
+                    else None
+                ),
+                review_token=(
+                    snapshot.review_token(artifact_base)
+                    if legacy_baseline and row['review_result'] is not None
+                    else str(row['review_token'])
+                    if row['review_token'] is not None
+                    else None
+                ),
+                publication_token=(str(row['publication_token']) if row['publication_token'] is not None else None),
+            ),
+            unmet_dependencies=tuple(unmet),
+            base_requires_validation=base_requires_validation,
+        )
+        self.archive_sources = tuple(archive_sources)
+        self.archive_candidates = tuple(archive_candidates)
+        self.archive_scope_sources = tuple(sorted(set(archive_candidates)))
+
+        if decision.kind is RevisionGateKind.FINAL_SAFETY_ERROR:
+            return self._revision_error(context, str(decision.detail))
+        if decision.kind is RevisionGateKind.WAIT:
+            # A conflicted rebase cannot accept a second refresh or clear its
+            # recovery marker. Still reconcile dependencies before Worker.
+            if not context.resolving_rebase:
+                self._install_revision_state(
+                    snapshot,
+                    decision,
+                    latest_sha,
+                    legacy_baseline=legacy_baseline,
+                )
+            self.effects.events.operation_log(str(decision.detail))
+            return ExecutionOutcome(
+                ExecutionOutcomeKind.STABLE_WAIT,
+                context=context if context.resolving_rebase else self._context(),
+                detail=decision.detail,
+            )
+        if context.resolving_rebase:
+            if (
+                (previous is None and not legacy_baseline)
+                or decision.deltas & (
+                    WORKER_INVALIDATING_DELTAS - {DefinitionDelta.DEPENDENCIES}
+                )
+            ):
+                detail = (
+                    'rebase 충돌 복구 중 ExecPlan 구현 입력이 변경되어 기존 '
+                    'Worker 변경과 안전하게 결합할 수 없습니다.'
+                )
+                self.effects.blocking.block_active_execplan(
+                    self.repo,
+                    context.worktree,
+                    detail,
+                    str(row['verify_result'] or ''),
+                    reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
+                )
+                self.effects.events.operation_print(detail, file=sys.stderr)
+                return self._final(detail)
+            if DefinitionDelta.DEPENDENCIES in decision.deltas:
+                # Dependency readiness was checked above. Resolve the existing
+                # conflict first, but retain the applied definition so the next
+                # gate refreshes the worktree and reruns Worker on the new DAG.
+                self.effects.state.update_project(
+                    self.repo,
+                    validated_base_sha=None,
+                    worker_result=None,
+                    verify_result=None,
+                    review_result=None,
+                    worker_input_token=None,
+                    archive_token=None,
+                    verify_token=None,
+                    review_token=None,
+                    publication_token=None,
+                )
+            # The ongoing Git rebase remains pinned to its original target.
+            # Do not install the new stage state until it has been resolved.
+            self._definition_snapshot = snapshot
+            self.level = self.effects.validation.ensure_worker_level_state(
+                self.repo, self.plan
+            )
+            return self._context()
+        if str(row['active_sha'] or '') != latest_sha:
+            return self._refresh_revision_base(
+                context,
+                snapshot,
+                decision,
+                latest_sha,
+                legacy_baseline=legacy_baseline,
+            )
+        self._install_revision_state(
+            snapshot,
+            decision,
+            latest_sha,
+            legacy_baseline=legacy_baseline,
+        )
+        if decision.kind is RevisionGateKind.INVALIDATE_TO_PHASE:
+            return self._retry('ExecPlan revision 변경으로 필요한 실행 단계부터 재개합니다.')
         try:
             self.plan = self.effects.validation.validate_active_execplan_metadata(
                 self.repo_path,
-                worktree,
-                str(row['plan_path']),
-                catalog_plan,
+                context.worktree,
+                str(self._row()['plan_path']),
+                self.catalog_plan,
             )
-            self.level = self.effects.validation.ensure_worker_level_state(self.repo, self.plan)
-        except RuntimeError as error:
-            metadata_error = str(error)
-            self.effects.blocking.block_active_execplan(
-                self.repo,
-                worktree,
-                metadata_error,
-                str(row['verify_result'] or ''),
-                reason=BlockReasonCode.PLAN_INPUT_INVALID,
+            self.level = self.effects.validation.ensure_worker_level_state(
+                self.repo, self.plan
             )
-            self.effects.events.operation_print(metadata_error, file=sys.stderr)
-            return self._final(metadata_error)
-        try:
-            archive_sources = self.effects.archive.requirement_archive_sources(self.repo)
-        except self.effects.contract.RequirementArchiveError as error:
-            archive_error = f"Requirement archive source 확인 실패: {error}"
-            self.effects.blocking.block_active_execplan(
-                self.repo,
-                worktree,
-                archive_error,
-                str(row['verify_result'] or ''),
-                reason=BlockReasonCode.PLAN_INPUT_INVALID,
-            )
-            self.effects.events.operation_print(archive_error, file=sys.stderr)
-            return self._final(archive_error)
-        self.archive_candidates = ()
-        self.archive_sources = archive_sources
-        self.archive_scope_sources = ()
-        if row['phase'] == 'WORKING' and archive_sources:
-            archive_revision = str(row['active_sha'] or '')
-            try:
-                self.archive_candidates = self.effects.archive.requirement_archive_candidates(
-                    self.repo_path,
-                    self.repo,
-                    archive_revision,
-                    str(self.plan['id']),
-                )
+            if self.archive_sources and self._row()['phase'] == 'WORKING':
                 self.archive_scope_sources = tuple(
                     sorted(
-                        set(self.archive_candidates) | set(
+                        set(self.archive_candidates)
+                        | set(
                             self.effects.archive.requirement_archive_touched_sources(
                                 self.repo_path,
-                                archive_revision,
-                                worktree,
-                            ),
-                        ),
-                    ),
+                                latest_sha,
+                                context.worktree,
+                            )
+                        )
+                    )
                 )
-            except self.effects.contract.RequirementArchiveError as error:
-                archive_error = f"Requirement archive eligibility 확인 실패: {error}"
-                self.effects.blocking.block_active_execplan(
-                    self.repo,
-                    worktree,
-                    archive_error,
-                    str(row['verify_result'] or ''),
-                    reason=BlockReasonCode.PLAN_INPUT_INVALID,
-                )
-                self.effects.events.operation_print(archive_error, file=sys.stderr)
-                return self._final(archive_error)
-        self.catalog_plan = catalog_plan
+        except RuntimeError as error:
+            return self._revision_error(context, str(error))
         return self._context()
+
+    def _post_effect_guard(self, context):
+        # Direct policy unit tests can still exercise a handler without the
+        # coordinator. Real execution always installs this snapshot first.
+        if self._definition_snapshot is None:
+            return context
+        return self.guard(self._context())
 
     def run(self, context):
         self.effects.state.check_context(context)
@@ -391,16 +894,12 @@ class ExecutionHandlers:
                 catalog_plan,
                 worker_scope_before,
                 allow_rebase=context.resolving_rebase,
+                **({'rebase_definition': DefinitionSnapshot.deserialize(
+                    row['definition_snapshot']
+                )} if context.resolving_rebase else {}),
                 allowed_requirement_archives=self.archive_scope_sources,
                 allowed_guidance_targets=guidance_targets,
                 allow_common_plans=allow_common_plans,
-            )
-            guidance_blocked = self.effects.agent.inspect_worker_guidance_result(
-                self.repo_path,
-                self.repo,
-                context.worktree,
-                catalog_plan,
-                message,
             )
         except (self.effects.contract.AgentScopeError, self.effects.contract.WorkspaceOwnershipError, RuntimeError) as error:
             scope_error = str(error)
@@ -413,6 +912,21 @@ class ExecutionHandlers:
             )
             self.effects.events.operation_print(scope_error, file=sys.stderr)
             return self._final(scope_error)
+        self.effects.agent.clear_agent_scope(self.repo)
+        guarded = self._post_effect_guard(context)
+        if isinstance(guarded, ExecutionOutcome):
+            return guarded
+        context = guarded
+        row = self._row()
+        catalog_plan = self.catalog_plan
+        assert catalog_plan is not None
+        guidance_blocked = self.effects.agent.inspect_worker_guidance_result(
+            self.repo_path,
+            self.repo,
+            context.worktree,
+            catalog_plan,
+            message,
+        )
         if guidance_blocked:
             blocked = self.effects.state.blocked()
             self.effects.events.operation_print(
@@ -420,7 +934,6 @@ class ExecutionHandlers:
                 file=sys.stderr,
             )
             return self._final()
-        self.effects.agent.clear_agent_scope(self.repo)
         if code:
             worker_error = message or f"Agent 종료 코드 {code}"
             if result.result_kind is self.effects.contract.AgentResultKind.TRANSIENT_FAILURE:
@@ -511,7 +1024,14 @@ class ExecutionHandlers:
                 )
                 self.effects.events.operation_print(no_change_error, file=sys.stderr)
                 return self._final(no_change_error)
-            latest_sha = str(row['pr_conflict_base_oid']) if int(row['pr_conflict_recovery']) else self.effects.workspace.git(context.worktree, 'rev-parse', f"origin/{self.base}").stdout.strip()
+            # The conflict may have been resolved on an older rebase target
+            # while origin advanced again. Keep the last *proven* base until
+            # the next revision gate can refresh the completed worktree.
+            latest_sha = (
+                str(row['pr_conflict_base_oid'])
+                if int(row['pr_conflict_recovery'])
+                else str(row['active_sha'] or '')
+            )
             self.effects.state.update_project(self.repo, active_sha=latest_sha)
             if self.effects.agent.validate_guidance_publication(
                 self.repo,
@@ -556,6 +1076,11 @@ class ExecutionHandlers:
                     worker_result=message,
                     verify_result=None,
                     review_result=None,
+                    worker_input_token=None,
+                    archive_token=None,
+                    verify_token=None,
+                    review_token=None,
+                    publication_token=None,
                     last_error=archive_error,
                 )
                 self.effects.events.operation_print(archive_error, file=sys.stderr)
@@ -566,6 +1091,18 @@ class ExecutionHandlers:
             validated_base_sha=None,
             worker_result=message,
             verify_result=None,
+            review_result=None,
+            worker_input_token=(
+                self._definition_snapshot.worker_token
+                if self._definition_snapshot is not None else None
+            ),
+            archive_token=(
+                self._definition_snapshot.archive_token
+                if self._definition_snapshot is not None else None
+            ),
+            verify_token=None,
+            review_token=None,
+            publication_token=None,
             last_error=None,
         )
         return self._advanced()
@@ -603,6 +1140,10 @@ class ExecutionHandlers:
             self.effects.events.operation_print(scope_error, file=sys.stderr)
             return (self._final(scope_error), output)
         self.effects.agent.clear_agent_scope(self.repo)
+        guarded = self._post_effect_guard(context)
+        if isinstance(guarded, ExecutionOutcome):
+            return (guarded, output)
+        context = guarded
         if not passed:
             stage = 'rebase 후 전체 verify 실패' if after_rebase else '전체 verify 실패'
             self.effects.events.operation_log(
@@ -664,6 +1205,10 @@ class ExecutionHandlers:
                 self.catalog_plan,
             )
             self.effects.workspace.git(context.worktree, 'commit', '-m', worker_publication.commit_title)
+        guarded = self._post_effect_guard(context)
+        if isinstance(guarded, ExecutionOutcome):
+            return guarded
+        context = guarded
         self._latest_verify_output = output
         self._worker_publication = worker_publication
         latest_outcome = latest_base.reconcile(context, LatestBaseCheckpoint.AFTER_VERIFY)
@@ -688,6 +1233,7 @@ class ExecutionHandlers:
             self.repo,
             phase='WORKING',
             validated_base_sha=None,
+            revision_resume_status='VERIFYING',
             pr_conflict_base_oid=latest_sha if int(row['pr_conflict_recovery']) else row['pr_conflict_base_oid'],
             last_error=self.effects.contract.REBASE_IN_PROGRESS_ERROR,
         )
@@ -724,7 +1270,12 @@ class ExecutionHandlers:
                 file=sys.stderr,
             )
             return self._final(rebase_failure)
-        self.effects.state.update_project(self.repo, active_sha=latest_sha)
+        self.effects.state.update_project(
+            self.repo,
+            active_sha=latest_sha,
+            phase='VERIFYING',
+            revision_resume_status=None,
+        )
         if self.effects.agent.validate_guidance_publication(
             self.repo,
             context.worktree,
@@ -764,12 +1315,26 @@ class ExecutionHandlers:
                 active_sha=latest_sha,
                 validated_base_sha=latest_sha,
                 verify_result=output,
+                verify_token=(
+                    self._definition_snapshot.verify_token(latest_sha)
+                    if self._definition_snapshot is not None else None
+                ),
+                review_token=None,
+                publication_token=None,
             )
         else:
             self.effects.state.update_project(
                 self.repo,
                 validated_base_sha=str(row['active_sha'] or ''),
                 verify_result=output,
+                verify_token=(
+                    self._definition_snapshot.verify_token(
+                        str(row['active_sha'] or '')
+                    )
+                    if self._definition_snapshot is not None else None
+                ),
+                review_token=None,
+                publication_token=None,
             )
         self._latest_verify_output = output
         return None
@@ -877,6 +1442,11 @@ class ExecutionHandlers:
                 self.effects.events.operation_print(scope_error, file=sys.stderr)
                 return self._final(scope_error)
             self.effects.agent.clear_agent_scope(self.repo)
+            guarded = self._post_effect_guard(context)
+            if isinstance(guarded, ExecutionOutcome):
+                return guarded
+            context = guarded
+            row = self._row()
             if code:
                 reviewer_error = review or f"Reviewer 종료 코드 {code}"
                 if review_result.result_kind is self.effects.contract.AgentResultKind.TRANSIENT_FAILURE:
@@ -943,6 +1513,13 @@ class ExecutionHandlers:
             phase='PUBLISHING',
             last_error=None,
             review_result=review,
+            review_token=(
+                self._definition_snapshot.review_token(
+                    str(row['validated_base_sha'] or row['active_sha'] or '')
+                )
+                if self._definition_snapshot is not None else None
+            ),
+            publication_token=None,
         )
         return self._advanced()
 
@@ -1001,6 +1578,9 @@ class ExecutionHandlers:
                     phase='VERIFYING',
                     verify_result=None,
                     review_result=None,
+                    verify_token=None,
+                    review_token=None,
+                    publication_token=None,
                     last_error=None,
                 )
             else:
@@ -1010,6 +1590,9 @@ class ExecutionHandlers:
                     phase='VERIFYING',
                     verify_result=None,
                     review_result=None,
+                    verify_token=None,
+                    review_token=None,
+                    publication_token=None,
                     last_error=None,
                 )
             self.effects.events.operation_print(
@@ -1103,6 +1686,11 @@ class ExecutionHandlers:
                     validated_base_sha=None,
                     verify_result=None,
                     review_result=None,
+                    worker_input_token=None,
+                    archive_token=None,
+                    verify_token=None,
+                    review_token=None,
+                    publication_token=None,
                     last_error=archive_error,
                 )
                 self.effects.events.operation_print(archive_error, file=sys.stderr)
@@ -1114,6 +1702,11 @@ class ExecutionHandlers:
             str(row['worker_result'] or ''),
         ):
             return self._final()
+        guarded = self._post_effect_guard(context)
+        if isinstance(guarded, ExecutionOutcome):
+            return guarded
+        context = guarded
+        row = self._row()
         if not self.effects.workspace.branch_has_changes(context.worktree, self.base):
             no_change_error = '게시할 Worker 변경이 남지 않아 PR을 생성할 수 없습니다.'
             self.effects.blocking.block_active_execplan(
@@ -1125,6 +1718,14 @@ class ExecutionHandlers:
             )
             self.effects.events.operation_print(no_change_error, file=sys.stderr)
             return self._final(no_change_error)
+        if self._definition_snapshot is not None:
+            self.effects.state.update_project(
+                self.repo,
+                publication_token=self._definition_snapshot.publication_token(
+                    str(self._row()['validated_base_sha'] or '')
+                ),
+            )
+            context = self._context()
         if int(row['pr_conflict_recovery']):
             return self._publish_conflict_recovery(context, row)
         return self._publish_new_pull_request(context, row)
@@ -1177,6 +1778,10 @@ class ExecutionHandlers:
             self.effects.state.update_project(self.repo, phase='PUBLISHING', last_error=publication_error)
             self.effects.events.operation_print(publication_error, file=sys.stderr)
             return self._final(publication_error)
+        guarded = self._post_effect_guard(context)
+        if isinstance(guarded, ExecutionOutcome):
+            return guarded
+        context = guarded
         self.effects.state.open_pull_request(
             self.repo,
             publication_remote_oid=head_oid,
@@ -1260,6 +1865,10 @@ class ExecutionHandlers:
             self.effects.state.update_project(self.repo, phase='PUBLISHING', last_error=publication_error)
             self.effects.events.operation_print(publication_error, file=sys.stderr)
             return self._final(publication_error)
+        guarded = self._post_effect_guard(context)
+        if isinstance(guarded, ExecutionOutcome):
+            return guarded
+        context = guarded
         title = f"Implement {self.plan['id']}: {self.plan['title']}"
         created = self.effects.publication.command(
             ['gh', 'pr', 'create', '--base', self.base, '--head', context.branch, '--title', title, '--body', body],

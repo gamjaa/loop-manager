@@ -35,6 +35,11 @@ class ExecutionStatePort:
             or current.validated_base_sha != context.validated_base_sha
             or current.branch != context.branch
             or current.worktree != str(context.worktree)
+            or current.worker_input_token != context.worker_input_token
+            or current.archive_token != context.archive_token
+            or current.verify_token != context.verify_token
+            or current.review_token != context.review_token
+            or current.publication_token != context.publication_token
         ):
             raise runtime_state.RuntimeStateError("phase context가 최신 snapshot과 다릅니다.")
 

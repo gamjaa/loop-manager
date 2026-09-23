@@ -80,6 +80,13 @@ class ExecutionContext:
     pr_conflict_base_oid: str | None = None
     resolving_rebase: bool = False
     archive_sources: tuple[str, ...] = ()
+    current_definition_token: str | None = None
+    current_base_token: str | None = None
+    worker_input_token: str | None = None
+    archive_token: str | None = None
+    verify_token: str | None = None
+    review_token: str | None = None
+    publication_token: str | None = None
 
     def at_phase(
         self, phase: ExecutionPhase, **changes: object
@@ -107,6 +114,12 @@ class ExecutionWorkspacePort(Protocol):
     """Managed-worktree preparation and recovery boundary."""
 
     def prepare(self) -> ExecutionContext | ExecutionOutcome: ...
+
+
+class ExecutionRevisionPort(Protocol):
+    """Reconciled definition, dependency, and stage-token safety gate."""
+
+    def guard(self, context: ExecutionContext) -> ExecutionContext | ExecutionOutcome: ...
 
 
 class ExecutionWorkerPort(Protocol):
@@ -148,7 +161,7 @@ class ExecutionPublicationPort(Protocol):
 
 
 class ExecutionLifecyclePorts(
-    ExecutionWorkspacePort, ExecutionWorkerPort, ExecutionValidationPort,
+    ExecutionWorkspacePort, ExecutionRevisionPort, ExecutionWorkerPort, ExecutionValidationPort,
     ExecutionPublicationPort, LatestBasePort, Protocol,
 ):
     """Phase policy interface; concrete handlers receive granular effect ports."""
@@ -165,6 +178,10 @@ class ExecutionPhaseCoordinator:
         return self._ports.prepare()
 
     def dispatch(self, context: ExecutionContext) -> ExecutionOutcome:
+        guarded = self._ports.guard(context)
+        if isinstance(guarded, ExecutionOutcome):
+            return guarded
+        context = guarded
         handlers = {
             ExecutionPhase.IMPLEMENTING: self._run_worker,
             ExecutionPhase.VERIFYING: self._run_verify,
