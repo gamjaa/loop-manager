@@ -1,8 +1,11 @@
 import unittest
+from pathlib import Path
+from unittest import mock
 
 import execplan_archive
 import execplan_archive_state
 import execplan_catalog
+import loop_manager
 
 
 def candidate(plan_id: str) -> execplan_archive_state.MergedArchiveCandidate:
@@ -138,7 +141,7 @@ class FakeGit:
 
 
 class ExecPlanArchiveTest(unittest.TestCase):
-    def test_empty_candidate_set_is_a_git_free_noop(self):
+    def test_empty_candidate_set_is_checked_after_remote_refresh(self):
         repository = FakeRepository(())
         git = FakeGit({})
 
@@ -149,7 +152,69 @@ class ExecPlanArchiveTest(unittest.TestCase):
         self.assertEqual(
             outcome.kind, execplan_archive.ArchiveDispatchKind.NO_CANDIDATES
         )
-        self.assertEqual(git.fetch_count, 0)
+        self.assertEqual(git.fetch_count, 1)
+
+    def test_remote_refresh_finds_candidate_after_empty_cache(self):
+        item = candidate("G-001")
+        repository = FakeRepository(())
+        git = FakeGit({"base": {"G-001": (entry("G-001"), None)}})
+
+        def refresh(_base):
+            repository.candidates = (item,)
+            return True
+
+        outcome = execplan_archive.ExecPlanArchiveDispatcher(
+            repository, git, refresh_candidates=refresh,
+        ).dispatch("/repo", "main")
+
+        self.assertEqual(outcome.archived_plan_ids, ("G-001",))
+        self.assertEqual(git.prepared, [("base", ("G-001",))])
+
+    def test_other_archive_path_conflict_does_not_hold_safe_candidate(self):
+        conflicted = candidate("G-001")
+        safe = candidate("G-002")
+        repository = FakeRepository((conflicted, safe))
+
+        class ConflictGit(FakeGit):
+            def observe(self, revision, candidates):
+                observations = super().observe(revision, candidates)
+                return tuple(
+                    execplan_archive.ArchiveCandidateObservation(
+                        item.candidate, item.source, item.destination,
+                        "docs/plans/archive/[G-001] Old.md"
+                        if item.candidate.plan_id == "G-001" else None,
+                    )
+                    for item in observations
+                )
+
+        git = ConflictGit({"base": {
+            "G-001": (entry("G-001"), None),
+            "G-002": (entry("G-002"), None),
+        }})
+        outcome = execplan_archive.ExecPlanArchiveDispatcher(
+            repository, git,
+        ).dispatch("/repo", "main")
+
+        self.assertEqual(outcome.archived_plan_ids, ("G-002",))
+        self.assertEqual(dict(outcome.pending), {"G-001": "archive_id_conflict"})
+        self.assertEqual(git.prepared, [("base", ("G-002",))])
+
+    def test_git_observation_identifies_other_archive_path_for_same_id(self):
+        item = candidate("G-001")
+        other = "docs/plans/archive/[G-001] Old.md"
+        port = loop_manager._ExecPlanArchiveGitPort(
+            Path("/repo"), Path("/state"), "/repo"
+        )
+        with mock.patch.object(
+            port, "_manifest", return_value={item.active_path: (), other: ()}
+        ), mock.patch.object(port, "_entry", side_effect=(entry("G-001"), None)):
+            observation = port.observe("base", (item,))[0]
+
+        self.assertEqual(observation.other_archive_path, other)
+        self.assertEqual(
+            execplan_archive.validate_candidate(observation)[0],
+            "archive_id_conflict",
+        )
 
     def test_candidate_validation_rejects_unsafe_states_without_overwrite(self):
         item = candidate("G-001")

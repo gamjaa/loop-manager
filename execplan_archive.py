@@ -36,6 +36,7 @@ class ArchiveCandidateObservation:
     candidate: MergedArchiveCandidate
     source: ArchiveTreeEntry | None
     destination: ArchiveTreeEntry | None
+    other_archive_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -124,6 +125,8 @@ def validate_candidate(
     candidate = observation.candidate
     if not candidate.revision_sha:
         return "current_revision_missing", None
+    if observation.other_archive_path is not None:
+        return "archive_id_conflict", None
     source = observation.source
     destination = observation.destination
     if source is None:
@@ -190,8 +193,6 @@ class ExecPlanArchiveDispatcher:
         self.refresh_candidates = refresh_candidates
 
     def dispatch(self, repo: str, base_branch: str) -> ArchiveDispatchOutcome:
-        if not self.repository.merged_candidates(repo):
-            return ArchiveDispatchOutcome(ArchiveDispatchKind.NO_CANDIDATES)
         last_pending: dict[str, str] = {}
         archived_ids: set[str] = set()
         for _attempt in range(self.max_base_restarts):
@@ -201,7 +202,11 @@ class ExecPlanArchiveDispatcher:
                     continue
                 candidates = self.repository.merged_candidates(repo)
                 if not candidates:
-                    return self._outcome(archived_ids, last_pending)
+                    return (
+                        self._outcome(archived_ids, last_pending)
+                        if archived_ids or last_pending
+                        else ArchiveDispatchOutcome(ArchiveDispatchKind.NO_CANDIDATES)
+                    )
                 observations = self.git.observe(base_sha, candidates)
             except Exception as error:
                 reason = f"remote_observation_failed:{error}"

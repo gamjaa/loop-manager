@@ -2,8 +2,11 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import execplan_catalog
+import loop_manager
 
 
 def plan_text(
@@ -175,6 +178,61 @@ class ExecPlanCatalogSnapshotTest(unittest.TestCase):
         self.assertEqual(tuple(definitions), ("G-001", "G-002"))
         self.assertEqual(definitions["G-002"].revision_sha, "c" * 40)
         self.assertEqual(definitions["G-002"].depends_on, ("G-001",))
+
+    def test_remote_snapshot_isolates_active_archive_id_conflict(self):
+        active = "docs/plans/[G-001] Revised.md"
+        archived = "docs/plans/archive/[G-001] Old.md"
+        other = "docs/plans/[G-002] Independent.md"
+        documents = {
+            active: plan_text("G-001", "Revised"),
+            archived: b"invalid archived bytes: \xff",
+            other: plan_text("G-002", "Independent"),
+        }
+
+        snapshot = execplan_catalog.snapshot_from_documents(
+            documents,
+            revision_sha="a" * 40,
+            allow_active_archive_conflicts=True,
+        )
+
+        self.assertEqual(tuple(snapshot.active), ("G-001", "G-002"))
+        self.assertEqual(tuple(snapshot.archived), ())
+        self.assertEqual(
+            execplan_catalog.conflicting_archived_plan_paths(documents),
+            {"G-001": (archived,)},
+        )
+        with self.assertRaises(execplan_catalog.ExecPlanCatalogError):
+            execplan_catalog.snapshot_from_documents(documents)
+
+    def test_remote_git_snapshot_keeps_other_plans_when_archive_id_conflicts(self):
+        documents = {
+            "docs/PRODUCT.md": b"# Product\n",
+            "docs/plans/[G-001] Revised.md": plan_text("G-001", "Revised").encode(),
+            "docs/plans/archive/[G-001] Old.md": b"invalid archived bytes: \xff",
+            "docs/plans/[G-002] Independent.md": plan_text(
+                "G-002", "Independent"
+            ).encode(),
+        }
+        object_ids = {f"{index:040x}": path for index, path in enumerate(documents, 1)}
+        tree = b"".join(
+            f"100644 blob {object_id}\t{path}".encode() + b"\0"
+            for object_id, path in object_ids.items()
+        )
+
+        def git_bytes(_repo, *args):
+            if args[0] == "ls-tree":
+                return tree
+            return documents[object_ids[args[2]]]
+
+        with mock.patch.object(
+            loop_manager, "git", return_value=SimpleNamespace(stdout="a" * 40)
+        ), mock.patch.object(loop_manager, "git_bytes", side_effect=git_bytes):
+            snapshot = loop_manager.revision_execplan_snapshot(
+                Path("/unused"), "base"
+            )
+
+        self.assertEqual(tuple(snapshot.active), ("G-001", "G-002"))
+        self.assertEqual(tuple(snapshot.archived), ())
 
 
 if __name__ == "__main__":

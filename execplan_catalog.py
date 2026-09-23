@@ -14,7 +14,7 @@ from pathlib import Path, PurePosixPath
 import re
 import stat
 from types import MappingProxyType
-from typing import AbstractSet, Mapping
+from typing import AbstractSet, Iterable, Mapping
 
 
 PRIORITIES = frozenset({"critical", "high", "normal", "low"})
@@ -36,6 +36,27 @@ def plan_content_hash(content: bytes | str) -> str:
 def final_content_matches(observed_hash: str, current_hash: str) -> bool:
     """Check final bytes independently of immutable publication audit bytes."""
     return bool(current_hash) and observed_hash == current_hash
+
+
+def conflicting_archived_plan_paths(
+    paths: Iterable[str],
+) -> Mapping[str, tuple[str, ...]]:
+    """Find archived paths sharing an ID with an active plan in one tree."""
+    paths = tuple(paths)
+    active_ids = {
+        match.group(1)
+        for path in paths
+        if (match := _ACTIVE_PATH.fullmatch(path)) is not None
+    }
+    conflicts: dict[str, list[str]] = {}
+    for path in paths:
+        match = _ARCHIVED_PATH.fullmatch(path)
+        if match is not None and match.group(1) in active_ids:
+            conflicts.setdefault(match.group(1), []).append(path)
+    return {
+        plan_id: tuple(sorted(conflicts[plan_id]))
+        for plan_id in sorted(conflicts)
+    }
 
 
 class ArchiveDocumentKind(str, Enum):
@@ -450,6 +471,7 @@ def snapshot_from_documents(
     available_regular_paths: AbstractSet[str] | None = None,
     invalid_plan_entries: Mapping[str, str] | None = None,
     revision_sha: str | None = None,
+    allow_active_archive_conflicts: bool = False,
 ) -> ExecPlanCatalogSnapshot:
     """Build a snapshot from already-read regular-file documents.
 
@@ -457,8 +479,22 @@ def snapshot_from_documents(
     aware of Git.  Nested paths are ignored by the exact path expressions.
     """
 
-    if invalid_plan_entries:
-        relative_path = sorted(invalid_plan_entries)[0]
+    # The remote reconciliation boundary keeps the active declaration when an
+    # archive copy with the same path identity coexists. Archive housekeeping
+    # observes that second path separately and records a candidate-level
+    # pending reason. All other duplicate IDs remain catalog errors.
+    archive_conflicts = (
+        conflicting_archived_plan_paths(
+            set(documents) | set(invalid_plan_entries or ())
+        )
+        if allow_active_archive_conflicts else {}
+    )
+    conflicted_paths = {
+        path for paths in archive_conflicts.values() for path in paths
+    }
+    remaining_invalid = set(invalid_plan_entries or ()) - conflicted_paths
+    if remaining_invalid:
+        relative_path = sorted(remaining_invalid)[0]
         kind = invalid_plan_entries[relative_path]
         raise ExecPlanCatalogError(
             f"ExecPlan은 원격 revision의 일반 파일이어야 합니다: "
@@ -471,6 +507,8 @@ def snapshot_from_documents(
     archived: dict[str, ExecPlanCatalogEntry] = {}
     filenames: dict[str, str] = {}
     for relative_path in sorted(documents):
+        if relative_path in conflicted_paths:
+            continue
         active_candidate = re.fullmatch(
             r"docs/plans/[^/]+\.md", relative_path
         )

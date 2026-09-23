@@ -1463,6 +1463,9 @@ def revision_execplan_snapshot(
         available_regular_paths=frozenset(regular_paths),
         invalid_plan_entries=invalid_plan_entries,
         revision_sha=revision_sha,
+        # A same-ID archived copy is an archive path conflict. Keep the
+        # active declaration available to READY selection and housekeeping.
+        allow_active_archive_conflicts=True,
     )
 
 
@@ -14044,11 +14047,21 @@ class _ExecPlanArchiveGitPort:
         revision: str,
         candidates: Sequence[execplan_archive_state.MergedArchiveCandidate],
     ) -> tuple[execplan_archive.ArchiveCandidateObservation, ...]:
+        conflicts = execplan_catalog.conflicting_archived_plan_paths(
+            self._manifest(revision)
+        )
         return tuple(
             execplan_archive.ArchiveCandidateObservation(
                 candidate,
                 self._entry(revision, candidate.active_path),
                 self._entry(revision, candidate.archive_path),
+                next(
+                    (
+                        path for path in conflicts.get(candidate.plan_id, ())
+                        if path != candidate.archive_path
+                    ),
+                    None,
+                ),
             )
             for candidate in candidates
         )
