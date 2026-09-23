@@ -1,5 +1,5 @@
 """Run the real phase policies with in-memory state and fake external effects."""
-from dataclasses import fields
+from dataclasses import fields, replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase, mock
@@ -97,6 +97,16 @@ class ExecutionHandlerTests(TestCase):
         if phase is not None:
             self.state.update_project('repo', phase=phase)
         return self.handler._context()
+
+    def _use_runtime_contract(self):
+        runtime = lm._ExecutionLifecyclePorts(
+            self.connection, self.repository,
+            repo='repo', repo_path=Path('/repo'), state_dir=Path('/state'),
+            base='main', base_sha='base', provider='codex', config_path=Path('/config'),
+            newly_activated=False,
+        )
+        self.effects = replace(self.effects, contract=runtime.effects.contract)
+        self.handler.effects = self.effects
 
     def test_final_block_uses_current_verify_output_before_project_checkpoint(self):
         result = self.handler._block_final(
@@ -1213,6 +1223,7 @@ class ExecutionHandlerTests(TestCase):
         self.effects.blocking.block_active_execplan.assert_not_called()
 
     def test_archive_destination_collision_is_final_with_actual_path(self):
+        self._use_runtime_contract()
         path = 'docs/requirements/archive/source.md'
         self.handler.archive_sources = ('docs/requirements/source.md',)
         self.state.update_project('repo', phase='PUBLISHING', validated_base_sha='base')
@@ -1227,6 +1238,7 @@ class ExecutionHandlerTests(TestCase):
         self.effects.blocking.block_active_execplan.assert_called_once()
 
     def test_archive_git_lock_retries_without_blocking(self):
+        self._use_runtime_contract()
         self.handler.archive_sources = ('docs/requirements/source.md',)
         self.state.update_project('repo', phase='PUBLISHING', validated_base_sha='base')
         self.effects.archive.requirement_archive_candidates.side_effect = (

@@ -16691,7 +16691,18 @@ def _ExecutionLifecyclePorts(connection, runtime_repository, **identity):
     state = _ExecutionStatePort(connection, runtime_repository, identity["repo"])
     effects = execution_handlers.ExecutionEffects(
         state=state,
-        contract=SimpleNamespace(**{name: globals()[name] for name in ('AgentResultKind', 'AgentScopeError', 'ExecPlanMetadataError', 'MAX_REVIEWER_PROTOCOL_ATTEMPTS', 'MAX_VALIDATION_FINGERPRINT_REPEATS', 'PROJECT_STEP_RETRY', 'PROJECT_STEP_TRANSIENT_PAUSE', 'PROJECT_STEP_USAGE_PAUSE', 'PROJECT_STEP_PLANNING_PENDING', 'PublicationSafetyError', 'REBASE_CONFLICT_PREFIX', 'REBASE_IN_PROGRESS_ERROR', 'RequirementArchiveError', 'ReviewerProtocolError', 'TRANSIENT_AGENT_ERROR_PREFIX', 'USAGE_LIMIT_ERROR_PREFIX', 'WORKSPACE_OWNED', 'WORKSPACE_RESERVED', 'WorkerResultError', 'WorkspaceOwnershipError')}),
+        contract=SimpleNamespace(**{name: globals()[name] for name in (
+            'AgentResultKind', 'AgentScopeError', 'ExecPlanMetadataError',
+            'GitLockError', 'MAX_REVIEWER_PROTOCOL_ATTEMPTS',
+            'MAX_VALIDATION_FINGERPRINT_REPEATS', 'PROJECT_STEP_RETRY',
+            'PROJECT_STEP_TRANSIENT_PAUSE', 'PROJECT_STEP_USAGE_PAUSE',
+            'PROJECT_STEP_PLANNING_PENDING', 'PublicationSafetyError',
+            'REBASE_CONFLICT_PREFIX', 'REBASE_IN_PROGRESS_ERROR',
+            'RequirementArchiveCollisionError', 'RequirementArchiveError',
+            'ReviewerProtocolError', 'TRANSIENT_AGENT_ERROR_PREFIX',
+            'USAGE_LIMIT_ERROR_PREFIX', 'WORKSPACE_OWNED', 'WORKSPACE_RESERVED',
+            'WorkerResultError', 'WorkspaceOwnershipError',
+        )}),
         workspace=execution_handlers.WorkspaceEffects(
             is_directory=lambda path: path.is_dir(),
             git=state.bind(_typed_execution_git, name="git", connected=False, mutates=False),
