@@ -18,6 +18,7 @@ priority: critical
 ## Acceptance Criteria
 
 - rebase correction record는 plan/definition revision, target base, rebase 원래 head, 충돌 path와 index stage blob OID로 만든 conflict fingerprint, worktree progress marker, Worker session 및 correction occurrence를 저장한다.
+- rebase 본문 충돌뿐 아니라 `rebase --autostash` 완료 뒤 stash 재적용에서 생긴 unmerged index도 correction 대상으로 삼는다. 이 경우 rebase 디렉터리나 `REBASE_HEAD`가 없어도 G-044의 보존된 intent, 소유 branch/HEAD, target base, index stage와 stash identity로 충돌 출처를 확인하고 기존 구현 변경과 Worker session을 보존한다.
 - worktree와 rebase ownership이 안전하게 보존된 경우 Worker 또는 Agent subprocess의 첫 비정상 종료를 `AGENT_CORRECTION`으로 유지하고 PLAN_BLOCKED/PROJECT_BLOCKED, checkpoint 및 BLOCKED 알림을 만들지 않는다.
 - timeout·사용 한도·일시적 Agent 오류는 기존 Agent pause 정책을 사용하고, 그 밖의 단일 비정상 결과나 Worker 결과 형식 오류도 rebase 상태가 안전하면 저장된 session 또는 session-unavailable fallback으로 다시 correction할 기회를 준다.
 - 같은 conflict fingerprint에서도 unmerged index, 충돌 파일 content, staged resolution 또는 rebase position이 달라지면 진전으로 기록하고 무진전 반복 횟수를 증가시키지 않는다. 과거 occurrence audit은 보존한다.
@@ -25,6 +26,7 @@ priority: critical
 - conflict fingerprint가 바뀌면 새 충돌로 추적하되 A→B→A처럼 이전 지문과 동일 progress가 돌아오는 경우의 기존 무진전 이력을 유지해 순환을 탐지한다.
 - Worker가 정상 결과를 반환한 뒤 stage 또는 `rebase --continue`/`--skip`이 Git lock, 프로세스 중단이나 일시 오류로 실패하면 명령 실패만으로 차단하지 않는다. G-044 checkpoint에서 index와 rebase state를 다시 읽어 이미 완료된 stage/continue를 반복하지 않고 이어간다.
 - `rebase --continue` 뒤 새 충돌이 나타나면 새 fingerprint로 같은 correction flow를 계속하고, rebase가 완료되면 최신 base/HEAD를 저장한 뒤 전체 verify와 Review를 다시 수행한다.
+- autostash 재적용 충돌은 `rebase --continue` 대상이 아니다. 허용된 충돌 경로의 해결 결과를 stage한 뒤 unmerged index가 없어졌는지 확인하고, stash를 중복 적용하지 않은 채 최신 base/HEAD와 보존 변경을 재관측해 필요한 전체 verify와 Review로 복귀한다.
 - Worker correction은 현재 ExecPlan과 G-043의 최신 Requirement archive 이동 집합 및 승인된 guidance patch 범위 안에서만 허용된다. 범위 밖 변경이나 workspace ownership 위반은 진전으로 인정하지 않고 기존 final safety block으로 보낸다.
 - rebase가 안전하게 복구되지 않거나 실제 Git state를 하나로 해석할 수 없거나 external remote 변경을 덮어써야만 진행할 수 있으면 correction 횟수와 무관하게 최종 사용자 조치로 전환한다.
 - correction 또는 rebase 완료 후 게시할 변경이 남지 않으면 해당 ExecPlan이 이미 충족됐거나 MERGED됐다고 추정하지 않고 기존 무변경 `USER_ACTION_REQUIRED` 조건을 유지한다.
@@ -35,6 +37,7 @@ priority: critical
 ## Implementation
 
 - 새 `rebase_correction.py`에 Git rebase metadata 정규화, conflict fingerprint, allowed progress marker와 next action을 정의하고, 새 `rebase_correction_state.py` repository가 occurrence, no-progress count와 pending Agent/Git operation identity를 저장한다.
+- correction source를 진행 중인 rebase와 rebase 완료 후 autostash 재적용 충돌로 구분한다. 후자는 G-044 checkpoint의 intent/index 증거를 사용하며 stage 뒤 `rebase --continue`를 호출하지 않고, 중단·재시작에서도 동일 stash와 Worker turn을 다시 적용하지 않는다.
 - G-049 `LatestBasePort`와 PR-conflict preparation adapter가 동일 correction engine을 호출하도록 하고, `execution_handlers.py`의 직접 `git add -A`, `rebase --continue/--skip` 및 즉시 block 분기를 typed engine result로 교체한다.
 - Worker turn은 기존 Agent/session port를 사용하되 호출 전 pending turn identity를 저장하고 result·scope snapshot을 compare-and-swap으로 적용한다. 일반 validation history와 rebase no-progress history는 별도 repository와 reset rule을 유지한다.
 - stage/continue/skip은 G-044 durable Git operation port를 사용하고 매 시도 뒤 index/rebase observation을 다시 읽어 completed, next-conflict, transient와 unsafe를 판정한다. 허용 pathspec만 stage하며 범위/ownership 위반은 progress로 기록하지 않는다.
@@ -46,6 +49,7 @@ priority: critical
 - 첫 Worker abnormal result, result format error, session fallback과 process restart가 safe rebase를 final block하지 않고 동일 pending turn을 중복 호출하지 않는지 검증한다.
 - 동일 fingerprint/progress 세 번 재발, 실제 file/index/rebase-position 진전, 새 conflict와 A→B→A 순환을 pure marker 및 repository history test로 검증한다.
 - stage/continue 전후 중단, Git lock과 transient failure에서 actual state 재관측이 중복 stage/continue 없이 completed/next-conflict로 수렴하는지 검증한다.
+- 실제 Git의 `rebase --autostash`가 성공 종료하면서 unmerged index를 남기는 경우, rebase metadata가 없는 상태에서도 같은 Worker correction으로 들어가고 재시작·수동 또는 Worker stage 해결 뒤 중복 stash 적용이나 `rebase --continue` 없이 verify·Review로 복귀하는지 검증한다.
 - base/archive scope 변경이 stale correction을 폐기하고 최신 G-043/G-044 snapshot에서 같은 Worker context로 돌아가는지 handler fake로 검증한다.
 - 범위 위반, ownership 불명, external remote mutation, unrecoverable rebase와 no-change만 즉시 또는 한도 후 final user action으로 전환하고 worktree를 삭제하지 않는지 검증한다.
 - PR 없는 publication과 PR_OPEN conflict가 같은 engine을 쓰면서 각각의 session, source checkout, lease와 동일 PR 재사용 계약을 보존하는지 검증한다.
