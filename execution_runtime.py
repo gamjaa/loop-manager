@@ -84,6 +84,8 @@ class ExecutionContext:
     pr_conflict_base_oid: str | None = None
     resolving_rebase: bool = False
     archive_sources: tuple[str, ...] = ()
+    archive_snapshot_token: str | None = None
+    archive_candidate_scope: tuple[str, ...] = ()
     current_definition_token: str | None = None
     current_base_token: str | None = None
     worker_input_token: str | None = None

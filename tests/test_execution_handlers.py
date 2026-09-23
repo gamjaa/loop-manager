@@ -1,5 +1,5 @@
 """Run the real phase policies with in-memory state and fake external effects."""
-from dataclasses import fields
+from dataclasses import fields, replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import TestCase, mock
@@ -8,6 +8,7 @@ import execution_handlers as handlers
 from execution_revision import DefinitionSnapshot
 import loop_manager as lm
 import runtime_state
+from requirement_archive import ArchiveSnapshot
 from execution_state import ExecutionStatePort
 from execution_runtime import (
     ExecutionPhase,
@@ -96,6 +97,16 @@ class ExecutionHandlerTests(TestCase):
         if phase is not None:
             self.state.update_project('repo', phase=phase)
         return self.handler._context()
+
+    def _use_runtime_contract(self):
+        runtime = lm._ExecutionLifecyclePorts(
+            self.connection, self.repository,
+            repo='repo', repo_path=Path('/repo'), state_dir=Path('/state'),
+            base='main', base_sha='base', provider='codex', config_path=Path('/config'),
+            newly_activated=False,
+        )
+        self.effects = replace(self.effects, contract=runtime.effects.contract)
+        self.handler.effects = self.effects
 
     def test_final_block_uses_current_verify_output_before_project_checkpoint(self):
         result = self.handler._block_final(
@@ -718,6 +729,201 @@ class ExecutionHandlerTests(TestCase):
         self.assertEqual(self.state.row()['phase'], 'WORKING')
         self.assertNotIn('push', self.calls)
 
+    def test_guard_pins_archive_target_without_resetting_worker_session(self):
+        source = 'docs/requirements/source.md'
+        self.effects.archive.requirement_archive_sources.return_value = (source,)
+        self.effects.archive.requirement_archive_touched_sources.return_value = ()
+        snapshot = ArchiveSnapshot('base', 'catalog', 'states', 'G-047', (), ())
+        self.effects.archive.requirement_archive_snapshot.return_value = snapshot
+        original_git = self.git
+
+        def git(path, *args, **kwargs):
+            if args[0] == 'merge-base':
+                return SimpleNamespace(stdout='base', returncode=0)
+            return original_git(path, *args, **kwargs)
+
+        self.effects.workspace.git.side_effect = git
+        self.state.update_project('repo', worker_session_id='saved-session')
+
+        result = self.handler.guard(self.context())
+
+        self.assertEqual(result.archive_snapshot_token, snapshot.token)
+        target = self.connection.execute(
+            'SELECT snapshot_token, stage FROM requirement_archive_targets '
+            "WHERE repo = 'repo' AND plan_id = 'G-047'"
+        ).fetchone()
+        self.assertEqual(target['snapshot_token'], snapshot.token)
+        self.assertEqual(target['stage'], 'WORKTREE_UPDATED')
+        self.assertEqual(self.state.row()['worker_session_id'], 'saved-session')
+        self.effects.blocking.block_active_execplan.assert_not_called()
+
+    def test_guard_remote_race_preserves_worker_session_without_block(self):
+        source = 'docs/requirements/source.md'
+        self.effects.archive.requirement_archive_sources.return_value = (source,)
+        self.effects.archive.requirement_archive_touched_sources.return_value = ()
+        self.effects.archive.requirement_archive_snapshot.return_value = (
+            ArchiveSnapshot('base', 'catalog', 'states', 'G-047', (), ())
+        )
+        original_git = self.git
+        fetches = 0
+
+        def git(path, *args, **kwargs):
+            nonlocal fetches
+            if args[0] == 'fetch':
+                fetches += 1
+                if fetches == 2:
+                    self.remote = 'base-2'
+            if args[0] == 'merge-base':
+                return SimpleNamespace(stdout='base', returncode=0)
+            return original_git(path, *args, **kwargs)
+
+        self.effects.workspace.git.side_effect = git
+        self.state.update_project('repo', worker_session_id='saved-session')
+
+        result = self.handler.guard(self.context())
+
+        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(result.recovery.observation.reason,
+                         handlers.RecoveryReason.BASE_BEHIND)
+        self.assertEqual(self.state.row()['worker_session_id'], 'saved-session')
+        self.effects.blocking.block_active_execplan.assert_not_called()
+
+    def test_guard_persists_archive_target_before_latest_base_refresh(self):
+        source = 'docs/requirements/source.md'
+        self.remote = 'base-2'
+        self.effects.archive.requirement_archive_sources.return_value = (source,)
+        snapshot = ArchiveSnapshot('base-2', 'catalog', 'states', 'G-047', (), ())
+        self.effects.archive.requirement_archive_snapshot.return_value = snapshot
+        self.handler._refresh_revision_base = mock.Mock(
+            return_value=ExecutionOutcome(ExecutionOutcomeKind.RETRY)
+        )
+
+        result = self.handler.guard(self.context())
+
+        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+        self.handler._refresh_revision_base.assert_called_once()
+        target = self.connection.execute(
+            'SELECT base_oid, snapshot_token, stage '
+            "FROM requirement_archive_targets WHERE repo = 'repo'"
+        ).fetchone()
+        self.assertEqual(tuple(target), ('base-2', snapshot.token, 'OBSERVED'))
+        self.effects.blocking.block_active_execplan.assert_not_called()
+
+    def test_guard_invalid_remote_catalog_uses_final_recovery_gate(self):
+        path = 'docs/plans/[G-002] Invalid.md'
+        self.effects.revision.reconcile_catalog.side_effect = None
+        self.effects.revision.reconcile_catalog.return_value = SimpleNamespace(
+            kind=SimpleNamespace(value='invalid-catalog'),
+            revision_sha='base',
+            diagnostic=SimpleNamespace(message='invalid source', path=path,
+                                       source='docs/requirements/missing.md'),
+        )
+
+        result = self.handler.guard(self.context())
+
+        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertEqual(result.recovery.observation.reason,
+                         handlers.RecoveryReason.CATALOG_INVALID)
+        self.assertEqual(result.recovery.observation.user_targets,
+                         (path, 'docs/requirements/missing.md'))
+        self.effects.blocking.block_active_execplan.assert_called_once()
+        self.effects.archive.requirement_archive_snapshot.assert_not_called()
+
+    def test_guard_refuses_archive_rebase_when_head_lacks_plan_ancestry(self):
+        source = 'docs/requirements/source.md'
+        self.remote = 'base-2'
+        self.effects.archive.requirement_archive_sources.return_value = (source,)
+        self.effects.archive.requirement_archive_touched_sources.return_value = ()
+        self.effects.archive.requirement_archive_snapshot.return_value = (
+            ArchiveSnapshot('base-2', 'catalog', 'states', 'G-047', (), ())
+        )
+        original_git = self.git
+
+        def git(path, *args, **kwargs):
+            if args[:2] == ('merge-base', '--is-ancestor'):
+                return SimpleNamespace(
+                    stdout='', returncode=1 if path == Path('/state/G-047') else 0
+                )
+            return original_git(path, *args, **kwargs)
+
+        self.effects.workspace.git.side_effect = git
+
+        result = self.handler.guard(self.context())
+
+        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertEqual(result.recovery.observation.reason,
+                         handlers.RecoveryReason.OWNERSHIP_UNCERTAIN)
+        self.assertNotIn('rebase', self.calls)
+        self.assertIsNone(self.connection.execute(
+            "SELECT snapshot_token FROM requirement_archive_targets WHERE repo = 'repo'"
+        ).fetchone())
+
+    def test_guard_archive_rebase_checks_managed_head_not_base_checkout(self):
+        self.remote = 'base-2'
+        self.effects.archive.requirement_archive_sources.return_value = (
+            'docs/requirements/source.md',
+        )
+        self.effects.archive.requirement_archive_snapshot.return_value = (
+            ArchiveSnapshot('base-2', 'catalog', 'states', 'G-047', (), ())
+        )
+        original_git = self.git
+
+        def git(path, *args, **kwargs):
+            if args[:2] == ('merge-base', '--is-ancestor'):
+                return SimpleNamespace(
+                    stdout='', returncode=0 if path == Path('/state/G-047') else 1
+                )
+            return original_git(path, *args, **kwargs)
+
+        self.effects.workspace.git.side_effect = git
+        self.handler._refresh_revision_base = mock.Mock(
+            return_value=ExecutionOutcome(ExecutionOutcomeKind.RETRY)
+        )
+
+        result = self.handler.guard(self.context())
+
+        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+        self.handler._refresh_revision_base.assert_called_once()
+        ancestry_paths = [
+            call.args[0] for call in self.effects.workspace.git.call_args_list
+            if call.args[1:3] == ('merge-base', '--is-ancestor')
+        ]
+        self.assertEqual(ancestry_paths, [Path('/state/G-047')])
+        self.effects.workspace.validate_managed_worktree.assert_called_with(
+            Path('/repo'), Path('/state/G-047'), 'loop-manager/G-047'
+        )
+
+    def test_guard_archive_snapshot_ignores_base_checkout_head(self):
+        self.effects.archive.requirement_archive_sources.return_value = (
+            'docs/requirements/source.md',
+        )
+        self.effects.archive.requirement_archive_touched_sources.return_value = ()
+        self.effects.archive.requirement_archive_snapshot.return_value = (
+            ArchiveSnapshot('base', 'catalog', 'states', 'G-047', (), ())
+        )
+        original_git = self.git
+
+        def git(path, *args, **kwargs):
+            if args[:2] == ('merge-base', '--is-ancestor'):
+                return SimpleNamespace(
+                    stdout='', returncode=0 if path == Path('/state/G-047') else 1
+                )
+            if args[0] == 'merge-base':
+                return SimpleNamespace(stdout='base', returncode=0)
+            return original_git(path, *args, **kwargs)
+
+        self.effects.workspace.git.side_effect = git
+
+        result = self.handler.guard(self.context())
+
+        self.assertNotIsInstance(result, ExecutionOutcome)
+        ancestry_paths = [
+            call.args[0] for call in self.effects.workspace.git.call_args_list
+            if call.args[1:3] == ('merge-base', '--is-ancestor')
+        ]
+        self.assertEqual(ancestry_paths, [Path('/state/G-047')])
+        self.effects.blocking.block_active_execplan.assert_not_called()
+
     def test_existing_pr_recovery_does_not_push_or_create(self):
         self.effects.publication.pr_for_branch.return_value = {'url': 'existing'}
         self.effects.publication.reconcile_existing_pull_request.return_value = 0
@@ -1014,6 +1220,36 @@ class ExecutionHandlerTests(TestCase):
         self.assertEqual(self.state.row()['phase'], 'WORKING')
         self.assertEqual(self.state.row()['verify_result'], 'saved verify')
         self.assertEqual(self.state.row()['review_result'], 'saved review')
+        self.effects.blocking.block_active_execplan.assert_not_called()
+
+    def test_archive_destination_collision_is_final_with_actual_path(self):
+        self._use_runtime_contract()
+        path = 'docs/requirements/archive/source.md'
+        self.handler.archive_sources = ('docs/requirements/source.md',)
+        self.state.update_project('repo', phase='PUBLISHING', validated_base_sha='base')
+        self.effects.archive.requirement_archive_candidates.side_effect = (
+            lm.RequirementArchiveCollisionError(path)
+        )
+
+        result = self.handler.publish(self.context(), self.handler)
+
+        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertEqual(result.recovery.observation.user_targets, (path,))
+        self.effects.blocking.block_active_execplan.assert_called_once()
+
+    def test_archive_git_lock_retries_without_blocking(self):
+        self._use_runtime_contract()
+        self.handler.archive_sources = ('docs/requirements/source.md',)
+        self.state.update_project('repo', phase='PUBLISHING', validated_base_sha='base')
+        self.effects.archive.requirement_archive_candidates.side_effect = (
+            lm.GitLockError('locked')
+        )
+
+        result = self.handler.publish(self.context(), self.handler)
+
+        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(result.recovery.observation.reason,
+                         handlers.RecoveryReason.GIT_LOCK)
         self.effects.blocking.block_active_execplan.assert_not_called()
 
     def test_publication_interruption_recovers_existing_pr_without_repush(self):

@@ -17,6 +17,10 @@ from execution_revision import (DefinitionDelta, DefinitionSnapshot, RevisionGat
     StageArtifacts, WORKER_INVALIDATING_DELTAS, decide_revision_gate)
 from execution_runtime import (ExecutionContext, ExecutionOutcome, ExecutionOutcomeKind,
     ExecutionPhase, ExecutionPlanMetadata, LatestBaseCheckpoint)
+from requirement_archive_state import ArchiveTargetRepository, ArchiveTargetConflict
+from requirement_archive_recovery import (
+    ArchiveRecoveryPorts, ArchiveRecoveryService,
+)
 
 @dataclass(frozen=True)
 class WorkspaceEffects:
@@ -66,6 +70,7 @@ class ValidationEffects:
 @dataclass(frozen=True)
 class ArchiveEffects:
     requirement_archive_sources: Callable[..., Any]
+    requirement_archive_snapshot: Callable[..., Any]
     requirement_archive_candidates: Callable[..., Any]
     requirement_archive_move_set: Callable[..., Any]
     requirement_archive_reconciliation_error: Callable[..., Any]
@@ -134,6 +139,7 @@ class ExecutionHandlers:
         self.archive_sources = ()
         self.archive_candidates = ()
         self.archive_scope_sources = ()
+        self._archive_snapshot = None
         self._latest_verify_output = ''
         self._worker_publication = None
         self._definition_snapshot = None
@@ -198,6 +204,11 @@ class ExecutionHandlers:
             pr_conflict_base_oid=str(row['pr_conflict_base_oid']) if row['pr_conflict_base_oid'] is not None else None,
             resolving_rebase=self._resolving_rebase(row),
             archive_sources=self.archive_sources,
+            archive_snapshot_token=(
+                self._archive_snapshot.token
+                if self._archive_snapshot is not None else None
+            ),
+            archive_candidate_scope=self.archive_candidates,
             current_definition_token=(
                 self._definition_snapshot.definition_token
                 if self._definition_snapshot is not None
@@ -678,19 +689,53 @@ class ExecutionHandlers:
         self.effects.events.operation_print(detail, file=sys.stderr)
         return self._final(detail)
 
+    def _archive_collision(self, context, error):
+        return self._recover(
+            RecoveryReason.PLAN_INPUT_INVALID, str(error), context=context,
+            user_targets=(error.path,),
+        )
+
+    def _archive_workspace_owned(self, context):
+        active = self.effects.state.active_execplan(self.repo)
+        if not (
+            active is not None
+            and str(active['plan_id']) == context.plan.plan_id
+            and int(active['workspace_owned']) == self.effects.contract.WORKSPACE_OWNED
+            and str(active['branch'] or '') == context.branch
+            and str(active['worktree'] or '') == str(context.worktree)
+            and context.plan.plan_sha
+        ):
+            return False
+        try:
+            self.effects.workspace.validate_managed_worktree(
+                self.repo_path, context.worktree, context.branch
+            )
+            return self.effects.workspace.git(
+                context.worktree, 'merge-base', '--is-ancestor',
+                context.plan.plan_sha, 'HEAD', check=False,
+            ).returncode == 0
+        except self.effects.contract.WorkspaceOwnershipError:
+            return False
+        except self.effects.contract.GitLockError as error:
+            raise RecoveryFailure(RecoveryReason.GIT_LOCK, str(error)) from error
+        except (RuntimeError, OSError) as error:
+            raise RecoveryFailure(RecoveryReason.STATUS_FAILED, str(error)) from error
+
     def guard(self, context):
         """Refresh and reconcile before any phase effect consumes its snapshot."""
 
         self.effects.state.check_context(context)
-        self.effects.workspace.git(self.repo_path, 'fetch', 'origin')
-        latest_sha = self.effects.workspace.git(
-            self.repo_path,
-            'rev-parse',
-            f"origin/{self.base}",
-        ).stdout.strip()
-        result = self.effects.revision.reconcile_catalog(
-            self.repo_path, self.repo, self.base
-        )
+        latest_sha = self._fetch_latest_base()
+        try:
+            result = self.effects.revision.reconcile_catalog(
+                self.repo_path, self.repo, self.base
+            )
+        except self.effects.contract.GitLockError as error:
+            return self._recover(RecoveryReason.GIT_LOCK, str(error), context=context)
+        except (RuntimeError, OSError) as error:
+            return self._recover(
+                RecoveryReason.STATUS_FAILED, str(error), context=context
+            )
         kind = getattr(getattr(result, 'kind', None), 'value', None)
         if kind == 'stale':
             return self._recover(
@@ -701,7 +746,13 @@ class ExecutionHandlers:
         if kind == 'invalid-catalog':
             diagnostic = getattr(result, 'diagnostic', None)
             detail = str(getattr(diagnostic, 'message', None) or '원격 ExecPlan catalog가 유효하지 않습니다.')
-            return self._final(detail)
+            return self._recover(
+                RecoveryReason.CATALOG_INVALID, detail, context=context,
+                user_targets=tuple(
+                    path for path in (getattr(diagnostic, 'path', None),
+                                      getattr(diagnostic, 'source', None)) if path
+                ),
+            )
         if str(getattr(result, 'revision_sha', '') or '') != latest_sha:
             return self._recover(
                 RecoveryReason.REMOTE_SNAPSHOT_RACE,
@@ -722,14 +773,18 @@ class ExecutionHandlers:
             archive_sources = self.effects.archive.requirement_archive_sources(
                 self.repo
             )
-            archive_candidates = (
-                self.effects.archive.requirement_archive_candidates(
+            archive_snapshot = (
+                self.effects.archive.requirement_archive_snapshot(
                     self.repo_path,
                     self.repo,
                     latest_sha,
                     str(catalog_plan['plan_id']),
                 )
-                if archive_sources else ()
+                if archive_sources else None
+            )
+            archive_candidates = (
+                archive_snapshot.candidates
+                if archive_snapshot is not None else ()
             )
             snapshot = DefinitionSnapshot(
                 revision_sha=latest_sha,
@@ -761,7 +816,21 @@ class ExecutionHandlers:
             )
         except RecoveryFailure:
             raise
-        except (RuntimeError, ValueError, self.effects.contract.RequirementArchiveError) as error:
+        except self.effects.contract.GitLockError as error:
+            return self._recover(RecoveryReason.GIT_LOCK, str(error), context=context)
+        except self.effects.contract.RequirementArchiveCollisionError as error:
+            return self._archive_collision(context, error)
+        except self.effects.contract.RequirementArchiveError as error:
+            if self._fetch_latest_base() != latest_sha:
+                return self._recover(
+                    RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                    'Requirement archive 계산 중 원격 base가 변경됐습니다.',
+                    context=context,
+                )
+            return self._revision_error(
+                context, f"ExecPlan revision gate 확인 실패: {error}"
+            )
+        except (RuntimeError, ValueError) as error:
             return self._revision_error(
                 context, f"ExecPlan revision gate 확인 실패: {error}"
             )
@@ -839,6 +908,7 @@ class ExecutionHandlers:
         self.archive_sources = tuple(archive_sources)
         self.archive_candidates = tuple(archive_candidates)
         self.archive_scope_sources = tuple(sorted(set(archive_candidates)))
+        self._archive_snapshot = archive_snapshot
 
         if decision.kind is RevisionGateKind.FINAL_SAFETY_ERROR:
             return self._revision_error(context, str(decision.detail))
@@ -902,6 +972,47 @@ class ExecutionHandlers:
             )
             return self._context()
         if str(row['active_sha'] or '') != latest_sha:
+            if self._archive_snapshot is not None:
+                try:
+                    workspace_owned = self._archive_workspace_owned(context)
+                except RecoveryFailure as error:
+                    return self._recover(error.reason, str(error), context=context)
+                if not workspace_owned:
+                    return self._recover(
+                        RecoveryReason.OWNERSHIP_UNCERTAIN,
+                        'Requirement archive 관리 worktree와 ExecPlan HEAD의 소유권을 확인할 수 없습니다.',
+                        context=context,
+                    )
+                repository = ArchiveTargetRepository(self.effects.state.connection)
+                previous_target = repository.get(self.repo, str(self.plan['id']))
+                try:
+                    repository.put(
+                        self.repo, self._archive_snapshot,
+                        expected_execution=self.effects.state.expected,
+                        expected_generation=(
+                            previous_target.generation if previous_target else None
+                        ),
+                        base_is_current=lambda oid: self._fetch_latest_base() == oid,
+                        snapshot_is_current=lambda: (
+                            self.effects.archive.requirement_archive_snapshot(
+                                self.repo_path, self.repo, latest_sha,
+                                str(self.plan['id']),
+                            ).token == self._archive_snapshot.token
+                        ),
+                        stage='OBSERVED',
+                    )
+                except ArchiveTargetConflict:
+                    return self._recover(
+                        RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                        'Requirement archive rebase 대상 snapshot이 변경됐습니다.',
+                        context=context,
+                    )
+                except self.effects.contract.RequirementArchiveCollisionError as error:
+                    return self._archive_collision(context, error)
+                except self.effects.contract.RequirementArchiveError as error:
+                    return self._recover(
+                        RecoveryReason.CATALOG_INVALID, str(error), context=context
+                    )
             return self._refresh_revision_base(
                 context,
                 snapshot,
@@ -944,6 +1055,90 @@ class ExecutionHandlers:
             raise
         except RuntimeError as error:
             return self._revision_error(context, str(error))
+        if self._archive_snapshot is not None:
+            def require_next_guard(_base):
+                raise RecoveryFailure(
+                    RecoveryReason.BASE_BEHIND,
+                    'Requirement archive 복구 중 새 원격 base를 관측했습니다.',
+                )
+
+            def reconcile_catalog(_base):
+                try:
+                    return self.effects.revision.reconcile_catalog(
+                        self.repo_path, self.repo, self.base
+                    )
+                except self.effects.contract.GitLockError as error:
+                    raise RecoveryFailure(RecoveryReason.GIT_LOCK, str(error)) from error
+
+            def applied_base():
+                try:
+                    return self.effects.workspace.git(
+                        context.worktree, 'merge-base', 'HEAD',
+                        f'origin/{self.base}',
+                    ).stdout.strip()
+                except self.effects.contract.GitLockError as error:
+                    raise RecoveryFailure(RecoveryReason.GIT_LOCK, str(error)) from error
+                except RuntimeError as error:
+                    raise RecoveryFailure(RecoveryReason.STATUS_FAILED, str(error)) from error
+
+            def calculate_snapshot(oid):
+                try:
+                    return self.effects.archive.requirement_archive_snapshot(
+                        self.repo_path, self.repo, oid, str(self.plan['id'])
+                    )
+                except self.effects.contract.GitLockError as error:
+                    raise RecoveryFailure(RecoveryReason.GIT_LOCK, str(error)) from error
+
+            ports = ArchiveRecoveryPorts(
+                fetch_base=self._fetch_latest_base,
+                observe_pull_request=lambda: self.effects.publication.pr_for_branch(
+                    self.repo_path, context.branch, context.pr_url or ''
+                ),
+                reconcile_catalog=reconcile_catalog,
+                workspace_owned=lambda: self._archive_workspace_owned(context),
+                applied_base=applied_base,
+                refresh_worktree=require_next_guard,
+                calculate_snapshot=calculate_snapshot,
+                current_base=self._fetch_latest_base,
+                execution_snapshot=lambda: self.effects.state.expected,
+                plan_revision=lambda: (
+                    str(self.catalog_plan['current_revision_sha'])
+                    if self.catalog_plan is not None
+                    and self.catalog_plan['current_revision_sha'] is not None
+                    else None
+                ),
+            )
+            try:
+                recovered = ArchiveRecoveryService(
+                    ArchiveTargetRepository(self.effects.state.connection),
+                    ports,
+                ).run()
+            except RecoveryFailure as error:
+                return self._recover(
+                    error.reason, str(error), context=context
+                )
+            except self.effects.contract.RequirementArchiveCollisionError as error:
+                return self._archive_collision(context, error)
+            except self.effects.contract.RequirementArchiveError as error:
+                reason = (
+                    RecoveryReason.REMOTE_SNAPSHOT_RACE
+                    if self._fetch_latest_base() != latest_sha
+                    else RecoveryReason.CATALOG_INVALID
+                )
+                return self._recover(reason, str(error), context=context)
+            if recovered.decision is not None:
+                return self._recover(
+                    recovered.decision.observation.reason,
+                    recovered.decision.observation.detail,
+                    context=context, attempts=recovered.decision.attempts,
+                    user_targets=recovered.decision.observation.user_targets,
+                )
+            if recovered.snapshot is None or recovered.snapshot.token != self._archive_snapshot.token:
+                return self._recover(
+                    RecoveryReason.CATALOG_CACHE_STALE,
+                    'Requirement archive snapshot이 변경되어 최신 선언으로 다시 평가합니다.',
+                    context=context,
+                )
         return self._context()
 
     def _post_effect_guard(self, context):
@@ -952,6 +1147,62 @@ class ExecutionHandlers:
         if self._definition_snapshot is None:
             return context
         return self.guard(self._context())
+
+    def _archive_candidates_at(self, context, revision):
+        """Require the archive input used by this phase before reading moves."""
+
+        try:
+            if self._archive_snapshot is None:
+                return self.effects.archive.requirement_archive_candidates(
+                    self.repo_path, self.repo, revision, str(self.plan['id'])
+                )
+            snapshot = self.effects.archive.requirement_archive_snapshot(
+                self.repo_path, self.repo, revision, str(self.plan['id'])
+            )
+        except self.effects.contract.GitLockError as error:
+            raise RecoveryFailure(RecoveryReason.GIT_LOCK, str(error)) from error
+        if (
+            snapshot.token != self._archive_snapshot.token
+            or snapshot.token != context.archive_snapshot_token
+        ):
+            raise RecoveryFailure(
+                RecoveryReason.CATALOG_CACHE_STALE,
+                'Requirement archive base/catalog/state snapshot이 변경됐습니다.',
+            )
+        return snapshot.candidates
+
+    def _record_archive_target(self, stage, *, moves=None):
+        if self._archive_snapshot is None:
+            return
+        snapshot = (
+            self._archive_snapshot.with_moves(tuple(moves))
+            if moves is not None else self._archive_snapshot
+        )
+        repository = ArchiveTargetRepository(self.effects.state.connection)
+        previous = repository.get(self.repo, str(self.plan['id']))
+        try:
+            repository.put(
+                self.repo, snapshot,
+                expected_execution=self.effects.state.expected,
+                expected_generation=previous.generation if previous else None,
+                base_is_current=lambda oid: self._fetch_latest_base() == oid,
+                snapshot_is_current=lambda: (
+                    self.effects.archive.requirement_archive_snapshot(
+                        self.repo_path, self.repo, snapshot.base_oid,
+                        str(self.plan['id']),
+                    ).token == snapshot.token
+                ),
+                stage=stage,
+            )
+        except ArchiveTargetConflict as error:
+            raise RecoveryFailure(
+                RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                'Requirement archive target 저장 중 snapshot이 변경됐습니다.',
+            ) from error
+        except self.effects.contract.GitLockError as error:
+            raise RecoveryFailure(RecoveryReason.GIT_LOCK, str(error)) from error
+        except self.effects.contract.RequirementArchiveError as error:
+            raise RecoveryFailure(RecoveryReason.CATALOG_INVALID, str(error)) from error
 
     def run(self, context):
         self.effects.state.check_context(context)
@@ -1172,29 +1423,42 @@ class ExecutionHandlers:
         if context.archive_sources:
             post_worker_revision = latest_sha if context.resolving_rebase else str(row['active_sha'] or '')
             try:
-                expected_archives = self.effects.archive.requirement_archive_candidates(
-                    self.repo_path,
-                    self.repo,
-                    post_worker_revision,
-                    str(self.plan['id']),
+                expected_archives = self._archive_candidates_at(
+                    context, post_worker_revision
                 )
+            except RecoveryFailure as error:
+                return self._recover(error.reason, str(error), context=context)
+            except self.effects.contract.RequirementArchiveCollisionError as error:
+                return self._archive_collision(context, error)
             except self.effects.contract.RequirementArchiveError as error:
                 archive_error = f"Requirement archive eligibility 확인 실패: {error}"
-                self._block_final(
-                    self.repo, context.worktree, archive_error,
-                    str(row['verify_result'] or ''),
-                    reason=BlockReasonCode.PLAN_INPUT_INVALID,
+                if self._fetch_latest_base() != post_worker_revision:
+                    return self._recover(
+                        RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                        archive_error, context=context,
+                    )
+                outcome = self._recover(
+                    RecoveryReason.CATALOG_INVALID,
+                    archive_error, context=context,
                 )
                 self.effects.events.operation_print(archive_error, file=sys.stderr)
-                return self._final(archive_error)
+                return outcome
             try:
                 actual_archives = self.effects.archive.requirement_archive_move_set(
                     self.repo_path,
                     post_worker_revision,
                     context.worktree,
                 )
+            except self.effects.contract.GitLockError as error:
+                return self._recover(RecoveryReason.GIT_LOCK, str(error), context=context)
+            except self.effects.contract.RequirementArchiveCollisionError as error:
+                return self._archive_collision(context, error)
             except self.effects.contract.RequirementArchiveError as error:
-                archive_error = f"Requirement archive 이동 검증 실패: {error}"
+                archive_error = (
+                    f"Requirement archive 이동 검증 실패: {error}\n"
+                    f"기준 revision: {post_worker_revision}; "
+                    f"기대: {json.dumps(expected_archives, ensure_ascii=False)}"
+                )
                 self.effects.state.update_project(
                     self.repo, phase='WORKING', validated_base_sha=None,
                     worker_result=message,
@@ -1206,11 +1470,18 @@ class ExecutionHandlers:
                     'Requirement archive 이동을 같은 Worker 세션에서 다시 확인합니다.',
                     file=sys.stderr,
                 )
+                try:
+                    self._record_archive_target('CORRECTION_PENDING')
+                except RecoveryFailure as race:
+                    return self._recover(race.reason, str(race), context=context)
                 return self._recover(
                     RecoveryReason.ARCHIVE_MOVE_MISMATCH,
                     archive_error, context=context,
                 )
-            archive_error = self.effects.archive.requirement_archive_reconciliation_error(expected_archives, actual_archives)
+            archive_error = self.effects.archive.requirement_archive_reconciliation_error(
+                expected_archives, actual_archives,
+                revision=post_worker_revision,
+            )
             if archive_error is not None:
                 self.effects.state.update_project(
                     self.repo,
@@ -1228,13 +1499,26 @@ class ExecutionHandlers:
                     'Requirement archive 이동 집합을 같은 Worker 세션에서 다시 맞춥니다.',
                     file=sys.stderr,
                 )
+                try:
+                    self._record_archive_target(
+                        'CORRECTION_PENDING', moves=actual_archives
+                    )
+                except RecoveryFailure as error:
+                    return self._recover(error.reason, str(error), context=context)
                 return self._recover(
                     RecoveryReason.ARCHIVE_MOVE_MISMATCH,
                     archive_error, context=context,
                     fingerprint=hashlib.sha256(
-                        json.dumps((sorted(expected_archives or ()), sorted(actual_archives or ()))).encode()
+                        json.dumps((post_worker_revision, context.archive_snapshot_token,
+                                    sorted(expected_archives or ()), sorted(actual_archives or ()))).encode()
                     ).hexdigest(),
                 )
+            try:
+                self._record_archive_target(
+                    'WORKTREE_UPDATED', moves=actual_archives
+                )
+            except RecoveryFailure as error:
+                return self._recover(error.reason, str(error), context=context)
         self.effects.state.update_project(
             self.repo,
             phase='VERIFYING',
@@ -1394,9 +1678,15 @@ class ExecutionHandlers:
         return self._latest_before_publication(context)
 
     def _fetch_latest_base(self):
-        self.effects.workspace.git(self.repo_path, 'fetch', 'origin')
-        latest_sha = self.effects.workspace.git(self.repo_path, 'rev-parse', f"origin/{self.base}").stdout.strip()
-        return latest_sha
+        try:
+            self.effects.workspace.git(self.repo_path, 'fetch', 'origin')
+            return self.effects.workspace.git(
+                self.repo_path, 'rev-parse', f"origin/{self.base}"
+            ).stdout.strip()
+        except self.effects.contract.GitLockError as error:
+            raise RecoveryFailure(RecoveryReason.GIT_LOCK, str(error)) from error
+        except (RuntimeError, OSError) as error:
+            raise RecoveryFailure(RecoveryReason.FETCH_FAILED, str(error)) from error
 
     def _rebase_latest(self, context, row, latest_sha, *, publishing, evidence):
         """Persist rebase intent, observe Git, then record the applied base."""
@@ -1865,21 +2155,26 @@ class ExecutionHandlers:
         latest_sha = str(row['active_sha'] or '')
         if context.archive_sources:
             try:
-                final_archive_candidates = self.effects.archive.requirement_archive_candidates(
-                    self.repo_path,
-                    self.repo,
-                    latest_sha,
-                    str(self.plan['id']),
+                final_archive_candidates = self._archive_candidates_at(
+                    context, latest_sha
                 )
+            except RecoveryFailure as error:
+                return self._recover(error.reason, str(error), context=context)
+            except self.effects.contract.RequirementArchiveCollisionError as error:
+                return self._archive_collision(context, error)
             except self.effects.contract.RequirementArchiveError as error:
                 archive_error = f"게시 직전 Requirement archive eligibility 확인 실패: {error}"
-                self._block_final(
-                    self.repo, context.worktree, archive_error,
-                    str(row['verify_result'] or ''),
-                    reason=BlockReasonCode.PLAN_INPUT_INVALID,
+                if self._fetch_latest_base() != latest_sha:
+                    return self._recover(
+                        RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                        archive_error, context=context,
+                    )
+                outcome = self._recover(
+                    RecoveryReason.CATALOG_INVALID,
+                    archive_error, context=context,
                 )
                 self.effects.events.operation_print(archive_error, file=sys.stderr)
-                return self._final(archive_error)
+                return outcome
             try:
                 final_archive_moves = self.effects.archive.requirement_archive_move_set(
                     self.repo_path,
@@ -1887,8 +2182,16 @@ class ExecutionHandlers:
                     context.worktree,
                     tracked_revision='HEAD',
                 )
+            except self.effects.contract.GitLockError as error:
+                return self._recover(RecoveryReason.GIT_LOCK, str(error), context=context)
+            except self.effects.contract.RequirementArchiveCollisionError as error:
+                return self._archive_collision(context, error)
             except self.effects.contract.RequirementArchiveError as error:
-                archive_error = f"게시 직전 Requirement archive 확인 실패: {error}"
+                archive_error = (
+                    f"게시 직전 Requirement archive 확인 실패: {error}\n"
+                    f"기준 revision: {latest_sha}; "
+                    f"기대: {json.dumps(final_archive_candidates, ensure_ascii=False)}"
+                )
                 self.effects.state.update_project(
                     self.repo, phase='WORKING', validated_base_sha=None,
                     worker_input_token=None, archive_token=None,
@@ -1899,6 +2202,10 @@ class ExecutionHandlers:
                     '게시 직전 Requirement archive 이동을 다시 확인합니다.',
                     file=sys.stderr,
                 )
+                try:
+                    self._record_archive_target('CORRECTION_PENDING')
+                except RecoveryFailure as race:
+                    return self._recover(race.reason, str(race), context=context)
                 return self._recover(
                     RecoveryReason.ARCHIVE_MOVE_MISMATCH,
                     archive_error, context=context,
@@ -1906,6 +2213,7 @@ class ExecutionHandlers:
             archive_error = self.effects.archive.requirement_archive_reconciliation_error(
                 final_archive_candidates,
                 final_archive_moves,
+                revision=latest_sha,
             )
             if archive_error is not None:
                 self.effects.state.update_project(
@@ -1923,13 +2231,24 @@ class ExecutionHandlers:
                     '게시 직전 Requirement archive 이동 집합을 다시 맞춥니다.',
                     file=sys.stderr,
                 )
+                try:
+                    self._record_archive_target(
+                        'CORRECTION_PENDING', moves=final_archive_moves
+                    )
+                except RecoveryFailure as error:
+                    return self._recover(error.reason, str(error), context=context)
                 return self._recover(
                     RecoveryReason.ARCHIVE_MOVE_MISMATCH,
                     archive_error, context=context,
                     fingerprint=hashlib.sha256(
-                        json.dumps((sorted(final_archive_candidates or ()), sorted(final_archive_moves or ()))).encode()
+                        json.dumps((latest_sha, context.archive_snapshot_token,
+                                    sorted(final_archive_candidates or ()), sorted(final_archive_moves or ()))).encode()
                     ).hexdigest(),
                 )
+            try:
+                self._record_archive_target('VALIDATED', moves=final_archive_moves)
+            except RecoveryFailure as error:
+                return self._recover(error.reason, str(error), context=context)
         if self.effects.agent.validate_guidance_publication(
             self.repo,
             context.worktree,
