@@ -293,6 +293,19 @@ class ExecutionHandlers:
                              user_targets=user_targets,
                              verify_result=verify_result)
 
+    def _metadata_correction(self, context, error, *, verify_result=None):
+        detail = f"ExecPlan metadata 검증 실패:\n{error}"
+        values = {'phase': 'WORKING', 'last_error': detail}
+        if verify_result is not None:
+            values['verify_result'] = verify_result
+        self.effects.state.update_project(self.repo, **values)
+        self.effects.events.operation_print(detail, file=sys.stderr)
+        return self._recover(
+            RecoveryReason.WORKER_CORRECTION, detail, context=context,
+            verify_result=verify_result,
+            final_block_reason=BlockReasonCode.PLAN_INPUT_INVALID,
+        )
+
     def _block_from_revision_final(self, repo_path, repo, revision, detail,
                                    verify_result='', *, reason):
         return self._recover(
@@ -1017,6 +1030,8 @@ class ExecutionHandlers:
             )
             self.effects.events.operation_print(scope_error, file=sys.stderr)
             return self._final(scope_error)
+        except self.effects.contract.ExecPlanMetadataError as error:
+            return self._metadata_correction(context, error)
         except RuntimeError as error:
             detail = f"Worker workspace 상태 조회 재시도: {error}"
             self.effects.events.operation_print(detail, file=sys.stderr)
@@ -1272,6 +1287,10 @@ class ExecutionHandlers:
             )
             self.effects.events.operation_print(scope_error, file=sys.stderr)
             return (self._final(scope_error), output)
+        except self.effects.contract.ExecPlanMetadataError as error:
+            return (self._metadata_correction(
+                context, error, verify_result=output,
+            ), output)
         except RuntimeError as error:
             detail = f"verify workspace 상태 조회 재시도: {error}"
             self.effects.events.operation_print(detail, file=sys.stderr)

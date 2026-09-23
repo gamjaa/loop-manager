@@ -7,7 +7,7 @@ import json
 import sqlite3
 
 from recovery_runtime import (
-    RecoveryAction, RecoveryDecision, RecoveryObservation, decide,
+    RecoveryAction, RecoveryDecision, RecoveryObservation, RecoveryReason, decide,
 )
 from scoped_blocking import BlockReasonCode
 
@@ -207,6 +207,35 @@ class RecoveryRepository:
             "DELETE FROM recovery_records WHERE repo = ? AND subject = ?",
             (repo, self._subject(plan_id)),
         )
+
+    def clear_correction_occurrences(
+        self, repo: str, plan_id: str, fingerprints: tuple[str, ...],
+    ) -> None:
+        """End successful validation streaks without discarding recovery evidence."""
+
+        if not fingerprints:
+            return
+        previous = self.row(repo, plan_id)
+        if previous is None:
+            return
+        selected = set(fingerprints)
+        index = json.loads(str(previous["occurrence_index"]))
+        remaining = {}
+        for key, occurrence in index.items():
+            reason, fingerprint, _progress = json.loads(key)
+            if reason != RecoveryReason.WORKER_CORRECTION.value or fingerprint not in selected:
+                remaining[key] = occurrence
+        if len(remaining) == len(index):
+            return
+        changed = self.connection.execute(
+            "UPDATE recovery_records SET occurrence_index = ?, "
+            "generation = generation + 1, updated_at = CURRENT_TIMESTAMP "
+            "WHERE repo = ? AND subject = ? AND generation = ?",
+            (json.dumps(remaining, sort_keys=True, separators=(",", ":")),
+             repo, self._subject(plan_id), int(previous["generation"])),
+        )
+        if changed.rowcount != 1:
+            raise RecoveryStateConflict("recovery generation changed")
 
     def mark_paused(self, repo: str, subject: str, identity: str,
                     generation: int, attempts: int) -> None:

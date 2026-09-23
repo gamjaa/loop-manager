@@ -465,7 +465,7 @@ class ExecutionHandlerTests(TestCase):
             ), mock.patch('loop_manager.validate_execplan', return_value={
                 **workspace_plan, field: value,
             }):
-                with self.assertRaisesRegex(RuntimeError, 'metadata'):
+                with self.assertRaisesRegex(lm.ExecPlanMetadataError, 'metadata'):
                     lm.validate_worker_workspace_scope(
                         Path('/repo'), Path('/state/G-047'), 'loop-manager/G-047',
                         'main', catalog['path'], catalog, mock.Mock(),
@@ -476,7 +476,7 @@ class ExecutionHandlerTests(TestCase):
         ), mock.patch('loop_manager.validate_managed_worktree'), mock.patch(
             'loop_manager.validate_execplan', return_value=workspace_plan
         ) as parsed:
-            with self.assertRaisesRegex(RuntimeError, 'metadata'):
+            with self.assertRaisesRegex(lm.ExecPlanMetadataError, 'metadata'):
                 lm.validate_worker_workspace_scope(
                     Path('/repo'), Path('/state/G-047'), 'loop-manager/G-047',
                     'main', catalog['path'], catalog, mock.Mock(),
@@ -746,6 +746,38 @@ class ExecutionHandlerTests(TestCase):
                     else ExecutionOutcomeKind.FINAL_BLOCK,
                 )
                 self.assertNotIn('verify', self.calls)
+
+    def test_worker_metadata_mismatch_corrects_then_final_blocks(self):
+        self.effects.agent.validate_worker_workspace_scope.side_effect = (
+            lm.ExecPlanMetadataError('catalog metadata mismatch')
+        )
+
+        outcomes = [self.handler.run(self.handler._context()) for _ in range(3)]
+
+        self.assertEqual([outcome.kind for outcome in outcomes], [
+            ExecutionOutcomeKind.RETRY, ExecutionOutcomeKind.RETRY,
+            ExecutionOutcomeKind.FINAL_BLOCK,
+        ])
+        self.assertEqual([outcome.recovery.occurrence for outcome in outcomes], [1, 2, 3])
+        self.assertEqual(outcomes[-1].recovery.block_reason, lm.BlockReasonCode.PLAN_INPUT_INVALID)
+        self.assertEqual(self.state.row()['worker_session_id'], 'session')
+        self.assertNotIn('verify', self.calls)
+        self.effects.blocking.block_active_execplan.assert_called_once()
+
+    def test_verify_metadata_mismatch_returns_to_worker_with_output(self):
+        self.effects.agent.validate_worker_workspace_scope.side_effect = (
+            lm.ExecPlanMetadataError('catalog metadata mismatch')
+        )
+        self.state.update_project('repo', phase='VERIFYING', worker_result='saved worker result')
+
+        outcome, output = self.handler._verify_once(self.handler._context())
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(outcome.recovery.observation.reason.value, 'worker_correction')
+        self.assertEqual(self.state.row()['phase'], 'WORKING')
+        self.assertEqual(self.state.row()['worker_result'], 'saved worker result')
+        self.assertEqual(self.state.row()['verify_result'], output)
+        self.effects.blocking.block_active_execplan.assert_not_called()
 
     def test_repeated_worker_result_format_uses_same_session_before_final_gate(self):
         self.effects.validation.parse_worker_result.side_effect = lm.WorkerResultError('bad format')

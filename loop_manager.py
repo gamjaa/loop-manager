@@ -620,6 +620,10 @@ class WorkerResultError(RuntimeError):
     """A Worker final response cannot safely be published."""
 
 
+class ExecPlanMetadataError(RuntimeError):
+    """The selected ExecPlan declaration disagrees with the catalog."""
+
+
 class ReviewerProtocolError(RuntimeError):
     """A failed Reviewer response does not identify actionable issues."""
 
@@ -5976,12 +5980,16 @@ def clear_validation_failure_history(
     plan = active_execplan(connection, repo)
     if plan is None:
         raise RuntimeError("지문 이력을 초기화할 활성 ExecPlan을 찾을 수 없습니다.")
+    fingerprints = tuple(_deserialize_failure_history(plan[column]))
     with connection:
         runtime_state.RuntimeStateRepository(connection).update_plan(
             repo,
             str(plan["plan_id"]),
             plan_values={column: "{}"},
             enqueue=False,
+        )
+        recovery_state.RecoveryRepository(connection).clear_correction_occurrences(
+            repo, str(plan["plan_id"]), fingerprints,
         )
 
 
@@ -8488,14 +8496,17 @@ def validate_active_execplan_metadata(
     *,
     rebase_definition: execution_revision.DefinitionSnapshot | None = None,
 ) -> dict[str, object]:
-    current = validate_execplan(worktree, relative_path)
+    try:
+        current = validate_execplan(worktree, relative_path)
+    except RuntimeError as error:
+        raise ExecPlanMetadataError(str(error)) from error
     comparison_plan = plan
     if rebase_definition is not None:
         # A paused rebase still contains its applied declaration. Scheduling,
         # profile and dependency fields may lag during conflict resolution;
         # all other identity fields and all normal validation remain strict.
         if rebase_definition.path != relative_path:
-            raise RuntimeError("rebase 기준 ExecPlan 경로가 현재 작업 경로와 다릅니다.")
+            raise ExecPlanMetadataError("rebase 기준 ExecPlan 경로가 현재 작업 경로와 다릅니다.")
         comparison_plan = dict(plan)
         for field, column in (
             ('priority', 'priority'),
@@ -8514,9 +8525,9 @@ def validate_active_execplan_metadata(
         "활성 ExecPlan",
     )
     if error is not None:
-        raise RuntimeError(error)
+        raise ExecPlanMetadataError(error)
     if relative_path != str(plan["path"]):
-        raise RuntimeError("활성 ExecPlan 경로가 reconciled catalog와 다릅니다.")
+        raise ExecPlanMetadataError("활성 ExecPlan 경로가 reconciled catalog와 다릅니다.")
     return _current_execplan_metadata(plan, current)
 
 
@@ -8538,7 +8549,7 @@ def validate_worker_workspace_scope(
     """Validate one Worker-controlled operation before Manager Git writes."""
 
     if rebase_definition is not None and not allow_rebase:
-        raise RuntimeError("rebase 기준 선언은 충돌 복구 중에만 사용할 수 있습니다.")
+        raise ExecPlanMetadataError("rebase 기준 선언은 충돌 복구 중에만 사용할 수 있습니다.")
     after = capture_git_snapshot(worktree)
     validate_agent_scope(
         "worker",
@@ -16702,7 +16713,7 @@ def _ExecutionLifecyclePorts(connection, runtime_repository, **identity):
     state = _ExecutionStatePort(connection, runtime_repository, identity["repo"])
     effects = execution_handlers.ExecutionEffects(
         state=state,
-        contract=SimpleNamespace(**{name: globals()[name] for name in ('AgentResultKind', 'AgentScopeError', 'MAX_REVIEWER_PROTOCOL_ATTEMPTS', 'MAX_VALIDATION_FINGERPRINT_REPEATS', 'PROJECT_STEP_RETRY', 'PROJECT_STEP_TRANSIENT_PAUSE', 'PROJECT_STEP_USAGE_PAUSE', 'PROJECT_STEP_PLANNING_PENDING', 'PublicationSafetyError', 'REBASE_CONFLICT_PREFIX', 'REBASE_IN_PROGRESS_ERROR', 'RequirementArchiveError', 'ReviewerProtocolError', 'TRANSIENT_AGENT_ERROR_PREFIX', 'USAGE_LIMIT_ERROR_PREFIX', 'WORKSPACE_OWNED', 'WORKSPACE_RESERVED', 'WorkerResultError', 'WorkspaceOwnershipError')}),
+        contract=SimpleNamespace(**{name: globals()[name] for name in ('AgentResultKind', 'AgentScopeError', 'ExecPlanMetadataError', 'MAX_REVIEWER_PROTOCOL_ATTEMPTS', 'MAX_VALIDATION_FINGERPRINT_REPEATS', 'PROJECT_STEP_RETRY', 'PROJECT_STEP_TRANSIENT_PAUSE', 'PROJECT_STEP_USAGE_PAUSE', 'PROJECT_STEP_PLANNING_PENDING', 'PublicationSafetyError', 'REBASE_CONFLICT_PREFIX', 'REBASE_IN_PROGRESS_ERROR', 'RequirementArchiveError', 'ReviewerProtocolError', 'TRANSIENT_AGENT_ERROR_PREFIX', 'USAGE_LIMIT_ERROR_PREFIX', 'WORKSPACE_OWNED', 'WORKSPACE_RESERVED', 'WorkerResultError', 'WorkspaceOwnershipError')}),
         workspace=execution_handlers.WorkspaceEffects(
             is_directory=lambda path: path.is_dir(),
             git=state.bind(_typed_execution_git, name="git", connected=False, mutates=False),

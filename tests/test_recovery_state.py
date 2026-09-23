@@ -1,12 +1,15 @@
+import json
 import sqlite3
 import unittest
 from pathlib import Path
 from unittest import mock
 
 import loop_manager
+import runtime_state
 from recovery_runtime import RecoveryAction, RecoveryObservation, RecoveryReason
 from recovery_state import RecoveryRepository, RecoveryStateConflict
 from recovery_dispatcher import RecoveryDispatcher
+from tests import test_runtime_state
 
 
 class RecoveryRepositoryTests(unittest.TestCase):
@@ -59,6 +62,58 @@ class RecoveryRepositoryTests(unittest.TestCase):
         self.assertEqual(record.decision.action, RecoveryAction.PAUSE)
         self.assertEqual(self.repository.row("repo", "G-042")["pending_action"], "pause")
         self.assertIsNone(record.final_evidence)
+
+    def test_validation_success_resets_only_its_correction_streak(self):
+        connection = test_runtime_state.RuntimeStateRepositoryTest()._connection()
+        self.addCleanup(connection.close)
+        runtime_state.RuntimeStateRepository(connection).activate(
+            'repo', 'G-047', activation_sha='base',
+            branch='loop-manager/G-047', worktree='/state/G-047',
+        )
+        repository = RecoveryRepository(connection)
+
+        def correction(fingerprint):
+            return RecoveryObservation(
+                RecoveryReason.WORKER_CORRECTION, 'repo', 'G-047',
+                'VERIFYING', 'plan-sha', 'base', fingerprint,
+                'worker-session:head', 'same validation failure',
+            )
+
+        verify = correction('verify-fingerprint')
+        review = correction('review-fingerprint')
+        rebase = RecoveryObservation(
+            RecoveryReason.REBASE_CONFLICT, 'repo', 'G-047', 'IMPLEMENTING',
+            'plan-sha', 'base', 'verify-fingerprint',
+            'worker-session:head', 'conflict remains',
+        )
+        repository.observe(verify)
+        repository.observe(verify)
+        repository.observe(review)
+        repository.observe(rebase)
+        connection.execute(
+            "UPDATE exec_plans SET verify_failure_history = ?, "
+            "review_failure_history = ? WHERE repo = 'repo' AND plan_id = 'G-047'",
+            (json.dumps({'verify-fingerprint': {'occurrences': 2, 'sample': 'failure'}}),
+             json.dumps({'review-fingerprint': {'occurrences': 1, 'sample': 'failure'}})),
+        )
+        connection.commit()
+
+        loop_manager.clear_validation_failure_history(connection, 'repo', 'verify')
+
+        plan = connection.execute(
+            "SELECT verify_failure_history, review_failure_history FROM exec_plans "
+            "WHERE repo = 'repo' AND plan_id = 'G-047'"
+        ).fetchone()
+        self.assertEqual(json.loads(plan['verify_failure_history']), {})
+        self.assertIn('review-fingerprint', json.loads(plan['review_failure_history']))
+        self.assertEqual(repository.observe(verify).decision.occurrence, 1)
+        self.assertEqual(repository.observe(review).decision.occurrence, 2)
+        self.assertEqual(repository.observe(rebase).decision.occurrence, 2)
+
+        loop_manager.clear_validation_failure_history(connection, 'repo', 'review')
+
+        self.assertEqual(repository.observe(review).decision.occurrence, 1)
+        self.assertEqual(repository.observe(verify).decision.occurrence, 2)
 
     def test_project_recovery_before_execplan_schema_is_durable(self):
         self.connection.execute(loop_manager.SCHEMA)
