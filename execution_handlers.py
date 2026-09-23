@@ -423,6 +423,10 @@ class ExecutionHandlers:
         current = checkpoint.get(self.repo, context.plan.plan_id)
         if current.operation != 'rebase':
             return
+        stage_evidence = (
+            {'stage_evidence': self._rebase_stage_evidence(context)}
+            if pending == 'stage' else {}
+        )
         checkpoint.record(
             self.repo, context.plan.plan_id,
             expected_generation=current.generation, operation='rebase',
@@ -432,8 +436,16 @@ class ExecutionHandlers:
             snapshot={
                 **(current.snapshot or {}), 'pending': pending,
                 'worker_result': worker_result or (current.snapshot or {}).get('worker_result'),
+                **stage_evidence,
             },
         )
+
+    def _rebase_stage_evidence(self, context):
+        observed = self.effects.agent.capture_git_snapshot(context.worktree)
+        return {
+            'head': observed.head, 'branch': observed.branch,
+            'files': {path: signature for path, (_, signature) in observed.dirty.items()},
+        }
 
     def _post_rebase_observation(self, context, target_oid, output):
         """A successful exit may leave autostash conflicts without rebase metadata."""
@@ -470,8 +482,9 @@ class ExecutionHandlers:
             )
             if not in_progress and not (stash_oid or (current.snapshot or {}).get('stash_oid')):
                 return self._recover(
-                    RecoveryReason.STATUS_FAILED, 'autostash_identity_unavailable',
-                    context=context, attempts=3,
+                    RecoveryReason.OWNERSHIP_UNCERTAIN, 'autostash_identity_unavailable',
+                    context=context,
+                    final_block_reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE,
                 )
         if not unmerged and not in_progress:
             if checkpoint is not None:
@@ -716,12 +729,26 @@ class ExecutionHandlers:
                     and (current.snapshot or {}).get('pending') == 'stage'
                     and (current.snapshot or {}).get('worker_result')
                     and not snapshot.unmerged_stages):
-                # Staging may have completed before its completion marker was
-                # saved. Reuse the accepted correction instead of rerunning
-                # the Worker, including an autostash without rebase metadata.
+                saved_evidence = (current.snapshot or {}).get('stage_evidence')
+                observed_evidence = self._rebase_stage_evidence(context)
+                unstaged = self.effects.workspace.git(
+                    context.worktree, 'diff', '--quiet', check=False,
+                )
+                if unstaged.returncode not in {0, 1}:
+                    return self._recover(RecoveryReason.STATUS_FAILED,
+                                         'stage resume worktree observation failed', context=context)
+                if saved_evidence != observed_evidence or unstaged.returncode:
+                    return self._recover(
+                        RecoveryReason.OWNERSHIP_UNCERTAIN,
+                        'staged rebase correction changed since Worker validation',
+                        context=context,
+                        final_block_reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE,
+                    )
+                # The accepted contents are already staged. Never add files
+                # again when resuming this interrupted boundary.
                 resumed = self._finish_worker(
                     replace(context, resolving_rebase=True), row,
-                    current.snapshot['worker_result'],
+                    current.snapshot['worker_result'], staged=True,
                 )
                 return (resumed.context
                         if resumed.kind is ExecutionOutcomeKind.PHASE_ADVANCED
@@ -809,7 +836,9 @@ class ExecutionHandlers:
             return self._recover(
                 RecoveryReason.OWNERSHIP_UNCERTAIN, decision.reason,
                 context=context,
-                final_block_reason=BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN,
+                final_block_reason=(BlockReasonCode.REPOSITORY_STATE_UNSAFE
+                                    if decision.reason == 'autostash_identity_unavailable'
+                                    else BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN),
             )
         except CheckpointRace:
             return self._recover(RecoveryReason.REMOTE_SNAPSHOT_RACE,
@@ -1846,15 +1875,16 @@ class ExecutionHandlers:
             )
         return self._finish_worker(context, row, message)
 
-    def _finish_worker(self, context, row, message):
+    def _finish_worker(self, context, row, message, *, staged=False):
         assert self.catalog_plan is not None and self.plan is not None
         latest_sha = str(row['active_sha'] or '')
         if context.resolving_rebase:
             self.effects.state.update_project(self.repo, worker_result=message)
-            self._record_rebase_suboperation(
-                context, 'stage', worker_result=message,
-            )
-            self.effects.workspace.git(context.worktree, 'add', '-A')
+            if not staged:
+                self._record_rebase_suboperation(
+                    context, 'stage', worker_result=message,
+                )
+                self.effects.workspace.git(context.worktree, 'add', '-A')
             if self._unmerged_stages(context.worktree):
                 detail = self.effects.contract.REBASE_CONFLICT_PREFIX + 'unmerged index remains after Worker correction'
                 self.effects.state.update_project(self.repo, phase='WORKING', last_error=detail)
@@ -2997,10 +3027,19 @@ class ExecutionHandlers:
         if isinstance(guarded, ExecutionOutcome):
             return guarded
         context = guarded
-        existing_after_push = self.effects.publication.pr_for_branch(
-            self.repo_path, context.branch,
+        after_push = self._publication_resume().observe(
+            self.repo_path, context.worktree, context.branch, head_oid,
         )
+        existing_after_push = after_push.pull_request
         if existing_after_push is not None:
+            if (after_push.local_oid != head_oid
+                    or assess_publication(after_push) is not PublicationNext.ATTACH_PR):
+                return self._block_final(
+                    self.repo, context.worktree,
+                    'push 뒤 PR head가 검증한 게시 commit과 다릅니다.',
+                    str(self._row()['verify_result'] or ''),
+                    reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
+                )
             reconciliation = self.effects.publication.reconcile_existing_pull_request(
                 self.repo_path, self.state_dir, self.repo, self._row(),
                 existing_after_push,

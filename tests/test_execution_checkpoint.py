@@ -101,10 +101,10 @@ class CheckpointAssessmentTests(unittest.TestCase):
         self.assertEqual(decision.action, CheckpointAction.CONFLICT)
         self.assertEqual(decision.phase, 'IMPLEMENTING')
 
-    def test_autostash_without_identity_pauses_before_worker_correction(self):
+    def test_autostash_without_identity_requires_user_before_worker_correction(self):
         actual = snapshot(rebase_intent=True,
                           unmerged_stages=(('app.py', 1, 'blob'),))
-        self.assertEqual(assess(actual).action, CheckpointAction.PAUSE)
+        self.assertEqual(assess(actual).action, CheckpointAction.USER_ACTION)
         self.assertEqual(assess(actual).reason, 'autostash_identity_unavailable')
         self.assertEqual(assess(replace(actual, git_operation='rebase')).action,
                          CheckpointAction.CONFLICT)

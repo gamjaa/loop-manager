@@ -52,6 +52,10 @@ class ExecutionHandlerTests(TestCase):
         self.effects.workspace.branch_has_changes.return_value = True
         self.effects.workspace.git.side_effect = self.git
         self.effects.agent.validate_worker_workspace_scope.return_value = self.plan
+        self.effects.agent.capture_git_snapshot.return_value = SimpleNamespace(
+            head='owned-head', branch='loop-manager/G-047',
+            dirty={'app.py': (('staged',), 'accepted-content')},
+        )
         self.effects.validation.validate_active_execplan_metadata.return_value = self.plan
         self.effects.validation._deserialize_failure_history.return_value = {}
         self.effects.validation.parse_worker_result.return_value = SimpleNamespace(commit_title='Concrete change')
@@ -380,6 +384,10 @@ class ExecutionHandlerTests(TestCase):
         first = self.handler.run(self.context())
         self.assertEqual(first.context.phase, ExecutionPhase.VERIFYING)
         self.assertIsNone(checkpoint.get('repo', 'G-047').operation)
+        self.assertEqual(checkpoint.get('repo', 'G-047').snapshot['stage_evidence'], {
+            'head': 'owned-head', 'branch': 'loop-manager/G-047',
+            'files': {'app.py': 'accepted-content'},
+        })
 
         self.effects.validation.verify.side_effect = lambda _: (False, 'verify failure')
 
@@ -412,7 +420,10 @@ class ExecutionHandlerTests(TestCase):
     def test_staged_autostash_resume_reuses_saved_worker_result(self):
         self._assert_staged_rebase_resume(False)
 
-    def _assert_staged_rebase_resume(self, rebase_metadata):
+    def test_staged_rebase_resume_rejects_added_files(self):
+        self._assert_staged_rebase_resume(True, changed=True)
+
+    def _assert_staged_rebase_resume(self, rebase_metadata, *, changed=False):
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)
         self.handler.effects = self.effects
@@ -424,8 +435,16 @@ class ExecutionHandlerTests(TestCase):
             'repo', 'G-047', expected_generation=0, operation='rebase',
             expected_head='before-head', target_base_oid='base',
             observed_remote_oid=None,
-            snapshot={'pending': 'stage', 'worker_result': 'saved correction'},
+            snapshot={'pending': 'stage', 'worker_result': 'saved correction',
+                      'stage_evidence': {'head': 'owned-head', 'branch': 'loop-manager/G-047',
+                                         'files': {'app.py': 'accepted-content'}}},
         )
+        if changed:
+            self.effects.agent.capture_git_snapshot.return_value = SimpleNamespace(
+                head='owned-head', branch='loop-manager/G-047',
+                dirty={'app.py': (('staged',), 'accepted-content'),
+                       'extra.py': (('untracked',), 'unexpected-content')},
+            )
         def staged_git(path, *args, **kwargs):
             if args == ('diff', '--cached', '--quiet'):
                 return SimpleNamespace(stdout='', returncode=1)
@@ -433,6 +452,15 @@ class ExecutionHandlerTests(TestCase):
         self.effects.workspace.git.side_effect = staged_git
         self.effects.workspace._rebase_in_progress_for_branch.return_value = rebase_metadata
         result = self.handler.recover(self.context())
+        self.effects.agent.run_agent.assert_not_called()
+        self.assertFalse(any(call.args[1:3] == ('add', '-A')
+                             for call in self.effects.workspace.git.call_args_list))
+        if changed:
+            self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+            self.assertEqual(checkpoint.get('repo', 'G-047').operation, 'rebase')
+            self.assertFalse(any('--continue' in call.args
+                                 for call in self.effects.workspace.git.call_args_list))
+            return
         self.assertEqual(result.phase, ExecutionPhase.VERIFYING)
         self.assertEqual(self.state.row()['worker_result'], 'saved correction')
         self.assertEqual(self.state.row()['worker_session_id'], 'saved-session')
@@ -442,7 +470,7 @@ class ExecutionHandlerTests(TestCase):
                          if '--continue' in call.args]
         self.assertEqual(len(continuations), int(rebase_metadata))
 
-    def test_autostash_without_identity_pauses_after_command_and_on_resume(self):
+    def test_autostash_without_identity_blocks_after_command_and_on_resume(self):
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)
         self.handler.effects = self.effects
@@ -462,12 +490,15 @@ class ExecutionHandlerTests(TestCase):
             self.handler._post_rebase_observation(context, 'base', 'completed'),
             self.handler.recover(context),
         ):
-            self.assertEqual(result.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
+            self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
             self.assertEqual(result.detail, 'autostash_identity_unavailable')
         self.effects.agent.run_agent.assert_not_called()
         self.effects.validation.verify.assert_not_called()
         self.effects.publication.push_managed_publication_branch.assert_not_called()
         self.assertEqual(checkpoint.get('repo', 'G-047').operation, 'rebase')
+        self.assertEqual(self.effects.blocking.block_active_execplan.call_count, 2)
+        for call in self.effects.blocking.block_active_execplan.call_args_list:
+            self.assertEqual(call.kwargs['reason'], lm.BlockReasonCode.REPOSITORY_STATE_UNSAFE)
 
     def test_old_pr_head_after_rebase_cannot_attach_or_push(self):
         self.effects.publication.pr_for_branch.return_value = {
@@ -479,6 +510,33 @@ class ExecutionHandlerTests(TestCase):
         self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
         self.effects.publication.reconcile_existing_pull_request.assert_not_called()
         self.effects.publication.push_managed_publication_branch.assert_not_called()
+        self.effects.publication.command.assert_not_called()
+
+    def test_post_push_pr_with_different_head_is_not_attached(self):
+        self._assert_post_push_pr_attachment('other-head', False)
+
+    def test_post_push_pr_with_verified_head_is_attached(self):
+        self._assert_post_push_pr_attachment('base', True)
+
+    def _assert_post_push_pr_attachment(self, pr_head, accepted):
+        self.state.update_project('repo', validated_base_sha='base')
+        self.effects.publication.push_managed_publication_branch.side_effect = (
+            lambda *_: self.calls.append('push') or 'base'
+        )
+        self.effects.workspace.remote_branch_oid.side_effect = (
+            lambda *_: 'base' if 'push' in self.calls else None
+        )
+        self.effects.publication.pr_for_branch.side_effect = lambda *_: (
+            {'url': 'existing', 'state': 'OPEN', 'headRefOid': pr_head,
+             'headRefName': 'loop-manager/G-047'} if 'push' in self.calls else None
+        )
+        self.effects.publication.reconcile_existing_pull_request.return_value = 0
+        result = self.handler.publish(self.context('PUBLISHING'), self.handler)
+        self.assertEqual(result.kind, ExecutionOutcomeKind.SUCCESS if accepted
+                         else ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertEqual(self.effects.publication.reconcile_existing_pull_request.call_count,
+                         int(accepted))
+        self.effects.publication.push_managed_publication_branch.assert_called_once()
         self.effects.publication.command.assert_not_called()
 
     def test_checkpoint_fetch_lock_preserves_intent_and_worker_session(self):

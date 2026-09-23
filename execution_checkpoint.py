@@ -86,7 +86,7 @@ def assess(snapshot: CheckpointSnapshot) -> CheckpointDecision:
             return CheckpointDecision(CheckpointAction.CONFLICT, phase="IMPLEMENTING", reason="rebase_index_conflict")
         if snapshot.rebase_intent:
             if not snapshot.stash_oid:
-                return CheckpointDecision(CheckpointAction.PAUSE, reason="autostash_identity_unavailable")
+                return CheckpointDecision(CheckpointAction.USER_ACTION, reason="autostash_identity_unavailable")
             return CheckpointDecision(CheckpointAction.CONFLICT, phase="IMPLEMENTING", reason="rebase_index_conflict")
         return CheckpointDecision(CheckpointAction.USER_ACTION, reason="unowned_index_conflict")
     if snapshot.git_operation == "rebase":
