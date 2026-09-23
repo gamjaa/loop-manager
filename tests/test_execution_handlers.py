@@ -9,7 +9,12 @@ from execution_revision import DefinitionSnapshot
 import loop_manager as lm
 import runtime_state
 from execution_state import ExecutionStatePort
-from execution_runtime import ExecutionPhase, ExecutionOutcomeKind
+from execution_runtime import (
+    ExecutionPhase,
+    ExecutionPhaseCoordinator,
+    ExecutionOutcome,
+    ExecutionOutcomeKind,
+)
 from tests import test_runtime_state
 
 
@@ -73,7 +78,7 @@ class ExecutionHandlerTests(TestCase):
 
     def git(self, path, *args, **kwargs):
         self.calls.append(args[0])
-        if args[0] == 'rebase':
+        if args[0] == 'rebase' and '--skip' not in args:
             self.assertEqual(self.state.row()['last_error'], lm.REBASE_IN_PROGRESS_ERROR)
         if args[0] == 'commit':
             self.dirty = False
@@ -193,6 +198,131 @@ class ExecutionHandlerTests(TestCase):
         self.assertEqual(row['reviewer_session_id'], 'reviewer-session')
         self.assertEqual(row['branch'], 'loop-manager/G-047')
         self.assertEqual(row['worktree'], '/state/G-047')
+
+    def test_working_body_change_clears_retry_artifacts_before_worker(self):
+        self.handler.guard(self.context())
+        self.state.update_project(
+            'repo',
+            worker_session_id='worker-session',
+            worker_result='previous worker result',
+            verify_result='failed verify result',
+            review_result='previous review result',
+            validated_base_sha='base',
+        )
+        self.effects.revision.body_hash.return_value = 'revised-body'
+
+        guarded = self.handler.guard(self.handler._context())
+
+        self.assertNotIsInstance(guarded, ExecutionOutcome)
+        row = self.state.row()
+        self.assertEqual(row['phase'], 'WORKING')
+        self.assertIsNone(row['worker_result'])
+        self.assertIsNone(row['verify_result'])
+        self.assertIsNone(row['review_result'])
+        self.assertIsNone(row['validated_base_sha'])
+        self.assertEqual(row['worker_session_id'], 'worker-session')
+
+    def test_working_source_change_clears_retry_artifacts_before_worker(self):
+        self.handler.guard(self.context())
+        self.state.update_project(
+            'repo',
+            worker_result='previous worker result',
+            verify_result='failed verify result',
+            worker_input_token='stale-worker-token',
+        )
+        self.effects.revision.source_fingerprint.return_value = 'revised-source'
+
+        guarded = self.handler.guard(self.handler._context())
+
+        self.assertNotIsInstance(guarded, ExecutionOutcome)
+        row = self.state.row()
+        self.assertIsNone(row['worker_result'])
+        self.assertIsNone(row['verify_result'])
+        self.assertIsNone(row['worker_input_token'])
+
+    def test_conflicted_rebase_waits_for_new_dependency_before_worker(self):
+        self.handler.guard(self.context())
+        self.state.update_project(
+            'repo',
+            last_error=lm.REBASE_CONFLICT_PREFIX + 'conflict',
+            worker_session_id='worker-session',
+            worker_result='previous worker result',
+        )
+        self.effects.workspace.is_directory.return_value = True
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        self.effects.revision.unmet_dependencies.return_value = ('G-048',)
+
+        outcome = ExecutionPhaseCoordinator(self.handler).dispatch(
+            self.handler._context()
+        )
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.STABLE_WAIT)
+        self.assertIn('G-048', outcome.detail)
+        self.effects.agent.run_agent.assert_not_called()
+        self.assertNotIn('rebase', self.calls)
+        row = self.state.row()
+        self.assertEqual(row['worker_session_id'], 'worker-session')
+        self.assertEqual(row['worker_result'], 'previous worker result')
+        self.assertTrue(row['last_error'].startswith(lm.REBASE_CONFLICT_PREFIX))
+        self.effects.revision.unmet_dependencies.return_value = ()
+        worker_outcome = ExecutionOutcome(ExecutionOutcomeKind.RETRY)
+        with mock.patch.object(self.handler, 'run', return_value=worker_outcome) as worker:
+            resumed = ExecutionPhaseCoordinator(self.handler).dispatch(
+                self.handler._context()
+            )
+        self.assertIs(resumed, worker_outcome)
+        worker.assert_called_once()
+
+    def test_conflicted_rebase_blocks_new_worker_input_before_worker(self):
+        self.handler.guard(self.context())
+        self.state.update_project(
+            'repo',
+            last_error=lm.REBASE_CONFLICT_PREFIX + 'conflict',
+            worker_session_id='worker-session',
+            worker_result='previous worker result',
+        )
+        self.effects.workspace.is_directory.return_value = True
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        self.effects.revision.body_hash.return_value = 'revised-body'
+
+        outcome = ExecutionPhaseCoordinator(self.handler).dispatch(
+            self.handler._context()
+        )
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.effects.agent.run_agent.assert_not_called()
+        self.effects.blocking.block_active_execplan.assert_called_once()
+        self.assertEqual(
+            self.effects.blocking.block_active_execplan.call_args.kwargs['reason'],
+            lm.BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
+        )
+
+    def test_conflict_resolution_rechecks_new_remote_base_before_verify(self):
+        self.handler.guard(self.context())
+        self.state.update_project(
+            'repo',
+            last_error=lm.REBASE_CONFLICT_PREFIX + 'conflict',
+            worker_session_id='worker-session',
+            worker_result='previous worker result',
+        )
+        self.effects.workspace.is_directory.return_value = True
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        self.remote = 'new-base'
+        guarded = self.handler.guard(self.handler._context())
+        self.assertNotIsInstance(guarded, ExecutionOutcome)
+
+        resolved = self.handler._finish_worker(
+            guarded, self.state.row(), 'resolved worker result'
+        )
+
+        self.assertEqual(resolved.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
+        self.assertEqual(self.state.row()['active_sha'], 'base')
+        self.dirty = False
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = False
+        refreshed = self.handler.guard(self.handler._context())
+        self.assertEqual(refreshed.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(self.state.row()['active_sha'], 'new-base')
+        self.assertEqual(self.calls.count('rebase'), 2)
 
     def test_revision_guard_adopts_legacy_phase_artifacts_without_worker_replay(self):
         self.state.update_project(

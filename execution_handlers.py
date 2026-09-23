@@ -7,7 +7,7 @@ import json
 import sys
 from scoped_blocking import BlockReasonCode
 from execution_revision import (DefinitionSnapshot, RevisionGateKind,
-    StageArtifacts, decide_revision_gate)
+    StageArtifacts, WORKER_INVALIDATING_DELTAS, decide_revision_gate)
 from execution_runtime import (ExecutionContext, ExecutionOutcome, ExecutionOutcomeKind,
     ExecutionPhase, ExecutionPlanMetadata, LatestBaseCheckpoint)
 
@@ -364,6 +364,7 @@ class ExecutionHandlers:
         if target == 'IMPLEMENTING' and (
             decision.kind is RevisionGateKind.INVALIDATE_TO_PHASE
             or str(row['phase']) != 'WORKING'
+            or bool(decision.deltas & WORKER_INVALIDATING_DELTAS)
         ):
             values.update(
                 validated_base_sha=None,
@@ -575,11 +576,6 @@ class ExecutionHandlers:
         """Refresh and reconcile before any phase effect consumes its snapshot."""
 
         self.effects.state.check_context(context)
-        # An in-progress rebase is already pinned to its recorded target. Git
-        # cannot start a second refresh until the same Worker session resolves
-        # or rejects that conflict; the next phase immediately gates again.
-        if context.resolving_rebase:
-            return context
         self.effects.workspace.git(self.repo_path, 'fetch', 'origin')
         latest_sha = self.effects.workspace.git(
             self.repo_path,
@@ -729,18 +725,46 @@ class ExecutionHandlers:
         if decision.kind is RevisionGateKind.FINAL_SAFETY_ERROR:
             return self._revision_error(context, str(decision.detail))
         if decision.kind is RevisionGateKind.WAIT:
-            self._install_revision_state(
-                snapshot,
-                decision,
-                latest_sha,
-                legacy_baseline=legacy_baseline,
-            )
+            # A conflicted rebase cannot accept a second refresh or clear its
+            # recovery marker. Still reconcile dependencies before Worker.
+            if not context.resolving_rebase:
+                self._install_revision_state(
+                    snapshot,
+                    decision,
+                    latest_sha,
+                    legacy_baseline=legacy_baseline,
+                )
             self.effects.events.operation_log(str(decision.detail))
             return ExecutionOutcome(
                 ExecutionOutcomeKind.STABLE_WAIT,
-                context=self._context(),
+                context=context if context.resolving_rebase else self._context(),
                 detail=decision.detail,
             )
+        if context.resolving_rebase:
+            if (
+                (previous is None and not legacy_baseline)
+                or decision.deltas & WORKER_INVALIDATING_DELTAS
+            ):
+                detail = (
+                    'rebase 충돌 복구 중 ExecPlan 구현 입력이 변경되어 기존 '
+                    'Worker 변경과 안전하게 결합할 수 없습니다.'
+                )
+                self.effects.blocking.block_active_execplan(
+                    self.repo,
+                    context.worktree,
+                    detail,
+                    str(row['verify_result'] or ''),
+                    reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
+                )
+                self.effects.events.operation_print(detail, file=sys.stderr)
+                return self._final(detail)
+            # The ongoing Git rebase remains pinned to its original target.
+            # Do not install the new stage state until it has been resolved.
+            self._definition_snapshot = snapshot
+            self.level = self.effects.validation.ensure_worker_level_state(
+                self.repo, self.plan
+            )
+            return self._context()
         if str(row['active_sha'] or '') != latest_sha:
             return self._refresh_revision_base(
                 context,
@@ -979,7 +1003,14 @@ class ExecutionHandlers:
                 )
                 self.effects.events.operation_print(no_change_error, file=sys.stderr)
                 return self._final(no_change_error)
-            latest_sha = str(row['pr_conflict_base_oid']) if int(row['pr_conflict_recovery']) else self.effects.workspace.git(context.worktree, 'rev-parse', f"origin/{self.base}").stdout.strip()
+            # The conflict may have been resolved on an older rebase target
+            # while origin advanced again. Keep the last *proven* base until
+            # the next revision gate can refresh the completed worktree.
+            latest_sha = (
+                str(row['pr_conflict_base_oid'])
+                if int(row['pr_conflict_recovery'])
+                else str(row['active_sha'] or '')
+            )
             self.effects.state.update_project(self.repo, active_sha=latest_sha)
             if self.effects.agent.validate_guidance_publication(
                 self.repo,
