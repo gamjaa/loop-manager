@@ -625,7 +625,7 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         self.assertEqual(second.kind, PlanningOutcomeKind.EXECUTION_READY)
         self.assertEqual(ports.agent.run_count, 1)
 
-    def test_unchanged_specification_activates_ready_before_changed_full_input(self):
+    def test_unchanged_specification_on_new_remote_sha_activates_ready_before_changed_full_input(self):
         ports = FakePorts(
             planning_snapshot(
                 specification_fingerprint="specification",
@@ -633,6 +633,7 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
             )
         )
         ports.git.fingerprint = "new-full"
+        ports.git.remote = "new-base"
         ports.state.schedule_result = SimpleNamespace(
             active=None,
             has_ready=True,
@@ -645,7 +646,85 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         outcome = PlanningLifecycleCoordinator(ports).run(self.context)
 
         self.assertEqual(outcome.kind, PlanningOutcomeKind.EXECUTION_READY)
+        self.assertEqual(outcome.base_sha, "new-base")
         self.assertEqual(ports.agent.run_count, 0)
+
+    def test_new_specification_at_direct_activation_restarts_before_worker(self):
+        ports = FakePorts(
+            planning_snapshot(
+                specification_fingerprint="specification",
+                planning_fingerprint="fingerprint",
+            )
+        )
+        ports.state.schedule_result = SimpleNamespace(
+            active=None,
+            has_ready=True,
+            has_waiting=False,
+            runnable_ready=object(),
+            project_blocked=False,
+        )
+        ports.state.activate_result = object()
+        ports.validation.result = None
+        ports.git.remote = "new-base"
+        ports.git.specification_fingerprints["new-base"] = "new-specification"
+
+        first = PlanningLifecycleCoordinator(ports).run(self.context)
+
+        self.assertEqual(first.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
+        self.assertIsNone(ports.state.snapshot.phase)
+        self.assertEqual(ports.agent.run_count, 0)
+
+        ports.git.head = "new-base"
+        second = PlanningLifecycleCoordinator(ports).run(
+            replace(self.context, base_sha="new-base")
+        )
+
+        self.assertEqual(second.kind, PlanningOutcomeKind.EXECUTION_READY)
+        self.assertEqual(ports.agent.run_count, 1)
+        self.assertEqual(
+            ports.state.snapshot.specification_fingerprint,
+            "new-specification",
+        )
+
+    def test_new_specification_after_planner_success_restarts_before_worker(self):
+        ports = FakePorts(
+            planning_snapshot(
+                specification_fingerprint="old-specification",
+                planning_fingerprint="old-full",
+            )
+        )
+        ports.state.schedule_result = SimpleNamespace(
+            active=None,
+            has_ready=True,
+            has_waiting=False,
+            runnable_ready=object(),
+            project_blocked=False,
+        )
+        ports.state.activate_result = object()
+        ports.validation.result = None
+        ports.git.remote = "new-base"
+        ports.git.specification_fingerprints["new-base"] = "new-specification"
+
+        first = PlanningLifecycleCoordinator(ports).run(self.context)
+
+        self.assertEqual(first.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
+        self.assertIsNone(ports.state.snapshot.phase)
+        self.assertEqual(ports.agent.run_count, 1)
+        self.assertEqual(
+            ports.state.snapshot.specification_fingerprint, "specification"
+        )
+
+        ports.git.head = "new-base"
+        second = PlanningLifecycleCoordinator(ports).run(
+            replace(self.context, base_sha="new-base")
+        )
+
+        self.assertEqual(second.kind, PlanningOutcomeKind.EXECUTION_READY)
+        self.assertEqual(ports.agent.run_count, 2)
+        self.assertEqual(
+            ports.state.snapshot.specification_fingerprint,
+            "new-specification",
+        )
 
     def test_no_runnable_fallback_plans_once_then_stably_waits(self):
         ports = FakePorts(
