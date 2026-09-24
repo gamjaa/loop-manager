@@ -1,6 +1,7 @@
 """Run the real phase policies with in-memory state and fake external effects."""
 from dataclasses import fields, replace
 from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 from unittest import TestCase, mock
 
@@ -20,6 +21,7 @@ from execution_runtime import (
     ExecutionOutcomeKind,
 )
 from tests import test_runtime_state
+from tests.test_guidance_approval import guidance_plan
 from worker_session import SessionBinding, SessionTransition
 
 
@@ -191,50 +193,106 @@ class ExecutionHandlerTests(TestCase):
             self.handler.run(self.context())
         self.assertIn('bad format', self.effects.agent.run_agent.call_args.args[5])
 
-    def test_guidance_result_keeps_worker_scope_until_block_is_recorded(self):
-        self.state.update_project(
-            'repo', agent_role='worker', agent_snapshot='worker-start',
-            worker_session_id='saved-session',
+    def _prepare_pending_guidance(self, *, implementation_changes):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        worktree = Path(directory.name)
+        plan_path = self.handler.catalog_plan['path']
+        document_path = worktree / plan_path
+        document_path.parent.mkdir(parents=True)
+        document_path.write_text(
+            guidance_plan().replace('G-020', 'G-047'), encoding='utf-8',
         )
+        (worktree / 'AGENTS.md').write_text('# Agents\n', encoding='utf-8')
+        before = lm.GitSnapshot(
+            head='owned-head', branch='loop-manager/G-047', index={}, dirty={},
+            refs={}, worktrees={}, config={}, operations={},
+        )
+        dirty = {plan_path: (('unstaged',), 'proposal-content')}
+        if implementation_changes:
+            dirty.update({
+                'app.py': (('unstaged',), 'implementation-content'),
+                'tests/test_app.py': (('untracked',), 'test-content'),
+            })
+        after = replace(before, dirty=dirty)
+        self.connection.execute(lm.GUIDANCE_APPROVALS_SCHEMA)
+        self.state.update_project(
+            'repo', worktree=str(worktree), agent_role='worker',
+            agent_snapshot=before.serialize(), worker_session_id='saved-session',
+        )
+        self.effects.agent.inspect_worker_guidance_result.side_effect = self.state.bind(
+            lm.inspect_worker_guidance_result, connected=True, mutates=True,
+        )
+        # Scope clearing must really mutate state so an ordering regression is
+        # visible after the real guidance transaction persists the block.
+        self.effects.agent.clear_agent_scope.side_effect = self.state.bind(
+            lm.clear_agent_scope, connected=True, mutates=True,
+        )
+        self.effects.agent.capture_git_snapshot.return_value = after
+        self.handler.catalog_plan = self.repository.active_row('repo')
+        return worktree, before, after
 
-        def inspect(*_args):
-            self.effects.agent.clear_agent_scope.assert_not_called()
-            row = self.state.row()
-            self.assertEqual(row['agent_role'], 'worker')
-            self.assertEqual(row['agent_snapshot'], 'worker-start')
-            self.assertEqual(row['worker_session_id'], 'session')
-            return True
-
-        self.effects.agent.inspect_worker_guidance_result.side_effect = inspect
-        self.handler.run(self.context())
-
-        self.effects.agent.inspect_worker_guidance_result.assert_called_once()
+    def _assert_pending_guidance(self, result, worktree, before, after, session):
+        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        projected = self.repository.projected('repo')
+        self.assertEqual(projected.status, 'PLAN_BLOCKED')
+        self.assertEqual(projected.agent_role, 'worker')
+        self.assertEqual(projected.agent_snapshot, before.serialize())
+        self.assertEqual(projected.agent_result_snapshot, after.serialize())
+        blocked = self.connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = 'repo' AND plan_id = 'G-047'",
+        ).fetchone()
+        self.assertEqual(blocked['status'], 'PLAN_BLOCKED')
+        self.assertEqual(blocked['blocked_reason'], lm.GUIDANCE_BLOCK_REASON)
+        self.assertEqual(blocked['agent_role'], 'worker')
+        self.assertEqual(blocked['agent_snapshot'], before.serialize())
+        self.assertEqual(blocked['agent_result_snapshot'], after.serialize())
+        self.assertEqual(blocked['worker_session_id'], session)
+        self.assertEqual(blocked['branch'], before.branch)
+        self.assertEqual(blocked['worktree'], str(worktree))
+        approval = self.connection.execute(
+            "SELECT * FROM guidance_approvals WHERE repo = 'repo' AND plan_id = 'G-047'",
+        ).fetchone()
+        self.assertEqual(approval['proposal_id'], 'worker-rule')
+        self.assertFalse(approval['applied'])
+        self.assertFalse(approval['decision_hash'])
+        self.assertEqual((worktree / 'AGENTS.md').read_text(), '# Agents\n')
+        self.assertIn('Decision: `pending`', (worktree / blocked['path']).read_text())
         self.effects.agent.clear_agent_scope.assert_not_called()
         self.effects.validation.verify.assert_not_called()
         self.effects.publication.push_managed_publication_branch.assert_not_called()
+        self.effects.publication.command.assert_not_called()
+
+    def test_guidance_result_keeps_worker_scope_until_block_is_recorded(self):
+        worktree, before, after = self._prepare_pending_guidance(
+            implementation_changes=True,
+        )
+        with (
+            mock.patch.object(lm, 'capture_git_snapshot', return_value=after),
+            mock.patch.object(lm, 'is_loop_manager_repository', return_value=False),
+        ):
+            result = self.handler.run(self.context())
+        self._assert_pending_guidance(result, worktree, before, after, 'session')
+        self.assertEqual(self.repository.get('repo', 'G-047').worker_result, 'result')
+        self.effects.agent.validate_worker_workspace_scope.assert_called_once()
 
     def test_saved_rebase_guidance_result_keeps_worker_scope(self):
-        self.state.update_project(
-            'repo', agent_role='worker', agent_snapshot='rebase-worker-start',
-            worker_session_id='saved-session',
+        worktree, before, after = self._prepare_pending_guidance(
+            implementation_changes=False,
         )
-
-        def inspect(*_args):
-            self.effects.agent.clear_agent_scope.assert_not_called()
-            self.assertEqual(self.state.row()['agent_snapshot'], 'rebase-worker-start')
-            return True
-
-        self.effects.agent.inspect_worker_guidance_result.side_effect = inspect
         saved = SimpleNamespace(
             scope_marker='accepted', worker_code=0, worker_result='proposal',
         )
-        self.handler._resume_saved_rebase_worker(
-            self.context(), saved, SimpleNamespace(progress='accepted'),
-        )
-
-        self.effects.agent.inspect_worker_guidance_result.assert_called_once()
-        self.effects.agent.clear_agent_scope.assert_not_called()
-        self.effects.validation.verify.assert_not_called()
+        with (
+            mock.patch.object(lm, 'capture_git_snapshot', return_value=after),
+            mock.patch.object(lm, 'is_loop_manager_repository', return_value=False),
+        ):
+            result = self.handler._resume_saved_rebase_worker(
+                self.context(), saved, SimpleNamespace(progress='accepted'),
+            )
+        self._assert_pending_guidance(result, worktree, before, after, 'saved-session')
+        self.assertEqual(self.repository.get('repo', 'G-047').worker_result, 'proposal')
+        self.effects.agent.run_agent.assert_not_called()
 
     def test_timeout_prompt_requests_cause_check_and_progress_evidence(self):
         prompt = lm.worker_prompt(
