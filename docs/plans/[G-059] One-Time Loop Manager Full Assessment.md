@@ -6,6 +6,7 @@ sources:
 depends_on:
   - G-051
   - G-058
+  - G-076
 complexity: medium
 risk: medium
 priority: normal
