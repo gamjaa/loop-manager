@@ -337,6 +337,66 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
         )
 
 
+def enqueue_persistent_execution_failure_events(
+    connection: sqlite3.Connection, repo: str,
+) -> None:
+    """Queue one actionable notice for each eligible external-run streak.
+
+    The recovery projection is retained even when Telegram is disabled.  The
+    outbox is intentionally populated only for an enabled notification session,
+    matching the established behaviour for all other project events.
+    """
+
+    exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'persistent_execution_failures'"
+    ).fetchone()
+    if exists is None or not _enabled(connection):
+        return
+    ensure_schema(connection)
+    project = connection.execute(
+        "SELECT 1 FROM projects WHERE repo = ?", (repo,)
+    ).fetchone()
+    if project is None:
+        return
+    rows = connection.execute(
+        "SELECT * FROM persistent_execution_failures WHERE repo = ? "
+        "AND active = 1 AND notification_eligible = 1 "
+        "AND notification_queued = 0 AND suppressed_by_block = 0 "
+        "ORDER BY subject",
+        (repo,),
+    ).fetchall()
+    for row in rows:
+        subject = str(row["subject"])
+        plan_id = None if subject == "__project__" else subject
+        identity = "\0".join((subject, str(row["episode"]), str(row["phase"]),
+                              str(row["reason_code"]), str(row["fingerprint"])))
+        payload = {
+            "project": Path(repo).name or repo,
+            "stage": str(row["phase"]),
+            "scope": "execution",
+            "execplan_id": plan_id,
+            "reason_code": str(row["reason_code"]),
+            "cause": str(row["detail"]),
+            "consecutive_external_runs": int(row["consecutive_runs"]),
+            "recovery_attempts": json.loads(str(row["recovery_attempts"])),
+            "required_action": (
+                "Review the structured failure and fix the reported "
+                "configuration, permission, or repository condition."
+            ),
+        }
+        _insert(
+            connection, _key("persistent_failure", repo, identity), repo,
+            "persistent_execution_failure", payload,
+        )
+        connection.execute(
+            "UPDATE persistent_execution_failures SET notification_queued = 1, "
+            "updated_at = CURRENT_TIMESTAMP WHERE repo = ? AND subject = ? "
+            "AND episode = ? AND notification_eligible = 1",
+            (repo, subject, int(row["episode"])),
+        )
+
+
 def record_merged_plan(
     connection: sqlite3.Connection, repo: str, plan_id: str, title: str
 ) -> None:
@@ -481,6 +541,22 @@ def _message(kind: str, payload: dict[str, object]) -> str:
             + (f"\nQuestion: {payload['specification_deadlock']['question']}"
                if payload.get('specification_deadlock') else "")
             + checkpoint_text
+        )
+    if kind == "persistent_execution_failure":
+        subject = payload.get("execplan_id") or "project"
+        attempts = payload.get("recovery_attempts")
+        attempt_text = ""
+        if isinstance(attempts, dict) and attempts:
+            attempt_text = "\nRecovery attempts: " + ", ".join(
+                f"{reason}: {count}" for reason, count in sorted(attempts.items())
+            )
+        return (
+            f"[{payload['project']}] Persistent execution failure "
+            f"({payload['stage']}: {subject})\n"
+            f"Reason: {payload['reason_code']}\n{payload['cause']}"
+            f"\nConsecutive external runs: {payload['consecutive_external_runs']}"
+            + attempt_text
+            + f"\nAction: {payload['required_action']}"
         )
     return (
         f"[{payload['project']}] Project complete\nLast completed work: "

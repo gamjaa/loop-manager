@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -62,6 +63,109 @@ class RecoveryRepositoryTests(unittest.TestCase):
         self.assertEqual(record.decision.action, RecoveryAction.PAUSE)
         self.assertEqual(self.repository.row("repo", "G-042")["pending_action"], "pause")
         self.assertIsNone(record.final_evidence)
+
+    def test_external_runs_count_once_and_reset_on_progress_or_success(self):
+        def observe_run(observation, repeats=1):
+            before = self.repository.external_run_snapshot("repo")
+            for _ in range(repeats):
+                self.repository.observe(observation)
+            self.repository.observe_external_run("repo", before)
+
+        failure = RecoveryObservation(
+            RecoveryReason.FETCH_FAILED, "repo", "G-042", "PUBLISHING",
+            "plan-sha", "base-sha", "fetch-failure", "head-a", "fetch failed",
+        )
+        observe_run(failure, repeats=3)
+        first = self.connection.execute(
+            "SELECT consecutive_runs, notification_eligible FROM "
+            "persistent_execution_failures WHERE repo = 'repo' AND subject = 'G-042'"
+        ).fetchone()
+        self.assertEqual(tuple(first), (1, 0))
+
+        observe_run(failure)
+        observe_run(failure)
+        third = self.connection.execute(
+            "SELECT consecutive_runs, notification_eligible FROM "
+            "persistent_execution_failures WHERE repo = 'repo' AND subject = 'G-042'"
+        ).fetchone()
+        self.assertEqual(tuple(third), (3, 1))
+
+        observe_run(RecoveryObservation(
+            RecoveryReason.FETCH_FAILED, "repo", "G-042", "PUBLISHING",
+            "plan-sha", "base-sha", "fetch-failure", "head-b", "fetch failed",
+        ))
+        progressed = self.connection.execute(
+            "SELECT consecutive_runs, notification_eligible FROM "
+            "persistent_execution_failures WHERE repo = 'repo' AND subject = 'G-042'"
+        ).fetchone()
+        self.assertEqual(tuple(progressed), (1, 0))
+
+        before_success = self.repository.external_run_snapshot("repo")
+        self.repository.observe_external_run("repo", before_success)
+        resolved = self.connection.execute(
+            "SELECT active, consecutive_runs FROM persistent_execution_failures "
+            "WHERE repo = 'repo' AND subject = 'G-042'"
+        ).fetchone()
+        self.assertEqual(tuple(resolved), (0, 0))
+
+    def test_final_block_is_suppressed_from_persistent_notification(self):
+        before = self.repository.external_run_snapshot("repo")
+        self.repository.observe(RecoveryObservation(
+            RecoveryReason.GUIDANCE_APPROVAL_REQUIRED, "repo", "G-042",
+            "IMPLEMENTING", "plan-sha", "base-sha", "guidance", "head-a",
+            "decision pending",
+        ))
+        self.repository.observe_external_run(
+            "repo", before, blocked_subjects=frozenset({"G-042"}),
+        )
+        row = self.connection.execute(
+            "SELECT notification_eligible, suppressed_by_block FROM "
+            "persistent_execution_failures WHERE repo = 'repo' AND subject = 'G-042'"
+        ).fetchone()
+        self.assertEqual(tuple(row), (0, 1))
+
+    def test_external_failure_streak_survives_database_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "state.db"
+            observation = RecoveryObservation(
+                RecoveryReason.FETCH_FAILED, "repo", "G-042", "PUBLISHING",
+                "plan-sha", "base-sha", "fetch-failure", "head-a", "fetch failed",
+            )
+            for _ in range(3):
+                connection = sqlite3.connect(database)
+                connection.row_factory = sqlite3.Row
+                repository = RecoveryRepository(connection)
+                before = repository.external_run_snapshot("repo")
+                repository.observe(observation)
+                repository.observe_external_run("repo", before)
+                connection.commit()
+                connection.close()
+
+            connection = sqlite3.connect(database)
+            row = connection.execute(
+                "SELECT consecutive_runs, notification_eligible FROM "
+                "persistent_execution_failures WHERE repo = 'repo' AND subject = 'G-042'"
+            ).fetchone()
+            connection.close()
+        self.assertEqual(tuple(row), (3, 1))
+
+    def test_external_failure_projection_supports_tuple_rows(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        repository = RecoveryRepository(connection)
+        before = repository.external_run_snapshot("repo")
+        repository.observe(RecoveryObservation(
+            RecoveryReason.FETCH_FAILED, "repo", None, "WORKING", None,
+            "base-sha", "fetch-failure", "head-a", "fetch failed",
+        ))
+
+        repository.observe_external_run("repo", before)
+
+        row = connection.execute(
+            "SELECT consecutive_runs, notification_eligible FROM "
+            "persistent_execution_failures WHERE repo = 'repo' AND subject = '__project__'"
+        ).fetchone()
+        self.assertEqual(row, (1, 0))
 
     def test_validation_success_resets_only_its_correction_streak(self):
         connection = test_runtime_state.RuntimeStateRepositoryTest()._connection()

@@ -17086,5 +17086,44 @@ class ExecPlanArchiveHousekeepingAdapterTest(unittest.TestCase):
         connection.close()
 
 
+class PersistentExecutionFailureBoundaryTest(unittest.TestCase):
+    def test_scheduler_invocations_enqueue_only_the_third_unchanged_failure(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        repo = str(Path("persistent-failure-repo").resolve())
+        connection.execute(loop_manager.SCHEMA)
+        loop_manager._ensure_execplans_schema(connection)
+        connection.execute(
+            "INSERT INTO projects (repo, base_branch, phase) VALUES (?, 'main', 'WORKING')",
+            (repo,),
+        )
+        loop_manager.notifications.configure_session(connection, enabled=True)
+        connection.commit()
+
+        def failed_step(*_args, **_kwargs):
+            from recovery_runtime import RecoveryObservation, RecoveryReason
+            from recovery_state import RecoveryRepository
+
+            RecoveryRepository(connection).observe(RecoveryObservation(
+                RecoveryReason.FETCH_FAILED, repo, None, "WORKING", None,
+                "base-sha", "fetch-failure", "head-a", "fetch failed",
+            ))
+            return loop_manager.PROJECT_STEP_TRANSIENT_PAUSE
+
+        with mock.patch("loop_manager._run_project_step", side_effect=failed_step):
+            for expected_events in (0, 0, 1):
+                outcome = loop_manager.run_project_result(
+                    connection, Path("/unused-state"), repo, Path("/unused.ini"),
+                    "main", False,
+                )
+                self.assertEqual(outcome.kind, loop_manager.ProjectRunKind.TRANSIENT_PAUSE)
+                events = connection.execute(
+                    "SELECT event_type FROM notification_outbox WHERE repo = ?",
+                    (repo,),
+                ).fetchall()
+                self.assertEqual(len(events), expected_events)
+
+
 if __name__ == "__main__":
     unittest.main()

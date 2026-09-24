@@ -18441,7 +18441,78 @@ def _record_project_recovery(
         ).decision
 
 
+def _blocked_recovery_subjects(
+    connection: sqlite3.Connection, repo: str,
+) -> frozenset[str]:
+    """Return subjects whose final BLOCKED event owns this failure instead."""
+
+    tables = {
+        str(row[0]) for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name IN ('execplan_blocks', 'project_blocks')"
+        )
+    }
+    subjects: set[str] = set()
+    if "execplan_blocks" in tables:
+        subjects.update(
+            str(row[0]) for row in connection.execute(
+                "SELECT plan_id FROM execplan_blocks WHERE repo = ?", (repo,)
+            )
+        )
+    if "project_blocks" in tables:
+        subjects.update(
+            str(row[0]) if row[0] is not None else "__project__"
+            for row in connection.execute(
+                "SELECT plan_id FROM project_blocks WHERE repo = ?", (repo,)
+            )
+        )
+    return frozenset(subjects)
+
+
 def run_project_result(
+    connection: sqlite3.Connection,
+    state_dir: Path,
+    repo_arg: str,
+    config_path: Path,
+    requested_base: str | None,
+    allow_agents_mismatch: bool,
+    requested_provider: str | None = None,
+    *,
+    registered_only: bool = False,
+    planner_mutex: threading.Lock | None = None,
+    refactoring_review_interval: int = 5,
+    verify_timeout_seconds: int = 600,
+    on_step_completed: Callable[[], None] | None = None,
+    runtime_mutation: RuntimeMutation | None = None,
+) -> ProjectRunResult:
+    """Run one scheduler invocation and project its external failure outcome."""
+
+    repo = str(Path(repo_arg).expanduser().resolve())
+    if not getattr(connection, "execplans_schema_ready", False):
+        recovery_state.ensure_schema(connection)
+    recovery_repository = recovery_state.RecoveryRepository(connection)
+    recovery_before = recovery_repository.external_run_snapshot(repo)
+    try:
+        return _run_project_result(
+            connection, state_dir, repo_arg, config_path, requested_base,
+            allow_agents_mismatch, requested_provider,
+            registered_only=registered_only, planner_mutex=planner_mutex,
+            refactoring_review_interval=refactoring_review_interval,
+            verify_timeout_seconds=verify_timeout_seconds,
+            on_step_completed=on_step_completed, runtime_mutation=runtime_mutation,
+        )
+    finally:
+        # This executes once regardless of in-process retry count.  It neither
+        # changes execution state nor affects the bounded recovery decision.
+        with connection:
+            recovery_repository.observe_external_run(
+                repo, recovery_before,
+                blocked_subjects=_blocked_recovery_subjects(connection, repo),
+            )
+            notifications.enqueue_persistent_execution_failure_events(connection, repo)
+
+
+def _run_project_result(
     connection: sqlite3.Connection,
     state_dir: Path,
     repo_arg: str,

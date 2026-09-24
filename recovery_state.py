@@ -37,6 +37,28 @@ CREATE TABLE IF NOT EXISTS recovery_records (
 )
 """
 
+PERSISTENT_FAILURE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS persistent_execution_failures (
+    repo TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    episode INTEGER NOT NULL DEFAULT 1,
+    phase TEXT NOT NULL,
+    reason_code TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    progress_marker TEXT NOT NULL,
+    consecutive_runs INTEGER NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 0,
+    notification_eligible INTEGER NOT NULL DEFAULT 0,
+    notification_queued INTEGER NOT NULL DEFAULT 0,
+    suppressed_by_block INTEGER NOT NULL DEFAULT 0,
+    detail TEXT NOT NULL DEFAULT '',
+    recovery_attempts TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    resolved_at TEXT,
+    PRIMARY KEY (repo, subject)
+)
+"""
+
 
 def block_user_targets(
     connection: sqlite3.Connection,
@@ -69,6 +91,7 @@ def block_user_targets(
 
 def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.execute(SCHEMA)
+    connection.execute(PERSISTENT_FAILURE_SCHEMA)
     columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(recovery_records)")}
     if "recovery_counts" not in columns:
         connection.execute(
@@ -207,6 +230,119 @@ class RecoveryRepository:
             "DELETE FROM recovery_records WHERE repo = ? AND subject = ?",
             (repo, self._subject(plan_id)),
         )
+
+    def external_run_snapshot(self, repo: str) -> dict[str, int]:
+        """Capture recovery generations before one scheduler invocation."""
+
+        return {
+            str(row[0]): int(row[1])
+            for row in self.connection.execute(
+                "SELECT subject, generation FROM recovery_records WHERE repo = ?",
+                (repo,),
+            )
+        }
+
+    def observe_external_run(
+        self,
+        repo: str,
+        before: dict[str, int],
+        *,
+        blocked_subjects: frozenset[str] = frozenset(),
+    ) -> None:
+        """Count at most one unresolved structured failure per scheduler run.
+
+        Recovery records intentionally count in-process retries.  This separate
+        projection is the scheduler boundary: a generation changed during this
+        invocation is one real external execution, while untouched rows are
+        resolved and cannot extend a later streak.
+        """
+
+        changed = {
+            str(row[0]): row
+            for row in self.connection.execute(
+                "SELECT subject, generation, phase, reason_code, fingerprint, "
+                "progress_marker, disposition, recovery_counts, detail "
+                "FROM recovery_records WHERE repo = ?", (repo,)
+            )
+            if int(row[1]) > before.get(str(row[0]), 0)
+        }
+        current = {
+            str(row[0]): row
+            for row in self.connection.execute(
+                "SELECT subject, episode, phase, reason_code, fingerprint, "
+                "progress_marker, consecutive_runs, active, notification_queued "
+                "FROM persistent_execution_failures WHERE repo = ?",
+                (repo,),
+            )
+        }
+
+        for subject, row in changed.items():
+            previous = current.get(subject)
+            same_cause = (
+                previous is not None
+                and bool(previous[7])
+                and str(previous[2]) == str(row[2])
+                and str(previous[3]) == str(row[3])
+                and str(previous[4]) == str(row[4])
+                and str(previous[5]) == str(row[5])
+            )
+            episode = int(previous[1]) if same_cause else (
+                int(previous[1]) + 1 if previous is not None else 1
+            )
+            consecutive_runs = (
+                int(previous[6]) + 1 if same_cause else 1
+            )
+            is_blocked = subject in blocked_subjects
+            eligible = (
+                not is_blocked
+                and (
+                    consecutive_runs >= 3
+                    or str(row[6]) == "user_action_required"
+                )
+            )
+            attempts = str(row[7])
+            if previous is None:
+                self.connection.execute(
+                    "INSERT INTO persistent_execution_failures "
+                    "(repo, subject, episode, phase, reason_code, fingerprint, "
+                    "progress_marker, consecutive_runs, active, "
+                    "notification_eligible, notification_queued, "
+                    "suppressed_by_block, detail, recovery_attempts) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 0, ?, ?, ?)",
+                    (
+                        repo, subject, episode, row[2], row[3], row[4], row[5],
+                        consecutive_runs, int(eligible), int(is_blocked),
+                        row[8], attempts,
+                    ),
+                )
+            else:
+                self.connection.execute(
+                    "UPDATE persistent_execution_failures SET "
+                    "episode = ?, phase = ?, reason_code = ?, fingerprint = ?, "
+                    "progress_marker = ?, consecutive_runs = ?, active = 1, "
+                    "notification_eligible = ?, notification_queued = CASE "
+                    "WHEN ? THEN notification_queued ELSE 0 END, "
+                    "suppressed_by_block = ?, detail = ?, recovery_attempts = ?, "
+                    "updated_at = CURRENT_TIMESTAMP, resolved_at = NULL "
+                    "WHERE repo = ? AND subject = ?",
+                    (
+                        episode, row[2], row[3], row[4], row[5],
+                        consecutive_runs, int(eligible), int(same_cause),
+                        int(is_blocked), row[8], attempts, repo, subject,
+                    ),
+                )
+
+        for subject, previous in current.items():
+            if subject in changed or not bool(previous[7]):
+                continue
+            self.connection.execute(
+                "UPDATE persistent_execution_failures SET active = 0, "
+                "consecutive_runs = 0, notification_eligible = 0, "
+                "notification_queued = 0, suppressed_by_block = 0, "
+                "updated_at = CURRENT_TIMESTAMP, resolved_at = CURRENT_TIMESTAMP "
+                "WHERE repo = ? AND subject = ?",
+                (repo, subject),
+            )
 
     def clear_correction_occurrences(
         self, repo: str, plan_id: str, fingerprints: tuple[str, ...],
