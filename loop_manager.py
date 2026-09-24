@@ -451,6 +451,7 @@ class RuntimeMutation:
     commit_sha: str
     mutation_id: str | None
     legacy: bool = False
+    registration_lock_reason: str | None = None
 
 
 class GitLockError(RuntimeError):
@@ -1026,6 +1027,59 @@ def _runtime_catalog_record(source: Path, runtime: Path) -> dict[str, str | bool
     raise WorkspaceOwnershipError(f"runtime Git worktree 등록이 없습니다: {runtime}")
 
 
+def _validate_runtime_lock_origin(
+    state_dir: Path, source: Path, runtime: Path, sha: str, lock_reason: object,
+) -> None:
+    prefix = "loop-manager-runtime:"
+    if not isinstance(lock_reason, str) or not lock_reason.startswith(prefix):
+        raise RuntimeError("runtime 잠금 소유권을 확인할 수 없습니다.")
+    prior_created, prior_lock = _read_runtime_intent(
+        state_dir, lock_reason.removeprefix(prefix), source, runtime, sha,
+    )
+    if not prior_created or prior_lock != lock_reason:
+        raise RuntimeError("runtime 등록 증거가 유효하지 않습니다.")
+
+
+def _validated_runtime_registration_marker(
+    source: Path,
+    state_dir: Path,
+    runtime: Path,
+    sha: str,
+    mutation_id: str | None,
+    *,
+    legacy: bool,
+    record_legacy_adoption: bool = False,
+) -> str | None:
+    """Verify the catalog marker against durable intent without changing Git."""
+    lock_reason = _runtime_catalog_record(source, runtime).get("locked")
+    if legacy:
+        if lock_reason is None:
+            if record_legacy_adoption:
+                _record_legacy_runtime_adoption(state_dir, source, runtime, sha)
+            else:
+                _validate_legacy_runtime_adoption(state_dir, source, runtime, sha)
+            return None
+        _validate_runtime_lock_origin(state_dir, source, runtime, sha, lock_reason)
+        return lock_reason
+
+    if mutation_id is None:
+        raise RuntimeError("runtime mutation ID가 없습니다.")
+    created, expected_lock_reason = _read_runtime_intent(
+        state_dir, mutation_id, source, runtime, sha,
+    )
+    if lock_reason != expected_lock_reason:
+        raise RuntimeError("runtime 등록의 durable mutation 표식이 다릅니다.")
+    if created and expected_lock_reason != f"loop-manager-runtime:{mutation_id}":
+        raise RuntimeError("runtime 등록의 durable mutation ID가 다릅니다.")
+    if not created and expected_lock_reason is None:
+        _validate_legacy_runtime_adoption(state_dir, source, runtime, sha)
+    elif not created:
+        _validate_runtime_lock_origin(
+            state_dir, source, runtime, sha, expected_lock_reason,
+        )
+    return lock_reason
+
+
 def prepare_runtime_worktree(
     source: Path, state_dir: Path, *, mutation_id: str | None = None,
 ) -> RuntimeWorktree:
@@ -1225,40 +1279,19 @@ def validate_runtime_mutation(
         if identity != f"runtime:{mutation_id}":
             raise RuntimeError("runtime mutation ID와 부모 process lock이 다릅니다.")
         legacy = False
-        created, expected_lock_reason = _read_runtime_intent(
-            state_dir, mutation_id, source, runtime, sha,
-        )
     origin_sha = git(source, "rev-parse", "--verify", "refs/remotes/origin/main^{commit}").stdout.strip()
     if origin_sha != sha:
         raise RuntimeError(f"runtime SHA가 현재 origin/main과 다릅니다: {sha} (origin/main {origin_sha})")
     validate_runtime_worktree(source, state_dir, runtime, sha)
-    if legacy:
-        record = _runtime_catalog_record(source, runtime)
-        lock_reason = record.get("locked")
-        if lock_reason:
-            prefix = "loop-manager-runtime:"
-            if not isinstance(lock_reason, str) or not lock_reason.startswith(prefix):
-                raise RuntimeError("구버전 runtime 잠금 소유권을 확인할 수 없습니다.")
-            prior_created, prior_lock = _read_runtime_intent(
-                state_dir, lock_reason.removeprefix(prefix), source, runtime, sha,
-            )
-            if not prior_created or prior_lock != lock_reason:
-                raise RuntimeError("구버전 runtime 등록 증거가 유효하지 않습니다.")
-        else:
-            _record_legacy_runtime_adoption(state_dir, source, runtime, sha)
-    if not legacy:
-        record = _runtime_catalog_record(source, runtime)
-        if record.get("locked") != expected_lock_reason:
-            raise RuntimeError("runtime 등록의 durable mutation 표식이 다릅니다.")
-        if created and expected_lock_reason != f"loop-manager-runtime:{mutation_id}":
-            raise RuntimeError("runtime 등록의 durable mutation ID가 다릅니다.")
-        if not created and expected_lock_reason is None:
-            _validate_legacy_runtime_adoption(state_dir, source, runtime, sha)
+    lock_reason = _validated_runtime_registration_marker(
+        source, state_dir, runtime, sha, mutation_id,
+        legacy=legacy, record_legacy_adoption=True,
+    )
     operation_log(
         f"runtime mutation 검증: path={runtime} sha={sha} "
         f"mode={'legacy' if legacy else 'owned'}"
     )
-    return RuntimeMutation(source, runtime, sha, mutation_id, legacy)
+    return RuntimeMutation(source, runtime, sha, mutation_id, legacy, lock_reason)
 
 class StateConnection(sqlite3.Connection):
     """Keep completed schema initialization local to one database connection."""
@@ -12015,6 +12048,15 @@ def validate_persisted_agent_scope(
                 runtime_mutation.source, state_dir,
                 runtime_mutation.path, runtime_mutation.commit_sha,
             )
+            current_lock_reason = _validated_runtime_registration_marker(
+                runtime_mutation.source, state_dir,
+                runtime_mutation.path, runtime_mutation.commit_sha,
+                runtime_mutation.mutation_id, legacy=runtime_mutation.legacy,
+            )
+            if current_lock_reason != runtime_mutation.registration_lock_reason:
+                raise WorkspaceOwnershipError(
+                    "runtime 등록의 잠금 표식이 자식 시작 이후 변경됐습니다."
+                )
         except RuntimeError as error:
             raise AgentScopeError(f"runtime mutation 검증 실패: {error}") from error
         manager_runtime = (
