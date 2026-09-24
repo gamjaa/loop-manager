@@ -13957,6 +13957,338 @@ def resume_project_block_if_safe(
     return True
 
 
+def _remote_checkpoint_input_identity(
+    blocked: sqlite3.Row, snapshot: GitSnapshot | None,
+    ignored_paths: tuple[str, ...] = (),
+) -> str:
+    payload = (
+        str(blocked["blocked_reason"] or ""),
+        str(blocked["blocked_fingerprint"] or ""),
+        str(blocked["blocked_worktree_fingerprint"] or ""),
+        snapshot.serialize() if snapshot is not None else "unavailable",
+        ignored_paths,
+    )
+    return hashlib.sha256(json.dumps(payload).encode()).hexdigest()
+
+
+def _remote_checkpoint_refusal(
+    connection: sqlite3.Connection,
+    repository: blocked_checkpoint_state.BlockedCheckpointRepository,
+    request: blocked_checkpoint.CheckpointRequest,
+    row: sqlite3.Row,
+    oid: str | None,
+    input_identity: str,
+    reason: str,
+    *, retryable: bool = False,
+) -> None:
+    if (
+        row["inspected_remote_oid"] == oid
+        and row["inspected_input"] == input_identity
+        and row["inspection_reason"] == reason
+    ):
+        return
+    with runtime_state._transaction(connection):
+        repository.record_remote_refusal(
+            request, oid, input_identity, reason, commit=False,
+            retryable=retryable,
+        )
+        runtime_state.RuntimeStateRepository(connection).transition(
+            request.repo, request.plan_id,
+            plan_values={"last_error": reason},
+            project_values={"last_error": reason},
+            enqueue=False,
+        )
+        connection.execute(
+            "UPDATE execplan_blocks SET evidence = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE repo = ? AND plan_id = ?",
+            (reason, request.repo, request.plan_id),
+        )
+        notifications.enqueue_current_project_events(connection, request.repo)
+
+
+def _resume_remote_corrected_execplan(
+    connection: sqlite3.Connection, repo: str, plan: sqlite3.Row,
+    repository: blocked_checkpoint_state.BlockedCheckpointRepository,
+    request: blocked_checkpoint.CheckpointRequest,
+    candidate_oid: str, input_identity: str, reason: str,
+) -> None:
+    """Treat a user's committed correction as unverified Worker input."""
+    plan_id = str(plan["plan_id"])
+    hydrate_execplan_project(connection, repo, plan)
+    with runtime_state._transaction(connection):
+        runtime_state.RuntimeStateRepository(connection).transition(
+            repo, plan_id,
+            plan_values={
+                "status": "IMPLEMENTING", "blocked_reason": None,
+                "blocked_fingerprint": None, "blocked_worktree_fingerprint": None,
+                "blocked_review_fingerprint": None, "last_error": None,
+                "retry_count": 0, "worker_result": None,
+                "verify_result": None, "review_result": None,
+                "validated_base_sha": None, "reviewer_session_id": None,
+                "worker_input_token": None, "archive_token": None,
+                "verify_token": None, "review_token": None,
+                "publication_token": None, "publication_remote_oid": None,
+                "verify_failure_history": "{}", "review_failure_history": "{}",
+                "effective_worker_level": plan["initial_worker_level"],
+                "review_level_history": "{}",
+            },
+            project_values={
+                "phase": "WORKING", "last_error": None,
+                "worker_result": None, "verify_result": None,
+                "review_result": None, "validated_base_sha": None,
+                "worker_session_id": plan["worker_session_id"],
+                "agent_role": None, "agent_snapshot": None,
+                "agent_baseline": None, "agent_recovery": None,
+                "agent_input_plan": None, "agent_result_plan": None,
+                "agent_input_fingerprint": None,
+                "agent_result_snapshot": None,
+                "agent_manager_snapshot": None,
+            },
+            enqueue=False,
+        )
+        scoped_blocking.clear_plan_block(connection, repo, plan_id)
+        repository.record_remote_inspection(
+            request, candidate_oid, input_identity, reason, commit=False,
+        )
+
+
+def _reconcile_published_blocked_checkpoint(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    state_dir: Path,
+    repo: str,
+    blocked: sqlite3.Row,
+    row: sqlite3.Row,
+    request: blocked_checkpoint.CheckpointRequest,
+    repository: blocked_checkpoint_state.BlockedCheckpointRepository,
+) -> str:
+    """Inspect one exact remote ref without adopting unproven or unsafe work."""
+    adapter = _BlockedCheckpointAdapter(connection, repo_path, state_dir, repo)
+    snapshot = None
+    worktree = Path(str(blocked["worktree"] or ""))
+    branch = str(blocked["branch"] or "")
+    try:
+        observed = adapter.observe_remote(request)
+    except (OSError, RuntimeError) as error:
+        observed = None
+        observation_error = f"원격 checkpoint를 재검증할 수 없습니다: {error}"
+    else:
+        observation_error = None
+    accepted = str(row["accepted_remote_oid"] or row["published_oid"] or row["remote_oid"])
+    unchanged = observed == accepted and not row["pending_remote_oid"]
+    try:
+        validate_execplan_workspace_identity(
+            state_dir, repo, str(blocked["plan_id"]), branch, worktree,
+        )
+        validate_managed_worktree(repo_path, worktree, branch)
+        snapshot = capture_git_snapshot(worktree)
+        ignored_paths = tuple(_nul_git_paths(
+            worktree, "ls-files", "--others", "--ignored",
+            "--exclude-standard", "-z",
+        ))
+    except (OSError, RuntimeError, WorkspaceOwnershipError) as error:
+        safety_error = f"관리 branch/worktree 소유권을 증명할 수 없습니다: {error}"
+        ignored_paths = ()
+    else:
+        safety_error = None
+    input_identity = _remote_checkpoint_input_identity(
+        blocked, snapshot, ignored_paths,
+    )
+
+    def refuse(message: str) -> str:
+        _remote_checkpoint_refusal(
+            connection, repository, request, row, observed, input_identity,
+            message,
+        )
+        return "blocked"
+
+    def retry(message: str) -> str:
+        _remote_checkpoint_refusal(
+            connection, repository, request, row, observed, input_identity,
+            message, retryable=True,
+        )
+        return "blocked"
+
+    if (
+        not row["pending_remote_oid"]
+        and row["inspected_remote_oid"] == observed
+        and row["inspected_input"] == input_identity
+        and row["inspection_reason"]
+        and not row["inspection_retryable"]
+        and blocked["blocked_reason"]
+        != BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT.value
+    ):
+        return "blocked"
+    if unchanged:
+        return "unchanged"
+    if observation_error:
+        return retry(observation_error)
+    current_block = connection.execute(
+        "SELECT reason_code FROM execplan_blocks WHERE repo = ? AND plan_id = ?",
+        (repo, blocked["plan_id"]),
+    ).fetchone()
+    if (
+        current_block is None
+        or current_block["reason_code"] != request.reason_code
+        or blocked["blocked_reason"] != request.reason_code
+        or request.plan_id != blocked["plan_id"]
+    ):
+        return refuse("checkpoint와 현재 PLAN_BLOCKED 원인/계획 identity가 다릅니다.")
+    if observed is None:
+        return refuse("게시된 원격 checkpoint branch가 삭제됐습니다.")
+    if not row["published_oid"]:
+        return refuse("게시 OID가 증명되지 않은 legacy checkpoint의 원격 변경은 채택할 수 없습니다.")
+    if row["pending_remote_oid"] and row["pending_remote_oid"] != observed:
+        return refuse("미완료 원격 checkpoint 채택 중 branch OID가 다시 변경됐습니다.")
+    if blocked["pr_url"] or int(blocked["workspace_owned"] or 0) != WORKSPACE_OWNED:
+        return refuse("PR 또는 관리 workspace 소유권 때문에 원격 checkpoint를 채택할 수 없습니다.")
+    if request.branch != branch or request.worktree != str(worktree):
+        return refuse("저장된 checkpoint branch/worktree가 ExecPlan 소유권과 다릅니다.")
+    if safety_error:
+        return refuse(safety_error)
+    assert snapshot is not None
+    if snapshot.operations:
+        return refuse("미해결 Git operation: " + ", ".join(sorted(snapshot.operations)))
+    if snapshot.branch != branch or not snapshot.head:
+        return refuse("관리 worktree의 branch 또는 HEAD가 저장된 ExecPlan과 다릅니다.")
+    own_ref = f"refs/heads/{branch}"
+    own_worktree = snapshot.worktrees.get(str(_canonical_path(worktree)), ())
+    if (
+        not snapshot.shared_metadata_complete
+        or snapshot.refs.get(own_ref, (None, None))[0] != snapshot.head
+        or f"branch={own_ref}" not in own_worktree
+    ):
+        return refuse("관리 branch ref와 worktree 등록 상태의 소유권을 증명할 수 없습니다.")
+    if snapshot.dirty:
+        return refuse("로컬 tracked/index/untracked 변경을 보존하기 위해 원격 fast-forward를 중단합니다.")
+    if any(_non_default_index_flags(entries) for entries in snapshot.index.values()):
+        return refuse("관리 worktree index flag가 안전하지 않습니다.")
+    project = connection.execute(
+        "SELECT origin FROM projects WHERE repo = ?", (repo,)
+    ).fetchone()
+    expected_origin = str(project["origin"] or "") if project else ""
+    try:
+        if not expected_origin:
+            raise RuntimeError("등록 origin이 없습니다.")
+        for context in (repo_path, worktree):
+            for args in (("remote", "get-url", "--all", "origin"),
+                         ("remote", "get-url", "--push", "--all", "origin")):
+                urls = git(context, *args).stdout.splitlines()
+                if len(urls) != 1 or github_repository(urls[0]) != expected_origin:
+                    raise RuntimeError("등록 origin과 fetch/push 대상이 다릅니다.")
+    except RuntimeError as error:
+        return refuse(f"원격 저장소 소유권을 증명할 수 없습니다: {error}")
+    fetched = git(
+        repo_path, "fetch", "--no-tags", "origin",
+        f"refs/heads/{branch}", check=False,
+    )
+    if fetched.returncode:
+        return retry("원격 checkpoint branch fetch 실패: " + fetched.stdout[-2000:])
+    fetched_result = git(
+        repo_path, "rev-parse", "FETCH_HEAD^{commit}", check=False,
+    )
+    if fetched_result.returncode:
+        return retry("fetch된 원격 checkpoint OID를 확인할 수 없습니다.")
+    fetched_oid = fetched_result.stdout.strip()
+    if fetched_oid != observed:
+        return retry("원격 checkpoint branch가 조회와 fetch 사이에 변경됐습니다.")
+    local_history = git(
+        repo_path, "merge-base", "--is-ancestor", accepted, snapshot.head,
+        check=False,
+    )
+    if local_history.returncode not in {0, 1}:
+        return retry("로컬 checkpoint ancestry를 확인할 수 없습니다.")
+    if local_history.returncode == 1:
+        return refuse("로컬 branch HEAD가 마지막 확인 원격 head의 후속이 아닙니다.")
+    for ancestor, label in ((accepted, "마지막 확인 head"),
+                            (str(row["published_oid"]), "게시 checkpoint"),
+                            (snapshot.head, "로컬 HEAD")):
+        relation = git(
+            repo_path, "merge-base", "--is-ancestor", ancestor, observed,
+            check=False,
+        )
+        if relation.returncode not in {0, 1}:
+            return retry(f"원격 branch의 {label} ancestry를 확인할 수 없습니다.")
+        if relation.returncode == 1:
+            return refuse(f"원격 branch가 {label}의 후속이 아닙니다 (삭제/재작성/분기 또는 검증 실패).")
+    try:
+        changed_paths = _nul_git_paths(
+            repo_path, "diff", "--no-renames", "--name-only", "-z",
+            accepted, observed, "--",
+        )
+    except RuntimeError as error:
+        return retry(f"원격 checkpoint 변경 경로를 확인할 수 없습니다: {error}")
+    try:
+        sources = tuple(str(source) for source in json.loads(str(blocked["sources"])))
+    except (TypeError, ValueError):
+        return refuse("ExecPlan source 목록을 검증할 수 없습니다.")
+    archives = tuple(source for source in sources if source.startswith("docs/requirements/")
+                     and "/archive/" not in source)
+    guidance = adapter._approved_guidance_targets(request)
+    common_plans = _published_plan_allows_common_plans(repo_path, blocked)
+    for path in changed_paths:
+        if not _worker_path_allowed(path, str(blocked["path"]), archives,
+                                    guidance, common_plans):
+            return refuse(f"원격 checkpoint 변경 범위 위반: {path}")
+        entry = git(repo_path, "ls-tree", observed, "--", path).stdout
+        if entry and not entry.startswith("100644 ") and not entry.startswith("100755 "):
+            return refuse(f"원격 checkpoint에 symlink 또는 특수 파일이 있습니다: {path}")
+    for local_path in ignored_paths:
+        if any(
+            local_path == remote_path
+            or local_path.startswith(remote_path + "/")
+            or remote_path.startswith(local_path + "/")
+            for remote_path in changed_paths
+        ):
+            return refuse(f"ignored 로컬 경로와 원격 변경이 겹칩니다: {local_path}")
+    metadata_error = _blocked_execplan_revision_metadata_error(
+        repo_path, observed, blocked,
+    )
+    if metadata_error:
+        return refuse(metadata_error)
+    repository.start_remote_adoption(request, observed)
+    if snapshot.head != observed:
+        advanced = git(
+            worktree, "-c", "core.hooksPath=/dev/null",
+            "merge", "--ff-only", "--no-edit", observed, check=False,
+        )
+        if advanced.returncode:
+            return retry("로컬 checkpoint fast-forward 실패: " + advanced.stdout[-2000:])
+    if git(worktree, "rev-parse", "HEAD^{commit}").stdout.strip() != observed:
+        return refuse("fast-forward 뒤 관리 worktree HEAD가 원격 후보와 다릅니다.")
+    input_identity = _remote_checkpoint_input_identity(
+        blocked, capture_git_snapshot(worktree), ignored_paths,
+    )
+    code_changed = any(
+        not path.startswith("docs/") and path != "AGENTS.md"
+        for path in changed_paths
+    )
+    if code_changed and blocked["blocked_reason"] in {
+        BlockReasonCode.VERIFY_RETRY_EXHAUSTED.value,
+        BlockReasonCode.REVIEW_RETRY_EXHAUSTED.value,
+        BlockReasonCode.REVIEW_PROTOCOL_EXHAUSTED.value,
+        BlockReasonCode.WORKER_OUTPUT_INVALID.value,
+    }:
+        _resume_remote_corrected_execplan(
+            connection, repo, blocked, repository, request, observed,
+            input_identity, "사용자 코드/테스트 변경을 Worker부터 재검증",
+        )
+        return "resumed"
+    if blocked["blocked_reason"] == BlockReasonCode.PLAN_INPUT_INVALID.value and (
+        blocked["blocked_fingerprint"]
+        and _revision_execplan_input_fingerprint(repo_path, observed, blocked)
+        != str(blocked["blocked_fingerprint"])
+    ):
+        _resume_remote_corrected_execplan(
+            connection, repo, blocked, repository, request, observed,
+            input_identity, "변경된 ExecPlan 입력을 Worker부터 재검증",
+        )
+        return "resumed"
+    reason = str(blocked["last_error"] or "저장된 차단 원인의 해제 조건이 아직 충족되지 않았습니다.")
+    repository.record_remote_inspection(request, observed, input_identity, reason)
+    return "adopted"
+
+
 def resume_plan_blocks(
     connection: sqlite3.Connection,
     repo_path: Path,
@@ -13974,7 +14306,7 @@ def resume_plan_blocks(
         if blocked["blocked_reason"] == PR_CLOSED_BLOCK_REASON:
             continue
         checkpoint_row = connection.execute(
-            "SELECT phase, remote_oid FROM blocked_checkpoints "
+            "SELECT * FROM blocked_checkpoints "
             "WHERE repo = ? AND plan_id = ?",
             (repo, blocked["plan_id"]),
         ).fetchone()
@@ -13989,27 +14321,14 @@ def resume_plan_blocks(
             checkpoint_request = checkpoint_repository.get(
                 repo, str(blocked["plan_id"])
             )
-            try:
-                observed_remote = _BlockedCheckpointAdapter(
-                    connection, repo_path, state_dir, repo
-                ).observe_remote(checkpoint_request)
-            except (OSError, RuntimeError) as error:
-                _update_blocked_error(
-                    connection,
-                    repo,
-                    str(blocked["plan_id"]),
-                    f"원격 checkpoint를 재검증할 수 없습니다: {error}",
-                )
+            remote_result = _reconcile_published_blocked_checkpoint(
+                connection, repo_path, state_dir, repo, blocked,
+                checkpoint_row, checkpoint_request, checkpoint_repository,
+            )
+            if remote_result == "blocked":
                 continue
-            if observed_remote != str(checkpoint_row["remote_oid"]):
-                _update_blocked_error(
-                    connection,
-                    repo,
-                    str(blocked["plan_id"]),
-                    "원격 checkpoint branch가 게시 뒤 외부에서 변경됐습니다. "
-                    "자동 merge, rebase 또는 덮어쓰기를 거부합니다.",
-                )
-                continue
+            if remote_result == "resumed":
+                return True
         if blocked["blocked_reason"] == BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT.value:
             old_timeout = int(blocked["blocked_fingerprint"])
             new_timeout = (

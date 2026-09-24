@@ -842,12 +842,13 @@ class ScopedBlockingTest(unittest.TestCase):
         ).fetchone()
         self.assertEqual(blocked["status"], "PLAN_BLOCKED")
 
-    def test_external_remote_checkpoint_change_prevents_plan_resume(self):
+    def test_legacy_remote_checkpoint_change_prevents_plan_resume(self):
         self.plan(
             "G-001",
             "IMPLEMENTING",
             branch="loop-manager/G-001",
         )
+        self.plan("G-002", "READY")
         self.connection.execute(
             "UPDATE exec_plans SET worktree = ? "
             "WHERE repo = ? AND plan_id = 'G-001'",
@@ -889,7 +890,13 @@ class ScopedBlockingTest(unittest.TestCase):
             (self.repo,),
         ).fetchone()
         self.assertEqual(plan["status"], "PLAN_BLOCKED")
-        self.assertIn("외부에서 변경", plan["last_error"])
+        self.assertIn("소유권", plan["last_error"])
+        self.assertEqual(
+            loop_manager.catalog_schedule_decision(
+                self.connection, self.repo,
+            ).runnable_ready["plan_id"],
+            "G-002",
+        )
 
     def test_legacy_unscoped_block_is_conservatively_project_blocked(self):
         self.plan("G-001", "READY")
