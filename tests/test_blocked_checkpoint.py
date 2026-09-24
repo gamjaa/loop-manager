@@ -433,6 +433,25 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
         ).fetchone()
         self.assertEqual(tuple(stored), (published, corrected))
 
+    def test_pathless_diagnostics_reassess_checkpoint_implementation_changes(self):
+        self.publish_block(evidence='File "tests/test_code.py", line 12\nAssertionError: 1 != 2')
+        self.connection.execute(
+            "UPDATE exec_plans SET worker_result = 'old', verify_result = 'AssertionError', "
+            "review_result = 'old' WHERE plan_id = 'G-034'"
+        )
+        self.connection.commit()
+        corrected = self.user_commit("code.py", "corrected implementation\n")
+        self.assertTrue(loop_manager.resume_plan_blocks(
+            self.connection, self.repo, self.state_dir, str(self.repo.resolve()), "main",
+        ))
+        row = self.connection.execute(
+            "SELECT status, worker_result, verify_result, review_result "
+            "FROM exec_plans WHERE plan_id = 'G-034'"
+        ).fetchone()
+        self.assertEqual(tuple(row), ("IMPLEMENTING", None, None, None))
+        self.assertEqual(self.run_git(self.worktree, "rev-parse", "HEAD"), corrected)
+        self.assertEqual(self.run_git(self.repo, "rev-parse", "main"), self.base_oid)
+
     def test_rewritten_remote_branch_keeps_local_checkpoint_blocked(self):
         published = self.publish_block()
         before_events = self.connection.execute(

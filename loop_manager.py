@@ -14252,6 +14252,20 @@ def _reconcile_published_blocked_checkpoint(
     )
     if metadata_error:
         return refuse(metadata_error)
+    # Use the frozen publication, not the growing accepted head: otherwise an
+    # unrelated user commit would become evidence for releasing the block later.
+    checkpoint_paths = ()
+    if blocked["blocked_reason"] in {
+        BlockReasonCode.VERIFY_RETRY_EXHAUSTED.value,
+        BlockReasonCode.REVIEW_RETRY_EXHAUSTED.value,
+    } and blocked["active_sha"]:
+        try:
+            checkpoint_paths = _nul_git_paths(
+                repo_path, "diff", "--no-renames", "--name-only", "-z",
+                f"{blocked['active_sha']}...{row['published_oid']}", "--",
+            )
+        except RuntimeError as error:
+            return retry(f"게시 checkpoint의 구현 변경 경로를 확인할 수 없습니다: {error}")
     repository.start_remote_adoption(request, observed)
     if snapshot.head != observed:
         advanced = git(
@@ -14275,11 +14289,12 @@ def _reconcile_published_blocked_checkpoint(
     )
     corrected_paths = execution_revision.remote_failure_correction_paths(
         str(blocked["blocked_reason"]), changed_paths, failure_evidence,
+        checkpoint_paths,
     )
     if corrected_paths:
         _resume_remote_corrected_execplan(
             connection, repo, blocked, repository, request, observed,
-            input_identity, "실패 증거에 연결된 사용자 변경을 Worker부터 재검증",
+            input_identity, "진단 또는 게시 구현 변경에 연결된 사용자 수정을 Worker부터 재평가",
         )
         return "resumed"
     if blocked["blocked_reason"] == BlockReasonCode.PLAN_INPUT_INVALID.value and (

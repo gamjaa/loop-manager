@@ -85,6 +85,18 @@ class ExecutionRevisionTests(unittest.TestCase):
             (),
         )
 
+    def test_checkpoint_changes_trigger_reassessment_without_diagnostic_path(self):
+        for reason in ("verify_retry_exhausted", "review_retry_exhausted"):
+            for evidence in ("", "AssertionError: 1 != 2", "tests/test_code.py:12"):
+                with self.subTest(reason=reason, evidence=evidence):
+                    self.assertEqual(remote_failure_correction_paths(
+                        reason, ("README.md", "src/code.py"), evidence,
+                        ("src/code.py",),
+                    ), ("src/code.py",))
+        self.assertEqual(remote_failure_correction_paths(
+            "worker_output_invalid", ("src/code.py",), "", ("src/code.py",),
+        ), ())
+
     def test_body_hash_excludes_frontmatter_metadata(self):
         first = "---\nid: G-037\ntitle: First\n---\n\n## Purpose\nSame\n"
         renamed = first.replace("title: First", "title: Renamed")

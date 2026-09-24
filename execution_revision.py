@@ -52,14 +52,20 @@ def remote_failure_correction_paths(
     reason_code: str,
     changed_paths: Iterable[str],
     failure_evidence: str,
+    checkpoint_paths: Iterable[str] = (),
 ) -> tuple[str, ...]:
-    """Identify changed files tied to the stored validation or review failure."""
-    if reason_code not in _REMOTE_FAILURE_REASONS or not failure_evidence:
+    """Select candidates for reassessment, without claiming the cause is fixed.
+
+    Diagnostics often name only a test, or no path at all. Changes to files
+    in the blocked implementation also warrant fresh Worker assessment.
+    """
+    if reason_code not in _REMOTE_FAILURE_REASONS:
         return ()
     evidence = failure_evidence.replace("\\", "/")
+    checkpoint_files = frozenset(checkpoint_paths)
     return tuple(
         path for path in changed_paths
-        if re.search(
+        if path in checkpoint_files or re.search(
             rf"(?<![\w.-]){re.escape(path)}(?![\w./-])",
             evidence,
         )

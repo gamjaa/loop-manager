@@ -45,3 +45,6 @@ priority: critical
 ## Decision Log
 
 - Remote branch progress is evidence to inspect, not evidence that the original block was resolved.
+
+- Review follow-up: diagnostics need not contain the corrected implementation path. For exhausted verify/review blocks, changes to files in the frozen published checkpoint diff against the execution base also trigger Worker reassessment. The accepted remote head is not used as that baseline, so unrelated adopted commits cannot expand this evidence. This is unverified input, not a successful validation result; Worker, full verify and Review remain required.
+- Targeted validation: five individual unit cases passed, covering diagnostic path matching, pathless/checkpoint classification, test-only traceback with implementation-only correction, unrelated README/code commits, and review diagnostic matching. Full verify is left to Loop Manager. R-039 was already archived when this Worker session resumed; its content was not changed.
