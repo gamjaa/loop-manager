@@ -72,19 +72,31 @@ def _limit_excerpt(value: str, limit: int) -> tuple[str, bool]:
 
 def _pytest_diagnostic_start(lines: list[str], marker_index: int) -> int:
     """Locate pytest's preceding failure section without interpreting prose."""
-    for index in range(marker_index - 1,
-                       max(-1, marker_index - _PYTEST_CONTEXT_LINES), -1):
-        if not _FAILURE_HEADER.match(lines[index]):
+    summary = _PYTEST_FAILURE.match(lines[marker_index])
+    if not summary:
+        return marker_index
+    test_name = summary.group("name").split("::")[-1]
+    start = max(0, marker_index - _PYTEST_CONTEXT_LINES)
+    headers = [(index, match.group("name").strip())
+               for index in range(start, marker_index)
+               if (match := _FAILURE_HEADER.match(lines[index]))]
+    matches = []
+    for position, (index, name) in enumerate(headers):
+        if name != test_name:
             continue
-        if any(_ERROR_DETAIL.match(line) for line in lines[index + 1:marker_index]):
-            return index
-    return marker_index
+        next_index = (headers[position + 1][0]
+                      if position + 1 < len(headers) else marker_index)
+        if any(_ERROR_DETAIL.match(line) for line in lines[index + 1:next_index]):
+            matches.append(index)
+    return matches[0] if len(matches) == 1 else marker_index
 
 
 def _failure_excerpt(lines: list[str], marker_index: int, marker: str,
                      diagnostic_start: int) -> str:
+    context_end = next((index for index in range(diagnostic_start + 1, marker_index)
+                        if _FAILURE_HEADER.match(lines[index])), marker_index)
     preceding = [
-        line for line in lines[diagnostic_start + 1:marker_index]
+        line for line in lines[diagnostic_start + 1:context_end]
         if line.strip() and not _SUCCESS_LOG.search(line)
     ][-8:]
     following = []
@@ -104,7 +116,7 @@ def _render_failure_excerpts(prefix: str, excerpts: list[str],
     summaries = list(dict.fromkeys(summaries[-1:]))
     summary = summaries[0] if summaries else ""
     summary, summary_omitted = _limit_excerpt(summary, MAX_DIAGNOSTIC // 4)
-    fixed = [prefix, *(summaries if not summary_omitted else [summary])]
+    fixed = [prefix, summary] if summary else [prefix]
     selected: list[str] = []
     omitted = 0
     # Each excerpt begins with a normalized, complete `FAILED: <name>` line.
@@ -113,6 +125,8 @@ def _render_failure_excerpts(prefix: str, excerpts: list[str],
         remaining = len(excerpts) - index - 1
         omission = f"[{remaining} recognizable failures omitted]" if remaining else ""
         candidate = [*fixed, *selected, excerpt.split("\n", 1)[0], omission]
+        if summary_omitted or remaining or any("\n" in item for item in excerpts[:index + 1]):
+            candidate.append(_TRUNCATED)
         if len("\n\n".join(part for part in candidate if part)) > MAX_DIAGNOSTIC:
             omitted = remaining + 1
             break
@@ -121,25 +135,26 @@ def _render_failure_excerpts(prefix: str, excerpts: list[str],
         omitted = 0
 
     omission = f"[{omitted} recognizable failures omitted]" if omitted else ""
-    used = len("\n\n".join([*fixed, *selected, omission]))
-    detail_budget = max(0, MAX_DIAGNOSTIC - used - (2 if omission else 0))
     details = [excerpt.split("\n", 1)[1] if "\n" in excerpt else "" for excerpt in excerpts[:len(selected)]]
-    detail_parts = []
-    if selected and detail_budget >= len(selected) * (len(_TRUNCATED) + 2):
-        each = detail_budget // len(selected)
-        for detail in details:
-            limited, detail_omitted = _limit_excerpt(detail, each)
-            detail_parts.append(limited if detail else "")
-            summary_omitted = summary_omitted or detail_omitted
+    marker_needed = summary_omitted or bool(omission) or any(details)
+    base = [prefix, *selected, omission, summary]
+    base_length = len("\n\n".join(part for part in base if part))
+    marker_space = len(_TRUNCATED) + 2 if marker_needed else 0
+    available = max(0, MAX_DIAGNOSTIC - base_length - marker_space)
+    nonempty = sum(bool(detail) for detail in details)
+    each = max(0, (available - nonempty) // nonempty) if nonempty else 0
+    detail_parts = [detail[:each].rstrip() for detail in details]
+    detail_omitted = any(len(part) < len(detail) for part, detail in zip(detail_parts, details))
     rendered = [prefix]
-    for name, detail in zip(selected, detail_parts or [""] * len(selected)):
-        rendered.append("\n".join(part for part in (name, detail) if part))
+    for name, detail in zip(selected, detail_parts):
+        rendered.append(f"{name}\n{detail}" if detail else name)
     if omission:
         rendered.append(omission)
-    rendered.extend(fixed[1:])
-    if summary_omitted:
+    if summary:
+        rendered.append(summary)
+    if summary_omitted or detail_omitted or omission:
         rendered.append(_TRUNCATED)
-    return _bounded_failure_diagnostic(rendered)
+    return "\n\n".join(rendered)
 
 
 def _fallback_verify_diagnostic(raw: str, exit_code: int | None) -> str:

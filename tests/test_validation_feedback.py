@@ -103,6 +103,46 @@ class ValidationFeedbackTests(unittest.TestCase):
         self.assertIn("tests/test_message.py::test_saves_message", diagnostic)
         self.assertIn("assert actual == 'published'", diagnostic)
 
+    def test_verify_formatter_matches_multiple_pytest_sections_by_name(self):
+        raw = (
+            "_____________ test_first _____________\n"
+            "E       AssertionError: first failure detail\n"
+            "_____________ test_second _____________\n"
+            "E       AssertionError: second failure detail\n"
+            "================ short test summary info ================\n"
+            "FAILED tests/test_pair.py::test_first - AssertionError\n"
+            "FAILED tests/test_pair.py::test_second - AssertionError\n"
+            "================ 2 failed in 0.1s ================\n"
+        )
+        diagnostic = format_verify_failure(raw, exit_code=1)
+        first = diagnostic.split("FAILED: tests/test_pair.py::test_first", 1)[1]
+        first = first.split("FAILED: tests/test_pair.py::test_second", 1)[0]
+        second = diagnostic.split("FAILED: tests/test_pair.py::test_second", 1)[1]
+        self.assertIn("first failure detail", first)
+        self.assertNotIn("second failure detail", first)
+        self.assertIn("second failure detail", second)
+
+    def test_verify_formatter_marks_dropped_details_with_many_names(self):
+        raw = "".join(
+            f"FAIL: test_case_{index:03d}\nAssertionError: detail {index}\n"
+            for index in range(65)
+        ) + "FAILED (failures=65)\n"
+        diagnostic = format_verify_failure(raw, exit_code=1)
+        self.assertIn("FAILED (failures=65)", diagnostic)
+        self.assertIn("[diagnostic truncated]", diagnostic)
+        self.assertLessEqual(len(diagnostic), MAX_DIAGNOSTIC)
+
+    def test_verify_formatter_preserves_final_summary_at_detail_budget(self):
+        raw = (
+            "FAIL: test_alpha\nAssertionError: " + "a" * 2000 + "\n"
+            "FAIL: test_beta\nAssertionError: " + "b" * 2000 + "\n"
+            "FAILED (failures=2)\n"
+        )
+        diagnostic = format_verify_failure(raw, exit_code=1)
+        self.assertIn("FAILED (failures=2)", diagnostic)
+        self.assertIn("[diagnostic truncated]", diagnostic)
+        self.assertLessEqual(len(diagnostic), MAX_DIAGNOSTIC)
+
     def test_verify_formatter_falls_back_to_bounded_tail_without_guessing(self):
         raw = "unrecognized output\n" + "x" * 3000 + "\nAPI_KEY=private-value"
         diagnostic = format_verify_failure(raw, exit_code=17)
