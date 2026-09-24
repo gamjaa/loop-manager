@@ -6201,8 +6201,7 @@ class WorkerPublicationTest(unittest.TestCase):
 
             result = loop_manager.synchronize_base_worktree(repo, "main")
 
-            self.assertEqual(result.status, "skipped")
-            self.assertIn("staged", result.reason)
+            self.assertEqual(result.status, "equal")
             self.assertEqual(
                 (repo / "src/app.py").read_text(encoding="utf-8"),
                 "VALUE = 99\n",
@@ -6212,6 +6211,17 @@ class WorkerPublicationTest(unittest.TestCase):
                 index_before,
             )
             self.assertEqual(git_command(repo, "rev-parse", "HEAD"), head_before)
+
+    def test_equal_base_worktree_sync_records_noop(self):
+        result = loop_manager.BaseWorktreeSyncResult(
+            "equal", "이미 원격 base와 같음", "example-sha"
+        )
+        with mock.patch("loop_manager.operation_log") as operation_log:
+            loop_manager.log_base_worktree_sync(Path("/source"), result)
+        operation_log.assert_called_once_with(
+            "기본 worktree 동기화 equal (/source): 이미 원격 base와 같음",
+            error=False,
+        )
 
     def test_verify_and_review_retries_keep_latest_worker_metadata(self):
         with tempfile.TemporaryDirectory() as directory:

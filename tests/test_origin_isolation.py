@@ -550,6 +550,154 @@ class OriginIsolatedRegistrationAndExecutionTest(unittest.TestCase):
             self.assertEqual(environment.read_text(), "python\n")
             self.assertEqual(cache.read_text(), "cache\n")
 
+    def test_safe_fast_forward_preserves_disjoint_dirty_files_and_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _remote, primary, writer = remote_fixture(directory)
+            git(primary, "config", "merge.autostash", "true")
+            tracked = primary / "tracked.txt"
+            tracked.write_text("staged\n", encoding="utf-8")
+            git(primary, "add", "tracked.txt")
+            tracked.write_text("unstaged\n", encoding="utf-8")
+            (primary / "untracked.txt").write_text("untracked\n", encoding="utf-8")
+            ignored = primary / "ignored/local.txt"
+            ignored.parent.mkdir()
+            ignored.write_text("ignored\n", encoding="utf-8")
+            local_index = git(primary, "ls-files", "--stage", "--", "tracked.txt")
+            local_staged = git(primary, "diff", "--cached", "--", "tracked.txt")
+            local_unstaged = git(primary, "diff", "--", "tracked.txt")
+            remote_sha = advance_remote(writer, path="remote.txt", value="remote\n")
+            git(primary, "fetch", "origin")
+
+            result = loop_manager.synchronize_base_worktree(
+                primary, "main", remote_sha=remote_sha
+            )
+
+            self.assertEqual(result.status, "updated", result.reason)
+            self.assertEqual(git(primary, "rev-parse", "HEAD"), remote_sha)
+            self.assertEqual((primary / "remote.txt").read_text(), "remote\n")
+            self.assertEqual(tracked.read_text(), "unstaged\n")
+            self.assertEqual(git(primary, "ls-files", "--stage", "--", "tracked.txt"), local_index)
+            self.assertEqual(git(primary, "diff", "--cached", "--", "tracked.txt"), local_staged)
+            self.assertEqual(git(primary, "diff", "--", "tracked.txt"), local_unstaged)
+            self.assertEqual((primary / "untracked.txt").read_text(), "untracked\n")
+            self.assertEqual(ignored.read_text(), "ignored\n")
+            self.assertEqual(git(primary, "stash", "list"), "")
+
+    def test_equal_remote_sha_is_noop_with_dirty_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _remote, primary, _writer = remote_fixture(directory)
+            (primary / "tracked.txt").write_text("local\n")
+            git(primary, "add", "tracked.txt")
+            (primary / "untracked.txt").write_text("untracked\n")
+            head = git(primary, "rev-parse", "HEAD")
+            index = git(primary, "ls-files", "--stage", "--", "tracked.txt")
+
+            with mock.patch("loop_manager._base_worktree_snapshot") as snapshot:
+                result = loop_manager.synchronize_base_worktree(primary, "main")
+
+            self.assertEqual(result.status, "equal")
+            snapshot.assert_not_called()
+            self.assertEqual(git(primary, "rev-parse", "HEAD"), head)
+            self.assertEqual(git(primary, "ls-files", "--stage", "--", "tracked.txt"), index)
+            self.assertEqual((primary / "tracked.txt").read_text(), "local\n")
+            self.assertEqual((primary / "untracked.txt").read_text(), "untracked\n")
+
+    def test_safe_fast_forward_rejects_nonstandard_index_flags(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _remote, primary, writer = remote_fixture(directory)
+            git(primary, "update-index", "--assume-unchanged", "tracked.txt")
+            remote_sha = advance_remote(writer, path="remote.txt")
+            git(primary, "fetch", "origin")
+            before_index = git(primary, "ls-files", "--stage", "-v")
+            before_head = git(primary, "rev-parse", "HEAD")
+
+            result = loop_manager.synchronize_base_worktree(
+                primary, "main", remote_sha=remote_sha
+            )
+
+            self.assertEqual(result.status, "skipped")
+            self.assertIn("index", result.reason)
+            self.assertEqual(git(primary, "rev-parse", "HEAD"), before_head)
+            self.assertEqual(git(primary, "ls-files", "--stage", "-v"), before_index)
+
+    def test_safe_fast_forward_rejects_remote_path_collisions(self):
+        scenarios = (
+            "staged", "unstaged", "untracked", "ignored", "parent",
+            "rename-old", "rename-new", "local-rename", "deletion",
+            "local-deletion", "directory-transition", "case",
+        )
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                _remote, primary, writer = remote_fixture(directory)
+                if scenario == "staged":
+                    (primary / "tracked.txt").write_text("local\n")
+                    git(primary, "add", "tracked.txt")
+                    remote_sha = advance_remote(writer)
+                elif scenario == "unstaged":
+                    (primary / "tracked.txt").write_text("local\n")
+                    remote_sha = advance_remote(writer)
+                elif scenario == "untracked":
+                    (primary / "new.txt").write_text("local\n")
+                    remote_sha = advance_remote(writer, path="new.txt")
+                elif scenario == "ignored":
+                    local = primary / "ignored/local.txt"
+                    local.parent.mkdir()
+                    local.write_text("local\n")
+                    remote_sha = advance_remote(writer, path="ignored/local.txt")
+                elif scenario == "parent":
+                    (primary / "folder").write_text("local\n")
+                    remote_sha = advance_remote(writer, path="folder/child.txt")
+                elif scenario in {"rename-old", "rename-new"}:
+                    if scenario == "rename-old":
+                        (primary / "tracked.txt").write_text("local\n")
+                    else:
+                        (primary / "renamed.txt").write_text("local\n")
+                    git(writer, "mv", "tracked.txt", "renamed.txt")
+                    remote_sha = commit_all(writer, "Rename tracked file")
+                    git(writer, "push", "origin", "main")
+                elif scenario == "local-rename":
+                    git(primary, "mv", "tracked.txt", "local-renamed.txt")
+                    remote_sha = advance_remote(writer)
+                elif scenario == "deletion":
+                    (primary / "tracked.txt").write_text("local\n")
+                    git(writer, "rm", "tracked.txt")
+                    remote_sha = commit_all(writer, "Delete tracked file")
+                    git(writer, "push", "origin", "main")
+                elif scenario == "local-deletion":
+                    git(primary, "rm", "tracked.txt")
+                    remote_sha = advance_remote(writer)
+                elif scenario == "directory-transition":
+                    (primary / "tracked.txt").write_text("local\n")
+                    git(writer, "rm", "tracked.txt")
+                    nested = writer / "tracked.txt/child.txt"
+                    nested.parent.mkdir()
+                    nested.write_text("remote\n")
+                    remote_sha = commit_all(writer, "Turn tracked file into directory")
+                    git(writer, "push", "origin", "main")
+                else:
+                    (primary / "case.txt").write_text("local\n")
+                    remote_sha = advance_remote(writer, path="CASE.txt")
+                git(primary, "fetch", "origin")
+                before_head = git(primary, "rev-parse", "HEAD")
+                before_index = git(primary, "ls-files", "--stage", "-v")
+                before_files = {
+                    path: path.read_bytes() for path in primary.rglob("*")
+                    if path.is_file() and ".git" not in path.relative_to(primary).parts
+                }
+
+                result = loop_manager.synchronize_base_worktree(
+                    primary, "main", remote_sha=remote_sha
+                )
+
+                self.assertEqual(result.status, "skipped", result.reason)
+                self.assertIn("겹치는", result.reason)
+                self.assertEqual(git(primary, "rev-parse", "HEAD"), before_head)
+                self.assertEqual(git(primary, "ls-files", "--stage", "-v"), before_index)
+                self.assertEqual({
+                    path: path.read_bytes() for path in primary.rglob("*")
+                    if path.is_file() and ".git" not in path.relative_to(primary).parts
+                }, before_files)
+
     def test_safe_fast_forward_skips_local_state_matrix_without_gating_remote_sha(self):
         scenarios = (
             "tracked",
@@ -588,7 +736,12 @@ class OriginIsolatedRegistrationAndExecutionTest(unittest.TestCase):
                 remote_sha = (
                     git(writer, "rev-parse", "HEAD")
                     if scenario == "ahead"
-                    else advance_remote(writer)
+                    else advance_remote(
+                        writer,
+                        path=("staged.txt" if scenario == "staged" else
+                              "untracked.txt" if scenario == "untracked" else
+                              "tracked.txt"),
+                    )
                 )
                 git(primary, "fetch", "origin")
                 before_head = git(primary, "rev-parse", "HEAD")
@@ -630,6 +783,8 @@ class OriginIsolatedRegistrationAndExecutionTest(unittest.TestCase):
             remote_sha = advance_remote(writer)
             git(primary, "fetch", "origin")
             before = git(primary, "rev-parse", "HEAD")
+            before_index = git(primary, "ls-files", "--stage", "-v")
+            before_file = (primary / "tracked.txt").read_text()
             real_git = loop_manager.git
 
             def locked(repo: Path, *arguments: str, **kwargs):
@@ -650,6 +805,8 @@ class OriginIsolatedRegistrationAndExecutionTest(unittest.TestCase):
             self.assertEqual(failed.status, "failed")
             self.assertIn("lock", failed.reason.casefold())
             self.assertEqual(git(primary, "rev-parse", "HEAD"), before)
+            self.assertEqual(git(primary, "ls-files", "--stage", "-v"), before_index)
+            self.assertEqual((primary / "tracked.txt").read_text(), before_file)
 
     def test_concurrent_user_change_after_eligibility_skips_without_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -686,6 +843,89 @@ class OriginIsolatedRegistrationAndExecutionTest(unittest.TestCase):
                 (primary / "concurrent.txt").read_text(),
                 "user-change\n",
             )
+
+    def test_concurrent_index_change_after_eligibility_skips_without_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _remote, primary, writer = remote_fixture(directory)
+            remote_sha = advance_remote(writer, path="remote.txt")
+            git(primary, "fetch", "origin")
+            before_head = git(primary, "rev-parse", "HEAD")
+            real_snapshot = loop_manager._base_worktree_snapshot
+            calls = 0
+
+            def changing_snapshot(repo: Path):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    (repo / "staged.txt").write_text("local\n")
+                    git(repo, "add", "staged.txt")
+                return real_snapshot(repo)
+
+            with mock.patch("loop_manager._base_worktree_snapshot", side_effect=changing_snapshot):
+                result = loop_manager.synchronize_base_worktree(
+                    primary, "main", remote_sha=remote_sha
+                )
+
+            self.assertEqual(result.status, "skipped")
+            self.assertIn("상태가 변경", result.reason)
+            self.assertEqual(git(primary, "rev-parse", "HEAD"), before_head)
+            self.assertEqual(git(primary, "ls-files", "--stage", "--", "staged.txt").count("staged.txt"), 1)
+
+    def test_concurrent_ignored_content_change_skips_without_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _remote, primary, writer = remote_fixture(directory)
+            ignored = primary / "ignored/local.txt"
+            ignored.parent.mkdir()
+            ignored.write_text("original\n")
+            remote_sha = advance_remote(writer, path="remote.txt")
+            git(primary, "fetch", "origin")
+            before_head = git(primary, "rev-parse", "HEAD")
+            real_snapshot = loop_manager._base_worktree_snapshot
+            calls = 0
+
+            def changing_snapshot(repo: Path):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    ignored.write_text("changed\n")
+                return real_snapshot(repo)
+
+            with mock.patch("loop_manager._base_worktree_snapshot", side_effect=changing_snapshot):
+                result = loop_manager.synchronize_base_worktree(
+                    primary, "main", remote_sha=remote_sha
+                )
+
+            self.assertEqual(result.status, "skipped")
+            self.assertIn("상태가 변경", result.reason)
+            self.assertEqual(git(primary, "rev-parse", "HEAD"), before_head)
+            self.assertEqual(ignored.read_text(), "changed\n")
+
+    def test_remote_ref_change_after_eligibility_skips_without_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _remote, primary, writer = remote_fixture(directory)
+            before_head = git(primary, "rev-parse", "HEAD")
+            remote_sha = advance_remote(writer, path="remote.txt")
+            git(primary, "fetch", "origin")
+            real_snapshot = loop_manager._base_worktree_snapshot
+            calls = 0
+
+            def changing_ref(repo: Path):
+                nonlocal calls
+                calls += 1
+                result = real_snapshot(repo)
+                if calls == 2:
+                    git(repo, "update-ref", "refs/remotes/origin/main", before_head)
+                return result
+
+            with mock.patch("loop_manager._base_worktree_snapshot", side_effect=changing_ref):
+                result = loop_manager.synchronize_base_worktree(
+                    primary, "main", remote_sha=remote_sha
+                )
+
+            self.assertEqual(result.status, "skipped")
+            self.assertIn("origin ref", result.reason)
+            self.assertEqual(git(primary, "rev-parse", "HEAD"), before_head)
+            self.assertFalse((primary / "remote.txt").exists())
 
     def test_exact_remote_sha_seeds_planning_and_implementation_worktrees(self):
         with tempfile.TemporaryDirectory() as directory:

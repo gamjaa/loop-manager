@@ -436,6 +436,15 @@ class BaseWorktreeSyncResult:
 
 
 @dataclass(frozen=True)
+class BaseWorktreeSnapshot:
+    branch: str | None
+    head: str
+    index: tuple[tuple[str, tuple[str, ...]], ...]
+    changes: tuple[tuple[str, str, str], ...]
+    operations: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
 class RuntimeWorktree:
     """The immutable Loop Manager revision selected by the source bootstrap."""
 
@@ -6008,16 +6017,6 @@ def add_registered_project(
     return project
 
 
-def _base_worktree_status(repo: Path) -> str:
-    return git(
-        repo,
-        "status",
-        "--porcelain=v1",
-        "-z",
-        "--untracked-files=all",
-    ).stdout
-
-
 def _ignored_worktree_paths(repo: Path) -> tuple[str, ...]:
     return tuple(
         sorted(
@@ -6165,7 +6164,7 @@ def _rebase_resume_ignored_overlap(worktree: Path, action: str) -> str | None:
 
 def _base_worktree_snapshot(
     repo: Path,
-) -> tuple[str | None, str, str, tuple[tuple[str, str], ...], tuple[str, ...]]:
+) -> BaseWorktreeSnapshot:
     branch_result = git(
         repo,
         "symbolic-ref",
@@ -6176,13 +6175,67 @@ def _base_worktree_snapshot(
     )
     branch = branch_result.stdout.strip() if branch_result.returncode == 0 else None
     head = git(repo, "rev-parse", "HEAD").stdout.strip()
-    return (
-        branch,
-        head,
-        _base_worktree_status(repo),
-        tuple(sorted(_git_operation_entries(repo).items())),
-        _ignored_worktree_paths(repo),
+    index = _index_entries(repo)
+    operations = tuple(sorted(_git_operation_entries(repo).items()))
+    preliminary = BaseWorktreeSnapshot(
+        branch=branch,
+        head=head,
+        index=tuple(sorted(index.items())),
+        changes=(),
+        operations=operations,
     )
+    if operations or _base_worktree_index_error(preliminary):
+        return preliminary
+    changes = []
+    for kind, paths in (
+        ("staged", _nul_git_paths(
+            repo, "diff", "--cached", "--no-renames", "--name-only", "-z",
+            "--ignore-submodules=none",
+        )),
+        ("unstaged", _nul_git_paths(
+            repo, "diff", "--no-renames", "--name-only", "-z",
+            "--ignore-submodules=none",
+        )),
+        ("untracked", _nul_git_paths(
+            repo, "ls-files", "--others", "--exclude-standard", "-z",
+        )),
+        ("ignored", _ignored_worktree_paths(repo)),
+    ):
+        changes.extend((kind, path, _base_local_path_signature(repo, path)) for path in paths)
+    return BaseWorktreeSnapshot(
+        branch=branch,
+        head=head,
+        index=preliminary.index,
+        changes=tuple(sorted(changes)),
+        operations=operations,
+    )
+
+
+def _base_local_path_signature(repo: Path, relative_path: str) -> str:
+    path = repo / relative_path
+    if not path.exists() and not path.is_symlink():
+        return "missing"
+    return _git_operation_path_signature(path)
+
+
+def _base_worktree_index_error(snapshot: BaseWorktreeSnapshot) -> str | None:
+    for path, entries in snapshot.index:
+        if len(entries) != 1:
+            return path
+        fields = entries[0].split()
+        if (
+            len(fields) != 4
+            or fields[0] != "H"
+            or fields[3] != "0"
+            or not fields[2].strip("0")
+        ):
+            return path
+    return None
+
+
+def _base_paths_overlap(left: str, right: str) -> bool:
+    # A remote checkout can be case insensitive even when the current host is not.
+    return _paths_overlap(left.casefold(), right.casefold())
 
 
 def synchronize_base_worktree(
@@ -6193,43 +6246,69 @@ def synchronize_base_worktree(
 ) -> BaseWorktreeSyncResult:
     """Best-effort fast-forward of an eligible primary checkout."""
 
+    selected_remote = remote_sha or ""
     try:
-        selected_remote = remote_sha or git(
+        observed_remote = git(
             repo,
             "rev-parse",
             "--verify",
             f"refs/remotes/origin/{base}^{{commit}}",
         ).stdout.strip()
-        before = _base_worktree_snapshot(repo)
-        branch, local_sha, status, operations, ignored = before
-        if branch is None:
-            return BaseWorktreeSyncResult("skipped", "detached HEAD", selected_remote)
-        if branch != base:
+        selected_remote = selected_remote or observed_remote
+        if selected_remote != observed_remote:
             return BaseWorktreeSyncResult(
-                "skipped",
-                f"다른 branch checkout: {branch}",
-                selected_remote,
+                "skipped", "선택한 원격 SHA와 현재 origin ref가 다름", selected_remote
             )
-        if operations:
-            return BaseWorktreeSyncResult(
-                "skipped",
-                "진행 중 Git operation: " + ", ".join(name for name, _ in operations),
-                selected_remote,
+        # Equal HEAD needs no file or index scan: nothing will be checked out.
+        if git(repo, "rev-parse", "HEAD").stdout.strip() == selected_remote:
+            current_branch = git(
+                repo, "symbolic-ref", "--quiet", "--short", "HEAD", check=False
             )
-        if status:
-            return BaseWorktreeSyncResult(
-                "skipped",
-                "tracked, staged 또는 non-ignored untracked 변경",
-                selected_remote,
-            )
-        if local_sha == selected_remote:
+            if current_branch.returncode:
+                return BaseWorktreeSyncResult("skipped", "detached HEAD", selected_remote)
+            branch = current_branch.stdout.strip()
+            if branch != base:
+                return BaseWorktreeSyncResult(
+                    "skipped", f"다른 branch checkout: {branch}", selected_remote
+                )
+            operations = _git_operation_entries(repo)
+            if operations:
+                return BaseWorktreeSyncResult(
+                    "skipped",
+                    "진행 중 Git operation: " + ", ".join(sorted(operations)),
+                    selected_remote,
+                )
             return BaseWorktreeSyncResult("equal", "이미 원격 base와 같음", selected_remote)
+        before = _base_worktree_snapshot(repo)
+        if before.branch is None:
+            return BaseWorktreeSyncResult("skipped", "detached HEAD", selected_remote)
+        if before.branch != base:
+            return BaseWorktreeSyncResult(
+                "skipped",
+                f"다른 branch checkout: {before.branch}",
+                selected_remote,
+            )
+        if before.operations:
+            return BaseWorktreeSyncResult(
+                "skipped",
+                "진행 중 Git operation: " + ", ".join(name for name, _ in before.operations),
+                selected_remote,
+            )
+        if before.head == selected_remote:
+            return BaseWorktreeSyncResult("equal", "이미 원격 base와 같음", selected_remote)
+        index_error = _base_worktree_index_error(before)
+        if index_error:
+            return BaseWorktreeSyncResult(
+                "skipped",
+                f"비정상 index entry: {index_error}",
+                selected_remote,
+            )
 
         behind = git(
             repo,
             "merge-base",
             "--is-ancestor",
-            local_sha,
+            before.head,
             selected_remote,
             check=False,
         )
@@ -6245,7 +6324,7 @@ def synchronize_base_worktree(
                 "merge-base",
                 "--is-ancestor",
                 selected_remote,
-                local_sha,
+                before.head,
                 check=False,
             )
             if ahead.returncode not in {0, 1}:
@@ -6262,24 +6341,23 @@ def synchronize_base_worktree(
             _nul_git_paths(
                 repo,
                 "diff",
+                "--no-renames",
                 "--name-only",
                 "-z",
-                local_sha,
+                before.head,
                 selected_remote,
             )
         )
-        overlaps = sorted(
-            ignored_path
-            for ignored_path in ignored
-            if any(
-                _paths_overlap(ignored_path, changed_path)
-                for changed_path in changed_paths
-            )
-        )
+        overlaps = sorted({
+            (kind, path)
+            for kind, path, _ in before.changes
+            if any(_base_paths_overlap(path, changed) for changed in changed_paths)
+        })
         if overlaps:
             return BaseWorktreeSyncResult(
                 "skipped",
-                "원격 변경과 겹치는 ignored 경로: " + ", ".join(overlaps[:8]),
+                "원격 변경과 겹치는 로컬 경로: "
+                + ", ".join(f"{kind} {path}" for kind, path in overlaps[:8]),
                 selected_remote,
             )
 
@@ -6290,7 +6368,17 @@ def synchronize_base_worktree(
                 "eligibility 확인 뒤 기본 worktree 상태가 변경됨",
                 selected_remote,
             )
-        updated = git(repo, "merge", "--ff-only", selected_remote, check=False)
+        current_remote = git(
+            repo, "rev-parse", "--verify", f"refs/remotes/origin/{base}^{{commit}}"
+        ).stdout.strip()
+        if current_remote != selected_remote:
+            return BaseWorktreeSyncResult(
+                "skipped", "eligibility 확인 뒤 origin ref가 변경됨", selected_remote
+            )
+        updated = git(
+            repo, "merge", "--ff-only", "--no-autostash", selected_remote,
+            check=False,
+        )
         if updated.returncode:
             output = updated.stdout[-2000:].strip()
             reason = "Git lock 충돌" if is_git_lock_failure(output) else "fast-forward 실패"
@@ -6306,7 +6394,7 @@ def synchronize_base_worktree(
             )
         return BaseWorktreeSyncResult("updated", "원격 base로 fast-forward", selected_remote)
     except (GitLockError, RuntimeError, OSError) as error:
-        return BaseWorktreeSyncResult("failed", str(error), remote_sha or "")
+        return BaseWorktreeSyncResult("failed", str(error), selected_remote)
 
 
 def ensure_safe_base_worktree(
@@ -6321,8 +6409,6 @@ def ensure_safe_base_worktree(
 
 
 def log_base_worktree_sync(repo: Path, result: BaseWorktreeSyncResult) -> None:
-    if result.status == "equal":
-        return
     operation_log(
         f"기본 worktree 동기화 {result.status} ({repo}): {result.reason}",
         error=result.status in {"skipped", "failed"},
