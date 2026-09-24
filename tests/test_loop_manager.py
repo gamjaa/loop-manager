@@ -4742,8 +4742,6 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             'question': 'Which migration should be used?',
         }
         review = f"SPEC_DEADLOCK: {json.dumps(evidence)}\nVERDICT: SPEC_BLOCKED"
-        snapshot = mock.Mock()
-        snapshot.serialize.return_value = 'saved-worktree'
         with (
             mock.patch.object(loop_manager, '_revision_execplan_input_fingerprint',
                               return_value='source-base'),
@@ -4754,7 +4752,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         ):
             loop_manager._reclassify_remote_specification_deadlock(
                 connection, Path('/repo'), 'repo', blocked, checkpoint, request,
-                'accepted-oid', Path('/state/G-047'), snapshot, (), review,
+                'accepted-oid', Path('/state/G-047'), review,
             )
         plan = connection.execute(
             "SELECT * FROM exec_plans WHERE repo = 'repo' AND plan_id = 'G-047'"
@@ -4781,8 +4779,30 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         self.assertEqual(saved['accepted_remote_oid'], 'accepted-oid')
         self.assertEqual(saved['reason_code'], 'review_specification_deadlock')
         self.assertNotEqual(saved['request_identity'], request.request_identity)
+        self.assertIsNone(saved['inspected_remote_oid'])
+        self.assertIsNone(saved['inspected_input'])
+        self.assertIsNone(saved['inspection_reason'])
         self.assertEqual(json.loads(recovery['final_evidence'])['user_targets'],
                          ['docs/ARCHITECTURE.md'])
+
+        snapshot = mock.Mock()
+        snapshot.serialize.return_value = 'saved-worktree'
+        with (
+            mock.patch.object(loop_manager._BlockedCheckpointAdapter, 'observe_remote',
+                              return_value='accepted-oid'),
+            mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
+            mock.patch.object(loop_manager, 'validate_managed_worktree'),
+            mock.patch.object(loop_manager, 'capture_git_snapshot',
+                              return_value=snapshot),
+            mock.patch.object(loop_manager, '_nul_git_paths', return_value=()),
+            mock.patch.object(loop_manager, 'run_agent') as reviewer,
+        ):
+            next_result = loop_manager._reconcile_published_blocked_checkpoint(
+                connection, Path('/repo'), Path('/state'), 'repo', plan,
+                saved, checkpoint.get('repo', 'G-047'), checkpoint,
+            )
+        self.assertEqual(next_result, 'unchanged')
+        reviewer.assert_not_called()
 
     def test_review_specification_block_uses_source_revision_not_worker_progress(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -14444,8 +14444,6 @@ def _reclassify_remote_specification_deadlock(
     request: blocked_checkpoint.CheckpointRequest,
     accepted_oid: str,
     worktree: Path,
-    snapshot: GitSnapshot,
-    ignored_paths: tuple[str, ...],
     review: str,
 ) -> None:
     """Persist a newly discovered specification block beside its published checkpoint."""
@@ -14510,17 +14508,10 @@ def _reclassify_remote_specification_deadlock(
         )
         if changed.rowcount != 1:
             raise RuntimeError("원격 checkpoint 차단 원인이 변경됐습니다.")
-        refreshed = connection.execute(
-            "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
-            (repo, blocked["plan_id"]),
-        ).fetchone()
-        input_identity = _remote_checkpoint_input_identity(
-            refreshed, snapshot, ignored_paths,
-        )
         repository.reclassify_published(
             request, reason_code=reason.value, evidence=review,
             release_fingerprint=release_fingerprint,
-            accepted_oid=accepted_oid, input_identity=input_identity,
+            accepted_oid=accepted_oid,
         )
         notifications.enqueue_current_project_events(connection, repo)
 
@@ -14767,7 +14758,7 @@ def _reconcile_published_blocked_checkpoint(
             try:
                 _reclassify_remote_specification_deadlock(
                     connection, repo_path, repo, blocked, repository, request,
-                    observed, worktree, adopted_snapshot, ignored_paths, assessment,
+                    observed, worktree, assessment,
                 )
             except (OSError, RuntimeError, ValueError) as error:
                 return retry(f"원격 checkpoint 명세 교착 기록 미완료: {error}")

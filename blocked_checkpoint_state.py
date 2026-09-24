@@ -338,9 +338,8 @@ class BlockedCheckpointRepository:
         evidence: str,
         release_fingerprint: str,
         accepted_oid: str,
-        input_identity: str,
     ) -> None:
-        """Keep a published checkpoint while replacing its final block cause."""
+        """Keep the published checkpoint; let document release checks run again."""
 
         if request.phase is not CheckpointPhase.PUBLISHED:
             raise RuntimeError("게시되지 않은 checkpoint의 차단 원인을 바꿀 수 없습니다.")
@@ -356,9 +355,9 @@ class BlockedCheckpointRepository:
             remote_oid=accepted_oid,
             accepted_remote_oid=accepted_oid,
             pending_remote_oid=None,
-            inspected_remote_oid=accepted_oid,
-            inspected_input=input_identity,
-            inspection_reason=evidence,
+            inspected_remote_oid=None,
+            inspected_input=None,
+            inspection_reason=None,
             inspection_retryable=0,
         )
 
