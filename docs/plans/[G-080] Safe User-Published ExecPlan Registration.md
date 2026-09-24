@@ -38,9 +38,9 @@ priority: critical
 
 ## Progress
 
-- [ ] 외부 신규 active ID의 안전 판정 및 pinned Git 입력 경계 구현
-- [ ] 신규 등록과 선언 cache 갱신의 원자적 CAS 처리
-- [ ] 중단 복구·멱등성·안전 거부 회귀 시나리오 검증
+- [x] 외부 신규 active ID의 안전 판정 및 pinned Git 입력 경계 구현
+- [x] 신규 등록과 선언 cache 갱신의 원자적 CAS 처리
+- [x] 중단 복구·멱등성·안전 거부 회귀 시나리오 검증
 
 ## Decision Log
 

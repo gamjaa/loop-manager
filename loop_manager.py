@@ -2009,7 +2009,25 @@ class _GitCatalogDefinitionPort:
             raise execplan_catalog_state.InvalidPinnedCatalog(
                 diagnostic
             ) from error
-        return execplan_catalog_state.PinnedCatalog(revision_sha, snapshot)
+        tree = git_bytes(
+            self.repo, "ls-tree", "-r", "-z", "--full-tree", revision_sha
+        )
+        regular_paths: set[str] = set()
+        for record in tree.split(b"\0"):
+            if not record:
+                continue
+            metadata, _separator, path = record.partition(b"\t")
+            if metadata.split()[:2] not in (
+                [b"100644", b"blob"], [b"100755", b"blob"]
+            ):
+                continue
+            try:
+                regular_paths.add(path.decode("utf-8"))
+            except UnicodeDecodeError:
+                continue
+        return execplan_catalog_state.PinnedCatalog(
+            revision_sha, snapshot, frozenset(regular_paths)
+        )
 
 
 def reconcile_execplan_catalog(
@@ -3432,37 +3450,8 @@ def _register_execplan_rows(
                     (initial_level, initial_level, repo, plan_id),
                 )
             continue
-        connection.execute(
-            """
-            INSERT INTO exec_plans (
-                repo, plan_id, path, title, sources, depends_on, priority,
-                content_hash, current_complexity, current_risk,
-                current_revision_sha, publication_path,
-                publication_content_hash, publication_sha,
-                status, plan_sha, initial_worker_level,
-                effective_worker_level
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                      'READY', ?, ?, ?)
-            """,
-            (
-                repo,
-                plan_id,
-                path,
-                str(plan["title"]),
-                sources,
-                dependencies,
-                priority,
-                content_hash,
-                str(plan["complexity"]),
-                str(plan["risk"]),
-                plan_commit,
-                path,
-                content_hash,
-                plan_commit,
-                plan_commit,
-                initial_level,
-                initial_level,
-            ),
+        execplan_catalog_state.insert_published_plan_row(
+            connection, repo, path, plan, content_hash, plan_commit,
         )
 
 
