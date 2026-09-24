@@ -4,6 +4,8 @@ title: Persistent Execution Failure Notification
 sources:
   - docs/requirements/[R-029] Persistent Execution Failure Notification.md
 depends_on:
+  - G-041
+  - G-045
   - G-051
   - G-056
   - G-057
