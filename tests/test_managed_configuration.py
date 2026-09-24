@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 import loop_manager
-from managed_config import ManagedConfigError, load_managed_config
+from managed_config import ManagedConfig, ManagedConfigError, load_managed_config
 import project_registry
 
 
@@ -127,6 +127,54 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
                         load_managed_config(invalid)
                     self.assertIn("refactoring_review_interval", str(raised.exception))
                     self.assertNotIn("do-not-leak", str(raised.exception))
+
+    def test_verify_timeout_defaults_and_rejects_invalid_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.ini"
+            path.write_text("[loop]\n", encoding="utf-8")
+            self.assertEqual(load_managed_config(path).verify_timeout_seconds, 600)
+            path.write_text("[loop]\nverify_timeout_seconds = 42\n", encoding="utf-8")
+            self.assertEqual(load_managed_config(path).verify_timeout_seconds, 42)
+            for value in ("0", "-1", "1.5", "abc", "1_0"):
+                with self.subTest(value=value):
+                    path.write_text(
+                        f"[loop]\nverify_timeout_seconds = {value}\n",
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(ManagedConfigError, "verify_timeout_seconds"):
+                        load_managed_config(path)
+
+    def test_invalid_verify_timeout_stops_before_database_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.ini"
+            config.write_text(
+                "[loop]\nverify_timeout_seconds = 0\n", encoding="utf-8"
+            )
+            with self.assertRaises(ManagedConfigError):
+                loop_manager.execute_runtime_command(
+                    loop_manager.build_parser().parse_args(["init"]),
+                    root / "state", config,
+                )
+            self.assertFalse((root / "state/loop-manager.db").exists())
+
+    def test_scheduler_passes_configured_verify_timeout_to_project_worker(self):
+        config = ManagedConfig(
+            Path('/config.ini'), 1, '', '', verify_timeout_seconds=42,
+        )
+        result = loop_manager.ScheduledProjectResult(
+            '/repo', loop_manager.ProjectRunResult(loop_manager.ProjectRunKind.WAITING, 0),
+        )
+        with mock.patch.object(
+            project_registry, 'list_projects', return_value=(self._record('/repo'),)
+        ), mock.patch.object(
+            loop_manager, '_run_registered_project', return_value=result
+        ) as worker:
+            self.assertEqual(
+                loop_manager.schedule_registered_projects(mock.Mock(), Path('/state'), config),
+                (result,),
+            )
+        self.assertEqual(worker.call_args.args[-1], 42)
 
     def test_invalid_refactoring_interval_stops_before_database_creation(self):
         with tempfile.TemporaryDirectory() as directory:

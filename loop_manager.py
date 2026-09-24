@@ -93,6 +93,7 @@ from agent_provider_usage import claude_usage, codex_log_usage
 import agent_invocation_state
 import validation_feedback_state
 from validation_feedback import redact_secrets
+from verify_process import run_verify_process, VerifyTerminationUncertain
 from execution_state import ExecutionStatePort as _ExecutionStatePort
 from types import SimpleNamespace
 from maintenance_planning import (
@@ -7008,14 +7009,17 @@ class VerifyOutput(str):
     """Bounded persisted feedback that retains full output for fingerprinting."""
 
     fingerprint_source: str
+    timed_out: bool
 
-    def __new__(cls, output: str) -> VerifyOutput:
-        instance = super().__new__(cls, output.strip()[-8000:])
+    def __new__(cls, output: str, *, timed_out: bool = False) -> VerifyOutput:
+        shown = redact_secrets(output) if timed_out else output
+        instance = super().__new__(cls, shown.strip()[-8000:])
         instance.fingerprint_source = output
+        instance.timed_out = timed_out
         return instance
 
 
-def verify(worktree: Path) -> tuple[bool, str]:
+def verify(worktree: Path, timeout_seconds: int = 600) -> tuple[bool, str]:
     if os.name == "nt":
         script = worktree / "scripts/verify.ps1"
         executable = shutil.which("pwsh") or shutil.which("powershell")
@@ -7025,8 +7029,13 @@ def verify(worktree: Path) -> tuple[bool, str]:
         arguments = ["bash", str(script)]
     if not script.is_file():
         return False, f"전체 검증 스크립트가 없습니다: {script.relative_to(worktree)}"
-    result = command(arguments, cwd=worktree, check=False)
-    return result.returncode == 0, VerifyOutput(result.stdout)
+    passed, timed_out, output = run_verify_process(arguments, worktree, timeout_seconds)
+    if timed_out:
+        output += (
+            f"\n전체 verify 시간 초과: verify_timeout_seconds={timeout_seconds}. "
+            "verify와 자식 프로세스 종료를 확인했습니다."
+        )
+    return passed, VerifyOutput(output, timed_out=timed_out)
 
 
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -7239,7 +7248,11 @@ def validation_failure_fingerprints(
     output: str,
     worktree: Path | None = None,
 ) -> tuple[tuple[str, str], ...]:
-    normalized = normalize_validation_failure(stage, output, worktree)
+    normalized = (
+        "전체 verify 시간 초과"
+        if stage == "verify" and getattr(output, "timed_out", False)
+        else normalize_validation_failure(stage, output, worktree)
+    )
     failures = normalized.splitlines() if stage == "review" else [normalized]
     fingerprints = []
     for failure in failures:
@@ -10953,6 +10966,8 @@ def block_active_execplan(
     reason: BlockReasonCode = BlockReasonCode.PLAN_INPUT_INVALID,
     preserved_agent_result_snapshot: str | None = None,
     recovery_decision: recovery_runtime.RecoveryDecision | None = None,
+    release_fingerprint: str | None = None,
+    worker_result: str | None = None,
 ) -> None:
     project = connection.execute(
         "SELECT plan_path, phase, agent_role, agent_snapshot, agent_input_fingerprint, "
@@ -10979,6 +10994,7 @@ def block_active_execplan(
     fingerprint = str(
         project["agent_input_fingerprint"] or blocked_worktree_fingerprint
     )
+    block_fingerprint = release_fingerprint or fingerprint
     agent_result_snapshot = preserved_agent_result_snapshot
     if agent_result_snapshot is None:
         try:
@@ -10994,7 +11010,7 @@ def block_active_execplan(
         if plan_file.is_file():
             agent_result_plan = plan_file.read_text(encoding="utf-8")
     plan_values = {
-        "blocked_fingerprint": fingerprint,
+        "blocked_fingerprint": block_fingerprint,
         "blocked_worktree_fingerprint": blocked_worktree_fingerprint,
         "blocked_review_fingerprint": None,
         "last_error": error,
@@ -11003,6 +11019,8 @@ def block_active_execplan(
         "agent_result_plan": agent_result_plan,
         "agent_manager_snapshot": None,
     }
+    if worker_result is not None:
+        plan_values["worker_result"] = worker_result
     plan_id = str(plan["plan_id"])
     with runtime_state._transaction(connection):
         decision = _final_block_recovery_decision(
@@ -11015,7 +11033,7 @@ def block_active_execplan(
                 plan_id,
                 reason_code=reason.value,
                 evidence=error,
-                release_fingerprint=fingerprint,
+                release_fingerprint=block_fingerprint,
                 plan_values=plan_values,
                 clear_projection=True,
             )
@@ -11043,6 +11061,35 @@ def block_active_execplan(
                 recovery_decision=decision,
             )
             notifications.enqueue_current_project_events(connection, repo)
+
+
+def block_verify_timeout_limit(
+    connection: sqlite3.Connection,
+    repo: str,
+    worktree: Path,
+    worker_result: str,
+    evidence: str,
+    verify_result: str,
+) -> str:
+    observed = re.search(
+        r"전체 verify 시간 초과: verify_timeout_seconds=([1-9][0-9]*)",
+        verify_result,
+    )
+    if observed is None:
+        raise RuntimeError("verify 시간 초과 상한 증거가 없습니다.")
+    timeout = int(observed.group(1))
+    detail = (
+        f"전체 verify에 필요한 검증이 진행 중이었으나 현재 상한 "
+        f"verify_timeout_seconds={timeout}초가 부족합니다. "
+        f"[loop] verify_timeout_seconds를 늘리세요.\n"
+        f"진행 근거: {redact_secrets(evidence)[-1800:]}"
+    )
+    block_active_execplan(
+        connection, repo, worktree, detail, verify_result,
+        reason=BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT,
+        release_fingerprint=str(timeout), worker_result=worker_result,
+    )
+    return detail
 
 
 def _final_block_recovery_decision(
@@ -13483,6 +13530,8 @@ def resume_plan_blocks(
     state_dir: Path,
     repo: str,
     base: str,
+    config_path: Path | None = None,
+    verify_timeout_seconds: int | None = None,
 ) -> bool:
     """Reevaluate each plan block without letting one overwrite another."""
 
@@ -13528,6 +13577,48 @@ def resume_plan_blocks(
                     "자동 merge, rebase 또는 덮어쓰기를 거부합니다.",
                 )
                 continue
+        if blocked["blocked_reason"] == BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT.value:
+            old_timeout = int(blocked["blocked_fingerprint"])
+            new_timeout = (
+                verify_timeout_seconds
+                if verify_timeout_seconds is not None
+                else load_managed_config(config_path or ROOT / "config/config.ini").verify_timeout_seconds
+            )
+            if new_timeout <= old_timeout:
+                continue
+            hydrate_execplan_project(connection, repo, blocked)
+            worktree = Path(str(blocked["worktree"]))
+            try:
+                validate_execplan_workspace_identity(
+                    state_dir, repo, str(blocked["plan_id"]),
+                    str(blocked["branch"]), worktree,
+                )
+                validate_blocked_agent_scope(
+                    connection, repo_path, repo, base, worktree,
+                    str(blocked["path"]),
+                )
+            except (AgentScopeError, WorkspaceOwnershipError, RuntimeError) as error:
+                _update_blocked_error(connection, repo, str(blocked["plan_id"]), str(error))
+                with connection:
+                    _clear_active_in_current_transaction(connection, repo)
+                continue
+            with connection:
+                runtime_state.RuntimeStateRepository(connection).transition(
+                    repo, str(blocked["plan_id"]),
+                    plan_values={
+                        "status": "VERIFYING", "blocked_reason": None,
+                        "blocked_fingerprint": None,
+                        "blocked_worktree_fingerprint": None,
+                        "blocked_review_fingerprint": None,
+                        "verify_failure_history": "{}",
+                        "retry_count": 0,
+                        "last_error": None,
+                    },
+                    project_values={"phase": "VERIFYING", "last_error": None},
+                    enqueue=False,
+                )
+                scoped_blocking.clear_plan_block(connection, repo, str(blocked["plan_id"]))
+            return True
         hydrate_execplan_project(connection, repo, blocked)
         resume = (
             resume_guidance_approval_if_decided
@@ -14293,6 +14384,15 @@ def worker_prompt(
         if validation_feedback
         else ""
     )
+    if "전체 verify 시간 초과:" in (error or "") or "전체 verify 시간 초과:" in (validation_feedback or ""):
+        failure += (
+            "검증 출력과 진행 위치, 실행된 테스트 및 verify 스크립트를 확인해 "
+            "무한 반복·교착·중복 검증을 먼저 점검하라. 필요한 검증을 삭제하거나 "
+            "시간 상한을 임의로 올리지 마라. 필요한 검증이 정상 진행했고 현재 "
+            "상한만 부족하다는 구체적 근거가 확인되면 PR_SUMMARY 안에 "
+            "VERIFY_TIMEOUT_LIMIT_INSUFFICIENT: <진행 근거와 필요한 설정 조정> "
+            "한 줄을 적어라.\n"
+        )
     if archive_candidates:
         archive_instruction = (
             "\n다음 Requirement만 내용 변경 없이 같은 파일명으로 "
@@ -16240,6 +16340,7 @@ def _run_project_step(
     registered_only: bool = False,
     planner_mutex: threading.Lock | None = None,
     refactoring_review_interval: int = 5,
+    verify_timeout_seconds: int = 600,
 ) -> int:
     # Resolve the persisted project key without consulting repository config.
     # An interrupted Agent may have changed origin or hooksPath, so the saved
@@ -16605,7 +16706,10 @@ def _run_project_step(
             )
             operation_print(message, file=sys.stderr)
             return 1
-    resume_plan_blocks(connection, repo_path, state_dir, repo, base)
+    resume_plan_blocks(
+        connection, repo_path, state_dir, repo, base, config_path,
+        verify_timeout_seconds,
+    )
     row = connection.execute(
         "SELECT * FROM projects WHERE repo = ?", (repo,)
     ).fetchone()
@@ -16723,6 +16827,7 @@ def _run_project_step(
         base_sha=base_sha,
         provider=provider,
         config_path=config_path,
+        verify_timeout_seconds=verify_timeout_seconds,
         newly_activated=newly_activated,
     )
     execution = ExecutionPhaseCoordinator(execution_ports)
@@ -16816,6 +16921,7 @@ def run_project_result(
     registered_only: bool = False,
     planner_mutex: threading.Lock | None = None,
     refactoring_review_interval: int = 5,
+    verify_timeout_seconds: int = 600,
     on_step_completed: Callable[[], None] | None = None,
 ) -> ProjectRunResult:
     """Run retryable validation progress to a stable project-level outcome."""
@@ -16866,6 +16972,7 @@ def run_project_result(
                 registered_only,
                 planner_mutex,
                 refactoring_review_interval,
+                verify_timeout_seconds,
             )
         except GitLockError as error:
             _record_project_recovery(
@@ -17006,6 +17113,7 @@ def run_project(
     registered_only: bool = False,
     planner_mutex: threading.Lock | None = None,
     refactoring_review_interval: int = 5,
+    verify_timeout_seconds: int = 600,
 ) -> int:
     """CLI-compatible adapter for the reusable structured project result."""
 
@@ -17020,6 +17128,7 @@ def run_project(
         registered_only=registered_only,
         planner_mutex=planner_mutex,
         refactoring_review_interval=refactoring_review_interval,
+        verify_timeout_seconds=verify_timeout_seconds,
     ).exit_code
 
 
@@ -17031,6 +17140,7 @@ def _run_registered_project(
     telegram_chat_id: str,
     planner_mutex: threading.Lock,
     refactoring_review_interval: int,
+    verify_timeout_seconds: int = 600,
 ) -> ScheduledProjectResult:
     """Run one registry row with state isolated to this worker connection."""
 
@@ -17071,6 +17181,7 @@ def _run_registered_project(
                 registered_only=True,
                 planner_mutex=planner_mutex,
                 refactoring_review_interval=refactoring_review_interval,
+                verify_timeout_seconds=verify_timeout_seconds,
                 on_step_completed=deliver_new_pr_notifications,
             )
     except (ManagedConfigError, project_registry.ProjectRegistryError) as error:
@@ -17123,6 +17234,7 @@ def schedule_registered_projects(
                 config.telegram_chat_id,
                 planner_mutex,
                 config.refactoring_review_interval,
+                config.verify_timeout_seconds,
             )
             for project in projects
         )
@@ -18077,6 +18189,7 @@ def _typed_execution_command(*arguments: object, **options: object):
 
 def _ExecutionLifecyclePorts(connection, runtime_repository, **identity):
     """Bind named effects to legacy helpers, preserving their patch points."""
+    verify_timeout_seconds = identity.pop("verify_timeout_seconds", 600)
     state = _ExecutionStatePort(connection, runtime_repository, identity["repo"])
     effects = execution_handlers.ExecutionEffects(
         state=state,
@@ -18092,6 +18205,7 @@ def _ExecutionLifecyclePorts(connection, runtime_repository, **identity):
             'ReviewerProtocolError', 'TRANSIENT_AGENT_ERROR_PREFIX',
             'USAGE_LIMIT_ERROR_PREFIX', 'WORKSPACE_OWNED', 'WORKSPACE_RESERVED',
             'WorkerResultError', 'WorkspaceOwnershipError',
+            'VerifyTerminationUncertain',
         )}),
         workspace=execution_handlers.WorkspaceEffects(
             is_directory=lambda path: path.is_dir(),
@@ -18131,7 +18245,16 @@ def _ExecutionLifecyclePorts(connection, runtime_repository, **identity):
             ),
         ),
         validation=execution_handlers.ValidationEffects(
-            verify=state.bind(verify, name="verify", connected=False, mutates=False),
+            verify=state.bind(
+                lambda worktree: verify(
+                    worktree, verify_timeout_seconds,
+                ),
+                name="verify", connected=False, mutates=False,
+            ),
+            block_verify_timeout_limit=state.bind(
+                block_verify_timeout_limit, name="block_verify_timeout_limit",
+                connected=True, mutates=True,
+            ),
             parse_worker_result=state.bind(parse_worker_result, name="parse_worker_result", connected=False, mutates=False),
             parse_reviewer_result=state.bind(parse_reviewer_result, name="parse_reviewer_result", connected=False, mutates=False),
             validate_active_execplan_metadata=state.bind(validate_active_execplan_metadata, name="validate_active_execplan_metadata", connected=False, mutates=False),

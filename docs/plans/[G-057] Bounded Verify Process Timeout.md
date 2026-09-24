@@ -35,8 +35,8 @@ priority: critical
 
 ## Progress
 
-- [ ] verify 설정 및 프로세스 종료 경계 추가
-- [ ] 시간 초과 분류·재개 targeted test 추가
+- [x] verify 설정 및 프로세스 종료 경계 추가
+- [x] 시간 초과 분류·재개 targeted test 추가
 
 ## Decision Log
 

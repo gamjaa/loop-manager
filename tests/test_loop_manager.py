@@ -4166,6 +4166,28 @@ risk: medium
 
 
 class BoundedExecutionRecoveryTest(unittest.TestCase):
+    def test_verify_port_uses_supplied_timeout_without_rereading_config(self):
+        from tests.test_runtime_state import RuntimeStateRepositoryTest
+        import runtime_state
+
+        connection = RuntimeStateRepositoryTest()._connection()
+        self.addCleanup(connection.close)
+        repository = runtime_state.RuntimeStateRepository(connection)
+        repository.activate(
+            'repo', 'G-047', activation_sha='base',
+            branch='loop-manager/G-047', worktree='/state/G-047',
+        )
+        with mock.patch.object(loop_manager, 'verify', return_value=(True, 'OK')) as verify:
+            ports = _real_execution_ports(
+                connection, repository, repo='repo', repo_path=Path('/repo'),
+                state_dir=Path('/state'), base='main', base_sha='base',
+                provider='codex', config_path=Path('unused.ini'),
+                verify_timeout_seconds=42,
+                newly_activated=False,
+            )
+            self.assertEqual(ports.effects.validation.verify(Path('/state/G-047')), (True, 'OK'))
+        verify.assert_called_once_with(Path('/state/G-047'), 42)
+
     def _failure_state(
         self,
         directory: str,
@@ -4543,11 +4565,8 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             ]
             ordered = "\n".join(lines)
             reordered = "\n".join(reversed(lines))
-            results = [
-                subprocess.CompletedProcess(["verify"], 1, stdout=ordered),
-                subprocess.CompletedProcess(["verify"], 1, stdout=reordered),
-            ]
-            with mock.patch("loop_manager.command", side_effect=results):
+            results = [(False, False, ordered), (False, False, reordered)]
+            with mock.patch("loop_manager.run_verify_process", side_effect=results):
                 first_passed, first_output = loop_manager.verify(worktree)
                 second_passed, second_output = loop_manager.verify(worktree)
 
@@ -6927,6 +6946,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "scoped_blocking.py",
                 "validation_feedback.py",
                 "validation_feedback_state.py",
+                "verify_process.py",
                 "worker_session.py",
             ):
                 shutil.copy(loop_manager.ROOT / module_name, repo / module_name)
@@ -9419,7 +9439,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
             )
             connection.commit()
 
-            def verify_with_protected_mutation(agent_worktree):
+            def verify_with_protected_mutation(agent_worktree, timeout_seconds):
+                self.assertEqual(timeout_seconds, 600)
                 (agent_worktree / "docs/requirements/Active.md").write_text(
                     "# changed by verify\n",
                     encoding="utf-8",
@@ -9483,7 +9504,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 ),
                 "# changed by verify\n",
             )
-            verify.assert_called_once_with(worktree)
+            verify.assert_called_once_with(worktree, 600)
             agent.assert_not_called()
 
     def test_rebase_verify_allowed_change_is_committed_before_review(self):
@@ -9553,7 +9574,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 )
                 return 1, "stop after publication check"
 
-            def verify_after_rebase(agent_worktree):
+            def verify_after_rebase(agent_worktree, timeout_seconds):
+                self.assertEqual(timeout_seconds, 600)
                 verify_calls.append(agent_worktree)
                 if len(verify_calls) == 1:
                     (agent_worktree / "verify-output.txt").write_text(
@@ -14785,6 +14807,7 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
                 registered_only,
                 planner_mutex,
                 refactoring_review_interval,
+                verify_timeout_seconds,
                 on_step_completed,
             ):
                 nonlocal active_workers, maximum_workers
@@ -14794,6 +14817,10 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
                 self.assertEqual(
                     refactoring_review_interval,
                     config.refactoring_review_interval,
+                )
+                self.assertEqual(
+                    verify_timeout_seconds,
+                    config.verify_timeout_seconds,
                 )
                 with guard:
                     connections.append(worker_connection)

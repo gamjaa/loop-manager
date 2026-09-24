@@ -68,7 +68,7 @@ bash scripts/setup.sh
 
 현재 최소 실행기는 외부 Python 패키지를 사용하지 않으므로 `requirements.txt`에는 의존성이 없다. 이후 패키지가 추가돼도 같은 스크립트를 다시 실행하면 된다.
 
-`config/config.ini.example`을 `config/config.ini`로 복사한 뒤 Codex와 Claude Code의 AI Agent 모델, Telegram 설정과 동시 실행 수를 입력한다. `max_workers` 기본값은 3이다.
+`config/config.ini.example`을 `config/config.ini`로 복사한 뒤 Codex와 Claude Code의 AI Agent 모델, Telegram 설정과 동시 실행 수를 입력한다. `max_workers` 기본값은 3이다. 전체 verify의 `verify_timeout_seconds` 기본값은 600초이며, 필요한 검증이 정상 진행 중인데 상한이 부족하면 `[loop]`에서 늘릴 수 있다.
 
 ```powershell
 Copy-Item -LiteralPath config/config.ini.example -Destination config/config.ini
