@@ -4026,7 +4026,8 @@ risk: medium
         self.assertEqual(sessions, [None] + ["worker-session"] * 3)
         fingerprint = next(iter(history))
         self.assertIn(
-            f"verify:{fingerprint} occurrence=1 revision=1\nverify failed",
+            f"verify:{fingerprint} occurrence=1 revision=1\n"
+            "verify exit code: unavailable\nverify failed",
             prompts[1],
         )
         self.assertNotIn("전체 검증 실패:\nverify failed", prompts[1])

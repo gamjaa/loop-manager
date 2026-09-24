@@ -437,6 +437,35 @@ class ExecutionHandlerTests(TestCase):
                          [('failure', raw), ('success', 'SUCCESS output')])
         self.assertEqual(feedback.prepare('repo', 'G-047', 'session').rows, ())
 
+    def test_verify_feedback_extracts_full_failure_source_not_persisted_tail(self):
+        feedback = ValidationFeedbackRepository(self.connection)
+        self._with_feedback(feedback)
+        raw = (
+            'FAILED tests/test_focus.py::test_message - AssertionError: expected message\n'
+            'E       assert actual == expected\n'
+            '================= 1 failed, 99 passed =================\n'
+            + 'PASS unrelated completion\n' * 800
+        )
+        self.effects.validation.verify.side_effect = None
+        self.effects.validation.verify.return_value = (
+            False, lm.VerifyOutput(raw, exit_code=1),
+        )
+        self.effects.validation.transition_validation_failure.return_value = SimpleNamespace(
+            blocked=False, fingerprint='fingerprint',
+        )
+
+        self.handler._verify_once(self.context('VERIFYING'))
+
+        row, = feedback.prepare('repo', 'G-047', 'session').rows
+        self.assertIn('tests/test_focus.py::test_message', row['diagnostic'])
+        self.assertIn('assert actual == expected', row['diagnostic'])
+        self.assertIn('verify exit code: 1', row['diagnostic'])
+        self.assertNotIn('unrelated completion', row['diagnostic'])
+        audit = self.connection.execute(
+            'SELECT raw_output FROM validation_results'
+        ).fetchone()
+        self.assertEqual(audit['raw_output'], raw)
+
     def test_timeout_verify_uses_stable_fingerprint_and_returns_to_worker(self):
         feedback = ValidationFeedbackRepository(self.connection)
         self._with_feedback(feedback)

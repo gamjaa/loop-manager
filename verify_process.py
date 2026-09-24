@@ -15,6 +15,17 @@ class VerifyTerminationUncertain(RuntimeError):
     """The process tree may still be running; no further work is safe."""
 
 
+class VerifyProcessOutput(str):
+    """Captured verify output with the subprocess's observed exit code."""
+
+    exit_code: int | None
+
+    def __new__(cls, output: str, *, exit_code: int | None) -> VerifyProcessOutput:
+        instance = super().__new__(cls, output)
+        instance.exit_code = exit_code
+        return instance
+
+
 _LINUX_SUBREAPER = """\
 import ctypes
 import os
@@ -273,7 +284,9 @@ def run_verify_process(
         try:
             code = process.wait(timeout=timeout_seconds)
             output.seek(0)
-            return code == 0, False, output.read().decode("utf-8", errors="replace")
+            return code == 0, False, VerifyProcessOutput(
+                output.read().decode("utf-8", errors="replace"), exit_code=code,
+            )
         except subprocess.TimeoutExpired:
             descendants = {}
             if os.name == "nt":
@@ -314,4 +327,6 @@ def run_verify_process(
                 _confirm_posix_group_stopped(process.pid)
                 if descendants:
                     _confirm_linux_descendants_stopped(descendants)
-            return False, True, _tail(output)
+            return False, True, VerifyProcessOutput(
+                _tail(output), exit_code=process.returncode,
+            )
