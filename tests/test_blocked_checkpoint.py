@@ -347,7 +347,7 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
         self.connection.close()
         self.temporary.cleanup()
 
-    def block(self, reason="verify_retry_exhausted"):
+    def block(self, reason="verify_retry_exhausted", evidence="same verify failure"):
         with self.connection:
             self.connection.execute(
                 "UPDATE exec_plans SET agent_result_snapshot = ?",
@@ -357,7 +357,7 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
                 str(self.repo.resolve()),
                 "G-034",
                 reason_code=reason,
-                evidence="same verify failure",
+                evidence=evidence,
                 release_fingerprint="fingerprint",
                 clear_projection=True,
             )
@@ -365,11 +365,12 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
             self.connection
         ).get(str(self.repo.resolve()), "G-034")
 
-    def publish_block(self, reason="verify_retry_exhausted"):
+    def publish_block(self, reason="verify_retry_exhausted",
+                      evidence="code.py: same verify failure"):
         (self.worktree / "code.py").write_text("checkpoint\n", encoding="utf-8")
         self.run_git(self.worktree, "add", "code.py")
         self.run_git(self.worktree, "commit", "-m", "Blocked checkpoint")
-        request = self.block(reason)
+        request = self.block(reason, evidence=evidence)
         oid = self.run_git(self.worktree, "rev-parse", "HEAD")
         self.run_git(
             self.worktree, "push", "origin",
@@ -609,6 +610,105 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
         ))
         self.assertEqual(self.run_git(self.worktree, "rev-parse", "HEAD"), next_oid)
 
+    def test_unrelated_readme_and_code_commits_keep_failure_blocked(self):
+        self.publish_block()
+        readme_oid = self.user_commit("README.md", "unrelated notes\n")
+        self.assertFalse(loop_manager.resume_plan_blocks(
+            self.connection, self.repo, self.state_dir,
+            str(self.repo.resolve()), "main",
+        ))
+        unrelated_oid = self.user_commit("unrelated.py", "unrelated = True\n")
+        self.assertFalse(loop_manager.resume_plan_blocks(
+            self.connection, self.repo, self.state_dir,
+            str(self.repo.resolve()), "main",
+        ))
+        self.assertEqual(self.connection.execute(
+            "SELECT status FROM exec_plans WHERE plan_id = 'G-034'"
+        ).fetchone()[0], "PLAN_BLOCKED")
+        self.assertEqual(self.connection.execute(
+            "SELECT accepted_remote_oid FROM blocked_checkpoints"
+        ).fetchone()[0], unrelated_oid)
+        self.assertNotEqual(readme_oid, unrelated_oid)
+
+        correction_oid = self.user_commit("code.py", "corrected failure\n")
+        self.assertTrue(loop_manager.resume_plan_blocks(
+            self.connection, self.repo, self.state_dir,
+            str(self.repo.resolve()), "main",
+        ))
+        self.assertEqual(self.run_git(self.worktree, "rev-parse", "HEAD"),
+                         correction_oid)
+
+    def test_review_result_path_controls_remote_release(self):
+        self.publish_block(
+            reason="review_retry_exhausted", evidence="review failed",
+        )
+        self.connection.execute(
+            "UPDATE exec_plans SET review_result = 'code.py: blocking issue' "
+            "WHERE plan_id = 'G-034'"
+        )
+        self.connection.commit()
+        self.user_commit("README.md", "unrelated notes\n")
+        self.assertFalse(loop_manager.resume_plan_blocks(
+            self.connection, self.repo, self.state_dir,
+            str(self.repo.resolve()), "main",
+        ))
+        self.assertEqual(self.connection.execute(
+            "SELECT status FROM exec_plans WHERE plan_id = 'G-034'"
+        ).fetchone()[0], "PLAN_BLOCKED")
+
+        corrected = self.user_commit("code.py", "fixed review issue\n")
+        self.assertTrue(loop_manager.resume_plan_blocks(
+            self.connection, self.repo, self.state_dir,
+            str(self.repo.resolve()), "main",
+        ))
+        self.assertEqual(self.run_git(self.worktree, "rev-parse", "HEAD"),
+                         corrected)
+
+    def test_interruption_after_release_does_not_restore_old_agent_snapshot(self):
+        self.publish_block()
+        stale = loop_manager.capture_git_snapshot(self.worktree).serialize()
+        self.connection.execute(
+            "UPDATE exec_plans SET agent_role = 'worker', agent_snapshot = ?, "
+            "agent_result_snapshot = ?, agent_manager_snapshot = ?, "
+            "agent_baseline = 'old' WHERE plan_id = 'G-034'",
+            (stale, stale, stale),
+        )
+        self.connection.commit()
+        corrected = self.user_commit()
+        original = loop_manager._resume_remote_corrected_execplan
+
+        def interrupted(*arguments):
+            original(*arguments)
+            raise KeyboardInterrupt
+
+        with mock.patch.object(loop_manager, "_resume_remote_corrected_execplan",
+                               side_effect=interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                loop_manager.resume_plan_blocks(
+                    self.connection, self.repo, self.state_dir,
+                    str(self.repo.resolve()), "main",
+                )
+
+        stored = self.connection.execute(
+            "SELECT status, agent_role, agent_snapshot, agent_result_snapshot, "
+            "agent_manager_snapshot, agent_baseline FROM exec_plans "
+            "WHERE plan_id = 'G-034'"
+        ).fetchone()
+        self.assertEqual(stored["status"], "IMPLEMENTING")
+        self.assertTrue(all(value is None for value in tuple(stored)[1:]))
+        loop_manager.hydrate_active_project(
+            self.connection, str(self.repo.resolve()),
+        )
+        project = self.connection.execute(
+            "SELECT agent_role, agent_snapshot, agent_result_snapshot, "
+            "agent_manager_snapshot FROM projects"
+        ).fetchone()
+        self.assertTrue(all(value is None for value in project))
+        resumed_scope = loop_manager.begin_agent_scope(
+            self.connection, str(self.repo.resolve()), self.worktree, "worker",
+        )
+        self.assertEqual(resumed_scope.head, corrected)
+
     def test_remote_plan_input_correction_restarts_worker(self):
         self.publish_block(reason="plan_input_invalid")
         blocked = self.connection.execute(
@@ -688,7 +788,7 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
         exclude = self.run_git(self.worktree, "rev-parse", "--git-path", "info/exclude")
         Path(exclude).write_text("cache.txt\n", encoding="utf-8")
         (self.worktree / "cache.txt").write_text("local cache\n", encoding="utf-8")
-        self.user_commit("cache.txt", "remote cache\n")
+        cache_oid = self.user_commit("cache.txt", "remote cache\n")
 
         self.assertFalse(loop_manager.resume_plan_blocks(
             self.connection, self.repo, self.state_dir,
@@ -701,10 +801,23 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
         ).fetchone()[0])
 
         (self.worktree / "cache.txt").unlink()
+        self.assertFalse(loop_manager.resume_plan_blocks(
+            self.connection, self.repo, self.state_dir,
+            str(self.repo.resolve()), "main",
+        ))
+        self.assertEqual(self.run_git(self.worktree, "rev-parse", "HEAD"),
+                         cache_oid)
+        self.assertEqual(self.connection.execute(
+            "SELECT status FROM exec_plans WHERE plan_id = 'G-034'"
+        ).fetchone()[0], "PLAN_BLOCKED")
+
+        corrected = self.user_commit("code.py", "corrected verify failure\n")
         self.assertTrue(loop_manager.resume_plan_blocks(
             self.connection, self.repo, self.state_dir,
             str(self.repo.resolve()), "main",
         ))
+        self.assertEqual(self.run_git(self.worktree, "rev-parse", "HEAD"),
+                         corrected)
 
     def test_unrelated_ignored_file_survives_remote_fast_forward(self):
         self.publish_block()

@@ -14031,6 +14031,12 @@ def _resume_remote_corrected_execplan(
                 "verify_failure_history": "{}", "review_failure_history": "{}",
                 "effective_worker_level": plan["initial_worker_level"],
                 "review_level_history": "{}",
+                "agent_role": None, "agent_snapshot": None,
+                "agent_baseline": None, "agent_recovery": None,
+                "agent_input_plan": None, "agent_result_plan": None,
+                "agent_input_fingerprint": None,
+                "agent_result_snapshot": None,
+                "agent_manager_snapshot": None,
             },
             project_values={
                 "phase": "WORKING", "last_error": None,
@@ -14259,19 +14265,21 @@ def _reconcile_published_blocked_checkpoint(
     input_identity = _remote_checkpoint_input_identity(
         blocked, capture_git_snapshot(worktree), ignored_paths,
     )
-    code_changed = any(
-        not path.startswith("docs/") and path != "AGENTS.md"
-        for path in changed_paths
+    failure_evidence = "\n".join(
+        str(value) for value in (
+            request.evidence,
+            blocked["verify_result"]
+            if blocked["blocked_reason"] == BlockReasonCode.VERIFY_RETRY_EXHAUSTED.value
+            else blocked["review_result"],
+        ) if value
     )
-    if code_changed and blocked["blocked_reason"] in {
-        BlockReasonCode.VERIFY_RETRY_EXHAUSTED.value,
-        BlockReasonCode.REVIEW_RETRY_EXHAUSTED.value,
-        BlockReasonCode.REVIEW_PROTOCOL_EXHAUSTED.value,
-        BlockReasonCode.WORKER_OUTPUT_INVALID.value,
-    }:
+    corrected_paths = execution_revision.remote_failure_correction_paths(
+        str(blocked["blocked_reason"]), changed_paths, failure_evidence,
+    )
+    if corrected_paths:
         _resume_remote_corrected_execplan(
             connection, repo, blocked, repository, request, observed,
-            input_identity, "사용자 코드/테스트 변경을 Worker부터 재검증",
+            input_identity, "실패 증거에 연결된 사용자 변경을 Worker부터 재검증",
         )
         return "resumed"
     if blocked["blocked_reason"] == BlockReasonCode.PLAN_INPUT_INVALID.value and (

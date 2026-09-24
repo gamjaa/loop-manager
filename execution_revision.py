@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 import hashlib
 import json
+import re
 from typing import Iterable
 
 
@@ -39,6 +40,30 @@ _PHASE_ORDER = {
     "REVIEWING": 2,
     "PUBLISHING": 3,
 }
+
+
+_REMOTE_FAILURE_REASONS = frozenset({
+    "verify_retry_exhausted",
+    "review_retry_exhausted",
+})
+
+
+def remote_failure_correction_paths(
+    reason_code: str,
+    changed_paths: Iterable[str],
+    failure_evidence: str,
+) -> tuple[str, ...]:
+    """Identify changed files tied to the stored validation or review failure."""
+    if reason_code not in _REMOTE_FAILURE_REASONS or not failure_evidence:
+        return ()
+    evidence = failure_evidence.replace("\\", "/")
+    return tuple(
+        path for path in changed_paths
+        if re.search(
+            rf"(?<![\w.-]){re.escape(path)}(?![\w./-])",
+            evidence,
+        )
+    )
 
 
 def _digest(label: str, values: Iterable[object]) -> str:
