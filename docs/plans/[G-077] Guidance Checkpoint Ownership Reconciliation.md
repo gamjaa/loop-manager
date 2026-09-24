@@ -56,3 +56,6 @@ Worker의 AGENTS.md guidance 제안이 사용자 결정을 기다리는 동안, 
 - PRODUCT의 checkpoint OID 보존, guidance 결정별 차단 해제와 허용되지 않은 공유 ref만 프로젝트 차단한다는 기존 규칙을 구현한다. 새로운 사용자 동작이나 AGENTS.md 권한을 추가하지 않는다.
 - checkpoint 게시 뒤의 ref 소유권 판정은 ARCHITECTURE.md의 Architecture Change Policy 중 branch·commit·push 경계와 맞닿아 있다. 구현이 그 경계를 바꾸는 것으로 판정되면 사용자 승인을 받기 전에는 해당 변경을 진행하지 않고 ExecPlan을 BLOCKED로 둔다.
 - G-058의 guidance 제안과 User Decision은 이 계획의 변경 대상이 아니다. 프로젝트가 PROJECT_BLOCKED인 동안 자동 Worker를 시작하거나 안전 gate를 우회하지 않는다.
+
+- 재개 시 확인: 이전 자동 승인 검토에서 checkpoint 영속 상태 형식과 branch/ref 소유권 판정 변경이 거부되었으며, 현재 문서에는 이를 승인한 사용자 결정이 없다. Architecture Change Policy에 따라 해당 구현을 보류한다. 승인 대상은 저장된 게시 OID를 이용한 후속 checkpoint ref 소유권 판정, 검증된 Merge worktree 정리 증거의 반영, checkpoint·게시·guidance 증거를 이용한 기존 이중 차단 복구다. 기존 공유 ref 보호와 증명 불가 시 차단 보존은 유지해야 한다.
+- 미해결 검증 범위: 실제 코드·테스트 파일이 포함된 checkpoint tree와 게시 후 재시작 중복 방지는 아직 검증하지 못했다. 기존 Worker 상태 보존 단위 테스트의 합성 snapshot은 이 Acceptance Criteria를 충족하는 증거로 간주하지 않는다. AGENTS.md 규칙 변경은 필요하지 않으며, 이 기록은 사용자 승인이나 완료 판정을 대신하지 않는다.
