@@ -52,7 +52,7 @@ def _linux_group_has_live_members(pgid: int, proc_root: Path = Path("/proc")) ->
                     continue
                 try:
                     stat = (Path(entry.path) / "stat").read_text(encoding="ascii")
-                except FileNotFoundError:
+                except (FileNotFoundError, ProcessLookupError):
                     continue
                 end = stat.rfind(")")
                 fields = stat[end + 2:].split() if end >= 0 else []
@@ -97,7 +97,7 @@ def _linux_process_info(pid: int) -> tuple[int, int, str, int] | None:
 
     try:
         stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii", errors="replace")
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return None
     except OSError as error:
         raise VerifyTerminationUncertain(
@@ -161,6 +161,79 @@ def _signal_linux_process(pid: int, start_time: int, action: int) -> None:
         ) from error
 
 
+def _wait_linux_process_stopped(
+    pid: int, start_time: int, deadline: float, *, required: bool = False,
+) -> None:
+    while True:
+        info = _linux_process_info(pid)
+        if info is None or info[3] != start_time:
+            if required:
+                raise VerifyTerminationUncertain(
+                    f"verify 부모 정지 전 소실 (PID {pid})"
+                )
+            return
+        if required and info[2] in {"Z", "X"}:
+            raise VerifyTerminationUncertain(
+                f"verify 부모 종료로 자식 추적 불가 (PID {pid})"
+            )
+        if info[2] in {"T", "t", "Z", "X"}:
+            return
+        if time.monotonic() >= deadline:
+            raise VerifyTerminationUncertain(
+                f"verify 자식 정지 확인 실패 (PID {pid})"
+            )
+        time.sleep(0.05)
+
+
+def _stop_linux_tree(root_pid: int) -> dict[int, int]:
+    """Freeze every observed descendant before the final ancestry snapshot."""
+
+    try:
+        os.killpg(root_pid, signal.SIGSTOP)
+    except ProcessLookupError:
+        raise VerifyTerminationUncertain(
+            f"verify 자식 추적 전 process group 소실 (PGID {root_pid})"
+        ) from None
+    except OSError as error:
+        raise VerifyTerminationUncertain(
+            f"verify process group 정지 실패 (PGID {root_pid}): {error}"
+        ) from error
+
+    descendants: dict[int, int] = {}
+    try:
+        root = _linux_process_info(root_pid)
+        if root is None:
+            raise VerifyTerminationUncertain(
+                f"verify 부모 상태 확인 실패 (PID {root_pid})"
+            )
+        deadline = time.monotonic() + 2
+        _wait_linux_process_stopped(
+            root_pid, root[3], deadline, required=True,
+        )
+        while True:
+            discovered = _linux_descendants(root_pid)
+            new = {
+                pid: started for pid, started in discovered.items()
+                if descendants.get(pid) != started
+            }
+            if not new:
+                return descendants
+            descendants.update(new)
+            for pid, started in new.items():
+                _signal_linux_process(pid, started, signal.SIGSTOP)
+            for pid, started in new.items():
+                _wait_linux_process_stopped(pid, started, deadline)
+            if time.monotonic() >= deadline:
+                raise VerifyTerminationUncertain(
+                    f"verify 자식 추적 상한 초과 (PGID {root_pid})"
+                )
+    except Exception:
+        os.killpg(root_pid, signal.SIGKILL)
+        for pid, started in descendants.items():
+            _signal_linux_process(pid, started, signal.SIGKILL)
+        raise
+
+
 def _confirm_linux_descendants_stopped(descendants: dict[int, int]) -> None:
     deadline = time.monotonic() + 2
     while True:
@@ -220,38 +293,7 @@ def run_verify_process(
                     )
             else:
                 if sys.platform.startswith("linux"):
-                    try:
-                        os.killpg(process.pid, signal.SIGSTOP)
-                    except ProcessLookupError:
-                        raise VerifyTerminationUncertain(
-                            f"verify 자식 추적 전 process group 소실 (PGID {process.pid})"
-                        ) from None
-                    except OSError as error:
-                        raise VerifyTerminationUncertain(
-                            f"verify process group 정지 실패 (PGID {process.pid}): {error}"
-                        ) from error
-                    try:
-                        deadline = time.monotonic() + 2
-                        while True:
-                            discovered = _linux_descendants(process.pid)
-                            new = {
-                                pid: started for pid, started in discovered.items()
-                                if pid not in descendants
-                            }
-                            if not new:
-                                break
-                            descendants.update(new)
-                            for pid, started in new.items():
-                                _signal_linux_process(pid, started, signal.SIGSTOP)
-                            if time.monotonic() >= deadline:
-                                raise VerifyTerminationUncertain(
-                                    f"verify 자식 추적 상한 초과 (PGID {process.pid})"
-                                )
-                    except Exception:
-                        os.killpg(process.pid, signal.SIGKILL)
-                        for pid, started in descendants.items():
-                            _signal_linux_process(pid, started, signal.SIGKILL)
-                        raise
+                    descendants = _stop_linux_tree(process.pid)
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
