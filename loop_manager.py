@@ -13749,7 +13749,10 @@ def _resume_reopened_pull_request(
     head_oid: object,
     *,
     recovery: bool,
+    conflict_oids: tuple[str, str] | None = None,
 ) -> None:
+    if conflict_oids is not None and not recovery:
+        raise ValueError("PR 충돌 복구 OID는 복구 전이에만 기록할 수 있습니다.")
     phase = "WORKING" if recovery else "PR_OPEN"
     status = "IMPLEMENTING" if recovery else "PR_OPEN"
     last_error = REBASE_IN_PROGRESS_ERROR if recovery else None
@@ -13776,7 +13779,13 @@ def _resume_reopened_pull_request(
                 verify_result=None,
                 review_result=None,
             )
-    with connection:
+            if conflict_oids is not None:
+                values.update(
+                    pr_conflict_recovery=1,
+                    pr_conflict_head_oid=conflict_oids[0],
+                    pr_conflict_base_oid=conflict_oids[1],
+                )
+    with runtime_state._transaction(connection):
         mirrored = connection.execute(
             "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
         ).fetchone()
@@ -13907,13 +13916,10 @@ def reconcile_existing_pull_request(
                 url,
                 head_oid,
                 recovery=mergeability == "conflicting",
+                conflict_oids=(observed_head, base_oid)
+                if mergeability == "conflicting" else None,
             )
             if mergeability == "conflicting":
-                update_project(
-                    connection, repo, pr_conflict_recovery=1,
-                    pr_conflict_head_oid=observed_head,
-                    pr_conflict_base_oid=base_oid,
-                )
                 operation_print(f"PR 충돌 자동 복구 재개: {url}")
                 return None
             operation_print(f"PR_OPEN 충돌 복구 false positive 자동 해제: {url}")

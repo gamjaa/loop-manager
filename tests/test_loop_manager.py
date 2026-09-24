@@ -13475,6 +13475,25 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             project = connection.execute(
                 "SELECT * FROM projects WHERE repo = ?", (str(repo),)
             ).fetchone()
+            with mock.patch(
+                "loop_manager.notifications.enqueue_current_project_events",
+                side_effect=RuntimeError("interrupt before commit"),
+            ), self.assertRaisesRegex(RuntimeError, "interrupt before commit"):
+                loop_manager.reconcile_existing_pull_request(
+                    connection, repo, state_dir, str(repo), project,
+                    self._pull_request(branch, url, head, "CONFLICTING"),
+                )
+            interrupted = connection.execute(
+                "SELECT status, pr_conflict_recovery, pr_conflict_head_oid, "
+                "pr_conflict_base_oid FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-026'", (str(repo),),
+            ).fetchone()
+            self.assertEqual(tuple(interrupted), ("PLAN_BLOCKED", 0, None, None))
+            interrupted_project = connection.execute(
+                "SELECT phase, pr_conflict_recovery FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(tuple(interrupted_project), ("PLAN_BLOCKED", 0))
             result = loop_manager.reconcile_existing_pull_request(
                 connection, repo, state_dir, str(repo), project,
                 self._pull_request(branch, url, head, "CONFLICTING"),
@@ -13489,6 +13508,11 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                 tuple(stored),
                 ("IMPLEMENTING", 1, head, "worker-existing", "reviewer-existing"),
             )
+            resumed_project = connection.execute(
+                "SELECT phase, pr_conflict_recovery, pr_conflict_head_oid "
+                "FROM projects WHERE repo = ?", (str(repo),),
+            ).fetchone()
+            self.assertEqual(tuple(resumed_project), ("WORKING", 1, head))
             self.assertTrue(cache.is_file())
 
     def test_conflicting_pr_blocks_ignored_path_overlapping_base_update(self):
