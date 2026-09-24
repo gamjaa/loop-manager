@@ -156,6 +156,92 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
                 load_managed_config(config)
             self.assertNotIn(secret, str(raised.exception))
 
+    def test_persistent_failure_queues_once_and_keeps_disabled_diagnostics(self):
+        connection = self.connection(enabled=False)
+        repo = "/projects/alpha"
+        repository = RecoveryRepository(connection)
+        failure = RecoveryObservation(
+            RecoveryReason.FETCH_FAILED, repo, "G-018", "PUBLISHING",
+            "plan-sha", "base-sha", "fetch-failure", "head-a", "fetch failed",
+        )
+        for _ in range(3):
+            before = repository.external_run_snapshot(repo)
+            repository.observe(failure)
+            repository.observe_external_run(repo, before)
+        notifications.enqueue_persistent_execution_failure_events(connection, repo)
+        self.assertEqual(self.events(connection), [])
+        diagnostic = connection.execute(
+            "SELECT consecutive_runs, notification_eligible, notification_queued "
+            "FROM persistent_execution_failures WHERE repo = ? AND subject = 'G-018'",
+            (repo,),
+        ).fetchone()
+        self.assertEqual(tuple(diagnostic), (3, 1, 0))
+
+        notifications.configure_session(connection, enabled=True)
+        with connection:
+            notifications.enqueue_persistent_execution_failure_events(connection, repo)
+            notifications.enqueue_persistent_execution_failure_events(connection, repo)
+        events = self.events(connection)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event_type"], "persistent_execution_failure")
+        payload = json.loads(events[0]["payload"])
+        self.assertEqual(payload["consecutive_external_runs"], 3)
+        self.assertEqual(payload["execplan_id"], "G-018")
+        self.assertIn("fetch failed", notifications._message(events[0]["event_type"], payload))
+
+        failed = mock.Mock(side_effect=RuntimeError("network unavailable"))
+        self.assertEqual(
+            notifications.dispatch_pending(connection, "token", "chat", adapter=failed),
+            0,
+        )
+        delivered = mock.Mock()
+        self.assertEqual(
+            notifications.dispatch_pending(connection, "token", "chat", adapter=delivered),
+            1,
+        )
+        delivered.assert_called_once()
+
+    def test_failed_persistent_delivery_remains_retryable_after_resolution(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        repository = RecoveryRepository(connection)
+        failure = RecoveryObservation(
+            RecoveryReason.FETCH_FAILED, repo, "G-018", "PUBLISHING",
+            "plan-sha", "base-sha", "fetch-failure", "head-a", "fetch failed",
+        )
+        for _ in range(3):
+            before = repository.external_run_snapshot(repo)
+            repository.observe(failure)
+            repository.observe_external_run(repo, before)
+        with connection:
+            notifications.enqueue_persistent_execution_failure_events(connection, repo)
+
+        failed = mock.Mock(side_effect=RuntimeError("network unavailable"))
+        for _ in range(2):
+            self.assertEqual(
+                notifications.dispatch_pending(
+                    connection, "token", "chat", adapter=failed,
+                ),
+                0,
+            )
+        with connection:
+            repository.finish_external_run(repo, None, resolved=True)
+        event = connection.execute(
+            "SELECT attempts, sent_at FROM notification_outbox "
+            "WHERE repo = ? AND event_type = 'persistent_execution_failure'",
+            (repo,),
+        ).fetchone()
+        self.assertEqual(tuple(event), (2, None))
+
+        delivered = mock.Mock()
+        self.assertEqual(
+            notifications.dispatch_pending(
+                connection, "token", "chat", adapter=delivered,
+            ),
+            1,
+        )
+        delivered.assert_called_once()
+
     def test_pr_and_blocked_payloads_are_complete_and_deduplicated(self):
         connection = self.connection()
         repo = "/projects/alpha"
