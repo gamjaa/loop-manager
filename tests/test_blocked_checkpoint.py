@@ -418,7 +418,7 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
         )
         self.assertEqual(adapter.observe_remote(request), next_oid)
 
-    def test_ignored_symlink_and_unowned_staged_paths_are_rejected_without_commit(self):
+    def test_symlink_and_unowned_staged_paths_remain_rejected_with_ignored_artifact(self):
         (self.worktree / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
         self.run_git(self.worktree, "add", ".gitignore")
         self.run_git(self.worktree, "commit", "-m", "ignore rule")
@@ -437,8 +437,37 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
         self.assertFalse(verdict.safe)
         self.assertEqual(verdict.reason_code, "dirty_scope_violation")
         self.assertIn("AGENTS.md", verdict.detail)
-        self.assertIn("ignored.txt", verdict.detail)
+        self.assertNotIn("ignored.txt", verdict.detail)
         self.assertIn("link.py", verdict.detail)
+        self.assertEqual(
+            (self.worktree / "ignored.txt").read_text(encoding="utf-8"),
+            "secret\n",
+        )
+
+    def test_ignored_only_artifact_is_preserved_without_checkpoint_commit(self):
+        (self.worktree / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+        self.run_git(self.worktree, "add", ".gitignore")
+        self.run_git(self.worktree, "commit", "-m", "ignore rule")
+        head = self.run_git(self.worktree, "rev-parse", "HEAD")
+        ignored = self.worktree / "ignored.txt"
+        ignored.write_text("local cache\n", encoding="utf-8")
+        request = self.block()
+        adapter = loop_manager._BlockedCheckpointAdapter(
+            self.connection,
+            self.repo,
+            self.state_dir,
+            str(self.repo.resolve()),
+        )
+        verdict = adapter.assess(request)
+        self.assertTrue(verdict.safe, verdict.detail)
+        self.assertEqual(verdict.included_paths, ())
+        prepared = adapter.prepare(request, verdict)
+        self.assertEqual(adapter.ensure_local_commit(request, prepared), head)
+        self.assertEqual(
+            self.run_git(self.worktree, "ls-files", "--stage", "ignored.txt"),
+            "",
+        )
+        self.assertEqual(ignored.read_text(encoding="utf-8"), "local cache\n")
 
     def test_existing_pr_short_circuits_dispatch_after_safety_before_push(self):
         request = self.block()

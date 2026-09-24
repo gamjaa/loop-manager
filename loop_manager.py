@@ -1373,6 +1373,15 @@ def is_git_lock_failure(output: str) -> bool:
 
 
 def git(repo: Path, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    if arguments and arguments[0] == "rebase" and not arguments[-1].startswith("-"):
+        overlaps = _ignored_paths_overlapping_git_update(repo, arguments[-1])
+        if overlaps:
+            message = "rebase 대상 tracked 경로와 겹치는 ignored 파일: " + ", ".join(overlaps[:8])
+            if check:
+                raise ManagedWorktreeConflictError(message)
+            return subprocess.CompletedProcess(
+                ["git", "-C", str(repo), *arguments], 1, message
+            )
     result = command(["git", "-C", str(repo), *arguments], check=False)
     if check and result.returncode:
         output = result.stdout[-6000:].strip()
@@ -5590,6 +5599,19 @@ def _paths_overlap(left: str, right: str) -> bool:
     return left_parts[:shorter] == right_parts[:shorter]
 
 
+def _ignored_paths_overlapping_git_update(worktree: Path, target: str) -> list[str]:
+    ignored = _ignored_worktree_paths(worktree)
+    if not ignored:
+        return []
+    changed = _nul_git_paths(
+        worktree, "diff", "--name-only", "-z", "HEAD", target
+    )
+    return sorted(
+        path for path in ignored
+        if any(_paths_overlap(path, candidate) for candidate in changed)
+    )
+
+
 def _base_worktree_snapshot(
     repo: Path,
 ) -> tuple[str | None, str, str, tuple[tuple[str, str], ...], tuple[str, ...]]:
@@ -6213,12 +6235,6 @@ def agent_environment(
     environment = {
         key: value for key, value in os.environ.items() if key.upper() in allowed
     }
-    if role_name == "planner":
-        # A Planner often imports project modules while inspecting a planning
-        # worktree. The scope snapshot deliberately includes ignored files,
-        # so prevent Python's automatic cache writes at this subprocess
-        # boundary rather than weakening that validation.
-        environment["PYTHONDONTWRITEBYTECODE"] = "1"
     return environment
 
 
@@ -8184,10 +8200,38 @@ def _config_entries(worktree: Path) -> dict[str, tuple[str, ...]]:
         origin = _normalized_config_origin(worktree, raw_origin)
         digest = hashlib.sha256(origin + b"\0" + raw_value).hexdigest()
         entries.setdefault(f"{scope}:{name}", []).append(digest)
-    return {
+    snapshot = {
         key: tuple(sorted(values))
         for key, values in entries.items()
     }
+    repository_exclude = Path(
+        os.fsdecode(
+            git_bytes(worktree, "rev-parse", "--git-path", "info/exclude").strip()
+        )
+    )
+    if not repository_exclude.is_absolute():
+        repository_exclude = worktree / repository_exclude
+    configured_global = subprocess.run(
+        ["git", "-C", str(worktree), "config", "--path", "--get", "core.excludesFile"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if configured_global.returncode not in {0, 1}:
+        raise RuntimeError("Git global exclude 경로를 확인할 수 없습니다.")
+    if configured_global.returncode == 0:
+        global_exclude = Path(os.fsdecode(configured_global.stdout.strip()))
+    else:
+        global_exclude = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "git/ignore"
+    if not global_exclude.is_absolute():
+        global_exclude = worktree / global_exclude
+    for name, path in (
+        ("repository-exclude", repository_exclude),
+        ("global-exclude", global_exclude),
+    ):
+        canonical = _canonical_path(path)
+        signature = _git_operation_path_signature(canonical) if canonical.exists() else "missing"
+        snapshot[f"ignore-source:{name}"] = (str(canonical), signature)
+    return snapshot
 
 
 # AUTO_MERGE is deliberately excluded. The ort strategy may leave this
@@ -8351,6 +8395,7 @@ def _capture_local_worktree_state(
                 worktree,
                 "ls-files",
                 "--others",
+                "--exclude-standard",
                 "-z",
             ),
         ),
@@ -8358,6 +8403,18 @@ def _capture_local_worktree_state(
     for kind, paths in path_groups:
         for relative_path in paths:
             path_kinds.setdefault(relative_path, set()).add(kind)
+    # A changed ignore rule cannot make a new file disappear from the scope
+    # snapshot. Git's current exclude result is trustworthy only when the
+    # matching tracked rule is still the version at HEAD.
+    for relative_path in _nul_git_paths(
+        worktree, "ls-files", "--others", "--ignored", "--exclude-standard", "-z"
+    ):
+        source = _ignore_rule_source(worktree, relative_path)
+        if source is None:
+            raise RuntimeError(f"ignored 경로의 Git 규칙을 확인할 수 없습니다: {relative_path}")
+        if source == ".gitignore" or source.endswith("/.gitignore"):
+            if source in path_kinds or source not in index:
+                path_kinds.setdefault(relative_path, set()).add("untracked")
     for relative_path, entries in index.items():
         if _non_default_index_flags(entries):
             path_kinds.setdefault(relative_path, set()).add("index-hidden")
@@ -8384,6 +8441,47 @@ def _worktree_state_signature(worktree: Path) -> str:
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _ignore_rule_source(worktree: Path, path: str) -> str | None:
+    result = git(
+        worktree, "check-ignore", "--no-index", "-v", "--", path,
+        check=False,
+    )
+    if result.returncode == 1:
+        return None
+    source, separator, _rest = result.stdout.partition(":")
+    if result.returncode != 0 or not separator:
+        raise RuntimeError(f"ignored 경로의 Git 규칙을 확인할 수 없습니다: {path}")
+    return source
+
+
+def _normalize_legacy_ignored_snapshot(
+    worktree: Path, saved: GitSnapshot, current: GitSnapshot
+) -> GitSnapshot:
+    """Discard old untracked entries only when their starting ignore rule is proven."""
+
+    dirty = dict(saved.dirty)
+    for path, (kinds, _signature) in saved.dirty.items():
+        if kinds != ("untracked",) or path in current.dirty:
+            continue
+        if path in saved.index or path in current.index:
+            continue
+        source = _ignore_rule_source(worktree, path)
+        if source is None:
+            continue
+        if not (source == ".gitignore" or source.endswith("/.gitignore")):
+            continue
+        if source not in saved.index or saved.index.get(source) != current.index.get(source):
+            continue
+        if source in saved.dirty or source in current.dirty:
+            continue
+        old_rule = git(worktree, "rev-parse", f"{saved.head}:{source}", check=False)
+        new_rule = git(worktree, "rev-parse", f"{current.head}:{source}", check=False)
+        if old_rule.returncode or new_rule.returncode or old_rule.stdout != new_rule.stdout:
+            continue
+        dirty.pop(path)
+    return replace(saved, dirty=dirty) if dirty != saved.dirty else saved
 
 
 def capture_git_snapshot(worktree: Path) -> GitSnapshot:
@@ -8440,6 +8538,28 @@ def agent_snapshot_changes(
     ]
 
 
+def _scope_snapshot_with_start_ignore_rules(
+    worktree: Path, before: GitSnapshot, after: GitSnapshot
+) -> GitSnapshot:
+    """Keep paths hidden by a changed tracked ignore rule in scope."""
+
+    if before.head == after.head:
+        return after
+    dirty = dict(after.dirty)
+    for path in _nul_git_paths(
+        worktree, "ls-files", "--others", "--ignored", "--exclude-standard", "-z"
+    ):
+        source = _ignore_rule_source(worktree, path)
+        if source is None:
+            raise AgentScopeError(f"ignored 경로의 Git 규칙을 확인할 수 없습니다: {path}")
+        if source == ".gitignore" or source.endswith("/.gitignore"):
+            old_rule = git(worktree, "rev-parse", f"{before.head}:{source}", check=False)
+            new_rule = git(worktree, "rev-parse", f"{after.head}:{source}", check=False)
+            if old_rule.returncode or new_rule.returncode or old_rule.stdout != new_rule.stdout:
+                dirty[path] = (("untracked",), _path_signature(worktree, path))
+    return replace(after, dirty=dirty) if dirty != after.dirty else after
+
+
 def _worker_path_allowed(
     path: str,
     selected_plan_path: str,
@@ -8490,6 +8610,7 @@ def validate_agent_scope(
 ) -> None:
     """Validate the net Git mutation made by one Agent role."""
 
+    after = _scope_snapshot_with_start_ignore_rules(worktree, before, after)
     changes = agent_snapshot_changes(worktree, before, after)
     violations: list[str] = []
     violation_reason = BlockReasonCode.MANAGED_WORKTREE_SCOPE_VIOLATION
@@ -9062,6 +9183,16 @@ def assess_cleanup(worktree: Path, pr_head_oid: str | None) -> CleanupAssessment
         dirty_kinds.append("tracked 파일 수정")
     if dirty_kinds:
         return CleanupAssessment("dirty", ", ".join(dirty_kinds))
+    try:
+        _head, _branch, _index, dirty = _capture_local_worktree_state(worktree)
+        operations = _git_operation_entries(worktree)
+    except RuntimeError as error:
+        return CleanupAssessment("unverifiable", f"worktree 상태 확인 실패: {error}")
+    if dirty or operations:
+        return CleanupAssessment(
+            "dirty", "index flag 또는 Git operation 변경: "
+            + ", ".join(sorted((*dirty, *operations))),
+        )
 
     if not pr_head_oid:
         return CleanupAssessment("unverifiable", "PR head commit 정보가 없습니다.")
@@ -9142,7 +9273,11 @@ def remove_cleanup_worktree(
     if assessment.status != "safe":
         return assessment
     try:
-        git(repo, "worktree", "remove", str(worktree))
+        _head, _branch, _index, dirty = _capture_local_worktree_state(worktree)
+        if dirty or _git_operation_entries(worktree):
+            return CleanupAssessment("dirty", "worktree 제거 직전 권위 있는 변경이 있습니다.")
+        arguments = ("--force",) if _ignored_worktree_paths(worktree) else ()
+        git(repo, "worktree", "remove", *arguments, str(worktree))
     except RuntimeError as error:
         return CleanupAssessment("unverifiable", f"worktree 제거 실패: {error}")
     return assessment
@@ -11283,6 +11418,17 @@ def validate_persisted_agent_scope(
             raise AgentScopeError(
                 f"저장된 BLOCKED Agent 결과 snapshot이 유효하지 않습니다: {error}"
             ) from error
+
+    before = _normalize_legacy_ignored_snapshot(saved_worktree, before, current)
+    if result is not None:
+        result = _normalize_legacy_ignored_snapshot(saved_worktree, result, current)
+    if checkpoint is not None:
+        checkpoint = replace(
+            checkpoint,
+            snapshot=_normalize_legacy_ignored_snapshot(
+                saved_worktree, checkpoint.snapshot, current
+            ),
+        )
 
     try:
         decision = agent_scope_decision.decide_persisted_scope(
@@ -15007,6 +15153,16 @@ class _PlanningGitPorts:
     def run(
         self, repo: Path, *arguments: str, check: bool = True
     ) -> subprocess.CompletedProcess[str]:
+        if len(arguments) == 3 and arguments[:2] == ("worktree", "remove"):
+            workspace = Path(arguments[2])
+            validate_managed_worktree(repo, workspace, None)
+            _head, _branch, _index, dirty = _capture_local_worktree_state(workspace)
+            if dirty or _git_operation_entries(workspace):
+                raise WorkspaceOwnershipError(
+                    f"planning worktree에 권위 있는 변경이 남았습니다: {workspace}"
+                )
+            if _ignored_worktree_paths(workspace):
+                arguments = ("worktree", "remove", "--force", str(workspace))
         return git(repo, *arguments, check=check)
 
     def input_fingerprint(self, repo_path: Path, sha: str) -> str:
