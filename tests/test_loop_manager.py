@@ -13286,7 +13286,9 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                     "loop_manager.git", side_effect=recording_git
                 ), mock.patch(
                     "loop_manager._fetch_pr_conflict_recovery_refs"
-                ) as conflict_fetch:
+                ) as conflict_fetch, mock.patch(
+                    "loop_manager._validate_pr_conflict_recovery_ownership"
+                ) as conflict_ownership:
                     result = loop_manager.run_project(
                         connection,
                         state_dir,
@@ -13306,6 +13308,7 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                 self.assertEqual(git_calls, [])
                 self.assertTrue(cache.is_file())
                 conflict_fetch.assert_not_called()
+                conflict_ownership.assert_not_called()
                 synchronize.assert_not_called()
                 agent.assert_not_called()
                 verify.assert_not_called()
@@ -13346,14 +13349,21 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                 "SELECT * FROM projects WHERE repo = ?",
                 (str(repo),),
             ).fetchone()
-            result = loop_manager.reconcile_existing_pull_request(
-                connection,
-                repo,
-                state_dir,
-                str(repo),
-                project,
-                self._pull_request(branch, pr_url, head_oid, "MERGEABLE"),
-            )
+            with mock.patch(
+                "loop_manager._fetch_pr_conflict_recovery_refs"
+            ) as conflict_fetch, mock.patch(
+                "loop_manager._validate_pr_conflict_recovery_ownership"
+            ) as conflict_ownership:
+                result = loop_manager.reconcile_existing_pull_request(
+                    connection,
+                    repo,
+                    state_dir,
+                    str(repo),
+                    project,
+                    self._pull_request(branch, pr_url, head_oid, "MERGEABLE"),
+                )
+            conflict_fetch.assert_not_called()
+            conflict_ownership.assert_not_called()
             stored = connection.execute(
                 """
                 SELECT status, blocked_reason, blocked_fingerprint,
@@ -13377,6 +13387,168 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
         self.assertEqual(stored["verify_result"], "verify: PASS")
         self.assertEqual(stored["review_result"], "VERDICT: PASS")
         self.assertTrue(cache_preserved)
+
+    def test_unknown_preflight_block_with_ignored_cache_recovers_without_fetch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state_dir, connection, branch, worktree, url, head = (
+                self._pr_open_state(directory)
+            )
+            cache = self._add_ignored_cache(worktree)
+            loop_manager.block_active_execplan_from_revision(
+                connection, repo, str(repo), "refs/remotes/origin/main",
+                loop_manager.PR_CONFLICT_PREFLIGHT_ERROR_PREFIX + " ignored cache",
+                "verify: PASS",
+            )
+            blocked = connection.execute(
+                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-026'",
+                (str(repo),),
+            ).fetchone()
+            loop_manager.hydrate_execplan_project(connection, str(repo), blocked)
+            project = connection.execute(
+                "SELECT * FROM projects WHERE repo = ?", (str(repo),)
+            ).fetchone()
+            with mock.patch("loop_manager._fetch_pr_conflict_recovery_refs") as fetch:
+                result = loop_manager.reconcile_existing_pull_request(
+                    connection, repo, state_dir, str(repo), project,
+                    self._pull_request(branch, url, head, "UNKNOWN"),
+                )
+            stored = connection.execute(
+                "SELECT status, pr_conflict_recovery, verify_result FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-026'", (str(repo),),
+            ).fetchone()
+            self.assertEqual(result, 0)
+            self.assertEqual(tuple(stored), ("PR_OPEN", 0, "verify: PASS"))
+            self.assertTrue(cache.is_file())
+            fetch.assert_not_called()
+
+    def test_preflight_block_with_ignored_cache_and_tracked_change_stays_blocked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state_dir, connection, branch, worktree, url, head = (
+                self._pr_open_state(directory)
+            )
+            cache = self._add_ignored_cache(worktree)
+            loop_manager.block_active_execplan_from_revision(
+                connection, repo, str(repo), "refs/remotes/origin/main",
+                loop_manager.PR_CONFLICT_PREFLIGHT_ERROR_PREFIX + " ignored cache",
+                "verify: PASS",
+            )
+            (worktree / "src/app.py").write_text("VALUE = 99\n", encoding="utf-8")
+            blocked = connection.execute(
+                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-026'",
+                (str(repo),),
+            ).fetchone()
+            loop_manager.hydrate_execplan_project(connection, str(repo), blocked)
+            project = connection.execute(
+                "SELECT * FROM projects WHERE repo = ?", (str(repo),)
+            ).fetchone()
+            with mock.patch("loop_manager._fetch_pr_conflict_recovery_refs") as fetch:
+                result = loop_manager.reconcile_existing_pull_request(
+                    connection, repo, state_dir, str(repo), project,
+                    self._pull_request(branch, url, head, "MERGEABLE"),
+                )
+            stored = connection.execute(
+                "SELECT status, last_error FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-026'", (str(repo),),
+            ).fetchone()
+            self.assertEqual(result, 1)
+            self.assertEqual(stored["status"], "PLAN_BLOCKED")
+            self.assertIn("src/app.py", stored["last_error"])
+            self.assertTrue(cache.is_file())
+            fetch.assert_not_called()
+
+    def test_preflight_block_with_conflicting_pr_starts_owned_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state_dir, connection, branch, worktree, url, head = (
+                self._pr_open_state(directory)
+            )
+            cache = self._add_ignored_cache(worktree)
+            loop_manager.block_active_execplan_from_revision(
+                connection, repo, str(repo), "refs/remotes/origin/main",
+                loop_manager.PR_CONFLICT_PREFLIGHT_ERROR_PREFIX + " ignored cache",
+                "verify: PASS",
+            )
+            blocked = connection.execute(
+                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-026'",
+                (str(repo),),
+            ).fetchone()
+            loop_manager.hydrate_execplan_project(connection, str(repo), blocked)
+            project = connection.execute(
+                "SELECT * FROM projects WHERE repo = ?", (str(repo),)
+            ).fetchone()
+            result = loop_manager.reconcile_existing_pull_request(
+                connection, repo, state_dir, str(repo), project,
+                self._pull_request(branch, url, head, "CONFLICTING"),
+            )
+            stored = connection.execute(
+                "SELECT status, pr_conflict_recovery, pr_conflict_head_oid, "
+                "worker_session_id, reviewer_session_id FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-026'", (str(repo),),
+            ).fetchone()
+            self.assertIsNone(result)
+            self.assertEqual(
+                tuple(stored),
+                ("IMPLEMENTING", 1, head, "worker-existing", "reviewer-existing"),
+            )
+            self.assertTrue(cache.is_file())
+
+    def test_conflicting_pr_blocks_ignored_path_overlapping_base_update(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state_dir, connection, branch, worktree, url, head = (
+                self._pr_open_state(directory)
+            )
+            exclude = Path(git_command(worktree, "rev-parse", "--git-path", "info/exclude"))
+            if not exclude.is_absolute():
+                exclude = worktree / exclude
+            exclude.write_text(
+                exclude.read_text(encoding="utf-8") + "\noverlap.txt\n",
+                encoding="utf-8",
+            )
+            artifact = worktree / "overlap.txt"
+            artifact.write_text("preserve ignored artifact\n", encoding="utf-8")
+            self._advance_base(
+                directory, repo, "overlap.txt", "tracked base value\n",
+                "Add overlapping base file",
+            )
+            project = connection.execute(
+                "SELECT * FROM projects WHERE repo = ?", (str(repo),)
+            ).fetchone()
+            with mock.patch("loop_manager.git", wraps=loop_manager.git) as git_spy:
+                result = loop_manager.reconcile_existing_pull_request(
+                    connection, repo, state_dir, str(repo), project,
+                    self._pull_request(branch, url, head, "CONFLICTING"),
+                )
+            stored = connection.execute(
+                "SELECT status, last_error FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-026'", (str(repo),),
+            ).fetchone()
+            self.assertEqual(result, 1)
+            self.assertEqual(stored["status"], "PLAN_BLOCKED")
+            self.assertIn("overlap.txt", stored["last_error"])
+            self.assertEqual(artifact.read_text(encoding="utf-8"), "preserve ignored artifact\n")
+            self.assertFalse(any(call.args[1:2] == ("rebase",) for call in git_spy.call_args_list))
+
+    def test_conflicting_pr_rejects_nondefault_index_flags_with_ignored_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state_dir, connection, branch, worktree, url, head = (
+                self._pr_open_state(directory)
+            )
+            cache = self._add_ignored_cache(worktree)
+            git_command(worktree, "update-index", "--skip-worktree", "src/app.py")
+            project = connection.execute(
+                "SELECT * FROM projects WHERE repo = ?", (str(repo),)
+            ).fetchone()
+            result = loop_manager.reconcile_existing_pull_request(
+                connection, repo, state_dir, str(repo), project,
+                self._pull_request(branch, url, head, "CONFLICTING"),
+            )
+            stored = connection.execute(
+                "SELECT status, last_error FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-026'", (str(repo),),
+            ).fetchone()
+            self.assertEqual(result, 1)
+            self.assertEqual(stored["status"], "PLAN_BLOCKED")
+            self.assertIn("index flags src/app.py", stored["last_error"])
+            self.assertTrue(cache.is_file())
 
     def test_conflicting_pr_still_blocks_nonignored_untracked_change(self):
         with tempfile.TemporaryDirectory() as directory:
