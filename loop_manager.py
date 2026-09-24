@@ -18766,6 +18766,16 @@ def main() -> int:
         with process_lock(state_dir, identity=f"bootstrap:{mutation_id}") as lock_handle:
             runtime = prepare_bootstrap_runtime(source, state_dir, mutation_id)
             if isinstance(runtime, BootstrapRefreshHandoff):
+                if args.command != "run":
+                    command_name = (
+                        f"config {args.config_command}"
+                        if args.command == "config" else args.command
+                    )
+                    raise RuntimeError(
+                        f"bootstrap source를 origin/{runtime.base_branch} "
+                        f"{runtime.commit_sha}로 갱신해 {command_name} 명령은 "
+                        "실행하지 않았습니다. 같은 명령을 다시 실행하세요."
+                    )
                 return 0
             _write_process_lock_identity(lock_handle, f"runtime:{mutation_id}")
             return run_runtime_child(

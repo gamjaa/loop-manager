@@ -1148,6 +1148,46 @@ class OriginIsolatedRegistrationAndExecutionTest(unittest.TestCase):
                 self.assertEqual(selected.commit_sha, remote_sha)
                 self.assertEqual(git(selected.path, "rev-parse", "HEAD"), remote_sha)
 
+    def test_bootstrap_refresh_requires_retry_for_one_shot_commands(self):
+        commands = (
+            ("init",),
+            ("config", "init"),
+            ("config", "list"),
+            ("config", "add", "/project"),
+            ("config", "remove", "/project"),
+        )
+        for command in commands:
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as directory:
+                _remote, source, writer = remote_fixture(directory)
+                state_dir = Path(directory) / "state"
+                if command not in {("init",), ("config", "init")}:
+                    state_dir.mkdir()
+                    with sqlite3.connect(state_dir / "loop-manager.db") as connection:
+                        connection.execute(loop_manager.SCHEMA)
+                remote_sha = advance_remote(writer)
+                arguments = ["--state-dir", str(state_dir), *command]
+
+                with mock.patch.object(loop_manager, "ROOT", source), mock.patch.object(
+                    loop_manager.sys, "argv", ["loop_manager.py", *arguments]
+                ), mock.patch("loop_manager.github_repository", return_value="owner/repo"), mock.patch(
+                    "loop_manager.run_runtime_child", return_value=7
+                ) as child, mock.patch("loop_manager.operation_log") as log:
+                    self.assertEqual(loop_manager.main(), 1)
+                    child.assert_not_called()
+                    self.assertTrue(any(
+                        "같은 명령을 다시 실행하세요" in call.args[0]
+                        and call.kwargs.get("error") is True
+                        for call in log.call_args_list
+                    ))
+                    self.assertEqual(git(source, "rev-parse", "HEAD"), remote_sha)
+                    self.assertFalse((state_dir / "runtimes").exists())
+                    if command in {("init",), ("config", "init")}:
+                        self.assertFalse((state_dir / "loop-manager.db").exists())
+
+                    self.assertEqual(loop_manager.main(), 7)
+                    child.assert_called_once()
+                    self.assertEqual(child.call_args.args[-1], arguments)
+
     def test_bootstrap_equal_sha_allows_dirty_source(self):
         with tempfile.TemporaryDirectory() as directory:
             _remote, source, _writer = remote_fixture(directory)
