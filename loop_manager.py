@@ -16614,9 +16614,9 @@ class _PlanningStatePorts:
         return catalog_schedule_decision(self._connection, repo)
 
     def maintenance_due(
-        self, repo: str, interval: int
+        self, repo: str, interval: int, *, self_repository: bool = False
     ) -> maintenance_state.ReviewDue:
-        return self._maintenance_repository.due(repo, interval)
+        return self._maintenance_repository.due(repo, interval, self_repository=self_repository)
 
     def begin_maintenance_assessment(
         self,
@@ -16625,12 +16625,22 @@ class _PlanningStatePorts:
         base_sha: str,
         *,
         include_general_planning: bool,
+        self_repository: bool = False,
     ) -> tuple[maintenance_state.MaintenanceCycle, bool]:
         return self._maintenance_repository.begin_assessment_if_due(
             repo,
             interval,
             base_sha,
             include_general_planning=include_general_planning,
+            self_repository=self_repository,
+        )
+
+    def record_full_assessment(
+        self, repo: str, *, expected_revision: int, source_sha: str, result: str
+    ) -> maintenance_state.MaintenanceCycle:
+        return self._maintenance_repository.record_full_assessment(
+            repo, expected_revision=expected_revision, source_sha=source_sha,
+            result=result,
         )
 
     def restart_stale_maintenance(
@@ -17466,7 +17476,8 @@ def _execplan_archive_housekeeping_safe(
         if (
             not decision.has_waiting
             and maintenance_repository.due(
-                repo, refactoring_review_interval
+                repo, refactoring_review_interval,
+                self_repository=is_loop_manager_repository(Path(repo)),
             ).required
         ):
             return False
@@ -18312,6 +18323,7 @@ def _run_project_step(
         config_path=config_path,
         registered_only=registered_only,
         refactoring_review_interval=refactoring_review_interval,
+        self_repository=registered_only and is_loop_manager_repository(repo_path),
     )
     planning_outcome = PlanningLifecycleCoordinator(
         _PlanningLifecyclePorts(
@@ -18619,7 +18631,8 @@ def run_project_result(
         or (
             registered_only
             and maintenance_repository.due(
-                repo, refactoring_review_interval
+                repo, refactoring_review_interval,
+                self_repository=is_loop_manager_repository(Path(repo)),
             ).required
         )
     ):

@@ -11,6 +11,73 @@ import maintenance_state
 
 
 class MaintenanceStateRepositoryTest(unittest.TestCase):
+    def test_self_full_assessment_is_once_and_survives_restart(self):
+        connection = self._connection()
+        repository = maintenance_state.MaintenanceRepository(connection)
+        self.assertEqual(repository.due("one", 5, self_repository=True).reason,
+                         "one_time_full_assessment")
+        cycle, created = repository.begin_assessment_if_due(
+            "one", 5, "a" * 40, self_repository=True)
+        self.assertTrue(created)
+        saved = repository.record_full_assessment(
+            "one", expected_revision=cycle.revision, source_sha="a" * 40,
+            result='{"findings":[]}',
+        )
+        self.assertEqual(maintenance_state.MaintenanceRepository(connection).get("one").full_assessment_result,
+                         saved.full_assessment_result)
+        completed = repository.advance_success_baseline(
+            "one", expected_phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+            expected_revision=cycle.revision, remote_commit="a" * 40,
+        )
+        self.assertTrue(completed.full_assessment_completed)
+        self.assertFalse(repository.due("one", 5, self_repository=True).required)
+        self.assertEqual(repository.due("two", 5).reason, "no_successful_assessment")
+        for number in range(1, 6):
+            self._insert_plan(connection, "one", f"G-{number:03d}", "MERGED")
+        periodic, started = repository.begin_assessment_if_due(
+            "one", 5, "b" * 40, self_repository=True)
+        self.assertTrue(started)
+        restarted = repository.restart_stale_planning_context(
+            "one", expected=periodic, new_base_sha="c" * 40)
+        self.assertEqual(restarted.full_assessment_source_sha, "a" * 40)
+        self.assertEqual(restarted.full_assessment_result, saved.full_assessment_result)
+
+    def test_full_assessment_source_drift_discards_unpublished_result(self):
+        connection = self._connection()
+        repository = maintenance_state.MaintenanceRepository(connection)
+        cycle, _ = repository.begin_assessment_if_due(
+            "one", 5, "a" * 40, self_repository=True)
+        saved = repository.record_full_assessment(
+            "one", expected_revision=cycle.revision, source_sha="a" * 40,
+            result='{"findings":[]}',
+        )
+        restarted = repository.restart_stale_planning_context(
+            "one", expected=saved, new_base_sha="b" * 40,
+        )
+        self.assertIsNone(restarted.full_assessment_result)
+        self.assertEqual(restarted.full_assessment_source_sha, "b" * 40)
+        self.assertFalse(restarted.full_assessment_completed)
+
+    def test_refactoring_publication_marks_full_assessment_without_resetting_periodic_due(self):
+        connection = self._connection()
+        self._insert_plan(connection, "one", "G-100", "READY")
+        repository = maintenance_state.MaintenanceRepository(connection)
+        cycle, _ = repository.begin_assessment_if_due(
+            "one", 5, "a" * 40, self_repository=True)
+        repository.record_full_assessment(
+            "one", expected_revision=cycle.revision, source_sha="a" * 40,
+            result='{"findings":[]}',
+        )
+        published = repository.transition(
+            "one", expected_phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+            expected_revision=cycle.revision,
+            next_phase=maintenance_state.MaintenancePhase.REFACTORING,
+            refactoring_plan_ids=("G-100",),
+        )
+        self.assertTrue(published.full_assessment_completed)
+        self.assertEqual(repository.due("one", 5, self_repository=True).reason,
+                         "active_cycle")
+
     def _connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row

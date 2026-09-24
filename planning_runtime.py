@@ -25,6 +25,7 @@ from maintenance_planning import (
     MaintenancePlanningRestart,
 )
 import maintenance_state
+import full_assessment
 import runtime_state
 
 
@@ -134,6 +135,7 @@ class PlanningContext:
     config_path: Path
     registered_only: bool
     refactoring_review_interval: int
+    self_repository: bool = False
 
 
 @dataclass(frozen=True)
@@ -187,7 +189,12 @@ class PlanningStatePort(Protocol):
         base_sha: str,
         *,
         include_general_planning: bool,
+        self_repository: bool = False,
     ) -> tuple[maintenance_state.MaintenanceCycle, bool]: ...
+
+    def record_full_assessment(
+        self, repo: str, *, expected_revision: int, source_sha: str, result: str
+    ) -> maintenance_state.MaintenanceCycle: ...
 
     def restart_stale_maintenance(
         self,
@@ -666,7 +673,8 @@ class PlanningLifecycleCoordinator:
             and not decision.has_waiting
         ):
             due = self._ports.state.maintenance_due(
-                context.repo, context.refactoring_review_interval
+                context.repo, context.refactoring_review_interval,
+                self_repository=context.self_repository,
             )
             if due.required:
                 include_general = False
@@ -682,6 +690,7 @@ class PlanningLifecycleCoordinator:
                     context.refactoring_review_interval,
                     run.base_sha,
                     include_general_planning=include_general,
+                    self_repository=context.self_repository,
                 )
         if (
             decision.has_waiting
@@ -1273,6 +1282,16 @@ class PlanningLifecycleCoordinator:
                         run.maintenance_cycle.include_general_planning
                     ),
                 )
+                if (context.self_repository and run.maintenance_cycle.phase
+                    is maintenance_state.MaintenancePhase.ASSESSMENT
+                    and not run.maintenance_cycle.full_assessment_completed):
+                    inventory = full_assessment.source_inventory(
+                        context.repo_path, str(row.active_sha)
+                    )
+                    prompt += full_assessment.assessment_prompt(
+                        inventory, str(row.active_sha),
+                        run.maintenance_cycle.full_assessment_result,
+                    )
             else:
                 assert run.mutable_ready_snapshot is not None
                 prompt = self._ports.validation.planner_prompt(
@@ -1444,6 +1463,33 @@ class PlanningLifecycleCoordinator:
                     dirty_files,
                     run.mutable_ready_snapshot,
                 )
+            if (
+                decision is not None
+                and context.self_repository
+                and run.maintenance_cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT
+                and not run.maintenance_cycle.full_assessment_completed
+                and decision.outcome is not MaintenanceOutcome.PREREQUISITES
+            ):
+                try:
+                    inventory = full_assessment.source_inventory(
+                        context.repo_path, str(row.active_sha)
+                    )
+                    report = full_assessment.parse_assessment_result(
+                        str(row.planning_result or ""), inventory,
+                        str(row.active_sha),
+                        decision.plan_ids
+                        if decision.outcome is MaintenanceOutcome.REFACTORING else (),
+                        {str(item["plan_id"]) for item in
+                         self._ports.state.execplan_rows(context.repo)},
+                    )
+                    run.maintenance_cycle = self._ports.state.record_full_assessment(
+                        context.repo,
+                        expected_revision=run.maintenance_cycle.revision,
+                        source_sha=str(row.active_sha), result=report,
+                    )
+                except (full_assessment.FullAssessmentError,
+                        maintenance_state.MaintenanceStateError) as error:
+                    raise PlanningResultInvalid(str(error)) from error
         except PlanningResultInvalid as error:
             message = str(error)
             retry_count = row.planning_retry_count

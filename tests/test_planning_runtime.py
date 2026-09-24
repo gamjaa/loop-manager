@@ -70,6 +70,9 @@ def maintenance_cycle(**overrides):
         "publication_refactoring_plan_ids": (),
         "publication_revalidation_plan_ids": (),
         "include_general_planning": False,
+        "full_assessment_completed": False,
+        "full_assessment_source_sha": None,
+        "full_assessment_result": None,
         "revision": 0,
     }
     values.update(overrides)
@@ -89,6 +92,8 @@ class FakeStatePort:
         self.general_intent = None
         self.general_intent_record_count = 0
         self.general_intent_error_call = None
+        self.maintenance_due_self_repository = None
+        self.maintenance_due_required = False
         self.schedule_result = SimpleNamespace(
             active=None,
             has_ready=False,
@@ -122,8 +127,9 @@ class FakeStatePort:
     def schedule(self, _repo):
         return self.schedule_result
 
-    def maintenance_due(self, _repo, _interval):
-        return SimpleNamespace(required=False)
+    def maintenance_due(self, _repo, _interval, *, self_repository=False):
+        self.maintenance_due_self_repository = self_repository
+        return SimpleNamespace(required=self.maintenance_due_required)
 
     def begin_maintenance_assessment(self, *_args, **_kwargs):
         return self.cycle, False
@@ -408,6 +414,40 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         self.assertEqual(outcome.kind, PlanningOutcomeKind.FINGERPRINT_SKIPPED)
         self.assertEqual(ports.agent.run_count, 0)
         self.assertEqual(ports.state.snapshot.processed_sha, "base")
+
+    def test_registered_self_flag_only_reaches_maintenance_due_for_self_context(self):
+        for self_repository in (False, True):
+            ports = FakePorts(planning_snapshot())
+            run = PlanningLifecycleCoordinator(ports)._new_run(
+                replace(self.context, registered_only=True,
+                        self_repository=self_repository)
+            )
+            PlanningLifecycleCoordinator(ports)._select_planning_work(run)
+            self.assertEqual(ports.state.maintenance_due_self_repository,
+                             self_repository)
+
+    def test_missing_full_assessment_evidence_uses_bounded_planner_retry(self):
+        cycle = maintenance_cycle(
+            phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+            cycle_base_sha="a" * 40, revision=1)
+        ports = FakePorts(planning_snapshot(
+            phase="PLANNING", active_sha="a" * 40,
+            planning_result='MAINTENANCE_RESULT: {"outcome":"no_change"}',
+            planning_result_pending_validation=True,
+            planning_validation_error="earlier invalid evidence",
+            planning_retry_count=1,
+        ), cycle)
+        ports.validation.validate_maintenance_result = mock.Mock(return_value=None)
+        coordinator = PlanningLifecycleCoordinator(ports)
+        run = coordinator._new_run(replace(self.context, self_repository=True))
+        run.planning_worktree = Path("/planning")
+        run.maintenance_context = object()
+        with mock.patch("planning_runtime.full_assessment.source_inventory",
+                        return_value={"docs/PRODUCT.md": "hash"}):
+            outcome = coordinator._validate_planner_result(run)
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.VALIDATION_RETRY)
+        self.assertEqual(ports.state.snapshot.planning_retry_count, 2)
+        self.assertIn("전수 평가 결과", ports.state.snapshot.planning_validation_error)
 
     def test_validation_retry_resumes_session_and_persists_retry_transition(self):
         ports = FakePorts(

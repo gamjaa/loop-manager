@@ -9,6 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import execplan_catalog
+import full_assessment
 import execplan_catalog_state
 import loop_manager
 import maintenance_planning
@@ -84,6 +85,60 @@ priority: {priority}
 
 - Keep the change structural.
 """
+
+
+class FullAssessmentEvidenceTest(unittest.TestCase):
+    def test_inventory_and_findings_bind_source_identity_and_plan_links(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            git(repo, "init", "--initial-branch=main")
+            git(repo, "config", "user.email", "test@example.com")
+            git(repo, "config", "user.name", "Test")
+            for path in ("docs/PRODUCT.md", "docs/ARCHITECTURE.md",
+                         "docs/requirements/current.md", "docs/requirements/archive/old.md",
+                         "module.py", "tests/test_module.py", "node_modules/vendor.py"):
+                target = repo / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(path, encoding="utf-8")
+            git(repo, "add", "-A")
+            git(repo, "commit", "-m", "Fixture")
+            sha = git(repo, "rev-parse", "HEAD")
+            inventory = full_assessment.source_inventory(repo, sha)
+            self.assertIn("tests/test_module.py", inventory)
+            self.assertNotIn("docs/requirements/archive/old.md", inventory)
+            self.assertNotIn("node_modules/vendor.py", inventory)
+            prompt = full_assessment.assessment_prompt(inventory, sha, None)
+            self.assertIn(inventory["module.py"], prompt)
+            self.assertNotIn("docs/requirements/archive/old.md", prompt)
+            self.assertIn("saved evidence", full_assessment.assessment_prompt(
+                inventory, sha, "saved evidence"))
+            report = {
+                "source_revision": sha,
+                "coverage": {key: "Reviewed responsibilities and evidence."
+                             for key in ("code", "tests", "documents")},
+                "findings": [{"id": "code-one", "kind": "code",
+                              "path": "module.py", "source_hash": inventory["module.py"],
+                              "evidence": "Repeated adapter responsibility in module.py.",
+                              "status": "planned", "plan_ids": ["G-100"]},
+                             {"id": "agent-scope", "kind": "code",
+                              "path": "module.py", "source_hash": inventory["module.py"],
+                              "evidence": "G-051 already separated Agent scope responsibilities.",
+                              "status": "resolved", "plan_ids": []},
+                             {"id": "doc-one", "kind": "document",
+                              "path": "docs/PRODUCT.md",
+                              "source_hash": inventory["docs/PRODUCT.md"],
+                              "evidence": "A decision and its exception are repeated here.",
+                              "status": "candidate", "plan_ids": []}],
+            }
+            output = full_assessment.RESULT_PREFIX + json.dumps(report)
+            saved = full_assessment.parse_assessment_result(
+                output, inventory, sha, ("G-100",), set())
+            self.assertEqual(json.loads(saved), report)
+            report["findings"][1]["source_hash"] = "0" * 64
+            with self.assertRaises(full_assessment.FullAssessmentError):
+                full_assessment.parse_assessment_result(
+                    full_assessment.RESULT_PREFIX + json.dumps(report),
+                    inventory, sha, ("G-100",), set())
 
 
 class MaintenancePlanningTest(unittest.TestCase):
