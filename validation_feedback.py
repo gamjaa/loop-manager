@@ -26,11 +26,12 @@ _ERROR_DETAIL = re.compile(
     r"(?i)^(?:E\s+|(?:assertion|error|exception|traceback)\b|.+(?:error|exception|failed)\b)"
 )
 _FAILURE_SUMMARY = re.compile(
-    r"(?i)^(?:=+.*\b(?:failed|errors?)\b.*=+|FAILED\s*\(|"
+    r"(?i)^(?:=+.*\b(?:failed|errors?)\b.*=+|FAILED\s*\(.*|"
     r"(?:\d+\s+)?(?:failures?|errors?)\b.*)$"
 )
 _SUCCESS_LOG = re.compile(r"(?i)\b(?:passed|success|succeeded)\b|^ok$")
 _TRUNCATED = "[diagnostic truncated]"
+_PYTEST_CONTEXT_LINES = 80
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,78 @@ def _limit_excerpt(value: str, limit: int) -> tuple[str, bool]:
     return f"{value[:limit - len(_TRUNCATED) - 1].rstrip()}\n{_TRUNCATED}", True
 
 
+def _pytest_diagnostic_start(lines: list[str], marker_index: int) -> int:
+    """Locate pytest's preceding failure section without interpreting prose."""
+    for index in range(marker_index - 1,
+                       max(-1, marker_index - _PYTEST_CONTEXT_LINES), -1):
+        if not _FAILURE_HEADER.match(lines[index]):
+            continue
+        if any(_ERROR_DETAIL.match(line) for line in lines[index + 1:marker_index]):
+            return index
+    return marker_index
+
+
+def _failure_excerpt(lines: list[str], marker_index: int, marker: str,
+                     diagnostic_start: int) -> str:
+    preceding = [
+        line for line in lines[diagnostic_start + 1:marker_index]
+        if line.strip() and not _SUCCESS_LOG.search(line)
+    ][-8:]
+    following = []
+    for line in lines[marker_index + 1:marker_index + 9]:
+        if _SUCCESS_LOG.search(line) or _PYTEST_FAILURE.match(line) or _UNITTEST_FAILURE.match(line):
+            break
+        if _FAILURE_SUMMARY.match(line):
+            break
+        if line.strip():
+            following.append(line)
+    return "\n".join([marker, *preceding, *following])
+
+
+def _render_failure_excerpts(prefix: str, excerpts: list[str],
+                             summaries: list[str]) -> str:
+    """Prioritize complete failure names; never spend space on name fragments."""
+    summaries = list(dict.fromkeys(summaries[-1:]))
+    summary = summaries[0] if summaries else ""
+    summary, summary_omitted = _limit_excerpt(summary, MAX_DIAGNOSTIC // 4)
+    fixed = [prefix, *(summaries if not summary_omitted else [summary])]
+    selected: list[str] = []
+    omitted = 0
+    # Each excerpt begins with a normalized, complete `FAILED: <name>` line.
+    # Select only entries whose names fit, reserving space to say what did not.
+    for index, excerpt in enumerate(excerpts):
+        remaining = len(excerpts) - index - 1
+        omission = f"[{remaining} recognizable failures omitted]" if remaining else ""
+        candidate = [*fixed, *selected, excerpt.split("\n", 1)[0], omission]
+        if len("\n\n".join(part for part in candidate if part)) > MAX_DIAGNOSTIC:
+            omitted = remaining + 1
+            break
+        selected.append(excerpt.split("\n", 1)[0])
+    else:
+        omitted = 0
+
+    omission = f"[{omitted} recognizable failures omitted]" if omitted else ""
+    used = len("\n\n".join([*fixed, *selected, omission]))
+    detail_budget = max(0, MAX_DIAGNOSTIC - used - (2 if omission else 0))
+    details = [excerpt.split("\n", 1)[1] if "\n" in excerpt else "" for excerpt in excerpts[:len(selected)]]
+    detail_parts = []
+    if selected and detail_budget >= len(selected) * (len(_TRUNCATED) + 2):
+        each = detail_budget // len(selected)
+        for detail in details:
+            limited, detail_omitted = _limit_excerpt(detail, each)
+            detail_parts.append(limited if detail else "")
+            summary_omitted = summary_omitted or detail_omitted
+    rendered = [prefix]
+    for name, detail in zip(selected, detail_parts or [""] * len(selected)):
+        rendered.append("\n".join(part for part in (name, detail) if part))
+    if omission:
+        rendered.append(omission)
+    rendered.extend(fixed[1:])
+    if summary_omitted:
+        rendered.append(_TRUNCATED)
+    return _bounded_failure_diagnostic(rendered)
+
+
 def _fallback_verify_diagnostic(raw: str, exit_code: int | None) -> str:
     clean = redact_secrets(_ANSI.sub("", raw).replace("\r\n", "\n").replace("\r", "\n")).strip()
     prefix = (
@@ -95,23 +168,20 @@ def format_verify_failure(raw: str, *, exit_code: int | None = None,
     """
     clean = redact_secrets(_ANSI.sub("", raw).replace("\r\n", "\n").replace("\r", "\n")).strip()
     lines = clean.splitlines()
-    markers: list[tuple[int, str]] = []
+    markers: list[tuple[int, str, int]] = []
     summaries: list[str] = []
     for index, line in enumerate(lines):
         pytest = _PYTEST_FAILURE.match(line)
         unittest = _UNITTEST_FAILURE.match(line)
         compiler = _COMPILER_FAILURE.match(line)
-        header = _FAILURE_HEADER.match(line)
-        if pytest:
+        if pytest and not _FAILURE_SUMMARY.match(line):
             markers.append((index, f"FAILED: {pytest.group('name')}" + (
                 f" - {pytest.group('message')}" if pytest.group('message') else ""
-            )))
+            ), _pytest_diagnostic_start(lines, index)))
         elif unittest:
-            markers.append((index, f"FAILED: {unittest.group('name')}"))
+            markers.append((index, f"FAILED: {unittest.group('name')}", index))
         elif compiler:
-            markers.append((index, f"FAILED: {compiler.group('name')} - {compiler.group('message')}"))
-        elif header and any(_ERROR_DETAIL.match(candidate) for candidate in lines[index + 1:index + 4]):
-            markers.append((index, f"FAILED: {header.group('name')}"))
+            markers.append((index, f"FAILED: {compiler.group('name')} - {compiler.group('message')}", index))
         if _FAILURE_SUMMARY.match(line):
             summaries.append(line)
 
@@ -125,35 +195,15 @@ def format_verify_failure(raw: str, *, exit_code: int | None = None,
     if not markers:
         return _fallback_verify_diagnostic(clean, exit_code)
 
-    excerpts: list[str] = []
-    for marker_index, marker in markers:
-        detail = [marker]
-        for line in lines[marker_index + 1:marker_index + 9]:
-            if _SUCCESS_LOG.search(line) or _PYTEST_FAILURE.match(line) or _UNITTEST_FAILURE.match(line):
-                break
-            if _FAILURE_SUMMARY.match(line):
-                break
-            if line.strip():
-                detail.append(line)
-        excerpts.append("\n".join(detail))
+    excerpts = [
+        _failure_excerpt(lines, marker_index, marker, diagnostic_start)
+        for marker_index, marker, diagnostic_start in markers
+    ]
     prefix = (
         f"verify exit code: {exit_code}" if exit_code is not None
         else "verify exit code: unavailable"
     )
-    summaries = list(dict.fromkeys(summaries))
-    fixed = [prefix, *summaries]
-    separator_cost = 2 * (len(fixed) + len(excerpts) - 1)
-    available = MAX_DIAGNOSTIC - sum(map(len, fixed)) - separator_cost
-    # Reserve the final omission marker before sharing the remaining prompt
-    # budget equally.  This preserves every recognizable failure name.
-    per_excerpt = max(1, (available - len(_TRUNCATED) - 2) // len(excerpts))
-    limited, omitted = zip(*(
-        _limit_excerpt(excerpt, per_excerpt) for excerpt in excerpts
-    ))
-    parts = [prefix, *limited, *summaries]
-    if any(omitted):
-        parts.append(_TRUNCATED)
-    return _bounded_failure_diagnostic(parts)
+    return _render_failure_excerpts(prefix, excerpts, summaries)
 
 
 def normalize_feedback(stage: str, raw: str, fingerprints=(), *,

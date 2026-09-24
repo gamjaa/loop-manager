@@ -1,3 +1,4 @@
+import re
 import unittest
 
 import loop_manager as lm
@@ -72,6 +73,35 @@ class ValidationFeedbackTests(unittest.TestCase):
         self.assertIn("test_beta", diagnostic)
         self.assertIn("[diagnostic truncated]", diagnostic)
         self.assertLessEqual(len(diagnostic), MAX_DIAGNOSTIC)
+
+    def test_verify_formatter_omits_extra_failures_without_truncating_names(self):
+        raw = "".join(
+            f"FAIL: test_case_{index:03d}\nAssertionError: detail {index}\n"
+            for index in range(100)
+        ) + "FAILED (failures=100)\n"
+        diagnostic = format_verify_failure(raw, exit_code=1)
+        names = [line for line in diagnostic.splitlines() if line.startswith("FAILED: ")]
+        self.assertTrue(names)
+        self.assertTrue(all(
+            re.fullmatch(r"FAILED: test_case_\d{3}", name)
+            for name in names
+        ))
+        self.assertIn("recognizable failures omitted]", diagnostic)
+        self.assertIn("FAILED (failures=100)", diagnostic)
+        self.assertLessEqual(len(diagnostic), MAX_DIAGNOSTIC)
+
+    def test_verify_formatter_keeps_pytest_diagnostics_before_failed_summary(self):
+        raw = (
+            "_____________ test_saves_message _____________\n"
+            "request context\n"
+            "E       AssertionError: expected published state\n"
+            "E       assert actual == 'published'\n"
+            "===================== short test summary info =====================\n"
+            "FAILED tests/test_message.py::test_saves_message - AssertionError\n"
+        )
+        diagnostic = format_verify_failure(raw, exit_code=1)
+        self.assertIn("tests/test_message.py::test_saves_message", diagnostic)
+        self.assertIn("assert actual == 'published'", diagnostic)
 
     def test_verify_formatter_falls_back_to_bounded_tail_without_guessing(self):
         raw = "unrecognized output\n" + "x" * 3000 + "\nAPI_KEY=private-value"
