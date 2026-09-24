@@ -132,8 +132,8 @@
 - 기존 ExecPlan 작업을 이어서 처리할 수 있다
 
 흐름:
-1. 프로그램이 모든 `PR_OPEN`의 Merge·Close·충돌 상태를 대상 ExecPlan별로 동기화하고 `PROJECT_BLOCKED`의 저장소 안전을 먼저 확인한다. 프로젝트 안전이 증명되지 않으면 fetch, 기본 worktree 동기화와 저장소 변경 단계를 실행하지 않는다. 단, 원격 ExecPlan catalog 오류 차단은 원인 push를 fetch하고 재검증해야 하므로 이 저장소 안전 gate와 별도로 처리한다
-2. 프로젝트 안전 gate가 열려 있으면 fetch하고 eligible 기본 worktree만 원격 base로 safe fast-forward한 뒤 각 `PLAN_BLOCKED`의 계획별 해제 조건 및 `planning_error`의 근거 입력 변경 여부를 독립적으로 확인한다
+1. 프로그램이 `PROJECT_BLOCKED`의 저장소 안전을 확인하고 저장된 모든 Merge 대기 PR의 GitHub identity와 Open·Merged·Closed 상태를 조회한다. 안전 gate가 허용하는 Merge·Close 전이와 worktree cleanup 판정 및 알림 outbox를 기본 worktree 동기화보다 먼저 SQLite에 기록한다. 프로젝트 안전이 증명되지 않으면 기본 worktree 동기화와 저장소 변경 단계를 실행하지 않는다. 단, 원격 ExecPlan catalog 오류 차단은 원인 push를 fetch하고 재검증해야 하므로 이 저장소 안전 gate와 별도로 처리한다
+2. 프로젝트 안전 gate가 열려 있으면 새 Merge 뒤 `origin/<base-branch>`를 다시 fetch하고 최신 ExecPlan·project 상태를 읽는다. 가능한 ExecPlan archive 게시를 먼저 완료한 뒤 최종 원격 SHA를 기준으로 기본 worktree의 safe fast-forward eligibility와 catalog를 평가한다. 저장된 `PR_OPEN` mirror, 다른 안정된 Open PR 또는 충돌 marker만으로 평가를 생략하지 않는다. 그 뒤 각 `PLAN_BLOCKED`의 계획별 해제 조건 및 `planning_error`의 근거 입력 변경 여부를 독립적으로 확인한다
 3. 동시에 처리할 프로젝트를 `max_workers` 범위에서 선택한다
 4. 실행 중인 변경 단계가 없으면 dependency를 충족한 확정 PR 충돌 복구 하나를 먼저 선택하고, 없으면 프로젝트별 유지보수 평가 주기를 확인한다. `PLAN_BLOCKED` 또는 `PR_OPEN`이 있으면 유지보수 평가는 보류하고 독립 READY 선택으로 이동한다
 5. due 유지보수 cycle이 prerequisite 또는 리팩터링 계획을 기록했으면 그 집합의 dependency 충족 계획만 선택하고, 사후 재검증 단계면 장벽 뒤 Worker보다 유지보수 Planner를 먼저 실행한다
@@ -216,11 +216,11 @@ ExecPlan 게시 실패:
 
 흐름:
 1. 사용자가 PR을 검토하고 Merge한다
-2. 다음 실행에서 프로그램이 GitHub의 Merge 상태를 확인한다
-3. SQLite의 ExecPlan 상태를 MERGED로 변경한다
-4. PR Merge 방식과 관계없이 관리 worktree에 미커밋 변경이나 PR에 포함되지 않은 로컬 전용 commit이 없으면 정리한다
-5. 변경이 남아 있으면 worktree를 보존하고 `cleanup_pending`에 경로와 원인을 기록한다
-6. 최신 원격 base에서 안전한 MERGED ExecPlan을 `docs/plans/archive/`로 내용 변경 없이 일괄 이동하고 fast-forward로 직접 게시한다
+2. 다음 실행에서 프로그램이 모든 Merge 대기 PR의 실제 상태를 확인한다
+3. PR Merge 방식과 관계없이 관리 worktree에 미커밋 변경이나 PR에 포함되지 않은 로컬 전용 commit이 없으면 정리한다
+4. 변경이 남아 있으면 worktree를 보존하고 `cleanup_pending`에 경로와 원인을 기록한다. 해당 ExecPlan의 MERGED 전이, cleanup 판정과 알림 outbox를 durable하게 저장한다
+5. 모든 대기 PR 상태를 반영한 뒤 원격 base를 fetch한다
+6. 최신 원격 base에서 안전한 MERGED ExecPlan을 `docs/plans/archive/`로 내용 변경 없이 일괄 이동하고 fast-forward로 직접 게시한 뒤, 최종 원격 SHA에 대해 기본 worktree의 안전한 fast-forward 여부를 평가한다
 7. archive할 수 없는 후보는 원인과 operation identity를 저장하되 다음 READY·Planner·완료 처리를 계속한다
 8. 의존성이 충족된 다음 READY ExecPlan이 있으면 새 관리 worktree에서 처리한다
 9. 대기 중인 ExecPlan이 없으면 Planner가 추가 ExecPlan이 필요한지 다시 확인한다
