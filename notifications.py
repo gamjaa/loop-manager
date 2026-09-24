@@ -255,6 +255,7 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
                 "implementation_choice": deadlock.implementation_choice,
                 "question": deadlock.question,
             }
+        suppress_persistent_failure_for_block(connection, repo, plan_id)
         _insert(
             connection,
             _key("blocked", repo, f"plan\0{plan[4]}\0{plan_id}" +
@@ -289,6 +290,9 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
         )
         if recovery_evidence is not None:
             project_paths = list(recovery_evidence["user_targets"])
+        suppress_persistent_failure_for_block(
+            connection, repo, str(project_block[1] or "__project__"),
+        )
         _insert(
             connection,
             _key(
@@ -395,6 +399,49 @@ def enqueue_persistent_execution_failure_events(
             "AND episode = ? AND notification_eligible = 1",
             (repo, subject, int(row["episode"])),
         )
+
+
+def cancel_pending_persistent_execution_failure_event(
+    connection: sqlite3.Connection, repo: str, subject: str, episode: int,
+    phase: str, reason_code: str, fingerprint: str,
+) -> None:
+    """Withdraw an unsent notice resolved or superseded in this run."""
+
+    identity = "\0".join((subject, str(episode), phase, reason_code, fingerprint))
+    connection.execute(
+        "DELETE FROM notification_outbox WHERE event_key = ? AND sent_at IS NULL",
+        (_key("persistent_failure", repo, identity),),
+    )
+
+
+def suppress_persistent_failure_for_block(
+    connection: sqlite3.Connection, repo: str, subject: str,
+) -> None:
+    """Make a final BLOCKED notice own its pending failure incident."""
+
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'persistent_execution_failures'"
+    ).fetchone() is None:
+        return
+    row = connection.execute(
+        "SELECT episode, phase, reason_code, fingerprint "
+        "FROM persistent_execution_failures WHERE repo = ? AND subject = ? "
+        "AND active = 1", (repo, subject),
+    ).fetchone()
+    if row is None:
+        return
+    cancel_pending_persistent_execution_failure_event(
+        connection, repo, subject, int(row[0]), str(row[1]), str(row[2]),
+        str(row[3]),
+    )
+    connection.execute(
+        "UPDATE persistent_execution_failures SET active = 0, "
+        "consecutive_runs = 0, notification_eligible = 0, "
+        "notification_queued = 0, suppressed_by_block = 1, "
+        "updated_at = CURRENT_TIMESTAMP, resolved_at = CURRENT_TIMESTAMP "
+        "WHERE repo = ? AND subject = ?", (repo, subject),
+    )
 
 
 def record_merged_plan(

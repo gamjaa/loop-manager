@@ -276,6 +276,12 @@ class RecoveryRepository:
                 ),
                 run_id=run_id,
             )
+            # The outbox entry belongs to the same durable transition as the
+            # third observation, even if the process never reaches run cleanup.
+            import notifications
+            notifications.enqueue_persistent_execution_failure_events(
+                self.connection, observation.repo,
+            )
         return RecoveryRecord(next_generation, decision, evidence)
 
     def clear(self, repo: str, plan_id: str | None) -> None:
@@ -338,6 +344,12 @@ class RecoveryRepository:
         eligible = (
             consecutive_runs >= 3 or disposition == "user_action_required"
         )
+        if previous is not None and not same_cause and bool(previous[7]):
+            import notifications
+            notifications.cancel_pending_persistent_execution_failure_event(
+                self.connection, repo, subject, int(previous[0]),
+                str(previous[1]), str(previous[2]), str(previous[3]),
+            )
         if previous is None:
             self.connection.execute(
                 "INSERT INTO persistent_execution_failures "
@@ -409,6 +421,18 @@ class RecoveryRepository:
 
         where = "repo = ?" + (" AND last_run_id = ?" if run_id is not None else "")
         parameters: tuple[object, ...] = (repo,) + ((run_id,) if run_id is not None else ())
+        if blocked_subjects or resolved:
+            import notifications
+            for row in self.connection.execute(
+                "SELECT subject, episode, phase, reason_code, fingerprint "
+                "FROM persistent_execution_failures WHERE repo = ? "
+                "AND notification_queued = 1", (repo,),
+            ):
+                if resolved or str(row[0]) in blocked_subjects:
+                    notifications.cancel_pending_persistent_execution_failure_event(
+                        self.connection, repo, str(row[0]), int(row[1]),
+                        str(row[2]), str(row[3]), str(row[4]),
+                    )
         for subject in blocked_subjects:
             self.connection.execute(
                 "UPDATE persistent_execution_failures SET active = 0, "
