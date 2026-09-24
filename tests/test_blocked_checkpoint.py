@@ -719,6 +719,57 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
         ).fetchone()
         self.assertEqual(tuple(row), ("IMPLEMENTING", "AssertionError: new cause"))
 
+    def test_diagnostic_resume_interruption_rolls_back_release(self):
+        self.publish_block(evidence="AssertionError: original cause")
+        history = '{"previous": {"occurrences": 3}}'
+        self.connection.execute(
+            "UPDATE exec_plans SET verify_failure_history = ?, review_failure_history = ? "
+            "WHERE plan_id = 'G-034'", (history, history),
+        )
+        self.connection.commit()
+        database = Path(self.temporary.name) / "resume.sqlite"
+        durable = sqlite3.connect(database)
+        self.connection.backup(durable)
+        self.connection.close()
+        self.connection = durable
+        self.connection.row_factory = sqlite3.Row
+        self.verify_probe.return_value = (False, "AssertionError: new cause")
+        corrected = self.user_commit("dependency.py", "fixed = True\n")
+        original = loop_manager.scoped_blocking.clear_plan_block
+
+        def interrupted(*args, **kwargs):
+            original(*args, **kwargs)
+            raise KeyboardInterrupt
+
+        with mock.patch.object(loop_manager.scoped_blocking, "clear_plan_block", side_effect=interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                loop_manager.resume_plan_blocks(
+                    self.connection, self.repo, self.state_dir, str(self.repo.resolve()), "main",
+                )
+        self.connection.close()
+        self.connection = sqlite3.connect(database)
+        self.connection.row_factory = sqlite3.Row
+        row = self.connection.execute(
+            "SELECT status, verify_failure_history, review_failure_history FROM exec_plans "
+            "WHERE plan_id = 'G-034'"
+        ).fetchone()
+        self.assertEqual(tuple(row), ("PLAN_BLOCKED", history, history))
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM execplan_blocks").fetchone()[0], 1)
+        self.assertEqual(self.connection.execute(
+            "SELECT pending_remote_oid FROM blocked_checkpoints"
+        ).fetchone()[0], corrected)
+        self.assertTrue(loop_manager.resume_plan_blocks(
+            self.connection, self.repo, self.state_dir, str(self.repo.resolve()), "main",
+        ))
+        row = self.connection.execute(
+            "SELECT status, verify_result, verify_failure_history, review_failure_history "
+            "FROM exec_plans WHERE plan_id = 'G-034'"
+        ).fetchone()
+        self.assertEqual(tuple(row), ("IMPLEMENTING", "AssertionError: new cause", history, history))
+        self.assertEqual(self.connection.execute(
+            "SELECT verify_result FROM projects"
+        ).fetchone()[0], "AssertionError: new cause")
+
     def test_new_review_issue_resumes_worker(self):
         old = "ISSUE_ID: code.py::old::bug\nOld issue\nVERDICT: FAIL"
         self.publish_block(reason="review_retry_exhausted", evidence=old)
@@ -821,8 +872,8 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
         corrected = self.user_commit()
         original = loop_manager._resume_remote_corrected_execplan
 
-        def interrupted(*arguments):
-            original(*arguments)
+        def interrupted(*arguments, **keywords):
+            original(*arguments, **keywords)
             raise KeyboardInterrupt
 
         with mock.patch.object(loop_manager, "_resume_remote_corrected_execplan",

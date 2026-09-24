@@ -14011,9 +14011,11 @@ def _resume_remote_corrected_execplan(
     repository: blocked_checkpoint_state.BlockedCheckpointRepository,
     request: blocked_checkpoint.CheckpointRequest,
     candidate_oid: str, input_identity: str, reason: str,
+    *, new_failure_stage: str | None = None, assessment: str | None = None,
 ) -> None:
     """Treat a user's committed correction as unverified Worker input."""
     plan_id = str(plan["plan_id"])
+    # Hydration commits; finish it before the atomic release boundary.
     hydrate_execplan_project(connection, repo, plan)
     with runtime_state._transaction(connection):
         runtime_state.RuntimeStateRepository(connection).transition(
@@ -14023,12 +14025,14 @@ def _resume_remote_corrected_execplan(
                 "blocked_fingerprint": None, "blocked_worktree_fingerprint": None,
                 "blocked_review_fingerprint": None, "last_error": None,
                 "retry_count": 0, "worker_result": None,
-                "verify_result": None, "review_result": None,
+                "verify_result": assessment if new_failure_stage == "verify" else None,
+                "review_result": assessment if new_failure_stage == "review" else None,
                 "validated_base_sha": None, "reviewer_session_id": None,
                 "worker_input_token": None, "archive_token": None,
                 "verify_token": None, "review_token": None,
                 "publication_token": None, "publication_remote_oid": None,
-                "verify_failure_history": "{}", "review_failure_history": "{}",
+                "verify_failure_history": plan["verify_failure_history"] if new_failure_stage else "{}",
+                "review_failure_history": plan["review_failure_history"] if new_failure_stage else "{}",
                 "effective_worker_level": plan["initial_worker_level"],
                 "review_level_history": "{}",
                 "agent_role": None, "agent_snapshot": None,
@@ -14040,8 +14044,9 @@ def _resume_remote_corrected_execplan(
             },
             project_values={
                 "phase": "WORKING", "last_error": None,
-                "worker_result": None, "verify_result": None,
-                "review_result": None, "validated_base_sha": None,
+                "worker_result": None,
+                "verify_result": assessment if new_failure_stage == "verify" else None,
+                "review_result": assessment if new_failure_stage == "review" else None, "validated_base_sha": None,
                 "worker_session_id": plan["worker_session_id"],
                 "agent_role": None, "agent_snapshot": None,
                 "agent_baseline": None, "agent_recovery": None,
@@ -14383,23 +14388,11 @@ def _reconcile_published_blocked_checkpoint(
                 )
                 notifications.enqueue_current_project_events(connection, repo)
             return "blocked"
-        with runtime_state._transaction(connection):
-            _resume_remote_corrected_execplan(
-                connection, repo, blocked, repository, request, observed,
-                input_identity, "원격 checkpoint 진행 확인 후 Worker부터 재검증: " + assessment,
-            )
-            if new_failure_stage:
-                # New diagnostics are Worker input, not evidence of successful validation.
-                runtime_state.RuntimeStateRepository(connection).transition(
-                    repo, request.plan_id,
-                    plan_values={
-                        f"{new_failure_stage}_result": assessment,
-                        "verify_failure_history": blocked["verify_failure_history"],
-                        "review_failure_history": blocked["review_failure_history"],
-                    },
-                    project_values={f"{new_failure_stage}_result": assessment},
-                    enqueue=False,
-                )
+        _resume_remote_corrected_execplan(
+            connection, repo, blocked, repository, request, observed,
+            input_identity, "원격 checkpoint 진행 확인 후 Worker부터 재검증: " + assessment,
+            new_failure_stage=new_failure_stage, assessment=assessment,
+        )
         return "resumed"
     if blocked["blocked_reason"] == BlockReasonCode.PLAN_INPUT_INVALID.value and (
         blocked["blocked_fingerprint"]
