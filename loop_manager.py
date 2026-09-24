@@ -14405,34 +14405,52 @@ def _evaluate_remote_checkpoint_cause(
     project = connection.execute(
         "SELECT provider, base_branch FROM projects WHERE repo = ?", (repo,),
     ).fetchone()
-    code, review = run_agent(
-        str(project["provider"]), worktree, state_dir, config, "reviewer",
-        reviewer_prompt(
-            str(project["base_branch"]), blocked["worker_result"], str(output),
-            blocked["review_result"], session_recovery=True,
-        ),
-        read_only=True,
-    )
-    validate_agent_scope(
-        "reviewer", worktree, before, capture_git_snapshot(worktree),
-        external_worktree=repo_path,
-    )
-    if code:
-        raise RuntimeError(f"원격 checkpoint Reviewer 실행 미완료: {review}")
-    verdict, details = parse_reviewer_result(review)
-    if verdict == "SPEC_BLOCKED":
-        assert isinstance(details, reviewer_specification.SpecificationDeadlock)
+    previous_review = blocked["review_result"]
+    protocol_error = None
+    for attempt in range(1, MAX_REVIEWER_PROTOCOL_ATTEMPTS + 1):
+        code, review = run_agent(
+            str(project["provider"]), worktree, state_dir, config, "reviewer",
+            reviewer_prompt(
+                str(project["base_branch"]), blocked["worker_result"], str(output),
+                previous_review, session_recovery=True,
+                protocol_error=protocol_error,
+            ),
+            read_only=True,
+        )
+        validate_agent_scope(
+            "reviewer", worktree, before, capture_git_snapshot(worktree),
+            external_worktree=repo_path,
+        )
+        if code:
+            raise RuntimeError(f"원격 checkpoint Reviewer 실행 미완료: {review}")
         try:
-            reviewer_specification.validate_locations(
-                details, str(blocked["path"]),
-                tuple(str(source) for source in json.loads(str(blocked["sources"]))),
-            )
-        except ValueError as error:
-            raise ReviewerProtocolError(str(error)) from error
-        return False, review, "specification"
-    return verdict == "PASS" or _remote_checkpoint_has_new_failure(
-        connection, repo, blocked, "review", review, worktree,
-    ), review, "review" if verdict != "PASS" else None
+            verdict, details = parse_reviewer_result(review)
+            if verdict == "SPEC_BLOCKED":
+                assert isinstance(details, reviewer_specification.SpecificationDeadlock)
+                try:
+                    reviewer_specification.validate_locations(
+                        details, str(blocked["path"]),
+                        tuple(str(source) for source in json.loads(str(blocked["sources"]))),
+                    )
+                except ValueError as error:
+                    raise ReviewerProtocolError(str(error)) from error
+        except ReviewerProtocolError as error:
+            protocol_error = str(error)
+            previous_review = review
+            if attempt == MAX_REVIEWER_PROTOCOL_ATTEMPTS:
+                evidence = (
+                    f"Reviewer 결과 프로토콜 오류: {protocol_error} "
+                    f"(프로토콜 교정 {MAX_REVIEWER_PROTOCOL_ATTEMPTS}회 실패)\n"
+                    f"직전 결과:\n{review}"
+                )
+                return False, evidence, "protocol_exhausted"
+            continue
+        if verdict == "SPEC_BLOCKED":
+            return False, review, "specification"
+        return verdict == "PASS" or _remote_checkpoint_has_new_failure(
+            connection, repo, blocked, "review", review, worktree,
+        ), review, "review" if verdict != "PASS" else None
+    raise AssertionError("Reviewer 프로토콜 교정 횟수가 소진되지 않았습니다.")
 
 
 def _reclassify_remote_specification_deadlock(
@@ -14453,28 +14471,55 @@ def _reclassify_remote_specification_deadlock(
         details, reviewer_specification.SpecificationDeadlock
     ):
         raise ReviewerProtocolError("원격 checkpoint 명세 교착 증거가 유효하지 않습니다.")
-    reason = BlockReasonCode.REVIEW_SPECIFICATION_DEADLOCK
+    _reclassify_remote_checkpoint_block(
+        connection, repo_path, repo, blocked, repository, request,
+        accepted_oid, worktree,
+        reason=BlockReasonCode.REVIEW_SPECIFICATION_DEADLOCK,
+        evidence=review, review_fingerprint_source=review,
+        user_targets=details.paths,
+    )
+
+
+def _reclassify_remote_checkpoint_block(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    repo: str,
+    blocked: sqlite3.Row,
+    repository: blocked_checkpoint_state.BlockedCheckpointRepository,
+    request: blocked_checkpoint.CheckpointRequest,
+    accepted_oid: str,
+    worktree: Path,
+    *,
+    reason: BlockReasonCode,
+    evidence: str,
+    review_fingerprint_source: str | None,
+    user_targets: tuple[str, ...],
+) -> None:
+    """Replace one final cause without resetting its published checkpoint."""
+
     base_revision = str(
         blocked["active_sha"] or blocked["current_revision_sha"] or blocked["plan_sha"] or ""
     )
     release_fingerprint = _revision_execplan_input_fingerprint(
         repo_path, base_revision, blocked,
     )
-    review_fingerprint = _revision_review_issue_fingerprint(
-        repo_path, base_revision, review,
+    review_fingerprint = (
+        _revision_review_issue_fingerprint(
+            repo_path, base_revision, review_fingerprint_source,
+        )
+        if review_fingerprint_source is not None else None
     )
-    assert review_fingerprint is not None
     worktree_fingerprint = _worktree_execplan_input_fingerprint(worktree, blocked)
     observation = recovery_runtime.RecoveryObservation(
-        reason=recovery_runtime.RecoveryReason.REVIEW_SPECIFICATION_DEADLOCK,
+        reason=recovery_runtime.reason_from_block(reason),
         repo=repo, plan_id=str(blocked["plan_id"]), phase="PLAN_BLOCKED",
         plan_revision=str(blocked["current_revision_sha"] or blocked["plan_sha"] or ""),
         base_revision=base_revision,
         fingerprint=hashlib.sha256(
-            f"{release_fingerprint}|{review_fingerprint}".encode()
+            f"{release_fingerprint}|{review_fingerprint or evidence}".encode()
         ).hexdigest(),
-        progress_marker=accepted_oid, detail=review,
-        user_targets=details.paths,
+        progress_marker=accepted_oid, detail=evidence,
+        user_targets=user_targets,
     )
     with runtime_state._transaction(connection):
         decision = recovery_state.RecoveryRepository(connection).observe(
@@ -14488,13 +14533,13 @@ def _reclassify_remote_specification_deadlock(
                 "blocked_fingerprint": release_fingerprint,
                 "blocked_worktree_fingerprint": worktree_fingerprint,
                 "blocked_review_fingerprint": review_fingerprint,
-                "review_result": review,
-                "last_error": review,
+                "review_result": evidence,
+                "last_error": evidence,
                 "review_failure_history": "{}",
                 "review_level_history": "{}",
                 "retry_count": 0,
             },
-            project_values={"last_error": review},
+            project_values={"last_error": evidence},
             enqueue=False,
         )
         changed = connection.execute(
@@ -14502,14 +14547,14 @@ def _reclassify_remote_specification_deadlock(
             "release_fingerprint = ?, updated_at = CURRENT_TIMESTAMP "
             "WHERE repo = ? AND plan_id = ? AND reason_code = ?",
             (
-                reason.value, review, release_fingerprint, repo,
+                reason.value, evidence, release_fingerprint, repo,
                 str(blocked["plan_id"]), str(blocked["blocked_reason"]),
             ),
         )
         if changed.rowcount != 1:
             raise RuntimeError("원격 checkpoint 차단 원인이 변경됐습니다.")
         repository.reclassify_published(
-            request, reason_code=reason.value, evidence=review,
+            request, reason_code=reason.value, evidence=evidence,
             release_fingerprint=release_fingerprint,
             accepted_oid=accepted_oid,
         )
@@ -14762,6 +14807,21 @@ def _reconcile_published_blocked_checkpoint(
                 )
             except (OSError, RuntimeError, ValueError) as error:
                 return retry(f"원격 checkpoint 명세 교착 기록 미완료: {error}")
+            return "blocked"
+        if new_failure_stage == "protocol_exhausted":
+            try:
+                _reclassify_remote_checkpoint_block(
+                    connection, repo_path, repo, blocked, repository, request,
+                    observed, worktree,
+                    reason=BlockReasonCode.REVIEW_PROTOCOL_EXHAUSTED,
+                    evidence=assessment, review_fingerprint_source=None,
+                    user_targets=(
+                        str(blocked["path"]),
+                        *(str(source) for source in json.loads(str(blocked["sources"]))),
+                    ),
+                )
+            except (OSError, RuntimeError, ValueError) as error:
+                return retry(f"원격 checkpoint Reviewer 프로토콜 차단 기록 미완료: {error}")
             return "blocked"
         if not resolved:
             detail = "원격 checkpoint 원인 유지:\n" + assessment
