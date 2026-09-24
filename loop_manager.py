@@ -2312,6 +2312,37 @@ def _assert_ready_plan_revision(
         )
 
 
+def _git_path_matches_revision(
+    worktree: Path,
+    revision: str,
+    path: str,
+    *,
+    cached: bool,
+) -> bool:
+    """Compare a Git path through its worktree or index checkout filters."""
+
+    arguments = ["diff", "--quiet", "--no-ext-diff"]
+    if cached:
+        arguments.append("--cached")
+    arguments.extend((revision, "--", path))
+    result = git(worktree, *arguments, check=False)
+    if result.returncode == 1:
+        return False
+    if result.returncode:
+        raise RuntimeError(result.stdout[-6000:].strip())
+    return True
+
+
+def _git_path_has_standard_index_flags(worktree: Path, path: str) -> bool:
+    """Require a normally tracked index entry before trusting Git diff output."""
+
+    entries = git_bytes(worktree, "ls-files", "-v", "-z", "--", path).split(
+        b"\0"
+    )
+    records = [entry for entry in entries if entry]
+    return records == [b"H " + os.fsencode(path)]
+
+
 def _ready_plan_snapshot(
     worktree: Path,
     active_sha: str,
@@ -2323,19 +2354,34 @@ def _ready_plan_snapshot(
         raise MaintenancePlanningError(
             f"READY ExecPlan 파일을 확인할 수 없습니다: {path}"
         )
-    contents = target.read_bytes()
     try:
         base_contents = git_bytes(worktree, "show", f"{active_sha}:{path}")
+        standard_index_flags = _git_path_has_standard_index_flags(worktree, path)
+        checkout_matches = _git_path_matches_revision(
+            worktree, active_sha, path, cached=False
+        )
     except RuntimeError as error:
         raise MaintenancePlanningError(
             f"평가 기준 revision에서 READY ExecPlan을 확인할 수 없습니다: {path}"
         ) from error
-    if contents != base_contents:
+    if not standard_index_flags or not checkout_matches:
         raise MaintenancePlanningError(
             f"READY ExecPlan 파일이 평가 기준 revision과 다릅니다: {path}"
         )
-    snapshot = _ready_plan_snapshot_from_contents(row, contents)
-    _assert_ready_plan_revision(worktree, active_sha, snapshot, contents)
+    snapshot = _ready_plan_snapshot_from_contents(row, base_contents)
+    _assert_ready_plan_revision(worktree, active_sha, snapshot, base_contents)
+    try:
+        index_matches = _git_path_matches_revision(
+            worktree, active_sha, path, cached=True
+        )
+    except RuntimeError as error:
+        raise MaintenancePlanningError(
+            f"평가 기준 revision에서 READY ExecPlan을 확인할 수 없습니다: {path}"
+        ) from error
+    if not index_matches:
+        raise MaintenancePlanningError(
+            f"READY ExecPlan 파일이 평가 기준 revision과 다릅니다: {path}"
+        )
     return snapshot
 
 

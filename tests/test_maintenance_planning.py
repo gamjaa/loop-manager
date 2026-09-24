@@ -336,6 +336,46 @@ class MaintenancePlanningTest(unittest.TestCase):
                 self.connection, str(self.repo), self.repo, self.base_sha
             )
 
+    def test_ready_snapshot_accepts_crlf_checkout_but_rejects_body_change(self):
+        git(self.repo, "config", "core.autocrlf", "true")
+        self.ready_path.write_bytes(
+            self.ready_path.read_bytes().replace(b"\n", b"\r\n")
+        )
+        self.assertIn(b"\r\n", self.ready_path.read_bytes())
+
+        context = self._begin_barrier()
+
+        self.assertEqual(context.eligible_plans[0].text, self.ready_path.read_text(
+            encoding="utf-8"
+        ).replace("\r\n", "\n"))
+        self.ready_path.write_text(
+            self.ready_path.read_text(encoding="utf-8").replace(
+                "Separate the responsibility into a testable module boundary.",
+                "A real checkout modification must remain rejected.",
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(
+            loop_manager.MaintenancePlanningError, "평가 기준 revision"
+        ):
+            self._begin_barrier()
+
+    def test_ready_snapshot_rejects_assume_unchanged_body_change(self):
+        relative_path = self.ready_path.relative_to(self.repo).as_posix()
+        git(self.repo, "update-index", "--assume-unchanged", relative_path)
+        self.ready_path.write_text(
+            self.ready_path.read_text(encoding="utf-8").replace(
+                "Separate the responsibility into a testable module boundary.",
+                "A hidden checkout modification must remain rejected.",
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            loop_manager.MaintenancePlanningError, "평가 기준 revision"
+        ):
+            self._begin_barrier()
+
     def test_ready_snapshot_rejects_all_ownership_nonready_and_hash_drift(self):
         maintenance_state.MaintenanceRepository(
             self.connection

@@ -33,8 +33,8 @@ priority: critical
 
 ## Progress
 
-- [ ] Git 기준 clean 판정과 blob snapshot 연결
-- [ ] Windows 줄바꿈 및 실제 수정 targeted test 추가
+- [x] Git 기준 clean 판정과 blob snapshot 연결
+- [x] Windows 줄바꿈 및 실제 수정 targeted test 추가
 
 ## Decision Log
 
