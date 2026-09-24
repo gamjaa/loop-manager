@@ -1858,10 +1858,12 @@ class _GitCatalogDefinitionPort:
         repo: Path,
         remote_ref: str,
         archive_conflict_plan_ids: Callable[[], frozenset[str]],
+        pinned_revision: str | None = None,
     ):
         self.repo = repo
         self.remote_ref = remote_ref
         self.archive_conflict_plan_ids = archive_conflict_plan_ids
+        self.pinned_revision = pinned_revision
 
     def current_revision(self) -> str:
         return git(
@@ -1872,7 +1874,7 @@ class _GitCatalogDefinitionPort:
         ).stdout.strip()
 
     def load(self) -> execplan_catalog_state.PinnedCatalog:
-        revision_sha = self.current_revision()
+        revision_sha = self.pinned_revision or self.current_revision()
         try:
             snapshot = revision_execplan_snapshot(
                 self.repo,
@@ -1918,13 +1920,25 @@ def reconcile_execplan_catalog(
     base_branch: str,
     *,
     record_invalid: bool = True,
+    remote_sha: str | None = None,
 ) -> execplan_catalog_state.CatalogReconciliationResult:
     """Converge declaration cache or persist a recoverable project diagnostic."""
 
+    remote_ref = f"refs/remotes/origin/{base_branch}"
+    if remote_sha is not None:
+        current_sha = git(
+            repo_path, "rev-parse", "--verify", f"{remote_ref}^{{commit}}"
+        ).stdout.strip()
+        if current_sha != remote_sha:
+            return execplan_catalog_state.CatalogReconciliationResult(
+                execplan_catalog_state.ReconciliationKind.STALE,
+                revision_sha=remote_sha,
+            )
     port = _GitCatalogDefinitionPort(
         repo_path,
-        f"refs/remotes/origin/{base_branch}",
+        remote_ref,
         lambda: _merged_execplan_ids(connection, repo),
+        pinned_revision=remote_sha,
     )
     result = execplan_catalog_state.CatalogReconciliationService(
         execplan_catalog_state.DefinitionStateRepository(connection),
@@ -13755,15 +13769,19 @@ class PullRequestSyncResult:
     merged: bool = False
 
 
-def synchronize_waiting_pull_requests(
+@dataclass(frozen=True)
+class WaitingPullRequestObservation:
+    conflicts: tuple[tuple[sqlite3.Row, Mapping[str, object]], ...]
+    merged: bool
+
+
+def observe_waiting_pull_requests(
     connection: sqlite3.Connection,
     repo_path: Path,
     state_dir: Path,
     repo: str,
-    *,
-    after_reconciliation: Callable[[], None] | None = None,
-) -> PullRequestSyncResult:
-    """Synchronize every merge-wait row, then select at most one conflict."""
+) -> WaitingPullRequestObservation:
+    """Commit every merge-wait observation before source or conflict work."""
 
     rows = connection.execute(
         "SELECT * FROM exec_plans WHERE repo = ? AND "
@@ -13772,29 +13790,42 @@ def synchronize_waiting_pull_requests(
         (repo, PR_CLOSED_BLOCK_REASON),
     ).fetchall()
     conflicts: list[tuple[sqlite3.Row, Mapping[str, object]]] = []
-    fetched_after_merge = False
     merged = False
     for stored in rows:
         branch = str(stored["branch"] or "")
         if not branch:
-            continue
+            raise RuntimeError(
+                f"저장된 Merge 대기 PR의 관리 branch를 확인할 수 없습니다: {stored['plan_id']}"
+            )
         pull_request = pr_for_branch(
             repo_path,
             branch,
             str(stored["pr_url"] or "") or None,
         )
         if pull_request is None:
-            continue
+            raise RuntimeError(
+                f"저장된 Merge 대기 PR의 GitHub 상태를 확인할 수 없습니다: {branch}"
+            )
+        observed_url = str(pull_request.get("url") or "")
+        stored_url = str(stored["pr_url"] or "")
+        if stored_url and observed_url and observed_url != stored_url:
+            raise PublicationSafetyError(
+                f"저장된 PR URL과 GitHub PR identity가 다릅니다: {branch}"
+            )
+        head_name = pull_request.get("headRefName")
+        if head_name and str(head_name) != branch:
+            raise PublicationSafetyError(
+                f"저장된 PR head branch와 GitHub PR identity가 다릅니다: {branch}"
+            )
         url = str(pull_request.get("url") or stored["pr_url"] or "")
+        if not url:
+            raise RuntimeError(f"저장된 Merge 대기 PR URL을 확인할 수 없습니다: {branch}")
         head_value = pull_request.get("headRefOid")
         head_oid = str(head_value) if head_value else stored["pr_head_oid"]
         state = str(pull_request.get("state") or "OPEN").upper()
         if state == "MERGED" or pull_request.get("mergedAt"):
             if scoped_blocking.project_block(connection, repo) is not None:
                 continue
-            if not fetched_after_merge:
-                git(repo_path, "fetch", "origin")
-                fetched_after_merge = True
             assessment = complete_merged_execplan_worktree(
                 connection,
                 repo_path,
@@ -13854,40 +13885,75 @@ def synchronize_waiting_pull_requests(
                 "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
                 (repo, stored["plan_id"]),
             ).fetchone()
+        mergeability = classify_pull_request_mergeability(pull_request)
         with connection:
+            plan_values: dict[str, object] = {"pr_url": url}
+            # Conflict recovery must compare GitHub's head with the stored
+            # ownership OID before adopting a changed head.
+            if mergeability != "conflicting":
+                plan_values["pr_head_oid"] = head_oid
             runtime_state.RuntimeStateRepository(connection).update_plan(
                 repo,
                 str(stored["plan_id"]),
-                plan_values={"pr_url": url, "pr_head_oid": head_oid},
+                plan_values=plan_values,
                 enqueue=False,
             )
             notifications.enqueue_current_project_events(connection, repo)
-        if classify_pull_request_mergeability(pull_request) == "conflicting":
+        if mergeability == "conflicting":
             conflicts.append((stored, pull_request))
 
-    if after_reconciliation is not None:
-        after_reconciliation()
+    # Each completed transition is committed before a remote fetch can fail.
+    # A later run fetches again and resumes source synchronization from SQLite.
+    if merged:
+        project = connection.execute(
+            "SELECT base_branch FROM projects WHERE repo = ?", (repo,)
+        ).fetchone()
+        if project is None or not project["base_branch"]:
+            raise RuntimeError("Merge 뒤 fetch할 프로젝트 base branch를 확인할 수 없습니다.")
+        base = str(project["base_branch"])
+        git(
+            repo_path,
+            "fetch",
+            "origin",
+            f"+refs/heads/{base}:refs/remotes/origin/{base}",
+        )
+    return WaitingPullRequestObservation(tuple(conflicts), merged)
+
+
+def select_waiting_pull_request_conflict(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    state_dir: Path,
+    repo: str,
+    observation: WaitingPullRequestObservation,
+) -> PullRequestSyncResult:
+    """Select one still-eligible conflict after all observations are durable."""
 
     if active_execplan(connection, repo) is not None:
-        return PullRequestSyncResult(merged=merged)
+        return PullRequestSyncResult(merged=observation.merged)
     if scoped_blocking.project_block(connection, repo) is not None:
-        return PullRequestSyncResult(merged=merged)
-    statuses = {
-        str(row["plan_id"]): str(row["status"])
+        return PullRequestSyncResult(merged=observation.merged)
+    current_rows = {
+        str(row["plan_id"]): row
         for row in connection.execute(
-            "SELECT plan_id, status FROM exec_plans WHERE repo = ?", (repo,)
+            "SELECT * FROM exec_plans WHERE repo = ?", (repo,)
         )
     }
-    eligible = [
-        item
-        for item in conflicts
+    statuses = {
+        plan_id: str(row["status"]) for plan_id, row in current_rows.items()
+    }
+    eligible: list[tuple[sqlite3.Row, Mapping[str, object]]] = []
+    for stored, pull_request in observation.conflicts:
+        current = current_rows.get(str(stored["plan_id"]))
+        if current is None or current["status"] != "PR_OPEN":
+            continue
         if all(
             statuses.get(str(dependency)) == "MERGED"
-            for dependency in json.loads(str(item[0]["depends_on"]))
-        )
-    ]
+            for dependency in json.loads(str(current["depends_on"]))
+        ):
+            eligible.append((current, pull_request))
     if not eligible:
-        return PullRequestSyncResult(merged=merged)
+        return PullRequestSyncResult(merged=observation.merged)
     plan, pull_request = min(
         eligible,
         key=lambda item: (
@@ -13908,7 +13974,25 @@ def synchronize_waiting_pull_requests(
         project,
         pull_request,
     )
-    return PullRequestSyncResult(result, result is None, merged)
+    return PullRequestSyncResult(result, result is None, observation.merged)
+
+
+def synchronize_waiting_pull_requests(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    state_dir: Path,
+    repo: str,
+    *,
+    after_reconciliation: Callable[[], None] | None = None,
+) -> PullRequestSyncResult:
+    observation = observe_waiting_pull_requests(
+        connection, repo_path, state_dir, repo
+    )
+    if after_reconciliation is not None:
+        after_reconciliation()
+    return select_waiting_pull_request_conflict(
+        connection, repo_path, state_dir, repo, observation
+    )
 
 
 def resume_project_block_if_safe(
@@ -17574,28 +17658,6 @@ def _run_project_step(
         repo_path,
         requested_base or (row["base_branch"] if row else None),
     )
-    base_sha = git(
-        repo_path,
-        "rev-parse",
-        f"refs/remotes/origin/{base}^{{commit}}",
-    ).stdout.strip()
-    if row is not None and (
-        row["phase"] == "PR_OPEN" or int(row["pr_conflict_recovery"])
-    ):
-        sync_result = BaseWorktreeSyncResult(
-            "skipped",
-            "PR 충돌 감지/복구 중 source checkout 보존",
-            base_sha,
-        )
-    else:
-        sync_result = ensure_safe_base_worktree(
-            repo_path,
-            base,
-            remote_sha=base_sha,
-        )
-    if isinstance(sync_result, BaseWorktreeSyncResult):
-        log_base_worktree_sync(repo_path, sync_result)
-
     backfill_plan_shas(connection, target_repo=repo)
     try:
         migrate_legacy_execplans(
@@ -17668,26 +17730,75 @@ def _run_project_step(
                 file=sys.stderr,
             )
 
+    base_sha = ""
+
+    def synchronize_source_after_pr_reconciliation() -> None:
+        nonlocal base_sha
+        # Read the durable project state after all PR transitions and cleanup.
+        current_project = connection.execute(
+            "SELECT * FROM projects WHERE repo = ?", (repo,)
+        ).fetchone()
+        if current_project is not None and str(current_project["base_branch"]) != base:
+            raise RuntimeError("PR 상태 동기화 중 프로젝트 base branch가 변경됐습니다.")
+        if scoped_blocking.project_block(connection, repo) is None:
+            base_sha = git(
+                repo_path,
+                "rev-parse",
+                f"refs/remotes/origin/{base}^{{commit}}",
+            ).stdout.strip()
+            waiting_open = connection.execute(
+                "SELECT 1 FROM exec_plans WHERE repo = ? AND status = 'PR_OPEN' LIMIT 1",
+                (repo,),
+            ).fetchone() is not None
+            confirmed_merge = connection.execute(
+                "SELECT 1 FROM exec_plans WHERE repo = ? AND status = 'MERGED' LIMIT 1",
+                (repo,),
+            ).fetchone() is not None
+            conflict_recovery = bool(
+                current_project is not None
+                and int(current_project["pr_conflict_recovery"])
+            )
+            if (waiting_open or conflict_recovery) and not confirmed_merge:
+                sync_result = BaseWorktreeSyncResult(
+                    "skipped",
+                    "PR 충돌 감지/복구 중 source checkout 보존",
+                    base_sha,
+                )
+            else:
+                sync_result = ensure_safe_base_worktree(
+                    repo_path, base, remote_sha=base_sha
+                )
+            if isinstance(sync_result, BaseWorktreeSyncResult):
+                log_base_worktree_sync(repo_path, sync_result)
+        archive_housekeeping()
+        # Archive publication can advance the remote after source sync.
+        base_sha = git(
+            repo_path,
+            "rev-parse",
+            f"refs/remotes/origin/{base}^{{commit}}",
+        ).stdout.strip()
+
     pr_sync = synchronize_waiting_pull_requests(
         connection,
         repo_path,
         state_dir,
         repo,
-        after_reconciliation=archive_housekeeping,
+        after_reconciliation=synchronize_source_after_pr_reconciliation,
     )
     if pr_sync.step_result not in {None, 0}:
         return pr_sync.step_result
-    base_sha = git(
-        repo_path,
-        "rev-parse",
-        f"refs/remotes/origin/{base}^{{commit}}",
-    ).stdout.strip()
+    if not base_sha:
+        base_sha = git(
+            repo_path,
+            "rev-parse",
+            f"refs/remotes/origin/{base}^{{commit}}",
+        ).stdout.strip()
     row = connection.execute(
         "SELECT * FROM projects WHERE repo = ?", (repo,)
     ).fetchone()
     if row is not None and row["phase"] != "PLANNING":
         catalog_result = reconcile_execplan_catalog(
-            connection, repo_path, repo, base
+            connection, repo_path, repo, base, remote_sha=base_sha
         )
         if (
             catalog_result.kind

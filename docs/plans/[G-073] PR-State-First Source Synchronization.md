@@ -36,10 +36,11 @@ priority: high
 
 ## Progress
 
-- [ ] PR 상태 관측·영속화와 충돌 선택 경계 분리
-- [ ] 최신 상태 기반 source sync 순서 연결
-- [ ] 단일·다중 PR 및 실패 targeted test 추가
+- [x] PR 상태 관측·영속화와 충돌 선택 경계 분리
+- [x] 최신 상태 기반 source sync 순서 연결
+- [x] 단일·다중 PR 및 실패 targeted test 추가
 
 ## Decision Log
 
 - PR 상태는 GitHub가, 계획 실행 상태는 SQLite가 소유한다. source sync는 둘을 조정한 뒤의 remote SHA와 최신 project 상태를 사용한다.
+- 기존 safe fast-forward synchronizer와 관리 worktree 소유권·Git 쓰기 경계를 그대로 사용한다. Architecture Change Policy의 경계 변경은 필요하지 않다.

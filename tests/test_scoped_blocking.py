@@ -133,7 +133,12 @@ class ScopedBlockingTest(unittest.TestCase):
                 loop_manager.synchronize_waiting_pull_requests(self.connection, Path(self.repo), Path(directory), self.repo)
             self.assertEqual(read.call_count, 2)
             cleanup.assert_called_once()
-            git.assert_called_once_with(Path(self.repo), "fetch", "origin")
+            git.assert_called_once_with(
+                Path(self.repo),
+                "fetch",
+                "origin",
+                "+refs/heads/main:refs/remotes/origin/main",
+            )
             self.assertIsNotNone(scoped_blocking.project_block(self.connection, self.repo))
             statuses = dict(self.connection.execute("SELECT plan_id, status FROM exec_plans"))
             self.assertEqual(statuses, {"G-001": "MERGED", "G-002": "PR_OPEN"})
