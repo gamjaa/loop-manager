@@ -68,6 +68,35 @@ class VerifyProcessTests(unittest.TestCase):
             if status.exists():
                 self.assertEqual(status.read_text().split()[2], "Z")
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux /proc assertion")
+    def test_timeout_kills_child_in_new_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            child_pid = root / "detached.pid"
+            parent = (
+                "import subprocess,sys,pathlib; "
+                "child=subprocess.Popen([sys.executable,'-c','while True: pass'], "
+                "start_new_session=True); "
+                f"pathlib.Path({str(child_pid)!r}).write_text(str(child.pid)); "
+                "print('detached child started',flush=True); child.wait()"
+            )
+            try:
+                passed, timed_out, output = run_verify_process(
+                    [sys.executable, "-c", parent], root, 1,
+                )
+                self.assertEqual((passed, timed_out), (False, True))
+                self.assertIn("detached child started", output)
+                pid = int(child_pid.read_text())
+                status = Path(f"/proc/{pid}/stat")
+                if status.exists():
+                    self.assertEqual(status.read_text().split()[2], "Z")
+            finally:
+                if child_pid.exists():
+                    try:
+                        os.kill(int(child_pid.read_text()), 9)
+                    except ProcessLookupError:
+                        pass
+
     @unittest.skipIf(os.name == "nt", "POSIX process-group assertion")
     def test_unconfirmed_group_kill_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch(

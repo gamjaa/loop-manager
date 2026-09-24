@@ -72,6 +72,92 @@ def _confirm_posix_group_stopped(pgid: int) -> None:
         time.sleep(0.05)
 
 
+def _linux_process_info(pid: int) -> tuple[int, int, str, int] | None:
+    """Return (parent, group, state, start time) for one process identity."""
+
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii", errors="replace")
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise VerifyTerminationUncertain(
+            f"verify 자식 상태 확인 실패 (PID {pid}): {error}"
+        ) from error
+    end = stat.rfind(")")
+    fields = stat[end + 2:].split() if end >= 0 else []
+    if len(fields) < 20:
+        raise VerifyTerminationUncertain(f"verify 자식 상태 해석 실패 (PID {pid})")
+    try:
+        return int(fields[1]), int(fields[2]), fields[0], int(fields[19])
+    except ValueError as error:
+        raise VerifyTerminationUncertain(
+            f"verify 자식 상태 해석 실패 (PID {pid})"
+        ) from error
+
+
+def _linux_descendants(root_pid: int) -> dict[int, int]:
+    """Snapshot descendants, including children that created a new session."""
+
+    processes = {}
+    try:
+        with os.scandir("/proc") as entries:
+            for entry in entries:
+                if entry.name.isdecimal():
+                    info = _linux_process_info(int(entry.name))
+                    if info is not None:
+                        processes[int(entry.name)] = info
+    except OSError as error:
+        raise VerifyTerminationUncertain(
+            f"verify 자식 목록 확인 실패 (PID {root_pid}): {error}"
+        ) from error
+    if root_pid not in processes:
+        raise VerifyTerminationUncertain(
+            f"verify 부모 종료 전 자식 추적 실패 (PID {root_pid})"
+        )
+    descendants = {}
+    parents = {root_pid}
+    while parents:
+        children = {
+            pid for pid, (parent, _, _, _) in processes.items()
+            if parent in parents and pid not in descendants and pid != root_pid
+        }
+        for pid in children:
+            descendants[pid] = processes[pid][3]
+        parents = children
+    return descendants
+
+
+def _signal_linux_process(pid: int, start_time: int, action: int) -> None:
+    info = _linux_process_info(pid)
+    if info is None or info[3] != start_time or info[2] in {"Z", "X"}:
+        return
+    try:
+        os.kill(pid, action)
+    except ProcessLookupError:
+        return
+    except OSError as error:
+        raise VerifyTerminationUncertain(
+            f"verify 자식 종료 실패 (PID {pid}): {error}"
+        ) from error
+
+
+def _confirm_linux_descendants_stopped(descendants: dict[int, int]) -> None:
+    deadline = time.monotonic() + 2
+    while True:
+        live = [
+            pid for pid, started in descendants.items()
+            if (info := _linux_process_info(pid)) is not None
+            and info[3] == started and info[2] not in {"Z", "X"}
+        ]
+        if not live:
+            return
+        if time.monotonic() >= deadline:
+            raise VerifyTerminationUncertain(
+                f"verify 분리된 자식 잔존 (PID {live[0]})"
+            )
+        time.sleep(0.05)
+
+
 def run_verify_process(
     arguments: list[str], worktree: Path, timeout_seconds: int,
 ) -> tuple[bool, bool, str]:
@@ -91,6 +177,7 @@ def run_verify_process(
             output.seek(0)
             return code == 0, False, output.read().decode("utf-8", errors="replace")
         except subprocess.TimeoutExpired:
+            descendants = {}
             if os.name == "nt":
                 try:
                     killed = subprocess.run(
@@ -107,6 +194,39 @@ def run_verify_process(
                         f"verify process tree 종료 실패 (PID {process.pid}, taskkill {killed.returncode})"
                     )
             else:
+                if sys.platform.startswith("linux"):
+                    try:
+                        os.killpg(process.pid, signal.SIGSTOP)
+                    except ProcessLookupError:
+                        raise VerifyTerminationUncertain(
+                            f"verify 자식 추적 전 process group 소실 (PGID {process.pid})"
+                        ) from None
+                    except OSError as error:
+                        raise VerifyTerminationUncertain(
+                            f"verify process group 정지 실패 (PGID {process.pid}): {error}"
+                        ) from error
+                    try:
+                        deadline = time.monotonic() + 2
+                        while True:
+                            discovered = _linux_descendants(process.pid)
+                            new = {
+                                pid: started for pid, started in discovered.items()
+                                if pid not in descendants
+                            }
+                            if not new:
+                                break
+                            descendants.update(new)
+                            for pid, started in new.items():
+                                _signal_linux_process(pid, started, signal.SIGSTOP)
+                            if time.monotonic() >= deadline:
+                                raise VerifyTerminationUncertain(
+                                    f"verify 자식 추적 상한 초과 (PGID {process.pid})"
+                                )
+                    except Exception:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        for pid, started in descendants.items():
+                            _signal_linux_process(pid, started, signal.SIGKILL)
+                        raise
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
@@ -115,6 +235,8 @@ def run_verify_process(
                     raise VerifyTerminationUncertain(
                         f"verify process group 종료 실패 (PGID {process.pid}): {error}"
                     ) from error
+                for pid, started in descendants.items():
+                    _signal_linux_process(pid, started, signal.SIGKILL)
             try:
                 process.wait(timeout=10)
             except (OSError, subprocess.TimeoutExpired) as error:
@@ -123,4 +245,6 @@ def run_verify_process(
                 ) from error
             if os.name != "nt":
                 _confirm_posix_group_stopped(process.pid)
+                if descendants:
+                    _confirm_linux_descendants_stopped(descendants)
             return False, True, _tail(output)
