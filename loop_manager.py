@@ -14058,11 +14058,37 @@ def _resume_remote_corrected_execplan(
         )
 
 
+def _remote_checkpoint_has_new_failure(
+    connection: sqlite3.Connection, repo: str, blocked: sqlite3.Row,
+    stage: str, output: str, worktree: Path,
+) -> bool:
+    """Use the normal validation fingerprint contract to recognize progress."""
+    history = _deserialize_failure_history(blocked[f"{stage}_failure_history"])
+    previous = blocked[f"{stage}_result"]
+    known = set(history)
+    if previous:
+        known.update(key for key, _ in validation_failure_fingerprints(stage, previous, worktree))
+    if not known:
+        request = blocked_checkpoint_state.BlockedCheckpointRepository(connection).get(
+            repo, str(blocked["plan_id"]),
+        )
+        if request and request.evidence:
+            try:
+                known.update(key for key, _ in validation_failure_fingerprints(
+                    stage, request.evidence, worktree,
+                ))
+            except ReviewerProtocolError:
+                return False
+    return bool(known) and any(
+        key not in known for key, _ in validation_failure_fingerprints(stage, output, worktree)
+    )
+
+
 def _evaluate_remote_checkpoint_cause(
     connection: sqlite3.Connection, repo_path: Path, state_dir: Path,
     repo: str, blocked: sqlite3.Row, config_path: Path | None,
     timeout_seconds: int | None,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, str | None]:
     """Inspect the candidate while retaining the block and all execution evidence."""
     worktree = Path(str(blocked["worktree"]))
     config = config_path or ROOT / "config/config.ini"
@@ -14075,9 +14101,11 @@ def _evaluate_remote_checkpoint_cause(
         external_worktree=repo_path,
     )
     if not passed:
-        return False, str(output)
+        return _remote_checkpoint_has_new_failure(
+            connection, repo, blocked, "verify", output, worktree,
+        ), str(output), "verify"
     if blocked["blocked_reason"] == BlockReasonCode.VERIFY_RETRY_EXHAUSTED.value:
-        return True, str(output)
+        return True, str(output), None
     project = connection.execute(
         "SELECT provider, base_branch FROM projects WHERE repo = ?", (repo,),
     ).fetchone()
@@ -14096,7 +14124,9 @@ def _evaluate_remote_checkpoint_cause(
     if code:
         raise RuntimeError(f"원격 checkpoint Reviewer 실행 미완료: {review}")
     verdict, _ = parse_reviewer_result(review)
-    return verdict == "PASS", review
+    return verdict == "PASS" or _remote_checkpoint_has_new_failure(
+        connection, repo, blocked, "review", review, worktree,
+    ), review, "review" if verdict != "PASS" else None
 
 
 def _reconcile_published_blocked_checkpoint(
@@ -14321,22 +14351,55 @@ def _reconcile_published_blocked_checkpoint(
     )
     if corrected_paths:
         try:
-            resolved, assessment = _evaluate_remote_checkpoint_cause(
+            resolved, assessment, new_failure_stage = _evaluate_remote_checkpoint_cause(
                 connection, repo_path, state_dir, repo, blocked, config_path,
                 verify_timeout_seconds,
             )
+        except VerifyTerminationUncertain as error:
+            with connection:
+                scoped_blocking.record_project_block(
+                    connection, repo, BlockReasonCode.REPOSITORY_STATE_UNSAFE,
+                    str(error), request.request_identity,
+                    plan_id=request.plan_id, previous_phase=None,
+                )
+                notifications.enqueue_current_project_events(connection, repo)
+            return "project-blocked"
         except (OSError, RuntimeError, ValueError) as error:
             return retry(f"원격 checkpoint 원인 재평가 미완료: {error}")
         if not resolved:
-            repository.record_remote_inspection(
-                request, observed, input_identity,
-                "원격 checkpoint 원인 유지:\n" + assessment,
-            )
+            detail = "원격 checkpoint 원인 유지:\n" + assessment
+            with connection:
+                connection.execute(
+                    "UPDATE execplan_blocks SET evidence = ?, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE repo = ? AND plan_id = ?",
+                    (detail, repo, request.plan_id),
+                )
+                connection.execute(
+                    "UPDATE exec_plans SET last_error = ? WHERE repo = ? AND plan_id = ?",
+                    (detail, repo, request.plan_id),
+                )
+                repository.record_remote_inspection(
+                    request, observed, input_identity, detail, commit=False,
+                )
+                notifications.enqueue_current_project_events(connection, repo)
             return "blocked"
-        _resume_remote_corrected_execplan(
-            connection, repo, blocked, repository, request, observed,
-            input_identity, "원격 checkpoint 원인 해소 확인 후 Worker부터 재검증: " + assessment,
-        )
+        with runtime_state._transaction(connection):
+            _resume_remote_corrected_execplan(
+                connection, repo, blocked, repository, request, observed,
+                input_identity, "원격 checkpoint 진행 확인 후 Worker부터 재검증: " + assessment,
+            )
+            if new_failure_stage:
+                # New diagnostics are Worker input, not evidence of successful validation.
+                runtime_state.RuntimeStateRepository(connection).transition(
+                    repo, request.plan_id,
+                    plan_values={
+                        f"{new_failure_stage}_result": assessment,
+                        "verify_failure_history": blocked["verify_failure_history"],
+                        "review_failure_history": blocked["review_failure_history"],
+                    },
+                    project_values={f"{new_failure_stage}_result": assessment},
+                    enqueue=False,
+                )
         return "resumed"
     if blocked["blocked_reason"] == BlockReasonCode.PLAN_INPUT_INVALID.value and (
         blocked["blocked_fingerprint"]
@@ -14364,6 +14427,8 @@ def resume_plan_blocks(
 ) -> bool:
     """Reevaluate each plan block without letting one overwrite another."""
 
+    if scoped_blocking.project_block(connection, repo) is not None:
+        return False
     if active_execplan(connection, repo) is not None:
         return False
     for blocked in plan_blocked_execplans(connection, repo):
@@ -14390,6 +14455,8 @@ def resume_plan_blocks(
                 checkpoint_row, checkpoint_request, checkpoint_repository,
                 config_path, verify_timeout_seconds,
             )
+            if remote_result == "project-blocked":
+                return False
             if remote_result == "blocked":
                 continue
             if remote_result == "resumed":
@@ -17621,6 +17688,8 @@ def _run_project_step(
         connection, repo_path, state_dir, repo, base, config_path,
         verify_timeout_seconds,
     )
+    if scoped_blocking.project_block(connection, repo) is not None:
+        return 1
     row = connection.execute(
         "SELECT * FROM projects WHERE repo = ?", (repo,)
     ).fetchone()

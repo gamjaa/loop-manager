@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import subprocess
 import tempfile
@@ -671,7 +672,7 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
         self.publish_block(evidence="AssertionError: original cause")
         self.connection.execute(
             "UPDATE exec_plans SET verify_failure_history = ?, "
-            "retry_count = 3, verify_result = 'original output' WHERE plan_id = 'G-034'",
+            "retry_count = 3, verify_result = 'AssertionError: original cause' WHERE plan_id = 'G-034'",
             ('{"old": {"occurrences": 3}}',),
         )
         self.connection.commit()
@@ -684,11 +685,17 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
             "SELECT status, retry_count, verify_failure_history, verify_result "
             "FROM exec_plans WHERE plan_id = 'G-034'"
         ).fetchone()
-        self.assertEqual(tuple(row), ("PLAN_BLOCKED", 3, '{"old": {"occurrences": 3}}', "original output"))
+        self.assertEqual(tuple(row), ("PLAN_BLOCKED", 3, '{"old": {"occurrences": 3}}', "AssertionError: original cause"))
         inspected = self.connection.execute(
             "SELECT inspected_remote_oid, inspection_reason FROM blocked_checkpoints"
         ).fetchone()
         self.assertEqual(tuple(inspected), (unrelated, "원격 checkpoint 원인 유지:\nAssertionError: original cause"))
+        evidence = self.connection.execute(
+            "SELECT evidence FROM execplan_blocks WHERE plan_id = 'G-034'"
+        ).fetchone()[0]
+        self.assertEqual(evidence, inspected["inspection_reason"])
+        payloads = self.connection.execute("SELECT payload FROM notification_outbox").fetchall()
+        self.assertTrue(any(evidence in json.loads(row[0]).get("cause", "") for row in payloads))
         self.assertFalse(loop_manager.resume_plan_blocks(
             self.connection, self.repo, self.state_dir, str(self.repo.resolve()), "main",
         ))
@@ -699,6 +706,46 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
             self.connection, self.repo, self.state_dir, str(self.repo.resolve()), "main",
         ))
         self.assertEqual(self.verify_probe.call_count, 2)
+
+    def test_new_verify_failure_resumes_worker_with_new_diagnostic(self):
+        self.publish_block(evidence="AssertionError: original cause")
+        self.verify_probe.return_value = (False, "AssertionError: new cause")
+        self.user_commit("dependency.py", "fixed = True\n")
+        self.assertTrue(loop_manager.resume_plan_blocks(
+            self.connection, self.repo, self.state_dir, str(self.repo.resolve()), "main",
+        ))
+        row = self.connection.execute(
+            "SELECT status, verify_result FROM exec_plans WHERE plan_id = 'G-034'"
+        ).fetchone()
+        self.assertEqual(tuple(row), ("IMPLEMENTING", "AssertionError: new cause"))
+
+    def test_new_review_issue_resumes_worker(self):
+        old = "ISSUE_ID: code.py::old::bug\nOld issue\nVERDICT: FAIL"
+        self.publish_block(reason="review_retry_exhausted", evidence=old)
+        new = "ISSUE_ID: dependency.py::new::bug\nNew issue\nVERDICT: FAIL"
+        self.reviewer_probe.return_value = (0, new)
+        self.user_commit("dependency.py", "fixed = True\n")
+        self.assertTrue(loop_manager.resume_plan_blocks(
+            self.connection, self.repo, self.state_dir, str(self.repo.resolve()), "main",
+        ))
+        self.assertEqual(self.connection.execute(
+            "SELECT review_result FROM exec_plans WHERE plan_id = 'G-034'"
+        ).fetchone()[0], new)
+
+    def test_uncertain_probe_termination_blocks_project_without_retry(self):
+        self.publish_block()
+        self.user_commit("dependency.py", "fixed = True\n")
+        self.verify_probe.side_effect = loop_manager.VerifyTerminationUncertain("process may be alive")
+        for _ in range(2):
+            self.assertFalse(loop_manager.resume_plan_blocks(
+                self.connection, self.repo, self.state_dir, str(self.repo.resolve()), "main",
+            ))
+        block = loop_manager.scoped_blocking.project_block(self.connection, str(self.repo.resolve()))
+        self.assertEqual(block["reason_code"], "repository_state_unsafe")
+        self.verify_probe.assert_called_once()
+        self.assertEqual(self.connection.execute(
+            "SELECT status FROM exec_plans WHERE plan_id = 'G-034'"
+        ).fetchone()[0], "PLAN_BLOCKED")
 
     def test_cause_probe_error_retries_same_candidate_without_release(self):
         self.publish_block()
