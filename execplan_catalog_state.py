@@ -20,6 +20,7 @@ from execplan_catalog import (
     ExecPlanCatalogEntry,
     ExecPlanCatalogSnapshot,
     final_content_matches,
+    parse_execplan_text,
 )
 
 
@@ -197,6 +198,7 @@ class CatalogRowVersion:
 class CatalogStateSnapshot:
     rows: tuple[CatalogRowVersion, ...]
     project_values: tuple[object, ...] | None
+    reserved: tuple[tuple[str, str], ...] = ()
 
     @property
     def plan_ids(self) -> frozenset[str]:
@@ -207,6 +209,7 @@ class CatalogStateSnapshot:
 class PinnedCatalog:
     revision_sha: str
     snapshot: ExecPlanCatalogSnapshot
+    regular_paths: frozenset[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -250,11 +253,16 @@ _ROW_VERSION_FIELDS = (
     "depends_on",
     "priority",
     "content_hash",
+    "plan_sha",
+    "publication_path",
+    "publication_content_hash",
+    "publication_sha",
     "current_complexity",
     "current_risk",
     "current_revision_sha",
     "catalog_generation",
     "status",
+    "ever_started",
     "retry_count",
     "verify_failure_history",
     "review_failure_history",
@@ -262,10 +270,13 @@ _ROW_VERSION_FIELDS = (
     "effective_worker_level",
     "review_level_history",
     "blocked_reason",
+    "guidance_plan_hash",
     "blocked_fingerprint",
     "blocked_worktree_fingerprint",
     "blocked_review_fingerprint",
     "worker_session_id",
+    "worker_session_binding",
+    "worker_session_transition",
     "reviewer_session_id",
     "worker_result",
     "verify_result",
@@ -273,6 +284,7 @@ _ROW_VERSION_FIELDS = (
     "definition_snapshot",
     "worker_input_token",
     "archive_token",
+    "archive_resume_status",
     "verify_token",
     "review_token",
     "publication_token",
@@ -281,6 +293,7 @@ _ROW_VERSION_FIELDS = (
     "worktree",
     "workspace_owned",
     "pr_url",
+    "last_error",
     "pr_head_oid",
     "publication_remote_oid",
     "pr_conflict_recovery",
@@ -357,6 +370,41 @@ def _worker_level(complexity: str, risk: str) -> int:
         {"low": 1, "medium": 3, "high": 5}[complexity]
         + {"low": 0, "medium": 1, "high": 2, "critical": 3}[risk],
         7,
+    )
+
+
+def insert_published_plan_row(
+    connection: sqlite3.Connection,
+    repo: str,
+    path: str,
+    plan: Mapping[str, object],
+    content_hash: str,
+    revision_sha: str,
+) -> None:
+    """Register validated publication metadata without reading a worktree."""
+
+    sources = json.dumps(plan["sources"], ensure_ascii=False, separators=(",", ":"))
+    dependencies = json.dumps(
+        plan["depends_on"], ensure_ascii=False, separators=(",", ":")
+    )
+    initial_level = _worker_level(str(plan["complexity"]), str(plan["risk"]))
+    connection.execute(
+        """
+        INSERT INTO exec_plans (
+            repo, plan_id, path, title, sources, depends_on, priority,
+            content_hash, current_complexity, current_risk,
+            current_revision_sha, publication_path,
+            publication_content_hash, publication_sha,
+            status, plan_sha, initial_worker_level, effective_worker_level
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'READY', ?, ?, ?)
+        """,
+        (
+            repo, str(plan["id"]), path, str(plan["title"]), sources,
+            dependencies, str(plan["priority"]), content_hash,
+            str(plan["complexity"]), str(plan["risk"]), revision_sha,
+            path, content_hash, revision_sha, revision_sha,
+            initial_level, initial_level,
+        ),
     )
 
 
@@ -438,6 +486,57 @@ class DefinitionStateRepository:
             + " FROM projects WHERE repo = ?",
             (repo,),
         ).fetchone()
+        reserved = self.connection.execute(
+            "SELECT plan_id, original_path AS path FROM execplan_catalog_history "
+            "WHERE repo = ? UNION SELECT plan_id, path FROM "
+            "execplan_cancellations WHERE repo = ? ORDER BY plan_id, path",
+            (repo, repo),
+        ).fetchall()
+        reserved_values = {(str(row[0]), str(row[1])) for row in reserved}
+        available_tables = {
+            str(row[0]) for row in self.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        # Some durable audit tables can outlive their execution row after an
+        # interrupted migration. An ID linked to any such history stays owned.
+        for table, path_column in (
+            ("execplan_archive_items", "active_path"),
+            ("execution_checkpoints", None),
+            ("blocked_checkpoints", None),
+            ("rebase_corrections", None),
+            ("agent_invocations", None),
+            ("validation_results", None),
+            ("validation_feedback_events", None),
+            ("validation_feedback_current", None),
+            ("validation_delivery_cursors", None),
+            ("validation_recovery_sessions", None),
+            ("validation_delivery_attempts", None),
+            ("validation_feedback_migrations", None),
+            ("guidance_approvals", None),
+            ("requirement_archive_targets", None),
+            ("execplan_blocks", None),
+            ("project_blocks", None),
+        ):
+            if table not in available_tables:
+                continue
+            selected_path = path_column or "''"
+            reserved_values.update(
+                (str(row[0]), str(row[1]))
+                for row in self.connection.execute(
+                    f"SELECT DISTINCT plan_id, {selected_path} FROM {table} "
+                    "WHERE repo = ? AND plan_id IS NOT NULL",
+                    (repo,),
+                )
+            )
+        if "project_completion_cycles" in available_tables:
+            reserved_values.update(
+                (str(row[0]), "") for row in self.connection.execute(
+                    "SELECT last_completed_plan_id FROM project_completion_cycles "
+                    "WHERE repo = ? AND last_completed_plan_id IS NOT NULL",
+                    (repo,),
+                )
+            )
         return CatalogStateSnapshot(
             rows=tuple(
                 CatalogRowVersion(
@@ -451,7 +550,27 @@ class DefinitionStateRepository:
                 if project is not None
                 else None
             ),
+            reserved=tuple(sorted(reserved_values)),
         )
+
+    def has_publication_intent(self, repo: str) -> bool:
+        general = self.connection.execute(
+            "SELECT 1 FROM general_planning_publications WHERE repo = ?",
+            (repo,),
+        ).fetchone()
+        if general is not None:
+            return True
+        if self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'maintenance_cycles'"
+        ).fetchone() is None:
+            return False
+        maintenance = self.connection.execute(
+            "SELECT 1 FROM maintenance_cycles WHERE repo = ? "
+            "AND publication_stage = 'prepared'",
+            (repo,),
+        ).fetchone()
+        return maintenance is not None
 
     def publication_audit(self, repo: str, plan_id: str) -> PublicationAudit:
         row = self.connection.execute(
@@ -538,13 +657,15 @@ class DefinitionStateRepository:
         expected: CatalogStateSnapshot,
         *,
         revision_is_current: Callable[[], bool],
+        new_plan_ids: tuple[str, ...] = (),
     ) -> tuple[str, ...] | None:
         """CAS all declaration deltas, rolling back on either stale boundary."""
 
         changed: list[str] = []
         try:
             with _transaction(self.connection):
-                if self.capture(repo) != expected or not revision_is_current():
+                if (self.capture(repo) != expected or self.has_publication_intent(repo)
+                        or not revision_is_current()):
                     raise _StaleCatalogSnapshot
                 project = self.connection.execute(
                     "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
@@ -556,6 +677,14 @@ class DefinitionStateRepository:
                         (repo, plan_id),
                     ).fetchone()
                     if row is None:
+                        if plan_id in new_plan_ids:
+                            insert_published_plan_row(
+                                self.connection, repo, entry.path,
+                                entry.metadata(), entry.content_hash,
+                                pinned.revision_sha,
+                            )
+                            changed.append(plan_id)
+                            self._fault(f"after-plan:{plan_id}")
                         continue
                     sources = json.dumps(
                         entry.sources, ensure_ascii=False, separators=(",", ":")
@@ -692,6 +821,10 @@ class CatalogReconciliationService:
         )
 
     def reconcile(self, repo: str) -> CatalogReconciliationResult:
+        # The owning Planner must recover its manifest before unrelated IDs
+        # can be classified as user publications.
+        if self.repository.has_publication_intent(repo):
+            return CatalogReconciliationResult(ReconciliationKind.STALE)
         try:
             pinned = self.catalog.load()
         except InvalidPinnedCatalog as error:
@@ -705,6 +838,9 @@ class CatalogReconciliationService:
         catalog_ids = frozenset(pinned.snapshot.all)
         missing_files = sorted(stored_ids - catalog_ids)
         historical_ids = self.repository.historical_ids(repo)
+        missing_history = sorted(
+            historical_ids - stored_ids - catalog_ids
+        )
         unknown_active = sorted(set(pinned.snapshot.active) - stored_ids)
         unknown_archived = sorted(
             set(pinned.snapshot.archived) - stored_ids - historical_ids
@@ -721,6 +857,18 @@ class CatalogReconciliationService:
                 path=entry.path,
                 related_paths=(old.path,),
             )
+        if missing_history and unknown:
+            entry = pinned.snapshot.all[unknown[0]]
+            old_path = next(
+                path for reserved_id, path in expected.reserved
+                if reserved_id == missing_history[0]
+            )
+            return self._invalid(
+                pinned.revision_sha, "ambiguous-id-change",
+                "원격 archive ID 누락과 신규 ExecPlan을 동시에 관측했습니다: "
+                f"{missing_history[0]} -> {unknown[0]}",
+                path=entry.path, related_paths=(old_path,),
+            )
         if missing_files:
             plan_id = missing_files[0]
             current = self.repository.current_definition(repo, plan_id)
@@ -730,16 +878,73 @@ class CatalogReconciliationService:
                 f"SQLite ExecPlan에 대응하는 원격 파일이 없습니다: {plan_id}",
                 path=current.path,
             )
-        if unknown:
-            plan_id = unknown[0]
-            entry = pinned.snapshot.all[plan_id]
+        if missing_history:
+            plan_id = missing_history[0]
             return self._invalid(
-                pinned.revision_sha,
-                "unknown-plan-id",
-                f"원격 ExecPlan ID를 SQLite 실행 이력과 대응할 수 없습니다: "
-                f"{plan_id}",
+                pinned.revision_sha, "missing-plan",
+                f"SQLite archive 이력에 대응하는 원격 파일이 없습니다: {plan_id}",
+                path=next(
+                    path for reserved_id, path in expected.reserved
+                    if reserved_id == plan_id
+                ),
+            )
+        if unknown_archived:
+            plan_id = unknown_archived[0]
+            entry = pinned.snapshot.archived[plan_id]
+            return self._invalid(
+                pinned.revision_sha, "unknown-plan-id",
+                f"신규 archive ExecPlan은 자동 등록할 수 없습니다: {plan_id}",
                 path=entry.path,
             )
+        if unknown_active:
+            if pinned.regular_paths is None:
+                entry = pinned.snapshot.active[unknown_active[0]]
+                return self._invalid(
+                    pinned.revision_sha, "unknown-plan-id",
+                    "신규 ExecPlan source를 검증할 원격 tree가 없습니다: "
+                    f"{entry.plan_id}", path=entry.path,
+                )
+            all_reserved = (
+                {(row.plan_id, str(row.values[1])) for row in expected.rows}
+                | set(expected.reserved)
+            )
+            max_number = max(
+                (
+                    int(plan_id[2:]) for plan_id, _ in all_reserved
+                    if plan_id.startswith("G-") and plan_id[2:].isdigit()
+                ), default=0
+            )
+            reserved_paths = {path for _, path in all_reserved}
+            for offset, plan_id in enumerate(
+                sorted(unknown_active, key=lambda value: int(value[2:]))
+            ):
+                entry = pinned.snapshot.active[plan_id]
+                number = int(plan_id[2:])
+                if number != max_number + offset + 1 or entry.path in reserved_paths:
+                    return self._invalid(
+                        pinned.revision_sha, "unknown-plan-id",
+                        "신규 ExecPlan ID가 저장된 최대 번호 다음부터 연속되지 "
+                        f"않거나 경로가 예약 이력과 충돌합니다: {plan_id}",
+                        path=entry.path,
+                    )
+                try:
+                    parse_execplan_text(
+                        entry.path, entry.text, require_priority=True,
+                        validate_sources=False,
+                    )
+                except RuntimeError as error:
+                    return self._invalid(
+                        pinned.revision_sha, "invalid-plan",
+                        f"신규 ExecPlan 형식이 유효하지 않습니다: {error}",
+                        path=entry.path,
+                    )
+                for source in entry.sources:
+                    if source not in pinned.regular_paths:
+                        return self._invalid(
+                            pinned.revision_sha, "missing-source",
+                            f"신규 ExecPlan의 활성 source가 없습니다: {source}",
+                            path=entry.path, source=source,
+                        )
         if self.catalog.current_revision() != pinned.revision_sha:
             return CatalogReconciliationResult(
                 ReconciliationKind.STALE, revision_sha=pinned.revision_sha
@@ -751,6 +956,7 @@ class CatalogReconciliationService:
             revision_is_current=(
                 lambda: self.catalog.current_revision() == pinned.revision_sha
             ),
+            new_plan_ids=tuple(unknown_active),
         )
         if changed is None:
             return CatalogReconciliationResult(

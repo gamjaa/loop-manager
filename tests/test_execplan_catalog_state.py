@@ -365,7 +365,9 @@ def active_snapshot(revision, documents):
     snapshot = execplan_catalog.snapshot_from_documents(
         documents, revision_sha=revision
     )
-    return execplan_catalog_state.PinnedCatalog(revision, snapshot)
+    return execplan_catalog_state.PinnedCatalog(
+        revision, snapshot, frozenset({"docs/PRODUCT.md"})
+    )
 
 
 class CatalogReconciliationTest(unittest.TestCase):
@@ -827,7 +829,7 @@ priority: {priority}
             [("Changed", "normal"), ("Dependency", "normal")],
         )
 
-    def test_missing_or_unknown_id_is_invalid_without_row_changes(self):
+    def test_missing_id_is_invalid_and_new_id_is_registered_once(self):
         pinned = active_snapshot(
             "f" * 40,
             {
@@ -864,8 +866,232 @@ priority: {priority}
             },
         )
         result = self._service(unknown).reconcile("/repo")
-        self.assertEqual(result.diagnostic.code, "unknown-plan-id")
-        self.assertEqual(result.diagnostic.path, "docs/plans/[G-003] Unknown.md")
+        self.assertEqual(result.kind, execplan_catalog_state.ReconciliationKind.RECONCILED)
+        self.assertIn("G-003", result.changed_plan_ids)
+        row = self.connection.execute(
+            "SELECT status, path, publication_path, publication_content_hash, "
+            "publication_sha, plan_sha, current_revision_sha, initial_worker_level, "
+            "effective_worker_level FROM exec_plans WHERE plan_id = 'G-003'"
+        ).fetchone()
+        self.assertEqual(row["status"], "READY")
+        self.assertEqual(row["path"], "docs/plans/[G-003] Unknown.md")
+        self.assertEqual(row["publication_path"], row["path"])
+        self.assertEqual(
+            row["publication_content_hash"],
+            unknown.snapshot.active["G-003"].content_hash,
+        )
+        self.assertEqual(row["publication_sha"], "f" * 40)
+        self.assertEqual(row["plan_sha"], "f" * 40)
+        self.assertEqual(row["current_revision_sha"], "f" * 40)
+        self.assertEqual((row["initial_worker_level"], row["effective_worker_level"]), (1, 1))
+        self.assertEqual(self._service(unknown).reconcile("/repo").changed_plan_ids, ())
+
+    def test_multiple_new_ids_and_existing_delta_commit_together(self):
+        pinned = active_snapshot("b" * 40, {
+            "docs/plans/[G-001] New Title.md": self._text("G-001", "New Title"),
+            "docs/plans/[G-002] Dependency.md": self._text("G-002", "Dependency"),
+            "docs/plans/[G-003] Third.md": self._text(
+                "G-003", "Third", depends_on=("G-002",), priority="critical",
+            ),
+            "docs/plans/[G-004] Fourth.md": self._text(
+                "G-004", "Fourth", depends_on=("G-003",), complexity="high", risk="critical",
+            ),
+        })
+        result = self._service(pinned).reconcile("/repo")
+        self.assertEqual(result.kind, execplan_catalog_state.ReconciliationKind.RECONCILED)
+        self.assertEqual(result.changed_plan_ids, ("G-001", "G-002", "G-003", "G-004"))
+        rows = self.connection.execute(
+            "SELECT plan_id, status, initial_worker_level FROM exec_plans ORDER BY plan_id"
+        ).fetchall()
+        self.assertEqual([tuple(row) for row in rows], [
+            ("G-001", "IMPLEMENTING", 1), ("G-002", "MERGED", 1),
+            ("G-003", "READY", 1), ("G-004", "READY", 7),
+        ])
+        self.assertEqual(self._service(pinned).reconcile("/repo").changed_plan_ids, ())
+
+    def test_new_registration_rolls_back_on_revision_drift_or_interruption(self):
+        pinned = active_snapshot("c" * 40, {
+            "docs/plans/[G-001] Changed.md": self._text("G-001", "Changed"),
+            "docs/plans/[G-002] Dependency.md": self._text("G-002", "Dependency"),
+            "docs/plans/[G-003] Third.md": self._text("G-003", "Third"),
+        })
+        result = self._service(
+            pinned, revisions=["c" * 40, "c" * 40, "d" * 40]
+        ).reconcile("/repo")
+        self.assertEqual(result.kind, execplan_catalog_state.ReconciliationKind.STALE)
+        self.assertIsNone(self.connection.execute(
+            "SELECT 1 FROM exec_plans WHERE plan_id = 'G-003'"
+        ).fetchone())
+        self.assertEqual(self.repository.current_definition("/repo", "G-001").title, "Old")
+
+        def interrupt(stage):
+            if stage == "after-plan:G-003":
+                raise RuntimeError("interrupted")
+
+        with self.assertRaisesRegex(RuntimeError, "interrupted"):
+            self._service(pinned, fault_hook=interrupt).reconcile("/repo")
+        self.assertIsNone(self.connection.execute(
+            "SELECT 1 FROM exec_plans WHERE plan_id = 'G-003'"
+        ).fetchone())
+        self.assertEqual(self.repository.current_definition("/repo", "G-001").title, "Old")
+        self.assertEqual(
+            self._service(pinned).reconcile("/repo").kind,
+            execplan_catalog_state.ReconciliationKind.RECONCILED,
+        )
+
+    def test_intent_and_unsafe_new_ids_do_not_partially_register(self):
+        documents = {
+            "docs/plans/[G-001] Old.md": self._text("G-001", "Old"),
+            "docs/plans/[G-002] Dependency.md": self._text("G-002", "Dependency"),
+        }
+        self.connection.execute(
+            "INSERT INTO general_planning_publications "
+            "(repo, stage, base_sha, commit_sha, snapshot_token, "
+            "specification_fingerprint, planning_fingerprint, manifest, manifest_hash) "
+            "VALUES ('/repo', 'prepared', 'a', 'b', 'token', 'spec', 'plan', '{}', 'hash')"
+        )
+        self.connection.commit()
+        candidate = active_snapshot("e" * 40, {
+            **documents,
+            "docs/plans/[G-003] Third.md": self._text("G-003", "Third"),
+        })
+        self.assertEqual(
+            self._service(candidate).reconcile("/repo").kind,
+            execplan_catalog_state.ReconciliationKind.STALE,
+        )
+        self.connection.execute("DELETE FROM general_planning_publications")
+        self.connection.commit()
+        maintenance_state.ensure_schema(self.connection)
+        self.connection.execute(
+            "INSERT INTO maintenance_cycles (repo, publication_stage) "
+            "VALUES ('/repo', 'prepared')"
+        )
+        self.connection.commit()
+        self.assertEqual(
+            self._service(candidate).reconcile("/repo").kind,
+            execplan_catalog_state.ReconciliationKind.STALE,
+        )
+        self.connection.execute("DELETE FROM maintenance_cycles")
+        self.connection.commit()
+
+        cases = (
+            ({"docs/plans/[G-004] Gap.md": self._text("G-004", "Gap")}, "unknown-plan-id"),
+            ({"docs/plans/archive/[G-003] Archive.md": self._text("G-003", "Archive")}, "unknown-plan-id"),
+            ({"docs/plans/[G-003] Legacy.md": self._text(
+                "G-003", "Legacy"
+            ).replace("priority: normal\n", "")}, "invalid-plan"),
+        )
+        for extra, code in cases:
+            with self.subTest(extra=extra):
+                result = self._service(active_snapshot("e" * 40, {
+                    **documents, **extra,
+                })).reconcile("/repo")
+                self.assertEqual(result.diagnostic.code, code)
+                self.assertEqual(self.connection.execute(
+                    "SELECT COUNT(*) FROM exec_plans WHERE repo = '/repo'"
+                ).fetchone()[0], 2)
+
+        missing = self._service(active_snapshot("e" * 40, {
+            "docs/plans/[G-001] Old.md": documents["docs/plans/[G-001] Old.md"],
+            "docs/plans/[G-003] Third.md": self._text("G-003", "Third"),
+        })).reconcile("/repo")
+        self.assertEqual(missing.diagnostic.code, "ambiguous-id-change")
+
+        archived_source = active_snapshot("e" * 40, {
+            **documents,
+            "docs/plans/[G-003] Third.md": self._text(
+                "G-003", "Third", sources=("docs/requirements/Archived.md",),
+            ),
+        })
+        missing_source = execplan_catalog_state.PinnedCatalog(
+            archived_source.revision_sha, archived_source.snapshot,
+            frozenset({"docs/PRODUCT.md"}),
+        )
+        self.assertEqual(
+            self._service(missing_source).reconcile("/repo").diagnostic.code,
+            "missing-source",
+        )
+        self.assertIsNone(self.connection.execute(
+            "SELECT 1 FROM exec_plans WHERE plan_id = 'G-003'"
+        ).fetchone())
+
+    def test_cancelled_number_and_sqlite_ownership_race_reject_registration(self):
+        documents = {
+            "docs/plans/[G-001] Old.md": self._text("G-001", "Old"),
+            "docs/plans/[G-002] Dependency.md": self._text("G-002", "Dependency"),
+            "docs/plans/[G-003] Third.md": self._text("G-003", "Third"),
+        }
+        pinned = active_snapshot("7" * 40, documents)
+        self.connection.execute(
+            "INSERT INTO execplan_cancellations "
+            "(repo, plan_id, path, title, sources, depends_on, complexity, risk, "
+            "priority, content_hash, plan_sha, deletion_commit) VALUES "
+            "('/repo', 'G-003', 'docs/plans/[G-003] Third.md', 'Third', "
+            "'[\"docs/PRODUCT.md\"]', '[]', 'low', 'low', 'normal', 'hash', 'sha', 'sha')"
+        )
+        self.connection.commit()
+        self.assertEqual(
+            self._service(pinned).reconcile("/repo").diagnostic.code,
+            "unknown-plan-id",
+        )
+        self.connection.execute("DELETE FROM execplan_cancellations")
+        self.connection.commit()
+
+        connection = self.connection
+
+        class MutatingPort(FakeDefinitionPort):
+            def current_revision(self):
+                connection.execute(
+                    "UPDATE exec_plans SET worker_session_id = 'changed-owner' "
+                    "WHERE plan_id = 'G-002'"
+                )
+                connection.commit()
+                return self.pinned.revision_sha
+
+        result = execplan_catalog_state.CatalogReconciliationService(
+            self.repository, MutatingPort(pinned)
+        ).reconcile("/repo")
+        self.assertEqual(result.kind, execplan_catalog_state.ReconciliationKind.STALE)
+        self.assertIsNone(self.connection.execute(
+            "SELECT 1 FROM exec_plans WHERE plan_id = 'G-003'"
+        ).fetchone())
+        self.assertEqual(
+            self._service(pinned).reconcile("/repo").kind,
+            execplan_catalog_state.ReconciliationKind.RECONCILED,
+        )
+
+    def test_orphaned_execution_history_and_path_collision_reserve_identity(self):
+        documents = {
+            "docs/plans/[G-001] Old.md": self._text("G-001", "Old"),
+            "docs/plans/[G-002] Dependency.md": self._text("G-002", "Dependency"),
+            "docs/plans/[G-003] Third.md": self._text("G-003", "Third"),
+        }
+        pinned = active_snapshot("8" * 40, documents)
+        self.connection.execute(
+            "CREATE TABLE IF NOT EXISTS execution_checkpoints (repo TEXT, plan_id TEXT)"
+        )
+        self.connection.execute(
+            "INSERT INTO execution_checkpoints (repo, plan_id) "
+            "VALUES ('/repo', 'G-003')"
+        )
+        self.connection.commit()
+        self.assertEqual(
+            self._service(pinned).reconcile("/repo").diagnostic.code,
+            "unknown-plan-id",
+        )
+        self.connection.execute("DELETE FROM execution_checkpoints WHERE plan_id = 'G-003'")
+        self.connection.execute(
+            "UPDATE exec_plans SET path = 'docs/plans/[G-003] Third.md' "
+            "WHERE plan_id = 'G-001'"
+        )
+        self.connection.commit()
+        self.assertEqual(
+            self._service(pinned).reconcile("/repo").diagnostic.code,
+            "unknown-plan-id",
+        )
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM exec_plans WHERE repo = '/repo'"
+        ).fetchone()[0], 2)
 
     def test_legacy_backfill_rejects_replacement_before_any_history_mutation(self):
         replacement = active_snapshot(
