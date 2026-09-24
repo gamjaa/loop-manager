@@ -69,6 +69,126 @@ class MaintenanceOrchestrationTest(unittest.TestCase):
             ),
         )
 
+    @staticmethod
+    def _archive_plan(
+        connection: sqlite3.Connection, repo: str, plan_id: str
+    ) -> None:
+        connection.execute(
+            "UPDATE exec_plans SET path = ? WHERE repo = ? AND plan_id = ?",
+            (f"docs/plans/archive/[{plan_id}] {plan_id}.md", repo, plan_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO execplan_catalog_history (
+                repo, plan_id, original_path, observed_path,
+                original_content_hash, final_content_hash, plan_sha,
+                merge_confirmed, identity_verified, currently_archived,
+                proof_kind, proof_revision
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, 1, ?, ?)
+            """,
+            (
+                repo, plan_id,
+                f"docs/plans/[{plan_id}] {plan_id}.md",
+                f"docs/plans/archive/[{plan_id}] {plan_id}.md",
+                f"hash-{plan_id}", f"hash-{plan_id}", "a" * 40,
+                "stored-and-git", "b" * 40,
+            ),
+        )
+
+    def test_prerequisite_rows_follow_only_required_merged_closure(self):
+        connection = self._connection()
+        self._insert_plan(connection, "/one", "G-054", status="MERGED")
+        self._archive_plan(connection, "/one", "G-054")
+        self._insert_plan(
+            connection, "/one", "G-060", status="MERGED", depends_on=("G-054",)
+        )
+        self._archive_plan(connection, "/one", "G-060")
+        self._insert_plan(
+            connection, "/one", "G-070", depends_on=("G-060", "G-054")
+        )
+        self._insert_plan(connection, "/one", "G-071", depends_on=("G-054",))
+        self._insert_plan(connection, "/one", "G-099", status="MERGED")
+        self._insert_plan(connection, "/two", "G-080", status="MERGED")
+
+        rows = loop_manager.prerequisite_validation_rows(connection, "/one")
+        self.assertEqual(
+            {row["plan_id"] for row in rows}, {"G-054", "G-060", "G-070", "G-071"}
+        )
+        self.assertEqual(validate_prerequisite_plan_ids(rows, ("G-070",)), ("G-070",))
+        compact = json.loads(loop_manager.compact_execplan_catalog(connection, "/one"))
+        self.assertEqual([entry["id"] for entry in compact], ["G-070", "G-071"])
+
+    def test_prerequisite_rows_reject_unverified_archived_dependency(self):
+        connection = self._connection()
+        self._insert_plan(connection, "/one", "G-054", status="MERGED")
+        self._archive_plan(connection, "/one", "G-054")
+        self._insert_plan(connection, "/one", "G-070", depends_on=("G-054",))
+
+        for field, value, reason in (
+            ("identity_verified", 0, "identity"),
+            ("observed_path", "docs/plans/archive/[G-999] wrong.md", "identity"),
+            ("merge_confirmed", 0, "Merge"),
+            ("proof_revision", None, "Merge"),
+        ):
+            with self.subTest(field=field):
+                original = connection.execute(
+                    f"SELECT {field} FROM execplan_catalog_history WHERE repo = '/one'"
+                ).fetchone()[0]
+                connection.execute(
+                    f"UPDATE execplan_catalog_history SET {field} = ? WHERE repo = '/one'",
+                    (value,),
+                )
+                with self.assertRaisesRegex(
+                    MaintenanceOrchestrationError, f"G-070 -> G-054.*{reason}"
+                ):
+                    loop_manager.prerequisite_validation_rows(connection, "/one")
+                connection.execute(
+                    f"UPDATE execplan_catalog_history SET {field} = ? WHERE repo = '/one'",
+                    (original,),
+                )
+
+        connection.execute(
+            "UPDATE exec_plans SET content_hash = 'mismatched' "
+            "WHERE repo = '/one' AND plan_id = 'G-054'"
+        )
+        with self.assertRaisesRegex(MaintenanceOrchestrationError, "G-070 -> G-054.*identity"):
+            loop_manager.prerequisite_validation_rows(connection, "/one")
+        connection.execute(
+            "UPDATE exec_plans SET content_hash = 'hash-G-054' "
+            "WHERE repo = '/one' AND plan_id = 'G-054'"
+        )
+
+        connection.execute(
+            "UPDATE exec_plans SET status = 'READY' "
+            "WHERE repo = '/one' AND plan_id = 'G-054'"
+        )
+        with self.assertRaisesRegex(MaintenanceOrchestrationError, "G-070 -> G-054.*MERGED"):
+            loop_manager.prerequisite_validation_rows(connection, "/one")
+        connection.execute(
+            "UPDATE exec_plans SET status = 'MERGED' "
+            "WHERE repo = '/one' AND plan_id = 'G-054'"
+        )
+
+        connection.execute(
+            "DELETE FROM execplan_catalog_history WHERE repo = '/one'"
+        )
+        with self.assertRaisesRegex(MaintenanceOrchestrationError, "G-070 -> G-054.*identity"):
+            loop_manager.prerequisite_validation_rows(connection, "/one")
+
+    def test_prerequisite_rows_reject_missing_or_cross_project_dependency(self):
+        connection = self._connection()
+        self._insert_plan(connection, "/two", "G-054", status="MERGED")
+        self._insert_plan(connection, "/one", "G-070", depends_on=("G-054",))
+        with self.assertRaisesRegex(MaintenanceOrchestrationError, "G-070 -> G-054"):
+            loop_manager.prerequisite_validation_rows(connection, "/one")
+
+        connection.execute(
+            "UPDATE exec_plans SET depends_on = '[\"G-999\"]' "
+            "WHERE repo = '/one' AND plan_id = 'G-070'"
+        )
+        with self.assertRaisesRegex(MaintenanceOrchestrationError, "G-070 -> G-999"):
+            loop_manager.prerequisite_validation_rows(connection, "/one")
+
     def _integration_project(
         self,
         directory: str,
