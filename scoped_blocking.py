@@ -19,6 +19,7 @@ class BlockReasonCode(str, Enum):
     """Code-owned reasons whose scope must never be inferred from prose."""
 
     VERIFY_RETRY_EXHAUSTED = "verify_retry_exhausted"
+    VERIFY_TIMEOUT_LIMIT_INSUFFICIENT = "verify_timeout_limit_insufficient"
     REVIEW_RETRY_EXHAUSTED = "review_retry_exhausted"
     REVIEW_PROTOCOL_EXHAUSTED = "review_protocol_exhausted"
     GUIDANCE_APPROVAL_REQUIRED = "guidance_approval_required"
@@ -44,6 +45,7 @@ class BlockReasonCode(str, Enum):
 _PLAN_REASONS = frozenset(
     {
         BlockReasonCode.VERIFY_RETRY_EXHAUSTED,
+        BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT,
         BlockReasonCode.REVIEW_RETRY_EXHAUSTED,
         BlockReasonCode.REVIEW_PROTOCOL_EXHAUSTED,
         BlockReasonCode.GUIDANCE_APPROVAL_REQUIRED,

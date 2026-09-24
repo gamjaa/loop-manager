@@ -80,6 +80,7 @@ class AgentEffects:
 @dataclass(frozen=True)
 class ValidationEffects:
     verify: Callable[..., Any]
+    block_verify_timeout_limit: Callable[..., Any]
     parse_worker_result: Callable[..., Any]
     parse_reviewer_result: Callable[..., Any]
     validate_active_execplan_metadata: Callable[..., Any]
@@ -2214,6 +2215,21 @@ class ExecutionHandlers:
         delivered_session = result.session_id or self._row()['worker_session_id']
         if feedback_repo is not None and delivery is not None and delivered_session:
             feedback_repo.delivered(delivery.attempt_id, str(delivered_session))
+        evidence = re.search(
+            r"(?m)^VERIFY_TIMEOUT_LIMIT_INSUFFICIENT:\s*(\S[^\r\n]*)$",
+            message,
+        )
+        if (
+            evidence is not None
+            and not context.resolving_rebase
+            and "전체 verify 시간 초과:" in str(row['verify_result'] or '')
+        ):
+            detail = self.effects.validation.block_verify_timeout_limit(
+                self.repo, context.worktree, message, evidence.group(1),
+                str(row['verify_result']),
+            )
+            self.effects.events.operation_print(detail, file=sys.stderr)
+            return self._final(detail)
         return self._finish_worker(context, row, message)
 
     def _resume_saved_rebase_worker(self, context, saved, observation):
@@ -2517,7 +2533,16 @@ class ExecutionHandlers:
             'worker',
             input_fingerprint=self.effects.agent._worktree_execplan_input_fingerprint(context.worktree, self.catalog_plan),
         )
-        passed, output = self.effects.validation.verify(context.worktree)
+        try:
+            passed, output = self.effects.validation.verify(context.worktree)
+        except self.effects.contract.VerifyTerminationUncertain as error:
+            detail = str(error)
+            self._block_final(
+                self.repo, context.worktree, detail, detail,
+                reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE,
+            )
+            self.effects.events.operation_print(detail, file=sys.stderr)
+            return (self._final(detail), detail)
         feedback_repo = self.effects.feedback.repository if self.effects.feedback else None
         if feedback_repo is not None:
             fingerprints = () if passed else self.effects.feedback.fingerprints(

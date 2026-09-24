@@ -199,6 +199,7 @@ class ScopedBlockingTest(unittest.TestCase):
 
         expected_plan_reasons = {
             BlockReasonCode.VERIFY_RETRY_EXHAUSTED,
+            BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT,
             BlockReasonCode.REVIEW_RETRY_EXHAUSTED,
             BlockReasonCode.REVIEW_PROTOCOL_EXHAUSTED,
             BlockReasonCode.GUIDANCE_APPROVAL_REQUIRED,

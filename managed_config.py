@@ -18,6 +18,7 @@ class ManagedConfig:
     telegram_token: str
     telegram_chat_id: str
     refactoring_review_interval: int = 5
+    verify_timeout_seconds: int = 600
 
     @property
     def telegram_enabled(self) -> bool:
@@ -88,6 +89,19 @@ def load_managed_config(path: Path) -> ManagedConfig:
             "[loop] refactoring_review_interval은 양의 정수여야 합니다."
         )
 
+    raw_verify_timeout = _setting(
+        parser, "loop", "verify_timeout_seconds", fallback="600",
+    )
+    if not raw_verify_timeout.isascii() or not raw_verify_timeout.isdecimal():
+        raise ManagedConfigError(
+            "[loop] verify_timeout_seconds는 양의 정수여야 합니다."
+        )
+    verify_timeout_seconds = int(raw_verify_timeout)
+    if verify_timeout_seconds <= 0:
+        raise ManagedConfigError(
+            "[loop] verify_timeout_seconds는 양의 정수여야 합니다."
+        )
+
     telegram_token = _setting(
         parser,
         "telegram",
@@ -111,4 +125,5 @@ def load_managed_config(path: Path) -> ManagedConfig:
         telegram_token=telegram_token,
         telegram_chat_id=telegram_chat_id,
         refactoring_review_interval=refactoring_review_interval,
+        verify_timeout_seconds=verify_timeout_seconds,
     )

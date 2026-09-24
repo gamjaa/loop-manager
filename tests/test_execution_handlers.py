@@ -191,6 +191,14 @@ class ExecutionHandlerTests(TestCase):
             self.handler.run(self.context())
         self.assertIn('bad format', self.effects.agent.run_agent.call_args.args[5])
 
+    def test_timeout_prompt_requests_cause_check_and_progress_evidence(self):
+        prompt = lm.worker_prompt(
+            'docs/plans/[G-047] Runtime.md', None,
+            validation_feedback='전체 verify 시간 초과: verify_timeout_seconds=2',
+        )
+        self.assertIn('무한 반복·교착·중복 검증', prompt)
+        self.assertIn('PR_SUMMARY 안에 VERIFY_TIMEOUT_LIMIT_INSUFFICIENT:', prompt)
+
     def test_session_unavailable_rebuilds_compact_unresolved_feedback(self):
         feedback = ValidationFeedbackRepository(self.connection)
         self._with_feedback(feedback)
@@ -428,6 +436,63 @@ class ExecutionHandlerTests(TestCase):
         self.assertEqual([(item['classification'], item['raw_output']) for item in audit],
                          [('failure', raw), ('success', 'SUCCESS output')])
         self.assertEqual(feedback.prepare('repo', 'G-047', 'session').rows, ())
+
+    def test_timeout_verify_uses_stable_fingerprint_and_returns_to_worker(self):
+        feedback = ValidationFeedbackRepository(self.connection)
+        self._with_feedback(feedback)
+        self.effects.validation.verify.side_effect = None
+        self.effects.validation.verify.return_value = (
+            False, lm.VerifyOutput(
+                'progress\n전체 verify 시간 초과: verify_timeout_seconds=2',
+                timed_out=True,
+            ),
+        )
+        self.effects.validation.transition_validation_failure.return_value = SimpleNamespace(
+            blocked=False, fingerprint='timeout',
+        )
+        outcome, output = self.handler._verify_once(self.context('VERIFYING'))
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+        self.assertIn('전체 verify 시간 초과:', output)
+        first = lm.validation_failure_fingerprints('verify', output)[0][0]
+        second = lm.validation_failure_fingerprints(
+            'verify', lm.VerifyOutput('other progress', timed_out=True),
+        )[0][0]
+        self.assertEqual(first, second)
+        self.effects.validation.transition_validation_failure.assert_called_once()
+
+    def test_unconfirmed_verify_termination_blocks_project(self):
+        self.effects.validation.verify.side_effect = lm.VerifyTerminationUncertain(
+            'verify process group 잔존 (PGID 123)'
+        )
+        with mock.patch.object(self.handler, '_block_final') as blocked:
+            outcome, _ = self.handler._verify_once(self.context('VERIFYING'))
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertEqual(
+            blocked.call_args.kwargs['reason'],
+            lm.BlockReasonCode.REPOSITORY_STATE_UNSAFE,
+        )
+
+    def test_worker_evidence_blocks_insufficient_verify_limit(self):
+        self.state.update_project(
+            'repo', phase='WORKING',
+            verify_result='progress\n전체 verify 시간 초과: verify_timeout_seconds=2',
+        )
+        self.effects.agent.run_agent.side_effect = lambda *_args, **_kwargs: lm.AgentResult(
+            0,
+            'COMMIT_TITLE: Fix verify\nPR_SUMMARY: progress\n'
+            'TARGETED_TESTS: none\n'
+            'VERIFY_TIMEOUT_LIMIT_INSUFFICIENT: 9 of 10 required tests completed',
+            session_id='session',
+        )
+        self.effects.validation.parse_worker_result.return_value = SimpleNamespace(
+            commit_title='Fix verify'
+        )
+        self.effects.validation.block_verify_timeout_limit.return_value = 'limit too short'
+        with mock.patch.object(self.handler, '_finish_worker') as finish:
+            result = self.handler.run(self.context())
+        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.effects.validation.block_verify_timeout_limit.assert_called_once()
+        finish.assert_not_called()
 
     def test_review_observation_tracks_each_issue_and_pass_resolves_them(self):
         feedback = ValidationFeedbackRepository(self.connection)
