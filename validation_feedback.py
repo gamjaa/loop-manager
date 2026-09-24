@@ -25,11 +25,18 @@ _FAILURE_HEADER = re.compile(r"^_{3,}\s*(?P<name>.+?)\s*_{3,}$")
 _ERROR_DETAIL = re.compile(
     r"(?i)^(?:E\s+|(?:assertion|error|exception|traceback)\b|.+(?:error|exception|failed)\b)"
 )
-_FAILURE_SUMMARY = re.compile(
+_SUMMARY_BOUNDARY = re.compile(
     r"(?i)^(?:=+.*\b(?:failed|errors?)\b.*=+|FAILED\s*\(.*|"
     r"(?:\d+\s+)?(?:failures?|errors?)\b.*)$"
 )
-_SUCCESS_LOG = re.compile(r"(?i)\b(?:passed|success|succeeded)\b|^ok$")
+_NONZERO_FAILURE_COUNT = re.compile(
+    r"(?i)(?<!\d)[1-9]\d*\s+(?:failed|failures?|errors?)\b|"
+    r"\b(?:failures?|errors?)\s*[:=]\s*[1-9]\d*\b"
+)
+_SUCCESS_LOG = re.compile(
+    r"(?i)^(?:PASS(?:ED)?|SUCCESS|SUCCEEDED)\b|^ok$|"
+    r"^=+.*\b\d+ passed\b.*=+$"
+)
 _TRUNCATED = "[diagnostic truncated]"
 _PYTEST_CONTEXT_LINES = 80
 
@@ -70,6 +77,10 @@ def _limit_excerpt(value: str, limit: int) -> tuple[str, bool]:
     return f"{value[:limit - len(_TRUNCATED) - 1].rstrip()}\n{_TRUNCATED}", True
 
 
+def _is_failure_summary(line: str) -> bool:
+    return bool(_SUMMARY_BOUNDARY.match(line) and _NONZERO_FAILURE_COUNT.search(line))
+
+
 def _pytest_diagnostic_start(lines: list[str], marker_index: int) -> int:
     """Locate pytest's preceding failure section without interpreting prose."""
     summary = _PYTEST_FAILURE.match(lines[marker_index])
@@ -97,13 +108,13 @@ def _failure_excerpt(lines: list[str], marker_index: int, marker: str,
                         if _FAILURE_HEADER.match(lines[index])), marker_index)
     preceding = [
         line for line in lines[diagnostic_start + 1:context_end]
-        if line.strip() and not _SUCCESS_LOG.search(line)
+        if line.strip() and not _SUCCESS_LOG.match(line)
     ][-8:]
     following = []
     for line in lines[marker_index + 1:marker_index + 9]:
-        if _SUCCESS_LOG.search(line) or _PYTEST_FAILURE.match(line) or _UNITTEST_FAILURE.match(line):
+        if _SUCCESS_LOG.match(line) or _PYTEST_FAILURE.match(line) or _UNITTEST_FAILURE.match(line):
             break
-        if _FAILURE_SUMMARY.match(line):
+        if _SUMMARY_BOUNDARY.match(line):
             break
         if line.strip():
             following.append(line)
@@ -189,7 +200,7 @@ def format_verify_failure(raw: str, *, exit_code: int | None = None,
         pytest = _PYTEST_FAILURE.match(line)
         unittest = _UNITTEST_FAILURE.match(line)
         compiler = _COMPILER_FAILURE.match(line)
-        if pytest and not _FAILURE_SUMMARY.match(line):
+        if pytest and not _SUMMARY_BOUNDARY.match(line):
             markers.append((index, f"FAILED: {pytest.group('name')}" + (
                 f" - {pytest.group('message')}" if pytest.group('message') else ""
             ), _pytest_diagnostic_start(lines, index)))
@@ -197,7 +208,7 @@ def format_verify_failure(raw: str, *, exit_code: int | None = None,
             markers.append((index, f"FAILED: {unittest.group('name')}", index))
         elif compiler:
             markers.append((index, f"FAILED: {compiler.group('name')} - {compiler.group('message')}", index))
-        if _FAILURE_SUMMARY.match(line):
+        if _is_failure_summary(line):
             summaries.append(line)
 
     if timed_out:

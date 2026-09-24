@@ -143,6 +143,32 @@ class ValidationFeedbackTests(unittest.TestCase):
         self.assertIn("[diagnostic truncated]", diagnostic)
         self.assertLessEqual(len(diagnostic), MAX_DIAGNOSTIC)
 
+    def test_verify_formatter_ignores_later_zero_failure_summaries(self):
+        raw = (
+            "FAIL: test_broken\nAssertionError: wrong value\n"
+            "FAILED (failures=1)\n"
+            "Failures: 0\n"
+            "================ 0 errors, 3 passed ================\n"
+        )
+        diagnostic = format_verify_failure(raw, exit_code=1)
+        self.assertIn("FAILED (failures=1)", diagnostic)
+        self.assertNotIn("Failures: 0", diagnostic)
+        self.assertNotIn("0 errors, 3 passed", diagnostic)
+
+    def test_verify_formatter_keeps_error_lines_mentioning_success(self):
+        raw = (
+            "_____________ test_state _____________\n"
+            "E       assert passed is False\n"
+            "E       AssertionError: success flag was True\n"
+            "================ short test summary info ================\n"
+            "FAILED tests/test_state.py::test_state - AssertionError\n"
+            "================ 1 failed, 2 passed ================\n"
+        )
+        diagnostic = format_verify_failure(raw, exit_code=1)
+        self.assertIn("assert passed is False", diagnostic)
+        self.assertIn("success flag was True", diagnostic)
+        self.assertIn("1 failed, 2 passed", diagnostic)
+
     def test_verify_formatter_falls_back_to_bounded_tail_without_guessing(self):
         raw = "unrecognized output\n" + "x" * 3000 + "\nAPI_KEY=private-value"
         diagnostic = format_verify_failure(raw, exit_code=17)
