@@ -7499,6 +7499,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "maintenance_git.py",
                 "maintenance_orchestration.py",
                 "maintenance_planning.py",
+                "full_assessment.py",
                 "maintenance_state.py",
                 "notifications.py",
                 "planning_catalog.py",

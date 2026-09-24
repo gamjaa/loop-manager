@@ -42,6 +42,9 @@ CREATE TABLE IF NOT EXISTS maintenance_cycles (
     publication_refactoring_plan_ids TEXT NOT NULL DEFAULT '[]',
     publication_revalidation_plan_ids TEXT NOT NULL DEFAULT '[]',
     include_general_planning INTEGER NOT NULL DEFAULT 0,
+    full_assessment_completed INTEGER NOT NULL DEFAULT 0,
+    full_assessment_source_sha TEXT,
+    full_assessment_result TEXT,
     revision INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (repo) REFERENCES projects(repo)
@@ -67,6 +70,9 @@ class MaintenanceCycle:
     publication_refactoring_plan_ids: tuple[str, ...]
     publication_revalidation_plan_ids: tuple[str, ...]
     include_general_planning: bool
+    full_assessment_completed: bool
+    full_assessment_source_sha: str | None
+    full_assessment_result: str | None
     revision: int
 
 
@@ -90,6 +96,9 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
         "include_general_planning": "INTEGER NOT NULL DEFAULT 0",
         "publication_refactoring_plan_ids": "TEXT NOT NULL DEFAULT '[]'",
         "publication_revalidation_plan_ids": "TEXT NOT NULL DEFAULT '[]'",
+        "full_assessment_completed": "INTEGER NOT NULL DEFAULT 0",
+        "full_assessment_source_sha": "TEXT",
+        "full_assessment_result": "TEXT",
     }
     for column, definition in migrations.items():
         if column not in columns:
@@ -229,6 +238,9 @@ class MaintenanceRepository:
             publication_refactoring_plan_ids=(),
             publication_revalidation_plan_ids=(),
             include_general_planning=False,
+            full_assessment_completed=False,
+            full_assessment_source_sha=None,
+            full_assessment_result=None,
             revision=0,
         )
 
@@ -315,11 +327,18 @@ class MaintenanceRepository:
                 "publication_revalidation_plan_ids",
             ),
             include_general_planning=bool(row["include_general_planning"]),
+            full_assessment_completed=bool(row["full_assessment_completed"]),
+            full_assessment_source_sha=row["full_assessment_source_sha"],
+            full_assessment_result=row["full_assessment_result"],
             revision=int(row["revision"]),
         )
 
-    def due(self, repo: str, interval: int) -> ReviewDue:
+    def due(self, repo: str, interval: int, *, self_repository: bool = False) -> ReviewDue:
+        if interval <= 0:
+            raise ValueError("refactoring review interval must be positive")
         state = self.get(repo)
+        if self_repository and state.phase is MaintenancePhase.IDLE and not state.full_assessment_completed:
+            return ReviewDue(True, "one_time_full_assessment", 0, state.phase)
         return calculate_review_due(
             state.last_success_merged_count,
             self._merged_count(repo),
@@ -360,6 +379,7 @@ class MaintenanceRepository:
         base_sha: str,
         *,
         include_general_planning: bool = False,
+        self_repository: bool = False,
     ) -> tuple[MaintenanceCycle, bool]:
         """Create one assessment cycle, or return the already-active cycle."""
 
@@ -368,12 +388,7 @@ class MaintenanceRepository:
             if state.phase is not MaintenancePhase.IDLE:
                 return state, False
             merged_count = self._merged_count(repo)
-            decision = calculate_review_due(
-                state.last_success_merged_count,
-                merged_count,
-                interval,
-                state.phase,
-            )
+            decision = self.due(repo, interval, self_repository=self_repository)
             if not decision.required:
                 return state, False
             self.connection.execute(
@@ -395,6 +410,12 @@ class MaintenanceRepository:
                     publication_remote_oid = NULL,
                     publication_refactoring_plan_ids = '[]',
                     publication_revalidation_plan_ids = '[]',
+                    full_assessment_source_sha = CASE
+                        WHEN full_assessment_completed = 0 THEN excluded.cycle_base_sha
+                        ELSE full_assessment_source_sha END,
+                    full_assessment_result = CASE
+                        WHEN full_assessment_completed = 0 THEN NULL
+                        ELSE full_assessment_result END,
                     include_general_planning = excluded.include_general_planning,
                     revision = maintenance_cycles.revision + 1,
                     updated_at = CURRENT_TIMESTAMP
@@ -402,6 +423,32 @@ class MaintenanceRepository:
                 (repo, base_sha, merged_count, int(include_general_planning)),
             )
             return self.get(repo), True
+
+    def record_full_assessment(
+        self, repo: str, *, expected_revision: int, source_sha: str,
+        result: str,
+    ) -> MaintenanceCycle:
+        """Preserve a validated assessment before planning publication."""
+        if len(result.encode("utf-8")) > 65536 or not result:
+            raise MaintenanceStateError("전수 평가 기록이 비었거나 크기 제한을 넘었습니다.")
+        with _transaction(self.connection):
+            state = self.get(repo)
+            if (state.phase is not MaintenancePhase.ASSESSMENT
+                or state.revision != expected_revision
+                or state.cycle_base_sha != source_sha
+                or state.full_assessment_completed):
+                raise MaintenanceStateError("전수 평가의 source 또는 단계가 변경됐습니다.")
+            if state.full_assessment_result is not None:
+                if state.full_assessment_result != result:
+                    raise MaintenanceStateError("보존된 전수 평가 결과가 현재 결과와 다릅니다.")
+                return state
+            self.connection.execute(
+                "UPDATE maintenance_cycles SET full_assessment_source_sha = ?, "
+                "full_assessment_result = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE repo = ? AND revision = ?",
+                (source_sha, result, repo, expected_revision),
+            )
+            return self.get(repo)
 
     def record_publication_intent(
         self,
@@ -532,6 +579,13 @@ class MaintenanceRepository:
                 """
                 UPDATE maintenance_cycles
                 SET cycle_base_sha = ?, publication_stage = NULL,
+                    full_assessment_result = CASE
+                        WHEN full_assessment_completed = 1
+                          OR full_assessment_source_sha = ? THEN full_assessment_result
+                        ELSE NULL END,
+                    full_assessment_source_sha = CASE
+                        WHEN full_assessment_completed = 1 THEN full_assessment_source_sha
+                        ELSE ? END,
                     publication_base_sha = NULL, publication_commit_sha = NULL,
                     publication_remote_oid = NULL,
                     publication_refactoring_plan_ids = '[]',
@@ -540,7 +594,7 @@ class MaintenanceRepository:
                     updated_at = CURRENT_TIMESTAMP
                 WHERE repo = ? AND phase = ? AND revision = ?
                 """,
-                (new_base_sha, repo, expected.phase.value, expected.revision),
+                (new_base_sha, new_base_sha, new_base_sha, repo, expected.phase.value, expected.revision),
             )
             return self.get(repo)
 
@@ -586,6 +640,13 @@ class MaintenanceRepository:
                 """
                 UPDATE maintenance_cycles
                 SET cycle_base_sha = ?, revision = revision + 1,
+                    full_assessment_result = CASE
+                        WHEN full_assessment_completed = 1
+                          OR full_assessment_source_sha = ? THEN full_assessment_result
+                        ELSE NULL END,
+                    full_assessment_source_sha = CASE
+                        WHEN full_assessment_completed = 1 THEN full_assessment_source_sha
+                        ELSE ? END,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE repo = ? AND phase = ? AND revision = ?
                   AND publication_stage IS NULL
@@ -593,7 +654,7 @@ class MaintenanceRepository:
                   AND publication_commit_sha IS NULL
                   AND publication_remote_oid IS NULL
                 """,
-                (new_base_sha, repo, expected.phase.value, expected.revision),
+                (new_base_sha, new_base_sha, new_base_sha, repo, expected.phase.value, expected.revision),
             )
             if cursor.rowcount != 1:
                 raise MaintenanceStateError(
@@ -650,6 +711,16 @@ class MaintenanceRepository:
             updates["publication_refactoring_plan_ids"] = "[]"
             updates["publication_revalidation_plan_ids"] = "[]"
         with _transaction(self.connection):
+            state = self.get(repo)
+            if cycle_base_sha is not None and not state.full_assessment_completed:
+                updates["full_assessment_result"] = (
+                    state.full_assessment_result
+                    if cycle_base_sha == state.full_assessment_source_sha else None
+                )
+                updates["full_assessment_source_sha"] = cycle_base_sha
+            if (next_phase is MaintenancePhase.REFACTORING
+                and state.full_assessment_result is not None):
+                updates["full_assessment_completed"] = 1
             if prerequisite_plan_ids is not None:
                 updates["prerequisite_plan_ids"] = self._serialize_plan_ids(
                     repo, prerequisite_plan_ids, "prerequisite_plan_ids"
@@ -699,6 +770,9 @@ class MaintenanceRepository:
                 """
                 UPDATE maintenance_cycles
                 SET last_success_commit = ?, last_success_merged_count = ?,
+                    full_assessment_completed = CASE
+                        WHEN full_assessment_result IS NOT NULL THEN 1
+                        ELSE full_assessment_completed END,
                     phase = 'idle', cycle_base_sha = NULL,
                     cycle_start_merged_count = NULL,
                     prerequisite_plan_ids = '[]',
