@@ -454,6 +454,12 @@ class RuntimeWorktree:
 
 
 @dataclass(frozen=True)
+class BootstrapRefreshHandoff:
+    base_branch: str
+    commit_sha: str
+
+
+@dataclass(frozen=True)
 class RuntimeMutation:
     source: Path
     path: Path
@@ -1091,23 +1097,13 @@ def _validated_runtime_registration_marker(
 
 def prepare_runtime_worktree(
     source: Path, state_dir: Path, *, mutation_id: str | None = None,
+    commit_sha: str | None = None,
 ) -> RuntimeWorktree:
-    """Fetch origin/main and select an immutable linked runtime worktree."""
+    """Select an immutable linked runtime worktree at a fetched commit."""
 
     source = _canonical_path(source)
-    root = _canonical_path(
-        Path(git(source, "rev-parse", "--show-toplevel").stdout.strip())
-    )
-    if root != source:
-        raise RuntimeError(f"Loop Manager source 저장소 루트가 아닙니다: {source}")
-    github_repository(git(source, "remote", "get-url", "origin").stdout)
-    git(source, "fetch", "origin")
-    commit_sha = git(
-        source,
-        "rev-parse",
-        "--verify",
-        "refs/remotes/origin/main^{commit}",
-    ).stdout.strip()
+    if commit_sha is None:
+        _, commit_sha = fetch_bootstrap_revision(source, state_dir)
     runtime = expected_runtime_worktree(state_dir, source, commit_sha)
     _validate_managed_path_boundary(
         state_dir,
@@ -1176,6 +1172,92 @@ def prepare_runtime_worktree(
         git(source, "worktree", "add", "--detach", str(runtime), commit_sha)
     validate_runtime_worktree(source, state_dir, runtime, commit_sha)
     return RuntimeWorktree(runtime, commit_sha, mutation_id)
+
+
+def bootstrap_base_branch(source: Path, state_dir: Path, origin: str) -> str:
+    """Read a registered self base without changing SQLite before the handoff."""
+
+    database = state_dir / "loop-manager.db"
+    if not database.is_file():
+        return "main"
+    with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(projects)")}
+        if not {"repo", "base_branch"} <= columns:
+            raise RuntimeError("상태 DB의 프로젝트 등록 정보를 읽을 수 없습니다.")
+        origin_column = "origin" if "origin" in columns else "NULL AS origin"
+        registered_filter = "WHERE registered = 1" if "registered" in columns else ""
+        rows = connection.execute(
+            f"SELECT repo, base_branch, {origin_column} FROM projects {registered_filter}"
+        ).fetchall()
+    matches = [row for row in rows if _canonical_path(Path(row[0])) == source]
+    if len(matches) > 1:
+        raise RuntimeError("등록된 self source identity가 중복됩니다.")
+    if not matches:
+        return "main"
+    _, base, saved_origin = matches[0]
+    if saved_origin is not None and str(saved_origin) != origin:
+        raise RuntimeError("등록된 self origin과 현재 source origin이 다릅니다.")
+    if not base:
+        raise RuntimeError("등록된 self base branch가 비어 있습니다.")
+    return str(base)
+
+
+def fetch_bootstrap_revision(source: Path, state_dir: Path) -> tuple[str, str]:
+    """Resolve the registered base and fetch that branch under the process lock."""
+
+    source = _canonical_path(source)
+    root = _canonical_path(Path(git(source, "rev-parse", "--show-toplevel").stdout.strip()))
+    if root != source:
+        raise RuntimeError(f"Loop Manager source 저장소 루트가 아닙니다: {source}")
+    origin = github_repository(git(source, "remote", "get-url", "origin").stdout)
+    base = bootstrap_base_branch(source, state_dir, origin)
+    git(source, "fetch", "origin", f"+refs/heads/{base}:refs/remotes/origin/{base}")
+    sha = git(
+        source, "rev-parse", "--verify", f"refs/remotes/origin/{base}^{{commit}}"
+    ).stdout.strip()
+    return base, sha
+
+
+def validate_bootstrap_revision(source: Path, base: str, sha: str) -> None:
+    """Reject a source or remote race before starting work at the selected SHA."""
+
+    current = git(source, "rev-parse", "HEAD").stdout.strip()
+    branch_result = git(source, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
+    branch = branch_result.stdout.strip() if branch_result.returncode == 0 else None
+    remote = git(
+        source, "rev-parse", "--verify", f"refs/remotes/origin/{base}^{{commit}}"
+    ).stdout.strip()
+    if current != sha or remote != sha or branch != base:
+        raise RuntimeError(
+            f"bootstrap revision 변경: source={current} branch={branch} "
+            f"origin/{base}={remote} expected={sha}"
+        )
+    operations = _git_operation_entries(source)
+    if operations:
+        raise RuntimeError("진행 중 Git operation: " + ", ".join(sorted(operations)))
+
+
+def prepare_bootstrap_runtime(
+    source: Path, state_dir: Path, mutation_id: str,
+) -> RuntimeWorktree | BootstrapRefreshHandoff:
+    """Refresh an old source and hand control to the next external invocation."""
+
+    base, sha = fetch_bootstrap_revision(source, state_dir)
+    result = synchronize_base_worktree(source, base, remote_sha=sha)
+    if result.status == "updated":
+        operation_log(f"bootstrap source 갱신 완료: origin/{base} {sha}; 다음 실행에 인계")
+        return BootstrapRefreshHandoff(base, sha)
+    if result.status != "equal":
+        raise RuntimeError(
+            f"bootstrap source 갱신 불가 (origin/{base} {sha}): "
+            f"{result.status}: {result.reason}"
+        )
+    validate_bootstrap_revision(source, base, sha)
+    runtime = prepare_runtime_worktree(
+        source, state_dir, mutation_id=mutation_id, commit_sha=sha,
+    )
+    validate_bootstrap_revision(source, base, sha)
+    return runtime
 
 
 def source_config_path(source: Path, value: str) -> Path:
@@ -1288,9 +1370,16 @@ def validate_runtime_mutation(
         if identity != f"runtime:{mutation_id}":
             raise RuntimeError("runtime mutation ID와 부모 process lock이 다릅니다.")
         legacy = False
-    origin_sha = git(source, "rev-parse", "--verify", "refs/remotes/origin/main^{commit}").stdout.strip()
+    origin = repository_origin(source)
+    base = bootstrap_base_branch(source, state_dir, origin)
+    origin_sha = git(
+        source, "rev-parse", "--verify", f"refs/remotes/origin/{base}^{{commit}}"
+    ).stdout.strip()
     if origin_sha != sha:
-        raise RuntimeError(f"runtime SHA가 현재 origin/main과 다릅니다: {sha} (origin/main {origin_sha})")
+        raise RuntimeError(
+            f"runtime SHA가 현재 origin/{base}와 다릅니다: "
+            f"{sha} (origin/{base} {origin_sha})"
+        )
     validate_runtime_worktree(source, state_dir, runtime, sha)
     lock_reason = _validated_runtime_registration_marker(
         source, state_dir, runtime, sha, mutation_id,
@@ -18665,6 +18754,9 @@ def main() -> int:
             runtime_mutation = validate_runtime_mutation(
                 source, state_dir, str(args.runtime_sha), args.runtime_mutation_id,
             )
+            if runtime_mutation is not None and not runtime_mutation.legacy:
+                base = bootstrap_base_branch(source, state_dir, repository_origin(source))
+                validate_bootstrap_revision(source, base, str(args.runtime_sha))
             return execute_runtime_command(
                 args, state_dir, config_path, runtime_mutation,
             )
@@ -18672,9 +18764,9 @@ def main() -> int:
         source = ROOT
         mutation_id = secrets.token_hex(16)
         with process_lock(state_dir, identity=f"bootstrap:{mutation_id}") as lock_handle:
-            runtime = prepare_runtime_worktree(
-                source, state_dir, mutation_id=mutation_id,
-            )
+            runtime = prepare_bootstrap_runtime(source, state_dir, mutation_id)
+            if isinstance(runtime, BootstrapRefreshHandoff):
+                return 0
             _write_process_lock_identity(lock_handle, f"runtime:{mutation_id}")
             return run_runtime_child(
                 source,
