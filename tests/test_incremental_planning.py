@@ -354,6 +354,26 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
             [plan.plan_id for plan in snapshot.plans], ["G-001"]
         )
 
+    def test_mutable_snapshot_uses_git_blob_with_crlf_checkout(self):
+        path = self.repo / self.paths["G-001"]
+        git(self.repo, "config", "core.autocrlf", "true")
+        path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+        self.assertIn(b"\r\n", path.read_bytes())
+
+        snapshot = loop_manager.mutable_ready_snapshot(
+            self.connection, str(self.repo), self.repo, self.base
+        )
+
+        self.assertNotIn("\r\n", snapshot.plans[0].text)
+        self.assertEqual(
+            snapshot.plans[0].content_hash,
+            hashlib.sha256(
+                loop_manager.git_bytes(
+                    self.repo, "show", f"{self.base}:{self.paths['G-001']}"
+                )
+            ).hexdigest(),
+        )
+
     def test_snapshot_authority_is_checked_before_changed_plan_contents(self):
         self.connection.execute(
             "UPDATE exec_plans SET ever_started = 1 "
