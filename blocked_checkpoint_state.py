@@ -30,6 +30,13 @@ CREATE TABLE IF NOT EXISTS blocked_checkpoints (
     tree_oid TEXT,
     local_oid TEXT,
     remote_oid TEXT,
+    published_oid TEXT,
+    accepted_remote_oid TEXT,
+    pending_remote_oid TEXT,
+    inspected_remote_oid TEXT,
+    inspected_input TEXT,
+    inspection_reason TEXT,
+    inspection_retryable INTEGER NOT NULL DEFAULT 0,
     rebase_recovery INTEGER NOT NULL DEFAULT 0,
     result TEXT,
     unpublished_reason TEXT,
@@ -44,6 +51,18 @@ CREATE TABLE IF NOT EXISTS blocked_checkpoints (
 
 def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.execute(SCHEMA)
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(blocked_checkpoints)")}
+    for name in (
+        "published_oid", "accepted_remote_oid", "pending_remote_oid",
+        "inspected_remote_oid", "inspected_input", "inspection_reason",
+    ):
+        if name not in columns:
+            connection.execute(f"ALTER TABLE blocked_checkpoints ADD COLUMN {name} TEXT")
+    if "inspection_retryable" not in columns:
+        connection.execute(
+            "ALTER TABLE blocked_checkpoints ADD COLUMN inspection_retryable "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 def request_identity(
@@ -122,6 +141,13 @@ class BlockedCheckpointRepository:
                     tree_oid = NULL,
                     local_oid = NULL,
                     remote_oid = NULL,
+                    published_oid = NULL,
+                    accepted_remote_oid = NULL,
+                    pending_remote_oid = NULL,
+                    inspected_remote_oid = NULL,
+                    inspected_input = NULL,
+                    inspection_reason = NULL,
+                    inspection_retryable = 0,
                     rebase_recovery = excluded.rebase_recovery,
                     result = NULL,
                     unpublished_reason = NULL,
@@ -264,6 +290,13 @@ class BlockedCheckpointRepository:
                 result="published",
                 local_oid=remote_oid,
                 remote_oid=remote_oid,
+                published_oid=remote_oid,
+                accepted_remote_oid=remote_oid,
+                pending_remote_oid=None,
+                inspected_remote_oid=None,
+                inspected_input=None,
+                inspection_reason=None,
+                inspection_retryable=0,
                 unpublished_reason=None,
                 retryable=0,
             )
@@ -273,6 +306,48 @@ class BlockedCheckpointRepository:
                 (remote_oid, request.repo, request.plan_id),
             )
             notifications.enqueue_current_project_events(self.connection, request.repo)
+
+    def start_remote_adoption(self, request: CheckpointRequest, oid: str) -> None:
+        with self.connection:
+            self._update(request, pending_remote_oid=oid)
+
+    def record_remote_inspection(
+        self, request: CheckpointRequest, oid: str, input_identity: str,
+        reason: str, *, commit: bool = True,
+    ) -> None:
+        if commit:
+            with self.connection:
+                self.record_remote_inspection(
+                    request, oid, input_identity, reason, commit=False,
+                )
+                notifications.enqueue_current_project_events(
+                    self.connection, request.repo,
+                )
+            return
+        self._update(
+            request, accepted_remote_oid=oid, pending_remote_oid=None,
+            inspected_remote_oid=oid, inspected_input=input_identity,
+            inspection_reason=reason, inspection_retryable=0,
+        )
+
+    def record_remote_refusal(
+        self, request: CheckpointRequest, oid: str | None,
+        input_identity: str, reason: str, *, commit: bool = True,
+        retryable: bool = False,
+    ) -> None:
+        if commit:
+            with self.connection:
+                self.record_remote_refusal(
+                    request, oid, input_identity, reason, commit=False,
+                    retryable=retryable,
+                )
+            return
+        self._update(
+            request, pending_remote_oid=None,
+            inspected_remote_oid=oid,
+            inspected_input=input_identity, inspection_reason=reason,
+            inspection_retryable=int(retryable),
+        )
 
     def finish_unpublished(
         self,

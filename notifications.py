@@ -160,7 +160,8 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
 
     plan_blocks = connection.execute(
         "SELECT p.plan_id, p.title, p.path, p.sources, b.reason_code, b.evidence, "
-        "c.result, c.remote_oid, c.unpublished_reason, c.branch, r.origin "
+        "c.result, c.remote_oid, c.unpublished_reason, c.branch, r.origin, "
+        "c.inspected_remote_oid, c.inspection_reason "
         "FROM execplan_blocks AS b JOIN exec_plans AS p USING (repo, plan_id) "
         "JOIN projects AS r ON r.repo = b.repo "
         "LEFT JOIN blocked_checkpoints AS c USING (repo, plan_id) "
@@ -217,10 +218,15 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
                 for location in (item["proposal"], item["user_decision"])
                 if location not in paths
             )
+        remote_inspection = (
+            f"\0remote\0{plan[11] or 'deleted'}\0{plan[12]}"
+            if plan[6] == "published" and plan[12] else ""
+        )
         _insert(
             connection,
             _key("blocked", repo, f"plan\0{plan[4]}\0{plan_id}" +
-                 (f"\0{recovery_identity}" if recovery_identity else "")),
+                 (f"\0{recovery_identity}" if recovery_identity else "") +
+                 remote_inspection),
             repo,
             "blocked",
             {

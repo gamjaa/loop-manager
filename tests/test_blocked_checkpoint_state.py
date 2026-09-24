@@ -128,9 +128,50 @@ class BlockedCheckpointRepositoryTest(unittest.TestCase):
         self.assertEqual(tuple(row), ("PLAN_BLOCKED", oid))
         self.assertEqual(self.repository.pending("repo"), ())
         checkpoint = self.connection.execute(
-            "SELECT phase, result, remote_oid FROM blocked_checkpoints"
+            "SELECT phase, result, remote_oid, published_oid, accepted_remote_oid "
+            "FROM blocked_checkpoints"
         ).fetchone()
-        self.assertEqual(tuple(checkpoint), ("published", "published", oid))
+        self.assertEqual(tuple(checkpoint),
+                         ("published", "published", oid, oid, oid))
+
+    def test_remote_inspection_keeps_original_publication_oid(self):
+        request = self.request()
+        published = "a" * 40
+        candidate = "b" * 40
+        self.repository.finish_published(request, published)
+        self.repository.start_remote_adoption(request, candidate)
+        self.repository.record_remote_inspection(
+            request, candidate, "input", "still blocked",
+        )
+        row = self.connection.execute("SELECT * FROM blocked_checkpoints").fetchone()
+        self.assertEqual(row["published_oid"], published)
+        self.assertEqual(row["remote_oid"], published)
+        self.assertEqual(row["accepted_remote_oid"], candidate)
+        self.assertEqual(row["inspected_remote_oid"], candidate)
+        self.assertEqual(row["inspection_reason"], "still blocked")
+        self.assertEqual(row["inspection_retryable"], 0)
+        self.assertIsNone(row["pending_remote_oid"])
+
+    def test_existing_checkpoint_table_gains_remote_inspection_columns(self):
+        connection = sqlite3.connect(":memory:")
+        try:
+            connection.execute(
+                "CREATE TABLE blocked_checkpoints (repo TEXT, plan_id TEXT, "
+                "remote_oid TEXT, PRIMARY KEY (repo, plan_id))"
+            )
+            blocked_checkpoint_state.ensure_schema(connection)
+            columns = {
+                row[1] for row in connection.execute(
+                    "PRAGMA table_info(blocked_checkpoints)"
+                )
+            }
+            self.assertTrue({
+                "published_oid", "accepted_remote_oid", "pending_remote_oid",
+                "inspected_remote_oid", "inspected_input", "inspection_reason",
+                "inspection_retryable",
+            }.issubset(columns))
+        finally:
+            connection.close()
 
     def test_plan_block_and_checkpoint_request_share_one_transaction(self):
         self.connection.execute(

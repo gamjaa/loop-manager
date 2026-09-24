@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from enum import Enum
 import hashlib
 import json
+import re
+from pathlib import PurePosixPath
 from typing import Iterable
 
 
@@ -39,6 +41,42 @@ _PHASE_ORDER = {
     "REVIEWING": 2,
     "PUBLISHING": 3,
 }
+
+
+_REMOTE_FAILURE_REASONS = frozenset({
+    "verify_retry_exhausted",
+    "review_retry_exhausted",
+})
+
+
+def remote_failure_correction_paths(
+    reason_code: str,
+    changed_paths: Iterable[str],
+    failure_evidence: str,
+) -> tuple[str, ...]:
+    """Select unverified inputs for Worker reassessment of exhausted validation.
+
+    A diagnostic path is not a dependency graph: an implementation, fixture or
+    build input absent from both the traceback and checkpoint can fix the cause.
+    Only clearly documentary changes need an explicit diagnostic connection.
+    Scope, ownership and reason-specific approval gates are enforced by callers.
+    """
+    if reason_code not in _REMOTE_FAILURE_REASONS:
+        return ()
+    evidence = failure_evidence.replace("\\", "/")
+    candidates = []
+    for path in changed_paths:
+        file = PurePosixPath(path)
+        documentary = (
+            path.startswith("docs/")
+            or file.suffix.lower() in {".md", ".rst"}
+            or file.name.lower() in {"readme", "license", "copying", "changelog"}
+        )
+        if not documentary or re.search(
+            rf"(?<![\w.-]){re.escape(path)}(?![\w./-])", evidence,
+        ):
+            candidates.append(path)
+    return tuple(candidates)
 
 
 def _digest(label: str, values: Iterable[object]) -> str:

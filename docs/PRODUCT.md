@@ -204,7 +204,7 @@ ExecPlan 게시 실패:
 3. 같은 소유 branch의 원격이 없으면 생성하고, 저장된 expected OID와 일치하는 fast-forward만 갱신한다. PR 없는 기존 rebase 복구만 정확한 `--force-with-lease`를 사용할 수 있으며 예상하지 못한 원격 commit, branch protection과 권한 거부를 우회하지 않는다
 4. commit·push phase와 local/remote OID를 저장해 중단 후 같은 checkpoint를 재개하고, 일시적 push 실패는 실행당 제한 횟수만 재시도한 뒤 local commit과 worktree를 보존한다. checkpoint 결과와 무관하게 ExecPlan은 `PLAN_BLOCKED`로 남고 독립 READY 선택 자리를 점유하지 않는다
 5. `PROJECT_BLOCKED`, `planning_error`, 등록·branch 생성 전 실패, 기존 PR 또는 소유권을 증명할 수 없는 legacy 차단에는 원격 쓰기를 수행하지 않고 미게시 이유를 저장한다. 차단 알림은 checkpoint 결과 확정 뒤 성공 시 commit OID와 immutable branch link를, 미게시 시 local-only 이유를 포함한다
-6. 계획별 입력 변경, guidance 결정 또는 닫힌 PR reopen 조건은 해당 `PLAN_BLOCKED`만 재평가한다. 게시된 checkpoint branch가 외부에서 변경됐으면 자동 merge·rebase·덮어쓰기를 거부한다
+6. 계획별 입력 변경, guidance 결정 또는 닫힌 PR reopen 조건은 해당 `PLAN_BLOCKED`만 재평가한다. PR 없는 게시 checkpoint의 저장된 원격 branch가 달라지면 게시 OID와 마지막 채택 head를 포함하는 후속 commit인지 확인한다. 계획·branch·worktree·저장소 소유권, 로컬 HEAD·index·작업 파일·ignored 경로·Git operation 및 허용 변경 범위를 검증한 뒤 로컬 작업을 보존할 수 있을 때만 같은 branch를 fast-forward한다. 삭제·재작성·분기·소유권 불명확·충돌은 구체적인 이유로 계속 차단한다. 새 OID만으로 해제하지 않고 실제 변경과 원인별 조건을 재평가하며, 해결된 사용자 commit은 Worker 검토와 targeted test, 전체 verify, Review를 다시 거친다. 해결되지 않은 검사 결과는 원격 head와 함께 저장해 동일 입력의 반복 시도와 알림을 막는다. 게시 증거가 없는 legacy checkpoint와 닫힌 PR에는 이 경로를 적용하지 않는다
 7. 해제 조건이 충족된 계획은 기존 branch와 worktree에서 재개하고 재시도 횟수와 verify·Review 실패 지문 이력을 초기화하며 effective Worker level과 승격 이력을 최초 level로 되돌린 뒤 READY 또는 PR_OPEN으로 변경한다. 같은 branch의 최초 PR은 최종 verify와 Review 성공 뒤에만 생성한다
 8. `PROJECT_BLOCKED`는 기본 worktree, 허용되지 않은 공유 ref, 외부 worktree와 workspace 소유권을 다시 검증해 프로젝트 안전이 증명된 경우에만 해제한다. `refs/codex/turn-diffs/*`의 순변경은 해제 조건을 무효화하지 않는다
 9. 프로젝트 차단이 해제돼도 별도 계획 원인이 남은 ExecPlan은 `PLAN_BLOCKED`를 유지하며, 다른 차단 계획의 fingerprint와 작업 공간은 변경하지 않는다
