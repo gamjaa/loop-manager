@@ -7605,12 +7605,15 @@ class VerifyOutput(str):
 
     fingerprint_source: str
     timed_out: bool
+    exit_code: int | None
 
-    def __new__(cls, output: str, *, timed_out: bool = False) -> VerifyOutput:
+    def __new__(cls, output: str, *, timed_out: bool = False,
+                exit_code: int | None = None) -> VerifyOutput:
         shown = redact_secrets(output) if timed_out else output
         instance = super().__new__(cls, shown.strip()[-8000:])
         instance.fingerprint_source = output
         instance.timed_out = timed_out
+        instance.exit_code = exit_code
         return instance
 
 
@@ -7625,12 +7628,13 @@ def verify(worktree: Path, timeout_seconds: int = 600) -> tuple[bool, str]:
     if not script.is_file():
         return False, f"전체 검증 스크립트가 없습니다: {script.relative_to(worktree)}"
     passed, timed_out, output = run_verify_process(arguments, worktree, timeout_seconds)
+    exit_code = getattr(output, "exit_code", 0 if passed else None)
     if timed_out:
         output += (
             f"\n전체 verify 시간 초과: verify_timeout_seconds={timeout_seconds}. "
             "verify와 자식 프로세스 종료를 확인했습니다."
         )
-    return passed, VerifyOutput(output, timed_out=timed_out)
+    return passed, VerifyOutput(output, timed_out=timed_out, exit_code=exit_code)
 
 
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")

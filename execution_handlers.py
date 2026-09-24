@@ -2549,8 +2549,12 @@ class ExecutionHandlers:
             fingerprints = () if passed else self.effects.feedback.fingerprints(
                 'verify', output, context.worktree,
             )
-            feedback_items = () if passed else normalize_feedback('verify', str(output), fingerprints)
             raw_output = getattr(output, 'fingerprint_source', str(output))
+            feedback_items = () if passed else normalize_feedback(
+                'verify', raw_output, fingerprints,
+                exit_code=getattr(output, 'exit_code', None),
+                timed_out=bool(getattr(output, 'timed_out', False)),
+            )
             def audit_rejected():
                 feedback_repo.record_result(
                     self.repo, str(self.plan['id']), context.plan.definition_revision_sha,
