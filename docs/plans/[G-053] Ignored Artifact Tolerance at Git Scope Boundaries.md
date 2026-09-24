@@ -36,8 +36,8 @@ priority: critical
 
 ## Progress
 
-- [ ] ignored artifact 판정 경계 통일
-- [ ] 역할별 artifact·권위 변경 targeted test 갱신
+- [x] ignored artifact 판정 경계 통일
+- [x] 역할별 artifact·권위 변경 targeted test 갱신
 
 ## Decision Log
 

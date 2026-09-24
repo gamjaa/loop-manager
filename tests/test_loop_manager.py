@@ -13,6 +13,7 @@ import threading
 import time
 import unittest
 from contextlib import redirect_stderr
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -3363,14 +3364,10 @@ risk: medium
         self.assertIn(started.session_id, calls[1])
         self.assertEqual(call_options[0]["cwd"], worktree)
         self.assertEqual(call_options[1]["cwd"], worktree)
-        self.assertEqual(
-            call_options[0]["env"]["PYTHONDONTWRITEBYTECODE"], "1"
-        )
-        self.assertEqual(
-            call_options[1]["env"]["PYTHONDONTWRITEBYTECODE"], "1"
-        )
+        self.assertNotIn("PYTHONDONTWRITEBYTECODE", call_options[0]["env"])
+        self.assertNotIn("PYTHONDONTWRITEBYTECODE", call_options[1]["env"])
 
-    def test_planner_environment_forces_bytecode_disable_without_mutating_parent(self):
+    def test_planner_environment_does_not_override_parent_bytecode_policy(self):
         parent_environment = {
             "HOME": "/home/test",
             "PATH": "/bin",
@@ -3383,8 +3380,8 @@ risk: medium
             worker_codex = loop_manager.agent_environment("codex", "worker")
             self.assertEqual(os.environ["PYTHONDONTWRITEBYTECODE"], "0")
 
-        self.assertEqual(planner_codex["PYTHONDONTWRITEBYTECODE"], "1")
-        self.assertEqual(planner_claude["PYTHONDONTWRITEBYTECODE"], "1")
+        self.assertNotIn("PYTHONDONTWRITEBYTECODE", planner_codex)
+        self.assertNotIn("PYTHONDONTWRITEBYTECODE", planner_claude)
         self.assertNotIn("PYTHONPYCACHEPREFIX", planner_codex)
         self.assertNotIn("PYTHONDONTWRITEBYTECODE", worker_codex)
 
@@ -6697,10 +6694,12 @@ class AgentScopeValidatorTest(unittest.TestCase):
                         selected_plan_path=selected_plan,
                     )
 
-    def test_ignored_untracked_creation_and_change_are_rejected(self):
+    def test_ignored_untracked_creation_change_and_deletion_are_allowed(self):
         scenarios = (
             ("planner", None, "created by planner\n"),
+            ("worker", "before work\n", "changed by worker\n"),
             ("reviewer", "before review\n", "changed by reviewer\n"),
+            ("reviewer", "before review\n", None),
         )
         for role_name, before_contents, after_contents in scenarios:
             with self.subTest(role=role_name), tempfile.TemporaryDirectory() as directory:
@@ -6712,24 +6711,179 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     ignored.write_text(before_contents, encoding="utf-8")
                 before = loop_manager.capture_git_snapshot(repo)
 
-                ignored.write_text(after_contents, encoding="utf-8")
+                if after_contents is None:
+                    ignored.unlink()
+                else:
+                    ignored.write_text(after_contents, encoding="utf-8")
                 after = loop_manager.capture_git_snapshot(repo)
 
-                self.assertIn("ignored.txt", after.dirty)
-                if before_contents is not None:
-                    self.assertIn("ignored.txt", before.dirty)
-                with self.assertRaisesRegex(
-                    loop_manager.AgentScopeError,
-                    "ignored.txt",
-                ):
-                    loop_manager.validate_agent_scope(
-                        role_name,
-                        repo,
-                        before,
-                        after,
-                    )
+                self.assertNotIn("ignored.txt", before.dirty)
+                self.assertNotIn("ignored.txt", after.dirty)
+                loop_manager.validate_agent_scope(
+                    role_name, repo, before, after,
+                    selected_plan_path="docs/plans/[G-001] Scope Safety.md"
+                    if role_name == "worker" else None,
+                )
 
-    def test_planner_imports_do_not_leave_bytecode_or_hide_scope_violations(self):
+    def test_legacy_ignored_snapshot_requires_unchanged_tracked_rule(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, _plan_path = self._repository_with_plan(directory)
+            (repo / ".gitignore").write_text("cache.bin\n", encoding="utf-8")
+            commit_and_push(repo, "Ignore cache fixture")
+            (repo / "cache.bin").write_bytes(b"old")
+            current = loop_manager.capture_git_snapshot(repo)
+            legacy = replace(
+                current,
+                dirty={"cache.bin": (("untracked",), "old-signature")},
+                config={
+                    key: value for key, value in current.config.items()
+                    if not key.startswith("ignore-source:")
+                },
+            )
+            normalized = loop_manager._normalize_legacy_ignored_snapshot(
+                repo, legacy, current
+            )
+            self.assertEqual(normalized.dirty, {})
+
+            (repo / ".gitignore").write_text("cache.bin\nnew.bin\n", encoding="utf-8")
+            changed = loop_manager.capture_git_snapshot(repo)
+            self.assertEqual(
+                loop_manager._normalize_legacy_ignored_snapshot(repo, legacy, changed),
+                legacy,
+            )
+
+    def test_persisted_worker_snapshot_resumes_with_legacy_ignored_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, plan_path = self._repository_with_plan(directory)
+            (repo / ".gitignore").write_text("cache.bin\n", encoding="utf-8")
+            commit_and_push(repo, "Ignore cache fixture")
+            (repo / "cache.bin").write_bytes(b"old")
+            current = loop_manager.capture_git_snapshot(repo)
+            legacy = replace(
+                current,
+                dirty={"cache.bin": (("untracked",), "old-signature")},
+                config={
+                    key: value for key, value in current.config.items()
+                    if not key.startswith("ignore-source:")
+                },
+            )
+            state_dir = Path(directory) / "state"
+            self._persist_interrupted_worker(state_dir, repo, plan_path, legacy)
+            connection = sqlite3.connect(state_dir / "loop-manager.db")
+            connection.row_factory = sqlite3.Row
+            try:
+                self.assertEqual(
+                    loop_manager.validate_persisted_agent_scope(
+                        connection, repo, state_dir, str(repo)
+                    ),
+                    current,
+                )
+            finally:
+                connection.close()
+
+    def test_legacy_snapshot_does_not_trust_unrecorded_exclude_rules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, plan_path = self._repository_with_plan(directory)
+            before = loop_manager.capture_git_snapshot(repo)
+            legacy = replace(
+                before,
+                config={
+                    key: value for key, value in before.config.items()
+                    if not key.startswith("ignore-source:")
+                },
+            )
+            state_dir = Path(directory) / "state"
+            self._persist_interrupted_worker(state_dir, repo, plan_path, legacy)
+            exclude = Path(git_command(repo, "rev-parse", "--git-path", "info/exclude"))
+            if not exclude.is_absolute():
+                exclude = repo / exclude
+            exclude.write_text(
+                exclude.read_text(encoding="utf-8") + "\nnew-cache.bin\n",
+                encoding="utf-8",
+            )
+            connection = sqlite3.connect(state_dir / "loop-manager.db")
+            connection.row_factory = sqlite3.Row
+            try:
+                with self.assertRaisesRegex(loop_manager.AgentScopeError, "ignore-source"):
+                    loop_manager.validate_persisted_agent_scope(
+                        connection, repo, state_dir, str(repo)
+                    )
+            finally:
+                connection.close()
+
+    def test_forced_staged_ignored_file_stays_in_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, _plan_path = self._repository_with_plan(directory)
+            (repo / ".gitignore").write_text("cache.bin\n", encoding="utf-8")
+            commit_and_push(repo, "Ignore cache fixture")
+            before = loop_manager.capture_git_snapshot(repo)
+            (repo / "cache.bin").write_bytes(b"staged")
+            git_command(repo, "add", "-f", "cache.bin")
+            after = loop_manager.capture_git_snapshot(repo)
+            self.assertIn("cache.bin", after.index)
+            with self.assertRaisesRegex(loop_manager.AgentScopeError, "cache.bin"):
+                loop_manager.validate_agent_scope("reviewer", repo, before, after)
+
+    def test_tracked_file_matching_ignore_rule_stays_in_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, _plan_path = self._repository_with_plan(directory)
+            (repo / ".gitignore").write_text("src/app.py\n", encoding="utf-8")
+            commit_and_push(repo, "Ignore tracked path fixture")
+            before = loop_manager.capture_git_snapshot(repo)
+            (repo / "src/app.py").write_text("VALUE = 3\n", encoding="utf-8")
+            after = loop_manager.capture_git_snapshot(repo)
+            self.assertIn("src/app.py", after.dirty)
+            with self.assertRaisesRegex(loop_manager.AgentScopeError, "src/app.py"):
+                loop_manager.validate_agent_scope("reviewer", repo, before, after)
+
+    def test_new_ignore_rule_cannot_hide_untracked_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, _plan_path = self._repository_with_plan(directory)
+            (repo / ".gitignore").write_text("*.cache\n", encoding="utf-8")
+            commit_and_push(repo, "Ignore cache fixture")
+            before = loop_manager.capture_git_snapshot(repo)
+            (repo / ".gitignore").write_text("*.cache\nhidden.txt\n", encoding="utf-8")
+            (repo / "hidden.txt").write_text("new", encoding="utf-8")
+            after = loop_manager.capture_git_snapshot(repo)
+            self.assertIn("hidden.txt", after.dirty)
+            with self.assertRaisesRegex(loop_manager.AgentScopeError, "hidden.txt"):
+                loop_manager.validate_agent_scope("reviewer", repo, before, after)
+
+    def test_colon_in_ignore_rule_path_cannot_hide_untracked_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, _plan_path = self._repository_with_plan(directory)
+            rule_directory = repo / "rules:old"
+            rule_directory.mkdir()
+            rule = rule_directory / ".gitignore"
+            rule.write_text("*.cache\n", encoding="utf-8")
+            git_command(repo, "add", "rules:old/.gitignore")
+            commit_and_push(repo, "Add ignore rule with colon in path")
+            before = loop_manager.capture_git_snapshot(repo)
+            rule.write_text("*.cache\nhidden.txt\n", encoding="utf-8")
+            (rule_directory / "hidden.txt").write_text("new", encoding="utf-8")
+            after = loop_manager.capture_git_snapshot(repo)
+            self.assertIn("rules:old/hidden.txt", after.dirty)
+            with self.assertRaisesRegex(loop_manager.AgentScopeError, "hidden.txt"):
+                loop_manager.validate_agent_scope("reviewer", repo, before, after)
+
+    def test_repository_exclude_change_cannot_hide_new_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, _plan_path = self._repository_with_plan(directory)
+            before = loop_manager.capture_git_snapshot(repo)
+            exclude = Path(git_command(repo, "rev-parse", "--git-path", "info/exclude"))
+            if not exclude.is_absolute():
+                exclude = repo / exclude
+            exclude.write_text(
+                exclude.read_text(encoding="utf-8") + "\nhidden.txt\n",
+                encoding="utf-8",
+            )
+            (repo / "hidden.txt").write_text("new", encoding="utf-8")
+            after = loop_manager.capture_git_snapshot(repo)
+            self.assertNotIn("hidden.txt", after.dirty)
+            with self.assertRaisesRegex(loop_manager.AgentScopeError, "Git config"):
+                loop_manager.validate_agent_scope("reviewer", repo, before, after)
+
+    def test_planner_import_bytecode_is_ignored_without_hiding_scope_violations(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, _plan_path = self._repository_with_plan(directory)
             for module_name in (
@@ -6794,10 +6948,10 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 stderr=subprocess.PIPE,
                 text=True,
             )
-            self.assertFalse(any(repo.rglob("*.pyc")))
+            self.assertTrue(any(repo.rglob("*.pyc")))
 
             existing_cache = repo / "__pycache__" / "preserved.pyc"
-            existing_cache.parent.mkdir()
+            existing_cache.parent.mkdir(exist_ok=True)
             existing_cache.write_bytes(b"existing cache")
             before = loop_manager.capture_git_snapshot(repo)
             subprocess.run(
@@ -6822,9 +6976,11 @@ class AgentScopeValidatorTest(unittest.TestCase):
             explicit_cache = repo / "__pycache__" / "explicit.pyc"
             explicit_cache.write_bytes(b"explicit cache")
             explicit_after = loop_manager.capture_git_snapshot(repo)
-            with self.assertRaisesRegex(loop_manager.AgentScopeError, "explicit.pyc"):
+            loop_manager.validate_agent_scope("planner", repo, after, explicit_after)
+            (repo / "unexpected.txt").write_text("publishable\n", encoding="utf-8")
+            with self.assertRaisesRegex(loop_manager.AgentScopeError, "unexpected.txt"):
                 loop_manager.validate_agent_scope(
-                    "planner", repo, after, explicit_after
+                    "planner", repo, after, loop_manager.capture_git_snapshot(repo)
                 )
 
     def test_planner_new_plan_and_worker_selected_plan_are_allowed(self):
@@ -11117,6 +11273,236 @@ class MergeIndependentWorktreeCleanupTest(unittest.TestCase):
         connection.commit()
         return connection
 
+    def test_ignored_only_worktree_is_removed_after_safe_assessment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, worktree, _branch, head = self._managed_worktree(Path(directory))
+            exclude = Path(git_command(worktree, "rev-parse", "--git-path", "info/exclude"))
+            if not exclude.is_absolute():
+                exclude = worktree / exclude
+            exclude.write_text(
+                exclude.read_text(encoding="utf-8") + "\n*.cache\n",
+                encoding="utf-8",
+            )
+            (worktree / "verify.cache").write_text("artifact", encoding="utf-8")
+            assessment = loop_manager.assess_cleanup(worktree, head)
+            self.assertEqual(assessment.status, "safe")
+            self.assertEqual(
+                loop_manager.remove_cleanup_worktree(repo, worktree, assessment).status,
+                "safe",
+            )
+            self.assertFalse(worktree.exists())
+
+    def test_planning_cleanup_accepts_ignored_artifact_but_preserves_dirty_workspace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = make_remote_repository(directory)
+            planning = root / "planning"
+            git_command(repo, "worktree", "add", "--detach", str(planning), "origin/main")
+            exclude = Path(git_command(planning, "rev-parse", "--git-path", "info/exclude"))
+            if not exclude.is_absolute():
+                exclude = planning / exclude
+            exclude.write_text(
+                exclude.read_text(encoding="utf-8") + "\n*.cache\n",
+                encoding="utf-8",
+            )
+            (planning / "build.cache").write_text("artifact", encoding="utf-8")
+            port = loop_manager._PlanningGitPorts(sqlite3.connect(":memory:"), repo, root)
+            (planning / "unexpected.txt").write_text("publishable", encoding="utf-8")
+            with self.assertRaises(loop_manager.WorkspaceOwnershipError):
+                port.run(repo, "worktree", "remove", str(planning))
+            self.assertTrue(planning.exists())
+            (planning / "unexpected.txt").unlink()
+            port.run(repo, "worktree", "remove", str(planning))
+            self.assertFalse(planning.exists())
+
+    def test_rebase_keeps_ignored_file_that_overlaps_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            git_command(repo, "checkout", "-b", "target")
+            (repo / "collide.txt").write_text("tracked", encoding="utf-8")
+            git_command(repo, "add", "collide.txt")
+            git_command(repo, "commit", "-m", "Add target file")
+            git_command(repo, "checkout", "main")
+            exclude = Path(git_command(repo, "rev-parse", "--git-path", "info/exclude"))
+            if not exclude.is_absolute():
+                exclude = repo / exclude
+            exclude.write_text(
+                exclude.read_text(encoding="utf-8") + "\ncollide.txt\n",
+                encoding="utf-8",
+            )
+            (repo / "collide.txt").write_text("local ignored", encoding="utf-8")
+            head = git_command(repo, "rev-parse", "HEAD")
+            result = loop_manager.git(repo, "rebase", "target", check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("collide.txt", result.stdout)
+            self.assertEqual((repo / "collide.txt").read_text(encoding="utf-8"), "local ignored")
+            self.assertEqual(git_command(repo, "rev-parse", "HEAD"), head)
+
+    def test_rebase_resume_commands_preserve_ignored_next_commit_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            onto = git_command(repo, "rev-parse", "HEAD")
+            git_command(repo, "checkout", "-b", "feature")
+            (repo / "src/app.py").write_text("VALUE = 3\n", encoding="utf-8")
+            git_command(repo, "add", "src/app.py")
+            git_command(repo, "commit", "-m", "First feature commit")
+            (repo / "later.txt").write_text("tracked", encoding="utf-8")
+            git_command(repo, "add", "later.txt")
+            git_command(repo, "commit", "-m", "Next feature commit")
+            original_head = git_command(repo, "rev-parse", "HEAD")
+            git_command(repo, "checkout", "main")
+            exclude = Path(git_command(repo, "rev-parse", "--git-path", "info/exclude"))
+            if not exclude.is_absolute():
+                exclude = repo / exclude
+            exclude.write_text(
+                exclude.read_text(encoding="utf-8") + "\nlater.txt\n",
+                encoding="utf-8",
+            )
+            ignored = repo / "later.txt"
+            ignored.write_text("local ignored", encoding="utf-8")
+            rebase_dir = Path(
+                git_command(repo, "rev-parse", "--git-path", "rebase-merge")
+            )
+            if not rebase_dir.is_absolute():
+                rebase_dir = repo / rebase_dir
+            rebase_dir.mkdir()
+            (rebase_dir / "orig-head").write_text(original_head, encoding="ascii")
+            (rebase_dir / "onto").write_text(onto, encoding="ascii")
+            (rebase_dir / "git-rebase-todo").write_text(
+                f"pick {original_head} Next feature commit\n", encoding="utf-8"
+            )
+            for arguments in (
+                ("-c", "core.editor=true", "rebase", "--continue"),
+                ("rebase", "--skip"),
+                ("rebase", "--abort"),
+            ):
+                with self.subTest(arguments=arguments), mock.patch(
+                    "loop_manager.command",
+                    side_effect=AssertionError("Git write started"),
+                ):
+                    result = loop_manager.git(repo, *arguments, check=False)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("later.txt", result.stdout)
+                    self.assertEqual(ignored.read_text(encoding="utf-8"), "local ignored")
+            ignored.unlink()
+            exclude.write_text(
+                exclude.read_text(encoding="utf-8") + "\n*.cache\n",
+                encoding="utf-8",
+            )
+            (repo / "unrelated.cache").write_text("keep", encoding="utf-8")
+            with mock.patch(
+                "loop_manager.command",
+                return_value=subprocess.CompletedProcess([], 0, "continued"),
+            ) as command_call:
+                allowed = loop_manager.git(
+                    repo, "-c", "core.editor=true", "rebase", "--continue",
+                    check=False,
+                )
+            self.assertEqual(allowed.returncode, 0)
+            command_call.assert_called_once()
+
+    def test_rebase_resume_ignores_paths_from_already_replayed_commits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            onto = git_command(repo, "rev-parse", "HEAD")
+            git_command(repo, "checkout", "-b", "feature")
+            (repo / "old.txt").write_text("tracked", encoding="utf-8")
+            git_command(repo, "add", "old.txt")
+            git_command(repo, "commit", "-m", "Add old path")
+            first_commit = git_command(repo, "rev-parse", "HEAD")
+            (repo / "old.txt").unlink()
+            git_command(repo, "add", "-u")
+            git_command(repo, "commit", "-m", "Remove old path")
+            second_commit = git_command(repo, "rev-parse", "HEAD")
+            (repo / "src/app.py").write_text("VALUE = 3\n", encoding="utf-8")
+            git_command(repo, "add", "src/app.py")
+            git_command(repo, "commit", "-m", "Change app")
+            original_head = git_command(repo, "rev-parse", "HEAD")
+            git_command(repo, "checkout", "main")
+            exclude = Path(git_command(repo, "rev-parse", "--git-path", "info/exclude"))
+            if not exclude.is_absolute():
+                exclude = repo / exclude
+            exclude.write_text(
+                exclude.read_text(encoding="utf-8") + "\nold.txt\n",
+                encoding="utf-8",
+            )
+            ignored = repo / "old.txt"
+            ignored.write_text("local ignored", encoding="utf-8")
+            rebase_dir = Path(git_command(repo, "rev-parse", "--git-path", "rebase-merge"))
+            if not rebase_dir.is_absolute():
+                rebase_dir = repo / rebase_dir
+            rebase_dir.mkdir()
+            (rebase_dir / "orig-head").write_text(original_head, encoding="ascii")
+            (rebase_dir / "onto").write_text(onto, encoding="ascii")
+            (rebase_dir / "done").write_text(
+                f"pick {first_commit} Add old path\npick {second_commit} Remove old path\n",
+                encoding="utf-8",
+            )
+            (rebase_dir / "git-rebase-todo").write_text(
+                f"pick {original_head} Change app\n", encoding="utf-8"
+            )
+            for arguments in (("rebase", "--continue"), ("rebase", "--skip")):
+                with self.subTest(arguments=arguments), mock.patch(
+                    "loop_manager.command",
+                    return_value=subprocess.CompletedProcess([], 0, "resumed"),
+                ) as command_call:
+                    result = loop_manager.git(repo, *arguments, check=False)
+                    self.assertEqual(result.returncode, 0)
+                    command_call.assert_called_once()
+                    self.assertEqual(ignored.read_text(encoding="utf-8"), "local ignored")
+
+    def test_apply_rebase_resume_checks_only_remaining_patch_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            onto = git_command(repo, "rev-parse", "HEAD")
+            git_command(repo, "checkout", "-b", "feature")
+            for filename in ("old.txt", "later.txt"):
+                (repo / filename).write_text("tracked", encoding="utf-8")
+                git_command(repo, "add", filename)
+                git_command(repo, "commit", "-m", f"Add {filename}")
+            original_head = git_command(repo, "rev-parse", "HEAD")
+            git_command(repo, "checkout", "main")
+            exclude = Path(git_command(repo, "rev-parse", "--git-path", "info/exclude"))
+            if not exclude.is_absolute():
+                exclude = repo / exclude
+            exclude.write_text(
+                exclude.read_text(encoding="utf-8") + "\nold.txt\nlater.txt\n",
+                encoding="utf-8",
+            )
+            (repo / "old.txt").write_text("old ignored", encoding="utf-8")
+            (repo / "later.txt").write_text("later ignored", encoding="utf-8")
+            rebase_dir = Path(git_command(repo, "rev-parse", "--git-path", "rebase-apply"))
+            if not rebase_dir.is_absolute():
+                rebase_dir = repo / rebase_dir
+            rebase_dir.mkdir()
+            for name, value in (
+                ("orig-head", original_head), ("onto", onto),
+                ("next", "2"), ("last", "2"),
+            ):
+                (rebase_dir / name).write_text(value, encoding="ascii")
+            with mock.patch(
+                "loop_manager.command",
+                side_effect=AssertionError("Git write started"),
+            ):
+                blocked = loop_manager.git(repo, "rebase", "--continue", check=False)
+            self.assertIn("later.txt", blocked.stdout)
+            with mock.patch(
+                "loop_manager.command",
+                return_value=subprocess.CompletedProcess([], 0, "skipped"),
+            ) as command_call:
+                skipped = loop_manager.git(repo, "rebase", "--skip", check=False)
+            self.assertEqual(skipped.returncode, 0)
+            command_call.assert_called_once()
+            (repo / "later.txt").unlink()
+            with mock.patch(
+                "loop_manager.command",
+                return_value=subprocess.CompletedProcess([], 0, "resumed"),
+            ) as command_call:
+                allowed = loop_manager.git(repo, "rebase", "--continue", check=False)
+            self.assertEqual(allowed.returncode, 0)
+            command_call.assert_called_once()
+            self.assertEqual((repo / "old.txt").read_text(encoding="utf-8"), "old ignored")
+
     def test_merge_modes_do_not_use_base_ancestry_for_cleanup(self):
         for mode in ("merge", "squash", "rebase"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
@@ -12826,7 +13212,7 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
         cache.parent.mkdir()
         cache.write_bytes(b"ignored verify artifact")
         self.assertEqual(git_command(worktree, "status", "--porcelain"), "")
-        self.assertIn(
+        self.assertNotIn(
             cache.relative_to(worktree).as_posix(),
             loop_manager.capture_git_snapshot(worktree).dirty,
         )
@@ -15065,7 +15451,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
         self.assertIn("--disallowedTools", resume_arguments)
         self.assertEqual(resume_options["cwd"], worktree)
 
-    def test_claude_planner_processes_force_bytecode_isolation(self):
+    def test_claude_planner_processes_do_not_force_bytecode_isolation(self):
         config = loop_manager.ROOT / "config/config.ini.example"
         session_id = "claude-planner-session"
         stream = (
@@ -15113,12 +15499,8 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
 
         self.assertEqual(started.session_id, session_id)
         self.assertEqual(resumed.session_id, session_id)
-        self.assertEqual(
-            popen.call_args.kwargs["env"]["PYTHONDONTWRITEBYTECODE"], "1"
-        )
-        self.assertEqual(
-            run.call_args.kwargs["env"]["PYTHONDONTWRITEBYTECODE"], "1"
-        )
+        self.assertNotIn("PYTHONDONTWRITEBYTECODE", popen.call_args.kwargs["env"])
+        self.assertNotIn("PYTHONDONTWRITEBYTECODE", run.call_args.kwargs["env"])
 
     def test_session_fallback_and_provider_errors_use_common_contract(self):
         sessions: list[tuple[str | None, bool]] = []
