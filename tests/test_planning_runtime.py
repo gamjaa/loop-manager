@@ -1,5 +1,6 @@
 from contextlib import nullcontext
 from dataclasses import replace
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import sqlite3
@@ -448,6 +449,40 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         self.assertEqual(outcome.kind, PlanningOutcomeKind.VALIDATION_RETRY)
         self.assertEqual(ports.state.snapshot.planning_retry_count, 2)
         self.assertIn("전수 평가 결과", ports.state.snapshot.planning_validation_error)
+
+    def test_malformed_full_assessment_finding_uses_bounded_planner_retry(self):
+        revision = "a" * 40
+        report = {
+            "source_revision": revision,
+            "coverage": {key: "Reviewed responsibility boundaries."
+                         for key in ("code", "tests", "documents")},
+            "findings": [{"id": "agent-scope", "kind": ["code"],
+                          "path": "module.py", "source_hash": "b" * 64,
+                          "evidence": "G-051 already separated Agent scope responsibilities.",
+                          "status": "resolved", "plan_ids": []}],
+        }
+        result = ('MAINTENANCE_RESULT: {"outcome":"no_change"}\n'
+                  'FULL_ASSESSMENT_RESULT: ' + json.dumps(report))
+        cycle = maintenance_cycle(
+            phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+            cycle_base_sha=revision, revision=1)
+        ports = FakePorts(planning_snapshot(
+            phase="PLANNING", active_sha=revision, planning_result=result,
+            planning_result_pending_validation=True,
+            planning_validation_error="earlier invalid evidence",
+            planning_retry_count=1,
+        ), cycle)
+        ports.validation.validate_maintenance_result = mock.Mock(return_value=None)
+        coordinator = PlanningLifecycleCoordinator(ports)
+        run = coordinator._new_run(replace(self.context, self_repository=True))
+        run.planning_worktree = Path("/planning")
+        run.maintenance_context = object()
+        with mock.patch("planning_runtime.full_assessment.source_inventory",
+                        return_value={"module.py": "b" * 64}):
+            outcome = coordinator._validate_planner_result(run)
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.VALIDATION_RETRY)
+        self.assertEqual(ports.state.snapshot.planning_retry_count, 2)
+        self.assertIn("발견 항목", ports.state.snapshot.planning_validation_error)
 
     def test_validation_retry_resumes_session_and_persists_retry_transition(self):
         ports = FakePorts(

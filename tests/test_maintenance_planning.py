@@ -88,6 +88,32 @@ priority: {priority}
 
 
 class FullAssessmentEvidenceTest(unittest.TestCase):
+    def test_malformed_finding_types_raise_validation_error(self):
+        revision = "a" * 40
+        inventory = {"module.py": "b" * 64}
+        finding = {
+            "id": "agent-scope", "kind": "code", "path": "module.py",
+            "evidence": "G-051 already separated Agent scope responsibilities.",
+            "status": "resolved", "plan_ids": [], "source_hash": "b" * 64,
+        }
+        report = {
+            "source_revision": revision,
+            "coverage": {key: "Reviewed responsibility boundaries."
+                         for key in ("code", "tests", "documents")},
+            "findings": [finding],
+        }
+        for key, value in (("kind", ["code"]), ("status", ["resolved"]),
+                           ("plan_ids", [["G-051"]]),
+                           ("plan_ids", ["G-051", ["G-051"]])):
+            with self.subTest(key=key, value=value):
+                malformed = dict(finding, **{key: value})
+                report["findings"] = [malformed]
+                with self.assertRaises(full_assessment.FullAssessmentError):
+                    full_assessment.parse_assessment_result(
+                        full_assessment.RESULT_PREFIX + json.dumps(report),
+                        inventory, revision, (), set(),
+                    )
+
     def test_inventory_and_findings_bind_source_identity_and_plan_links(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

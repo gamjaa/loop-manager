@@ -122,12 +122,15 @@ def parse_assessment_result(
             finding[key] for key in ("id", "kind", "path", "evidence", "status", "plan_ids", "source_hash")
         )
         if (not isinstance(identifier, str) or not re.fullmatch(r"[a-z0-9-]{3,64}", identifier)
-            or identifier in seen or kind not in {"code", "document"}
+            or identifier in seen
+            or not isinstance(kind, str) or kind not in {"code", "document"}
             or not isinstance(path, str) or path not in inventory
             or source_hash != inventory[path]
             or not isinstance(evidence, str) or len(evidence.strip()) < 20
-            or not isinstance(plan_ids, list) or len(plan_ids) != len(set(plan_ids))
-            or any(not isinstance(item, str) or _PLAN_ID.fullmatch(item) is None for item in plan_ids)):
+            or not isinstance(status, str)
+            or not isinstance(plan_ids, list)
+            or any(not isinstance(item, str) or _PLAN_ID.fullmatch(item) is None for item in plan_ids)
+            or len(plan_ids) != len(set(plan_ids))):
             raise FullAssessmentError("발견 항목의 근거·경로·원본 지문이 유효하지 않습니다.")
         seen.add(identifier)
         if kind == "document":
