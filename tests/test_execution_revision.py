@@ -45,14 +45,14 @@ def complete_artifacts(current, base="base"):
 
 
 class ExecutionRevisionTests(unittest.TestCase):
-    def test_remote_failure_correction_requires_path_in_stored_failure(self):
+    def test_remote_reassessment_separates_execution_inputs_and_documents(self):
         changed = ("README.md", "src/unrelated.py", "src/code.py")
         evidence = "verify failed at /work/src/code.py:12"
         self.assertEqual(
             remote_failure_correction_paths(
                 "verify_retry_exhausted", changed, evidence,
             ),
-            ("src/code.py",),
+            ("src/unrelated.py", "src/code.py"),
         )
         self.assertEqual(
             remote_failure_correction_paths(
@@ -68,7 +68,7 @@ class ExecutionRevisionTests(unittest.TestCase):
         )
         self.assertEqual(
             remote_failure_correction_paths(
-                "verify_retry_exhausted", ("code.py",), "othercode.py failed",
+                "verify_retry_exhausted", ("code.md",), "othercode.md failed",
             ),
             (),
         )
@@ -85,16 +85,15 @@ class ExecutionRevisionTests(unittest.TestCase):
             (),
         )
 
-    def test_checkpoint_changes_trigger_reassessment_without_diagnostic_path(self):
+    def test_execution_inputs_trigger_reassessment_without_diagnostic_path(self):
         for reason in ("verify_retry_exhausted", "review_retry_exhausted"):
             for evidence in ("", "AssertionError: 1 != 2", "tests/test_code.py:12"):
                 with self.subTest(reason=reason, evidence=evidence):
                     self.assertEqual(remote_failure_correction_paths(
-                        reason, ("README.md", "src/code.py"), evidence,
-                        ("src/code.py",),
-                    ), ("src/code.py",))
+                        reason, ("README.md", "src/code.py", "tests/new_test.py", "config.json", "Makefile"), evidence,
+                    ), ("src/code.py", "tests/new_test.py", "config.json", "Makefile"))
         self.assertEqual(remote_failure_correction_paths(
-            "worker_output_invalid", ("src/code.py",), "", ("src/code.py",),
+            "worker_output_invalid", ("src/code.py",), "",
         ), ())
 
     def test_body_hash_excludes_frontmatter_metadata(self):

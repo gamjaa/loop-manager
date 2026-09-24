@@ -7,6 +7,7 @@ from enum import Enum
 import hashlib
 import json
 import re
+from pathlib import PurePosixPath
 from typing import Iterable
 
 
@@ -52,24 +53,30 @@ def remote_failure_correction_paths(
     reason_code: str,
     changed_paths: Iterable[str],
     failure_evidence: str,
-    checkpoint_paths: Iterable[str] = (),
 ) -> tuple[str, ...]:
-    """Select candidates for reassessment, without claiming the cause is fixed.
+    """Select unverified inputs for Worker reassessment of exhausted validation.
 
-    Diagnostics often name only a test, or no path at all. Changes to files
-    in the blocked implementation also warrant fresh Worker assessment.
+    A diagnostic path is not a dependency graph: an implementation, fixture or
+    build input absent from both the traceback and checkpoint can fix the cause.
+    Only clearly documentary changes need an explicit diagnostic connection.
+    Scope, ownership and reason-specific approval gates are enforced by callers.
     """
     if reason_code not in _REMOTE_FAILURE_REASONS:
         return ()
     evidence = failure_evidence.replace("\\", "/")
-    checkpoint_files = frozenset(checkpoint_paths)
-    return tuple(
-        path for path in changed_paths
-        if path in checkpoint_files or re.search(
-            rf"(?<![\w.-]){re.escape(path)}(?![\w./-])",
-            evidence,
+    candidates = []
+    for path in changed_paths:
+        file = PurePosixPath(path)
+        documentary = (
+            path.startswith("docs/")
+            or file.suffix.lower() in {".md", ".rst"}
+            or file.name.lower() in {"readme", "license", "copying", "changelog"}
         )
-    )
+        if not documentary or re.search(
+            rf"(?<![\w.-]){re.escape(path)}(?![\w./-])", evidence,
+        ):
+            candidates.append(path)
+    return tuple(candidates)
 
 
 def _digest(label: str, values: Iterable[object]) -> str:

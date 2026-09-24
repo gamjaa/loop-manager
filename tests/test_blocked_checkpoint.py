@@ -276,6 +276,7 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
         self.run_git(self.repo, "config", "user.name", "Test")
         self.run_git(self.repo, "config", "user.email", "test@example.com")
         (self.repo / "code.py").write_text("before\n", encoding="utf-8")
+        (self.repo / "dependency.py").write_text("dependency = False\n", encoding="utf-8")
         plan_path = self.repo / "docs/plans/[G-034] Checkpoint.md"
         plan_path.parent.mkdir(parents=True)
         plan_path.write_text(
@@ -629,14 +630,9 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
         ))
         self.assertEqual(self.run_git(self.worktree, "rev-parse", "HEAD"), next_oid)
 
-    def test_unrelated_readme_and_code_commits_keep_failure_blocked(self):
-        self.publish_block()
+    def test_readme_stays_blocked_but_new_execution_input_is_reassessed(self):
+        self.publish_block(evidence='File "tests/test_code.py", line 12\nAssertionError: 1 != 2')
         readme_oid = self.user_commit("README.md", "unrelated notes\n")
-        self.assertFalse(loop_manager.resume_plan_blocks(
-            self.connection, self.repo, self.state_dir,
-            str(self.repo.resolve()), "main",
-        ))
-        unrelated_oid = self.user_commit("unrelated.py", "unrelated = True\n")
         self.assertFalse(loop_manager.resume_plan_blocks(
             self.connection, self.repo, self.state_dir,
             str(self.repo.resolve()), "main",
@@ -644,18 +640,19 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
         self.assertEqual(self.connection.execute(
             "SELECT status FROM exec_plans WHERE plan_id = 'G-034'"
         ).fetchone()[0], "PLAN_BLOCKED")
-        self.assertEqual(self.connection.execute(
-            "SELECT accepted_remote_oid FROM blocked_checkpoints"
-        ).fetchone()[0], unrelated_oid)
-        self.assertNotEqual(readme_oid, unrelated_oid)
-
-        correction_oid = self.user_commit("code.py", "corrected failure\n")
+        corrected = self.user_commit("dependency.py", "corrected_dependency = True\n")
         self.assertTrue(loop_manager.resume_plan_blocks(
             self.connection, self.repo, self.state_dir,
             str(self.repo.resolve()), "main",
         ))
-        self.assertEqual(self.run_git(self.worktree, "rev-parse", "HEAD"),
-                         correction_oid)
+        row = self.connection.execute(
+            "SELECT status, worker_result, verify_result, review_result "
+            "FROM exec_plans WHERE plan_id = 'G-034'"
+        ).fetchone()
+        self.assertEqual(tuple(row), ("IMPLEMENTING", None, None, None))
+        self.assertEqual(self.run_git(self.worktree, "rev-parse", "HEAD"), corrected)
+        self.assertEqual(self.run_git(self.repo, "rev-parse", "main"), self.base_oid)
+        self.assertNotEqual(readme_oid, corrected)
 
     def test_review_result_path_controls_remote_release(self):
         self.publish_block(
@@ -820,23 +817,15 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
         ).fetchone()[0])
 
         (self.worktree / "cache.txt").unlink()
-        self.assertFalse(loop_manager.resume_plan_blocks(
-            self.connection, self.repo, self.state_dir,
-            str(self.repo.resolve()), "main",
-        ))
-        self.assertEqual(self.run_git(self.worktree, "rev-parse", "HEAD"),
-                         cache_oid)
-        self.assertEqual(self.connection.execute(
-            "SELECT status FROM exec_plans WHERE plan_id = 'G-034'"
-        ).fetchone()[0], "PLAN_BLOCKED")
-
-        corrected = self.user_commit("code.py", "corrected verify failure\n")
         self.assertTrue(loop_manager.resume_plan_blocks(
             self.connection, self.repo, self.state_dir,
             str(self.repo.resolve()), "main",
         ))
-        self.assertEqual(self.run_git(self.worktree, "rev-parse", "HEAD"),
-                         corrected)
+        self.assertEqual(self.run_git(self.worktree, "rev-parse", "HEAD"), cache_oid)
+        self.assertEqual((self.worktree / "cache.txt").read_text(), "remote cache\n")
+        self.assertEqual(self.connection.execute(
+            "SELECT status FROM exec_plans WHERE plan_id = 'G-034'"
+        ).fetchone()[0], "IMPLEMENTING")
 
     def test_unrelated_ignored_file_survives_remote_fast_forward(self):
         self.publish_block()
