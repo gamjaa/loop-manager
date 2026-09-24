@@ -207,6 +207,7 @@ class ScopedBlockingTest(unittest.TestCase):
             BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT,
             BlockReasonCode.REVIEW_RETRY_EXHAUSTED,
             BlockReasonCode.REVIEW_PROTOCOL_EXHAUSTED,
+            BlockReasonCode.REVIEW_SPECIFICATION_DEADLOCK,
             BlockReasonCode.GUIDANCE_APPROVAL_REQUIRED,
             BlockReasonCode.USER_DECISION_REQUIRED,
             BlockReasonCode.PULL_REQUEST_CLOSED,

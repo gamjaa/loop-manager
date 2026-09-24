@@ -22,6 +22,7 @@ class BlockReasonCode(str, Enum):
     VERIFY_TIMEOUT_LIMIT_INSUFFICIENT = "verify_timeout_limit_insufficient"
     REVIEW_RETRY_EXHAUSTED = "review_retry_exhausted"
     REVIEW_PROTOCOL_EXHAUSTED = "review_protocol_exhausted"
+    REVIEW_SPECIFICATION_DEADLOCK = "review_specification_deadlock"
     GUIDANCE_APPROVAL_REQUIRED = "guidance_approval_required"
     USER_DECISION_REQUIRED = "user_decision_required"
     PULL_REQUEST_CLOSED = "pull_request_closed"
@@ -48,6 +49,7 @@ _PLAN_REASONS = frozenset(
         BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT,
         BlockReasonCode.REVIEW_RETRY_EXHAUSTED,
         BlockReasonCode.REVIEW_PROTOCOL_EXHAUSTED,
+        BlockReasonCode.REVIEW_SPECIFICATION_DEADLOCK,
         BlockReasonCode.GUIDANCE_APPROVAL_REQUIRED,
         BlockReasonCode.USER_DECISION_REQUIRED,
         BlockReasonCode.PULL_REQUEST_CLOSED,

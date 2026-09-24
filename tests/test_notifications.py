@@ -60,6 +60,38 @@ class NotificationFixture:
 
 
 class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
+    def test_specification_deadlock_notification_names_documents_and_question(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        evidence = {
+            "kind": "missing",
+            "locations": [{"path": "docs/PRODUCT.md", "section": "Review policy"}],
+            "problem": "No retention criterion is specified",
+            "implementation_choice": "Whether to retain review history",
+            "question": "How long should review history be retained?",
+        }
+        output = f"SPEC_DEADLOCK: {json.dumps(evidence)}\nVERDICT: SPEC_BLOCKED"
+        with connection:
+            scoped_blocking.record_plan_block(
+                connection, repo, "G-018",
+                scoped_blocking.BlockReasonCode.REVIEW_SPECIFICATION_DEADLOCK,
+                output, "input-fingerprint",
+            )
+            checkpoint = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
+            checkpoint.finish_unpublished(
+                checkpoint.get(repo, "G-018"), "local only", retryable=False,
+            )
+            notifications.enqueue_current_project_events(connection, repo)
+            notifications.enqueue_current_project_events(connection, repo)
+        events = self.events(connection)
+        self.assertEqual(len(events), 1)
+        payload = json.loads(events[0]["payload"])
+        self.assertEqual(payload["paths"], ["docs/PRODUCT.md"])
+        self.assertEqual(payload["specification_deadlock"], evidence)
+        message = notifications._message("blocked", payload)
+        self.assertIn("docs/PRODUCT.md", message)
+        self.assertIn(evidence["question"], message)
+
     def test_guidance_block_reports_exact_decision_lines_and_recovery_attempts(self):
         connection = self.connection()
         repo = "/projects/alpha"

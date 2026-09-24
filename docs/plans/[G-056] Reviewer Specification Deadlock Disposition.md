@@ -35,8 +35,8 @@ priority: normal
 
 ## Progress
 
-- [ ] 구조화된 Reviewer 명세 교착 판정 추가
-- [ ] 계획 단위 차단·재개 targeted test 추가
+- [x] 구조화된 Reviewer 명세 교착 판정 추가
+- [x] 계획 단위 차단·재개 targeted test 추가
 
 ## Decision Log
 

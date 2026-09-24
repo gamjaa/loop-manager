@@ -4530,6 +4530,124 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             ),
         )
 
+    def test_reviewer_specification_deadlock_requires_structured_evidence(self):
+        import json
+
+        evidence = {
+            "kind": "conflict",
+            "locations": [
+                {"path": "docs/PRODUCT.md", "section": "Review policy"},
+                {"path": "docs/requirements/[R-025] Review.md", "section": "Acceptance Criteria"},
+            ],
+            "problem": "The two retention rules conflict",
+            "implementation_choice": "Whether to retain review history",
+            "question": "Which retention rule should apply?",
+        }
+        response = f"SPEC_DEADLOCK: {json.dumps(evidence)}\nVERDICT: SPEC_BLOCKED"
+        verdict, details = loop_manager.parse_reviewer_result(response)
+        self.assertEqual(verdict, "SPEC_BLOCKED")
+        self.assertEqual(details.paths, (
+            "docs/PRODUCT.md", "docs/requirements/[R-025] Review.md",
+        ))
+        self.assertEqual(details.question, evidence["question"])
+        missing = {
+            **evidence,
+            "kind": "missing",
+            "locations": evidence["locations"][:1],
+        }
+        missing_verdict, missing_details = loop_manager.parse_reviewer_result(
+            f"SPEC_DEADLOCK: {json.dumps(missing)}\nVERDICT: SPEC_BLOCKED"
+        )
+        self.assertEqual(missing_verdict, "SPEC_BLOCKED")
+        self.assertEqual(missing_details.paths, ("docs/PRODUCT.md",))
+        for invalid in (
+            {**evidence, "locations": evidence["locations"][:1]},
+            {**evidence, "question": ""},
+            {**evidence, "locations": [
+                {"path": "docs/../PRODUCT.md", "section": "Review policy"},
+                evidence["locations"][1],
+            ]},
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(
+                loop_manager.ReviewerProtocolError
+            ):
+                loop_manager.parse_reviewer_result(
+                    f"SPEC_DEADLOCK: {json.dumps(invalid)}\nVERDICT: SPEC_BLOCKED"
+                )
+        with self.assertRaises(loop_manager.ReviewerProtocolError):
+            loop_manager.parse_reviewer_result(
+                f"SPEC_DEADLOCK: {json.dumps(evidence)}\nVERDICT: FAIL"
+            )
+
+    def test_review_specification_block_requeues_only_after_input_change(self):
+        from tests.test_runtime_state import RuntimeStateRepositoryTest
+
+        connection = RuntimeStateRepositoryTest()._connection()
+        self.addCleanup(connection.close)
+        connection.execute(
+            "UPDATE exec_plans SET status = 'PLAN_BLOCKED', "
+            "blocked_reason = 'review_specification_deadlock', "
+            "blocked_fingerprint = 'old-input', worktree = '/state/G-047', "
+            "workspace_owned = 0 WHERE repo = 'repo' AND plan_id = 'G-047'"
+        )
+        connection.commit()
+        with (
+            mock.patch.object(loop_manager, '_revision_execplan_input_fingerprint',
+                              return_value='old-input') as inputs,
+            mock.patch.object(loop_manager, '_revision_review_issue_fingerprint',
+                              return_value=None),
+            mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
+            mock.patch.object(loop_manager, 'git', return_value=mock.Mock(returncode=1)),
+            mock.patch.object(loop_manager, '_blocked_execplan_revision_metadata_error',
+                              return_value=None),
+            mock.patch.object(loop_manager, '_requeue_blocked_execplan') as requeue,
+        ):
+            self.assertFalse(loop_manager.resume_blocked_execplan_if_inputs_changed(
+                connection, Path('/repo'), 'repo', 'main', Path('/state'),
+            ))
+            requeue.assert_not_called()
+            inputs.return_value = 'changed-source'
+            self.assertTrue(loop_manager.resume_blocked_execplan_if_inputs_changed(
+                connection, Path('/repo'), 'repo', 'main', Path('/state'),
+            ))
+            requeue.assert_called_once_with(connection, 'repo', 'G-047')
+
+    def test_review_specification_block_uses_source_revision_not_worker_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, connection = self._failure_state(directory)
+            self.addCleanup(connection.close)
+            connection.execute(
+                "UPDATE exec_plans SET status = 'REVIEWING', active_sha = 'base' "
+                "WHERE repo = ? AND plan_id = 'G-013'", (str(root),)
+            )
+            connection.execute(
+                "UPDATE projects SET phase = 'REVIEWING', "
+                "agent_input_fingerprint = 'worktree-progress' WHERE repo = ?",
+                (str(root),),
+            )
+            connection.commit()
+            snapshot = mock.Mock()
+            snapshot.serialize.return_value = 'saved-snapshot'
+            with (
+                mock.patch.object(loop_manager, '_worktree_execplan_input_fingerprint',
+                                  return_value='worktree-progress'),
+                mock.patch.object(loop_manager, '_revision_execplan_input_fingerprint',
+                                  return_value='source-base') as source_input,
+                mock.patch.object(loop_manager, 'capture_git_snapshot',
+                                  return_value=snapshot),
+                mock.patch.object(loop_manager, '_final_block_recovery_decision',
+                                  return_value=mock.Mock()),
+                mock.patch.object(loop_manager.runtime_state.RuntimeStateRepository,
+                                  'block_plan') as block_plan,
+            ):
+                loop_manager.block_active_execplan(
+                    connection, str(root), root, 'Specification missing', 'verify passed',
+                    reason=loop_manager.BlockReasonCode.REVIEW_SPECIFICATION_DEADLOCK,
+                )
+            self.assertEqual(source_input.call_args.args[1], 'base')
+            self.assertEqual(block_plan.call_args.kwargs['release_fingerprint'],
+                             'source-base')
+
     def test_review_issue_id_rejects_unsafe_repo_relative_paths(self):
         invalid_paths = (
             "/docs/plans/plan.md",
@@ -7008,6 +7126,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "recovery_dispatcher.py",
                 "recovery_runtime.py",
                 "recovery_state.py",
+                "reviewer_specification.py",
                 "requirement_archive.py",
                 "requirement_archive_recovery.py",
                 "requirement_archive_state.py",
