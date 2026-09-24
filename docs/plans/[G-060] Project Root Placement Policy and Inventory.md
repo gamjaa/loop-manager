@@ -18,6 +18,10 @@ depends_on:
   - G-064
   - G-065
   - G-066
+  - G-067
+  - G-069
+  - G-071
+  - G-072
 complexity: medium
 risk: medium
 priority: normal
@@ -36,7 +40,7 @@ priority: normal
 
 ## Implementation
 
-- G-059의 전수 inventory를 최신 루트 파일 집합과 대조해 파일별 참조, 소유권과 이동 목적지를 기록한다. G-051과 G-064~G-066에서 추가된 루트 모듈이 있으면 import·검증 참조에 포함하고, `ROOT` 기반 resource lookup과 launcher가 요구하는 고정 파일을 식별한다.
+- G-059의 전수 inventory를 최신 루트 파일 집합과 대조해 파일별 참조, 소유권과 이동 목적지를 기록한다. G-051과 G-064~G-072에서 추가된 루트 모듈이 있으면 import·검증 참조에 포함하고, `ROOT` 기반 resource lookup과 launcher가 요구하는 고정 파일을 식별한다.
 - 필수 폴더·파일과 신규 루트 항목 판정 기준을 공통 provider-neutral prompt에 반영한다. 실제 내부 모듈 이동은 G-063에서 수행한다.
 - 기존 등록 프로젝트에도 적용되는 provider-neutral prompt에 필수 루트 경로와 안전한 파일 배치 기준을 반영한다.
 
