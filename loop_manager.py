@@ -5391,6 +5391,99 @@ def compact_execplan_catalog(connection: sqlite3.Connection, repo: str) -> str:
     return json.dumps(catalog, ensure_ascii=False, indent=2)
 
 
+def prerequisite_validation_rows(
+    connection: sqlite3.Connection, repo: str
+) -> list[sqlite3.Row]:
+    """Load active plans and only their verified, merged dependency closure."""
+
+    _ensure_execplans_schema(connection)
+    active = connection.execute(
+        "SELECT * FROM exec_plans WHERE repo = ? AND status != 'MERGED' "
+        "AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h "
+        "WHERE h.repo = exec_plans.repo AND h.plan_id = exec_plans.plan_id "
+        "AND h.currently_archived = 1)",
+        (repo,),
+    ).fetchall()
+    included = {str(row["plan_id"]): row for row in active}
+    pending = list(active)
+    while pending:
+        plan = pending.pop()
+        plan_id = str(plan["plan_id"])
+        try:
+            dependencies = json.loads(str(plan["depends_on"]))
+        except json.JSONDecodeError as error:
+            raise MaintenanceOrchestrationError(
+                f"선행 후보 dependency를 읽을 수 없습니다: {plan_id}"
+            ) from error
+        if not isinstance(dependencies, list) or any(
+            not isinstance(dependency, str) for dependency in dependencies
+        ):
+            raise MaintenanceOrchestrationError(
+                f"선행 후보 dependency 형식이 유효하지 않습니다: {plan_id}"
+            )
+        for dependency in dependencies:
+            if dependency in included:
+                continue
+            row = connection.execute(
+                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+                (repo, dependency),
+            ).fetchone()
+            if row is None:
+                raise MaintenanceOrchestrationError(
+                    f"선행 후보의 dependency가 catalog에 없습니다: {plan_id} -> {dependency}"
+                )
+            history = connection.execute(
+                "SELECT * FROM execplan_catalog_history "
+                "WHERE repo = ? AND plan_id = ? AND currently_archived = 1",
+                (repo, dependency),
+            ).fetchone()
+            if history is None and str(row["path"]).startswith(
+                "docs/plans/archive/"
+            ):
+                raise MaintenanceOrchestrationError(
+                    f"archived dependency 검증 실패: {plan_id} -> {dependency}: "
+                    "archive identity와 Merge 증명이 없습니다"
+                )
+            if history is not None:
+                identity_ok = (
+                    bool(history["identity_verified"])
+                    and re.fullmatch(
+                        rf"docs/plans/\[{re.escape(dependency)}\] [^/]+\.md",
+                        str(history["original_path"]),
+                    ) is not None
+                    and re.fullmatch(
+                        rf"docs/plans/archive/\[{re.escape(dependency)}\] [^/]+\.md",
+                        str(history["observed_path"]),
+                    ) is not None
+                    and bool(history["original_content_hash"])
+                    and bool(history["final_content_hash"])
+                    and bool(history["plan_sha"])
+                    and row["path"] == history["observed_path"]
+                    and row["content_hash"] == history["final_content_hash"]
+                )
+                proof_ok = (
+                    bool(history["merge_confirmed"])
+                    and history["proof_kind"] in {
+                        kind.value for kind in execplan_catalog_state.MergeProofKind
+                        if kind is not execplan_catalog_state.MergeProofKind.NONE
+                    }
+                    and bool(history["proof_revision"])
+                    and not history["diagnostic_code"]
+                )
+                if row["status"] != "MERGED" or not identity_ok or not proof_ok:
+                    reason = (
+                        "SQLite 상태가 MERGED가 아닙니다" if row["status"] != "MERGED"
+                        else "archive identity가 확인되지 않았습니다" if not identity_ok
+                        else "Merge 증명이 확인되지 않았습니다"
+                    )
+                    raise MaintenanceOrchestrationError(
+                        f"archived dependency 검증 실패: {plan_id} -> {dependency}: {reason}"
+                    )
+            included[dependency] = row
+            pending.append(row)
+    return list(included.values())
+
+
 def catalog_schedule_decision(
     connection: sqlite3.Connection,
     repo: str,
@@ -16151,14 +16244,7 @@ class _PlanningStatePorts:
         return compact_execplan_catalog(self._connection, repo)
 
     def execplan_rows(self, repo: str) -> list[sqlite3.Row]:
-        return self._connection.execute(
-            "SELECT * FROM exec_plans WHERE repo = ? "
-            "AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h "
-            "WHERE h.repo = exec_plans.repo "
-            "AND h.currently_archived = 1 "
-            "AND h.plan_id = exec_plans.plan_id)",
-            (repo,),
-        ).fetchall()
+        return prerequisite_validation_rows(self._connection, repo)
 
     def transition_maintenance(
         self,
