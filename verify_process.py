@@ -15,6 +15,26 @@ class VerifyTerminationUncertain(RuntimeError):
     """The process tree may still be running; no further work is safe."""
 
 
+_LINUX_SUBREAPER = """\
+import ctypes
+import os
+import subprocess
+import sys
+
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(36, 1, 0, 0, 0) != 0:
+    raise OSError(ctypes.get_errno(), 'PR_SET_CHILD_SUBREAPER')
+verify = subprocess.Popen(sys.argv[1:], stdin=subprocess.DEVNULL)
+code = verify.wait()
+while True:
+    try:
+        os.waitpid(-1, 0)
+    except ChildProcessError:
+        break
+sys.exit(code)
+"""
+
+
 def _tail(stream, limit: int = 8000) -> str:
     stream.seek(0, os.SEEK_END)
     stream.seek(max(0, stream.tell() - limit))
@@ -164,12 +184,17 @@ def run_verify_process(
     """Return (passed, timed_out, bounded output), or fail closed on live descendants."""
 
     with tempfile.TemporaryFile() as output:
+        command = (
+            [sys.executable, "-c", _LINUX_SUBREAPER, *arguments]
+            if sys.platform.startswith("linux") and os.name != "nt"
+            else arguments
+        )
         options = (
             {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
             if os.name == "nt" else {"start_new_session": True}
         )
         process = subprocess.Popen(
-            arguments, cwd=worktree, stdin=subprocess.DEVNULL,
+            command, cwd=worktree, stdin=subprocess.DEVNULL,
             stdout=output, stderr=subprocess.STDOUT, **options,
         )
         try:
