@@ -5628,39 +5628,90 @@ def _ignored_paths_overlapping_git_update(worktree: Path, target: str) -> list[s
     )
 
 
+def _remaining_rebase_commits(
+    worktree: Path,
+    metadata_directory: Path,
+    backend: str,
+    original_head: str,
+    onto: str,
+    action: str,
+) -> list[str] | None:
+    if backend == "rebase-merge":
+        todo = metadata_directory / "git-rebase-todo"
+        if not todo.is_file():
+            return None
+        commits = []
+        for line in todo.read_text(encoding="utf-8").splitlines():
+            fields = line.split(maxsplit=2)
+            if (
+                not fields
+                or fields[0].startswith("#")
+                or fields[0] in {"drop", "d"}
+            ):
+                continue
+            if fields[0] not in {
+                "pick", "p", "reword", "r", "edit", "e",
+                "squash", "s", "fixup", "f",
+            } or len(fields) < 2:
+                return None
+            commits.append(
+                git_bytes(
+                    worktree, "rev-parse", "--verify", f"{fields[1]}^{{commit}}"
+                ).decode("ascii").strip()
+            )
+        return commits
+
+    next_path = metadata_directory / "next"
+    last_path = metadata_directory / "last"
+    if not next_path.is_file() or not last_path.is_file():
+        return None
+    commits = git_bytes(
+        worktree, "rev-list", "--reverse", original_head, f"^{onto}"
+    ).decode("ascii").splitlines()
+    try:
+        next_index = int(next_path.read_text(encoding="ascii").strip())
+        last_index = int(last_path.read_text(encoding="ascii").strip())
+    except ValueError:
+        return None
+    if len(commits) != last_index or not 1 <= next_index <= last_index + 1:
+        return None
+    return commits[next_index - (1 if action == "--continue" else 0):]
+
+
 def _rebase_resume_ignored_overlap(worktree: Path, action: str) -> str | None:
     ignored = _ignored_worktree_paths(worktree)
     if not ignored:
         return None
-    metadata: tuple[str, str] | None = None
+    metadata: tuple[str, str, Path, str] | None = None
     for directory in ("rebase-merge", "rebase-apply"):
+        raw_directory = os.fsdecode(
+            git_bytes(worktree, "rev-parse", "--git-path", directory).strip()
+        )
+        metadata_directory = Path(raw_directory)
+        if not metadata_directory.is_absolute():
+            metadata_directory = worktree / metadata_directory
         values = []
         for name in ("orig-head", "onto"):
-            raw_path = os.fsdecode(
-                git_bytes(
-                    worktree, "rev-parse", "--git-path", f"{directory}/{name}"
-                ).strip()
-            )
-            path = Path(raw_path)
-            if not path.is_absolute():
-                path = worktree / path
+            path = metadata_directory / name
             if not path.is_file():
                 break
             values.append(path.read_text(encoding="ascii").strip())
         if len(values) == 2:
-            metadata = values[0], values[1]
+            metadata = values[0], values[1], metadata_directory, directory
             break
     if metadata is None:
         return "rebase 재개 전 남은 tracked 경로를 확인할 수 없습니다."
-    original_head, onto = metadata
+    original_head, onto, metadata_directory, backend = metadata
     if action == "--abort":
         changed = _nul_git_paths(
             worktree, "diff", "--name-only", "-z", "HEAD", original_head
         )
     else:
-        commits = git_bytes(
-            worktree, "rev-list", "--reverse", original_head, f"^{onto}"
-        ).decode("ascii").splitlines()
+        commits = _remaining_rebase_commits(
+            worktree, metadata_directory, backend, original_head, onto, action
+        )
+        if commits is None:
+            return "rebase 재개 전 남은 tracked 경로를 확인할 수 없습니다."
         changed = [
             path
             for commit in commits
@@ -8548,16 +8599,26 @@ def _worktree_state_signature(worktree: Path) -> str:
 
 
 def _ignore_rule_source(worktree: Path, path: str) -> str | None:
-    result = git(
-        worktree, "check-ignore", "--no-index", "-v", "--", path,
-        check=False,
+    result = subprocess.run(
+        [
+            "git", "-C", str(worktree), "check-ignore",
+            "--no-index", "-v", "-z", "--stdin",
+        ],
+        input=os.fsencode(path) + b"\0",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
     if result.returncode == 1:
         return None
-    source, separator, _rest = result.stdout.partition(":")
-    if result.returncode != 0 or not separator:
+    fields = result.stdout.split(b"\0")
+    if (
+        result.returncode != 0
+        or len(fields) != 5
+        or fields[-1]
+        or fields[3] != os.fsencode(path)
+    ):
         raise RuntimeError(f"ignored 경로의 Git 규칙을 확인할 수 없습니다: {path}")
-    return source
+    return os.fsdecode(fields[0])
 
 
 def _normalize_legacy_ignored_snapshot(
