@@ -18491,9 +18491,13 @@ def run_project_result(
     if not getattr(connection, "execplans_schema_ready", False):
         recovery_state.ensure_schema(connection)
     recovery_repository = recovery_state.RecoveryRepository(connection)
-    recovery_before = recovery_repository.external_run_snapshot(repo)
+    run_id = recovery_state.begin_external_run(connection)
+    # The TEMP run marker must not hold the transaction that later makes each
+    # recovery observation durable on its own bounded state transition.
+    connection.commit()
+    outcome: ProjectRunResult | None = None
     try:
-        return _run_project_result(
+        outcome = _run_project_result(
             connection, state_dir, repo_arg, config_path, requested_base,
             allow_agents_mismatch, requested_provider,
             registered_only=registered_only, planner_mutex=planner_mutex,
@@ -18501,12 +18505,22 @@ def run_project_result(
             verify_timeout_seconds=verify_timeout_seconds,
             on_step_completed=on_step_completed, runtime_mutation=runtime_mutation,
         )
+        return outcome
     finally:
-        # This executes once regardless of in-process retry count.  It neither
-        # changes execution state nor affects the bounded recovery decision.
+        # Failure observations are saved in their recovery transaction.  This
+        # boundary only resolves an execution that reached a stable outcome.
         with connection:
-            recovery_repository.observe_external_run(
-                repo, recovery_before,
+            recovery_repository.finish_external_run(
+                repo, run_id,
+                resolved=(
+                    outcome is not None
+                    and outcome.kind not in {
+                        ProjectRunKind.TRANSIENT_PAUSE,
+                        ProjectRunKind.USAGE_LIMIT_PAUSE,
+                        ProjectRunKind.OPERATIONAL_ERROR,
+                        ProjectRunKind.BLOCKED,
+                    }
+                ),
                 blocked_subjects=_blocked_recovery_subjects(connection, repo),
             )
             notifications.enqueue_persistent_execution_failure_events(connection, repo)

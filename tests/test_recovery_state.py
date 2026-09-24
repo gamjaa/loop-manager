@@ -8,7 +8,7 @@ from unittest import mock
 import loop_manager
 import runtime_state
 from recovery_runtime import RecoveryAction, RecoveryObservation, RecoveryReason
-from recovery_state import RecoveryRepository, RecoveryStateConflict
+from recovery_state import RecoveryRepository, RecoveryStateConflict, begin_external_run
 from recovery_dispatcher import RecoveryDispatcher
 from tests import test_runtime_state
 
@@ -124,7 +124,7 @@ class RecoveryRepositoryTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(tuple(row), (0, 1))
 
-    def test_external_failure_streak_survives_database_restart(self):
+    def test_external_failure_streak_survives_interrupted_database_restart(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "state.db"
             observation = RecoveryObservation(
@@ -135,9 +135,8 @@ class RecoveryRepositoryTests(unittest.TestCase):
                 connection = sqlite3.connect(database)
                 connection.row_factory = sqlite3.Row
                 repository = RecoveryRepository(connection)
-                before = repository.external_run_snapshot("repo")
+                begin_external_run(connection)
                 repository.observe(observation)
-                repository.observe_external_run("repo", before)
                 connection.commit()
                 connection.close()
 

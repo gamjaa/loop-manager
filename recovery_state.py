@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import sqlite3
+import uuid
 
 from recovery_runtime import (
     RecoveryAction, RecoveryDecision, RecoveryObservation, RecoveryReason, decide,
@@ -51,6 +52,7 @@ CREATE TABLE IF NOT EXISTS persistent_execution_failures (
     notification_eligible INTEGER NOT NULL DEFAULT 0,
     notification_queued INTEGER NOT NULL DEFAULT 0,
     suppressed_by_block INTEGER NOT NULL DEFAULT 0,
+    last_run_id TEXT,
     detail TEXT NOT NULL DEFAULT '',
     recovery_attempts TEXT NOT NULL DEFAULT '{}',
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -101,6 +103,41 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
         connection.execute(
             "ALTER TABLE recovery_records ADD COLUMN occurrence_index TEXT NOT NULL DEFAULT '{}'"
         )
+    failure_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(persistent_execution_failures)"
+        )
+    }
+    if "last_run_id" not in failure_columns:
+        connection.execute(
+            "ALTER TABLE persistent_execution_failures ADD COLUMN last_run_id TEXT"
+        )
+
+
+def begin_external_run(connection: sqlite3.Connection) -> str:
+    """Bind one scheduler invocation to this SQLite connection."""
+
+    run_id = uuid.uuid4().hex
+    connection.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS recovery_external_run "
+        "(run_id TEXT NOT NULL)"
+    )
+    connection.execute("DELETE FROM recovery_external_run")
+    connection.execute(
+        "INSERT INTO recovery_external_run (run_id) VALUES (?)", (run_id,)
+    )
+    return run_id
+
+
+def _external_run_id(connection: sqlite3.Connection) -> str | None:
+    try:
+        row = connection.execute(
+            "SELECT run_id FROM recovery_external_run LIMIT 1"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return str(row[0]) if row is not None else None
 
 
 class RecoveryStateConflict(RuntimeError):
@@ -223,6 +260,22 @@ class RecoveryRepository:
             if cursor.rowcount != 1:
                 raise RecoveryStateConflict("recovery generation changed")
             next_generation = generation + 1
+        run_id = _external_run_id(self.connection)
+        if run_id is not None:
+            self._record_external_failure(
+                observation.repo,
+                self._subject(observation.plan_id),
+                phase=observation.phase,
+                reason_code=observation.reason.value,
+                fingerprint=observation.fingerprint,
+                progress_marker=observation.progress_marker,
+                disposition=decision.disposition.value,
+                detail=observation.detail,
+                recovery_attempts=json.dumps(
+                    counts, sort_keys=True, separators=(",", ":"),
+                ),
+                run_id=run_id,
+            )
         return RecoveryRecord(next_generation, decision, evidence)
 
     def clear(self, repo: str, plan_id: str | None) -> None:
@@ -242,6 +295,80 @@ class RecoveryRepository:
             )
         }
 
+    def _record_external_failure(
+        self,
+        repo: str,
+        subject: str,
+        *,
+        phase: str,
+        reason_code: str,
+        fingerprint: str,
+        progress_marker: str,
+        disposition: str,
+        detail: str,
+        recovery_attempts: str,
+        run_id: str | None,
+    ) -> None:
+        """Durably project one observed failure, once per external run."""
+
+        previous = self.connection.execute(
+            "SELECT episode, phase, reason_code, fingerprint, progress_marker, "
+            "consecutive_runs, active, notification_queued, last_run_id "
+            "FROM persistent_execution_failures WHERE repo = ? AND subject = ?",
+            (repo, subject),
+        ).fetchone()
+        same_cause = (
+            previous is not None
+            and bool(previous[6])
+            and str(previous[1]) == phase
+            and str(previous[2]) == reason_code
+            and str(previous[3]) == fingerprint
+            and str(previous[4]) == progress_marker
+        )
+        same_run = (
+            same_cause and run_id is not None and previous[8] == run_id
+        )
+        episode = int(previous[0]) if same_cause else (
+            int(previous[0]) + 1 if previous is not None else 1
+        )
+        consecutive_runs = (
+            int(previous[5]) if same_run else
+            int(previous[5]) + 1 if same_cause else 1
+        )
+        eligible = (
+            consecutive_runs >= 3 or disposition == "user_action_required"
+        )
+        if previous is None:
+            self.connection.execute(
+                "INSERT INTO persistent_execution_failures "
+                "(repo, subject, episode, phase, reason_code, fingerprint, "
+                "progress_marker, consecutive_runs, active, "
+                "notification_eligible, notification_queued, suppressed_by_block, "
+                "last_run_id, detail, recovery_attempts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 0, 0, ?, ?, ?)",
+                (
+                    repo, subject, episode, phase, reason_code, fingerprint,
+                    progress_marker, consecutive_runs, int(eligible), run_id,
+                    detail, recovery_attempts,
+                ),
+            )
+            return
+        self.connection.execute(
+            "UPDATE persistent_execution_failures SET "
+            "episode = ?, phase = ?, reason_code = ?, fingerprint = ?, "
+            "progress_marker = ?, consecutive_runs = ?, active = 1, "
+            "notification_eligible = ?, notification_queued = CASE "
+            "WHEN ? THEN notification_queued ELSE 0 END, "
+            "suppressed_by_block = 0, last_run_id = ?, detail = ?, "
+            "recovery_attempts = ?, updated_at = CURRENT_TIMESTAMP, resolved_at = NULL "
+            "WHERE repo = ? AND subject = ?",
+            (
+                episode, phase, reason_code, fingerprint, progress_marker,
+                consecutive_runs, int(eligible), int(same_cause), run_id,
+                detail, recovery_attempts, repo, subject,
+            ),
+        )
+
     def observe_external_run(
         self,
         repo: str,
@@ -249,100 +376,61 @@ class RecoveryRepository:
         *,
         blocked_subjects: frozenset[str] = frozenset(),
     ) -> None:
-        """Count at most one unresolved structured failure per scheduler run.
+        """Compatibility boundary for callers without a scheduler run context."""
 
-        Recovery records intentionally count in-process retries.  This separate
-        projection is the scheduler boundary: a generation changed during this
-        invocation is one real external execution, while untouched rows are
-        resolved and cannot extend a later streak.
-        """
-
-        changed = {
-            str(row[0]): row
-            for row in self.connection.execute(
+        changed = [
+            row for row in self.connection.execute(
                 "SELECT subject, generation, phase, reason_code, fingerprint, "
                 "progress_marker, disposition, recovery_counts, detail "
                 "FROM recovery_records WHERE repo = ?", (repo,)
             )
             if int(row[1]) > before.get(str(row[0]), 0)
-        }
-        current = {
-            str(row[0]): row
-            for row in self.connection.execute(
-                "SELECT subject, episode, phase, reason_code, fingerprint, "
-                "progress_marker, consecutive_runs, active, notification_queued "
-                "FROM persistent_execution_failures WHERE repo = ?",
-                (repo,),
+        ]
+        for row in changed:
+            self._record_external_failure(
+                repo, str(row[0]), phase=str(row[2]), reason_code=str(row[3]),
+                fingerprint=str(row[4]), progress_marker=str(row[5]),
+                disposition=str(row[6]), detail=str(row[8]),
+                recovery_attempts=str(row[7]), run_id=None,
             )
-        }
+        self.finish_external_run(
+            repo, None, resolved=not bool(changed), blocked_subjects=blocked_subjects,
+        )
 
-        for subject, row in changed.items():
-            previous = current.get(subject)
-            same_cause = (
-                previous is not None
-                and bool(previous[7])
-                and str(previous[2]) == str(row[2])
-                and str(previous[3]) == str(row[3])
-                and str(previous[4]) == str(row[4])
-                and str(previous[5]) == str(row[5])
-            )
-            episode = int(previous[1]) if same_cause else (
-                int(previous[1]) + 1 if previous is not None else 1
-            )
-            consecutive_runs = (
-                int(previous[6]) + 1 if same_cause else 1
-            )
-            is_blocked = subject in blocked_subjects
-            eligible = (
-                not is_blocked
-                and (
-                    consecutive_runs >= 3
-                    or str(row[6]) == "user_action_required"
-                )
-            )
-            attempts = str(row[7])
-            if previous is None:
-                self.connection.execute(
-                    "INSERT INTO persistent_execution_failures "
-                    "(repo, subject, episode, phase, reason_code, fingerprint, "
-                    "progress_marker, consecutive_runs, active, "
-                    "notification_eligible, notification_queued, "
-                    "suppressed_by_block, detail, recovery_attempts) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 0, ?, ?, ?)",
-                    (
-                        repo, subject, episode, row[2], row[3], row[4], row[5],
-                        consecutive_runs, int(eligible), int(is_blocked),
-                        row[8], attempts,
-                    ),
-                )
-            else:
-                self.connection.execute(
-                    "UPDATE persistent_execution_failures SET "
-                    "episode = ?, phase = ?, reason_code = ?, fingerprint = ?, "
-                    "progress_marker = ?, consecutive_runs = ?, active = 1, "
-                    "notification_eligible = ?, notification_queued = CASE "
-                    "WHEN ? THEN notification_queued ELSE 0 END, "
-                    "suppressed_by_block = ?, detail = ?, recovery_attempts = ?, "
-                    "updated_at = CURRENT_TIMESTAMP, resolved_at = NULL "
-                    "WHERE repo = ? AND subject = ?",
-                    (
-                        episode, row[2], row[3], row[4], row[5],
-                        consecutive_runs, int(eligible), int(same_cause),
-                        int(is_blocked), row[8], attempts, repo, subject,
-                    ),
-                )
+    def finish_external_run(
+        self,
+        repo: str,
+        run_id: str | None,
+        *,
+        resolved: bool,
+        blocked_subjects: frozenset[str] = frozenset(),
+    ) -> None:
+        """Resolve successful attempts or suppress final BLOCKED duplicates."""
 
-        for subject, previous in current.items():
-            if subject in changed or not bool(previous[7]):
-                continue
+        where = "repo = ?" + (" AND last_run_id = ?" if run_id is not None else "")
+        parameters: tuple[object, ...] = (repo,) + ((run_id,) if run_id is not None else ())
+        for subject in blocked_subjects:
+            self.connection.execute(
+                "UPDATE persistent_execution_failures SET active = 0, "
+                "consecutive_runs = 0, notification_eligible = 0, "
+                "notification_queued = 0, suppressed_by_block = 1, "
+                "updated_at = CURRENT_TIMESTAMP, resolved_at = CURRENT_TIMESTAMP "
+                f"WHERE {where} AND subject = ?",
+                (*parameters, subject),
+            )
+        if resolved:
+            placeholders = ", ".join("?" for _ in blocked_subjects)
+            exclusion = f" AND subject NOT IN ({placeholders})" if placeholders else ""
             self.connection.execute(
                 "UPDATE persistent_execution_failures SET active = 0, "
                 "consecutive_runs = 0, notification_eligible = 0, "
                 "notification_queued = 0, suppressed_by_block = 0, "
                 "updated_at = CURRENT_TIMESTAMP, resolved_at = CURRENT_TIMESTAMP "
-                "WHERE repo = ? AND subject = ?",
-                (repo, subject),
+                f"WHERE repo = ?{exclusion}",
+                (repo, *blocked_subjects),
             )
+        if run_id is not None:
+            self.connection.execute("DELETE FROM recovery_external_run")
 
     def clear_correction_occurrences(
         self, repo: str, plan_id: str, fingerprints: tuple[str, ...],
