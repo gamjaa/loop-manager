@@ -13425,6 +13425,46 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             self.assertEqual(catalog_shas, [head])
             self.assertEqual(git_command(repo, "rev-parse", "HEAD"), head)
 
+    def test_archive_publication_syncs_source_and_catalog_to_final_remote_sha(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state_dir, connection, branch, worktree, url, head = (
+                self._pr_open_state(directory)
+            )
+            git_command(worktree, "push", "origin", "HEAD:main")
+            merged = self._pull_request(branch, url, head, "UNKNOWN", state="MERGED")
+            merged["mergedAt"] = "2026-09-24T00:00:00Z"
+            original_sync = loop_manager.ensure_safe_base_worktree
+            original_catalog = loop_manager.reconcile_execplan_catalog
+            source_shas = []
+            catalog_shas = []
+
+            def synchronize(path, base, *, remote_sha=None):
+                source_shas.append(remote_sha)
+                return original_sync(path, base, remote_sha=remote_sha)
+
+            def reconcile_catalog(*args, **kwargs):
+                if kwargs.get("remote_sha") is not None:
+                    catalog_shas.append(kwargs["remote_sha"])
+                return original_catalog(*args, **kwargs)
+
+            with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
+                "loop_manager.pr_for_branch", return_value=merged
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree", side_effect=synchronize
+            ), mock.patch(
+                "loop_manager.reconcile_execplan_catalog", side_effect=reconcile_catalog
+            ):
+                result = loop_manager.run_project(
+                    connection, state_dir, str(repo), Path("unused.ini"), "main", False
+                )
+
+            remote_sha = git_command(repo, "rev-parse", "origin/main")
+            self.assertEqual(result, 0)
+            self.assertNotEqual(remote_sha, head)
+            self.assertEqual(source_shas, [remote_sha])
+            self.assertEqual(catalog_shas, [remote_sha])
+            self.assertEqual(git_command(repo, "rev-parse", "HEAD"), remote_sha)
+
     def test_closed_pr_is_blocked_before_source_fast_forward(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, state_dir, connection, branch, _worktree, url, head = (

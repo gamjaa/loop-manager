@@ -17740,12 +17740,15 @@ def _run_project_step(
         ).fetchone()
         if current_project is not None and str(current_project["base_branch"]) != base:
             raise RuntimeError("PR 상태 동기화 중 프로젝트 base branch가 변경됐습니다.")
+        archive_housekeeping()
+        # Archive publication may fast-forward origin. Pin both source sync
+        # and catalog reconciliation to the resulting remote revision.
+        base_sha = git(
+            repo_path,
+            "rev-parse",
+            f"refs/remotes/origin/{base}^{{commit}}",
+        ).stdout.strip()
         if scoped_blocking.project_block(connection, repo) is None:
-            base_sha = git(
-                repo_path,
-                "rev-parse",
-                f"refs/remotes/origin/{base}^{{commit}}",
-            ).stdout.strip()
             waiting_open = connection.execute(
                 "SELECT 1 FROM exec_plans WHERE repo = ? AND status = 'PR_OPEN' LIMIT 1",
                 (repo,),
@@ -17770,13 +17773,6 @@ def _run_project_step(
                 )
             if isinstance(sync_result, BaseWorktreeSyncResult):
                 log_base_worktree_sync(repo_path, sync_result)
-        archive_housekeeping()
-        # Archive publication can advance the remote after source sync.
-        base_sha = git(
-            repo_path,
-            "rev-parse",
-            f"refs/remotes/origin/{base}^{{commit}}",
-        ).stdout.strip()
 
     pr_sync = synchronize_waiting_pull_requests(
         connection,
