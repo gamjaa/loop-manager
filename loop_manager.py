@@ -2333,6 +2333,16 @@ def _git_path_matches_revision(
     return True
 
 
+def _git_path_has_standard_index_flags(worktree: Path, path: str) -> bool:
+    """Require a normally tracked index entry before trusting Git diff output."""
+
+    entries = git_bytes(worktree, "ls-files", "-v", "-z", "--", path).split(
+        b"\0"
+    )
+    records = [entry for entry in entries if entry]
+    return records == [b"H " + os.fsencode(path)]
+
+
 def _ready_plan_snapshot(
     worktree: Path,
     active_sha: str,
@@ -2346,6 +2356,7 @@ def _ready_plan_snapshot(
         )
     try:
         base_contents = git_bytes(worktree, "show", f"{active_sha}:{path}")
+        standard_index_flags = _git_path_has_standard_index_flags(worktree, path)
         checkout_matches = _git_path_matches_revision(
             worktree, active_sha, path, cached=False
         )
@@ -2353,7 +2364,7 @@ def _ready_plan_snapshot(
         raise MaintenancePlanningError(
             f"평가 기준 revision에서 READY ExecPlan을 확인할 수 없습니다: {path}"
         ) from error
-    if not checkout_matches:
+    if not standard_index_flags or not checkout_matches:
         raise MaintenancePlanningError(
             f"READY ExecPlan 파일이 평가 기준 revision과 다릅니다: {path}"
         )
