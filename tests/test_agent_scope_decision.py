@@ -21,16 +21,53 @@ def snapshot(**changes):
 
 
 def decide(before, current, *, role="worker", phase="IMPLEMENTING", result=None,
-           checkpoint=None, planner_correction=False, cleanup=frozenset()):
+           checkpoint=None, planner_correction=False, cleanup=frozenset(),
+           manager_runtime=None):
     return decision.decide_persisted_scope(
         role=role, phase=phase, base_branch="main", selected_plan_path=PLAN,
         before=before, current=current, result=result, checkpoint=checkpoint,
         worktree_key=WORKTREE, repo_key=REPO,
         planner_correction=planner_correction, manager_cleanup_worktrees=cleanup,
+        manager_runtime=manager_runtime,
     )
 
 
 class PersistedScopeDecisionTests(unittest.TestCase):
+    def test_verified_runtime_reconciles_only_selected_registration_and_origin(self):
+        before = snapshot()
+        runtime = "/state/runtimes/source/b"
+        registration = ("HEAD=b", "detached=True", "locked=loop-manager-runtime:id")
+        current = replace(
+            before,
+            refs={**before.refs, "refs/remotes/origin/main": ("b", "")},
+            worktrees={**before.worktrees, runtime: registration},
+        )
+        result = decide(before, current, manager_runtime=(runtime, "b"))
+        check, = result.checks
+        self.assertEqual(check.before.refs, current.refs)
+        self.assertEqual(check.before.worktrees, current.worktrees)
+        self.assertEqual(result.reconciled_before, check.before)
+        self.assertEqual(decide(check.before, current, manager_runtime=(runtime, "b")).reconciled_before, check.before)
+
+        extra = replace(current, worktrees={**current.worktrees, "/external": ("HEAD=c",)})
+        check, = decide(before, extra, manager_runtime=(runtime, "b")).checks
+        self.assertNotIn("/external", check.before.worktrees)
+        with self.assertRaisesRegex(decision.ScopeDecisionError, "runtime 기준선"):
+            decide(before, current, manager_runtime=(runtime, "other"))
+
+    def test_blocked_false_positive_reconciles_from_original_start_snapshot(self):
+        before = snapshot()
+        runtime = "/state/runtimes/source/b"
+        current = replace(
+            before,
+            refs={**before.refs, "refs/remotes/origin/main": ("b", "")},
+            worktrees={**before.worktrees, runtime: ("HEAD=b", "detached=True")},
+        )
+        check, = decide(before, current, phase="PLAN_BLOCKED", result=current,
+                        manager_runtime=(runtime, "b")).checks
+        self.assertEqual(check.before.worktrees, current.worktrees)
+        self.assertEqual(check.before.refs, current.refs)
+
     def test_worker_and_reviewer_preserve_unallowed_shared_changes(self):
         before = snapshot()
         current = replace(before, refs={**before.refs, "refs/heads/unowned": ("b", "commit")})

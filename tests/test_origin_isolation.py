@@ -103,6 +103,348 @@ def advance_remote(writer: Path, *, path: str = "tracked.txt", value: str = "two
 
 
 class OriginIsolatedRegistrationAndExecutionTest(unittest.TestCase):
+    def _persist_planner_scope(self, connection, repo: Path):
+        before = loop_manager.capture_git_snapshot(repo)
+        connection.execute(loop_manager.SCHEMA)
+        connection.execute(
+            "INSERT INTO projects (repo, base_branch, phase, worktree, agent_role, agent_snapshot) "
+            "VALUES (?, 'main', 'PLANNING', ?, 'planner', ?)",
+            (str(repo), str(repo), before.serialize()),
+        )
+        connection.commit()
+        return before
+
+    def test_owned_runtime_reconciles_saved_planner_scope_and_reuses_same_sha(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _remote, source, writer = remote_fixture(directory)
+            state_dir = Path(directory) / "state"
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            before = self._persist_planner_scope(connection, source)
+            selected_sha = advance_remote(writer)
+            with mock.patch("loop_manager.github_repository", return_value="owner/repo"):
+                with loop_manager.process_lock(state_dir) as handle:
+                    mutation_id = "a" * 32
+                    runtime = loop_manager.prepare_runtime_worktree(
+                        source, state_dir, mutation_id=mutation_id,
+                    )
+                    loop_manager._write_process_lock_identity(handle, f"runtime:{mutation_id}")
+                    with mock.patch.object(loop_manager, "ROOT", runtime.path):
+                        identity = loop_manager.validate_runtime_mutation(
+                            source, state_dir, selected_sha, mutation_id,
+                        )
+                        loop_manager.validate_persisted_agent_scope(
+                            connection, source, state_dir, str(source),
+                            runtime_mutation=identity,
+                        )
+                    saved = loop_manager.GitSnapshot.deserialize(connection.execute(
+                        "SELECT agent_snapshot FROM projects WHERE repo = ?", (str(source),)
+                    ).fetchone()[0])
+                    self.assertNotEqual(saved, before)
+                    self.assertIn(str(runtime.path), saved.worktrees)
+                    self.assertEqual(saved.refs["refs/remotes/origin/main"][0], selected_sha)
+
+                with mock.patch.object(loop_manager, "ROOT", runtime.path):
+                    with self.assertRaisesRegex(RuntimeError, "process lock"):
+                        loop_manager.validate_runtime_mutation(
+                            source, state_dir, selected_sha, mutation_id,
+                        )
+                with self.assertRaisesRegex(loop_manager.AgentScopeError, "process lock"):
+                    loop_manager.validate_persisted_agent_scope(
+                        connection, source, state_dir, str(source),
+                        runtime_mutation=identity,
+                    )
+
+                with loop_manager.process_lock(state_dir) as handle:
+                    next_id = "b" * 32
+                    reused = loop_manager.prepare_runtime_worktree(
+                        source, state_dir, mutation_id=next_id,
+                    )
+                    self.assertEqual(reused.path, runtime.path)
+                    loop_manager._write_process_lock_identity(handle, f"runtime:{next_id}")
+                    with mock.patch.object(loop_manager, "ROOT", reused.path):
+                        identity = loop_manager.validate_runtime_mutation(
+                            source, state_dir, selected_sha, next_id,
+                        )
+                        loop_manager.validate_persisted_agent_scope(
+                            connection, source, state_dir, str(source),
+                            runtime_mutation=identity,
+                        )
+                self.assertEqual(
+                    git(source, "worktree", "list", "--porcelain").count(str(runtime.path)), 1,
+                )
+            connection.close()
+
+    def test_scope_rechecks_runtime_registration_marker_and_intent(self):
+        for change in ("unlock", "change_reason", "alter_intent"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                _remote, source, writer = remote_fixture(directory)
+                state_dir = Path(directory) / "state"
+                connection = sqlite3.connect(":memory:")
+                connection.row_factory = sqlite3.Row
+                before = self._persist_planner_scope(connection, source)
+                selected_sha = advance_remote(writer)
+                mutation_id = "a" * 32
+                with mock.patch("loop_manager.github_repository", return_value="owner/repo"):
+                    with loop_manager.process_lock(state_dir, identity=f"bootstrap:{mutation_id}") as handle:
+                        runtime = loop_manager.prepare_runtime_worktree(
+                            source, state_dir, mutation_id=mutation_id,
+                        )
+                        loop_manager._write_process_lock_identity(handle, f"runtime:{mutation_id}")
+                        with mock.patch.object(loop_manager, "ROOT", runtime.path):
+                            identity = loop_manager.validate_runtime_mutation(
+                                source, state_dir, selected_sha, mutation_id,
+                            )
+                        if change in {"unlock", "change_reason"}:
+                            git(source, "worktree", "unlock", str(runtime.path))
+                        if change == "change_reason":
+                            git(source, "worktree", "lock", "--reason=outside", str(runtime.path))
+                        if change == "alter_intent":
+                            loop_manager._runtime_intent_path(
+                                state_dir, mutation_id,
+                            ).write_text("{}", encoding="utf-8")
+                        with self.assertRaisesRegex(
+                            loop_manager.AgentScopeError, "runtime mutation 검증 실패",
+                        ):
+                            loop_manager.validate_persisted_agent_scope(
+                                connection, source, state_dir, str(source),
+                                runtime_mutation=identity,
+                            )
+                        saved = connection.execute(
+                            "SELECT agent_snapshot FROM projects WHERE repo = ?", (str(source),)
+                        ).fetchone()[0]
+                        self.assertEqual(saved, before.serialize())
+                connection.close()
+
+    def test_scope_rechecks_reused_runtime_origin_intent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _remote, source, writer = remote_fixture(directory)
+            state_dir = Path(directory) / "state"
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            before = self._persist_planner_scope(connection, source)
+            selected_sha = advance_remote(writer)
+            first_id, second_id = "a" * 32, "b" * 32
+            with mock.patch("loop_manager.github_repository", return_value="owner/repo"):
+                with loop_manager.process_lock(state_dir, identity=f"bootstrap:{first_id}"):
+                    first = loop_manager.prepare_runtime_worktree(
+                        source, state_dir, mutation_id=first_id,
+                    )
+                with loop_manager.process_lock(state_dir, identity=f"bootstrap:{second_id}") as handle:
+                    reused = loop_manager.prepare_runtime_worktree(
+                        source, state_dir, mutation_id=second_id,
+                    )
+                    self.assertEqual(reused.path, first.path)
+                    loop_manager._write_process_lock_identity(handle, f"runtime:{second_id}")
+                    with mock.patch.object(loop_manager, "ROOT", reused.path):
+                        identity = loop_manager.validate_runtime_mutation(
+                            source, state_dir, selected_sha, second_id,
+                        )
+                    loop_manager._runtime_intent_path(
+                        state_dir, first_id,
+                    ).write_text("{}", encoding="utf-8")
+                    with self.assertRaisesRegex(
+                        loop_manager.AgentScopeError, "runtime mutation 검증 실패",
+                    ):
+                        loop_manager.validate_persisted_agent_scope(
+                            connection, source, state_dir, str(source),
+                            runtime_mutation=identity,
+                        )
+                    saved = connection.execute(
+                        "SELECT agent_snapshot FROM projects WHERE repo = ?", (str(source),)
+                    ).fetchone()[0]
+                    self.assertEqual(saved, before.serialize())
+            connection.close()
+
+    def test_saved_scope_block_reopens_only_for_exact_runtime_delta(self):
+        for mixed in (False, True):
+            with self.subTest(mixed=mixed), tempfile.TemporaryDirectory() as directory:
+                _remote, source, writer = remote_fixture(directory)
+                state_dir = Path(directory) / "state"
+                connection = sqlite3.connect(":memory:")
+                connection.row_factory = sqlite3.Row
+                before = self._persist_planner_scope(connection, source)
+                selected_sha = advance_remote(writer)
+                with mock.patch("loop_manager.github_repository", return_value="owner/repo"):
+                    with loop_manager.process_lock(state_dir):
+                        runtime = loop_manager.prepare_runtime_worktree(source, state_dir)
+                        if mixed:
+                            git(source, "worktree", "add", "--detach",
+                                str(state_dir / "external"), selected_sha)
+                        current = loop_manager.capture_git_snapshot(source)
+                        connection.execute(
+                            "UPDATE projects SET phase = 'PROJECT_BLOCKED', "
+                            "agent_result_snapshot = ? WHERE repo = ?",
+                            (current.serialize(), str(source)),
+                        )
+                        loop_manager.scoped_blocking.ensure_schema(connection)
+                        connection.execute(
+                            "INSERT INTO project_blocks "
+                            "(repo, scope, reason_code, evidence, previous_phase) "
+                            "VALUES (?, 'project', 'outside_managed_worktree_mutation', ?, 'PLANNING')",
+                            (str(source), "Agent 범위 선검증 실패:\nruntime"),
+                        )
+                        connection.commit()
+                        project = connection.execute(
+                            "SELECT * FROM projects WHERE repo = ?", (str(source),)
+                        ).fetchone()
+                        with mock.patch.object(loop_manager, "ROOT", runtime.path):
+                            identity = loop_manager.validate_runtime_mutation(
+                                source, state_dir, selected_sha, None,
+                            )
+                        reopened = loop_manager.reconcile_false_positive_runtime_block(
+                            connection, source, state_dir, str(source), project,
+                            {"evidence": "Agent 범위 선검증 실패:\nruntime"}, identity,
+                        )
+                        self.assertEqual(reopened, not mixed)
+                        self.assertEqual(loop_manager.resume_project_block_if_safe(
+                            connection, source, state_dir, str(source),
+                        ), not mixed)
+                        saved = connection.execute(
+                            "SELECT agent_snapshot, agent_result_snapshot FROM projects WHERE repo = ?",
+                            (str(source),),
+                        ).fetchone()
+                        self.assertEqual(saved["agent_result_snapshot"], current.serialize())
+                        self.assertEqual(saved["agent_snapshot"] == before.serialize(), mixed)
+                connection.close()
+
+    def test_registration_intent_survives_interruption_before_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _remote, source, writer = remote_fixture(directory)
+            state_dir = Path(directory) / "state"
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            self._persist_planner_scope(connection, source)
+            selected_sha = advance_remote(writer)
+            with mock.patch("loop_manager.github_repository", return_value="owner/repo"):
+                with loop_manager.process_lock(state_dir, identity="bootstrap:" + "a" * 32):
+                    first = loop_manager.prepare_runtime_worktree(
+                        source, state_dir, mutation_id="a" * 32,
+                    )
+                with loop_manager.process_lock(state_dir, identity="bootstrap:" + "b" * 32) as handle:
+                    reused = loop_manager.prepare_runtime_worktree(
+                        source, state_dir, mutation_id="b" * 32,
+                    )
+                    self.assertEqual(reused.path, first.path)
+                    loop_manager._write_process_lock_identity(handle, "runtime:" + "b" * 32)
+                    with mock.patch.object(loop_manager, "ROOT", reused.path):
+                        identity = loop_manager.validate_runtime_mutation(
+                            source, state_dir, selected_sha, "b" * 32,
+                        )
+                    loop_manager.validate_persisted_agent_scope(
+                        connection, source, state_dir, str(source),
+                        runtime_mutation=identity,
+                    )
+            connection.close()
+
+    def test_new_parent_rejects_unmarked_existing_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _remote, source, writer = remote_fixture(directory)
+            state_dir = Path(directory) / "state"
+            advance_remote(writer)
+            with mock.patch("loop_manager.github_repository", return_value="owner/repo"):
+                with loop_manager.process_lock(state_dir):
+                    runtime = loop_manager.prepare_runtime_worktree(source, state_dir)
+                with loop_manager.process_lock(state_dir, identity="bootstrap:" + "e" * 32):
+                    with self.assertRaisesRegex(
+                        loop_manager.WorkspaceOwnershipError, "구버전 전환 소유 증거",
+                    ):
+                        loop_manager.prepare_runtime_worktree(
+                            source, state_dir, mutation_id="e" * 32,
+                        )
+                self.assertTrue(runtime.path.is_dir())
+
+    def test_child_rejects_changed_runtime_catalog_lock_reason(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _remote, source, writer = remote_fixture(directory)
+            state_dir = Path(directory) / "state"
+            selected_sha = advance_remote(writer)
+            with mock.patch("loop_manager.github_repository", return_value="owner/repo"):
+                mutation_id = "f" * 32
+                with loop_manager.process_lock(
+                    state_dir, identity=f"bootstrap:{mutation_id}",
+                ) as handle:
+                    runtime = loop_manager.prepare_runtime_worktree(
+                        source, state_dir, mutation_id=mutation_id,
+                    )
+                    git(source, "worktree", "unlock", str(runtime.path))
+                    git(source, "worktree", "lock", "--reason=outside", str(runtime.path))
+                    loop_manager._write_process_lock_identity(handle, f"runtime:{mutation_id}")
+                    with mock.patch.object(loop_manager, "ROOT", runtime.path):
+                        with self.assertRaisesRegex(RuntimeError, "durable mutation 표식"):
+                            loop_manager.validate_runtime_mutation(
+                                source, state_dir, selected_sha, mutation_id,
+                            )
+                    self.assertTrue(runtime.path.is_dir())
+
+    def test_legacy_parent_lock_allows_exact_runtime_but_new_lock_requires_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _remote, source, writer = remote_fixture(directory)
+            state_dir = Path(directory) / "state"
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            before = self._persist_planner_scope(connection, source)
+            selected_sha = advance_remote(writer)
+            with mock.patch("loop_manager.github_repository", return_value="owner/repo"):
+                with loop_manager.process_lock(state_dir):
+                    # Reproduce the pre-mutation-ID parent without calling the new bootstrap.
+                    git(source, "fetch", "origin")
+                    runtime_path = loop_manager.expected_runtime_worktree(
+                        state_dir, source, selected_sha,
+                    )
+                    runtime_path.parent.mkdir(parents=True, exist_ok=True)
+                    git(source, "worktree", "add", "--detach", str(runtime_path), selected_sha)
+                    runtime = loop_manager.RuntimeWorktree(runtime_path, selected_sha)
+                    with mock.patch.object(loop_manager, "ROOT", runtime.path):
+                        def resume(_args, _state, _config, identity):
+                            self.assertTrue(identity.legacy)
+                            loop_manager.validate_persisted_agent_scope(
+                                connection, source, state_dir, str(source),
+                                runtime_mutation=identity,
+                            )
+                            return 0
+
+                        with mock.patch.object(loop_manager.sys, "argv", [
+                            "loop_manager.py", "--runtime-child",
+                            "--runtime-source", str(source),
+                            "--runtime-sha", selected_sha,
+                            "--state-dir", str(state_dir), "run",
+                        ]), mock.patch(
+                            "loop_manager.execute_runtime_command", side_effect=resume,
+                        ) as execute:
+                            self.assertEqual(loop_manager.main(), 0)
+                            self.assertTrue(execute.call_args.args[3].legacy)
+                self.assertNotEqual(connection.execute(
+                    "SELECT agent_snapshot FROM projects WHERE repo = ?", (str(source),)
+                ).fetchone()[0], before.serialize())
+
+                with loop_manager.process_lock(state_dir):
+                    reused_legacy = loop_manager.prepare_runtime_worktree(source, state_dir)
+                    self.assertEqual(reused_legacy.path, runtime.path)
+                    with mock.patch.object(loop_manager, "ROOT", reused_legacy.path):
+                        self.assertTrue(loop_manager.validate_runtime_mutation(
+                            source, state_dir, selected_sha, None,
+                        ).legacy)
+
+                with loop_manager.process_lock(state_dir) as handle:
+                    loop_manager._write_process_lock_identity(handle, "runtime:" + "c" * 32)
+                    with mock.patch.object(loop_manager, "ROOT", runtime.path):
+                        with self.assertRaisesRegex(RuntimeError, "mutation ID가 없는 새 형식"):
+                            loop_manager.validate_runtime_mutation(
+                                source, state_dir, selected_sha, None,
+                            )
+                with loop_manager.process_lock(state_dir, identity="bootstrap:" + "d" * 32) as handle:
+                    adopted = loop_manager.prepare_runtime_worktree(
+                        source, state_dir, mutation_id="d" * 32,
+                    )
+                    self.assertEqual(adopted.path, runtime.path)
+                    loop_manager._write_process_lock_identity(handle, "runtime:" + "d" * 32)
+                    with mock.patch.object(loop_manager, "ROOT", adopted.path):
+                        self.assertFalse(loop_manager.validate_runtime_mutation(
+                            source, state_dir, selected_sha, "d" * 32,
+                        ).legacy)
+            connection.close()
+
     def test_registration_reads_only_the_selected_revision_tree(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -463,24 +805,28 @@ class OriginIsolatedRegistrationAndExecutionTest(unittest.TestCase):
         runtime = loop_manager.RuntimeWorktree(Path("/state/runtime"), "a" * 40)
 
         @contextlib.contextmanager
-        def locked(_state_dir: Path):
+        def locked(_state_dir: Path, *, identity: str):
+            self.assertRegex(identity, r"^bootstrap:[0-9a-f]{32}$")
             events.append("lock")
-            try:
-                yield
-            finally:
-                events.append("unlock")
+            with tempfile.TemporaryFile() as handle:
+                try:
+                    yield handle
+                finally:
+                    events.append("unlock")
 
-        def prepare(actual_source: Path, actual_state: Path):
+        def prepare(actual_source: Path, actual_state: Path, *, mutation_id: str):
             self.assertEqual(actual_source, source)
             self.assertEqual(actual_state, state_dir)
             events.append("prepare")
-            return runtime
+            return loop_manager.RuntimeWorktree(runtime.path, runtime.commit_sha, mutation_id)
 
         def child(actual_source, actual_state, config_path, selected, arguments):
             self.assertEqual(actual_source, source)
             self.assertEqual(actual_state, state_dir)
             self.assertEqual(config_path, source / "custom/config.ini")
-            self.assertEqual(selected, runtime)
+            self.assertEqual(selected.path, runtime.path)
+            self.assertEqual(selected.commit_sha, runtime.commit_sha)
+            self.assertRegex(selected.mutation_id, r"^[0-9a-f]{32}$")
             self.assertEqual(arguments[-2:], ["run", "--skip-if-running"])
             events.append("child")
             return 7
@@ -512,6 +858,14 @@ class OriginIsolatedRegistrationAndExecutionTest(unittest.TestCase):
         )
         self.assertIn(str(source / "custom/config.ini"), arguments)
         self.assertNotIn("secret-value", " ".join(arguments))
+        secured = loop_manager.runtime_child_arguments(
+            ["--runtime-mutation-id", "spoofed", "run"],
+            source=source, state_dir=state_dir,
+            config_path=source / "custom/config.ini",
+            runtime=loop_manager.RuntimeWorktree(runtime.path, runtime.commit_sha, "f" * 32),
+        )
+        self.assertEqual(secured[secured.index("--runtime-mutation-id") + 1], "f" * 32)
+        self.assertNotIn("spoofed", secured)
 
     def test_runtime_child_does_not_reacquire_process_lock(self):
         with mock.patch.object(
@@ -527,6 +881,9 @@ class OriginIsolatedRegistrationAndExecutionTest(unittest.TestCase):
                 "run",
             ],
         ), mock.patch("loop_manager.validate_runtime_child"), mock.patch(
+            "loop_manager.validate_runtime_mutation",
+            return_value=loop_manager.RuntimeMutation(loop_manager.ROOT, Path("/state/runtime"), "a" * 40, None, True),
+        ), mock.patch(
             "loop_manager.execute_runtime_command", return_value=0
         ), mock.patch("loop_manager.process_lock") as process_lock:
             self.assertEqual(loop_manager.main(), 0)

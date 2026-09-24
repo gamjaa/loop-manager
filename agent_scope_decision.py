@@ -30,6 +30,30 @@ class ScopeCheck:
 @dataclass(frozen=True)
 class ScopeDecision:
     checks: tuple[ScopeCheck, ...]
+    reconciled_before: GitSnapshot | None = None
+
+
+def reconcile_runtime_snapshot(
+    snapshot: GitSnapshot,
+    original: GitSnapshot,
+    current: GitSnapshot,
+    runtime_path: str,
+) -> GitSnapshot:
+    """Carry only the verified parent runtime and origin/main delta forward."""
+    ref = "refs/remotes/origin/main"
+    worktrees = dict(snapshot.worktrees)
+    refs = dict(snapshot.refs)
+    if snapshot.worktrees.get(runtime_path) == original.worktrees.get(runtime_path):
+        worktrees[runtime_path] = current.worktrees[runtime_path]
+    if snapshot.refs.get(ref) == original.refs.get(ref):
+        refs[ref] = current.refs[ref]
+    symbolic_head = "refs/remotes/origin/HEAD"
+    if (
+        original.refs.get(symbolic_head) != current.refs.get(symbolic_head)
+        and snapshot.refs.get(symbolic_head) == original.refs.get(symbolic_head)
+    ):
+        refs[symbolic_head] = current.refs[symbolic_head]
+    return replace(snapshot, worktrees=worktrees, refs=refs)
 
 
 def metadata_changes_after_block(
@@ -128,12 +152,47 @@ def decide_persisted_scope(
     repo_key: str,
     planner_correction: bool,
     manager_cleanup_worktrees: frozenset[str],
+    manager_runtime: tuple[str, str] | None = None,
 ) -> ScopeDecision:
     """Describe ordered scope checks without reading Git or persisted state."""
     if role not in {"planner", "maintenance_planner", "worker", "reviewer"}:
         raise ScopeDecisionError(f"저장된 Agent 역할이 유효하지 않습니다: {role or '없음'}")
     if role == "worker" and not selected_plan_path:
         raise ScopeDecisionError("저장된 Worker ExecPlan 경로가 없습니다.")
+
+    if manager_runtime is not None:
+        runtime_path, runtime_sha = manager_runtime
+        registration = current.worktrees.get(runtime_path)
+        origin = current.refs.get("refs/remotes/origin/main")
+        previous_origin = before.refs.get("refs/remotes/origin/main")
+        previous_head = before.refs.get("refs/remotes/origin/HEAD")
+        current_head = current.refs.get("refs/remotes/origin/HEAD")
+        if (
+            registration is None
+            or f"HEAD={runtime_sha}" not in registration
+            or "detached=True" not in registration
+            or origin is None or origin[0] != runtime_sha
+            or before.worktrees.get(runtime_path) not in (None, registration)
+            or (previous_head != current_head and (
+                previous_origin is None
+                or previous_head != (previous_origin[0], "refs/remotes/origin/main")
+                or current_head != (runtime_sha, "refs/remotes/origin/main")
+            ))
+        ):
+            raise ScopeDecisionError(
+                f"runtime 기준선 증거가 일치하지 않습니다: {runtime_path} sha={runtime_sha}"
+            )
+        original_before = before
+        before = reconcile_runtime_snapshot(before, original_before, current, runtime_path)
+        if result is not None:
+            result = reconcile_runtime_snapshot(result, original_before, current, runtime_path)
+        if checkpoint is not None:
+            checkpoint = replace(
+                checkpoint,
+                snapshot=reconcile_runtime_snapshot(
+                    checkpoint.snapshot, original_before, current, runtime_path,
+                ),
+            )
 
     if planner_correction:
         correction_worktrees = dict(before.worktrees)
@@ -164,7 +223,7 @@ def decide_persisted_scope(
             worktrees=correction_worktrees, config=before.config,
             operations=before.operations, shared_metadata_complete=True,
         )
-        return ScopeDecision((ScopeCheck(role, correction_before, current, allowed_refs, allowed_worktrees),))
+        return ScopeDecision((ScopeCheck(role, correction_before, current, allowed_refs, allowed_worktrees),), before)
 
     if checkpoint is not None:
         checks: list[ScopeCheck] = []
@@ -192,7 +251,7 @@ def decide_persisted_scope(
             "reviewer", scope_before, current, manager_refs, allowed_cleanup,
             checkpoint_result=True,
         ))
-        return ScopeDecision(tuple(checks))
+        return ScopeDecision(tuple(checks), before)
 
     scope_before = before
     allowed_refs = frozenset()
@@ -216,4 +275,4 @@ def decide_persisted_scope(
         allowed_worktrees = metadata_changes_after_block(
             before.worktrees, result.worktrees, current.worktrees, frozenset((repo_key,)),
         ) | commit_worktrees
-    return ScopeDecision((ScopeCheck(role, scope_before, current, allowed_refs, allowed_worktrees),))
+    return ScopeDecision((ScopeCheck(role, scope_before, current, allowed_refs, allowed_worktrees),), before)

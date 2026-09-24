@@ -201,6 +201,8 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
                     "run",
                 ],
             ), mock.patch("loop_manager.validate_runtime_child"), mock.patch(
+                "loop_manager.validate_runtime_mutation", return_value=None,
+            ), mock.patch(
                 "builtins.print"
             ):
                 self.assertEqual(loop_manager.main(), 1)
