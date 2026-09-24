@@ -6735,6 +6735,10 @@ class AgentScopeValidatorTest(unittest.TestCase):
             legacy = replace(
                 current,
                 dirty={"cache.bin": (("untracked",), "old-signature")},
+                config={
+                    key: value for key, value in current.config.items()
+                    if not key.startswith("ignore-source:")
+                },
             )
             normalized = loop_manager._normalize_legacy_ignored_snapshot(
                 repo, legacy, current
@@ -6758,6 +6762,10 @@ class AgentScopeValidatorTest(unittest.TestCase):
             legacy = replace(
                 current,
                 dirty={"cache.bin": (("untracked",), "old-signature")},
+                config={
+                    key: value for key, value in current.config.items()
+                    if not key.startswith("ignore-source:")
+                },
             )
             state_dir = Path(directory) / "state"
             self._persist_interrupted_worker(state_dir, repo, plan_path, legacy)
@@ -6770,6 +6778,36 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     ),
                     current,
                 )
+            finally:
+                connection.close()
+
+    def test_legacy_snapshot_does_not_trust_unrecorded_exclude_rules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, plan_path = self._repository_with_plan(directory)
+            before = loop_manager.capture_git_snapshot(repo)
+            legacy = replace(
+                before,
+                config={
+                    key: value for key, value in before.config.items()
+                    if not key.startswith("ignore-source:")
+                },
+            )
+            state_dir = Path(directory) / "state"
+            self._persist_interrupted_worker(state_dir, repo, plan_path, legacy)
+            exclude = Path(git_command(repo, "rev-parse", "--git-path", "info/exclude"))
+            if not exclude.is_absolute():
+                exclude = repo / exclude
+            exclude.write_text(
+                exclude.read_text(encoding="utf-8") + "\nnew-cache.bin\n",
+                encoding="utf-8",
+            )
+            connection = sqlite3.connect(state_dir / "loop-manager.db")
+            connection.row_factory = sqlite3.Row
+            try:
+                with self.assertRaisesRegex(loop_manager.AgentScopeError, "ignore-source"):
+                    loop_manager.validate_persisted_agent_scope(
+                        connection, repo, state_dir, str(repo)
+                    )
             finally:
                 connection.close()
 
@@ -11282,6 +11320,66 @@ class MergeIndependentWorktreeCleanupTest(unittest.TestCase):
             self.assertIn("collide.txt", result.stdout)
             self.assertEqual((repo / "collide.txt").read_text(encoding="utf-8"), "local ignored")
             self.assertEqual(git_command(repo, "rev-parse", "HEAD"), head)
+
+    def test_rebase_resume_commands_preserve_ignored_next_commit_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            onto = git_command(repo, "rev-parse", "HEAD")
+            git_command(repo, "checkout", "-b", "feature")
+            (repo / "src/app.py").write_text("VALUE = 3\n", encoding="utf-8")
+            git_command(repo, "add", "src/app.py")
+            git_command(repo, "commit", "-m", "First feature commit")
+            (repo / "later.txt").write_text("tracked", encoding="utf-8")
+            git_command(repo, "add", "later.txt")
+            git_command(repo, "commit", "-m", "Next feature commit")
+            original_head = git_command(repo, "rev-parse", "HEAD")
+            git_command(repo, "checkout", "main")
+            exclude = Path(git_command(repo, "rev-parse", "--git-path", "info/exclude"))
+            if not exclude.is_absolute():
+                exclude = repo / exclude
+            exclude.write_text(
+                exclude.read_text(encoding="utf-8") + "\nlater.txt\n",
+                encoding="utf-8",
+            )
+            ignored = repo / "later.txt"
+            ignored.write_text("local ignored", encoding="utf-8")
+            rebase_dir = Path(
+                git_command(repo, "rev-parse", "--git-path", "rebase-merge")
+            )
+            if not rebase_dir.is_absolute():
+                rebase_dir = repo / rebase_dir
+            rebase_dir.mkdir()
+            (rebase_dir / "orig-head").write_text(original_head, encoding="ascii")
+            (rebase_dir / "onto").write_text(onto, encoding="ascii")
+            for arguments in (
+                ("-c", "core.editor=true", "rebase", "--continue"),
+                ("rebase", "--skip"),
+                ("rebase", "--abort"),
+            ):
+                with self.subTest(arguments=arguments), mock.patch(
+                    "loop_manager.command",
+                    side_effect=AssertionError("Git write started"),
+                ):
+                    result = loop_manager.git(repo, *arguments, check=False)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("later.txt", result.stdout)
+                    self.assertEqual(ignored.read_text(encoding="utf-8"), "local ignored")
+            ignored.unlink()
+            exclude.write_text(
+                exclude.read_text(encoding="utf-8") + "\n*.cache\n",
+                encoding="utf-8",
+            )
+            (repo / "unrelated.cache").write_text("keep", encoding="utf-8")
+            with mock.patch(
+                "loop_manager.command",
+                return_value=subprocess.CompletedProcess([], 0, "continued"),
+            ) as command_call:
+                allowed = loop_manager.git(
+                    repo, "-c", "core.editor=true", "rebase", "--continue",
+                    check=False,
+                )
+            self.assertEqual(allowed.returncode, 0)
+            command_call.assert_called_once()
 
     def test_merge_modes_do_not_use_base_ancestry_for_cleanup(self):
         for mode in ("merge", "squash", "rebase"):

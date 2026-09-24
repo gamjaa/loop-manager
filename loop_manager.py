@@ -1373,14 +1373,30 @@ def is_git_lock_failure(output: str) -> bool:
 
 
 def git(repo: Path, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    if arguments and arguments[0] == "rebase" and not arguments[-1].startswith("-"):
-        overlaps = _ignored_paths_overlapping_git_update(repo, arguments[-1])
-        if overlaps:
-            message = "rebase 대상 tracked 경로와 겹치는 ignored 파일: " + ", ".join(overlaps[:8])
+    command_index = 0
+    while command_index < len(arguments) and arguments[command_index] == "-c":
+        command_index += 2
+    if arguments[command_index : command_index + 1] == ("rebase",):
+        rebase_arguments = arguments[command_index + 1:]
+        overlap_error = None
+        if rebase_arguments and rebase_arguments[-1] in {
+            "--continue", "--skip", "--abort"
+        }:
+            overlap_error = _rebase_resume_ignored_overlap(repo, rebase_arguments[-1])
+        elif rebase_arguments and not rebase_arguments[-1].startswith("-"):
+            overlaps = _ignored_paths_overlapping_git_update(
+                repo, rebase_arguments[-1]
+            )
+            if overlaps:
+                overlap_error = (
+                    "rebase 대상 tracked 경로와 겹치는 ignored 파일: "
+                    + ", ".join(overlaps[:8])
+                )
+        if overlap_error:
             if check:
-                raise ManagedWorktreeConflictError(message)
+                raise ManagedWorktreeConflictError(overlap_error)
             return subprocess.CompletedProcess(
-                ["git", "-C", str(repo), *arguments], 1, message
+                ["git", "-C", str(repo), *arguments], 1, overlap_error
             )
     result = command(["git", "-C", str(repo), *arguments], check=False)
     if check and result.returncode:
@@ -5612,6 +5628,59 @@ def _ignored_paths_overlapping_git_update(worktree: Path, target: str) -> list[s
     )
 
 
+def _rebase_resume_ignored_overlap(worktree: Path, action: str) -> str | None:
+    ignored = _ignored_worktree_paths(worktree)
+    if not ignored:
+        return None
+    metadata: tuple[str, str] | None = None
+    for directory in ("rebase-merge", "rebase-apply"):
+        values = []
+        for name in ("orig-head", "onto"):
+            raw_path = os.fsdecode(
+                git_bytes(
+                    worktree, "rev-parse", "--git-path", f"{directory}/{name}"
+                ).strip()
+            )
+            path = Path(raw_path)
+            if not path.is_absolute():
+                path = worktree / path
+            if not path.is_file():
+                break
+            values.append(path.read_text(encoding="ascii").strip())
+        if len(values) == 2:
+            metadata = values[0], values[1]
+            break
+    if metadata is None:
+        return "rebase 재개 전 남은 tracked 경로를 확인할 수 없습니다."
+    original_head, onto = metadata
+    if action == "--abort":
+        changed = _nul_git_paths(
+            worktree, "diff", "--name-only", "-z", "HEAD", original_head
+        )
+    else:
+        commits = git_bytes(
+            worktree, "rev-list", "--reverse", original_head, f"^{onto}"
+        ).decode("ascii").splitlines()
+        changed = [
+            path
+            for commit in commits
+            for path in _nul_git_paths(
+                worktree, "diff-tree", "-m", "--root", "--no-commit-id",
+                "--name-only", "-r", "-z", commit,
+            )
+        ]
+    overlaps = sorted(
+        path for path in ignored
+        if any(_paths_overlap(path, candidate) for candidate in changed)
+    )
+    if overlaps:
+        return (
+            "rebase 재개 tracked 경로와 겹치는 ignored 파일: "
+            + ", ".join(overlaps[:8])
+        )
+    return None
+
+
 def _base_worktree_snapshot(
     repo: Path,
 ) -> tuple[str | None, str, str, tuple[tuple[str, str], ...], tuple[str, ...]]:
@@ -8232,6 +8301,41 @@ def _config_entries(worktree: Path) -> dict[str, tuple[str, ...]]:
         signature = _git_operation_path_signature(canonical) if canonical.exists() else "missing"
         snapshot[f"ignore-source:{name}"] = (str(canonical), signature)
     return snapshot
+
+
+def _with_proven_legacy_ignore_config(
+    saved: GitSnapshot, current_config: dict[str, tuple[str, ...]]
+) -> GitSnapshot:
+    """Fill old snapshot keys only when external ignore sources have no rules."""
+
+    keys = tuple(
+        sorted(key for key in current_config if key.startswith("ignore-source:"))
+    )
+    if any(key.startswith("ignore-source:") for key in saved.config):
+        return saved
+    if len(keys) != 2:
+        return saved
+    for key in keys:
+        path_text, signature = current_config[key]
+        path = Path(path_text)
+        if signature == "missing":
+            if path.exists() or path.is_symlink():
+                return saved
+            continue
+        try:
+            if not path.is_file() or _git_operation_path_signature(path) != signature:
+                return saved
+            if any(
+                line and not line.startswith(b"#")
+                for line in path.read_bytes().splitlines()
+            ):
+                return saved
+        except OSError:
+            return saved
+    return replace(
+        saved,
+        config={**saved.config, **{key: current_config[key] for key in keys}},
+    )
 
 
 # AUTO_MERGE is deliberately excluded. The ort strategy may leave this
@@ -11350,6 +11454,7 @@ def validate_persisted_agent_scope(
     saved_worktree = Path(str(project["worktree"] or ""))
     config_context = saved_worktree if saved_worktree.is_dir() else repo_path
     current_config = _config_entries(config_context)
+    before = _with_proven_legacy_ignore_config(before, current_config)
     changed_keys = sorted(
         key
         for key in set(before.config) | set(current_config)
@@ -11421,12 +11526,15 @@ def validate_persisted_agent_scope(
 
     before = _normalize_legacy_ignored_snapshot(saved_worktree, before, current)
     if result is not None:
+        result = _with_proven_legacy_ignore_config(result, current_config)
         result = _normalize_legacy_ignored_snapshot(saved_worktree, result, current)
     if checkpoint is not None:
         checkpoint = replace(
             checkpoint,
             snapshot=_normalize_legacy_ignored_snapshot(
-                saved_worktree, checkpoint.snapshot, current
+                saved_worktree,
+                _with_proven_legacy_ignore_config(checkpoint.snapshot, current_config),
+                current,
             ),
         )
 
