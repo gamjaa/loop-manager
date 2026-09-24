@@ -6491,6 +6491,65 @@ risk: medium
         self.assertIn("%5BR-004%5D%20%ED%95%9C%EA%B8%80%20%EC%9A%94%EA%B5%AC%EC%82%AC%ED%95%AD.md", body)
 
 class AgentScopeValidatorTest(unittest.TestCase):
+    def test_self_hosted_runtime_preserves_interrupted_worker_and_reviewer_identity(self):
+        for role in ("worker", "reviewer"):
+            with self.subTest(role=role), tempfile.TemporaryDirectory() as directory:
+                repo, plan_path = self._repository_with_plan(directory)
+                before = loop_manager.capture_git_snapshot(repo)
+                state_dir = Path(directory) / "state"
+                self._persist_interrupted_worker(state_dir, repo, plan_path, before)
+                connection = sqlite3.connect(state_dir / "loop-manager.db")
+                connection.row_factory = sqlite3.Row
+                connection.execute(
+                    "UPDATE projects SET agent_role = ?, worker_session_id = 'worker-existing', "
+                    "reviewer_session_id = 'reviewer-existing' WHERE repo = ?",
+                    (role, str(repo)),
+                )
+                connection.commit()
+
+                writer = Path(directory) / "writer"
+                subprocess.run(
+                    ["git", "clone", str(Path(directory) / "remote.git"), str(writer)],
+                    check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                )
+                git_command(writer, "config", "user.email", "loop-manager@example.com")
+                git_command(writer, "config", "user.name", "Loop Manager Test")
+                (writer / "README.md").write_text("# Changed\n", encoding="utf-8")
+                commit_and_push(writer, "Advance runtime")
+                selected_sha = git_command(writer, "rev-parse", "HEAD")
+
+                with mock.patch("loop_manager.github_repository", return_value="owner/repo"):
+                    with loop_manager.process_lock(state_dir) as handle:
+                        mutation_id = "d" * 32
+                        runtime = loop_manager.prepare_runtime_worktree(
+                            repo, state_dir, mutation_id=mutation_id,
+                        )
+                        loop_manager._write_process_lock_identity(handle, f"runtime:{mutation_id}")
+                        with mock.patch.object(loop_manager, "ROOT", runtime.path):
+                            identity = loop_manager.validate_runtime_mutation(
+                                repo, state_dir, selected_sha, mutation_id,
+                            )
+                        loop_manager.validate_persisted_agent_scope(
+                            connection, repo, state_dir, str(repo),
+                            runtime_mutation=identity,
+                        )
+                project = connection.execute(
+                    "SELECT worker_session_id, reviewer_session_id, agent_snapshot "
+                    "FROM projects WHERE repo = ?", (str(repo),),
+                ).fetchone()
+                plan = connection.execute(
+                    "SELECT status, retry_count FROM exec_plans WHERE repo = ? "
+                    "AND plan_id = 'G-001'", (str(repo),),
+                ).fetchone()
+                self.assertEqual(project["worker_session_id"], "worker-existing")
+                self.assertEqual(project["reviewer_session_id"], "reviewer-existing")
+                self.assertEqual(plan["status"], "IMPLEMENTING")
+                self.assertEqual(plan["retry_count"], 0)
+                self.assertIn(str(runtime.path), loop_manager.GitSnapshot.deserialize(
+                    project["agent_snapshot"]
+                ).worktrees)
+                connection.close()
+
     def _repository_with_plan(self, directory: str) -> tuple[Path, str]:
         repo = make_remote_repository(directory)
         (repo / "docs/plans").mkdir()
@@ -7763,6 +7822,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 ), mock.patch(
                     "loop_manager.validate_runtime_child"
                 ), mock.patch(
+                    "loop_manager.validate_runtime_mutation", return_value=None
+                ), mock.patch(
                     "loop_manager.git",
                     side_effect=AssertionError(
                         "unsafe Git command before config validation"
@@ -7835,6 +7896,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 ],
             ), mock.patch(
                 "loop_manager.validate_runtime_child"
+            ), mock.patch(
+                "loop_manager.validate_runtime_mutation", return_value=None
             ), mock.patch(
                 "loop_manager.validate_repository",
                 return_value=repo,
@@ -15077,6 +15140,29 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
             stored,
             {repo: Path(repo).name for repo in repos},
         )
+
+    def test_scheduler_forwards_runtime_mutation_when_present(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir, connection, config, repos = self._scheduler_state(
+                directory, ("manager",), max_workers=1,
+            )
+            mutation = loop_manager.RuntimeMutation(
+                Path(repos[0]), state_dir / "runtime", "a" * 40, "b" * 32,
+            )
+            try:
+                with mock.patch(
+                    "loop_manager.run_project_result",
+                    return_value=loop_manager.ProjectRunResult(
+                        loop_manager.ProjectRunKind.WAITING, 0,
+                    ),
+                ) as run_project:
+                    outcomes = loop_manager.schedule_registered_projects(
+                        connection, state_dir, config, runtime_mutation=mutation,
+                    )
+                self.assertEqual(tuple(item.repo for item in outcomes), repos)
+                self.assertIs(run_project.call_args.kwargs["runtime_mutation"], mutation)
+            finally:
+                connection.close()
 
     def test_project_failures_are_classified_without_cancelling_peers(self):
         names = (

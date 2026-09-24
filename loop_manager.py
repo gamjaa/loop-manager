@@ -18,6 +18,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import sqlite3
 import stat
@@ -440,6 +441,16 @@ class RuntimeWorktree:
 
     path: Path
     commit_sha: str
+    mutation_id: str | None = None
+
+
+@dataclass(frozen=True)
+class RuntimeMutation:
+    source: Path
+    path: Path
+    commit_sha: str
+    mutation_id: str | None
+    legacy: bool = False
 
 
 class GitLockError(RuntimeError):
@@ -793,15 +804,11 @@ def is_lock_contention(error: OSError) -> bool:
 
 
 @contextlib.contextmanager
-def process_lock(state_dir: Path):
+def process_lock(state_dir: Path, *, identity: str = "0"):
     # ponytail: 부트스트랩은 전역 직렬화한다. 실제 병렬 처리 도입 시 프로젝트별 잠금으로 교체한다.
     state_dir.mkdir(parents=True, exist_ok=True)
     lock_path = state_dir / "loop-manager.lock"
-    handle = lock_path.open("a+b")
-    handle.seek(0)
-    if handle.read(1) == b"":
-        handle.write(b"0")
-        handle.flush()
+    handle = os.fdopen(os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600), "r+b")
     handle.seek(0)
     try:
         if os.name == "nt":
@@ -818,7 +825,8 @@ def process_lock(state_dir: Path):
             raise ProcessLockBusyError("다른 Loop Manager 프로세스가 실행 중입니다.") from error
         raise
     try:
-        yield
+        _write_process_lock_identity(handle, identity)
+        yield handle
     finally:
         handle.seek(0)
         if os.name == "nt":
@@ -826,6 +834,141 @@ def process_lock(state_dir: Path):
         else:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         handle.close()
+
+
+def _write_process_lock_identity(handle, identity: str) -> None:
+    handle.seek(0)
+    handle.write(identity.encode("ascii"))
+    handle.truncate()
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def _held_process_lock_identity(state_dir: Path) -> str:
+    """Read the parent lease only after proving another process still holds it."""
+    with (state_dir / "loop-manager.lock").open("r+b") as handle:
+        identity = handle.read(128).decode("ascii", errors="replace")
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if is_lock_contention(error):
+                return identity
+            raise
+        else:
+            if os.name == "nt":
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    raise RuntimeError("runtime 부모 process lock이 유지되지 않습니다.")
+
+
+def _runtime_intent_path(state_dir: Path, mutation_id: str) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{32}", mutation_id):
+        raise RuntimeError("runtime mutation ID 형식이 유효하지 않습니다.")
+    return state_dir / "runtime-intents" / f"{mutation_id}.json"
+
+
+def _runtime_intent_fields(source: Path, runtime: Path, sha: str) -> dict[str, str]:
+    return {
+        "source": str(_canonical_path(source)),
+        "path": str(_canonical_path(runtime)),
+        "sha": sha,
+    }
+
+
+def _write_runtime_intent(
+    state_dir: Path, mutation_id: str, source: Path, runtime: Path, sha: str,
+    *, created: bool, lock_reason: str | None,
+) -> None:
+    path = _runtime_intent_path(state_dir, mutation_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        **_runtime_intent_fields(source, runtime, sha),
+        "created": created,
+        "lock_reason": lock_reason,
+    }
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    if os.name != "nt":
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+
+def _read_runtime_intent(
+    state_dir: Path, mutation_id: str, source: Path, runtime: Path, sha: str,
+) -> tuple[bool, str | None]:
+    try:
+        payload = json.loads(_runtime_intent_path(state_dir, mutation_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise RuntimeError("runtime mutation intent를 확인할 수 없습니다.") from error
+    if not isinstance(payload, dict) or any(
+        payload.get(key) != value
+        for key, value in _runtime_intent_fields(source, runtime, sha).items()
+    ) or type(payload.get("created")) is not bool or (
+        payload.get("lock_reason") is not None
+        and not isinstance(payload.get("lock_reason"), str)
+    ):
+        raise RuntimeError("runtime mutation intent의 repository·경로·SHA가 다릅니다.")
+    return payload["created"], payload.get("lock_reason")
+
+
+def _legacy_runtime_adoption_path(state_dir: Path, source: Path, sha: str) -> Path:
+    return state_dir / "runtime-intents" / "legacy" / runtime_repository_id(source) / f"{sha}.json"
+
+
+def _validate_legacy_runtime_adoption(
+    state_dir: Path, source: Path, runtime: Path, sha: str,
+) -> None:
+    try:
+        payload = json.loads(
+            _legacy_runtime_adoption_path(state_dir, source, sha).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError) as error:
+        raise WorkspaceOwnershipError(
+            f"runtime의 구버전 전환 소유 증거가 없습니다: {runtime}"
+        ) from error
+    if payload != {**_runtime_intent_fields(source, runtime, sha), "legacy": True}:
+        raise WorkspaceOwnershipError(
+            f"runtime의 구버전 전환 소유 증거가 다릅니다: {runtime}"
+        )
+
+
+def _record_legacy_runtime_adoption(
+    state_dir: Path, source: Path, runtime: Path, sha: str,
+) -> None:
+    path = _legacy_runtime_adoption_path(state_dir, source, sha)
+    if path.exists():
+        _validate_legacy_runtime_adoption(state_dir, source, runtime, sha)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {**_runtime_intent_fields(source, runtime, sha), "legacy": True}
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        _validate_legacy_runtime_adoption(state_dir, source, runtime, sha)
+        return
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    if os.name != "nt":
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
 
 def runtime_repository_id(source: Path) -> str:
@@ -875,7 +1018,17 @@ def validate_runtime_worktree(
         )
 
 
-def prepare_runtime_worktree(source: Path, state_dir: Path) -> RuntimeWorktree:
+def _runtime_catalog_record(source: Path, runtime: Path) -> dict[str, str | bool]:
+    expected = _canonical_path(runtime)
+    for record in _worktree_catalog(source):
+        if _canonical_path(Path(str(record.get("worktree", "")))) == expected:
+            return record
+    raise WorkspaceOwnershipError(f"runtime Git worktree 등록이 없습니다: {runtime}")
+
+
+def prepare_runtime_worktree(
+    source: Path, state_dir: Path, *, mutation_id: str | None = None,
+) -> RuntimeWorktree:
     """Fetch origin/main and select an immutable linked runtime worktree."""
 
     source = _canonical_path(source)
@@ -913,7 +1066,26 @@ def prepare_runtime_worktree(source: Path, state_dir: Path) -> RuntimeWorktree:
                 f"runtime 경로가 디렉터리가 아닙니다: {runtime}"
             )
         validate_runtime_worktree(source, state_dir, runtime, commit_sha)
-        return RuntimeWorktree(runtime, commit_sha)
+        if mutation_id is not None:
+            record = _runtime_catalog_record(source, runtime)
+            lock_reason = record.get("locked")
+            if lock_reason:
+                prefix = "loop-manager-runtime:"
+                if not isinstance(lock_reason, str) or not lock_reason.startswith(prefix):
+                    raise WorkspaceOwnershipError(f"runtime 잠금 소유권을 확인할 수 없습니다: {runtime}")
+                prior_id = lock_reason.removeprefix(prefix)
+                prior_created, prior_lock = _read_runtime_intent(
+                    state_dir, prior_id, source, runtime, commit_sha,
+                )
+                if not prior_created or prior_lock != lock_reason:
+                    raise WorkspaceOwnershipError(f"runtime 등록 증거가 유효하지 않습니다: {runtime}")
+            else:
+                _validate_legacy_runtime_adoption(state_dir, source, runtime, commit_sha)
+            _write_runtime_intent(
+                state_dir, mutation_id, source, runtime, commit_sha,
+                created=False, lock_reason=lock_reason if isinstance(lock_reason, str) else None,
+            )
+        return RuntimeWorktree(runtime, commit_sha, mutation_id)
 
     expected_path = _canonical_path(runtime)
     registered = next(
@@ -930,9 +1102,17 @@ def prepare_runtime_worktree(source: Path, state_dir: Path) -> RuntimeWorktree:
             f"runtime 경로가 없지만 Git worktree 등록이 남아 있습니다: {runtime}"
         )
     runtime.parent.mkdir(parents=True, exist_ok=True)
-    git(source, "worktree", "add", "--detach", str(runtime), commit_sha)
+    if mutation_id is not None:
+        _write_runtime_intent(
+            state_dir, mutation_id, source, runtime, commit_sha,
+            created=True, lock_reason=f"loop-manager-runtime:{mutation_id}",
+        )
+        git(source, "worktree", "add", "--detach", "--lock",
+            f"--reason=loop-manager-runtime:{mutation_id}", str(runtime), commit_sha)
+    else:
+        git(source, "worktree", "add", "--detach", str(runtime), commit_sha)
     validate_runtime_worktree(source, state_dir, runtime, commit_sha)
-    return RuntimeWorktree(runtime, commit_sha)
+    return RuntimeWorktree(runtime, commit_sha, mutation_id)
 
 
 def source_config_path(source: Path, value: str) -> Path:
@@ -959,6 +1139,7 @@ def runtime_child_arguments(
         "--config",
         "--runtime-source",
         "--runtime-sha",
+        "--runtime-mutation-id",
     }
     for argument in arguments:
         if skip_value:
@@ -974,12 +1155,17 @@ def runtime_child_arguments(
         stripped.append(argument)
     if skip_value:
         raise RuntimeError("경로 옵션 값이 없습니다.")
-    return [
+    child_arguments = [
         "--runtime-child",
         "--runtime-source",
         str(source),
         "--runtime-sha",
         runtime.commit_sha,
+    ]
+    if runtime.mutation_id is not None:
+        child_arguments.extend(("--runtime-mutation-id", runtime.mutation_id))
+    return [
+        *child_arguments,
         "--state-dir",
         str(state_dir),
         "--config",
@@ -1021,6 +1207,58 @@ def validate_runtime_child(
     commit_sha: str,
 ) -> None:
     validate_runtime_worktree(source, state_dir, ROOT, commit_sha)
+
+
+def validate_runtime_mutation(
+    source: Path, state_dir: Path, sha: str, mutation_id: str | None,
+) -> RuntimeMutation:
+    """Bind a child invocation to the held parent lock and actual Git runtime."""
+    runtime = expected_runtime_worktree(state_dir, source, sha)
+    if _canonical_path(ROOT) != _canonical_path(runtime):
+        raise RuntimeError(f"runtime 경로가 선택한 SHA와 다릅니다: {ROOT} (expected {runtime})")
+    identity = _held_process_lock_identity(state_dir)
+    if mutation_id is None:
+        if identity != "0":
+            raise RuntimeError("mutation ID가 없는 새 형식 runtime 호출은 허용되지 않습니다.")
+        legacy = True
+    else:
+        if identity != f"runtime:{mutation_id}":
+            raise RuntimeError("runtime mutation ID와 부모 process lock이 다릅니다.")
+        legacy = False
+        created, expected_lock_reason = _read_runtime_intent(
+            state_dir, mutation_id, source, runtime, sha,
+        )
+    origin_sha = git(source, "rev-parse", "--verify", "refs/remotes/origin/main^{commit}").stdout.strip()
+    if origin_sha != sha:
+        raise RuntimeError(f"runtime SHA가 현재 origin/main과 다릅니다: {sha} (origin/main {origin_sha})")
+    validate_runtime_worktree(source, state_dir, runtime, sha)
+    if legacy:
+        record = _runtime_catalog_record(source, runtime)
+        lock_reason = record.get("locked")
+        if lock_reason:
+            prefix = "loop-manager-runtime:"
+            if not isinstance(lock_reason, str) or not lock_reason.startswith(prefix):
+                raise RuntimeError("구버전 runtime 잠금 소유권을 확인할 수 없습니다.")
+            prior_created, prior_lock = _read_runtime_intent(
+                state_dir, lock_reason.removeprefix(prefix), source, runtime, sha,
+            )
+            if not prior_created or prior_lock != lock_reason:
+                raise RuntimeError("구버전 runtime 등록 증거가 유효하지 않습니다.")
+        else:
+            _record_legacy_runtime_adoption(state_dir, source, runtime, sha)
+    if not legacy:
+        record = _runtime_catalog_record(source, runtime)
+        if record.get("locked") != expected_lock_reason:
+            raise RuntimeError("runtime 등록의 durable mutation 표식이 다릅니다.")
+        if created and expected_lock_reason != f"loop-manager-runtime:{mutation_id}":
+            raise RuntimeError("runtime 등록의 durable mutation ID가 다릅니다.")
+        if not created and expected_lock_reason is None:
+            _validate_legacy_runtime_adoption(state_dir, source, runtime, sha)
+    operation_log(
+        f"runtime mutation 검증: path={runtime} sha={sha} "
+        f"mode={'legacy' if legacy else 'owned'}"
+    )
+    return RuntimeMutation(source, runtime, sha, mutation_id, legacy)
 
 class StateConnection(sqlite3.Connection):
     """Keep completed schema initialization local to one database connection."""
@@ -11654,6 +11892,7 @@ def validate_persisted_agent_scope(
     *,
     allow_planner_worktree_correction: bool = False,
     manager_cleanup_worktrees: frozenset[str] = frozenset(),
+    runtime_mutation: RuntimeMutation | None = None,
 ) -> GitSnapshot | None:
     """Validate persisted Agent output before repository-aware Git work."""
 
@@ -11760,6 +11999,28 @@ def validate_persisted_agent_scope(
             ),
         )
 
+    manager_runtime: tuple[str, str] | None = None
+    if runtime_mutation is not None and _canonical_path(repo_path) == _canonical_path(runtime_mutation.source):
+        try:
+            held_identity = _held_process_lock_identity(state_dir)
+            expected_identity = (
+                "0" if runtime_mutation.legacy
+                else f"runtime:{runtime_mutation.mutation_id}"
+            )
+            if held_identity != expected_identity:
+                raise WorkspaceOwnershipError(
+                    "runtime scope 검증 중 부모 process lock identity가 변경됐습니다."
+                )
+            validate_runtime_worktree(
+                runtime_mutation.source, state_dir,
+                runtime_mutation.path, runtime_mutation.commit_sha,
+            )
+        except RuntimeError as error:
+            raise AgentScopeError(f"runtime mutation 검증 실패: {error}") from error
+        manager_runtime = (
+            str(_canonical_path(runtime_mutation.path)), runtime_mutation.commit_sha,
+        )
+
     try:
         decision = agent_scope_decision.decide_persisted_scope(
             role=role_name,
@@ -11774,9 +12035,17 @@ def validate_persisted_agent_scope(
             repo_key=str(_canonical_path(repo_path)),
             planner_correction=allow_planner_worktree_correction,
             manager_cleanup_worktrees=manager_cleanup_worktrees,
+            manager_runtime=manager_runtime,
         )
     except agent_scope_decision.ScopeDecisionError as error:
         raise AgentScopeError(str(error)) from error
+    if manager_runtime is not None:
+        operation_log(
+            "runtime scope 기준선 검증: "
+            f"before={hashlib.sha256(before.serialize().encode()).hexdigest()[:16]} "
+            f"current={hashlib.sha256(current.serialize().encode()).hexdigest()[:16]} "
+            f"path={manager_runtime[0]} sha={manager_runtime[1]}"
+        )
     for check in decision.checks:
         try:
             validate_agent_scope(
@@ -11804,6 +12073,14 @@ def validate_persisted_agent_scope(
                     f"중단된 Manager Git 작업 후 Agent scope 검증 실패: {error}"
                 ) from error
             raise
+    if decision.reconciled_before is not None and decision.reconciled_before != before:
+        update_project(
+            connection, repo,
+            agent_snapshot=decision.reconciled_before.serialize(),
+        )
+        operation_log(
+            f"runtime scope 기준선 반영: path={manager_runtime[0]} sha={manager_runtime[1]}"
+        )
     return current
 
 
@@ -16465,6 +16742,71 @@ def _planning_outcome_step_result(outcome: PlanningOutcome) -> int | None:
     return 1
 
 
+def reconcile_false_positive_runtime_block(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    state_dir: Path,
+    repo: str,
+    project: sqlite3.Row,
+    block: sqlite3.Row,
+    runtime_mutation: RuntimeMutation,
+) -> bool:
+    """Reconcile a saved prevalidation result only when its entire delta is ours."""
+    if (
+        _canonical_path(repo_path) != _canonical_path(runtime_mutation.source)
+        or not str(block["evidence"] or "").startswith("Agent 범위 선검증 실패:")
+        or not project["agent_snapshot"]
+        or not project["agent_result_snapshot"]
+    ):
+        return False
+    try:
+        before = GitSnapshot.deserialize(str(project["agent_snapshot"]))
+        result = GitSnapshot.deserialize(str(project["agent_result_snapshot"]))
+        saved_worktree = Path(str(project["worktree"] or repo))
+        current = capture_git_snapshot(saved_worktree)
+        runtime_path = str(_canonical_path(runtime_mutation.path))
+        expected = agent_scope_decision.reconcile_runtime_snapshot(
+            before, before, current, runtime_path,
+        )
+        if result != current:
+            operation_log(
+                f"runtime 차단 재조정 거부: 결과 snapshot 불일치 "
+                f"path={runtime_path} sha={runtime_mutation.commit_sha}",
+                error=True,
+            )
+            return False
+        if expected != current:
+            deltas = []
+            for label, older, newer in (
+                ("refs", expected.refs, current.refs),
+                ("worktrees", expected.worktrees, current.worktrees),
+                ("config", expected.config, current.config),
+                ("operations", expected.operations, current.operations),
+            ):
+                changed = sorted(
+                    key for key in set(older) | set(newer)
+                    if older.get(key) != newer.get(key)
+                )
+                if changed:
+                    deltas.append(f"{label}={','.join(changed[:8])}")
+            if any(getattr(expected, key) != getattr(current, key)
+                   for key in ("head", "branch", "index", "dirty")):
+                deltas.append("local-state")
+            operation_log(
+                f"runtime 차단 재조정 거부: path={runtime_path} "
+                f"sha={runtime_mutation.commit_sha} delta={'; '.join(deltas)}",
+                error=True,
+            )
+            return False
+        validate_persisted_agent_scope(
+            connection, repo_path, state_dir, repo,
+            runtime_mutation=runtime_mutation,
+        )
+    except (AgentScopeError, RuntimeError, ValueError, KeyError):
+        return False
+    return True
+
+
 def _run_project_step(
     connection: sqlite3.Connection,
     state_dir: Path,
@@ -16477,6 +16819,7 @@ def _run_project_step(
     planner_mutex: threading.Lock | None = None,
     refactoring_review_interval: int = 5,
     verify_timeout_seconds: int = 600,
+    runtime_mutation: RuntimeMutation | None = None,
 ) -> int:
     # Resolve the persisted project key without consulting repository config.
     # An interrupted Agent may have changed origin or hooksPath, so the saved
@@ -16509,6 +16852,11 @@ def _run_project_step(
     initial_project_block = (
         scoped_blocking.project_block(connection, repo) if row is not None else None
     )
+    if row is not None and initial_project_block is not None and runtime_mutation is not None:
+        reconcile_false_positive_runtime_block(
+            connection, repo_path, state_dir, repo, row,
+            initial_project_block, runtime_mutation,
+        )
     if (
         row is not None
         and initial_project_block is not None
@@ -16576,6 +16924,7 @@ def _run_project_step(
                 repo,
                 allow_planner_worktree_correction=planner_correction,
                 manager_cleanup_worktrees=cleanup_candidates,
+                **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
             )
         except AgentScopeError as error:
             detail = str(error)
@@ -17059,6 +17408,7 @@ def run_project_result(
     refactoring_review_interval: int = 5,
     verify_timeout_seconds: int = 600,
     on_step_completed: Callable[[], None] | None = None,
+    runtime_mutation: RuntimeMutation | None = None,
 ) -> ProjectRunResult:
     """Run retryable validation progress to a stable project-level outcome."""
 
@@ -17097,7 +17447,7 @@ def run_project_result(
                     (repo,),
                 )
             }
-            step_result = _run_project_step(
+            step_arguments = (
                 connection,
                 state_dir,
                 repo_arg,
@@ -17109,6 +17459,10 @@ def run_project_result(
                 planner_mutex,
                 refactoring_review_interval,
                 verify_timeout_seconds,
+            )
+            step_result = _run_project_step(
+                *step_arguments,
+                **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
             )
         except GitLockError as error:
             _record_project_recovery(
@@ -17277,6 +17631,7 @@ def _run_registered_project(
     planner_mutex: threading.Lock,
     refactoring_review_interval: int,
     verify_timeout_seconds: int = 600,
+    runtime_mutation: RuntimeMutation | None = None,
 ) -> ScheduledProjectResult:
     """Run one registry row with state isolated to this worker connection."""
 
@@ -17319,6 +17674,7 @@ def _run_registered_project(
                 refactoring_review_interval=refactoring_review_interval,
                 verify_timeout_seconds=verify_timeout_seconds,
                 on_step_completed=deliver_new_pr_notifications,
+                **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
             )
     except (ManagedConfigError, project_registry.ProjectRegistryError) as error:
         result = ProjectRunResult(
@@ -17347,6 +17703,7 @@ def schedule_registered_projects(
     connection: sqlite3.Connection,
     state_dir: Path,
     config: ManagedConfig,
+    runtime_mutation: RuntimeMutation | None = None,
 ) -> tuple[ScheduledProjectResult, ...]:
     """Run each registered project once with bounded cross-project concurrency."""
 
@@ -17371,6 +17728,7 @@ def schedule_registered_projects(
                 planner_mutex,
                 config.refactoring_review_interval,
                 config.verify_timeout_seconds,
+                **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
             )
             for project in projects
         )
@@ -17381,6 +17739,7 @@ def run_registered_projects(
     connection: sqlite3.Connection,
     state_dir: Path,
     config: ManagedConfig,
+    runtime_mutation: RuntimeMutation | None = None,
 ) -> int:
     """Run all registered projects and aggregate outcomes after every worker exits."""
 
@@ -17392,7 +17751,10 @@ def run_registered_projects(
         operation_log(
             f"알림 재시도 실패 ({type(error).__name__})", error=True
         )
-    results = schedule_registered_projects(connection, state_dir, config)
+    results = schedule_registered_projects(
+        connection, state_dir, config,
+        **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
+    )
     try:
         notifications.dispatch_pending(
             connection, config.telegram_token, config.telegram_chat_id
@@ -17462,6 +17824,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--runtime-source", help=argparse.SUPPRESS)
     parser.add_argument("--runtime-sha", help=argparse.SUPPRESS)
+    parser.add_argument("--runtime-mutation-id", help=argparse.SUPPRESS)
     subcommands = parser.add_subparsers(dest="command", required=True)
     subcommands.add_parser("init", help=argparse.SUPPRESS)
 
@@ -17503,6 +17866,7 @@ def execute_runtime_command(
     args: argparse.Namespace,
     state_dir: Path,
     config_path: Path,
+    runtime_mutation: RuntimeMutation | None = None,
 ) -> int:
     config = load_managed_config(config_path)
     if args.command == "init":
@@ -17514,7 +17878,10 @@ def execute_runtime_command(
         return configure_registry(args, state_dir, config_path)
     with connect_database(state_dir) as connection:
         agent_invocation_state.InvocationRepository(connection).reconcile_interrupted()
-        return run_registered_projects(connection, state_dir, config)
+        return run_registered_projects(
+            connection, state_dir, config,
+            **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
+        )
 
 
 def main() -> int:
@@ -17528,11 +17895,20 @@ def main() -> int:
                 raise RuntimeError("runtime 자식 소유권 정보가 없습니다.")
             source = Path(args.runtime_source).expanduser().resolve()
             validate_runtime_child(source, state_dir, str(args.runtime_sha))
-            return execute_runtime_command(args, state_dir, config_path)
+            runtime_mutation = validate_runtime_mutation(
+                source, state_dir, str(args.runtime_sha), args.runtime_mutation_id,
+            )
+            return execute_runtime_command(
+                args, state_dir, config_path, runtime_mutation,
+            )
 
         source = ROOT
-        with process_lock(state_dir):
-            runtime = prepare_runtime_worktree(source, state_dir)
+        mutation_id = secrets.token_hex(16)
+        with process_lock(state_dir, identity=f"bootstrap:{mutation_id}") as lock_handle:
+            runtime = prepare_runtime_worktree(
+                source, state_dir, mutation_id=mutation_id,
+            )
+            _write_process_lock_identity(lock_handle, f"runtime:{mutation_id}")
             return run_runtime_child(
                 source,
                 state_dir,
