@@ -292,6 +292,19 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
         self.run_git(self.repo, "branch", "-M", "main")
         self.run_git(self.repo, "push", "-u", "origin", "main")
         self.base_oid = self.run_git(self.repo, "rev-parse", "HEAD")
+        # Cause probes are external effects; unit tests never run full verify/CLI.
+        verify_probe = mock.patch.object(loop_manager, "verify", return_value=(True, "OK"))
+        self.verify_probe = verify_probe.start()
+        self.addCleanup(verify_probe.stop)
+        reviewer_probe = mock.patch.object(loop_manager, "run_agent", return_value=(0, "VERDICT: PASS"))
+        self.reviewer_probe = reviewer_probe.start()
+        self.addCleanup(reviewer_probe.stop)
+        config_probe = mock.patch.object(
+            loop_manager, "load_managed_config",
+            return_value=mock.Mock(verify_timeout_seconds=600),
+        )
+        config_probe.start()
+        self.addCleanup(config_probe.stop)
         self.worktree = loop_manager.expected_execplan_workspace(
             self.state_dir, str(self.repo.resolve()), "G-034"
         )[1]
@@ -653,6 +666,74 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
         self.assertEqual(self.run_git(self.worktree, "rev-parse", "HEAD"), corrected)
         self.assertEqual(self.run_git(self.repo, "rev-parse", "main"), self.base_oid)
         self.assertNotEqual(readme_oid, corrected)
+
+    def test_unrelated_code_keeps_cause_and_history_until_probe_passes(self):
+        self.publish_block(evidence="AssertionError: original cause")
+        self.connection.execute(
+            "UPDATE exec_plans SET verify_failure_history = ?, "
+            "retry_count = 3, verify_result = 'original output' WHERE plan_id = 'G-034'",
+            ('{"old": {"occurrences": 3}}',),
+        )
+        self.connection.commit()
+        self.verify_probe.return_value = (False, "AssertionError: original cause")
+        unrelated = self.user_commit("unrelated.py", "unrelated = True\n")
+        self.assertFalse(loop_manager.resume_plan_blocks(
+            self.connection, self.repo, self.state_dir, str(self.repo.resolve()), "main",
+        ))
+        row = self.connection.execute(
+            "SELECT status, retry_count, verify_failure_history, verify_result "
+            "FROM exec_plans WHERE plan_id = 'G-034'"
+        ).fetchone()
+        self.assertEqual(tuple(row), ("PLAN_BLOCKED", 3, '{"old": {"occurrences": 3}}', "original output"))
+        inspected = self.connection.execute(
+            "SELECT inspected_remote_oid, inspection_reason FROM blocked_checkpoints"
+        ).fetchone()
+        self.assertEqual(tuple(inspected), (unrelated, "원격 checkpoint 원인 유지:\nAssertionError: original cause"))
+        self.assertFalse(loop_manager.resume_plan_blocks(
+            self.connection, self.repo, self.state_dir, str(self.repo.resolve()), "main",
+        ))
+        self.verify_probe.assert_called_once()
+        self.verify_probe.return_value = (True, "OK")
+        self.user_commit("dependency.py", "corrected_dependency = True\n")
+        self.assertTrue(loop_manager.resume_plan_blocks(
+            self.connection, self.repo, self.state_dir, str(self.repo.resolve()), "main",
+        ))
+        self.assertEqual(self.verify_probe.call_count, 2)
+
+    def test_cause_probe_error_retries_same_candidate_without_release(self):
+        self.publish_block()
+        self.user_commit("dependency.py", "fixed = True\n")
+        self.verify_probe.side_effect = RuntimeError("temporarily unavailable")
+        self.assertFalse(loop_manager.resume_plan_blocks(
+            self.connection, self.repo, self.state_dir, str(self.repo.resolve()), "main",
+        ))
+        self.assertEqual(self.connection.execute(
+            "SELECT status FROM exec_plans WHERE plan_id = 'G-034'"
+        ).fetchone()[0], "PLAN_BLOCKED")
+        self.verify_probe.side_effect = None
+        self.assertTrue(loop_manager.resume_plan_blocks(
+            self.connection, self.repo, self.state_dir, str(self.repo.resolve()), "main",
+        ))
+        self.assertEqual(self.verify_probe.call_count, 2)
+
+    def test_review_cause_requires_pass_before_release(self):
+        self.publish_block(reason="review_retry_exhausted", evidence="original issue")
+        self.reviewer_probe.return_value = (
+            0, "ISSUE_ID: code.py::function::bug\nStill present\nVERDICT: FAIL",
+        )
+        self.user_commit("unrelated.py", "unrelated = True\n")
+        self.assertFalse(loop_manager.resume_plan_blocks(
+            self.connection, self.repo, self.state_dir, str(self.repo.resolve()), "main",
+        ))
+        self.assertEqual(self.connection.execute(
+            "SELECT status FROM exec_plans WHERE plan_id = 'G-034'"
+        ).fetchone()[0], "PLAN_BLOCKED")
+        self.reviewer_probe.return_value = (0, "VERDICT: PASS")
+        self.user_commit("dependency.py", "fixed = True\n")
+        self.assertTrue(loop_manager.resume_plan_blocks(
+            self.connection, self.repo, self.state_dir, str(self.repo.resolve()), "main",
+        ))
+        self.assertTrue(self.reviewer_probe.call_args.kwargs["read_only"])
 
     def test_review_result_path_controls_remote_release(self):
         self.publish_block(

@@ -14058,6 +14058,47 @@ def _resume_remote_corrected_execplan(
         )
 
 
+def _evaluate_remote_checkpoint_cause(
+    connection: sqlite3.Connection, repo_path: Path, state_dir: Path,
+    repo: str, blocked: sqlite3.Row, config_path: Path | None,
+    timeout_seconds: int | None,
+) -> tuple[bool, str]:
+    """Inspect the candidate while retaining the block and all execution evidence."""
+    worktree = Path(str(blocked["worktree"]))
+    config = config_path or ROOT / "config/config.ini"
+    timeout = (timeout_seconds if timeout_seconds is not None
+               else load_managed_config(config).verify_timeout_seconds)
+    before = capture_git_snapshot(worktree)
+    passed, output = verify(worktree, timeout)
+    validate_agent_scope(
+        "reviewer", worktree, before, capture_git_snapshot(worktree),
+        external_worktree=repo_path,
+    )
+    if not passed:
+        return False, str(output)
+    if blocked["blocked_reason"] == BlockReasonCode.VERIFY_RETRY_EXHAUSTED.value:
+        return True, str(output)
+    project = connection.execute(
+        "SELECT provider, base_branch FROM projects WHERE repo = ?", (repo,),
+    ).fetchone()
+    code, review = run_agent(
+        str(project["provider"]), worktree, state_dir, config, "reviewer",
+        reviewer_prompt(
+            str(project["base_branch"]), blocked["worker_result"], str(output),
+            blocked["review_result"], session_recovery=True,
+        ),
+        read_only=True,
+    )
+    validate_agent_scope(
+        "reviewer", worktree, before, capture_git_snapshot(worktree),
+        external_worktree=repo_path,
+    )
+    if code:
+        raise RuntimeError(f"원격 checkpoint Reviewer 실행 미완료: {review}")
+    verdict, _ = parse_reviewer_result(review)
+    return verdict == "PASS", review
+
+
 def _reconcile_published_blocked_checkpoint(
     connection: sqlite3.Connection,
     repo_path: Path,
@@ -14067,6 +14108,8 @@ def _reconcile_published_blocked_checkpoint(
     row: sqlite3.Row,
     request: blocked_checkpoint.CheckpointRequest,
     repository: blocked_checkpoint_state.BlockedCheckpointRepository,
+    config_path: Path | None = None,
+    verify_timeout_seconds: int | None = None,
 ) -> str:
     """Inspect one exact remote ref without adopting unproven or unsafe work."""
     adapter = _BlockedCheckpointAdapter(connection, repo_path, state_dir, repo)
@@ -14277,9 +14320,22 @@ def _reconcile_published_blocked_checkpoint(
         str(blocked["blocked_reason"]), changed_paths, failure_evidence,
     )
     if corrected_paths:
+        try:
+            resolved, assessment = _evaluate_remote_checkpoint_cause(
+                connection, repo_path, state_dir, repo, blocked, config_path,
+                verify_timeout_seconds,
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            return retry(f"원격 checkpoint 원인 재평가 미완료: {error}")
+        if not resolved:
+            repository.record_remote_inspection(
+                request, observed, input_identity,
+                "원격 checkpoint 원인 유지:\n" + assessment,
+            )
+            return "blocked"
         _resume_remote_corrected_execplan(
             connection, repo, blocked, repository, request, observed,
-            input_identity, "변경된 실행 입력 또는 진단 관련 문서를 Worker부터 재평가",
+            input_identity, "원격 checkpoint 원인 해소 확인 후 Worker부터 재검증: " + assessment,
         )
         return "resumed"
     if blocked["blocked_reason"] == BlockReasonCode.PLAN_INPUT_INVALID.value and (
@@ -14332,6 +14388,7 @@ def resume_plan_blocks(
             remote_result = _reconcile_published_blocked_checkpoint(
                 connection, repo_path, state_dir, repo, blocked,
                 checkpoint_row, checkpoint_request, checkpoint_repository,
+                config_path, verify_timeout_seconds,
             )
             if remote_result == "blocked":
                 continue
