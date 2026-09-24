@@ -39,6 +39,7 @@ from rebase_correction import (
 )
 from rebase_correction_state import CorrectionRace, RebaseCorrectionRepository
 from validation_feedback import is_validation_error, normalize_feedback, render_delta
+from reviewer_specification import SpecificationDeadlock, validate_locations
 
 @dataclass(frozen=True)
 class WorkspaceEffects:
@@ -2997,7 +2998,20 @@ class ExecutionHandlers:
                 self.effects.events.operation_print(reviewer_error, file=sys.stderr)
                 return ExecutionOutcome(outcome, detail=reviewer_error, error=True)
             try:
-                verdict, _issue_ids = self.effects.validation.parse_reviewer_result(review)
+                verdict, review_details = self.effects.validation.parse_reviewer_result(review)
+                if verdict == 'SPEC_BLOCKED':
+                    if not isinstance(review_details, SpecificationDeadlock):
+                        raise self.effects.contract.ReviewerProtocolError(
+                            'SPEC_BLOCKED 증거 형식이 유효하지 않습니다.'
+                        )
+                    try:
+                        validate_locations(
+                            review_details,
+                            str(self.catalog_plan['path']),
+                            tuple(str(path) for path in self.plan.get('sources', ())),
+                        )
+                    except ValueError as error:
+                        raise self.effects.contract.ReviewerProtocolError(str(error)) from error
             except self.effects.contract.ReviewerProtocolError as error:
                 if feedback_repo is not None:
                     feedback_repo.record_result(
@@ -3028,6 +3042,18 @@ class ExecutionHandlers:
                 continue
             break
         assert verdict is not None
+        if verdict == 'SPEC_BLOCKED':
+            self.effects.state.update_project(self.repo, review_result=review)
+            self.effects.events.operation_log(
+                f"사용자 명세 결정 필요: {self.plan['id']} {self.plan['title']}",
+                error=True,
+            )
+            return self._block_final(
+                self.repo, context.worktree, review,
+                str(row['verify_result'] or ''),
+                reason=BlockReasonCode.REVIEW_SPECIFICATION_DEADLOCK,
+                user_targets=review_details.paths,
+            )
         if feedback_repo is not None:
             feedback_repo.observe(
                 self.repo, str(self.plan['id']), context.plan.definition_revision_sha,

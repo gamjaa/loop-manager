@@ -330,6 +330,37 @@ class BlockedCheckpointRepository:
             inspection_reason=reason, inspection_retryable=0,
         )
 
+    def reclassify_published(
+        self,
+        request: CheckpointRequest,
+        *,
+        reason_code: str,
+        evidence: str,
+        release_fingerprint: str,
+        accepted_oid: str,
+    ) -> None:
+        """Keep the published checkpoint; let document release checks run again."""
+
+        if request.phase is not CheckpointPhase.PUBLISHED:
+            raise RuntimeError("게시되지 않은 checkpoint의 차단 원인을 바꿀 수 없습니다.")
+        identity = request_identity(
+            request.repo, request.plan_id, reason_code, evidence,
+            request.branch, request.worktree, release_fingerprint,
+        )
+        self._update(
+            request,
+            request_identity=identity,
+            reason_code=reason_code,
+            evidence=evidence,
+            remote_oid=accepted_oid,
+            accepted_remote_oid=accepted_oid,
+            pending_remote_oid=None,
+            inspected_remote_oid=None,
+            inspected_input=None,
+            inspection_reason=None,
+            inspection_retryable=0,
+        )
+
     def record_remote_refusal(
         self, request: CheckpointRequest, oid: str | None,
         input_identity: str, reason: str, *, commit: bool = True,

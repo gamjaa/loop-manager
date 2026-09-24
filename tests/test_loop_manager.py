@@ -4530,6 +4530,457 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             ),
         )
 
+    def test_reviewer_specification_deadlock_requires_structured_evidence(self):
+        import json
+
+        evidence = {
+            "kind": "conflict",
+            "locations": [
+                {"path": "docs/PRODUCT.md", "section": "Review policy"},
+                {"path": "docs/requirements/[R-025] Review.md", "section": "Acceptance Criteria"},
+            ],
+            "problem": "The two retention rules conflict",
+            "implementation_choice": "Whether to retain review history",
+            "question": "Which retention rule should apply?",
+        }
+        response = f"SPEC_DEADLOCK: {json.dumps(evidence)}\nVERDICT: SPEC_BLOCKED"
+        verdict, details = loop_manager.parse_reviewer_result(response)
+        self.assertEqual(verdict, "SPEC_BLOCKED")
+        self.assertEqual(details.paths, (
+            "docs/PRODUCT.md", "docs/requirements/[R-025] Review.md",
+        ))
+        self.assertEqual(details.question, evidence["question"])
+        missing = {
+            **evidence,
+            "kind": "missing",
+            "locations": evidence["locations"][:1],
+        }
+        missing_verdict, missing_details = loop_manager.parse_reviewer_result(
+            f"SPEC_DEADLOCK: {json.dumps(missing)}\nVERDICT: SPEC_BLOCKED"
+        )
+        self.assertEqual(missing_verdict, "SPEC_BLOCKED")
+        self.assertEqual(missing_details.paths, ("docs/PRODUCT.md",))
+        for invalid in (
+            {**evidence, "locations": evidence["locations"][:1]},
+            {**evidence, "question": ""},
+            {**evidence, "kind": ["conflict"]},
+            {**evidence, "kind": {"value": "conflict"}},
+            {**evidence, "locations": [
+                {"path": "docs/../PRODUCT.md", "section": "Review policy"},
+                evidence["locations"][1],
+            ]},
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(
+                loop_manager.ReviewerProtocolError
+            ):
+                loop_manager.parse_reviewer_result(
+                    f"SPEC_DEADLOCK: {json.dumps(invalid)}\nVERDICT: SPEC_BLOCKED"
+                )
+        with self.assertRaises(loop_manager.ReviewerProtocolError):
+            loop_manager.parse_reviewer_result(
+                f"SPEC_DEADLOCK: {json.dumps(evidence)}\nVERDICT: FAIL"
+            )
+
+    def test_review_specification_block_requeues_only_after_input_change(self):
+        from tests.test_runtime_state import RuntimeStateRepositoryTest
+
+        connection = RuntimeStateRepositoryTest()._connection()
+        self.addCleanup(connection.close)
+        connection.execute(
+            "UPDATE exec_plans SET status = 'PLAN_BLOCKED', "
+            "blocked_reason = 'review_specification_deadlock', "
+            "blocked_fingerprint = 'old-input', "
+            "blocked_review_fingerprint = 'old-document', "
+            "worktree = '/state/G-047', "
+            "workspace_owned = 0 WHERE repo = 'repo' AND plan_id = 'G-047'"
+        )
+        connection.commit()
+        with (
+            mock.patch.object(loop_manager, '_revision_execplan_input_fingerprint',
+                              return_value='old-input') as inputs,
+            mock.patch.object(loop_manager, '_revision_review_issue_fingerprint',
+                              return_value='old-document') as document_input,
+            mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
+            mock.patch.object(loop_manager, 'git', return_value=mock.Mock(returncode=1)),
+            mock.patch.object(loop_manager, '_blocked_execplan_revision_metadata_error',
+                              return_value=None),
+            mock.patch.object(loop_manager, '_requeue_blocked_execplan') as requeue,
+        ):
+            self.assertFalse(loop_manager.resume_blocked_execplan_if_inputs_changed(
+                connection, Path('/repo'), 'repo', 'main', Path('/state'),
+            ))
+            requeue.assert_not_called()
+            document_input.return_value = 'changed-architecture'
+            self.assertTrue(loop_manager.resume_blocked_execplan_if_inputs_changed(
+                connection, Path('/repo'), 'repo', 'main', Path('/state'),
+            ))
+            requeue.assert_called_once_with(connection, 'repo', 'G-047')
+            requeue.reset_mock()
+            document_input.return_value = 'old-document'
+            inputs.return_value = 'changed-source'
+            self.assertTrue(loop_manager.resume_blocked_execplan_if_inputs_changed(
+                connection, Path('/repo'), 'repo', 'main', Path('/state'),
+            ))
+            requeue.assert_called_once_with(connection, 'repo', 'G-047')
+
+    def test_specification_document_fingerprint_tracks_architecture_revision(self):
+        import json
+
+        evidence = {
+            'kind': 'missing',
+            'locations': [
+                {'path': 'docs/ARCHITECTURE.md', 'section': 'Migration policy'},
+            ],
+            'problem': 'The migration decision is absent',
+            'implementation_choice': 'Which migration to use',
+            'question': 'Which migration should be used?',
+        }
+        review = f"SPEC_DEADLOCK: {json.dumps(evidence)}\nVERDICT: SPEC_BLOCKED"
+
+        def git(_repo, _command, revision_path, **_kwargs):
+            revision = revision_path.split(':', 1)[0]
+            return mock.Mock(returncode=0, stdout=(
+                'Old policy' if revision in {'base', 'unrelated'} else 'New policy'
+            ))
+
+        with mock.patch.object(loop_manager, 'git', side_effect=git) as shown:
+            base = loop_manager._revision_review_issue_fingerprint(
+                Path('/repo'), 'base', review,
+            )
+            unrelated = loop_manager._revision_review_issue_fingerprint(
+                Path('/repo'), 'unrelated', review,
+            )
+            changed = loop_manager._revision_review_issue_fingerprint(
+                Path('/repo'), 'changed', review,
+            )
+        self.assertEqual(base, unrelated)
+        self.assertNotEqual(base, changed)
+        self.assertTrue(all(
+            call.args[2].endswith(':docs/ARCHITECTURE.md')
+            for call in shown.call_args_list
+        ))
+
+    def test_remote_checkpoint_reviewer_specification_skips_fail_fingerprint(self):
+        from tests.test_runtime_state import RuntimeStateRepositoryTest
+        import runtime_state
+
+        connection = RuntimeStateRepositoryTest()._connection()
+        self.addCleanup(connection.close)
+        repository = runtime_state.RuntimeStateRepository(connection)
+        repository.activate(
+            'repo', 'G-047', activation_sha='base',
+            branch='loop-manager/G-047', worktree='/state/G-047',
+        )
+        prior = 'ISSUE_ID: app.py::review::blocking\nReview failure\nVERDICT: FAIL'
+        repository.block_plan(
+            'repo', 'G-047', reason_code='review_retry_exhausted',
+            evidence=prior, release_fingerprint='prior-input',
+            plan_values={'review_result': prior}, clear_projection=True,
+        )
+        blocked = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = 'repo' AND plan_id = 'G-047'"
+        ).fetchone()
+        evidence = {
+            'kind': 'missing',
+            'locations': [
+                {'path': 'docs/ARCHITECTURE.md', 'section': 'Migration policy'},
+            ],
+            'problem': 'The decision is absent',
+            'implementation_choice': 'Which migration to use',
+            'question': 'Which migration should be used?',
+        }
+        review = f"SPEC_DEADLOCK: {json.dumps(evidence)}\nVERDICT: SPEC_BLOCKED"
+        snapshot = mock.Mock()
+        with (
+            mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=snapshot),
+            mock.patch.object(loop_manager, 'verify', return_value=(True, 'OK')),
+            mock.patch.object(loop_manager, 'validate_agent_scope'),
+            mock.patch.object(loop_manager, 'run_agent', return_value=(0, review)),
+            mock.patch.object(loop_manager, '_remote_checkpoint_has_new_failure') as fingerprint,
+        ):
+            result = loop_manager._evaluate_remote_checkpoint_cause(
+                connection, Path('/repo'), Path('/state'), 'repo', blocked,
+                Path('/config'), 30,
+            )
+        self.assertEqual(result, (False, review, 'specification'))
+        fingerprint.assert_not_called()
+
+    def test_remote_checkpoint_corrects_invalid_specification_to_pass(self):
+        from tests.test_runtime_state import RuntimeStateRepositoryTest
+        import runtime_state
+
+        connection = RuntimeStateRepositoryTest()._connection()
+        self.addCleanup(connection.close)
+        repository = runtime_state.RuntimeStateRepository(connection)
+        repository.activate(
+            'repo', 'G-047', activation_sha='base',
+            branch='loop-manager/G-047', worktree='/state/G-047',
+        )
+        repository.block_plan(
+            'repo', 'G-047', reason_code='review_retry_exhausted',
+            evidence='prior review failure', release_fingerprint='prior-input',
+            clear_projection=True,
+        )
+        blocked = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = 'repo' AND plan_id = 'G-047'"
+        ).fetchone()
+        invalid = (
+            'SPEC_DEADLOCK: {"kind":"missing","locations":'
+            '[{"path":"docs/other.md","section":"Policy"}],'
+            '"problem":"Missing rule","implementation_choice":"Choice",'
+            '"question":"Which rule?"}\nVERDICT: SPEC_BLOCKED'
+        )
+        snapshot = mock.Mock()
+        with (
+            mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=snapshot),
+            mock.patch.object(loop_manager, 'verify', return_value=(True, 'OK')),
+            mock.patch.object(loop_manager, 'validate_agent_scope'),
+            mock.patch.object(loop_manager, 'run_agent', side_effect=[
+                (0, invalid), (0, 'VERDICT: PASS'),
+            ]) as reviewer,
+        ):
+            result = loop_manager._evaluate_remote_checkpoint_cause(
+                connection, Path('/repo'), Path('/state'), 'repo', blocked,
+                Path('/config'), 30,
+            )
+        self.assertEqual(result, (True, 'VERDICT: PASS', None))
+        self.assertEqual(reviewer.call_count, 2)
+        self.assertIn('직전 Reviewer 결과가 아래 프로토콜 검증에 실패',
+                      reviewer.call_args_list[1].args[5])
+        self.assertIn('docs/other.md', reviewer.call_args_list[1].args[5])
+
+    def test_remote_checkpoint_protocol_exhaustion_stops_at_three_attempts(self):
+        from tests.test_runtime_state import RuntimeStateRepositoryTest
+        import runtime_state
+        import blocked_checkpoint_state
+
+        connection = RuntimeStateRepositoryTest()._connection()
+        self.addCleanup(connection.close)
+        repository = runtime_state.RuntimeStateRepository(connection)
+        repository.activate(
+            'repo', 'G-047', activation_sha='base',
+            branch='loop-manager/G-047', worktree='/state/G-047',
+        )
+        repository.block_plan(
+            'repo', 'G-047', reason_code='review_retry_exhausted',
+            evidence='prior review failure', release_fingerprint='prior-input',
+            clear_projection=True,
+        )
+        checkpoint = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
+        checkpoint.finish_published(checkpoint.get('repo', 'G-047'), 'published-oid')
+        request = checkpoint.get('repo', 'G-047')
+        blocked = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = 'repo' AND plan_id = 'G-047'"
+        ).fetchone()
+        invalid = (
+            'SPEC_DEADLOCK: {"kind":"missing","locations":'
+            '[{"path":"docs/other.md","section":"Policy"}],'
+            '"problem":"Missing rule","implementation_choice":"Choice",'
+            '"question":"Which rule?"}\nVERDICT: SPEC_BLOCKED'
+        )
+        snapshot = mock.Mock()
+        with (
+            mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=snapshot),
+            mock.patch.object(loop_manager, 'verify', return_value=(True, 'OK')),
+            mock.patch.object(loop_manager, 'validate_agent_scope'),
+            mock.patch.object(loop_manager, 'run_agent', return_value=(0, invalid)) as reviewer,
+            mock.patch.object(loop_manager, '_remote_checkpoint_has_new_failure') as fingerprint,
+        ):
+            resolved, evidence, stage = loop_manager._evaluate_remote_checkpoint_cause(
+                connection, Path('/repo'), Path('/state'), 'repo', blocked,
+                Path('/config'), 30,
+            )
+        self.assertFalse(resolved)
+        self.assertEqual(stage, 'protocol_exhausted')
+        self.assertEqual(reviewer.call_count, loop_manager.MAX_REVIEWER_PROTOCOL_ATTEMPTS)
+        self.assertIn('프로토콜 교정 3회 실패', evidence)
+        self.assertIn(invalid, evidence)
+        fingerprint.assert_not_called()
+
+        with (
+            mock.patch.object(loop_manager, '_revision_execplan_input_fingerprint',
+                              return_value='source-base'),
+            mock.patch.object(loop_manager, '_worktree_execplan_input_fingerprint',
+                              return_value='accepted-worktree'),
+        ):
+            loop_manager._reclassify_remote_checkpoint_block(
+                connection, Path('/repo'), 'repo', blocked, checkpoint, request,
+                'accepted-oid', Path('/state/G-047'),
+                reason=loop_manager.BlockReasonCode.REVIEW_PROTOCOL_EXHAUSTED,
+                evidence=evidence, review_fingerprint_source=None,
+                user_targets=('docs/plans/[G-047] Runtime.md', 'docs/PRODUCT.md'),
+            )
+        plan = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = 'repo' AND plan_id = 'G-047'"
+        ).fetchone()
+        saved = connection.execute(
+            "SELECT * FROM blocked_checkpoints WHERE repo = 'repo' AND plan_id = 'G-047'"
+        ).fetchone()
+        self.assertEqual(plan['blocked_reason'], 'review_protocol_exhausted')
+        self.assertEqual(plan['review_result'], evidence)
+        self.assertEqual(saved['phase'], 'published')
+        self.assertEqual(saved['accepted_remote_oid'], 'accepted-oid')
+        self.assertIsNone(saved['inspected_remote_oid'])
+        next_snapshot = mock.Mock()
+        next_snapshot.serialize.return_value = 'saved-worktree'
+        with (
+            mock.patch.object(loop_manager._BlockedCheckpointAdapter, 'observe_remote',
+                              return_value='accepted-oid'),
+            mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
+            mock.patch.object(loop_manager, 'validate_managed_worktree'),
+            mock.patch.object(loop_manager, 'capture_git_snapshot',
+                              return_value=next_snapshot),
+            mock.patch.object(loop_manager, '_nul_git_paths', return_value=()),
+            mock.patch.object(loop_manager, 'run_agent') as repeated_reviewer,
+        ):
+            next_result = loop_manager._reconcile_published_blocked_checkpoint(
+                connection, Path('/repo'), Path('/state'), 'repo', plan,
+                saved, checkpoint.get('repo', 'G-047'), checkpoint,
+            )
+        self.assertEqual(next_result, 'unchanged')
+        repeated_reviewer.assert_not_called()
+
+    def test_remote_checkpoint_specification_block_preserves_published_identity(self):
+        from tests.test_runtime_state import RuntimeStateRepositoryTest
+        import runtime_state
+        import blocked_checkpoint_state
+
+        connection = RuntimeStateRepositoryTest()._connection()
+        self.addCleanup(connection.close)
+        repository = runtime_state.RuntimeStateRepository(connection)
+        repository.activate(
+            'repo', 'G-047', activation_sha='base',
+            branch='loop-manager/G-047', worktree='/state/G-047',
+        )
+        prior = 'ISSUE_ID: app.py::review::blocking\nReview failure\nVERDICT: FAIL'
+        repository.block_plan(
+            'repo', 'G-047', reason_code='review_retry_exhausted',
+            evidence=prior, release_fingerprint='prior-input',
+            plan_values={'review_result': prior, 'review_failure_history':
+                         '{"prior": {"occurrences": 4}}'},
+            clear_projection=True,
+        )
+        checkpoint = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
+        initial_request = checkpoint.get('repo', 'G-047')
+        checkpoint.finish_published(initial_request, 'published-oid')
+        request = checkpoint.get('repo', 'G-047')
+        blocked = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = 'repo' AND plan_id = 'G-047'"
+        ).fetchone()
+        evidence = {
+            'kind': 'missing',
+            'locations': [
+                {'path': 'docs/ARCHITECTURE.md', 'section': 'Migration policy'},
+            ],
+            'problem': 'The decision is absent',
+            'implementation_choice': 'Which migration to use',
+            'question': 'Which migration should be used?',
+        }
+        review = f"SPEC_DEADLOCK: {json.dumps(evidence)}\nVERDICT: SPEC_BLOCKED"
+        with (
+            mock.patch.object(loop_manager, '_revision_execplan_input_fingerprint',
+                              return_value='source-base'),
+            mock.patch.object(loop_manager, '_revision_review_issue_fingerprint',
+                              return_value='architecture-base'),
+            mock.patch.object(loop_manager, '_worktree_execplan_input_fingerprint',
+                              return_value='accepted-worktree'),
+        ):
+            loop_manager._reclassify_remote_specification_deadlock(
+                connection, Path('/repo'), 'repo', blocked, checkpoint, request,
+                'accepted-oid', Path('/state/G-047'), review,
+            )
+        plan = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = 'repo' AND plan_id = 'G-047'"
+        ).fetchone()
+        block = connection.execute(
+            "SELECT * FROM execplan_blocks WHERE repo = 'repo' AND plan_id = 'G-047'"
+        ).fetchone()
+        saved = connection.execute(
+            "SELECT * FROM blocked_checkpoints WHERE repo = 'repo' AND plan_id = 'G-047'"
+        ).fetchone()
+        recovery = connection.execute(
+            "SELECT * FROM recovery_records WHERE repo = 'repo' AND subject = 'G-047'"
+        ).fetchone()
+        self.assertEqual(plan['status'], 'PLAN_BLOCKED')
+        self.assertEqual(plan['blocked_reason'], 'review_specification_deadlock')
+        self.assertEqual(plan['review_result'], review)
+        self.assertEqual(plan['blocked_fingerprint'], 'source-base')
+        self.assertEqual(plan['blocked_review_fingerprint'], 'architecture-base')
+        self.assertEqual(json.loads(plan['review_failure_history']), {})
+        self.assertEqual((block['reason_code'], block['evidence']),
+                         ('review_specification_deadlock', review))
+        self.assertEqual(saved['phase'], 'published')
+        self.assertEqual(saved['published_oid'], 'published-oid')
+        self.assertEqual(saved['accepted_remote_oid'], 'accepted-oid')
+        self.assertEqual(saved['reason_code'], 'review_specification_deadlock')
+        self.assertNotEqual(saved['request_identity'], request.request_identity)
+        self.assertIsNone(saved['inspected_remote_oid'])
+        self.assertIsNone(saved['inspected_input'])
+        self.assertIsNone(saved['inspection_reason'])
+        self.assertEqual(json.loads(recovery['final_evidence'])['user_targets'],
+                         ['docs/ARCHITECTURE.md'])
+
+        snapshot = mock.Mock()
+        snapshot.serialize.return_value = 'saved-worktree'
+        with (
+            mock.patch.object(loop_manager._BlockedCheckpointAdapter, 'observe_remote',
+                              return_value='accepted-oid'),
+            mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
+            mock.patch.object(loop_manager, 'validate_managed_worktree'),
+            mock.patch.object(loop_manager, 'capture_git_snapshot',
+                              return_value=snapshot),
+            mock.patch.object(loop_manager, '_nul_git_paths', return_value=()),
+            mock.patch.object(loop_manager, 'run_agent') as reviewer,
+        ):
+            next_result = loop_manager._reconcile_published_blocked_checkpoint(
+                connection, Path('/repo'), Path('/state'), 'repo', plan,
+                saved, checkpoint.get('repo', 'G-047'), checkpoint,
+            )
+        self.assertEqual(next_result, 'unchanged')
+        reviewer.assert_not_called()
+
+    def test_review_specification_block_uses_source_revision_not_worker_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, connection = self._failure_state(directory)
+            self.addCleanup(connection.close)
+            connection.execute(
+                "UPDATE exec_plans SET status = 'REVIEWING', active_sha = 'base' "
+                "WHERE repo = ? AND plan_id = 'G-013'", (str(root),)
+            )
+            connection.execute(
+                "UPDATE projects SET phase = 'REVIEWING', "
+                "agent_input_fingerprint = 'worktree-progress' WHERE repo = ?",
+                (str(root),),
+            )
+            connection.commit()
+            snapshot = mock.Mock()
+            snapshot.serialize.return_value = 'saved-snapshot'
+            with (
+                mock.patch.object(loop_manager, '_worktree_execplan_input_fingerprint',
+                                  return_value='worktree-progress'),
+                mock.patch.object(loop_manager, '_revision_execplan_input_fingerprint',
+                                  return_value='source-base') as source_input,
+                mock.patch.object(loop_manager, '_revision_review_issue_fingerprint',
+                                  return_value='spec-document-base'),
+                mock.patch.object(loop_manager, 'capture_git_snapshot',
+                                  return_value=snapshot),
+                mock.patch.object(loop_manager, '_final_block_recovery_decision',
+                                  return_value=mock.Mock()),
+                mock.patch.object(loop_manager.runtime_state.RuntimeStateRepository,
+                                  'block_plan') as block_plan,
+            ):
+                loop_manager.block_active_execplan(
+                    connection, str(root), root, 'Specification missing', 'verify passed',
+                    reason=loop_manager.BlockReasonCode.REVIEW_SPECIFICATION_DEADLOCK,
+                )
+            self.assertEqual(source_input.call_args.args[1], 'base')
+            self.assertEqual(block_plan.call_args.kwargs['release_fingerprint'],
+                             'source-base')
+            self.assertEqual(
+                block_plan.call_args.kwargs['plan_values']['blocked_review_fingerprint'],
+                'spec-document-base',
+            )
+
     def test_review_issue_id_rejects_unsafe_repo_relative_paths(self):
         invalid_paths = (
             "/docs/plans/plan.md",
@@ -7008,6 +7459,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "recovery_dispatcher.py",
                 "recovery_runtime.py",
                 "recovery_state.py",
+                "reviewer_specification.py",
                 "requirement_archive.py",
                 "requirement_archive_recovery.py",
                 "requirement_archive_state.py",

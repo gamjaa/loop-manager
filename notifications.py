@@ -8,6 +8,7 @@ import json
 import re
 from pathlib import Path
 import sqlite3
+import reviewer_specification
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
@@ -183,6 +184,14 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
             if recovery_evidence is not None
             else [str(plan[2]), *(str(item) for item in sources)]
         )
+        deadlock = None
+        if plan[4] == "review_specification_deadlock":
+            try:
+                deadlock = reviewer_specification.parse_evidence(str(plan[5]))
+            except ValueError:
+                pass
+            if deadlock is not None:
+                paths = list(deadlock.paths)
         checkpoint = None
         if plan[6] == "published":
             checkpoint = {
@@ -222,6 +231,30 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
             f"\0remote\0{plan[11] or 'deleted'}\0{plan[12]}"
             if plan[6] == "published" and plan[12] else ""
         )
+        payload = {
+            "project": name,
+            "stage": stage,
+            "scope": "plan",
+            "reason_code": str(plan[4]),
+            "execplan_id": plan_id,
+            "execplan_title": plan_title,
+            "cause": str(plan[5]),
+            "paths": paths,
+            "guidance_locations": guidance_locations,
+            "checkpoint": checkpoint,
+            "recovery": recovery_evidence,
+        }
+        if deadlock is not None:
+            payload["specification_deadlock"] = {
+                "kind": deadlock.kind,
+                "locations": [
+                    {"path": path, "section": section}
+                    for path, section in deadlock.locations
+                ],
+                "problem": deadlock.problem,
+                "implementation_choice": deadlock.implementation_choice,
+                "question": deadlock.question,
+            }
         _insert(
             connection,
             _key("blocked", repo, f"plan\0{plan[4]}\0{plan_id}" +
@@ -229,19 +262,7 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
                  remote_inspection),
             repo,
             "blocked",
-            {
-                "project": name,
-                "stage": stage,
-                "scope": "plan",
-                "reason_code": str(plan[4]),
-                "execplan_id": plan_id,
-                "execplan_title": plan_title,
-                "cause": str(plan[5]),
-                "paths": paths,
-                "guidance_locations": guidance_locations,
-                "checkpoint": checkpoint,
-                "recovery": recovery_evidence,
-            },
+            payload,
         )
 
     project_block = connection.execute(
@@ -457,6 +478,8 @@ def _message(kind: str, payload: dict[str, object]) -> str:
             f"Reason: {payload.get('reason_code')}\n{payload['cause']}"
             + recovery_text
             + (f"\nFiles to edit:\n{paths}" if paths else "")
+            + (f"\nQuestion: {payload['specification_deadlock']['question']}"
+               if payload.get('specification_deadlock') else "")
             + checkpoint_text
         )
     return (
