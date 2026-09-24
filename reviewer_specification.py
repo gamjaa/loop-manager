@@ -35,7 +35,7 @@ def parse_evidence(output: str) -> SpecificationDeadlock:
     }:
         raise ValueError("SPEC_DEADLOCK 필수 항목이 누락됐습니다.")
     kind = value["kind"]
-    if kind not in {"conflict", "missing"}:
+    if not isinstance(kind, str) or kind not in {"conflict", "missing"}:
         raise ValueError("SPEC_DEADLOCK kind는 conflict 또는 missing이어야 합니다.")
     locations = value["locations"]
     if not isinstance(locations, list) or len(locations) < (2 if kind == "conflict" else 1):

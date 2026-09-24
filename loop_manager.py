@@ -7708,9 +7708,12 @@ def _review_issue_paths(output: object) -> list[str]:
     if not isinstance(output, str) or not output.strip():
         return []
     try:
-        verdict, _issue_ids = parse_reviewer_result(output)
+        verdict, details = parse_reviewer_result(output)
     except ReviewerProtocolError:
         return []
+    if verdict == "SPEC_BLOCKED":
+        assert isinstance(details, reviewer_specification.SpecificationDeadlock)
+        return sorted(details.paths)
     if verdict != "FAIL":
         return []
     return sorted(
@@ -11589,10 +11592,14 @@ def block_active_execplan(
         project["agent_input_fingerprint"] or blocked_worktree_fingerprint
     )
     block_fingerprint = release_fingerprint or fingerprint
+    blocked_review_fingerprint = None
     if reason is BlockReasonCode.REVIEW_SPECIFICATION_DEADLOCK:
         revision = str(plan["active_sha"] or plan["current_revision_sha"] or "")
         block_fingerprint = _revision_execplan_input_fingerprint(
             Path(repo), revision, plan
+        )
+        blocked_review_fingerprint = _revision_review_issue_fingerprint(
+            Path(repo), revision, error
         )
     agent_result_snapshot = preserved_agent_result_snapshot
     if agent_result_snapshot is None:
@@ -11611,7 +11618,7 @@ def block_active_execplan(
     plan_values = {
         "blocked_fingerprint": block_fingerprint,
         "blocked_worktree_fingerprint": blocked_worktree_fingerprint,
-        "blocked_review_fingerprint": None,
+        "blocked_review_fingerprint": blocked_review_fingerprint,
         "last_error": error,
         "verify_result": verify_result,
         "agent_result_snapshot": agent_result_snapshot,
@@ -16311,7 +16318,7 @@ relative/path는 `/`로 구분한 실제 저장소 상대 경로이며 공백과
 ISSUE_ID에는 줄 번호나 자연어 설명을 넣지 말고, 같은 issue가 재발하면 위치·표현이 바뀌어도 이전과 정확히 같은 ID를 사용하라.
 `VERDICT: FAIL`은 하나 이상의 ISSUE_ID가 있어야 하며, 서로 다른 issue는 서로 다른 ID를 사용하라.
 근거 PRODUCT/Requirement/ARCHITECTURE 또는 ExecPlan의 누락·모순 때문에 구현 정답을 판정할 수 없으면 `SPEC_DEADLOCK: {{"kind":"conflict","locations":[{{"path":"저장소 상대 문서 경로","section":"절 이름"}}],"problem":"상충 내용 또는 빠진 기준","implementation_choice":"판단할 수 없는 구현 선택","question":"사용자가 문서에 보강할 결정"}}`를 한 줄로 기록하고 마지막 줄을 `VERDICT: SPEC_BLOCKED`로 끝내라. 누락이면 kind를 `missing`으로 쓴다.
-locations는 현재 ExecPlan 또는 그 sources 문서의 실제 경로와 절이어야 한다. conflict는 서로 다른 두 위치 이상, missing은 한 위치 이상 필요하다. ISSUE_ID와 함께 쓰지 마라. 현재 문서로 판단 가능한 코드·테스트 결함은 기존 FAIL로 보고하라.
+locations는 현재 ExecPlan, 그 sources, docs/PRODUCT.md 또는 docs/ARCHITECTURE.md의 실제 경로와 절이어야 한다. conflict는 서로 다른 두 위치 이상, missing은 한 위치 이상 필요하다. ISSUE_ID와 함께 쓰지 마라. 현재 문서로 판단 가능한 코드·테스트 결함은 기존 FAIL로 보고하라.
 blocking issue가 있으면 간결히 설명하고 마지막 줄을 `VERDICT: FAIL`로 끝내라.
 blocking issue가 없으면 마지막 줄을 `VERDICT: PASS`로 끝내라. 파일은 수정하지 마라.
 """.strip()

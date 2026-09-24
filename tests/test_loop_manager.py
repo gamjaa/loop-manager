@@ -4563,6 +4563,8 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         for invalid in (
             {**evidence, "locations": evidence["locations"][:1]},
             {**evidence, "question": ""},
+            {**evidence, "kind": ["conflict"]},
+            {**evidence, "kind": {"value": "conflict"}},
             {**evidence, "locations": [
                 {"path": "docs/../PRODUCT.md", "section": "Review policy"},
                 evidence["locations"][1],
@@ -4587,7 +4589,9 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         connection.execute(
             "UPDATE exec_plans SET status = 'PLAN_BLOCKED', "
             "blocked_reason = 'review_specification_deadlock', "
-            "blocked_fingerprint = 'old-input', worktree = '/state/G-047', "
+            "blocked_fingerprint = 'old-input', "
+            "blocked_review_fingerprint = 'old-document', "
+            "worktree = '/state/G-047', "
             "workspace_owned = 0 WHERE repo = 'repo' AND plan_id = 'G-047'"
         )
         connection.commit()
@@ -4595,7 +4599,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             mock.patch.object(loop_manager, '_revision_execplan_input_fingerprint',
                               return_value='old-input') as inputs,
             mock.patch.object(loop_manager, '_revision_review_issue_fingerprint',
-                              return_value=None),
+                              return_value='old-document') as document_input,
             mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
             mock.patch.object(loop_manager, 'git', return_value=mock.Mock(returncode=1)),
             mock.patch.object(loop_manager, '_blocked_execplan_revision_metadata_error',
@@ -4606,11 +4610,55 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                 connection, Path('/repo'), 'repo', 'main', Path('/state'),
             ))
             requeue.assert_not_called()
+            document_input.return_value = 'changed-architecture'
+            self.assertTrue(loop_manager.resume_blocked_execplan_if_inputs_changed(
+                connection, Path('/repo'), 'repo', 'main', Path('/state'),
+            ))
+            requeue.assert_called_once_with(connection, 'repo', 'G-047')
+            requeue.reset_mock()
+            document_input.return_value = 'old-document'
             inputs.return_value = 'changed-source'
             self.assertTrue(loop_manager.resume_blocked_execplan_if_inputs_changed(
                 connection, Path('/repo'), 'repo', 'main', Path('/state'),
             ))
             requeue.assert_called_once_with(connection, 'repo', 'G-047')
+
+    def test_specification_document_fingerprint_tracks_architecture_revision(self):
+        import json
+
+        evidence = {
+            'kind': 'missing',
+            'locations': [
+                {'path': 'docs/ARCHITECTURE.md', 'section': 'Migration policy'},
+            ],
+            'problem': 'The migration decision is absent',
+            'implementation_choice': 'Which migration to use',
+            'question': 'Which migration should be used?',
+        }
+        review = f"SPEC_DEADLOCK: {json.dumps(evidence)}\nVERDICT: SPEC_BLOCKED"
+
+        def git(_repo, _command, revision_path, **_kwargs):
+            revision = revision_path.split(':', 1)[0]
+            return mock.Mock(returncode=0, stdout=(
+                'Old policy' if revision in {'base', 'unrelated'} else 'New policy'
+            ))
+
+        with mock.patch.object(loop_manager, 'git', side_effect=git) as shown:
+            base = loop_manager._revision_review_issue_fingerprint(
+                Path('/repo'), 'base', review,
+            )
+            unrelated = loop_manager._revision_review_issue_fingerprint(
+                Path('/repo'), 'unrelated', review,
+            )
+            changed = loop_manager._revision_review_issue_fingerprint(
+                Path('/repo'), 'changed', review,
+            )
+        self.assertEqual(base, unrelated)
+        self.assertNotEqual(base, changed)
+        self.assertTrue(all(
+            call.args[2].endswith(':docs/ARCHITECTURE.md')
+            for call in shown.call_args_list
+        ))
 
     def test_review_specification_block_uses_source_revision_not_worker_progress(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -4633,6 +4681,8 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                                   return_value='worktree-progress'),
                 mock.patch.object(loop_manager, '_revision_execplan_input_fingerprint',
                                   return_value='source-base') as source_input,
+                mock.patch.object(loop_manager, '_revision_review_issue_fingerprint',
+                                  return_value='spec-document-base'),
                 mock.patch.object(loop_manager, 'capture_git_snapshot',
                                   return_value=snapshot),
                 mock.patch.object(loop_manager, '_final_block_recovery_decision',
@@ -4647,6 +4697,10 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             self.assertEqual(source_input.call_args.args[1], 'base')
             self.assertEqual(block_plan.call_args.kwargs['release_fingerprint'],
                              'source-base')
+            self.assertEqual(
+                block_plan.call_args.kwargs['plan_values']['blocked_review_fingerprint'],
+                'spec-document-base',
+            )
 
     def test_review_issue_id_rejects_unsafe_repo_relative_paths(self):
         invalid_paths = (

@@ -3007,10 +3007,12 @@ class ExecutionHandlers:
                     source_paths = {
                         str(self.catalog_plan['path']),
                         *(str(path) for path in self.plan.get('sources', ())),
+                        'docs/PRODUCT.md',
+                        'docs/ARCHITECTURE.md',
                     }
                     if any(path not in source_paths for path in review_details.paths):
                         raise self.effects.contract.ReviewerProtocolError(
-                            'SPEC_BLOCKED 위치는 현재 ExecPlan 또는 sources 문서여야 합니다.'
+                            'SPEC_BLOCKED 위치는 현재 ExecPlan, sources, PRODUCT 또는 ARCHITECTURE 문서여야 합니다.'
                         )
             except self.effects.contract.ReviewerProtocolError as error:
                 if feedback_repo is not None:

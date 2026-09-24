@@ -2305,6 +2305,7 @@ class ExecutionHandlerTests(TestCase):
     def test_review_specification_deadlock_blocks_plan_without_worker_correction(self):
         from reviewer_specification import SpecificationDeadlock
 
+        self.plan['sources'] = ['docs/requirements/source.md']
         details = SpecificationDeadlock(
             'missing', (('docs/PRODUCT.md', 'Review policy'),),
             'A retention decision is absent', 'Whether to retain the result',
@@ -2327,6 +2328,27 @@ class ExecutionHandlerTests(TestCase):
             ('docs/PRODUCT.md',),
         )
         self.effects.validation.transition_validation_failure.assert_not_called()
+
+    def test_review_deadlock_accepts_architecture_outside_sources(self):
+        from reviewer_specification import SpecificationDeadlock
+
+        self.plan['sources'] = ['docs/requirements/source.md']
+        details = SpecificationDeadlock(
+            'missing', (('docs/ARCHITECTURE.md', 'Architecture Change Policy'),),
+            'The migration choice is unspecified', 'Which migration to use',
+            'Which migration policy should apply?',
+        )
+        self.effects.validation.parse_reviewer_result.return_value = (
+            'SPEC_BLOCKED', details,
+        )
+        result = self.handler.review(self.context('REVIEWING'))
+        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertEqual(
+            self.effects.blocking.block_active_execplan.call_args.kwargs[
+                'recovery_decision'
+            ].observation.user_targets,
+            ('docs/ARCHITECTURE.md',),
+        )
 
     def test_review_deadlock_with_unrelated_path_uses_protocol_correction(self):
         from reviewer_specification import SpecificationDeadlock
