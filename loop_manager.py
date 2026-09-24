@@ -5623,6 +5623,12 @@ def _ignored_paths_overlapping_git_update(worktree: Path, target: str) -> list[s
     changed = _nul_git_paths(
         worktree, "diff", "--name-only", "-z", "HEAD", target
     )
+    fork = git(worktree, "merge-base", "HEAD", target).stdout.strip()
+    for commit in git(worktree, "rev-list", "--reverse", f"{fork}..HEAD").stdout.splitlines():
+        changed.extend(_nul_git_paths(
+            worktree, "diff-tree", "-m", "--root", "--no-commit-id",
+            "--name-only", "-r", "-z", commit,
+        ))
     return sorted(
         path for path in ignored
         if any(_paths_overlap(path, candidate) for candidate in changed)
@@ -7461,14 +7467,25 @@ def _validate_pr_conflict_recovery_ownership(
         for path, state in snapshot.dirty.items()
         if path not in ignored_paths
     }
-    if snapshot.head != head_oid or publishable_dirty or snapshot.operations:
+    flagged_paths = sorted(
+        path for path, entries in snapshot.index.items()
+        if _non_default_index_flags(entries)
+    )
+    if (
+        snapshot.branch != branch or snapshot.head != head_oid
+        or publishable_dirty or flagged_paths or snapshot.operations
+    ):
         details = []
+        if snapshot.branch != branch:
+            details.append(f"branch {snapshot.branch} (expected {branch})")
         if snapshot.head != head_oid:
             details.append(f"HEAD {snapshot.head} (expected {head_oid})")
         if publishable_dirty:
             details.append(
                 "게시 가능 변경 " + ", ".join(sorted(publishable_dirty)[:8])
             )
+        if flagged_paths:
+            details.append("index flags " + ", ".join(flagged_paths[:8]))
         if snapshot.operations:
             details.append(
                 "Git operation " + ", ".join(sorted(snapshot.operations))
@@ -7488,7 +7505,58 @@ def _validate_pr_conflict_recovery_ownership(
         "rev-parse",
         f"refs/remotes/origin/{project['base_branch']}^{{commit}}",
     ).stdout.strip()
+    overlaps = _ignored_paths_overlapping_git_update(worktree, base_oid)
+    if overlaps:
+        raise ManagedWorktreeConflictError(
+            "PR 충돌 복구 tracked 경로와 겹치는 ignored 파일: "
+            + ", ".join(overlaps[:8])
+        )
     return plan, worktree, branch, head_oid, base_oid
+
+
+def _validate_blocked_pr_without_conflict(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    state_dir: Path,
+    repo: str,
+    project: sqlite3.Row,
+    pull_request: Mapping[str, object],
+) -> None:
+    """Read-only proof for releasing an old conflict preflight false positive."""
+
+    plan, worktree, branch, head_oid = _validate_pr_conflict_recovery_identity(
+        connection, repo, project, pull_request, expected_status="PLAN_BLOCKED"
+    )
+    validate_execplan_workspace_identity(
+        state_dir, repo, str(plan["plan_id"]), branch, worktree
+    )
+    if not worktree.is_dir():
+        raise WorkspaceOwnershipError("PR 충돌 복구 worktree가 존재하지 않습니다.")
+    snapshot = capture_git_snapshot(worktree)
+    ignored = frozenset(_ignored_worktree_paths(worktree))
+    dirty = sorted(path for path in snapshot.dirty if path not in ignored)
+    flags = sorted(
+        path for path, entries in snapshot.index.items()
+        if _non_default_index_flags(entries)
+    )
+    if snapshot.branch != branch or snapshot.head != head_oid or dirty or flags or snapshot.operations:
+        raise ManagedWorktreeConflictError(
+            "PR 충돌 복구 차단 해제 전 관리 worktree 상태 불일치: "
+            + "; ".join(filter(None, (
+                f"branch {snapshot.branch} (expected {branch})" if snapshot.branch != branch else "",
+                f"HEAD {snapshot.head} (expected {head_oid})" if snapshot.head != head_oid else "",
+                "게시 가능 변경 " + ", ".join(dirty[:8]) if dirty else "",
+                "index flags " + ", ".join(flags[:8]) if flags else "",
+                "Git operation " + ", ".join(sorted(snapshot.operations)) if snapshot.operations else "",
+            )))
+        )
+    remote = git(
+        repo_path, "ls-remote", "--heads", "origin", f"refs/heads/{branch}"
+    ).stdout.splitlines()
+    if len(remote) != 1 or remote[0].split("\t", 1)[0] != head_oid:
+        raise PublicationSafetyError(
+            "PR 충돌 복구 차단 해제 전 원격 branch가 관측한 PR head와 일치하지 않습니다."
+        )
 
 
 def _is_pr_conflict_preflight_block(
@@ -13681,7 +13749,10 @@ def _resume_reopened_pull_request(
     head_oid: object,
     *,
     recovery: bool,
+    conflict_oids: tuple[str, str] | None = None,
 ) -> None:
+    if conflict_oids is not None and not recovery:
+        raise ValueError("PR 충돌 복구 OID는 복구 전이에만 기록할 수 있습니다.")
     phase = "WORKING" if recovery else "PR_OPEN"
     status = "IMPLEMENTING" if recovery else "PR_OPEN"
     last_error = REBASE_IN_PROGRESS_ERROR if recovery else None
@@ -13708,7 +13779,13 @@ def _resume_reopened_pull_request(
                 verify_result=None,
                 review_result=None,
             )
-    with connection:
+            if conflict_oids is not None:
+                values.update(
+                    pr_conflict_recovery=1,
+                    pr_conflict_head_oid=conflict_oids[0],
+                    pr_conflict_base_oid=conflict_oids[1],
+                )
+    with runtime_state._transaction(connection):
         mirrored = connection.execute(
             "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
         ).fetchone()
@@ -13783,7 +13860,7 @@ def reconcile_existing_pull_request(
         )
         return 1
     if state != "OPEN" or (
-        project["phase"] != "PR_OPEN"
+        project["phase"] not in {"PR_OPEN", "PLAN_BLOCKED"}
         and not int(project["pr_conflict_recovery"])
     ):
         update_project(
@@ -13797,18 +13874,26 @@ def reconcile_existing_pull_request(
         if recovering_preflight_block:
             assert blocked_plan is not None
             try:
-                _fetch_pr_conflict_recovery_refs(
-                    repo_path, str(project["base_branch"]), branch
-                )
-                _validate_pr_conflict_recovery_ownership(
-                    connection,
-                    repo_path,
-                    state_dir,
-                    repo,
-                    project,
-                    pull_request,
-                    expected_status="PLAN_BLOCKED",
-                )
+                mergeability = classify_pull_request_mergeability(pull_request)
+                if mergeability == "conflicting":
+                    _validate_pr_conflict_recovery_identity(
+                        connection, repo, project, pull_request,
+                        expected_status="PLAN_BLOCKED",
+                    )
+                    _fetch_pr_conflict_recovery_refs(
+                        repo_path, str(project["base_branch"]), branch
+                    )
+                    (_plan, _worktree, _branch, observed_head, base_oid) = (
+                        _validate_pr_conflict_recovery_ownership(
+                            connection, repo_path, state_dir, repo, project,
+                            pull_request, expected_status="PLAN_BLOCKED",
+                        )
+                    )
+                else:
+                    _validate_blocked_pr_without_conflict(
+                        connection, repo_path, state_dir, repo, project,
+                        pull_request,
+                    )
             except (
                 PublicationSafetyError,
                 WorkspaceOwnershipError,
@@ -13830,8 +13915,13 @@ def reconcile_existing_pull_request(
                 blocked_plan,
                 url,
                 head_oid,
-                recovery=False,
+                recovery=mergeability == "conflicting",
+                conflict_oids=(observed_head, base_oid)
+                if mergeability == "conflicting" else None,
             )
+            if mergeability == "conflicting":
+                operation_print(f"PR 충돌 자동 복구 재개: {url}")
+                return None
             operation_print(f"PR_OPEN 충돌 복구 false positive 자동 해제: {url}")
             return 0
 
