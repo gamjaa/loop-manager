@@ -19,6 +19,20 @@ class SpecificationDeadlock:
         return tuple(dict.fromkeys(path for path, _ in self.locations))
 
 
+def validate_locations(
+    deadlock: SpecificationDeadlock,
+    plan_path: str,
+    sources: tuple[str, ...],
+) -> None:
+    allowed = {
+        plan_path, *sources, "docs/PRODUCT.md", "docs/ARCHITECTURE.md",
+    }
+    if any(path not in allowed for path in deadlock.paths):
+        raise ValueError(
+            "SPEC_BLOCKED 위치는 현재 ExecPlan, sources, PRODUCT 또는 ARCHITECTURE 문서여야 합니다."
+        )
+
+
 def parse_evidence(output: str) -> SpecificationDeadlock:
     declarations = [
         line.strip() for line in output.splitlines()

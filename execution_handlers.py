@@ -39,7 +39,7 @@ from rebase_correction import (
 )
 from rebase_correction_state import CorrectionRace, RebaseCorrectionRepository
 from validation_feedback import is_validation_error, normalize_feedback, render_delta
-from reviewer_specification import SpecificationDeadlock
+from reviewer_specification import SpecificationDeadlock, validate_locations
 
 @dataclass(frozen=True)
 class WorkspaceEffects:
@@ -3004,16 +3004,14 @@ class ExecutionHandlers:
                         raise self.effects.contract.ReviewerProtocolError(
                             'SPEC_BLOCKED 증거 형식이 유효하지 않습니다.'
                         )
-                    source_paths = {
-                        str(self.catalog_plan['path']),
-                        *(str(path) for path in self.plan.get('sources', ())),
-                        'docs/PRODUCT.md',
-                        'docs/ARCHITECTURE.md',
-                    }
-                    if any(path not in source_paths for path in review_details.paths):
-                        raise self.effects.contract.ReviewerProtocolError(
-                            'SPEC_BLOCKED 위치는 현재 ExecPlan, sources, PRODUCT 또는 ARCHITECTURE 문서여야 합니다.'
+                    try:
+                        validate_locations(
+                            review_details,
+                            str(self.catalog_plan['path']),
+                            tuple(str(path) for path in self.plan.get('sources', ())),
                         )
+                    except ValueError as error:
+                        raise self.effects.contract.ReviewerProtocolError(str(error)) from error
             except self.effects.contract.ReviewerProtocolError as error:
                 if feedback_repo is not None:
                     feedback_repo.record_result(

@@ -4660,6 +4660,130 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             for call in shown.call_args_list
         ))
 
+    def test_remote_checkpoint_reviewer_specification_skips_fail_fingerprint(self):
+        from tests.test_runtime_state import RuntimeStateRepositoryTest
+        import runtime_state
+
+        connection = RuntimeStateRepositoryTest()._connection()
+        self.addCleanup(connection.close)
+        repository = runtime_state.RuntimeStateRepository(connection)
+        repository.activate(
+            'repo', 'G-047', activation_sha='base',
+            branch='loop-manager/G-047', worktree='/state/G-047',
+        )
+        prior = 'ISSUE_ID: app.py::review::blocking\nReview failure\nVERDICT: FAIL'
+        repository.block_plan(
+            'repo', 'G-047', reason_code='review_retry_exhausted',
+            evidence=prior, release_fingerprint='prior-input',
+            plan_values={'review_result': prior}, clear_projection=True,
+        )
+        blocked = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = 'repo' AND plan_id = 'G-047'"
+        ).fetchone()
+        evidence = {
+            'kind': 'missing',
+            'locations': [
+                {'path': 'docs/ARCHITECTURE.md', 'section': 'Migration policy'},
+            ],
+            'problem': 'The decision is absent',
+            'implementation_choice': 'Which migration to use',
+            'question': 'Which migration should be used?',
+        }
+        review = f"SPEC_DEADLOCK: {json.dumps(evidence)}\nVERDICT: SPEC_BLOCKED"
+        snapshot = mock.Mock()
+        with (
+            mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=snapshot),
+            mock.patch.object(loop_manager, 'verify', return_value=(True, 'OK')),
+            mock.patch.object(loop_manager, 'validate_agent_scope'),
+            mock.patch.object(loop_manager, 'run_agent', return_value=(0, review)),
+            mock.patch.object(loop_manager, '_remote_checkpoint_has_new_failure') as fingerprint,
+        ):
+            result = loop_manager._evaluate_remote_checkpoint_cause(
+                connection, Path('/repo'), Path('/state'), 'repo', blocked,
+                Path('/config'), 30,
+            )
+        self.assertEqual(result, (False, review, 'specification'))
+        fingerprint.assert_not_called()
+
+    def test_remote_checkpoint_specification_block_preserves_published_identity(self):
+        from tests.test_runtime_state import RuntimeStateRepositoryTest
+        import runtime_state
+        import blocked_checkpoint_state
+
+        connection = RuntimeStateRepositoryTest()._connection()
+        self.addCleanup(connection.close)
+        repository = runtime_state.RuntimeStateRepository(connection)
+        repository.activate(
+            'repo', 'G-047', activation_sha='base',
+            branch='loop-manager/G-047', worktree='/state/G-047',
+        )
+        prior = 'ISSUE_ID: app.py::review::blocking\nReview failure\nVERDICT: FAIL'
+        repository.block_plan(
+            'repo', 'G-047', reason_code='review_retry_exhausted',
+            evidence=prior, release_fingerprint='prior-input',
+            plan_values={'review_result': prior, 'review_failure_history':
+                         '{"prior": {"occurrences": 4}}'},
+            clear_projection=True,
+        )
+        checkpoint = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
+        initial_request = checkpoint.get('repo', 'G-047')
+        checkpoint.finish_published(initial_request, 'published-oid')
+        request = checkpoint.get('repo', 'G-047')
+        blocked = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = 'repo' AND plan_id = 'G-047'"
+        ).fetchone()
+        evidence = {
+            'kind': 'missing',
+            'locations': [
+                {'path': 'docs/ARCHITECTURE.md', 'section': 'Migration policy'},
+            ],
+            'problem': 'The decision is absent',
+            'implementation_choice': 'Which migration to use',
+            'question': 'Which migration should be used?',
+        }
+        review = f"SPEC_DEADLOCK: {json.dumps(evidence)}\nVERDICT: SPEC_BLOCKED"
+        snapshot = mock.Mock()
+        snapshot.serialize.return_value = 'saved-worktree'
+        with (
+            mock.patch.object(loop_manager, '_revision_execplan_input_fingerprint',
+                              return_value='source-base'),
+            mock.patch.object(loop_manager, '_revision_review_issue_fingerprint',
+                              return_value='architecture-base'),
+            mock.patch.object(loop_manager, '_worktree_execplan_input_fingerprint',
+                              return_value='accepted-worktree'),
+        ):
+            loop_manager._reclassify_remote_specification_deadlock(
+                connection, Path('/repo'), 'repo', blocked, checkpoint, request,
+                'accepted-oid', Path('/state/G-047'), snapshot, (), review,
+            )
+        plan = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = 'repo' AND plan_id = 'G-047'"
+        ).fetchone()
+        block = connection.execute(
+            "SELECT * FROM execplan_blocks WHERE repo = 'repo' AND plan_id = 'G-047'"
+        ).fetchone()
+        saved = connection.execute(
+            "SELECT * FROM blocked_checkpoints WHERE repo = 'repo' AND plan_id = 'G-047'"
+        ).fetchone()
+        recovery = connection.execute(
+            "SELECT * FROM recovery_records WHERE repo = 'repo' AND subject = 'G-047'"
+        ).fetchone()
+        self.assertEqual(plan['status'], 'PLAN_BLOCKED')
+        self.assertEqual(plan['blocked_reason'], 'review_specification_deadlock')
+        self.assertEqual(plan['review_result'], review)
+        self.assertEqual(plan['blocked_fingerprint'], 'source-base')
+        self.assertEqual(plan['blocked_review_fingerprint'], 'architecture-base')
+        self.assertEqual(json.loads(plan['review_failure_history']), {})
+        self.assertEqual((block['reason_code'], block['evidence']),
+                         ('review_specification_deadlock', review))
+        self.assertEqual(saved['phase'], 'published')
+        self.assertEqual(saved['published_oid'], 'published-oid')
+        self.assertEqual(saved['accepted_remote_oid'], 'accepted-oid')
+        self.assertEqual(saved['reason_code'], 'review_specification_deadlock')
+        self.assertNotEqual(saved['request_identity'], request.request_identity)
+        self.assertEqual(json.loads(recovery['final_evidence'])['user_targets'],
+                         ['docs/ARCHITECTURE.md'])
+
     def test_review_specification_block_uses_source_revision_not_worker_progress(self):
         with tempfile.TemporaryDirectory() as directory:
             root, connection = self._failure_state(directory)
