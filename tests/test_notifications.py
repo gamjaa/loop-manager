@@ -201,6 +201,47 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
         )
         delivered.assert_called_once()
 
+    def test_failed_persistent_delivery_remains_retryable_after_resolution(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        repository = RecoveryRepository(connection)
+        failure = RecoveryObservation(
+            RecoveryReason.FETCH_FAILED, repo, "G-018", "PUBLISHING",
+            "plan-sha", "base-sha", "fetch-failure", "head-a", "fetch failed",
+        )
+        for _ in range(3):
+            before = repository.external_run_snapshot(repo)
+            repository.observe(failure)
+            repository.observe_external_run(repo, before)
+        with connection:
+            notifications.enqueue_persistent_execution_failure_events(connection, repo)
+
+        failed = mock.Mock(side_effect=RuntimeError("network unavailable"))
+        for _ in range(2):
+            self.assertEqual(
+                notifications.dispatch_pending(
+                    connection, "token", "chat", adapter=failed,
+                ),
+                0,
+            )
+        with connection:
+            repository.finish_external_run(repo, None, resolved=True)
+        event = connection.execute(
+            "SELECT attempts, sent_at FROM notification_outbox "
+            "WHERE repo = ? AND event_type = 'persistent_execution_failure'",
+            (repo,),
+        ).fetchone()
+        self.assertEqual(tuple(event), (2, None))
+
+        delivered = mock.Mock()
+        self.assertEqual(
+            notifications.dispatch_pending(
+                connection, "token", "chat", adapter=delivered,
+            ),
+            1,
+        )
+        delivered.assert_called_once()
+
     def test_pr_and_blocked_payloads_are_complete_and_deduplicated(self):
         connection = self.connection()
         repo = "/projects/alpha"

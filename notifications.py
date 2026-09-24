@@ -405,11 +405,12 @@ def cancel_pending_persistent_execution_failure_event(
     connection: sqlite3.Connection, repo: str, subject: str, episode: int,
     phase: str, reason_code: str, fingerprint: str,
 ) -> None:
-    """Withdraw an unsent notice resolved or superseded in this run."""
+    """Withdraw a notice only before its first delivery attempt."""
 
     identity = "\0".join((subject, str(episode), phase, reason_code, fingerprint))
     connection.execute(
-        "DELETE FROM notification_outbox WHERE event_key = ? AND sent_at IS NULL",
+        "DELETE FROM notification_outbox WHERE event_key = ? "
+        "AND sent_at IS NULL AND attempts = 0",
         (_key("persistent_failure", repo, identity),),
     )
 
