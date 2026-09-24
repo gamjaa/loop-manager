@@ -191,6 +191,51 @@ class ExecutionHandlerTests(TestCase):
             self.handler.run(self.context())
         self.assertIn('bad format', self.effects.agent.run_agent.call_args.args[5])
 
+    def test_guidance_result_keeps_worker_scope_until_block_is_recorded(self):
+        self.state.update_project(
+            'repo', agent_role='worker', agent_snapshot='worker-start',
+            worker_session_id='saved-session',
+        )
+
+        def inspect(*_args):
+            self.effects.agent.clear_agent_scope.assert_not_called()
+            row = self.state.row()
+            self.assertEqual(row['agent_role'], 'worker')
+            self.assertEqual(row['agent_snapshot'], 'worker-start')
+            self.assertEqual(row['worker_session_id'], 'session')
+            return True
+
+        self.effects.agent.inspect_worker_guidance_result.side_effect = inspect
+        self.handler.run(self.context())
+
+        self.effects.agent.inspect_worker_guidance_result.assert_called_once()
+        self.effects.agent.clear_agent_scope.assert_not_called()
+        self.effects.validation.verify.assert_not_called()
+        self.effects.publication.push_managed_publication_branch.assert_not_called()
+
+    def test_saved_rebase_guidance_result_keeps_worker_scope(self):
+        self.state.update_project(
+            'repo', agent_role='worker', agent_snapshot='rebase-worker-start',
+            worker_session_id='saved-session',
+        )
+
+        def inspect(*_args):
+            self.effects.agent.clear_agent_scope.assert_not_called()
+            self.assertEqual(self.state.row()['agent_snapshot'], 'rebase-worker-start')
+            return True
+
+        self.effects.agent.inspect_worker_guidance_result.side_effect = inspect
+        saved = SimpleNamespace(
+            scope_marker='accepted', worker_code=0, worker_result='proposal',
+        )
+        self.handler._resume_saved_rebase_worker(
+            self.context(), saved, SimpleNamespace(progress='accepted'),
+        )
+
+        self.effects.agent.inspect_worker_guidance_result.assert_called_once()
+        self.effects.agent.clear_agent_scope.assert_not_called()
+        self.effects.validation.verify.assert_not_called()
+
     def test_timeout_prompt_requests_cause_check_and_progress_evidence(self):
         prompt = lm.worker_prompt(
             'docs/plans/[G-047] Runtime.md', None,
