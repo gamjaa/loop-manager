@@ -165,8 +165,6 @@ def _adopt_legacy_block_notices(connection: sqlite3.Connection) -> None:
         repo = str(row[1])
         event_key = str(row[0])
         current_key = _current_block_key(connection, repo, payload)
-        if current_key is None:
-            continue
         if subject == "planning":
             current_error = connection.execute(
                 "SELECT planning_error FROM projects WHERE repo = ?", (repo,),
@@ -175,10 +173,20 @@ def _adopt_legacy_block_notices(connection: sqlite3.Connection) -> None:
             # A different saved cause proves this notice belongs to an earlier
             # error; a later Planner invocation proves the old error cleared,
             # even if the next error has identical text.
-            if (event_key != current_key or current_error is None
+            if (current_key is None or event_key != current_key
+                    or current_error is None
                     or payload.get("cause") != current_error[0]
                     or _planner_started_after_notice(connection, repo, str(row[5]))):
+                # The legacy key still matches a new planning error, so its
+                # unsent pieces must be canceled before dispatch sees it.
+                connection.execute(
+                    "UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP, "
+                    "delivery_started_at = NULL WHERE event_key = ? "
+                    "AND sent_at IS NULL AND canceled_at IS NULL", (event_key,),
+                )
                 continue
+        elif current_key is None:
+            continue
         elif subject.startswith("plan:"):
             block = connection.execute(
                 "SELECT reason_code, created_at FROM execplan_blocks "

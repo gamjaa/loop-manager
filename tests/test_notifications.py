@@ -176,6 +176,61 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
             "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'resumed'"
         ).fetchone()[0], 0)
 
+    def test_unsent_legacy_planning_notice_is_canceled_before_new_error_dispatch(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        old_key = notifications._key("blocked", repo, "project\0planning_error\0")
+        old_payload = {
+            "project": "alpha", "stage": "planning", "scope": "project",
+            "reason_code": "planning_error", "execplan_id": None,
+            "cause": "resolved error", "paths": [],
+        }
+        with connection:
+            connection.execute("DROP TABLE block_notice_events")
+            connection.execute("DROP TABLE notified_block_incidents")
+            connection.execute(
+                "UPDATE projects SET planning_error = 'resolved error' WHERE repo = ?",
+                (repo,),
+            )
+            connection.execute(
+                "INSERT INTO notification_outbox "
+                "(event_key, repo, event_type, payload) VALUES (?, ?, 'blocked', ?)",
+                (old_key, repo, json.dumps(old_payload)),
+            )
+            # The earlier error clears without dispatch before another error.
+            connection.execute(
+                "UPDATE projects SET planning_error = NULL WHERE repo = ?", (repo,),
+            )
+            connection.execute(
+                "UPDATE projects SET planning_error = 'new error' WHERE repo = ?",
+                (repo,),
+            )
+        with connection:
+            notifications.enqueue_current_project_events(connection, repo)
+        delivered = []
+        self.assertEqual(notifications.dispatch_pending(
+            connection, "token", "chat",
+            adapter=lambda _token, _chat, message: delivered.append(message),
+        ), 1)
+        self.assertEqual(len(delivered), 1)
+        self.assertIn("new error", delivered[0])
+        self.assertNotIn("resolved error", delivered[0])
+        old_notice = connection.execute(
+            "SELECT canceled_at, sent_at FROM notification_outbox WHERE event_key = ?",
+            (old_key,),
+        ).fetchone()
+        self.assertIsNotNone(old_notice[0])
+        self.assertIsNone(old_notice[1])
+        loop_manager.update_project(connection, repo, planning_error=None)
+        with connection:
+            self.assertEqual(notifications.record_work_start(
+                connection, repo, "Planner",
+            ), 1)
+        resumed = connection.execute(
+            "SELECT payload FROM notification_outbox WHERE event_type = 'resumed'",
+        ).fetchone()
+        self.assertEqual(json.loads(resumed[0])["cause"], "new error")
+
     def test_identical_planning_error_after_later_planner_start_is_new_incident(self):
         connection = self.connection()
         repo = "/projects/alpha"
