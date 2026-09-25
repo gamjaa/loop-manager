@@ -13977,12 +13977,12 @@ def _proven_manager_base_refs(
     before: GitSnapshot,
     current: GitSnapshot,
 ) -> frozenset[str]:
-    """Follow only persisted Manager fetch intents from old to observed OID."""
+    """Follow only completed Manager fetches from old to observed OID."""
     _ensure_cleanup_pending_schema(connection)
     proven: set[str] = set()
     rows = connection.execute(
         "SELECT refname, before_ref, target_oid FROM manager_base_fetches "
-        "WHERE repo = ? AND plan_id = ? AND phase IN ('pending', 'complete') "
+        "WHERE repo = ? AND plan_id = ? AND phase = 'complete' "
         "ORDER BY id",
         (repo, plan_id),
     ).fetchall()

@@ -1439,20 +1439,16 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
         )
         plan = adapter._plan(request)
         before = loop_manager.capture_git_snapshot(self.worktree)
-        other = Path(self.temporary.name) / "base-writer"
-        self.run_git(self.repo, "clone", "-b", "main", str(self.remote), str(other))
-        self.run_git(other, "config", "user.name", "Other")
-        self.run_git(other, "config", "user.email", "other@example.com")
-        (other / "dependency.py").write_text("dependency = True\n")
-        self.run_git(other, "add", "dependency.py")
-        self.run_git(other, "commit", "-m", "advance base")
-        self.run_git(other, "push", "origin", "main")
+        self._advance_base_remote()
         intent = loop_manager._record_manager_base_fetch_intent(
             self.connection, self.repo, repo, "G-034", "main", before,
         )
         loop_manager.remote_base(self.repo, "main", narrow_fetch=True)
         current = loop_manager.capture_git_snapshot(self.worktree)
-        self.assertIsNone(adapter._shared_safety_error(request, plan, current))
+        self.assertEqual(
+            adapter._shared_safety_error(request, plan, current).reason_code,
+            "shared_ref_mutation",
+        )
         loop_manager._finish_manager_base_fetch(self.connection, self.repo, intent)
         self.assertIsNone(adapter._shared_safety_error(request, plan, current))
         self.assertEqual(loop_manager.validate_persisted_agent_scope(
@@ -1463,6 +1459,50 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
             request, plan, loop_manager.capture_git_snapshot(self.worktree),
         )
         self.assertEqual(verdict.reason_code, "shared_ref_mutation")
+
+    def _advance_base_remote(self):
+        other = Path(self.temporary.name) / "base-writer"
+        self.run_git(self.repo, "clone", "-b", "main", str(self.remote), str(other))
+        self.run_git(other, "config", "user.name", "Other")
+        self.run_git(other, "config", "user.email", "other@example.com")
+        (other / "dependency.py").write_text("dependency = True\n")
+        self.run_git(other, "add", "dependency.py")
+        self.run_git(other, "commit", "-m", "advance base")
+        self.run_git(other, "push", "origin", "main")
+        return self.run_git(other, "rev-parse", "HEAD")
+
+    def test_pending_base_fetch_does_not_own_external_ref_update(self):
+        repo, _, _ = self.prepare_guidance_block(implementation_changes=False)
+        request = blocked_checkpoint_state.BlockedCheckpointRepository(
+            self.connection,
+        ).get(repo, "G-034")
+        adapter = loop_manager._BlockedCheckpointAdapter(
+            self.connection, self.repo, self.state_dir, repo,
+        )
+        before = loop_manager.capture_git_snapshot(self.worktree)
+        target = self._advance_base_remote()
+        intent = loop_manager._record_manager_base_fetch_intent(
+            self.connection, self.repo, repo, "G-034", "main", before,
+        )
+        self.assertEqual(self.connection.execute(
+            "SELECT phase FROM manager_base_fetches WHERE id = ?", (intent,),
+        ).fetchone()[0], "pending")
+        self.run_git(
+            self.repo, "fetch", "--no-tags", "--refmap=", "origin",
+            "+refs/heads/main:refs/heads/external-staging",
+        )
+        self.run_git(self.repo, "update-ref", "refs/remotes/origin/main", target)
+        self.run_git(self.repo, "update-ref", "-d", "refs/heads/external-staging")
+        current = loop_manager.capture_git_snapshot(self.worktree)
+        self.assertEqual(current.refs["refs/remotes/origin/main"][0], target)
+        self.assertEqual(
+            adapter._shared_safety_error(request, adapter._plan(request), current).reason_code,
+            "shared_ref_mutation",
+        )
+        with self.assertRaises(loop_manager.AgentScopeError):
+            loop_manager.validate_persisted_agent_scope(
+                self.connection, self.repo, self.state_dir, repo,
+            )
 
     def test_guidance_restart_rejects_foreign_ref_change(self):
         repo, _, _ = self.prepare_guidance_block(implementation_changes=False)
