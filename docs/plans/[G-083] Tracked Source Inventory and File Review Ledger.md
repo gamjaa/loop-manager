@@ -3,7 +3,8 @@ id: G-083
 title: Tracked Source Inventory and File Review Ledger
 sources:
   - docs/requirements/[R-042] Periodic Repository-Wide Code Assessment for Token-Efficient Refactoring.md
-depends_on: []
+depends_on:
+  - G-082
 complexity: high
 risk: high
 priority: normal
@@ -41,3 +42,4 @@ priority: normal
 ## Decision Log
 
 - inventory와 ledger는 후속 평가 단계가 사용할 검증 가능한 자료 경계다. 이 계획 자체는 성공 평가나 계획 게시를 기록하지 않는다.
+- G-082가 같은 유지보수 SQLite schema와 시작 기준값을 먼저 확정한 뒤 ledger를 추가한다. 두 PR이 같은 상태 경계를 서로 다른 base에서 수정하지 않도록 Merge 순서를 명시한다.
