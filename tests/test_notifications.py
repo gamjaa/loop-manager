@@ -912,6 +912,38 @@ class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
             connection, "token", "chat", adapter=mock.Mock(),
         ), 0)
 
+    def test_published_block_with_remote_inspection_is_delivered(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        with connection:
+            scoped_blocking.record_plan_block(
+                connection, repo, "G-018",
+                scoped_blocking.BlockReasonCode.USER_DECISION_REQUIRED,
+                "Decision still required", "fingerprint",
+            )
+        checkpoint = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
+        request = checkpoint.get(repo, "G-018")
+        checkpoint.finish_published(request, "a" * 40)
+        original_key = self.events(connection)[0]["event_key"]
+        checkpoint.record_remote_inspection(
+            request, "b" * 40, "input", "still blocked",
+        )
+        self.assertEqual(len(self.events(connection)), 2)
+        current_key = next(
+            row["event_key"] for row in self.events(connection)
+            if row["event_key"] != original_key
+        )
+
+        delivered = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(
+            connection, "token", "chat", adapter=delivered,
+        ), 1)
+        delivered.assert_called_once()
+        rows = {row["event_key"]: row for row in self.events(connection)}
+        self.assertIsNotNone(rows[original_key]["canceled_at"])
+        self.assertIsNone(rows[current_key]["canceled_at"])
+        self.assertIsNotNone(rows[current_key]["sent_at"])
+
     def test_cleared_planning_error_cancels_only_its_unsent_notice(self):
         connection = self.connection()
         repo = "/projects/alpha"

@@ -97,6 +97,12 @@ def _key(kind: str, repo: str, identity: str) -> str:
     return f"{kind}:{digest}"
 
 
+def _remote_inspection_suffix(result: object, oid: object, reason: object) -> str:
+    if result == "published" and reason:
+        return f"\0remote\0{oid or 'deleted'}\0{reason}"
+    return ""
+
+
 def _insert(
     connection: sqlite3.Connection,
     key: str,
@@ -243,9 +249,8 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
                 for location in (item["proposal"], item["user_decision"])
                 if location not in paths
             )
-        remote_inspection = (
-            f"\0remote\0{plan[11] or 'deleted'}\0{plan[12]}"
-            if plan[6] == "published" and plan[12] else ""
+        remote_inspection = _remote_inspection_suffix(
+            plan[6], plan[11], plan[12]
         )
         payload = {
             "project": name,
@@ -669,8 +674,7 @@ def _current_block_key(
     if payload.get("scope") == "plan":
         block = connection.execute(
             "SELECT b.reason_code, c.result, c.inspected_remote_oid, "
-            "r.origin FROM execplan_blocks b "
-            "JOIN projects r ON r.repo = b.repo "
+            "c.inspection_reason FROM execplan_blocks b "
             "LEFT JOIN blocked_checkpoints c USING (repo, plan_id) "
             "WHERE b.repo = ? AND b.plan_id = ?", (repo, subject),
         ).fetchone()
@@ -678,8 +682,7 @@ def _current_block_key(
             return None
         recovery_subject = str(subject)
         identity = f"plan\0{reason}\0{subject}"
-        remote = (f"\0remote\0{block[3] or 'deleted'}\0{block[2]}"
-                  if block[1] == "published" and block[2] else "")
+        remote = _remote_inspection_suffix(block[1], block[2], block[3])
     elif payload.get("scope") == "project":
         block = connection.execute(
             "SELECT reason_code, plan_id FROM project_blocks WHERE repo = ?",
