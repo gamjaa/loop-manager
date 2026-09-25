@@ -15069,14 +15069,24 @@ def _evaluate_remote_checkpoint_cause(
     project = connection.execute(
         "SELECT provider, base_branch FROM projects WHERE repo = ?", (repo,),
     ).fetchone()
+    try:
+        worker_publication = parse_worker_result(
+            str(blocked["worker_result"] or ""),
+            {"id": str(blocked["plan_id"]), "title": str(blocked["title"])},
+        )
+    except WorkerResultError as error:
+        return False, f"Reviewer 시작 전 Worker 결과 검증 실패: {error}", "worker"
+    targeted_test_reason = reviewer_targeted_test_reason(
+        worker_publication.test_evidence,
+    )
     previous_review = blocked["review_result"]
     protocol_error = None
     for attempt in range(1, MAX_REVIEWER_PROTOCOL_ATTEMPTS + 1):
         code, review = run_agent(
             str(project["provider"]), worktree, state_dir, config, "reviewer",
             reviewer_prompt(
-                str(project["base_branch"]), blocked["worker_result"], str(output),
-                previous_review, session_recovery=True,
+                str(project["base_branch"]), targeted_test_reason, previous_review,
+                session_recovery=True,
                 protocol_error=protocol_error,
             ),
             read_only=True,
@@ -16655,6 +16665,29 @@ def parse_worker_result(message: str, plan: dict[str, object]) -> WorkerPublicat
         )
     return WorkerPublication(title, summary, test_evidence)
 
+
+_NO_RUNNABLE_TARGETED_TEST = re.compile(
+    r"(?:"
+    r"실행 가능한 관련 targeted unit test가 없(?:습니다|다)"
+    r"|관련 targeted unit test를 실행할 수 없(?:습니다|다)"
+    r"|no runnable targeted (?:unit )?tests?"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def reviewer_targeted_test_reason(test_evidence: str) -> str | None:
+    """Return only an explicit exceptional no-test disposition for review.
+
+    Successful test prose is deliberately not interpreted: the validated Worker
+    result and verify checkpoint are the program's evidence for entering Review.
+    """
+    for line in test_evidence.splitlines():
+        normalized = " ".join(line.split())
+        if _NO_RUNNABLE_TARGETED_TEST.search(normalized):
+            return normalized[:600]
+    return None
+
 def immutable_github_blob_url(origin_url: str, commit_sha: str, relative_path: str) -> str:
     if not re.fullmatch(r"[0-9a-fA-F]{7,64}", commit_sha):
         raise RuntimeError("계획 commit SHA가 유효하지 않습니다.")
@@ -17107,15 +17140,18 @@ def build_pr_body(
 
 def reviewer_prompt(
     base: str,
-    worker_result: str | None = None,
-    verify_result: str | None = None,
+    targeted_test_reason: str | None = None,
     review_result: str | None = None,
     *,
     session_recovery: bool = False,
     protocol_error: str | None = None,
 ) -> str:
-    worker_evidence = (worker_result or "Worker가 targeted unit test 결과 또는 미실행 사유를 보고하지 않았습니다.")[-6000:]
-    verify_evidence = (verify_result or "Loop Manager 전체 verify가 성공했습니다(출력 없음).")[-6000:]
+    targeted_test_context = ""
+    if targeted_test_reason:
+        targeted_test_context = (
+            "\n관련 targeted unit test를 실행하지 못한 사유:\n"
+            f"{targeted_test_reason}\n"
+        )
     recovery = ""
     if session_recovery:
         recovery = (
@@ -17135,14 +17171,10 @@ def reviewer_prompt(
     return f"""
 origin/{base}와 현재 HEAD의 차이를 읽기 전용으로 검토하라.
 AGENTS.md, 근거 PRODUCT/Requirement, ARCHITECTURE와 ExecPlan을 기준으로 correctness, 회귀, 테스트 누락, verify 약화를 확인하라.
-Worker가 보고한 targeted unit test 결과 또는 미실행 사유:
-{worker_evidence}
-
-Loop Manager가 실행한 전체 verify 결과:
-{verify_evidence}
+{targeted_test_context}
 {recovery}
 {correction}
-테스트 command와 scripts/verify를 실행하지 말고, 코드·테스트·verify 스크립트의 diff 및 위 결과만으로 판단하라.
+테스트 command와 scripts/verify를 실행하지 말고, 코드·테스트·verify 스크립트의 diff와 필요한 미실행 사유만으로 판단하라.
 blocking issue마다 설명 직전에 `ISSUE_ID: relative/path::stable-symbol-or-test::category-slug`를 한 줄로 기록하라.
 relative/path는 `/`로 구분한 실제 저장소 상대 경로이며 공백과 대괄호를 허용하지만, 절대 경로·빈 구성요소·`.`·`..`·역슬래시·colon·제어문자는 허용하지 않는다.
 ISSUE_ID에는 줄 번호나 자연어 설명을 넣지 말고, 같은 issue가 재발하면 위치·표현이 바뀌어도 이전과 정확히 같은 ID를 사용하라.
@@ -20921,6 +20953,7 @@ def _ExecutionLifecyclePorts(connection, runtime_repository, **identity):
             'ReviewerProtocolError', 'TRANSIENT_AGENT_ERROR_PREFIX',
             'USAGE_LIMIT_ERROR_PREFIX', 'WORKSPACE_OWNED', 'WORKSPACE_RESERVED',
             'WorkerResultError', 'WorkspaceOwnershipError',
+            'reviewer_targeted_test_reason',
             'VerifyTerminationUncertain',
         )}),
         workspace=execution_handlers.WorkspaceEffects(

@@ -2975,6 +2975,63 @@ class ExecutionHandlers:
             )
         return result
 
+    def _review_entry_evidence(self, context):
+        """Require current Worker and verify evidence before invoking Reviewer."""
+        row = self._row()
+        try:
+            worker_publication = self.effects.validation.parse_worker_result(
+                str(row['worker_result'] or ''), self.plan,
+            )
+        except self.effects.contract.WorkerResultError as error:
+            detail = f"Reviewer 시작 전 Worker 결과 검증 실패:\n{error}"
+            self.effects.state.update_project(
+                self.repo, phase='WORKING', validated_base_sha=None,
+                verify_result=None, review_result=None, verify_token=None,
+                review_token=None, publication_token=None, last_error=detail,
+            )
+            self.effects.events.operation_print(detail, file=sys.stderr)
+            return self._recover(
+                RecoveryReason.WORKER_CORRECTION, detail, context=context,
+            )
+
+        # Every normal execution turn installs this durable definition snapshot
+        # in guard(). Keep legacy direct callers from inventing a verification
+        # identity; they must return through the normal correction path.
+        if self._definition_snapshot is None:
+            detail = 'Reviewer 시작 전 검증 대상 ExecPlan 선언 증거가 없습니다.'
+            self.effects.state.update_project(
+                self.repo, phase='VERIFYING', validated_base_sha=None,
+                verify_result=None, review_result=None, verify_token=None,
+                review_token=None, publication_token=None, last_error=detail,
+            )
+            self.effects.events.operation_print(detail, file=sys.stderr)
+            return self._retry(detail)
+
+        latest_sha = self._fetch_latest_base()
+        if latest_sha != row['active_sha']:
+            return self._latest_before_verify(context, latest_sha)
+
+        candidate_head = self.effects.workspace.git(
+            context.worktree, 'rev-parse', 'HEAD',
+        ).stdout.strip()
+        expected_verify = self._definition_snapshot.verify_token(
+            latest_sha, candidate_head,
+        )
+        if (
+            not row['verify_result']
+            or row['validated_base_sha'] != latest_sha
+            or row['verify_token'] != expected_verify
+        ):
+            detail = 'Reviewer 시작 전 현재 후보 revision의 성공한 전체 verify 증거가 없습니다. 다시 검증합니다.'
+            self.effects.state.update_project(
+                self.repo, phase='VERIFYING', validated_base_sha=None,
+                verify_result=None, review_result=None, verify_token=None,
+                review_token=None, publication_token=None, last_error=detail,
+            )
+            self.effects.events.operation_print(detail, file=sys.stderr)
+            return self._retry(detail)
+        return worker_publication
+
     def review(self, context):
         self.effects.state.check_context(context)
         row = self._row()
@@ -2985,6 +3042,12 @@ class ExecutionHandlers:
                 self._document_guard(context, draft)
             except (document_drafts.DocumentDraftError, OSError, UnicodeError) as error:
                 return self._document_block(context, draft, error)
+        entry_evidence = self._review_entry_evidence(context)
+        if isinstance(entry_evidence, ExecutionOutcome):
+            return entry_evidence
+        targeted_test_reason = self.effects.contract.reviewer_targeted_test_reason(
+            entry_evidence.test_evidence,
+        )
         protocol_error: str | None = None
         verdict: str | None = None
         review = ''
@@ -3012,8 +3075,7 @@ class ExecutionHandlers:
                     self._document_review_prompt(
                         self.effects.agent.reviewer_prompt(
                             self.base,
-                            row['worker_result'],
-                            row['verify_result'],
+                            targeted_test_reason,
                             row['review_result'],
                             session_recovery=session_recovery,
                             protocol_error=protocol_error,

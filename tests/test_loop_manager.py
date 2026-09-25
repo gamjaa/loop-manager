@@ -4057,7 +4057,10 @@ risk: medium
 
     def test_worker_and_reviewer_prompts_define_test_execution_boundary(self):
         worker = loop_manager.worker_prompt("docs/plans/[G-001] Worker Boundary.md", None)
-        reviewer = loop_manager.reviewer_prompt("main", "targeted: PASS", "verify: PASS")
+        reviewer = loop_manager.reviewer_prompt("main")
+        no_test_reviewer = loop_manager.reviewer_prompt(
+            "main", "실행 가능한 관련 targeted unit test가 없습니다: 문서 변경만 포함합니다.",
+        )
 
         for phrase in (
             "최소 범위의 targeted unit test만 실행",
@@ -4070,8 +4073,9 @@ risk: medium
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, worker)
-        self.assertIn("targeted: PASS", reviewer)
-        self.assertIn("verify: PASS", reviewer)
+        self.assertNotIn("targeted: PASS", reviewer)
+        self.assertNotIn("verify: PASS", reviewer)
+        self.assertIn("문서 변경만 포함합니다", no_test_reviewer)
         self.assertIn("테스트 command와 scripts/verify를 실행하지 말고", reviewer)
         self.assertIn("ISSUE_ID: relative/path::stable-symbol-or-test::category-slug", reviewer)
         self.assertIn("이전과 정확히 같은 ID", reviewer)
@@ -4082,6 +4086,15 @@ risk: medium
         self.assertIn("COMMIT_TITLE:", worker)
         self.assertIn("PR_SUMMARY:", worker)
         self.assertIn("TARGETED_TESTS:", worker)
+        self.assertIsNone(
+            loop_manager.reviewer_targeted_test_reason("targeted test: PASS")
+        )
+        self.assertEqual(
+            loop_manager.reviewer_targeted_test_reason(
+                "실행 가능한 관련 targeted unit test가 없습니다: 문서 변경만 포함합니다."
+            ),
+            "실행 가능한 관련 targeted unit test가 없습니다: 문서 변경만 포함합니다.",
+        )
 
     def test_existing_database_adds_worker_session_and_result_fields(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -4302,7 +4315,7 @@ risk: medium
         # The base advances at the pre-Worker gate, so neither a stale Worker
         # result nor a stale verify result is produced or consumed.
 
-    def test_verify_success_passes_worker_and_verify_results_to_reviewer(self):
+    def test_verify_success_keeps_worker_and_verify_logs_out_of_reviewer(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, state_dir, connection = self._make_active_worker_project(directory)
             calls = []
@@ -4336,8 +4349,8 @@ risk: medium
             self.assertEqual(logs[:3], [("Worker 시작: G-001 Worker Boundary", {}), ("전체 verify 시작: G-001 Worker Boundary", {}), ("Reviewer 시작: G-001 Worker Boundary", {})])
             self.assertEqual([role for role, _prompt, _kwargs in calls], ["worker", "reviewer"])
             reviewer_prompt = calls[1][1]
-            self.assertIn("targeted test: PASS", reviewer_prompt)
-            self.assertIn("verify: PASS", reviewer_prompt)
+            self.assertNotIn("targeted test: PASS", reviewer_prompt)
+            self.assertNotIn("verify: PASS", reviewer_prompt)
             self.assertIn("테스트 command와 scripts/verify를 실행하지 말고", reviewer_prompt)
 
             row = connection.execute(

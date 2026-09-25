@@ -203,6 +203,23 @@ class ExecutionRevisionTests(unittest.TestCase):
         self.assertEqual(decision.kind, RevisionGateKind.INVALIDATE_TO_PHASE)
         self.assertEqual(decision.phase, "VERIFYING")
 
+    def test_reviewing_phase_requires_current_successful_verify_evidence(self):
+        current = definition()
+        artifacts = StageArtifacts(
+            worker_result=True,
+            worker_input_token=current.worker_token,
+            archive_token=current.archive_token,
+        )
+
+        decision = decide_revision_gate(
+            phase="REVIEWING", previous=current, current=current,
+            active_base_token="base", current_base_token="base",
+            artifacts=artifacts, candidate_head="candidate-head",
+        )
+
+        self.assertEqual(decision.kind, RevisionGateKind.INVALIDATE_TO_PHASE)
+        self.assertEqual(decision.phase, "VERIFYING")
+
     def test_serialization_is_deterministic_and_rejects_invalid_state(self):
         current = definition(archive_candidates=("b", "a"))
         restored = DefinitionSnapshot.deserialize(current.serialize())

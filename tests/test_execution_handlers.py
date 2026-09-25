@@ -95,7 +95,7 @@ class ExecutionHandlerTests(TestCase):
                               return_value=ExecutionOutcome(ExecutionOutcomeKind.FINAL_BLOCK)) as block,
             mock.patch.object(handlers.document_drafts, 'review_artifact', return_value='artifact'),
         ):
-            outcome = self.handler.review(self.context('REVIEWING'))
+            outcome = self.handler.review(self.review_context())
         self.assertEqual(outcome.kind, ExecutionOutcomeKind.FINAL_BLOCK)
         self.assertIn('명시적으로 확정', block.call_args.args[2])
         self.effects.publication.command.assert_not_called()
@@ -113,7 +113,7 @@ class ExecutionHandlerTests(TestCase):
             mock.patch.object(self.handler, '_document_guard'),
             mock.patch.object(handlers.document_drafts, 'review_artifact', return_value='artifact'),
         ):
-            outcome = self.handler.review(self.context('REVIEWING'))
+            outcome = self.handler.review(self.review_context())
         self.assertEqual(outcome.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
         self.assertEqual(self.state.row()['phase'], 'PUBLISHING')
 
@@ -256,7 +256,9 @@ class ExecutionHandlerTests(TestCase):
             dirty={'app.py': (('staged',), 'accepted-content')},
         )
         self.effects.validation.validate_active_execplan_metadata.return_value = self.plan
-        self.effects.validation.parse_worker_result.return_value = SimpleNamespace(commit_title='Concrete change')
+        self.effects.validation.parse_worker_result.return_value = SimpleNamespace(
+            commit_title='Concrete change', test_evidence='targeted test: PASS',
+        )
         self.effects.validation.verify.side_effect = lambda _: (self.calls.append('verify') or True, 'OK')
         self.effects.validation.parse_reviewer_result.return_value = ('PASS', ())
         self.effects.agent.run_agent_with_retries.side_effect = lambda call, session_id: call(session_id, False)
@@ -308,6 +310,24 @@ class ExecutionHandlerTests(TestCase):
     def context(self, phase=None):
         if phase is not None:
             self.state.update_project('repo', phase=phase)
+        return self.handler._context()
+
+    def review_context(self):
+        snapshot = DefinitionSnapshot(
+            revision_sha='base', path='docs/plans/[G-047] Runtime.md',
+            title='Runtime', sources=('docs/PRODUCT.md',), depends_on=(),
+            complexity='medium', risk='medium', priority='normal',
+            body_hash='body', source_fingerprint='source', archive_candidates=(),
+        )
+        self.handler._definition_snapshot = snapshot
+        self.state.update_project(
+            'repo', phase='REVIEWING', active_sha='base',
+            validated_base_sha='base', worker_result='worker result',
+            verify_result='successful verify output',
+            worker_input_token=snapshot.worker_token,
+            archive_token=snapshot.archive_token,
+            verify_token=snapshot.verify_token('base', 'base'),
+        )
         return self.handler._context()
 
     def observed_git(self, path, *args, **kwargs):
@@ -934,11 +954,11 @@ class ExecutionHandlerTests(TestCase):
             lm.AgentResult(0, 'VERDICT: PASS', session_id='review-session'),
         ]
 
-        self.handler.review(self.context('REVIEWING'))
+        self.handler.review(self.review_context())
         self.assertEqual([row['identity'] for row in feedback.prepare(
             'repo', 'G-047', 'worker-session',
         ).rows], ['review:a.py::g::bug', 'review:z.py::f::bug'])
-        self.handler.review(self.context('REVIEWING'))
+        self.handler.review(self.review_context())
         self.assertEqual(feedback.prepare('repo', 'G-047', 'worker-session').rows, ())
         self.assertEqual(self.connection.execute(
             "SELECT classification FROM validation_results ORDER BY id"
@@ -953,7 +973,7 @@ class ExecutionHandlerTests(TestCase):
             lm.AgentResult(1, raw, kind=lm.AgentResultKind.TRANSIENT_FAILURE),
             lm.AgentResult(0, 'VERDICT: PASS'),
         ]
-        self.handler.review(self.context('REVIEWING'))
+        self.handler.review(self.review_context())
         audit = self.connection.execute(
             "SELECT classification,raw_output FROM validation_results ORDER BY id"
         ).fetchall()
@@ -975,7 +995,7 @@ class ExecutionHandlerTests(TestCase):
                         if rejection == 'ownership' else None)
                     self.effects.agent.capture_git_snapshot.side_effect = (
                         RuntimeError('snapshot') if rejection == 'snapshot' else None)
-                    context = self.context('REVIEWING')
+                    context = self.review_context()
                     stale = ExecutionOutcome(ExecutionOutcomeKind.RETRY, detail='stale')
                     with mock.patch.object(self.handler, '_block_final'), mock.patch.object(
                         self.handler, '_post_effect_guard', return_value=stale,
@@ -1003,7 +1023,7 @@ class ExecutionHandlerTests(TestCase):
             KeyboardInterrupt(),
         ]
         with self.assertRaises(KeyboardInterrupt):
-            self.handler.review(self.context('REVIEWING'))
+            self.handler.review(self.review_context())
         audit = self.connection.execute(
             "SELECT classification,raw_output FROM validation_results ORDER BY id"
         ).fetchall()
@@ -2108,7 +2128,7 @@ class ExecutionHandlerTests(TestCase):
         )
 
     def test_real_handlers_complete_each_phase_and_reject_replay(self):
-        context = self.context()
+        context = self.handler.guard(self.context())
         for method in ('run', 'verify', 'review', 'publish'):
             old = context
             call = getattr(self.handler, method)
@@ -2133,7 +2153,7 @@ class ExecutionHandlerTests(TestCase):
                                   collection_status='error')
 
         self.effects.agent.run_agent.side_effect = reported_agent
-        worker = self.handler.run(self.context())
+        worker = self.handler.run(self.handler.guard(self.context()))
         verified = self.handler.verify(worker.context, self.handler)
         reviewed = self.handler.review(verified.context)
 
@@ -2757,6 +2777,38 @@ class ExecutionHandlerTests(TestCase):
         self.assertIsNone(self.state.row()['verify_token'])
         self.effects.agent.run_agent.assert_called_once()
 
+    def test_review_entry_rechecks_verified_candidate_before_agent(self):
+        self.handler.guard(self.context())
+        worker = self.handler.run(self.handler._context())
+        verified = self.handler.verify(worker.context, self.handler)
+        original = self.git
+
+        def replaced_head(path, *args, **kwargs):
+            if path == Path('/state/G-047') and args == ('rev-parse', 'HEAD'):
+                return SimpleNamespace(stdout='replacement-head\n', returncode=0)
+            return original(path, *args, **kwargs)
+
+        self.effects.workspace.git.side_effect = replaced_head
+        outcome = self.handler.review(verified.context)
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(self.state.row()['phase'], 'VERIFYING')
+        self.effects.agent.run_agent.assert_called_once()
+
+    def test_review_entry_returns_invalid_worker_result_to_correction(self):
+        self.handler.guard(self.context())
+        worker = self.handler.run(self.handler._context())
+        verified = self.handler.verify(worker.context, self.handler)
+        self.effects.validation.parse_worker_result.side_effect = lm.WorkerResultError(
+            'TARGETED_TESTS 형식이 유효하지 않습니다.',
+        )
+
+        outcome = self.handler.review(verified.context)
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(self.state.row()['phase'], 'WORKING')
+        self.effects.agent.run_agent.assert_called_once()
+
     def test_head_change_during_verify_does_not_save_success(self):
         original = self.git
         changed = False
@@ -2833,9 +2885,12 @@ class ExecutionHandlerTests(TestCase):
     def test_protocol_correction_reuses_session_before_publication(self):
         self.effects.validation.parse_reviewer_result.side_effect = [
             lm.ReviewerProtocolError('malformed'), ('PASS', ())]
-        result = self.handler.review(self.context('REVIEWING'))
+        result = self.handler.review(self.review_context())
         self.assertEqual(result.context.phase, ExecutionPhase.PUBLISHING)
-        self.assertEqual(self.calls, ['reviewer', 'reviewer'])
+        self.assertEqual(
+            [call for call in self.calls if call == 'reviewer'],
+            ['reviewer', 'reviewer'],
+        )
         self.assertEqual(self.effects.agent.run_agent.call_args.kwargs['session_id'], 'session')
 
     def test_review_specification_deadlock_blocks_plan_without_worker_correction(self):
@@ -2850,9 +2905,9 @@ class ExecutionHandlerTests(TestCase):
         self.effects.validation.parse_reviewer_result.return_value = (
             'SPEC_BLOCKED', details,
         )
-        result = self.handler.review(self.context('REVIEWING'))
+        result = self.handler.review(self.review_context())
         self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
-        self.assertEqual(self.calls, ['reviewer'])
+        self.assertEqual([call for call in self.calls if call == 'reviewer'], ['reviewer'])
         self.assertEqual(
             self.effects.blocking.block_active_execplan.call_args.kwargs['reason'],
             lm.BlockReasonCode.REVIEW_SPECIFICATION_DEADLOCK,
@@ -2877,7 +2932,7 @@ class ExecutionHandlerTests(TestCase):
         self.effects.validation.parse_reviewer_result.return_value = (
             'SPEC_BLOCKED', details,
         )
-        result = self.handler.review(self.context('REVIEWING'))
+        result = self.handler.review(self.review_context())
         self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
         self.assertEqual(
             self.effects.blocking.block_active_execplan.call_args.kwargs[
@@ -2896,9 +2951,12 @@ class ExecutionHandlerTests(TestCase):
         self.effects.validation.parse_reviewer_result.side_effect = [
             ('SPEC_BLOCKED', details), ('PASS', ()),
         ]
-        result = self.handler.review(self.context('REVIEWING'))
+        result = self.handler.review(self.review_context())
         self.assertEqual(result.context.phase, ExecutionPhase.PUBLISHING)
-        self.assertEqual(self.calls, ['reviewer', 'reviewer'])
+        self.assertEqual(
+            [call for call in self.calls if call == 'reviewer'],
+            ['reviewer', 'reviewer'],
+        )
         self.effects.blocking.block_active_execplan.assert_not_called()
 
     def test_archive_change_returns_to_worker_before_push(self):
