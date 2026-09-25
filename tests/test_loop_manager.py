@@ -6884,7 +6884,7 @@ class WorkerPublicationTest(unittest.TestCase):
             error=False,
         )
 
-    def test_verify_and_review_retries_keep_latest_worker_metadata(self):
+    def test_verify_and_review_retries_keep_latest_worker_metadata_out_of_reviewer_prompt(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = make_remote_repository(directory)
             state_dir = Path(directory) / "state"
@@ -6988,9 +6988,11 @@ class WorkerPublicationTest(unittest.TestCase):
             row["worker_result"],
             worker_result("Publish reviewed context", "Final summary", "test: PASS"),
         )
-        self.assertIn("Publish reviewed context", reviewer_prompts[-1])
-        self.assertIn("Final summary", reviewer_prompts[-1])
+        self.assertNotIn("Publish reviewed context", reviewer_prompts[-1])
+        self.assertNotIn("Final summary", reviewer_prompts[-1])
         self.assertNotIn("Initial summary", reviewer_prompts[-1])
+        self.assertNotIn("test: PASS", reviewer_prompts[-1])
+        self.assertNotIn("verify: PASS", reviewer_prompts[-1])
         self.assertIn("Final summary", latest_body)
         self.assertEqual(row["status"], "PR_OPEN")
         self.assertNotEqual(worktree, repo)
