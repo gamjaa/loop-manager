@@ -17241,6 +17241,11 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
             "(?, 'G-018', 'docs/plans/[G-018] Work.md', 'Work', '[]', "
             "'[]', 'normal', 'hash', 'PR_OPEN')", (repo,),
         )
+        loop_manager.maintenance_state.ensure_schema(connection)
+        connection.execute(
+            "INSERT INTO maintenance_cycles (repo, last_success_merged_count) "
+            "VALUES (?, 0)", (repo,),
+        )
         connection.commit()
         return connection, repo
 
@@ -17256,8 +17261,7 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
         ):
             git_command.return_value.stdout = "base-sha\n"
             snapshot = loop_manager._stable_work_reason(
-                connection, repo, registered_only=False,
-                refactoring_review_interval=5,
+                connection, repo, refactoring_review_interval=5,
             )
             self.assertIsNotNone(snapshot)
             self.assertIn("[R-031]", snapshot.describe())
@@ -17265,16 +17269,14 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
                 "UPDATE exec_plans SET status = 'MERGED' WHERE repo = ?", (repo,),
             )
             no_plan = loop_manager._stable_work_reason(
-                connection, repo, registered_only=False,
-                refactoring_review_interval=5,
+                connection, repo, refactoring_review_interval=5,
             )
             self.assertFalse(no_plan.completed)
             connection.execute(
                 "UPDATE projects SET planning_fingerprint = 'older' WHERE repo = ?", (repo,),
             )
             self.assertIsNone(loop_manager._stable_work_reason(
-                connection, repo, registered_only=False,
-                refactoring_review_interval=5,
+                connection, repo, refactoring_review_interval=5,
             ))
         connection.close()
 
@@ -17284,16 +17286,41 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
             "UPDATE exec_plans SET status = 'READY' WHERE repo = ?", (repo,),
         )
         self.assertIsNone(loop_manager._stable_work_reason(
-            connection, repo, registered_only=False,
-            refactoring_review_interval=5,
+            connection, repo, refactoring_review_interval=5,
         ))
         connection.execute(
             "UPDATE exec_plans SET status = 'PR_OPEN' WHERE repo = ?", (repo,),
         )
-        self.assertIsNone(loop_manager._stable_work_reason(
-            connection, repo, registered_only=True,
-            refactoring_review_interval=5,
-        ))
+        connection.execute(
+            "UPDATE maintenance_cycles SET last_success_merged_count = NULL "
+            "WHERE repo = ?", (repo,),
+        )
+        with mock.patch("loop_manager.is_loop_manager_repository", return_value=False), \
+                mock.patch("loop_manager.git") as git_command:
+            self.assertIsNone(loop_manager._stable_work_reason(
+                connection, repo, refactoring_review_interval=5,
+            ))
+            git_command.assert_not_called()
+        connection.close()
+
+    def test_manual_run_with_due_maintenance_does_not_complete(self):
+        connection, repo = self._connection()
+        connection.execute(
+            "UPDATE exec_plans SET status = 'MERGED' WHERE repo = ?", (repo,),
+        )
+        connection.execute(
+            "UPDATE maintenance_cycles SET last_success_merged_count = NULL "
+            "WHERE repo = ?", (repo,),
+        )
+        with mock.patch("loop_manager._checkpoint_dispatch_ready", return_value=False), \
+                mock.patch("loop_manager._run_project_step", return_value=0), \
+                mock.patch.object(loop_manager.notifications, "enqueue_completion_if_ready") as completed:
+            result = loop_manager._run_project_result(
+                connection, Path("/unused"), repo, Path("/unused.ini"),
+                None, False, registered_only=False,
+            )
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
+        completed.assert_not_called()
         connection.close()
 
     def test_planner_no_change_with_active_requirement_waits_without_completion(self):

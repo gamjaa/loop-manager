@@ -1180,11 +1180,31 @@ class WorkReasonOutboxTest(NotificationFixture, unittest.TestCase):
         self.assertFalse(notifications.enqueue_waiting_reason(connection, repo, snapshot))
         self.assertEqual(self.events(connection), [])
 
-        with_requirement = work_exhaustion.WorkReasonSnapshot(
-            snapshot.cycle, snapshot.plans,
-            ({"id": "[R-031]", "path": "docs/requirements/[R-031] x.md",
-              "reason": "archive 확인 대기"},), None, None,
+        requirement_path = "docs/requirements/[R-031] x.md"
+        connection.execute(
+            "UPDATE exec_plans SET sources = ? WHERE repo = ? AND plan_id = 'G-018'",
+            (json.dumps([requirement_path]), repo),
         )
+        related = work_exhaustion.collect(
+            connection, repo, cycle="cycle-one",
+            active_requirements=(requirement_path,),
+        )
+        assert related is not None
+        self.assertIn("[R-031]", related.describe())
+        self.assertFalse(related.has_distinct_wait)
+        self.assertFalse(notifications.enqueue_waiting_reason(connection, repo, related))
+        self.assertEqual(self.events(connection), [])
+
+        connection.execute(
+            "UPDATE exec_plans SET sources = '[]' "
+            "WHERE repo = ? AND plan_id = 'G-018'", (repo,),
+        )
+        with_requirement = work_exhaustion.collect(
+            connection, repo, cycle="cycle-one",
+            active_requirements=(requirement_path,),
+        )
+        assert with_requirement is not None
+        self.assertTrue(with_requirement.has_distinct_wait)
         notifications.enqueue_waiting_reason(connection, repo, with_requirement)
         failed = mock.Mock(side_effect=RuntimeError("network unavailable"))
         self.assertEqual(notifications.dispatch_pending(

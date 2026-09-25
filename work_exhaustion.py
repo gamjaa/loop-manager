@@ -12,7 +12,7 @@ import sqlite3
 class WorkReasonSnapshot:
     cycle: str
     plans: tuple[dict[str, object], ...]
-    requirements: tuple[dict[str, str], ...]
+    requirements: tuple[dict[str, object], ...]
     project_block: dict[str, str] | None
     planning_error: str | None
 
@@ -23,9 +23,14 @@ class WorkReasonSnapshot:
     @property
     def has_distinct_wait(self) -> bool:
         # A BLOCKED event already owns a wait consisting only of blocks.
-        return bool(self.requirements or any(
-            plan["status"] != "PLAN_BLOCKED" for plan in self.plans
-        ))
+        if any(plan["status"] != "PLAN_BLOCKED" for plan in self.plans):
+            return True
+        if not self.plans:
+            return bool(self.requirements)
+        return any(
+            requirement.get("independent_wait") is True
+            for requirement in self.requirements
+        )
 
     def payload(self, project: str) -> dict[str, object]:
         return {
@@ -181,14 +186,22 @@ def collect(
             except (TypeError, ValueError):
                 sources = []
             if path in sources:
-                related.append(str(row["status"]))
+                related.append(statuses[str(row["plan_id"])])
         if related and all(status == "MERGED" for status in related):
             reason = "관련 계획은 Merge됐고 archive 게시 확인을 기다립니다"
-        elif not plans:
+        elif not related:
             reason = "Planner는 추가 계획이 없다고 확인했지만 활성 Requirement가 남아 있습니다"
+        elif all(status in {"MERGED", "PLAN_BLOCKED"} for status in related):
+            reason = "관련 PLAN_BLOCKED 계획의 사용자 조치를 기다립니다"
         else:
             reason = "관련 계획 또는 archive 확인을 기다립니다"
-        requirement_reasons.append({"id": identifier, "path": path, "reason": reason})
+        independent_wait = not related or all(
+            status == "MERGED" for status in related
+        ) or any(status in {"READY", "PR_OPEN"} for status in related)
+        requirement_reasons.append({
+            "id": identifier, "path": path, "reason": reason,
+            "independent_wait": independent_wait,
+        })
 
     return WorkReasonSnapshot(
         cycle, tuple(plans), tuple(requirement_reasons), project_block, planning_error,

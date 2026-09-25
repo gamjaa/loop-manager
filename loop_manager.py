@@ -19072,7 +19072,7 @@ def run_project_result(
 
 def _stable_work_reason(
     connection: sqlite3.Connection, repo: str, *,
-    registered_only: bool, refactoring_review_interval: int,
+    refactoring_review_interval: int,
 ) -> work_exhaustion.WorkReasonSnapshot | None:
     """Confirm that the latest remote selection has no runnable work."""
 
@@ -19100,10 +19100,10 @@ def _stable_work_reason(
     if (
         cycle.phase is not maintenance_state.MaintenancePhase.IDLE
         or cycle.publication_stage is not None
-        or (registered_only and maintenance.due(
+        or maintenance.due(
             repo, refactoring_review_interval,
             self_repository=is_loop_manager_repository(Path(repo)),
-        ).required)
+        ).required
     ):
         return None
     repo_path = Path(repo)
@@ -19333,8 +19333,7 @@ def _run_project_result(
         "LIMIT 1", (repo,),
     ).fetchone() is not None):
         snapshot = _stable_work_reason(
-            connection, repo, registered_only=registered_only,
-            refactoring_review_interval=refactoring_review_interval,
+            connection, repo, refactoring_review_interval=refactoring_review_interval,
         )
     if snapshot is not None:
         reason = snapshot.describe()
@@ -19364,13 +19363,10 @@ def _run_project_result(
     maintenance_cycle = maintenance_repository.get(repo)
     if (
         maintenance_cycle.phase is not maintenance_state.MaintenancePhase.IDLE
-        or (
-            registered_only
-            and maintenance_repository.due(
-                repo, refactoring_review_interval,
-                self_repository=is_loop_manager_repository(Path(repo)),
-            ).required
-        )
+        or maintenance_repository.due(
+            repo, refactoring_review_interval,
+            self_repository=is_loop_manager_repository(Path(repo)),
+        ).required
     ):
         return ProjectRunResult(ProjectRunKind.WAITING, 0, detail)
     unfinished = connection.execute(
