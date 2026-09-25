@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 import loop_manager
+import notifications
 import maintenance_state
 from planning_catalog import MutableReadySnapshot, mutable_snapshot_token
 from planning_runtime import (
@@ -393,6 +394,39 @@ class FakePorts:
 
 
 class PlanningLifecycleCoordinatorTest(unittest.TestCase):
+    def test_real_planner_port_records_resumption_at_agent_start(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.row_factory = sqlite3.Row
+        connection.execute(loop_manager.SCHEMA)
+        loop_manager._ensure_execplans_schema(connection)
+        notifications.configure_session(connection, enabled=True)
+        repo = "/projects/alpha"
+        connection.execute(
+            "INSERT INTO projects (repo, base_branch, planning_error) "
+            "VALUES (?, 'main', 'bad plan')", (repo,),
+        )
+        with connection:
+            notifications.enqueue_current_project_events(connection, repo)
+        notifications.dispatch_pending(connection, "token", "chat", adapter=mock.Mock())
+        loop_manager.update_project(connection, repo, planning_error=None)
+        context = SimpleNamespace(
+            repo=repo, provider="codex", state_dir=Path("/state"),
+            config_path=Path("/config.ini"),
+        )
+        port = loop_manager._PlanningAgentPorts(connection, context, None)
+        result = SimpleNamespace(
+            code=0, message="", session_id=None,
+            result_kind=loop_manager.AgentResultKind.SUCCESS,
+        )
+        with mock.patch.object(loop_manager, "run_agent_with_retries", return_value=result):
+            port.run_planner(Path("/worktree"), "prompt", None, lambda _: None)
+        resumed = connection.execute(
+            "SELECT payload FROM notification_outbox WHERE event_type = 'resumed'"
+        ).fetchall()
+        self.assertEqual(len(resumed), 1)
+        self.assertEqual(json.loads(resumed[0][0])["operation"], "Planner")
+
     def setUp(self):
         self.context = PlanningContext(
             repo="/repo",

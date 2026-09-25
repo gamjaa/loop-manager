@@ -522,6 +522,12 @@ class RuntimeStateRepository:
 
     def _update_project_row(self, repo: str, values: Mapping[str, object]) -> None:
         self._validate_fields(values, PROJECT_UPDATE_FIELDS)
+        if "planning_error" in values and values["planning_error"] is None:
+            previous = self.connection.execute(
+                "SELECT planning_error FROM projects WHERE repo = ?", (repo,),
+            ).fetchone()
+            if previous is not None and previous[0]:
+                notifications.release_block(self.connection, repo, "planning")
         assignments = ", ".join(f"{field} = ?" for field in values)
         changed = self.connection.execute(
             f"UPDATE projects SET {assignments} WHERE repo = ?",

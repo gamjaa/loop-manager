@@ -14407,6 +14407,12 @@ def observe_waiting_pull_requests(
                 "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
                 (repo, stored["plan_id"]),
             ).fetchone()
+        with connection:
+            resumed = notifications.record_work_start(
+                connection, repo, "PR handling", plan_id=str(stored["plan_id"]),
+            )
+        if resumed:
+            operation_log(f"차단 해제 후 PR 처리 재개: {stored['plan_id']}")
         mergeability = classify_pull_request_mergeability(pull_request)
         with connection:
             plan_values: dict[str, object] = {"pr_url": url}
@@ -15646,7 +15652,12 @@ def _resume_reopened_pull_request(
         scoped_blocking.clear_plan_block(
             connection, repo, str(plan["plan_id"])
         )
+        resumed = notifications.record_work_start(
+            connection, repo, "PR handling", plan_id=str(plan["plan_id"]),
+        )
         notifications.enqueue_current_project_events(connection, repo)
+    if resumed:
+        operation_log(f"차단 해제 후 PR 처리 재개: {plan['plan_id']}")
 
 def reconcile_existing_pull_request(
     connection: sqlite3.Connection,
@@ -17999,6 +18010,12 @@ class _PlanningAgentPorts:
         context = self._context
         guard = self._planner_mutex or contextlib.nullcontext()
         with guard:
+            with self._connection:
+                resumed = notifications.record_work_start(
+                    self._connection, context.repo, "Planner",
+                )
+            if resumed:
+                operation_log(f"차단 해제 후 Planner 작업 재개: {context.repo}")
             result = run_agent_with_retries(
                 TrackedAgentCall(lambda current_session_id, _session_recovery, invocation: run_agent(
                     context.provider,
