@@ -10,7 +10,7 @@ Loop Manager는 현재 source checkout과 분리된 exact `origin/main` SHA의 d
 
 Loop Manager 저장소 자체를 등록 프로젝트로 운영할 때는 영향이 더 크다. 현재 실행이 자기 프로젝트의 PR Merge를 새로 확인하면 해당 Merge commit에는 다음 실행부터 사용해야 할 Loop Manager 코드가 포함될 수 있다. Merge 확인 뒤에도 같은 runtime에서 후속 Worker나 다른 프로젝트 작업을 시작하면, 새 원격 revision을 가져왔는데도 Merge 전 프로그램 revision으로 orchestration을 계속할 수 있다.
 
-현재 Agent Git 범위 감시는 관리 worktree뿐 아니라 같은 repository에 등록된 기본 worktree의 HEAD·index·파일 상태 signature도 하나의 repository-wide 불변 조건으로 비교한다. 그 결과 bootstrap/source checkout의 사용자 변경이 Agent 실행 중 우연히 발생해도 변경 주체와 무관하게 `worker Git 범위 위반`과 `PROJECT_BLOCKED`로 기록될 수 있다. 나중에 기본 worktree가 clean해져도 과거 snapshot의 정확한 복원을 요구하면 정상적인 fetch, runtime worktree 생성과 source 갱신까지 새 차이로 누적되어 차단이 반복된다.
+현재 Agent Git 범위 감시는 관리 worktree뿐 아니라 같은 repository의 worktree와 shared Git metadata까지 하나의 repository-wide 불변 조건으로 비교한다. 그 결과 bootstrap/source checkout의 사용자 변경이나 현재 계획과 무관한 branch·worktree 변경도 Agent 실행 중 우연히 발생하면 변경 주체와 관계없이 `worker Git 범위 위반`과 `PROJECT_BLOCKED`로 기록될 수 있다. Loop Manager가 저장된 Agent 시작 snapshot 뒤에 관리 rebase를 수행한 경우에도 그 HEAD·branch ref·worktree index 변화를 Agent 결과로 오인할 수 있다. 과거 snapshot의 정확한 복원을 요구하면 정상적인 fetch, runtime worktree 생성·정리와 source 갱신까지 차이로 누적되어 차단이 반복된다.
 
 ## Requirement
 
@@ -26,9 +26,13 @@ Loop Manager는 각 프로젝트의 기본 worktree 동기화 여부를 결정�
 
 bootstrap/source checkout의 HEAD·index·tracked·untracked·ignored 파일 상태는 Planner·Worker·Reviewer가 소유하는 관리 worktree 변경 범위가 아니다. source가 dirty하다는 사실이나 Agent 실행 중 그 local 상태가 바뀌었다는 사실만으로 Agent Git 범위 위반 또는 `PROJECT_BLOCKED`를 만들지 않으며, source의 local 상태는 bootstrap freshness gate와 기본 worktree safe fast-forward 판단에서만 평가한다. self bootstrap이 원격보다 뒤처진 경우에는 실제 safe fast-forward가 로컬 상태를 보존하며 성공할 수 있는지가 실행 허용 조건이고, 이미 같은 원격 revision이면 pull이나 파일 상태 정리를 요구하지 않는다.
 
-이 완화는 repository-wide Git 보호를 제거하지 않는다. 등록 worktree의 생성·삭제, Agent가 소유하지 않은 다른 관리 worktree의 HEAD·index·파일 변경, 허용되지 않은 shared ref·Git config·진행 중인 Git operation 변경은 bootstrap 파일 상태와 구분해 기존 범위 위반으로 탐지한다. Loop Manager 자신이 process lock 아래 수행한 fetch, runtime worktree 생성·정리와 source safe fast-forward는 Manager-owned checkpoint로 반영해 이후 Agent 결과에 귀속하지 않는다.
+모든 등록 프로젝트의 Agent Git 범위 판정은 현재 단계의 안전에 필요한 최소 상태만 대상으로 한다. 선택된 관리 worktree의 identity·등록·branch·HEAD·index·허용 파일 변경과 현재 작업이 실제로 사용하는 소유 branch, 원격 base ref, 게시 원격 ref·PR head, 해당 Git 작업에 영향을 주는 config·operation을 검증한다. 사용하지 않는 다른 branch·tag·ref와 다른 worktree의 독립적인 등록·HEAD·index·파일 변화는 Agent 변경으로 귀속하거나 `PLAN_BLOCKED`·`PROJECT_BLOCKED`의 단독 원인으로 삼지 않는다. 해당 자원을 나중에 사용하게 되면 사용 직전에 실제 값과 소유권을 확인한다. 검증된 원격 base 전진은 기존 fetch·rebase·재검증 흐름으로 처리한다. 그 밖에 현재 작업에 영향을 미치는 예상 밖 변화 또는 영향 여부를 증명할 수 없는 변화는 계속 안전 차단한다.
 
-저장된 `PROJECT_BLOCKED`의 유일한 원인이 bootstrap/default worktree의 local 상태 변경이라면 과거 source signature의 정확한 복원을 해제 조건으로 요구하지 않는다. 활성 관리 worktree의 identity·소유권과 Agent 허용 변경 범위에 다른 위반이 없고 보호 대상 shared metadata가 현재 Manager-owned 상태와 일치함을 확인하면 해당 차단을 해제하고 현재 안전 기준으로 rebaseline한다. source가 원격보다 뒤처졌는지와 dirty 때문에 fast-forward가 실제로 불가능한지는 차단 해제 뒤 bootstrap freshness 또는 일반 source sync 단계에서 독립적으로 판정한다.
+Agent가 선택된 관리 worktree 밖의 파일과 shared Git metadata를 쓸 권한은 없다. 무관한 변화의 범위 검사 제외는 이 쓰기 격리가 실제 실행에서 유효함을 검증할 수 있을 때만 적용한다. 격리를 증명할 수 없는 실행이나 과거 기록에서는 무관한 shared ref·다른 worktree 변화를 단순 관측만으로 외부 변경이라 추정해 허용하지 않는다. 감시 축소는 Agent의 Git 쓰기 권한, worktree·branch·push·PR 소유권을 넓히지 않는다.
+
+Loop Manager 자신이 process lock 아래 수행한 fetch, 관리 worktree 생성·정리·rebase, source safe fast-forward와 runtime worktree 생성·정리는 각 작업의 소유 대상, 실행 전 기대 상태와 실행 뒤 실제 결과를 연결한 durable checkpoint로 증명한다. Agent 시작 snapshot 이후 Manager 작업이 있었다면, 해당 checkpoint와 실제 Git 상태가 정확히 일치하는 부분만 Agent 범위 판정 전에 기준선에 반영한다. Agent의 원래 허용 파일 변경과 session·실행 증거는 보존하며, 불완전한 checkpoint나 관측 OID만으로 Manager 소유권을 추정하지 않는다. Git 작업과 상태 저장 사이에 중단돼도 같은 증거로 재개하고, 다른 주체의 변화가 섞였으면 영향을 받는 작업을 차단한다.
+
+저장된 `PLAN_BLOCKED`·`PROJECT_BLOCKED`의 원인이 격리가 증명된 실행의 무관한 변화 또는 증명된 Manager 작업의 낡은 기준선뿐이라면, 선택된 관리 worktree의 identity·소유권·허용 변경과 사용 중인 ref·Git 상태를 다시 확인한 뒤 해당 차단을 해제하고 안전한 현재 기준으로 재조정한다. 기존 Agent session·작업물과 다른 계획의 차단 원인은 보존하고, 후보 revision이 달라졌다면 필요한 targeted test·전체 verify·Review를 다시 수행한다. 증거가 부족하거나 현재 작업에 영향을 주는 변화가 남으면 차단을 유지한다. source가 원격보다 뒤처졌는지와 dirty 때문에 fast-forward가 불가능한지는 차단 해제 뒤 bootstrap freshness 또는 일반 source sync 단계에서 독립적으로 판정한다.
 
 runtime 자식은 bootstrap이 전달하고 검증한 canonical source checkout, 현재 runtime SHA, repository identity와 origin을 이용해 등록 프로젝트가 실행 중인 Loop Manager 자신인지 결정해야 한다. 자기 자신으로 인정하려면 등록된 canonical repository path가 runtime source와 같고 실제 Git repository 및 origin identity도 일치해야 한다. 디렉터리 이름, 프로젝트 표시명, 원격 저장소 이름 또는 경로 prefix만으로 자기 자신으로 판단하지 않는다.
 
@@ -57,8 +61,10 @@ self runtime handoff 판정은 같은 실행에서 병렬 프로젝트 작업을
 - 로컬과 원격 변경 경로가 겹치거나 다른 branch·detached·ahead·diverged·Git operation·동시 변경 또는 Git 거부가 있으면 reset·stash·autostash·source rebase 없이 보존하고 실제 skip 이유를 기록한다.
 - source bootstrap과 원격 base가 같은 revision으로 runtime 자식이 시작된 뒤의 source checkout dirty 또는 sync skip은 clean한 `origin/<base-branch>`에서 수행하는 Planner·Worker workspace 생성, 기존 workspace 재개, PR conflict rebase와 검증을 막지 않는다.
 - Planner·Worker·Reviewer 실행 전후 bootstrap/default worktree의 HEAD·index·파일·dirty 상태만 달라진 경우 이를 해당 Agent의 변경으로 귀속하거나 `PROJECT_BLOCKED`를 만들지 않는다.
-- bootstrap/default worktree local 상태를 Agent 범위에서 제외해도 등록 worktree 추가·삭제, 다른 관리 worktree 변경과 허용되지 않은 shared ref·Git config·Git operation 변경은 계속 차단한다.
-- 기존 `default_worktree_mutation` 차단은 과거 bootstrap signature가 아니라 활성 관리 worktree의 identity·소유권·허용 변경과 현재 보호 대상 shared metadata를 검증해 다른 위반이 없으면 자동 해제하고 rebaseline한다.
+- 선택된 관리 worktree와 현재 단계가 실제로 사용하는 ref·worktree·Git config·operation만 Agent 범위와 Git 작업 직전 안전 검사의 대상으로 삼는다. 실행과 무관한 `draft` 등 다른 local branch·tag·ref 또는 다른 worktree의 독립적인 변동만으로 Agent 범위 위반이나 프로젝트 차단을 만들지 않는다. 사용하게 되는 자원은 사용 직전에 다시 검증한다.
+- 선택된 관리 worktree의 범위 밖 파일·index·branch·HEAD 변화, 소유 branch·게시 ref·PR head의 예상 밖 변화, 검증된 fetch·rebase로 처리할 수 없는 원격 base 변화, 사용 중인 worktree 등록·Git operation·config 불일치 또는 영향 여부를 증명할 수 없는 변화는 기존 안전 차단을 유지한다. Agent의 다른 worktree·shared Git metadata 쓰기 격리가 검증되지 않으면 무관한 변화에 최소 범위 예외를 적용하지 않는다.
+- Agent 시작 뒤 Manager가 수행한 fetch·worktree 생성/정리·rebase·source 갱신은 실행 전후 상태와 durable checkpoint가 일치할 때만 기준선에 반영한다. Manager rebase로 HEAD·소유 branch ref·선택된 worktree index가 바뀐 뒤 재시작해도 낡은 Agent 시작 snapshot과의 차이만으로 차단하지 않으며, Agent의 허용 파일 변경과 session을 보존한다. Manager 변화와 예상 밖 영향권 변화가 섞였거나 checkpoint가 불완전하면 해당 영향을 안전 차단한다.
+- 기존 `default_worktree_mutation` 및 같은 유형의 저장된 `PLAN_BLOCKED`·`PROJECT_BLOCKED`는 격리 증거가 필요한 경우 이를 확인하고 과거 snapshot의 정확한 복원 대신 현재 작업에 필요한 소유권, 허용 변경, Manager checkpoint와 실제 Git 상태를 검증해 다른 위반이 없으면 자동 해제한다. 다른 계획의 차단과 저장된 작업물·session은 보존하고, 후보 revision 변경에 따른 검증과 Review는 다시 수행한다.
 - `MERGEABLE` 또는 `UNKNOWN`인 Open PR만 있고 새 Merge 완료가 없으면 기존 PR 대기 및 충돌 복구 권한을 변경하지 않는다. `CONFLICTING` 판정도 기존 소유권, worktree와 explicit lease 조건을 유지한다.
 - runtime source와 같은 canonical repository path이며 실제 repository 및 origin identity가 일치하는 등록 프로젝트만 self로 판정한다. 같은 이름, 같은 origin만 가진 다른 clone, source 하위 경로, symlink alias 또는 state directory 아래 runtime 경로를 self source로 오인하지 않는다.
 - 현재 실행이 self 프로젝트의 새 PR Merge 완료를 확인하면 Merge 결과를 포함한 최신 `origin/<base-branch>` fetch, 관련 SQLite와 outbox 영속화 및 source checkout 동기화 시도를 완료하고 fetch된 SHA를 현재 runtime SHA와 비교한다.
@@ -68,7 +74,8 @@ self runtime handoff 판정은 같은 실행에서 병렬 프로젝트 작업을
 - self Planner의 직접 planning commit이나 일반 외부 push만 관측했고 self PR Merge 완료를 새로 확인하지 않은 경우에는 runtime handoff를 시작하지 않는다.
 - 다른 등록 프로젝트의 PR Merge는 해당 프로젝트 상태와 기본 worktree를 정상 갱신하지만 Loop Manager 프로세스 전체의 runtime handoff를 만들지 않는다.
 - runtime handoff는 해석한 `<base-branch>`, 현재 runtime SHA, fetch된 원격 SHA, self repository, Merge된 PR과 source sync 결과를 비밀값 없이 로그에 남기며 오류나 BLOCKED 알림으로 취급하지 않는다.
-- 자동 테스트는 `main`과 대체 base branch, 시작 시 equal bootstrap/runtime의 clean·dirty 진행, 시작 시 behind source의 clean·non-overlap dirty 갱신 후 runtime·PR 미시작, overlap dirty·ahead·diverged에서 구 bootstrap의 최신 runtime 실행 거부, 다음 실행의 최신 bootstrap/runtime 일치, Merge 직전 `PR_OPEN` mirror, 다중 Open PR 중 하나의 Merge, Agent 실행 중 bootstrap dirty 변화의 비귀속과 stale `default_worktree_mutation` 자동 해제, worktree 등록·다른 관리 worktree·shared metadata 위반의 유지, source dirty 상태의 managed rebase 지속, 실행 중 runtime보다 앞선 self Merge의 종료, 이미 최신 runtime에서 새로 확인한 Merge의 계속 실행, self Planner push 비트리거, 다른 clone·origin·runtime path 오인 방지, fetch 실패·non-fast-forward SHA 관계와 다중 프로젝트 scheduling 중 새 작업 미시작을 검증한다.
+- 자동 테스트는 `main`과 대체 base branch, 시작 시 equal bootstrap/runtime의 clean·dirty 진행, 시작 시 behind source의 clean·non-overlap dirty 갱신 후 runtime·PR 미시작, overlap dirty·ahead·diverged에서 구 bootstrap의 최신 runtime 실행 거부, 다음 실행의 최신 bootstrap/runtime 일치, Merge 직전 `PR_OPEN` mirror, 다중 Open PR 중 하나의 Merge, Agent 실행 중 bootstrap dirty 변화의 비귀속과 stale `default_worktree_mutation` 자동 해제, source dirty 상태의 managed rebase 지속, 실행 중 runtime보다 앞선 self Merge의 종료, 이미 최신 runtime에서 새로 확인한 Merge의 계속 실행, self Planner push 비트리거, 다른 clone·origin·runtime path 오인 방지, fetch 실패·non-fast-forward SHA 관계와 다중 프로젝트 scheduling 중 새 작업 미시작을 검증한다.
+- Agent 범위 테스트는 다른 local branch·tag·ref와 다른 worktree가 독립적으로 변경된 경우의 비차단, 실제 작업에 쓰는 ref·worktree 및 범위 밖 파일·index 변경의 차단, 격리 검증 실패 시 완화 거부, Manager rebase·fetch·worktree 작업 전후의 기준선 재조정, Git 작업과 checkpoint 저장 사이의 중단·재시작, Manager 변화와 영향권 외부 변화의 혼합, 기존 차단의 증거 기반 복구와 session·작업물 보존을 검증한다.
 - 전체 verify에서 exact-SHA runtime bootstrap, process lock, Manager runtime scope reconciliation, PR conflict recovery, source checkout 보존과 origin-only Planner·Worker 입력 규칙이 유지된다.
 
 ## Product Impact
@@ -79,6 +86,7 @@ self runtime handoff 판정은 같은 실행에서 병렬 프로젝트 작업을
 - non-overlap dirty source checkout은 로컬 변경을 유지한 채 원격 base로 전진할 수 있다.
 - 최신 bootstrap으로 runtime이 이미 시작된 뒤 source checkout을 갱신할 수 없는 로컬 상태는 관리 worktree 작업을 막지 않는다. 시작 시 bootstrap이 원격보다 뒤처졌다면 갱신되기 전까지 runtime 자식을 시작하지 않는다.
 - bootstrap이 이미 원격 base revision이면 dirty 상태를 정리하지 않고 실행하며, Agent 실행 중 bootstrap 파일 상태가 바뀌어도 관리 worktree 위반으로 오인하거나 과거 signature에 프로젝트를 영구 차단하지 않는다.
+- Agent 범위 검사는 현재 계획의 안전에 필요한 Git 상태로 제한된다. 무관한 branch·worktree 변화는 실행을 막지 않고, Manager 소유 Git 작업은 검증된 checkpoint로 재개되며, 실제 영향권 위반은 계속 차단된다.
 
 ## Non-Goals
 
@@ -89,7 +97,7 @@ self runtime handoff 판정은 같은 실행에서 병렬 프로젝트 작업을
 - 기존 PR 충돌 복구의 rebase, force-with-lease, branch 소유권 또는 Agent 권한을 확대하지 않는다.
 - runtime refresh를 이유로 영속화되지 않은 작업을 폐기하거나 관리 worktree, Agent session, retry history를 정리하지 않는다.
 - self Planner의 planning commit, 일반 외부 push 또는 다른 프로젝트 PR Merge를 프로세스 종료 신호로 확대하지 않는다.
-- bootstrap local 상태를 허용한다는 이유로 등록 worktree catalog, 다른 관리 worktree, shared ref·Git config 또는 Git operation 보호를 완화하지 않는다.
+- 무관한 Git 변화의 비차단을 이유로 Agent의 다른 worktree·shared Git metadata 쓰기, 현재 작업의 소유 branch·base·게시 ref 변경 수용 또는 검증되지 않은 checkpoint 신뢰를 허용하지 않는다.
 
 ## Open Questions
 
