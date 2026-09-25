@@ -11,6 +11,8 @@ import sqlite3
 from typing import Iterator, Sequence
 from uuid import uuid4
 
+import maintenance_file_ledger
+
 
 class MaintenanceStateError(RuntimeError):
     """Raised when persisted maintenance state cannot be used safely."""
@@ -120,6 +122,7 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
 
     connection.execute(MAINTENANCE_SCHEMA)
     connection.execute(DOCUMENT_DRAFTS_SCHEMA)
+    maintenance_file_ledger.ensure_schema(connection)
     columns = {
         str(row[1])
         for row in connection.execute("PRAGMA table_info(maintenance_cycles)")
