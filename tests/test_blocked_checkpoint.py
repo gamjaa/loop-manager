@@ -1497,6 +1497,69 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
         )
         self.assertEqual(verdict.reason_code, "shared_ref_mutation")
 
+    def test_interrupted_base_fetch_chain_survives_later_fetch_and_restart(self):
+        repo, _, _ = self.prepare_guidance_block(implementation_changes=False)
+        request = blocked_checkpoint_state.BlockedCheckpointRepository(
+            self.connection,
+        ).get(repo, "G-034")
+        before = loop_manager.capture_git_snapshot(self.worktree)
+        self._advance_base_remote()
+        first = loop_manager._record_manager_base_fetch_intent(
+            self.connection, self.repo, repo, "G-034", "main", before,
+        )
+        loop_manager._perform_manager_base_fetch(
+            self.connection, self.repo, first, "main",
+        )
+        intermediate = loop_manager.capture_git_snapshot(self.worktree)
+        self.assertEqual(loop_manager._proven_manager_base_refs(
+            self.connection, self.repo, repo, "G-034", before, intermediate,
+        ), frozenset({"refs/remotes/origin/main"}))
+
+        other = Path(self.temporary.name) / "base-writer"
+        (other / "dependency.py").write_text("dependency = False\n")
+        self.run_git(other, "commit", "-am", "advance base again")
+        self.run_git(other, "push", "origin", "main")
+        second = loop_manager._record_manager_base_fetch_intent(
+            self.connection, self.repo, repo, "G-034", "main", intermediate,
+        )
+        loop_manager._perform_manager_base_fetch(
+            self.connection, self.repo, second, "main",
+        )
+        loop_manager._finish_manager_base_fetch(self.connection, self.repo, second)
+        current = loop_manager.capture_git_snapshot(self.worktree)
+        saved_db = Path(self.temporary.name) / "fetch-chain.sqlite"
+        with sqlite3.connect(saved_db) as copy:
+            self.connection.backup(copy)
+        copy.close()
+        reopened = sqlite3.connect(saved_db)
+        reopened.row_factory = sqlite3.Row
+        try:
+            self.assertEqual(reopened.execute(
+                "SELECT phase FROM manager_base_fetches WHERE id = ?", (first,),
+            ).fetchone()[0], "pending")
+            resumed = loop_manager._BlockedCheckpointAdapter(
+                reopened, self.repo, self.state_dir, repo,
+            )
+            self.assertIsNone(resumed._shared_safety_error(
+                request, resumed._plan(request), current,
+            ))
+            self.assertEqual(loop_manager.validate_persisted_agent_scope(
+                reopened, self.repo, self.state_dir, repo,
+            ).refs["refs/remotes/origin/main"], current.refs["refs/remotes/origin/main"])
+
+            # A later completed intent cannot bridge missing proof of the first.
+            self.run_git(self.repo, "reflog", "expire", "--expire=all",
+                         "refs/remotes/origin/main")
+            self.assertEqual(resumed._shared_safety_error(
+                request, resumed._plan(request), current,
+            ).reason_code, "shared_ref_mutation")
+            with self.assertRaises(loop_manager.AgentScopeError):
+                loop_manager.validate_persisted_agent_scope(
+                    reopened, self.repo, self.state_dir, repo,
+                )
+        finally:
+            reopened.close()
+
     def _advance_base_remote(self):
         other = Path(self.temporary.name) / "base-writer"
         self.run_git(self.repo, "clone", "-b", "main", str(self.remote), str(other))

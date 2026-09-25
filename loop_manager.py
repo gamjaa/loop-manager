@@ -13962,15 +13962,17 @@ def _manager_base_fetch_applied(repo_path: Path, row: sqlite3.Row) -> bool:
     token = str(row["action_token"] or "")
     if not re.fullmatch(r"[0-9a-f]{32}", token):
         return False
+    # Later Manager fetches can move this entry away from the reflog tip.
+    # Match the exact action and target in retained history; the caller still
+    # requires an unbroken intent chain from the saved snapshot to current refs.
     reflog = git(
-        repo_path, "reflog", "show", "-1", "--format=%H%x00%gs",
+        repo_path, "reflog", "show", "--format=%H%x00%gs",
         str(row["refname"]), check=False,
     )
     return (
         reflog.returncode == 0
-        and reflog.stdout.strip() == (
-            f"{row['target_oid']}\x00loop-manager-base-fetch:{token}"
-        )
+        and f"{row['target_oid']}\x00loop-manager-base-fetch:{token}"
+        in reflog.stdout.splitlines()
     )
 
 
