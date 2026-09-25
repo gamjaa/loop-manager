@@ -36,8 +36,8 @@ priority: normal
 
 ## Progress
 
-- [ ] 결정적 원격 파일 inventory와 분류 근거
-- [ ] 파일별 성공 검토 ledger와 선정 API
+- [x] 결정적 원격 파일 inventory와 분류 근거
+- [x] 파일별 성공 검토 ledger와 선정 API
 
 ## Decision Log
 

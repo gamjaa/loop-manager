@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -12,6 +13,8 @@ import document_drafts
 import document_publication
 import loop_manager
 import maintenance_git
+import maintenance_file_inventory
+import maintenance_file_ledger
 import maintenance_state
 
 
@@ -1044,6 +1047,189 @@ class BoundedGitChangeContextTest(unittest.TestCase):
                 len(failed.stderr.encode("utf-8")),
                 maintenance_git.MAX_GIT_ERROR_BYTES,
             )
+
+
+class FileReviewLedgerTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.repo = Path(temporary.name) / "repo"
+        self.repo.mkdir()
+        self.git("init", "-b", "main")
+        self.git("config", "user.email", "test@example.com")
+        self.git("config", "user.name", "Test")
+        self.connection = sqlite3.connect(":memory:")
+        self.addCleanup(self.connection.close)
+        self.connection.row_factory = sqlite3.Row
+        self.connection.execute(loop_manager.SCHEMA)
+        loop_manager._ensure_execplans_schema(self.connection)
+        self.connection.execute(
+            "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')", (str(self.repo),)
+        )
+        maintenance_state.ensure_schema(self.connection)
+        self.ledger = maintenance_file_ledger.FileReviewRepository(self.connection)
+
+    def git(self, *args):
+        return subprocess.run(
+            ["git", "-C", str(self.repo), *args], check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+
+    def write(self, path, data):
+        target = self.repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+
+    def publish(self):
+        self.git("add", "-A")
+        self.git("commit", "-m", "fixture")
+        revision = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/remotes/origin/main", revision)
+        return revision
+
+    def inventory(self, revision):
+        return maintenance_file_inventory.tracked_source_inventory(self.repo, "main", revision)
+
+    def reviewed(self, sources):
+        return tuple(
+            maintenance_file_ledger.ReviewedSource(
+                source.path, source.content_hash, source.mode, source.revision,
+                "Reviewed implementation and related test responsibilities.",
+            ) for source in sources
+        )
+
+    def record(self, inventory, reviewed):
+        return self.ledger.record_success(
+            str(self.repo), str(self.repo), "main", inventory, reviewed,
+        )
+
+    def test_first_review_then_content_mode_rename_new_and_deleted_paths(self):
+        self.write("src/alpha.go", b"package alpha\n")
+        self.write("tests/check.py", b"assert True\n")
+        self.write("docs/PRODUCT.md", b"# Product\n")
+        first = self.publish()
+        inventory = self.inventory(first)
+        selected = self.ledger.selected_sources(str(self.repo), inventory)
+        self.assertEqual([source.path for source in selected], ["src/alpha.go", "tests/check.py"])
+        first_success = self.record(inventory, self.reviewed(selected))
+        first_reviews = self.ledger.reviews(str(self.repo))
+        self.assertEqual(first_success.source_revision, first)
+
+        self.write("docs/PRODUCT.md", b"# Updated product\n")
+        second = self.publish()
+        unchanged = self.inventory(second)
+        self.assertEqual(self.ledger.selected_sources(str(self.repo), unchanged), ())
+        self.record(unchanged, ())
+        self.assertEqual(self.ledger.reviews(str(self.repo)), first_reviews)
+        self.assertEqual(self.ledger.last_success(str(self.repo)).source_revision, second)
+
+        (self.repo / "src/alpha.go").chmod(0o755)
+        (self.repo / "tests/check.py").rename(self.repo / "tests/renamed.py")
+        self.write("scripts/verify", b"#!/bin/sh\nexit 0\n")
+        third = self.publish()
+        changed = self.inventory(third)
+        selected = self.ledger.selected_sources(str(self.repo), changed)
+        self.assertEqual(
+            [source.path for source in selected],
+            ["scripts/verify", "src/alpha.go", "tests/renamed.py"],
+        )
+        self.assertEqual(next(source.mode for source in selected if source.path == "src/alpha.go"), "100755")
+        with self.assertRaises(maintenance_file_ledger.FileReviewLedgerError):
+            self.record(changed, self.reviewed(selected[:-1]))
+        self.assertEqual(self.ledger.last_success(str(self.repo)).source_revision, second)
+        self.record(changed, self.reviewed(selected))
+        retired = {review.path: review for review in self.ledger.reviews(str(self.repo), include_retired=True)}
+        self.assertFalse(retired["tests/check.py"].active)
+        self.assertEqual(retired["src/alpha.go"].mode, "100755")
+        self.assertEqual(retired["tests/renamed.py"].source_revision, third)
+
+        (self.repo / "src/alpha.go").unlink()
+        fourth = self.publish()
+        deleted = self.inventory(fourth)
+        self.assertEqual(self.ledger.selected_sources(str(self.repo), deleted), ())
+        self.record(deleted, ())
+        self.assertNotIn("src/alpha.go", {review.path for review in self.ledger.reviews(str(self.repo))})
+        self.assertFalse(
+            {review.path: review for review in self.ledger.reviews(str(self.repo), include_retired=True)}
+            ["src/alpha.go"].active
+        )
+
+    def test_wrong_identity_and_remote_drift_leave_success_unchanged(self):
+        self.write("src/alpha.go", b"package alpha\n")
+        first = self.publish()
+        inventory = self.inventory(first)
+        selected = self.ledger.selected_sources(str(self.repo), inventory)
+        result = self.reviewed(selected)[0]
+        self.git("update-ref", "refs/remotes/origin/feature", first)
+        with self.assertRaises(maintenance_file_ledger.FileReviewLedgerError):
+            self.ledger.record_success(
+                str(self.repo), str(self.repo), "feature", inventory, (result,),
+            )
+        with self.assertRaises(maintenance_file_ledger.FileReviewLedgerError):
+            self.record(inventory, (replace(result, content_hash="0" * 64),))
+        with self.assertRaises(maintenance_file_ledger.FileReviewLedgerError):
+            self.record(inventory, (replace(result, evidence="too short"),))
+        forged = replace(inventory, sources=(replace(selected[0], content_hash="0" * 64),))
+        with self.assertRaises(maintenance_file_ledger.FileReviewLedgerError):
+            self.record(forged, self.reviewed(forged.sources))
+        self.assertIsNone(self.ledger.last_success(str(self.repo)))
+        self.write("src/beta.go", b"package beta\n")
+        self.publish()
+        with self.assertRaises(maintenance_file_inventory.SourceInventoryError):
+            self.record(inventory, self.reviewed(selected))
+        self.assertIsNone(self.ledger.last_success(str(self.repo)))
+
+    def test_content_change_and_project_isolation(self):
+        self.write("src/alpha.go", b"package alpha\n")
+        first = self.publish()
+        inventory = self.inventory(first)
+        selected = self.ledger.selected_sources(str(self.repo), inventory)
+        self.record(inventory, self.reviewed(selected))
+        other = str(self.repo) + "-other"
+        self.connection.execute(
+            "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')", (other,)
+        )
+        self.assertEqual(self.ledger.selected_sources(other, inventory), selected)
+        with self.assertRaises(maintenance_file_ledger.FileReviewLedgerError):
+            self.ledger.record_success(other, str(self.repo), "main", inventory, self.reviewed(selected))
+
+        self.write("src/alpha.go", b"package alpha\nfunc changed() {}\n")
+        second = self.publish()
+        changed = self.inventory(second)
+        current = self.ledger.selected_sources(str(self.repo), changed)
+        self.assertEqual(len(current), 1)
+        self.assertNotEqual(current[0].content_hash, selected[0].content_hash)
+        self.record(changed, self.reviewed(current))
+        self.assertEqual(self.ledger.reviews(str(self.repo))[0].source_revision, second)
+        self.assertEqual(self.ledger.selected_sources(other, changed), current)
+
+    def test_success_write_rolls_back_file_rows_when_project_record_fails(self):
+        self.write("src/alpha.go", b"package alpha\n")
+        revision = self.publish()
+        inventory = self.inventory(revision)
+        selected = self.ledger.selected_sources(str(self.repo), inventory)
+        self.connection.execute(
+            "CREATE TRIGGER reject_file_success BEFORE INSERT ON file_assessment_successes "
+            "BEGIN SELECT RAISE(ABORT, 'simulated success failure'); END"
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.record(inventory, self.reviewed(selected))
+        self.assertEqual(self.ledger.reviews(str(self.repo)), ())
+        self.assertIsNone(self.ledger.last_success(str(self.repo)))
+
+    def test_additive_schema_recheck_preserves_file_reviews(self):
+        self.write("src/alpha.go", b"package alpha\n")
+        revision = self.publish()
+        inventory = self.inventory(revision)
+        self.record(inventory, self.reviewed(inventory.sources))
+        before = self.ledger.reviews(str(self.repo))
+        success = self.ledger.last_success(str(self.repo))
+
+        maintenance_state.ensure_schema(self.connection)
+        maintenance_state.ensure_schema(self.connection)
+
+        self.assertEqual(self.ledger.reviews(str(self.repo)), before)
+        self.assertEqual(self.ledger.last_success(str(self.repo)), success)
 
 
 if __name__ == "__main__":
