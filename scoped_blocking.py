@@ -294,6 +294,9 @@ def _record_project_block_in_transaction(
 
 
 def clear_plan_block(connection: sqlite3.Connection, repo: str, plan_id: str) -> None:
+    import notifications
+
+    notifications.release_block(connection, repo, f"plan:{plan_id}")
     connection.execute(
         "DELETE FROM execplan_blocks WHERE repo = ? AND plan_id = ?",
         (repo, plan_id),
@@ -305,6 +308,9 @@ def clear_project_block(connection: sqlite3.Connection, repo: str) -> str | None
     if row is None:
         return None
     previous_phase = str(row["previous_phase"]) if row["previous_phase"] else None
+    import notifications
+
+    notifications.release_block(connection, repo, "project")
     connection.execute("DELETE FROM project_blocks WHERE repo = ?", (repo,))
     connection.execute(
         "UPDATE projects SET phase = ?, last_error = NULL WHERE repo = ?",

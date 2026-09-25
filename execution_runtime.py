@@ -213,6 +213,9 @@ class ExecutionPhaseCoordinator:
             if isinstance(guarded, ExecutionOutcome):
                 return self._recovery_outcome(guarded)
             context = guarded
+            work_started = getattr(self._ports, "work_started", None)
+            if work_started is not None:
+                work_started(context)
             handlers = {
                 ExecutionPhase.IMPLEMENTING: self._run_worker,
                 ExecutionPhase.VERIFYING: self._run_verify,

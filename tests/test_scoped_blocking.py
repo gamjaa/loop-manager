@@ -16,6 +16,40 @@ from scoped_blocking import BlockReasonCode, BlockScope
 
 
 class ScopedBlockingTest(unittest.TestCase):
+    def test_releasing_notified_plan_block_rolls_back_notice_cancellation(self):
+        self.plan("G-001", "PLAN_BLOCKED")
+        notifications.configure_session(self.connection, enabled=True)
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO execplan_blocks "
+                "(repo, plan_id, scope, reason_code, evidence) "
+                "VALUES (?, 'G-001', 'plan', 'user_decision_required', 'decision')",
+                (self.repo,),
+            )
+            notifications.enqueue_current_project_events(self.connection, self.repo)
+        event = self.connection.execute(
+            "SELECT event_key FROM notification_outbox WHERE event_type = 'blocked'"
+        ).fetchone()
+        self.assertIsNotNone(event)
+
+        with self.assertRaisesRegex(RuntimeError, "rollback"):
+            with self.connection:
+                scoped_blocking.clear_plan_block(self.connection, self.repo, "G-001")
+                raise RuntimeError("rollback")
+
+        self.assertIsNotNone(self.connection.execute(
+            "SELECT 1 FROM execplan_blocks WHERE repo = ? AND plan_id = 'G-001'",
+            (self.repo,),
+        ).fetchone())
+        self.assertIsNone(self.connection.execute(
+            "SELECT canceled_at FROM notification_outbox WHERE event_key = ?",
+            (event[0],),
+        ).fetchone()[0])
+        self.assertIsNone(self.connection.execute(
+            "SELECT released_at FROM notified_block_incidents WHERE event_key = ?",
+            (event[0],),
+        ).fetchone()[0])
+
     def setUp(self):
         self.connection = sqlite3.connect(":memory:")
         self.connection.row_factory = sqlite3.Row

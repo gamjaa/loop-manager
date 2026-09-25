@@ -6,6 +6,7 @@ from pathlib import Path
 from dataclasses import asdict
 import hashlib
 import json
+import notifications
 import re
 import subprocess
 import sys
@@ -181,6 +182,18 @@ class ExecutionHandlers:
 
     def _row(self):
         return self.effects.state.row()
+
+    def work_started(self, context):
+        with self.effects.state.connection:
+            resumed = notifications.record_work_start(
+                self.effects.state.connection, self.repo,
+                f"ExecPlan {context.phase.value}",
+                plan_id=context.plan.plan_id,
+            )
+        if resumed:
+            self.effects.events.operation_log(
+                f"차단 해제 후 ExecPlan 작업 재개: {context.plan.plan_id}"
+            )
 
     def recover_failure(self, context, error):
         return self._recover(error.reason, str(error), context=context)
@@ -2040,6 +2053,15 @@ class ExecutionHandlers:
             if is_validation_error(prompt_error, row['verify_result'], row['review_result']):
                 prompt_error = None
             try:
+                with self.effects.state.connection:
+                    resumed = notifications.record_work_start(
+                        self.effects.state.connection, self.repo, "Worker",
+                        plan_id=str(plan['id']),
+                    )
+                if resumed:
+                    self.effects.events.operation_log(
+                        f"차단 해제 후 Worker 작업 재개: {plan['id']}"
+                    )
                 return self.effects.agent.run_agent(
                     target.provider, context.worktree, self.state_dir,
                     self.config_path, 'worker',

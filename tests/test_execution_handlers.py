@@ -1,5 +1,6 @@
 """Run the real phase policies with in-memory state and fake external effects."""
 from dataclasses import fields, replace
+import json
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -8,6 +9,8 @@ from unittest import TestCase, mock
 import execution_handlers as handlers
 from execution_revision import DefinitionSnapshot
 import loop_manager as lm
+import notifications
+import scoped_blocking
 import runtime_state
 from validation_feedback import Feedback
 from validation_feedback_state import ValidationFeedbackRepository
@@ -28,6 +31,27 @@ from worker_session import SessionBinding, SessionTransition
 
 
 class ExecutionHandlerTests(TestCase):
+    def test_project_resume_is_recorded_when_execution_phase_starts(self):
+        notifications.configure_session(self.connection, enabled=True)
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO project_blocks (repo, scope, reason_code, plan_id, evidence) "
+                "VALUES ('repo', 'project', 'repository_state_unsafe', 'G-047', 'unsafe')"
+            )
+            notifications.enqueue_current_project_events(self.connection, 'repo')
+        notifications.dispatch_pending(
+            self.connection, 'token', 'chat', adapter=mock.Mock(),
+        )
+        with self.connection:
+            scoped_blocking.clear_project_block(self.connection, 'repo')
+        self.handler.work_started(self.context())
+        resumed = self.connection.execute(
+            "SELECT payload FROM notification_outbox WHERE event_type = 'resumed'"
+        ).fetchall()
+        self.assertEqual(len(resumed), 1)
+        self.assertEqual(json.loads(resumed[0][0])['operation'],
+                         'ExecPlan IMPLEMENTING')
+
     def setUp(self):
         self.connection = test_runtime_state.RuntimeStateRepositoryTest()._connection()
         self.addCleanup(self.connection.close)

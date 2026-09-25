@@ -61,6 +61,322 @@ class NotificationFixture:
 
 
 class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
+    def test_notified_plan_resumes_only_at_its_worker_start_and_new_block_is_distinct(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+
+        def block():
+            with connection:
+                connection.execute(
+                    "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+                    "VALUES (?, 'G-018', 'plan', 'user_decision_required', 'Decision pending')",
+                    (repo,),
+                )
+                notifications.enqueue_current_project_events(connection, repo)
+
+        block()
+        self.assertEqual(notifications.dispatch_pending(
+            connection, "token", "chat", adapter=mock.Mock(),
+        ), 1)
+        first_key = next(row["event_key"] for row in self.events(connection)
+                         if row["event_type"] == "blocked")
+        with connection:
+            scoped_blocking.clear_plan_block(connection, repo, "G-018")
+            self.assertEqual(notifications.record_work_start(
+                connection, repo, "Worker", plan_id="G-019",
+            ), 0)
+            self.assertEqual(notifications.record_work_start(
+                connection, repo, "Worker", plan_id="G-018",
+            ), 1)
+            self.assertEqual(notifications.record_work_start(
+                connection, repo, "Worker", plan_id="G-018",
+            ), 0)
+        resumed = [row for row in self.events(connection)
+                   if row["event_type"] == "resumed"]
+        self.assertEqual(len(resumed), 1)
+        self.assertEqual(json.loads(resumed[0]["payload"])["cause"], "Decision pending")
+        block()
+        second_key = next(row["event_key"] for row in self.events(connection)
+                          if row["event_type"] == "blocked"
+                          and row["event_key"] != first_key)
+        self.assertNotEqual(first_key, second_key)
+
+    def test_partial_block_release_cancels_stale_piece_and_retries_resumption(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        with connection:
+            connection.execute(
+                "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+                "VALUES (?, 'G-018', 'plan', 'user_decision_required', ?)",
+                (repo, "x" * 9000),
+            )
+            notifications.enqueue_current_project_events(connection, repo)
+        sent = []
+
+        def fail_second(_token, _chat, piece):
+            sent.append(piece)
+            if len(sent) == 2:
+                raise RuntimeError("offline")
+
+        self.assertEqual(notifications.dispatch_pending(
+            connection, "token", "chat", adapter=fail_second,
+        ), 0)
+        with connection:
+            scoped_blocking.clear_plan_block(connection, repo, "G-018")
+            self.assertEqual(notifications.record_work_start(
+                connection, repo, "Worker", plan_id="G-018",
+            ), 1)
+        blocked = next(row for row in self.events(connection)
+                       if row["event_type"] == "blocked")
+        self.assertEqual(blocked["confirmed_pieces"], 1)
+        self.assertIsNotNone(blocked["canceled_at"])
+        self.assertEqual(notifications.dispatch_pending(
+            connection, "token", "chat", adapter=lambda *_: (_ for _ in ()).throw(
+                RuntimeError("offline")
+            ),
+        ), 0)
+        delivered = []
+        self.assertEqual(notifications.dispatch_pending(
+            connection, "token", "chat", adapter=lambda _t, _c, text: delivered.append(text),
+        ), 1)
+        self.assertEqual(len(delivered), 3)
+        self.assertIn("작업 재개", delivered[0])
+
+    def test_project_and_planning_release_wait_for_matching_work(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        with connection:
+            connection.execute(
+                "INSERT INTO project_blocks (repo, scope, reason_code, evidence) "
+                "VALUES (?, 'project', 'repository_state_unsafe', 'unsafe worktree')",
+                (repo,),
+            )
+            notifications.enqueue_current_project_events(connection, repo)
+        notifications.dispatch_pending(connection, "token", "chat", adapter=mock.Mock())
+        with connection:
+            scoped_blocking.clear_project_block(connection, repo)
+            self.assertEqual(notifications.record_work_start(
+                connection, repo, "Planner",
+            ), 1)
+        loop_manager.update_project(connection, repo, planning_error="invalid plan")
+        notifications.dispatch_pending(connection, "token", "chat", adapter=mock.Mock())
+        loop_manager.update_project(connection, repo, planning_error=None)
+        with connection:
+            self.assertEqual(notifications.record_work_start(
+                connection, repo, "Worker", plan_id="G-018",
+            ), 0)
+            self.assertEqual(notifications.record_work_start(
+                connection, repo, "Planner",
+            ), 1)
+        payloads = [json.loads(row["payload"]) for row in self.events(connection)
+                    if row["event_type"] == "resumed"]
+        self.assertEqual([item["reason_code"] for item in payloads],
+                         ["repository_state_unsafe", "planning_error"])
+
+    def test_disabled_telegram_never_creates_resumption(self):
+        connection = self.connection(enabled=False)
+        repo = "/projects/alpha"
+        with connection:
+            connection.execute(
+                "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+                "VALUES (?, 'G-018', 'plan', 'user_decision_required', 'decision')",
+                (repo,),
+            )
+            notifications.enqueue_current_project_events(connection, repo)
+            scoped_blocking.clear_plan_block(connection, repo, "G-018")
+            self.assertEqual(notifications.record_work_start(
+                connection, repo, "Worker", plan_id="G-018",
+            ), 0)
+        self.assertEqual(self.events(connection), [])
+
+    def test_disabling_telegram_after_notice_suppresses_late_resumption(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        with connection:
+            connection.execute(
+                "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+                "VALUES (?, 'G-018', 'plan', 'user_decision_required', 'decision')",
+                (repo,),
+            )
+            notifications.enqueue_current_project_events(connection, repo)
+        notifications.dispatch_pending(connection, "token", "chat", adapter=mock.Mock())
+        with connection:
+            scoped_blocking.clear_plan_block(connection, repo, "G-018")
+        notifications.configure_session(connection, enabled=False)
+        with connection:
+            self.assertEqual(notifications.record_work_start(
+                connection, repo, "Worker", plan_id="G-018",
+            ), 0)
+        notifications.configure_session(connection, enabled=True)
+        with connection:
+            self.assertEqual(notifications.record_work_start(
+                connection, repo, "Worker", plan_id="G-018",
+            ), 0)
+        self.assertFalse(any(row["event_type"] == "resumed"
+                             for row in self.events(connection)))
+
+    def test_restart_preserves_confirmed_incident_and_unconfirmed_block_stays_silent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "notices.db"
+            connection = self.connection(database=database)
+            repo = "/projects/alpha"
+            with connection:
+                connection.execute(
+                    "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+                    "VALUES (?, 'G-018', 'plan', 'user_decision_required', 'original cause')",
+                    (repo,),
+                )
+                notifications.enqueue_current_project_events(connection, repo)
+            notifications.dispatch_pending(
+                connection, "token", "chat", adapter=mock.Mock(),
+            )
+            with connection:
+                scoped_blocking.clear_plan_block(connection, repo, "G-018")
+            connection.close()
+
+            restarted = sqlite3.connect(database)
+            self.addCleanup(restarted.close)
+            restarted.row_factory = sqlite3.Row
+            notifications.configure_session(restarted, enabled=True)
+            with restarted:
+                self.assertEqual(notifications.record_work_start(
+                    restarted, repo, "Worker", plan_id="G-018",
+                ), 1)
+                restarted.execute(
+                    "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+                    "VALUES (?, 'G-018', 'plan', 'user_decision_required', 'new cause')",
+                    (repo,),
+                )
+                notifications.enqueue_current_project_events(restarted, repo)
+                scoped_blocking.clear_plan_block(restarted, repo, "G-018")
+                self.assertEqual(notifications.record_work_start(
+                    restarted, repo, "Worker", plan_id="G-018",
+                ), 0)
+            self.assertEqual(len([row for row in self.events(restarted)
+                                  if row["event_type"] == "resumed"]), 1)
+
+    def test_reopened_pr_records_resumption_in_transition(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        with connection:
+            connection.execute(
+                "UPDATE exec_plans SET status = 'PLAN_BLOCKED', "
+                "blocked_reason = 'pull_request_closed' WHERE repo = ?", (repo,),
+            )
+            connection.execute(
+                "UPDATE projects SET phase = 'PLAN_BLOCKED' WHERE repo = ?", (repo,),
+            )
+            connection.execute(
+                "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+                "VALUES (?, 'G-018', 'plan', 'pull_request_closed', 'PR closed')",
+                (repo,),
+            )
+            notifications.enqueue_current_project_events(connection, repo)
+        notifications.dispatch_pending(connection, "token", "chat", adapter=mock.Mock())
+        plan = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-018'",
+            (repo,),
+        ).fetchone()
+        loop_manager._resume_reopened_pull_request(
+            connection, repo, plan, "https://example.test/pr/18", "head",
+            recovery=False,
+        )
+        payload = connection.execute(
+            "SELECT payload FROM notification_outbox WHERE event_type = 'resumed'"
+        ).fetchone()
+        self.assertIsNotNone(payload)
+        self.assertEqual(json.loads(payload[0])["operation"], "PR handling")
+
+    def test_inflight_block_piece_confirmed_after_release_still_resumes(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        with connection:
+            connection.execute(
+                "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+                "VALUES (?, 'G-018', 'plan', 'user_decision_required', 'decision')",
+                (repo,),
+            )
+            notifications.enqueue_current_project_events(connection, repo)
+
+        def release_during_send(_token, _chat, _text):
+            with connection:
+                scoped_blocking.clear_plan_block(connection, repo, "G-018")
+                self.assertEqual(notifications.record_work_start(
+                    connection, repo, "Worker", plan_id="G-018",
+                ), 0)
+
+        notifications.dispatch_pending(
+            connection, "token", "chat", adapter=release_during_send,
+        )
+        resumed = [row for row in self.events(connection)
+                   if row["event_type"] == "resumed"]
+        self.assertEqual(len(resumed), 1)
+
+    def test_updated_notice_during_one_block_has_one_resumption_incident(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        with connection:
+            connection.execute(
+                "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+                "VALUES (?, 'G-018', 'plan', 'user_decision_required', 'first cause')",
+                (repo,),
+            )
+            notifications.enqueue_current_project_events(connection, repo)
+        notifications.dispatch_pending(connection, "token", "chat", adapter=mock.Mock())
+        with connection:
+            connection.execute(
+                "UPDATE execplan_blocks SET reason_code = 'guidance_approval_required', "
+                "evidence = 'updated cause' WHERE repo = ? AND plan_id = 'G-018'",
+                (repo,),
+            )
+            notifications.enqueue_current_project_events(connection, repo)
+        notifications.dispatch_pending(connection, "token", "chat", adapter=mock.Mock())
+        with connection:
+            scoped_blocking.clear_plan_block(connection, repo, "G-018")
+            self.assertEqual(notifications.record_work_start(
+                connection, repo, "Worker", plan_id="G-018",
+            ), 1)
+        incidents = connection.execute(
+            "SELECT * FROM notified_block_incidents WHERE repo = ?", (repo,),
+        ).fetchall()
+        self.assertEqual(len(incidents), 1)
+        resumed = next(row for row in self.events(connection)
+                       if row["event_type"] == "resumed")
+        self.assertEqual(json.loads(resumed["payload"])["cause"], "first cause")
+
+    def test_inflight_earlier_notice_keeps_first_confirmed_cause_after_update(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        with connection:
+            connection.execute(
+                "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+                "VALUES (?, 'G-018', 'plan', 'user_decision_required', 'first cause')",
+                (repo,),
+            )
+            notifications.enqueue_current_project_events(connection, repo)
+
+        def update_during_send(_token, _chat, _text):
+            with connection:
+                connection.execute(
+                    "UPDATE execplan_blocks SET reason_code = 'guidance_approval_required', "
+                    "evidence = 'later cause' WHERE repo = ? AND plan_id = 'G-018'",
+                    (repo,),
+                )
+                notifications.enqueue_current_project_events(connection, repo)
+
+        notifications.dispatch_pending(
+            connection, "token", "chat", adapter=update_during_send,
+        )
+        with connection:
+            scoped_blocking.clear_plan_block(connection, repo, "G-018")
+            self.assertEqual(notifications.record_work_start(
+                connection, repo, "Worker", plan_id="G-018",
+            ), 1)
+        payload = connection.execute(
+            "SELECT payload FROM notification_outbox WHERE event_type = 'resumed'"
+        ).fetchone()
+        self.assertEqual(json.loads(payload[0])["cause"], "first cause")
+
     def test_specification_deadlock_notification_names_documents_and_question(self):
         connection = self.connection()
         repo = "/projects/alpha"
