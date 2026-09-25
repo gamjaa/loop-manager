@@ -2809,6 +2809,15 @@ class ExecutionHandlerTests(TestCase):
         self.assertEqual(self.state.row()['phase'], 'WORKING')
         self.effects.agent.run_agent.assert_called_once()
 
+    def test_review_entry_accepts_empty_successful_verify_output(self):
+        context = self.review_context()
+        self.state.update_project('repo', verify_result='')
+
+        outcome = self.handler.review(context)
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
+        self.effects.agent.run_agent.assert_called_once()
+
     def test_head_change_during_verify_does_not_save_success(self):
         original = self.git
         changed = False

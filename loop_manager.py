@@ -15069,22 +15069,16 @@ def _evaluate_remote_checkpoint_cause(
     project = connection.execute(
         "SELECT provider, base_branch FROM projects WHERE repo = ?", (repo,),
     ).fetchone()
-    targeted_test_reason = None
-    if blocked["worker_result"]:
-        try:
-            worker_publication = parse_worker_result(
-                str(blocked["worker_result"]),
-                {"id": str(blocked["plan_id"]), "title": str(blocked["title"])},
-            )
-        except WorkerResultError:
-            # This is a historical blocked-checkpoint reassessment, not a
-            # REVIEWING entry. Its fresh full verify remains authoritative,
-            # while an old malformed Worker result supplies no prompt context.
-            pass
-        else:
-            targeted_test_reason = reviewer_targeted_test_reason(
-                worker_publication.test_evidence,
-            )
+    try:
+        worker_publication = parse_worker_result(
+            str(blocked["worker_result"] or ""),
+            {"id": str(blocked["plan_id"]), "title": str(blocked["title"])},
+        )
+    except WorkerResultError as error:
+        return False, f"원격 checkpoint Worker 결과 검증 실패: {error}", "worker"
+    targeted_test_reason = reviewer_targeted_test_reason(
+        worker_publication.test_evidence,
+    )
     previous_review = blocked["review_result"]
     protocol_error = None
     for attempt in range(1, MAX_REVIEWER_PROTOCOL_ATTEMPTS + 1):
@@ -16646,6 +16640,11 @@ def parse_worker_result(message: str, plan: dict[str, object]) -> WorkerPublicat
         raise WorkerResultError(
             "Worker가 해결되지 않은 targeted unit test 실패를 보고했습니다."
         )
+    if not (_TARGETED_TEST_SUCCESS.search(test_evidence)
+            or reviewer_targeted_test_reason(test_evidence)):
+        raise WorkerResultError(
+            "Worker targeted unit test 통과 결과 또는 실행하지 못한 구체적인 사유가 필요합니다."
+        )
 
     plan_id = str(plan["id"])
     plan_title = str(plan["title"])
@@ -16674,8 +16673,8 @@ def parse_worker_result(message: str, plan: dict[str, object]) -> WorkerPublicat
 
 _NO_RUNNABLE_TARGETED_TEST = re.compile(
     r"(?:"
-    r"실행 가능한 관련 targeted unit test가 없(?:습니다|다)"
-    r"|관련 targeted unit test를 실행할 수 없(?:습니다|다)"
+    r"실행 가능한 관련 (?:targeted )?unit test가 없(?:습니다|다)"
+    r"|관련 (?:targeted )?unit test를 실행할 수 없(?:습니다|다)"
     r"|no runnable targeted (?:unit )?tests?"
     r")",
     re.IGNORECASE,
@@ -16690,7 +16689,9 @@ def reviewer_targeted_test_reason(test_evidence: str) -> str | None:
     """
     for line in test_evidence.splitlines():
         normalized = " ".join(line.split())
-        if _NO_RUNNABLE_TARGETED_TEST.search(normalized):
+        match = _NO_RUNNABLE_TARGETED_TEST.search(normalized)
+        if match and (normalized[:match.start()].strip(" :;.,-")
+                      or normalized[match.end():].strip(" :;.,-")):
             return normalized[:600]
     return None
 

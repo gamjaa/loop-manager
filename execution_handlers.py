@@ -3018,7 +3018,7 @@ class ExecutionHandlers:
             latest_sha, candidate_head,
         )
         if (
-            not row['verify_result']
+            row['verify_result'] is None
             or row['validated_base_sha'] != latest_sha
             or row['verify_token'] != expected_verify
         ):

@@ -4095,6 +4095,12 @@ risk: medium
             ),
             "실행 가능한 관련 targeted unit test가 없습니다: 문서 변경만 포함합니다.",
         )
+        self.assertEqual(
+            loop_manager.reviewer_targeted_test_reason(
+                "문서 바이트 적용만 수행하므로 실행 가능한 관련 unit test가 없습니다."
+            ),
+            "문서 바이트 적용만 수행하므로 실행 가능한 관련 unit test가 없습니다.",
+        )
 
     def test_existing_database_adds_worker_session_and_result_fields(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -4885,7 +4891,10 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         repository.block_plan(
             'repo', 'G-047', reason_code='review_retry_exhausted',
             evidence=prior, release_fingerprint='prior-input',
-            plan_values={'review_result': prior}, clear_projection=True,
+            plan_values={
+                'review_result': prior,
+                'worker_result': worker_result(),
+            }, clear_projection=True,
         )
         blocked = connection.execute(
             "SELECT * FROM exec_plans WHERE repo = 'repo' AND plan_id = 'G-047'"
@@ -4915,6 +4924,43 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         self.assertEqual(result, (False, review, 'specification'))
         fingerprint.assert_not_called()
 
+    def test_remote_checkpoint_requires_valid_worker_evidence_before_reviewer(self):
+        from tests.test_runtime_state import RuntimeStateRepositoryTest
+        import runtime_state
+
+        connection = RuntimeStateRepositoryTest()._connection()
+        self.addCleanup(connection.close)
+        repository = runtime_state.RuntimeStateRepository(connection)
+        repository.activate(
+            'repo', 'G-047', activation_sha='base',
+            branch='loop-manager/G-047', worktree='/state/G-047',
+        )
+        for evidence in (None, worker_result(tests='none')):
+            with self.subTest(evidence=evidence):
+                repository.block_plan(
+                    'repo', 'G-047', reason_code='review_retry_exhausted',
+                    evidence='prior review failure', release_fingerprint='prior-input',
+                    plan_values={'worker_result': evidence}, clear_projection=True,
+                )
+                blocked = connection.execute(
+                    "SELECT * FROM exec_plans WHERE repo = 'repo' AND plan_id = 'G-047'"
+                ).fetchone()
+                with (
+                    mock.patch.object(loop_manager, 'capture_git_snapshot',
+                                      return_value=mock.Mock()),
+                    mock.patch.object(loop_manager, 'verify', return_value=(True, '')),
+                    mock.patch.object(loop_manager, 'validate_agent_scope'),
+                    mock.patch.object(loop_manager, 'run_agent') as reviewer,
+                ):
+                    resolved, message, stage = loop_manager._evaluate_remote_checkpoint_cause(
+                        connection, Path('/repo'), Path('/state'), 'repo', blocked,
+                        Path('/config'), 30,
+                    )
+                self.assertFalse(resolved)
+                self.assertEqual(stage, 'worker')
+                self.assertIn('Worker 결과 검증 실패', message)
+                reviewer.assert_not_called()
+
     def test_remote_checkpoint_corrects_invalid_specification_to_pass(self):
         from tests.test_runtime_state import RuntimeStateRepositoryTest
         import runtime_state
@@ -4929,6 +4975,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         repository.block_plan(
             'repo', 'G-047', reason_code='review_retry_exhausted',
             evidence='prior review failure', release_fingerprint='prior-input',
+            plan_values={'worker_result': worker_result()},
             clear_projection=True,
         )
         blocked = connection.execute(
@@ -4974,6 +5021,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         repository.block_plan(
             'repo', 'G-047', reason_code='review_retry_exhausted',
             evidence='prior review failure', release_fingerprint='prior-input',
+            plan_values={'worker_result': worker_result()},
             clear_projection=True,
         )
         checkpoint = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
@@ -6685,6 +6733,15 @@ class WorkerPublicationTest(unittest.TestCase):
         self.assertIn(
             "RERUN: python3 -m unittest tests.test_one", resolved.test_evidence
         )
+        document_reason = "문서 바이트 적용만 수행하므로 실행 가능한 관련 unit test가 없습니다."
+        document_publication = loop_manager.parse_worker_result(
+            worker_result("Apply approved document bytes", "Summary", document_reason),
+            self.plan,
+        )
+        self.assertEqual(
+            loop_manager.reviewer_targeted_test_reason(document_publication.test_evidence),
+            document_reason,
+        )
         invalid_results = (
             worker_result("", "Summary", "test: PASS"),
             worker_result(
@@ -6704,6 +6761,8 @@ class WorkerPublicationTest(unittest.TestCase):
             worker_result("Implement the changes", "Summary", "test: PASS"),
             worker_result("Fix!", "Summary", "test: PASS"),
             worker_result("Descriptive Worker Commits.", "Summary", "test: PASS"),
+            worker_result("Reject missing test disposition", "Summary", "none"),
+            worker_result("Reject unexplained no-test claim", "Summary", "실행 가능한 관련 unit test가 없습니다"),
         )
         for result in invalid_results:
             with self.subTest(result=result):
