@@ -536,6 +536,56 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
             ),
         )
 
+    def test_requirement_archive_with_source_change_requires_replanning(self):
+        active = self.repo / "docs/requirements/R.md"
+        archive = self.repo / "docs/requirements/archive/R.md"
+        archive.parent.mkdir()
+        active.rename(archive)
+        (self.repo / "source.py").write_text("VALUE = 2\n", encoding="utf-8")
+        git(self.repo, "add", "docs/requirements/R.md",
+            "docs/requirements/archive/R.md", "source.py")
+        git(self.repo, "commit", "-m", "archive and change source")
+        changed = git(self.repo, "rev-parse", "HEAD")
+
+        self.assertFalse(loop_manager._is_requirement_archive_only_change(
+            self.repo, self.base, changed
+        ))
+        self.assertNotEqual(
+            loop_manager._planning_input_fingerprint(self.repo, self.base),
+            loop_manager._planning_input_fingerprint(self.repo, changed),
+        )
+
+    def test_plan_edits_and_archive_do_not_change_full_input_but_agents_does(self):
+        baseline = loop_manager._planning_input_fingerprint(self.repo, self.base)
+        plan = self.repo / self.paths["G-001"]
+        plan.write_text(plan_text("G-001", "Edited First"), encoding="utf-8")
+        git(self.repo, "add", self.paths["G-001"])
+        git(self.repo, "commit", "-m", "edit plan")
+        edited = git(self.repo, "rev-parse", "HEAD")
+
+        archive = self.repo / "docs/plans/archive" / plan.name
+        archive.parent.mkdir()
+        plan.rename(archive)
+        git(self.repo, "add", "docs/plans")
+        git(self.repo, "commit", "-m", "archive plan")
+        archived = git(self.repo, "rev-parse", "HEAD")
+
+        self.assertEqual(
+            [loop_manager._planning_input_fingerprint(self.repo, revision)
+             for revision in (edited, archived)],
+            [baseline, baseline],
+        )
+
+        (self.repo / "AGENTS.md").write_text("# New guidance\n", encoding="utf-8")
+        git(self.repo, "add", "AGENTS.md")
+        git(self.repo, "commit", "-m", "change guidance")
+        self.assertNotEqual(
+            loop_manager._planning_input_fingerprint(
+                self.repo, git(self.repo, "rev-parse", "HEAD")
+            ),
+            baseline,
+        )
+
 
 class MutableReadyMetadataCasTest(unittest.TestCase):
     def setUp(self):

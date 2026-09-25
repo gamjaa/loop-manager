@@ -37,10 +37,11 @@ priority: high
 
 ## Progress
 
-- [ ] Full-input-first selection and activation race check
-- [ ] Merge/archive-only baseline preservation
-- [ ] Targeted ordering, failure and completion tests
+- [x] Full-input-first selection and activation race check
+- [x] Merge/archive-only baseline preservation
+- [x] Targeted ordering, failure and completion tests
 
 ## Decision Log
 
 - Input content, rather than the fact of a Merge, determines whether general planning is due.
+- A failed Planner with runnable READY remains in PLANNING or records a planning error; the project step must return that error instead of immediately retrying the same input.
