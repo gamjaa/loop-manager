@@ -15069,16 +15069,22 @@ def _evaluate_remote_checkpoint_cause(
     project = connection.execute(
         "SELECT provider, base_branch FROM projects WHERE repo = ?", (repo,),
     ).fetchone()
-    try:
-        worker_publication = parse_worker_result(
-            str(blocked["worker_result"] or ""),
-            {"id": str(blocked["plan_id"]), "title": str(blocked["title"])},
-        )
-    except WorkerResultError as error:
-        return False, f"Reviewer 시작 전 Worker 결과 검증 실패: {error}", "worker"
-    targeted_test_reason = reviewer_targeted_test_reason(
-        worker_publication.test_evidence,
-    )
+    targeted_test_reason = None
+    if blocked["worker_result"]:
+        try:
+            worker_publication = parse_worker_result(
+                str(blocked["worker_result"]),
+                {"id": str(blocked["plan_id"]), "title": str(blocked["title"])},
+            )
+        except WorkerResultError:
+            # This is a historical blocked-checkpoint reassessment, not a
+            # REVIEWING entry. Its fresh full verify remains authoritative,
+            # while an old malformed Worker result supplies no prompt context.
+            pass
+        else:
+            targeted_test_reason = reviewer_targeted_test_reason(
+                worker_publication.test_evidence,
+            )
     previous_review = blocked["review_result"]
     protocol_error = None
     for attempt in range(1, MAX_REVIEWER_PROTOCOL_ATTEMPTS + 1):

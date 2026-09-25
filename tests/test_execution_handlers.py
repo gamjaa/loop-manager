@@ -3306,7 +3306,10 @@ class ExecutionHandlerTests(TestCase):
                     self.effects.validation.verify.side_effect = lambda _: (False, 'diagnostics')
                     self.effects.validation.parse_reviewer_result.return_value = ('FAIL', ('issue',))
                     phase = 'VERIFYING' if stage == 'verify' else 'REVIEWING'
-                    context = self.context(phase)
+                    context = (
+                        self.context(phase) if stage == 'verify'
+                        else self.review_context()
+                    )
                     result = (self.handler.verify(context, self.handler) if stage == 'verify'
                               else self.handler.review(context))
                     self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK if blocked else ExecutionOutcomeKind.RETRY)
