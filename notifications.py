@@ -499,7 +499,7 @@ def enqueue_completion_if_ready(
 ) -> bool:
     """Record completion only for an already verified stable selection."""
 
-    if snapshot is None or not snapshot.completed or not _enabled(connection):
+    if snapshot is None or not snapshot.completed:
         return False
     ensure_schema(connection)
     project = connection.execute(
@@ -559,6 +559,8 @@ def enqueue_completion_if_ready(
     last_title = last_title or "Planner confirmed no additional work"
     with connection:
         _cancel_pending_waiting(connection, repo)
+        if not _enabled(connection):
+            return False
         connection.execute(
             """
             INSERT INTO project_completion_cycles (repo, cycle_key, completed_at)

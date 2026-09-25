@@ -1038,6 +1038,59 @@ class CompletionCycleTest(NotificationFixture, unittest.TestCase):
         self.assertEqual(payload["last_completed_title"], "Reliable notices")
         self.assertIn("활성 Requirement", payload["reason"])
 
+    def test_completion_while_disabled_cancels_wait_before_reenabled_dispatch(self):
+        for fail_delivery in (False, True):
+            with self.subTest(fail_delivery=fail_delivery), tempfile.TemporaryDirectory() as directory:
+                database = Path(directory) / "state.db"
+                connection = self.connection(database=database)
+                repo = "/projects/alpha"
+                waiting = work_exhaustion.WorkReasonSnapshot(
+                    "cycle-one", (),
+                    ({"id": "[R-031]", "path": "docs/requirements/[R-031] x.md",
+                      "reason": "archive 확인 대기"},), None, None,
+                )
+                self.assertTrue(notifications.enqueue_waiting_reason(connection, repo, waiting))
+                if fail_delivery:
+                    self.assertEqual(notifications.dispatch_pending(
+                        connection, "token", "chat",
+                        adapter=mock.Mock(side_effect=RuntimeError("network unavailable")),
+                    ), 0)
+                notifications.configure_session(connection, enabled=False)
+                self._complete_project(connection, "cycle-one")
+                self.assertFalse(notifications.enqueue_completion_if_ready(
+                    connection, repo, self._snapshot("cycle-one"),
+                ))
+                events = self.events(connection)
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0]["event_type"], "work_waiting")
+                self.assertIsNotNone(events[0]["canceled_at"])
+                self.assertIsNone(events[0]["sent_at"])
+                self.assertEqual(events[0]["attempts"], int(fail_delivery))
+                connection.close()
+
+                restarted = sqlite3.connect(database)
+                self.addCleanup(restarted.close)
+                restarted.row_factory = sqlite3.Row
+                notifications.configure_session(restarted, enabled=True)
+                delivered = mock.Mock()
+                self.assertEqual(notifications.dispatch_pending(
+                    restarted, "token", "chat", adapter=delivered,
+                ), 0)
+                delivered.assert_not_called()
+                for _ in range(2):
+                    self.assertTrue(notifications.enqueue_completion_if_ready(
+                        restarted, repo, self._snapshot("cycle-one"),
+                    ))
+                self.assertEqual(notifications.dispatch_pending(
+                    restarted, "token", "chat", adapter=delivered,
+                ), 1)
+                delivered.assert_called_once()
+                self.assertEqual(
+                    [row["event_type"] for row in self.events(restarted)
+                     if row["sent_at"] is not None],
+                    ["project_completed"],
+                )
+
     def test_same_and_archive_only_cycle_deduplicate_but_new_input_reopens(self):
         connection = self.connection()
         self._complete_project(connection, "cycle-one")
