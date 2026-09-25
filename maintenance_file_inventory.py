@@ -137,9 +137,9 @@ def _classify(path: str, mode: str, sample: bytes, has_nul: bool) -> tuple[str, 
     suffix = PurePosixPath(name).suffix
     if mode == "160000":
         return "excluded", "Git submodule is an external dependency"
-    if any(part in _DEPENDENCY_DIRS for part in lowered):
+    if any(part in _DEPENDENCY_DIRS for part in lowered[:-1]):
         return "excluded", "external dependency directory"
-    if any(part in _EXCLUDED_DIRS for part in lowered):
+    if any(part in _EXCLUDED_DIRS for part in lowered[:-1]):
         return "excluded", "documentation, archive, generated, or cache directory"
     document_stem = PurePosixPath(name).stem
     if ((document_stem in {"readme", "changelog"} and suffix in {"", ".txt", *_DOC_SUFFIXES})
@@ -147,6 +147,8 @@ def _classify(path: str, mode: str, sample: bytes, has_nul: bool) -> tuple[str, 
         return "excluded", "documentation file"
     if suffix in _ASSET_SUFFIXES:
         return "excluded", "non-source asset or data format"
+    if len(parts) == 1 and re.fullmatch(r"requirements(?:[-_][a-z0-9_-]+)?\.txt", name):
+        return "excluded", "root dependency manifest"
     if mode not in {"100644", "100755"}:
         return "uncertain", f"unsupported Git file mode {mode}"
     if has_nul:

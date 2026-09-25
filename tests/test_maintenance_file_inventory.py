@@ -86,6 +86,22 @@ class TrackedSourceInventoryTest(unittest.TestCase):
         with self.assertRaisesRegex(source_inventory.SourceInventoryError, "src/link"):
             source_inventory.tracked_source_inventory(self.repo, "main", later)
 
+    def test_root_dependency_manifest_is_excluded_but_scripts_build_is_source(self):
+        self.write("requirements.txt", b"pytest==8.0\n")
+        self.write("requirements-dev.txt", b"ruff==0.1\n")
+        self.write("scripts/build", b"#!/bin/sh\nexit 0\n", executable=True)
+        self.write("build/generated.go", b"package generated\n")
+        revision = self.publish()
+
+        inventory = source_inventory.tracked_source_inventory(self.repo, "main", revision)
+
+        self.assertEqual([source.path for source in inventory.sources], ["scripts/build"])
+        self.assertEqual(inventory.sources[0].mode, "100755")
+        classified = {item.path: item for item in inventory.classifications}
+        self.assertEqual(classified["requirements.txt"].disposition, "excluded")
+        self.assertEqual(classified["requirements-dev.txt"].reason, "root dependency manifest")
+        self.assertEqual(classified["build/generated.go"].disposition, "excluded")
+
     def test_revision_drift_and_invalid_revision_fail_before_inventory(self):
         self.write("main.go", b"package main\n")
         first = self.publish()
