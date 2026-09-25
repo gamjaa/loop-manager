@@ -22,7 +22,7 @@ class ExecutionPhase(str, Enum):
 class LatestBaseCheckpoint(str, Enum):
     """Points that share the latest-base reconciliation boundary."""
 
-    AFTER_VERIFY = "after_verify"
+    BEFORE_VERIFY = "before_verify"
     BEFORE_PUBLICATION = "before_publication"
 
 
@@ -150,6 +150,7 @@ class LatestBasePort(Protocol):
         self,
         context: ExecutionContext,
         checkpoint: LatestBaseCheckpoint,
+        observed_base_sha: str | None = None,
     ) -> ExecutionOutcome | None: ...
 
 

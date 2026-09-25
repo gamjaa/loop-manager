@@ -1964,7 +1964,8 @@ class ExecutionHandlerTests(TestCase):
         self.assertEqual(result.kind, ExecutionOutcomeKind.SUCCESS)
         self.assertEqual(self.repository.get('repo', 'G-047').status, 'PR_OPEN')
         order = [c for c in self.calls if c in {'worker', 'verify', 'commit', 'reviewer', 'push', 'pr'}]
-        self.assertEqual(order, ['worker', 'verify', 'commit', 'reviewer', 'push', 'pr'])
+        self.assertEqual(order, ['worker', 'commit', 'verify', 'reviewer', 'push', 'pr'])
+        self.assertEqual(self.calls.count('verify'), 1)
 
     def test_worker_and_reviewer_keep_phase_outcome_after_telemetry_error(self):
         def reported_agent(*args, **kwargs):
@@ -2005,6 +2006,10 @@ class ExecutionHandlerTests(TestCase):
         self.assertIsNotNone(completed.verify_token)
         self.assertIsNotNone(completed.review_token)
         self.assertIsNotNone(completed.publication_token)
+        snapshot = DefinitionSnapshot.deserialize(completed.definition_snapshot)
+        assert snapshot is not None
+        self.assertEqual(completed.verify_token, snapshot.verify_token('base', 'base'))
+        self.assertEqual(completed.review_token, snapshot.review_token('base', 'base'))
 
     def test_latest_base_uses_same_intent_and_rebase_for_both_checkpoints(self):
         for phase in ('VERIFYING', 'PUBLISHING'):
@@ -2015,8 +2020,11 @@ class ExecutionHandlerTests(TestCase):
                 context = self.context()
                 if phase == 'VERIFYING':
                     result = self.handler.verify(context, self.handler)
+                    self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+                    self.assertEqual(self.calls.count('verify'), 0)
+                    result = self.handler.verify(self.handler._context(), self.handler)
                     self.assertEqual(result.context.phase, ExecutionPhase.REVIEWING)
-                    self.assertEqual(self.calls.count('verify'), 2)
+                    self.assertEqual(self.calls.count('verify'), 1)
                 else:
                     result = self.handler.publish(context, self.handler)
                     self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
@@ -2024,6 +2032,11 @@ class ExecutionHandlerTests(TestCase):
                     self.assertIsNone(self.state.row()['review_result'])
                 self.assertEqual(self.calls.count('rebase'), 1)
                 self.assertEqual(self.state.row()['active_sha'], 'new-base')
+                if phase == 'VERIFYING':
+                    self.assertLess(self.calls.index('fetch'), self.calls.index('rebase'))
+                    self.assertLess(self.calls.index('fetch'), self.calls.index('commit'))
+                    self.assertLess(self.calls.index('commit'), self.calls.index('rebase'))
+                    self.assertLess(self.calls.index('rebase'), self.calls.index('verify'))
 
     def test_stale_callback_cannot_update_same_phase_new_snapshot(self):
         context = self.context()
@@ -2431,18 +2444,19 @@ class ExecutionHandlerTests(TestCase):
 
         guarded = self.handler.guard(self.handler._context())
 
-        self.assertNotIsInstance(guarded, handlers.ExecutionOutcome)
+        self.assertEqual(guarded.kind, ExecutionOutcomeKind.RETRY)
         row = self.state.row()
         snapshot = DefinitionSnapshot.deserialize(row['definition_snapshot'])
         assert snapshot is not None
-        self.assertEqual(row['phase'], 'PUBLISHING')
+        self.assertEqual(row['phase'], 'VERIFYING')
         self.assertEqual(row['worker_result'], 'worker-result')
-        self.assertEqual(row['verify_result'], 'verify-result')
-        self.assertEqual(row['review_result'], 'review-result')
         self.assertEqual(row['worker_input_token'], snapshot.worker_token)
         self.assertEqual(row['archive_token'], snapshot.archive_token)
-        self.assertEqual(row['verify_token'], snapshot.verify_token('base'))
-        self.assertEqual(row['review_token'], snapshot.review_token('base'))
+        self.assertIsNone(row['verify_result'])
+        self.assertIsNone(row['review_result'])
+        self.assertIsNone(row['verify_token'])
+        self.assertIsNone(row['review_token'])
+        self.assertEqual(row['phase'], 'VERIFYING')
 
     def test_revision_guard_retries_when_base_and_catalog_shas_disagree(self):
         self.effects.revision.reconcile_catalog.side_effect = None
@@ -2558,9 +2572,105 @@ class ExecutionHandlerTests(TestCase):
         self.effects.workspace.git.side_effect = interrupted
         with self.assertRaisesRegex(RuntimeError, 'interruption'):
             self.handler.verify(context, self.handler)
+        self.effects.validation.verify.assert_not_called()
         self.effects.workspace.git.side_effect = original
         self.handler.verify(self.context(), self.handler)
         self.assertEqual(self.calls.count('commit'), 1)
+        self.assertEqual(self.calls.count('verify'), 1)
+
+    def test_candidate_head_change_after_verify_requires_new_validation(self):
+        self.handler.guard(self.context())
+        worker = self.handler.run(self.handler._context())
+        verified = self.handler.verify(worker.context, self.handler)
+        self.assertEqual(verified.context.phase, ExecutionPhase.REVIEWING)
+        previous_token = self.state.row()['verify_token']
+        self.assertIsNotNone(previous_token)
+        original = self.git
+
+        def replaced_head(path, *args, **kwargs):
+            if path == Path('/state/G-047') and args == ('rev-parse', 'HEAD'):
+                return SimpleNamespace(stdout='replacement-head\n', returncode=0)
+            return original(path, *args, **kwargs)
+
+        self.effects.workspace.git.side_effect = replaced_head
+        outcome = self.handler.guard(self.handler._context())
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(self.state.row()['phase'], 'VERIFYING')
+        self.assertIsNone(self.state.row()['verify_token'])
+        self.effects.agent.run_agent.assert_called_once()
+
+    def test_head_change_during_verify_does_not_save_success(self):
+        original = self.git
+        changed = False
+
+        def changing_git(path, *args, **kwargs):
+            if path == Path('/state/G-047') and args == ('rev-parse', 'HEAD') and changed:
+                return SimpleNamespace(stdout='new-head\n', returncode=0)
+            return original(path, *args, **kwargs)
+
+        def verify(_worktree):
+            nonlocal changed
+            changed = True
+            return True, 'OK'
+
+        self.effects.workspace.git.side_effect = changing_git
+        self.effects.validation.verify.side_effect = verify
+        outcome = self.handler.verify(self.context('VERIFYING'), self.handler)
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+        self.assertIsNone(self.state.row()['verify_result'])
+        self.assertIsNone(self.state.row()['verify_token'])
+        self.effects.validation.verify.assert_called_once()
+
+    def test_verify_generated_allowed_change_is_committed_and_reverified(self):
+        attempts = 0
+
+        def verify(_worktree):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                self.dirty = True
+            return True, 'OK'
+
+        self.effects.validation.verify.side_effect = verify
+        first = self.handler.verify(self.context('VERIFYING'), self.handler)
+        self.assertEqual(first.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(self.calls.count('commit'), 2)
+        self.assertEqual(attempts, 1)
+        self.assertIsNone(self.state.row()['verify_result'])
+        self.effects.validation.clear_validation_failure_history.assert_not_called()
+        second = self.handler.verify(self.handler._context(), self.handler)
+        self.assertEqual(second.context.phase, ExecutionPhase.REVIEWING)
+        self.assertEqual(attempts, 2)
+        self.assertEqual(self.calls.count('commit'), 2)
+        self.effects.validation.clear_validation_failure_history.assert_called_once_with(
+            'repo', 'verify',
+        )
+
+    def test_unchanged_worker_result_blocks_before_full_verify(self):
+        self.dirty = False
+        self.effects.workspace.branch_has_changes.return_value = False
+        outcome = self.handler.verify(self.context('VERIFYING'), self.handler)
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.effects.validation.verify.assert_not_called()
+        self.assertNotIn('commit', self.calls)
+
+    def test_rebase_discards_prior_candidate_evidence_before_verify(self):
+        self.remote = 'new-base'
+        self.state.update_project(
+            'repo', phase='VERIFYING', worker_result='worker result',
+            verify_result='old verify', review_result='old review',
+            validated_base_sha='base', verify_token='old token',
+            review_token='old review token',
+        )
+        outcome = self.handler.verify(self.handler._context(), self.handler)
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+        row = self.state.row()
+        self.assertEqual(row['active_sha'], 'new-base')
+        self.assertIsNone(row['verify_result'])
+        self.assertIsNone(row['review_result'])
+        self.assertIsNone(row['verify_token'])
+        self.assertIsNone(row['review_token'])
+        self.effects.validation.verify.assert_not_called()
 
     def test_protocol_correction_reuses_session_before_publication(self):
         self.effects.validation.parse_reviewer_result.side_effect = [
@@ -3008,6 +3118,7 @@ class ExecutionHandlerTests(TestCase):
                 self.assertEqual(self.state.row()['phase'], 'WORKING')
                 self.assertTrue(self.state.row()['last_error'].startswith(lm.REBASE_CONFLICT_PREFIX))
                 self.assertIsNone(self.state.row()['validated_base_sha'])
+                self.effects.validation.verify.assert_not_called()
 
     def test_workspace_runtime_failure_retries_without_blocking_or_losing_context(self):
         self.effects.workspace._plan_id_from_path.return_value = 'G-047'

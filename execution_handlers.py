@@ -171,7 +171,6 @@ class ExecutionHandlers:
         self.archive_scope_sources = ()
         self._archive_snapshot = None
         self._latest_verify_output = ''
-        self._worker_publication = None
         self._definition_snapshot = None
         self.recovery = RecoveryDispatcher(
             effects.state.connection,
@@ -1026,8 +1025,8 @@ class ExecutionHandlers:
                 return self._context()
             if decision.action is CheckpointAction.REBASE:
                 # The revision gate decides which artifacts a changed base
-                # invalidates.  VERIFYING also owns its verify-before-rebase
-                # contract.  Starting rebase during preparation skips both.
+                # invalidates. VERIFYING commits its Worker result before
+                # reconciling the latest base and starting full verify.
                 return context
             if decision.action is CheckpointAction.PAUSE:
                 return self._recover(RecoveryReason.STATUS_FAILED, decision.reason,
@@ -1189,20 +1188,11 @@ class ExecutionHandlers:
             # latest-base rebase on the next process step.
             values['last_error'] = None
         if legacy_baseline:
-            artifact_base = str(
-                row['validated_base_sha'] or row['active_sha'] or latest_sha
-            )
             if row['worker_result'] is not None:
                 values['worker_input_token'] = snapshot.worker_token
                 values['archive_token'] = snapshot.archive_token
-            if row['verify_result'] is not None:
-                values['verify_token'] = snapshot.verify_token(artifact_base)
-            if row['review_result'] is not None:
-                values['review_token'] = snapshot.review_token(artifact_base)
-            if row['publication_token'] is not None:
-                values['publication_token'] = snapshot.publication_token(
-                    artifact_base
-                )
+            # Legacy validation has no durable candidate HEAD. Retain its
+            # audit text but require validation on the current candidate.
         if target == 'IMPLEMENTING' and (
             decision.kind is RevisionGateKind.INVALIDATE_TO_PHASE
             or str(row['phase']) != 'WORKING'
@@ -1243,14 +1233,6 @@ class ExecutionHandlers:
                 publication_token=None,
                 last_error=None,
             )
-        if decision.preserve_validation:
-            if row['verify_result'] is not None:
-                values['validated_base_sha'] = latest_sha
-                values['verify_token'] = snapshot.verify_token(latest_sha)
-            if row['review_result'] is not None:
-                values['review_token'] = snapshot.review_token(latest_sha)
-            if row['publication_token'] is not None:
-                values['publication_token'] = snapshot.publication_token(latest_sha)
         return values
 
     def _install_revision_state(
@@ -1559,9 +1541,6 @@ class ExecutionHandlers:
             )
 
         row = self._row()
-        base_requires_validation = any(
-            not path.startswith('docs/plans/') for path in changed_paths
-        )
         active_sha = str(row['active_sha'] or '')
         legacy_input_paths = {
             str(catalog_plan['path']),
@@ -1578,9 +1557,9 @@ class ExecutionHandlers:
             and active_sha
             and not legacy_definition_changed
         )
-        artifact_base = str(
-            row['validated_base_sha'] or row['active_sha'] or latest_sha
-        )
+        candidate_head = self.effects.workspace.git(
+            context.worktree, 'rev-parse', 'HEAD'
+        ).stdout.strip()
         decision = decide_revision_gate(
             phase=ExecutionPhase(str(catalog_plan['status'])).value,
             # Rows created before G-037 have valid phase artifacts but no
@@ -1610,23 +1589,19 @@ class ExecutionHandlers:
                     else None
                 ),
                 verify_token=(
-                    snapshot.verify_token(artifact_base)
-                    if legacy_baseline and row['verify_result'] is not None
-                    else str(row['verify_token'])
+                    str(row['verify_token'])
                     if row['verify_token'] is not None
                     else None
                 ),
                 review_token=(
-                    snapshot.review_token(artifact_base)
-                    if legacy_baseline and row['review_result'] is not None
-                    else str(row['review_token'])
+                    str(row['review_token'])
                     if row['review_token'] is not None
                     else None
                 ),
                 publication_token=(str(row['publication_token']) if row['publication_token'] is not None else None),
             ),
             unmet_dependencies=tuple(unmet),
-            base_requires_validation=base_requires_validation,
+            candidate_head=candidate_head,
         )
         self.archive_sources = tuple(archive_sources)
         self.archive_candidates = tuple(archive_candidates)
@@ -2551,10 +2526,9 @@ class ExecutionHandlers:
         )
         return self._advanced()
 
-    def _verify_once(self, context, *, after_rebase=False):
+    def _verify_once(self, context):
         assert self.catalog_plan is not None and self.plan is not None
-        suffix = ' (rebase 후)' if after_rebase else ''
-        self.effects.events.operation_log(f"전체 verify 시작: {self.plan['id']} {self.plan['title']}{suffix}")
+        self.effects.events.operation_log(f"전체 verify 시작: {self.plan['id']} {self.plan['title']}")
         verify_scope_before = self.effects.agent.begin_agent_scope(
             self.repo,
             context.worktree,
@@ -2639,9 +2613,8 @@ class ExecutionHandlers:
                 'verify', passed, raw_output, feedback_items,
             )
         if not passed:
-            stage = 'rebase 후 전체 verify 실패' if after_rebase else '전체 verify 실패'
             self.effects.events.operation_log(
-                f"Worker 반환: {self.plan['id']} {self.plan['title']} ({stage})",
+                f"Worker 반환: {self.plan['id']} {self.plan['title']} (전체 verify 실패)",
                 error=True,
             )
             decision = self.effects.validation.transition_validation_failure(
@@ -2661,7 +2634,6 @@ class ExecutionHandlers:
                 context=context, fingerprint=decision.fingerprint,
                 correction_limit=self.effects.contract.MAX_VALIDATION_FINGERPRINT_REPEATS + 1,
             ), output)
-        self.effects.validation.clear_validation_failure_history(self.repo, 'verify')
         return (None, output)
 
     def verify(self, context, latest_base):
@@ -2685,9 +2657,7 @@ class ExecutionHandlers:
                 RecoveryReason.WORKER_CORRECTION, validation_error,
                 context=context,
             )
-        outcome, output = self._verify_once(context)
-        if outcome is not None:
-            return outcome
+        latest_sha = self._fetch_latest_base()
         dirty = bool(self.effects.workspace.git(context.worktree, 'status', '--porcelain').stdout.strip())
         if not dirty and (not self.effects.workspace.branch_has_changes(context.worktree, self.base)):
             no_change_error = 'Worker가 변경을 만들지 않아 PR을 생성할 수 없습니다. ExecPlan은 연결된 PR의 Merge가 확인된 경우에만 MERGED가 됩니다.'
@@ -2695,7 +2665,7 @@ class ExecutionHandlers:
                 self.repo,
                 context.worktree,
                 no_change_error,
-                output,
+                str(row['verify_result'] or ''),
                 reason=BlockReasonCode.PLAN_INPUT_INVALID,
                 recovery_reason=RecoveryReason.NO_CHANGE,
             )
@@ -2714,16 +2684,58 @@ class ExecutionHandlers:
         if isinstance(guarded, ExecutionOutcome):
             return guarded
         context = guarded
-        self._latest_verify_output = output
-        self._worker_publication = worker_publication
-        latest_outcome = latest_base.reconcile(context, LatestBaseCheckpoint.AFTER_VERIFY)
+        latest_outcome = latest_base.reconcile(
+            context, LatestBaseCheckpoint.BEFORE_VERIFY, latest_sha,
+        )
         if latest_outcome is not None:
             return latest_outcome
+        context = self._context()
+        candidate_head = self.effects.workspace.git(
+            context.worktree, 'rev-parse', 'HEAD'
+        ).stdout.strip()
+        outcome, output = self._verify_once(context)
+        if outcome is not None:
+            return outcome
+        if self.effects.workspace.git(
+            context.worktree, 'rev-parse', 'HEAD'
+        ).stdout.strip() != candidate_head:
+            self.effects.state.update_project(
+                self.repo, validated_base_sha=None, verify_result=None,
+                review_result=None, verify_token=None, review_token=None,
+                publication_token=None,
+            )
+            return self._retry('전체 verify 중 게시 후보 HEAD가 변경되어 다시 검증합니다.')
+        if self.effects.workspace.git(
+            context.worktree, 'status', '--porcelain'
+        ).stdout.strip():
+            # Scope validation in _verify_once accepted these paths, but the
+            # verified HEAD has not included them. Commit and validate the
+            # resulting candidate on the next VERIFYING turn.
+            self.plan = self.effects.validation.validate_active_execplan_metadata(
+                self.repo_path, context.worktree, context.plan.path,
+                self.catalog_plan,
+            )
+            self.effects.workspace.git(context.worktree, 'add', '-A')
+            self._commit_owned(context, worker_publication.commit_title)
+            return self._retry('전체 verify 중 허용된 변경을 commit했습니다. 새 후보를 다시 검증합니다.')
+        self.effects.validation.clear_validation_failure_history(self.repo, 'verify')
+        self.effects.state.update_project(
+            self.repo,
+            validated_base_sha=context.active_sha,
+            verify_result=output,
+            verify_token=(
+                self._definition_snapshot.verify_token(context.active_sha, candidate_head)
+                if self._definition_snapshot is not None else None
+            ),
+            review_token=None,
+            publication_token=None,
+        )
+        self._latest_verify_output = output
         return self._finish_verified(context)
 
-    def reconcile(self, context, checkpoint):
-        if checkpoint is LatestBaseCheckpoint.AFTER_VERIFY:
-            return self._latest_after_verify(context)
+    def reconcile(self, context, checkpoint, observed_base_sha=None):
+        if checkpoint is LatestBaseCheckpoint.BEFORE_VERIFY:
+            return self._latest_before_verify(context, observed_base_sha)
         return self._latest_before_publication(context)
 
     def _fetch_latest_base(self):
@@ -2737,7 +2749,7 @@ class ExecutionHandlers:
         except (RuntimeError, OSError) as error:
             raise RecoveryFailure(RecoveryReason.FETCH_FAILED, str(error)) from error
 
-    def _rebase_latest(self, context, row, latest_sha, *, publishing, evidence):
+    def _rebase_latest(self, context, row, latest_sha, *, publishing):
         """Persist rebase intent, observe Git, then record the applied base."""
         prefix = '게시 직전 ' if publishing else ''
         self.effects.state.update_project(
@@ -2787,6 +2799,12 @@ class ExecutionHandlers:
             active_sha=latest_sha,
             phase='VERIFYING',
             revision_resume_status=None,
+            validated_base_sha=None,
+            verify_result=None,
+            review_result=None,
+            verify_token=None,
+            review_token=None,
+            publication_token=None,
         )
         self._complete_rebase_intent(context)
         if self.effects.agent.validate_guidance_publication(
@@ -2800,56 +2818,15 @@ class ExecutionHandlers:
             return self._final()
         return None
 
-    def _latest_after_verify(self, context):
+    def _latest_before_verify(self, context, observed_base_sha):
         row = self._row()
         assert self.catalog_plan is not None and self.plan is not None
-        assert self._worker_publication is not None
-        output = self._latest_verify_output
-        latest_sha = self._fetch_latest_base()
+        latest_sha = observed_base_sha or self._fetch_latest_base()
         if latest_sha != row['active_sha']:
-            outcome = self._rebase_latest(context, row, latest_sha, publishing=False, evidence=output)
+            outcome = self._rebase_latest(context, row, latest_sha, publishing=False)
             if outcome is not None:
                 return outcome
-            rebased_context = context.at_phase(ExecutionPhase.VERIFYING, active_sha=latest_sha)
-            outcome, output = self._verify_once(rebased_context, after_rebase=True)
-            if outcome is not None:
-                return outcome
-            if self.effects.workspace.git(context.worktree, 'status', '--porcelain').stdout.strip():
-                self.effects.workspace.git(context.worktree, 'add', '-A')
-                self.plan = self.effects.validation.validate_active_execplan_metadata(
-                    self.repo_path,
-                    context.worktree,
-                    context.plan.path,
-                    self.catalog_plan,
-                )
-                self._commit_owned(context, self._worker_publication.commit_title)
-            self.effects.state.update_project(
-                self.repo,
-                active_sha=latest_sha,
-                validated_base_sha=latest_sha,
-                verify_result=output,
-                verify_token=(
-                    self._definition_snapshot.verify_token(latest_sha)
-                    if self._definition_snapshot is not None else None
-                ),
-                review_token=None,
-                publication_token=None,
-            )
-        else:
-            self.effects.state.update_project(
-                self.repo,
-                validated_base_sha=str(row['active_sha'] or ''),
-                verify_result=output,
-                verify_token=(
-                    self._definition_snapshot.verify_token(
-                        str(row['active_sha'] or '')
-                    )
-                    if self._definition_snapshot is not None else None
-                ),
-                review_token=None,
-                publication_token=None,
-            )
-        self._latest_verify_output = output
+            return self._retry('최신 base를 반영했습니다. 게시 후보와 선언을 다시 확인합니다.')
         return None
 
     def _finish_verified(self, context):
@@ -3121,7 +3098,8 @@ class ExecutionHandlers:
             review_result=review,
             review_token=(
                 self._definition_snapshot.review_token(
-                    str(row['validated_base_sha'] or row['active_sha'] or '')
+                    str(row['validated_base_sha'] or row['active_sha'] or ''),
+                    self.effects.workspace.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip(),
                 )
                 if self._definition_snapshot is not None else None
             ),
@@ -3162,7 +3140,6 @@ class ExecutionHandlers:
                     row,
                     latest_sha,
                     publishing=True,
-                    evidence=str(row['verify_result'] or ''),
                 )
                 if outcome is not None:
                     return outcome
@@ -3221,7 +3198,6 @@ class ExecutionHandlers:
             if ancestry.returncode == 1:
                 outcome = self._rebase_latest(
                     context, row, latest_sha, publishing=True,
-                    evidence=str(row['verify_result'] or ''),
                 )
                 if outcome is not None:
                     return outcome
@@ -3418,7 +3394,8 @@ class ExecutionHandlers:
             self.effects.state.update_project(
                 self.repo,
                 publication_token=self._definition_snapshot.publication_token(
-                    str(self._row()['validated_base_sha'] or '')
+                    str(self._row()['validated_base_sha'] or ''),
+                    self.effects.workspace.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip(),
                 ),
             )
             context = self._context()

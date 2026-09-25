@@ -369,7 +369,8 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 
 - Worker가 현재 환경에 맞는 전체 검증 스크립트를 생성하거나 갱신해야 한다
 - Worker는 전체 검증 스크립트를 직접 실행하지 않으며 Loop Manager 코드가 실행한다
-- PR 생성 직전에 최신 `origin/<base-branch>`를 rebase로 반영하고 전체 검증과 Review를 다시 통과해야 한다
+- Worker 결과와 작업 범위를 확인한 뒤 최신 `origin/<base-branch>`를 fetch하고 소유 변경을 commit하여 필요한 rebase를 완료한 다음 게시 후보 HEAD에서 전체 검증과 Review를 수행한다. 기준이 안정적이면 한 Worker 결과의 전체 검증은 한 번 수행한다. 이후 base 또는 후보 HEAD가 바뀌면 기존 검증과 Review를 무효화하고 최종 revision을 다시 검증한다
+- PR 생성 직전에 최신 `origin/<base-branch>`를 확인하고 변경됐으면 rebase 후 전체 검증과 Review를 다시 통과해야 한다
 - 게시 직전 archive eligibility가 검증된 이동 집합과 다르면 같은 Worker 세션으로 돌아가 전체 검증과 Review를 다시 수행한다
 - 관련 테스트와 전체 검증이 통과해야 한다
 - Reviewer의 blocking issue가 없어야 한다

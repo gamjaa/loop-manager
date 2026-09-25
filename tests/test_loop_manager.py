@@ -19,6 +19,7 @@ from unittest import mock
 
 import loop_manager
 import execplan_catalog
+from execution_revision import DefinitionSnapshot
 from worker_session import SessionBinding
 
 
@@ -132,6 +133,53 @@ def git_command(repo: Path, *arguments: str) -> str:
         stderr=subprocess.STDOUT,
     )
     return result.stdout.strip()
+
+
+def seed_validated_candidate(
+    connection: sqlite3.Connection, repo: Path, worktree: Path, plan_id: str,
+) -> None:
+    """Give a publication fixture evidence for its exact base and HEAD."""
+
+    row = connection.execute(
+        "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+        (str(repo), plan_id),
+    ).fetchone()
+    base_sha = git_command(repo, "rev-parse", "origin/main")
+    candidate_head = git_command(worktree, "rev-parse", "HEAD")
+    snapshot = DefinitionSnapshot(
+        revision_sha=base_sha,
+        path=str(row["path"]),
+        title=str(row["title"]),
+        sources=tuple(json.loads(str(row["sources"]))),
+        depends_on=tuple(json.loads(str(row["depends_on"]))),
+        complexity=str(row["current_complexity"]),
+        risk=str(row["current_risk"]),
+        priority=str(row["priority"]),
+        body_hash=loop_manager._revision_execplan_body_hash(
+            repo, base_sha, str(row["path"]),
+        ),
+        source_fingerprint=loop_manager._revision_execplan_source_fingerprint(
+            repo, base_sha, row,
+        ),
+        archive_candidates=(),
+    )
+    values = (
+        snapshot.serialize(), snapshot.worker_token, snapshot.archive_token,
+        snapshot.verify_token(base_sha, candidate_head),
+        snapshot.review_token(base_sha, candidate_head),
+    )
+    with connection:
+        connection.execute(
+            "UPDATE exec_plans SET definition_snapshot = ?, worker_input_token = ?, "
+            "archive_token = ?, verify_token = ?, review_token = ? "
+            "WHERE repo = ? AND plan_id = ?",
+            (*values, str(repo), plan_id),
+        )
+        connection.execute(
+            "UPDATE projects SET definition_snapshot = ?, worker_input_token = ?, "
+            "archive_token = ?, verify_token = ?, review_token = ? WHERE repo = ?",
+            (*values, str(repo)),
+        )
 
 
 def matching_branch_pr_lookup(responses):
@@ -3902,9 +3950,9 @@ risk: medium
             (0, 0, 0, 1),
         )
         self.assertEqual(roles, ["worker", "planner", "worker"])
-        verify.assert_called_once()
+        verify.assert_not_called()
         self.assertIsNone(blocked_project["phase"])
-        self.assertEqual(blocked_plan["verify_result"], "verify: PASS")
+        self.assertEqual(blocked_plan["verify_result"], "")
         self.assertIsNone(blocked_project["pr_url"])
         self.assertTrue(worktree_preserved)
         self.assertIn("PR을 생성할 수 없습니다", blocked_plan["last_error"])
@@ -3972,8 +4020,7 @@ risk: medium
             ), mock.patch(
                 "loop_manager.run_codex", side_effect=worker
             ), mock.patch(
-                "loop_manager.verify",
-                side_effect=[(True, "verify before rebase"), (True, "verify after rebase")],
+                "loop_manager.verify", return_value=(True, "verify: PASS"),
             ) as verify:
                 result = loop_manager.run_project(
                     connection,
@@ -4001,7 +4048,7 @@ risk: medium
         self.assertEqual(roles, ["worker"])
         # The revision gate now refreshes the base before Worker dispatch, so
         # it never validates the already-absorbed patch on the stale base.
-        verify.assert_called_once()
+        verify.assert_not_called()
         self.assertEqual(ahead, "0")
         self.assertIsNone(project["phase"])
         self.assertIn("Worker가 변경을 만들지 않아", plan["last_error"])
@@ -4074,6 +4121,9 @@ risk: medium
                 self.assertEqual(role_name, "worker")
                 sessions.append(kwargs["session_id"])
                 prompts.append(prompt)
+                (_worktree / "src/app.py").write_text(
+                    f"VALUE = {len(sessions) + 1}\n", encoding="utf-8",
+                )
                 return loop_manager.CodexResult(
                     0, worker_result(), "worker-session"
                 )
@@ -9537,6 +9587,9 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 state_dir, str(repo), "G-001"
             )
             loop_manager.make_worktree(repo, worktree, branch, "main")
+            (worktree / "src/app.py").write_text("VALUE = 2\n", encoding="utf-8")
+            git_command(worktree, "add", "src/app.py")
+            git_command(worktree, "commit", "-m", "Prepare verified candidate")
             plan_sha = git_command(repo, "rev-parse", "origin/main")
             connection = sqlite3.connect(":memory:")
             connection.row_factory = sqlite3.Row
@@ -9546,7 +9599,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 INSERT INTO projects (
                     repo, base_branch, active_sha, plan_sha, phase, branch,
                     worktree, plan_path, worker_result, verify_result
-                ) VALUES (?, 'main', ?, ?, 'REVIEWING', ?, ?, ?, ?, ?)
+                ) VALUES (?, 'main', ?, ?, 'VERIFYING', ?, ?, ?, ?, ?)
                 """,
                 (
                     str(repo),
@@ -9556,7 +9609,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     str(worktree),
                     plan_path,
                     worker_result(),
-                    "verify: PASS",
+                    None,
                 ),
             )
             connection.commit()
@@ -9591,6 +9644,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "loop_manager.ensure_safe_base_worktree"
             ), mock.patch(
                 "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.verify", return_value=(True, "verify: PASS")
             ), mock.patch(
                 "loop_manager.run_codex", side_effect=reviewer
             ):
@@ -10106,6 +10161,9 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 state_dir, str(repo), "G-001"
             )
             loop_manager.make_worktree(repo, worktree, branch, "main")
+            (worktree / "src/app.py").write_text("VALUE = 2\n", encoding="utf-8")
+            git_command(worktree, "add", "src/app.py")
+            git_command(worktree, "commit", "-m", "Prepare Worker candidate")
             plan_sha = git_command(repo, "rev-parse", "origin/main")
             initial_head = git_command(worktree, "rev-parse", "HEAD")
             connection = sqlite3.connect(":memory:")
@@ -10310,7 +10368,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
 
             self.assertEqual(result, 1)
             self.assertEqual(roles, ["worker", "reviewer"])
-            self.assertEqual(len(verify_calls), 1)
+            self.assertEqual(len(verify_calls), 2)
             self.assertEqual(project["phase"], "REVIEWING")
             self.assertIn("stop after publication check", project["last_error"])
             self.assertIn("src/app.py", published_paths)
@@ -13469,6 +13527,7 @@ class LatestBasePublicationTest(unittest.TestCase):
                 "origin",
                 f"HEAD:refs/heads/{branch}",
             )
+            seed_validated_candidate(connection, repo, worktree, "G-014")
             created = []
             git_calls = []
             original_git = loop_manager.git
@@ -15454,6 +15513,7 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                 pr_conflict_head_oid=observed_head,
                 pr_conflict_base_oid=base_oid,
             )
+            seed_validated_candidate(connection, repo, worktree, "G-026")
 
             competitor = Path(directory) / "lease-competitor"
             git_command(
