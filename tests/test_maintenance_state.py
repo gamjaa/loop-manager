@@ -1,3 +1,4 @@
+import io
 import sqlite3
 import subprocess
 import tempfile
@@ -199,14 +200,22 @@ class DocumentDraftTest(unittest.TestCase):
 
     def test_cli_has_explicit_identity_and_hash_boundary(self):
         parser = loop_manager.build_parser()
-        draft = self._create()
+        proposal = b"# Product\r\n\r\nRule.\r\n"
+        draft = self._create(content=proposal)
         show = parser.parse_args(["document-drafts", str(self.repo), "show",
                                   draft.draft_id])
+        output = io.BytesIO()
         with mock.patch.object(loop_manager, "is_loop_manager_repository", return_value=True), \
              mock.patch.object(loop_manager, "connect_database", return_value=self.database), \
-             mock.patch.object(loop_manager, "operation_print") as printed:
+             mock.patch.object(loop_manager.sys, "stdout", mock.Mock(buffer=output)):
             self.assertEqual(loop_manager._document_drafts_command(show, self.root, self.root / "config.ini"), 0)
-            self.assertIn(draft.proposed_hash, printed.call_args.args[0])
+        review = output.getvalue()
+        self.assertIn(draft.proposed_hash.encode("ascii"), review)
+        self.assertIn(
+            f"=== Complete proposal ({len(proposal)} bytes) ===\n".encode("ascii") + proposal,
+            review,
+        )
+        self.assertIn(draft.complete_diff.encode("utf-8"), review)
         args = parser.parse_args(["document-drafts", str(self.repo), "decide",
                                   draft.draft_id, draft.proposed_hash, "approve"])
         self.assertEqual((args.draft_id, args.proposed_hash, args.decision),
@@ -229,7 +238,7 @@ class DocumentDraftTest(unittest.TestCase):
         self.assertIn("doc-product", prompt)
         self.assertNotIn("policy-choice", prompt)
         self.assertEqual(identity[1], hashlib.sha256(self.documents["docs/PRODUCT.md"]).hexdigest())
-        proposal = b"# Product\n\nRule.\n"
+        proposal = b"# Product\r\n\r\nRule.\r\n"
         response = "DOCUMENT_DRAFT_RESULT: " + json.dumps({
             "status": "candidate", "content": proposal.decode(),
             "meaning_evidence": "Only duplicate wording changed; product behavior remains unchanged.",
@@ -237,15 +246,20 @@ class DocumentDraftTest(unittest.TestCase):
         args = loop_manager.build_parser().parse_args([
             "document-drafts", str(self.repo), "generate", "docs/PRODUCT.md",
         ])
+        output = io.BytesIO()
         with mock.patch.object(loop_manager, "is_loop_manager_repository", return_value=True), \
              mock.patch.object(loop_manager, "connect_database", return_value=self.database), \
              mock.patch.object(loop_manager, "git"), \
              mock.patch.object(loop_manager, "run_agent", return_value=(0, response)) as agent, \
-             mock.patch.object(loop_manager, "operation_print"):
+             mock.patch.object(loop_manager.sys, "stdout", mock.Mock(buffer=output)):
             self.assertEqual(loop_manager._document_drafts_command(
                 args, self.root, self.root / "config.ini"), 0)
             self.assertTrue(agent.call_args.kwargs["read_only"])
             self.assertEqual(agent.call_args.args[1], loop_manager.ROOT)
+        self.assertIn(
+            f"=== Complete proposal ({len(proposal)} bytes) ===\n".encode("ascii") + proposal,
+            output.getvalue(),
+        )
         self.assertEqual(self.drafts.list(str(self.repo))[0].proposed_content, proposal)
         with self.assertRaises(document_drafts.DocumentDraftError):
             self.drafts.generation_prompt(str(self.repo), self.repo, "main", "docs/PRODUCT.md")

@@ -422,9 +422,9 @@ class DocumentDraftRepository:
         return tuple(result)
 
 
-def review_artifact(draft: DocumentDraft) -> str:
-    """Render complete persisted bytes; never read the source checkout for review."""
-    return (
+def review_artifact_bytes(draft: DocumentDraft) -> bytes:
+    """Render length-delimited review data without changing document line endings."""
+    header = (
         f"Draft ID: {draft.draft_id}\nState: {draft.state}\n"
         f"Target: {draft.target_path}\nFindings: {', '.join(draft.finding_ids)}\n"
         f"Assessment revision: {draft.assessment_revision}\n"
@@ -435,10 +435,22 @@ def review_artifact(draft: DocumentDraft) -> str:
         f"Requested decision: {draft.requested_decision or ''}\n"
         f"Decision revision: {draft.decision_revision or ''}\n"
         f"Decision reason: {draft.decision_reason or ''}\n"
-        "\n=== Complete original ===\n" + draft.original_content.decode("utf-8")
-        + "\n=== Complete proposal ===\n" + draft.proposed_content.decode("utf-8")
-        + "\n=== Complete diff ===\n" + draft.complete_diff
     )
+    diff = draft.complete_diff.encode("utf-8")
+    return (
+        header.encode("utf-8")
+        + f"\n=== Complete original ({len(draft.original_content)} bytes) ===\n".encode("ascii")
+        + draft.original_content
+        + f"\n=== Complete proposal ({len(draft.proposed_content)} bytes) ===\n".encode("ascii")
+        + draft.proposed_content
+        + f"\n=== Complete diff ({len(diff)} bytes) ===\n".encode("ascii")
+        + diff
+    )
+
+
+def review_artifact(draft: DocumentDraft) -> str:
+    """Return the same review data as text for callers that need a string."""
+    return review_artifact_bytes(draft).decode("utf-8")
 
 
 def parse_generated_draft(output: str) -> tuple[bytes, str] | None:

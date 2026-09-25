@@ -19623,6 +19623,13 @@ def _document_drafts_command(
             raise document_drafts.DocumentDraftError("등록된 Loop Manager 저장소가 아닙니다.")
         base_branch = str(project["base_branch"])
         drafts = document_drafts.DocumentDraftRepository(connection)
+
+        def display_review(draft: document_drafts.DocumentDraft) -> None:
+            sys.stdout.flush()
+            output = sys.stdout.buffer
+            output.write(document_drafts.review_artifact_bytes(draft))
+            output.flush()
+
         if args.draft_command == "list":
             for path, findings in drafts.candidates(repo).items():
                 operation_print(f"candidate\t{path}\t{','.join(findings)}")
@@ -19636,7 +19643,7 @@ def _document_drafts_command(
             draft = drafts.get(args.draft_id)
             if draft.repo != repo:
                 raise document_drafts.DocumentDraftError("다른 저장소의 수정본입니다.")
-            operation_print(document_drafts.review_artifact(draft))
+            display_review(draft)
             return 0
         git(repository, "fetch", "origin", f"+refs/heads/{base_branch}:refs/remotes/origin/{base_branch}")
         if args.draft_command == "generate":
@@ -19663,7 +19670,7 @@ def _document_drafts_command(
                 expected_identity=identity,
             )
             connection.commit()
-            operation_print(document_drafts.review_artifact(draft))
+            display_review(draft)
         elif args.draft_command == "create":
             content_file = Path(args.content_file).expanduser().resolve()
             if content_file.is_relative_to(repository):
@@ -19675,7 +19682,7 @@ def _document_drafts_command(
                 content_file.read_bytes(), args.meaning_evidence,
             )
             connection.commit()
-            operation_print(document_drafts.review_artifact(draft))
+            display_review(draft)
         elif args.draft_command == "decide":
             draft = drafts.get(args.draft_id)
             if draft.repo != repo:
