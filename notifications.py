@@ -24,6 +24,9 @@ CREATE TABLE IF NOT EXISTS notification_outbox (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     delivery_started_at TEXT,
     sent_at TEXT,
+    rendered_text TEXT,
+    confirmed_pieces INTEGER NOT NULL DEFAULT 0,
+    canceled_at TEXT,
     FOREIGN KEY (repo) REFERENCES projects(repo)
 )
 """
@@ -48,6 +51,19 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
     if "delivery_started_at" not in columns:
         connection.execute(
             "ALTER TABLE notification_outbox ADD COLUMN delivery_started_at TEXT"
+        )
+    if "rendered_text" not in columns:
+        connection.execute(
+            "ALTER TABLE notification_outbox ADD COLUMN rendered_text TEXT"
+        )
+    if "confirmed_pieces" not in columns:
+        connection.execute(
+            "ALTER TABLE notification_outbox ADD COLUMN confirmed_pieces "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+    if "canceled_at" not in columns:
+        connection.execute(
+            "ALTER TABLE notification_outbox ADD COLUMN canceled_at TEXT"
         )
     connection.execute(COMPLETION_SCHEMA)
 
@@ -626,6 +642,122 @@ def send_telegram(token: str, chat_id: str, text: str) -> None:
             raise RuntimeError("Telegram returned a non-success status")
 
 
+MESSAGE_LIMIT = 4096
+
+
+def _pieces(text: str) -> list[str]:
+    return [text[start:start + MESSAGE_LIMIT]
+            for start in range(0, len(text), MESSAGE_LIMIT)]
+
+
+def _current_block_key(
+    connection: sqlite3.Connection, repo: str, payload: dict[str, object],
+) -> str | None:
+    """Rebuild the identity of the block currently owning this notice."""
+
+    subject = payload.get("execplan_id")
+    reason = payload.get("reason_code")
+    if payload.get("stage") == "planning":
+        project = connection.execute(
+            "SELECT planning_error FROM projects WHERE repo = ?", (repo,),
+        ).fetchone()
+        has_block = connection.execute(
+            "SELECT 1 FROM project_blocks WHERE repo = ?", (repo,),
+        ).fetchone()
+        return (_key("blocked", repo, "project\0planning_error\0")
+                if project and project[0] and not has_block else None)
+    if payload.get("scope") == "plan":
+        block = connection.execute(
+            "SELECT b.reason_code, c.result, c.inspected_remote_oid, "
+            "r.origin FROM execplan_blocks b "
+            "JOIN projects r ON r.repo = b.repo "
+            "LEFT JOIN blocked_checkpoints c USING (repo, plan_id) "
+            "WHERE b.repo = ? AND b.plan_id = ?", (repo, subject),
+        ).fetchone()
+        if block is None or block[0] != reason:
+            return None
+        recovery_subject = str(subject)
+        identity = f"plan\0{reason}\0{subject}"
+        remote = (f"\0remote\0{block[3] or 'deleted'}\0{block[2]}"
+                  if block[1] == "published" and block[2] else "")
+    elif payload.get("scope") == "project":
+        block = connection.execute(
+            "SELECT reason_code, plan_id FROM project_blocks WHERE repo = ?",
+            (repo,),
+        ).fetchone()
+        if block is None or block[0] != reason or block[1] != subject:
+            return None
+        recovery_subject = str(subject or "__project__")
+        identity = f"project\0{reason}\0{subject or ''}"
+        remote = ""
+    else:
+        return None
+    recovery_table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'recovery_records'"
+    ).fetchone()
+    if recovery_table:
+        recovery = connection.execute(
+            "SELECT identity FROM recovery_records WHERE repo = ? "
+            "AND subject = ? AND final_evidence IS NOT NULL",
+            (repo, recovery_subject),
+        ).fetchone()
+        if recovery:
+            identity += f"\0{recovery[0]}"
+    return _key("blocked", repo, identity + remote)
+
+
+def _cancel_stale_block(
+    connection: sqlite3.Connection, event_key: str, repo: str,
+    payload: dict[str, object],
+) -> bool:
+    if event_key == _current_block_key(connection, repo, payload):
+        return False
+    connection.execute(
+        "UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP, "
+        "delivery_started_at = NULL WHERE event_key = ? "
+        "AND sent_at IS NULL AND canceled_at IS NULL",
+        (event_key,),
+    )
+    return True
+
+
+def _claim_piece(
+    connection: sqlite3.Connection, event_key: str, *, first_attempt_only: bool,
+) -> tuple[str, int, int] | None:
+    with connection:
+        if not connection.in_transaction:
+            connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT repo, event_type, payload, rendered_text, confirmed_pieces, "
+            "attempts FROM notification_outbox WHERE event_key = ? "
+            "AND sent_at IS NULL AND canceled_at IS NULL",
+            (event_key,),
+        ).fetchone()
+        if row is None or (first_attempt_only and row[5] != 0):
+            return None
+        payload = json.loads(str(row[2]))
+        if row[1] == "blocked" and _cancel_stale_block(
+            connection, event_key, str(row[0]), payload
+        ):
+            return None
+        text = str(row[3]) if row[3] is not None else _message(str(row[1]), payload)
+        pieces = _pieces(text)
+        cursor = int(row[4])
+        if cursor >= len(pieces):
+            return None
+        claimed = connection.execute(
+            "UPDATE notification_outbox SET rendered_text = ?, "
+            "attempts = attempts + 1, last_error = NULL, "
+            "delivery_started_at = CURRENT_TIMESTAMP "
+            "WHERE event_key = ? AND sent_at IS NULL AND canceled_at IS NULL "
+            "AND confirmed_pieces = ?"
+            + (" AND attempts = 0" if first_attempt_only else ""),
+            (text, event_key, cursor),
+        ).rowcount
+        return (pieces[cursor], cursor, len(pieces)) if claimed == 1 else None
+
+
 def dispatch_pending(
     connection: sqlite3.Connection,
     token: str,
@@ -640,7 +772,7 @@ def dispatch_pending(
     ensure_schema(connection)
     rows = connection.execute(
         "SELECT event_key, event_type, payload FROM notification_outbox "
-        "WHERE sent_at IS NULL "
+        "WHERE sent_at IS NULL AND canceled_at IS NULL "
         "ORDER BY created_at, event_key"
     ).fetchall()
     return _deliver_rows(connection, token, chat_id, rows, adapter)
@@ -664,7 +796,7 @@ def dispatch_new_pr_notifications(
     rows = connection.execute(
         "SELECT event_key, event_type, payload FROM notification_outbox "
         "WHERE repo = ? AND event_type = 'pr_created' "
-        "AND sent_at IS NULL AND attempts = 0 "
+        "AND sent_at IS NULL AND canceled_at IS NULL AND attempts = 0 "
         "ORDER BY created_at, event_key",
         (repo,),
     ).fetchall()
@@ -684,34 +816,40 @@ def _deliver_rows(
 ) -> int:
     sent = 0
     for row in rows:
-        with connection:
-            claimed = connection.execute(
-                "UPDATE notification_outbox "
-                "SET attempts = attempts + 1, last_error = NULL, "
-                "delivery_started_at = CURRENT_TIMESTAMP "
-                "WHERE event_key = ? AND sent_at IS NULL"
-                + (" AND attempts = 0" if first_attempt_only else ""),
-                (row[0],),
-            ).rowcount
-        if claimed != 1:
-            continue
-        try:
-            adapter(token, chat_id, _message(str(row[1]), json.loads(str(row[2]))))
-        except Exception as error:
-            failure = f"Telegram delivery failed ({type(error).__name__})"
+        first_piece = True
+        while True:
+            claimed = _claim_piece(
+                connection, str(row[0]),
+                first_attempt_only=first_attempt_only and first_piece,
+            )
+            if claimed is None:
+                break
+            piece, cursor, total = claimed
+            first_piece = False
+            try:
+                adapter(token, chat_id, piece)
+            except Exception as error:
+                failure = f"Telegram delivery failed ({type(error).__name__})"
+                with connection:
+                    connection.execute(
+                        "UPDATE notification_outbox SET delivery_started_at = NULL, "
+                        "last_error = ? WHERE event_key = ? AND sent_at IS NULL "
+                        "AND confirmed_pieces = ?",
+                        (failure, row[0], cursor),
+                    )
+                break
             with connection:
                 connection.execute(
-                    "UPDATE notification_outbox SET delivery_started_at = NULL, "
-                    "last_error = ? WHERE event_key = ? AND sent_at IS NULL",
-                    (failure, row[0]),
+                    "UPDATE notification_outbox SET confirmed_pieces = ?, "
+                    "delivery_started_at = CASE WHEN ? = ? "
+                    "THEN delivery_started_at ELSE NULL END, last_error = NULL, "
+                    "sent_at = CASE WHEN ? = ? THEN CURRENT_TIMESTAMP "
+                    "ELSE NULL END WHERE event_key = ? AND sent_at IS NULL "
+                    "AND confirmed_pieces = ? AND delivery_started_at IS NOT NULL",
+                    (cursor + 1, cursor + 1, total, cursor + 1, total,
+                     row[0], cursor),
                 )
-            continue
-        with connection:
-            connection.execute(
-                "UPDATE notification_outbox SET last_error = NULL, "
-                "sent_at = CURRENT_TIMESTAMP WHERE event_key = ? "
-                "AND sent_at IS NULL AND delivery_started_at IS NOT NULL",
-                (row[0],),
-            )
-        sent += 1
+            if cursor + 1 == total:
+                sent += 1
+                break
     return sent

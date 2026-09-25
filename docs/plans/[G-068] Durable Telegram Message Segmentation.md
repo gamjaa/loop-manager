@@ -36,9 +36,9 @@ priority: high
 
 ## Progress
 
-- [ ] Exact plain-text segmentation and durable piece cursor
-- [ ] Shared dispatch and stale BLOCKED cancellation
-- [ ] Targeted boundary, retry and restart tests
+- [x] Exact plain-text segmentation and durable piece cursor
+- [x] Shared dispatch and stale BLOCKED cancellation
+- [x] Targeted boundary, retry and restart tests
 
 ## Decision Log
 
