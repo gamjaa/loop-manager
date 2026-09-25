@@ -100,6 +100,7 @@ class FakeStatePort:
         self.maintenance_due_required = False
         self.maintenance_due_reason = "interval_reached"
         self.maintenance_begin_count = 0
+        self.document_approval_pending = False
         self.schedule_result = SimpleNamespace(
             active=None,
             has_ready=False,
@@ -132,6 +133,9 @@ class FakeStatePort:
 
     def schedule(self, _repo):
         return self.schedule_result
+
+    def pending_document_approval(self, _repo, _repository, _base_branch):
+        return self.document_approval_pending
 
     def maintenance_due(self, _repo, _interval, *, self_repository=False):
         self.maintenance_due_self_repository = self_repository
@@ -400,6 +404,28 @@ class FakePorts:
 
 
 class PlanningLifecycleCoordinatorTest(unittest.TestCase):
+    def test_new_document_approval_forces_planning_with_unchanged_fingerprints(self):
+        ports = FakePorts(planning_snapshot(
+            planning_fingerprint="fingerprint",
+            specification_fingerprint="specification",
+        ))
+        ports.state.document_approval_pending = True
+        ports.state.maintenance_due_required = True
+        ports.state.schedule_result.has_ready = True
+        ports.state.schedule_result.runnable_ready = object()
+        coordinator = PlanningLifecycleCoordinator(ports)
+        run = coordinator._new_run(replace(
+            self.context, registered_only=True, self_repository=True,
+        ))
+
+        self.assertIsNone(coordinator._select_planning_work(run))
+        self.assertEqual(
+            run.selection.kind,
+            PlanningDecisionKind.RUN_SPECIFICATION_PLANNING,
+        )
+        self.assertFalse(run.ready_activated_before_planning)
+        self.assertEqual(ports.state.maintenance_begin_count, 0)
+
     def test_real_planner_port_records_resumption_at_agent_start(self):
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)
