@@ -2,11 +2,15 @@
 
 from dataclasses import replace
 from pathlib import Path
+import subprocess
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
 import loop_manager
+import checkpoint_ownership
+import blocked_checkpoint
 
 from execution_checkpoint import (
     CheckpointAction, CheckpointSnapshot, assess, observe,
@@ -33,6 +37,141 @@ def snapshot(**changes):
 
 
 class CheckpointAssessmentTests(unittest.TestCase):
+    def test_published_owner_requires_commit_tree_and_exact_live_ref(self):
+        row = {
+            'phase': 'published', 'result': 'published',
+            'branch': 'loop/G-044', 'worktree': '/owned',
+            'accepted_remote_oid': 'a' * 40, 'published_oid': 'a' * 40,
+            'pending_remote_oid': None, 'commit_identity': 'identity',
+            'tree_oid': 'tree',
+        }
+        connection = mock.Mock()
+        connection.execute.return_value.fetchone.return_value = row
+
+        def git(_repo, *args, **_kwargs):
+            if args[0] == 'show':
+                return SimpleNamespace(
+                    stdout='[G-044] BLOCKED checkpoint\n\nScope: plan\n'
+                           'Checkpoint-Identity: identity\n', returncode=0,
+                )
+            if args[0] == 'rev-parse':
+                return SimpleNamespace(stdout='tree\n', returncode=0)
+            if args[0] == 'ls-remote':
+                return SimpleNamespace(stdout=f"{'a' * 40}\trefs/heads/loop/G-044\n", returncode=0)
+            return SimpleNamespace(stdout='', returncode=0)
+
+        def owner(**changes):
+            arguments = dict(
+                connection=connection, repo_path=Path('/repo'), repo='repo',
+                plan_id='G-044', branch='loop/G-044', worktree=Path('/owned'),
+                remote_oid='a' * 40, git=git, before_head='before',
+                recorded_oid='a' * 40,
+            )
+            arguments.update(changes)
+            return checkpoint_ownership.owned_remote_oid(**arguments)
+
+        self.assertEqual(owner(), 'a' * 40)
+        row['tree_oid'] = 'forged'
+        self.assertIsNone(owner())
+        row['tree_oid'] = 'tree'
+        self.assertIsNone(owner(branch='other'))
+        self.assertIsNone(owner(remote_oid='b' * 40))
+
+    def test_rebase_owner_requires_equal_replayed_patch_series(self):
+        def git(_repo, *args, **_kwargs):
+            outputs = {
+                'merge-base': 'old-base\n', 'rev-list': '1\n',
+                'range-diff': '1:  aaaaaaa = 1:  bbbbbbb same change\n',
+            }
+            return SimpleNamespace(stdout=outputs[args[0]], returncode=0)
+
+        self.assertTrue(checkpoint_ownership.rebase_preserves_commits(
+            Path('/repo'), 'old-head', 'new-head', 'new-base', git,
+        ))
+
+        def changed(_repo, *args, **kwargs):
+            result = git(_repo, *args, **kwargs)
+            if args[0] == 'range-diff':
+                return SimpleNamespace(stdout=result.stdout.replace(' = ', ' ! '), returncode=0)
+            return result
+
+        self.assertFalse(checkpoint_ownership.rebase_preserves_commits(
+            Path('/repo'), 'old-head', 'new-head', 'new-base', changed,
+        ))
+
+    def test_clean_checkpoint_proves_preexisting_commit_without_marker(self):
+        oid = 'a' * 40
+        identity = blocked_checkpoint.checkpoint_identity(
+            plan_id='G-044', reason_code='review_retry_exhausted',
+            evidence='review failed', parent_oid=oid,
+            tree_oid='tree', included_paths=(),
+        )
+        row = {
+            'phase': 'published', 'result': 'published',
+            'branch': 'loop/G-044', 'worktree': '/owned',
+            'accepted_remote_oid': oid, 'published_oid': oid,
+            'pending_remote_oid': None, 'commit_identity': identity,
+            'tree_oid': 'tree', 'local_oid': oid,
+            'reason_code': 'review_retry_exhausted', 'evidence': 'review failed',
+        }
+        connection = mock.Mock()
+        connection.execute.return_value.fetchone.return_value = row
+
+        def git(_repo, *args, **_kwargs):
+            if args[0] == 'show':
+                return SimpleNamespace(stdout='Existing Worker commit\n', returncode=0)
+            if args[0] == 'rev-parse':
+                return SimpleNamespace(stdout='tree\n', returncode=0)
+            if args[0] == 'ls-remote':
+                return SimpleNamespace(
+                    stdout=f'{oid}\trefs/heads/loop/G-044\n', returncode=0,
+                )
+            return SimpleNamespace(stdout='', returncode=0)
+
+        self.assertEqual(checkpoint_ownership.owned_remote_oid(
+            connection, Path('/repo'), 'repo', 'G-044', 'loop/G-044',
+            Path('/owned'), oid, git,
+        ), oid)
+        row['commit_identity'] = 'forged'
+        self.assertIsNone(checkpoint_ownership.owned_remote_oid(
+            connection, Path('/repo'), 'repo', 'G-044', 'loop/G-044',
+            Path('/owned'), oid, git,
+        ))
+
+    def test_real_rebase_preserves_owned_patch_series(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+
+            def git(path, *arguments, check=True):
+                return subprocess.run(
+                    ['git', '-C', str(path), *arguments], text=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    check=check,
+                )
+
+            git(repo, 'init', '-q')
+            git(repo, 'config', 'user.name', 'Unit Test')
+            git(repo, 'config', 'user.email', 'unit@example.test')
+            (repo / 'app.py').write_text('VALUE = 1\n')
+            git(repo, 'add', 'app.py')
+            git(repo, 'commit', '-qm', 'base')
+            git(repo, 'branch', 'owned')
+            (repo / 'notes.md').write_text('new base\n')
+            git(repo, 'add', 'notes.md')
+            git(repo, 'commit', '-qm', 'advance base')
+            target = git(repo, 'rev-parse', 'HEAD').stdout.strip()
+            git(repo, 'checkout', '-q', 'owned')
+            (repo / 'app.py').write_text('VALUE = 2\n')
+            git(repo, 'add', 'app.py')
+            git(repo, 'commit', '-qm', 'owned patch')
+            before = git(repo, 'rev-parse', 'HEAD').stdout.strip()
+            git(repo, 'rebase', target)
+            after = git(repo, 'rev-parse', 'HEAD').stdout.strip()
+
+            self.assertTrue(checkpoint_ownership.rebase_preserves_commits(
+                repo, before, after, target, git,
+            ))
+
     def test_pr_rebase_resume_does_not_complete_unmerged_index_without_metadata(self):
         project = {
             'pr_conflict_recovery': 1, 'phase': 'WORKING',

@@ -89,6 +89,7 @@ import recovery_runtime
 import execution_handlers
 import execution_revision
 import execution_checkpoint_state
+import checkpoint_ownership
 from agent_invocation import (AgentProfile, AgentRequest, AgentResult, AgentResultKind,
                               AttemptSequence, InvocationContext, ResolvedProfile,
                               TrackedAgentCall, Usage, classify_agent_result)
@@ -8450,6 +8451,10 @@ def push_managed_publication_branch(
     )
     local_oid = git(worktree, "rev-parse", "HEAD").stdout.strip()
     remote_oid = remote_branch_oid(repo_path, branch)
+    if remote_oid is None and plan['publication_remote_oid']:
+        raise PublicationSafetyError(
+            '저장된 게시 branch가 원격에서 삭제돼 새 branch 생성으로 복구할 수 없습니다.'
+        )
     record_remote_publication_branch(
         connection,
         repo_path,
@@ -8479,10 +8484,29 @@ def push_managed_publication_branch(
             raise PublicationSafetyError(
                 "저장된 원격 branch OID와 fetch 결과가 달라 강제 갱신을 거부합니다."
             )
+        live = git(repo_path, 'ls-remote', '--heads', 'origin',
+                   f'refs/heads/{branch}', check=False)
+        if (live.returncode or
+                [line.split() for line in live.stdout.splitlines() if line.strip()]
+                != [[remote_oid, f'refs/heads/{branch}']]):
+            raise PublicationSafetyError(
+                'push 직전 원격 branch가 저장된 lease OID와 다릅니다.'
+            )
+        if plan['pr_url'] or pr_for_branch(repo_path, branch) is not None:
+            raise PublicationSafetyError(
+                'PR이 있는 branch를 checkpoint 복구 강제 push할 수 없습니다.'
+            )
         push_arguments.insert(
             1,
             f"--force-with-lease=refs/heads/{branch}:{remote_oid}",
         )
+    else:
+        live = git(repo_path, 'ls-remote', '--heads', 'origin',
+                   f'refs/heads/{branch}', check=False)
+        if live.returncode or live.stdout.strip():
+            raise PublicationSafetyError(
+                '새 branch push 직전 원격 ref가 생성되거나 조회에 실패했습니다.'
+            )
 
     pushed = git(worktree, *push_arguments, check=False)
     if pushed.returncode:
@@ -8499,6 +8523,12 @@ def push_managed_publication_branch(
         raise RuntimeError(
             "publication branch push 결과를 원격에서 확인할 수 없습니다."
         )
+    confirmed = git(repo_path, 'ls-remote', '--heads', 'origin',
+                    f'refs/heads/{branch}', check=False)
+    if (confirmed.returncode or
+            [line.split() for line in confirmed.stdout.splitlines() if line.strip()]
+            != [[local_oid, f'refs/heads/{branch}']]):
+        raise RuntimeError('publication branch push의 새 OID를 원격에서 확인할 수 없습니다.')
     update_project(
         connection,
         repo,
@@ -13627,6 +13657,7 @@ def _requeue_blocked_execplan(
     connection: sqlite3.Connection,
     repo: str,
     plan_id: str,
+    *, publication_remote_oid: str | None = None,
 ) -> None:
     plan = connection.execute(
         "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
@@ -13706,7 +13737,7 @@ def _requeue_blocked_execplan(
                 "verify_result": None,
                 "review_result": None,
                 "validated_base_sha": None,
-                "publication_remote_oid": None,
+                "publication_remote_oid": publication_remote_oid,
                 "pr_url": None,
                 "pr_head_oid": None,
                 "verify_failure_history": "{}",
@@ -13718,6 +13749,82 @@ def _requeue_blocked_execplan(
             enqueue=False,
         )
         scoped_blocking.clear_plan_block(connection, repo, plan_id)
+
+
+def _record_blocked_resume_head(
+    connection: sqlite3.Connection, repo: str, plan_id: str,
+    owner_oid: str, before_head: str, target_base_oid: str,
+    after_head: str | None,
+) -> None:
+    checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
+    current = checkpoint.get(repo, plan_id)
+    checkpoint.record(
+        repo, plan_id, expected_generation=current.generation,
+        operation=None, expected_head=after_head or before_head,
+        target_base_oid=target_base_oid, observed_remote_oid=owner_oid,
+        snapshot={'blocked_resume': {
+            'owner_oid': owner_oid, 'before_head': before_head,
+            'target_base_oid': target_base_oid, 'after_head': after_head,
+        }},
+    )
+
+
+def _resume_interrupted_blocked_rebase(
+    connection: sqlite3.Connection, repo_path: Path,
+    repo: str, base: str, plan: sqlite3.Row, worktree: Path, branch: str,
+) -> bool | None:
+    """Complete a saved release only after its Git effect is independently proven."""
+    checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
+        repo, str(plan['plan_id']),
+    )
+    marker = (checkpoint.snapshot or {}).get('blocked_resume')
+    if not marker:
+        return None
+    current_head = git(worktree, 'rev-parse', 'HEAD').stdout.strip()
+    before_head = str(marker.get('before_head') or '')
+    after_head = str(marker.get('after_head') or '')
+    if not after_head and current_head == before_head:
+        return None
+    try:
+        target_base = git(repo_path, 'rev-parse',
+                          f'refs/remotes/origin/{base}').stdout.strip()
+        snapshot = capture_git_snapshot(worktree)
+        remote_oid = remote_branch_oid(repo_path, branch)
+        owned_oid = checkpoint_ownership.owned_remote_oid(
+            connection, repo_path, repo, str(plan['plan_id']), branch,
+            worktree, remote_oid, git, before_head=before_head,
+            recorded_oid=str(plan['publication_remote_oid'] or '') or None,
+        ) if not plan['pr_url'] else None
+        safe = (
+            owned_oid is not None
+            and marker.get('owner_oid') == owned_oid
+            and marker.get('target_base_oid') == target_base
+            and checkpoint.observed_remote_oid == owned_oid
+            and snapshot.head == current_head and snapshot.branch == branch
+            and not snapshot.operations
+            and (not after_head or after_head == current_head)
+            and (after_head or not snapshot.dirty)
+            and checkpoint_ownership.rebase_preserves_commits(
+                repo_path, before_head, current_head, target_base, git,
+            )
+            and _blocked_execplan_metadata_error(repo_path, worktree, plan) is None
+        )
+    except (OSError, RuntimeError, ValueError):
+        safe = False
+    if not safe:
+        _update_blocked_error(connection, repo, str(plan['plan_id']),
+                              '중단된 차단 해제 rebase의 게시 소유권과 HEAD를 증명할 수 없습니다.')
+        return False
+    if not after_head:
+        _record_blocked_resume_head(
+            connection, repo, str(plan['plan_id']), owned_oid,
+            before_head, target_base, current_head,
+        )
+    clear_agent_scope(connection, repo)
+    _requeue_blocked_execplan(
+        connection, repo, str(plan['plan_id']), publication_remote_oid=owned_oid,
+    )
+    return True
 
 
 def resume_blocked_execplan_if_inputs_changed(
@@ -13846,6 +13953,11 @@ def resume_blocked_execplan_if_inputs_changed(
         message = f"BLOCKED worktree 복구 실패:\n{error}"
         _update_blocked_error(connection, repo, str(plan["plan_id"]), message)
         return False
+    interrupted = _resume_interrupted_blocked_rebase(
+        connection, repo_path, repo, base, plan, worktree, branch,
+    )
+    if interrupted is not None:
+        return interrupted
     try:
         validate_blocked_agent_scope(
             connection,
@@ -13871,6 +13983,25 @@ def resume_blocked_execplan_if_inputs_changed(
     )
     if not worktree_changed and not remote_input_changed:
         return False
+    owned_oid = None
+    checkpoint_row = connection.execute(
+        "SELECT phase FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?",
+        (repo, plan['plan_id']),
+    ).fetchone()
+    if checkpoint_row is not None and checkpoint_row['phase'] == 'published':
+        remote_oid = remote_branch_oid(repo_path, branch)
+        owned_oid = checkpoint_ownership.owned_remote_oid(
+            connection, repo_path, repo, str(plan['plan_id']), branch,
+            worktree, remote_oid, git,
+            before_head=git(worktree, 'rev-parse', 'HEAD').stdout.strip(),
+            recorded_oid=str(plan['publication_remote_oid'] or '') or None,
+        ) if not plan['pr_url'] else None
+        if owned_oid is None:
+            _update_blocked_error(
+                connection, repo, str(plan['plan_id']),
+                '게시 checkpoint의 원격 OID와 계획 소유권을 증명할 수 없습니다.',
+            )
+            return False
     try:
         preserved_before = preserve_blocked_agent_changes(
             connection,
@@ -13883,6 +14014,18 @@ def resume_blocked_execplan_if_inputs_changed(
         message = f"BLOCKED Agent 변경 보존 실패:\n{error}"
         _update_blocked_error(connection, repo, str(plan["plan_id"]), message)
         return False
+    if owned_oid is not None:
+        before_head = git(worktree, 'rev-parse', 'HEAD').stdout.strip()
+        if git(repo_path, 'merge-base', '--is-ancestor', owned_oid,
+               before_head, check=False).returncode != 0:
+            _update_blocked_error(connection, repo, str(plan['plan_id']),
+                                  '게시 checkpoint 이후 로컬 HEAD 계보가 다릅니다.')
+            return False
+        target_base_oid = git(repo_path, 'rev-parse', revision).stdout.strip()
+        _record_blocked_resume_head(
+            connection, repo, str(plan['plan_id']), owned_oid,
+            before_head, target_base_oid, None,
+        )
     base_ancestry = git(
         worktree,
         "merge-base",
@@ -13933,8 +14076,22 @@ def resume_blocked_execplan_if_inputs_changed(
             )
             return False
 
+    if owned_oid is not None:
+        after_head = git(worktree, 'rev-parse', 'HEAD').stdout.strip()
+        if not checkpoint_ownership.rebase_preserves_commits(
+            repo_path, before_head, after_head, target_base_oid, git,
+        ):
+            _update_blocked_error(connection, repo, str(plan['plan_id']),
+                                  '차단 해제 rebase의 commit 계보를 증명할 수 없습니다.')
+            return False
+        _record_blocked_resume_head(
+            connection, repo, str(plan['plan_id']), owned_oid,
+            before_head, target_base_oid, after_head,
+        )
+
     clear_agent_scope(connection, repo)
-    _requeue_blocked_execplan(connection, repo, str(plan["plan_id"]))
+    _requeue_blocked_execplan(connection, repo, str(plan["plan_id"]),
+                              publication_remote_oid=owned_oid)
     return True
 
 
@@ -14769,6 +14926,112 @@ def _reconcile_guidance_double_block(
     return True
 
 
+def _resume_owned_checkpoint_project_block(
+    connection: sqlite3.Connection, repo_path: Path, state_dir: Path,
+    repo: str, block: sqlite3.Row, project: sqlite3.Row, plan: sqlite3.Row,
+) -> bool:
+    """Undo only a checkpoint rebase mistaken for an external publication."""
+    plan_id = str(plan['plan_id'])
+    branch = str(plan['branch'] or '')
+    worktree = Path(str(plan['worktree'] or ''))
+    original_phase = ('WORKING' if plan['status'] == 'IMPLEMENTING'
+                      else str(plan['status']))
+    blocked_projection = plan['status'] == 'PLAN_BLOCKED'
+    projection_matches = (
+        project['plan_path'] in (None, plan['path'])
+        and project['branch'] in (None, branch)
+        and project['worktree'] in (None, str(worktree))
+    ) if blocked_projection else (
+        project['plan_path'] == plan['path']
+        and project['branch'] == branch
+        and project['worktree'] == str(worktree)
+    )
+    if (
+        block['plan_id'] != plan_id
+        or project['phase'] != 'PROJECT_BLOCKED'
+        or block['previous_phase'] != original_phase
+        or plan['status'] not in ACTIVE_EXECPLAN_STATUSES | {'PLAN_BLOCKED'}
+        or not projection_matches
+        or plan['pr_url'] or project['pr_url']
+        or int(plan['workspace_owned'] or 0) != WORKSPACE_OWNED
+    ):
+        return False
+    checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
+        repo, plan_id,
+    )
+    snapshot = checkpoint.snapshot or {}
+    marker = snapshot.get('blocked_resume')
+    try:
+        validate_execplan_workspace_identity(state_dir, repo, plan_id, branch, worktree)
+        validate_managed_worktree(repo_path, worktree, branch)
+        current = capture_git_snapshot(worktree)
+        if (current.operations or current.dirty or current.branch != branch
+                or not current.head):
+            return False
+        remote_oid = remote_branch_oid(repo_path, branch)
+        if pr_for_branch(repo_path, branch) is not None:
+            return False
+        if marker:
+            before_head = str(marker.get('before_head') or '')
+            after_head = str(marker.get('after_head') or '')
+            target_base = str(marker.get('target_base_oid') or '')
+            if (not before_head or not after_head or not target_base
+                    or marker.get('owner_oid') != remote_oid
+                    or after_head != current.head):
+                return False
+        else:
+            before_head = str(snapshot.get('reactivated_from_head') or '')
+            after_head = current.head
+            target_base = str(snapshot.get('base_oid') or checkpoint.target_base_oid or '')
+            if not before_head or not target_base:
+                return False
+        if (
+            checkpoint.expected_head != current.head
+            or checkpoint.observed_remote_oid != remote_oid
+            or not checkpoint_ownership.rebase_preserves_commits(
+                repo_path, before_head, after_head, target_base, git,
+            )
+        ):
+            return False
+        owned_oid = checkpoint_ownership.owned_remote_oid(
+            connection, repo_path, repo, plan_id, branch, worktree,
+            remote_oid, git, before_head=before_head,
+            recorded_oid=str(plan['publication_remote_oid'] or '') or None,
+        )
+        if owned_oid is None:
+            return False
+    except (OSError, RuntimeError, WorkspaceOwnershipError, ValueError):
+        return False
+    with runtime_state._transaction(connection):
+        if not marker:
+            execution_checkpoint_state.ExecutionCheckpointRepository(connection).record(
+                repo, plan_id, expected_generation=checkpoint.generation,
+                operation=checkpoint.operation, expected_head=checkpoint.expected_head,
+                target_base_oid=checkpoint.target_base_oid,
+                observed_remote_oid=checkpoint.observed_remote_oid,
+                snapshot={**snapshot, 'blocked_resume': {
+                    'owner_oid': owned_oid, 'before_head': before_head,
+                    'after_head': after_head, 'target_base_oid': target_base,
+                }},
+            )
+        connection.execute(
+            'UPDATE exec_plans SET publication_remote_oid = ? '
+            'WHERE repo = ? AND plan_id = ?', (owned_oid, repo, plan_id),
+        )
+        scoped_blocking.clear_project_block(connection, repo)
+        if plan['status'] in ACTIVE_EXECPLAN_STATUSES:
+            refreshed = connection.execute(
+                'SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
+                (repo, plan_id),
+            ).fetchone()
+            runtime_state.RuntimeStateRepository(connection).hydrate_snapshot(
+                repo, runtime_state.ExecutionSnapshot.from_row(refreshed),
+            )
+        else:
+            _clear_active_in_current_transaction(connection, repo)
+    return True
+
+
 def resume_project_block_if_safe(
     connection: sqlite3.Connection,
     repo_path: Path,
@@ -14780,10 +15043,7 @@ def resume_project_block_if_safe(
     block = scoped_blocking.project_block(connection, repo)
     if block is None:
         return False
-    if block["reason_code"] in {
-        BlockReasonCode.LEGACY_UNSCOPED_BLOCK.value,
-        BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value,
-    }:
+    if block["reason_code"] == BlockReasonCode.LEGACY_UNSCOPED_BLOCK.value:
         return False
     plan_id = str(block["plan_id"] or "")
     project = connection.execute(
@@ -14792,6 +15052,8 @@ def resume_project_block_if_safe(
     if project is None:
         return False
     if not plan_id:
+        if block['reason_code'] == BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value:
+            return False
         try:
             if block["reason_code"] == BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value:
                 worktree = Path(str(project["worktree"] or ""))
@@ -14835,6 +15097,10 @@ def resume_project_block_if_safe(
         connection, repo_path, state_dir, repo, block, project, plan,
     ):
         return True
+    if block['reason_code'] == BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value:
+        return _resume_owned_checkpoint_project_block(
+            connection, repo_path, state_dir, repo, block, project, plan,
+        )
     if (
         block["reason_code"]
         == BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value

@@ -9,6 +9,7 @@ from unittest import mock
 
 import blocked_checkpoint
 import blocked_checkpoint_state
+import execution_checkpoint_state
 import loop_manager
 import notifications
 import runtime_state
@@ -265,6 +266,142 @@ class BlockedCheckpointPolicyTest(unittest.TestCase):
 
 
 class BlockedCheckpointGitAdapterTest(unittest.TestCase):
+    def test_owned_checkpoint_release_keeps_remote_oid_across_real_rebase(self):
+        repo_id = str(self.repo.resolve())
+        (self.worktree / 'code.py').write_text('checkpoint\n', encoding='utf-8')
+        self.run_git(self.worktree, 'add', 'code.py')
+        self.run_git(
+            self.worktree, 'commit', '-m',
+            '[G-034] BLOCKED checkpoint\n\nScope: plan\n'
+            'Checkpoint-Identity: owned-identity',
+        )
+        published = self.run_git(self.worktree, 'rev-parse', 'HEAD')
+        tree = self.run_git(self.worktree, 'rev-parse', 'HEAD^{tree}')
+        request = self.block(evidence='code.py: failed')
+        self.run_git(
+            self.worktree, 'push', 'origin',
+            'HEAD:refs/heads/loop-manager/G-034',
+        )
+        blocked_checkpoint_state.BlockedCheckpointRepository(
+            self.connection,
+        ).finish_published(request, published)
+        self.connection.execute(
+            "UPDATE blocked_checkpoints SET commit_identity = 'owned-identity', "
+            "tree_oid = ? WHERE repo = ? AND plan_id = 'G-034'",
+            (tree, repo_id),
+        )
+        plan = self.connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-034'",
+            (repo_id,),
+        ).fetchone()
+        old_input = loop_manager._revision_execplan_input_fingerprint(
+            self.repo, 'refs/remotes/origin/main', plan,
+        )
+        old_worktree = loop_manager._worktree_execplan_input_fingerprint(
+            self.worktree, plan,
+        )
+        self.connection.execute(
+            "UPDATE exec_plans SET blocked_fingerprint = ?, "
+            "blocked_worktree_fingerprint = ? WHERE repo = ? AND plan_id = 'G-034'",
+            (old_input, old_worktree, repo_id),
+        )
+        self.connection.commit()
+        (self.repo / 'docs/PRODUCT.md').write_text('product\nnew input\n')
+        self.run_git(self.repo, 'add', 'docs/PRODUCT.md')
+        self.run_git(self.repo, 'commit', '-m', 'Change product input')
+        self.run_git(self.repo, 'push', 'origin', 'main')
+
+        record = loop_manager._record_blocked_resume_head
+
+        def interrupt_after_rebase(*arguments):
+            if arguments[-1] is not None:
+                raise KeyboardInterrupt('after rebase before checkpoint save')
+            return record(*arguments)
+
+        with mock.patch.object(loop_manager, '_record_blocked_resume_head',
+                               side_effect=interrupt_after_rebase):
+            with self.assertRaises(KeyboardInterrupt):
+                loop_manager.resume_blocked_execplan_if_inputs_changed(
+                    self.connection, self.repo, repo_id, 'main', self.state_dir,
+                )
+        pending = execution_checkpoint_state.ExecutionCheckpointRepository(
+            self.connection,
+        ).get(repo_id, 'G-034')
+        self.assertIsNone(pending.snapshot['blocked_resume']['after_head'])
+        resumed = loop_manager.resume_blocked_execplan_if_inputs_changed(
+            self.connection, self.repo, repo_id, 'main', self.state_dir,
+        )
+
+        self.assertTrue(resumed, self.connection.execute(
+            "SELECT last_error FROM exec_plans WHERE repo = ? AND plan_id = 'G-034'",
+            (repo_id,),
+        ).fetchone()[0])
+        plan = self.connection.execute(
+            "SELECT status, publication_remote_oid FROM exec_plans "
+            "WHERE repo = ? AND plan_id = 'G-034'", (repo_id,),
+        ).fetchone()
+        self.assertEqual(tuple(plan), ('READY', published))
+        rebased = self.run_git(self.worktree, 'rev-parse', 'HEAD')
+        self.assertNotEqual(rebased, published)
+        self.assertEqual(self.run_git(self.repo, 'ls-remote', '--heads', 'origin',
+                                      'refs/heads/loop-manager/G-034').split()[0],
+                         published)
+        checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(
+            self.connection,
+        ).get(repo_id, 'G-034')
+        self.assertEqual(checkpoint.snapshot['blocked_resume']['before_head'], published)
+        self.assertEqual(checkpoint.snapshot['blocked_resume']['after_head'], rebased)
+
+        target = self.run_git(self.repo, 'rev-parse', 'refs/remotes/origin/main')
+        runtime_state.RuntimeStateRepository(self.connection).activate(
+            repo_id, 'G-034', activation_sha=target,
+            branch='loop-manager/G-034', worktree=str(self.worktree),
+        )
+        checkpoint_store = execution_checkpoint_state.ExecutionCheckpointRepository(
+            self.connection,
+        )
+        current = checkpoint_store.get(repo_id, 'G-034')
+        checkpoint_store.record(
+            repo_id, 'G-034', expected_generation=current.generation,
+            operation=None, expected_head=rebased, target_base_oid=target,
+            observed_remote_oid=published,
+            snapshot={'reactivated_from_head': published,
+                      'base_oid': target, 'local_head': rebased},
+        )
+        with self.connection:
+            self.connection.execute(
+                "UPDATE exec_plans SET publication_remote_oid = NULL, "
+                "worker_session_id = 'retained-session' "
+                "WHERE repo = ? AND plan_id = 'G-034'", (repo_id,),
+            )
+            self.connection.execute(
+                "UPDATE projects SET publication_remote_oid = NULL, "
+                "phase = 'PROJECT_BLOCKED' WHERE repo = ?", (repo_id,),
+            )
+            self.connection.execute(
+                "INSERT INTO project_blocks "
+                "(repo, scope, reason_code, plan_id, evidence, previous_phase) "
+                "VALUES (?, 'project', 'publication_ownership_uncertain', "
+                "'G-034', 'external_remote_oid', 'WORKING')", (repo_id,),
+            )
+        with mock.patch.object(loop_manager, 'pr_for_branch', return_value=None):
+            self.assertTrue(loop_manager.resume_project_block_if_safe(
+                self.connection, self.repo, self.state_dir, repo_id,
+            ))
+        recovered = self.connection.execute(
+            "SELECT status, publication_remote_oid, worker_session_id "
+            "FROM exec_plans WHERE repo = ? AND plan_id = 'G-034'",
+            (repo_id,),
+        ).fetchone()
+        self.assertEqual(tuple(recovered),
+                         ('IMPLEMENTING', published, 'retained-session'))
+        self.assertIsNone(scoped_blocking.project_block(self.connection, repo_id))
+        restored_checkpoint = checkpoint_store.get(repo_id, 'G-034')
+        self.assertEqual(restored_checkpoint.snapshot['blocked_resume'], {
+            'owner_oid': published, 'before_head': published,
+            'after_head': rebased, 'target_base_oid': target,
+        })
+
     def run_git(self, cwd, *arguments):
         result = subprocess.run(
             ["git", "-C", str(cwd), *arguments],

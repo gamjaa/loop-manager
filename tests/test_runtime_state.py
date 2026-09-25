@@ -12,6 +12,24 @@ from scoped_blocking import BlockReasonCode
 
 
 class RuntimeStateRepositoryTest(unittest.TestCase):
+    def test_activation_projects_owned_checkpoint_remote_oid(self):
+        connection = self._connection()
+        self.addCleanup(connection.close)
+        connection.execute(
+            "UPDATE exec_plans SET publication_remote_oid = ? "
+            "WHERE repo = 'repo' AND plan_id = 'G-047'", ('a' * 40,),
+        )
+        connection.commit()
+
+        activated = runtime_state.RuntimeStateRepository(connection).activate(
+            'repo', 'G-047', activation_sha='base',
+            branch='loop-manager/G-047', worktree='/state/G-047',
+        )
+
+        self.assertEqual(activated.publication_remote_oid, 'a' * 40)
+        project = connection.execute("SELECT * FROM projects WHERE repo = 'repo'").fetchone()
+        self.assertEqual(project['publication_remote_oid'], 'a' * 40)
+
     def test_blocked_requeue_discards_stale_worker_profile_target(self):
         from worker_session import SessionBinding, SessionTransition
 

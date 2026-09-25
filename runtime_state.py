@@ -821,7 +821,7 @@ class RuntimeStateRepository:
             project_values={
                 "active_sha": activation_sha,
                 "validated_base_sha": None,
-                "publication_remote_oid": None,
+                "publication_remote_oid": selected.publication_remote_oid,
                 "pr_conflict_recovery": 0,
                 "pr_conflict_head_oid": None,
                 "pr_conflict_base_oid": None,
