@@ -390,6 +390,9 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 - 프로젝트 완료 알림은 프로젝트별로 관리한다
 - 새로운 PRODUCT/Requirement 변경으로 작업 주기가 시작되고 다시 완료되면 새 완료 알림을 전송한다
 - Requirement archive 이동만으로 완료 알림을 다시 활성화하지 않는다
+- 안정적인 작업 선택에서 Planner가 최신 입력에 추가 작업이 없음을 확인하고 활성 Requirement·비종료 ExecPlan·프로젝트 차단·planning error·활성 또는 due 유지보수 작업이 모두 없을 때만 완료로 판정한다
+- 시작 가능한 계획이 없지만 활성 Requirement 또는 비종료 ExecPlan이 남으면 계획별 dependency 상태, PR Merge 대기, 구조화된 차단 원인과 확인된 사용자 조치, 활성 Requirement의 대기 이유를 결과·로그에 남기고 별도 대기 사건으로 한 번 알린다
+- 실행 가능한 READY, 진행·복구 중인 단계, 일시 오류 대기에는 작업 소진 알림을 만들지 않으며, 기존 BLOCKED 사건만으로 설명되는 상태는 대기 알림을 중복 생성하지 않는다
 
 ### Telegram 알림 조건
 
@@ -399,4 +402,7 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 - 차단 알림에는 scope, 구조화 원인, 관련 ExecPlan, 실제 수정 대상이 확인된 경우에만 그 경로, checkpoint 성공 시 원격 commit link·OID 또는 미게시 시 local-only 보존 이유가 포함돼야 한다
 - 차단 알림은 plan·scope·원인·지문·revision이 같을 때 같은 사건으로 중복 제거한다
 - 프로젝트 완료 알림은 해당 프로젝트의 현재 작업 주기가 완료됐을 때 전송한다
+- 완료 알림에는 Planner의 추가 작업 없음 확인, 활성 Requirement 없음과 마지막 완료 계획을 포함한다
+- 같은 안정적 대기 원인은 재실행·재시작 뒤 중복 알리지 않고, 작업 진행 또는 관련 입력·차단 원인이 바뀐 새 대기 상태는 한 번 다시 알릴 수 있다
+- Telegram이 비활성화되거나 전송에 실패해도 완료·대기 이유는 실행 결과와 로그에 남는다
 - 동일한 이벤트는 한 번만 전송하며 실패한 알림만 다음 실행에서 재시도한다

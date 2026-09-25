@@ -53,6 +53,7 @@ from execution_runtime import (
 )
 from managed_config import ManagedConfig, ManagedConfigError, load_managed_config
 import notifications
+import work_exhaustion
 import reviewer_specification
 import blocked_checkpoint
 import blocked_checkpoint_state
@@ -19069,6 +19070,79 @@ def run_project_result(
             notifications.enqueue_persistent_execution_failure_events(connection, repo)
 
 
+def _stable_work_reason(
+    connection: sqlite3.Connection, repo: str, *,
+    refactoring_review_interval: int,
+) -> work_exhaustion.WorkReasonSnapshot | None:
+    """Confirm that the latest remote selection has no runnable work."""
+
+    row = connection.execute(
+        "SELECT * FROM projects WHERE repo = ?", (repo,),
+    ).fetchone()
+    if row is None or row["phase"] not in {None, "PR_OPEN", "PLAN_BLOCKED"}:
+        return None
+    if row["pr_conflict_recovery"] or row["planning_error"]:
+        return None
+    if not row["planning_fingerprint"]:
+        return None
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'general_planning_publications'"
+    ).fetchone() is not None and connection.execute(
+        "SELECT 1 FROM general_planning_publications WHERE repo = ?", (repo,),
+    ).fetchone() is not None:
+        return None
+    schedule = catalog_schedule_decision(connection, repo)
+    if schedule.active is not None or schedule.runnable_ready is not None:
+        return None
+    maintenance = maintenance_state.MaintenanceRepository(connection)
+    cycle = maintenance.get(repo)
+    if (
+        cycle.phase is not maintenance_state.MaintenancePhase.IDLE
+        or cycle.publication_stage is not None
+        or maintenance.due(
+            repo, refactoring_review_interval,
+            self_repository=is_loop_manager_repository(Path(repo)),
+        ).required
+    ):
+        return None
+    repo_path = Path(repo)
+    revision = f"refs/remotes/origin/{row['base_branch']}"
+    base_sha = git(
+        repo_path, "rev-parse", "--verify", f"{revision}^{{commit}}"
+    ).stdout.strip()
+    current_input = _planning_input_fingerprint(repo_path, base_sha)
+    current_specification = _specification_input_fingerprint(repo_path, base_sha)
+    archive_only = False
+    if current_input != row["planning_fingerprint"] and row["processed_sha"]:
+        archive_only = _is_requirement_archive_only_change(
+            repo_path, str(row["processed_sha"]), base_sha,
+        )
+    if _general_planning_required(row, repo_path, base_sha, current_input):
+        return None
+    if row["specification_fingerprint"] is not None:
+        if (
+            current_specification != row["specification_fingerprint"]
+            and not archive_only
+            and not (
+                row["processed_sha"]
+                and _specification_input_fingerprint(
+                    repo_path, str(row["processed_sha"])
+                ) == current_specification
+            )
+        ):
+            return None
+    active_requirements = tuple(
+        path.decode("utf-8") for path in _git_tree_entries(repo_path, base_sha)
+        if _is_active_requirement(path)
+    )
+    snapshot = work_exhaustion.collect(
+        connection, repo, cycle=str(row["planning_fingerprint"]),
+        active_requirements=active_requirements,
+    )
+    return None if snapshot is not None and snapshot.completed and row["phase"] else snapshot
+
+
 def _run_project_result(
     connection: sqlite3.Connection,
     state_dir: Path,
@@ -19095,6 +19169,24 @@ def _run_project_result(
     pause_detail: str | None = None
     while True:
         if _checkpoint_dispatch_ready(connection, repo):
+            project_before = connection.execute(
+                "SELECT phase, pr_conflict_recovery FROM projects WHERE repo = ?",
+                (repo,),
+            ).fetchone()
+            schedule_before = catalog_schedule_decision(connection, repo)
+            maintenance_before = maintenance_state.MaintenanceRepository(
+                connection
+            ).get(repo)
+            if (
+                schedule_before.active is not None
+                or schedule_before.runnable_ready is not None
+                or project_before["phase"] not in {
+                    None, "PR_OPEN", "PLAN_BLOCKED", "PROJECT_BLOCKED",
+                }
+                or project_before["pr_conflict_recovery"]
+                or maintenance_before.phase is not maintenance_state.MaintenancePhase.IDLE
+            ):
+                notifications.mark_work_available(connection, repo)
             pending_before = (
                 blocked_checkpoint_state.BlockedCheckpointRepository(
                     connection
@@ -19213,7 +19305,7 @@ def _run_project_result(
             break
 
     row = connection.execute(
-        "SELECT phase, last_error FROM projects WHERE repo = ?",
+        "SELECT phase, last_error, planning_error FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
     detail = str(row["last_error"] or "") if row else None
@@ -19224,7 +19316,34 @@ def _run_project_result(
     if step_result == PROJECT_STEP_PLANNING_PENDING:
         return ProjectRunResult(ProjectRunKind.WAITING, 0, detail)
     if row is not None and row["phase"] == "PROJECT_BLOCKED":
-        return ProjectRunResult(ProjectRunKind.BLOCKED, 1, detail)
+        project_block = scoped_blocking.project_block(connection, repo)
+        reason = (
+            f"PROJECT_BLOCKED {project_block['reason_code']}: {project_block['evidence']}"
+            if project_block is not None else detail
+        )
+        operation_log(str(reason), error=True)
+        return ProjectRunResult(ProjectRunKind.BLOCKED, 1, reason)
+    if row is not None and row["planning_error"]:
+        reason = f"planning_error: {row['planning_error']}"
+        operation_log(reason, error=True)
+        return ProjectRunResult(ProjectRunKind.OPERATIONAL_ERROR, 1, reason)
+    snapshot = None
+    if step_result == 0 or (step_result == 1 and connection.execute(
+        "SELECT 1 FROM exec_plans WHERE repo = ? AND status = 'PLAN_BLOCKED' "
+        "LIMIT 1", (repo,),
+    ).fetchone() is not None):
+        snapshot = _stable_work_reason(
+            connection, repo, refactoring_review_interval=refactoring_review_interval,
+        )
+    if snapshot is not None:
+        reason = snapshot.describe()
+        operation_log(f"작업 선택 결과 ({repo}): {reason}")
+        if snapshot.completed and step_result == 0:
+            notifications.enqueue_completion_if_ready(connection, repo, snapshot)
+            return ProjectRunResult(ProjectRunKind.COMPLETED, 0, reason)
+        if not snapshot.completed:
+            notifications.enqueue_waiting_reason(connection, repo, snapshot)
+            return ProjectRunResult(ProjectRunKind.WAITING, 0, reason)
     plan_block = connection.execute(
         "SELECT evidence FROM execplan_blocks WHERE repo = ? "
         "ORDER BY updated_at DESC, plan_id LIMIT 1",
@@ -19244,13 +19363,10 @@ def _run_project_result(
     maintenance_cycle = maintenance_repository.get(repo)
     if (
         maintenance_cycle.phase is not maintenance_state.MaintenancePhase.IDLE
-        or (
-            registered_only
-            and maintenance_repository.due(
-                repo, refactoring_review_interval,
-                self_repository=is_loop_manager_repository(Path(repo)),
-            ).required
-        )
+        or maintenance_repository.due(
+            repo, refactoring_review_interval,
+            self_repository=is_loop_manager_repository(Path(repo)),
+        ).required
     ):
         return ProjectRunResult(ProjectRunKind.WAITING, 0, detail)
     unfinished = connection.execute(
@@ -19263,8 +19379,7 @@ def _run_project_result(
     ).fetchone()
     if unfinished is not None:
         return ProjectRunResult(ProjectRunKind.WAITING, 0, detail)
-    notifications.enqueue_completion_if_ready(connection, repo)
-    return ProjectRunResult(ProjectRunKind.COMPLETED, 0, detail)
+    return ProjectRunResult(ProjectRunKind.WAITING, 0, detail or "Planner 확인 대기")
 
 
 def run_project(

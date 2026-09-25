@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 import sqlite3
 import reviewer_specification
+from work_exhaustion import WorkReasonSnapshot
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
@@ -40,6 +41,14 @@ CREATE TABLE IF NOT EXISTS project_completion_cycles (
     FOREIGN KEY (repo) REFERENCES projects(repo)
 )
 """
+WORK_REASON_SCHEMA = """
+CREATE TABLE IF NOT EXISTS work_reason_episodes (
+    repo TEXT PRIMARY KEY,
+    signature TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    FOREIGN KEY (repo) REFERENCES projects(repo)
+)
+"""
 
 
 def ensure_schema(connection: sqlite3.Connection) -> None:
@@ -66,6 +75,7 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
             "ALTER TABLE notification_outbox ADD COLUMN canceled_at TEXT"
         )
     connection.execute(COMPLETION_SCHEMA)
+    connection.execute(WORK_REASON_SCHEMA)
 
 
 def configure_session(connection: sqlite3.Connection, *, enabled: bool) -> None:
@@ -483,10 +493,13 @@ def record_merged_plan(
     )
 
 
-def enqueue_completion_if_ready(connection: sqlite3.Connection, repo: str) -> bool:
-    """Record one completion event for a Planner-confirmed input cycle."""
+def enqueue_completion_if_ready(
+    connection: sqlite3.Connection, repo: str,
+    snapshot: WorkReasonSnapshot | None = None,
+) -> bool:
+    """Record completion only for an already verified stable selection."""
 
-    if not _enabled(connection):
+    if snapshot is None or not snapshot.completed:
         return False
     ensure_schema(connection)
     project = connection.execute(
@@ -497,22 +510,25 @@ def enqueue_completion_if_ready(connection: sqlite3.Connection, repo: str) -> bo
     has_historical_catalog = connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' "
         "AND name = 'execplan_catalog_history'"
-    ).fetchone()
+    ).fetchone() is not None
     unfinished_query = (
         "SELECT 1 FROM exec_plans WHERE repo = ? AND status != 'MERGED' "
         "AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h "
         "WHERE h.repo = exec_plans.repo AND h.currently_archived = 1 "
         "AND h.plan_id = exec_plans.plan_id) LIMIT 1"
-        if has_historical_catalog
-        else "SELECT 1 FROM exec_plans WHERE repo = ? AND status != 'MERGED' LIMIT 1"
+        if has_historical_catalog else
+        "SELECT 1 FROM exec_plans WHERE repo = ? AND status != 'MERGED' LIMIT 1"
     )
-    unfinished = connection.execute(unfinished_query, (repo,)).fetchone()
     if (
         project is None
         or project[0] is not None
         or not project[1]
+        or str(project[1]) != snapshot.cycle
         or project[2]
-        or unfinished is not None
+        or connection.execute(unfinished_query, (repo,)).fetchone() is not None
+        or connection.execute(
+            "SELECT 1 FROM project_blocks WHERE repo = ?", (repo,),
+        ).fetchone() is not None
     ):
         return False
 
@@ -542,6 +558,9 @@ def enqueue_completion_if_ready(connection: sqlite3.Connection, repo: str) -> bo
             last_id, last_title = str(latest[0]), str(latest[1])
     last_title = last_title or "Planner confirmed no additional work"
     with connection:
+        _cancel_pending_waiting(connection, repo)
+        if not _enabled(connection):
+            return False
         connection.execute(
             """
             INSERT INTO project_completion_cycles (repo, cycle_key, completed_at)
@@ -559,6 +578,7 @@ def enqueue_completion_if_ready(connection: sqlite3.Connection, repo: str) -> bo
             "project_completed",
             {
                 "project": Path(repo).name or repo,
+                "reason": snapshot.describe(),
                 "last_completed_plan_id": last_id,
                 "last_completed_title": last_title,
             },
@@ -566,7 +586,85 @@ def enqueue_completion_if_ready(connection: sqlite3.Connection, repo: str) -> bo
     return True
 
 
+def _cancel_pending_waiting(connection: sqlite3.Connection, repo: str) -> None:
+    connection.execute(
+        "UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP "
+        "WHERE repo = ? AND event_type = 'work_waiting' "
+        "AND sent_at IS NULL AND canceled_at IS NULL",
+        (repo,),
+    )
+
+
+def mark_work_available(connection: sqlite3.Connection, repo: str) -> None:
+    """End a waiting incident when selection can proceed again."""
+
+    ensure_schema(connection)
+    with connection:
+        connection.execute(
+            "UPDATE work_reason_episodes SET signature = '__work_available__' "
+            "WHERE repo = ? AND signature != '__work_available__'", (repo,),
+        )
+        _cancel_pending_waiting(connection, repo)
+
+
+def enqueue_waiting_reason(
+    connection: sqlite3.Connection, repo: str, snapshot: WorkReasonSnapshot,
+) -> bool:
+    """Create one waiting incident per stable cause and cause transition."""
+
+    if snapshot.completed:
+        return False
+    ensure_schema(connection)
+    payload = snapshot.payload(Path(repo).name or repo)
+    signature = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                   separators=(",", ":")).encode()
+    ).hexdigest()
+    with connection:
+        previous = connection.execute(
+            "SELECT signature, generation FROM work_reason_episodes WHERE repo = ?",
+            (repo,),
+        ).fetchone()
+        generation = (
+            int(previous[1]) if previous and previous[0] == signature
+            else int(previous[1]) + 1 if previous else 1
+        )
+        connection.execute(
+            "INSERT INTO work_reason_episodes (repo, signature, generation) "
+            "VALUES (?, ?, ?) ON CONFLICT(repo) DO UPDATE SET "
+            "signature = excluded.signature, generation = excluded.generation",
+            (repo, signature, generation),
+        )
+        if not snapshot.has_distinct_wait:
+            _cancel_pending_waiting(connection, repo)
+            return False
+        event_key = _key("waiting", repo, f"{generation}\0{signature}")
+        connection.execute(
+            "UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP "
+            "WHERE repo = ? AND event_type = 'work_waiting' "
+            "AND event_key != ? AND sent_at IS NULL AND canceled_at IS NULL",
+            (repo, event_key),
+        )
+        if not _enabled(connection):
+            return False
+        _insert(connection, event_key, repo, "work_waiting", payload)
+    return True
+
+
 def _message(kind: str, payload: dict[str, object]) -> str:
+    if kind == "work_waiting":
+        lines = [f"[{payload['project']}] 다음 작업 대기"]
+        for plan in payload["plans"]:
+            lines.append(f"- {plan['id']} {plan['title']}: {plan['reason']}")
+            if plan.get("action_targets"):
+                lines.append("  사용자 확인 대상: " + ", ".join(plan["action_targets"]))
+        for requirement in payload["requirements"]:
+            lines.append(f"- {requirement['id']}: {requirement['reason']}")
+        if payload.get("project_block"):
+            lines.append("PROJECT_BLOCKED: " + payload["project_block"]["reason"])
+        if payload.get("planning_error"):
+            lines.append("planning_error: " + str(payload["planning_error"]))
+        return "\n".join(lines)
     if kind == "pr_created":
         return (
             f"[{payload['project']}] PR created\n"
@@ -628,7 +726,9 @@ def _message(kind: str, payload: dict[str, object]) -> str:
             + f"\nAction: {payload['required_action']}"
         )
     return (
-        f"[{payload['project']}] Project complete\nLast completed work: "
+        f"[{payload['project']}] Project complete\n"
+        f"{payload.get('reason', 'Planner confirmed no additional work.')}\n"
+        "Last completed work: "
         f"{payload.get('last_completed_plan_id') or '-'} "
         f"{payload['last_completed_title']}"
     )
