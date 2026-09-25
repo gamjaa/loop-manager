@@ -5177,6 +5177,7 @@ def _migrate_execplan_catalog(
     *,
     reconcile_history: bool,
     target_repo: str | None,
+    manage_transaction: bool = True,
 ) -> None:
     phase_status = {
         "WORKING": "IMPLEMENTING",
@@ -5194,7 +5195,7 @@ def _migrate_execplan_catalog(
         parameters = (target_repo,)
     projects = connection.execute(query, parameters).fetchall()
 
-    with connection:
+    with connection if manage_transaction else contextlib.nullcontext():
         for project in projects:
             if project["phase"] == "PLANNING":
                 continue
@@ -5393,6 +5394,7 @@ def migrate_legacy_execplans(
     reconcile_history: bool = False,
     target_repo: str | None = None,
     ensure_schema: bool = True,
+    manage_transaction: bool = True,
 ) -> None:
     """Conservatively move legacy project-owned execution state into the catalog."""
 
@@ -5402,8 +5404,9 @@ def migrate_legacy_execplans(
         connection,
         reconcile_history=reconcile_history,
         target_repo=target_repo,
+        manage_transaction=manage_transaction,
     )
-    with connection:
+    with connection if manage_transaction else contextlib.nullcontext():
         scoped_blocking.migrate_legacy_blocks(connection)
     return
 
@@ -6115,45 +6118,54 @@ def add_registered_project(
         agents_approved=inspection.agents_approved,
         origin=inspection.origin,
     )
-    project_registry.add_project(connection, project)
-    if inspection.root.is_dir():
-        current_sha = git(
-            inspection.root, "rev-parse", "--verify",
-            f"refs/remotes/origin/{project.base_branch}^{{commit}}",
-        ).stdout.strip()
-        source_sha = inspection.source_revision or current_sha
-        if current_sha != source_sha:
-            raise RuntimeError("등록 중 원격 source revision이 변경됐습니다.")
-        migrate_legacy_execplans(
-            connection,
-            reconcile_history=True,
-            target_repo=project.repo,
-        )
-        snapshot = revision_execplan_snapshot(
-            inspection.root, source_sha,
-            archive_conflict_plan_ids=_merged_execplan_ids(connection, project.repo),
-        )
-        current_sha = git(
-            inspection.root, "rev-parse", "--verify",
-            f"refs/remotes/origin/{project.base_branch}^{{commit}}",
-        ).stdout.strip()
-        if current_sha != source_sha:
-            raise RuntimeError("등록 중 원격 ExecPlan catalog revision이 변경됐습니다.")
-        connection.execute(
-            "INSERT INTO execplan_catalog_revisions "
-            "(repo, revision_sha, catalog_fingerprint) VALUES (?, ?, ?) "
-            "ON CONFLICT(repo) DO UPDATE SET "
-            "revision_sha = excluded.revision_sha, "
-            "catalog_fingerprint = excluded.catalog_fingerprint",
-            (project.repo, source_sha,
-             execplan_catalog_state._catalog_fingerprint(snapshot)),
-        )
-        repository = maintenance_state.MaintenanceRepository(connection)
-        repository.initialize_file_assessment_start(
-            project.repo,
-            source_sha=source_sha,
-            expected_merged_count=repository.merged_count(project.repo),
-        )
+    # Schema migration is independent of registration and may commit. Finish it
+    # before the registration transaction so a stale remote revision can roll
+    # back the registry row together with recovered catalog and baseline data.
+    project_registry.ensure_registry_schema(connection)
+    _ensure_execplans_schema(connection)
+    maintenance_state.ensure_schema(connection)
+    with runtime_state._transaction(connection):
+        project_registry.add_project(connection, project, manage_transaction=False)
+        if inspection.root.is_dir():
+            current_sha = git(
+                inspection.root, "rev-parse", "--verify",
+                f"refs/remotes/origin/{project.base_branch}^{{commit}}",
+            ).stdout.strip()
+            source_sha = inspection.source_revision or current_sha
+            if current_sha != source_sha:
+                raise RuntimeError("등록 중 원격 source revision이 변경됐습니다.")
+            migrate_legacy_execplans(
+                connection,
+                reconcile_history=True,
+                target_repo=project.repo,
+                ensure_schema=False,
+                manage_transaction=False,
+            )
+            snapshot = revision_execplan_snapshot(
+                inspection.root, source_sha,
+                archive_conflict_plan_ids=_merged_execplan_ids(connection, project.repo),
+            )
+            current_sha = git(
+                inspection.root, "rev-parse", "--verify",
+                f"refs/remotes/origin/{project.base_branch}^{{commit}}",
+            ).stdout.strip()
+            if current_sha != source_sha:
+                raise RuntimeError("등록 중 원격 ExecPlan catalog revision이 변경됐습니다.")
+            connection.execute(
+                "INSERT INTO execplan_catalog_revisions "
+                "(repo, revision_sha, catalog_fingerprint) VALUES (?, ?, ?) "
+                "ON CONFLICT(repo) DO UPDATE SET "
+                "revision_sha = excluded.revision_sha, "
+                "catalog_fingerprint = excluded.catalog_fingerprint",
+                (project.repo, source_sha,
+                 execplan_catalog_state._catalog_fingerprint(snapshot)),
+            )
+            repository = maintenance_state.MaintenanceRepository(connection)
+            repository.initialize_file_assessment_start(
+                project.repo,
+                source_sha=source_sha,
+                expected_merged_count=repository.merged_count(project.repo),
+            )
     return project
 
 

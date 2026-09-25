@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import nullcontext
 import sqlite3
 
 
@@ -78,7 +79,12 @@ def list_projects(connection: sqlite3.Connection) -> tuple[RegisteredProject, ..
     )
 
 
-def add_project(connection: sqlite3.Connection, project: RegisteredProject) -> None:
+def add_project(
+    connection: sqlite3.Connection,
+    project: RegisteredProject,
+    *,
+    manage_transaction: bool = True,
+) -> None:
     ensure_registry_schema(connection)
     existing = connection.execute(
         "SELECT registered FROM projects WHERE repo = ?",
@@ -87,7 +93,7 @@ def add_project(connection: sqlite3.Connection, project: RegisteredProject) -> N
     if existing is not None and int(existing["registered"]) == 1:
         raise ProjectRegistryError(f"이미 등록된 프로젝트입니다: {project.repo}")
 
-    with connection:
+    with connection if manage_transaction else nullcontext():
         if existing is None:
             connection.execute(
                 """
