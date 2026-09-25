@@ -235,6 +235,32 @@ CREATE TABLE IF NOT EXISTS cleanup_pending (
 )
 """
 
+MERGED_WORKTREE_CLEANUP_SCHEMA = """
+CREATE TABLE IF NOT EXISTS merged_worktree_cleanups (
+    repo TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    worktree TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    registration TEXT NOT NULL,
+    pr_head_oid TEXT NOT NULL,
+    PRIMARY KEY (repo, plan_id),
+    FOREIGN KEY (repo, plan_id) REFERENCES exec_plans(repo, plan_id)
+)
+"""
+
+MANAGER_BASE_FETCH_SCHEMA = """
+CREATE TABLE IF NOT EXISTS manager_base_fetches (
+    id INTEGER PRIMARY KEY,
+    repo TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    refname TEXT NOT NULL,
+    before_ref TEXT,
+    target_oid TEXT NOT NULL,
+    action_token TEXT,
+    phase TEXT NOT NULL
+)
+"""
+
 EXEC_PLANS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS exec_plans (
     repo TEXT NOT NULL,
@@ -10142,6 +10168,8 @@ def remove_cleanup_worktree(
 
 def _ensure_cleanup_pending_schema(connection: sqlite3.Connection) -> None:
     connection.execute(CLEANUP_PENDING_SCHEMA)
+    connection.execute(MERGED_WORKTREE_CLEANUP_SCHEMA)
+    connection.execute(MANAGER_BASE_FETCH_SCHEMA)
     columns = {
         row[1] for row in connection.execute("PRAGMA table_info(cleanup_pending)")
     }
@@ -10149,6 +10177,13 @@ def _ensure_cleanup_pending_schema(connection: sqlite3.Connection) -> None:
         connection.execute(
             "ALTER TABLE cleanup_pending ADD COLUMN workspace_owned "
             "INTEGER NOT NULL DEFAULT 1"
+        )
+    fetch_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(manager_base_fetches)")
+    }
+    if "action_token" not in fetch_columns:
+        connection.execute(
+            "ALTER TABLE manager_base_fetches ADD COLUMN action_token TEXT"
         )
 
 
@@ -12294,7 +12329,36 @@ def validate_persisted_agent_scope(
         )
 
     current = capture_git_snapshot(saved_worktree)
+    proven_cleanups = _proven_merged_cleanup_paths(
+        connection, repo, before, current,
+    )
+    manager_cleanup_worktrees |= proven_cleanups
     phase = str(project["phase"] or "")
+    guidance_ref_allowances: frozenset[str] | None = None
+    if phase == "PLAN_BLOCKED" and role_name == "worker":
+        plan_id = _plan_id_from_path(selected_plan_path)
+        plan_row = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+            (repo, plan_id),
+        ).fetchone() if plan_id else None
+        if plan_row is not None and plan_row["blocked_reason"] == GUIDANCE_BLOCK_REASON:
+            owned = set(_proven_manager_base_refs(
+                connection, repo_path, repo, plan_id, before, current,
+            ))
+            checkpoint_row = connection.execute(
+                "SELECT 1 FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?",
+                (repo, plan_id),
+            ).fetchone()
+            if checkpoint_row is not None:
+                request = blocked_checkpoint_state.BlockedCheckpointRepository(connection).get(
+                    repo, plan_id,
+                )
+                if _owned_checkpoint_remote_oid(
+                    connection, repo_path, request, plan_row, current,
+                ) is not None:
+                    owned.add(f"refs/remotes/origin/{plan_row['branch']}")
+                    owned.add(f"refs/heads/{plan_row['branch']}")
+            guidance_ref_allowances = frozenset(owned)
     result: GitSnapshot | None = None
     checkpoint: ManagerGitCheckpoint | None = None
     if allow_planner_worktree_correction and project["agent_result_snapshot"]:
@@ -12393,6 +12457,13 @@ def validate_persisted_agent_scope(
         )
     for check in decision.checks:
         try:
+            check_refs = check.allowed_refs
+            check_worktrees = check.allowed_worktrees
+            if guidance_ref_allowances is not None:
+                check_refs &= guidance_ref_allowances
+                check_worktrees = (
+                    check_worktrees & (proven_cleanups | frozenset((str(_canonical_path(saved_worktree)),)))
+                ) | proven_cleanups
             validate_agent_scope(
                 check.role,
                 saved_worktree,
@@ -12407,8 +12478,8 @@ def validate_persisted_agent_scope(
                 allow_common_plans=(
                     allow_common_plans if check.role == "worker" else False
                 ),
-                allowed_ref_changes=check.allowed_refs,
-                allowed_worktree_changes=check.allowed_worktrees,
+                allowed_ref_changes=check_refs,
+                allowed_worktree_changes=check_worktrees,
                 external_worktree=repo_path,
                 base_branch=str(project["base_branch"]),
             )
@@ -12536,6 +12607,36 @@ def validate_blocked_agent_scope(
     scope_before = before
     allowed_ref_changes: frozenset[str] = frozenset()
     allowed_worktree_changes: frozenset[str] = frozenset()
+    allowed_worktree_changes |= _proven_merged_cleanup_paths(
+        connection, repo, before, current,
+    )
+    plan_id = _plan_id_from_path(selected_plan_path)
+    has_execplans = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'exec_plans'"
+    ).fetchone() is not None
+    guidance_plan = connection.execute(
+        "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+        (repo, plan_id),
+    ).fetchone() if plan_id and has_execplans else None
+    if plan_id is not None:
+        allowed_ref_changes |= _proven_manager_base_refs(
+            connection, repo_path, repo, plan_id, before, current,
+        )
+    if guidance_plan is not None and guidance_plan["blocked_reason"] == GUIDANCE_BLOCK_REASON:
+        checkpoint_row = connection.execute(
+            "SELECT 1 FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?",
+            (repo, plan_id),
+        ).fetchone()
+        if checkpoint_row is not None:
+            request = blocked_checkpoint_state.BlockedCheckpointRepository(connection).get(
+                repo, plan_id,
+            )
+            if _owned_checkpoint_remote_oid(
+                connection, repo_path, request, guidance_plan, current,
+            ) is not None:
+                allowed_ref_changes |= frozenset((
+                    f"refs/remotes/origin/{guidance_plan['branch']}",
+                ))
     if project["agent_manager_snapshot"]:
         try:
             manager_checkpoint = ManagerGitCheckpoint.deserialize(
@@ -12545,7 +12646,8 @@ def validate_blocked_agent_scope(
             raise AgentScopeError(
                 f"저장된 BLOCKED Manager Git checkpoint가 유효하지 않습니다: {error}"
             ) from error
-        allowed_worktree_changes |= manager_checkpoint.cleanup_worktrees
+        if guidance_plan is None or guidance_plan["blocked_reason"] != GUIDANCE_BLOCK_REASON:
+            allowed_worktree_changes |= manager_checkpoint.cleanup_worktrees
     result_serialized = project["agent_result_snapshot"]
     if result_serialized:
         try:
@@ -12578,16 +12680,20 @@ def validate_blocked_agent_scope(
                 worktree,
                 scope_before,
             )
-            manager_ref_candidates = frozenset(
-                {f"refs/heads/{base}"}
-                | {
-                    refname
-                    for refname in set(before.refs) | set(current.refs)
-                    if refname.startswith("refs/remotes/origin/")
-                    or refname.startswith("refs/tags/")
-                }
+            manager_ref_candidates = (
+                frozenset()
+                if guidance_plan is not None and guidance_plan["blocked_reason"] == GUIDANCE_BLOCK_REASON
+                else frozenset(
+                    {f"refs/heads/{base}"}
+                    | {
+                        refname
+                        for refname in set(before.refs) | set(current.refs)
+                        if refname.startswith("refs/remotes/origin/")
+                        or refname.startswith("refs/tags/")
+                    }
+                )
             )
-            allowed_ref_changes = _metadata_changes_after_block(
+            allowed_ref_changes |= _metadata_changes_after_block(
                 before.refs,
                 blocked_result.refs,
                 current.refs,
@@ -13749,6 +13855,230 @@ def resume_blocked_execplan_if_inputs_changed(
     return True
 
 
+def _record_merged_worktree_cleanup(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    repo: str,
+    plan_id: str,
+    worktree: Path,
+    branch: str,
+    pr_head_oid: str | None,
+    assessment: CleanupAssessment,
+    registration: tuple[str, ...] | None,
+) -> None:
+    """Save only a completed removal of a validated Merge workspace."""
+    if assessment.status != "safe" or not registration or not pr_head_oid:
+        return
+    key = str(_canonical_path(worktree))
+    if (
+        f"branch=refs/heads/{branch}" not in registration
+        or capture_git_snapshot(repo_path).worktrees.get(key) is not None
+        or worktree.exists() or worktree.is_symlink()
+    ):
+        raise WorkspaceOwnershipError("Merge cleanup 뒤 worktree 제거를 확인할 수 없습니다.")
+    _ensure_cleanup_pending_schema(connection)
+    connection.execute(
+        "INSERT OR REPLACE INTO merged_worktree_cleanups "
+        "(repo, plan_id, worktree, branch, registration, pr_head_oid) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (repo, plan_id, key, branch, json.dumps(registration), pr_head_oid),
+    )
+
+
+def _proven_merged_cleanup_paths(
+    connection: sqlite3.Connection,
+    repo: str,
+    before: GitSnapshot,
+    current: GitSnapshot,
+) -> frozenset[str]:
+    """Allow only the exact registration removed by a recorded Merge cleanup."""
+    _ensure_cleanup_pending_schema(connection)
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'exec_plans'"
+    ).fetchone() is None:
+        return frozenset()
+    proven: set[str] = set()
+    for row in connection.execute(
+        "SELECT c.*, p.status, p.branch AS plan_branch, p.worktree AS plan_worktree, "
+        "p.workspace_owned, p.pr_head_oid AS plan_pr_head_oid "
+        "FROM merged_worktree_cleanups c JOIN exec_plans p "
+        "ON p.repo = c.repo AND p.plan_id = c.plan_id WHERE c.repo = ?",
+        (repo,),
+    ):
+        path = str(row["worktree"])
+        try:
+            registration = tuple(json.loads(str(row["registration"])))
+        except (TypeError, ValueError):
+            continue
+        if (
+            row["status"] == "MERGED"
+            and int(row["workspace_owned"] or 0) == WORKSPACE_OWNED
+            and str(row["plan_branch"] or "") == row["branch"]
+            and str(_canonical_path(Path(str(row["plan_worktree"] or "")))) == path
+            and row["pr_head_oid"] == row["plan_pr_head_oid"]
+            and before.worktrees.get(path) == registration
+            and current.worktrees.get(path) is None
+            and not Path(path).exists()
+            and not Path(path).is_symlink()
+        ):
+            proven.add(path)
+    return frozenset(proven)
+
+
+def _record_manager_base_fetch_intent(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    repo: str,
+    plan_id: str,
+    base: str,
+    before: GitSnapshot,
+) -> int:
+    """Persist the exact base ref we intend to fetch before changing Git refs."""
+    refname = f"refs/remotes/origin/{base}"
+    remote = git(
+        repo_path, "ls-remote", "--heads", "origin", f"refs/heads/{base}",
+        check=False,
+    )
+    rows = [line.split() for line in remote.stdout.splitlines() if line.strip()]
+    if remote.returncode or len(rows) != 1 or rows[0][1:] != [f"refs/heads/{base}"]:
+        raise RuntimeError("Manager base fetch의 원격 OID를 확정할 수 없습니다.")
+    target = rows[0][0]
+    if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", target) is None:
+        raise RuntimeError("Manager base fetch 원격 OID가 유효하지 않습니다.")
+    _ensure_cleanup_pending_schema(connection)
+    with connection:
+        cursor = connection.execute(
+            "INSERT INTO manager_base_fetches "
+            "(repo, plan_id, refname, before_ref, target_oid, action_token, phase) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'pending')",
+            (repo, plan_id, refname, json.dumps(before.refs.get(refname)),
+             target, secrets.token_hex(16)),
+        )
+    return int(cursor.lastrowid)
+
+
+def _manager_base_fetch_applied(repo_path: Path, row: sqlite3.Row) -> bool:
+    """Check the Git record of this exact Manager ref update after a crash."""
+    token = str(row["action_token"] or "")
+    if not re.fullmatch(r"[0-9a-f]{32}", token):
+        return False
+    # Later Manager fetches can move this entry away from the reflog tip.
+    # Match the exact action and target in retained history; the caller still
+    # requires an unbroken intent chain from the saved snapshot to current refs.
+    reflog = git(
+        repo_path, "reflog", "show", "--format=%H%x00%gs",
+        str(row["refname"]), check=False,
+    )
+    return (
+        reflog.returncode == 0
+        and f"{row['target_oid']}\x00loop-manager-base-fetch:{token}"
+        in reflog.stdout.splitlines()
+    )
+
+
+def _perform_manager_base_fetch(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    intent_id: int,
+    base: str,
+) -> str:
+    """Fetch the object, then update only the intended tracking ref with CAS."""
+    row = connection.execute(
+        "SELECT * FROM manager_base_fetches WHERE id = ? AND phase = 'pending'",
+        (intent_id,),
+    ).fetchone()
+    if row is None or row["refname"] != f"refs/remotes/origin/{base}":
+        raise RuntimeError("Manager base fetch intent가 현재 base와 다릅니다.")
+    token = str(row["action_token"] or "")
+    if not re.fullmatch(r"[0-9a-f]{32}", token):
+        raise RuntimeError("Manager base fetch action token이 유효하지 않습니다.")
+    try:
+        previous = json.loads(str(row["before_ref"]))
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("Manager base fetch 이전 ref가 유효하지 않습니다.") from error
+    if previous is not None and (
+        not isinstance(previous, list) or len(previous) != 2
+        or previous[1] != ""
+        or not isinstance(previous[0], str)
+        or not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", previous[0])
+    ):
+        raise RuntimeError("Manager base fetch 이전 ref가 유효하지 않습니다.")
+    target = str(row["target_oid"])
+    git(repo_path, "fetch", "--no-tags", "--refmap=", "origin",
+        f"refs/heads/{base}")
+    fetched = git(repo_path, "rev-parse", "--verify", "FETCH_HEAD^{commit}").stdout.strip()
+    if fetched != target:
+        raise RuntimeError("Manager base fetch 원격 OID가 저장된 intent와 다릅니다.")
+    git(
+        repo_path, "update-ref", "--create-reflog", "-m",
+        f"loop-manager-base-fetch:{token}", str(row["refname"]), target,
+        previous[0] if previous is not None else "0" * len(target),
+    )
+    return base
+
+
+def _finish_manager_base_fetch(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    intent_id: int,
+) -> None:
+    row = connection.execute(
+        "SELECT * FROM manager_base_fetches WHERE id = ?",
+        (intent_id,),
+    ).fetchone()
+    if row is None or git(repo_path, "rev-parse", str(row["refname"])).stdout.strip() != row["target_oid"]:
+        raise RuntimeError("Manager base fetch 결과가 저장된 원격 OID와 다릅니다.")
+    try:
+        previous = json.loads(str(row["before_ref"]))
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("Manager base fetch 이전 ref가 유효하지 않습니다.") from error
+    if previous != [row["target_oid"], ""] and not _manager_base_fetch_applied(repo_path, row):
+        raise RuntimeError("Manager base fetch의 ref 갱신 증거가 없습니다.")
+    with connection:
+        connection.execute(
+            "UPDATE manager_base_fetches SET phase = 'complete' WHERE id = ?",
+            (intent_id,),
+        )
+
+
+def _proven_manager_base_refs(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    repo: str,
+    plan_id: str,
+    before: GitSnapshot,
+    current: GitSnapshot,
+) -> frozenset[str]:
+    """Follow completed fetches or an interrupted fetch with its Git action."""
+    _ensure_cleanup_pending_schema(connection)
+    proven: set[str] = set()
+    rows = connection.execute(
+        "SELECT id, refname, before_ref, target_oid, action_token, phase "
+        "FROM manager_base_fetches "
+        "WHERE repo = ? AND plan_id = ? AND phase IN ('pending', 'complete') "
+        "ORDER BY id",
+        (repo, plan_id),
+    ).fetchall()
+    for refname in {str(row["refname"]) for row in rows}:
+        cursor = before.refs.get(refname)
+        for row in rows:
+            if row["refname"] != refname:
+                continue
+            try:
+                previous = json.loads(str(row["before_ref"]))
+            except (TypeError, ValueError):
+                continue
+            previous = tuple(previous) if previous is not None else None
+            if previous == cursor and (
+                row["phase"] == "complete"
+                or _manager_base_fetch_applied(repo_path, row)
+            ):
+                cursor = (str(row["target_oid"]), "")
+        if cursor is not None and cursor == current.refs.get(refname):
+            proven.add(refname)
+    return frozenset(proven)
+
+
 def complete_merged_worktree(
     connection: sqlite3.Connection,
     repo_path: Path,
@@ -13778,6 +14108,7 @@ def complete_merged_worktree(
             f"Merge cleanup ExecPlan을 찾을 수 없습니다: {plan_id}"
         )
     workspace_owned = WORKSPACE_OWNED
+    cleanup_registration: tuple[str, ...] | None = None
     worktree_present = worktree.exists() or worktree.is_symlink()
     if not worktree_present:
         assessment = CleanupAssessment("missing")
@@ -13810,6 +14141,10 @@ def complete_merged_worktree(
             )
         else:
             assessment = assess_cleanup(worktree, pr_head_oid)
+            if assessment.status == "safe":
+                cleanup_registration = capture_git_snapshot(repo_path).worktrees.get(
+                    str(_canonical_path(worktree))
+                )
             assessment = remove_cleanup_worktree(repo_path, worktree, assessment)
     with connection:
         _ensure_execplans_schema(connection)
@@ -13848,6 +14183,10 @@ def complete_merged_worktree(
             project_values=project_values,
             enqueue=False,
         )
+        _record_merged_worktree_cleanup(
+            connection, repo_path, repo, plan_id, worktree, branch,
+            pr_head_oid, assessment, cleanup_registration,
+        )
         notifications.record_merged_plan(connection, repo, plan_id, str(plan["title"]))
     return assessment
 
@@ -13867,6 +14206,7 @@ def complete_merged_execplan_worktree(
     branch = str(plan["branch"] or "")
     worktree = Path(str(plan["worktree"] or ""))
     workspace_owned = WORKSPACE_OWNED
+    cleanup_registration: tuple[str, ...] | None = None
     if not (worktree.exists() or worktree.is_symlink()):
         assessment = CleanupAssessment("missing")
     elif int(plan["workspace_owned"]) != WORKSPACE_OWNED:
@@ -13893,10 +14233,15 @@ def complete_merged_execplan_worktree(
                 f"Merge cleanup workspace 소유권 검증 실패: {error}",
             )
         else:
+            assessment = assess_cleanup(worktree, pr_head_oid)
+            if assessment.status == "safe":
+                cleanup_registration = capture_git_snapshot(repo_path).worktrees.get(
+                    str(_canonical_path(worktree))
+                )
             assessment = remove_cleanup_worktree(
                 repo_path,
                 worktree,
-                assess_cleanup(worktree, pr_head_oid),
+                assessment,
             )
 
     with connection:
@@ -13939,6 +14284,10 @@ def complete_merged_execplan_worktree(
             plan_id,
             project_values=project_values,
             enqueue=False,
+        )
+        _record_merged_worktree_cleanup(
+            connection, repo_path, repo, plan_id, worktree, branch,
+            pr_head_oid, assessment, cleanup_registration,
         )
         scoped_blocking.clear_plan_block(connection, repo, str(plan["plan_id"]))
         notifications.record_merged_plan(
@@ -14191,6 +14540,170 @@ def synchronize_waiting_pull_requests(
     )
 
 
+def _reconcile_guidance_double_block(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    state_dir: Path,
+    repo: str,
+    block: sqlite3.Row,
+    project: sqlite3.Row,
+    plan: sqlite3.Row,
+) -> bool:
+    """Restore a published guidance wait only from independent Git and DB proof."""
+    false_positive_reasons = {
+        BlockReasonCode.MANAGED_WORKTREE_SCOPE_VIOLATION.value,
+        BlockReasonCode.SHARED_REF_MUTATION.value,
+        BlockReasonCode.OUTSIDE_MANAGED_WORKTREE_MUTATION.value,
+        BlockReasonCode.REPOSITORY_STATE_UNSAFE.value,
+    }
+    if (
+        block["reason_code"] not in false_positive_reasons
+        or plan["status"] != "PLAN_BLOCKED"
+        or plan["blocked_reason"] not in false_positive_reasons | {GUIDANCE_BLOCK_REASON}
+        or plan["agent_role"] != "worker"
+        or not plan["guidance_plan_hash"]
+        or not plan["publication_remote_oid"]
+        or not plan["worker_session_id"]
+        or project["plan_path"] != plan["path"]
+        or project["branch"] != plan["branch"]
+        or project["worktree"] != plan["worktree"]
+        or project["agent_role"] != "worker"
+        or project["agent_snapshot"] != plan["agent_snapshot"]
+        or project["worker_session_id"] != plan["worker_session_id"]
+        or int(plan["workspace_owned"] or 0) != WORKSPACE_OWNED
+    ):
+        return False
+    checkpoint = connection.execute(
+        "SELECT * FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?",
+        (repo, plan["plan_id"]),
+    ).fetchone()
+    recorded_block = connection.execute(
+        "SELECT * FROM execplan_blocks WHERE repo = ? AND plan_id = ?",
+        (repo, plan["plan_id"]),
+    ).fetchone()
+    if checkpoint is None or recorded_block is None:
+        return False
+    branch = str(plan["branch"])
+    worktree = Path(str(plan["worktree"]))
+    oid = str(plan["publication_remote_oid"])
+    try:
+        validate_execplan_workspace_identity(
+            state_dir, repo, str(plan["plan_id"]), branch, worktree,
+        )
+        validate_managed_worktree(repo_path, worktree, branch)
+        before = GitSnapshot.deserialize(str(plan["agent_snapshot"]))
+        current = capture_git_snapshot(worktree)
+        request = blocked_checkpoint_state.BlockedCheckpointRepository(connection).get(
+            repo, str(plan["plan_id"]),
+        )
+        if _owned_checkpoint_remote_oid(connection, repo_path, request, plan, current) != oid:
+            raise ValueError("게시 OID와 원격 head가 일치하지 않습니다.")
+        evidence = _guidance_checkpoint_commit_evidence(
+            repo_path, str(plan["plan_id"]), oid,
+        )
+        if evidence is None:
+            raise ValueError("guidance checkpoint commit identity 또는 tree가 유효하지 않습니다.")
+        document = _guidance_document(worktree, str(plan["path"]))
+        rows = _guidance_rows(connection, repo, str(plan["plan_id"]))
+        if (
+            document is None or document.structure_hash != plan["guidance_plan_hash"]
+            or not rows or any(row["applied"] or row["invalidated_decision_hash"] for row in rows)
+        ):
+            raise ValueError("guidance 제안 또는 승인 대기 상태가 변경됐습니다.")
+        proposals, new = _guidance_document_matches_rows(
+            document, rows, require_decisions=False,
+        )
+        if new or any(
+            row["decision_hash"]
+            and proposals[str(row["proposal_id"])].decision.identity != row["decision_hash"]
+            for row in rows
+        ):
+            raise ValueError("guidance User Decision과 저장된 증거가 다릅니다.")
+        for target in {str(row["target_path"]) for row in rows}:
+            row = next(row for row in rows if row["target_path"] == target)
+            if _guidance_target_state(worktree, target) != (
+                bytes(row["baseline_content"]), int(row["baseline_mode"]),
+            ):
+                raise ValueError(f"승인 전 AGENTS.md 내용이 변경됐습니다: {target}")
+        own_path = str(_canonical_path(worktree))
+        cleaned = _proven_merged_cleanup_paths(connection, repo, before, current)
+        fetched_refs = _proven_manager_base_refs(
+            connection, repo_path, repo, str(plan["plan_id"]), before, current,
+        )
+        remote_ref = f"refs/remotes/origin/{branch}"
+        own_ref = f"refs/heads/{branch}"
+        if (
+            not before.shared_metadata_complete or not current.shared_metadata_complete
+            or before.head != oid or current.head != oid
+            or before.branch != branch or current.branch != branch
+            or before.index != current.index
+            or before.config != current.config
+            or before.operations != current.operations
+            or any(path != str(plan["path"]) for path in current.dirty)
+            or any(
+                before.refs.get(name) != current.refs.get(name)
+                for name in before.refs.keys() | current.refs.keys()
+                if name not in {remote_ref, own_ref} | fetched_refs
+                and not name.startswith("refs/codex/turn-diffs/")
+            )
+            or any(
+                before.worktrees.get(path) != current.worktrees.get(path)
+                for path in before.worktrees.keys() | current.worktrees.keys()
+                if path not in cleaned | {own_path}
+            )
+        ):
+            raise ValueError("저장된 Worker snapshot 밖의 Git 변경이 있습니다.")
+        if before.worktrees.get(own_path) != current.worktrees.get(own_path):
+            raise ValueError("guidance worktree 등록이 변경됐습니다.")
+        if checkpoint["phase"] == "published" and checkpoint["published_oid"] != oid:
+            raise ValueError("저장된 checkpoint 게시 OID가 다릅니다.")
+        if checkpoint["phase"] == "published" and checkpoint["reason_code"] not in false_positive_reasons | {GUIDANCE_BLOCK_REASON}:
+            raise ValueError("저장된 checkpoint 차단 원인이 guidance와 무관합니다.")
+        if checkpoint["phase"] != "published" and checkpoint["reason_code"] not in false_positive_reasons:
+            raise ValueError("교체된 checkpoint 원인의 소유권을 확인할 수 없습니다.")
+        if recorded_block["reason_code"] not in false_positive_reasons | {GUIDANCE_BLOCK_REASON}:
+            raise ValueError("계획 차단 원인이 guidance와 무관합니다.")
+        commit_message = git(repo_path, "show", "-s", "--format=%B", oid).stdout
+        commit_fields = dict(line.split(": ", 1) for line in commit_message.splitlines() if ": " in line)
+        tree = git(repo_path, "rev-parse", f"{oid}^{{tree}}").stdout.strip()
+    except (AgentScopeError, GuidanceFormatError, RuntimeError, ValueError, KeyError, TypeError, WorkspaceOwnershipError) as error:
+        operation_log(f"guidance 이중 차단 복구 보류 ({plan['plan_id']}): {error}", error=True)
+        return False
+    identity = blocked_checkpoint_state.request_identity(
+        repo, str(plan["plan_id"]), GUIDANCE_BLOCK_REASON, evidence,
+        branch, str(worktree), str(plan["guidance_plan_hash"]),
+    )
+    with runtime_state._transaction(connection):
+        connection.execute(
+            "UPDATE exec_plans SET blocked_reason = ?, blocked_fingerprint = NULL, "
+            "blocked_worktree_fingerprint = NULL, last_error = ? "
+            "WHERE repo = ? AND plan_id = ?",
+            (GUIDANCE_BLOCK_REASON, evidence, repo, plan["plan_id"]),
+        )
+        connection.execute(
+            "UPDATE execplan_blocks SET reason_code = ?, evidence = ?, "
+            "release_fingerprint = ? WHERE repo = ? AND plan_id = ?",
+            (GUIDANCE_BLOCK_REASON, evidence, plan["guidance_plan_hash"],
+             repo, plan["plan_id"]),
+        )
+        connection.execute(
+            "UPDATE blocked_checkpoints SET request_identity = ?, phase = 'published', "
+            "reason_code = ?, evidence = ?, branch = ?, worktree = ?, "
+            "commit_identity = ?, tree_oid = ?, local_oid = ?, remote_oid = ?, "
+            "published_oid = ?, accepted_remote_oid = ?, result = 'published', "
+            "unpublished_reason = NULL, retryable = 0 WHERE repo = ? AND plan_id = ?",
+            (identity, GUIDANCE_BLOCK_REASON, evidence, branch, str(worktree),
+             commit_fields["Checkpoint-Identity"], tree, oid, oid, oid, oid,
+             repo, plan["plan_id"]),
+        )
+        scoped_blocking.clear_project_block(connection, repo)
+        connection.execute(
+            "UPDATE projects SET phase = 'PLAN_BLOCKED', last_error = ? WHERE repo = ?",
+            (evidence, repo),
+        )
+    return True
+
+
 def resume_project_block_if_safe(
     connection: sqlite3.Connection,
     repo_path: Path,
@@ -14253,6 +14766,10 @@ def resume_project_block_if_safe(
     ).fetchone()
     if plan is None:
         return False
+    if _reconcile_guidance_double_block(
+        connection, repo_path, state_dir, repo, block, project, plan,
+    ):
+        return True
     if (
         block["reason_code"]
         == BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value
@@ -18024,10 +18541,31 @@ def _run_project_step(
         )
         current_origin = validated_origins[0] if validated_origins else None
 
-    base = remote_base(
-        repo_path,
-        requested_base or (row["base_branch"] if row else None),
-    )
+    selected_base = requested_base or (row["base_branch"] if row else None)
+    fetch_intent: int | None = None
+    if (
+        row is not None and validated_agent_scope is not None
+        and row["phase"] == "PLAN_BLOCKED"
+        and selected_base == row["base_branch"] and row["plan_path"]
+    ):
+        plan_id = _plan_id_from_path(str(row["plan_path"]))
+        if plan_id:
+            waiting_plan = connection.execute(
+                "SELECT blocked_reason FROM exec_plans WHERE repo = ? AND plan_id = ?",
+                (repo, plan_id),
+            ).fetchone()
+            if waiting_plan and waiting_plan["blocked_reason"] == GUIDANCE_BLOCK_REASON:
+                fetch_intent = _record_manager_base_fetch_intent(
+                    connection, repo_path, repo, plan_id,
+                    str(selected_base), validated_agent_scope,
+                )
+    if fetch_intent is not None:
+        base = _perform_manager_base_fetch(
+            connection, repo_path, fetch_intent, str(selected_base),
+        )
+        _finish_manager_base_fetch(connection, repo_path, fetch_intent)
+    else:
+        base = remote_base(repo_path, selected_base)
     backfill_plan_shas(connection, target_repo=repo)
     try:
         migrate_legacy_execplans(
@@ -19084,6 +19622,90 @@ def main() -> int:
         return 1
 
 
+def _owned_checkpoint_remote_oid(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    request: blocked_checkpoint.CheckpointRequest,
+    plan: sqlite3.Row,
+    current: GitSnapshot,
+) -> str | None:
+    """Prove a changed tracking ref against durable publication and live origin."""
+    if not request.branch or current.branch != request.branch:
+        return None
+    remote_ref = f"refs/remotes/origin/{request.branch}"
+    local_ref = f"refs/heads/{request.branch}"
+    tracked = current.refs.get(remote_ref)
+    if tracked is None or tracked[1] or current.refs.get(local_ref) != (current.head, ""):
+        return None
+    candidate = tracked[0]
+    published = str(plan["publication_remote_oid"] or "")
+    durable = candidate == published and bool(published)
+    if not durable and request.local_oid == candidate and request.tree_oid and request.commit_identity:
+        try:
+            durable = (
+                current.head == candidate
+                and git(repo_path, "rev-parse", f"{candidate}^{{tree}}").stdout.strip()
+                == request.tree_oid
+                and f"Checkpoint-Identity: {request.commit_identity}" in
+                git(repo_path, "show", "-s", "--format=%B", candidate).stdout
+            )
+        except RuntimeError:
+            durable = False
+    if not durable:
+        return None
+    try:
+        observed = git(
+            repo_path, "ls-remote", "--heads", "origin",
+            f"refs/heads/{request.branch}", check=False,
+        )
+    except RuntimeError:
+        return None
+    rows = [line.split() for line in observed.stdout.splitlines() if line.strip()]
+    if observed.returncode or rows != [[candidate, f"refs/heads/{request.branch}"]]:
+        return None
+    return candidate
+
+
+def _guidance_checkpoint_commit_evidence(
+    repo_path: Path, plan_id: str, oid: str,
+) -> str | None:
+    """Return the original guidance evidence only for an intact Manager commit."""
+    try:
+        message = git(repo_path, "show", "-s", "--format=%B", oid).stdout
+        parent_line = git(repo_path, "show", "-s", "--format=%P", oid).stdout.strip()
+        parents = parent_line.split()
+        tree = git(repo_path, "rev-parse", f"{oid}^{{tree}}").stdout.strip()
+        changed = tuple(sorted(_nul_git_paths(
+            repo_path, "diff", "--name-only", "-z", parents[0], oid,
+        ))) if len(parents) == 1 else ()
+        author = git(repo_path, "show", "-s", "--format=%an <%ae>%n%cn <%ce>", oid).stdout.splitlines()
+        fields = dict(line.split(": ", 1) for line in message.splitlines() if ": " in line)
+        evidence = json.loads(fields["Evidence"])
+        paths = tuple(sorted(
+            line[2:] for line in message.split("Paths:\n", 1)[1].splitlines()
+            if line.startswith("- ") and line != "- (none)"
+        ))
+        if (
+            len(parents) != 1
+            or author != ["Loop Manager <loop-manager@localhost>"] * 2
+            or not isinstance(evidence, str)
+            or fields.get("Reason") != GUIDANCE_BLOCK_REASON
+            or fields.get("Scope") != "plan"
+            or fields.get("Evidence-SHA256") != hashlib.sha256(evidence.encode()).hexdigest()
+            or paths != changed
+            or message.splitlines()[0] != f"[{plan_id}] BLOCKED checkpoint"
+            or fields.get("Checkpoint-Identity") != blocked_checkpoint.checkpoint_identity(
+                plan_id=plan_id, reason_code=GUIDANCE_BLOCK_REASON,
+                evidence=evidence, parent_oid=parents[0], tree_oid=tree,
+                included_paths=paths,
+            )
+        ):
+            return None
+        return evidence
+    except (KeyError, ValueError, IndexError, RuntimeError, json.JSONDecodeError):
+        return None
+
+
 class _BlockedCheckpointAdapter:
     """Git/GitHub safety and publication adapter for one registered project."""
 
@@ -19430,17 +20052,32 @@ class _BlockedCheckpointAdapter:
             return reject("shared_git_config_mutation", "checkpoint Git config가 저장된 snapshot과 다릅니다.")
         own_ref = f"refs/heads/{request.branch}"
         remote_ref = f"refs/remotes/origin/{request.branch}"
+        owned_remote_oid = (
+            _owned_checkpoint_remote_oid(
+                self.connection, self.repo_path, request, plan, current,
+            )
+            if before.refs.get(remote_ref) != current.refs.get(remote_ref)
+            else None
+        )
+        fetched_refs = _proven_manager_base_refs(
+            self.connection, self.repo_path, request.repo, request.plan_id,
+            before, current,
+        )
         for name in before.refs.keys() | current.refs.keys():
-            if name == own_ref or name.startswith("refs/codex/turn-diffs/"):
+            if name == own_ref or name in fetched_refs or name.startswith("refs/codex/turn-diffs/"):
                 continue
             if before.refs.get(name) == current.refs.get(name):
                 continue
-            if name == remote_ref and request.local_oid and current.refs.get(name) == (request.local_oid, ""):
+            if name == remote_ref and current.refs.get(name) == (owned_remote_oid, ""):
                 continue
             return reject("shared_ref_mutation", f"checkpoint 공유 ref 변경: {name}")
         own_path = str(_canonical_path(Path(request.worktree)))
+        cleaned = _proven_merged_cleanup_paths(
+            self.connection, request.repo, before, current,
+        )
         for path in before.worktrees.keys() | current.worktrees.keys():
-            if path != own_path and before.worktrees.get(path) != current.worktrees.get(path):
+            if (path != own_path and path not in cleaned
+                    and before.worktrees.get(path) != current.worktrees.get(path)):
                 return reject("outside_managed_worktree_mutation", f"checkpoint 외부 worktree 변경: {path}")
         return None
 

@@ -2138,9 +2138,9 @@ class ExecutionHandlers:
                     classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
                     str(error), context=context,
                 )
-        self.effects.agent.clear_agent_scope(self.repo)
         guarded = self._post_effect_guard(context)
         if isinstance(guarded, ExecutionOutcome):
+            self.effects.agent.clear_agent_scope(self.repo)
             return guarded
         context = guarded
         row = self._row()
@@ -2160,6 +2160,7 @@ class ExecutionHandlers:
                 file=sys.stderr,
             )
             return self._final()
+        self.effects.agent.clear_agent_scope(self.repo)
         if code:
             if context.resolving_rebase:
                 saved_turn = self.rebase_corrections.get(self.repo, context.plan.plan_id)
@@ -2246,9 +2247,9 @@ class ExecutionHandlers:
                 context=context,
                 final_block_reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE,
             )
-        if self._row()['agent_snapshot'] is not None:
-            self.effects.agent.clear_agent_scope(self.repo)
         if saved.worker_code:
+            if self._row()['agent_snapshot'] is not None:
+                self.effects.agent.clear_agent_scope(self.repo)
             self.rebase_corrections.abandon_turn(
                 self.repo, context.plan.plan_id,
                 expected_generation=saved.generation,
@@ -2269,6 +2270,8 @@ class ExecutionHandlers:
             )
         guarded = self._post_effect_guard(context)
         if isinstance(guarded, ExecutionOutcome):
+            if self._row()['agent_snapshot'] is not None:
+                self.effects.agent.clear_agent_scope(self.repo)
             return guarded
         context = guarded
         if self.effects.agent.inspect_worker_guidance_result(
@@ -2276,6 +2279,8 @@ class ExecutionHandlers:
             saved.worker_result,
         ):
             return self._final()
+        if self._row()['agent_snapshot'] is not None:
+            self.effects.agent.clear_agent_scope(self.repo)
         try:
             self.effects.validation.parse_worker_result(saved.worker_result, self.plan)
         except self.effects.contract.WorkerResultError as error:
