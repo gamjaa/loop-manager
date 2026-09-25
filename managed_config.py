@@ -17,7 +17,7 @@ class ManagedConfig:
     max_workers: int
     telegram_token: str
     telegram_chat_id: str
-    refactoring_review_interval: int = 5
+    refactoring_review_interval: int = 20
     verify_timeout_seconds: int = 600
 
     @property
@@ -76,7 +76,7 @@ def load_managed_config(path: Path) -> ManagedConfig:
         parser,
         "loop",
         "refactoring_review_interval",
-        fallback="5",
+        fallback="20",
     )
     try:
         refactoring_review_interval = int(raw_refactoring_review_interval)

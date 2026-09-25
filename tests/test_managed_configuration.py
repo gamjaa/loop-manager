@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 import loop_manager
+import maintenance_state
 from managed_config import ManagedConfig, ManagedConfigError, load_managed_config
 import project_registry
 
@@ -100,7 +101,7 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
             default_config.write_text("[loop]\nmax_workers = 2\n", encoding="utf-8")
             self.assertEqual(
                 load_managed_config(default_config).refactoring_review_interval,
-                5,
+                20,
             )
 
             configured = root / "configured.ini"
@@ -437,11 +438,15 @@ Registration recovery fixture.
                 "WHERE repo = ? AND plan_id = 'G-001'",
                 (str(root),),
             ).fetchone()
+            baseline = maintenance_state.MaintenanceRepository(connection).get(
+                str(root)
+            ).file_assessment_start_merged_count
             connection.close()
 
         self.assertEqual(row["path"], "docs/plans/[G-001] Historical.md")
         self.assertEqual(row["status"], "MERGED")
         self.assertEqual(row["plan_sha"], publication_sha)
+        self.assertEqual(baseline, 1)
 
     def test_remove_refuses_active_execplans_and_planning_errors(self):
         connection = self._connection()

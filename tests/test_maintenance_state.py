@@ -151,6 +151,152 @@ class MaintenanceStateRepositoryTest(unittest.TestCase):
         self.assertTrue(repository.due("one", 2).required)
         self.assertEqual(repository.due("two", 2).reason, "no_successful_assessment")
 
+    def test_file_assessment_start_waits_for_legacy_cycle_and_is_idempotent(self):
+        connection = self._connection()
+        repository = maintenance_state.MaintenanceRepository(connection)
+        source = "a" * 40
+        connection.execute(
+            "INSERT INTO execplan_catalog_revisions "
+            "(repo, revision_sha, catalog_fingerprint) VALUES ('one', ?, 'catalog')",
+            (source,),
+        )
+        self._insert_plan(connection, "one", "G-001", "MERGED")
+        cycle, _ = repository.begin_assessment_if_due("one", 5, source)
+        self.assertIsNone(repository.initialize_file_assessment_start(
+            "one", source_sha=source, expected_merged_count=1,
+        ).file_assessment_start_merged_count)
+        recovered = repository.restart_stale_planning_context(
+            "one", expected=cycle, new_base_sha=source,
+        )
+        self.assertIsNone(recovered.file_assessment_start_merged_count)
+        connection.execute(
+            "UPDATE maintenance_cycles SET full_assessment_completed = 1 "
+            "WHERE repo = 'one'"
+        )
+        completed = repository.advance_success_baseline(
+            "one", expected_phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+            expected_revision=recovered.revision, remote_commit=source,
+        )
+        self.assertIsNone(completed.file_assessment_start_merged_count)
+        started = repository.initialize_file_assessment_start(
+            "one", source_sha=source, expected_merged_count=1,
+        )
+        self.assertEqual(started.file_assessment_start_merged_count, 1)
+        self.assertEqual(started.last_success_merged_count, 1)
+        self.assertTrue(started.full_assessment_completed)
+        self._insert_plan(connection, "one", "G-002", "MERGED")
+        restarted = maintenance_state.MaintenanceRepository(connection)
+        self.assertEqual(restarted.initialize_file_assessment_start(
+            "one", source_sha="b" * 40, expected_merged_count=2,
+        ), started)
+        self.assertEqual(restarted.file_assessment_due("one", 20).merged_since_baseline, 1)
+
+    def test_file_assessment_due_uses_first_and_success_baselines(self):
+        connection = self._connection()
+        repository = maintenance_state.MaintenanceRepository(connection)
+        source = "a" * 40
+        self.assertEqual(repository.file_assessment_due("two", 20).reason,
+                         "baseline_pending")
+        self.assertEqual(repository.file_assessment_due(
+            "two", 20, self_repository=True,
+        ).reason, "one_time_full_assessment")
+        connection.execute(
+            "INSERT INTO execplan_catalog_revisions "
+            "(repo, revision_sha, catalog_fingerprint) VALUES ('one', ?, 'catalog')",
+            (source,),
+        )
+        repository.initialize_file_assessment_start(
+            "one", source_sha=source, expected_merged_count=0,
+        )
+        scheduling_port = loop_manager._PlanningStatePorts(
+            connection,
+            loop_manager.runtime_state.RuntimeStateRepository(connection),
+            repository,
+            Path("/unused"),
+        )
+        self.assertFalse(repository.file_assessment_due(
+            "one", 20, completion_candidate=True,
+        ).required)
+        self.assertFalse(scheduling_port.maintenance_due("one", 20).required)
+        for number in range(1, 20):
+            self._insert_plan(connection, "one", f"G-{number:03d}", "MERGED")
+        self.assertEqual(repository.file_assessment_due(
+            "one", 20, completion_candidate=True,
+        ).reason, "interval_pending")
+        self.assertTrue(repository.file_assessment_due("one", 19).required)
+        self._insert_plan(connection, "one", "G-020", "MERGED")
+        self.assertEqual(repository.file_assessment_due("one", 20).reason,
+                         "interval_reached")
+        self.assertTrue(scheduling_port.maintenance_due("one", 20).required)
+
+        cycle, _ = repository.begin_assessment_if_due("one", 5, source)
+        for bad_source, count in (("b" * 40, 20), (source, 19)):
+            with self.assertRaises(maintenance_state.MaintenanceStateError):
+                repository.advance_file_assessment_success_baseline(
+                    "one", expected_revision=cycle.revision,
+                    source_sha=bad_source, expected_merged_count=count,
+                )
+        self.assertIsNone(repository.get(
+            "one"
+        ).last_success_file_assessment_merged_count)
+        recorded = repository.advance_file_assessment_success_baseline(
+            "one", expected_revision=cycle.revision, source_sha=source,
+            expected_merged_count=20,
+        )
+        self.assertEqual(recorded.last_success_file_assessment_merged_count, 20)
+        self.assertIsNone(recorded.last_success_merged_count)
+        repository.advance_success_baseline(
+            "one", expected_phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+            expected_revision=recorded.revision, remote_commit=source,
+        )
+        for number in range(21, 31):
+            self._insert_plan(connection, "one", f"G-{number:03d}", "MERGED")
+        self.assertFalse(repository.file_assessment_due("one", 20).required)
+        self.assertEqual(repository.file_assessment_due(
+            "one", 20, completion_candidate=True,
+        ).reason, "stabilization_due")
+
+    def test_file_assessment_rejects_unverified_source_or_count_drift(self):
+        connection = self._connection()
+        repository = maintenance_state.MaintenanceRepository(connection)
+        source = "a" * 40
+        connection.execute(
+            "INSERT INTO execplan_catalog_revisions "
+            "(repo, revision_sha, catalog_fingerprint) VALUES ('one', ?, 'catalog')",
+            (source,),
+        )
+        self._insert_plan(connection, "one", "G-001", "MERGED")
+        for bad_source, count in (("b" * 40, 1), (source, 0)):
+            with self.assertRaises(maintenance_state.MaintenanceStateError):
+                repository.initialize_file_assessment_start(
+                    "one", source_sha=bad_source, expected_merged_count=count,
+                )
+        self.assertIsNone(repository.get("one").file_assessment_start_merged_count)
+        repository.initialize_file_assessment_start(
+            "one", source_sha=source, expected_merged_count=1,
+        )
+        connection.execute("DELETE FROM exec_plans WHERE repo = 'one'")
+        with self.assertRaises(maintenance_state.MaintenanceStateError):
+            repository.file_assessment_due("one", 20)
+
+    def test_additive_file_baseline_schema_preserves_legacy_success(self):
+        connection = self._connection()
+        old_schema = maintenance_state.MAINTENANCE_SCHEMA.replace(
+            "    file_assessment_start_merged_count INTEGER,\n", ""
+        ).replace("    last_success_file_assessment_merged_count INTEGER,\n", "")
+        connection.execute(old_schema)
+        connection.execute(
+            "INSERT INTO maintenance_cycles "
+            "(repo, last_success_merged_count, full_assessment_completed) "
+            "VALUES ('one', 7, 1)"
+        )
+        repository = maintenance_state.MaintenanceRepository(connection)
+        state = repository.get("one")
+        self.assertEqual(state.last_success_merged_count, 7)
+        self.assertTrue(state.full_assessment_completed)
+        self.assertIsNone(state.file_assessment_start_merged_count)
+        self.assertIsNone(state.last_success_file_assessment_merged_count)
+
     def test_plan_sets_round_trip_deterministically_and_reject_invalid_ids(self):
         connection = self._connection()
         for plan_id in ("G-010", "G-002", "G-003"):

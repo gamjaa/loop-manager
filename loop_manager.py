@@ -452,6 +452,7 @@ class ProjectRegistrationInspection:
     agents_hash: str
     agents_approved: bool
     origin: str | None = None
+    source_revision: str | None = None
 
 
 @dataclass(frozen=True)
@@ -6086,6 +6087,7 @@ def inspect_project_registration(
         agents_hash=agents_hash,
         agents_approved=agents_approved,
         origin=origin,
+        source_revision=revision,
     )
 
 
@@ -6115,10 +6117,42 @@ def add_registered_project(
     )
     project_registry.add_project(connection, project)
     if inspection.root.is_dir():
+        current_sha = git(
+            inspection.root, "rev-parse", "--verify",
+            f"refs/remotes/origin/{project.base_branch}^{{commit}}",
+        ).stdout.strip()
+        source_sha = inspection.source_revision or current_sha
+        if current_sha != source_sha:
+            raise RuntimeError("등록 중 원격 source revision이 변경됐습니다.")
         migrate_legacy_execplans(
             connection,
             reconcile_history=True,
             target_repo=project.repo,
+        )
+        snapshot = revision_execplan_snapshot(
+            inspection.root, source_sha,
+            archive_conflict_plan_ids=_merged_execplan_ids(connection, project.repo),
+        )
+        current_sha = git(
+            inspection.root, "rev-parse", "--verify",
+            f"refs/remotes/origin/{project.base_branch}^{{commit}}",
+        ).stdout.strip()
+        if current_sha != source_sha:
+            raise RuntimeError("등록 중 원격 ExecPlan catalog revision이 변경됐습니다.")
+        connection.execute(
+            "INSERT INTO execplan_catalog_revisions "
+            "(repo, revision_sha, catalog_fingerprint) VALUES (?, ?, ?) "
+            "ON CONFLICT(repo) DO UPDATE SET "
+            "revision_sha = excluded.revision_sha, "
+            "catalog_fingerprint = excluded.catalog_fingerprint",
+            (project.repo, source_sha,
+             execplan_catalog_state._catalog_fingerprint(snapshot)),
+        )
+        repository = maintenance_state.MaintenanceRepository(connection)
+        repository.initialize_file_assessment_start(
+            project.repo,
+            source_sha=source_sha,
+            expected_merged_count=repository.merged_count(project.repo),
         )
     return project
 
@@ -17114,7 +17148,9 @@ class _PlanningStatePorts:
     def maintenance_due(
         self, repo: str, interval: int, *, self_repository: bool = False
     ) -> maintenance_state.ReviewDue:
-        return self._maintenance_repository.due(repo, interval, self_repository=self_repository)
+        return self._maintenance_repository.file_assessment_due(
+            repo, interval, self_repository=self_repository,
+        )
 
     def begin_maintenance_assessment(
         self,
@@ -17973,7 +18009,7 @@ def _execplan_archive_housekeeping_safe(
         decision = catalog_schedule_decision(connection, repo)
         if (
             not decision.has_waiting
-            and maintenance_repository.due(
+            and maintenance_repository.file_assessment_due(
                 repo, refactoring_review_interval,
                 self_repository=is_loop_manager_repository(Path(repo)),
             ).required
@@ -18354,7 +18390,7 @@ def _run_project_step(
     requested_provider: str | None = None,
     registered_only: bool = False,
     planner_mutex: threading.Lock | None = None,
-    refactoring_review_interval: int = 5,
+    refactoring_review_interval: int = 20,
     verify_timeout_seconds: int = 600,
     runtime_mutation: RuntimeMutation | None = None,
 ) -> int:
@@ -18742,6 +18778,28 @@ def _run_project_step(
             file=sys.stderr,
         )
         return 1
+    if (
+        row is not None
+        and int(row["registered"]) == 1
+        and row["phase"] is None
+        and active_execplan(connection, repo) is None
+    ):
+        repository = maintenance_state.MaintenanceRepository(connection)
+        state = repository.get(repo)
+        if (
+            state.phase is maintenance_state.MaintenancePhase.IDLE
+            and state.file_assessment_start_merged_count is None
+        ):
+            current_sha = git(
+                repo_path, "rev-parse", "--verify",
+                f"refs/remotes/origin/{base}^{{commit}}",
+            ).stdout.strip()
+            if current_sha != base_sha:
+                return PROJECT_STEP_RETRY
+            repository.initialize_file_assessment_start(
+                repo, source_sha=base_sha,
+                expected_merged_count=repository.merged_count(repo),
+            )
     if pr_sync.step_result not in {None, 0}:
         return pr_sync.step_result
     if validated_agent_scope is not None:
@@ -19015,7 +19073,7 @@ def run_project_result(
     *,
     registered_only: bool = False,
     planner_mutex: threading.Lock | None = None,
-    refactoring_review_interval: int = 5,
+    refactoring_review_interval: int = 20,
     verify_timeout_seconds: int = 600,
     on_step_completed: Callable[[], None] | None = None,
     runtime_mutation: RuntimeMutation | None = None,
@@ -19091,7 +19149,7 @@ def _stable_work_reason(
     if (
         cycle.phase is not maintenance_state.MaintenancePhase.IDLE
         or cycle.publication_stage is not None
-        or maintenance.due(
+        or maintenance.file_assessment_due(
             repo, refactoring_review_interval,
             self_repository=is_loop_manager_repository(Path(repo)),
         ).required
@@ -19145,7 +19203,7 @@ def _run_project_result(
     *,
     registered_only: bool = False,
     planner_mutex: threading.Lock | None = None,
-    refactoring_review_interval: int = 5,
+    refactoring_review_interval: int = 20,
     verify_timeout_seconds: int = 600,
     on_step_completed: Callable[[], None] | None = None,
     runtime_mutation: RuntimeMutation | None = None,
@@ -19362,7 +19420,7 @@ def _run_project_result(
     maintenance_cycle = maintenance_repository.get(repo)
     if (
         maintenance_cycle.phase is not maintenance_state.MaintenancePhase.IDLE
-        or maintenance_repository.due(
+        or maintenance_repository.file_assessment_due(
             repo, refactoring_review_interval,
             self_repository=is_loop_manager_repository(Path(repo)),
         ).required
@@ -19392,7 +19450,7 @@ def run_project(
     *,
     registered_only: bool = False,
     planner_mutex: threading.Lock | None = None,
-    refactoring_review_interval: int = 5,
+    refactoring_review_interval: int = 20,
     verify_timeout_seconds: int = 600,
 ) -> int:
     """CLI-compatible adapter for the reusable structured project result."""

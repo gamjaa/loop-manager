@@ -239,6 +239,18 @@ class MaintenanceOrchestrationTest(unittest.TestCase):
                 "WHERE repo = ? AND plan_id = ?",
                 (status, repo, plan_id),
             )
+        # These cases exercise recovery and ordering of a legacy cycle that
+        # was already active when the file-assessment schedule was introduced.
+        cycle, started = maintenance_state.MaintenanceRepository(
+            connection
+        ).begin_assessment_if_due(
+            repo, 5, plan_sha,
+            include_general_planning=not any(
+                status == "READY" for _id, _title, status, _deps, _priority in plans
+            ),
+        )
+        self.assertTrue(started)
+        self.assertEqual(cycle.phase, maintenance_state.MaintenancePhase.ASSESSMENT)
         connection.commit()
         return repo_path, state_dir, connection, repo
 
@@ -590,7 +602,7 @@ class MaintenanceOrchestrationTest(unittest.TestCase):
             with self.subTest(signal=signal):
                 self.assertIn(signal, prompt)
 
-    def test_registered_initial_cycle_combines_general_gate_in_one_planner_call(self):
+    def test_active_legacy_cycle_combines_general_gate_in_one_planner_call(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo_path = make_remote_repository(str(root / "project"))
@@ -601,6 +613,12 @@ class MaintenanceOrchestrationTest(unittest.TestCase):
             connection.execute(
                 "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
                 (repo,),
+            )
+            maintenance_state.MaintenanceRepository(
+                connection
+            ).begin_assessment_if_due(
+                repo, 5, git_command(repo_path, "rev-parse", "origin/main"),
+                include_general_planning=True,
             )
             connection.commit()
             prompts: list[str] = []
@@ -660,7 +678,7 @@ class MaintenanceOrchestrationTest(unittest.TestCase):
         self.assertIsNotNone(project["planning_fingerprint"])
         enqueue.assert_not_called()
 
-    def test_due_assessment_runs_before_existing_ready_worker(self):
+    def test_active_legacy_assessment_runs_before_existing_ready_worker(self):
         with tempfile.TemporaryDirectory() as directory:
             repo_path, state_dir, connection, repo = self._integration_project(
                 directory,

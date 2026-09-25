@@ -17128,7 +17128,7 @@ class ExecPlanArchiveHousekeepingAdapterTest(unittest.TestCase):
             environment["GIT_COMMITTER_EMAIL"], "loop-manager@localhost"
         )
 
-    def test_archive_housekeeping_waits_for_due_or_active_maintenance_cycle(self):
+    def test_archive_housekeeping_waits_for_file_due_or_active_legacy_cycle(self):
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row
         connection.execute(loop_manager.SCHEMA)
@@ -17147,7 +17147,7 @@ class ExecPlanArchiveHousekeepingAdapterTest(unittest.TestCase):
                 refactoring_review_interval=5,
             )
         )
-        self.assertFalse(
+        self.assertTrue(
             loop_manager._execplan_archive_housekeeping_safe(
                 connection,
                 "/repo",
@@ -17194,6 +17194,28 @@ class ExecPlanArchiveHousekeepingAdapterTest(unittest.TestCase):
                 None,
                 maintenance_assessment_enabled=True,
                 refactoring_review_interval=5,
+            )
+        )
+        connection.execute(
+            "INSERT INTO execplan_catalog_revisions "
+            "(repo, revision_sha, catalog_fingerprint) "
+            "VALUES ('/repo', ?, 'catalog')",
+            ("b" * 40,),
+        )
+        repository.initialize_file_assessment_start(
+            "/repo", source_sha="b" * 40, expected_merged_count=0,
+        )
+        connection.execute(
+            "INSERT INTO exec_plans (repo, plan_id, path, title, sources, "
+            "depends_on, priority, content_hash, status) VALUES "
+            "('/repo', 'G-001', 'docs/plans/[G-001] Done.md', 'Done', "
+            "'[]', '[]', 'normal', 'hash', 'MERGED')"
+        )
+        self.assertFalse(
+            loop_manager._execplan_archive_housekeeping_safe(
+                connection, "/repo", None,
+                maintenance_assessment_enabled=True,
+                refactoring_review_interval=1,
             )
         )
         connection.close()
@@ -17386,8 +17408,9 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
         )
         loop_manager.maintenance_state.ensure_schema(connection)
         connection.execute(
-            "INSERT INTO maintenance_cycles (repo, last_success_merged_count) "
-            "VALUES (?, 0)", (repo,),
+            "INSERT INTO maintenance_cycles "
+            "(repo, last_success_merged_count, file_assessment_start_merged_count) "
+            "VALUES (?, 0, 0)", (repo,),
         )
         connection.commit()
         return connection, repo
@@ -17438,10 +17461,17 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
             "UPDATE maintenance_cycles SET last_success_merged_count = NULL "
             "WHERE repo = ?", (repo,),
         )
+        connection.execute(
+            "INSERT INTO exec_plans (repo, plan_id, path, title, sources, "
+            "depends_on, priority, content_hash, status) VALUES "
+            "(?, 'G-019', 'docs/plans/[G-019] Done.md', 'Done', "
+            "'[]', '[]', 'normal', 'hash-19', 'MERGED')",
+            (repo,),
+        )
         with mock.patch("loop_manager.is_loop_manager_repository", return_value=False), \
                 mock.patch("loop_manager.git") as git_command:
             self.assertIsNone(loop_manager._stable_work_reason(
-                connection, repo, refactoring_review_interval=5,
+                connection, repo, refactoring_review_interval=1,
             ))
             git_command.assert_not_called()
         connection.close()
@@ -17461,6 +17491,7 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
             result = loop_manager._run_project_result(
                 connection, Path("/unused"), repo, Path("/unused.ini"),
                 None, False, registered_only=False,
+                refactoring_review_interval=1,
             )
         self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
         completed.assert_not_called()

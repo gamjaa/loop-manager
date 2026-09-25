@@ -676,6 +676,13 @@ class PlanningLifecycleCoordinator:
                 context.repo, context.refactoring_review_interval,
                 self_repository=context.self_repository,
             )
+            # File assessments cannot start until their execution path is
+            # installed. Preserve their place ahead of READY work meanwhile.
+            if due.required and getattr(due, "reason", None) != "one_time_full_assessment":
+                self._ports.events.info(
+                    "파일별 유지보수 평가 실행 경로가 준비될 때까지 대기합니다."
+                )
+                return PlanningOutcome(PlanningOutcomeKind.WAITING)
             if due.required:
                 include_general = False
                 if not decision.has_ready:
