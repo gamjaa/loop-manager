@@ -147,7 +147,6 @@ class ExecutionRevisionTests(unittest.TestCase):
             current_base_token="new",
             artifacts=complete_artifacts(original, "old"),
             unmet_dependencies=("G-049", "G-036"),
-            base_requires_validation=True,
         )
 
         self.assertEqual(decision.kind, RevisionGateKind.WAIT)
@@ -171,34 +170,38 @@ class ExecutionRevisionTests(unittest.TestCase):
                 )
                 self.assertEqual(decision.phase, "IMPLEMENTING")
 
-    def test_title_only_rebase_carries_validation_but_code_change_reverifies(self):
+    def test_base_change_always_reverifies_even_for_title_only_change(self):
         original = definition()
         renamed = replace(original, revision_sha="b" * 40, title="Renamed")
         artifacts = complete_artifacts(original, "old")
 
-        harmless = decide_revision_gate(
+        decision = decide_revision_gate(
             phase="PUBLISHING",
             previous=original,
             current=renamed,
             active_base_token="old",
             current_base_token="new",
             artifacts=artifacts,
-            base_requires_validation=False,
-        )
-        code_change = decide_revision_gate(
-            phase="PUBLISHING",
-            previous=original,
-            current=renamed,
-            active_base_token="old",
-            current_base_token="new",
-            artifacts=artifacts,
-            base_requires_validation=True,
         )
 
-        self.assertEqual(harmless.kind, RevisionGateKind.REFRESH_WORKTREE)
-        self.assertTrue(harmless.preserve_validation)
-        self.assertEqual(code_change.kind, RevisionGateKind.INVALIDATE_TO_PHASE)
-        self.assertEqual(code_change.phase, "VERIFYING")
+        self.assertEqual(decision.kind, RevisionGateKind.INVALIDATE_TO_PHASE)
+        self.assertEqual(decision.phase, "VERIFYING")
+
+    def test_candidate_head_change_invalidates_verify_and_review(self):
+        current = definition()
+        artifacts = complete_artifacts(current, "base")
+        verified = replace(
+            artifacts,
+            verify_token=current.verify_token("base", "old-head"),
+            review_token=current.review_token("base", "old-head"),
+        )
+        decision = decide_revision_gate(
+            phase="PUBLISHING", previous=current, current=current,
+            active_base_token="base", current_base_token="base",
+            artifacts=verified, candidate_head="new-head",
+        )
+        self.assertEqual(decision.kind, RevisionGateKind.INVALIDATE_TO_PHASE)
+        self.assertEqual(decision.phase, "VERIFYING")
 
     def test_serialization_is_deterministic_and_rejects_invalid_state(self):
         current = definition(archive_candidates=("b", "a"))

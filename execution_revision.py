@@ -198,16 +198,16 @@ class DefinitionSnapshot:
             (self.sources, self.archive_candidates),
         )
 
-    def verify_token(self, base_token: str) -> str:
-        return _digest("verify-stage", (self.worker_token, base_token))
+    def verify_token(self, base_token: str, candidate_head: str | None = None) -> str:
+        return _digest("verify-stage", (self.worker_token, base_token, candidate_head))
 
-    def review_token(self, base_token: str) -> str:
-        return _digest("review-stage", (self.verify_token(base_token),))
+    def review_token(self, base_token: str, candidate_head: str | None = None) -> str:
+        return _digest("review-stage", (self.verify_token(base_token, candidate_head),))
 
-    def publication_token(self, base_token: str) -> str:
+    def publication_token(self, base_token: str, candidate_head: str | None = None) -> str:
         return _digest(
             "publication-stage",
-            (self.definition_token, self.review_token(base_token)),
+            (self.definition_token, self.review_token(base_token, candidate_head)),
         )
 
 
@@ -287,7 +287,6 @@ class RevisionGateDecision:
     phase: str
     deltas: frozenset[DefinitionDelta] = frozenset()
     unmet_dependencies: tuple[str, ...] = ()
-    preserve_validation: bool = False
     detail: str | None = None
 
 
@@ -304,7 +303,7 @@ def decide_revision_gate(
     current_base_token: str,
     artifacts: StageArtifacts,
     unmet_dependencies: tuple[str, ...] = (),
-    base_requires_validation: bool = False,
+    candidate_head: str | None = None,
 ) -> RevisionGateDecision:
     """Choose the earliest safe phase while preserving execution identity."""
 
@@ -336,37 +335,26 @@ def decide_revision_gate(
         target = "IMPLEMENTING"
 
     base_changed = active_base_token != current_base_token
-    if base_changed and base_requires_validation and target != "IMPLEMENTING":
+    if base_changed and target != "IMPLEMENTING":
         target = _earlier_phase(target, "VERIFYING")
 
-    expected_verify = current.verify_token(current_base_token)
+    expected_verify = current.verify_token(current_base_token, candidate_head)
     if target in {"REVIEWING", "PUBLISHING"} and (
         not artifacts.verify_result or artifacts.verify_token != expected_verify
     ):
-        # A harmless declaration-only rebase can deliberately carry successful
-        # validation forward; the handler rewrites its token after the rebase.
-        if not (base_changed and not base_requires_validation and artifacts.verify_result):
-            target = _earlier_phase(target, "VERIFYING")
+        target = _earlier_phase(target, "VERIFYING")
     if target == "PUBLISHING" and (
         not artifacts.review_result
-        or artifacts.review_token != current.review_token(current_base_token)
+        or artifacts.review_token != current.review_token(current_base_token, candidate_head)
     ):
-        if not (base_changed and not base_requires_validation and artifacts.review_result):
-            target = "REVIEWING"
+        target = "REVIEWING"
 
-    preserve_validation = bool(
-        base_changed
-        and not base_requires_validation
-        and not (deltas & WORKER_INVALIDATING_DELTAS)
-        and target == phase
-    )
     if unmet_dependencies:
         return RevisionGateDecision(
             RevisionGateKind.WAIT,
             target,
             deltas,
             tuple(sorted(set(unmet_dependencies))),
-            preserve_validation=preserve_validation,
             detail="미충족 dependency Merge 대기: "
             + ", ".join(sorted(set(unmet_dependencies))),
         )
@@ -375,14 +363,12 @@ def decide_revision_gate(
             RevisionGateKind.INVALIDATE_TO_PHASE,
             target,
             deltas,
-            preserve_validation=False,
         )
     if base_changed:
         return RevisionGateDecision(
             RevisionGateKind.REFRESH_WORKTREE,
             target,
             deltas,
-            preserve_validation=preserve_validation,
         )
     return RevisionGateDecision(
         RevisionGateKind.CONTINUE,
