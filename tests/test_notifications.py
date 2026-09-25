@@ -1212,6 +1212,72 @@ class WorkReasonOutboxTest(NotificationFixture, unittest.TestCase):
             self.assertEqual(len(self.events(restarted)), 3)
             restarted.close()
 
+    def test_disabled_wait_transition_cancels_stale_notice_before_restart(self):
+        for remaining_requirement in (False, True):
+            for failed_delivery in (False, True):
+                with self.subTest(requirement=remaining_requirement, failed=failed_delivery), tempfile.TemporaryDirectory() as directory:
+                    database = Path(directory) / "state.db"
+                    connection = self.connection(database=database)
+                    repo = "/projects/alpha"
+                    connection.execute(
+                        "UPDATE exec_plans SET status = 'PR_OPEN' WHERE repo = ?", (repo,),
+                    )
+                    waiting = work_exhaustion.collect(
+                        connection, repo, cycle="cycle-one", active_requirements=(),
+                    )
+                    assert waiting is not None
+                    self.assertIn("PR Merge 대기", waiting.describe())
+                    self.assertTrue(notifications.enqueue_waiting_reason(connection, repo, waiting))
+                    if failed_delivery:
+                        self.assertEqual(notifications.dispatch_pending(
+                            connection, "token", "chat",
+                            adapter=mock.Mock(side_effect=RuntimeError("network unavailable")),
+                        ), 0)
+                    notifications.configure_session(connection, enabled=False)
+                    # An unchanged wait still owns its pending delivery.
+                    self.assertFalse(notifications.enqueue_waiting_reason(connection, repo, waiting))
+                    self.assertIsNone(self.events(connection)[0]["canceled_at"])
+                    connection.execute(
+                        "UPDATE exec_plans SET status = 'PLAN_BLOCKED' WHERE repo = ?", (repo,),
+                    )
+                    connection.execute(
+                        "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+                        "VALUES (?, 'G-018', 'plan', 'user_decision_required', 'PR closed without merge')",
+                        (repo,),
+                    )
+                    changed = work_exhaustion.collect(
+                        connection, repo, cycle="cycle-one",
+                        active_requirements=("docs/requirements/[R-031] x.md",)
+                        if remaining_requirement else (),
+                    )
+                    assert changed is not None
+                    self.assertEqual(changed.has_distinct_wait, remaining_requirement)
+                    self.assertFalse(notifications.enqueue_waiting_reason(connection, repo, changed))
+                    events = self.events(connection)
+                    self.assertEqual(len(events), 1)
+                    self.assertIsNotNone(events[0]["canceled_at"])
+                    self.assertIsNone(events[0]["sent_at"])
+                    self.assertEqual(events[0]["attempts"], int(failed_delivery))
+                    connection.close()
+
+                    restarted = sqlite3.connect(database)
+                    self.addCleanup(restarted.close)
+                    restarted.row_factory = sqlite3.Row
+                    notifications.configure_session(restarted, enabled=True)
+                    delivered = mock.Mock()
+                    self.assertEqual(notifications.dispatch_pending(
+                        restarted, "token", "chat", adapter=delivered,
+                    ), 0)
+                    delivered.assert_not_called()
+                    for _ in range(2):
+                        self.assertEqual(notifications.enqueue_waiting_reason(
+                            restarted, repo, changed,
+                        ), remaining_requirement)
+                    self.assertEqual(notifications.dispatch_pending(
+                        restarted, "token", "chat", adapter=delivered,
+                    ), int(remaining_requirement))
+                    self.assertEqual(len(self.events(restarted)), 1 + int(remaining_requirement))
+
     def test_block_only_suppresses_wait_and_disabled_delivery_keeps_reason(self):
         connection = self.connection(enabled=False)
         repo = "/projects/alpha"

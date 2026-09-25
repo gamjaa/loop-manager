@@ -612,7 +612,7 @@ def enqueue_waiting_reason(
 ) -> bool:
     """Create one waiting incident per stable cause and cause transition."""
 
-    if snapshot.completed or not _enabled(connection):
+    if snapshot.completed:
         return False
     ensure_schema(connection)
     payload = snapshot.payload(Path(repo).name or repo)
@@ -645,6 +645,8 @@ def enqueue_waiting_reason(
             "AND event_key != ? AND sent_at IS NULL AND canceled_at IS NULL",
             (repo, event_key),
         )
+        if not _enabled(connection):
+            return False
         _insert(connection, event_key, repo, "work_waiting", payload)
     return True
 
