@@ -650,14 +650,15 @@ class MaintenanceOrchestrationTest(unittest.TestCase):
             finally:
                 connection.close()
 
-        self.assertEqual(result.kind, loop_manager.ProjectRunKind.COMPLETED)
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
+        self.assertIn("docs/requirements/Active.md", result.detail)
         self.assertEqual(len(prompts), 1)
         self.assertIn("현재 미충족 일반 PRODUCT/Requirement 작업도", prompts[0])
         self.assertEqual(cycle.phase, maintenance_state.MaintenancePhase.IDLE)
         self.assertEqual(cycle.last_success_merged_count, 0)
         self.assertIsNone(project["phase"])
         self.assertIsNotNone(project["planning_fingerprint"])
-        enqueue.assert_called_once_with(mock.ANY, repo)
+        enqueue.assert_not_called()
 
     def test_due_assessment_runs_before_existing_ready_worker(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1298,11 +1299,22 @@ class MaintenanceOrchestrationTest(unittest.TestCase):
 
     def test_active_or_due_cycle_blocks_project_completion_notification(self):
         connection = self._connection()
+        connection.execute(
+            "UPDATE projects SET planning_fingerprint = 'cycle-one', "
+            "specification_fingerprint = 'spec-one' WHERE repo = '/one'"
+        )
         repository = maintenance_state.MaintenanceRepository(connection)
         cycle, _ = repository.begin_assessment_if_due("/one", 5, "a" * 40)
         with mock.patch.object(loop_manager, "_run_project_step", return_value=0), mock.patch.object(
             loop_manager.notifications, "enqueue_completion_if_ready"
-        ) as enqueue:
+        ) as enqueue, mock.patch.object(
+            loop_manager, "_planning_input_fingerprint", return_value="cycle-one"
+        ), mock.patch.object(
+            loop_manager, "_specification_input_fingerprint", return_value="spec-one"
+        ), mock.patch.object(
+            loop_manager, "_git_tree_entries", return_value={}
+        ), mock.patch.object(loop_manager, "git") as git:
+            git.return_value.stdout = "a" * 40
             result = loop_manager.run_project_result(
                 connection,
                 Path("/state"),
@@ -1329,7 +1341,7 @@ class MaintenanceOrchestrationTest(unittest.TestCase):
                 False,
             )
             self.assertEqual(result.kind, loop_manager.ProjectRunKind.COMPLETED)
-            enqueue.assert_called_once_with(connection, "/one")
+            enqueue.assert_called_once_with(connection, "/one", mock.ANY)
 
 
 if __name__ == "__main__":

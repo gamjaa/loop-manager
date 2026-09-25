@@ -7503,6 +7503,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "full_assessment.py",
                 "maintenance_state.py",
                 "notifications.py",
+                "work_exhaustion.py",
                 "planning_catalog.py",
                 "planning_runtime.py",
                 "publication_resume.py",
@@ -17218,6 +17219,170 @@ class PersistentExecutionFailureBoundaryTest(unittest.TestCase):
                     (repo,),
                 ).fetchall()
                 self.assertEqual(len(events), expected_events)
+
+
+class StableWorkReasonBoundaryTest(unittest.TestCase):
+    def _connection(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute(loop_manager.SCHEMA)
+        loop_manager._ensure_execplans_schema(connection)
+        loop_manager.notifications.ensure_schema(connection)
+        loop_manager.notifications.configure_session(connection, enabled=True)
+        repo = "/projects/alpha"
+        connection.execute(
+            "INSERT INTO projects (repo, base_branch, planning_fingerprint, "
+            "specification_fingerprint) VALUES (?, 'main', 'cycle-one', 'spec-one')",
+            (repo,),
+        )
+        connection.execute(
+            "INSERT INTO exec_plans (repo, plan_id, path, title, sources, "
+            "depends_on, priority, content_hash, status) VALUES "
+            "(?, 'G-018', 'docs/plans/[G-018] Work.md', 'Work', '[]', "
+            "'[]', 'normal', 'hash', 'PR_OPEN')", (repo,),
+        )
+        connection.commit()
+        return connection, repo
+
+    def test_remote_requirement_and_planner_confirmation_gate_completion(self):
+        connection, repo = self._connection()
+        requirement = b"docs/requirements/[R-031] Waiting.md"
+        with mock.patch("loop_manager.git") as git_command, mock.patch(
+            "loop_manager._planning_input_fingerprint", return_value="cycle-one"
+        ), mock.patch(
+            "loop_manager._specification_input_fingerprint", return_value="spec-one"
+        ), mock.patch(
+            "loop_manager._git_tree_entries", return_value={requirement: (b"blob", b"oid")}
+        ):
+            git_command.return_value.stdout = "base-sha\n"
+            snapshot = loop_manager._stable_work_reason(
+                connection, repo, registered_only=False,
+                refactoring_review_interval=5,
+            )
+            self.assertIsNotNone(snapshot)
+            self.assertIn("[R-031]", snapshot.describe())
+            connection.execute(
+                "UPDATE exec_plans SET status = 'MERGED' WHERE repo = ?", (repo,),
+            )
+            no_plan = loop_manager._stable_work_reason(
+                connection, repo, registered_only=False,
+                refactoring_review_interval=5,
+            )
+            self.assertFalse(no_plan.completed)
+            connection.execute(
+                "UPDATE projects SET planning_fingerprint = 'older' WHERE repo = ?", (repo,),
+            )
+            self.assertIsNone(loop_manager._stable_work_reason(
+                connection, repo, registered_only=False,
+                refactoring_review_interval=5,
+            ))
+        connection.close()
+
+    def test_runnable_and_due_maintenance_do_not_emit_exhaustion(self):
+        connection, repo = self._connection()
+        connection.execute(
+            "UPDATE exec_plans SET status = 'READY' WHERE repo = ?", (repo,),
+        )
+        self.assertIsNone(loop_manager._stable_work_reason(
+            connection, repo, registered_only=False,
+            refactoring_review_interval=5,
+        ))
+        connection.execute(
+            "UPDATE exec_plans SET status = 'PR_OPEN' WHERE repo = ?", (repo,),
+        )
+        self.assertIsNone(loop_manager._stable_work_reason(
+            connection, repo, registered_only=True,
+            refactoring_review_interval=5,
+        ))
+        connection.close()
+
+    def test_planner_no_change_with_active_requirement_waits_without_completion(self):
+        connection, repo = self._connection()
+        import work_exhaustion
+        snapshot = work_exhaustion.WorkReasonSnapshot(
+            "cycle-one", (),
+            ({"id": "[R-031]", "path": "docs/requirements/[R-031] Waiting.md",
+              "reason": "Planner는 추가 계획이 없다고 확인했지만 활성 Requirement가 남아 있습니다"},),
+            None, None,
+        )
+        with mock.patch("loop_manager._checkpoint_dispatch_ready", return_value=False), \
+                mock.patch("loop_manager._run_project_step", return_value=0), \
+                mock.patch("loop_manager._stable_work_reason", return_value=snapshot), \
+                mock.patch.object(loop_manager.notifications, "enqueue_completion_if_ready") as completed:
+            result = loop_manager._run_project_result(
+                connection, Path("/unused"), repo, Path("/unused.ini"),
+                None, False,
+            )
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
+        self.assertIn("[R-031]", result.detail)
+        completed.assert_not_called()
+        connection.close()
+
+    def test_stable_result_reports_reason_and_pause_skips_notification(self):
+        connection, repo = self._connection()
+        import work_exhaustion
+        snapshot = work_exhaustion.WorkReasonSnapshot(
+            "cycle-one", ({"id": "G-018", "title": "Work", "status": "PR_OPEN",
+                            "reason": "PR Merge 대기"},), (), None, None,
+        )
+        with mock.patch("loop_manager._checkpoint_dispatch_ready", return_value=False), \
+                mock.patch("loop_manager._run_project_step", return_value=0), \
+                mock.patch("loop_manager._stable_work_reason", return_value=snapshot):
+            result = loop_manager._run_project_result(
+                connection, Path("/unused"), repo, Path("/unused.ini"),
+                None, False,
+            )
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
+        self.assertIn("PR Merge 대기", result.detail)
+        self.assertEqual(connection.execute(
+            "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'work_waiting'"
+        ).fetchone()[0], 1)
+        with mock.patch("loop_manager._checkpoint_dispatch_ready", return_value=False), \
+                mock.patch("loop_manager._run_project_step", return_value=loop_manager.PROJECT_STEP_TRANSIENT_PAUSE), \
+                mock.patch("loop_manager._stable_work_reason") as reason:
+            paused = loop_manager._run_project_result(
+                connection, Path("/unused"), repo, Path("/unused.ini"),
+                None, False,
+            )
+        self.assertEqual(paused.kind, loop_manager.ProjectRunKind.TRANSIENT_PAUSE)
+        reason.assert_not_called()
+        connection.close()
+
+    def test_project_block_and_planning_error_report_actual_causes(self):
+        connection, repo = self._connection()
+        connection.execute(
+            "INSERT INTO project_blocks (repo, scope, reason_code, evidence) "
+            "VALUES (?, 'project', 'repository_state_unsafe', 'Unsafe worktree')",
+            (repo,),
+        )
+        connection.execute(
+            "UPDATE projects SET phase = 'PROJECT_BLOCKED' WHERE repo = ?", (repo,),
+        )
+        with mock.patch("loop_manager._checkpoint_dispatch_ready", return_value=False), \
+                mock.patch("loop_manager._run_project_step", return_value=1):
+            blocked = loop_manager._run_project_result(
+                connection, Path("/unused"), repo, Path("/unused.ini"),
+                None, False,
+            )
+        self.assertEqual(blocked.kind, loop_manager.ProjectRunKind.BLOCKED)
+        self.assertIn("Unsafe worktree", blocked.detail)
+        connection.execute("DELETE FROM project_blocks WHERE repo = ?", (repo,))
+        connection.execute(
+            "UPDATE projects SET phase = 'PLANNING', planning_error = 'Invalid plans' "
+            "WHERE repo = ?", (repo,),
+        )
+        with mock.patch("loop_manager._checkpoint_dispatch_ready", return_value=False), \
+                mock.patch("loop_manager._run_project_step", return_value=1):
+            planning = loop_manager._run_project_result(
+                connection, Path("/unused"), repo, Path("/unused.ini"),
+                None, False,
+            )
+        self.assertEqual(planning.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
+        self.assertIn("planning_error: Invalid plans", planning.detail)
+        self.assertEqual(connection.execute(
+            "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'work_waiting'"
+        ).fetchone()[0], 0)
+        connection.close()
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ import loop_manager
 import blocked_checkpoint_state
 from managed_config import ManagedConfigError, load_managed_config
 import notifications
+import work_exhaustion
 import project_registry
 import scoped_blocking
 from recovery_runtime import RecoveryObservation, RecoveryReason
@@ -989,6 +990,10 @@ class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
 
 
 class CompletionCycleTest(NotificationFixture, unittest.TestCase):
+    @staticmethod
+    def _snapshot(cycle: str) -> work_exhaustion.WorkReasonSnapshot:
+        return work_exhaustion.WorkReasonSnapshot(cycle, (), (), None, None)
+
     def _complete_project(
         self,
         connection: sqlite3.Connection,
@@ -1016,13 +1021,13 @@ class CompletionCycleTest(NotificationFixture, unittest.TestCase):
         )
         self.assertFalse(
             notifications.enqueue_completion_if_ready(
-                connection, "/projects/alpha"
+                connection, "/projects/alpha", self._snapshot("cycle-one")
             )
         )
         self._complete_project(connection, "cycle-one")
         self.assertTrue(
             notifications.enqueue_completion_if_ready(
-                connection, "/projects/alpha"
+                connection, "/projects/alpha", self._snapshot("cycle-one")
             )
         )
         event = self.events(connection)[0]
@@ -1031,12 +1036,13 @@ class CompletionCycleTest(NotificationFixture, unittest.TestCase):
         self.assertEqual(payload["project"], "alpha")
         self.assertEqual(payload["last_completed_plan_id"], "G-018")
         self.assertEqual(payload["last_completed_title"], "Reliable notices")
+        self.assertIn("활성 Requirement", payload["reason"])
 
     def test_same_and_archive_only_cycle_deduplicate_but_new_input_reopens(self):
         connection = self.connection()
         self._complete_project(connection, "cycle-one")
-        notifications.enqueue_completion_if_ready(connection, "/projects/alpha")
-        notifications.enqueue_completion_if_ready(connection, "/projects/alpha")
+        notifications.enqueue_completion_if_ready(connection, "/projects/alpha", self._snapshot("cycle-one"))
+        notifications.enqueue_completion_if_ready(connection, "/projects/alpha", self._snapshot("cycle-one"))
 
         # Archive-only handling retains the prior planning fingerprint.
         connection.execute(
@@ -1044,7 +1050,7 @@ class CompletionCycleTest(NotificationFixture, unittest.TestCase):
             ("/projects/alpha",),
         )
         connection.commit()
-        notifications.enqueue_completion_if_ready(connection, "/projects/alpha")
+        notifications.enqueue_completion_if_ready(connection, "/projects/alpha", self._snapshot("cycle-one"))
         self.assertEqual(len(self.events(connection)), 1)
 
         connection.execute(
@@ -1052,7 +1058,7 @@ class CompletionCycleTest(NotificationFixture, unittest.TestCase):
             ("/projects/alpha",),
         )
         connection.commit()
-        notifications.enqueue_completion_if_ready(connection, "/projects/alpha")
+        notifications.enqueue_completion_if_ready(connection, "/projects/alpha", self._snapshot("cycle-two"))
         self.assertEqual(len(self.events(connection)), 2)
 
     def test_planning_error_blocks_completion(self):
@@ -1065,10 +1071,133 @@ class CompletionCycleTest(NotificationFixture, unittest.TestCase):
         connection.commit()
         self.assertFalse(
             notifications.enqueue_completion_if_ready(
-                connection, "/projects/alpha"
+                connection, "/projects/alpha", self._snapshot("cycle-one")
             )
         )
         self.assertEqual(self.events(connection), [])
+
+    def test_active_requirement_and_project_block_reject_completion(self):
+        connection = self.connection()
+        self._complete_project(connection, "cycle-one")
+        requirement = work_exhaustion.WorkReasonSnapshot(
+            "cycle-one", (), ({"id": "[R-031]", "path": "docs/requirements/[R-031] x.md",
+                               "reason": "archive 확인 대기"},), None, None,
+        )
+        self.assertFalse(notifications.enqueue_completion_if_ready(
+            connection, "/projects/alpha", requirement,
+        ))
+        connection.execute(
+            "INSERT INTO project_blocks (repo, scope, reason_code, evidence) "
+            "VALUES (?, 'project', 'repository_state_unsafe', 'unsafe')",
+            ("/projects/alpha",),
+        )
+        self.assertFalse(notifications.enqueue_completion_if_ready(
+            connection, "/projects/alpha", self._snapshot("cycle-one"),
+        ))
+        self.assertEqual(self.events(connection), [])
+
+
+class WorkReasonOutboxTest(NotificationFixture, unittest.TestCase):
+    def test_waiting_snapshot_lists_confirmed_causes_and_deduplicates_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "state.db"
+            connection = self.connection(database=database)
+            repo = "/projects/alpha"
+            connection.execute(
+                "UPDATE exec_plans SET depends_on = '[\"G-017\"]' "
+                "WHERE repo = ? AND plan_id = 'G-018'", (repo,),
+            )
+            connection.execute(
+                "INSERT INTO exec_plans (repo, plan_id, path, title, sources, "
+                "depends_on, priority, content_hash, status) VALUES "
+                "(?, 'G-017', 'docs/plans/[G-017] Base.md', 'Base', '[]', "
+                "'[]', 'normal', 'hash', 'PR_OPEN')", (repo,),
+            )
+            connection.execute(
+                "INSERT INTO exec_plans (repo, plan_id, path, title, sources, "
+                "depends_on, priority, content_hash, status) VALUES "
+                "(?, 'G-019', 'docs/plans/[G-019] Choice.md', 'Choice', '[]', "
+                "'[]', 'normal', 'hash', 'PLAN_BLOCKED')", (repo,),
+            )
+            connection.execute(
+                "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+                "VALUES (?, 'G-019', 'plan', 'user_decision_required', 'Choose A or B')",
+                (repo,),
+            )
+            paths = ("docs/requirements/[R-031] Waiting.md",)
+            snapshot = work_exhaustion.collect(
+                connection, repo, cycle="cycle-one", active_requirements=paths,
+            )
+            self.assertIsNotNone(snapshot)
+            assert snapshot is not None
+            self.assertFalse(snapshot.completed)
+            self.assertIn("G-017 (PR_OPEN)", snapshot.describe())
+            self.assertIn("user_decision_required", snapshot.describe())
+            self.assertIn("[R-031]", snapshot.describe())
+            self.assertTrue(notifications.enqueue_waiting_reason(connection, repo, snapshot))
+            first = self.events(connection)[0]
+            message = notifications._message("work_waiting", json.loads(first["payload"]))
+            self.assertIn("G-017 Base: PR Merge 대기", message)
+            self.assertIn("G-019 Choice", message)
+            connection.close()
+
+            restarted = sqlite3.connect(database)
+            restarted.row_factory = sqlite3.Row
+            notifications.configure_session(restarted, enabled=True)
+            notifications.enqueue_waiting_reason(restarted, repo, snapshot)
+            self.assertEqual(len(self.events(restarted)), 1)
+            changed = work_exhaustion.WorkReasonSnapshot(
+                "cycle-one", snapshot.plans,
+                ({"id": "[R-031]", "path": paths[0], "reason": "새 archive 원인"},),
+                None, None,
+            )
+            notifications.enqueue_waiting_reason(restarted, repo, changed)
+            self.assertEqual(len(self.events(restarted)), 2)
+            self.assertIsNotNone(self.events(restarted)[0]["canceled_at"])
+            notifications.mark_work_available(restarted, repo)
+            notifications.enqueue_waiting_reason(restarted, repo, snapshot)
+            self.assertEqual(len(self.events(restarted)), 3)
+            restarted.close()
+
+    def test_block_only_suppresses_wait_and_disabled_delivery_keeps_reason(self):
+        connection = self.connection(enabled=False)
+        repo = "/projects/alpha"
+        connection.execute(
+            "UPDATE exec_plans SET status = 'PLAN_BLOCKED' WHERE repo = ?", (repo,),
+        )
+        connection.execute(
+            "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+            "VALUES (?, 'G-018', 'plan', 'user_decision_required', 'Choose A')",
+            (repo,),
+        )
+        snapshot = work_exhaustion.collect(
+            connection, repo, cycle="cycle-one", active_requirements=(),
+        )
+        assert snapshot is not None
+        self.assertIn("Choose A", snapshot.describe())
+        self.assertFalse(notifications.enqueue_waiting_reason(connection, repo, snapshot))
+        notifications.configure_session(connection, enabled=True)
+        self.assertFalse(notifications.enqueue_waiting_reason(connection, repo, snapshot))
+        self.assertEqual(self.events(connection), [])
+
+        with_requirement = work_exhaustion.WorkReasonSnapshot(
+            snapshot.cycle, snapshot.plans,
+            ({"id": "[R-031]", "path": "docs/requirements/[R-031] x.md",
+              "reason": "archive 확인 대기"},), None, None,
+        )
+        notifications.enqueue_waiting_reason(connection, repo, with_requirement)
+        failed = mock.Mock(side_effect=RuntimeError("network unavailable"))
+        self.assertEqual(notifications.dispatch_pending(
+            connection, "token", "chat", adapter=failed,
+        ), 0)
+        event = self.events(connection)[0]
+        self.assertEqual(event["attempts"], 1)
+        self.assertIsNone(event["sent_at"])
+        delivered = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(
+            connection, "token", "chat", adapter=delivered,
+        ), 1)
+        self.assertIsNotNone(self.events(connection)[0]["sent_at"])
 
 
 if __name__ == "__main__":
