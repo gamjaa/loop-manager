@@ -406,6 +406,15 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
         (self.worktree / "code.py").write_text("checkpoint\n", encoding="utf-8")
         self.run_git(self.worktree, "add", "code.py")
         self.run_git(self.worktree, "commit", "-m", "Blocked checkpoint")
+        if reason == "review_retry_exhausted":
+            self.connection.execute(
+                "UPDATE exec_plans SET worker_result = ? WHERE plan_id = 'G-034'",
+                (
+                    "COMMIT_TITLE: Repair checkpoint review issue\n"
+                    "PR_SUMMARY: Preserve the blocked review evidence.\n"
+                    "TARGETED_TESTS:\ntest_checkpoint: PASS",
+                ),
+            )
         request = self.block(reason, evidence=evidence)
         oid = self.run_git(self.worktree, "rev-parse", "HEAD")
         self.run_git(

@@ -15044,6 +15044,25 @@ def _remote_checkpoint_has_new_failure(
     )
 
 
+def _remote_checkpoint_review_revision(
+    repo_path: Path, worktree: Path, base_branch: str,
+) -> tuple[str, str] | None:
+    """Read the latest base and a candidate HEAD that contains that base."""
+    git(repo_path, "fetch", "origin")
+    base = git(
+        repo_path, "rev-parse", f"refs/remotes/origin/{base_branch}^{{commit}}",
+    ).stdout.strip()
+    head = git(worktree, "rev-parse", "HEAD^{commit}").stdout.strip()
+    if not base or not head:
+        raise RuntimeError("원격 checkpoint 검증 revision을 확인할 수 없습니다.")
+    ancestry = git(
+        repo_path, "merge-base", "--is-ancestor", base, head, check=False,
+    ).returncode
+    if ancestry not in {0, 1}:
+        raise RuntimeError("원격 checkpoint 후보의 base ancestry를 확인할 수 없습니다.")
+    return (base, head) if ancestry == 0 else None
+
+
 def _evaluate_remote_checkpoint_cause(
     connection: sqlite3.Connection, repo_path: Path, state_dir: Path,
     repo: str, blocked: sqlite3.Row, config_path: Path | None,
@@ -15054,11 +15073,24 @@ def _evaluate_remote_checkpoint_cause(
     config = config_path or ROOT / "config/config.ini"
     timeout = (timeout_seconds if timeout_seconds is not None
                else load_managed_config(config).verify_timeout_seconds)
+    project = connection.execute(
+        "SELECT provider, base_branch FROM projects WHERE repo = ?", (repo,),
+    ).fetchone()
+    revision = _remote_checkpoint_review_revision(
+        repo_path, worktree, str(project["base_branch"]),
+    )
+    if revision is None:
+        return False, "원격 checkpoint 후보가 최신 base를 포함하지 않습니다.", "stale_base"
     before = capture_git_snapshot(worktree)
     passed, output = verify(worktree, timeout)
     validate_agent_scope(
         "reviewer", worktree, before, capture_git_snapshot(worktree),
         external_worktree=repo_path,
+    )
+    validation_feedback_state.ValidationFeedbackRepository(connection).record_result(
+        repo, str(blocked["plan_id"]), revision[0], "verify",
+        "success" if passed else "failure",
+        str(getattr(output, "fingerprint_source", output)),
     )
     if not passed:
         return _remote_checkpoint_has_new_failure(
@@ -15066,23 +15098,35 @@ def _evaluate_remote_checkpoint_cause(
         ), str(output), "verify"
     if blocked["blocked_reason"] == BlockReasonCode.VERIFY_RETRY_EXHAUSTED.value:
         return True, str(output), None
-    project = connection.execute(
-        "SELECT provider, base_branch FROM projects WHERE repo = ?", (repo,),
-    ).fetchone()
+    try:
+        worker_publication = parse_worker_result(
+            str(blocked["worker_result"] or ""),
+            {"id": str(blocked["plan_id"]), "title": str(blocked["title"])},
+        )
+    except WorkerResultError as error:
+        return False, f"원격 checkpoint Worker 결과 검증 실패: {error}", "worker"
+    targeted_test_reason = reviewer_targeted_test_reason(
+        worker_publication.test_evidence,
+    )
     previous_review = blocked["review_result"]
     protocol_error = None
     for attempt in range(1, MAX_REVIEWER_PROTOCOL_ATTEMPTS + 1):
+        if _remote_checkpoint_review_revision(
+            repo_path, worktree, str(project["base_branch"]),
+        ) != revision:
+            return False, "원격 checkpoint verify 뒤 base 또는 HEAD가 변경됐습니다.", "revision_drift"
+        review_before = capture_git_snapshot(worktree)
         code, review = run_agent(
             str(project["provider"]), worktree, state_dir, config, "reviewer",
             reviewer_prompt(
-                str(project["base_branch"]), blocked["worker_result"], str(output),
-                previous_review, session_recovery=True,
+                str(project["base_branch"]), targeted_test_reason, previous_review,
+                session_recovery=True,
                 protocol_error=protocol_error,
             ),
             read_only=True,
         )
         validate_agent_scope(
-            "reviewer", worktree, before, capture_git_snapshot(worktree),
+            "reviewer", worktree, review_before, capture_git_snapshot(worktree),
             external_worktree=repo_path,
         )
         if code:
@@ -15487,6 +15531,8 @@ def _reconcile_published_blocked_checkpoint(
             except (OSError, RuntimeError, ValueError) as error:
                 return retry(f"원격 checkpoint Reviewer 프로토콜 차단 기록 미완료: {error}")
             return "blocked"
+        if new_failure_stage == "revision_drift":
+            return retry(assessment)
         if not resolved:
             detail = "원격 checkpoint 원인 유지:\n" + assessment
             with connection:
@@ -16506,7 +16552,9 @@ TARGETED_TESTS:
 
 
 _TARGETED_TEST_FAILURE = re.compile(
-    r"(?i)(?<![\w])(?:FAIL(?:ED|URES?)?|ERRORS?|실패)(?![\w])"
+    r"(?i)(?<![\w])(?:FAIL(?:ED|URES?)?|ERRORS?|실패"
+    r"|(?:did|does|do|has|have|had|was|were|is|are)\s+not\s+pass(?:ed)?"
+    r"|(?:not|never|didn't|doesn't|don't)\s+pass(?:ed)?)(?![\w])"
 )
 _TARGETED_TEST_EXCEPTION_FAILURE = re.compile(
     r"(?m)(?<![\w])[A-Z][A-Za-z0-9_]*(?:Error|Exception)"
@@ -16630,6 +16678,15 @@ def parse_worker_result(message: str, plan: dict[str, object]) -> WorkerPublicat
         raise WorkerResultError(
             "Worker가 해결되지 않은 targeted unit test 실패를 보고했습니다."
         )
+    no_test_reason = reviewer_targeted_test_reason(test_evidence)
+    if _NO_RUNNABLE_TARGETED_TEST.search(test_evidence) and not no_test_reason:
+        raise WorkerResultError(
+            "Worker targeted unit test 미실행 사유에서 성공 내역을 제외하고 구체적인 이유를 보고해야 합니다."
+        )
+    if not (_TARGETED_TEST_SUCCESS.search(test_evidence) or no_test_reason):
+        raise WorkerResultError(
+            "Worker targeted unit test 통과 결과 또는 실행하지 못한 구체적인 사유가 필요합니다."
+        )
 
     plan_id = str(plan["id"])
     plan_title = str(plan["title"])
@@ -16654,6 +16711,61 @@ def parse_worker_result(message: str, plan: dict[str, object]) -> WorkerPublicat
             "Worker commit 제목은 ExecPlan 제목이나 일반적인 변경 문구가 아니라 실제 변경을 설명해야 합니다."
         )
     return WorkerPublication(title, summary, test_evidence)
+
+
+_NO_RUNNABLE_TARGETED_TEST = re.compile(
+    r"(?:"
+    r"(?:(?:실행 가능한|적용할|관련)\s+)*(?:targeted\s+)?unit\s+tests?(?:가|를|는)?\s+"
+    r"(?:없(?:어|어서|었습니다|습니다|다)"
+    r"|(?:실행|수행)(?:할\s+수\s+없|하지\s+(?:않았|못했))(?:습니다|다))"
+    r"|no runnable targeted (?:unit )?tests?"
+    r")",
+    re.IGNORECASE,
+)
+_TARGETED_TEST_METADATA = re.compile(
+    r"(?i)(?<![\w])(?:[\w./-]+\s*:\s*)?"
+    r"(?:\d+\s+tests?\s+)?"
+    r"(?:PASS(?:ED)?|SUCCESS|OK|성공|통과)(?![\w])(?:\s*\([^)]*\))?"
+    r"|(?i:(?<![\w])(?:FAILED_COMMAND|RERUN):)"
+    r"|(?i:(?<![\w])(?:python\d*(?:\.\d+)?\s+-m\s+unittest|pytest|npm\s+test)\b)"
+)
+_INLINE_TEST_COMMAND = re.compile(
+    r"(?i)(?<![\w])(?:python\d*(?:\.\d+)?\s+-m\s+unittest|pytest|npm\s+test)\b"
+)
+
+
+def reviewer_targeted_test_reason(test_evidence: str) -> str | None:
+    """Return only an explicit exceptional no-test disposition for review.
+
+    Successful test prose is deliberately not interpreted: the validated Worker
+    result and verify checkpoint are the program's evidence for entering Review.
+    """
+    for line in test_evidence.splitlines():
+        for clause in re.split(r"[;|]", line):
+            normalized = " ".join(clause.split())
+            match = _NO_RUNNABLE_TARGETED_TEST.search(normalized)
+            if match is None:
+                continue
+            if any(command.start() < match.start()
+                   for command in _INLINE_TEST_COMMAND.finditer(normalized)):
+                continue
+            metadata = list(_TARGETED_TEST_METADATA.finditer(normalized))
+            start = max(
+                (item.end() for item in metadata if item.end() <= match.start()),
+                default=0,
+            )
+            end = min(
+                (item.start() for item in metadata if item.start() >= match.end()),
+                default=len(normalized),
+            )
+            reason = normalized[start:end].lstrip(" :;|,.-").rstrip(" :;|,")
+            reason_match = _NO_RUNNABLE_TARGETED_TEST.search(reason)
+            if reason_match and (
+                reason[:reason_match.start()].strip(" :;|,.-")
+                or reason[reason_match.end():].strip(" :;|,.-")
+            ):
+                return reason[:600]
+    return None
 
 def immutable_github_blob_url(origin_url: str, commit_sha: str, relative_path: str) -> str:
     if not re.fullmatch(r"[0-9a-fA-F]{7,64}", commit_sha):
@@ -17107,15 +17219,18 @@ def build_pr_body(
 
 def reviewer_prompt(
     base: str,
-    worker_result: str | None = None,
-    verify_result: str | None = None,
+    targeted_test_reason: str | None = None,
     review_result: str | None = None,
     *,
     session_recovery: bool = False,
     protocol_error: str | None = None,
 ) -> str:
-    worker_evidence = (worker_result or "Worker가 targeted unit test 결과 또는 미실행 사유를 보고하지 않았습니다.")[-6000:]
-    verify_evidence = (verify_result or "Loop Manager 전체 verify가 성공했습니다(출력 없음).")[-6000:]
+    targeted_test_context = ""
+    if targeted_test_reason:
+        targeted_test_context = (
+            "\n관련 targeted unit test를 실행하지 못한 사유:\n"
+            f"{targeted_test_reason}\n"
+        )
     recovery = ""
     if session_recovery:
         recovery = (
@@ -17135,14 +17250,10 @@ def reviewer_prompt(
     return f"""
 origin/{base}와 현재 HEAD의 차이를 읽기 전용으로 검토하라.
 AGENTS.md, 근거 PRODUCT/Requirement, ARCHITECTURE와 ExecPlan을 기준으로 correctness, 회귀, 테스트 누락, verify 약화를 확인하라.
-Worker가 보고한 targeted unit test 결과 또는 미실행 사유:
-{worker_evidence}
-
-Loop Manager가 실행한 전체 verify 결과:
-{verify_evidence}
+{targeted_test_context}
 {recovery}
 {correction}
-테스트 command와 scripts/verify를 실행하지 말고, 코드·테스트·verify 스크립트의 diff 및 위 결과만으로 판단하라.
+테스트 command와 scripts/verify를 실행하지 말고, 코드·테스트·verify 스크립트의 diff와 필요한 미실행 사유만으로 판단하라.
 blocking issue마다 설명 직전에 `ISSUE_ID: relative/path::stable-symbol-or-test::category-slug`를 한 줄로 기록하라.
 relative/path는 `/`로 구분한 실제 저장소 상대 경로이며 공백과 대괄호를 허용하지만, 절대 경로·빈 구성요소·`.`·`..`·역슬래시·colon·제어문자는 허용하지 않는다.
 ISSUE_ID에는 줄 번호나 자연어 설명을 넣지 말고, 같은 issue가 재발하면 위치·표현이 바뀌어도 이전과 정확히 같은 ID를 사용하라.
@@ -20921,6 +21032,7 @@ def _ExecutionLifecyclePorts(connection, runtime_repository, **identity):
             'ReviewerProtocolError', 'TRANSIENT_AGENT_ERROR_PREFIX',
             'USAGE_LIMIT_ERROR_PREFIX', 'WORKSPACE_OWNED', 'WORKSPACE_RESERVED',
             'WorkerResultError', 'WorkspaceOwnershipError',
+            'reviewer_targeted_test_reason',
             'VerifyTerminationUncertain',
         )}),
         workspace=execution_handlers.WorkspaceEffects(
