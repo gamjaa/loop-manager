@@ -168,7 +168,16 @@ def _adopt_legacy_block_notices(connection: sqlite3.Connection) -> None:
         if current_key is None:
             continue
         if subject == "planning":
-            if event_key != current_key:
+            current_error = connection.execute(
+                "SELECT planning_error FROM projects WHERE repo = ?", (repo,),
+            ).fetchone()
+            # Legacy planning notices reused a constant key across incidents.
+            # A different saved cause proves this notice belongs to an earlier
+            # error; a later Planner invocation proves the old error cleared,
+            # even if the next error has identical text.
+            if (event_key != current_key or current_error is None
+                    or payload.get("cause") != current_error[0]
+                    or _planner_started_after_notice(connection, repo, str(row[5]))):
                 continue
         elif subject.startswith("plan:"):
             block = connection.execute(
@@ -226,6 +235,25 @@ def _adopt_legacy_block_notices(connection: sqlite3.Connection) -> None:
                     "delivery_started_at = NULL WHERE event_key = ? "
                     "AND sent_at IS NULL AND canceled_at IS NULL", (row[0],),
                 )
+
+
+def _planner_started_after_notice(
+    connection: sqlite3.Connection, repo: str, notice_created_at: str,
+) -> bool:
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'agent_invocations'"
+    ).fetchone() is None:
+        return False
+    # Outbox timestamps have second precision. Treat same-second starts as
+    # ambiguous instead of mistaking the invocation that caused the notice
+    # for a later episode.
+    return connection.execute(
+        "SELECT 1 FROM agent_invocations WHERE repo = ? "
+        "AND role IN ('planner', 'maintenance_planner') "
+        "AND julianday(started_at) >= julianday(?) + 1.0 / 86400 LIMIT 1",
+        (repo, notice_created_at),
+    ).fetchone() is not None
 
 
 def configure_session(connection: sqlite3.Connection, *, enabled: bool) -> None:

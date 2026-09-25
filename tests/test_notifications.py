@@ -136,6 +136,87 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
             "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'blocked'"
         ).fetchone()[0], 1)
 
+    def test_prior_planning_notice_does_not_notify_new_error_with_reused_key(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        old_key = notifications._key("blocked", repo, "project\0planning_error\0")
+        old_payload = {
+            "project": "alpha", "stage": "planning", "scope": "project",
+            "reason_code": "planning_error", "execplan_id": None,
+            "cause": "previous resolved error", "paths": [],
+        }
+        with connection:
+            connection.execute("DROP TABLE block_notice_events")
+            connection.execute("DROP TABLE notified_block_incidents")
+            connection.execute(
+                "UPDATE projects SET planning_error = 'new undelivered error' "
+                "WHERE repo = ?", (repo,),
+            )
+            connection.execute(
+                "INSERT INTO notification_outbox "
+                "(event_key, repo, event_type, payload, sent_at) "
+                "VALUES (?, ?, 'blocked', ?, CURRENT_TIMESTAMP)",
+                (old_key, repo, json.dumps(old_payload)),
+            )
+        with connection:
+            notifications.enqueue_current_project_events(connection, repo)
+        self.assertEqual(connection.execute(
+            "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'blocked'"
+        ).fetchone()[0], 2)
+        self.assertEqual(connection.execute(
+            "SELECT COUNT(*) FROM notified_block_incidents WHERE repo = ?",
+            (repo,),
+        ).fetchone()[0], 1)
+        loop_manager.update_project(connection, repo, planning_error=None)
+        with connection:
+            self.assertEqual(notifications.record_work_start(
+                connection, repo, "Planner",
+            ), 0)
+        self.assertEqual(connection.execute(
+            "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'resumed'"
+        ).fetchone()[0], 0)
+
+    def test_identical_planning_error_after_later_planner_start_is_new_incident(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        key = notifications._key("blocked", repo, "project\0planning_error\0")
+        payload = {
+            "project": "alpha", "stage": "planning", "scope": "project",
+            "reason_code": "planning_error", "execplan_id": None,
+            "cause": "repeated error", "paths": [],
+        }
+        with connection:
+            connection.execute("DROP TABLE block_notice_events")
+            connection.execute("DROP TABLE notified_block_incidents")
+            connection.execute(
+                "UPDATE projects SET planning_error = 'repeated error' WHERE repo = ?",
+                (repo,),
+            )
+            connection.execute(
+                "INSERT INTO notification_outbox "
+                "(event_key, repo, event_type, payload, sent_at, created_at) "
+                "VALUES (?, ?, 'blocked', ?, CURRENT_TIMESTAMP, '2000-01-01 00:00:00')",
+                (key, repo, json.dumps(payload)),
+            )
+            connection.execute(
+                "INSERT INTO agent_invocations "
+                "(invocation_id, repo, role, provider, model, effort, transition, "
+                "attempt, started_at) VALUES "
+                "('later-planner', ?, 'planner', 'codex', 'model', 'high', "
+                "'start', 1, '2000-01-02T00:00:00+00:00')",
+                (repo,),
+            )
+        with connection:
+            notifications.enqueue_current_project_events(connection, repo)
+        self.assertEqual(connection.execute(
+            "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'blocked'"
+        ).fetchone()[0], 2)
+        loop_manager.update_project(connection, repo, planning_error=None)
+        with connection:
+            self.assertEqual(notifications.record_work_start(
+                connection, repo, "Planner",
+            ), 0)
+
     def test_legacy_partial_project_notice_cancels_remaining_piece_on_release(self):
         connection = self.connection()
         repo = "/projects/alpha"
