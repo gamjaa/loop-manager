@@ -6,6 +6,8 @@ from pathlib import Path
 from dataclasses import asdict
 import hashlib
 import json
+import document_drafts
+import document_publication
 import notifications
 import re
 import subprocess
@@ -181,6 +183,91 @@ class ExecutionHandlers:
 
     def _row(self):
         return self.effects.state.row()
+
+    def _document_draft(self, context):
+        if not self.effects.agent.is_loop_manager_repository(self.repo_path):
+            return None
+        draft = document_drafts.DocumentDraftRepository(
+            self.effects.state.connection,
+        ).for_plan(self.repo, context.plan.plan_id)
+        try:
+            claim = document_publication.plan_claim(
+                document_publication.read_plan_text(context.worktree / context.plan.path)
+            )
+        except (OSError, UnicodeError) as error:
+            raise document_drafts.DocumentDraftError(
+                '문서 ExecPlan identity를 읽을 수 없습니다.'
+            ) from error
+        if (claim is None) != (draft is None) or (
+            claim is not None and draft is not None and claim != draft.draft_id
+        ):
+            raise document_drafts.DocumentDraftError(
+                '문서 ExecPlan과 승인 매핑 identity가 다릅니다.'
+            )
+        return draft
+
+    def _document_block(self, context, draft, error):
+        detail = f"승인 문서 게시 중단: {error}"
+        with self.effects.state.connection:
+            document_drafts.DocumentDraftRepository(
+                self.effects.state.connection,
+            ).record_publication_error(draft.draft_id, detail)
+        return self._block_final(
+            self.repo, context.worktree, detail,
+            str(self._row()['verify_result'] or ''),
+            reason=BlockReasonCode.REVIEW_SPECIFICATION_DEADLOCK,
+            user_targets=(draft.target_path,),
+        )
+
+    def _document_guard(self, context, draft):
+        drafts = document_drafts.DocumentDraftRepository(
+            self.effects.state.connection,
+        )
+        drafts.assert_current(draft, self.repo_path, self.base)
+        plan_text = document_publication.read_plan_text(
+            context.worktree / context.plan.path,
+        )
+        document_publication.validate_document_plan(plan_text, self.plan, draft)
+        document_publication.validate_exact_worktree(
+            draft, context.worktree, str(self._row()['active_sha'] or ''),
+        )
+
+    def _document_review_prompt(self, base_prompt, draft):
+        if draft is None:
+            return base_prompt
+        return (
+            base_prompt
+            + "\n문서 전용 검토: 아래 승인 artifact의 원본·수정본·전체 diff와 "
+            "현재 PR diff를 비교하고 PRODUCT·Requirement·ARCHITECTURE 역할, "
+            "기존 동작·결정·Acceptance Criteria·문서 간 일관성의 의미 보존을 "
+            "판정하라. 마지막 VERDICT 앞에 DOCUMENT_MEANING: PASS 또는 "
+            "DOCUMENT_MEANING: UNCERTAIN 및 DOCUMENT_DIFF: PASS 또는 "
+            "DOCUMENT_DIFF: FAIL을 각각 한 줄로 명시하라.\n"
+            + document_drafts.review_artifact(draft)
+        )
+
+    def _run_document(self, context, draft):
+        try:
+            drafts = document_drafts.DocumentDraftRepository(
+                self.effects.state.connection,
+            )
+            drafts.assert_current(draft, self.repo_path, self.base)
+            plan_text = document_publication.read_plan_text(
+                context.worktree / context.plan.path,
+            )
+            document_publication.validate_document_plan(plan_text, self.plan, draft)
+            document_publication.apply_approved_bytes(
+                draft, context.worktree, str(self._row()['active_sha'] or ''),
+            )
+        except (document_drafts.DocumentDraftError, OSError, UnicodeError) as error:
+            return self._document_block(context, draft, error)
+        result = (
+            f"COMMIT_TITLE: Apply approved document draft {draft.draft_id[:12]}\n"
+            f"PR_SUMMARY: Apply the exact approved bytes to {draft.target_path}; "
+            "retain the source and meaning-preservation review gates.\n"
+            "TARGETED_TESTS: 문서 바이트 적용만 수행하므로 실행 가능한 관련 unit test가 없습니다."
+        )
+        return self._finish_worker(context, self._row(), result)
 
     def work_started(self, context):
         with self.effects.state.connection:
@@ -1475,8 +1562,9 @@ class ExecutionHandlers:
         self.catalog_plan = catalog_plan
         self.plan = self._cached_plan(catalog_plan)
         try:
-            archive_sources = self.effects.archive.requirement_archive_sources(
-                self.repo
+            archive_sources = (
+                () if self._document_draft(context) is not None
+                else self.effects.archive.requirement_archive_sources(self.repo)
             )
             archive_snapshot = (
                 self.effects.archive.requirement_archive_snapshot(
@@ -1908,6 +1996,9 @@ class ExecutionHandlers:
         catalog_plan = self.catalog_plan
         plan = self.plan
         assert catalog_plan is not None and plan is not None
+        draft = self._document_draft(context)
+        if draft is not None:
+            return self._run_document(context, draft)
         self.effects.events.operation_log(f"Worker 시작: {plan['id']} {plan['title']}")
         correction_turn = None
         if context.resolving_rebase:
@@ -2640,6 +2731,12 @@ class ExecutionHandlers:
         self.effects.state.check_context(context)
         row = self._row()
         assert self.catalog_plan is not None and self.plan is not None
+        draft = self._document_draft(context)
+        if draft is not None:
+            try:
+                self._document_guard(context, draft)
+            except (document_drafts.DocumentDraftError, OSError, UnicodeError) as error:
+                return self._document_block(context, draft, error)
         if self.effects.agent.validate_guidance_publication(
             self.repo,
             context.worktree,
@@ -2882,6 +2979,12 @@ class ExecutionHandlers:
         self.effects.state.check_context(context)
         row = self._row()
         assert self.catalog_plan is not None and self.plan is not None
+        draft = self._document_draft(context)
+        if draft is not None:
+            try:
+                self._document_guard(context, draft)
+            except (document_drafts.DocumentDraftError, OSError, UnicodeError) as error:
+                return self._document_block(context, draft, error)
         protocol_error: str | None = None
         verdict: str | None = None
         review = ''
@@ -2906,13 +3009,16 @@ class ExecutionHandlers:
                     self.state_dir,
                     self.config_path,
                     'reviewer',
-                    self.effects.agent.reviewer_prompt(
-                        self.base,
-                        row['worker_result'],
-                        row['verify_result'],
-                        row['review_result'],
-                        session_recovery=session_recovery,
-                        protocol_error=protocol_error,
+                    self._document_review_prompt(
+                        self.effects.agent.reviewer_prompt(
+                            self.base,
+                            row['worker_result'],
+                            row['verify_result'],
+                            row['review_result'],
+                            session_recovery=session_recovery,
+                            protocol_error=protocol_error,
+                        ),
+                        draft,
                     ),
                     read_only=True,
                     persist_session=True,
@@ -3050,6 +3156,15 @@ class ExecutionHandlers:
                 continue
             break
         assert verdict is not None
+        if draft is not None and (
+            verdict != 'PASS'
+            or not document_publication.review_confirms_publication(review)
+        ):
+            return self._document_block(
+                context, draft,
+                "Reviewer가 의미 보존과 승인 diff 일치를 명시적으로 확정하지 못했습니다. "
+                + review[-6000:],
+            )
         if verdict == 'SPEC_BLOCKED':
             self.effects.state.update_project(self.repo, review_result=review)
             self.effects.events.operation_log(
@@ -3225,6 +3340,13 @@ class ExecutionHandlers:
         self.effects.state.check_context(context)
         row = self._row()
         assert self.catalog_plan is not None and self.plan is not None
+        draft = self._document_draft(context)
+        if draft is not None:
+            try:
+                self._fetch_latest_base()
+                self._document_guard(context, draft)
+            except (document_drafts.DocumentDraftError, OSError, UnicodeError) as error:
+                return self._document_block(context, draft, error)
         publication = self._publication_resume().observe(
             self.repo_path, context.worktree, context.branch,
             str(row['publication_remote_oid'] or '') or None,
@@ -3268,6 +3390,11 @@ class ExecutionHandlers:
         latest_outcome = latest_base.reconcile(context, LatestBaseCheckpoint.BEFORE_PUBLICATION)
         if latest_outcome is not None:
             return latest_outcome
+        if draft is not None:
+            try:
+                self._document_guard(self._context(), draft)
+            except (document_drafts.DocumentDraftError, OSError, UnicodeError) as error:
+                return self._document_block(context, draft, error)
         row = self._row()
         latest_sha = str(row['active_sha'] or '')
         if context.archive_sources:

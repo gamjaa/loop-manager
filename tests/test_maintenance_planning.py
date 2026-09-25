@@ -7,13 +7,17 @@ import unittest
 from unittest import mock
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
+import document_drafts
+import document_publication
 import execplan_catalog
 import full_assessment
 import execplan_catalog_state
 import loop_manager
 import maintenance_planning
 import maintenance_state
+from planning_catalog import MutableReadySnapshot, mutable_snapshot_token
 
 
 def git(repo: Path, *arguments: str) -> str:
@@ -26,6 +30,213 @@ def git(repo: Path, *arguments: str) -> str:
         stderr=subprocess.STDOUT,
     )
     return result.stdout.strip()
+
+
+class ApprovedDocumentPlanTest(unittest.TestCase):
+    def test_crlf_approved_diff_survives_planner_validation(self):
+        original = b"# Product\r\nOld.\r\n"
+        proposed = b"# Product\r\nNew.\r\n"
+        draft = SimpleNamespace(
+            draft_id="a" * 32, state="approved", target_path="docs/PRODUCT.md",
+            decision_revision="b" * 32, original_revision="c" * 40,
+            original_hash=hashlib.sha256(original).hexdigest(),
+            proposed_hash=hashlib.sha256(proposed).hexdigest(),
+            complete_diff=document_drafts._complete_diff(
+                "docs/PRODUCT.md", original, proposed,
+            ),
+        )
+        content = document_publication.planning_instruction(draft)
+        for line in (
+            f"DOCUMENT_DRAFT_ID: {draft.draft_id}",
+            f"Target: {draft.target_path}",
+            f"Decision revision: {draft.decision_revision}",
+            f"Original revision: {draft.original_revision}",
+            f"Original SHA256: {draft.original_hash}",
+            f"Proposed SHA256: {draft.proposed_hash}",
+            f"Approved diff SHA256: {hashlib.sha256(draft.complete_diff.encode()).hexdigest()}",
+            "```diff",
+        ):
+            content = content.replace(line + "\n", line + "\r\n", 1)
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            path = "docs/plans/[G-300] Approved Product.md"
+            target = worktree / path
+            target.parent.mkdir(parents=True)
+            target.write_bytes(content.encode("utf-8"))
+            plan = {"id": "G-300", "sources": [document_publication.R027_SOURCE]}
+            result = SimpleNamespace(
+                plans=((path, plan),), revisions=(), deletions=(),
+                publication_paths=(path,),
+            )
+            connection = sqlite3.connect(":memory:")
+            self.addCleanup(connection.close)
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+                (str(worktree),),
+            )
+            drafts = mock.Mock()
+            drafts.planning_candidate.return_value = draft
+            drafts.assert_current = mock.Mock()
+            with (
+                mock.patch.object(loop_manager, "validate_planner_result", return_value=result),
+                mock.patch.object(loop_manager, "is_loop_manager_repository", return_value=True),
+                mock.patch.object(document_drafts, "DocumentDraftRepository", return_value=drafts),
+            ):
+                self.assertIs(
+                    loop_manager._PlanningValidationPorts(connection).validate_general_result(
+                        str(worktree), worktree, "d" * 40, [], None,
+                    ),
+                    result,
+                )
+            self.assertEqual(document_publication.read_plan_text(target), content)
+            with self.assertRaises(document_drafts.DocumentDraftError):
+                document_publication.validate_document_plan(
+                    content.replace("\r\n", "\n"), plan, draft,
+                )
+
+    def test_planner_validation_audits_original_changed_after_candidate_selection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            connection = sqlite3.connect(':memory:')
+            self.addCleanup(connection.close)
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+                (str(worktree),),
+            )
+            path = 'docs/plans/[G-300] Approved Product.md'
+            target = worktree / path
+            target.parent.mkdir(parents=True)
+            draft_id = 'a' * 32
+            target.write_text('DOCUMENT_DRAFT_ID: ' + draft_id + '\n', encoding='utf-8')
+            result = SimpleNamespace(
+                plans=((path, {'id': 'G-300'}),), revisions=(), deletions=(),
+                publication_paths=(path,),
+            )
+            drafts = mock.Mock()
+            drafts.planning_candidate.return_value = SimpleNamespace(draft_id=draft_id)
+            drafts.assert_current = mock.Mock(
+                side_effect=document_drafts.DocumentDraftError('original changed'),
+            )
+            with (
+                mock.patch.object(loop_manager, 'validate_planner_result', return_value=result),
+                mock.patch.object(loop_manager, 'is_loop_manager_repository', return_value=True),
+                mock.patch.object(document_drafts, 'DocumentDraftRepository', return_value=drafts),
+            ):
+                with self.assertRaises(loop_manager.PlannerValidationError):
+                    loop_manager._PlanningValidationPorts(connection).validate_general_result(
+                        str(worktree), worktree, 'b' * 40, [], None,
+                    )
+            drafts.record_publication_error.assert_called_once_with(
+                draft_id, 'original changed',
+            )
+
+    def test_published_plan_mapping_is_atomic_and_repeatable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            connection = sqlite3.connect(":memory:")
+            self.addCleanup(connection.close)
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            loop_manager._ensure_execplans_schema(connection)
+            maintenance_state.ensure_schema(connection)
+            repo = str(worktree)
+            connection.execute(
+                "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+                (repo,),
+            )
+            original, proposed = b"# Product\r\nOld.\r\n", b"# Product\r\nNew.\r\n"
+            diff = document_drafts._complete_diff("docs/PRODUCT.md", original, proposed)
+            draft_id = "a" * 32
+            connection.execute(
+                "INSERT INTO document_drafts (draft_id, repo, finding_ids, target_path, "
+                "assessment_revision, original_revision, original_hash, original_content, "
+                "proposed_hash, proposed_content, complete_diff, source_relationships, "
+                "meaning_evidence, state, requested_decision, decision_revision) "
+                "VALUES (?, ?, '[]', 'docs/PRODUCT.md', ?, ?, ?, ?, ?, ?, ?, '[]', "
+                "'Only repeated wording changes.', 'approved', 'approve', ?)",
+                (draft_id, repo, "b" * 40, "c" * 40,
+                 hashlib.sha256(original).hexdigest(), original,
+                 hashlib.sha256(proposed).hexdigest(), proposed, diff, "d" * 32),
+            )
+            draft = document_drafts.DocumentDraftRepository(connection).get(draft_id)
+            path = "docs/plans/[G-300] Approved Product Wording.md"
+            target = worktree / path
+            target.parent.mkdir(parents=True)
+            target.write_text(
+                "## Approved Document Draft\n" + document_publication.planning_instruction(draft),
+                encoding="utf-8",
+            )
+            plan = {"id": "G-300", "sources": [document_publication.R027_SOURCE]}
+            snapshot = MutableReadySnapshot(
+                repo=repo, active_sha="e" * 40, plans=(),
+                token=mutable_snapshot_token(repo, "e" * 40, ()),
+            )
+            result = loop_manager.ValidatedPlanningResult(
+                plans=((path, plan),), publication_paths=(path,),
+                mutable_snapshot=snapshot,
+            )
+            intent = SimpleNamespace(
+                stage="prepared", base_sha=snapshot.active_sha,
+                commit_sha="f" * 40, snapshot_token=snapshot.token,
+                specification_fingerprint="spec", planning_fingerprint="plan",
+            )
+            with (
+                mock.patch.object(loop_manager, "is_loop_manager_repository", return_value=True),
+                mock.patch.object(loop_manager, "general_planning_publication", return_value=intent),
+                mock.patch.object(loop_manager, "_assert_mutable_ready_snapshot_current"),
+                mock.patch.object(loop_manager, "_register_execplan_rows"),
+                mock.patch.object(loop_manager, "_clear_active_in_current_transaction"),
+            ):
+                for _ in range(2):
+                    loop_manager._apply_general_planning_batch(
+                        connection, repo, worktree, result, "f" * 40, "spec", "plan",
+                    )
+                plan["id"] = "G-301"
+                with self.assertRaises(loop_manager.PlannerValidationError):
+                    loop_manager._apply_general_planning_batch(
+                        connection, repo, worktree, result, "f" * 40, "spec", "plan",
+                    )
+            self.assertEqual(
+                document_drafts.DocumentDraftRepository(connection).get(draft_id).plan_id,
+                "G-300",
+            )
+
+    def test_plan_claim_binds_one_approved_diff_and_r027_source(self):
+        original = b"# Product\n\nRepeated rule.\n"
+        proposed = b"# Product\n\nRule.\n"
+        draft = SimpleNamespace(
+            draft_id="a" * 32, state="approved", target_path="docs/PRODUCT.md",
+            decision_revision="b" * 32, original_revision="c" * 40,
+            original_hash=hashlib.sha256(original).hexdigest(),
+            proposed_hash=hashlib.sha256(proposed).hexdigest(),
+            complete_diff=document_drafts._complete_diff(
+                "docs/PRODUCT.md", original, proposed,
+            ),
+        )
+        text = "## Approved Document Draft\n" + document_publication.planning_instruction(draft)
+        plan = {"sources": [document_publication.R027_SOURCE]}
+        document_publication.validate_document_plan(text, plan, draft)
+        self.assertEqual(document_publication.plan_claim(text), draft.draft_id)
+        with self.assertRaises(document_drafts.DocumentDraftError):
+            document_publication.validate_document_plan(
+                text.replace("-Repeated rule.", "-Different rule."), plan, draft,
+            )
+        with self.assertRaises(document_drafts.DocumentDraftError):
+            document_publication.validate_document_plan(text, {"sources": ["docs/PRODUCT.md"]}, draft)
+        self.assertTrue(document_publication.review_confirms_publication(
+            "DOCUMENT_MEANING: PASS\nDOCUMENT_DIFF: PASS\nVERDICT: PASS",
+        ))
+        self.assertTrue(document_publication.review_confirms_publication(
+            "DOCUMENT_MEANING: PASS\r\nDOCUMENT_DIFF: PASS\r\nVERDICT: PASS",
+        ))
+        self.assertFalse(document_publication.review_confirms_publication(
+            "DOCUMENT_MEANING: PASS\nDOCUMENT_MEANING: UNCERTAIN\n"
+            "DOCUMENT_DIFF: PASS\nVERDICT: PASS",
+        ))
 
 
 def plan_text(

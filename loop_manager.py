@@ -124,6 +124,7 @@ from maintenance_orchestration import (
 )
 import maintenance_git
 import maintenance_state
+import document_publication
 import scoped_blocking
 import agent_scope_decision
 from scoped_blocking import BlockReasonCode, BlockScope
@@ -3727,6 +3728,28 @@ def record_general_planning_publication_intent(
         )
     _assert_mutable_ready_snapshot_current(connection, snapshot)
     _validate_general_planning_commit(worktree, result, plan_commit)
+    if is_loop_manager_repository(Path(repo)):
+        import document_drafts
+        project = connection.execute(
+            "SELECT base_branch FROM projects WHERE repo = ?", (repo,),
+        ).fetchone()
+        if project is None:
+            raise PlannerValidationError("문서 계획의 등록 프로젝트가 없습니다.")
+        drafts = document_drafts.DocumentDraftRepository(connection)
+        try:
+            for path, plan in result.plans:
+                plan_text = document_publication.read_plan_text(worktree / path)
+                claim = document_publication.plan_claim(plan_text)
+                if claim is not None:
+                    try:
+                        draft = drafts.get(claim)
+                        document_publication.validate_document_plan(plan_text, plan, draft)
+                        drafts.assert_current(draft, Path(repo), str(project["base_branch"]))
+                    except document_drafts.DocumentDraftError as error:
+                        drafts.record_publication_error(claim, str(error))
+                        raise
+        except (document_drafts.DocumentDraftError, OSError, UnicodeError) as error:
+            raise PlannerValidationError(str(error)) from error
     manifest = _planning_result_manifest(result)
     manifest_hash = hashlib.sha256(manifest.encode("utf-8")).hexdigest()
     expected = (
@@ -4089,6 +4112,19 @@ def _apply_general_planning_batch(
         _register_execplan_rows(
             connection, repo, worktree, list(result.plans), plan_commit
         )
+        if is_loop_manager_repository(Path(repo)):
+            import document_drafts
+            drafts = document_drafts.DocumentDraftRepository(connection)
+            try:
+                for path, plan in result.plans:
+                    plan_text = document_publication.read_plan_text(worktree / path)
+                    claim = document_publication.plan_claim(plan_text)
+                    if claim is not None:
+                        draft = drafts.get(claim)
+                        document_publication.validate_document_plan(plan_text, plan, draft)
+                        drafts.bind_plan(repo, claim, str(plan["id"]))
+            except (document_drafts.DocumentDraftError, OSError, UnicodeError) as error:
+                raise PlannerValidationError(str(error)) from error
         _clear_active_in_current_transaction(
             connection,
             repo,
@@ -17157,6 +17193,16 @@ class _PlanningStatePorts:
     def schedule(self, repo: str) -> CatalogScheduleDecision:
         return catalog_schedule_decision(self._connection, repo)
 
+    def pending_document_approval(
+        self, repo: str, repository: Path, base_branch: str,
+    ) -> bool:
+        if not is_loop_manager_repository(repository):
+            return False
+        import document_drafts
+        return bool(document_drafts.DocumentDraftRepository(
+            self._connection,
+        ).unplanned_approved(repo, repository, base_branch))
+
     def maintenance_due(
         self, repo: str, interval: int, *, self_repository: bool = False
     ) -> maintenance_state.ReviewDue:
@@ -18199,7 +18245,23 @@ class _PlanningValidationPorts:
         catalog: str,
         mutable_snapshot: MutableReadySnapshot,
     ) -> str:
-        return planner_prompt(error, catalog, mutable_snapshot)
+        prompt = planner_prompt(error, catalog, mutable_snapshot)
+        import document_drafts
+        repository = Path(mutable_snapshot.repo)
+        if is_loop_manager_repository(repository):
+            project = self._connection.execute(
+                "SELECT base_branch FROM projects WHERE repo = ?",
+                (mutable_snapshot.repo,),
+            ).fetchone()
+            if project is not None:
+                candidate = document_drafts.DocumentDraftRepository(
+                    self._connection,
+                ).planning_candidate(
+                    mutable_snapshot.repo, repository, str(project["base_branch"]),
+                )
+                if candidate is not None:
+                    prompt += document_publication.planning_instruction(candidate)
+        return prompt
 
     def maintenance_prompt(
         self,
@@ -18226,7 +18288,7 @@ class _PlanningValidationPorts:
         dirty_files: list[str],
         mutable_snapshot: MutableReadySnapshot,
     ) -> ValidatedPlanningResult | None:
-        return validate_planner_result(
+        result = validate_planner_result(
             worktree,
             active_sha,
             dirty_files,
@@ -18234,6 +18296,46 @@ class _PlanningValidationPorts:
             repo=repo,
             mutable_snapshot=mutable_snapshot,
         )
+        import document_drafts
+        repository = Path(repo)
+        if not is_loop_manager_repository(repository):
+            return result
+        project = self._connection.execute(
+            "SELECT base_branch FROM projects WHERE repo = ?", (repo,),
+        ).fetchone()
+        if project is None:
+            return result
+        drafts = document_drafts.DocumentDraftRepository(self._connection)
+        candidate = drafts.planning_candidate(
+            repo, repository, str(project["base_branch"]),
+        )
+        claims = []
+        for path, plan in result.plans if result is not None else ():
+            text = document_publication.read_plan_text(worktree / path)
+            try:
+                claim = document_publication.plan_claim(text)
+            except document_drafts.DocumentDraftError as error:
+                raise PlannerValidationError(str(error)) from error
+            if claim is not None:
+                claims.append((text, plan, claim))
+        if candidate is not None:
+            if (result is None or len(result.plans) != 1 or result.revisions
+                or result.deletions or result.publication_paths != (result.plans[0][0],)
+                or len(claims) != 1 or claims[0][2] != candidate.draft_id):
+                raise PlannerValidationError(
+                    "승인 문서 수정본에는 별도 새 ExecPlan 하나만 필요합니다."
+                )
+            try:
+                drafts.assert_current(candidate, repository, str(project["base_branch"]))
+                document_publication.validate_document_plan(
+                    claims[0][0], claims[0][1], candidate,
+                )
+            except document_drafts.DocumentDraftError as error:
+                drafts.record_publication_error(candidate.draft_id, str(error))
+                raise PlannerValidationError(str(error)) from error
+        elif claims:
+            raise PlannerValidationError("계획할 승인 문서 수정본이 없습니다.")
+        return result
 
     def validate_maintenance_result(
         self,

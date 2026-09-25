@@ -180,6 +180,10 @@ class PlanningStatePort(Protocol):
 
     def schedule(self, repo: str) -> Any: ...
 
+    def pending_document_approval(
+        self, repo: str, repository: Path, base_branch: str,
+    ) -> bool: ...
+
     def maintenance_due(self, repo: str, interval: int) -> Any: ...
 
     def begin_maintenance_assessment(
@@ -667,10 +671,18 @@ class PlanningLifecycleCoordinator:
             )
             row = self._ports.state.planning(context.repo)
         decision = self._ports.state.schedule(context.repo)
+        approval_pending = (
+            context.self_repository
+            and cycle.phase is maintenance_state.MaintenancePhase.IDLE
+            and self._ports.state.pending_document_approval(
+                context.repo, context.repo_path, context.base_branch,
+            )
+        )
         if (
             context.registered_only
             and cycle.phase is maintenance_state.MaintenancePhase.IDLE
             and not decision.has_waiting
+            and not approval_pending
         ):
             due = self._ports.state.maintenance_due(
                 context.repo, context.refactoring_review_interval,
@@ -760,7 +772,7 @@ class PlanningLifecycleCoordinator:
             )
             run.selection = choose_planning_decision(
                 has_active=getattr(decision, "active", None) is not None,
-                specification_changed=specification_changed,
+                specification_changed=specification_changed or approval_pending,
                 runnable_ready=decision.runnable_ready is not None,
                 planning_input_changed=planning_input_changed,
                 has_waiting_catalog=bool(

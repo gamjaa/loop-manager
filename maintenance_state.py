@@ -72,6 +72,8 @@ CREATE TABLE IF NOT EXISTS document_drafts (
     requested_decision TEXT,
     decision_revision TEXT,
     decision_reason TEXT,
+    plan_id TEXT,
+    publication_error TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     decided_at TEXT,
     FOREIGN KEY (repo) REFERENCES projects(repo)
@@ -137,6 +139,16 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
             connection.execute(
                 f"ALTER TABLE maintenance_cycles ADD COLUMN {column} {definition}"
             )
+    draft_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(document_drafts)")
+    }
+    for column in ("plan_id", "publication_error"):
+        if column not in draft_columns:
+            connection.execute(f"ALTER TABLE document_drafts ADD COLUMN {column} TEXT")
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS document_drafts_plan "
+        "ON document_drafts(repo, plan_id) WHERE plan_id IS NOT NULL"
+    )
 
 
 def calculate_review_due(

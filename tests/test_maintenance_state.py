@@ -9,12 +9,185 @@ from pathlib import Path
 from unittest import mock
 
 import document_drafts
+import document_publication
 import loop_manager
 import maintenance_git
 import maintenance_state
 
 
 class DocumentDraftTest(unittest.TestCase):
+    def test_approved_document_bytes_apply_once_and_reject_unrelated_edits(self):
+        draft = self._create()
+        approved = self.drafts.decide(
+            draft.draft_id, draft.proposed_hash, "approve", self.repo, "main",
+        )
+        self.drafts.bind_plan(str(self.repo), approved.draft_id, "G-300")
+        self.assertEqual(
+            self.drafts.for_plan(str(self.repo), "G-300").draft_id,
+            approved.draft_id,
+        )
+        with self.assertRaises(document_drafts.DocumentDraftError):
+            self.drafts.bind_plan(str(self.repo), approved.draft_id, "G-301")
+        worktree = self.root / "managed"
+        self._git("worktree", "add", "--detach", str(worktree), self.source_sha)
+        document_publication.apply_approved_bytes(approved, worktree, self.source_sha)
+        document_publication.apply_approved_bytes(approved, worktree, self.source_sha)
+        self.assertEqual((worktree / approved.target_path).read_bytes(), approved.proposed_content)
+        (worktree / "AGENTS.md").write_text("unauthorized\n", encoding="utf-8")
+        with self.assertRaises(document_drafts.DocumentDraftError):
+            document_publication.validate_exact_worktree(approved, worktree, self.source_sha)
+        (worktree / "AGENTS.md").unlink()
+        (worktree / approved.target_path).chmod(0o755)
+        with self.assertRaises(document_drafts.DocumentDraftError):
+            document_publication.validate_exact_worktree(approved, worktree, self.source_sha)
+
+    def test_newly_stale_approval_records_failed_planning_check(self):
+        draft = self._create()
+        self.drafts.decide(
+            draft.draft_id, draft.proposed_hash, "approve", self.repo, "main",
+        )
+        self.assertEqual(
+            len(self.drafts.unplanned_approved(str(self.repo), self.repo, "main")), 1,
+        )
+        (self.repo / draft.target_path).write_bytes(b"# Product\n\nChanged.\n")
+        self._git("add", draft.target_path)
+        self._git("commit", "-m", "change original")
+        self._git("update-ref", "refs/remotes/origin/main", self._git("rev-parse", "HEAD"))
+        self.assertFalse(self.drafts.unplanned_approved(str(self.repo), self.repo, "main"))
+        with self.assertRaises(document_drafts.DocumentDraftError):
+            self.drafts.assert_current(
+                self.drafts.get(draft.draft_id), self.repo, "main",
+            )
+        recorded = self.drafts.get(draft.draft_id)
+        self.assertEqual(recorded.requested_decision, "approve")
+        self.assertIn("원본 revision", recorded.publication_error)
+
+    def test_document_plan_does_not_change_its_own_source_snapshot(self):
+        target = document_publication.R027_SOURCE
+        self.database.execute(
+            "INSERT INTO exec_plans (repo, plan_id, path, title, sources, "
+            "depends_on, priority, content_hash, status) "
+            "VALUES (?, 'G-300', 'docs/plans/[G-300] Document.md', "
+            "'Document', ?, '[]', 'normal', 'hash', 'READY')",
+            (str(self.repo), json.dumps([target])),
+        )
+        self.assertEqual(
+            document_drafts.source_relationships(
+                self.database, str(self.repo), target,
+                exclude_plan_id="G-300",
+            ),
+            "[]",
+        )
+        self.assertIn(
+            "G-300",
+            document_drafts.source_relationships(self.database, str(self.repo), target),
+        )
+
+    def test_approved_listing_keeps_draft_after_its_own_plan_is_published(self):
+        draft = self._create()
+        approved = self.drafts.decide(
+            draft.draft_id, draft.proposed_hash, 'approve', self.repo, 'main',
+        )
+        path = 'docs/plans/[G-300] Approved Product.md'
+        target = self.repo / path
+        target.parent.mkdir(parents=True)
+        target.write_text(
+            '---\nid: G-300\ntitle: Approved Product\nsources:\n'
+            '  - docs/PRODUCT.md\ndepends_on: []\ncomplexity: low\n'
+            'risk: low\npriority: normal\n---\n\n## Purpose\n\nApproved change.\n',
+            encoding='utf-8',
+        )
+        self._git('add', path)
+        self._git('commit', '-m', 'publish approved plan')
+        self._git('update-ref', 'refs/remotes/origin/main', self._git('rev-parse', 'HEAD'))
+        self.database.execute(
+            "INSERT INTO exec_plans (repo, plan_id, path, title, sources, "
+            "depends_on, priority, content_hash, status) "
+            "VALUES (?, 'G-300', ?, 'Approved Product', ?, '[]', 'normal', 'hash', 'READY')",
+            (str(self.repo), path, json.dumps(['docs/PRODUCT.md'])),
+        )
+        self.drafts.bind_plan(str(self.repo), approved.draft_id, 'G-300')
+        self.assertEqual(
+            [item.draft_id for item in self.drafts.approved(str(self.repo), self.repo, 'main')],
+            [approved.draft_id],
+        )
+
+    def test_r027_document_approval_is_planned_before_other_drafts(self):
+        product = mock.Mock(target_path="docs/PRODUCT.md")
+        requirement = mock.Mock(target_path=document_publication.R027_SOURCE)
+        with mock.patch.object(
+            self.drafts, 'unplanned_approved', return_value=(product, requirement),
+        ):
+            self.assertIs(
+                self.drafts.planning_candidate(str(self.repo), self.repo, 'main'),
+                requirement,
+            )
+
+    def test_corrupt_approved_bytes_are_audited_without_creating_plan(self):
+        draft = self._create()
+        self.drafts.decide(
+            draft.draft_id, draft.proposed_hash, 'approve', self.repo, 'main',
+        )
+        self.database.execute(
+            "UPDATE document_drafts SET proposed_content = ? WHERE draft_id = ?",
+            (b'corrupt', draft.draft_id),
+        )
+        self.assertFalse(self.drafts.unplanned_approved(str(self.repo), self.repo, 'main'))
+        row = self.database.execute(
+            "SELECT requested_decision, plan_id, publication_error "
+            "FROM document_drafts WHERE draft_id = ?", (draft.draft_id,),
+        ).fetchone()
+        self.assertEqual(row['requested_decision'], 'approve')
+        self.assertIsNone(row['plan_id'])
+        self.assertIn('손상', row['publication_error'])
+
+    def test_approved_document_target_cannot_escape_managed_worktree(self):
+        draft = self._create()
+        approved = self.drafts.decide(
+            draft.draft_id, draft.proposed_hash, 'approve', self.repo, 'main',
+        )
+        worktree = self.root / 'managed'
+        worktree.mkdir()
+        (worktree / 'docs').symlink_to(self.repo / 'docs', target_is_directory=True)
+        with self.assertRaises(document_drafts.DocumentDraftError):
+            document_publication.apply_approved_bytes(
+                approved, worktree, self.source_sha,
+            )
+        self.database.execute(
+            "UPDATE document_drafts SET target_path = '../AGENTS.md' WHERE draft_id = ?",
+            (draft.draft_id,),
+        )
+        with self.assertRaises(document_drafts.DocumentDraftError):
+            self.drafts.get(draft.draft_id)
+
+    def test_approved_source_graph_change_blocks_plan_and_application(self):
+        draft = self._create()
+        approved = self.drafts.decide(
+            draft.draft_id, draft.proposed_hash, 'approve', self.repo, 'main',
+        )
+        path = 'docs/plans/[G-300] Product Source.md'
+        plan = self.repo / path
+        plan.parent.mkdir(parents=True, exist_ok=True)
+        plan.write_text(
+            '---\nid: G-300\ntitle: Product Source\nsources:\n'
+            '  - docs/PRODUCT.md\ndepends_on: []\ncomplexity: low\n'
+            'risk: low\npriority: normal\n---\n\n## Purpose\n\nSource.\n',
+            encoding='utf-8',
+        )
+        self._git('add', path)
+        self._git('commit', '-m', 'new source relation')
+        self._git('update-ref', 'refs/remotes/origin/main', self._git('rev-parse', 'HEAD'))
+        self.database.execute(
+            "INSERT INTO exec_plans (repo, plan_id, path, title, sources, "
+            "depends_on, priority, content_hash, status) "
+            "VALUES (?, 'G-300', ?, 'Product Source', ?, '[]', 'normal', 'hash', 'READY')",
+            (str(self.repo), path, json.dumps(['docs/PRODUCT.md'])),
+        )
+        self.assertFalse(self.drafts.unplanned_approved(str(self.repo), self.repo, 'main'))
+        with self.assertRaises(document_drafts.DocumentDraftError):
+            self.drafts.assert_current(approved, self.repo, 'main')
+        self.assertIn('source 관계', self.drafts.get(draft.draft_id).publication_error)
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

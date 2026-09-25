@@ -20,6 +20,12 @@ class DocumentDraftError(ValueError):
     pass
 
 
+R027_SOURCE = (
+    "docs/requirements/[R-027] Shared Quality Guidance and Full Project "
+    "Refactoring Assessment.md"
+)
+
+
 def _hash(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
@@ -62,7 +68,10 @@ def _document_path(path: str) -> bool:
     return bool(re.fullmatch(r"docs/requirements/[^/]+\.md", path))
 
 
-def source_relationships(connection: sqlite3.Connection, repo: str, path: str) -> str:
+def source_relationships(
+    connection: sqlite3.Connection, repo: str, path: str,
+    *, exclude_plan_id: str | None = None,
+) -> str:
     """Snapshot nonterminal plan IDs and their source lists for one document."""
     relationships = []
     rows = connection.execute(
@@ -76,14 +85,14 @@ def source_relationships(connection: sqlite3.Connection, repo: str, path: str) -
             raise DocumentDraftError("비종료 ExecPlan source 관계가 유효하지 않습니다.") from error
         if not isinstance(sources, list) or any(not isinstance(s, str) for s in sources):
             raise DocumentDraftError("비종료 ExecPlan source 관계가 유효하지 않습니다.")
-        if path in sources:
+        if path in sources and row["plan_id"] != exclude_plan_id:
             relationships.append([str(row["plan_id"]), sorted(sources)])
     return json.dumps(relationships, ensure_ascii=False, separators=(",", ":"))
 
 
 def checked_source_relationships(
     connection: sqlite3.Connection, repo: str, repository: Path,
-    revision: str, path: str,
+    revision: str, path: str, *, exclude_plan_id: str | None = None,
 ) -> str:
     """Require the fetched remote catalog to agree with nonterminal SQLite rows."""
     rows = connection.execute(
@@ -127,7 +136,9 @@ def checked_source_relationships(
         )}
         if any(plan_id not in merged for plan_id in remote if plan_id not in expected):
             raise DocumentDraftError("원격에 SQLite가 알지 못하는 비종료 ExecPlan이 있습니다.")
-    return source_relationships(connection, repo, path)
+    return source_relationships(
+        connection, repo, path, exclude_plan_id=exclude_plan_id,
+    )
 
 
 def _complete_diff(path: str, original: bytes, proposed: bytes) -> str:
@@ -186,6 +197,8 @@ class DocumentDraft:
     requested_decision: str | None
     decision_revision: str | None
     decision_reason: str | None
+    plan_id: str | None
+    publication_error: str | None
 
 
 class DocumentDraftRepository:
@@ -235,6 +248,7 @@ class DocumentDraftRepository:
             requested_decision=row["requested_decision"],
             decision_revision=row["decision_revision"],
             decision_reason=row["decision_reason"],
+            plan_id=row["plan_id"], publication_error=row["publication_error"],
         )
         try:
             intact = (
@@ -245,7 +259,7 @@ class DocumentDraftRepository:
             )
         except UnicodeDecodeError:
             intact = False
-        if not intact:
+        if not intact or not _document_path(draft.target_path):
             raise DocumentDraftError("저장된 문서 수정본 바이트 또는 diff가 손상됐습니다.")
         return draft
 
@@ -255,6 +269,89 @@ class DocumentDraftRepository:
             (repo,),
         )
         return tuple(self.get(row[0]) for row in ids)
+
+    def for_plan(self, repo: str, plan_id: str) -> DocumentDraft | None:
+        row = self.connection.execute(
+            "SELECT draft_id FROM document_drafts WHERE repo = ? AND plan_id = ?",
+            (repo, plan_id),
+        ).fetchone()
+        return self.get(row[0]) if row else None
+
+    def unplanned_approved(
+        self, repo: str, repository: Path, base_branch: str,
+    ) -> tuple[DocumentDraft, ...]:
+        """Return fresh approvals which do not yet own a published plan."""
+        result = []
+        ids = tuple(row[0] for row in self.connection.execute(
+            "SELECT draft_id FROM document_drafts WHERE repo = ? "
+            "AND state = 'approved' AND plan_id IS NULL ORDER BY created_at, rowid",
+            (repo,),
+        ))
+        for draft_id in ids:
+            try:
+                draft = self.get(draft_id)
+                self.assert_current(draft, repository, base_branch)
+            except DocumentDraftError as error:
+                self.record_publication_error(str(draft_id), str(error))
+            else:
+                result.append(draft)
+        return tuple(result)
+
+    def planning_candidate(
+        self, repo: str, repository: Path, base_branch: str,
+    ) -> DocumentDraft | None:
+        drafts = self.unplanned_approved(repo, repository, base_branch)
+        # A plan for another draft cites R-027. Publish an approved edit to
+        # R-027 first so that new plan does not stale its source snapshot.
+        return min(drafts, key=lambda draft: draft.target_path != R027_SOURCE) if drafts else None
+
+    def bind_plan(self, repo: str, draft_id: str, plan_id: str) -> None:
+        draft = self.get(draft_id)
+        if draft.repo != repo or draft.state != "approved":
+            raise DocumentDraftError("게시할 문서 수정본 승인이 유효하지 않습니다.")
+        if draft.plan_id == plan_id:
+            return
+        if draft.plan_id is not None:
+            raise DocumentDraftError("문서 수정본에 이미 다른 ExecPlan이 있습니다.")
+        try:
+            changed = self.connection.execute(
+                "UPDATE document_drafts SET plan_id = ? WHERE draft_id = ? "
+                "AND repo = ? AND plan_id IS NULL AND state = 'approved'",
+                (plan_id, draft_id, repo),
+            )
+        except sqlite3.IntegrityError as error:
+            raise DocumentDraftError(
+                "ExecPlan ID가 다른 문서 수정본에 이미 연결됐습니다."
+            ) from error
+        if changed.rowcount != 1:
+            raise DocumentDraftError("문서 수정본과 ExecPlan의 연결이 변경됐습니다.")
+
+    def record_publication_error(self, draft_id: str, reason: str) -> None:
+        self.connection.execute(
+            "UPDATE document_drafts SET publication_error = ? WHERE draft_id = ?",
+            (reason, draft_id),
+        )
+
+    def assert_current(
+        self, draft: DocumentDraft, repository: Path, base_branch: str,
+    ) -> str:
+        """Check the latest remote original and nonterminal source graph."""
+        revision = remote_revision(repository, base_branch)
+        original_revision, content = document_at(
+            repository, revision, draft.target_path,
+        )
+        relationships = checked_source_relationships(
+            self.connection, draft.repo, repository, revision, draft.target_path,
+            exclude_plan_id=draft.plan_id,
+        )
+        if (draft.state != "approved"
+            or original_revision != draft.original_revision
+            or _hash(content) != draft.original_hash
+            or relationships != draft.source_relationships):
+            raise DocumentDraftError(
+                "승인 뒤 원본 revision·내용 또는 비종료 ExecPlan source 관계가 변경됐습니다."
+            )
+        return revision
 
     def generation_prompt(
         self, repo: str, repository: Path, base_branch: str, path: str,
@@ -412,6 +509,7 @@ class DocumentDraftRepository:
                 current_revision, content = document_at(repository, revision, draft.target_path)
                 relationships = checked_source_relationships(
                     self.connection, repo, repository, revision, draft.target_path,
+                    exclude_plan_id=draft.plan_id,
                 )
             except DocumentDraftError:
                 continue
@@ -435,6 +533,8 @@ def review_artifact_bytes(draft: DocumentDraft) -> bytes:
         f"Requested decision: {draft.requested_decision or ''}\n"
         f"Decision revision: {draft.decision_revision or ''}\n"
         f"Decision reason: {draft.decision_reason or ''}\n"
+        f"Publication check: {draft.publication_error or ''}\n"
+        f"ExecPlan ID: {draft.plan_id or ''}\n"
     )
     diff = draft.complete_diff.encode("utf-8")
     return (
