@@ -22,6 +22,8 @@ from execution_runtime import (
 )
 from tests import test_runtime_state
 from tests.test_guidance_approval import guidance_plan
+from tests.test_blocked_checkpoint import BlockedCheckpointGitAdapterTest
+import blocked_checkpoint_state
 from worker_session import SessionBinding, SessionTransition
 
 
@@ -293,6 +295,116 @@ class ExecutionHandlerTests(TestCase):
         self._assert_pending_guidance(result, worktree, before, after, 'saved-session')
         self.assertEqual(self.repository.get('repo', 'G-047').worker_result, 'proposal')
         self.effects.agent.run_agent.assert_not_called()
+
+    def _run_real_worker_guidance_checkpoint(self, *, implementation_changes):
+        fixture = BlockedCheckpointGitAdapterTest(methodName='runTest')
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        self.addCleanup(fixture.tearDown)
+        repo = str(fixture.repo.resolve())
+        plan_path = 'docs/plans/[G-034] Checkpoint.md'
+        (fixture.worktree / 'AGENTS.md').write_text('# Agents\n')
+        fixture.run_git(fixture.worktree, 'add', 'AGENTS.md')
+        fixture.run_git(fixture.worktree, 'commit', '-m', 'guidance baseline')
+        plan_row = fixture.connection.execute(
+            "SELECT * FROM exec_plans WHERE plan_id = 'G-034'",
+        ).fetchone()
+        lm.hydrate_execplan_project(fixture.connection, repo, plan_row)
+        state = ExecutionStatePort(
+            fixture.connection, runtime_state.RuntimeStateRepository(fixture.connection), repo,
+        )
+        effects = replace(self.effects, state=state)
+        effects.agent.begin_agent_scope.side_effect = state.bind(
+            lm.begin_agent_scope, connected=True, mutates=True,
+        )
+        effects.agent.inspect_worker_guidance_result.side_effect = state.bind(
+            lm.inspect_worker_guidance_result, connected=True, mutates=True,
+        )
+        effects.agent.clear_agent_scope.side_effect = state.bind(
+            lm.clear_agent_scope, connected=True, mutates=True,
+        )
+        effects.agent.capture_git_snapshot.side_effect = lm.capture_git_snapshot
+        effects.agent._guidance_worker_targets.return_value = ()
+        effects.agent._published_plan_allows_common_plans.return_value = False
+        effects.agent.worker_prompt.return_value = 'worker guidance prompt'
+        plan = {
+            'id': 'G-034', 'title': 'Checkpoint',
+            'sources': ['docs/PRODUCT.md'], 'depends_on': [],
+            'complexity': 'high', 'risk': 'critical', 'priority': 'critical',
+        }
+
+        def validate_scope(_repo_path, worktree, _branch, _base, selected,
+                           _catalog, before, **_kwargs):
+            lm.validate_agent_scope(
+                'worker', worktree, before, lm.capture_git_snapshot(worktree),
+                selected_plan_path=selected,
+            )
+            return plan
+
+        effects.agent.validate_worker_workspace_scope.side_effect = validate_scope
+
+        def worker(_provider, worktree, *_args, **kwargs):
+            (worktree / plan_path).write_text(
+                guidance_plan().replace('G-020', 'G-034')
+                .replace('title: Guidance', 'title: Checkpoint'),
+            )
+            if implementation_changes:
+                (worktree / 'code.py').write_text('safe implementation\n')
+                test_path = worktree / 'tests/test_app.py'
+                test_path.parent.mkdir(parents=True, exist_ok=True)
+                test_path.write_text('def test_safe():\n    assert True\n')
+            kwargs['on_session_started']('real-worker-session')
+            return lm.AgentResult(0, 'result', session_id='real-worker-session')
+
+        effects.agent.run_agent.side_effect = worker
+        handler = handlers.ExecutionHandlers(
+            effects, repo=repo, repo_path=fixture.repo,
+            state_dir=fixture.state_dir, base='main', base_sha=fixture.base_oid,
+            provider='codex', config_path=Path('/config'), newly_activated=False,
+        )
+        handler.plan = plan
+        handler.catalog_plan = plan_row
+        with mock.patch.object(lm, 'is_loop_manager_repository', return_value=False):
+            outcome = handler.run(handler._context())
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertEqual(fixture.connection.execute(
+            "SELECT blocked_reason FROM exec_plans WHERE plan_id = 'G-034'",
+        ).fetchone()[0], lm.GUIDANCE_BLOCK_REASON)
+        blocked = fixture.connection.execute(
+            "SELECT agent_role, agent_snapshot, agent_result_snapshot, "
+            "worker_session_id FROM exec_plans WHERE plan_id = 'G-034'",
+        ).fetchone()
+        self.assertEqual(blocked['agent_role'], 'worker')
+        self.assertTrue(blocked['agent_snapshot'])
+        self.assertTrue(blocked['agent_result_snapshot'])
+        self.assertEqual(blocked['worker_session_id'], 'real-worker-session')
+        effects.validation.verify.assert_not_called()
+        effects.publication.push_managed_publication_branch.assert_not_called()
+        with mock.patch.object(lm, 'pr_for_branch', return_value=None):
+            self.assertEqual(lm.dispatch_blocked_checkpoints(
+                fixture.connection, fixture.repo, fixture.state_dir, repo,
+            ), 1)
+        oid = fixture.run_git(fixture.worktree, 'rev-parse', 'HEAD')
+        changed = set(fixture.run_git(
+            fixture.worktree, 'diff-tree', '--no-commit-id', '--name-only', '-r', oid,
+        ).splitlines())
+        expected = {plan_path}
+        if implementation_changes:
+            expected.update(('code.py', 'tests/test_app.py'))
+        self.assertEqual(changed, expected)
+        checkpoint = blocked_checkpoint_state.BlockedCheckpointRepository(
+            fixture.connection,
+        ).get(repo, 'G-034')
+        self.assertEqual(checkpoint.remote_oid, oid)
+        self.assertEqual(lm.validate_persisted_agent_scope(
+            fixture.connection, fixture.repo, fixture.state_dir, repo,
+        ).head, oid)
+
+    def test_real_worker_guidance_plan_only_checkpoint_tree(self):
+        self._run_real_worker_guidance_checkpoint(implementation_changes=False)
+
+    def test_real_worker_guidance_with_code_and_test_checkpoint_tree(self):
+        self._run_real_worker_guidance_checkpoint(implementation_changes=True)
 
     def test_timeout_prompt_requests_cause_check_and_progress_evidence(self):
         prompt = lm.worker_prompt(

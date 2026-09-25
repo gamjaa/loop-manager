@@ -59,3 +59,5 @@ Worker의 AGENTS.md guidance 제안이 사용자 결정을 기다리는 동안, 
 
 - 재개 시 확인: 이전 자동 승인 검토에서 checkpoint 영속 상태 형식과 branch/ref 소유권 판정 변경이 거부되었으며, 현재 문서에는 이를 승인한 사용자 결정이 없다. Architecture Change Policy에 따라 해당 구현을 보류한다. 승인 대상은 저장된 게시 OID를 이용한 후속 checkpoint ref 소유권 판정, 검증된 Merge worktree 정리 증거의 반영, checkpoint·게시·guidance 증거를 이용한 기존 이중 차단 복구다. 기존 공유 ref 보호와 증명 불가 시 차단 보존은 유지해야 한다.
 - 미해결 검증 범위: 실제 코드·테스트 파일이 포함된 checkpoint tree와 게시 후 재시작 중복 방지는 아직 검증하지 못했다. 기존 Worker 상태 보존 단위 테스트의 합성 snapshot은 이 Acceptance Criteria를 충족하는 증거로 간주하지 않는다. AGENTS.md 규칙 변경은 필요하지 않으며, 이 기록은 사용자 승인이나 완료 판정을 대신하지 않는다.
+
+- 2026-09-25 사용자 승인: 게시 OID를 이용한 후속 checkpoint ref 소유권 판정, 검증된 다른 계획의 Merge worktree 정리 증거 반영, checkpoint·게시·guidance 증거에 따른 기존 이중 차단 복구를 승인했다. 기존 공유 ref 보호와 증명 불가 시 차단 보존을 유지한다. 이 결정은 수동 복구 요청 대화에서 확정됐다.
