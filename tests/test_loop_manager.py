@@ -15,6 +15,7 @@ import unittest
 from contextlib import redirect_stderr
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import loop_manager
@@ -4916,6 +4917,8 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         with (
             mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=snapshot),
             mock.patch.object(loop_manager, 'verify', return_value=(True, 'OK')),
+            mock.patch.object(loop_manager, '_remote_checkpoint_review_revision',
+                              return_value=('base', 'head')),
             mock.patch.object(loop_manager, 'validate_agent_scope'),
             mock.patch.object(loop_manager, 'run_agent', return_value=(0, review)),
             mock.patch.object(loop_manager, '_remote_checkpoint_has_new_failure') as fingerprint,
@@ -4952,6 +4955,8 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                     mock.patch.object(loop_manager, 'capture_git_snapshot',
                                       return_value=mock.Mock()),
                     mock.patch.object(loop_manager, 'verify', return_value=(True, '')),
+                    mock.patch.object(loop_manager, '_remote_checkpoint_review_revision',
+                                      return_value=('base', 'head')),
                     mock.patch.object(loop_manager, 'validate_agent_scope'),
                     mock.patch.object(loop_manager, 'run_agent') as reviewer,
                 ):
@@ -4963,6 +4968,82 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                 self.assertEqual(stage, 'worker')
                 self.assertIn('Worker 결과 검증 실패', message)
                 reviewer.assert_not_called()
+
+    def test_remote_checkpoint_base_change_after_verify_skips_reviewer(self):
+        from tests.test_runtime_state import RuntimeStateRepositoryTest
+        import runtime_state
+
+        connection = RuntimeStateRepositoryTest()._connection()
+        self.addCleanup(connection.close)
+        repository = runtime_state.RuntimeStateRepository(connection)
+        repository.activate(
+            'repo', 'G-047', activation_sha='base',
+            branch='loop-manager/G-047', worktree='/state/G-047',
+        )
+        repository.block_plan(
+            'repo', 'G-047', reason_code='review_retry_exhausted',
+            evidence='prior review failure', release_fingerprint='prior-input',
+            plan_values={'worker_result': worker_result()}, clear_projection=True,
+        )
+        blocked = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = 'repo' AND plan_id = 'G-047'"
+        ).fetchone()
+        with (
+            mock.patch.object(loop_manager, '_remote_checkpoint_review_revision',
+                              return_value=None),
+            mock.patch.object(loop_manager, 'verify') as verify,
+            mock.patch.object(loop_manager, 'run_agent') as reviewer,
+        ):
+            resolved, _, stage = loop_manager._evaluate_remote_checkpoint_cause(
+                connection, Path('/repo'), Path('/state'), 'repo', blocked,
+                Path('/config'), 30,
+            )
+        self.assertFalse(resolved)
+        self.assertEqual(stage, 'stale_base')
+        verify.assert_not_called()
+        reviewer.assert_not_called()
+        for revisions, expected_calls in (
+            ([('base', 'head'), ('new-base', 'head')], 0),
+            ([('base', 'head'), ('base', 'head'), ('new-base', 'head')], 1),
+        ):
+            with self.subTest(expected_calls=expected_calls):
+                with (
+                    mock.patch.object(loop_manager, '_remote_checkpoint_review_revision',
+                                      side_effect=revisions),
+                    mock.patch.object(loop_manager, 'capture_git_snapshot',
+                                      return_value=mock.Mock()),
+                    mock.patch.object(loop_manager, 'verify', return_value=(True, '')),
+                    mock.patch.object(loop_manager, 'validate_agent_scope'),
+                    mock.patch.object(loop_manager, 'run_agent',
+                                      return_value=(0, 'invalid review')) as reviewer,
+                ):
+                    resolved, message, stage = loop_manager._evaluate_remote_checkpoint_cause(
+                        connection, Path('/repo'), Path('/state'), 'repo', blocked,
+                        Path('/config'), 30,
+                    )
+                self.assertFalse(resolved)
+                self.assertEqual(stage, 'revision_drift')
+                self.assertIn('base 또는 HEAD', message)
+                self.assertEqual(reviewer.call_count, expected_calls)
+
+    def test_remote_checkpoint_revision_requires_latest_base_ancestry(self):
+        responses = [
+            SimpleNamespace(stdout='base\n'),
+            SimpleNamespace(stdout='head\n'),
+            SimpleNamespace(returncode=1),
+        ]
+        with mock.patch.object(loop_manager, 'git', side_effect=[
+            SimpleNamespace(), *responses,
+        ]) as git:
+            revision = loop_manager._remote_checkpoint_review_revision(
+                Path('/repo'), Path('/worktree'), 'main',
+            )
+        self.assertIsNone(revision)
+        self.assertEqual(git.call_args_list[0].args, (Path('/repo'), 'fetch', 'origin'))
+        self.assertEqual(
+            git.call_args_list[-1].args,
+            (Path('/repo'), 'merge-base', '--is-ancestor', 'base', 'head'),
+        )
 
     def test_remote_checkpoint_corrects_invalid_specification_to_pass(self):
         from tests.test_runtime_state import RuntimeStateRepositoryTest
@@ -4994,6 +5075,8 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         with (
             mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=snapshot),
             mock.patch.object(loop_manager, 'verify', return_value=(True, 'OK')),
+            mock.patch.object(loop_manager, '_remote_checkpoint_review_revision',
+                              return_value=('base', 'head')),
             mock.patch.object(loop_manager, 'validate_agent_scope'),
             mock.patch.object(loop_manager, 'run_agent', side_effect=[
                 (0, invalid), (0, 'VERDICT: PASS'),
@@ -5043,6 +5126,8 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         with (
             mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=snapshot),
             mock.patch.object(loop_manager, 'verify', return_value=(True, 'OK')),
+            mock.patch.object(loop_manager, '_remote_checkpoint_review_revision',
+                              return_value=('base', 'head')),
             mock.patch.object(loop_manager, 'validate_agent_scope'),
             mock.patch.object(loop_manager, 'run_agent', return_value=(0, invalid)) as reviewer,
             mock.patch.object(loop_manager, '_remote_checkpoint_has_new_failure') as fingerprint,
@@ -6754,6 +6839,24 @@ class WorkerPublicationTest(unittest.TestCase):
             loop_manager.reviewer_targeted_test_reason(freeform_publication.test_evidence),
             freeform_reason,
         )
+        alternate_reason = "문서만 변경되어 적용할 unit test가 없어 실행하지 않았습니다"
+        alternate_publication = loop_manager.parse_worker_result(
+            worker_result("Explain omitted unit tests", "Summary", alternate_reason),
+            self.plan,
+        )
+        self.assertEqual(
+            loop_manager.reviewer_targeted_test_reason(alternate_publication.test_evidence),
+            alternate_reason,
+        )
+        configuration_reason = "설정만 바뀌어 unit test를 수행하지 못했습니다"
+        configuration_publication = loop_manager.parse_worker_result(
+            worker_result("Explain omitted configuration tests", "Summary", configuration_reason),
+            self.plan,
+        )
+        self.assertEqual(
+            loop_manager.reviewer_targeted_test_reason(configuration_publication.test_evidence),
+            configuration_reason,
+        )
         invalid_results = (
             worker_result("", "Summary", "test: PASS"),
             worker_result(
@@ -6791,6 +6894,7 @@ class WorkerPublicationTest(unittest.TestCase):
         for evidence in (
             f"test_api: PASS; {reason}; python3 -m unittest tests.test_api",
             f"{reason} test_api: PASS python3 -m unittest tests.test_api",
+            f"{reason} npm test: 3 tests passed",
         ):
             with self.subTest(evidence=evidence):
                 publication = loop_manager.parse_worker_result(
@@ -6805,6 +6909,7 @@ class WorkerPublicationTest(unittest.TestCase):
                 self.assertIn(reason, prompt)
                 self.assertNotIn("test_api: PASS", prompt)
                 self.assertNotIn("python3 -m unittest tests.test_api", prompt)
+                self.assertNotIn("npm test: 3 tests passed", prompt)
 
     def test_targeted_test_evidence_requires_a_clean_explicit_rerun(self):
         valid_evidence = (

@@ -15044,6 +15044,25 @@ def _remote_checkpoint_has_new_failure(
     )
 
 
+def _remote_checkpoint_review_revision(
+    repo_path: Path, worktree: Path, base_branch: str,
+) -> tuple[str, str] | None:
+    """Read the latest base and a candidate HEAD that contains that base."""
+    git(repo_path, "fetch", "origin")
+    base = git(
+        repo_path, "rev-parse", f"refs/remotes/origin/{base_branch}^{{commit}}",
+    ).stdout.strip()
+    head = git(worktree, "rev-parse", "HEAD^{commit}").stdout.strip()
+    if not base or not head:
+        raise RuntimeError("원격 checkpoint 검증 revision을 확인할 수 없습니다.")
+    ancestry = git(
+        repo_path, "merge-base", "--is-ancestor", base, head, check=False,
+    ).returncode
+    if ancestry not in {0, 1}:
+        raise RuntimeError("원격 checkpoint 후보의 base ancestry를 확인할 수 없습니다.")
+    return (base, head) if ancestry == 0 else None
+
+
 def _evaluate_remote_checkpoint_cause(
     connection: sqlite3.Connection, repo_path: Path, state_dir: Path,
     repo: str, blocked: sqlite3.Row, config_path: Path | None,
@@ -15054,6 +15073,14 @@ def _evaluate_remote_checkpoint_cause(
     config = config_path or ROOT / "config/config.ini"
     timeout = (timeout_seconds if timeout_seconds is not None
                else load_managed_config(config).verify_timeout_seconds)
+    project = connection.execute(
+        "SELECT provider, base_branch FROM projects WHERE repo = ?", (repo,),
+    ).fetchone()
+    revision = _remote_checkpoint_review_revision(
+        repo_path, worktree, str(project["base_branch"]),
+    )
+    if revision is None:
+        return False, "원격 checkpoint 후보가 최신 base를 포함하지 않습니다.", "stale_base"
     before = capture_git_snapshot(worktree)
     passed, output = verify(worktree, timeout)
     validate_agent_scope(
@@ -15066,9 +15093,6 @@ def _evaluate_remote_checkpoint_cause(
         ), str(output), "verify"
     if blocked["blocked_reason"] == BlockReasonCode.VERIFY_RETRY_EXHAUSTED.value:
         return True, str(output), None
-    project = connection.execute(
-        "SELECT provider, base_branch FROM projects WHERE repo = ?", (repo,),
-    ).fetchone()
     try:
         worker_publication = parse_worker_result(
             str(blocked["worker_result"] or ""),
@@ -15082,6 +15106,11 @@ def _evaluate_remote_checkpoint_cause(
     previous_review = blocked["review_result"]
     protocol_error = None
     for attempt in range(1, MAX_REVIEWER_PROTOCOL_ATTEMPTS + 1):
+        if _remote_checkpoint_review_revision(
+            repo_path, worktree, str(project["base_branch"]),
+        ) != revision:
+            return False, "원격 checkpoint verify 뒤 base 또는 HEAD가 변경됐습니다.", "revision_drift"
+        review_before = capture_git_snapshot(worktree)
         code, review = run_agent(
             str(project["provider"]), worktree, state_dir, config, "reviewer",
             reviewer_prompt(
@@ -15092,7 +15121,7 @@ def _evaluate_remote_checkpoint_cause(
             read_only=True,
         )
         validate_agent_scope(
-            "reviewer", worktree, before, capture_git_snapshot(worktree),
+            "reviewer", worktree, review_before, capture_git_snapshot(worktree),
             external_worktree=repo_path,
         )
         if code:
@@ -15497,6 +15526,8 @@ def _reconcile_published_blocked_checkpoint(
             except (OSError, RuntimeError, ValueError) as error:
                 return retry(f"원격 checkpoint Reviewer 프로토콜 차단 기록 미완료: {error}")
             return "blocked"
+        if new_failure_stage == "revision_drift":
+            return retry(assessment)
         if not resolved:
             detail = "원격 checkpoint 원인 유지:\n" + assessment
             with connection:
@@ -16679,21 +16710,22 @@ def parse_worker_result(message: str, plan: dict[str, object]) -> WorkerPublicat
 
 _NO_RUNNABLE_TARGETED_TEST = re.compile(
     r"(?:"
-    r"실행 가능한 관련 (?:targeted )?unit test가 없(?:습니다|다)"
-    r"|관련 (?:targeted )?unit test를 실행할 수 없(?:습니다|다)"
-    r"|관련 (?:targeted )?unit test를 (?:실행|수행)하지 (?:않았|못했)(?:습니다|다)"
+    r"(?:(?:실행 가능한|적용할|관련)\s+)*(?:targeted\s+)?unit\s+tests?(?:가|를|는)?\s+"
+    r"(?:없(?:어|어서|었습니다|습니다|다)"
+    r"|(?:실행|수행)(?:할\s+수\s+없|하지\s+(?:않았|못했))(?:습니다|다))"
     r"|no runnable targeted (?:unit )?tests?"
     r")",
     re.IGNORECASE,
 )
 _TARGETED_TEST_METADATA = re.compile(
     r"(?i)(?<![\w])(?:[\w./-]+\s*:\s*)?"
+    r"(?:\d+\s+tests?\s+)?"
     r"(?:PASS(?:ED)?|SUCCESS|OK|성공|통과)(?![\w])(?:\s*\([^)]*\))?"
     r"|(?i:(?<![\w])(?:FAILED_COMMAND|RERUN):)"
-    r"|(?i:(?<![\w])(?:python\d*(?:\.\d+)?\s+-m\s+unittest|pytest)\b)"
+    r"|(?i:(?<![\w])(?:python\d*(?:\.\d+)?\s+-m\s+unittest|pytest|npm\s+test)\b)"
 )
 _INLINE_TEST_COMMAND = re.compile(
-    r"(?i)(?<![\w])(?:python\d*(?:\.\d+)?\s+-m\s+unittest|pytest)\b"
+    r"(?i)(?<![\w])(?:python\d*(?:\.\d+)?\s+-m\s+unittest|pytest|npm\s+test)\b"
 )
 
 
