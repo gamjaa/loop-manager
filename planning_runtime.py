@@ -97,16 +97,16 @@ def choose_planning_decision(
     planning_input_changed: bool,
     has_waiting_catalog: bool,
 ) -> PlanningDecision:
-    """Apply the R-024 priority order without repository side effects."""
+    """Choose active work, changed planning input, or READY at a safe boundary."""
 
     if has_active:
         kind = PlanningDecisionKind.RESUME_ACTIVE
     elif specification_changed:
         kind = PlanningDecisionKind.RUN_SPECIFICATION_PLANNING
-    elif runnable_ready:
-        kind = PlanningDecisionKind.ACTIVATE_READY
     elif planning_input_changed:
         kind = PlanningDecisionKind.RUN_FALLBACK_PLANNING
+    elif runnable_ready:
+        kind = PlanningDecisionKind.ACTIVATE_READY
     elif has_waiting_catalog:
         kind = PlanningDecisionKind.STABLE_WAIT
     else:
@@ -762,10 +762,8 @@ class PlanningLifecycleCoordinator:
             )
             if run.selection.kind is PlanningDecisionKind.ACTIVATE_READY:
                 latest_sha = self._fetch_remote_head(context)
-                if self._specification_changed_before_activation(
-                    run, row, latest_sha
-                ):
-                    return self._restart_for_new_specification()
+                if self._remote_base_changed_before_activation(run, latest_sha):
+                    return self._restart_for_new_input()
                 run.base_sha = latest_sha
                 self._ports.state.activate_ready(context.repo, run.base_sha)
                 row = self._ports.state.planning(context.repo)
@@ -832,32 +830,16 @@ class PlanningLifecycleCoordinator:
                 return False
         return True
 
-    def _specification_changed_before_activation(
-        self,
-        run: _PlanningRun,
-        row: runtime_state.PlanningSnapshot,
-        latest_sha: str,
+    def _remote_base_changed_before_activation(
+        self, run: _PlanningRun, latest_sha: str
     ) -> bool:
-        if run.maintenance_planning or latest_sha == run.base_sha:
-            return False
-        context = run.context
-        latest_specification = self._ports.git.specification_fingerprint(
-            context.repo_path, latest_sha
-        )
-        if latest_specification == run.specification_fingerprint:
-            return False
-        latest_input = (
-            self._ports.git.input_fingerprint(context.repo_path, latest_sha)
-            if row.specification_fingerprint is None and row.planning_fingerprint
-            else ""
-        )
-        return self._specification_planning_required(
-            row, context, latest_sha, latest_specification, latest_input
-        )
+        # Even a plan-only revision can reorder READY declarations. Re-enter
+        # the project step so catalog reconciliation reads the new revision.
+        return not run.maintenance_planning and latest_sha != run.base_sha
 
-    def _restart_for_new_specification(self) -> PlanningOutcome:
+    def _restart_for_new_input(self) -> PlanningOutcome:
         self._ports.events.info(
-            "READY 시작 전 원격 명세가 변경되어 최신 기준에서 계획을 다시 선택합니다."
+            "READY 시작 전 원격 기준이 변경되어 최신 catalog와 계획 입력을 다시 선택합니다."
         )
         return PlanningOutcome(PlanningOutcomeKind.REMOTE_BASE_RESTART)
 
@@ -2007,10 +1989,8 @@ class PlanningLifecycleCoordinator:
         newly_activated = run.ready_activated_before_planning
         if not row.phase:
             latest_sha = self._fetch_remote_head(context)
-            if self._specification_changed_before_activation(
-                run, row, latest_sha
-            ):
-                return self._restart_for_new_specification()
+            if self._remote_base_changed_before_activation(run, latest_sha):
+                return self._restart_for_new_input()
             decision = self._ports.state.schedule(context.repo)
             if not decision.has_ready and decision.has_waiting:
                 self._ports.events.info(

@@ -238,6 +238,7 @@ class FakeGitPort:
         self.head = "base"
         self.remote = "base"
         self.fingerprint = "fingerprint"
+        self.fingerprints = {}
         self.specification_fingerprints = {}
         self.dirty_files = []
         self.ancestor = True
@@ -260,7 +261,7 @@ class FakeGitPort:
         return SimpleNamespace(stdout="", returncode=0)
 
     def input_fingerprint(self, _repo_path, _sha):
-        return self.fingerprint
+        return self.fingerprints.get(_sha, self.fingerprint)
 
     def specification_fingerprint(self, _repo_path, sha):
         return self.specification_fingerprints.get(sha, "specification")
@@ -700,7 +701,7 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         self.assertEqual(second.kind, PlanningOutcomeKind.EXECUTION_READY)
         self.assertEqual(ports.agent.run_count, 1)
 
-    def test_unchanged_specification_on_new_remote_sha_activates_ready_before_changed_full_input(self):
+    def test_source_change_with_ready_runs_planner_once_before_activation(self):
         ports = FakePorts(
             planning_snapshot(
                 specification_fingerprint="specification",
@@ -708,7 +709,6 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
             )
         )
         ports.git.fingerprint = "new-full"
-        ports.git.remote = "new-base"
         ports.state.schedule_result = SimpleNamespace(
             active=None,
             has_ready=True,
@@ -721,7 +721,101 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         outcome = PlanningLifecycleCoordinator(ports).run(self.context)
 
         self.assertEqual(outcome.kind, PlanningOutcomeKind.EXECUTION_READY)
-        self.assertEqual(outcome.base_sha, "new-base")
+        self.assertEqual(ports.agent.run_count, 1)
+        self.assertEqual(ports.state.snapshot.planning_fingerprint, "new-full")
+
+        ports.state.snapshot = replace(ports.state.snapshot, phase=None)
+        PlanningLifecycleCoordinator(ports).run(self.context)
+        self.assertEqual(ports.agent.run_count, 1)
+
+    def test_no_change_planner_result_advances_full_baseline_before_ready(self):
+        ports = FakePorts(planning_snapshot(
+            processed_sha="old-base",
+            specification_fingerprint="specification",
+            planning_fingerprint="old-full",
+        ))
+        ports.git.fingerprint = "new-full"
+        ports.git.fingerprints["old-base"] = "old-full"
+        ports.validation.result = None
+        ports.state.schedule_result = SimpleNamespace(
+            active=None, has_ready=True, has_waiting=False,
+            runnable_ready=object(), project_blocked=False,
+        )
+        ports.state.activate_result = object()
+
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.EXECUTION_READY)
+        self.assertEqual(ports.agent.run_count, 1)
+        self.assertEqual(ports.state.snapshot.planning_fingerprint, "new-full")
+        self.assertEqual(ports.state.snapshot.processed_sha, "base")
+
+    def test_source_change_at_direct_activation_restarts_before_worker(self):
+        ports = FakePorts(planning_snapshot(
+            processed_sha="base",
+            specification_fingerprint="specification",
+            planning_fingerprint="fingerprint",
+        ))
+        ports.state.schedule_result = SimpleNamespace(
+            active=None, has_ready=True, has_waiting=False,
+            runnable_ready=object(), project_blocked=False,
+        )
+        ports.state.activate_result = object()
+        ports.git.remote = "new-base"
+        ports.git.fingerprints["new-base"] = "new-full"
+
+        first = PlanningLifecycleCoordinator(ports).run(self.context)
+
+        self.assertEqual(first.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
+        self.assertEqual(ports.agent.run_count, 0)
+        self.assertIsNone(ports.state.snapshot.phase)
+
+        ports.git.head = "new-base"
+        second = PlanningLifecycleCoordinator(ports).run(
+            replace(self.context, base_sha="new-base")
+        )
+        self.assertEqual(second.kind, PlanningOutcomeKind.EXECUTION_READY)
+        self.assertEqual(ports.agent.run_count, 1)
+
+    def test_plan_only_remote_change_reselects_ready_from_latest_catalog(self):
+        ports = FakePorts(planning_snapshot(
+            processed_sha="base",
+            specification_fingerprint="specification",
+            planning_fingerprint="fingerprint",
+        ))
+        old_ready = SimpleNamespace(plan_id="G-001", priority="critical")
+        new_ready = SimpleNamespace(plan_id="G-002", priority="critical")
+        ports.state.schedule_result = SimpleNamespace(
+            active=None, has_ready=True, has_waiting=False,
+            runnable_ready=old_ready, project_blocked=False,
+        )
+        ports.state.activate_result = object()
+        ports.git.remote = "new-base"
+        ports.git.fingerprints["new-base"] = "fingerprint"
+        activated = []
+        original_activate = ports.state.activate_ready
+
+        def activate_selected(repo, base_sha):
+            activated.append(ports.state.schedule_result.runnable_ready.plan_id)
+            return original_activate(repo, base_sha)
+
+        ports.state.activate_ready = activate_selected
+
+        first = PlanningLifecycleCoordinator(ports).run(self.context)
+
+        self.assertEqual(first.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
+        self.assertEqual(activated, [])
+        self.assertIsNone(ports.state.snapshot.phase)
+        self.assertEqual(ports.agent.run_count, 0)
+
+        ports.git.head = "new-base"
+        ports.state.schedule_result.runnable_ready = new_ready
+        second = PlanningLifecycleCoordinator(ports).run(
+            replace(self.context, base_sha="new-base")
+        )
+
+        self.assertEqual(second.kind, PlanningOutcomeKind.EXECUTION_READY)
+        self.assertEqual(activated, ["G-002"])
         self.assertEqual(ports.agent.run_count, 0)
 
     def test_new_specification_at_direct_activation_restarts_before_worker(self):
@@ -742,6 +836,7 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         ports.validation.result = None
         ports.git.remote = "new-base"
         ports.git.specification_fingerprints["new-base"] = "new-specification"
+        ports.git.fingerprints["new-base"] = "new-full"
 
         first = PlanningLifecycleCoordinator(ports).run(self.context)
 
@@ -779,6 +874,7 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         ports.validation.result = None
         ports.git.remote = "new-base"
         ports.git.specification_fingerprints["new-base"] = "new-specification"
+        ports.git.fingerprints["new-base"] = "new-full"
 
         first = PlanningLifecycleCoordinator(ports).run(self.context)
 
@@ -824,8 +920,86 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         self.assertEqual(second.kind, PlanningOutcomeKind.WAITING)
         self.assertEqual(ports.agent.run_count, 1)
 
+    def test_archive_only_change_keeps_ready_and_success_baseline(self):
+        ports = FakePorts(planning_snapshot(
+            processed_sha="old-base",
+            specification_fingerprint="old-specification",
+            planning_fingerprint="old-full",
+        ))
+        ports.git.fingerprint = "archive-full"
+        ports.git.fingerprints["old-base"] = "old-full"
+        ports.git.requirement_archive_only = mock.Mock(return_value=True)
+        ports.state.schedule_result = SimpleNamespace(
+            active=None, has_ready=True, has_waiting=False,
+            runnable_ready=object(), project_blocked=False,
+        )
+        ports.state.activate_result = object()
+
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.EXECUTION_READY)
+        self.assertEqual(ports.agent.run_count, 0)
+        self.assertEqual(ports.state.snapshot.planning_fingerprint, "old-full")
+
+    def test_failed_planner_does_not_activate_stale_ready(self):
+        ports = FakePorts(planning_snapshot(
+            processed_sha="old-base",
+            specification_fingerprint="specification",
+            planning_fingerprint="old-full",
+        ))
+        ports.git.fingerprint = "new-full"
+        ports.git.fingerprints["old-base"] = "old-full"
+        ports.agent.result = PlanningAgentResult(
+            1, "planner failed", None,
+            PlanningAgentResultKind.PERMANENT_CONFIGURATION,
+        )
+        ports.state.schedule_result = SimpleNamespace(
+            active=None, has_ready=True, has_waiting=False,
+            runnable_ready=object(), project_blocked=False,
+        )
+        ports.state.activate_result = object()
+
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+        self.assertNotEqual(ports.state.snapshot.phase, "WORKING")
+        self.assertEqual(ports.state.snapshot.planning_fingerprint, "old-full")
+
+    def test_unpublished_planner_does_not_activate_stale_ready(self):
+        ports = FakePorts(planning_snapshot(
+            processed_sha="old-base",
+            specification_fingerprint="specification",
+            planning_fingerprint="old-full",
+        ))
+        ports.git.fingerprint = "new-full"
+        ports.git.fingerprints["old-base"] = "old-full"
+        ports.git.dirty_files = ["docs/plans/[G-001] Plan.md"]
+        ports.state.general_intent_error_call = 1
+        ports.state.schedule_result = SimpleNamespace(
+            active=None, has_ready=True, has_waiting=False,
+            runnable_ready=object(), project_blocked=False,
+        )
+        ports.state.activate_result = object()
+
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+        self.assertNotEqual(ports.state.snapshot.phase, "WORKING")
+        self.assertEqual(ports.state.snapshot.planning_fingerprint, "old-full")
+
 
 class PlanningDecisionTest(unittest.TestCase):
+    def test_active_work_keeps_precedence_over_changed_full_input(self):
+        decision = choose_planning_decision(
+            has_active=True,
+            specification_changed=True,
+            runnable_ready=True,
+            planning_input_changed=True,
+            has_waiting_catalog=True,
+        )
+
+        self.assertEqual(decision.kind, PlanningDecisionKind.RESUME_ACTIVE)
+
     def test_specification_change_precedes_runnable_ready(self):
         decision = choose_planning_decision(
             has_active=False,
@@ -840,7 +1014,7 @@ class PlanningDecisionTest(unittest.TestCase):
             PlanningDecisionKind.RUN_SPECIFICATION_PLANNING,
         )
 
-    def test_unchanged_specification_prefers_ready_before_fallback(self):
+    def test_changed_full_input_precedes_runnable_ready(self):
         decision = choose_planning_decision(
             has_active=False,
             specification_changed=False,
@@ -849,9 +1023,9 @@ class PlanningDecisionTest(unittest.TestCase):
             has_waiting_catalog=True,
         )
 
-        self.assertEqual(decision.kind, PlanningDecisionKind.ACTIVATE_READY)
+        self.assertEqual(decision.kind, PlanningDecisionKind.RUN_FALLBACK_PLANNING)
 
-    def test_changed_full_input_falls_back_only_without_runnable_ready(self):
+    def test_changed_full_input_plans_without_runnable_ready(self):
         decision = choose_planning_decision(
             has_active=False,
             specification_changed=False,

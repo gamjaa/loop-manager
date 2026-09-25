@@ -1276,7 +1276,86 @@ class AutomationFirstCatalogTest(unittest.TestCase):
         self.assertEqual(statuses, {"G-001": "MERGED", "G-002": "READY"})
         self.assertEqual(selected["plan_id"], "G-002")
 
-    def test_remote_input_change_after_planner_yields_to_published_ready_worker(self):
+    def test_last_merge_preserves_successful_planning_baseline(self):
+        for completion in ("projected", "catalog"):
+            with self.subTest(completion=completion), tempfile.TemporaryDirectory() as directory:
+                connection = self._connection()
+                self.addCleanup(connection.close)
+                self._insert_plan(connection, "G-001", "PR_OPEN")
+                state_dir = Path(directory) / "state"
+                branch, worktree = loop_manager.expected_execplan_workspace(
+                    state_dir, "repo", "G-001"
+                )
+                plan_path = "docs/plans/[G-001] Plan G-001.md"
+                connection.execute(
+                    "UPDATE exec_plans SET branch = ?, worktree = ? "
+                    "WHERE repo = 'repo' AND plan_id = 'G-001'",
+                    (branch, str(worktree)),
+                )
+                connection.execute(
+                    "UPDATE projects SET phase = 'PR_OPEN', branch = ?, "
+                    "worktree = ?, plan_path = ?, processed_sha = 'baseline-sha', "
+                    "specification_fingerprint = 'baseline-spec', "
+                    "planning_fingerprint = 'baseline-full' WHERE repo = 'repo'",
+                    (branch, str(worktree), plan_path),
+                )
+                connection.commit()
+
+                if completion == "projected":
+                    assessment = loop_manager.complete_merged_worktree(
+                        connection, Path(directory), "repo", state_dir,
+                        worktree, "https://pr/1", None,
+                    )
+                else:
+                    plan = connection.execute(
+                        "SELECT * FROM exec_plans WHERE repo = 'repo' "
+                        "AND plan_id = 'G-001'"
+                    ).fetchone()
+                    assessment = loop_manager.complete_merged_execplan_worktree(
+                        connection, Path(directory), "repo", state_dir,
+                        plan, "https://pr/1", None,
+                    )
+
+                row = connection.execute(
+                    "SELECT phase, processed_sha, specification_fingerprint, "
+                    "planning_fingerprint FROM projects WHERE repo = 'repo'"
+                ).fetchone()
+                self.assertEqual(assessment.status, "missing")
+                self.assertEqual(
+                    tuple(row),
+                    (None, "baseline-sha", "baseline-spec", "baseline-full"),
+                )
+
+    def test_planner_error_with_ready_does_not_repeat_project_step(self):
+        for phase, planning_error in (("PLANNING", None), (None, "planner error")):
+            with self.subTest(phase=phase, planning_error=planning_error):
+                connection = self._connection()
+                self.addCleanup(connection.close)
+                self._insert_plan(connection, "G-001", "READY")
+
+                def failed_planner_step(*_args, **_kwargs):
+                    connection.execute(
+                        "UPDATE projects SET phase = ?, planning_error = ?, "
+                        "last_error = 'planner stopped' WHERE repo = 'repo'",
+                        (phase, planning_error),
+                    )
+                    connection.commit()
+                    return 1
+
+                with mock.patch(
+                    "loop_manager._checkpoint_dispatch_ready", return_value=False
+                ), mock.patch(
+                    "loop_manager._run_project_step", side_effect=failed_planner_step
+                ) as step:
+                    result = loop_manager._run_project_result(
+                        connection, Path("/unused"), "repo",
+                        Path("/unused.ini"), "main", False,
+                    )
+
+                self.assertEqual(result.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
+                step.assert_called_once()
+
+    def test_remote_input_change_after_planner_defers_published_ready_worker(self):
         for publishes_plan in (False, True):
             with self.subTest(publishes_plan=publishes_plan), tempfile.TemporaryDirectory() as directory:
                 repo = make_remote_repository(directory)
@@ -1294,6 +1373,7 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                 git_command(external_repo, "config", "user.name", "External User")
                 state_dir = Path(directory) / "state"
                 connection = self._connection(str(repo))
+                baseline_sha = git_command(repo, "rev-parse", "origin/main")
                 self._insert_plan(
                     connection,
                     "G-001",
@@ -1301,12 +1381,16 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                     priority="high",
                     repo=str(repo),
                     title="Queued",
-                    plan_sha=git_command(repo, "rev-parse", "origin/main"),
+                    plan_sha=baseline_sha,
                 )
                 started_fingerprint = loop_manager.planning_input_fingerprint(repo, "main")
                 roles = []
+                remote_advanced = False
 
                 def advance_remote():
+                    nonlocal remote_advanced
+                    if remote_advanced:
+                        return
                     git_command(external_repo, "fetch", "origin")
                     git_command(external_repo, "merge", "--ff-only", "origin/main")
                     (external_repo / "src/app.py").write_text(
@@ -1314,18 +1398,19 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                         encoding="utf-8",
                     )
                     commit_and_push(external_repo, "Change input during planning")
+                    remote_advanced = True
 
                 def agent(worktree, _state, _config, role_name, _prompt, **_kwargs):
                     roles.append(role_name)
                     if role_name == "planner":
-                        if publishes_plan:
+                        if publishes_plan and roles.count("planner") == 1:
                             write_execplan(
                                 worktree,
                                 "G-002",
                                 "Deferred",
                                 priority="low",
                             )
-                        else:
+                        elif not publishes_plan:
                             advance_remote()
                         return loop_manager.CodexResult(0, "", "planner-session")
                     return loop_manager.CodexResult(1, "worker must not start", "worker-session")
@@ -1334,7 +1419,7 @@ class AutomationFirstCatalogTest(unittest.TestCase):
 
                 def publish(*args, **kwargs):
                     original_publish(*args, **kwargs)
-                    if publishes_plan:
+                    if publishes_plan and not remote_advanced:
                         git_command(repo, "merge", "--ff-only", "origin/main")
                         advance_remote()
 
@@ -1374,24 +1459,24 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                 self.assertEqual(result, 1 if publishes_plan else 0)
                 self.assertEqual(
                     roles,
-                    ["planner", "worker"] if publishes_plan else ["planner"],
+                    ["planner", "planner", "worker"] if publishes_plan
+                    else ["planner", "planner"],
                 )
                 self.assertEqual(
-                    project["phase"],
-                    "WORKING" if publishes_plan else None,
+                    project["phase"], "WORKING" if publishes_plan else None
                 )
-                self.assertEqual(project["planning_fingerprint"], started_fingerprint)
-                self.assertNotEqual(
+                self.assertEqual(
+                    project["planning_fingerprint"],
                     loop_manager.planning_input_fingerprint(repo, "main"),
-                    started_fingerprint,
                 )
+                self.assertNotEqual(project["planning_fingerprint"], started_fingerprint)
                 self.assertEqual(
                     [tuple(plan) for plan in plans],
                     [("G-001", "MERGED")]
                     + ([('G-002', 'IMPLEMENTING')] if publishes_plan else []),
                 )
 
-    def test_ready_worker_precedes_planning_for_changed_and_unchanged_input(self):
+    def test_changed_input_plans_before_ready_and_unchanged_input_runs_worker(self):
         for changed in (True, False):
             with self.subTest(changed=changed), tempfile.TemporaryDirectory() as directory:
                 repo = make_remote_repository(directory)
@@ -1400,6 +1485,7 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                 commit_and_push(repo, "Add queued plan")
                 state_dir = Path(directory) / "state"
                 connection = self._connection(str(repo))
+                baseline_sha = git_command(repo, "rev-parse", "origin/main")
                 self._insert_plan(
                     connection,
                     "G-001",
@@ -1407,12 +1493,17 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                     priority="high",
                     repo=str(repo),
                     title="Queued",
-                    plan_sha=git_command(repo, "rev-parse", "origin/main"),
+                    plan_sha=baseline_sha,
                 )
                 fingerprint = loop_manager.planning_input_fingerprint(repo, "main")
                 specification = loop_manager.specification_input_fingerprint(
                     repo, "main"
                 )
+                if changed:
+                    (repo / "src/app.py").write_text(
+                        "VALUE = 2\n", encoding="utf-8"
+                    )
+                    commit_and_push(repo, "Change source before READY selection")
                 connection.execute(
                     """
                     UPDATE projects
@@ -1422,8 +1513,8 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                     """,
                     (
                         specification,
-                        "changed" if changed else fingerprint,
-                        None if changed else git_command(repo, "rev-parse", "origin/main"),
+                        fingerprint,
+                        baseline_sha,
                         str(repo),
                     ),
                 )
@@ -1432,6 +1523,8 @@ class AutomationFirstCatalogTest(unittest.TestCase):
 
                 def agent(_worktree, _state, _config, role_name, _prompt, **_kwargs):
                     roles.append(role_name)
+                    if role_name == "planner":
+                        return loop_manager.CodexResult(0, "", "planner-session")
                     return loop_manager.CodexResult(1, "stop", f"{role_name}-session")
 
                 with mock.patch(
@@ -1456,7 +1549,9 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                     )
 
                 self.assertEqual(result, 1)
-                self.assertEqual(roles, ["worker"])
+                self.assertEqual(
+                    roles, ["planner", "worker"] if changed else ["worker"]
+                )
 
     def test_planning_and_ready_selection_pin_fingerprint_to_resolved_sha(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -8798,11 +8893,12 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "loop_manager.pr_for_branch", return_value=None
             ), mock.patch(
                 "loop_manager.run_codex",
-                return_value=loop_manager.CodexResult(
-                    1,
-                    "stop after cleanup recovery",
-                    "planner-session",
-                ),
+                side_effect=[
+                    loop_manager.CodexResult(0, "", "planner-session"),
+                    loop_manager.CodexResult(
+                        1, "stop after cleanup recovery", "worker-session"
+                    ),
+                ],
             ) as resumed_agent:
                 resumed_run = loop_manager.run_project(
                     connection,
@@ -8834,8 +8930,10 @@ class AgentScopeValidatorTest(unittest.TestCase):
             self.assertEqual(resumed_plan["status"], "IMPLEMENTING")
             self.assertIsNone(resumed_plan["blocked_fingerprint"])
             self.assertIsNone(resumed_plan["blocked_worktree_fingerprint"])
-            resumed_agent.assert_called_once()
-            self.assertEqual(resumed_agent.call_args.args[3], "worker")
+            self.assertEqual(
+                [call.args[3] for call in resumed_agent.call_args_list],
+                ["planner", "worker"],
+            )
 
     def test_blocked_resume_does_not_excuse_agent_owned_ref_change(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -9051,7 +9149,11 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     ),
                 )
 
-            def stop_after_isolation(*_args, **_kwargs):
+            def stop_after_isolation(
+                _worktree, _state, _config, role_name, _prompt, **_kwargs
+            ):
+                if role_name == "planner":
+                    return loop_manager.CodexResult(0, "", "planner-session")
                 restored = loop_manager.capture_git_snapshot(worktree)
                 self.assertIn("staged", restored.dirty["src/app.py"][0])
                 self.assertIn("unstaged", restored.dirty["README.md"][0])
@@ -9135,8 +9237,10 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 ),
                 "# Active\n",
             )
-            resumed_agent.assert_called_once()
-            self.assertEqual(resumed_agent.call_args.args[3], "worker")
+            self.assertEqual(
+                [call.args[3] for call in resumed_agent.call_args_list],
+                ["planner", "worker"],
+            )
 
     def test_restored_worker_git_metadata_allows_changed_input_to_requeue(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -9262,11 +9366,12 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 return_value=None,
             ), mock.patch(
                 "loop_manager.run_codex",
-                return_value=loop_manager.CodexResult(
-                    1,
-                    "stop after restored metadata",
-                    "planner-session",
-                ),
+                side_effect=[
+                    loop_manager.CodexResult(0, "", "planner-session"),
+                    loop_manager.CodexResult(
+                        1, "stop after restored metadata", "worker-session"
+                    ),
+                ],
             ) as resumed_agent:
                 result = loop_manager.run_project(
                     connection,
@@ -9294,8 +9399,10 @@ class AgentScopeValidatorTest(unittest.TestCase):
             self.assertIsNone(project["agent_result_snapshot"])
             self.assertEqual(plan["status"], "IMPLEMENTING")
             self.assertIsNone(plan["blocked_fingerprint"])
-            resumed_agent.assert_called_once()
-            self.assertEqual(resumed_agent.call_args.args[3], "worker")
+            self.assertEqual(
+                [call.args[3] for call in resumed_agent.call_args_list],
+                ["planner", "worker"],
+            )
 
     def test_index_flags_are_rejected_for_worker_allowed_path(self):
         for option in ("--skip-worktree", "--assume-unchanged"):
@@ -9596,9 +9703,12 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "loop_manager.pr_for_branch", return_value=None
             ), mock.patch(
                 "loop_manager.run_codex",
-                return_value=loop_manager.CodexResult(
-                    1, "stop after scope unblock", "planner-session"
-                ),
+                side_effect=[
+                    loop_manager.CodexResult(0, "", "planner-session"),
+                    loop_manager.CodexResult(
+                        1, "stop after scope unblock", "worker-session"
+                    ),
+                ],
             ) as resumed_agent:
                 resumed_result = loop_manager.run_project(
                     connection,
@@ -9636,8 +9746,10 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "loop-manager scope violation G-001",
                 git_command(worktree, "stash", "list"),
             )
-            resumed_agent.assert_called_once()
-            self.assertEqual(resumed_agent.call_args.args[3], "worker")
+            self.assertEqual(
+                [call.args[3] for call in resumed_agent.call_args_list],
+                ["planner", "worker"],
+            )
 
 
     def test_reviewer_scope_block_records_execplan_body_boundaries(self):
@@ -11325,10 +11437,9 @@ class WorkspaceRecoveryTest(unittest.TestCase):
             resumed_agent.assert_not_called()
 
             git_command(repo, "branch", "-D", branch)
-            planner_stop = loop_manager.CodexResult(
-                1,
-                "stop after ownership recovery",
-                "planner-session",
+            planner_result = loop_manager.CodexResult(0, "", "planner-session")
+            worker_stop = loop_manager.CodexResult(
+                1, "stop after ownership recovery", "worker-session"
             )
             with mock.patch(
                 "loop_manager.validate_repository", return_value=repo
@@ -11339,7 +11450,7 @@ class WorkspaceRecoveryTest(unittest.TestCase):
             ), mock.patch(
                 "loop_manager.pr_for_branch", return_value=None
             ), mock.patch(
-                "loop_manager.run_codex", return_value=planner_stop
+                "loop_manager.run_codex", side_effect=[planner_result, worker_stop]
             ) as recovered_agent:
                 recovered_result = loop_manager.run_project(
                     connection,
@@ -11380,8 +11491,10 @@ class WorkspaceRecoveryTest(unittest.TestCase):
                 ).returncode,
                 0,
             )
-            recovered_agent.assert_called_once()
-            self.assertEqual(recovered_agent.call_args.args[3], "worker")
+            self.assertEqual(
+                [call.args[3] for call in recovered_agent.call_args_list],
+                ["planner", "worker"],
+            )
 
     def test_new_planning_rejects_preexisting_detached_worktree(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -11631,6 +11744,10 @@ class WorkspaceRecoveryTest(unittest.TestCase):
                 branch,
                 worktree,
             ) = self._ready_execplan(directory)
+            planning_baseline = connection.execute(
+                "SELECT planning_fingerprint, processed_sha FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
             loop_manager.make_worktree(repo, worktree, branch, "main")
             (worktree / "src/app.py").write_text("VALUE = 2\n", encoding="utf-8")
             git_command(worktree, "add", "src/app.py")
@@ -11725,7 +11842,10 @@ class WorkspaceRecoveryTest(unittest.TestCase):
                 loop_manager.ProjectRunKind.BLOCKED,
             )
             self.assertEqual(completion_result.exit_code, 1)
-            self.assertEqual(tuple(after_merge), ("PROJECT_BLOCKED", None, None))
+            self.assertEqual(
+                tuple(after_merge),
+                ("PROJECT_BLOCKED", *tuple(planning_baseline)),
+            )
             self.assertEqual(project["phase"], "PROJECT_BLOCKED")
             self.assertIn(
                 "소유권이 확인되지 않았습니다",
@@ -12362,7 +12482,12 @@ class MergeIndependentWorktreeCleanupTest(unittest.TestCase):
 
             with mock.patch(
                 "loop_manager.validate_repository", return_value=repo
-            ), mock.patch("loop_manager.pr_for_branch", return_value=merged_pr):
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=merged_pr
+            ), mock.patch(
+                "loop_manager.run_codex",
+                return_value=loop_manager.CodexResult(0, "", "planner-session"),
+            ) as planner:
                 result = loop_manager.run_project(
                     connection,
                     state_dir,
@@ -12386,6 +12511,8 @@ class MergeIndependentWorktreeCleanupTest(unittest.TestCase):
             self.assertEqual(pending["pr_head_oid"], pr_head)
             self.assertIn("untracked 파일", pending["reason"])
             self.assertTrue(worktree.exists())
+            planner.assert_called_once()
+            self.assertEqual(planner.call_args.args[3], "planner")
 
     def test_pr_queries_request_immutable_head_oid(self):
         response = subprocess.CompletedProcess(
@@ -13931,7 +14058,10 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                 "loop_manager.ensure_safe_base_worktree", side_effect=synchronize
             ), mock.patch(
                 "loop_manager.reconcile_execplan_catalog", side_effect=reconcile_catalog
-            ), mock.patch("loop_manager.dispatch_execplan_archive_housekeeping"):
+            ), mock.patch("loop_manager.dispatch_execplan_archive_housekeeping"), mock.patch(
+                "loop_manager.run_codex",
+                return_value=loop_manager.CodexResult(0, "", "planner-session"),
+            ) as planner:
                 result = loop_manager.run_project(
                     connection, state_dir, str(repo), Path("unused.ini"), "main", False
                 )
@@ -13940,6 +14070,7 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             self.assertEqual(observed, [("MERGED", head, False, "G-026", False)])
             self.assertEqual(catalog_shas, [head])
             self.assertEqual(git_command(repo, "rev-parse", "HEAD"), head)
+            planner.assert_called_once()
 
     def test_archive_publication_syncs_source_and_catalog_to_final_remote_sha(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -13969,7 +14100,10 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                 "loop_manager.ensure_safe_base_worktree", side_effect=synchronize
             ), mock.patch(
                 "loop_manager.reconcile_execplan_catalog", side_effect=reconcile_catalog
-            ):
+            ), mock.patch(
+                "loop_manager.run_codex",
+                return_value=loop_manager.CodexResult(0, "", "planner-session"),
+            ) as planner:
                 result = loop_manager.run_project(
                     connection, state_dir, str(repo), Path("unused.ini"), "main", False
                 )
@@ -13980,6 +14114,7 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             self.assertEqual(source_shas, [remote_sha])
             self.assertEqual(catalog_shas, [remote_sha])
             self.assertEqual(git_command(repo, "rev-parse", "HEAD"), remote_sha)
+            planner.assert_called_once()
 
     def test_closed_pr_is_blocked_before_source_fast_forward(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -14084,7 +14219,10 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                 "loop_manager.pr_for_branch", side_effect=lambda _repo, name, _url: responses[name]
             ), mock.patch(
                 "loop_manager.ensure_safe_base_worktree", side_effect=synchronize
-            ), mock.patch("loop_manager.dispatch_execplan_archive_housekeeping"):
+            ), mock.patch("loop_manager.dispatch_execplan_archive_housekeeping"), mock.patch(
+                "loop_manager.run_codex",
+                return_value=loop_manager.CodexResult(0, "", "planner-session"),
+            ) as planner:
                 result = loop_manager.run_project(
                     connection, state_dir, str(repo), Path("unused.ini"), "main", False
                 )
@@ -14097,6 +14235,7 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             )
             self.assertEqual(git_command(repo, "rev-parse", "HEAD"), merged_head)
             self.assertTrue(second_worktree.exists())
+            planner.assert_called_once()
 
     def test_fetch_failure_after_merge_keeps_transition_for_source_resume(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -14178,13 +14317,17 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             merged["mergedAt"] = "2026-09-24T00:00:00Z"
             with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
                 "loop_manager.pr_for_branch", return_value=merged
-            ), mock.patch("loop_manager.dispatch_execplan_archive_housekeeping"):
+            ), mock.patch("loop_manager.dispatch_execplan_archive_housekeeping"), mock.patch(
+                "loop_manager.run_codex",
+                return_value=loop_manager.CodexResult(0, "", "planner-session"),
+            ) as planner:
                 self.assertEqual(
                     loop_manager.run_project(
                         connection, state_dir, str(repo), Path("unused.ini"), "main", False
                     ), 0,
                 )
             self.assertEqual(git_command(repo, "rev-parse", "HEAD"), head)
+            planner.assert_called_once()
 
     def test_unverifiable_merge_cleanup_blocks_source_sync_without_losing_merge(self):
         with tempfile.TemporaryDirectory() as directory:

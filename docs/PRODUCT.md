@@ -52,9 +52,9 @@
 - 원격 ExecPlan catalog가 누락 파일, 잘못된 형식·source·ID 또는 dependency graph 때문에 유효하지 않으면 다른 ExecPlan 상태를 바꾸지 않고 실제 원인 파일을 포함한 프로젝트 범위 진단으로 격리한다
 - ExecPlan 생성 전 Planner 실패는 프로젝트의 `planning_error`로 SQLite에 저장하며 ExecPlan BLOCKED 상태를 만들지 않는다
 - 미충족 PRODUCT 또는 Requirement에 근거해서만 ExecPlan을 작성한다
-- 실행 중인 변경 작업은 새 계획 입력이 선점하지 않는다. 안전한 선택 경계에서 마지막 성공 Planner 이후 명세가 바뀌었으면 대기 중인 READY보다 일반 Planner를 정확히 한 번 먼저 실행하고, 명세가 같으면 실행 가능한 READY를 우선순위대로 시작하며, 실행 가능한 READY가 없을 때만 변경된 전체 계획 입력을 한 번 재계획한다. due 유지보수 평가는 기존 순서를 유지한다
+- 실행 중인 변경 작업은 새 계획 입력이 선점하지 않는다. 안전한 선택 경계에서 마지막 성공 Planner 이후 명세 또는 전체 계획 입력이 바뀌었으면 대기 중인 READY보다 일반 Planner를 정확히 한 번 먼저 실행한다. 입력이 같으면 실행 가능한 READY를 우선순위대로 시작하며, 없으면 대기 또는 완료 조건을 평가한다. due 유지보수 평가는 기존 순서를 유지한다
 - 프로젝트별 성공한 유지보수 평가 이후 새로 MERGED가 된 ExecPlan 수로 다음 평가 시점을 계산하며, 이력이 없으면 첫 선택 경계에서 평가한다. 공통 `refactoring_review_interval`은 양의 정수이고 기본값은 5다
-- 실행 가능한 READY ExecPlan은 명세 변경 우선 계획이 없을 때 안전한 무인 자동화를 막는 작업부터 결정적 순서로 선택한다. dependency 미충족 READY, `PLAN_BLOCKED`·안정된 `PR_OPEN`만 남은 경우에도 명세 또는 전체 계획 입력 trigger를 평가하되, 활성 유지보수 주기의 prerequisite 집합과 리팩터링 DAG 순서는 유지한다
+- 실행 가능한 READY ExecPlan은 명세 또는 전체 계획 입력 변경에 따른 우선 계획이 없을 때 안전한 무인 자동화를 막는 작업부터 결정적 순서로 선택한다. dependency 미충족 READY, `PLAN_BLOCKED`·안정된 `PR_OPEN`만 남은 경우에도 명세 또는 전체 계획 입력 trigger를 평가하되, 활성 유지보수 주기의 prerequisite 집합과 리팩터링 DAG 순서는 유지한다
 - Planner는 최신 `origin/<base-branch>` 기준의 detached planning worktree에서 새 ExecPlan을 작성하고, SQLite와 Git snapshot으로 증명된 미착수 READY만 같은 ID로 수정·rename·삭제할 수 있다. 그 밖의 기존 계획과 파일은 변경하지 않으며 범위 밖 아이디어만 `docs/FUTURE_IDEAS.md`에 기록한다
 - 유지보수 Planner만 활성 cycle mode와 무소유 READY snapshot에 한정해 barrier dependency 또는 사후 구조 참조를 개정할 수 있다. READY가 없고 일반 계획 입력도 변경된 due 경계에서만 일반 계획과 유지보수 평가를 한 호출로 결합한다
 - 유지보수 planning batch는 원격 fast-forward가 확인된 뒤 catalog와 cycle 상태를 원자적으로 반영하며, 평가 없음 또는 사후 재검증 성공 전에는 평가 기준선을 전진시키지 않는다
@@ -137,7 +137,7 @@
 3. 동시에 처리할 프로젝트를 `max_workers` 범위에서 선택한다
 4. 실행 중인 변경 단계가 없으면 dependency를 충족한 확정 PR 충돌 복구 하나를 먼저 선택하고, 없으면 프로젝트별 유지보수 평가 주기를 확인한다. `PLAN_BLOCKED` 또는 `PR_OPEN`이 있으면 유지보수 평가는 보류하고 독립 READY 선택으로 이동한다
 5. due 유지보수 cycle이 prerequisite 또는 리팩터링 계획을 기록했으면 그 집합의 dependency 충족 계획만 선택하고, 사후 재검증 단계면 장벽 뒤 Worker보다 유지보수 Planner를 먼저 실행한다
-6. 유지보수 cycle이 없으면 최신 원격 PRODUCT·ARCHITECTURE·활성 Requirement 명세 지문을 먼저 비교한다. 마지막 성공 기준과 다르면 READY·`PLAN_BLOCKED`·안정된 `PR_OPEN`보다 일반 Planner를 한 번 먼저 실행하고, 같으면 실행 가능한 READY를 priority와 숫자 ID 순으로 시작한다. 실행 가능한 READY가 없을 때만 전체 계획 입력 지문을 비교해 달라진 경우 한 번 재계획하며, 두 지문이 같으면 대기하거나 완료한다
+6. 유지보수 cycle이 없으면 최신 원격 명세와 전체 계획 입력 지문을 마지막 성공 기준과 비교한다. 둘 중 하나라도 달라졌으면 READY·`PLAN_BLOCKED`·안정된 `PR_OPEN`보다 일반 Planner를 한 번 먼저 실행한다. 입력이 같으면 실행 가능한 READY를 priority와 숫자 ID 순으로 시작하고, 없으면 대기하거나 완료한다. ExecPlan 상태·파일 변경과 내용 보존 Requirement archive만으로는 성공 기준을 무효화하지 않는다
 7. Planner가 PRODUCT, Requirement, ARCHITECTURE, 현재 코드, 비종료 compact catalog와 프로그램이 제공한 미착수 READY snapshot을 확인한다
 8. 계획과 `docs/FUTURE_IDEAS.md` 변경이 모두 없으면 관측한 명세·전체 계획 입력 지문을 함께 저장하고 planning worktree를 정리한 뒤 프로젝트 완료 여부를 확인한다
 9. 작업이 필요하면 Planner가 미충족 작업을 새 ExecPlan으로 나누어 일괄 작성하고, snapshot의 미착수 READY를 같은 ID로 수정·rename·삭제할 수 있다. 현재 범위 밖의 아이디어는 `docs/FUTURE_IDEAS.md`에 분리한다

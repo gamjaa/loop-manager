@@ -14165,19 +14165,7 @@ def complete_merged_worktree(
                 assessment.reason or assessment.status,
                 workspace_owned=workspace_owned,
             )
-        unfinished = connection.execute(
-            "SELECT 1 FROM exec_plans "
-            "WHERE repo = ? AND plan_id != ? AND status != 'MERGED' "
-            "AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h "
-            "WHERE h.repo = exec_plans.repo "
-            "AND h.currently_archived = 1 "
-            "AND h.plan_id = exec_plans.plan_id) LIMIT 1",
-            (repo, plan_id),
-        ).fetchone()
         project_values = _clear_active_values()
-        if unfinished is None:
-            project_values["processed_sha"] = None
-            project_values["planning_fingerprint"] = None
         runtime_state.RuntimeStateRepository(connection).mark_merged(
             repo,
             plan_id,
@@ -14262,24 +14250,12 @@ def complete_merged_execplan_worktree(
                 workspace_owned=workspace_owned,
             )
         plan_id = str(plan["plan_id"])
-        unfinished = connection.execute(
-            "SELECT 1 FROM exec_plans "
-            "WHERE repo = ? AND plan_id != ? AND status != 'MERGED' "
-            "AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h "
-            "WHERE h.repo = exec_plans.repo "
-            "AND h.currently_archived = 1 "
-            "AND h.plan_id = exec_plans.plan_id) LIMIT 1",
-            (repo, plan_id),
-        ).fetchone()
         mirrored = connection.execute(
             "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
         ).fetchone()
         project_values: dict[str, object] = {}
         if mirrored and mirrored["plan_path"] == plan["path"]:
             project_values.update(_clear_active_values())
-        if unfinished is None:
-            project_values["processed_sha"] = None
-            project_values["planning_fingerprint"] = None
         runtime_state.RuntimeStateRepository(connection).mark_merged(
             repo,
             plan_id,
@@ -18751,8 +18727,6 @@ def _run_project_step(
         return 1
     if pr_sync.step_result not in {None, 0}:
         return pr_sync.step_result
-    if pr_sync.merged and not catalog_schedule_decision(connection, repo).has_ready:
-        return 0
     if validated_agent_scope is not None:
         try:
             validated_agent_scope = refresh_persisted_agent_scope_after_manager_git(
@@ -19300,7 +19274,15 @@ def _run_project_result(
                 and schedule.runnable_ready is not None
                 and not schedule.project_blocked
             ):
-                step_result = PROJECT_STEP_RETRY
+                project_after = connection.execute(
+                    "SELECT phase, planning_error FROM projects WHERE repo = ?",
+                    (repo,),
+                ).fetchone()
+                if project_after is not None and (
+                    project_after["phase"] != "PLANNING"
+                    and not project_after["planning_error"]
+                ):
+                    step_result = PROJECT_STEP_RETRY
         if step_result != PROJECT_STEP_RETRY:
             break
 
