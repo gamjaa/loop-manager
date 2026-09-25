@@ -51,6 +51,31 @@ CREATE TABLE IF NOT EXISTS maintenance_cycles (
 )
 """
 
+DOCUMENT_DRAFTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS document_drafts (
+    draft_id TEXT PRIMARY KEY,
+    repo TEXT NOT NULL,
+    finding_ids TEXT NOT NULL,
+    target_path TEXT NOT NULL,
+    assessment_revision TEXT NOT NULL,
+    original_revision TEXT NOT NULL,
+    original_hash TEXT NOT NULL,
+    original_content BLOB NOT NULL,
+    proposed_hash TEXT NOT NULL,
+    proposed_content BLOB NOT NULL,
+    complete_diff TEXT NOT NULL,
+    source_relationships TEXT NOT NULL,
+    meaning_evidence TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'approved', 'rejected', 'stale')),
+    requested_decision TEXT,
+    decision_revision TEXT,
+    decision_reason TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    decided_at TEXT,
+    FOREIGN KEY (repo) REFERENCES projects(repo)
+)
+"""
+
 
 @dataclass(frozen=True)
 class MaintenanceCycle:
@@ -88,6 +113,7 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
     """Create the additive maintenance table without rewriting audit data."""
 
     connection.execute(MAINTENANCE_SCHEMA)
+    connection.execute(DOCUMENT_DRAFTS_SCHEMA)
     columns = {
         str(row[1])
         for row in connection.execute("PRAGMA table_info(maintenance_cycles)")
