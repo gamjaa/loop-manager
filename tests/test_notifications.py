@@ -758,6 +758,236 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
         self.assertIsNotNone(self.events(connection)[0]["sent_at"])
 
 
+class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
+    def add_event(self, connection, kind="pr_created", body=""):
+        payload = {
+            "project": "alpha", "execplan_id": "G-018",
+            "execplan_title": body, "pr_url": "https://example.test/pr/18",
+        }
+        notifications._insert(connection, "test-event", "/projects/alpha", kind, payload)
+        connection.commit()
+        return notifications._message(kind, payload)
+
+    def test_exact_boundaries_and_unicode_round_trip(self):
+        for length in (4096, 4097, 8193):
+            with self.subTest(length=length):
+                connection = self.connection()
+                header = "[alpha] PR created\nG-018: "
+                suffix = "\nhttps://example.test/pr/18"
+                title_length = length - len(header) - len(suffix)
+                title = ("한글🙂\n" * (title_length // 4 + 1))[:title_length]
+                body = self.add_event(connection, body=title)
+                self.assertEqual(len(body), length)
+                calls = []
+                self.assertEqual(notifications.dispatch_pending(
+                    connection, "token", "chat",
+                    adapter=lambda _token, _chat, text: calls.append(text),
+                ), 1)
+                self.assertEqual([len(piece) for piece in calls],
+                                 [4096] * (length // 4096) +
+                                 ([length % 4096] if length % 4096 else []))
+                self.assertEqual("".join(calls), body)
+                row = self.events(connection)[0]
+                self.assertEqual(row["confirmed_pieces"], len(calls))
+                self.assertIsNotNone(row["sent_at"])
+                connection.close()
+
+    def test_later_failure_resumes_frozen_text_after_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "state.db"
+            connection = self.connection(database=database)
+            original = self.add_event(connection, body="가🙂\n" * 3000)
+            delivered = []
+
+            def fail_second(_token, _chat, text):
+                if delivered:
+                    raise RuntimeError("body-secret token-secret chat-secret")
+                delivered.append(text)
+
+            self.assertEqual(notifications.dispatch_pending(
+                connection, "token-secret", "chat-secret", adapter=fail_second,
+            ), 0)
+            row = self.events(connection)[0]
+            self.assertEqual(row["confirmed_pieces"], 1)
+            self.assertEqual(row["attempts"], 2)
+            self.assertIsNone(row["sent_at"])
+            self.assertEqual(row["rendered_text"], original)
+            for secret in ("body-secret", "token-secret", "chat-secret", original):
+                self.assertNotIn(secret, row["last_error"])
+            connection.execute(
+                "UPDATE notification_outbox SET payload = ? WHERE event_key = ?",
+                ('{"project":"changed"}', "test-event"),
+            )
+            connection.commit()
+            connection.close()
+
+            restarted = sqlite3.connect(database)
+            restarted.row_factory = sqlite3.Row
+            notifications.ensure_schema(restarted)
+            remaining = []
+            self.assertEqual(notifications.dispatch_pending(
+                restarted, "token", "chat",
+                adapter=lambda _token, _chat, text: remaining.append(text),
+            ), 1)
+            self.assertEqual("".join(delivered + remaining), original)
+            self.assertEqual(self.events(restarted)[0]["confirmed_pieces"], 3)
+            self.assertEqual(notifications.dispatch_pending(
+                restarted, "token", "chat", adapter=mock.Mock(),
+            ), 0)
+            restarted.close()
+
+    def test_interrupted_later_piece_retries_only_uncertain_piece(self):
+        connection = self.connection()
+        original = self.add_event(connection, body="x" * 8200)
+        delivered = []
+
+        def interrupt(_token, _chat, text):
+            delivered.append(text)
+            if len(delivered) == 2:
+                raise KeyboardInterrupt()
+
+        with self.assertRaises(KeyboardInterrupt):
+            notifications.dispatch_pending(
+                connection, "token", "chat", adapter=interrupt,
+            )
+        row = self.events(connection)[0]
+        self.assertEqual(row["confirmed_pieces"], 1)
+        self.assertEqual(row["attempts"], 2)
+        self.assertIsNotNone(row["delivery_started_at"])
+        retried = []
+        self.assertEqual(notifications.dispatch_pending(
+            connection, "token", "chat",
+            adapter=lambda _token, _chat, text: retried.append(text),
+        ), 1)
+        self.assertEqual(retried[0], delivered[1])
+        self.assertEqual("".join([delivered[0], *retried]), original)
+        self.assertEqual(self.events(connection)[0]["attempts"], 4)
+
+    def test_immediate_pr_dispatch_uses_same_piece_cursor(self):
+        connection = self.connection()
+        original = self.add_event(connection, body="x" * 5000)
+        calls = []
+        self.assertEqual(notifications.dispatch_new_pr_notifications(
+            connection, "token", "chat", "/projects/alpha",
+            adapter=lambda _token, _chat, text: calls.append(text),
+        ), 1)
+        self.assertEqual("".join(calls), original)
+        self.assertEqual(self.events(connection)[0]["attempts"], 2)
+        self.assertEqual(notifications.dispatch_pending(
+            connection, "token", "chat", adapter=mock.Mock(),
+        ), 0)
+
+    def test_cleared_block_cancels_remaining_pieces_and_keeps_progress(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        with connection:
+            scoped_blocking.record_plan_block(
+                connection, repo, "G-018",
+                scoped_blocking.BlockReasonCode.USER_DECISION_REQUIRED,
+                "x" * 9000, "fingerprint",
+            )
+            checkpoint = blocked_checkpoint_state.BlockedCheckpointRepository(
+                connection
+            )
+            checkpoint.finish_unpublished(
+                checkpoint.get(repo, "G-018"), "local only", retryable=False,
+            )
+            notifications.enqueue_current_project_events(connection, repo)
+        calls = []
+
+        def clear_after_first(_token, _chat, text):
+            calls.append(text)
+            scoped_blocking.clear_plan_block(connection, repo, "G-018")
+            connection.commit()
+
+        self.assertEqual(notifications.dispatch_pending(
+            connection, "token", "chat", adapter=clear_after_first,
+        ), 0)
+        row = self.events(connection)[0]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(row["confirmed_pieces"], 1)
+        self.assertIsNotNone(row["canceled_at"])
+        self.assertIsNone(row["sent_at"])
+        self.assertEqual(notifications.dispatch_pending(
+            connection, "token", "chat", adapter=mock.Mock(),
+        ), 0)
+
+    def test_published_block_with_remote_inspection_is_delivered(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        with connection:
+            scoped_blocking.record_plan_block(
+                connection, repo, "G-018",
+                scoped_blocking.BlockReasonCode.USER_DECISION_REQUIRED,
+                "Decision still required", "fingerprint",
+            )
+        checkpoint = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
+        request = checkpoint.get(repo, "G-018")
+        checkpoint.finish_published(request, "a" * 40)
+        original_key = self.events(connection)[0]["event_key"]
+        checkpoint.record_remote_inspection(
+            request, "b" * 40, "input", "still blocked",
+        )
+        self.assertEqual(len(self.events(connection)), 2)
+        current_key = next(
+            row["event_key"] for row in self.events(connection)
+            if row["event_key"] != original_key
+        )
+
+        delivered = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(
+            connection, "token", "chat", adapter=delivered,
+        ), 1)
+        delivered.assert_called_once()
+        rows = {row["event_key"]: row for row in self.events(connection)}
+        self.assertIsNotNone(rows[original_key]["canceled_at"])
+        self.assertIsNone(rows[current_key]["canceled_at"])
+        self.assertIsNotNone(rows[current_key]["sent_at"])
+
+    def test_cleared_planning_error_cancels_only_its_unsent_notice(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        loop_manager.update_project(
+            connection, repo, phase="PLANNING", planning_error="Old failure",
+        )
+        pr_message = self.add_event(connection, body="Unrelated PR")
+        connection.execute(
+            "UPDATE projects SET planning_error = NULL WHERE repo = ?", (repo,),
+        )
+        connection.commit()
+        calls = []
+        self.assertEqual(notifications.dispatch_pending(
+            connection, "token", "chat",
+            adapter=lambda _token, _chat, text: calls.append(text),
+        ), 1)
+        self.assertEqual(calls, [pr_message])
+        rows = {row["event_type"]: row for row in self.events(connection)}
+        self.assertIsNotNone(rows["blocked"]["canceled_at"])
+        self.assertEqual(rows["blocked"]["confirmed_pieces"], 0)
+        self.assertIsNone(rows["blocked"]["sent_at"])
+        self.assertIsNotNone(rows["pr_created"]["sent_at"])
+
+    def test_legacy_pending_row_gains_piece_progress(self):
+        connection = self.connection()
+        connection.execute("DROP TABLE notification_outbox")
+        connection.execute(
+            "CREATE TABLE notification_outbox (event_key TEXT PRIMARY KEY, "
+            "repo TEXT NOT NULL, event_type TEXT NOT NULL, payload TEXT NOT NULL, "
+            "attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, "
+            "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+            "delivery_started_at TEXT, sent_at TEXT)"
+        )
+        original = self.add_event(connection, body="legacy")
+        calls = []
+        self.assertEqual(notifications.dispatch_pending(
+            connection, "token", "chat",
+            adapter=lambda _token, _chat, text: calls.append(text),
+        ), 1)
+        self.assertEqual(calls, [original])
+        self.assertEqual(self.events(connection)[0]["confirmed_pieces"], 1)
+        self.assertIsNotNone(self.events(connection)[0]["delivery_started_at"])
+
+
 class CompletionCycleTest(NotificationFixture, unittest.TestCase):
     def _complete_project(
         self,
