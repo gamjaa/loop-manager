@@ -61,6 +61,216 @@ class NotificationFixture:
 
 
 class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
+    def test_existing_delivered_plan_notice_is_adopted_without_duplicate_delivery(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        reason = "user_decision_required"
+        key = notifications._key("blocked", repo, f"plan\0{reason}\0G-018")
+        payload = {
+            "project": "alpha", "stage": "ExecPlan", "scope": "plan",
+            "reason_code": reason, "execplan_id": "G-018",
+            "cause": "old notified cause", "paths": [],
+        }
+        with connection:
+            connection.execute("DROP TABLE block_notice_events")
+            connection.execute("DROP TABLE notified_block_incidents")
+            connection.execute(
+                "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+                "VALUES (?, 'G-018', 'plan', ?, 'later mutable error')",
+                (repo, reason),
+            )
+            connection.execute(
+                "INSERT INTO notification_outbox "
+                "(event_key, repo, event_type, payload, sent_at) "
+                "VALUES (?, ?, 'blocked', ?, CURRENT_TIMESTAMP)",
+                (key, repo, json.dumps(payload)),
+            )
+        with connection:
+            notifications.enqueue_current_project_events(connection, repo)
+        self.assertEqual(connection.execute(
+            "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'blocked'"
+        ).fetchone()[0], 1)
+        incident = connection.execute(
+            "SELECT event_key FROM notified_block_incidents WHERE repo = ?",
+            (repo,),
+        ).fetchone()
+        self.assertEqual(incident[0], key)
+        with connection:
+            scoped_blocking.clear_plan_block(connection, repo, "G-018")
+            self.assertEqual(notifications.record_work_start(
+                connection, repo, "Worker", plan_id="G-018",
+            ), 1)
+        resumed = connection.execute(
+            "SELECT payload FROM notification_outbox WHERE event_type = 'resumed'"
+        ).fetchone()
+        self.assertEqual(json.loads(resumed[0])["cause"], "old notified cause")
+
+    def test_legacy_planning_notice_is_adopted_before_release_without_reenqueue(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        key = notifications._key("blocked", repo, "project\0planning_error\0")
+        payload = {
+            "project": "alpha", "stage": "planning", "scope": "project",
+            "reason_code": "planning_error", "execplan_id": None,
+            "cause": "old planning error", "paths": [],
+        }
+        with connection:
+            connection.execute("DROP TABLE block_notice_events")
+            connection.execute("DROP TABLE notified_block_incidents")
+            connection.execute(
+                "UPDATE projects SET planning_error = 'old planning error' "
+                "WHERE repo = ?", (repo,),
+            )
+            connection.execute(
+                "INSERT INTO notification_outbox "
+                "(event_key, repo, event_type, payload, sent_at) "
+                "VALUES (?, ?, 'blocked', ?, CURRENT_TIMESTAMP)",
+                (key, repo, json.dumps(payload)),
+            )
+        loop_manager.update_project(connection, repo, planning_error=None)
+        with connection:
+            self.assertEqual(notifications.record_work_start(
+                connection, repo, "Planner",
+            ), 1)
+        self.assertEqual(connection.execute(
+            "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'blocked'"
+        ).fetchone()[0], 1)
+
+    def test_legacy_partial_project_notice_cancels_remaining_piece_on_release(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        reason = "repository_state_unsafe"
+        key = notifications._key("blocked", repo, f"project\0{reason}\0")
+        payload = {
+            "project": "alpha", "stage": "project", "scope": "project",
+            "reason_code": reason, "execplan_id": None,
+            "cause": "old project cause", "paths": [],
+        }
+        with connection:
+            connection.execute("DROP TABLE block_notice_events")
+            connection.execute("DROP TABLE notified_block_incidents")
+            connection.execute(
+                "INSERT INTO project_blocks (repo, scope, reason_code, evidence) "
+                "VALUES (?, 'project', ?, 'later mutable error')",
+                (repo, reason),
+            )
+            connection.execute(
+                "INSERT INTO notification_outbox "
+                "(event_key, repo, event_type, payload, rendered_text, "
+                "confirmed_pieces) VALUES (?, ?, 'blocked', ?, ?, 1)",
+                (key, repo, json.dumps(payload), "x" * 5000),
+            )
+        with connection:
+            scoped_blocking.clear_project_block(connection, repo)
+            self.assertEqual(notifications.record_work_start(
+                connection, repo, "Planner",
+            ), 1)
+        old = connection.execute(
+            "SELECT canceled_at, confirmed_pieces FROM notification_outbox "
+            "WHERE event_key = ?", (key,),
+        ).fetchone()
+        self.assertIsNotNone(old[0])
+        self.assertEqual(old[1], 1)
+        self.assertEqual(notifications.dispatch_pending(
+            connection, "token", "chat", adapter=mock.Mock(),
+        ), 1)
+        self.assertEqual(connection.execute(
+            "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'resumed'"
+        ).fetchone()[0], 1)
+
+    def test_legacy_changed_checkpoint_notices_share_one_active_incident(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        reason = "user_decision_required"
+        current_key = notifications._key("blocked", repo, f"plan\0{reason}\0G-018")
+        old_key = notifications._key(
+            "blocked", repo, f"plan\0{reason}\0G-018\0old-checkpoint",
+        )
+        old_payload = {
+            "project": "alpha", "stage": "ExecPlan", "scope": "plan",
+            "reason_code": reason, "execplan_id": "G-018",
+            "cause": "first notified cause", "paths": [],
+        }
+        new_payload = {**old_payload, "cause": "later block detail"}
+        with connection:
+            connection.execute("DROP TABLE block_notice_events")
+            connection.execute("DROP TABLE notified_block_incidents")
+            connection.execute(
+                "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+                "VALUES (?, 'G-018', 'plan', ?, 'later block detail')",
+                (repo, reason),
+            )
+            connection.execute(
+                "INSERT INTO notification_outbox "
+                "(event_key, repo, event_type, payload, rendered_text, "
+                "confirmed_pieces) VALUES (?, ?, 'blocked', ?, ?, 1)",
+                (old_key, repo, json.dumps(old_payload), "x" * 5000),
+            )
+            connection.execute(
+                "INSERT INTO notification_outbox (event_key, repo, event_type, payload) "
+                "VALUES (?, ?, 'blocked', ?)",
+                (current_key, repo, json.dumps(new_payload)),
+            )
+        with connection:
+            notifications.enqueue_current_project_events(connection, repo)
+        self.assertEqual(connection.execute(
+            "SELECT COUNT(*) FROM notified_block_incidents WHERE repo = ?",
+            (repo,),
+        ).fetchone()[0], 1)
+        self.assertEqual(connection.execute(
+            "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'blocked'"
+        ).fetchone()[0], 2)
+        self.assertIsNotNone(connection.execute(
+            "SELECT canceled_at FROM notification_outbox WHERE event_key = ?",
+            (old_key,),
+        ).fetchone()[0])
+        with connection:
+            scoped_blocking.clear_plan_block(connection, repo, "G-018")
+            self.assertEqual(notifications.record_work_start(
+                connection, repo, "Worker", plan_id="G-018",
+            ), 1)
+        resumed = connection.execute(
+            "SELECT payload FROM notification_outbox WHERE event_type = 'resumed'"
+        ).fetchone()
+        self.assertEqual(json.loads(resumed[0])["cause"], "first notified cause")
+
+    def test_older_legacy_notice_does_not_notify_new_undelivered_same_reason_block(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        reason = "user_decision_required"
+        old_key = notifications._key("blocked", repo, f"plan\0{reason}\0G-018")
+        payload = {
+            "project": "alpha", "stage": "ExecPlan", "scope": "plan",
+            "reason_code": reason, "execplan_id": "G-018",
+            "cause": "prior incident", "paths": [],
+        }
+        with connection:
+            connection.execute("DROP TABLE block_notice_events")
+            connection.execute("DROP TABLE notified_block_incidents")
+            connection.execute(
+                "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+                "VALUES (?, 'G-018', 'plan', ?, 'new incident')",
+                (repo, reason),
+            )
+            connection.execute(
+                "INSERT INTO notification_outbox "
+                "(event_key, repo, event_type, payload, sent_at, created_at) "
+                "VALUES (?, ?, 'blocked', ?, CURRENT_TIMESTAMP, '2000-01-01 00:00:00')",
+                (old_key, repo, json.dumps(payload)),
+            )
+        with connection:
+            notifications.enqueue_current_project_events(connection, repo)
+            scoped_blocking.clear_plan_block(connection, repo, "G-018")
+            self.assertEqual(notifications.record_work_start(
+                connection, repo, "Worker", plan_id="G-018",
+            ), 0)
+        self.assertEqual(connection.execute(
+            "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'blocked'"
+        ).fetchone()[0], 2)
+        self.assertEqual(connection.execute(
+            "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'resumed'"
+        ).fetchone()[0], 0)
+
     def test_notified_plan_resumes_only_at_its_worker_start_and_new_block_is_distinct(self):
         connection = self.connection()
         repo = "/projects/alpha"

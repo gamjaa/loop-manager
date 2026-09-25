@@ -120,6 +120,112 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
             "ALTER TABLE notified_block_incidents ADD COLUMN version "
             "INTEGER NOT NULL DEFAULT 0"
         )
+    _adopt_legacy_block_notices(connection)
+
+
+def _adopt_legacy_block_notices(connection: sqlite3.Connection) -> None:
+    """Attach notices from each still-active pre-incident block."""
+
+    required = {
+        "projects", "project_blocks", "execplan_blocks", "blocked_checkpoints",
+    }
+    available = {
+        str(row[0]) for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name IN ('projects', 'project_blocks', 'execplan_blocks', "
+            "'blocked_checkpoints')"
+        )
+    }
+    if available != required:
+        return
+    rows = connection.execute(
+        "SELECT o.event_key, o.repo, o.payload, o.sent_at, o.confirmed_pieces, "
+        "o.created_at "
+        "FROM notification_outbox AS o WHERE o.event_type = 'blocked' "
+        "AND o.canceled_at IS NULL "
+        "AND NOT EXISTS (SELECT 1 FROM block_notice_events AS n "
+        "WHERE n.event_key = o.event_key) ORDER BY o.rowid"
+    ).fetchall()
+    groups: dict[tuple[str, str], list[tuple[sqlite3.Row, dict[str, object]]]] = {}
+    for row in rows:
+        try:
+            payload = json.loads(str(row[2]))
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("stage") == "planning":
+            subject = "planning"
+        elif payload.get("scope") == "plan" and payload.get("execplan_id"):
+            subject = f"plan:{payload['execplan_id']}"
+        elif payload.get("scope") == "project":
+            subject = "project"
+        else:
+            continue
+        repo = str(row[1])
+        event_key = str(row[0])
+        current_key = _current_block_key(connection, repo, payload)
+        if current_key is None:
+            continue
+        if subject == "planning":
+            if event_key != current_key:
+                continue
+        elif subject.startswith("plan:"):
+            block = connection.execute(
+                "SELECT reason_code, created_at FROM execplan_blocks "
+                "WHERE repo = ? AND plan_id = ?",
+                (repo, payload["execplan_id"]),
+            ).fetchone()
+            if (block is None or block[0] != payload.get("reason_code")
+                    or str(row[5]) < str(block[1])):
+                continue
+        else:
+            block = connection.execute(
+                "SELECT reason_code, plan_id, created_at FROM project_blocks "
+                "WHERE repo = ?", (repo,),
+            ).fetchone()
+            if (block is None or block[0] != payload.get("reason_code")
+                    or block[1] != payload.get("execplan_id")
+                    or str(row[5]) < str(block[2])):
+                continue
+        groups.setdefault((repo, subject), []).append((row, payload))
+
+    for (repo, subject), notices in groups.items():
+        active = connection.execute(
+            "SELECT 1 FROM notified_block_incidents WHERE repo = ? "
+            "AND subject = ? AND released_at IS NULL",
+            (repo, subject),
+        ).fetchone()
+        if active is not None:
+            continue
+        current_key = _current_block_key(connection, repo, notices[-1][1])
+        current = next(
+            (item for item in notices if str(item[0][0]) == current_key),
+            notices[-1],
+        )
+        confirmed = next(
+            (item for item in notices if item[0][3] or int(item[0][4]) > 0),
+            None,
+        )
+        event_key = str(current[0][0])
+        cursor = connection.execute(
+            "INSERT INTO notified_block_incidents "
+            "(repo, subject, block_key, event_key, payload, confirmed_before) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (repo, subject, event_key, event_key,
+             str((confirmed or current)[0][2]), int(confirmed is not None)),
+        )
+        for row, _payload in notices:
+            connection.execute(
+                "INSERT INTO block_notice_events (event_key, incident_id) "
+                "VALUES (?, ?)", (row[0], cursor.lastrowid),
+            )
+            if str(row[0]) != event_key:
+                connection.execute(
+                    "UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP, "
+                    "delivery_started_at = NULL WHERE event_key = ? "
+                    "AND sent_at IS NULL AND canceled_at IS NULL", (row[0],),
+                )
 
 
 def configure_session(connection: sqlite3.Connection, *, enabled: bool) -> None:
