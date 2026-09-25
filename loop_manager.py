@@ -19603,6 +19603,111 @@ def configure_registry(
 
 
 
+def _document_drafts_command(
+    args: argparse.Namespace, state_dir: Path, config_path: Path,
+) -> int:
+    import document_drafts
+
+    repository = Path(args.repository).expanduser().resolve()
+    if not is_loop_manager_repository(repository):
+        raise document_drafts.DocumentDraftError(
+            "일회성 문서 수정본은 Loop Manager 저장소 자체에서만 사용할 수 있습니다."
+        )
+    repo = str(repository)
+    with connect_database(state_dir) as connection:
+        project = connection.execute(
+            "SELECT base_branch, provider FROM projects WHERE repo = ? AND registered = 1",
+            (repo,),
+        ).fetchone()
+        if project is None:
+            raise document_drafts.DocumentDraftError("등록된 Loop Manager 저장소가 아닙니다.")
+        base_branch = str(project["base_branch"])
+        drafts = document_drafts.DocumentDraftRepository(connection)
+
+        def display_review(draft: document_drafts.DocumentDraft) -> None:
+            sys.stdout.flush()
+            output = sys.stdout.buffer
+            output.write(document_drafts.review_artifact_bytes(draft))
+            output.flush()
+
+        if args.draft_command == "list":
+            for path, findings in drafts.candidates(repo).items():
+                operation_print(f"candidate\t{path}\t{','.join(findings)}")
+            for draft in drafts.list(repo):
+                operation_print(
+                    f"{draft.state}\t{draft.draft_id}\t{draft.proposed_hash}\t"
+                    f"{draft.target_path}"
+                )
+            return 0
+        if args.draft_command == "show":
+            draft = drafts.get(args.draft_id)
+            if draft.repo != repo:
+                raise document_drafts.DocumentDraftError("다른 저장소의 수정본입니다.")
+            display_review(draft)
+            return 0
+        git(repository, "fetch", "origin", f"+refs/heads/{base_branch}:refs/remotes/origin/{base_branch}")
+        if args.draft_command == "generate":
+            prompt, identity = drafts.generation_prompt(
+                repo, repository, base_branch, args.target,
+            )
+            result = _coerce_agent_result(
+                run_agent(
+                    str(project["provider"]), ROOT, state_dir, config_path,
+                    "planner", prompt, read_only=True,
+                ),
+                None,
+            )
+            if result.code:
+                raise document_drafts.DocumentDraftError(
+                    "문서 수정본 Agent가 성공하지 못했습니다. 원본과 결정은 그대로입니다."
+                )
+            generated = document_drafts.parse_generated_draft(result.message)
+            if generated is None:
+                operation_print("의미 보존을 확정하지 못해 수정본을 만들지 않았습니다.")
+                return 0
+            draft = drafts.create(
+                repo, repository, base_branch, args.target, *generated,
+                expected_identity=identity,
+            )
+            connection.commit()
+            display_review(draft)
+        elif args.draft_command == "create":
+            content_file = Path(args.content_file).expanduser().resolve()
+            if content_file.is_relative_to(repository):
+                raise document_drafts.DocumentDraftError(
+                    "수정본 입력 파일은 source checkout 밖에 두어야 합니다."
+                )
+            draft = drafts.create(
+                repo, repository, base_branch, args.target,
+                content_file.read_bytes(), args.meaning_evidence,
+            )
+            connection.commit()
+            display_review(draft)
+        elif args.draft_command == "decide":
+            draft = drafts.get(args.draft_id)
+            if draft.repo != repo:
+                raise document_drafts.DocumentDraftError("다른 저장소의 수정본입니다.")
+            draft = drafts.decide(
+                args.draft_id, args.proposed_hash, args.decision,
+                repository, base_branch,
+                uncertain_reason=args.uncertain_reason,
+            )
+            connection.commit()
+            operation_print(
+                f"{draft.state}\t{draft.draft_id}\t{draft.proposed_hash}\t"
+                f"{draft.decision_revision}"
+            )
+            if draft.decision_reason:
+                operation_print(draft.decision_reason)
+        else:
+            for draft in drafts.approved(repo, repository, base_branch):
+                operation_print(
+                    f"approved\t{draft.draft_id}\t{draft.proposed_hash}\t"
+                    f"{draft.target_path}"
+                )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-dir", help="기본 운영체제 상태 디렉터리 대신 사용할 경로")
@@ -19643,6 +19748,29 @@ def build_parser() -> argparse.ArgumentParser:
     remove = config_commands.add_parser("remove", help="프로젝트 등록 해제")
     remove.add_argument("repository", help="등록 해제할 저장소 루트")
 
+    drafts = subcommands.add_parser(
+        "document-drafts", help="Loop Manager 전수 평가 문서 수정본 검토와 결정"
+    )
+    drafts.add_argument("repository", help="등록된 Loop Manager 저장소 루트")
+    draft_commands = drafts.add_subparsers(dest="draft_command", required=True)
+    draft_commands.add_parser("list", help="문서 후보와 저장된 수정본 조회")
+    generate_draft = draft_commands.add_parser("generate", help="평가 발견에서 읽기 전용 수정본 생성")
+    generate_draft.add_argument("target", help="평가 결과의 활성 문서 경로")
+    create_draft = draft_commands.add_parser("create", help="외부 파일의 수정본 저장")
+    create_draft.add_argument("target", help="평가 결과의 활성 문서 경로")
+    create_draft.add_argument("content_file", help="원본 checkout 밖의 UTF-8 수정본 파일")
+    create_draft.add_argument("--meaning-evidence", required=True,
+                              help="기존 의미가 보존된 구체적인 근거")
+    show_draft = draft_commands.add_parser("show", help="전체 원본·수정본·diff 조회")
+    show_draft.add_argument("draft_id")
+    decide_draft = draft_commands.add_parser("decide", help="정확한 수정본 승인 또는 거절")
+    decide_draft.add_argument("draft_id")
+    decide_draft.add_argument("proposed_hash", help="show의 Proposed SHA256")
+    decide_draft.add_argument("decision", choices=("approve", "reject"))
+    decide_draft.add_argument("--uncertain-reason", default="",
+                              help="의미 보존이 불확실하면 승인 대신 새 검토 요구")
+    draft_commands.add_parser("approved", help="현재 원본에 유효한 승인 조회")
+
     run = subcommands.add_parser("run", help="등록 프로젝트의 다음 작업을 처리")
     run.add_argument(
         "--skip-if-running",
@@ -19666,6 +19794,8 @@ def execute_runtime_command(
         return 0
     if args.command == "config":
         return configure_registry(args, state_dir, config_path)
+    if args.command == "document-drafts":
+        return _document_drafts_command(args, state_dir, config_path)
     with connect_database(state_dir) as connection:
         agent_invocation_state.InvocationRepository(connection).reconcile_interrupted()
         return run_registered_projects(
