@@ -7629,6 +7629,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "agent_provider_usage.py",
                 "blocked_checkpoint.py",
                 "blocked_checkpoint_state.py",
+                "document_drafts.py",
+                "document_publication.py",
                 "loop_manager.py",
                 "execution_checkpoint.py",
                 "execution_checkpoint_state.py",
