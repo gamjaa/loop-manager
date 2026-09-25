@@ -230,6 +230,20 @@ class ExecutionHandlers:
             draft, context.worktree, str(self._row()['active_sha'] or ''),
         )
 
+    def _document_review_prompt(self, base_prompt, draft):
+        if draft is None:
+            return base_prompt
+        return (
+            base_prompt
+            + "\n문서 전용 검토: 아래 승인 artifact의 원본·수정본·전체 diff와 "
+            "현재 PR diff를 비교하고 PRODUCT·Requirement·ARCHITECTURE 역할, "
+            "기존 동작·결정·Acceptance Criteria·문서 간 일관성의 의미 보존을 "
+            "판정하라. 마지막 VERDICT 앞에 DOCUMENT_MEANING: PASS 또는 "
+            "DOCUMENT_MEANING: UNCERTAIN 및 DOCUMENT_DIFF: PASS 또는 "
+            "DOCUMENT_DIFF: FAIL을 각각 한 줄로 명시하라.\n"
+            + document_drafts.review_artifact(draft)
+        )
+
     def _run_document(self, context, draft):
         try:
             drafts = document_drafts.DocumentDraftRepository(
@@ -2991,22 +3005,16 @@ class ExecutionHandlers:
                     self.state_dir,
                     self.config_path,
                     'reviewer',
-                    self.effects.agent.reviewer_prompt(
-                        self.base,
-                        row['worker_result'],
-                        row['verify_result'],
-                        row['review_result'],
-                        session_recovery=session_recovery,
-                        protocol_error=protocol_error,
-                    ) + (
-                        "\n문서 전용 검토: 아래 승인 artifact의 원본·수정본·전체 diff와 "
-                        "현재 PR diff를 비교하고 PRODUCT·Requirement·ARCHITECTURE 역할, "
-                        "기존 동작·결정·Acceptance Criteria·문서 간 일관성의 의미 보존을 "
-                        "판정하라. 마지막 VERDICT 앞에 DOCUMENT_MEANING: PASS 또는 "
-                        "DOCUMENT_MEANING: UNCERTAIN 및 DOCUMENT_DIFF: PASS 또는 "
-                        "DOCUMENT_DIFF: FAIL을 각각 한 줄로 명시하라.\n"
-                        + document_drafts.review_artifact(draft)
-                        if draft is not None else ""
+                    self._document_review_prompt(
+                        self.effects.agent.reviewer_prompt(
+                            self.base,
+                            row['worker_result'],
+                            row['verify_result'],
+                            row['review_result'],
+                            session_recovery=session_recovery,
+                            protocol_error=protocol_error,
+                        ),
+                        draft,
                     ),
                     read_only=True,
                     persist_session=True,
