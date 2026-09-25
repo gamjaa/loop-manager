@@ -1058,6 +1058,8 @@ class FileReviewLedgerTest(unittest.TestCase):
         self.git("init", "-b", "main")
         self.git("config", "user.email", "test@example.com")
         self.git("config", "user.name", "Test")
+        # Exercise Git mode fixtures even when filesystem permissions are ignored.
+        self.git("config", "core.filemode", "false")
         self.connection = sqlite3.connect(":memory:")
         self.addCleanup(self.connection.close)
         self.connection.row_factory = sqlite3.Row
@@ -1123,7 +1125,7 @@ class FileReviewLedgerTest(unittest.TestCase):
         self.assertEqual(self.ledger.reviews(str(self.repo)), first_reviews)
         self.assertEqual(self.ledger.last_success(str(self.repo)).source_revision, second)
 
-        (self.repo / "src/alpha.go").chmod(0o755)
+        self.git("update-index", "--chmod=+x", "--", "src/alpha.go")
         (self.repo / "tests/check.py").rename(self.repo / "tests/renamed.py")
         self.write("scripts/verify", b"#!/bin/sh\nexit 0\n")
         third = self.publish()

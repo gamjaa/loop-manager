@@ -16,6 +16,8 @@ class TrackedSourceInventoryTest(unittest.TestCase):
         self.git("init", "-b", "main")
         self.git("config", "user.email", "test@example.com")
         self.git("config", "user.name", "Test")
+        # Exercise Git mode fixtures even when filesystem permissions are ignored.
+        self.git("config", "core.filemode", "false")
 
     def git(self, *args):
         return subprocess.run(
@@ -28,7 +30,7 @@ class TrackedSourceInventoryTest(unittest.TestCase):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
         if executable:
-            target.chmod(0o755)
+            self.git("add", "--chmod=+x", "--", path)
 
     def publish(self):
         self.git("add", "-A")
