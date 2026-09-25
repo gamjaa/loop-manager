@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS maintenance_cycles (
     repo TEXT PRIMARY KEY,
     last_success_commit TEXT,
     last_success_merged_count INTEGER,
+    file_assessment_start_merged_count INTEGER,
+    last_success_file_assessment_merged_count INTEGER,
     phase TEXT NOT NULL DEFAULT 'idle',
     cycle_base_sha TEXT,
     cycle_start_merged_count INTEGER,
@@ -82,6 +84,8 @@ class MaintenanceCycle:
     repo: str
     last_success_commit: str | None
     last_success_merged_count: int | None
+    file_assessment_start_merged_count: int | None
+    last_success_file_assessment_merged_count: int | None
     phase: MaintenancePhase
     cycle_base_sha: str | None
     cycle_start_merged_count: int | None
@@ -125,6 +129,8 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
         "full_assessment_completed": "INTEGER NOT NULL DEFAULT 0",
         "full_assessment_source_sha": "TEXT",
         "full_assessment_result": "TEXT",
+        "file_assessment_start_merged_count": "INTEGER",
+        "last_success_file_assessment_merged_count": "INTEGER",
     }
     for column, definition in migrations.items():
         if column not in columns:
@@ -159,6 +165,52 @@ def calculate_review_due(
         merged_since_baseline,
         phase,
     )
+
+
+def calculate_file_assessment_due(
+    start_merged_count: int | None,
+    last_success_merged_count: int | None,
+    current_merged_count: int,
+    interval: int,
+    phase: MaintenancePhase = MaintenancePhase.IDLE,
+    *,
+    completion_candidate: bool = False,
+) -> ReviewDue:
+    """Schedule a file assessment independently of legacy review history."""
+
+    if interval <= 0:
+        raise ValueError("refactoring review interval must be positive")
+    if current_merged_count < 0:
+        raise MaintenanceStateError("MERGED ExecPlan 수가 음수입니다.")
+    if start_merged_count is not None and (
+        start_merged_count < 0 or current_merged_count < start_merged_count
+    ):
+        raise MaintenanceStateError("파일별 평가 시작 기준값이 현재 이력보다 큽니다.")
+    if last_success_merged_count is not None and (
+        start_merged_count is None
+        or last_success_merged_count < start_merged_count
+        or current_merged_count < last_success_merged_count
+    ):
+        raise MaintenanceStateError("파일별 평가 성공 기준값이 현재 이력과 맞지 않습니다.")
+    if phase is not MaintenancePhase.IDLE:
+        return ReviewDue(False, "active_cycle", 0, phase)
+    if start_merged_count is None:
+        return ReviewDue(False, "baseline_pending", 0, phase)
+    baseline = (
+        last_success_merged_count
+        if last_success_merged_count is not None
+        else start_merged_count
+    )
+    merged_since_baseline = current_merged_count - baseline
+    if merged_since_baseline >= interval:
+        return ReviewDue(True, "interval_reached", merged_since_baseline, phase)
+    if (
+        completion_candidate
+        and last_success_merged_count is not None
+        and merged_since_baseline >= 10
+    ):
+        return ReviewDue(True, "stabilization_due", merged_since_baseline, phase)
+    return ReviewDue(False, "interval_pending", merged_since_baseline, phase)
 
 
 def _plan_sort_key(plan_id: str) -> tuple[int, int | str, str]:
@@ -245,12 +297,19 @@ class MaintenanceRepository:
             ).fetchone()[0]
         )
 
+    def merged_count(self, repo: str) -> int:
+        """Return the existing catalog-backed MERGED count for a project."""
+
+        return self._merged_count(repo)
+
     @staticmethod
     def _empty(repo: str) -> MaintenanceCycle:
         return MaintenanceCycle(
             repo=repo,
             last_success_commit=None,
             last_success_merged_count=None,
+            file_assessment_start_merged_count=None,
+            last_success_file_assessment_merged_count=None,
             phase=MaintenancePhase.IDLE,
             cycle_base_sha=None,
             cycle_start_merged_count=None,
@@ -308,6 +367,16 @@ class MaintenanceRepository:
             last_success_merged_count=(
                 int(row["last_success_merged_count"])
                 if row["last_success_merged_count"] is not None
+                else None
+            ),
+            file_assessment_start_merged_count=(
+                int(row["file_assessment_start_merged_count"])
+                if row["file_assessment_start_merged_count"] is not None
+                else None
+            ),
+            last_success_file_assessment_merged_count=(
+                int(row["last_success_file_assessment_merged_count"])
+                if row["last_success_file_assessment_merged_count"] is not None
                 else None
             ),
             phase=phase,
@@ -371,6 +440,114 @@ class MaintenanceRepository:
             interval,
             state.phase,
         )
+
+    def file_assessment_due(
+        self, repo: str, interval: int, *, completion_candidate: bool = False,
+        self_repository: bool = False,
+    ) -> ReviewDue:
+        state = self.get(repo)
+        if (
+            self_repository
+            and state.phase is MaintenancePhase.IDLE
+            and not state.full_assessment_completed
+        ):
+            return ReviewDue(True, "one_time_full_assessment", 0, state.phase)
+        return calculate_file_assessment_due(
+            state.file_assessment_start_merged_count,
+            state.last_success_file_assessment_merged_count,
+            self._merged_count(repo),
+            interval,
+            state.phase,
+            completion_candidate=completion_candidate,
+        )
+
+    def _verified_merged_count(
+        self, repo: str, source_sha: str, expected_merged_count: int
+    ) -> int:
+        if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", source_sha):
+            raise MaintenanceStateError("검증된 catalog source revision이 없습니다.")
+        try:
+            revision = self.connection.execute(
+                "SELECT revision_sha FROM execplan_catalog_revisions WHERE repo = ?",
+                (repo,),
+            ).fetchone()
+        except sqlite3.OperationalError as error:
+            raise MaintenanceStateError(
+                "검증된 catalog source revision이 없습니다."
+            ) from error
+        if revision is None or str(revision[0]) != source_sha:
+            raise MaintenanceStateError("검증된 catalog source revision이 다릅니다.")
+        count = self._merged_count(repo)
+        if expected_merged_count < 0 or count != expected_merged_count:
+            raise MaintenanceStateError("검증된 MERGED ExecPlan 수가 변경됐습니다.")
+        return count
+
+    def initialize_file_assessment_start(
+        self, repo: str, *, source_sha: str, expected_merged_count: int
+    ) -> MaintenanceCycle:
+        """Set the first schedule baseline once at a verified, idle boundary."""
+
+        with _transaction(self.connection):
+            state = self.get(repo)
+            if state.file_assessment_start_merged_count is not None:
+                return state
+            if state.phase is not MaintenancePhase.IDLE:
+                return state
+            count = self._verified_merged_count(repo, source_sha, expected_merged_count)
+            if state.last_success_merged_count is not None and (
+                state.last_success_merged_count < 0
+                or count < state.last_success_merged_count
+            ):
+                raise MaintenanceStateError("MERGED ExecPlan 감사 기준값이 현재 이력보다 큽니다.")
+            self.connection.execute(
+                "INSERT INTO maintenance_cycles "
+                "(repo, file_assessment_start_merged_count, revision) "
+                "VALUES (?, ?, 1) ON CONFLICT(repo) DO UPDATE SET "
+                "file_assessment_start_merged_count = excluded.file_assessment_start_merged_count, "
+                "revision = maintenance_cycles.revision + 1, "
+                "updated_at = CURRENT_TIMESTAMP "
+                "WHERE maintenance_cycles.file_assessment_start_merged_count IS NULL "
+                "AND maintenance_cycles.phase = 'idle'",
+                (repo, count),
+            )
+            return self.get(repo)
+
+    def advance_file_assessment_success_baseline(
+        self,
+        repo: str,
+        *,
+        expected_revision: int,
+        source_sha: str,
+        expected_merged_count: int,
+    ) -> MaintenanceCycle:
+        """Persist a verified file assessment success for the publication path."""
+
+        with _transaction(self.connection):
+            state = self.get(repo)
+            if (
+                state.phase not in {
+                    MaintenancePhase.ASSESSMENT,
+                    MaintenancePhase.POST_REFACTOR_REVALIDATION,
+                }
+                or state.revision != expected_revision
+                or state.cycle_base_sha != source_sha
+                or state.file_assessment_start_merged_count is None
+            ):
+                raise MaintenanceStateError("파일별 평가의 source 또는 단계가 변경됐습니다.")
+            count = self._verified_merged_count(repo, source_sha, expected_merged_count)
+            if count < state.file_assessment_start_merged_count or (
+                state.last_success_file_assessment_merged_count is not None
+                and count < state.last_success_file_assessment_merged_count
+            ):
+                raise MaintenanceStateError("파일별 평가 성공 기준값이 현재 이력보다 큽니다.")
+            self.connection.execute(
+                "UPDATE maintenance_cycles SET "
+                "last_success_file_assessment_merged_count = ?, "
+                "revision = revision + 1, updated_at = CURRENT_TIMESTAMP "
+                "WHERE repo = ? AND revision = ?",
+                (count, repo, expected_revision),
+            )
+            return self.get(repo)
 
     def _serialize_plan_ids(
         self, repo: str, values: Sequence[str], field: str

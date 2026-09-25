@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 import loop_manager
+import maintenance_state
 from managed_config import ManagedConfig, ManagedConfigError, load_managed_config
 import project_registry
 
@@ -100,7 +101,7 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
             default_config.write_text("[loop]\nmax_workers = 2\n", encoding="utf-8")
             self.assertEqual(
                 load_managed_config(default_config).refactoring_review_interval,
-                5,
+                20,
             )
 
             configured = root / "configured.ini"
@@ -437,11 +438,127 @@ Registration recovery fixture.
                 "WHERE repo = ? AND plan_id = 'G-001'",
                 (str(root),),
             ).fetchone()
+            baseline = maintenance_state.MaintenanceRepository(connection).get(
+                str(root)
+            ).file_assessment_start_merged_count
             connection.close()
 
         self.assertEqual(row["path"], "docs/plans/[G-001] Historical.md")
         self.assertEqual(row["status"], "MERGED")
         self.assertEqual(row["plan_sha"], publication_sha)
+        self.assertEqual(baseline, 1)
+
+    def test_registration_revision_drift_rolls_back_catalog_and_allows_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            remote = parent / "remote.git"
+            root = parent / "repo"
+            subprocess.run(
+                ["git", "init", "--bare", "--initial-branch=main", str(remote)],
+                check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            )
+            root.mkdir()
+            self._project_files(root)
+            self._git(root, "remote", "add", "origin", str(remote))
+            plans = root / "docs/plans"
+            plans.mkdir()
+            (plans / "[G-001] Ready.md").write_text(
+                """---
+id: G-001
+title: Ready
+sources:
+  - docs/PRODUCT.md
+depends_on: []
+complexity: low
+risk: low
+priority: normal
+---
+
+## Purpose
+
+Registration rollback fixture.
+""",
+                encoding="utf-8",
+            )
+            self._commit(root, "Add ready plan")
+            self._git(root, "push", "-u", "origin", "main")
+            source_sha = loop_manager.git(root, "rev-parse", "HEAD").stdout.strip()
+            inspection = loop_manager.ProjectRegistrationInspection(
+                root=root, base_branch="main", provider="codex",
+                agents_hash="agents-hash", agents_approved=False,
+                origin=str(remote), source_revision=source_sha,
+            )
+            connection = self._connection()
+            connection.commit()
+            real_git = loop_manager.git
+            real_snapshot = loop_manager.revision_execplan_snapshot
+            snapshot_calls = 0
+            revision_checks = 0
+
+            def observed_snapshot(*arguments, **kwargs):
+                nonlocal snapshot_calls
+                snapshot = real_snapshot(*arguments, **kwargs)
+                snapshot_calls += 1
+                return snapshot
+
+            def changed_remote_revision(repo, *arguments, **kwargs):
+                nonlocal revision_checks
+                result = real_git(repo, *arguments, **kwargs)
+                if snapshot_calls == 2 and arguments == (
+                    "rev-parse", "--verify", "refs/remotes/origin/main^{commit}"
+                ):
+                    revision_checks += 1
+                    return subprocess.CompletedProcess(
+                        result.args, 0, stdout="f" * 40
+                    )
+                return result
+
+            with mock.patch(
+                "loop_manager.inspect_project_registration", return_value=inspection
+            ), mock.patch("loop_manager.pr_for_branch", return_value=None):
+                with mock.patch(
+                    "loop_manager.git", side_effect=changed_remote_revision
+                ), mock.patch(
+                    "loop_manager.revision_execplan_snapshot",
+                    side_effect=observed_snapshot,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "catalog revision"):
+                        loop_manager.add_registered_project(
+                            connection, root, config_path=Path("config.ini"),
+                            provider="codex", requested_base=None,
+                            approve_agents_mismatch=False,
+                        )
+                self.assertEqual(snapshot_calls, 2)
+                self.assertEqual(revision_checks, 1)
+                for table in (
+                    "projects", "exec_plans", "execplan_catalog_revisions",
+                    "maintenance_cycles",
+                ):
+                    self.assertEqual(
+                        connection.execute(
+                            f"SELECT COUNT(*) FROM {table} WHERE repo = ?",
+                            (str(root),),
+                        ).fetchone()[0], 0, table,
+                    )
+
+                loop_manager.add_registered_project(
+                    connection, root, config_path=Path("config.ini"),
+                    provider="codex", requested_base=None,
+                    approve_agents_mismatch=False,
+                )
+            self.assertEqual(len(project_registry.list_projects(connection)), 1)
+            self.assertEqual(
+                connection.execute(
+                    "SELECT status FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+                    (str(root),),
+                ).fetchone()[0], "READY",
+            )
+            self.assertEqual(
+                maintenance_state.MaintenanceRepository(connection).get(
+                    str(root)
+                ).file_assessment_start_merged_count, 0,
+            )
+            connection.close()
 
     def test_remove_refuses_active_execplans_and_planning_errors(self):
         connection = self._connection()

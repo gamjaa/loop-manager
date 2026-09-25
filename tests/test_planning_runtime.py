@@ -59,6 +59,8 @@ def maintenance_cycle(**overrides):
         "repo": "/repo",
         "last_success_commit": None,
         "last_success_merged_count": None,
+        "file_assessment_start_merged_count": None,
+        "last_success_file_assessment_merged_count": None,
         "phase": maintenance_state.MaintenancePhase.IDLE,
         "cycle_base_sha": None,
         "cycle_start_merged_count": None,
@@ -96,6 +98,8 @@ class FakeStatePort:
         self.general_intent_error_call = None
         self.maintenance_due_self_repository = None
         self.maintenance_due_required = False
+        self.maintenance_due_reason = "interval_reached"
+        self.maintenance_begin_count = 0
         self.schedule_result = SimpleNamespace(
             active=None,
             has_ready=False,
@@ -131,9 +135,11 @@ class FakeStatePort:
 
     def maintenance_due(self, _repo, _interval, *, self_repository=False):
         self.maintenance_due_self_repository = self_repository
-        return SimpleNamespace(required=self.maintenance_due_required)
+        return SimpleNamespace(required=self.maintenance_due_required,
+                               reason=self.maintenance_due_reason)
 
     def begin_maintenance_assessment(self, *_args, **_kwargs):
+        self.maintenance_begin_count += 1
         return self.cycle, False
 
     def restart_stale_maintenance(self, _repo, _expected, base_sha):
@@ -461,6 +467,30 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
             PlanningLifecycleCoordinator(ports)._select_planning_work(run)
             self.assertEqual(ports.state.maintenance_due_self_repository,
                              self_repository)
+
+    def test_new_periodic_review_waits_for_file_assessment_execution_path(self):
+        ports = FakePorts(planning_snapshot())
+        ports.state.maintenance_due_required = True
+        ports.state.schedule_result.has_ready = True
+        ports.state.schedule_result.runnable_ready = object()
+        for reason in ("no_successful_assessment", "interval_reached"):
+            ports.state.maintenance_due_reason = reason
+            run = PlanningLifecycleCoordinator(ports)._new_run(
+                replace(self.context, registered_only=True)
+            )
+            outcome = PlanningLifecycleCoordinator(ports)._select_planning_work(run)
+            self.assertEqual(outcome.kind, PlanningOutcomeKind.WAITING)
+            self.assertEqual(ports.state.maintenance_begin_count, 0)
+            self.assertFalse(run.maintenance_planning)
+
+        ports.state.maintenance_due_reason = "one_time_full_assessment"
+        ports.state.schedule_result.has_ready = False
+        ports.state.schedule_result.runnable_ready = None
+        run = PlanningLifecycleCoordinator(ports)._new_run(
+            replace(self.context, registered_only=True, self_repository=True)
+        )
+        PlanningLifecycleCoordinator(ports)._select_planning_work(run)
+        self.assertEqual(ports.state.maintenance_begin_count, 1)
 
     def test_missing_full_assessment_evidence_uses_bounded_planner_retry(self):
         cycle = maintenance_cycle(
