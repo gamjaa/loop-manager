@@ -192,7 +192,7 @@ class ExecutionHandlers:
         ).for_plan(self.repo, context.plan.plan_id)
         try:
             claim = document_publication.plan_claim(
-                (context.worktree / context.plan.path).read_text(encoding='utf-8')
+                document_publication.read_plan_text(context.worktree / context.plan.path)
             )
         except (OSError, UnicodeError) as error:
             raise document_drafts.DocumentDraftError(
@@ -224,7 +224,9 @@ class ExecutionHandlers:
             self.effects.state.connection,
         )
         drafts.assert_current(draft, self.repo_path, self.base)
-        plan_text = (context.worktree / context.plan.path).read_text(encoding='utf-8')
+        plan_text = document_publication.read_plan_text(
+            context.worktree / context.plan.path,
+        )
         document_publication.validate_document_plan(plan_text, self.plan, draft)
         document_publication.validate_exact_worktree(
             draft, context.worktree, str(self._row()['active_sha'] or ''),
@@ -250,7 +252,9 @@ class ExecutionHandlers:
                 self.effects.state.connection,
             )
             drafts.assert_current(draft, self.repo_path, self.base)
-            plan_text = (context.worktree / context.plan.path).read_text(encoding='utf-8')
+            plan_text = document_publication.read_plan_text(
+                context.worktree / context.plan.path,
+            )
             document_publication.validate_document_plan(plan_text, self.plan, draft)
             document_publication.apply_approved_bytes(
                 draft, context.worktree, str(self._row()['active_sha'] or ''),

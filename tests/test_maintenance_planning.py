@@ -33,6 +33,69 @@ def git(repo: Path, *arguments: str) -> str:
 
 
 class ApprovedDocumentPlanTest(unittest.TestCase):
+    def test_crlf_approved_diff_survives_planner_validation(self):
+        original = b"# Product\r\nOld.\r\n"
+        proposed = b"# Product\r\nNew.\r\n"
+        draft = SimpleNamespace(
+            draft_id="a" * 32, state="approved", target_path="docs/PRODUCT.md",
+            decision_revision="b" * 32, original_revision="c" * 40,
+            original_hash=hashlib.sha256(original).hexdigest(),
+            proposed_hash=hashlib.sha256(proposed).hexdigest(),
+            complete_diff=document_drafts._complete_diff(
+                "docs/PRODUCT.md", original, proposed,
+            ),
+        )
+        content = document_publication.planning_instruction(draft)
+        for line in (
+            f"DOCUMENT_DRAFT_ID: {draft.draft_id}",
+            f"Target: {draft.target_path}",
+            f"Decision revision: {draft.decision_revision}",
+            f"Original revision: {draft.original_revision}",
+            f"Original SHA256: {draft.original_hash}",
+            f"Proposed SHA256: {draft.proposed_hash}",
+            f"Approved diff SHA256: {hashlib.sha256(draft.complete_diff.encode()).hexdigest()}",
+            "```diff",
+        ):
+            content = content.replace(line + "\n", line + "\r\n", 1)
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            path = "docs/plans/[G-300] Approved Product.md"
+            target = worktree / path
+            target.parent.mkdir(parents=True)
+            target.write_bytes(content.encode("utf-8"))
+            plan = {"id": "G-300", "sources": [document_publication.R027_SOURCE]}
+            result = SimpleNamespace(
+                plans=((path, plan),), revisions=(), deletions=(),
+                publication_paths=(path,),
+            )
+            connection = sqlite3.connect(":memory:")
+            self.addCleanup(connection.close)
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+                (str(worktree),),
+            )
+            drafts = mock.Mock()
+            drafts.planning_candidate.return_value = draft
+            drafts.assert_current = mock.Mock()
+            with (
+                mock.patch.object(loop_manager, "validate_planner_result", return_value=result),
+                mock.patch.object(loop_manager, "is_loop_manager_repository", return_value=True),
+                mock.patch.object(document_drafts, "DocumentDraftRepository", return_value=drafts),
+            ):
+                self.assertIs(
+                    loop_manager._PlanningValidationPorts(connection).validate_general_result(
+                        str(worktree), worktree, "d" * 40, [], None,
+                    ),
+                    result,
+                )
+            self.assertEqual(document_publication.read_plan_text(target), content)
+            with self.assertRaises(document_drafts.DocumentDraftError):
+                document_publication.validate_document_plan(
+                    content.replace("\r\n", "\n"), plan, draft,
+                )
+
     def test_planner_validation_audits_original_changed_after_candidate_selection(self):
         with tempfile.TemporaryDirectory() as directory:
             worktree = Path(directory)
@@ -85,7 +148,7 @@ class ApprovedDocumentPlanTest(unittest.TestCase):
                 "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
                 (repo,),
             )
-            original, proposed = b"# Product\nOld.\n", b"# Product\nNew.\n"
+            original, proposed = b"# Product\r\nOld.\r\n", b"# Product\r\nNew.\r\n"
             diff = document_drafts._complete_diff("docs/PRODUCT.md", original, proposed)
             draft_id = "a" * 32
             connection.execute(

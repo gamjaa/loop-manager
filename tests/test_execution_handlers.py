@@ -1,5 +1,6 @@
 """Run the real phase policies with in-memory state and fake external effects."""
 from dataclasses import fields, replace
+import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -31,6 +32,33 @@ from worker_session import SessionBinding, SessionTransition
 
 
 class ExecutionHandlerTests(TestCase):
+    def test_document_execution_guard_preserves_crlf_approved_diff(self):
+        original, proposed = b"# Product\r\nOld.\r\n", b"# Product\r\nNew.\r\n"
+        draft = SimpleNamespace(
+            draft_id="a" * 32, state="approved", target_path="docs/PRODUCT.md",
+            decision_revision="b" * 32, original_revision="c" * 40,
+            original_hash=hashlib.sha256(original).hexdigest(),
+            proposed_hash=hashlib.sha256(proposed).hexdigest(),
+            complete_diff=handlers.document_drafts._complete_diff(
+                "docs/PRODUCT.md", original, proposed,
+            ),
+        )
+        self.handler.plan = {
+            **self.plan,
+            "sources": [handlers.document_publication.R027_SOURCE],
+        }
+        plan_text = handlers.document_publication.planning_instruction(draft)
+        repository = mock.Mock()
+        repository.assert_current = mock.Mock()
+        with (
+            mock.patch.object(handlers.document_drafts, "DocumentDraftRepository",
+                              return_value=repository),
+            mock.patch.object(Path, "read_bytes", return_value=plan_text.encode("utf-8")),
+            mock.patch.object(handlers.document_publication, "validate_exact_worktree"),
+        ):
+            self.handler._document_guard(self.context(), draft)
+        repository.assert_current.assert_called_once()
+
     def test_document_plan_applies_program_bytes_without_worker_agent(self):
         draft = SimpleNamespace(
             draft_id="a" * 32, target_path="docs/PRODUCT.md",
@@ -41,7 +69,8 @@ class ExecutionHandlerTests(TestCase):
             mock.patch.object(self.handler, '_document_draft', return_value=draft),
             mock.patch.object(handlers.document_drafts, 'DocumentDraftRepository',
                               return_value=repository),
-            mock.patch.object(Path, 'read_text', return_value='approved plan'),
+            mock.patch.object(handlers.document_publication, 'read_plan_text',
+                              return_value='approved plan'),
             mock.patch.object(handlers.document_publication, 'validate_document_plan'),
             mock.patch.object(handlers.document_publication, 'apply_approved_bytes') as apply,
         ):
@@ -141,7 +170,8 @@ class ExecutionHandlerTests(TestCase):
     def test_document_plan_without_durable_approval_mapping_blocks_before_agent(self):
         self.effects.agent.is_loop_manager_repository.return_value = True
         with mock.patch.object(
-            Path, 'read_text', return_value='DOCUMENT_DRAFT_ID: ' + 'a' * 32,
+            handlers.document_publication, 'read_plan_text',
+            return_value='DOCUMENT_DRAFT_ID: ' + 'a' * 32,
         ):
             outcome = self.handler.guard(self.context())
         self.assertEqual(outcome.kind, ExecutionOutcomeKind.FINAL_BLOCK)

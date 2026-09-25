@@ -28,8 +28,13 @@ def _document_target(draft: DocumentDraft, worktree: Path) -> Path:
     return target
 
 
+def read_plan_text(path: Path) -> str:
+    """Preserve approved diff line endings while decoding a plan as UTF-8."""
+    return path.read_bytes().decode("utf-8")
+
+
 def plan_claim(text: str) -> str | None:
-    match = re.search(r"(?m)^DOCUMENT_DRAFT_ID: ([0-9a-f]{32})$", text)
+    match = re.search(r"(?m)^DOCUMENT_DRAFT_ID: ([0-9a-f]{32})\r?$", text)
     if text.count("DOCUMENT_DRAFT_ID:") > 1:
         raise DocumentDraftError("문서 ExecPlan에 수정본 ID가 중복됐습니다.")
     if match is None and "DOCUMENT_DRAFT_ID:" in text:
@@ -54,10 +59,15 @@ def validate_document_plan(
         "Approved diff SHA256": _hash(draft.complete_diff.encode("utf-8")),
     }
     for label, expected in claims.items():
-        if expected is None or text.count(f"{label}: {expected}\n") != 1:
+        if expected is None or len(re.findall(
+            rf"(?m)^{re.escape(label)}: {re.escape(expected)}\r?$", text,
+        )) != 1:
             raise DocumentDraftError(f"문서 ExecPlan {label} identity가 다릅니다.")
-    diff_block = f"```diff\n{draft.complete_diff}```"
-    if text.count(diff_block) != 1:
+    diff_count = sum(
+        text.count(f"```diff{newline}{draft.complete_diff}```")
+        for newline in ("\n", "\r\n")
+    )
+    if diff_count != 1:
         raise DocumentDraftError("문서 ExecPlan의 승인 diff가 정확히 일치하지 않습니다.")
 
 

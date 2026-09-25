@@ -3738,7 +3738,7 @@ def record_general_planning_publication_intent(
         drafts = document_drafts.DocumentDraftRepository(connection)
         try:
             for path, plan in result.plans:
-                plan_text = (worktree / path).read_text(encoding="utf-8")
+                plan_text = document_publication.read_plan_text(worktree / path)
                 claim = document_publication.plan_claim(plan_text)
                 if claim is not None:
                     try:
@@ -4117,7 +4117,7 @@ def _apply_general_planning_batch(
             drafts = document_drafts.DocumentDraftRepository(connection)
             try:
                 for path, plan in result.plans:
-                    plan_text = (worktree / path).read_text(encoding="utf-8")
+                    plan_text = document_publication.read_plan_text(worktree / path)
                     claim = document_publication.plan_claim(plan_text)
                     if claim is not None:
                         draft = drafts.get(claim)
@@ -18311,7 +18311,7 @@ class _PlanningValidationPorts:
         )
         claims = []
         for path, plan in result.plans if result is not None else ():
-            text = (worktree / path).read_text(encoding="utf-8")
+            text = document_publication.read_plan_text(worktree / path)
             try:
                 claim = document_publication.plan_claim(text)
             except document_drafts.DocumentDraftError as error:
