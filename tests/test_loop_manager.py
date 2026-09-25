@@ -1267,7 +1267,7 @@ class AutomationFirstCatalogTest(unittest.TestCase):
         )
         self.assertCountEqual(
             roles, ["planner", "worker"],
-            msg=[(item.repo, item.result.message) for item in outcomes],
+            msg=[(item.repo, item.result.detail) for item in outcomes],
         )
         self.assertEqual(
             tuple(blocked_project), ("PLANNING", preserved_fingerprint)
