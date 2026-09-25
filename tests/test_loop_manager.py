@@ -1265,7 +1265,10 @@ class AutomationFirstCatalogTest(unittest.TestCase):
             results[str(runnable_repo)],
             loop_manager.ProjectRunKind.OPERATIONAL_ERROR,
         )
-        self.assertCountEqual(roles, ["planner", "worker"])
+        self.assertCountEqual(
+            roles, ["planner", "worker"],
+            msg=[(item.repo, item.result.message) for item in outcomes],
+        )
         self.assertEqual(
             tuple(blocked_project), ("PLANNING", preserved_fingerprint)
         )
