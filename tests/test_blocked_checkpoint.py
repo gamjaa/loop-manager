@@ -18,6 +18,25 @@ from worker_session import SessionBinding
 
 
 class BlockedCheckpointPolicyTest(unittest.TestCase):
+    def test_existing_base_fetch_table_adds_action_token_column(self):
+        connection = sqlite3.connect(":memory:")
+        try:
+            connection.execute(
+                "CREATE TABLE manager_base_fetches ("
+                "id INTEGER PRIMARY KEY, repo TEXT NOT NULL, "
+                "plan_id TEXT NOT NULL, refname TEXT NOT NULL, "
+                "before_ref TEXT, target_oid TEXT NOT NULL, phase TEXT NOT NULL)"
+            )
+            loop_manager._ensure_cleanup_pending_schema(connection)
+            columns = {
+                row[1] for row in connection.execute(
+                    "PRAGMA table_info(manager_base_fetches)"
+                )
+            }
+            self.assertIn("action_token", columns)
+        finally:
+            connection.close()
+
     def observation(self, **changes):
         values = {
             "workspace_identity_matches": True,
@@ -1443,12 +1462,30 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
         intent = loop_manager._record_manager_base_fetch_intent(
             self.connection, self.repo, repo, "G-034", "main", before,
         )
-        loop_manager.remote_base(self.repo, "main", narrow_fetch=True)
-        current = loop_manager.capture_git_snapshot(self.worktree)
-        self.assertEqual(
-            adapter._shared_safety_error(request, plan, current).reason_code,
-            "shared_ref_mutation",
+        loop_manager._perform_manager_base_fetch(
+            self.connection, self.repo, intent, "main",
         )
+        current = loop_manager.capture_git_snapshot(self.worktree)
+        saved_db = Path(self.temporary.name) / "pending-fetch.sqlite"
+        copy = sqlite3.connect(saved_db)
+        try:
+            self.connection.backup(copy)
+        finally:
+            copy.close()
+        reopened = sqlite3.connect(saved_db)
+        reopened.row_factory = sqlite3.Row
+        try:
+            resumed = loop_manager._BlockedCheckpointAdapter(
+                reopened, self.repo, self.state_dir, repo,
+            )
+            self.assertIsNone(resumed._shared_safety_error(
+                request, resumed._plan(request), current,
+            ))
+            self.assertEqual(loop_manager.validate_persisted_agent_scope(
+                reopened, self.repo, self.state_dir, repo,
+            ).refs["refs/remotes/origin/main"][0], current.refs["refs/remotes/origin/main"][0])
+        finally:
+            reopened.close()
         loop_manager._finish_manager_base_fetch(self.connection, self.repo, intent)
         self.assertIsNone(adapter._shared_safety_error(request, plan, current))
         self.assertEqual(loop_manager.validate_persisted_agent_scope(
@@ -1499,6 +1536,14 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
             adapter._shared_safety_error(request, adapter._plan(request), current).reason_code,
             "shared_ref_mutation",
         )
+        with self.assertRaises(RuntimeError):
+            loop_manager._perform_manager_base_fetch(
+                self.connection, self.repo, intent, "main",
+            )
+        with self.assertRaisesRegex(RuntimeError, "ref 갱신 증거"):
+            loop_manager._finish_manager_base_fetch(
+                self.connection, self.repo, intent,
+            )
         with self.assertRaises(loop_manager.AgentScopeError):
             loop_manager.validate_persisted_agent_scope(
                 self.connection, self.repo, self.state_dir, repo,

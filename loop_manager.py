@@ -256,6 +256,7 @@ CREATE TABLE IF NOT EXISTS manager_base_fetches (
     refname TEXT NOT NULL,
     before_ref TEXT,
     target_oid TEXT NOT NULL,
+    action_token TEXT,
     phase TEXT NOT NULL
 )
 """
@@ -5955,12 +5956,8 @@ def validate_repository(
     return root
 
 
-def remote_base(repo: Path, requested: str | None, *, narrow_fetch: bool = False) -> str:
-    if narrow_fetch and requested:
-        git(repo, "fetch", "--no-tags", "origin",
-            f"+refs/heads/{requested}:refs/remotes/origin/{requested}")
-    else:
-        git(repo, "fetch", "origin")
+def remote_base(repo: Path, requested: str | None) -> str:
+    git(repo, "fetch", "origin")
     if requested:
         base = requested
     else:
@@ -10181,6 +10178,13 @@ def _ensure_cleanup_pending_schema(connection: sqlite3.Connection) -> None:
             "ALTER TABLE cleanup_pending ADD COLUMN workspace_owned "
             "INTEGER NOT NULL DEFAULT 1"
         )
+    fetch_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(manager_base_fetches)")
+    }
+    if "action_token" not in fetch_columns:
+        connection.execute(
+            "ALTER TABLE manager_base_fetches ADD COLUMN action_token TEXT"
+        )
 
 
 def _store_cleanup_pending(
@@ -12339,7 +12343,7 @@ def validate_persisted_agent_scope(
         ).fetchone() if plan_id else None
         if plan_row is not None and plan_row["blocked_reason"] == GUIDANCE_BLOCK_REASON:
             owned = set(_proven_manager_base_refs(
-                connection, repo, plan_id, before, current,
+                connection, repo_path, repo, plan_id, before, current,
             ))
             checkpoint_row = connection.execute(
                 "SELECT 1 FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?",
@@ -12616,7 +12620,7 @@ def validate_blocked_agent_scope(
     ).fetchone() if plan_id and has_execplans else None
     if plan_id is not None:
         allowed_ref_changes |= _proven_manager_base_refs(
-            connection, repo, plan_id, before, current,
+            connection, repo_path, repo, plan_id, before, current,
         )
     if guidance_plan is not None and guidance_plan["blocked_reason"] == GUIDANCE_BLOCK_REASON:
         checkpoint_row = connection.execute(
@@ -13945,11 +13949,70 @@ def _record_manager_base_fetch_intent(
     with connection:
         cursor = connection.execute(
             "INSERT INTO manager_base_fetches "
-            "(repo, plan_id, refname, before_ref, target_oid, phase) "
-            "VALUES (?, ?, ?, ?, ?, 'pending')",
-            (repo, plan_id, refname, json.dumps(before.refs.get(refname)), target),
+            "(repo, plan_id, refname, before_ref, target_oid, action_token, phase) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'pending')",
+            (repo, plan_id, refname, json.dumps(before.refs.get(refname)),
+             target, secrets.token_hex(16)),
         )
     return int(cursor.lastrowid)
+
+
+def _manager_base_fetch_applied(repo_path: Path, row: sqlite3.Row) -> bool:
+    """Check the Git record of this exact Manager ref update after a crash."""
+    token = str(row["action_token"] or "")
+    if not re.fullmatch(r"[0-9a-f]{32}", token):
+        return False
+    reflog = git(
+        repo_path, "reflog", "show", "-1", "--format=%H%x00%gs",
+        str(row["refname"]), check=False,
+    )
+    return (
+        reflog.returncode == 0
+        and reflog.stdout.strip() == (
+            f"{row['target_oid']}\x00loop-manager-base-fetch:{token}"
+        )
+    )
+
+
+def _perform_manager_base_fetch(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    intent_id: int,
+    base: str,
+) -> str:
+    """Fetch the object, then update only the intended tracking ref with CAS."""
+    row = connection.execute(
+        "SELECT * FROM manager_base_fetches WHERE id = ? AND phase = 'pending'",
+        (intent_id,),
+    ).fetchone()
+    if row is None or row["refname"] != f"refs/remotes/origin/{base}":
+        raise RuntimeError("Manager base fetch intent가 현재 base와 다릅니다.")
+    token = str(row["action_token"] or "")
+    if not re.fullmatch(r"[0-9a-f]{32}", token):
+        raise RuntimeError("Manager base fetch action token이 유효하지 않습니다.")
+    try:
+        previous = json.loads(str(row["before_ref"]))
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("Manager base fetch 이전 ref가 유효하지 않습니다.") from error
+    if previous is not None and (
+        not isinstance(previous, list) or len(previous) != 2
+        or previous[1] != ""
+        or not isinstance(previous[0], str)
+        or not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", previous[0])
+    ):
+        raise RuntimeError("Manager base fetch 이전 ref가 유효하지 않습니다.")
+    target = str(row["target_oid"])
+    git(repo_path, "fetch", "--no-tags", "--refmap=", "origin",
+        f"refs/heads/{base}")
+    fetched = git(repo_path, "rev-parse", "--verify", "FETCH_HEAD^{commit}").stdout.strip()
+    if fetched != target:
+        raise RuntimeError("Manager base fetch 원격 OID가 저장된 intent와 다릅니다.")
+    git(
+        repo_path, "update-ref", "--create-reflog", "-m",
+        f"loop-manager-base-fetch:{token}", str(row["refname"]), target,
+        previous[0] if previous is not None else "0" * len(target),
+    )
+    return base
 
 
 def _finish_manager_base_fetch(
@@ -13958,11 +14021,17 @@ def _finish_manager_base_fetch(
     intent_id: int,
 ) -> None:
     row = connection.execute(
-        "SELECT refname, target_oid FROM manager_base_fetches WHERE id = ?",
+        "SELECT * FROM manager_base_fetches WHERE id = ?",
         (intent_id,),
     ).fetchone()
     if row is None or git(repo_path, "rev-parse", str(row["refname"])).stdout.strip() != row["target_oid"]:
         raise RuntimeError("Manager base fetch 결과가 저장된 원격 OID와 다릅니다.")
+    try:
+        previous = json.loads(str(row["before_ref"]))
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("Manager base fetch 이전 ref가 유효하지 않습니다.") from error
+    if previous != [row["target_oid"], ""] and not _manager_base_fetch_applied(repo_path, row):
+        raise RuntimeError("Manager base fetch의 ref 갱신 증거가 없습니다.")
     with connection:
         connection.execute(
             "UPDATE manager_base_fetches SET phase = 'complete' WHERE id = ?",
@@ -13972,17 +14041,19 @@ def _finish_manager_base_fetch(
 
 def _proven_manager_base_refs(
     connection: sqlite3.Connection,
+    repo_path: Path,
     repo: str,
     plan_id: str,
     before: GitSnapshot,
     current: GitSnapshot,
 ) -> frozenset[str]:
-    """Follow only completed Manager fetches from old to observed OID."""
+    """Follow completed fetches or an interrupted fetch with its Git action."""
     _ensure_cleanup_pending_schema(connection)
     proven: set[str] = set()
     rows = connection.execute(
-        "SELECT refname, before_ref, target_oid FROM manager_base_fetches "
-        "WHERE repo = ? AND plan_id = ? AND phase = 'complete' "
+        "SELECT id, refname, before_ref, target_oid, action_token, phase "
+        "FROM manager_base_fetches "
+        "WHERE repo = ? AND plan_id = ? AND phase IN ('pending', 'complete') "
         "ORDER BY id",
         (repo, plan_id),
     ).fetchall()
@@ -13996,7 +14067,10 @@ def _proven_manager_base_refs(
             except (TypeError, ValueError):
                 continue
             previous = tuple(previous) if previous is not None else None
-            if previous == cursor:
+            if previous == cursor and (
+                row["phase"] == "complete"
+                or _manager_base_fetch_applied(repo_path, row)
+            ):
                 cursor = (str(row["target_oid"]), "")
         if cursor is not None and cursor == current.refs.get(refname):
             proven.add(refname)
@@ -14552,7 +14626,7 @@ def _reconcile_guidance_double_block(
         own_path = str(_canonical_path(worktree))
         cleaned = _proven_merged_cleanup_paths(connection, repo, before, current)
         fetched_refs = _proven_manager_base_refs(
-            connection, repo, str(plan["plan_id"]), before, current,
+            connection, repo_path, repo, str(plan["plan_id"]), before, current,
         )
         remote_ref = f"refs/remotes/origin/{branch}"
         own_ref = f"refs/heads/{branch}"
@@ -18483,9 +18557,13 @@ def _run_project_step(
                     connection, repo_path, repo, plan_id,
                     str(selected_base), validated_agent_scope,
                 )
-    base = remote_base(repo_path, selected_base, narrow_fetch=fetch_intent is not None)
     if fetch_intent is not None:
+        base = _perform_manager_base_fetch(
+            connection, repo_path, fetch_intent, str(selected_base),
+        )
         _finish_manager_base_fetch(connection, repo_path, fetch_intent)
+    else:
+        base = remote_base(repo_path, selected_base)
     backfill_plan_shas(connection, target_repo=repo)
     try:
         migrate_legacy_execplans(
@@ -19980,7 +20058,8 @@ class _BlockedCheckpointAdapter:
             else None
         )
         fetched_refs = _proven_manager_base_refs(
-            self.connection, request.repo, request.plan_id, before, current,
+            self.connection, self.repo_path, request.repo, request.plan_id,
+            before, current,
         )
         for name in before.refs.keys() | current.refs.keys():
             if name == own_ref or name in fetched_refs or name.startswith("refs/codex/turn-diffs/"):
