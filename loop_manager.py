@@ -15087,6 +15087,11 @@ def _evaluate_remote_checkpoint_cause(
         "reviewer", worktree, before, capture_git_snapshot(worktree),
         external_worktree=repo_path,
     )
+    validation_feedback_state.ValidationFeedbackRepository(connection).record_result(
+        repo, str(blocked["plan_id"]), revision[0], "verify",
+        "success" if passed else "failure",
+        str(getattr(output, "fingerprint_source", output)),
+    )
     if not passed:
         return _remote_checkpoint_has_new_failure(
             connection, repo, blocked, "verify", output, worktree,

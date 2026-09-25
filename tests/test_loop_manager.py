@@ -5025,6 +5025,14 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                 self.assertEqual(stage, 'revision_drift')
                 self.assertIn('base 또는 HEAD', message)
                 self.assertEqual(reviewer.call_count, expected_calls)
+        audit = connection.execute(
+            "SELECT stage, classification, raw_output FROM validation_results "
+            "WHERE repo = 'repo' AND plan_id = 'G-047' ORDER BY id"
+        ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in audit],
+            [('verify', 'success', ''), ('verify', 'success', '')],
+        )
 
     def test_remote_checkpoint_revision_requires_latest_base_ancestry(self):
         responses = [
@@ -5071,10 +5079,13 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             '"problem":"Missing rule","implementation_choice":"Choice",'
             '"question":"Which rule?"}\nVERDICT: SPEC_BLOCKED'
         )
+        raw_verify = 'PRIVATE_SUCCESS_LOG\n' + 'x' * 9000
         snapshot = mock.Mock()
         with (
             mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=snapshot),
-            mock.patch.object(loop_manager, 'verify', return_value=(True, 'OK')),
+            mock.patch.object(loop_manager, 'verify', return_value=(
+                True, loop_manager.VerifyOutput(raw_verify),
+            )),
             mock.patch.object(loop_manager, '_remote_checkpoint_review_revision',
                               return_value=('base', 'head')),
             mock.patch.object(loop_manager, 'validate_agent_scope'),
@@ -5091,6 +5102,16 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         self.assertIn('직전 Reviewer 결과가 아래 프로토콜 검증에 실패',
                       reviewer.call_args_list[1].args[5])
         self.assertIn('docs/other.md', reviewer.call_args_list[1].args[5])
+        audit = connection.execute(
+            "SELECT definition_revision, stage, classification, raw_output "
+            "FROM validation_results WHERE repo = 'repo' AND plan_id = 'G-047'"
+        ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in audit],
+            [('base', 'verify', 'success', raw_verify)],
+        )
+        for call in reviewer.call_args_list:
+            self.assertNotIn('PRIVATE_SUCCESS_LOG', call.args[5])
 
     def test_remote_checkpoint_protocol_exhaustion_stops_at_three_attempts(self):
         from tests.test_runtime_state import RuntimeStateRepositoryTest
