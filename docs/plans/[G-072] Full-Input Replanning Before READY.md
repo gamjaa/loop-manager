@@ -45,3 +45,4 @@ priority: high
 
 - Input content, rather than the fact of a Merge, determines whether general planning is due.
 - A failed Planner with runnable READY remains in PLANNING or records a planning error; the project step must return that error instead of immediately retrying the same input.
+- A remote SHA change immediately before READY activation restarts selection even when the full-input fingerprint matches, so the latest ExecPlan catalog can change priority or dependencies before a plan starts.

@@ -762,9 +762,7 @@ class PlanningLifecycleCoordinator:
             )
             if run.selection.kind is PlanningDecisionKind.ACTIVATE_READY:
                 latest_sha = self._fetch_remote_head(context)
-                if self._planning_input_changed_before_activation(
-                    run, row, latest_sha
-                ):
+                if self._remote_base_changed_before_activation(run, latest_sha):
                     return self._restart_for_new_input()
                 run.base_sha = latest_sha
                 self._ports.state.activate_ready(context.repo, run.base_sha)
@@ -832,27 +830,16 @@ class PlanningLifecycleCoordinator:
                 return False
         return True
 
-    def _planning_input_changed_before_activation(
-        self,
-        run: _PlanningRun,
-        row: runtime_state.PlanningSnapshot,
-        latest_sha: str,
+    def _remote_base_changed_before_activation(
+        self, run: _PlanningRun, latest_sha: str
     ) -> bool:
-        if run.maintenance_planning or latest_sha == run.base_sha:
-            return False
-        context = run.context
-        latest_input = self._ports.git.input_fingerprint(
-            context.repo_path, latest_sha
-        )
-        if latest_input == run.general_fingerprint:
-            return False
-        return self._general_planning_required(
-            row, context, latest_sha, latest_input
-        )
+        # Even a plan-only revision can reorder READY declarations. Re-enter
+        # the project step so catalog reconciliation reads the new revision.
+        return not run.maintenance_planning and latest_sha != run.base_sha
 
     def _restart_for_new_input(self) -> PlanningOutcome:
         self._ports.events.info(
-            "READY 시작 전 원격 계획 입력이 변경되어 최신 기준에서 계획을 다시 선택합니다."
+            "READY 시작 전 원격 기준이 변경되어 최신 catalog와 계획 입력을 다시 선택합니다."
         )
         return PlanningOutcome(PlanningOutcomeKind.REMOTE_BASE_RESTART)
 
@@ -2002,9 +1989,7 @@ class PlanningLifecycleCoordinator:
         newly_activated = run.ready_activated_before_planning
         if not row.phase:
             latest_sha = self._fetch_remote_head(context)
-            if self._planning_input_changed_before_activation(
-                run, row, latest_sha
-            ):
+            if self._remote_base_changed_before_activation(run, latest_sha):
                 return self._restart_for_new_input()
             decision = self._ports.state.schedule(context.repo)
             if not decision.has_ready and decision.has_waiting:

@@ -777,6 +777,47 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         self.assertEqual(second.kind, PlanningOutcomeKind.EXECUTION_READY)
         self.assertEqual(ports.agent.run_count, 1)
 
+    def test_plan_only_remote_change_reselects_ready_from_latest_catalog(self):
+        ports = FakePorts(planning_snapshot(
+            processed_sha="base",
+            specification_fingerprint="specification",
+            planning_fingerprint="fingerprint",
+        ))
+        old_ready = SimpleNamespace(plan_id="G-001", priority="critical")
+        new_ready = SimpleNamespace(plan_id="G-002", priority="critical")
+        ports.state.schedule_result = SimpleNamespace(
+            active=None, has_ready=True, has_waiting=False,
+            runnable_ready=old_ready, project_blocked=False,
+        )
+        ports.state.activate_result = object()
+        ports.git.remote = "new-base"
+        ports.git.fingerprints["new-base"] = "fingerprint"
+        activated = []
+        original_activate = ports.state.activate_ready
+
+        def activate_selected(repo, base_sha):
+            activated.append(ports.state.schedule_result.runnable_ready.plan_id)
+            return original_activate(repo, base_sha)
+
+        ports.state.activate_ready = activate_selected
+
+        first = PlanningLifecycleCoordinator(ports).run(self.context)
+
+        self.assertEqual(first.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
+        self.assertEqual(activated, [])
+        self.assertIsNone(ports.state.snapshot.phase)
+        self.assertEqual(ports.agent.run_count, 0)
+
+        ports.git.head = "new-base"
+        ports.state.schedule_result.runnable_ready = new_ready
+        second = PlanningLifecycleCoordinator(ports).run(
+            replace(self.context, base_sha="new-base")
+        )
+
+        self.assertEqual(second.kind, PlanningOutcomeKind.EXECUTION_READY)
+        self.assertEqual(activated, ["G-002"])
+        self.assertEqual(ports.agent.run_count, 0)
+
     def test_new_specification_at_direct_activation_restarts_before_worker(self):
         ports = FakePorts(
             planning_snapshot(
