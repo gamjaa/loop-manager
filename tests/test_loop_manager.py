@@ -6742,6 +6742,15 @@ class WorkerPublicationTest(unittest.TestCase):
             loop_manager.reviewer_targeted_test_reason(document_publication.test_evidence),
             document_reason,
         )
+        freeform_reason = "문서만 변경해 관련 unit test를 실행하지 않았습니다"
+        freeform_publication = loop_manager.parse_worker_result(
+            worker_result("Explain omitted document tests", "Summary", freeform_reason),
+            self.plan,
+        )
+        self.assertEqual(
+            loop_manager.reviewer_targeted_test_reason(freeform_publication.test_evidence),
+            freeform_reason,
+        )
         invalid_results = (
             worker_result("", "Summary", "test: PASS"),
             worker_result(
@@ -6763,11 +6772,36 @@ class WorkerPublicationTest(unittest.TestCase):
             worker_result("Descriptive Worker Commits.", "Summary", "test: PASS"),
             worker_result("Reject missing test disposition", "Summary", "none"),
             worker_result("Reject unexplained no-test claim", "Summary", "실행 가능한 관련 unit test가 없습니다"),
+            worker_result("Reject negated pass result", "Summary", "test_api did not pass"),
+            worker_result(
+                "Reject unexplained mixed test report", "Summary",
+                "실행 가능한 관련 unit test가 없습니다; test_api: PASS",
+            ),
         )
         for result in invalid_results:
             with self.subTest(result=result):
                 with self.assertRaises(loop_manager.WorkerResultError):
                     loop_manager.parse_worker_result(result, self.plan)
+
+    def test_no_test_reason_omits_same_line_success_details_and_commands(self):
+        reason = "문서만 변경해 관련 unit test를 실행하지 않았습니다"
+        for evidence in (
+            f"test_api: PASS; {reason}; python3 -m unittest tests.test_api",
+            f"{reason} test_api: PASS python3 -m unittest tests.test_api",
+        ):
+            with self.subTest(evidence=evidence):
+                publication = loop_manager.parse_worker_result(
+                    worker_result("Explain document test omission", "Summary", evidence),
+                    self.plan,
+                )
+                extracted = loop_manager.reviewer_targeted_test_reason(
+                    publication.test_evidence,
+                )
+                self.assertEqual(extracted, reason)
+                prompt = loop_manager.reviewer_prompt("main", extracted)
+                self.assertIn(reason, prompt)
+                self.assertNotIn("test_api: PASS", prompt)
+                self.assertNotIn("python3 -m unittest tests.test_api", prompt)
 
     def test_targeted_test_evidence_requires_a_clean_explicit_rerun(self):
         valid_evidence = (
@@ -6781,6 +6815,11 @@ class WorkerPublicationTest(unittest.TestCase):
                 "FAILED_COMMAND: python3 -m unittest tests.test_syntax\n"
                 "first run: SyntaxError 발생\n"
                 "RERUN: python3 -m unittest tests.test_syntax\n1 passed"
+            ),
+            (
+                "FAILED_COMMAND: python3 -m unittest tests.test_api\n"
+                "test_api did not pass\n"
+                "RERUN: python3 -m unittest tests.test_api\n1 passed"
             ),
         )
         for evidence in valid_evidence:

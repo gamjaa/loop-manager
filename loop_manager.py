@@ -16516,7 +16516,9 @@ TARGETED_TESTS:
 
 
 _TARGETED_TEST_FAILURE = re.compile(
-    r"(?i)(?<![\w])(?:FAIL(?:ED|URES?)?|ERRORS?|실패)(?![\w])"
+    r"(?i)(?<![\w])(?:FAIL(?:ED|URES?)?|ERRORS?|실패"
+    r"|(?:did|does|do|has|have|had|was|were|is|are)\s+not\s+pass(?:ed)?"
+    r"|(?:not|never|didn't|doesn't|don't)\s+pass(?:ed)?)(?![\w])"
 )
 _TARGETED_TEST_EXCEPTION_FAILURE = re.compile(
     r"(?m)(?<![\w])[A-Z][A-Za-z0-9_]*(?:Error|Exception)"
@@ -16640,8 +16642,12 @@ def parse_worker_result(message: str, plan: dict[str, object]) -> WorkerPublicat
         raise WorkerResultError(
             "Worker가 해결되지 않은 targeted unit test 실패를 보고했습니다."
         )
-    if not (_TARGETED_TEST_SUCCESS.search(test_evidence)
-            or reviewer_targeted_test_reason(test_evidence)):
+    no_test_reason = reviewer_targeted_test_reason(test_evidence)
+    if _NO_RUNNABLE_TARGETED_TEST.search(test_evidence) and not no_test_reason:
+        raise WorkerResultError(
+            "Worker targeted unit test 미실행 사유에서 성공 내역을 제외하고 구체적인 이유를 보고해야 합니다."
+        )
+    if not (_TARGETED_TEST_SUCCESS.search(test_evidence) or no_test_reason):
         raise WorkerResultError(
             "Worker targeted unit test 통과 결과 또는 실행하지 못한 구체적인 사유가 필요합니다."
         )
@@ -16675,9 +16681,19 @@ _NO_RUNNABLE_TARGETED_TEST = re.compile(
     r"(?:"
     r"실행 가능한 관련 (?:targeted )?unit test가 없(?:습니다|다)"
     r"|관련 (?:targeted )?unit test를 실행할 수 없(?:습니다|다)"
+    r"|관련 (?:targeted )?unit test를 (?:실행|수행)하지 (?:않았|못했)(?:습니다|다)"
     r"|no runnable targeted (?:unit )?tests?"
     r")",
     re.IGNORECASE,
+)
+_TARGETED_TEST_METADATA = re.compile(
+    r"(?i)(?<![\w])(?:[\w./-]+\s*:\s*)?"
+    r"(?:PASS(?:ED)?|SUCCESS|OK|성공|통과)(?![\w])(?:\s*\([^)]*\))?"
+    r"|(?i:(?<![\w])(?:FAILED_COMMAND|RERUN):)"
+    r"|(?i:(?<![\w])(?:python\d*(?:\.\d+)?\s+-m\s+unittest|pytest)\b)"
+)
+_INLINE_TEST_COMMAND = re.compile(
+    r"(?i)(?<![\w])(?:python\d*(?:\.\d+)?\s+-m\s+unittest|pytest)\b"
 )
 
 
@@ -16688,11 +16704,30 @@ def reviewer_targeted_test_reason(test_evidence: str) -> str | None:
     result and verify checkpoint are the program's evidence for entering Review.
     """
     for line in test_evidence.splitlines():
-        normalized = " ".join(line.split())
-        match = _NO_RUNNABLE_TARGETED_TEST.search(normalized)
-        if match and (normalized[:match.start()].strip(" :;.,-")
-                      or normalized[match.end():].strip(" :;.,-")):
-            return normalized[:600]
+        for clause in re.split(r"[;|]", line):
+            normalized = " ".join(clause.split())
+            match = _NO_RUNNABLE_TARGETED_TEST.search(normalized)
+            if match is None:
+                continue
+            if any(command.start() < match.start()
+                   for command in _INLINE_TEST_COMMAND.finditer(normalized)):
+                continue
+            metadata = list(_TARGETED_TEST_METADATA.finditer(normalized))
+            start = max(
+                (item.end() for item in metadata if item.end() <= match.start()),
+                default=0,
+            )
+            end = min(
+                (item.start() for item in metadata if item.start() >= match.end()),
+                default=len(normalized),
+            )
+            reason = normalized[start:end].lstrip(" :;|,.-").rstrip(" :;|,")
+            reason_match = _NO_RUNNABLE_TARGETED_TEST.search(reason)
+            if reason_match and (
+                reason[:reason_match.start()].strip(" :;|,.-")
+                or reason[reason_match.end():].strip(" :;|,.-")
+            ):
+                return reason[:600]
     return None
 
 def immutable_github_blob_url(origin_url: str, commit_sha: str, relative_path: str) -> str:
