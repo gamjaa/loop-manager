@@ -32,8 +32,9 @@ class TrackedSourceInventoryTest(unittest.TestCase):
         if executable:
             self.git("add", "--chmod=+x", "--", path)
 
-    def publish(self):
-        self.git("add", "-A")
+    def publish(self, *, staged=False):
+        if not staged:
+            self.git("add", "-A")
         self.git("commit", "-m", "fixture")
         revision = self.git("rev-parse", "HEAD")
         self.git("update-ref", "refs/remotes/origin/main", revision)
@@ -82,9 +83,16 @@ class TrackedSourceInventoryTest(unittest.TestCase):
         with self.assertRaisesRegex(source_inventory.SourceInventoryError, "mystery.dat"):
             source_inventory.tracked_source_inventory(self.repo, "main", revision)
         (self.repo / "mystery.dat").unlink()
-        (self.repo / "src").mkdir()
-        (self.repo / "src/link").symlink_to("missing")
-        later = self.publish()
+        self.git("add", "-A")
+        # Store the link target as a Git blob without requiring OS symlink privileges.
+        self.write("link-target", b"missing")
+        target_blob = self.git("hash-object", "-w", "--", "link-target")
+        self.git("update-index", "--add", "--cacheinfo", "120000", target_blob, "src/link")
+        later = self.publish(staged=True)
+        self.assertEqual(
+            self.git("ls-tree", later, "--", "src/link"),
+            f"120000 blob {target_blob}\tsrc/link",
+        )
         with self.assertRaisesRegex(source_inventory.SourceInventoryError, "src/link"):
             source_inventory.tracked_source_inventory(self.repo, "main", later)
 
