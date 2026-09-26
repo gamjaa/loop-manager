@@ -1,4 +1,5 @@
 import contextlib
+from dataclasses import replace
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -512,6 +513,39 @@ class OriginIsolatedRegistrationAndExecutionTest(unittest.TestCase):
                 loop_manager.prepare_runtime_worktree(
                     source, state, mutation_id="b" * 32, commit_sha=sha)
             self.assertTrue(runtime.path.exists())
+    def test_unverified_agent_snapshot_keeps_strict_shared_git_boundary(self):
+        selected = Path("/managed/selected")
+        source = Path("/source")
+        other = Path("/managed/other")
+        before = loop_manager.GitSnapshot(
+            head="a" * 40,
+            branch="loop-manager/G-088",
+            index={}, dirty={},
+            refs={"refs/heads/draft": ("a" * 40, "")},
+            worktrees={
+                str(source): ("branch=refs/heads/main",),
+                str(selected): ("branch=refs/heads/loop-manager/G-088",),
+                str(other): ("branch=refs/heads/draft",),
+            },
+            config={}, operations={},
+        )
+        cases = (
+            (replace(before, refs={"refs/heads/draft": ("b" * 40, "")}),
+             loop_manager.BlockReasonCode.SHARED_REF_MUTATION),
+            (replace(before, worktrees={**before.worktrees,
+                                        str(other): ("branch=refs/heads/changed",)}),
+             loop_manager.BlockReasonCode.OUTSIDE_MANAGED_WORKTREE_MUTATION),
+            (replace(before, shared_metadata_complete=False),
+             loop_manager.BlockReasonCode.REPOSITORY_STATE_UNSAFE),
+        )
+        for after, expected_reason in cases:
+            with self.subTest(reason=expected_reason):
+                with self.assertRaises(loop_manager.AgentScopeError) as caught:
+                    loop_manager.validate_agent_scope(
+                        "reviewer", selected, before, after,
+                        external_worktree=source, base_branch="main",
+                    )
+                self.assertEqual(caught.exception.reason_code, expected_reason)
 
     def _persist_planner_scope(self, connection, repo: Path):
         before = loop_manager.capture_git_snapshot(repo)
