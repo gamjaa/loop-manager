@@ -307,7 +307,8 @@ class MaintenanceOrchestrationTest(unittest.TestCase):
         worktree = Path(str(project["worktree"] or ""))
         if worktree.is_dir():
             git_command(
-                repo_path, "worktree", "remove", "--force", str(worktree)
+                repo_path, "worktree", "remove", "--force", "--force",
+                str(worktree),
             )
         with connection:
             connection.execute(

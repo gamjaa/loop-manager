@@ -52,3 +52,19 @@ priority: critical
 - G-090은 source/runtime 작업과 공통 journal을 제공하고, G-081은 게시 checkpoint OID를 보존한다. 이 계획은 관리 worktree와 rebase의 소유 Git 전이만 증명한다.
 
 - 2026-09-26: G-088에서 Manager rebase 충돌 뒤 detached HEAD를 일반 branch 검사로 거부해 프로젝트 차단이 반복됐다. 사용자는 별도 구현 대신 기존 개선 계획을 먼저 진행하도록 요청했다. G-088은 이 계획의 Merge를 기다리며, 이 계획에서는 Manager 작업 증명과 충돌 재개 gate를 먼저 수정하고 G-092의 일반 차단 자동 복구 범위는 유지한다.
+
+- 2026-09-26: 재시작 시 Git 실행 전 continuation intent가 남아 있어도 같은 slot의 이전 확정 충돌 증거를 조회하도록 수정했다. 활성 operation ID의 결과만 제외하며, 기존 결과의 owner·session·전이 검증은 유지한다. 새 targeted unit case에서 intent 보존, 이전 충돌 증거 기반 게시 소유권 매칭, 다른 session·외부 ref 거부와 활성 결과 제외를 검증했다. 관련 복구·게시 gate 기존 case를 포함한 3개 unit test가 통과했다. 전체 verify는 Worker에서 실행하지 않았다.
+
+- 2026-09-26: skip 완료 시 과거 reflog의 intent 표식만으로 외부 HEAD를 확정하지 않도록 최신 소유 branch reflog 한 건의 OID와 정확한 intent 완료 메시지를 관측 HEAD에 결합했다. 정상 skip과 외부 branch 이동·복귀, OID 불일치, 다른 intent, reflog 누락·조회 오류 및 기존 continue 내용 검증을 다루는 targeted unit case 2개가 통과했다. 전체 verify는 실행하지 않았다.
+
+- 2026-09-26: 전체 verify 피드백 후 설치된 Git의 branch reflog 완료 형식이 `<intent> (finish): <branch> onto <base OID>`임을 확인했다. 이전 exact-match 검증에서 누락한 `onto`와 checkpoint의 target base OID를 포함하고 fixture를 실제 형식으로 수정했다. 잘못된 base·누락된 base 거부를 추가한 skip case와 continue case 2개가 통과했다. 전달된 통합 시나리오와 전체 verify는 Worker에서 재실행하지 않았으며 Loop Manager의 재검증이 필요하다.
+
+- 2026-09-26: autostash가 같은 파일의 로컬 수정과 새 base 변경을 합칠 때 전체 파일 해시가 달라지는 정상 결과를 검증하도록 줄별 해시 기반 증거를 추가했다. 두 rebase snapshot 경로에서 원래 base·로컬 파일의 줄별 해시와 mode·signature를 기록하고, 비중첩 변경의 병합 결과가 실제 파일 증거와 일치할 때만 보존으로 인정한다. 원문은 journal에 기록하지 않는다. 증거가 없는 과거 기록, 외부 수정, 겹치는 변경과 mode 불일치는 기존 엄격 판정을 유지한다. 관련 unit test 5개가 통과했으며 새 모듈을 Linux verify 검사 목록에 추가했지만 전체 verify는 실행하지 않았다.
+
+- 2026-09-26: Planner import fixture의 복사 목록에서 새 의존성 `rebase_file_evidence.py`가 누락된 것을 수정했다. 해당 case는 임시 Git 저장소의 commit·push와 Agent scope 검증을 함께 수행하는 통합 시나리오이므로 Worker에서 실행하지 않았다. 이번 변경은 테스트 fixture 목록과 이 기록뿐이며 별도로 실행할 관련 unit test는 없다. 전체 verify에서 import 및 기존 scope 위반 검증을 재확인해야 한다.
+
+- 2026-09-26: 줄별 증거의 치환·삭제 범위를 반열린 구간으로 비교해 `[0,1)`과 `[1,2)` 같은 인접 수정을 허용했다. 길이가 없는 삽입은 같은 위치와 치환 경계에서 순서가 불명확하므로 보수적 거부를 유지한다. 양방향 인접 치환·삭제, 외부 내용 추가, 실제 겹침·삽입 모호성과 인접 변경의 journal 확정·재조회를 다루는 targeted unit case 3개가 통과했다. 전체 verify는 실행하지 않았다.
+
+- 2026-09-26: 직접 rebase 복구와 실행 handler의 완료 검증을 공통 journal 함수로 통합했다. 두 경로 모두 최신 branch reflog의 OID·정확한 intent·target base가 일치해야 결과를 확정한다. 직접 복구에서 패치 동등성이 참이어도 외부 HEAD·외부 복귀·OID/intent/base 불일치는 intent를 보존하고 확정을 거부하는 회귀를 추가했다. 직접 복구·skip·continue unit case 3개가 통과했으며 전체 verify는 실행하지 않았다.
+
+- 2026-09-26: 충돌 중인 rebase 결과에도 실행 표식을 필수로 요구했다. 직접 복구와 handler 모두 선택된 worktree의 최신 HEAD reflog OID 및 정확한 intent의 start/pick/continue/skip 표식을 확인한다. 같은 metadata를 가진 외부 rebase는 확정하지 않고 active intent를 보존한다. 표식·OID·operation 불일치, journal 미확정 및 기존 충돌 범위/재개를 다루는 unit case 4개가 통과했고, 중단 지점 검증을 보강한 case도 재실행하여 통과했다. 전체 verify는 실행하지 않았다.

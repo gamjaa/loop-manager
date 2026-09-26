@@ -128,6 +128,7 @@ import maintenance_state
 import document_publication
 import scoped_blocking
 import agent_scope_decision
+import rebase_file_evidence
 import manager_git_journal
 from scoped_blocking import BlockReasonCode, BlockScope
 
@@ -1100,6 +1101,77 @@ def _runtime_transition_state(source: Path, runtime: Path) -> dict[str, object]:
             if record is not None else None
         ),
     }
+
+
+def _managed_worktree_transition_state(repo: Path, worktree: Path) -> dict[str, object]:
+    """Observe the registration and index tree of one ExecPlan workspace."""
+    record = next((item for item in _worktree_catalog(repo)
+                   if _canonical_path(Path(str(item.get("worktree", ""))))
+                   == _canonical_path(worktree)), None)
+    exists = worktree.exists() or worktree.is_symlink()
+    return {
+        "exists": exists,
+        "registration": ({"head": record.get("HEAD"),
+                          "branch": record.get("branch"),
+                          "locked": record.get("locked")}
+                         if record is not None else None),
+        "index": (git(worktree, "write-tree").stdout.strip()
+                  if exists and record is not None else None),
+    }
+
+
+def _managed_worktree_receipt(
+    state_dir: Path, intent: Mapping[str, object], kind: str,
+) -> Path:
+    return state_dir / "managed-worktree-intents" / f"{intent['id']}.{kind}.json"
+
+
+def _managed_worktree_marker(
+    state_dir: Path, intent: Mapping[str, object], kind: str,
+) -> bool:
+    receipt = _managed_worktree_receipt(state_dir, intent, kind)
+    return receipt.is_file() and manager_git_journal._read(receipt) == {
+        "id": intent["id"], "repo": intent["repo"],
+        "target": intent["target"], "before": intent["before"],
+        "expected": intent["expected"],
+    }
+
+
+def _write_managed_worktree_receipt(
+    state_dir: Path, token: str, repo: Path, worktree: Path,
+    before: Mapping[str, object], expected: Mapping[str, object], kind: str,
+) -> None:
+    root = state_dir / "managed-worktree-intents"
+    root.mkdir(parents=True, exist_ok=True)
+    manager_git_journal._sync_directory(state_dir)
+    manager_git_journal._write_new(root / f"{token}.{kind}.json", {
+        "id": token, "repo": str(_canonical_path(repo)),
+        "target": str(_canonical_path(worktree)), "before": dict(before),
+        "expected": dict(expected),
+    })
+
+
+def _recover_managed_worktree_removal(
+    state_dir: Path, repo: Path, worktree: Path,
+) -> bool:
+    return manager_git_journal.recover_active(
+        state_dir, repo=str(_canonical_path(repo)),
+        kind="managed_worktree_remove", target=str(_canonical_path(worktree)),
+        observe=lambda: _managed_worktree_transition_state(repo, worktree),
+        marker=lambda intent: _managed_worktree_marker(
+            state_dir, intent, "remove",
+        ),
+    )
+
+
+def _assess_missing_managed_cleanup(
+    state_dir: Path, repo: Path, worktree: Path,
+) -> CleanupAssessment:
+    try:
+        _recover_managed_worktree_removal(state_dir, repo, worktree)
+    except RuntimeError as error:
+        return CleanupAssessment("unverifiable", f"worktree 정리 기록 복구 실패: {error}")
+    return CleanupAssessment("missing")
 
 
 def _runtime_transition_marker(
@@ -8481,6 +8553,8 @@ def _validate_pr_conflict_recovery_ownership(
         worktree,
         branch,
         str(project["base_branch"]),
+        journal_state_dir=state_dir,
+        journal_owner=f"plan:{plan_id}",
         allow_create_branch=False,
         allow_recovery=True,
         allow_existing=True,
@@ -8647,6 +8721,8 @@ def _validate_active_pr_conflict_recovery(
         worktree,
         branch,
         str(project["base_branch"]),
+        journal_state_dir=state_dir,
+        journal_owner=f"plan:{plan['plan_id']}",
         allow_create_branch=False,
         allow_recovery=True,
         allow_existing=True,
@@ -9079,6 +9155,174 @@ def _rebase_in_progress_for_branch(worktree: Path, branch: str) -> bool:
     return _rebase_head_name(worktree) == f"refs/heads/{branch}"
 
 
+def _owned_rebase_state_dir(repo: str, plan_id: str, worktree: Path) -> Path | None:
+    """Legacy recovery calls can be journaled only for a deterministic plan path."""
+    if not re.fullmatch(r"G-\d+", plan_id) or len(worktree.parents) < 3:
+        return None
+    state_dir = worktree.parents[2]
+    _branch, expected = expected_execplan_workspace(state_dir, repo, plan_id)
+    return state_dir if _canonical_path(expected) == _canonical_path(worktree) else None
+
+
+def _owned_rebase_metadata(worktree: Path) -> dict[str, str] | None:
+    for directory in ("rebase-merge", "rebase-apply"):
+        values = {}
+        for name in ("orig-head", "head-name", "onto"):
+            result = git(worktree, "rev-parse", "--git-path", f"{directory}/{name}",
+                         check=False)
+            if result.returncode:
+                break
+            path = Path(result.stdout.strip())
+            if not path.is_absolute():
+                path = worktree / path
+            if not path.is_file():
+                break
+            values[name] = path.read_text(encoding="utf-8").strip()
+        if len(values) == 3:
+            return values
+    return None
+
+
+def _owned_rebase_journal_state(worktree: Path, branch: str) -> dict[str, object]:
+    snapshot = capture_git_snapshot(worktree)
+    return json.loads(json.dumps({
+        "head": snapshot.head, "branch": snapshot.branch,
+        "ref": snapshot.refs.get(f"refs/heads/{branch}"),
+        "index": snapshot.index, "dirty": snapshot.dirty,
+        "file_evidence": rebase_file_evidence.capture(worktree, snapshot.head, snapshot.dirty),
+        "registration": snapshot.worktrees.get(str(_canonical_path(worktree))),
+        "operations": snapshot.operations,
+        "metadata": _owned_rebase_metadata(worktree),
+        "unmerged": bool(git(worktree, "ls-files", "-u", "-z").stdout),
+        "index_clean": git(worktree, "diff", "--cached", "--quiet",
+                           check=False).returncode == 0,
+    }, sort_keys=True))
+
+
+def _finish_owned_direct_rebase(
+    state_dir: Path, connection: sqlite3.Connection, repo_path: Path,
+    repo: str, plan_id: str, worktree: Path, branch: str,
+    *, allow_equal: bool = False, agent_session_id: str | None = None,
+) -> bool:
+    checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
+        repo, plan_id,
+    )
+
+    def validate(intent: Mapping[str, object], observed: Mapping[str, object]):
+        expected = intent["expected"]
+        if (
+            intent["owner"] != f"plan:{plan_id}"
+            or expected["branch"] != branch
+            or expected.get("agent_session_id") != agent_session_id
+            or checkpoint.operation != "rebase"
+            or checkpoint.expected_head != expected["before_head"]
+            or checkpoint.target_base_oid != expected["target_base_oid"]
+            or checkpoint.observed_remote_oid != expected["remote_oid"]
+        ):
+            raise manager_git_journal.MutationEvidenceError(
+                "Manager rebase checkpoint 또는 원격 OID가 다릅니다."
+            )
+        if observed["metadata"] is None:
+            marker = manager_git_journal.rebase_completion_matches(
+                git, repo_path, branch=branch, head=observed["head"],
+                identity=intent["id"], target_base_oid=expected["target_base_oid"],
+            )
+            patches = checkpoint_ownership.rebase_preserves_commits(
+                repo_path, expected["before_head"], observed["head"],
+                expected["target_base_oid"], git,
+            )
+        else:
+            marker = manager_git_journal.rebase_conflict_matches(
+                git, worktree, head=observed["head"], identity=intent["id"],
+            )
+            patches = False
+        ancestor = git(worktree, "merge-base", "--is-ancestor",
+                       expected["target_base_oid"], observed["head"], check=False)
+        return manager_git_journal.verified_rebase_result(
+            intent, observed, current_remote_oid=remote_branch_oid(repo_path, branch),
+            target_ancestor=ancestor.returncode == 0,
+            patches_preserved=patches, reflog_marker=marker,
+            autostash_owned=bool((checkpoint.snapshot or {}).get("stash_oid")),
+        )
+
+    return manager_git_journal.complete_rebase(
+        state_dir, repo=str(_canonical_path(repo_path)),
+        target=str(_canonical_path(worktree)),
+        observe=lambda: _owned_rebase_journal_state(worktree, branch),
+        validate=validate,
+        allow_equal=allow_equal,
+    )
+
+
+def _journaled_direct_rebase(
+    connection: sqlite3.Connection, repo_path: Path, repo: str, plan_id: str,
+    worktree: Path, branch: str, target_oid: str, *, autostash: bool = False,
+    agent_session_id: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    state_dir = _owned_rebase_state_dir(repo, plan_id, worktree)
+    if state_dir is None:
+        return git(worktree, "rebase", *(("--autostash",) if autostash else ()),
+                   target_oid, check=False)
+    before = _owned_rebase_journal_state(worktree, branch)
+    checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
+    current = checkpoint.get(repo, plan_id)
+    remote_oid = remote_branch_oid(repo_path, branch)
+    if current.observed_remote_oid not in (None, remote_oid):
+        raise manager_git_journal.MutationEvidenceError(
+            "Manager rebase 전 게시 원격 OID가 checkpoint와 다릅니다."
+        )
+    if current.operation == "rebase":
+        if (current.expected_head != before["head"]
+                or current.target_base_oid != target_oid
+                or current.observed_remote_oid != remote_oid):
+            raise manager_git_journal.MutationEvidenceError(
+                "Manager rebase 기존 checkpoint가 현재 작업과 다릅니다."
+            )
+    else:
+        checkpoint.record(
+            repo, plan_id, expected_generation=current.generation,
+            operation="rebase", expected_head=before["head"],
+            target_base_oid=target_oid, observed_remote_oid=remote_oid,
+            snapshot=current.snapshot,
+        )
+    token = manager_git_journal.begin_rebase(
+        state_dir, owner=f"plan:{plan_id}", repo=str(_canonical_path(repo_path)),
+        target=str(_canonical_path(worktree)), before=before,
+        expected={"branch": branch, "before_head": before["head"],
+                  "target_base_oid": target_oid, "remote_oid": remote_oid,
+                  "affected_paths": manager_git_journal.rebase_affected_paths(
+                      git, worktree, before["head"], target_oid,
+                  ),
+                  "agent_session_id": agent_session_id},
+    )
+    environment = dict(os.environ)
+    environment["GIT_REFLOG_ACTION"] = f"loop-manager-rebase:{token}"
+    result = git(worktree, "rebase", *(("--autostash",) if autostash else ()),
+                 target_oid, check=False, env=environment)
+    _finish_owned_direct_rebase(
+        state_dir, connection, repo_path, repo, plan_id, worktree, branch,
+        allow_equal=True, agent_session_id=agent_session_id,
+    )
+    return result
+
+
+def _complete_direct_rebase_checkpoint(
+    connection: sqlite3.Connection, repo: str, plan_id: str,
+    worktree: Path, target_base_oid: str,
+) -> None:
+    repository = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
+    current = repository.get(repo, plan_id)
+    if current.operation == "rebase":
+        repository.record(
+            repo, plan_id, expected_generation=current.generation,
+            operation=None,
+            expected_head=git(worktree, "rev-parse", "HEAD").stdout.strip(),
+            target_base_oid=target_base_oid,
+            observed_remote_oid=current.observed_remote_oid,
+            snapshot=current.snapshot,
+        )
+
+
 def validate_managed_worktree(
     repo: Path,
     worktree: Path,
@@ -9168,6 +9412,8 @@ def make_worktree(
     ownership_reserved: bool = False,
     expected_head: str | None = None,
     before_create: Callable[[], None] | None = None,
+    journal_state_dir: Path | None = None,
+    journal_owner: str | None = None,
 ) -> str:
     """Create, recover, or validate one owned ExecPlan worktree."""
 
@@ -9178,6 +9424,17 @@ def make_worktree(
     if worktree.exists() and not worktree.is_dir():
         raise WorkspaceOwnershipError(
             f"관리 worktree 경로가 디렉터리가 아닙니다: {worktree}"
+        )
+    if journal_state_dir is not None:
+        if not journal_owner:
+            raise WorkspaceOwnershipError("관리 worktree journal의 계획 identity가 없습니다.")
+        manager_git_journal.recover_active(
+            journal_state_dir, repo=str(_canonical_path(repo)),
+            kind="managed_worktree_create", target=str(_canonical_path(worktree)),
+            observe=lambda: _managed_worktree_transition_state(repo, worktree),
+            marker=lambda intent: _managed_worktree_marker(
+                journal_state_dir, intent, "create",
+            ),
         )
     if worktree.is_dir():
         if not allow_existing:
@@ -9194,7 +9451,8 @@ def make_worktree(
         return "existing"
 
     worktree.parent.mkdir(parents=True, exist_ok=True)
-    git(repo, "worktree", "prune", "--expire", "now")
+    if journal_state_dir is None:
+        git(repo, "worktree", "prune", "--expire", "now")
     branch_exists = (
         git(
             repo,
@@ -9231,18 +9489,57 @@ def make_worktree(
                     "예약 ExecPlan branch가 저장된 기준 commit과 다릅니다: "
                     f"{branch} ({branch_head}, expected {expected_head})"
                 )
-        git(repo, "worktree", "add", str(worktree), branch)
+        arguments = ("worktree", "add", str(worktree), branch)
         outcome = "recovered"
     elif allow_create_branch or ownership_reserved:
         if before_create is not None:
             before_create()
         start_point = expected_head or f"origin/{base}"
-        git(repo, "worktree", "add", "-b", branch, str(worktree), start_point)
+        arguments = ("worktree", "add", "-b", branch, str(worktree), start_point)
         outcome = "created"
     else:
         raise WorkspaceOwnershipError(
             f"저장된 worktree와 관리 branch를 모두 복구할 수 없습니다: "
             f"{worktree} ({branch})"
+        )
+    if journal_state_dir is None:
+        git(repo, *arguments)
+    else:
+        before = _managed_worktree_transition_state(repo, worktree)
+        if before != {"exists": False, "registration": None, "index": None}:
+            raise WorkspaceOwnershipError("관리 worktree 생성 직전 등록 상태가 변경됐습니다.")
+        head = git(
+            repo, "rev-parse", "--verify",
+            start_point if outcome == "created" else branch,
+        ).stdout.strip()
+        tree = git(repo, "rev-parse", "--verify", f"{head}^{{tree}}").stdout.strip()
+        mutation_id = secrets.token_hex(16)
+        lock_reason = f"loop-manager-worktree:{mutation_id}"
+        expected = {
+            "exists": True,
+            "registration": {"head": head, "branch": f"refs/heads/{branch}",
+                             "locked": lock_reason},
+            "index": tree,
+        }
+
+        def apply(token: str) -> None:
+            _write_managed_worktree_receipt(
+                journal_state_dir, token, repo, worktree, before, expected,
+                "create",
+            )
+            git(repo, "worktree", "add", "--lock", f"--reason={lock_reason}",
+                *arguments[2:])
+
+        manager_git_journal.execute(
+            journal_state_dir, owner=journal_owner,
+            kind="managed_worktree_create", repo=str(_canonical_path(repo)),
+            target=str(_canonical_path(worktree)), before=before,
+            expected=expected,
+            observe=lambda: _managed_worktree_transition_state(repo, worktree),
+            apply=apply,
+            marker=lambda intent: _managed_worktree_marker(
+                journal_state_dir, intent, "create",
+            ),
         )
     if ownership_reserved:
         validate_reserved_worktree(repo, worktree, branch, str(expected_head))
@@ -10559,7 +10856,8 @@ def validate_pending_cleanup_worktree(
 
 
 def remove_cleanup_worktree(
-    repo: Path, worktree: Path, assessment: CleanupAssessment
+    repo: Path, worktree: Path, assessment: CleanupAssessment,
+    *, state_dir: Path | None = None, owner: str | None = None,
 ) -> CleanupAssessment:
     if assessment.status != "safe":
         return assessment
@@ -10568,7 +10866,39 @@ def remove_cleanup_worktree(
         if dirty or _git_operation_entries(worktree):
             return CleanupAssessment("dirty", "worktree 제거 직전 권위 있는 변경이 있습니다.")
         arguments = ("--force",) if _ignored_worktree_paths(worktree) else ()
-        git(repo, "worktree", "remove", *arguments, str(worktree))
+        if state_dir is None:
+            git(repo, "worktree", "remove", *arguments, str(worktree))
+        else:
+            if not owner:
+                raise WorkspaceOwnershipError("관리 worktree 정리 journal의 계획 identity가 없습니다.")
+            before = _managed_worktree_transition_state(repo, worktree)
+            head = before["registration"]["head"] if before["registration"] else None
+            tree = git(repo, "rev-parse", "--verify", f"{head}^{{tree}}").stdout.strip()
+            if (not before["exists"] or before["index"] != tree):
+                raise WorkspaceOwnershipError("관리 worktree 정리 직전 index가 HEAD와 다릅니다.")
+            expected = {"exists": False, "registration": None, "index": None}
+
+            def marker(intent: Mapping[str, object]) -> bool:
+                return _managed_worktree_marker(state_dir, intent, "remove")
+
+            def apply(token: str) -> None:
+                if _managed_worktree_transition_state(repo, worktree) != before:
+                    raise WorkspaceOwnershipError("관리 worktree 정리 직전 상태가 변경됐습니다.")
+                if before["registration"]["locked"]:
+                    git(repo, "worktree", "unlock", str(worktree))
+                git(repo, "worktree", "remove", *arguments, str(worktree))
+                _write_managed_worktree_receipt(
+                    state_dir, token, repo, worktree, before, expected, "remove",
+                )
+
+            manager_git_journal.execute(
+                state_dir, owner=owner, kind="managed_worktree_remove",
+                repo=str(_canonical_path(repo)),
+                target=str(_canonical_path(worktree)), before=before,
+                expected=expected,
+                observe=lambda: _managed_worktree_transition_state(repo, worktree),
+                apply=apply, marker=marker,
+            )
     except RuntimeError as error:
         return CleanupAssessment("unverifiable", f"worktree 제거 실패: {error}")
     return assessment
@@ -10642,6 +10972,7 @@ def recheck_cleanup_pending(
                 )
             continue
         try:
+            _recover_managed_worktree_removal(state_dir, repo_path, worktree)
             validate_pending_cleanup_worktree(
                 repo_path,
                 state_dir,
@@ -10655,7 +10986,10 @@ def recheck_cleanup_pending(
             )
         else:
             assessment = assess_cleanup(worktree, item["pr_head_oid"])
-            assessment = remove_cleanup_worktree(repo_path, worktree, assessment)
+            assessment = remove_cleanup_worktree(
+                repo_path, worktree, assessment, state_dir=state_dir,
+                owner=f"plan:{worktree.name}",
+            )
         if assessment.status in {"safe", "missing"}:
             connection.execute(
                 "DELETE FROM cleanup_pending WHERE repo = ? AND worktree = ?",
@@ -11619,6 +11953,8 @@ def resume_guidance_approval_if_decided(
             worktree,
             branch,
             base,
+            journal_state_dir=state_dir,
+            journal_owner=f"plan:{plan['plan_id']}",
             allow_create_branch=False,
             allow_recovery=True,
             allow_existing=True,
@@ -12588,7 +12924,7 @@ def recover_persisted_agent_worktree(
     state_dir: Path,
     repo: str,
     project: sqlite3.Row,
-) -> None:
+) -> str:
     """Recover a missing Agent worktree only from its proven owned branch."""
 
     worktree = Path(str(project["worktree"] or ""))
@@ -12617,11 +12953,13 @@ def recover_persisted_agent_worktree(
             branch,
             worktree,
         )
-        make_worktree(
+        return make_worktree(
             repo_path,
             worktree,
             branch,
             str(project["base_branch"]),
+            journal_state_dir=state_dir,
+            journal_owner=f"plan:{plan_id}",
             allow_create_branch=False,
             allow_recovery=True,
             allow_existing=True,
@@ -12630,6 +12968,46 @@ def recover_persisted_agent_worktree(
         raise AgentScopeError(
             f"저장된 Agent worktree 복구 실패: {error}"
         ) from error
+
+
+def _proven_recovered_worktree_baseline(
+    before: GitSnapshot, current: GitSnapshot, state_dir: Path,
+    repo_path: Path, plan_id: str, worktree: Path,
+) -> GitSnapshot:
+    """Account for only this run's journaled lock on a recreated worktree."""
+    key = str(_canonical_path(worktree))
+    old = before.worktrees.get(key)
+    new = current.worktrees.get(key)
+    if (
+        old is None or new is None or before.head != current.head
+        or before.branch != current.branch or before.index != current.index
+        or before.dirty != current.dirty
+        or f"HEAD={before.head}" not in old
+        or f"branch=refs/heads/{before.branch}" not in old
+    ):
+        raise AgentScopeError("복구한 Agent worktree의 기존 파일·HEAD 상태가 다릅니다.")
+    transitions = manager_git_journal.verified_managed_transitions(
+        state_dir, str(_canonical_path(repo_path)), f"plan:{plan_id}",
+    )
+    owned = any(
+        item["intent"]["kind"] == "managed_worktree_create"
+        and item["intent"]["target"] == key
+        and item["intent"]["before"] == {
+            "exists": False, "registration": None, "index": None,
+        }
+        and item["result"]["observed"]["registration"] == {
+            "head": current.head,
+            "branch": f"refs/heads/{current.branch}",
+            "locked": item["intent"]["expected"]["registration"]["locked"],
+        }
+        and set(new) == set(old) | {
+            "locked=" + item["intent"]["expected"]["registration"]["locked"]
+        }
+        for item in transitions
+    )
+    if not owned:
+        raise AgentScopeError("복구한 Agent worktree의 Manager journal 소유권이 없습니다.")
+    return replace(before, worktrees={**before.worktrees, key: new})
 
 
 def _blocked_agent_local_baseline(
@@ -12731,12 +13109,26 @@ def validate_persisted_agent_scope(
         allow_common_plans = _published_plan_allows_common_plans(
             repo_path, active_plan
         )
+    recovered_worktree = False
     if not saved_worktree.is_dir():
-        recover_persisted_agent_worktree(
+        recovered_worktree = recover_persisted_agent_worktree(
             connection, repo_path, state_dir, repo, project
-        )
+        ) == "recovered"
 
     current = capture_git_snapshot(saved_worktree)
+    if recovered_worktree:
+        plan_id = _plan_id_from_path(selected_plan_path)
+        if not plan_id:
+            raise AgentScopeError("복구한 Agent worktree의 ExecPlan identity가 없습니다.")
+        previous_registration = before.worktrees.get(
+            str(_canonical_path(saved_worktree))
+        )
+        before = _proven_recovered_worktree_baseline(
+            before, current, state_dir, repo_path, plan_id, saved_worktree,
+        )
+        recovered_baseline = before
+    else:
+        recovered_baseline = None
     proven_cleanups = _proven_merged_cleanup_paths(
         connection, repo, before, current,
     )
@@ -12792,6 +13184,30 @@ def validate_persisted_agent_scope(
             raise AgentScopeError(
                 f"저장된 BLOCKED Agent 결과 snapshot이 유효하지 않습니다: {error}"
             ) from error
+    recovered_result_baseline = None
+    if recovered_worktree and result is not None:
+        key = str(_canonical_path(saved_worktree))
+        if result.worktrees.get(key) != previous_registration:
+            raise AgentScopeError(
+                "복구한 Agent worktree의 저장된 결과 등록 상태가 다릅니다."
+            )
+        result = replace(
+            result, worktrees={**result.worktrees, key: current.worktrees[key]},
+        )
+        recovered_result_baseline = result
+    recovered_manager_checkpoint = None
+    if recovered_worktree and checkpoint is not None:
+        key = str(_canonical_path(saved_worktree))
+        if checkpoint.snapshot.worktrees.get(key) != previous_registration:
+            raise AgentScopeError(
+                "복구한 Agent worktree의 Manager checkpoint 등록 상태가 다릅니다."
+            )
+        checkpoint = replace(checkpoint, snapshot=replace(
+            checkpoint.snapshot,
+            worktrees={**checkpoint.snapshot.worktrees,
+                       key: current.worktrees[key]},
+        ))
+        recovered_manager_checkpoint = checkpoint
 
     before = _normalize_legacy_ignored_snapshot(saved_worktree, before, current)
     if result is not None:
@@ -12897,6 +13313,17 @@ def validate_persisted_agent_scope(
                     f"중단된 Manager Git 작업 후 Agent scope 검증 실패: {error}"
                 ) from error
             raise
+    if recovered_baseline is not None:
+        recovered_values = {"agent_snapshot": recovered_baseline.serialize()}
+        if recovered_result_baseline is not None:
+            recovered_values["agent_result_snapshot"] = (
+                recovered_result_baseline.serialize()
+            )
+        if recovered_manager_checkpoint is not None:
+            recovered_values["agent_manager_snapshot"] = (
+                recovered_manager_checkpoint.serialize()
+            )
+        update_project(connection, repo, **recovered_values)
     if decision.reconciled_before is not None and decision.reconciled_before != before:
         update_project(
             connection, repo,
@@ -13930,6 +14357,8 @@ def resume_interrupted_blocked_agent_recovery(
             worktree,
             branch,
             str(project["base_branch"]),
+            journal_state_dir=state_dir,
+            journal_owner=f"plan:{plan['plan_id']}",
             allow_create_branch=False,
             allow_recovery=True,
             allow_existing=True,
@@ -14162,6 +14591,14 @@ def _resume_interrupted_blocked_rebase(
             and _blocked_execplan_metadata_error(repo_path, worktree, plan) is None
             and _blocked_resume_worktree_matches(worktree, marker, snapshot)
         )
+        if safe:
+            state_dir = _owned_rebase_state_dir(repo, str(plan['plan_id']), worktree)
+            if state_dir is not None:
+                _finish_owned_direct_rebase(
+                    state_dir, connection, repo_path, repo,
+                    str(plan['plan_id']), worktree, branch,
+                    agent_session_id=plan['worker_session_id'],
+                )
     except (OSError, RuntimeError, ValueError, KeyError, TypeError):
         safe = False
     if not safe:
@@ -14298,6 +14735,8 @@ def resume_blocked_execplan_if_inputs_changed(
             worktree,
             branch,
             base,
+            journal_state_dir=state_dir,
+            journal_owner=f"plan:{plan['plan_id']}",
             allow_create_branch=False,
             allow_recovery=True,
             allow_existing=True,
@@ -14367,6 +14806,7 @@ def resume_blocked_execplan_if_inputs_changed(
         message = f"BLOCKED Agent 변경 보존 실패:\n{error}"
         _update_blocked_error(connection, repo, str(plan["plan_id"]), message)
         return False
+    target_base_oid = git(repo_path, 'rev-parse', revision).stdout.strip()
     if owned_oid is not None:
         before_head = git(worktree, 'rev-parse', 'HEAD').stdout.strip()
         if git(repo_path, 'merge-base', '--is-ancestor', owned_oid,
@@ -14374,7 +14814,6 @@ def resume_blocked_execplan_if_inputs_changed(
             _update_blocked_error(connection, repo, str(plan['plan_id']),
                                   '게시 checkpoint 이후 로컬 HEAD 계보가 다릅니다.')
             return False
-        target_base_oid = git(repo_path, 'rev-parse', revision).stdout.strip()
         _record_blocked_resume_head(
             connection, repo, str(plan['plan_id']), owned_oid,
             before_head, target_base_oid, None,
@@ -14396,12 +14835,10 @@ def resume_blocked_execplan_if_inputs_changed(
         _update_blocked_error(connection, repo, str(plan["plan_id"]), error)
         return False
     if base_ancestry.returncode == 1:
-        rebased = git(
-            worktree,
-            "rebase",
-            "--autostash",
-            f"origin/{base}",
-            check=False,
+        rebased = _journaled_direct_rebase(
+            connection, repo_path, repo, str(plan['plan_id']), worktree,
+            branch, target_base_oid, autostash=True,
+            agent_session_id=plan['worker_session_id'],
         )
         if rebased.returncode:
             error = f"BLOCKED 해제 전 rebase 실패:\n{rebased.stdout[-8000:]}"
@@ -14450,6 +14887,10 @@ def resume_blocked_execplan_if_inputs_changed(
         _record_blocked_resume_head(
             connection, repo, str(plan['plan_id']), owned_oid,
             before_head, target_base_oid, after_head,
+        )
+    elif base_ancestry.returncode == 1:
+        _complete_direct_rebase_checkpoint(
+            connection, repo, str(plan['plan_id']), worktree, target_base_oid,
         )
 
     clear_agent_scope(connection, repo)
@@ -14810,7 +15251,7 @@ def complete_merged_worktree(
     cleanup_registration: tuple[str, ...] | None = None
     worktree_present = worktree.exists() or worktree.is_symlink()
     if not worktree_present:
-        assessment = CleanupAssessment("missing")
+        assessment = _assess_missing_managed_cleanup(state_dir, repo_path, worktree)
     elif (
         int(plan["workspace_owned"]) != WORKSPACE_OWNED
         or str(plan["branch"] or "") != branch
@@ -14844,7 +15285,10 @@ def complete_merged_worktree(
                 cleanup_registration = capture_git_snapshot(repo_path).worktrees.get(
                     str(_canonical_path(worktree))
                 )
-            assessment = remove_cleanup_worktree(repo_path, worktree, assessment)
+            assessment = remove_cleanup_worktree(
+                repo_path, worktree, assessment, state_dir=state_dir,
+                owner=f"plan:{plan_id}",
+            )
     with connection:
         _ensure_execplans_schema(connection)
         _ensure_cleanup_pending_schema(connection)
@@ -14895,7 +15339,7 @@ def complete_merged_execplan_worktree(
     workspace_owned = WORKSPACE_OWNED
     cleanup_registration: tuple[str, ...] | None = None
     if not (worktree.exists() or worktree.is_symlink()):
-        assessment = CleanupAssessment("missing")
+        assessment = _assess_missing_managed_cleanup(state_dir, repo_path, worktree)
     elif int(plan["workspace_owned"]) != WORKSPACE_OWNED:
         workspace_owned = WORKSPACE_UNOWNED
         assessment = CleanupAssessment(
@@ -14929,6 +15373,8 @@ def complete_merged_execplan_worktree(
                 repo_path,
                 worktree,
                 assessment,
+                state_dir=state_dir,
+                owner=f"plan:{plan['plan_id']}",
             )
 
     with connection:
@@ -16810,6 +17256,8 @@ def reconcile_existing_pull_request(
                 worktree,
                 branch,
                 str(project["base_branch"]),
+                journal_state_dir=state_dir,
+                journal_owner=f"plan:{plan_id}",
                 allow_create_branch=False,
                 allow_recovery=True,
                 allow_existing=True,
@@ -16969,6 +17417,14 @@ def resume_pr_conflict_rebase(
         operation_print(error, file=sys.stderr)
         return 1
 
+    state_dir = _owned_rebase_state_dir(repo, str(plan['plan_id']), worktree)
+    if state_dir is not None:
+        _finish_owned_direct_rebase(
+            state_dir, connection, repo_path, repo,
+            str(plan['plan_id']), worktree, branch,
+            agent_session_id=plan['worker_session_id'],
+        )
+
     latest_base = git(
         repo_path,
         "rev-parse",
@@ -17011,7 +17467,10 @@ def resume_pr_conflict_rebase(
         operation_print(error, file=sys.stderr)
         return PROJECT_STEP_RETRY
 
-    rebased = git(worktree, "rebase", target_base, check=False)
+    rebased = _journaled_direct_rebase(
+        connection, repo_path, repo, str(plan['plan_id']), worktree,
+        branch, target_base, agent_session_id=plan['worker_session_id'],
+    )
     if rebased.returncode and is_git_lock_failure(rebased.stdout):
         raise GitLockError(rebased.stdout[-8000:])
     if git(worktree, "ls-files", "-u", "-z").stdout:

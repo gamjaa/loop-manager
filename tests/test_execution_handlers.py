@@ -284,6 +284,28 @@ class ExecutionHandlerTests(TestCase):
         )
         self.handler.plan = self.plan
         self.handler.catalog_plan = self.repository.active_row('repo')
+        # This class exercises phase policy with fake Git effects. Journal
+        # persistence and ownership are covered by test_managed_mutation_evidence;
+        # keep these legacy policy tests at the Git operation boundary.
+        journal_start = mock.patch.object(
+            handlers.manager_git_journal, 'begin_rebase',
+            return_value='test-rebase-token',
+        )
+        journal_start.start()
+        self.addCleanup(journal_start.stop)
+        self.handler._rebase_journal_state = mock.Mock(return_value={})
+        self.handler._begin_rebase_continuation = mock.Mock(
+            return_value='test-rebase-token',
+        )
+        self.handler._finish_rebase_journal = mock.Mock(return_value=True)
+
+        def fake_rebase(context, target_oid, *, autostash=False):
+            arguments = ('--autostash', target_oid) if autostash else (target_oid,)
+            return self.effects.workspace.git(
+                context.worktree, 'rebase', *arguments, check=False,
+            )
+
+        self.handler._run_managed_rebase = fake_rebase
 
     def git(self, path, *args, **kwargs):
         self.calls.append(args[0])
@@ -1787,7 +1809,7 @@ class ExecutionHandlerTests(TestCase):
         self.effects.workspace.git.side_effect = lambda *_args, **_kwargs: SimpleNamespace(
             stdout='user-head\n', returncode=0,
         )
-        current = SimpleNamespace(snapshot=None)
+        current = SimpleNamespace(operation=None, snapshot=None)
         row = {'pr_url': None, 'publication_remote_oid': None}
 
         with mock.patch.object(handlers.checkpoint_ownership, 'owned_remote_oid',

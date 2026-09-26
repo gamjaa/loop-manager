@@ -100,7 +100,11 @@ def rebase_preserves_commits(
                                f'{old_base}..{before_head}').stdout.strip())
         after_count = int(git(repo_path, 'rev-list', '--count',
                               f'{target_base_oid}..{after_head}').stdout.strip())
-        if before_count == 0 or before_count != after_count:
+        if before_count == 0:
+            # A branch at the old base can only rebase by fast-forwarding to
+            # the target. There is no patch series for range-diff to compare.
+            return old_base == before_head and after_head == target_base_oid
+        if before_count != after_count:
             return False
         comparison = git(repo_path, 'range-diff', '--no-color', '--no-patch',
                          f'{old_base}..{before_head}',

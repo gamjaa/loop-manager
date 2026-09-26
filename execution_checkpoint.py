@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import rebase_file_evidence
+
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Mapping
@@ -68,6 +70,43 @@ class CheckpointDecision:
     validated_base_sha: str | None = None
     invalidate_validation: bool = False
     reason: str = ""
+
+
+def owned_detached_rebase(
+    *, operation: str | None, expected_head: str | None,
+    target_base_oid: str | None, recorded_before_head: str | None,
+    branch: str, remote_oid: str | None, accepted_remote_oid: str | None,
+    recorded_remote_oid: str | None, checkpoint_remote_oid: str | None,
+    head_name: str | None,
+    orig_head: str | None, onto: str | None,
+) -> bool:
+    """A detached conflict is owned only by the persisted rebase and Git metadata."""
+    return bool(
+        operation == "rebase"
+        and expected_head and target_base_oid
+        and (not recorded_before_head or recorded_before_head == expected_head)
+        and accepted_remote_oid and remote_oid == accepted_remote_oid
+        and recorded_remote_oid in (None, "", accepted_remote_oid)
+        and checkpoint_remote_oid in (None, accepted_remote_oid)
+        and head_name == f"refs/heads/{branch}"
+        and orig_head == expected_head and onto == target_base_oid
+    )
+
+
+def rebase_preserves_worktree_files(before: Mapping[str, object],
+                                    after: Mapping[str, object], *,
+                                    before_evidence=None, after_evidence=None) -> bool:
+    """Preserve contents or prove the local edits survived a disjoint base merge."""
+    return set(before) == set(after) and all(
+        isinstance(before[path], (list, tuple))
+        and isinstance(after[path], (list, tuple))
+        and len(before[path]) == len(after[path]) == 2
+        and (before[path][1] == after[path][1] or rebase_file_evidence.preserved(
+            (before_evidence or {}).get(path), (after_evidence or {}).get(path),
+            before[path][1], after[path][1],
+        ))
+        for path in before
+    )
 
 
 def assess(snapshot: CheckpointSnapshot) -> CheckpointDecision:
