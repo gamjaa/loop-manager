@@ -5,6 +5,7 @@ sources:
   - docs/requirements/[R-023] Self-Hosted Runtime Refresh Handoff.md
 depends_on:
   - G-051
+  - G-091
 complexity: high
 risk: critical
 priority: critical
@@ -41,3 +42,5 @@ priority: critical
 ## Decision Log
 
 - R-023은 격리 증명 없는 실행에서 무관한 Git 변화의 비차단을 허용하지 않는다. 특정 CLI 옵션의 존재를 격리 증명으로 간주하지 않는다.
+
+- 2026-09-26: 사용자 요청에 따라 반복되는 Manager rebase 소유권 오탐을 기존 G-091에서 먼저 수정한다. G-091의 구현 PR이 Merge된 뒤 이 계획의 기존 작업물과 게시 checkpoint를 보존해 재개한다.

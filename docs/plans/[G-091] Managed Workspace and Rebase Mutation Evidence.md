@@ -22,11 +22,15 @@ priority: critical
 - G-081의 게시 checkpoint OID, rebase 전후 HEAD, 원격 branch 기대 OID 및 `--force-with-lease` 경계를 교차 검증한다. Manager rebase와 Agent의 허용 파일 변경이 함께 있는 경우 파일 변경을 보존하며, 외부 영향권 변화가 섞이면 증거로 인정하지 않는다.
 - 검증된 작업별 전이만 G-092의 기준선 재조정 입력으로 제공한다. 이 계획 자체는 기존 `PLAN_BLOCKED`·`PROJECT_BLOCKED`를 자동 해제하지 않는다.
 
+- 소유 게시 checkpoint가 있는 계획의 Manager rebase가 충돌로 detached HEAD에 머무르거나 다음 Loop 실행에서 재개돼도, 실행 checkpoint와 실제 rebase metadata가 소유 작업을 증명하면 `publication_ownership_uncertain`으로 오탐 차단하지 않고 기존 충돌 수정·재개 경로로 진행한다. 기록 없는 rebase, 다른 branch/worktree, 예상 밖 원격 OID와 외부 변경은 계속 거부한다. 이 경로는 G-088의 Agent 격리 구현이나 G-089의 감시 축소에 의존하지 않는다.
+
 ## Implementation
 
 - `loop_manager.py`와 `execution_checkpoint.py`의 관리 worktree add/remove 및 rebase 경계에 G-090의 intent·결과 기록을 연결한다. 운영상 기존 cleanup pending과 활성 작업 상태 전이는 유지한다.
 - 검증기는 G-081의 소유 게시 OID와 실행 checkpoint를 확인해 rebase 전후 HEAD·ref·index·등록의 변화만 Manager 결과로 산출한다. 충돌·재시작·외부 ref 경쟁은 안전하게 구분한다.
 - 현재 `agent_manager_snapshot`의 Agent 결과와 허용 파일 변경은 보존하고, G-092가 작업별 검증 결과를 사용하도록 별도 조회 경계를 제공한다.
+
+- `execution_handlers.py`의 `_owned_checkpoint_remote`부터 rebase 충돌 수정 dispatch까지, 정상 branch 검증과 소유 Manager rebase 중 detached HEAD 검증을 구분한다. 무조건 `allow_rebase`를 켜지 않고 execution checkpoint의 operation·expected HEAD·target base, 게시 OID·원격 기대 OID, 등록 worktree 및 rebase의 `orig-head`·`head-name`·`onto`를 대조한다. 기존 checkpoint도 동일한 증거를 충족할 때만 호환하며, 충돌 상태와 허용 작업물을 보존한다.
 
 ## Validation
 
@@ -34,12 +38,17 @@ priority: critical
 - worktree 생성·정리·rebase 전후 증거, rebase 충돌과 재개, Git/기록 저장 사이 중단, 예상 밖 원격 OID·등록·index 변화, 허용 파일 변경 보존 및 불완전 checkpoint 차단을 검증한다.
 - 전체 verify에서 G-081의 원격 게시 lease, PR head 소유권, worktree cleanup·recovery와 Agent 범위 안전이 유지돼야 한다.
 
+- G-088 재발 조건을 재현한다: 소유 게시 OID에서 시작한 Manager rebase가 충돌해 detached HEAD가 된 첫 실행과 process 재시작 뒤 모두 소유권 gate를 통과하고 기존 충돌 수정 경로에 도달해야 한다. `allow_rebase=True` validator 단독 통과만으로 완료하지 않는다. 소유 증거 없는 rebase·metadata 불일치·원격 경쟁은 계속 차단하고, 기존 다른 차단은 자동 해제하지 않는 회귀도 함께 검증한다.
+
 ## Progress
 
 - [ ] 관리 worktree 생성·정리의 journal 연결
 - [ ] rebase 전후 소유권·OID 검증 및 중단 복구
+- [ ] 게시 checkpoint가 있는 rebase 충돌·재시작의 소유권 오탐 회귀 수정
 - [ ] 기준선 재조정용 검증된 전이 제공
 
 ## Decision Log
 
 - G-090은 source/runtime 작업과 공통 journal을 제공하고, G-081은 게시 checkpoint OID를 보존한다. 이 계획은 관리 worktree와 rebase의 소유 Git 전이만 증명한다.
+
+- 2026-09-26: G-088에서 Manager rebase 충돌 뒤 detached HEAD를 일반 branch 검사로 거부해 프로젝트 차단이 반복됐다. 사용자는 별도 구현 대신 기존 개선 계획을 먼저 진행하도록 요청했다. G-088은 이 계획의 Merge를 기다리며, 이 계획에서는 Manager 작업 증명과 충돌 재개 gate를 먼저 수정하고 G-092의 일반 차단 자동 복구 범위는 유지한다.
