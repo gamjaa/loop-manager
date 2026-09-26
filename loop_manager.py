@@ -14452,10 +14452,30 @@ def _record_manager_base_fetch_intent(
     ).fetchone()
     before_ref = json.dumps(before.refs.get(refname))
     if existing is not None:
-        if (existing["before_ref"] != before_ref or existing["target_oid"] != target
-                or not existing["action_token"]):
+        if existing["before_ref"] == before_ref and existing["target_oid"] == target:
+            if not existing["action_token"]:
+                raise RuntimeError("이전 Manager base fetch intent의 소유 표식이 없습니다.")
+            return int(existing["id"])
+        try:
+            saved = json.loads(str(existing["before_ref"]))
+            cursor = tuple(saved) if saved is not None else None
+            for prior in connection.execute(
+                "SELECT * FROM manager_base_fetches WHERE repo = ? AND plan_id = ? "
+                "AND refname = ? AND id >= ? ORDER BY id",
+                (repo, plan_id, refname, int(existing["id"])),
+            ):
+                previous = json.loads(str(prior["before_ref"]))
+                previous = tuple(previous) if previous is not None else None
+                if previous != cursor or (
+                    prior["phase"] != "complete"
+                    and not _manager_base_fetch_applied(repo_path, prior)
+                ):
+                    raise RuntimeError("이전 Manager base fetch 체인을 증명할 수 없습니다.")
+                cursor = (str(prior["target_oid"]), "")
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("이전 Manager base fetch intent가 유효하지 않습니다.") from error
+        if cursor != before.refs.get(refname):
             raise RuntimeError("이전 Manager base fetch intent를 안전하게 재개할 수 없습니다.")
-        return int(existing["id"])
     with connection:
         cursor = connection.execute(
             "INSERT INTO manager_base_fetches "
@@ -15619,13 +15639,12 @@ def _remote_checkpoint_has_new_failure(
 
 def _remote_checkpoint_review_revision(
     repo_path: Path, worktree: Path, base_branch: str,
-    state_dir: Path | None = None,
+    state_dir: Path,
 ) -> tuple[str, str] | None:
     """Read the latest base and a candidate HEAD that contains that base."""
-    remote_base(repo_path, base_branch, state_dir=state_dir)
-    base = git(
-        repo_path, "rev-parse", f"refs/remotes/origin/{base_branch}^{{commit}}",
-    ).stdout.strip()
+    base = _recorded_base_fetch(
+        repo_path, state_dir, base_branch, owner="project",
+    )
     head = git(worktree, "rev-parse", "HEAD^{commit}").stdout.strip()
     if not base or not head:
         raise RuntimeError("원격 checkpoint 검증 revision을 확인할 수 없습니다.")

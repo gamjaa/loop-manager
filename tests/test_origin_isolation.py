@@ -1468,9 +1468,10 @@ class OriginIsolatedRegistrationAndExecutionTest(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, "fast-forward 실패"):
                         loop_manager.prepare_bootstrap_runtime(source, state_dir, "a" * 32)
             self.assertFalse((state_dir / "runtimes").exists())
+            advance_remote(writer, value="three\n")
 
             def failing_fetch(repo, *arguments, **kwargs):
-                if arguments[:2] == ("fetch", "origin"):
+                if arguments[:2] == ("fetch", "--no-tags"):
                     raise RuntimeError("fetch refused")
                 return real_git(repo, *arguments, **kwargs)
 
@@ -1482,7 +1483,7 @@ class OriginIsolatedRegistrationAndExecutionTest(unittest.TestCase):
                         loop_manager.prepare_bootstrap_runtime(source, state_dir, "c" * 32)
             self.assertFalse((state_dir / "runtimes").exists())
 
-            def raced_sync(repo, base, *, remote_sha):
+            def raced_sync(repo, base, *, remote_sha, state_dir, owner):
                 git(source, "checkout", "-b", "topic")
                 return loop_manager.BaseWorktreeSyncResult("equal", "raced", remote_sha)
 

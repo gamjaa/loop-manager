@@ -282,17 +282,14 @@ class ScopedBlockingTest(unittest.TestCase):
             self.connection.execute("UPDATE exec_plans SET workspace_owned = 0, worktree = ?", (directory,))
             self.connection.commit()
             merged = {"state": "MERGED", "url": "https://pr/1", "headRefOid": "a" * 40}
-            with mock.patch("loop_manager.pr_for_branch", return_value=merged) as read, mock.patch("loop_manager.git") as git, mock.patch(
+            with mock.patch("loop_manager.pr_for_branch", return_value=merged) as read, mock.patch("loop_manager._recorded_base_fetch", return_value="a" * 40) as fetched, mock.patch(
                 "loop_manager.complete_merged_execplan_worktree", wraps=loop_manager.complete_merged_execplan_worktree
             ) as cleanup:
                 loop_manager.synchronize_waiting_pull_requests(self.connection, Path(self.repo), Path(directory), self.repo)
             self.assertEqual(read.call_count, 2)
             cleanup.assert_called_once()
-            git.assert_called_once_with(
-                Path(self.repo),
-                "fetch",
-                "origin",
-                "+refs/heads/main:refs/remotes/origin/main",
+            fetched.assert_called_once_with(
+                Path(self.repo), Path(directory), "main", owner="project",
             )
             self.assertIsNotNone(scoped_blocking.project_block(self.connection, self.repo))
             statuses = dict(self.connection.execute("SELECT plan_id, status FROM exec_plans"))

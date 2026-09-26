@@ -398,10 +398,12 @@ class DocumentDraftTest(unittest.TestCase):
                          (draft.draft_id, draft.proposed_hash, "approve"))
         with mock.patch.object(loop_manager, "is_loop_manager_repository", return_value=True), \
              mock.patch.object(loop_manager, "connect_database", return_value=self.database), \
-             mock.patch.object(loop_manager, "git") as fetched, \
+             mock.patch.object(loop_manager, "_recorded_base_fetch", return_value="base") as fetched, \
              mock.patch.object(loop_manager, "operation_print"):
             self.assertEqual(loop_manager._document_drafts_command(args, self.root, self.root / "config.ini"), 0)
-            fetched.assert_called_once()
+            fetched.assert_called_once_with(
+                self.repo, self.root, "main", owner="project",
+            )
         self.assertEqual(self.drafts.get(draft.draft_id).state, "approved")
         with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
             parser.parse_args(["document-drafts", str(self.repo), "decide",
@@ -425,11 +427,14 @@ class DocumentDraftTest(unittest.TestCase):
         output = io.BytesIO()
         with mock.patch.object(loop_manager, "is_loop_manager_repository", return_value=True), \
              mock.patch.object(loop_manager, "connect_database", return_value=self.database), \
-             mock.patch.object(loop_manager, "git"), \
+             mock.patch.object(loop_manager, "_recorded_base_fetch", return_value="base") as fetched, \
              mock.patch.object(loop_manager, "run_agent", return_value=(0, response)) as agent, \
              mock.patch.object(loop_manager.sys, "stdout", mock.Mock(buffer=output)):
             self.assertEqual(loop_manager._document_drafts_command(
                 args, self.root, self.root / "config.ini"), 0)
+            fetched.assert_called_once_with(
+                self.repo, self.root, "main", owner="project",
+            )
             self.assertTrue(agent.call_args.kwargs["read_only"])
             self.assertEqual(agent.call_args.args[1], loop_manager.ROOT)
         self.assertIn(
