@@ -58,3 +58,5 @@ priority: critical
 - 2026-09-26: skip 완료 시 과거 reflog의 intent 표식만으로 외부 HEAD를 확정하지 않도록 최신 소유 branch reflog 한 건의 OID와 정확한 intent 완료 메시지를 관측 HEAD에 결합했다. 정상 skip과 외부 branch 이동·복귀, OID 불일치, 다른 intent, reflog 누락·조회 오류 및 기존 continue 내용 검증을 다루는 targeted unit case 2개가 통과했다. 전체 verify는 실행하지 않았다.
 
 - 2026-09-26: 전체 verify 피드백 후 설치된 Git의 branch reflog 완료 형식이 `<intent> (finish): <branch> onto <base OID>`임을 확인했다. 이전 exact-match 검증에서 누락한 `onto`와 checkpoint의 target base OID를 포함하고 fixture를 실제 형식으로 수정했다. 잘못된 base·누락된 base 거부를 추가한 skip case와 continue case 2개가 통과했다. 전달된 통합 시나리오와 전체 verify는 Worker에서 재실행하지 않았으며 Loop Manager의 재검증이 필요하다.
+
+- 2026-09-26: autostash가 같은 파일의 로컬 수정과 새 base 변경을 합칠 때 전체 파일 해시가 달라지는 정상 결과를 검증하도록 줄별 해시 기반 증거를 추가했다. 두 rebase snapshot 경로에서 원래 base·로컬 파일의 줄별 해시와 mode·signature를 기록하고, 비중첩 변경의 병합 결과가 실제 파일 증거와 일치할 때만 보존으로 인정한다. 원문은 journal에 기록하지 않는다. 증거가 없는 과거 기록, 외부 수정, 겹치는 변경과 mode 불일치는 기존 엄격 판정을 유지한다. 관련 unit test 5개가 통과했으며 새 모듈을 Linux verify 검사 목록에 추가했지만 전체 verify는 실행하지 않았다.

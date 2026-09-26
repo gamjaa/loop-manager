@@ -127,6 +127,8 @@ def verified_rebase_result(
     else:
         files_preserved = rebase_preserves_worktree_files(
             before["dirty"], observed["dirty"],
+            before_evidence=before.get("file_evidence"),
+            after_evidence=observed.get("file_evidence"),
         )
         valid = (
             observed["branch"] == branch

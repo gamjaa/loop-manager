@@ -9,6 +9,7 @@ import json
 import os
 import document_drafts
 import document_publication
+import rebase_file_evidence
 import manager_git_journal
 import notifications
 import re
@@ -925,6 +926,9 @@ class ExecutionHandlers:
             'head': snapshot.head, 'branch': snapshot.branch,
             'ref': snapshot.refs.get(ref), 'index': snapshot.index,
             'dirty': snapshot.dirty,
+            'file_evidence': rebase_file_evidence.capture(
+                context.worktree, snapshot.head, snapshot.dirty,
+            ),
             'registration': snapshot.worktrees.get(key),
             'operations': snapshot.operations,
             'metadata': self._rebase_metadata(context),

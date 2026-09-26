@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import rebase_file_evidence
+
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Mapping
@@ -92,13 +94,17 @@ def owned_detached_rebase(
 
 
 def rebase_preserves_worktree_files(before: Mapping[str, object],
-                                    after: Mapping[str, object]) -> bool:
-    """Autostash may change staging, but it must preserve each file's content."""
+                                    after: Mapping[str, object], *,
+                                    before_evidence=None, after_evidence=None) -> bool:
+    """Preserve contents or prove the local edits survived a disjoint base merge."""
     return set(before) == set(after) and all(
         isinstance(before[path], (list, tuple))
         and isinstance(after[path], (list, tuple))
         and len(before[path]) == len(after[path]) == 2
-        and before[path][1] == after[path][1]
+        and (before[path][1] == after[path][1] or rebase_file_evidence.preserved(
+            (before_evidence or {}).get(path), (after_evidence or {}).get(path),
+            before[path][1], after[path][1],
+        ))
         for path in before
     )
 

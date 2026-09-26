@@ -128,6 +128,7 @@ import maintenance_state
 import document_publication
 import scoped_blocking
 import agent_scope_decision
+import rebase_file_evidence
 import manager_git_journal
 from scoped_blocking import BlockReasonCode, BlockScope
 
@@ -9188,6 +9189,7 @@ def _owned_rebase_journal_state(worktree: Path, branch: str) -> dict[str, object
         "head": snapshot.head, "branch": snapshot.branch,
         "ref": snapshot.refs.get(f"refs/heads/{branch}"),
         "index": snapshot.index, "dirty": snapshot.dirty,
+        "file_evidence": rebase_file_evidence.capture(worktree, snapshot.head, snapshot.dirty),
         "registration": snapshot.worktrees.get(str(_canonical_path(worktree))),
         "operations": snapshot.operations,
         "metadata": _owned_rebase_metadata(worktree),
