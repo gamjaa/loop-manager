@@ -26,7 +26,7 @@ def verified_rebase_result(
     intent: Mapping[str, Any], observed: Mapping[str, Any], *,
     current_remote_oid: str | None, target_ancestor: bool,
     patches_preserved: bool, reflog_marker: bool,
-    autostash_owned: bool = False,
+    autostash_owned: bool = False, accepted_correction: bool = False,
 ) -> dict[str, Any]:
     """Validate one initial or continued rebase without owning file edits."""
     before = intent["before"]
@@ -72,7 +72,10 @@ def verified_rebase_result(
             and observed["ref"][0] == observed["head"]
             and observed["registration"] is not None
             and f"branch=refs/heads/{branch}" in observed["registration"]
-            and (patches_preserved or expected.get("action") == "skip")
+            and (patches_preserved or expected.get("action") == "skip"
+                 or (expected.get("action") == "continue"
+                     and expected.get("staged_tree_oid")
+                     and accepted_correction))
             and reflog_marker
             and (not observed.get("unmerged") or autostash_owned)
             and (not beginning or files_preserved

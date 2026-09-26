@@ -12917,7 +12917,7 @@ def recover_persisted_agent_worktree(
     state_dir: Path,
     repo: str,
     project: sqlite3.Row,
-) -> None:
+) -> str:
     """Recover a missing Agent worktree only from its proven owned branch."""
 
     worktree = Path(str(project["worktree"] or ""))
@@ -12946,7 +12946,7 @@ def recover_persisted_agent_worktree(
             branch,
             worktree,
         )
-        make_worktree(
+        return make_worktree(
             repo_path,
             worktree,
             branch,
@@ -12961,6 +12961,46 @@ def recover_persisted_agent_worktree(
         raise AgentScopeError(
             f"저장된 Agent worktree 복구 실패: {error}"
         ) from error
+
+
+def _proven_recovered_worktree_baseline(
+    before: GitSnapshot, current: GitSnapshot, state_dir: Path,
+    repo_path: Path, plan_id: str, worktree: Path,
+) -> GitSnapshot:
+    """Account for only this run's journaled lock on a recreated worktree."""
+    key = str(_canonical_path(worktree))
+    old = before.worktrees.get(key)
+    new = current.worktrees.get(key)
+    if (
+        old is None or new is None or before.head != current.head
+        or before.branch != current.branch or before.index != current.index
+        or before.dirty != current.dirty
+        or f"HEAD={before.head}" not in old
+        or f"branch=refs/heads/{before.branch}" not in old
+    ):
+        raise AgentScopeError("복구한 Agent worktree의 기존 파일·HEAD 상태가 다릅니다.")
+    transitions = manager_git_journal.verified_managed_transitions(
+        state_dir, str(_canonical_path(repo_path)), f"plan:{plan_id}",
+    )
+    owned = any(
+        item["intent"]["kind"] == "managed_worktree_create"
+        and item["intent"]["target"] == key
+        and item["intent"]["before"] == {
+            "exists": False, "registration": None, "index": None,
+        }
+        and item["result"]["observed"]["registration"] == {
+            "head": current.head,
+            "branch": f"refs/heads/{current.branch}",
+            "locked": item["intent"]["expected"]["registration"]["locked"],
+        }
+        and set(new) == set(old) | {
+            "locked=" + item["intent"]["expected"]["registration"]["locked"]
+        }
+        for item in transitions
+    )
+    if not owned:
+        raise AgentScopeError("복구한 Agent worktree의 Manager journal 소유권이 없습니다.")
+    return replace(before, worktrees={**before.worktrees, key: new})
 
 
 def _blocked_agent_local_baseline(
@@ -13062,12 +13102,26 @@ def validate_persisted_agent_scope(
         allow_common_plans = _published_plan_allows_common_plans(
             repo_path, active_plan
         )
+    recovered_worktree = False
     if not saved_worktree.is_dir():
-        recover_persisted_agent_worktree(
+        recovered_worktree = recover_persisted_agent_worktree(
             connection, repo_path, state_dir, repo, project
-        )
+        ) == "recovered"
 
     current = capture_git_snapshot(saved_worktree)
+    if recovered_worktree:
+        plan_id = _plan_id_from_path(selected_plan_path)
+        if not plan_id:
+            raise AgentScopeError("복구한 Agent worktree의 ExecPlan identity가 없습니다.")
+        previous_registration = before.worktrees.get(
+            str(_canonical_path(saved_worktree))
+        )
+        before = _proven_recovered_worktree_baseline(
+            before, current, state_dir, repo_path, plan_id, saved_worktree,
+        )
+        recovered_baseline = before
+    else:
+        recovered_baseline = None
     proven_cleanups = _proven_merged_cleanup_paths(
         connection, repo, before, current,
     )
@@ -13123,6 +13177,30 @@ def validate_persisted_agent_scope(
             raise AgentScopeError(
                 f"저장된 BLOCKED Agent 결과 snapshot이 유효하지 않습니다: {error}"
             ) from error
+    recovered_result_baseline = None
+    if recovered_worktree and result is not None:
+        key = str(_canonical_path(saved_worktree))
+        if result.worktrees.get(key) != previous_registration:
+            raise AgentScopeError(
+                "복구한 Agent worktree의 저장된 결과 등록 상태가 다릅니다."
+            )
+        result = replace(
+            result, worktrees={**result.worktrees, key: current.worktrees[key]},
+        )
+        recovered_result_baseline = result
+    recovered_manager_checkpoint = None
+    if recovered_worktree and checkpoint is not None:
+        key = str(_canonical_path(saved_worktree))
+        if checkpoint.snapshot.worktrees.get(key) != previous_registration:
+            raise AgentScopeError(
+                "복구한 Agent worktree의 Manager checkpoint 등록 상태가 다릅니다."
+            )
+        checkpoint = replace(checkpoint, snapshot=replace(
+            checkpoint.snapshot,
+            worktrees={**checkpoint.snapshot.worktrees,
+                       key: current.worktrees[key]},
+        ))
+        recovered_manager_checkpoint = checkpoint
 
     before = _normalize_legacy_ignored_snapshot(saved_worktree, before, current)
     if result is not None:
@@ -13228,6 +13306,17 @@ def validate_persisted_agent_scope(
                     f"중단된 Manager Git 작업 후 Agent scope 검증 실패: {error}"
                 ) from error
             raise
+    if recovered_baseline is not None:
+        recovered_values = {"agent_snapshot": recovered_baseline.serialize()}
+        if recovered_result_baseline is not None:
+            recovered_values["agent_result_snapshot"] = (
+                recovered_result_baseline.serialize()
+            )
+        if recovered_manager_checkpoint is not None:
+            recovered_values["agent_manager_snapshot"] = (
+                recovered_manager_checkpoint.serialize()
+            )
+        update_project(connection, repo, **recovered_values)
     if decision.reconciled_before is not None and decision.reconciled_before != before:
         update_project(
             connection, repo,

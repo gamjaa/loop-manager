@@ -99,6 +99,23 @@ class CheckpointAssessmentTests(unittest.TestCase):
             Path('/repo'), 'old-head', 'new-head', 'new-base', changed,
         ))
 
+    def test_rebase_owner_accepts_only_exact_empty_patch_fast_forward(self):
+        def git(_repo, *args, **_kwargs):
+            if args[:2] == ('merge-base', '--is-ancestor'):
+                return SimpleNamespace(stdout='', returncode=0)
+            if args[0] == 'merge-base':
+                return SimpleNamespace(stdout='old-head\n', returncode=0)
+            if args[0] == 'rev-list':
+                return SimpleNamespace(stdout='0\n', returncode=0)
+            self.fail('An empty patch series must not invoke range-diff')
+
+        self.assertTrue(checkpoint_ownership.rebase_preserves_commits(
+            Path('/repo'), 'old-head', 'new-base', 'new-base', git,
+        ))
+        self.assertFalse(checkpoint_ownership.rebase_preserves_commits(
+            Path('/repo'), 'old-head', 'unexpected-head', 'new-base', git,
+        ))
+
     def test_clean_checkpoint_proves_preexisting_commit_without_marker(self):
         oid = 'a' * 40
         identity = blocked_checkpoint.checkpoint_identity(

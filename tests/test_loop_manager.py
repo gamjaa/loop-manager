@@ -3877,7 +3877,8 @@ risk: medium
                     (str(repo),),
                 )
                 connection.commit()
-                shutil.rmtree(managed)
+                git_command(repo, "worktree", "remove", "--force", "--force",
+                            str(managed))
                 self.assertFalse(managed.exists())
 
                 unchanged_result = loop_manager.run_project(
@@ -10723,7 +10724,7 @@ class WorkspaceRecoveryTest(unittest.TestCase):
             real_git = loop_manager.git
 
             def interrupt_before_worktree_add(target, *arguments, **kwargs):
-                if arguments[:3] == ("worktree", "add", "-b"):
+                if arguments[:2] == ("worktree", "add") and "-b" in arguments:
                     raise KeyboardInterrupt(
                         "interrupt before ExecPlan worktree creation"
                     )

@@ -917,10 +917,31 @@ class ExecutionHandlers:
             raise manager_git_journal.MutationEvidenceError(
                 'rebase continuation checkpoint가 불완전합니다.'
             )
+        before = self._rebase_journal_state(context)
+        stage_evidence = (current.snapshot or {}).get('stage_evidence')
+        accepted_files = (
+            stage_evidence.get('files')
+            if isinstance(stage_evidence, dict)
+            and (current.snapshot or {}).get('pending') == 'continue'
+            and stage_evidence.get('head') == before['head']
+            and stage_evidence.get('branch') == before['branch']
+            and isinstance(stage_evidence.get('files'), dict)
+            else None
+        )
+        staged_tree_oid = (
+            self.effects.workspace.git(
+                context.worktree, 'write-tree',
+            ).stdout.strip()
+            if accepted_files else None
+        )
+        if staged_tree_oid and self._rebase_journal_state(context) != before:
+            raise manager_git_journal.MutationEvidenceError(
+                'rebase continuation index가 intent 기록 전에 변경됐습니다.'
+            )
         return manager_git_journal.begin_rebase(
             self.state_dir, owner=f'plan:{context.plan.plan_id}',
             repo=str(self.repo_path.resolve()), target=str(context.worktree.resolve()),
-            before=self._rebase_journal_state(context),
+            before=before,
             expected={
                 'branch': context.branch, 'before_head': current.expected_head,
                 'target_base_oid': current.target_base_oid,
@@ -928,6 +949,8 @@ class ExecutionHandlers:
                     self.repo_path, context.branch,
                 ),
                 'action': action.value,
+                'accepted_files': accepted_files,
+                'staged_tree_oid': staged_tree_oid,
                 'agent_session_id': getattr(context, 'worker_session_id', None),
             },
         )
@@ -950,11 +973,18 @@ class ExecutionHandlers:
     def _finish_rebase_journal(self, context, *, allow_equal=False):
         def validate(intent, observed):
             expected = intent['expected']
+            checkpoint = self.effects.checkpoint.get(
+                self.repo, context.plan.plan_id,
+            )
             if (
                 intent['owner'] != f'plan:{context.plan.plan_id}'
                 or expected['branch'] != context.branch
                 or expected.get('agent_session_id')
                 != getattr(context, 'worker_session_id', None)
+                or checkpoint.operation != 'rebase'
+                or checkpoint.expected_head != expected['before_head']
+                or checkpoint.target_base_oid != expected['target_base_oid']
+                or checkpoint.observed_remote_oid not in (None, expected['remote_oid'])
             ):
                 raise manager_git_journal.MutationEvidenceError(
                     'Manager rebase 계획 또는 Agent session identity가 다릅니다.'
@@ -971,8 +1001,45 @@ class ExecutionHandlers:
                     self.repo_path, expected['before_head'], observed['head'],
                     expected['target_base_oid'], self.effects.workspace.git,
                 )
+                accepted_files = expected.get('accepted_files')
+                staged_tree = expected.get('staged_tree_oid')
+                first_commit = None
+                if expected.get('action') == 'continue' and staged_tree:
+                    ancestry = self.effects.workspace.git(
+                        self.repo_path, 'merge-base', '--is-ancestor',
+                        intent['before']['head'], observed['head'], check=False,
+                    )
+                    if ancestry.returncode == 0:
+                        commits = self.effects.workspace.git(
+                            self.repo_path, 'rev-list', '--reverse',
+                            f"{intent['before']['head']}..{observed['head']}",
+                        ).stdout.splitlines()
+                        if commits:
+                            first_commit = commits[0]
+                replayed_tree = (
+                    self.effects.workspace.git(
+                        self.repo_path, 'rev-parse', f'{first_commit}^{{tree}}',
+                    ).stdout.strip()
+                    if first_commit else None
+                )
+                accepted_correction = (
+                    expected.get('action') == 'continue'
+                    and isinstance(accepted_files, dict)
+                    and bool(accepted_files)
+                    and isinstance(staged_tree, str) and bool(staged_tree)
+                    and staged_tree == replayed_tree
+                    and set(accepted_files) == set(intent['before']['dirty'])
+                    and all(
+                        intent['before']['dirty'][path][1] == signature
+                        and self.effects.agent.path_signature(
+                            context.worktree, path,
+                        ) == signature
+                        for path, signature in accepted_files.items()
+                    )
+                )
             else:
                 marker = patches = False
+                accepted_correction = False
             ancestor = self.effects.workspace.git(
                 context.worktree, 'merge-base', '--is-ancestor',
                 expected['target_base_oid'], observed['head'], check=False,
@@ -984,10 +1051,9 @@ class ExecutionHandlers:
                 ),
                 target_ancestor=ancestor.returncode == 0,
                 patches_preserved=patches, reflog_marker=marker,
+                accepted_correction=accepted_correction,
                 autostash_owned=bool(
-                    (self.effects.checkpoint.get(
-                        self.repo, context.plan.plan_id,
-                    ).snapshot or {}).get('stash_oid')
+                    (checkpoint.snapshot or {}).get('stash_oid')
                 ),
             )
 
@@ -1162,7 +1228,15 @@ class ExecutionHandlers:
                         RecoveryReason.STATUS_FAILED,
                         'rebase completed without expected target ancestry',
                     )
-            self._finish_rebase_journal(context, allow_equal=True)
+            try:
+                self._finish_rebase_journal(context, allow_equal=True)
+            except manager_git_journal.MutationEvidenceError:
+                if self.effects.workspace.branch_has_changes(
+                    context.worktree, self.base,
+                ):
+                    raise
+                # A dropped Worker patch is not journal evidence. Keep the
+                # intent unresolved and let the existing no-change gate block.
             return None
         self._finish_rebase_journal(context, allow_equal=True)
         message = self.effects.contract.REBASE_CONFLICT_PREFIX + output[-8000:]
