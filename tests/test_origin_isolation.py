@@ -7,6 +7,7 @@ import unittest
 from unittest import mock
 
 import loop_manager
+import manager_git_journal
 
 
 def git(repo: Path, *arguments: str) -> str:
@@ -103,6 +104,358 @@ def advance_remote(writer: Path, *, path: str = "tracked.txt", value: str = "two
 
 
 class OriginIsolatedRegistrationAndExecutionTest(unittest.TestCase):
+    def test_project_fetch_recovers_owned_ref_update_after_result_write_crash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _remote, source, writer = remote_fixture(directory)
+            state_dir = Path(directory) / "state"
+            original_oid = git(source, "rev-parse", "origin/main")
+            selected = advance_remote(writer)
+            git(writer, "checkout", "-b", "z-extra")
+            git(writer, "push", "origin", "z-extra")
+            git(writer, "checkout", "main")
+            with mock.patch.object(manager_git_journal, "_finish",
+                                   side_effect=RuntimeError("interrupted")):
+                with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                    loop_manager.remote_base(source, "main", state_dir=state_dir)
+            self.assertEqual(git(source, "rev-parse", "origin/main"), selected)
+            with mock.patch.object(loop_manager, "git", wraps=loop_manager.git) as calls:
+                self.assertEqual(
+                    loop_manager.remote_base(source, "main", state_dir=state_dir), "main",
+                )
+            self.assertEqual(git(source, "rev-parse", "origin/z-extra"), selected)
+            self.assertFalse(any(call.args[1:3] == ("update-ref", "--create-reflog")
+                                 and call.args[5] == "refs/remotes/origin/main"
+                                 for call in calls.call_args_list))
+            self.assertEqual(
+                manager_git_journal.verified_candidates(
+                    state_dir, str(source),
+                    baseline_refs={"refs/remotes/origin/main": original_oid},
+                    baseline_worktrees={},
+                    live_refs={"refs/remotes/origin/main": selected},
+                    live_worktrees={},
+                    marker=lambda intent: (
+                        f"loop-manager-base-fetch:{intent['id']}"
+                        in git(source, "reflog", "show", str(intent["target"]))
+                    ),
+                )["refs"][
+                    "refs/remotes/origin/main"], selected,
+            )
+            self.assertEqual(
+                manager_git_journal.verified_candidates(
+                    state_dir, str(source),
+                    baseline_refs={"refs/remotes/origin/z-extra": None},
+                    baseline_worktrees={},
+                    live_refs={"refs/remotes/origin/z-extra": selected},
+                    live_worktrees={},
+                    marker=lambda intent: (
+                        f"loop-manager-base-fetch:{intent['id']}"
+                        in git(source, "reflog", "show", str(intent["target"]))
+                    ),
+                )["refs"]["refs/remotes/origin/z-extra"], selected,
+            )
+
+    def test_guidance_fetch_resumes_sqlite_and_common_journal_after_git_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _remote, source, writer = remote_fixture(directory)
+            state_dir = Path(directory) / "state"
+            before = loop_manager.capture_git_snapshot(source)
+            selected = advance_remote(writer)
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.MANAGER_BASE_FETCH_SCHEMA)
+            intent_id = loop_manager._record_manager_base_fetch_intent(
+                connection, source, str(source), "G-001", "main", before,
+            )
+            with mock.patch.object(manager_git_journal, "_finish",
+                                   side_effect=RuntimeError("interrupted")):
+                with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                    loop_manager._journaled_manager_base_fetch(
+                        connection, source, state_dir, intent_id, "main", "G-001",
+                    )
+            self.assertEqual(git(source, "rev-parse", "origin/main"), selected)
+            self.assertEqual(
+                loop_manager._record_manager_base_fetch_intent(
+                    connection, source, str(source), "G-001", "main", before,
+                ), intent_id,
+            )
+            loop_manager._journaled_manager_base_fetch(
+                connection, source, state_dir, intent_id, "main", "G-001",
+            )
+            self.assertEqual(connection.execute(
+                "SELECT phase FROM manager_base_fetches WHERE id = ?", (intent_id,),
+            ).fetchone()[0], "complete")
+            connection.close()
+
+    def test_guidance_fetch_rejects_external_round_trip_after_journal_crash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _remote, source, writer = remote_fixture(directory)
+            state = Path(directory) / "state"
+            before = loop_manager.capture_git_snapshot(source)
+            old = git(source, "rev-parse", "origin/main")
+            selected = advance_remote(writer)
+            database = Path(directory) / "guidance.sqlite"
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.MANAGER_BASE_FETCH_SCHEMA)
+            identity = loop_manager._record_manager_base_fetch_intent(
+                connection, source, str(source), "G-001", "main", before)
+            with mock.patch.object(manager_git_journal, "_finish", side_effect=RuntimeError("crash")):
+                with self.assertRaisesRegex(RuntimeError, "crash"):
+                    loop_manager._journaled_manager_base_fetch(
+                        connection, source, state, identity, "main", "G-001")
+            connection.close()
+            git(source, "update-ref", "-m", "external away", "refs/remotes/origin/main", old)
+            git(source, "update-ref", "-m", "external back", "refs/remotes/origin/main", selected)
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            try:
+                with self.assertRaises(manager_git_journal.MutationEvidenceError):
+                    loop_manager._journaled_manager_base_fetch(
+                        connection, source, state, identity, "main", "G-001")
+                self.assertEqual(connection.execute(
+                    "SELECT phase FROM manager_base_fetches WHERE id = ?", (identity,),
+                ).fetchone()[0], "pending")
+                self.assertTrue(list((state / "manager-git-journal").glob("*/active.json")))
+                self.assertEqual(git(source, "rev-parse", "origin/main"), selected)
+            finally:
+                connection.close()
+
+    def test_guidance_fetch_history_requires_uninterrupted_owned_suffix(self):
+        for external in (False, True):
+            with self.subTest(external=external), tempfile.TemporaryDirectory() as directory:
+                _remote, source, writer = remote_fixture(directory)
+                connection = sqlite3.connect(":memory:")
+                connection.row_factory = sqlite3.Row
+                connection.execute(loop_manager.MANAGER_BASE_FETCH_SCHEMA)
+                try:
+                    before = loop_manager.capture_git_snapshot(source)
+                    old = git(source, "rev-parse", "origin/main")
+                    first_sha = advance_remote(writer)
+                    first = loop_manager._record_manager_base_fetch_intent(
+                        connection, source, str(source), "G-001", "main", before)
+                    loop_manager._perform_manager_base_fetch(connection, source, first, "main")
+                    intermediate = loop_manager.capture_git_snapshot(source)
+                    advance_remote(writer, value="third")
+                    second = loop_manager._record_manager_base_fetch_intent(
+                        connection, source, str(source), "G-001", "main", intermediate)
+                    if external:
+                        git(source, "update-ref", "-m", "external away", "refs/remotes/origin/main", old)
+                        git(source, "update-ref", "-m", "external back", "refs/remotes/origin/main", first_sha)
+                    loop_manager._perform_manager_base_fetch(connection, source, second, "main")
+                    loop_manager._finish_manager_base_fetch(connection, source, second)
+                    rows = connection.execute("SELECT * FROM manager_base_fetches ORDER BY id").fetchall()
+                    self.assertEqual(loop_manager._manager_base_fetch_applied(
+                        source, rows[0], rows), not external)
+                    self.assertFalse(loop_manager._manager_base_fetch_applied(source, rows[0]))
+                    self.assertTrue(loop_manager._manager_base_fetch_applied(source, rows[1]))
+                finally:
+                    connection.close()
+
+    def test_runtime_imports_local_module_without_bytecode_and_is_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _remote, source, _writer = remote_fixture(directory)
+            (source / ".gitignore").write_text("__pycache__/\n")
+            (source / "runtime_helper.py").write_text("VALUE = 7\n")
+            (source / "loop_manager.py").write_text(
+                "import runtime_helper\nraise SystemExit(runtime_helper.VALUE)\n")
+            sha = commit_all(source, "Runtime import fixture")
+            state = Path(directory) / "state"
+            with loop_manager.process_lock(state):
+                runtime = loop_manager.prepare_runtime_worktree(
+                    source, state, mutation_id="a" * 32, commit_sha=sha)
+                remove = loop_manager.remove_runtime_worktree
+                def checked_remove(*args):
+                    self.assertFalse((runtime.path / "__pycache__").exists())
+                    self.assertFalse(loop_manager._ignored_worktree_paths(runtime.path))
+                    remove(*args)
+                with mock.patch.object(loop_manager, "remove_runtime_worktree", side_effect=checked_remove) as cleanup:
+                    self.assertEqual(loop_manager.run_runtime_child(
+                        source, state, source / "config.ini", runtime, []), 7)
+                    cleanup.assert_called_once()
+                self.assertFalse(runtime.path.exists())
+                self.assertEqual(loop_manager._runtime_transition_state(source, runtime.path),
+                                 {"exists": False, "registration": None})
+                self.assertFalse(list((state / "manager-git-journal").glob("*/active.json")))
+
+    def test_source_fast_forward_recovers_without_touching_disjoint_local_delta(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _remote, source, writer = remote_fixture(directory)
+            state_dir = Path(directory) / "state"
+            (source / "local.txt").write_text("user\n", encoding="utf-8")
+            (source / "staged.txt").write_text("staged\n", encoding="utf-8")
+            git(source, "add", "staged.txt")
+            selected = advance_remote(writer)
+            loop_manager._recorded_base_fetch(source, state_dir, "main", owner="project")
+            with mock.patch.object(manager_git_journal, "_finish",
+                                   side_effect=RuntimeError("interrupted")):
+                result = loop_manager.synchronize_base_worktree(
+                    source, "main", remote_sha=selected, state_dir=state_dir,
+                )
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(git(source, "rev-parse", "HEAD"), selected)
+            self.assertEqual((source / "local.txt").read_text(), "user\n")
+            self.assertEqual(git(source, "diff", "--cached", "--name-only"), "staged.txt")
+            result = loop_manager.synchronize_base_worktree(
+                source, "main", remote_sha=selected, state_dir=state_dir,
+            )
+            self.assertEqual(result.status, "equal")
+            self.assertEqual((source / "local.txt").read_text(), "user\n")
+            self.assertEqual(git(source, "diff", "--cached", "--name-only"), "staged.txt")
+
+    def test_runtime_create_recovers_owned_registration_after_result_write_crash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _remote, source, writer = remote_fixture(directory)
+            state_dir = Path(directory) / "state"
+            selected = advance_remote(writer)
+            with mock.patch("loop_manager.github_repository", return_value="owner/repo"):
+                with loop_manager.process_lock(state_dir):
+                    loop_manager._recorded_base_fetch(
+                        source, state_dir, "main", owner="bootstrap",
+                    )
+                    with mock.patch.object(manager_git_journal, "_finish",
+                                           side_effect=RuntimeError("interrupted")):
+                        with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                            loop_manager.prepare_runtime_worktree(
+                                source, state_dir, mutation_id="a" * 32,
+                                commit_sha=selected,
+                            )
+                    recovered = loop_manager.prepare_runtime_worktree(
+                        source, state_dir, mutation_id="b" * 32,
+                        commit_sha=selected,
+                    )
+                    loop_manager.validate_runtime_worktree(
+                        source, state_dir, recovered.path, selected,
+                    )
+            self.assertTrue(recovered.path.is_dir())
+
+    def test_interrupted_fetch_rejects_external_ref_round_trip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _remote, source, writer = remote_fixture(directory)
+            state = Path(directory) / "state"
+            old = git(source, "rev-parse", "HEAD")
+            selected = advance_remote(writer)
+            with mock.patch.object(manager_git_journal, "_finish", side_effect=RuntimeError("crash")):
+                with self.assertRaises(RuntimeError):
+                    loop_manager._recorded_base_fetch(source, state, "main", owner="project")
+            git(source, "update-ref", "-m", "external away", "refs/remotes/origin/main", old)
+            git(source, "update-ref", "-m", "external back", "refs/remotes/origin/main", selected)
+            with self.assertRaises(manager_git_journal.MutationEvidenceError):
+                loop_manager._recorded_base_fetch(source, state, "main", owner="project")
+            self.assertTrue(list((state / "manager-git-journal").glob("*/active.json")))
+
+    def test_interrupted_source_rejects_ref_round_trip_and_index_changes(self):
+        for mutation in ("ref", "head", "blob", "flag"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                _remote, source, writer = remote_fixture(directory)
+                state = Path(directory) / "state"
+                old = git(source, "rev-parse", "HEAD")
+                (source / "staged.txt").write_text("first")
+                git(source, "add", "staged.txt")
+                (source / "staged.txt").write_text("working")
+                selected = advance_remote(writer)
+                loop_manager._recorded_base_fetch(source, state, "main", owner="project")
+                with mock.patch.object(manager_git_journal, "_finish", side_effect=RuntimeError("crash")):
+                    self.assertEqual(loop_manager.synchronize_base_worktree(
+                        source, "main", state_dir=state).status, "failed")
+                if mutation == "ref":
+                    git(source, "update-ref", "-m", "external away", "refs/heads/main", old)
+                    git(source, "update-ref", "-m", "external back", "refs/heads/main", selected)
+                elif mutation == "head":
+                    git(source, "checkout", "--detach", selected)
+                    git(source, "checkout", "main")
+                elif mutation == "blob":
+                    (source / "staged.txt").write_text("second")
+                    git(source, "add", "staged.txt")
+                    (source / "staged.txt").write_text("working")
+                else:
+                    git(source, "update-index", "--assume-unchanged", "staged.txt")
+                observed = loop_manager._source_transition_state(source)
+                self.assertEqual(loop_manager.synchronize_base_worktree(
+                    source, "main", state_dir=state).status, "failed")
+                self.assertEqual(loop_manager._source_transition_state(source), observed)
+                self.assertTrue(list((state / "manager-git-journal").glob("*/active.json")))
+
+    def test_runtime_removal_recovers_receipt_and_blocks_unproven_absence(self):
+        for receipt in (True, False):
+            with self.subTest(receipt=receipt), tempfile.TemporaryDirectory() as directory:
+                _remote, source, _writer = remote_fixture(directory)
+                state = Path(directory) / "state"
+                sha = git(source, "rev-parse", "HEAD")
+                runtime = loop_manager.prepare_runtime_worktree(
+                    source, state, mutation_id="a" * 32, commit_sha=sha)
+                with mock.patch.object(manager_git_journal, "_finish", side_effect=RuntimeError("crash")):
+                    with self.assertRaisesRegex(RuntimeError, "crash"):
+                        loop_manager.remove_runtime_worktree(source, state, runtime)
+                self.assertFalse(runtime.path.exists())
+                if not receipt:
+                    for path in (state / "runtime-removals").glob("*.json"):
+                        path.unlink()
+                    with self.assertRaises(manager_git_journal.MutationEvidenceError):
+                        loop_manager.prepare_runtime_worktree(
+                            source, state, mutation_id="b" * 32, commit_sha=sha)
+                else:
+                    with mock.patch.object(loop_manager, "git", wraps=loop_manager.git) as calls:
+                        loop_manager.remove_runtime_worktree(source, state, runtime)
+                    self.assertFalse(any(call.args[1:3] == ("worktree", "remove")
+                                         for call in calls.call_args_list))
+                    self.assertFalse(list((state / "manager-git-journal").glob("*/active.json")))
+
+    def test_runtime_child_cleanup_preserves_dirty_and_ignored_files(self):
+        for dirty in (False, True):
+            with self.subTest(dirty=dirty), tempfile.TemporaryDirectory() as directory:
+                _remote, source, _writer = remote_fixture(directory)
+                state = Path(directory) / "state"
+                runtime = loop_manager.prepare_runtime_worktree(
+                    source, state, mutation_id="a" * 32,
+                    commit_sha=git(source, "rev-parse", "HEAD"))
+                if dirty:
+                    (runtime.path / "tracked.txt").write_text("user")
+                else:
+                    (runtime.path / "ignored").mkdir()
+                    (runtime.path / "ignored/user.txt").write_text("user")
+                with self.assertRaises(loop_manager.WorkspaceOwnershipError):
+                    loop_manager.remove_runtime_worktree(source, state, runtime)
+                self.assertTrue(runtime.path.exists())
+
+    def test_runtime_child_removes_only_after_exit_and_preserves_exit_code(self):
+        runtime = loop_manager.RuntimeWorktree(Path("/runtime"), "a" * 40, "b" * 32)
+        events = []
+        def child(*args, **kwargs):
+            events.append("exit")
+            return subprocess.CompletedProcess(args, 7)
+        def cleanup(*args):
+            events.append("remove")
+        with mock.patch.object(loop_manager.subprocess, "run", side_effect=child), mock.patch.object(
+            loop_manager, "remove_runtime_worktree", side_effect=cleanup,
+        ) as remove:
+            result = loop_manager.run_runtime_child(
+                Path("/source"), Path("/state"), Path("/config"), runtime, [],
+            )
+        self.assertEqual(result, 7)
+        self.assertEqual(events, ["exit", "remove"])
+        remove.assert_called_once_with(Path("/source"), Path("/state"), runtime)
+
+    def test_runtime_removal_interrupted_after_unlock_blocks_recreation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _remote, source, _writer = remote_fixture(directory)
+            state = Path(directory) / "state"
+            sha = git(source, "rev-parse", "HEAD")
+            runtime = loop_manager.prepare_runtime_worktree(
+                source, state, mutation_id="a" * 32, commit_sha=sha)
+            original_git = loop_manager.git
+            def interrupted(repo, *args, **kwargs):
+                result = original_git(repo, *args, **kwargs)
+                if args[:2] == ("worktree", "unlock"):
+                    raise RuntimeError("crash after unlock")
+                return result
+            with mock.patch.object(loop_manager, "git", side_effect=interrupted):
+                with self.assertRaisesRegex(RuntimeError, "crash after unlock"):
+                    loop_manager.remove_runtime_worktree(source, state, runtime)
+            with self.assertRaises(manager_git_journal.MutationEvidenceError):
+                loop_manager.prepare_runtime_worktree(
+                    source, state, mutation_id="b" * 32, commit_sha=sha)
+            self.assertTrue(runtime.path.exists())
+
     def _persist_planner_scope(self, connection, repo: Path):
         before = loop_manager.capture_git_snapshot(repo)
         connection.execute(loop_manager.SCHEMA)
@@ -1334,9 +1687,10 @@ class OriginIsolatedRegistrationAndExecutionTest(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, "fast-forward 실패"):
                         loop_manager.prepare_bootstrap_runtime(source, state_dir, "a" * 32)
             self.assertFalse((state_dir / "runtimes").exists())
+            advance_remote(writer, value="three\n")
 
             def failing_fetch(repo, *arguments, **kwargs):
-                if arguments[:2] == ("fetch", "origin"):
+                if arguments[:2] == ("fetch", "--no-tags"):
                     raise RuntimeError("fetch refused")
                 return real_git(repo, *arguments, **kwargs)
 
@@ -1348,7 +1702,7 @@ class OriginIsolatedRegistrationAndExecutionTest(unittest.TestCase):
                         loop_manager.prepare_bootstrap_runtime(source, state_dir, "c" * 32)
             self.assertFalse((state_dir / "runtimes").exists())
 
-            def raced_sync(repo, base, *, remote_sha):
+            def raced_sync(repo, base, *, remote_sha, state_dir, owner):
                 git(source, "checkout", "-b", "topic")
                 return loop_manager.BaseWorktreeSyncResult("equal", "raced", remote_sha)
 

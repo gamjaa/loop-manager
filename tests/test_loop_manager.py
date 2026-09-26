@@ -5036,18 +5036,18 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
 
     def test_remote_checkpoint_revision_requires_latest_base_ancestry(self):
         responses = [
-            SimpleNamespace(stdout='base\n'),
             SimpleNamespace(stdout='head\n'),
             SimpleNamespace(returncode=1),
         ]
-        with mock.patch.object(loop_manager, 'git', side_effect=[
-            SimpleNamespace(), *responses,
-        ]) as git:
+        with mock.patch.object(loop_manager, '_recorded_base_fetch', return_value='base') as fetched, \
+             mock.patch.object(loop_manager, 'git', side_effect=responses) as git:
             revision = loop_manager._remote_checkpoint_review_revision(
-                Path('/repo'), Path('/worktree'), 'main',
+                Path('/repo'), Path('/worktree'), 'main', Path('/state'),
             )
         self.assertIsNone(revision)
-        self.assertEqual(git.call_args_list[0].args, (Path('/repo'), 'fetch', 'origin'))
+        fetched.assert_called_once_with(
+            Path('/repo'), Path('/state'), 'main', owner='project',
+        )
         self.assertEqual(
             git.call_args_list[-1].args,
             (Path('/repo'), 'merge-base', '--is-ancestor', 'base', 'head'),
@@ -7875,6 +7875,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "document_publication.py",
                 "checkpoint_ownership.py",
                 "loop_manager.py",
+                "manager_git_journal.py",
                 "execution_checkpoint.py",
                 "execution_checkpoint_state.py",
                 "execution_runtime.py",
@@ -13962,6 +13963,7 @@ class LatestBasePublicationTest(unittest.TestCase):
             mock.patch('loop_manager.pr_for_branch', return_value=None),
             mock.patch('loop_manager.update_project') as update,
             mock.patch('loop_manager.git', side_effect=git),
+            mock.patch('loop_manager._recorded_base_fetch', return_value=new) as fetched,
         ):
             result = loop_manager.push_managed_publication_branch(
                 object(), Path('/repo'), Path('/state'), 'repo',
@@ -13969,6 +13971,9 @@ class LatestBasePublicationTest(unittest.TestCase):
             )
 
         self.assertEqual(result, new)
+        fetched.assert_called_once_with(
+            Path('/repo'), Path('/state'), branch, owner='project',
+        )
         self.assertEqual(len(pushes), 1)
         self.assertIn(f'--force-with-lease=refs/heads/{branch}:{old}', pushes[0])
         update.assert_called_once_with(mock.ANY, 'repo', publication_remote_oid=new)
@@ -14408,7 +14413,7 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             observed = []
             catalog_shas = []
 
-            def synchronize(path, base, *, remote_sha=None):
+            def synchronize(path, base, *, remote_sha=None, state_dir=None):
                 plan = connection.execute(
                     "SELECT status FROM exec_plans WHERE repo = ? AND plan_id = 'G-026'",
                     (str(repo),),
@@ -14422,7 +14427,9 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                     (plan["status"], remote_sha, worktree.exists(),
                      completion["last_completed_plan_id"], connection.in_transaction)
                 )
-                return original_sync(path, base, remote_sha=remote_sha)
+                return original_sync(
+                    path, base, remote_sha=remote_sha, state_dir=state_dir,
+                )
 
             def reconcile_catalog(*args, **kwargs):
                 catalog_shas.append(kwargs.get("remote_sha"))
@@ -14463,9 +14470,11 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             source_shas = []
             catalog_shas = []
 
-            def synchronize(path, base, *, remote_sha=None):
+            def synchronize(path, base, *, remote_sha=None, state_dir=None):
                 source_shas.append(remote_sha)
-                return original_sync(path, base, remote_sha=remote_sha)
+                return original_sync(
+                    path, base, remote_sha=remote_sha, state_dir=state_dir,
+                )
 
             def reconcile_catalog(*args, **kwargs):
                 if kwargs.get("remote_sha") is not None:
@@ -14505,13 +14514,15 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             original_sync = loop_manager.ensure_safe_base_worktree
             observed = []
 
-            def synchronize(path, base, *, remote_sha=None):
+            def synchronize(path, base, *, remote_sha=None, state_dir=None):
                 status = connection.execute(
                     "SELECT status FROM exec_plans WHERE repo = ? AND plan_id = 'G-026'",
                     (str(repo),),
                 ).fetchone()["status"]
                 observed.append((status, remote_sha))
-                return original_sync(path, base, remote_sha=remote_sha)
+                return original_sync(
+                    path, base, remote_sha=remote_sha, state_dir=state_dir,
+                )
 
             closed = self._pull_request(branch, url, head, "UNKNOWN", state="CLOSED")
             with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
@@ -14581,7 +14592,7 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             original_sync = loop_manager.ensure_safe_base_worktree
             observed = []
 
-            def synchronize(path, base, *, remote_sha=None):
+            def synchronize(path, base, *, remote_sha=None, state_dir=None):
                 statuses = connection.execute(
                     "SELECT plan_id, status FROM exec_plans WHERE repo = ? ORDER BY plan_id",
                     (str(repo),),
@@ -14591,7 +14602,9 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                 ).fetchone()
                 observed.append((tuple(tuple(item) for item in statuses),
                                  project["phase"], remote_sha, second_worktree.exists()))
-                return original_sync(path, base, remote_sha=remote_sha)
+                return original_sync(
+                    path, base, remote_sha=remote_sha, state_dir=state_dir,
+                )
 
             with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
                 "loop_manager.pr_for_branch", side_effect=lambda _repo, name, _url: responses[name]
@@ -14623,12 +14636,12 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             git_command(worktree, "push", "origin", "HEAD:main")
             merged = self._pull_request(branch, url, head, "UNKNOWN", state="MERGED")
             merged["mergedAt"] = "2026-09-24T00:00:00Z"
-            original_git = loop_manager.git
+            original_fetch = loop_manager._recorded_base_fetch
             failed = False
 
             def fail_after_transition(path, *arguments, **kwargs):
                 nonlocal failed
-                if arguments[:2] == ("fetch", "origin") and not failed:
+                if not failed:
                     status = connection.execute(
                         "SELECT status FROM exec_plans WHERE repo = ? AND plan_id = 'G-026'",
                         (str(repo),),
@@ -14636,11 +14649,11 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                     if status == "MERGED":
                         failed = True
                         raise RuntimeError("fetch unavailable")
-                return original_git(path, *arguments, **kwargs)
+                return original_fetch(path, *arguments, **kwargs)
 
             with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
                 "loop_manager.pr_for_branch", return_value=merged
-            ), mock.patch("loop_manager.git", side_effect=fail_after_transition), mock.patch(
+            ), mock.patch("loop_manager._recorded_base_fetch", side_effect=fail_after_transition), mock.patch(
                 "loop_manager.dispatch_execplan_archive_housekeeping"
             ):
                 with self.assertRaisesRegex(RuntimeError, "fetch unavailable"):
@@ -16294,6 +16307,7 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                 ))
                 source_before = self._source_checkout_snapshot(repo)
                 original_command = loop_manager.command
+                original_fetch = loop_manager._recorded_base_fetch
                 injected = False
                 rebases = []
                 pushes = []
@@ -16304,12 +16318,10 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                     is_query = arguments[:3] == ["gh", "pr", "view"]
                     matches = {
                         "github": is_query,
-                        "fetch": operation == "fetch" and
-                            f"+refs/heads/{branch}:refs/remotes/origin/{branch}" in arguments,
                         "rebase": operation == "rebase",
                         "push": operation == "push",
                     }
-                    if not injected and matches[stage]:
+                    if not injected and matches.get(stage, False):
                         injected = True
                         if stage == "github":
                             raise RuntimeError("GitHub HTTP 503 Service Unavailable")
@@ -16330,8 +16342,17 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                         pushes.append(arguments)
                     return result
 
+                def interrupted_fetch(*args, **kwargs):
+                    nonlocal injected
+                    if stage == "fetch" and not injected:
+                        injected = True
+                        raise RuntimeError("fatal: unable to access origin: Connection timed out")
+                    return original_fetch(*args, **kwargs)
+
                 with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
                     "loop_manager.command", side_effect=interrupted_command
+                ), mock.patch(
+                    "loop_manager._recorded_base_fetch", side_effect=interrupted_fetch
                 ), mock.patch("loop_manager.verify", return_value=(True, "verify: PASS")), mock.patch(
                     "loop_manager.run_codex",
                     return_value=loop_manager.CodexResult(
