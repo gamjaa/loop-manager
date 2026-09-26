@@ -14408,7 +14408,7 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             observed = []
             catalog_shas = []
 
-            def synchronize(path, base, *, remote_sha=None):
+            def synchronize(path, base, *, remote_sha=None, state_dir=None):
                 plan = connection.execute(
                     "SELECT status FROM exec_plans WHERE repo = ? AND plan_id = 'G-026'",
                     (str(repo),),
@@ -14422,7 +14422,9 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                     (plan["status"], remote_sha, worktree.exists(),
                      completion["last_completed_plan_id"], connection.in_transaction)
                 )
-                return original_sync(path, base, remote_sha=remote_sha)
+                return original_sync(
+                    path, base, remote_sha=remote_sha, state_dir=state_dir,
+                )
 
             def reconcile_catalog(*args, **kwargs):
                 catalog_shas.append(kwargs.get("remote_sha"))
@@ -14623,12 +14625,12 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             git_command(worktree, "push", "origin", "HEAD:main")
             merged = self._pull_request(branch, url, head, "UNKNOWN", state="MERGED")
             merged["mergedAt"] = "2026-09-24T00:00:00Z"
-            original_git = loop_manager.git
+            original_fetch = loop_manager._recorded_base_fetch
             failed = False
 
             def fail_after_transition(path, *arguments, **kwargs):
                 nonlocal failed
-                if arguments[:2] == ("fetch", "origin") and not failed:
+                if not failed:
                     status = connection.execute(
                         "SELECT status FROM exec_plans WHERE repo = ? AND plan_id = 'G-026'",
                         (str(repo),),
@@ -14636,11 +14638,11 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                     if status == "MERGED":
                         failed = True
                         raise RuntimeError("fetch unavailable")
-                return original_git(path, *arguments, **kwargs)
+                return original_fetch(path, *arguments, **kwargs)
 
             with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
                 "loop_manager.pr_for_branch", return_value=merged
-            ), mock.patch("loop_manager.git", side_effect=fail_after_transition), mock.patch(
+            ), mock.patch("loop_manager._recorded_base_fetch", side_effect=fail_after_transition), mock.patch(
                 "loop_manager.dispatch_execplan_archive_housekeeping"
             ):
                 with self.assertRaisesRegex(RuntimeError, "fetch unavailable"):

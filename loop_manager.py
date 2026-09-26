@@ -128,6 +128,7 @@ import maintenance_state
 import document_publication
 import scoped_blocking
 import agent_scope_decision
+import manager_git_journal
 from scoped_blocking import BlockReasonCode, BlockScope
 
 
@@ -935,12 +936,25 @@ def _write_runtime_intent(
 ) -> None:
     path = _runtime_intent_path(state_dir, mutation_id)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        directory = os.open(state_dir, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     payload = {
         **_runtime_intent_fields(source, runtime, sha),
         "created": created,
         "lock_reason": lock_reason,
     }
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        if _read_runtime_intent(state_dir, mutation_id, source, runtime, sha) == (
+            created, lock_reason,
+        ):
+            return
+        raise RuntimeError("runtime mutation intent가 기존 기록과 다릅니다.")
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, sort_keys=True)
         handle.flush()
@@ -1073,6 +1087,38 @@ def _runtime_catalog_record(source: Path, runtime: Path) -> dict[str, str | bool
     raise WorkspaceOwnershipError(f"runtime Git worktree 등록이 없습니다: {runtime}")
 
 
+def _runtime_transition_state(source: Path, runtime: Path) -> dict[str, object]:
+    expected = _canonical_path(runtime)
+    record = next((item for item in _worktree_catalog(source)
+                   if _canonical_path(Path(str(item.get("worktree", "")))) == expected),
+                  None)
+    return {
+        "exists": runtime.exists() or runtime.is_symlink(),
+        "registration": (
+            {"head": record.get("HEAD"), "detached": bool(record.get("detached")),
+             "locked": record.get("locked")}
+            if record is not None else None
+        ),
+    }
+
+
+def _runtime_transition_marker(
+    state_dir: Path, source: Path, runtime: Path, sha: str,
+    intent: Mapping[str, object],
+) -> bool:
+    expected = intent["expected"]
+    lock_reason = expected["registration"]["locked"]
+    if not isinstance(lock_reason, str) or not lock_reason.startswith("loop-manager-runtime:"):
+        return False
+    mutation_id = lock_reason.removeprefix("loop-manager-runtime:")
+    try:
+        return _read_runtime_intent(
+            state_dir, mutation_id, source, runtime, sha,
+        ) == (True, lock_reason)
+    except RuntimeError:
+        return False
+
+
 def _validate_runtime_lock_origin(
     state_dir: Path, source: Path, runtime: Path, sha: str, lock_reason: object,
 ) -> None:
@@ -1150,6 +1196,14 @@ def prepare_runtime_worktree(
         raise WorkspaceOwnershipError(
             f"runtime 경로가 source checkout 내부에 있습니다: {runtime}"
         )
+    if mutation_id is not None:
+        manager_git_journal.recover_active(
+            state_dir, repo=str(source), kind="runtime_create", target=str(runtime),
+            observe=lambda: _runtime_transition_state(source, runtime),
+            marker=lambda intent: _runtime_transition_marker(
+                state_dir, source, runtime, commit_sha, intent,
+            ),
+        )
     if runtime.exists() or runtime.is_symlink():
         if not runtime.is_dir():
             raise WorkspaceOwnershipError(
@@ -1193,12 +1247,33 @@ def prepare_runtime_worktree(
         )
     runtime.parent.mkdir(parents=True, exist_ok=True)
     if mutation_id is not None:
-        _write_runtime_intent(
-            state_dir, mutation_id, source, runtime, commit_sha,
-            created=True, lock_reason=f"loop-manager-runtime:{mutation_id}",
+        lock_reason = f"loop-manager-runtime:{mutation_id}"
+        before_state = _runtime_transition_state(source, runtime)
+        if before_state != {"exists": False, "registration": None}:
+            raise WorkspaceOwnershipError("runtime 생성 직전 worktree 상태가 변경됐습니다.")
+        expected_state = {
+            "exists": True,
+            "registration": {"head": commit_sha, "detached": True,
+                             "locked": lock_reason},
+        }
+
+        def apply(_token: str) -> None:
+            _write_runtime_intent(
+                state_dir, mutation_id, source, runtime, commit_sha,
+                created=True, lock_reason=lock_reason,
+            )
+            git(source, "worktree", "add", "--detach", "--lock",
+                f"--reason={lock_reason}", str(runtime), commit_sha)
+            validate_runtime_worktree(source, state_dir, runtime, commit_sha)
+
+        manager_git_journal.execute(
+            state_dir, owner="bootstrap", kind="runtime_create",
+            repo=str(source), target=str(runtime), before=before_state,
+            expected=expected_state, observe=lambda: _runtime_transition_state(source, runtime),
+            apply=apply, marker=lambda intent: _runtime_transition_marker(
+                state_dir, source, runtime, commit_sha, intent,
+            ),
         )
-        git(source, "worktree", "add", "--detach", "--lock",
-            f"--reason=loop-manager-runtime:{mutation_id}", str(runtime), commit_sha)
     else:
         git(source, "worktree", "add", "--detach", str(runtime), commit_sha)
     validate_runtime_worktree(source, state_dir, runtime, commit_sha)
@@ -1233,6 +1308,56 @@ def bootstrap_base_branch(source: Path, state_dir: Path, origin: str) -> str:
     return str(base)
 
 
+def _tracking_ref_oid(repo: Path, refname: str) -> str | None:
+    result = git(repo, "rev-parse", "--verify", f"{refname}^{{commit}}", check=False)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _recorded_base_fetch(
+    repo: Path, state_dir: Path, base: str, *, owner: str,
+) -> str:
+    """Fetch one base object and move its tracking ref with an owned CAS."""
+    refname = f"refs/remotes/origin/{base}"
+    remote_ref = f"refs/heads/{base}"
+    remote = git(repo, "ls-remote", "--heads", "origin", remote_ref, check=False)
+    rows = [line.split() for line in remote.stdout.splitlines() if line.strip()]
+    if remote.returncode or len(rows) != 1 or rows[0][1:] != [remote_ref]:
+        raise RuntimeError(f"origin/{base}의 원격 OID를 확정할 수 없습니다.")
+    selected = rows[0][0]
+    if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", selected) is None:
+        raise RuntimeError(f"origin/{base}의 원격 OID가 유효하지 않습니다.")
+    before = {"oid": _tracking_ref_oid(repo, refname)}
+
+    def apply(token: str) -> None:
+        git(repo, "fetch", "--no-tags", "--refmap=", "origin", remote_ref)
+        fetched = git(repo, "rev-parse", "--verify", "FETCH_HEAD^{commit}").stdout.strip()
+        if fetched != selected:
+            raise RuntimeError(f"origin/{base}가 fetch 중 변경됐습니다.")
+        git(repo, "update-ref", "--create-reflog", "-m",
+            f"loop-manager-base-fetch:{token}", refname, selected,
+            before["oid"] or "0" * len(selected))
+
+    def marker(intent: Mapping[str, object]) -> bool:
+        token = intent["id"]
+        result = git(repo, "reflog", "show", "--format=%H%x00%gs", refname,
+                     check=False)
+        return (
+            result.returncode == 0
+            and f"{intent['expected']['oid']}\x00loop-manager-base-fetch:{token}"
+            in result.stdout.splitlines()
+        )
+
+    manager_git_journal.execute(
+        state_dir, owner=owner, kind=("bootstrap_fetch" if owner == "bootstrap"
+                                      else "project_fetch"),
+        repo=str(_canonical_path(repo)), target=refname,
+        before=before, expected={"oid": selected},
+        observe=lambda: {"oid": _tracking_ref_oid(repo, refname)},
+        apply=apply, marker=marker,
+    )
+    return selected
+
+
 def fetch_bootstrap_revision(source: Path, state_dir: Path) -> tuple[str, str]:
     """Resolve the registered base and fetch that branch under the process lock."""
 
@@ -1242,10 +1367,7 @@ def fetch_bootstrap_revision(source: Path, state_dir: Path) -> tuple[str, str]:
         raise RuntimeError(f"Loop Manager source 저장소 루트가 아닙니다: {source}")
     origin = github_repository(git(source, "remote", "get-url", "origin").stdout)
     base = bootstrap_base_branch(source, state_dir, origin)
-    git(source, "fetch", "origin", f"+refs/heads/{base}:refs/remotes/origin/{base}")
-    sha = git(
-        source, "rev-parse", "--verify", f"refs/remotes/origin/{base}^{{commit}}"
-    ).stdout.strip()
+    sha = _recorded_base_fetch(source, state_dir, base, owner="bootstrap")
     return base, sha
 
 
@@ -1274,7 +1396,9 @@ def prepare_bootstrap_runtime(
     """Refresh an old source and hand control to the next external invocation."""
 
     base, sha = fetch_bootstrap_revision(source, state_dir)
-    result = synchronize_base_worktree(source, base, remote_sha=sha)
+    result = synchronize_base_worktree(
+        source, base, remote_sha=sha, state_dir=state_dir, owner="bootstrap",
+    )
     if result.status == "updated":
         operation_log(f"bootstrap source 갱신 완료: origin/{base} {sha}; 다음 실행에 인계")
         return BootstrapRefreshHandoff(base, sha)
@@ -1773,7 +1897,10 @@ def is_git_lock_failure(output: str) -> bool:
     ) and ("lock" in normalized or ".lock" in normalized)
 
 
-def git(repo: Path, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+def git(
+    repo: Path, *arguments: str, check: bool = True,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     command_index = 0
     while command_index < len(arguments) and arguments[command_index] == "-c":
         command_index += 2
@@ -1799,7 +1926,10 @@ def git(repo: Path, *arguments: str, check: bool = True) -> subprocess.Completed
             return subprocess.CompletedProcess(
                 ["git", "-C", str(repo), *arguments], 1, overlap_error
             )
-    result = command(["git", "-C", str(repo), *arguments], check=False)
+    result = command(
+        ["git", "-C", str(repo), *arguments], check=False,
+        **({"env": env} if env is not None else {}),
+    )
     if check and result.returncode:
         output = result.stdout[-6000:].strip()
         message = f"명령 실패 (git -C {repo}):\n{output}"
@@ -5998,8 +6128,11 @@ def validate_repository(
     return root
 
 
-def remote_base(repo: Path, requested: str | None) -> str:
-    git(repo, "fetch", "origin")
+def remote_base(
+    repo: Path, requested: str | None, *, state_dir: Path | None = None,
+) -> str:
+    if state_dir is None:
+        git(repo, "fetch", "origin")
     if requested:
         base = requested
     else:
@@ -6010,6 +6143,18 @@ def remote_base(repo: Path, requested: str | None) -> str:
             "refs/remotes/origin/HEAD",
         ).stdout.strip()
         base = reference.removeprefix("origin/")
+    if state_dir is not None:
+        heads = git(repo, "ls-remote", "--heads", "origin").stdout.splitlines()
+        branches = []
+        for line in heads:
+            fields = line.split()
+            if len(fields) != 2 or not fields[1].startswith("refs/heads/"):
+                raise RuntimeError("project fetch 원격 branch 목록이 유효하지 않습니다.")
+            branches.append(fields[1].removeprefix("refs/heads/"))
+        if base not in branches:
+            raise RuntimeError(f"origin/{base} 원격 branch를 찾을 수 없습니다.")
+        for branch in sorted(branches):
+            _recorded_base_fetch(repo, state_dir, branch, owner="project")
     git(repo, "rev-parse", "--verify", f"refs/remotes/origin/{base}^{{commit}}")
     return base
 
@@ -6093,6 +6238,7 @@ def inspect_project_registration(
     provider: str,
     requested_base: str | None,
     approve_agents_mismatch: bool,
+    state_dir: Path | None = None,
 ) -> ProjectRegistrationInspection:
     """Validate one project from its fetched origin revision before registry writes."""
 
@@ -6108,7 +6254,7 @@ def inspect_project_registration(
     if not origins:
         raise RuntimeError("검증한 GitHub origin을 확인할 수 없습니다.")
     origin = origins[0]
-    base_branch = remote_base(root, requested_base)
+    base_branch = remote_base(root, requested_base, state_dir=state_dir)
     revision = git(
         root,
         "rev-parse",
@@ -6139,6 +6285,7 @@ def add_registered_project(
     provider: str,
     requested_base: str | None,
     approve_agents_mismatch: bool,
+    state_dir: Path | None = None,
 ) -> project_registry.RegisteredProject:
     inspection = inspect_project_registration(
         path,
@@ -6146,6 +6293,7 @@ def add_registered_project(
         provider=provider,
         requested_base=requested_base,
         approve_agents_mismatch=approve_agents_mismatch,
+        state_dir=state_dir,
     )
     project = project_registry.RegisteredProject(
         repo=str(inspection.root),
@@ -6427,16 +6575,48 @@ def _base_paths_overlap(left: str, right: str) -> bool:
     return _paths_overlap(left.casefold(), right.casefold())
 
 
+def _source_transition_state(repo: Path) -> dict[str, object]:
+    snapshot = _base_worktree_snapshot(repo)
+    return {
+        "branch": snapshot.branch, "head": snapshot.head,
+        "changes": [list(entry) for entry in snapshot.changes],
+        "operations": [list(entry) for entry in snapshot.operations],
+    }
+
+
+def _source_transition_marker(repo: Path, base: str, intent: Mapping[str, object]) -> bool:
+    refname = f"refs/heads/{base}"
+    result = git(repo, "reflog", "show", "--format=%H%x00%gs", refname,
+                 check=False)
+    token = f"loop-manager-source:{intent['id']}"
+    return (
+        result.returncode == 0
+        and any(
+            line.startswith(f"{intent['expected']['head']}\x00") and token in line
+            for line in result.stdout.splitlines()
+        )
+    )
+
+
 def synchronize_base_worktree(
     repo: Path,
     base: str,
     *,
     remote_sha: str | None = None,
+    state_dir: Path | None = None,
+    owner: str = "project",
 ) -> BaseWorktreeSyncResult:
     """Best-effort fast-forward of an eligible primary checkout."""
 
     selected_remote = remote_sha or ""
     try:
+        if state_dir is not None:
+            manager_git_journal.recover_active(
+                state_dir, repo=str(_canonical_path(repo)),
+                kind="source_fast_forward", target=str(_canonical_path(repo)),
+                observe=lambda: _source_transition_state(repo),
+                marker=lambda intent: _source_transition_marker(repo, base, intent),
+            )
         observed_remote = git(
             repo,
             "rev-parse",
@@ -6564,16 +6744,42 @@ def synchronize_base_worktree(
             return BaseWorktreeSyncResult(
                 "skipped", "eligibility 확인 뒤 origin ref가 변경됨", selected_remote
             )
-        updated = git(
-            repo, "merge", "--ff-only", "--no-autostash", selected_remote,
-            check=False,
-        )
-        if updated.returncode:
-            output = updated.stdout[-2000:].strip()
-            reason = "Git lock 충돌" if is_git_lock_failure(output) else "fast-forward 실패"
-            if output:
-                reason += f": {output}"
-            return BaseWorktreeSyncResult("failed", reason, selected_remote)
+        if state_dir is None:
+            updated = git(
+                repo, "merge", "--ff-only", "--no-autostash", selected_remote,
+                check=False,
+            )
+            if updated.returncode:
+                output = updated.stdout[-2000:].strip()
+                reason = "Git lock 충돌" if is_git_lock_failure(output) else "fast-forward 실패"
+                if output:
+                    reason += f": {output}"
+                return BaseWorktreeSyncResult("failed", reason, selected_remote)
+        else:
+            before_state = _source_transition_state(repo)
+            if before_state["head"] != before.head or before_state["branch"] != base:
+                raise manager_git_journal.MutationEvidenceError(
+                    "source fast-forward 직전 HEAD 또는 branch가 변경됐습니다."
+                )
+            expected_state = {**before_state, "head": selected_remote}
+
+            def apply(token: str) -> None:
+                environment = {**os.environ,
+                               "GIT_REFLOG_ACTION": f"loop-manager-source:{token}"}
+                updated = git(
+                    repo, "merge", "--ff-only", "--no-autostash", selected_remote,
+                    check=False, env=environment,
+                )
+                if updated.returncode:
+                    raise RuntimeError("fast-forward 실패: " + updated.stdout[-2000:].strip())
+
+            manager_git_journal.execute(
+                state_dir, owner=owner, kind="source_fast_forward",
+                repo=str(_canonical_path(repo)), target=str(_canonical_path(repo)),
+                before=before_state, expected=expected_state,
+                observe=lambda: _source_transition_state(repo), apply=apply,
+                marker=lambda intent: _source_transition_marker(repo, base, intent),
+            )
         final_head = git(repo, "rev-parse", "HEAD").stdout.strip()
         if final_head != selected_remote:
             return BaseWorktreeSyncResult(
@@ -6591,10 +6797,13 @@ def ensure_safe_base_worktree(
     base: str,
     *,
     remote_sha: str | None = None,
+    state_dir: Path | None = None,
 ) -> BaseWorktreeSyncResult:
     """Compatibility entry point for the non-blocking worktree synchronizer."""
 
-    return synchronize_base_worktree(repo, base, remote_sha=remote_sha)
+    return synchronize_base_worktree(
+        repo, base, remote_sha=remote_sha, state_dir=state_dir,
+    )
 
 
 def log_base_worktree_sync(repo: Path, result: BaseWorktreeSyncResult) -> None:
@@ -8080,22 +8289,12 @@ def classify_pull_request_mergeability(
 
 def _fetch_pr_conflict_recovery_refs(
     repo_path: Path,
+    state_dir: Path,
     base: str,
     branch: str,
 ) -> None:
-    fetched = git(
-        repo_path,
-        "fetch",
-        "origin",
-        f"+refs/heads/{base}:refs/remotes/origin/{base}",
-        f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
-        check=False,
-    )
-    if fetched.returncode:
-        raise RuntimeError(
-            "PR 충돌 복구에 필요한 원격 base/head ref를 가져올 수 없습니다:\n"
-            + fetched.stdout[-8000:]
-        )
+    for ref in dict.fromkeys((base, branch)):
+        _recorded_base_fetch(repo_path, state_dir, ref, owner="project")
 
 
 def _validate_pr_conflict_recovery_identity(
@@ -8329,7 +8528,7 @@ def _validate_active_pr_conflict_recovery(
             "관측값과 달라졌습니다."
         )
     _fetch_pr_conflict_recovery_refs(
-        repo_path, str(project["base_branch"]), branch
+        repo_path, state_dir, str(project["base_branch"]), branch
     )
     if remote_branch_oid(repo_path, branch) != observed_head:
         raise PublicationSafetyError(
@@ -8512,12 +8711,7 @@ def push_managed_publication_branch(
     if pushed.returncode:
         raise RuntimeError(f"publication branch push 실패:\n{pushed.stdout[-8000:]}")
 
-    git(
-        repo_path,
-        "fetch",
-        "origin",
-        f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
-    )
+    _recorded_base_fetch(repo_path, state_dir, branch, owner="project")
     confirmed_oid = remote_branch_oid(repo_path, branch)
     if confirmed_oid != local_oid:
         raise RuntimeError(
@@ -8606,6 +8800,7 @@ def push_owned_pr_conflict_recovery(
 
     _fetch_pr_conflict_recovery_refs(
         repo_path,
+        state_dir,
         str(project["base_branch"]),
         branch,
     )
@@ -8638,12 +8833,7 @@ def push_owned_pr_conflict_recovery(
             f"기존 PR 충돌 복구 push 실패:\n{pushed.stdout[-8000:]}"
         )
 
-    git(
-        repo_path,
-        "fetch",
-        "origin",
-        f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
-    )
+    _recorded_base_fetch(repo_path, state_dir, branch, owner="project")
     if remote_branch_oid(repo_path, branch) != local_oid:
         raise RuntimeError(
             "기존 PR 충돌 복구 push 결과를 원격에서 확인할 수 없습니다."
@@ -8704,7 +8894,7 @@ def recover_confirmed_pr_conflict_push(
     if contains_base.returncode != 0:
         return False
     _fetch_pr_conflict_recovery_refs(
-        repo_path, str(project["base_branch"]), branch
+        repo_path, state_dir, str(project["base_branch"]), branch
     )
     if remote_branch_oid(repo_path, branch) != local_oid:
         return False
@@ -14254,12 +14444,24 @@ def _record_manager_base_fetch_intent(
     if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", target) is None:
         raise RuntimeError("Manager base fetch 원격 OID가 유효하지 않습니다.")
     _ensure_cleanup_pending_schema(connection)
+    existing = connection.execute(
+        "SELECT id, before_ref, target_oid, action_token FROM manager_base_fetches "
+        "WHERE repo = ? AND plan_id = ? AND refname = ? AND phase = 'pending' "
+        "ORDER BY id DESC LIMIT 1",
+        (repo, plan_id, refname),
+    ).fetchone()
+    before_ref = json.dumps(before.refs.get(refname))
+    if existing is not None:
+        if (existing["before_ref"] != before_ref or existing["target_oid"] != target
+                or not existing["action_token"]):
+            raise RuntimeError("이전 Manager base fetch intent를 안전하게 재개할 수 없습니다.")
+        return int(existing["id"])
     with connection:
         cursor = connection.execute(
             "INSERT INTO manager_base_fetches "
             "(repo, plan_id, refname, before_ref, target_oid, action_token, phase) "
             "VALUES (?, ?, ?, ?, ?, ?, 'pending')",
-            (repo, plan_id, refname, json.dumps(before.refs.get(refname)),
+            (repo, plan_id, refname, before_ref,
              target, secrets.token_hex(16)),
         )
     return int(cursor.lastrowid)
@@ -14347,6 +14549,48 @@ def _finish_manager_base_fetch(
             "UPDATE manager_base_fetches SET phase = 'complete' WHERE id = ?",
             (intent_id,),
         )
+
+
+def _journaled_manager_base_fetch(
+    connection: sqlite3.Connection, repo_path: Path, state_dir: Path,
+    intent_id: int, base: str, plan_id: str,
+) -> str:
+    row = connection.execute(
+        "SELECT * FROM manager_base_fetches WHERE id = ? AND phase = 'pending'",
+        (intent_id,),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("Manager base fetch intent를 찾을 수 없습니다.")
+    previous = json.loads(str(row["before_ref"]))
+    before_oid = previous[0] if previous is not None else None
+    refname = str(row["refname"])
+    target = str(row["target_oid"])
+
+    def marker(_intent: Mapping[str, object]) -> bool:
+        return before_oid == target or _manager_base_fetch_applied(repo_path, row)
+
+    manager_git_journal.recover_active(
+        state_dir, repo=str(_canonical_path(repo_path)),
+        kind="project_fetch", target=refname,
+        observe=lambda: {"oid": _tracking_ref_oid(repo_path, refname)},
+        marker=marker,
+    )
+    current = _tracking_ref_oid(repo_path, refname)
+    if current != target:
+        manager_git_journal.execute(
+            state_dir, owner=f"guidance:{plan_id}", kind="project_fetch",
+            repo=str(_canonical_path(repo_path)), target=refname,
+            before={"oid": before_oid}, expected={"oid": target},
+            observe=lambda: {"oid": _tracking_ref_oid(repo_path, refname)},
+            apply=lambda _token: _perform_manager_base_fetch(
+                connection, repo_path, intent_id, base,
+            ),
+            marker=marker,
+        )
+    elif not marker({}):
+        raise RuntimeError("Manager base fetch의 소유 ref 갱신 증거가 없습니다.")
+    _finish_manager_base_fetch(connection, repo_path, intent_id)
+    return base
 
 
 def _proven_manager_base_refs(
@@ -14746,12 +14990,7 @@ def observe_waiting_pull_requests(
         if project is None or not project["base_branch"]:
             raise RuntimeError("Merge 뒤 fetch할 프로젝트 base branch를 확인할 수 없습니다.")
         base = str(project["base_branch"])
-        git(
-            repo_path,
-            "fetch",
-            "origin",
-            f"+refs/heads/{base}:refs/remotes/origin/{base}",
-        )
+        _recorded_base_fetch(repo_path, state_dir, base, owner="project")
     return WaitingPullRequestObservation(tuple(conflicts), merged)
 
 
@@ -15380,9 +15619,10 @@ def _remote_checkpoint_has_new_failure(
 
 def _remote_checkpoint_review_revision(
     repo_path: Path, worktree: Path, base_branch: str,
+    state_dir: Path | None = None,
 ) -> tuple[str, str] | None:
     """Read the latest base and a candidate HEAD that contains that base."""
-    git(repo_path, "fetch", "origin")
+    remote_base(repo_path, base_branch, state_dir=state_dir)
     base = git(
         repo_path, "rev-parse", f"refs/remotes/origin/{base_branch}^{{commit}}",
     ).stdout.strip()
@@ -15411,7 +15651,7 @@ def _evaluate_remote_checkpoint_cause(
         "SELECT provider, base_branch FROM projects WHERE repo = ?", (repo,),
     ).fetchone()
     revision = _remote_checkpoint_review_revision(
-        repo_path, worktree, str(project["base_branch"]),
+        repo_path, worktree, str(project["base_branch"]), state_dir,
     )
     if revision is None:
         return False, "원격 checkpoint 후보가 최신 base를 포함하지 않습니다.", "stale_base"
@@ -15446,7 +15686,7 @@ def _evaluate_remote_checkpoint_cause(
     protocol_error = None
     for attempt in range(1, MAX_REVIEWER_PROTOCOL_ATTEMPTS + 1):
         if _remote_checkpoint_review_revision(
-            repo_path, worktree, str(project["base_branch"]),
+            repo_path, worktree, str(project["base_branch"]), state_dir,
         ) != revision:
             return False, "원격 checkpoint verify 뒤 base 또는 HEAD가 변경됐습니다.", "revision_drift"
         review_before = capture_git_snapshot(worktree)
@@ -16191,7 +16431,7 @@ def reconcile_existing_pull_request(
                         expected_status="PLAN_BLOCKED",
                     )
                     _fetch_pr_conflict_recovery_refs(
-                        repo_path, str(project["base_branch"]), branch
+                        repo_path, state_dir, str(project["base_branch"]), branch
                     )
                     (_plan, _worktree, _branch, observed_head, base_oid) = (
                         _validate_pr_conflict_recovery_ownership(
@@ -16343,7 +16583,7 @@ def reconcile_existing_pull_request(
                 return 0
             try:
                 _fetch_pr_conflict_recovery_refs(
-                    repo_path, str(project["base_branch"]), branch
+                    repo_path, state_dir, str(project["base_branch"]), branch
                 )
                 (
                     _plan,
@@ -16470,7 +16710,9 @@ def reconcile_existing_pull_request(
         return 0
 
     if state == "MERGED" or pull_request.get("mergedAt"):
-        git(repo_path, "fetch", "origin")
+        remote_base(
+            repo_path, str(project["base_branch"]), state_dir=state_dir,
+        )
         persisted = connection.execute(
             "SELECT pr_head_oid FROM projects WHERE repo = ?",
             (repo,),
@@ -17996,17 +18238,9 @@ class _ExecPlanArchiveGitPort:
         self.repo = repo
 
     def fetch_remote_base(self, base_branch: str) -> str:
-        git(
-            self.repo_path,
-            "fetch",
-            "origin",
-            f"+refs/heads/{base_branch}:refs/remotes/origin/{base_branch}",
+        return _recorded_base_fetch(
+            self.repo_path, self.state_dir, base_branch, owner="project",
         )
-        return git(
-            self.repo_path,
-            "rev-parse",
-            f"refs/remotes/origin/{base_branch}^{{commit}}",
-        ).stdout.strip()
 
     @staticmethod
     def _parse_tree_record(record: bytes) -> tuple[str, str, str, str]:
@@ -19149,12 +19383,12 @@ def _run_project_step(
                     str(selected_base), validated_agent_scope,
                 )
     if fetch_intent is not None:
-        base = _perform_manager_base_fetch(
-            connection, repo_path, fetch_intent, str(selected_base),
+        base = _journaled_manager_base_fetch(
+            connection, repo_path, state_dir, fetch_intent, str(selected_base),
+            str(plan_id),
         )
-        _finish_manager_base_fetch(connection, repo_path, fetch_intent)
     else:
-        base = remote_base(repo_path, selected_base)
+        base = remote_base(repo_path, selected_base, state_dir=state_dir)
     backfill_plan_shas(connection, target_repo=repo)
     try:
         migrate_legacy_execplans(
@@ -19266,7 +19500,7 @@ def _run_project_step(
                 )
             else:
                 sync_result = ensure_safe_base_worktree(
-                    repo_path, base, remote_sha=base_sha
+                    repo_path, base, remote_sha=base_sha, state_dir=state_dir,
                 )
             if isinstance(sync_result, BaseWorktreeSyncResult):
                 log_base_worktree_sync(repo_path, sync_result)
@@ -20206,6 +20440,7 @@ def configure_registry(
                 provider=args.provider,
                 requested_base=args.base,
                 approve_agents_mismatch=args.approve_agents_mismatch,
+                state_dir=state_dir,
             )
             approval = " (AGENTS.md 불일치 승인 저장)" if project.agents_approved else ""
             operation_print(
@@ -20262,7 +20497,9 @@ def _document_drafts_command(
                 raise document_drafts.DocumentDraftError("다른 저장소의 수정본입니다.")
             display_review(draft)
             return 0
-        git(repository, "fetch", "origin", f"+refs/heads/{base_branch}:refs/remotes/origin/{base_branch}")
+        _recorded_base_fetch(
+            repository, state_dir, base_branch, owner="project",
+        )
         if args.draft_command == "generate":
             prompt, identity = drafts.generation_prompt(
                 repo, repository, base_branch, args.target,
