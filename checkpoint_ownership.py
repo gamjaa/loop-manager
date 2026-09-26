@@ -45,8 +45,13 @@ def owned_remote_oid(
         elif (
             row['local_oid'] != published
             or row['commit_identity'] != blocked_checkpoint.checkpoint_identity(
-                plan_id=plan_id, reason_code=str(row['reason_code']),
-                evidence=str(row['evidence']), parent_oid=published,
+                plan_id=plan_id,
+                reason_code=str(row['identity_reason_code']
+                                if row['identity_reason_code'] is not None
+                                else row['reason_code']),
+                evidence=str(row['identity_evidence']
+                             if row['identity_evidence'] is not None
+                             else row['evidence']), parent_oid=published,
                 tree_oid=tree, included_paths=(),
             )
         ):

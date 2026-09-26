@@ -1676,6 +1676,25 @@ class ExecutionHandlerTests(TestCase):
             self.assertTrue(self.handler._owned_checkpoint_remote(
                 self.context(), row, 'b' * 40, current,
             ))
+            row['publication_remote_oid'] = 'a' * 40
+            with mock.patch.object(self.effects.workspace.git, 'side_effect', new=lambda _repo, *args, **kw: (
+                SimpleNamespace(stdout='b' * 40 + '\n', returncode=0)
+                if args[0] == 'rev-parse' else git(_repo, *args, **kw)
+            )):
+                self.assertTrue(self.handler._owned_checkpoint_remote(
+                    self.context(), row, 'b' * 40, current,
+                ))
+                current.snapshot['remote_before'] = 'external'
+                self.assertFalse(self.handler._owned_checkpoint_remote(
+                    self.context(), row, 'b' * 40, current,
+                ))
+                current.snapshot['remote_before'] = 'a' * 40
+                current.expected_head = 'external'
+                self.assertFalse(self.handler._owned_checkpoint_remote(
+                    self.context(), row, 'b' * 40, current,
+                ))
+                current.expected_head = 'b' * 40
+            row['publication_remote_oid'] = 'b' * 40
             current.operation = None
             current.snapshot['pushed_checkpoint_head'] = 'b' * 40
             self.assertTrue(self.handler._owned_checkpoint_remote(
@@ -1691,6 +1710,50 @@ class ExecutionHandlerTests(TestCase):
                 self.context(), row, 'b' * 40, current,
                 {'headRefOid': 'b' * 40},
             ))
+
+    def test_interrupted_owned_push_persists_oid_before_clearing_intent(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        blocked_checkpoint_state.ensure_schema(self.connection)
+        self.connection.execute(
+            "INSERT INTO blocked_checkpoints "
+            "(repo, plan_id, request_identity, phase, reason_code, evidence, "
+            "branch, worktree, accepted_remote_oid) "
+            "VALUES ('repo', 'G-047', 'request', 'published', 'review', 'evidence', "
+            "'loop-manager/G-047', '/state/G-047', 'old-head')"
+        )
+        marker = {'owner_oid': 'old-head', 'before_head': 'old-head',
+                  'after_head': 'owned-head', 'target_base_oid': 'base'}
+        self.state.update_project('repo', publication_remote_oid='old-head')
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0, operation='push',
+            expected_head='owned-head', target_base_oid='base',
+            observed_remote_oid='old-head',
+            snapshot={'blocked_resume': marker, 'remote_before': 'old-head'},
+        )
+        def observed_git(path, *args, **kwargs):
+            if args[0] == 'ls-remote':
+                return SimpleNamespace(
+                    stdout='owned-head\trefs/heads/loop-manager/G-047\n',
+                    returncode=0,
+                )
+            return self.observed_git(path, *args, **kwargs)
+
+        self.effects.workspace.git.side_effect = observed_git
+        self.effects.workspace.remote_branch_oid.return_value = 'owned-head'
+        self.effects.publication.pr_for_branch.return_value = None
+        with (
+            mock.patch.object(handlers.checkpoint_ownership,
+                              'rebase_preserves_commits', return_value=True),
+            mock.patch.object(handlers.checkpoint_ownership,
+                              'owned_remote_oid', return_value='old-head'),
+        ):
+            self.handler.recover(self.context())
+        self.assertEqual(self.state.row()['publication_remote_oid'], 'owned-head')
+        saved = checkpoint.get('repo', 'G-047')
+        self.assertIsNone(saved.operation)
+        self.assertEqual(saved.snapshot['pushed_checkpoint_head'], 'owned-head')
 
     def test_completed_owned_push_persists_new_oid_in_execution_checkpoint(self):
         checkpoint = ExecutionCheckpointRepository(self.connection)

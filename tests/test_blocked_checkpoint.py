@@ -266,7 +266,68 @@ class BlockedCheckpointPolicyTest(unittest.TestCase):
 
 
 class BlockedCheckpointGitAdapterTest(unittest.TestCase):
+    def test_clean_checkpoint_identity_survives_reclassification(self):
+        import checkpoint_ownership
+        repo = str(self.repo.resolve())
+        store = blocked_checkpoint_state.BlockedCheckpointRepository(self.connection)
+        request = self.block()
+        head = self.run_git(self.worktree, 'rev-parse', 'HEAD')
+        tree = self.run_git(self.worktree, 'rev-parse', 'HEAD^{tree}')
+        identity = blocked_checkpoint.checkpoint_identity(
+            plan_id='G-034', reason_code=request.reason_code,
+            evidence=request.evidence, parent_oid=head, tree_oid=tree,
+            included_paths=(),
+        )
+        store.record_prepared(request, blocked_checkpoint.PreparedCheckpoint(
+            head, tree, identity, '', (),
+        ))
+        store.record_local(request, head)
+        self.run_git(self.worktree, 'push', 'origin', 'HEAD:refs/heads/loop-manager/G-034')
+        store.finish_published(request, head)
+        # Existing rows have no identity inputs until their first reclassification.
+        self.connection.execute(
+            'UPDATE blocked_checkpoints SET identity_reason_code = NULL, '
+            'identity_evidence = NULL WHERE repo = ? AND plan_id = ?',
+            (repo, 'G-034'),
+        )
+        for reason in ('changed-cause', 'changed-again'):
+            store.reclassify_published(
+                store.get(repo, 'G-034'), reason_code=reason, evidence='new evidence',
+                release_fingerprint=reason, accepted_oid=head,
+            )
+            self.assertEqual(checkpoint_ownership.owned_remote_oid(
+                self.connection, self.repo, repo, 'G-034', 'loop-manager/G-034',
+                self.worktree, head, loop_manager.git,
+            ), head)
+        self.connection.execute("UPDATE blocked_checkpoints SET commit_identity = 'forged'")
+        self.assertIsNone(checkpoint_ownership.owned_remote_oid(
+            self.connection, self.repo, repo, 'G-034', 'loop-manager/G-034',
+            self.worktree, head, loop_manager.git,
+        ))
+
+    def test_interrupted_rebase_preserves_dirty_worktree(self):
+        self._owned_checkpoint_release(dirty=True)
+
+    def test_interrupted_rebase_restores_staged_worktree(self):
+        self._owned_checkpoint_release(dirty=True, staged=True)
+
+    def test_interrupted_rebase_preserves_dirty_worktree_after_head_save(self):
+        self._owned_checkpoint_release(dirty=True, after_save=True)
+
+    def test_interrupted_rebase_rejects_new_dirty_changes_before_head_save(self):
+        self._owned_checkpoint_release(dirty=True, tamper=True)
+
+    def test_interrupted_rebase_rejects_new_dirty_changes_after_head_save(self):
+        self._owned_checkpoint_release(dirty=True, tamper=True, after_save=True)
+
+    def test_interrupted_rebase_rejects_changed_preserved_file(self):
+        self._owned_checkpoint_release(dirty=True, tamper_preserved=True)
+
     def test_owned_checkpoint_release_keeps_remote_oid_across_real_rebase(self):
+        self._owned_checkpoint_release()
+
+    def _owned_checkpoint_release(self, *, dirty=False, tamper=False,
+                                  tamper_preserved=False, after_save=False, staged=False):
         repo_id = str(self.repo.resolve())
         (self.worktree / 'code.py').write_text('checkpoint\n', encoding='utf-8')
         self.run_git(self.worktree, 'add', 'code.py')
@@ -311,15 +372,38 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
         self.run_git(self.repo, 'commit', '-m', 'Change product input')
         self.run_git(self.repo, 'push', 'origin', 'main')
 
+        if dirty:
+            if staged:
+                (self.worktree / 'code.py').write_text(
+                    'checkpoint\npreserved local edit\n', encoding='utf-8',
+                )
+                self.run_git(self.worktree, 'add', 'code.py')
+            else:
+                (self.worktree / 'dependency.py').write_text(
+                    'preserved local edit\n', encoding='utf-8',
+                )
         record = loop_manager._record_blocked_resume_head
 
         def interrupt_after_rebase(*arguments):
-            if arguments[-1] is not None:
+            if arguments[6] is not None:
+                if after_save:
+                    record(*arguments)
                 raise KeyboardInterrupt('after rebase before checkpoint save')
             return record(*arguments)
 
-        with mock.patch.object(loop_manager, '_record_blocked_resume_head',
-                               side_effect=interrupt_after_rebase):
+        actual_git = loop_manager.git
+
+        def interrupt_autostash(*arguments, **kwargs):
+            result = actual_git(*arguments, **kwargs)
+            if staged and arguments[1] == 'rebase':
+                raise KeyboardInterrupt('after autostash before index restore')
+            return result
+
+        with (
+            mock.patch.object(loop_manager, 'git', side_effect=interrupt_autostash),
+            mock.patch.object(loop_manager, '_record_blocked_resume_head',
+                              side_effect=interrupt_after_rebase),
+        ):
             with self.assertRaises(KeyboardInterrupt):
                 loop_manager.resume_blocked_execplan_if_inputs_changed(
                     self.connection, self.repo, repo_id, 'main', self.state_dir,
@@ -327,11 +411,35 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
         pending = execution_checkpoint_state.ExecutionCheckpointRepository(
             self.connection,
         ).get(repo_id, 'G-034')
-        self.assertIsNone(pending.snapshot['blocked_resume']['after_head'])
+        self.assertEqual(bool(pending.snapshot['blocked_resume']['after_head']), after_save)
+        if staged:
+            self.assertEqual(
+                self.run_git(self.worktree, 'diff', '--cached', '--name-only'), '',
+            )
+        if tamper:
+            (self.worktree / 'AGENTS.md').write_text('unexpected scope edit\n')
+        if tamper_preserved:
+            (self.worktree / 'dependency.py').write_text('changed after rebase\n')
         resumed = loop_manager.resume_blocked_execplan_if_inputs_changed(
             self.connection, self.repo, repo_id, 'main', self.state_dir,
         )
 
+        if tamper or tamper_preserved:
+            self.assertFalse(resumed)
+            self.assertEqual(self.connection.execute(
+                "SELECT status FROM exec_plans WHERE plan_id = 'G-034'",
+            ).fetchone()[0], 'PLAN_BLOCKED')
+            return
+        if dirty:
+            self.assertTrue(resumed)
+            if staged:
+                self.assertEqual(self.run_git(self.worktree, 'diff', '--cached', '--name-only'), 'code.py')
+                self.assertEqual((self.worktree / 'code.py').read_text(),
+                                 'checkpoint\npreserved local edit\n')
+            else:
+                self.assertEqual((self.worktree / 'dependency.py').read_text(),
+                                 'preserved local edit\n')
+            return
         self.assertTrue(resumed, self.connection.execute(
             "SELECT last_error FROM exec_plans WHERE repo = ? AND plan_id = 'G-034'",
             (repo_id,),

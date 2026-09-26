@@ -326,6 +326,20 @@ class ExecutionHandlers:
             return False
         original_oid = str(checkpoint['accepted_remote_oid'] or '')
         recorded_oid = str(row['publication_remote_oid'] or '')
+        pending_push = (
+            current.operation == 'push'
+            and (current.snapshot or {}).get('remote_before') == original_oid
+            and recorded_oid == original_oid
+            and remote_oid == current.expected_head
+            and remote_oid != original_oid
+        )
+        if pending_push:
+            local_head = self.effects.workspace.git(
+                context.worktree, 'rev-parse', 'HEAD',
+            ).stdout.strip()
+            if local_head != current.expected_head:
+                return False
+            recorded_oid = current.expected_head
         if original_oid == recorded_oid:
             return checkpoint_ownership.owned_remote_oid(
                 self.effects.state.connection, self.repo_path, self.repo,
@@ -1076,6 +1090,10 @@ class ExecutionHandlers:
             if (current.operation == 'push' and remote_oid == snapshot.local_head
                     or current.operation == 'pr_create' and pull_request is not None):
                 completed_push = current.operation == 'push'
+                if completed_push and marker:
+                    self.effects.state.update_project(
+                        self.repo, publication_remote_oid=remote_oid,
+                    )
                 current = checkpoint.record(
                     self.repo, context.plan.plan_id,
                     expected_generation=current.generation, operation=None,

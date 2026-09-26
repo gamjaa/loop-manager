@@ -13754,7 +13754,7 @@ def _requeue_blocked_execplan(
 def _record_blocked_resume_head(
     connection: sqlite3.Connection, repo: str, plan_id: str,
     owner_oid: str, before_head: str, target_base_oid: str,
-    after_head: str | None,
+    after_head: str | None, before_snapshot: str | None = None,
 ) -> None:
     checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
     current = checkpoint.get(repo, plan_id)
@@ -13765,8 +13765,56 @@ def _record_blocked_resume_head(
         snapshot={'blocked_resume': {
             'owner_oid': owner_oid, 'before_head': before_head,
             'target_base_oid': target_base_oid, 'after_head': after_head,
+            'before_snapshot': (before_snapshot or
+                (current.snapshot or {}).get('blocked_resume', {}).get('before_snapshot')),
         }},
     )
+
+
+def _blocked_resume_worktree_matches(
+    worktree: Path, marker: dict, current: GitSnapshot,
+) -> bool:
+    """Match preserved files and staging, allowing only autostash unstaging."""
+    serialized = marker.get('before_snapshot')
+    if not serialized:
+        return False
+    before = GitSnapshot.deserialize(serialized)
+    if before.head != marker.get('before_head') or before.branch != current.branch:
+        return False
+    if before.config != current.config or not current.shared_metadata_complete:
+        return False
+    # Rebase may change blobs, but cannot legitimately introduce index flags.
+    for path, entries in current.index.items():
+        tags = tuple(entry.split()[0] for entry in entries)
+        old_tags = tuple(entry.split()[0] for entry in before.index.get(path, ()))
+        if tags != (old_tags if path in before.index else ('H',)):
+            return False
+    if set(before.dirty) != set(current.dirty):
+        return False
+    unstaged_by_rebase = False
+    for path, (kinds, signature) in before.dirty.items():
+        now_kinds, now_signature = current.dirty[path]
+        if signature != now_signature:
+            return False
+        if kinds == now_kinds:
+            if 'staged' in kinds and before.index.get(path) != current.index.get(path):
+                return False
+        elif (not marker.get('after_head') and 'staged' in kinds
+              and now_kinds == ('unstaged',)):
+            unstaged_by_rebase = True
+        else:
+            return False
+    if unstaged_by_rebase:
+        # Only a clean index can be attributed to rebase --autostash.
+        if git(worktree, 'diff', '--cached', '--quiet', check=False).returncode:
+            return False
+        _restore_agent_staged_entries(worktree, before)
+        restored = capture_git_snapshot(worktree)
+        return restored.dirty == before.dirty and all(
+            restored.index.get(path) == before.index.get(path)
+            for path, (kinds, _) in before.dirty.items() if 'staged' in kinds
+        )
+    return True
 
 
 def _resume_interrupted_blocked_rebase(
@@ -13803,13 +13851,13 @@ def _resume_interrupted_blocked_rebase(
             and snapshot.head == current_head and snapshot.branch == branch
             and not snapshot.operations
             and (not after_head or after_head == current_head)
-            and (after_head or not snapshot.dirty)
             and checkpoint_ownership.rebase_preserves_commits(
                 repo_path, before_head, current_head, target_base, git,
             )
             and _blocked_execplan_metadata_error(repo_path, worktree, plan) is None
+            and _blocked_resume_worktree_matches(worktree, marker, snapshot)
         )
-    except (OSError, RuntimeError, ValueError):
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
         safe = False
     if not safe:
         _update_blocked_error(connection, repo, str(plan['plan_id']),
@@ -14025,6 +14073,7 @@ def resume_blocked_execplan_if_inputs_changed(
         _record_blocked_resume_head(
             connection, repo, str(plan['plan_id']), owned_oid,
             before_head, target_base_oid, None,
+            capture_git_snapshot(worktree).serialize(),
         )
     base_ancestry = git(
         worktree,
@@ -14083,6 +14132,15 @@ def resume_blocked_execplan_if_inputs_changed(
         ):
             _update_blocked_error(connection, repo, str(plan['plan_id']),
                                   '차단 해제 rebase의 commit 계보를 증명할 수 없습니다.')
+            return False
+        pending = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
+            repo, str(plan['plan_id']),
+        )
+        if not _blocked_resume_worktree_matches(
+            worktree, pending.snapshot['blocked_resume'], capture_git_snapshot(worktree),
+        ):
+            _update_blocked_error(connection, repo, str(plan['plan_id']),
+                                  '차단 해제 rebase 이후 보존한 작업 상태가 다릅니다.')
             return False
         _record_blocked_resume_head(
             connection, repo, str(plan['plan_id']), owned_oid,
