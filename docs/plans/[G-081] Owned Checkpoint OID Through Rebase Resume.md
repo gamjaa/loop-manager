@@ -35,12 +35,17 @@ priority: critical
 
 ## Progress
 
-- [ ] 게시 checkpoint 소유 OID의 차단 해제·rebase·재활성화 전이 보존
-- [ ] 실행 checkpoint와 PR 전 게시 판정의 공통 소유권 검증 및 lease 연결
-- [ ] 기존 프로젝트 오탐의 증거 기반 복구와 targeted 회귀 사례
+- [x] 게시 checkpoint 소유 OID의 차단 해제·rebase·재활성화 전이 보존
+- [x] 실행 checkpoint와 PR 전 게시 판정의 공통 소유권 검증 및 lease 연결
+- [x] 기존 프로젝트 오탐의 증거 기반 복구와 targeted 회귀 사례
 
 ## Decision Log
 
 - G-077은 guidance checkpoint의 게시·범위 재검사와 기존 G-058 이중 차단 복구를 다룬다. 이 계획은 게시 후 `PLAN_BLOCKED` 해제·rebase에서 실행 checkpoint와 publication 경계로 소유 OID가 이어지지 않는 별도 전이를 다루므로 G-077의 Merge를 선행 조건으로 두지 않는다.
 - 확인된 사고에서는 원격 G-077 checkpoint와 `blocked_checkpoints.accepted_remote_oid`가 `aa155d4`로 일치했고, 관리 rebase 뒤 로컬 HEAD는 `b2dbcaa`였다. 해제 경로에서 `publication_remote_oid`가 초기화됐으며 실행 checkpoint의 `reactivated_from_head`는 `aa155d4`였다. 이 값은 재현 증거이며 구현 상수로 사용하지 않는다.
 - 기존 PRODUCT는 PR 없는 소유 branch의 rebase 복구에 정확한 `--force-with-lease`만 허용한다. branch·commit·push 안전 경계의 변경이 ARCHITECTURE.md의 Architecture Change Policy에 해당하면 구현 전에 사용자 승인을 확인한다. `PROJECT_BLOCKED`가 유지되는 동안 자동 Worker나 Git 쓰기를 시작하지 않는다.
+
+- 검토 피드백 반영: 최초 checkpoint identity의 원인·증거를 별도 nullable 컬럼에 보존한다. 기존 행은 재분류 전에 원래 입력을 보존하며, identity 검증을 생략하지 않는다. SQLite 변경은 기존 데이터 삭제 없는 호환 확장이다.
+- push 성공 직후 중단은 저장된 push intent, 이전 원격 OID, 현재 로컬 HEAD와 live ref가 모두 일치할 때 복구하고 새 OID를 intent 해제 전에 저장한다.
+- rebase 전에 작업 snapshot을 저장하고 중단 복구 시 파일 signature·경로·index와 설정을 대조한다. autostash로 풀린 staging만 검증 후 복원하며, 새 변경이나 증거 누락은 차단을 유지한다.
+- Worker 검증은 변경 경계의 개별 unit test로 제한한다. 전체 verify와 최종 Reviewer 판정은 Loop Manager 단계에 남긴다.

@@ -1618,6 +1618,196 @@ class ExecutionHandlerTests(TestCase):
         self.assertEqual(saved.snapshot['reactivated_from_head'],
                          'old-execution-head')
 
+    def test_new_activation_keeps_published_resume_lineage(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        self.handler.newly_activated = True
+        marker = {
+            'owner_oid': 'remote-head', 'before_head': 'old-execution-head',
+            'after_head': 'owned-head', 'target_base_oid': 'base',
+        }
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0,
+            operation=None, expected_head='owned-head',
+            target_base_oid='base', observed_remote_oid='remote-head',
+            snapshot={'blocked_resume': marker},
+        )
+        self.effects.workspace.git.side_effect = self.observed_git
+        with mock.patch.object(self.handler, '_owned_checkpoint_remote',
+                               return_value=True):
+            recovered = self.handler.recover(self.context())
+
+        self.assertEqual(recovered.phase, ExecutionPhase.IMPLEMENTING)
+        saved = checkpoint.get('repo', 'G-047')
+        self.assertEqual(saved.snapshot['blocked_resume'], marker)
+        self.assertEqual(saved.snapshot['reactivated_from_head'], 'owned-head')
+
+    def test_confirmed_checkpoint_push_remains_owned_during_pr_creation(self):
+        blocked_checkpoint_state.ensure_schema(self.connection)
+        self.connection.execute(
+            "INSERT INTO blocked_checkpoints "
+            "(repo, plan_id, request_identity, phase, reason_code, evidence, "
+            "branch, worktree, accepted_remote_oid) "
+            "VALUES ('repo', 'G-047', 'request', 'published', 'review', 'evidence', "
+            "'loop-manager/G-047', '/state/G-047', ?)",
+            ('a' * 40,),
+        )
+        marker = {'owner_oid': 'a' * 40, 'before_head': 'before',
+                  'after_head': 'after', 'target_base_oid': 'base'}
+        row = {'pr_url': None, 'publication_remote_oid': 'b' * 40}
+        current = SimpleNamespace(
+            expected_head='b' * 40, operation='push',
+            snapshot={'blocked_resume': marker, 'remote_before': 'a' * 40},
+        )
+        def git(_repo, *args, **_kwargs):
+            self.assertEqual(args[0], 'ls-remote')
+            return SimpleNamespace(
+                returncode=0,
+                stdout='b' * 40 + '\trefs/heads/loop-manager/G-047\n',
+            )
+        self.effects.workspace.git.side_effect = git
+        with (
+            mock.patch.object(handlers.checkpoint_ownership,
+                              'rebase_preserves_commits', return_value=True),
+            mock.patch.object(handlers.checkpoint_ownership,
+                              'owned_remote_oid', return_value='a' * 40),
+        ):
+            self.assertTrue(self.handler._owned_checkpoint_remote(
+                self.context(), row, 'b' * 40, current,
+            ))
+            row['publication_remote_oid'] = 'a' * 40
+            with mock.patch.object(self.effects.workspace.git, 'side_effect', new=lambda _repo, *args, **kw: (
+                SimpleNamespace(stdout='b' * 40 + '\n', returncode=0)
+                if args[0] == 'rev-parse' else git(_repo, *args, **kw)
+            )):
+                self.assertTrue(self.handler._owned_checkpoint_remote(
+                    self.context(), row, 'b' * 40, current,
+                ))
+                current.snapshot['remote_before'] = 'external'
+                self.assertFalse(self.handler._owned_checkpoint_remote(
+                    self.context(), row, 'b' * 40, current,
+                ))
+                current.snapshot['remote_before'] = 'a' * 40
+                current.expected_head = 'external'
+                self.assertFalse(self.handler._owned_checkpoint_remote(
+                    self.context(), row, 'b' * 40, current,
+                ))
+                current.expected_head = 'b' * 40
+            row['publication_remote_oid'] = 'b' * 40
+            current.operation = None
+            current.snapshot['pushed_checkpoint_head'] = 'b' * 40
+            self.assertTrue(self.handler._owned_checkpoint_remote(
+                self.context(), row, 'b' * 40, current,
+            ))
+            self.assertFalse(self.handler._owned_checkpoint_remote(
+                self.context(), row, 'b' * 40, current,
+                {'headRefOid': 'b' * 40},
+            ))
+            current.operation = 'pr_create'
+            current.snapshot['remote_before'] = 'b' * 40
+            self.assertTrue(self.handler._owned_checkpoint_remote(
+                self.context(), row, 'b' * 40, current,
+                {'headRefOid': 'b' * 40},
+            ))
+
+    def test_interrupted_owned_push_persists_oid_before_clearing_intent(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        blocked_checkpoint_state.ensure_schema(self.connection)
+        self.connection.execute(
+            "INSERT INTO blocked_checkpoints "
+            "(repo, plan_id, request_identity, phase, reason_code, evidence, "
+            "branch, worktree, accepted_remote_oid) "
+            "VALUES ('repo', 'G-047', 'request', 'published', 'review', 'evidence', "
+            "'loop-manager/G-047', '/state/G-047', 'old-head')"
+        )
+        marker = {'owner_oid': 'old-head', 'before_head': 'old-head',
+                  'after_head': 'owned-head', 'target_base_oid': 'base'}
+        self.state.update_project('repo', publication_remote_oid='old-head')
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0, operation='push',
+            expected_head='owned-head', target_base_oid='base',
+            observed_remote_oid='old-head',
+            snapshot={'blocked_resume': marker, 'remote_before': 'old-head'},
+        )
+        def observed_git(path, *args, **kwargs):
+            if args[0] == 'ls-remote':
+                return SimpleNamespace(
+                    stdout='owned-head\trefs/heads/loop-manager/G-047\n',
+                    returncode=0,
+                )
+            return self.observed_git(path, *args, **kwargs)
+
+        self.effects.workspace.git.side_effect = observed_git
+        self.effects.workspace.remote_branch_oid.return_value = 'owned-head'
+        self.effects.publication.pr_for_branch.return_value = None
+        with (
+            mock.patch.object(handlers.checkpoint_ownership,
+                              'rebase_preserves_commits', return_value=True),
+            mock.patch.object(handlers.checkpoint_ownership,
+                              'owned_remote_oid', return_value='old-head'),
+        ):
+            self.handler.recover(self.context())
+        self.assertEqual(self.state.row()['publication_remote_oid'], 'owned-head')
+        saved = checkpoint.get('repo', 'G-047')
+        self.assertIsNone(saved.operation)
+        self.assertEqual(saved.snapshot['pushed_checkpoint_head'], 'owned-head')
+
+    def test_completed_owned_push_persists_new_oid_in_execution_checkpoint(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        marker = {'owner_oid': 'a' * 40, 'before_head': 'before',
+                  'after_head': 'after', 'target_base_oid': 'base'}
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0, operation='push',
+            expected_head='b' * 40, target_base_oid='base',
+            observed_remote_oid='a' * 40,
+            snapshot={'blocked_resume': marker, 'remote_before': 'a' * 40},
+        )
+
+        self.handler._complete_publication_intent(self.context('PUBLISHING'))
+
+        saved = checkpoint.get('repo', 'G-047')
+        self.assertIsNone(saved.operation)
+        self.assertEqual(saved.observed_remote_oid, 'b' * 40)
+        self.assertEqual(saved.snapshot['pushed_checkpoint_head'], 'b' * 40)
+
+    def test_accepted_user_correction_requires_checkpoint_remote_ownership(self):
+        blocked_checkpoint_state.ensure_schema(self.connection)
+        self.connection.execute(
+            "INSERT INTO blocked_checkpoints "
+            "(repo, plan_id, request_identity, phase, reason_code, evidence, "
+            "accepted_remote_oid) "
+            "VALUES ('repo', 'G-047', 'request', 'published', 'review', "
+            "'evidence', 'user-head')"
+        )
+        self.effects.workspace.git.side_effect = lambda *_args, **_kwargs: SimpleNamespace(
+            stdout='user-head\n', returncode=0,
+        )
+        current = SimpleNamespace(snapshot=None)
+        row = {'pr_url': None, 'publication_remote_oid': None}
+
+        with mock.patch.object(handlers.checkpoint_ownership, 'owned_remote_oid',
+                               return_value='user-head') as owner:
+            self.assertTrue(self.handler._owned_checkpoint_remote(
+                self.context(), row, 'user-head', current,
+            ))
+            owner.assert_called_once()
+            owner.return_value = None
+            self.assertFalse(self.handler._owned_checkpoint_remote(
+                self.context(), row, 'user-head', current,
+            ))
+        self.connection.execute(
+            "UPDATE blocked_checkpoints SET accepted_remote_oid = 'old-head' "
+            "WHERE repo = 'repo' AND plan_id = 'G-047'"
+        )
+        self.assertFalse(self.handler._owned_checkpoint_remote(
+            self.context(), row, 'user-head', current,
+        ))
+
     def test_external_remote_checkpoint_uses_publication_ownership_cause(self):
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)

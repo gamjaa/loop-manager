@@ -7873,6 +7873,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "blocked_checkpoint_state.py",
                 "document_drafts.py",
                 "document_publication.py",
+                "checkpoint_ownership.py",
                 "loop_manager.py",
                 "execution_checkpoint.py",
                 "execution_checkpoint_state.py",
@@ -13899,6 +13900,78 @@ class LatestBasePublicationTest(unittest.TestCase):
         self.assertIn(lease, pushes[0])
         self.assertNotIn("--force", pushes[0])
         self.assertEqual(len(created), 1)
+
+    def test_owned_branch_push_rechecks_live_ref_before_lease(self):
+        branch = 'loop-manager/G-081'
+        plan = {'publication_remote_oid': 'a' * 40, 'pr_url': None}
+        calls = []
+
+        def git(_path, *arguments, **_kwargs):
+            calls.append(arguments)
+            if arguments[:2] == ('rev-parse', 'HEAD'):
+                return subprocess.CompletedProcess(arguments, 0, 'b' * 40 + '\n')
+            if arguments[0] == 'ls-remote':
+                return subprocess.CompletedProcess(
+                    arguments, 0, 'c' * 40 + f'\trefs/heads/{branch}\n',
+                )
+            raise AssertionError(f'unexpected Git command: {arguments}')
+
+        with (
+            mock.patch('loop_manager._owned_publication_plan', return_value=plan),
+            mock.patch('loop_manager.remote_branch_oid', return_value='a' * 40) as remote,
+            mock.patch('loop_manager.record_remote_publication_branch'),
+            mock.patch('loop_manager.git', side_effect=git),
+        ):
+            with self.assertRaises(loop_manager.PublicationSafetyError):
+                loop_manager.push_managed_publication_branch(
+                    object(), Path('/repo'), Path('/state'), 'repo',
+                    branch, Path('/managed'),
+                )
+            remote.return_value = None
+            with self.assertRaises(loop_manager.PublicationSafetyError):
+                loop_manager.push_managed_publication_branch(
+                    object(), Path('/repo'), Path('/state'), 'repo',
+                    branch, Path('/managed'),
+                )
+        self.assertFalse(any(args[0] == 'push' for args in calls))
+
+    def test_owned_branch_push_uses_exact_lease_and_saves_confirmed_head(self):
+        branch = 'loop-manager/G-081'
+        old, new = 'a' * 40, 'b' * 40
+        pushes = []
+        remote_observations = iter((old, new))
+
+        def git(_path, *arguments, **_kwargs):
+            if arguments[:2] == ('rev-parse', 'HEAD'):
+                return subprocess.CompletedProcess(arguments, 0, new + '\n')
+            if arguments[0] == 'ls-remote':
+                return subprocess.CompletedProcess(
+                    arguments, 0,
+                    next(remote_observations) + f'\trefs/heads/{branch}\n',
+                )
+            if arguments[0] == 'push':
+                pushes.append(arguments)
+            return subprocess.CompletedProcess(arguments, 0, '')
+
+        with (
+            mock.patch('loop_manager._owned_publication_plan', return_value={
+                'publication_remote_oid': old, 'pr_url': None,
+            }),
+            mock.patch('loop_manager.remote_branch_oid', side_effect=[old, new]),
+            mock.patch('loop_manager.record_remote_publication_branch'),
+            mock.patch('loop_manager.pr_for_branch', return_value=None),
+            mock.patch('loop_manager.update_project') as update,
+            mock.patch('loop_manager.git', side_effect=git),
+        ):
+            result = loop_manager.push_managed_publication_branch(
+                object(), Path('/repo'), Path('/state'), 'repo',
+                branch, Path('/managed'),
+            )
+
+        self.assertEqual(result, new)
+        self.assertEqual(len(pushes), 1)
+        self.assertIn(f'--force-with-lease=refs/heads/{branch}:{old}', pushes[0])
+        update.assert_called_once_with(mock.ANY, 'repo', publication_remote_oid=new)
 
     def test_unowned_remote_branch_is_blocked_without_force_push(self):
         with tempfile.TemporaryDirectory() as directory:

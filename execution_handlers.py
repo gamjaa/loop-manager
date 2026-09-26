@@ -34,6 +34,7 @@ from requirement_archive_recovery import (
 )
 from execution_checkpoint import CheckpointAction, assess, observe
 from execution_checkpoint_state import CheckpointRace
+import checkpoint_ownership
 from runtime_state import RuntimeStateError
 from publication_resume import PublicationNext, PublicationResume, assess_publication
 from rebase_correction import (
@@ -280,6 +281,115 @@ class ExecutionHandlers:
             self.effects.events.operation_log(
                 f"차단 해제 후 ExecPlan 작업 재개: {context.plan.plan_id}"
             )
+    def _owned_checkpoint_remote(
+        self, context, row, remote_oid, current, pull_request=None,
+    ):
+        """Require the published checkpoint's durable owner on an active resume."""
+        checkpoint = self.effects.state.connection.execute(
+            'SELECT phase, accepted_remote_oid FROM blocked_checkpoints '
+            'WHERE repo = ? AND plan_id = ?',
+            (self.repo, context.plan.plan_id),
+        ).fetchone()
+        if checkpoint is None or checkpoint['phase'] != 'published':
+            return True
+        marker = (current.snapshot or {}).get('blocked_resume') if current else None
+        if not marker and not row['publication_remote_oid']:
+            # A reviewed correction is Worker input only when its remote head
+            # is still the checkpoint's last accepted, owned ref.
+            if (row['pr_url'] or pull_request is not None
+                    or remote_oid != checkpoint['accepted_remote_oid']):
+                return False
+            try:
+                self.effects.workspace.validate_execplan_workspace_identity(
+                    self.state_dir, self.repo, context.plan.plan_id,
+                    context.branch, context.worktree,
+                )
+                self.effects.workspace.validate_managed_worktree(
+                    self.repo_path, context.worktree, context.branch,
+                )
+                local_oid = self.effects.workspace.git(
+                    context.worktree, 'rev-parse', 'HEAD',
+                ).stdout.strip()
+            except (RuntimeError, OSError):
+                return False
+            if local_oid != remote_oid:
+                return False
+            return checkpoint_ownership.owned_remote_oid(
+                self.effects.state.connection, self.repo_path, self.repo,
+                context.plan.plan_id, context.branch, context.worktree,
+                remote_oid, self.effects.workspace.git,
+                before_head=local_oid, recorded_oid=remote_oid,
+            ) == remote_oid
+        if (
+            not marker or row['pr_url']
+            or (pull_request is not None and current.operation != 'pr_create')
+            or marker.get('owner_oid') != checkpoint['accepted_remote_oid']
+            or not marker.get('before_head') or not marker.get('after_head')
+            or not marker.get('target_base_oid')
+        ):
+            return False
+        try:
+            self.effects.workspace.validate_execplan_workspace_identity(
+                self.state_dir, self.repo, context.plan.plan_id,
+                context.branch, context.worktree,
+            )
+            self.effects.workspace.validate_managed_worktree(
+                self.repo_path, context.worktree, context.branch,
+            )
+            if not checkpoint_ownership.rebase_preserves_commits(
+                self.repo_path, marker['before_head'], marker['after_head'],
+                marker['target_base_oid'], self.effects.workspace.git,
+            ):
+                return False
+        except (RuntimeError, OSError):
+            return False
+        original_oid = str(checkpoint['accepted_remote_oid'] or '')
+        recorded_oid = str(row['publication_remote_oid'] or '')
+        pending_push = (
+            current.operation == 'push'
+            and (current.snapshot or {}).get('remote_before') == original_oid
+            and recorded_oid == original_oid
+            and remote_oid == current.expected_head
+            and remote_oid != original_oid
+        )
+        if pending_push:
+            local_head = self.effects.workspace.git(
+                context.worktree, 'rev-parse', 'HEAD',
+            ).stdout.strip()
+            if local_head != current.expected_head:
+                return False
+            recorded_oid = current.expected_head
+        if original_oid == recorded_oid:
+            return checkpoint_ownership.owned_remote_oid(
+                self.effects.state.connection, self.repo_path, self.repo,
+                context.plan.plan_id, context.branch, context.worktree,
+                remote_oid, self.effects.workspace.git,
+                before_head=marker['before_head'], recorded_oid=recorded_oid,
+            ) == remote_oid
+        if (
+            not original_oid or not recorded_oid or remote_oid != recorded_oid
+            or current.expected_head != recorded_oid
+            or (current.operation == 'push' and
+                (current.snapshot or {}).get('remote_before') != original_oid)
+            or (current.operation != 'push' and
+                (current.snapshot or {}).get('pushed_checkpoint_head') != recorded_oid)
+        ):
+            return False
+        if checkpoint_ownership.owned_remote_oid(
+            self.effects.state.connection, self.repo_path, self.repo,
+            context.plan.plan_id, context.branch, context.worktree,
+            original_oid, self.effects.workspace.git,
+            before_head=marker['before_head'],
+            require_live=False,
+        ) != original_oid:
+            return False
+        live = self.effects.workspace.git(
+            self.repo_path, 'ls-remote', '--heads', 'origin',
+            f'refs/heads/{context.branch}', check=False,
+        )
+        return (live.returncode == 0 and
+                [line.split() for line in live.stdout.splitlines() if line.strip()]
+                == [[recorded_oid, f'refs/heads/{context.branch}']])
 
     def recover_failure(self, context, error):
         return self._recover(error.reason, str(error), context=context)
@@ -600,6 +710,9 @@ class ExecutionHandlers:
             expected_head=head, target_base_oid=target_oid,
             observed_remote_oid=current.observed_remote_oid,
             snapshot={
+                **({'blocked_resume': current.snapshot['blocked_resume']}
+                   if current.snapshot and 'blocked_resume' in current.snapshot
+                   else {}),
                 'before_head': head,
                 'target_base': target_oid,
                 'staged_paths': self.effects.workspace.git(
@@ -800,8 +913,8 @@ class ExecutionHandlers:
             expected_generation=current.generation, operation=operation,
             expected_head=head, target_base_oid=context.active_sha,
             observed_remote_oid=remote_oid,
-            snapshot={'phase': 'PUBLISHING', 'head': head,
-                      'remote_before': remote_oid},
+            snapshot={**(current.snapshot or {}), 'phase': 'PUBLISHING',
+                      'head': head, 'remote_before': remote_oid},
         )
 
     def _commit_owned(self, context, title):
@@ -848,8 +961,12 @@ class ExecutionHandlers:
             expected_generation=current.generation, operation=None,
             expected_head=current.expected_head,
             target_base_oid=current.target_base_oid,
-            observed_remote_oid=current.observed_remote_oid,
-            snapshot=current.snapshot,
+            observed_remote_oid=(current.expected_head if current.operation == 'push'
+                                 else current.observed_remote_oid),
+            snapshot={**(current.snapshot or {}),
+                      **({'pushed_checkpoint_head': current.expected_head}
+                         if current.operation == 'push' and
+                         (current.snapshot or {}).get('blocked_resume') else {})},
         )
 
     def recover(self, context):
@@ -876,7 +993,12 @@ class ExecutionHandlers:
                     expected_generation=current.generation, operation=None,
                     expected_head=None, target_base_oid=None,
                     observed_remote_oid=None,
-                    snapshot={'reactivated_from_head': current.expected_head},
+                    snapshot={
+                        'reactivated_from_head': current.expected_head,
+                        **({'blocked_resume': current.snapshot['blocked_resume']}
+                           if current.snapshot and 'blocked_resume' in current.snapshot
+                           else {}),
+                    },
                 )
             current = checkpoint.record(
                 self.repo, context.plan.plan_id,
@@ -965,16 +1087,43 @@ class ExecutionHandlers:
                     RecoveryReason.REMOTE_SNAPSHOT_RACE,
                     'checkpoint catalog revision changed', context=context,
                 )
+            if not self._owned_checkpoint_remote(
+                context, row, remote_oid, current, pull_request,
+            ):
+                return self._recover(
+                    RecoveryReason.REMOTE_OID_UNCERTAIN,
+                    '게시 checkpoint의 원격 OID 또는 재활성화 계보가 유효하지 않습니다.',
+                    context=context,
+                )
+            marker = (current.snapshot or {}).get('blocked_resume')
+            if (self.newly_activated and marker
+                    and (snapshot.local_head != marker['after_head']
+                         or (current.snapshot or {}).get('reactivated_from_head')
+                         != marker['after_head'])):
+                return self._recover(
+                    RecoveryReason.REMOTE_OID_UNCERTAIN,
+                    '재활성화 전후 HEAD가 게시 checkpoint 기록과 다릅니다.',
+                    context=context,
+                )
             self.effects.state.check_context(context)
             if (current.operation == 'push' and remote_oid == snapshot.local_head
                     or current.operation == 'pr_create' and pull_request is not None):
+                completed_push = current.operation == 'push'
+                if completed_push and marker:
+                    self.effects.state.update_project(
+                        self.repo, publication_remote_oid=remote_oid,
+                    )
                 current = checkpoint.record(
                     self.repo, context.plan.plan_id,
                     expected_generation=current.generation, operation=None,
                     expected_head=snapshot.local_head,
                     target_base_oid=current.target_base_oid,
                     observed_remote_oid=remote_oid,
-                    snapshot=current.snapshot,
+                    snapshot={**(current.snapshot or {}),
+                              **({'pushed_checkpoint_head': snapshot.local_head}
+                                 if completed_push and
+                                 (current.snapshot or {}).get('blocked_resume')
+                                 else {})},
                 )
             current = checkpoint.record(
                 self.repo, context.plan.plan_id,
@@ -3414,6 +3563,18 @@ class ExecutionHandlers:
             str(row['publication_remote_oid'] or '') or None,
             str(row['pr_url']) if int(row['pr_conflict_recovery']) else None,
         )
+        current = (self.effects.checkpoint.get(self.repo, context.plan.plan_id)
+                   if self.effects.checkpoint else None)
+        if not self._owned_checkpoint_remote(
+            context, row, publication.remote_oid, current,
+            publication.pull_request,
+        ):
+            return self._block_final(
+                self.repo, context.worktree,
+                '게시 checkpoint 원격 OID 소유권을 다시 증명할 수 없습니다.',
+                str(row['verify_result'] or ''),
+                reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
+            )
         existing_pr = publication.pull_request
         # Owned PR conflict recovery deliberately starts from its saved PR
         # head; its existing lease gate authorizes the later rebased push.
@@ -3714,6 +3875,15 @@ class ExecutionHandlers:
                 self.repo_path, context.worktree, context.branch,
                 str(row['publication_remote_oid'] or '') or None,
             )
+            current = (self.effects.checkpoint.get(self.repo, context.plan.plan_id)
+                       if self.effects.checkpoint else None)
+            if not self._owned_checkpoint_remote(
+                context, row, publication.remote_oid, current,
+                publication.pull_request,
+            ):
+                raise self.effects.contract.PublicationSafetyError(
+                    '게시 직전 checkpoint 원격 OID 소유권을 증명할 수 없습니다.'
+                )
             action = assess_publication(publication)
             if action is PublicationNext.USER_ACTION:
                 raise self.effects.contract.PublicationSafetyError(
@@ -3768,6 +3938,18 @@ class ExecutionHandlers:
             self.repo_path, context.worktree, context.branch, head_oid,
         )
         existing_after_push = after_push.pull_request
+        current = (self.effects.checkpoint.get(self.repo, context.plan.plan_id)
+                   if self.effects.checkpoint else None)
+        if not self._owned_checkpoint_remote(
+            context, self._row(), after_push.remote_oid, current,
+            existing_after_push,
+        ):
+            return self._block_final(
+                self.repo, context.worktree,
+                'push 뒤 checkpoint branch의 원격 OID 또는 PR 소유권을 증명할 수 없습니다.',
+                str(self._row()['verify_result'] or ''),
+                reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
+            )
         if existing_after_push is not None:
             if (after_push.local_oid != head_oid
                     or assess_publication(after_push) is not PublicationNext.ATTACH_PR):

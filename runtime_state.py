@@ -821,7 +821,7 @@ class RuntimeStateRepository:
             project_values={
                 "active_sha": activation_sha,
                 "validated_base_sha": None,
-                "publication_remote_oid": None,
+                "publication_remote_oid": selected.publication_remote_oid,
                 "pr_conflict_recovery": 0,
                 "pr_conflict_head_oid": None,
                 "pr_conflict_base_oid": None,
@@ -1025,6 +1025,23 @@ class RuntimeStateRepository:
                 ),
                 release_fingerprint=release_fingerprint,
             )
+            # Resolve the checkpoint module at the transition boundary; its
+            # recovery types also import runtime state during startup.
+            import execution_checkpoint_state
+            execution_checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(
+                self.connection
+            )
+            current = execution_checkpoint.get(repo, plan_id)
+            if current.snapshot and 'blocked_resume' in current.snapshot:
+                snapshot = dict(current.snapshot)
+                del snapshot['blocked_resume']
+                execution_checkpoint.record(
+                    repo, plan_id, expected_generation=current.generation,
+                    operation=current.operation, expected_head=current.expected_head,
+                    target_base_oid=current.target_base_oid,
+                    observed_remote_oid=current.observed_remote_oid,
+                    snapshot=snapshot,
+                )
             projection = (
                 clear_project_values() if clear_projection else project_values
             )

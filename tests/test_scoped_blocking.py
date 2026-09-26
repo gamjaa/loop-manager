@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import tempfile
+from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 import unittest
 from pathlib import Path
@@ -8,6 +9,7 @@ from unittest import mock
 
 import loop_manager
 import blocked_checkpoint_state
+import execution_checkpoint_state
 import maintenance_state
 import notifications
 import project_registry
@@ -49,6 +51,125 @@ class ScopedBlockingTest(unittest.TestCase):
             "SELECT released_at FROM notified_block_incidents WHERE event_key = ?",
             (event[0],),
         ).fetchone()[0])
+    def test_requeued_plan_keeps_only_verified_checkpoint_remote_oid(self):
+        self.plan('G-081', 'PLAN_BLOCKED', branch='loop/G-081')
+        loop_manager._requeue_blocked_execplan(
+            self.connection, self.repo, 'G-081',
+            publication_remote_oid='a' * 40,
+        )
+        row = self.connection.execute(
+            "SELECT status, publication_remote_oid FROM exec_plans WHERE repo = ? AND plan_id = 'G-081'",
+            (self.repo,),
+        ).fetchone()
+        self.assertEqual(row['status'], 'READY')
+        self.assertEqual(row['publication_remote_oid'], 'a' * 40)
+
+    def test_project_publication_block_recovers_only_matching_owned_rebase(self):
+        plan = self.plan('G-081', 'IMPLEMENTING', branch='loop/G-081')
+        marker = {'owner_oid': 'a' * 40, 'before_head': 'before',
+                  'after_head': 'after', 'target_base_oid': 'base'}
+        checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
+        checkpoint.record(
+            self.repo, 'G-081', expected_generation=0, operation=None,
+            expected_head='after', target_base_oid='base',
+            observed_remote_oid='a' * 40,
+            snapshot={'blocked_resume': marker},
+        )
+        with self.connection:
+            self.connection.execute(
+                "UPDATE exec_plans SET worktree = '/managed', worker_session_id = 'session' "
+                "WHERE repo = ? AND plan_id = 'G-081'", (self.repo,),
+            )
+            self.connection.execute(
+                "UPDATE projects SET phase = 'PROJECT_BLOCKED', plan_path = ?, "
+                "branch = 'loop/G-081', worktree = '/managed' WHERE repo = ?",
+                (plan['path'], self.repo),
+            )
+            self.connection.execute(
+                "INSERT INTO project_blocks (repo, scope, reason_code, plan_id, evidence, previous_phase) "
+                "VALUES (?, 'project', 'publication_ownership_uncertain', 'G-081', 'old error', 'WORKING')",
+                (self.repo,),
+            )
+        current = SimpleNamespace(
+            head='after', branch='loop/G-081', operations={}, dirty={},
+        )
+        with (
+            mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
+            mock.patch.object(loop_manager, 'validate_managed_worktree'),
+            mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=current),
+            mock.patch.object(loop_manager, 'remote_branch_oid', return_value='a' * 40),
+            mock.patch.object(loop_manager, 'pr_for_branch', return_value=None),
+            mock.patch.object(loop_manager.checkpoint_ownership, 'owned_remote_oid',
+                              return_value='a' * 40) as owner,
+            mock.patch.object(loop_manager.checkpoint_ownership,
+                              'rebase_preserves_commits', return_value=True),
+        ):
+            owner.return_value = None
+            self.assertFalse(loop_manager.resume_project_block_if_safe(
+                self.connection, Path(self.repo), Path('/state'), self.repo,
+            ))
+            self.assertIsNotNone(scoped_blocking.project_block(
+                self.connection, self.repo,
+            ))
+            owner.reset_mock()
+            owner.return_value = 'a' * 40
+            recovered = loop_manager.resume_project_block_if_safe(
+                self.connection, Path(self.repo), Path('/state'), self.repo,
+            )
+        self.assertTrue(recovered)
+        owner.assert_called_once()
+        self.assertIsNone(scoped_blocking.project_block(self.connection, self.repo))
+        saved = self.connection.execute(
+            "SELECT status, publication_remote_oid, worker_session_id FROM exec_plans "
+            "WHERE repo = ? AND plan_id = 'G-081'", (self.repo,),
+        ).fetchone()
+        self.assertEqual(tuple(saved), ('IMPLEMENTING', 'a' * 40, 'session'))
+
+        with self.connection:
+            self.connection.execute(
+                "UPDATE exec_plans SET status = 'PLAN_BLOCKED', "
+                "blocked_reason = 'review_retry_exhausted' "
+                "WHERE repo = ? AND plan_id = 'G-081'", (self.repo,),
+            )
+            self.connection.execute(
+                "UPDATE projects SET phase = 'PROJECT_BLOCKED', plan_path = NULL, "
+                "branch = NULL, worktree = NULL WHERE repo = ?", (self.repo,),
+            )
+            self.connection.execute(
+                "INSERT INTO execplan_blocks "
+                "(repo, plan_id, scope, reason_code, evidence) VALUES "
+                "(?, 'G-081', 'plan', 'review_retry_exhausted', 'separate block')",
+                (self.repo,),
+            )
+            self.connection.execute(
+                "INSERT INTO project_blocks "
+                "(repo, scope, reason_code, plan_id, evidence, previous_phase) "
+                "VALUES (?, 'project', 'publication_ownership_uncertain', "
+                "'G-081', 'old error', 'PLAN_BLOCKED')", (self.repo,),
+            )
+        with (
+            mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
+            mock.patch.object(loop_manager, 'validate_managed_worktree'),
+            mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=current),
+            mock.patch.object(loop_manager, 'remote_branch_oid', return_value='a' * 40),
+            mock.patch.object(loop_manager, 'pr_for_branch', return_value=None),
+            mock.patch.object(loop_manager.checkpoint_ownership, 'owned_remote_oid',
+                              return_value='a' * 40),
+            mock.patch.object(loop_manager.checkpoint_ownership,
+                              'rebase_preserves_commits', return_value=True),
+        ):
+            self.assertTrue(loop_manager.resume_project_block_if_safe(
+                self.connection, Path(self.repo), Path('/state'), self.repo,
+            ))
+        self.assertIsNone(scoped_blocking.project_block(self.connection, self.repo))
+        self.assertEqual(self.connection.execute(
+            "SELECT status FROM exec_plans WHERE repo = ? AND plan_id = 'G-081'",
+            (self.repo,),
+        ).fetchone()[0], 'PLAN_BLOCKED')
+        self.assertIsNotNone(self.connection.execute(
+            "SELECT 1 FROM execplan_blocks WHERE repo = ? AND plan_id = 'G-081'",
+            (self.repo,),
+        ).fetchone())
 
     def setUp(self):
         self.connection = sqlite3.connect(":memory:")

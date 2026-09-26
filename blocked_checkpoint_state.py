@@ -27,6 +27,8 @@ CREATE TABLE IF NOT EXISTS blocked_checkpoints (
     expected_remote_oid TEXT,
     remote_observed INTEGER NOT NULL DEFAULT 0,
     commit_identity TEXT,
+    identity_reason_code TEXT,
+    identity_evidence TEXT,
     tree_oid TEXT,
     local_oid TEXT,
     remote_oid TEXT,
@@ -55,6 +57,7 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
     for name in (
         "published_oid", "accepted_remote_oid", "pending_remote_oid",
         "inspected_remote_oid", "inspected_input", "inspection_reason",
+        "identity_reason_code", "identity_evidence",
     ):
         if name not in columns:
             connection.execute(f"ALTER TABLE blocked_checkpoints ADD COLUMN {name} TEXT")
@@ -138,6 +141,8 @@ class BlockedCheckpointRepository:
                     expected_remote_oid = excluded.expected_remote_oid,
                     remote_observed = excluded.remote_observed,
                     commit_identity = NULL,
+                    identity_reason_code = NULL,
+                    identity_evidence = NULL,
                     tree_oid = NULL,
                     local_oid = NULL,
                     remote_oid = NULL,
@@ -244,6 +249,8 @@ class BlockedCheckpointRepository:
                 request,
                 phase=CheckpointPhase.PREPARED.value,
                 commit_identity=prepared.commit_identity,
+                identity_reason_code=request.reason_code,
+                identity_evidence=request.evidence,
                 tree_oid=prepared.tree_oid,
                 local_oid=None,
                 result=None,
@@ -346,6 +353,14 @@ class BlockedCheckpointRepository:
         identity = request_identity(
             request.repo, request.plan_id, reason_code, evidence,
             request.branch, request.worktree, release_fingerprint,
+        )
+        # Legacy rows must retain the original identity inputs before reclassification.
+        self.connection.execute(
+            "UPDATE blocked_checkpoints SET "
+            "identity_reason_code = COALESCE(identity_reason_code, reason_code), "
+            "identity_evidence = COALESCE(identity_evidence, evidence) "
+            "WHERE repo = ? AND plan_id = ? AND request_identity = ?",
+            (request.repo, request.plan_id, request.request_identity),
         )
         self._update(
             request,
