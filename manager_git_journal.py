@@ -34,6 +34,18 @@ def rebase_completion_matches(git: Callable[..., Any], repo: Path, *,
     )
 
 
+def rebase_conflict_matches(git: Callable[..., Any], worktree: Path, *,
+                            head: str, identity: str) -> bool:
+    """Require this operation at the selected worktree's current HEAD reflog tip."""
+    result = git(worktree, "reflog", "show", "-1", "--format=%H%x00%gs",
+                 "HEAD", check=False)
+    prefix = f"{head}\0loop-manager-rebase:{identity}"
+    return result.returncode == 0 and any(
+        result.stdout.rstrip("\n").startswith(f"{prefix} ({action}): ")
+        for action in ("start", "pick", "continue", "skip")
+    )
+
+
 def rebase_affected_paths(git: Callable[..., Any], repo: Path,
                           original: str, target: str) -> list[str]:
     """Record the paths Git may touch before starting a managed replay."""
@@ -127,7 +139,8 @@ def verified_rebase_result(
         raise MutationEvidenceError("Manager rebase 실행 전 소유권 또는 원격 OID가 다릅니다.")
     if observed["metadata"] is not None:
         valid = (
-            observed["metadata"] == metadata
+            reflog_marker
+            and observed["metadata"] == metadata
             and observed["branch"] is None
             and observed["ref"] == before["ref"]
             and observed["registration"] is not None

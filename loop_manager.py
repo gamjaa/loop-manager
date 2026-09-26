@@ -9232,7 +9232,10 @@ def _finish_owned_direct_rebase(
                 expected["target_base_oid"], git,
             )
         else:
-            marker = patches = False
+            marker = manager_git_journal.rebase_conflict_matches(
+                git, worktree, head=observed["head"], identity=intent["id"],
+            )
+            patches = False
         ancestor = git(worktree, "merge-base", "--is-ancestor",
                        expected["target_base_oid"], observed["head"], check=False)
         return manager_git_journal.verified_rebase_result(

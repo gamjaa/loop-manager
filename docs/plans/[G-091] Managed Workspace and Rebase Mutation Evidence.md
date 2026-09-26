@@ -66,3 +66,5 @@ priority: critical
 - 2026-09-26: 줄별 증거의 치환·삭제 범위를 반열린 구간으로 비교해 `[0,1)`과 `[1,2)` 같은 인접 수정을 허용했다. 길이가 없는 삽입은 같은 위치와 치환 경계에서 순서가 불명확하므로 보수적 거부를 유지한다. 양방향 인접 치환·삭제, 외부 내용 추가, 실제 겹침·삽입 모호성과 인접 변경의 journal 확정·재조회를 다루는 targeted unit case 3개가 통과했다. 전체 verify는 실행하지 않았다.
 
 - 2026-09-26: 직접 rebase 복구와 실행 handler의 완료 검증을 공통 journal 함수로 통합했다. 두 경로 모두 최신 branch reflog의 OID·정확한 intent·target base가 일치해야 결과를 확정한다. 직접 복구에서 패치 동등성이 참이어도 외부 HEAD·외부 복귀·OID/intent/base 불일치는 intent를 보존하고 확정을 거부하는 회귀를 추가했다. 직접 복구·skip·continue unit case 3개가 통과했으며 전체 verify는 실행하지 않았다.
+
+- 2026-09-26: 충돌 중인 rebase 결과에도 실행 표식을 필수로 요구했다. 직접 복구와 handler 모두 선택된 worktree의 최신 HEAD reflog OID 및 정확한 intent의 start/pick/continue/skip 표식을 확인한다. 같은 metadata를 가진 외부 rebase는 확정하지 않고 active intent를 보존한다. 표식·OID·operation 불일치, journal 미확정 및 기존 충돌 범위/재개를 다루는 unit case 4개가 통과했고, 중단 지점 검증을 보강한 case도 재실행하여 통과했다. 전체 verify는 실행하지 않았다.

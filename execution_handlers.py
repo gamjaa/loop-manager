@@ -1067,7 +1067,11 @@ class ExecutionHandlers:
                     )
                 )
             else:
-                marker = patches = False
+                marker = manager_git_journal.rebase_conflict_matches(
+                    self.effects.workspace.git, context.worktree,
+                    head=observed['head'], identity=intent['id'],
+                )
+                patches = False
                 accepted_correction = False
             ancestor = self.effects.workspace.git(
                 context.worktree, 'merge-base', '--is-ancestor',

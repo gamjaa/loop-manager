@@ -97,6 +97,35 @@ class ManagedTransitionTests(unittest.TestCase):
                 **{**checks, 'current_remote_oid': NEW},
             )
 
+    def test_conflict_marker_requires_current_head_and_exact_operation(self):
+        git = mock.Mock()
+        for action in ('start', 'pick', 'continue', 'skip'):
+            git.return_value = SimpleNamespace(returncode=0, stdout=(
+                f'{NEW}\0loop-manager-rebase:owned ({action}): message\n'
+            ))
+            self.assertTrue(journal.rebase_conflict_matches(
+                git, Path('/selected'), head=NEW, identity='owned',
+            ))
+        for output in (
+            f'{NEW}\0rebase (start): checkout base\n',
+            f'{OLD}\0loop-manager-rebase:owned (start): checkout base\n',
+            f'{NEW}\0loop-manager-rebase:owned-other (start): checkout base\n',
+            f'{NEW}\0reset: external\n', '',
+        ):
+            with self.subTest(output=output):
+                git.return_value = SimpleNamespace(returncode=0, stdout=output)
+                self.assertFalse(journal.rebase_conflict_matches(
+                    git, Path('/selected'), head=NEW, identity='owned',
+                ))
+        git.return_value = SimpleNamespace(returncode=1, stdout=(
+            f'{NEW}\0loop-manager-rebase:owned (start): checkout base\n'
+        ))
+        self.assertFalse(journal.rebase_conflict_matches(
+            git, Path('/selected'), head=NEW, identity='owned',
+        ))
+        git.assert_called_with(Path('/selected'), 'reflog', 'show', '-1',
+                               '--format=%H%x00%gs', 'HEAD', check=False)
+
     def test_rebase_conflict_result_requires_matching_metadata_and_remote(self):
         before = {
             'head': OLD, 'branch': BRANCH, 'ref': [OLD, ''],
@@ -119,10 +148,15 @@ class ManagedTransitionTests(unittest.TestCase):
                          'head-name': f'refs/heads/{BRANCH}', 'onto': NEW},
             'unmerged': True, 'index_clean': False,
         }
+        with self.assertRaises(journal.MutationEvidenceError):
+            journal.verified_rebase_result(
+                intent, observed, current_remote_oid=OLD,
+                target_ancestor=True, patches_preserved=False, reflog_marker=False,
+            )
         candidate = journal.verified_rebase_result(
             intent, observed, current_remote_oid=OLD,
             target_ancestor=True, patches_preserved=False,
-            reflog_marker=False,
+            reflog_marker=True,
         )
         self.assertIsNone(candidate['selected']['index'])
         self.assertIsNone(candidate['selected']['dirty'])
@@ -135,7 +169,7 @@ class ManagedTransitionTests(unittest.TestCase):
                     journal.verified_rebase_result(
                         intent, changed, current_remote_oid=remote,
                         target_ancestor=True, patches_preserved=False,
-                        reflog_marker=False,
+                        reflog_marker=True,
                     )
 
     def test_pending_continuation_preserves_sealed_conflict_evidence(self):
@@ -166,11 +200,24 @@ class ManagedTransitionTests(unittest.TestCase):
                 state, owner='plan:G-091', repo='/repo', target=target,
                 before=before, expected=expected,
             )
+            # Intent exists, but an external rebase can produce the same
+            # metadata without executing this Manager operation.
+            with self.assertRaises(journal.MutationEvidenceError):
+                journal.complete_rebase(
+                    state, repo='/repo', target=target, observe=lambda: conflict,
+                    validate=lambda intent, observed: journal.verified_rebase_result(
+                        intent, observed, current_remote_oid=OLD,
+                        target_ancestor=True, patches_preserved=False, reflog_marker=False,
+                    ),
+                )
+            slot = journal._slot(state, '/repo', 'managed_rebase', target)
+            self.assertTrue((slot / 'active.json').exists())
+            self.assertFalse((slot / f'{sealed_id}.result.json').exists())
             journal.complete_rebase(
                 state, repo='/repo', target=target, observe=lambda: conflict,
                 validate=lambda intent, observed: journal.verified_rebase_result(
                     intent, observed, current_remote_oid=OLD,
-                    target_ancestor=True, patches_preserved=False, reflog_marker=False,
+                    target_ancestor=True, patches_preserved=False, reflog_marker=True,
                 ),
             )
             corrected = {
@@ -250,7 +297,7 @@ class ManagedTransitionTests(unittest.TestCase):
             'unmerged': True, 'index_clean': False,
         }
         checks = dict(current_remote_oid=OLD, target_ancestor=True,
-                      patches_preserved=False, reflog_marker=False)
+                      patches_preserved=False, reflog_marker=True)
         self.assertIsNone(journal.verified_rebase_result(
             intent, observed, **checks,
         )['selected']['dirty'])
