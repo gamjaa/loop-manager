@@ -62,3 +62,5 @@ priority: critical
 - 2026-09-26: autostash가 같은 파일의 로컬 수정과 새 base 변경을 합칠 때 전체 파일 해시가 달라지는 정상 결과를 검증하도록 줄별 해시 기반 증거를 추가했다. 두 rebase snapshot 경로에서 원래 base·로컬 파일의 줄별 해시와 mode·signature를 기록하고, 비중첩 변경의 병합 결과가 실제 파일 증거와 일치할 때만 보존으로 인정한다. 원문은 journal에 기록하지 않는다. 증거가 없는 과거 기록, 외부 수정, 겹치는 변경과 mode 불일치는 기존 엄격 판정을 유지한다. 관련 unit test 5개가 통과했으며 새 모듈을 Linux verify 검사 목록에 추가했지만 전체 verify는 실행하지 않았다.
 
 - 2026-09-26: Planner import fixture의 복사 목록에서 새 의존성 `rebase_file_evidence.py`가 누락된 것을 수정했다. 해당 case는 임시 Git 저장소의 commit·push와 Agent scope 검증을 함께 수행하는 통합 시나리오이므로 Worker에서 실행하지 않았다. 이번 변경은 테스트 fixture 목록과 이 기록뿐이며 별도로 실행할 관련 unit test는 없다. 전체 verify에서 import 및 기존 scope 위반 검증을 재확인해야 한다.
+
+- 2026-09-26: 줄별 증거의 치환·삭제 범위를 반열린 구간으로 비교해 `[0,1)`과 `[1,2)` 같은 인접 수정을 허용했다. 길이가 없는 삽입은 같은 위치와 치환 경계에서 순서가 불명확하므로 보수적 거부를 유지한다. 양방향 인접 치환·삭제, 외부 내용 추가, 실제 겹침·삽입 모호성과 인접 변경의 journal 확정·재조회를 다루는 targeted unit case 3개가 통과했다. 전체 verify는 실행하지 않았다.

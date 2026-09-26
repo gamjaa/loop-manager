@@ -64,8 +64,17 @@ def preserved(before: dict, after: dict, old_signature: str, new_signature: str)
                 if tag != 'equal']
 
     local_edits, base_edits = edits(local), edits(new_base)
-    if any(left != right and left[0] <= right[1] and right[0] <= left[1]
-           for left in local_edits for right in base_edits):
+    def overlaps(left, right):
+        if left == right:
+            return False
+        # Replacements/deletions occupy half-open ranges, so adjacent edits
+        # are independent. Insertions have no width: keep shared insertion
+        # points and replacement boundaries conservative because order matters.
+        if left[0] == left[1] or right[0] == right[1]:
+            return left[0] <= right[1] and right[0] <= left[1]
+        return left[0] < right[1] and right[0] < left[1]
+
+    if any(overlaps(left, right) for left in local_edits for right in base_edits):
         return False
     combined = local_edits + [edit for edit in base_edits if edit not in local_edits]
     expected = list(base)

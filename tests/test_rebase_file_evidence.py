@@ -19,7 +19,7 @@ def evidence(base, local, signature):
 class AutostashFileEvidenceTests(unittest.TestCase):
     def test_nonoverlapping_base_change_is_preserved_and_sealed(self):
         old = evidence(['a', 'b', 'c', 'd'], ['local', 'b', 'c', 'd'], 'old-hash')
-        new = evidence(['a', 'b', 'c', 'base'], ['local', 'b', 'c', 'base'], 'new-hash')
+        new = evidence(['a', 'base', 'c', 'd'], ['local', 'base', 'c', 'd'], 'new-hash')
         before = {
             'head': 'old', 'branch': 'loop-manager/G-091', 'ref': ['old', ''],
             'registration': ['HEAD=old', 'branch=refs/heads/loop-manager/G-091'],
@@ -48,6 +48,40 @@ class AutostashFileEvidenceTests(unittest.TestCase):
             self.assertEqual(len(journal.verified_managed_transitions(
                 state, '/repo', 'plan:G-091',
             )), 1)
+
+    def test_adjacent_edits_preserve_both_changes(self):
+        base = ['a', 'b', 'c']
+        for local, upstream, merged in (
+            (['local', 'b', 'c'], ['a', 'base', 'c'], ['local', 'base', 'c']),
+            (['a', 'local', 'c'], ['base', 'b', 'c'], ['base', 'local', 'c']),
+            (['b', 'c'], ['a', 'base', 'c'], ['base', 'c']),
+            (['local', 'b', 'c'], ['a', 'c'], ['local', 'c']),
+        ):
+            with self.subTest(local=local, upstream=upstream):
+                self.assertTrue(files.preserved(
+                    evidence(base, local, 'old'), evidence(upstream, merged, 'new'),
+                    'old', 'new',
+                ))
+                self.assertFalse(files.preserved(
+                    evidence(base, local, 'old'),
+                    evidence(upstream, merged + ['external'], 'new'), 'old', 'new',
+                ))
+
+    def test_overlaps_and_ambiguous_insertions_remain_rejected(self):
+        base = ['a', 'b', 'c']
+        for local, upstream, merged in (
+            (['local', 'c'], ['a', 'base', 'c'], ['local', 'base', 'c']),
+            (['local', 'b', 'c'], ['base', 'b', 'c'], ['local', 'b', 'c']),
+            (['a', 'local', 'b', 'c'], ['a', 'base', 'b', 'c'],
+             ['a', 'local', 'base', 'b', 'c']),
+            (['local', 'b', 'c'], ['a', 'insert', 'b', 'c'],
+             ['local', 'insert', 'b', 'c']),
+        ):
+            with self.subTest(local=local, upstream=upstream):
+                self.assertFalse(files.preserved(
+                    evidence(base, local, 'old'), evidence(upstream, merged, 'new'),
+                    'old', 'new',
+                ))
 
     def test_missing_external_or_overlapping_evidence_is_rejected(self):
         old = evidence(['a', 'b', 'c', 'd'], ['local', 'b', 'c', 'd'], 'old')
