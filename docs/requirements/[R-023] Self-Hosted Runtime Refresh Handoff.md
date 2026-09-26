@@ -30,6 +30,14 @@ bootstrap/source checkout의 HEAD·index·tracked·untracked·ignored 파일 상
 
 Agent가 선택된 관리 worktree 밖의 파일과 shared Git metadata를 쓸 권한은 없다. 무관한 변화의 범위 검사 제외는 이 쓰기 격리가 실제 실행에서 유효함을 검증할 수 있을 때만 적용한다. 격리를 증명할 수 없는 실행이나 과거 기록에서는 무관한 shared ref·다른 worktree 변화를 단순 관측만으로 외부 변경이라 추정해 허용하지 않는다. 감시 축소는 Agent의 Git 쓰기 권한, worktree·branch·push·PR 소유권을 넓히지 않는다.
 
+Planner·Worker·Reviewer와 유지보수 Planner는 각 호출에서 선택된 관리 worktree를 workspace로 사용하며, provider의 내장 쓰기 제한을 우선 적용한다. 작업 디렉터리 지정만으로 제한이 적용됐다고 간주하지 않는다. 기본 source checkout, 다른 worktree와 shared Git metadata는 쓰기 허용 범위에 포함하지 않고, Reviewer는 선택된 worktree도 읽기 전용으로 사용한다. workspace 쓰기 허용은 해당 역할의 문서·파일 변경 범위를 확대하지 않으며, 기존 역할별 변경 검사는 유지한다. 필요한 임시 작업은 해당 실행에 소유권이 있는 제한된 경로에서만 허용한다.
+
+Codex와 Claude의 자동 승인 검토는 쓰기 제한과 함께 유지한다. 쓰기 경계 확대와 격리 밖 재실행 요청은 자동 검토의 승인으로 허용할 수 없는 거부 대상으로 두고, 나머지 검토 대상은 provider의 자동 검토로 처리한다. 허용 범위 안의 모든 동작에 검토가 발생한다고 보장하지 않으며, 자동 검토가 비활성화된 설정이나 단순 편집 자동 승인 모드를 이 요구사항의 자동 검토 유지로 간주하지 않는다. Worker 결과에 대한 Loop Manager의 Reviewer 검토는 provider의 실행 전 승인 검토와 별개로 유지한다.
+
+새 호출에서 요구한 쓰기 제한과 자동 검토의 적용을 확인할 수 없거나, 격리 때문에 기존 허용 작업을 수행할 수 없으면 제한을 해제하거나 자동 검토를 끈 채 진행하지 않는다. 지원하지 않는 provider·운영체제·CLI 버전, 설정 충돌과 격리 초기화 실패의 구체적 원인을 남기고 작업물·session·재시도 이력을 보존한 채 해당 자동 실행을 중단한다. 내장 sandbox를 지원하지 않는 Claude native Windows는 이러한 미지원 환경으로 명확히 판정하며, 이 요구사항을 근거로 WSL·컨테이너 등 새로운 실행 infrastructure를 자동 도입하지 않는다. 격리 증거가 없는 과거 실행의 Git 판정은 기존 엄격 감시를 유지한다.
+
+격리 적용·거부와 실제 효력 확인 결과는 provider·CLI 버전·실행 환경·역할·선택된 canonical worktree·repository identity·유효 설정·Agent session 및 개별 호출에 결합해 보존한다. CLI 인자나 설정의 존재만으로 격리 확인을 기록하지 않으며, provider 내부 쓰기를 포함한 경계를 증명할 수 없으면 확인되지 않은 것으로 남긴다. 세션 재개, provider·설정 변경과 중단 뒤의 새 호출에서는 다시 확인한다. 비밀값이나 source checkout의 로컬 파일 내용은 증거에 저장하지 않는다.
+
 Loop Manager 자신이 process lock 아래 수행한 fetch, 관리 worktree 생성·정리·rebase, source safe fast-forward와 runtime worktree 생성·정리는 각 작업의 소유 대상, 실행 전 기대 상태와 실행 뒤 실제 결과를 연결한 durable checkpoint로 증명한다. Agent 시작 snapshot 이후 Manager 작업이 있었다면, 해당 checkpoint와 실제 Git 상태가 정확히 일치하는 부분만 Agent 범위 판정 전에 기준선에 반영한다. Agent의 원래 허용 파일 변경과 session·실행 증거는 보존하며, 불완전한 checkpoint나 관측 OID만으로 Manager 소유권을 추정하지 않는다. Git 작업과 상태 저장 사이에 중단돼도 같은 증거로 재개하고, 다른 주체의 변화가 섞였으면 영향을 받는 작업을 차단한다.
 
 저장된 `PLAN_BLOCKED`·`PROJECT_BLOCKED`의 원인이 격리가 증명된 실행의 무관한 변화 또는 증명된 Manager 작업의 낡은 기준선뿐이라면, 선택된 관리 worktree의 identity·소유권·허용 변경과 사용 중인 ref·Git 상태를 다시 확인한 뒤 해당 차단을 해제하고 안전한 현재 기준으로 재조정한다. 기존 Agent session·작업물과 다른 계획의 차단 원인은 보존하고, 후보 revision이 달라졌다면 필요한 targeted test·전체 verify·Review를 다시 수행한다. 증거가 부족하거나 현재 작업에 영향을 주는 변화가 남으면 차단을 유지한다. source가 원격보다 뒤처졌는지와 dirty 때문에 fast-forward가 불가능한지는 차단 해제 뒤 bootstrap freshness 또는 일반 source sync 단계에서 독립적으로 판정한다.
@@ -76,6 +84,9 @@ self runtime handoff 판정은 같은 실행에서 병렬 프로젝트 작업을
 - runtime handoff는 해석한 `<base-branch>`, 현재 runtime SHA, fetch된 원격 SHA, self repository, Merge된 PR과 source sync 결과를 비밀값 없이 로그에 남기며 오류나 BLOCKED 알림으로 취급하지 않는다.
 - 자동 테스트는 `main`과 대체 base branch, 시작 시 equal bootstrap/runtime의 clean·dirty 진행, 시작 시 behind source의 clean·non-overlap dirty 갱신 후 runtime·PR 미시작, overlap dirty·ahead·diverged에서 구 bootstrap의 최신 runtime 실행 거부, 다음 실행의 최신 bootstrap/runtime 일치, Merge 직전 `PR_OPEN` mirror, 다중 Open PR 중 하나의 Merge, Agent 실행 중 bootstrap dirty 변화의 비귀속과 stale `default_worktree_mutation` 자동 해제, source dirty 상태의 managed rebase 지속, 실행 중 runtime보다 앞선 self Merge의 종료, 이미 최신 runtime에서 새로 확인한 Merge의 계속 실행, self Planner push 비트리거, 다른 clone·origin·runtime path 오인 방지, fetch 실패·non-fast-forward SHA 관계와 다중 프로젝트 scheduling 중 새 작업 미시작을 검증한다.
 - Agent 범위 테스트는 다른 local branch·tag·ref와 다른 worktree가 독립적으로 변경된 경우의 비차단, 실제 작업에 쓰는 ref·worktree 및 범위 밖 파일·index 변경의 차단, 격리 검증 실패 시 완화 거부, Manager rebase·fetch·worktree 작업 전후의 기준선 재조정, Git 작업과 checkpoint 저장 사이의 중단·재시작, Manager 변화와 영향권 외부 변화의 혼합, 기존 차단의 증거 기반 복구와 session·작업물 보존을 검증한다.
+- 각 역할의 신규 호출과 session 재개에서 workspace 및 허용 파일 쓰기와 source checkout·다른 worktree·shared Git metadata 쓰기 거부를 검증한다. Reviewer의 worktree 쓰기도 거부하며, provider 내부 쓰기를 분리해 증명할 수 없는 경우에는 격리 확인을 기록하지 않는다.
+- Codex·Claude의 지원 환경에서 쓰기 경계 확대와 격리 밖 재실행은 거부하면서 나머지 승인 검토 대상의 자동 검토가 유지됨을 검증한다. 단순 편집 자동 승인으로 대체하거나 자동 검토를 전부 비활성화한 설정은 실패로 판정한다. 기존 Loop Manager Reviewer 흐름도 유지한다.
+- CLI 버전·provider·설정 변경, session 재개와 중단 뒤의 증거 재확인, 설정 충돌·격리 초기화 실패·Claude native Windows 미지원 시 안전 중단과 상태 보존, 증거 없는 과거 실행의 엄격 판정을 검증한다. 확인·거부 기록에는 비밀값과 source checkout의 로컬 파일 내용을 포함하지 않는다.
 - 전체 verify에서 exact-SHA runtime bootstrap, process lock, Manager runtime scope reconciliation, PR conflict recovery, source checkout 보존과 origin-only Planner·Worker 입력 규칙이 유지된다.
 
 ## Product Impact
@@ -87,6 +98,7 @@ self runtime handoff 판정은 같은 실행에서 병렬 프로젝트 작업을
 - 최신 bootstrap으로 runtime이 이미 시작된 뒤 source checkout을 갱신할 수 없는 로컬 상태는 관리 worktree 작업을 막지 않는다. 시작 시 bootstrap이 원격보다 뒤처졌다면 갱신되기 전까지 runtime 자식을 시작하지 않는다.
 - bootstrap이 이미 원격 base revision이면 dirty 상태를 정리하지 않고 실행하며, Agent 실행 중 bootstrap 파일 상태가 바뀌어도 관리 worktree 위반으로 오인하거나 과거 signature에 프로젝트를 영구 차단하지 않는다.
 - Agent 범위 검사는 현재 계획의 안전에 필요한 Git 상태로 제한된다. 무관한 branch·worktree 변화는 실행을 막지 않고, Manager 소유 Git 작업은 검증된 checkpoint로 재개되며, 실제 영향권 위반은 계속 차단된다.
+- provider의 내장 workspace 쓰기 제한과 자동 승인 검토를 함께 사용한다. 격리 밖 쓰기 권한을 자동 승인하지 않으며, 지원하지 않거나 확인할 수 없는 환경에서는 상태를 보존하고 자동 실행을 멈춘다.
 
 ## Non-Goals
 

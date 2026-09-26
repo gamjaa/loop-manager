@@ -218,6 +218,25 @@ ExecPlan 파일은 구현 PR에 처음 포함하지 않는다. Planner 단계에
 - Worker는 commit, fetch, pull, rebase, push, worktree 등록과 PR 생성을 수행하지 않는다. Worker 반환 뒤의 모든 Git 쓰기는 Agent 호출 밖의 프로그램 코드가 소유한다
 - AI Agent와 verify subprocess에는 역할 수행에 필요한 환경 변수만 전달하고 Telegram token을 포함한 Loop Manager 비밀값을 상속하지 않는다
 
+### R-023: workspace 쓰기 제한과 자동 승인 검토 (구현 예정)
+
+2026-09-26 사용자 결정으로 provider의 내장 workspace 쓰기 제한을 우선 사용하고, Codex·Claude의 자동 승인 검토를 함께 유지하는 설계를 채택한다. 이 절은 R-023의 구현 대상 설계이며 현재 Merge된 동작의 구현 완료를 뜻하지 않는다. Agent 호출 밖에서 Manager가 Git 쓰기를 소유하는 기존 경계는 유지한다.
+
+provider adapter는 실제 호출 직전에 선택된 canonical worktree, Git worktree 등록과 repository identity를 확인하고, 신규 session과 재개 호출에 동일한 쓰기 정책을 명시한다. 허용 경로는 선택된 workspace와 실행별로 소유권을 확인한 최소 임시 경로로 제한한다. 사용자·프로젝트·session 설정의 병합으로 다른 worktree, source checkout, shared Git metadata 또는 넓은 임시 경로가 추가되면 이를 격리 확인으로 인정하지 않는다. workspace 정책과 별도로 기존 Planner·Worker·Reviewer·유지보수 Planner의 허용 파일 및 변경 범위 검사를 유지한다.
+
+- Codex는 선택된 관리 worktree를 `-C`로 지정하고, 쓰기 역할에는 `workspace-write`, Reviewer에는 `read-only`를 적용한다. `approvals_reviewer="auto_review"`를 유지하면서 `approval_policy.granular`의 `sandbox_approval=false`, `request_permissions=false`로 sandbox 밖 실행과 권한 확대 요청을 거부한다. 필요한 나머지 승인 항목은 검토 대상으로 유지한다. `approval_policy="never"`로 전체 자동 검토를 비활성화하거나, 편의 CLI 옵션이 명시한 granular 정책을 덮어쓰게 하지 않는다.
+- Codex의 추가 `writable_roots`는 Manager가 허용한 최소 경로만 포함한다. 기본 `/tmp` 및 `$TMPDIR` 쓰기 범위는 `exclude_slash_tmp`, `exclude_tmpdir_env_var`로 제외하고 필요 시 실행별 임시 경로만 추가한다. `.git` pointer file과 그 resolved Git directory를 포함한 보호 경로 및 shared Git directory는 쓰기를 허용하지 않는다. 상속된 profile·규칙·확장 기능이 경계를 우회할 수 없는지도 확인한다.
+- Claude의 쓰기 역할은 `--permission-mode auto`를 명시하고 지원 모델·계정·CLI 버전에서 실제 적용 여부를 확인한다. `acceptEdits`는 편집 자동 승인 모드이므로 자동 검토 유지의 대체 설정으로 사용하지 않는다. Reviewer는 기존 읽기 전용 역할과 편집 도구 금지를 유지하고, 해당 역할에서도 지원되는 자동 검토 경로를 확인한다. 지원되지 않으면 권한 모드를 완화하지 않고 원인을 기록한다.
+- Claude는 `sandbox.enabled=true`, `failIfUnavailable=true`, `allowUnsandboxedCommands=false`를 적용하고 `excludedCommands`를 비워 sandbox 밖 재실행을 막는다. sandbox 안 명령을 자동 검토 없이 일괄 승인하지 않도록 `autoAllowBashIfSandboxed=false`를 사용해 permission mode의 검토 흐름을 유지한다. 실제 검토 대상은 provider 정책에 따르며 모든 읽기·편집·명령이 검토된다고 표시하지 않는다.
+- Claude의 linked worktree는 기본 sandbox에서 main repository의 shared `.git` 쓰기가 추가 허용될 수 있으므로 resolved shared Git directory와 worktree Git directory를 `sandbox.filesystem.denyWrite`로 명시적으로 거부한다. 설정 병합으로 추가 workspace나 우회 예외가 생기지 않도록 확인한다. Bash sandbox 밖에서 처리하는 Edit·Write·NotebookEdit 등 파일 도구에도 같은 쓰기 경계를 강제한다. Reviewer는 선택된 worktree의 쓰기까지 거부한다.
+- 내장 sandbox가 없는 Claude native Windows는 미지원으로 진단하고 해당 Agent 호출을 시작하지 않는다. Linux와 Codex native Windows도 필요한 CLI 기능과 sandbox 초기화를 확인할 수 없으면 동일하게 중단한다. WSL·컨테이너 전환이나 새로운 외부 격리 infrastructure는 이 설계에 포함하지 않는다.
+
+격리 정책 작성과 실제 효력 확인은 provider 호출 경계의 독립 책임으로 두고, 기존 Agent invocation·session·snapshot 저장과 연결한다. SQLite에는 호환 가능한 추가 저장만 사용하며, 개별 호출마다 provider, CLI 버전, 실행 환경, 역할, canonical worktree, repository identity, 유효한 격리 정책의 지문, session/호출 identity와 확인·거부 결과를 보존한다. 증거 저장이나 확인이 실패하면 검증된 실행으로 취급하지 않는다. 재개·provider 전환·설정 변경·중단 뒤에는 이전 증거를 새 호출의 증거로 재사용하지 않는다. 비밀값, 인증 자료와 source checkout의 로컬 파일 내용은 저장하지 않는다.
+
+단순 CLI 옵션, cwd 지정, 자동 검토의 승인 또는 사후 Git diff만으로 호출 전 격리를 증명하지 않는다. 실제 적용되는 정책과 허용 경로 쓰기·금지 경로 쓰기 거부를 확인하며, source checkout의 로컬 상태를 바꾸지 않고 증명해야 한다. provider 자체의 Git 임시 ref·파일 도구·session 처리까지 분리해 증명할 수 없으면 미확인 결과를 남기고 무관한 Git 변화의 검사 범위를 축소하지 않는다. 신규 호출에서 요구 정책을 적용·확인할 수 없거나 기존 허용 작업과 양립하지 않으면 원인과 기존 작업물·session을 보존한 채 중단한다. 격리 증거가 없는 과거 snapshot과 session의 판정은 기존 엄격한 shared ref·다른 worktree 감시를 유지한다. Loop Manager의 Worker 이후 Reviewer 검토는 provider의 실행 전 자동 승인 검토와 별도로 유지한다.
+
+설정 의미와 지원 범위는 구현 시 설치된 CLI와 공식 문서를 대조한다: [OpenAI 승인 정책 설정](https://learn.chatgpt.com/docs/config-file/config-reference), [Codex 자동 검토](https://learn.chatgpt.com/docs/sandboxing/auto-review), [Claude sandbox](https://code.claude.com/docs/en/sandboxing), [Claude permission mode](https://code.claude.com/docs/en/permission-modes). 지원되지 않는 key를 무시한 실행을 격리 확인으로 기록하지 않는다.
+
 ### AGENTS.md 변경 제안과 승인
 
 - Worker는 현재 ExecPlan에 필요한 `AGENTS.md` 변경을 발견해도 파일을 직접 수정하지 않고 선택된 ExecPlan의 `Decision Log`에 대상 경로, 프로젝트 전용·공통 범위, 이유, 영향과 정확한 patch를 기록한다
