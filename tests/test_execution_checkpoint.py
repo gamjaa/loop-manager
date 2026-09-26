@@ -132,6 +132,21 @@ class CheckpointAssessmentTests(unittest.TestCase):
             connection, Path('/repo'), 'repo', 'G-044', 'loop/G-044',
             Path('/owned'), oid, git,
         ), oid)
+        row.update(
+            identity_reason_code='review_retry_exhausted',
+            identity_evidence='review failed',
+            reason_code='reclassified', evidence='later failure',
+        )
+        self.assertEqual(checkpoint_ownership.owned_remote_oid(
+            connection, Path('/repo'), 'repo', 'G-044', 'loop/G-044',
+            Path('/owned'), oid, git,
+        ), oid)
+        row['identity_evidence'] = 'forged'
+        self.assertIsNone(checkpoint_ownership.owned_remote_oid(
+            connection, Path('/repo'), 'repo', 'G-044', 'loop/G-044',
+            Path('/owned'), oid, git,
+        ))
+        row['identity_evidence'] = 'review failed'
         row['commit_identity'] = 'forged'
         self.assertIsNone(checkpoint_ownership.owned_remote_oid(
             connection, Path('/repo'), 'repo', 'G-044', 'loop/G-044',

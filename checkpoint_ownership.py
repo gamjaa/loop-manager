@@ -42,20 +42,29 @@ def owned_remote_oid(
             if (message.splitlines()[0] != f'[{plan_id}] BLOCKED checkpoint'
                     or 'Scope: plan' not in message.splitlines()):
                 return None
-        elif (
-            row['local_oid'] != published
-            or row['commit_identity'] != blocked_checkpoint.checkpoint_identity(
-                plan_id=plan_id,
-                reason_code=str(row['identity_reason_code']
-                                if row['identity_reason_code'] is not None
-                                else row['reason_code']),
-                evidence=str(row['identity_evidence']
-                             if row['identity_evidence'] is not None
-                             else row['evidence']), parent_oid=published,
-                tree_oid=tree, included_paths=(),
+        else:
+            # Older checkpoint rows only recorded the current block inputs.
+            keys = row.keys()
+            identity_reason = (
+                row['identity_reason_code']
+                if 'identity_reason_code' in keys else None
             )
-        ):
-            return None
+            identity_evidence = (
+                row['identity_evidence']
+                if 'identity_evidence' in keys else None
+            )
+            if (
+                row['local_oid'] != published
+                or row['commit_identity'] != blocked_checkpoint.checkpoint_identity(
+                    plan_id=plan_id,
+                    reason_code=str(identity_reason if identity_reason is not None
+                                    else row['reason_code']),
+                    evidence=str(identity_evidence if identity_evidence is not None
+                                 else row['evidence']),
+                    parent_oid=published, tree_oid=tree, included_paths=(),
+                )
+            ):
+                return None
         if git(repo_path, 'merge-base', '--is-ancestor', published,
                remote_oid, check=False).returncode != 0:
             return None
