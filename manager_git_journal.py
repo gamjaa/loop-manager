@@ -574,11 +574,15 @@ def verified_managed_transitions(
         return []
     transitions = []
     for slot in root.iterdir():
-        if not slot.is_dir() or (slot / "active.json").exists():
+        if not slot.is_dir():
             continue
+        active = slot / "active.json"
+        active_id = _read(active).get("id") if active.exists() else None
         for result_path in slot.glob("*.result.json"):
             result = _read(result_path)
-            if result.get("status") != "complete":
+            # A pending operation must not hide earlier sealed evidence. Its
+            # own result remains unavailable until active-intent cleanup ends.
+            if result.get("id") == active_id or result.get("status") != "complete":
                 continue
             intent = _read(slot / f"{result.get('id')}.intent.json")
             if intent.get("repo") != repo or intent.get("owner") != owner:

@@ -138,6 +138,92 @@ class ManagedTransitionTests(unittest.TestCase):
                         reflog_marker=False,
                     )
 
+    def test_pending_continuation_preserves_sealed_conflict_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            target = str((state / 'worktree').resolve())
+            before = {
+                'head': OLD, 'branch': BRANCH, 'ref': [OLD, ''],
+                'index': {'app.py': ['old']}, 'dirty': {},
+                'registration': [f'HEAD={OLD}', f'branch=refs/heads/{BRANCH}'],
+                'operations': {}, 'metadata': None, 'index_clean': True,
+            }
+            expected = {
+                'branch': BRANCH, 'before_head': OLD, 'target_base_oid': NEW,
+                'remote_oid': OLD, 'affected_paths': ['app.py'],
+                'agent_session_id': 'worker-original',
+            }
+            conflict = {
+                **before, 'head': NEW, 'branch': None,
+                'index': {'app.py': [f'H 100644 {OLD} 1', f'H 100644 {NEW} 2']},
+                'dirty': {'app.py': [['unstaged'], 'conflict']},
+                'registration': [f'HEAD={NEW}', 'detached=True'],
+                'metadata': {'orig-head': OLD,
+                             'head-name': f'refs/heads/{BRANCH}', 'onto': NEW},
+                'unmerged': True, 'index_clean': False,
+            }
+            sealed_id = journal.begin_rebase(
+                state, owner='plan:G-091', repo='/repo', target=target,
+                before=before, expected=expected,
+            )
+            journal.complete_rebase(
+                state, repo='/repo', target=target, observe=lambda: conflict,
+                validate=lambda intent, observed: journal.verified_rebase_result(
+                    intent, observed, current_remote_oid=OLD,
+                    target_ancestor=True, patches_preserved=False, reflog_marker=False,
+                ),
+            )
+            corrected = {
+                **conflict, 'index': {'app.py': [f'H 100644 {TREE} 0']},
+                'dirty': {'app.py': [['staged'], 'resolved']}, 'unmerged': False,
+            }
+            pending_id = journal.begin_rebase(
+                state, owner='plan:G-091', repo='/repo', target=target,
+                before=corrected, expected={**expected, 'action': 'continue',
+                                           'accepted_files': {'app.py': 'resolved'},
+                                           'staged_tree_oid': TREE},
+            )
+            # Restart after saving intent but before invoking Git: no outcome
+            # can be sealed, and the same intent must remain available to retry.
+            validate = mock.Mock()
+            self.assertFalse(journal.complete_rebase(
+                state, repo='/repo', target=target,
+                observe=lambda: corrected, validate=validate,
+            ))
+            validate.assert_not_called()
+            slot = journal._slot(state, '/repo', 'managed_rebase', target)
+            self.assertEqual(journal._read(slot / 'active.json')['id'], pending_id)
+            self.assertFalse((slot / f'{pending_id}.result.json').exists())
+            transitions = journal.verified_managed_transitions(
+                state, '/repo', 'plan:G-091', agent_session_id='worker-original',
+            )
+            self.assertEqual([item['intent']['id'] for item in transitions], [sealed_id])
+            self.assertEqual(journal.verified_managed_transitions(
+                state, '/repo', 'plan:G-091', agent_session_id='other-worker',
+            ), [])
+            handler = object.__new__(ExecutionHandlers)
+            handler.state_dir, handler.repo_path = state, Path('/repo')
+            context = SimpleNamespace(
+                plan=SimpleNamespace(plan_id='G-091'), worktree=Path(target),
+                worker_session_id='worker-original',
+            )
+            current = SimpleNamespace(expected_head=OLD, target_base_oid=NEW)
+            self.assertTrue(handler._matching_rebase_journal_result(
+                context, current, OLD, corrected, allow_later_file_changes=True,
+            ))
+            self.assertFalse(handler._matching_rebase_journal_result(
+                context, current, OLD, {**corrected, 'ref': [NEW, '']},
+                allow_later_file_changes=True,
+            ))
+            # A result written before active.json cleanup is still pending.
+            # It must not be exposed just because older results are now visible.
+            (slot / 'active.json').write_text(
+                (slot / f'{sealed_id}.intent.json').read_text(),
+            )
+            self.assertEqual(journal.verified_managed_transitions(
+                state, '/repo', 'plan:G-091', agent_session_id='worker-original',
+            ), [])
+
     def test_conflict_rejects_unrelated_file_and_index_changes(self):
         before = {
             'head': OLD, 'branch': BRANCH, 'ref': [OLD, ''],
