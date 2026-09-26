@@ -28,7 +28,7 @@ class ManagerGitTransitionTests(unittest.TestCase):
     def test_source_local_delta_cannot_become_agent_baseline(self):
         before = {
             "head": OLD, "branch": "main", "changes": [["untracked", "user.txt", "sig"]],
-            "operations": [],
+            "operations": [], "index": {},
         }
         intent = {
             "kind": "source_fast_forward", "target": "/source",
@@ -42,6 +42,31 @@ class ManagerGitTransitionTests(unittest.TestCase):
             journal.verified_transition(
                 intent, {**intent["expected"], "changes": []}, True,
             )
+
+    def test_source_rejects_legacy_evidence_without_index(self):
+        before = {"head": OLD, "branch": "main", "changes": [], "operations": []}
+        intent = {
+            "kind": "source_fast_forward", "target": "/source",
+            "before": before, "expected": {**before, "head": NEW},
+        }
+        with self.assertRaises(journal.MutationEvidenceError):
+            journal.verified_transition(intent, intent["expected"], True)
+
+    def test_runtime_removal_requires_owned_registration_and_receipt(self):
+        intent = {
+            "kind": "runtime_remove", "target": "/runtime",
+            "before": {"exists": True, "registration": {
+                "head": OLD, "detached": True, "locked": "loop-manager-runtime:" + "a" * 32,
+            }},
+            "expected": {"exists": False, "registration": None},
+        }
+        self.assertEqual(journal.verified_transition(intent, intent["expected"], True),
+                         {"refs": {}, "worktrees": {"/runtime": None}})
+        with self.assertRaises(journal.MutationEvidenceError):
+            journal.verified_transition(intent, intent["expected"], False)
+        intent["before"]["registration"]["locked"] = "external"
+        with self.assertRaises(journal.MutationEvidenceError):
+            journal.verified_transition(intent, intent["expected"], True)
 
     def test_pending_mixed_state_blocks_and_preserves_intent(self):
         with tempfile.TemporaryDirectory() as directory:

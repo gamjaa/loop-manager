@@ -1196,6 +1196,13 @@ def prepare_runtime_worktree(
         raise WorkspaceOwnershipError(
             f"runtime 경로가 source checkout 내부에 있습니다: {runtime}"
         )
+    removal_slot = manager_git_journal._slot(
+        state_dir, str(source), "runtime_remove", str(runtime),
+    )
+    if (removal_slot / "active.json").exists():
+        remove_runtime_worktree(
+            source, state_dir, RuntimeWorktree(runtime, commit_sha, mutation_id),
+        )
     if mutation_id is not None:
         manager_git_journal.recover_active(
             state_dir, repo=str(source), kind="runtime_create", target=str(runtime),
@@ -1280,6 +1287,66 @@ def prepare_runtime_worktree(
     return RuntimeWorktree(runtime, commit_sha, mutation_id)
 
 
+def remove_runtime_worktree(
+    source: Path, state_dir: Path, runtime: RuntimeWorktree,
+) -> None:
+    """Remove an inactive owned runtime under the caller's process lock.
+
+    A missing directory is never proof of our removal: recovery requires the
+    durable receipt written only after a successful non-forced Git removal.
+    """
+    source = _canonical_path(source)
+    path = runtime.path
+    sha = runtime.commit_sha
+    _validate_managed_path_boundary(
+        state_dir, path, expected_runtime_worktree(state_dir, source, sha),
+        "runtime worktree",
+    )
+    receipts = state_dir / "runtime-removals"
+
+    def marker(intent: Mapping[str, object]) -> bool:
+        receipt = receipts / f"{intent['id']}.json"
+        return receipt.is_file() and manager_git_journal._read(receipt) == {
+            "id": intent["id"], "repo": str(source), "target": str(path),
+            "before": intent["before"],
+        }
+
+    if manager_git_journal.recover_active(
+        state_dir, repo=str(source), kind="runtime_remove", target=str(path),
+        observe=lambda: _runtime_transition_state(source, path), marker=marker,
+    ):
+        return
+    validate_runtime_worktree(source, state_dir, path, sha)
+    before = _runtime_transition_state(source, path)
+    lock_reason = before["registration"]["locked"]
+    _validate_runtime_lock_origin(state_dir, source, path, sha, lock_reason)
+    # Do not let Git remove ignored user data as part of an otherwise clean tree.
+    if _ignored_worktree_paths(path):
+        raise WorkspaceOwnershipError("runtime ignored 파일을 보존하기 위해 정리를 중단합니다.")
+    receipts.mkdir(parents=True, exist_ok=True)
+    manager_git_journal._sync_directory(state_dir)
+
+    def apply(token: str) -> None:
+        validate_runtime_worktree(source, state_dir, path, sha)
+        if _runtime_transition_state(source, path) != before or _ignored_worktree_paths(path):
+            raise WorkspaceOwnershipError("runtime 정리 직전 상태가 변경됐습니다.")
+        git(source, "worktree", "unlock", str(path))
+        # An interruption after unlock or before the receipt deliberately blocks;
+        # neither absence nor a stale creation marker can authorize recovery.
+        git(source, "worktree", "remove", str(path))
+        manager_git_journal._write_new(receipts / f"{token}.json", {
+            "id": token, "repo": str(source), "target": str(path), "before": before,
+        })
+
+    manager_git_journal.execute(
+        state_dir, owner="bootstrap", kind="runtime_remove", repo=str(source),
+        target=str(path), before=before,
+        expected={"exists": False, "registration": None},
+        observe=lambda: _runtime_transition_state(source, path),
+        apply=apply, marker=marker,
+    )
+
+
 def bootstrap_base_branch(source: Path, state_dir: Path, origin: str) -> str:
     """Read a registered self base without changing SQLite before the handoff."""
 
@@ -1339,7 +1406,7 @@ def _recorded_base_fetch(
 
     def marker(intent: Mapping[str, object]) -> bool:
         token = intent["id"]
-        result = git(repo, "reflog", "show", "--format=%H%x00%gs", refname,
+        result = git(repo, "reflog", "show", "-1", "--format=%H%x00%gs", refname,
                      check=False)
         return (
             result.returncode == 0
@@ -1498,6 +1565,11 @@ def run_runtime_child(
         cwd=runtime.path,
         check=False,
     )
+    if runtime.mutation_id is not None:
+        try:
+            remove_runtime_worktree(source, state_dir, runtime)
+        except (RuntimeError, OSError) as error:
+            operation_log(f"runtime 정리 보류: {error}", error=True)
     return completed.returncode
 
 
@@ -6579,23 +6651,41 @@ def _source_transition_state(repo: Path) -> dict[str, object]:
     snapshot = _base_worktree_snapshot(repo)
     return {
         "branch": snapshot.branch, "head": snapshot.head,
+        "index": {path: list(entries) for path, entries in snapshot.index},
         "changes": [list(entry) for entry in snapshot.changes],
         "operations": [list(entry) for entry in snapshot.operations],
     }
 
 
 def _source_transition_marker(repo: Path, base: str, intent: Mapping[str, object]) -> bool:
-    refname = f"refs/heads/{base}"
-    result = git(repo, "reflog", "show", "--format=%H%x00%gs", refname,
-                 check=False)
-    token = f"loop-manager-source:{intent['id']}"
-    return (
-        result.returncode == 0
-        and any(
-            line.startswith(f"{intent['expected']['head']}\x00") and token in line
-            for line in result.stdout.splitlines()
-        )
-    )
+    token = f"loop-manager-source:{intent['id']}: "
+    for refname in (f"refs/heads/{base}", "HEAD"):
+        result = git(repo, "reflog", "show", "-1", "--format=%H%x00%gs",
+                     refname, check=False)
+        if result.returncode or not result.stdout.startswith(
+            f"{intent['expected']['head']}\x00{token}"
+        ):
+            return False
+    return True
+
+
+def _source_expected_index(
+    repo: Path, selected_remote: str, before_index: Mapping[str, object],
+    changed_paths: tuple[str, ...],
+) -> dict[str, object]:
+    """Keep local entries verbatim and replace only the remote tree delta."""
+    expected = dict(before_index)
+    remote_entries = {}
+    for record in git_bytes(repo, "ls-tree", "-r", "-z", selected_remote).split(b"\0"):
+        if record:
+            metadata, path = record.split(b"\t", 1)
+            mode, _kind, oid = metadata.decode("ascii").split()
+            remote_entries[os.fsdecode(path)] = [f"H {mode} {oid} 0"]
+    for path in changed_paths:
+        expected.pop(path, None)
+        if path in remote_entries:
+            expected[path] = remote_entries[path]
+    return expected
 
 
 def synchronize_base_worktree(
@@ -6761,7 +6851,21 @@ def synchronize_base_worktree(
                 raise manager_git_journal.MutationEvidenceError(
                     "source fast-forward 직전 HEAD 또는 branch가 변경됐습니다."
                 )
-            expected_state = {**before_state, "head": selected_remote}
+            if before_state != {
+                "branch": before.branch, "head": before.head,
+                "index": {path: list(entries) for path, entries in before.index},
+                "changes": [list(entry) for entry in before.changes],
+                "operations": [list(entry) for entry in before.operations],
+            }:
+                raise manager_git_journal.MutationEvidenceError(
+                    "source fast-forward 직전 로컬 상태가 변경됐습니다."
+                )
+            expected_state = {
+                **before_state, "head": selected_remote,
+                "index": _source_expected_index(
+                    repo, selected_remote, before_state["index"], changed_paths,
+                ),
+            }
 
             def apply(token: str) -> None:
                 environment = {**os.environ,

@@ -44,10 +44,12 @@ def verified_transition(
         )
     elif kind == "source_fast_forward":
         valid = (
-            set(before) == set(expected) == {"head", "branch", "changes", "operations"}
+            set(before) == set(expected) == {"head", "branch", "index", "changes", "operations"}
             and isinstance(before["head"], str) and oid.fullmatch(before["head"])
             and isinstance(expected["head"], str) and oid.fullmatch(expected["head"])
             and isinstance(before["branch"], str) and before["branch"] == expected["branch"]
+            and isinstance(before["index"], dict)
+            and isinstance(expected["index"], dict)
             and before["changes"] == expected["changes"]
             and before["operations"] == expected["operations"] == []
         )
@@ -68,7 +70,12 @@ def verified_transition(
             ))
             and (kind != "runtime_remove" or (
                 before["exists"] is True
-                and before["registration"] is not None
+                and isinstance(before["registration"], dict)
+                and isinstance(before["registration"].get("head"), str)
+                and oid.fullmatch(before["registration"]["head"])
+                and before["registration"].get("detached") is True
+                and isinstance(before["registration"].get("locked"), str)
+                and before["registration"]["locked"].startswith("loop-manager-runtime:")
                 and expected == {"exists": False, "registration": None}
             ))
         )
