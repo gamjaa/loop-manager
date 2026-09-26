@@ -1558,6 +1558,7 @@ def run_runtime_child(
     completed = subprocess.run(
         [
             sys.executable,
+            "-B",  # Keep immutable runtime imports from creating ignored bytecode.
             "-u",
             str(runtime.path / "loop_manager.py"),
             *child_arguments,
@@ -14563,16 +14564,17 @@ def _record_manager_base_fetch_intent(
         try:
             saved = json.loads(str(existing["before_ref"]))
             cursor = tuple(saved) if saved is not None else None
-            for prior in connection.execute(
+            successors = connection.execute(
                 "SELECT * FROM manager_base_fetches WHERE repo = ? AND plan_id = ? "
                 "AND refname = ? AND id >= ? ORDER BY id",
                 (repo, plan_id, refname, int(existing["id"])),
-            ):
+            ).fetchall()
+            for prior in successors:
                 previous = json.loads(str(prior["before_ref"]))
                 previous = tuple(previous) if previous is not None else None
                 if previous != cursor or (
                     prior["phase"] != "complete"
-                    and not _manager_base_fetch_applied(repo_path, prior)
+                    and not _manager_base_fetch_applied(repo_path, prior, successors)
                 ):
                     raise RuntimeError("이전 Manager base fetch 체인을 증명할 수 없습니다.")
                 cursor = (str(prior["target_oid"]), "")
@@ -14591,23 +14593,44 @@ def _record_manager_base_fetch_intent(
     return int(cursor.lastrowid)
 
 
-def _manager_base_fetch_applied(repo_path: Path, row: sqlite3.Row) -> bool:
-    """Check the Git record of this exact Manager ref update after a crash."""
+def _manager_base_fetch_applied(
+    repo_path: Path, row: sqlite3.Row,
+    successors: list[sqlite3.Row] | None = None,
+) -> bool:
+    """Require this action at the tip or an uninterrupted owned reflog suffix."""
     token = str(row["action_token"] or "")
     if not re.fullmatch(r"[0-9a-f]{32}", token):
         return False
-    # Later Manager fetches can move this entry away from the reflog tip.
-    # Match the exact action and target in retained history; the caller still
-    # requires an unbroken intent chain from the saved snapshot to current refs.
     reflog = git(
         repo_path, "reflog", "show", "--format=%H%x00%gs",
         str(row["refname"]), check=False,
     )
-    return (
-        reflog.returncode == 0
-        and f"{row['target_oid']}\x00loop-manager-base-fetch:{token}"
-        in reflog.stdout.splitlines()
-    )
+    if reflog.returncode:
+        return False
+    lines = reflog.stdout.splitlines()
+    action = f"{row['target_oid']}\x00loop-manager-base-fetch:{token}"
+    if lines.count(action) != 1:
+        return False
+    position = lines.index(action)
+    cursor = str(row["target_oid"])
+    remaining = [item for item in (successors or [])
+                 if item["refname"] == row["refname"] and item["id"] > row["id"]]
+    for line in reversed(lines[:position]):
+        matched = None
+        for candidate in remaining:
+            try:
+                previous = json.loads(str(candidate["before_ref"]))
+            except (TypeError, ValueError):
+                return False
+            if (previous == [cursor, ""] and line ==
+                    f"{candidate['target_oid']}\x00loop-manager-base-fetch:{candidate['action_token']}"):
+                matched = candidate
+                break
+        if matched is None:
+            return False
+        cursor = str(matched["target_oid"])
+        remaining = [item for item in remaining if item["id"] > matched["id"]]
+    return _tracking_ref_oid(repo_path, str(row["refname"])) == cursor
 
 
 def _perform_manager_base_fetch(
@@ -14747,7 +14770,7 @@ def _proven_manager_base_refs(
             previous = tuple(previous) if previous is not None else None
             if previous == cursor and (
                 row["phase"] == "complete"
-                or _manager_base_fetch_applied(repo_path, row)
+                or _manager_base_fetch_applied(repo_path, row, rows)
             ):
                 cursor = (str(row["target_oid"]), "")
         if cursor is not None and cursor == current.refs.get(refname):

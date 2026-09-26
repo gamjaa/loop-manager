@@ -186,6 +186,97 @@ class OriginIsolatedRegistrationAndExecutionTest(unittest.TestCase):
             ).fetchone()[0], "complete")
             connection.close()
 
+    def test_guidance_fetch_rejects_external_round_trip_after_journal_crash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _remote, source, writer = remote_fixture(directory)
+            state = Path(directory) / "state"
+            before = loop_manager.capture_git_snapshot(source)
+            old = git(source, "rev-parse", "origin/main")
+            selected = advance_remote(writer)
+            database = Path(directory) / "guidance.sqlite"
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.MANAGER_BASE_FETCH_SCHEMA)
+            identity = loop_manager._record_manager_base_fetch_intent(
+                connection, source, str(source), "G-001", "main", before)
+            with mock.patch.object(manager_git_journal, "_finish", side_effect=RuntimeError("crash")):
+                with self.assertRaisesRegex(RuntimeError, "crash"):
+                    loop_manager._journaled_manager_base_fetch(
+                        connection, source, state, identity, "main", "G-001")
+            connection.close()
+            git(source, "update-ref", "-m", "external away", "refs/remotes/origin/main", old)
+            git(source, "update-ref", "-m", "external back", "refs/remotes/origin/main", selected)
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            try:
+                with self.assertRaises(manager_git_journal.MutationEvidenceError):
+                    loop_manager._journaled_manager_base_fetch(
+                        connection, source, state, identity, "main", "G-001")
+                self.assertEqual(connection.execute(
+                    "SELECT phase FROM manager_base_fetches WHERE id = ?", (identity,),
+                ).fetchone()[0], "pending")
+                self.assertTrue(list((state / "manager-git-journal").glob("*/active.json")))
+                self.assertEqual(git(source, "rev-parse", "origin/main"), selected)
+            finally:
+                connection.close()
+
+    def test_guidance_fetch_history_requires_uninterrupted_owned_suffix(self):
+        for external in (False, True):
+            with self.subTest(external=external), tempfile.TemporaryDirectory() as directory:
+                _remote, source, writer = remote_fixture(directory)
+                connection = sqlite3.connect(":memory:")
+                connection.row_factory = sqlite3.Row
+                connection.execute(loop_manager.MANAGER_BASE_FETCH_SCHEMA)
+                try:
+                    before = loop_manager.capture_git_snapshot(source)
+                    old = git(source, "rev-parse", "origin/main")
+                    first_sha = advance_remote(writer)
+                    first = loop_manager._record_manager_base_fetch_intent(
+                        connection, source, str(source), "G-001", "main", before)
+                    loop_manager._perform_manager_base_fetch(connection, source, first, "main")
+                    intermediate = loop_manager.capture_git_snapshot(source)
+                    advance_remote(writer, value="third")
+                    second = loop_manager._record_manager_base_fetch_intent(
+                        connection, source, str(source), "G-001", "main", intermediate)
+                    if external:
+                        git(source, "update-ref", "-m", "external away", "refs/remotes/origin/main", old)
+                        git(source, "update-ref", "-m", "external back", "refs/remotes/origin/main", first_sha)
+                    loop_manager._perform_manager_base_fetch(connection, source, second, "main")
+                    loop_manager._finish_manager_base_fetch(connection, source, second)
+                    rows = connection.execute("SELECT * FROM manager_base_fetches ORDER BY id").fetchall()
+                    self.assertEqual(loop_manager._manager_base_fetch_applied(
+                        source, rows[0], rows), not external)
+                    self.assertFalse(loop_manager._manager_base_fetch_applied(source, rows[0]))
+                    self.assertTrue(loop_manager._manager_base_fetch_applied(source, rows[1]))
+                finally:
+                    connection.close()
+
+    def test_runtime_imports_local_module_without_bytecode_and_is_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _remote, source, _writer = remote_fixture(directory)
+            (source / ".gitignore").write_text("__pycache__/\n")
+            (source / "runtime_helper.py").write_text("VALUE = 7\n")
+            (source / "loop_manager.py").write_text(
+                "import runtime_helper\nraise SystemExit(runtime_helper.VALUE)\n")
+            sha = commit_all(source, "Runtime import fixture")
+            state = Path(directory) / "state"
+            with loop_manager.process_lock(state):
+                runtime = loop_manager.prepare_runtime_worktree(
+                    source, state, mutation_id="a" * 32, commit_sha=sha)
+                remove = loop_manager.remove_runtime_worktree
+                def checked_remove(*args):
+                    self.assertFalse((runtime.path / "__pycache__").exists())
+                    self.assertFalse(loop_manager._ignored_worktree_paths(runtime.path))
+                    remove(*args)
+                with mock.patch.object(loop_manager, "remove_runtime_worktree", side_effect=checked_remove) as cleanup:
+                    self.assertEqual(loop_manager.run_runtime_child(
+                        source, state, source / "config.ini", runtime, []), 7)
+                    cleanup.assert_called_once()
+                self.assertFalse(runtime.path.exists())
+                self.assertEqual(loop_manager._runtime_transition_state(source, runtime.path),
+                                 {"exists": False, "registration": None})
+                self.assertFalse(list((state / "manager-git-journal").glob("*/active.json")))
+
     def test_source_fast_forward_recovers_without_touching_disjoint_local_delta(self):
         with tempfile.TemporaryDirectory() as directory:
             _remote, source, writer = remote_fixture(directory)
