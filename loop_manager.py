@@ -13828,6 +13828,16 @@ def _resume_interrupted_blocked_rebase(
     marker = (checkpoint.snapshot or {}).get('blocked_resume')
     if not marker:
         return None
+    published = connection.execute(
+        'SELECT phase, accepted_remote_oid FROM blocked_checkpoints '
+        'WHERE repo = ? AND plan_id = ?',
+        (repo, plan['plan_id']),
+    ).fetchone()
+    if (published is None or published['phase'] != 'published'
+            or marker.get('owner_oid') != published['accepted_remote_oid']):
+        # A later block may publish a new checkpoint while retaining the old
+        # execution snapshot. It must start a fresh release proof.
+        return None
     current_head = git(worktree, 'rev-parse', 'HEAD').stdout.strip()
     before_head = str(marker.get('before_head') or '')
     after_head = str(marker.get('after_head') or '')

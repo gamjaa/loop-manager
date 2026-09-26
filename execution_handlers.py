@@ -294,13 +294,32 @@ class ExecutionHandlers:
             return True
         marker = (current.snapshot or {}).get('blocked_resume') if current else None
         if not marker and not row['publication_remote_oid']:
-            # A separately reviewed user correction is Worker input. It may
-            # coincide with origin, but grants no lease over a later rewrite.
-            local_oid = self.effects.workspace.git(
-                context.worktree, 'rev-parse', 'HEAD',
-            ).stdout.strip()
-            return (remote_oid is not None and remote_oid == local_oid
-                    and not row['pr_url'] and pull_request is None)
+            # A reviewed correction is Worker input only when its remote head
+            # is still the checkpoint's last accepted, owned ref.
+            if (row['pr_url'] or pull_request is not None
+                    or remote_oid != checkpoint['accepted_remote_oid']):
+                return False
+            try:
+                self.effects.workspace.validate_execplan_workspace_identity(
+                    self.state_dir, self.repo, context.plan.plan_id,
+                    context.branch, context.worktree,
+                )
+                self.effects.workspace.validate_managed_worktree(
+                    self.repo_path, context.worktree, context.branch,
+                )
+                local_oid = self.effects.workspace.git(
+                    context.worktree, 'rev-parse', 'HEAD',
+                ).stdout.strip()
+            except (RuntimeError, OSError):
+                return False
+            if local_oid != remote_oid:
+                return False
+            return checkpoint_ownership.owned_remote_oid(
+                self.effects.state.connection, self.repo_path, self.repo,
+                context.plan.plan_id, context.branch, context.worktree,
+                remote_oid, self.effects.workspace.git,
+                before_head=local_oid, recorded_oid=remote_oid,
+            ) == remote_oid
         if (
             not marker or row['pr_url']
             or (pull_request is not None and current.operation != 'pr_create')

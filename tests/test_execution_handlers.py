@@ -1775,12 +1775,14 @@ class ExecutionHandlerTests(TestCase):
         self.assertEqual(saved.observed_remote_oid, 'b' * 40)
         self.assertEqual(saved.snapshot['pushed_checkpoint_head'], 'b' * 40)
 
-    def test_accepted_user_correction_does_not_gain_checkpoint_lease(self):
+    def test_accepted_user_correction_requires_checkpoint_remote_ownership(self):
         blocked_checkpoint_state.ensure_schema(self.connection)
         self.connection.execute(
             "INSERT INTO blocked_checkpoints "
-            "(repo, plan_id, request_identity, phase, reason_code, evidence) "
-            "VALUES ('repo', 'G-047', 'request', 'published', 'review', 'evidence')"
+            "(repo, plan_id, request_identity, phase, reason_code, evidence, "
+            "accepted_remote_oid) "
+            "VALUES ('repo', 'G-047', 'request', 'published', 'review', "
+            "'evidence', 'user-head')"
         )
         self.effects.workspace.git.side_effect = lambda *_args, **_kwargs: SimpleNamespace(
             stdout='user-head\n', returncode=0,
@@ -1788,11 +1790,22 @@ class ExecutionHandlerTests(TestCase):
         current = SimpleNamespace(snapshot=None)
         row = {'pr_url': None, 'publication_remote_oid': None}
 
-        self.assertTrue(self.handler._owned_checkpoint_remote(
-            self.context(), row, 'user-head', current,
-        ))
+        with mock.patch.object(handlers.checkpoint_ownership, 'owned_remote_oid',
+                               return_value='user-head') as owner:
+            self.assertTrue(self.handler._owned_checkpoint_remote(
+                self.context(), row, 'user-head', current,
+            ))
+            owner.assert_called_once()
+            owner.return_value = None
+            self.assertFalse(self.handler._owned_checkpoint_remote(
+                self.context(), row, 'user-head', current,
+            ))
+        self.connection.execute(
+            "UPDATE blocked_checkpoints SET accepted_remote_oid = 'old-head' "
+            "WHERE repo = 'repo' AND plan_id = 'G-047'"
+        )
         self.assertFalse(self.handler._owned_checkpoint_remote(
-            self.context(), row, 'other-head', current,
+            self.context(), row, 'user-head', current,
         ))
 
     def test_external_remote_checkpoint_uses_publication_ownership_cause(self):

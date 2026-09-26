@@ -326,6 +326,87 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
     def test_owned_checkpoint_release_keeps_remote_oid_across_real_rebase(self):
         self._owned_checkpoint_release()
 
+    def test_new_block_ignores_previous_release_marker(self):
+        self._owned_checkpoint_release()
+        repo = str(self.repo.resolve())
+        store = blocked_checkpoint_state.BlockedCheckpointRepository(self.connection)
+        previous_oid = self.connection.execute(
+            "SELECT accepted_remote_oid FROM blocked_checkpoints "
+            "WHERE repo = ? AND plan_id = 'G-034'", (repo,),
+        ).fetchone()[0]
+        checkpoint_store = execution_checkpoint_state.ExecutionCheckpointRepository(
+            self.connection,
+        )
+        stale = checkpoint_store.get(repo, 'G-034').snapshot['blocked_resume']
+        request = self.block(evidence='second failure')
+        current = checkpoint_store.get(repo, 'G-034')
+        self.assertNotIn('blocked_resume', current.snapshot or {})
+        # Simulate a row written before block_plan cleared the previous marker.
+        checkpoint_store.record(
+            repo, 'G-034', expected_generation=current.generation,
+            operation=current.operation, expected_head=current.expected_head,
+            target_base_oid=current.target_base_oid,
+            observed_remote_oid=current.observed_remote_oid,
+            snapshot={**(current.snapshot or {}), 'blocked_resume': stale},
+        )
+        new_oid = self.run_git(self.worktree, 'rev-parse', 'HEAD')
+        self.assertNotEqual(new_oid, previous_oid)
+        tree = self.run_git(self.worktree, 'rev-parse', 'HEAD^{tree}')
+        identity = blocked_checkpoint.checkpoint_identity(
+            plan_id='G-034', reason_code=request.reason_code,
+            evidence=request.evidence, parent_oid=new_oid,
+            tree_oid=tree, included_paths=(),
+        )
+        store.record_prepared(request, blocked_checkpoint.PreparedCheckpoint(
+            new_oid, tree, identity, '', (),
+        ))
+        store.record_local(request, new_oid)
+        self.run_git(
+            self.worktree, 'push',
+            f'--force-with-lease=refs/heads/loop-manager/G-034:{previous_oid}',
+            'origin', 'HEAD:refs/heads/loop-manager/G-034',
+        )
+        store.finish_published(request, new_oid)
+        self.assertEqual(stale['owner_oid'], previous_oid)
+
+        plan = self.connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-034'",
+            (repo,),
+        ).fetchone()
+        fingerprint = loop_manager._revision_execplan_input_fingerprint(
+            self.repo, 'refs/remotes/origin/main', plan,
+        )
+        worktree_fingerprint = loop_manager._worktree_execplan_input_fingerprint(
+            self.worktree, plan,
+        )
+        self.connection.execute(
+            "UPDATE exec_plans SET blocked_fingerprint = ?, "
+            "blocked_worktree_fingerprint = ? "
+            "WHERE repo = ? AND plan_id = 'G-034'",
+            (fingerprint, worktree_fingerprint, repo),
+        )
+        self.connection.commit()
+        (self.repo / 'docs/PRODUCT.md').write_text(
+            'product\nnew input\nsecond input\n', encoding='utf-8',
+        )
+        self.run_git(self.repo, 'add', 'docs/PRODUCT.md')
+        self.run_git(self.repo, 'commit', '-m', 'Change product input again')
+        self.run_git(self.repo, 'push', 'origin', 'main')
+
+        self.assertTrue(loop_manager.resume_blocked_execplan_if_inputs_changed(
+            self.connection, self.repo, repo, 'main', self.state_dir,
+        ))
+        released = self.connection.execute(
+            "SELECT status, publication_remote_oid FROM exec_plans "
+            "WHERE repo = ? AND plan_id = 'G-034'", (repo,),
+        ).fetchone()
+        self.assertEqual(tuple(released), ('READY', new_oid))
+        resumed = execution_checkpoint_state.ExecutionCheckpointRepository(
+            self.connection,
+        ).get(repo, 'G-034').snapshot['blocked_resume']
+        self.assertEqual(resumed['owner_oid'], new_oid)
+        self.assertEqual(resumed['before_head'], new_oid)
+
     def _owned_checkpoint_release(self, *, dirty=False, tamper=False,
                                   tamper_preserved=False, after_save=False, staged=False):
         repo_id = str(self.repo.resolve())
