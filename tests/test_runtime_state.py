@@ -12,6 +12,36 @@ from scoped_blocking import BlockReasonCode
 
 
 class RuntimeStateRepositoryTest(unittest.TestCase):
+    def test_recovery_slot_waits_for_preserved_planning_attempt(self):
+        connection = self._connection()
+        self.addCleanup(connection.close)
+        repository = runtime_state.RuntimeStateRepository(connection)
+        for values in (
+            {"phase": "PLANNING"},
+            {"phase": None, "planning_error": "planner failed"},
+            {"phase": None, "planning_error_fingerprint": "failed-input"},
+            {"phase": None, "planning_workspace_owned": 1},
+            {"phase": None, "planning_retry_count": 2},
+            {"phase": None, "planning_result_completed": 1},
+        ):
+            with self.subTest(values=values):
+                connection.execute(
+                    "UPDATE projects SET phase = NULL, planning_error = NULL, "
+                    "planning_error_fingerprint = NULL, planning_workspace_owned = 0, "
+                    "planning_retry_count = 0, planning_result_completed = 0 "
+                    "WHERE repo = 'repo'"
+                )
+                connection.execute(
+                    "UPDATE projects SET planning_attempt_fingerprint = NULL "
+                    "WHERE repo = 'repo'"
+                )
+                repository.update_project('repo', values, enqueue=False)
+                self.assertFalse(repository.recovery_slot_available('repo'))
+        connection.execute(
+            "UPDATE projects SET planning_result_completed = 0 WHERE repo = 'repo'"
+        )
+        self.assertTrue(repository.recovery_slot_available('repo'))
+
     def test_activation_projects_owned_checkpoint_remote_oid(self):
         connection = self._connection()
         self.addCleanup(connection.close)

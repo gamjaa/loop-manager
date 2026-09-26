@@ -15559,7 +15559,14 @@ def complete_merged_execplan_worktree(
     worktree = Path(str(plan["worktree"] or ""))
     workspace_owned = WORKSPACE_OWNED
     cleanup_registration: tuple[str, ...] | None = None
-    if not (worktree.exists() or worktree.is_symlink()):
+    # Merge recording is plan-scoped; managed worktree cleanup can wait until
+    # the planning attempt releases the shared repository mutation slot.
+    planning_owns_slot = not runtime_state.RuntimeStateRepository(
+        connection
+    ).recovery_slot_available(repo)
+    if planning_owns_slot:
+        assessment = CleanupAssessment("deferred", "planning 실행 자리 보존")
+    elif not (worktree.exists() or worktree.is_symlink()):
         assessment = _assess_missing_managed_cleanup(state_dir, repo_path, worktree)
     elif int(plan["workspace_owned"]) != WORKSPACE_OWNED:
         workspace_owned = WORKSPACE_UNOWNED
@@ -15616,10 +15623,11 @@ def complete_merged_execplan_worktree(
             )
         plan_id = str(plan["plan_id"])
         mirrored = connection.execute(
-            "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
+            "SELECT * FROM projects WHERE repo = ?", (repo,)
         ).fetchone()
         project_values: dict[str, object] = {}
-        if mirrored and mirrored["plan_path"] == plan["path"]:
+        if (mirrored and not runtime_state.planning_owns_execution_slot(mirrored)
+                and mirrored["plan_path"] == plan["path"]):
             project_values.update(_clear_active_values())
         runtime_state.RuntimeStateRepository(connection).mark_merged(
             repo,
@@ -15744,6 +15752,12 @@ def observe_waiting_pull_requests(
         ):
             expected_head = str(stored["pr_head_oid"] or "")
             if expected_head and head_oid and str(head_oid) != expected_head:
+                if not runtime_state.RuntimeStateRepository(
+                    connection
+                ).recovery_slot_available(repo):
+                    # Keep the closed-PR block until its head can be checked
+                    # without replacing an unrelated planning projection.
+                    continue
                 error = (
                     "다시 열린 PR head OID가 저장된 관리 head와 다릅니다: "
                     f"expected {expected_head}, actual {head_oid}"
@@ -15818,6 +15832,10 @@ def select_waiting_pull_request_conflict(
     """Select one still-eligible conflict after all observations are durable."""
 
     if active_execplan(connection, repo) is not None:
+        return PullRequestSyncResult(merged=observation.merged)
+    if not runtime_state.RuntimeStateRepository(
+        connection
+    ).recovery_slot_available(repo):
         return PullRequestSyncResult(merged=observation.merged)
     if scoped_blocking.project_block(connection, repo) is not None:
         return PullRequestSyncResult(merged=observation.merged)
@@ -16155,6 +16173,20 @@ def _resume_owned_checkpoint_project_block(
     return True
 
 
+def _clear_project_block_without_losing_planning_error(
+    connection: sqlite3.Connection, repo: str, project: sqlite3.Row,
+) -> None:
+    scoped_blocking.clear_project_block(connection, repo)
+    if (
+        runtime_state.planning_owns_execution_slot(project)
+        and project["planning_error"]
+    ):
+        connection.execute(
+            "UPDATE projects SET last_error = ? WHERE repo = ?",
+            (project["planning_error"], repo),
+        )
+
+
 def resume_project_block_if_safe(
     connection: sqlite3.Connection,
     repo_path: Path,
@@ -16174,6 +16206,7 @@ def resume_project_block_if_safe(
     ).fetchone()
     if project is None:
         return False
+    planning_owns_slot = runtime_state.planning_owns_execution_slot(project)
     if not plan_id:
         if block['reason_code'] == BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value:
             return False
@@ -16208,7 +16241,7 @@ def resume_project_block_if_safe(
         except (AgentScopeError, RuntimeError, WorkspaceOwnershipError, ValueError):
             return False
         with connection:
-            scoped_blocking.clear_project_block(connection, repo)
+            _clear_project_block_without_losing_planning_error(connection, repo, project)
         return True
     plan = connection.execute(
         "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
@@ -16216,7 +16249,15 @@ def resume_project_block_if_safe(
     ).fetchone()
     if plan is None:
         return False
-    if _reconcile_guidance_double_block(
+    if planning_owns_slot and str(plan["status"]) in ACTIVE_EXECPLAN_STATUSES:
+        return False
+    if (
+        planning_owns_slot
+        and block['reason_code']
+        == BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value
+    ):
+        return False
+    if not planning_owns_slot and _reconcile_guidance_double_block(
         connection, repo_path, state_dir, repo, block, project, plan,
     ):
         return True
@@ -16254,12 +16295,13 @@ def resume_project_block_if_safe(
             return False
         status = str(plan["status"])
         with connection:
-            scoped_blocking.clear_project_block(connection, repo)
+            _clear_project_block_without_losing_planning_error(connection, repo, project)
         if status in ACTIVE_EXECPLAN_STATUSES:
             _requeue_blocked_execplan(connection, repo, plan_id)
         else:
-            with connection:
-                _clear_active_in_current_transaction(connection, repo)
+            if not planning_owns_slot:
+                with connection:
+                    _clear_active_in_current_transaction(connection, repo)
         return True
     if int(plan["workspace_owned"]) != WORKSPACE_OWNED:
         return False
@@ -16293,10 +16335,10 @@ def resume_project_block_if_safe(
     except (AgentScopeError, RuntimeError, WorkspaceOwnershipError, ValueError):
         return False
     with connection:
-        scoped_blocking.clear_project_block(connection, repo)
+        _clear_project_block_without_losing_planning_error(connection, repo, project)
         if str(plan["status"]) in ACTIVE_EXECPLAN_STATUSES:
             hydrate_execplan_project(connection, repo, plan)
-        else:
+        elif not planning_owns_slot:
             _clear_active_in_current_transaction(connection, repo)
     return True
 
@@ -17117,6 +17159,10 @@ def resume_plan_blocks(
         return False
     if active_execplan(connection, repo) is not None:
         return False
+    if not runtime_state.RuntimeStateRepository(
+        connection
+    ).recovery_slot_available(repo):
+        return False
     for blocked in plan_blocked_execplans(connection, repo):
         if blocked["blocked_reason"] == PR_CLOSED_BLOCK_REASON:
             continue
@@ -17233,10 +17279,11 @@ def _block_closed_pull_request(
 ) -> None:
     error = "PR이 Merge 없이 닫혔습니다."
     mirrored = connection.execute(
-        "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
+        "SELECT * FROM projects WHERE repo = ?", (repo,)
     ).fetchone()
     clear_projection = bool(
-        mirrored and mirrored["plan_path"] == plan["path"]
+        mirrored and not runtime_state.planning_owns_execution_slot(mirrored)
+        and mirrored["plan_path"] == plan["path"]
     )
     with runtime_state._transaction(connection):
         _final_block_recovery_decision(
@@ -17304,10 +17351,11 @@ def _resume_reopened_pull_request(
                 )
     with runtime_state._transaction(connection):
         mirrored = connection.execute(
-            "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
+            "SELECT * FROM projects WHERE repo = ?", (repo,)
         ).fetchone()
         repository = runtime_state.RuntimeStateRepository(connection)
-        if mirrored and mirrored["plan_path"] == plan["path"]:
+        if (mirrored and not runtime_state.planning_owns_execution_slot(mirrored)
+                and mirrored["plan_path"] == plan["path"]):
             projection = project_values if recovery else _clear_active_values()
             repository.transition(
                 repo,
@@ -19762,11 +19810,12 @@ def _execplan_archive_housekeeping_safe(
     if scoped_blocking.project_block(connection, repo) is not None:
         return False
     current = connection.execute(
-        "SELECT phase FROM projects WHERE repo = ?", (repo,)
+        "SELECT * FROM projects WHERE repo = ?", (repo,)
     ).fetchone()
     if (
         current is None
         or current["phase"] is not None
+        or runtime_state.planning_owns_execution_slot(current)
         or active_execplan(connection, repo) is not None
         or validated_agent_scope is not None
     ):
@@ -20636,6 +20685,7 @@ def _run_project_step(
         if (
             active_execplan(connection, repo) is None
             and row["phase"] in {"PR_OPEN", "PLAN_BLOCKED", "BLOCKED"}
+            and not runtime_state.planning_owns_execution_slot(row)
             and scoped_blocking.project_block(connection, repo) is None
             and validated_agent_scope is None
         ):
@@ -20651,9 +20701,14 @@ def _run_project_step(
             (repo, WORKSPACE_OWNED),
         ).fetchall()
     )
-    cleanup_pending = recheck_cleanup_pending(
-        connection, repo_path, repo, state_dir
-    )
+    if row is not None and runtime_state.planning_owns_execution_slot(row):
+        cleanup_pending = connection.execute(
+            "SELECT * FROM cleanup_pending WHERE repo = ?", (repo,)
+        ).fetchall()
+    else:
+        cleanup_pending = recheck_cleanup_pending(
+            connection, repo_path, repo, state_dir
+        )
     remaining_cleanup = frozenset(
         str(_canonical_path(Path(item["worktree"])))
         for item in cleanup_pending
@@ -20860,7 +20915,7 @@ def _run_project_step(
         "SELECT * FROM projects WHERE repo = ?", (repo,)
     ).fetchone()
 
-    if row and row["branch"]:
+    if row and row["branch"] and not runtime_state.planning_owns_execution_slot(row):
         existing_pr = pr_for_branch(repo_path, row["branch"], row["pr_url"])
         if existing_pr:
             try:

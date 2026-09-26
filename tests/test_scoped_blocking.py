@@ -148,6 +148,229 @@ class ScopedBlockingTest(unittest.TestCase):
                 "WHERE repo = ? AND plan_id = 'G-001'", (self.repo,),
             ).fetchone()['phase'], 'unpublished')
 
+    def test_planning_attempt_keeps_slot_across_multiple_plan_blocks_and_pr_close(self):
+        self.plan('G-001', 'PLAN_BLOCKED')
+        self.plan('G-002', 'PLAN_BLOCKED')
+        self.plan('G-003', 'PR_OPEN', branch='loop/G-003',
+                  pr_url='https://example.test/pr/3')
+        with self.connection:
+            self.connection.execute(loop_manager.GENERAL_PLANNING_PUBLICATIONS_SCHEMA)
+            self.connection.execute(
+                "INSERT INTO general_planning_publications "
+                "(repo, stage, base_sha, commit_sha, snapshot_token, "
+                "specification_fingerprint, planning_fingerprint, manifest, "
+                "manifest_hash) VALUES (?, 'prepared', 'base', 'commit', "
+                "'snapshot', 'spec', 'input', '{}', 'hash')", (self.repo,),
+            )
+            self.connection.execute(
+                "INSERT INTO maintenance_cycles "
+                "(repo, phase, cycle_base_sha, publication_stage, revision) "
+                "VALUES (?, 'assessment', 'base', 'prepared', 3)", (self.repo,),
+            )
+            self.connection.execute(
+                "UPDATE projects SET phase = 'PLANNING', active_sha = 'base', "
+                "planning_attempt_fingerprint = 'attempt', "
+                "planning_workspace_owned = 1, worktree = '/planning', "
+                "planner_session_id = 'planner', planning_retry_count = 2, "
+                "agent_role = 'planner', agent_snapshot = 'snapshot', "
+                "planning_result_pending_validation = 1, "
+                "planning_result = 'saved' WHERE repo = ?", (self.repo,),
+            )
+        before = dict(self.connection.execute(
+            "SELECT * FROM projects WHERE repo = ?", (self.repo,),
+        ).fetchone())
+        publication_before = dict(self.connection.execute(
+            "SELECT * FROM general_planning_publications WHERE repo = ?",
+            (self.repo,),
+        ).fetchone())
+        cycle_before = dict(self.connection.execute(
+            "SELECT * FROM maintenance_cycles WHERE repo = ?", (self.repo,),
+        ).fetchone())
+        with mock.patch.object(loop_manager, 'hydrate_execplan_project') as hydrate:
+            self.assertFalse(loop_manager.resume_plan_blocks(
+                self.connection, Path(self.repo), Path('/state'), self.repo, 'main',
+            ))
+        hydrate.assert_not_called()
+        with mock.patch.object(loop_manager, 'pr_for_branch', return_value={
+            'state': 'CLOSED', 'url': 'https://example.test/pr/3',
+            'headRefName': 'loop/G-003', 'headRefOid': 'head',
+        }):
+            loop_manager.observe_waiting_pull_requests(
+                self.connection, Path(self.repo), Path('/state'), self.repo,
+            )
+        self.assertEqual(dict(self.connection.execute(
+            "SELECT * FROM projects WHERE repo = ?", (self.repo,),
+        ).fetchone()), before)
+        self.assertEqual(dict(self.connection.execute(
+            "SELECT * FROM general_planning_publications WHERE repo = ?",
+            (self.repo,),
+        ).fetchone()), publication_before)
+        self.assertEqual(dict(self.connection.execute(
+            "SELECT * FROM maintenance_cycles WHERE repo = ?", (self.repo,),
+        ).fetchone()), cycle_before)
+        statuses = dict(self.connection.execute(
+            "SELECT plan_id, status FROM exec_plans WHERE repo = ?", (self.repo,),
+        ).fetchall())
+        self.assertEqual(statuses, {
+            'G-001': 'PLAN_BLOCKED', 'G-002': 'PLAN_BLOCKED',
+            'G-003': 'PLAN_BLOCKED',
+        })
+        with mock.patch.object(loop_manager, 'pr_for_branch', return_value={
+            'state': 'OPEN', 'url': 'https://example.test/pr/3',
+            'headRefName': 'loop/G-003', 'headRefOid': 'head',
+        }):
+            loop_manager.observe_waiting_pull_requests(
+                self.connection, Path(self.repo), Path('/state'), self.repo,
+            )
+        self.assertEqual(dict(self.connection.execute(
+            "SELECT * FROM projects WHERE repo = ?", (self.repo,),
+        ).fetchone()), before)
+        self.assertEqual(self.connection.execute(
+            "SELECT status FROM exec_plans WHERE repo = ? AND plan_id = 'G-003'",
+            (self.repo,),
+        ).fetchone()[0], 'PR_OPEN')
+
+    def test_plan_project_block_releases_only_after_validation_without_clearing_planning(self):
+        plan = self.plan('G-001', 'PLAN_BLOCKED', branch='loop/G-001')
+        with self.connection:
+            self.connection.execute(
+                "UPDATE exec_plans SET worktree = '/managed/G-001' "
+                "WHERE repo = ? AND plan_id = 'G-001'", (self.repo,),
+            )
+            self.connection.execute(
+                "UPDATE projects SET phase = 'PROJECT_BLOCKED', "
+                "planning_error = 'planner failed', "
+                "planning_attempt_fingerprint = 'attempt', "
+                "worktree = '/planning', agent_snapshot = 'snapshot' "
+                "WHERE repo = ?", (self.repo,),
+            )
+            self.connection.execute(
+                "INSERT INTO project_blocks (repo, scope, reason_code, plan_id, "
+                "evidence, previous_phase) VALUES (?, 'project', "
+                "'workspace_ownership_uncertain', 'G-001', 'blocked', 'PLANNING')",
+                (self.repo,),
+            )
+        before = dict(self.connection.execute(
+            "SELECT * FROM projects WHERE repo = ?", (self.repo,),
+        ).fetchone())
+        with mock.patch.object(
+            loop_manager, 'validate_execplan_workspace_identity',
+            side_effect=loop_manager.WorkspaceOwnershipError('not owned'),
+        ):
+            self.assertFalse(loop_manager.resume_project_block_if_safe(
+                self.connection, Path(self.repo), Path('/state'), self.repo,
+            ))
+        self.assertEqual(dict(self.connection.execute(
+            "SELECT * FROM projects WHERE repo = ?", (self.repo,),
+        ).fetchone()), before)
+        self.assertIsNotNone(scoped_blocking.project_block(self.connection, self.repo))
+        with mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'), \
+                mock.patch.object(loop_manager, 'validate_managed_worktree'), \
+                mock.patch.object(loop_manager, '_rebase_in_progress_for_branch',
+                                  return_value=False):
+            self.assertTrue(loop_manager.resume_project_block_if_safe(
+                self.connection, Path(self.repo), Path('/state'), self.repo,
+            ))
+        after = self.connection.execute(
+            "SELECT * FROM projects WHERE repo = ?", (self.repo,),
+        ).fetchone()
+        self.assertEqual(after['phase'], 'PLANNING')
+        self.assertEqual(after['planning_error'], 'planner failed')
+        self.assertEqual(after['last_error'], 'planner failed')
+        for field in ('planning_attempt_fingerprint', 'worktree', 'agent_snapshot'):
+            self.assertEqual(after[field], before[field])
+        self.assertIsNone(scoped_blocking.project_block(self.connection, self.repo))
+        self.assertEqual(plan['plan_id'], 'G-001')
+
+    def test_merged_pr_records_plan_and_defers_cleanup_during_planning(self):
+        self.plan('G-003', 'PR_OPEN', branch='loop/G-003',
+                  pr_url='https://example.test/pr/3')
+        with self.connection:
+            self.connection.execute(
+                "UPDATE exec_plans SET worktree = '/managed/G-003' "
+                "WHERE repo = ? AND plan_id = 'G-003'", (self.repo,),
+            )
+            self.connection.execute(
+                "UPDATE projects SET phase = 'PLANNING', worktree = '/planning', "
+                "planning_attempt_fingerprint = 'attempt', "
+                "planning_result_completed = 1, "
+                "agent_snapshot = 'planner-snapshot' WHERE repo = ?", (self.repo,),
+            )
+        before = dict(self.connection.execute(
+            "SELECT * FROM projects WHERE repo = ?", (self.repo,),
+        ).fetchone())
+        with mock.patch.object(loop_manager, 'pr_for_branch', return_value={
+            'state': 'MERGED', 'url': 'https://example.test/pr/3',
+            'headRefName': 'loop/G-003', 'headRefOid': 'head',
+        }), mock.patch.object(loop_manager, 'remove_cleanup_worktree') as cleanup, \
+                mock.patch.object(loop_manager, '_recorded_base_fetch'):
+            observed = loop_manager.observe_waiting_pull_requests(
+                self.connection, Path(self.repo), Path('/state'), self.repo,
+            )
+        self.assertTrue(observed.merged)
+        cleanup.assert_not_called()
+        self.assertEqual(dict(self.connection.execute(
+            "SELECT * FROM projects WHERE repo = ?", (self.repo,),
+        ).fetchone()), before)
+        self.assertEqual(self.connection.execute(
+            "SELECT status FROM exec_plans WHERE repo = ? AND plan_id = 'G-003'",
+            (self.repo,),
+        ).fetchone()[0], 'MERGED')
+        self.assertIsNotNone(self.connection.execute(
+            "SELECT 1 FROM cleanup_pending WHERE repo = ? AND worktree = '/managed/G-003'",
+            (self.repo,),
+        ).fetchone())
+
+    def test_missing_merged_worktree_uses_managed_cleanup_evidence_without_planning(self):
+        self.plan('G-003', 'PR_OPEN', branch='loop/G-003')
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory) / 'missing'
+            self.connection.execute(
+                "UPDATE exec_plans SET worktree = ? "
+                "WHERE repo = ? AND plan_id = 'G-003'",
+                (str(worktree), self.repo),
+            )
+            plan = self.connection.execute(
+                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-003'",
+                (self.repo,),
+            ).fetchone()
+            with mock.patch.object(
+                loop_manager, '_assess_missing_managed_cleanup',
+                return_value=loop_manager.CleanupAssessment('missing'),
+            ) as assess:
+                result = loop_manager.complete_merged_execplan_worktree(
+                    self.connection, Path(self.repo), self.repo,
+                    Path('/state'), plan, 'https://example.test/pr/3', 'head',
+                )
+        assess.assert_called_once_with(Path('/state'), Path(self.repo), worktree)
+        self.assertEqual(result.status, 'missing')
+        self.assertEqual(self.connection.execute(
+            "SELECT status FROM exec_plans WHERE repo = ? AND plan_id = 'G-003'",
+            (self.repo,),
+        ).fetchone()[0], 'MERGED')
+
+    def test_conflicting_pr_waits_for_planning_slot(self):
+        plan = self.plan('G-003', 'PR_OPEN', branch='loop/G-003')
+        self.connection.execute(
+            "UPDATE projects SET phase = 'PLANNING', "
+            "planning_attempt_fingerprint = 'attempt' WHERE repo = ?",
+            (self.repo,),
+        )
+        self.connection.commit()
+        observation = loop_manager.WaitingPullRequestObservation(
+            ((plan, {'state': 'OPEN', 'mergeable': 'CONFLICTING'}),), False,
+        )
+        with mock.patch.object(loop_manager, 'hydrate_execplan_project') as hydrate:
+            result = loop_manager.select_waiting_pull_request_conflict(
+                self.connection, Path(self.repo), Path('/state'),
+                self.repo, observation,
+            )
+        hydrate.assert_not_called()
+        self.assertFalse(result.conflict_started)
+        self.assertEqual(self.connection.execute(
+            "SELECT phase FROM projects WHERE repo = ?", (self.repo,),
+        ).fetchone()[0], 'PLANNING')
+
     def test_releasing_notified_plan_block_rolls_back_notice_cancellation(self):
         self.plan("G-001", "PLAN_BLOCKED")
         notifications.configure_session(self.connection, enabled=True)
