@@ -52,4 +52,9 @@ priority: critical
 
 - 2026-09-26: 사용자 요청에 따라 반복되는 Manager rebase 소유권 오탐을 기존 G-091에서 먼저 수정한다. G-091의 구현 PR이 Merge된 뒤 이 계획의 기존 작업물과 게시 checkpoint를 보존해 재개한다.
 
+- 2026-09-26 Worker 재확인: 현재 HEAD `94bb59f`에는 증거 없는 snapshot의 엄격한 shared Git 경계를 검증하는 회귀 테스트만 포함되어 있고 worktree에는 미커밋 변경이 없다. 호출 전 쓰기 격리, 효력 검증 및 실행·세션에 결합된 durable 증거는 아직 구현되지 않았다. 미해결 검토 `review:loop_manager.py::run_agent::missing-write-isolation` occurrence=2, revision=2는 해결되지 않았다.
+- 승인 대기 범위: (1) `agent_invocation.py`와 `loop_manager.py::run_agent` 호출 경계에 선택 worktree 밖·source checkout·다른 worktree·shared Git metadata 쓰기를 차단하고 실행 전에 효력을 확인하는 격리 적용 및 확인 불가 시 안전 중단, (2) provider·환경·역할·canonical worktree·repository identity·session/turn에 결합된 실행별 증거 보존과 재개·provider/설정 변경·중단 뒤 재검증. 증거 없는 실행·과거 기록의 엄격한 Git 판정은 유지한다.
+- 이전 자동 승인 검토가 위 두 변경을 아키텍처 승인 대상으로 거부했다는 전달 기록과 `ARCHITECTURE.md`의 Architecture Change Policy를 확인했다. 이번 재개 요청에는 해당 거부를 해소하는 별도 승인 결정이 없어 구현을 중단한다. `AGENTS.md` 규칙 자체의 변경은 필요하지 않으므로 guidance 변경 제안을 만들지 않는다. 사용자 승인 및 근거 문서 반영 후 재개가 필요하다. SQLite 상태 전이는 Architecture에 따라 Loop Manager 프로그램이 담당하며 Worker가 직접 수정하지 않았다.
+- 이번 변경은 이 Decision Log 기록뿐이다. 실행 코드·테스트·verify 스크립트를 변경하지 않았으므로 targeted unit test를 실행하지 않았다. 이전 세션의 테스트 성공을 이번 세션의 검증 결과로 보고하지 않는다.
+
 - 2026-09-29 User Decision: 사용자가 G-088의 차단 알림에 포함된 하위 writable mount의 source/shared Git 별칭 사례를 제시하며, 하위 경로에 Git 경로가 있는 등의 사례를 고려하지 않아도 된다고 명시했다. 위 운영 환경 전제와 제외 범위를 승인된 계획 범위로 반영한다. `loop_manager.py::run_agent::missing-write-isolation`의 마지막 Review가 요구한 하위 bind mount 별칭 탐지·거부 및 회귀 테스트는 현재 Acceptance Criteria가 아니다. Worker와 Reviewer는 남아 있는 실제 격리 요구를 확인하되 이 제외 사례를 다시 교정 또는 blocking 근거로 사용하지 않는다. 기존 Review·실패 감사는 보존하고, 계획 입력 변경을 감지한 Manager가 정상 재개와 필요한 검증·Review를 수행한다.
