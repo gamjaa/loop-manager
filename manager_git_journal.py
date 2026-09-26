@@ -22,6 +22,65 @@ class MutationEvidenceError(RuntimeError):
     """An intended Git transition cannot be attributed to the Manager."""
 
 
+def rebase_affected_paths(git: Callable[..., Any], repo: Path,
+                          original: str, target: str) -> list[str]:
+    """Record the paths Git may touch before starting a managed replay."""
+    base = git(repo, "merge-base", original, target).stdout.strip()
+    if not base:
+        # No replay range can be established. A later conflict with changed
+        # files cannot be certified against this empty allowance.
+        return []
+    paths = set(filter(None, git(
+        repo, "diff", "--no-renames", "--name-only", "-z", original, target,
+    ).stdout.split("\0")))
+    commits = git(repo, "rev-list", f"{base}..{original}").stdout.splitlines()
+    for commit in commits:
+        paths.update(filter(None, git(
+            repo, "diff-tree", "--root", "-m", "--no-renames", "--no-commit-id",
+            "--name-only", "-r", "-z", commit,
+        ).stdout.split("\0")))
+    return sorted(paths)
+
+
+def _conflict_files_bounded(before: Mapping[str, Any],
+                            observed: Mapping[str, Any],
+                            affected: Any) -> bool:
+    """Reject file/index changes outside the immutable replay path set."""
+    if (not isinstance(affected, list) or any(
+            not isinstance(path, str) or not path for path in affected
+    ) or not isinstance(before.get("index"), dict)
+            or not isinstance(observed.get("index"), dict)
+            or not isinstance(before.get("dirty"), dict)
+            or not isinstance(observed.get("dirty"), dict)):
+        return False
+    allowed = set(affected)
+    unmerged_paths = {
+        path for path, entries in observed["index"].items()
+        if isinstance(entries, list) and any(
+            isinstance(entry, str) and entry.rsplit(" ", 1)[-1] in {"1", "2", "3"}
+            for entry in entries
+        )
+    }
+    if bool(observed.get("unmerged")) != bool(unmerged_paths):
+        return False
+    for field in ("index", "dirty"):
+        old, new = before[field], observed[field]
+        if any(old.get(path) != new.get(path) and path not in allowed
+               for path in old.keys() | new.keys()):
+            return False
+    # A replay does not create untracked files, even on an affected path.
+    for path, value in observed["dirty"].items():
+        if (not isinstance(value, list) or len(value) != 2
+                or not isinstance(value[0], list)):
+            return False
+        kinds = value[0]
+        if ("untracked" in kinds and path not in before["dirty"]
+                or "unstaged" in kinds and path not in unmerged_paths
+                and before["dirty"].get(path) != value):
+            return False
+    return True
+
+
 def verified_rebase_result(
     intent: Mapping[str, Any], observed: Mapping[str, Any], *,
     current_remote_oid: str | None, target_ancestor: bool,
@@ -61,6 +120,9 @@ def verified_rebase_result(
             and observed["ref"] == before["ref"]
             and observed["registration"] is not None
             and "detached=True" in observed["registration"]
+            and _conflict_files_bounded(
+                before, observed, expected.get("affected_paths"),
+            )
         )
     else:
         files_preserved = rebase_preserves_worktree_files(
@@ -87,9 +149,11 @@ def verified_rebase_result(
         "refs": {f"refs/heads/{branch}": observed["ref"]},
         "worktrees": {intent["target"]: observed["registration"]},
         "selected": {"head": observed["head"],
-                     "index": (observed["index"] if observed.get("index_clean")
+                     "index": (observed["index"] if observed["metadata"] is None
+                               and observed.get("index_clean")
                                and not observed.get("unmerged") else None),
-                     "dirty": observed["dirty"],
+                     "dirty": (observed["dirty"] if observed["metadata"] is None
+                               else None),
                      "unmerged": bool(observed.get("unmerged"))},
     }
 

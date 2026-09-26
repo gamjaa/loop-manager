@@ -464,11 +464,41 @@ class ExecutionHandlers:
                 remote_oid, self.effects.workspace.git,
                 before_head=current.expected_head, recorded_oid=remote_oid,
             ) == remote_oid
-            if owned:
-                self._finish_rebase_journal(context)
-            return owned
-        except (RuntimeError, OSError, UnicodeError):
+            if not owned:
+                return False
+            self._finish_rebase_journal(context)
+            observed = self._rebase_journal_state(context)
+            return self._matching_rebase_journal_result(
+                context, current, remote_oid, observed,
+                allow_later_file_changes=True,
+            )
+        except (RuntimeError, OSError, UnicodeError, KeyError, TypeError):
             return False
+
+    def _matching_rebase_journal_result(self, context, current, remote_oid,
+                                        observed, *, allow_later_file_changes=False):
+        def matches(saved):
+            if not allow_later_file_changes:
+                return saved == observed
+            # The sealed rebase result owns Git's progress, not subsequent
+            # Worker edits to conflict files and their index entries.
+            return all(saved.get(field) == observed.get(field) for field in (
+                'head', 'branch', 'ref', 'registration', 'operations', 'metadata',
+            ))
+
+        return any(
+            item['intent']['kind'] == 'managed_rebase'
+            and item['intent']['target'] == str(context.worktree.resolve())
+            and item['intent']['expected']['before_head'] == current.expected_head
+            and item['intent']['expected']['target_base_oid'] == current.target_base_oid
+            and item['intent']['expected']['remote_oid'] == remote_oid
+            and matches(item['result']['observed'])
+            for item in manager_git_journal.verified_managed_transitions(
+                self.state_dir, str(self.repo_path.resolve()),
+                f'plan:{context.plan.plan_id}',
+                agent_session_id=getattr(context, 'worker_session_id', None),
+            )
+        )
 
     def _owned_completed_rebase(
         self, context, row, remote_oid, current, checkpoint,
@@ -502,18 +532,8 @@ class ExecutionHandlers:
             observed = self._rebase_journal_state(context)
             if observed['head'] != local_head or observed['unmerged']:
                 return False
-            return any(
-                item['intent']['kind'] == 'managed_rebase'
-                and item['intent']['target'] == str(context.worktree.resolve())
-                and item['intent']['expected']['before_head'] == current.expected_head
-                and item['intent']['expected']['target_base_oid'] == current.target_base_oid
-                and item['intent']['expected']['remote_oid'] == remote_oid
-                and item['result']['observed'] == observed
-                for item in manager_git_journal.verified_managed_transitions(
-                    self.state_dir, str(self.repo_path.resolve()),
-                    f'plan:{context.plan.plan_id}',
-                    agent_session_id=getattr(context, 'worker_session_id', None),
-                )
+            return self._matching_rebase_journal_result(
+                context, current, remote_oid, observed,
             )
         except (RuntimeError, OSError, UnicodeError, KeyError, TypeError):
             return False
@@ -870,6 +890,9 @@ class ExecutionHandlers:
                 'branch': context.branch, 'before_head': head,
                 'target_base_oid': target_oid,
                 'remote_oid': remote_oid,
+                'affected_paths': manager_git_journal.rebase_affected_paths(
+                    self.effects.workspace.git, context.worktree, head, target_oid,
+                ),
                 'agent_session_id': getattr(context, 'worker_session_id', None),
             },
         )
@@ -947,6 +970,10 @@ class ExecutionHandlers:
                 'target_base_oid': current.target_base_oid,
                 'remote_oid': self.effects.workspace.remote_branch_oid(
                     self.repo_path, context.branch,
+                ),
+                'affected_paths': manager_git_journal.rebase_affected_paths(
+                    self.effects.workspace.git, context.worktree,
+                    current.expected_head, current.target_base_oid,
                 ),
                 'action': action.value,
                 'accepted_files': accepted_files,

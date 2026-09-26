@@ -9286,6 +9286,9 @@ def _journaled_direct_rebase(
         target=str(_canonical_path(worktree)), before=before,
         expected={"branch": branch, "before_head": before["head"],
                   "target_base_oid": target_oid, "remote_oid": remote_oid,
+                  "affected_paths": manager_git_journal.rebase_affected_paths(
+                      git, worktree, before["head"], target_oid,
+                  ),
                   "agent_session_id": agent_session_id},
     )
     environment = dict(os.environ)

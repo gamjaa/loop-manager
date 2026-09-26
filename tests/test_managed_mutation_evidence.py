@@ -107,23 +107,25 @@ class ManagedTransitionTests(unittest.TestCase):
         intent = {
             'id': 'owned', 'target': '/worktree', 'before': before,
             'expected': {'branch': BRANCH, 'before_head': OLD,
-                         'target_base_oid': NEW, 'remote_oid': OLD},
+                         'target_base_oid': NEW, 'remote_oid': OLD,
+                         'affected_paths': ['app.py']},
         }
         observed = {
             **before, 'head': NEW, 'branch': None,
-            'index': {'app.py': ['conflict']},
+            'index': {'app.py': [f'H 100644 {OLD} 1',
+                                  f'H 100644 {NEW} 2']},
             'registration': [f'HEAD={NEW}', 'detached=True'],
             'metadata': {'orig-head': OLD,
                          'head-name': f'refs/heads/{BRANCH}', 'onto': NEW},
             'unmerged': True, 'index_clean': False,
         }
-        self.assertEqual(
-            journal.verified_rebase_result(
-                intent, observed, current_remote_oid=OLD,
-                target_ancestor=True, patches_preserved=False,
-                reflog_marker=False,
-            )['selected']['index'], None,
+        candidate = journal.verified_rebase_result(
+            intent, observed, current_remote_oid=OLD,
+            target_ancestor=True, patches_preserved=False,
+            reflog_marker=False,
         )
+        self.assertIsNone(candidate['selected']['index'])
+        self.assertIsNone(candidate['selected']['dirty'])
         for changed, remote in (({**observed, 'metadata':
                                  {**observed['metadata'], 'onto': OLD}}, OLD),
                                 (observed, NEW),
@@ -135,6 +137,94 @@ class ManagedTransitionTests(unittest.TestCase):
                         target_ancestor=True, patches_preserved=False,
                         reflog_marker=False,
                     )
+
+    def test_conflict_rejects_unrelated_file_and_index_changes(self):
+        before = {
+            'head': OLD, 'branch': BRANCH, 'ref': [OLD, ''],
+            'index': {'app.py': ['old'], 'other.py': ['unchanged']},
+            'dirty': {},
+            'registration': [f'HEAD={OLD}', f'branch=refs/heads/{BRANCH}'],
+            'metadata': None,
+        }
+        intent = {
+            'target': '/worktree', 'before': before,
+            'expected': {'branch': BRANCH, 'before_head': OLD,
+                         'target_base_oid': NEW, 'remote_oid': OLD,
+                         'affected_paths': ['app.py']},
+        }
+        observed = {
+            **before, 'head': NEW, 'branch': None,
+            'registration': [f'HEAD={NEW}', 'detached=True'],
+            'metadata': {'orig-head': OLD,
+                         'head-name': f'refs/heads/{BRANCH}', 'onto': NEW},
+            'index': {'app.py': [f'H 100644 {OLD} 1',
+                                  f'H 100644 {NEW} 2'],
+                      'other.py': ['unchanged']},
+            'dirty': {'app.py': [['unstaged'], 'conflict']},
+            'unmerged': True, 'index_clean': False,
+        }
+        checks = dict(current_remote_oid=OLD, target_ancestor=True,
+                      patches_preserved=False, reflog_marker=False)
+        self.assertIsNone(journal.verified_rebase_result(
+            intent, observed, **checks,
+        )['selected']['dirty'])
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            journal.begin_rebase(
+                state, owner='plan:G-091', repo='/repo', target='/worktree',
+                before=before, expected=intent['expected'],
+            )
+            self.assertTrue(journal.complete_rebase(
+                state, repo='/repo', target='/worktree',
+                observe=lambda: observed,
+                validate=lambda saved, actual: journal.verified_rebase_result(
+                    saved, actual, **checks,
+                ),
+            ))
+            selected = journal.verified_managed_transitions(
+                state, '/repo', 'plan:G-091',
+            )[0]['result']['candidates']['selected']
+            self.assertIsNone(selected['index'])
+            self.assertIsNone(selected['dirty'])
+        for changed in (
+            {**observed, 'dirty': {**observed['dirty'],
+                                  'other.py': [['unstaged'], 'external']}},
+            {**observed, 'index': {**observed['index'],
+                                  'other.py': ['external']}},
+            {**observed, 'dirty': {**observed['dirty'],
+                                  'app.py': [['untracked'], 'external']}},
+            {**observed, 'dirty': {**observed['dirty'],
+                                  'other.py': [['unstaged'], 'external']},
+             'index': {**observed['index'],
+                       'other.py': [f'H 100644 {NEW} 0']}},
+        ):
+            with self.subTest(changed=changed):
+                with self.assertRaises(journal.MutationEvidenceError):
+                    journal.verified_rebase_result(intent, changed, **checks)
+        with self.assertRaises(journal.MutationEvidenceError):
+            journal.verified_rebase_result(
+                {**intent, 'expected': {**intent['expected'],
+                                        'affected_paths': ['app.py', 'other.py']}},
+                {**observed, 'dirty': {**observed['dirty'],
+                                       'other.py': [['unstaged'], 'external']}},
+                **checks,
+            )
+
+    def test_rebase_affected_paths_include_intermediate_commit_changes(self):
+        def git(_repo, *args):
+            if args[0] == 'merge-base':
+                return SimpleNamespace(stdout=TREE + '\n')
+            if args[0] == 'diff':
+                return SimpleNamespace(stdout='base.py\0')
+            if args[0] == 'rev-list':
+                return SimpleNamespace(stdout=OLD + '\n')
+            if args[0] == 'diff-tree':
+                return SimpleNamespace(stdout='reverted.py\0')
+            raise AssertionError(args)
+
+        self.assertEqual(journal.rebase_affected_paths(
+            git, Path('/repo'), OLD, NEW,
+        ), ['base.py', 'reverted.py'])
 
     def test_autostash_conflict_requires_saved_stash_identity(self):
         before = {
@@ -744,7 +834,7 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
             )
             context = SimpleNamespace(
                 plan=SimpleNamespace(plan_id='G-091'), branch=BRANCH,
-                worktree=worktree,
+                worktree=worktree, worker_session_id='worker-original',
             )
 
             def handler():
@@ -756,10 +846,28 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
                 instance.repo = 'repo'
                 instance.repo_path = Path('/repo')
                 instance._finish_rebase_journal = mock.Mock(return_value=False)
+                instance._rebase_journal_state = mock.Mock(return_value=observed)
                 return instance
 
+            observed = {'head': NEW, 'branch': None,
+                        'metadata': {'orig-head': OLD,
+                                     'head-name': f'refs/heads/{BRANCH}',
+                                     'onto': NEW}}
+            saved = {'intent': {
+                'kind': 'managed_rebase', 'target': str(worktree.resolve()),
+                'expected': {'before_head': OLD, 'target_base_oid': NEW,
+                             'remote_oid': OLD},
+            }, 'result': {'observed': observed}}
             with mock.patch('execution_handlers.checkpoint_ownership.owned_remote_oid',
-                            return_value=OLD):
+                            return_value=OLD), mock.patch(
+                                'execution_handlers.manager_git_journal.verified_managed_transitions',
+                                return_value=[],
+                            ) as transitions:
+                self.assertFalse(handler()._owned_checkpoint_remote(
+                    context, {'pr_url': None, 'publication_remote_oid': OLD},
+                    OLD, current,
+                ))
+                transitions.return_value = [saved]
                 for _ in range(2):
                     instance = handler()
                     self.assertTrue(instance._owned_checkpoint_remote(
@@ -769,6 +877,25 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
                     workspace.validate_managed_worktree.assert_called_with(
                         Path('/repo'), worktree, BRANCH, allow_rebase=True,
                     )
+                transitions.assert_called_with(
+                    worktree, str(Path('/repo').resolve()), 'plan:G-091',
+                    agent_session_id='worker-original',
+                )
+                corrected = handler()
+                corrected._rebase_journal_state.return_value = {
+                    **observed, 'index': {'app.py': ['resolved']},
+                    'dirty': {'app.py': [['staged'], 'accepted']},
+                }
+                self.assertTrue(corrected._owned_checkpoint_remote(
+                    context, {'pr_url': None, 'publication_remote_oid': OLD},
+                    OLD, current,
+                ))
+                saved['result']['observed'] = {**observed, 'head': OLD}
+                self.assertFalse(handler()._owned_checkpoint_remote(
+                    context, {'pr_url': None, 'publication_remote_oid': OLD},
+                    OLD, current,
+                ))
+                saved['result']['observed'] = observed
                 (metadata / 'onto').write_text(OLD)
                 self.assertFalse(handler()._owned_checkpoint_remote(
                     context, {'pr_url': None, 'publication_remote_oid': OLD},
