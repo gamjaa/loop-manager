@@ -772,6 +772,8 @@ class MaintenancePlanningTest(unittest.TestCase):
         self.assertIn("G-001", prompt)
         self.assertIn("docs/FUTURE_IDEAS.md", prompt)
         self.assertIn("사용자 편집을 대행", prompt)
+        self.assertIn("원본을 실제로 읽는 파일별 단위", prompt)
+        self.assertIn("성공 ledger가 아니다", prompt)
         self.assertEqual(
             [plan["id"] for _path, plan in result.plans],
             ["G-002", "G-003"],

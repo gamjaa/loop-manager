@@ -36,8 +36,8 @@ priority: normal
 
 ## Progress
 
-- [ ] source-bound 파일 검토와 코드맵 결과 계약
-- [ ] 검증된 잠정 단위의 저장·재개
+- [x] source-bound 파일 검토와 코드맵 결과 계약
+- [x] 검증된 잠정 단위의 저장·재개
 
 ## Decision Log
 

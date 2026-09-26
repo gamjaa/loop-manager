@@ -6,6 +6,7 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from enum import Enum
 import hashlib
+import json
 from pathlib import Path
 from typing import Any, Callable, Protocol, Sequence
 
@@ -25,6 +26,8 @@ from maintenance_planning import (
     MaintenancePlanningRestart,
 )
 import maintenance_state
+import maintenance_file_review
+from maintenance_file_inventory import SourceInventoryError
 import full_assessment
 import runtime_state
 
@@ -470,6 +473,7 @@ class PlanningLifecyclePorts(Protocol):
     agent: PlanningAgentPort
     validation: PlanningValidationPort
     events: PlanningEventPort
+    file_review: Any
 
 
 @dataclass
@@ -1261,6 +1265,14 @@ class PlanningLifecycleCoordinator:
             )
         )
         if should_run:
+            if (run.maintenance_planning
+                and run.maintenance_cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT
+                and (not context.self_repository
+                     or run.maintenance_cycle.full_assessment_completed)
+                and hasattr(self._ports, "file_review")):
+                review_outcome = self._review_one_file(run, worktree)
+                if review_outcome is not None:
+                    return review_outcome
             self._ports.events.log("Planner 시작: 다음 ExecPlan 계획을 생성합니다.")
             if not result_in_flight:
                 self._ports.state.update(
@@ -1283,6 +1295,16 @@ class PlanningLifecycleCoordinator:
                         run.maintenance_cycle.include_general_planning
                     ),
                 )
+                if (run.maintenance_cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT
+                    and hasattr(self._ports, "file_review")
+                    and (not context.self_repository
+                         or run.maintenance_cycle.full_assessment_completed)):
+                    reviews = self._ports.file_review.completed_summary(
+                        context.repo,
+                    )
+                    prompt += "\n\n검증된 잠정 파일 검토와 코드맵의 bounded 미리보기 (성공 기록 아님):\n" + json.dumps(
+                        reviews, ensure_ascii=False,
+                    )
                 if (context.self_repository and run.maintenance_cycle.phase
                     is maintenance_state.MaintenancePhase.ASSESSMENT
                     and not run.maintenance_cycle.full_assessment_completed):
@@ -1376,6 +1398,67 @@ class PlanningLifecycleCoordinator:
         run.dirty_files = dirty_files
         run.planner_scope_error = scope_error
         return None
+
+    def _review_one_file(self, run: _PlanningRun, worktree: Path) -> PlanningOutcome | None:
+        """Persist at most one source-bound review unit per scheduler turn."""
+        context = run.context
+        review = self._ports.file_review
+        try:
+            progress = review.progress(
+                context.repo, context.repo_path, context.base_branch,
+                run.maintenance_cycle.revision, str(run.row.active_sha),
+            )
+            unit = progress.next_unit
+            if unit is None:
+                return None
+            content = review.content(context.repo_path, context.base_branch, unit.source)
+            prompt = maintenance_file_review.review_prompt(unit.source, content)
+            if unit.error:
+                prompt += "\n이전 검토 결과 오류를 수정하라: " + unit.error
+            review.start(context.repo, run.maintenance_cycle.revision, unit.source)
+        except (maintenance_file_review.FileReviewError, SourceInventoryError) as error:
+            self._ports.events.error(str(error))
+            return PlanningOutcome(PlanningOutcomeKind.REMOTE_BASE_RESTART,
+                                   detail=str(error))
+        before = self._ports.agent.begin_scope("maintenance_planner", worktree)
+        result = self._ports.agent.run_planner(
+            worktree, prompt, unit.session_id,
+            lambda session_id: review.session(
+                context.repo, run.maintenance_cycle.revision, unit.source, session_id,
+            ),
+        )
+        if result.session_id:
+            review.session(context.repo, run.maintenance_cycle.revision,
+                           unit.source, result.session_id)
+        scope = self._ports.agent.finish_scope("maintenance_planner", worktree, before)
+        if scope.error:
+            self._ports.events.error(scope.error)
+            return self._operational_error()
+        self._ports.agent.clear_scope(context.repo)
+        if result.code:
+            self._ports.events.error(result.message)
+            if result.kind is PlanningAgentResultKind.TRANSIENT_FAILURE:
+                kind = PlanningOutcomeKind.TRANSIENT_PAUSE
+            elif result.kind is PlanningAgentResultKind.USAGE_LIMIT:
+                kind = PlanningOutcomeKind.USAGE_LIMIT_PAUSE
+            else:
+                kind = PlanningOutcomeKind.OPERATIONAL_ERROR
+            return PlanningOutcome(kind, error=True)
+        try:
+            # Re-read the current ref before accepting any Agent-supplied claim.
+            content = review.content(context.repo_path, context.base_branch, unit.source)
+            parsed = maintenance_file_review.parse_review(
+                result.message, unit.source, content,
+            )
+            review.complete(context.repo, run.maintenance_cycle.revision,
+                            unit.source, parsed)
+        except (maintenance_file_review.FileReviewError, SourceInventoryError) as error:
+            review.fail(context.repo, run.maintenance_cycle.revision,
+                        unit.source, str(error))
+            self._ports.events.error(str(error))
+            return PlanningOutcome(PlanningOutcomeKind.VALIDATION_RETRY,
+                                   detail=str(error))
+        return PlanningOutcome(PlanningOutcomeKind.WAITING)
 
     def _validate_planner_result(
         self, run: _PlanningRun

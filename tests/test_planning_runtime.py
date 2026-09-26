@@ -1,5 +1,6 @@
 from contextlib import nullcontext
 from dataclasses import replace
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +11,9 @@ from unittest import mock
 import loop_manager
 import notifications
 import maintenance_state
+import maintenance_file_review
+from maintenance_file_inventory import TrackedSource
+from tests.test_maintenance_file_review import result_for
 from planning_catalog import MutableReadySnapshot, mutable_snapshot_token
 from planning_runtime import (
     PlanningAgentResult,
@@ -404,6 +408,46 @@ class FakePorts:
 
 
 class PlanningLifecycleCoordinatorTest(unittest.TestCase):
+    def test_assessment_review_unit_precedes_planner_and_preserves_session(self):
+        content = b"def calculate(): return 1\n"
+        source = TrackedSource(
+            "src/calc.py", hashlib.sha256(content).hexdigest(), "100644",
+            "a" * 40, "source code",
+        )
+        ports = FakePorts(
+            planning_snapshot(phase="PLANNING", active_sha="a" * 40),
+            maintenance_cycle(phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+                              cycle_base_sha="a" * 40, revision=4),
+        )
+        unit = maintenance_file_review.ReviewUnit(source, "saved-session", None)
+        ports.file_review = SimpleNamespace(
+            progress=mock.Mock(return_value=maintenance_file_review.FileReviewProgress(
+                (source,), (), unit,
+            )),
+            content=mock.Mock(return_value=content),
+            start=mock.Mock(), session=mock.Mock(), complete=mock.Mock(),
+            fail=mock.Mock(),
+        )
+        ports.agent.result = PlanningAgentResult(
+            0,
+            maintenance_file_review.RESULT_PREFIX + json.dumps(
+                result_for(source, "def calculate(): return 1")
+            ),
+            "saved-session", PlanningAgentResultKind.SUCCESS,
+        )
+        ports.git.head = "a" * 40
+        coordinator = PlanningLifecycleCoordinator(ports)
+        run = coordinator._new_run(self.context)
+        run.planning_worktree = Path("/worktree")
+
+        outcome = coordinator._run_planner_turn(run)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.WAITING)
+        self.assertEqual(ports.agent.resumed_session, "saved-session")
+        self.assertEqual(ports.agent.run_count, 1)
+        self.assertEqual(ports.file_review.complete.call_args.args[2], source)
+        self.assertEqual(ports.file_review.fail.call_count, 0)
+
     def test_new_document_approval_forces_planning_with_unchanged_fingerprints(self):
         ports = FakePorts(planning_snapshot(
             planning_fingerprint="fingerprint",
