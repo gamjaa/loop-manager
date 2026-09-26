@@ -22,6 +22,18 @@ class MutationEvidenceError(RuntimeError):
     """An intended Git transition cannot be attributed to the Manager."""
 
 
+def rebase_completion_matches(git: Callable[..., Any], repo: Path, *,
+                              branch: str, head: str, identity: str,
+                              target_base_oid: str) -> bool:
+    """Bind completion to the latest branch update, never an older marker."""
+    reflog = git(repo, "reflog", "show", "-1", "--format=%H%x00%gs",
+                 f"refs/heads/{branch}", check=False)
+    return reflog.returncode == 0 and reflog.stdout.rstrip("\n") == (
+        f"{head}\0loop-manager-rebase:{identity}"
+        f" (finish): refs/heads/{branch} onto {target_base_oid}"
+    )
+
+
 def rebase_affected_paths(git: Callable[..., Any], repo: Path,
                           original: str, target: str) -> list[str]:
     """Record the paths Git may touch before starting a managed replay."""

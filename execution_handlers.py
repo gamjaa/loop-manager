@@ -1021,17 +1021,10 @@ class ExecutionHandlers:
                     'Manager rebase 계획 또는 Agent session identity가 다릅니다.'
                 )
             if observed['metadata'] is None:
-                reflog = self.effects.workspace.git(
-                    self.repo_path, 'reflog', 'show', '-1', '--format=%H%x00%gs',
-                    f"refs/heads/{context.branch}", check=False,
-                )
-                # Bind completion to the latest branch update and its exact
-                # OID. An older intent marker cannot own a later external HEAD,
-                # including when skip legitimately drops a patch.
-                marker = reflog.returncode == 0 and reflog.stdout.rstrip('\n') == (
-                    f"{observed['head']}\0loop-manager-rebase:{intent['id']}"
-                    f" (finish): refs/heads/{context.branch}"
-                    f" onto {expected['target_base_oid']}"
+                marker = manager_git_journal.rebase_completion_matches(
+                    self.effects.workspace.git, self.repo_path,
+                    branch=context.branch, head=observed['head'],
+                    identity=intent['id'], target_base_oid=expected['target_base_oid'],
                 )
                 patches = checkpoint_ownership.rebase_preserves_commits(
                     self.repo_path, expected['before_head'], observed['head'],

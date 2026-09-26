@@ -9223,10 +9223,9 @@ def _finish_owned_direct_rebase(
                 "Manager rebase checkpoint 또는 원격 OID가 다릅니다."
             )
         if observed["metadata"] is None:
-            reflog = git(repo_path, "reflog", "show", "--format=%gs",
-                         f"refs/heads/{branch}", check=False)
-            marker = reflog.returncode == 0 and (
-                f"loop-manager-rebase:{intent['id']}" in reflog.stdout
+            marker = manager_git_journal.rebase_completion_matches(
+                git, repo_path, branch=branch, head=observed["head"],
+                identity=intent["id"], target_base_oid=expected["target_base_oid"],
             )
             patches = checkpoint_ownership.rebase_preserves_commits(
                 repo_path, expected["before_head"], observed["head"],

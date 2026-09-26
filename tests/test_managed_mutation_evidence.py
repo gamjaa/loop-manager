@@ -622,10 +622,15 @@ class ManagedTransitionTests(unittest.TestCase):
                         head=NEW, ref=[NEW, ''],
                         registration=[f'HEAD={NEW}', f'branch=refs/heads/{BRANCH}'],
                     )
-                    reflog.append(kwargs['env']['GIT_REFLOG_ACTION'])
+                    reflog.append(
+                        f"{NEW}\0{kwargs['env']['GIT_REFLOG_ACTION']}"
+                        f' (finish): refs/heads/{BRANCH} onto {NEW}'
+                    )
                     return SimpleNamespace(returncode=0, stdout='')
                 if args[0] == 'reflog':
-                    return SimpleNamespace(returncode=0, stdout='\n'.join(reflog))
+                    self.assertEqual(args, ('reflog', 'show', '-1',
+                                            '--format=%H%x00%gs', f'refs/heads/{BRANCH}'))
+                    return SimpleNamespace(returncode=0, stdout='\n'.join(reflog[:1]))
                 return SimpleNamespace(returncode=0, stdout='')
 
             with (mock.patch.object(loop_manager, 'git', side_effect=git),
@@ -660,6 +665,30 @@ class ManagedTransitionTests(unittest.TestCase):
                                     side_effect=lambda *_: observed.copy()),
                   mock.patch.object(loop_manager.checkpoint_ownership,
                                     'rebase_preserves_commits', return_value=True)):
+                owned = reflog[0]
+                saved = observed.copy()
+                for head, latest in (
+                    (TREE, f'{TREE}\0commit: external same patch'),
+                    (NEW, f'{NEW}\0reset: external return'),
+                    (TREE, owned),
+                    (NEW, owned.replace(' (finish)', '-other (finish)')),
+                    (NEW, owned.replace(f'onto {NEW}', f'onto {OLD}')),
+                ):
+                    with self.subTest(head=head, latest=latest):
+                        observed.update(head=head, ref=[head, ''], registration=[
+                            f'HEAD={head}', f'branch=refs/heads/{BRANCH}',
+                        ])
+                        reflog[:] = [latest, owned]
+                        with self.assertRaises(journal.MutationEvidenceError):
+                            loop_manager._finish_owned_direct_rebase(
+                                state, connection, repo, repo_key, 'G-091', worktree,
+                                BRANCH,
+                            )
+                        self.assertTrue(list((state / 'manager-git-journal').glob('*/active.json')))
+                        self.assertFalse(list((state / 'manager-git-journal').glob('*/*.result.json')))
+                observed.clear()
+                observed.update(saved)
+                reflog[:] = [owned]
                 self.assertTrue(loop_manager._finish_owned_direct_rebase(
                     state, connection, repo, repo_key, 'G-091', worktree,
                     BRANCH,

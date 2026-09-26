@@ -64,3 +64,5 @@ priority: critical
 - 2026-09-26: Planner import fixture의 복사 목록에서 새 의존성 `rebase_file_evidence.py`가 누락된 것을 수정했다. 해당 case는 임시 Git 저장소의 commit·push와 Agent scope 검증을 함께 수행하는 통합 시나리오이므로 Worker에서 실행하지 않았다. 이번 변경은 테스트 fixture 목록과 이 기록뿐이며 별도로 실행할 관련 unit test는 없다. 전체 verify에서 import 및 기존 scope 위반 검증을 재확인해야 한다.
 
 - 2026-09-26: 줄별 증거의 치환·삭제 범위를 반열린 구간으로 비교해 `[0,1)`과 `[1,2)` 같은 인접 수정을 허용했다. 길이가 없는 삽입은 같은 위치와 치환 경계에서 순서가 불명확하므로 보수적 거부를 유지한다. 양방향 인접 치환·삭제, 외부 내용 추가, 실제 겹침·삽입 모호성과 인접 변경의 journal 확정·재조회를 다루는 targeted unit case 3개가 통과했다. 전체 verify는 실행하지 않았다.
+
+- 2026-09-26: 직접 rebase 복구와 실행 handler의 완료 검증을 공통 journal 함수로 통합했다. 두 경로 모두 최신 branch reflog의 OID·정확한 intent·target base가 일치해야 결과를 확정한다. 직접 복구에서 패치 동등성이 참이어도 외부 HEAD·외부 복귀·OID/intent/base 불일치는 intent를 보존하고 확정을 거부하는 회귀를 추가했다. 직접 복구·skip·continue unit case 3개가 통과했으며 전체 verify는 실행하지 않았다.
