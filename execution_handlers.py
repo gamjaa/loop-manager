@@ -1027,6 +1027,7 @@ class ExecutionHandlers:
                 marker = reflog.returncode == 0 and reflog.stdout.rstrip('\n') == (
                     f"{observed['head']}\0loop-manager-rebase:{intent['id']}"
                     f" (finish): refs/heads/{context.branch}"
+                    f" onto {expected['target_base_oid']}"
                 )
                 patches = checkpoint_ownership.rebase_preserves_commits(
                     self.repo_path, expected['before_head'], observed['head'],

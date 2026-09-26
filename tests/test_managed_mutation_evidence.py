@@ -778,7 +778,7 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
             if args == ('rev-parse', 'replayed-commit^{tree}'):
                 return SimpleNamespace(stdout=replayed_tree[0] + '\n', returncode=0)
             return SimpleNamespace(
-                stdout=f'{NEW}\0loop-manager-rebase:owned-token (finish): refs/heads/{BRANCH}\n', returncode=0,
+                stdout=f'{NEW}\0loop-manager-rebase:owned-token (finish): refs/heads/{BRANCH} onto {NEW}\n', returncode=0,
             )
 
         handler.effects = SimpleNamespace(
@@ -827,7 +827,8 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
 
     def test_skip_completion_requires_latest_reflog_oid_and_intent(self):
         for scenario in ('owned', 'external-head', 'external-return',
-                         'wrong-oid', 'other-intent', 'missing', 'git-error'):
+                         'wrong-oid', 'other-intent', 'wrong-base', 'missing-base',
+                         'missing', 'git-error'):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
                 state = Path(directory)
                 context = SimpleNamespace(
@@ -859,13 +860,15 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
                     'index_clean': True, 'unmerged': False,
                 }
                 owned_entry = (
-                    f'{NEW}\0loop-manager-rebase:{token} (finish): refs/heads/{BRANCH}'
+                    f'{NEW}\0loop-manager-rebase:{token} (finish): refs/heads/{BRANCH} onto {NEW}'
                 )
                 entries = {
                     'owned': [owned_entry],
                     'external-head': [f'{TREE}\0commit: external', owned_entry],
                     'external-return': [f'{NEW}\0reset: external', owned_entry],
-                    'wrong-oid': [owned_entry.replace(NEW, TREE)],
+                    'wrong-oid': [owned_entry.replace(NEW, TREE, 1)],
+                    'wrong-base': [owned_entry.replace(f'onto {NEW}', f'onto {OLD}')],
+                    'missing-base': [owned_entry.removesuffix(f' onto {NEW}')],
                     'other-intent': [owned_entry.replace(token, token + '-other')],
                     'missing': [], 'git-error': [owned_entry],
                 }[scenario]
