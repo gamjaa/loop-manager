@@ -1018,11 +1018,15 @@ class ExecutionHandlers:
                 )
             if observed['metadata'] is None:
                 reflog = self.effects.workspace.git(
-                    self.repo_path, 'reflog', 'show', '--format=%gs',
+                    self.repo_path, 'reflog', 'show', '-1', '--format=%H%x00%gs',
                     f"refs/heads/{context.branch}", check=False,
                 )
-                marker = reflog.returncode == 0 and (
-                    f"loop-manager-rebase:{intent['id']}" in reflog.stdout
+                # Bind completion to the latest branch update and its exact
+                # OID. An older intent marker cannot own a later external HEAD,
+                # including when skip legitimately drops a patch.
+                marker = reflog.returncode == 0 and reflog.stdout.rstrip('\n') == (
+                    f"{observed['head']}\0loop-manager-rebase:{intent['id']}"
+                    f" (finish): refs/heads/{context.branch}"
                 )
                 patches = checkpoint_ownership.rebase_preserves_commits(
                     self.repo_path, expected['before_head'], observed['head'],

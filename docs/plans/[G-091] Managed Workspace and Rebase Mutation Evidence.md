@@ -54,3 +54,5 @@ priority: critical
 - 2026-09-26: G-088에서 Manager rebase 충돌 뒤 detached HEAD를 일반 branch 검사로 거부해 프로젝트 차단이 반복됐다. 사용자는 별도 구현 대신 기존 개선 계획을 먼저 진행하도록 요청했다. G-088은 이 계획의 Merge를 기다리며, 이 계획에서는 Manager 작업 증명과 충돌 재개 gate를 먼저 수정하고 G-092의 일반 차단 자동 복구 범위는 유지한다.
 
 - 2026-09-26: 재시작 시 Git 실행 전 continuation intent가 남아 있어도 같은 slot의 이전 확정 충돌 증거를 조회하도록 수정했다. 활성 operation ID의 결과만 제외하며, 기존 결과의 owner·session·전이 검증은 유지한다. 새 targeted unit case에서 intent 보존, 이전 충돌 증거 기반 게시 소유권 매칭, 다른 session·외부 ref 거부와 활성 결과 제외를 검증했다. 관련 복구·게시 gate 기존 case를 포함한 3개 unit test가 통과했다. 전체 verify는 Worker에서 실행하지 않았다.
+
+- 2026-09-26: skip 완료 시 과거 reflog의 intent 표식만으로 외부 HEAD를 확정하지 않도록 최신 소유 branch reflog 한 건의 OID와 정확한 intent 완료 메시지를 관측 HEAD에 결합했다. 정상 skip과 외부 branch 이동·복귀, OID 불일치, 다른 intent, reflog 누락·조회 오류 및 기존 continue 내용 검증을 다루는 targeted unit case 2개가 통과했다. 전체 verify는 실행하지 않았다.

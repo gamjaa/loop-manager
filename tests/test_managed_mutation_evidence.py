@@ -778,7 +778,7 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
             if args == ('rev-parse', 'replayed-commit^{tree}'):
                 return SimpleNamespace(stdout=replayed_tree[0] + '\n', returncode=0)
             return SimpleNamespace(
-                stdout='loop-manager-rebase:owned-token\n', returncode=0,
+                stdout=f'{NEW}\0loop-manager-rebase:owned-token (finish): refs/heads/{BRANCH}\n', returncode=0,
             )
 
         handler.effects = SimpleNamespace(
@@ -824,6 +824,90 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
             replayed_tree[0] = OLD
             handler._finish_rebase_journal(context)
             self.assertFalse(verified.call_args.kwargs['accepted_correction'])
+
+    def test_skip_completion_requires_latest_reflog_oid_and_intent(self):
+        for scenario in ('owned', 'external-head', 'external-return',
+                         'wrong-oid', 'other-intent', 'missing', 'git-error'):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                state = Path(directory)
+                context = SimpleNamespace(
+                    plan=SimpleNamespace(plan_id='G-091'), branch=BRANCH,
+                    worktree=state / 'worktree', worker_session_id='owned-session',
+                )
+                target = str(context.worktree.resolve())
+                before = {
+                    'head': NEW, 'branch': None, 'ref': [OLD, ''],
+                    'index': {}, 'dirty': {},
+                    'registration': [f'HEAD={NEW}', 'detached=True'],
+                    'metadata': {'orig-head': OLD,
+                                 'head-name': f'refs/heads/{BRANCH}', 'onto': NEW},
+                }
+                expected = {
+                    'branch': BRANCH, 'before_head': OLD, 'target_base_oid': NEW,
+                    'remote_oid': OLD, 'action': 'skip',
+                    'agent_session_id': 'owned-session',
+                }
+                token = journal.begin_rebase(
+                    state, owner='plan:G-091', repo='/repo', target=target,
+                    before=before, expected=expected,
+                )
+                head = TREE if scenario == 'external-head' else NEW
+                observed = {
+                    'head': head, 'branch': BRANCH, 'ref': [head, ''],
+                    'index': {}, 'dirty': {}, 'metadata': None,
+                    'registration': [f'HEAD={head}', f'branch=refs/heads/{BRANCH}'],
+                    'index_clean': True, 'unmerged': False,
+                }
+                owned_entry = (
+                    f'{NEW}\0loop-manager-rebase:{token} (finish): refs/heads/{BRANCH}'
+                )
+                entries = {
+                    'owned': [owned_entry],
+                    'external-head': [f'{TREE}\0commit: external', owned_entry],
+                    'external-return': [f'{NEW}\0reset: external', owned_entry],
+                    'wrong-oid': [owned_entry.replace(NEW, TREE)],
+                    'other-intent': [owned_entry.replace(token, token + '-other')],
+                    'missing': [], 'git-error': [owned_entry],
+                }[scenario]
+
+                def git(_path, *args, **_kwargs):
+                    if args[0] == 'reflog':
+                        self.assertEqual(args, (
+                            'reflog', 'show', '-1', '--format=%H%x00%gs',
+                            f'refs/heads/{BRANCH}',
+                        ))
+                        return SimpleNamespace(
+                            returncode=int(scenario == 'git-error'),
+                            stdout='\n'.join(entries[:1]) + '\n',
+                        )
+                    return SimpleNamespace(returncode=0, stdout='')
+
+                handler = object.__new__(ExecutionHandlers)
+                handler.repo, handler.repo_path, handler.state_dir = 'repo', Path('/repo'), state
+                handler._rebase_journal_state = lambda *_: observed
+                handler.effects = SimpleNamespace(
+                    checkpoint=SimpleNamespace(get=lambda *_: SimpleNamespace(
+                        operation='rebase', expected_head=OLD, target_base_oid=NEW,
+                        observed_remote_oid=OLD, snapshot={},
+                    )),
+                    workspace=SimpleNamespace(git=git, remote_branch_oid=lambda *_: OLD),
+                )
+                slot = journal._slot(state, '/repo', 'managed_rebase', target)
+                with mock.patch(
+                    'execution_handlers.checkpoint_ownership.rebase_preserves_commits',
+                    return_value=False,
+                ):
+                    if scenario == 'owned':
+                        self.assertTrue(handler._finish_rebase_journal(context))
+                        self.assertFalse((slot / 'active.json').exists())
+                        self.assertEqual(journal._read(
+                            slot / f'{token}.result.json',
+                        )['observed']['head'], NEW)
+                    else:
+                        with self.assertRaises(journal.MutationEvidenceError):
+                            handler._finish_rebase_journal(context)
+                        self.assertTrue((slot / 'active.json').exists())
+                        self.assertFalse((slot / f'{token}.result.json').exists())
 
     def test_resumed_continue_uses_the_saved_journal_identity(self):
         git = mock.Mock(return_value=SimpleNamespace(returncode=0, stdout=''))
