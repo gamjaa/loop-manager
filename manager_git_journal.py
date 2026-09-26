@@ -15,10 +15,80 @@ from pathlib import Path
 import re
 import secrets
 from typing import Any
+from execution_checkpoint import rebase_preserves_worktree_files
 
 
 class MutationEvidenceError(RuntimeError):
     """An intended Git transition cannot be attributed to the Manager."""
+
+
+def verified_rebase_result(
+    intent: Mapping[str, Any], observed: Mapping[str, Any], *,
+    current_remote_oid: str | None, target_ancestor: bool,
+    patches_preserved: bool, reflog_marker: bool,
+    autostash_owned: bool = False,
+) -> dict[str, Any]:
+    """Validate one initial or continued rebase without owning file edits."""
+    before = intent["before"]
+    expected = intent["expected"]
+    branch = expected["branch"]
+    original = expected["before_head"]
+    metadata = {
+        "orig-head": original, "head-name": f"refs/heads/{branch}",
+        "onto": expected["target_base_oid"],
+    }
+    beginning = before["metadata"] is None
+    if (
+        current_remote_oid != expected["remote_oid"]
+        or not target_ancestor
+        or not before["ref"] or before["ref"][0] != original
+        or not before["registration"]
+        or (beginning and (
+            before["head"] != original or before["branch"] != branch
+            or f"branch=refs/heads/{branch}" not in before["registration"]
+            or f"HEAD={original}" not in before["registration"]
+        ))
+        or (not beginning and (
+            before["metadata"] != metadata
+            or "detached=True" not in before["registration"]
+        ))
+    ):
+        raise MutationEvidenceError("Manager rebase 실행 전 소유권 또는 원격 OID가 다릅니다.")
+    if observed["metadata"] is not None:
+        valid = (
+            observed["metadata"] == metadata
+            and observed["branch"] is None
+            and observed["ref"] == before["ref"]
+            and observed["registration"] is not None
+            and "detached=True" in observed["registration"]
+        )
+    else:
+        files_preserved = rebase_preserves_worktree_files(
+            before["dirty"], observed["dirty"],
+        )
+        valid = (
+            observed["branch"] == branch
+            and observed["ref"] is not None
+            and observed["ref"][0] == observed["head"]
+            and observed["registration"] is not None
+            and f"branch=refs/heads/{branch}" in observed["registration"]
+            and (patches_preserved or expected.get("action") == "skip")
+            and reflog_marker
+            and (not observed.get("unmerged") or autostash_owned)
+            and (not beginning or files_preserved
+                 or (observed.get("unmerged") and autostash_owned))
+        )
+    if not valid:
+        raise MutationEvidenceError("Manager rebase 결과의 HEAD·ref·index·등록 상태가 다릅니다.")
+    return {
+        "refs": {f"refs/heads/{branch}": observed["ref"]},
+        "worktrees": {intent["target"]: observed["registration"]},
+        "selected": {"head": observed["head"],
+                     "index": (observed["index"] if observed.get("index_clean")
+                               and not observed.get("unmerged") else None),
+                     "dirty": observed["dirty"],
+                     "unmerged": bool(observed.get("unmerged"))},
+    }
 
 
 def verified_transition(
@@ -29,10 +99,16 @@ def verified_transition(
     The before/after maps are deliberately small, task-relevant observations.
     A source local delta is result evidence, never an Agent allowance.
     """
-    before = intent["before"]
-    expected = intent["expected"]
-    kind = intent["kind"]
-    target = intent["target"]
+    try:
+        before = intent["before"]
+        expected = intent["expected"]
+        kind = intent["kind"]
+        target = intent["target"]
+    except (KeyError, TypeError) as error:
+        raise MutationEvidenceError("Manager Git intent가 불완전합니다.") from error
+    if (not isinstance(before, Mapping) or not isinstance(expected, Mapping)
+            or not isinstance(kind, str) or not isinstance(target, str)):
+        raise MutationEvidenceError("Manager Git intent 형식이 유효하지 않습니다.")
     oid = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
     if kind in {"bootstrap_fetch", "project_fetch"}:
         valid = (
@@ -79,6 +155,36 @@ def verified_transition(
                 and expected == {"exists": False, "registration": None}
             ))
         )
+    elif kind in {"managed_worktree_create", "managed_worktree_remove"}:
+        registration = (expected.get("registration") if kind == "managed_worktree_create"
+                        else before.get("registration"))
+        branch = registration.get("branch") if isinstance(registration, dict) else None
+        plan_id = (branch.removeprefix("refs/heads/loop-manager/")
+                   if isinstance(branch, str)
+                   and branch.startswith("refs/heads/loop-manager/") else None)
+        valid = (
+            set(before) == set(expected) == {"exists", "registration", "index"}
+            and plan_id is not None and re.fullmatch(r"G-\d+", plan_id)
+            and intent.get("owner") == f"plan:{plan_id}"
+            and Path(target).name == plan_id
+            and (kind != "managed_worktree_create" or (
+                before == {"exists": False, "registration": None, "index": None}
+                and expected["exists"] is True
+                and isinstance(expected["registration"], dict)
+                and expected["registration"].get("branch", "").startswith("refs/heads/loop-manager/G-")
+                and isinstance(expected["registration"].get("head"), str)
+                and oid.fullmatch(expected["registration"]["head"])
+                and isinstance(expected["registration"].get("locked"), str)
+                and expected["registration"]["locked"].startswith("loop-manager-worktree:")
+                and isinstance(expected["index"], str) and oid.fullmatch(expected["index"])
+            ))
+            and (kind != "managed_worktree_remove" or (
+                before["exists"] is True
+                and isinstance(before["registration"], dict)
+                and isinstance(before["index"], str) and oid.fullmatch(before["index"])
+                and expected == {"exists": False, "registration": None, "index": None}
+            ))
+        )
     else:
         valid = False
     if not valid:
@@ -90,6 +196,10 @@ def verified_transition(
     if kind == "runtime_create":
         return {"refs": {}, "worktrees": {target: expected["registration"]}}
     if kind == "runtime_remove":
+        return {"refs": {}, "worktrees": {target: None}}
+    if kind == "managed_worktree_create":
+        return {"refs": {}, "worktrees": {target: expected["registration"]}}
+    if kind == "managed_worktree_remove":
         return {"refs": {}, "worktrees": {target: None}}
     if kind == "source_fast_forward":
         return {"refs": {}, "worktrees": {}}
@@ -260,6 +370,8 @@ def verified_candidates(
         active = slot / "active.json"
         if active.exists():
             intent = _read(active)
+            if str(intent.get("kind", "")).startswith("managed_"):
+                continue
             category = "refs" if intent.get("kind") in {
                 "bootstrap_fetch", "project_fetch",
             } else "worktrees"
@@ -271,6 +383,8 @@ def verified_candidates(
             identity = str(result.get("id", ""))
             intent = _read(slot / f"{identity}.intent.json")
             if intent.get("repo") != repo:
+                continue
+            if str(intent.get("kind", "")).startswith("managed_"):
                 continue
             validated = verified_transition(
                 intent, result["observed"], marker(intent),
@@ -312,3 +426,145 @@ def verified_candidates(
                     candidates[category][target] = cursor
                 break
     return candidates
+
+
+def begin_rebase(
+    state_dir: Path, *, owner: str, repo: str, target: str,
+    before: Mapping[str, Any], expected: Mapping[str, Any],
+) -> str:
+    """Persist a rebase intent whose resulting HEAD and index are not predictable."""
+    if not owner.startswith("plan:G-") or not repo or not target:
+        raise MutationEvidenceError("Manager rebase 작업 identity가 유효하지 않습니다.")
+    root = state_dir / "manager-git-journal"
+    root.mkdir(parents=True, exist_ok=True)
+    _sync_directory(state_dir)
+    slot = _slot(state_dir, repo, "managed_rebase", target)
+    slot.mkdir(parents=True, exist_ok=True)
+    _sync_directory(root)
+    active = slot / "active.json"
+    if active.exists():
+        prior = _read(active)
+        if (slot / f"{prior.get('id')}.result.json").exists():
+            raise MutationEvidenceError(
+                "Manager rebase 결과 기록을 먼저 복구해야 합니다."
+            )
+        if (
+            prior.get("version") != 1 or prior.get("kind") != "managed_rebase"
+            or prior.get("repo") != repo or prior.get("target") != target
+            or _read(slot / f"{prior.get('id')}.intent.json") != prior
+            or prior.get("owner") != owner or prior.get("before") != before
+            or prior.get("expected") != expected
+        ):
+            raise MutationEvidenceError("Manager rebase 활성 intent가 현재 작업과 다릅니다.")
+        return str(prior["id"])
+    identity = secrets.token_hex(16)
+    intent = {
+        "version": 1, "id": identity, "owner": owner,
+        "kind": "managed_rebase", "repo": repo, "target": target,
+        "before": dict(before), "expected": dict(expected),
+    }
+    _write_new(slot / f"{identity}.intent.json", intent)
+    _write_new(active, intent)
+    return identity
+
+
+def complete_rebase(
+    state_dir: Path, *, repo: str, target: str,
+    observe: Callable[[], dict[str, Any]],
+    validate: Callable[[Mapping[str, Any], Mapping[str, Any]], dict[str, Any]],
+    allow_equal: bool = False,
+) -> bool:
+    """Finalize only an owned Git outcome; leave ambiguous intent active."""
+    slot = _slot(state_dir, repo, "managed_rebase", target)
+    active = slot / "active.json"
+    if not active.exists():
+        return False
+    intent = _read(active)
+    if (
+        intent.get("version") != 1 or intent.get("kind") != "managed_rebase"
+        or intent.get("repo") != repo or intent.get("target") != target
+        or _read(slot / f"{intent.get('id')}.intent.json") != intent
+    ):
+        raise MutationEvidenceError("Manager rebase 활성 intent가 불완전합니다.")
+    observed = observe()
+    if observed == intent["before"]:
+        if allow_equal:
+            _finish(slot, active, intent, observed, {}, "aborted")
+            return True
+        return False
+    candidates = validate(intent, observed)
+    _finish(slot, active, intent, observed, candidates, "complete")
+    return True
+
+
+def verified_managed_transitions(
+    state_dir: Path, repo: str, owner: str, *,
+    agent_session_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Offer G-092 sealed per-operation evidence, not a live-state allowance."""
+    root = state_dir / "manager-git-journal"
+    if not root.exists():
+        return []
+    transitions = []
+    for slot in root.iterdir():
+        if not slot.is_dir() or (slot / "active.json").exists():
+            continue
+        for result_path in slot.glob("*.result.json"):
+            result = _read(result_path)
+            if result.get("status") != "complete":
+                continue
+            intent = _read(slot / f"{result.get('id')}.intent.json")
+            if intent.get("repo") != repo or intent.get("owner") != owner:
+                continue
+            kind = intent.get("kind")
+            if kind not in {
+                "managed_worktree_create", "managed_worktree_remove", "managed_rebase",
+            }:
+                continue
+            if (kind == "managed_rebase"
+                    and intent["expected"].get("agent_session_id")
+                    != agent_session_id):
+                continue
+            if result.get("id") != intent.get("id") or result.get("candidates") is None:
+                raise MutationEvidenceError("Manager Git 전이 결과 identity가 다릅니다.")
+            if not isinstance(result.get("observed"), dict):
+                raise MutationEvidenceError("Manager Git 저장 결과 상태가 불완전합니다.")
+            if kind in {"managed_worktree_create", "managed_worktree_remove"}:
+                action = "create" if kind.endswith("create") else "remove"
+                receipt = state_dir / "managed-worktree-intents" / f"{intent['id']}.{action}.json"
+                marker = receipt.is_file() and _read(receipt) == {
+                    "id": intent["id"], "repo": intent["repo"],
+                    "target": intent["target"], "before": intent["before"],
+                    "expected": intent["expected"],
+                }
+                expected_candidates = verified_transition(
+                    intent, result["observed"], marker,
+                )
+            else:
+                observed = result["observed"]
+                branch = intent["expected"]["branch"]
+                if (
+                    not isinstance(observed, dict)
+                    or not isinstance(observed.get("head"), str)
+                    or not isinstance(observed.get("index"), dict)
+                    or not isinstance(observed.get("dirty"), dict)
+                    or not isinstance(observed.get("registration"), list)
+                    or type(observed.get("index_clean")) is not bool
+                    or intent["owner"] != f"plan:{branch.removeprefix('loop-manager/')}"
+                ):
+                    raise MutationEvidenceError("Manager rebase 저장 결과가 유효하지 않습니다.")
+                try:
+                    expected_candidates = verified_rebase_result(
+                        intent, observed,
+                        current_remote_oid=intent["expected"]["remote_oid"],
+                        target_ancestor=True, patches_preserved=True,
+                        reflog_marker=True, autostash_owned=True,
+                    )
+                except (KeyError, TypeError, ValueError) as error:
+                    raise MutationEvidenceError(
+                        "Manager rebase 저장 결과가 불완전합니다."
+                    ) from error
+            if result["candidates"] != expected_candidates:
+                raise MutationEvidenceError("Manager Git 저장된 전이 후보가 불일치합니다.")
+            transitions.append({"intent": intent, "result": result})
+    return transitions
