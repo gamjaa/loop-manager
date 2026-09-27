@@ -1715,7 +1715,8 @@ class ExecutionHandlerTests(TestCase):
         )
         self.handler.rebase_corrections.finish_turn(
             'repo', 'G-047', expected_generation=turn.generation,
-            turn=turn.pending_turn, session='same-session', result='saved result',
+            turn=turn.pending_turn, session='same-session',
+            result=READY_WORKER_RESULT,
             scope_marker=observation.progress,
         )
 
@@ -1723,7 +1724,7 @@ class ExecutionHandlerTests(TestCase):
 
         self.assertEqual(resumed.context.phase, ExecutionPhase.VERIFYING)
         self.effects.agent.run_agent.assert_not_called()
-        self.assertEqual(self.state.row()['worker_result'], 'saved result')
+        self.assertEqual(self.state.row()['worker_result'], READY_WORKER_RESULT)
 
     def test_changed_pending_turn_without_scope_baseline_blocks_before_agent(self):
         checkpoint = ExecutionCheckpointRepository(self.connection)
