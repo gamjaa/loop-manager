@@ -276,6 +276,17 @@ def _encode_publication_plan_ids(values: Sequence[str], field: str) -> str:
 
 @contextmanager
 def _transaction(connection: sqlite3.Connection) -> Iterator[None]:
+    if not connection.in_transaction:
+        # Reserve the writer before reading cycle/baseline state. Concurrent
+        # projects cannot safely upgrade two deferred read locks to writers.
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        return
     savepoint = f"maintenance_{uuid4().hex}"
     connection.execute(f"SAVEPOINT {savepoint}")
     try:

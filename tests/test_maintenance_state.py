@@ -466,6 +466,55 @@ class DocumentDraftTest(unittest.TestCase):
             self._create()
 
 
+class MaintenanceTransactionTest(unittest.TestCase):
+    def test_read_then_write_reserves_writer_before_competing_project(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'state.db'
+            first = sqlite3.connect(path, timeout=0)
+            second = sqlite3.connect(path, timeout=0)
+            try:
+                first.execute('CREATE TABLE baseline (repo TEXT, count INTEGER)')
+                with maintenance_state._transaction(first):
+                    self.assertEqual(first.execute('SELECT * FROM baseline').fetchall(), [])
+                    # A different project must wait before obtaining a write
+                    # reservation, not deadlock with our later lock upgrade.
+                    with self.assertRaises(sqlite3.OperationalError) as raised:
+                        second.execute('BEGIN IMMEDIATE')
+                    self.assertEqual(raised.exception.sqlite_errorcode, sqlite3.SQLITE_BUSY)
+                    first.execute("INSERT INTO baseline VALUES ('one', 1)")
+                with maintenance_state._transaction(second):
+                    second.execute("INSERT INTO baseline VALUES ('two', 2)")
+                self.assertEqual(first.execute('SELECT * FROM baseline ORDER BY repo').fetchall(),
+                                 [('one', 1), ('two', 2)])
+                self.assertFalse(first.in_transaction)
+                self.assertFalse(second.in_transaction)
+            finally:
+                second.close()
+                first.close()
+
+    def test_failure_and_nested_savepoint_preserve_caller_transaction(self):
+        connection = sqlite3.connect(':memory:')
+        self.addCleanup(connection.close)
+        connection.execute('CREATE TABLE baseline (count INTEGER)')
+        with self.assertRaises(KeyboardInterrupt):
+            with maintenance_state._transaction(connection):
+                connection.execute('INSERT INTO baseline VALUES (1)')
+                raise KeyboardInterrupt()
+        self.assertFalse(connection.in_transaction)
+        self.assertEqual(connection.execute('SELECT * FROM baseline').fetchall(), [])
+        connection.execute('INSERT INTO baseline VALUES (2)')
+        with self.assertRaises(ValueError):
+            with maintenance_state._transaction(connection):
+                connection.execute('INSERT INTO baseline VALUES (3)')
+                raise ValueError('abort nested operation')
+        with maintenance_state._transaction(connection):
+            connection.execute('INSERT INTO baseline VALUES (4)')
+        self.assertTrue(connection.in_transaction)
+        self.assertEqual(connection.execute('SELECT * FROM baseline').fetchall(), [(2,), (4,)])
+        connection.rollback()
+        self.assertEqual(connection.execute('SELECT * FROM baseline').fetchall(), [])
+
+
 class MaintenanceStateRepositoryTest(unittest.TestCase):
     @staticmethod
     def _start_legacy_assessment(connection, repo, source_sha):

@@ -47,6 +47,8 @@ priority: critical
 
 - SKIP 내용 검증 보완: index가 clean인 승인 경로도 호출 직전 직접 signature를 읽어 승인값과 비교하고, 동일 snapshot의 dirty 관측 및 안정성을 확인한다. 이 관측을 journal에 저장해 재검증에서도 누락·내용 불일치를 거부한다. 호출 전 변경·삭제·관측 중 변경과 저장 receipt 변조를 확인하는 targeted unit test 2개가 통과했다. 전체 verify는 Loop Manager 검증 대상이다.
 
+- 전체 verify 피드백의 병렬 catalog 처리 `database is locked`를 조사했다. 해당 경로에서 호출하는 유지보수 기준값 초기화의 deferred read→write 잠금 전환을 방지하도록 최상위 transaction을 `BEGIN IMMEDIATE`로 바꾸고, 중첩 savepoint 경계는 보존했다. 잠금 선점·rollback unit test 2개와 기준값 초기화 멱등성 unit test 1개가 통과했다. 원래 실패한 테스트는 실제 Git·병렬 scheduler 통합 사례여서 Worker가 재실행하지 않았으며, 원래 실패 해소 여부는 Loop Manager 전체 verify에서 확인해야 한다.
+
 ## Decision Log
 
 - G-091의 소유 Git journal을 확장한다. R-023의 Agent 기준선 조정과 범용 차단 해제는 G-092에 남기며, 이 계획은 현재 rebase 실행의 증거와 완료 판정만 다룬다.
