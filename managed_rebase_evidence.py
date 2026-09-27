@@ -79,12 +79,15 @@ def patch_equal(git: Callable[..., Any], repo: Any, source: Mapping[str, str],
 def stage_matches(*, before_index: Mapping[str, list[str]],
                   staged_index: Mapping[str, list[str]],
                   allowed_paths: Sequence[str], accepted_files: Mapping[str, str],
-                  staged_dirty: Mapping[str, Any]) -> bool:
+                  staged_dirty: Mapping[str, Any],
+                  accepted_modes: Mapping[str, str | None] | None = None) -> bool:
     """Reject changes outside the correction and non-default stage/index flags."""
     if not allowed_paths or not set(accepted_files) <= set(allowed_paths):
         return False
     if not stage_index_matches(before_index=before_index, staged_index=staged_index,
                                allowed_paths=allowed_paths):
+        return False
+    if not stage_modes_match(accepted_files, accepted_modes, staged_index):
         return False
     return all(
         isinstance(staged_dirty.get(path), list)
@@ -92,6 +95,24 @@ def stage_matches(*, before_index: Mapping[str, list[str]],
         and staged_dirty[path][1] == signature
         for path, signature in accepted_files.items()
     )
+
+
+def stage_modes_match(accepted_files, accepted_modes, staged_index) -> bool:
+    """Compare modes directly, regardless of Git's core.fileMode/diff policy."""
+    if (not isinstance(accepted_modes, Mapping)
+            or not isinstance(staged_index, Mapping)
+            or set(accepted_modes) != set(accepted_files)):
+        return False
+    for path, mode in accepted_modes.items():
+        entries = staged_index.get(path, [])
+        if mode is None:
+            if entries:
+                return False
+        elif (mode not in {'100644', '100755', '120000', '160000'}
+              or not isinstance(entries, list) or len(entries) != 1
+              or not re.fullmatch(r'H ' + mode + r' [0-9a-f]{40,64} 0', entries[0])):
+            return False
+    return True
 
 
 def stage_index_matches(*, before_index: Mapping[str, list[str]],

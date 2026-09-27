@@ -186,6 +186,7 @@ def rebase_replay_proof(
                         allowed_paths=list((item.get('accepted_files') or {}).keys()),
                         accepted_files=item.get('accepted_files') or {},
                         staged_dirty=saved['before'].get('dirty') or {},
+                        accepted_modes=item.get('accepted_modes'),
                     )):
                 raise MutationEvidenceError('rebase resolution: stage or turn mismatch')
             corrections[source] = {
@@ -198,6 +199,10 @@ def rebase_replay_proof(
                     or not item.get('correction_turn')
                     or item.get('staged_index') != saved['before'].get('index')
                     or not isinstance(item.get('accepted_files'), dict)
+                    or not replay_evidence.stage_modes_match(
+                        item.get('accepted_files') or {}, item.get('accepted_modes'),
+                        item.get('staged_index'),
+                    )
                     or not replay_evidence.stage_index_matches(
                         before_index=item.get('stage_before_index'),
                         staged_index=item.get('staged_index'),

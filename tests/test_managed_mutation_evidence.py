@@ -894,6 +894,32 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
             self.assertEqual(begin.call_args_list[0].kwargs['expected'],
                              begin.call_args_list[1].kwargs['expected'])
 
+    def test_stage_capture_binds_modes_to_approved_file_signatures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            path = worktree / 'app.py'
+            path.write_text('approved content')
+            path.chmod(0o644)
+            signature = loop_manager._path_signature(worktree, 'app.py')
+            observed = SimpleNamespace(
+                head=OLD, branch=None, index={},
+                dirty={'app.py': (('unstaged',), signature),
+                       'removed.py': (('unstaged',), 'missing')})
+            handler = object.__new__(ExecutionHandlers)
+            handler.repo = 'repo'
+            handler.effects = SimpleNamespace(
+                agent=SimpleNamespace(capture_git_snapshot=lambda *_: observed,
+                                      path_signature=loop_manager._path_signature),
+                checkpoint=SimpleNamespace(get=lambda *_: SimpleNamespace(
+                    snapshot={'rebase_evidence_version': 2})))
+            context = SimpleNamespace(worktree=worktree,
+                                      plan=SimpleNamespace(plan_id='G-099'))
+            evidence = handler._rebase_stage_evidence(context)
+            self.assertEqual(evidence['modes'], {'app.py': '100644', 'removed.py': None})
+            path.write_text('changed after approval')
+            with self.assertRaisesRegex(RuntimeError, 'changed while capturing'):
+                handler._rebase_stage_evidence(context)
+
     def test_versioned_continuation_binds_source_turn_and_stage_before_git(self):
         handler = object.__new__(ExecutionHandlers)
         context = SimpleNamespace(
@@ -910,7 +936,8 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
         snapshot = {
             'pending': 'continue', 'worker_result': 'saved-result',
             'stage_evidence': {'head': NEW, 'branch': None,
-                               'files': {'app.py': 'approved'}, 'index': pre_index},
+                               'files': {'app.py': 'approved'}, 'index': pre_index,
+                               'modes': {'app.py': '100644'}},
             'rebase_evidence_version': 2, 'rebase_run_id': 'run-one',
             'rebase_source_base': OLD, 'rebase_source_commits': [TREE],
             'rebase_remote_oid': OLD,
@@ -951,6 +978,14 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
             self.assertEqual(expected['source_commit'], TREE)
             self.assertEqual(expected['correction_turn'], 'turn-one')
             self.assertEqual(expected['staged_index'], staged_index)
+            self.assertEqual(expected['accepted_modes'], {'app.py': '100644'})
+            # core.fileMode=false can report a clean worktree diff even when
+            # update-index --chmod changes only the staged executable bit.
+            before['index'] = {'app.py': [f'H 100755 {TREE} 0']}
+            with self.assertRaises(journal.MutationEvidenceError):
+                handler._begin_rebase_continuation(context, CorrectionAction.CONTINUE)
+            self.assertEqual(begin.call_count, 1)
+            before['index'] = staged_index
             diff_code[0] = 1
             with self.assertRaises(journal.MutationEvidenceError):
                 handler._begin_rebase_continuation(context, CorrectionAction.CONTINUE)
@@ -976,7 +1011,8 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
         snapshot = dict(
             pending='continue', worker_result='approved',
             stage_evidence=dict(head=NEW, branch=None,
-                                files={'app.py': 'signature'}, index=original),
+                                files={'app.py': 'signature'}, index=original,
+                                modes={'app.py': '100644'}),
             rebase_evidence_version=2, rebase_run_id='run',
             rebase_source_base=OLD, rebase_source_commits=[TREE],
             rebase_remote_oid=None,

@@ -43,6 +43,8 @@ priority: critical
 - targeted unit 검증: skip 호출 전 검사, continue 회귀 검사, stage 판정 2개, skip receipt 재검증 등 5개 통과.
 - `tests/test_managed_rebase_lifecycle.py`에 실제 Git 다중 충돌·skip·후속 동일 파일 내용/mode 변경, PR/게시 checkpoint 분기, SQLite 재시작 전후 Worker·verify·Review 사례를 추가했다. 통합 테스트와 전체 verify는 Worker 실행 금지 범위이므로 실행하지 않았으며 Loop Manager 검증이 남아 있다.
 
+- mode 검증 보완: 승인 파일 signature에 결합한 Git mode를 stage 전에 저장하고 CONTINUE·SKIP과 journal 재검증에서 index mode를 직접 비교한다. `core.fileMode=false`의 clean diff로 index 실행 비트 변경이 숨겨지는 회귀를 unit test와 실제 Git fixture에 추가했다. targeted unit test 8개가 통과했으며 실제 Git 사례는 Loop Manager 전체 verify 대상이다.
+
 ## Decision Log
 
 - G-091의 소유 Git journal을 확장한다. R-023의 Agent 기준선 조정과 범용 차단 해제는 G-092에 남기며, 이 계획은 현재 rebase 실행의 증거와 완료 판정만 다룬다.

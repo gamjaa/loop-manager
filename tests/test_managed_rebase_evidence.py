@@ -12,7 +12,7 @@ import manager_git_journal as journal
 import loop_manager
 
 from managed_rebase_evidence import (
-    ReplayEvidenceError, source_commits, stage_index_matches, stage_matches, verify_replay,
+    ReplayEvidenceError, source_commits, stage_index_matches, stage_matches, stage_modes_match, verify_replay,
 )
 
 
@@ -110,6 +110,20 @@ class ReplayVerdictTests(unittest.TestCase):
 
 
 class StageVerdictTests(unittest.TestCase):
+    def test_modes_require_exact_approved_types_and_executable_bits(self):
+        files = {'app.py': 'approved'}
+        for mode in ('100644', '100755', '120000', '160000'):
+            index = {'app.py': [f'H {mode} ' + 'a' * 40 + ' 0']}
+            with self.subTest(mode=mode):
+                self.assertTrue(stage_modes_match(files, {'app.py': mode}, index))
+                other = '100644' if mode != '100644' else '100755'
+                self.assertFalse(stage_modes_match(files, {'app.py': other}, index))
+                self.assertFalse(stage_modes_match(files, None, index))
+                self.assertFalse(stage_modes_match(files, {}, index))
+                self.assertFalse(stage_modes_match(files, {'app.py': None}, index))
+        self.assertTrue(stage_modes_match(files, {'app.py': None}, {}))
+        self.assertFalse(stage_modes_match(files, {'app.py': '100644'}, {}))
+
     def test_empty_skip_still_requires_complete_unchanged_index(self):
         index = {'app.py': ['H 100644 ' + 'a' * 40 + ' 0']}
         self.assertTrue(stage_index_matches(
@@ -130,6 +144,7 @@ class StageVerdictTests(unittest.TestCase):
                   'other.py': before['other.py']}
         options = dict(before_index=before, allowed_paths=['app.py'],
                        accepted_files={'app.py': 'accepted'},
+                       accepted_modes={'app.py': '100644'},
                        staged_dirty={'app.py': [['staged'], 'accepted']})
         self.assertTrue(stage_matches(staged_index=staged, **options))
         for changed in (
@@ -168,7 +183,8 @@ class JournalReplayProofTests(unittest.TestCase):
                           'source_commit': 'source', 'correction_turn': 'turn',
                           'skip_reason': 'worker-approved', 'staged_index': staged,
                           'stage_before_index': original,
-                          'accepted_files': {'app.py': 'approved'}})
+                          'accepted_files': {'app.py': 'approved'},
+                          'accepted_modes': {'app.py': '100644'}})
             active = journal._read(journal._slot(
                 state, '/repo', 'managed_rebase', '/worktree') / 'active.json')
             with (mock.patch.object(journal.replay_evidence, 'source_commits',
@@ -366,6 +382,7 @@ class JournalReplayProofTests(unittest.TestCase):
                             'staged_tree_oid': trees[replayed[1]],
                             'stage_before_index': pre, 'staged_index': staged,
                             'accepted_files': {'app.py': 'approved'},
+                            'accepted_modes': {'app.py': '100644'},
                             'correction_turn': 'turn-1'}
             identity = journal.begin_rebase(
                 state, owner='plan:G-099', repo='/repo', target='/worktree',
@@ -381,6 +398,15 @@ class JournalReplayProofTests(unittest.TestCase):
                              ['patch', 'resolved', 'patch'])
             self.assertEqual(mapping[1]['tree'], trees[replayed[1]])
             self.assertNotEqual(mapping[2]['tree'], mapping[1]['tree'])
+            # Even a matching staged tree and dirty file signature cannot
+            # authorize an index-only executable-bit change in a saved receipt.
+            changed_index = {'app.py': ['H 100755 ' + '5' * 40 + ' 0']}
+            active['expected']['staged_index'] = changed_index
+            active['before']['index'] = changed_index
+            with self.assertRaisesRegex(journal.MutationEvidenceError, 'stage or turn'):
+                journal.rebase_replay_proof(git, state, active, result)
+            active['expected']['staged_index'] = staged
+            active['before']['index'] = staged
             trees[replayed[1]] = '9' * 40
             with self.assertRaises(journal.MutationEvidenceError):
                 journal.rebase_replay_proof(git, state, active, result)
@@ -509,6 +535,21 @@ class RealGitJournalReplayTests(unittest.TestCase):
             app.write_text(''.join(resolved), encoding='utf-8')
             git('add', 'app.txt')
             staged = loop_manager._owned_rebase_journal_state(repo, branch)
+            # Reproduce the mode-only attack that Git diff can conceal when
+            # core.fileMode is false. The file and its approval stay unchanged.
+            git('config', 'core.fileMode', 'false')
+            git('update-index', '--chmod=+x', '--', 'app.txt')
+            self.assertEqual(git('diff', '--quiet', '--', 'app.txt',
+                                 check=False).returncode, 0)
+            tampered = loop_manager._owned_rebase_journal_state(repo, branch)
+            self.assertEqual(tampered['dirty']['app.txt'][1], staged['dirty']['app.txt'][1])
+            self.assertFalse(stage_matches(
+                before_index=conflict['index'], staged_index=tampered['index'],
+                allowed_paths=['app.txt'],
+                accepted_files={'app.txt': staged['dirty']['app.txt'][1]},
+                accepted_modes={'app.txt': '100644'}, staged_dirty=tampered['dirty']))
+            git('update-index', '--chmod=-x', '--', 'app.txt')
+            git('config', 'core.fileMode', 'true')
             staged_tree = git('write-tree').stdout.strip()
             continuation = journal.begin_rebase(
                 state, owner='plan:G-099', repo=repo_key, target=repo_key,
@@ -521,6 +562,7 @@ class RealGitJournalReplayTests(unittest.TestCase):
                     'stage_before_index': conflict['index'],
                     'staged_index': staged['index'],
                     'accepted_files': {'app.txt': staged['dirty']['app.txt'][1]},
+                    'accepted_modes': {'app.txt': '100644'},
                 },
             )
             continued = rebase('--continue', identity=continuation)

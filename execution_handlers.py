@@ -1118,6 +1118,7 @@ class ExecutionHandlers:
                 allowed_paths=list((accepted_files or {}).keys()),
                 accepted_files=accepted_files or {},
                 staged_dirty=before.get('dirty') or {},
+                accepted_modes=stage_evidence.get('modes'),
             ):
                 raise manager_git_journal.MutationEvidenceError(
                     'rebase resolution: staged index differs from Worker-approved paths'
@@ -1132,6 +1133,9 @@ class ExecutionHandlers:
             if action is CorrectionAction.SKIP and (
                 not before.get('index_clean') or before.get('unmerged')
                 or accepted_files is None
+                or not managed_rebase_evidence.stage_modes_match(
+                    accepted_files, stage_evidence.get('modes'), before.get('index'),
+                )
                 or not managed_rebase_evidence.stage_index_matches(
                     before_index=stage_evidence.get('index'),
                     staged_index=before.get('index'),
@@ -1151,6 +1155,7 @@ class ExecutionHandlers:
                 'correction_generation': correction.generation,
                 'checkpoint_generation': current.generation,
                 'pr_head_oid': snapshot.get('rebase_pr_head_oid'),
+                'accepted_modes': stage_evidence.get('modes'),
                 'staged_index': before.get('index'),
                 'stage_before_index': stage_evidence.get('index') if isinstance(stage_evidence, dict) else None,
                 'skip_reason': 'worker-approved' if action is CorrectionAction.SKIP else None,
@@ -1386,6 +1391,12 @@ class ExecutionHandlers:
             evidence['index'] = {
                 path: list(entries) for path, entries in observed.index.items()
             }
+        checkpoint = self.effects.checkpoint
+        current = checkpoint.get(self.repo, context.plan.plan_id) if checkpoint else None
+        if current and (current.snapshot or {}).get('rebase_evidence_version') == 2:
+            evidence['modes'] = rebase_file_evidence.capture_modes(
+                context.worktree, evidence['files'], self.effects.agent.path_signature,
+            )
         return evidence
 
     def _stage_rebase_correction(self, context):
