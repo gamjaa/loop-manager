@@ -8062,6 +8062,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "maintenance_file_inventory.py",
                 "maintenance_file_ledger.py",
                 "maintenance_file_review.py",
+                "maintenance_reconciliation.py",
+                "maintenance_findings.py",
                 "maintenance_git.py",
                 "maintenance_orchestration.py",
                 "maintenance_planning.py",

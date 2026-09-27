@@ -27,6 +27,8 @@ from maintenance_planning import (
 )
 import maintenance_state
 import maintenance_file_review
+import maintenance_reconciliation
+import maintenance_findings
 from maintenance_file_inventory import SourceInventoryError
 import full_assessment
 import runtime_state
@@ -1273,10 +1275,15 @@ class PlanningLifecycleCoordinator:
             and hasattr(self._ports, "file_review")
         )
         if should_run:
+            final_page = None
             if file_review_enabled:
                 review_outcome = self._review_one_file(run, worktree)
                 if review_outcome is not None:
                     return review_outcome
+                if hasattr(self._ports, "reconciliation"):
+                    relation_outcome = self._reconcile_one_relation(run, worktree)
+                    if relation_outcome is not None:
+                        return relation_outcome
             self._ports.events.log("Planner 시작: 다음 ExecPlan 계획을 생성합니다.")
             if not result_in_flight:
                 self._ports.state.update(
@@ -1300,12 +1307,37 @@ class PlanningLifecycleCoordinator:
                     ),
                 )
                 if file_review_enabled:
-                    reviews = self._ports.file_review.completed_summary(
-                        context.repo,
-                    )
-                    prompt += "\n\n검증된 잠정 파일 검토와 코드맵의 bounded 미리보기 (성공 기록 아님):\n" + json.dumps(
-                        reviews, ensure_ascii=False,
-                    )
+                    if hasattr(self._ports, "reconciliation"):
+                        progress = self._ports.reconciliation.progress(
+                            context.repo, context.repo_path, context.base_branch,
+                            run.maintenance_cycle.revision, str(row.active_sha),
+                        )
+                        final_page = self._ports.reconciliation.synthesis(
+                            context.repo, run.maintenance_cycle.revision, str(row.active_sha), progress,
+                        )
+                        if final_page.index != final_page.total:
+                            return PlanningOutcome(PlanningOutcomeKind.WAITING)
+                        manifest = self._ports.reconciliation.synthesis_export(
+                            context.repo, final_page, progress, context.state_dir / "maintenance-evidence",
+                        )
+                        existing = self._active_plan_statuses(context.repo)
+                        collection, result_manifest = self._ports.reconciliation.findings_unit(
+                            context.repo, context.repo_path, context.base_branch,
+                            run.maintenance_cycle.revision, str(row.active_sha), existing,
+                            context.state_dir / "maintenance-evidence",
+                        )
+                        if collection.receipt is None:
+                            return PlanningOutcome(PlanningOutcomeKind.WAITING)
+                        prompt += (
+                            "\n\n검증된 발견·계획 비교 결과 manifest: " + str(result_manifest)
+                            + "\nmanifest의 unit_pattern으로 저장된 발견·비교 원문을 필요한 부분만 조회하라. "
+                            "제안된 새 계획을 실제 ExecPlan으로 작성하고 사용자 동작·공개 계약·저장 형식 "
+                            "보존과 targeted unit test·전체 verify 회귀 조건을 명시하라. "
+                            "모든 발견·비교는 이미 저장돼 있으므로 최종 응답에 배열을 다시 출력하지 마라. "
+                            "페이지별 발견 연결·제외 검증은 이후 별도 단위에서 진행한다. "
+                            "최종 응답에 아래 식별자·digest·개수·요약만 그대로 포함하라:\n"
+                            + maintenance_findings.RESULT_PREFIX + maintenance_findings.encode(collection.receipt)
+                        )
                 if (context.self_repository and run.maintenance_cycle.phase
                     is maintenance_state.MaintenancePhase.ASSESSMENT
                     and not run.maintenance_cycle.full_assessment_completed):
@@ -1323,19 +1355,18 @@ class PlanningLifecycleCoordinator:
                     self._ports.state.compact_catalog(context.repo),
                     run.mutable_ready_snapshot,
                 )
+            def save_final_session(session_id):
+                if final_page is not None:
+                    self._ports.reconciliation.synthesis_session(context.repo, final_page, session_id)
+                self._ports.state.update(context.repo, planner_session_id=session_id)
+
             before = self._ports.agent.begin_scope(role, worktree)
             result = self._ports.agent.run_planner(
-                worktree,
-                prompt,
-                row.planner_session_id,
-                lambda session_id: self._ports.state.update(
-                    context.repo, planner_session_id=session_id
-                ),
+                worktree, prompt, final_page.session_id if final_page is not None else row.planner_session_id,
+                save_final_session,
             )
             if result.session_id:
-                self._ports.state.update(
-                    context.repo, planner_session_id=result.session_id
-                )
+                save_final_session(result.session_id)
             scope_result = self._ports.agent.finish_scope(role, worktree, before)
             if scope_result.error:
                 scope_error = scope_result.error
@@ -1461,6 +1492,189 @@ class PlanningLifecycleCoordinator:
                                    detail=str(error))
         return PlanningOutcome(PlanningOutcomeKind.WAITING)
 
+    def _reconcile_one_relation(self, run: _PlanningRun, worktree: Path) -> PlanningOutcome | None:
+        """Verify one cross-file candidate per turn, retaining session progress."""
+        context = run.context
+        port = self._ports.reconciliation
+        try:
+            progress = port.progress(
+                context.repo, context.repo_path, context.base_branch,
+                run.maintenance_cycle.revision, str(run.row.active_sha),
+            )
+            if progress.pending_scan:
+                return PlanningOutcome(PlanningOutcomeKind.WAITING)
+            relation = progress.next_relation
+            if relation is None:
+                return self._synthesize_one_page(run, worktree, progress)
+            left = port.content(context.repo_path, context.base_branch, relation.left)
+            right = port.content(context.repo_path, context.base_branch, relation.right)
+            prompt = maintenance_reconciliation.relation_prompt(relation, left, right)
+            port.start(context.repo, run.maintenance_cycle.revision,
+                       str(run.row.active_sha), relation)
+            session_id, previous_error = port.unit(context.repo, relation)
+            if previous_error:
+                prompt += "\n이전 관계 확인 결과 오류를 수정하라: " + previous_error
+        except (maintenance_reconciliation.ReconciliationError, maintenance_file_review.FileReviewError,
+                SourceInventoryError) as error:
+            self._ports.events.error(str(error))
+            return PlanningOutcome(PlanningOutcomeKind.REMOTE_BASE_RESTART, detail=str(error))
+        before = self._ports.agent.begin_scope("maintenance_planner", worktree)
+        result = self._ports.agent.run_planner(
+            worktree, prompt, session_id,
+            lambda value: port.session(context.repo, run.maintenance_cycle.revision,
+                                       relation, value),
+        )
+        if result.session_id:
+            port.session(context.repo, run.maintenance_cycle.revision, relation, result.session_id)
+        scope = self._ports.agent.finish_scope("maintenance_planner", worktree, before)
+        if scope.error:
+            self._ports.events.error(scope.error)
+            return self._operational_error()
+        self._ports.agent.clear_scope(context.repo)
+        if result.code:
+            self._ports.events.error(result.message)
+            if result.kind is PlanningAgentResultKind.TRANSIENT_FAILURE:
+                kind = PlanningOutcomeKind.TRANSIENT_PAUSE
+            elif result.kind is PlanningAgentResultKind.USAGE_LIMIT:
+                kind = PlanningOutcomeKind.USAGE_LIMIT_PAUSE
+            else:
+                kind = PlanningOutcomeKind.OPERATIONAL_ERROR
+            return PlanningOutcome(kind, error=True)
+        try:
+            left = port.content(context.repo_path, context.base_branch, relation.left)
+            right = port.content(context.repo_path, context.base_branch, relation.right)
+            parsed = maintenance_reconciliation.parse_relation(result.message, relation, left, right)
+            port.complete(context.repo, run.maintenance_cycle.revision, relation, parsed)
+        except (maintenance_reconciliation.ReconciliationError, maintenance_file_review.FileReviewError,
+                SourceInventoryError) as error:
+            port.fail(context.repo, run.maintenance_cycle.revision, relation, str(error))
+            self._ports.events.error(str(error))
+            return PlanningOutcome(PlanningOutcomeKind.VALIDATION_RETRY, detail=str(error))
+        return PlanningOutcome(PlanningOutcomeKind.WAITING)
+
+    def _synthesize_one_page(self, run: _PlanningRun, worktree: Path,
+                             progress) -> PlanningOutcome | None:
+        """Assess one page independently; only its durable result crosses sessions."""
+        context, port = run.context, self._ports.reconciliation
+        page = port.synthesis(context.repo, run.maintenance_cycle.revision,
+                              str(run.row.active_sha), progress)
+        if page.index == page.total:
+            return self._collect_findings_unit(run, worktree)
+        manifest = port.synthesis_export(context.repo, page, progress,
+                                         context.state_dir / "maintenance-evidence")
+        before = self._ports.agent.begin_scope("maintenance_planner", worktree)
+        session_errors = []
+
+        def save_session(session_id):
+            try:
+                port.synthesis_session(context.repo, page, session_id)
+            except maintenance_reconciliation.ReconciliationError as error:
+                session_errors.append(str(error))
+
+        result = self._ports.agent.run_planner(
+            worktree, maintenance_reconciliation.synthesis_prompt(page, manifest),
+            page.session_id, save_session,
+        )
+        if result.session_id:
+            save_session(result.session_id)
+        scope = self._ports.agent.finish_scope("maintenance_planner", worktree, before)
+        if scope.error:
+            self._ports.events.error(scope.error)
+            return self._operational_error()
+        self._ports.agent.clear_scope(context.repo)
+        if result.code:
+            self._ports.events.error(result.message)
+            kind = {PlanningAgentResultKind.TRANSIENT_FAILURE: PlanningOutcomeKind.TRANSIENT_PAUSE,
+                    PlanningAgentResultKind.USAGE_LIMIT: PlanningOutcomeKind.USAGE_LIMIT_PAUSE}.get(
+                        result.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+            return PlanningOutcome(kind, error=True)
+        try:
+            if session_errors:
+                raise maintenance_reconciliation.ReconciliationError(session_errors[0])
+            current = port.progress(context.repo, context.repo_path, context.base_branch,
+                                    run.maintenance_cycle.revision, str(run.row.active_sha))
+            fresh = port.synthesis(context.repo, run.maintenance_cycle.revision,
+                                   str(run.row.active_sha), current)
+            if fresh.key != page.key:
+                raise maintenance_reconciliation.ReconciliationError("종합 중 source가 바뀌었습니다.")
+            port.synthesis_complete(context.repo, page, result.message)
+        except (maintenance_reconciliation.ReconciliationError, maintenance_file_review.FileReviewError,
+                SourceInventoryError) as error:
+            self._ports.events.error(str(error))
+            return PlanningOutcome(PlanningOutcomeKind.VALIDATION_RETRY, detail=str(error))
+        return PlanningOutcome(PlanningOutcomeKind.WAITING)
+
+    def _active_plan_statuses(self, repo: str) -> dict[str, str]:
+        return {str(item["plan_id"]): str(item["status"])
+                for item in self._ports.state.execplan_rows(repo) if str(item["status"]) != "MERGED"}
+
+    def _collect_findings_unit(self, run: _PlanningRun, worktree: Path) -> PlanningOutcome | None:
+        context, port = run.context, self._ports.reconciliation
+        plans = self._active_plan_statuses(context.repo)
+        unit, manifest = port.findings_unit(context.repo, context.repo_path, context.base_branch,
+            run.maintenance_cycle.revision, str(run.row.active_sha), plans, context.state_dir / "maintenance-evidence")
+        if unit.receipt is not None:
+            return None
+        before = self._ports.agent.begin_scope("maintenance_planner", worktree)
+        result = self._ports.agent.run_planner(worktree, maintenance_findings.unit_prompt(unit, manifest),
+            unit.session_id, lambda session_id: port.findings_session(context.repo, unit, session_id))
+        if result.session_id:
+            port.findings_session(context.repo, unit, result.session_id)
+        scope = self._ports.agent.finish_scope("maintenance_planner", worktree, before)
+        if scope.error:
+            self._ports.events.error(scope.error)
+            return self._operational_error()
+        self._ports.agent.clear_scope(context.repo)
+        if result.code:
+            self._ports.events.error(result.message)
+            kind = {PlanningAgentResultKind.TRANSIENT_FAILURE: PlanningOutcomeKind.TRANSIENT_PAUSE,
+                    PlanningAgentResultKind.USAGE_LIMIT: PlanningOutcomeKind.USAGE_LIMIT_PAUSE}.get(
+                        result.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+            return PlanningOutcome(kind, error=True)
+        try:
+            port.findings_complete(context.repo, context.repo_path, context.base_branch,
+                run.maintenance_cycle.revision, str(run.row.active_sha), self._active_plan_statuses(context.repo),
+                unit, result.message)
+        except (maintenance_reconciliation.ReconciliationError, maintenance_file_review.FileReviewError,
+                SourceInventoryError) as error:
+            try:
+                port.findings_fail(context.repo, unit, str(error))
+            except maintenance_reconciliation.ReconciliationError:
+                pass  # A new snapshot already invalidated the old unit.
+            self._ports.events.error(str(error))
+            return PlanningOutcome(PlanningOutcomeKind.VALIDATION_RETRY, detail=str(error))
+        return PlanningOutcome(PlanningOutcomeKind.WAITING)
+
+    def _resolve_one_page(self, run: _PlanningRun, worktree: Path,
+                          unit: maintenance_reconciliation.ResolutionUnit) -> PlanningOutcome:
+        """Keep the final Planner result pending while one coverage receipt is validated."""
+        repo, port = run.context.repo, self._ports.reconciliation
+        before = self._ports.agent.begin_scope("maintenance_planner", worktree)
+        result = self._ports.agent.run_planner(
+            worktree, maintenance_reconciliation.resolution_prompt(unit), unit.session_id,
+            lambda session_id: port.resolution_session(repo, unit, session_id),
+        )
+        if result.session_id:
+            port.resolution_session(repo, unit, result.session_id)
+        scope = self._ports.agent.finish_scope("maintenance_planner", worktree, before)
+        if scope.error:
+            self._ports.events.error(scope.error)
+            return self._operational_error()
+        self._ports.agent.clear_scope(repo)
+        if result.code:
+            self._ports.events.error(result.message)
+            kind = {PlanningAgentResultKind.TRANSIENT_FAILURE: PlanningOutcomeKind.TRANSIENT_PAUSE,
+                    PlanningAgentResultKind.USAGE_LIMIT: PlanningOutcomeKind.USAGE_LIMIT_PAUSE}.get(
+                        result.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+            return PlanningOutcome(kind, error=True)
+        try:
+            port.resolution_complete(repo, unit, result.message)
+        except maintenance_reconciliation.ReconciliationError as error:
+            port.resolution_fail(repo, unit, str(error))
+            self._ports.events.error(str(error))
+            return PlanningOutcome(PlanningOutcomeKind.VALIDATION_RETRY, detail=str(error))
+        return PlanningOutcome(PlanningOutcomeKind.WAITING)
+
     def _validate_planner_result(
         self, run: _PlanningRun
     ) -> PlanningOutcome | None:
@@ -1484,6 +1698,26 @@ class PlanningLifecycleCoordinator:
                     )
                 except MaintenanceOrchestrationError as error:
                     raise PlanningResultInvalid(str(error)) from error
+                if (run.maintenance_cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT
+                    and run.maintenance_cycle.file_assessment_start_merged_count is not None
+                    and (not context.self_repository or run.maintenance_cycle.full_assessment_completed)
+                    and hasattr(self._ports, "reconciliation")):
+                    try:
+                        resolution = self._ports.reconciliation.validate(
+                            context.repo, context.repo_path, context.base_branch,
+                            run.maintenance_cycle.revision, str(row.active_sha),
+                            str(row.planning_result or ""),
+                            {str(item["plan_id"]): str(item["status"])
+                             for item in self._ports.state.execplan_rows(context.repo)
+                             if str(item["status"]) != "MERGED"},
+                            decision.plan_ids if decision.outcome is MaintenanceOutcome.REFACTORING else (),
+                            resolution_directory=context.state_dir / "maintenance-evidence",
+                        )
+                        if isinstance(resolution, maintenance_reconciliation.ResolutionUnit):
+                            return self._resolve_one_page(run, worktree, resolution)
+                    except (maintenance_reconciliation.ReconciliationError,
+                            maintenance_file_review.FileReviewError, SourceInventoryError) as error:
+                        raise PlanningResultInvalid(str(error)) from error
                 changed = sorted(
                     set(dirty_files)
                     | set(

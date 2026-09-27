@@ -16,7 +16,10 @@ import full_assessment
 import execplan_catalog_state
 import loop_manager
 import maintenance_planning
+import maintenance_findings
+import maintenance_reconciliation
 import maintenance_state
+from maintenance_file_inventory import SourceInventory, TrackedSource
 from planning_catalog import MutableReadySnapshot, mutable_snapshot_token
 
 
@@ -1911,6 +1914,191 @@ class MaintenancePlanningTest(unittest.TestCase):
         )
         self.assertEqual(fresh.mode, loop_manager.MaintenancePlanMode.REVALIDATION)
         self.assertEqual(fresh.cycle_revision, restarted.revision)
+
+
+class ReconciledPlanLinkTest(unittest.TestCase):
+    def test_findings_port_persists_manifest_and_rejects_changed_catalog(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        port = loop_manager._PlanningReconciliationPorts(connection)
+        progress = maintenance_reconciliation.ReconciliationProgress((), (), (), None)
+        with (tempfile.TemporaryDirectory() as directory,
+              mock.patch.object(port, "progress", return_value=progress),
+              mock.patch.object(port, "_plan_texts", return_value={}),
+              mock.patch.object(loop_manager.maintenance_file_inventory, "cached_source_inventory",
+                                return_value=SourceInventory("a" * 40, (), ()))):
+            args = ("repo", Path("repo"), "main", 1, "a" * 40)
+            unit, manifest = port.findings_unit(*args, {}, Path(directory))
+            self.assertTrue(manifest.exists())
+            port.findings_session("repo", unit, "resume")
+            port.findings_fail("repo", unit, "retry bounded unit")
+            resumed, _ = port.findings_unit(*args, {}, Path(directory))
+            self.assertEqual(resumed.session_id, "resume")
+            self.assertEqual(resumed.error, "retry bounded unit")
+            output = maintenance_findings.UNIT_PREFIX + json.dumps({
+                "manifest_id": unit.manifest_id, "index": 0, "parts": [], "complete": True,
+                "counts": {"finding_count": 0, "comparison_count": 0},
+                "summary": "No selected structural evidence requires a new refactoring plan."})
+            port.findings_complete(*args, {}, resumed, output)
+            sealed, _ = port.findings_unit(*args, {}, Path(directory))
+            self.assertEqual(sealed.receipt["unit_count"], 1)
+            final = maintenance_findings.RESULT_PREFIX + json.dumps(sealed.receipt)
+            self.assertEqual(port.validate(*args, final, {}, ())["findings"], [])
+            with mock.patch.object(port, "_plan_texts", return_value={"G-100": "Changed scope"}):
+                with self.assertRaises(maintenance_reconciliation.ReconciliationError):
+                    port.findings_complete(*args, {"G-100": "READY"}, resumed, output)
+
+    def test_compact_no_issue_waits_for_every_durable_resolution(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute("CREATE TABLE projects (repo TEXT PRIMARY KEY)")
+        connection.execute("INSERT INTO projects VALUES ('repo')")
+        port = loop_manager._PlanningReconciliationPorts(connection)
+        progress = maintenance_reconciliation.ReconciliationProgress((), (), (), None,
+            file_reviews=({"path": "src/a.py", "evidence": "This reviewed module has one cohesive responsibility."},))
+        page = port.synthesis("repo", 1, "a" * 40, progress)
+        port.synthesis_session("repo", page, "review-session")
+        port.synthesis_complete("repo", page, maintenance_reconciliation.SYNTHESIS_PREFIX + json.dumps({
+            "key": page.key, "excerpt": "This reviewed module has one cohesive responsibility.",
+            "has_issue": False, "assessment": "This independently reviewed module needs no structural change.",
+        }))
+        collection = port._findings.prepare("repo", 1, "a" * 40, page.digest, {}, {})
+        port._findings.complete("repo", collection, maintenance_findings.UNIT_PREFIX + json.dumps({
+            "manifest_id": collection.manifest_id, "index": 0, "parts": [], "complete": True,
+            "counts": {"finding_count": 0, "comparison_count": 0},
+            "summary": "Reviewed responsibilities do not need structural changes."}), {}, lambda value: None)
+        collection = port._findings.prepare("repo", 1, "a" * 40, page.digest, {}, {})
+        output = maintenance_findings.RESULT_PREFIX + json.dumps(collection.receipt)
+        with (tempfile.TemporaryDirectory() as directory,
+              mock.patch.object(port, "progress", return_value=progress),
+              mock.patch.object(loop_manager.maintenance_file_inventory, "cached_source_inventory",
+                                return_value=SourceInventory("a" * 40, (), ())),
+              mock.patch.object(loop_manager, "_git_tree_entries", return_value={})):
+            args = ("repo", Path("repo"), "main", 1, "a" * 40, output, {}, ())
+            with self.assertRaisesRegex(maintenance_reconciliation.ReconciliationError, "저장된 판단 처리"):
+                port.validate(*args)
+            unit = port.validate(*args, resolution_directory=Path(directory))
+            self.assertIsInstance(unit, maintenance_reconciliation.ResolutionUnit)
+            port.resolution_complete("repo", unit, maintenance_reconciliation.RESOLUTION_PREFIX + json.dumps({
+                "key": unit.assessment["key"], "excerpt": unit.assessment["assessment"],
+                "issue_keys": [], "disposition": "no_issue",
+                "reason": "The reviewed responsibility has no duplicate or mixed integration boundary."}))
+            self.assertEqual(port.validate(*args)["findings"], [])
+            bad_args = (*args[:5], output.replace(collection.receipt["digest"], "stale-digest"), *args[6:])
+            with self.assertRaisesRegex(maintenance_reconciliation.ReconciliationError, "manifest"):
+                port.validate(*bad_args)
+
+    def test_unconsumed_evidence_pages_block_final_validation(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute("CREATE TABLE projects (repo TEXT PRIMARY KEY)")
+        connection.execute("INSERT INTO projects VALUES ('repo')")
+        port = loop_manager._PlanningReconciliationPorts(connection)
+        progress = maintenance_reconciliation.ReconciliationProgress((), (), (), None,
+            file_reviews=({"path": "src/a.py", "evidence": "A single file issue must be reviewed."},))
+        with (mock.patch.object(port, "progress", return_value=progress),
+              mock.patch.object(maintenance_reconciliation, "parse_findings") as parse):
+            with self.assertRaisesRegex(maintenance_reconciliation.ReconciliationError, "페이지 검토"):
+                port.validate("repo", Path("repo"), "main", 1, "a" * 40, "output", {}, ())
+        parse.assert_not_called()
+
+    def test_validation_reads_plan_scope_from_pinned_active_tree(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        port = loop_manager._PlanningReconciliationPorts(connection)
+        progress = maintenance_reconciliation.ReconciliationProgress((), (), (), None)
+        inventory = SourceInventory("a" * 40, (), ())
+        text = plan_text("G-100", "Extract Boundary")
+        with (mock.patch.object(port, "progress", return_value=progress),
+              mock.patch.object(loop_manager.maintenance_file_inventory, "cached_source_inventory", return_value=inventory),
+              mock.patch.object(loop_manager, "_git_tree_entries", return_value={
+                  b"docs/plans/[G-100] Extract Boundary.md": (b"blob", b"oid"),
+                  b"docs/plans/archive/[G-099] Old.md": (b"blob", b"old"),
+                  b"src/invalid-\xff.py": (b"blob", b"source"),
+              }),
+              mock.patch.object(loop_manager, "git_bytes", return_value=text.encode()) as read,
+              mock.patch.object(port._findings, "resolve", return_value={}),
+              mock.patch.object(maintenance_reconciliation, "parse_findings", return_value={}) as parse):
+            port.validate("repo", Path("repo"), "main", 1, inventory.revision,
+                          "output", {"G-100": "READY"}, ())
+        read.assert_called_once_with(Path("repo"), "show",
+                                     f"{inventory.revision}:docs/plans/[G-100] Extract Boundary.md")
+        self.assertEqual(parse.call_args.args[-1], {"G-100": text})
+
+    def test_refactoring_plan_preserves_all_three_contracts(self):
+        path = "docs/plans/[G-100] Extract Boundary.md"
+        text = plan_text("G-100", "Extract Boundary")
+        plan = {"priority": "normal"}
+        maintenance_planning.validate_refactoring_plan(path, plan, text)
+        changed = text.replace("the public contract, and ", "").replace(
+            "the public API contract, and ", ""
+        )
+        with self.assertRaisesRegex(maintenance_planning.MaintenancePlanningError,
+                                    "공개 계약"):
+            maintenance_planning.validate_refactoring_plan(path, plan, changed)
+
+    def test_findings_link_existing_plan_without_duplicate_and_allow_grounded_no_issue(self):
+        content = b"def calculate(): return 1\n"
+        source = TrackedSource("src/calc.py", hashlib.sha256(content).hexdigest(),
+                               "100644", "a" * 40, "source")
+        inventory = SourceInventory(source.revision, (source,), ())
+        progress = maintenance_reconciliation.ReconciliationProgress(
+            (source,), (), (), None, file_reviews=({"path": source.path, "evidence": {
+                "responsibility_and_integration": "Calculation has one pure responsibility and no external integration."}},))
+        finding = {
+            "issue_key": "mixed-calculation", "targets": [source.path],
+            "evidence": [{"path": source.path, "content_hash": source.content_hash,
+                          "mode": source.mode, "excerpt": "def calculate()"}],
+            "relation_keys": [],
+            "boundary": "Move calculation from the interface module into its own unit.",
+            "context_reduction": "Later interface changes avoid unrelated calculation details.",
+            "integration_cost": "One import and a focused unit test are added for the boundary.",
+            "status": "existing_plan", "plan_id": "G-100",
+            "plan_comparisons": [{"plan_id": "G-100",
+                "plan_excerpt": "Extract calculation from the interface module.",
+                "finding_excerpt": "Move calculation from the interface module into its own unit.",
+                "same_issue": True, "reason": "Both isolate calculation from the same interface responsibility."}],
+        }
+        payload = {"source_revision": source.revision, "findings": [finding],
+                   "no_issue_reason": None}
+        parse = lambda value, existing, new: maintenance_reconciliation.parse_findings(
+            maintenance_reconciliation.FINDINGS_PREFIX + json.dumps(value), progress,
+            inventory, {source.path: content}, existing, new,
+            {"G-100": "Extract calculation from the interface module."},
+        )
+        self.assertEqual(parse(payload, {"G-100": "READY"}, ()), payload)
+        with self.assertRaisesRegex(maintenance_reconciliation.ReconciliationError, "계획 연결"):
+            parse(payload, {}, ())
+        with self.assertRaisesRegex(maintenance_reconciliation.ReconciliationError, "새 리팩터링"):
+            parse(payload, {"G-100": "READY"}, ("G-101",))
+        no_issue = {"source_revision": source.revision, "findings": [],
+                    "no_issue_reason": {"files": [{"id": source.path,
+                        "excerpt": "Calculation has one pure responsibility",
+                        "reason": "The reviewed function has no mixed integration responsibility."}], "relations": []}}
+        self.assertEqual(parse(no_issue, {}, ()), no_issue)
+        import copy
+        for change in ("unrelated", "duplicate", "forged", "missing"):
+            changed = copy.deepcopy(payload)
+            candidate = changed["findings"][0]
+            new = ()
+            if change == "unrelated":
+                candidate["plan_comparisons"][0]["same_issue"] = False
+            elif change == "duplicate":
+                candidate.update(status="new_plan", plan_id="G-101")
+                new = ("G-101",)
+            elif change == "forged":
+                candidate["plan_comparisons"][0]["plan_excerpt"] = "A made up scope that is absent from the plan."
+            else:
+                candidate["plan_comparisons"] = []
+            with self.subTest(change=change), self.assertRaises(maintenance_reconciliation.ReconciliationError):
+                parse(changed, {"G-100": "READY"}, new)
+        for reason in ("Everything looks fine after careful review.",
+                       {"files": [], "relations": []},
+                       {"files": [{"id": source.path, "excerpt": "This review evidence was fabricated.",
+                                   "reason": "There is no issue requiring any refactoring."}], "relations": []}):
+            with self.subTest(reason=reason), self.assertRaises(maintenance_reconciliation.ReconciliationError):
+                parse({**no_issue, "no_issue_reason": reason}, {}, ())
+
 
 
 if __name__ == "__main__":

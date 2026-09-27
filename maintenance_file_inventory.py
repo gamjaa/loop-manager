@@ -6,8 +6,10 @@ assessment instead of disappearing from its coverage silently.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import hashlib
+import json
+import sqlite3
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
@@ -210,3 +212,25 @@ def tracked_source_inventory(repo: Path, base_branch: str, revision: str) -> Sou
         details = "; ".join(f"{item.path}: {item.reason}" for item in uncertain[:10])
         raise SourceInventoryError("추적 파일 분류를 확정할 수 없습니다: " + details)
     return SourceInventory(revision, tuple(sorted(sources, key=lambda item: item.path)), tuple(classifications))
+
+
+def cached_source_inventory(connection: sqlite3.Connection, repository: Path,
+                            base: str, revision: str) -> SourceInventory:
+    """Reuse classification of an immutable tree, checking the live ref every time."""
+    verify_remote_revision(repository, base, revision)
+    connection.execute("""CREATE TABLE IF NOT EXISTS maintenance_inventory_cache (
+        repository TEXT NOT NULL, base TEXT NOT NULL, revision TEXT NOT NULL,
+        inventory_json TEXT NOT NULL, PRIMARY KEY (repository, base))""")
+    key = (str(repository.resolve()), base)
+    row = connection.execute(
+        "SELECT revision, inventory_json FROM maintenance_inventory_cache WHERE repository = ? AND base = ?", key,
+    ).fetchone()
+    if row and row[0] == revision:
+        value = json.loads(row[1])
+        return SourceInventory(revision, tuple(TrackedSource(**item) for item in value["sources"]),
+                               tuple(ClassifiedPath(**item) for item in value["classifications"]))
+    inventory = tracked_source_inventory(repository, base, revision)
+    with connection:
+        connection.execute("INSERT OR REPLACE INTO maintenance_inventory_cache VALUES (?, ?, ?, ?)",
+                           (*key, revision, json.dumps(asdict(inventory), ensure_ascii=False)))
+    return inventory
