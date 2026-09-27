@@ -29,7 +29,6 @@ class FileReviewError(ValueError):
 
 RESULT_PREFIX = "FILE_REVIEW_RESULT: "
 MAX_EMBEDDED_SOURCE_BYTES = 48_000
-MAX_RESULT_CHARS = 48_000
 MAX_FIELD_CHARS = 1_200
 MAX_LIST_ITEMS = 32
 _SCHEMA = """
@@ -216,8 +215,8 @@ def parse_review(output: str, source: TrackedSource, content: bytes) -> dict:
              if line.startswith(RESULT_PREFIX)]
     if len(lines) != 1:
         raise FileReviewError("FILE_REVIEW_RESULT JSON 줄이 정확히 하나 필요합니다.")
-    if len(lines[0]) > MAX_RESULT_CHARS:
-        raise FileReviewError("FILE_REVIEW_RESULT가 잠정 검토 크기 상한을 넘었습니다.")
+    # Bound individual fields and lists below, not the serialized document:
+    # mandatory chunk evidence grows with the source and JSON escaping varies.
     try:
         result = json.loads(lines[0])
     except json.JSONDecodeError as error:

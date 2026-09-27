@@ -99,6 +99,57 @@ class ProvisionalFileReviewTest(unittest.TestCase):
         with self.assertRaisesRegex(review.FileReviewError, "중간"):
             review.parse_review(review.RESULT_PREFIX + json.dumps(payload), source, content)
 
+    def test_many_chunk_result_over_old_limit_is_saved_and_resumed(self):
+        line = b"def calculate(): return 1\n"
+        content = line * (review.MAX_EMBEDDED_SOURCE_BYTES * 160 // len(line))
+        inventory = self.publish({"src/calc.py": content})
+        source = inventory.sources[0]
+        payload = result_for(source, "def calculate(): return 1", content)
+        self.assertEqual(len(payload["evidence"]["chunk_reviews"]), 160)
+        raw = json.dumps(payload)
+        self.assertGreater(len(raw), 48_000)
+        parsed = review.parse_review(review.RESULT_PREFIX + raw, source, content)
+        self.progress.start(str(self.repo), 1, source)
+        self.progress.complete(str(self.repo), 1, source, parsed)
+
+        resumed = review.ProvisionalReviewRepository(self.connection).progress(
+            str(self.repo), self.repo, "main", 1, inventory,
+        )
+        self.assertEqual(resumed.completed, (parsed,))
+        self.assertIsNone(resumed.next_unit)
+        self.assertEqual(self.ledger.reviews(str(self.repo)), ())
+        self.assertIsNone(self.ledger.last_success(str(self.repo)))
+
+        # A large saved result must still cover every source span on resume.
+        payload["evidence"]["chunk_reviews"].pop(80)
+        self.connection.execute(
+            "UPDATE provisional_file_reviews SET result_json = ? WHERE repo = ?",
+            (json.dumps(payload), str(self.repo)),
+        )
+        invalid = self.state(inventory)
+        self.assertEqual(invalid.completed, ())
+        self.assertEqual(invalid.next_unit.source, source)
+
+    def test_result_without_total_cap_still_enforces_field_and_list_bounds(self):
+        content = b"def calculate(): return 1\n"
+        source = maintenance_file_inventory.TrackedSource(
+            "src/calc.py", hashlib.sha256(content).hexdigest(), "100644",
+            "a" * 40, "source",
+        )
+        for field in ("readability", "chunk_review", "public_symbols"):
+            with self.subTest(field=field):
+                payload = result_for(source, "def calculate(): return 1", content)
+                if field == "readability":
+                    payload["evidence"][field] = "x" * (review.MAX_FIELD_CHARS + 1)
+                elif field == "chunk_review":
+                    payload["evidence"]["chunk_reviews"][0]["review"] = (
+                        "x" * (review.MAX_FIELD_CHARS + 1)
+                    )
+                else:
+                    payload["code_map"][field] = ["calculate"] * (review.MAX_LIST_ITEMS + 1)
+                with self.assertRaises(review.FileReviewError):
+                    review.parse_review(review.RESULT_PREFIX + json.dumps(payload), source, content)
+
     def test_non_utf8_source_has_byte_preserving_prompt_and_review(self):
         content = b"def calculate(): return '\xff'\n"
         inventory = self.publish({"src/calc.py": content})
