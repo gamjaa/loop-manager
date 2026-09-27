@@ -38,8 +38,8 @@ priority: normal
 
 ## Progress
 
-- [ ] 파일별 평가 실행 및 빈 대상 완료 연결
-- [ ] 계획 게시와 파일 ledger·성공 기준의 원자 확정·복구
+- [x] 파일별 평가 실행 및 빈 대상 완료 연결
+- [x] 계획 게시와 파일 ledger·성공 기준의 원자 확정·복구
 
 ## Decision Log
 

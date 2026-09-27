@@ -53,11 +53,12 @@
 - ExecPlan 생성 전 Planner 실패는 프로젝트의 `planning_error`로 SQLite에 저장하며 ExecPlan BLOCKED 상태를 만들지 않는다
 - 미충족 PRODUCT 또는 Requirement에 근거해서만 ExecPlan을 작성한다
 - 실행 중인 변경 작업은 새 계획 입력이 선점하지 않는다. 안전한 선택 경계에서 마지막 성공 Planner 이후 명세 또는 전체 계획 입력이 바뀌었으면 대기 중인 READY보다 일반 Planner를 정확히 한 번 먼저 실행한다. 입력이 같으면 실행 가능한 READY를 우선순위대로 시작하며, 없으면 대기 또는 완료 조건을 평가한다. due 유지보수 평가는 기존 순서를 유지한다
-- 프로젝트별 성공한 유지보수 평가 이후 새로 MERGED가 된 ExecPlan 수로 다음 평가 시점을 계산하며, 이력이 없으면 첫 선택 경계에서 평가한다. 공통 `refactoring_review_interval`은 양의 정수이고 기본값은 5다
+- 프로젝트별 첫 파일별 평가 전에는 등록 또는 기존 정책 적용의 안전한 시점에 확인한 MERGED ExecPlan 수를 시작 기준으로 보존한다. 기존 활성 유지보수 cycle은 먼저 복구·완료하고 과거 성공 이력은 감사 자료로 보존한다. 첫 평가와 이후 정기 평가는 각각 시작 기준 또는 마지막 성공한 파일별 평가 이후 새로 MERGED된 ExecPlan 수가 공통 `refactoring_review_interval`에 도달할 때 시작한다. 이 설정은 양의 정수이며 기본값은 20이다. 성공한 파일별 평가 이력이 있는 완료 후보는 정기 주기 전에도 이후 Merge 수가 10개 이상이고 새 검토 대상이 있을 때 한 번 안정화 평가를 한다
 - 실행 가능한 READY ExecPlan은 명세 또는 전체 계획 입력 변경에 따른 우선 계획이 없을 때 안전한 무인 자동화를 막는 작업부터 결정적 순서로 선택한다. dependency 미충족 READY, `PLAN_BLOCKED`·안정된 `PR_OPEN`만 남은 경우에도 명세 또는 전체 계획 입력 trigger를 평가하되, 활성 유지보수 주기의 prerequisite 집합과 리팩터링 DAG 순서는 유지한다
 - Planner는 최신 `origin/<base-branch>` 기준의 detached planning worktree에서 새 ExecPlan을 작성하고, SQLite와 Git snapshot으로 증명된 미착수 READY만 같은 ID로 수정·rename·삭제할 수 있다. 그 밖의 기존 계획과 파일은 변경하지 않으며 범위 밖 아이디어만 `docs/FUTURE_IDEAS.md`에 기록한다
 - 유지보수 Planner만 활성 cycle mode와 무소유 READY snapshot에 한정해 barrier dependency 또는 사후 구조 참조를 개정할 수 있다. READY가 없고 일반 계획 입력도 변경된 due 경계에서만 일반 계획과 유지보수 평가를 한 호출로 결합한다
-- 유지보수 planning batch는 원격 fast-forward가 확인된 뒤 catalog와 cycle 상태를 원자적으로 반영하며, 평가 없음 또는 사후 재검증 성공 전에는 평가 기준선을 전진시키지 않는다
+- 파일별 유지보수 평가는 최신 원격 한 revision의 추적 코드·테스트·실행·검증 스크립트를 분류하고, 기존 성공 기록에 없거나 경로·내용·실행 모드가 달라진 파일만 원본과 관계를 검토한다. 변경 없는 파일은 다시 검토하지 않고, 분류 불확실성·검토 누락·미확인 관계는 성공으로 처리하지 않는다. 선정 파일이 없으면 평가 Agent나 형식적 계획 없이 목록을 검증하고 완료할 수 있다. 검토 중 작성한 코드맵은 성공한 파일에만 원본 identity와 함께 보존하며 변경된 코드맵은 현재 관계 근거로 사용하지 않는다
+- 유지보수 planning batch는 원격 fast-forward와 catalog 적용이 확인된 뒤 실제 검토한 파일의 ledger·코드맵과 마지막 성공 파일별 평가의 MERGED 수를 한 SQLite transaction으로 확정한다. 새 리팩터링 계획은 동작·공개 계약·저장 형식을 보존하며 기존 DAG·장벽·사후 재검증 경로를 따른다. 사후 재검증은 cycle 완료를 담당하고 파일별 성공 시점을 다시 쓰지 않는다. 미게시·검증 실패·원격 source 변경은 성공 기준값을 전진시키지 않으며 같은 source의 검증된 잠정 증거와 publication intent를 복구한다
 - `docs/FUTURE_IDEAS.md`는 Planner 입력이나 실행 상태가 아니며, 항목을 같은 계획 주기의 ExecPlan 범위로 사용하거나 Requirement·ExecPlan으로 자동 승격하지 않는다
 - 검증된 새 ExecPlan, 미착수 READY의 개정·rename·삭제와 `docs/FUTURE_IDEAS.md` 변경은 하나의 planning commit으로 만들고 `origin/<base-branch>`에 fast-forward push한다. 삭제 ID는 취소 감사로 예약하며, 원격 확인 뒤 catalog 변경과 명세·전체 입력 성공 지문을 하나의 SQLite transaction으로 적용한다
 - 같은 프로젝트에는 여러 READY, `PLAN_BLOCKED`, 안정된 `PR_OPEN` ExecPlan을 함께 보존할 수 있지만 IMPLEMENTING, VERIFYING, REVIEWING, PUBLISHING 또는 PR 충돌 복구로 저장소를 변경하는 실행은 동시에 하나만 둔다

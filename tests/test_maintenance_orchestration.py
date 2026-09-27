@@ -3,6 +3,7 @@ import sqlite3
 import subprocess
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
 
@@ -16,6 +17,7 @@ from maintenance_orchestration import (
 )
 from maintenance_planning import MaintenancePlanMode, MaintenancePlanningContext
 import maintenance_state
+import planning_runtime
 from tests.test_loop_manager import (
     _ports_with_bound_dummy_sessions,
     _profile_for_dummy_worker_config,
@@ -27,6 +29,25 @@ from tests.test_maintenance_planning import plan_text
 
 
 class MaintenanceOrchestrationTest(unittest.TestCase):
+    @staticmethod
+    def _legacy_cycle(
+        connection: sqlite3.Connection, repo: str, source_sha: str,
+        *, include_general_planning: bool = False,
+    ):
+        maintenance_state.ensure_schema(connection)
+        count = connection.execute(
+            "SELECT COUNT(*) FROM exec_plans WHERE repo = ? AND status = 'MERGED'",
+            (repo,),
+        ).fetchone()[0]
+        connection.execute(
+            "INSERT INTO maintenance_cycles "
+            "(repo, phase, cycle_base_sha, cycle_start_merged_count, "
+            "include_general_planning, revision) "
+            "VALUES (?, 'assessment', ?, ?, ?, 1)",
+            (repo, source_sha, count, int(include_general_planning)),
+        )
+        return maintenance_state.MaintenanceRepository(connection).get(repo), True
+
     def _connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row
@@ -241,10 +262,8 @@ class MaintenanceOrchestrationTest(unittest.TestCase):
             )
         # These cases exercise recovery and ordering of a legacy cycle that
         # was already active when the file-assessment schedule was introduced.
-        cycle, started = maintenance_state.MaintenanceRepository(
-            connection
-        ).begin_assessment_if_due(
-            repo, 5, plan_sha,
+        cycle, started = self._legacy_cycle(
+            connection, repo, plan_sha,
             include_general_planning=not any(
                 status == "READY" for _id, _title, status, _deps, _priority in plans
             ),
@@ -358,7 +377,8 @@ class MaintenanceOrchestrationTest(unittest.TestCase):
         base_sha: str,
     ) -> maintenance_state.MaintenanceCycle:
         repository = maintenance_state.MaintenanceRepository(connection)
-        cycle, _ = repository.begin_assessment_if_due(repo, 5, base_sha)
+        cycle = repository.get(repo)
+        self.assertEqual(cycle.phase, maintenance_state.MaintenancePhase.ASSESSMENT)
         refactoring = repository.transition(
             repo,
             expected_phase=cycle.phase,
@@ -419,7 +439,7 @@ class MaintenanceOrchestrationTest(unittest.TestCase):
         self.assertTrue(repository.due("/two", 2).required)
 
         cycle, created = repository.begin_assessment_if_due(
-            "/one", 2, "a" * 40
+            "/one", 2, "a" * 40, self_repository=True,
         )
         self.assertTrue(created)
         completed = repository.advance_success_baseline(
@@ -435,11 +455,49 @@ class MaintenanceOrchestrationTest(unittest.TestCase):
         self.assertTrue(repository.due("/one", 2).required)
         self.assertTrue(repository.due("/two", 2).required)
 
+    def test_empty_file_selection_finishes_without_assessment_agent(self):
+        source = "a" * 40
+        context = planning_runtime.PlanningContext(
+            repo="/repo", repo_path=Path("/repo"), state_dir=Path("/state"),
+            base_branch="main", base_sha=source, provider="codex",
+            config_path=Path("/config.ini"), registered_only=True,
+            refactoring_review_interval=20,
+        )
+        row = SimpleNamespace(
+            phase="PLANNING", active_sha=source, planning_validation_error=None,
+            planning_result_pending_validation=0, planning_result_completed=0,
+            planning_retry_count=0, last_error=None,
+        )
+        cycle = SimpleNamespace(
+            phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+            file_assessment_start_merged_count=0,
+            full_assessment_completed=True, include_general_planning=False,
+            publication_stage=None, revision=1,
+        )
+        run = planning_runtime._PlanningRun(
+            context, row, cycle, source, True,
+        )
+        run.planning_worktree = Path("/worktree")
+        ports = mock.Mock()
+        ports.git.run.return_value.stdout = source
+        ports.git.changed_files.return_value = []
+        ports.file_review.progress.return_value.selected = ()
+        coordinator = planning_runtime.PlanningLifecycleCoordinator(ports)
+        outcome = planning_runtime.PlanningOutcome(
+            planning_runtime.PlanningOutcomeKind.NO_CHANGE,
+        )
+        with mock.patch.object(
+            coordinator, "_complete_empty_file_assessment", return_value=outcome,
+        ) as complete:
+            self.assertEqual(coordinator._run_planner_turn(run), outcome)
+        complete.assert_called_once_with(run, Path("/worktree"))
+        ports.agent.run_planner.assert_not_called()
+
     def test_prepared_batch_persists_new_plan_sets_for_restart_recovery(self):
         connection = self._connection()
         repository = maintenance_state.MaintenanceRepository(connection)
-        cycle, _ = repository.begin_assessment_if_due(
-            "/one", 5, "a" * 40, include_general_planning=True
+        cycle, _ = self._legacy_cycle(
+            connection, "/one", "a" * 40, include_general_planning=True,
         )
         prepared = repository.record_publication_intent(
             "/one",
@@ -457,7 +515,7 @@ class MaintenanceOrchestrationTest(unittest.TestCase):
         )
         self.assertTrue(prepared.include_general_planning)
 
-        restarted = repository.restart_unpublished_batch(
+        restarted = repository.restart_prepared_batch(
             "/one", expected=prepared, new_base_sha="c" * 40
         )
         self.assertIsNone(restarted.publication_stage)
@@ -519,7 +577,7 @@ class MaintenanceOrchestrationTest(unittest.TestCase):
         self._insert_plan(connection, "/one", "G-002", priority="low")
         self._insert_plan(connection, "/one", "G-099", priority="critical")
         repository = maintenance_state.MaintenanceRepository(connection)
-        cycle, _ = repository.begin_assessment_if_due("/one", 5, "a" * 40)
+        cycle, _ = self._legacy_cycle(connection, "/one", "a" * 40)
         waiting = repository.transition(
             "/one",
             expected_phase=cycle.phase,
@@ -571,11 +629,9 @@ class MaintenanceOrchestrationTest(unittest.TestCase):
     def test_prompt_and_fingerprint_distinguish_combined_maintenance_call(self):
         connection = self._connection()
         repository = maintenance_state.MaintenanceRepository(connection)
-        maintenance_only, _ = repository.begin_assessment_if_due(
-            "/one", 5, "a" * 40
-        )
-        combined, _ = repository.begin_assessment_if_due(
-            "/two", 5, "a" * 40, include_general_planning=True
+        maintenance_only, _ = self._legacy_cycle(connection, "/one", "a" * 40)
+        combined, _ = self._legacy_cycle(
+            connection, "/two", "a" * 40, include_general_planning=True,
         )
         self.assertNotEqual(
             maintenance_planning_fingerprint(maintenance_only, "same"),
@@ -615,10 +671,8 @@ class MaintenanceOrchestrationTest(unittest.TestCase):
                 "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
                 (repo,),
             )
-            maintenance_state.MaintenanceRepository(
-                connection
-            ).begin_assessment_if_due(
-                repo, 5, git_command(repo_path, "rev-parse", "origin/main"),
+            self._legacy_cycle(
+                connection, repo, git_command(repo_path, "rev-parse", "origin/main"),
                 include_general_planning=True,
             )
             connection.commit()
@@ -1323,7 +1377,7 @@ class MaintenanceOrchestrationTest(unittest.TestCase):
             "specification_fingerprint = 'spec-one' WHERE repo = '/one'"
         )
         repository = maintenance_state.MaintenanceRepository(connection)
-        cycle, _ = repository.begin_assessment_if_due("/one", 5, "a" * 40)
+        cycle, _ = self._legacy_cycle(connection, "/one", "a" * 40)
         with mock.patch.object(loop_manager, "_run_project_step", return_value=0), mock.patch.object(
             loop_manager.notifications, "enqueue_completion_if_ready"
         ) as enqueue, mock.patch.object(

@@ -15,6 +15,7 @@ import loop_manager
 import maintenance_git
 import maintenance_file_inventory
 import maintenance_file_ledger
+import maintenance_file_publication
 import maintenance_state
 
 
@@ -466,6 +467,25 @@ class DocumentDraftTest(unittest.TestCase):
 
 
 class MaintenanceStateRepositoryTest(unittest.TestCase):
+    @staticmethod
+    def _start_legacy_assessment(connection, repo, source_sha):
+        maintenance_state.ensure_schema(connection)
+        count = connection.execute(
+            "SELECT COUNT(*) FROM exec_plans WHERE repo = ? AND status = 'MERGED'",
+            (repo,),
+        ).fetchone()[0]
+        connection.execute(
+            "INSERT INTO maintenance_cycles "
+            "(repo, phase, cycle_base_sha, cycle_start_merged_count, revision) "
+            "VALUES (?, 'assessment', ?, ?, 1) "
+            "ON CONFLICT(repo) DO UPDATE SET phase = 'assessment', "
+            "cycle_base_sha = excluded.cycle_base_sha, "
+            "cycle_start_merged_count = excluded.cycle_start_merged_count, "
+            "revision = maintenance_cycles.revision + 1",
+            (repo, source_sha, count),
+        )
+        return maintenance_state.MaintenanceRepository(connection).get(repo)
+
     def test_self_full_assessment_is_once_and_survives_restart(self):
         connection = self._connection()
         repository = maintenance_state.MaintenanceRepository(connection)
@@ -487,6 +507,14 @@ class MaintenanceStateRepositoryTest(unittest.TestCase):
         self.assertTrue(completed.full_assessment_completed)
         self.assertFalse(repository.due("one", 5, self_repository=True).required)
         self.assertEqual(repository.due("two", 5).reason, "no_successful_assessment")
+        connection.execute(
+            "INSERT INTO execplan_catalog_revisions "
+            "(repo, revision_sha, catalog_fingerprint) VALUES ('one', ?, 'catalog')",
+            ("a" * 40,),
+        )
+        repository.initialize_file_assessment_start(
+            "one", source_sha="a" * 40, expected_merged_count=0,
+        )
         for number in range(1, 6):
             self._insert_plan(connection, "one", f"G-{number:03d}", "MERGED")
         periodic, started = repository.begin_assessment_if_due(
@@ -580,8 +608,7 @@ class MaintenanceStateRepositoryTest(unittest.TestCase):
 
         self.assertEqual(repository.due("one", 5).reason, "no_successful_assessment")
         self.assertEqual(repository.due("two", 5).reason, "no_successful_assessment")
-        cycle, created = repository.begin_assessment_if_due("one", 5, "a" * 40)
-        self.assertTrue(created)
+        cycle = self._start_legacy_assessment(connection, "one", "a" * 40)
         self.assertEqual(cycle.phase, maintenance_state.MaintenancePhase.ASSESSMENT)
         self.assertEqual(cycle.cycle_start_merged_count, 1)
 
@@ -616,7 +643,13 @@ class MaintenanceStateRepositoryTest(unittest.TestCase):
             (source,),
         )
         self._insert_plan(connection, "one", "G-001", "MERGED")
-        cycle, _ = repository.begin_assessment_if_due("one", 5, source)
+        # A cycle started before file baselines existed remains recoverable.
+        connection.execute(
+            "INSERT INTO maintenance_cycles "
+            "(repo, phase, cycle_base_sha, cycle_start_merged_count, revision) "
+            "VALUES ('one', 'assessment', ?, 1, 1)", (source,),
+        )
+        cycle = repository.get("one")
         self.assertIsNone(repository.initialize_file_assessment_start(
             "one", source_sha=source, expected_merged_count=1,
         ).file_assessment_start_merged_count)
@@ -684,6 +717,11 @@ class MaintenanceStateRepositoryTest(unittest.TestCase):
                          "interval_reached")
         self.assertTrue(scheduling_port.maintenance_due("one", 20).required)
 
+        # The execution gate uses the file baseline even before legacy success.
+        started, created = repository.begin_assessment_if_due("one", 20, source)
+        self.assertTrue(created)
+        self.assertEqual(started.phase, maintenance_state.MaintenancePhase.ASSESSMENT)
+
         cycle, _ = repository.begin_assessment_if_due("one", 5, source)
         for bad_source, count in (("b" * 40, 20), (source, 19)):
             with self.assertRaises(maintenance_state.MaintenanceStateError):
@@ -710,6 +748,33 @@ class MaintenanceStateRepositoryTest(unittest.TestCase):
         self.assertEqual(repository.file_assessment_due(
             "one", 20, completion_candidate=True,
         ).reason, "stabilization_due")
+
+    def test_completion_candidate_starts_only_after_successful_file_assessment(self):
+        connection = self._connection()
+        repository = maintenance_state.MaintenanceRepository(connection)
+        source = "a" * 40
+        connection.execute(
+            "INSERT INTO execplan_catalog_revisions "
+            "(repo, revision_sha, catalog_fingerprint) VALUES ('one', ?, 'catalog')",
+            (source,),
+        )
+        repository.initialize_file_assessment_start(
+            "one", source_sha=source, expected_merged_count=0,
+        )
+        for number in range(1, 11):
+            self._insert_plan(connection, "one", f"G-{number:03d}", "MERGED")
+        self.assertFalse(repository.begin_assessment_if_due(
+            "one", 20, source, completion_candidate=True,
+        )[1])
+        connection.execute(
+            "UPDATE maintenance_cycles SET last_success_file_assessment_merged_count = 0 "
+            "WHERE repo = 'one'"
+        )
+        cycle, started = repository.begin_assessment_if_due(
+            "one", 20, source, completion_candidate=True,
+        )
+        self.assertTrue(started)
+        self.assertEqual(cycle.cycle_start_merged_count, 10)
 
     def test_file_assessment_rejects_unverified_source_or_count_drift(self):
         connection = self._connection()
@@ -757,7 +822,7 @@ class MaintenanceStateRepositoryTest(unittest.TestCase):
         for plan_id in ("G-010", "G-002", "G-003"):
             self._insert_plan(connection, "one", plan_id, "READY")
         repository = maintenance_state.MaintenanceRepository(connection)
-        cycle, _ = repository.begin_assessment_if_due("one", 5, "a" * 40)
+        cycle = self._start_legacy_assessment(connection, "one", "a" * 40)
         waiting = repository.transition(
             "one",
             expected_phase=maintenance_state.MaintenancePhase.ASSESSMENT,
@@ -800,7 +865,7 @@ class MaintenanceStateRepositoryTest(unittest.TestCase):
         connection = self._connection()
         self._insert_plan(connection, "one", "G-100", "READY")
         repository = maintenance_state.MaintenanceRepository(connection)
-        cycle, _ = repository.begin_assessment_if_due("one", 5, "a" * 40)
+        cycle = self._start_legacy_assessment(connection, "one", "a" * 40)
         refactoring = repository.transition(
             "one",
             expected_phase=maintenance_state.MaintenancePhase.ASSESSMENT,
@@ -1223,6 +1288,90 @@ class FileReviewLedgerTest(unittest.TestCase):
             self.record(inventory, self.reviewed(selected))
         self.assertEqual(self.ledger.reviews(str(self.repo)), ())
         self.assertIsNone(self.ledger.last_success(str(self.repo)))
+
+    def test_file_publication_requires_complete_reviews_and_accepts_empty_inventory(self):
+        self.write("docs/PRODUCT.md", b"# Product\n")
+        empty_revision = self.publish()
+        empty = maintenance_file_publication.collect(
+            self.connection, str(self.repo), self.repo, "main", 1,
+            empty_revision,
+        )
+        self.assertEqual(empty.reviewed, ())
+        self.assertEqual(empty.code_maps, ())
+        self.write("src/new.go", b"package new\n")
+        revision = self.publish()
+        with self.assertRaisesRegex(
+            maintenance_file_publication.FileAssessmentPublicationError,
+            "검토",
+        ):
+            maintenance_file_publication.collect(
+                self.connection, str(self.repo), self.repo, "main", 1,
+                revision,
+            )
+
+    def test_published_file_evidence_and_count_commit_atomically(self):
+        self.write("src/alpha.go", b"package alpha\n")
+        source = self.publish()
+        inventory = self.inventory(source)
+        selected = self.ledger.selected_sources(str(self.repo), inventory)
+        evidence = maintenance_file_publication.AssessmentEvidence(
+            inventory, self.reviewed(selected),
+            ((selected[0].path, json.dumps({
+                "responsibility": "Alpha package responsibilities",
+                "entry_points": [], "public_symbols": [],
+                "direct_references": [], "related_tests": [],
+            })),), 0,
+        )
+        self.connection.execute(
+            "INSERT INTO execplan_catalog_revisions "
+            "(repo, revision_sha, catalog_fingerprint) VALUES (?, ?, 'catalog')",
+            (str(self.repo), source),
+        )
+        self.connection.execute(
+            "INSERT INTO maintenance_cycles "
+            "(repo, phase, cycle_base_sha, file_assessment_start_merged_count, revision) "
+            "VALUES (?, 'assessment', ?, 0, 1)", (str(self.repo), source),
+        )
+        self.connection.commit()
+        port = loop_manager._PlanningStatePorts(
+            self.connection,
+            loop_manager.runtime_state.RuntimeStateRepository(self.connection),
+            maintenance_state.MaintenanceRepository(self.connection),
+            Path("/unused"),
+        )
+        with mock.patch.object(
+            port._maintenance_repository,
+            "advance_file_assessment_success_baseline",
+            side_effect=maintenance_state.MaintenanceStateError("injected"),
+        ):
+            with self.assertRaisesRegex(maintenance_state.MaintenanceStateError, "injected"):
+                with self.connection:
+                    port.complete_file_assessment(
+                        str(self.repo), self.repo, "main", 1, source, evidence,
+                    )
+        self.assertEqual(self.ledger.reviews(str(self.repo)), ())
+        self.assertIsNone(self.connection.execute(
+            "SELECT 1 FROM successful_code_maps WHERE repo = ?", (str(self.repo),)
+        ).fetchone())
+        with self.connection:
+            port.complete_file_assessment(
+                str(self.repo), self.repo, "main", 1, source, evidence,
+            )
+        self.assertEqual(self.ledger.reviews(str(self.repo))[0].source_revision, source)
+        self.assertEqual(self.connection.execute(
+            "SELECT path FROM successful_code_maps WHERE repo = ?", (str(self.repo),)
+        ).fetchone()[0], "src/alpha.go")
+        self.assertEqual(maintenance_state.MaintenanceRepository(
+            self.connection
+        ).get(str(self.repo)).last_success_file_assessment_merged_count, 0)
+
+        self.write("src/alpha.go", b"package changed\n")
+        drift = self.publish()
+        with self.assertRaises(maintenance_file_ledger.FileReviewLedgerError):
+            maintenance_file_publication.promote(
+                self.connection, str(self.repo), self.repo, "main", drift,
+                evidence,
+            )
 
     def test_additive_schema_recheck_preserves_file_reviews(self):
         self.write("src/alpha.go", b"package alpha\n")

@@ -139,6 +139,7 @@ class FileReviewRepository:
     def record_success(
         self, repo: str, repository_path: str, base_branch: str,
         inventory: SourceInventory, reviewed: Sequence[ReviewedSource],
+        *, published_revision: str | None = None,
     ) -> AssessmentSuccess:
         """Commit only complete, source-bound review evidence in one transaction.
 
@@ -153,9 +154,16 @@ class FileReviewRepository:
         ).fetchone()
         if project is None or str(project[0]) != base_branch:
             raise FileReviewLedgerError("등록된 프로젝트의 base branch가 다릅니다.")
-        verify_remote_revision(source_repo, base_branch, inventory.revision)
-        if tracked_source_inventory(source_repo, base_branch, inventory.revision) != inventory:
+        remote_revision = published_revision or inventory.revision
+        current = tracked_source_inventory(source_repo, base_branch, remote_revision)
+        if remote_revision == inventory.revision and current != inventory:
             raise FileReviewLedgerError("inventory가 검증된 원격 Git tree와 다릅니다.")
+        if tuple((item.path, item.content_hash, item.mode, item.reason)
+                 for item in current.sources) != tuple(
+                     (item.path, item.content_hash, item.mode, item.reason)
+                     for item in inventory.sources
+                 ):
+            raise FileReviewLedgerError("평가 후 원격 파일 목록 또는 내용이 변경됐습니다.")
         with _transaction(self.connection):
             selected = self.selected_sources(repo, inventory)
             if len(reviewed) != len(selected):
@@ -202,5 +210,5 @@ class FileReviewRepository:
                 "source_revision = excluded.source_revision, reviewed_at = excluded.reviewed_at",
                 (repo, inventory.revision, reviewed_at),
             )
-            verify_remote_revision(source_repo, base_branch, inventory.revision)
+            verify_remote_revision(source_repo, base_branch, remote_revision)
         return AssessmentSuccess(inventory.revision, reviewed_at)

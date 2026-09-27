@@ -1209,7 +1209,7 @@ class AutomationFirstCatalogTest(unittest.TestCase):
                     current_repo, "rev-parse", "origin/main"
                 )
                 cycle, _ = maintenance_repository.begin_assessment_if_due(
-                    str(current_repo), 5, current_sha
+                    str(current_repo), 5, current_sha, self_repository=True,
                 )
                 maintenance_repository.advance_success_baseline(
                     str(current_repo),
@@ -8061,6 +8061,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "managed_config.py",
                 "maintenance_file_inventory.py",
                 "maintenance_file_ledger.py",
+                "maintenance_file_publication.py",
                 "maintenance_file_review.py",
                 "maintenance_reconciliation.py",
                 "maintenance_findings.py",
@@ -17740,7 +17741,7 @@ class ExecPlanArchiveHousekeepingAdapterTest(unittest.TestCase):
             connection
         )
         cycle, started = repository.begin_assessment_if_due(
-            "/repo", 5, "a" * 40
+            "/repo", 5, "a" * 40, self_repository=True,
         )
 
         self.assertTrue(started)

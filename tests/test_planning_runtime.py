@@ -144,14 +144,19 @@ class FakeStatePort:
     def pending_document_approval(self, _repo, _repository, _base_branch):
         return self.document_approval_pending
 
-    def maintenance_due(self, _repo, _interval, *, self_repository=False):
+    def maintenance_due(self, _repo, _interval, *, self_repository=False,
+                        completion_candidate=False):
         self.maintenance_due_self_repository = self_repository
         return SimpleNamespace(required=self.maintenance_due_required,
                                reason=self.maintenance_due_reason)
 
     def begin_maintenance_assessment(self, *_args, **_kwargs):
         self.maintenance_begin_count += 1
-        return self.cycle, False
+        self.cycle = replace(
+            self.cycle, phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+            cycle_base_sha=_args[2], revision=self.cycle.revision + 1,
+        )
+        return self.cycle, True
 
     def restart_stale_maintenance(self, _repo, _expected, base_sha):
         self.cycle = replace(
@@ -739,20 +744,21 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
             self.assertEqual(ports.state.maintenance_due_self_repository,
                              self_repository)
 
-    def test_new_periodic_review_waits_for_file_assessment_execution_path(self):
+    def test_new_periodic_review_starts_file_assessment_before_ready_worker(self):
         ports = FakePorts(planning_snapshot())
         ports.state.maintenance_due_required = True
         ports.state.schedule_result.has_ready = True
         ports.state.schedule_result.runnable_ready = object()
-        for reason in ("no_successful_assessment", "interval_reached"):
+        for index, reason in enumerate(("no_successful_assessment", "interval_reached"), 1):
             ports.state.maintenance_due_reason = reason
             run = PlanningLifecycleCoordinator(ports)._new_run(
                 replace(self.context, registered_only=True)
             )
             outcome = PlanningLifecycleCoordinator(ports)._select_planning_work(run)
-            self.assertEqual(outcome.kind, PlanningOutcomeKind.WAITING)
-            self.assertEqual(ports.state.maintenance_begin_count, 0)
-            self.assertFalse(run.maintenance_planning)
+            self.assertIsNone(outcome)
+            self.assertEqual(ports.state.maintenance_begin_count, index)
+            self.assertTrue(run.maintenance_planning)
+            ports.state.cycle = maintenance_cycle()
 
         ports.state.maintenance_due_reason = "one_time_full_assessment"
         ports.state.schedule_result.has_ready = False
@@ -761,7 +767,7 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
             replace(self.context, registered_only=True, self_repository=True)
         )
         PlanningLifecycleCoordinator(ports)._select_planning_work(run)
-        self.assertEqual(ports.state.maintenance_begin_count, 1)
+        self.assertEqual(ports.state.maintenance_begin_count, 3)
 
     def test_missing_full_assessment_evidence_uses_bounded_planner_retry(self):
         cycle = maintenance_cycle(

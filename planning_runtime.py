@@ -189,7 +189,10 @@ class PlanningStatePort(Protocol):
         self, repo: str, repository: Path, base_branch: str,
     ) -> bool: ...
 
-    def maintenance_due(self, repo: str, interval: int) -> Any: ...
+    def maintenance_due(
+        self, repo: str, interval: int, *, completion_candidate: bool = False,
+        self_repository: bool = False,
+    ) -> Any: ...
 
     def begin_maintenance_assessment(
         self,
@@ -199,6 +202,7 @@ class PlanningStatePort(Protocol):
         *,
         include_general_planning: bool,
         self_repository: bool = False,
+        completion_candidate: bool = False,
     ) -> tuple[maintenance_state.MaintenanceCycle, bool]: ...
 
     def record_full_assessment(
@@ -261,6 +265,16 @@ class PlanningStatePort(Protocol):
         expected_revision: int,
         remote_commit: str,
     ) -> maintenance_state.MaintenanceCycle: ...
+
+    def file_assessment_evidence(
+        self, repo: str, repository: Path, base_branch: str,
+        cycle_revision: int, source_sha: str,
+    ) -> Any: ...
+
+    def complete_file_assessment(
+        self, repo: str, repository: Path, base_branch: str,
+        cycle_revision: int, source_sha: str, evidence: Any,
+    ) -> None: ...
 
     def recover_maintenance_batch(
         self, repo: str, worktree: Path, base: str
@@ -512,6 +526,16 @@ class PlanningLifecycleCoordinator:
     def _operational_error() -> PlanningOutcome:
         return PlanningOutcome(PlanningOutcomeKind.OPERATIONAL_ERROR, error=True)
 
+    @staticmethod
+    def _file_assessment_active(run: _PlanningRun) -> bool:
+        cycle = run.maintenance_cycle
+        return bool(
+            run.maintenance_planning
+            and cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT
+            and cycle.file_assessment_start_merged_count is not None
+            and (not run.context.self_repository or cycle.full_assessment_completed)
+        )
+
     def _new_run(self, context: PlanningContext) -> _PlanningRun:
         row = self._ports.state.planning(context.repo)
         cycle = self._ports.state.maintenance_cycle(context.repo)
@@ -690,17 +714,44 @@ class PlanningLifecycleCoordinator:
             and not decision.has_waiting
             and not approval_pending
         ):
+            completion_candidate = bool(
+                not decision.has_ready and not decision.has_waiting
+                and getattr(decision, "active", None) is None
+                and not getattr(decision, "project_blocked", False)
+                and row.planning_fingerprint
+            )
+            if completion_candidate:
+                run.general_fingerprint = self._ports.git.input_fingerprint(
+                    context.repo_path, run.base_sha,
+                )
+                run.specification_fingerprint = self._ports.git.specification_fingerprint(
+                    context.repo_path, run.base_sha,
+                )
+                completion_candidate = not (
+                    self._general_planning_required(
+                        row, context, run.base_sha, run.general_fingerprint,
+                    ) or self._specification_planning_required(
+                        row, context, run.base_sha,
+                        run.specification_fingerprint, run.general_fingerprint,
+                    )
+                )
             due = self._ports.state.maintenance_due(
                 context.repo, context.refactoring_review_interval,
                 self_repository=context.self_repository,
+                completion_candidate=completion_candidate,
             )
-            # File assessments cannot start until their execution path is
-            # installed. Preserve their place ahead of READY work meanwhile.
-            if due.required and getattr(due, "reason", None) != "one_time_full_assessment":
-                self._ports.events.info(
-                    "파일별 유지보수 평가 실행 경로가 준비될 때까지 대기합니다."
+            if (
+                due.reason == "stabilization_due"
+                and hasattr(self._ports, "file_review")
+                and not self._ports.file_review.has_selected_sources(
+                    context.repo, context.repo_path, context.base_branch,
+                    run.base_sha,
                 )
-                return PlanningOutcome(PlanningOutcomeKind.WAITING)
+            ):
+                due = maintenance_state.ReviewDue(
+                    False, "no_selected_files", due.merged_since_baseline,
+                    due.active_phase,
+                )
             if due.required:
                 include_general = False
                 if not decision.has_ready:
@@ -716,6 +767,7 @@ class PlanningLifecycleCoordinator:
                     run.base_sha,
                     include_general_planning=include_general,
                     self_repository=context.self_repository,
+                    completion_candidate=completion_candidate,
                 )
         if (
             decision.has_waiting
@@ -1267,16 +1319,22 @@ class PlanningLifecycleCoordinator:
             )
         )
         file_review_enabled = (
-            run.maintenance_planning
-            and run.maintenance_cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT
-            and run.maintenance_cycle.file_assessment_start_merged_count is not None
-            and (not context.self_repository
-                 or run.maintenance_cycle.full_assessment_completed)
+            self._file_assessment_active(run)
             and hasattr(self._ports, "file_review")
         )
         if should_run:
             final_page = None
             if file_review_enabled:
+                progress = self._ports.file_review.progress(
+                    context.repo, context.repo_path, context.base_branch,
+                    run.maintenance_cycle.revision, str(row.active_sha),
+                )
+                if (not progress.selected
+                    and not run.maintenance_cycle.include_general_planning
+                    and run.maintenance_cycle.publication_stage is None
+                    and not row.planning_result_completed
+                    and not result_in_flight):
+                    return self._complete_empty_file_assessment(run, worktree)
                 review_outcome = self._review_one_file(run, worktree)
                 if review_outcome is not None:
                     return review_outcome
@@ -1430,6 +1488,46 @@ class PlanningLifecycleCoordinator:
         run.dirty_files = dirty_files
         run.planner_scope_error = scope_error
         return None
+
+    def _complete_empty_file_assessment(
+        self, run: _PlanningRun, worktree: Path,
+    ) -> PlanningOutcome:
+        """A verified empty selection needs no assessment Agent or plan commit."""
+        context = run.context
+        row = run.row
+        assert run.maintenance_context is not None
+        self._ports.git.validate_worktree_ownership(
+            context.repo, str(run.current_fingerprint or ""), worktree,
+        )
+        self._ports.git.run(context.repo_path, "fetch", "origin")
+        try:
+            self._ports.validation.validate_publication_base(
+                context.repo, context.repo_path, context.base_branch,
+                run.maintenance_context,
+            )
+        except MaintenancePlanningRestart:
+            self._ports.git.run(context.repo_path, "worktree", "remove", "--force", str(worktree))
+            return PlanningOutcome(PlanningOutcomeKind.REMOTE_BASE_RESTART, error=True)
+        evidence = self._ports.state.file_assessment_evidence(
+            context.repo, context.repo_path, context.base_branch,
+            run.maintenance_cycle.revision, str(row.active_sha),
+        )
+        if evidence.reviewed:
+            raise PlanningResultInvalid("빈 선정 집합의 검토 결과가 예상과 다릅니다.")
+        with self._ports.state.transaction():
+            self._ports.state.complete_file_assessment(
+                context.repo, context.repo_path, context.base_branch,
+                run.maintenance_cycle.revision, str(row.active_sha), evidence,
+            )
+            self._ports.state.advance_success_baseline(
+                context.repo,
+                expected_phase=run.maintenance_cycle.phase,
+                expected_revision=run.maintenance_cycle.revision,
+                remote_commit=str(row.active_sha),
+            )
+            self._ports.state.clear_active_in_transaction(context.repo)
+        self._ports.git.run(context.repo_path, "worktree", "remove", str(worktree))
+        return PlanningOutcome(PlanningOutcomeKind.NO_CHANGE)
 
     def _review_one_file(self, run: _PlanningRun, worktree: Path) -> PlanningOutcome | None:
         """Persist at most one source-bound review unit per scheduler turn."""
@@ -1947,7 +2045,19 @@ class PlanningLifecycleCoordinator:
                     )
                     self._ports.events.error(message)
                     return self._operational_error()
+                evidence = None
+                if self._file_assessment_active(run):
+                    evidence = self._ports.state.file_assessment_evidence(
+                        context.repo, context.repo_path, context.base_branch,
+                        run.maintenance_cycle.revision, str(row.active_sha),
+                    )
                 with self._ports.state.transaction():
+                    if evidence is not None:
+                        self._ports.state.complete_file_assessment(
+                            context.repo, context.repo_path, context.base_branch,
+                            run.maintenance_cycle.revision, str(row.active_sha),
+                            evidence,
+                        )
                     self._ports.state.advance_success_baseline(
                         context.repo,
                         expected_phase=run.maintenance_cycle.phase,
