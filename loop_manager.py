@@ -7568,6 +7568,7 @@ def run_codex(
     isolation_evidence: agent_write_isolation.IsolationEvidence | None = None,
     isolation_snapshot_digest: Callable[[], str] | None = None,
     expected_repository: str | None = None,
+    on_isolation_checked: Callable[[agent_write_isolation.IsolationEvidence], None] | None = None,
 ) -> tuple[int, str] | CodexResult:
     if resolved_profile is not None:
         model, effort = resolved_profile.model, resolved_profile.effort
@@ -7579,6 +7580,21 @@ def run_codex(
         if level is not None:
             raise RuntimeError(f"Codex {role_name}에 Worker level을 지정할 수 없습니다.")
         model, effort = role(config_path, role_name, worktree)
+    if on_isolation_checked is not None:
+        checked: list[agent_write_isolation.IsolationEvidence] = []
+
+        def observe(evidence: agent_write_isolation.IsolationEvidence) -> None:
+            on_isolation_checked(evidence)
+            checked.append(evidence)
+
+        isolation_arguments = agent_write_isolation.prepare_isolation(
+            "codex", role_name, worktree, state_dir, read_only, observe,
+            isolation_snapshot_digest, config_path=config_path,
+            expected_repository=expected_repository, session_id=session_id,
+        )
+        if len(checked) != 1 or checked[0].status != "verified":
+            raise agent_write_isolation.IsolationError("Codex 격리 증거가 없습니다.")
+        isolation_evidence = checked[0]
     if isolation_arguments is not None:
         if isolation_evidence is None or isolation_snapshot_digest is None:
             raise agent_write_isolation.IsolationError("Codex 격리 증거가 없습니다.")
@@ -7874,11 +7890,21 @@ def run_claude(
     session_id: str | None = None,
     on_session_started: Callable[[str], None] | None = None,
     resolved_profile: ResolvedProfile | None = None,
+    on_isolation_checked: Callable[[agent_write_isolation.IsolationEvidence], None] | None = None,
+    isolation_snapshot_digest: Callable[[], str] | None = None,
+    expected_repository: str | None = None,
 ) -> tuple[int, str] | AgentResult:
     profile = resolved_profile or _agent_profile(
         config_path, "claude", role_name, level, worktree
     )
     model, effort = profile.model, profile.effort
+    if on_isolation_checked is not None:
+        agent_write_isolation.prepare_isolation(
+            "claude", role_name, worktree, state_dir, read_only,
+            on_isolation_checked, isolation_snapshot_digest,
+            config_path=config_path, expected_repository=expected_repository,
+            session_id=session_id,
+        )
     project_dir = (
         state_dir
         / "logs"
@@ -8061,23 +8087,6 @@ class CodexAgentAdapter:
     name = "codex"
 
     def run(self, request: AgentRequest) -> tuple[int, str] | AgentResult:
-        checked: list[agent_write_isolation.IsolationEvidence] = []
-
-        def observe(evidence: agent_write_isolation.IsolationEvidence) -> None:
-            if request.on_isolation_checked is not None:
-                request.on_isolation_checked(evidence)
-            checked.append(evidence)
-
-        isolation_arguments = agent_write_isolation.prepare_isolation(
-            self.name, request.role_name, request.worktree, request.state_dir,
-            request.read_only, observe,
-            request.isolation_snapshot_digest,
-            config_path=request.config_path,
-            expected_repository=request.expected_repository,
-            session_id=request.session_id,
-        )
-        if len(checked) != 1 or checked[0].status != "verified":
-            raise agent_write_isolation.IsolationError("Codex 격리 증거가 없습니다.")
         return run_codex(
             request.worktree,
             request.state_dir,
@@ -8090,10 +8099,9 @@ class CodexAgentAdapter:
             session_id=request.session_id,
             on_session_started=request.on_session_started,
             resolved_profile=request.profile,
-            isolation_arguments=isolation_arguments,
-            isolation_evidence=checked[0],
             isolation_snapshot_digest=request.isolation_snapshot_digest,
             expected_repository=request.expected_repository,
+            on_isolation_checked=request.on_isolation_checked,
         )
 
 
@@ -8101,14 +8109,6 @@ class ClaudeAgentAdapter:
     name = "claude"
 
     def run(self, request: AgentRequest) -> tuple[int, str] | AgentResult:
-        agent_write_isolation.prepare_isolation(
-            self.name, request.role_name, request.worktree, request.state_dir,
-            request.read_only, request.on_isolation_checked,
-            request.isolation_snapshot_digest,
-            config_path=request.config_path,
-            expected_repository=request.expected_repository,
-            session_id=request.session_id,
-        )
         return run_claude(
             request.worktree,
             request.state_dir,
@@ -8121,6 +8121,9 @@ class ClaudeAgentAdapter:
             session_id=request.session_id,
             on_session_started=request.on_session_started,
             resolved_profile=request.profile,
+            on_isolation_checked=request.on_isolation_checked,
+            isolation_snapshot_digest=request.isolation_snapshot_digest,
+            expected_repository=request.expected_repository,
         )
 
 

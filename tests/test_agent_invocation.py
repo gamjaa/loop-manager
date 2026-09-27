@@ -300,7 +300,7 @@ class WriteIsolationTests(TestCase):
             raise isolation.IsolationError('sandbox unavailable')
 
         with mock.patch.object(isolation, 'prepare_isolation', side_effect=reject), \
-             mock.patch.object(manager, 'run_codex') as launch:
+             mock.patch.object(manager.subprocess, 'Popen') as launch:
             with self.assertRaisesRegex(isolation.IsolationError, 'sandbox unavailable'):
                 manager.run_agent('codex', Path('/worktree'), Path('/state'),
                                   Path('/config'), 'worker', 'secret prompt',
@@ -313,6 +313,32 @@ class WriteIsolationTests(TestCase):
             USING (invocation_id)''').fetchone()
         self.assertEqual(row, ('rejected', 'sandbox unavailable', 'exception'))
         self.assertNotIn('secret prompt', repr(row))
+
+    def test_claude_preflight_rejection_precedes_log_and_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            records = []
+
+            def reject(*args, **_kwargs):
+                evidence = isolation.IsolationEvidence(
+                    'claude', 'unknown', 'Linux:x:y', 'reviewer', str(root),
+                    'repository', 'policy', 'rejected', 'file tool unverified')
+                args[-2](evidence)
+                raise isolation.IsolationError('file tool unverified')
+
+            with mock.patch.object(isolation, 'prepare_isolation', side_effect=reject), \
+                 mock.patch.object(manager.subprocess, 'Popen') as launch:
+                with self.assertRaisesRegex(isolation.IsolationError, 'file tool unverified'):
+                    manager.run_claude(
+                        root, root, root / 'config', 'reviewer', 'prompt',
+                        read_only=True,
+                        resolved_profile=invocation.ResolvedProfile('model', 'high'),
+                        on_isolation_checked=records.append,
+                        isolation_snapshot_digest=lambda: 'snapshot',
+                        expected_repository=str(root))
+            launch.assert_not_called()
+            self.assertEqual(records[0].status, 'rejected')
+            self.assertFalse((root / 'logs').exists())
 
     def test_missing_launch_evidence_preserves_prior_provider_log(self):
         with tempfile.TemporaryDirectory() as directory:
