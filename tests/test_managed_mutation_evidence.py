@@ -1301,7 +1301,7 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
                     )
                 transitions.assert_called_with(
                     worktree, str(Path('/repo').resolve()), 'plan:G-091',
-                    agent_session_id='worker-original',
+                    agent_session_id='worker-original', git=git,
                 )
                 corrected = handler()
                 corrected._rebase_journal_state.return_value = {
