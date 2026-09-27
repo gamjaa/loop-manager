@@ -482,7 +482,8 @@ def _validate_plan_comparisons(finding: dict, existing: Mapping[str, str],
 def parse_findings(output: str, progress: ReconciliationProgress,
                    inventory: SourceInventory, contents: Mapping[str, bytes],
                    existing_plans: Mapping[str, str], new_plan_ids: Sequence[str],
-                   plan_texts: Mapping[str, str] | None = None) -> dict:
+                   plan_texts: Mapping[str, str] | None = None,
+                   synthesis_digest: str | None = None) -> dict:
     if progress.pending_scan or progress.next_relation is not None or len(progress.completed) != len(progress.relations):
         raise ReconciliationError("미확인 파일 간 관계가 남았습니다.")
     value = _single_json(output, FINDINGS_PREFIX)
@@ -492,7 +493,15 @@ def parse_findings(output: str, progress: ReconciliationProgress,
     if not isinstance(findings, list):
         raise ReconciliationError("발견은 배열이어야 합니다.")
     if not findings:
-        _validate_no_issue(value["no_issue_reason"], progress)
+        reason = value["no_issue_reason"]
+        if synthesis_digest is not None and isinstance(reason, dict) and set(reason) == {"synthesis_digest", "summary"}:
+            if reason["synthesis_digest"] != synthesis_digest:
+                raise ReconciliationError("문제 없음 근거의 종합 snapshot이 다릅니다.")
+            _note(reason["summary"], "문제 없음 요약", 20)
+            # This is a provisional decision. The adapter must validate every
+            # durable page resolution before returning the final result.
+        else:
+            _validate_no_issue(reason, progress)
     elif value["no_issue_reason"] is not None:
         raise ReconciliationError("발견과 문제 없음 근거가 상충합니다.")
     sources = {item.path: item for item in inventory.sources}
@@ -614,6 +623,57 @@ def synthesis_prompt(page: SynthesisPage, manifest: Path) -> str:
     )
 
 
+RESOLUTION_PREFIX = "SYNTHESIS_RESOLUTION: "
+MAX_RESOLUTION_BYTES = 24_000
+
+
+@dataclass(frozen=True)
+class ResolutionUnit:
+    digest: str
+    decision_digest: str
+    index: int
+    assessment: dict
+    finding_keys: frozenset[str]
+    manifest: Path
+    session_id: str | None = None
+    error: str | None = None
+
+
+def resolution_prompt(unit: ResolutionUnit) -> str:
+    return (
+        "최종 발견에 대한 종합 페이지 하나의 처리 결과를 확인하라. 파일을 수정하지 마라. "
+        "다른 세션 기억에 의존하지 말고 필요한 근거와 발견만 manifest의 개별 파일에서 조회하라. "
+        "이 페이지의 저장된 판단을 발견에 연결하거나 구체적인 이유로 제외하라. "
+        "has_issue=true인 후보를 no_issue로 처리하지 마라.\n"
+        f"decision_manifest={unit.manifest}\n"
+        + json.dumps(unit.assessment, ensure_ascii=False)
+        + "\nSYNTHESIS_RESOLUTION: 한 줄 JSON {key:위 페이지 key, "
+        "excerpt:저장된 assessment의 정확한 12자 이상 인용,issue_keys:연결된 발견 식별자 배열(최대 32개), "
+        "disposition:linked|excluded|no_issue,reason:연결 또는 제외의 구체적 20~2000자 근거}. "
+        "현재 페이지 항목 하나만 응답하라. 전체 페이지 배열을 출력하지 마라. 응답은 24000 bytes 이내다."
+        + ("\n이전 결과 오류를 수정하라: " + unit.error[:2000] if unit.error else "")
+    )
+
+
+def _validate_resolution(item: dict, expected: dict, issue_keys: frozenset[str]) -> None:
+    if not isinstance(item, dict) or set(item) != {"key", "excerpt", "issue_keys", "reason", "disposition"}:
+        raise ReconciliationError("종합 페이지 처리 필드가 다릅니다.")
+    if item["key"] != expected["key"]:
+        raise ReconciliationError("종합 페이지 처리 identity가 다릅니다.")
+    if _note(item["excerpt"], "저장된 판단 인용", 12) not in expected["assessment"]:
+        raise ReconciliationError("종합 페이지의 저장된 판단과 다릅니다.")
+    keys = item["issue_keys"]
+    if (not isinstance(keys, list) or len(keys) > 32
+        or any(not isinstance(k, str) or k not in issue_keys for k in keys)):
+        raise ReconciliationError("페이지 발견 연결이 다릅니다.")
+    disposition = item["disposition"]
+    if (not isinstance(disposition, str) or disposition not in {"linked", "excluded", "no_issue"}
+        or (disposition == "linked" and not keys) or (disposition != "linked" and keys)
+        or (disposition == "no_issue" and expected["has_issue"])):
+        raise ReconciliationError("저장된 문제 후보는 발견 연결 또는 명시적인 제외가 필요합니다.")
+    _note(item["reason"], "페이지 발견 연결 또는 제외 이유", 20)
+
+
 class SynthesisRepository:
     """A source/evidence-bound cursor; completion never depends on an in-memory run."""
 
@@ -628,6 +688,11 @@ class SynthesisRepository:
                 results_json TEXT NOT NULL
             )
         """)
+
+        connection.execute("""CREATE TABLE IF NOT EXISTS provisional_synthesis_resolutions (
+            repo TEXT NOT NULL REFERENCES projects(repo), page_index INTEGER NOT NULL,
+            digest TEXT NOT NULL, decision_digest TEXT NOT NULL, result_json TEXT,
+            session_id TEXT, validation_error TEXT, PRIMARY KEY (repo, page_index))""")
 
     def prepare(self, repo: str, cycle: int, revision: str,
                 progress: ReconciliationProgress) -> SynthesisPage:
@@ -731,35 +796,82 @@ class SynthesisRepository:
             ensure_ascii=False), encoding="utf-8")
         return manifest
 
-    def validate_resolutions(self, repo: str, page: SynthesisPage, output: str, findings: dict) -> None:
-        if not page.total:
-            return
-        value = _single_json(output, "SYNTHESIS_RESOLUTIONS: ")
-        if (set(value) != {"digest", "pages"} or value["digest"] != page.digest
-            or not isinstance(value["pages"], list)):
-            raise ReconciliationError("종합 페이지 처리 결과의 source가 다릅니다.")
+    @staticmethod
+    def decision_digest(page: SynthesisPage, findings: dict) -> str:
+        return hashlib.sha256(json.dumps([page.digest, findings], ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+    def _resolution_rows(self, repo: str, page: SynthesisPage, findings: dict) -> dict:
+        return {row[0]: row[1:] for row in self.connection.execute(
+            "SELECT page_index, result_json, session_id, validation_error FROM provisional_synthesis_resolutions "
+            "WHERE repo = ? AND digest = ? AND decision_digest = ?",
+            (repo, page.digest, self.decision_digest(page, findings)),
+        )}
+
+    def next_resolution(self, repo: str, page: SynthesisPage, findings: dict,
+                        evidence_manifest: Path) -> ResolutionUnit | None:
         results = self.results(repo, page)
-        expected = {item["key"]: item for item in results}
-        issue_keys = {item["issue_key"] for item in findings["findings"]}
-        seen = set()
-        for item in value["pages"]:
-            if not isinstance(item, dict) or set(item) != {"key", "excerpt", "issue_keys", "reason", "disposition"}:
-                raise ReconciliationError("종합 페이지 처리 필드가 다릅니다.")
-            key = item["key"]
-            if not isinstance(key, str) or key not in expected or key in seen:
-                raise ReconciliationError("종합 페이지 처리가 누락·중복되거나 오래됐습니다.")
-            seen.add(key)
-            if _note(item["excerpt"], "저장된 판단 인용", 12) not in expected[key]["assessment"]:
-                raise ReconciliationError("종합 페이지의 저장된 판단과 다릅니다.")
-            keys = item["issue_keys"]
-            if not isinstance(keys, list) or any(not isinstance(k, str) or k not in issue_keys for k in keys):
-                raise ReconciliationError("페이지 발견 연결이 다릅니다.")
-            disposition = item["disposition"]
-            if (not isinstance(disposition, str) or disposition not in {"linked", "excluded", "no_issue"}
-                or (disposition == "linked" and not keys)
-                or (disposition != "linked" and keys)
-                or (disposition == "no_issue" and expected[key]["has_issue"])):
-                raise ReconciliationError("저장된 문제 후보는 발견 연결 또는 명시적인 제외가 필요합니다.")
-            _note(item["reason"], "페이지 발견 연결 또는 제외 이유", 20)
-        if seen != set(expected):
+        if page.index != page.total:
+            raise ReconciliationError("종합 증거 페이지 검토가 완료되지 않았습니다.")
+        rows = self._resolution_rows(repo, page, findings)
+        decision_digest = self.decision_digest(page, findings)
+        keys = frozenset(item["issue_key"] for item in findings["findings"])
+        for index, assessment in enumerate(results):
+            row = rows.get(index)
+            if row and row[0] is not None:
+                continue
+            directory = evidence_manifest.parent / decision_digest
+            manifest = directory / "decision.json"
+            if not manifest.exists():
+                directory.mkdir(parents=True, exist_ok=True)
+                for number, finding in enumerate(findings["findings"]):
+                    (directory / f"finding-{number:08d}.json").write_text(
+                        json.dumps(finding, ensure_ascii=False), encoding="utf-8")
+                manifest.write_text(json.dumps({"digest": page.digest, "decision_digest": decision_digest,
+                    "evidence_manifest": str(evidence_manifest), "finding_count": len(findings["findings"]),
+                    "finding_pattern": "finding-{index:08d}.json", "no_issue_reason": findings["no_issue_reason"]},
+                    ensure_ascii=False), encoding="utf-8")
+            if row is None:
+                with self.connection:
+                    self.connection.execute("INSERT OR REPLACE INTO provisional_synthesis_resolutions "
+                        "VALUES (?, ?, ?, ?, NULL, NULL, NULL)", (repo, index, page.digest, decision_digest))
+            return ResolutionUnit(page.digest, decision_digest, index, assessment, keys, manifest,
+                                  row[1] if row else None, row[2] if row else None)
+        return None
+
+    def resolution_session(self, repo: str, unit: ResolutionUnit, session_id: str) -> None:
+        self._update_resolution(repo, unit, "session_id = ?", (session_id,))
+
+    def resolution_fail(self, repo: str, unit: ResolutionUnit, error: str) -> None:
+        self._update_resolution(repo, unit, "validation_error = ?", (error[:2000],))
+
+    def _update_resolution(self, repo: str, unit: ResolutionUnit, assignment: str, values: tuple) -> None:
+        with self.connection:
+            changed = self.connection.execute(
+                "UPDATE provisional_synthesis_resolutions SET " + assignment
+                + " WHERE repo = ? AND page_index = ? AND digest = ? AND decision_digest = ? AND result_json IS NULL "
+                "AND EXISTS (SELECT 1 FROM provisional_synthesis WHERE repo = ? AND digest = ?)",
+                (*values, repo, unit.index, unit.digest, unit.decision_digest, repo, unit.digest),
+            )
+            if changed.rowcount != 1:
+                raise ReconciliationError("페이지 처리 결과의 source 또는 최종 판단이 바뀌었습니다.")
+
+    def resolution_complete(self, repo: str, unit: ResolutionUnit, output: str) -> None:
+        if len(output.encode()) > MAX_RESOLUTION_BYTES:
+            raise ReconciliationError("페이지 처리 응답이 크기 제한을 넘었습니다.")
+        value = _single_json(output, RESOLUTION_PREFIX)
+        _validate_resolution(value, unit.assessment, unit.finding_keys)
+        self._update_resolution(repo, unit, "result_json = ?, session_id = NULL, validation_error = NULL",
+                                (json.dumps(value, ensure_ascii=False),))
+
+    def validate_resolutions(self, repo: str, page: SynthesisPage, findings: dict) -> None:
+        if page.total == 0:
+            return
+        results = self.results(repo, page)
+        rows = self._resolution_rows(repo, page, findings)
+        if page.index != page.total or set(rows) != set(range(page.total)):
             raise ReconciliationError("모든 종합 페이지의 저장된 판단 처리가 필요합니다.")
+        keys = frozenset(item["issue_key"] for item in findings["findings"])
+        for index, expected in enumerate(results):
+            if rows[index][0] is None:
+                raise ReconciliationError("미확인 페이지 처리 결과가 남았습니다.")
+            _validate_resolution(json.loads(rows[index][0]), expected, keys)

@@ -494,6 +494,37 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         self.assertEqual(ports.file_review.complete.call_args.args[2], source)
         self.assertEqual(ports.file_review.fail.call_count, 0)
 
+    def test_final_decision_waits_for_one_resolution_without_rerunning_planner(self):
+        output = 'MAINTENANCE_RESULT: {"outcome":"no_change"}'
+        ports = FakePorts(
+            planning_snapshot(phase="PLANNING", active_sha="a" * 40,
+                              planning_result=output, planning_result_completed=1,
+                              planning_result_pending_validation=1),
+            maintenance_cycle(phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+                              cycle_base_sha="a" * 40, revision=4,
+                              file_assessment_start_merged_count=0),
+        )
+        unit = maintenance_reconciliation.ResolutionUnit("d" * 64, "e" * 64, 7,
+            {"key": "page-7", "assessment": "This page has one cohesive responsibility.", "has_issue": False},
+            frozenset(), Path("/evidence/decision.json"), "saved-unit-session")
+        ports.reconciliation = SimpleNamespace(validate=mock.Mock(return_value=unit),
+            resolution_session=mock.Mock(), resolution_complete=mock.Mock(), resolution_fail=mock.Mock())
+        ports.agent.result = PlanningAgentResult(0,
+            maintenance_reconciliation.RESOLUTION_PREFIX + json.dumps({"key": "page-7",
+                "excerpt": unit.assessment["assessment"], "issue_keys": [], "disposition": "no_issue",
+                "reason": "The existing boundary needs no structural change."}),
+            "saved-unit-session", PlanningAgentResultKind.SUCCESS)
+        coordinator = PlanningLifecycleCoordinator(ports)
+        run = coordinator._new_run(self.context)
+        run.planning_worktree = Path("/worktree")
+        run.maintenance_context = object()
+        self.assertEqual(coordinator._validate_planner_result(run).kind, PlanningOutcomeKind.WAITING)
+        self.assertEqual(ports.agent.run_count, 1)
+        self.assertEqual(ports.agent.resumed_session, "saved-unit-session")
+        ports.reconciliation.resolution_complete.assert_called_once()
+        self.assertEqual(ports.state.planning(self.context.repo).planning_result, output)
+        self.assertTrue(ports.state.planning(self.context.repo).planning_result_pending_validation)
+
     def test_pending_reverse_scan_yields_before_relation_or_synthesis_agent(self):
         ports = FakePorts(
             planning_snapshot(phase="PLANNING", active_sha="a" * 40),
@@ -575,6 +606,8 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         self.assertTrue(all(len(prompt.encode()) < 50_000 for prompt in prompts))
         self.assertIn("unique responsibility issue 12", "".join(prompts[:-1]))
         self.assertNotIn("chunk_reviews", prompts[-1])
+        self.assertNotIn("SYNTHESIS_RESOLUTIONS:", prompts[-1])
+        self.assertIn("synthesis_digest", prompts[-1])
 
     def test_active_legacy_assessment_skips_new_file_review_stage(self):
         ports = FakePorts(

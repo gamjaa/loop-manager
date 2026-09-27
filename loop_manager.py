@@ -19923,9 +19923,19 @@ class _PlanningReconciliationPorts:
     def unit(self, repo: str, relation: maintenance_reconciliation.Relation) -> tuple[str | None, str | None]:
         return self._repository.unit(repo, relation)
 
+    def resolution_session(self, repo, unit, session_id):
+        self._synthesis.resolution_session(repo, unit, session_id)
+
+    def resolution_complete(self, repo, unit, output):
+        self._synthesis.resolution_complete(repo, unit, output)
+
+    def resolution_fail(self, repo, unit, error):
+        self._synthesis.resolution_fail(repo, unit, error)
+
     def validate(self, repo: str, repository: Path, base: str, cycle_revision: int,
                  revision: str, output: str, existing_plans: dict[str, str],
-                 new_plan_ids: tuple[str, ...]) -> dict:
+                 new_plan_ids: tuple[str, ...], *, resolution_directory: Path | None = None
+                 ) -> dict | maintenance_reconciliation.ResolutionUnit:
         progress = self.progress(repo, repository, base, cycle_revision, revision)
         synthesis = self.synthesis(repo, cycle_revision, revision, progress)
         if synthesis.index != synthesis.total:
@@ -19951,8 +19961,14 @@ class _PlanningReconciliationPorts:
 
         findings = maintenance_reconciliation.parse_findings(
             output, progress, inventory, CurrentContents(), existing_plans, new_plan_ids, plan_texts,
+            synthesis_digest=synthesis.digest,
         )
-        self._synthesis.validate_resolutions(repo, synthesis, output, findings)
+        if resolution_directory is not None and synthesis.total:
+            manifest = self.synthesis_export(repo, synthesis, progress, resolution_directory)
+            unit = self._synthesis.next_resolution(repo, synthesis, findings, manifest)
+            if unit is not None:
+                return unit
+        self._synthesis.validate_resolutions(repo, synthesis, findings)
         return findings
 
 

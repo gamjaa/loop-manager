@@ -371,24 +371,116 @@ class SynthesisPagingTest(unittest.TestCase):
                 self.assertIn("assessment", record["result"])
                 resolutions.append({"key": record["key"], "excerpt": record["result"]["assessment"],
                     "issue_keys": ["found-issue"], "disposition": "linked", "reason": "This saved candidate is addressed by the linked finding."})
-            payload = {"digest": page.digest, "pages": resolutions}
-            findings = {"findings": [{"issue_key": "found-issue"}]}
-            def validate(value):
-                self.repository.validate_resolutions("repo", page,
-                    "SYNTHESIS_RESOLUTIONS: " + json.dumps(value), findings)
-            validate(payload)
-            for changed in ({**payload, "pages": resolutions[1:]},
-                            {**payload, "digest": "stale"},
-                            {**payload, "pages": [*resolutions, resolutions[0]]},
-                            {**payload, "pages": [{**resolutions[0], "issue_keys": [], "disposition": "no_issue"}, *resolutions[1:]]},
-                            {**payload, "pages": [{**resolutions[0], "excerpt": "invented saved assessment"}, *resolutions[1:]]}):
+            findings = {"findings": [{"issue_key": "found-issue"}], "no_issue_reason": None}
+            with self.assertRaises(reconciliation.ReconciliationError):
+                self.repository.validate_resolutions("repo", page, findings)
+            while (unit := self.repository.next_resolution("repo", page, findings, manifest)) is not None:
+                value = resolutions[unit.index]
+                for changed in ({**value, "key": "stale"},
+                                {**value, "issue_keys": [], "disposition": "no_issue"},
+                                {**value, "excerpt": "invented saved assessment"}):
+                    with self.assertRaises(reconciliation.ReconciliationError):
+                        self.repository.resolution_complete("repo", unit,
+                            reconciliation.RESOLUTION_PREFIX + json.dumps(changed))
+                self.repository.resolution_complete("repo", unit,
+                    reconciliation.RESOLUTION_PREFIX + json.dumps(value))
                 with self.assertRaises(reconciliation.ReconciliationError):
-                    validate(changed)
-            excluded = [{**item, "issue_keys": [], "disposition": "excluded",
-                         "reason": "The original candidate is excluded after comparing the verified responsibilities."}
-                        for item in resolutions]
-            self.repository.validate_resolutions("repo", page,
-                "SYNTHESIS_RESOLUTIONS: " + json.dumps({**payload, "pages": excluded}), {"findings": []})
+                    self.repository.resolution_complete("repo", unit,
+                        reconciliation.RESOLUTION_PREFIX + json.dumps(value))
+            self.repository.validate_resolutions("repo", page, findings)
+
+
+class ResolutionUnitTest(unittest.TestCase):
+    def setUp(self):
+        self.connection = sqlite3.connect(":memory:")
+        self.addCleanup(self.connection.close)
+        self.connection.execute("CREATE TABLE projects (repo TEXT PRIMARY KEY)")
+        self.connection.execute("INSERT INTO projects VALUES ('repo')")
+        self.repository = reconciliation.SynthesisRepository(self.connection)
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.manifest = Path(directory.name) / "manifest.json"
+
+    def seed(self, count):
+        digest = hashlib.sha256(str(count).encode()).hexdigest()
+        self.results = [{"key": f"{digest}:{index}", "has_issue": False,
+                         "assessment": "This independently reviewed page contains no mixed responsibility.",
+                         "excerpt": "validated evidence"} for index in range(count)]
+        self.connection.execute("INSERT OR REPLACE INTO provisional_synthesis VALUES (?, ?, ?, NULL, ?)",
+                                ("repo", digest, count, json.dumps(self.results)))
+        page = reconciliation.SynthesisPage(digest, count, count, "", None)
+        findings = {"source_revision": REVISION, "findings": [],
+                    "no_issue_reason": {"synthesis_digest": digest,
+                                        "summary": "All independently reviewed responsibilities remain cohesive."}}
+        return page, findings
+
+    def answer(self, unit):
+        return reconciliation.RESOLUTION_PREFIX + json.dumps({
+            "key": unit.assessment["key"], "excerpt": unit.assessment["assessment"],
+            "issue_keys": [], "disposition": "no_issue",
+            "reason": "The reviewed code has a cohesive responsibility and no duplicate implementation.",
+        })
+
+    def test_ten_thousand_pages_use_bounded_responses_and_constant_final_output(self):
+        small, small_findings = self.seed(1)
+        small_output = reconciliation.FINDINGS_PREFIX + json.dumps(small_findings)
+        page, findings = self.seed(10_000)
+        final_output = reconciliation.FINDINGS_PREFIX + json.dumps(findings)
+        self.assertEqual(len(final_output), len(small_output))
+        self.assertLess(len(final_output.encode()), 400)
+        decision = self.repository.decision_digest(page, findings)
+        self.connection.executemany("INSERT INTO provisional_synthesis_resolutions VALUES (?, ?, ?, ?, NULL, NULL, NULL)",
+                                   (("repo", index, page.digest, decision) for index in range(page.total)))
+        for index, assessment in enumerate(self.results):
+            unit = reconciliation.ResolutionUnit(page.digest, decision, index, assessment, frozenset(), self.manifest)
+            output = self.answer(unit)
+            self.assertLess(len(output.encode()), 600)
+            self.assertLess(len(reconciliation.resolution_prompt(unit).encode()), 24000)
+            self.repository.resolution_complete("repo", unit, output)
+        self.repository = reconciliation.SynthesisRepository(self.connection)
+        self.repository.validate_resolutions("repo", page, findings)
+        parsed = reconciliation.parse_findings(final_output,
+            reconciliation.ReconciliationProgress((), (), (), None), SourceInventory(REVISION, (), ()),
+            {}, {}, (), synthesis_digest=page.digest)
+        self.assertEqual(parsed, findings)
+        self.connection.execute("DELETE FROM provisional_synthesis_resolutions WHERE page_index = 5000")
+        with self.assertRaises(reconciliation.ReconciliationError):
+            self.repository.validate_resolutions("repo", page, findings)
+        resume = self.repository.next_resolution("repo", page, findings, self.manifest)
+        self.assertEqual(resume.index, 5000)
+        self.repository.resolution_complete("repo", resume, self.answer(resume))
+        self.repository.validate_resolutions("repo", page, findings)
+
+    def test_resolution_resume_and_decision_or_source_change(self):
+        page, findings = self.seed(3)
+        first = self.repository.next_resolution("repo", page, findings, self.manifest)
+        self.repository.resolution_complete("repo", first, self.answer(first))
+        second = self.repository.next_resolution("repo", page, findings, self.manifest)
+        self.repository.resolution_session("repo", second, "saved-resolution-session")
+        self.repository.resolution_fail("repo", second, "correct the missing reason")
+        self.repository = reconciliation.SynthesisRepository(self.connection)
+        resumed = self.repository.next_resolution("repo", page, findings, self.manifest)
+        self.assertEqual((resumed.index, resumed.session_id, resumed.error),
+                         (1, "saved-resolution-session", "correct the missing reason"))
+        self.repository.resolution_complete("repo", resumed, self.answer(resumed))
+        changed = {**findings, "no_issue_reason": {**findings["no_issue_reason"], "summary": "A revised conclusion with different scope and reasoning."}}
+        self.assertEqual(self.repository.next_resolution("repo", page, changed, self.manifest).index, 0)
+        with self.assertRaises(reconciliation.ReconciliationError):
+            self.repository.validate_resolutions("repo", page, changed)
+        pending = self.repository.next_resolution("repo", page, changed, self.manifest)
+        self.seed(4)
+        with self.assertRaises(reconciliation.ReconciliationError):
+            self.repository.resolution_complete("repo", pending, self.answer(pending))
+
+    def test_invalid_or_oversized_resolution_does_not_advance(self):
+        page, findings = self.seed(1)
+        unit = self.repository.next_resolution("repo", page, findings, self.manifest)
+        with self.assertRaises(reconciliation.ReconciliationError):
+            self.repository.resolution_complete("repo", unit, self.answer(unit) + " " * 24000)
+        with self.assertRaises(reconciliation.ReconciliationError):
+            self.repository.resolution_complete("repo", unit, self.answer(unit).replace("no_issue", "linked"))
+        self.assertEqual(self.repository.next_resolution("repo", page, findings, self.manifest).index, 0)
+
 
 
 

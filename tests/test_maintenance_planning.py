@@ -1916,6 +1916,43 @@ class MaintenancePlanningTest(unittest.TestCase):
 
 
 class ReconciledPlanLinkTest(unittest.TestCase):
+    def test_compact_no_issue_waits_for_every_durable_resolution(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute("CREATE TABLE projects (repo TEXT PRIMARY KEY)")
+        connection.execute("INSERT INTO projects VALUES ('repo')")
+        port = loop_manager._PlanningReconciliationPorts(connection)
+        progress = maintenance_reconciliation.ReconciliationProgress((), (), (), None,
+            file_reviews=({"path": "src/a.py", "evidence": "This reviewed module has one cohesive responsibility."},))
+        page = port.synthesis("repo", 1, "a" * 40, progress)
+        port.synthesis_session("repo", page, "review-session")
+        port.synthesis_complete("repo", page, maintenance_reconciliation.SYNTHESIS_PREFIX + json.dumps({
+            "key": page.key, "excerpt": "This reviewed module has one cohesive responsibility.",
+            "has_issue": False, "assessment": "This independently reviewed module needs no structural change.",
+        }))
+        output = maintenance_reconciliation.FINDINGS_PREFIX + json.dumps({
+            "source_revision": "a" * 40, "findings": [],
+            "no_issue_reason": {"synthesis_digest": page.digest,
+                                "summary": "Reviewed responsibilities do not need structural changes."}})
+        with (tempfile.TemporaryDirectory() as directory,
+              mock.patch.object(port, "progress", return_value=progress),
+              mock.patch.object(loop_manager.maintenance_file_inventory, "cached_source_inventory",
+                                return_value=SourceInventory("a" * 40, (), ())),
+              mock.patch.object(loop_manager, "_git_tree_entries", return_value={})):
+            args = ("repo", Path("repo"), "main", 1, "a" * 40, output, {}, ())
+            with self.assertRaisesRegex(maintenance_reconciliation.ReconciliationError, "저장된 판단 처리"):
+                port.validate(*args)
+            unit = port.validate(*args, resolution_directory=Path(directory))
+            self.assertIsInstance(unit, maintenance_reconciliation.ResolutionUnit)
+            port.resolution_complete("repo", unit, maintenance_reconciliation.RESOLUTION_PREFIX + json.dumps({
+                "key": unit.assessment["key"], "excerpt": unit.assessment["assessment"],
+                "issue_keys": [], "disposition": "no_issue",
+                "reason": "The reviewed responsibility has no duplicate or mixed integration boundary."}))
+            self.assertEqual(port.validate(*args)["findings"], [])
+            bad_args = (*args[:5], output.replace(page.digest, "stale-digest"), *args[6:])
+            with self.assertRaisesRegex(maintenance_reconciliation.ReconciliationError, "snapshot"):
+                port.validate(*bad_args)
+
     def test_unconsumed_evidence_pages_block_final_validation(self):
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)
