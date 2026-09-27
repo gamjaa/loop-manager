@@ -4963,6 +4963,92 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         self.assertEqual(result, (False, review, 'specification'))
         fingerprint.assert_not_called()
 
+    def test_remote_checkpoint_new_review_failure_uses_existing_run_budget(self):
+        import blocked_checkpoint_state
+        import runtime_state
+        from tests.test_runtime_state import RuntimeStateRepositoryTest
+        from validation_feedback import normalize_feedback
+        from validation_feedback_state import ValidationFeedbackRepository
+
+        connection = RuntimeStateRepositoryTest()._connection()
+        self.addCleanup(connection.close)
+        runtime = runtime_state.RuntimeStateRepository(connection)
+        runtime.activate(
+            'repo', 'G-047', activation_sha='base',
+            branch='loop-manager/G-047', worktree='/state/G-047',
+        )
+        old_review = 'ISSUE_ID: app.py::old::blocking\nOld issue\nVERDICT: FAIL'
+        runtime.block_plan(
+            'repo', 'G-047', reason_code='review_retry_exhausted',
+            evidence=old_review, release_fingerprint='prior-input',
+            plan_values={'review_result': old_review, 'worker_result': worker_result()},
+            clear_projection=True,
+        )
+        checkpoints = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
+        request = checkpoints.get('repo', 'G-047')
+        checkpoints.finish_published(request, 'published-oid')
+        blocked = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = 'repo' AND plan_id = 'G-047'"
+        ).fetchone()
+        run_id = loop_manager.recovery_state.begin_external_run(connection, 'same-run')
+        feedback = ValidationFeedbackRepository(connection)
+        for index in range(3):
+            prior = f'ISSUE_ID: app.py::prior-{index}::blocking\nVERDICT: FAIL'
+            feedback.observe(
+                'repo', 'G-047', 'base', 'review', False, prior,
+                normalize_feedback('review', prior),
+            )
+            result_id = loop_manager.recovery_state.pending_review_correction(
+                connection, 'repo', 'G-047', prior,
+            )
+            self.assertEqual(
+                loop_manager.recovery_state.reserve_review_correction(
+                    connection, 'repo', 'G-047', result_id,
+                ), (True, index + 1, run_id),
+            )
+
+        new_review = 'ISSUE_ID: app.py::new::blocking\nNew issue\nVERDICT: FAIL'
+        with (
+            mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=mock.Mock()),
+            mock.patch.object(loop_manager, 'verify', return_value=(True, 'OK')),
+            mock.patch.object(loop_manager, '_remote_checkpoint_review_revision',
+                              return_value=('base', 'candidate-head')),
+            mock.patch.object(loop_manager, 'validate_agent_scope'),
+            mock.patch.object(loop_manager, 'run_agent', return_value=(0, new_review)),
+            mock.patch.object(loop_manager, '_remote_checkpoint_has_new_failure',
+                              return_value=True),
+        ):
+            resolved = loop_manager._evaluate_remote_checkpoint_cause(
+                connection, Path('/repo'), Path('/state'), 'repo', blocked,
+                Path('/config'), 30,
+            )
+        self.assertEqual(resolved, (True, new_review, 'review'))
+        loop_manager._resume_remote_corrected_execplan(
+            connection, 'repo', blocked, checkpoints, request,
+            'candidate-head', 'candidate-input', 'new Review issue',
+            new_failure_stage='review', assessment=new_review,
+        )
+        plan = connection.execute(
+            "SELECT status, review_result FROM exec_plans "
+            "WHERE repo = 'repo' AND plan_id = 'G-047'"
+        ).fetchone()
+        self.assertEqual(tuple(plan), ('IMPLEMENTING', new_review))
+        latest = connection.execute(
+            "SELECT id, stage, classification, raw_output FROM validation_results "
+            "WHERE repo = 'repo' AND plan_id = 'G-047' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(tuple(latest)[1:], ('review', 'failure', new_review))
+        self.assertEqual(
+            loop_manager.recovery_state.pending_review_correction(
+                connection, 'repo', 'G-047', plan['review_result'],
+            ), latest['id'],
+        )
+        self.assertEqual(
+            loop_manager.recovery_state.reserve_review_correction(
+                connection, 'repo', 'G-047', latest['id'],
+            ), (False, 3, run_id),
+        )
+
     def test_remote_checkpoint_requires_valid_worker_evidence_before_reviewer(self):
         from tests.test_runtime_state import RuntimeStateRepositoryTest
         import runtime_state
@@ -5141,7 +5227,8 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         ).fetchall()
         self.assertEqual(
             [tuple(row) for row in audit],
-            [('base', 'verify', 'success', raw_verify)],
+            [('base', 'verify', 'success', raw_verify),
+             ('base', 'review', 'success', 'VERDICT: PASS')],
         )
         for call in reviewer.call_args_list:
             self.assertNotIn('PRIVATE_SUCCESS_LOG', call.args[5])

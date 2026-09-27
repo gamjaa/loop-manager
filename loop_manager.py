@@ -96,7 +96,7 @@ from agent_invocation import (AgentProfile, AgentRequest, AgentResult, AgentResu
 from agent_provider_usage import claude_usage, codex_log_usage
 import agent_invocation_state
 import validation_feedback_state
-from validation_feedback import redact_secrets
+from validation_feedback import normalize_feedback, redact_secrets
 from worker_outcome import worker_outcome_instruction
 from verify_process import run_verify_process, VerifyTerminationUncertain
 from execution_state import ExecutionStatePort as _ExecutionStatePort
@@ -16335,6 +16335,10 @@ def _evaluate_remote_checkpoint_cause(
             continue
         if verdict == "SPEC_BLOCKED":
             return False, review, "specification"
+        validation_feedback_state.ValidationFeedbackRepository(connection).observe(
+            repo, str(blocked["plan_id"]), revision[0], "review", verdict == "PASS", review,
+            normalize_feedback("review", review) if verdict == "FAIL" else (),
+        )
         return verdict == "PASS" or _remote_checkpoint_has_new_failure(
             connection, repo, blocked, "review", review, worktree,
         ), review, "review" if verdict != "PASS" else None
