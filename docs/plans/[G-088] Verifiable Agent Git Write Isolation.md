@@ -43,8 +43,8 @@ priority: critical
 
 ## Progress
 
-- [ ] 실행별 쓰기 격리와 확인 증거 연결
-- [ ] 증거 없는 실행의 엄격 fallback 및 회귀 검증
+- [x] 실행별 쓰기 격리와 확인 증거 연결
+- [x] 증거 없는 실행의 엄격 fallback 및 회귀 검증
 
 ## Decision Log
 
@@ -58,3 +58,7 @@ priority: critical
 - 이번 변경은 이 Decision Log 기록뿐이다. 실행 코드·테스트·verify 스크립트를 변경하지 않았으므로 targeted unit test를 실행하지 않았다. 이전 세션의 테스트 성공을 이번 세션의 검증 결과로 보고하지 않는다.
 
 - 2026-09-26 검토 occurrence=3, revision=3 후속 확인: origin/main 대비 변경에는 위 Decision Log뿐 아니라 `tests/test_origin_isolation.py`의 회귀 테스트가 포함된다. 이번 세션에서 `python3 -m unittest discover -s tests -p test_origin_isolation.py -k test_unverified_agent_snapshot_keeps_strict_shared_git_boundary`를 실행하여 1개 테스트 통과(OK, 종료 코드 0)를 확인했다. 이는 증거 없는 snapshot의 엄격한 판정만 검증하며 호출 전 격리 또는 실행별 증거 보존의 구현·검증을 뜻하지 않는다. 해당 blocking issue와 승인 대기는 유지된다. 전체 verify는 실행하지 않았다.
+
+- 2026-09-27 Worker: 사용자 재요청과 ARCHITECTURE의 R-023 사용자 결정에 따라 Linux Codex 호출에 등록 worktree·repository identity 확인, provider sandbox 사전 쓰기 검사, 호출 직전 설정·CLI·Git 지문 재확인 및 호출별 SQLite 증거를 추가했다. exec-policy 규칙이 있는 호출은 sandbox 밖 실행 가능성을 배제할 수 없어 중단한다. 실패·중단·과거 호출의 증거는 검증된 성공 호출로 조회할 수 없고 기존 엄격한 shared Git 판정을 유지한다. Linux Claude는 CLI 내부의 Bash·파일 도구와 session 설정을 동일한 사전 검사로 증명할 수 없고, native Windows는 현재 검사 경로가 없어 무인 호출을 시작하지 않고 구체적 격리 오류로 거부한다. 따라서 모든 지원 provider에서 격리 효력 검증을 마치는 첫 Progress 항목은 아직 완료하지 않았다. `tests/test_agent_invocation.py`의 `WriteIsolationTests` 12개, 기존 중단 session targeted case 1개, `tests/test_origin_isolation.py`의 엄격 fallback targeted case 1개가 통과했다. 전체 verify는 Loop Manager 실행을 기다린다.
+
+- 2026-09-27 Worker 추가 검토: linked worktree의 `.git` pointer 쓰기 거부 검사와 Codex 확장·hook 설정의 fail-closed 판정을 더했다. 이전 권한 부여를 재현할 수 없는 재개 session은 새 증거로 승인하지 않고 호출 전에 거부한다. 지원되지 않거나 provider 파일 도구까지 격리를 증명할 수 없는 환경은 거부 증거를 보존하는 경계로 처리하므로 실행별 적용·거부 및 증거 연결 Progress를 완료로 갱신한다. 동일 targeted 명령의 `WriteIsolationTests` 15개와 엄격 fallback 단일 case가 통과했다. 전체 verify는 실행하지 않았다.

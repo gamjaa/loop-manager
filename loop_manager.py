@@ -99,6 +99,7 @@ from agent_invocation import (AgentProfile, AgentRequest, AgentResult, AgentResu
                               TrackedAgentCall, Usage, classify_agent_result)
 from agent_provider_usage import claude_usage, codex_log_usage
 import agent_invocation_state
+import agent_write_isolation
 import validation_feedback_state
 from validation_feedback import normalize_feedback, redact_secrets
 from worker_outcome import worker_outcome_instruction
@@ -7563,6 +7564,10 @@ def run_codex(
     session_id: str | None = None,
     on_session_started: Callable[[str], None] | None = None,
     resolved_profile: ResolvedProfile | None = None,
+    isolation_arguments: tuple[str, ...] | None = None,
+    isolation_evidence: agent_write_isolation.IsolationEvidence | None = None,
+    isolation_snapshot_digest: Callable[[], str] | None = None,
+    expected_repository: str | None = None,
 ) -> tuple[int, str] | CodexResult:
     if resolved_profile is not None:
         model, effort = resolved_profile.model, resolved_profile.effort
@@ -7574,16 +7579,25 @@ def run_codex(
         if level is not None:
             raise RuntimeError(f"Codex {role_name}에 Worker level을 지정할 수 없습니다.")
         model, effort = role(config_path, role_name, worktree)
+    if isolation_arguments is not None:
+        if isolation_evidence is None or isolation_snapshot_digest is None:
+            raise agent_write_isolation.IsolationError("Codex 격리 증거가 없습니다.")
+        agent_write_isolation.assert_current(
+            isolation_evidence, worktree, state_dir, config_path,
+            expected_repository, read_only, isolation_snapshot_digest,
+        )
     project_dir = state_dir / "logs" / hashlib.sha256(str(worktree).encode()).hexdigest()[:16]
     project_dir.mkdir(parents=True, exist_ok=True)
     last_message = project_dir / f"{role_name}-last.txt"
     log = project_dir / f"{role_name}.log"
     last_message.unlink(missing_ok=True)
+    permissions = (list(isolation_arguments) if isolation_arguments is not None
+                   else codex_sandbox_arguments(read_only))
     if session_id:
         arguments = [
             "codex",
             "exec",
-            *codex_sandbox_arguments(read_only),
+            *permissions,
             "-C",
             str(worktree),
             "resume",
@@ -7602,7 +7616,7 @@ def run_codex(
             "codex",
             "exec",
             *(["--json"] if persist_session else ["--ephemeral"]),
-            *codex_sandbox_arguments(read_only),
+            *permissions,
             "-C",
             str(worktree),
             "-m",
@@ -8047,6 +8061,23 @@ class CodexAgentAdapter:
     name = "codex"
 
     def run(self, request: AgentRequest) -> tuple[int, str] | AgentResult:
+        checked: list[agent_write_isolation.IsolationEvidence] = []
+
+        def observe(evidence: agent_write_isolation.IsolationEvidence) -> None:
+            if request.on_isolation_checked is not None:
+                request.on_isolation_checked(evidence)
+            checked.append(evidence)
+
+        isolation_arguments = agent_write_isolation.prepare_isolation(
+            self.name, request.role_name, request.worktree, request.state_dir,
+            request.read_only, observe,
+            request.isolation_snapshot_digest,
+            config_path=request.config_path,
+            expected_repository=request.expected_repository,
+            session_id=request.session_id,
+        )
+        if len(checked) != 1 or checked[0].status != "verified":
+            raise agent_write_isolation.IsolationError("Codex 격리 증거가 없습니다.")
         return run_codex(
             request.worktree,
             request.state_dir,
@@ -8059,6 +8090,10 @@ class CodexAgentAdapter:
             session_id=request.session_id,
             on_session_started=request.on_session_started,
             resolved_profile=request.profile,
+            isolation_arguments=isolation_arguments,
+            isolation_evidence=checked[0],
+            isolation_snapshot_digest=request.isolation_snapshot_digest,
+            expected_repository=request.expected_repository,
         )
 
 
@@ -8066,6 +8101,14 @@ class ClaudeAgentAdapter:
     name = "claude"
 
     def run(self, request: AgentRequest) -> tuple[int, str] | AgentResult:
+        agent_write_isolation.prepare_isolation(
+            self.name, request.role_name, request.worktree, request.state_dir,
+            request.read_only, request.on_isolation_checked,
+            request.isolation_snapshot_digest,
+            config_path=request.config_path,
+            expected_repository=request.expected_repository,
+            session_id=request.session_id,
+        )
         return run_claude(
             request.worktree,
             request.state_dir,
@@ -8150,6 +8193,18 @@ def run_agent(
         if on_session_started is not None:
             on_session_started(started_session_id)
 
+    def observe_isolation(evidence: agent_write_isolation.IsolationEvidence) -> None:
+        if ledger is None or identity is None:
+            raise agent_write_isolation.IsolationError(
+                "Agent 격리 증거를 저장할 invocation 상태가 없습니다."
+            )
+        try:
+            ledger.record_isolation(identity, evidence)
+        except sqlite3.Error as error:
+            raise agent_write_isolation.IsolationError(
+                "Agent 격리 증거 저장 실패"
+            ) from error
+
     request = AgentRequest(
         worktree=worktree,
         state_dir=state_dir,
@@ -8162,6 +8217,10 @@ def run_agent(
         session_id=session_id,
         on_session_started=observe_session,
         profile=resolved,
+        on_isolation_checked=observe_isolation,
+        isolation_snapshot_digest=lambda: hashlib.sha256(
+            capture_git_snapshot(worktree).serialize().encode()).hexdigest(),
+        expected_repository=invocation.repo if invocation is not None else None,
     )
     started = time.monotonic()
     try:
@@ -8190,7 +8249,11 @@ def run_agent(
         except sqlite3.Error:
             collection_status = "error"
     if isinstance(raw, AgentResult):
-        return replace(raw, collection_status=collection_status)
+        return replace(raw, collection_status=collection_status,
+                       isolation_invocation_id=identity)
+    if identity is not None:
+        return replace(result, collection_status=collection_status,
+                       isolation_invocation_id=identity)
     return raw
 
 
@@ -17219,6 +17282,8 @@ def _evaluate_remote_checkpoint_cause(
                 protocol_error=protocol_error,
             ),
             read_only=True,
+            connection=connection,
+            invocation=InvocationContext(repo, str(blocked["plan_id"])),
         )
         validate_agent_scope(
             "reviewer", worktree, review_before, capture_git_snapshot(worktree),
@@ -23032,6 +23097,8 @@ def _document_drafts_command(
                 run_agent(
                     str(project["provider"]), ROOT, state_dir, config_path,
                     "planner", prompt, read_only=True,
+                    connection=connection,
+                    invocation=InvocationContext(repo, None),
                 ),
                 None,
             )

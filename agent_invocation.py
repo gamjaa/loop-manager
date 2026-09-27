@@ -7,6 +7,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable
 
+from agent_write_isolation import IsolationEvidence
+
 
 @dataclass(frozen=True)
 class ResolvedProfile:
@@ -71,6 +73,7 @@ class AgentResult:
     kind: AgentResultKind | None = None
     usage: Usage = Usage()
     collection_status: str = "unknown"
+    isolation_invocation_id: str | None = None
 
     def __iter__(self):
         return iter((self.code, self.message))
@@ -100,6 +103,9 @@ class AgentRequest:
     session_id: str | None = None
     on_session_started: Callable[[str], None] | None = None
     profile: ResolvedProfile | None = None
+    on_isolation_checked: Callable[[IsolationEvidence], None] | None = None
+    isolation_snapshot_digest: Callable[[], str] | None = None
+    expected_repository: str | None = None
 
 
 @dataclass(frozen=True)

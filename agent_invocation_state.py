@@ -7,6 +7,7 @@ import sqlite3
 from uuid import uuid4
 
 from agent_invocation import InvocationContext, ResolvedProfile, Usage
+from agent_write_isolation import IsolationEvidence
 
 
 SCHEMA = """
@@ -42,9 +43,28 @@ CREATE TABLE IF NOT EXISTS agent_invocations (
 )
 """
 
+ISOLATION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS agent_isolation_evidence (
+    invocation_id TEXT PRIMARY KEY REFERENCES agent_invocations(invocation_id),
+    provider TEXT NOT NULL,
+    cli_version TEXT NOT NULL,
+    environment TEXT NOT NULL,
+    role TEXT NOT NULL,
+    canonical_worktree TEXT NOT NULL,
+    repository_identity TEXT NOT NULL,
+    policy_digest TEXT NOT NULL,
+    snapshot_digest TEXT NOT NULL,
+    configuration_digest TEXT NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    checked_at TEXT NOT NULL
+)
+"""
+
 
 def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.execute(SCHEMA)
+    connection.execute(ISOLATION_SCHEMA)
     columns = {row[1] for row in connection.execute("PRAGMA table_info(agent_invocations)")}
     for field in ("transition_id", "previous_provider", "previous_model",
                   "previous_effort", "previous_session_id"):
@@ -86,10 +106,51 @@ class InvocationRepository:
             self.connection.execute("""UPDATE agent_invocations SET session_id = ?
                 WHERE invocation_id = ? AND finished_at IS NULL""", (session_id, identity))
 
+    def record_isolation(self, identity: str, evidence: IsolationEvidence) -> None:
+        """Tie preflight to one invocation, never to a reusable session alone."""
+        with self.connection:
+            self.connection.execute("""INSERT INTO agent_isolation_evidence
+                (invocation_id, provider, cli_version, environment, role,
+                 canonical_worktree, repository_identity, policy_digest, snapshot_digest,
+                 configuration_digest,
+                 status, reason, checked_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (identity, evidence.provider, evidence.cli_version,
+                 evidence.environment, evidence.role, evidence.worktree,
+                 evidence.repository_identity, evidence.policy_digest,
+                 evidence.snapshot_digest, evidence.configuration_digest,
+                 evidence.status, evidence.reason, utc_now()))
+
+    def verified_invocation(self, identity: str, *, session_id: str | None,
+                            expected: IsolationEvidence) -> bool:
+        """Legacy, pending, interrupted and rejected attempts are never proof."""
+        if expected.status != "verified":
+            return False
+        row = self.connection.execute("""SELECT 1 FROM agent_invocations AS call
+            JOIN agent_isolation_evidence AS proof USING (invocation_id)
+            WHERE call.invocation_id = ? AND proof.status = 'verified'
+              AND call.finished_at IS NOT NULL AND call.result_kind = 'success'
+              AND proof.provider = ? AND proof.cli_version = ?
+              AND proof.environment = ? AND proof.role = ?
+              AND proof.canonical_worktree = ? AND proof.repository_identity = ?
+              AND proof.policy_digest = ? AND proof.snapshot_digest = ?
+              AND proof.configuration_digest = ?
+              AND (? IS NULL OR call.session_id = ?)""",
+            (identity, expected.provider, expected.cli_version,
+             expected.environment, expected.role, expected.worktree,
+             expected.repository_identity, expected.policy_digest,
+             expected.snapshot_digest, expected.configuration_digest,
+             session_id, session_id)).fetchone()
+        return row is not None
+
     def finish(self, identity: str, kind: str, code: int | None,
                duration_ms: int, session_id: str | None, usage: Usage,
                collection_status: str | None = None) -> None:
         with self.connection:
+            if kind != "success":
+                self.connection.execute("""UPDATE agent_isolation_evidence
+                    SET status = 'invalidated', reason = 'agent_attempt_not_successful'
+                    WHERE invocation_id = ? AND status = 'verified'""", (identity,))
             self.connection.execute("""UPDATE agent_invocations SET
                 finished_at = ?, duration_ms = ?, result_kind = ?, result_code = ?,
                 session_id = COALESCE(?, session_id), collection_status = ?,
@@ -104,6 +165,11 @@ class InvocationRepository:
 
     def reconcile_interrupted(self) -> int:
         with self.connection:
+            self.connection.execute("""UPDATE agent_isolation_evidence
+                SET status = 'invalidated', reason = 'agent_attempt_interrupted'
+                WHERE status = 'verified' AND invocation_id IN (
+                    SELECT invocation_id FROM agent_invocations WHERE finished_at IS NULL
+                )""")
             cursor = self.connection.execute("""UPDATE agent_invocations SET
                 finished_at = ?, result_kind = 'interrupted', collection_status = 'unknown'
                 WHERE finished_at IS NULL""", (utc_now(),))

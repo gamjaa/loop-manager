@@ -4,12 +4,410 @@ import sqlite3
 from pathlib import Path
 import tempfile
 import io
+import json
 from unittest import TestCase, mock
 
 import agent_invocation as invocation
+import agent_write_isolation as isolation
 import agent_invocation_state as state
 import agent_provider_usage as provider_usage
 import loop_manager as manager
+
+
+class WriteIsolationTests(TestCase):
+    def test_worktree_inspection_rejects_alias_and_unregistered_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_root = root / 'state'
+            selected = state_root / 'worktrees' / 'project' / 'G-088'
+            source = root / 'source'
+            common = source / '.git'
+            git_dir = common / 'worktrees' / 'G-088'
+            for path in (selected, git_dir):
+                path.mkdir(parents=True)
+            listed = f'worktree {source}\nHEAD abc\n\nworktree {selected}\nHEAD def\n'
+
+            def git(path, *args):
+                if args[-1] == '--show-toplevel':
+                    return str(selected)
+                if args[-1] == '--git-common-dir':
+                    return str(common)
+                if args[-1] == '--absolute-git-dir':
+                    return str(git_dir)
+                if args[-1] == '--porcelain':
+                    return listed
+                if args[-2:] == ('get-url', 'origin'):
+                    return 'https://example.invalid/owner/repo.git'
+                raise AssertionError(args)
+
+            with mock.patch.object(isolation, '_git', side_effect=git):
+                boundary = isolation.inspect_worktree(selected, state_root)
+                self.assertEqual((boundary.worktree, boundary.source,
+                                  boundary.common_dir), (selected, source, common))
+                alias = selected.parent / 'alias'
+                alias.symlink_to(selected, target_is_directory=True)
+                with self.assertRaises(isolation.IsolationError):
+                    isolation.inspect_worktree(alias, state_root)
+                unrelated = root / 'unrelated'
+                unrelated.mkdir()
+                with mock.patch.object(isolation, '_git', side_effect=lambda path, *args:
+                                       listed.replace(f'worktree {selected}',
+                                                      f'worktree {unrelated}')
+                                       if args[-1] == '--porcelain' else git(path, *args)):
+                    with self.assertRaisesRegex(isolation.IsolationError, '등록되지'):
+                        isolation.inspect_worktree(selected, state_root)
+
+    def test_codex_policy_preserves_auto_review_and_denies_broad_writes(self):
+        args = isolation.codex_arguments(False)
+        self.assertIn('approvals_reviewer="auto_review"', args)
+        self.assertTrue(any('sandbox_approval=false' in item and
+                            'request_permissions=false' in item for item in args))
+        self.assertIn('sandbox_workspace_write.exclude_slash_tmp=true', args)
+        self.assertIn('sandbox_workspace_write.exclude_tmpdir_env_var=true', args)
+        self.assertIn('mcp_servers={}', args)
+        self.assertNotIn('--approve-for-me', args)
+        self.assertEqual(args[args.index('--sandbox') + 1], 'workspace-write')
+        self.assertEqual(isolation.codex_arguments(True)[1], 'read-only')
+
+    def test_execpolicy_rule_blocks_unproven_sandbox_bypass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            provider_home = root / 'codex-home'
+            rules = provider_home / 'rules'
+            rules.mkdir(parents=True)
+            (rules / 'default.rules').write_text(
+                'prefix_rule(pattern = ["git"], decision = "allow")\n',
+                encoding='utf-8')
+            with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(provider_home)}):
+                with self.assertRaisesRegex(isolation.IsolationError, 'exec-policy'):
+                    isolation._assert_no_codex_execpolicy(root)
+
+    def test_inherited_codex_extensions_block_unproven_tool_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            provider_home = root / 'codex-home'
+            provider_home.mkdir()
+            config = provider_home / 'config.toml'
+            with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(provider_home)}):
+                config.write_text('model = "test"\n', encoding='utf-8')
+                isolation._assert_no_codex_extensions(root)
+                for setting in ('[mcp_servers.external]\ncommand = "tool"\n',
+                                '[plugins.external]\nenabled = true\n',
+                                'notify = ["external-command"]\n'):
+                    config.write_text(setting, encoding='utf-8')
+                    with self.assertRaisesRegex(isolation.IsolationError, 'MCP'):
+                        isolation._assert_no_codex_extensions(root)
+
+    def test_configuration_revision_changes_attempt_fingerprint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            provider_home = root / 'codex-home'
+            provider_home.mkdir()
+            config = provider_home / 'config.toml'
+            config.write_text('model = "first"\n', encoding='utf-8')
+            with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(provider_home)}):
+                first = isolation._configuration_digest('codex', root, None)
+                config.write_text('model = "second"\n', encoding='utf-8')
+                second = isolation._configuration_digest('codex', root, None)
+            self.assertNotEqual(first, second)
+
+    def test_configuration_drift_refuses_launch_after_successful_probe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            provider_home = root / 'codex-home'
+            provider_home.mkdir()
+            config = provider_home / 'config.toml'
+            config.write_text('model = "first"\n', encoding='utf-8')
+            boundary = isolation.WorktreeBoundary(root, root / 'source', (),
+                                                   root / 'git', root / 'common', 'repository')
+            with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(provider_home)}):
+                digest = isolation._configuration_digest('codex', root, root / 'config')
+                evidence = isolation.IsolationEvidence(
+                    'codex', 'codex version', 'Linux:x:y', 'worker', str(root),
+                    'repository', 'policy', 'verified', snapshot_digest='snapshot',
+                    configuration_digest=digest)
+                with mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
+                     mock.patch.object(isolation.subprocess, 'run', return_value=
+                                       manager.subprocess.CompletedProcess(
+                                           ['codex', '--version'], 0, 'codex version\n', '')):
+                    isolation.assert_current(evidence, root, root, root / 'config',
+                                             str(root / 'source'), False,
+                                             lambda: 'snapshot')
+                    config.write_text('model = "second"\n', encoding='utf-8')
+                    with self.assertRaisesRegex(isolation.IsolationError, '변경됐습니다'):
+                        isolation.assert_current(evidence, root, root, root / 'config',
+                                                 str(root / 'source'), False,
+                                                 lambda: 'snapshot')
+
+    def test_each_codex_attempt_gets_fresh_verified_policy_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            provider_home = root / 'codex-home'
+            provider_home.mkdir()
+            config = provider_home / 'config.toml'
+            config.write_text('model = "first"\n', encoding='utf-8')
+            boundary = isolation.WorktreeBoundary(root, root / 'source', (),
+                                                   root / 'git', root / 'common', 'repository')
+            records = []
+            with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(provider_home)}), \
+                 mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
+                 mock.patch.object(isolation, '_codex_probe') as probe, \
+                 mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
+                 mock.patch.object(isolation.subprocess, 'run', return_value=
+                                   manager.subprocess.CompletedProcess(
+                                       ['codex', '--version'], 0, 'codex version\n', '')):
+                first_args = isolation.prepare_isolation(
+                    'codex', 'worker', root, root, False, records.append,
+                    lambda: 'snapshot', expected_repository=str(root / 'source'))
+                config.write_text('model = "second"\n', encoding='utf-8')
+                second_args = isolation.prepare_isolation(
+                    'codex', 'worker', root, root, False, records.append,
+                    lambda: 'snapshot', expected_repository=str(root / 'source'))
+            self.assertEqual(first_args, second_args)
+            self.assertEqual(probe.call_count, 2)
+            self.assertEqual([record.status for record in records], ['verified', 'verified'])
+            self.assertNotEqual(records[0].policy_digest, records[1].policy_digest)
+            self.assertEqual(records[0].repository_identity, 'repository')
+
+    def test_codex_probe_requires_allowed_selected_and_denied_external_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            selected = root / 'selected'
+            source = root / 'source'
+            other = root / 'other'
+            git_dir = root / 'git-worktree'
+            common = root / 'common'
+            for path in (selected, source, other, git_dir, common):
+                path.mkdir()
+            for path in (source / 'file', other / 'file', git_dir / 'HEAD',
+                         common / 'HEAD', selected / 'file', selected / '.git'):
+                path.write_text('unchanged', encoding='utf-8')
+            boundary = isolation.WorktreeBoundary(
+                selected, source, (other,), git_dir, common, 'repository')
+            observed = []
+
+            def probe(command, **_kwargs):
+                paths = json.loads(command[-1])
+                observed.append(paths)
+                result = {name: 'denied' if name != 'selected' else 'allowed'
+                          for name in paths}
+                return manager.subprocess.CompletedProcess(
+                    command, 0, json.dumps(result), '')
+
+            with mock.patch.object(isolation, '_existing_writable_file',
+                                   side_effect=lambda path: path / 'file'), \
+                 mock.patch.object(isolation.subprocess, 'run', side_effect=probe):
+                isolation._codex_probe(boundary, False, ())
+            self.assertIn('source', observed[0])
+            self.assertIn('other_0', observed[0])
+            self.assertIn('shared_git', observed[0])
+            self.assertIn('worktree_pointer', observed[0])
+            self.assertIn('slash_tmp', observed[0])
+            self.assertEqual((source / 'file').read_text(encoding='utf-8'), 'unchanged')
+
+            def readonly(command, **_kwargs):
+                paths = json.loads(command[-1])
+                observed.append(paths)
+                return manager.subprocess.CompletedProcess(
+                    command, 0, json.dumps({name: 'denied' for name in paths}), '')
+
+            with mock.patch.object(isolation, '_existing_writable_file',
+                                   side_effect=lambda path: path / 'file'), \
+                 mock.patch.object(isolation.subprocess, 'run', side_effect=readonly):
+                isolation._codex_probe(boundary, True, ())
+            self.assertEqual(observed[-1]['selected'], str(selected / 'file'))
+
+            def escaped(command, **_kwargs):
+                paths = json.loads(command[-1])
+                result = {name: 'denied' if name != 'selected' else 'allowed'
+                          for name in paths}
+                result['shared_git'] = 'allowed'
+                return manager.subprocess.CompletedProcess(
+                    command, 0, json.dumps(result), '')
+
+            with mock.patch.object(isolation, '_existing_writable_file',
+                                   side_effect=lambda path: path / 'file'), \
+                 mock.patch.object(isolation.subprocess, 'run', side_effect=escaped):
+                with self.assertRaisesRegex(isolation.IsolationError, '경계가 일치'):
+                    isolation._codex_probe(boundary, False, ())
+
+            (selected / '.git').unlink()
+            (selected / '.git').mkdir()
+            with mock.patch.object(isolation, '_existing_writable_file',
+                                   side_effect=lambda path: path / 'file'), \
+                 mock.patch.object(isolation.subprocess, 'run', side_effect=readonly):
+                isolation._codex_probe(boundary, True, ())
+            self.assertNotIn('worktree_pointer', observed[-1])
+
+    def test_resume_with_uninspectable_session_grants_records_rejection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            boundary = isolation.WorktreeBoundary(root, root / 'source', (),
+                                                   root / 'git', root / 'common', 'repo')
+            records = []
+            with mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
+                 mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
+                 mock.patch.object(isolation, '_codex_probe') as probe:
+                with self.assertRaisesRegex(isolation.IsolationError, '재개 session'):
+                    isolation.prepare_isolation(
+                        'codex', 'worker', root, root, False, records.append,
+                        lambda: 'snapshot', expected_repository=str(root / 'source'),
+                        session_id='prior-session')
+            probe.assert_not_called()
+            self.assertEqual(records[0].status, 'rejected')
+
+    def test_unsupported_provider_records_rejection_without_launch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            boundary = isolation.WorktreeBoundary(root, root / 'source', (),
+                                                   root / 'git', root / 'common', 'repo')
+            records = []
+            with mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
+                 mock.patch.object(isolation.platform, 'system', return_value='Linux'):
+                with self.assertRaisesRegex(isolation.IsolationError, 'claude'):
+                    isolation.prepare_isolation('claude', 'worker', root, root,
+                                                False, records.append, lambda: 'snapshot',
+                                                expected_repository=str(root / 'source'))
+            self.assertEqual(records[0].status, 'rejected')
+            self.assertEqual(records[0].repository_identity, 'repo')
+
+    def test_native_windows_records_rejection_before_codex_probe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            boundary = isolation.WorktreeBoundary(root, root / 'source', (),
+                                                   root / 'git', root / 'common', 'repo')
+            records = []
+            with mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
+                 mock.patch.object(isolation.platform, 'system', return_value='Windows'), \
+                 mock.patch.object(isolation, '_codex_probe') as probe:
+                with self.assertRaisesRegex(isolation.IsolationError, 'Windows'):
+                    isolation.prepare_isolation(
+                        'codex', 'worker', root, root, False, records.append,
+                        lambda: 'snapshot', expected_repository=str(root / 'source'))
+            probe.assert_not_called()
+            self.assertEqual(records[0].status, 'rejected')
+
+    def test_rejected_preflight_stops_adapter_and_persists_attempt(self):
+        connection = sqlite3.connect(':memory:')
+        self.addCleanup(connection.close)
+        state.ensure_schema(connection)
+        profile = invocation.ResolvedProfile('model', 'high')
+
+        def reject(*args, **_kwargs):
+            args[-2](isolation.IsolationEvidence(
+                'codex', 'version', 'Linux:x:y', 'worker', '/worktree',
+                'repository', 'digest', 'rejected', 'sandbox unavailable'))
+            raise isolation.IsolationError('sandbox unavailable')
+
+        with mock.patch.object(isolation, 'prepare_isolation', side_effect=reject), \
+             mock.patch.object(manager, 'run_codex') as launch:
+            with self.assertRaisesRegex(isolation.IsolationError, 'sandbox unavailable'):
+                manager.run_agent('codex', Path('/worktree'), Path('/state'),
+                                  Path('/config'), 'worker', 'secret prompt',
+                                  read_only=False, level=1, connection=connection,
+                                  invocation=invocation.InvocationContext('repo', 'G-088'),
+                                  resolved_profile=profile)
+        launch.assert_not_called()
+        row = connection.execute('''SELECT proof.status, proof.reason, call.result_kind
+            FROM agent_isolation_evidence AS proof JOIN agent_invocations AS call
+            USING (invocation_id)''').fetchone()
+        self.assertEqual(row, ('rejected', 'sandbox unavailable', 'exception'))
+        self.assertNotIn('secret prompt', repr(row))
+
+    def test_missing_launch_evidence_preserves_prior_provider_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log_dir = root / 'logs' / manager.hashlib.sha256(str(root).encode()).hexdigest()[:16]
+            log_dir.mkdir(parents=True)
+            prior = log_dir / 'planner-last.txt'
+            prior.write_text('previous result', encoding='utf-8')
+            with self.assertRaisesRegex(isolation.IsolationError, '증거가 없습니다'):
+                manager.run_codex(
+                    root, root, root / 'config', 'planner', 'prompt',
+                    read_only=False,
+                    resolved_profile=invocation.ResolvedProfile('model', 'high'),
+                    isolation_arguments=isolation.codex_arguments(False))
+            self.assertEqual(prior.read_text(encoding='utf-8'), 'previous result')
+
+    def test_verified_evidence_is_bound_to_successful_attempt_and_session(self):
+        connection = sqlite3.connect(':memory:')
+        self.addCleanup(connection.close)
+        state.ensure_schema(connection)
+        profile = invocation.ResolvedProfile('model', 'high')
+        evidence = isolation.IsolationEvidence(
+            'codex', 'version', 'Linux:x:y', 'worker', '/worktree',
+            'repository', 'policy', 'verified', snapshot_digest='snapshot',
+            configuration_digest='configuration')
+
+        class Provider:
+            def run(self, request):
+                request.on_isolation_checked(evidence)
+                request.on_session_started('session-one')
+                return manager.AgentResult(0, 'done', 'session-one')
+
+        with mock.patch.object(manager, 'agent_provider', return_value=Provider()):
+            result = manager.run_agent(
+                'codex', Path('/worktree'), Path('/state'), Path('/config'),
+                'worker', 'prompt', read_only=False, level=1,
+                connection=connection,
+                invocation=invocation.InvocationContext('repo', 'G-088'),
+                resolved_profile=profile)
+        ledger = state.InvocationRepository(connection)
+        self.assertTrue(ledger.verified_invocation(result.isolation_invocation_id,
+                                                    session_id='session-one',
+                                                    expected=evidence))
+        self.assertFalse(ledger.verified_invocation(result.isolation_invocation_id,
+                                                     session_id='another-session',
+                                                     expected=evidence))
+        self.assertFalse(ledger.verified_invocation(result.isolation_invocation_id,
+                                                     session_id='session-one',
+                                                     expected=isolation.IsolationEvidence(
+                                                         'codex', 'version', 'Linux:x:y',
+                                                         'worker', '/worktree', 'repository',
+                                                         'policy', 'verified',
+                                                         snapshot_digest='changed',
+                                                         configuration_digest='configuration')))
+        self.assertFalse(ledger.verified_invocation(result.isolation_invocation_id,
+                                                     session_id='session-one',
+                                                     expected=isolation.IsolationEvidence(
+                                                         'codex', 'version', 'Linux:x:y',
+                                                         'worker', '/worktree', 'repository',
+                                                         'policy', 'verified',
+                                                         snapshot_digest='snapshot',
+                                                         configuration_digest='changed')))
+        self.assertFalse(ledger.verified_invocation('unrecorded', session_id=None,
+                                                    expected=evidence))
+        self.assertFalse(ledger.verified_invocation(
+            result.isolation_invocation_id, session_id='session-one',
+            expected=isolation.IsolationEvidence(
+                'codex', 'version', 'Linux:x:y', 'worker', '/worktree',
+                'repository', 'policy', 'rejected', snapshot_digest='snapshot',
+                configuration_digest='configuration')))
+        connection.execute('UPDATE agent_invocations SET result_kind = ? WHERE invocation_id = ?',
+                           ('interrupted', result.isolation_invocation_id))
+        self.assertFalse(ledger.verified_invocation(result.isolation_invocation_id,
+                                                    session_id='session-one',
+                                                    expected=evidence))
+
+    def test_interrupted_pending_attempt_invalidates_preflight_evidence(self):
+        connection = sqlite3.connect(':memory:')
+        self.addCleanup(connection.close)
+        state.ensure_schema(connection)
+        ledger = state.InvocationRepository(connection)
+        identity = ledger.start(invocation.InvocationContext('repo', 'G-088'),
+                                'worker', 'codex',
+                                invocation.ResolvedProfile('model', 'high'),
+                                'saved-session')
+        evidence = isolation.IsolationEvidence(
+            'codex', 'version', 'Linux:x:y', 'worker', '/worktree', 'repo',
+            'policy', 'verified', snapshot_digest='snapshot')
+        ledger.record_isolation(identity, evidence)
+        self.assertEqual(ledger.reconcile_interrupted(), 1)
+        row = connection.execute('''SELECT status, reason FROM agent_isolation_evidence
+            WHERE invocation_id = ?''', (identity,)).fetchone()
+        self.assertEqual(row, ('invalidated', 'agent_attempt_interrupted'))
+        self.assertFalse(ledger.verified_invocation(identity, session_id='saved-session',
+                                                    expected=evidence))
 
 
 class UsageTests(TestCase):
