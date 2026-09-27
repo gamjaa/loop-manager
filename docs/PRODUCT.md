@@ -374,6 +374,8 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 - Worker가 현재 환경에 맞는 전체 검증 스크립트를 생성하거나 갱신해야 한다
 - Worker는 전체 검증 스크립트를 직접 실행하지 않으며 Loop Manager 코드가 실행한다
 - Worker 결과와 작업 범위를 확인한 뒤 최신 `origin/<base-branch>`를 fetch하고 소유 변경을 commit하여 필요한 rebase를 완료한 다음 게시 후보 HEAD에서 전체 검증과 Review를 수행한다. 기준이 안정적이면 한 Worker 결과의 전체 검증은 한 번 수행한다. 이후 base 또는 후보 HEAD가 바뀌면 기존 검증과 Review를 무효화하고 최종 revision을 다시 검증한다
+- 관리 rebase는 실행 전 소유권·원격 OID·대상 base·원본 commit 순서를 고정한다. 충돌 해결 때 승인한 stage tree는 해당 원본의 실제 재생 commit과 parent에 대해 검증하고, 나머지는 원본별 patch 보존 또는 승인된 skip 근거로 순서대로 대조한다. 이후 commit이 같은 파일을 변경해도 이전 해결 당시의 파일 signature를 최종 worktree에 다시 요구하지 않는다
+- 중단 후에는 저장된 rebase 실행·교정·stage·재생 증거와 현재 HEAD·branch ref·worktree 등록·원격 OID·index·작업 파일·Git operation을 재검증해 이미 완료한 Git 단계만 확정한다. 증거가 불완전하거나 단계가 불일치하면 작업물과 감사를 보존하고 기존 안전 차단을 유지한다. 후보 revision이 바뀌면 게시 전 필요한 Worker 확인, targeted test, 전체 verify와 Review를 다시 수행한다
 - PR 생성 직전에 최신 `origin/<base-branch>`를 확인하고 변경됐으면 rebase 후 전체 검증과 Review를 다시 통과해야 한다
 - 게시 직전 archive eligibility가 검증된 이동 집합과 다르면 같은 Worker 세션으로 돌아가 전체 검증과 Review를 다시 수행한다
 - 관련 테스트와 전체 검증이 통과해야 한다

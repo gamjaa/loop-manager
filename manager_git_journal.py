@@ -16,6 +16,7 @@ import re
 import secrets
 from typing import Any
 from execution_checkpoint import rebase_preserves_worktree_files
+import managed_rebase_evidence as replay_evidence
 
 
 class MutationEvidenceError(RuntimeError):
@@ -34,6 +35,22 @@ def rebase_completion_matches(git: Callable[..., Any], repo: Path, *,
     )
 
 
+def live_remote_branch_oid(git: Callable[..., Any], repo: Path,
+                           branch: str) -> str | None:
+    """Observe the publication ref on origin, independent of fetched refs."""
+    ref = f'refs/heads/{branch}'
+    result = git(repo, 'ls-remote', '--heads', 'origin', ref, check=False)
+    if result.returncode:
+        raise MutationEvidenceError('rebase remote: live branch query failed')
+    lines = [line.split() for line in result.stdout.splitlines() if line.strip()]
+    if not lines:
+        return None
+    if (len(lines) != 1 or len(lines[0]) != 2 or lines[0][1] != ref
+            or re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', lines[0][0]) is None):
+        raise MutationEvidenceError('rebase remote: live branch response is ambiguous')
+    return lines[0][0]
+
+
 def rebase_conflict_matches(git: Callable[..., Any], worktree: Path, *,
                             head: str, identity: str) -> bool:
     """Require this operation at the selected worktree's current HEAD reflog tip."""
@@ -44,6 +61,39 @@ def rebase_conflict_matches(git: Callable[..., Any], worktree: Path, *,
         result.stdout.rstrip("\n").startswith(f"{prefix} ({action}): ")
         for action in ("start", "pick", "continue", "skip")
     )
+
+
+def record_rebase_invocation(
+    state_dir: Path, repo: str, target: str, identity: str, *,
+    returncode: int,
+) -> None:
+    """Seal the Manager's own command outcome for an unchanged rebase."""
+    slot = _slot(state_dir, repo, 'managed_rebase', target)
+    active = _read(slot / 'active.json')
+    if active.get('id') != identity:
+        raise MutationEvidenceError('rebase invocation: active identity mismatch')
+    receipt = {'id': identity, 'run_id': active['expected'].get('run_id'),
+               'returncode': returncode}
+    path = slot / f'{identity}.invocation.json'
+    if path.exists():
+        if _read(path) != receipt:
+            raise MutationEvidenceError('rebase invocation: outcome changed')
+    else:
+        _write_new(path, receipt)
+
+
+def successful_rebase_invocation(
+    state_dir: Path, repo: str, target: str, identity: str,
+) -> bool:
+    slot = _slot(state_dir, repo, 'managed_rebase', target)
+    path = slot / f'{identity}.invocation.json'
+    if not path.is_file():
+        return False
+    receipt = _read(path)
+    intent = _read(slot / f'{identity}.intent.json')
+    return receipt == {'id': identity,
+                       'run_id': intent['expected'].get('run_id'),
+                       'returncode': 0}
 
 
 def rebase_affected_paths(git: Callable[..., Any], repo: Path,
@@ -64,6 +114,193 @@ def rebase_affected_paths(git: Callable[..., Any], repo: Path,
             "--name-only", "-r", "-z", commit,
         ).stdout.split("\0")))
     return sorted(paths)
+
+
+def rebase_replay_proof(
+    git: Callable[..., Any], state_dir: Path, intent: Mapping[str, Any],
+    observed: Mapping[str, Any],
+) -> list[dict[str, str]]:
+    """Compare one frozen source sequence with the actual replay and receipts."""
+    expected = intent['expected']
+    if expected.get('evidence_version') != replay_evidence.EVIDENCE_VERSION:
+        raise MutationEvidenceError('rebase replay evidence version is unavailable')
+    sources = expected.get('source_commits')
+    run_id = expected.get('run_id')
+    generation = expected.get('checkpoint_generation')
+    if (not isinstance(sources, list) or not isinstance(run_id, str)
+            or not run_id or not isinstance(expected.get('source_base'), str)
+            or not isinstance(generation, int)):
+        raise MutationEvidenceError('rebase start: source sequence is incomplete')
+    repo = Path(intent['repo'])
+    actual_base, actual_sources = replay_evidence.source_commits(
+        git, repo, expected['before_head'], expected['target_base_oid'],
+    )
+    if actual_base != expected['source_base'] or actual_sources != sources:
+        raise MutationEvidenceError('rebase start: frozen source sequence mismatch')
+    slot = _slot(state_dir, intent['repo'], 'managed_rebase', intent['target'])
+    receipts = []
+    for result_path in slot.glob('*.result.json'):
+        result = _read(result_path)
+        if result.get('status') != 'complete':
+            continue
+        saved = _read(slot / f"{result.get('id')}.intent.json")
+        if (saved.get('expected', {}).get('run_id') == run_id
+                and saved.get('id') != intent['id']):
+            saved_generation = saved['expected'].get('checkpoint_generation')
+            if not isinstance(saved_generation, int):
+                raise MutationEvidenceError('rebase replay: receipt generation missing')
+            if saved_generation >= generation:
+                continue
+            if (saved.get('repo') != intent['repo'] or saved.get('target') != intent['target']
+                    or saved.get('owner') != intent['owner']
+                    or saved['expected'].get('source_commits') != sources
+                    or saved['expected'].get('target_base_oid') != expected['target_base_oid']):
+                raise MutationEvidenceError('rebase replay: receipt identity mismatch')
+            if result.get('id') != saved.get('id') or not isinstance(result.get('candidates'), dict):
+                raise MutationEvidenceError('rebase replay: sealed receipt mismatch')
+            receipts.append(saved)
+    receipts.append(intent)
+    if len([saved for saved in receipts if saved['before'].get('metadata') is None
+            and saved['before'].get('head') == expected['before_head']
+            and not saved['expected'].get('action')]) != 1:
+        raise MutationEvidenceError('rebase start: unique initial intent unavailable')
+    corrections: dict[str, dict[str, str]] = {}
+    skips: dict[str, dict[str, str]] = {}
+    for saved in receipts:
+        item = saved['expected']
+        source = item.get('source_commit')
+        action = item.get('action')
+        if action not in {'continue', 'skip'}:
+            continue
+        if source not in sources or item.get('run_id') != run_id:
+            raise MutationEvidenceError('rebase resolution: source identity mismatch')
+        parent = saved['before']['head']
+        if action == 'continue':
+            tree = item.get('staged_tree_oid')
+            if (not tree or source in corrections or source in skips
+                    or item.get('staged_index') != saved['before'].get('index')
+                    or not item.get('correction_turn')
+                    or not replay_evidence.stage_matches(
+                        before_index=item.get('stage_before_index'),
+                        staged_index=item.get('staged_index'),
+                        allowed_paths=list((item.get('accepted_files') or {}).keys()),
+                        accepted_files=item.get('accepted_files') or {},
+                        staged_dirty=saved['before'].get('dirty') or {},
+                    )):
+                raise MutationEvidenceError('rebase resolution: stage or turn mismatch')
+            corrections[source] = {
+                'source': source, 'parent': parent, 'tree': tree,
+                'intent_id': saved['id'], 'turn_id': item['correction_turn'],
+            }
+        else:
+            if (source in skips or source in corrections
+                    or item.get('skip_reason') != 'worker-approved'
+                    or not item.get('correction_turn')
+                    or item.get('staged_index') != saved['before'].get('index')
+                    or not saved['before'].get('index_clean')
+                    or saved['before'].get('unmerged')):
+                raise MutationEvidenceError('rebase skip: source receipt mismatch')
+            skips[source] = {
+                'source': source, 'parent': parent, 'reason': item['skip_reason'],
+                'intent_id': saved['id'],
+            }
+    target = expected['target_base_oid']
+    head = observed['head']
+    stop_source = observed.get('rebase_head') if observed.get('metadata') is not None else None
+    if observed.get('metadata') is not None and stop_source not in sources:
+        raise MutationEvidenceError('rebase replay: current conflict source missing')
+    replayed = [replay_evidence.commit_fact(git, repo, oid) for oid in
+                replay_evidence.replay_commits(git, repo, target, head)]
+    source_facts = {oid: replay_evidence.commit_fact(git, repo, oid) for oid in sources}
+    try:
+        proof = replay_evidence.verify_replay(
+            sources=sources, replayed=replayed, target=target, head=head,
+            corrections=corrections, skips=skips, source_facts=source_facts,
+            same_patch=lambda original, actual: replay_evidence.patch_equal(
+                git, repo, original, actual,
+            ), allow_prefix=observed.get('metadata') is not None,
+            stop_source=stop_source,
+        )
+    except replay_evidence.ReplayEvidenceError as error:
+        raise MutationEvidenceError(str(error)) from error
+    return proof
+
+
+def legacy_rebase_replay_proof(
+    git: Callable[..., Any], state_dir: Path, intent: Mapping[str, Any],
+    observed: Mapping[str, Any],
+) -> list[dict[str, str]]:
+    """Recover old staged-tree receipts only when their replay is unique."""
+    expected = intent['expected']
+    repo = Path(intent['repo'])
+    _base, sources = replay_evidence.source_commits(
+        git, repo, expected['before_head'], expected['target_base_oid'],
+    )
+    replayed = [replay_evidence.commit_fact(git, repo, oid) for oid in
+                replay_evidence.replay_commits(
+                    git, repo, expected['target_base_oid'], observed['head'],
+                )]
+    if len(sources) != len(replayed):
+        raise MutationEvidenceError('rebase legacy replay: source count is ambiguous')
+    slot = _slot(state_dir, intent['repo'], 'managed_rebase', intent['target'])
+    receipts = [intent]
+    initial_count = 0
+    for path in slot.glob('*.result.json'):
+        result = _read(path)
+        if result.get('status') != 'complete' or result.get('id') == intent['id']:
+            continue
+        saved = _read(slot / f"{result.get('id')}.intent.json")
+        if (saved.get('owner') == intent['owner']
+                and saved.get('expected', {}).get('before_head') == expected['before_head']
+                and saved['expected'].get('target_base_oid') == expected['target_base_oid']
+                and saved.get('target') == intent['target']):
+            if (result.get('id') != saved.get('id')
+                    or not isinstance(result.get('candidates'), dict)):
+                raise MutationEvidenceError('rebase legacy replay: sealed result mismatch')
+            if (not saved['expected'].get('action')
+                    and saved['before'].get('metadata') is None
+                    and saved['before'].get('head') == expected['before_head']
+                    and result.get('observed', {}).get('metadata') is not None):
+                initial_count += 1
+            receipts.append(saved)
+    if initial_count != 1:
+        raise MutationEvidenceError('rebase legacy replay: unique initial execution missing')
+    corrections: dict[str, dict[str, str]] = {}
+    for receipt in receipts:
+        item = receipt['expected']
+        tree = item.get('staged_tree_oid')
+        if item.get('action') != 'continue' or not tree:
+            continue
+        matches = [index for index, commit in enumerate(replayed)
+                   if commit['parent'] == receipt['before']['head']
+                   and commit['tree'] == tree]
+        if len(matches) != 1:
+            raise MutationEvidenceError('rebase legacy resolution: staged tree has no unique commit')
+        source = sources[matches[0]]
+        accepted = item.get('accepted_files')
+        if (source in corrections or not isinstance(accepted, dict) or not accepted
+                or any(receipt['before'].get('dirty', {}).get(path, [None, None])[1]
+                       != signature for path, signature in accepted.items())):
+            raise MutationEvidenceError('rebase legacy resolution: approved files mismatch')
+        corrections[source] = {
+            'source': source, 'parent': receipt['before']['head'],
+            'tree': tree, 'intent_id': receipt['id'],
+            'turn_id': item.get('correction_turn') or receipt['id'],
+        }
+    if not corrections:
+        raise MutationEvidenceError('rebase legacy resolution: no approved tree')
+    source_facts = {oid: replay_evidence.commit_fact(git, repo, oid) for oid in sources}
+    try:
+        return replay_evidence.verify_replay(
+            sources=sources, replayed=replayed,
+            target=expected['target_base_oid'], head=observed['head'],
+            corrections=corrections, skips={}, source_facts=source_facts,
+            same_patch=lambda source, actual: replay_evidence.patch_equal(
+                git, repo, source, actual,
+            ),
+        )
+    except replay_evidence.ReplayEvidenceError as error:
+        raise MutationEvidenceError(str(error)) from error
 
 
 def _conflict_files_bounded(before: Mapping[str, Any],
@@ -110,6 +347,7 @@ def verified_rebase_result(
     current_remote_oid: str | None, target_ancestor: bool,
     patches_preserved: bool, reflog_marker: bool,
     autostash_owned: bool = False, accepted_correction: bool = False,
+    replay_verified: bool = False,
 ) -> dict[str, Any]:
     """Validate one initial or continued rebase without owning file edits."""
     before = intent["before"]
@@ -145,6 +383,7 @@ def verified_rebase_result(
             and observed["ref"] == before["ref"]
             and observed["registration"] is not None
             and "detached=True" in observed["registration"]
+            and f"HEAD={observed['head']}" in observed["registration"]
             and _conflict_files_bounded(
                 before, observed, expected.get("affected_paths"),
             )
@@ -161,11 +400,20 @@ def verified_rebase_result(
             and observed["ref"][0] == observed["head"]
             and observed["registration"] is not None
             and f"branch=refs/heads/{branch}" in observed["registration"]
-            and (patches_preserved or expected.get("action") == "skip"
+            and f"HEAD={observed['head']}" in observed["registration"]
+            and ((replay_verified if expected.get('evidence_version') == 2 else
+                  patches_preserved or (expected.get("action") == "skip"
+                                        and accepted_correction)
                  or (expected.get("action") == "continue"
                      and expected.get("staged_tree_oid")
-                     and accepted_correction))
+                     and accepted_correction)))
             and reflog_marker
+            and (expected.get('evidence_version') != 2
+                 or ((observed.get('index_clean') and not observed.get('operations'))
+                     or (autostash_owned and observed.get('unmerged')
+                         and not observed.get('metadata'))))
+            and (expected.get('evidence_version') != 2
+                 or beginning or autostash_owned or not observed.get('dirty'))
             and (not observed.get("unmerged") or autostash_owned)
             and (not beginning or files_preserved
                  or (observed.get("unmerged") and autostash_owned))
@@ -432,10 +680,13 @@ def recover_active(
 def _finish(
     slot: Path, active: Path, intent: Mapping[str, Any],
     observed: Mapping[str, Any], candidates: Mapping[str, Any], status: str,
+    replay_proof: list[dict[str, str]] | None = None,
 ) -> None:
     result_path = slot / f"{intent['id']}.result.json"
     result = {"id": intent["id"], "status": status,
               "observed": dict(observed), "candidates": dict(candidates)}
+    if replay_proof is not None:
+        result['replay_proof'] = replay_proof
     if result_path.exists():
         if _read(result_path) != result:
             raise MutationEvidenceError("Manager Git 저장 결과가 현재 증거와 다릅니다.")
@@ -567,6 +818,8 @@ def complete_rebase(
     observe: Callable[[], dict[str, Any]],
     validate: Callable[[Mapping[str, Any], Mapping[str, Any]], dict[str, Any]],
     allow_equal: bool = False,
+    replay_proof: Callable[[Mapping[str, Any], Mapping[str, Any]],
+                           list[dict[str, str]]] | None = None,
 ) -> bool:
     """Finalize only an owned Git outcome; leave ambiguous intent active."""
     slot = _slot(state_dir, repo, "managed_rebase", target)
@@ -582,18 +835,29 @@ def complete_rebase(
         raise MutationEvidenceError("Manager rebase 활성 intent가 불완전합니다.")
     observed = observe()
     if observed == intent["before"]:
-        if allow_equal:
+        if (intent['expected'].get('evidence_version') == 2
+                and allow_equal
+                and successful_rebase_invocation(
+                    state_dir, repo, target, intent['id'],
+                )):
+            candidates = validate(intent, observed)
+            proof = replay_proof(intent, observed) if replay_proof is not None else None
+            _finish(slot, active, intent, observed, candidates, 'complete', proof)
+            return True
+        if allow_equal and intent['expected'].get('evidence_version') != 2:
             _finish(slot, active, intent, observed, {}, "aborted")
             return True
         return False
     candidates = validate(intent, observed)
-    _finish(slot, active, intent, observed, candidates, "complete")
+    proof = replay_proof(intent, observed) if replay_proof is not None else None
+    _finish(slot, active, intent, observed, candidates, "complete", proof)
     return True
 
 
 def verified_managed_transitions(
     state_dir: Path, repo: str, owner: str, *,
     agent_session_id: str | None = None,
+    git: Callable[..., Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Offer G-092 sealed per-operation evidence, not a live-state allowance."""
     root = state_dir / "manager-git-journal"
@@ -652,11 +916,24 @@ def verified_managed_transitions(
                 ):
                     raise MutationEvidenceError("Manager rebase 저장 결과가 유효하지 않습니다.")
                 try:
+                    replay_verified = False
+                    if intent['expected'].get('evidence_version') == 2:
+                        if git is None:
+                            raise MutationEvidenceError('rebase stored replay requires Git observation')
+                        proof = rebase_replay_proof(git, state_dir, intent, observed)
+                        if result.get('replay_proof') != proof:
+                            raise MutationEvidenceError('rebase stored replay proof mismatch')
+                        replay_verified = True
+                    elif result.get('replay_proof') is not None:
+                        if git is None or result['replay_proof'] != legacy_rebase_replay_proof(
+                                git, state_dir, intent, observed):
+                            raise MutationEvidenceError('rebase stored legacy replay proof mismatch')
                     expected_candidates = verified_rebase_result(
                         intent, observed,
                         current_remote_oid=intent["expected"]["remote_oid"],
                         target_ancestor=True, patches_preserved=True,
                         reflog_marker=True, autostash_owned=True,
+                        replay_verified=replay_verified,
                     )
                 except (KeyError, TypeError, ValueError) as error:
                     raise MutationEvidenceError(
