@@ -12,7 +12,7 @@ import manager_git_journal as journal
 import loop_manager
 
 from managed_rebase_evidence import (
-    ReplayEvidenceError, source_commits, stage_matches, verify_replay,
+    ReplayEvidenceError, source_commits, stage_index_matches, stage_matches, verify_replay,
 )
 
 
@@ -110,6 +110,19 @@ class ReplayVerdictTests(unittest.TestCase):
 
 
 class StageVerdictTests(unittest.TestCase):
+    def test_empty_skip_still_requires_complete_unchanged_index(self):
+        index = {'app.py': ['H 100644 ' + 'a' * 40 + ' 0']}
+        self.assertTrue(stage_index_matches(
+            before_index=index, staged_index=index, allowed_paths=[]))
+        self.assertFalse(stage_index_matches(
+            before_index=None, staged_index=index, allowed_paths=[]))
+        self.assertFalse(stage_index_matches(
+            before_index=index, staged_index={}, allowed_paths=[]))
+        self.assertFalse(stage_index_matches(
+            before_index=index,
+            staged_index={'app.py': ['h 100644 ' + 'a' * 40 + ' 0']},
+            allowed_paths=[]))
+
     def test_stage_rejects_other_path_or_index_flag_change(self):
         before = {'app.py': ['H 100644 ' + 'a' * 40 + ' 1'],
                   'other.py': ['H 100644 ' + 'b' * 40 + ' 0']}
@@ -132,6 +145,52 @@ class StageVerdictTests(unittest.TestCase):
 
 
 class JournalReplayProofTests(unittest.TestCase):
+    def test_skip_receipt_rechecks_approved_index(self):
+        with TemporaryDirectory() as directory:
+            state = Path(directory)
+            expected = dict(evidence_version=2, run_id='run', source_base='old-base',
+                            source_commits=['source'], before_head='source',
+                            target_base_oid='target', checkpoint_generation=1)
+            journal.begin_rebase(
+                state, owner='plan:G-099', repo='/repo', target='/worktree',
+                before={'head': 'source', 'metadata': None}, expected=expected)
+            journal.complete_rebase(
+                state, repo='/repo', target='/worktree',
+                observe=lambda: {'head': 'target', 'metadata': {'onto': 'target'}},
+                validate=lambda *_: {})
+            original = {'app.py': ['H 100644 ' + 'a' * 40 + ' 1']}
+            staged = {'app.py': ['H 100644 ' + 'b' * 40 + ' 0']}
+            journal.begin_rebase(
+                state, owner='plan:G-099', repo='/repo', target='/worktree',
+                before=dict(head='target', index=staged, index_clean=True,
+                            unmerged=False, metadata={'onto': 'target'}),
+                expected={**expected, 'checkpoint_generation': 2, 'action': 'skip',
+                          'source_commit': 'source', 'correction_turn': 'turn',
+                          'skip_reason': 'worker-approved', 'staged_index': staged,
+                          'stage_before_index': original,
+                          'accepted_files': {'app.py': 'approved'}})
+            active = journal._read(journal._slot(
+                state, '/repo', 'managed_rebase', '/worktree') / 'active.json')
+            with (mock.patch.object(journal.replay_evidence, 'source_commits',
+                                    return_value=('old-base', ['source'])),
+                  mock.patch.object(journal.replay_evidence, 'replay_commits', return_value=[]),
+                  mock.patch.object(journal.replay_evidence, 'commit_fact', return_value={})):
+                observed = {'head': 'target', 'metadata': None}
+                proof = journal.rebase_replay_proof(None, state, active, observed)
+                self.assertEqual(proof[0]['outcome'], 'skip')
+                for flag in ('S', 'h'):
+                    with self.subTest(flag=flag):
+                        changed = {'app.py': [flag + ' 100644 ' + 'b' * 40 + ' 0']}
+                        active['before']['index'] = changed
+                        active['expected']['staged_index'] = changed
+                        with self.assertRaisesRegex(journal.MutationEvidenceError, 'rebase skip'):
+                            journal.rebase_replay_proof(None, state, active, observed)
+                active['before']['index'] = staged
+                active['expected']['staged_index'] = staged
+                active['expected'].pop('stage_before_index')
+                with self.assertRaises(journal.MutationEvidenceError):
+                    journal.rebase_replay_proof(None, state, active, observed)
+
     def test_legacy_staged_tree_recovers_only_unique_resolution_commit(self):
         base, target = '0' * 40, 'd' * 40
         source = ['1' * 40, '2' * 40]

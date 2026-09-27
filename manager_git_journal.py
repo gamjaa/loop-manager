@@ -197,6 +197,12 @@ def rebase_replay_proof(
                     or item.get('skip_reason') != 'worker-approved'
                     or not item.get('correction_turn')
                     or item.get('staged_index') != saved['before'].get('index')
+                    or not isinstance(item.get('accepted_files'), dict)
+                    or not replay_evidence.stage_index_matches(
+                        before_index=item.get('stage_before_index'),
+                        staged_index=item.get('staged_index'),
+                        allowed_paths=list(item.get('accepted_files') or {}),
+                    )
                     or not saved['before'].get('index_clean')
                     or saved['before'].get('unmerged')):
                 raise MutationEvidenceError('rebase skip: source receipt mismatch')

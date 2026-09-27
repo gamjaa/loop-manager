@@ -961,6 +961,61 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
                 handler._begin_rebase_continuation(context, CorrectionAction.CONTINUE)
             self.assertEqual(begin.call_count, 1)
 
+    def test_skip_checks_approved_index_before_recording_intent(self):
+        handler = object.__new__(ExecutionHandlers)
+        context = SimpleNamespace(
+            plan=SimpleNamespace(plan_id='G-099'), branch=BRANCH,
+            worktree=Path('/worktree'), worker_session_id='session',
+        )
+        original = {'app.py': [f'H 100644 {OLD} 1'],
+                    'other.py': [f'H 100644 {OLD} 0']}
+        staged = {'app.py': [f'H 100644 {NEW} 0'],
+                  'other.py': original['other.py']}
+        before = dict(head=NEW, branch=None, index=staged,
+                      dirty={}, index_clean=True, unmerged=False)
+        snapshot = dict(
+            pending='continue', worker_result='approved',
+            stage_evidence=dict(head=NEW, branch=None,
+                                files={'app.py': 'signature'}, index=original),
+            rebase_evidence_version=2, rebase_run_id='run',
+            rebase_source_base=OLD, rebase_source_commits=[TREE],
+            rebase_remote_oid=None,
+        )
+        handler.repo, handler.repo_path, handler.state_dir = 'repo', Path('/repo'), Path('/state')
+        handler.effects = SimpleNamespace(
+            checkpoint=SimpleNamespace(get=lambda *_: SimpleNamespace(
+                operation='rebase', expected_head=OLD, target_base_oid=NEW,
+                generation=3, snapshot=snapshot)),
+            workspace=SimpleNamespace(
+                git=lambda *_a, **_k: SimpleNamespace(stdout=TREE, returncode=0),
+                remote_branch_oid=lambda *_: None),
+        )
+        handler.rebase_corrections = SimpleNamespace(get=lambda *_: SimpleNamespace(
+            pending_turn='turn', worker_result='approved', worker_session='session',
+            generation=2))
+        handler._rebase_journal_state = lambda *_: before.copy()
+        with (mock.patch.object(journal, 'live_remote_branch_oid', return_value=None),
+              mock.patch.object(journal, 'rebase_affected_paths', return_value=['app.py']),
+              mock.patch.object(journal, 'begin_rebase', return_value='intent') as begin):
+            self.assertEqual(handler._begin_rebase_continuation(
+                context, CorrectionAction.SKIP), 'intent')
+            for index in (
+                {**staged, 'app.py': [f'S 100644 {NEW} 0']},
+                {**staged, 'app.py': [f'h 100644 {NEW} 0']},
+                {**staged, 'other.py': [f'S 100644 {OLD} 0']},
+                {**staged, 'other.py': [f'H 100755 {OLD} 0']},
+            ):
+                with self.subTest(index=index):
+                    before['index'] = index
+                    with self.assertRaisesRegex(journal.MutationEvidenceError, 'rebase skip'):
+                        handler._begin_rebase_continuation(context, CorrectionAction.SKIP)
+            self.assertEqual(begin.call_count, 1)
+            before['index'] = staged
+            snapshot['stage_evidence'].pop('index')
+            with self.assertRaises(journal.MutationEvidenceError):
+                handler._begin_rebase_continuation(context, CorrectionAction.SKIP)
+            self.assertEqual(begin.call_count, 1)
+
     def test_continuation_intent_carries_only_matching_saved_stage_files(self):
         handler = object.__new__(ExecutionHandlers)
         context = SimpleNamespace(

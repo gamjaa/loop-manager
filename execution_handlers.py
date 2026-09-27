@@ -1131,9 +1131,15 @@ class ExecutionHandlers:
                 )
             if action is CorrectionAction.SKIP and (
                 not before.get('index_clean') or before.get('unmerged')
+                or accepted_files is None
+                or not managed_rebase_evidence.stage_index_matches(
+                    before_index=stage_evidence.get('index'),
+                    staged_index=before.get('index'),
+                    allowed_paths=list(accepted_files),
+                )
             ):
                 raise manager_git_journal.MutationEvidenceError(
-                    'rebase skip: index is not clean'
+                    'rebase skip: index differs from Worker-approved stage evidence'
                 )
             replay_fields = {
                 'evidence_version': managed_rebase_evidence.EVIDENCE_VERSION,

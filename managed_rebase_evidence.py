@@ -81,11 +81,26 @@ def stage_matches(*, before_index: Mapping[str, list[str]],
                   allowed_paths: Sequence[str], accepted_files: Mapping[str, str],
                   staged_dirty: Mapping[str, Any]) -> bool:
     """Reject changes outside the correction and non-default stage/index flags."""
+    if not allowed_paths or not set(accepted_files) <= set(allowed_paths):
+        return False
+    if not stage_index_matches(before_index=before_index, staged_index=staged_index,
+                               allowed_paths=allowed_paths):
+        return False
+    return all(
+        isinstance(staged_dirty.get(path), list)
+        and len(staged_dirty[path]) == 2
+        and staged_dirty[path][1] == signature
+        for path, signature in accepted_files.items()
+    )
+
+
+def stage_index_matches(*, before_index: Mapping[str, list[str]],
+                        staged_index: Mapping[str, list[str]],
+                        allowed_paths: Sequence[str]) -> bool:
+    """Allow only normal staging of approved paths, including an empty skip."""
     if not isinstance(before_index, Mapping) or not isinstance(staged_index, Mapping):
         return False
     allowed = set(allowed_paths)
-    if not allowed or not set(accepted_files) <= allowed:
-        return False
     for path in before_index.keys() | staged_index.keys():
         if before_index.get(path) != staged_index.get(path):
             if path not in allowed:
@@ -95,12 +110,7 @@ def stage_matches(*, before_index: Mapping[str, list[str]],
                     not re.fullmatch(r'H (?:100644|100755|120000|160000) [0-9a-f]{40,64} 0', entry)
                     for entry in entries)):
                 return False
-    return all(
-        isinstance(staged_dirty.get(path), list)
-        and len(staged_dirty[path]) == 2
-        and staged_dirty[path][1] == signature
-        for path, signature in accepted_files.items()
-    )
+    return True
 
 
 def verify_replay(*, sources: Sequence[str], replayed: Sequence[Mapping[str, str]],
