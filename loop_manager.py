@@ -13200,6 +13200,7 @@ def _proven_recovered_worktree_baseline(
         raise AgentScopeError("복구한 Agent worktree의 기존 파일·HEAD 상태가 다릅니다.")
     transitions = manager_git_journal.verified_managed_transitions(
         state_dir, str(_canonical_path(repo_path)), f"plan:{plan_id}",
+        git=git,
     )
     owned = any(
         item["intent"]["kind"] == "managed_worktree_create"

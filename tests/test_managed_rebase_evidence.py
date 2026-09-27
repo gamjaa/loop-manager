@@ -1,5 +1,7 @@
 """Focused phase and stage checks for managed rebase proof."""
 
+import os
+import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -7,9 +9,10 @@ from types import SimpleNamespace
 from unittest import mock
 
 import manager_git_journal as journal
+import loop_manager
 
 from managed_rebase_evidence import (
-    ReplayEvidenceError, stage_matches, verify_replay,
+    ReplayEvidenceError, source_commits, stage_matches, verify_replay,
 )
 
 
@@ -222,6 +225,7 @@ class JournalReplayProofTests(unittest.TestCase):
                         state, '/repo', 'plan:G-099', git=lambda *_: None,
                     )
 
+
     def test_unchanged_rebase_requires_its_own_successful_invocation(self):
         with TemporaryDirectory() as directory:
             state = Path(directory)
@@ -321,6 +325,179 @@ class JournalReplayProofTests(unittest.TestCase):
             trees[replayed[1]] = '9' * 40
             with self.assertRaises(journal.MutationEvidenceError):
                 journal.rebase_replay_proof(git, state, active, result)
+
+
+class RealGitJournalReplayTests(unittest.TestCase):
+    def test_middle_conflict_later_content_and_mode_survive_journal_recovery(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / 'repo'
+            state = root / 'state'
+            state.mkdir()
+            subprocess.run(
+                ['git', 'init', '-b', 'main', str(repo)], check=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+
+            def git(*args, **kwargs):
+                return loop_manager.git(repo, *args, **kwargs)
+
+            git('config', 'user.name', 'Rebase Test')
+            git('config', 'user.email', 'rebase@example.test')
+            app = repo / 'app.txt'
+            original_lines = ['value=initial\n'] + [f'line-{n}\n' for n in range(1, 25)]
+            app.write_text(''.join(original_lines), encoding='utf-8')
+            git('add', 'app.txt')
+            git('commit', '-m', 'Initial application')
+
+            branch = 'loop-manager/G-099'
+            git('switch', '-c', branch)
+            (repo / 'notes.txt').write_text('first replayed commit\n', encoding='utf-8')
+            git('add', 'notes.txt')
+            git('commit', '-m', 'Add independent note')
+            changed = original_lines.copy()
+            changed[0] = 'value=worker\n'
+            app.write_text(''.join(changed), encoding='utf-8')
+            git('add', 'app.txt')
+            git('commit', '-m', 'Change value on worker branch')
+            changed[20] = 'line-20-after-resolution\n'
+            app.write_text(''.join(changed), encoding='utf-8')
+            app.chmod(0o755)
+            git('add', 'app.txt')
+            git('commit', '-m', 'Change later content and mode')
+            changed[12] = 'line-12-after-resolution\n'
+            app.write_text(''.join(changed), encoding='utf-8')
+            git('add', 'app.txt')
+            git('commit', '-m', 'Change same file in another later commit')
+            original_head = git('rev-parse', 'HEAD').stdout.strip()
+
+            git('switch', 'main')
+            changed_base = original_lines.copy()
+            changed_base[0] = 'value=base\n'
+            app.write_text(''.join(changed_base), encoding='utf-8')
+            git('add', 'app.txt')
+            git('commit', '-m', 'Advance base with conflicting value')
+            target = git('rev-parse', 'HEAD').stdout.strip()
+            git('switch', branch)
+
+            repo_key = str(repo.resolve())
+            source_base, sources = source_commits(loop_manager.git, repo, original_head, target)
+            self.assertEqual(len(sources), 4)
+            expected = {
+                'branch': branch, 'before_head': original_head,
+                'target_base_oid': target, 'remote_oid': None,
+                'affected_paths': journal.rebase_affected_paths(
+                    loop_manager.git, repo, original_head, target,
+                ),
+                'agent_session_id': None, 'evidence_version': 2,
+                'run_id': 'owned-run', 'source_base': source_base,
+                'source_commits': sources, 'checkpoint_generation': 1,
+                'pr_head_oid': None,
+            }
+            first = journal.begin_rebase(
+                state, owner='plan:G-099', repo=repo_key, target=repo_key,
+                before=loop_manager._owned_rebase_journal_state(repo, branch),
+                expected=expected,
+            )
+
+            def rebase(*args, identity):
+                environment = dict(os.environ)
+                environment['GIT_REFLOG_ACTION'] = f'loop-manager-rebase:{identity}'
+                environment['GIT_EDITOR'] = 'true'
+                return git('rebase', *args, check=False, env=environment)
+
+            started = rebase(target, identity=first)
+            self.assertNotEqual(started.returncode, 0)
+            conflict = loop_manager._owned_rebase_journal_state(repo, branch)
+            self.assertEqual(conflict['rebase_head'], sources[1])
+
+            def seal():
+                def validate(intent, observed):
+                    journal.rebase_replay_proof(loop_manager.git, state, intent, observed)
+                    if observed['metadata'] is None:
+                        marker = journal.rebase_completion_matches(
+                            loop_manager.git, repo, branch=branch,
+                            head=observed['head'], identity=intent['id'],
+                            target_base_oid=target,
+                        )
+                    else:
+                        marker = journal.rebase_conflict_matches(
+                            loop_manager.git, repo, head=observed['head'],
+                            identity=intent['id'],
+                        )
+                    ancestor = git(
+                        'merge-base', '--is-ancestor', target, observed['head'],
+                        check=False,
+                    ).returncode == 0
+                    return journal.verified_rebase_result(
+                        intent, observed, current_remote_oid=None,
+                        target_ancestor=ancestor, patches_preserved=False,
+                        reflog_marker=marker, replay_verified=True,
+                    )
+
+                return journal.complete_rebase(
+                    state, repo=repo_key, target=repo_key,
+                    observe=lambda: loop_manager._owned_rebase_journal_state(repo, branch),
+                    validate=validate,
+                    replay_proof=lambda intent, observed: journal.rebase_replay_proof(
+                        loop_manager.git, state, intent, observed,
+                    ),
+                )
+
+            self.assertTrue(seal())
+            resolved = changed_base.copy()
+            resolved[0] = 'value=resolved\n'
+            app.write_text(''.join(resolved), encoding='utf-8')
+            git('add', 'app.txt')
+            staged = loop_manager._owned_rebase_journal_state(repo, branch)
+            staged_tree = git('write-tree').stdout.strip()
+            continuation = journal.begin_rebase(
+                state, owner='plan:G-099', repo=repo_key, target=repo_key,
+                before=staged,
+                expected={
+                    **expected, 'checkpoint_generation': 2,
+                    'action': 'continue', 'source_commit': sources[1],
+                    'correction_turn': 'worker-turn-1',
+                    'staged_tree_oid': staged_tree,
+                    'stage_before_index': conflict['index'],
+                    'staged_index': staged['index'],
+                    'accepted_files': {'app.txt': staged['dirty']['app.txt'][1]},
+                },
+            )
+            continued = rebase('--continue', identity=continuation)
+            self.assertEqual(continued.returncode, 0, continued.stdout)
+            completed = loop_manager._owned_rebase_journal_state(repo, branch)
+            self.assertIsNone(completed['metadata'])
+            slot = journal._slot(state, repo_key, 'managed_rebase', repo_key)
+            self.assertTrue((slot / 'active.json').is_file())
+            self.assertFalse((slot / f'{continuation}.result.json').exists())
+
+            # Resume from durable Git and journal state after the completed command.
+            original_git = loop_manager.git
+
+            def read_only_recovery(path, *args, **kwargs):
+                if args and args[0] == 'rebase':
+                    raise AssertionError('completed rebase was invoked again')
+                return original_git(path, *args, **kwargs)
+
+            with mock.patch.object(loop_manager, 'git', side_effect=read_only_recovery):
+                self.assertTrue(seal())
+            intent = journal._read(slot / f'{continuation}.intent.json')
+            proof = journal.rebase_replay_proof(loop_manager.git, state, intent, completed)
+            self.assertEqual([item['outcome'] for item in proof],
+                             ['patch', 'resolved', 'patch', 'patch'])
+            self.assertEqual(proof[1]['tree'], staged_tree)
+            self.assertNotEqual(git('rev-parse', 'HEAD^{tree}').stdout.strip(), staged_tree)
+            self.assertEqual(app.read_text(encoding='utf-8').splitlines()[0],
+                             'value=resolved')
+            self.assertEqual(app.read_text(encoding='utf-8').splitlines()[12],
+                             'line-12-after-resolution')
+            self.assertEqual(app.read_text(encoding='utf-8').splitlines()[20],
+                             'line-20-after-resolution')
+            self.assertTrue(git('ls-tree', 'HEAD', 'app.txt').stdout.startswith('100755 '))
+            self.assertEqual(len(journal.verified_managed_transitions(
+                state, repo_key, 'plan:G-099', git=loop_manager.git,
+            )), 2)
 
 
 if __name__ == '__main__':

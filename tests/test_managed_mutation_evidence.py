@@ -106,8 +106,13 @@ class ManagedTransitionTests(unittest.TestCase):
         }, 'result': {'observed': {'registration': {
             'head': OLD, 'branch': f'refs/heads/{BRANCH}', 'locked': lock,
         }}}}
+        def journal_transitions(*_args, git=None, **_kwargs):
+            if git is None:
+                raise journal.MutationEvidenceError('v2 rebase requires Git observation')
+            return [transition]
+
         with mock.patch.object(journal, 'verified_managed_transitions',
-                               return_value=[transition]):
+                               side_effect=journal_transitions) as transitions:
             corrected = loop_manager._proven_recovered_worktree_baseline(
                 before, current, Path('/state'), Path('/repo'),
                 'G-091', Path('/worktree'),
@@ -125,6 +130,10 @@ class ManagedTransitionTests(unittest.TestCase):
                     before, current, Path('/state'), Path('/repo'),
                     'G-091', Path('/worktree'),
                 )
+            transitions.assert_called_with(
+                Path('/state'), str(Path('/repo').resolve()), 'plan:G-091',
+                git=loop_manager.git,
+            )
 
     def test_rebase_continuation_accepts_only_proven_worker_correction(self):
         before = {
