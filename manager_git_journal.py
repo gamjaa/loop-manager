@@ -15,7 +15,7 @@ from pathlib import Path
 import re
 import secrets
 from typing import Any
-from execution_checkpoint import rebase_preserves_worktree_files
+from execution_checkpoint import controlling_git_operation, rebase_preserves_worktree_files
 import managed_rebase_evidence as replay_evidence
 
 
@@ -409,7 +409,9 @@ def verified_rebase_result(
                      and accepted_correction)))
             and reflog_marker
             and (expected.get('evidence_version') != 2
-                 or ((observed.get('index_clean') and not observed.get('operations'))
+                 or ((observed.get('index_clean')
+                      and isinstance(observed.get('operations'), Mapping)
+                      and not controlling_git_operation(observed.get('operations')))
                      or (autostash_owned and observed.get('unmerged')
                          and not observed.get('metadata'))))
             and (expected.get('evidence_version') != 2
@@ -773,6 +775,20 @@ def verified_candidates(
     return candidates
 
 
+def _same_rebase_expectation(saved: object, current: Mapping[str, Any]) -> bool:
+    if saved == current:
+        return True
+    if not isinstance(saved, dict) or saved.get('evidence_version') != 2:
+        return False
+    old_generation = saved.get('checkpoint_generation')
+    new_generation = current.get('checkpoint_generation')
+    return (
+        type(old_generation) is int and type(new_generation) is int
+        and new_generation > old_generation
+        and saved == {**current, 'checkpoint_generation': old_generation}
+    )
+
+
 def begin_rebase(
     state_dir: Path, *, owner: str, repo: str, target: str,
     before: Mapping[str, Any], expected: Mapping[str, Any],
@@ -798,7 +814,7 @@ def begin_rebase(
             or prior.get("repo") != repo or prior.get("target") != target
             or _read(slot / f"{prior.get('id')}.intent.json") != prior
             or prior.get("owner") != owner or prior.get("before") != before
-            or prior.get("expected") != expected
+            or not _same_rebase_expectation(prior.get("expected"), expected)
         ):
             raise MutationEvidenceError("Manager rebase 활성 intent가 현재 작업과 다릅니다.")
         return str(prior["id"])

@@ -22,6 +22,71 @@ BRANCH = 'loop-manager/G-091'
 
 
 class ManagedTransitionTests(unittest.TestCase):
+    def test_v2_rebase_retry_keeps_intent_after_checkpoint_observation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            expected = {
+                'evidence_version': 2, 'run_id': 'same-run',
+                'checkpoint_generation': 3, 'branch': BRANCH,
+                'before_head': OLD, 'target_base_oid': NEW,
+                'remote_oid': OLD, 'source_commits': [OLD],
+                'agent_session_id': 'same-worker',
+            }
+            arguments = dict(state_dir=state, owner='plan:G-091',
+                             repo='/repo', target='/worktree', before={'head': OLD})
+            identity = journal.begin_rebase(**arguments, expected=expected)
+
+            self.assertEqual(journal.begin_rebase(
+                **arguments, expected={**expected, 'checkpoint_generation': 4},
+            ), identity)
+            for changed in (
+                {**expected, 'checkpoint_generation': 2},
+                {**expected, 'checkpoint_generation': 4, 'run_id': 'other-run'},
+                {**expected, 'checkpoint_generation': 4,
+                 'agent_session_id': 'other-worker'},
+            ):
+                with self.subTest(changed=changed), self.assertRaises(journal.MutationEvidenceError):
+                    journal.begin_rebase(**arguments, expected=changed)
+
+    def test_completed_rebase_accepts_stale_head_marker_but_rejects_active_operation(self):
+        before = {
+            'head': OLD, 'branch': BRANCH, 'ref': [OLD, ''],
+            'index': {}, 'dirty': {},
+            'registration': [f'HEAD={OLD}', f'branch=refs/heads/{BRANCH}'],
+            'metadata': None,
+        }
+        intent = {
+            'target': '/worktree', 'before': before,
+            'expected': {
+                'branch': BRANCH, 'before_head': OLD,
+                'target_base_oid': NEW, 'remote_oid': OLD,
+                'evidence_version': 2,
+            },
+        }
+        observed = {
+            **before, 'head': NEW, 'ref': [NEW, ''],
+            'registration': [f'HEAD={NEW}', f'branch=refs/heads/{BRANCH}'],
+            'operations': {'REBASE_HEAD': 'stale-marker'},
+            'index_clean': True, 'unmerged': False,
+        }
+        checks = dict(current_remote_oid=OLD, target_ancestor=True,
+                      patches_preserved=False, reflog_marker=True,
+                      replay_verified=True)
+
+        self.assertEqual(journal.verified_rebase_result(
+            intent, observed, **checks,
+        )['selected']['head'], NEW)
+        with self.assertRaises(journal.MutationEvidenceError):
+            journal.verified_rebase_result(
+                intent, {**observed, 'operations': {
+                    **observed['operations'], 'rebase-merge': 'active-marker',
+                }}, **checks,
+            )
+        with self.assertRaises(journal.MutationEvidenceError):
+            journal.verified_rebase_result(
+                intent, {**observed, 'operations': None}, **checks,
+            )
+
     def test_recovered_agent_baseline_accepts_only_journaled_lock_change(self):
         old_registration = (f'HEAD={OLD}', f'branch=refs/heads/{BRANCH}')
         lock = 'loop-manager-worktree:owned-token'

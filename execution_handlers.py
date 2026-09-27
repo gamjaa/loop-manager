@@ -1377,7 +1377,9 @@ class ExecutionHandlers:
             'files': {path: signature for path, (_, signature) in observed.dirty.items()},
         }
         if hasattr(observed, 'index'):
-            evidence['index'] = observed.index
+            evidence['index'] = {
+                path: list(entries) for path, entries in observed.index.items()
+            }
         return evidence
 
     def _stage_rebase_correction(self, context):

@@ -1595,7 +1595,7 @@ class ExecutionHandlerTests(TestCase):
         self.effects.agent.capture_git_snapshot.return_value = SimpleNamespace(
             head='owned-head', branch='loop-manager/G-047',
             dirty={'app.py': (('unstaged',), 'accepted-content')},
-            index={'app.py': ['H 100644 ' + 'a' * 40]},
+            index={'app.py': ('H 100644 ' + 'a' * 40,)},
         )
 
         self.assertEqual(self.handler._rebase_stage_evidence(self.context('WORKING')), {
