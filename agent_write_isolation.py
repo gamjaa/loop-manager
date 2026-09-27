@@ -64,7 +64,9 @@ def inspect_worktree(worktree: Path, state_dir: Path,
     try:
         selected = worktree.resolve(strict=True)
         state_root = state_dir.resolve(strict=True)
-        selected.relative_to(state_root / "worktrees")
+        runtime = selected.is_relative_to(state_root / "runtimes")
+        if not (selected.is_relative_to(state_root / "worktrees") or (read_only and runtime)):
+            raise IsolationError("Agent 경로가 허용된 관리 worktree가 아닙니다.")
         root = Path(_git(selected, "rev-parse", "--show-toplevel")).resolve(strict=True)
         if selected != root or worktree.absolute() != selected:
             raise IsolationError("Agent worktree 경로가 canonical 저장소 루트가 아닙니다.")
@@ -84,6 +86,8 @@ def inspect_worktree(worktree: Path, state_dir: Path,
                                   "--git-common-dir")).resolve(strict=True)
         if common != source_common or git_dir == common:
             raise IsolationError("Agent worktree의 shared Git identity가 일치하지 않습니다.")
+        if runtime:
+            _inspect_read_only_runtime(selected, state_root, source)
         origin = _git(selected, "remote", "get-url", "origin")
         identity = sha256((str(common) + "\0" + origin).encode()).hexdigest()
         return WorktreeBoundary(selected, source,
@@ -91,6 +95,18 @@ def inspect_worktree(worktree: Path, state_dir: Path,
                                 git_dir, common, identity)
     except (OSError, ValueError) as error:
         raise IsolationError("Agent worktree 등록·canonical 경로 확인 실패") from error
+
+
+def _inspect_read_only_runtime(selected: Path, state_root: Path, source: Path) -> None:
+    """Keep the bootstrap's exact-SHA, detached runtime boundary read-only."""
+    head = _git(selected, "rev-parse", "HEAD")
+    repository_id = sha256(str(source).encode()).hexdigest()[:16]
+    expected = state_root / "runtimes" / repository_id / head
+    if (len(head) not in (40, 64) or any(char not in "0123456789abcdef" for char in head)
+            or selected != expected
+            or _git(selected, "rev-parse", "--abbrev-ref", "HEAD") != "HEAD"
+            or _git(selected, "status", "--porcelain=v1", "--untracked-files=all")):
+        raise IsolationError("읽기 전용 runtime의 경로·exact SHA·detached·clean 상태가 일치하지 않습니다.")
 
 
 def _configuration_digest(provider: str, worktree: Path,
