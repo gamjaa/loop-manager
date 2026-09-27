@@ -1,0 +1,45 @@
+---
+id: G-097
+title: Provider Auto-Review Policy Enforcement
+sources:
+  - docs/requirements/[R-023] Self-Hosted Runtime Refresh Handoff.md
+depends_on:
+  - G-088
+complexity: high
+risk: critical
+priority: critical
+---
+
+## Purpose
+
+G-088 establishes verifiable Agent write isolation, but R-023 also requires Codex and Claude to retain automatic approval review within that boundary. Current Codex calls use `--approve-for-me` for writing roles and Claude calls use `acceptEdits`; neither call proves that the required review policy is active. Enforce the architecture-defined review policy for every role and invocation without expanding workspace permissions.
+
+## Acceptance Criteria
+
+- New and resumed Planner, maintenance Planner, Worker and Reviewer calls use the G-088 verified workspace policy together with an effective provider auto-review policy. The selected worktree, role, provider, CLI version, model/account eligibility, merged settings and invocation identity are checked for each call; a command-line flag alone is not proof that review remains active.
+- Codex uses `approvals_reviewer="auto_review"` with granular approval policy that rejects sandbox escalation and `request_permissions`, while preserving review of other eligible approval categories. `--approve-for-me`, `approval_policy="never"`, inherited configuration or a resume path must not silently replace that policy. Reviewer remains read-only.
+- Claude uses supported `auto` permission mode rather than `acceptEdits` as a substitute for automatic review. Effective settings keep the G-088 sandbox active, reject unsandboxed reruns and write-boundary expansion, and do not blanket-approve sandboxed Bash commands. The Reviewer keeps its read-only tool restrictions.
+- When provider, CLI version, model/account, operating system, merged settings, sandbox initialization or session resume cannot satisfy and confirm both policies, the Agent call stops before unreviewed work. It records a specific non-secret reason and preserves the current session, workspace, work product and retry state. Unsupported Claude native Windows does not fall back to a weaker mode or new infrastructure.
+- Provider auto-review is separate from Loop Manager's read-only Reviewer after Worker verification. The policy does not claim that every action inside the sandbox receives an approval review, and it does not weaken existing role-specific file-diff, Git scope, publication or PR ownership checks.
+
+## Implementation
+
+- Put effective approval-policy construction and validation beside G-088's provider invocation boundary, with a narrow role-independent policy result consumed by the Codex and Claude adapters. Apply it on initial calls, session resume and session-unavailable fallback; check the installed CLI and official provider documentation for supported settings before relying on them.
+- Replace the convenience Codex and Claude modes in `loop_manager.py` with explicit settings that preserve automatic review and G-088's write restrictions. Reject inherited/profile/session overrides or unsupported modes when the effective policy cannot be confirmed. Keep any policy evidence bound to G-088's per-call isolation record without storing secrets or source checkout contents.
+- Handle configuration rejection, classifier unavailability and denied out-of-scope actions through the existing safe Agent failure boundary. Do not retry with broader write access, disabled review, `acceptEdits` or unsandboxed execution. Keep the existing Worker-result Reviewer stage unchanged.
+
+## Validation
+
+- Worker runs the directly affected provider-argument and policy targeted unit tests in `tests/test_agent_invocation.py` and `tests/test_loop_manager.py` only.
+- Cover Codex and Claude initial, resumed and fallback calls for writing roles and Reviewer; eligible automatic review with forbidden escalation, unsupported CLI/model/account/OS or conflicting inherited settings, review failure, and preservation of state without weaker-mode retry. Assert that review and workspace isolation are both effective, while in-sandbox actions are not incorrectly represented as universally reviewed.
+- Full verify must preserve G-088 isolation, existing Git-scope safety, Agent session recovery, Worker targeted-test ownership and Loop Manager's independent Reviewer and publication gates.
+
+## Progress
+
+- [ ] Effective provider auto-review policy and per-call validation
+- [ ] Fail-closed invocation and resume behavior
+- [ ] Focused provider-policy regression tests
+
+## Decision Log
+
+- R-023 and `docs/ARCHITECTURE.md` already specify automatic approval review alongside workspace isolation. This plan covers that separate missing contract after G-088; it does not change the approved architecture or grant Agent Git writes.

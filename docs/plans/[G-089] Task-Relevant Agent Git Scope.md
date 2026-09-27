@@ -5,6 +5,7 @@ sources:
   - docs/requirements/[R-023] Self-Hosted Runtime Refresh Handoff.md
 depends_on:
   - G-088
+  - G-097
 complexity: high
 risk: critical
 priority: critical
