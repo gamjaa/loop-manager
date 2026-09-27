@@ -222,6 +222,8 @@ class RecoveryRepository:
                 "unresolved": decision.unresolved,
                 "user_targets": list(observation.user_targets),
             }
+            if observation.worker_decision is not None:
+                evidence["worker_decision"] = observation.worker_decision
         values = (
             observation.identity, observation.reason.value,
             decision.disposition.value, decision.action.value,

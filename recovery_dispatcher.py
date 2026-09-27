@@ -40,6 +40,7 @@ class RecoveryDispatcher:
         correction_limit: int | None = None,
         attempts: int = 0,
         final_block_reason: BlockReasonCode | None = None,
+        worker_result: str | None = None,
     ) -> RecoveryDecision:
         with runtime_state._transaction(self.connection):
             decision = RecoveryRepository(self.connection).observe(
@@ -57,11 +58,15 @@ class RecoveryDispatcher:
                         recovery_decision=decision,
                     )
                 else:
+                    block_kwargs = {
+                        "reason": decision.block_reason,
+                        "recovery_decision": decision,
+                    }
+                    if worker_result is not None:
+                        block_kwargs["worker_result"] = worker_result
                     self.block_worktree(
                         observation.repo, worktree,
-                        observation.detail, verify_result,
-                        reason=decision.block_reason,
-                        recovery_decision=decision,
+                        observation.detail, verify_result, **block_kwargs,
                     )
             else:
                 assert decision.disposition is not RecoveryDisposition.USER_ACTION_REQUIRED

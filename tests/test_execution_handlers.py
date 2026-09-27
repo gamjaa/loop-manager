@@ -29,6 +29,7 @@ from tests.test_guidance_approval import guidance_plan
 from tests.test_blocked_checkpoint import BlockedCheckpointGitAdapterTest
 import blocked_checkpoint_state
 from worker_session import SessionBinding, SessionTransition
+from tests.test_worker_outcome import decision as worker_decision
 
 
 class ExecutionHandlerTests(TestCase):
@@ -410,6 +411,8 @@ class ExecutionHandlerTests(TestCase):
             self.handler.run(self.context())
             second_prompt = self.effects.agent.run_agent.call_args.args[5]
         self.assertIn('verify:fingerprint occurrence=1 revision=1', first_prompt)
+        self.assertIn('WORKER_OUTCOME:', first_prompt)
+        self.assertIn('needs_user_decision', second_prompt)
         self.assertEqual(first_prompt.count('first failure'), 1)
         self.assertNotIn('private raw prelude', first_prompt)
         self.assertNotIn('first failure', second_prompt)
@@ -1071,6 +1074,173 @@ class ExecutionHandlerTests(TestCase):
         self.assertEqual(self.connection.execute(
             "SELECT COUNT(*) FROM validation_delivery_attempts WHERE status='delivered'"
         ).fetchone()[0], 0)
+
+    def _decision_workspace(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        worktree = Path(directory.name)
+        plan_path = worktree / 'docs/plans/[G-047] Runtime.md'
+        plan_path.parent.mkdir(parents=True)
+        plan_path.write_text('# Runtime\n## Decision Log\n', encoding='utf-8')
+        product = worktree / 'docs/PRODUCT.md'
+        product.parent.mkdir(parents=True, exist_ok=True)
+        product.write_text('# Product\n## User approval\n', encoding='utf-8')
+        architecture = worktree / 'docs/ARCHITECTURE.md'
+        architecture.write_text('# Architecture\n## Architecture Change Policy\n',
+                                encoding='utf-8')
+        self.state.update_project('repo', worktree=str(worktree))
+        self.effects.agent.begin_agent_scope.side_effect = lambda *_args, **_kwargs: (
+            self.state.update_project(
+                'repo', agent_role='worker', agent_snapshot='before-scope',
+                agent_input_fingerprint='remote-input',
+            ) or 'before-scope'
+        )
+        self.effects.agent._revision_execplan_input_fingerprint.return_value = 'remote-input'
+        self.effects.blocking.block_active_execplan.side_effect = (
+            lambda *args, **kwargs: lm.block_active_execplan(
+                self.connection, *args, **kwargs,
+            )
+        )
+        return worktree
+
+    def test_worker_decision_blocks_before_publication_and_keeps_failure_history(self):
+        self._decision_workspace()
+        message = worker_decision()
+        self.effects.agent.run_agent.side_effect = lambda *_args, **kwargs: (
+            kwargs['on_session_started']('session') or
+            lm.AgentResult(0, message, session_id='session')
+        )
+        self.connection.execute(
+            "UPDATE exec_plans SET verify_failure_history = ?, "
+            "review_failure_history = ?, effective_worker_level = 7 "
+            "WHERE repo = 'repo' AND plan_id = 'G-047'",
+            ('{"verify":2}', '{"review":3}'),
+        )
+        self.connection.commit()
+        with mock.patch.object(lm, 'capture_git_snapshot') as snapshot:
+            snapshot.return_value.serialize.return_value = 'after-scope'
+            result = self.handler.run(self.context())
+
+        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        blocked = self.repository.get('repo', 'G-047')
+        self.assertEqual(blocked.status, 'PLAN_BLOCKED')
+        row = self.connection.execute(
+            "SELECT blocked_reason, blocked_fingerprint, worker_result, "
+            "worker_session_id, agent_snapshot, agent_result_snapshot, "
+            "verify_failure_history, review_failure_history, effective_worker_level "
+            "FROM exec_plans WHERE repo = 'repo' AND plan_id = 'G-047'"
+        ).fetchone()
+        self.assertEqual(row['blocked_reason'], 'user_decision_required')
+        self.assertEqual(row['blocked_fingerprint'], 'remote-input')
+        self.assertEqual(row['worker_result'], message)
+        self.assertEqual(row['worker_session_id'], 'session')
+        self.assertEqual(row['agent_snapshot'], 'before-scope')
+        self.assertEqual(row['agent_result_snapshot'], 'after-scope')
+        self.assertEqual(row['verify_failure_history'], '{"verify":2}')
+        self.assertEqual(row['review_failure_history'], '{"review":3}')
+        self.assertEqual(row['effective_worker_level'], 7)
+        recovery = self.connection.execute(
+            "SELECT final_evidence FROM recovery_records WHERE repo = 'repo' "
+            "AND subject = 'G-047'"
+        ).fetchone()
+        self.assertEqual(json.loads(recovery[0])['worker_decision']['question'],
+                         '이 변경을 승인합니까?')
+        self.effects.validation.parse_worker_result.assert_not_called()
+        self.effects.validation.verify.assert_not_called()
+        self.effects.agent.clear_agent_scope.assert_not_called()
+        self.assertNotIn('commit', self.calls)
+
+    def test_worker_decision_without_file_change_bypasses_no_change_gate(self):
+        self._decision_workspace()
+        self.dirty = False
+        self.effects.workspace.branch_has_changes.return_value = False
+        message = worker_decision()
+        self.effects.agent.run_agent.side_effect = lambda *_args, **kwargs: (
+            kwargs['on_session_started']('session') or
+            lm.AgentResult(0, message, session_id='session')
+        )
+        with mock.patch.object(lm, 'capture_git_snapshot') as snapshot:
+            snapshot.return_value.serialize.return_value = 'unchanged-scope'
+            result = self.handler.run(self.context())
+        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertEqual(self.connection.execute(
+            "SELECT blocked_reason FROM exec_plans WHERE repo = 'repo' "
+            "AND plan_id = 'G-047'"
+        ).fetchone()[0], 'user_decision_required')
+        self.effects.validation.parse_worker_result.assert_not_called()
+        self.effects.validation.verify.assert_not_called()
+
+    def test_malformed_worker_outcome_enters_protocol_correction(self):
+        self.effects.agent.run_agent.side_effect = lambda *_args, **kwargs: (
+            kwargs['on_session_started']('session') or
+            lm.AgentResult(0, 'WORKER_OUTCOME: {bad}', session_id='session')
+        )
+        result = self.handler.run(self.context())
+        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(self.repository.get('repo', 'G-047').status, 'IMPLEMENTING')
+        self.effects.validation.parse_worker_result.assert_not_called()
+        self.effects.blocking.block_active_execplan.assert_not_called()
+
+    def test_saved_rebase_decision_blocks_before_stage(self):
+        self._decision_workspace()
+        message = worker_decision()
+        self.state.update_project(
+            'repo', agent_role='worker', agent_snapshot='before-scope',
+            agent_input_fingerprint='remote-input',
+        )
+        saved = SimpleNamespace(
+            scope_marker='same', worker_code=0, worker_result=message,
+            generation=1,
+        )
+        context = replace(self.context(), resolving_rebase=True)
+        with mock.patch.object(lm, 'capture_git_snapshot') as snapshot:
+            snapshot.return_value.serialize.return_value = 'after-scope'
+            result = self.handler._resume_saved_rebase_worker(
+                context, saved, SimpleNamespace(progress='same'),
+            )
+        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertEqual(self.repository.get('repo', 'G-047').status, 'PLAN_BLOCKED')
+        self.effects.validation.parse_worker_result.assert_not_called()
+        self.effects.agent.clear_agent_scope.assert_not_called()
+        self.assertNotIn('add', self.calls)
+
+    def test_saved_verifying_decision_blocks_before_commit_and_verify(self):
+        self._decision_workspace()
+        message = worker_decision()
+        self.state.update_project(
+            'repo', phase='VERIFYING', worker_result=message,
+            agent_role=None, agent_snapshot=None, agent_input_fingerprint=None,
+        )
+        with mock.patch.object(lm, 'capture_git_snapshot') as snapshot:
+            snapshot.return_value.serialize.return_value = 'after-scope'
+            result = self.handler.verify(self.context(), None)
+        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertEqual(self.repository.get('repo', 'G-047').status, 'PLAN_BLOCKED')
+        self.assertEqual(self.connection.execute(
+            "SELECT blocked_fingerprint FROM exec_plans WHERE repo = 'repo' "
+            "AND plan_id = 'G-047'"
+        ).fetchone()[0], 'remote-input')
+        self.effects.validation.parse_worker_result.assert_not_called()
+        self.effects.validation.verify.assert_not_called()
+        self.assertNotIn('add', self.calls)
+
+    def test_saved_decision_blocks_revision_refresh_before_checkpoint_commit(self):
+        self._decision_workspace()
+        message = worker_decision()
+        self.state.update_project(
+            'repo', phase='VERIFYING', worker_result=message,
+            agent_role=None, agent_snapshot=None, agent_input_fingerprint=None,
+        )
+        with mock.patch.object(lm, 'capture_git_snapshot') as snapshot:
+            snapshot.return_value.serialize.return_value = 'after-scope'
+            result = self.handler._refresh_revision_base(
+                self.context(), None, None, 'new-base',
+            )
+        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertEqual(self.repository.get('repo', 'G-047').status, 'PLAN_BLOCKED')
+        self.effects.validation.parse_worker_result.assert_not_called()
+        self.assertNotIn('add', self.calls)
+        self.assertNotIn('commit', self.calls)
 
     def test_failed_fallback_start_reuses_recovery_prompt_on_next_turn(self):
         feedback = ValidationFeedbackRepository(self.connection)

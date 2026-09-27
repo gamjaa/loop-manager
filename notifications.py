@@ -643,6 +643,10 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
             "checkpoint": checkpoint,
             "recovery": recovery_evidence,
         }
+        if recovery_evidence is not None and isinstance(
+            recovery_evidence.get("worker_decision"), dict
+        ):
+            payload["worker_decision"] = recovery_evidence["worker_decision"]
         if deadlock is not None:
             payload["specification_deadlock"] = {
                 "kind": deadlock.kind,
@@ -1082,6 +1086,8 @@ def _message(kind: str, payload: dict[str, object]) -> str:
             + (f"\nFiles to edit:\n{paths}" if paths else "")
             + (f"\nQuestion: {payload['specification_deadlock']['question']}"
                if payload.get('specification_deadlock') else "")
+            + (f"\nQuestion: {payload['worker_decision']['question']}"
+               if payload.get('worker_decision') else "")
             + checkpoint_text
         )
     if kind == "persistent_execution_failure":
