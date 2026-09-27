@@ -5,10 +5,12 @@ from pathlib import Path
 import tempfile
 import io
 import json
-from unittest import TestCase, mock
+from unittest import TestCase, mock, skipUnless
 
 import agent_invocation as invocation
 import agent_write_isolation as isolation
+import agent_codex_sandbox as envelope
+import agent_sandbox_exec as gate
 import agent_invocation_state as state
 import agent_provider_usage as provider_usage
 import loop_manager as manager
@@ -42,6 +44,8 @@ class WriteIsolationTests(TestCase):
 
             with mock.patch.object(isolation, '_git', side_effect=git):
                 boundary = isolation.inspect_worktree(selected, state_root)
+                with self.assertRaises(isolation.IsolationError):
+                    isolation.inspect_worktree(source, state_root, read_only=True)
                 self.assertEqual((boundary.worktree, boundary.source,
                                   boundary.common_dir), (selected, source, common))
                 alias = selected.parent / 'alias'
@@ -139,7 +143,7 @@ class WriteIsolationTests(TestCase):
                                                  str(root / 'source'), False,
                                                  lambda: 'snapshot')
 
-    def test_command_probe_cannot_verify_codex_file_tool_boundary(self):
+    def test_full_cli_probe_binds_new_configuration_and_resume(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             provider_home = root / 'codex-home'
@@ -149,25 +153,23 @@ class WriteIsolationTests(TestCase):
             boundary = isolation.WorktreeBoundary(root, root / 'source', (),
                                                    root / 'git', root / 'common', 'repository')
             records = []
+            launch = mock.Mock(prefix=('native', 'envelope'), arguments=('inner',))
             with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(provider_home)}), \
                  mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
-                 mock.patch.object(isolation, '_codex_probe') as probe, \
+                 mock.patch.object(isolation, 'prepare_launch', return_value=launch), \
                  mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
                  mock.patch.object(isolation.subprocess, 'run', return_value=
                                    manager.subprocess.CompletedProcess(
                                        ['codex', '--version'], 0, 'codex version\n', '')):
-                with self.assertRaisesRegex(isolation.IsolationError, '파일 도구'):
-                    isolation.prepare_isolation(
+                for session in (None, 'resume-session'):
+                    result = isolation.prepare_isolation(
                         'codex', 'worker', root, root, False, records.append,
-                        lambda: 'snapshot', expected_repository=str(root / 'source'))
-                config.write_text('model = "second"\n', encoding='utf-8')
-                with self.assertRaisesRegex(isolation.IsolationError, '파일 도구'):
-                    isolation.prepare_isolation(
-                        'codex', 'worker', root, root, False, records.append,
-                        lambda: 'snapshot', expected_repository=str(root / 'source'))
-            self.assertEqual(probe.call_count, 2)
-            self.assertEqual([record.status for record in records], ['rejected', 'rejected'])
-            self.assertTrue(all('새 파일 생성·삭제' in record.reason for record in records))
+                        lambda: 'snapshot', expected_repository=str(root / 'source'),
+                        session_id=session, environment_variables={})
+                    self.assertIs(result, launch)
+                    config.write_text('model = "second"\n', encoding='utf-8')
+            self.assertEqual(launch.probe.call_count, 2)
+            self.assertEqual([record.status for record in records], ['verified', 'verified'])
             self.assertNotEqual(records[0].policy_digest, records[1].policy_digest)
             self.assertEqual(records[0].repository_identity, 'repository')
 
@@ -187,7 +189,7 @@ class WriteIsolationTests(TestCase):
             prior.write_text('previous result', encoding='utf-8')
             with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(provider_home)}), \
                  mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
-                 mock.patch.object(isolation, '_codex_probe') as probe, \
+                 mock.patch.object(isolation, 'prepare_launch', side_effect=RuntimeError('파일 도구 경계 미확인')) as probe, \
                  mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
                  mock.patch.object(manager, 'capture_git_snapshot', return_value=
                                    mock.Mock(serialize=lambda: 'snapshot')), \
@@ -213,91 +215,28 @@ class WriteIsolationTests(TestCase):
             self.assertEqual(proof[2], 'exception')
             self.assertEqual(prior.read_text(encoding='utf-8'), 'previous result')
 
-    def test_codex_probe_requires_allowed_selected_and_denied_external_paths(self):
+    def test_resume_rechecks_envelope_and_records_rejection_on_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            selected = root / 'selected'
-            source = root / 'source'
-            other = root / 'other'
-            git_dir = root / 'git-worktree'
-            common = root / 'common'
-            for path in (selected, source, other, git_dir, common):
-                path.mkdir()
-            for path in (source / 'file', other / 'file', git_dir / 'HEAD',
-                         common / 'HEAD', selected / 'file', selected / '.git'):
-                path.write_text('unchanged', encoding='utf-8')
-            boundary = isolation.WorktreeBoundary(
-                selected, source, (other,), git_dir, common, 'repository')
-            observed = []
-
-            def probe(command, **_kwargs):
-                paths = json.loads(command[-1])
-                observed.append(paths)
-                result = {name: 'denied' if name != 'selected' else 'allowed'
-                          for name in paths}
-                return manager.subprocess.CompletedProcess(
-                    command, 0, json.dumps(result), '')
-
-            with mock.patch.object(isolation, '_existing_writable_file',
-                                   side_effect=lambda path: path / 'file'), \
-                 mock.patch.object(isolation.subprocess, 'run', side_effect=probe):
-                isolation._codex_probe(boundary, False, ())
-            self.assertIn('source', observed[0])
-            self.assertIn('other_0', observed[0])
-            self.assertIn('shared_git', observed[0])
-            self.assertIn('worktree_pointer', observed[0])
-            self.assertIn('slash_tmp', observed[0])
-            self.assertEqual((source / 'file').read_text(encoding='utf-8'), 'unchanged')
-
-            def readonly(command, **_kwargs):
-                paths = json.loads(command[-1])
-                observed.append(paths)
-                return manager.subprocess.CompletedProcess(
-                    command, 0, json.dumps({name: 'denied' for name in paths}), '')
-
-            with mock.patch.object(isolation, '_existing_writable_file',
-                                   side_effect=lambda path: path / 'file'), \
-                 mock.patch.object(isolation.subprocess, 'run', side_effect=readonly):
-                isolation._codex_probe(boundary, True, ())
-            self.assertEqual(observed[-1]['selected'], str(selected / 'file'))
-
-            def escaped(command, **_kwargs):
-                paths = json.loads(command[-1])
-                result = {name: 'denied' if name != 'selected' else 'allowed'
-                          for name in paths}
-                result['shared_git'] = 'allowed'
-                return manager.subprocess.CompletedProcess(
-                    command, 0, json.dumps(result), '')
-
-            with mock.patch.object(isolation, '_existing_writable_file',
-                                   side_effect=lambda path: path / 'file'), \
-                 mock.patch.object(isolation.subprocess, 'run', side_effect=escaped):
-                with self.assertRaisesRegex(isolation.IsolationError, '경계가 일치'):
-                    isolation._codex_probe(boundary, False, ())
-
-            (selected / '.git').unlink()
-            (selected / '.git').mkdir()
-            with mock.patch.object(isolation, '_existing_writable_file',
-                                   side_effect=lambda path: path / 'file'), \
-                 mock.patch.object(isolation.subprocess, 'run', side_effect=readonly):
-                isolation._codex_probe(boundary, True, ())
-            self.assertNotIn('worktree_pointer', observed[-1])
-
-    def test_resume_with_uninspectable_session_grants_records_rejection(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            home = root / 'home'
+            home.mkdir()
             boundary = isolation.WorktreeBoundary(root, root / 'source', (),
                                                    root / 'git', root / 'common', 'repo')
             records = []
-            with mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
+            launch = mock.Mock(prefix=('native',))
+            launch.probe.side_effect = RuntimeError('sandbox unavailable')
+            with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
+                 mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
                  mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
-                 mock.patch.object(isolation, '_codex_probe') as probe:
-                with self.assertRaisesRegex(isolation.IsolationError, '재개 session'):
+                 mock.patch.object(isolation, 'prepare_launch', return_value=launch), \
+                 mock.patch.object(isolation.subprocess, 'run', return_value=
+                                   manager.subprocess.CompletedProcess([], 0, 'version', '')):
+                with self.assertRaisesRegex(isolation.IsolationError, 'sandbox unavailable'):
                     isolation.prepare_isolation(
                         'codex', 'worker', root, root, False, records.append,
                         lambda: 'snapshot', expected_repository=str(root / 'source'),
-                        session_id='prior-session')
-            probe.assert_not_called()
+                        session_id='prior-session', environment_variables={})
+            launch.probe.assert_called_once()
             self.assertEqual(records[0].status, 'rejected')
 
     def test_unsupported_provider_records_rejection_without_launch(self):
@@ -323,7 +262,7 @@ class WriteIsolationTests(TestCase):
             records = []
             with mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
                  mock.patch.object(isolation.platform, 'system', return_value='Windows'), \
-                 mock.patch.object(isolation, '_codex_probe') as probe:
+                 mock.patch.object(isolation, 'prepare_launch') as probe:
                 with self.assertRaisesRegex(isolation.IsolationError, 'Windows'):
                     isolation.prepare_isolation(
                         'codex', 'worker', root, root, False, records.append,
@@ -478,6 +417,322 @@ class WriteIsolationTests(TestCase):
         self.assertEqual(row, ('invalidated', 'agent_attempt_interrupted'))
         self.assertFalse(ledger.verified_invocation(identity, session_id='saved-session',
                                                     expected=evidence))
+
+
+@skipUnless(isolation.platform.system() == "Linux", "native mount proof requires Linux")
+class NativeWriteIsolationTests(TestCase):
+    def boundary(self, root):
+        state_root = root / 'state'
+        selected = state_root / 'worktrees' / 'project' / 'G-088'
+        source = root / 'source'
+        other = root / 'other'
+        common = source / '.git'
+        git_dir = common / 'worktrees' / 'G-088'
+        home = root / 'user-codex'
+        for path in (selected, other, git_dir, home):
+            path.mkdir(parents=True)
+        (selected / '.git').write_text('gitdir: ' + str(git_dir))
+        for path in (common / 'HEAD', git_dir / 'HEAD'):
+            path.write_text('ref: refs/heads/main\n')
+        (home / 'auth.json').write_text('private-auth-placeholder')
+        (home / 'config.toml').write_text('model="test"\n')
+        return isolation.WorktreeBoundary(selected, source, (other,), git_dir, common,
+                                         'repository'), state_root, home
+
+    def test_native_envelope_keeps_auth_read_only_and_limits_runtime_roots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            boundary, state_root, home = self.boundary(Path(directory))
+            environment = {'CODEX_HOME': str(home), 'PATH': '/bin'}
+            launch = envelope.prepare_launch(boundary, state_root, 'worker', False,
+                                             isolation.codex_arguments(False), environment)
+            self.assertEqual(environment['CODEX_HOME'], str(home))
+            scoped_home = Path(launch.environment['CODEX_HOME'])
+            self.assertTrue((scoped_home / 'auth.json').is_symlink())
+            self.assertEqual((scoped_home / 'auth.json').resolve(), home / 'auth.json')
+            policy = json.loads(launch.specification)
+            self.assertEqual(set(policy['writable']),
+                             {str(scoped_home), str(launch.attempt), str(boundary.worktree)})
+            self.assertIn(str(home), policy['protected'])
+            self.assertIn(str(boundary.common_dir), policy['protected'])
+            self.assertIn(str(boundary.other_worktrees[0]), policy['protected'])
+            self.assertIn(str(boundary.worktree / '.git'), policy['protected'])
+            self.assertIn('sandbox_workspace_write.network_access=true', launch.prefix)
+            self.assertIn('sandbox_workspace_write.network_access=false', launch.arguments)
+            second = envelope.prepare_launch(boundary, state_root, 'worker', False,
+                                              launch.arguments, environment)
+            self.assertEqual(launch.runtime, second.runtime)
+            self.assertNotEqual(launch.attempt, second.attempt)
+            reviewer = envelope.prepare_launch(boundary, state_root, 'reviewer', True,
+                                                isolation.codex_arguments(True), environment)
+            self.assertNotEqual(launch.runtime, reviewer.runtime)
+            self.assertNotIn(str(boundary.worktree), json.loads(reviewer.specification)['writable'])
+            self.assertIn(str(boundary.worktree), json.loads(reviewer.specification)['protected'])
+
+    def test_runtime_alias_and_replaced_auth_link_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            boundary, state_root, home = self.boundary(root)
+            environment = {'CODEX_HOME': str(home)}
+            launch = envelope.prepare_launch(boundary, state_root, 'worker', False, (), environment)
+            auth = Path(launch.environment['CODEX_HOME']) / 'auth.json'
+            auth.unlink()
+            auth.write_text('replaced')
+            with self.assertRaisesRegex(RuntimeError, '읽기 전용 연결'):
+                envelope.prepare_launch(boundary, state_root, 'worker', False, (), environment)
+            alias = root / 'alias'
+            alias.symlink_to(launch.runtime, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, '소유권'):
+                envelope._owned_directory(alias)
+
+    def test_preexisting_hardlink_alias_is_rejected_without_content_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source'
+            selected = root / 'selected'
+            source.mkdir()
+            selected.mkdir()
+            secret = source / 'local-only'
+            secret.write_bytes(b'preserved')
+            (selected / 'alias').hardlink_to(secret)
+            with self.assertRaisesRegex(gate.BoundaryError, 'hardlink'):
+                gate.check_hardlinks([selected])
+            self.assertEqual(secret.read_bytes(), b'preserved')
+            (selected / 'alias').unlink()
+            gate.check_hardlinks([selected])
+
+    def test_runtime_overlap_is_rejected_before_source_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            boundary, _state_root, home = self.boundary(Path(directory))
+            before = set(boundary.source.iterdir())
+            with self.assertRaisesRegex(RuntimeError, '보호 경로가 겹칩니다'):
+                envelope.prepare_launch(boundary, boundary.source, 'worker', False, (),
+                                        {'CODEX_HOME': str(home)})
+            self.assertEqual(set(boundary.source.iterdir()), before)
+            self.assertFalse((boundary.source / 'agent-runtime').exists())
+
+    def test_failed_proof_and_unknown_probe_output_do_not_verify(self):
+        launch = envelope.CodexLaunch((), ('codex', 'sandbox'), {}, Path('/runtime'),
+                                     Path('/attempt'), '{}')
+        for code, output in ((1, ''), (0, '{}'), (0, 'agent-write-boundary-v1 extra')):
+            with self.subTest(code=code, output=output), \
+                 mock.patch.object(envelope.subprocess, 'run', return_value=
+                                   manager.subprocess.CompletedProcess([], code, output, '')):
+                with self.assertRaisesRegex(RuntimeError, '확인할 수 없습니다'):
+                    launch.probe()
+
+    def test_mount_proof_rejects_writable_root_submount_and_git_pointer(self):
+        writable = [Path('/work'), Path('/runtime')]
+        protected = [Path('/source'), Path('/common'), Path('/work/.git')]
+        mounts = [(Path('/'), True, 'ext4'), (Path('/work'), False, 'ext4'),
+                  (Path('/runtime'), False, 'ext4'), (Path('/work/.git'), True, 'ext4')]
+        gate.check_mounts(mounts, writable, protected)
+        for invalid in (
+            [(Path('/'), False, 'ext4'), *mounts[1:]],
+            [*mounts, (Path('/source/subdir'), False, 'ext4')],
+            [*mounts[:-1], (Path('/work/.git'), False, 'ext4')],
+            [*mounts, (Path('/tmp'), False, 'tmpfs')],
+            [*mounts, (Path('/unexpected'), False, 'ext4')],
+        ):
+            with self.subTest(mounts=invalid), self.assertRaises(gate.BoundaryError):
+                gate.check_mounts(invalid, writable, protected)
+
+    def test_mount_parser_preserves_escaped_paths_and_per_mount_readonly(self):
+        mounts = gate.mount_table(
+            '1 0 8:1 / / ro,relatime - ext4 /dev/root rw\n'
+            '2 1 8:1 /work /with\\040space rw,relatime - ext4 /dev/root rw\n')
+        self.assertEqual(mounts, [(Path('/'), True, 'ext4'),
+                                  (Path('/with space'), False, 'ext4')])
+
+    def test_same_gate_must_pass_before_provider_exec(self):
+        specification = json.dumps({'worktree': '/selected'})
+        with mock.patch.object(gate.sys, 'argv', ['gate', specification, 'codex', 'exec']), \
+             mock.patch.object(gate, 'check_boundary') as check, \
+             mock.patch.object(gate.os, 'chdir') as chdir, \
+             mock.patch.object(gate.os, 'execvpe') as execute:
+            gate.main()
+            check.assert_called_once_with({'worktree': '/selected'})
+            chdir.assert_called_once_with('/selected')
+            execute.assert_called_once_with('codex', ['codex', 'exec'], gate.os.environ)
+            execute.reset_mock()
+            check.side_effect = gate.BoundaryError('unproven')
+            with mock.patch.object(gate.sys, 'stderr', io.StringIO()):
+                self.assertEqual(gate.main(), 125)
+            execute.assert_not_called()
+
+    def test_source_readonly_failure_never_attempts_mutation(self):
+        specification = {'writable': [], 'protected': ['/source'], 'files': ['/source/file']}
+        with mock.patch.object(gate.Path, 'read_text', side_effect=[
+                '1 0 8:1 / / ro - ext4 root rw\n',
+                'CapEff:\t00000000\nNoNewPrivs:\t1\n']), \
+             mock.patch.object(gate.os, 'readlink', return_value='mnt:[1]'), \
+             mock.patch.object(gate.Path, 'exists', return_value=True), \
+             mock.patch.object(gate.os, 'statvfs', return_value=mock.Mock(f_flag=0)), \
+             mock.patch.object(gate.os, 'open') as write_open, \
+             mock.patch.object(gate.tempfile, 'TemporaryDirectory') as scratch:
+            with self.assertRaisesRegex(gate.BoundaryError, 'not read-only'):
+                gate.check_boundary(specification)
+            write_open.assert_not_called()
+            scratch.assert_not_called()
+
+    def test_writable_probe_creates_updates_renames_and_removes_only_scratch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source'
+            selected = root / 'selected'
+            source.mkdir()
+            selected.mkdir()
+            preserved = source / 'local-only'
+            preserved.write_bytes(b'unchanged')
+            specification = {'writable': [str(selected)], 'protected': [str(source)], 'files': []}
+            with mock.patch.object(gate.Path, 'read_text', side_effect=[
+                    '1 0 8:1 / / ro - ext4 root rw\n'
+                    f'2 1 8:1 / {selected} rw - ext4 root rw\n',
+                    'CapEff:\t0\nNoNewPrivs:\t1\n']), \
+                 mock.patch.object(gate.os, 'readlink', return_value='mnt:[1]'), \
+                 mock.patch.object(gate.os, 'statvfs', return_value=mock.Mock(f_flag=gate.os.ST_RDONLY)):
+                gate.check_boundary(specification)
+            self.assertEqual(list(selected.iterdir()), [])
+            self.assertEqual(preserved.read_bytes(), b'unchanged')
+            self.assertEqual(list(source.iterdir()), [preserved])
+
+    def test_actual_adapter_wraps_roles_and_resume_and_persists_evidence(self):
+        for role, read_only, session in (('planner', False, None), ('worker', False, 'saved'),
+                                        ('reviewer', True, None), ('maintenance', False, None)):
+            with self.subTest(role=role), tempfile.TemporaryDirectory() as directory:
+                boundary, state_root, home = self.boundary(Path(directory))
+                connection = sqlite3.connect(':memory:')
+                self.addCleanup(connection.close)
+                state.ensure_schema(connection)
+                commands = []
+
+                def run(command, **kwargs):
+                    if command == ['codex', '--version']:
+                        return manager.subprocess.CompletedProcess(command, 0, 'version', '')
+                    self.assertEqual(command[:2], ('codex', 'sandbox') if isinstance(command, tuple)
+                                     else ['codex', 'sandbox'])
+                    commands.append(command)
+                    if 'exec' not in command:
+                        return manager.subprocess.CompletedProcess(command, 0, 'agent-write-boundary-v1\n', '')
+                    self.assertIn('approvals_reviewer="auto_review"', command)
+                    self.assertIn('sandbox_workspace_write.network_access=false', command)
+                    if session:
+                        self.assertIn('resume', command)
+                        self.assertIn(session, command)
+                    target = Path(command[command.index('-o') + 1])
+                    target.write_text('completed')
+                    kwargs['stdout'].write('provider log\n')
+                    return manager.subprocess.CompletedProcess(command, 0)
+
+                with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
+                     mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
+                     mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
+                     mock.patch.object(manager, 'capture_git_snapshot', return_value=
+                                       mock.Mock(serialize=lambda: 'snapshot')), \
+                     mock.patch.object(isolation.subprocess, 'run', side_effect=run), \
+                     mock.patch.object(envelope.CodexLaunch, 'run', side_effect=run):
+                    result = manager.run_agent(
+                        'codex', boundary.worktree, state_root, state_root / 'config', role, 'prompt',
+                        read_only=read_only, session_id=session, connection=connection,
+                        resolved_profile=invocation.ResolvedProfile('model', 'high'),
+                        invocation=invocation.InvocationContext(str(boundary.source), 'G-088'))
+                self.assertEqual(result.code, 0)
+                self.assertEqual(result.message, 'completed')
+                self.assertEqual(len(commands), 2)
+                self.assertEqual(list(commands[0]), list(commands[1][:len(commands[0])]))
+                row = connection.execute('''SELECT proof.status, call.result_kind, call.session_id
+                    FROM agent_isolation_evidence proof JOIN agent_invocations call USING(invocation_id)''').fetchone()
+                self.assertEqual(row, ('verified', 'success', session))
+
+    def test_envelope_timeout_kills_process_group_and_waits(self):
+        launch = envelope.CodexLaunch((), ('native',), {}, Path('/runtime'), Path('/attempt'), '{}')
+        process = mock.Mock(pid=4321)
+        process.communicate.side_effect = manager.subprocess.TimeoutExpired(['native'], 1)
+        with mock.patch.object(envelope.subprocess, 'Popen', return_value=process) as start, \
+             mock.patch.object(envelope.os, 'killpg') as terminate:
+            with self.assertRaises(manager.subprocess.TimeoutExpired):
+                launch.run(['native'], input='prompt', timeout=1, text=True)
+        self.assertTrue(start.call_args.kwargs['start_new_session'])
+        terminate.assert_called_once_with(4321, envelope.signal.SIGKILL)
+        process.wait.assert_called_once()
+
+    def test_streamed_new_session_uses_envelope_and_persists_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            boundary, state_root, home = self.boundary(Path(directory))
+            connection = sqlite3.connect(':memory:')
+            self.addCleanup(connection.close)
+            state.ensure_schema(connection)
+            process = mock.Mock(pid=4321)
+            process.stdin = io.StringIO()
+            process.stdout = io.StringIO('{"type":"thread.started","thread_id":"new-session"}\n')
+            process.wait.return_value = 0
+            commands = []
+
+            def run(command, **kwargs):
+                if command == ['codex', '--version']:
+                    return manager.subprocess.CompletedProcess(command, 0, 'version', '')
+                return manager.subprocess.CompletedProcess(command, 0, 'agent-write-boundary-v1\n', '')
+
+            def start(command, **kwargs):
+                commands.append(command)
+                self.assertTrue(kwargs['start_new_session'])
+                Path(command[command.index('-o') + 1]).write_text('streamed result')
+                return process
+
+            with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
+                 mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
+                 mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
+                 mock.patch.object(manager, 'capture_git_snapshot', return_value=
+                                   mock.Mock(serialize=lambda: 'snapshot')), \
+                 mock.patch.object(isolation.subprocess, 'run', side_effect=run), \
+                 mock.patch.object(manager.subprocess, 'Popen', side_effect=start), \
+                 mock.patch.object(envelope.os, 'killpg') as terminate:
+                result = manager.run_agent(
+                    'codex', boundary.worktree, state_root, state_root / 'config', 'worker', 'prompt',
+                    read_only=False, persist_session=True, connection=connection,
+                    resolved_profile=invocation.ResolvedProfile('model', 'high'),
+                    invocation=invocation.InvocationContext(str(boundary.source), 'G-088'))
+            self.assertEqual(commands[0][:2], ['codex', 'sandbox'])
+            self.assertEqual((result.code, result.session_id), (0, 'new-session'))
+            self.assertEqual(connection.execute('SELECT session_id FROM agent_invocations').fetchone()[0],
+                             'new-session')
+            terminate.assert_called_once_with(4321, envelope.signal.SIGKILL)
+
+    def test_actual_gate_failure_invalidates_evidence_and_preserves_old_logs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            boundary, state_root, home = self.boundary(Path(directory))
+            connection = sqlite3.connect(':memory:')
+            self.addCleanup(connection.close)
+            state.ensure_schema(connection)
+            logs = state_root / 'logs' / manager.hashlib.sha256(str(boundary.worktree).encode()).hexdigest()[:16]
+            logs.mkdir(parents=True)
+            (logs / 'planner.log').write_text('old log')
+            (logs / 'planner-last.txt').write_text('old result')
+
+            def run(command, **kwargs):
+                if command == ['codex', '--version']:
+                    return manager.subprocess.CompletedProcess(command, 0, 'version', '')
+                if 'exec' not in command:
+                    return manager.subprocess.CompletedProcess(command, 0, 'agent-write-boundary-v1\n', '')
+                kwargs['stdout'].write('agent write boundary verification failed')
+                return manager.subprocess.CompletedProcess(command, 125)
+
+            with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
+                 mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
+                 mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
+                 mock.patch.object(manager, 'capture_git_snapshot', return_value=
+                                   mock.Mock(serialize=lambda: 'snapshot')), \
+                 mock.patch.object(isolation.subprocess, 'run', side_effect=run), \
+                     mock.patch.object(envelope.CodexLaunch, 'run', side_effect=run):
+                result = manager.run_agent(
+                    'codex', boundary.worktree, state_root, state_root / 'config', 'planner', 'prompt',
+                    read_only=False, connection=connection,
+                    resolved_profile=invocation.ResolvedProfile('model', 'high'),
+                    invocation=invocation.InvocationContext(str(boundary.source), None))
+            self.assertEqual(result.code, 125)
+            self.assertEqual(connection.execute('SELECT status FROM agent_isolation_evidence').fetchone()[0],
+                             'invalidated')
+            self.assertEqual((logs / 'planner.log').read_text(), 'old log')
+            self.assertEqual((logs / 'planner-last.txt').read_text(), 'old result')
 
 
 class UsageTests(TestCase):

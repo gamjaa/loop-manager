@@ -7580,6 +7580,8 @@ def run_codex(
         if level is not None:
             raise RuntimeError(f"Codex {role_name}에 Worker level을 지정할 수 없습니다.")
         model, effort = role(config_path, role_name, worktree)
+    sandbox_launch = None
+    launch_environment = agent_environment("codex", role_name)
     if on_isolation_checked is not None:
         checked: list[agent_write_isolation.IsolationEvidence] = []
 
@@ -7591,7 +7593,12 @@ def run_codex(
             "codex", role_name, worktree, state_dir, read_only, observe,
             isolation_snapshot_digest, config_path=config_path,
             expected_repository=expected_repository, session_id=session_id,
+            environment_variables=launch_environment,
         )
+        if isinstance(isolation_arguments, agent_write_isolation.CodexLaunch):
+            sandbox_launch = isolation_arguments
+            isolation_arguments = sandbox_launch.arguments
+            launch_environment = sandbox_launch.environment
         if len(checked) != 1 or checked[0].status != "verified":
             raise agent_write_isolation.IsolationError("Codex 격리 증거가 없습니다.")
         isolation_evidence = checked[0]
@@ -7605,8 +7612,13 @@ def run_codex(
     project_dir = state_dir / "logs" / hashlib.sha256(str(worktree).encode()).hexdigest()[:16]
     project_dir.mkdir(parents=True, exist_ok=True)
     last_message = project_dir / f"{role_name}-last.txt"
-    log = project_dir / f"{role_name}.log"
-    last_message.unlink(missing_ok=True)
+    saved_log = project_dir / f"{role_name}.log"
+    log = sandbox_launch.attempt / "provider.log" if sandbox_launch else saved_log
+    # Preserve the previous result until the sandbox gate has accepted the call.
+    provider_last_message = (sandbox_launch.attempt / "last-message.txt"
+                             if sandbox_launch else last_message)
+    if sandbox_launch is None:
+        last_message.unlink(missing_ok=True)
     permissions = (list(isolation_arguments) if isolation_arguments is not None
                    else codex_sandbox_arguments(read_only))
     if session_id:
@@ -7623,7 +7635,7 @@ def run_codex(
             "-c",
             f'model_reasoning_effort="{effort}"',
             "-o",
-            str(last_message),
+            str(provider_last_message),
             session_id,
             "-",
         ]
@@ -7640,9 +7652,11 @@ def run_codex(
             "-c",
             f'model_reasoning_effort="{effort}"',
             "-o",
-            str(last_message),
+            str(provider_last_message),
             "-",
         ]
+    if sandbox_launch is not None:
+        arguments = sandbox_launch.wrap(arguments)
     resolved_session_id = session_id
     timeout_triggered = threading.Event()
     if persist_session and not session_id:
@@ -7655,8 +7669,9 @@ def run_codex(
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                env=agent_environment("codex", role_name),
+                env=launch_environment,
                 cwd=worktree,
+                start_new_session=sandbox_launch is not None,
             )
             assert process.stdin is not None
             assert process.stdout is not None
@@ -7664,7 +7679,10 @@ def run_codex(
             def terminate_on_timeout() -> None:
                 timeout_triggered.set()
                 try:
-                    process.kill()
+                    if sandbox_launch is not None:
+                        sandbox_launch.stop(process)
+                    else:
+                        process.kill()
                 except OSError:
                     pass
 
@@ -7697,7 +7715,10 @@ def run_codex(
                 returncode = process.wait()
             except BaseException:
                 try:
-                    process.kill()
+                    if sandbox_launch is not None:
+                        sandbox_launch.stop(process)
+                    else:
+                        process.kill()
                 except OSError:
                     pass
                 process.wait()
@@ -7705,9 +7726,12 @@ def run_codex(
             finally:
                 timeout.cancel()
                 process.stdout.close()
+                if sandbox_launch is not None:
+                    sandbox_launch.stop(process)
     else:
         with log.open("w", encoding="utf-8") as output:
-            result = _handoff_run(
+            runner = sandbox_launch.run if sandbox_launch is not None else _handoff_run
+            result = runner(
                 arguments,
                 input=prompt,
                 text=True,
@@ -7715,12 +7739,15 @@ def run_codex(
                 errors="replace",
                 stdout=output,
                 stderr=subprocess.STDOUT,
-                env=agent_environment("codex", role_name),
+                env=launch_environment,
                 cwd=worktree,
                 timeout=AGENT_CLI_TIMEOUT_SECONDS,
             )
         returncode = result.returncode
-    message = last_message.read_text(encoding="utf-8") if last_message.is_file() else ""
+    message = (provider_last_message.read_text(encoding="utf-8")
+               if provider_last_message.is_file() else "")
+    if sandbox_launch is not None and provider_last_message.is_file():
+        last_message.write_text(message, encoding="utf-8")
     if timeout_triggered.is_set():
         message = f"Codex {role_name} 실행 timeout ({AGENT_CLI_TIMEOUT_SECONDS}초)"
     if returncode and not message:
@@ -7730,6 +7757,8 @@ def run_codex(
     except (OSError, UnicodeError):
         # Usage is observational; a failed log read cannot retry a completed CLI call.
         usage = Usage(status="invalid")
+    if sandbox_launch is not None and returncode != 125:
+        saved_log.write_text(log.read_text(encoding="utf-8"), encoding="utf-8")
     if persist_session and not resolved_session_id:
         if returncode == 0:
             return CodexResult(

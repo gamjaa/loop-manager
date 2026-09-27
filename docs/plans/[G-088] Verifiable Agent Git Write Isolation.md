@@ -43,7 +43,7 @@ priority: critical
 
 ## Progress
 
-- [ ] 실행별 쓰기 격리와 확인 증거 연결
+- [x] 실행별 쓰기 격리와 확인 증거 연결
 - [x] 증거 없는 실행의 엄격 fallback 및 회귀 검증
 
 ## Decision Log
@@ -77,3 +77,12 @@ priority: critical
 - 검토 가능한 보완 설계: (1) provider 내장 workspace 정책·자동 승인 검토를 그대로 유지하면서 provider CLI 전체와 자손에 적용되는 OS 쓰기 경계를 추가한다. (2) Manager가 호출별 최소 runtime 디렉터리를 만들고 소유권을 확인하며, 결과·임시 파일은 그곳에만 쓴다. (3) provider session은 역할·repository identity에 결합한 Manager 소유 경로에서 보존·재개하고 기존 인증 자료는 복사·이동하거나 쓰기 허용하지 않는다. (4) API 연결은 provider runtime에 필요하지만 Agent 명령의 기존 network 정책과 승인 범위는 확대하지 않는다. (5) 실제 호출을 시작하는 동일한 경계 안에서 허용 파일의 생성·수정·삭제 및 보호 경로의 쓰기 거부를 검증하고, 검증 뒤에만 호출 identity에 결합한 증거를 저장한다. 보호 경로 검사는 source checkout의 로컬 상태를 변경하지 않아야 한다. 지원하지 못하는 OS/provider 또는 인증 갱신·session 저장과 양립하지 않는 실행은 구체적인 이유로 거부한다.
 - 위 보완은 현재 Architecture 221–236행의 provider 내장 제한 설계 및 368행 이후 Architecture Change Policy와 대조할 사용자 결정이 필요하다. 추가 OS 경계와 provider runtime/session 경로의 설계 승인을 질문했으며 아직 승인 응답은 없다. 이 기록은 구현 완료나 사용자 승인으로 간주하지 않는다. AGENTS.md 규칙 변경은 필요하지 않아 guidance proposal을 만들지 않았다. SQLite 차단 전이는 Loop Manager 프로그램에 맡긴다.
 - 이번 세션의 변경은 선택된 ExecPlan의 조사·보완 설계·승인 대기 기록뿐이다. 실행 코드·테스트·verify 스크립트를 변경하지 않아 targeted unit test는 실행하지 않았다. 이전 세션의 통과 결과를 이번 세션의 실행 결과로 보고하지 않는다. commit, push, PR 생성과 전체 verify는 실행하지 않았다.
+
+
+- 2026-09-27 Worker review occurrence=7, revision=7 구현: 외부 격리 infrastructure를 추가하지 않고 설치된 provider의 `codex sandbox`로 `codex exec` 전체를 감싼다. 신규·재개·Planner·Worker·Reviewer·유지보수 역할의 Linux Codex 호출은 같은 native sandbox prefix와 동일한 검증 helper를 사전 검사와 실제 exec에 사용한다. 모든 호출을 무조건 거부하던 경로를 제거했고, 확인된 호출만 `verified` 증거를 저장한다. 실제 exec 직전 helper가 다시 실패하면 provider를 시작하지 않고 실패 호출의 증거를 무효화한다.
+- 증명 경계: Linux mount namespace의 root와 보호 경로·하위 mount가 읽기 전용인지, 예상 밖 writable mount가 없는지, effective capability 제거·no_new_privs와 host process namespace 접근 차단을 확인한다. source checkout의 파일을 생성·수정·삭제하지 않고 readonly mount와 기존 Git 파일의 비파괴 쓰기-open 거부로 보호를 확인한다. 허용 경로에서만 임시 파일 생성·수정·rename·삭제를 실행한다. 기존 hardlink가 다른 읽기 전용 경로의 inode를 쓸 수 있는 경우도 시작 전에 거부한다. read-only mount 증거를 제공하지 못하는 Landlock-only/알 수 없는 native 구현도 성공으로 표시하지 않는다.
+- runtime 경계: Manager 상태 디렉터리 아래 repository·worktree·role에 결합한 전용 Codex session 경로와 호출별 임시 경로만 추가 허용한다. 기존 인증·설정 파일은 원래 위치를 유지한 읽기 전용 symlink이며 복사·이동하지 않는다. 자식 환경만 전용 provider 경로를 사용한다. 바깥 sandbox는 CLI의 API 연결을 허용하지만 안쪽 Agent 명령은 기존 network 제한, granular 권한 확대 거부와 자동 승인 검토를 유지한다. 이전 session이 전용 저장소에 없거나 인증 갱신 등이 제한과 양립하지 않으면 기존 실패·새 세션 fallback 흐름을 사용하며 권한을 확대하지 않는다.
+- 호출별 정책 지문은 native sandbox prefix·session identity·설정에 결합되고 재개마다 새 검사와 새 호출 임시 경로를 사용한다. Reviewer도 등록된 관리 linked worktree를 요구한다. 실제 gate 실패 시 이전 결과·로그를 보존하고 timeout·중단 시 추가 sandbox 프로세스 그룹을 종료한다. 기존 증거 없는 session의 엄격한 Git 판정은 유지한다. Claude와 native Windows의 확인 불가 거부는 유지하며 이번 변경으로 지원을 주장하지 않는다.
+- targeted 검증: `python3 -m unittest discover -s tests -p test_agent_invocation.py -k WriteIsolationTests`로 격리 관련 두 unit test class의 30개 테스트가 통과했다. native mount 검증 로직, hardlink·경로 중첩 거부, 역할별 정상 adapter 연결, 신규 streaming session·재개, 실패 증거 무효화, 기존 로그 보존과 timeout 프로세스 그룹 종료를 검증한다. CLI·kernel 경계는 unit test double로 제어했으며 실제 provider 호출 또는 integration test를 실행했다고 주장하지 않는다. 새 모듈을 기존 verify의 compile 목록과 import fixture에 추가했고 전체 검증 범위는 줄이지 않았다. 전체 verify와 Reviewer 결과는 Loop Manager 실행을 기다린다. AGENTS.md, docs/PLANS.md와 Requirement는 변경하지 않았고 commit·push·PR 생성도 하지 않았다.
+
+- 2026-09-29 User Decision: 사용자가 G-088의 차단 알림에 포함된 하위 writable mount의 source/shared Git 별칭 사례를 제시하며, 하위 경로에 Git 경로가 있는 등의 사례를 고려하지 않아도 된다고 명시했다. 위 운영 환경 전제와 제외 범위를 승인된 계획 범위로 반영한다. `loop_manager.py::run_agent::missing-write-isolation`의 마지막 Review가 요구한 하위 bind mount 별칭 탐지·거부 및 회귀 테스트는 현재 Acceptance Criteria가 아니다. Worker와 Reviewer는 남아 있는 실제 격리 요구를 확인하되 이 제외 사례를 다시 교정 또는 blocking 근거로 사용하지 않는다. 기존 Review·실패 감사는 보존하고, 계획 입력 변경을 감지한 Manager가 정상 재개와 필요한 검증·Review를 수행한다.

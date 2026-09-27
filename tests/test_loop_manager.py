@@ -8156,6 +8156,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "agent_invocation.py",
                 "agent_invocation_state.py",
                 "agent_write_isolation.py",
+                "agent_codex_sandbox.py",
+                "agent_sandbox_exec.py",
                 "agent_provider_usage.py",
                 "blocked_checkpoint.py",
                 "blocked_checkpoint_state.py",
