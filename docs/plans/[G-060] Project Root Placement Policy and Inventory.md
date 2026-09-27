@@ -29,6 +29,7 @@ depends_on:
   - G-087
   - G-092
   - G-095
+  - G-101
 complexity: medium
 risk: medium
 priority: normal
@@ -48,7 +49,7 @@ priority: normal
 
 ## Implementation
 
-- G-059의 Loop Manager 자체 전수 inventory를 최신 루트 파일 집합과 대조해 파일별 참조, 소유권과 이동 목적지를 기록한다. G-051, G-064~G-072, G-077, G-080, G-081과 G-083~G-095에서 추가·변경된 루트 모듈이 있으면 import·검증 참조에 포함하고, `ROOT` 기반 resource lookup과 launcher가 요구하는 고정 파일을 식별한다.
+- G-059의 Loop Manager 자체 전수 inventory를 최신 루트 파일 집합과 대조해 파일별 참조, 소유권과 이동 목적지를 기록한다. G-051, G-064~G-072, G-077, G-080, G-081, G-083~G-095와 G-099~G-101에서 추가·변경된 루트 모듈이 있으면 import·검증 참조에 포함하고, `ROOT` 기반 resource lookup과 launcher가 요구하는 고정 파일을 식별한다.
 - 필수 폴더·파일과 신규 루트 항목 판정 기준을 공통 provider-neutral prompt에 반영한다. 실제 내부 모듈 이동은 G-063에서 수행한다.
 - 기존 등록 프로젝트에도 적용되는 provider-neutral prompt에 필수 루트 경로와 안전한 파일 배치 기준을 반영한다.
 - G-086의 정상 파일별 평가가 처음 도래할 때 유지보수 Planner의 평가 입력과 결과에 루트 항목 inventory를 포함한다. G-083의 추적 source 목록만으로 문서·고정 경로 등 루트 항목을 누락하지 않으며, 별도 조기 평가나 중복 전체 파일 읽기를 만들지 않는다. 이미 평가된 프로젝트는 다음 해당 평가에서 확인된 기존 결과를 재사용한다. 소유권·참조를 증명하지 못한 항목은 이동 계획에서 제외하고 판단 근거를 기록한다.
@@ -73,3 +74,4 @@ priority: normal
 - G-081의 checkpoint 복구 경계와 G-083~G-087의 파일별 평가 모듈·실행 경계가 Merge된 뒤 루트 inventory를 확정한다. R-028의 첫 구조 조사는 R-042의 정상 평가 일정 안에서 수행하며 별도 조기 평가를 만들지 않는다.
 - G-088~G-092의 Agent 격리·Git 범위·Manager checkpoint 및 차단 복구가 Merge된 뒤 그 경계의 새 모듈과 테스트 참조도 inventory에 포함한다.
 - G-093~G-095의 planning 상태·차단 사건 복구가 Merge된 뒤 변경된 복구 경계와 테스트 참조를 inventory에 포함한다.
+- G-099~G-101의 단계별 rebase 증거·복구가 Merge된 뒤 변경된 코드·테스트·검증 참조를 inventory에 포함한다.
