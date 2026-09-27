@@ -1309,7 +1309,7 @@ class ExecutionHandlerTests(TestCase):
         )
         saved = SimpleNamespace(
             scope_marker='same', worker_code=0, worker_result=message,
-            generation=1,
+            generation=1, outcome_contract_version=1,
         )
         context = replace(self.context(), resolving_rebase=True)
         with mock.patch.object(lm, 'capture_git_snapshot') as snapshot:
@@ -1696,6 +1696,38 @@ class ExecutionHandlerTests(TestCase):
             'PR_SUMMARY: Resolves the saved rebase conflict.\n'
             'TARGETED_TESTS:\ntargeted test: PASS'
         )
+        context = self._save_rebase_worker_result(legacy_result, outcome_contract_version=0)
+
+        resumed = self.handler.run(context)
+
+        self.assertEqual(resumed.context.phase, ExecutionPhase.VERIFYING)
+        self.effects.agent.run_agent.assert_not_called()
+        self.assertEqual(self.state.row()['worker_result'], legacy_result)
+
+        self.effects.validation.parse_worker_result.assert_any_call(legacy_result, self.plan)
+        self.effects.blocking.block_active_execplan.assert_not_called()
+
+    def test_saved_new_rebase_result_requires_outcome_before_finishing(self):
+        message = (
+            '사용자 승인을 기다려 구현을 중단했습니다.\n'
+            'COMMIT_TITLE: Preserve resolved rebase changes\n'
+            'PR_SUMMARY: Waiting for approval.\n'
+            'TARGETED_TESTS:\ntargeted test: PASS'
+        )
+        context = self._save_rebase_worker_result(message)
+        # Reconstruct the repository as after a Manager restart.
+        self.handler.rebase_corrections = type(self.handler.rebase_corrections)(self.connection)
+        with mock.patch.object(self.handler, '_finish_worker') as finish:
+            resumed = self.handler.run(context)
+        self.assertEqual(resumed.kind, ExecutionOutcomeKind.RETRY)
+        self.assertIn('WORKER_OUTCOME', self.state.row()['last_error'])
+        finish.assert_not_called()
+        self.effects.agent.run_agent.assert_not_called()
+        self.effects.validation.parse_worker_result.assert_not_called()
+        self.effects.validation.verify.assert_not_called()
+        self.assertNotIn('add', self.calls)
+
+    def _save_rebase_worker_result(self, message, *, outcome_contract_version=1):
         self.effects.validation.parse_worker_result.side_effect = lm.parse_worker_result
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)
@@ -1722,18 +1754,12 @@ class ExecutionHandlerTests(TestCase):
         self.handler.rebase_corrections.finish_turn(
             'repo', 'G-047', expected_generation=turn.generation,
             turn=turn.pending_turn, session='same-session',
-            result=legacy_result,
+            result=message,
             scope_marker=observation.progress,
+            outcome_contract_version=outcome_contract_version,
         )
 
-        resumed = self.handler.run(context)
-
-        self.assertEqual(resumed.context.phase, ExecutionPhase.VERIFYING)
-        self.effects.agent.run_agent.assert_not_called()
-        self.assertEqual(self.state.row()['worker_result'], legacy_result)
-
-        self.effects.validation.parse_worker_result.assert_any_call(legacy_result, self.plan)
-        self.effects.blocking.block_active_execplan.assert_not_called()
+        return context
 
     def test_changed_pending_turn_without_scope_baseline_blocks_before_agent(self):
         checkpoint = ExecutionCheckpointRepository(self.connection)

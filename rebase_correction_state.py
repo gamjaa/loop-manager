@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS rebase_corrections (
     worker_code INTEGER,
     result_kind TEXT,
     scope_marker TEXT,
+    outcome_contract_version INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (repo, plan_id)
 )
 """
@@ -56,12 +57,19 @@ class CorrectionRecord:
     worker_code: int | None
     result_kind: str | None
     scope_marker: str | None
+    outcome_contract_version: int = 0
 
 
 class RebaseCorrectionRepository:
     def __init__(self, connection: sqlite3.Connection):
         self.connection = connection
         connection.execute(SCHEMA)
+        columns = {row[1] for row in connection.execute('PRAGMA table_info(rebase_corrections)')}
+        if 'outcome_contract_version' not in columns:
+            connection.execute(
+                'ALTER TABLE rebase_corrections ADD COLUMN '
+                'outcome_contract_version INTEGER NOT NULL DEFAULT 0'
+            )
 
     @staticmethod
     def _key(observation: ConflictObservation) -> str:
@@ -86,7 +94,7 @@ class RebaseCorrectionRepository:
             tuple(json.loads(row["audit"])),
             row["pending_turn"], row["worker_session"], row["worker_result"],
             row["worker_code"], row["result_kind"],
-            row["scope_marker"],
+            row["scope_marker"], int(row["outcome_contract_version"]),
         )
 
     def observe(self, repo: str, plan_id: str, observation: ConflictObservation,
@@ -191,13 +199,14 @@ class RebaseCorrectionRepository:
     def finish_turn(self, repo: str, plan_id: str, *, expected_generation: int,
                     turn: str, session: str | None, result: str,
                     scope_marker: str, code: int = 0,
-                    result_kind: str = 'success') -> CorrectionRecord:
+                    result_kind: str = 'success',
+                    outcome_contract_version: int = 1) -> CorrectionRecord:
         changed = self.connection.execute(
             "UPDATE rebase_corrections SET generation = generation + 1, "
             "worker_session = ?, worker_result = ?, worker_code = ?, "
-            "result_kind = ?, scope_marker = ? "
+            "result_kind = ?, scope_marker = ?, outcome_contract_version = ? "
             "WHERE repo = ? AND plan_id = ? AND generation = ? AND pending_turn = ?",
-            (session, result, code, result_kind, scope_marker,
+            (session, result, code, result_kind, scope_marker, outcome_contract_version,
              repo, plan_id, expected_generation, turn),
         )
         if changed.rowcount != 1:
