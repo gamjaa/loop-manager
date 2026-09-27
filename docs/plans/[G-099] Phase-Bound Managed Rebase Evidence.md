@@ -45,6 +45,8 @@ priority: critical
 
 - mode 검증 보완: 승인 파일 signature에 결합한 Git mode를 stage 전에 저장하고 CONTINUE·SKIP과 journal 재검증에서 index mode를 직접 비교한다. `core.fileMode=false`의 clean diff로 index 실행 비트 변경이 숨겨지는 회귀를 unit test와 실제 Git fixture에 추가했다. targeted unit test 8개가 통과했으며 실제 Git 사례는 Loop Manager 전체 verify 대상이다.
 
+- SKIP 내용 검증 보완: index가 clean인 승인 경로도 호출 직전 직접 signature를 읽어 승인값과 비교하고, 동일 snapshot의 dirty 관측 및 안정성을 확인한다. 이 관측을 journal에 저장해 재검증에서도 누락·내용 불일치를 거부한다. 호출 전 변경·삭제·관측 중 변경과 저장 receipt 변조를 확인하는 targeted unit test 2개가 통과했다. 전체 verify는 Loop Manager 검증 대상이다.
+
 ## Decision Log
 
 - G-091의 소유 Git journal을 확장한다. R-023의 Agent 기준선 조정과 범용 차단 해제는 G-092에 남기며, 이 계획은 현재 rebase 실행의 증거와 완료 판정만 다룬다.

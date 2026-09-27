@@ -199,6 +199,10 @@ def rebase_replay_proof(
                     or not item.get('correction_turn')
                     or item.get('staged_index') != saved['before'].get('index')
                     or not isinstance(item.get('accepted_files'), dict)
+                    or not replay_evidence.skip_files_match(
+                        item.get('accepted_files'), item.get('skip_observed_files'),
+                        saved['before'].get('dirty'),
+                    )
                     or not replay_evidence.stage_modes_match(
                         item.get('accepted_files') or {}, item.get('accepted_modes'),
                         item.get('staged_index'),

@@ -1145,7 +1145,20 @@ class ExecutionHandlers:
                 raise manager_git_journal.MutationEvidenceError(
                     'rebase skip: index differs from Worker-approved stage evidence'
                 )
+            skip_observed_files = None
+            if action is CorrectionAction.SKIP:
+                skip_observed_files = {
+                    path: self.effects.agent.path_signature(context.worktree, path)
+                    for path in accepted_files
+                }
+                if (not managed_rebase_evidence.skip_files_match(
+                        accepted_files, skip_observed_files, before.get('dirty'),
+                    ) or self._rebase_journal_state(context) != before):
+                    raise manager_git_journal.MutationEvidenceError(
+                        'rebase skip: files differ from Worker-approved signatures'
+                    )
             replay_fields = {
+                'skip_observed_files': skip_observed_files,
                 'evidence_version': managed_rebase_evidence.EVIDENCE_VERSION,
                 'run_id': snapshot['rebase_run_id'],
                 'source_base': snapshot['rebase_source_base'],

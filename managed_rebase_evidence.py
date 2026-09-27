@@ -97,6 +97,20 @@ def stage_matches(*, before_index: Mapping[str, list[str]],
     )
 
 
+def skip_files_match(accepted_files, observed_files, dirty) -> bool:
+    """Bind skip to live signatures, including approved paths now clean in Git."""
+    if (not isinstance(accepted_files, Mapping)
+            or not isinstance(observed_files, Mapping)
+            or not isinstance(dirty, Mapping)
+            or accepted_files != observed_files):
+        return False
+    return all(
+        path in observed_files and isinstance(entry, list) and len(entry) == 2
+        and entry[1] == observed_files[path]
+        for path, entry in dirty.items()
+    )
+
+
 def stage_modes_match(accepted_files, accepted_modes, staged_index) -> bool:
     """Compare modes directly, regardless of Git's core.fileMode/diff policy."""
     if (not isinstance(accepted_modes, Mapping)

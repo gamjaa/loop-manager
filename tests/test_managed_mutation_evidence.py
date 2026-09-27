@@ -1018,7 +1018,9 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
             rebase_remote_oid=None,
         )
         handler.repo, handler.repo_path, handler.state_dir = 'repo', Path('/repo'), Path('/state')
+        live_signature = ['signature']
         handler.effects = SimpleNamespace(
+            agent=SimpleNamespace(path_signature=lambda *_: live_signature[0]),
             checkpoint=SimpleNamespace(get=lambda *_: SimpleNamespace(
                 operation='rebase', expected_head=OLD, target_base_oid=NEW,
                 generation=3, snapshot=snapshot)),
@@ -1035,6 +1037,26 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
               mock.patch.object(journal, 'begin_rebase', return_value='intent') as begin):
             self.assertEqual(handler._begin_rebase_continuation(
                 context, CorrectionAction.SKIP), 'intent')
+            self.assertEqual(begin.call_args.kwargs['expected']['skip_observed_files'],
+                             {'app.py': 'signature'})
+            for changed in ('unstaged content', 'missing'):
+                with self.subTest(signature=changed):
+                    live_signature[0] = changed
+                    before['dirty'] = {'app.py': [['unstaged'], changed]}
+                    with self.assertRaisesRegex(journal.MutationEvidenceError, 'signatures'):
+                        handler._execute_rebase_step(context, CorrectionAction.SKIP)
+                    self.assertEqual(begin.call_count, 1)
+            # Also read clean tracked paths directly instead of trusting dirty.
+            before['dirty'] = {}
+            with self.assertRaisesRegex(journal.MutationEvidenceError, 'signatures'):
+                handler._begin_rebase_continuation(context, CorrectionAction.SKIP)
+            live_signature[0] = 'signature'
+            # A changing snapshot during signature capture is not a stable receipt.
+            snapshots = iter((before.copy(), before.copy(), {**before, 'head': OLD}))
+            handler._rebase_journal_state = lambda *_: next(snapshots)
+            with self.assertRaisesRegex(journal.MutationEvidenceError, 'signatures'):
+                handler._begin_rebase_continuation(context, CorrectionAction.SKIP)
+            handler._rebase_journal_state = lambda *_: before.copy()
             for index in (
                 {**staged, 'app.py': [f'S 100644 {NEW} 0']},
                 {**staged, 'app.py': [f'h 100644 {NEW} 0']},

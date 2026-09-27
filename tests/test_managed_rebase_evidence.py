@@ -178,10 +178,11 @@ class JournalReplayProofTests(unittest.TestCase):
             journal.begin_rebase(
                 state, owner='plan:G-099', repo='/repo', target='/worktree',
                 before=dict(head='target', index=staged, index_clean=True,
-                            unmerged=False, metadata={'onto': 'target'}),
+                            unmerged=False, dirty={}, metadata={'onto': 'target'}),
                 expected={**expected, 'checkpoint_generation': 2, 'action': 'skip',
                           'source_commit': 'source', 'correction_turn': 'turn',
                           'skip_reason': 'worker-approved', 'staged_index': staged,
+                          'skip_observed_files': {'app.py': 'approved'},
                           'stage_before_index': original,
                           'accepted_files': {'app.py': 'approved'},
                           'accepted_modes': {'app.py': '100644'}})
@@ -194,6 +195,16 @@ class JournalReplayProofTests(unittest.TestCase):
                 observed = {'head': 'target', 'metadata': None}
                 proof = journal.rebase_replay_proof(None, state, active, observed)
                 self.assertEqual(proof[0]['outcome'], 'skip')
+                for files in (None, {}, {'app.py': 'changed'}, {'app.py': 'missing'}):
+                    with self.subTest(files=files):
+                        active['expected']['skip_observed_files'] = files
+                        with self.assertRaisesRegex(journal.MutationEvidenceError, 'rebase skip'):
+                            journal.rebase_replay_proof(None, state, active, observed)
+                active['expected']['skip_observed_files'] = {'app.py': 'approved'}
+                active['before']['dirty'] = {'app.py': [['unstaged'], 'changed']}
+                with self.assertRaisesRegex(journal.MutationEvidenceError, 'rebase skip'):
+                    journal.rebase_replay_proof(None, state, active, observed)
+                active['before']['dirty'] = {}
                 for flag in ('S', 'h'):
                     with self.subTest(flag=flag):
                         changed = {'app.py': [flag + ' 100644 ' + 'b' * 40 + ' 0']}
