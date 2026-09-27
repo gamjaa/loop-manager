@@ -2,6 +2,8 @@ import hashlib
 import json
 from pathlib import Path
 import sqlite3
+import tempfile
+from dataclasses import replace
 import unittest
 from unittest import mock
 
@@ -94,7 +96,7 @@ class ReconciliationUnitTest(unittest.TestCase):
         self.connection.execute("INSERT INTO successful_code_maps VALUES (?, ?, ?, ?, ?)",
                                 ("repo", "src/b.py", self.sources["src/b.py"].content_hash,
                                  "100644", json.dumps(old_map)))
-        with (mock.patch.object(reconciliation, "tracked_source_inventory", return_value=self.inventory),
+        with (mock.patch.object(reconciliation, "cached_source_inventory", return_value=self.inventory),
               mock.patch.object(reconciliation, "source_bytes",
                                 side_effect=lambda _repo, _base, item: self.contents[item.path]) as read):
             progress = self.repository.progress("repo", Path("repo"), "main", 1, self.inventory, selected)
@@ -103,6 +105,95 @@ class ReconciliationUnitTest(unittest.TestCase):
         self.assertIn(self.sources["src/b.py"], [call.args[2] for call in read.call_args_list])
         self.assertIsNotNone(progress.next_relation)
         self.assertEqual(progress.selected, selected.selected)
+
+    def test_cached_relation_receipt_avoids_rereads_but_revalidates_changed_result(self):
+        selected = self.progress((self.sources["src/a.py"],), (self.review_a,))
+        with (mock.patch.object(reconciliation, "cached_source_inventory", return_value=self.inventory),
+              mock.patch.object(reconciliation, "source_bytes", side_effect=lambda _repo, _base, item: self.contents[item.path]) as read):
+            progress = self.repository.progress("repo", Path("repo"), "main", 1, self.inventory, selected)
+            relation = next(item for item in progress.relations if item.right.path == "src/b.py")
+            self.repository.start("repo", 1, REVISION, relation)
+            result = {"key": relation.key, "status": "confirmed", "left_excerpt": "helper()",
+                      "right_excerpt": "def helper()", "reason": "The reviewed caller uses this helper implementation."}
+            self.repository.complete("repo", 1, relation, result)
+            self.repository.progress("repo", Path("repo"), "main", 1, self.inventory, selected)
+            read.reset_mock()
+            self.repository = reconciliation.ReconciliationRepository(self.connection)
+            self.repository.progress("repo", Path("repo"), "main", 1, self.inventory, selected)
+            read.assert_not_called()
+            result["left_excerpt"] = "fabricated source excerpt"
+            self.connection.execute("UPDATE provisional_relations SET result_json = ?", (json.dumps(result),))
+            progress = self.repository.progress("repo", Path("repo"), "main", 1, self.inventory, selected)
+            self.assertEqual(progress.completed, ())
+            self.assertEqual(read.call_count, 2)
+
+    def test_interrupted_scan_keeps_completed_source_receipts(self):
+        selected = self.progress((self.sources["src/a.py"],), (self.review_a,))
+        def interrupted(_repository, _base, source):
+            if source.path == "src/c.py":
+                raise reconciliation.FileReviewError("interrupted source read")
+            return self.contents[source.path]
+        with (mock.patch.object(reconciliation, "cached_source_inventory", return_value=self.inventory),
+              mock.patch.object(reconciliation, "source_bytes", side_effect=interrupted)):
+            with self.assertRaises(reconciliation.FileReviewError):
+                self.repository.progress("repo", Path("repo"), "main", 1, self.inventory, selected)
+        self.repository = reconciliation.ReconciliationRepository(self.connection)
+        with (mock.patch.object(reconciliation, "cached_source_inventory", return_value=self.inventory),
+              mock.patch.object(reconciliation, "source_bytes", return_value=self.contents["src/c.py"]) as read):
+            progress = self.repository.progress("repo", Path("repo"), "main", 1, self.inventory, selected)
+        read.assert_called_once_with(Path("repo"), "main", self.sources["src/c.py"])
+        self.assertFalse(progress.pending_scan)
+
+    def test_only_changed_context_identity_is_rescanned(self):
+        selected = self.progress((self.sources["src/a.py"],), (self.review_a,))
+        with (mock.patch.object(reconciliation, "cached_source_inventory", return_value=self.inventory) as inventory,
+              mock.patch.object(reconciliation, "source_bytes", side_effect=lambda _repo, _base, item: self.contents[item.path]) as read):
+            self.repository.progress("repo", Path("repo"), "main", 1, self.inventory, selected)
+            changed = replace(self.sources["src/b.py"], mode="100755")
+            inventory.return_value = replace(self.inventory, sources=(self.sources["src/a.py"], changed, self.sources["src/c.py"]))
+            read.reset_mock()
+            self.repository.progress("repo", Path("repo"), "main", 1, inventory.return_value, selected)
+            read.assert_called_once_with(Path("repo"), "main", changed)
+
+    def test_short_public_symbols_missing_from_valid_map_still_form_candidates(self):
+        for symbol in ("foo", "id", "x"):
+            with self.subTest(symbol=symbol):
+                selected_review = review(self.sources["src/a.py"])
+                selected_review["code_map"]["public_symbols"] = [symbol]
+                old_map = review(self.sources["src/b.py"])["code_map"]
+                old_map["responsibility"] = "A different responsibility with an incomplete reference map."
+                progress = self.progress((self.sources["src/a.py"],), (selected_review,))
+                relations = reconciliation.relation_candidates(self.inventory, progress,
+                    {"src/b.py": old_map}, {"src/b.py": f"result = {symbol}()"})
+                self.assertEqual(len(relations), 1)
+                self.assertIn({"origin": "src/b.py", "target": "src/a.py",
+                               "kind": "source_reverse", "evidence": symbol}, relations[0].signals)
+                near_miss = reconciliation.relation_candidates(self.inventory, progress,
+                    {"src/b.py": old_map}, {"src/b.py": f"result = prefix{symbol}suffix()"})
+                self.assertEqual(near_miss, ())
+
+    def test_context_scan_is_bounded_durable_and_invalidates_changed_queries(self):
+        selected = self.progress((self.sources["src/a.py"],), (self.review_a,))
+        context = tuple(source(f"src/context_{index}.py", b"calculate()") for index in range(35))
+        inventory = SourceInventory(REVISION, (self.sources["src/a.py"], *context), ())
+        with (mock.patch.object(reconciliation, "cached_source_inventory", return_value=inventory),
+              mock.patch.object(reconciliation, "source_bytes", return_value=b"calculate()") as read):
+            first = self.repository.progress("repo", Path("repo"), "main", 1, inventory, selected)
+            self.assertTrue(first.pending_scan)
+            self.assertEqual(read.call_count, 16)
+            with self.assertRaises(reconciliation.ReconciliationError):
+                reconciliation.synthesis_pages(first)
+            self.repository = reconciliation.ReconciliationRepository(self.connection)
+            second = self.repository.progress("repo", Path("repo"), "main", 1, inventory, selected)
+            self.assertTrue(second.pending_scan)
+            self.assertEqual(read.call_count, 32)
+            self.repository.progress("repo", Path("repo"), "main", 1, inventory, selected)
+            read.reset_mock()
+            self.repository.progress("repo", Path("repo"), "main", 1, inventory, selected)
+            read.assert_not_called()
+            changed = self.progress(selected.selected, ({**self.review_a, "pending_references": []},))
+            self.assertTrue(self.repository.progress("repo", Path("repo"), "main", 1, inventory, changed).pending_scan)
+            self.assertEqual(read.call_count, 16)
 
     def test_symbol_only_candidate_matches_current_code_map(self):
         selected_review = review(self.sources["src/a.py"])
@@ -120,7 +211,7 @@ class ReconciliationUnitTest(unittest.TestCase):
 
     def test_relation_resume_and_source_change_invalidate_only_related_result(self):
         selected = self.progress((self.sources["src/a.py"],), (self.review_a,))
-        with (mock.patch.object(reconciliation, "tracked_source_inventory", return_value=self.inventory),
+        with (mock.patch.object(reconciliation, "cached_source_inventory", return_value=self.inventory),
               mock.patch.object(reconciliation, "source_bytes",
                                 side_effect=lambda _repo, _base, item: self.contents[item.path])):
             progress = self.repository.progress("repo", Path("repo"), "main", 1,
@@ -207,7 +298,7 @@ class SynthesisPagingTest(unittest.TestCase):
     def finish(self, page):
         self.repository.session("repo", page, "session-one")
         self.repository.complete("repo", page, reconciliation.SYNTHESIS_PREFIX + json.dumps({
-            "key": page.key, "excerpt": page.text[:20],
+            "key": page.key, "excerpt": page.text.partition("\n")[2][:20], "has_issue": True,
             "assessment": "Keep this page's structural issue for the final reconciliation.",
         }))
 
@@ -216,14 +307,14 @@ class SynthesisPagingTest(unittest.TestCase):
         self.assertGreater(len(pages), 13)
         expected = "".join(json.dumps({"kind": "file_review", "value": value},
                                      ensure_ascii=False, sort_keys=True) for value in self.reviews)
-        self.assertEqual("".join(pages), expected)
+        self.assertEqual("".join(page.partition("\n")[2] for page in pages), expected)
         first = self.repository.prepare("repo", 1, REVISION, self.progress)
         self.finish(first)
         self.repository = reconciliation.SynthesisRepository(self.connection)
         page = self.repository.prepare("repo", 1, REVISION, self.progress)
-        self.assertEqual((page.index, page.session_id), (1, "session-one"))
+        self.assertEqual((page.index, page.session_id), (1, None))
         while page.index < page.total:
-            self.assertLess(len(reconciliation.synthesis_prompt(page).encode()), 50_000)
+            self.assertLess(len(reconciliation.synthesis_prompt(page, Path("/evidence/manifest.json")).encode()), 50_000)
             self.finish(page)
             page = self.repository.prepare("repo", 1, REVISION, self.progress)
         self.assertEqual(page.index, len(pages))
@@ -254,16 +345,52 @@ class SynthesisPagingTest(unittest.TestCase):
         self.repository.session("repo", first, "session-one")
         with self.assertRaises(reconciliation.ReconciliationError):
             self.repository.complete("repo", first, reconciliation.SYNTHESIS_PREFIX + json.dumps({
-                "key": first.key, "excerpt": "nonexistent page evidence", "assessment": "A detailed but unsupported assessment."}))
+                "key": first.key, "excerpt": "nonexistent page evidence", "has_issue": True, "assessment": "A detailed but unsupported assessment."}))
         self.assertEqual(self.repository.prepare("repo", 1, REVISION, self.progress).index, 0)
         self.finish(first)
         second = self.repository.prepare("repo", 1, REVISION, self.progress)
-        with self.assertRaisesRegex(reconciliation.ReconciliationError, "첫 페이지"):
-            self.repository.session("repo", second, "replacement")
+        self.repository.session("repo", second, "replacement")
         replay = self.repository.prepare("repo", 1, REVISION, self.progress)
-        self.assertEqual((replay.index, replay.session_id), (0, "replacement"))
-        with self.assertRaises(reconciliation.ReconciliationError):
-            self.finish(second)
+        self.assertEqual((replay.index, replay.session_id), (1, "replacement"))
+        self.finish(replay)
+        self.assertEqual(self.repository.prepare("repo", 1, REVISION, self.progress).index, 2)
+
+    def test_fresh_final_session_can_retrieve_all_receipts_and_cannot_omit_any(self):
+        page = self.repository.prepare("repo", 1, REVISION, self.progress)
+        while page.index < page.total:
+            self.finish(page)
+            page = self.repository.prepare("repo", 1, REVISION, self.progress)
+        self.repository = reconciliation.SynthesisRepository(self.connection)
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = self.repository.export("repo", page, self.progress, Path(directory))
+            metadata = json.loads(manifest.read_text())
+            self.assertEqual(metadata["completed"], len(reconciliation.synthesis_pages(self.progress)))
+            resolutions = []
+            for index in range(metadata["total"]):
+                record = json.loads((manifest.parent / f"page-{index:08d}.json").read_text())
+                self.assertIn("assessment", record["result"])
+                resolutions.append({"key": record["key"], "excerpt": record["result"]["assessment"],
+                    "issue_keys": ["found-issue"], "disposition": "linked", "reason": "This saved candidate is addressed by the linked finding."})
+            payload = {"digest": page.digest, "pages": resolutions}
+            findings = {"findings": [{"issue_key": "found-issue"}]}
+            def validate(value):
+                self.repository.validate_resolutions("repo", page,
+                    "SYNTHESIS_RESOLUTIONS: " + json.dumps(value), findings)
+            validate(payload)
+            for changed in ({**payload, "pages": resolutions[1:]},
+                            {**payload, "digest": "stale"},
+                            {**payload, "pages": [*resolutions, resolutions[0]]},
+                            {**payload, "pages": [{**resolutions[0], "issue_keys": [], "disposition": "no_issue"}, *resolutions[1:]]},
+                            {**payload, "pages": [{**resolutions[0], "excerpt": "invented saved assessment"}, *resolutions[1:]]}):
+                with self.assertRaises(reconciliation.ReconciliationError):
+                    validate(changed)
+            excluded = [{**item, "issue_keys": [], "disposition": "excluded",
+                         "reason": "The original candidate is excluded after comparing the verified responsibilities."}
+                        for item in resolutions]
+            self.repository.validate_resolutions("repo", page,
+                "SYNTHESIS_RESOLUTIONS: " + json.dumps({**payload, "pages": excluded}), {"findings": []})
+
+
 
 
 if __name__ == "__main__":

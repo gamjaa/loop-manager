@@ -1938,7 +1938,7 @@ class ReconciledPlanLinkTest(unittest.TestCase):
         inventory = SourceInventory("a" * 40, (), ())
         text = plan_text("G-100", "Extract Boundary")
         with (mock.patch.object(port, "progress", return_value=progress),
-              mock.patch.object(loop_manager.maintenance_file_inventory, "tracked_source_inventory", return_value=inventory),
+              mock.patch.object(loop_manager.maintenance_file_inventory, "cached_source_inventory", return_value=inventory),
               mock.patch.object(loop_manager, "_git_tree_entries", return_value={
                   b"docs/plans/[G-100] Extract Boundary.md": (b"blob", b"oid"),
                   b"docs/plans/archive/[G-099] Old.md": (b"blob", b"old"),

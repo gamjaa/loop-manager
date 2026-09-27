@@ -384,5 +384,33 @@ class ProvisionalFileReviewTest(unittest.TestCase):
                          {"preview": [], "more_than_preview": False})
 
 
+class ReviewReceiptUnitTest(unittest.TestCase):
+    def test_validated_results_survive_restart_without_source_reread(self):
+        from unittest import mock
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute("CREATE TABLE projects (repo TEXT PRIMARY KEY)")
+        connection.execute("INSERT INTO projects VALUES ('repo')")
+        content = b"def calculate(): return 1\n"
+        source = maintenance_file_inventory.TrackedSource("src/a.py", hashlib.sha256(content).hexdigest(),
+                                                         "100644", "a" * 40, "source")
+        inventory = maintenance_file_inventory.SourceInventory(source.revision, (source,), ())
+        repository = review.ProvisionalReviewRepository(connection)
+        repository.start("repo", 1, source)
+        result = result_for(source, "def calculate(): return 1", content)
+        repository.complete("repo", 1, source, result)
+        with (mock.patch.object(review, "cached_source_inventory", return_value=inventory),
+              mock.patch.object(review.FileReviewRepository, "selected_sources", return_value=(source,)),
+              mock.patch.object(review, "source_bytes", return_value=content) as read):
+            self.assertEqual(len(repository.progress("repo", Path("repo"), "main", 1, inventory).completed), 1)
+            repository = review.ProvisionalReviewRepository(connection)
+            self.assertEqual(len(repository.progress("repo", Path("repo"), "main", 1, inventory).completed), 1)
+            read.assert_called_once()
+            result["evidence"]["excerpts"] = ["invented code that is absent"]
+            connection.execute("UPDATE provisional_file_reviews SET result_json = ?", (json.dumps(result),))
+            self.assertEqual(repository.progress("repo", Path("repo"), "main", 1, inventory).completed, ())
+            self.assertEqual(read.call_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -17,7 +17,7 @@ import sqlite3
 from typing import Sequence
 
 from maintenance_file_inventory import (
-    SourceInventory, TrackedSource, _git, tracked_source_inventory,
+    SourceInventory, TrackedSource, _git, cached_source_inventory,
     verify_remote_revision,
 )
 from maintenance_file_ledger import FileReviewRepository
@@ -339,13 +339,16 @@ class ProvisionalReviewRepository:
     def __init__(self, connection: sqlite3.Connection):
         self.connection = connection
         ensure_schema(connection)
+        connection.execute("""CREATE TABLE IF NOT EXISTS provisional_review_receipts (
+            repo TEXT NOT NULL, path TEXT NOT NULL, identity TEXT NOT NULL,
+            PRIMARY KEY (repo, path))""")
 
     def progress(
         self, repo: str, repository: Path, base: str,
         cycle_revision: int, inventory: SourceInventory,
     ) -> FileReviewProgress:
         """Reconcile every saved unit with the current selected source set."""
-        if tracked_source_inventory(repository, base, inventory.revision) != inventory:
+        if cached_source_inventory(self.connection, repository, base, inventory.revision) != inventory:
             raise FileReviewError("잠정 검토 inventory가 원격 source와 다릅니다.")
         selected = FileReviewRepository(self.connection).selected_sources(repo, inventory)
         expected = {item.path: item for item in selected}
@@ -367,9 +370,22 @@ class ProvisionalReviewRepository:
                     )
                     continue
                 try:
-                    result = (parse_review(RESULT_PREFIX + str(raw), source,
-                                           source_bytes(repository, base, source))
-                              if raw is not None else None)
+                    result = None
+                    if raw is not None:
+                        identity = hashlib.sha256(json.dumps(
+                            [cycle_revision, source.__dict__, raw], sort_keys=True,
+                        ).encode()).hexdigest()
+                        receipt = self.connection.execute(
+                            "SELECT identity FROM provisional_review_receipts WHERE repo = ? AND path = ?",
+                            (repo, path),
+                        ).fetchone()
+                        if receipt and receipt[0] == identity:
+                            result = json.loads(raw)
+                        else:
+                            result = parse_review(RESULT_PREFIX + str(raw), source,
+                                                  source_bytes(repository, base, source))
+                            self.connection.execute("INSERT OR REPLACE INTO provisional_review_receipts VALUES (?, ?, ?)",
+                                                    (repo, path, identity))
                 except (FileReviewError, ValueError):
                     self.connection.execute(
                         "DELETE FROM provisional_file_reviews WHERE repo = ? AND path = ?",

@@ -19840,14 +19840,15 @@ class _PlanningFileReviewPorts:
     """Keep provisional file units outside the success ledger and Planner row."""
 
     def __init__(self, connection: sqlite3.Connection):
+        self._connection = connection
         self._repository = maintenance_file_review.ProvisionalReviewRepository(connection)
 
     def progress(
         self, repo: str, repository: Path, base: str, cycle_revision: int,
         source_revision: str,
     ) -> maintenance_file_review.FileReviewProgress:
-        inventory = maintenance_file_inventory.tracked_source_inventory(
-            repository, base, source_revision,
+        inventory = maintenance_file_inventory.cached_source_inventory(
+            self._connection, repository, base, source_revision,
         )
         return self._repository.progress(
             repo, repository, base, cycle_revision, inventory,
@@ -19876,19 +19877,23 @@ class _PlanningReconciliationPorts:
     """Keep relation evidence provisional until G-086 publication succeeds."""
 
     def __init__(self, connection: sqlite3.Connection):
+        self._connection = connection
         self._repository = maintenance_reconciliation.ReconciliationRepository(connection)
         self._synthesis = maintenance_reconciliation.SynthesisRepository(connection)
         self._reviews = maintenance_file_review.ProvisionalReviewRepository(connection)
 
     def progress(self, repo: str, repository: Path, base: str, cycle_revision: int,
                  source_revision: str) -> maintenance_reconciliation.ReconciliationProgress:
-        inventory = maintenance_file_inventory.tracked_source_inventory(repository, base, source_revision)
+        inventory = maintenance_file_inventory.cached_source_inventory(self._connection, repository, base, source_revision)
         reviews = self._reviews.progress(repo, repository, base, cycle_revision, inventory)
         return self._repository.progress(repo, repository, base, cycle_revision, inventory, reviews)
 
     def synthesis(self, repo: str, cycle: int, revision: str,
                   progress: maintenance_reconciliation.ReconciliationProgress):
         return self._synthesis.prepare(repo, cycle, revision, progress)
+
+    def synthesis_export(self, repo: str, page, progress, directory: Path) -> Path:
+        return self._synthesis.export(repo, page, progress, directory)
 
     def synthesis_session(self, repo: str, page, session_id: str) -> None:
         self._synthesis.session(repo, page, session_id)
@@ -19925,7 +19930,7 @@ class _PlanningReconciliationPorts:
         synthesis = self.synthesis(repo, cycle_revision, revision, progress)
         if synthesis.index != synthesis.total:
             raise maintenance_reconciliation.ReconciliationError("종합 증거 페이지 검토가 완료되지 않았습니다.")
-        inventory = maintenance_file_inventory.tracked_source_inventory(repository, base, revision)
+        inventory = maintenance_file_inventory.cached_source_inventory(self._connection, repository, base, revision)
         sources = {source.path: source for source in inventory.sources}
 
         class CurrentContents(dict):
@@ -19944,9 +19949,11 @@ class _PlanningReconciliationPorts:
             if plan_id in existing_plans:
                 plan_texts[plan_id] = text
 
-        return maintenance_reconciliation.parse_findings(
+        findings = maintenance_reconciliation.parse_findings(
             output, progress, inventory, CurrentContents(), existing_plans, new_plan_ids, plan_texts,
         )
+        self._synthesis.validate_resolutions(repo, synthesis, output, findings)
+        return findings
 
 
 class _PlanningLifecyclePorts:

@@ -1316,11 +1316,19 @@ class PlanningLifecycleCoordinator:
                         )
                         if final_page.index != final_page.total:
                             return PlanningOutcome(PlanningOutcomeKind.WAITING)
+                        manifest = self._ports.reconciliation.synthesis_export(
+                            context.repo, final_page, progress, context.state_dir / "maintenance-evidence",
+                        )
                         prompt += (
-                            "\n\n모든 선정 파일의 검토와 관계 확인 결과 (성공 기록 아님):\n"
-                            "이 세션에 순서대로 전달된 모든 증거 페이지를 종합하라. "
-                            "각 페이지의 파일별 검토, 단일 파일 문제와 관계 결과를 빠짐없이 반영하라. "
-                            "최종 응답 전에 누락된 페이지가 있다면 결과를 확정하지 마라."
+                            "\n\n검증된 증거와 독립된 페이지 판단의 영속 snapshot: " + str(manifest) + "\n"
+                            "이전 Agent 세션의 기억에 의존하지 마라. manifest의 page_pattern을 사용해 "
+                            "저장된 모든 페이지 result를 개별 조회하고 필요한 text만 제한된 크기로 읽어라. "
+                            "앞선 판단은 언제든 다시 조회할 수 있으므로 전체 원문을 문맥에 누적하지 마라. "
+                            "최종 응답에 SYNTHESIS_RESOLUTIONS: {digest:manifest digest,pages:[{key, "
+                            "excerpt:저장된 assessment의 정확한 12자 이상 인용,issue_keys:연결된 발견 식별자 배열, "
+                            "disposition:linked|excluded|no_issue,reason:발견 연결 또는 제외의 구체적 20자 이상 근거}]} 한 줄 JSON을 추가하라. "
+                            "has_issue=true인 판단은 linked로 발견에 연결하거나 excluded로 근거를 남겨야 한다. "
+                            "문제 없음 페이지도 포함하며 모든 페이지를 처리해야 한다."
                             + "\n최종 응답에 FINDINGS_RESULT: 한 줄 JSON object도 기록하라. "
                             "필드: source_revision(현재 SHA), findings:[], no_issue_reason. "
                             "문제가 없으면 findings=[]와 no_issue_reason={files:[{id:경로,excerpt:파일 검토 evidence의 정확한 12자 이상 인용,reason:20자 이상 판단}],relations:[{id:key,excerpt:관계 reason의 정확한 인용,reason:20자 이상 판단}]}을 기록하고 모든 선정 파일과 관계를 포함하라. "
@@ -1351,27 +1359,18 @@ class PlanningLifecycleCoordinator:
                     self._ports.state.compact_catalog(context.repo),
                     run.mutable_ready_snapshot,
                 )
-            final_session_errors = []
-
             def save_final_session(session_id):
                 if final_page is not None:
-                    try:
-                        self._ports.reconciliation.synthesis_session(context.repo, final_page, session_id)
-                    except maintenance_reconciliation.ReconciliationError as error:
-                        final_session_errors.append(str(error))
+                    self._ports.reconciliation.synthesis_session(context.repo, final_page, session_id)
                 self._ports.state.update(context.repo, planner_session_id=session_id)
 
             before = self._ports.agent.begin_scope(role, worktree)
             result = self._ports.agent.run_planner(
-                worktree,
-                prompt,
-                final_page.session_id if final_page is not None else row.planner_session_id,
+                worktree, prompt, final_page.session_id if final_page is not None else row.planner_session_id,
                 save_final_session,
             )
             if result.session_id:
                 save_final_session(result.session_id)
-            if final_session_errors:
-                scope_error = final_session_errors[0]
             scope_result = self._ports.agent.finish_scope(role, worktree, before)
             if scope_result.error:
                 scope_error = scope_result.error
@@ -1506,6 +1505,8 @@ class PlanningLifecycleCoordinator:
                 context.repo, context.repo_path, context.base_branch,
                 run.maintenance_cycle.revision, str(run.row.active_sha),
             )
+            if progress.pending_scan:
+                return PlanningOutcome(PlanningOutcomeKind.WAITING)
             relation = progress.next_relation
             if relation is None:
                 return self._synthesize_one_page(run, worktree, progress)
@@ -1557,14 +1558,14 @@ class PlanningLifecycleCoordinator:
 
     def _synthesize_one_page(self, run: _PlanningRun, worktree: Path,
                              progress) -> PlanningOutcome | None:
-        """Consume one bounded evidence page in the final Planner's durable session."""
+        """Assess one page independently; only its durable result crosses sessions."""
         context, port = run.context, self._ports.reconciliation
         page = port.synthesis(context.repo, run.maintenance_cycle.revision,
                               str(run.row.active_sha), progress)
         if page.index == page.total:
-            if page.session_id:
-                self._ports.state.update(context.repo, planner_session_id=page.session_id)
             return None
+        manifest = port.synthesis_export(context.repo, page, progress,
+                                         context.state_dir / "maintenance-evidence")
         before = self._ports.agent.begin_scope("maintenance_planner", worktree)
         session_errors = []
 
@@ -1575,7 +1576,7 @@ class PlanningLifecycleCoordinator:
                 session_errors.append(str(error))
 
         result = self._ports.agent.run_planner(
-            worktree, maintenance_reconciliation.synthesis_prompt(page),
+            worktree, maintenance_reconciliation.synthesis_prompt(page, manifest),
             page.session_id, save_session,
         )
         if result.session_id:

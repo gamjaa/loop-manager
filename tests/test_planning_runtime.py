@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 import sqlite3
+import tempfile
 import unittest
 from unittest import mock
 
@@ -493,13 +494,32 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         self.assertEqual(ports.file_review.complete.call_args.args[2], source)
         self.assertEqual(ports.file_review.fail.call_count, 0)
 
-    def test_final_assessment_consumes_bounded_pages_in_one_resumable_session(self):
+    def test_pending_reverse_scan_yields_before_relation_or_synthesis_agent(self):
+        ports = FakePorts(
+            planning_snapshot(phase="PLANNING", active_sha="a" * 40),
+            maintenance_cycle(phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+                              cycle_base_sha="a" * 40, revision=4),
+        )
+        ports.reconciliation = mock.Mock()
+        ports.reconciliation.progress.return_value = maintenance_reconciliation.ReconciliationProgress(
+            (), (), (), None, pending_scan=True)
+        coordinator = PlanningLifecycleCoordinator(ports)
+        run = coordinator._new_run(self.context)
+        outcome = coordinator._reconcile_one_relation(run, Path("/worktree"))
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.WAITING)
+        self.assertEqual(ports.agent.run_count, 0)
+        ports.reconciliation.synthesis.assert_not_called()
+
+    def test_final_assessment_uses_independent_pages_and_durable_evidence(self):
         import sqlite3
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)
         connection.execute("CREATE TABLE projects (repo TEXT PRIMARY KEY)")
         connection.execute("INSERT INTO projects VALUES (?)", (self.context.repo,))
         repository = maintenance_reconciliation.SynthesisRepository(connection)
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        context = replace(self.context, state_dir=Path(directory.name))
         ports = FakePorts(
             planning_snapshot(phase="PLANNING", active_sha="a" * 40),
             maintenance_cycle(phase=maintenance_state.MaintenancePhase.ASSESSMENT,
@@ -515,7 +535,8 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         ports.file_review = mock.Mock()
         ports.reconciliation = SimpleNamespace(
             progress=mock.Mock(return_value=progress), synthesis=repository.prepare,
-            synthesis_session=repository.session, synthesis_complete=repository.complete)
+            synthesis_session=repository.session, synthesis_complete=repository.complete,
+            synthesis_export=repository.export)
         ports.validation.maintenance_prompt = mock.Mock(return_value="assessment prompt")
         prompts, sessions = [], []
 
@@ -526,16 +547,22 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
             page = repository.prepare(self.context.repo, 4, "a" * 40, progress)
             if page.index < page.total:
                 message = maintenance_reconciliation.SYNTHESIS_PREFIX + json.dumps({
-                    "key": page.key, "excerpt": page.text[:20],
+                    "key": page.key, "excerpt": page.text.partition("\n")[2][:20], "has_issue": True,
                     "assessment": "Retain every local issue and compare across the reviewed pages.",
                 })
             else:
+                # This final call has never seen prior sessions. All validated
+                # observations must still be recoverable via the supplied bundle.
+                manifest = next(Path(directory.name).rglob("manifest.json"))
+                self.assertIn(str(manifest), prompt)
+                saved = json.loads((manifest.parent / "page-00000000.json").read_text())
+                self.assertIn("Retain every local issue", saved["result"]["assessment"])
                 message = "planner result"
             return PlanningAgentResult(0, message, "session-one", PlanningAgentResultKind.SUCCESS)
 
         ports.agent.run_planner = mock.Mock(side_effect=consume)
         coordinator = PlanningLifecycleCoordinator(ports)
-        run = coordinator._new_run(self.context)
+        run = coordinator._new_run(context)
         run.planning_worktree = Path("/worktree")
         run.maintenance_context = object()
         with mock.patch.object(coordinator, "_review_one_file", return_value=None):
@@ -544,7 +571,7 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
                 self.assertEqual(result.kind, PlanningOutcomeKind.WAITING)
             self.assertIsNone(coordinator._run_planner_turn(run))
         self.assertIsNone(sessions[0])
-        self.assertTrue(all(session == "session-one" for session in sessions[1:]))
+        self.assertTrue(all(session is None for session in sessions))
         self.assertTrue(all(len(prompt.encode()) < 50_000 for prompt in prompts))
         self.assertIn("unique responsibility issue 12", "".join(prompts[:-1]))
         self.assertNotIn("chunk_reviews", prompts[-1])

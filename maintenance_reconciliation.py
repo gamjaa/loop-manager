@@ -6,10 +6,11 @@ from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
+import re
 import sqlite3
 from typing import Mapping, Sequence
 
-from maintenance_file_inventory import SourceInventory, TrackedSource, tracked_source_inventory
+from maintenance_file_inventory import SourceInventory, TrackedSource, cached_source_inventory
 from maintenance_file_review import FileReviewError, FileReviewProgress, source_bytes
 
 
@@ -67,6 +68,7 @@ class ReconciliationProgress:
     next_relation: Relation | None
     excluded_candidates: tuple[dict, ...] = ()
     file_reviews: tuple[dict, ...] = ()
+    pending_scan: bool = False
 
 
 def _note(value: object, field: str, minimum: int = 12) -> str:
@@ -144,6 +146,7 @@ def _excluded_candidates(inventory: SourceInventory, progress: FileReviewProgres
 def relation_candidates(
     inventory: SourceInventory, progress: FileReviewProgress,
     previous_maps: Mapping[str, dict], context_contents: Mapping[str, str],
+    cached_signals: Sequence[dict] = (),
 ) -> tuple[Relation, ...]:
     """Combine both directions; source search fills gaps in old map coverage."""
     if progress.next_unit is not None or len(progress.completed) != len(progress.selected):
@@ -188,21 +191,8 @@ def relation_candidates(
             if (target != path and len(responsibility) >= 12
                 and code_map["responsibility"].strip().casefold() == responsibility):
                 add(path, target, "similar_map_responsibility", responsibility)
-    # Even current maps are incomplete: search every context source for selected
-    # public names/paths, including files with a valid cached map.
-    for path, content in context_contents.items():
-        if path not in sources:
-            continue
-        for item in progress.completed:
-            target = item["path"]
-            needles = (target, target.rsplit("/", 1)[-1],
-                       *item["code_map"]["public_symbols"])
-            for needle in needles:
-                if len(needle) >= 4 and needle in content:
-                    add(path, target, "source_reverse" if path in maps else "unmapped_reverse", needle)
-            for ref in item["pending_references"]:
-                if ref["target_path"] is None and ref["symbol"] and ref["symbol"] in content:
-                    add(target, path, "unmapped_symbol_target", ref["evidence"])
+    for signal in (*cached_signals, *reverse_signals(progress, maps, context_contents)):
+        add(signal["origin"], signal["target"], signal["kind"], signal["evidence"])
     return tuple(
         Relation(_key(*pair), sources[pair[0]], sources[pair[1]],
                  tuple(sorted(values, key=lambda value: json.dumps(value, sort_keys=True))))
@@ -210,17 +200,49 @@ def relation_candidates(
     )
 
 
-def parse_relation(output: str, relation: Relation, left: bytes, right: bytes) -> dict:
+def _contains_symbol(content: str, symbol: str) -> bool:
+    return re.search(r"(?<!\w)" + re.escape(symbol) + r"(?!\w)", content) is not None
+
+
+def reverse_signals(progress: FileReviewProgress, maps: Mapping[str, dict],
+                    context: Mapping[str, str]) -> tuple[dict, ...]:
+    signals = []
+    for path, content in context.items():
+        for item in progress.completed:
+            target = item["path"]
+            paths = (target, target.rsplit("/", 1)[-1])
+            symbols = item["code_map"]["public_symbols"]
+            for needle in (*paths, *symbols):
+                # Short public names (foo, id, x) are still real references.
+                # False positives are resolved by the relation verification unit.
+                if needle and (needle in content if needle in paths else _contains_symbol(content, needle)):
+                    signals.append({"origin": path, "target": target,
+                                    "kind": "source_reverse" if path in maps else "unmapped_reverse",
+                                    "evidence": needle})
+            for ref in item["pending_references"]:
+                if ref["target_path"] is None and ref["symbol"] and _contains_symbol(content, ref["symbol"]):
+                    signals.append({"origin": target, "target": path,
+                                    "kind": "unmapped_symbol_target", "evidence": ref["evidence"]})
+    return tuple(signals)
+
+
+def _relation_metadata(output: str, relation: Relation) -> dict:
     value = _single_json(output, RELATION_PREFIX)
     if set(value) != {"key", "status", "left_excerpt", "right_excerpt", "reason"}:
         raise ReconciliationError("관계 확인 결과 필드가 유효하지 않습니다.")
-    if value["key"] != relation.key or value["status"] not in {"confirmed", "excluded"}:
+    if value["key"] != relation.key or not isinstance(value["status"], str) or value["status"] not in {"confirmed", "excluded"}:
         raise ReconciliationError("관계 identity 또는 처리 상태가 다릅니다.")
+    for field in ("left_excerpt", "right_excerpt"):
+        _note(value[field], field, 4)
+    value["reason"] = _note(value["reason"], "관계 확인·제외 근거", 20)
+    return value
+
+
+def parse_relation(output: str, relation: Relation, left: bytes, right: bytes) -> dict:
+    value = _relation_metadata(output, relation)
     for field, content in (("left_excerpt", left), ("right_excerpt", right)):
-        excerpt = _note(value[field], field, minimum=4)
-        if excerpt not in content.decode("utf-8", "backslashreplace"):
+        if value[field].strip() not in content.decode("utf-8", "backslashreplace"):
             raise ReconciliationError(f"{field}가 현재 원본에 없습니다.")
-    value["reason"] = _note(value["reason"], "관계 확인·제외 근거", minimum=20)
     return value
 
 
@@ -255,6 +277,12 @@ class ReconciliationRepository:
     def __init__(self, connection: sqlite3.Connection):
         self.connection = connection
         ensure_schema(connection)
+        connection.execute("""CREATE TABLE IF NOT EXISTS provisional_reverse_scans (
+            repo TEXT NOT NULL, path TEXT NOT NULL, identity TEXT NOT NULL,
+            signals_json TEXT NOT NULL, PRIMARY KEY (repo, path))""")
+        connection.execute("""CREATE TABLE IF NOT EXISTS provisional_relation_receipts (
+            repo TEXT NOT NULL, relation_key TEXT NOT NULL, identity TEXT NOT NULL,
+            PRIMARY KEY (repo, relation_key))""")
 
     def valid_maps(self, repo: str, inventory: SourceInventory) -> dict[str, dict]:
         sources = {item.path: item for item in inventory.sources}
@@ -274,15 +302,39 @@ class ReconciliationRepository:
 
     def progress(self, repo: str, repository: Path, base: str, cycle_revision: int,
                  inventory: SourceInventory, reviews: FileReviewProgress) -> ReconciliationProgress:
-        if tracked_source_inventory(repository, base, inventory.revision) != inventory:
+        if cached_source_inventory(self.connection, repository, base, inventory.revision) != inventory:
             raise ReconciliationError("관계 종합 source가 현재 원격과 다릅니다.")
         maps = self.valid_maps(repo, inventory)
-        context = {}
         selected = {item.path for item in reviews.selected}
+        query = hashlib.sha256(json.dumps(
+            ["reverse-symbol-v1", sorted(reviews.completed, key=lambda item: item["path"])],
+            ensure_ascii=False, sort_keys=True,
+        ).encode()).hexdigest()
+        signals, remaining, reads = [], False, 0
         for source in inventory.sources:
-            if source.path not in selected:
-                context[source.path] = source_bytes(repository, base, source).decode("utf-8", "backslashreplace")
-        relations = relation_candidates(inventory, reviews, maps, context)
+            if source.path in selected:
+                continue
+            identity = json.dumps([cycle_revision, source.__dict__, query, source.path in maps], sort_keys=True)
+            row = self.connection.execute(
+                "SELECT identity, signals_json FROM provisional_reverse_scans WHERE repo = ? AND path = ?",
+                (repo, source.path),
+            ).fetchone()
+            if row and row[0] == identity:
+                signals.extend(json.loads(row[1]))
+                continue
+            if reads >= 16:
+                remaining = True
+                continue
+            content = source_bytes(repository, base, source).decode("utf-8", "backslashreplace")
+            found = reverse_signals(reviews, maps, {source.path: content})
+            # Commit each source independently so an interrupted batch resumes at
+            # the next source. Store only matched signals, never all source text.
+            with self.connection:
+                self.connection.execute("INSERT OR REPLACE INTO provisional_reverse_scans VALUES (?, ?, ?, ?)",
+                    (repo, source.path, identity, json.dumps(found, ensure_ascii=False)))
+            signals.extend(found)
+            reads += 1
+        relations = relation_candidates(inventory, reviews, maps, {}, signals)
         expected = {item.key: item for item in relations}
         completed = {}
         with self.connection:
@@ -297,17 +349,28 @@ class ReconciliationRepository:
                     continue
                 if raw_result:
                     try:
-                        completed[key] = parse_relation(
-                            RELATION_PREFIX + raw_result, relation,
-                            source_bytes(repository, base, relation.left),
-                            source_bytes(repository, base, relation.right),
-                        )
+                        identity = hashlib.sha256(json.dumps([
+                            cycle, revision, relation.left.__dict__, relation.right.__dict__,
+                            raw_candidate, raw_result,
+                        ], sort_keys=True).encode()).hexdigest()
+                        receipt = self.connection.execute(
+                            "SELECT identity FROM provisional_relation_receipts WHERE repo = ? AND relation_key = ?",
+                            (repo, key),
+                        ).fetchone()
+                        if receipt and receipt[0] == identity:
+                            completed[key] = _relation_metadata(RELATION_PREFIX + raw_result, relation)
+                        else:
+                            completed[key] = parse_relation(RELATION_PREFIX + raw_result, relation,
+                                source_bytes(repository, base, relation.left),
+                                source_bytes(repository, base, relation.right))
+                            self.connection.execute("INSERT OR REPLACE INTO provisional_relation_receipts VALUES (?, ?, ?)",
+                                                    (repo, key, identity))
                     except ReconciliationError:
                         self.connection.execute("DELETE FROM provisional_relations WHERE repo = ? AND relation_key = ?", (repo, key))
         next_relation = next((item for item in relations if item.key not in completed), None)
         return ReconciliationProgress(reviews.selected, tuple(completed[key] for key in sorted(completed)),
                                       relations, next_relation,
-                                      _excluded_candidates(inventory, reviews, maps), reviews.completed)
+                                      _excluded_candidates(inventory, reviews, maps), reviews.completed, remaining)
 
     def start(self, repo: str, cycle_revision: int, revision: str, relation: Relation) -> None:
         with self.connection:
@@ -420,7 +483,7 @@ def parse_findings(output: str, progress: ReconciliationProgress,
                    inventory: SourceInventory, contents: Mapping[str, bytes],
                    existing_plans: Mapping[str, str], new_plan_ids: Sequence[str],
                    plan_texts: Mapping[str, str] | None = None) -> dict:
-    if progress.next_relation is not None or len(progress.completed) != len(progress.relations):
+    if progress.pending_scan or progress.next_relation is not None or len(progress.completed) != len(progress.relations):
         raise ReconciliationError("미확인 파일 간 관계가 남았습니다.")
     value = _single_json(output, FINDINGS_PREFIX)
     if set(value) != {"source_revision", "findings", "no_issue_reason"} or value["source_revision"] != inventory.revision:
@@ -513,7 +576,7 @@ class SynthesisPage:
 
 def synthesis_pages(progress: ReconciliationProgress) -> tuple[str, ...]:
     """Losslessly page validated evidence, including oversized single-file records."""
-    if progress.next_relation is not None or len(progress.completed) != len(progress.relations):
+    if progress.pending_scan or progress.next_relation is not None or len(progress.completed) != len(progress.relations):
         raise ReconciliationError("미확인 관계가 있어 종합을 시작할 수 없습니다.")
     records = (
         *(('selected', source.__dict__) for source in progress.selected),
@@ -522,27 +585,31 @@ def synthesis_pages(progress: ReconciliationProgress) -> tuple[str, ...]:
         *(('excluded_candidate', candidate) for candidate in progress.excluded_candidates),
     )
     pages = []
-    for kind, record in records:
+    for record_index, (kind, record) in enumerate(records):
         text = json.dumps({"kind": kind, "value": record}, ensure_ascii=False, sort_keys=True)
-        # A large chunk_reviews array must not bypass the per-call bound. Fragments
-        # preserve every character; the same session consumes them in order.
-        count = (len(text) + SYNTHESIS_PAGE_CHARS - 1) // SYNTHESIS_PAGE_CHARS
+        # Preserve record boundaries for independent sessions. Neighbouring
+        # fragments remain retrievable from the durable evidence bundle.
+        fragment_limit = SYNTHESIS_PAGE_CHARS - 256  # Reserve space for record/part metadata.
+        count = (len(text) + fragment_limit - 1) // fragment_limit
         width = (len(text) + count - 1) // count
-        pages.extend(text[offset:offset + width] for offset in range(0, len(text), width))
+        pages.extend(f"record={record_index} kind={kind} part={part + 1}/{count}\n" + text[offset:offset + width]
+                     for part, offset in enumerate(range(0, len(text), width)))
     return tuple(pages)
 
 
-def synthesis_prompt(page: SynthesisPage) -> str:
+def synthesis_prompt(page: SynthesisPage, manifest: Path) -> str:
     return (
         "유지보수 종합의 증거 페이지를 순서대로 검토하라. 파일을 수정하지 마라. "
         "이것은 이미 검증된 파일 검토·관계 결과이며 원본 전체를 다시 읽지 마라. "
-        "큰 JSON 기록은 여러 페이지에 걸칠 수 있다. 단일 파일의 구조 문제와 "
-        "다른 페이지의 관련 발견을 놓치지 말고 이 세션에서 누적하라. "
+        "큰 JSON 기록은 여러 페이지에 걸칠 수 있다. 단일 파일의 구조 문제도 포함해 "
+        "독립된 세션에서 판단하라. 다른 조각의 문맥이 필요하면 아래 증거 manifest와 "
+        "같은 record의 인접 페이지 또는 관련 관계만 제한된 크기로 조회하라. "
+        "이전 세션의 기억에 의존하지 마라. "
         "최종 계획 및 FINDINGS_RESULT는 모든 페이지를 처리한 다음 요청한다.\n"
-        f"page_key={page.key}, page={page.index + 1}/{page.total}\n"
+        f"evidence_manifest={manifest}\npage_key={page.key}, page={page.index + 1}/{page.total}\n"
         + page.text
         + "\nSYNTHESIS_PAGE_RESULT: 한 줄 JSON {key:page_key, "
-        "excerpt:이 페이지의 정확한 12자 이상 인용, "
+        "excerpt:이 페이지의 정확한 12자 이상 인용, has_issue:구조 문제 후보 유무 boolean, "
         "assessment:발견 후보 또는 문제 없음 근거와 앞뒤 페이지의 연결을 설명하는 20~2000자}를 반환하라."
     )
 
@@ -566,7 +633,7 @@ class SynthesisRepository:
                 progress: ReconciliationProgress) -> SynthesisPage:
         pages = synthesis_pages(progress)
         digest = hashlib.sha256(json.dumps(
-            [cycle, revision, pages], ensure_ascii=False,
+            ["independent-pages-v2", cycle, revision, pages], ensure_ascii=False,
         ).encode()).hexdigest()
         with self.connection:
             row = self.connection.execute(
@@ -583,35 +650,23 @@ class SynthesisRepository:
         return SynthesisPage(digest, index, len(pages), pages[index] if index < len(pages) else "", session)
 
     def session(self, repo: str, page: SynthesisPage, session_id: str) -> None:
-        replaced = False
         with self.connection:
-            row = self.connection.execute(
-                "SELECT session_id FROM provisional_synthesis WHERE repo = ? AND digest = ? AND next_page = ?",
-                (repo, page.digest, page.index),
-            ).fetchone()
-            if row is None:
-                raise ReconciliationError("종합 페이지의 source가 바뀌었습니다.")
-            if row[0] and row[0] != session_id and page.index:
-                # A provider replacement session lacks prior pages. Replay them;
-                # never claim complete coverage using only the latest fragment.
-                self.connection.execute(
-                    "UPDATE provisional_synthesis SET next_page = 0, session_id = ?, results_json = '[]' WHERE repo = ?",
-                    (session_id, repo),
-                )
-                replaced = True
-            self.connection.execute(
-                "UPDATE provisional_synthesis SET session_id = ? WHERE repo = ?", (session_id, repo),
+            changed = self.connection.execute(
+                "UPDATE provisional_synthesis SET session_id = ? WHERE repo = ? AND digest = ? AND next_page = ?",
+                (session_id, repo, page.digest, page.index),
             )
-        if replaced:
-            raise ReconciliationError("종합 세션이 바뀌어 첫 페이지부터 재개합니다.")
+            if changed.rowcount != 1:
+                raise ReconciliationError("종합 페이지의 source가 바뀌었습니다.")
 
     def complete(self, repo: str, page: SynthesisPage, output: str) -> None:
         value = _single_json(output, SYNTHESIS_PREFIX)
-        if set(value) != {"key", "excerpt", "assessment"} or value["key"] != page.key:
+        if set(value) != {"key", "excerpt", "assessment", "has_issue"} or value["key"] != page.key:
             raise ReconciliationError("종합 페이지 identity가 다릅니다.")
-        if _note(value["excerpt"], "페이지 근거", 12) not in page.text:
+        if _note(value["excerpt"], "페이지 근거", 12) not in page.text.partition("\n")[2]:
             raise ReconciliationError("종합 페이지 근거가 다릅니다.")
         _note(value["assessment"], "페이지 판단", 20)
+        if type(value["has_issue"]) is not bool:
+            raise ReconciliationError("페이지의 문제 후보 유무가 필요합니다.")
         with self.connection:
             row = self.connection.execute(
                 "SELECT results_json, session_id FROM provisional_synthesis "
@@ -622,6 +677,89 @@ class SynthesisRepository:
             results = json.loads(row[0])
             results.append(value)
             self.connection.execute(
-                "UPDATE provisional_synthesis SET next_page = next_page + 1, results_json = ? WHERE repo = ?",
+                "UPDATE provisional_synthesis SET next_page = next_page + 1, session_id = NULL, results_json = ? WHERE repo = ?",
                 (json.dumps(results, ensure_ascii=False), repo),
             )
+
+
+    def results(self, repo: str, page: SynthesisPage) -> list[dict]:
+        row = self.connection.execute(
+            "SELECT results_json FROM provisional_synthesis WHERE repo = ? AND digest = ? AND next_page = ?",
+            (repo, page.digest, page.index),
+        ).fetchone()
+        if row is None:
+            raise ReconciliationError("종합 증거 snapshot이 바뀌었습니다.")
+        results = json.loads(row[0])
+        if len(results) != page.index:
+            raise ReconciliationError("종합 페이지 결과가 누락됐습니다.")
+        return results
+
+    def export(self, repo: str, page: SynthesisPage, progress: ReconciliationProgress,
+               directory: Path) -> Path:
+        """Materialize disposable, lossless input snapshots outside the worktree.
+
+        SQLite remains authoritative; agent edits to exported files never change
+        receipts or final coverage checks. Each file is independently retrievable.
+        """
+        directory = directory / hashlib.sha256(repo.encode()).hexdigest() / page.digest
+        directory.mkdir(parents=True, exist_ok=True)
+        pages, results = synthesis_pages(progress), self.results(repo, page)
+        if len(pages) != page.total:
+            raise ReconciliationError("종합 증거 페이지 집합이 다릅니다.")
+        manifest = directory / "manifest.json"
+        previous = None
+        if manifest.exists():
+            try:
+                previous = json.loads(manifest.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                pass
+        initialized = (isinstance(previous, dict) and previous.get("digest") == page.digest
+                       and previous.get("total") == page.total
+                       and type(previous.get("completed")) is int
+                       and 0 <= previous["completed"] <= page.index)
+        # Evidence is immutable for a digest. Publish it once, then update only
+        # newly completed receipts; do not reread every exported file per turn.
+        indices = range(previous["completed"], page.index) if initialized else range(len(pages))
+        for index in indices:
+            record = {"key": f"{page.digest}:{index}", "text": pages[index],
+                      "result": results[index] if index < len(results) else None}
+            path = directory / f"page-{index:08d}.json"
+            path.write_text(json.dumps(record, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        manifest.write_text(json.dumps({"digest": page.digest, "total": page.total,
+            "completed": page.index, "page_pattern": "page-{index:08d}.json",
+            "instructions": "Read individual pages in bounded ranges; text and result are lossless durable evidence."},
+            ensure_ascii=False), encoding="utf-8")
+        return manifest
+
+    def validate_resolutions(self, repo: str, page: SynthesisPage, output: str, findings: dict) -> None:
+        if not page.total:
+            return
+        value = _single_json(output, "SYNTHESIS_RESOLUTIONS: ")
+        if (set(value) != {"digest", "pages"} or value["digest"] != page.digest
+            or not isinstance(value["pages"], list)):
+            raise ReconciliationError("종합 페이지 처리 결과의 source가 다릅니다.")
+        results = self.results(repo, page)
+        expected = {item["key"]: item for item in results}
+        issue_keys = {item["issue_key"] for item in findings["findings"]}
+        seen = set()
+        for item in value["pages"]:
+            if not isinstance(item, dict) or set(item) != {"key", "excerpt", "issue_keys", "reason", "disposition"}:
+                raise ReconciliationError("종합 페이지 처리 필드가 다릅니다.")
+            key = item["key"]
+            if not isinstance(key, str) or key not in expected or key in seen:
+                raise ReconciliationError("종합 페이지 처리가 누락·중복되거나 오래됐습니다.")
+            seen.add(key)
+            if _note(item["excerpt"], "저장된 판단 인용", 12) not in expected[key]["assessment"]:
+                raise ReconciliationError("종합 페이지의 저장된 판단과 다릅니다.")
+            keys = item["issue_keys"]
+            if not isinstance(keys, list) or any(not isinstance(k, str) or k not in issue_keys for k in keys):
+                raise ReconciliationError("페이지 발견 연결이 다릅니다.")
+            disposition = item["disposition"]
+            if (not isinstance(disposition, str) or disposition not in {"linked", "excluded", "no_issue"}
+                or (disposition == "linked" and not keys)
+                or (disposition != "linked" and keys)
+                or (disposition == "no_issue" and expected[key]["has_issue"])):
+                raise ReconciliationError("저장된 문제 후보는 발견 연결 또는 명시적인 제외가 필요합니다.")
+            _note(item["reason"], "페이지 발견 연결 또는 제외 이유", 20)
+        if seen != set(expected):
+            raise ReconciliationError("모든 종합 페이지의 저장된 판단 처리가 필요합니다.")

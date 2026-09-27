@@ -147,5 +147,28 @@ class TrackedSourceInventoryTest(unittest.TestCase):
                 source_inventory.tracked_source_inventory(self.repo, "main", revision)
 
 
+class InventoryCacheUnitTest(unittest.TestCase):
+    def test_cached_inventory_checks_remote_but_does_not_reload_blobs(self):
+        import sqlite3
+        from unittest import mock
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        inventory = source_inventory.SourceInventory("a" * 40, (), ())
+        with (mock.patch.object(source_inventory, "verify_remote_revision") as verify,
+              mock.patch.object(source_inventory, "tracked_source_inventory", return_value=inventory) as read):
+            for _ in range(3):
+                self.assertEqual(source_inventory.cached_source_inventory(connection, Path("repo"), "main", inventory.revision), inventory)
+            self.assertEqual(verify.call_count, 3)
+            read.assert_called_once()
+            verify.side_effect = source_inventory.SourceInventoryError("changed ref")
+            with self.assertRaises(source_inventory.SourceInventoryError):
+                source_inventory.cached_source_inventory(connection, Path("repo"), "main", inventory.revision)
+            self.assertEqual(read.call_count, 1)
+            verify.side_effect = None
+            read.return_value = source_inventory.SourceInventory("b" * 40, (), ())
+            source_inventory.cached_source_inventory(connection, Path("repo"), "main", "b" * 40)
+            self.assertEqual(read.call_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
