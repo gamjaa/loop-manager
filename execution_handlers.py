@@ -3008,7 +3008,9 @@ class ExecutionHandlers:
         ):
             return self._final()
         try:
-            disposition = self._parse_worker_outcome(context, saved.worker_result)
+            disposition = self._parse_worker_outcome(
+                context, saved.worker_result, allow_legacy_ready=True,
+            )
             if disposition.kind == 'needs_user_decision':
                 return self._block_worker_decision(
                     context, saved.worker_result, disposition,

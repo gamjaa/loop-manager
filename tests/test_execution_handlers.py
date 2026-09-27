@@ -1691,6 +1691,12 @@ class ExecutionHandlerTests(TestCase):
         self.assertEqual(self.handler.rebase_corrections.get('repo', 'G-047').occurrence, 4)
 
     def test_saved_worker_result_finishes_after_restart_without_second_agent_turn(self):
+        legacy_result = (
+            'COMMIT_TITLE: Preserve resolved rebase changes\n'
+            'PR_SUMMARY: Resolves the saved rebase conflict.\n'
+            'TARGETED_TESTS:\ntargeted test: PASS'
+        )
+        self.effects.validation.parse_worker_result.side_effect = lm.parse_worker_result
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)
         self.handler.effects = self.effects
@@ -1716,7 +1722,7 @@ class ExecutionHandlerTests(TestCase):
         self.handler.rebase_corrections.finish_turn(
             'repo', 'G-047', expected_generation=turn.generation,
             turn=turn.pending_turn, session='same-session',
-            result=READY_WORKER_RESULT,
+            result=legacy_result,
             scope_marker=observation.progress,
         )
 
@@ -1724,7 +1730,10 @@ class ExecutionHandlerTests(TestCase):
 
         self.assertEqual(resumed.context.phase, ExecutionPhase.VERIFYING)
         self.effects.agent.run_agent.assert_not_called()
-        self.assertEqual(self.state.row()['worker_result'], READY_WORKER_RESULT)
+        self.assertEqual(self.state.row()['worker_result'], legacy_result)
+
+        self.effects.validation.parse_worker_result.assert_any_call(legacy_result, self.plan)
+        self.effects.blocking.block_active_execplan.assert_not_called()
 
     def test_changed_pending_turn_without_scope_baseline_blocks_before_agent(self):
         checkpoint = ExecutionCheckpointRepository(self.connection)
