@@ -12,6 +12,7 @@ from typing import Iterator, Sequence
 from uuid import uuid4
 
 import maintenance_file_ledger
+import maintenance_file_publication
 import maintenance_file_review
 import maintenance_reconciliation
 
@@ -125,6 +126,7 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.execute(MAINTENANCE_SCHEMA)
     connection.execute(DOCUMENT_DRAFTS_SCHEMA)
     maintenance_file_ledger.ensure_schema(connection)
+    maintenance_file_publication.ensure_schema(connection)
     maintenance_file_review.ensure_schema(connection)
     maintenance_reconciliation.ensure_schema(connection)
     columns = {
@@ -538,6 +540,7 @@ class MaintenanceRepository:
         expected_revision: int,
         source_sha: str,
         expected_merged_count: int,
+        bump_revision: bool = True,
     ) -> MaintenanceCycle:
         """Persist a verified file assessment success for the publication path."""
 
@@ -562,9 +565,9 @@ class MaintenanceRepository:
             self.connection.execute(
                 "UPDATE maintenance_cycles SET "
                 "last_success_file_assessment_merged_count = ?, "
-                "revision = revision + 1, updated_at = CURRENT_TIMESTAMP "
+                "revision = revision + ?, updated_at = CURRENT_TIMESTAMP "
                 "WHERE repo = ? AND revision = ?",
-                (count, repo, expected_revision),
+                (count, int(bump_revision), repo, expected_revision),
             )
             return self.get(repo)
 
@@ -602,6 +605,7 @@ class MaintenanceRepository:
         *,
         include_general_planning: bool = False,
         self_repository: bool = False,
+        completion_candidate: bool = False,
     ) -> tuple[MaintenanceCycle, bool]:
         """Create one assessment cycle, or return the already-active cycle."""
 
@@ -610,7 +614,10 @@ class MaintenanceRepository:
             if state.phase is not MaintenancePhase.IDLE:
                 return state, False
             merged_count = self._merged_count(repo)
-            decision = self.due(repo, interval, self_repository=self_repository)
+            decision = self.file_assessment_due(
+                repo, interval, self_repository=self_repository,
+                completion_candidate=completion_candidate,
+            )
             if not decision.required:
                 return state, False
             self.connection.execute(

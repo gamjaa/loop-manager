@@ -17,6 +17,9 @@ import execplan_catalog_state
 import loop_manager
 import maintenance_planning
 import maintenance_findings
+import maintenance_file_inventory
+import maintenance_file_ledger
+import maintenance_file_publication
 import maintenance_reconciliation
 import maintenance_state
 from maintenance_file_inventory import SourceInventory, TrackedSource
@@ -499,13 +502,23 @@ class MaintenancePlanningTest(unittest.TestCase):
         )
 
     def _begin_barrier(self) -> loop_manager.MaintenancePlanningContext:
-        repository = maintenance_state.MaintenanceRepository(self.connection)
-        repository.begin_assessment_if_due(
-            str(self.repo), 5, self.base_sha
-        )
+        self._begin_legacy_assessment(self.base_sha)
         return loop_manager.prepare_maintenance_planning_context(
             self.connection, str(self.repo), self.repo, self.base_sha
         )
+
+    def _begin_legacy_assessment(self, source_sha: str):
+        """Model a cycle already active before file schedules were installed."""
+        maintenance_state.ensure_schema(self.connection)
+        self.connection.execute(
+            "INSERT INTO maintenance_cycles "
+            "(repo, phase, cycle_base_sha, cycle_start_merged_count, revision) "
+            "VALUES (?, 'assessment', ?, 1, 1)",
+            (str(self.repo), source_sha),
+        )
+        return maintenance_state.MaintenanceRepository(self.connection).get(
+            str(self.repo)
+        ), True
 
     def _write_barrier_batch(self) -> None:
         self._write_plan("G-002", "Extract Boundary")
@@ -585,9 +598,7 @@ class MaintenancePlanningTest(unittest.TestCase):
             )
 
         git(self.repo, "restore", "docs/plans/[G-001] Ready Feature.md")
-        maintenance_state.MaintenanceRepository(
-            self.connection
-        ).begin_assessment_if_due(str(self.repo), 5, self.base_sha)
+        self._begin_legacy_assessment(self.base_sha)
         self.connection.execute(
             "UPDATE exec_plans SET workspace_owned = 2 "
             "WHERE repo = ? AND plan_id = 'G-001'",
@@ -620,9 +631,7 @@ class MaintenancePlanningTest(unittest.TestCase):
             (mismatched_revision, mismatched_revision, str(self.repo)),
         )
         self.connection.commit()
-        maintenance_state.MaintenanceRepository(
-            self.connection
-        ).begin_assessment_if_due(str(self.repo), 5, self.base_sha)
+        self._begin_legacy_assessment(self.base_sha)
 
         with self.assertRaisesRegex(
             loop_manager.MaintenancePlanningError, "plan revision SHA"
@@ -672,9 +681,7 @@ class MaintenancePlanningTest(unittest.TestCase):
             self._begin_barrier()
 
     def test_ready_snapshot_rejects_all_ownership_nonready_and_hash_drift(self):
-        maintenance_state.MaintenanceRepository(
-            self.connection
-        ).begin_assessment_if_due(str(self.repo), 5, self.base_sha)
+        self._begin_legacy_assessment(self.base_sha)
 
         ownership_cases = (
             ("branch", "loop-manager/G-001"),
@@ -939,9 +946,7 @@ class MaintenancePlanningTest(unittest.TestCase):
 
     def test_revalidation_preserves_goal_and_allows_only_current_structure_sections(self):
         repository = maintenance_state.MaintenanceRepository(self.connection)
-        cycle, _created = repository.begin_assessment_if_due(
-            str(self.repo), 5, self.base_sha
-        )
+        cycle, _created = self._begin_legacy_assessment(self.base_sha)
         refactoring = repository.transition(
             str(self.repo),
             expected_phase=maintenance_state.MaintenancePhase.ASSESSMENT,
@@ -1344,6 +1349,78 @@ class MaintenancePlanningTest(unittest.TestCase):
             completed.phase, maintenance_state.MaintenancePhase.REFACTORING
         )
 
+    def test_refactoring_publication_promotes_file_evidence_once_after_remote_push(self):
+        context = self._begin_barrier()
+        self.connection.execute(
+            "UPDATE maintenance_cycles SET file_assessment_start_merged_count = 1 "
+            "WHERE repo = ?", (str(self.repo),),
+        )
+        self.connection.execute(
+            "INSERT INTO execplan_catalog_revisions "
+            "(repo, revision_sha, catalog_fingerprint) VALUES (?, ?, 'catalog')",
+            (str(self.repo), self.base_sha),
+        )
+        self._write_barrier_batch()
+        result = self._validate_barrier(context)
+        inventory = maintenance_file_inventory.tracked_source_inventory(
+            self.repo, "main", self.base_sha,
+        )
+        reviewed = tuple(maintenance_file_ledger.ReviewedSource(
+            source.path, source.content_hash, source.mode, source.revision,
+            "Reviewed implementation, dependencies, and related tests.",
+        ) for source in inventory.sources)
+        maps = tuple((source.path, json.dumps({
+            "responsibility": "Review the module responsibility",
+            "entry_points": [], "public_symbols": [],
+            "direct_references": [], "related_tests": [],
+        })) for source in inventory.sources)
+        evidence = maintenance_file_publication.AssessmentEvidence(
+            inventory, reviewed, maps, 1,
+        )
+        git(self.repo, "add", "docs/plans")
+        git(self.repo, "commit", "-m", "Publish refactoring plans")
+        plan_commit = git(self.repo, "rev-parse", "HEAD")
+        with mock.patch.object(
+            maintenance_file_publication, "collect", return_value=evidence,
+        ):
+            loop_manager.record_maintenance_publication_intent(
+                self.connection, str(self.repo), self.repo, "main", result,
+                plan_commit,
+            )
+        self.assertIsNone(maintenance_file_ledger.FileReviewRepository(
+            self.connection,
+        ).last_success(str(self.repo)))
+        git(self.repo, "push", "origin", "HEAD:main")
+        git(self.repo, "fetch", "origin")
+        with mock.patch.object(
+            maintenance_state.MaintenanceRepository, "transition",
+            side_effect=maintenance_state.MaintenanceStateError("injected"),
+        ):
+            with self.assertRaisesRegex(maintenance_state.MaintenanceStateError, "injected"):
+                loop_manager.publish_maintenance_planning_batch(
+                    self.connection, str(self.repo), self.repo, "main", result,
+                    plan_commit,
+                )
+        self.assertIsNone(maintenance_file_ledger.FileReviewRepository(
+            self.connection,
+        ).last_success(str(self.repo)))
+        self.assertIsNone(maintenance_state.MaintenanceRepository(
+            self.connection,
+        ).get(str(self.repo)).last_success_file_assessment_merged_count)
+        published = loop_manager.recover_maintenance_planning_batch(
+            self.connection, str(self.repo), self.repo, "main",
+        )
+        self.assertEqual(published.phase, maintenance_state.MaintenancePhase.REFACTORING)
+        self.assertEqual(published.last_success_file_assessment_merged_count, 1)
+        self.assertEqual(len(maintenance_file_ledger.FileReviewRepository(
+            self.connection,
+        ).reviews(str(self.repo))), len(inventory.sources))
+        repeated = loop_manager.publish_maintenance_planning_batch(
+            self.connection, str(self.repo), self.repo, "main", result,
+            plan_commit,
+        )
+        self.assertEqual(repeated, published)
+
     def test_pushed_batch_recovers_from_durable_intent_after_restart(self):
         context = self._begin_barrier()
         self._write_barrier_batch()
@@ -1468,7 +1545,7 @@ class MaintenancePlanningTest(unittest.TestCase):
         )
         self.connection.commit()
         repository = maintenance_state.MaintenanceRepository(self.connection)
-        cycle, _ = repository.begin_assessment_if_due(str(self.repo), 5, old_sha)
+        cycle, _ = self._begin_legacy_assessment(old_sha)
         cycle = repository.transition(
             str(self.repo), expected_phase=cycle.phase,
             expected_revision=cycle.revision,
@@ -1870,9 +1947,7 @@ class MaintenancePlanningTest(unittest.TestCase):
 
     def test_revalidation_preflight_restarts_in_same_phase(self):
         repository = maintenance_state.MaintenanceRepository(self.connection)
-        assessment, _created = repository.begin_assessment_if_due(
-            str(self.repo), 5, self.base_sha
-        )
+        assessment, _created = self._begin_legacy_assessment(self.base_sha)
         refactoring = repository.transition(
             str(self.repo),
             expected_phase=maintenance_state.MaintenancePhase.ASSESSMENT,

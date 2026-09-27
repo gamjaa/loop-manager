@@ -128,6 +128,8 @@ import maintenance_git
 import maintenance_state
 import maintenance_file_review
 import maintenance_reconciliation
+import maintenance_file_publication
+import maintenance_file_ledger
 import maintenance_findings
 import maintenance_file_inventory
 import document_publication
@@ -4754,17 +4756,34 @@ def record_maintenance_publication_intent(
         if context.mode is MaintenancePlanMode.BARRIER
         else maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION
     )
-    return maintenance_state.MaintenanceRepository(
-        connection
-    ).record_publication_intent(
-        repo,
-        expected_phase=expected_phase,
-        expected_revision=context.cycle_revision,
-        base_sha=context.active_sha,
-        commit_sha=plan_commit,
-        refactoring_plan_ids=result.refactoring_plan_ids,
-        revalidation_plan_ids=result.revalidation_plan_ids,
-    )
+    cycle = maintenance_state.MaintenanceRepository(connection).get(repo)
+    evidence = None
+    if (expected_phase is maintenance_state.MaintenancePhase.ASSESSMENT
+        and cycle.file_assessment_start_merged_count is not None
+        and (not is_loop_manager_repository(Path(repo))
+             or cycle.full_assessment_completed)):
+        evidence = maintenance_file_publication.collect(
+            connection, repo, worktree, base_branch,
+            context.cycle_revision, context.active_sha,
+        )
+    with runtime_state._transaction(connection):
+        intent = maintenance_state.MaintenanceRepository(
+            connection
+        ).record_publication_intent(
+            repo,
+            expected_phase=expected_phase,
+            expected_revision=context.cycle_revision,
+            base_sha=context.active_sha,
+            commit_sha=plan_commit,
+            refactoring_plan_ids=result.refactoring_plan_ids,
+            revalidation_plan_ids=result.revalidation_plan_ids,
+        )
+        if evidence is not None:
+            maintenance_file_publication.save_intent(
+                connection, repo, context.cycle_revision, context.active_sha,
+                plan_commit, evidence,
+            )
+        return intent
 
 
 def _maintenance_rows_match_published_batch(
@@ -4882,6 +4901,18 @@ def _maintenance_publication_already_applied(
             and cycle.revision == context.cycle_revision + 1
             and cycle.last_success_commit == plan_commit
         )
+    if (cycle_matches and context.mode is MaintenancePlanMode.BARRIER
+        and cycle.file_assessment_start_merged_count is not None
+        and (not is_loop_manager_repository(Path(repo))
+             or cycle.full_assessment_completed)):
+        evidence = maintenance_file_publication.saved_intent(
+            connection, repo, context.cycle_revision, context.active_sha,
+            plan_commit,
+        )
+        success = maintenance_file_ledger.FileReviewRepository(connection).last_success(repo)
+        if (success is None or success.source_revision != evidence.inventory.revision
+            or cycle.last_success_file_assessment_merged_count is None):
+            return False
     return cycle_matches and _maintenance_rows_match_published_batch(
         connection, repo, worktree, result, plan_commit
     )
@@ -4910,7 +4941,7 @@ def publish_maintenance_planning_batch(
         worktree, base_branch, result, plan_commit
     )
     return _apply_maintenance_planning_batch(
-        connection, repo, worktree, result, plan_commit
+        connection, repo, worktree, base_branch, result, plan_commit
     )
 
 
@@ -4918,8 +4949,10 @@ def _apply_maintenance_planning_batch(
     connection: sqlite3.Connection,
     repo: str,
     worktree: Path,
+    base_branch: str,
     result: ValidatedPlanningResult,
     plan_commit: str,
+    *, current_remote: str | None = None,
 ) -> maintenance_state.MaintenanceCycle:
     """Apply one already-confirmed maintenance batch in a SQLite transaction."""
 
@@ -4928,7 +4961,7 @@ def _apply_maintenance_planning_batch(
         raise MaintenancePlanningError(
             "SQLite-bound maintenance context가 publication 대상과 일치하지 않습니다."
         )
-    with connection:
+    with runtime_state._transaction(connection):
         repository = maintenance_state.MaintenanceRepository(connection)
         if _maintenance_publication_already_applied(
             connection, repo, worktree, result, plan_commit
@@ -4998,6 +5031,26 @@ def _apply_maintenance_planning_batch(
                     "publication 직전 READY snapshot이 변경됐습니다: "
                     f"{snapshot.plan_id}"
                 )
+
+        cycle = repository.get(repo)
+        if (context.mode is MaintenancePlanMode.BARRIER
+            and cycle.file_assessment_start_merged_count is not None
+            and (not is_loop_manager_repository(Path(repo))
+                 or cycle.full_assessment_completed)):
+            evidence = maintenance_file_publication.saved_intent(
+                connection, repo, context.cycle_revision, context.active_sha,
+                plan_commit,
+            )
+            maintenance_file_publication.promote(
+                connection, repo, Path(repo), base_branch,
+                current_remote or plan_commit, evidence,
+            )
+            repository.advance_file_assessment_success_baseline(
+                repo, expected_revision=context.cycle_revision,
+                source_sha=context.active_sha,
+                expected_merged_count=evidence.merged_count,
+                bump_revision=False,
+            )
 
         if (
             context.mode is MaintenancePlanMode.BARRIER
@@ -5186,7 +5239,8 @@ def recover_maintenance_planning_batch(
     if remote_advanced_after_publication:
         _validate_maintenance_planning_commit(worktree, result, plan_commit)
         return _apply_maintenance_planning_batch(
-            connection, repo, worktree, result, plan_commit
+            connection, repo, worktree, base_branch, result, plan_commit,
+            current_remote=current_remote,
         )
     return publish_maintenance_planning_batch(
         connection,
@@ -18648,7 +18702,7 @@ class _PlanningStatePorts:
         update_project(self._connection, repo, **values)
 
     def transaction(self):
-        return self._connection
+        return runtime_state._transaction(self._connection)
 
     def advance_maintenance_cycle(
         self, repo: str, base_sha: str
@@ -18671,10 +18725,12 @@ class _PlanningStatePorts:
         ).unplanned_approved(repo, repository, base_branch))
 
     def maintenance_due(
-        self, repo: str, interval: int, *, self_repository: bool = False
+        self, repo: str, interval: int, *, self_repository: bool = False,
+        completion_candidate: bool = False,
     ) -> maintenance_state.ReviewDue:
         return self._maintenance_repository.file_assessment_due(
             repo, interval, self_repository=self_repository,
+            completion_candidate=completion_candidate,
         )
 
     def begin_maintenance_assessment(
@@ -18685,6 +18741,7 @@ class _PlanningStatePorts:
         *,
         include_general_planning: bool,
         self_repository: bool = False,
+        completion_candidate: bool = False,
     ) -> tuple[maintenance_state.MaintenanceCycle, bool]:
         return self._maintenance_repository.begin_assessment_if_due(
             repo,
@@ -18692,6 +18749,7 @@ class _PlanningStatePorts:
             base_sha,
             include_general_planning=include_general_planning,
             self_repository=self_repository,
+            completion_candidate=completion_candidate,
         )
 
     def record_full_assessment(
@@ -18798,6 +18856,31 @@ class _PlanningStatePorts:
             expected_revision=expected_revision,
             remote_commit=remote_commit,
         )
+
+    def file_assessment_evidence(
+        self, repo: str, repository: Path, base_branch: str,
+        cycle_revision: int, source_sha: str,
+    ) -> maintenance_file_publication.AssessmentEvidence:
+        return maintenance_file_publication.collect(
+            self._connection, repo, repository, base_branch,
+            cycle_revision, source_sha,
+        )
+
+    def complete_file_assessment(
+        self, repo: str, repository: Path, base_branch: str,
+        cycle_revision: int, source_sha: str,
+        evidence: maintenance_file_publication.AssessmentEvidence,
+    ) -> None:
+        with runtime_state._transaction(self._connection):
+            maintenance_file_publication.promote(
+                self._connection, repo, repository, base_branch, source_sha,
+                evidence,
+            )
+            self._maintenance_repository.advance_file_assessment_success_baseline(
+                repo, expected_revision=cycle_revision, source_sha=source_sha,
+                expected_merged_count=evidence.merged_count,
+                bump_revision=False,
+            )
 
     def recover_maintenance_batch(
         self, repo: str, worktree: Path, base: str
@@ -19843,6 +19926,16 @@ class _PlanningFileReviewPorts:
     def __init__(self, connection: sqlite3.Connection):
         self._connection = connection
         self._repository = maintenance_file_review.ProvisionalReviewRepository(connection)
+
+    def has_selected_sources(
+        self, repo: str, repository: Path, base: str, source_revision: str,
+    ) -> bool:
+        inventory = maintenance_file_inventory.cached_source_inventory(
+            self._connection, repository, base, source_revision,
+        )
+        return bool(maintenance_file_ledger.FileReviewRepository(
+            self._connection,
+        ).selected_sources(repo, inventory))
 
     def progress(
         self, repo: str, repository: Path, base: str, cycle_revision: int,
