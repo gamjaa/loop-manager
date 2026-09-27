@@ -295,6 +295,67 @@ BLOCKED → PR_OPEN
 
 미착수 READY가 일반 Planner batch에서 삭제되면 실행 상태 전이를 만들지 않고 활성 `exec_plans` row를 제거하며, 같은 transaction에서 별도 취소 감사 기록에 ID, 마지막 선언과 삭제 planning commit을 남긴다. 이 ID는 이후 새 계획 번호 계산과 고유성 검증에 계속 포함한다. `READY → IMPLEMENTING` activation은 최초 실행 marker를 같은 transaction에서 영구 설정하며 이후 READY로 복귀해도 일반 Planner 변경 대상이 되지 않는다.
 
+### 관리 rebase의 단계별 증거와 완료 복구 — R-045 목표 설계
+
+이 절은 `docs/requirements/[R-045] Phase-Bound Managed Rebase Validation and Recovery.md`를 구현하기 위한 목표 설계다. 구현·Merge 전의 요구를 현재 완료된 제품 동작으로 해석하지 않는다. 기존 ExecPlan 상태 모델, Manager의 Git 쓰기 권한과 게시 경계를 유지하며, rebase 내부 단계의 증거와 복구 판정을 구체화한다.
+
+#### 증거의 적용 시점
+
+충돌 해결의 승인 대상은 Manager가 검증해 stage한 결과와 그 결과를 반영한 재생 commit이다. 최종 HEAD에는 나머지 commit이 추가로 반영될 수 있으므로, 승인 시점의 파일 해시를 전체 rebase 완료 시점의 작업 폴더와 비교하지 않는다. 대신 원본 commit, 충돌 해결 commit과 최종 HEAD를 연결하는 재생 근거를 검증한다.
+
+| 검증 단계 | 보존할 증거 | 비교 대상 |
+|---|---|---|
+| 실행 전 소유권 | repository·plan·branch·worktree identity, 실행 ID·generation, 시작 HEAD, target base, 원격 기대 OID·PR head, 원본 재생 대상과 순서 | Git 실행 직전의 실제 소유권·ref·등록·operation 상태 |
+| Worker 충돌 교정 | 원본 commit, 재생 위치와 현재 parent HEAD, Worker invocation·session·결과 선언, 허용 경로와 승인된 내용·mode, 범위 검사 결과 | stage 직전의 파일·index 상태와 승인 내용 |
+| stage 확정 | 해당 교정 identity, parent HEAD, 정확한 staged tree OID와 path·blob·mode, 실행 직전 snapshot | 충돌 해결을 반영한 해당 commit의 tree와 parent |
+| 후속 commit 재생 | 원본에서 실제 재생 commit으로의 대응, 순서·parent 관계, 각 충돌 해결의 증거, 기존 정책이 허용한 무변경·skip 근거 | 실제 재생 이력 및 소유 실행에 결합된 Git 결과 |
+| 전체 완료 | 완료 실행 표식, 최종 HEAD·소유 branch ref·등록 상태, target base 관계, 원격 기대 OID, 남은 index·작업 파일·Git operation 상태 | 완료 시점의 실제 Git 상태 |
+
+표의 단계는 journal과 checkpoint 내부의 구분이며 새 ExecPlan 실행 상태를 추가하지 않는다. Git 실행과 결과 조회·기록은 Agent 호출 밖에서 Manager가 수행한다. Worker가 제출한 결과나 clean 상태만으로 Git 실행 소유권을 증명하지 않는다.
+
+#### 책임과 저장 경계
+
+`execution_handlers.py`는 stage, rebase 계속과 기존 실행 phase 전이를 조정한다. 소유 실행의 시작·단계별 결과·완료 기록은 `manager_git_journal.py`의 기존 journal 경계가 담당하고, 단계별 증거 대조는 부작용 없는 검증 경계로 분리한다. 하나의 함수에서 Git 실행, 증거 판정과 오류 상태 저장을 함께 처리하지 않는다.
+
+`rebase_correction.py`와 `rebase_correction_state.py`의 교정 identity·결과 선언·범위 검증을 stage 증거에 연결한다. `execution_checkpoint_state.py`는 미완료 하위 단계와 journal 결과 identity를 보존하고, `runtime_state.py`는 확인된 완료를 계획 실행 row와 프로젝트 투영에 반영한다. 신규 실행·재시작·legacy 복구가 같은 판정 함수를 사용해 검사 기준의 차이를 없앤다.
+
+저장은 기존 `<state-dir>` journal과 SQLite에 호환 가능한 필드·기록을 추가하는 방식으로 확장한다. 기존 기록과 schema를 삭제·재작성하지 않는다. 증거 버전을 명시하고 원래 rebase 실행 ID, 하위 Git 호출 ID, plan·repository·canonical worktree, Worker 교정 invocation과 session, SQLite generation에 결합한다. 세션만 같다는 이유로 서로 다른 교정 turn의 증거를 재사용하지 않는다. 내용은 commit/tree/blob OID, 허용 경로·mode·필요한 지문과 실행 결과 식별자로 보존하며 인증 자료와 source checkout 파일 내용은 기록하지 않는다.
+
+#### 충돌 해결과 재생 검증
+
+1. rebase 시작 전에 실제 소유권과 최신으로 관측한 원격 기대값을 확인하고, 현재 Git 방식이 재생할 원본 commit 집합과 순서를 고정한다. 이후 다른 원본 이력이나 target base를 같은 intent에 끼워 넣지 않는다.
+2. 충돌 때 원본 commit과 현재 재생 위치를 기록한다. Worker 결과 선언과 허용 파일·index 범위를 검증한 뒤 Manager가 stage한다. stage 전후의 변경을 대조하고 정확한 staged tree를 Git 계속 호출 전에 저장한다. 미해결 stage, 예상 밖 flag·blob·mode 또는 승인 뒤 내용 변화가 남으면 계속하지 않는다.
+3. `rebase --continue`가 해결 commit과 여러 후속 commit을 한 호출에서 생성하더라도, 저장한 parent·재생 위치·원본 commit으로 해결 commit을 식별한다. 그 commit의 tree가 승인된 staged tree와 같은지 확인한다. 항상 target base 다음의 첫 commit이라고 가정하지 않는다.
+4. 나머지 재생 commit은 원본 commit·순서·parent 관계와 소유 Git 실행 결과를 대조한다. 충돌 없는 재생은 원본 patch의 보존 근거를, 충돌을 거친 재생은 그 commit에 결합된 승인 tree를 적용한다. 같은 파일을 변경하는 뒤의 원본 commit도 이 대응 관계로 검증한다. 전체 `range-diff`가 모두 동일하다는 조건이나 commit 수의 동일성만을 완료 근거로 사용하지 않는다.
+5. 기존 정책이 허용한 무변경·skip은 처리된 원본 commit과 사유·검증 근거를 재생 대응에 남긴다. 설명되지 않는 누락, 추가 또는 순서 변경은 거부한다. 하나의 확인된 해결로 이후 충돌 해결이나 다른 commit 변경을 승인하지 않는다. 재생 대응을 유일하게 확인할 수 없으면 증거 부족으로 판정한다.
+6. 전체 완료에서 현재 branch·HEAD·branch ref·worktree 등록, target base 관계와 최신 원격 기대값을 다시 확인한다. 실행 표식은 해당 소유 호출의 최신 결과와 연결하고 과거 reflog 전체에서 같은 문구를 찾은 사실만으로 인정하지 않는다. 남은 미해결 operation·index가 없고 최종 tracked·untracked·ignored 상태가 허용 범위인지 확인한다. 기존 autostash 경로는 저장된 stash identity와 보존 대상에 결합해 별도로 검증하며 미해결 복원은 기존 교정 경로로 넘긴다.
+
+이 과정은 Manager가 이미 수행한 Git 전이의 증명을 다룬다. Agent 격리가 없는 호출의 shared ref·외부 worktree 변화를 자동 허용하거나 Agent 범위 검사를 줄이는 근거가 되지 않는다. rebase 없이 같은 HEAD에서 재개하는 실행은 일반 소유권·허용 변경 검사로 처리하고, 수행하지 않은 rebase의 intent나 해결 기록을 요구·생성하지 않는다.
+
+#### 완료 확정과 중단 후 복구
+
+검증된 journal 결과를 먼저 durable하게 확정하고, 그 결과 identity와 generation을 확인한 뒤 실행 checkpoint의 하위 단계를 정리하고 ExecPlan·프로젝트 투영을 같은 SQLite transaction에서 갱신한다. Git, 파일 journal과 SQLite를 하나의 원자 transaction으로 간주하지 않는다. 각 저장 경계 사이의 중단은 다음 실행에서 실제 Git 상태와 이미 저장된 증거를 다시 대조해 복구한다.
+
+| 중단 경계 | 복구 판정 |
+|---|---|
+| Worker 결과 저장 뒤, 검증 또는 stage 전 | invocation·결과 선언·범위를 재검증한다. 미검증 결과를 legacy 성공으로 채택하지 않고 저장된 동일 교정을 이어간다. |
+| stage 뒤, Git 계속 호출 전 | 저장된 staged tree·parent·재생 위치와 실제 index를 대조한다. 동일하면 같은 단계에서 계속하고 달라졌으면 자동 재사용하지 않는다. |
+| 해결 commit 뒤, 후속 재생 중 | 해결 commit의 tree와 남은 재생 위치를 확인한다. 이미 반영된 해결을 다시 stage하거나 같은 Worker 교정을 중복 호출하지 않는다. 새 충돌은 별도 교정 identity로 처리한다. |
+| Git 완료 뒤, journal 확정 전 | 실행 표식·해결 tree·재생 대응·최종 소유권을 재검증해 같은 호출의 완료 결과를 기록한다. 이미 완료된 `--continue`를 다시 실행하지 않는다. |
+| journal 확정 뒤, SQLite 반영 전 | 저장 결과가 현재 Git과 여전히 일치하는지 확인하고 같은 generation의 완료 반영만 멱등하게 수행한다. |
+
+target base나 원격 OID가 달라졌으면 저장된 작업의 완료 사실과 새 기준의 적용 필요를 구분한다. 이전 완료를 다른 target의 완료로 해석하지 않으며, 원격 변화는 기존 소유권·경쟁·lease 규칙에 따라 재관측 또는 차단한다. 필요한 새 rebase는 이전 작업의 확정 뒤 별도 intent로 시작한다.
+
+구 형식 기록은 삭제하지 않는다. G-085처럼 승인된 staged tree와 해당 실행 표식이 남아 있으면 실제 해결 commit과 나머지 원본 재생을 유일하게 대응시키는 호환 검증을 수행한다. 증거 버전이 부족하다는 이유만으로 과거 실행을 승인하지 않으며, clean 상태·base ancestry·최종 OID 일치만으로 누락된 증거를 채우지 않는다. 확인된 증거와 판정 근거만 별도로 보존한다.
+
+저장된 `status_failed` 재시도 또는 관련 `PLAN_BLOCKED`·`PROJECT_BLOCKED`는 같은 단계별 검증으로 재평가한다. 이 결함의 원인만 해제하고 독립적인 Review 실패, 사용자 결정, 다른 계획과 planning 상태를 보존한다. 후보 revision 변경에 따른 검증 증거를 무효화하고 필요한 기존 Worker 확인·targeted test·Manager 전체 verify·Review를 다시 수행한다. 완료 증거의 복구 자체는 구현 완료나 게시 승인이 아니다.
+
+#### 진단과 검증
+
+실패 진단에는 안정적인 원인 code, 단계, intent·교정 identity, 원본/재생 commit, 관련 경로와 기대·관측 지문을 기록한다. 해결 tree 불일치, 재생 대응 누락·변조, 최종 branch/ref/등록 불일치, 원격 lease 변화와 legacy 증거 부족을 구분한다. 큰 index·파일 본문·인증 자료를 로그에 출력하지 않으며 기존 실패 사건 및 알림 중복 제거를 유지한다.
+
+직접 변경한 판정·저장 경계에는 targeted unit test를 두고, Manager가 실행하는 전체 verify에서는 실제 Git 이력의 충돌 해결·여러 후속 commit의 동일 파일 변경·다중 충돌·기존 PR 및 PR 없는 checkpoint를 확인한다. 각 저장 경계의 중단을 주입해 완료된 단계가 반복되지 않고 이후 Worker 교정·verify·Review까지 진행되는지 확인한다. 해결 tree 변조, 범위 밖 stage, 후속 commit 누락·변조, 다른 invocation의 증거, 원격 OID 변경과 불완전한 legacy 기록은 계속 거부해야 한다. 이 검증 책임은 기존 Worker·Manager·Reviewer 분담을 따른다.
+
 ## 검증과 재시도
 
 - Worker는 구현과 관련 targeted unit test를 작성하고, 수정 범위에 직접 관련된 최소 unit test command만 실행한다
