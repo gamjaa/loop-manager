@@ -3767,6 +3767,14 @@ risk: medium
 
         resumed_sessions = []
 
+        def verified_preflight(_provider, _role, worktree, _state_dir,
+                               read_only, observe, *_args, **_kwargs):
+            observe(loop_manager.agent_write_isolation.IsolationEvidence(
+                'codex', 'fixture-version', 'Linux:fixture', 'planner',
+                str(worktree), 'fixture-repository', 'fixture-policy', 'verified',
+            ))
+            return loop_manager.agent_write_isolation.codex_arguments(read_only)
+
         def stopped_resume(_worktree, _state, _config, role_name, _prompt, **kwargs):
             self.assertEqual(role_name, "planner")
             resumed_sessions.append(kwargs["session_id"])
@@ -3792,6 +3800,11 @@ risk: medium
                 return_value={"gpt-5.6-sol": frozenset({"xhigh"})},
             ), mock.patch(
                 "loop_manager.subprocess.Popen", side_effect=start_process
+            ), mock.patch(
+                "loop_manager.agent_write_isolation.prepare_isolation",
+                side_effect=verified_preflight,
+            ), mock.patch(
+                "loop_manager.agent_write_isolation.assert_current",
             ):
                 with self.assertRaisesRegex(RuntimeError, "Planner process interrupted"):
                     loop_manager.run_project(
@@ -8142,6 +8155,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "agent_scope_decision.py",
                 "agent_invocation.py",
                 "agent_invocation_state.py",
+                "agent_write_isolation.py",
                 "agent_provider_usage.py",
                 "blocked_checkpoint.py",
                 "blocked_checkpoint_state.py",

@@ -64,3 +64,5 @@ priority: critical
 - 2026-09-27 Worker 추가 검토: linked worktree의 `.git` pointer 쓰기 거부 검사와 Codex 확장·hook 설정의 fail-closed 판정을 더했다. 이전 권한 부여를 재현할 수 없는 재개 session은 새 증거로 승인하지 않고 호출 전에 거부한다. 지원되지 않거나 provider 파일 도구까지 격리를 증명할 수 없는 환경은 거부 증거를 보존하는 경계로 처리하므로 실행별 적용·거부 및 증거 연결 Progress를 완료로 갱신한다. 동일 targeted 명령의 `WriteIsolationTests` 15개와 엄격 fallback 단일 case가 통과했다. 전체 verify는 실행하지 않았다.
 
 - 2026-09-27 Worker verify 피드백 수정: 기존 scope unit test가 실제 CLI 함수 `run_codex`를 mock할 때 adapter의 선행 preflight가 테스트용 설정에서 ledger identity 없이 실행돼 다수 오류가 발생했다. preflight를 `run_codex`·`run_claude`의 실제 process·log 생성 직전으로 옮겨 운영 호출의 격리 검사는 유지하면서 mock 경계를 복원했다. 보고된 실패 중 Reviewer 변경, 중단 Worker 재개 및 archive 게시 단일 case가 각각 통과했고, 갱신된 `WriteIsolationTests` 16개가 통과했다. Worker는 전체 verify를 실행하지 않았으며 Loop Manager 재검증을 기다린다.
+
+- 2026-09-27 Worker verify 후속 수정: Planner import fixture에 새 `agent_write_isolation.py`를 포함하고, Planner 중단·재개 unit test의 외부 Codex 사전 검사만 test double로 고정해 시스템의 MCP·plugin·hook 설정이 프로세스 중단 검증을 가리지 않게 했다. 보고된 두 단일 targeted unit test를 각각 실패 명령 그대로 재실행해 통과했다. 전체 verify는 Worker가 실행하지 않았다.
