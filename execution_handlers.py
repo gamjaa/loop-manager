@@ -46,6 +46,8 @@ from rebase_correction import (
 )
 from rebase_correction_state import CorrectionRace, RebaseCorrectionRepository
 from validation_feedback import is_validation_error, normalize_feedback, render_delta
+from validation_feedback import redact_secrets
+from worker_outcome import WorkerOutcome, WorkerOutcomeError, parse_worker_outcome
 from reviewer_specification import SpecificationDeadlock, validate_locations
 
 @dataclass(frozen=True)
@@ -73,6 +75,7 @@ class AgentEffects:
     validate_agent_scope: Callable[..., Any]
     validate_worker_workspace_scope: Callable[..., Any]
     _worktree_execplan_input_fingerprint: Callable[..., Any]
+    _revision_execplan_input_fingerprint: Callable[..., Any]
     _guidance_worker_targets: Callable[..., Any]
     guidance_resume_context: Callable[..., Any]
     _published_plan_allows_common_plans: Callable[..., Any]
@@ -637,7 +640,8 @@ class ExecutionHandlers:
     def _recover(self, reason, detail, *, context=None, fingerprint=None,
                  progress_marker=None, final_block_reason=None,
                  from_revision=False, correction_limit=None, attempts=0,
-                 user_targets=(), verify_result=None):
+                 user_targets=(), verify_result=None, worker_result=None,
+                 worker_decision=None):
         """Persist a typed decision and apply the final gate in one transaction."""
 
         row = self._row()
@@ -662,6 +666,7 @@ class ExecutionHandlers:
             base_revision=base, fingerprint=stable_fingerprint,
             progress_marker=progress, detail=detail,
             user_targets=tuple(user_targets),
+            worker_decision=worker_decision,
         )
         decision = self.recovery.apply(
             observation,
@@ -674,6 +679,7 @@ class ExecutionHandlers:
             correction_limit=correction_limit,
             attempts=attempts,
             final_block_reason=final_block_reason,
+            worker_result=worker_result,
         )
         kind = {
             RecoveryAction.RETRY: ExecutionOutcomeKind.RETRY,
@@ -685,6 +691,57 @@ class ExecutionHandlers:
         return ExecutionOutcome(kind, context=context, detail=detail,
                                 error=kind is ExecutionOutcomeKind.FINAL_BLOCK,
                                 recovery=decision)
+
+    def _parse_worker_outcome(self, context, message, *, allow_legacy_ready=False):
+        allowed = {context.plan.path, *context.plan.sources,
+                   'docs/PRODUCT.md', 'docs/ARCHITECTURE.md'}
+        documents = {}
+        root = context.worktree.resolve()
+        for path in allowed:
+            target = root / path
+            if target.is_file() and target.resolve() == target:
+                documents[path] = target.read_text(encoding='utf-8')
+        return parse_worker_outcome(
+            message, plan_path=context.plan.path,
+            sources=context.plan.sources, documents=documents,
+            allow_legacy_ready=allow_legacy_ready,
+        )
+
+    def _block_worker_decision(self, context, message, outcome: WorkerOutcome):
+        if not self._row()['agent_input_fingerprint']:
+            # Legacy saved results may have cleared their Agent projection
+            # before the disposition contract existed. Anchor release to an
+            # immutable remote definition instead of the Worker's local edit.
+            revision = context.plan.definition_revision_sha or context.base_sha
+            self.effects.state.update_project(
+                self.repo,
+                agent_input_fingerprint=self.effects.agent._revision_execplan_input_fingerprint(
+                    self.repo_path, revision, self.catalog_plan,
+                ),
+            )
+        evidence = outcome.evidence()
+        for field in ('problem', 'proposal', 'question'):
+            evidence[field] = redact_secrets(str(evidence[field]))
+        locations = [
+            redact_secrets(f"{item.path}#{item.section}")
+            for item in outcome.locations
+        ]
+        evidence['locations'] = [
+            {'path': item.path, 'section': redact_secrets(item.section)}
+            for item in outcome.locations
+        ]
+        detail = (
+            f"Worker 사용자 결정 대기: {evidence['problem']}\n"
+            f"제안: {evidence['proposal']}\n"
+            f"질문: {evidence['question']}\n"
+            f"근거: {', '.join(locations)}"
+        )
+        return self._recover(
+            RecoveryReason.USER_DECISION, detail, context=context,
+            final_block_reason=BlockReasonCode.USER_DECISION_REQUIRED,
+            user_targets=tuple(locations),
+            worker_result=message, worker_decision=evidence,
+        )
 
     def _block_final(self, repo, worktree, detail, verify_result, *, reason,
                      recovery_reason=None, user_targets=()):
@@ -1563,6 +1620,21 @@ class ExecutionHandlers:
                         context=context,
                         final_block_reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE,
                     )
+                saved_result = current.snapshot['worker_result']
+                try:
+                    disposition = self._parse_worker_outcome(
+                        context, saved_result, allow_legacy_ready=True,
+                    )
+                    if disposition.kind == 'needs_user_decision':
+                        return self._block_worker_decision(
+                            context, saved_result, disposition,
+                        )
+                except WorkerOutcomeError as error:
+                    return self._recover(
+                        RecoveryReason.WORKER_CORRECTION,
+                        f'저장된 Worker 결과 검증 실패: {error}',
+                        context=context,
+                    )
                 untracked = self.effects.workspace.git(
                     context.worktree, 'ls-files', '--others', '--exclude-standard', '-z',
                 ).stdout
@@ -1898,6 +1970,24 @@ class ExecutionHandlers:
         legacy_baseline=False,
     ):
         row = self._row()
+        if row['worker_result']:
+            try:
+                disposition = self._parse_worker_outcome(
+                    context, str(row['worker_result']), allow_legacy_ready=True,
+                )
+                if disposition.kind == 'needs_user_decision':
+                    return self._block_worker_decision(
+                        context, str(row['worker_result']), disposition,
+                    )
+            except WorkerOutcomeError as error:
+                detail = f'저장된 Worker 결과 검증 실패: {error}'
+                self.effects.state.update_project(
+                    self.repo, phase='WORKING', last_error=detail,
+                )
+                return self._recover(
+                    RecoveryReason.WORKER_CORRECTION, detail,
+                    context=context,
+                )
         if context.phase is ExecutionPhase.PUBLISHING and not int(
             row['pr_conflict_recovery']
         ):
@@ -2606,7 +2696,9 @@ class ExecutionHandlers:
             self.repo,
             context.worktree,
             'worker',
-            input_fingerprint=self.effects.agent._worktree_execplan_input_fingerprint(context.worktree, catalog_plan),
+            input_fingerprint=self.effects.agent._revision_execplan_input_fingerprint(
+                self.repo_path, context.base_sha, catalog_plan,
+            ),
         )
         feedback_repo = self.effects.feedback.repository if self.effects.feedback else None
         delivery = None
@@ -2791,8 +2883,8 @@ class ExecutionHandlers:
                 file=sys.stderr,
             )
             return self._final()
-        self.effects.agent.clear_agent_scope(self.repo)
         if code:
+            self.effects.agent.clear_agent_scope(self.repo)
             if context.resolving_rebase:
                 saved_turn = self.rebase_corrections.get(self.repo, context.plan.plan_id)
                 self.rebase_corrections.abandon_turn(
@@ -2829,8 +2921,12 @@ class ExecutionHandlers:
             self.effects.events.operation_print(worker_error, file=sys.stderr)
             return ExecutionOutcome(outcome, detail=worker_error, error=True)
         try:
+            disposition = self._parse_worker_outcome(context, message)
+            if disposition.kind == 'needs_user_decision':
+                return self._block_worker_decision(context, message, disposition)
             self.effects.validation.parse_worker_result(message, self.plan)
-        except self.effects.contract.WorkerResultError as error:
+        except (WorkerOutcomeError, self.effects.contract.WorkerResultError) as error:
+            self.effects.agent.clear_agent_scope(self.repo)
             validation_error = f"Worker 결과 검증 실패:\n{error}"
             if context.resolving_rebase:
                 validation_error = self.effects.contract.REBASE_CONFLICT_PREFIX + validation_error
@@ -2845,6 +2941,7 @@ class ExecutionHandlers:
                 RecoveryReason.WORKER_CORRECTION, validation_error,
                 context=context,
             )
+        self.effects.agent.clear_agent_scope(self.repo)
         delivered_session = result.session_id or self._row()['worker_session_id']
         if feedback_repo is not None and delivery is not None and delivered_session:
             feedback_repo.delivered(delivery.attempt_id, str(delivered_session))
@@ -2910,11 +3007,19 @@ class ExecutionHandlers:
             saved.worker_result,
         ):
             return self._final()
-        if self._row()['agent_snapshot'] is not None:
-            self.effects.agent.clear_agent_scope(self.repo)
         try:
+            disposition = self._parse_worker_outcome(
+                context, saved.worker_result,
+                allow_legacy_ready=saved.outcome_contract_version == 0,
+            )
+            if disposition.kind == 'needs_user_decision':
+                return self._block_worker_decision(
+                    context, saved.worker_result, disposition,
+                )
             self.effects.validation.parse_worker_result(saved.worker_result, self.plan)
-        except self.effects.contract.WorkerResultError as error:
+        except (WorkerOutcomeError, self.effects.contract.WorkerResultError) as error:
+            if self._row()['agent_snapshot'] is not None:
+                self.effects.agent.clear_agent_scope(self.repo)
             detail = self.effects.contract.REBASE_CONFLICT_PREFIX + (
                 f'Worker 결과 검증 실패:\n{error}'
             )
@@ -2924,6 +3029,8 @@ class ExecutionHandlers:
                 worker_result=saved.worker_result,
                 recovery_reason=RecoveryReason.WORKER_CORRECTION,
             )
+        if self._row()['agent_snapshot'] is not None:
+            self.effects.agent.clear_agent_scope(self.repo)
         return self._finish_worker(context, self._row(), saved.worker_result)
 
     def _finish_worker(self, context, row, message, *, staged=False):
@@ -3286,8 +3393,15 @@ class ExecutionHandlers:
         ):
             return self._final()
         try:
+            disposition = self._parse_worker_outcome(
+                context, str(row['worker_result'] or ''), allow_legacy_ready=True,
+            )
+            if disposition.kind == 'needs_user_decision':
+                return self._block_worker_decision(
+                    context, str(row['worker_result'] or ''), disposition,
+                )
             worker_publication = self.effects.validation.parse_worker_result(str(row['worker_result'] or ''), self.plan)
-        except self.effects.contract.WorkerResultError as error:
+        except (WorkerOutcomeError, self.effects.contract.WorkerResultError) as error:
             validation_error = f"Worker 결과 검증 실패:\n{error}"
             self.effects.state.update_project(self.repo, phase='WORKING', last_error=validation_error)
             self.effects.events.operation_print(validation_error, file=sys.stderr)

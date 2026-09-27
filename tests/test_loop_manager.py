@@ -21,6 +21,7 @@ from unittest import mock
 import loop_manager
 import execplan_catalog
 from execution_revision import DefinitionSnapshot
+from worker_outcome import parse_worker_outcome
 from worker_session import SessionBinding
 
 
@@ -120,6 +121,7 @@ def worker_result(
     tests: str = "targeted test: PASS",
 ) -> str:
     return (
+        'WORKER_OUTCOME: {"kind":"ready_for_validation"}\n'
         f"COMMIT_TITLE: {title}\nPR_SUMMARY: {summary}\n"
         f"TARGETED_TESTS:\n{tests}"
     )
@@ -6821,6 +6823,19 @@ class ReviewDrivenWorkerProfileEscalationTest(unittest.TestCase):
 class WorkerPublicationTest(unittest.TestCase):
     plan = {"id": "G-008", "title": "Descriptive Worker Commits"}
 
+    def test_worker_result_fixture_satisfies_new_and_publication_contracts(self):
+        message = worker_result(
+            "Store immutable plan links", "Adds immutable PR context.",
+            "test_one: PASS",
+        )
+        outcome = parse_worker_outcome(
+            message, plan_path="docs/plans/[G-008] Descriptive Worker Commits.md",
+            sources=(), documents={},
+        )
+        publication = loop_manager.parse_worker_result(message, self.plan)
+        self.assertEqual(outcome.kind, "ready_for_validation")
+        self.assertEqual(publication.commit_title, "Store immutable plan links")
+
     def test_worker_result_contract_preserves_fields_and_rejects_bad_titles(self):
         publication = loop_manager.parse_worker_result(
             worker_result("Store immutable plan links", "Adds immutable PR context.", "test_one: PASS"),
@@ -7919,6 +7934,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "validation_feedback_state.py",
                 "verify_process.py",
                 "worker_session.py",
+                "worker_outcome.py",
             ):
                 shutil.copy(loop_manager.ROOT / module_name, repo / module_name)
             (repo / ".gitignore").write_text("__pycache__/\n", encoding="utf-8")

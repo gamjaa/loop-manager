@@ -159,6 +159,7 @@ class RecoveryObservation:
     detail: str = ""
     operation: str | None = None
     user_targets: tuple[str, ...] = ()
+    worker_decision: dict[str, object] | None = None
 
     @property
     def identity(self) -> str:

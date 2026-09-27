@@ -97,6 +97,7 @@ from agent_provider_usage import claude_usage, codex_log_usage
 import agent_invocation_state
 import validation_feedback_state
 from validation_feedback import redact_secrets
+from worker_outcome import worker_outcome_instruction
 from verify_process import run_verify_process, VerifyTerminationUncertain
 from execution_state import ExecutionStatePort as _ExecutionStatePort
 from types import SimpleNamespace
@@ -10607,7 +10608,7 @@ def begin_agent_scope(
     input_fingerprint: str | None = None,
 ) -> GitSnapshot:
     row = connection.execute(
-        "SELECT agent_role, agent_snapshot, plan_path "
+        "SELECT agent_role, agent_snapshot, agent_input_fingerprint, plan_path "
         "FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
@@ -10618,6 +10619,15 @@ def begin_agent_scope(
             raise RuntimeError(
                 f"저장된 Agent 역할이 현재 역할과 다릅니다: "
                 f"{row['agent_role']} -> {role_name}"
+            )
+        if (
+            role_name == "worker" and input_fingerprint is not None
+            and row["agent_input_fingerprint"] != input_fingerprint
+        ):
+            # A resumed pre-contract Worker scope may have saved its local
+            # plan fingerprint. The new turn's remote input is authoritative.
+            update_project(
+                connection, repo, agent_input_fingerprint=input_fingerprint,
             )
         return GitSnapshot.deserialize(str(row["agent_snapshot"]))
     preliminary_snapshot = capture_git_snapshot(worktree)
@@ -14640,34 +14650,36 @@ def resume_blocked_execplan_if_inputs_changed(
     execplan_input_changed = (
         _revision_execplan_input_fingerprint(repo_path, revision, plan) != stored
     )
-    current_review_fingerprint = _revision_review_issue_fingerprint(
-        repo_path, revision, plan["review_result"]
-    )
-    stored_review_fingerprint = plan["blocked_review_fingerprint"]
-    if current_review_fingerprint is None:
-        review_input_changed = False
-    elif stored_review_fingerprint:
-        review_input_changed = current_review_fingerprint != str(
-            stored_review_fingerprint
+    review_input_changed = False
+    if plan["blocked_reason"] != BlockReasonCode.USER_DECISION_REQUIRED.value:
+        current_review_fingerprint = _revision_review_issue_fingerprint(
+            repo_path, revision, plan["review_result"]
         )
-    else:
-        blocked_revision = str(
-            plan["active_sha"]
-            or plan["current_revision_sha"]
-            or plan["plan_sha"]
-            or ""
-        )
-        blocked_review_fingerprint = (
-            _revision_review_issue_fingerprint(
-                repo_path, blocked_revision, plan["review_result"]
+        stored_review_fingerprint = plan["blocked_review_fingerprint"]
+        if current_review_fingerprint is None:
+            review_input_changed = False
+        elif stored_review_fingerprint:
+            review_input_changed = current_review_fingerprint != str(
+                stored_review_fingerprint
             )
-            if blocked_revision
-            else None
-        )
-        review_input_changed = (
-            blocked_review_fingerprint is not None
-            and current_review_fingerprint != blocked_review_fingerprint
-        )
+        else:
+            blocked_revision = str(
+                plan["active_sha"]
+                or plan["current_revision_sha"]
+                or plan["plan_sha"]
+                or ""
+            )
+            blocked_review_fingerprint = (
+                _revision_review_issue_fingerprint(
+                    repo_path, blocked_revision, plan["review_result"]
+                )
+                if blocked_revision
+                else None
+            )
+            review_input_changed = (
+                blocked_review_fingerprint is not None
+                and current_review_fingerprint != blocked_review_fingerprint
+            )
     remote_input_changed = execplan_input_changed or review_input_changed
     if int(plan["workspace_owned"]) != WORKSPACE_OWNED:
         if not remote_input_changed:
@@ -17727,6 +17739,7 @@ COMMIT_TITLE: 한 줄의 구체적인 변경 제목
 PR_SUMMARY: 실제 변경을 간결히 설명하는 Summary
 TARGETED_TESTS:
 실행한 최소 범위 targeted unit test와 결과, 또는 실행하지 못한 구체적인 사유
+{worker_outcome_instruction()}
 {archive_instruction}
 {recovery}
 {saved_feedback}
@@ -22274,6 +22287,7 @@ def _ExecutionLifecyclePorts(connection, runtime_repository, **identity):
             validate_agent_scope=state.bind(validate_agent_scope, name="validate_agent_scope", connected=False, mutates=False),
             validate_worker_workspace_scope=state.bind(validate_worker_workspace_scope, name="validate_worker_workspace_scope", connected=False, mutates=False),
             _worktree_execplan_input_fingerprint=state.bind(_worktree_execplan_input_fingerprint, name="_worktree_execplan_input_fingerprint", connected=False, mutates=False),
+            _revision_execplan_input_fingerprint=state.bind(_revision_execplan_input_fingerprint, name="_revision_execplan_input_fingerprint", connected=False, mutates=False),
             _guidance_worker_targets=state.bind(_guidance_worker_targets, name="_guidance_worker_targets", connected=True, mutates=False),
             guidance_resume_context=state.bind(guidance_resume_context, name="guidance_resume_context", connected=True, mutates=False),
             _published_plan_allows_common_plans=state.bind(_published_plan_allows_common_plans, name="_published_plan_allows_common_plans", connected=False, mutates=False),
