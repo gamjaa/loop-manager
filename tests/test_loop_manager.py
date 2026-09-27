@@ -7919,6 +7919,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "validation_feedback_state.py",
                 "verify_process.py",
                 "worker_session.py",
+                "worker_outcome.py",
             ):
                 shutil.copy(loop_manager.ROOT / module_name, repo / module_name)
             (repo / ".gitignore").write_text("__pycache__/\n", encoding="utf-8")
