@@ -14797,13 +14797,7 @@ def _resume_interrupted_blocked_rebase(
             and snapshot.head == current_head and snapshot.branch == branch
             and not snapshot.operations
             and (not after_head or after_head == current_head)
-            and _direct_rebase_history_proven(
-                connection, repo_path, repo, str(plan['plan_id']), worktree,
-                branch, before_head, current_head, target_base,
-                plan['worker_session_id'],
-            )
             and _blocked_execplan_metadata_error(repo_path, worktree, plan) is None
-            and _blocked_resume_worktree_matches(worktree, marker, snapshot)
         )
         if safe:
             state_dir = _owned_rebase_state_dir(repo, str(plan['plan_id']), worktree)
@@ -14813,6 +14807,14 @@ def _resume_interrupted_blocked_rebase(
                     str(plan['plan_id']), worktree, branch,
                     agent_session_id=plan['worker_session_id'],
                 )
+            safe = (
+                _direct_rebase_history_proven(
+                    connection, repo_path, repo, str(plan['plan_id']), worktree,
+                    branch, before_head, current_head, target_base,
+                    plan['worker_session_id'],
+                )
+                and _blocked_resume_worktree_matches(worktree, marker, snapshot)
+            )
     except (OSError, RuntimeError, ValueError, KeyError, TypeError):
         safe = False
     if not safe:

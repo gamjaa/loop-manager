@@ -1372,11 +1372,13 @@ class ExecutionHandlers:
 
     def _rebase_stage_evidence(self, context):
         observed = self.effects.agent.capture_git_snapshot(context.worktree)
-        return {
+        evidence = {
             'head': observed.head, 'branch': observed.branch,
             'files': {path: signature for path, (_, signature) in observed.dirty.items()},
-            'index': observed.index,
         }
+        if hasattr(observed, 'index'):
+            evidence['index'] = observed.index
+        return evidence
 
     def _stage_rebase_correction(self, context):
         """Stage only paths accepted by the Worker scope validator."""
