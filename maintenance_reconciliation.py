@@ -479,14 +479,14 @@ def _validate_plan_comparisons(finding: dict, existing: Mapping[str, str],
         raise ReconciliationError("같은 문제의 기존 계획 연결 또는 중복 방지가 필요합니다.")
 
 
-def parse_findings(output: str, progress: ReconciliationProgress,
+def parse_findings(output: str | dict, progress: ReconciliationProgress,
                    inventory: SourceInventory, contents: Mapping[str, bytes],
                    existing_plans: Mapping[str, str], new_plan_ids: Sequence[str],
                    plan_texts: Mapping[str, str] | None = None,
                    synthesis_digest: str | None = None) -> dict:
     if progress.pending_scan or progress.next_relation is not None or len(progress.completed) != len(progress.relations):
         raise ReconciliationError("미확인 파일 간 관계가 남았습니다.")
-    value = _single_json(output, FINDINGS_PREFIX)
+    value = _single_json(output, FINDINGS_PREFIX) if isinstance(output, str) else output
     if set(value) != {"source_revision", "findings", "no_issue_reason"} or value["source_revision"] != inventory.revision:
         raise ReconciliationError("발견 결과의 source 또는 필드가 다릅니다.")
     findings = value["findings"]

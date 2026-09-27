@@ -13,6 +13,7 @@ import loop_manager
 import notifications
 import maintenance_state
 import maintenance_file_review
+import maintenance_findings
 import maintenance_reconciliation
 from maintenance_file_inventory import TrackedSource
 from tests.test_maintenance_file_review import result_for
@@ -548,6 +549,7 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         connection.execute("CREATE TABLE projects (repo TEXT PRIMARY KEY)")
         connection.execute("INSERT INTO projects VALUES (?)", (self.context.repo,))
         repository = maintenance_reconciliation.SynthesisRepository(connection)
+        findings = maintenance_findings.FindingsRepository(connection)
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         context = replace(self.context, state_dir=Path(directory.name))
@@ -564,7 +566,17 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
             for index in range(13))
         progress = maintenance_reconciliation.ReconciliationProgress((), (), (), None, file_reviews=reviews)
         ports.file_review = mock.Mock()
+        def findings_unit(repo, path, base, cycle, revision, plans, directory):
+            page = repository.prepare(repo, cycle, revision, progress)
+            unit = findings.prepare(repo, cycle, revision, page.digest, plans, {})
+            return unit, findings.export(repo, unit, plans, {}, repository.export(repo, page, progress, directory))
+
+        def findings_complete(repo, path, base, cycle, revision, plans, unit, output):
+            findings.complete(repo, unit, output, plans, lambda value: None)
+
         ports.reconciliation = SimpleNamespace(
+            findings_unit=findings_unit, findings_session=findings.session,
+            findings_complete=findings_complete, findings_fail=findings.fail,
             progress=mock.Mock(return_value=progress), synthesis=repository.prepare,
             synthesis_session=repository.session, synthesis_complete=repository.complete,
             synthesis_export=repository.export)
@@ -581,11 +593,18 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
                     "key": page.key, "excerpt": page.text.partition("\n")[2][:20], "has_issue": True,
                     "assessment": "Retain every local issue and compare across the reviewed pages.",
                 })
+            elif "FINDINGS_UNIT:" in prompt:
+                unit = findings.prepare(context.repo, 4, "a" * 40, page.digest, {}, {})
+                message = maintenance_findings.UNIT_PREFIX + json.dumps({
+                    "manifest_id": unit.manifest_id, "index": unit.index, "parts": [],
+                    "complete": True, "counts": {"finding_count": 0, "comparison_count": 0},
+                    "summary": "All stored assessments remain available for final resolution."})
             else:
                 # This final call has never seen prior sessions. All validated
                 # observations must still be recoverable via the supplied bundle.
-                manifest = next(Path(directory.name).rglob("manifest.json"))
-                self.assertIn(str(manifest), prompt)
+                manifest = next(path for path in Path(directory.name).rglob("manifest.json")
+                                if (path.parent / "page-00000000.json").exists())
+                self.assertIn(str(next(Path(directory.name).rglob("findings/*/manifest.json"))), prompt)
                 saved = json.loads((manifest.parent / "page-00000000.json").read_text())
                 self.assertIn("Retain every local issue", saved["result"]["assessment"])
                 message = "planner result"
@@ -600,6 +619,7 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
             for _ in maintenance_reconciliation.synthesis_pages(progress):
                 result = coordinator._run_planner_turn(run)
                 self.assertEqual(result.kind, PlanningOutcomeKind.WAITING)
+            self.assertEqual(coordinator._run_planner_turn(run).kind, PlanningOutcomeKind.WAITING)
             self.assertIsNone(coordinator._run_planner_turn(run))
         self.assertIsNone(sessions[0])
         self.assertTrue(all(session is None for session in sessions))
@@ -607,7 +627,8 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         self.assertIn("unique responsibility issue 12", "".join(prompts[:-1]))
         self.assertNotIn("chunk_reviews", prompts[-1])
         self.assertNotIn("SYNTHESIS_RESOLUTIONS:", prompts[-1])
-        self.assertIn("synthesis_digest", prompts[-1])
+        self.assertIn("manifest_id", prompts[-1])
+        self.assertIn("finding_count", prompts[-1])
 
     def test_active_legacy_assessment_skips_new_file_review_stage(self):
         ports = FakePorts(

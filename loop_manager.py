@@ -128,6 +128,7 @@ import maintenance_git
 import maintenance_state
 import maintenance_file_review
 import maintenance_reconciliation
+import maintenance_findings
 import maintenance_file_inventory
 import document_publication
 import scoped_blocking
@@ -19880,6 +19881,7 @@ class _PlanningReconciliationPorts:
         self._connection = connection
         self._repository = maintenance_reconciliation.ReconciliationRepository(connection)
         self._synthesis = maintenance_reconciliation.SynthesisRepository(connection)
+        self._findings = maintenance_findings.FindingsRepository(connection)
         self._reviews = maintenance_file_review.ProvisionalReviewRepository(connection)
 
     def progress(self, repo: str, repository: Path, base: str, cycle_revision: int,
@@ -19932,6 +19934,56 @@ class _PlanningReconciliationPorts:
     def resolution_fail(self, repo, unit, error):
         self._synthesis.resolution_fail(repo, unit, error)
 
+    def _plan_texts(self, repository: Path, revision: str, existing_plans: dict[str, str]) -> dict[str, str]:
+        texts = {}
+        for raw_path in _git_tree_entries(repository, revision):
+            if not re.fullmatch(rb"docs/plans/[^/]+\.md", raw_path):
+                continue
+            path = raw_path.decode("utf-8")
+            text = git_bytes(repository, "show", f"{revision}:{path}").decode("utf-8")
+            plan_id = str(parse_frontmatter(text).get("id", ""))
+            if plan_id in existing_plans:
+                texts[plan_id] = text
+        if set(texts) != set(existing_plans):
+            raise maintenance_reconciliation.ReconciliationError("고정 비종료 계획의 원문이 누락됐습니다.")
+        return texts
+
+    def findings_unit(self, repo, repository, base, cycle, revision, existing_plans, directory):
+        progress = self.progress(repo, repository, base, cycle, revision)
+        synthesis = self.synthesis(repo, cycle, revision, progress)
+        if synthesis.index != synthesis.total:
+            raise maintenance_reconciliation.ReconciliationError("발견 수집 전 모든 증거 페이지가 필요합니다.")
+        texts = self._plan_texts(repository, revision, existing_plans)
+        unit = self._findings.prepare(repo, cycle, revision, synthesis.digest, existing_plans, texts)
+        evidence = self.synthesis_export(repo, synthesis, progress, directory)
+        manifest = self._findings.export(repo, unit, existing_plans, texts, evidence)
+        return unit, manifest
+
+    def findings_session(self, repo, unit, session_id):
+        self._findings.session(repo, unit, session_id)
+
+    def findings_fail(self, repo, unit, error):
+        self._findings.fail(repo, unit, error)
+
+    def findings_complete(self, repo, repository, base, cycle, revision, existing_plans, unit, output):
+        progress = self.progress(repo, repository, base, cycle, revision)
+        synthesis = self.synthesis(repo, cycle, revision, progress)
+        texts = self._plan_texts(repository, revision, existing_plans)
+        fresh = self._findings.prepare(repo, cycle, revision, synthesis.digest, existing_plans, texts)
+        if (fresh.manifest_id, fresh.index) != (unit.manifest_id, unit.index):
+            raise maintenance_reconciliation.ReconciliationError("발견 수집 중 source·계획 집합이 바뀌었습니다.")
+        inventory = maintenance_file_inventory.cached_source_inventory(self._connection, repository, base, revision)
+        sources = {item.path: item for item in inventory.sources}
+        class Contents(dict):
+            def __missing__(self, path):
+                self[path] = maintenance_file_review.source_bytes(repository, base, sources[path])
+                return self[path]
+        def validate(value):
+            new_ids = tuple(sorted({item.get("plan_id", "") for item in value["findings"] if item.get("status") == "new_plan"}))
+            maintenance_reconciliation.parse_findings(value, progress, inventory, Contents(),
+                existing_plans, new_ids, texts, synthesis_digest=synthesis.digest)
+        self._findings.complete(repo, unit, output, existing_plans, validate)
+
     def validate(self, repo: str, repository: Path, base: str, cycle_revision: int,
                  revision: str, output: str, existing_plans: dict[str, str],
                  new_plan_ids: tuple[str, ...], *, resolution_directory: Path | None = None
@@ -19949,18 +20001,12 @@ class _PlanningReconciliationPorts:
                 self[path] = content
                 return content
 
-        plan_texts = {}
-        for raw_path in _git_tree_entries(repository, revision):
-            if not re.fullmatch(rb"docs/plans/[^/]+\.md", raw_path):
-                continue
-            path = raw_path.decode("utf-8")
-            text = git_bytes(repository, "show", f"{revision}:{path}").decode("utf-8")
-            plan_id = str(parse_frontmatter(text).get("id", ""))
-            if plan_id in existing_plans:
-                plan_texts[plan_id] = text
+        plan_texts = self._plan_texts(repository, revision, existing_plans)
+        collection = self._findings.prepare(repo, cycle_revision, revision, synthesis.digest, existing_plans, plan_texts)
+        payload = self._findings.resolve(repo, collection, output, existing_plans)
 
         findings = maintenance_reconciliation.parse_findings(
-            output, progress, inventory, CurrentContents(), existing_plans, new_plan_ids, plan_texts,
+            payload, progress, inventory, CurrentContents(), existing_plans, new_plan_ids, plan_texts,
             synthesis_digest=synthesis.digest,
         )
         if resolution_directory is not None and synthesis.total:

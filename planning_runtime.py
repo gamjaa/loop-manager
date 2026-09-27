@@ -28,6 +28,7 @@ from maintenance_planning import (
 import maintenance_state
 import maintenance_file_review
 import maintenance_reconciliation
+import maintenance_findings
 from maintenance_file_inventory import SourceInventoryError
 import full_assessment
 import runtime_state
@@ -1319,26 +1320,23 @@ class PlanningLifecycleCoordinator:
                         manifest = self._ports.reconciliation.synthesis_export(
                             context.repo, final_page, progress, context.state_dir / "maintenance-evidence",
                         )
+                        existing = self._active_plan_statuses(context.repo)
+                        collection, result_manifest = self._ports.reconciliation.findings_unit(
+                            context.repo, context.repo_path, context.base_branch,
+                            run.maintenance_cycle.revision, str(row.active_sha), existing,
+                            context.state_dir / "maintenance-evidence",
+                        )
+                        if collection.receipt is None:
+                            return PlanningOutcome(PlanningOutcomeKind.WAITING)
                         prompt += (
-                            "\n\n검증된 증거와 독립된 페이지 판단의 영속 snapshot: " + str(manifest) + "\n"
-                            "이전 Agent 세션의 기억에 의존하지 마라. manifest의 page_pattern을 사용해 "
-                            "저장된 모든 페이지 result를 개별 조회하고 필요한 text만 제한된 크기로 읽어라. "
-                            "앞선 판단은 언제든 다시 조회할 수 있으므로 전체 원문을 문맥에 누적하지 마라. "
-                            "최종 응답에 페이지별 처리 배열을 출력하지 마라. "
-                            "페이지별 발견 연결·제외·문제 없음 검증은 이 최종 판단 이후 별도 단위로 요청한다."
-                            + "\n최종 응답에 FINDINGS_RESULT: 한 줄 JSON object도 기록하라. "
-                            "필드: source_revision(현재 SHA), findings:[], no_issue_reason. "
-                            "문제가 없으면 findings=[]와 no_issue_reason={synthesis_digest:manifest digest,summary:20~2000자의 판단 요약}을 기록하라. "
-                            "파일별·관계별 근거는 저장된 증거와 이후 페이지별 처리 결과에서 검증하므로 최종 응답에 반복하지 마라. "
-                            "발견이 있으면 no_issue_reason=null이고 각 발견은 "
-                            "issue_key, targets:[현재 경로], evidence:[{path,content_hash,mode,excerpt}], "
-                            "relation_keys:[확인된 관계 key], boundary, context_reduction, "
-                            "integration_cost, status(existing_plan|new_plan), plan_id, plan_comparisons를 포함한다. "
-                            "plan_comparisons는 모든 비종료 계획마다 {plan_id,plan_excerpt:현재 revision 계획 본문 범위의 정확한 20자 이상 인용,finding_excerpt:boundary의 정확한 20자 이상 인용,same_issue:boolean,reason:20자 이상 비교 이유}를 포함한다. 계획 원문을 읽고 같은 문제인 계획에만 연결하라. "
-                            "다른 파일과의 발견은 확인된 관계를 인용하라. 기존 비종료 계획이 "
-                            "같은 문제를 다루면 해당 ID에 연결하고 새 계획을 만들지 마라. "
-                            "새 계획은 사용자 동작·공개 계약·저장 형식 보존과 독립적인 "
-                            "targeted unit test·전체 verify를 명시하라."
+                            "\n\n검증된 발견·계획 비교 결과 manifest: " + str(result_manifest)
+                            + "\nmanifest의 unit_pattern으로 저장된 발견·비교 원문을 필요한 부분만 조회하라. "
+                            "제안된 새 계획을 실제 ExecPlan으로 작성하고 사용자 동작·공개 계약·저장 형식 "
+                            "보존과 targeted unit test·전체 verify 회귀 조건을 명시하라. "
+                            "모든 발견·비교는 이미 저장돼 있으므로 최종 응답에 배열을 다시 출력하지 마라. "
+                            "페이지별 발견 연결·제외 검증은 이후 별도 단위에서 진행한다. "
+                            "최종 응답에 아래 식별자·digest·개수·요약만 그대로 포함하라:\n"
+                            + maintenance_findings.RESULT_PREFIX + maintenance_findings.encode(collection.receipt)
                         )
                 if (context.self_repository and run.maintenance_cycle.phase
                     is maintenance_state.MaintenancePhase.ASSESSMENT
@@ -1561,7 +1559,7 @@ class PlanningLifecycleCoordinator:
         page = port.synthesis(context.repo, run.maintenance_cycle.revision,
                               str(run.row.active_sha), progress)
         if page.index == page.total:
-            return None
+            return self._collect_findings_unit(run, worktree)
         manifest = port.synthesis_export(context.repo, page, progress,
                                          context.state_dir / "maintenance-evidence")
         before = self._ports.agent.begin_scope("maintenance_planner", worktree)
@@ -1602,6 +1600,47 @@ class PlanningLifecycleCoordinator:
             port.synthesis_complete(context.repo, page, result.message)
         except (maintenance_reconciliation.ReconciliationError, maintenance_file_review.FileReviewError,
                 SourceInventoryError) as error:
+            self._ports.events.error(str(error))
+            return PlanningOutcome(PlanningOutcomeKind.VALIDATION_RETRY, detail=str(error))
+        return PlanningOutcome(PlanningOutcomeKind.WAITING)
+
+    def _active_plan_statuses(self, repo: str) -> dict[str, str]:
+        return {str(item["plan_id"]): str(item["status"])
+                for item in self._ports.state.execplan_rows(repo) if str(item["status"]) != "MERGED"}
+
+    def _collect_findings_unit(self, run: _PlanningRun, worktree: Path) -> PlanningOutcome | None:
+        context, port = run.context, self._ports.reconciliation
+        plans = self._active_plan_statuses(context.repo)
+        unit, manifest = port.findings_unit(context.repo, context.repo_path, context.base_branch,
+            run.maintenance_cycle.revision, str(run.row.active_sha), plans, context.state_dir / "maintenance-evidence")
+        if unit.receipt is not None:
+            return None
+        before = self._ports.agent.begin_scope("maintenance_planner", worktree)
+        result = self._ports.agent.run_planner(worktree, maintenance_findings.unit_prompt(unit, manifest),
+            unit.session_id, lambda session_id: port.findings_session(context.repo, unit, session_id))
+        if result.session_id:
+            port.findings_session(context.repo, unit, result.session_id)
+        scope = self._ports.agent.finish_scope("maintenance_planner", worktree, before)
+        if scope.error:
+            self._ports.events.error(scope.error)
+            return self._operational_error()
+        self._ports.agent.clear_scope(context.repo)
+        if result.code:
+            self._ports.events.error(result.message)
+            kind = {PlanningAgentResultKind.TRANSIENT_FAILURE: PlanningOutcomeKind.TRANSIENT_PAUSE,
+                    PlanningAgentResultKind.USAGE_LIMIT: PlanningOutcomeKind.USAGE_LIMIT_PAUSE}.get(
+                        result.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+            return PlanningOutcome(kind, error=True)
+        try:
+            port.findings_complete(context.repo, context.repo_path, context.base_branch,
+                run.maintenance_cycle.revision, str(run.row.active_sha), self._active_plan_statuses(context.repo),
+                unit, result.message)
+        except (maintenance_reconciliation.ReconciliationError, maintenance_file_review.FileReviewError,
+                SourceInventoryError) as error:
+            try:
+                port.findings_fail(context.repo, unit, str(error))
+            except maintenance_reconciliation.ReconciliationError:
+                pass  # A new snapshot already invalidated the old unit.
             self._ports.events.error(str(error))
             return PlanningOutcome(PlanningOutcomeKind.VALIDATION_RETRY, detail=str(error))
         return PlanningOutcome(PlanningOutcomeKind.WAITING)

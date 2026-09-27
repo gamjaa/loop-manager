@@ -16,6 +16,7 @@ import full_assessment
 import execplan_catalog_state
 import loop_manager
 import maintenance_planning
+import maintenance_findings
 import maintenance_reconciliation
 import maintenance_state
 from maintenance_file_inventory import SourceInventory, TrackedSource
@@ -1916,6 +1917,37 @@ class MaintenancePlanningTest(unittest.TestCase):
 
 
 class ReconciledPlanLinkTest(unittest.TestCase):
+    def test_findings_port_persists_manifest_and_rejects_changed_catalog(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        port = loop_manager._PlanningReconciliationPorts(connection)
+        progress = maintenance_reconciliation.ReconciliationProgress((), (), (), None)
+        with (tempfile.TemporaryDirectory() as directory,
+              mock.patch.object(port, "progress", return_value=progress),
+              mock.patch.object(port, "_plan_texts", return_value={}),
+              mock.patch.object(loop_manager.maintenance_file_inventory, "cached_source_inventory",
+                                return_value=SourceInventory("a" * 40, (), ()))):
+            args = ("repo", Path("repo"), "main", 1, "a" * 40)
+            unit, manifest = port.findings_unit(*args, {}, Path(directory))
+            self.assertTrue(manifest.exists())
+            port.findings_session("repo", unit, "resume")
+            port.findings_fail("repo", unit, "retry bounded unit")
+            resumed, _ = port.findings_unit(*args, {}, Path(directory))
+            self.assertEqual(resumed.session_id, "resume")
+            self.assertEqual(resumed.error, "retry bounded unit")
+            output = maintenance_findings.UNIT_PREFIX + json.dumps({
+                "manifest_id": unit.manifest_id, "index": 0, "parts": [], "complete": True,
+                "counts": {"finding_count": 0, "comparison_count": 0},
+                "summary": "No selected structural evidence requires a new refactoring plan."})
+            port.findings_complete(*args, {}, resumed, output)
+            sealed, _ = port.findings_unit(*args, {}, Path(directory))
+            self.assertEqual(sealed.receipt["unit_count"], 1)
+            final = maintenance_findings.RESULT_PREFIX + json.dumps(sealed.receipt)
+            self.assertEqual(port.validate(*args, final, {}, ())["findings"], [])
+            with mock.patch.object(port, "_plan_texts", return_value={"G-100": "Changed scope"}):
+                with self.assertRaises(maintenance_reconciliation.ReconciliationError):
+                    port.findings_complete(*args, {"G-100": "READY"}, resumed, output)
+
     def test_compact_no_issue_waits_for_every_durable_resolution(self):
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)
@@ -1930,10 +1962,13 @@ class ReconciledPlanLinkTest(unittest.TestCase):
             "key": page.key, "excerpt": "This reviewed module has one cohesive responsibility.",
             "has_issue": False, "assessment": "This independently reviewed module needs no structural change.",
         }))
-        output = maintenance_reconciliation.FINDINGS_PREFIX + json.dumps({
-            "source_revision": "a" * 40, "findings": [],
-            "no_issue_reason": {"synthesis_digest": page.digest,
-                                "summary": "Reviewed responsibilities do not need structural changes."}})
+        collection = port._findings.prepare("repo", 1, "a" * 40, page.digest, {}, {})
+        port._findings.complete("repo", collection, maintenance_findings.UNIT_PREFIX + json.dumps({
+            "manifest_id": collection.manifest_id, "index": 0, "parts": [], "complete": True,
+            "counts": {"finding_count": 0, "comparison_count": 0},
+            "summary": "Reviewed responsibilities do not need structural changes."}), {}, lambda value: None)
+        collection = port._findings.prepare("repo", 1, "a" * 40, page.digest, {}, {})
+        output = maintenance_findings.RESULT_PREFIX + json.dumps(collection.receipt)
         with (tempfile.TemporaryDirectory() as directory,
               mock.patch.object(port, "progress", return_value=progress),
               mock.patch.object(loop_manager.maintenance_file_inventory, "cached_source_inventory",
@@ -1949,8 +1984,8 @@ class ReconciledPlanLinkTest(unittest.TestCase):
                 "issue_keys": [], "disposition": "no_issue",
                 "reason": "The reviewed responsibility has no duplicate or mixed integration boundary."}))
             self.assertEqual(port.validate(*args)["findings"], [])
-            bad_args = (*args[:5], output.replace(page.digest, "stale-digest"), *args[6:])
-            with self.assertRaisesRegex(maintenance_reconciliation.ReconciliationError, "snapshot"):
+            bad_args = (*args[:5], output.replace(collection.receipt["digest"], "stale-digest"), *args[6:])
+            with self.assertRaisesRegex(maintenance_reconciliation.ReconciliationError, "manifest"):
                 port.validate(*bad_args)
 
     def test_unconsumed_evidence_pages_block_final_validation(self):
@@ -1982,6 +2017,7 @@ class ReconciledPlanLinkTest(unittest.TestCase):
                   b"src/invalid-\xff.py": (b"blob", b"source"),
               }),
               mock.patch.object(loop_manager, "git_bytes", return_value=text.encode()) as read,
+              mock.patch.object(port._findings, "resolve", return_value={}),
               mock.patch.object(maintenance_reconciliation, "parse_findings", return_value={}) as parse):
             port.validate("repo", Path("repo"), "main", 1, inventory.revision,
                           "output", {"G-100": "READY"}, ())
