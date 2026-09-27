@@ -139,7 +139,7 @@ class WriteIsolationTests(TestCase):
                                                  str(root / 'source'), False,
                                                  lambda: 'snapshot')
 
-    def test_each_codex_attempt_gets_fresh_verified_policy_evidence(self):
+    def test_command_probe_cannot_verify_codex_file_tool_boundary(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             provider_home = root / 'codex-home'
@@ -156,18 +156,62 @@ class WriteIsolationTests(TestCase):
                  mock.patch.object(isolation.subprocess, 'run', return_value=
                                    manager.subprocess.CompletedProcess(
                                        ['codex', '--version'], 0, 'codex version\n', '')):
-                first_args = isolation.prepare_isolation(
-                    'codex', 'worker', root, root, False, records.append,
-                    lambda: 'snapshot', expected_repository=str(root / 'source'))
+                with self.assertRaisesRegex(isolation.IsolationError, '파일 도구'):
+                    isolation.prepare_isolation(
+                        'codex', 'worker', root, root, False, records.append,
+                        lambda: 'snapshot', expected_repository=str(root / 'source'))
                 config.write_text('model = "second"\n', encoding='utf-8')
-                second_args = isolation.prepare_isolation(
-                    'codex', 'worker', root, root, False, records.append,
-                    lambda: 'snapshot', expected_repository=str(root / 'source'))
-            self.assertEqual(first_args, second_args)
+                with self.assertRaisesRegex(isolation.IsolationError, '파일 도구'):
+                    isolation.prepare_isolation(
+                        'codex', 'worker', root, root, False, records.append,
+                        lambda: 'snapshot', expected_repository=str(root / 'source'))
             self.assertEqual(probe.call_count, 2)
-            self.assertEqual([record.status for record in records], ['verified', 'verified'])
+            self.assertEqual([record.status for record in records], ['rejected', 'rejected'])
+            self.assertTrue(all('새 파일 생성·삭제' in record.reason for record in records))
             self.assertNotEqual(records[0].policy_digest, records[1].policy_digest)
             self.assertEqual(records[0].repository_identity, 'repository')
+
+    def test_unverified_codex_file_tools_stop_before_process_and_log_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            connection = sqlite3.connect(':memory:')
+            self.addCleanup(connection.close)
+            state.ensure_schema(connection)
+            provider_home = root / 'codex-home'
+            provider_home.mkdir()
+            boundary = isolation.WorktreeBoundary(
+                root, root / 'source', (), root / 'git', root / 'common', 'repository')
+            log_dir = root / 'logs' / manager.hashlib.sha256(str(root).encode()).hexdigest()[:16]
+            log_dir.mkdir(parents=True)
+            prior = log_dir / 'planner-last.txt'
+            prior.write_text('previous result', encoding='utf-8')
+            with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(provider_home)}), \
+                 mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
+                 mock.patch.object(isolation, '_codex_probe') as probe, \
+                 mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
+                 mock.patch.object(manager, 'capture_git_snapshot', return_value=
+                                   mock.Mock(serialize=lambda: 'snapshot')), \
+                 mock.patch.object(isolation.subprocess, 'run', return_value=
+                                   manager.subprocess.CompletedProcess(
+                                       ['codex', '--version'], 0, 'codex version\n', '')), \
+                 mock.patch.object(manager.subprocess, 'Popen') as launch:
+                with self.assertRaisesRegex(isolation.IsolationError, '파일 도구'):
+                    manager.run_agent(
+                        'codex',
+                        root, root, root / 'config', 'planner', 'prompt',
+                        read_only=False,
+                        resolved_profile=invocation.ResolvedProfile('model', 'high'),
+                        connection=connection,
+                        invocation=invocation.InvocationContext(str(root / 'source'), None))
+            probe.assert_called_once()
+            launch.assert_not_called()
+            proof = connection.execute('''SELECT proof.status, proof.reason, call.result_kind
+                FROM agent_isolation_evidence AS proof JOIN agent_invocations AS call
+                USING (invocation_id)''').fetchone()
+            self.assertEqual(proof[0], 'rejected')
+            self.assertIn('파일 도구', proof[1])
+            self.assertEqual(proof[2], 'exception')
+            self.assertEqual(prior.read_text(encoding='utf-8'), 'previous result')
 
     def test_codex_probe_requires_allowed_selected_and_denied_external_paths(self):
         with tempfile.TemporaryDirectory() as directory:

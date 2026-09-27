@@ -43,7 +43,7 @@ priority: critical
 
 ## Progress
 
-- [x] 실행별 쓰기 격리와 확인 증거 연결
+- [ ] 실행별 쓰기 격리와 확인 증거 연결
 - [x] 증거 없는 실행의 엄격 fallback 및 회귀 검증
 
 ## Decision Log
@@ -66,3 +66,7 @@ priority: critical
 - 2026-09-27 Worker verify 피드백 수정: 기존 scope unit test가 실제 CLI 함수 `run_codex`를 mock할 때 adapter의 선행 preflight가 테스트용 설정에서 ledger identity 없이 실행돼 다수 오류가 발생했다. preflight를 `run_codex`·`run_claude`의 실제 process·log 생성 직전으로 옮겨 운영 호출의 격리 검사는 유지하면서 mock 경계를 복원했다. 보고된 실패 중 Reviewer 변경, 중단 Worker 재개 및 archive 게시 단일 case가 각각 통과했고, 갱신된 `WriteIsolationTests` 16개가 통과했다. Worker는 전체 verify를 실행하지 않았으며 Loop Manager 재검증을 기다린다.
 
 - 2026-09-27 Worker verify 후속 수정: Planner import fixture에 새 `agent_write_isolation.py`를 포함하고, Planner 중단·재개 unit test의 외부 Codex 사전 검사만 test double로 고정해 시스템의 MCP·plugin·hook 설정이 프로세스 중단 검증을 가리지 않게 했다. 보고된 두 단일 targeted unit test를 각각 실패 명령 그대로 재실행해 통과했다. 전체 verify는 Worker가 실행하지 않았다.
+
+- 2026-09-27 Worker review occurrence=5, revision=5 수정: 현재 `codex sandbox` 사전 검사는 기존 파일을 쓰기 모드로 여는 명령 경계만 확인한다. 새 파일 생성·삭제와 `codex exec` 내부 파일 도구의 동일한 쓰기 경계를 증명하지 못하므로 Linux Codex 호출도 `verified`로 기록하지 않고, 구체적 거부 증거를 남긴 뒤 process·기존 session/log 변경 전에 중단한다. 이전 Progress의 격리 완료 표시는 철회했다. provider 내부 경계를 독립적으로 검증할 수 있는 방법이 마련되기 전에는 모든 provider의 무인 호출을 안전하게 거부하며 엄격한 Git 판정을 유지한다. `AGENTS.md` 규칙 변경은 필요하지 않다.
+
+- 2026-09-27 Worker targeted 검증: `tests/test_agent_invocation.py`의 `WriteIsolationTests` 17개를 실행해 명령 sandbox 검사만 통과한 Codex 호출도 거부되고, 실제 `run_agent` 경계에서 거부 사유가 SQLite에 남으며 CLI process가 시작되지 않고 기존 로그가 보존되는 것을 확인했다. 전체 verify는 실행하지 않았다.

@@ -1,7 +1,7 @@
-"""Preflight evidence for a provider's effective Agent write boundary.
+"""Preflight evidence for an Agent write boundary.
 
-The probe only opens existing files for writing; it never changes their bytes.
-An unproven boundary is a configuration error, not permission to run unsandboxed.
+A command sandbox probe is only partial evidence: it cannot establish the
+provider's file-tool or new-file boundary. Unproven calls must stop.
 """
 
 from __future__ import annotations
@@ -212,7 +212,7 @@ print(json.dumps(out, sort_keys=True))
 
 def _codex_probe(boundary: WorktreeBoundary, read_only: bool,
                  settings: tuple[str, ...]) -> None:
-    """Run Codex's own sandbox with the exact invocation policy, before the Agent."""
+    """Check existing-file command writes; never treat this as complete proof."""
     with ExitStack() as stack:
         selected_file = (
             _existing_writable_file(boundary.worktree) if read_only else
@@ -312,7 +312,10 @@ def prepare_isolation(provider: str, role: str, worktree: Path, state_dir: Path,
         version = result.stdout.strip()
         args = codex_arguments(read_only)
         _codex_probe(boundary, read_only, _codex_configuration(read_only))
-        status = "verified"
+        raise IsolationError(
+            "Codex 명령 sandbox 검사는 새 파일 생성·삭제와 codex exec 내부 파일 도구의 "
+            "쓰기 경계를 증명하지 못합니다. Agent 호출을 중단합니다."
+        )
     except (IsolationError, OSError, subprocess.TimeoutExpired) as error:
         reason = str(error) if isinstance(error, IsolationError) else "격리 확인 도구 실행 실패"
     policy = json.dumps({"provider": provider, "version": version,
