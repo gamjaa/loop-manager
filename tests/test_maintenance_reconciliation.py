@@ -141,6 +141,20 @@ class ReconciliationUnitTest(unittest.TestCase):
                 self.contents[relation.left.path], self.contents[relation.right.path],
             )
 
+    def test_no_issue_requires_each_completed_relation_reason(self):
+        result = {"key": "relation-key", "status": "excluded",
+                  "reason": "The helpers implement distinct responsibilities for their callers."}
+        progress = reconciliation.ReconciliationProgress((), (result,), (), None)
+        value = {"files": [], "relations": []}
+        with self.assertRaisesRegex(reconciliation.ReconciliationError, "누락"):
+            reconciliation._validate_no_issue(value, progress)
+        value["relations"] = [{"id": result["key"], "excerpt": result["reason"],
+                               "reason": "Distinct responsibilities do not justify merging these helpers."}]
+        reconciliation._validate_no_issue(value, progress)
+        value["relations"][0]["excerpt"] = "Fabricated relationship review evidence."
+        with self.assertRaisesRegex(reconciliation.ReconciliationError, "검증된 검토"):
+            reconciliation._validate_no_issue(value, progress)
+
     def test_unresolved_relation_blocks_even_a_no_issue_result(self):
         relation = reconciliation.relation_candidates(
             self.inventory, self.progress((self.sources["src/a.py"],), (self.review_a,)),

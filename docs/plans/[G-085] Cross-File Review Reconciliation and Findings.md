@@ -44,3 +44,8 @@ priority: normal
 - G-085의 발견은 잠정 평가 결과다. 원격 계획 게시와 파일별 성공 기록의 동시 확정은 G-086이 맡는다.
 
 - 관계별 검증 결과는 source revision과 cycle에 결합해 잠정 저장한다. 성공 코드맵의 조회 경계를 마련했지만 검토 기록·코드맵의 성공 전환은 G-086에서만 수행한다.
+
+- 검토 피드백 보완: 최종 Planner에 모든 선정 파일의 검증된 잠정 결과를 전달한다. 발견은 모든 비종료 계획의 고정 revision 본문 인용·책임 경계 비교와 동일 문제 판단을 포함하며, 기존 연결 불일치와 같은 문제의 신규 계획을 거부한다. 문제 없음 결과도 모든 파일 검토와 완료된 관계의 근거 인용을 포함해야 한다.
+- 추가 targeted 검증: 검증기·Planner 입력 9 tests OK(초기 Planner fixture의 revision 오류 수정 후 동일 명령 재실행), 계획 원문 전달 단일 test OK. 전체 verify와 게시 작업은 Worker에서 실행하지 않는다.
+
+- Worker 결과 보고 보완: 이전 보고는 FAILED_COMMAND와 RERUN 사이에 최초 ERROR 결과가 없어 미해결 실패로 판정됐다. 코드의 Git revision fixture 수정은 유지돼 있으며, 동일 targeted 명령을 다시 실행해 추가 회귀 사례를 포함한 11 tests OK를 확인했다. 결과 보고에서 최초 ERROR와 최종 OK를 별도로 기록하며 검증기 동작은 변경하지 않는다.

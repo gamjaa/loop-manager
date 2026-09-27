@@ -19920,8 +19920,18 @@ class _PlanningReconciliationPorts:
                 self[path] = content
                 return content
 
+        plan_texts = {}
+        for raw_path in _git_tree_entries(repository, revision):
+            if not re.fullmatch(rb"docs/plans/[^/]+\.md", raw_path):
+                continue
+            path = raw_path.decode("utf-8")
+            text = git_bytes(repository, "show", f"{revision}:{path}").decode("utf-8")
+            plan_id = str(parse_frontmatter(text).get("id", ""))
+            if plan_id in existing_plans:
+                plan_texts[plan_id] = text
+
         return maintenance_reconciliation.parse_findings(
-            output, progress, inventory, CurrentContents(), existing_plans, new_plan_ids,
+            output, progress, inventory, CurrentContents(), existing_plans, new_plan_ids, plan_texts,
         )
 
 

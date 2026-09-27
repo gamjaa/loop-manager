@@ -1916,6 +1916,28 @@ class MaintenancePlanningTest(unittest.TestCase):
 
 
 class ReconciledPlanLinkTest(unittest.TestCase):
+    def test_validation_reads_plan_scope_from_pinned_active_tree(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        port = loop_manager._PlanningReconciliationPorts(connection)
+        progress = maintenance_reconciliation.ReconciliationProgress((), (), (), None)
+        inventory = SourceInventory("a" * 40, (), ())
+        text = plan_text("G-100", "Extract Boundary")
+        with (mock.patch.object(port, "progress", return_value=progress),
+              mock.patch.object(loop_manager.maintenance_file_inventory, "tracked_source_inventory", return_value=inventory),
+              mock.patch.object(loop_manager, "_git_tree_entries", return_value={
+                  b"docs/plans/[G-100] Extract Boundary.md": (b"blob", b"oid"),
+                  b"docs/plans/archive/[G-099] Old.md": (b"blob", b"old"),
+                  b"src/invalid-\xff.py": (b"blob", b"source"),
+              }),
+              mock.patch.object(loop_manager, "git_bytes", return_value=text.encode()) as read,
+              mock.patch.object(maintenance_reconciliation, "parse_findings", return_value={}) as parse):
+            port.validate("repo", Path("repo"), "main", 1, inventory.revision,
+                          "output", {"G-100": "READY"}, ())
+        read.assert_called_once_with(Path("repo"), "show",
+                                     f"{inventory.revision}:docs/plans/[G-100] Extract Boundary.md")
+        self.assertEqual(parse.call_args.args[-1], {"G-100": text})
+
     def test_refactoring_plan_preserves_all_three_contracts(self):
         path = "docs/plans/[G-100] Extract Boundary.md"
         text = plan_text("G-100", "Extract Boundary")
@@ -1933,7 +1955,9 @@ class ReconciledPlanLinkTest(unittest.TestCase):
         source = TrackedSource("src/calc.py", hashlib.sha256(content).hexdigest(),
                                "100644", "a" * 40, "source")
         inventory = SourceInventory(source.revision, (source,), ())
-        progress = maintenance_reconciliation.ReconciliationProgress((source,), (), (), None)
+        progress = maintenance_reconciliation.ReconciliationProgress(
+            (source,), (), (), None, file_reviews=({"path": source.path, "evidence": {
+                "responsibility_and_integration": "Calculation has one pure responsibility and no external integration."}},))
         finding = {
             "issue_key": "mixed-calculation", "targets": [source.path],
             "evidence": [{"path": source.path, "content_hash": source.content_hash,
@@ -1943,12 +1967,17 @@ class ReconciledPlanLinkTest(unittest.TestCase):
             "context_reduction": "Later interface changes avoid unrelated calculation details.",
             "integration_cost": "One import and a focused unit test are added for the boundary.",
             "status": "existing_plan", "plan_id": "G-100",
+            "plan_comparisons": [{"plan_id": "G-100",
+                "plan_excerpt": "Extract calculation from the interface module.",
+                "finding_excerpt": "Move calculation from the interface module into its own unit.",
+                "same_issue": True, "reason": "Both isolate calculation from the same interface responsibility."}],
         }
         payload = {"source_revision": source.revision, "findings": [finding],
                    "no_issue_reason": None}
         parse = lambda value, existing, new: maintenance_reconciliation.parse_findings(
             maintenance_reconciliation.FINDINGS_PREFIX + json.dumps(value), progress,
             inventory, {source.path: content}, existing, new,
+            {"G-100": "Extract calculation from the interface module."},
         )
         self.assertEqual(parse(payload, {"G-100": "READY"}, ()), payload)
         with self.assertRaisesRegex(maintenance_reconciliation.ReconciliationError, "계획 연결"):
@@ -1956,8 +1985,33 @@ class ReconciledPlanLinkTest(unittest.TestCase):
         with self.assertRaisesRegex(maintenance_reconciliation.ReconciliationError, "새 리팩터링"):
             parse(payload, {"G-100": "READY"}, ("G-101",))
         no_issue = {"source_revision": source.revision, "findings": [],
-                    "no_issue_reason": "No duplicate or mixed responsibility is present in this source."}
+                    "no_issue_reason": {"files": [{"id": source.path,
+                        "excerpt": "Calculation has one pure responsibility",
+                        "reason": "The reviewed function has no mixed integration responsibility."}], "relations": []}}
         self.assertEqual(parse(no_issue, {}, ()), no_issue)
+        import copy
+        for change in ("unrelated", "duplicate", "forged", "missing"):
+            changed = copy.deepcopy(payload)
+            candidate = changed["findings"][0]
+            new = ()
+            if change == "unrelated":
+                candidate["plan_comparisons"][0]["same_issue"] = False
+            elif change == "duplicate":
+                candidate.update(status="new_plan", plan_id="G-101")
+                new = ("G-101",)
+            elif change == "forged":
+                candidate["plan_comparisons"][0]["plan_excerpt"] = "A made up scope that is absent from the plan."
+            else:
+                candidate["plan_comparisons"] = []
+            with self.subTest(change=change), self.assertRaises(maintenance_reconciliation.ReconciliationError):
+                parse(changed, {"G-100": "READY"}, new)
+        for reason in ("Everything looks fine after careful review.",
+                       {"files": [], "relations": []},
+                       {"files": [{"id": source.path, "excerpt": "This review evidence was fabricated.",
+                                   "reason": "There is no issue requiring any refactoring."}], "relations": []}):
+            with self.subTest(reason=reason), self.assertRaises(maintenance_reconciliation.ReconciliationError):
+                parse({**no_issue, "no_issue_reason": reason}, {}, ())
+
 
 
 if __name__ == "__main__":

@@ -493,6 +493,35 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         self.assertEqual(ports.file_review.complete.call_args.args[2], source)
         self.assertEqual(ports.file_review.fail.call_count, 0)
 
+    def test_final_assessment_prompt_includes_thirteenth_file_evidence(self):
+        ports = FakePorts(
+            planning_snapshot(phase="PLANNING", active_sha="a" * 40),
+            maintenance_cycle(phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+                              cycle_base_sha="a" * 40, revision=4,
+                              file_assessment_start_merged_count=0),
+        )
+        ports.git.head = "a" * 40
+        reviews = tuple({"path": f"src/file_{index}.py", "evidence": {
+            "responsibility_and_integration": f"unique responsibility issue {index}"}}
+            for index in range(13))
+        ports.file_review = mock.Mock()
+        ports.reconciliation = mock.Mock()
+        ports.reconciliation.progress.return_value = maintenance_reconciliation.ReconciliationProgress(
+            (), (), (), None, file_reviews=reviews)
+        ports.validation.maintenance_prompt = mock.Mock(return_value="assessment prompt")
+        ports.agent.run_planner = mock.Mock(return_value=ports.agent.result)
+        coordinator = PlanningLifecycleCoordinator(ports)
+        run = coordinator._new_run(self.context)
+        run.planning_worktree = Path("/worktree")
+        run.maintenance_context = object()
+        with (mock.patch.object(coordinator, "_review_one_file", return_value=None),
+              mock.patch.object(coordinator, "_reconcile_one_relation", return_value=None)):
+            coordinator._run_planner_turn(run)
+        prompt = ports.agent.run_planner.call_args.args[1]
+        for review in reviews:
+            self.assertIn(review["path"], prompt)
+            self.assertIn(review["evidence"]["responsibility_and_integration"], prompt)
+
     def test_active_legacy_assessment_skips_new_file_review_stage(self):
         ports = FakePorts(
             planning_snapshot(phase="PLANNING", active_sha="base"),

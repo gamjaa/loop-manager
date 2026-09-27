@@ -1305,12 +1305,6 @@ class PlanningLifecycleCoordinator:
                     ),
                 )
                 if file_review_enabled:
-                    reviews = self._ports.file_review.completed_summary(
-                        context.repo,
-                    )
-                    prompt += "\n\n검증된 잠정 파일 검토와 코드맵의 bounded 미리보기 (성공 기록 아님):\n" + json.dumps(
-                        reviews, ensure_ascii=False,
-                    )
                     if hasattr(self._ports, "reconciliation"):
                         progress = self._ports.reconciliation.progress(
                             context.repo, context.repo_path, context.base_branch,
@@ -1320,16 +1314,18 @@ class PlanningLifecycleCoordinator:
                             "\n\n모든 선정 파일의 검토와 관계 확인 결과 (성공 기록 아님):\n"
                             + json.dumps({
                                 "selected": [item.path for item in progress.selected],
+                                "file_reviews": list(progress.file_reviews),
                                 "relations": list(progress.completed),
                                 "excluded_candidates": list(progress.excluded_candidates),
                             }, ensure_ascii=False)
                             + "\n최종 응답에 FINDINGS_RESULT: 한 줄 JSON object도 기록하라. "
                             "필드: source_revision(현재 SHA), findings:[], no_issue_reason. "
-                            "문제가 없으면 findings=[]와 20자 이상의 구체적인 no_issue_reason을 기록하라. "
+                            "문제가 없으면 findings=[]와 no_issue_reason={files:[{id:경로,excerpt:파일 검토 evidence의 정확한 12자 이상 인용,reason:20자 이상 판단}],relations:[{id:key,excerpt:관계 reason의 정확한 인용,reason:20자 이상 판단}]}을 기록하고 모든 선정 파일과 관계를 포함하라. "
                             "발견이 있으면 no_issue_reason=null이고 각 발견은 "
                             "issue_key, targets:[현재 경로], evidence:[{path,content_hash,mode,excerpt}], "
                             "relation_keys:[확인된 관계 key], boundary, context_reduction, "
-                            "integration_cost, status(existing_plan|new_plan), plan_id를 포함한다. "
+                            "integration_cost, status(existing_plan|new_plan), plan_id, plan_comparisons를 포함한다. "
+                            "plan_comparisons는 모든 비종료 계획마다 {plan_id,plan_excerpt:현재 revision 계획 본문 범위의 정확한 20자 이상 인용,finding_excerpt:boundary의 정확한 20자 이상 인용,same_issue:boolean,reason:20자 이상 비교 이유}를 포함한다. 계획 원문을 읽고 같은 문제인 계획에만 연결하라. "
                             "다른 파일과의 발견은 확인된 관계를 인용하라. 기존 비종료 계획이 "
                             "같은 문제를 다루면 해당 ID에 연결하고 새 계획을 만들지 마라. "
                             "새 계획은 사용자 동작·공개 계약·저장 형식 보존과 독립적인 "

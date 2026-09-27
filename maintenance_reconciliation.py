@@ -66,6 +66,7 @@ class ReconciliationProgress:
     relations: tuple[Relation, ...]
     next_relation: Relation | None
     excluded_candidates: tuple[dict, ...] = ()
+    file_reviews: tuple[dict, ...] = ()
 
 
 def _note(value: object, field: str, minimum: int = 12) -> str:
@@ -306,7 +307,7 @@ class ReconciliationRepository:
         next_relation = next((item for item in relations if item.key not in completed), None)
         return ReconciliationProgress(reviews.selected, tuple(completed[key] for key in sorted(completed)),
                                       relations, next_relation,
-                                      _excluded_candidates(inventory, reviews, maps))
+                                      _excluded_candidates(inventory, reviews, maps), reviews.completed)
 
     def start(self, repo: str, cycle_revision: int, revision: str, relation: Relation) -> None:
         with self.connection:
@@ -353,9 +354,72 @@ class ReconciliationRepository:
         return (row[0], row[1]) if row else (None, None)
 
 
+def _validate_no_issue(value: object, progress: ReconciliationProgress) -> None:
+    if not isinstance(value, dict) or set(value) != {"files", "relations"}:
+        raise ReconciliationError("문제 없음 근거는 모든 파일 검토와 관계에 연결해야 합니다.")
+    reviews = {item["path"]: item for item in progress.file_reviews}
+    selected = {item.path for item in progress.selected}
+    if set(reviews) != selected:
+        raise ReconciliationError("문제 없음 근거에 전체 파일 검토가 필요합니다.")
+    for field, expected in (("files", reviews), ("relations", {item["key"]: item for item in progress.completed})):
+        entries = value[field]
+        if not isinstance(entries, list):
+            raise ReconciliationError("문제 없음 근거는 배열이어야 합니다.")
+        seen = set()
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry) != {"id", "excerpt", "reason"}:
+                raise ReconciliationError("문제 없음 근거 필드가 유효하지 않습니다.")
+            identity = entry["id"]
+            if not isinstance(identity, str) or identity not in expected or identity in seen:
+                raise ReconciliationError("문제 없음 근거의 대상이 다르거나 중복됐습니다.")
+            seen.add(identity)
+            evidence = expected[identity]["evidence"] if field == "files" else expected[identity]["reason"]
+            excerpt = _note(entry["excerpt"], "검토 근거 인용", 12)
+            if excerpt not in json.dumps(evidence, ensure_ascii=False):
+                raise ReconciliationError("문제 없음 근거가 검증된 검토와 다릅니다.")
+            _note(entry["reason"], "문제 없음 판단", 20)
+        if seen != set(expected):
+            raise ReconciliationError("문제 없음 근거에 파일 또는 관계가 누락됐습니다.")
+
+
+def _validate_plan_comparisons(finding: dict, existing: Mapping[str, str],
+                               texts: Mapping[str, str]) -> None:
+    comparisons = finding["plan_comparisons"]
+    active = {key for key, status in existing.items() if status != "MERGED"}
+    if not isinstance(comparisons, list):
+        raise ReconciliationError("계획 범위 비교가 필요합니다.")
+    seen, matches = set(), set()
+    for comparison in comparisons:
+        if not isinstance(comparison, dict) or set(comparison) != {
+            "plan_id", "plan_excerpt", "finding_excerpt", "same_issue", "reason",
+        }:
+            raise ReconciliationError("계획 범위 비교 필드가 유효하지 않습니다.")
+        plan_id = comparison["plan_id"]
+        if not isinstance(plan_id, str) or plan_id not in active or plan_id in seen:
+            raise ReconciliationError("계획 범위 비교 대상이 다르거나 중복됐습니다.")
+        seen.add(plan_id)
+        excerpt = _note(comparison["plan_excerpt"], "계획 범위 인용", 20)
+        if excerpt not in texts.get(plan_id, ""):
+            raise ReconciliationError("계획 범위 근거가 원본과 다릅니다.")
+        finding_excerpt = _note(comparison["finding_excerpt"], "발견 책임 경계 인용", 20)
+        if finding_excerpt not in finding["boundary"]:
+            raise ReconciliationError("계획 비교가 발견 책임 경계와 다릅니다.")
+        if type(comparison["same_issue"]) is not bool:
+            raise ReconciliationError("계획의 동일 문제 판단이 필요합니다.")
+        _note(comparison["reason"], "계획 범위 비교 이유", 20)
+        if comparison["same_issue"]:
+            matches.add(plan_id)
+    if seen != active:
+        raise ReconciliationError("모든 비종료 계획의 범위 비교가 필요합니다.")
+    if ((finding["status"] == "existing_plan" and finding["plan_id"] not in matches)
+        or (finding["status"] == "new_plan" and matches)):
+        raise ReconciliationError("같은 문제의 기존 계획 연결 또는 중복 방지가 필요합니다.")
+
+
 def parse_findings(output: str, progress: ReconciliationProgress,
                    inventory: SourceInventory, contents: Mapping[str, bytes],
-                   existing_plans: Mapping[str, str], new_plan_ids: Sequence[str]) -> dict:
+                   existing_plans: Mapping[str, str], new_plan_ids: Sequence[str],
+                   plan_texts: Mapping[str, str] | None = None) -> dict:
     if progress.next_relation is not None or len(progress.completed) != len(progress.relations):
         raise ReconciliationError("미확인 파일 간 관계가 남았습니다.")
     value = _single_json(output, FINDINGS_PREFIX)
@@ -365,7 +429,7 @@ def parse_findings(output: str, progress: ReconciliationProgress,
     if not isinstance(findings, list):
         raise ReconciliationError("발견은 배열이어야 합니다.")
     if not findings:
-        _note(value["no_issue_reason"], "문제 없음 근거", minimum=20)
+        _validate_no_issue(value["no_issue_reason"], progress)
     elif value["no_issue_reason"] is not None:
         raise ReconciliationError("발견과 문제 없음 근거가 상충합니다.")
     sources = {item.path: item for item in inventory.sources}
@@ -376,7 +440,7 @@ def parse_findings(output: str, progress: ReconciliationProgress,
     for finding in findings:
         if not isinstance(finding, dict) or set(finding) != {
             "issue_key", "targets", "evidence", "relation_keys", "boundary",
-            "context_reduction", "integration_cost", "status", "plan_id",
+            "context_reduction", "integration_cost", "status", "plan_id", "plan_comparisons",
         }:
             raise ReconciliationError("발견 필드가 유효하지 않습니다.")
         issue_key = _note(finding["issue_key"], "문제 식별자", minimum=4)
@@ -424,6 +488,7 @@ def parse_findings(output: str, progress: ReconciliationProgress,
             or (status == "new_plan" and plan_id not in new_plan_ids)
             or status not in {"existing_plan", "new_plan"}):
             raise ReconciliationError("발견의 비종료 또는 새 계획 연결이 유효하지 않습니다.")
+        _validate_plan_comparisons(finding, existing_plans, plan_texts or {})
     if {item["plan_id"] for item in findings if item["status"] == "new_plan"} != set(new_plan_ids):
         raise ReconciliationError("새 리팩터링 계획마다 근거 있는 발견 연결이 필요합니다.")
     return value
