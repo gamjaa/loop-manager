@@ -61,6 +61,20 @@ CREATE TABLE IF NOT EXISTS persistent_execution_failures (
 )
 """
 
+REVIEW_CORRECTION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS review_correction_turns (
+    repo TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    review_result_id INTEGER NOT NULL,
+    reserved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    started_at TEXT,
+    PRIMARY KEY (repo, plan_id, run_id, review_result_id)
+)
+"""
+
+MAX_REVIEW_CORRECTIONS_PER_RUN = 3
+
 
 def block_user_targets(
     connection: sqlite3.Connection,
@@ -94,6 +108,7 @@ def block_user_targets(
 def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.execute(SCHEMA)
     connection.execute(PERSISTENT_FAILURE_SCHEMA)
+    connection.execute(REVIEW_CORRECTION_SCHEMA)
     columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(recovery_records)")}
     if "recovery_counts" not in columns:
         connection.execute(
@@ -115,10 +130,12 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
         )
 
 
-def begin_external_run(connection: sqlite3.Connection) -> str:
+def begin_external_run(
+    connection: sqlite3.Connection, run_id: str | None = None,
+) -> str:
     """Bind one scheduler invocation to this SQLite connection."""
 
-    run_id = uuid.uuid4().hex
+    run_id = run_id or uuid.uuid4().hex
     connection.execute(
         "CREATE TEMP TABLE IF NOT EXISTS recovery_external_run "
         "(run_id TEXT NOT NULL)"
@@ -138,6 +155,83 @@ def _external_run_id(connection: sqlite3.Connection) -> str | None:
     except sqlite3.OperationalError:
         return None
     return str(row[0]) if row is not None else None
+
+
+def pending_review_correction(
+    connection: sqlite3.Connection, repo: str, plan_id: str, review_result: str | None,
+) -> int | None:
+    """Identify only the latest undischarged Review FAIL as Worker input."""
+
+    if not review_result:
+        return None
+    recovery = connection.execute(
+        "SELECT reason_code FROM recovery_records "
+        "WHERE repo = ? AND subject = ?",
+        (repo, plan_id),
+    ).fetchone()
+    if (recovery is not None
+            and recovery["reason_code"] == RecoveryReason.WORKER_CORRECTION.value):
+        return None
+    row = connection.execute(
+        "SELECT id, stage, classification, raw_output FROM validation_results "
+        "WHERE repo = ? AND plan_id = ? ORDER BY id DESC LIMIT 1",
+        (repo, plan_id),
+    ).fetchone()
+    if (row is None or row["stage"] != "review"
+            or row["classification"] not in {"failure", "legacy_failure"}
+            or row["raw_output"] != review_result):
+        return None
+    return int(row["id"])
+
+
+def reserve_review_correction(
+    connection: sqlite3.Connection, repo: str, plan_id: str, review_result_id: int,
+) -> tuple[bool, int, str | None]:
+    """Reserve one logical Review Worker turn before invoking any provider."""
+
+    run_id = _external_run_id(connection)
+    if run_id is None:
+        return True, 0, None
+    with connection:
+        existing = connection.execute(
+            "SELECT 1 FROM review_correction_turns WHERE repo = ? AND plan_id = ? "
+            "AND run_id = ? AND review_result_id = ?",
+            (repo, plan_id, run_id, review_result_id),
+        ).fetchone()
+        used = int(connection.execute(
+            "SELECT COUNT(*) FROM review_correction_turns "
+            "WHERE repo = ? AND plan_id = ? AND run_id = ?",
+            (repo, plan_id, run_id),
+        ).fetchone()[0])
+        if existing is not None:
+            return True, used, run_id
+        if used >= MAX_REVIEW_CORRECTIONS_PER_RUN:
+            return False, used, run_id
+        connection.execute(
+            "INSERT INTO review_correction_turns "
+            "(repo, plan_id, run_id, review_result_id) VALUES (?, ?, ?, ?)",
+            (repo, plan_id, run_id, review_result_id),
+        )
+        return True, used + 1, run_id
+
+
+def start_review_correction(
+    connection: sqlite3.Connection, repo: str, plan_id: str,
+    run_id: str | None, review_result_id: int | None,
+) -> None:
+    """Durably mark the reserved turn immediately before the provider call."""
+
+    if run_id is None or review_result_id is None:
+        return
+    with connection:
+        changed = connection.execute(
+            "UPDATE review_correction_turns "
+            "SET started_at = COALESCE(started_at, CURRENT_TIMESTAMP) "
+            "WHERE repo = ? AND plan_id = ? AND run_id = ? AND review_result_id = ?",
+            (repo, plan_id, run_id, review_result_id),
+        )
+        if changed.rowcount != 1:
+            raise RecoveryStateConflict("Review correction reservation changed")
 
 
 class RecoveryStateConflict(RuntimeError):
@@ -473,7 +567,10 @@ class RecoveryRepository:
         remaining = {}
         for key, occurrence in index.items():
             reason, fingerprint, _progress = json.loads(key)
-            if reason != RecoveryReason.WORKER_CORRECTION.value or fingerprint not in selected:
+            if reason not in {
+                RecoveryReason.WORKER_CORRECTION.value,
+                RecoveryReason.REVIEW_FEEDBACK_CORRECTION.value,
+            } or fingerprint not in selected:
                 remaining[key] = occurrence
         if len(remaining) == len(index):
             return

@@ -96,7 +96,7 @@ from agent_invocation import (AgentProfile, AgentRequest, AgentResult, AgentResu
 from agent_provider_usage import claude_usage, codex_log_usage
 import agent_invocation_state
 import validation_feedback_state
-from validation_feedback import redact_secrets
+from validation_feedback import normalize_feedback, redact_secrets
 from worker_outcome import worker_outcome_instruction
 from verify_process import run_verify_process, VerifyTerminationUncertain
 from execution_state import ExecutionStatePort as _ExecutionStatePort
@@ -12640,7 +12640,7 @@ def transition_validation_failure(
         (
             failure
             for failure in recorded_failures
-            if failure[2] > MAX_VALIDATION_FINGERPRINT_REPEATS
+            if stage == "verify" and failure[2] > MAX_VALIDATION_FINGERPRINT_REPEATS
         ),
         None,
     )
@@ -16335,6 +16335,10 @@ def _evaluate_remote_checkpoint_cause(
             continue
         if verdict == "SPEC_BLOCKED":
             return False, review, "specification"
+        validation_feedback_state.ValidationFeedbackRepository(connection).observe(
+            repo, str(blocked["plan_id"]), revision[0], "review", verdict == "PASS", review,
+            normalize_feedback("review", review) if verdict == "FAIL" else (),
+        )
         return verdict == "PASS" or _remote_checkpoint_has_new_failure(
             connection, repo, blocked, "review", review, worktree,
         ), review, "review" if verdict != "PASS" else None
@@ -16751,6 +16755,144 @@ def _reconcile_published_blocked_checkpoint(
     return "adopted"
 
 
+def _resume_legacy_review_count_block(
+    connection: sqlite3.Connection, repo_path: Path, state_dir: Path,
+    repo: str, plan: sqlite3.Row,
+) -> bool:
+    """Release only a Review occurrence block with proven workspace ownership."""
+
+    plan_id = str(plan["plan_id"])
+    block = scoped_blocking.plan_block(connection, repo, plan_id)
+    if (
+        block is None
+        or block["reason_code"] != BlockReasonCode.REVIEW_RETRY_EXHAUSTED.value
+        or scoped_blocking.project_block(connection, repo) is not None
+        or plan["status"] != "PLAN_BLOCKED"
+        or plan["blocked_reason"] != BlockReasonCode.REVIEW_RETRY_EXHAUSTED.value
+        or plan["pr_url"] or plan["pr_head_oid"]
+        or plan["agent_recovery"] or int(plan["pr_conflict_recovery"] or 0)
+        or not str(plan["review_result"] or "").strip().endswith("VERDICT: FAIL")
+        or not plan["agent_result_snapshot"]
+        or int(plan["workspace_owned"] or 0) != WORKSPACE_OWNED
+    ):
+        return False
+    record = recovery_state.RecoveryRepository(connection).row(repo, plan_id)
+    if record is not None and record["final_evidence"]:
+        try:
+            evidence = json.loads(str(record["final_evidence"]))
+        except (TypeError, ValueError):
+            return False
+        if evidence.get("block_reason_code") != BlockReasonCode.REVIEW_RETRY_EXHAUSTED.value:
+            return False
+    worktree = Path(str(plan["worktree"] or ""))
+    branch = str(plan["branch"] or "")
+    if not branch or not worktree.is_dir():
+        return False
+    checkpoint = connection.execute(
+        "SELECT phase, reason_code, published_oid, local_oid, "
+        "tree_oid, commit_identity FROM blocked_checkpoints "
+        "WHERE repo = ? AND plan_id = ?", (repo, plan_id),
+    ).fetchone()
+    if checkpoint is not None and checkpoint["reason_code"] != BlockReasonCode.REVIEW_RETRY_EXHAUSTED.value:
+        return False
+    if checkpoint is not None and checkpoint["phase"] not in {"published", "unpublished"}:
+        return False
+    try:
+        validate_execplan_workspace_identity(state_dir, repo, plan_id, branch, worktree)
+        validate_managed_worktree(repo_path, worktree, branch)
+        if _rebase_in_progress_for_branch(worktree, branch):
+            return False
+        snapshot = capture_git_snapshot(worktree)
+        if snapshot.branch != branch or snapshot.operations or not snapshot.head:
+            return False
+        blocked_snapshot = GitSnapshot.deserialize(str(plan["agent_result_snapshot"]))
+        if (not snapshot.shared_metadata_complete
+                or not blocked_snapshot.shared_metadata_complete):
+            return False
+        if checkpoint is None or (
+            checkpoint["phase"] == "unpublished" and not checkpoint["local_oid"]
+        ):
+            if (
+                snapshot.head != blocked_snapshot.head
+                or snapshot.branch != blocked_snapshot.branch
+                or snapshot.index != blocked_snapshot.index
+                or snapshot.dirty != blocked_snapshot.dirty
+            ):
+                return False
+        elif checkpoint["phase"] == "unpublished":
+            local_oid = str(checkpoint["local_oid"])
+            commit_identity = str(checkpoint["commit_identity"] or "")
+            tree_oid = str(checkpoint["tree_oid"] or "")
+            if (
+                snapshot.head != local_oid or not commit_identity or not tree_oid
+                or git(repo_path, "rev-parse", f"{local_oid}^{{tree}}").stdout.strip() != tree_oid
+                or f"Checkpoint-Identity: {commit_identity}" not in git(
+                    repo_path, "show", "-s", "--format=%B", local_oid,
+                ).stdout
+            ):
+                return False
+        validate_blocked_agent_scope(
+            connection, repo_path, repo,
+            str(connection.execute(
+                "SELECT base_branch FROM projects WHERE repo = ?", (repo,),
+            ).fetchone()[0]),
+            worktree, str(plan["path"]),
+        )
+        remote_oid = remote_branch_oid(repo_path, branch)
+        observed_remote = git(
+            repo_path, "ls-remote", "--heads", "origin",
+            f"refs/heads/{branch}", check=False,
+        )
+        remote_lines = [
+            line.split() for line in observed_remote.stdout.splitlines() if line.strip()
+        ]
+        expected_lines = ([[remote_oid, f"refs/heads/{branch}"]]
+                          if remote_oid is not None else [])
+        if observed_remote.returncode or remote_lines != expected_lines:
+            return False
+        if pr_for_branch(repo_path, branch) is not None:
+            return False
+        if checkpoint is not None and checkpoint["phase"] == "published":
+            published = str(checkpoint["published_oid"] or "")
+            request = blocked_checkpoint_state.BlockedCheckpointRepository(
+                connection,
+            ).get(repo, plan_id)
+            if (not published or remote_oid != published or request is None
+                    or _owned_checkpoint_remote_oid(
+                        connection, repo_path, request, plan, snapshot,
+                    ) != remote_oid):
+                return False
+        elif remote_oid is not None and remote_oid != plan["publication_remote_oid"]:
+            return False
+        if remote_oid is not None and git(
+            repo_path, "merge-base", "--is-ancestor", remote_oid,
+            snapshot.head, check=False,
+        ).returncode != 0:
+            return False
+    except (AgentScopeError, OSError, RuntimeError, WorkspaceOwnershipError,
+            KeyError, TypeError, ValueError):
+        return False
+    with runtime_state._transaction(connection):
+        runtime_state.RuntimeStateRepository(connection).transition(
+            repo, plan_id,
+            plan_values={
+                "status": "IMPLEMENTING", "blocked_reason": None,
+                "blocked_fingerprint": None,
+                "blocked_worktree_fingerprint": None,
+                "blocked_review_fingerprint": None,
+                "validated_base_sha": None,
+                "last_error": f"Review 실패:\n{str(plan['review_result'] or '')[-8000:]}",
+            },
+            project_values={
+                "phase": "WORKING", "validated_base_sha": None,
+                "last_error": f"Review 실패:\n{str(plan['review_result'] or '')[-8000:]}",
+            },
+            enqueue=False,
+        )
+        scoped_blocking.clear_plan_block(connection, repo, plan_id)
+    return True
+
+
 def resume_plan_blocks(
     connection: sqlite3.Connection,
     repo_path: Path,
@@ -16796,6 +16938,21 @@ def resume_plan_blocks(
                 continue
             if remote_result == "resumed":
                 return True
+        else:
+            remote_result = None
+        if blocked["blocked_reason"] == BlockReasonCode.REVIEW_RETRY_EXHAUSTED.value:
+            # A changed published checkpoint needs the existing remote cause
+            # and ownership review. Only an unchanged (or absent) checkpoint
+            # can use the count-only legacy release path.
+            if remote_result in {None, "unchanged"}:
+                hydrate_execplan_project(connection, repo, blocked)
+                if _resume_legacy_review_count_block(
+                    connection, repo_path, state_dir, repo, blocked,
+                ):
+                    return True
+            with connection:
+                _clear_active_in_current_transaction(connection, repo)
+            continue
         if blocked["blocked_reason"] == BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT.value:
             old_timeout = int(blocked["blocked_fingerprint"])
             new_timeout = (
@@ -20528,6 +20685,7 @@ def run_project_result(
     verify_timeout_seconds: int = 600,
     on_step_completed: Callable[[], None] | None = None,
     runtime_mutation: RuntimeMutation | None = None,
+    external_run_id: str | None = None,
 ) -> ProjectRunResult:
     """Run one scheduler invocation and project its external failure outcome."""
 
@@ -20535,7 +20693,7 @@ def run_project_result(
     if not getattr(connection, "execplans_schema_ready", False):
         recovery_state.ensure_schema(connection)
     recovery_repository = recovery_state.RecoveryRepository(connection)
-    run_id = recovery_state.begin_external_run(connection)
+    run_id = recovery_state.begin_external_run(connection, external_run_id)
     # The TEMP run marker must not hold the transaction that later makes each
     # recovery observation durable on its own bounded state transition.
     connection.commit()
@@ -20931,6 +21089,7 @@ def _run_registered_project(
     refactoring_review_interval: int,
     verify_timeout_seconds: int = 600,
     runtime_mutation: RuntimeMutation | None = None,
+    external_run_id: str | None = None,
 ) -> ScheduledProjectResult:
     """Run one registry row with state isolated to this worker connection."""
 
@@ -20973,6 +21132,7 @@ def _run_registered_project(
                 refactoring_review_interval=refactoring_review_interval,
                 verify_timeout_seconds=verify_timeout_seconds,
                 on_step_completed=deliver_new_pr_notifications,
+                external_run_id=external_run_id,
                 **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
             )
     except (ManagedConfigError, project_registry.ProjectRegistryError) as error:
@@ -21011,6 +21171,7 @@ def schedule_registered_projects(
         return ()
 
     planner_mutex = threading.Lock()
+    external_run_id = secrets.token_hex(16)
     worker_count = min(config.max_workers, len(projects))
     with ThreadPoolExecutor(
         max_workers=worker_count,
@@ -21027,6 +21188,7 @@ def schedule_registered_projects(
                 planner_mutex,
                 config.refactoring_review_interval,
                 config.verify_timeout_seconds,
+                external_run_id=external_run_id,
                 **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
             )
             for project in projects

@@ -133,6 +133,17 @@ def plan_blocks(connection: sqlite3.Connection, repo: str) -> tuple[sqlite3.Row,
     )
 
 
+def plan_block(
+    connection: sqlite3.Connection, repo: str, plan_id: str,
+) -> sqlite3.Row | None:
+    """Read the current structured cause for one blocked plan."""
+
+    return connection.execute(
+        "SELECT * FROM execplan_blocks WHERE repo = ? AND plan_id = ?",
+        (repo, plan_id),
+    ).fetchone()
+
+
 def project_block(connection: sqlite3.Connection, repo: str) -> sqlite3.Row | None:
     return connection.execute(
         "SELECT * FROM project_blocks WHERE repo = ?", (repo,)

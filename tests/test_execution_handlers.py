@@ -38,6 +38,96 @@ VALID_WORKER_RESULT = 'WORKER_OUTCOME: {"kind":"ready_for_validation"}\nvalid re
 
 
 class ExecutionHandlerTests(TestCase):
+    def test_review_budget_pauses_before_worker_and_preserves_projection(self):
+        run_id = handlers.recovery_state.begin_external_run(self.connection)
+        feedback = ValidationFeedbackRepository(self.connection)
+        for index in range(4):
+            review = f"ISSUE_ID: app.py::issue-{index}::blocking\nVERDICT: FAIL"
+            feedback.observe('repo', 'G-047', 'base', 'review', False, review,
+                             (Feedback('review', f'review:app.py::issue-{index}::blocking', review),))
+            result_id = self.connection.execute(
+                "SELECT MAX(id) FROM validation_results"
+            ).fetchone()[0]
+            if index < 3:
+                self.assertEqual(
+                    handlers.recovery_state.reserve_review_correction(
+                        self.connection, 'repo', 'G-047', result_id,
+                    ), (True, index + 1, run_id),
+                )
+        self.state.update_project(
+            'repo', phase='WORKING', review_result=review,
+            last_error='Review 실패:\n' + review,
+            worker_session_id='worker-session',
+        )
+        before = self.state.check()
+        outcome = self.handler.run(self.context())
+        after = self.state.check()
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
+        self.assertEqual((after.status, after.worker_session_id, after.review_result),
+                         (before.status, before.worker_session_id, before.review_result))
+        self.assertIn('used=3/3', outcome.detail)
+        self.effects.agent.run_agent.assert_not_called()
+        self.assertIsNone(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
+        self.assertIsNone(self.connection.execute(
+            "SELECT 1 FROM blocked_checkpoints WHERE repo = 'repo' AND plan_id = 'G-047'"
+        ).fetchone())
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM notification_outbox "
+            "WHERE repo = 'repo' AND event_type IN ('blocked', 'resumed')"
+        ).fetchone()[0], 0)
+
+    def test_review_pass_after_third_correction_advances_to_publication(self):
+        run_id = handlers.recovery_state.begin_external_run(self.connection)
+        for result_id in range(1, 4):
+            self.assertEqual(
+                handlers.recovery_state.reserve_review_correction(
+                    self.connection, 'repo', 'G-047', result_id,
+                ), (True, result_id, run_id),
+            )
+        self.effects.validation.parse_reviewer_result.side_effect = lm.parse_reviewer_result
+        self.effects.agent.run_agent.side_effect = [lm.AgentResult(
+            0, 'VERDICT: PASS', session_id='review-session',
+        )]
+        outcome = self.handler.review(self.review_context())
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
+        self.assertEqual(self.state.row()['phase'], 'PUBLISHING')
+        self.assertIsNone(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
+
+    def test_worker_result_correction_does_not_consume_review_budget(self):
+        run_id = handlers.recovery_state.begin_external_run(self.connection)
+        feedback = ValidationFeedbackRepository(self.connection)
+        for result_id in range(1, 5):
+            review = f'ISSUE_ID: app.py::issue-{result_id}::blocking\nVERDICT: FAIL'
+            feedback.observe('repo', 'G-047', 'base', 'review', False, review)
+            if result_id <= 3:
+                self.assertEqual(
+                    handlers.recovery_state.reserve_review_correction(
+                        self.connection, 'repo', 'G-047', result_id,
+                    ), (True, result_id, run_id),
+                )
+        self.state.update_project(
+            'repo', phase='WORKING', review_result=review,
+            last_error='Worker 결과 검증 실패: format',
+        )
+        handlers.recovery_state.RecoveryRepository(self.connection).observe(
+            handlers.RecoveryObservation(
+                handlers.RecoveryReason.WORKER_CORRECTION,
+                'repo', 'G-047', 'IMPLEMENTING', 'base', 'base',
+                'worker-format', 'worker-session', 'invalid Worker result',
+            ),
+        )
+        self.effects.agent.run_agent.side_effect = lambda *_args, **_kwargs: lm.AgentResult(
+            1, 'worker failed', session_id='worker-session',
+        )
+        outcome = self.handler.run(self.context())
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.OPERATIONAL_ERROR)
+        self.effects.agent.run_agent.assert_called_once()
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM review_correction_turns WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()[0], 3)
+
     def test_document_execution_guard_preserves_crlf_approved_diff(self):
         original, proposed = b"# Product\r\nOld.\r\n", b"# Product\r\nNew.\r\n"
         draft = SimpleNamespace(

@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import loop_manager
+import scoped_blocking
 import execplan_catalog
 from execution_revision import DefinitionSnapshot
 from worker_outcome import parse_worker_outcome
@@ -4389,6 +4390,35 @@ risk: medium
 
 
 class BoundedExecutionRecoveryTest(unittest.TestCase):
+    def test_review_occurrence_history_does_not_create_final_block(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, connection = self._failure_state(directory)
+            self.addCleanup(connection.close)
+            reviews = [
+                ('ISSUE_ID: app.py::same-issue::blocking\n'
+                 f'Changed diagnostic {index}\n'
+                 + ('ISSUE_ID: app.py::extra-issue::blocking\n' if index == 3 else '')
+                 + 'VERDICT: FAIL')
+                for index in range(5)
+            ]
+            decisions = [
+                loop_manager.transition_validation_failure(
+                    connection, str(root), root, 'review', review,
+                ) for review in reviews
+            ]
+            row = connection.execute(
+                "SELECT status, review_failure_history FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-013'", (str(root),),
+            ).fetchone()
+            self.assertEqual([item.occurrences for item in decisions], [1, 2, 3, 4, 5])
+            self.assertTrue(all(not item.blocked for item in decisions))
+            self.assertEqual(row['status'], 'IMPLEMENTING')
+            self.assertEqual(json.loads(row['review_failure_history'])[
+                decisions[-1].fingerprint]['occurrences'], 5)
+            self.assertIsNone(scoped_blocking.plan_block(
+                connection, str(root), 'G-013',
+            ))
+
     def test_verify_port_uses_supplied_timeout_without_rereading_config(self):
         from tests.test_runtime_state import RuntimeStateRepositoryTest
         import runtime_state
@@ -4933,6 +4963,92 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         self.assertEqual(result, (False, review, 'specification'))
         fingerprint.assert_not_called()
 
+    def test_remote_checkpoint_new_review_failure_uses_existing_run_budget(self):
+        import blocked_checkpoint_state
+        import runtime_state
+        from tests.test_runtime_state import RuntimeStateRepositoryTest
+        from validation_feedback import normalize_feedback
+        from validation_feedback_state import ValidationFeedbackRepository
+
+        connection = RuntimeStateRepositoryTest()._connection()
+        self.addCleanup(connection.close)
+        runtime = runtime_state.RuntimeStateRepository(connection)
+        runtime.activate(
+            'repo', 'G-047', activation_sha='base',
+            branch='loop-manager/G-047', worktree='/state/G-047',
+        )
+        old_review = 'ISSUE_ID: app.py::old::blocking\nOld issue\nVERDICT: FAIL'
+        runtime.block_plan(
+            'repo', 'G-047', reason_code='review_retry_exhausted',
+            evidence=old_review, release_fingerprint='prior-input',
+            plan_values={'review_result': old_review, 'worker_result': worker_result()},
+            clear_projection=True,
+        )
+        checkpoints = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
+        request = checkpoints.get('repo', 'G-047')
+        checkpoints.finish_published(request, 'published-oid')
+        blocked = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = 'repo' AND plan_id = 'G-047'"
+        ).fetchone()
+        run_id = loop_manager.recovery_state.begin_external_run(connection, 'same-run')
+        feedback = ValidationFeedbackRepository(connection)
+        for index in range(3):
+            prior = f'ISSUE_ID: app.py::prior-{index}::blocking\nVERDICT: FAIL'
+            feedback.observe(
+                'repo', 'G-047', 'base', 'review', False, prior,
+                normalize_feedback('review', prior),
+            )
+            result_id = loop_manager.recovery_state.pending_review_correction(
+                connection, 'repo', 'G-047', prior,
+            )
+            self.assertEqual(
+                loop_manager.recovery_state.reserve_review_correction(
+                    connection, 'repo', 'G-047', result_id,
+                ), (True, index + 1, run_id),
+            )
+
+        new_review = 'ISSUE_ID: app.py::new::blocking\nNew issue\nVERDICT: FAIL'
+        with (
+            mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=mock.Mock()),
+            mock.patch.object(loop_manager, 'verify', return_value=(True, 'OK')),
+            mock.patch.object(loop_manager, '_remote_checkpoint_review_revision',
+                              return_value=('base', 'candidate-head')),
+            mock.patch.object(loop_manager, 'validate_agent_scope'),
+            mock.patch.object(loop_manager, 'run_agent', return_value=(0, new_review)),
+            mock.patch.object(loop_manager, '_remote_checkpoint_has_new_failure',
+                              return_value=True),
+        ):
+            resolved = loop_manager._evaluate_remote_checkpoint_cause(
+                connection, Path('/repo'), Path('/state'), 'repo', blocked,
+                Path('/config'), 30,
+            )
+        self.assertEqual(resolved, (True, new_review, 'review'))
+        loop_manager._resume_remote_corrected_execplan(
+            connection, 'repo', blocked, checkpoints, request,
+            'candidate-head', 'candidate-input', 'new Review issue',
+            new_failure_stage='review', assessment=new_review,
+        )
+        plan = connection.execute(
+            "SELECT status, review_result FROM exec_plans "
+            "WHERE repo = 'repo' AND plan_id = 'G-047'"
+        ).fetchone()
+        self.assertEqual(tuple(plan), ('IMPLEMENTING', new_review))
+        latest = connection.execute(
+            "SELECT id, stage, classification, raw_output FROM validation_results "
+            "WHERE repo = 'repo' AND plan_id = 'G-047' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(tuple(latest)[1:], ('review', 'failure', new_review))
+        self.assertEqual(
+            loop_manager.recovery_state.pending_review_correction(
+                connection, 'repo', 'G-047', plan['review_result'],
+            ), latest['id'],
+        )
+        self.assertEqual(
+            loop_manager.recovery_state.reserve_review_correction(
+                connection, 'repo', 'G-047', latest['id'],
+            ), (False, 3, run_id),
+        )
+
     def test_remote_checkpoint_requires_valid_worker_evidence_before_reviewer(self):
         from tests.test_runtime_state import RuntimeStateRepositoryTest
         import runtime_state
@@ -5111,7 +5227,8 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         ).fetchall()
         self.assertEqual(
             [tuple(row) for row in audit],
-            [('base', 'verify', 'success', raw_verify)],
+            [('base', 'verify', 'success', raw_verify),
+             ('base', 'review', 'success', 'VERDICT: PASS')],
         )
         for call in reviewer.call_args_list:
             self.assertNotIn('PRIVATE_SUCCESS_LOG', call.args[5])
@@ -5446,7 +5563,9 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             [1, 1, 1, 4],
         )
 
-    def test_validation_block_uses_base_and_worktree_fingerprints_across_rebase(self):
+    def test_legacy_review_block_uses_base_and_worktree_fingerprints_across_rebase(self):
+        import runtime_state
+
         with tempfile.TemporaryDirectory() as directory:
             repo, state_dir, connection = self._active_worker_project(directory)
             loop_manager.migrate_legacy_execplans(
@@ -5501,11 +5620,44 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                 "ISSUE_ID: docs/PLANS.md::stable-contract::blocking\n"
                 "Contract is still missing.\nVERDICT: FAIL"
             )
+
+            def record_legacy_review_block() -> None:
+                active = connection.execute(
+                    "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+                    (str(repo),),
+                ).fetchone()
+                blocked_input, blocked_worktree_input = (
+                    loop_manager._blocked_validation_input_fingerprints(
+                        connection, repo, str(repo), worktree, active,
+                    )
+                )
+                blocked_revision = loop_manager._blocked_validation_base_revision(
+                    connection, str(repo), active,
+                )
+                runtime_state.RuntimeStateRepository(connection).block_plan(
+                    str(repo), "G-001", reason_code="review_retry_exhausted",
+                    evidence=output, release_fingerprint=blocked_input,
+                    plan_values={
+                        "blocked_fingerprint": blocked_input,
+                        "blocked_worktree_fingerprint": blocked_worktree_input,
+                        "blocked_review_fingerprint": (
+                            loop_manager._revision_review_issue_fingerprint(
+                                repo, blocked_revision, output,
+                            )
+                        ),
+                        "agent_result_snapshot": (
+                            loop_manager.capture_git_snapshot(worktree).serialize()
+                        ),
+                    },
+                    clear_projection=True,
+                )
+
             for _ in range(4):
                 decision = loop_manager.transition_validation_failure(
                     connection, str(repo), worktree, "review", output
                 )
-            self.assertTrue(decision.blocked)
+            self.assertFalse(decision.blocked)
+            record_legacy_review_block()
 
             blocked = connection.execute(
                 "SELECT * FROM exec_plans "
@@ -5625,9 +5777,11 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                     ),
                 )
             for _ in range(4):
-                loop_manager.transition_validation_failure(
+                decision = loop_manager.transition_validation_failure(
                     connection, str(repo), worktree, "review", output
                 )
+            self.assertFalse(decision.blocked)
+            record_legacy_review_block()
             refreshed = connection.execute(
                 "SELECT * FROM exec_plans "
                 "WHERE repo = ? AND plan_id = 'G-001'",
@@ -5929,7 +6083,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         self.assertEqual(json.loads(plan["verify_failure_history"]), {})
         self.assertEqual(json.loads(plan["review_failure_history"]), {})
 
-    def test_distinct_review_issues_continue_past_four_failures(self):
+    def test_distinct_review_issues_pause_before_fourth_worker_correction(self):
         messages = (
             "ISSUE_ID: app.py::issue-a::blocking\nissue A\nVERDICT: FAIL",
             "ISSUE_ID: app.py::issue-b::blocking\nissue B\nVERDICT: FAIL",
@@ -5946,13 +6100,13 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         transitions = data["transitions"]
         project = data["project"]
         plan = data["plan"]
-        self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.TRANSIENT_PAUSE)
         self.assertEqual(result.exit_code, 0)
-        self.assertEqual(data["verify_calls"], 5)
-        self.assertEqual(data["roles"], ["worker", "reviewer"] * 5)
+        self.assertEqual(data["verify_calls"], 4)
+        self.assertEqual(data["roles"], ["worker", "reviewer"] * 4)
         self.assertEqual(
             data["reviewer_sessions"],
-            [None] + ["reviewer-session"] * 4,
+            [None] + ["reviewer-session"] * 3,
         )
         self.assertEqual(
             [
@@ -5970,11 +6124,11 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             ),
             4,
         )
-        self.assertIsNone(project["phase"])
-        self.assertEqual(plan["status"], "PR_OPEN")
-        self.assertEqual(json.loads(plan["review_failure_history"]), {})
+        self.assertEqual(project["phase"], "WORKING")
+        self.assertEqual(plan["status"], "IMPLEMENTING")
+        self.assertEqual(len(json.loads(plan["review_failure_history"])), 4)
 
-    def test_review_issue_in_changing_sets_blocks_exactly_on_fourth_occurrence(self):
+    def test_review_issue_in_changing_sets_pauses_after_three_corrections(self):
         messages = (
             "ISSUE_ID: app.py::a-shared-issue::blocking\n"
             "ISSUE_ID: app.py::z-extra-a::blocking\nVERDICT: FAIL",
@@ -5995,7 +6149,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         project = data["project"]
         plan = data["plan"]
         history = json.loads(plan["review_failure_history"])
-        self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.TRANSIENT_PAUSE)
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(data["verify_calls"], 4)
         self.assertEqual(data["roles"], ["worker", "reviewer"] * 4)
@@ -6012,7 +6166,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                 ("review", 1, False),
                 ("review", 2, False),
                 ("review", 3, False),
-                ("review", 4, True),
+                ("review", 4, False),
             ],
         )
         self.assertEqual(
@@ -6024,8 +6178,8 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             ),
             1,
         )
-        self.assertIsNone(project["phase"])
-        self.assertEqual(plan["status"], "PLAN_BLOCKED")
+        self.assertEqual(project["phase"], "WORKING")
+        self.assertEqual(plan["status"], "IMPLEMENTING")
         self.assertEqual(
             sorted(record["occurrences"] for record in history.values()),
             [1, 1, 1, 1, 4],
@@ -16476,6 +16630,7 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
             connections: list[sqlite3.Connection] = []
             thread_ids: set[int] = set()
             planner_mutex_ids: set[int] = set()
+            external_run_ids: set[str] = set()
             active_workers = 0
             maximum_workers = 0
             active_planners = 0
@@ -16494,6 +16649,7 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
                 refactoring_review_interval,
                 verify_timeout_seconds,
                 on_step_completed,
+                external_run_id,
             ):
                 nonlocal active_workers, maximum_workers
                 nonlocal active_planners, maximum_planners
@@ -16507,10 +16663,12 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
                     verify_timeout_seconds,
                     config.verify_timeout_seconds,
                 )
+                self.assertTrue(external_run_id)
                 with guard:
                     connections.append(worker_connection)
                     thread_ids.add(threading.get_ident())
                     planner_mutex_ids.add(id(planner_mutex))
+                    external_run_ids.add(external_run_id)
                     active_workers += 1
                     maximum_workers = max(maximum_workers, active_workers)
                     if active_workers == config.max_workers:
@@ -16557,6 +16715,7 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
 
         self.assertEqual(tuple(item.repo for item in outcomes), repos)
         self.assertEqual(maximum_workers, config.max_workers)
+        self.assertEqual(len(external_run_ids), 1)
         self.assertGreaterEqual(len(thread_ids), 2)
         self.assertEqual(maximum_planners, 1)
         self.assertEqual(len(planner_mutex_ids), 1)
