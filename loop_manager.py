@@ -19877,6 +19877,7 @@ class _PlanningReconciliationPorts:
 
     def __init__(self, connection: sqlite3.Connection):
         self._repository = maintenance_reconciliation.ReconciliationRepository(connection)
+        self._synthesis = maintenance_reconciliation.SynthesisRepository(connection)
         self._reviews = maintenance_file_review.ProvisionalReviewRepository(connection)
 
     def progress(self, repo: str, repository: Path, base: str, cycle_revision: int,
@@ -19884,6 +19885,16 @@ class _PlanningReconciliationPorts:
         inventory = maintenance_file_inventory.tracked_source_inventory(repository, base, source_revision)
         reviews = self._reviews.progress(repo, repository, base, cycle_revision, inventory)
         return self._repository.progress(repo, repository, base, cycle_revision, inventory, reviews)
+
+    def synthesis(self, repo: str, cycle: int, revision: str,
+                  progress: maintenance_reconciliation.ReconciliationProgress):
+        return self._synthesis.prepare(repo, cycle, revision, progress)
+
+    def synthesis_session(self, repo: str, page, session_id: str) -> None:
+        self._synthesis.session(repo, page, session_id)
+
+    def synthesis_complete(self, repo: str, page, output: str) -> None:
+        self._synthesis.complete(repo, page, output)
 
     def content(self, repository: Path, base: str, source: maintenance_file_inventory.TrackedSource) -> bytes:
         return maintenance_file_review.source_bytes(repository, base, source)
@@ -19911,6 +19922,9 @@ class _PlanningReconciliationPorts:
                  revision: str, output: str, existing_plans: dict[str, str],
                  new_plan_ids: tuple[str, ...]) -> dict:
         progress = self.progress(repo, repository, base, cycle_revision, revision)
+        synthesis = self.synthesis(repo, cycle_revision, revision, progress)
+        if synthesis.index != synthesis.total:
+            raise maintenance_reconciliation.ReconciliationError("종합 증거 페이지 검토가 완료되지 않았습니다.")
         inventory = maintenance_file_inventory.tracked_source_inventory(repository, base, revision)
         sources = {source.path: source for source in inventory.sources}
 

@@ -1274,6 +1274,7 @@ class PlanningLifecycleCoordinator:
             and hasattr(self._ports, "file_review")
         )
         if should_run:
+            final_page = None
             if file_review_enabled:
                 review_outcome = self._review_one_file(run, worktree)
                 if review_outcome is not None:
@@ -1310,14 +1311,16 @@ class PlanningLifecycleCoordinator:
                             context.repo, context.repo_path, context.base_branch,
                             run.maintenance_cycle.revision, str(row.active_sha),
                         )
+                        final_page = self._ports.reconciliation.synthesis(
+                            context.repo, run.maintenance_cycle.revision, str(row.active_sha), progress,
+                        )
+                        if final_page.index != final_page.total:
+                            return PlanningOutcome(PlanningOutcomeKind.WAITING)
                         prompt += (
                             "\n\n모든 선정 파일의 검토와 관계 확인 결과 (성공 기록 아님):\n"
-                            + json.dumps({
-                                "selected": [item.path for item in progress.selected],
-                                "file_reviews": list(progress.file_reviews),
-                                "relations": list(progress.completed),
-                                "excluded_candidates": list(progress.excluded_candidates),
-                            }, ensure_ascii=False)
+                            "이 세션에 순서대로 전달된 모든 증거 페이지를 종합하라. "
+                            "각 페이지의 파일별 검토, 단일 파일 문제와 관계 결과를 빠짐없이 반영하라. "
+                            "최종 응답 전에 누락된 페이지가 있다면 결과를 확정하지 마라."
                             + "\n최종 응답에 FINDINGS_RESULT: 한 줄 JSON object도 기록하라. "
                             "필드: source_revision(현재 SHA), findings:[], no_issue_reason. "
                             "문제가 없으면 findings=[]와 no_issue_reason={files:[{id:경로,excerpt:파일 검토 evidence의 정확한 12자 이상 인용,reason:20자 이상 판단}],relations:[{id:key,excerpt:관계 reason의 정확한 인용,reason:20자 이상 판단}]}을 기록하고 모든 선정 파일과 관계를 포함하라. "
@@ -1348,19 +1351,27 @@ class PlanningLifecycleCoordinator:
                     self._ports.state.compact_catalog(context.repo),
                     run.mutable_ready_snapshot,
                 )
+            final_session_errors = []
+
+            def save_final_session(session_id):
+                if final_page is not None:
+                    try:
+                        self._ports.reconciliation.synthesis_session(context.repo, final_page, session_id)
+                    except maintenance_reconciliation.ReconciliationError as error:
+                        final_session_errors.append(str(error))
+                self._ports.state.update(context.repo, planner_session_id=session_id)
+
             before = self._ports.agent.begin_scope(role, worktree)
             result = self._ports.agent.run_planner(
                 worktree,
                 prompt,
-                row.planner_session_id,
-                lambda session_id: self._ports.state.update(
-                    context.repo, planner_session_id=session_id
-                ),
+                final_page.session_id if final_page is not None else row.planner_session_id,
+                save_final_session,
             )
             if result.session_id:
-                self._ports.state.update(
-                    context.repo, planner_session_id=result.session_id
-                )
+                save_final_session(result.session_id)
+            if final_session_errors:
+                scope_error = final_session_errors[0]
             scope_result = self._ports.agent.finish_scope(role, worktree, before)
             if scope_result.error:
                 scope_error = scope_result.error
@@ -1497,7 +1508,7 @@ class PlanningLifecycleCoordinator:
             )
             relation = progress.next_relation
             if relation is None:
-                return None
+                return self._synthesize_one_page(run, worktree, progress)
             left = port.content(context.repo_path, context.base_branch, relation.left)
             right = port.content(context.repo_path, context.base_branch, relation.right)
             prompt = maintenance_reconciliation.relation_prompt(relation, left, right)
@@ -1540,6 +1551,58 @@ class PlanningLifecycleCoordinator:
         except (maintenance_reconciliation.ReconciliationError, maintenance_file_review.FileReviewError,
                 SourceInventoryError) as error:
             port.fail(context.repo, run.maintenance_cycle.revision, relation, str(error))
+            self._ports.events.error(str(error))
+            return PlanningOutcome(PlanningOutcomeKind.VALIDATION_RETRY, detail=str(error))
+        return PlanningOutcome(PlanningOutcomeKind.WAITING)
+
+    def _synthesize_one_page(self, run: _PlanningRun, worktree: Path,
+                             progress) -> PlanningOutcome | None:
+        """Consume one bounded evidence page in the final Planner's durable session."""
+        context, port = run.context, self._ports.reconciliation
+        page = port.synthesis(context.repo, run.maintenance_cycle.revision,
+                              str(run.row.active_sha), progress)
+        if page.index == page.total:
+            if page.session_id:
+                self._ports.state.update(context.repo, planner_session_id=page.session_id)
+            return None
+        before = self._ports.agent.begin_scope("maintenance_planner", worktree)
+        session_errors = []
+
+        def save_session(session_id):
+            try:
+                port.synthesis_session(context.repo, page, session_id)
+            except maintenance_reconciliation.ReconciliationError as error:
+                session_errors.append(str(error))
+
+        result = self._ports.agent.run_planner(
+            worktree, maintenance_reconciliation.synthesis_prompt(page),
+            page.session_id, save_session,
+        )
+        if result.session_id:
+            save_session(result.session_id)
+        scope = self._ports.agent.finish_scope("maintenance_planner", worktree, before)
+        if scope.error:
+            self._ports.events.error(scope.error)
+            return self._operational_error()
+        self._ports.agent.clear_scope(context.repo)
+        if result.code:
+            self._ports.events.error(result.message)
+            kind = {PlanningAgentResultKind.TRANSIENT_FAILURE: PlanningOutcomeKind.TRANSIENT_PAUSE,
+                    PlanningAgentResultKind.USAGE_LIMIT: PlanningOutcomeKind.USAGE_LIMIT_PAUSE}.get(
+                        result.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+            return PlanningOutcome(kind, error=True)
+        try:
+            if session_errors:
+                raise maintenance_reconciliation.ReconciliationError(session_errors[0])
+            current = port.progress(context.repo, context.repo_path, context.base_branch,
+                                    run.maintenance_cycle.revision, str(run.row.active_sha))
+            fresh = port.synthesis(context.repo, run.maintenance_cycle.revision,
+                                   str(run.row.active_sha), current)
+            if fresh.key != page.key:
+                raise maintenance_reconciliation.ReconciliationError("종합 중 source가 바뀌었습니다.")
+            port.synthesis_complete(context.repo, page, result.message)
+        except (maintenance_reconciliation.ReconciliationError, maintenance_file_review.FileReviewError,
+                SourceInventoryError) as error:
             self._ports.events.error(str(error))
             return PlanningOutcome(PlanningOutcomeKind.VALIDATION_RETRY, detail=str(error))
         return PlanningOutcome(PlanningOutcomeKind.WAITING)

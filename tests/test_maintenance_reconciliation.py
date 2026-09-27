@@ -84,6 +84,26 @@ class ReconciliationUnitTest(unittest.TestCase):
         self.connection.execute("UPDATE successful_code_maps SET mode = '100755'")
         self.assertEqual(self.repository.valid_maps("repo", self.inventory), {})
 
+    def test_valid_map_does_not_hide_reverse_reference_in_current_source(self):
+        selected_review = review(self.sources["src/a.py"])
+        selected_review["code_map"]["responsibility"] = "Compute values for the public API."
+        selected = self.progress((self.sources["src/a.py"],), (selected_review,))
+        old_map = review(self.sources["src/b.py"])["code_map"]
+        old_map["responsibility"] = "Handle requests through the adapter."
+        old_map["public_symbols"] = ["helper"]
+        self.connection.execute("INSERT INTO successful_code_maps VALUES (?, ?, ?, ?, ?)",
+                                ("repo", "src/b.py", self.sources["src/b.py"].content_hash,
+                                 "100644", json.dumps(old_map)))
+        with (mock.patch.object(reconciliation, "tracked_source_inventory", return_value=self.inventory),
+              mock.patch.object(reconciliation, "source_bytes",
+                                side_effect=lambda _repo, _base, item: self.contents[item.path]) as read):
+            progress = self.repository.progress("repo", Path("repo"), "main", 1, self.inventory, selected)
+        relation = next(item for item in progress.relations if item.right.path == "src/b.py")
+        self.assertIn("source_reverse", {item["kind"] for item in relation.signals})
+        self.assertIn(self.sources["src/b.py"], [call.args[2] for call in read.call_args_list])
+        self.assertIsNotNone(progress.next_relation)
+        self.assertEqual(progress.selected, selected.selected)
+
     def test_symbol_only_candidate_matches_current_code_map(self):
         selected_review = review(self.sources["src/a.py"])
         selected_review["pending_references"] = [{
@@ -170,6 +190,80 @@ class ReconciliationUnitTest(unittest.TestCase):
         with self.assertRaisesRegex(reconciliation.ReconciliationError, "미확인"):
             reconciliation.parse_findings(output, progress, self.inventory,
                                           self.contents, {}, ())
+
+
+class SynthesisPagingTest(unittest.TestCase):
+    def setUp(self):
+        self.connection = sqlite3.connect(":memory:")
+        self.addCleanup(self.connection.close)
+        self.connection.execute("CREATE TABLE projects (repo TEXT PRIMARY KEY)")
+        self.connection.execute("INSERT INTO projects VALUES ('repo')")
+        self.repository = reconciliation.SynthesisRepository(self.connection)
+        self.reviews = tuple({"path": f"src/{index}.py", "evidence": {
+            "chunk_reviews": ["large evidence " * 3000], "issue": f"unique-issue-{index}"}}
+            for index in range(13))
+        self.progress = reconciliation.ReconciliationProgress((), (), (), None, file_reviews=self.reviews)
+
+    def finish(self, page):
+        self.repository.session("repo", page, "session-one")
+        self.repository.complete("repo", page, reconciliation.SYNTHESIS_PREFIX + json.dumps({
+            "key": page.key, "excerpt": page.text[:20],
+            "assessment": "Keep this page's structural issue for the final reconciliation.",
+        }))
+
+    def test_large_records_are_lossless_bounded_and_resume_after_restart(self):
+        pages = reconciliation.synthesis_pages(self.progress)
+        self.assertGreater(len(pages), 13)
+        expected = "".join(json.dumps({"kind": "file_review", "value": value},
+                                     ensure_ascii=False, sort_keys=True) for value in self.reviews)
+        self.assertEqual("".join(pages), expected)
+        first = self.repository.prepare("repo", 1, REVISION, self.progress)
+        self.finish(first)
+        self.repository = reconciliation.SynthesisRepository(self.connection)
+        page = self.repository.prepare("repo", 1, REVISION, self.progress)
+        self.assertEqual((page.index, page.session_id), (1, "session-one"))
+        while page.index < page.total:
+            self.assertLess(len(reconciliation.synthesis_prompt(page).encode()), 50_000)
+            self.finish(page)
+            page = self.repository.prepare("repo", 1, REVISION, self.progress)
+        self.assertEqual(page.index, len(pages))
+        self.assertEqual(len(json.loads(self.connection.execute(
+            "SELECT results_json FROM provisional_synthesis").fetchone()[0])), len(pages))
+        stale = self.repository.prepare("repo", 1, "b" * 40, self.progress)
+        self.assertEqual((stale.index, stale.session_id), (0, None))
+
+    def test_short_tail_and_changed_evidence_or_cycle(self):
+        for size in range(11920, 12030):
+            progress = reconciliation.ReconciliationProgress((), (), (), None,
+                file_reviews=({"path": "a.py", "evidence": "x" * size},))
+            pages = reconciliation.synthesis_pages(progress)
+            self.assertTrue(all(12 <= len(page) <= reconciliation.SYNTHESIS_PAGE_CHARS for page in pages))
+        first = self.repository.prepare("repo", 1, REVISION, self.progress)
+        self.finish(first)
+        changed = reconciliation.ReconciliationProgress((), (), (), None,
+            file_reviews=(*self.reviews, {"path": "new.py", "evidence": "newly validated issue"}))
+        page = self.repository.prepare("repo", 1, REVISION, changed)
+        self.assertEqual((page.index, page.session_id), (0, None))
+        self.assertNotEqual(page.digest, first.digest)
+        self.finish(page)
+        next_cycle = self.repository.prepare("repo", 2, REVISION, changed)
+        self.assertEqual((next_cycle.index, next_cycle.session_id), (0, None))
+
+    def test_invalid_receipt_and_replaced_session_cannot_skip_pages(self):
+        first = self.repository.prepare("repo", 1, REVISION, self.progress)
+        self.repository.session("repo", first, "session-one")
+        with self.assertRaises(reconciliation.ReconciliationError):
+            self.repository.complete("repo", first, reconciliation.SYNTHESIS_PREFIX + json.dumps({
+                "key": first.key, "excerpt": "nonexistent page evidence", "assessment": "A detailed but unsupported assessment."}))
+        self.assertEqual(self.repository.prepare("repo", 1, REVISION, self.progress).index, 0)
+        self.finish(first)
+        second = self.repository.prepare("repo", 1, REVISION, self.progress)
+        with self.assertRaisesRegex(reconciliation.ReconciliationError, "첫 페이지"):
+            self.repository.session("repo", second, "replacement")
+        replay = self.repository.prepare("repo", 1, REVISION, self.progress)
+        self.assertEqual((replay.index, replay.session_id), (0, "replacement"))
+        with self.assertRaises(reconciliation.ReconciliationError):
+            self.finish(second)
 
 
 if __name__ == "__main__":

@@ -1916,6 +1916,20 @@ class MaintenancePlanningTest(unittest.TestCase):
 
 
 class ReconciledPlanLinkTest(unittest.TestCase):
+    def test_unconsumed_evidence_pages_block_final_validation(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute("CREATE TABLE projects (repo TEXT PRIMARY KEY)")
+        connection.execute("INSERT INTO projects VALUES ('repo')")
+        port = loop_manager._PlanningReconciliationPorts(connection)
+        progress = maintenance_reconciliation.ReconciliationProgress((), (), (), None,
+            file_reviews=({"path": "src/a.py", "evidence": "A single file issue must be reviewed."},))
+        with (mock.patch.object(port, "progress", return_value=progress),
+              mock.patch.object(maintenance_reconciliation, "parse_findings") as parse):
+            with self.assertRaisesRegex(maintenance_reconciliation.ReconciliationError, "페이지 검토"):
+                port.validate("repo", Path("repo"), "main", 1, "a" * 40, "output", {}, ())
+        parse.assert_not_called()
+
     def test_validation_reads_plan_scope_from_pinned_active_tree(self):
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)

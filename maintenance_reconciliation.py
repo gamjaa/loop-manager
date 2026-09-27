@@ -188,10 +188,10 @@ def relation_candidates(
             if (target != path and len(responsibility) >= 12
                 and code_map["responsibility"].strip().casefold() == responsibility):
                 add(path, target, "similar_map_responsibility", responsibility)
-    # A missing map cannot prove the absence of reverse references. Search only
-    # context files without a current map, using selected public names/paths.
+    # Even current maps are incomplete: search every context source for selected
+    # public names/paths, including files with a valid cached map.
     for path, content in context_contents.items():
-        if path in maps or path not in sources:
+        if path not in sources:
             continue
         for item in progress.completed:
             target = item["path"]
@@ -199,7 +199,7 @@ def relation_candidates(
                        *item["code_map"]["public_symbols"])
             for needle in needles:
                 if len(needle) >= 4 and needle in content:
-                    add(path, target, "unmapped_reverse", needle)
+                    add(path, target, "source_reverse" if path in maps else "unmapped_reverse", needle)
             for ref in item["pending_references"]:
                 if ref["target_path"] is None and ref["symbol"] and ref["symbol"] in content:
                     add(target, path, "unmapped_symbol_target", ref["evidence"])
@@ -280,7 +280,7 @@ class ReconciliationRepository:
         context = {}
         selected = {item.path for item in reviews.selected}
         for source in inventory.sources:
-            if source.path not in selected and source.path not in maps:
+            if source.path not in selected:
                 context[source.path] = source_bytes(repository, base, source).decode("utf-8", "backslashreplace")
         relations = relation_candidates(inventory, reviews, maps, context)
         expected = {item.key: item for item in relations}
@@ -492,3 +492,136 @@ def parse_findings(output: str, progress: ReconciliationProgress,
     if {item["plan_id"] for item in findings if item["status"] == "new_plan"} != set(new_plan_ids):
         raise ReconciliationError("새 리팩터링 계획마다 근거 있는 발견 연결이 필요합니다.")
     return value
+
+
+SYNTHESIS_PREFIX = "SYNTHESIS_PAGE_RESULT: "
+SYNTHESIS_PAGE_CHARS = 12_000
+
+
+@dataclass(frozen=True)
+class SynthesisPage:
+    digest: str
+    index: int
+    total: int
+    text: str
+    session_id: str | None
+
+    @property
+    def key(self) -> str:
+        return f"{self.digest}:{self.index}"
+
+
+def synthesis_pages(progress: ReconciliationProgress) -> tuple[str, ...]:
+    """Losslessly page validated evidence, including oversized single-file records."""
+    if progress.next_relation is not None or len(progress.completed) != len(progress.relations):
+        raise ReconciliationError("미확인 관계가 있어 종합을 시작할 수 없습니다.")
+    records = (
+        *(('selected', source.__dict__) for source in progress.selected),
+        *(('file_review', review) for review in progress.file_reviews),
+        *(('relation', result) for result in progress.completed),
+        *(('excluded_candidate', candidate) for candidate in progress.excluded_candidates),
+    )
+    pages = []
+    for kind, record in records:
+        text = json.dumps({"kind": kind, "value": record}, ensure_ascii=False, sort_keys=True)
+        # A large chunk_reviews array must not bypass the per-call bound. Fragments
+        # preserve every character; the same session consumes them in order.
+        count = (len(text) + SYNTHESIS_PAGE_CHARS - 1) // SYNTHESIS_PAGE_CHARS
+        width = (len(text) + count - 1) // count
+        pages.extend(text[offset:offset + width] for offset in range(0, len(text), width))
+    return tuple(pages)
+
+
+def synthesis_prompt(page: SynthesisPage) -> str:
+    return (
+        "유지보수 종합의 증거 페이지를 순서대로 검토하라. 파일을 수정하지 마라. "
+        "이것은 이미 검증된 파일 검토·관계 결과이며 원본 전체를 다시 읽지 마라. "
+        "큰 JSON 기록은 여러 페이지에 걸칠 수 있다. 단일 파일의 구조 문제와 "
+        "다른 페이지의 관련 발견을 놓치지 말고 이 세션에서 누적하라. "
+        "최종 계획 및 FINDINGS_RESULT는 모든 페이지를 처리한 다음 요청한다.\n"
+        f"page_key={page.key}, page={page.index + 1}/{page.total}\n"
+        + page.text
+        + "\nSYNTHESIS_PAGE_RESULT: 한 줄 JSON {key:page_key, "
+        "excerpt:이 페이지의 정확한 12자 이상 인용, "
+        "assessment:발견 후보 또는 문제 없음 근거와 앞뒤 페이지의 연결을 설명하는 20~2000자}를 반환하라."
+    )
+
+
+class SynthesisRepository:
+    """A source/evidence-bound cursor; completion never depends on an in-memory run."""
+
+    def __init__(self, connection: sqlite3.Connection):
+        self.connection = connection
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS provisional_synthesis (
+                repo TEXT PRIMARY KEY REFERENCES projects(repo),
+                digest TEXT NOT NULL,
+                next_page INTEGER NOT NULL,
+                session_id TEXT,
+                results_json TEXT NOT NULL
+            )
+        """)
+
+    def prepare(self, repo: str, cycle: int, revision: str,
+                progress: ReconciliationProgress) -> SynthesisPage:
+        pages = synthesis_pages(progress)
+        digest = hashlib.sha256(json.dumps(
+            [cycle, revision, pages], ensure_ascii=False,
+        ).encode()).hexdigest()
+        with self.connection:
+            row = self.connection.execute(
+                "SELECT digest, next_page, session_id FROM provisional_synthesis WHERE repo = ?", (repo,),
+            ).fetchone()
+            if row is None or row[0] != digest:
+                self.connection.execute(
+                    "INSERT OR REPLACE INTO provisional_synthesis VALUES (?, ?, 0, NULL, '[]')",
+                    (repo, digest),
+                )
+                index, session = 0, None
+            else:
+                index, session = row[1], row[2]
+        return SynthesisPage(digest, index, len(pages), pages[index] if index < len(pages) else "", session)
+
+    def session(self, repo: str, page: SynthesisPage, session_id: str) -> None:
+        replaced = False
+        with self.connection:
+            row = self.connection.execute(
+                "SELECT session_id FROM provisional_synthesis WHERE repo = ? AND digest = ? AND next_page = ?",
+                (repo, page.digest, page.index),
+            ).fetchone()
+            if row is None:
+                raise ReconciliationError("종합 페이지의 source가 바뀌었습니다.")
+            if row[0] and row[0] != session_id and page.index:
+                # A provider replacement session lacks prior pages. Replay them;
+                # never claim complete coverage using only the latest fragment.
+                self.connection.execute(
+                    "UPDATE provisional_synthesis SET next_page = 0, session_id = ?, results_json = '[]' WHERE repo = ?",
+                    (session_id, repo),
+                )
+                replaced = True
+            self.connection.execute(
+                "UPDATE provisional_synthesis SET session_id = ? WHERE repo = ?", (session_id, repo),
+            )
+        if replaced:
+            raise ReconciliationError("종합 세션이 바뀌어 첫 페이지부터 재개합니다.")
+
+    def complete(self, repo: str, page: SynthesisPage, output: str) -> None:
+        value = _single_json(output, SYNTHESIS_PREFIX)
+        if set(value) != {"key", "excerpt", "assessment"} or value["key"] != page.key:
+            raise ReconciliationError("종합 페이지 identity가 다릅니다.")
+        if _note(value["excerpt"], "페이지 근거", 12) not in page.text:
+            raise ReconciliationError("종합 페이지 근거가 다릅니다.")
+        _note(value["assessment"], "페이지 판단", 20)
+        with self.connection:
+            row = self.connection.execute(
+                "SELECT results_json, session_id FROM provisional_synthesis "
+                "WHERE repo = ? AND digest = ? AND next_page = ?", (repo, page.digest, page.index),
+            ).fetchone()
+            if row is None or not row[1]:
+                raise ReconciliationError("종합 페이지의 source 또는 세션이 다릅니다.")
+            results = json.loads(row[0])
+            results.append(value)
+            self.connection.execute(
+                "UPDATE provisional_synthesis SET next_page = next_page + 1, results_json = ? WHERE repo = ?",
+                (json.dumps(results, ensure_ascii=False), repo),
+            )

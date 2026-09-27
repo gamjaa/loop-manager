@@ -49,3 +49,9 @@ priority: normal
 - 추가 targeted 검증: 검증기·Planner 입력 9 tests OK(초기 Planner fixture의 revision 오류 수정 후 동일 명령 재실행), 계획 원문 전달 단일 test OK. 전체 verify와 게시 작업은 Worker에서 실행하지 않는다.
 
 - Worker 결과 보고 보완: 이전 보고는 FAILED_COMMAND와 RERUN 사이에 최초 ERROR 결과가 없어 미해결 실패로 판정됐다. 코드의 Git revision fixture 수정은 유지돼 있으며, 동일 targeted 명령을 다시 실행해 추가 회귀 사례를 포함한 11 tests OK를 확인했다. 결과 보고에서 최초 ERROR와 최종 OK를 별도로 기록하며 검증기 동작은 변경하지 않는다.
+
+- 추가 검토 피드백 보완: 유효한 기존 코드맵도 완전한 참조 목록으로 취급하지 않는다. 모든 비선정 문맥 원본에서 선정 파일의 공개 심벌·경로 역참조를 검색하고, 찾은 후보는 기존 관계 확인 절차를 거친다.
+- 종합 입력은 파일별 검토·선정 source identity·관계 결과·제외 근거를 손실 없이 최대 12,000자 페이지로 나눈다. 큰 단일 파일의 구간 근거도 나누며, 호출당 한 페이지만 같은 Planner 세션에 전달한다. SQLite에 cycle·revision·전체 증거 digest, 페이지 위치·확인 결과·세션을 저장하고, 증거 변경 또는 세션 교체 시 다시 처리한다. 모든 페이지 확인 전 최종 결과 검증을 차단한다. 최종 프롬프트는 전체 증거를 다시 포함하지 않는다.
+- targeted 검증: 역참조·페이지 저장/재개·최종 Planner 세션 연결·계획 원문 전달 12 tests OK. 짧은 마지막 조각·증거/cycle 변경·미완료 페이지 차단을 추가한 targeted 검증 4 tests OK. 전체 verify, commit, push 및 PR 생성은 실행하지 않았다.
+
+- Worker 결과 보고 재확인: 이전 TARGETED_TESTS의 한국어 부정문을 검증기가 오류 키워드로 인식했다. 판정 함수를 통해 해당 문구와 명령·OK로만 구성한 대체 문구의 판정 차이를 확인했다. 검증기 코드는 변경하지 않았으며, 역참조·페이지 저장/재개·최종 세션 연결·미완료 결과 차단의 targeted unit tests 6개를 다시 실행해 OK를 확인했다.

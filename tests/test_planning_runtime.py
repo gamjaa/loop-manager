@@ -493,7 +493,13 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         self.assertEqual(ports.file_review.complete.call_args.args[2], source)
         self.assertEqual(ports.file_review.fail.call_count, 0)
 
-    def test_final_assessment_prompt_includes_thirteenth_file_evidence(self):
+    def test_final_assessment_consumes_bounded_pages_in_one_resumable_session(self):
+        import sqlite3
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute("CREATE TABLE projects (repo TEXT PRIMARY KEY)")
+        connection.execute("INSERT INTO projects VALUES (?)", (self.context.repo,))
+        repository = maintenance_reconciliation.SynthesisRepository(connection)
         ports = FakePorts(
             planning_snapshot(phase="PLANNING", active_sha="a" * 40),
             maintenance_cycle(phase=maintenance_state.MaintenancePhase.ASSESSMENT,
@@ -502,25 +508,46 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         )
         ports.git.head = "a" * 40
         reviews = tuple({"path": f"src/file_{index}.py", "evidence": {
+            "chunk_reviews": ["large review evidence " * 2000],
             "responsibility_and_integration": f"unique responsibility issue {index}"}}
             for index in range(13))
+        progress = maintenance_reconciliation.ReconciliationProgress((), (), (), None, file_reviews=reviews)
         ports.file_review = mock.Mock()
-        ports.reconciliation = mock.Mock()
-        ports.reconciliation.progress.return_value = maintenance_reconciliation.ReconciliationProgress(
-            (), (), (), None, file_reviews=reviews)
+        ports.reconciliation = SimpleNamespace(
+            progress=mock.Mock(return_value=progress), synthesis=repository.prepare,
+            synthesis_session=repository.session, synthesis_complete=repository.complete)
         ports.validation.maintenance_prompt = mock.Mock(return_value="assessment prompt")
-        ports.agent.run_planner = mock.Mock(return_value=ports.agent.result)
+        prompts, sessions = [], []
+
+        def consume(_worktree, prompt, session_id, callback):
+            prompts.append(prompt)
+            sessions.append(session_id)
+            callback("session-one")
+            page = repository.prepare(self.context.repo, 4, "a" * 40, progress)
+            if page.index < page.total:
+                message = maintenance_reconciliation.SYNTHESIS_PREFIX + json.dumps({
+                    "key": page.key, "excerpt": page.text[:20],
+                    "assessment": "Retain every local issue and compare across the reviewed pages.",
+                })
+            else:
+                message = "planner result"
+            return PlanningAgentResult(0, message, "session-one", PlanningAgentResultKind.SUCCESS)
+
+        ports.agent.run_planner = mock.Mock(side_effect=consume)
         coordinator = PlanningLifecycleCoordinator(ports)
         run = coordinator._new_run(self.context)
         run.planning_worktree = Path("/worktree")
         run.maintenance_context = object()
-        with (mock.patch.object(coordinator, "_review_one_file", return_value=None),
-              mock.patch.object(coordinator, "_reconcile_one_relation", return_value=None)):
-            coordinator._run_planner_turn(run)
-        prompt = ports.agent.run_planner.call_args.args[1]
-        for review in reviews:
-            self.assertIn(review["path"], prompt)
-            self.assertIn(review["evidence"]["responsibility_and_integration"], prompt)
+        with mock.patch.object(coordinator, "_review_one_file", return_value=None):
+            for _ in maintenance_reconciliation.synthesis_pages(progress):
+                result = coordinator._run_planner_turn(run)
+                self.assertEqual(result.kind, PlanningOutcomeKind.WAITING)
+            self.assertIsNone(coordinator._run_planner_turn(run))
+        self.assertIsNone(sessions[0])
+        self.assertTrue(all(session == "session-one" for session in sessions[1:]))
+        self.assertTrue(all(len(prompt.encode()) < 50_000 for prompt in prompts))
+        self.assertIn("unique responsibility issue 12", "".join(prompts[:-1]))
+        self.assertNotIn("chunk_reviews", prompts[-1])
 
     def test_active_legacy_assessment_skips_new_file_review_stage(self):
         ports = FakePorts(
