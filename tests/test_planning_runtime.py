@@ -417,7 +417,8 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         ports = FakePorts(
             planning_snapshot(phase="PLANNING", active_sha="a" * 40),
             maintenance_cycle(phase=maintenance_state.MaintenancePhase.ASSESSMENT,
-                              cycle_base_sha="a" * 40, revision=4),
+                              cycle_base_sha="a" * 40, revision=4,
+                              file_assessment_start_merged_count=0),
         )
         unit = maintenance_file_review.ReviewUnit(source, "saved-session", None)
         ports.file_review = SimpleNamespace(
@@ -447,6 +448,25 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         self.assertEqual(ports.agent.run_count, 1)
         self.assertEqual(ports.file_review.complete.call_args.args[2], source)
         self.assertEqual(ports.file_review.fail.call_count, 0)
+
+    def test_active_legacy_assessment_skips_new_file_review_stage(self):
+        ports = FakePorts(
+            planning_snapshot(phase="PLANNING", active_sha="base"),
+            maintenance_cycle(phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+                              cycle_base_sha="base", revision=4),
+        )
+        ports.file_review = mock.Mock()
+        ports.validation.maintenance_prompt = mock.Mock(return_value="legacy prompt")
+        coordinator = PlanningLifecycleCoordinator(ports)
+        run = coordinator._new_run(self.context)
+        run.planning_worktree = Path("/worktree")
+        run.maintenance_context = object()
+
+        self.assertIsNone(coordinator._run_planner_turn(run))
+
+        ports.file_review.progress.assert_not_called()
+        ports.file_review.completed_summary.assert_not_called()
+        self.assertEqual(ports.agent.run_count, 1)
 
     def test_new_document_approval_forces_planning_with_unchanged_fingerprints(self):
         ports = FakePorts(planning_snapshot(

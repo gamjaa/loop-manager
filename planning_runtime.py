@@ -1264,12 +1264,16 @@ class PlanningLifecycleCoordinator:
                 and row.planning_retry_count >= MAX_PLANNER_VALIDATION_RETRIES
             )
         )
+        file_review_enabled = (
+            run.maintenance_planning
+            and run.maintenance_cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT
+            and run.maintenance_cycle.file_assessment_start_merged_count is not None
+            and (not context.self_repository
+                 or run.maintenance_cycle.full_assessment_completed)
+            and hasattr(self._ports, "file_review")
+        )
         if should_run:
-            if (run.maintenance_planning
-                and run.maintenance_cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT
-                and (not context.self_repository
-                     or run.maintenance_cycle.full_assessment_completed)
-                and hasattr(self._ports, "file_review")):
+            if file_review_enabled:
                 review_outcome = self._review_one_file(run, worktree)
                 if review_outcome is not None:
                     return review_outcome
@@ -1295,10 +1299,7 @@ class PlanningLifecycleCoordinator:
                         run.maintenance_cycle.include_general_planning
                     ),
                 )
-                if (run.maintenance_cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT
-                    and hasattr(self._ports, "file_review")
-                    and (not context.self_repository
-                         or run.maintenance_cycle.full_assessment_completed)):
+                if file_review_enabled:
                     reviews = self._ports.file_review.completed_summary(
                         context.repo,
                     )
