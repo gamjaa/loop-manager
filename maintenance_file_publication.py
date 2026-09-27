@@ -9,6 +9,7 @@ import sqlite3
 
 from maintenance_file_inventory import (
     ClassifiedPath, SourceInventory, TrackedSource, cached_source_inventory,
+    tracked_source_inventory,
 )
 from maintenance_file_ledger import FileReviewRepository, ReviewedSource
 from maintenance_file_review import ProvisionalReviewRepository
@@ -39,6 +40,21 @@ class AssessmentEvidence:
     reviewed: tuple[ReviewedSource, ...]
     code_maps: tuple[tuple[str, str], ...]
     merged_count: int
+
+
+def sources_match_remote(
+    repository: Path, base_branch: str, revision: str,
+    evidence: AssessmentEvidence,
+) -> bool:
+    """Recheck the live remote source set before promoting saved evidence."""
+    current = tracked_source_inventory(repository, base_branch, revision)
+    return tuple(
+        (source.path, source.content_hash, source.mode, source.reason)
+        for source in current.sources
+    ) == tuple(
+        (source.path, source.content_hash, source.mode, source.reason)
+        for source in evidence.inventory.sources
+    )
 
 
 def ensure_schema(connection: sqlite3.Connection) -> None:

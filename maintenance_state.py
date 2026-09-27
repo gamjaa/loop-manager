@@ -773,17 +773,18 @@ class MaintenanceRepository:
                 )
             return self.get(repo)
 
-    def restart_unpublished_batch(
+    def restart_prepared_batch(
         self,
         repo: str,
         *,
         expected: MaintenanceCycle,
         new_base_sha: str,
     ) -> MaintenanceCycle:
-        """Invalidate one unpushed intent while retaining its maintenance phase.
+        """Invalidate a prepared intent while retaining its maintenance phase.
 
-        The caller must first prove from Git that the remote advanced without
-        publishing this batch. Revision comparison invalidates old contexts.
+        The caller proves either that the batch was not published or that its
+        published plans survived but source drift requires a new assessment.
+        Revision comparison invalidates old contexts.
         """
         if (
             expected.repo != repo
@@ -800,7 +801,7 @@ class MaintenanceRepository:
                 expected.publication_base_sha, expected.publication_commit_sha
             }
         ):
-            raise MaintenanceStateError("재시작할 미게시 publication intent가 유효하지 않습니다.")
+            raise MaintenanceStateError("재시작할 prepared publication intent가 유효하지 않습니다.")
         with _transaction(self.connection):
             if self.get(repo) != expected:
                 raise MaintenanceStateError("유지보수 주기 단계 또는 revision이 변경됐습니다.")

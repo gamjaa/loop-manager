@@ -515,7 +515,7 @@ class MaintenanceOrchestrationTest(unittest.TestCase):
         )
         self.assertTrue(prepared.include_general_planning)
 
-        restarted = repository.restart_unpublished_batch(
+        restarted = repository.restart_prepared_batch(
             "/one", expected=prepared, new_base_sha="c" * 40
         )
         self.assertIsNone(restarted.publication_stage)

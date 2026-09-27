@@ -1727,7 +1727,7 @@ class MaintenancePlanningTest(unittest.TestCase):
         )
         self.assertEqual(git(self.repo, "rev-parse", "HEAD"), commit)
         with self.assertRaises(maintenance_state.MaintenanceStateError):
-            repository.restart_unpublished_batch(
+            repository.restart_prepared_batch(
                 str(self.repo), expected=intent, new_base_sha=latest
             )
         with self.assertRaises(loop_manager.PlannerValidationError):
@@ -1804,6 +1804,133 @@ class MaintenancePlanningTest(unittest.TestCase):
             ["G-000", "G-001", "G-002", "G-003"],
         )
         self.assertNotEqual(recovered, intent)
+
+    def _prepare_pushed_file_assessment_batch(self):
+        context = self._begin_barrier()
+        self.connection.execute(
+            "UPDATE maintenance_cycles SET file_assessment_start_merged_count = 1 "
+            "WHERE repo = ?", (str(self.repo),),
+        )
+        self.connection.execute(
+            "INSERT INTO execplan_catalog_revisions "
+            "(repo, revision_sha, catalog_fingerprint) VALUES (?, ?, 'catalog')",
+            (str(self.repo), self.base_sha),
+        )
+        self._write_barrier_batch()
+        result = self._validate_barrier(context)
+        inventory = maintenance_file_inventory.tracked_source_inventory(
+            self.repo, "main", self.base_sha,
+        )
+        reviewed = tuple(maintenance_file_ledger.ReviewedSource(
+            source.path, source.content_hash, source.mode, source.revision,
+            "Reviewed implementation, dependencies, and related tests.",
+        ) for source in inventory.sources)
+        maps = tuple((source.path, json.dumps({
+            "responsibility": "Review the module responsibility",
+            "entry_points": [], "public_symbols": [],
+            "direct_references": [], "related_tests": [],
+        })) for source in inventory.sources)
+        evidence = maintenance_file_publication.AssessmentEvidence(
+            inventory, reviewed, maps, 1,
+        )
+        git(self.repo, "add", "docs/plans")
+        git(self.repo, "commit", "-m", "Publish refactoring plans")
+        plan_commit = git(self.repo, "rev-parse", "HEAD")
+        with mock.patch.object(
+            maintenance_file_publication, "collect", return_value=evidence,
+        ):
+            intent = loop_manager.record_maintenance_publication_intent(
+                self.connection, str(self.repo), self.repo, "main", result,
+                plan_commit,
+            )
+        git(self.repo, "push", "origin", "HEAD:main")
+        return plan_commit, intent, inventory
+
+    def test_published_batch_unchanged_sources_promote_saved_evidence(self):
+        plan_commit, _intent, inventory = self._prepare_pushed_file_assessment_batch()
+        other = Path(self.temporary.name) / "unchanged-source-descendant"
+        git(self.repo, "worktree", "add", "--detach", str(other), plan_commit)
+        git(other, "commit", "--allow-empty", "-m", "Advance after publication")
+        git(other, "push", "origin", "HEAD:main")
+        git(self.repo, "fetch", "origin")
+
+        recovered = loop_manager.recover_maintenance_planning_batch(
+            self.connection, str(self.repo), self.repo, "main",
+        )
+        self.assertEqual(recovered.phase, maintenance_state.MaintenancePhase.REFACTORING)
+        self.assertEqual(recovered.last_success_file_assessment_merged_count, 1)
+        self.assertEqual(maintenance_file_ledger.FileReviewRepository(
+            self.connection,
+        ).last_success(str(self.repo)).source_revision, self.base_sha)
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM successful_code_maps WHERE repo = ?",
+            (str(self.repo),),
+        ).fetchone()[0], len(inventory.sources))
+
+    def test_published_batch_source_drift_restarts_file_assessment(self):
+        plan_commit, intent, _inventory = self._prepare_pushed_file_assessment_batch()
+        other = Path(self.temporary.name) / "source-drift-descendant"
+        git(self.repo, "worktree", "add", "--detach", str(other), plan_commit)
+        source = other / "legacy/module.py"
+        source.write_text("# changed after plan publication\n", encoding="utf-8")
+        git(other, "add", "legacy/module.py")
+        git(other, "commit", "-m", "Change reviewed source")
+        git(other, "push", "origin", "HEAD:main")
+        latest = git(other, "rev-parse", "HEAD")
+        git(self.repo, "fetch", "origin")
+        self.connection.execute(
+            "UPDATE projects SET phase = 'PLANNING', active_sha = ?, worktree = ? "
+            "WHERE repo = ?", (self.base_sha, str(self.repo), str(self.repo)),
+        )
+
+        with mock.patch(
+            "loop_manager._clear_active_in_current_transaction",
+            side_effect=RuntimeError("injected project cleanup failure"),
+        ), self.assertRaisesRegex(RuntimeError, "injected project cleanup failure"):
+            loop_manager.recover_maintenance_planning_batch(
+                self.connection, str(self.repo), self.repo, "main",
+            )
+        self.assertEqual(
+            maintenance_state.MaintenanceRepository(self.connection).get(str(self.repo)),
+            intent,
+        )
+
+        restarted = loop_manager.recover_maintenance_planning_batch(
+            self.connection, str(self.repo), self.repo, "main",
+        )
+        self.assertEqual(restarted.phase, maintenance_state.MaintenancePhase.ASSESSMENT)
+        self.assertEqual(restarted.revision, intent.revision + 1)
+        self.assertEqual(restarted.cycle_base_sha, latest)
+        self.assertIsNone(restarted.publication_stage)
+        self.assertIsNone(restarted.last_success_file_assessment_merged_count)
+        self.assertIsNone(maintenance_file_ledger.FileReviewRepository(
+            self.connection,
+        ).last_success(str(self.repo)))
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM file_review_ledger WHERE repo = ?",
+            (str(self.repo),),
+        ).fetchone()[0], 0)
+        maintenance_reconciliation.ensure_schema(self.connection)
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM successful_code_maps WHERE repo = ?",
+            (str(self.repo),),
+        ).fetchone()[0], 0)
+        self.assertEqual(self.connection.execute(
+            "SELECT phase FROM projects WHERE repo = ?", (str(self.repo),),
+        ).fetchone()[0], None)
+        self.assertTrue((other / "docs/plans/[G-002] Extract Boundary.md").is_file())
+        loop_manager.reconcile_execplan_catalog(
+            self.connection, self.repo, str(self.repo), "main", remote_sha=latest,
+        )
+        self.assertEqual({row[0] for row in self.connection.execute(
+            "SELECT plan_id FROM exec_plans WHERE repo = ?", (str(self.repo),),
+        )}, {"G-000", "G-001", "G-002", "G-003"})
+        self.assertEqual(
+            loop_manager.prepare_maintenance_planning_context(
+                self.connection, str(self.repo), other, latest,
+            ).active_sha,
+            latest,
+        )
 
     def test_published_batch_recovery_rejects_changed_batch_path(self):
         context = self._begin_barrier()

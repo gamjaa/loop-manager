@@ -5142,7 +5142,7 @@ def restart_stale_maintenance_publication(
     if any(base_tree.get(path) != remote_tree.get(path) for path in batch_paths):
         raise MaintenancePlanningError("원격 파일이 보존된 batch와 겹쳐 재시작할 수 없습니다.")
     with connection:
-        restarted = repository.restart_unpublished_batch(
+        restarted = repository.restart_prepared_batch(
             repo, expected=cycle, new_base_sha=remote
         )
         _clear_active_in_current_transaction(connection, repo)
@@ -5216,6 +5216,29 @@ def recover_maintenance_planning_batch(
             return restart_stale_maintenance_publication(
                 connection, repo, worktree, base_branch
             )
+    if (
+        remote_advanced_after_publication
+        and cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT
+        and cycle.file_assessment_start_merged_count is not None
+        and (not is_loop_manager_repository(Path(repo))
+             or cycle.full_assessment_completed)
+    ):
+        evidence = maintenance_file_publication.saved_intent(
+            connection, repo, cycle.revision, base_sha, plan_commit,
+        )
+        if not maintenance_file_publication.sources_match_remote(
+            Path(repo), base_branch, current_remote, evidence,
+        ):
+            # The plans remain published. A later catalog reconciliation imports
+            # them, while this assessment must inspect the new source revision.
+            with runtime_state._transaction(connection):
+                restarted = maintenance_state.MaintenanceRepository(
+                    connection
+                ).restart_prepared_batch(
+                    repo, expected=cycle, new_base_sha=current_remote,
+                )
+                _clear_active_in_current_transaction(connection, repo)
+                return restarted
     context = _maintenance_context_at_revision(
         connection, repo, worktree, base_sha, cycle
     )
