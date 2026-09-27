@@ -2,6 +2,7 @@
 from dataclasses import fields, replace
 import hashlib
 import json
+import sqlite3
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -28,8 +29,12 @@ from tests import test_runtime_state
 from tests.test_guidance_approval import guidance_plan
 from tests.test_blocked_checkpoint import BlockedCheckpointGitAdapterTest
 import blocked_checkpoint_state
+import blocked_checkpoint
 from worker_session import SessionBinding, SessionTransition
 from tests.test_worker_outcome import decision as worker_decision
+
+READY_WORKER_RESULT = 'WORKER_OUTCOME: {"kind":"ready_for_validation"}\nresult'
+VALID_WORKER_RESULT = 'WORKER_OUTCOME: {"kind":"ready_for_validation"}\nvalid result'
 
 
 class ExecutionHandlerTests(TestCase):
@@ -328,7 +333,7 @@ class ExecutionHandlerTests(TestCase):
     def agent(self, *args, **kwargs):
         self.calls.append(args[4])
         kwargs['on_session_started']('session')
-        return lm.AgentResult(0, 'result', session_id='session')
+        return lm.AgentResult(0, READY_WORKER_RESULT, session_id='session')
 
     def context(self, phase=None):
         if phase is not None:
@@ -403,7 +408,7 @@ class ExecutionHandlerTests(TestCase):
         )
         self.effects.agent.worker_prompt.side_effect = lm.worker_prompt
         self.effects.agent.run_agent.side_effect = lambda *_args, **_kwargs: lm.AgentResult(
-            0, 'valid result', session_id='same-session',
+            0, VALID_WORKER_RESULT, session_id='same-session',
         )
         with mock.patch.object(self.handler, '_finish_worker', return_value=SimpleNamespace(kind='done')):
             self.handler.run(self.context())
@@ -502,7 +507,8 @@ class ExecutionHandlerTests(TestCase):
         ):
             result = self.handler.run(self.context())
         self._assert_pending_guidance(result, worktree, before, after, 'session')
-        self.assertEqual(self.repository.get('repo', 'G-047').worker_result, 'result')
+        self.assertEqual(self.repository.get('repo', 'G-047').worker_result,
+                         READY_WORKER_RESULT)
         self.effects.agent.validate_worker_workspace_scope.assert_called_once()
 
     def test_saved_rebase_guidance_result_keeps_worker_scope(self):
@@ -581,7 +587,8 @@ class ExecutionHandlerTests(TestCase):
                 test_path.parent.mkdir(parents=True, exist_ok=True)
                 test_path.write_text('def test_safe():\n    assert True\n')
             kwargs['on_session_started']('real-worker-session')
-            return lm.AgentResult(0, 'result', session_id='real-worker-session')
+            return lm.AgentResult(0, READY_WORKER_RESULT,
+                                  session_id='real-worker-session')
 
         effects.agent.run_agent.side_effect = worker
         handler = handlers.ExecutionHandlers(
@@ -663,7 +670,7 @@ class ExecutionHandlerTests(TestCase):
             if kwargs['session_id']:
                 return lm.AgentResult(1, 'unknown session', session_id='missing-session')
             kwargs['on_session_started']('replacement')
-            return lm.AgentResult(0, 'valid result', session_id='replacement')
+            return lm.AgentResult(0, VALID_WORKER_RESULT, session_id='replacement')
 
         self.effects.agent.run_agent.side_effect = invoke
         with mock.patch.object(self.handler, '_finish_worker', return_value=SimpleNamespace(kind='done')):
@@ -693,7 +700,7 @@ class ExecutionHandlerTests(TestCase):
                              SessionTransition.deserialize(row['worker_session_transition']),
                              kwargs['resolved_profile'], kwargs['invocation']))
             kwargs['on_session_started']('new-session')
-            return lm.AgentResult(0, 'valid result', session_id='new-session')
+            return lm.AgentResult(0, VALID_WORKER_RESULT, session_id='new-session')
         self.effects.agent.run_agent.side_effect = invoke
         with mock.patch.object(self.handler, '_finish_worker',
                                return_value=SimpleNamespace(kind='done')):
@@ -725,7 +732,7 @@ class ExecutionHandlerTests(TestCase):
                              'unbound_session_recovery')
             self.assertIn('AGENTS.md, 선택된 최신 ExecPlan과 현재 worktree', args[5])
             kwargs['on_session_started']('bound-session')
-            return lm.AgentResult(0, 'valid result', session_id='bound-session')
+            return lm.AgentResult(0, VALID_WORKER_RESULT, session_id='bound-session')
         self.effects.agent.run_agent.side_effect = invoke
         with mock.patch.object(self.handler, '_finish_worker',
                                return_value=SimpleNamespace(kind='done')):
@@ -744,7 +751,7 @@ class ExecutionHandlerTests(TestCase):
             self.assertEqual(kwargs['invocation'].transition_cause,
                              'provider_changed')
             kwargs['on_session_started']('claude-session')
-            return lm.AgentResult(0, 'valid result', session_id='claude-session')
+            return lm.AgentResult(0, VALID_WORKER_RESULT, session_id='claude-session')
         self.effects.agent.run_agent.side_effect = invoke
         with mock.patch.object(self.handler, '_finish_worker',
                                return_value=SimpleNamespace(kind='done')):
@@ -773,7 +780,7 @@ class ExecutionHandlerTests(TestCase):
             self.assertIsNone(kwargs['session_id'])
             self.assertEqual(kwargs['resolved_profile'].model, 'new-model')
             kwargs['on_session_started']('new-session')
-            return lm.AgentResult(0, 'valid result', session_id='new-session')
+            return lm.AgentResult(0, VALID_WORKER_RESULT, session_id='new-session')
         self.effects.agent.run_agent.side_effect = invoke
         with mock.patch.object(self.handler, '_finish_worker',
                                return_value=SimpleNamespace(kind='done')):
@@ -794,7 +801,7 @@ class ExecutionHandlerTests(TestCase):
             self.assertEqual(kwargs['resolved_profile'].effort, 'low')
             self.assertEqual(kwargs['invocation'].transition, 'effort_resume')
             self.assertIsNone(self.state.row()['worker_session_transition'])
-            return lm.AgentResult(0, 'valid result', session_id='same-session')
+            return lm.AgentResult(0, VALID_WORKER_RESULT, session_id='same-session')
         self.effects.agent.run_agent.side_effect = invoke
         with mock.patch.object(self.handler, '_finish_worker',
                                return_value=SimpleNamespace(kind='done')):
@@ -834,7 +841,8 @@ class ExecutionHandlerTests(TestCase):
             self.assertIn('saved result', args[5])
             self.assertEqual(kwargs['invocation'].transition_id, pending.identity)
             kwargs['on_session_started']('replacement-session')
-            return lm.AgentResult(0, 'valid result', session_id='replacement-session')
+            return lm.AgentResult(0, VALID_WORKER_RESULT,
+                                  session_id='replacement-session')
         self.effects.agent.run_agent.side_effect = recovered
         with mock.patch.object(self.handler, '_finish_worker',
                                return_value=SimpleNamespace(kind='done')):
@@ -850,7 +858,8 @@ class ExecutionHandlerTests(TestCase):
             if len(attempts) == 1:
                 kwargs['on_session_started']('observed-session')
                 raise lm.subprocess.TimeoutExpired('agent', 1)
-            return lm.AgentResult(0, 'valid result', session_id='observed-session')
+            return lm.AgentResult(0, VALID_WORKER_RESULT,
+                                  session_id='observed-session')
         self.effects.agent.run_agent.side_effect = invoke
         with mock.patch.object(self.handler, '_finish_worker',
                                return_value=SimpleNamespace(kind='done')):
@@ -950,6 +959,7 @@ class ExecutionHandlerTests(TestCase):
         )
         self.effects.agent.run_agent.side_effect = lambda *_args, **_kwargs: lm.AgentResult(
             0,
+            'WORKER_OUTCOME: {"kind":"ready_for_validation"}\n'
             'COMMIT_TITLE: Fix verify\nPR_SUMMARY: progress\n'
             'TARGETED_TESTS: none\n'
             'VERIFY_TIMEOUT_LIMIT_INSUFFICIENT: 9 of 10 required tests completed',
@@ -1170,6 +1180,94 @@ class ExecutionHandlerTests(TestCase):
         self.effects.validation.parse_worker_result.assert_not_called()
         self.effects.validation.verify.assert_not_called()
 
+    def test_worker_decision_checkpoint_wait_survives_three_restarted_runs(self):
+        worktree = self._decision_workspace()
+        notifications.configure_session(self.connection, enabled=True)
+        self.connection.execute(
+            "UPDATE exec_plans SET workspace_owned = 1, "
+            "verify_failure_history = '{\"verify\":2}', "
+            "review_failure_history = '{\"review\":3}' "
+            "WHERE repo = 'repo' AND plan_id = 'G-047'"
+        )
+        plan_file = worktree / 'docs/plans/[G-047] Runtime.md'
+        plan_file.write_text(
+            plan_file.read_text(encoding='utf-8') + '- Worker decision pending\n',
+            encoding='utf-8',
+        )
+        message = worker_decision()
+        self.effects.agent.run_agent.side_effect = lambda *_args, **kwargs: (
+            kwargs['on_session_started']('session') or
+            lm.AgentResult(0, message, session_id='session')
+        )
+        with mock.patch.object(lm, 'capture_git_snapshot') as snapshot:
+            snapshot.return_value.serialize.return_value = 'after-scope'
+            result = self.handler.run(self.context())
+        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertEqual(blocked_checkpoint_state.BlockedCheckpointRepository(
+            self.connection).get('repo', 'G-047').phase,
+            blocked_checkpoint.CheckpointPhase.REQUESTED)
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        database = Path(directory.name) / 'state.sqlite'
+        with sqlite3.connect(database) as saved:
+            self.connection.backup(saved)
+
+        self.effects.agent.run_agent.reset_mock()
+        self.effects.validation.verify.reset_mock()
+        self.effects.validation.parse_reviewer_result.reset_mock()
+        local_only = blocked_checkpoint.SafetyVerdict(
+            False, blocked_checkpoint.SafetyScope.PLAN,
+            'git_operation_in_progress', 'unresolved rebase', None, (),
+        )
+        for iteration in range(3):
+            with sqlite3.connect(database) as connection:
+                connection.row_factory = sqlite3.Row
+                notifications.configure_session(connection, enabled=True)
+                with (
+                    mock.patch.object(lm._BlockedCheckpointAdapter, 'assess',
+                                      return_value=local_only) as assess,
+                    mock.patch.object(lm, '_revision_execplan_input_fingerprint',
+                                      return_value='remote-input'),
+                    mock.patch.object(lm, '_revision_review_issue_fingerprint') as review,
+                    mock.patch.object(lm, 'validate_execplan_workspace_identity'),
+                    mock.patch.object(lm, 'make_worktree'),
+                    mock.patch.object(lm, '_resume_interrupted_blocked_rebase',
+                                      return_value=None),
+                    mock.patch.object(lm, 'validate_blocked_agent_scope'),
+                ):
+                    self.assertEqual(lm.dispatch_blocked_checkpoints(
+                        connection, Path('/repo'), Path('/state'), 'repo',
+                    ), 1 if iteration == 0 else 0)
+                    self.assertFalse(lm.resume_plan_blocks(
+                        connection, Path('/repo'), Path('/state'), 'repo', 'main',
+                    ))
+                    self.assertEqual(assess.call_count, 1 if iteration == 0 else 0)
+                    review.assert_not_called()
+                row = connection.execute(
+                    "SELECT status, blocked_reason, worker_result, worker_session_id, "
+                    "verify_failure_history, review_failure_history "
+                    "FROM exec_plans WHERE repo = 'repo' AND plan_id = 'G-047'"
+                ).fetchone()
+                self.assertEqual(tuple(row), (
+                    'PLAN_BLOCKED', 'user_decision_required', message, 'session',
+                    '{"verify":2}', '{"review":3}',
+                ))
+                checkpoint = connection.execute(
+                    "SELECT phase, result, unpublished_reason "
+                    "FROM blocked_checkpoints WHERE repo = 'repo' AND plan_id = 'G-047'"
+                ).fetchone()
+                self.assertEqual(tuple(checkpoint),
+                                 ('unpublished', 'local_only', 'unresolved rebase'))
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM notification_outbox "
+                    "WHERE repo = 'repo' AND event_type = 'blocked'"
+                ).fetchone()[0], 1)
+        self.assertIn('Worker decision pending', plan_file.read_text(encoding='utf-8'))
+        self.effects.agent.run_agent.assert_not_called()
+        self.effects.validation.verify.assert_not_called()
+        self.effects.validation.parse_reviewer_result.assert_not_called()
+
     def test_malformed_worker_outcome_enters_protocol_correction(self):
         self.effects.agent.run_agent.side_effect = lambda *_args, **kwargs: (
             kwargs['on_session_started']('session') or
@@ -1179,6 +1277,27 @@ class ExecutionHandlerTests(TestCase):
         self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
         self.assertEqual(self.repository.get('repo', 'G-047').status, 'IMPLEMENTING')
         self.effects.validation.parse_worker_result.assert_not_called()
+        self.effects.blocking.block_active_execplan.assert_not_called()
+
+    def test_new_worker_wait_without_outcome_declaration_enters_protocol_correction(self):
+        message = (
+            '사용자 승인을 기다려 구현을 중단했습니다.\n'
+            'COMMIT_TITLE: Premature candidate\n'
+            'PR_SUMMARY: Waiting for approval.\n'
+            'TARGETED_TESTS:\ncase: PASS'
+        )
+        self.effects.agent.run_agent.side_effect = lambda *_args, **kwargs: (
+            kwargs['on_session_started']('session') or
+            lm.AgentResult(0, message, session_id='session')
+        )
+
+        result = self.handler.run(self.context())
+
+        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(self.repository.get('repo', 'G-047').status, 'IMPLEMENTING')
+        self.assertIn('WORKER_OUTCOME', self.state.row()['last_error'])
+        self.effects.validation.parse_worker_result.assert_not_called()
+        self.effects.validation.verify.assert_not_called()
         self.effects.blocking.block_active_execplan.assert_not_called()
 
     def test_saved_rebase_decision_blocks_before_stage(self):
@@ -1269,7 +1388,7 @@ class ExecutionHandlerTests(TestCase):
                          ExecutionOutcomeKind.OPERATIONAL_ERROR)
         self.effects.agent.run_agent.side_effect = lambda *args, **kwargs: (
             prompts.append(args[5]) or lm.AgentResult(
-                0, 'valid result', session_id='replacement',
+                0, VALID_WORKER_RESULT, session_id='replacement',
             )
         )
         with mock.patch.object(self.handler, '_finish_worker', return_value=SimpleNamespace(kind='done')):
@@ -1448,7 +1567,7 @@ class ExecutionHandlerTests(TestCase):
         self.effects.workspace._rebase_in_progress_for_branch.return_value = True
         self.effects.workspace.git.side_effect = self.observed_git
         self.effects.agent.run_agent.side_effect = lambda *_args, **_kwargs: lm.AgentResult(
-            0, 'result', session_id='pr-worker-session',
+            0, READY_WORKER_RESULT, session_id='pr-worker-session',
         )
         self.effects.agent.capture_git_snapshot.return_value = SimpleNamespace(
             head='owned-head', branch='loop-manager/G-047',
@@ -2531,7 +2650,7 @@ class ExecutionHandlerTests(TestCase):
         def reported_agent(*args, **kwargs):
             self.calls.append(args[4])
             kwargs['on_session_started']('session')
-            return lm.AgentResult(0, 'result', session_id='session',
+            return lm.AgentResult(0, READY_WORKER_RESULT, session_id='session',
                                   collection_status='error')
 
         self.effects.agent.run_agent.side_effect = reported_agent
@@ -2704,7 +2823,7 @@ class ExecutionHandlerTests(TestCase):
             self.calls.append(args[4])
             session = kwargs['session_id'] or 'session'
             kwargs['on_session_started'](session)
-            return lm.AgentResult(0, 'result', session_id=session)
+            return lm.AgentResult(0, READY_WORKER_RESULT, session_id=session)
         self.effects.agent.run_agent.side_effect = resume_agent
         return workspace_plan
 
@@ -2815,7 +2934,7 @@ class ExecutionHandlerTests(TestCase):
         refreshed = self.handler.guard(self.handler._context())
         self.assertEqual(refreshed.kind, ExecutionOutcomeKind.RETRY)
         self.assertEqual(self.state.row()['phase'], 'VERIFYING')
-        self.assertEqual(self.state.row()['worker_result'], 'result')
+        self.assertEqual(self.state.row()['worker_result'], READY_WORKER_RESULT)
 
     def _assert_conflict_profile_resume(self, old_profile, new_profile, effective):
         self.connection.execute(
@@ -2866,7 +2985,7 @@ class ExecutionHandlerTests(TestCase):
         self.effects.workspace._rebase_in_progress_for_branch.return_value = False
         self.handler.guard(self.handler._context())
         self.assertEqual(self.state.row()['phase'], 'VERIFYING')
-        self.assertEqual(self.state.row()['worker_result'], 'result')
+        self.assertEqual(self.state.row()['worker_result'], READY_WORKER_RESULT)
 
     def test_conflict_profile_complexity_change_resumes_same_worker(self):
         self._assert_conflict_profile_resume(('low', 'low'), ('high', 'low'), 1)
@@ -3610,7 +3729,7 @@ class ExecutionHandlerTests(TestCase):
         self.effects.workspace.is_directory.return_value = True
         self.effects.workspace._rebase_in_progress_for_branch.return_value = True
         self.effects.agent.run_agent.side_effect = lambda *_args, **_kwargs: lm.AgentResult(
-            0, 'result', session_id='worker-session',
+            0, READY_WORKER_RESULT, session_id='worker-session',
         )
         self.effects.agent.validate_worker_workspace_scope.side_effect = (
             lm.ExecPlanMetadataError('catalog metadata mismatch')

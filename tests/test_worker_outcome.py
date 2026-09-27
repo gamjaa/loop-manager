@@ -45,7 +45,14 @@ def decision(**changes):
 
 class WorkerOutcomeTests(unittest.TestCase):
     def test_ready_and_legacy_completion_remain_distinct_from_decision_words(self):
-        self.assertEqual(parse('승인 대기 BLOCKED 중단').kind, 'ready_for_validation')
+        with self.assertRaisesRegex(WorkerOutcomeError, 'WORKER_OUTCOME'):
+            parse('승인 대기 BLOCKED 중단')
+        self.assertEqual(parse_worker_outcome(
+            'COMMIT_TITLE: Saved completion\nPR_SUMMARY: Saved summary\n'
+            'TARGETED_TESTS:\ncase: PASS',
+            plan_path=PLAN, sources=('docs/PRODUCT.md',),
+            documents=DOCUMENTS, allow_legacy_ready=True,
+        ).kind, 'ready_for_validation')
         self.assertEqual(parse('WORKER_OUTCOME: {"kind":"ready_for_validation"}')
                          .kind, 'ready_for_validation')
         self.assertIn('needs_user_decision', worker_outcome_instruction())
@@ -91,7 +98,7 @@ class WorkerOutcomeTests(unittest.TestCase):
             with self.subTest(message=message), self.assertRaises(WorkerOutcomeError):
                 parse(message)
 
-    def test_user_decision_wait_survives_restart_and_unrelated_review_changes(self):
+    def test_user_decision_release_ignores_unrelated_review_changes(self):
         source = test_runtime_state.RuntimeStateRepositoryTest()._connection()
         self.addCleanup(source.close)
         source.execute(

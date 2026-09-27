@@ -68,14 +68,17 @@ def parse_worker_outcome(
     plan_path: str,
     sources: tuple[str, ...],
     documents: Mapping[str, str],
+    allow_legacy_ready: bool = False,
 ) -> WorkerOutcome:
-    """Read one explicit disposition; legacy publication text remains ready."""
+    """Read one explicit disposition, except for a stored legacy completion."""
 
     declarations = _DECLARATION.findall(message)
     if re.search(r"(?m)^[ \t]+WORKER_OUTCOME:", message):
         raise WorkerOutcomeError("Worker 결과 선언은 줄 시작에서 작성해야 합니다.")
     if not declarations:
-        return WorkerOutcome("ready_for_validation")
+        if allow_legacy_ready:
+            return WorkerOutcome("ready_for_validation")
+        raise WorkerOutcomeError("새 Worker 결과에 WORKER_OUTCOME 선언이 없습니다.")
     if len(declarations) != 1 or len(message) > 65536 or len(declarations[0]) > 12000:
         raise WorkerOutcomeError("Worker 결과 선언이 중복되거나 너무 깁니다.")
     try:

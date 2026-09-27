@@ -692,7 +692,7 @@ class ExecutionHandlers:
                                 error=kind is ExecutionOutcomeKind.FINAL_BLOCK,
                                 recovery=decision)
 
-    def _parse_worker_outcome(self, context, message):
+    def _parse_worker_outcome(self, context, message, *, allow_legacy_ready=False):
         allowed = {context.plan.path, *context.plan.sources,
                    'docs/PRODUCT.md', 'docs/ARCHITECTURE.md'}
         documents = {}
@@ -704,6 +704,7 @@ class ExecutionHandlers:
         return parse_worker_outcome(
             message, plan_path=context.plan.path,
             sources=context.plan.sources, documents=documents,
+            allow_legacy_ready=allow_legacy_ready,
         )
 
     def _block_worker_decision(self, context, message, outcome: WorkerOutcome):
@@ -1621,7 +1622,9 @@ class ExecutionHandlers:
                     )
                 saved_result = current.snapshot['worker_result']
                 try:
-                    disposition = self._parse_worker_outcome(context, saved_result)
+                    disposition = self._parse_worker_outcome(
+                        context, saved_result, allow_legacy_ready=True,
+                    )
                     if disposition.kind == 'needs_user_decision':
                         return self._block_worker_decision(
                             context, saved_result, disposition,
@@ -1970,7 +1973,7 @@ class ExecutionHandlers:
         if row['worker_result']:
             try:
                 disposition = self._parse_worker_outcome(
-                    context, str(row['worker_result']),
+                    context, str(row['worker_result']), allow_legacy_ready=True,
                 )
                 if disposition.kind == 'needs_user_decision':
                     return self._block_worker_decision(
@@ -3388,7 +3391,7 @@ class ExecutionHandlers:
             return self._final()
         try:
             disposition = self._parse_worker_outcome(
-                context, str(row['worker_result'] or ''),
+                context, str(row['worker_result'] or ''), allow_legacy_ready=True,
             )
             if disposition.kind == 'needs_user_decision':
                 return self._block_worker_decision(
