@@ -383,12 +383,14 @@ def validate_refactoring_plan(
         raise MaintenancePlanningError(
             f"리팩터링 계획에 대상 책임 경계가 없습니다: {path}"
         )
-    if not re.search(r"(?:보존|preserv)", evidence, re.IGNORECASE) or not re.search(
-        r"(?:사용자\s*동작|공개\s*(?:계약|API)|저장\s*형식|user\s*behavio|"
-        r"public\s*(?:contract|api)|storage\s*format)",
-        evidence,
-        re.IGNORECASE,
-    ):
+    preservation = (
+        r"(?:사용자\s*동작|user\s*behavio)",
+        r"(?:공개\s*(?:계약|API)|public\s*(?:contract|api))",
+        r"(?:저장\s*형식|storage\s*format)",
+    )
+    if (not re.search(r"(?:보존|preserv)", evidence, re.IGNORECASE)
+        or any(not re.search(pattern, evidence, re.IGNORECASE)
+               for pattern in preservation)):
         raise MaintenancePlanningError(
             f"리팩터링 계획에 사용자 동작·공개 계약·저장 형식 보존 조건이 없습니다: {path}"
         )

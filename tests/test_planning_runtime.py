@@ -12,6 +12,7 @@ import loop_manager
 import notifications
 import maintenance_state
 import maintenance_file_review
+import maintenance_reconciliation
 from maintenance_file_inventory import TrackedSource
 from tests.test_maintenance_file_review import result_for
 from planning_catalog import MutableReadySnapshot, mutable_snapshot_token
@@ -408,6 +409,49 @@ class FakePorts:
 
 
 class PlanningLifecycleCoordinatorTest(unittest.TestCase):
+    def test_assessment_reconciles_one_relation_before_final_planner(self):
+        left_content = b"def calculate(): return helper()\n"
+        right_content = b"def helper(): return 1\n"
+        left = TrackedSource("src/a.py", hashlib.sha256(left_content).hexdigest(),
+                             "100644", "a" * 40, "source code")
+        right = TrackedSource("src/b.py", hashlib.sha256(right_content).hexdigest(),
+                              "100644", "a" * 40, "source code")
+        relation = maintenance_reconciliation.Relation("relation-key", left, right, ())
+        ports = FakePorts(
+            planning_snapshot(phase="PLANNING", active_sha="a" * 40),
+            maintenance_cycle(phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+                              cycle_base_sha="a" * 40, revision=4,
+                              file_assessment_start_merged_count=0),
+        )
+        ports.file_review = SimpleNamespace(progress=mock.Mock(return_value=
+            maintenance_file_review.FileReviewProgress((left,), ({"path": left.path},), None)))
+        ports.reconciliation = SimpleNamespace(
+            progress=mock.Mock(return_value=maintenance_reconciliation.ReconciliationProgress(
+                (left,), (), (relation,), relation)),
+            content=mock.Mock(side_effect=[left_content, right_content,
+                                           left_content, right_content]),
+            start=mock.Mock(), unit=mock.Mock(return_value=("saved-relation-session", None)),
+            session=mock.Mock(), complete=mock.Mock(), fail=mock.Mock(),
+        )
+        ports.agent.result = PlanningAgentResult(
+            0, maintenance_reconciliation.RELATION_PREFIX + json.dumps({
+                "key": relation.key, "status": "confirmed",
+                "left_excerpt": "helper()", "right_excerpt": "def helper()",
+                "reason": "The caller resolves to this helper's implementation.",
+            }), "saved-relation-session", PlanningAgentResultKind.SUCCESS,
+        )
+        ports.git.head = "a" * 40
+        coordinator = PlanningLifecycleCoordinator(ports)
+        run = coordinator._new_run(self.context)
+        run.planning_worktree = Path("/worktree")
+
+        outcome = coordinator._run_planner_turn(run)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.WAITING)
+        self.assertEqual(ports.agent.resumed_session, "saved-relation-session")
+        self.assertEqual(ports.reconciliation.complete.call_count, 1)
+        self.assertEqual(ports.reconciliation.fail.call_count, 0)
+
     def test_assessment_review_unit_precedes_planner_and_preserves_session(self):
         content = b"def calculate(): return 1\n"
         source = TrackedSource(

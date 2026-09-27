@@ -16,7 +16,9 @@ import full_assessment
 import execplan_catalog_state
 import loop_manager
 import maintenance_planning
+import maintenance_reconciliation
 import maintenance_state
+from maintenance_file_inventory import SourceInventory, TrackedSource
 from planning_catalog import MutableReadySnapshot, mutable_snapshot_token
 
 
@@ -1911,6 +1913,51 @@ class MaintenancePlanningTest(unittest.TestCase):
         )
         self.assertEqual(fresh.mode, loop_manager.MaintenancePlanMode.REVALIDATION)
         self.assertEqual(fresh.cycle_revision, restarted.revision)
+
+
+class ReconciledPlanLinkTest(unittest.TestCase):
+    def test_refactoring_plan_preserves_all_three_contracts(self):
+        path = "docs/plans/[G-100] Extract Boundary.md"
+        text = plan_text("G-100", "Extract Boundary")
+        plan = {"priority": "normal"}
+        maintenance_planning.validate_refactoring_plan(path, plan, text)
+        changed = text.replace("the public contract, and ", "").replace(
+            "the public API contract, and ", ""
+        )
+        with self.assertRaisesRegex(maintenance_planning.MaintenancePlanningError,
+                                    "공개 계약"):
+            maintenance_planning.validate_refactoring_plan(path, plan, changed)
+
+    def test_findings_link_existing_plan_without_duplicate_and_allow_grounded_no_issue(self):
+        content = b"def calculate(): return 1\n"
+        source = TrackedSource("src/calc.py", hashlib.sha256(content).hexdigest(),
+                               "100644", "a" * 40, "source")
+        inventory = SourceInventory(source.revision, (source,), ())
+        progress = maintenance_reconciliation.ReconciliationProgress((source,), (), (), None)
+        finding = {
+            "issue_key": "mixed-calculation", "targets": [source.path],
+            "evidence": [{"path": source.path, "content_hash": source.content_hash,
+                          "mode": source.mode, "excerpt": "def calculate()"}],
+            "relation_keys": [],
+            "boundary": "Move calculation from the interface module into its own unit.",
+            "context_reduction": "Later interface changes avoid unrelated calculation details.",
+            "integration_cost": "One import and a focused unit test are added for the boundary.",
+            "status": "existing_plan", "plan_id": "G-100",
+        }
+        payload = {"source_revision": source.revision, "findings": [finding],
+                   "no_issue_reason": None}
+        parse = lambda value, existing, new: maintenance_reconciliation.parse_findings(
+            maintenance_reconciliation.FINDINGS_PREFIX + json.dumps(value), progress,
+            inventory, {source.path: content}, existing, new,
+        )
+        self.assertEqual(parse(payload, {"G-100": "READY"}, ()), payload)
+        with self.assertRaisesRegex(maintenance_reconciliation.ReconciliationError, "계획 연결"):
+            parse(payload, {}, ())
+        with self.assertRaisesRegex(maintenance_reconciliation.ReconciliationError, "새 리팩터링"):
+            parse(payload, {"G-100": "READY"}, ("G-101",))
+        no_issue = {"source_revision": source.revision, "findings": [],
+                    "no_issue_reason": "No duplicate or mixed responsibility is present in this source."}
+        self.assertEqual(parse(no_issue, {}, ()), no_issue)
 
 
 if __name__ == "__main__":

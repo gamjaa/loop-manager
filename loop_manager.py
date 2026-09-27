@@ -127,6 +127,7 @@ from maintenance_orchestration import (
 import maintenance_git
 import maintenance_state
 import maintenance_file_review
+import maintenance_reconciliation
 import maintenance_file_inventory
 import document_publication
 import scoped_blocking
@@ -19871,6 +19872,59 @@ class _PlanningFileReviewPorts:
         return self._repository.completed_summary(repo)
 
 
+class _PlanningReconciliationPorts:
+    """Keep relation evidence provisional until G-086 publication succeeds."""
+
+    def __init__(self, connection: sqlite3.Connection):
+        self._repository = maintenance_reconciliation.ReconciliationRepository(connection)
+        self._reviews = maintenance_file_review.ProvisionalReviewRepository(connection)
+
+    def progress(self, repo: str, repository: Path, base: str, cycle_revision: int,
+                 source_revision: str) -> maintenance_reconciliation.ReconciliationProgress:
+        inventory = maintenance_file_inventory.tracked_source_inventory(repository, base, source_revision)
+        reviews = self._reviews.progress(repo, repository, base, cycle_revision, inventory)
+        return self._repository.progress(repo, repository, base, cycle_revision, inventory, reviews)
+
+    def content(self, repository: Path, base: str, source: maintenance_file_inventory.TrackedSource) -> bytes:
+        return maintenance_file_review.source_bytes(repository, base, source)
+
+    def start(self, repo: str, cycle_revision: int, revision: str,
+              relation: maintenance_reconciliation.Relation) -> None:
+        self._repository.start(repo, cycle_revision, revision, relation)
+
+    def session(self, repo: str, cycle_revision: int, relation: maintenance_reconciliation.Relation,
+                session_id: str) -> None:
+        self._repository.session(repo, cycle_revision, relation, session_id)
+
+    def complete(self, repo: str, cycle_revision: int, relation: maintenance_reconciliation.Relation,
+                 result: dict) -> None:
+        self._repository.complete(repo, cycle_revision, relation, result)
+
+    def fail(self, repo: str, cycle_revision: int, relation: maintenance_reconciliation.Relation,
+             error: str) -> None:
+        self._repository.fail(repo, cycle_revision, relation, error)
+
+    def unit(self, repo: str, relation: maintenance_reconciliation.Relation) -> tuple[str | None, str | None]:
+        return self._repository.unit(repo, relation)
+
+    def validate(self, repo: str, repository: Path, base: str, cycle_revision: int,
+                 revision: str, output: str, existing_plans: dict[str, str],
+                 new_plan_ids: tuple[str, ...]) -> dict:
+        progress = self.progress(repo, repository, base, cycle_revision, revision)
+        inventory = maintenance_file_inventory.tracked_source_inventory(repository, base, revision)
+        sources = {source.path: source for source in inventory.sources}
+
+        class CurrentContents(dict):
+            def __missing__(self, path: str) -> bytes:
+                content = maintenance_file_review.source_bytes(repository, base, sources[path])
+                self[path] = content
+                return content
+
+        return maintenance_reconciliation.parse_findings(
+            output, progress, inventory, CurrentContents(), existing_plans, new_plan_ids,
+        )
+
+
 class _PlanningLifecyclePorts:
     """Concrete bootstrap bindings for the independent coordinator."""
 
@@ -19891,6 +19945,7 @@ class _PlanningLifecyclePorts:
         self.agent = _PlanningAgentPorts(connection, context, planner_mutex)
         self.validation = _PlanningValidationPorts(connection)
         self.file_review = _PlanningFileReviewPorts(connection)
+        self.reconciliation = _PlanningReconciliationPorts(connection)
         self.events = _PlanningEventPorts()
 
 
