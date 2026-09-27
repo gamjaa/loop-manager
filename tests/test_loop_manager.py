@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import loop_manager
+import scoped_blocking
 import execplan_catalog
 from execution_revision import DefinitionSnapshot
 from worker_outcome import parse_worker_outcome
@@ -4389,6 +4390,35 @@ risk: medium
 
 
 class BoundedExecutionRecoveryTest(unittest.TestCase):
+    def test_review_occurrence_history_does_not_create_final_block(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, connection = self._failure_state(directory)
+            self.addCleanup(connection.close)
+            reviews = [
+                ('ISSUE_ID: app.py::same-issue::blocking\n'
+                 f'Changed diagnostic {index}\n'
+                 + ('ISSUE_ID: app.py::extra-issue::blocking\n' if index == 3 else '')
+                 + 'VERDICT: FAIL')
+                for index in range(5)
+            ]
+            decisions = [
+                loop_manager.transition_validation_failure(
+                    connection, str(root), root, 'review', review,
+                ) for review in reviews
+            ]
+            row = connection.execute(
+                "SELECT status, review_failure_history FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-013'", (str(root),),
+            ).fetchone()
+            self.assertEqual([item.occurrences for item in decisions], [1, 2, 3, 4, 5])
+            self.assertTrue(all(not item.blocked for item in decisions))
+            self.assertEqual(row['status'], 'IMPLEMENTING')
+            self.assertEqual(json.loads(row['review_failure_history'])[
+                decisions[-1].fingerprint]['occurrences'], 5)
+            self.assertIsNone(scoped_blocking.plan_block(
+                connection, str(root), 'G-013',
+            ))
+
     def test_verify_port_uses_supplied_timeout_without_rereading_config(self):
         from tests.test_runtime_state import RuntimeStateRepositoryTest
         import runtime_state
@@ -5929,7 +5959,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         self.assertEqual(json.loads(plan["verify_failure_history"]), {})
         self.assertEqual(json.loads(plan["review_failure_history"]), {})
 
-    def test_distinct_review_issues_continue_past_four_failures(self):
+    def test_distinct_review_issues_pause_before_fourth_worker_correction(self):
         messages = (
             "ISSUE_ID: app.py::issue-a::blocking\nissue A\nVERDICT: FAIL",
             "ISSUE_ID: app.py::issue-b::blocking\nissue B\nVERDICT: FAIL",
@@ -5946,13 +5976,13 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         transitions = data["transitions"]
         project = data["project"]
         plan = data["plan"]
-        self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.TRANSIENT_PAUSE)
         self.assertEqual(result.exit_code, 0)
-        self.assertEqual(data["verify_calls"], 5)
-        self.assertEqual(data["roles"], ["worker", "reviewer"] * 5)
+        self.assertEqual(data["verify_calls"], 4)
+        self.assertEqual(data["roles"], ["worker", "reviewer"] * 4)
         self.assertEqual(
             data["reviewer_sessions"],
-            [None] + ["reviewer-session"] * 4,
+            [None] + ["reviewer-session"] * 3,
         )
         self.assertEqual(
             [
@@ -5970,11 +6000,11 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             ),
             4,
         )
-        self.assertIsNone(project["phase"])
-        self.assertEqual(plan["status"], "PR_OPEN")
-        self.assertEqual(json.loads(plan["review_failure_history"]), {})
+        self.assertEqual(project["phase"], "WORKING")
+        self.assertEqual(plan["status"], "IMPLEMENTING")
+        self.assertEqual(len(json.loads(plan["review_failure_history"])), 4)
 
-    def test_review_issue_in_changing_sets_blocks_exactly_on_fourth_occurrence(self):
+    def test_review_issue_in_changing_sets_pauses_after_three_corrections(self):
         messages = (
             "ISSUE_ID: app.py::a-shared-issue::blocking\n"
             "ISSUE_ID: app.py::z-extra-a::blocking\nVERDICT: FAIL",
@@ -5995,7 +6025,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         project = data["project"]
         plan = data["plan"]
         history = json.loads(plan["review_failure_history"])
-        self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.TRANSIENT_PAUSE)
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(data["verify_calls"], 4)
         self.assertEqual(data["roles"], ["worker", "reviewer"] * 4)
@@ -6012,7 +6042,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                 ("review", 1, False),
                 ("review", 2, False),
                 ("review", 3, False),
-                ("review", 4, True),
+                ("review", 4, False),
             ],
         )
         self.assertEqual(
@@ -6024,8 +6054,8 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             ),
             1,
         )
-        self.assertIsNone(project["phase"])
-        self.assertEqual(plan["status"], "PLAN_BLOCKED")
+        self.assertEqual(project["phase"], "WORKING")
+        self.assertEqual(plan["status"], "IMPLEMENTING")
         self.assertEqual(
             sorted(record["occurrences"] for record in history.values()),
             [1, 1, 1, 1, 4],

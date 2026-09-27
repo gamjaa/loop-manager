@@ -42,6 +42,8 @@ class RecoveryReason(str, Enum):
     ARCHIVE_MOVE_MISMATCH = "archive_move_mismatch"
     REBASE_CONFLICT = "rebase_conflict"
     WORKER_CORRECTION = "worker_correction"
+    REVIEW_FEEDBACK_CORRECTION = "review_feedback_correction"
+    REVIEW_CORRECTION_BUDGET = "review_correction_budget"
     GUIDANCE_APPROVAL_REQUIRED = "guidance_approval_required"
     PULL_REQUEST_CLOSED = "pull_request_closed"
     OWNERSHIP_UNCERTAIN = "ownership_uncertain"
@@ -75,6 +77,7 @@ TRANSIENT = frozenset({
     RecoveryReason.WORKTREE_RECOVERY_FAILED,
     RecoveryReason.PUBLICATION_RETRY,
     RecoveryReason.REMOTE_SNAPSHOT_RACE,
+    RecoveryReason.REVIEW_CORRECTION_BUDGET,
 })
 RECONCILE = frozenset({
     RecoveryReason.BASE_BEHIND, RecoveryReason.CATALOG_CACHE_STALE,
@@ -83,6 +86,7 @@ RECONCILE = frozenset({
 CORRECTION = frozenset({
     RecoveryReason.ARCHIVE_MOVE_MISMATCH, RecoveryReason.REBASE_CONFLICT,
     RecoveryReason.WORKER_CORRECTION,
+    RecoveryReason.REVIEW_FEEDBACK_CORRECTION,
 })
 
 BLOCK_REASON = {
@@ -226,6 +230,9 @@ def decide(
         disposition = RecoveryDisposition.STATE_RECONCILE
         action = (RecoveryAction.RECONCILE if attempts < same_run_retry_limit
                   else RecoveryAction.PAUSE)
+    elif reason is RecoveryReason.REVIEW_FEEDBACK_CORRECTION:
+        disposition = RecoveryDisposition.AGENT_CORRECTION
+        action = RecoveryAction.CORRECT
     elif reason in CORRECTION and occurrence < correction_limit:
         disposition = RecoveryDisposition.AGENT_CORRECTION
         action = RecoveryAction.CORRECT

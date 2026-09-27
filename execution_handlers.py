@@ -12,6 +12,7 @@ import document_publication
 import rebase_file_evidence
 import manager_git_journal
 import notifications
+import recovery_state
 import re
 import subprocess
 import sys
@@ -2676,6 +2677,34 @@ class ExecutionHandlers:
         resolved = self.effects.agent.resolve_worker_profile(
             self.config_path, self.provider, self.level, context.worktree,
         )
+        review_result_id = None
+        review_turn_run_id = None
+        if not context.resolving_rebase:
+            review_result_id = recovery_state.pending_review_correction(
+                self.effects.state.connection, self.repo, str(plan['id']),
+                str(row['review_result'] or ''),
+            )
+            if review_result_id is not None:
+                allowed, used, review_turn_run_id = recovery_state.reserve_review_correction(
+                    self.effects.state.connection, self.repo, str(plan['id']),
+                    review_result_id,
+                )
+                if not allowed:
+                    detail = (
+                        f"Review 교정 실행 한도 도달: run={review_turn_run_id}, "
+                        f"plan={plan['id']}, used={used}/"
+                        f"{recovery_state.MAX_REVIEW_CORRECTIONS_PER_RUN}. "
+                        "다음 외부 실행에서 저장된 Review 피드백으로 재개합니다.\n"
+                        + str(row['review_result'] or '')[-8000:]
+                    )
+                    return self._recover(
+                        RecoveryReason.REVIEW_CORRECTION_BUDGET, detail,
+                        context=context, attempts=3,
+                        fingerprint=hashlib.sha256(
+                            ("review-correction-budget|" + str(plan['id']) + "|"
+                             + str(row['review_result'] or '')).encode()
+                        ).hexdigest(),
+                    )
         decision = decide_session(
             row['worker_session_id'],
             SessionBinding.deserialize(row['worker_session_binding']),
@@ -2754,6 +2783,10 @@ class ExecutionHandlers:
             if is_validation_error(prompt_error, row['verify_result'], row['review_result']):
                 prompt_error = None
             try:
+                recovery_state.start_review_correction(
+                    self.effects.state.connection, self.repo, str(plan['id']),
+                    review_turn_run_id, review_result_id,
+                )
                 with self.effects.state.connection:
                     resumed = notifications.record_work_start(
                         self.effects.state.connection, self.repo, "Worker",
@@ -3918,9 +3951,8 @@ class ExecutionHandlers:
                     recovery=getattr(decision, 'recovery', None),
                 )
             return self._recover(
-                RecoveryReason.WORKER_CORRECTION, review,
+                RecoveryReason.REVIEW_FEEDBACK_CORRECTION, review,
                 context=context, fingerprint=decision.fingerprint,
-                correction_limit=self.effects.contract.MAX_VALIDATION_FINGERPRINT_REPEATS + 1,
             )
         self.effects.validation.clear_validation_failure_history(self.repo, 'review')
         self.effects.state.update_project(

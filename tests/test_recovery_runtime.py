@@ -22,6 +22,19 @@ def observation(reason, detail="same RuntimeError"):
 
 
 class RecoveryPolicyTests(unittest.TestCase):
+    def test_review_feedback_occurrence_never_blocks_and_budget_pauses(self):
+        correction = decide(
+            observation(RecoveryReason.REVIEW_FEEDBACK_CORRECTION),
+            occurrence=99,
+        )
+        budget = decide(
+            observation(RecoveryReason.REVIEW_CORRECTION_BUDGET), attempts=3,
+        )
+        self.assertEqual(correction.action, RecoveryAction.CORRECT)
+        self.assertIsNone(correction.block_reason)
+        self.assertEqual(budget.action, RecoveryAction.PAUSE)
+        self.assertIsNone(budget.block_reason)
+
     def test_each_disposition_and_action_are_independent_of_block_scope(self):
         cases = (
             (RecoveryReason.FETCH_FAILED, 1, 0, RecoveryDisposition.TRANSIENT_RETRY, RecoveryAction.RETRY),

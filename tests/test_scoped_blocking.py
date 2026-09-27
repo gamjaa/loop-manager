@@ -18,6 +18,107 @@ from scoped_blocking import BlockReasonCode, BlockScope
 
 
 class ScopedBlockingTest(unittest.TestCase):
+    def test_legacy_review_count_block_releases_only_owned_non_rebase_workspace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            snapshot = loop_manager.GitSnapshot(
+                head='owned-head', branch='loop-manager/G-001',
+                index={}, dirty={}, refs={}, worktrees={}, config={}, operations={},
+            )
+            self.plan('G-001', 'IMPLEMENTING', branch='loop-manager/G-001')
+            with self.connection:
+                self.connection.execute(
+                    "UPDATE exec_plans SET worktree = ?, worker_session_id = 'worker-session', "
+                    "reviewer_session_id = 'review-session', review_result = 'VERDICT: FAIL', "
+                    "agent_result_snapshot = ?, "
+                    "review_failure_history = '{\"old\":{\"occurrences\":4}}' "
+                    "WHERE repo = ? AND plan_id = 'G-001'",
+                    (str(worktree), snapshot.serialize(), self.repo),
+                )
+                scoped_blocking.record_plan_block(
+                    self.connection, self.repo, 'G-001',
+                    BlockReasonCode.REVIEW_RETRY_EXHAUSTED, 'old count limit', 'old',
+                )
+                checkpoint = blocked_checkpoint_state.BlockedCheckpointRepository(
+                    self.connection,
+                )
+                checkpoint.finish_unpublished(
+                    checkpoint.get(self.repo, 'G-001'), 'local only', retryable=False,
+                )
+            plan = self.connection.execute(
+                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+                (self.repo,),
+            ).fetchone()
+            loop_manager.hydrate_execplan_project(self.connection, self.repo, plan)
+            with self.connection:
+                self.connection.execute(
+                    "INSERT INTO project_blocks "
+                    "(repo, scope, reason_code, plan_id, evidence) "
+                    "VALUES (?, 'project', 'repository_state_unsafe', 'G-001', 'unsafe')",
+                    (self.repo,),
+                )
+            with (
+                mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
+                mock.patch.object(loop_manager, 'validate_managed_worktree'),
+                mock.patch.object(loop_manager, 'validate_blocked_agent_scope'),
+                mock.patch.object(loop_manager, '_rebase_in_progress_for_branch', return_value=True) as rebase,
+                mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=snapshot) as captured,
+                mock.patch.object(loop_manager, 'remote_branch_oid', return_value=None),
+                mock.patch.object(loop_manager, 'git', return_value=SimpleNamespace(
+                    stdout='', returncode=0,
+                )) as git_effect,
+                mock.patch.object(loop_manager, 'pr_for_branch', return_value=None),
+            ):
+                self.assertFalse(loop_manager._resume_legacy_review_count_block(
+                    self.connection, Path(self.repo), Path('/state'), self.repo, plan,
+                ))
+                with self.connection:
+                    self.connection.execute(
+                        "DELETE FROM project_blocks WHERE repo = ?", (self.repo,),
+                    )
+                self.assertFalse(loop_manager._resume_legacy_review_count_block(
+                    self.connection, Path(self.repo), Path('/state'), self.repo, plan,
+                ))
+                rebase.return_value = False
+                captured.return_value = loop_manager.GitSnapshot(
+                    **{**snapshot.__dict__, 'dirty': {'new.py': (('unstaged',), 'changed')}}
+                )
+                self.assertFalse(loop_manager._resume_legacy_review_count_block(
+                    self.connection, Path(self.repo), Path('/state'), self.repo, plan,
+                ))
+                captured.return_value = snapshot
+                git_effect.return_value = SimpleNamespace(
+                    stdout='other-head\trefs/heads/loop-manager/G-001\n',
+                    returncode=0,
+                )
+                self.assertFalse(loop_manager._resume_legacy_review_count_block(
+                    self.connection, Path(self.repo), Path('/state'), self.repo, plan,
+                ))
+                git_effect.return_value = SimpleNamespace(stdout='', returncode=0)
+                self.assertTrue(loop_manager._resume_legacy_review_count_block(
+                    self.connection, Path(self.repo), Path('/state'), self.repo, plan,
+                ))
+            saved = self.connection.execute(
+                "SELECT status, worker_session_id, reviewer_session_id, "
+                "review_result, review_failure_history FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-001'", (self.repo,),
+            ).fetchone()
+            self.assertEqual(tuple(saved), (
+                'IMPLEMENTING', 'worker-session', 'review-session',
+                'VERDICT: FAIL', '{"old":{"occurrences":4}}',
+            ))
+            self.assertIsNone(scoped_blocking.plan_block(
+                self.connection, self.repo, 'G-001',
+            ))
+            self.assertIsNotNone(self.connection.execute(
+                "SELECT final_evidence FROM recovery_records "
+                "WHERE repo = ? AND subject = 'G-001'", (self.repo,),
+            ).fetchone()['final_evidence'])
+            self.assertEqual(self.connection.execute(
+                "SELECT phase FROM blocked_checkpoints "
+                "WHERE repo = ? AND plan_id = 'G-001'", (self.repo,),
+            ).fetchone()['phase'], 'unpublished')
+
     def test_releasing_notified_plan_block_rolls_back_notice_cancellation(self):
         self.plan("G-001", "PLAN_BLOCKED")
         notifications.configure_session(self.connection, enabled=True)

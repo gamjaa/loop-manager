@@ -8,12 +8,86 @@ from unittest import mock
 import loop_manager
 import runtime_state
 from recovery_runtime import RecoveryAction, RecoveryObservation, RecoveryReason
-from recovery_state import RecoveryRepository, RecoveryStateConflict, begin_external_run
+from recovery_state import (
+    RecoveryRepository, RecoveryStateConflict, begin_external_run,
+    pending_review_correction, reserve_review_correction, start_review_correction,
+)
 from recovery_dispatcher import RecoveryDispatcher
 from tests import test_runtime_state
 
 
 class RecoveryRepositoryTests(unittest.TestCase):
+    def test_registered_project_reentry_shares_budget_across_connections(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / 'state.db'
+            for result_id, expected in ((1, 1), (2, 2)):
+                connection = sqlite3.connect(database)
+                connection.row_factory = sqlite3.Row
+                RecoveryRepository(connection)
+                begin_external_run(connection, 'same-scheduler-run')
+                self.assertEqual(
+                    reserve_review_correction(
+                        connection, 'repo', 'G-042', result_id,
+                    ), (True, expected, 'same-scheduler-run'),
+                )
+                connection.close()
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            begin_external_run(connection, 'next-scheduler-run')
+            self.assertEqual(
+                reserve_review_correction(connection, 'repo', 'G-042', 2),
+                (True, 1, 'next-scheduler-run'),
+            )
+            connection.close()
+
+    def test_review_budget_counts_distinct_review_results_once_per_external_run(self):
+        self.connection.execute(
+            "CREATE TABLE validation_results (id INTEGER PRIMARY KEY, repo TEXT, "
+            "plan_id TEXT, stage TEXT, classification TEXT, raw_output TEXT)"
+        )
+        run = begin_external_run(self.connection)
+        for result_id in range(1, 5):
+            diagnostic = f"ISSUE_ID: a.py::issue-{result_id}::blocking"
+            self.connection.execute(
+                "INSERT INTO validation_results VALUES (?, 'repo', 'G-042', "
+                "'review', 'failure', ?)", (result_id, diagnostic),
+            )
+            self.assertEqual(
+                pending_review_correction(self.connection, 'repo', 'G-042', diagnostic),
+                result_id,
+            )
+            allowed, used, identity = reserve_review_correction(
+                self.connection, 'repo', 'G-042', result_id,
+            )
+            self.assertEqual((allowed, used, identity), (result_id <= 3, min(result_id, 3), run))
+            if result_id <= 3:
+                start_review_correction(
+                    self.connection, 'repo', 'G-042', run, result_id,
+                )
+                start_review_correction(
+                    self.connection, 'repo', 'G-042', run, result_id,
+                )
+                self.assertEqual(
+                    reserve_review_correction(self.connection, 'repo', 'G-042', result_id),
+                    (True, result_id, run),
+                )
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM review_correction_turns WHERE started_at IS NOT NULL"
+        ).fetchone()[0], 3)
+        self.connection.execute(
+            "INSERT INTO validation_results VALUES (5, 'repo', 'G-042', "
+            "'verify', 'failure', 'verify failure')"
+        )
+        self.assertIsNone(pending_review_correction(
+            self.connection, 'repo', 'G-042', diagnostic,
+        ))
+        next_run = begin_external_run(self.connection)
+        self.assertNotEqual(next_run, run)
+        self.assertEqual(
+            reserve_review_correction(self.connection, 'repo', 'G-042', 4),
+            (True, 1, next_run),
+        )
+
     def setUp(self):
         self.connection = sqlite3.connect(":memory:")
         self.connection.row_factory = sqlite3.Row
