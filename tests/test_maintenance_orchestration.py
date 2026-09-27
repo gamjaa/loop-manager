@@ -377,7 +377,8 @@ class MaintenanceOrchestrationTest(unittest.TestCase):
         base_sha: str,
     ) -> maintenance_state.MaintenanceCycle:
         repository = maintenance_state.MaintenanceRepository(connection)
-        cycle, _ = self._legacy_cycle(connection, repo, base_sha)
+        cycle = repository.get(repo)
+        self.assertEqual(cycle.phase, maintenance_state.MaintenancePhase.ASSESSMENT)
         refactoring = repository.transition(
             repo,
             expected_phase=cycle.phase,

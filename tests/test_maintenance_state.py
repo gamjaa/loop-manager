@@ -467,6 +467,25 @@ class DocumentDraftTest(unittest.TestCase):
 
 
 class MaintenanceStateRepositoryTest(unittest.TestCase):
+    @staticmethod
+    def _start_legacy_assessment(connection, repo, source_sha):
+        maintenance_state.ensure_schema(connection)
+        count = connection.execute(
+            "SELECT COUNT(*) FROM exec_plans WHERE repo = ? AND status = 'MERGED'",
+            (repo,),
+        ).fetchone()[0]
+        connection.execute(
+            "INSERT INTO maintenance_cycles "
+            "(repo, phase, cycle_base_sha, cycle_start_merged_count, revision) "
+            "VALUES (?, 'assessment', ?, ?, 1) "
+            "ON CONFLICT(repo) DO UPDATE SET phase = 'assessment', "
+            "cycle_base_sha = excluded.cycle_base_sha, "
+            "cycle_start_merged_count = excluded.cycle_start_merged_count, "
+            "revision = maintenance_cycles.revision + 1",
+            (repo, source_sha, count),
+        )
+        return maintenance_state.MaintenanceRepository(connection).get(repo)
+
     def test_self_full_assessment_is_once_and_survives_restart(self):
         connection = self._connection()
         repository = maintenance_state.MaintenanceRepository(connection)
@@ -488,6 +507,14 @@ class MaintenanceStateRepositoryTest(unittest.TestCase):
         self.assertTrue(completed.full_assessment_completed)
         self.assertFalse(repository.due("one", 5, self_repository=True).required)
         self.assertEqual(repository.due("two", 5).reason, "no_successful_assessment")
+        connection.execute(
+            "INSERT INTO execplan_catalog_revisions "
+            "(repo, revision_sha, catalog_fingerprint) VALUES ('one', ?, 'catalog')",
+            ("a" * 40,),
+        )
+        repository.initialize_file_assessment_start(
+            "one", source_sha="a" * 40, expected_merged_count=0,
+        )
         for number in range(1, 6):
             self._insert_plan(connection, "one", f"G-{number:03d}", "MERGED")
         periodic, started = repository.begin_assessment_if_due(
@@ -581,8 +608,7 @@ class MaintenanceStateRepositoryTest(unittest.TestCase):
 
         self.assertEqual(repository.due("one", 5).reason, "no_successful_assessment")
         self.assertEqual(repository.due("two", 5).reason, "no_successful_assessment")
-        cycle, created = repository.begin_assessment_if_due("one", 5, "a" * 40)
-        self.assertTrue(created)
+        cycle = self._start_legacy_assessment(connection, "one", "a" * 40)
         self.assertEqual(cycle.phase, maintenance_state.MaintenancePhase.ASSESSMENT)
         self.assertEqual(cycle.cycle_start_merged_count, 1)
 
@@ -796,7 +822,7 @@ class MaintenanceStateRepositoryTest(unittest.TestCase):
         for plan_id in ("G-010", "G-002", "G-003"):
             self._insert_plan(connection, "one", plan_id, "READY")
         repository = maintenance_state.MaintenanceRepository(connection)
-        cycle, _ = repository.begin_assessment_if_due("one", 5, "a" * 40)
+        cycle = self._start_legacy_assessment(connection, "one", "a" * 40)
         waiting = repository.transition(
             "one",
             expected_phase=maintenance_state.MaintenancePhase.ASSESSMENT,
@@ -839,7 +865,7 @@ class MaintenanceStateRepositoryTest(unittest.TestCase):
         connection = self._connection()
         self._insert_plan(connection, "one", "G-100", "READY")
         repository = maintenance_state.MaintenanceRepository(connection)
-        cycle, _ = repository.begin_assessment_if_due("one", 5, "a" * 40)
+        cycle = self._start_legacy_assessment(connection, "one", "a" * 40)
         refactoring = repository.transition(
             "one",
             expected_phase=maintenance_state.MaintenancePhase.ASSESSMENT,

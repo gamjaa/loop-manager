@@ -513,7 +513,11 @@ class MaintenancePlanningTest(unittest.TestCase):
         self.connection.execute(
             "INSERT INTO maintenance_cycles "
             "(repo, phase, cycle_base_sha, cycle_start_merged_count, revision) "
-            "VALUES (?, 'assessment', ?, 1, 1)",
+            "VALUES (?, 'assessment', ?, 1, 1) "
+            "ON CONFLICT(repo) DO UPDATE SET phase = 'assessment', "
+            "cycle_base_sha = excluded.cycle_base_sha, "
+            "cycle_start_merged_count = excluded.cycle_start_merged_count, "
+            "revision = maintenance_cycles.revision + 1",
             (str(self.repo), source_sha),
         )
         return maintenance_state.MaintenanceRepository(self.connection).get(
