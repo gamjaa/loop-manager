@@ -125,6 +125,8 @@ from maintenance_orchestration import (
 )
 import maintenance_git
 import maintenance_state
+import maintenance_file_review
+import maintenance_file_inventory
 import document_publication
 import scoped_blocking
 import agent_scope_decision
@@ -17593,6 +17595,7 @@ MAINTENANCE_RESULT: {{"outcome":"unsafe","reason":"구체적인 진단"}}
 당신은 Loop Manager의 유지보수 Planner다.
 AGENTS.md, 활성 PRODUCT와 Requirement, docs/ARCHITECTURE.md, docs/PLANS.md, 현재 코드·테스트 및 아래 compact catalog와 bounded 변경 문맥을 읽어라.
 책임·상태 전이·외부 연동의 혼합, 핵심 경로의 반복 변경 집중, 독립 테스트가 어려운 경계, 이름·제어 흐름·결합도, 오류 복구 경계, 중복 구현·불필요한 전역 가변 상태와 후속 변경 충돌을 함께 검토하라.
+assessment에서는 선정 파일의 원본을 실제로 읽는 파일별 단위와 동시에 책임·진입점·공개 심벌·직접 참조·관련 테스트 경로의 짧은 코드맵을 만든다. 아래 잠정 기록은 관계 확인 후보이지 성공 ledger가 아니다. 변경되지 않은 파일은 필요한 문맥으로만 읽고 검토 완료 대상으로 세지 마라. 인용과 source revision을 확인하고, 줄 수나 토큰 수만으로 분리를 강제하지 마라.
 
 compact catalog:
 {compact_catalog}
@@ -19662,6 +19665,42 @@ class _PlanningEventPorts:
         operation_print(message, file=sys.stderr)
 
 
+class _PlanningFileReviewPorts:
+    """Keep provisional file units outside the success ledger and Planner row."""
+
+    def __init__(self, connection: sqlite3.Connection):
+        self._repository = maintenance_file_review.ProvisionalReviewRepository(connection)
+
+    def progress(
+        self, repo: str, repository: Path, base: str, cycle_revision: int,
+        source_revision: str,
+    ) -> maintenance_file_review.FileReviewProgress:
+        inventory = maintenance_file_inventory.tracked_source_inventory(
+            repository, base, source_revision,
+        )
+        return self._repository.progress(
+            repo, repository, base, cycle_revision, inventory,
+        )
+
+    def content(self, repository: Path, base: str, source: maintenance_file_inventory.TrackedSource) -> bytes:
+        return maintenance_file_review.source_bytes(repository, base, source)
+
+    def start(self, repo: str, cycle_revision: int, source: maintenance_file_inventory.TrackedSource) -> None:
+        self._repository.start(repo, cycle_revision, source)
+
+    def session(self, repo: str, cycle_revision: int, source: maintenance_file_inventory.TrackedSource, session_id: str) -> None:
+        self._repository.session(repo, cycle_revision, source, session_id)
+
+    def complete(self, repo: str, cycle_revision: int, source: maintenance_file_inventory.TrackedSource, result: dict) -> None:
+        self._repository.complete(repo, cycle_revision, source, result)
+
+    def fail(self, repo: str, cycle_revision: int, source: maintenance_file_inventory.TrackedSource, error: str) -> None:
+        self._repository.fail(repo, cycle_revision, source, error)
+
+    def completed_summary(self, repo: str) -> dict:
+        return self._repository.completed_summary(repo)
+
+
 class _PlanningLifecyclePorts:
     """Concrete bootstrap bindings for the independent coordinator."""
 
@@ -19681,6 +19720,7 @@ class _PlanningLifecyclePorts:
         )
         self.agent = _PlanningAgentPorts(connection, context, planner_mutex)
         self.validation = _PlanningValidationPorts(connection)
+        self.file_review = _PlanningFileReviewPorts(connection)
         self.events = _PlanningEventPorts()
 
 

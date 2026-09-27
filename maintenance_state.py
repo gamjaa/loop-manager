@@ -12,6 +12,7 @@ from typing import Iterator, Sequence
 from uuid import uuid4
 
 import maintenance_file_ledger
+import maintenance_file_review
 
 
 class MaintenanceStateError(RuntimeError):
@@ -123,6 +124,7 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.execute(MAINTENANCE_SCHEMA)
     connection.execute(DOCUMENT_DRAFTS_SCHEMA)
     maintenance_file_ledger.ensure_schema(connection)
+    maintenance_file_review.ensure_schema(connection)
     columns = {
         str(row[1])
         for row in connection.execute("PRAGMA table_info(maintenance_cycles)")
