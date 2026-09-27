@@ -150,6 +150,51 @@ class ProvisionalFileReviewTest(unittest.TestCase):
                 with self.assertRaises(review.FileReviewError):
                     review.parse_review(review.RESULT_PREFIX + json.dumps(payload), source, content)
 
+    def test_empty_and_whitespace_sources_are_reviewed_and_resumed(self):
+        for content in (b"", b" \n\t"):
+            with self.subTest(content=content):
+                inventory = self.publish({"src/__init__.py": content})
+                selected = self.state(inventory)
+                source = selected.next_unit.source
+                self.assertEqual(source.path, "src/__init__.py")
+                self.assertEqual(review.source_bytes(self.repo, "main", source), content)
+                prompt = review.review_prompt(source, content)
+                self.assertIn('"bytes": ' + str(len(content)), prompt)
+                self.assertIn("excerpts는 []", prompt)
+                self.progress.start(str(self.repo), 1, source)
+                self.progress.session(str(self.repo), 1, source, "empty-review")
+                self.assertEqual(self.state(inventory).next_unit.session_id, "empty-review")
+                payload = result_for(source, "", content)
+                payload["evidence"]["excerpts"] = []
+                for key in payload["evidence"]:
+                    if key not in {"excerpts", "chunk_reviews"}:
+                        payload["evidence"][key] = "No executable code exists in this package marker."
+                payload["code_map"] = {
+                    "responsibility": "Package marker without executable statements.",
+                    "entry_points": [], "public_symbols": [],
+                    "direct_references": [], "related_tests": [],
+                }
+                parsed = review.parse_review(review.RESULT_PREFIX + json.dumps(payload), source, content)
+                self.progress.complete(str(self.repo), 1, source, parsed)
+                resumed = review.ProvisionalReviewRepository(self.connection).progress(
+                    str(self.repo), self.repo, "main", 1, inventory,
+                )
+                self.assertEqual(resumed.completed, (parsed,))
+                self.assertIsNone(resumed.next_unit)
+                self.assertEqual(self.ledger.reviews(str(self.repo)), ())
+                self.assertIsNone(self.ledger.last_success(str(self.repo)))
+                for field in ("excerpts", "public_symbols", "readability"):
+                    with self.subTest(forged=field):
+                        forged = json.loads(json.dumps(payload))
+                        if field == "excerpts":
+                            forged["evidence"][field] = ["def imaginary(): pass"]
+                        elif field == "public_symbols":
+                            forged["code_map"][field] = ["imaginary"]
+                        else:
+                            forged["evidence"][field] = ""
+                        with self.assertRaises(review.FileReviewError):
+                            review.parse_review(review.RESULT_PREFIX + json.dumps(forged), source, content)
+
     def test_non_utf8_source_has_byte_preserving_prompt_and_review(self):
         content = b"def calculate(): return '\xff'\n"
         inventory = self.publish({"src/calc.py": content})

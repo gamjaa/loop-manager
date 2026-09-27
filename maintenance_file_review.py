@@ -239,8 +239,8 @@ def parse_review(output: str, source: TrackedSource, content: bytes) -> dict:
         "chunk_reviews",
     }:
         raise FileReviewError("파일별 검토 근거가 누락됐습니다.")
-    excerpts = _strings(evidence["excerpts"], "코드 인용", required=True)
-    if not text.strip() or any(excerpt not in text for excerpt in excerpts):
+    excerpts = _strings(evidence["excerpts"], "코드 인용", required=bool(text.strip()))
+    if (not text.strip() and excerpts) or any(excerpt not in text for excerpt in excerpts):
         raise FileReviewError("빈 원본 또는 원본에 없는 코드 인용은 검토로 인정할 수 없습니다.")
     if len(text.strip()) >= 8 and all(len(excerpt) < 8 for excerpt in excerpts):
         raise FileReviewError("코드 인용이 실제 검토 근거로 사용하기에 너무 짧습니다.")
@@ -279,8 +279,6 @@ def parse_review(output: str, source: TrackedSource, content: bytes) -> dict:
 def review_prompt(source: TrackedSource, content: bytes) -> str:
     """Give the Agent the exact blob for a bounded, single-file review unit."""
     text = _source_text(content)
-    if not text.strip():
-        raise FileReviewError("빈 source는 근거 있는 파일 검토를 만들 수 없습니다.")
     source_location = json.dumps({
         "source_revision": source.revision, "path": source.path,
         "content_hash": source.content_hash, "mode": source.mode,
@@ -302,6 +300,14 @@ def review_prompt(source: TrackedSource, content: bytes) -> str:
             f"i=int(sys.argv[2]); n={MAX_EMBEDDED_SOURCE_BYTES}; "
             "print(b[i*n:(i+1)*n].decode(\"utf-8\",\"backslashreplace\"),end=\"\")' "
             f"{spec} INDEX\n"
+        )
+    if not text.strip():
+        source_instruction += (
+            "검증된 원본은 0 byte이거나 공백만 포함한다. excerpts는 []로 기록하고 "
+            "각 평가 항목과 code_map.responsibility에 실행 코드가 없는 사실과 "
+            "경로에서 확인할 수 있는 역할을 설명하라. 심벌·직접 참조를 만들어내지 마라. "
+            "0 byte이면 chunk_reviews도 []이며, 공백 byte가 있으면 모든 구간의 "
+            "지문과 공백 인용 및 검토 근거를 기록하라.\n"
         )
     return (
         "당신은 유지보수 Planner다. 아래 Git blob 원본 파일 하나를 실제로 읽고 검토하라. "
