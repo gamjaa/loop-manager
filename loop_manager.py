@@ -16907,15 +16907,6 @@ def resume_plan_blocks(
     for blocked in plan_blocked_execplans(connection, repo):
         if blocked["blocked_reason"] == PR_CLOSED_BLOCK_REASON:
             continue
-        if blocked["blocked_reason"] == BlockReasonCode.REVIEW_RETRY_EXHAUSTED.value:
-            hydrate_execplan_project(connection, repo, blocked)
-            if _resume_legacy_review_count_block(
-                connection, repo_path, state_dir, repo, blocked,
-            ):
-                return True
-            with connection:
-                _clear_active_in_current_transaction(connection, repo)
-            continue
         checkpoint_row = connection.execute(
             "SELECT * FROM blocked_checkpoints "
             "WHERE repo = ? AND plan_id = ?",
@@ -16943,6 +16934,21 @@ def resume_plan_blocks(
                 continue
             if remote_result == "resumed":
                 return True
+        else:
+            remote_result = None
+        if blocked["blocked_reason"] == BlockReasonCode.REVIEW_RETRY_EXHAUSTED.value:
+            # A changed published checkpoint needs the existing remote cause
+            # and ownership review. Only an unchanged (or absent) checkpoint
+            # can use the count-only legacy release path.
+            if remote_result in {None, "unchanged"}:
+                hydrate_execplan_project(connection, repo, blocked)
+                if _resume_legacy_review_count_block(
+                    connection, repo_path, state_dir, repo, blocked,
+                ):
+                    return True
+            with connection:
+                _clear_active_in_current_transaction(connection, repo)
+            continue
         if blocked["blocked_reason"] == BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT.value:
             old_timeout = int(blocked["blocked_fingerprint"])
             new_timeout = (

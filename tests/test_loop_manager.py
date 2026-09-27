@@ -5476,7 +5476,9 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             [1, 1, 1, 4],
         )
 
-    def test_validation_block_uses_base_and_worktree_fingerprints_across_rebase(self):
+    def test_legacy_review_block_uses_base_and_worktree_fingerprints_across_rebase(self):
+        import runtime_state
+
         with tempfile.TemporaryDirectory() as directory:
             repo, state_dir, connection = self._active_worker_project(directory)
             loop_manager.migrate_legacy_execplans(
@@ -5531,11 +5533,44 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                 "ISSUE_ID: docs/PLANS.md::stable-contract::blocking\n"
                 "Contract is still missing.\nVERDICT: FAIL"
             )
+
+            def record_legacy_review_block() -> None:
+                active = connection.execute(
+                    "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+                    (str(repo),),
+                ).fetchone()
+                blocked_input, blocked_worktree_input = (
+                    loop_manager._blocked_validation_input_fingerprints(
+                        connection, repo, str(repo), worktree, active,
+                    )
+                )
+                blocked_revision = loop_manager._blocked_validation_base_revision(
+                    connection, str(repo), active,
+                )
+                runtime_state.RuntimeStateRepository(connection).block_plan(
+                    str(repo), "G-001", reason_code="review_retry_exhausted",
+                    evidence=output, release_fingerprint=blocked_input,
+                    plan_values={
+                        "blocked_fingerprint": blocked_input,
+                        "blocked_worktree_fingerprint": blocked_worktree_input,
+                        "blocked_review_fingerprint": (
+                            loop_manager._revision_review_issue_fingerprint(
+                                repo, blocked_revision, output,
+                            )
+                        ),
+                        "agent_result_snapshot": (
+                            loop_manager.capture_git_snapshot(worktree).serialize()
+                        ),
+                    },
+                    clear_projection=True,
+                )
+
             for _ in range(4):
                 decision = loop_manager.transition_validation_failure(
                     connection, str(repo), worktree, "review", output
                 )
-            self.assertTrue(decision.blocked)
+            self.assertFalse(decision.blocked)
+            record_legacy_review_block()
 
             blocked = connection.execute(
                 "SELECT * FROM exec_plans "
@@ -5655,9 +5690,11 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                     ),
                 )
             for _ in range(4):
-                loop_manager.transition_validation_failure(
+                decision = loop_manager.transition_validation_failure(
                     connection, str(repo), worktree, "review", output
                 )
+            self.assertFalse(decision.blocked)
+            record_legacy_review_block()
             refreshed = connection.execute(
                 "SELECT * FROM exec_plans "
                 "WHERE repo = ? AND plan_id = 'G-001'",
@@ -16506,6 +16543,7 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
             connections: list[sqlite3.Connection] = []
             thread_ids: set[int] = set()
             planner_mutex_ids: set[int] = set()
+            external_run_ids: set[str] = set()
             active_workers = 0
             maximum_workers = 0
             active_planners = 0
@@ -16524,6 +16562,7 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
                 refactoring_review_interval,
                 verify_timeout_seconds,
                 on_step_completed,
+                external_run_id,
             ):
                 nonlocal active_workers, maximum_workers
                 nonlocal active_planners, maximum_planners
@@ -16537,10 +16576,12 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
                     verify_timeout_seconds,
                     config.verify_timeout_seconds,
                 )
+                self.assertTrue(external_run_id)
                 with guard:
                     connections.append(worker_connection)
                     thread_ids.add(threading.get_ident())
                     planner_mutex_ids.add(id(planner_mutex))
+                    external_run_ids.add(external_run_id)
                     active_workers += 1
                     maximum_workers = max(maximum_workers, active_workers)
                     if active_workers == config.max_workers:
@@ -16587,6 +16628,7 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
 
         self.assertEqual(tuple(item.repo for item in outcomes), repos)
         self.assertEqual(maximum_workers, config.max_workers)
+        self.assertEqual(len(external_run_ids), 1)
         self.assertGreaterEqual(len(thread_ids), 2)
         self.assertEqual(maximum_planners, 1)
         self.assertEqual(len(planner_mutex_ids), 1)

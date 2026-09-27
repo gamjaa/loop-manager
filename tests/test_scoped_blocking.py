@@ -18,6 +18,35 @@ from scoped_blocking import BlockReasonCode, BlockScope
 
 
 class ScopedBlockingTest(unittest.TestCase):
+    def test_published_review_checkpoint_reconciles_before_legacy_count_release(self):
+        self.plan('G-001', 'IMPLEMENTING', branch='loop-manager/G-001')
+        loop_manager.runtime_state.RuntimeStateRepository(self.connection).block_plan(
+            self.repo, 'G-001', reason_code='review_retry_exhausted',
+            evidence='prior issue', release_fingerprint='prior-input',
+            clear_projection=True,
+        )
+        checkpoint = blocked_checkpoint_state.BlockedCheckpointRepository(
+            self.connection,
+        )
+        checkpoint.finish_published(checkpoint.get(self.repo, 'G-001'), 'published-oid')
+
+        with (
+            mock.patch.object(loop_manager, '_reconcile_published_blocked_checkpoint',
+                              return_value='blocked') as reconcile,
+            mock.patch.object(loop_manager, '_resume_legacy_review_count_block',
+                              return_value=True) as release,
+        ):
+            self.assertFalse(loop_manager.resume_plan_blocks(
+                self.connection, Path(self.repo), Path('/state'), self.repo, 'main',
+            ))
+            reconcile.assert_called_once()
+            release.assert_not_called()
+            reconcile.return_value = 'unchanged'
+            self.assertTrue(loop_manager.resume_plan_blocks(
+                self.connection, Path(self.repo), Path('/state'), self.repo, 'main',
+            ))
+            release.assert_called_once()
+
     def test_legacy_review_count_block_releases_only_owned_non_rebase_workspace(self):
         with tempfile.TemporaryDirectory() as directory:
             worktree = Path(directory)
