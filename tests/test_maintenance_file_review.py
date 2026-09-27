@@ -11,7 +11,20 @@ import maintenance_file_review as review
 import maintenance_file_ledger
 
 
-def result_for(source, excerpt):
+def result_for(source, excerpt, content):
+    chunk_reviews = []
+    for index, start in enumerate(range(0, len(content), review.MAX_EMBEDDED_SOURCE_BYTES)):
+        end = min(start + review.MAX_EMBEDDED_SOURCE_BYTES, len(content))
+        rendered = content[start:end].decode("utf-8", "backslashreplace")
+        middle_start = max(0, len(rendered) // 2 - 128)
+        chunk_reviews.append({
+            "index": index, "start": start, "end": end,
+            "chunk_hash": hashlib.sha256(content[start:end]).hexdigest(),
+            "opening_excerpt": rendered[:16],
+            "middle_excerpt": rendered[middle_start:middle_start + 16],
+            "closing_excerpt": rendered[-16:],
+            "review": "This segment begins with " + rendered[:16] + " and continues its responsibility.",
+        })
     return {
         "path": source.path,
         "content_hash": source.content_hash,
@@ -25,6 +38,7 @@ def result_for(source, excerpt):
             "test_boundary": "The function can be tested through its return value.",
             "duplication": "No duplicate implementation was found in this file.",
             "change_context": "The narrow function keeps unrelated code out of later work.",
+            "chunk_reviews": chunk_reviews,
         },
         "code_map": {
             "responsibility": "Calculate the input value for callers.",
@@ -45,7 +59,7 @@ class ProvisionalFileReviewTest(unittest.TestCase):
             "src/calc.py", hashlib.sha256(content).hexdigest(), "100644",
             "a" * 40, "source",
         )
-        payload = result_for(source, "def calculate(): return helper()")
+        payload = result_for(source, "def calculate(): return helper()", content)
         payload["code_map"]["direct_references"] = [
             {"target_path": "src/helper.py", "symbol": "helper", "evidence": "helper()"},
         ]
@@ -71,9 +85,49 @@ class ProvisionalFileReviewTest(unittest.TestCase):
             "a" * 40, "source",
         )
         prompt = review.review_prompt(source, content)
-        self.assertIn("git show " + source.revision + ":" + source.path, prompt)
+        self.assertIn(source.revision + ":" + source.path, prompt)
         self.assertIn("작은 연속 구간", prompt)
         self.assertNotIn("원본 시작", prompt)
+        payload = result_for(source, "def calculate(): return 1", content)
+        self.assertEqual(len(payload["evidence"]["chunk_reviews"]), 2)
+        review.parse_review(review.RESULT_PREFIX + json.dumps(payload), source, content)
+        payload["evidence"]["chunk_reviews"].pop()
+        with self.assertRaisesRegex(review.FileReviewError, "모든 검토 구간"):
+            review.parse_review(review.RESULT_PREFIX + json.dumps(payload), source, content)
+        payload = result_for(source, "def calculate(): return 1", content)
+        payload["evidence"]["chunk_reviews"][1]["middle_excerpt"] = "not in source"
+        with self.assertRaisesRegex(review.FileReviewError, "중간"):
+            review.parse_review(review.RESULT_PREFIX + json.dumps(payload), source, content)
+
+    def test_non_utf8_source_has_byte_preserving_prompt_and_review(self):
+        content = b"def calculate(): return '\xff'\n"
+        inventory = self.publish({"src/calc.py": content})
+        source = inventory.sources[0]
+        self.assertEqual(review.source_bytes(self.repo, "main", source), content)
+        prompt = review.review_prompt(source, content)
+        self.assertIn("\\xff", prompt)
+        payload = result_for(source, "def calculate(): return '\\xff'", content)
+        parsed = review.parse_review(
+            review.RESULT_PREFIX + json.dumps(payload), source, content,
+        )
+        self.progress.start(str(self.repo), 1, source)
+        self.progress.complete(str(self.repo), 1, source, parsed)
+        self.assertEqual(self.state(inventory).completed, (parsed,))
+
+    def test_incomplete_large_result_cannot_resume_as_completed(self):
+        content = b"def calculate(): return 1\n" * 3000
+        inventory = self.publish({"src/calc.py": content})
+        source = inventory.sources[0]
+        payload = result_for(source, "def calculate(): return 1", content)
+        payload["evidence"]["chunk_reviews"].pop()
+        self.progress.start(str(self.repo), 1, source)
+        self.progress.complete(str(self.repo), 1, source, payload)
+
+        resumed = self.state(inventory)
+
+        self.assertEqual(resumed.completed, ())
+        self.assertEqual(resumed.next_unit.source, source)
+        self.assertIsNone(self.ledger.last_success(str(self.repo)))
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -104,7 +158,10 @@ class ProvisionalFileReviewTest(unittest.TestCase):
         for path, content in files.items():
             target = self.repo / path
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
+            if isinstance(content, bytes):
+                target.write_bytes(content)
+            else:
+                target.write_text(content, encoding="utf-8")
         self.git("add", "-A")
         self.git("commit", "-m", "source")
         revision = self.git("rev-parse", "HEAD")
@@ -120,7 +177,7 @@ class ProvisionalFileReviewTest(unittest.TestCase):
 
     def finish(self, source):
         content = review.source_bytes(self.repo, "main", source)
-        payload = result_for(source, content.decode().strip())
+        payload = result_for(source, content.decode().strip(), content)
         parsed = review.parse_review(
             review.RESULT_PREFIX + json.dumps(payload), source, content,
         )
@@ -160,7 +217,7 @@ class ProvisionalFileReviewTest(unittest.TestCase):
         inventory = self.publish({"src/a.py": "def calculate(): return 1\n"})
         source = inventory.sources[0]
         content = review.source_bytes(self.repo, "main", source)
-        payload = result_for(source, "not in source")
+        payload = result_for(source, "not in source", content)
         with self.assertRaisesRegex(review.FileReviewError, "인용"):
             review.parse_review(review.RESULT_PREFIX + json.dumps(payload), source, content)
         payload["evidence"]["excerpts"] = ["def calculate(): return 1"]

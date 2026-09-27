@@ -432,7 +432,7 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         ports.agent.result = PlanningAgentResult(
             0,
             maintenance_file_review.RESULT_PREFIX + json.dumps(
-                result_for(source, "def calculate(): return 1")
+                result_for(source, "def calculate(): return 1", content)
             ),
             "saved-session", PlanningAgentResultKind.SUCCESS,
         )

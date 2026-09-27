@@ -157,6 +157,59 @@ def source_bytes(repository: Path, base: str, source: TrackedSource) -> bytes:
     return content
 
 
+def _source_text(content: bytes) -> str:
+    """Render arbitrary NUL-free source bytes without losing their identity."""
+    return content.decode("utf-8", "backslashreplace")
+
+
+def _chunk_spans(content: bytes) -> tuple[tuple[int, int], ...]:
+    return tuple(
+        (start, min(start + MAX_EMBEDDED_SOURCE_BYTES, len(content)))
+        for start in range(0, len(content), MAX_EMBEDDED_SOURCE_BYTES)
+    )
+
+
+def _validate_chunk_reviews(value: object, content: bytes) -> list[dict]:
+    """Require separately grounded evidence for every deterministic byte span."""
+    spans = _chunk_spans(content)
+    if not isinstance(value, list) or len(value) != len(spans):
+        raise FileReviewError("원본의 모든 검토 구간에 대한 근거가 필요합니다.")
+    normalized = []
+    for index, ((start, end), item) in enumerate(zip(spans, value)):
+        if not isinstance(item, dict) or set(item) != {
+            "index", "start", "end", "chunk_hash", "opening_excerpt",
+            "middle_excerpt", "closing_excerpt", "review",
+        }:
+            raise FileReviewError("검토 구간의 결과 형식이 유효하지 않습니다.")
+        if (type(item["index"]) is not int or item["index"] != index
+            or type(item["start"]) is not int or item["start"] != start
+            or type(item["end"]) is not int or item["end"] != end):
+            raise FileReviewError("검토 구간이 누락되거나 source byte 범위와 다릅니다.")
+        rendered = _source_text(content[start:end])
+        middle_start = max(0, len(rendered) // 2 - 128)
+        middle_end = min(len(rendered), len(rendered) // 2 + 128)
+        opening = item["opening_excerpt"]
+        middle = item["middle_excerpt"]
+        closing = item["closing_excerpt"]
+        if (item["chunk_hash"] != hashlib.sha256(content[start:end]).hexdigest()
+            or not isinstance(opening, str) or not opening or len(opening) > MAX_FIELD_CHARS
+            or not isinstance(middle, str) or not middle or len(middle) > MAX_FIELD_CHARS
+            or not isinstance(closing, str) or not closing or len(closing) > MAX_FIELD_CHARS
+            or opening not in rendered[:256]
+            or middle not in rendered[middle_start:middle_end]
+            or closing not in rendered[-256:]):
+            raise FileReviewError("검토 구간의 지문 또는 시작·중간·끝 인용이 원본과 다릅니다.")
+        note = _string(item["review"], "구간별 검토 근거", minimum=20)
+        if not any(anchor in note for anchor in (opening, middle, closing)):
+            raise FileReviewError("구간별 검토 근거가 원본 인용과 연결되지 않았습니다.")
+        normalized.append({
+            "index": index, "start": start, "end": end,
+            "chunk_hash": item["chunk_hash"], "opening_excerpt": opening,
+            "middle_excerpt": middle, "closing_excerpt": closing, "review": note,
+        })
+    return normalized
+
+
 def parse_review(output: str, source: TrackedSource, content: bytes) -> dict:
     """Validate a single Agent result against content actually read from Git."""
     lines = [line[len(RESULT_PREFIX):] for line in output.splitlines()
@@ -179,14 +232,12 @@ def parse_review(output: str, source: TrackedSource, content: bytes) -> dict:
         source.path, source.content_hash, source.mode, source.revision,
     ):
         raise FileReviewError("검토 결과의 source identity가 선정 파일과 다릅니다.")
-    try:
-        text = content.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise FileReviewError("UTF-8이 아닌 source를 검토 근거와 대조할 수 없습니다.") from error
+    text = _source_text(content)
     evidence = result["evidence"]
     if not isinstance(evidence, dict) or set(evidence) != {
         "excerpts", "readability", "responsibility_and_integration",
         "error_recovery", "test_boundary", "duplication", "change_context",
+        "chunk_reviews",
     }:
         raise FileReviewError("파일별 검토 근거가 누락됐습니다.")
     excerpts = _strings(evidence["excerpts"], "코드 인용", required=True)
@@ -194,7 +245,10 @@ def parse_review(output: str, source: TrackedSource, content: bytes) -> dict:
         raise FileReviewError("빈 원본 또는 원본에 없는 코드 인용은 검토로 인정할 수 없습니다.")
     if len(text.strip()) >= 8 and all(len(excerpt) < 8 for excerpt in excerpts):
         raise FileReviewError("코드 인용이 실제 검토 근거로 사용하기에 너무 짧습니다.")
-    for key in set(evidence) - {"excerpts"}:
+    evidence["chunk_reviews"] = _validate_chunk_reviews(
+        evidence["chunk_reviews"], content,
+    )
+    for key in set(evidence) - {"excerpts", "chunk_reviews"}:
         _string(evidence[key], key, minimum=12)
     code_map = result["code_map"]
     if not isinstance(code_map, dict) or set(code_map) != {
@@ -225,26 +279,30 @@ def parse_review(output: str, source: TrackedSource, content: bytes) -> dict:
 
 def review_prompt(source: TrackedSource, content: bytes) -> str:
     """Give the Agent the exact blob for a bounded, single-file review unit."""
-    try:
-        text = content.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise FileReviewError("UTF-8이 아닌 source는 이 검토 단위로 읽을 수 없습니다.") from error
+    text = _source_text(content)
     if not text.strip():
         raise FileReviewError("빈 source는 근거 있는 파일 검토를 만들 수 없습니다.")
     source_location = json.dumps({
         "source_revision": source.revision, "path": source.path,
         "content_hash": source.content_hash, "mode": source.mode,
         "bytes": len(content),
+        "chunk_bytes": MAX_EMBEDDED_SOURCE_BYTES,
+        "chunk_count": len(_chunk_spans(content)),
     }, ensure_ascii=False)
     if len(content) <= MAX_EMBEDDED_SOURCE_BYTES:
         source_instruction = "원본 시작\n" + text + "\n원본 끝\n"
     else:
         spec = shlex.quote(f"{source.revision}:{source.path}")
         source_instruction = (
-            "이 파일은 prompt에 모두 넣기에는 크다. 아래 명령의 Git blob을 "
-            "작은 연속 구간으로 나누어 끝까지 읽고 각 구간의 책임을 확인하라. "
+            "이 파일은 prompt에 모두 넣기에는 크다. INDEX를 0부터 "
+            f"{len(_chunk_spans(content)) - 1}까지 바꾸어 각 Git blob 구간을 "
+            "작은 연속 구간으로 끝까지 읽어라. 비 UTF-8 byte는 \\xNN으로 표시된다. "
             "미확인 구간이 남으면 완료 JSON을 만들지 마라.\n"
-            f"git show {spec}\n"
+            "python3 -c 'import subprocess,sys; "
+            "b=subprocess.check_output([\"git\",\"show\",sys.argv[1]]); "
+            f"i=int(sys.argv[2]); n={MAX_EMBEDDED_SOURCE_BYTES}; "
+            "print(b[i*n:(i+1)*n].decode(\"utf-8\",\"backslashreplace\"),end=\"\")' "
+            f"{spec} INDEX\n"
         )
     return (
         "당신은 유지보수 Planner다. 아래 Git blob 원본 파일 하나를 실제로 읽고 검토하라. "
@@ -258,7 +316,12 @@ def review_prompt(source: TrackedSource, content: bytes) -> str:
         "필수 필드: path, content_hash, mode, source_revision, "
         "evidence={excerpts:[원본의 정확한 인용], readability, "
         "responsibility_and_integration, error_recovery, test_boundary, "
-        "duplication, change_context}, code_map={responsibility, entry_points:[], "
+        "duplication, change_context, chunk_reviews:[각 구간마다 순서대로 "
+        "{index, start, end, chunk_hash:해당 byte 구간 SHA256, "
+        "opening_excerpt, middle_excerpt, closing_excerpt, review}]}, "
+        "각 구간의 byte 범위는 index*chunk_bytes부터 다음 경계까지이며 "
+        "시작·중간·끝 인용과 그중 하나를 직접 언급하는 구체적인 review가 모두 필요하다. "
+        "code_map={responsibility, entry_points:[], "
         "public_symbols:[], direct_references:[{target_path:null|상대경로, "
         "symbol:null|심벌, evidence:원본의 정확한 인용}], related_tests:[]}, "
         "pending_references:[같은 참조 객체], "
