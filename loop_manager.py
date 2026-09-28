@@ -21763,13 +21763,18 @@ def _handoff_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess
     timeout = options.pop("timeout", None)
     if input_data is not None:
         options["stdin"] = subprocess.PIPE
-    process = gate.popen(*args, **options)
-    try:
-        stdout, stderr = process.communicate(input_data, timeout=timeout)
-    except subprocess.TimeoutExpired as error:
-        process.kill()
-        stdout, stderr = process.communicate()
-        raise subprocess.TimeoutExpired(error.cmd, error.timeout, stdout, stderr) from error
+    with gate.popen(*args, **options) as process:
+        try:
+            stdout, stderr = process.communicate(input_data, timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            process.kill()
+            stdout, stderr = process.communicate()
+            raise subprocess.TimeoutExpired(error.cmd, error.timeout, stdout, stderr) from error
+        except BaseException:
+            # Match subprocess.run: stop the child before the context manager
+            # closes its pipes and waits, including on KeyboardInterrupt.
+            process.kill()
+            raise
     return subprocess.CompletedProcess(args[0], process.returncode, stdout, stderr)
 
 

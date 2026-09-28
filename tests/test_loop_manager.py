@@ -16901,6 +16901,34 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                 self.assertEqual(self._source_checkout_snapshot(repo), source_before)
 
 class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
+    def test_handoff_run_reaps_child_and_closes_pipes_on_interruption(self):
+        for error in (KeyboardInterrupt(), RuntimeError("communication failed")):
+            with self.subTest(error=type(error).__name__):
+                gate = loop_manager.RuntimeHandoffGate(threading.Event(), threading.Lock())
+                token = loop_manager._runtime_handoff_signal.set(gate)
+                process = subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(60)"],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                try:
+                    with mock.patch.object(
+                        loop_manager.RuntimeHandoffGate, "popen", return_value=process,
+                    ), mock.patch.object(process, "communicate", side_effect=error):
+                        with self.assertRaises(type(error)) as raised:
+                            loop_manager._handoff_run(["agent"], input=b"prompt")
+                    self.assertIs(raised.exception, error)
+                    self.assertIsNotNone(process.returncode)
+                    self.assertIsNotNone(process.poll())
+                    for pipe in (process.stdin, process.stdout, process.stderr):
+                        self.assertTrue(pipe.closed)
+                finally:
+                    loop_manager._runtime_handoff_signal.reset(token)
+                    if process.poll() is None:
+                        process.kill()
+                    process.wait()
+                    for pipe in (process.stdin, process.stdout, process.stderr):
+                        pipe.close()
+
     def test_handoff_launch_gate_allows_concurrent_running_agents(self):
         gate = loop_manager.RuntimeHandoffGate(threading.Event(), threading.Lock())
         both_started = threading.Event()
@@ -16911,6 +16939,12 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
 
         class Process:
             returncode = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
 
             def communicate(self, _input, *, timeout):
                 self_test.assertTrue(release.wait(timeout=2))
