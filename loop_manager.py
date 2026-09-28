@@ -4213,7 +4213,7 @@ def _apply_general_planning_batch(
     snapshot = result.mutable_snapshot
     if snapshot is None or snapshot.repo != repo:
         raise PlannerValidationError("general planning snapshot 대상이 다릅니다.")
-    with connection:
+    with runtime_state._transaction(connection):
         intent = general_planning_publication(connection, repo)
         if intent is None:
             if _general_planning_batch_already_applied(
@@ -4505,7 +4505,7 @@ def recover_general_planning_batch(
         raise PlannerValidationError(
             "general planning publication base가 origin/base 이력에 없습니다."
         )
-    with connection:
+    with runtime_state._transaction(connection):
         connection.execute(
             "DELETE FROM general_planning_publications WHERE repo = ?", (repo,)
         )
@@ -5142,7 +5142,7 @@ def restart_stale_maintenance_publication(
     }
     if any(base_tree.get(path) != remote_tree.get(path) for path in batch_paths):
         raise MaintenancePlanningError("원격 파일이 보존된 batch와 겹쳐 재시작할 수 없습니다.")
-    with connection:
+    with runtime_state._transaction(connection):
         restarted = repository.restart_prepared_batch(
             repo, expected=cycle, new_base_sha=remote
         )

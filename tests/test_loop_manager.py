@@ -2991,6 +2991,109 @@ class LoopManagerTest(unittest.TestCase):
             self.assertIn(str(preserved_worktree), stderr.getvalue())
             planner.assert_not_called()
 
+    def test_unowned_failed_planning_workspace_survives_restarts_and_base_only_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            state_dir = Path(directory) / "state"
+            database = Path(directory) / "state.sqlite"
+            fingerprint = loop_manager.planning_input_fingerprint(repo, "main")
+            project_id = hashlib.sha256(str(repo).encode()).hexdigest()[:16]
+            worktree = state_dir / "worktrees" / project_id / "planning" / fingerprint
+            worktree.parent.mkdir(parents=True)
+            git_command(repo, "worktree", "add", "--detach", str(worktree), "origin/main")
+            marker = worktree / "saved.txt"
+            marker.write_text("preserve planning output\n", encoding="utf-8")
+            git_command(worktree, "add", "saved.txt")
+            saved_head = git_command(worktree, "rev-parse", "HEAD")
+            saved_index = git_command(worktree, "ls-files", "--stage")
+            connection = sqlite3.connect(database)
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                "INSERT INTO projects (repo, base_branch, phase, active_sha, "
+                "worktree, planning_attempt_fingerprint, planning_workspace_owned, "
+                "planning_error, planning_error_fingerprint, planner_session_id, "
+                "planning_validation_error) "
+                "VALUES (?, 'main', 'PLANNING', ?, ?, ?, 0, ?, ?, ?, ?)",
+                (str(repo), saved_head, str(worktree), fingerprint,
+                 "saved ownership failure", fingerprint, "saved-session",
+                 "saved diagnostics"),
+            )
+            connection.commit()
+            (repo / "docs/notes.md").write_text("# updated note\n", encoding="utf-8")
+            commit_and_push(repo, "Advance base without planning input change")
+            self.assertEqual(loop_manager.planning_input_fingerprint(repo, "main"),
+                             fingerprint)
+            saved_registration = git_command(repo, "worktree", "list", "--porcelain")
+
+            with mock.patch("loop_manager.validate_repository", return_value=repo), \
+                    mock.patch("loop_manager.remote_base", return_value="main"), \
+                    mock.patch("loop_manager.run_codex") as planner:
+                for attempt in range(4):
+                    if attempt == 2:
+                        connection.close()
+                        connection = sqlite3.connect(database)
+                        connection.row_factory = sqlite3.Row
+                    self.assertEqual(loop_manager.run_project(
+                        connection, state_dir, str(repo), Path("unused.ini"),
+                        "main", False,
+                    ), 1)
+                    row = connection.execute(
+                        "SELECT planning_error, planning_error_fingerprint, worktree, "
+                        "planning_workspace_owned, planner_session_id, "
+                        "planning_validation_error FROM projects WHERE repo = ?",
+                        (str(repo),),
+                    ).fetchone()
+                    self.assertEqual(tuple(row), (
+                        "saved ownership failure", fingerprint, str(worktree), 0,
+                        "saved-session", "saved diagnostics",
+                    ))
+                planner.assert_not_called()
+            self.assertEqual(git_command(worktree, "rev-parse", "HEAD"), saved_head)
+            self.assertEqual(git_command(worktree, "ls-files", "--stage"), saved_index)
+            self.assertEqual(git_command(repo, "worktree", "list", "--porcelain"),
+                             saved_registration)
+            self.assertEqual(marker.read_text(encoding="utf-8"),
+                             "preserve planning output\n")
+            connection.close()
+
+    def test_general_publication_restart_can_roll_back_with_cleanup_failure(self):
+        connection = sqlite3.connect(":memory:")
+        connection.execute(
+            "CREATE TABLE general_planning_publications (repo TEXT PRIMARY KEY)"
+        )
+        connection.execute(
+            "INSERT INTO general_planning_publications (repo) VALUES ('/repo')"
+        )
+        connection.commit()
+        intent = SimpleNamespace(
+            manifest="manifest", snapshot_token="token", commit_sha="commit",
+            base_sha="base",
+        )
+        result = SimpleNamespace(mutable_snapshot=SimpleNamespace(token="token"))
+        remote = SimpleNamespace(stdout="remote\n")
+        with mock.patch("loop_manager.general_planning_publication", return_value=intent), \
+                mock.patch("loop_manager._planning_result_from_manifest",
+                           return_value=result), \
+                mock.patch("loop_manager._validate_general_planning_commit"), \
+                mock.patch("loop_manager.git", return_value=remote), \
+                mock.patch("loop_manager._git_commit_is_ancestor",
+                           side_effect=(False, True)), \
+                mock.patch("loop_manager._clear_active_in_current_transaction"):
+            with self.assertRaisesRegex(RuntimeError, "cleanup failed"):
+                with loop_manager.runtime_state._transaction(connection):
+                    self.assertEqual(loop_manager.recover_general_planning_batch(
+                        connection, "/repo", Path("/planning"), "main"
+                    ), "restart")
+                    self.assertIsNone(connection.execute(
+                        "SELECT repo FROM general_planning_publications"
+                    ).fetchone())
+                    raise RuntimeError("cleanup failed")
+        self.assertEqual(connection.execute(
+            "SELECT repo FROM general_planning_publications"
+        ).fetchone()[0], "/repo")
+        connection.close()
+
     def test_changed_remote_input_restarts_failed_planning_from_latest_origin(self):
         seen_source_contents = []
 
@@ -12033,7 +12136,8 @@ class WorkspaceRecoveryTest(unittest.TestCase):
                 )
 
             project = connection.execute(
-                "SELECT phase, planning_error, planning_workspace_owned "
+                "SELECT phase, planning_error, planning_error_fingerprint, "
+                "planning_workspace_owned "
                 "FROM projects WHERE repo = ?",
                 (str(repo),),
             ).fetchone()
@@ -12075,14 +12179,20 @@ class WorkspaceRecoveryTest(unittest.TestCase):
                 )
 
             resumed = connection.execute(
-                "SELECT planning_error, planning_workspace_owned "
+                "SELECT planning_error, planning_error_fingerprint, "
+                "planning_workspace_owned, last_error "
                 "FROM projects WHERE repo = ?",
                 (str(repo),),
             ).fetchone()
             self.assertEqual(resumed_result, 1)
+            self.assertEqual(resumed["planning_error"], project["planning_error"])
+            self.assertEqual(
+                resumed["planning_error_fingerprint"],
+                project["planning_error_fingerprint"],
+            )
             self.assertIn(
                 "planning worktree의 Loop Manager 소유권이 확인되지 않았습니다",
-                resumed["planning_error"],
+                resumed["last_error"],
             )
             self.assertEqual(resumed["planning_workspace_owned"], 0)
             self.assertEqual(marker.read_text(encoding="utf-8"), "preserve me\n")

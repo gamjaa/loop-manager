@@ -38,6 +38,53 @@ def git(repo: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
+class MaintenancePublicationTransactionTest(unittest.TestCase):
+    def test_stale_publication_restart_rolls_back_if_workspace_cleanup_fails(self):
+        connection = sqlite3.connect(":memory:")
+        connection.execute("CREATE TABLE marker (value TEXT)")
+        connection.execute("INSERT INTO marker (value) VALUES ('preserved')")
+        connection.commit()
+        cycle = SimpleNamespace(
+            publication_stage="prepared",
+            publication_base_sha="base",
+            publication_commit_sha="plan-commit",
+            publication_remote_oid=None,
+        )
+
+        class Repository:
+            def get(self, _repo):
+                return cycle
+
+            def restart_prepared_batch(self, _repo, *, expected, new_base_sha):
+                if expected is not cycle or new_base_sha != "advanced":
+                    raise AssertionError("unexpected maintenance restart input")
+                connection.execute("UPDATE marker SET value = 'restarted'")
+                return cycle
+
+        with mock.patch("loop_manager.maintenance_state.MaintenanceRepository",
+                        return_value=Repository()), \
+                mock.patch("loop_manager.git",
+                           return_value=SimpleNamespace(stdout="advanced\n")), \
+                mock.patch("loop_manager._git_commit_is_ancestor",
+                           side_effect=(True, False)), \
+                mock.patch("loop_manager._git_tree_entries",
+                           side_effect=({}, {}, {})), \
+                mock.patch("loop_manager._clear_active_in_current_transaction"):
+            with self.assertRaisesRegex(RuntimeError, "cleanup failed"):
+                with loop_manager.runtime_state._transaction(connection):
+                    loop_manager.restart_stale_maintenance_publication(
+                        connection, "/repo", Path("/planning"), "main"
+                    )
+                    self.assertEqual(connection.execute(
+                        "SELECT value FROM marker"
+                    ).fetchone()[0], "restarted")
+                    raise RuntimeError("cleanup failed")
+        self.assertEqual(connection.execute(
+            "SELECT value FROM marker"
+        ).fetchone()[0], "preserved")
+        connection.close()
+
+
 class ApprovedDocumentPlanTest(unittest.TestCase):
     def test_crlf_approved_diff_survives_planner_validation(self):
         original = b"# Product\r\nOld.\r\n"
