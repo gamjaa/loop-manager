@@ -182,6 +182,28 @@ def execplan_status_for_phase(phase: object) -> str | None:
     return COMPATIBILITY_STATUS_BY_PHASE.get(normalized, normalized)
 
 
+def planning_owns_execution_slot(project: sqlite3.Row) -> bool:
+    """Recognize a live or preserved planning attempt, including interrupted ones.
+
+    Successful input fingerprints are durable baselines, not slot ownership.
+    Attempt-specific evidence must remain intact until planning itself clears it.
+    """
+
+    return bool(
+        project["phase"] == "PLANNING"
+        or project["planning_error"]
+        or project["planning_error_fingerprint"]
+        or project["planning_attempt_fingerprint"]
+        or project["planning_workspace_owned"]
+        or project["planning_retry_count"]
+        or project["planner_session_id"]
+        or project["planning_validation_error"]
+        or project["planning_result_pending_validation"]
+        or project["planning_result_completed"]
+        or project["planning_result"]
+    )
+
+
 @dataclass(frozen=True)
 class PlanningSnapshot:
     """Typed view of the project-owned planning lifecycle fields."""
@@ -489,6 +511,14 @@ class RuntimeStateRepository:
         if row is None:
             raise RuntimeStateError("planning 상태를 읽을 프로젝트가 없습니다.")
         return PlanningSnapshot.from_row(row)
+
+    def recovery_slot_available(self, repo: str) -> bool:
+        """Allow plan recovery to project or clear only after planning releases it."""
+
+        row = self.connection.execute(
+            "SELECT * FROM projects WHERE repo = ?", (repo,)
+        ).fetchone()
+        return row is not None and not planning_owns_execution_slot(row)
 
     def active_row(self, repo: str) -> sqlite3.Row | None:
         placeholders = ", ".join("?" for _ in ACTIVE_STATUSES)

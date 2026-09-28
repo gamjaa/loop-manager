@@ -62,6 +62,7 @@
 - `docs/FUTURE_IDEAS.md`는 Planner 입력이나 실행 상태가 아니며, 항목을 같은 계획 주기의 ExecPlan 범위로 사용하거나 Requirement·ExecPlan으로 자동 승격하지 않는다
 - 검증된 새 ExecPlan, 미착수 READY의 개정·rename·삭제와 `docs/FUTURE_IDEAS.md` 변경은 하나의 planning commit으로 만들고 `origin/<base-branch>`에 fast-forward push한다. 삭제 ID는 취소 감사로 예약하며, 원격 확인 뒤 catalog 변경과 명세·전체 입력 성공 지문을 하나의 SQLite transaction으로 적용한다
 - 같은 프로젝트에는 여러 READY, `PLAN_BLOCKED`, 안정된 `PR_OPEN` ExecPlan을 함께 보존할 수 있지만 IMPLEMENTING, VERIFYING, REVIEWING, PUBLISHING 또는 PR 충돌 복구로 저장소를 변경하는 실행은 동시에 하나만 둔다
+- 일반·유지보수 planning이 진행 중이거나 시도·오류·게시 결과를 보존하는 동안 다른 ExecPlan의 차단 복구는 project 실행 투영을 교체하거나 정리하지 않는다. Worker·검증·Review·게시와 Git 변경 복구는 planning이 실행 자리를 유효하게 비운 뒤 재개한다. 안전 gate가 허용한 PR Merge·Close 확인과 해당 계획의 상태·알림 기록은 계속할 수 있다
 - ExecPlan은 모든 `depends_on`의 PR이 실제로 Merge된 뒤에만 시작한다
 - 각 ExecPlan은 하나의 결정적 branch, 별도 worktree와 하나의 PR을 사용한다
 - 서로 다른 프로젝트의 동시 실행 수는 `max_workers`를 넘지 않는다

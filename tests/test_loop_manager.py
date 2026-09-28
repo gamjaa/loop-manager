@@ -17665,6 +17665,22 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
 
 
 class ExecPlanArchiveHousekeepingAdapterTest(unittest.TestCase):
+    def test_archive_housekeeping_waits_for_preserved_planning_attempt(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.row_factory = sqlite3.Row
+        connection.execute(loop_manager.SCHEMA)
+        loop_manager._ensure_execplans_schema(connection)
+        connection.execute(
+            "INSERT INTO projects (repo, base_branch, "
+            "planning_attempt_fingerprint) VALUES ('/repo', 'main', 'attempt')"
+        )
+        self.assertFalse(loop_manager._execplan_archive_housekeeping_safe(
+            connection, '/repo', None,
+            maintenance_assessment_enabled=False,
+            refactoring_review_interval=5,
+        ))
+
     def test_archive_commit_ignores_ambient_identity_signing_and_hooks(self):
         workspace = Path("/archive-worktree")
         ambient = {
