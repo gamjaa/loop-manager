@@ -35,8 +35,8 @@ planning 오류가 잘못 초기화되면 기존 BLOCKED 알림 사건도 해제
 
 ## Progress
 
-- [ ] planning 오류와 차단 사건의 원자적 해제
-- [ ] 과거 중복 사건 보존 및 실제 재개·재발 회귀 사례
+- [x] planning 오류와 차단 사건의 원자적 해제
+- [x] 과거 중복 사건 보존 및 실제 재개·재발 회귀 사례
 
 ## Decision Log
 

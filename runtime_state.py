@@ -558,6 +558,7 @@ class RuntimeStateRepository:
             ).fetchone()
             if previous is not None and previous[0]:
                 notifications.release_block(self.connection, repo, "planning")
+                self._fault("after_planning_block_release")
         assignments = ", ".join(f"{field} = ?" for field in values)
         changed = self.connection.execute(
             f"UPDATE projects SET {assignments} WHERE repo = ?",

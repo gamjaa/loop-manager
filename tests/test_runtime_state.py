@@ -12,6 +12,53 @@ from scoped_blocking import BlockReasonCode
 
 
 class RuntimeStateRepositoryTest(unittest.TestCase):
+    def test_planning_error_release_rolls_back_with_incident_on_interruption(self):
+        connection = self._connection()
+        self.addCleanup(connection.close)
+        notifications.configure_session(connection, enabled=True)
+        repository = runtime_state.RuntimeStateRepository(connection)
+        repository.update_project("repo", {"planning_error": "owner mismatch"})
+        incident = connection.execute(
+            "SELECT id, event_key FROM notified_block_incidents "
+            "WHERE repo = 'repo' AND subject = 'planning'",
+        ).fetchone()
+        connection.commit()
+
+        for stage in ("after_planning_block_release", "after_project_update"):
+            with self.subTest(stage=stage):
+                def interrupt(current: str) -> None:
+                    if current == stage:
+                        raise RuntimeError(stage)
+
+                with self.assertRaisesRegex(RuntimeError, stage):
+                    runtime_state.RuntimeStateRepository(
+                        connection, fault_hook=interrupt,
+                    ).update_project("repo", {"planning_error": None})
+                self.assertEqual(connection.execute(
+                    "SELECT planning_error FROM projects WHERE repo = 'repo'",
+                ).fetchone()[0], "owner mismatch")
+                self.assertIsNone(connection.execute(
+                    "SELECT released_at FROM notified_block_incidents WHERE id = ?",
+                    (incident["id"],),
+                ).fetchone()[0])
+                self.assertIsNone(connection.execute(
+                    "SELECT canceled_at FROM notification_outbox WHERE event_key = ?",
+                    (incident["event_key"],),
+                ).fetchone()[0])
+
+        repository.update_project("repo", {"planning_error": None})
+        self.assertIsNone(connection.execute(
+            "SELECT planning_error FROM projects WHERE repo = 'repo'",
+        ).fetchone()[0])
+        self.assertIsNotNone(connection.execute(
+            "SELECT released_at FROM notified_block_incidents WHERE id = ?",
+            (incident["id"],),
+        ).fetchone()[0])
+        self.assertIsNotNone(connection.execute(
+            "SELECT canceled_at FROM notification_outbox WHERE event_key = ?",
+            (incident["event_key"],),
+        ).fetchone()[0])
+
     def test_recovery_slot_waits_for_preserved_planning_attempt(self):
         connection = self._connection()
         self.addCleanup(connection.close)
