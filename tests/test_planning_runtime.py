@@ -998,6 +998,28 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         self.assertEqual(ports.state.clear_calls, [])
         self.assertEqual(ports.agent.run_count, 0)
 
+    def test_changed_input_without_workspace_preserves_phase_or_active_sha(self):
+        for phase, active_sha in (("PLANNING", None), (None, "base")):
+            with self.subTest(phase=phase, active_sha=active_sha):
+                ports = FakePorts(planning_snapshot(
+                    phase=phase,
+                    active_sha=active_sha,
+                    planning_error="saved failure",
+                    planning_error_fingerprint="old-input",
+                ))
+
+                outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+
+                self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+                self.assertEqual(ports.state.snapshot.phase, phase)
+                self.assertEqual(ports.state.snapshot.active_sha, active_sha)
+                self.assertEqual(ports.state.snapshot.planning_error,
+                                 "saved failure")
+                self.assertEqual(ports.state.snapshot.planning_error_fingerprint,
+                                 "old-input")
+                self.assertEqual(ports.state.clear_calls, [])
+                self.assertEqual(ports.agent.run_count, 0)
+
     def test_failed_maintenance_input_ignores_base_only_advance(self):
         cycle = maintenance_cycle(
             phase=maintenance_state.MaintenancePhase.ASSESSMENT,
@@ -1286,6 +1308,267 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
             arguments[:1] == ("push",)
             for _repo, arguments, _check in ports.git.calls
         ))
+
+    def test_pending_general_publication_cleanup_failure_restores_saved_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory) / "planning"
+            worktree.mkdir()
+            before = planning_snapshot(
+                phase="PLANNING",
+                active_sha="base",
+                worktree=str(worktree),
+                planning_attempt_fingerprint="fingerprint",
+                planning_workspace_owned=1,
+                planning_error="saved push failure",
+                planning_error_fingerprint="fingerprint",
+                planning_validation_error="saved diagnostics",
+                planner_session_id="saved-session",
+                planning_result="saved result",
+                planning_result_pending_validation=True,
+                planning_result_completed=True,
+            )
+            ports = FakePorts(before)
+            ports.state.general_intent = object()
+            ports.state.general_recovery_result = "pending"
+            def apply_batch(*_args):
+                ports.state.general_intent = None
+                ports.state.clear_active("/repo")
+                ports.state.update(
+                    "/repo",
+                    planning_validation_error=None,
+                    planner_session_id=None,
+                    planning_result=None,
+                    planning_result_pending_validation=False,
+                    planning_result_completed=False,
+                )
+            ports.state.publish_general_batch = mock.Mock(side_effect=apply_batch)
+            ports.git.dirty_files = ["docs/plans/[G-001] Plan.md"]
+            ports.git.advance_remote_on_push = True
+            ports.git.remove_error = RuntimeError("cleanup failed")
+
+            outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+
+            self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+            self.assertEqual(ports.state.snapshot.phase, "PLANNING")
+            self.assertEqual(ports.state.snapshot.active_sha, "base")
+            self.assertEqual(ports.state.snapshot.worktree, str(worktree))
+            self.assertEqual(ports.state.snapshot.planning_attempt_fingerprint,
+                             "fingerprint")
+            self.assertEqual(ports.state.snapshot.planning_workspace_owned, 1)
+            self.assertEqual(ports.state.snapshot.planning_error,
+                             "saved push failure")
+            self.assertEqual(ports.state.snapshot.planning_error_fingerprint,
+                             "fingerprint")
+            self.assertEqual(ports.state.snapshot.planning_validation_error,
+                             "saved diagnostics")
+            self.assertEqual(ports.state.snapshot.planner_session_id,
+                             "saved-session")
+            self.assertEqual(ports.state.snapshot.planning_result,
+                             "saved result")
+            self.assertTrue(ports.state.snapshot.planning_result_pending_validation)
+            self.assertTrue(ports.state.snapshot.planning_result_completed)
+            self.assertIsNotNone(ports.state.general_intent)
+            self.assertTrue(worktree.exists())
+            self.assertEqual(ports.agent.run_count, 0)
+            self.assertFalse(ports.state.validation_cleared)
+            ports.state.publish_general_batch.assert_called_once()
+
+    def test_remote_publication_recovery_cleanup_failure_keeps_saved_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory) / "planning"
+            worktree.mkdir()
+            ports = FakePorts(planning_snapshot(
+                phase="PLANNING",
+                active_sha="base",
+                worktree=str(worktree),
+                planning_attempt_fingerprint="fingerprint",
+                planning_workspace_owned=1,
+                planning_result="saved result",
+                planning_result_completed=True,
+            ))
+            ports.git.dirty_files = ["docs/plans/[G-001] Plan.md"]
+            ports.git.remote = "concurrent-base"
+            ports.git.remove_error = RuntimeError("cleanup failed")
+
+            outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+
+            self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+            self.assertEqual(ports.state.snapshot.phase, "PLANNING")
+            self.assertEqual(ports.state.snapshot.worktree, str(worktree))
+            self.assertEqual(ports.state.snapshot.planning_result,
+                             "saved result")
+            self.assertTrue(ports.state.snapshot.planning_result_completed)
+            self.assertEqual(ports.state.snapshot.planning_error_fingerprint,
+                             "fingerprint")
+            self.assertIsNotNone(ports.state.general_intent)
+            self.assertTrue(worktree.exists())
+            self.assertEqual(ports.agent.run_count, 0)
+
+    def test_pending_maintenance_publication_cleanup_failure_restores_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory) / "planning"
+            worktree.mkdir()
+            cycle = maintenance_cycle(
+                phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+                cycle_base_sha="base",
+                publication_stage="prepared",
+                publication_base_sha="base",
+                revision=4,
+            )
+            fingerprint = maintenance_planning_fingerprint(cycle, "fingerprint")
+            before = planning_snapshot(
+                phase="PLANNING",
+                active_sha="base",
+                worktree=str(worktree),
+                planning_attempt_fingerprint=fingerprint,
+                planning_workspace_owned=1,
+                planning_error="saved publication failure",
+                planning_error_fingerprint=fingerprint,
+                planning_validation_error="saved diagnostics",
+                planner_session_id="saved-session",
+                planning_result="saved result",
+                planning_result_completed=True,
+            )
+            ports = FakePorts(before, cycle)
+            ports.git.head = "plan-commit"
+            ports.git.advance_remote_on_push = True
+            ports.git.remove_error = RuntimeError("cleanup failed")
+            def apply_batch(*_args):
+                ports.state.clear_active("/repo")
+                ports.state.update(
+                    "/repo",
+                    planning_validation_error=None,
+                    planner_session_id=None,
+                    planning_result=None,
+                    planning_result_completed=False,
+                )
+            ports.state.publish_maintenance_batch = mock.Mock(side_effect=apply_batch)
+            coordinator = PlanningLifecycleCoordinator(ports)
+            run = coordinator._new_run(self.context)
+            run.current_fingerprint = fingerprint
+            run.planning_worktree = worktree
+            run.maintenance_context = object()
+            run.validated_result = ports.validation.result
+
+            outcome = coordinator._publish_planner_result(run)
+
+            self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+            self.assertEqual(ports.state.snapshot.phase, "PLANNING")
+            self.assertEqual(ports.state.snapshot.active_sha, "base")
+            self.assertEqual(ports.state.snapshot.worktree, str(worktree))
+            self.assertEqual(ports.state.snapshot.planning_attempt_fingerprint,
+                             fingerprint)
+            self.assertEqual(ports.state.snapshot.planning_workspace_owned, 1)
+            self.assertEqual(ports.state.snapshot.planning_error,
+                             "saved publication failure")
+            self.assertEqual(ports.state.snapshot.planning_error_fingerprint,
+                             fingerprint)
+            self.assertEqual(ports.state.snapshot.planning_validation_error,
+                             "saved diagnostics")
+            self.assertEqual(ports.state.snapshot.planner_session_id,
+                             "saved-session")
+            self.assertEqual(ports.state.snapshot.planning_result,
+                             "saved result")
+            self.assertTrue(ports.state.snapshot.planning_result_completed)
+            self.assertTrue(worktree.exists())
+            ports.state.publish_maintenance_batch.assert_called_once()
+
+    def test_no_change_cleanup_failure_keeps_saved_planning_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory) / "planning"
+            worktree.mkdir()
+            ports = FakePorts(planning_snapshot(
+                phase="PLANNING",
+                active_sha="base",
+                worktree=str(worktree),
+                planning_attempt_fingerprint="fingerprint",
+                planning_workspace_owned=1,
+                planning_error="saved validation failure",
+                planning_error_fingerprint="fingerprint",
+                planner_session_id="saved-session",
+                planning_result="saved result",
+                planning_result_completed=True,
+            ))
+            ports.git.remove_error = RuntimeError("cleanup failed")
+            coordinator = PlanningLifecycleCoordinator(ports)
+            run = coordinator._new_run(self.context)
+            run.planning_worktree = worktree
+            run.current_fingerprint = "fingerprint"
+
+            outcome = coordinator._publish_planner_result(run)
+
+            self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+            self.assertEqual(ports.state.snapshot.phase, "PLANNING")
+            self.assertEqual(ports.state.snapshot.worktree, str(worktree))
+            self.assertEqual(ports.state.snapshot.planning_error,
+                             "saved validation failure")
+            self.assertEqual(ports.state.snapshot.planning_error_fingerprint,
+                             "fingerprint")
+            self.assertEqual(ports.state.snapshot.planner_session_id,
+                             "saved-session")
+            self.assertEqual(ports.state.snapshot.planning_result,
+                             "saved result")
+            self.assertTrue(ports.state.snapshot.planning_result_completed)
+            self.assertTrue(worktree.exists())
+
+    def test_prerequisite_cleanup_failure_preserves_planning_and_cycle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory) / "planning"
+            worktree.mkdir()
+            cycle = maintenance_cycle(
+                phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+                cycle_base_sha="base",
+                revision=4,
+            )
+            ports = FakePorts(planning_snapshot(
+                phase="PLANNING",
+                active_sha="base",
+                worktree=str(worktree),
+                planning_attempt_fingerprint="fingerprint",
+                planning_workspace_owned=1,
+                planning_error="saved validation failure",
+                planning_error_fingerprint="fingerprint",
+                planner_session_id="saved-session",
+                planning_result=(
+                    'MAINTENANCE_RESULT: '
+                    '{"outcome":"prerequisites","plan_ids":["G-001"]}'
+                ),
+                planning_result_completed=True,
+            ), cycle)
+            ports.git.remove_error = RuntimeError("cleanup failed")
+            ports.state.transition_maintenance = mock.Mock(
+                side_effect=lambda *_args, **_kwargs: setattr(
+                    ports.state, "cycle", replace(
+                        ports.state.cycle,
+                        phase=maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
+                    )
+                )
+            )
+            coordinator = PlanningLifecycleCoordinator(ports)
+            run = coordinator._new_run(self.context)
+            run.planning_worktree = worktree
+            run.current_fingerprint = "fingerprint"
+            run.maintenance_context = object()
+
+            with mock.patch(
+                "planning_runtime.validate_prerequisite_plan_ids",
+                return_value=("G-001",),
+            ):
+                outcome = coordinator._validate_planner_result(run)
+
+            self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+            self.assertEqual(ports.state.snapshot.phase, "PLANNING")
+            self.assertEqual(ports.state.snapshot.worktree, str(worktree))
+            self.assertEqual(ports.state.snapshot.planning_error,
+                             "saved validation failure")
+            self.assertEqual(ports.state.snapshot.planning_error_fingerprint,
+                             "fingerprint")
+            self.assertEqual(ports.state.snapshot.planner_session_id,
+                             "saved-session")
+            self.assertTrue(ports.state.snapshot.planning_result_completed)
+            self.assertEqual(ports.state.cycle, cycle)
+            self.assertTrue(worktree.exists())
+            ports.state.transition_maintenance.assert_called_once()
 
     def test_specification_change_plans_once_before_runnable_ready(self):
         ports = FakePorts(

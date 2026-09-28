@@ -1230,7 +1230,9 @@ class PlanningLifecycleCoordinator:
         try:
             if worktree is None:
                 if (
-                    row.planning_workspace_owned
+                    row.phase == "PLANNING"
+                    or row.active_sha
+                    or row.planning_workspace_owned
                     or row.planning_attempt_fingerprint
                     or row.planning_retry_count
                     or row.planner_session_id
@@ -2065,29 +2067,42 @@ class PlanningLifecycleCoordinator:
             decision is not None
             and decision.outcome is MaintenanceOutcome.PREREQUISITES
         ):
-            self._ports.git.validate_worktree_ownership(
-                context.repo,
-                str(run.current_fingerprint or ""),
-                worktree,
-            )
-            with self._ports.state.transaction():
-                self._ports.state.transition_maintenance(
+            try:
+                self._ports.git.validate_worktree_ownership(
                     context.repo,
-                    expected_phase=maintenance_state.MaintenancePhase.ASSESSMENT,
-                    expected_revision=run.maintenance_cycle.revision,
-                    next_phase=(
-                        maintenance_state.MaintenancePhase.PREREQUISITE_WAIT
-                    ),
-                    prerequisite_plan_ids=decision.plan_ids,
-                    include_general_planning=False,
+                    str(run.current_fingerprint or ""),
+                    worktree,
                 )
-                self._ports.state.clear_active_in_transaction(context.repo)
-            self._ports.git.run(
-                context.repo_path,
-                "worktree",
-                "remove",
-                str(worktree),
-            )
+                with self._ports.state.transaction():
+                    self._ports.state.transition_maintenance(
+                        context.repo,
+                        expected_phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+                        expected_revision=run.maintenance_cycle.revision,
+                        next_phase=(
+                            maintenance_state.MaintenancePhase.PREREQUISITE_WAIT
+                        ),
+                        prerequisite_plan_ids=decision.plan_ids,
+                        include_general_planning=False,
+                    )
+                    self._ports.state.clear_active_in_transaction(context.repo)
+                    self._ports.git.run(
+                        context.repo_path,
+                        "worktree",
+                        "remove",
+                        str(worktree),
+                    )
+            except RuntimeError as error:
+                message = str(error)
+                self._ports.state.update(
+                    context.repo,
+                    planning_error=row.planning_error or message,
+                    planning_error_fingerprint=(
+                        row.planning_error_fingerprint or run.current_fingerprint
+                    ),
+                    last_error=message,
+                )
+                self._ports.events.error(message)
+                return self._operational_error()
             return PlanningOutcome(PlanningOutcomeKind.PREREQUISITE_WAIT)
 
         if decision is not None and decision.outcome is MaintenanceOutcome.UNSAFE:
@@ -2179,52 +2194,66 @@ class PlanningLifecycleCoordinator:
                         context.repo, context.repo_path, context.base_branch,
                         run.maintenance_cycle.revision, str(row.active_sha),
                     )
+            try:
                 with self._ports.state.transaction():
-                    if evidence is not None:
-                        self._ports.state.complete_file_assessment(
-                            context.repo, context.repo_path, context.base_branch,
-                            run.maintenance_cycle.revision, str(row.active_sha),
-                            evidence,
+                    if run.maintenance_planning:
+                        if evidence is not None:
+                            self._ports.state.complete_file_assessment(
+                                context.repo, context.repo_path, context.base_branch,
+                                run.maintenance_cycle.revision, str(row.active_sha),
+                                evidence,
+                            )
+                        self._ports.state.advance_success_baseline(
+                            context.repo,
+                            expected_phase=run.maintenance_cycle.phase,
+                            expected_revision=run.maintenance_cycle.revision,
+                            remote_commit=str(row.active_sha or ""),
                         )
-                    self._ports.state.advance_success_baseline(
-                        context.repo,
-                        expected_phase=run.maintenance_cycle.phase,
-                        expected_revision=run.maintenance_cycle.revision,
-                        remote_commit=str(row.active_sha or ""),
+                        self._ports.state.clear_active_in_transaction(
+                            context.repo,
+                            processed_sha=(
+                                str(row.active_sha or "")
+                                if run.maintenance_cycle.include_general_planning
+                                else None
+                            ),
+                            specification_fingerprint=(
+                                completed_specification_fingerprint
+                                if run.maintenance_cycle.include_general_planning
+                                else None
+                            ),
+                            planning_fingerprint=(
+                                completed_fingerprint
+                                if run.maintenance_cycle.include_general_planning
+                                else None
+                            ),
+                        )
+                    else:
+                        self._ports.state.clear_active_in_transaction(
+                            context.repo,
+                            processed_sha=row.active_sha,
+                            specification_fingerprint=(
+                                completed_specification_fingerprint
+                            ),
+                            planning_fingerprint=completed_fingerprint,
+                        )
+                    self._ports.git.run(
+                        context.repo_path,
+                        "worktree",
+                        "remove",
+                        str(worktree),
                     )
-                    self._ports.state.clear_active_in_transaction(
-                        context.repo,
-                        processed_sha=(
-                            str(row.active_sha or "")
-                            if run.maintenance_cycle.include_general_planning
-                            else None
-                        ),
-                        specification_fingerprint=(
-                            completed_specification_fingerprint
-                            if run.maintenance_cycle.include_general_planning
-                            else None
-                        ),
-                        planning_fingerprint=(
-                            completed_fingerprint
-                            if run.maintenance_cycle.include_general_planning
-                            else None
-                        ),
-                    )
-            else:
-                self._ports.state.clear_active(
+            except RuntimeError as error:
+                message = str(error)
+                self._ports.state.update(
                     context.repo,
-                    processed_sha=row.active_sha,
-                    specification_fingerprint=(
-                        completed_specification_fingerprint
+                    planning_error=row.planning_error or message,
+                    planning_error_fingerprint=(
+                        row.planning_error_fingerprint or run.current_fingerprint
                     ),
-                    planning_fingerprint=completed_fingerprint,
+                    last_error=message,
                 )
-            self._ports.git.run(
-                context.repo_path,
-                "worktree",
-                "remove",
-                str(worktree),
-            )
+                self._ports.events.error(message)
+                return self._operational_error()
             self._ports.events.info(
                 "유지보수 평가와 재검증을 완료했습니다."
                 if run.maintenance_planning
@@ -2259,8 +2288,6 @@ class PlanningLifecycleCoordinator:
                 )
             self._ports.git.run(worktree, "commit", "-m", message)
 
-        if not run.maintenance_planning:
-            self._ports.state.clear_validation(context.repo)
         plan_commit = self._ports.git.run(
             worktree, "rev-parse", "HEAD"
         ).stdout.strip()
@@ -2356,30 +2383,32 @@ class PlanningLifecycleCoordinator:
             and latest_sha not in {row.active_sha, plan_commit}
         ):
             try:
-                recovery = self._ports.state.recover_general_batch(
-                    context.repo, worktree, context.base_branch
-                )
+                with self._ports.state.transaction():
+                    recovery = self._ports.state.recover_general_batch(
+                        context.repo, worktree, context.base_branch
+                    )
+                    if recovery == "pending":
+                        raise RuntimeError(
+                            "원격 base가 이동했지만 publication recovery가 pending을 반환했습니다."
+                        )
+                    self._ports.git.run(
+                        context.repo_path,
+                        "worktree",
+                        "remove",
+                        str(worktree),
+                    )
             except RuntimeError as error:
                 message = str(error)
                 self._ports.state.update(
                     context.repo,
-                    planning_error=message,
-                    planning_error_fingerprint=run.current_fingerprint,
+                    planning_error=row.planning_error or message,
+                    planning_error_fingerprint=(
+                        row.planning_error_fingerprint or run.current_fingerprint
+                    ),
                     last_error=message,
                 )
                 self._ports.events.error(message)
                 return self._operational_error()
-            if recovery == "pending":
-                raise RuntimeError(
-                    "원격 base가 이동했지만 publication recovery가 pending을 반환했습니다."
-                )
-            self._ports.git.run(
-                context.repo_path,
-                "worktree",
-                "remove",
-                "--force",
-                str(worktree),
-            )
             self._ports.events.info(
                 "게시된 일반 planning batch를 복구했습니다."
                 if recovery == "applied"
@@ -2391,26 +2420,28 @@ class PlanningLifecycleCoordinator:
             plan_commit,
         }:
             try:
-                recovered_cycle = self._ports.state.recover_maintenance_batch(
-                    context.repo, worktree, context.base_branch
-                )
+                with self._ports.state.transaction():
+                    recovered_cycle = self._ports.state.recover_maintenance_batch(
+                        context.repo, worktree, context.base_branch
+                    )
+                    self._ports.git.run(
+                        context.repo_path,
+                        "worktree",
+                        "remove",
+                        str(worktree),
+                    )
             except RuntimeError as error:
                 message = str(error)
                 self._ports.state.update(
                     context.repo,
-                    planning_error=message,
-                    planning_error_fingerprint=run.current_fingerprint,
+                    planning_error=row.planning_error or message,
+                    planning_error_fingerprint=(
+                        row.planning_error_fingerprint or run.current_fingerprint
+                    ),
                     last_error=message,
                 )
                 self._ports.events.error(message)
                 return self._operational_error()
-            self._ports.git.run(
-                context.repo_path,
-                "worktree",
-                "remove",
-                "--force",
-                str(worktree),
-            )
             if recovered_cycle.phase in {
                 maintenance_state.MaintenancePhase.ASSESSMENT,
                 maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
@@ -2510,48 +2541,51 @@ class PlanningLifecycleCoordinator:
                 )
                 return self._operational_error()
 
-        if run.maintenance_planning:
-            try:
-                self._ports.state.publish_maintenance_batch(
-                    context.repo,
-                    worktree,
-                    context.base_branch,
-                    validated_result,
-                    plan_commit,
+        try:
+            with self._ports.state.transaction():
+                if run.maintenance_planning:
+                    self._ports.state.publish_maintenance_batch(
+                        context.repo,
+                        worktree,
+                        context.base_branch,
+                        validated_result,
+                        plan_commit,
+                    )
+                else:
+                    self._ports.git.validate_worktree_ownership(
+                        context.repo,
+                        str(run.current_fingerprint or ""),
+                        worktree,
+                    )
+                    assert run.specification_fingerprint is not None
+                    assert run.general_fingerprint is not None
+                    self._ports.state.publish_general_batch(
+                        context.repo,
+                        worktree,
+                        context.base_branch,
+                        validated_result,
+                        plan_commit,
+                        run.specification_fingerprint,
+                        run.general_fingerprint,
+                    )
+                self._ports.git.run(
+                    context.repo_path,
+                    "worktree",
+                    "remove",
+                    str(worktree),
                 )
-            except RuntimeError as error:
-                message = str(error)
-                self._ports.state.update(
-                    context.repo,
-                    planning_error=message,
-                    planning_error_fingerprint=run.current_fingerprint,
-                    last_error=message,
-                )
-                self._ports.events.error(message)
-                return self._operational_error()
-        else:
-            self._ports.git.validate_worktree_ownership(
+        except RuntimeError as error:
+            message = str(error)
+            self._ports.state.update(
                 context.repo,
-                str(run.current_fingerprint or ""),
-                worktree,
+                planning_error=row.planning_error or message,
+                planning_error_fingerprint=(
+                    row.planning_error_fingerprint or run.current_fingerprint
+                ),
+                last_error=message,
             )
-            assert run.specification_fingerprint is not None
-            assert run.general_fingerprint is not None
-            self._ports.state.publish_general_batch(
-                context.repo,
-                worktree,
-                context.base_branch,
-                validated_result,
-                plan_commit,
-                run.specification_fingerprint,
-                run.general_fingerprint,
-            )
-        self._ports.git.run(
-            context.repo_path,
-            "worktree",
-            "remove",
-            str(worktree),
-        )
+            self._ports.events.error(message)
+            return self._operational_error()
         run.base_sha = latest_sha
         run.row = self._ports.state.planning(context.repo)
         return None
