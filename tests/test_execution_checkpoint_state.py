@@ -11,6 +11,31 @@ from tests import test_runtime_state
 
 
 class CheckpointRepositoryTests(unittest.TestCase):
+    def test_completed_rebase_requires_later_generation_and_cleared_operation(self):
+        connection = sqlite3.connect(':memory:')
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        repository = ExecutionCheckpointRepository(connection)
+        proof = {'generation': 1, 'journal_id': 'sealed'}
+        intent = repository.record(
+            'repo', 'G-102', expected_generation=0, operation='rebase',
+            expected_head='before', target_base_oid='base',
+            observed_remote_oid='remote', snapshot={'completed_rebase': proof},
+        )
+        self.assertIsNone(intent.completed_rebase())
+        completed = repository.record(
+            'repo', 'G-102', expected_generation=1, operation=None,
+            expected_head='after', target_base_oid='base',
+            observed_remote_oid='remote', snapshot={'completed_rebase': proof},
+        )
+        self.assertEqual(completed.completed_rebase(), proof)
+        self.assertIsNone(repository.record(
+            'repo', 'G-102', expected_generation=2, operation=None,
+            expected_head='after', target_base_oid='base',
+            observed_remote_oid='remote',
+            snapshot={'completed_rebase': {'generation': 3}},
+        ).completed_rebase())
+
     def test_intent_and_completion_reject_stale_generation(self):
         connection = sqlite3.connect(':memory:')
         connection.row_factory = sqlite3.Row

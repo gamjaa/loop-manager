@@ -35,8 +35,8 @@ PR 없는 게시 checkpoint branch가 관리 rebase를 완료하면 로컬 HEAD�
 
 ## Progress
 
-- [ ] rebase 완료 증거와 게시 소유권의 지속적 연결
-- [ ] 재시작·원격 경쟁·별도 계획 차단 회귀
+- [x] rebase 완료 증거와 게시 소유권의 지속적 연결
+- [x] 재시작·원격 경쟁·별도 계획 차단 회귀
 
 ## Decision Log
 
