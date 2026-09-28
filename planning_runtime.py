@@ -520,6 +520,8 @@ class _PlanningRun:
     planner_scope_error: str | None = None
     maintenance_decision: MaintenancePlannerDecision | None = None
     validated_result: Any = None
+    error_input_changed: bool = False
+    publication_recovery_verified: bool = False
 
 
 class PlanningLifecycleCoordinator:
@@ -565,6 +567,7 @@ class PlanningLifecycleCoordinator:
         run = self._new_run(context)
         handlers = (
             self._recover_publication,
+            self._gate_preserved_error,
             self._select_planning_work,
             self._reconcile_inputs,
             self._prepare_workspace,
@@ -578,6 +581,52 @@ class PlanningLifecycleCoordinator:
             if outcome is not None:
                 return outcome
         raise RuntimeError("planning lifecycle ended without a typed outcome")
+
+    def _gate_preserved_error(self, run: _PlanningRun) -> PlanningOutcome | None:
+        """Check the failed input before scheduling or stale-workspace cleanup."""
+
+        row = run.row
+        if not row.planning_error or run.publication_recovery_verified:
+            return None
+        cycle = run.maintenance_cycle
+        related_source_changed = False
+        if str(row.planning_error_fingerprint or "").startswith("maintenance-cycle:"):
+            current = f"maintenance-cycle:{cycle.phase.value}:{cycle.revision}"
+        else:
+            run.general_fingerprint = self._ports.git.input_fingerprint(
+                run.context.repo_path, run.base_sha
+            )
+            maintenance_error = cycle.phase in {
+                maintenance_state.MaintenancePhase.ASSESSMENT,
+                maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+            } and (run.maintenance_planning or row.phase is None)
+            current = (
+                maintenance_planning_fingerprint(cycle, run.general_fingerprint)
+                if maintenance_error
+                else run.general_fingerprint
+            )
+            if (
+                maintenance_error
+                and not cycle.include_general_planning
+                and cycle.cycle_base_sha
+                and cycle.cycle_base_sha != run.base_sha
+            ):
+                related_source_changed = (
+                    self._ports.git.input_fingerprint(
+                        run.context.repo_path, cycle.cycle_base_sha
+                    ) != run.general_fingerprint
+                )
+        if not row.planning_error_fingerprint or (
+            row.planning_error_fingerprint == current
+            and not related_source_changed
+        ):
+            self._ports.events.error(
+                f"계획 오류가 해결되지 않았습니다: {row.planning_error}\n"
+                f"보존된 planning worktree: {row.worktree}"
+            )
+            return self._operational_error()
+        run.error_input_changed = True
+        return None
 
     def _recover_publication(
         self, run: _PlanningRun
@@ -594,29 +643,29 @@ class PlanningLifecycleCoordinator:
                     context.repo, fingerprint, worktree
                 )
                 self._ports.git.run(context.repo_path, "fetch", "origin")
-                recovery = self._ports.state.recover_general_batch(
-                    context.repo, worktree, context.base_branch
-                )
+                with self._ports.state.transaction():
+                    recovery = self._ports.state.recover_general_batch(
+                        context.repo, worktree, context.base_branch
+                    )
+                    if recovery != "pending" and worktree.exists():
+                        self._ports.git.run(
+                            context.repo_path, "worktree", "remove", str(worktree)
+                        )
             except RuntimeError as error:
                 message = str(error)
                 self._ports.state.update(
                     context.repo,
-                    planning_error=message,
-                    planning_error_fingerprint=fingerprint,
+                    planning_error=row.planning_error or message,
+                    planning_error_fingerprint=(
+                        row.planning_error_fingerprint or fingerprint
+                    ),
                     last_error=message,
                 )
                 self._ports.events.error(message)
                 return self._operational_error()
             if recovery == "pending":
+                run.publication_recovery_verified = True
                 return None
-            if worktree.exists():
-                self._ports.git.run(
-                    context.repo_path,
-                    "worktree",
-                    "remove",
-                    "--force",
-                    str(worktree),
-                )
             self._ports.events.info(
                 "게시된 일반 planning batch를 복구했습니다."
                 if recovery == "applied"
@@ -645,29 +694,29 @@ class PlanningLifecycleCoordinator:
             run.base_sha = remote_sha
             recovered_cycle = None
             if remote_sha != cycle.publication_base_sha:
-                recovered_cycle = self._ports.state.recover_maintenance_batch(
-                    context.repo, worktree, context.base_branch
-                )
+                with self._ports.state.transaction():
+                    recovered_cycle = self._ports.state.recover_maintenance_batch(
+                        context.repo, worktree, context.base_branch
+                    )
+                    if worktree.exists():
+                        self._ports.git.run(
+                            context.repo_path, "worktree", "remove", str(worktree)
+                        )
         except RuntimeError as error:
             message = str(error)
             self._ports.state.update(
                 context.repo,
-                planning_error=message,
-                planning_error_fingerprint=fingerprint,
+                planning_error=row.planning_error or message,
+                planning_error_fingerprint=(
+                    row.planning_error_fingerprint or fingerprint
+                ),
                 last_error=message,
             )
             self._ports.events.error(message)
             return self._operational_error()
         if recovered_cycle is None:
+            run.publication_recovery_verified = True
             return None
-        if worktree.exists():
-            self._ports.git.run(
-                context.repo_path,
-                "worktree",
-                "remove",
-                "--force",
-                str(worktree),
-            )
         self._ports.events.info(
             "게시된 유지보수 batch를 fingerprint 정리 전에 복구했습니다."
             if recovered_cycle.publication_stage == "remote_confirmed"
@@ -698,14 +747,14 @@ class PlanningLifecycleCoordinator:
             )
             self._ports.events.error(message)
             return self._operational_error()
-        if row.planning_error and not row.worktree:
-            self._ports.state.update(
-                context.repo,
-                planning_error=None,
-                planning_error_fingerprint=None,
-                last_error=None,
-            )
-            row = self._ports.state.planning(context.repo)
+        if run.error_input_changed:
+            run.maintenance_planning = cycle.phase in {
+                maintenance_state.MaintenancePhase.ASSESSMENT,
+                maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+            }
+            run.row = row
+            run.maintenance_cycle = cycle
+            return None
         decision = self._ports.state.schedule(context.repo)
         approval_pending = (
             context.self_repository
@@ -968,6 +1017,7 @@ class PlanningLifecycleCoordinator:
             and cycle.cycle_base_sha != run.base_sha
             and cycle.publication_stage is None
             and row.phase == "PLANNING"
+            and not row.planning_error
         ):
             stale_worktree = Path(str(row.worktree or ""))
             stored_fingerprint = str(row.planning_attempt_fingerprint or "")
@@ -1013,14 +1063,18 @@ class PlanningLifecycleCoordinator:
             else None
         )
         recoverable_publication = bool(
-            run.maintenance_planning
-            and row.phase == "PLANNING"
-            and cycle.publication_stage == "prepared"
+            run.publication_recovery_verified
+            or (
+                run.maintenance_planning
+                and row.phase == "PLANNING"
+                and cycle.publication_stage == "prepared"
+            )
         )
         if (
             row.planning_error
             and row.planning_error_fingerprint == run.current_fingerprint
             and not recoverable_publication
+            and not run.error_input_changed
         ):
             self._ports.events.error(
                 f"계획 오류가 해결되지 않았습니다: {row.planning_error}\n"
@@ -1033,6 +1087,16 @@ class PlanningLifecycleCoordinator:
             if outcome is not None:
                 return outcome
             row = self._ports.state.planning(context.repo)
+            if (
+                run.maintenance_planning
+                and cycle.cycle_base_sha != run.base_sha
+                and cycle.publication_stage is None
+            ):
+                cycle = self._ports.state.restart_stale_maintenance(
+                    context.repo, cycle, run.base_sha
+                )
+                run.maintenance_cycle = cycle
+                return PlanningOutcome(PlanningOutcomeKind.REMOTE_BASE_RESTART)
 
         if row.phase == "PLANNING":
             started_fingerprint = (
@@ -1165,30 +1229,57 @@ class PlanningLifecycleCoordinator:
         )
         try:
             if worktree is None:
-                raise RuntimeError("planning worktree 경로가 저장되지 않았습니다.")
-            self._ports.git.validate_worktree_ownership(
-                context.repo, stored_fingerprint, worktree
-            )
+                if (
+                    row.planning_workspace_owned
+                    or row.planning_attempt_fingerprint
+                    or row.planning_retry_count
+                    or row.planner_session_id
+                    or row.planning_validation_error
+                    or row.planning_result_pending_validation
+                    or row.planning_result_completed
+                    or row.planning_result
+                    or row.agent_snapshot
+                    or row.agent_result_snapshot
+                ):
+                    raise RuntimeError("planning worktree 경로가 저장되지 않았습니다.")
+            else:
+                self._ports.git.validate_worktree_ownership(
+                    context.repo, stored_fingerprint, worktree
+                )
         except RuntimeError as error:
             message = f"planning workspace cleanup 소유권 검증 실패: {error}"
             self._ports.state.update(
                 context.repo,
-                planning_error=message,
-                planning_error_fingerprint=run.current_fingerprint,
+                planning_error=row.planning_error or message,
+                planning_error_fingerprint=(
+                    row.planning_error_fingerprint or run.current_fingerprint
+                ),
                 last_error=message,
             )
             self._ports.events.error(message)
             return self._operational_error()
         if preserve:
             self._ports.state.preserve_diagnostics(context.repo, row)
-        if worktree.exists():
-            self._ports.git.run(
-                context.repo_path,
-                "worktree",
-                "remove",
-                "--force",
-                str(worktree),
+        try:
+            if worktree is not None and worktree.exists():
+                self._ports.git.run(
+                    context.repo_path,
+                    "worktree",
+                    "remove",
+                    str(worktree),
+                )
+        except RuntimeError as error:
+            message = f"planning workspace cleanup 실패: {error}"
+            self._ports.state.update(
+                context.repo,
+                planning_error=row.planning_error or message,
+                planning_error_fingerprint=(
+                    row.planning_error_fingerprint or run.current_fingerprint
+                ),
+                last_error=message,
             )
+            self._ports.events.error(message)
+            return self._operational_error()
         self._ports.state.clear_active(context.repo)
         return None
 

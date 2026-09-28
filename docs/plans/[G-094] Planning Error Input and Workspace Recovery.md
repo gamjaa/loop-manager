@@ -35,8 +35,8 @@ priority: critical
 
 ## Progress
 
-- [ ] planning 오류 해제 조건을 관련 입력·게시 증거에 결합
-- [ ] worktree 소유권 불명확·정리 실패 보존 검증
+- [x] planning 오류 해제 조건을 관련 입력·게시 증거에 결합
+- [x] worktree 소유권 불명확·정리 실패 보존 검증
 
 ## Decision Log
 

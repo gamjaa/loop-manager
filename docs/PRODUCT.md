@@ -51,6 +51,8 @@
 - 유효한 ExecPlan 선언 변경은 계획 또는 프로젝트 차단 사유가 아니며, catalog 전체가 유효하고 원격 revision과 SQLite 상태·소유권 snapshot이 그대로일 때만 모든 현재 cache delta를 한 transaction으로 반영한다
 - 원격 ExecPlan catalog가 누락 파일, 잘못된 형식·source·ID 또는 dependency graph 때문에 유효하지 않으면 다른 ExecPlan 상태를 바꾸지 않고 실제 원인 파일을 포함한 프로젝트 범위 진단으로 격리한다
 - ExecPlan 생성 전 Planner 실패는 프로젝트의 `planning_error`로 SQLite에 저장하며 ExecPlan BLOCKED 상태를 만들지 않는다
+- 일반·유지보수 planning의 미해결 오류와 입력 지문은 다른 ExecPlan의 차단 해제·PR 상태 변경·project 실행 상태 정리와 독립적으로 보존한다. worktree 경로 부재나 관련 입력이 같은 원격 base 전진만으로 해제하지 않으며, 같은 입력의 반복 실행·재시작에서는 Planner를 다시 호출하지 않는다
+- 관련 planning 입력이 바뀌거나 검증된 게시 복구가 가능할 때만 저장된 소유권·workspace identity를 확인하고 정리 또는 게시 결과가 확정된 뒤 오류를 해제한다. 소유 증거 없는 기존 planning 경로와 정리 실패는 Git 등록·HEAD·index·파일 및 진단·session·작업물을 보존한다
 - 미충족 PRODUCT 또는 Requirement에 근거해서만 ExecPlan을 작성한다
 - 실행 중인 변경 작업은 새 계획 입력이 선점하지 않는다. 안전한 선택 경계에서 마지막 성공 Planner 이후 명세 또는 전체 계획 입력이 바뀌었으면 대기 중인 READY보다 일반 Planner를 정확히 한 번 먼저 실행한다. 입력이 같으면 실행 가능한 READY를 우선순위대로 시작하며, 없으면 대기 또는 완료 조건을 평가한다. due 유지보수 평가는 기존 순서를 유지한다
 - 프로젝트별 첫 파일별 평가 전에는 등록 또는 기존 정책 적용의 안전한 시점에 확인한 MERGED ExecPlan 수를 시작 기준으로 보존한다. 기존 활성 유지보수 cycle은 먼저 복구·완료하고 과거 성공 이력은 감사 자료로 보존한다. 첫 평가와 이후 정기 평가는 각각 시작 기준 또는 마지막 성공한 파일별 평가 이후 새로 MERGED된 ExecPlan 수가 공통 `refactoring_review_interval`에 도달할 때 시작한다. 이 설정은 양의 정수이며 기본값은 20이다. 성공한 파일별 평가 이력이 있는 완료 후보는 정기 주기 전에도 이후 Merge 수가 10개 이상이고 새 검토 대상이 있을 때 한 번 안정화 평가를 한다
