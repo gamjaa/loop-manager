@@ -503,6 +503,8 @@ class ExecutionHandlers:
 
     def _matching_rebase_journal_result(self, context, current, remote_oid,
                                         observed, *, allow_later_file_changes=False):
+        checkpoint_snapshot = getattr(current, 'snapshot', None) or {}
+
         def matches(saved):
             if not allow_later_file_changes:
                 return saved == observed
@@ -515,9 +517,12 @@ class ExecutionHandlers:
         return any(
             item['intent']['kind'] == 'managed_rebase'
             and item['intent']['target'] == str(context.worktree.resolve())
-            and item['intent']['expected'].get('branch') == context.branch
-            and item['intent']['expected'].get('run_id') == (current.snapshot or {}).get('rebase_run_id')
-            and item['intent']['expected'].get('checkpoint_generation', -1) <= current.generation
+            and (checkpoint_snapshot.get('rebase_evidence_version') != 2
+                 or (item['intent']['expected'].get('branch') == context.branch
+                     and item['intent']['expected'].get('run_id')
+                         == checkpoint_snapshot.get('rebase_run_id')
+                     and item['intent']['expected'].get('checkpoint_generation', -1)
+                         <= getattr(current, 'generation', -1)))
             and item['intent']['expected']['before_head'] == current.expected_head
             and item['intent']['expected']['target_base_oid'] == current.target_base_oid
             and item['intent']['expected']['remote_oid'] == remote_oid

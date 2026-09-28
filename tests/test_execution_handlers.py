@@ -38,6 +38,45 @@ VALID_WORKER_RESULT = 'WORKER_OUTCOME: {"kind":"ready_for_validation"}\nvalid re
 
 
 class ExecutionHandlerTests(TestCase):
+    def test_rebase_journal_match_requires_run_identity_only_for_v2(self):
+        context = SimpleNamespace(
+            plan=SimpleNamespace(plan_id='G-047'),
+            branch='loop-manager/G-047', worktree=Path('/state/G-047'),
+            worker_session_id='worker-session',
+        )
+        observed = {'head': 'after', 'branch': context.branch}
+        transition = {
+            'intent': {
+                'kind': 'managed_rebase',
+                'target': str(context.worktree.resolve()),
+                'expected': {
+                    'branch': context.branch, 'run_id': 'other-run',
+                    'checkpoint_generation': 2, 'before_head': 'before',
+                    'target_base_oid': 'base', 'remote_oid': 'remote',
+                },
+            },
+            'result': {'observed': observed},
+        }
+        current = SimpleNamespace(
+            expected_head='before', target_base_oid='base', generation=2,
+            snapshot={'rebase_evidence_version': 2, 'rebase_run_id': 'run'},
+        )
+        with mock.patch.object(
+            handlers.manager_git_journal, 'verified_managed_transitions',
+            return_value=[transition],
+        ):
+            self.assertFalse(self.handler._matching_rebase_journal_result(
+                context, current, 'remote', observed,
+            ))
+            transition['intent']['expected']['run_id'] = 'run'
+            self.assertTrue(self.handler._matching_rebase_journal_result(
+                context, current, 'remote', observed,
+            ))
+            transition['intent']['expected']['checkpoint_generation'] = 3
+            self.assertFalse(self.handler._matching_rebase_journal_result(
+                context, current, 'remote', observed,
+            ))
+
     def test_review_budget_pauses_before_worker_and_preserves_projection(self):
         run_id = handlers.recovery_state.begin_external_run(self.connection)
         feedback = ValidationFeedbackRepository(self.connection)
