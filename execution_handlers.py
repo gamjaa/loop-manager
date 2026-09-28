@@ -1490,7 +1490,7 @@ class ExecutionHandlers:
             )
         return result
 
-    def _finish_rebase_journal(self, context, *, allow_equal=False):
+    def _rebase_journal_checks(self, context):
         def proof(intent, observed):
             if intent['expected'].get('evidence_version') == 2:
                 return manager_git_journal.rebase_replay_proof(
@@ -1586,6 +1586,10 @@ class ExecutionHandlers:
                 ),
             )
 
+        return proof, validate
+
+    def _finish_rebase_journal(self, context, *, allow_equal=False):
+        proof, validate = self._rebase_journal_checks(context)
         return manager_git_journal.complete_rebase(
             self.state_dir, repo=str(self.repo_path.resolve()),
             target=str(context.worktree.resolve()),
@@ -1797,15 +1801,42 @@ class ExecutionHandlers:
             stash_oid=(stash_oid if unmerged and not in_progress else None),
         )
 
-    def _complete_rebase_intent(self, context):
+    def _complete_rebase_intent(self, context, *, project_values=None):
         checkpoint = self.effects.checkpoint
         if checkpoint is None:
             return
         current = checkpoint.get(self.repo, context.plan.plan_id)
         if current.operation != 'rebase':
             return
-        head = self.effects.workspace.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
-        saved_snapshot = current.snapshot or {}
+        proof, validate = self._rebase_journal_checks(context)
+        result = manager_git_journal.verified_rebase_completion(
+            self.state_dir, repo=str(self.repo_path.resolve()),
+            target=str(context.worktree.resolve()),
+            owner=f'plan:{context.plan.plan_id}', branch=context.branch,
+            before_head=current.expected_head,
+            target_base_oid=current.target_base_oid,
+            remote_oid=current.observed_remote_oid,
+            agent_session_id=getattr(context, 'worker_session_id', None),
+            run_id=(current.snapshot or {}).get('rebase_run_id'),
+            checkpoint_generation=current.generation,
+            observe=lambda: self._rebase_journal_state(context),
+            validate=validate, replay_proof=proof,
+        )
+        intent = result['intent']
+        expected = intent['expected']
+        observed = result['result']['observed']
+        if observed.get('metadata') is not None:
+            raise manager_git_journal.MutationEvidenceError(
+                'rebase completion: Git operation is still in progress'
+            )
+        completion = {
+            'id': intent['id'], 'run_id': expected.get('run_id'),
+            'intent_generation': expected.get('checkpoint_generation'),
+            'before_head': expected['before_head'],
+            'target_base_oid': expected['target_base_oid'],
+            'remote_oid': expected['remote_oid'], 'head': observed['head'],
+        }
+        published_proof = None
         published = self.effects.state.connection.execute(
             'SELECT phase, accepted_remote_oid FROM blocked_checkpoints '
             'WHERE repo = ? AND plan_id = ?',
@@ -1818,25 +1849,30 @@ class ExecutionHandlers:
                     or remote_oid != published['accepted_remote_oid']
                     or row['publication_remote_oid'] not in (None, '', remote_oid)
                     or not self._owned_completed_rebase(
-                        context, row, remote_oid, current, published, None, head,
+                        context, row, remote_oid, current, published,
+                        None, observed['head'],
                     )):
                 raise manager_git_journal.MutationEvidenceError(
                     '게시 checkpoint의 완료 rebase 소유권을 증명할 수 없습니다.'
                 )
-            completion = self._completed_rebase_proof(
-                context, current, remote_oid, self._rebase_journal_state(context),
+            published_proof = self._completed_rebase_proof(
+                context, current, remote_oid, observed,
             )
-            if completion is None:
+            if published_proof is None:
                 raise manager_git_journal.MutationEvidenceError(
                     '게시 checkpoint의 완료 rebase journal identity가 다릅니다.'
                 )
-            saved_snapshot = {**saved_snapshot, 'completed_rebase': completion}
-        checkpoint.record(
-            self.repo, context.plan.plan_id,
-            expected_generation=current.generation, operation=None,
-            expected_head=head, target_base_oid=current.target_base_oid,
-            observed_remote_oid=current.observed_remote_oid,
-            snapshot=saved_snapshot,
+        values = project_values or {
+            'phase': 'VERIFYING', 'active_sha': current.target_base_oid,
+            'validated_base_sha': None, 'last_error': None,
+            'revision_resume_status': None,
+            'verify_result': None, 'review_result': None,
+            'verify_token': None, 'review_token': None,
+            'publication_token': None,
+        }
+        self.effects.state.complete_rebase(
+            checkpoint, completion=completion, project_values=values,
+            published_proof=published_proof,
         )
 
     def _publication_intent(self, context, operation, remote_oid):
@@ -2044,7 +2080,17 @@ class ExecutionHandlers:
                     context=context,
                 )
             if current.operation == 'rebase':
-                self._finish_rebase_journal(context)
+                finished = self._finish_rebase_journal(context)
+                active_rebase = manager_git_journal._slot(
+                    self.state_dir, str(self.repo_path.resolve()),
+                    'managed_rebase', str(context.worktree.resolve()),
+                ) / 'active.json'
+                if (not self.effects.workspace._rebase_in_progress_for_branch(
+                        context.worktree, context.branch)
+                        and not self._unmerged_stages(context.worktree)
+                        and (finished or not active_rebase.exists())):
+                    self._complete_rebase_intent(context)
+                    return self._context()
             marker = (current.snapshot or {}).get('blocked_resume')
             if (self.newly_activated and marker
                     and (snapshot.local_head != marker['after_head']
@@ -2187,13 +2233,15 @@ class ExecutionHandlers:
                 if continued.returncode:
                     return self._recover(RecoveryReason.REBASE_CONTINUE_FAILED,
                                          continued.output[-8000:], context=context)
-                self.effects.state.correct_checkpoint(
-                    phase='VERIFYING',
-                    active_sha=str(current.target_base_oid or base_oid),
-                    validated_base_sha=None, invalidate_validation=True,
-                    expected_catalog=catalog_marker,
-                )
-                self._complete_rebase_intent(context)
+                self._complete_rebase_intent(context, project_values={
+                    'phase': 'VERIFYING',
+                    'active_sha': str(current.target_base_oid or base_oid),
+                    'validated_base_sha': None, 'last_error': None,
+                    'revision_resume_status': None,
+                    'verify_result': None, 'review_result': None,
+                    'verify_token': None, 'review_token': None,
+                    'publication_token': None,
+                })
                 return self._context()
             if decision.action is CheckpointAction.CONTINUE:
                 return context
@@ -2211,24 +2259,12 @@ class ExecutionHandlers:
                 return self._context()
             if decision.action is CheckpointAction.CORRECT:
                 completion = None
-                published = self.effects.state.connection.execute(
-                    'SELECT 1 FROM blocked_checkpoints WHERE repo = ? AND plan_id = ? '
-                    "AND phase = 'published'",
-                    (self.repo, context.plan.plan_id),
-                ).fetchone()
-                if current.operation == 'rebase' and published is not None:
-                    completion = self._completed_rebase_proof(
-                        context, current, remote_oid,
-                        self._rebase_journal_state(context),
+                if current.operation == 'rebase':
+                    return self._recover(
+                        RecoveryReason.OWNERSHIP_UNCERTAIN,
+                        'rebase checkpoint correction lacks a sealed completion',
+                        context=context,
                     )
-                    if completion is None and (current.snapshot or {}).get(
-                        'rebase_evidence_version',
-                    ) == 2:
-                        return self._recover(
-                            RecoveryReason.OWNERSHIP_UNCERTAIN,
-                            '완료된 Manager rebase의 journal identity가 다릅니다.',
-                            context=context,
-                        )
                 self.effects.state.correct_checkpoint(
                     phase=decision.phase, active_sha=decision.active_sha,
                     validated_base_sha=decision.validated_base_sha,
@@ -2590,8 +2626,13 @@ class ExecutionHandlers:
                 RecoveryReason.REBASE_CONFLICT if in_progress else RecoveryReason.WORKTREE_RECOVERY_FAILED,
                 rebase_failure, context=context,
             )
-        self.effects.state.update_project(self.repo, active_sha=latest_sha)
-        self._complete_rebase_intent(context)
+        self._complete_rebase_intent(context, project_values={
+            'phase': 'WORKING', 'active_sha': latest_sha,
+            'validated_base_sha': None, 'last_error': None,
+            'verify_result': None, 'review_result': None,
+            'verify_token': None, 'review_token': None,
+            'publication_token': None,
+        })
         if (
             decision.phase != 'IMPLEMENTING'
             and not self.effects.workspace.branch_has_changes(
@@ -3687,8 +3728,13 @@ class ExecutionHandlers:
                     or row['active_sha'] or ''
                 )
             )
-            self.effects.state.update_project(self.repo, active_sha=latest_sha)
-            self._complete_rebase_intent(context)
+            self._complete_rebase_intent(context, project_values={
+                'phase': 'WORKING', 'active_sha': latest_sha,
+                'validated_base_sha': None, 'last_error': None,
+                'verify_result': None, 'review_result': None,
+                'verify_token': None, 'review_token': None,
+                'publication_token': None,
+            })
             if self.effects.agent.validate_guidance_publication(
                 self.repo,
                 context.worktree,
@@ -4100,19 +4146,13 @@ class ExecutionHandlers:
                 RecoveryReason.REBASE_CONFLICT if in_progress else RecoveryReason.WORKTREE_RECOVERY_FAILED,
                 rebase_failure, context=context,
             )
-        self.effects.state.update_project(
-            self.repo,
-            active_sha=latest_sha,
-            phase='VERIFYING',
-            revision_resume_status=None,
-            validated_base_sha=None,
-            verify_result=None,
-            review_result=None,
-            verify_token=None,
-            review_token=None,
-            publication_token=None,
-        )
-        self._complete_rebase_intent(context)
+        self._complete_rebase_intent(context, project_values={
+            'active_sha': latest_sha, 'phase': 'VERIFYING',
+            'revision_resume_status': None, 'validated_base_sha': None,
+            'last_error': None, 'verify_result': None, 'review_result': None,
+            'verify_token': None, 'review_token': None,
+            'publication_token': None,
+        })
         if self.effects.agent.validate_guidance_publication(
             self.repo,
             context.worktree,

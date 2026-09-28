@@ -36,6 +36,99 @@ class CheckpointRepositoryTests(unittest.TestCase):
             snapshot={'completed_rebase': {'generation': 3}},
         ).completed_rebase())
 
+    def test_rebase_completion_rolls_back_checkpoint_when_projection_fails(self):
+        connection = test_runtime_state.RuntimeStateRepositoryTest()._connection()
+        self.addCleanup(connection.close)
+        runtime = runtime_state.RuntimeStateRepository(connection)
+        runtime.activate('repo', 'G-047', activation_sha='old-base',
+                         branch='loop/G-047', worktree='/owned')
+        checkpoint = ExecutionCheckpointRepository(connection)
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0, operation='rebase',
+            expected_head='old-head', target_base_oid='new-base',
+            observed_remote_oid=None, snapshot={'rebase_run_id': 'run-1'},
+        )
+        before = checkpoint.get('repo', 'G-047')
+        original = runtime.projected('repo')
+        def fail(stage):
+            if stage == 'after_execplan_update':
+                raise RuntimeError('projection interrupted')
+        failing = runtime_state.RuntimeStateRepository(connection, fault_hook=fail)
+        with self.assertRaisesRegex(RuntimeError, 'projection interrupted'):
+            failing.complete_rebase(
+                original, checkpoint, completion={
+                    'id': 'result-1', 'run_id': 'run-1',
+                    'intent_generation': 1, 'before_head': 'old-head',
+                    'target_base_oid': 'new-base', 'remote_oid': None,
+                    'head': 'new-head',
+                },
+                project_values={'phase': 'VERIFYING', 'active_sha': 'new-base'},
+            )
+        self.assertEqual(checkpoint.get('repo', 'G-047'), before)
+        self.assertEqual(runtime.projected('repo'), original)
+
+    def test_rebase_completion_updates_checkpoint_and_projection_once(self):
+        connection = test_runtime_state.RuntimeStateRepositoryTest()._connection()
+        self.addCleanup(connection.close)
+        runtime = runtime_state.RuntimeStateRepository(connection)
+        runtime.activate('repo', 'G-047', activation_sha='old-base',
+                         branch='loop/G-047', worktree='/owned')
+        checkpoint = ExecutionCheckpointRepository(connection)
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0, operation='rebase',
+            expected_head='old-head', target_base_oid='new-base',
+            observed_remote_oid='remote', snapshot={
+                'rebase_run_id': 'run-1', 'pending': 'continue',
+                'worker_result': 'approved', 'stage_evidence': {'tree': 'tree'},
+                'stash_oid': 'saved-stash',
+            },
+        )
+        completion = {
+            'id': 'result-1', 'run_id': 'run-1', 'intent_generation': 1,
+            'before_head': 'old-head', 'target_base_oid': 'new-base',
+            'remote_oid': 'remote', 'head': 'new-head',
+        }
+        values = {
+            'phase': 'VERIFYING', 'active_sha': 'new-base',
+            'validated_base_sha': None, 'verify_result': None,
+            'review_result': None,
+        }
+        published_proof = {
+            'generation': 1, 'journal_id': 'result-1',
+            'before_head': 'old-head', 'after_head': 'new-head',
+            'remote_oid': 'remote',
+        }
+        original = runtime.projected('repo')
+        completed = runtime.complete_rebase(
+            original, checkpoint, completion=completion, project_values=values,
+            published_proof=published_proof,
+        )
+        saved = checkpoint.get('repo', 'G-047')
+        self.assertIsNone(saved.operation)
+        self.assertEqual(saved.snapshot['rebase_completion'], completion)
+        self.assertEqual(saved.completed_rebase(), published_proof)
+        self.assertNotIn('pending', saved.snapshot)
+        self.assertNotIn('stash_oid', saved.snapshot)
+        self.assertEqual(completed.status, 'VERIFYING')
+        self.assertEqual(connection.execute(
+            "SELECT active_sha FROM projects WHERE repo = 'repo'"
+        ).fetchone()[0], 'new-base')
+        self.assertEqual(runtime.complete_rebase(
+            completed, checkpoint, completion=completion, project_values=values,
+            published_proof=published_proof,
+        ), completed)
+        self.assertEqual(checkpoint.get('repo', 'G-047').generation, saved.generation)
+        with self.assertRaises(runtime_state.RuntimeStateError):
+            runtime.complete_rebase(
+                completed, checkpoint, completion=completion, project_values=values,
+                published_proof={**published_proof, 'journal_id': 'other'},
+            )
+        with self.assertRaises(runtime_state.RuntimeStateError):
+            runtime.complete_rebase(
+                completed, checkpoint, completion={**completion, 'id': 'other'},
+                project_values=values,
+            )
+
     def test_intent_and_completion_reject_stale_generation(self):
         connection = sqlite3.connect(':memory:')
         connection.row_factory = sqlite3.Row

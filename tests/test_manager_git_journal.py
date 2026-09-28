@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import manager_git_journal as journal
 
@@ -11,6 +12,109 @@ REF = "refs/remotes/origin/main"
 
 
 class ManagerGitTransitionTests(unittest.TestCase):
+    def test_legacy_resolution_uses_approved_commit_before_later_same_file_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            slot = journal._slot(state, '/repo', 'managed_rebase', '/owned')
+            slot.mkdir(parents=True)
+            expected = {
+                'branch': 'loop-manager/G-100', 'before_head': OLD,
+                'target_base_oid': NEW, 'remote_oid': OLD,
+                'agent_session_id': 'worker-1',
+            }
+            initial = {
+                'id': 'initial', 'repo': '/repo', 'target': '/owned',
+                'owner': 'plan:G-100', 'before': {
+                    'head': OLD, 'metadata': None,
+                }, 'expected': expected,
+            }
+            final = {
+                **initial, 'id': 'resolution', 'before': {
+                    'head': NEW, 'dirty': {'same.txt': [['staged'], 'approved']},
+                }, 'expected': {
+                    **expected, 'action': 'continue',
+                    'staged_tree_oid': 'c' * 40,
+                    'accepted_files': {'same.txt': 'approved'},
+                },
+            }
+            journal._write_new(slot / 'initial.intent.json', initial)
+            journal._write_new(slot / 'initial.result.json', {
+                'id': 'initial', 'status': 'complete', 'candidates': {},
+                'observed': {'metadata': {'onto': NEW}},
+            })
+            replay_oids = ['d' * 40, 'e' * 40]
+            facts = {
+                replay_oids[0]: {'oid': replay_oids[0], 'parent': NEW,
+                                 'tree': 'c' * 40},
+                replay_oids[1]: {'oid': replay_oids[1],
+                                 'parent': replay_oids[0], 'tree': 'f' * 40},
+            }
+            proof = [{'source': '1' * 40, 'replayed': replay_oids[0]},
+                     {'source': '2' * 40, 'replayed': replay_oids[1]}]
+            with (mock.patch.object(journal.replay_evidence, 'source_commits',
+                                    return_value=(OLD, ['1' * 40, '2' * 40])),
+                  mock.patch.object(journal.replay_evidence, 'replay_commits',
+                                    return_value=replay_oids),
+                  mock.patch.object(journal.replay_evidence, 'commit_fact',
+                                    side_effect=lambda _git, _repo, oid: facts.get(oid, {})),
+                  mock.patch.object(journal.replay_evidence, 'verify_replay',
+                                    return_value=proof) as verify):
+                self.assertEqual(journal.legacy_rebase_replay_proof(
+                    mock.Mock(), state, final, {'head': replay_oids[1]},
+                ), proof)
+                self.assertEqual(verify.call_args.kwargs['corrections']['1' * 40]['tree'],
+                                 'c' * 40)
+                other_session = {**initial, 'expected': {
+                    **expected, 'agent_session_id': 'worker-2',
+                }}
+                (slot / 'initial.intent.json').write_text(
+                    journal.json.dumps(other_session), encoding='utf-8',
+                )
+                with self.assertRaises(journal.MutationEvidenceError):
+                    journal.legacy_rebase_replay_proof(
+                        mock.Mock(), state, final, {'head': replay_oids[1]},
+                    )
+
+    def test_sealed_rebase_completion_rechecks_identity_generation_and_live_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            before = {'head': OLD}
+            observed = {'head': NEW, 'metadata': None}
+            expected = {
+                'branch': 'loop-manager/G-100', 'before_head': OLD,
+                'target_base_oid': NEW, 'remote_oid': OLD,
+                'agent_session_id': 'worker-1', 'run_id': 'run-1',
+                'checkpoint_generation': 3,
+            }
+            identity = journal.begin_rebase(
+                state, owner='plan:G-100', repo='/repo', target='/owned',
+                before=before, expected=expected,
+            )
+            validate = lambda _intent, _observed: {'selected': {'head': NEW}}
+            proof = lambda _intent, _observed: [{'source': OLD, 'replayed': NEW}]
+            self.assertTrue(journal.complete_rebase(
+                state, repo='/repo', target='/owned', observe=lambda: observed,
+                validate=validate, replay_proof=proof,
+            ))
+            arguments = dict(
+                state_dir=state, repo='/repo', target='/owned',
+                owner='plan:G-100', branch='loop-manager/G-100',
+                before_head=OLD, target_base_oid=NEW, remote_oid=OLD,
+                agent_session_id='worker-1', run_id='run-1',
+                checkpoint_generation=4, observe=lambda: observed,
+                validate=validate, replay_proof=proof,
+            )
+            self.assertEqual(journal.verified_rebase_completion(**arguments)['intent']['id'], identity)
+            for changed in (
+                {'agent_session_id': 'worker-2'},
+                {'run_id': 'run-2'},
+                {'checkpoint_generation': 2},
+                {'observe': lambda: {'head': OLD, 'metadata': None}},
+                {'replay_proof': lambda *_: []},
+            ):
+                with self.subTest(changed=list(changed)), self.assertRaises(journal.MutationEvidenceError):
+                    journal.verified_rebase_completion(**{**arguments, **changed})
+
     def test_fetch_requires_owned_marker_and_exact_live_result(self):
         intent = {
             "kind": "project_fetch", "target": REF,

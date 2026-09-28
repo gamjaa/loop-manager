@@ -424,6 +424,52 @@ class ExecutionHandlerTests(TestCase):
                 context, current, 'remote', observed,
             ))
 
+    def test_sealed_rebase_completion_updates_runtime_without_repeating_git(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        self.state.update_project(
+            'repo', phase='WORKING', worker_session_id='saved-session',
+            worker_result='accepted correction',
+            verify_result='previous pass', review_result='previous review',
+        )
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0, operation='rebase',
+            expected_head='before', target_base_oid='new-base',
+            observed_remote_oid=None,
+            snapshot={'rebase_run_id': 'run-1', 'pending': 'continue'},
+        )
+        context = self.context()
+        intent = {'id': 'result-1', 'expected': {
+            'run_id': 'run-1', 'checkpoint_generation': 1,
+            'before_head': 'before', 'target_base_oid': 'new-base',
+            'remote_oid': None,
+        }}
+        sealed = {'intent': intent, 'result': {'observed': {
+            'head': 'after', 'metadata': None,
+        }}}
+        self.handler._complete_rebase_intent = (
+            handlers.ExecutionHandlers._complete_rebase_intent.__get__(self.handler)
+        )
+        self.handler._rebase_journal_checks = mock.Mock(return_value=(
+            mock.Mock(), mock.Mock(),
+        ))
+        with mock.patch.object(
+            handlers.manager_git_journal, 'verified_rebase_completion',
+            return_value=sealed,
+        ) as verified:
+            self.handler._complete_rebase_intent(context)
+            self.assertEqual(verified.call_args.kwargs['run_id'], 'run-1')
+        saved = checkpoint.get('repo', 'G-047')
+        self.assertIsNone(saved.operation)
+        self.assertEqual(saved.snapshot['rebase_completion']['id'], 'result-1')
+        self.assertEqual(self.state.row()['phase'], 'VERIFYING')
+        self.assertIsNone(self.state.row()['verify_result'])
+        self.assertIsNone(self.state.row()['review_result'])
+        self.assertEqual(self.state.row()['worker_session_id'], 'saved-session')
+        self.assertEqual(self.state.row()['worker_result'], 'accepted correction')
+        self.effects.workspace.git.assert_not_called()
+
     def test_review_budget_pauses_before_worker_and_preserves_projection(self):
         run_id = handlers.recovery_state.begin_external_run(self.connection)
         feedback = ValidationFeedbackRepository(self.connection)
@@ -780,6 +826,21 @@ class ExecutionHandlerTests(TestCase):
             return_value='test-rebase-token',
         )
         self.handler._finish_rebase_journal = mock.Mock(return_value=True)
+        def fake_complete_rebase(context, *, project_values=None):
+            checkpoint = self.handler.effects.checkpoint
+            if checkpoint is not None:
+                current = checkpoint.get('repo', context.plan.plan_id)
+                if current.operation == 'rebase':
+                    checkpoint.record(
+                        'repo', context.plan.plan_id,
+                        expected_generation=current.generation, operation=None,
+                        expected_head=self.remote, target_base_oid=current.target_base_oid,
+                        observed_remote_oid=current.observed_remote_oid,
+                        snapshot=current.snapshot,
+                    )
+            if project_values:
+                self.state.update_project('repo', **project_values)
+        self.handler._complete_rebase_intent = mock.Mock(side_effect=fake_complete_rebase)
 
         def fake_rebase(context, target_oid, *, autostash=False):
             arguments = ('--autostash', target_oid) if autostash else (target_oid,)

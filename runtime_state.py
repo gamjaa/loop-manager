@@ -640,6 +640,54 @@ class RuntimeStateRepository:
             if enqueue:
                 self._enqueue(repo)
 
+    def complete_rebase(
+        self, expected, checkpoint_repository, *, completion: Mapping[str, object],
+        project_values: Mapping[str, object],
+        published_proof: Mapping[str, object] | None = None,
+    ):
+        """Apply one sealed journal result to checkpoint and both runtime rows."""
+        repo, plan_id = expected.repo, expected.plan_id
+        with _transaction(self.connection):
+            current = checkpoint_repository.get(repo, plan_id)
+            snapshot = current.snapshot or {}
+            if current.operation is None:
+                if (snapshot.get('rebase_completion') != dict(completion)
+                        or (published_proof is not None
+                            and snapshot.get('completed_rebase') != dict(published_proof))
+                        or current.expected_head != completion['head']):
+                    raise RuntimeStateError('rebase completion identity changed')
+                return self.projected(repo)
+            if (current.operation != 'rebase'
+                    or current.expected_head != completion['before_head']
+                    or current.target_base_oid != completion['target_base_oid']
+                    or current.observed_remote_oid != completion['remote_oid']
+                    or (completion.get('run_id') is not None and (
+                        snapshot.get('rebase_run_id') != completion['run_id']
+                        or current.generation < completion['intent_generation']
+                    ))):
+                raise RuntimeStateError('rebase checkpoint differs from sealed result')
+            cleared = dict(snapshot)
+            for key in ('pending', 'stage_evidence', 'worker_result',
+                        'unmerged_index', 'after_head', 'stash_oid'):
+                cleared.pop(key, None)
+            cleared['rebase_completion'] = dict(completion)
+            if published_proof is not None:
+                cleared['completed_rebase'] = dict(published_proof)
+            checkpoint_repository.record(
+                repo, plan_id, expected_generation=current.generation,
+                operation=None, expected_head=str(completion['head']),
+                target_base_oid=current.target_base_oid,
+                observed_remote_oid=current.observed_remote_oid,
+                snapshot=cleared,
+            )
+            plan_values = dict(project_values)
+            if 'phase' in plan_values:
+                plan_values['status'] = execplan_status_for_phase(plan_values.pop('phase'))
+            return self.transition_from_snapshot(
+                expected, plan_values=plan_values,
+                project_values=project_values,
+            )
+
     def mirror_project_values(
         self,
         repo: str,

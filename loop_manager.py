@@ -9315,9 +9315,16 @@ def _finish_owned_direct_rebase(
     )
 
     def replay_proof(intent, observed):
-        return manager_git_journal.rebase_replay_proof(
-            git, state_dir, intent, observed,
-        )
+        if intent['expected'].get('evidence_version') == 2:
+            return manager_git_journal.rebase_replay_proof(
+                git, state_dir, intent, observed,
+            )
+        if (observed.get('metadata') is None
+                and intent['expected'].get('staged_tree_oid')):
+            return manager_git_journal.legacy_rebase_replay_proof(
+                git, state_dir, intent, observed,
+            )
+        return None
 
     def validate(intent: Mapping[str, object], observed: Mapping[str, object]):
         expected = intent["expected"]
@@ -9372,6 +9379,11 @@ def _finish_owned_direct_rebase(
                 git, worktree, head=observed["head"], identity=intent["id"],
             )
             patches = False
+        accepted_correction = bool(replay_proof(intent, observed)) if (
+            expected.get('evidence_version') != 2
+            and expected.get('staged_tree_oid')
+            and observed.get('metadata') is None
+        ) else False
         ancestor = git(worktree, "merge-base", "--is-ancestor",
                        expected["target_base_oid"], observed["head"], check=False)
         replay_verified = False
@@ -9385,6 +9397,7 @@ def _finish_owned_direct_rebase(
             ),
             target_ancestor=ancestor.returncode == 0,
             patches_preserved=patches, reflog_marker=marker,
+            accepted_correction=accepted_correction,
             autostash_owned=bool((checkpoint.snapshot or {}).get("stash_oid")),
             replay_verified=replay_verified,
         )
@@ -9395,10 +9408,7 @@ def _finish_owned_direct_rebase(
         observe=lambda: _owned_rebase_journal_state(worktree, branch),
         validate=validate,
         allow_equal=allow_equal,
-        replay_proof=lambda intent, observed: (
-            replay_proof(intent, observed)
-            if intent['expected'].get('evidence_version') == 2 else None
-        ),
+        replay_proof=replay_proof,
     )
 
 
@@ -9409,8 +9419,9 @@ def _journaled_direct_rebase(
 ) -> subprocess.CompletedProcess[str]:
     state_dir = _owned_rebase_state_dir(repo, plan_id, worktree)
     if state_dir is None:
-        return git(worktree, "rebase", *(("--autostash",) if autostash else ()),
-                   target_oid, check=False)
+        raise manager_git_journal.MutationEvidenceError(
+            'direct rebase: owned journal workspace unavailable'
+        )
     before = _owned_rebase_journal_state(worktree, branch)
     checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
     current = checkpoint.get(repo, plan_id)
@@ -9493,6 +9504,14 @@ def _journaled_direct_rebase(
         state_dir, connection, repo_path, repo, plan_id, worktree, branch,
         allow_equal=True, agent_session_id=agent_session_id,
     )
+    if (result.returncode == 0
+            and not _rebase_in_progress_for_branch(worktree, branch)
+            and not git(worktree, 'ls-files', '-u', '-z').stdout):
+        _complete_direct_rebase_checkpoint(
+            connection, repo, plan_id, worktree, target_oid,
+            repo_path=repo_path, branch=branch,
+            agent_session_id=agent_session_id,
+        )
     return result
 
 
@@ -9529,18 +9548,68 @@ def _direct_rebase_history_proven(
 def _complete_direct_rebase_checkpoint(
     connection: sqlite3.Connection, repo: str, plan_id: str,
     worktree: Path, target_base_oid: str,
+    *, repo_path: Path, branch: str, agent_session_id: str | None,
 ) -> None:
     repository = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
     current = repository.get(repo, plan_id)
     if current.operation == "rebase":
-        repository.record(
-            repo, plan_id, expected_generation=current.generation,
-            operation=None,
-            expected_head=git(worktree, "rev-parse", "HEAD").stdout.strip(),
-            target_base_oid=target_base_oid,
-            observed_remote_oid=current.observed_remote_oid,
-            snapshot=current.snapshot,
+        state_dir = _owned_rebase_state_dir(repo, plan_id, worktree)
+        if state_dir is None or current.target_base_oid != target_base_oid:
+            raise manager_git_journal.MutationEvidenceError(
+                'direct rebase completion: journal or target missing'
+            )
+        observed = _owned_rebase_journal_state(worktree, branch)
+        transitions = manager_git_journal.verified_managed_transitions(
+            state_dir, str(_canonical_path(repo_path)), f'plan:{plan_id}',
+            agent_session_id=agent_session_id, git=git,
         )
+        matching = [item for item in transitions
+                    if item['intent']['kind'] == 'managed_rebase'
+                    and item['intent']['target'] == str(_canonical_path(worktree))
+                    and item['intent']['expected']['before_head'] == current.expected_head
+                    and item['intent']['expected']['target_base_oid'] == target_base_oid
+                    and item['intent']['expected']['remote_oid'] == current.observed_remote_oid
+                    and item['intent']['expected'].get('run_id') ==
+                    (current.snapshot or {}).get('rebase_run_id')
+                    and item['result']['observed'] == observed
+                    and observed.get('metadata') is None]
+        if len(matching) != 1:
+            raise manager_git_journal.MutationEvidenceError(
+                'direct rebase completion: unique owned result unavailable'
+            )
+        intent = matching[0]['intent']
+        completion = {
+            'id': intent['id'], 'run_id': intent['expected'].get('run_id'),
+            'intent_generation': intent['expected'].get('checkpoint_generation'),
+            'before_head': current.expected_head, 'target_base_oid': target_base_oid,
+            'remote_oid': current.observed_remote_oid, 'head': observed['head'],
+        }
+        runtime = runtime_state.RuntimeStateRepository(connection)
+        projected = runtime.projected(repo)
+        if projected is not None and projected.plan_id == plan_id:
+            runtime.complete_rebase(
+                projected, repository, completion=completion,
+                project_values={
+                    'phase': 'VERIFYING', 'active_sha': target_base_oid,
+                    'validated_base_sha': None, 'last_error': None,
+                    'verify_result': None, 'review_result': None,
+                    'verify_token': None, 'review_token': None,
+                    'publication_token': None,
+                },
+            )
+        else:
+            cleared = dict(current.snapshot or {})
+            for key in ('pending', 'stage_evidence', 'worker_result',
+                        'unmerged_index', 'after_head', 'stash_oid'):
+                cleared.pop(key, None)
+            cleared['rebase_completion'] = completion
+            repository.record(
+                repo, plan_id, expected_generation=current.generation,
+                operation=None, expected_head=observed['head'],
+                target_base_oid=target_base_oid,
+                observed_remote_oid=current.observed_remote_oid,
+                snapshot=cleared,
+            )
 
 
 def validate_managed_worktree(
@@ -14819,25 +14888,37 @@ def _resume_interrupted_blocked_rebase(
         )
         if safe:
             state_dir = _owned_rebase_state_dir(repo, str(plan['plan_id']), worktree)
-            if state_dir is not None:
+            if state_dir is None:
+                safe = False
+            else:
                 _finish_owned_direct_rebase(
                     state_dir, connection, repo_path, repo,
                     str(plan['plan_id']), worktree, branch,
                     agent_session_id=plan['worker_session_id'],
                 )
-            safe = (
-                _direct_rebase_history_proven(
-                    connection, repo_path, repo, str(plan['plan_id']), worktree,
-                    branch, before_head, current_head, target_base,
-                    plan['worker_session_id'],
+                safe = (
+                    _direct_rebase_history_proven(
+                        connection, repo_path, repo, str(plan['plan_id']), worktree,
+                        branch, before_head, current_head, target_base,
+                        plan['worker_session_id'],
+                    )
+                    and _blocked_resume_worktree_matches(worktree, marker, snapshot)
                 )
-                and _blocked_resume_worktree_matches(worktree, marker, snapshot)
-            )
     except (OSError, RuntimeError, ValueError, KeyError, TypeError):
         safe = False
     if not safe:
         _update_blocked_error(connection, repo, str(plan['plan_id']),
                               '중단된 차단 해제 rebase의 게시 소유권과 HEAD를 증명할 수 없습니다.')
+        return False
+    try:
+        _complete_direct_rebase_checkpoint(
+            connection, repo, str(plan['plan_id']), worktree, target_base,
+            repo_path=repo_path, branch=branch,
+            agent_session_id=plan['worker_session_id'],
+        )
+    except (RuntimeError, OSError, ValueError) as error:
+        _update_blocked_error(connection, repo, str(plan['plan_id']),
+                              f'중단된 차단 해제 rebase 완료 근거가 다릅니다: {error}')
         return False
     if not after_head:
         _record_blocked_resume_head(
@@ -15129,6 +15210,8 @@ def resume_blocked_execplan_if_inputs_changed(
     elif base_ancestry.returncode == 1:
         _complete_direct_rebase_checkpoint(
             connection, repo, str(plan['plan_id']), worktree, target_base_oid,
+            repo_path=repo_path, branch=branch,
+            agent_session_id=plan['worker_session_id'],
         )
 
     clear_agent_scope(connection, repo)
@@ -18040,6 +18123,14 @@ def resume_pr_conflict_rebase(
             str(plan['plan_id']), worktree, branch,
             agent_session_id=plan['worker_session_id'],
         )
+        if execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
+                repo, str(plan['plan_id'])).operation == 'rebase' and not _rebase_in_progress_for_branch(worktree, branch):
+            _complete_direct_rebase_checkpoint(
+                connection, repo, str(plan['plan_id']), worktree,
+                target_base_oid=str(project['pr_conflict_base_oid'] or ''),
+                repo_path=repo_path, branch=branch,
+                agent_session_id=plan['worker_session_id'],
+            )
 
     latest_base = git(
         repo_path,
@@ -18096,6 +18187,12 @@ def resume_pr_conflict_rebase(
         )
         return 0
     if rebased.returncode == 0:
+        if state_dir is not None:
+            _complete_direct_rebase_checkpoint(
+                connection, repo, str(plan['plan_id']), worktree, target_base,
+                repo_path=repo_path, branch=branch,
+                agent_session_id=plan['worker_session_id'],
+            )
         update_project(
             connection,
             repo,

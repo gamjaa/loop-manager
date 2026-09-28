@@ -763,6 +763,8 @@ class ManagedTransitionTests(unittest.TestCase):
                     self.assertEqual(args, ('reflog', 'show', '-1',
                                             '--format=%H%x00%gs', f'refs/heads/{BRANCH}'))
                     return SimpleNamespace(returncode=0, stdout='\n'.join(reflog[:1]))
+                if args[0] == 'rev-parse':
+                    return SimpleNamespace(returncode=0, stdout=observed['head'] + '\n')
                 return SimpleNamespace(returncode=0, stdout='')
 
             with (mock.patch.object(loop_manager, 'git', side_effect=git),
@@ -830,8 +832,27 @@ class ManagedTransitionTests(unittest.TestCase):
             self.assertEqual(len(journal.verified_managed_transitions(
                 state, repo_key, 'plan:G-091', git=git,
             )), 1)
+            live_oid[0] = NEW
+            with self.assertRaises(journal.MutationEvidenceError):
+                journal.verified_managed_transitions(
+                    state, repo_key, 'plan:G-091', git=git,
+                )
+            live_oid[0] = OLD
+            with (mock.patch.object(loop_manager, 'git', side_effect=git),
+                  mock.patch.object(loop_manager, '_owned_rebase_journal_state',
+                                    side_effect=lambda *_: observed.copy()),
+                  mock.patch.object(loop_manager.runtime_state,
+                                    'RuntimeStateRepository') as runtime):
+                runtime.return_value.projected.return_value = None
+                loop_manager._complete_direct_rebase_checkpoint(
+                    connection, repo_key, 'G-091', worktree, NEW,
+                    repo_path=repo, branch=BRANCH, agent_session_id=None,
+                )
+            saved = ExecutionCheckpointRepository(connection).get(repo_key, 'G-091')
+            self.assertIsNone(saved.operation)
+            self.assertEqual(saved.snapshot['rebase_completion']['head'], NEW)
 
-    def test_completed_direct_rebase_clears_only_its_checkpoint_operation(self):
+    def test_direct_rebase_without_sealed_result_keeps_checkpoint_operation(self):
         connection = sqlite3.connect(':memory:')
         connection.row_factory = sqlite3.Row
         self.addCleanup(connection.close)
@@ -841,15 +862,15 @@ class ManagedTransitionTests(unittest.TestCase):
             expected_head=OLD, target_base_oid=NEW,
             observed_remote_oid=OLD, snapshot={'owned': True},
         )
-        with mock.patch.object(loop_manager, 'git', return_value=SimpleNamespace(
-            stdout=NEW + '\n', returncode=0,
-        )):
+        with self.assertRaises(journal.MutationEvidenceError):
             loop_manager._complete_direct_rebase_checkpoint(
                 connection, 'repo', 'G-091', Path('/owned'), NEW,
+                repo_path=Path('/repo'), branch=BRANCH,
+                agent_session_id=None,
             )
         current = repository.get('repo', 'G-091')
-        self.assertIsNone(current.operation)
-        self.assertEqual(current.expected_head, NEW)
+        self.assertEqual(current.operation, 'rebase')
+        self.assertEqual(current.expected_head, OLD)
         self.assertEqual(current.observed_remote_oid, OLD)
         self.assertEqual(current.snapshot, {'owned': True})
 
