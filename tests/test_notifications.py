@@ -61,6 +61,63 @@ class NotificationFixture:
 
 
 class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
+    def test_released_planning_duplicates_keep_delivered_notice_not_unsent_latest(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        loop_manager.update_project(connection, repo, planning_error="owner mismatch")
+        first = connection.execute(
+            "SELECT block_key, event_key, payload FROM notified_block_incidents "
+            "WHERE repo = ? AND subject = 'planning'", (repo,),
+        ).fetchone()
+        latest_key = first["event_key"] + ":unsent"
+        with connection:
+            connection.execute(
+                "UPDATE notification_outbox SET sent_at = CURRENT_TIMESTAMP, "
+                "confirmed_pieces = 1 WHERE event_key = ?",
+                (first["event_key"],),
+            )
+            connection.execute(
+                "UPDATE notified_block_incidents SET released_at = CURRENT_TIMESTAMP "
+                "WHERE event_key = ?", (first["event_key"],),
+            )
+            connection.execute(
+                "INSERT INTO notified_block_incidents "
+                "(repo, subject, block_key, event_key, payload, released_at) "
+                "VALUES (?, 'planning', ?, ?, ?, CURRENT_TIMESTAMP)",
+                (repo, first["block_key"], latest_key, first["payload"]),
+            )
+            connection.execute(
+                "INSERT INTO notification_outbox "
+                "(event_key, repo, event_type, payload, canceled_at) "
+                "VALUES (?, ?, 'blocked', ?, CURRENT_TIMESTAMP)",
+                (latest_key, repo, first["payload"]),
+            )
+
+        for _ in range(3):
+            with connection:
+                notifications.enqueue_current_project_events(connection, repo)
+            self.assertIsNotNone(connection.execute(
+                "SELECT canceled_at FROM notification_outbox WHERE event_key = ?",
+                (latest_key,),
+            ).fetchone()[0])
+        self.assertEqual(notifications.dispatch_pending(
+            connection, "token", "chat", adapter=mock.Mock(),
+        ), 0)
+        self.assertEqual(connection.execute(
+            "SELECT COUNT(*) FROM notified_block_incidents "
+            "WHERE repo = ? AND subject = 'planning'", (repo,),
+        ).fetchone()[0], 2)
+
+        loop_manager.update_project(connection, repo, planning_error=None)
+        with connection:
+            self.assertEqual(notifications.record_work_start(
+                connection, repo, "Planner",
+            ), 1)
+        self.assertEqual(connection.execute(
+            "SELECT COUNT(*) FROM notification_outbox "
+            "WHERE repo = ? AND event_type = 'resumed'", (repo,),
+        ).fetchone()[0], 1)
+
     def test_release_of_duplicate_active_planning_incidents_resumes_once(self):
         connection = self.connection()
         repo = "/projects/alpha"
