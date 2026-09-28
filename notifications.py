@@ -329,6 +329,7 @@ def _carry_planning_delivery(
     ).fetchall()
     confirmed_payload = None
     confirmed_from_older = False
+    retry_row = None
     for row in rows:
         try:
             same_cause = (row[1] == block_key
@@ -343,6 +344,8 @@ def _carry_planning_delivery(
         if (int(row[5]) > 0 or int(row[6] or 0) > 0 or row[7] is not None):
             confirmed_payload = row[3]
             confirmed_from_older = int(row[0]) != incident_id
+            retry_row = (row if confirmed_from_older
+                         and int(row[6] or 0) > 0 and row[7] is None else None)
     if confirmed_payload is None:
         return False
     connection.execute(
@@ -350,6 +353,17 @@ def _carry_planning_delivery(
         "payload = ? WHERE id = ?",
         (confirmed_payload, incident_id),
     )
+    if retry_row is not None:
+        # A false release canceled the unfinished pieces. Keep the original
+        # cursor retryable while the newer duplicate notice stays canceled.
+        connection.execute(
+            "UPDATE notified_block_incidents SET released_at = NULL WHERE id = ?",
+            (retry_row[0],),
+        )
+        connection.execute(
+            "UPDATE notification_outbox SET canceled_at = NULL "
+            "WHERE event_key = ? AND sent_at IS NULL", (retry_row[2],),
+        )
     if confirmed_from_older:
         connection.execute(
             "UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP, "
@@ -589,7 +603,16 @@ def record_work_start(
                 "WHERE id = ? AND started_operation IS NULL",
                 (operation, row[0]),
             )
-            queued += _materialize_resumption(connection, int(row[0]))
+            materialized = _materialize_resumption(connection, int(row[0]))
+            queued += materialized
+            if subject == "planning" and not materialized:
+                # A real Planner start closes even an unsent block episode.
+                # Timestamps alone cannot distinguish a same-second restart.
+                connection.execute(
+                    "UPDATE notified_block_incidents SET resumed_at = "
+                    "CURRENT_TIMESTAMP WHERE id = ? AND resumed_at IS NULL",
+                    (row[0],),
+                )
     return queued
 
 
