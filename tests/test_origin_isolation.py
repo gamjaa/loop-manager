@@ -104,6 +104,63 @@ def advance_remote(writer: Path, *, path: str = "tracked.txt", value: str = "two
 
 
 class OriginIsolatedRegistrationAndExecutionTest(unittest.TestCase):
+    def test_self_runtime_identity_rejects_alias_and_other_clone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _remote, source, other_clone = remote_fixture(directory)
+            state_dir = Path(directory) / "state"
+            state_dir.mkdir()
+            runtime_path = state_dir / "runtime"
+            selected = git(source, "rev-parse", "HEAD")
+            git(source, "worktree", "add", "--detach", str(runtime_path), selected)
+            with sqlite3.connect(state_dir / "loop-manager.db") as connection:
+                connection.execute(loop_manager.SCHEMA)
+                connection.execute(
+                    "INSERT INTO projects (repo, base_branch, origin) VALUES (?, ?, ?)",
+                    (str(source), "develop", "owner/repo"),
+                )
+            runtime = loop_manager.RuntimeMutation(
+                source, runtime_path, selected, "a" * 32,
+            )
+            alias = Path(directory) / "source-alias"
+            alias.symlink_to(source, target_is_directory=True)
+            project = lambda path, origin="owner/repo": loop_manager.project_registry.RegisteredProject(
+                str(path), "develop", "codex", None, False, origin,
+            )
+            with mock.patch.object(loop_manager, "ROOT", runtime_path), mock.patch(
+                "loop_manager.github_repository", return_value="owner/repo"
+            ):
+                self.assertTrue(
+                    loop_manager._registered_self_runtime_project(
+                        project(source), runtime, state_dir,
+                    )
+                )
+                for path in (other_clone, alias, source / "subdir", runtime_path):
+                    self.assertFalse(
+                        loop_manager._registered_self_runtime_project(
+                            project(path), runtime, state_dir,
+                        )
+                    )
+                with self.assertRaisesRegex(RuntimeError, "origin"):
+                    loop_manager._registered_self_runtime_project(
+                        project(source, "another/repo"), runtime, state_dir,
+                    )
+                self.assertEqual(
+                    loop_manager.bootstrap_base_branch(
+                        source, state_dir, "owner/repo",
+                    ),
+                    "develop",
+                )
+                with sqlite3.connect(state_dir / "loop-manager.db") as connection:
+                    connection.execute(
+                        "UPDATE projects SET repo = ?", (str(alias),)
+                    )
+                self.assertEqual(
+                    loop_manager.bootstrap_base_branch(
+                        source, state_dir, "owner/repo",
+                    ),
+                    "main",
+                )
+
     def test_project_fetch_recovers_owned_ref_update_after_result_write_crash(self):
         with tempfile.TemporaryDirectory() as directory:
             _remote, source, writer = remote_fixture(directory)
