@@ -321,7 +321,8 @@ def _carry_planning_delivery(
 
     rows = connection.execute(
         "SELECT i.id, i.block_key, i.event_key, i.payload, i.resumed_at, "
-        "i.confirmed_before, o.confirmed_pieces, o.sent_at, o.created_at "
+        "i.confirmed_before, o.confirmed_pieces, o.sent_at, o.created_at, "
+        "i.started_operation "
         "FROM notified_block_incidents i LEFT JOIN notification_outbox o "
         "ON o.event_key = i.event_key "
         "WHERE i.repo = ? AND i.subject = 'planning' AND i.id <= ? "
@@ -336,7 +337,7 @@ def _carry_planning_delivery(
                           and json.loads(str(row[3])).get("cause") == cause)
         except (TypeError, ValueError, AttributeError):
             same_cause = False
-        if (not same_cause or row[4] is not None
+        if (not same_cause or row[4] is not None or row[9] is not None
                 or (row[8] is not None and _planner_started_after_notice(
                     connection, repo, str(row[8]),
                 ))):
@@ -393,13 +394,15 @@ def _queue_block(
         # started, keeping its delivery audit and identity intact.
         previous = connection.execute(
             "SELECT i.id, i.block_key, i.event_key, i.confirmed_before, "
-            "i.version, i.payload, o.created_at FROM notified_block_incidents i "
+            "i.version, i.payload, o.created_at, i.started_operation "
+            "FROM notified_block_incidents i "
             "JOIN notification_outbox o ON o.event_key = i.event_key "
             "WHERE i.repo = ? AND i.subject = 'planning' "
             "ORDER BY i.id DESC LIMIT 1", (repo,),
         ).fetchone()
         if (previous is not None and previous[1] == block_key
                 and previous[5] is not None
+                and previous[7] is None
                 and json.loads(str(previous[5])).get("cause") == payload.get("cause")
                 and not _planner_started_after_notice(
                     connection, repo, str(previous[6]),
@@ -603,16 +606,7 @@ def record_work_start(
                 "WHERE id = ? AND started_operation IS NULL",
                 (operation, row[0]),
             )
-            materialized = _materialize_resumption(connection, int(row[0]))
-            queued += materialized
-            if subject == "planning" and not materialized:
-                # A real Planner start closes even an unsent block episode.
-                # Timestamps alone cannot distinguish a same-second restart.
-                connection.execute(
-                    "UPDATE notified_block_incidents SET resumed_at = "
-                    "CURRENT_TIMESTAMP WHERE id = ? AND resumed_at IS NULL",
-                    (row[0],),
-                )
+            queued += _materialize_resumption(connection, int(row[0]))
     return queued
 
 

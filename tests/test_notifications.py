@@ -61,6 +61,40 @@ class NotificationFixture:
 
 
 class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
+    def test_inflight_planning_piece_confirmed_after_start_still_resumes(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        loop_manager.update_project(connection, repo, planning_error="x" * 9000)
+        incident_id = connection.execute(
+            "SELECT id FROM notified_block_incidents "
+            "WHERE repo = ? AND subject = 'planning'", (repo,),
+        ).fetchone()[0]
+
+        def release_during_first_piece(_token, _chat, _text):
+            loop_manager.update_project(connection, repo, planning_error=None)
+            with connection:
+                self.assertEqual(notifications.record_work_start(
+                    connection, repo, "Planner",
+                ), 0)
+            incident = connection.execute(
+                "SELECT started_operation, resumed_at "
+                "FROM notified_block_incidents WHERE id = ?", (incident_id,),
+            ).fetchone()
+            self.assertEqual(incident["started_operation"], "Planner")
+            self.assertIsNone(incident["resumed_at"])
+
+        self.assertEqual(notifications.dispatch_pending(
+            connection, "token", "chat", adapter=release_during_first_piece,
+        ), 0)
+        self.assertEqual(connection.execute(
+            "SELECT COUNT(*) FROM notification_outbox "
+            "WHERE repo = ? AND event_type = 'resumed'", (repo,),
+        ).fetchone()[0], 1)
+        self.assertIsNotNone(connection.execute(
+            "SELECT resumed_at FROM notified_block_incidents WHERE id = ?",
+            (incident_id,),
+        ).fetchone()[0])
+
     def test_released_partial_planning_notice_retries_original_remaining_piece(self):
         connection = self.connection()
         repo = "/projects/alpha"
@@ -131,10 +165,12 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
             self.assertEqual(notifications.record_work_start(
                 connection, repo, "Planner",
             ), 0)
-        self.assertIsNotNone(connection.execute(
-            "SELECT resumed_at FROM notified_block_incidents WHERE id = ?",
-            (first_id,),
-        ).fetchone()[0])
+        started = connection.execute(
+            "SELECT started_operation, resumed_at FROM notified_block_incidents "
+            "WHERE id = ?", (first_id,),
+        ).fetchone()
+        self.assertEqual(started["started_operation"], "Planner")
+        self.assertIsNone(started["resumed_at"])
         notice_created_at = connection.execute(
             "SELECT o.created_at FROM notification_outbox o "
             "JOIN notified_block_incidents i ON i.event_key = o.event_key "
