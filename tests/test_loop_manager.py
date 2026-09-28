@@ -13109,7 +13109,10 @@ class MergeIndependentWorktreeCleanupTest(unittest.TestCase):
 
     def test_pr_queries_request_immutable_head_oid(self):
         response = subprocess.CompletedProcess(
-            ["gh"], 0, stdout='{"url":"u","state":"MERGED","mergedAt":"t","headRefOid":"abc"}'
+            ["gh"], 0, stdout=(
+                '{"url":"u","state":"MERGED","mergedAt":"t",'
+                '"headRefOid":"abc","baseRefName":"main"}'
+            ),
         )
         with mock.patch("loop_manager.command", return_value=response) as command:
             row = loop_manager.pr_for_branch(
@@ -13117,7 +13120,9 @@ class MergeIndependentWorktreeCleanupTest(unittest.TestCase):
             )
 
         self.assertEqual(row["headRefOid"], "abc")
+        self.assertEqual(row["baseRefName"], "main")
         self.assertIn("headRefOid", command.call_args.args[0][-1])
+        self.assertIn("baseRefName", command.call_args.args[0][-1])
         self.assertIn("mergeable", command.call_args.args[0][-1])
 
     def test_main_rejects_unknown_options_before_state_creation(self):
@@ -14523,6 +14528,196 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             head_oid,
         )
 
+    def test_self_merge_handoff_persists_merge_before_parallel_submission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state_dir, connection, branch, worktree, url, head = (
+                self._pr_open_state(directory)
+            )
+            old_sha = git_command(repo, "rev-parse", "HEAD")
+            runtime_path = state_dir / "runtime"
+            git_command(repo, "worktree", "add", "--detach", str(runtime_path), old_sha)
+            git_command(worktree, "push", "origin", "HEAD:main")
+            other = str((Path(directory) / "other").resolve())
+            with connection:
+                connection.execute(
+                    "INSERT INTO projects (repo, base_branch, worker_session_id, "
+                    "worktree, planning_retry_count) "
+                    "VALUES (?, 'main', 'peer-session', '/peer-worktree', 2)",
+                    (other,),
+                )
+            merged = self._pull_request(branch, url, head, "UNKNOWN", state="MERGED")
+            merged["mergedAt"] = "2026-09-24T00:00:00Z"
+            runtime = loop_manager.RuntimeMutation(
+                repo, runtime_path, old_sha, "a" * 32,
+            )
+            config = loop_manager.ManagedConfig(
+                path=Path(directory) / "config.ini", max_workers=2,
+                telegram_token="test-token", telegram_chat_id="test-chat",
+            )
+            try:
+                with mock.patch.object(loop_manager, "ROOT", runtime_path), mock.patch(
+                    "loop_manager.github_repository", return_value="owner/repo"
+                ), mock.patch(
+                    "loop_manager.pr_for_branch", return_value=merged
+                ), mock.patch("loop_manager.run_project_result") as run_project:
+                    with self.assertRaises(loop_manager.SelfMergeRuntimeHandoff):
+                        loop_manager.schedule_registered_projects(
+                            connection, state_dir, config, runtime_mutation=runtime,
+                        )
+                run_project.assert_not_called()
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT status FROM exec_plans WHERE repo = ? AND plan_id = 'G-026'",
+                        (str(repo),),
+                    ).fetchone()["status"],
+                    "MERGED",
+                )
+                self.assertEqual(git_command(repo, "rev-parse", "HEAD"), head)
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT enabled FROM notification_session"
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertIsNone(
+                    connection.execute(
+                        "SELECT last_error FROM projects WHERE repo = ?", (other,)
+                    ).fetchone()["last_error"]
+                )
+                self.assertEqual(
+                    tuple(connection.execute(
+                        "SELECT worker_session_id, worktree, planning_retry_count "
+                        "FROM projects WHERE repo = ?", (other,),
+                    ).fetchone()),
+                    ("peer-session", "/peer-worktree", 2),
+                )
+            finally:
+                connection.close()
+
+    def test_self_merge_requires_pr_targeting_registered_base(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state_dir, connection, branch, worktree, url, head = (
+                self._pr_open_state(directory)
+            )
+            old_sha = git_command(repo, "rev-parse", "HEAD")
+            runtime_path = state_dir / "runtime"
+            git_command(repo, "worktree", "add", "--detach", str(runtime_path), old_sha)
+            git_command(worktree, "push", "origin", "HEAD:main")
+            runtime = loop_manager.RuntimeMutation(repo, runtime_path, old_sha, "a" * 32)
+            config = loop_manager.ManagedConfig(
+                path=Path(directory) / "config.ini", max_workers=1,
+                telegram_token="", telegram_chat_id="",
+            )
+            try:
+                for target in ("release", None):
+                    with self.subTest(target=target):
+                        merged = self._pull_request(
+                            branch, url, head, "UNKNOWN", state="MERGED",
+                        )
+                        merged["mergedAt"] = "2026-09-24T00:00:00Z"
+                        merged["baseRefName"] = target
+                        with mock.patch.object(loop_manager, "ROOT", runtime_path), mock.patch(
+                            "loop_manager.github_repository", return_value="owner/repo"
+                        ), mock.patch(
+                            "loop_manager.pr_for_branch", return_value=merged
+                        ), mock.patch("loop_manager.run_project_result") as run_project:
+                            with self.assertRaises(loop_manager.PublicationSafetyError):
+                                loop_manager.schedule_registered_projects(
+                                    connection, state_dir, config,
+                                    runtime_mutation=runtime,
+                                )
+                        run_project.assert_not_called()
+                        self.assertEqual(
+                            connection.execute(
+                                "SELECT status FROM exec_plans "
+                                "WHERE repo = ? AND plan_id = 'G-026'", (str(repo),)
+                            ).fetchone()["status"],
+                            "PR_OPEN",
+                        )
+                        self.assertEqual(git_command(repo, "rev-parse", "HEAD"), old_sha)
+            finally:
+                connection.close()
+
+    def test_self_merge_at_current_runtime_continues(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state_dir, connection, branch, worktree, url, head = (
+                self._pr_open_state(directory)
+            )
+            git_command(worktree, "push", "origin", "HEAD:main")
+            git_command(repo, "fetch", "origin")
+            runtime_path = state_dir / "runtime"
+            git_command(repo, "worktree", "add", "--detach", str(runtime_path), head)
+            merged = self._pull_request(branch, url, head, "UNKNOWN", state="MERGED")
+            merged["mergedAt"] = "2026-09-24T00:00:00Z"
+            runtime = loop_manager.RuntimeMutation(repo, runtime_path, head, "a" * 32)
+            config = loop_manager.ManagedConfig(
+                path=Path(directory) / "config.ini", max_workers=1,
+                telegram_token="", telegram_chat_id="",
+            )
+            try:
+                with mock.patch.object(loop_manager, "ROOT", runtime_path), mock.patch(
+                    "loop_manager.github_repository", return_value="owner/repo"
+                ), mock.patch(
+                    "loop_manager.pr_for_branch", return_value=merged
+                ), mock.patch(
+                    "loop_manager._run_registered_project",
+                    return_value=loop_manager.ScheduledProjectResult(
+                        str(repo), loop_manager.ProjectRunResult(
+                            loop_manager.ProjectRunKind.WAITING, 0,
+                        ),
+                    ),
+                ) as run_project:
+                    outcomes = loop_manager.schedule_registered_projects(
+                        connection, state_dir, config, runtime_mutation=runtime,
+                    )
+                self.assertEqual(len(outcomes), 1)
+                run_project.assert_called_once()
+            finally:
+                connection.close()
+
+    def test_merge_observed_after_preflight_stops_before_archive_or_planner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, state_dir, connection, branch, worktree, url, head = (
+                self._pr_open_state(directory)
+            )
+            old_sha = git_command(repo, "rev-parse", "HEAD")
+            runtime_path = state_dir / "runtime"
+            git_command(repo, "worktree", "add", "--detach", str(runtime_path), old_sha)
+            git_command(worktree, "push", "origin", "HEAD:main")
+            merged = self._pull_request(branch, url, head, "UNKNOWN", state="MERGED")
+            merged["mergedAt"] = "2026-09-24T00:00:00Z"
+            runtime = loop_manager.RuntimeMutation(repo, runtime_path, old_sha, "a" * 32)
+            gate = loop_manager.RuntimeHandoffGate(threading.Event(), threading.Lock())
+            token = loop_manager._runtime_handoff_signal.set(gate)
+            try:
+                with mock.patch.object(loop_manager, "ROOT", runtime_path), mock.patch(
+                    "loop_manager.github_repository", return_value="owner/repo"
+                ), mock.patch(
+                    "loop_manager.validate_repository", return_value=repo,
+                ), mock.patch(
+                    "loop_manager.pr_for_branch", return_value=merged,
+                ), mock.patch(
+                    "loop_manager.dispatch_execplan_archive_housekeeping",
+                ) as archive, mock.patch("loop_manager.run_codex") as planner:
+                    with self.assertRaises(loop_manager.SelfMergeRuntimeHandoff):
+                        loop_manager.run_project_result(
+                            connection, state_dir, str(repo), Path("unused.ini"),
+                            "main", False, runtime_mutation=runtime,
+                        )
+                archive.assert_not_called()
+                planner.assert_not_called()
+                self.assertTrue(gate.event.is_set())
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT status FROM exec_plans WHERE repo = ? AND plan_id = 'G-026'",
+                        (str(repo),),
+                    ).fetchone()["status"],
+                    "MERGED",
+                )
+            finally:
+                loop_manager._runtime_handoff_signal.reset(token)
+                connection.close()
+
     def _advance_base(
         self,
         directory: str,
@@ -14558,6 +14753,7 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             "mergedAt": None,
             "headRefOid": head_oid,
             "headRefName": branch,
+            "baseRefName": "main",
             "mergeable": mergeable,
         }
 
@@ -16705,6 +16901,404 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                 self.assertEqual(self._source_checkout_snapshot(repo), source_before)
 
 class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
+    def test_handoff_run_reaps_child_and_closes_pipes_on_interruption(self):
+        for error in (KeyboardInterrupt(), RuntimeError("communication failed")):
+            with self.subTest(error=type(error).__name__):
+                gate = loop_manager.RuntimeHandoffGate(threading.Event(), threading.Lock())
+                token = loop_manager._runtime_handoff_signal.set(gate)
+                process = subprocess.Popen(
+                    [sys.executable, "-c", "import time; time.sleep(60)"],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                try:
+                    with mock.patch.object(
+                        loop_manager.RuntimeHandoffGate, "popen", return_value=process,
+                    ), mock.patch.object(process, "communicate", side_effect=error):
+                        with self.assertRaises(type(error)) as raised:
+                            loop_manager._handoff_run(["agent"], input=b"prompt")
+                    self.assertIs(raised.exception, error)
+                    self.assertIsNotNone(process.returncode)
+                    self.assertIsNotNone(process.poll())
+                    for pipe in (process.stdin, process.stdout, process.stderr):
+                        self.assertTrue(pipe.closed)
+                finally:
+                    loop_manager._runtime_handoff_signal.reset(token)
+                    if process.poll() is None:
+                        process.kill()
+                    process.wait()
+                    for pipe in (process.stdin, process.stdout, process.stderr):
+                        pipe.close()
+
+    def test_handoff_launch_gate_allows_concurrent_running_agents(self):
+        gate = loop_manager.RuntimeHandoffGate(threading.Event(), threading.Lock())
+        both_started = threading.Event()
+        release = threading.Event()
+        guard = threading.Lock()
+        starts = 0
+        results: list[int] = []
+
+        class Process:
+            returncode = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def communicate(self, _input, *, timeout):
+                self_test.assertTrue(release.wait(timeout=2))
+                return "", None
+
+        self_test = self
+
+        def start_process(*_args, **_kwargs):
+            nonlocal starts
+            with guard:
+                starts += 1
+                if starts == 2:
+                    both_started.set()
+            return Process()
+
+        def run_one() -> None:
+            token = loop_manager._runtime_handoff_signal.set(gate)
+            try:
+                result = loop_manager._handoff_run(
+                    ["agent"], input="prompt", text=True, timeout=2,
+                )
+                results.append(result.returncode)
+            finally:
+                loop_manager._runtime_handoff_signal.reset(token)
+
+        with mock.patch("loop_manager.subprocess.Popen", side_effect=start_process):
+            workers = [threading.Thread(target=run_one) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            try:
+                self.assertTrue(both_started.wait(timeout=2))
+            finally:
+                release.set()
+                for worker in workers:
+                    worker.join(timeout=2)
+        self.assertEqual(sorted(results), [0, 0])
+
+    def test_handoff_between_entry_check_and_launch_blocks_agent_and_verify(self):
+        for phase in ("agent", "verify"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                worktree = Path(directory)
+                (worktree / "scripts").mkdir()
+                (worktree / "scripts/verify.sh").write_text("#!/bin/sh\nexit 0\n")
+                gate = loop_manager.RuntimeHandoffGate(
+                    threading.Event(), threading.Lock(),
+                )
+                entered = threading.Event()
+                release = threading.Event()
+                observed: list[type[BaseException]] = []
+
+                def wait_before_launch(*_args, **_kwargs):
+                    entered.set()
+                    self.assertTrue(release.wait(timeout=2))
+                    if phase == "agent":
+                        return {}
+                    return gate.popen(*_args, **_kwargs)
+
+                def run_one() -> None:
+                    token = loop_manager._runtime_handoff_signal.set(gate)
+                    try:
+                        if phase == "agent":
+                            loop_manager.run_codex(
+                                worktree, worktree / "state", worktree / "config.ini",
+                                "planner", "prompt", read_only=True,
+                            )
+                        else:
+                            loop_manager.verify(worktree)
+                    except BaseException as error:
+                        observed.append(type(error))
+                    finally:
+                        loop_manager._runtime_handoff_signal.reset(token)
+
+                with mock.patch(
+                    "loop_manager.role", return_value=("model", "medium"),
+                ), mock.patch(
+                    "loop_manager.agent_environment", side_effect=wait_before_launch,
+                ), (
+                    mock.patch(
+                        "loop_manager._handoff_popen", side_effect=wait_before_launch,
+                    ) if phase == "verify" else contextlib.nullcontext()
+                ), mock.patch("loop_manager.subprocess.Popen") as popen:
+                    worker = threading.Thread(target=run_one)
+                    worker.start()
+                    try:
+                        self.assertTrue(entered.wait(timeout=2))
+                        gate.stop()
+                    finally:
+                        release.set()
+                        worker.join(timeout=2)
+                    self.assertFalse(worker.is_alive())
+                    popen.assert_not_called()
+                self.assertEqual(observed, [loop_manager.SelfMergeRuntimeHandoff])
+
+    def test_handoff_gate_blocks_new_publication_git_process(self):
+        gate = loop_manager.RuntimeHandoffGate(threading.Event(), threading.Lock())
+        token = loop_manager._runtime_handoff_signal.set(gate)
+        try:
+            gate.stop()
+            with mock.patch("loop_manager.subprocess.Popen") as popen:
+                with self.assertRaises(loop_manager.SelfMergeRuntimeHandoff):
+                    loop_manager.command(["git", "push", "origin", "branch"])
+                popen.assert_not_called()
+        finally:
+            loop_manager._runtime_handoff_signal.reset(token)
+
+    def test_preflight_handoff_returns_success_without_post_dispatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _state_dir, connection, config, _repos = self._scheduler_state(
+                directory, ("manager",), max_workers=1,
+            )
+            try:
+                with mock.patch(
+                    "loop_manager.schedule_registered_projects",
+                    side_effect=loop_manager.SelfMergeRuntimeHandoff,
+                ), mock.patch(
+                    "loop_manager.notifications.dispatch_pending",
+                ) as dispatch:
+                    self.assertEqual(
+                        loop_manager.run_registered_projects(
+                            connection, Path(directory) / "state", config,
+                        ),
+                        0,
+                    )
+                    dispatch.assert_called_once()
+            finally:
+                connection.close()
+
+    def test_late_handoff_signal_stops_new_agent_verify_and_project_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir, connection, config, repos = self._scheduler_state(
+                directory, ("manager",), max_workers=1,
+            )
+            gate = loop_manager.RuntimeHandoffGate(threading.Event(), threading.Lock())
+            project = loop_manager.project_registry.list_projects(connection)[0]
+            try:
+                with mock.patch(
+                    "loop_manager.run_project_result",
+                    side_effect=loop_manager.SelfMergeRuntimeHandoff,
+                ):
+                    result = loop_manager._run_registered_project(
+                        project, state_dir, config.path, "", "", threading.Lock(),
+                        config.refactoring_review_interval,
+                        handoff_gate=gate,
+                    )
+                self.assertEqual(
+                    result.result.kind, loop_manager.ProjectRunKind.RUNTIME_HANDOFF,
+                )
+                self.assertTrue(gate.event.is_set())
+                token = loop_manager._runtime_handoff_signal.set(gate)
+                try:
+                    with mock.patch("loop_manager.agent_provider") as agent:
+                        with self.assertRaises(loop_manager.SelfMergeRuntimeHandoff):
+                            loop_manager.run_agent(
+                                "codex", Path(repos[0]), state_dir, config.path,
+                                "worker", "prompt", read_only=False,
+                            )
+                        agent.assert_not_called()
+                    with mock.patch("loop_manager.run_verify_process") as verify_process:
+                        with self.assertRaises(loop_manager.SelfMergeRuntimeHandoff):
+                            loop_manager.verify(Path(repos[0]))
+                        verify_process.assert_not_called()
+                finally:
+                    loop_manager._runtime_handoff_signal.reset(token)
+            finally:
+                connection.close()
+
+    def test_runtime_handoff_finishes_external_run_without_failure_event(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir, connection, config, repos = self._scheduler_state(
+                directory, ("manager",), max_workers=1,
+            )
+            try:
+                loop_manager.notifications.configure_session(connection, enabled=False)
+                connection.commit()
+                with mock.patch(
+                    "loop_manager._run_project_result",
+                    side_effect=loop_manager.SelfMergeRuntimeHandoff,
+                ):
+                    with self.assertRaises(loop_manager.SelfMergeRuntimeHandoff):
+                        loop_manager.run_project_result(
+                            connection, state_dir, repos[0], config.path,
+                            None, False, registered_only=True,
+                        )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM recovery_records WHERE repo = ?",
+                        (repos[0],),
+                    ).fetchone()[0],
+                    0,
+                )
+            finally:
+                connection.close()
+
+    def test_merge_observation_handoff_precedes_source_and_conflict_work(self):
+        observation = loop_manager.WaitingPullRequestObservation(
+            (), True, ("https://example.test/pr/1",),
+        )
+        after_source = mock.Mock()
+        with mock.patch(
+            "loop_manager.observe_waiting_pull_requests", return_value=observation,
+        ), mock.patch("loop_manager.select_waiting_pull_request_conflict") as conflict:
+            with self.assertRaises(loop_manager.SelfMergeRuntimeHandoff):
+                loop_manager.synchronize_waiting_pull_requests(
+                    mock.Mock(), Path("/repo"), Path("/state"), "/repo",
+                    after_observation=mock.Mock(
+                        side_effect=loop_manager.SelfMergeRuntimeHandoff,
+                    ),
+                    after_reconciliation=after_source,
+                )
+        after_source.assert_not_called()
+        conflict.assert_not_called()
+
+    def test_self_merge_handoff_uses_registered_base_after_skipped_or_failed_sync(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir, connection, _config, repos = self._scheduler_state(
+                directory, ("manager",), max_workers=1,
+            )
+            with connection:
+                connection.execute(
+                    "UPDATE projects SET base_branch = 'develop' WHERE repo = ?",
+                    (repos[0],),
+                )
+            project = loop_manager.project_registry.list_projects(connection)[0]
+            runtime = loop_manager.RuntimeMutation(
+                Path(repos[0]), state_dir / "runtime", "a" * 40, "b" * 32,
+            )
+            observation = loop_manager.WaitingPullRequestObservation(
+                (), True, ("https://example.test/pr/1",),
+            )
+            try:
+                for status in ("skipped", "failed"):
+                    with self.subTest(status=status), mock.patch(
+                        "loop_manager._registered_self_runtime_project", return_value=True
+                    ), mock.patch(
+                        "loop_manager.observe_waiting_pull_requests",
+                        return_value=observation,
+                    ), mock.patch(
+                        "loop_manager.ensure_safe_base_worktree",
+                        return_value=loop_manager.BaseWorktreeSyncResult(
+                            status, "local checkout preserved", "c" * 40,
+                        ),
+                    ) as synchronize, mock.patch(
+                        "loop_manager.git",
+                        side_effect=lambda _repo, command, *args, **_kwargs: subprocess.CompletedProcess(
+                            [command, *args], 0, stdout=("c" * 40 + "\n")
+                            if command == "rev-parse" else "",
+                        ),
+                    ):
+                        with self.assertRaises(loop_manager.SelfMergeRuntimeHandoff):
+                            loop_manager._preflight_self_merge_handoff(
+                                connection, (project,), state_dir, runtime,
+                            )
+                        self.assertEqual(synchronize.call_args.args[1], "develop")
+                        self.assertEqual(
+                            synchronize.call_args.kwargs["remote_sha"], "c" * 40,
+                        )
+            finally:
+                connection.close()
+
+    def test_self_preflight_keeps_running_without_new_merge_and_rejects_uncertain_fetch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir, connection, _config, repos = self._scheduler_state(
+                directory, ("manager",), max_workers=1,
+            )
+            project = loop_manager.project_registry.list_projects(connection)[0]
+            runtime = loop_manager.RuntimeMutation(
+                Path(repos[0]), state_dir / "runtime", "a" * 40, "b" * 32,
+            )
+            try:
+                with mock.patch(
+                    "loop_manager._registered_self_runtime_project", return_value=True
+                ), mock.patch(
+                    "loop_manager.observe_waiting_pull_requests",
+                    return_value=loop_manager.WaitingPullRequestObservation((), False),
+                ), mock.patch("loop_manager.ensure_safe_base_worktree") as synchronize:
+                    self.assertIsNone(loop_manager._preflight_self_merge_handoff(
+                        connection, (project,), state_dir, runtime,
+                    ))
+                    synchronize.assert_not_called()
+                with mock.patch(
+                    "loop_manager._registered_self_runtime_project", return_value=True
+                ), mock.patch(
+                    "loop_manager.observe_waiting_pull_requests",
+                    side_effect=RuntimeError("fetch failed"),
+                ), mock.patch("loop_manager.ensure_safe_base_worktree") as synchronize:
+                    with self.assertRaisesRegex(RuntimeError, "fetch failed"):
+                        loop_manager._preflight_self_merge_handoff(
+                            connection, (project,), state_dir, runtime,
+                        )
+                    synchronize.assert_not_called()
+            finally:
+                connection.close()
+
+    def test_self_merge_rejects_non_fast_forward_runtime_relation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir, connection, _config, repos = self._scheduler_state(
+                directory, ("manager",), max_workers=1,
+            )
+            project = loop_manager.project_registry.list_projects(connection)[0]
+            runtime = loop_manager.RuntimeMutation(
+                Path(repos[0]), state_dir / "runtime", "a" * 40, "b" * 32,
+            )
+            observation = loop_manager.WaitingPullRequestObservation(
+                (), True, ("https://example.test/pr/1",),
+            )
+            def git_result(_repo, command, *arguments, **_kwargs):
+                if command == "merge-base":
+                    return subprocess.CompletedProcess(
+                        [command, *arguments], 1, stdout="",
+                    )
+                return subprocess.CompletedProcess(
+                    [command, *arguments], 0, stdout="c" * 40 + "\n",
+                )
+            try:
+                with mock.patch(
+                    "loop_manager._registered_self_runtime_project", return_value=True
+                ), mock.patch(
+                    "loop_manager.git", side_effect=git_result,
+                ), mock.patch(
+                    "loop_manager.ensure_safe_base_worktree",
+                    return_value=loop_manager.BaseWorktreeSyncResult(
+                        "skipped", "local checkout preserved", "c" * 40,
+                    ),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "fast-forward"):
+                        loop_manager._finish_self_merge_handoff(
+                            connection, project, state_dir, runtime, observation,
+                        )
+            finally:
+                connection.close()
+
+    def test_other_project_merge_does_not_signal_runtime_handoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir, connection, _config, repos = self._scheduler_state(
+                directory, ("manager", "peer"), max_workers=2,
+            )
+            runtime = loop_manager.RuntimeMutation(
+                Path(repos[0]), state_dir / "runtime", "a" * 40, "b" * 32,
+            )
+            try:
+                with mock.patch(
+                    "loop_manager._registered_self_runtime_project",
+                    return_value=False,
+                ), mock.patch("loop_manager._finish_self_merge_handoff") as finish:
+                    loop_manager._handoff_observed_self_merge(
+                        connection, repos[1], state_dir, runtime,
+                        loop_manager.WaitingPullRequestObservation(
+                            (), True, ("https://example.test/pr/peer",),
+                        ),
+                    )
+                    finish.assert_not_called()
+            finally:
+                connection.close()
+
     def _scheduler_state(
         self,
         directory: str,

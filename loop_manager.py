@@ -8,6 +8,7 @@ from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 import configparser
 import contextlib
+from contextvars import ContextVar
 import difflib
 import errno
 from dataclasses import dataclass, replace
@@ -427,6 +428,7 @@ class ProjectRunKind(str, Enum):
     USAGE_LIMIT_PAUSE = "usage_limit_pause"
     CONFIGURATION_ERROR = "configuration_error"
     OPERATIONAL_ERROR = "operational_error"
+    RUNTIME_HANDOFF = "runtime_handoff"
 
 
 @dataclass(frozen=True)
@@ -1442,7 +1444,8 @@ def bootstrap_base_branch(source: Path, state_dir: Path, origin: str) -> str:
         rows = connection.execute(
             f"SELECT repo, base_branch, {origin_column} FROM projects {registered_filter}"
         ).fetchall()
-    matches = [row for row in rows if _canonical_path(Path(row[0])) == source]
+    # A registered alias or another worktree must not select the bootstrap base.
+    matches = [row for row in rows if row[0] == str(source)]
     if len(matches) > 1:
         raise RuntimeError("등록된 self source identity가 중복됩니다.")
     if not matches:
@@ -2018,7 +2021,7 @@ def command(
     check: bool = True,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(
+    result = _handoff_run(
         arguments,
         cwd=cwd,
         env=env,
@@ -2158,7 +2161,7 @@ def backfill_plan_shas(
 
 
 def git_bytes(repo: Path, *arguments: str) -> bytes:
-    result = subprocess.run(
+    result = _handoff_run(
         ["git", "-C", str(repo), *arguments],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -7604,7 +7607,7 @@ def run_codex(
     timeout_triggered = threading.Event()
     if persist_session and not session_id:
         with log.open("w", encoding="utf-8") as output:
-            process = subprocess.Popen(
+            process = _handoff_popen(
                 arguments,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -7664,7 +7667,7 @@ def run_codex(
                 process.stdout.close()
     else:
         with log.open("w", encoding="utf-8") as output:
-            result = subprocess.run(
+            result = _handoff_run(
                 arguments,
                 input=prompt,
                 text=True,
@@ -7888,7 +7891,7 @@ def run_claude(
         stream_error_message = ""
         diagnostic_tail = ""
         with log.open("w", encoding="utf-8") as output:
-            process = subprocess.Popen(
+            process = _handoff_popen(
                 arguments,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -7972,7 +7975,7 @@ def run_claude(
         if returncode and not message:
             message = diagnostic_tail
     else:
-        result = subprocess.run(
+        result = _handoff_run(
             arguments,
             input=prompt,
             text=True,
@@ -8100,6 +8103,7 @@ def run_agent(
 ) -> tuple[int, str] | AgentResult:
     """Execute one provider-neutral Agent request."""
 
+    _check_runtime_handoff()
     resolved: ResolvedProfile | None = resolved_profile
     collection_status = "unknown"
     if invocation is not None and resolved is None:
@@ -8113,7 +8117,15 @@ def run_agent(
     identity: str | None = None
     if ledger is not None and invocation is not None and resolved is not None:
         try:
-            identity = ledger.start(invocation, role_name, provider, resolved, session_id)
+            gate = _runtime_handoff_signal.get()
+            if gate is None:
+                identity = ledger.start(invocation, role_name, provider, resolved, session_id)
+            else:
+                with gate.launch_lock:
+                    gate.check()
+                    identity = ledger.start(
+                        invocation, role_name, provider, resolved, session_id,
+                    )
             collection_status = "pending"
         except sqlite3.Error:
             collection_status = "error"
@@ -8197,6 +8209,7 @@ class VerifyOutput(str):
 
 
 def verify(worktree: Path, timeout_seconds: int = 600) -> tuple[bool, str]:
+    _check_runtime_handoff()
     if os.name == "nt":
         script = worktree / "scripts/verify.ps1"
         executable = shutil.which("pwsh") or shutil.which("powershell")
@@ -8206,7 +8219,11 @@ def verify(worktree: Path, timeout_seconds: int = 600) -> tuple[bool, str]:
         arguments = ["bash", str(script)]
     if not script.is_file():
         return False, f"전체 검증 스크립트가 없습니다: {script.relative_to(worktree)}"
-    passed, timed_out, output = run_verify_process(arguments, worktree, timeout_seconds)
+    gate = _runtime_handoff_signal.get()
+    passed, timed_out, output = run_verify_process(
+        arguments, worktree, timeout_seconds,
+        **({"launch_process": _handoff_popen} if gate is not None else {}),
+    )
     exit_code = getattr(output, "exit_code", 0 if passed else None)
     if timed_out:
         output += (
@@ -8522,7 +8539,7 @@ def clear_validation_failure_history(
 
 
 def pr_for_branch(repo: Path, branch: str, url: str | None = None) -> dict[str, object] | None:
-    fields = "url,state,mergedAt,headRefOid,headRefName,mergeable"
+    fields = "url,state,mergedAt,headRefOid,headRefName,baseRefName,mergeable"
     if url:
         result = command(["gh", "pr", "view", url, "--json", fields], cwd=repo)
         return json.loads(result.stdout)
@@ -10225,7 +10242,7 @@ def _worktree_state_signature(worktree: Path) -> str:
 
 
 def _ignore_rule_source(worktree: Path, path: str) -> str | None:
-    result = subprocess.run(
+    result = _handoff_run(
         [
             "git", "-C", str(worktree), "check-ignore",
             "--no-index", "-v", "-z", "--stdin",
@@ -10621,7 +10638,7 @@ def _git_with_index(
 
 
 def _hash_git_blob(worktree: Path, contents: bytes) -> str:
-    result = subprocess.run(
+    result = _handoff_run(
         ["git", "-C", str(worktree), "hash-object", "-w", "--stdin"],
         input=contents,
         stdout=subprocess.PIPE,
@@ -15668,6 +15685,7 @@ class PullRequestSyncResult:
 class WaitingPullRequestObservation:
     conflicts: tuple[tuple[sqlite3.Row, Mapping[str, object]], ...]
     merged: bool
+    merged_pr_urls: tuple[str, ...] = ()
 
 
 def observe_waiting_pull_requests(
@@ -15675,6 +15693,8 @@ def observe_waiting_pull_requests(
     repo_path: Path,
     state_dir: Path,
     repo: str,
+    *,
+    require_base_identity: bool = False,
 ) -> WaitingPullRequestObservation:
     """Commit every merge-wait observation before source or conflict work."""
 
@@ -15684,8 +15704,17 @@ def observe_waiting_pull_requests(
         "ORDER BY plan_id",
         (repo, PR_CLOSED_BLOCK_REASON),
     ).fetchall()
+    registered_base = ""
+    if rows:
+        project = connection.execute(
+            "SELECT base_branch FROM projects WHERE repo = ?", (repo,)
+        ).fetchone()
+        if project is None or not project["base_branch"]:
+            raise RuntimeError("Merge 대기 PR의 등록 base branch를 확인할 수 없습니다.")
+        registered_base = str(project["base_branch"])
     conflicts: list[tuple[sqlite3.Row, Mapping[str, object]]] = []
     merged = False
+    merged_pr_urls: list[str] = []
     for stored in rows:
         branch = str(stored["branch"] or "")
         if not branch:
@@ -15712,6 +15741,15 @@ def observe_waiting_pull_requests(
             raise PublicationSafetyError(
                 f"저장된 PR head branch와 GitHub PR identity가 다릅니다: {branch}"
             )
+        observed_base = pull_request.get("baseRefName")
+        if observed_base is not None and str(observed_base) != registered_base:
+            raise PublicationSafetyError(
+                f"GitHub PR base branch가 등록 base와 다릅니다: {branch}"
+            )
+        if require_base_identity and not observed_base:
+            raise PublicationSafetyError(
+                f"self PR base branch identity를 확인할 수 없습니다: {branch}"
+            )
         url = str(pull_request.get("url") or stored["pr_url"] or "")
         if not url:
             raise RuntimeError(f"저장된 Merge 대기 PR URL을 확인할 수 없습니다: {branch}")
@@ -15731,6 +15769,7 @@ def observe_waiting_pull_requests(
                 str(head_oid) if head_oid else None,
             )
             merged = True
+            merged_pr_urls.append(url)
             if assessment.status in {"safe", "missing"}:
                 operation_print(f"Merge 확인 및 worktree 정리 완료: {url}")
             else:
@@ -15819,7 +15858,9 @@ def observe_waiting_pull_requests(
             raise RuntimeError("Merge 뒤 fetch할 프로젝트 base branch를 확인할 수 없습니다.")
         base = str(project["base_branch"])
         _recorded_base_fetch(repo_path, state_dir, base, owner="project")
-    return WaitingPullRequestObservation(tuple(conflicts), merged)
+    return WaitingPullRequestObservation(
+        tuple(conflicts), merged, tuple(merged_pr_urls)
+    )
 
 
 def select_waiting_pull_request_conflict(
@@ -15890,10 +15931,15 @@ def synchronize_waiting_pull_requests(
     repo: str,
     *,
     after_reconciliation: Callable[[], None] | None = None,
+    after_observation: Callable[[WaitingPullRequestObservation], None] | None = None,
+    require_base_identity: bool = False,
 ) -> PullRequestSyncResult:
     observation = observe_waiting_pull_requests(
-        connection, repo_path, state_dir, repo
+        connection, repo_path, state_dir, repo,
+        require_base_identity=require_base_identity,
     )
+    if after_observation is not None:
+        after_observation(observation)
     if after_reconciliation is not None:
         after_reconciliation()
     return select_waiting_pull_request_conflict(
@@ -20465,6 +20511,7 @@ def _run_project_step(
     verify_timeout_seconds: int = 600,
     runtime_mutation: RuntimeMutation | None = None,
 ) -> int:
+    _check_runtime_handoff()
     # Resolve the persisted project key without consulting repository config.
     # An interrupted Agent may have changed origin or hooksPath, so the saved
     # snapshot must be checked before normal repository validation reads it.
@@ -20481,6 +20528,9 @@ def _run_project_step(
         raise RuntimeError(f"등록되지 않은 프로젝트입니다: {repo}")
     if row is None and registered_only:
         raise RuntimeError(f"등록되지 않은 프로젝트입니다: {repo}")
+    require_self_pr_base = _self_runtime_project(
+        connection, repo, state_dir, runtime_mutation,
+    ) is not None
     provider = str(row["provider"]) if row else (requested_provider or "codex")
     if provider not in AGENT_PROVIDERS:
         raise RuntimeError(f"지원하지 않는 Agent provider입니다: {provider}")
@@ -20507,7 +20557,13 @@ def _run_project_step(
         and initial_project_block["reason_code"]
         != BlockReasonCode.EXECPLAN_CATALOG_INVALID.value
     ):
-        synchronize_waiting_pull_requests(connection, repo_path, state_dir, repo)
+        synchronize_waiting_pull_requests(
+            connection, repo_path, state_dir, repo,
+            require_base_identity=require_self_pr_base,
+            after_observation=lambda observation: _handoff_observed_self_merge(
+                connection, repo, state_dir, runtime_mutation, observation,
+            ),
+        )
         resume_project_block_if_safe(connection, repo_path, state_dir, repo)
         project_block = scoped_blocking.project_block(connection, repo)
         if project_block is not None:
@@ -20795,6 +20851,10 @@ def _run_project_step(
         state_dir,
         repo,
         after_reconciliation=synchronize_source_after_pr_reconciliation,
+        require_base_identity=require_self_pr_base,
+        after_observation=lambda observation: _handoff_observed_self_merge(
+            connection, repo, state_dir, runtime_mutation, observation,
+        ),
     )
     if pr_sync.step_result not in {None, 0}:
         return pr_sync.step_result
@@ -20983,6 +21043,7 @@ def _run_project_step(
         refactoring_review_interval=refactoring_review_interval,
         self_repository=registered_only and is_loop_manager_repository(repo_path),
     )
+    _check_runtime_handoff()
     planning_outcome = PlanningLifecycleCoordinator(
         _PlanningLifecyclePorts(
             connection,
@@ -21033,11 +21094,13 @@ def _run_project_step(
         newly_activated=newly_activated,
     )
     execution = ExecutionPhaseCoordinator(execution_ports)
+    _check_runtime_handoff()
     prepared = execution.prepare()
     if isinstance(prepared, ExecutionOutcome):
         return _execution_outcome_step_result(prepared)
     execution_context = prepared
     while True:
+        _check_runtime_handoff()
         execution_outcome = execution.dispatch(execution_context)
         if (
             execution_outcome.kind is ExecutionOutcomeKind.PHASE_ADVANCED
@@ -21177,6 +21240,9 @@ def run_project_result(
             on_step_completed=on_step_completed, runtime_mutation=runtime_mutation,
         )
         return outcome
+    except SelfMergeRuntimeHandoff:
+        outcome = ProjectRunResult(ProjectRunKind.RUNTIME_HANDOFF, 0)
+        raise
     finally:
         # Failure observations are saved in their recovery transaction.  This
         # boundary only resolves an execution that reached a stable outcome.
@@ -21190,11 +21256,17 @@ def run_project_result(
                         ProjectRunKind.USAGE_LIMIT_PAUSE,
                         ProjectRunKind.OPERATIONAL_ERROR,
                         ProjectRunKind.BLOCKED,
+                        ProjectRunKind.RUNTIME_HANDOFF,
                     }
                 ),
-                blocked_subjects=_blocked_recovery_subjects(connection, repo),
+                blocked_subjects=(
+                    frozenset() if outcome is not None
+                    and outcome.kind is ProjectRunKind.RUNTIME_HANDOFF
+                    else _blocked_recovery_subjects(connection, repo)
+                ),
             )
-            notifications.enqueue_persistent_execution_failure_events(connection, repo)
+            if outcome is None or outcome.kind is not ProjectRunKind.RUNTIME_HANDOFF:
+                notifications.enqueue_persistent_execution_failure_events(connection, repo)
 
 
 def _stable_work_reason(
@@ -21559,10 +21631,13 @@ def _run_registered_project(
     verify_timeout_seconds: int = 600,
     runtime_mutation: RuntimeMutation | None = None,
     external_run_id: str | None = None,
+    handoff_gate: RuntimeHandoffGate | None = None,
 ) -> ScheduledProjectResult:
     """Run one registry row with state isolated to this worker connection."""
 
+    handoff_token = _runtime_handoff_signal.set(handoff_gate)
     try:
+        _check_runtime_handoff()
         # The scheduler connection completed migrations before starting any
         # project threads. Repeating DDL here races with another project's
         # state transaction and can fail with SQLITE_BUSY.
@@ -21604,6 +21679,10 @@ def _run_registered_project(
                 external_run_id=external_run_id,
                 **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
             )
+    except SelfMergeRuntimeHandoff:
+        if handoff_gate is not None:
+            handoff_gate.stop()
+        result = ProjectRunResult(ProjectRunKind.RUNTIME_HANDOFF, 0)
     except (ManagedConfigError, project_registry.ProjectRegistryError) as error:
         result = ProjectRunResult(
             ProjectRunKind.CONFIGURATION_ERROR,
@@ -21624,7 +21703,228 @@ def _run_registered_project(
             f"프로젝트 처리 실패 ({project.repo}): {error}",
             error=True,
         )
+    finally:
+        _runtime_handoff_signal.reset(handoff_token)
     return ScheduledProjectResult(project.repo, result)
+
+
+class SelfMergeRuntimeHandoff(BaseException):
+    """A durable self PR merge requires the next external bootstrap revision."""
+
+
+@dataclass(frozen=True)
+class RuntimeHandoffGate:
+    """Serialize a handoff decision with the instant a subprocess starts."""
+
+    event: threading.Event
+    launch_lock: threading.Lock
+
+    def check(self) -> None:
+        if self.event.is_set():
+            raise SelfMergeRuntimeHandoff()
+
+    def stop(self) -> None:
+        with self.launch_lock:
+            self.event.set()
+
+    def popen(self, *args: object, **kwargs: object) -> subprocess.Popen:
+        with self.launch_lock:
+            self.check()
+            return subprocess.Popen(*args, **kwargs)
+
+
+_runtime_handoff_signal: ContextVar[RuntimeHandoffGate | None] = ContextVar(
+    "runtime_handoff_signal", default=None,
+)
+
+
+def _check_runtime_handoff() -> None:
+    gate = _runtime_handoff_signal.get()
+    if gate is not None:
+        gate.check()
+
+
+def _handoff_popen(*args: object, **kwargs: object) -> subprocess.Popen:
+    gate = _runtime_handoff_signal.get()
+    return (
+        gate.popen(*args, **kwargs) if gate is not None
+        else subprocess.Popen(*args, **kwargs)
+    )
+
+
+def _handoff_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
+    """Keep the spawn atomic with handoff without holding the lock while waiting."""
+
+    gate = _runtime_handoff_signal.get()
+    if gate is None:
+        return subprocess.run(*args, **kwargs)
+    options = dict(kwargs)
+    input_data = options.pop("input", None)
+    timeout = options.pop("timeout", None)
+    if input_data is not None:
+        options["stdin"] = subprocess.PIPE
+    with gate.popen(*args, **options) as process:
+        try:
+            stdout, stderr = process.communicate(input_data, timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            process.kill()
+            stdout, stderr = process.communicate()
+            raise subprocess.TimeoutExpired(error.cmd, error.timeout, stdout, stderr) from error
+        except BaseException:
+            # Match subprocess.run: stop the child before the context manager
+            # closes its pipes and waits, including on KeyboardInterrupt.
+            process.kill()
+            raise
+    return subprocess.CompletedProcess(args[0], process.returncode, stdout, stderr)
+
+
+def _registered_self_runtime_project(
+    project: project_registry.RegisteredProject,
+    runtime: RuntimeMutation,
+    state_dir: Path,
+) -> bool:
+    """Match the parent's source checkout, not an alias or another clone."""
+
+    source = _canonical_path(runtime.source)
+    if _canonical_path(runtime.path) != _canonical_path(ROOT):
+        return False
+    if project.repo != str(source) or Path(project.repo).is_symlink():
+        return False
+    repository = Path(project.repo)
+    top_level = _canonical_path(Path(git(
+        repository, "rev-parse", "--show-toplevel"
+    ).stdout.strip()))
+    if top_level != source or _git_common_directory(repository) != _git_common_directory(source):
+        raise RuntimeError("등록된 self source repository identity가 다릅니다.")
+    if _git_common_directory(runtime.path) != _git_common_directory(source):
+        raise RuntimeError("runtime과 self source repository identity가 다릅니다.")
+    source_origin = repository_origin(source)
+    if repository_origin(repository) != source_origin or repository_origin(runtime.path) != source_origin:
+        raise RuntimeError("runtime과 등록된 self source origin이 다릅니다.")
+    if project.origin is not None and project.origin != source_origin:
+        raise RuntimeError("등록된 self origin이 현재 origin과 다릅니다.")
+    if not project.base_branch:
+        raise RuntimeError("등록된 self base branch가 비어 있습니다.")
+    if bootstrap_base_branch(source, state_dir, source_origin) != project.base_branch:
+        raise RuntimeError("runtime과 등록된 self base branch가 다릅니다.")
+    if git(runtime.path, "rev-parse", "HEAD").stdout.strip() != runtime.commit_sha:
+        raise RuntimeError("현재 runtime SHA가 선택된 SHA와 다릅니다.")
+    return True
+
+
+def _self_runtime_project(
+    connection: sqlite3.Connection,
+    repo: str,
+    state_dir: Path,
+    runtime: RuntimeMutation | None,
+) -> project_registry.RegisteredProject | None:
+    if runtime is None:
+        return None
+    for project in project_registry.list_projects(connection):
+        if project.repo == repo:
+            return project if _registered_self_runtime_project(
+                project, runtime, state_dir,
+            ) else None
+    return None
+
+
+def _finish_self_merge_handoff(
+    connection: sqlite3.Connection,
+    project: project_registry.RegisteredProject,
+    state_dir: Path,
+    runtime: RuntimeMutation,
+    observation: WaitingPullRequestObservation,
+) -> None:
+    """Use the durable merge observation to decide a normal runtime exit."""
+
+    if not observation.merged:
+        return
+    if not _registered_self_runtime_project(project, runtime, state_dir):
+        raise RuntimeError("self Merge 뒤 source identity가 변경됐습니다.")
+    repo_path = Path(project.repo)
+    base = project.base_branch
+    remote_sha = git(
+        repo_path, "rev-parse", "--verify",
+        f"refs/remotes/origin/{base}^{{commit}}",
+    ).stdout.strip()
+    if scoped_blocking.project_block(connection, project.repo) is None:
+        sync = ensure_safe_base_worktree(
+            repo_path, base, remote_sha=remote_sha, state_dir=state_dir,
+        )
+    else:
+        sync = BaseWorktreeSyncResult(
+            "skipped", "프로젝트 안전 차단 중 source checkout 보존", remote_sha,
+        )
+    log_base_worktree_sync(repo_path, sync)
+    if git(
+        repo_path, "rev-parse", "--verify",
+        f"refs/remotes/origin/{base}^{{commit}}",
+    ).stdout.strip() != remote_sha:
+        raise RuntimeError("self Merge 뒤 origin base ref가 변경됐습니다.")
+    if not _registered_self_runtime_project(project, runtime, state_dir):
+        raise RuntimeError("self Merge 뒤 source identity가 변경됐습니다.")
+    if remote_sha == runtime.commit_sha:
+        return
+    ancestor = git(
+        repo_path, "merge-base", "--is-ancestor",
+        runtime.commit_sha, remote_sha, check=False,
+    )
+    if ancestor.returncode != 0:
+        raise RuntimeError(
+            "self Merge 뒤 runtime과 원격 base의 fast-forward 관계를 "
+            "확인할 수 없습니다."
+        )
+    gate = _runtime_handoff_signal.get()
+    if gate is not None:
+        gate.stop()
+    operation_log(
+        f"self Merge runtime handoff: repository={project.repo} "
+        f"base={base} runtime={runtime.commit_sha} remote={remote_sha} "
+        f"prs={','.join(observation.merged_pr_urls)} "
+        f"source_sync={sync.status} ({sync.reason})"
+    )
+    raise SelfMergeRuntimeHandoff()
+
+
+def _preflight_self_merge_handoff(
+    connection: sqlite3.Connection,
+    projects: tuple[project_registry.RegisteredProject, ...],
+    state_dir: Path,
+    runtime: RuntimeMutation | None,
+) -> None:
+    """Reconcile self PRs before any project thread can start new work."""
+
+    if runtime is None:
+        return
+    for project in projects:
+        if not _registered_self_runtime_project(project, runtime, state_dir):
+            continue
+        observation = observe_waiting_pull_requests(
+            connection, Path(project.repo), state_dir, project.repo,
+            require_base_identity=True,
+        )
+        _finish_self_merge_handoff(
+            connection, project, state_dir, runtime, observation,
+        )
+        return
+
+
+def _handoff_observed_self_merge(
+    connection: sqlite3.Connection,
+    repo: str,
+    state_dir: Path,
+    runtime: RuntimeMutation | None,
+    observation: WaitingPullRequestObservation,
+) -> None:
+    """Guard a merge newly observed after the scheduler preflight."""
+
+    if runtime is None or not observation.merged:
+        return
+    project = _self_runtime_project(connection, repo, state_dir, runtime)
+    if project is not None:
+        _finish_self_merge_handoff(
+            connection, project, state_dir, runtime, observation,
+        )
 
 
 def schedule_registered_projects(
@@ -21639,7 +21939,15 @@ def schedule_registered_projects(
     if not projects:
         return ()
 
+    if runtime_mutation is not None:
+        notifications.configure_session(
+            connection, enabled=bool(config.telegram_token and config.telegram_chat_id),
+        )
+        connection.commit()
+    _preflight_self_merge_handoff(connection, projects, state_dir, runtime_mutation)
+
     planner_mutex = threading.Lock()
+    handoff_gate = RuntimeHandoffGate(threading.Event(), threading.Lock())
     external_run_id = secrets.token_hex(16)
     worker_count = min(config.max_workers, len(projects))
     with ThreadPoolExecutor(
@@ -21658,6 +21966,7 @@ def schedule_registered_projects(
                 config.refactoring_review_interval,
                 config.verify_timeout_seconds,
                 external_run_id=external_run_id,
+                handoff_gate=handoff_gate,
                 **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
             )
             for project in projects
@@ -21681,10 +21990,15 @@ def run_registered_projects(
         operation_log(
             f"알림 재시도 실패 ({type(error).__name__})", error=True
         )
-    results = schedule_registered_projects(
-        connection, state_dir, config,
-        **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
-    )
+    try:
+        results = schedule_registered_projects(
+            connection, state_dir, config,
+            **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
+        )
+    except SelfMergeRuntimeHandoff:
+        return 0
+    if any(item.result.kind is ProjectRunKind.RUNTIME_HANDOFF for item in results):
+        return 0
     try:
         notifications.dispatch_pending(
             connection, config.telegram_token, config.telegram_chat_id
