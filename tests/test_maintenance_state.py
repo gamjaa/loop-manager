@@ -844,9 +844,26 @@ class MaintenanceStateRepositoryTest(unittest.TestCase):
         for number in range(1, 11):
             self._insert_plan(connection, "one", f"G-{number:03d}", "MERGED")
 
-        settled = repository.settle_empty_stabilization_assessment(
-            "one", 20, source_sha=source,
+        inventory = mock.Mock(revision=source)
+        with mock.patch.object(
+            maintenance_file_ledger.FileReviewRepository,
+            "record_success",
+        ) as record_success, mock.patch.object(
+            maintenance_state,
+            "verify_remote_revision",
+        ) as verify_remote:
+            settled = repository.settle_empty_stabilization_assessment(
+                "one",
+                20,
+                source_sha=source,
+                repository_path="/repo",
+                base_branch="main",
+                inventory=inventory,
+            )
+        record_success.assert_called_once_with(
+            "one", "/repo", "main", inventory, (),
         )
+        verify_remote.assert_called_once_with(Path("/repo"), "main", source)
 
         self.assertEqual(settled.phase, maintenance_state.MaintenancePhase.IDLE)
         self.assertEqual(settled.last_success_file_assessment_merged_count, 10)
@@ -860,7 +877,12 @@ class MaintenanceStateRepositoryTest(unittest.TestCase):
             self._insert_plan(connection, "one", f"G-{number:03d}", "MERGED")
         with self.assertRaises(maintenance_state.MaintenanceStateError):
             repository.settle_empty_stabilization_assessment(
-                "one", 20, source_sha="b" * 40,
+                "one",
+                20,
+                source_sha="b" * 40,
+                repository_path="/repo",
+                base_branch="main",
+                inventory=inventory,
             )
         self.assertEqual(
             repository.get("one").last_success_file_assessment_merged_count,
@@ -1266,6 +1288,44 @@ class FileReviewLedgerTest(unittest.TestCase):
             str(self.repo), str(self.repo), "main", inventory, reviewed,
         )
 
+    def prepare_empty_stabilization(self, source):
+        self.connection.execute(
+            "INSERT INTO execplan_catalog_revisions "
+            "(repo, revision_sha, catalog_fingerprint) VALUES (?, ?, 'catalog')",
+            (str(self.repo), source),
+        )
+        self.connection.execute(
+            "INSERT INTO maintenance_cycles "
+            "(repo, file_assessment_start_merged_count, "
+            "last_success_file_assessment_merged_count, revision) "
+            "VALUES (?, 0, 0, 1)",
+            (str(self.repo),),
+        )
+        for number in range(1, 11):
+            self.connection.execute(
+                "INSERT INTO exec_plans "
+                "(repo, plan_id, path, title, sources, depends_on, priority, "
+                "content_hash, status) VALUES (?, ?, ?, ?, '[]', '[]', "
+                "'normal', ?, 'MERGED')",
+                (
+                    str(self.repo), f"G-{number:03d}",
+                    f"docs/plans/[G-{number:03d}] Done.md", "Done",
+                    f"hash-{number}",
+                ),
+            )
+
+    def settle_empty_stabilization(self, source, inventory):
+        return maintenance_state.MaintenanceRepository(
+            self.connection
+        ).settle_empty_stabilization_assessment(
+            str(self.repo),
+            20,
+            source_sha=source,
+            repository_path=str(self.repo),
+            base_branch="main",
+            inventory=inventory,
+        )
+
     def test_first_review_then_content_mode_rename_new_and_deleted_paths(self):
         self.write("src/alpha.go", b"package alpha\n")
         self.write("tests/check.py", b"assert True\n")
@@ -1316,6 +1376,57 @@ class FileReviewLedgerTest(unittest.TestCase):
             {review.path: review for review in self.ledger.reviews(str(self.repo), include_retired=True)}
             ["src/alpha.go"].active
         )
+
+    def test_empty_stabilization_retires_deleted_review_before_same_path_returns(self):
+        self.write("src/alpha.go", b"package alpha\n")
+        first = self.publish()
+        first_inventory = self.inventory(first)
+        self.record(first_inventory, self.reviewed(first_inventory.sources))
+        (self.repo / "src/alpha.go").unlink()
+        empty_source = self.publish()
+        empty_inventory = self.inventory(empty_source)
+        self.assertEqual(empty_inventory.sources, ())
+        self.prepare_empty_stabilization(empty_source)
+
+        settled = self.settle_empty_stabilization(empty_source, empty_inventory)
+
+        self.assertEqual(settled.last_success_file_assessment_merged_count, 10)
+        retired = {review.path: review for review in self.ledger.reviews(
+            str(self.repo), include_retired=True,
+        )}
+        self.assertFalse(retired["src/alpha.go"].active)
+        self.write("src/alpha.go", b"package alpha\n")
+        returned_source = self.publish()
+        returned_inventory = self.inventory(returned_source)
+        self.assertEqual(
+            [source.path for source in self.ledger.selected_sources(
+                str(self.repo), returned_inventory,
+            )],
+            ["src/alpha.go"],
+        )
+
+    def test_empty_stabilization_source_drift_keeps_ledger_and_baseline(self):
+        self.write("src/alpha.go", b"package alpha\n")
+        first = self.publish()
+        first_inventory = self.inventory(first)
+        self.record(first_inventory, self.reviewed(first_inventory.sources))
+        (self.repo / "src/alpha.go").unlink()
+        empty_source = self.publish()
+        empty_inventory = self.inventory(empty_source)
+        self.prepare_empty_stabilization(empty_source)
+        self.write("src/new.go", b"package new\n")
+        self.publish()
+
+        with self.assertRaises(maintenance_file_inventory.SourceInventoryError):
+            self.settle_empty_stabilization(empty_source, empty_inventory)
+
+        cycle = maintenance_state.MaintenanceRepository(self.connection).get(
+            str(self.repo)
+        )
+        self.assertEqual(cycle.last_success_file_assessment_merged_count, 0)
+        self.assertTrue({review.path: review for review in self.ledger.reviews(
+            str(self.repo), include_retired=True,
+        )}["src/alpha.go"].active)
 
     def test_wrong_identity_and_remote_drift_leave_success_unchanged(self):
         self.write("src/alpha.go", b"package alpha\n")

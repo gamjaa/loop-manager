@@ -524,18 +524,20 @@ class MaintenanceOrchestrationTest(unittest.TestCase):
         ports.state.settle_empty_stabilization_assessment.return_value = cycle
         ports.git.input_fingerprint.return_value = "planning"
         ports.git.specification_fingerprint.return_value = "specification"
-        ports.file_review.has_selected_sources.return_value = False
+        empty_inventory = object()
+        ports.file_review.empty_selection_inventory.return_value = empty_inventory
         coordinator = planning_runtime.PlanningLifecycleCoordinator(ports)
         run = planning_runtime._PlanningRun(context, row, cycle, source, False)
 
         self.assertIsNone(coordinator._select_planning_work(run))
         ports.state.settle_empty_stabilization_assessment.assert_called_once_with(
-            "/repo", 20, source_sha=source,
+            "/repo", 20, source_sha=source, repository_path="/repo",
+            base_branch="main", inventory=empty_inventory,
         )
         ports.state.begin_maintenance_assessment.assert_not_called()
         ports.agent.run_planner.assert_not_called()
 
-        ports.file_review.has_selected_sources.side_effect = SourceInventoryError(
+        ports.file_review.empty_selection_inventory.side_effect = SourceInventoryError(
             "unclassified source"
         )
         failed_run = planning_runtime._PlanningRun(context, row, cycle, source, False)

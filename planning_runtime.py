@@ -26,10 +26,11 @@ from maintenance_planning import (
     MaintenancePlanningRestart,
 )
 import maintenance_state
+import maintenance_file_ledger
 import maintenance_file_review
 import maintenance_reconciliation
 import maintenance_findings
-from maintenance_file_inventory import SourceInventoryError
+from maintenance_file_inventory import SourceInventory, SourceInventoryError
 import full_assessment
 import runtime_state
 
@@ -207,6 +208,7 @@ class PlanningStatePort(Protocol):
 
     def settle_empty_stabilization_assessment(
         self, repo: str, interval: int, *, source_sha: str,
+        repository_path: str, base_branch: str, inventory: SourceInventory,
     ) -> maintenance_state.MaintenanceCycle: ...
 
     def record_full_assessment(
@@ -748,25 +750,35 @@ class PlanningLifecycleCoordinator:
                 self._ports, "file_review"
             ):
                 try:
-                    has_selected_sources = self._ports.file_review.has_selected_sources(
+                    empty_inventory = self._ports.file_review.empty_selection_inventory(
                         context.repo, context.repo_path, context.base_branch,
                         run.base_sha,
                     )
-                except SourceInventoryError as error:
+                except (
+                    SourceInventoryError,
+                    maintenance_file_ledger.FileReviewLedgerError,
+                ) as error:
                     self._ports.events.error(str(error))
                     return PlanningOutcome(
                         PlanningOutcomeKind.REMOTE_BASE_RESTART,
                         detail=str(error),
                         error=True,
                     )
-                if not has_selected_sources:
+                if empty_inventory is not None:
                     try:
                         cycle = self._ports.state.settle_empty_stabilization_assessment(
                             context.repo,
                             context.refactoring_review_interval,
                             source_sha=run.base_sha,
+                            repository_path=str(context.repo_path),
+                            base_branch=context.base_branch,
+                            inventory=empty_inventory,
                         )
-                    except maintenance_state.MaintenanceStateError as error:
+                    except (
+                        maintenance_state.MaintenanceStateError,
+                        maintenance_file_ledger.FileReviewLedgerError,
+                        SourceInventoryError,
+                    ) as error:
                         self._ports.events.error(str(error))
                         return PlanningOutcome(
                             PlanningOutcomeKind.REMOTE_BASE_RESTART,
