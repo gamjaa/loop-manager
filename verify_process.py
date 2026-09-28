@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import os
 import signal
 import subprocess
@@ -264,6 +265,8 @@ def _confirm_linux_descendants_stopped(descendants: dict[int, int]) -> None:
 
 def run_verify_process(
     arguments: list[str], worktree: Path, timeout_seconds: int,
+    *,
+    launch_process: Callable[..., subprocess.Popen] | None = None,
 ) -> tuple[bool, bool, str]:
     """Return (passed, timed_out, bounded output), or fail closed on live descendants."""
 
@@ -277,7 +280,7 @@ def run_verify_process(
             {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
             if os.name == "nt" else {"start_new_session": True}
         )
-        process = subprocess.Popen(
+        process = (launch_process or subprocess.Popen)(
             command, cwd=worktree, stdin=subprocess.DEVNULL,
             stdout=output, stderr=subprocess.STDOUT, **options,
         )

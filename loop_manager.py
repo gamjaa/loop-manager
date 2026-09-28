@@ -2021,7 +2021,7 @@ def command(
     check: bool = True,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(
+    result = _handoff_run(
         arguments,
         cwd=cwd,
         env=env,
@@ -2161,7 +2161,7 @@ def backfill_plan_shas(
 
 
 def git_bytes(repo: Path, *arguments: str) -> bytes:
-    result = subprocess.run(
+    result = _handoff_run(
         ["git", "-C", str(repo), *arguments],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -7607,7 +7607,7 @@ def run_codex(
     timeout_triggered = threading.Event()
     if persist_session and not session_id:
         with log.open("w", encoding="utf-8") as output:
-            process = subprocess.Popen(
+            process = _handoff_popen(
                 arguments,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -7667,7 +7667,7 @@ def run_codex(
                 process.stdout.close()
     else:
         with log.open("w", encoding="utf-8") as output:
-            result = subprocess.run(
+            result = _handoff_run(
                 arguments,
                 input=prompt,
                 text=True,
@@ -7891,7 +7891,7 @@ def run_claude(
         stream_error_message = ""
         diagnostic_tail = ""
         with log.open("w", encoding="utf-8") as output:
-            process = subprocess.Popen(
+            process = _handoff_popen(
                 arguments,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -7975,7 +7975,7 @@ def run_claude(
         if returncode and not message:
             message = diagnostic_tail
     else:
-        result = subprocess.run(
+        result = _handoff_run(
             arguments,
             input=prompt,
             text=True,
@@ -8117,7 +8117,15 @@ def run_agent(
     identity: str | None = None
     if ledger is not None and invocation is not None and resolved is not None:
         try:
-            identity = ledger.start(invocation, role_name, provider, resolved, session_id)
+            gate = _runtime_handoff_signal.get()
+            if gate is None:
+                identity = ledger.start(invocation, role_name, provider, resolved, session_id)
+            else:
+                with gate.launch_lock:
+                    gate.check()
+                    identity = ledger.start(
+                        invocation, role_name, provider, resolved, session_id,
+                    )
             collection_status = "pending"
         except sqlite3.Error:
             collection_status = "error"
@@ -8211,7 +8219,11 @@ def verify(worktree: Path, timeout_seconds: int = 600) -> tuple[bool, str]:
         arguments = ["bash", str(script)]
     if not script.is_file():
         return False, f"전체 검증 스크립트가 없습니다: {script.relative_to(worktree)}"
-    passed, timed_out, output = run_verify_process(arguments, worktree, timeout_seconds)
+    gate = _runtime_handoff_signal.get()
+    passed, timed_out, output = run_verify_process(
+        arguments, worktree, timeout_seconds,
+        **({"launch_process": _handoff_popen} if gate is not None else {}),
+    )
     exit_code = getattr(output, "exit_code", 0 if passed else None)
     if timed_out:
         output += (
@@ -8527,7 +8539,7 @@ def clear_validation_failure_history(
 
 
 def pr_for_branch(repo: Path, branch: str, url: str | None = None) -> dict[str, object] | None:
-    fields = "url,state,mergedAt,headRefOid,headRefName,mergeable"
+    fields = "url,state,mergedAt,headRefOid,headRefName,baseRefName,mergeable"
     if url:
         result = command(["gh", "pr", "view", url, "--json", fields], cwd=repo)
         return json.loads(result.stdout)
@@ -10230,7 +10242,7 @@ def _worktree_state_signature(worktree: Path) -> str:
 
 
 def _ignore_rule_source(worktree: Path, path: str) -> str | None:
-    result = subprocess.run(
+    result = _handoff_run(
         [
             "git", "-C", str(worktree), "check-ignore",
             "--no-index", "-v", "-z", "--stdin",
@@ -10626,7 +10638,7 @@ def _git_with_index(
 
 
 def _hash_git_blob(worktree: Path, contents: bytes) -> str:
-    result = subprocess.run(
+    result = _handoff_run(
         ["git", "-C", str(worktree), "hash-object", "-w", "--stdin"],
         input=contents,
         stdout=subprocess.PIPE,
@@ -15681,6 +15693,8 @@ def observe_waiting_pull_requests(
     repo_path: Path,
     state_dir: Path,
     repo: str,
+    *,
+    require_base_identity: bool = False,
 ) -> WaitingPullRequestObservation:
     """Commit every merge-wait observation before source or conflict work."""
 
@@ -15690,6 +15704,14 @@ def observe_waiting_pull_requests(
         "ORDER BY plan_id",
         (repo, PR_CLOSED_BLOCK_REASON),
     ).fetchall()
+    registered_base = ""
+    if rows:
+        project = connection.execute(
+            "SELECT base_branch FROM projects WHERE repo = ?", (repo,)
+        ).fetchone()
+        if project is None or not project["base_branch"]:
+            raise RuntimeError("Merge 대기 PR의 등록 base branch를 확인할 수 없습니다.")
+        registered_base = str(project["base_branch"])
     conflicts: list[tuple[sqlite3.Row, Mapping[str, object]]] = []
     merged = False
     merged_pr_urls: list[str] = []
@@ -15718,6 +15740,15 @@ def observe_waiting_pull_requests(
         if head_name and str(head_name) != branch:
             raise PublicationSafetyError(
                 f"저장된 PR head branch와 GitHub PR identity가 다릅니다: {branch}"
+            )
+        observed_base = pull_request.get("baseRefName")
+        if observed_base is not None and str(observed_base) != registered_base:
+            raise PublicationSafetyError(
+                f"GitHub PR base branch가 등록 base와 다릅니다: {branch}"
+            )
+        if require_base_identity and not observed_base:
+            raise PublicationSafetyError(
+                f"self PR base branch identity를 확인할 수 없습니다: {branch}"
             )
         url = str(pull_request.get("url") or stored["pr_url"] or "")
         if not url:
@@ -15901,9 +15932,11 @@ def synchronize_waiting_pull_requests(
     *,
     after_reconciliation: Callable[[], None] | None = None,
     after_observation: Callable[[WaitingPullRequestObservation], None] | None = None,
+    require_base_identity: bool = False,
 ) -> PullRequestSyncResult:
     observation = observe_waiting_pull_requests(
-        connection, repo_path, state_dir, repo
+        connection, repo_path, state_dir, repo,
+        require_base_identity=require_base_identity,
     )
     if after_observation is not None:
         after_observation(observation)
@@ -20495,6 +20528,9 @@ def _run_project_step(
         raise RuntimeError(f"등록되지 않은 프로젝트입니다: {repo}")
     if row is None and registered_only:
         raise RuntimeError(f"등록되지 않은 프로젝트입니다: {repo}")
+    require_self_pr_base = _self_runtime_project(
+        connection, repo, state_dir, runtime_mutation,
+    ) is not None
     provider = str(row["provider"]) if row else (requested_provider or "codex")
     if provider not in AGENT_PROVIDERS:
         raise RuntimeError(f"지원하지 않는 Agent provider입니다: {provider}")
@@ -20523,6 +20559,7 @@ def _run_project_step(
     ):
         synchronize_waiting_pull_requests(
             connection, repo_path, state_dir, repo,
+            require_base_identity=require_self_pr_base,
             after_observation=lambda observation: _handoff_observed_self_merge(
                 connection, repo, state_dir, runtime_mutation, observation,
             ),
@@ -20814,6 +20851,7 @@ def _run_project_step(
         state_dir,
         repo,
         after_reconciliation=synchronize_source_after_pr_reconciliation,
+        require_base_identity=require_self_pr_base,
         after_observation=lambda observation: _handoff_observed_self_merge(
             connection, repo, state_dir, runtime_mutation, observation,
         ),
@@ -21593,11 +21631,11 @@ def _run_registered_project(
     verify_timeout_seconds: int = 600,
     runtime_mutation: RuntimeMutation | None = None,
     external_run_id: str | None = None,
-    handoff_event: threading.Event | None = None,
+    handoff_gate: RuntimeHandoffGate | None = None,
 ) -> ScheduledProjectResult:
     """Run one registry row with state isolated to this worker connection."""
 
-    handoff_token = _runtime_handoff_signal.set(handoff_event)
+    handoff_token = _runtime_handoff_signal.set(handoff_gate)
     try:
         _check_runtime_handoff()
         # The scheduler connection completed migrations before starting any
@@ -21642,8 +21680,8 @@ def _run_registered_project(
                 **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
             )
     except SelfMergeRuntimeHandoff:
-        if handoff_event is not None:
-            handoff_event.set()
+        if handoff_gate is not None:
+            handoff_gate.stop()
         result = ProjectRunResult(ProjectRunKind.RUNTIME_HANDOFF, 0)
     except (ManagedConfigError, project_registry.ProjectRegistryError) as error:
         result = ProjectRunResult(
@@ -21674,15 +21712,65 @@ class SelfMergeRuntimeHandoff(BaseException):
     """A durable self PR merge requires the next external bootstrap revision."""
 
 
-_runtime_handoff_signal: ContextVar[threading.Event | None] = ContextVar(
+@dataclass(frozen=True)
+class RuntimeHandoffGate:
+    """Serialize a handoff decision with the instant a subprocess starts."""
+
+    event: threading.Event
+    launch_lock: threading.Lock
+
+    def check(self) -> None:
+        if self.event.is_set():
+            raise SelfMergeRuntimeHandoff()
+
+    def stop(self) -> None:
+        with self.launch_lock:
+            self.event.set()
+
+    def popen(self, *args: object, **kwargs: object) -> subprocess.Popen:
+        with self.launch_lock:
+            self.check()
+            return subprocess.Popen(*args, **kwargs)
+
+
+_runtime_handoff_signal: ContextVar[RuntimeHandoffGate | None] = ContextVar(
     "runtime_handoff_signal", default=None,
 )
 
 
 def _check_runtime_handoff() -> None:
-    signal = _runtime_handoff_signal.get()
-    if signal is not None and signal.is_set():
-        raise SelfMergeRuntimeHandoff()
+    gate = _runtime_handoff_signal.get()
+    if gate is not None:
+        gate.check()
+
+
+def _handoff_popen(*args: object, **kwargs: object) -> subprocess.Popen:
+    gate = _runtime_handoff_signal.get()
+    return (
+        gate.popen(*args, **kwargs) if gate is not None
+        else subprocess.Popen(*args, **kwargs)
+    )
+
+
+def _handoff_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
+    """Keep the spawn atomic with handoff without holding the lock while waiting."""
+
+    gate = _runtime_handoff_signal.get()
+    if gate is None:
+        return subprocess.run(*args, **kwargs)
+    options = dict(kwargs)
+    input_data = options.pop("input", None)
+    timeout = options.pop("timeout", None)
+    if input_data is not None:
+        options["stdin"] = subprocess.PIPE
+    process = gate.popen(*args, **options)
+    try:
+        stdout, stderr = process.communicate(input_data, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        process.kill()
+        stdout, stderr = process.communicate()
+        raise subprocess.TimeoutExpired(error.cmd, error.timeout, stdout, stderr) from error
+    return subprocess.CompletedProcess(args[0], process.returncode, stdout, stderr)
 
 
 def _registered_self_runtime_project(
@@ -21717,6 +21805,22 @@ def _registered_self_runtime_project(
     if git(runtime.path, "rev-parse", "HEAD").stdout.strip() != runtime.commit_sha:
         raise RuntimeError("현재 runtime SHA가 선택된 SHA와 다릅니다.")
     return True
+
+
+def _self_runtime_project(
+    connection: sqlite3.Connection,
+    repo: str,
+    state_dir: Path,
+    runtime: RuntimeMutation | None,
+) -> project_registry.RegisteredProject | None:
+    if runtime is None:
+        return None
+    for project in project_registry.list_projects(connection):
+        if project.repo == repo:
+            return project if _registered_self_runtime_project(
+                project, runtime, state_dir,
+            ) else None
+    return None
 
 
 def _finish_self_merge_handoff(
@@ -21765,6 +21869,9 @@ def _finish_self_merge_handoff(
             "self Merge 뒤 runtime과 원격 base의 fast-forward 관계를 "
             "확인할 수 없습니다."
         )
+    gate = _runtime_handoff_signal.get()
+    if gate is not None:
+        gate.stop()
     operation_log(
         f"self Merge runtime handoff: repository={project.repo} "
         f"base={base} runtime={runtime.commit_sha} remote={remote_sha} "
@@ -21789,6 +21896,7 @@ def _preflight_self_merge_handoff(
             continue
         observation = observe_waiting_pull_requests(
             connection, Path(project.repo), state_dir, project.repo,
+            require_base_identity=True,
         )
         _finish_self_merge_handoff(
             connection, project, state_dir, runtime, observation,
@@ -21807,14 +21915,11 @@ def _handoff_observed_self_merge(
 
     if runtime is None or not observation.merged:
         return
-    for project in project_registry.list_projects(connection):
-        if project.repo != repo:
-            continue
-        if _registered_self_runtime_project(project, runtime, state_dir):
-            _finish_self_merge_handoff(
-                connection, project, state_dir, runtime, observation,
-            )
-        return
+    project = _self_runtime_project(connection, repo, state_dir, runtime)
+    if project is not None:
+        _finish_self_merge_handoff(
+            connection, project, state_dir, runtime, observation,
+        )
 
 
 def schedule_registered_projects(
@@ -21837,7 +21942,7 @@ def schedule_registered_projects(
     _preflight_self_merge_handoff(connection, projects, state_dir, runtime_mutation)
 
     planner_mutex = threading.Lock()
-    handoff_event = threading.Event()
+    handoff_gate = RuntimeHandoffGate(threading.Event(), threading.Lock())
     external_run_id = secrets.token_hex(16)
     worker_count = min(config.max_workers, len(projects))
     with ThreadPoolExecutor(
@@ -21856,7 +21961,7 @@ def schedule_registered_projects(
                 config.refactoring_review_interval,
                 config.verify_timeout_seconds,
                 external_run_id=external_run_id,
-                handoff_event=handoff_event,
+                handoff_gate=handoff_gate,
                 **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
             )
             for project in projects

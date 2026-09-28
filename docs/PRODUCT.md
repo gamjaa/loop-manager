@@ -348,7 +348,7 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 - 마지막 리팩터링 계획 Merge 뒤에는 최신 원격 기준 사후 재검증을 성공하고 계획 개정의 원격 게시와 catalog 반영을 마칠 때까지 장벽 뒤 READY를 시작하지 않는다
 - 각 ExecPlan은 고유하고 결정적인 이름의 branch와 별도 관리 worktree에서 작업한다
 - 서로 다른 프로젝트는 `max_workers` 범위에서 병렬로 처리한다
-- runtime 자식은 병렬 프로젝트 작업을 제출하기 전에 등록된 self source checkout의 대기 PR을 동기화한다. 이 실행에서 새 self PR Merge를 확인하면 전이·cleanup·알림 outbox를 영속화하고 등록 base의 최신 fetch와 source checkout 안전 동기화를 평가한다. 원격 SHA가 현재 runtime SHA와 같으면 계속 실행하고 fast-forward 후속이면 source 동기화 결과와 관계없이 정상 종료해 다음 외부 실행의 bootstrap에 제어를 넘긴다. self Merge가 없거나 다른 프로젝트의 Merge 또는 일반 push만 있으면 handoff하지 않는다. repository·origin identity, fetch 또는 ancestry를 확인할 수 없으면 성공 handoff로 처리하지 않고 기존 작업 상태를 보존한다
+- runtime 자식은 병렬 프로젝트 작업을 제출하기 전에 등록된 self source checkout의 대기 PR을 동기화한다. PR의 실제 base branch가 등록 base와 같음을 확인한 새 self PR Merge만 handoff 근거로 삼는다. Merge 전이·cleanup·알림 outbox를 영속화하고 등록 base의 최신 fetch와 source checkout 안전 동기화를 평가한다. 원격 SHA가 현재 runtime SHA와 같으면 계속 실행하고 fast-forward 후속이면 source 동기화 결과와 관계없이 정상 종료해 다음 외부 실행의 bootstrap에 제어를 넘긴다. handoff 판정 뒤에는 새 Agent·verify·publication 또는 다른 프로젝트 작업을 시작하지 않는다. self Merge가 없거나 다른 프로젝트의 Merge 또는 일반 push만 있으면 handoff하지 않는다. repository·origin·PR base identity, fetch 또는 ancestry를 확인할 수 없으면 성공 handoff로 처리하지 않고 기존 작업 상태를 보존한다
 - `max_workers` 기본값은 3이며 `config/config.ini`에서 변경할 수 있다
 - `PLAN_BLOCKED` 또는 안정된 `PR_OPEN`이 있어도 명세 변경 우선 trigger를 먼저 평가하고, 없으면 독립 READY 하나를 기존 priority와 숫자 ID 순으로 시작한다. 독립 READY가 없으면 변경된 전체 입력만 한 번 재계획한다
 - `PROJECT_BLOCKED` 동안에는 새 Planner, maintenance Planner, Worker와 저장소 변경 단계를 시작하지 않는다
