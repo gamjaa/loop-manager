@@ -12136,7 +12136,8 @@ class WorkspaceRecoveryTest(unittest.TestCase):
                 )
 
             project = connection.execute(
-                "SELECT phase, planning_error, planning_workspace_owned "
+                "SELECT phase, planning_error, planning_error_fingerprint, "
+                "planning_workspace_owned "
                 "FROM projects WHERE repo = ?",
                 (str(repo),),
             ).fetchone()
@@ -12178,14 +12179,20 @@ class WorkspaceRecoveryTest(unittest.TestCase):
                 )
 
             resumed = connection.execute(
-                "SELECT planning_error, planning_workspace_owned "
+                "SELECT planning_error, planning_error_fingerprint, "
+                "planning_workspace_owned, last_error "
                 "FROM projects WHERE repo = ?",
                 (str(repo),),
             ).fetchone()
             self.assertEqual(resumed_result, 1)
+            self.assertEqual(resumed["planning_error"], project["planning_error"])
+            self.assertEqual(
+                resumed["planning_error_fingerprint"],
+                project["planning_error_fingerprint"],
+            )
             self.assertIn(
                 "planning worktree의 Loop Manager 소유권이 확인되지 않았습니다",
-                resumed["planning_error"],
+                resumed["last_error"],
             )
             self.assertEqual(resumed["planning_workspace_owned"], 0)
             self.assertEqual(marker.read_text(encoding="utf-8"), "preserve me\n")
