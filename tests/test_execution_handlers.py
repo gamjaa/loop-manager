@@ -1591,6 +1591,19 @@ class ExecutionHandlerTests(TestCase):
         self.assertEqual(len(additions), 1)
         self.assertEqual(additions[0].args[1:], ('add', '-A', '--', 'app.py'))
 
+    def test_rebase_stage_evidence_records_index_entries(self):
+        self.effects.agent.capture_git_snapshot.return_value = SimpleNamespace(
+            head='owned-head', branch='loop-manager/G-047',
+            dirty={'app.py': (('unstaged',), 'accepted-content')},
+            index={'app.py': ('H 100644 ' + 'a' * 40,)},
+        )
+
+        self.assertEqual(self.handler._rebase_stage_evidence(self.context('WORKING')), {
+            'head': 'owned-head', 'branch': 'loop-manager/G-047',
+            'files': {'app.py': 'accepted-content'},
+            'index': {'app.py': ['H 100644 ' + 'a' * 40]},
+        })
+
     def test_partial_stage_resume_only_stages_remaining_dirty_path(self):
         self._assert_partial_stage_resume(changed=False)
 

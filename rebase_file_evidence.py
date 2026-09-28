@@ -44,6 +44,29 @@ def capture(worktree: Path, head: str, dirty: dict) -> dict:
     return evidence
 
 
+def capture_modes(worktree: Path, files: dict, path_signature) -> dict:
+    """Bind filesystem types/executable bits to the already approved signatures."""
+    modes = {}
+    for name, signature in files.items():
+        try:
+            mode = (worktree / name).lstat().st_mode
+        except FileNotFoundError:
+            approved = None
+        else:
+            if stat.S_ISREG(mode):
+                approved = '100755' if mode & stat.S_IXUSR else '100644'
+            elif stat.S_ISLNK(mode):
+                approved = '120000'
+            elif stat.S_ISDIR(mode):
+                approved = '160000'
+            else:
+                raise RuntimeError('rebase resolution: unsupported approved file type')
+        if path_signature(worktree, name) != signature:
+            raise RuntimeError('rebase resolution: file changed while capturing approved mode')
+        modes[name] = approved
+    return modes
+
+
 def preserved(before: dict, after: dict, old_signature: str, new_signature: str) -> bool:
     """Replay disjoint local/base edits on hashed lines; reject ambiguous overlap."""
     if (not isinstance(before, dict) or not isinstance(after, dict)

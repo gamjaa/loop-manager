@@ -28,6 +28,11 @@ _CONTROLLING_GIT_OPERATIONS = frozenset({
 })
 
 
+def controlling_git_operation(markers: Mapping[str, object] | None) -> str | None:
+    """Return a marker that still controls a Git operation, if any."""
+    return next(iter(sorted(_CONTROLLING_GIT_OPERATIONS.intersection(markers or {}))), None)
+
+
 @dataclass(frozen=True)
 class CheckpointSnapshot:
     plan_id: str
@@ -224,9 +229,7 @@ def observe(
         archive_token=str(row["archive_token"]) if row["archive_token"] else None,
         publication_token=(str(row["publication_token"])
                            if row["publication_token"] else None),
-        git_operation=("rebase" if rebase else next(iter(sorted(
-            _CONTROLLING_GIT_OPERATIONS.intersection(operation_markers or {})
-        )), None)),
+        git_operation=("rebase" if rebase else controlling_git_operation(operation_markers)),
         git_operation_markers=tuple(sorted(
             (str(name), str(signature))
             for name, signature in (operation_markers or {}).items()

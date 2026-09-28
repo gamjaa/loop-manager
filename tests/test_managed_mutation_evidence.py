@@ -22,6 +22,71 @@ BRANCH = 'loop-manager/G-091'
 
 
 class ManagedTransitionTests(unittest.TestCase):
+    def test_v2_rebase_retry_keeps_intent_after_checkpoint_observation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            expected = {
+                'evidence_version': 2, 'run_id': 'same-run',
+                'checkpoint_generation': 3, 'branch': BRANCH,
+                'before_head': OLD, 'target_base_oid': NEW,
+                'remote_oid': OLD, 'source_commits': [OLD],
+                'agent_session_id': 'same-worker',
+            }
+            arguments = dict(state_dir=state, owner='plan:G-091',
+                             repo='/repo', target='/worktree', before={'head': OLD})
+            identity = journal.begin_rebase(**arguments, expected=expected)
+
+            self.assertEqual(journal.begin_rebase(
+                **arguments, expected={**expected, 'checkpoint_generation': 4},
+            ), identity)
+            for changed in (
+                {**expected, 'checkpoint_generation': 2},
+                {**expected, 'checkpoint_generation': 4, 'run_id': 'other-run'},
+                {**expected, 'checkpoint_generation': 4,
+                 'agent_session_id': 'other-worker'},
+            ):
+                with self.subTest(changed=changed), self.assertRaises(journal.MutationEvidenceError):
+                    journal.begin_rebase(**arguments, expected=changed)
+
+    def test_completed_rebase_accepts_stale_head_marker_but_rejects_active_operation(self):
+        before = {
+            'head': OLD, 'branch': BRANCH, 'ref': [OLD, ''],
+            'index': {}, 'dirty': {},
+            'registration': [f'HEAD={OLD}', f'branch=refs/heads/{BRANCH}'],
+            'metadata': None,
+        }
+        intent = {
+            'target': '/worktree', 'before': before,
+            'expected': {
+                'branch': BRANCH, 'before_head': OLD,
+                'target_base_oid': NEW, 'remote_oid': OLD,
+                'evidence_version': 2,
+            },
+        }
+        observed = {
+            **before, 'head': NEW, 'ref': [NEW, ''],
+            'registration': [f'HEAD={NEW}', f'branch=refs/heads/{BRANCH}'],
+            'operations': {'REBASE_HEAD': 'stale-marker'},
+            'index_clean': True, 'unmerged': False,
+        }
+        checks = dict(current_remote_oid=OLD, target_ancestor=True,
+                      patches_preserved=False, reflog_marker=True,
+                      replay_verified=True)
+
+        self.assertEqual(journal.verified_rebase_result(
+            intent, observed, **checks,
+        )['selected']['head'], NEW)
+        with self.assertRaises(journal.MutationEvidenceError):
+            journal.verified_rebase_result(
+                intent, {**observed, 'operations': {
+                    **observed['operations'], 'rebase-merge': 'active-marker',
+                }}, **checks,
+            )
+        with self.assertRaises(journal.MutationEvidenceError):
+            journal.verified_rebase_result(
+                intent, {**observed, 'operations': None}, **checks,
+            )
+
     def test_recovered_agent_baseline_accepts_only_journaled_lock_change(self):
         old_registration = (f'HEAD={OLD}', f'branch=refs/heads/{BRANCH}')
         lock = 'loop-manager-worktree:owned-token'
@@ -41,8 +106,13 @@ class ManagedTransitionTests(unittest.TestCase):
         }, 'result': {'observed': {'registration': {
             'head': OLD, 'branch': f'refs/heads/{BRANCH}', 'locked': lock,
         }}}}
+        def journal_transitions(*_args, git=None, **_kwargs):
+            if git is None:
+                raise journal.MutationEvidenceError('v2 rebase requires Git observation')
+            return [transition]
+
         with mock.patch.object(journal, 'verified_managed_transitions',
-                               return_value=[transition]):
+                               side_effect=journal_transitions) as transitions:
             corrected = loop_manager._proven_recovered_worktree_baseline(
                 before, current, Path('/state'), Path('/repo'),
                 'G-091', Path('/worktree'),
@@ -60,6 +130,10 @@ class ManagedTransitionTests(unittest.TestCase):
                     before, current, Path('/state'), Path('/repo'),
                     'G-091', Path('/worktree'),
                 )
+            transitions.assert_called_with(
+                Path('/state'), str(Path('/repo').resolve()), 'plan:G-091',
+                git=loop_manager.git,
+            )
 
     def test_rebase_continuation_accepts_only_proven_worker_correction(self):
         before = {
@@ -250,6 +324,7 @@ class ManagedTransitionTests(unittest.TestCase):
             ), [])
             handler = object.__new__(ExecutionHandlers)
             handler.state_dir, handler.repo_path = state, Path('/repo')
+            handler.effects = SimpleNamespace(workspace=SimpleNamespace(git=mock.Mock()))
             context = SimpleNamespace(
                 plan=SimpleNamespace(plan_id='G-091'), worktree=Path(target),
                 worker_session_id='worker-original',
@@ -662,8 +737,18 @@ class ManagedTransitionTests(unittest.TestCase):
             self.addCleanup(connection.close)
             ExecutionCheckpointRepository(connection)
             reflog = []
+            live_oid = [OLD]
 
             def git(_path, *args, **kwargs):
+                if args[0] == 'ls-remote':
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=f'{live_oid[0]}\trefs/heads/{BRANCH}\n',
+                    )
+                if args[0] == 'merge-base':
+                    return SimpleNamespace(returncode=0, stdout=OLD + '\n')
+                if args[0] == 'rev-list':
+                    return SimpleNamespace(returncode=0, stdout='')
                 if args[0] == 'rebase':
                     observed.update(
                         head=NEW, ref=[NEW, ''],
@@ -693,6 +778,7 @@ class ManagedTransitionTests(unittest.TestCase):
                         connection, repo, repo_key, 'G-091', worktree,
                         BRANCH, NEW,
                     )
+            live_oid[0] = NEW
             with (mock.patch.object(loop_manager, 'git', side_effect=git),
                   mock.patch.object(loop_manager, 'remote_branch_oid',
                                     return_value=NEW),
@@ -705,6 +791,7 @@ class ManagedTransitionTests(unittest.TestCase):
                         state, connection, repo, repo_key, 'G-091', worktree,
                         BRANCH,
                     )
+            live_oid[0] = OLD
             with (mock.patch.object(loop_manager, 'git', side_effect=git),
                   mock.patch.object(loop_manager, 'remote_branch_oid',
                                     return_value=OLD),
@@ -741,7 +828,7 @@ class ManagedTransitionTests(unittest.TestCase):
                     BRANCH,
                 ))
             self.assertEqual(len(journal.verified_managed_transitions(
-                state, repo_key, 'plan:G-091',
+                state, repo_key, 'plan:G-091', git=git,
             )), 1)
 
     def test_completed_direct_rebase_clears_only_its_checkpoint_operation(self):
@@ -768,6 +855,225 @@ class ManagedTransitionTests(unittest.TestCase):
 
 
 class DetachedRebaseOwnershipTests(unittest.TestCase):
+    def test_rebase_start_retry_reuses_frozen_run_and_generation(self):
+        connection = sqlite3.connect(':memory:')
+        self.addCleanup(connection.close)
+        connection.row_factory = sqlite3.Row
+        checkpoints = ExecutionCheckpointRepository(connection)
+        handler = object.__new__(ExecutionHandlers)
+        handler.repo, handler.repo_path, handler.state_dir = 'repo', Path('/repo'), Path('/state')
+        context = SimpleNamespace(
+            plan=SimpleNamespace(plan_id='G-099'), branch='loop-manager/G-099',
+            worktree=Path('/worktree'), worker_session_id='worker-session',
+        )
+
+        def git(_path, *args, **_kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=OLD + '\n' if args == ('rev-parse', 'HEAD') else '',
+            )
+
+        handler.effects = SimpleNamespace(
+            checkpoint=checkpoints,
+            workspace=SimpleNamespace(git=git, remote_branch_oid=lambda *_: None),
+        )
+        handler._row = lambda: {'pr_head_oid': None, 'pr_conflict_head_oid': None}
+        handler._rebase_journal_state = lambda *_: {'head': OLD, 'metadata': None}
+        with (mock.patch.object(journal, 'live_remote_branch_oid', return_value=None),
+              mock.patch('execution_handlers.managed_rebase_evidence.source_commits',
+                         return_value=(OLD, [TREE])),
+              mock.patch.object(journal, 'rebase_affected_paths', return_value=['app.py']),
+              mock.patch.object(journal, 'begin_rebase', return_value='same-intent') as begin):
+            handler._record_rebase_intent(context, NEW)
+            first = checkpoints.get('repo', 'G-099')
+            handler._record_rebase_intent(context, NEW)
+            second = checkpoints.get('repo', 'G-099')
+            self.assertEqual(first.generation, second.generation)
+            self.assertEqual(first.snapshot['rebase_run_id'],
+                             second.snapshot['rebase_run_id'])
+            self.assertEqual(begin.call_args_list[0].kwargs['expected'],
+                             begin.call_args_list[1].kwargs['expected'])
+
+    def test_stage_capture_binds_modes_to_approved_file_signatures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            path = worktree / 'app.py'
+            path.write_text('approved content')
+            path.chmod(0o644)
+            signature = loop_manager._path_signature(worktree, 'app.py')
+            observed = SimpleNamespace(
+                head=OLD, branch=None, index={},
+                dirty={'app.py': (('unstaged',), signature),
+                       'removed.py': (('unstaged',), 'missing')})
+            handler = object.__new__(ExecutionHandlers)
+            handler.repo = 'repo'
+            handler.effects = SimpleNamespace(
+                agent=SimpleNamespace(capture_git_snapshot=lambda *_: observed,
+                                      path_signature=loop_manager._path_signature),
+                checkpoint=SimpleNamespace(get=lambda *_: SimpleNamespace(
+                    snapshot={'rebase_evidence_version': 2})))
+            context = SimpleNamespace(worktree=worktree,
+                                      plan=SimpleNamespace(plan_id='G-099'))
+            evidence = handler._rebase_stage_evidence(context)
+            self.assertEqual(evidence['modes'], {'app.py': '100644', 'removed.py': None})
+            path.write_text('changed after approval')
+            with self.assertRaisesRegex(RuntimeError, 'changed while capturing'):
+                handler._rebase_stage_evidence(context)
+
+    def test_versioned_continuation_binds_source_turn_and_stage_before_git(self):
+        handler = object.__new__(ExecutionHandlers)
+        context = SimpleNamespace(
+            plan=SimpleNamespace(plan_id='G-091'), branch=BRANCH,
+            worktree=Path('/worktree'), worker_session_id='worker-session',
+        )
+        pre_index = {'app.py': [f'H 100644 {OLD} 1']}
+        staged_index = {'app.py': [f'H 100644 {TREE} 0']}
+        before = {
+            'head': NEW, 'branch': None, 'index': staged_index,
+            'dirty': {'app.py': [['staged'], 'approved']},
+            'index_clean': False, 'unmerged': False,
+        }
+        snapshot = {
+            'pending': 'continue', 'worker_result': 'saved-result',
+            'stage_evidence': {'head': NEW, 'branch': None,
+                               'files': {'app.py': 'approved'}, 'index': pre_index,
+                               'modes': {'app.py': '100644'}},
+            'rebase_evidence_version': 2, 'rebase_run_id': 'run-one',
+            'rebase_source_base': OLD, 'rebase_source_commits': [TREE],
+            'rebase_remote_oid': OLD,
+        }
+        checkpoint = SimpleNamespace(
+            operation='rebase', expected_head=OLD, target_base_oid=NEW,
+            generation=7, snapshot=snapshot,
+        )
+        correction = SimpleNamespace(
+            pending_turn='turn-one', worker_result='saved-result',
+            worker_session='worker-session', generation=9,
+        )
+        diff_code = [0]
+
+        def git(_path, *args, **_kwargs):
+            if args[0] == 'write-tree':
+                return SimpleNamespace(stdout=TREE + '\n', returncode=0)
+            if args[:3] == ('rev-parse', '--verify', 'REBASE_HEAD'):
+                return SimpleNamespace(stdout=TREE + '\n', returncode=0)
+            if args[:2] == ('diff', '--quiet'):
+                return SimpleNamespace(stdout='', returncode=diff_code[0])
+            raise AssertionError(args)
+
+        handler.effects = SimpleNamespace(
+            checkpoint=SimpleNamespace(get=lambda *_: checkpoint),
+            workspace=SimpleNamespace(git=git, remote_branch_oid=lambda *_: OLD),
+        )
+        handler.rebase_corrections = SimpleNamespace(get=lambda *_: correction)
+        handler.repo, handler.repo_path, handler.state_dir = 'repo', Path('/repo'), Path('/state')
+        handler._rebase_journal_state = lambda *_: before.copy()
+        with (mock.patch.object(journal, 'live_remote_branch_oid', return_value=OLD),
+              mock.patch.object(journal, 'rebase_affected_paths', return_value=['app.py']),
+              mock.patch.object(journal, 'begin_rebase', return_value='intent') as begin):
+            self.assertEqual(handler._begin_rebase_continuation(
+                context, CorrectionAction.CONTINUE,
+            ), 'intent')
+            expected = begin.call_args.kwargs['expected']
+            self.assertEqual(expected['source_commit'], TREE)
+            self.assertEqual(expected['correction_turn'], 'turn-one')
+            self.assertEqual(expected['staged_index'], staged_index)
+            self.assertEqual(expected['accepted_modes'], {'app.py': '100644'})
+            # core.fileMode=false can report a clean worktree diff even when
+            # update-index --chmod changes only the staged executable bit.
+            before['index'] = {'app.py': [f'H 100755 {TREE} 0']}
+            with self.assertRaises(journal.MutationEvidenceError):
+                handler._begin_rebase_continuation(context, CorrectionAction.CONTINUE)
+            self.assertEqual(begin.call_count, 1)
+            before['index'] = staged_index
+            diff_code[0] = 1
+            with self.assertRaises(journal.MutationEvidenceError):
+                handler._begin_rebase_continuation(context, CorrectionAction.CONTINUE)
+            self.assertEqual(begin.call_count, 1)
+            diff_code[0] = 0
+            correction.pending_turn = None
+            with self.assertRaises(journal.MutationEvidenceError):
+                handler._begin_rebase_continuation(context, CorrectionAction.CONTINUE)
+            self.assertEqual(begin.call_count, 1)
+
+    def test_skip_checks_approved_index_before_recording_intent(self):
+        handler = object.__new__(ExecutionHandlers)
+        context = SimpleNamespace(
+            plan=SimpleNamespace(plan_id='G-099'), branch=BRANCH,
+            worktree=Path('/worktree'), worker_session_id='session',
+        )
+        original = {'app.py': [f'H 100644 {OLD} 1'],
+                    'other.py': [f'H 100644 {OLD} 0']}
+        staged = {'app.py': [f'H 100644 {NEW} 0'],
+                  'other.py': original['other.py']}
+        before = dict(head=NEW, branch=None, index=staged,
+                      dirty={}, index_clean=True, unmerged=False)
+        snapshot = dict(
+            pending='continue', worker_result='approved',
+            stage_evidence=dict(head=NEW, branch=None,
+                                files={'app.py': 'signature'}, index=original,
+                                modes={'app.py': '100644'}),
+            rebase_evidence_version=2, rebase_run_id='run',
+            rebase_source_base=OLD, rebase_source_commits=[TREE],
+            rebase_remote_oid=None,
+        )
+        handler.repo, handler.repo_path, handler.state_dir = 'repo', Path('/repo'), Path('/state')
+        live_signature = ['signature']
+        handler.effects = SimpleNamespace(
+            agent=SimpleNamespace(path_signature=lambda *_: live_signature[0]),
+            checkpoint=SimpleNamespace(get=lambda *_: SimpleNamespace(
+                operation='rebase', expected_head=OLD, target_base_oid=NEW,
+                generation=3, snapshot=snapshot)),
+            workspace=SimpleNamespace(
+                git=lambda *_a, **_k: SimpleNamespace(stdout=TREE, returncode=0),
+                remote_branch_oid=lambda *_: None),
+        )
+        handler.rebase_corrections = SimpleNamespace(get=lambda *_: SimpleNamespace(
+            pending_turn='turn', worker_result='approved', worker_session='session',
+            generation=2))
+        handler._rebase_journal_state = lambda *_: before.copy()
+        with (mock.patch.object(journal, 'live_remote_branch_oid', return_value=None),
+              mock.patch.object(journal, 'rebase_affected_paths', return_value=['app.py']),
+              mock.patch.object(journal, 'begin_rebase', return_value='intent') as begin):
+            self.assertEqual(handler._begin_rebase_continuation(
+                context, CorrectionAction.SKIP), 'intent')
+            self.assertEqual(begin.call_args.kwargs['expected']['skip_observed_files'],
+                             {'app.py': 'signature'})
+            for changed in ('unstaged content', 'missing'):
+                with self.subTest(signature=changed):
+                    live_signature[0] = changed
+                    before['dirty'] = {'app.py': [['unstaged'], changed]}
+                    with self.assertRaisesRegex(journal.MutationEvidenceError, 'signatures'):
+                        handler._execute_rebase_step(context, CorrectionAction.SKIP)
+                    self.assertEqual(begin.call_count, 1)
+            # Also read clean tracked paths directly instead of trusting dirty.
+            before['dirty'] = {}
+            with self.assertRaisesRegex(journal.MutationEvidenceError, 'signatures'):
+                handler._begin_rebase_continuation(context, CorrectionAction.SKIP)
+            live_signature[0] = 'signature'
+            # A changing snapshot during signature capture is not a stable receipt.
+            snapshots = iter((before.copy(), before.copy(), {**before, 'head': OLD}))
+            handler._rebase_journal_state = lambda *_: next(snapshots)
+            with self.assertRaisesRegex(journal.MutationEvidenceError, 'signatures'):
+                handler._begin_rebase_continuation(context, CorrectionAction.SKIP)
+            handler._rebase_journal_state = lambda *_: before.copy()
+            for index in (
+                {**staged, 'app.py': [f'S 100644 {NEW} 0']},
+                {**staged, 'app.py': [f'h 100644 {NEW} 0']},
+                {**staged, 'other.py': [f'S 100644 {OLD} 0']},
+                {**staged, 'other.py': [f'H 100755 {OLD} 0']},
+            ):
+                with self.subTest(index=index):
+                    before['index'] = index
+                    with self.assertRaisesRegex(journal.MutationEvidenceError, 'rebase skip'):
+                        handler._begin_rebase_continuation(context, CorrectionAction.SKIP)
+            self.assertEqual(begin.call_count, 1)
+            before['index'] = staged
+            snapshot['stage_evidence'].pop('index')
+            with self.assertRaises(journal.MutationEvidenceError):
+                handler._begin_rebase_continuation(context, CorrectionAction.SKIP)
+            self.assertEqual(begin.call_count, 1)
+
     def test_continuation_intent_carries_only_matching_saved_stage_files(self):
         handler = object.__new__(ExecutionHandlers)
         context = SimpleNamespace(
@@ -835,7 +1141,7 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
         with self.assertRaises(journal.MutationEvidenceError):
             handler._post_rebase_observation(context, NEW, 'rebase completed')
 
-    def test_continuation_finishes_only_with_saved_stage_content(self):
+    def test_continuation_checks_saved_stage_commit_instead_of_final_file(self):
         handler = object.__new__(ExecutionHandlers)
         context = SimpleNamespace(
             plan=SimpleNamespace(plan_id='G-091'), branch=BRANCH,
@@ -846,13 +1152,7 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
             observed_remote_oid=OLD, snapshot={},
         )
         signature = mock.Mock(return_value='accepted-content')
-        replayed_tree = [TREE]
-
         def git(_path, *args, **_kwargs):
-            if args[:2] == ('rev-list', '--reverse'):
-                return SimpleNamespace(stdout='replayed-commit\n', returncode=0)
-            if args == ('rev-parse', 'replayed-commit^{tree}'):
-                return SimpleNamespace(stdout=replayed_tree[0] + '\n', returncode=0)
             return SimpleNamespace(
                 stdout=f'{NEW}\0loop-manager-rebase:owned-token (finish): refs/heads/{BRANCH} onto {NEW}\n', returncode=0,
             )
@@ -889,19 +1189,21 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
         with (mock.patch.object(journal, 'complete_rebase', side_effect=complete),
               mock.patch.object(journal, 'verified_rebase_result',
                                 return_value={}) as verified,
+              mock.patch.object(journal, 'legacy_rebase_replay_proof',
+                                return_value=[{'source': OLD, 'replayed': NEW}]) as proof,
               mock.patch('execution_handlers.checkpoint_ownership.rebase_preserves_commits',
                          return_value=False)):
             handler._finish_rebase_journal(context)
             self.assertTrue(verified.call_args.kwargs['accepted_correction'])
             signature.return_value = 'external-edit'
             handler._finish_rebase_journal(context)
-            self.assertFalse(verified.call_args.kwargs['accepted_correction'])
-            signature.return_value = 'accepted-content'
-            replayed_tree[0] = OLD
-            handler._finish_rebase_journal(context)
-            self.assertFalse(verified.call_args.kwargs['accepted_correction'])
+            self.assertTrue(verified.call_args.kwargs['accepted_correction'])
+            signature.assert_not_called()
+            proof.side_effect = journal.MutationEvidenceError('resolution tree mismatch')
+            with self.assertRaises(journal.MutationEvidenceError):
+                handler._finish_rebase_journal(context)
 
-    def test_skip_completion_requires_latest_reflog_oid_and_intent(self):
+    def test_legacy_skip_without_source_receipt_is_rejected(self):
         for scenario in ('owned', 'external-head', 'external-return',
                          'wrong-oid', 'other-intent', 'wrong-base', 'missing-base',
                          'missing', 'git-error'):
@@ -976,17 +1278,10 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
                     'execution_handlers.checkpoint_ownership.rebase_preserves_commits',
                     return_value=False,
                 ):
-                    if scenario == 'owned':
-                        self.assertTrue(handler._finish_rebase_journal(context))
-                        self.assertFalse((slot / 'active.json').exists())
-                        self.assertEqual(journal._read(
-                            slot / f'{token}.result.json',
-                        )['observed']['head'], NEW)
-                    else:
-                        with self.assertRaises(journal.MutationEvidenceError):
-                            handler._finish_rebase_journal(context)
-                        self.assertTrue((slot / 'active.json').exists())
-                        self.assertFalse((slot / f'{token}.result.json').exists())
+                    with self.assertRaises(journal.MutationEvidenceError):
+                        handler._finish_rebase_journal(context)
+                    self.assertTrue((slot / 'active.json').exists())
+                    self.assertFalse((slot / f'{token}.result.json').exists())
 
     def test_resumed_continue_uses_the_saved_journal_identity(self):
         git = mock.Mock(return_value=SimpleNamespace(returncode=0, stdout=''))
@@ -1128,7 +1423,7 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
                     )
                 transitions.assert_called_with(
                     worktree, str(Path('/repo').resolve()), 'plan:G-091',
-                    agent_session_id='worker-original',
+                    agent_session_id='worker-original', git=git,
                 )
                 corrected = handler()
                 corrected._rebase_journal_state.return_value = {

@@ -136,6 +136,7 @@ import document_publication
 import scoped_blocking
 import agent_scope_decision
 import rebase_file_evidence
+import managed_rebase_evidence
 import manager_git_journal
 from scoped_blocking import BlockReasonCode, BlockScope
 
@@ -9267,6 +9268,12 @@ def _owned_rebase_metadata(worktree: Path) -> dict[str, str] | None:
 
 def _owned_rebase_journal_state(worktree: Path, branch: str) -> dict[str, object]:
     snapshot = capture_git_snapshot(worktree)
+    metadata = _owned_rebase_metadata(worktree)
+    rebase_head = None
+    if metadata is not None:
+        result = git(worktree, 'rev-parse', '--verify', 'REBASE_HEAD', check=False)
+        if result.returncode == 0:
+            rebase_head = result.stdout.strip()
     return json.loads(json.dumps({
         "head": snapshot.head, "branch": snapshot.branch,
         "ref": snapshot.refs.get(f"refs/heads/{branch}"),
@@ -9274,7 +9281,7 @@ def _owned_rebase_journal_state(worktree: Path, branch: str) -> dict[str, object
         "file_evidence": rebase_file_evidence.capture(worktree, snapshot.head, snapshot.dirty),
         "registration": snapshot.worktrees.get(str(_canonical_path(worktree))),
         "operations": snapshot.operations,
-        "metadata": _owned_rebase_metadata(worktree),
+        "metadata": metadata, "rebase_head": rebase_head,
         "unmerged": bool(git(worktree, "ls-files", "-u", "-z").stdout),
         "index_clean": git(worktree, "diff", "--cached", "--quiet",
                            check=False).returncode == 0,
@@ -9290,8 +9297,24 @@ def _finish_owned_direct_rebase(
         repo, plan_id,
     )
 
+    def replay_proof(intent, observed):
+        return manager_git_journal.rebase_replay_proof(
+            git, state_dir, intent, observed,
+        )
+
     def validate(intent: Mapping[str, object], observed: Mapping[str, object]):
         expected = intent["expected"]
+        current_pr_head = None
+        if expected.get('evidence_version') == 2:
+            try:
+                row = connection.execute(
+                    'SELECT pr_head_oid, pr_conflict_head_oid FROM projects WHERE repo = ?',
+                    (repo,),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                row = None
+            if row is not None:
+                current_pr_head = str(row['pr_head_oid'] or row['pr_conflict_head_oid'] or '') or None
         if (
             intent["owner"] != f"plan:{plan_id}"
             or expected["branch"] != branch
@@ -9300,6 +9323,14 @@ def _finish_owned_direct_rebase(
             or checkpoint.expected_head != expected["before_head"]
             or checkpoint.target_base_oid != expected["target_base_oid"]
             or checkpoint.observed_remote_oid != expected["remote_oid"]
+            or (expected.get('evidence_version') == 2 and (
+                (checkpoint.snapshot or {}).get('rebase_run_id') != expected.get('run_id')
+                or (checkpoint.snapshot or {}).get('rebase_source_commits') != expected.get('source_commits')
+                or (checkpoint.snapshot or {}).get('rebase_remote_oid') != expected.get('remote_oid')
+                or (checkpoint.snapshot or {}).get('rebase_pr_head_oid') != expected.get('pr_head_oid')
+                or current_pr_head != expected.get('pr_head_oid')
+                or checkpoint.generation < expected.get('checkpoint_generation', -1)
+            ))
         ):
             raise manager_git_journal.MutationEvidenceError(
                 "Manager rebase checkpoint 또는 원격 OID가 다릅니다."
@@ -9309,10 +9340,16 @@ def _finish_owned_direct_rebase(
                 git, repo_path, branch=branch, head=observed["head"],
                 identity=intent["id"], target_base_oid=expected["target_base_oid"],
             )
-            patches = checkpoint_ownership.rebase_preserves_commits(
-                repo_path, expected["before_head"], observed["head"],
-                expected["target_base_oid"], git,
-            )
+            if (not marker and expected.get('evidence_version') == 2
+                    and observed == intent['before']):
+                marker = manager_git_journal.successful_rebase_invocation(
+                    state_dir, intent['repo'], intent['target'], intent['id'],
+                )
+            patches = (False if expected.get('evidence_version') == 2 else
+                       checkpoint_ownership.rebase_preserves_commits(
+                           repo_path, expected["before_head"], observed["head"],
+                           expected["target_base_oid"], git,
+                       ))
         else:
             marker = manager_git_journal.rebase_conflict_matches(
                 git, worktree, head=observed["head"], identity=intent["id"],
@@ -9320,11 +9357,19 @@ def _finish_owned_direct_rebase(
             patches = False
         ancestor = git(worktree, "merge-base", "--is-ancestor",
                        expected["target_base_oid"], observed["head"], check=False)
+        replay_verified = False
+        if expected.get('evidence_version') == 2:
+            replay_proof(intent, observed)
+            replay_verified = True
         return manager_git_journal.verified_rebase_result(
-            intent, observed, current_remote_oid=remote_branch_oid(repo_path, branch),
+            intent, observed, current_remote_oid=(
+                manager_git_journal.live_remote_branch_oid(git, repo_path, branch)
+                if expected.get('evidence_version') == 2 else remote_branch_oid(repo_path, branch)
+            ),
             target_ancestor=ancestor.returncode == 0,
             patches_preserved=patches, reflog_marker=marker,
             autostash_owned=bool((checkpoint.snapshot or {}).get("stash_oid")),
+            replay_verified=replay_verified,
         )
 
     return manager_git_journal.complete_rebase(
@@ -9333,6 +9378,10 @@ def _finish_owned_direct_rebase(
         observe=lambda: _owned_rebase_journal_state(worktree, branch),
         validate=validate,
         allow_equal=allow_equal,
+        replay_proof=lambda intent, observed: (
+            replay_proof(intent, observed)
+            if intent['expected'].get('evidence_version') == 2 else None
+        ),
     )
 
 
@@ -9353,6 +9402,10 @@ def _journaled_direct_rebase(
         raise manager_git_journal.MutationEvidenceError(
             "Manager rebase 전 게시 원격 OID가 checkpoint와 다릅니다."
         )
+    if manager_git_journal.live_remote_branch_oid(git, repo_path, branch) != remote_oid:
+        raise manager_git_journal.MutationEvidenceError(
+            'Manager rebase start: live remote differs from fetched OID'
+        )
     if current.operation == "rebase":
         if (current.expected_head != before["head"]
                 or current.target_base_oid != target_oid
@@ -9361,12 +9414,37 @@ def _journaled_direct_rebase(
                 "Manager rebase 기존 checkpoint가 현재 작업과 다릅니다."
             )
     else:
+        try:
+            row = connection.execute(
+                'SELECT pr_head_oid, pr_conflict_head_oid FROM projects WHERE repo = ?',
+                (repo,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            row = None
+        pr_head_oid = (str(row['pr_head_oid'] or row['pr_conflict_head_oid'] or '')
+                       or None) if row is not None else None
+        if pr_head_oid and pr_head_oid != remote_oid:
+            raise manager_git_journal.MutationEvidenceError(
+                'Manager rebase start: PR head differs from remote OID'
+            )
+        source_base, source_commits = managed_rebase_evidence.source_commits(
+            git, worktree, before['head'], target_oid,
+        )
+        run_id = secrets.token_hex(16)
         checkpoint.record(
             repo, plan_id, expected_generation=current.generation,
             operation="rebase", expected_head=before["head"],
             target_base_oid=target_oid, observed_remote_oid=remote_oid,
-            snapshot=current.snapshot,
+            snapshot={**(current.snapshot or {}),
+                      'rebase_evidence_version': managed_rebase_evidence.EVIDENCE_VERSION,
+                      'rebase_run_id': run_id,
+                      'rebase_source_base': source_base,
+                      'rebase_source_commits': source_commits,
+                      'rebase_pr_head_oid': pr_head_oid,
+                      'rebase_remote_oid': remote_oid},
         )
+    current = checkpoint.get(repo, plan_id)
+    snapshot = current.snapshot or {}
     token = manager_git_journal.begin_rebase(
         state_dir, owner=f"plan:{plan_id}", repo=str(_canonical_path(repo_path)),
         target=str(_canonical_path(worktree)), before=before,
@@ -9375,17 +9453,60 @@ def _journaled_direct_rebase(
                   "affected_paths": manager_git_journal.rebase_affected_paths(
                       git, worktree, before["head"], target_oid,
                   ),
-                  "agent_session_id": agent_session_id},
+                  "agent_session_id": agent_session_id,
+                  **({"evidence_version": managed_rebase_evidence.EVIDENCE_VERSION,
+                      "run_id": snapshot['rebase_run_id'],
+                      "source_base": snapshot['rebase_source_base'],
+                      "source_commits": snapshot['rebase_source_commits'],
+                      "pr_head_oid": snapshot.get('rebase_pr_head_oid'),
+                      "checkpoint_generation": current.generation}
+                     if snapshot.get('rebase_evidence_version') ==
+                     managed_rebase_evidence.EVIDENCE_VERSION else {})},
     )
     environment = dict(os.environ)
     environment["GIT_REFLOG_ACTION"] = f"loop-manager-rebase:{token}"
     result = git(worktree, "rebase", *(("--autostash",) if autostash else ()),
                  target_oid, check=False, env=environment)
+    if result.returncode == 0:
+        manager_git_journal.record_rebase_invocation(
+            state_dir, str(_canonical_path(repo_path)),
+            str(_canonical_path(worktree)), token, returncode=result.returncode,
+        )
     _finish_owned_direct_rebase(
         state_dir, connection, repo_path, repo, plan_id, worktree, branch,
         allow_equal=True, agent_session_id=agent_session_id,
     )
     return result
+
+
+def _direct_rebase_history_proven(
+    connection: sqlite3.Connection, repo_path: Path, repo: str, plan_id: str,
+    worktree: Path, branch: str, before_head: str, after_head: str,
+    target_base: str, agent_session_id: str | None,
+) -> bool:
+    checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
+        repo, plan_id,
+    )
+    if (checkpoint.snapshot or {}).get('rebase_evidence_version') != 2:
+        return checkpoint_ownership.rebase_preserves_commits(
+            repo_path, before_head, after_head, target_base, git,
+        )
+    state_dir = _owned_rebase_state_dir(repo, plan_id, worktree)
+    if state_dir is None:
+        return False
+    transitions = manager_git_journal.verified_managed_transitions(
+        state_dir, str(_canonical_path(repo_path)), f'plan:{plan_id}',
+        agent_session_id=agent_session_id, git=git,
+    )
+    return any(
+        item['intent']['kind'] == 'managed_rebase'
+        and item['intent']['expected'].get('branch') == branch
+        and item['intent']['expected'].get('before_head') == before_head
+        and item['intent']['expected'].get('target_base_oid') == target_base
+        and item['result']['observed'].get('head') == after_head
+        and item['result']['observed'].get('metadata') is None
+        for item in transitions
+    )
 
 
 def _complete_direct_rebase_checkpoint(
@@ -13079,6 +13200,7 @@ def _proven_recovered_worktree_baseline(
         raise AgentScopeError("복구한 Agent worktree의 기존 파일·HEAD 상태가 다릅니다.")
     transitions = manager_git_journal.verified_managed_transitions(
         state_dir, str(_canonical_path(repo_path)), f"plan:{plan_id}",
+        git=git,
     )
     owned = any(
         item["intent"]["kind"] == "managed_worktree_create"
@@ -14676,11 +14798,7 @@ def _resume_interrupted_blocked_rebase(
             and snapshot.head == current_head and snapshot.branch == branch
             and not snapshot.operations
             and (not after_head or after_head == current_head)
-            and checkpoint_ownership.rebase_preserves_commits(
-                repo_path, before_head, current_head, target_base, git,
-            )
             and _blocked_execplan_metadata_error(repo_path, worktree, plan) is None
-            and _blocked_resume_worktree_matches(worktree, marker, snapshot)
         )
         if safe:
             state_dir = _owned_rebase_state_dir(repo, str(plan['plan_id']), worktree)
@@ -14690,6 +14808,14 @@ def _resume_interrupted_blocked_rebase(
                     str(plan['plan_id']), worktree, branch,
                     agent_session_id=plan['worker_session_id'],
                 )
+            safe = (
+                _direct_rebase_history_proven(
+                    connection, repo_path, repo, str(plan['plan_id']), worktree,
+                    branch, before_head, current_head, target_base,
+                    plan['worker_session_id'],
+                )
+                and _blocked_resume_worktree_matches(worktree, marker, snapshot)
+            )
     except (OSError, RuntimeError, ValueError, KeyError, TypeError):
         safe = False
     if not safe:
@@ -14962,8 +15088,10 @@ def resume_blocked_execplan_if_inputs_changed(
 
     if owned_oid is not None:
         after_head = git(worktree, 'rev-parse', 'HEAD').stdout.strip()
-        if not checkpoint_ownership.rebase_preserves_commits(
-            repo_path, before_head, after_head, target_base_oid, git,
+        if not _direct_rebase_history_proven(
+            connection, repo_path, repo, str(plan['plan_id']), worktree,
+            branch, before_head, after_head, target_base_oid,
+            plan['worker_session_id'],
         ):
             _update_blocked_error(connection, repo, str(plan['plan_id']),
                                   '차단 해제 rebase의 commit 계보를 증명할 수 없습니다.')
@@ -15981,8 +16109,10 @@ def _resume_owned_checkpoint_project_block(
         if (
             checkpoint.expected_head != current.head
             or checkpoint.observed_remote_oid != remote_oid
-            or not checkpoint_ownership.rebase_preserves_commits(
-                repo_path, before_head, after_head, target_base, git,
+            or not _direct_rebase_history_proven(
+                connection, repo_path, repo, plan_id, worktree, branch,
+                before_head, after_head, target_base,
+                plan['worker_session_id'],
             )
         ):
             return False
