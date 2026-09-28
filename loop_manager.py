@@ -18905,6 +18905,13 @@ class _PlanningStatePorts:
             completion_candidate=completion_candidate,
         )
 
+    def settle_empty_stabilization_assessment(
+        self, repo: str, interval: int, *, source_sha: str,
+    ) -> maintenance_state.MaintenanceCycle:
+        return self._maintenance_repository.settle_empty_stabilization_assessment(
+            repo, interval, source_sha=source_sha,
+        )
+
     def record_full_assessment(
         self, repo: str, *, expected_revision: int, source_sha: str, result: str
     ) -> maintenance_state.MaintenanceCycle:

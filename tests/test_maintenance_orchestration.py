@@ -18,6 +18,7 @@ from maintenance_orchestration import (
 from maintenance_planning import MaintenancePlanMode, MaintenancePlanningContext
 import maintenance_state
 import planning_runtime
+from maintenance_file_inventory import SourceInventoryError
 from tests.test_loop_manager import (
     _ports_with_bound_dummy_sessions,
     _profile_for_dummy_worker_config,
@@ -492,6 +493,58 @@ class MaintenanceOrchestrationTest(unittest.TestCase):
             self.assertEqual(coordinator._run_planner_turn(run), outcome)
         complete.assert_called_once_with(run, Path("/worktree"))
         ports.agent.run_planner.assert_not_called()
+
+    def test_empty_stabilization_selection_settles_or_restarts_without_an_agent(self):
+        source = "a" * 40
+        context = planning_runtime.PlanningContext(
+            repo="/repo", repo_path=Path("/repo"), state_dir=Path("/state"),
+            base_branch="main", base_sha=source, provider="codex",
+            config_path=Path("/config.ini"), registered_only=True,
+            refactoring_review_interval=20,
+        )
+        row = SimpleNamespace(
+            phase=None, planning_error=None, worktree=None,
+            planning_fingerprint="planning", specification_fingerprint="specification",
+            processed_sha=None,
+        )
+        cycle = SimpleNamespace(
+            phase=maintenance_state.MaintenancePhase.IDLE,
+            publication_stage=None,
+        )
+        decision = SimpleNamespace(
+            active=None, has_ready=False, has_waiting=False,
+            runnable_ready=None, project_blocked=False,
+        )
+        ports = mock.Mock()
+        ports.state.advance_maintenance_cycle.return_value = cycle
+        ports.state.schedule.return_value = decision
+        ports.state.maintenance_due.return_value = maintenance_state.ReviewDue(
+            True, "stabilization_due", 10, maintenance_state.MaintenancePhase.IDLE,
+        )
+        ports.state.settle_empty_stabilization_assessment.return_value = cycle
+        ports.git.input_fingerprint.return_value = "planning"
+        ports.git.specification_fingerprint.return_value = "specification"
+        ports.file_review.has_selected_sources.return_value = False
+        coordinator = planning_runtime.PlanningLifecycleCoordinator(ports)
+        run = planning_runtime._PlanningRun(context, row, cycle, source, False)
+
+        self.assertIsNone(coordinator._select_planning_work(run))
+        ports.state.settle_empty_stabilization_assessment.assert_called_once_with(
+            "/repo", 20, source_sha=source,
+        )
+        ports.state.begin_maintenance_assessment.assert_not_called()
+        ports.agent.run_planner.assert_not_called()
+
+        ports.file_review.has_selected_sources.side_effect = SourceInventoryError(
+            "unclassified source"
+        )
+        failed_run = planning_runtime._PlanningRun(context, row, cycle, source, False)
+        failed = coordinator._select_planning_work(failed_run)
+        self.assertEqual(
+            failed.kind, planning_runtime.PlanningOutcomeKind.REMOTE_BASE_RESTART,
+        )
+        self.assertEqual(failed.detail, "unclassified source")
+        self.assertEqual(ports.state.settle_empty_stabilization_assessment.call_count, 1)
 
     def test_prepared_batch_persists_new_plan_sets_for_restart_recovery(self):
         connection = self._connection()

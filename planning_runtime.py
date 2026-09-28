@@ -205,6 +205,10 @@ class PlanningStatePort(Protocol):
         completion_candidate: bool = False,
     ) -> tuple[maintenance_state.MaintenanceCycle, bool]: ...
 
+    def settle_empty_stabilization_assessment(
+        self, repo: str, interval: int, *, source_sha: str,
+    ) -> maintenance_state.MaintenanceCycle: ...
+
     def record_full_assessment(
         self, repo: str, *, expected_revision: int, source_sha: str, result: str
     ) -> maintenance_state.MaintenanceCycle: ...
@@ -740,18 +744,39 @@ class PlanningLifecycleCoordinator:
                 self_repository=context.self_repository,
                 completion_candidate=completion_candidate,
             )
-            if (
-                due.reason == "stabilization_due"
-                and hasattr(self._ports, "file_review")
-                and not self._ports.file_review.has_selected_sources(
-                    context.repo, context.repo_path, context.base_branch,
-                    run.base_sha,
-                )
+            if due.reason == "stabilization_due" and hasattr(
+                self._ports, "file_review"
             ):
-                due = maintenance_state.ReviewDue(
-                    False, "no_selected_files", due.merged_since_baseline,
-                    due.active_phase,
-                )
+                try:
+                    has_selected_sources = self._ports.file_review.has_selected_sources(
+                        context.repo, context.repo_path, context.base_branch,
+                        run.base_sha,
+                    )
+                except SourceInventoryError as error:
+                    self._ports.events.error(str(error))
+                    return PlanningOutcome(
+                        PlanningOutcomeKind.REMOTE_BASE_RESTART,
+                        detail=str(error),
+                        error=True,
+                    )
+                if not has_selected_sources:
+                    try:
+                        cycle = self._ports.state.settle_empty_stabilization_assessment(
+                            context.repo,
+                            context.refactoring_review_interval,
+                            source_sha=run.base_sha,
+                        )
+                    except maintenance_state.MaintenanceStateError as error:
+                        self._ports.events.error(str(error))
+                        return PlanningOutcome(
+                            PlanningOutcomeKind.REMOTE_BASE_RESTART,
+                            detail=str(error),
+                            error=True,
+                        )
+                    due = maintenance_state.ReviewDue(
+                        False, "no_selected_files", due.merged_since_baseline,
+                        cycle.phase,
+                    )
             if due.required:
                 include_general = False
                 if not decision.has_ready:

@@ -825,6 +825,48 @@ class MaintenanceStateRepositoryTest(unittest.TestCase):
         self.assertTrue(started)
         self.assertEqual(cycle.cycle_start_merged_count, 10)
 
+    def test_empty_stabilization_advances_the_verified_file_baseline_once(self):
+        connection = self._connection()
+        repository = maintenance_state.MaintenanceRepository(connection)
+        source = "a" * 40
+        connection.execute(
+            "INSERT INTO execplan_catalog_revisions "
+            "(repo, revision_sha, catalog_fingerprint) VALUES ('one', ?, 'catalog')",
+            (source,),
+        )
+        repository.initialize_file_assessment_start(
+            "one", source_sha=source, expected_merged_count=0,
+        )
+        connection.execute(
+            "UPDATE maintenance_cycles SET last_success_file_assessment_merged_count = 0 "
+            "WHERE repo = 'one'"
+        )
+        for number in range(1, 11):
+            self._insert_plan(connection, "one", f"G-{number:03d}", "MERGED")
+
+        settled = repository.settle_empty_stabilization_assessment(
+            "one", 20, source_sha=source,
+        )
+
+        self.assertEqual(settled.phase, maintenance_state.MaintenancePhase.IDLE)
+        self.assertEqual(settled.last_success_file_assessment_merged_count, 10)
+        self.assertEqual(
+            repository.file_assessment_due(
+                "one", 20, completion_candidate=True,
+            ).reason,
+            "interval_pending",
+        )
+        for number in range(11, 21):
+            self._insert_plan(connection, "one", f"G-{number:03d}", "MERGED")
+        with self.assertRaises(maintenance_state.MaintenanceStateError):
+            repository.settle_empty_stabilization_assessment(
+                "one", 20, source_sha="b" * 40,
+            )
+        self.assertEqual(
+            repository.get("one").last_success_file_assessment_merged_count,
+            10,
+        )
+
     def test_file_assessment_rejects_unverified_source_or_count_drift(self):
         connection = self._connection()
         repository = maintenance_state.MaintenanceRepository(connection)
