@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 import json
+from pathlib import Path
 import re
 import sqlite3
 from typing import Iterator, Sequence
@@ -15,6 +16,7 @@ import maintenance_file_ledger
 import maintenance_file_publication
 import maintenance_file_review
 import maintenance_reconciliation
+from maintenance_file_inventory import SourceInventory, verify_remote_revision
 
 
 class MaintenanceStateError(RuntimeError):
@@ -581,6 +583,61 @@ class MaintenanceRepository:
                 (count, int(bump_revision), repo, expected_revision),
             )
             return self.get(repo)
+
+    def settle_empty_stabilization_assessment(
+        self,
+        repo: str,
+        interval: int,
+        *,
+        source_sha: str,
+        repository_path: str,
+        base_branch: str,
+        inventory: SourceInventory,
+    ) -> MaintenanceCycle:
+        """Record a verified empty completion-candidate assessment once.
+
+        Re-recording the empty success through the ledger retires deleted
+        paths and rechecks the live remote revision immediately before the
+        durable baseline advances.
+        """
+
+        with _transaction(self.connection):
+            state = self.get(repo)
+            if inventory.revision != source_sha:
+                raise MaintenanceStateError("빈 안정화 평가 inventory source가 다릅니다.")
+            decision = self.file_assessment_due(
+                repo, interval, completion_candidate=True,
+            )
+            if (
+                state.phase is not MaintenancePhase.IDLE
+                or decision.reason != "stabilization_due"
+            ):
+                raise MaintenanceStateError(
+                    "빈 안정화 평가는 현재 완료 후보에서만 확정할 수 있습니다."
+                )
+            maintenance_file_ledger.FileReviewRepository(
+                self.connection
+            ).record_success(
+                repo, repository_path, base_branch, inventory, (),
+            )
+            # Keep the durable count tied to the exact revision whose empty
+            # inventory just retired obsolete ledger entries.
+            verify_remote_revision(Path(repository_path), base_branch, source_sha)
+            count = self._verified_merged_count(
+                repo, source_sha, decision.merged_since_baseline
+                + int(state.last_success_file_assessment_merged_count or 0),
+            )
+            self.connection.execute(
+                "UPDATE maintenance_cycles SET "
+                "last_success_file_assessment_merged_count = ?, "
+                "revision = revision + 1, updated_at = CURRENT_TIMESTAMP "
+                "WHERE repo = ? AND phase = 'idle' AND revision = ?",
+                (count, repo, state.revision),
+            )
+            settled = self.get(repo)
+            if settled.revision == state.revision:
+                raise MaintenanceStateError("빈 안정화 평가 기준값을 확정하지 못했습니다.")
+            return settled
 
     def _serialize_plan_ids(
         self, repo: str, values: Sequence[str], field: str

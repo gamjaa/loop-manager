@@ -35,8 +35,8 @@ priority: normal
 
 ## Progress
 
-- [ ] 완료 후보의 안정화 trigger와 빈 대상 단축 경로
-- [ ] 중복 cycle 방지 및 완료 알림 회귀 검증
+- [x] 완료 후보의 안정화 trigger와 빈 대상 단축 경로
+- [x] 중복 cycle 방지 및 완료 알림 회귀 검증
 
 ## Decision Log
 

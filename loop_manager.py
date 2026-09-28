@@ -18905,6 +18905,25 @@ class _PlanningStatePorts:
             completion_candidate=completion_candidate,
         )
 
+    def settle_empty_stabilization_assessment(
+        self,
+        repo: str,
+        interval: int,
+        *,
+        source_sha: str,
+        repository_path: str,
+        base_branch: str,
+        inventory: maintenance_file_inventory.SourceInventory,
+    ) -> maintenance_state.MaintenanceCycle:
+        return self._maintenance_repository.settle_empty_stabilization_assessment(
+            repo,
+            interval,
+            source_sha=source_sha,
+            repository_path=repository_path,
+            base_branch=base_branch,
+            inventory=inventory,
+        )
+
     def record_full_assessment(
         self, repo: str, *, expected_revision: int, source_sha: str, result: str
     ) -> maintenance_state.MaintenanceCycle:
@@ -20080,15 +20099,16 @@ class _PlanningFileReviewPorts:
         self._connection = connection
         self._repository = maintenance_file_review.ProvisionalReviewRepository(connection)
 
-    def has_selected_sources(
+    def empty_selection_inventory(
         self, repo: str, repository: Path, base: str, source_revision: str,
-    ) -> bool:
+    ) -> maintenance_file_inventory.SourceInventory | None:
         inventory = maintenance_file_inventory.cached_source_inventory(
             self._connection, repository, base, source_revision,
         )
-        return bool(maintenance_file_ledger.FileReviewRepository(
+        selected = maintenance_file_ledger.FileReviewRepository(
             self._connection,
-        ).selected_sources(repo, inventory))
+        ).selected_sources(repo, inventory)
+        return None if selected else inventory
 
     def progress(
         self, repo: str, repository: Path, base: str, cycle_revision: int,
