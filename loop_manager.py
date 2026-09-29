@@ -20661,6 +20661,7 @@ def observe_blocked_plan_remotes(
         return
     configured = git(repo_path, "remote", "get-url", "origin", check=False)
     origin = configured.stdout.strip() if configured.returncode == 0 else ""
+    origin_failure = "origin-unavailable"
     registered_origin = str(project["origin"] or "")
     if registered_origin and origin:
         try:
@@ -20669,26 +20670,29 @@ def observe_blocked_plan_remotes(
             origin_identity = origin
         if origin_identity != registered_origin:
             origin = ""
+            origin_failure = "registered-origin-mismatch"
     base_ref = f"refs/heads/{project['base_branch']}"
     for plan in plans:
         branch_ref = f"refs/heads/{plan['branch']}" if plan["branch"] else ""
         base, branch = blocked_remote_observation.observe_refs(
             repo_path, origin, (base_ref, branch_ref),
+            unavailable_reason=origin_failure,
         )
         block = connection.execute(
             "SELECT reason_code, release_fingerprint FROM execplan_blocks "
             "WHERE repo = ? AND plan_id = ?",
             (repo, plan["plan_id"]),
         ).fetchone()
-        reason = (
-            str(block["reason_code"]) if block else
-            str(project_block["reason_code"]) if project_block and linked_plan_id == plan["plan_id"] else
-            str(plan["blocked_reason"] or "")
-        )
-        fingerprint = (
-            str(block["release_fingerprint"] or "") if block else
-            str(plan["blocked_fingerprint"] or "")
-        )
+        if block is not None:
+            reason = str(block["reason_code"])
+            fingerprint = str(block["release_fingerprint"] or "")
+        elif plan["status"] == "PLAN_BLOCKED":
+            reason = str(plan["blocked_reason"] or "")
+            fingerprint = str(plan["blocked_fingerprint"] or "")
+        else:
+            reason = None
+            fingerprint = None
+        linked_project_block = project_block if linked_plan_id == plan["plan_id"] else None
         worktree_fingerprint = str(plan["blocked_worktree_fingerprint"] or "")
         if plan["worktree"]:
             try:
@@ -20700,6 +20704,14 @@ def observe_blocked_plan_remotes(
             origin_url=origin or None, base_ref=base_ref, branch_ref=branch_ref,
             base=base, branch=branch, blocked_reason=reason,
             blocked_fingerprint=fingerprint,
+            project_blocked_reason=(
+                str(linked_project_block["reason_code"])
+                if linked_project_block else None
+            ),
+            project_blocked_fingerprint=(
+                str(linked_project_block["release_fingerprint"] or "")
+                if linked_project_block else None
+            ),
             worktree_fingerprint=worktree_fingerprint,
         )
     connection.commit()

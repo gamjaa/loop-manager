@@ -121,6 +121,8 @@ class BlockedRemoteObservationTest(unittest.TestCase):
         with mock.patch.object(observation.subprocess, "run", side_effect=offline_remote):
             failed = self.observe()
         self.assertEqual((failed["base_result"], failed["branch_result"]), ("error", "error"))
+        self.assertEqual(failed["base_error"], "os-error-unknown")
+        self.assertEqual(failed["branch_error"], "os-error-unknown")
         self.assertEqual(failed["confirmed_base_oid"], confirmed["base_oid"])
         self.assertEqual(failed["confirmed_branch_oid"], confirmed["branch_oid"])
         statuses = self.connection.execute(
@@ -145,13 +147,26 @@ class BlockedRemoteObservationTest(unittest.TestCase):
             (str(self.repo),),
         )
         self.connection.execute(
-            "INSERT INTO project_blocks (repo, scope, reason_code, plan_id, evidence) "
-            "VALUES (?, 'project', 'repository_state_unsafe', 'G-001', 'unsafe')",
+            "INSERT INTO project_blocks (repo, scope, reason_code, plan_id, evidence, release_fingerprint) "
+            "VALUES (?, 'project', 'repository_state_unsafe', 'G-001', 'unsafe', 'first')",
             (str(self.repo),),
         )
         linked = self.observe()
         self.assertEqual(linked["branch_oid"], branch_oid)
-        self.assertEqual(linked["blocked_reason"], "repository_state_unsafe")
+        self.assertIsNone(linked["blocked_reason"])
+        self.assertEqual(linked["project_blocked_reason"], "repository_state_unsafe")
+        self.assertEqual(linked["project_blocked_fingerprint"], "first")
+        self.assertTrue(observation.mark_processed(
+            self.connection, str(self.repo), "G-001", observation.input_identity(linked),
+        ))
+        self.connection.execute(
+            "UPDATE project_blocks SET release_fingerprint = 'second' WHERE repo = ?",
+            (str(self.repo),),
+        )
+        changed_project_input = self.observe()
+        self.assertEqual(changed_project_input["base_oid"], linked["base_oid"])
+        self.assertEqual(changed_project_input["branch_oid"], linked["branch_oid"])
+        self.assertTrue(observation.pending_input(changed_project_input))
         next_oid = self.advance("work/one", "next branch commit\n")
         with (
             mock.patch.object(loop_manager, "_self_runtime_project", return_value=None),
@@ -188,6 +203,71 @@ class BlockedRemoteObservationTest(unittest.TestCase):
         self.assertNotEqual(after["worktree_fingerprint"], before["worktree_fingerprint"])
         self.assertTrue(observation.pending_input(after))
         self.assertEqual(git(self.repo, "status", "--porcelain"), "")
+
+    def test_remote_failure_cause_changes_are_persisted_as_new_input(self):
+        for diagnostic, cause in (
+            ("fatal: Authentication failed", "authentication"),
+            ("fatal: Could not resolve host", "network"),
+        ):
+            with self.subTest(cause=cause), mock.patch.object(
+                observation.subprocess, "run",
+                return_value=subprocess.CompletedProcess([], 128, "", diagnostic),
+            ):
+                base, branch = observation.observe_refs(
+                    self.repo, str(self.remote),
+                    ("refs/heads/main", "refs/heads/work/one"),
+                )
+            observation.record(
+                self.connection, repo=str(self.repo), plan_id="G-001",
+                origin_url=str(self.remote), base_ref="refs/heads/main",
+                branch_ref="refs/heads/work/one", base=base, branch=branch,
+                blocked_reason="user_decision_required", blocked_fingerprint="same-input",
+                project_blocked_reason=None, project_blocked_fingerprint=None,
+                worktree_fingerprint="",
+            )
+            row = self.connection.execute(
+                "SELECT * FROM blocked_remote_observations WHERE repo = ?",
+                (str(self.repo),),
+            ).fetchone()
+            self.assertEqual((row["base_error"], row["branch_error"]), (cause, cause))
+            self.assertTrue(observation.pending_input(row))
+            self.assertTrue(observation.mark_processed(
+                self.connection, str(self.repo), "G-001", observation.input_identity(row),
+            ))
+
+    def test_plan_and_project_block_inputs_remain_distinct(self):
+        self.connection.execute(
+            "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence, release_fingerprint) "
+            "VALUES (?, 'G-001', 'plan', 'user_decision_required', 'decision', 'plan-input')",
+            (str(self.repo),),
+        )
+        self.connection.execute(
+            "INSERT INTO project_blocks (repo, scope, reason_code, plan_id, evidence, release_fingerprint) "
+            "VALUES (?, 'project', 'repository_state_unsafe', 'G-001', 'unsafe', 'project-input')",
+            (str(self.repo),),
+        )
+        row = self.observe()
+        self.assertEqual(row["blocked_reason"], "user_decision_required")
+        self.assertEqual(row["blocked_fingerprint"], "plan-input")
+        self.assertEqual(row["project_blocked_reason"], "repository_state_unsafe")
+        self.assertEqual(row["project_blocked_fingerprint"], "project-input")
+
+    def test_existing_observation_table_adds_failure_and_project_columns(self):
+        self.connection.execute("DROP TABLE blocked_remote_observations")
+        self.connection.execute(
+            "CREATE TABLE blocked_remote_observations "
+            "(repo TEXT, plan_id TEXT, base_result TEXT, branch_result TEXT)"
+        )
+        observation.ensure_schema(self.connection)
+        columns = {
+            row[1] for row in self.connection.execute(
+                "PRAGMA table_info(blocked_remote_observations)"
+            )
+        }
+        self.assertTrue({
+            "base_error", "branch_error", "project_blocked_reason",
+            "project_blocked_fingerprint",
+        } <= columns)
 
 
 if __name__ == "__main__":
