@@ -2302,9 +2302,11 @@ class ExecutionHandlerTests(TestCase):
         self.connection.execute(
             "INSERT INTO blocked_checkpoints "
             "(repo, plan_id, request_identity, phase, reason_code, evidence, "
-            "branch, worktree, accepted_remote_oid) "
+            "branch, worktree, accepted_remote_oid, result, published_oid, "
+            "commit_identity, tree_oid) "
             "VALUES ('repo', 'G-047', 'request', 'published', 'review', 'evidence', "
-            "'loop-manager/G-047', '/state/G-047', 'remote')"
+            "'loop-manager/G-047', '/state/G-047', 'remote', 'published', "
+            "'remote', 'checkpoint-token', 'checkpoint-tree')"
         )
         self.state.update_project('repo', worker_session_id='worker-session',
                                   publication_remote_oid='remote')
@@ -2345,20 +2347,35 @@ class ExecutionHandlerTests(TestCase):
             'result': {'observed': dict(observed)},
         }
         self.handler._rebase_journal_state.return_value = observed
-        base_state = {'oid': 'base', 'descends_from_target': True}
+        base_state = {'oid': 'base', 'descends_from_target': True,
+                      'live_oid': 'remote'}
         def git_for_owned_rebase(_path, *args, **_kwargs):
             if args[:2] == ('rev-parse', 'origin/main'):
                 return SimpleNamespace(stdout=base_state['oid'] + '\n', returncode=0)
+            if args[:2] == ('rev-parse', 'remote^{tree}'):
+                return SimpleNamespace(stdout='checkpoint-tree\n', returncode=0)
+            if args[0] == 'show':
+                return SimpleNamespace(
+                    stdout='[G-047] BLOCKED checkpoint\nScope: plan\n'
+                           'Checkpoint-Identity: checkpoint-token\n',
+                    returncode=0,
+                )
+            if args[0] == 'ls-remote':
+                return SimpleNamespace(
+                    stdout=f"{base_state['live_oid']}\trefs/heads/{context.branch}\n",
+                    returncode=0,
+                )
             if args[:2] == ('merge-base', '--is-ancestor'):
                 return SimpleNamespace(
-                    stdout='', returncode=0 if base_state['descends_from_target'] else 1,
+                    stdout='', returncode=(
+                        0 if args[2:] != ('base', base_state['oid'])
+                        or base_state['descends_from_target'] else 1
+                    ),
                 )
             return SimpleNamespace(stdout='rebased\n', returncode=0)
         self.effects.workspace.git.side_effect = git_for_owned_rebase
         row = {'pr_url': None, 'publication_remote_oid': 'remote'}
         with (
-            mock.patch.object(handlers.checkpoint_ownership, 'owned_remote_oid',
-                              return_value='remote'),
             mock.patch.object(handlers.manager_git_journal,
                               'verified_managed_transitions',
                               return_value=[transition]),
@@ -2375,6 +2392,11 @@ class ExecutionHandlerTests(TestCase):
             self.assertTrue(self.handler._owned_checkpoint_remote(
                 context, row, 'remote', checkpoint.get('repo', 'G-047'),
             ))
+            base_state['live_oid'] = 'external'
+            self.assertFalse(self.handler._owned_checkpoint_remote(
+                context, row, 'remote', checkpoint.get('repo', 'G-047'),
+            ))
+            base_state['live_oid'] = 'remote'
             base_state['oid'] = 'advanced-base'
             self.assertTrue(self.handler._owned_checkpoint_remote(
                 context, row, 'remote', checkpoint.get('repo', 'G-047'),
@@ -2429,16 +2451,12 @@ class ExecutionHandlerTests(TestCase):
                           'remote_before': 'remote'},
             )
             row['publication_remote_oid'] = 'candidate'
-            self.effects.workspace.git.side_effect = lambda _path, *args, **_kw: (
-                SimpleNamespace(
-                    stdout='candidate\trefs/heads/loop-manager/G-047\n',
-                    returncode=0,
-                ) if args[0] == 'ls-remote' else
-                SimpleNamespace(stdout='base\n', returncode=0)
-                if args[:2] == ('rev-parse', 'origin/main') else
-                SimpleNamespace(stdout='candidate\n', returncode=0)
-            )
+            base_state['live_oid'] = 'candidate'
             self.assertTrue(self.handler._owned_checkpoint_remote(
+                context, row, 'candidate', push,
+            ))
+            base_state['live_oid'] = 'external'
+            self.assertFalse(self.handler._owned_checkpoint_remote(
                 context, row, 'candidate', push,
             ))
             observed['dirty'] = {'app.py': 'external'}
@@ -2451,6 +2469,25 @@ class ExecutionHandlerTests(TestCase):
         completed_push = checkpoint.get('repo', 'G-047')
         self.assertEqual(completed_push.generation, push.generation + 1)
         self.assertEqual(completed_push.snapshot['pushed_checkpoint_head'], 'candidate')
+        observed['dirty'] = {}
+        base_state['live_oid'] = 'candidate'
+        with mock.patch.object(
+            handlers.manager_git_journal, 'verified_managed_transitions',
+            return_value=[transition],
+        ):
+            self.assertTrue(self.handler._owned_checkpoint_remote(
+                context, row, 'candidate', completed_push,
+            ))
+            pr_intent = checkpoint.record(
+                'repo', 'G-047', expected_generation=completed_push.generation,
+                operation='pr_create', expected_head='candidate',
+                target_base_oid='base', observed_remote_oid='candidate',
+                snapshot=completed_push.snapshot,
+            )
+            self.assertTrue(self.handler._owned_checkpoint_remote(
+                context, row, 'candidate', pr_intent,
+                {'headRefOid': 'candidate'},
+            ))
 
     def test_normal_published_rebase_completion_persists_sealed_owner(self):
         blocked_checkpoint_state.ensure_schema(self.connection)

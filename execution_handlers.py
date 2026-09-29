@@ -607,7 +607,7 @@ class ExecutionHandlers:
                 context.plan.plan_id, context.branch, context.worktree,
                 original_oid, self.effects.workspace.git,
                 before_head=proof['before_head'], recorded_oid=original_oid,
-                require_live=remote_oid != original_oid,
+                require_live=remote_oid == original_oid,
             ) != original_oid:
                 return False
             observed = self._rebase_journal_state(context)
