@@ -480,8 +480,10 @@ class ExecutionHandlerTests(TestCase):
         self.handler.effects = self.effects
         self.state.update_project('repo', worker_session_id='corrector')
         context = self.context()
-        stage = {'files': {'app.py': 'accepted'},
-                 'modes': {'app.py': '100644'}}
+        stage = {'head': 'head', 'branch': context.branch,
+                 'files': {'app.py': 'accepted'},
+                 'modes': {'app.py': '100644'},
+                 'index': {'app.py': ['M 100644 before 2']}}
         checkpoint.record(
             'repo', 'G-047', expected_generation=0, operation='rebase',
             expected_head='before', target_base_oid='base',
@@ -501,8 +503,12 @@ class ExecutionHandlerTests(TestCase):
         live = {**common, 'unmerged': False,
                 'dirty': {'app.py': [['staged'], 'accepted']},
                 'index': {'app.py': [f'H 100644 {blob_oid} 0']}}
-        self.handler._stage_evidence_preserved = mock.Mock(return_value=True)
-        self.handler._rebase_stage_evidence = mock.Mock(return_value=stage)
+        self.handler._stage_evidence_preserved = (
+            handlers.ExecutionHandlers._stage_evidence_preserved.__get__(self.handler)
+        )
+        self.handler._rebase_stage_evidence = mock.Mock(return_value={
+            **stage, 'index': live['index'],
+        })
 
         def evidence_git(_worktree, *args, **_kwargs):
             if args[:2] == ('ls-files', '--cached'):

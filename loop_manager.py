@@ -9581,9 +9581,14 @@ def _complete_direct_rebase_checkpoint(
             raise manager_git_journal.MutationEvidenceError(
                 'direct rebase completion: preserved checkpoint marker changed'
             )
+        # The caller has already checked staged and dirty files. Only the
+        # checkpoint marker is written before this call; compare stable Git
+        # ownership fields here while the sealed journal checks the rebase.
         preserved = bool(
             preserved_worktree and isinstance(marker, dict)
-            and (observed == preserved_observation
+            and (all(observed.get(field) == preserved_observation.get(field)
+                     for field in ('head', 'branch', 'ref', 'registration',
+                                   'operations', 'metadata'))
                  if preserved_observation is not None else
                  _blocked_resume_worktree_matches(
                      worktree, marker, capture_git_snapshot(worktree),
@@ -9608,10 +9613,15 @@ def _complete_direct_rebase_checkpoint(
                     )
                     and observed.get('metadata') is None]
         if len(matching) != 1:
+            changed_fields = (
+                sorted(field for field in observed.keys() | preserved_observation.keys()
+                       if observed.get(field) != preserved_observation.get(field))
+                if preserved_observation is not None else []
+            )
             raise manager_git_journal.MutationEvidenceError(
                 'direct rebase completion: unique owned result unavailable '
                 f'(transitions={len(transitions)}, preserved={preserved}, '
-                f'matching={len(matching)})'
+                f'matching={len(matching)}, observation drift={changed_fields})'
             )
         intent = matching[0]['intent']
         completion = {

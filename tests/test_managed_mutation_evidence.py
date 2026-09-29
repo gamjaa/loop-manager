@@ -897,6 +897,10 @@ class ManagedTransitionTests(unittest.TestCase):
             'index': {}, 'dirty': {},
         }
         observed = {**sealed, 'dirty': {'app.py': [['staged'], 'accepted']}}
+        preserved_observation = {
+            **observed, 'dirty': {'app.py': [['unstaged'], 'accepted']},
+            'index': {'app.py': ['H 100644 before 0']},
+        }
         transition = {
             'intent': {'id': 'sealed', 'kind': 'managed_rebase',
                        'target': '/owned', 'expected': {
@@ -924,20 +928,22 @@ class ManagedTransitionTests(unittest.TestCase):
                     repo_path=Path('/repo'), branch=BRANCH,
                     agent_session_id=None, preserved_worktree=True,
                 )
-            with self.assertRaises(journal.MutationEvidenceError):
+            with self.assertRaisesRegex(
+                journal.MutationEvidenceError, "observation drift=.*'head'",
+            ):
                 loop_manager._complete_direct_rebase_checkpoint(
                     connection, 'repo', 'G-091', Path('/owned'), NEW,
                     repo_path=Path('/repo'), branch=BRANCH,
                     agent_session_id=None, preserved_worktree=True,
                     preserved_marker=original_marker,
-                    preserved_observation={**observed, 'head': OLD},
+                    preserved_observation={**preserved_observation, 'head': OLD},
                 )
             loop_manager._complete_direct_rebase_checkpoint(
                 connection, 'repo', 'G-091', Path('/owned'), NEW,
                 repo_path=Path('/repo'), branch=BRANCH,
                 agent_session_id=None, preserved_worktree=True,
                 preserved_marker=original_marker,
-                preserved_observation=observed,
+                preserved_observation=preserved_observation,
             )
         saved = repository.get('repo', 'G-091')
         self.assertIsNone(saved.operation)

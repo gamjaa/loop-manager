@@ -1850,8 +1850,15 @@ class ExecutionHandlers:
                 context.worktree, 'ls-files', '--cached', '-z',
             ).stdout.split('\0') if path
         }
+        observed_stage = self._rebase_stage_evidence(context)
+        # Normal staging changes the index. Compare the approved file
+        # signatures here; stage_matches below checks every index entry.
+        file_fields = ('head', 'branch', 'files')
         if not self._stage_evidence_preserved(
-                context, stage, self._rebase_stage_evidence(context), tracked):
+                context,
+                {field: stage.get(field) for field in file_fields},
+                {field: observed_stage.get(field) for field in file_fields},
+                tracked):
             return reject('approved stage evidence')
         if any(sealed['dirty'].get(path) != live['dirty'].get(path)
                for path in sealed['dirty'].keys() | live['dirty'].keys()
