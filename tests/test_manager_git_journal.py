@@ -115,6 +115,44 @@ class ManagerGitTransitionTests(unittest.TestCase):
                 with self.subTest(changed=list(changed)), self.assertRaises(journal.MutationEvidenceError):
                     journal.verified_rebase_completion(**{**arguments, **changed})
 
+    def test_sealed_autostash_result_requires_verified_later_correction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            sealed = {'head': NEW, 'metadata': None, 'unmerged': True}
+            live = {'head': NEW, 'metadata': None, 'unmerged': False}
+            identity = journal.begin_rebase(
+                state, owner='plan:G-100', repo='/repo', target='/owned',
+                before={'head': OLD},
+                expected={'branch': 'loop-manager/G-100',
+                          'before_head': OLD, 'target_base_oid': NEW,
+                          'remote_oid': OLD, 'agent_session_id': 'worker-1',
+                          'run_id': 'run-1', 'checkpoint_generation': 1},
+            )
+            validate = lambda _intent, observed: {'unmerged': observed['unmerged']}
+            proof = lambda _intent, observed: [{'head': observed['head']}]
+            self.assertTrue(journal.complete_rebase(
+                state, repo='/repo', target='/owned', observe=lambda: sealed,
+                validate=validate, replay_proof=proof,
+            ))
+            arguments = dict(
+                state_dir=state, repo='/repo', target='/owned',
+                owner='plan:G-100', branch='loop-manager/G-100',
+                before_head=OLD, target_base_oid=NEW, remote_oid=OLD,
+                agent_session_id='worker-1', run_id='run-1',
+                checkpoint_generation=2, observe=lambda: live,
+                validate=validate, replay_proof=proof,
+            )
+            with self.assertRaises(journal.MutationEvidenceError):
+                journal.verified_rebase_completion(**arguments)
+            accepted = lambda _intent, old, now: old['unmerged'] and not now['unmerged']
+            self.assertEqual(journal.verified_rebase_completion(
+                **arguments, later_correction=accepted,
+            )['intent']['id'], identity)
+            with self.assertRaises(journal.MutationEvidenceError):
+                journal.verified_rebase_completion(
+                    **arguments, later_correction=lambda *_: False,
+                )
+
     def test_fetch_requires_owned_marker_and_exact_live_result(self):
         intent = {
             "kind": "project_fetch", "target": REF,

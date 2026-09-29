@@ -904,6 +904,8 @@ def verified_rebase_completion(
     validate: Callable[[Mapping[str, Any], Mapping[str, Any]], dict[str, Any]],
     replay_proof: Callable[[Mapping[str, Any], Mapping[str, Any]],
                            list[dict[str, str]] | None],
+    later_correction: Callable[[Mapping[str, Any], Mapping[str, Any],
+                                Mapping[str, Any]], bool] | None = None,
 ) -> dict[str, Any]:
     """Recheck one sealed completion against the current owned Git state.
 
@@ -916,7 +918,8 @@ def verified_rebase_completion(
     matches = []
     for result_path in slot.glob('*.result.json'):
         result = _read(result_path)
-        if result.get('status') != 'complete' or result.get('observed') != observed:
+        sealed_observed = result.get('observed')
+        if result.get('status') != 'complete' or not isinstance(sealed_observed, dict):
             continue
         identity = result.get('id')
         if not isinstance(identity, str) or re.fullmatch(r'[0-9a-f]{32}', identity) is None:
@@ -938,8 +941,12 @@ def verified_rebase_completion(
                     or expected['checkpoint_generation'] > checkpoint_generation
                 ))):
             continue
-        if (result.get('candidates') != validate(intent, observed)
-                or result.get('replay_proof') != replay_proof(intent, observed)):
+        if (sealed_observed != observed
+                and (later_correction is None
+                     or not later_correction(intent, sealed_observed, observed))):
+            continue
+        if (result.get('candidates') != validate(intent, sealed_observed)
+                or result.get('replay_proof') != replay_proof(intent, sealed_observed)):
             raise MutationEvidenceError('rebase stored completion: evidence changed')
         matches.append({'intent': intent, 'result': result})
     if len(matches) != 1:
@@ -1032,24 +1039,50 @@ def verified_managed_transitions(
                         live_head = git(Path(intent['target']), 'rev-parse', 'HEAD', check=False)
                         live_ref = git(Path(intent['repo']), 'rev-parse', '--verify',
                                        f'refs/heads/{branch}', check=False)
+                        current_head = live_head.stdout.strip()
                         if (live_head.returncode or live_ref.returncode
-                                or live_head.stdout.strip() != observed['head']
-                                or live_ref.stdout.strip() != observed['head']):
+                                or live_ref.stdout.strip() != current_head):
                             continue
-                        marker = rebase_completion_matches(
-                            git, Path(intent['repo']), branch=branch,
-                            head=observed['head'], identity=intent['id'],
-                            target_base_oid=intent['expected']['target_base_oid'],
-                        )
+                        historical = current_head != observed['head']
+                        if historical:
+                            # A later owned commit may move the ref beyond a
+                            # sealed result. Preserve the old finish receipt
+                            # only while that result remains in this history.
+                            if git(
+                                Path(intent['target']), 'merge-base', '--is-ancestor',
+                                observed['head'], current_head, check=False,
+                            ).returncode != 0:
+                                continue
+                            reflog = git(
+                                Path(intent['repo']), 'reflog', 'show',
+                                '--format=%H%x00%gs', f'refs/heads/{branch}',
+                                check=False,
+                            )
+                            finish = (
+                                f"{observed['head']}\0loop-manager-rebase:{intent['id']}"
+                                f" (finish): refs/heads/{branch} onto "
+                                f"{intent['expected']['target_base_oid']}"
+                            )
+                            marker = (reflog.returncode == 0
+                                      and finish in reflog.stdout.splitlines())
+                        else:
+                            marker = rebase_completion_matches(
+                                git, Path(intent['repo']), branch=branch,
+                                head=observed['head'], identity=intent['id'],
+                                target_base_oid=intent['expected']['target_base_oid'],
+                            )
                         if (not marker and observed == intent['before']):
                             marker = successful_rebase_invocation(
                                 state_dir, intent['repo'], intent['target'], intent['id'],
                             )
                         if not marker:
                             continue
-                        remote_oid = live_remote_branch_oid(
-                            git, Path(intent['repo']), branch,
-                        )
+                        if not historical:
+                            remote_oid = live_remote_branch_oid(
+                                git, Path(intent['repo']), branch,
+                            )
+                        # A historical lease is the sealed value; current
+                        # publication callers check their live lease again.
                         ancestor = git(
                             Path(intent['target']), 'merge-base', '--is-ancestor',
                             intent['expected']['target_base_oid'], observed['head'],

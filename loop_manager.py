@@ -9504,14 +9504,6 @@ def _journaled_direct_rebase(
         state_dir, connection, repo_path, repo, plan_id, worktree, branch,
         allow_equal=True, agent_session_id=agent_session_id,
     )
-    if (result.returncode == 0
-            and not _rebase_in_progress_for_branch(worktree, branch)
-            and not git(worktree, 'ls-files', '-u', '-z').stdout):
-        _complete_direct_rebase_checkpoint(
-            connection, repo, plan_id, worktree, target_oid,
-            repo_path=repo_path, branch=branch,
-            agent_session_id=agent_session_id,
-        )
     return result
 
 
@@ -9545,10 +9537,26 @@ def _direct_rebase_history_proven(
     )
 
 
+def _direct_rebase_result_matches_observation(
+    sealed: Mapping[str, object], observed: Mapping[str, object],
+    *, preserved_worktree: bool,
+) -> bool:
+    if sealed == observed:
+        return True
+    return bool(
+        preserved_worktree and sealed.get('metadata') is None
+        and observed.get('metadata') is None
+        and all(sealed.get(field) == observed.get(field) for field in (
+            'head', 'branch', 'ref', 'registration', 'operations',
+        ))
+    )
+
+
 def _complete_direct_rebase_checkpoint(
     connection: sqlite3.Connection, repo: str, plan_id: str,
     worktree: Path, target_base_oid: str,
     *, repo_path: Path, branch: str, agent_session_id: str | None,
+    preserved_worktree: bool = False,
 ) -> None:
     repository = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
     current = repository.get(repo, plan_id)
@@ -9559,6 +9567,14 @@ def _complete_direct_rebase_checkpoint(
                 'direct rebase completion: journal or target missing'
             )
         observed = _owned_rebase_journal_state(worktree, branch)
+        marker = (current.snapshot or {}).get('blocked_resume')
+        preserved = (
+            preserved_worktree and isinstance(marker, dict)
+            and _blocked_resume_worktree_matches(
+                worktree, marker, capture_git_snapshot(worktree),
+            )
+        )
+
         transitions = manager_git_journal.verified_managed_transitions(
             state_dir, str(_canonical_path(repo_path)), f'plan:{plan_id}',
             agent_session_id=agent_session_id, git=git,
@@ -9571,7 +9587,10 @@ def _complete_direct_rebase_checkpoint(
                     and item['intent']['expected']['remote_oid'] == current.observed_remote_oid
                     and item['intent']['expected'].get('run_id') ==
                     (current.snapshot or {}).get('rebase_run_id')
-                    and item['result']['observed'] == observed
+                    and _direct_rebase_result_matches_observation(
+                        item['result']['observed'], observed,
+                        preserved_worktree=preserved,
+                    )
                     and observed.get('metadata') is None]
         if len(matching) != 1:
             raise manager_git_journal.MutationEvidenceError(
@@ -14781,16 +14800,20 @@ def _record_blocked_resume_head(
 ) -> None:
     checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
     current = checkpoint.get(repo, plan_id)
+    active_rebase = current.operation == 'rebase'
+    marker = {
+        'owner_oid': owner_oid, 'before_head': before_head,
+        'target_base_oid': target_base_oid, 'after_head': after_head,
+        'before_snapshot': (before_snapshot or
+            (current.snapshot or {}).get('blocked_resume', {}).get('before_snapshot')),
+    }
     checkpoint.record(
         repo, plan_id, expected_generation=current.generation,
-        operation=None, expected_head=after_head or before_head,
+        operation='rebase' if active_rebase else None,
+        expected_head=current.expected_head if active_rebase else after_head or before_head,
         target_base_oid=target_base_oid, observed_remote_oid=owner_oid,
-        snapshot={'blocked_resume': {
-            'owner_oid': owner_oid, 'before_head': before_head,
-            'target_base_oid': target_base_oid, 'after_head': after_head,
-            'before_snapshot': (before_snapshot or
-                (current.snapshot or {}).get('blocked_resume', {}).get('before_snapshot')),
-        }},
+        snapshot={**(current.snapshot or {}), 'blocked_resume': marker}
+        if active_rebase else {'blocked_resume': marker},
     )
 
 
@@ -14915,6 +14938,7 @@ def _resume_interrupted_blocked_rebase(
             connection, repo, str(plan['plan_id']), worktree, target_base,
             repo_path=repo_path, branch=branch,
             agent_session_id=plan['worker_session_id'],
+            preserved_worktree=True,
         )
     except (RuntimeError, OSError, ValueError) as error:
         _update_blocked_error(connection, repo, str(plan['plan_id']),
@@ -15207,6 +15231,13 @@ def resume_blocked_execplan_if_inputs_changed(
             connection, repo, str(plan['plan_id']), owned_oid,
             before_head, target_base_oid, after_head,
         )
+        if base_ancestry.returncode == 1:
+            _complete_direct_rebase_checkpoint(
+                connection, repo, str(plan['plan_id']), worktree,
+                target_base_oid, repo_path=repo_path, branch=branch,
+                agent_session_id=plan['worker_session_id'],
+                preserved_worktree=True,
+            )
     elif base_ancestry.returncode == 1:
         _complete_direct_rebase_checkpoint(
             connection, repo, str(plan['plan_id']), worktree, target_base_oid,
@@ -18117,20 +18148,49 @@ def resume_pr_conflict_rebase(
         return 1
 
     state_dir = _owned_rebase_state_dir(repo, str(plan['plan_id']), worktree)
-    if state_dir is not None:
-        _finish_owned_direct_rebase(
-            state_dir, connection, repo_path, repo,
-            str(plan['plan_id']), worktree, branch,
-            agent_session_id=plan['worker_session_id'],
+    rebase_retry_pending = False
+    checkpoint_record = execution_checkpoint_state.ExecutionCheckpointRepository(
+        connection,
+    ).get(repo, str(plan['plan_id']))
+    if state_dir is None and checkpoint_record.operation == 'rebase':
+        error = 'PR 충돌 복구 rebase journal workspace가 없습니다.'
+        block_active_execplan(
+            connection, repo, worktree, error,
+            str(project['verify_result'] or ''),
+            reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
         )
-        if execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
-                repo, str(plan['plan_id'])).operation == 'rebase' and not _rebase_in_progress_for_branch(worktree, branch):
-            _complete_direct_rebase_checkpoint(
-                connection, repo, str(plan['plan_id']), worktree,
-                target_base_oid=str(project['pr_conflict_base_oid'] or ''),
-                repo_path=repo_path, branch=branch,
+        operation_print(error, file=sys.stderr)
+        return 1
+    if state_dir is not None:
+        try:
+            _finish_owned_direct_rebase(
+                state_dir, connection, repo_path, repo,
+                str(plan['plan_id']), worktree, branch,
                 agent_session_id=plan['worker_session_id'],
             )
+            active_rebase = manager_git_journal._slot(
+                state_dir, str(_canonical_path(repo_path)), 'managed_rebase',
+                str(_canonical_path(worktree)),
+            ) / 'active.json'
+            if checkpoint_record.operation == 'rebase':
+                if active_rebase.exists():
+                    rebase_retry_pending = True
+                elif not _rebase_in_progress_for_branch(worktree, branch):
+                    _complete_direct_rebase_checkpoint(
+                        connection, repo, str(plan['plan_id']), worktree,
+                        target_base_oid=str(project['pr_conflict_base_oid'] or ''),
+                        repo_path=repo_path, branch=branch,
+                        agent_session_id=plan['worker_session_id'],
+                    )
+        except manager_git_journal.MutationEvidenceError as error:
+            detail = f'PR 충돌 복구 rebase 증거가 다릅니다: {error}'
+            block_active_execplan(
+                connection, repo, worktree, detail,
+                str(project['verify_result'] or ''),
+                reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
+            )
+            operation_print(detail, file=sys.stderr)
+            return 1
 
     latest_base = git(
         repo_path,
@@ -18157,7 +18217,7 @@ def resume_pr_conflict_rebase(
         "HEAD",
         check=False,
     )
-    if ancestry.returncode == 0:
+    if ancestry.returncode == 0 and not rebase_retry_pending:
         update_project(
             connection,
             repo,
@@ -18166,7 +18226,7 @@ def resume_pr_conflict_rebase(
             last_error=None,
         )
         return 0
-    if ancestry.returncode != 1:
+    if ancestry.returncode not in (0, 1):
         error = (
             "PR 충돌 복구 base ancestry 확인 실패:\n"
             + ancestry.stdout[-8000:]

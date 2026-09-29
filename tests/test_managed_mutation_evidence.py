@@ -572,12 +572,13 @@ class ManagedTransitionTests(unittest.TestCase):
                                  'dirty': actual['dirty'], 'unmerged': False},
                 },
             ))
-            self.assertEqual(
+            # The legacy result has no Git replay proof. Its stored candidate
+            # alone cannot establish current ownership on a later read.
+            with self.assertRaises(journal.MutationEvidenceError):
                 journal.verified_managed_transitions(
                     state, '/repo', 'plan:G-091',
                     agent_session_id='worker-original',
-                )[0]['result']['observed']['head'], NEW,
-            )
+                )
             self.assertEqual(journal.verified_managed_transitions(
                 state, '/repo', 'plan:G-091',
                 agent_session_id='worker-new',

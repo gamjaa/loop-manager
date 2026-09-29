@@ -1245,6 +1245,9 @@ class ExecutionHandlers:
                     'rebase_source_commits': source_commits,
                     'rebase_pr_head_oid': pr_head_oid,
                     'rebase_remote_oid': remote_oid,
+                    'rebase_start_session_id': getattr(
+                        context, 'worker_session_id', None,
+                    ),
                     'staged_paths': self.effects.workspace.git(
                         context.worktree, 'diff', '--cached', '--name-only', '-z'
                     ).stdout.split('\0'),
@@ -1508,6 +1511,12 @@ class ExecutionHandlers:
             checkpoint = self.effects.checkpoint.get(
                 self.repo, context.plan.plan_id,
             )
+            expected_session = getattr(context, 'worker_session_id', None)
+            if (expected.get('evidence_version') == 2
+                    and not expected.get('action')):
+                expected_session = (checkpoint.snapshot or {}).get(
+                    'rebase_start_session_id', expected_session,
+                )
             row = self._row() if expected.get('evidence_version') == 2 else None
             pr_head_oid = (
                 str(row['pr_head_oid'] or row['pr_conflict_head_oid'] or '') or None
@@ -1516,8 +1525,7 @@ class ExecutionHandlers:
             if (
                 intent['owner'] != f'plan:{context.plan.plan_id}'
                 or expected['branch'] != context.branch
-                or expected.get('agent_session_id')
-                != getattr(context, 'worker_session_id', None)
+                or expected.get('agent_session_id') != expected_session
                 or checkpoint.operation != 'rebase'
                 or checkpoint.expected_head != expected['before_head']
                 or checkpoint.target_base_oid != expected['target_base_oid']
@@ -1801,6 +1809,68 @@ class ExecutionHandlers:
             stash_oid=(stash_oid if unmerged and not in_progress else None),
         )
 
+    def _completed_autostash_correction(self, context, intent, sealed, live):
+        current = self.effects.checkpoint.get(self.repo, context.plan.plan_id)
+        saved = current.snapshot or {}
+        stage = saved.get('stage_evidence')
+        accepted = stage.get('files') if isinstance(stage, dict) else None
+        modes = stage.get('modes') if isinstance(stage, dict) else None
+        if (intent['expected'].get('evidence_version') != 2
+                or not saved.get('stash_oid') or saved.get('pending') != 'continue'
+                or intent['expected'].get('agent_session_id')
+                != saved.get('rebase_start_session_id')
+                or not saved.get('worker_result') or not isinstance(accepted, dict)
+                or not accepted or not isinstance(modes, dict)
+                or sealed.get('metadata') is not None or not sealed.get('unmerged')
+                or live.get('metadata') is not None or live.get('unmerged')
+                or live.get('operations') != sealed.get('operations')
+                or any(live.get(field) != sealed.get(field) for field in (
+                    'head', 'branch', 'ref', 'registration',
+                ))):
+            return False
+        tracked = {
+            path for path in self.effects.workspace.git(
+                context.worktree, 'ls-files', '--cached', '-z',
+            ).stdout.split('\0') if path
+        }
+        if not self._stage_evidence_preserved(
+                context, stage, self._rebase_stage_evidence(context), tracked):
+            return False
+        if any(sealed['dirty'].get(path) != live['dirty'].get(path)
+               for path in sealed['dirty'].keys() | live['dirty'].keys()
+               if path not in accepted):
+            return False
+        sealed_files = sealed.get('file_evidence') or {}
+        live_files = live.get('file_evidence') or {}
+        if any(sealed_files.get(path) != live_files.get(path)
+               for path in sealed_files.keys() | live_files.keys()
+               if path not in accepted):
+            return False
+        if not managed_rebase_evidence.stage_matches(
+                before_index=sealed['index'], staged_index=live['index'],
+                allowed_paths=list(accepted), accepted_files=accepted,
+                accepted_modes=modes,
+                staged_dirty={path: [[], signature]
+                              for path, signature in accepted.items()}):
+            return False
+        for path in accepted:
+            entries = live['index'].get(path)
+            if modes[path] is None:
+                if entries or (context.worktree / path).exists() or (
+                        context.worktree / path).is_symlink():
+                    return False
+                continue
+            if not isinstance(entries, list) or len(entries) != 1:
+                return False
+            staged_oid = entries[0].split()[2]
+            blob = self.effects.workspace.git(
+                context.worktree, 'hash-object', f'--path={path}', '--', path,
+                check=False,
+            )
+            if blob.returncode or blob.stdout.strip() != staged_oid:
+                return False
+        return True
+
     def _complete_rebase_intent(self, context, *, project_values=None):
         checkpoint = self.effects.checkpoint
         if checkpoint is None:
@@ -1809,6 +1879,12 @@ class ExecutionHandlers:
         if current.operation != 'rebase':
             return
         proof, validate = self._rebase_journal_checks(context)
+        completion_session = getattr(context, 'worker_session_id', None)
+        if ((current.snapshot or {}).get('stash_oid')
+                and (current.snapshot or {}).get('pending') == 'continue'):
+            completion_session = (current.snapshot or {}).get(
+                'rebase_start_session_id', completion_session,
+            )
         result = manager_git_journal.verified_rebase_completion(
             self.state_dir, repo=str(self.repo_path.resolve()),
             target=str(context.worktree.resolve()),
@@ -1816,11 +1892,15 @@ class ExecutionHandlers:
             before_head=current.expected_head,
             target_base_oid=current.target_base_oid,
             remote_oid=current.observed_remote_oid,
-            agent_session_id=getattr(context, 'worker_session_id', None),
+            agent_session_id=completion_session,
             run_id=(current.snapshot or {}).get('rebase_run_id'),
             checkpoint_generation=current.generation,
             observe=lambda: self._rebase_journal_state(context),
             validate=validate, replay_proof=proof,
+            later_correction=lambda intent, sealed, live:
+                self._completed_autostash_correction(
+                    context, intent, sealed, live,
+                ),
         )
         intent = result['intent']
         expected = intent['expected']
@@ -2085,7 +2165,8 @@ class ExecutionHandlers:
                     self.state_dir, str(self.repo_path.resolve()),
                     'managed_rebase', str(context.worktree.resolve()),
                 ) / 'active.json'
-                if (not self.effects.workspace._rebase_in_progress_for_branch(
+                if ((current.snapshot or {}).get('pending') != 'stage'
+                        and not self.effects.workspace._rebase_in_progress_for_branch(
                         context.worktree, context.branch)
                         and not self._unmerged_stages(context.worktree)
                         and (finished or not active_rebase.exists())):
@@ -2626,13 +2707,6 @@ class ExecutionHandlers:
                 RecoveryReason.REBASE_CONFLICT if in_progress else RecoveryReason.WORKTREE_RECOVERY_FAILED,
                 rebase_failure, context=context,
             )
-        self._complete_rebase_intent(context, project_values={
-            'phase': 'WORKING', 'active_sha': latest_sha,
-            'validated_base_sha': None, 'last_error': None,
-            'verify_result': None, 'review_result': None,
-            'verify_token': None, 'review_token': None,
-            'publication_token': None,
-        })
         if (
             decision.phase != 'IMPLEMENTING'
             and not self.effects.workspace.branch_has_changes(
@@ -2657,6 +2731,13 @@ class ExecutionHandlers:
             )
             self.effects.events.operation_print(no_change_error, file=sys.stderr)
             return self._final(no_change_error)
+        self._complete_rebase_intent(context, project_values={
+            'phase': 'WORKING', 'active_sha': latest_sha,
+            'validated_base_sha': None, 'last_error': None,
+            'verify_result': None, 'review_result': None,
+            'verify_token': None, 'review_token': None,
+            'publication_token': None,
+        })
         self._install_revision_state(
             snapshot,
             decision,

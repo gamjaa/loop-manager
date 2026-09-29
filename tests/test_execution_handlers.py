@@ -437,7 +437,9 @@ class ExecutionHandlerTests(TestCase):
             'repo', 'G-047', expected_generation=0, operation='rebase',
             expected_head='before', target_base_oid='new-base',
             observed_remote_oid=None,
-            snapshot={'rebase_run_id': 'run-1', 'pending': 'continue'},
+            snapshot={'rebase_run_id': 'run-1', 'pending': 'continue',
+                      'stash_oid': 'owned-stash',
+                      'rebase_start_session_id': 'start-session'},
         )
         context = self.context()
         intent = {'id': 'result-1', 'expected': {
@@ -460,6 +462,8 @@ class ExecutionHandlerTests(TestCase):
         ) as verified:
             self.handler._complete_rebase_intent(context)
             self.assertEqual(verified.call_args.kwargs['run_id'], 'run-1')
+            self.assertEqual(verified.call_args.kwargs['agent_session_id'],
+                             'start-session')
         saved = checkpoint.get('repo', 'G-047')
         self.assertIsNone(saved.operation)
         self.assertEqual(saved.snapshot['rebase_completion']['id'], 'result-1')
@@ -469,6 +473,70 @@ class ExecutionHandlerTests(TestCase):
         self.assertEqual(self.state.row()['worker_session_id'], 'saved-session')
         self.assertEqual(self.state.row()['worker_result'], 'accepted correction')
         self.effects.workspace.git.assert_not_called()
+
+    def test_autostash_completion_requires_approved_stage_and_matching_blob(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        self.state.update_project('repo', worker_session_id='corrector')
+        context = self.context()
+        stage = {'files': {'app.py': 'accepted'},
+                 'modes': {'app.py': '100644'}}
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0, operation='rebase',
+            expected_head='before', target_base_oid='base',
+            observed_remote_oid=None,
+            snapshot={'rebase_evidence_version': 2, 'stash_oid': 'stash',
+                      'rebase_start_session_id': 'original',
+                      'pending': 'continue', 'worker_result': 'result',
+                      'stage_evidence': stage},
+        )
+        blob_oid = 'a' * 40
+        common = {'head': 'head', 'branch': context.branch,
+                  'ref': ['head', ''], 'registration': ['owned'],
+                  'operations': {}, 'metadata': None}
+        sealed = {**common, 'unmerged': True,
+                  'dirty': {'app.py': [['unmerged'], 'before']},
+                  'index': {'app.py': ['M 100644 before 2']}}
+        live = {**common, 'unmerged': False,
+                'dirty': {'app.py': [['staged'], 'accepted']},
+                'index': {'app.py': [f'H 100644 {blob_oid} 0']}}
+        self.handler._stage_evidence_preserved = mock.Mock(return_value=True)
+        self.handler._rebase_stage_evidence = mock.Mock(return_value=stage)
+
+        def evidence_git(_worktree, *args, **_kwargs):
+            if args[:2] == ('ls-files', '--cached'):
+                return SimpleNamespace(returncode=0, stdout='app.py\0')
+            if args[:1] == ('hash-object',):
+                return SimpleNamespace(returncode=0, stdout=blob_oid + '\n')
+            raise AssertionError(args)
+
+        self.effects.workspace.git.side_effect = evidence_git
+        intent = {'expected': {'evidence_version': 2,
+                               'agent_session_id': 'original'}}
+        self.assertTrue(self.handler._completed_autostash_correction(
+            context, intent, sealed, live,
+        ))
+        self.assertFalse(self.handler._completed_autostash_correction(
+            context, intent, sealed,
+            {**live, 'dirty': {**live['dirty'], 'extra.py': [['staged'], 'extra']}},
+        ))
+        self.assertFalse(self.handler._completed_autostash_correction(
+            context, intent, sealed,
+            {**live, 'file_evidence': {'extra.py': {'mode': '100755'}}},
+        ))
+        self.assertFalse(self.handler._completed_autostash_correction(
+            context, {'expected': {**intent['expected'],
+                                   'agent_session_id': 'foreign'}}, sealed, live,
+        ))
+        self.effects.workspace.git.side_effect = lambda *_args, **_kwargs: (
+            SimpleNamespace(returncode=0, stdout='app.py\0')
+            if _args[1:3] == ('ls-files', '--cached') else
+            SimpleNamespace(returncode=0, stdout='b' * 40 + '\n')
+        )
+        self.assertFalse(self.handler._completed_autostash_correction(
+            context, intent, sealed, live,
+        ))
 
     def test_review_budget_pauses_before_worker_and_preserves_projection(self):
         run_id = handlers.recovery_state.begin_external_run(self.connection)
@@ -1897,6 +1965,27 @@ class ExecutionHandlerTests(TestCase):
         self.effects.validation.parse_worker_result.assert_not_called()
         self.assertNotIn('add', self.calls)
         self.assertNotIn('commit', self.calls)
+
+    def test_no_change_rebase_blocks_before_sealed_completion(self):
+        self.effects.workspace.git.side_effect = None
+        self.effects.workspace.git.return_value = SimpleNamespace(
+            stdout='', returncode=0,
+        )
+        self.effects.workspace.branch_has_changes.return_value = False
+        self.handler._record_rebase_intent = mock.Mock()
+        self.handler._run_managed_rebase = mock.Mock(return_value=SimpleNamespace(
+            returncode=0, stdout='',
+        ))
+        self.handler._post_rebase_observation = mock.Mock(return_value=None)
+        self.handler._complete_rebase_intent = mock.Mock()
+
+        outcome = self.handler._refresh_revision_base(
+            self.context('VERIFYING'), None,
+            SimpleNamespace(phase='VERIFYING'), 'new-base',
+        )
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.handler._complete_rebase_intent.assert_not_called()
 
     def test_failed_fallback_start_reuses_recovery_prompt_on_next_turn(self):
         feedback = ValidationFeedbackRepository(self.connection)

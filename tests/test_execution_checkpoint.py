@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 from pathlib import Path
+import sqlite3
 import subprocess
 import tempfile
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ from unittest import mock
 import loop_manager
 import checkpoint_ownership
 import blocked_checkpoint
+import execution_checkpoint_state
 
 from execution_checkpoint import (
     CheckpointAction, CheckpointSnapshot, assess, observe,
@@ -225,6 +227,140 @@ class CheckpointAssessmentTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(update.call_args.kwargs['phase'], 'WORKING')
         self.assertNotIn('active_sha', update.call_args.kwargs)
+
+    def test_pr_rebase_resume_retries_unsealed_active_intent_after_lock(self):
+        project = {
+            'pr_conflict_recovery': 1, 'phase': 'WORKING',
+            'last_error': loop_manager.REBASE_IN_PROGRESS_ERROR,
+            'pr_conflict_base_oid': 'base', 'pr_conflict_head_oid': 'head',
+            'base_branch': 'main',
+        }
+        plan = {'plan_id': 'G-044', 'pr_conflict_recovery': 1,
+                'worker_session_id': 'worker'}
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            active = loop_manager.manager_git_journal._slot(
+                state, '/repo', 'managed_rebase', '/owned',
+            ) / 'active.json'
+            active.parent.mkdir(parents=True)
+            active.write_text('{}', encoding='utf-8')
+
+            def observed_git(_path, *args, **_kwargs):
+                if args[0] == 'ls-files':
+                    return SimpleNamespace(stdout='', returncode=0)
+                if args[0] == 'rev-parse':
+                    return SimpleNamespace(stdout='base\n', returncode=0)
+                if args[0] == 'merge-base':
+                    return SimpleNamespace(stdout='', returncode=0)
+                raise AssertionError(args)
+
+            with (
+                mock.patch.object(loop_manager, '_rebase_in_progress_for_branch',
+                                  return_value=False),
+                mock.patch.object(loop_manager, 'git', side_effect=observed_git),
+                mock.patch.object(loop_manager, 'active_execplan', return_value=plan),
+                mock.patch.object(loop_manager, '_owned_rebase_state_dir',
+                                  return_value=state),
+                mock.patch.object(loop_manager, '_finish_owned_direct_rebase',
+                                  return_value=False),
+                mock.patch.object(loop_manager.execution_checkpoint_state,
+                                  'ExecutionCheckpointRepository') as checkpoints,
+                mock.patch.object(loop_manager, '_complete_direct_rebase_checkpoint') as complete,
+                mock.patch.object(loop_manager, '_journaled_direct_rebase',
+                                  return_value=SimpleNamespace(
+                                      returncode=1, stdout='temporary failure',
+                                  )) as retry,
+                mock.patch.object(loop_manager, 'update_project') as update,
+            ):
+                checkpoints.return_value.get.return_value = SimpleNamespace(
+                    operation='rebase',
+                )
+                result = loop_manager.resume_pr_conflict_rebase(
+                    object(), Path('/repo'), '/repo', project,
+                    Path('/owned'), 'loop-manager/G-044',
+                )
+            self.assertEqual(result, loop_manager.PROJECT_STEP_RETRY)
+            retry.assert_called_once()
+            complete.assert_not_called()
+            update.assert_not_called()
+
+    def test_pr_rebase_resume_blocks_when_active_checkpoint_has_no_journal(self):
+        project = {
+            'pr_conflict_recovery': 1, 'phase': 'WORKING',
+            'last_error': loop_manager.REBASE_IN_PROGRESS_ERROR,
+            'pr_conflict_base_oid': 'base', 'pr_conflict_head_oid': 'head',
+            'verify_result': '',
+        }
+        plan = {'plan_id': 'G-044', 'pr_conflict_recovery': 1}
+        with (
+            mock.patch.object(loop_manager, '_rebase_in_progress_for_branch',
+                              return_value=False),
+            mock.patch.object(loop_manager, 'git', return_value=SimpleNamespace(
+                stdout='', returncode=0,
+            )),
+            mock.patch.object(loop_manager, 'active_execplan', return_value=plan),
+            mock.patch.object(loop_manager, '_owned_rebase_state_dir',
+                              return_value=None),
+            mock.patch.object(loop_manager.execution_checkpoint_state,
+                              'ExecutionCheckpointRepository') as checkpoints,
+            mock.patch.object(loop_manager, 'block_active_execplan') as block,
+            mock.patch.object(loop_manager, '_complete_direct_rebase_checkpoint') as complete,
+        ):
+            checkpoints.return_value.get.return_value = SimpleNamespace(
+                operation='rebase',
+            )
+            result = loop_manager.resume_pr_conflict_rebase(
+                object(), Path('/repo'), '/repo', project,
+                Path('/owned'), 'loop-manager/G-044',
+            )
+        self.assertEqual(result, 1)
+        block.assert_called_once()
+        complete.assert_not_called()
+
+    def test_direct_rebase_completion_allows_only_preserved_worktree_delta(self):
+        sealed = {
+            'head': 'rebased', 'branch': 'loop-manager/G-044',
+            'ref': ['rebased', ''], 'registration': ['owned'],
+            'operations': {}, 'metadata': None,
+            'index': {'code.py': ['old']}, 'dirty': {},
+        }
+        restored = {**sealed, 'index': {'code.py': ['restored']},
+                    'dirty': {'code.py': [['staged'], 'saved']}}
+        matches = loop_manager._direct_rebase_result_matches_observation
+        self.assertFalse(matches(sealed, restored, preserved_worktree=False))
+        self.assertTrue(matches(sealed, restored, preserved_worktree=True))
+        self.assertFalse(matches(
+            sealed, {**restored, 'head': 'foreign'}, preserved_worktree=True,
+        ))
+        self.assertFalse(matches(
+            sealed, {**restored, 'metadata': {'onto': 'other'}},
+            preserved_worktree=True,
+        ))
+
+    def test_blocked_resume_head_keeps_active_rebase_identity(self):
+        connection = sqlite3.connect(':memory:')
+        connection.row_factory = sqlite3.Row
+        checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(
+            connection,
+        )
+        checkpoint.record(
+            'repo', 'G-044', expected_generation=0, operation='rebase',
+            expected_head='before', target_base_oid='base',
+            observed_remote_oid='published',
+            snapshot={'rebase_run_id': 'run-1', 'blocked_resume': {
+                'before_snapshot': 'saved-worktree',
+            }},
+        )
+        loop_manager._record_blocked_resume_head(
+            connection, 'repo', 'G-044', 'published', 'before', 'base', 'after',
+        )
+        saved = checkpoint.get('repo', 'G-044')
+        self.assertEqual(saved.operation, 'rebase')
+        self.assertEqual(saved.expected_head, 'before')
+        self.assertEqual(saved.snapshot['rebase_run_id'], 'run-1')
+        self.assertEqual(saved.snapshot['blocked_resume']['after_head'], 'after')
+        self.assertEqual(saved.snapshot['blocked_resume']['before_snapshot'],
+                         'saved-worktree')
 
     def test_unmerged_index_never_reaches_baseline_write_tree(self):
         before = loop_manager.GitSnapshot(
