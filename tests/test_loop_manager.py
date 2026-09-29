@@ -8151,6 +8151,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "loop_manager.py",
                 "manager_git_journal.py",
                 "managed_rebase_evidence.py",
+                "rebase_block_reconciliation.py",
                 "rebase_file_evidence.py",
                 "execution_checkpoint.py",
                 "execution_checkpoint_state.py",
