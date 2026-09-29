@@ -56,6 +56,7 @@ from managed_config import ManagedConfig, ManagedConfigError, load_managed_confi
 import notifications
 import work_exhaustion
 import reviewer_specification
+from quality_guidance import AGENT_QUALITY_GUIDANCE
 import blocked_checkpoint
 import blocked_checkpoint_state
 import project_blocked_recovery
@@ -19055,6 +19056,7 @@ def planner_prompt(
     return f"""
 당신은 Loop Manager의 Planner다.
 AGENTS.md, 활성 PRODUCT와 Requirement, docs/ARCHITECTURE.md, docs/PLANS.md 및 현재 코드·테스트를 읽어라.
+{AGENT_QUALITY_GUIDANCE}
 아래 compact catalog는 SQLite의 비종료 ExecPlan만 코드로 직렬화한 것이다. MERGED 계획은 제외됐다.
 {compact_catalog}
 
@@ -19250,6 +19252,7 @@ Patch:
     return f"""
 당신은 Loop Manager의 Worker다.
 AGENTS.md와 {plan_path}를 읽고 해당 ExecPlan 하나만 구현하라.
+{AGENT_QUALITY_GUIDANCE}
 관련 targeted test를 작성하되 commit, push, PR 생성과 scripts/verify 실행은 하지 마라.
 docs/plans에 새 ExecPlan을 만들지 말고 불필요한 후속 기능도 구현하지 마라.
 {plans_scope}
@@ -19972,6 +19975,7 @@ def reviewer_prompt(
     return f"""
 origin/{base}와 현재 HEAD의 차이를 읽기 전용으로 검토하라.
 AGENTS.md, 근거 PRODUCT/Requirement, ARCHITECTURE와 ExecPlan을 기준으로 correctness, 회귀, 테스트 누락, verify 약화를 확인하라.
+{AGENT_QUALITY_GUIDANCE}
 {targeted_test_context}
 {recovery}
 {correction}
