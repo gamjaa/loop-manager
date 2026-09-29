@@ -16111,11 +16111,26 @@ def _reconcile_guidance_double_block(
     return True
 
 
+def _published_review_commit_intent_matches(
+    repo_path: Path, checkpoint: execution_checkpoint_state.CheckpointRecord,
+    head: str,
+) -> bool:
+    """Prove an unfinished Manager commit intent produced the current HEAD."""
+    saved = checkpoint.snapshot or {}
+    if (checkpoint.operation != 'commit' or not checkpoint.expected_head
+            or checkpoint.expected_head == head
+            or not saved.get('commit_tree_oid')):
+        return False
+    return checkpoint_ownership.committed_tree_matches_intent(
+        repo_path, checkpoint.expected_head, head, saved, git,
+    )
+
+
 def _resume_owned_checkpoint_project_block(
     connection: sqlite3.Connection, repo_path: Path, state_dir: Path,
     repo: str, block: sqlite3.Row, project: sqlite3.Row, plan: sqlite3.Row,
 ) -> bool:
-    """Undo only a checkpoint rebase mistaken for an external publication."""
+    """Restore only a proven published checkpoint mistaken for external work."""
     plan_id = str(plan['plan_id'])
     branch = str(plan['branch'] or '')
     worktree = Path(str(plan['worktree'] or ''))
@@ -16146,11 +16161,16 @@ def _resume_owned_checkpoint_project_block(
     )
     snapshot = checkpoint.snapshot or {}
     marker = snapshot.get('blocked_resume')
+    review_marker = snapshot.get('published_review_resume')
+    if review_marker is not None and not isinstance(review_marker, dict):
+        return False
     try:
         validate_execplan_workspace_identity(state_dir, repo, plan_id, branch, worktree)
         validate_managed_worktree(repo_path, worktree, branch)
         current = capture_git_snapshot(worktree)
         if (current.operations or current.dirty or current.branch != branch
+                or (not marker and any(_non_default_index_flags(entries)
+                                       for entries in current.index.values()))
                 or not current.head):
             return False
         remote_oid = remote_branch_oid(repo_path, branch)
@@ -16165,32 +16185,115 @@ def _resume_owned_checkpoint_project_block(
                     or after_head != current.head):
                 return False
         else:
-            before_head = str(snapshot.get('reactivated_from_head') or '')
+            before_head = str(
+                (review_marker.get('head') if isinstance(review_marker, dict) else None)
+                or snapshot.get('reactivated_from_head') or ''
+            )
             after_head = current.head
             target_base = str(snapshot.get('base_oid') or checkpoint.target_base_oid or '')
-            if not before_head or not target_base:
+            if not before_head:
                 return False
+        pending_review_commit = (
+            not marker and review_marker is not None
+            and _published_review_commit_intent_matches(
+                repo_path, checkpoint, current.head,
+            )
+        )
+        pushed_review = (
+            not marker and review_marker is not None
+            and remote_oid != before_head
+            and remote_oid == current.head == checkpoint.expected_head
+            and plan['publication_remote_oid'] in (before_head, remote_oid)
+            and (
+                (snapshot.get('pushed_checkpoint_head') == remote_oid
+                 and checkpoint.observed_remote_oid == remote_oid)
+                or (checkpoint.operation == 'push'
+                    and snapshot.get('remote_before') == before_head
+                    and checkpoint.observed_remote_oid in (before_head, remote_oid))
+            )
+        )
+        direct_review = (
+            pushed_review or (
+                not marker and before_head == remote_oid
+                and (after_head == remote_oid or review_marker is not None)
+                and (checkpoint.expected_head == current.head or pending_review_commit)
+                and checkpoint.observed_remote_oid == remote_oid
+                and (not plan['publication_remote_oid']
+                     or plan['publication_remote_oid'] == remote_oid)
+            )
+        )
+        if direct_review:
+            published = connection.execute(
+                'SELECT request_identity, phase, reason_code, branch, worktree, '
+                'accepted_remote_oid FROM blocked_checkpoints '
+                'WHERE repo = ? AND plan_id = ?', (repo, plan_id),
+            ).fetchone()
+            if (published is None or published['phase'] != 'published'
+                    or published['reason_code'] != BlockReasonCode.REVIEW_RETRY_EXHAUSTED.value
+                    or published['branch'] != branch
+                    or published['worktree'] != str(worktree)
+                    or published['accepted_remote_oid'] != before_head
+                    or not published['request_identity']
+                    or (review_marker and (
+                        review_marker.get('request_identity') != published['request_identity']
+                        or review_marker.get('owner_oid') != before_head
+                        or review_marker.get('head') != before_head
+                    ))
+                    or not current.shared_metadata_complete
+                    or current.refs.get(f'refs/heads/{branch}') != (current.head, '')
+                    or current.refs.get(f'refs/remotes/origin/{branch}') != (remote_oid, '')):
+                return False
+        elif review_marker is not None and not marker:
+            return False
+        elif not target_base:
+            return False
         if (
-            checkpoint.expected_head != current.head
-            or checkpoint.observed_remote_oid != remote_oid
-            or not _direct_rebase_history_proven(
+            (checkpoint.expected_head != current.head and not pending_review_commit)
+            or (checkpoint.observed_remote_oid != remote_oid and not pushed_review)
+            or (not direct_review and not _direct_rebase_history_proven(
                 connection, repo_path, repo, plan_id, worktree, branch,
                 before_head, after_head, target_base,
                 plan['worker_session_id'],
-            )
+            ))
         ):
             return False
-        owned_oid = checkpoint_ownership.owned_remote_oid(
-            connection, repo_path, repo, plan_id, branch, worktree,
-            remote_oid, git, before_head=before_head,
-            recorded_oid=str(plan['publication_remote_oid'] or '') or None,
-        )
+        if pushed_review:
+            original_oid = checkpoint_ownership.owned_remote_oid(
+                connection, repo_path, repo, plan_id, branch, worktree,
+                before_head, git, before_head=current.head,
+                recorded_oid=before_head, require_live=False,
+            )
+            live = git(repo_path, 'ls-remote', '--heads', 'origin',
+                       f'refs/heads/{branch}', check=False)
+            rows = [line.split() for line in live.stdout.splitlines() if line.strip()]
+            if (original_oid != before_head or live.returncode
+                    or rows != [[remote_oid, f'refs/heads/{branch}']]):
+                return False
+            owned_oid = remote_oid
+        else:
+            owned_oid = checkpoint_ownership.owned_remote_oid(
+                connection, repo_path, repo, plan_id, branch, worktree,
+                remote_oid, git,
+                before_head=current.head if direct_review else before_head,
+                recorded_oid=str(plan['publication_remote_oid'] or '') or None,
+            )
         if owned_oid is None:
             return False
     except (OSError, RuntimeError, WorkspaceOwnershipError, ValueError):
         return False
     with runtime_state._transaction(connection):
-        if not marker:
+        if direct_review and review_marker is None:
+            execution_checkpoint_state.ExecutionCheckpointRepository(connection).record(
+                repo, plan_id, expected_generation=checkpoint.generation,
+                operation=checkpoint.operation, expected_head=checkpoint.expected_head,
+                target_base_oid=checkpoint.target_base_oid,
+                observed_remote_oid=checkpoint.observed_remote_oid,
+                snapshot={**snapshot, 'published_review_resume': {
+                    'request_identity': str(published['request_identity']),
+                    'owner_oid': owned_oid, 'head': current.head,
+                }},
+            )
+        elif not marker and not direct_review:
             execution_checkpoint_state.ExecutionCheckpointRepository(connection).record(
                 repo, plan_id, expected_generation=checkpoint.generation,
                 operation=checkpoint.operation, expected_head=checkpoint.expected_head,
@@ -17094,6 +17197,7 @@ def _resume_legacy_review_count_block(
         return False
     if checkpoint is not None and checkpoint["phase"] not in {"published", "unpublished"}:
         return False
+    published_resume = None
     try:
         validate_execplan_workspace_identity(state_dir, repo, plan_id, branch, worktree)
         validate_managed_worktree(repo_path, worktree, branch)
@@ -17151,14 +17255,37 @@ def _resume_legacy_review_count_block(
             return False
         if checkpoint is not None and checkpoint["phase"] == "published":
             published = str(checkpoint["published_oid"] or "")
-            request = blocked_checkpoint_state.BlockedCheckpointRepository(
-                connection,
-            ).get(repo, plan_id)
-            if (not published or remote_oid != published or request is None
-                    or _owned_checkpoint_remote_oid(
-                        connection, repo_path, request, plan, snapshot,
+            request_row = connection.execute(
+                "SELECT request_identity, reason_code, branch, worktree, "
+                "accepted_remote_oid FROM blocked_checkpoints "
+                "WHERE repo = ? AND plan_id = ?", (repo, plan_id),
+            ).fetchone()
+            if (not published or remote_oid != published
+                    or snapshot.head != published or snapshot.dirty
+                    or any(_non_default_index_flags(entries)
+                           for entries in snapshot.index.values())
+                    or request_row is None
+                    or request_row["reason_code"] != block["reason_code"]
+                    or request_row["branch"] != branch
+                    or request_row["worktree"] != str(worktree)
+                    or request_row["accepted_remote_oid"] != published
+                    or request_row["request_identity"] !=
+                    blocked_checkpoint_state.request_identity(
+                        repo, plan_id, str(block["reason_code"]),
+                        str(block["evidence"]), branch, str(worktree),
+                        str(block["release_fingerprint"] or "") or None,
+                    )
+                    or checkpoint_ownership.owned_remote_oid(
+                        connection, repo_path, repo, plan_id, branch,
+                        worktree, remote_oid, git, before_head=snapshot.head,
+                        recorded_oid=str(plan["publication_remote_oid"] or "") or None,
                     ) != remote_oid):
                 return False
+            published_resume = {
+                "request_identity": str(request_row["request_identity"]),
+                "owner_oid": published,
+                "head": snapshot.head,
+            }
         elif remote_oid is not None and remote_oid != plan["publication_remote_oid"]:
             return False
         if remote_oid is not None and git(
@@ -17170,6 +17297,17 @@ def _resume_legacy_review_count_block(
             KeyError, TypeError, ValueError):
         return False
     with runtime_state._transaction(connection):
+        if published_resume is not None:
+            execution = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
+            current = execution.get(repo, plan_id)
+            execution.record(
+                repo, plan_id, expected_generation=current.generation,
+                operation=None, expected_head=snapshot.head,
+                target_base_oid=current.target_base_oid,
+                observed_remote_oid=remote_oid,
+                snapshot={**(current.snapshot or {}),
+                          "published_review_resume": published_resume},
+            )
         runtime_state.RuntimeStateRepository(connection).transition(
             repo, plan_id,
             plan_values={
@@ -17178,10 +17316,14 @@ def _resume_legacy_review_count_block(
                 "blocked_worktree_fingerprint": None,
                 "blocked_review_fingerprint": None,
                 "validated_base_sha": None,
+                **({"publication_remote_oid": remote_oid}
+                   if published_resume is not None else {}),
                 "last_error": f"Review 실패:\n{str(plan['review_result'] or '')[-8000:]}",
             },
             project_values={
                 "phase": "WORKING", "validated_base_sha": None,
+                **({"publication_remote_oid": remote_oid}
+                   if published_resume is not None else {}),
                 "last_error": f"Review 실패:\n{str(plan['review_result'] or '')[-8000:]}",
             },
             enqueue=False,

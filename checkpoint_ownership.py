@@ -83,6 +83,31 @@ def owned_remote_oid(
     return remote_oid
 
 
+def committed_tree_matches_intent(
+    repo_path: Path, before_head: str | None, head: str,
+    snapshot: dict, git: Callable[..., object],
+) -> bool:
+    """Match an interrupted Manager commit to its approved staged tree."""
+    tree = snapshot.get('commit_tree_oid')
+    if (not before_head or before_head == head
+            or snapshot.get('before_head') != before_head
+            or not snapshot.get('commit_message')
+            or not isinstance(tree, str)
+            or re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', tree) is None):
+        return False
+    try:
+        return (
+            git(repo_path, 'show', '-s', '--format=%P', head).stdout.strip()
+            == before_head
+            and git(repo_path, 'show', '-s', '--format=%B', head).stdout.strip()
+            == str(snapshot['commit_message']).strip()
+            and git(repo_path, 'rev-parse', f'{head}^{{tree}}').stdout.strip()
+            == tree
+        )
+    except (OSError, RuntimeError):
+        return False
+
+
 def rebase_preserves_commits(
     repo_path: Path, before_head: str, after_head: str,
     target_base_oid: str, git: Callable[..., object],

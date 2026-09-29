@@ -38,6 +38,353 @@ VALID_WORKER_RESULT = 'WORKER_OUTCOME: {"kind":"ready_for_validation"}\nvalid re
 
 
 class ExecutionHandlerTests(TestCase):
+    def test_real_git_published_review_release_restart_and_correction(self):
+        # Exercise the ownership boundary with real commits, refs, registration,
+        # snapshots and SQLite persistence; only external PR/agent services are fake.
+        fixture = BlockedCheckpointGitAdapterTest(methodName='runTest')
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        self.addCleanup(fixture.tearDown)
+        repo = str(fixture.repo.resolve())
+        branch = 'loop-manager/G-034'
+        connection = fixture.connection
+        connection.execute(
+            "UPDATE exec_plans SET review_result = 'code.py: repair\nVERDICT: FAIL', "
+            "worker_session_id = 'saved-worker'",
+        )
+        (fixture.worktree / 'code.py').write_text('checkpoint work\n')
+        fixture.block('review_retry_exhausted', 'code.py: repair')
+        with mock.patch.object(lm, 'pr_for_branch', return_value=None):
+            self.assertEqual(lm.dispatch_blocked_checkpoints(
+                connection, fixture.repo, fixture.state_dir, repo,
+            ), 1)
+        published = fixture.run_git(fixture.worktree, 'rev-parse', 'HEAD')
+        original = dict(connection.execute(
+            "SELECT * FROM blocked_checkpoints WHERE plan_id = 'G-034'",
+        ).fetchone())
+        self.assertEqual(original['published_oid'], published)
+        self.assertEqual(original['accepted_remote_oid'], published)
+        self.assertEqual(original['tree_oid'], fixture.run_git(
+            fixture.worktree, 'rev-parse', f'{published}^{{tree}}',
+        ))
+        self.assertIn(f"Checkpoint-Identity: {original['commit_identity']}",
+                      fixture.run_git(fixture.worktree, 'show', '-s', '--format=%B', published))
+
+        def plan_row():
+            return fixture.connection.execute(
+                "SELECT * FROM exec_plans WHERE plan_id = 'G-034'",
+            ).fetchone()
+
+        with mock.patch.object(lm, 'pr_for_branch', return_value=None):
+            # A real published commit must not excuse corrupted durable evidence.
+            for column in ('request_identity', 'commit_identity', 'tree_oid'):
+                with self.subTest(column=column):
+                    connection.execute(
+                        f"UPDATE blocked_checkpoints SET {column} = 'invalid'",
+                    )
+                    self.assertFalse(lm._resume_legacy_review_count_block(
+                        connection, fixture.repo, fixture.state_dir, repo, plan_row(),
+                    ))
+                    connection.execute(
+                        f"UPDATE blocked_checkpoints SET {column} = ?", (original[column],),
+                    )
+            self.assertTrue(lm._resume_legacy_review_count_block(
+                connection, fixture.repo, fixture.state_dir, repo, plan_row(),
+            ))
+        self.assertEqual(plan_row()['status'], 'IMPLEMENTING')
+        self.assertEqual(plan_row()['worker_session_id'], 'saved-worker')
+        self.assertIn('VERDICT: FAIL', plan_row()['review_result'])
+        self.assertIsNone(scoped_blocking.plan_block(connection, repo, 'G-034'))
+
+        # Close the original connection and reconstruct both repositories and
+        # handler, so ownership cannot depend on in-process state from release.
+        database = fixture.state_dir / 'restart.db'
+        connection.commit()
+        with sqlite3.connect(database) as persisted:
+            connection.backup(persisted)
+        connection.close()
+        fixture.connection = sqlite3.connect(database)
+        fixture.connection.row_factory = sqlite3.Row
+        connection = fixture.connection
+        lm.hydrate_execplan_project(connection, repo, plan_row())
+        checkpoint = ExecutionCheckpointRepository(connection)
+        effects = replace(
+            self.effects,
+            state=ExecutionStatePort(connection, runtime_state.RuntimeStateRepository(connection), repo),
+            checkpoint=checkpoint,
+            workspace=replace(
+                self.effects.workspace, git=lm.git,
+                validate_execplan_workspace_identity=lm.validate_execplan_workspace_identity,
+                validate_managed_worktree=lm.validate_managed_worktree,
+            ),
+        )
+        handler = handlers.ExecutionHandlers(
+            effects, repo=repo, repo_path=fixture.repo, state_dir=fixture.state_dir,
+            base='main', base_sha=fixture.base_oid, provider='codex',
+            config_path=Path('/config'), newly_activated=False,
+        )
+        context = SimpleNamespace(
+            plan=SimpleNamespace(plan_id='G-034'), branch=branch,
+            worktree=fixture.worktree, active_sha=fixture.base_oid,
+        )
+
+        def assert_owned(expected):
+            saved = checkpoint.get(repo, 'G-034')
+            self.assertNotIn('blocked_resume', saved.snapshot)
+            self.assertEqual(saved.snapshot['published_review_resume']['owner_oid'], published)
+            self.assertEqual(handler._owned_checkpoint_remote(
+                context, plan_row(), published, saved,
+            ), expected)
+
+        assert_owned(True)
+        before = lm.capture_git_snapshot(fixture.worktree)
+        (fixture.worktree / 'code.py').write_text('review correction\n')
+        lm.validate_agent_scope(
+            'worker', fixture.worktree, before, lm.capture_git_snapshot(fixture.worktree),
+            selected_plan_path=plan_row()['path'],
+        )
+        fixture.run_git(fixture.worktree, 'add', '--', 'code.py')
+        handler._commit_owned(context, 'Repair review issue')
+        corrected = fixture.run_git(fixture.worktree, 'rev-parse', 'HEAD')
+        self.assertNotEqual(corrected, published)
+        self.assertEqual(fixture.run_git(fixture.worktree, 'rev-parse', 'HEAD^'), published)
+        self.assertEqual(checkpoint.get(repo, 'G-034').snapshot['commit_tree_oid'],
+                         fixture.run_git(fixture.worktree, 'rev-parse', 'HEAD^{tree}'))
+        assert_owned(True)
+        self.assertEqual(lm.git(fixture.repo, 'ls-remote', '--heads', 'origin',
+                               f'refs/heads/{branch}').stdout.split()[0], published)
+        self.assertEqual(dict(connection.execute(
+            "SELECT * FROM blocked_checkpoints WHERE plan_id = 'G-034'",
+        ).fetchone()), original)
+        effects.validation.verify.assert_not_called()
+        effects.agent.run_agent.assert_not_called()
+        effects.publication.push_managed_publication_branch.assert_not_called()
+        effects.publication.command.assert_not_called()
+        fixture.verify_probe.assert_not_called()
+        fixture.reviewer_probe.assert_not_called()
+        # A successor pushed by somebody else invalidates the same durable owner.
+        fixture.user_commit(contents='external correction\n')
+        assert_owned(False)
+
+    def test_published_review_commit_correction_keeps_owner_on_restart(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        blocked_checkpoint_state.ensure_schema(self.connection)
+        self.connection.execute(
+            "INSERT INTO blocked_checkpoints "
+            "(repo, plan_id, request_identity, phase, reason_code, evidence, "
+            "branch, worktree, accepted_remote_oid) "
+            "VALUES ('repo', 'G-047', 'request', 'published', "
+            "'review_retry_exhausted', 'review', 'loop-manager/G-047', "
+            "'/state/G-047', 'old-head')"
+        )
+        self.state.update_project('repo', phase='VERIFYING',
+                                  publication_remote_oid='old-head')
+        self.dirty = False
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0, operation='commit',
+            expected_head='old-head', target_base_oid='base',
+            observed_remote_oid='old-head',
+            snapshot={'published_review_resume': {
+                'request_identity': 'request', 'owner_oid': 'old-head',
+                'head': 'old-head',
+            }, 'before_head': 'old-head',
+                'commit_message': 'Worker correction',
+                'commit_tree_oid': 'c' * 40},
+        )
+
+        def observed_git(path, *args, **kwargs):
+            if args in {('rev-parse', 'HEAD'),
+                        ('rev-parse', 'refs/heads/loop-manager/G-047')}:
+                return SimpleNamespace(stdout='corrected-head\n', returncode=0)
+            if args[0] == 'ls-remote':
+                return SimpleNamespace(
+                    stdout='old-head\trefs/heads/loop-manager/G-047\n',
+                    returncode=0,
+                )
+            if args == ('show', '-s', '--format=%P', 'corrected-head'):
+                return SimpleNamespace(stdout='old-head\n', returncode=0)
+            if args == ('show', '-s', '--format=%B', 'corrected-head'):
+                return SimpleNamespace(stdout='Worker correction\n', returncode=0)
+            if args == ('rev-parse', 'corrected-head^{tree}'):
+                return SimpleNamespace(stdout='c' * 40 + '\n', returncode=0)
+            return self.observed_git(path, *args, **kwargs)
+
+        self.effects.workspace.git.side_effect = observed_git
+        self.effects.workspace.remote_branch_oid.return_value = 'old-head'
+        self.effects.publication.pr_for_branch.return_value = None
+        with mock.patch.object(handlers.checkpoint_ownership, 'owned_remote_oid',
+                               return_value='old-head'):
+            first = self.handler.recover(self.context())
+            saved = checkpoint.get('repo', 'G-047')
+            self.assertEqual(first.phase, ExecutionPhase.VERIFYING)
+            self.assertIsNone(saved.operation)
+            self.assertEqual(saved.expected_head, 'corrected-head')
+            self.assertEqual(saved.snapshot['published_review_resume'], {
+                'request_identity': 'request', 'owner_oid': 'old-head',
+                'head': 'old-head',
+            })
+            self.assertEqual(self.handler.recover(self.context()).phase,
+                             ExecutionPhase.VERIFYING)
+        self.effects.publication.command.assert_not_called()
+
+    def test_published_review_push_restarts_before_completion_checkpoint(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        blocked_checkpoint_state.ensure_schema(self.connection)
+        self.connection.execute(
+            "INSERT INTO blocked_checkpoints "
+            "(repo, plan_id, request_identity, phase, reason_code, evidence, "
+            "branch, worktree, accepted_remote_oid) "
+            "VALUES ('repo', 'G-047', 'request', 'published', "
+            "'review_retry_exhausted', 'review', 'loop-manager/G-047', "
+            "'/state/G-047', 'old-head')"
+        )
+        self.state.update_project('repo', publication_remote_oid='corrected-head')
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0, operation='push',
+            expected_head='corrected-head', target_base_oid='base',
+            observed_remote_oid='old-head',
+            snapshot={
+                'published_review_resume': {
+                    'request_identity': 'request', 'owner_oid': 'old-head',
+                    'head': 'old-head',
+                },
+                'remote_before': 'old-head',
+            },
+        )
+
+        def observed_git(path, *args, **kwargs):
+            if args in {('rev-parse', 'HEAD'),
+                        ('rev-parse', 'refs/heads/loop-manager/G-047')}:
+                return SimpleNamespace(stdout='corrected-head\n', returncode=0)
+            if args[0] == 'ls-remote':
+                return SimpleNamespace(
+                    stdout='corrected-head\trefs/heads/loop-manager/G-047\n',
+                    returncode=0,
+                )
+            return self.observed_git(path, *args, **kwargs)
+
+        self.effects.workspace.git.side_effect = observed_git
+        self.effects.workspace.remote_branch_oid.return_value = 'corrected-head'
+        self.effects.publication.pr_for_branch.return_value = None
+        with mock.patch.object(handlers.checkpoint_ownership, 'owned_remote_oid',
+                               return_value='old-head'):
+            pending = checkpoint.get('repo', 'G-047')
+            self.assertNotIn('pushed_checkpoint_head', pending.snapshot)
+            self.assertTrue(self.handler._owned_checkpoint_remote(
+                self.context(), self.state.row(), 'corrected-head', pending,
+            ))
+            self.handler.recover(self.context())
+        saved = checkpoint.get('repo', 'G-047')
+        self.assertIsNone(saved.operation)
+        self.assertEqual(saved.snapshot['pushed_checkpoint_head'], 'corrected-head')
+        self.assertEqual(self.state.row()['publication_remote_oid'], 'corrected-head')
+
+    def test_published_review_resume_push_completion_survives_restart(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        blocked_checkpoint_state.ensure_schema(self.connection)
+        self.connection.execute(
+            "INSERT INTO blocked_checkpoints "
+            "(repo, plan_id, request_identity, phase, reason_code, evidence, "
+            "branch, worktree, accepted_remote_oid) "
+            "VALUES ('repo', 'G-047', 'request', 'published', "
+            "'review_retry_exhausted', 'review', 'loop-manager/G-047', "
+            "'/state/G-047', 'owned-head')"
+        )
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0, operation='push',
+            expected_head='corrected-head', target_base_oid='base',
+            observed_remote_oid='owned-head',
+            snapshot={
+                'published_review_resume': {
+                    'request_identity': 'request', 'owner_oid': 'owned-head',
+                    'head': 'owned-head',
+                },
+                'remote_before': 'owned-head',
+            },
+        )
+        self.handler._complete_publication_intent(self.context())
+        saved = checkpoint.get('repo', 'G-047')
+        self.assertIsNone(saved.operation)
+        self.assertEqual(saved.snapshot['pushed_checkpoint_head'], 'corrected-head')
+        self.assertEqual(saved.observed_remote_oid, 'corrected-head')
+
+        def git(_path, *args, **_kwargs):
+            if args[0] == 'rev-parse':
+                return SimpleNamespace(stdout='corrected-head\n', returncode=0)
+            if args[0] == 'ls-remote':
+                return SimpleNamespace(
+                    stdout='corrected-head\trefs/heads/loop-manager/G-047\n',
+                    returncode=0,
+                )
+            raise AssertionError(args)
+
+        self.effects.workspace.git.side_effect = git
+        with mock.patch.object(handlers.checkpoint_ownership, 'owned_remote_oid',
+                               return_value='owned-head'):
+            self.assertTrue(self.handler._owned_checkpoint_remote(
+                self.context(),
+                {'pr_url': None, 'publication_remote_oid': 'corrected-head'},
+                'corrected-head', checkpoint.get('repo', 'G-047'),
+            ))
+
+    def test_published_review_resume_rechecks_identity_and_live_owner(self):
+        blocked_checkpoint_state.ensure_schema(self.connection)
+        self.connection.execute(
+            "INSERT INTO blocked_checkpoints "
+            "(repo, plan_id, request_identity, phase, reason_code, evidence, "
+            "branch, worktree, accepted_remote_oid) "
+            "VALUES ('repo', 'G-047', 'request', 'published', "
+            "'review_retry_exhausted', 'review', 'loop-manager/G-047', "
+            "'/state/G-047', 'owned-head')"
+        )
+        context = self.context()
+        marker = {'request_identity': 'request', 'owner_oid': 'owned-head',
+                  'head': 'owned-head'}
+        current = SimpleNamespace(
+            operation=None, expected_head='owned-head',
+            snapshot={'published_review_resume': marker},
+            completed_rebase=lambda: None,
+        )
+        row = {'pr_url': None, 'publication_remote_oid': 'owned-head'}
+        live = {'oid': 'owned-head'}
+
+        def git(_path, *args, **_kwargs):
+            if args[0] == 'rev-parse':
+                return SimpleNamespace(stdout='owned-head\n', returncode=0)
+            if args[0] == 'ls-remote':
+                return SimpleNamespace(
+                    stdout=f"{live['oid']}\trefs/heads/loop-manager/G-047\n",
+                    returncode=0,
+                )
+            raise AssertionError(args)
+
+        self.effects.workspace.git.side_effect = git
+        with mock.patch.object(handlers.checkpoint_ownership, 'owned_remote_oid',
+                               return_value='owned-head'):
+            self.assertTrue(self.handler._owned_checkpoint_remote(
+                context, row, live['oid'], current,
+            ))
+            live['oid'] = 'external'
+            self.assertFalse(self.handler._owned_checkpoint_remote(
+                context, row, live['oid'], current,
+            ))
+            live['oid'] = 'owned-head'
+            marker['request_identity'] = 'other-request'
+            self.assertFalse(self.handler._owned_checkpoint_remote(
+                context, row, live['oid'], current,
+            ))
+            marker['request_identity'] = 'request'
+            row['publication_remote_oid'] = 'other-head'
+            self.assertFalse(self.handler._owned_checkpoint_remote(
+                context, row, live['oid'], current,
+            ))
+
     def test_rebase_journal_match_requires_run_identity_only_for_v2(self):
         context = SimpleNamespace(
             plan=SimpleNamespace(plan_id='G-047'),
@@ -3093,6 +3440,8 @@ class ExecutionHandlerTests(TestCase):
         def failing_git(path, *args, **kwargs):
             if args == ('rev-parse', 'HEAD'):
                 return SimpleNamespace(stdout='before-head\n', returncode=0)
+            if args == ('write-tree',):
+                return SimpleNamespace(stdout='c' * 40 + '\n', returncode=0)
             if args[0] == 'commit':
                 raise lm.GitLockError('index.lock')
             return self.git(path, *args, **kwargs)
@@ -3103,6 +3452,7 @@ class ExecutionHandlerTests(TestCase):
         saved = checkpoint.get('repo', 'G-047')
         self.assertEqual(saved.operation, 'commit')
         self.assertEqual(saved.expected_head, 'before-head')
+        self.assertEqual(saved.snapshot['commit_tree_oid'], 'c' * 40)
         self.assertEqual(self.state.row()['phase'], 'VERIFYING')
 
     def test_final_block_uses_current_verify_output_before_project_checkpoint(self):
