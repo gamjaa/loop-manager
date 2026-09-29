@@ -34,11 +34,61 @@ def source_commits(git: Callable[..., Any], repo: Any, original: str,
     base = git(repo, 'merge-base', original, target).stdout.strip()
     if not base:
         raise ReplayEvidenceError('start', None, None, 'merge base unavailable')
-    result = git(repo, 'rev-list', '--reverse', f'{base}..{original}')
+    result = git(repo, 'rev-list', '--no-merges', '--reverse', f'{base}..{original}')
     commits = result.stdout.splitlines()
     if result.returncode or any(not commit for commit in commits):
         raise ReplayEvidenceError('start', None, None, 'source order unavailable')
+    merges = git(repo, 'rev-list', '--min-parents=2', f'{base}..{original}',
+                 check=False)
+    if merges.returncode:
+        raise ReplayEvidenceError('start', None, None, 'merge source order unavailable')
+    if merges.stdout.strip():
+        historical = git(repo, 'rev-list', '--reverse', f'{base}..{original}',
+                         check=False)
+        if historical.returncode:
+            raise ReplayEvidenceError('start', None, None, 'source order unavailable')
+        reconcile_frozen_sources(
+            git, repo, original=original, target=target, base=base,
+            frozen=historical.stdout.splitlines(), current=commits,
+        )
     return base, commits
+
+
+def reconcile_frozen_sources(git: Callable[..., Any], repo: Any, *,
+                             original: str, target: str, base: str,
+                             frozen: Sequence[str], current: Sequence[str]) -> list[str]:
+    """Read a pre-fix receipt that included an automatically merged commit.
+
+    The sealed receipt stays unchanged. Only a merge whose second parent is
+    already in the target and whose tree is Git's automatic merge result can
+    be omitted from the replay proof.
+    """
+    if not isinstance(frozen, list) or any(not isinstance(oid, str) or not oid
+                                           for oid in frozen):
+        raise ReplayEvidenceError('start', None, None, 'frozen source sequence invalid')
+    if frozen == list(current):
+        return list(current)
+    historical = git(repo, 'rev-list', '--reverse', f'{base}..{original}', check=False)
+    if historical.returncode or historical.stdout.splitlines() != frozen:
+        raise ReplayEvidenceError('start', None, None, 'frozen source sequence mismatch')
+    omitted = [oid for oid in frozen if oid not in current]
+    if not omitted or [oid for oid in frozen if oid not in omitted] != list(current):
+        raise ReplayEvidenceError('start', None, None, 'frozen source order mismatch')
+    for oid in omitted:
+        parents = git(repo, 'rev-list', '--parents', '-n', '1', oid, check=False)
+        words = parents.stdout.strip().split()
+        if parents.returncode or len(words) != 3 or words[0] != oid:
+            raise ReplayEvidenceError('start', oid, None, 'omitted merge parents unavailable')
+        ancestor = git(repo, 'merge-base', '--is-ancestor', words[2], target,
+                       check=False)
+        automatic = git(repo, 'merge-tree', '--write-tree', words[1], words[2],
+                        check=False)
+        actual = git(repo, 'rev-parse', f'{oid}^{{tree}}', check=False)
+        if (ancestor.returncode or automatic.returncode or actual.returncode
+                or automatic.stdout.strip() != actual.stdout.strip()):
+            raise ReplayEvidenceError('start', oid, None,
+                                      'omitted merge has unproven content')
+    return list(current)
 
 
 def replay_commits(git: Callable[..., Any], repo: Any, target: str,

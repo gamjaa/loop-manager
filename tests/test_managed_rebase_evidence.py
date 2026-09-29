@@ -12,7 +12,8 @@ import manager_git_journal as journal
 import loop_manager
 
 from managed_rebase_evidence import (
-    ReplayEvidenceError, source_commits, stage_index_matches, stage_matches, stage_modes_match, verify_replay,
+    ReplayEvidenceError, reconcile_frozen_sources, source_commits, stage_index_matches,
+    stage_matches, stage_modes_match, verify_replay,
 )
 
 
@@ -229,8 +230,13 @@ class JournalReplayProofTests(unittest.TestCase):
         def git(_repo, *arguments, **_kwargs):
             if arguments[0] == 'merge-base':
                 return SimpleNamespace(stdout=base + '\n', returncode=0)
+            if arguments[:3] == ('rev-list', '--no-merges', '--reverse'):
+                commits = source
+                return SimpleNamespace(stdout='\n'.join(commits) + '\n', returncode=0)
+            if arguments[:2] == ('rev-list', '--min-parents=2'):
+                return SimpleNamespace(stdout='', returncode=0)
             if arguments[:2] == ('rev-list', '--reverse'):
-                commits = source if arguments[2] == f'{base}..{source[-1]}' else replayed
+                commits = replayed
                 return SimpleNamespace(stdout='\n'.join(commits) + '\n', returncode=0)
             if arguments[:2] == ('rev-list', '--parents'):
                 oid = arguments[-1]
@@ -354,8 +360,13 @@ class JournalReplayProofTests(unittest.TestCase):
         def git(_repo, *arguments, **_kwargs):
             if arguments[0] == 'merge-base':
                 return SimpleNamespace(stdout=base + '\n', returncode=0)
+            if arguments[:3] == ('rev-list', '--no-merges', '--reverse'):
+                commits = sources
+                return SimpleNamespace(stdout='\n'.join(commits) + '\n', returncode=0)
+            if arguments[:2] == ('rev-list', '--min-parents=2'):
+                return SimpleNamespace(stdout='', returncode=0)
             if arguments[:2] == ('rev-list', '--reverse'):
-                commits = sources if arguments[2] == f'{base}..{sources[-1]}' else replayed
+                commits = replayed
                 return SimpleNamespace(stdout='\n'.join(commits) + '\n', returncode=0)
             if arguments[:2] == ('rev-list', '--parents'):
                 oid = arguments[-1]
@@ -424,6 +435,51 @@ class JournalReplayProofTests(unittest.TestCase):
 
 
 class RealGitJournalReplayTests(unittest.TestCase):
+    def test_saved_merge_with_manual_content_is_not_silently_omitted(self):
+        with TemporaryDirectory() as directory:
+            repo = Path(directory)
+            subprocess.run(['git', 'init', '-b', 'main', str(repo)], check=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+            def git(*args, **kwargs):
+                return loop_manager.git(repo, *args, **kwargs)
+
+            git('config', 'user.name', 'Rebase Test')
+            git('config', 'user.email', 'rebase@example.test')
+            (repo / 'initial.txt').write_text('initial\n', encoding='utf-8')
+            git('add', 'initial.txt')
+            git('commit', '-m', 'Initial')
+            git('switch', '-c', 'work')
+            (repo / 'work.txt').write_text('work\n', encoding='utf-8')
+            git('add', 'work.txt')
+            git('commit', '-m', 'Work')
+            git('switch', 'main')
+            (repo / 'main.txt').write_text('main\n', encoding='utf-8')
+            git('add', 'main.txt')
+            git('commit', '-m', 'Main')
+            target = git('rev-parse', 'HEAD').stdout.strip()
+            git('switch', 'work')
+            git('merge', '--no-commit', 'main')
+            (repo / 'manual.txt').write_text('unrecorded resolution\n', encoding='utf-8')
+            git('add', 'manual.txt')
+            git('commit', '-m', 'Manual merge addition')
+            original = git('rev-parse', 'HEAD').stdout.strip()
+            base = git('merge-base', original, target).stdout.strip()
+            current = git('rev-list', '--no-merges', '--reverse',
+                          f'{base}..{original}').stdout.splitlines()
+            frozen = git('rev-list', '--reverse', f'{base}..{original}').stdout.splitlines()
+            self.assertEqual(len(current), 1)
+            self.assertEqual(len(frozen), 2)
+            with self.assertRaisesRegex(ReplayEvidenceError,
+                                        'omitted merge has unproven content'):
+                source_commits(loop_manager.git, repo, original, target)
+            with self.assertRaisesRegex(ReplayEvidenceError,
+                                        'omitted merge has unproven content'):
+                reconcile_frozen_sources(
+                    loop_manager.git, repo, original=original, target=target,
+                    base=base, frozen=frozen, current=current,
+                )
+
     def test_middle_conflict_later_content_and_mode_survive_journal_recovery(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -445,12 +501,20 @@ class RealGitJournalReplayTests(unittest.TestCase):
             app.write_text(''.join(original_lines), encoding='utf-8')
             git('add', 'app.txt')
             git('commit', '-m', 'Initial application')
+            initial = git('rev-parse', 'HEAD').stdout.strip()
 
             branch = 'loop-manager/G-099'
             git('switch', '-c', branch)
             (repo / 'notes.txt').write_text('first replayed commit\n', encoding='utf-8')
             git('add', 'notes.txt')
             git('commit', '-m', 'Add independent note')
+            git('switch', 'main')
+            (repo / 'base-note.txt').write_text('merged base note\n', encoding='utf-8')
+            git('add', 'base-note.txt')
+            git('commit', '-m', 'Advance base before merge')
+            git('switch', branch)
+            git('merge', '--no-edit', 'main')
+            merged = git('rev-parse', 'HEAD').stdout.strip()
             changed = original_lines.copy()
             changed[0] = 'value=worker\n'
             app.write_text(''.join(changed), encoding='utf-8')
@@ -479,6 +543,22 @@ class RealGitJournalReplayTests(unittest.TestCase):
             repo_key = str(repo.resolve())
             source_base, sources = source_commits(loop_manager.git, repo, original_head, target)
             self.assertEqual(len(sources), 4)
+            with self.assertRaisesRegex(ReplayEvidenceError,
+                                        'omitted merge has unproven content'):
+                source_commits(loop_manager.git, repo, original_head, initial)
+            frozen_sources = git('rev-list', '--reverse',
+                                 f'{source_base}..{original_head}').stdout.splitlines()
+            self.assertEqual(len(frozen_sources), 5)
+            self.assertIn(merged, frozen_sources)
+            self.assertEqual(reconcile_frozen_sources(
+                loop_manager.git, repo, original=original_head, target=target,
+                base=source_base, frozen=frozen_sources, current=sources,
+            ), sources)
+            with self.assertRaisesRegex(ReplayEvidenceError, 'frozen source sequence mismatch'):
+                reconcile_frozen_sources(
+                    loop_manager.git, repo, original=original_head, target=target,
+                    base=source_base, frozen=frozen_sources[:-1], current=sources,
+                )
             expected = {
                 'branch': branch, 'before_head': original_head,
                 'target_base_oid': target, 'remote_oid': None,
@@ -487,7 +567,7 @@ class RealGitJournalReplayTests(unittest.TestCase):
                 ),
                 'agent_session_id': None, 'evidence_version': 2,
                 'run_id': 'owned-run', 'source_base': source_base,
-                'source_commits': sources, 'checkpoint_generation': 1,
+                'source_commits': frozen_sources, 'checkpoint_generation': 1,
                 'pr_head_oid': None,
             }
             first = journal.begin_rebase(

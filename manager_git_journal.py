@@ -124,10 +124,10 @@ def rebase_replay_proof(
     expected = intent['expected']
     if expected.get('evidence_version') != replay_evidence.EVIDENCE_VERSION:
         raise MutationEvidenceError('rebase replay evidence version is unavailable')
-    sources = expected.get('source_commits')
+    frozen_sources = expected.get('source_commits')
     run_id = expected.get('run_id')
     generation = expected.get('checkpoint_generation')
-    if (not isinstance(sources, list) or not isinstance(run_id, str)
+    if (not isinstance(frozen_sources, list) or not isinstance(run_id, str)
             or not run_id or not isinstance(expected.get('source_base'), str)
             or not isinstance(generation, int)):
         raise MutationEvidenceError('rebase start: source sequence is incomplete')
@@ -135,8 +135,13 @@ def rebase_replay_proof(
     actual_base, actual_sources = replay_evidence.source_commits(
         git, repo, expected['before_head'], expected['target_base_oid'],
     )
-    if actual_base != expected['source_base'] or actual_sources != sources:
+    if actual_base != expected['source_base']:
         raise MutationEvidenceError('rebase start: frozen source sequence mismatch')
+    sources = replay_evidence.reconcile_frozen_sources(
+        git, repo, original=expected['before_head'],
+        target=expected['target_base_oid'], base=actual_base,
+        frozen=frozen_sources, current=actual_sources,
+    )
     slot = _slot(state_dir, intent['repo'], 'managed_rebase', intent['target'])
     receipts = []
     for result_path in slot.glob('*.result.json'):
@@ -153,7 +158,7 @@ def rebase_replay_proof(
                 continue
             if (saved.get('repo') != intent['repo'] or saved.get('target') != intent['target']
                     or saved.get('owner') != intent['owner']
-                    or saved['expected'].get('source_commits') != sources
+                    or saved['expected'].get('source_commits') != frozen_sources
                     or saved['expected'].get('target_base_oid') != expected['target_base_oid']):
                 raise MutationEvidenceError('rebase replay: receipt identity mismatch')
             if result.get('id') != saved.get('id') or not isinstance(result.get('candidates'), dict):
