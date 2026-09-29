@@ -9552,6 +9552,43 @@ def _direct_rebase_result_matches_observation(
     )
 
 
+def _direct_rebase_restored_stage_matches(
+    intent: Mapping[str, object], sealed: Mapping[str, object],
+    observed: Mapping[str, object],
+) -> bool:
+    """Prove Manager-restored staging from the rebase's frozen before state."""
+    before = intent.get('before')
+    if (not isinstance(before, dict)
+            or not isinstance(before.get('dirty'), dict)
+            or not before['dirty']
+            or not isinstance(before.get('index'), dict)
+            or not isinstance(sealed.get('dirty'), dict)
+            or not isinstance(sealed.get('index'), dict)
+            or not isinstance(observed.get('dirty'), dict)
+            or not isinstance(observed.get('index'), dict)
+            or set(sealed['dirty']) != set(before['dirty'])
+            or observed['dirty'] != before['dirty']
+            or observed.get('file_evidence') != sealed.get('file_evidence')
+            or observed.get('rebase_head') != sealed.get('rebase_head')
+            or observed.get('unmerged') != sealed.get('unmerged')
+            or not _direct_rebase_result_matches_observation(
+                sealed, observed, preserved_worktree=True,
+            )):
+        return False
+    staged_paths = {
+        path for path, state in before['dirty'].items()
+        if (isinstance(state, list) and state
+            and isinstance(state[0], list) and 'staged' in state[0])
+    }
+    if not staged_paths or observed.get('index_clean') is not False:
+        return False
+    for path in before['index'].keys() | sealed['index'].keys() | observed['index'].keys():
+        expected = (before['index'] if path in staged_paths else sealed['index'])
+        if observed['index'].get(path) != expected.get(path):
+            return False
+    return True
+
+
 def _complete_direct_rebase_checkpoint(
     connection: sqlite3.Connection, repo: str, plan_id: str,
     worktree: Path, target_base_oid: str,
@@ -9609,7 +9646,10 @@ def _complete_direct_rebase_checkpoint(
                     (current.snapshot or {}).get('rebase_run_id')
                     and _direct_rebase_result_matches_observation(
                         item['result']['observed'], observed,
-                        preserved_worktree=preserved,
+                        preserved_worktree=(preserved or
+                            _direct_rebase_restored_stage_matches(
+                                item['intent'], item['result']['observed'], observed,
+                            )),
                     )
                     and observed.get('metadata') is None]
         if len(matching) != 1:

@@ -949,6 +949,83 @@ class ManagedTransitionTests(unittest.TestCase):
         self.assertIsNone(saved.operation)
         self.assertEqual(saved.snapshot['rebase_completion']['id'], 'sealed')
 
+    def test_direct_rebase_completion_accepts_only_original_restored_stage(self):
+        connection = sqlite3.connect(':memory:')
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        repository = ExecutionCheckpointRepository(connection)
+        repository.record(
+            'repo', 'G-091', expected_generation=0, operation='rebase',
+            expected_head=OLD, target_base_oid=NEW,
+            observed_remote_oid=OLD, snapshot={'rebase_run_id': 'run'},
+        )
+        before_dirty = {
+            'app.py': [['staged'], 'app-content'],
+            'README.md': [['unstaged'], 'readme-content'],
+        }
+        before_index = {
+            'app.py': [f'H 100644 {TREE} 0'],
+            'README.md': [f'H 100644 {OLD} 0'],
+        }
+        sealed = {
+            'head': NEW, 'branch': BRANCH, 'ref': [NEW, ''],
+            'registration': ['owned'], 'operations': {}, 'metadata': None,
+            'rebase_head': None, 'unmerged': False, 'index_clean': True,
+            'index': {'app.py': [f'H 100644 {OLD} 0'],
+                      'README.md': before_index['README.md']},
+            'dirty': {'app.py': [['unstaged'], 'app-content'],
+                      'README.md': before_dirty['README.md']},
+            'file_evidence': {'app.py': 'accepted', 'README.md': 'accepted'},
+        }
+        restored = {**sealed, 'index': before_index, 'dirty': before_dirty,
+                    'index_clean': False}
+        transition = {
+            'intent': {
+                'id': 'sealed', 'kind': 'managed_rebase', 'target': '/owned',
+                'before': {'head': OLD, 'branch': BRANCH,
+                           'dirty': before_dirty, 'index': before_index},
+                'expected': {'before_head': OLD, 'target_base_oid': NEW,
+                             'remote_oid': OLD, 'run_id': 'run'},
+            },
+            'result': {'observed': sealed},
+        }
+        observed = [restored]
+        with (mock.patch.object(loop_manager, '_owned_rebase_state_dir',
+                                return_value=Path('/state')),
+              mock.patch.object(loop_manager, '_owned_rebase_journal_state',
+                                side_effect=lambda *_: observed[0]),
+              mock.patch.object(journal, 'verified_managed_transitions',
+                                return_value=[transition]),
+              mock.patch.object(loop_manager.runtime_state,
+                                'RuntimeStateRepository') as runtime):
+            runtime.return_value.projected.return_value = None
+            for changed in (
+                {**restored, 'index': {**before_index,
+                                       'app.py': [f'H 100644 {NEW} 0']}},
+                {**restored, 'dirty': {**before_dirty,
+                                       'README.md': [['unstaged'], 'foreign']}},
+                {**restored, 'file_evidence': {'app.py': 'foreign'}},
+                {**restored, 'unmerged': True},
+            ):
+                with self.subTest(changed=changed), self.assertRaisesRegex(
+                    journal.MutationEvidenceError, 'unique owned result unavailable',
+                ):
+                    observed[0] = changed
+                    loop_manager._complete_direct_rebase_checkpoint(
+                        connection, 'repo', 'G-091', Path('/owned'), NEW,
+                        repo_path=Path('/repo'), branch=BRANCH,
+                        agent_session_id=None,
+                    )
+                self.assertEqual(repository.get('repo', 'G-091').operation, 'rebase')
+            observed[0] = restored
+            loop_manager._complete_direct_rebase_checkpoint(
+                connection, 'repo', 'G-091', Path('/owned'), NEW,
+                repo_path=Path('/repo'), branch=BRANCH, agent_session_id=None,
+            )
+        saved = repository.get('repo', 'G-091')
+        self.assertIsNone(saved.operation)
+        self.assertEqual(saved.snapshot['rebase_completion']['id'], 'sealed')
+
 
 class DetachedRebaseOwnershipTests(unittest.TestCase):
     def test_rebase_start_retry_reuses_frozen_run_and_generation(self):
