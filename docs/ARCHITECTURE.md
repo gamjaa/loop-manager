@@ -372,7 +372,7 @@ target base나 원격 OID가 달라졌으면 저장된 작업의 완료 사실�
 
 원격 base가 전진했으면 계획·Requirement의 내용 지문이 같아도 해당 계획의 관리 작업 공간에서 rebase를 수행한다. 시작 HEAD, 원본 commit 집합, target base, 작업 branch의 마지막 확인 원격 OID와 저장된 세션·journal identity를 하나의 복구 intent에 결합한다. R-045의 단계별 증거 검증으로 완료를 확정하고, 충돌은 기존 Worker 교정 경계로 보내거나 미해결 상태를 보존한다. 충돌 중에는 checkpoint commit·push를 시작하지 않는다. 이미 완료된 Git 효과는 재시작 후 증거를 대조해 확정하고 같은 rebase를 반복하지 않는다.
 
-완료된 후보 revision에서 원래 차단 원인을 해당 원인의 해제 검사로 재평가한다. 원인 해소와 별도 안전 gate 해제를 구분해 SQLite에 기록한다. 해제한 계획은 기존 세션·branch·worktree로 재개하되 변경된 후보에 필요한 Worker 확인, targeted test, 전체 verify와 Review를 거친다. 원인이 남으면 계획 또는 프로젝트의 차단 이유를 보존한 채 R-015의 checkpoint 경계로 현재 작업물 게시를 시도한다. checkpoint 게시 자체는 어떤 차단도 해제하지 않는다.
+PR 없는 기존 원격 작업 branch의 관리 rebase가 완료됐으면 R-047의 중간 checkpoint 게시를 먼저 확정한다. 그 뒤 완료된 후보 revision에서 원래 차단 원인을 해당 원인의 해제 검사로 재평가한다. 원인 해소와 별도 안전 gate 해제를 구분해 SQLite에 기록한다. 해제한 계획은 기존 세션·branch·worktree로 재개하되 변경된 후보에 필요한 Worker 확인, targeted test, 전체 verify와 Review를 거친다. 원인이 남으면 계획 또는 프로젝트의 차단 이유를 보존한 채 R-015의 checkpoint 경계로 현재 작업물 게시를 시도한다. 이미 같은 head가 게시됐다면 중복 push하지 않는다. checkpoint 게시 자체는 어떤 차단도 해제하지 않는다.
 
 #### 게시와 미게시 결과
 
@@ -381,6 +381,14 @@ target base나 원격 OID가 달라졌으면 저장된 작업의 완료 사실�
 원래 작업 branch의 게시 계보를 확정할 수 없어 기존 ref를 갱신할 수 없을 때는 해당 ref를 덮지 않는 별도 진단 branch에 검증 가능한 commit만 게시한다. 진단 branch 이름은 계획과 작업물 identity에 결합하고 원격에 없을 때만 생성한다. 이미 같은 OID가 있으면 게시 완료로 확정하고, 다른 OID가 있으면 갱신하거나 재사용하지 않는다. 이름·원본 plan·base·작업 branch·원인·내용 OID를 저장하고, 재시작 시 같은 결과를 중복 생성하지 않는다. 이 ref는 PR head나 소유권 증거로 자동 채택하지 않는다. 대상 작업의 범위·Git 상태가 불확실하거나 rebase가 미완료이면 원격 쓰기를 하지 않고 local-only 원인과 보존된 작업 경로를 기록한다. 차단 알림은 성공 시 확인 가능한 원격 OID와 ref를, 실패 시 실제 미게시 이유를 포함한다.
 
 관측, fetch, rebase, 원인 재검증, checkpoint commit, push와 SQLite 확정은 각각 중단될 수 있다. 각 단계의 기대 OID와 실제 Git 효과를 재확인한 뒤에만 다음 단계로 넘어가며, 중단 복구는 사용자 commit·로컬 변경·원래 차단 감사와 다른 계획의 상태를 보존한다. 자동 검증은 동시 base·작업 branch 변경, 활성 계획 중 관측, 프로젝트 차단 중 계획별 복구, 원인 지속·해소, 동일 입력 반복, 미해결 충돌, 원격 경쟁과 단계별 중단을 실제 Git 이력으로 다룬다.
+
+### 관리 rebase 직후 중간 checkpoint 게시 — R-047 목표 설계
+
+이 절은 `docs/requirements/[R-047] Immediate Remote Checkpoint After Managed Rebase.md`의 목표 설계다. 현재 PR 게시 경계의 예외는 PR이 없는 동일 계획의 기존 원격 작업 branch에 한정한다. Manager는 R-045의 완료 journal과 소유 worktree·branch·HEAD·작업 범위를 검증한 뒤, 다음 Worker·전체 verify·Review·추가 base rebase보다 먼저 중간 게시 intent를 저장한다. 충돌 중이거나 rebase 완료 증거가 없으면 intent를 게시 가능 상태로 만들지 않는다.
+
+게시 경계는 마지막 채택 원격 작업 OID와 현재 ref 및 PR 부재를 실제 원격에서 확인한다. 원격 OID가 예상과 같을 때만 fast-forward 또는 정확한 `--force-with-lease`로 결과 HEAD를 게시하고, 게시 후 원격 OID를 다시 확인해 SQLite의 마지막 채택 OID와 rebase 완료 identity를 갱신한다. base가 다시 전진했더라도 완료된 결과의 게시 또는 안전한 거부를 먼저 확정한 뒤 별도 rebase intent를 시작한다. 일시적인 push 실패는 같은 intent로 재개하며, push 성공 후 SQLite 반영 전 중단은 실제 ref와 journal을 대조해 중복 push 없이 확정한다.
+
+기존 미게시 rebase가 여러 개 쌓인 상태는 마지막 채택 원격 OID에서 각 완료 journal의 원본·결과 HEAD가 끊김 없이 이어질 때에만 복구한다. 원격 HEAD가 rebased HEAD의 조상이 아니라는 사실이나 공통 base 조상만으로 소유권을 판정하지 않는다. 원격 후속 commit·삭제·재작성, PR 생성, 불완전한 journal 또는 예상 밖 작업 변경은 기존 branch를 덮지 않고 작업물·감사와 실패 원인을 보존한다. 중간 게시 뒤에도 최종 후보의 targeted test, 전체 verify, Review와 PR 생성 조건은 기존 경계에서 별도로 확인한다.
 
 ## 검증과 재시도
 
