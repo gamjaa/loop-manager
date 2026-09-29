@@ -491,7 +491,8 @@ class ExecutionHandlers:
                 current.operation == 'push'
                 and (current.snapshot or {}).get('remote_before') == original
                 and current.expected_head == local == remote_oid
-                and recorded == original
+                and remote_oid != original
+                and recorded in (original, remote_oid)
             )
             if remote_oid == original and recorded == original:
                 expected_live = original
