@@ -17,6 +17,7 @@ import secrets
 from typing import Any
 from execution_checkpoint import controlling_git_operation, rebase_preserves_worktree_files
 import managed_rebase_evidence as replay_evidence
+import checkpoint_ownership
 
 
 class MutationEvidenceError(RuntimeError):
@@ -270,7 +271,10 @@ def legacy_rebase_replay_proof(
         if result.get('status') != 'complete' or result.get('id') == intent['id']:
             continue
         saved = _read(slot / f"{result.get('id')}.intent.json")
-        if (saved.get('owner') == intent['owner']
+        if (saved.get('repo') == intent['repo']
+                and saved.get('owner') == intent['owner']
+                and saved.get('expected', {}).get('agent_session_id')
+                == expected.get('agent_session_id')
                 and saved.get('expected', {}).get('before_head') == expected['before_head']
                 and saved['expected'].get('target_base_oid') == expected['target_base_oid']
                 and saved.get('target') == intent['target']):
@@ -299,6 +303,7 @@ def legacy_rebase_replay_proof(
         source = sources[matches[0]]
         accepted = item.get('accepted_files')
         if (source in corrections or not isinstance(accepted, dict) or not accepted
+                or item.get('agent_session_id') != expected.get('agent_session_id')
                 or any(receipt['before'].get('dirty', {}).get(path, [None, None])[1]
                        != signature for path, signature in accepted.items())):
             raise MutationEvidenceError('rebase legacy resolution: approved files mismatch')
@@ -890,6 +895,73 @@ def complete_rebase(
     return True
 
 
+def verified_rebase_completion(
+    state_dir: Path, *, repo: str, target: str, owner: str,
+    branch: str, before_head: str, target_base_oid: str,
+    remote_oid: str | None, agent_session_id: str | None,
+    run_id: str | None, checkpoint_generation: int,
+    observe: Callable[[], dict[str, Any]],
+    validate: Callable[[Mapping[str, Any], Mapping[str, Any]], dict[str, Any]],
+    replay_proof: Callable[[Mapping[str, Any], Mapping[str, Any]],
+                           list[dict[str, str]] | None],
+    later_correction: Callable[[Mapping[str, Any], Mapping[str, Any],
+                                Mapping[str, Any]], bool] | None = None,
+) -> dict[str, Any]:
+    """Recheck one sealed completion against the current owned Git state.
+
+    A result file is durable evidence, not an allowance to adopt a later HEAD
+    or another run. The caller's validator must check the live marker, remote,
+    ownership and replay using the same rules as initial finalization.
+    """
+    slot = _slot(state_dir, repo, 'managed_rebase', target)
+    observed = observe()
+    matches = []
+    owned_intents = 0
+    unverified_corrections = 0
+    for result_path in slot.glob('*.result.json'):
+        result = _read(result_path)
+        sealed_observed = result.get('observed')
+        if result.get('status') != 'complete' or not isinstance(sealed_observed, dict):
+            continue
+        identity = result.get('id')
+        if not isinstance(identity, str) or re.fullmatch(r'[0-9a-f]{32}', identity) is None:
+            raise MutationEvidenceError('rebase stored completion: invalid result identity')
+        intent = _read(slot / f'{identity}.intent.json')
+        expected = intent.get('expected')
+        if (not isinstance(expected, dict) or intent.get('version') != 1
+                or intent.get('kind') != 'managed_rebase'
+                or intent.get('id') != identity or intent.get('repo') != repo
+                or intent.get('target') != target or intent.get('owner') != owner
+                or expected.get('branch') != branch
+                or expected.get('before_head') != before_head
+                or expected.get('target_base_oid') != target_base_oid
+                or expected.get('remote_oid') != remote_oid
+                or expected.get('agent_session_id') != agent_session_id
+                or expected.get('run_id') != run_id
+                or (run_id is not None and (
+                    type(expected.get('checkpoint_generation')) is not int
+                    or expected['checkpoint_generation'] > checkpoint_generation
+                ))):
+            continue
+        owned_intents += 1
+        if (sealed_observed != observed
+                and (later_correction is None
+                     or not later_correction(intent, sealed_observed, observed))):
+            unverified_corrections += 1
+            continue
+        if (result.get('candidates') != validate(intent, sealed_observed)
+                or result.get('replay_proof') != replay_proof(intent, sealed_observed)):
+            raise MutationEvidenceError('rebase stored completion: evidence changed')
+        matches.append({'intent': intent, 'result': result})
+    if len(matches) != 1:
+        raise MutationEvidenceError(
+            'rebase stored completion: unique owned result unavailable '
+            f'(owned={owned_intents}, unverified correction={unverified_corrections}, '
+            f'matching={len(matches)})'
+        )
+    return matches[0]
+
+
 def verified_managed_transitions(
     state_dir: Path, repo: str, owner: str, *,
     agent_session_id: str | None = None,
@@ -953,6 +1025,7 @@ def verified_managed_transitions(
                     raise MutationEvidenceError("Manager rebase 저장 결과가 유효하지 않습니다.")
                 try:
                     replay_verified = False
+                    accepted_correction = False
                     if intent['expected'].get('evidence_version') == 2:
                         if git is None:
                             raise MutationEvidenceError('rebase stored replay requires Git observation')
@@ -964,11 +1037,81 @@ def verified_managed_transitions(
                         if git is None or result['replay_proof'] != legacy_rebase_replay_proof(
                                 git, state_dir, intent, observed):
                             raise MutationEvidenceError('rebase stored legacy replay proof mismatch')
+                        accepted_correction = bool(result['replay_proof'])
+                    elif intent['expected'].get('staged_tree_oid'):
+                        raise MutationEvidenceError('rebase stored legacy resolution proof missing')
+                    marker = True
+                    remote_oid = intent['expected']['remote_oid']
+                    ancestor = True
+                    if git is not None and observed.get('metadata') is None:
+                        live_head = git(Path(intent['target']), 'rev-parse', 'HEAD', check=False)
+                        live_ref = git(Path(intent['repo']), 'rev-parse', '--verify',
+                                       f'refs/heads/{branch}', check=False)
+                        current_head = live_head.stdout.strip()
+                        if (live_head.returncode or live_ref.returncode
+                                or live_ref.stdout.strip() != current_head):
+                            continue
+                        historical = current_head != observed['head']
+                        if historical:
+                            # A later owned commit may move the ref beyond a
+                            # sealed result. Preserve the old finish receipt
+                            # only while that result remains in this history.
+                            if git(
+                                Path(intent['target']), 'merge-base', '--is-ancestor',
+                                observed['head'], current_head, check=False,
+                            ).returncode != 0:
+                                continue
+                            reflog = git(
+                                Path(intent['repo']), 'reflog', 'show',
+                                '--format=%H%x00%gs', f'refs/heads/{branch}',
+                                check=False,
+                            )
+                            finish = (
+                                f"{observed['head']}\0loop-manager-rebase:{intent['id']}"
+                                f" (finish): refs/heads/{branch} onto "
+                                f"{intent['expected']['target_base_oid']}"
+                            )
+                            marker = (reflog.returncode == 0
+                                      and finish in reflog.stdout.splitlines())
+                        else:
+                            marker = rebase_completion_matches(
+                                git, Path(intent['repo']), branch=branch,
+                                head=observed['head'], identity=intent['id'],
+                                target_base_oid=intent['expected']['target_base_oid'],
+                            )
+                        if (not marker and observed == intent['before']):
+                            marker = successful_rebase_invocation(
+                                state_dir, intent['repo'], intent['target'], intent['id'],
+                            )
+                        if not marker:
+                            continue
+                        if not historical:
+                            remote_oid = live_remote_branch_oid(
+                                git, Path(intent['repo']), branch,
+                            )
+                        # A historical lease is the sealed value; current
+                        # publication callers check their live lease again.
+                        ancestor = git(
+                            Path(intent['target']), 'merge-base', '--is-ancestor',
+                            intent['expected']['target_base_oid'], observed['head'],
+                            check=False,
+                        ).returncode == 0
+                    patches_preserved = (
+                        False if intent['expected'].get('evidence_version') == 2
+                        else (accepted_correction or (
+                            git is not None and checkpoint_ownership.rebase_preserves_commits(
+                                Path(intent['repo']),
+                                intent['expected']['before_head'], observed['head'],
+                                intent['expected']['target_base_oid'], git,
+                            )
+                        ))
+                    )
                     expected_candidates = verified_rebase_result(
                         intent, observed,
-                        current_remote_oid=intent["expected"]["remote_oid"],
-                        target_ancestor=True, patches_preserved=True,
-                        reflog_marker=True, autostash_owned=True,
+                        current_remote_oid=remote_oid,
+                        target_ancestor=ancestor, patches_preserved=patches_preserved,
+                        reflog_marker=marker, autostash_owned=True,
+                        accepted_correction=accepted_correction,
                         replay_verified=replay_verified,
                     )
                 except (KeyError, TypeError, ValueError) as error:

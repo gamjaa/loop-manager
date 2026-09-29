@@ -383,6 +383,8 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 - 관리 rebase는 실행 전 소유권·원격 OID·대상 base·원본 commit 순서를 고정한다. 충돌 해결 때 승인한 stage tree는 해당 원본의 실제 재생 commit과 parent에 대해 검증하고, 나머지는 원본별 patch 보존 또는 승인된 skip 근거로 순서대로 대조한다. 이후 commit이 같은 파일을 변경해도 이전 해결 당시의 파일 signature를 최종 worktree에 다시 요구하지 않는다
 - 중단 후에는 저장된 rebase 실행·교정·stage·재생 증거와 현재 HEAD·branch ref·worktree 등록·원격 OID·index·작업 파일·Git operation을 재검증해 이미 완료한 Git 단계만 확정한다. 증거가 불완전하거나 단계가 불일치하면 작업물과 감사를 보존하고 기존 안전 차단을 유지한다. 후보 revision이 바뀌면 게시 전 필요한 Worker 확인, targeted test, 전체 verify와 Review를 다시 수행한다
 - PR 없는 게시 checkpoint branch의 관리 rebase가 완료되면 완료 journal identity와 checkpoint generation, 원본·결과 HEAD, target base, Worker session 및 마지막 채택 원격 OID를 실행 checkpoint에 보존한다. 재진입 시 이 증거와 clean worktree·branch ref·등록 identity·원격 lease를 다시 대조해 로컬 HEAD가 게시 OID와 달라도 소유권을 유지하며, 이후 후보 commit과 push는 기존 검증 및 원격 lease 규칙을 따른다
+
+- journal 완료 결과는 현재 소유 Git 상태와 해당 실행·Worker session·재생 증거가 일치할 때만 채택한다. journal 결과 identity와 checkpoint generation을 결합한 뒤 rebase 하위 단계를 정리하고 ExecPlan 실행 row·프로젝트 투영을 같은 SQLite transaction에서 갱신한다. journal 확정 뒤 SQLite 반영 전에 중단되면 같은 완료 결과를 재검증해 한 번만 적용한다. 구 형식 intent의 승인 staged tree는 실제 해결 commit과 나머지 원본 재생에 유일하게 연결될 때만 복구하며, clean HEAD나 base ancestry만으로 부족한 감사를 만들어내지 않는다. 이후 원격 base 전진은 과거 완료 사실과 새 rebase 필요성을 별도로 판정한다
 - PR 생성 직전에 최신 `origin/<base-branch>`를 확인하고 변경됐으면 rebase 후 전체 검증과 Review를 다시 통과해야 한다
 - 게시 직전 archive eligibility가 검증된 이동 집합과 다르면 같은 Worker 세션으로 돌아가 전체 검증과 Review를 다시 수행한다
 - 관련 테스트와 전체 검증이 통과해야 한다

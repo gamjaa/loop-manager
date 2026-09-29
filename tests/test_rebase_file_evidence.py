@@ -45,9 +45,10 @@ class AutostashFileEvidenceTests(unittest.TestCase):
                     patches_preserved=True, reflog_marker=True,
                 ),
             ))
-            self.assertEqual(len(journal.verified_managed_transitions(
-                state, '/repo', 'plan:G-091',
-            )), 1)
+            with self.assertRaises(journal.MutationEvidenceError):
+                journal.verified_managed_transitions(
+                    state, '/repo', 'plan:G-091',
+                )
 
     def test_adjacent_edits_preserve_both_changes(self):
         base = ['a', 'b', 'c']

@@ -114,6 +114,17 @@ class ExecutionStatePort:
                 expected_catalog=expected_catalog,
             )
 
+    def complete_rebase(self, checkpoint_repository, *, completion, project_values,
+                        published_proof=None):
+        with self.connection:
+            expected = self.check()
+            if expected is None:
+                raise runtime_state.RuntimeStateError("execution projection이 없습니다.")
+            self.expected = self.repository.complete_rebase(
+                expected, checkpoint_repository, completion=completion,
+                project_values=project_values, published_proof=published_proof,
+            )
+
     def open_pull_request(self, repo, **values):
         if repo != self.repo:
             raise runtime_state.RuntimeStateError("execution repository identity 불일치")

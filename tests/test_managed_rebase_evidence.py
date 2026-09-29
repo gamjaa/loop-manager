@@ -295,7 +295,7 @@ class JournalReplayProofTests(unittest.TestCase):
                 state, owner='plan:G-099', repo='/repo', target='/worktree',
                 before={'head': 'a' * 40},
                 expected={'branch': 'loop-manager/G-099', 'remote_oid': None,
-                          'evidence_version': 2},
+                          'target_base_oid': 'a' * 40, 'evidence_version': 2},
             )
             journal.complete_rebase(
                 state, repo='/repo', target='/worktree',
@@ -303,19 +303,80 @@ class JournalReplayProofTests(unittest.TestCase):
                 validate=lambda *_: candidates,
                 replay_proof=lambda *_: proof,
             )
+            def owned_git(_path, *args, **_kwargs):
+                if args[:1] == ('rev-parse',):
+                    return SimpleNamespace(returncode=0, stdout=observed['head'] + '\n')
+                if args[:2] == ('merge-base', '--is-ancestor'):
+                    return SimpleNamespace(returncode=0, stdout='')
+                raise AssertionError(f'unexpected Git query: {args}')
+
             with (mock.patch.object(journal, 'rebase_replay_proof', return_value=proof),
                   mock.patch.object(journal, 'verified_rebase_result',
-                                    return_value=candidates)):
+                                    return_value=candidates),
+                  mock.patch.object(journal, 'rebase_completion_matches', return_value=True),
+                  mock.patch.object(journal, 'live_remote_branch_oid', return_value=None)):
                 self.assertEqual(len(journal.verified_managed_transitions(
-                    state, '/repo', 'plan:G-099', git=lambda *_: None,
+                    state, '/repo', 'plan:G-099', git=owned_git,
                 )), 1)
             with (mock.patch.object(journal, 'rebase_replay_proof', return_value=[]),
                   mock.patch.object(journal, 'verified_rebase_result',
                                     return_value=candidates)):
                 with self.assertRaises(journal.MutationEvidenceError):
                     journal.verified_managed_transitions(
-                        state, '/repo', 'plan:G-099', git=lambda *_: None,
+                        state, '/repo', 'plan:G-099', git=owned_git,
                     )
+
+    def test_sealed_rebase_remains_owned_after_later_commit_with_finish_receipt(self):
+        with TemporaryDirectory() as directory:
+            state = Path(directory)
+            before_head = 'a' * 40
+            sealed_head = 'b' * 40
+            current_head = 'c' * 40
+            branch = 'loop-manager/G-099'
+            observed = {
+                'head': sealed_head, 'index': {}, 'dirty': {},
+                'registration': [f'HEAD={sealed_head}'],
+                'index_clean': True, 'metadata': None,
+            }
+            candidates = {'selected': {'head': sealed_head}}
+            proof = [{'source': before_head, 'replayed': sealed_head}]
+            identity = journal.begin_rebase(
+                state, owner='plan:G-099', repo='/repo', target='/worktree',
+                before={'head': before_head},
+                expected={'branch': branch, 'before_head': before_head,
+                          'target_base_oid': before_head, 'remote_oid': None,
+                          'evidence_version': 2},
+            )
+            journal.complete_rebase(
+                state, repo='/repo', target='/worktree',
+                observe=lambda: observed, validate=lambda *_: candidates,
+                replay_proof=lambda *_: proof,
+            )
+            finish = (f'{sealed_head}\0loop-manager-rebase:{identity} '
+                      f'(finish): refs/heads/{branch} onto {before_head}\n')
+            receipts = {'reflog': finish}
+
+            def owned_git(_path, *args, **_kwargs):
+                if args[:1] == ('rev-parse',):
+                    return SimpleNamespace(returncode=0, stdout=current_head + '\n')
+                if args[:1] == ('merge-base',):
+                    return SimpleNamespace(returncode=0, stdout='')
+                if args[:1] == ('reflog',):
+                    return SimpleNamespace(returncode=0, stdout=receipts['reflog'])
+                raise AssertionError(f'unexpected Git query: {args}')
+
+            with (mock.patch.object(journal, 'rebase_replay_proof', return_value=proof),
+                  mock.patch.object(journal, 'verified_rebase_result',
+                                    return_value=candidates),
+                  mock.patch.object(journal, 'live_remote_branch_oid') as remote):
+                self.assertEqual(len(journal.verified_managed_transitions(
+                    state, '/repo', 'plan:G-099', git=owned_git,
+                )), 1)
+                remote.assert_not_called()
+                receipts['reflog'] = ''
+                self.assertEqual(journal.verified_managed_transitions(
+                    state, '/repo', 'plan:G-099', git=owned_git,
+                ), [])
 
 
     def test_unchanged_rebase_requires_its_own_successful_invocation(self):
@@ -486,6 +547,11 @@ class RealGitJournalReplayTests(unittest.TestCase):
             repo = root / 'repo'
             state = root / 'state'
             state.mkdir()
+            origin = root / 'origin.git'
+            subprocess.run(
+                ['git', 'init', '--bare', str(origin)], check=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
             subprocess.run(
                 ['git', 'init', '-b', 'main', str(repo)], check=True,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -496,6 +562,7 @@ class RealGitJournalReplayTests(unittest.TestCase):
 
             git('config', 'user.name', 'Rebase Test')
             git('config', 'user.email', 'rebase@example.test')
+            git('remote', 'add', 'origin', str(origin))
             app = repo / 'app.txt'
             original_lines = ['value=initial\n'] + [f'line-{n}\n' for n in range(1, 25)]
             app.write_text(''.join(original_lines), encoding='utf-8')
