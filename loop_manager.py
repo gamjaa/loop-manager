@@ -58,6 +58,7 @@ import work_exhaustion
 import reviewer_specification
 import blocked_checkpoint
 import blocked_checkpoint_state
+import blocked_remote_observation
 import execplan_archive
 import execplan_archive_state
 import requirement_archive
@@ -1891,6 +1892,7 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
     if not getattr(connection, "execplans_schema_ready", False):
         recovery_state.ensure_schema(connection)
     blocked_checkpoint_state.ensure_schema(connection)
+    blocked_remote_observation.ensure_schema(connection)
     connection.execute("DROP INDEX IF EXISTS one_active_execplan_per_project")
     connection.execute(EXEC_PLANS_ACTIVE_INDEX)
     scoped_blocking.migrate_legacy_blocks(connection)
@@ -1920,6 +1922,7 @@ def connect_database(
         maintenance_state.ensure_schema(connection)
         notifications.ensure_schema(connection)
         blocked_checkpoint_state.ensure_schema(connection)
+        blocked_remote_observation.ensure_schema(connection)
         connection.commit()
     else:
         try:
@@ -1989,6 +1992,7 @@ def connect_database(
     maintenance_state.ensure_schema(connection)
     notifications.ensure_schema(connection)
     blocked_checkpoint_state.ensure_schema(connection)
+    blocked_remote_observation.ensure_schema(connection)
     connection.commit()
     # Repository-aware migrations belong in run_project, after persisted Agent
     # config has been checked against its pre-invocation snapshot.
@@ -20639,6 +20643,68 @@ def reconcile_false_positive_runtime_block(
     return True
 
 
+def observe_blocked_plan_remotes(
+    connection: sqlite3.Connection, repo_path: Path, repo: str,
+    project: sqlite3.Row,
+) -> None:
+    """Persist blocked-plan remote input before any project execution gate."""
+
+    blocked_remote_observation.ensure_schema(connection)
+    project_block = scoped_blocking.project_block(connection, repo)
+    linked_plan_id = str(project_block["plan_id"] or "") if project_block else ""
+    plans = connection.execute(
+        "SELECT * FROM exec_plans WHERE repo = ? AND "
+        "(status = 'PLAN_BLOCKED' OR plan_id = ?) ORDER BY plan_id",
+        (repo, linked_plan_id),
+    ).fetchall()
+    if not plans:
+        return
+    configured = git(repo_path, "remote", "get-url", "origin", check=False)
+    origin = configured.stdout.strip() if configured.returncode == 0 else ""
+    registered_origin = str(project["origin"] or "")
+    if registered_origin and origin:
+        try:
+            origin_identity = github_repository(origin)
+        except RuntimeError:
+            origin_identity = origin
+        if origin_identity != registered_origin:
+            origin = ""
+    base_ref = f"refs/heads/{project['base_branch']}"
+    for plan in plans:
+        branch_ref = f"refs/heads/{plan['branch']}" if plan["branch"] else ""
+        base, branch = blocked_remote_observation.observe_refs(
+            repo_path, origin, (base_ref, branch_ref),
+        )
+        block = connection.execute(
+            "SELECT reason_code, release_fingerprint FROM execplan_blocks "
+            "WHERE repo = ? AND plan_id = ?",
+            (repo, plan["plan_id"]),
+        ).fetchone()
+        reason = (
+            str(block["reason_code"]) if block else
+            str(project_block["reason_code"]) if project_block and linked_plan_id == plan["plan_id"] else
+            str(plan["blocked_reason"] or "")
+        )
+        fingerprint = (
+            str(block["release_fingerprint"] or "") if block else
+            str(plan["blocked_fingerprint"] or "")
+        )
+        worktree_fingerprint = str(plan["blocked_worktree_fingerprint"] or "")
+        if plan["worktree"]:
+            try:
+                worktree_fingerprint = _worktree_state_signature(Path(plan["worktree"]))
+            except (OSError, RuntimeError, ValueError):
+                worktree_fingerprint = "unavailable"
+        blocked_remote_observation.record(
+            connection, repo=repo, plan_id=str(plan["plan_id"]),
+            origin_url=origin or None, base_ref=base_ref, branch_ref=branch_ref,
+            base=base, branch=branch, blocked_reason=reason,
+            blocked_fingerprint=fingerprint,
+            worktree_fingerprint=worktree_fingerprint,
+        )
+    connection.commit()
+
+
 def _run_project_step(
     connection: sqlite3.Connection,
     state_dir: Path,
@@ -20684,6 +20750,8 @@ def _run_project_step(
         raise RuntimeError(
             f"등록된 provider는 {provider}이며 {requested_provider}로 변경할 수 없습니다."
         )
+    if row is not None:
+        observe_blocked_plan_remotes(connection, repo_path, repo, row)
     _ensure_cleanup_pending_schema(connection)
     initial_project_block = (
         scoped_blocking.project_block(connection, repo) if row is not None else None
