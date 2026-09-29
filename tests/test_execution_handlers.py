@@ -38,6 +38,134 @@ VALID_WORKER_RESULT = 'WORKER_OUTCOME: {"kind":"ready_for_validation"}\nvalid re
 
 
 class ExecutionHandlerTests(TestCase):
+    def test_real_git_published_review_release_restart_and_correction(self):
+        # Exercise the ownership boundary with real commits, refs, registration,
+        # snapshots and SQLite persistence; only external PR/agent services are fake.
+        fixture = BlockedCheckpointGitAdapterTest(methodName='runTest')
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        self.addCleanup(fixture.tearDown)
+        repo = str(fixture.repo.resolve())
+        branch = 'loop-manager/G-034'
+        connection = fixture.connection
+        connection.execute(
+            "UPDATE exec_plans SET review_result = 'code.py: repair\nVERDICT: FAIL', "
+            "worker_session_id = 'saved-worker'",
+        )
+        (fixture.worktree / 'code.py').write_text('checkpoint work\n')
+        fixture.block('review_retry_exhausted', 'code.py: repair')
+        with mock.patch.object(lm, 'pr_for_branch', return_value=None):
+            self.assertEqual(lm.dispatch_blocked_checkpoints(
+                connection, fixture.repo, fixture.state_dir, repo,
+            ), 1)
+        published = fixture.run_git(fixture.worktree, 'rev-parse', 'HEAD')
+        original = dict(connection.execute(
+            "SELECT * FROM blocked_checkpoints WHERE plan_id = 'G-034'",
+        ).fetchone())
+        self.assertEqual(original['published_oid'], published)
+        self.assertEqual(original['accepted_remote_oid'], published)
+        self.assertEqual(original['tree_oid'], fixture.run_git(
+            fixture.worktree, 'rev-parse', f'{published}^{{tree}}',
+        ))
+        self.assertIn(f"Checkpoint-Identity: {original['commit_identity']}",
+                      fixture.run_git(fixture.worktree, 'show', '-s', '--format=%B', published))
+
+        def plan_row():
+            return fixture.connection.execute(
+                "SELECT * FROM exec_plans WHERE plan_id = 'G-034'",
+            ).fetchone()
+
+        with mock.patch.object(lm, 'pr_for_branch', return_value=None):
+            # A real published commit must not excuse corrupted durable evidence.
+            for column in ('request_identity', 'commit_identity', 'tree_oid'):
+                with self.subTest(column=column):
+                    connection.execute(
+                        f"UPDATE blocked_checkpoints SET {column} = 'invalid'",
+                    )
+                    self.assertFalse(lm._resume_legacy_review_count_block(
+                        connection, fixture.repo, fixture.state_dir, repo, plan_row(),
+                    ))
+                    connection.execute(
+                        f"UPDATE blocked_checkpoints SET {column} = ?", (original[column],),
+                    )
+            self.assertTrue(lm._resume_legacy_review_count_block(
+                connection, fixture.repo, fixture.state_dir, repo, plan_row(),
+            ))
+        self.assertEqual(plan_row()['status'], 'IMPLEMENTING')
+        self.assertEqual(plan_row()['worker_session_id'], 'saved-worker')
+        self.assertIn('VERDICT: FAIL', plan_row()['review_result'])
+        self.assertIsNone(scoped_blocking.plan_block(connection, repo, 'G-034'))
+
+        # Close the original connection and reconstruct both repositories and
+        # handler, so ownership cannot depend on in-process state from release.
+        database = fixture.state_dir / 'restart.db'
+        connection.commit()
+        with sqlite3.connect(database) as persisted:
+            connection.backup(persisted)
+        connection.close()
+        fixture.connection = sqlite3.connect(database)
+        fixture.connection.row_factory = sqlite3.Row
+        connection = fixture.connection
+        lm.hydrate_execplan_project(connection, repo, plan_row())
+        checkpoint = ExecutionCheckpointRepository(connection)
+        effects = replace(
+            self.effects,
+            state=ExecutionStatePort(connection, runtime_state.RuntimeStateRepository(connection), repo),
+            checkpoint=checkpoint,
+            workspace=replace(
+                self.effects.workspace, git=lm.git,
+                validate_execplan_workspace_identity=lm.validate_execplan_workspace_identity,
+                validate_managed_worktree=lm.validate_managed_worktree,
+            ),
+        )
+        handler = handlers.ExecutionHandlers(
+            effects, repo=repo, repo_path=fixture.repo, state_dir=fixture.state_dir,
+            base='main', base_sha=fixture.base_oid, provider='codex',
+            config_path=Path('/config'), newly_activated=False,
+        )
+        context = SimpleNamespace(
+            plan=SimpleNamespace(plan_id='G-034'), branch=branch,
+            worktree=fixture.worktree, active_sha=fixture.base_oid,
+        )
+
+        def assert_owned(expected):
+            saved = checkpoint.get(repo, 'G-034')
+            self.assertNotIn('blocked_resume', saved.snapshot)
+            self.assertEqual(saved.snapshot['published_review_resume']['owner_oid'], published)
+            self.assertEqual(handler._owned_checkpoint_remote(
+                context, plan_row(), published, saved,
+            ), expected)
+
+        assert_owned(True)
+        before = lm.capture_git_snapshot(fixture.worktree)
+        (fixture.worktree / 'code.py').write_text('review correction\n')
+        lm.validate_agent_scope(
+            'worker', fixture.worktree, before, lm.capture_git_snapshot(fixture.worktree),
+            selected_plan_path=plan_row()['path'],
+        )
+        fixture.run_git(fixture.worktree, 'add', '--', 'code.py')
+        handler._commit_owned(context, 'Repair review issue')
+        corrected = fixture.run_git(fixture.worktree, 'rev-parse', 'HEAD')
+        self.assertNotEqual(corrected, published)
+        self.assertEqual(fixture.run_git(fixture.worktree, 'rev-parse', 'HEAD^'), published)
+        self.assertEqual(checkpoint.get(repo, 'G-034').snapshot['commit_tree_oid'],
+                         fixture.run_git(fixture.worktree, 'rev-parse', 'HEAD^{tree}'))
+        assert_owned(True)
+        self.assertEqual(lm.git(fixture.repo, 'ls-remote', '--heads', 'origin',
+                               f'refs/heads/{branch}').stdout.split()[0], published)
+        self.assertEqual(dict(connection.execute(
+            "SELECT * FROM blocked_checkpoints WHERE plan_id = 'G-034'",
+        ).fetchone()), original)
+        effects.validation.verify.assert_not_called()
+        effects.agent.run_agent.assert_not_called()
+        effects.publication.push_managed_publication_branch.assert_not_called()
+        effects.publication.command.assert_not_called()
+        fixture.verify_probe.assert_not_called()
+        fixture.reviewer_probe.assert_not_called()
+        # A successor pushed by somebody else invalidates the same durable owner.
+        fixture.user_commit(contents='external correction\n')
+        assert_owned(False)
+
     def test_published_review_commit_correction_keeps_owner_on_restart(self):
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)
