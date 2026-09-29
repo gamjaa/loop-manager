@@ -1713,12 +1713,38 @@ class ExecutionHandlers:
         if current.operation != 'rebase':
             return
         head = self.effects.workspace.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
+        saved_snapshot = current.snapshot or {}
+        published = self.effects.state.connection.execute(
+            'SELECT phase, accepted_remote_oid FROM blocked_checkpoints '
+            'WHERE repo = ? AND plan_id = ?',
+            (self.repo, context.plan.plan_id),
+        ).fetchone()
+        if published is not None and published['phase'] == 'published':
+            row = self._row()
+            remote_oid = current.observed_remote_oid
+            if (not remote_oid
+                    or remote_oid != published['accepted_remote_oid']
+                    or row['publication_remote_oid'] not in (None, '', remote_oid)
+                    or not self._owned_completed_rebase(
+                        context, row, remote_oid, current, published, None, head,
+                    )):
+                raise manager_git_journal.MutationEvidenceError(
+                    '게시 checkpoint의 완료 rebase 소유권을 증명할 수 없습니다.'
+                )
+            completion = self._completed_rebase_proof(
+                context, current, remote_oid, self._rebase_journal_state(context),
+            )
+            if completion is None:
+                raise manager_git_journal.MutationEvidenceError(
+                    '게시 checkpoint의 완료 rebase journal identity가 다릅니다.'
+                )
+            saved_snapshot = {**saved_snapshot, 'completed_rebase': completion}
         checkpoint.record(
             self.repo, context.plan.plan_id,
             expected_generation=current.generation, operation=None,
             expected_head=head, target_base_oid=current.target_base_oid,
             observed_remote_oid=current.observed_remote_oid,
-            snapshot=current.snapshot,
+            snapshot=saved_snapshot,
         )
 
     def _publication_intent(self, context, operation, remote_oid):
