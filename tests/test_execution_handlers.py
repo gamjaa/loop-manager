@@ -385,6 +385,29 @@ class ExecutionHandlerTests(TestCase):
                 context, row, live['oid'], current,
             ))
 
+    def test_rebase_completion_session_handles_optional_snapshot(self):
+        context = SimpleNamespace(worker_session_id='current-session')
+        cases = (
+            ({}, 'current-session'),
+            ({'snapshot': None}, 'current-session'),
+            ({'snapshot': {}}, 'current-session'),
+            ({'snapshot': {'rebase_start_session_id': 'start-session'}},
+             'current-session'),
+            ({'snapshot': {'stash_oid': 'stash', 'pending': 'stage',
+                           'rebase_start_session_id': 'start-session'}},
+             'current-session'),
+            ({'snapshot': {'stash_oid': 'stash', 'pending': 'continue',
+                           'rebase_start_session_id': 'start-session'}},
+             'start-session'),
+            ({'snapshot': {'stash_oid': 'stash', 'pending': 'continue',
+                           'rebase_start_session_id': None}}, None),
+        )
+        for fields, expected in cases:
+            with self.subTest(fields=fields):
+                self.assertEqual(self.handler._rebase_completion_session(
+                    context, SimpleNamespace(**fields),
+                ), expected)
+
     def test_rebase_journal_match_requires_run_identity_only_for_v2(self):
         context = SimpleNamespace(
             plan=SimpleNamespace(plan_id='G-047'),

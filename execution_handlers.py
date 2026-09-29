@@ -586,7 +586,7 @@ class ExecutionHandlers:
 
     @staticmethod
     def _rebase_completion_session(context, current):
-        snapshot = current.snapshot or {}
+        snapshot = getattr(current, 'snapshot', None) or {}
         session = getattr(context, 'worker_session_id', None)
         if snapshot.get('stash_oid') and snapshot.get('pending') == 'continue':
             return snapshot.get('rebase_start_session_id', session)
