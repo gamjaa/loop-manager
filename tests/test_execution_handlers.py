@@ -38,6 +38,58 @@ VALID_WORKER_RESULT = 'WORKER_OUTCOME: {"kind":"ready_for_validation"}\nvalid re
 
 
 class ExecutionHandlerTests(TestCase):
+    def test_published_review_resume_rechecks_identity_and_live_owner(self):
+        blocked_checkpoint_state.ensure_schema(self.connection)
+        self.connection.execute(
+            "INSERT INTO blocked_checkpoints "
+            "(repo, plan_id, request_identity, phase, reason_code, evidence, "
+            "branch, worktree, accepted_remote_oid) "
+            "VALUES ('repo', 'G-047', 'request', 'published', "
+            "'review_retry_exhausted', 'review', 'loop-manager/G-047', "
+            "'/state/G-047', 'owned-head')"
+        )
+        context = self.context()
+        marker = {'request_identity': 'request', 'owner_oid': 'owned-head',
+                  'head': 'owned-head'}
+        current = SimpleNamespace(
+            operation=None, expected_head='owned-head',
+            snapshot={'published_review_resume': marker},
+            completed_rebase=lambda: None,
+        )
+        row = {'pr_url': None, 'publication_remote_oid': 'owned-head'}
+        live = {'oid': 'owned-head'}
+
+        def git(_path, *args, **_kwargs):
+            if args[0] == 'rev-parse':
+                return SimpleNamespace(stdout='owned-head\n', returncode=0)
+            if args[0] == 'ls-remote':
+                return SimpleNamespace(
+                    stdout=f"{live['oid']}\trefs/heads/loop-manager/G-047\n",
+                    returncode=0,
+                )
+            raise AssertionError(args)
+
+        self.effects.workspace.git.side_effect = git
+        with mock.patch.object(handlers.checkpoint_ownership, 'owned_remote_oid',
+                               return_value='owned-head'):
+            self.assertTrue(self.handler._owned_checkpoint_remote(
+                context, row, live['oid'], current,
+            ))
+            live['oid'] = 'external'
+            self.assertFalse(self.handler._owned_checkpoint_remote(
+                context, row, live['oid'], current,
+            ))
+            live['oid'] = 'owned-head'
+            marker['request_identity'] = 'other-request'
+            self.assertFalse(self.handler._owned_checkpoint_remote(
+                context, row, live['oid'], current,
+            ))
+            marker['request_identity'] = 'request'
+            row['publication_remote_oid'] = 'other-head'
+            self.assertFalse(self.handler._owned_checkpoint_remote(
+                context, row, live['oid'], current,
+            ))
+
     def test_rebase_journal_match_requires_run_identity_only_for_v2(self):
         context = SimpleNamespace(
             plan=SimpleNamespace(plan_id='G-047'),

@@ -294,7 +294,8 @@ class ExecutionHandlers:
     ):
         """Require the published checkpoint's durable owner on an active resume."""
         checkpoint = self.effects.state.connection.execute(
-            'SELECT phase, accepted_remote_oid FROM blocked_checkpoints '
+            'SELECT phase, accepted_remote_oid, request_identity, branch, worktree '
+            'FROM blocked_checkpoints '
             'WHERE repo = ? AND plan_id = ?',
             (self.repo, context.plan.plan_id),
         ).fetchone()
@@ -321,6 +322,12 @@ class ExecutionHandlers:
         if current is not None and getattr(current, 'completed_rebase', lambda: None)():
             return self._owned_persisted_rebase(
                 context, row, remote_oid, current, checkpoint, pull_request,
+            )
+        review_resume = (current.snapshot or {}).get('published_review_resume') if current else None
+        if review_resume is not None and current.operation != 'rebase':
+            return self._owned_published_review_resume(
+                context, row, remote_oid, current, checkpoint,
+                review_resume, pull_request,
             )
         marker = (current.snapshot or {}).get('blocked_resume') if current else None
         if not marker and not row['publication_remote_oid']:
@@ -436,6 +443,74 @@ class ExecutionHandlers:
         return (live.returncode == 0 and
                 [line.split() for line in live.stdout.splitlines() if line.strip()]
                 == [[recorded_oid, f'refs/heads/{context.branch}']])
+
+    def _owned_published_review_resume(
+        self, context, row, remote_oid, current, checkpoint, marker, pull_request,
+    ):
+        """Recheck the original published owner without inventing rebase proof."""
+        original = str(checkpoint['accepted_remote_oid'] or '')
+        recorded = str(row['publication_remote_oid'] or '')
+        if (
+            not isinstance(marker, dict) or not original
+            or marker.get('request_identity') != checkpoint['request_identity']
+            or marker.get('owner_oid') != original
+            or marker.get('head') != original
+            or checkpoint['branch'] != context.branch
+            or checkpoint['worktree'] != str(context.worktree)
+            or (current.snapshot or {}).get('blocked_resume')
+            or row['pr_url']
+            or (pull_request is not None and current.operation != 'pr_create')
+            or (pull_request is not None
+                and pull_request.get('headRefOid') != remote_oid)
+        ):
+            return False
+        try:
+            self.effects.workspace.validate_execplan_workspace_identity(
+                self.state_dir, self.repo, context.plan.plan_id,
+                context.branch, context.worktree,
+            )
+            self.effects.workspace.validate_managed_worktree(
+                self.repo_path, context.worktree, context.branch,
+            )
+            local = self.effects.workspace.git(
+                context.worktree, 'rev-parse', 'HEAD',
+            ).stdout.strip()
+            branch_ref = self.effects.workspace.git(
+                self.repo_path, 'rev-parse', f'refs/heads/{context.branch}',
+            ).stdout.strip()
+            if local != branch_ref:
+                return False
+            if checkpoint_ownership.owned_remote_oid(
+                self.effects.state.connection, self.repo_path, self.repo,
+                context.plan.plan_id, context.branch, context.worktree,
+                original, self.effects.workspace.git,
+                before_head=local, require_live=False,
+            ) != original:
+                return False
+            pending_push = (
+                current.operation == 'push'
+                and (current.snapshot or {}).get('remote_before') == original
+                and current.expected_head == local == remote_oid
+                and recorded == original
+            )
+            if remote_oid == original and recorded == original:
+                expected_live = original
+            elif pending_push or (
+                remote_oid == recorded == local
+                and (current.snapshot or {}).get('pushed_checkpoint_head') == local
+            ):
+                expected_live = remote_oid
+            else:
+                return False
+            observed = self.effects.workspace.git(
+                self.repo_path, 'ls-remote', '--heads', 'origin',
+                f'refs/heads/{context.branch}', check=False,
+            )
+        except (RuntimeError, OSError):
+            return False
+        return (observed.returncode == 0 and
+                [line.split() for line in observed.stdout.splitlines() if line.strip()]
+                == [[expected_live, f'refs/heads/{context.branch}']])
 
     def _owned_detached_rebase(
         self, context, row, remote_oid, current, checkpoint, pull_request,
@@ -1850,6 +1925,9 @@ class ExecutionHandlers:
                         **({'blocked_resume': current.snapshot['blocked_resume']}
                            if current.snapshot and 'blocked_resume' in current.snapshot
                            else {}),
+                        **({'published_review_resume': current.snapshot['published_review_resume']}
+                           if current.snapshot and 'published_review_resume' in current.snapshot
+                           else {}),
                     },
                 )
             current = checkpoint.record(
@@ -1963,7 +2041,8 @@ class ExecutionHandlers:
             if (current.operation == 'push' and remote_oid == snapshot.local_head
                     or current.operation == 'pr_create' and pull_request is not None):
                 completed_push = current.operation == 'push'
-                if completed_push and (marker or current.completed_rebase()):
+                if completed_push and (marker or current.completed_rebase()
+                                       or (current.snapshot or {}).get('published_review_resume')):
                     self.effects.state.update_project(
                         self.repo, publication_remote_oid=remote_oid,
                     )
@@ -1977,6 +2056,7 @@ class ExecutionHandlers:
                               **({'pushed_checkpoint_head': snapshot.local_head}
                                  if completed_push and
                                  ((current.snapshot or {}).get('blocked_resume') or
+                                  (current.snapshot or {}).get('published_review_resume') or
                                   current.completed_rebase())
                                  else {})},
                 )

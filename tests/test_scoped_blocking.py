@@ -18,6 +18,163 @@ from scoped_blocking import BlockReasonCode, BlockScope
 
 
 class ScopedBlockingTest(unittest.TestCase):
+    def test_published_review_release_seals_owner_without_rebase_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            branch, oid = 'loop-manager/G-001', 'a' * 40
+            snapshot = loop_manager.GitSnapshot(
+                head=oid, branch=branch, index={}, dirty={}, refs={
+                    f'refs/heads/{branch}': (oid, ''),
+                    f'refs/remotes/origin/{branch}': (oid, ''),
+                }, worktrees={}, config={}, operations={},
+            )
+            self.plan('G-001', 'IMPLEMENTING', branch=branch)
+            with self.connection:
+                self.connection.execute(
+                    "UPDATE exec_plans SET worktree = ?, publication_remote_oid = ?, "
+                    "review_result = 'VERDICT: FAIL', agent_result_snapshot = ? "
+                    "WHERE repo = ? AND plan_id = 'G-001'",
+                    (str(worktree), oid, snapshot.serialize(), self.repo),
+                )
+                scoped_blocking.record_plan_block(
+                    self.connection, self.repo, 'G-001',
+                    BlockReasonCode.REVIEW_RETRY_EXHAUSTED, 'review failure', 'old',
+                )
+                self.connection.execute(
+                    "UPDATE blocked_checkpoints SET request_identity = ?, "
+                    "phase = 'published', "
+                    "result = 'published', branch = ?, worktree = ?, "
+                    "reason_code = 'review_retry_exhausted', published_oid = ?, "
+                    "accepted_remote_oid = ? WHERE repo = ? AND plan_id = 'G-001'",
+                    (blocked_checkpoint_state.request_identity(
+                        self.repo, 'G-001', 'review_retry_exhausted',
+                        'review failure', branch, str(worktree), 'old',
+                    ), branch, str(worktree), oid, oid, self.repo),
+                )
+            plan = self.connection.execute(
+                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+                (self.repo,),
+            ).fetchone()
+            with (
+                mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
+                mock.patch.object(loop_manager, 'validate_managed_worktree'),
+                mock.patch.object(loop_manager, 'validate_blocked_agent_scope'),
+                mock.patch.object(loop_manager, '_rebase_in_progress_for_branch', return_value=False),
+                mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=snapshot),
+                mock.patch.object(loop_manager, 'remote_branch_oid', return_value=oid),
+                mock.patch.object(loop_manager, 'pr_for_branch', return_value=None),
+                mock.patch.object(loop_manager.checkpoint_ownership, 'owned_remote_oid',
+                                  return_value=oid) as owner,
+                mock.patch.object(loop_manager, 'git', return_value=SimpleNamespace(
+                    stdout=f'{oid}\trefs/heads/{branch}\n', returncode=0,
+                )),
+            ):
+                self.connection.execute(
+                    "UPDATE blocked_checkpoints SET request_identity = 'wrong' "
+                    "WHERE repo = ? AND plan_id = 'G-001'", (self.repo,),
+                )
+                self.assertFalse(loop_manager._resume_legacy_review_count_block(
+                    self.connection, Path(self.repo), Path('/state'), self.repo, plan,
+                ))
+                self.connection.execute(
+                    "UPDATE blocked_checkpoints SET request_identity = ? "
+                    "WHERE repo = ? AND plan_id = 'G-001'",
+                    (blocked_checkpoint_state.request_identity(
+                        self.repo, 'G-001', 'review_retry_exhausted',
+                        'review failure', branch, str(worktree), 'old',
+                    ), self.repo),
+                )
+                owner.return_value = None
+                self.assertFalse(loop_manager._resume_legacy_review_count_block(
+                    self.connection, Path(self.repo), Path('/state'), self.repo, plan,
+                ))
+                owner.return_value = oid
+                self.assertTrue(loop_manager._resume_legacy_review_count_block(
+                    self.connection, Path(self.repo), Path('/state'), self.repo, plan,
+                ))
+            saved = execution_checkpoint_state.ExecutionCheckpointRepository(
+                self.connection,
+            ).get(self.repo, 'G-001')
+            self.assertEqual(saved.snapshot['published_review_resume']['owner_oid'], oid)
+            self.assertNotIn('blocked_resume', saved.snapshot)
+            self.assertEqual(self.connection.execute(
+                "SELECT publication_remote_oid FROM exec_plans WHERE repo = ? "
+                "AND plan_id = 'G-001'", (self.repo,),
+            ).fetchone()[0], oid)
+
+    def test_project_ownership_block_recovers_unrebased_review_owner(self):
+        branch, oid, worktree = 'loop-manager/G-001', 'a' * 40, Path('/managed')
+        plan = self.plan('G-001', 'IMPLEMENTING', branch=branch)
+        with self.connection:
+            self.connection.execute(
+                "UPDATE exec_plans SET worktree = ?, publication_remote_oid = ? "
+                "WHERE repo = ? AND plan_id = 'G-001'",
+                (str(worktree), oid, self.repo),
+            )
+            self.connection.execute(
+                "UPDATE projects SET phase = 'PROJECT_BLOCKED', plan_path = ?, "
+                "branch = ?, worktree = ? WHERE repo = ?",
+                (plan['path'], branch, str(worktree), self.repo),
+            )
+            self.connection.execute(
+                "INSERT INTO project_blocks "
+                "(repo, scope, reason_code, plan_id, evidence, previous_phase) "
+                "VALUES (?, 'project', 'publication_ownership_uncertain', "
+                "'G-001', 'uncertain', 'WORKING')", (self.repo,),
+            )
+            self.connection.execute(
+                "INSERT INTO blocked_checkpoints "
+                "(repo, plan_id, request_identity, phase, reason_code, evidence, "
+                "branch, worktree, accepted_remote_oid) "
+                "VALUES (?, 'G-001', 'request', 'published', "
+                "'review_retry_exhausted', 'review', ?, ?, ?)",
+                (self.repo, branch, str(worktree), oid),
+            )
+            execution_checkpoint_state.ExecutionCheckpointRepository(
+                self.connection,
+            ).record(
+                self.repo, 'G-001', expected_generation=0, operation=None,
+                expected_head=oid, target_base_oid=None,
+                observed_remote_oid=oid,
+                snapshot={'reactivated_from_head': oid},
+            )
+        current = SimpleNamespace(
+            head=oid, branch=branch, operations={}, dirty={}, index={},
+            shared_metadata_complete=True, refs={
+                f'refs/heads/{branch}': (oid, ''),
+                f'refs/remotes/origin/{branch}': (oid, ''),
+            },
+        )
+        with (
+            mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
+            mock.patch.object(loop_manager, 'validate_managed_worktree'),
+            mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=current),
+            mock.patch.object(loop_manager, 'remote_branch_oid', return_value=oid) as remote,
+            mock.patch.object(loop_manager, 'pr_for_branch', return_value=None),
+            mock.patch.object(loop_manager.checkpoint_ownership, 'owned_remote_oid',
+                              return_value=oid),
+        ):
+            remote.return_value = 'external'
+            self.assertFalse(loop_manager.resume_project_block_if_safe(
+                self.connection, Path(self.repo), Path('/state'), self.repo,
+            ))
+            remote.return_value = oid
+            current.refs[f'refs/heads/{branch}'] = ('other-local', '')
+            self.assertFalse(loop_manager.resume_project_block_if_safe(
+                self.connection, Path(self.repo), Path('/state'), self.repo,
+            ))
+            current.refs[f'refs/heads/{branch}'] = (oid, '')
+            self.assertTrue(loop_manager.resume_project_block_if_safe(
+                self.connection, Path(self.repo), Path('/state'), self.repo,
+            ))
+        self.assertIsNone(scoped_blocking.project_block(self.connection, self.repo))
+        saved = execution_checkpoint_state.ExecutionCheckpointRepository(
+            self.connection,
+        ).get(self.repo, 'G-001')
+        self.assertEqual(saved.snapshot['published_review_resume'], {
+            'request_identity': 'request', 'owner_oid': oid, 'head': oid,
+        })
+
     def test_published_review_checkpoint_reconciles_before_legacy_count_release(self):
         self.plan('G-001', 'IMPLEMENTING', branch='loop-manager/G-001')
         loop_manager.runtime_state.RuntimeStateRepository(self.connection).block_plan(
