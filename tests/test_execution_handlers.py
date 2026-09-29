@@ -2992,9 +2992,18 @@ class ExecutionHandlerTests(TestCase):
             },
             'result': {'observed': observed},
         }
+        self.handler._complete_rebase_intent = (
+            handlers.ExecutionHandlers._complete_rebase_intent.__get__(self.handler)
+        )
+        self.handler._rebase_journal_checks = mock.Mock(return_value=(
+            mock.Mock(), mock.Mock(),
+        ))
         with (
             mock.patch.object(self.handler, '_owned_completed_rebase',
                               return_value=True),
+            mock.patch.object(handlers.manager_git_journal,
+                              'verified_rebase_completion',
+                              return_value=transition),
             mock.patch.object(handlers.manager_git_journal,
                               'verified_managed_transitions', return_value=[])
             as transitions,
