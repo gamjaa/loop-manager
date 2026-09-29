@@ -584,13 +584,28 @@ class ExecutionHandlers:
         except (RuntimeError, OSError, UnicodeError, KeyError, TypeError):
             return False
 
+    @staticmethod
+    def _rebase_completion_session(context, current):
+        snapshot = current.snapshot or {}
+        session = getattr(context, 'worker_session_id', None)
+        if snapshot.get('stash_oid') and snapshot.get('pending') == 'continue':
+            return snapshot.get('rebase_start_session_id', session)
+        return session
+
     def _matching_rebase_journal_result(self, context, current, remote_oid,
                                         observed, *, allow_later_file_changes=False):
         checkpoint_snapshot = getattr(current, 'snapshot', None) or {}
 
-        def matches(saved):
+        def matches(item):
+            saved = item['result']['observed']
             if not allow_later_file_changes:
-                return saved == observed
+                return saved == observed or (
+                    checkpoint_snapshot.get('stash_oid')
+                    and checkpoint_snapshot.get('pending') == 'continue'
+                    and self._completed_autostash_correction(
+                        context, item['intent'], saved, observed,
+                    )
+                )
             # The sealed rebase result owns Git's progress, not subsequent
             # Worker edits to conflict files and their index entries.
             return all(saved.get(field) == observed.get(field) for field in (
@@ -609,11 +624,11 @@ class ExecutionHandlers:
             and item['intent']['expected']['before_head'] == current.expected_head
             and item['intent']['expected']['target_base_oid'] == current.target_base_oid
             and item['intent']['expected']['remote_oid'] == remote_oid
-            and matches(item['result']['observed'])
+            and matches(item)
             for item in manager_git_journal.verified_managed_transitions(
                 self.state_dir, str(self.repo_path.resolve()),
                 f'plan:{context.plan.plan_id}',
-                agent_session_id=getattr(context, 'worker_session_id', None),
+                agent_session_id=self._rebase_completion_session(context, current),
                 git=self.effects.workspace.git,
             )
         )
@@ -760,7 +775,7 @@ class ExecutionHandlers:
         for item in manager_git_journal.verified_managed_transitions(
             self.state_dir, str(self.repo_path.resolve()),
             f'plan:{context.plan.plan_id}',
-            agent_session_id=getattr(context, 'worker_session_id', None),
+            agent_session_id=self._rebase_completion_session(context, current),
             git=self.effects.workspace.git,
         ):
             expected = item['intent']['expected']
@@ -783,7 +798,7 @@ class ExecutionHandlers:
                     'remote_oid': remote_oid,
                     'branch': context.branch,
                     'worktree': str(context.worktree.resolve()),
-                    'session': getattr(context, 'worker_session_id', None),
+                    'session': self._rebase_completion_session(context, current),
                 }
         return None
 
@@ -1903,12 +1918,7 @@ class ExecutionHandlers:
         if current.operation != 'rebase':
             return
         proof, validate = self._rebase_journal_checks(context)
-        completion_session = getattr(context, 'worker_session_id', None)
-        if ((current.snapshot or {}).get('stash_oid')
-                and (current.snapshot or {}).get('pending') == 'continue'):
-            completion_session = (current.snapshot or {}).get(
-                'rebase_start_session_id', completion_session,
-            )
+        completion_session = self._rebase_completion_session(context, current)
         correction_rejections = []
         try:
             result = manager_git_journal.verified_rebase_completion(

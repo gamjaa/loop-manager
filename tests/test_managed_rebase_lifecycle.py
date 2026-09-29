@@ -37,7 +37,19 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
     def test_pr_multiconflict_skip_restart_verify_review(self):
         self._lifecycle(with_pr=True)
 
-    def _lifecycle(self, *, with_pr):
+    def test_checkpoint_restart_after_journal_seal_before_sqlite(self):
+        self._lifecycle(with_pr=False, sealed_restart=True)
+
+    def test_pr_restart_after_journal_seal_before_sqlite(self):
+        self._lifecycle(with_pr=True, sealed_restart=True)
+
+    def test_legacy_same_file_replay_restart_before_journal_seal(self):
+        self._lifecycle(with_pr=True, legacy=True)
+
+    def test_legacy_same_file_replay_restart_after_journal_seal(self):
+        self._lifecycle(with_pr=True, legacy=True, sealed_restart=True)
+
+    def _lifecycle(self, *, with_pr, legacy=False, sealed_restart=False):
         # Reuse only the deterministic service bundle, not the policy fixture's
         # substituted Manager rebase methods or its substituted journal writer.
         real_begin = journal.begin_rebase
@@ -91,7 +103,8 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
             changed = lines.copy()
             changed[0] = 'value=worker\n'
             commit('app.txt', ''.join(changed), 'Middle conflicting commit')
-            commit('skip.txt', 'worker\n', 'Second conflict to resolve as empty')
+            if not legacy:
+                commit('skip.txt', 'worker\n', 'Second conflict to resolve as empty')
             changed[20] = 'later-content\n'
             commit('app.txt', ''.join(changed), 'Later content and mode', executable=True)
             changed[12] = 'another-later-change\n'
@@ -221,6 +234,33 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                     checkpoint=ExecutionCheckpointRepository(connection))
                 return new_handler()
 
+            if legacy:
+                # Emit the pre-v2 journal format at creation time. Keep actual
+                # Git observations, approved tree and reflog invocation IDs;
+                # do not downgrade or rewrite any sealed modern receipt.
+                def begin_legacy(state_path, **kwargs):
+                    expected = kwargs['expected']
+                    kwargs['expected'] = {
+                        key: expected[key] for key in (
+                            'branch', 'before_head', 'target_base_oid',
+                            'remote_oid', 'affected_paths', 'agent_session_id',
+                            'action', 'accepted_files', 'staged_tree_oid',
+                        ) if key in expected
+                    }
+                    current = effects.checkpoint.get('repo', 'G-047')
+                    if (current.snapshot or {}).get('rebase_evidence_version') == 2:
+                        effects.checkpoint.record(
+                            'repo', 'G-047', expected_generation=current.generation,
+                            operation=current.operation, expected_head=current.expected_head,
+                            target_base_oid=current.target_base_oid,
+                            observed_remote_oid=current.observed_remote_oid,
+                            snapshot={key: value for key, value in current.snapshot.items()
+                                      if not key.startswith('rebase_')},
+                        )
+                    return real_begin(state_path, **kwargs)
+
+                journal.begin_rebase = begin_legacy
+
             handler = new_handler()
             handler._rebase_latest(handler._context(), handler._row(), target, publishing=with_pr)
             self.assertTrue(lm._rebase_in_progress_for_branch(worktree, branch))
@@ -229,9 +269,10 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
             self.assertNotIsInstance(conflict_context, ExecutionOutcome)
             self.assertTrue(conflict_context.resolving_rebase)
             self.assertEqual(events, [])
-            handler.run(conflict_context)
-            self.assertEqual(len(resolutions), 1)
-            self.assertEqual(git(worktree, 'diff', '--name-only', '--diff-filter=U').stdout.strip(), 'skip.txt')
+            if not legacy:
+                handler.run(conflict_context)
+                self.assertEqual(len(resolutions), 1)
+                self.assertEqual(git(worktree, 'diff', '--name-only', '--diff-filter=U').stdout.strip(), 'skip.txt')
             real_post = handler._post_rebase_observation
 
             def crash_after_git(context, target_oid, output, **kwargs):
@@ -239,13 +280,27 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                     raise SimulatedProcessExit()
                 return real_post(context, target_oid, output, **kwargs)
 
-            with mock.patch.object(handler, '_post_rebase_observation', side_effect=crash_after_git):
+            crash = (mock.patch.object(effects.state, 'complete_rebase',
+                                       side_effect=SimulatedProcessExit)
+                     if sealed_restart else mock.patch.object(
+                         handler, '_post_rebase_observation', side_effect=crash_after_git))
+            with crash:
                 with self.assertRaises(SimulatedProcessExit):
                     handler.run(handler._context())
-            self.assertEqual(len(resolutions), 2)
+            self.assertEqual(len(resolutions), 1 if legacy else 2)
             final_head = git(worktree, 'rev-parse', 'HEAD').stdout.strip()
             slot = journal._slot(state_dir, str(repo.resolve()), 'managed_rebase', str(worktree.resolve()))
-            self.assertTrue((slot / 'active.json').exists())
+            self.assertEqual((slot / 'active.json').exists(), not sealed_restart)
+            sealed_before = {path.name: path.read_bytes()
+                             for path in slot.glob('*.result.json')}
+            intents_before = {path.name: path.read_bytes()
+                              for path in slot.glob('*.intent.json')}
+            if sealed_restart:
+                final_results = [journal._read(path) for path in slot.glob('*.result.json')
+                                 if journal._read(path)['observed']['metadata'] is None]
+                self.assertEqual(len(final_results), 1)
+                sealed_id = final_results[0]['id']
+                self.assertIsNone(effects.checkpoint.get('repo', 'G-047').completed_rebase())
             self.assertEqual(effects.checkpoint.get('repo', 'G-047').operation, 'rebase')
             audit_before = handler.rebase_corrections.get('repo', 'G-047').audit
             handler = restart()
@@ -258,10 +313,17 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
             effects.workspace.git.side_effect = no_repeated_rebase
             recovered = handler.recover(handler._context())
             self.assertNotIsInstance(recovered, ExecutionOutcome)
-            self.assertIsNone(effects.checkpoint.get('repo', 'G-047').operation)
+            completed_checkpoint = effects.checkpoint.get('repo', 'G-047')
+            self.assertIsNone(completed_checkpoint.operation)
+            for name, content in {**sealed_before, **intents_before}.items():
+                self.assertEqual((slot / name).read_bytes(), content)
+            if sealed_restart:
+                self.assertEqual(completed_checkpoint.snapshot['rebase_completion']['id'], sealed_id)
+            handler._complete_rebase_intent(handler._context())
+            self.assertEqual(effects.checkpoint.get('repo', 'G-047'), completed_checkpoint)
             self.assertEqual(effects.state.row()['worker_session_id'], 'worker-session')
             self.assertEqual(handler.rebase_corrections.get('repo', 'G-047').audit, audit_before)
-            self.assertEqual(len(resolutions), 2)
+            self.assertEqual(len(resolutions), 1 if legacy else 2)
             transitions = journal.verified_managed_transitions(
                 state_dir, str(repo.resolve()), 'plan:G-047',
                 agent_session_id='worker-session', git=git)
@@ -270,7 +332,8 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
             self.assertEqual(len(completed), 1)
             proof = completed[0]['result']['replay_proof']
             self.assertEqual([item['outcome'] for item in proof],
-                             ['patch', 'resolved', 'skip', 'patch', 'patch'])
+                             (['patch', 'resolved', 'patch', 'patch'] if legacy else
+                              ['patch', 'resolved', 'skip', 'patch', 'patch']))
             self.assertNotEqual(proof[1]['tree'], proof[-1]['tree'])
             context = handler.guard(recovered)
             self.assertNotIsInstance(context, ExecutionOutcome)
@@ -283,7 +346,7 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
             self.assertEqual(reviewed.context.phase, ExecutionPhase.PUBLISHING, reviewed.detail)
             self.assertEqual(events.count('verify'), 1)
             self.assertEqual(events[-2:], ['verify', 'reviewer'])
-            self.assertEqual(len(resolutions), 2)
+            self.assertEqual(len(resolutions), 1 if legacy else 2)
             self.assertEqual(git(worktree, 'rev-parse', 'HEAD').stdout.strip(), final_head)
             self.assertIn('phase-bound candidate verified', effects.state.row()['verify_result'])
             effects.publication.push_managed_publication_branch.assert_not_called()
