@@ -16111,6 +16111,25 @@ def _reconcile_guidance_double_block(
     return True
 
 
+def _published_review_commit_intent_matches(
+    repo_path: Path, checkpoint: execution_checkpoint_state.CheckpointRecord,
+    head: str,
+) -> bool:
+    """Prove an unfinished Manager commit intent produced the current HEAD."""
+    saved = checkpoint.snapshot or {}
+    if (checkpoint.operation != 'commit' or not checkpoint.expected_head
+            or checkpoint.expected_head == head
+            or saved.get('before_head') != checkpoint.expected_head
+            or not saved.get('commit_message')):
+        return False
+    return (
+        git(repo_path, 'show', '-s', '--format=%P', head).stdout.strip()
+        == checkpoint.expected_head
+        and git(repo_path, 'show', '-s', '--format=%B', head).stdout.strip()
+        == str(saved['commit_message']).strip()
+    )
+
+
 def _resume_owned_checkpoint_project_block(
     connection: sqlite3.Connection, repo_path: Path, state_dir: Path,
     repo: str, block: sqlite3.Row, project: sqlite3.Row, plan: sqlite3.Row,
@@ -16147,6 +16166,8 @@ def _resume_owned_checkpoint_project_block(
     snapshot = checkpoint.snapshot or {}
     marker = snapshot.get('blocked_resume')
     review_marker = snapshot.get('published_review_resume')
+    if review_marker is not None and not isinstance(review_marker, dict):
+        return False
     try:
         validate_execplan_workspace_identity(state_dir, repo, plan_id, branch, worktree)
         validate_managed_worktree(repo_path, worktree, branch)
@@ -16168,14 +16189,23 @@ def _resume_owned_checkpoint_project_block(
                     or after_head != current.head):
                 return False
         else:
-            before_head = str(snapshot.get('reactivated_from_head') or '')
+            before_head = str(
+                (review_marker.get('head') if isinstance(review_marker, dict) else None)
+                or snapshot.get('reactivated_from_head') or ''
+            )
             after_head = current.head
             target_base = str(snapshot.get('base_oid') or checkpoint.target_base_oid or '')
             if not before_head:
                 return False
+        pending_review_commit = (
+            not marker and review_marker is not None
+            and _published_review_commit_intent_matches(
+                repo_path, checkpoint, current.head,
+            )
+        )
         direct_review = (
-            not marker and before_head == after_head == remote_oid
-            and checkpoint.expected_head == current.head
+            not marker and before_head == remote_oid
+            and (checkpoint.expected_head == current.head or pending_review_commit)
             and checkpoint.observed_remote_oid == remote_oid
             and (not plan['publication_remote_oid']
                  or plan['publication_remote_oid'] == remote_oid)
@@ -16195,7 +16225,7 @@ def _resume_owned_checkpoint_project_block(
                     or (review_marker and (
                         review_marker.get('request_identity') != published['request_identity']
                         or review_marker.get('owner_oid') != remote_oid
-                        or review_marker.get('head') != current.head
+                        or review_marker.get('head') != remote_oid
                     ))
                     or not current.shared_metadata_complete
                     or current.refs.get(f'refs/heads/{branch}') != (current.head, '')
@@ -16204,7 +16234,7 @@ def _resume_owned_checkpoint_project_block(
         elif not target_base:
             return False
         if (
-            checkpoint.expected_head != current.head
+            (checkpoint.expected_head != current.head and not pending_review_commit)
             or checkpoint.observed_remote_oid != remote_oid
             or (not direct_review and not _direct_rebase_history_proven(
                 connection, repo_path, repo, plan_id, worktree, branch,
@@ -16215,7 +16245,8 @@ def _resume_owned_checkpoint_project_block(
             return False
         owned_oid = checkpoint_ownership.owned_remote_oid(
             connection, repo_path, repo, plan_id, branch, worktree,
-            remote_oid, git, before_head=before_head,
+            remote_oid, git,
+            before_head=current.head if direct_review else before_head,
             recorded_oid=str(plan['publication_remote_oid'] or '') or None,
         )
         if owned_oid is None:
