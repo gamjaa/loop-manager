@@ -18,6 +18,61 @@ from scoped_blocking import BlockReasonCode, BlockScope
 
 
 class ScopedBlockingTest(unittest.TestCase):
+    def test_legacy_rebased_project_owner_uses_rebase_proof(self):
+        branch, published, rebased = 'loop-manager/G-001', 'a' * 40, 'b' * 40
+        worktree = Path('/managed')
+        plan = self.plan('G-001', 'IMPLEMENTING', branch=branch)
+        with self.connection:
+            self.connection.execute(
+                "UPDATE exec_plans SET worktree = ?, publication_remote_oid = NULL "
+                "WHERE repo = ? AND plan_id = 'G-001'",
+                (str(worktree), self.repo),
+            )
+            self.connection.execute(
+                "UPDATE projects SET phase = 'PROJECT_BLOCKED', plan_path = ?, "
+                "branch = ?, worktree = ? WHERE repo = ?",
+                (plan['path'], branch, str(worktree), self.repo),
+            )
+            self.connection.execute(
+                "INSERT INTO project_blocks "
+                "(repo, scope, reason_code, plan_id, evidence, previous_phase) "
+                "VALUES (?, 'project', 'publication_ownership_uncertain', "
+                "'G-001', 'old rebase projection', 'WORKING')", (self.repo,),
+            )
+            execution_checkpoint_state.ExecutionCheckpointRepository(
+                self.connection,
+            ).record(
+                self.repo, 'G-001', expected_generation=0, operation=None,
+                expected_head=rebased, target_base_oid='base',
+                observed_remote_oid=published,
+                snapshot={'reactivated_from_head': published,
+                          'base_oid': 'base'},
+            )
+        current = SimpleNamespace(
+            head=rebased, branch=branch, operations={}, dirty={}, index={},
+        )
+        with (
+            mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
+            mock.patch.object(loop_manager, 'validate_managed_worktree'),
+            mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=current),
+            mock.patch.object(loop_manager, 'remote_branch_oid', return_value=published),
+            mock.patch.object(loop_manager, 'pr_for_branch', return_value=None),
+            mock.patch.object(loop_manager, '_direct_rebase_history_proven',
+                              return_value=True) as rebase_proof,
+            mock.patch.object(loop_manager.checkpoint_ownership, 'owned_remote_oid',
+                              return_value=published),
+        ):
+            self.assertTrue(loop_manager.resume_project_block_if_safe(
+                self.connection, Path(self.repo), Path('/state'), self.repo,
+            ))
+        rebase_proof.assert_called_once()
+        saved = execution_checkpoint_state.ExecutionCheckpointRepository(
+            self.connection,
+        ).get(self.repo, 'G-001')
+        self.assertEqual(saved.snapshot['blocked_resume']['before_head'], published)
+        self.assertEqual(saved.snapshot['blocked_resume']['after_head'], rebased)
+        self.assertNotIn('published_review_resume', saved.snapshot)
+
     def test_project_owner_recovers_pending_unrebased_worker_commit(self):
         branch, published, corrected = 'loop-manager/G-001', 'a' * 40, 'b' * 40
         worktree = Path('/managed')

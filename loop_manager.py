@@ -16205,6 +16205,7 @@ def _resume_owned_checkpoint_project_block(
         )
         direct_review = (
             not marker and before_head == remote_oid
+            and (after_head == remote_oid or review_marker is not None)
             and (checkpoint.expected_head == current.head or pending_review_commit)
             and checkpoint.observed_remote_oid == remote_oid
             and (not plan['publication_remote_oid']
