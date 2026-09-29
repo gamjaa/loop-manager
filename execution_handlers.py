@@ -480,6 +480,13 @@ class ExecutionHandlers:
             ).stdout.strip()
             if local != branch_ref:
                 return False
+            if (current.operation == 'commit'
+                    and local != current.expected_head
+                    and not checkpoint_ownership.committed_tree_matches_intent(
+                        self.repo_path, current.expected_head, local,
+                        current.snapshot or {}, self.effects.workspace.git,
+                    )):
+                return False
             if checkpoint_ownership.owned_remote_oid(
                 self.effects.state.connection, self.repo_path, self.repo,
                 context.plan.plan_id, context.branch, context.worktree,
@@ -1851,13 +1858,17 @@ class ExecutionHandlers:
             before = self.effects.workspace.git(
                 context.worktree, 'rev-parse', 'HEAD'
             ).stdout.strip()
+            approved_tree = self.effects.workspace.git(
+                context.worktree, 'write-tree',
+            ).stdout.strip()
             checkpoint.record(
                 self.repo, context.plan.plan_id,
                 expected_generation=current.generation, operation='commit',
                 expected_head=before, target_base_oid=context.active_sha,
                 observed_remote_oid=current.observed_remote_oid,
                 snapshot={**(current.snapshot or {}),
-                          'commit_message': title, 'before_head': before},
+                          'commit_message': title, 'before_head': before,
+                          'commit_tree_oid': approved_tree},
             )
         result = self.effects.workspace.git(
             context.worktree, 'commit', '-m', title,

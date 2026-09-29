@@ -61,7 +61,9 @@ class ExecutionHandlerTests(TestCase):
             snapshot={'published_review_resume': {
                 'request_identity': 'request', 'owner_oid': 'old-head',
                 'head': 'old-head',
-            }},
+            }, 'before_head': 'old-head',
+                'commit_message': 'Worker correction',
+                'commit_tree_oid': 'c' * 40},
         )
 
         def observed_git(path, *args, **kwargs):
@@ -73,6 +75,12 @@ class ExecutionHandlerTests(TestCase):
                     stdout='old-head\trefs/heads/loop-manager/G-047\n',
                     returncode=0,
                 )
+            if args == ('show', '-s', '--format=%P', 'corrected-head'):
+                return SimpleNamespace(stdout='old-head\n', returncode=0)
+            if args == ('show', '-s', '--format=%B', 'corrected-head'):
+                return SimpleNamespace(stdout='Worker correction\n', returncode=0)
+            if args == ('rev-parse', 'corrected-head^{tree}'):
+                return SimpleNamespace(stdout='c' * 40 + '\n', returncode=0)
             return self.observed_git(path, *args, **kwargs)
 
         self.effects.workspace.git.side_effect = observed_git
@@ -3304,6 +3312,8 @@ class ExecutionHandlerTests(TestCase):
         def failing_git(path, *args, **kwargs):
             if args == ('rev-parse', 'HEAD'):
                 return SimpleNamespace(stdout='before-head\n', returncode=0)
+            if args == ('write-tree',):
+                return SimpleNamespace(stdout='c' * 40 + '\n', returncode=0)
             if args[0] == 'commit':
                 raise lm.GitLockError('index.lock')
             return self.git(path, *args, **kwargs)
@@ -3314,6 +3324,7 @@ class ExecutionHandlerTests(TestCase):
         saved = checkpoint.get('repo', 'G-047')
         self.assertEqual(saved.operation, 'commit')
         self.assertEqual(saved.expected_head, 'before-head')
+        self.assertEqual(saved.snapshot['commit_tree_oid'], 'c' * 40)
         self.assertEqual(self.state.row()['phase'], 'VERIFYING')
 
     def test_final_block_uses_current_verify_output_before_project_checkpoint(self):
