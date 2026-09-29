@@ -2345,11 +2345,16 @@ class ExecutionHandlerTests(TestCase):
             'result': {'observed': dict(observed)},
         }
         self.handler._rebase_journal_state.return_value = observed
-        self.effects.workspace.git.side_effect = lambda _path, *args, **_kw: (
-            SimpleNamespace(stdout='base\n', returncode=0)
-            if args[:2] == ('rev-parse', 'origin/main') else
-            SimpleNamespace(stdout='rebased\n', returncode=0)
-        )
+        base_state = {'oid': 'base', 'descends_from_target': True}
+        def git_for_owned_rebase(_path, *args, **_kwargs):
+            if args[:2] == ('rev-parse', 'origin/main'):
+                return SimpleNamespace(stdout=base_state['oid'] + '\n', returncode=0)
+            if args[:2] == ('merge-base', '--is-ancestor'):
+                return SimpleNamespace(
+                    stdout='', returncode=0 if base_state['descends_from_target'] else 1,
+                )
+            return SimpleNamespace(stdout='rebased\n', returncode=0)
+        self.effects.workspace.git.side_effect = git_for_owned_rebase
         row = {'pr_url': None, 'publication_remote_oid': 'remote'}
         with (
             mock.patch.object(handlers.checkpoint_ownership, 'owned_remote_oid',
@@ -2370,6 +2375,15 @@ class ExecutionHandlerTests(TestCase):
             self.assertTrue(self.handler._owned_checkpoint_remote(
                 context, row, 'remote', checkpoint.get('repo', 'G-047'),
             ))
+            base_state['oid'] = 'advanced-base'
+            self.assertTrue(self.handler._owned_checkpoint_remote(
+                context, row, 'remote', checkpoint.get('repo', 'G-047'),
+            ))
+            base_state['descends_from_target'] = False
+            self.assertFalse(self.handler._owned_checkpoint_remote(
+                context, row, 'remote', checkpoint.get('repo', 'G-047'),
+            ))
+            base_state.update(oid='base', descends_from_target=True)
             self.state.update_project('repo', worker_session_id='other-session')
             self.assertFalse(self.handler._owned_checkpoint_remote(
                 self.context(), row, 'remote', checkpoint.get('repo', 'G-047'),

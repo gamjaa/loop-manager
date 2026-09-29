@@ -594,9 +594,13 @@ class ExecutionHandlers:
             self.effects.workspace.validate_managed_worktree(
                 self.repo_path, context.worktree, context.branch,
             )
-            if self.effects.workspace.git(
+            observed_base = self.effects.workspace.git(
                 self.repo_path, 'rev-parse', f'origin/{self.base}',
-            ).stdout.strip() != proof['target_base_oid']:
+            ).stdout.strip()
+            if (not observed_base or self.effects.workspace.git(
+                    self.repo_path, 'merge-base', '--is-ancestor',
+                    proof['target_base_oid'], observed_base, check=False,
+            ).returncode != 0):
                 return False
             if checkpoint_ownership.owned_remote_oid(
                 self.effects.state.connection, self.repo_path, self.repo,
