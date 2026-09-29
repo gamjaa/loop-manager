@@ -9618,19 +9618,24 @@ def _complete_direct_rebase_checkpoint(
             raise manager_git_journal.MutationEvidenceError(
                 'direct rebase completion: preserved checkpoint marker changed'
             )
-        # The caller has already checked staged and dirty files. Only the
-        # checkpoint marker is written before this call; compare stable Git
-        # ownership fields here while the sealed journal checks the rebase.
-        preserved = bool(
-            preserved_worktree and isinstance(marker, dict)
-            and (all(observed.get(field) == preserved_observation.get(field)
-                     for field in ('head', 'branch', 'ref', 'registration',
-                                   'operations', 'metadata'))
-                 if preserved_observation is not None else
-                 _blocked_resume_worktree_matches(
-                     worktree, marker, capture_git_snapshot(worktree),
-                 ))
-        )
+        # The caller validated preserved files and staging before recording
+        # the marker. Recording it changes no Git state, so the entire live
+        # observation must still be identical, including dirty files/index.
+        if preserved_worktree and (
+            not isinstance(marker, dict) or preserved_observation is None
+        ):
+            raise manager_git_journal.MutationEvidenceError(
+                'direct rebase completion: preserved observation missing'
+            )
+        if preserved_observation is not None and observed != preserved_observation:
+            changed_fields = sorted(
+                field for field in observed.keys() | preserved_observation.keys()
+                if observed.get(field) != preserved_observation.get(field)
+            )
+            raise manager_git_journal.MutationEvidenceError(
+                f'direct rebase completion: observation drift={changed_fields}'
+            )
+        preserved = preserved_worktree
 
         transitions = manager_git_journal.verified_managed_transitions(
             state_dir, str(_canonical_path(repo_path)), f'plan:{plan_id}',
@@ -14879,8 +14884,7 @@ def _record_blocked_resume_head(
         operation='rebase' if active_rebase else None,
         expected_head=current.expected_head if active_rebase else after_head or before_head,
         target_base_oid=target_base_oid, observed_remote_oid=owner_oid,
-        snapshot={**(current.snapshot or {}), 'blocked_resume': marker}
-        if active_rebase else {'blocked_resume': marker},
+        snapshot={**(current.snapshot or {}), 'blocked_resume': marker},
     )
 
 

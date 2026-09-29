@@ -897,10 +897,6 @@ class ManagedTransitionTests(unittest.TestCase):
             'index': {}, 'dirty': {},
         }
         observed = {**sealed, 'dirty': {'app.py': [['staged'], 'accepted']}}
-        preserved_observation = {
-            **observed, 'dirty': {'app.py': [['unstaged'], 'accepted']},
-            'index': {'app.py': ['H 100644 before 0']},
-        }
         transition = {
             'intent': {'id': 'sealed', 'kind': 'managed_rebase',
                        'target': '/owned', 'expected': {
@@ -912,11 +908,6 @@ class ManagedTransitionTests(unittest.TestCase):
                                 return_value=Path('/state')),
               mock.patch.object(loop_manager, '_owned_rebase_journal_state',
                                 return_value=observed),
-              mock.patch.object(loop_manager, 'capture_git_snapshot',
-                                return_value=SimpleNamespace()),
-              mock.patch.object(loop_manager, '_blocked_resume_worktree_matches',
-                                side_effect=lambda _path, marker, _snapshot:
-                                marker['after_head'] is None),
               mock.patch.object(journal, 'verified_managed_transitions',
                                 return_value=[transition]),
               mock.patch.object(loop_manager.runtime_state,
@@ -928,26 +919,68 @@ class ManagedTransitionTests(unittest.TestCase):
                     repo_path=Path('/repo'), branch=BRANCH,
                     agent_session_id=None, preserved_worktree=True,
                 )
-            with self.assertRaisesRegex(
-                journal.MutationEvidenceError, "observation drift=.*'head'",
+            for changed_field, prior in (
+                ('head', {**observed, 'head': OLD}),
+                ('dirty', {**observed,
+                           'dirty': {'app.py': [['unstaged'], 'accepted']}}),
+                ('index', {**observed,
+                           'index': {'app.py': ['H 100644 before 0']}}),
             ):
-                loop_manager._complete_direct_rebase_checkpoint(
-                    connection, 'repo', 'G-091', Path('/owned'), NEW,
-                    repo_path=Path('/repo'), branch=BRANCH,
-                    agent_session_id=None, preserved_worktree=True,
-                    preserved_marker=original_marker,
-                    preserved_observation={**preserved_observation, 'head': OLD},
-                )
+                with self.subTest(changed_field=changed_field), self.assertRaisesRegex(
+                    journal.MutationEvidenceError,
+                    f"observation drift=.*'{changed_field}'",
+                ):
+                    loop_manager._complete_direct_rebase_checkpoint(
+                        connection, 'repo', 'G-091', Path('/owned'), NEW,
+                        repo_path=Path('/repo'), branch=BRANCH,
+                        agent_session_id=None, preserved_worktree=True,
+                        preserved_marker=original_marker,
+                        preserved_observation=prior,
+                    )
             loop_manager._complete_direct_rebase_checkpoint(
                 connection, 'repo', 'G-091', Path('/owned'), NEW,
                 repo_path=Path('/repo'), branch=BRANCH,
                 agent_session_id=None, preserved_worktree=True,
                 preserved_marker=original_marker,
-                preserved_observation=preserved_observation,
+                preserved_observation=observed,
             )
         saved = repository.get('repo', 'G-091')
         self.assertIsNone(saved.operation)
         self.assertEqual(saved.snapshot['rebase_completion']['id'], 'sealed')
+
+    def test_blocked_resume_head_keeps_completed_rebase_identity(self):
+        connection = sqlite3.connect(':memory:')
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        repository = ExecutionCheckpointRepository(connection)
+        completion = {
+            'id': 'sealed', 'run_id': 'run', 'intent_generation': 2,
+            'before_head': OLD, 'target_base_oid': NEW,
+            'remote_oid': OLD, 'head': NEW,
+        }
+        before_marker = {
+            'owner_oid': OLD, 'before_head': OLD, 'target_base_oid': NEW,
+            'after_head': None, 'before_snapshot': 'preserved worktree',
+        }
+        completed = repository.record(
+            'repo', 'G-091', expected_generation=0, operation=None,
+            expected_head=NEW, target_base_oid=NEW,
+            observed_remote_oid=OLD,
+            snapshot={'rebase_completion': completion,
+                      'blocked_resume': before_marker},
+        )
+        loop_manager._record_blocked_resume_head(
+            connection, 'repo', 'G-091', OLD, OLD, NEW, NEW,
+        )
+        saved = repository.get('repo', 'G-091')
+        self.assertEqual(saved.generation, completed.generation + 1)
+        self.assertIsNone(saved.operation)
+        self.assertEqual(saved.expected_head, NEW)
+        self.assertEqual(saved.snapshot['rebase_completion'], completion)
+        self.assertEqual(
+            saved.snapshot['blocked_resume'],
+            {**before_marker, 'after_head': NEW},
+        )
 
     def test_direct_rebase_completion_accepts_only_original_restored_stage(self):
         connection = sqlite3.connect(':memory:')
