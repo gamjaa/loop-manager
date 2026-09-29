@@ -1963,7 +1963,7 @@ class ExecutionHandlers:
             if (current.operation == 'push' and remote_oid == snapshot.local_head
                     or current.operation == 'pr_create' and pull_request is not None):
                 completed_push = current.operation == 'push'
-                if completed_push and marker:
+                if completed_push and (marker or current.completed_rebase()):
                     self.effects.state.update_project(
                         self.repo, publication_remote_oid=remote_oid,
                     )
