@@ -20663,19 +20663,23 @@ def observe_blocked_plan_remotes(
     origin = configured.stdout.strip() if configured.returncode == 0 else ""
     origin_failure = "origin-unavailable"
     registered_origin = str(project["origin"] or "")
-    if registered_origin and origin:
+    query_origin = ""
+    if not registered_origin:
+        origin_failure = "registered-origin-missing"
+    elif origin:
         try:
             origin_identity = github_repository(origin)
         except RuntimeError:
             origin_identity = origin
-        if origin_identity != registered_origin:
-            origin = ""
+        if origin_identity == registered_origin:
+            query_origin = origin
+        else:
             origin_failure = "registered-origin-mismatch"
     base_ref = f"refs/heads/{project['base_branch']}"
     for plan in plans:
         branch_ref = f"refs/heads/{plan['branch']}" if plan["branch"] else ""
         base, branch = blocked_remote_observation.observe_refs(
-            repo_path, origin, (base_ref, branch_ref),
+            repo_path, query_origin, (base_ref, branch_ref),
             unavailable_reason=origin_failure,
         )
         block = connection.execute(
@@ -20701,6 +20705,7 @@ def observe_blocked_plan_remotes(
                 worktree_fingerprint = "unavailable"
         blocked_remote_observation.record(
             connection, repo=repo, plan_id=str(plan["plan_id"]),
+            registered_origin=registered_origin or None,
             origin_url=origin or None, base_ref=base_ref, branch_ref=branch_ref,
             base=base, branch=branch, blocked_reason=reason,
             blocked_fingerprint=fingerprint,

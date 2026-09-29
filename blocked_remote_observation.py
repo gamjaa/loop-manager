@@ -19,6 +19,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS blocked_remote_observations (
     repo TEXT NOT NULL,
     plan_id TEXT NOT NULL,
+    registered_origin TEXT,
     origin_url TEXT,
     base_ref TEXT,
     branch_ref TEXT,
@@ -56,6 +57,7 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.execute(SCHEMA)
     columns = {row[1] for row in connection.execute("PRAGMA table_info(blocked_remote_observations)")}
     for name in (
+        "registered_origin",
         "base_error", "branch_error", "project_blocked_reason",
         "project_blocked_fingerprint",
     ):
@@ -124,7 +126,8 @@ def observe_refs(
 def input_identity(row: sqlite3.Row | dict[str, object]) -> str:
     """Stable recovery input; observation timestamp is intentionally excluded."""
     keys = (
-        "origin_url", "base_ref", "branch_ref", "base_result", "branch_result",
+        "registered_origin", "origin_url", "base_ref", "branch_ref",
+        "base_result", "branch_result",
         "base_error", "branch_error", "base_oid", "branch_oid",
         "blocked_reason", "blocked_fingerprint",
         "project_blocked_reason", "project_blocked_fingerprint",
@@ -140,7 +143,8 @@ def pending_input(row: sqlite3.Row) -> bool:
 
 def record(
     connection: sqlite3.Connection, *, repo: str, plan_id: str,
-    origin_url: str | None, base_ref: str, branch_ref: str,
+    registered_origin: str | None, origin_url: str | None,
+    base_ref: str, branch_ref: str,
     base: RefObservation, branch: RefObservation,
     blocked_reason: str | None, blocked_fingerprint: str | None,
     project_blocked_reason: str | None, project_blocked_fingerprint: str | None,
@@ -152,7 +156,8 @@ def record(
         (repo, plan_id),
     ).fetchone()
     values = dict(
-        origin_url=origin_url, base_ref=base_ref, branch_ref=branch_ref,
+        registered_origin=registered_origin, origin_url=origin_url,
+        base_ref=base_ref, branch_ref=branch_ref,
         base_result=base.result, branch_result=branch.result,
         base_error=base.error, branch_error=branch.error,
         base_oid=base.oid, branch_oid=branch.oid,
@@ -164,13 +169,14 @@ def record(
     changed = previous is None or input_identity(previous) != input_identity(values)
     connection.execute(
         """INSERT INTO blocked_remote_observations (
-            repo, plan_id, origin_url, base_ref, branch_ref,
+            repo, plan_id, registered_origin, origin_url, base_ref, branch_ref,
             base_result, branch_result, base_error, branch_error, base_oid, branch_oid,
             confirmed_base_oid, confirmed_branch_oid, blocked_reason,
             blocked_fingerprint, project_blocked_reason, project_blocked_fingerprint,
             worktree_fingerprint, observed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(repo, plan_id) DO UPDATE SET
+            registered_origin = excluded.registered_origin,
             origin_url = excluded.origin_url, base_ref = excluded.base_ref,
             branch_ref = excluded.branch_ref, base_result = excluded.base_result,
             branch_result = excluded.branch_result,
@@ -186,7 +192,7 @@ def record(
             worktree_fingerprint = excluded.worktree_fingerprint,
             observed_at = excluded.observed_at""",
         (
-            repo, plan_id, origin_url, base_ref, branch_ref,
+            repo, plan_id, registered_origin, origin_url, base_ref, branch_ref,
             base.result, branch.result, base.error, branch.error, base.oid, branch.oid,
             base.oid if base.result == "present" else None,
             branch.oid if branch.result == "present" else None,

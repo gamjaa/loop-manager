@@ -38,8 +38,9 @@ class BlockedRemoteObservationTest(unittest.TestCase):
         git(self.repo, "add", "file.txt")
         git(self.repo, "commit", "-m", "initial")
         git(self.repo, "push", "origin", "main")
-        self.connection = sqlite3.connect(":memory:")
-        self.addCleanup(self.connection.close)
+        self.database = root / "state.sqlite"
+        self.connection = sqlite3.connect(self.database)
+        self.addCleanup(lambda: self.connection.close())
         self.connection.row_factory = sqlite3.Row
         self.connection.execute(loop_manager.SCHEMA)
         loop_manager._ensure_execplans_schema(self.connection)
@@ -69,6 +70,12 @@ class BlockedRemoteObservationTest(unittest.TestCase):
             (str(self.repo),),
         ).fetchone()
 
+    def reconnect(self) -> None:
+        self.connection.commit()
+        self.connection.close()
+        self.connection = sqlite3.connect(self.database)
+        self.connection.row_factory = sqlite3.Row
+
     def advance(self, branch: str, value: str) -> str:
         (self.repo / "file.txt").write_text(value)
         git(self.repo, "add", "file.txt")
@@ -83,13 +90,25 @@ class BlockedRemoteObservationTest(unittest.TestCase):
         self.assertTrue(observation.mark_processed(
             self.connection, str(self.repo), "G-001", observation.input_identity(initial),
         ))
-        self.assertFalse(observation.pending_input(self.observe()))
+        self.reconnect()
+        restarted = self.observe()
+        self.assertEqual(restarted["confirmed_base_oid"], initial["base_oid"])
+        self.assertEqual(restarted["processed_input"], observation.input_identity(initial))
+        self.assertFalse(observation.pending_input(restarted))
 
         base_oid = self.advance("main", "base\n")
         base_only = self.observe()
         self.assertEqual(base_only["base_oid"], base_oid)
         self.assertTrue(observation.pending_input(base_only))
         self.assertEqual(base_only["blocked_fingerprint"], "same-input")
+        self.reconnect()
+        saved_base = self.connection.execute(
+            "SELECT * FROM blocked_remote_observations WHERE repo = ? AND plan_id = 'G-001'",
+            (str(self.repo),),
+        ).fetchone()
+        self.assertEqual(saved_base["base_oid"], base_oid)
+        self.assertEqual(saved_base["processed_input"], observation.input_identity(initial))
+        self.assertTrue(observation.pending_input(saved_base))
         git(self.repo, "switch", "-c", "work/one")
         branch_oid = self.advance("work/one", "branch\n")
         both = self.observe()
@@ -130,6 +149,30 @@ class BlockedRemoteObservationTest(unittest.TestCase):
         ).fetchall()
         self.assertEqual([row[0] for row in statuses], ["PLAN_BLOCKED", "IMPLEMENTING"])
         self.assertEqual(git(self.repo, "status", "--porcelain"), "")
+
+    def test_missing_or_mismatched_registered_origin_preserves_url_without_confirming_oid(self):
+        confirmed = self.observe()
+        self.connection.execute(
+            "UPDATE projects SET origin = NULL WHERE repo = ?", (str(self.repo),)
+        )
+        missing = self.observe()
+        self.assertIsNone(missing["registered_origin"])
+        self.assertEqual(missing["origin_url"], str(self.remote))
+        self.assertEqual(missing["base_error"], "registered-origin-missing")
+        self.assertIsNone(missing["base_oid"])
+        self.assertEqual(missing["confirmed_base_oid"], confirmed["base_oid"])
+
+        self.connection.execute(
+            "UPDATE projects SET origin = 'another/repo' WHERE repo = ?",
+            (str(self.repo),),
+        )
+        mismatch = self.observe()
+        self.assertEqual(mismatch["registered_origin"], "another/repo")
+        self.assertEqual(mismatch["origin_url"], str(self.remote))
+        self.assertEqual(mismatch["base_error"], "registered-origin-mismatch")
+        self.assertIsNone(mismatch["base_oid"])
+        self.assertEqual(mismatch["confirmed_base_oid"], confirmed["base_oid"])
+        self.assertNotEqual(observation.input_identity(missing), observation.input_identity(mismatch))
 
     def test_work_branch_only_change_and_project_linked_plan(self):
         initial = self.observe()
@@ -219,7 +262,8 @@ class BlockedRemoteObservationTest(unittest.TestCase):
                 )
             observation.record(
                 self.connection, repo=str(self.repo), plan_id="G-001",
-                origin_url=str(self.remote), base_ref="refs/heads/main",
+                registered_origin=str(self.remote), origin_url=str(self.remote),
+                base_ref="refs/heads/main",
                 branch_ref="refs/heads/work/one", base=base, branch=branch,
                 blocked_reason="user_decision_required", blocked_fingerprint="same-input",
                 project_blocked_reason=None, project_blocked_fingerprint=None,
@@ -265,7 +309,7 @@ class BlockedRemoteObservationTest(unittest.TestCase):
             )
         }
         self.assertTrue({
-            "base_error", "branch_error", "project_blocked_reason",
+            "registered_origin", "base_error", "branch_error", "project_blocked_reason",
             "project_blocked_fingerprint",
         } <= columns)
 
