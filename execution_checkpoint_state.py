@@ -39,6 +39,16 @@ class CheckpointRecord:
     observed_remote_oid: str | None = None
     snapshot: dict | None = None
 
+    def completed_rebase(self) -> dict | None:
+        """Return the sealed rebase identity only while this generation retains it."""
+        proof = (self.snapshot or {}).get('completed_rebase')
+        if not isinstance(proof, dict) or self.operation == 'rebase':
+            return None
+        if (not isinstance(proof.get('generation'), int)
+                or proof['generation'] >= self.generation):
+            return None
+        return proof
+
 
 class ExecutionCheckpointRepository:
     def __init__(self, connection: sqlite3.Connection):

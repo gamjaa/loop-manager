@@ -38,6 +38,45 @@ VALID_WORKER_RESULT = 'WORKER_OUTCOME: {"kind":"ready_for_validation"}\nvalid re
 
 
 class ExecutionHandlerTests(TestCase):
+    def test_rebase_journal_match_requires_run_identity_only_for_v2(self):
+        context = SimpleNamespace(
+            plan=SimpleNamespace(plan_id='G-047'),
+            branch='loop-manager/G-047', worktree=Path('/state/G-047'),
+            worker_session_id='worker-session',
+        )
+        observed = {'head': 'after', 'branch': context.branch}
+        transition = {
+            'intent': {
+                'kind': 'managed_rebase',
+                'target': str(context.worktree.resolve()),
+                'expected': {
+                    'branch': context.branch, 'run_id': 'other-run',
+                    'checkpoint_generation': 2, 'before_head': 'before',
+                    'target_base_oid': 'base', 'remote_oid': 'remote',
+                },
+            },
+            'result': {'observed': observed},
+        }
+        current = SimpleNamespace(
+            expected_head='before', target_base_oid='base', generation=2,
+            snapshot={'rebase_evidence_version': 2, 'rebase_run_id': 'run'},
+        )
+        with mock.patch.object(
+            handlers.manager_git_journal, 'verified_managed_transitions',
+            return_value=[transition],
+        ):
+            self.assertFalse(self.handler._matching_rebase_journal_result(
+                context, current, 'remote', observed,
+            ))
+            transition['intent']['expected']['run_id'] = 'run'
+            self.assertTrue(self.handler._matching_rebase_journal_result(
+                context, current, 'remote', observed,
+            ))
+            transition['intent']['expected']['checkpoint_generation'] = 3
+            self.assertFalse(self.handler._matching_rebase_journal_result(
+                context, current, 'remote', observed,
+            ))
+
     def test_review_budget_pauses_before_worker_and_preserves_projection(self):
         run_id = handlers.recovery_state.begin_external_run(self.connection)
         feedback = ValidationFeedbackRepository(self.connection)
@@ -2205,6 +2244,63 @@ class ExecutionHandlerTests(TestCase):
         self.assertIsNone(saved.operation)
         self.assertEqual(saved.snapshot['pushed_checkpoint_head'], 'owned-head')
 
+    def test_interrupted_rebased_checkpoint_push_updates_projection_before_intent(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        blocked_checkpoint_state.ensure_schema(self.connection)
+        self.connection.execute(
+            "INSERT INTO blocked_checkpoints "
+            "(repo, plan_id, request_identity, phase, reason_code, evidence, "
+            "branch, worktree, accepted_remote_oid) "
+            "VALUES ('repo', 'G-047', 'request', 'published', 'review', 'evidence', "
+            "'loop-manager/G-047', '/state/G-047', 'old-head')"
+        )
+        self.state.update_project('repo', publication_remote_oid='old-head',
+                                  worker_session_id='worker-session')
+        proof = {'generation': 1, 'remote_oid': 'old-head',
+                 'after_head': 'rebased-head'}
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0, operation='rebase',
+            expected_head='old-head', target_base_oid='base',
+            observed_remote_oid='old-head', snapshot={},
+        )
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=1, operation=None,
+            expected_head='rebased-head', target_base_oid='base',
+            observed_remote_oid='old-head',
+            snapshot={'completed_rebase': proof},
+        )
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=2, operation='push',
+            expected_head='owned-head', target_base_oid='base',
+            observed_remote_oid='old-head',
+            snapshot={'completed_rebase': proof, 'after_head': 'owned-head',
+                      'remote_before': 'old-head'},
+        )
+        self.effects.workspace.git.side_effect = self.observed_git
+        self.effects.workspace.remote_branch_oid.return_value = 'owned-head'
+        self.effects.publication.pr_for_branch.return_value = None
+        original_record = checkpoint.record
+        def record_after_projection(*args, **kwargs):
+            if (kwargs.get('operation') is None
+                    and kwargs.get('observed_remote_oid') == 'owned-head'):
+                self.assertEqual(
+                    self.state.row()['publication_remote_oid'], 'owned-head',
+                )
+            return original_record(*args, **kwargs)
+        with (mock.patch.object(self.handler, '_owned_checkpoint_remote',
+                                return_value=True),
+              mock.patch.object(checkpoint, 'record',
+                                side_effect=record_after_projection)):
+            self.handler.recover(self.context())
+
+        self.assertEqual(self.state.row()['publication_remote_oid'], 'owned-head')
+        saved = checkpoint.get('repo', 'G-047')
+        self.assertIsNone(saved.operation)
+        self.assertEqual(saved.observed_remote_oid, 'owned-head')
+        self.assertEqual(saved.snapshot['pushed_checkpoint_head'], 'owned-head')
+
     def test_completed_owned_push_persists_new_oid_in_execution_checkpoint(self):
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)
@@ -2257,6 +2353,260 @@ class ExecutionHandlerTests(TestCase):
         self.assertFalse(self.handler._owned_checkpoint_remote(
             self.context(), row, 'user-head', current,
         ))
+
+    def test_completed_published_rebase_keeps_remote_lease_only_with_sealed_owner(self):
+        blocked_checkpoint_state.ensure_schema(self.connection)
+        self.connection.execute(
+            "INSERT INTO blocked_checkpoints "
+            "(repo, plan_id, request_identity, phase, reason_code, evidence, "
+            "branch, worktree, accepted_remote_oid, result, published_oid, "
+            "commit_identity, tree_oid) "
+            "VALUES ('repo', 'G-047', 'request', 'published', 'review', 'evidence', "
+            "'loop-manager/G-047', '/state/G-047', 'remote', 'published', "
+            "'remote', 'checkpoint-token', 'checkpoint-tree')"
+        )
+        self.state.update_project('repo', worker_session_id='worker-session',
+                                  publication_remote_oid='remote')
+        context = self.context()
+        proof = {
+            'journal_id': 'journal', 'generation': 1, 'run_id': 'run',
+            'before_head': 'remote', 'after_head': 'rebased',
+            'target_base_oid': 'base', 'remote_oid': 'remote',
+            'branch': context.branch, 'worktree': str(context.worktree.resolve()),
+            'session': 'worker-session',
+        }
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0, operation='rebase',
+            expected_head='remote', target_base_oid='base',
+            observed_remote_oid='remote', snapshot={'rebase_run_id': 'run'},
+        )
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=1, operation=None,
+            expected_head='rebased', target_base_oid='base',
+            observed_remote_oid='remote', snapshot={'completed_rebase': proof},
+        )
+        observed = {
+            'head': 'rebased', 'branch': context.branch,
+            'ref': ['rebased', ''], 'metadata': None, 'operations': {},
+            'unmerged': False, 'index_clean': True, 'dirty': {},
+        }
+        transition = {
+            'intent': {
+                'id': 'journal', 'kind': 'managed_rebase',
+                'target': proof['worktree'],
+                'expected': {
+                    'checkpoint_generation': 1, 'run_id': 'run',
+                    'branch': context.branch, 'before_head': 'remote',
+                    'target_base_oid': 'base', 'remote_oid': 'remote',
+                },
+            },
+            'result': {'observed': dict(observed)},
+        }
+        self.handler._rebase_journal_state.return_value = observed
+        base_state = {'oid': 'base', 'descends_from_target': True,
+                      'live_oid': 'remote'}
+        def git_for_owned_rebase(_path, *args, **_kwargs):
+            if args[:2] == ('rev-parse', 'origin/main'):
+                return SimpleNamespace(stdout=base_state['oid'] + '\n', returncode=0)
+            if args[:2] == ('rev-parse', 'remote^{tree}'):
+                return SimpleNamespace(stdout='checkpoint-tree\n', returncode=0)
+            if args[0] == 'show':
+                return SimpleNamespace(
+                    stdout='[G-047] BLOCKED checkpoint\nScope: plan\n'
+                           'Checkpoint-Identity: checkpoint-token\n',
+                    returncode=0,
+                )
+            if args[0] == 'ls-remote':
+                return SimpleNamespace(
+                    stdout=f"{base_state['live_oid']}\trefs/heads/{context.branch}\n",
+                    returncode=0,
+                )
+            if args[:2] == ('merge-base', '--is-ancestor'):
+                return SimpleNamespace(
+                    stdout='', returncode=(
+                        0 if args[2:] != ('base', base_state['oid'])
+                        or base_state['descends_from_target'] else 1
+                    ),
+                )
+            return SimpleNamespace(stdout='rebased\n', returncode=0)
+        self.effects.workspace.git.side_effect = git_for_owned_rebase
+        row = {'pr_url': None, 'publication_remote_oid': 'remote'}
+        with (
+            mock.patch.object(handlers.manager_git_journal,
+                              'verified_managed_transitions',
+                              return_value=[transition]),
+        ):
+            sealed = self.handler._completed_rebase_proof(
+                context, SimpleNamespace(
+                    generation=1, expected_head='remote',
+                    target_base_oid='base',
+                    snapshot={'rebase_evidence_version': 2,
+                              'rebase_run_id': 'run'},
+                ), 'remote', dict(observed),
+            )
+            self.assertEqual(sealed, proof)
+            self.assertTrue(self.handler._owned_checkpoint_remote(
+                context, row, 'remote', checkpoint.get('repo', 'G-047'),
+            ))
+            base_state['live_oid'] = 'external'
+            self.assertFalse(self.handler._owned_checkpoint_remote(
+                context, row, 'remote', checkpoint.get('repo', 'G-047'),
+            ))
+            base_state['live_oid'] = 'remote'
+            base_state['oid'] = 'advanced-base'
+            self.assertTrue(self.handler._owned_checkpoint_remote(
+                context, row, 'remote', checkpoint.get('repo', 'G-047'),
+            ))
+            base_state['descends_from_target'] = False
+            self.assertFalse(self.handler._owned_checkpoint_remote(
+                context, row, 'remote', checkpoint.get('repo', 'G-047'),
+            ))
+            base_state.update(oid='base', descends_from_target=True)
+            self.state.update_project('repo', worker_session_id='other-session')
+            self.assertFalse(self.handler._owned_checkpoint_remote(
+                self.context(), row, 'remote', checkpoint.get('repo', 'G-047'),
+            ))
+            self.state.update_project('repo', worker_session_id='worker-session')
+            self.assertFalse(self.handler._owned_checkpoint_remote(
+                context, row, 'changed', checkpoint.get('repo', 'G-047'),
+            ))
+            self.assertFalse(self.handler._owned_checkpoint_remote(
+                context, row, 'remote', checkpoint.get('repo', 'G-047'),
+                {'headRefOid': 'remote'},
+            ))
+            transition['intent']['expected']['run_id'] = 'tampered'
+            self.assertFalse(self.handler._owned_checkpoint_remote(
+                context, row, 'remote', checkpoint.get('repo', 'G-047'),
+            ))
+            transition['intent']['expected']['run_id'] = 'run'
+            observed['head'] = 'candidate'
+            observed['ref'] = ['candidate', '']
+            interrupted = checkpoint.record(
+                'repo', 'G-047', expected_generation=2, operation='commit',
+                expected_head='rebased', target_base_oid='base',
+                observed_remote_oid='remote',
+                snapshot={'completed_rebase': proof, 'before_head': 'rebased'},
+            )
+            self.assertTrue(self.handler._owned_checkpoint_remote(
+                context, row, 'remote', interrupted,
+            ))
+            candidate = checkpoint.record(
+                'repo', 'G-047', expected_generation=3, operation=None,
+                expected_head='candidate', target_base_oid='base',
+                observed_remote_oid='remote',
+                snapshot={'completed_rebase': proof, 'after_head': 'candidate'},
+            )
+            self.assertTrue(self.handler._owned_checkpoint_remote(
+                context, row, 'remote', candidate,
+            ))
+            push = checkpoint.record(
+                'repo', 'G-047', expected_generation=4, operation='push',
+                expected_head='candidate', target_base_oid='base',
+                observed_remote_oid='remote',
+                snapshot={'completed_rebase': proof, 'after_head': 'candidate',
+                          'remote_before': 'remote'},
+            )
+            row['publication_remote_oid'] = 'candidate'
+            base_state['live_oid'] = 'candidate'
+            self.assertTrue(self.handler._owned_checkpoint_remote(
+                context, row, 'candidate', push,
+            ))
+            base_state['live_oid'] = 'external'
+            self.assertFalse(self.handler._owned_checkpoint_remote(
+                context, row, 'candidate', push,
+            ))
+            observed['dirty'] = {'app.py': 'external'}
+            self.assertFalse(self.handler._owned_checkpoint_remote(
+                context, row, 'remote', candidate,
+            ))
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        self.handler._complete_publication_intent(context)
+        completed_push = checkpoint.get('repo', 'G-047')
+        self.assertEqual(completed_push.generation, push.generation + 1)
+        self.assertEqual(completed_push.snapshot['pushed_checkpoint_head'], 'candidate')
+        observed['dirty'] = {}
+        base_state['live_oid'] = 'candidate'
+        with mock.patch.object(
+            handlers.manager_git_journal, 'verified_managed_transitions',
+            return_value=[transition],
+        ):
+            self.assertTrue(self.handler._owned_checkpoint_remote(
+                context, row, 'candidate', completed_push,
+            ))
+            pr_intent = checkpoint.record(
+                'repo', 'G-047', expected_generation=completed_push.generation,
+                operation='pr_create', expected_head='candidate',
+                target_base_oid='base', observed_remote_oid='candidate',
+                snapshot=completed_push.snapshot,
+            )
+            self.assertTrue(self.handler._owned_checkpoint_remote(
+                context, row, 'candidate', pr_intent,
+                {'headRefOid': 'candidate'},
+            ))
+
+    def test_normal_published_rebase_completion_persists_sealed_owner(self):
+        blocked_checkpoint_state.ensure_schema(self.connection)
+        self.connection.execute(
+            "INSERT INTO blocked_checkpoints "
+            "(repo, plan_id, request_identity, phase, reason_code, evidence, "
+            "branch, worktree, accepted_remote_oid) "
+            "VALUES ('repo', 'G-047', 'request', 'published', 'review', 'evidence', "
+            "'loop-manager/G-047', '/state/G-047', 'remote')"
+        )
+        self.state.update_project('repo', worker_session_id='worker-session',
+                                  publication_remote_oid='remote')
+        context = self.context()
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0, operation='rebase',
+            expected_head='remote', target_base_oid='base',
+            observed_remote_oid='remote',
+            snapshot={'rebase_evidence_version': 2, 'rebase_run_id': 'run'},
+        )
+        observed = {'head': 'owned-head', 'branch': context.branch,
+                    'ref': ['owned-head', ''], 'metadata': None,
+                    'operations': {}, 'dirty': {}, 'index_clean': True}
+        self.handler._rebase_journal_state.return_value = observed
+        self.effects.workspace.git.side_effect = self.observed_git
+        transition = {
+            'intent': {
+                'id': 'journal', 'kind': 'managed_rebase',
+                'target': str(context.worktree.resolve()),
+                'expected': {
+                    'branch': context.branch, 'run_id': 'run',
+                    'checkpoint_generation': 1, 'before_head': 'remote',
+                    'target_base_oid': 'base', 'remote_oid': 'remote',
+                },
+            },
+            'result': {'observed': observed},
+        }
+        with (
+            mock.patch.object(self.handler, '_owned_completed_rebase',
+                              return_value=True),
+            mock.patch.object(handlers.manager_git_journal,
+                              'verified_managed_transitions', return_value=[])
+            as transitions,
+        ):
+            with self.assertRaises(handlers.manager_git_journal.MutationEvidenceError):
+                self.handler._complete_rebase_intent(context)
+            self.assertEqual(checkpoint.get('repo', 'G-047').operation, 'rebase')
+            transitions.return_value = [transition]
+            self.handler._complete_rebase_intent(context)
+
+        completed = checkpoint.get('repo', 'G-047')
+        self.assertIsNone(completed.operation)
+        self.assertEqual(completed.expected_head, 'owned-head')
+        self.assertEqual(completed.completed_rebase(), {
+            'journal_id': 'journal', 'generation': 1, 'run_id': 'run',
+            'before_head': 'remote', 'after_head': 'owned-head',
+            'target_base_oid': 'base', 'remote_oid': 'remote',
+            'branch': context.branch, 'worktree': str(context.worktree.resolve()),
+            'session': 'worker-session',
+        })
 
     def test_external_remote_checkpoint_uses_publication_ownership_cause(self):
         checkpoint = ExecutionCheckpointRepository(self.connection)
