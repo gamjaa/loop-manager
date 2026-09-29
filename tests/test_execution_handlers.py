@@ -38,6 +38,61 @@ VALID_WORKER_RESULT = 'WORKER_OUTCOME: {"kind":"ready_for_validation"}\nvalid re
 
 
 class ExecutionHandlerTests(TestCase):
+    def test_published_review_commit_correction_keeps_owner_on_restart(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        blocked_checkpoint_state.ensure_schema(self.connection)
+        self.connection.execute(
+            "INSERT INTO blocked_checkpoints "
+            "(repo, plan_id, request_identity, phase, reason_code, evidence, "
+            "branch, worktree, accepted_remote_oid) "
+            "VALUES ('repo', 'G-047', 'request', 'published', "
+            "'review_retry_exhausted', 'review', 'loop-manager/G-047', "
+            "'/state/G-047', 'old-head')"
+        )
+        self.state.update_project('repo', phase='VERIFYING',
+                                  publication_remote_oid='old-head')
+        self.dirty = False
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0, operation='commit',
+            expected_head='old-head', target_base_oid='base',
+            observed_remote_oid='old-head',
+            snapshot={'published_review_resume': {
+                'request_identity': 'request', 'owner_oid': 'old-head',
+                'head': 'old-head',
+            }},
+        )
+
+        def observed_git(path, *args, **kwargs):
+            if args in {('rev-parse', 'HEAD'),
+                        ('rev-parse', 'refs/heads/loop-manager/G-047')}:
+                return SimpleNamespace(stdout='corrected-head\n', returncode=0)
+            if args[0] == 'ls-remote':
+                return SimpleNamespace(
+                    stdout='old-head\trefs/heads/loop-manager/G-047\n',
+                    returncode=0,
+                )
+            return self.observed_git(path, *args, **kwargs)
+
+        self.effects.workspace.git.side_effect = observed_git
+        self.effects.workspace.remote_branch_oid.return_value = 'old-head'
+        self.effects.publication.pr_for_branch.return_value = None
+        with mock.patch.object(handlers.checkpoint_ownership, 'owned_remote_oid',
+                               return_value='old-head'):
+            first = self.handler.recover(self.context())
+            saved = checkpoint.get('repo', 'G-047')
+            self.assertEqual(first.phase, ExecutionPhase.VERIFYING)
+            self.assertIsNone(saved.operation)
+            self.assertEqual(saved.expected_head, 'corrected-head')
+            self.assertEqual(saved.snapshot['published_review_resume'], {
+                'request_identity': 'request', 'owner_oid': 'old-head',
+                'head': 'old-head',
+            })
+            self.assertEqual(self.handler.recover(self.context()).phase,
+                             ExecutionPhase.VERIFYING)
+        self.effects.publication.command.assert_not_called()
+
     def test_published_review_push_restarts_before_completion_checkpoint(self):
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)

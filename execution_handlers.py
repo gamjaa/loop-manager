@@ -2228,6 +2228,10 @@ class ExecutionHandlers:
                         {'completed_rebase': completion} if completion else
                         {'completed_rebase': current.completed_rebase()}
                         if current.completed_rebase() else {}
+                    ), **(
+                        {'published_review_resume': current.snapshot['published_review_resume']}
+                        if (current.snapshot or {}).get('published_review_resume')
+                        else {}
                     )},
                 )
                 return self._context()
