@@ -1809,7 +1809,14 @@ class ExecutionHandlers:
             stash_oid=(stash_oid if unmerged and not in_progress else None),
         )
 
-    def _completed_autostash_correction(self, context, intent, sealed, live):
+    def _completed_autostash_correction(
+        self, context, intent, sealed, live, *, rejection=None,
+    ):
+        def reject(reason):
+            if rejection is not None:
+                rejection.append(reason)
+            return False
+
         current = self.effects.checkpoint.get(self.repo, context.plan.plan_id)
         saved = current.snapshot or {}
         stage = saved.get('stage_evidence')
@@ -1820,7 +1827,9 @@ class ExecutionHandlers:
         operation_markers_match = (
             live_operations == sealed_operations
             or (isinstance(sealed_operations, dict) and live_operations == {}
-                and set(sealed_operations) <= {'MERGE_MSG', 'MERGE_MODE'})
+                and set(sealed_operations) <= {
+                    'MERGE_MSG', 'MERGE_MODE', 'REBASE_HEAD',
+                })
         )
         if (intent['expected'].get('evidence_version') != 2
                 or not saved.get('stash_oid') or saved.get('pending') != 'continue'
@@ -1829,12 +1838,13 @@ class ExecutionHandlers:
                 or not saved.get('worker_result') or not isinstance(accepted, dict)
                 or not accepted or not isinstance(modes, dict)
                 or sealed.get('metadata') is not None or not sealed.get('unmerged')
-                or live.get('metadata') is not None or live.get('unmerged')
-                or not operation_markers_match
-                or any(live.get(field) != sealed.get(field) for field in (
-                    'head', 'branch', 'ref', 'registration',
-                ))):
-            return False
+                or live.get('metadata') is not None or live.get('unmerged')):
+            return reject('checkpoint or conflict identity')
+        if not operation_markers_match:
+            return reject('Git operation markers')
+        if any(live.get(field) != sealed.get(field) for field in (
+                'head', 'branch', 'ref', 'registration')):
+            return reject('HEAD, branch or registration')
         tracked = {
             path for path in self.effects.workspace.git(
                 context.worktree, 'ls-files', '--cached', '-z',
@@ -1842,40 +1852,40 @@ class ExecutionHandlers:
         }
         if not self._stage_evidence_preserved(
                 context, stage, self._rebase_stage_evidence(context), tracked):
-            return False
+            return reject('approved stage evidence')
         if any(sealed['dirty'].get(path) != live['dirty'].get(path)
                for path in sealed['dirty'].keys() | live['dirty'].keys()
                if path not in accepted):
-            return False
+            return reject('unapproved dirty path')
         sealed_files = sealed.get('file_evidence') or {}
         live_files = live.get('file_evidence') or {}
         if any(sealed_files.get(path) != live_files.get(path)
                for path in sealed_files.keys() | live_files.keys()
                if path not in accepted):
-            return False
+            return reject('unapproved file evidence')
         if not managed_rebase_evidence.stage_matches(
                 before_index=sealed['index'], staged_index=live['index'],
                 allowed_paths=list(accepted), accepted_files=accepted,
                 accepted_modes=modes,
                 staged_dirty={path: [[], signature]
                               for path, signature in accepted.items()}):
-            return False
+            return reject('staged index or mode')
         for path in accepted:
             entries = live['index'].get(path)
             if modes[path] is None:
                 if entries or (context.worktree / path).exists() or (
                         context.worktree / path).is_symlink():
-                    return False
+                    return reject('approved deletion')
                 continue
             if not isinstance(entries, list) or len(entries) != 1:
-                return False
+                return reject('approved index entry')
             staged_oid = entries[0].split()[2]
             blob = self.effects.workspace.git(
                 context.worktree, 'hash-object', f'--path={path}', '--', path,
                 check=False,
             )
             if blob.returncode or blob.stdout.strip() != staged_oid:
-                return False
+                return reject('approved blob')
         return True
 
     def _complete_rebase_intent(self, context, *, project_values=None):
@@ -1892,23 +1902,33 @@ class ExecutionHandlers:
             completion_session = (current.snapshot or {}).get(
                 'rebase_start_session_id', completion_session,
             )
-        result = manager_git_journal.verified_rebase_completion(
-            self.state_dir, repo=str(self.repo_path.resolve()),
-            target=str(context.worktree.resolve()),
-            owner=f'plan:{context.plan.plan_id}', branch=context.branch,
-            before_head=current.expected_head,
-            target_base_oid=current.target_base_oid,
-            remote_oid=current.observed_remote_oid,
-            agent_session_id=completion_session,
-            run_id=(current.snapshot or {}).get('rebase_run_id'),
-            checkpoint_generation=current.generation,
-            observe=lambda: self._rebase_journal_state(context),
-            validate=validate, replay_proof=proof,
-            later_correction=lambda intent, sealed, live:
-                self._completed_autostash_correction(
-                    context, intent, sealed, live,
-                ),
-        )
+        correction_rejections = []
+        try:
+            result = manager_git_journal.verified_rebase_completion(
+                self.state_dir, repo=str(self.repo_path.resolve()),
+                target=str(context.worktree.resolve()),
+                owner=f'plan:{context.plan.plan_id}', branch=context.branch,
+                before_head=current.expected_head,
+                target_base_oid=current.target_base_oid,
+                remote_oid=current.observed_remote_oid,
+                agent_session_id=completion_session,
+                run_id=(current.snapshot or {}).get('rebase_run_id'),
+                checkpoint_generation=current.generation,
+                observe=lambda: self._rebase_journal_state(context),
+                validate=validate, replay_proof=proof,
+                later_correction=lambda intent, sealed, live:
+                    self._completed_autostash_correction(
+                        context, intent, sealed, live,
+                        rejection=correction_rejections,
+                    ),
+            )
+        except manager_git_journal.MutationEvidenceError as error:
+            if correction_rejections and 'unique owned result unavailable' in str(error):
+                raise manager_git_journal.MutationEvidenceError(
+                    f'{error}; correction rejected: '
+                    f'{", ".join(sorted(set(correction_rejections)))}'
+                ) from error
+            raise
         intent = result['intent']
         expected = intent['expected']
         observed = result['result']['observed']

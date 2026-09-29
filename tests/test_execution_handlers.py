@@ -521,14 +521,21 @@ class ExecutionHandlerTests(TestCase):
             context, intent,
             {**sealed, 'operations': {'MERGE_MSG': 'sealed-marker'}}, live,
         ))
+        self.assertTrue(self.handler._completed_autostash_correction(
+            context, intent,
+            {**sealed, 'operations': {'REBASE_HEAD': 'sealed-marker'}}, live,
+        ))
         self.assertFalse(self.handler._completed_autostash_correction(
             context, intent,
-            {**sealed, 'operations': {'REBASE_HEAD': 'owned-marker'}}, live,
+            {**sealed, 'operations': {'CHERRY_PICK_HEAD': 'foreign-marker'}}, live,
         ))
+        rejection = []
         self.assertFalse(self.handler._completed_autostash_correction(
             context, intent, sealed,
             {**live, 'dirty': {**live['dirty'], 'extra.py': [['staged'], 'extra']}},
+            rejection=rejection,
         ))
+        self.assertEqual(rejection, ['unapproved dirty path'])
         self.assertFalse(self.handler._completed_autostash_correction(
             context, intent, sealed,
             {**live, 'file_evidence': {'extra.py': {'mode': '100755'}}},
@@ -545,6 +552,48 @@ class ExecutionHandlerTests(TestCase):
         self.assertFalse(self.handler._completed_autostash_correction(
             context, intent, sealed, live,
         ))
+
+    def test_autostash_completion_reports_rejected_operation_marker(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.handler.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler._complete_rebase_intent = (
+            handlers.ExecutionHandlers._complete_rebase_intent.__get__(self.handler)
+        )
+        checkpoint.record(
+            'repo', 'G-047', expected_generation=0, operation='rebase',
+            expected_head='before', target_base_oid='base',
+            observed_remote_oid=None,
+            snapshot={'stash_oid': 'stash', 'pending': 'continue',
+                      'worker_result': 'accepted',
+                      'rebase_start_session_id': 'original',
+                      'stage_evidence': {'files': {'app.py': 'accepted'},
+                                         'modes': {'app.py': '100644'}}},
+        )
+        self.handler._rebase_journal_checks = mock.Mock(return_value=(
+            mock.Mock(), mock.Mock(),
+        ))
+
+        def rejected_result(*_args, **kwargs):
+            self.assertFalse(kwargs['later_correction'](
+                {'expected': {'evidence_version': 2,
+                              'agent_session_id': 'original'}},
+                {'metadata': None, 'unmerged': True, 'operations': {}},
+                {'metadata': None, 'unmerged': False,
+                 'operations': {'CHERRY_PICK_HEAD': 'foreign'}},
+            ))
+            raise handlers.manager_git_journal.MutationEvidenceError(
+                'rebase stored completion: unique owned result unavailable'
+            )
+
+        with mock.patch.object(
+            handlers.manager_git_journal, 'verified_rebase_completion',
+            side_effect=rejected_result,
+        ), self.assertRaisesRegex(
+            handlers.manager_git_journal.MutationEvidenceError,
+            'correction rejected: Git operation markers',
+        ):
+            self.handler._complete_rebase_intent(self.context())
+        self.assertEqual(checkpoint.get('repo', 'G-047').operation, 'rebase')
 
     def test_review_budget_pauses_before_worker_and_preserves_projection(self):
         run_id = handlers.recovery_state.begin_external_run(self.connection)

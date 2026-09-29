@@ -9558,6 +9558,7 @@ def _complete_direct_rebase_checkpoint(
     *, repo_path: Path, branch: str, agent_session_id: str | None,
     preserved_worktree: bool = False,
     preserved_marker: Mapping[str, object] | None = None,
+    preserved_observation: Mapping[str, object] | None = None,
 ) -> None:
     repository = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
     current = repository.get(repo, plan_id)
@@ -9580,11 +9581,13 @@ def _complete_direct_rebase_checkpoint(
             raise manager_git_journal.MutationEvidenceError(
                 'direct rebase completion: preserved checkpoint marker changed'
             )
-        preserved = (
+        preserved = bool(
             preserved_worktree and isinstance(marker, dict)
-            and _blocked_resume_worktree_matches(
-                worktree, marker, capture_git_snapshot(worktree),
-            )
+            and (observed == preserved_observation
+                 if preserved_observation is not None else
+                 _blocked_resume_worktree_matches(
+                     worktree, marker, capture_git_snapshot(worktree),
+                 ))
         )
 
         transitions = manager_git_journal.verified_managed_transitions(
@@ -14948,11 +14951,13 @@ def _resume_interrupted_blocked_rebase(
                               '중단된 차단 해제 rebase의 게시 소유권과 HEAD를 증명할 수 없습니다.')
         return False
     try:
+        preserved_observation = _owned_rebase_journal_state(worktree, branch)
         _complete_direct_rebase_checkpoint(
             connection, repo, str(plan['plan_id']), worktree, target_base,
             repo_path=repo_path, branch=branch,
             agent_session_id=plan['worker_session_id'],
             preserved_worktree=True,
+            preserved_observation=preserved_observation,
         )
     except (RuntimeError, OSError, ValueError) as error:
         _update_blocked_error(connection, repo, str(plan['plan_id']),
@@ -15241,8 +15246,9 @@ def resume_blocked_execplan_if_inputs_changed(
             _update_blocked_error(connection, repo, str(plan['plan_id']),
                                   '차단 해제 rebase 이후 보존한 작업 상태가 다릅니다.')
             return False
-        # Keep the exact preservation marker that just passed. Recording the
-        # new HEAD changes its unstaging allowance before journal completion.
+        # The preservation check may restore staged entries. Pin its resulting
+        # Git state before recording a new HEAD in the checkpoint marker.
+        preserved_observation = _owned_rebase_journal_state(worktree, branch)
         _record_blocked_resume_head(
             connection, repo, str(plan['plan_id']), owned_oid,
             before_head, target_base_oid, after_head,
@@ -15254,6 +15260,7 @@ def resume_blocked_execplan_if_inputs_changed(
                 agent_session_id=plan['worker_session_id'],
                 preserved_worktree=True,
                 preserved_marker=pending.snapshot['blocked_resume'],
+                preserved_observation=preserved_observation,
             )
     elif base_ancestry.returncode == 1:
         _complete_direct_rebase_checkpoint(

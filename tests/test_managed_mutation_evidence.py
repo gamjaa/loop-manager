@@ -924,11 +924,20 @@ class ManagedTransitionTests(unittest.TestCase):
                     repo_path=Path('/repo'), branch=BRANCH,
                     agent_session_id=None, preserved_worktree=True,
                 )
+            with self.assertRaises(journal.MutationEvidenceError):
+                loop_manager._complete_direct_rebase_checkpoint(
+                    connection, 'repo', 'G-091', Path('/owned'), NEW,
+                    repo_path=Path('/repo'), branch=BRANCH,
+                    agent_session_id=None, preserved_worktree=True,
+                    preserved_marker=original_marker,
+                    preserved_observation={**observed, 'head': OLD},
+                )
             loop_manager._complete_direct_rebase_checkpoint(
                 connection, 'repo', 'G-091', Path('/owned'), NEW,
                 repo_path=Path('/repo'), branch=BRANCH,
                 agent_session_id=None, preserved_worktree=True,
                 preserved_marker=original_marker,
+                preserved_observation=observed,
             )
         saved = repository.get('repo', 'G-091')
         self.assertIsNone(saved.operation)
