@@ -14,10 +14,116 @@ import maintenance_state
 import notifications
 import project_registry
 import scoped_blocking
+import rebase_block_reconciliation
 from scoped_blocking import BlockReasonCode, BlockScope
 
 
 class ScopedBlockingTest(unittest.TestCase):
+    def test_incomplete_legacy_rebase_plan_block_stays_blocked(self):
+        self.plan('G-001', 'PLAN_BLOCKED', branch='loop-manager/G-001')
+        reason = rebase_block_reconciliation.LEGACY_COMPLETION_DIAGNOSTIC
+        with self.connection:
+            self.connection.execute(
+                "UPDATE exec_plans SET blocked_reason = 'managed_worktree_conflict' "
+                "WHERE repo = ? AND plan_id = 'G-001'", (self.repo,),
+            )
+            self.connection.execute(
+                "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, "
+                "evidence) VALUES (?, 'G-001', 'plan', "
+                "'managed_worktree_conflict', ?)", (self.repo, reason),
+            )
+        with (
+            mock.patch.object(loop_manager, '_reconcile_rebase_evidence_block',
+                              return_value=False) as proof,
+            mock.patch.object(loop_manager, 'hydrate_execplan_project') as generic,
+        ):
+            self.assertFalse(loop_manager.resume_plan_blocks(
+                self.connection, Path(self.repo), Path('/state'),
+                self.repo, 'main',
+            ))
+        proof.assert_called_once()
+        generic.assert_not_called()
+        self.assertIsNotNone(scoped_blocking.plan_block(
+            self.connection, self.repo, 'G-001',
+        ))
+
+    def test_rebase_false_block_cannot_take_generic_project_release(self):
+        plan = self.plan('G-001', 'VERIFYING', branch='loop-manager/G-001')
+        reason = rebase_block_reconciliation.LEGACY_COMPLETION_DIAGNOSTIC
+        with self.connection:
+            self.connection.execute(
+                "UPDATE exec_plans SET worktree = '/managed', active_sha = 'base', "
+                "worker_session_id = 'worker' WHERE repo = ? AND plan_id = 'G-001'",
+                (self.repo,),
+            )
+            self.connection.execute(
+                "UPDATE projects SET phase = 'PROJECT_BLOCKED', plan_path = ?, "
+                "branch = 'loop-manager/G-001', worktree = '/managed' WHERE repo = ?",
+                (plan['path'], self.repo),
+            )
+            self.connection.execute(
+                "INSERT INTO project_blocks (repo, scope, reason_code, plan_id, "
+                "evidence, previous_phase) VALUES (?, 'project', "
+                "'repository_state_unsafe', 'G-001', ?, 'VERIFYING')",
+                (self.repo, reason),
+            )
+            self.connection.execute(
+                "INSERT INTO recovery_records (repo, subject, identity, reason_code, "
+                "disposition, pending_action, phase, base_revision, fingerprint, progress_marker, "
+                "occurrence, attempts, detail) VALUES (?, 'G-001', 'retry', "
+                "'status_failed', 'transient_retry', 'pause', 'VERIFYING', 'base', "
+                "'fingerprint', 'base|worker|', 1, 3, ?)",
+                (self.repo, reason),
+            )
+            execution_checkpoint_state.ExecutionCheckpointRepository(
+                self.connection,
+            ).record(
+                self.repo, 'G-001', expected_generation=0, operation='rebase',
+                expected_head='before', target_base_oid='base',
+                observed_remote_oid=None, snapshot={},
+            )
+        with (
+            mock.patch.object(loop_manager, '_reconcile_rebase_evidence_block',
+                              return_value=False) as proof,
+            mock.patch.object(loop_manager, 'validate_managed_worktree') as generic,
+        ):
+            self.assertFalse(loop_manager.resume_project_block_if_safe(
+                self.connection, Path(self.repo), Path('/state'), self.repo,
+            ))
+        proof.assert_called_once()
+        generic.assert_not_called()
+        self.assertIsNotNone(scoped_blocking.project_block(self.connection, self.repo))
+        with (
+            mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
+            mock.patch.object(loop_manager, 'validate_managed_worktree'),
+            mock.patch.object(loop_manager, 'remote_branch_oid',
+                              return_value='external-head'),
+            mock.patch.object(loop_manager, '_ExecutionLifecyclePorts') as construction,
+        ):
+            self.assertFalse(loop_manager._reconcile_rebase_evidence_block(
+                self.connection, Path(self.repo), Path('/state'), self.repo,
+                scoped_blocking.project_block(self.connection, self.repo),
+                plan_block=False,
+            ))
+        construction.assert_not_called()
+        with (
+            mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
+            mock.patch.object(loop_manager, 'validate_managed_worktree'),
+            mock.patch.object(loop_manager, 'remote_branch_oid', return_value=None),
+            mock.patch.object(loop_manager, 'pr_for_branch', return_value=None),
+            mock.patch.object(loop_manager, '_ExecutionLifecyclePorts',
+                              side_effect=RuntimeError('injected evidence failure')),
+        ):
+            self.assertFalse(loop_manager._reconcile_rebase_evidence_block(
+                self.connection, Path(self.repo), Path('/state'), self.repo,
+                scoped_blocking.project_block(self.connection, self.repo),
+                plan_block=False,
+            ))
+        self.assertIsNotNone(scoped_blocking.project_block(self.connection, self.repo))
+        self.assertEqual(self.connection.execute(
+            "SELECT phase FROM projects WHERE repo = ?", (self.repo,),
+        ).fetchone()['phase'], 'PROJECT_BLOCKED')
+
     def test_project_owner_recovers_pushed_unrebased_review_commit(self):
         branch, published, corrected = 'loop-manager/G-001', 'a' * 40, 'b' * 40
         worktree = Path('/managed')

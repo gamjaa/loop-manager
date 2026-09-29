@@ -34,10 +34,13 @@ priority: critical
 
 ## Progress
 
-- [ ] R-045 증거 실패의 저장된 retry·차단 원인별 재평가
-- [ ] 차단 사건·진단 및 재검증 연결
-- [ ] 실제 Git 이력과 중단·재시작 회귀
+- [x] R-045 증거 실패의 저장된 retry·차단 원인별 재평가
+- [x] 차단 사건·진단 및 재검증 연결
+- [x] 실제 Git 이력과 중단·재시작 회귀
 
 ## Decision Log
+
+- Worker 재개 시 기존 변경을 보존했다. 실제 Git의 충돌 해결 뒤 동일 파일을 수정하는 두 후속 commit과 SQLite 재시작을 사용하는 개별 unit test로 계획·프로젝트 차단의 해제와 VERIFYING 전이를 검증했다. 외부 Worker·verify·Review 호출은 mock으로 두었으며 전체 verify는 Loop Manager에 남긴다.
+- 계획 차단 해제의 마지막 runtime 전이가 빈 project_values를 전달해 롤백되는 결함을 수정했다. 완료 증거 반영과 차단 해제를 하나의 중첩 안전 transaction에서 확정하고 실패·차단 사건 감사를 보존한다.
 
 - G-092는 R-023의 Agent Git 범위와 Manager 기준선 차단을 담당한다. 이 계획은 R-045의 완료 증거 오탐으로 남은 실패·차단만 다룬다.

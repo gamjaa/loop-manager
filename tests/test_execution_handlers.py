@@ -2,6 +2,7 @@
 from dataclasses import fields, replace
 import hashlib
 import json
+import os
 import sqlite3
 from pathlib import Path
 import tempfile
@@ -9,6 +10,7 @@ from types import SimpleNamespace
 from unittest import TestCase, mock
 
 import execution_handlers as handlers
+import rebase_block_reconciliation
 from execution_revision import DefinitionSnapshot
 import loop_manager as lm
 import notifications
@@ -38,6 +40,175 @@ VALID_WORKER_RESULT = 'WORKER_OUTCOME: {"kind":"ready_for_validation"}\nvalid re
 
 
 class ExecutionHandlerTests(TestCase):
+    def test_legacy_rebase_false_block_recovers_after_restart_with_later_file_changes(self):
+        self._legacy_rebase_false_block_recovery(plan_block=True)
+
+    def test_legacy_rebase_project_block_recovers_after_restart_with_later_file_changes(self):
+        self._legacy_rebase_false_block_recovery(plan_block=False)
+
+    def _legacy_rebase_false_block_recovery(self, *, plan_block):
+        self.journal_start.stop()
+        fixture = BlockedCheckpointGitAdapterTest(methodName='runTest')
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        self.addCleanup(fixture.tearDown)
+        repo = str(fixture.repo.resolve())
+        branch = 'loop-manager/G-034'
+        git = fixture.run_git
+        app = fixture.worktree / 'code.py'
+        lines = ['value=initial\n'] + [f'line-{n}\n' for n in range(30)]
+        app.write_text(''.join(lines))
+        git(fixture.worktree, 'add', 'code.py')
+        git(fixture.worktree, 'commit', '-m', 'Worker value')
+        for index in (20, 12):
+            lines[index] = f'later-{index}\n'
+            app.write_text(''.join(lines))
+            git(fixture.worktree, 'add', 'code.py')
+            git(fixture.worktree, 'commit', '-m', f'Later change {index}')
+        original = git(fixture.worktree, 'rev-parse', 'HEAD')
+        (fixture.repo / 'code.py').write_text('value=base\n')
+        git(fixture.repo, 'add', 'code.py')
+        git(fixture.repo, 'commit', '-m', 'Conflicting base')
+        target = git(fixture.repo, 'rev-parse', 'HEAD')
+        connection = fixture.connection
+        connection.execute(
+            "UPDATE exec_plans SET worker_session_id = 'saved-worker', "
+            "worker_result = 'accepted correction', verify_result = 'old pass', "
+            "review_result = 'old pass'",
+        )
+        lm.hydrate_execplan_project(connection, repo, connection.execute(
+            "SELECT * FROM exec_plans",
+        ).fetchone())
+        connection.execute("UPDATE projects SET phase = 'WORKING'")
+        checkpoint = ExecutionCheckpointRepository(connection)
+        checkpoint.record(
+            repo, 'G-034', expected_generation=0, operation='rebase',
+            expected_head=original, target_base_oid=target,
+            observed_remote_oid=None, snapshot={},
+        )
+        handler = lm._ExecutionLifecyclePorts(
+            connection, runtime_state.RuntimeStateRepository(connection),
+            repo=repo, repo_path=fixture.repo, state_dir=fixture.state_dir,
+            base='main', base_sha=target, provider='codex',
+            config_path=Path('/config'), newly_activated=False,
+        )
+        handler.plan = handler._cached_plan(handler.effects.state.active_execplan(repo))
+        context = handler._context()
+        journal = handlers.manager_git_journal
+        expected = dict(
+            branch=branch, before_head=original, target_base_oid=target,
+            remote_oid=None, agent_session_id='saved-worker',
+            affected_paths=['code.py'],
+        )
+        identity = journal.begin_rebase(
+            fixture.state_dir, owner='plan:G-034', repo=repo,
+            target=str(fixture.worktree.resolve()),
+            before=lm._owned_rebase_journal_state(fixture.worktree, branch),
+            expected=expected,
+        )
+        environment = dict(os.environ, GIT_REFLOG_ACTION=f'loop-manager-rebase:{identity}',
+                           GIT_EDITOR='true')
+        self.assertNotEqual(lm.git(
+            fixture.worktree, 'rebase', target, check=False, env=environment,
+        ).returncode, 0)
+        handler._finish_rebase_journal(context)
+        resolved = ['value=resolved\n'] + [f'line-{n}\n' for n in range(30)]
+        app.write_text(''.join(resolved))
+        git(fixture.worktree, 'add', 'code.py')
+        staged = lm._owned_rebase_journal_state(fixture.worktree, branch)
+        tree = git(fixture.worktree, 'write-tree')
+        continuation = journal.begin_rebase(
+            fixture.state_dir, owner='plan:G-034', repo=repo,
+            target=str(fixture.worktree.resolve()), before=staged,
+            expected={**expected, 'action': 'continue', 'staged_tree_oid': tree,
+                      'accepted_files': {'code.py': staged['dirty']['code.py'][1]}},
+        )
+        environment['GIT_REFLOG_ACTION'] = f'loop-manager-rebase:{continuation}'
+        self.assertEqual(lm.git(
+            fixture.worktree, 'rebase', '--continue', check=False, env=environment,
+        ).returncode, 0)
+        self.assertNotEqual(git(fixture.worktree, 'rev-parse', 'HEAD^{tree}'), tree)
+        reason = rebase_block_reconciliation.LEGACY_COMPLETION_DIAGNOSTIC
+        handlers.recovery_state.begin_external_run(connection)
+        handlers.recovery_state.RecoveryRepository(connection).observe(
+            handlers.RecoveryObservation(
+                handlers.RecoveryReason.STATUS_FAILED, repo, 'G-034', 'WORKING',
+                fixture.base_oid, fixture.base_oid, 'old-failure',
+                f'{fixture.base_oid}|saved-worker|', reason,
+            ),
+        )
+        if plan_block:
+            fixture.block('managed_worktree_conflict', reason)
+        else:
+            with connection:
+                connection.execute(
+                    "INSERT INTO project_blocks (repo, scope, reason_code, plan_id, "
+                    "evidence, previous_phase) VALUES (?, 'project', "
+                    "'repository_state_unsafe', 'G-034', ?, 'WORKING')", (repo, reason),
+                )
+                connection.execute("UPDATE projects SET phase = 'PROJECT_BLOCKED'")
+        subject = 'plan:G-034' if plan_block else 'project'
+        connection.execute(
+            "INSERT INTO notified_block_incidents "
+            "(repo, subject, block_key, event_key, payload) "
+            "VALUES (?, ?, 'legacy-failure', 'old-block-event', ?)",
+            (repo, subject, json.dumps({'cause': reason})),
+        )
+        database = fixture.state_dir / 'restart.db'
+        connection.commit()
+        with sqlite3.connect(database) as persisted:
+            connection.backup(persisted)
+        connection.close()
+        fixture.connection = sqlite3.connect(database)
+        fixture.connection.row_factory = sqlite3.Row
+        connection = fixture.connection
+        def resume():
+            if plan_block:
+                return lm.resume_plan_blocks(
+                    connection, fixture.repo, fixture.state_dir, repo, 'main',
+                )
+            return lm.resume_project_block_if_safe(
+                connection, fixture.repo, fixture.state_dir, repo,
+            )
+
+        with mock.patch.object(lm, 'pr_for_branch', return_value=None):
+            # Another session and planning state cannot borrow this proof.
+            connection.execute("UPDATE exec_plans SET worker_session_id = 'foreign'")
+            self.assertFalse(resume())
+            connection.execute("UPDATE exec_plans SET worker_session_id = 'saved-worker'")
+            connection.execute("UPDATE projects SET planning_error = 'independent error'")
+            self.assertFalse(resume())
+            self.assertEqual(connection.execute(
+                'SELECT planning_error FROM projects',
+            ).fetchone()[0], 'independent error')
+            connection.execute('UPDATE projects SET planning_error = NULL')
+            self.assertTrue(resume())
+            self.assertFalse(resume())
+        row = connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual(row['status'], 'VERIFYING')
+        self.assertEqual(row['worker_session_id'], 'saved-worker')
+        self.assertEqual(row['worker_result'], 'accepted correction')
+        self.assertIsNone(row['verify_result'])
+        self.assertIsNone(row['review_result'])
+        self.assertIsNone(scoped_blocking.plan_block(connection, repo, 'G-034'))
+        self.assertIsNone(scoped_blocking.project_block(connection, repo))
+        incidents = connection.execute('SELECT * FROM notified_block_incidents').fetchall()
+        self.assertEqual(len(incidents), 1)
+        self.assertIsNotNone(incidents[0]['released_at'])
+        self.assertEqual(json.loads(incidents[0]['payload'])['cause'], reason)
+        failure = connection.execute('SELECT * FROM persistent_execution_failures').fetchone()
+        self.assertEqual(failure['active'], 0)
+        self.assertEqual(failure['detail'], reason)
+        self.assertIsNotNone(failure['resolved_at'])
+        self.assertIsNone(ExecutionCheckpointRepository(connection).get(repo, 'G-034').operation)
+        self.assertEqual(handlers.recovery_state.RecoveryRepository(connection).row(
+            repo, 'G-034',
+        )['pending_action'], 'reconcile')
+        self.assertEqual(app.read_text().splitlines()[20], 'later-20')
+        self.assertEqual(app.read_text().splitlines()[12], 'later-12')
+        fixture.verify_probe.assert_not_called()
+        fixture.reviewer_probe.assert_not_called()
+
     def test_real_git_published_review_release_restart_and_correction(self):
         # Exercise the ownership boundary with real commits, refs, registration,
         # snapshots and SQLite persistence; only external PR/agent services are fake.
@@ -456,6 +627,16 @@ class ExecutionHandlerTests(TestCase):
             worker_result='accepted correction',
             verify_result='previous pass', review_result='previous review',
         )
+        handlers.recovery_state.begin_external_run(self.connection)
+        base_revision = str(self.state.row()['active_sha'])
+        handlers.recovery_state.RecoveryRepository(self.connection).observe(
+            handlers.RecoveryObservation(
+                handlers.RecoveryReason.STATUS_FAILED, 'repo', 'G-047',
+                'WORKING', 'plan-revision', base_revision, 'old-failure',
+                f'{base_revision}|saved-session|',
+                rebase_block_reconciliation.LEGACY_COMPLETION_DIAGNOSTIC,
+            ),
+        )
         checkpoint.record(
             'repo', 'G-047', expected_generation=0, operation='rebase',
             expected_head='before', target_base_oid='new-base',
@@ -495,6 +676,17 @@ class ExecutionHandlerTests(TestCase):
         self.assertIsNone(self.state.row()['review_result'])
         self.assertEqual(self.state.row()['worker_session_id'], 'saved-session')
         self.assertEqual(self.state.row()['worker_result'], 'accepted correction')
+        retry = handlers.recovery_state.RecoveryRepository(
+            self.connection,
+        ).row('repo', 'G-047')
+        self.assertEqual(retry['pending_action'], 'reconcile')
+        self.assertEqual(retry['reason_code'], 'status_failed')
+        failure = self.connection.execute(
+            "SELECT active, resolved_at FROM persistent_execution_failures "
+            "WHERE repo = 'repo' AND subject = 'G-047'",
+        ).fetchone()
+        self.assertEqual(failure['active'], 0)
+        self.assertIsNotNone(failure['resolved_at'])
         self.effects.workspace.git.assert_not_called()
 
     def test_autostash_completion_requires_approved_stage_and_matching_blob(self):
@@ -973,6 +1165,7 @@ class ExecutionHandlerTests(TestCase):
             handlers.manager_git_journal, 'begin_rebase',
             return_value='test-rebase-token',
         )
+        self.journal_start = journal_start
         journal_start.start()
         self.addCleanup(journal_start.stop)
         self.handler._rebase_journal_state = mock.Mock(return_value={})

@@ -139,6 +139,7 @@ import scoped_blocking
 import agent_scope_decision
 import rebase_file_evidence
 import managed_rebase_evidence
+import rebase_block_reconciliation
 import manager_git_journal
 from scoped_blocking import BlockReasonCode, BlockScope
 
@@ -16532,6 +16533,174 @@ def _clear_project_block_without_losing_planning_error(
         )
 
 
+def _reconcile_rebase_evidence_block(
+    connection: sqlite3.Connection, repo_path: Path, state_dir: Path,
+    repo: str, block: sqlite3.Row, *, plan_block: bool,
+) -> bool:
+    """Resume only a proven R-045 false block in its original execution slot."""
+
+    plan_id = str(block["plan_id"] or "")
+    plan = connection.execute(
+        "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+        (repo, plan_id),
+    ).fetchone()
+    project = connection.execute(
+        "SELECT * FROM projects WHERE repo = ?", (repo,),
+    ).fetchone()
+    if plan is None or project is None:
+        return False
+    checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(
+        connection,
+    ).get(repo, plan_id)
+    recovery = recovery_state.RecoveryRepository(connection).row(repo, plan_id)
+    if not rebase_block_reconciliation.block_matches(block, recovery, checkpoint):
+        operation_log(
+            f"R-045 rebase 차단 유지 ({plan_id}): 저장된 실패 원인·legacy "
+            "재생 증거 또는 rebase intent가 불완전합니다.", error=True,
+        )
+        return False
+    if (
+        runtime_state.planning_owns_execution_slot(project)
+        or int(plan["workspace_owned"] or 0) != WORKSPACE_OWNED
+        or not plan["branch"] or not plan["worktree"]
+        or recovery["base_revision"] != plan["active_sha"]
+        or not str(recovery["progress_marker"] or "").startswith(
+            f"{plan['active_sha'] or ''}|{plan['worker_session_id'] or ''}|"
+        )
+        or plan["agent_snapshot"] is not None
+        or project["agent_snapshot"] is not None
+        or project["agent_recovery"] is not None
+        or project["planning_error"]
+        or (plan_block and (plan["status"] != "PLAN_BLOCKED"
+            or plan["blocked_reason"] != block["reason_code"]))
+        or (plan_block and scoped_blocking.project_block(connection, repo) is not None)
+        or (not plan_block and project["phase"] != "PROJECT_BLOCKED")
+        or (not plan_block and plan["status"] == "PLAN_BLOCKED")
+        or (not plan_block and block["previous_phase"] not in
+            {"WORKING", "VERIFYING", "REVIEWING"})
+    ):
+        return False
+    if plan_block and recovery["phase"] not in {
+        "WORKING", "VERIFYING", "REVIEWING",
+    }:
+        return False
+    if plan_block and active_execplan(connection, repo) is not None:
+        return False
+    if not plan_block:
+        active = active_execplan(connection, repo)
+        if active is None or active["plan_id"] != plan_id:
+            return False
+    branch = str(plan["branch"])
+    worktree = Path(str(plan["worktree"]))
+    try:
+        validate_execplan_workspace_identity(
+            state_dir, repo, plan_id, branch, worktree,
+        )
+        validate_managed_worktree(repo_path, worktree, branch)
+        remote_oid = remote_branch_oid(repo_path, branch)
+        if remote_oid != checkpoint.observed_remote_oid:
+            operation_log(
+                f"R-045 rebase remote lease 불일치 ({plan_id}): "
+                f"expected={checkpoint.observed_remote_oid} observed={remote_oid}",
+                error=True,
+            )
+            return False
+        pull_request = pr_for_branch(
+            repo_path, branch, str(plan["pr_url"] or "") or None,
+        )
+        if plan["pr_url"]:
+            if (pull_request is None
+                    or pull_request.get("url") != plan["pr_url"]
+                    or pull_request.get("state") != "OPEN"
+                    or pull_request.get("headRefName") != branch
+                    or pull_request.get("baseRefName") != project["base_branch"]
+                    or pull_request.get("headRefOid") != plan["pr_head_oid"]
+                    or pull_request.get("headRefOid") != remote_oid):
+                operation_log(
+                    f"R-045 rebase PR head 불일치 ({plan_id}): "
+                    f"expected={plan['pr_head_oid']} "
+                    f"observed={(pull_request or {}).get('headRefOid')}",
+                    error=True,
+                )
+                return False
+        elif pull_request is not None:
+            operation_log(
+                f"R-045 rebase 예상 밖 PR ({plan_id}): "
+                f"observed={pull_request.get('headRefOid')}", error=True,
+            )
+            return False
+        with runtime_state._transaction(connection):
+            repository = runtime_state.RuntimeStateRepository(connection)
+            if plan_block:
+                restored_phase = str(recovery["phase"])
+                restored_status = (
+                    "IMPLEMENTING" if restored_phase == "WORKING"
+                    else restored_phase
+                )
+                projection = runtime_state.ExecutionSnapshot.from_row(
+                    plan,
+                ).project_values()
+                projection.update(phase=restored_phase, last_error=None)
+                repository.transition(
+                    repo, plan_id,
+                    plan_values={"status": restored_status, "last_error": None},
+                    project_values=projection, enqueue=False,
+                )
+            else:
+                scoped_blocking.clear_project_block(connection, repo)
+            handler = _ExecutionLifecyclePorts(
+                connection, repository, repo=repo, repo_path=repo_path,
+                state_dir=state_dir, base=str(project["base_branch"]),
+                base_sha=str(checkpoint.target_base_oid),
+                provider=str(project["provider"]),
+                config_path=ROOT / "config/config.ini",
+                newly_activated=False,
+            )
+            handler.catalog_plan = repository.active_row(repo)
+            handler.plan = handler._cached_plan(handler.catalog_plan)
+            context = handler._context()
+            current = handler.effects.checkpoint.get(repo, plan_id)
+            row = handler._row()
+            if not handler._owned_checkpoint_remote(
+                context, row, remote_oid, current, pull_request,
+            ):
+                raise RuntimeError("R-045 rebase: published checkpoint owner differs")
+            handler._finish_rebase_journal(context, allow_equal=True)
+            observed_remote = remote_branch_oid(repo_path, branch)
+            observed_pr = pr_for_branch(
+                repo_path, branch, str(plan["pr_url"] or "") or None,
+            )
+            if observed_remote != remote_oid or observed_pr != pull_request:
+                raise RuntimeError(
+                    "R-045 rebase remote lease/PR head: "
+                    f"expected={remote_oid}/{(pull_request or {}).get('headRefOid')} "
+                    f"observed={observed_remote}/{(observed_pr or {}).get('headRefOid')}"
+                )
+            handler._complete_rebase_intent(context)
+            recovery_state.RecoveryRepository(
+                connection,
+            ).resolve_rebase_evidence_failure(
+                repo, plan_id, base_revision=str(plan["active_sha"] or ""),
+                worker_session=str(plan["worker_session_id"] or ""),
+                released_block_reason=str(block["reason_code"]),
+            )
+            if plan_block:
+                scoped_blocking.clear_plan_block(connection, repo, plan_id)
+                repository.transition(
+                    repo, plan_id,
+                    plan_values={
+                        "blocked_reason": None, "blocked_fingerprint": None,
+                        "blocked_worktree_fingerprint": None,
+                        "blocked_review_fingerprint": None,
+                    },
+                    project_values={"last_error": None}, enqueue=False,
+                )
+        return True
+    except (RuntimeError, OSError, ValueError, sqlite3.Error) as error:
+        operation_log(f"R-045 rebase 차단 재평가 보류 ({plan_id}): {error}", error=True)
+        return False
+
+
 def resume_project_block_if_safe(
     connection: sqlite3.Connection,
     repo_path: Path,
@@ -16543,6 +16712,10 @@ def resume_project_block_if_safe(
     block = scoped_blocking.project_block(connection, repo)
     if block is None:
         return False
+    if rebase_block_reconciliation.could_be_rebase_evidence_block(block):
+        return _reconcile_rebase_evidence_block(
+            connection, repo_path, state_dir, repo, block, plan_block=False,
+        )
     if block["reason_code"] == BlockReasonCode.LEGACY_UNSCOPED_BLOCK.value:
         return False
     plan_id = str(block["plan_id"] or "")
@@ -17548,6 +17721,16 @@ def resume_plan_blocks(
     ).recovery_slot_available(repo):
         return False
     for blocked in plan_blocked_execplans(connection, repo):
+        current_block = scoped_blocking.plan_block(
+            connection, repo, str(blocked["plan_id"]),
+        )
+        if rebase_block_reconciliation.could_be_rebase_evidence_block(current_block):
+            if _reconcile_rebase_evidence_block(
+                connection, repo_path, state_dir, repo, current_block,
+                plan_block=True,
+            ):
+                return True
+            continue
         if blocked["blocked_reason"] == PR_CLOSED_BLOCK_REASON:
             continue
         checkpoint_row = connection.execute(
