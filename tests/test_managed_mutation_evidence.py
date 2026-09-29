@@ -875,6 +875,65 @@ class ManagedTransitionTests(unittest.TestCase):
         self.assertEqual(current.observed_remote_oid, OLD)
         self.assertEqual(current.snapshot, {'owned': True})
 
+    def test_direct_rebase_completion_rechecks_pre_head_marker_after_head_record(self):
+        connection = sqlite3.connect(':memory:')
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        repository = ExecutionCheckpointRepository(connection)
+        original_marker = {
+            'owner_oid': OLD, 'before_head': OLD, 'target_base_oid': NEW,
+            'after_head': None, 'before_snapshot': 'preserved worktree',
+        }
+        recorded_marker = {**original_marker, 'after_head': NEW}
+        repository.record(
+            'repo', 'G-091', expected_generation=0, operation='rebase',
+            expected_head=OLD, target_base_oid=NEW,
+            observed_remote_oid=OLD,
+            snapshot={'rebase_run_id': 'run', 'blocked_resume': recorded_marker},
+        )
+        sealed = {
+            'head': NEW, 'branch': BRANCH, 'ref': [NEW, ''],
+            'registration': ['owned'], 'operations': {}, 'metadata': None,
+            'index': {}, 'dirty': {},
+        }
+        observed = {**sealed, 'dirty': {'app.py': [['staged'], 'accepted']}}
+        transition = {
+            'intent': {'id': 'sealed', 'kind': 'managed_rebase',
+                       'target': '/owned', 'expected': {
+                           'before_head': OLD, 'target_base_oid': NEW,
+                           'remote_oid': OLD, 'run_id': 'run'}},
+            'result': {'observed': sealed},
+        }
+        with (mock.patch.object(loop_manager, '_owned_rebase_state_dir',
+                                return_value=Path('/state')),
+              mock.patch.object(loop_manager, '_owned_rebase_journal_state',
+                                return_value=observed),
+              mock.patch.object(loop_manager, 'capture_git_snapshot',
+                                return_value=SimpleNamespace()),
+              mock.patch.object(loop_manager, '_blocked_resume_worktree_matches',
+                                side_effect=lambda _path, marker, _snapshot:
+                                marker['after_head'] is None),
+              mock.patch.object(journal, 'verified_managed_transitions',
+                                return_value=[transition]),
+              mock.patch.object(loop_manager.runtime_state,
+                                'RuntimeStateRepository') as runtime):
+            runtime.return_value.projected.return_value = None
+            with self.assertRaises(journal.MutationEvidenceError):
+                loop_manager._complete_direct_rebase_checkpoint(
+                    connection, 'repo', 'G-091', Path('/owned'), NEW,
+                    repo_path=Path('/repo'), branch=BRANCH,
+                    agent_session_id=None, preserved_worktree=True,
+                )
+            loop_manager._complete_direct_rebase_checkpoint(
+                connection, 'repo', 'G-091', Path('/owned'), NEW,
+                repo_path=Path('/repo'), branch=BRANCH,
+                agent_session_id=None, preserved_worktree=True,
+                preserved_marker=original_marker,
+            )
+        saved = repository.get('repo', 'G-091')
+        self.assertIsNone(saved.operation)
+        self.assertEqual(saved.snapshot['rebase_completion']['id'], 'sealed')
+
 
 class DetachedRebaseOwnershipTests(unittest.TestCase):
     def test_rebase_start_retry_reuses_frozen_run_and_generation(self):

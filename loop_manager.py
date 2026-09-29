@@ -9557,6 +9557,7 @@ def _complete_direct_rebase_checkpoint(
     worktree: Path, target_base_oid: str,
     *, repo_path: Path, branch: str, agent_session_id: str | None,
     preserved_worktree: bool = False,
+    preserved_marker: Mapping[str, object] | None = None,
 ) -> None:
     repository = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
     current = repository.get(repo, plan_id)
@@ -9567,7 +9568,18 @@ def _complete_direct_rebase_checkpoint(
                 'direct rebase completion: journal or target missing'
             )
         observed = _owned_rebase_journal_state(worktree, branch)
-        marker = (current.snapshot or {}).get('blocked_resume')
+        recorded_marker = (current.snapshot or {}).get('blocked_resume')
+        marker = preserved_marker if preserved_marker is not None else recorded_marker
+        if preserved_marker is not None and (
+            not isinstance(recorded_marker, dict)
+            or any(marker.get(field) != recorded_marker.get(field) for field in (
+                'owner_oid', 'before_head', 'target_base_oid', 'before_snapshot',
+            ))
+            or marker.get('after_head') not in (None, recorded_marker.get('after_head'))
+        ):
+            raise manager_git_journal.MutationEvidenceError(
+                'direct rebase completion: preserved checkpoint marker changed'
+            )
         preserved = (
             preserved_worktree and isinstance(marker, dict)
             and _blocked_resume_worktree_matches(
@@ -9594,7 +9606,9 @@ def _complete_direct_rebase_checkpoint(
                     and observed.get('metadata') is None]
         if len(matching) != 1:
             raise manager_git_journal.MutationEvidenceError(
-                'direct rebase completion: unique owned result unavailable'
+                'direct rebase completion: unique owned result unavailable '
+                f'(transitions={len(transitions)}, preserved={preserved}, '
+                f'matching={len(matching)})'
             )
         intent = matching[0]['intent']
         completion = {
@@ -15227,6 +15241,8 @@ def resume_blocked_execplan_if_inputs_changed(
             _update_blocked_error(connection, repo, str(plan['plan_id']),
                                   '차단 해제 rebase 이후 보존한 작업 상태가 다릅니다.')
             return False
+        # Keep the exact preservation marker that just passed. Recording the
+        # new HEAD changes its unstaging allowance before journal completion.
         _record_blocked_resume_head(
             connection, repo, str(plan['plan_id']), owned_oid,
             before_head, target_base_oid, after_head,
@@ -15237,6 +15253,7 @@ def resume_blocked_execplan_if_inputs_changed(
                 target_base_oid, repo_path=repo_path, branch=branch,
                 agent_session_id=plan['worker_session_id'],
                 preserved_worktree=True,
+                preserved_marker=pending.snapshot['blocked_resume'],
             )
     elif base_ancestry.returncode == 1:
         _complete_direct_rebase_checkpoint(

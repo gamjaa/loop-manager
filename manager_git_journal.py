@@ -916,6 +916,8 @@ def verified_rebase_completion(
     slot = _slot(state_dir, repo, 'managed_rebase', target)
     observed = observe()
     matches = []
+    owned_intents = 0
+    unverified_corrections = 0
     for result_path in slot.glob('*.result.json'):
         result = _read(result_path)
         sealed_observed = result.get('observed')
@@ -941,16 +943,22 @@ def verified_rebase_completion(
                     or expected['checkpoint_generation'] > checkpoint_generation
                 ))):
             continue
+        owned_intents += 1
         if (sealed_observed != observed
                 and (later_correction is None
                      or not later_correction(intent, sealed_observed, observed))):
+            unverified_corrections += 1
             continue
         if (result.get('candidates') != validate(intent, sealed_observed)
                 or result.get('replay_proof') != replay_proof(intent, sealed_observed)):
             raise MutationEvidenceError('rebase stored completion: evidence changed')
         matches.append({'intent': intent, 'result': result})
     if len(matches) != 1:
-        raise MutationEvidenceError('rebase stored completion: unique owned result unavailable')
+        raise MutationEvidenceError(
+            'rebase stored completion: unique owned result unavailable '
+            f'(owned={owned_intents}, unverified correction={unverified_corrections}, '
+            f'matching={len(matches)})'
+        )
     return matches[0]
 
 

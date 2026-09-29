@@ -517,6 +517,14 @@ class ExecutionHandlerTests(TestCase):
         self.assertTrue(self.handler._completed_autostash_correction(
             context, intent, sealed, live,
         ))
+        self.assertTrue(self.handler._completed_autostash_correction(
+            context, intent,
+            {**sealed, 'operations': {'MERGE_MSG': 'sealed-marker'}}, live,
+        ))
+        self.assertFalse(self.handler._completed_autostash_correction(
+            context, intent,
+            {**sealed, 'operations': {'REBASE_HEAD': 'owned-marker'}}, live,
+        ))
         self.assertFalse(self.handler._completed_autostash_correction(
             context, intent, sealed,
             {**live, 'dirty': {**live['dirty'], 'extra.py': [['staged'], 'extra']}},

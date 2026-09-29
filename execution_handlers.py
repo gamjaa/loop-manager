@@ -1815,6 +1815,13 @@ class ExecutionHandlers:
         stage = saved.get('stage_evidence')
         accepted = stage.get('files') if isinstance(stage, dict) else None
         modes = stage.get('modes') if isinstance(stage, dict) else None
+        sealed_operations = sealed.get('operations')
+        live_operations = live.get('operations')
+        operation_markers_match = (
+            live_operations == sealed_operations
+            or (isinstance(sealed_operations, dict) and live_operations == {}
+                and set(sealed_operations) <= {'MERGE_MSG', 'MERGE_MODE'})
+        )
         if (intent['expected'].get('evidence_version') != 2
                 or not saved.get('stash_oid') or saved.get('pending') != 'continue'
                 or intent['expected'].get('agent_session_id')
@@ -1823,7 +1830,7 @@ class ExecutionHandlers:
                 or not accepted or not isinstance(modes, dict)
                 or sealed.get('metadata') is not None or not sealed.get('unmerged')
                 or live.get('metadata') is not None or live.get('unmerged')
-                or live.get('operations') != sealed.get('operations')
+                or not operation_markers_match
                 or any(live.get(field) != sealed.get(field) for field in (
                     'head', 'branch', 'ref', 'registration',
                 ))):
