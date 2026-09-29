@@ -15,9 +15,15 @@ priority: critical
 
 현재 Codex의 `--approve-for-me`와 Claude의 `acceptEdits` 호출만으로는 Agent가 선택된 관리 worktree 밖의 파일과 공유 Git metadata를 쓸 수 없다는 증거가 없다. R-023의 무관한 Git 변화 비차단 판단에 앞서 실행별 쓰기 격리를 검증 가능한 상태로 만든다.
 
+## Scope and Environment Assumptions
+
+- 사용자는 2026-09-29에 하위 경로에 별도 Git 경로가 있거나 이와 유사한 특수 배치가 있는 경우를 고려하지 않아도 된다고 결정했다. 이 계획은 선택된 writable worktree와 실행별 임시 경로 안에 별도 하위 Git 저장소가 없고, 기본 source checkout·다른 worktree·shared Git metadata를 하위 경로로 노출하는 별도 bind mount 별칭이 없는 운영 환경을 전제로 한다.
+- 하위 Git 저장소 및 위와 같은 mount 별칭의 전수 탐지, 별칭 원본의 device·inode 대조, 해당 배치를 통한 우회 방지와 그 회귀 테스트는 이 계획의 구현·격리 증명·Review 범위에서 제외한다. 그 전제를 프로그램이 별도로 증명하도록 요구하지 않으며, 해당 제외 사례만을 이유로 격리 확인을 거부하거나 blocking issue를 만들지 않는다.
+- 선택된 등록 저장소의 표준 `.git` 디렉터리 또는 linked worktree의 `.git` 파일, 실제 per-worktree Git directory와 common/shared Git directory는 보호 대상이다. 기본 source checkout과 다른 등록 worktree의 canonical 경로, provider 내부 쓰기와 역할별 허용 파일·index 범위에 대한 기존 검증은 계속 적용한다.
+
 ## Acceptance Criteria
 
-- Planner·Worker·Reviewer와 유지보수 Planner의 실제 호출에서 선택된 관리 worktree의 허용 파일·index 경계 밖, 기본 source checkout, 다른 worktree 및 shared Git metadata에 대한 Agent 쓰기가 차단됨을 실행 전에 증명한다. provider 내부 동작 때문에 이를 분리해 증명할 수 없는 환경은 격리 확인으로 표시하지 않는다.
+- 위 운영 환경 전제에서 Planner·Worker·Reviewer와 유지보수 Planner의 실제 호출 중 선택된 관리 worktree의 허용 파일·index 경계 밖, 기본 source checkout, 다른 worktree 및 shared Git metadata에 대한 Agent 쓰기가 차단됨을 실행 전에 증명한다. provider 내부 동작 때문에 이를 분리해 증명할 수 없는 환경은 격리 확인으로 표시하지 않는다.
 - 격리 증거는 provider, 실행 환경, 역할, 선택된 canonical worktree, repository identity 및 Agent session/turn에 결합해 보존한다. 재개·provider 전환·설정 변경·중단 뒤에는 이전 증거를 무조건 재사용하지 않는다.
 - 쓰기 격리를 검증할 수 없는 실행과 이를 증명할 수 없는 과거 기록은 기존의 엄격한 shared ref·다른 worktree 감시를 유지한다. 격리 확인 실패를 근거로 Agent의 Git·worktree·push·PR 권한을 확대하거나 무관한 변화를 외부 변경으로 추정하지 않는다.
 - 지원하는 Linux·Windows 및 Codex·Claude 호출에서 격리 적용·거부 결과가 명확하며, 비밀값과 기본 worktree의 로컬 상태를 노출하거나 변경하지 않는다. 격리와 기존 허용 변경이 양립하지 않는 경우에는 무인 실행을 안전하게 멈추고 구체적 원인을 남긴다.
@@ -32,6 +38,7 @@ priority: critical
 
 - Worker는 `tests/test_agent_invocation.py`와 직접 변경한 `tests/test_origin_isolation.py`의 격리·session targeted unit test만 실행한다.
 - 선택 worktree 쓰기 허용, 기본 checkout·다른 worktree·shared metadata 쓰기 거부, provider/OS별 설정 불가, 재개·전환·중단 뒤 증거 무효화와 과거 세션의 엄격 fallback을 검증한다.
+- 하위 Git 저장소 또는 보호 경로의 하위 bind mount 별칭이 존재하는 배치는 검증 대상에 포함하지 않는다. 등록된 저장소 자체의 `.git` 파일과 실제 shared Git metadata 보호는 검증 대상에 포함한다.
 - 전체 verify에서 기존 Agent 결과 protocol, 승인된 guidance, process lock과 비밀값 격리가 유지돼야 한다.
 
 ## Progress
@@ -44,3 +51,5 @@ priority: critical
 - R-023은 격리 증명 없는 실행에서 무관한 Git 변화의 비차단을 허용하지 않는다. 특정 CLI 옵션의 존재를 격리 증명으로 간주하지 않는다.
 
 - 2026-09-26: 사용자 요청에 따라 반복되는 Manager rebase 소유권 오탐을 기존 G-091에서 먼저 수정한다. G-091의 구현 PR이 Merge된 뒤 이 계획의 기존 작업물과 게시 checkpoint를 보존해 재개한다.
+
+- 2026-09-29 User Decision: 사용자가 G-088의 차단 알림에 포함된 하위 writable mount의 source/shared Git 별칭 사례를 제시하며, 하위 경로에 Git 경로가 있는 등의 사례를 고려하지 않아도 된다고 명시했다. 위 운영 환경 전제와 제외 범위를 승인된 계획 범위로 반영한다. `loop_manager.py::run_agent::missing-write-isolation`의 마지막 Review가 요구한 하위 bind mount 별칭 탐지·거부 및 회귀 테스트는 현재 Acceptance Criteria가 아니다. Worker와 Reviewer는 남아 있는 실제 격리 요구를 확인하되 이 제외 사례를 다시 교정 또는 blocking 근거로 사용하지 않는다. 기존 Review·실패 감사는 보존하고, 계획 입력 변경을 감지한 Manager가 정상 재개와 필요한 검증·Review를 수행한다.
