@@ -356,6 +356,32 @@ target base나 원격 OID가 달라졌으면 저장된 작업의 완료 사실�
 
 직접 변경한 판정·저장 경계에는 targeted unit test를 두고, Manager가 실행하는 전체 verify에서는 실제 Git 이력의 충돌 해결·여러 후속 commit의 동일 파일 변경·다중 충돌·기존 PR 및 PR 없는 checkpoint를 확인한다. 각 저장 경계의 중단을 주입해 완료된 단계가 반복되지 않고 이후 Worker 교정·verify·Review까지 진행되는지 확인한다. 해결 tree 변조, 범위 밖 stage, 후속 commit 누락·변조, 다른 invocation의 증거, 원격 OID 변경과 불완전한 legacy 기록은 계속 거부해야 한다. 이 검증 책임은 기존 Worker·Manager·Reviewer 분담을 따른다.
 
+### 차단 중 원격 반영과 checkpoint 갱신 — R-046 목표 설계
+
+이 절은 `docs/requirements/[R-046] Blocked Plan Remote Reconciliation and Checkpoint Refresh.md`의 목표 설계다. 구현·Merge 전의 현재 제품 동작으로 해석하지 않는다. `PROJECT_BLOCKED`에서 계획별 복구 Git 쓰기를 허용하는 것은 기존 안전 gate의 정책 변경이며, 일반 Worker·Planner 실행을 여는 것과 분리한다.
+
+#### 원격 관측과 실행 자리
+
+프로젝트 실행의 안전 gate보다 앞에서, 등록된 origin과 현재 조회 대상의 일치를 확인하고 저장된 base branch와 각 차단 계획의 정확한 작업 branch를 읽기 전용 원격 조회로 관측한다. 원격 URL, ref 이름, OID 또는 실패 원인과 관측 시각을 계획별 durable 기록에 저장한다. 프로젝트 차단이나 다른 활성 계획이 있어도 관측은 수행한다. 관측 OID는 소유권 증거나 해제 판정이 아니며, 기본 worktree의 파일·index·HEAD를 변경하지 않는다. 원격 조회 실패는 마지막 확정 OID를 덮지 않는다.
+
+계획별 처리 키는 원래 차단 원인과 검사 입력 지문, 관측 base OID, 관측 작업 branch OID 및 로컬 작업 지문을 포함한다. 같은 키에서 확정된 결과는 반복 rebase·검사·알림을 만들지 않고, 어느 관련 입력이 바뀌어도 다시 평가한다. 관측은 활성 계획과 병행할 수 있지만 fetch·worktree 변경·rebase·checkpoint commit·push는 프로젝트별 단일 변경 자리가 비었거나 차단된 동일 계획이 점유한 경우에만 수행한다. 활성인 다른 계획이나 PR 충돌 복구의 Git 변경을 중단시키지 않는다.
+
+#### 계획별 반영과 원인 재검증
+
+변경 자리를 얻으면 원격 ref와 PR 상태를 다시 조회해 관측·처리 사이의 경쟁을 확인한다. 저장된 계획·branch·worktree와 작업 범위를 대조하고, 원격 작업 branch가 R-039의 후속 commit 조건을 만족하면 정확한 ref를 fetch해 로컬 작업을 보존하는 방식으로 먼저 반영한다. 삭제·재작성·분기, 기존 PR 또는 보존할 수 없는 로컬 변경은 해당 이유를 기록하고 원격 ref를 덮지 않는다.
+
+원격 base가 전진했으면 계획·Requirement의 내용 지문이 같아도 해당 계획의 관리 작업 공간에서 rebase를 수행한다. 시작 HEAD, 원본 commit 집합, target base, 작업 branch의 마지막 확인 원격 OID와 저장된 세션·journal identity를 하나의 복구 intent에 결합한다. R-045의 단계별 증거 검증으로 완료를 확정하고, 충돌은 기존 Worker 교정 경계로 보내거나 미해결 상태를 보존한다. 충돌 중에는 checkpoint commit·push를 시작하지 않는다. 이미 완료된 Git 효과는 재시작 후 증거를 대조해 확정하고 같은 rebase를 반복하지 않는다.
+
+완료된 후보 revision에서 원래 차단 원인을 해당 원인의 해제 검사로 재평가한다. 원인 해소와 별도 안전 gate 해제를 구분해 SQLite에 기록한다. 해제한 계획은 기존 세션·branch·worktree로 재개하되 변경된 후보에 필요한 Worker 확인, targeted test, 전체 verify와 Review를 거친다. 원인이 남으면 계획 또는 프로젝트의 차단 이유를 보존한 채 R-015의 checkpoint 경계로 현재 작업물 게시를 시도한다. checkpoint 게시 자체는 어떤 차단도 해제하지 않는다.
+
+#### 게시와 미게시 결과
+
+원래 작업 branch에 게시할 때는 게시 checkpoint와 마지막 채택 원격 OID를 다시 확인한다. fast-forward가 아니면 PR 없는 동일한 소유 branch의 검증된 rebase 결과에만 정확한 원격 OID의 `--force-with-lease`를 적용한다. 게시 직전 원격 OID가 바뀌면 push를 중단하고 새 관측부터 재평가한다. 재검증 뒤에도 차단이 남아 있다면 안전한 미커밋 변경만 결정적 checkpoint commit에 포함하고, 이미 같은 head가 원격에 있으면 빈 commit이나 반복 push 없이 그 OID와 남은 원인을 게시 결과로 기록한다.
+
+원래 작업 branch의 게시 계보를 확정할 수 없어 기존 ref를 갱신할 수 없을 때는 해당 ref를 덮지 않는 별도 진단 branch에 검증 가능한 commit만 게시한다. 진단 branch 이름은 계획과 작업물 identity에 결합하고 원격에 없을 때만 생성한다. 이미 같은 OID가 있으면 게시 완료로 확정하고, 다른 OID가 있으면 갱신하거나 재사용하지 않는다. 이름·원본 plan·base·작업 branch·원인·내용 OID를 저장하고, 재시작 시 같은 결과를 중복 생성하지 않는다. 이 ref는 PR head나 소유권 증거로 자동 채택하지 않는다. 대상 작업의 범위·Git 상태가 불확실하거나 rebase가 미완료이면 원격 쓰기를 하지 않고 local-only 원인과 보존된 작업 경로를 기록한다. 차단 알림은 성공 시 확인 가능한 원격 OID와 ref를, 실패 시 실제 미게시 이유를 포함한다.
+
+관측, fetch, rebase, 원인 재검증, checkpoint commit, push와 SQLite 확정은 각각 중단될 수 있다. 각 단계의 기대 OID와 실제 Git 효과를 재확인한 뒤에만 다음 단계로 넘어가며, 중단 복구는 사용자 commit·로컬 변경·원래 차단 감사와 다른 계획의 상태를 보존한다. 자동 검증은 동시 base·작업 branch 변경, 활성 계획 중 관측, 프로젝트 차단 중 계획별 복구, 원인 지속·해소, 동일 입력 반복, 미해결 충돌, 원격 경쟁과 단계별 중단을 실제 Git 이력으로 다룬다.
+
 ## 검증과 재시도
 
 - Worker는 구현과 관련 targeted unit test를 작성하고, 수정 범위에 직접 관련된 최소 unit test command만 실행한다
