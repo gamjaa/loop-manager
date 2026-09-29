@@ -38,6 +38,19 @@ def source_commits(git: Callable[..., Any], repo: Any, original: str,
     commits = result.stdout.splitlines()
     if result.returncode or any(not commit for commit in commits):
         raise ReplayEvidenceError('start', None, None, 'source order unavailable')
+    merges = git(repo, 'rev-list', '--min-parents=2', f'{base}..{original}',
+                 check=False)
+    if merges.returncode:
+        raise ReplayEvidenceError('start', None, None, 'merge source order unavailable')
+    if merges.stdout.strip():
+        historical = git(repo, 'rev-list', '--reverse', f'{base}..{original}',
+                         check=False)
+        if historical.returncode:
+            raise ReplayEvidenceError('start', None, None, 'source order unavailable')
+        reconcile_frozen_sources(
+            git, repo, original=original, target=target, base=base,
+            frozen=historical.stdout.splitlines(), current=commits,
+        )
     return base, commits
 
 
