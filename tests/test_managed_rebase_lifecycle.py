@@ -49,6 +49,12 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
     def test_legacy_same_file_replay_restart_after_journal_seal(self):
         self._lifecycle(with_pr=True, legacy=True, sealed_restart=True)
 
+    def test_legacy_checkpoint_restart_before_journal_seal(self):
+        self._lifecycle(with_pr=False, legacy=True)
+
+    def test_legacy_checkpoint_restart_after_journal_seal(self):
+        self._lifecycle(with_pr=False, legacy=True, sealed_restart=True)
+
     def _lifecycle(self, *, with_pr, legacy=False, sealed_restart=False):
         # Reuse only the deterministic service bundle, not the policy fixture's
         # substituted Manager rebase methods or its substituted journal writer.
@@ -321,6 +327,11 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                 self.assertEqual(completed_checkpoint.snapshot['rebase_completion']['id'], sealed_id)
             handler._complete_rebase_intent(handler._context())
             self.assertEqual(effects.checkpoint.get('repo', 'G-047'), completed_checkpoint)
+            if not with_pr:
+                self.assertTrue(handler._owned_checkpoint_remote(
+                    handler._context(), handler._row(), original,
+                    effects.checkpoint.get('repo', 'G-047'),
+                ))
             self.assertEqual(effects.state.row()['worker_session_id'], 'worker-session')
             self.assertEqual(handler.rebase_corrections.get('repo', 'G-047').audit, audit_before)
             self.assertEqual(len(resolutions), 1 if legacy else 2)

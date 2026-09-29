@@ -641,17 +641,19 @@ class ExecutionHandlers:
         if (not proof or row['pr_url']
                 or (pull_request is not None and current.operation != 'pr_create')):
             return False
+        correction = proof.get('autostash_correction')
+        completion_session = (correction.get('session')
+                              if isinstance(correction, dict) else proof.get('session'))
         expected = {
             'before_head': proof.get('before_head'),
             'after_head': proof.get('after_head'),
             'target_base_oid': proof.get('target_base_oid'),
             'remote_oid': proof.get('remote_oid'),
-            'run_id': proof.get('run_id'),
             'branch': context.branch,
             'worktree': str(context.worktree.resolve()),
-            'session': getattr(context, 'worker_session_id', None),
         }
-        if (not all(expected.values())
+        if (completion_session != getattr(context, 'worker_session_id', None)
+                or not all(expected.values())
                 or any(proof.get(key) != value for key, value in expected.items())
                 or current.target_base_oid != proof['target_base_oid']
                 or current.expected_head is None):
@@ -716,12 +718,18 @@ class ExecutionHandlers:
             )
             if interrupted_commit:
                 candidate_oid = observed['head']
+            approved_stage = (
+                isinstance(correction, dict)
+                and candidate_oid == proof['after_head']
+                and observed == correction.get('approved')
+            )
             if (observed['head'] != candidate_oid
                     or observed['branch'] != context.branch
                     or observed['ref'] != [candidate_oid, '']
                     or observed['metadata'] is not None
                     or observed['operations'] or observed['unmerged']
-                    or not observed['index_clean'] or observed['dirty']):
+                    or (not approved_stage and (
+                        not observed['index_clean'] or observed['dirty']))):
                 return False
             if candidate_oid != proof['after_head']:
                 if (not interrupted_commit
@@ -741,12 +749,30 @@ class ExecutionHandlers:
                         [line.split() for line in live.stdout.splitlines() if line.strip()]
                         != [[remote_oid, f'refs/heads/{context.branch}']]):
                     return False
+            def matches_completion(item):
+                sealed = item['result']['observed']
+                if isinstance(correction, dict):
+                    if sealed != correction.get('sealed'):
+                        return False
+                    approved = correction.get('approved')
+                    if (not isinstance(approved, dict)
+                            or not correction.get('stash_oid')
+                            or not correction.get('stage_evidence')
+                            or approved.get('head') != proof['after_head']
+                            or approved.get('unmerged')
+                            or approved.get('metadata') is not None
+                            or approved.get('operations')):
+                        return False
+                    return candidate_oid != proof['after_head'] or approved == observed
+                return (not sealed.get('dirty') and sealed.get('index_clean') is True
+                        and (candidate_oid != proof['after_head'] or sealed == observed))
+
             return any(
                 item['intent']['id'] == proof['journal_id']
                 and item['intent']['target'] == proof['worktree']
                 and item['intent']['expected'].get('checkpoint_generation', -1)
                     <= proof['generation']
-                and item['intent']['expected'].get('run_id') == proof['run_id']
+                and item['intent']['expected'].get('run_id') == proof.get('run_id')
                 and item['intent']['expected'].get('branch') == context.branch
                 and item['intent']['expected'].get('before_head') == proof['before_head']
                 and item['intent']['expected'].get('target_base_oid') == proof['target_base_oid']
@@ -754,10 +780,7 @@ class ExecutionHandlers:
                 and item['result']['observed'].get('head') == proof['after_head']
                 and item['result']['observed'].get('ref') == [proof['after_head'], '']
                 and item['result']['observed'].get('metadata') is None
-                and not item['result']['observed'].get('dirty')
-                and item['result']['observed'].get('index_clean') is True
-                and (candidate_oid != proof['after_head']
-                     or item['result']['observed'] == observed)
+                and matches_completion(item)
                 for item in manager_git_journal.verified_managed_transitions(
                     self.state_dir, str(self.repo_path.resolve()),
                     f'plan:{context.plan.plan_id}',
@@ -770,8 +793,6 @@ class ExecutionHandlers:
 
     def _completed_rebase_proof(self, context, current, remote_oid, observed):
         """Bind the SQLite completion generation to one verified journal result."""
-        if (current.snapshot or {}).get('rebase_evidence_version') != 2:
-            return None
         for item in manager_git_journal.verified_managed_transitions(
             self.state_dir, str(self.repo_path.resolve()),
             f'plan:{context.plan.plan_id}',
@@ -788,10 +809,10 @@ class ExecutionHandlers:
                     and expected.get('target_base_oid') == current.target_base_oid
                     and expected.get('remote_oid') == remote_oid
                     and item['result']['observed'] == observed):
-                return {
+                proof = {
                     'journal_id': item['intent']['id'],
                     'generation': current.generation,
-                    'run_id': expected['run_id'],
+                    'run_id': expected.get('run_id'),
                     'before_head': current.expected_head,
                     'after_head': observed['head'],
                     'target_base_oid': current.target_base_oid,
@@ -800,6 +821,19 @@ class ExecutionHandlers:
                     'worktree': str(context.worktree.resolve()),
                     'session': self._rebase_completion_session(context, current),
                 }
+                snapshot = current.snapshot or {}
+                if snapshot.get('stash_oid') and snapshot.get('pending') == 'continue':
+                    live = self._rebase_journal_state(context)
+                    if not self._completed_autostash_correction(
+                            context, item['intent'], observed, live):
+                        return None
+                    proof['autostash_correction'] = {
+                        'sealed': observed, 'approved': live,
+                        'stash_oid': snapshot['stash_oid'],
+                        'stage_evidence': snapshot.get('stage_evidence'),
+                        'session': getattr(context, 'worker_session_id', None),
+                    }
+                return proof
         return None
 
     def _owned_completed_rebase(

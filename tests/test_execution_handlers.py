@@ -3130,6 +3130,12 @@ class ExecutionHandlerTests(TestCase):
             ))
 
     def test_normal_published_rebase_completion_persists_sealed_owner(self):
+        self._published_rebase_completion(legacy=False)
+
+    def test_legacy_published_rebase_completion_persists_sealed_owner(self):
+        self._published_rebase_completion(legacy=True)
+
+    def _published_rebase_completion(self, *, legacy):
         blocked_checkpoint_state.ensure_schema(self.connection)
         self.connection.execute(
             "INSERT INTO blocked_checkpoints "
@@ -3148,11 +3154,11 @@ class ExecutionHandlerTests(TestCase):
             'repo', 'G-047', expected_generation=0, operation='rebase',
             expected_head='remote', target_base_oid='base',
             observed_remote_oid='remote',
-            snapshot={'rebase_evidence_version': 2, 'rebase_run_id': 'run'},
+            snapshot={} if legacy else {'rebase_evidence_version': 2, 'rebase_run_id': 'run'},
         )
         observed = {'head': 'owned-head', 'branch': context.branch,
                     'ref': ['owned-head', ''], 'metadata': None,
-                    'operations': {}, 'dirty': {}, 'index_clean': True}
+                    'operations': {}, 'dirty': {}, 'index_clean': True, 'unmerged': False}
         self.handler._rebase_journal_state.return_value = observed
         self.effects.workspace.git.side_effect = self.observed_git
         transition = {
@@ -3167,6 +3173,9 @@ class ExecutionHandlerTests(TestCase):
             },
             'result': {'observed': observed},
         }
+        if legacy:
+            transition['intent']['expected'].pop('run_id')
+            transition['intent']['expected'].pop('checkpoint_generation')
         self.handler._complete_rebase_intent = (
             handlers.ExecutionHandlers._complete_rebase_intent.__get__(self.handler)
         )
@@ -3193,12 +3202,26 @@ class ExecutionHandlerTests(TestCase):
         self.assertIsNone(completed.operation)
         self.assertEqual(completed.expected_head, 'owned-head')
         self.assertEqual(completed.completed_rebase(), {
-            'journal_id': 'journal', 'generation': 1, 'run_id': 'run',
+            'journal_id': 'journal', 'generation': 1, 'run_id': None if legacy else 'run',
             'before_head': 'remote', 'after_head': 'owned-head',
             'target_base_oid': 'base', 'remote_oid': 'remote',
             'branch': context.branch, 'worktree': str(context.worktree.resolve()),
             'session': 'worker-session',
         })
+
+        with (
+            mock.patch.object(handlers.checkpoint_ownership, 'owned_remote_oid',
+                              return_value='remote'),
+            mock.patch.object(handlers.manager_git_journal,
+                              'verified_managed_transitions', return_value=[transition]),
+        ):
+            self.assertTrue(self.handler._owned_checkpoint_remote(
+                context, self.handler._row(), 'remote', completed,
+            ))
+            transition['intent']['id'] = 'foreign-journal'
+            self.assertFalse(self.handler._owned_checkpoint_remote(
+                context, self.handler._row(), 'remote', completed,
+            ))
 
     def test_autostash_published_completion_keeps_start_session_after_worker_replacement(self):
         blocked_checkpoint_state.ensure_schema(self.connection)
@@ -3221,12 +3244,15 @@ class ExecutionHandlerTests(TestCase):
             observed_remote_oid='remote',
             snapshot={'rebase_evidence_version': 2, 'rebase_run_id': 'run',
                       'stash_oid': 'stash', 'pending': 'continue',
-                      'rebase_start_session_id': 'start-session'},
+                      'rebase_start_session_id': 'start-session',
+                      'stage_evidence': {'files': {'app.py': 'approved'}}},
         )
         observed = {'head': 'owned-head', 'branch': context.branch,
                     'ref': ['owned-head', ''], 'metadata': None,
                     'operations': {}, 'dirty': {}, 'index_clean': True, 'unmerged': True}
-        live = {**observed, 'unmerged': False}
+        live = {**observed, 'unmerged': False, 'index_clean': False,
+                'index': {'app.py': ['H 100644 approved 0']},
+                'dirty': {'app.py': [['staged'], 'approved']}}
 
         self.handler._rebase_journal_state.return_value = live
         self.effects.workspace.git.side_effect = self.observed_git
@@ -3274,7 +3300,8 @@ class ExecutionHandlerTests(TestCase):
             correction.return_value = True
             self.handler._complete_rebase_intent(context)
 
-        correction.assert_called_once_with(context, transition['intent'], observed, live)
+        self.assertEqual(correction.call_count, 2)
+        correction.assert_called_with(context, transition['intent'], observed, live)
         self.assertEqual(self.state.row()['worker_session_id'], 'worker-session')
         completed = checkpoint.get('repo', 'G-047')
         self.assertIsNone(completed.operation)
@@ -3285,7 +3312,52 @@ class ExecutionHandlerTests(TestCase):
             'target_base_oid': 'base', 'remote_oid': 'remote',
             'branch': context.branch, 'worktree': str(context.worktree.resolve()),
             'session': 'start-session',
+            'autostash_correction': {
+                'sealed': observed, 'approved': live, 'stash_oid': 'stash',
+                'stage_evidence': {'files': {'app.py': 'approved'}},
+                'session': 'worker-session',
+            },
         })
+        with (
+            mock.patch.object(handlers.checkpoint_ownership, 'owned_remote_oid',
+                              return_value='remote'),
+            mock.patch.object(handlers.manager_git_journal,
+                              'verified_managed_transitions',
+                              side_effect=lambda *args, **kwargs: [transition]
+                              if kwargs['agent_session_id'] == 'start-session' else []),
+        ):
+            def owned(ctx=context):
+                return self.handler._owned_checkpoint_remote(
+                    ctx, self.handler._row(), 'remote',
+                    checkpoint.get('repo', 'G-047'),
+                )
+            self.assertTrue(owned())
+            for field, value in (
+                ('index', {'app.py': ['H 100644 foreign 0']}),
+                ('dirty', {'app.py': [['staged'], 'foreign']}),
+                ('operations', {'MERGE_HEAD': 'foreign'}),
+            ):
+                with self.subTest(field=field):
+                    self.handler._rebase_journal_state.return_value = {**live, field: value}
+                    self.assertFalse(owned())
+            self.handler._rebase_journal_state.return_value = live
+            self.assertFalse(owned(replace(context, worker_session_id='foreign')))
+            self.assertTrue(owned())
+
+
+            # Once the approved stage becomes a candidate commit, ownership
+            # still follows the same sealed journal and completion generation.
+            checkpoint.record(
+                'repo', 'G-047', expected_generation=completed.generation,
+                operation='commit', expected_head='owned-head',
+                target_base_oid='base', observed_remote_oid='remote',
+                snapshot={**completed.snapshot, 'before_head': 'owned-head'},
+            )
+            self.handler._rebase_journal_state.return_value = {
+                **live, 'head': 'candidate', 'ref': ['candidate', ''],
+                'dirty': {}, 'index_clean': True,
+            }
+            self.assertTrue(owned())
 
     def test_external_remote_checkpoint_uses_publication_ownership_cause(self):
         checkpoint = ExecutionCheckpointRepository(self.connection)
