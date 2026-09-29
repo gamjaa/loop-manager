@@ -16234,7 +16234,7 @@ def _resume_owned_checkpoint_project_block(
                     'owner_oid': owned_oid, 'head': current.head,
                 }},
             )
-        elif not marker:
+        elif not marker and not direct_review:
             execution_checkpoint_state.ExecutionCheckpointRepository(connection).record(
                 repo, plan_id, expected_generation=checkpoint.generation,
                 operation=checkpoint.operation, expected_head=checkpoint.expected_head,
@@ -17257,10 +17257,14 @@ def _resume_legacy_review_count_block(
                 "blocked_worktree_fingerprint": None,
                 "blocked_review_fingerprint": None,
                 "validated_base_sha": None,
+                **({"publication_remote_oid": remote_oid}
+                   if published_resume is not None else {}),
                 "last_error": f"Review 실패:\n{str(plan['review_result'] or '')[-8000:]}",
             },
             project_values={
                 "phase": "WORKING", "validated_base_sha": None,
+                **({"publication_remote_oid": remote_oid}
+                   if published_resume is not None else {}),
                 "last_error": f"Review 실패:\n{str(plan['review_result'] or '')[-8000:]}",
             },
             enqueue=False,

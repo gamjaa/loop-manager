@@ -1893,6 +1893,7 @@ class ExecutionHandlers:
                       **({'pushed_checkpoint_head': current.expected_head}
                          if current.operation == 'push' and
                          ((current.snapshot or {}).get('blocked_resume') or
+                          (current.snapshot or {}).get('published_review_resume') or
                           current.completed_rebase()) else {})},
         )
 

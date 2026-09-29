@@ -31,10 +31,10 @@ class ScopedBlockingTest(unittest.TestCase):
             self.plan('G-001', 'IMPLEMENTING', branch=branch)
             with self.connection:
                 self.connection.execute(
-                    "UPDATE exec_plans SET worktree = ?, publication_remote_oid = ?, "
+                    "UPDATE exec_plans SET worktree = ?, publication_remote_oid = NULL, "
                     "review_result = 'VERDICT: FAIL', agent_result_snapshot = ? "
                     "WHERE repo = ? AND plan_id = 'G-001'",
-                    (str(worktree), oid, snapshot.serialize(), self.repo),
+                    (str(worktree), snapshot.serialize(), self.repo),
                 )
                 scoped_blocking.record_plan_block(
                     self.connection, self.repo, 'G-001',
@@ -100,6 +100,10 @@ class ScopedBlockingTest(unittest.TestCase):
             self.assertEqual(self.connection.execute(
                 "SELECT publication_remote_oid FROM exec_plans WHERE repo = ? "
                 "AND plan_id = 'G-001'", (self.repo,),
+            ).fetchone()[0], oid)
+            self.assertEqual(self.connection.execute(
+                "SELECT publication_remote_oid FROM projects WHERE repo = ?",
+                (self.repo,),
             ).fetchone()[0], oid)
 
     def test_project_ownership_block_recovers_unrebased_review_owner(self):
@@ -167,10 +171,29 @@ class ScopedBlockingTest(unittest.TestCase):
             self.assertTrue(loop_manager.resume_project_block_if_safe(
                 self.connection, Path(self.repo), Path('/state'), self.repo,
             ))
+            first = execution_checkpoint_state.ExecutionCheckpointRepository(
+                self.connection,
+            ).get(self.repo, 'G-001')
+            with self.connection:
+                self.connection.execute(
+                    "UPDATE projects SET phase = 'PROJECT_BLOCKED' WHERE repo = ?",
+                    (self.repo,),
+                )
+                self.connection.execute(
+                    "INSERT INTO project_blocks "
+                    "(repo, scope, reason_code, plan_id, evidence, previous_phase) "
+                    "VALUES (?, 'project', 'publication_ownership_uncertain', "
+                    "'G-001', 'uncertain again', 'WORKING')", (self.repo,),
+                )
+            self.assertTrue(loop_manager.resume_project_block_if_safe(
+                self.connection, Path(self.repo), Path('/state'), self.repo,
+            ))
         self.assertIsNone(scoped_blocking.project_block(self.connection, self.repo))
         saved = execution_checkpoint_state.ExecutionCheckpointRepository(
             self.connection,
         ).get(self.repo, 'G-001')
+        self.assertEqual(saved.generation, first.generation)
+        self.assertNotIn('blocked_resume', saved.snapshot)
         self.assertEqual(saved.snapshot['published_review_resume'], {
             'request_identity': 'request', 'owner_oid': oid, 'head': oid,
         })
