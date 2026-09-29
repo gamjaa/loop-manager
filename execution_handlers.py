@@ -1216,7 +1216,12 @@ class ExecutionHandlers:
             if (current.expected_head != head or current.target_base_oid != target_oid
                     or saved.get('rebase_evidence_version') != managed_rebase_evidence.EVIDENCE_VERSION
                     or saved.get('rebase_source_base') != source_base
-                    or saved.get('rebase_source_commits') != source_commits
+                    or managed_rebase_evidence.reconcile_frozen_sources(
+                        self.effects.workspace.git, context.worktree,
+                        original=head, target=target_oid, base=source_base,
+                        frozen=saved.get('rebase_source_commits'),
+                        current=source_commits,
+                    ) != source_commits
                     or saved.get('rebase_remote_oid') != remote_oid
                     or saved.get('rebase_pr_head_oid') != pr_head_oid):
                 raise manager_git_journal.MutationEvidenceError(
