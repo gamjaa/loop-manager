@@ -44,3 +44,6 @@ priority: critical
 - 계획 차단 해제의 마지막 runtime 전이가 빈 project_values를 전달해 롤백되는 결함을 수정했다. 완료 증거 반영과 차단 해제를 하나의 중첩 안전 transaction에서 확정하고 실패·차단 사건 감사를 보존한다.
 
 - G-092는 R-023의 Agent Git 범위와 Manager 기준선 차단을 담당한다. 이 계획은 R-045의 완료 증거 오탐으로 남은 실패·차단만 다룬다.
+
+- Reviewer 피드백에 따라 차단 재평가에서 실제 원격 branch OID를 journal 확정 전후로 조회하고, 완료 채택 전에 clean worktree·index·표준 index flag를 확인한다. 예상 밖 변경은 journal 완료 근거로 채택하지 않으며 차단·작업물·사건 감사를 보존한다.
+- 실제 Git fixture로 완료 뒤 unstaged/staged/flag 변경, 오래된 원격 캐시, journal 확정 뒤 파일·원격 경쟁을 검증했다. PR 유무와 계획·프로젝트 차단 복구 후 기존 Worker session을 유지하며 실제 phase handler의 Worker 확인 → verify mock → Review mock → PUBLISHING 진행을 검증한다. 전체 verify와 게시 작업은 Worker 밖의 Loop Manager에 남긴다.

@@ -96,7 +96,7 @@ class ScopedBlockingTest(unittest.TestCase):
         with (
             mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
             mock.patch.object(loop_manager, 'validate_managed_worktree'),
-            mock.patch.object(loop_manager, 'remote_branch_oid',
+            mock.patch.object(loop_manager.manager_git_journal, 'live_remote_branch_oid',
                               return_value='external-head'),
             mock.patch.object(loop_manager, '_ExecutionLifecyclePorts') as construction,
         ):
@@ -109,7 +109,7 @@ class ScopedBlockingTest(unittest.TestCase):
         with (
             mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
             mock.patch.object(loop_manager, 'validate_managed_worktree'),
-            mock.patch.object(loop_manager, 'remote_branch_oid', return_value=None),
+            mock.patch.object(loop_manager.manager_git_journal, 'live_remote_branch_oid', return_value=None),
             mock.patch.object(loop_manager, 'pr_for_branch', return_value=None),
             mock.patch.object(loop_manager, '_ExecutionLifecyclePorts',
                               side_effect=RuntimeError('injected evidence failure')),

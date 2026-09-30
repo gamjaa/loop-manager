@@ -16597,7 +16597,7 @@ def _reconcile_rebase_evidence_block(
             state_dir, repo, plan_id, branch, worktree,
         )
         validate_managed_worktree(repo_path, worktree, branch)
-        remote_oid = remote_branch_oid(repo_path, branch)
+        remote_oid = manager_git_journal.live_remote_branch_oid(git, repo_path, branch)
         if remote_oid != checkpoint.observed_remote_oid:
             operation_log(
                 f"R-045 rebase remote lease 불일치 ({plan_id}): "
@@ -16665,8 +16665,11 @@ def _reconcile_rebase_evidence_block(
                 context, row, remote_oid, current, pull_request,
             ):
                 raise RuntimeError("R-045 rebase: published checkpoint owner differs")
+            rebase_block_reconciliation.require_clean_completion(
+                handler._rebase_journal_state(context),
+            )
             handler._finish_rebase_journal(context, allow_equal=True)
-            observed_remote = remote_branch_oid(repo_path, branch)
+            observed_remote = manager_git_journal.live_remote_branch_oid(git, repo_path, branch)
             observed_pr = pr_for_branch(
                 repo_path, branch, str(plan["pr_url"] or "") or None,
             )
@@ -16676,6 +16679,9 @@ def _reconcile_rebase_evidence_block(
                     f"expected={remote_oid}/{(pull_request or {}).get('headRefOid')} "
                     f"observed={observed_remote}/{(observed_pr or {}).get('headRefOid')}"
                 )
+            rebase_block_reconciliation.require_clean_completion(
+                handler._rebase_journal_state(context),
+            )
             handler._complete_rebase_intent(context)
             recovery_state.RecoveryRepository(
                 connection,

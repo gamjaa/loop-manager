@@ -6,7 +6,10 @@ managed rebase journal and current Git/remote ownership before release.
 
 from __future__ import annotations
 
+import hashlib
 import json
+
+from execution_checkpoint import controlling_git_operation
 
 from recovery_runtime import RecoveryReason
 from scoped_blocking import BlockReasonCode
@@ -78,3 +81,30 @@ def could_be_rebase_evidence_block(block) -> bool:
         and block["reason_code"] in REBASE_BLOCK_REASONS
         and block["evidence"] == LEGACY_COMPLETION_DIAGNOSTIC
     )
+
+
+def require_clean_completion(observed) -> None:
+    """Do not seal unapproved post-rebase files or index changes as completion."""
+
+    index = observed.get("index")
+    flagged_paths = sorted(
+        path for path, entries in (index or {}).items()
+        if any(not entry.startswith("H ") for entry in entries)
+    ) if isinstance(index, dict) else []
+    if (not isinstance(index, dict) or flagged_paths
+            or observed.get("metadata") is not None
+            or observed.get("unmerged") is not False
+            or observed.get("index_clean") is not True
+            or observed.get("dirty") != {}
+            or not isinstance(observed.get("operations"), dict)
+            or controlling_git_operation(observed["operations"])):
+        index_fingerprint = hashlib.sha256(json.dumps(
+            observed.get("index"), sort_keys=True,
+        ).encode()).hexdigest()
+        raise ValueError(
+            "R-045 rebase final worktree/index: expected=clean "
+            f"observed index_clean={observed.get('index_clean')} "
+            f"dirty={sorted(observed.get('dirty') or {})} "
+            f"unmerged={observed.get('unmerged')} flags={flagged_paths} "
+            f"index_fingerprint={index_fingerprint}"
+        )
