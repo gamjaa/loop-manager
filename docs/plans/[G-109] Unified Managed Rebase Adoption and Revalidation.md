@@ -46,6 +46,8 @@ G-108의 현재 상태 판정을 일반 구현, 관리 rebase 재시작, PR 충�
 - [x] 최종 후보 Worker 확인·검증 무효화 구현과 unit 검증, 실제 Git 회귀 사례 작성
 - [ ] Loop Manager 전체 verify·실제 Git lifecycle 실행, Reviewer 검토와 사용자 Merge 확인
 
+- 2026-09-30 두 번째 Manager verify 피드백 반영: 완료 후 남은 auxiliary Git 파일을 활성 operation과 구분해 최신 base 재전진의 시작·변경 범위 관측에 같은 기준을 적용하고, stage 재개 fixture를 현재 상태 service에 연결했다. 관련 unit case 13개가 최종 오류 없는 실행에서 통과했다. 새 Manager 전체 verify·Reviewer 검증 대기.
+
 ## Decision Log
 
 - 일반 구현과 PR 충돌 복구까지 적용하는 R-048의 전역 정책이다. legacy 오탐 차단만 고쳤던 G-101을 다시 계획하지 않는다. 저장된 최종 차단을 원인별로 해제하는 추가 연결은 G-110이 담당한다.
@@ -183,3 +185,30 @@ FAILED_COMMAND: python3 -B -m unittest tests.test_managed_mutation_evidence.Curr
 RERUN: python3 -B -m unittest tests.test_managed_mutation_evidence.CurrentRebaseRuntimeAdapterTests.test_blocked_release_records_head_after_adoption_and_stage_restore
 FINAL_RESULT: PASS (1 tests, failures=0, errors=0)
 ```
+
+
+## Manager Verify Delta Follow-up (2026-09-30)
+
+- Manager feedback `verify:ca95e9e07bbe3d100ef84faeb2f892c2cf68b5531a9c9af6ece6c835bb769ef7`, occurrence=1, revision=1은 errors=2였다. 저장된 전체 진단을 읽고 두 경계만 수정했다. 전체 verify를 Worker가 재실행하지 않았다.
+- stage 재개 helper가 production current service를 제공하지 않아 historical stage-evidence fallback으로 들어가던 fixture를 수정했다. 현재 허용된 unstaged/untracked path를 stage하고 staged-only path는 유지하며, 새 허용 파일이 과거 stage 감사에 없다는 이유로 거부하지 않는 기대값을 적용했다.
+- Review 중 base 재전진 뒤 새 rebase의 START와 common-ancestor diff 관측에서 `REBASE_HEAD`·`MERGE_MSG`·`MERGE_MODE`의 잔존을 활성 operation으로 취급하지 않도록 기존 controlling-marker 정책을 재사용한다. 파일을 삭제하거나 실행 증거를 만들지 않는다. 실제 활성 merge/cherry-pick/revert/rebase/sequencer/bisect, 미해결·staged index, HEAD·scope·원격 불일치는 계속 거부한다.
+- fake Git 관측의 새 회귀 case로 START의 auxiliary/controlling marker 구분과 새 base의 보호 문서 변경을 선택 branch 변경으로 오인하지 않는 common-ancestor 범위를 검증했다. 실제 Git integration 실패 case는 사용자 제한에 따라 실행하지 않았으며 새 Manager verify 결과 대기다.
+
+### Delta targeted unit 실패와 동일 명령 재실행
+
+- 새 회귀 case의 최초 실행은 failures=5(두 case의 subtest 포함)였다. 시작 판정과 관측에 controlling-marker 기준을 적용한 뒤 같은 명령을 재실행했다. 최초 혼합 실행을 통과로 계산하지 않는다.
+
+```text
+FAILED_COMMAND: python3 -B -m unittest tests.test_execution_handlers.ExecutionHandlerTests.test_pending_stage_accepts_current_allowed_changes_before_staging tests.test_managed_rebase_validation.CurrentRebasePolicyTests.test_new_rebase_start_retains_auxiliary_files_but_rejects_active_operations tests.test_managed_rebase_validation.CurrentRebaseObservationTests.test_new_base_observation_uses_common_ancestor_with_retained_auxiliary_files
+RERUN: python3 -B -m unittest tests.test_execution_handlers.ExecutionHandlerTests.test_pending_stage_accepts_current_allowed_changes_before_staging tests.test_managed_rebase_validation.CurrentRebasePolicyTests.test_new_rebase_start_retains_auxiliary_files_but_rejects_active_operations tests.test_managed_rebase_validation.CurrentRebaseObservationTests.test_new_base_observation_uses_common_ancestor_with_retained_auxiliary_files
+FINAL_RESULT: PASS (3 tests, failures=0, errors=0)
+```
+
+- 변경한 stage helper의 나머지 9개 case와 실제 snapshot parser를 사용하는 detached 관측 1개 case를 최소 selector로 추가 검증했다.
+
+```text
+COMMAND: python3 -B -m unittest tests.test_execution_handlers.ExecutionHandlerTests.test_staged_rebase_resume_reuses_saved_worker_result tests.test_execution_handlers.ExecutionHandlerTests.test_staged_autostash_resume_reuses_saved_worker_result tests.test_execution_handlers.ExecutionHandlerTests.test_completed_stage_matching_head_resumes_without_restaging tests.test_execution_handlers.ExecutionHandlerTests.test_completed_autostash_stage_matching_head_resumes_without_rebase tests.test_execution_handlers.ExecutionHandlerTests.test_completed_stage_accepts_replaced_clean_resolution_before_skip tests.test_execution_handlers.ExecutionHandlerTests.test_completed_autostash_stage_accepts_replaced_clean_resolution tests.test_execution_handlers.ExecutionHandlerTests.test_staged_rebase_resume_accepts_allowed_added_files tests.test_execution_handlers.ExecutionHandlerTests.test_pending_stage_resumes_accepted_unstaged_changes tests.test_execution_handlers.ExecutionHandlerTests.test_pending_stage_resumes_accepted_untracked_files tests.test_managed_rebase_validation.CurrentRebaseObservationTests.test_adapter_preserves_actual_detached_snapshot_and_waits_for_resolution
+FINAL_RESULT: PASS (10 tests, failures=0, errors=0)
+```
+
+- 서로 다른 관련 unit case 총 13개 통과. 전체 suite, integration/E2E, 전체 lint/build/type check, scripts/verify 실행과 commit/push/PR 생성은 하지 않았다. AGENTS.md·docs/PLANS.md·PRODUCT·ARCHITECTURE·Requirement·archive를 변경하지 않았다. Worker 준비 완료이며 전체 verify와 Reviewer 결과를 기다린다.

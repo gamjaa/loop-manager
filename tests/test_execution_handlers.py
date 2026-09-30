@@ -3699,14 +3699,16 @@ class ExecutionHandlerTests(TestCase):
         self.assertEqual(attempts, {'add': 1, 'continue': 2})
         self.effects.agent.run_agent.assert_not_called()
 
-    def test_pending_stage_rejects_changed_worktree_before_staging(self):
+    def test_pending_stage_accepts_current_allowed_changes_before_staging(self):
         self._assert_staged_rebase_resume(True, changed=True, unstaged=True)
 
     def _assert_staged_rebase_resume(self, rebase_metadata, *, changed=False,
                                     unstaged=False, untracked=False,
                                     clean_after_stage=False, replaced_resolution=False):
         checkpoint = ExecutionCheckpointRepository(self.connection)
-        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.effects = replace(self.effects, checkpoint=checkpoint,
+            workspace=replace(self.effects.workspace,
+                              current_rebase_service=self.handler._current_rebase_service))
         self.handler.effects = self.effects
         self.state.update_project(
             'repo', phase='WORKING', worker_session_id='saved-session',
@@ -3751,7 +3753,9 @@ class ExecutionHandlerTests(TestCase):
                     returncode=0,
                 )
             if args == ('ls-files', '--others', '--exclude-standard', '-z'):
-                return SimpleNamespace(stdout='allowed.py\0' if untracked else '', returncode=0)
+                return SimpleNamespace(
+                    stdout=('allowed.py\0' if untracked else '') + ('extra.py\0' if changed else ''),
+                    returncode=0)
             if args == ('diff', '--cached', '--quiet'):
                 return SimpleNamespace(stdout='', returncode=int(not clean_after_stage))
             return self.observed_git(path, *args, **kwargs)
@@ -3761,12 +3765,12 @@ class ExecutionHandlerTests(TestCase):
         self.effects.agent.run_agent.assert_not_called()
         additions = [call for call in self.effects.workspace.git.call_args_list
                      if call.args[1:3] == ('add', '-A')]
-        self.assertEqual(len(additions), int(not changed and (unstaged or untracked)))
+        self.assertEqual(len(additions), int(unstaged or untracked or changed))
         for call in additions:
             self.assertEqual(call.args[3], '--')
             self.assertEqual(set(call.args[4:]),
-                             {'app.py', 'allowed.py'} if unstaged or untracked
-                             else {'app.py'})
+                             ({'allowed.py'} if unstaged or untracked else set())
+                             | ({'extra.py'} if changed else set()))
         self.assertEqual(result.phase, ExecutionPhase.IMPLEMENTING)
         self.assertIsNone(self.state.row()['worker_result'])
         self.assertEqual(self.state.row()['worker_session_id'], 'saved-session')

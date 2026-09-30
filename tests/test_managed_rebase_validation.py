@@ -93,6 +93,34 @@ class CurrentRebasePolicyTests(unittest.TestCase):
                                                   'old', 'new-content', 'M'),))
         self.assertEqual(decision_for(expected, rewritten).status, RebaseStatus.COMPLETE)
 
+    def test_new_rebase_start_retains_auxiliary_files_but_rejects_active_operations(self):
+        expected = expectation(before_head='rebased', target_base_oid='advanced-base')
+        current = observation(expected, head='rebased', branch_ref=('rebased', ''),
+            registration=('HEAD=rebased', f'branch=refs/heads/{expected.branch}'),
+            base_is_ancestor=False)
+        auxiliary = (('REBASE_HEAD', 'last-commit'), ('MERGE_MSG', 'message'),
+                     ('MERGE_MODE', 'mode'))
+        for operations in ((), *(tuple([item]) for item in auxiliary), auxiliary):
+            with self.subTest(operations=operations):
+                self.assertEqual(decision_for(expected, replace(current, operations=operations)).status,
+                                 RebaseStatus.START)
+        for marker in ('MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'sequencer',
+                       'rebase-merge', 'rebase-apply', 'BISECT_START'):
+            with self.subTest(marker=marker):
+                pending = replace(current, operations=(*auxiliary, (marker, 'active')))
+                self.assertEqual(decision_for(expected, pending).status, RebaseStatus.REJECTED)
+        for changes in (
+            {'head': 'unexpected'}, {'index_clean': False},
+            {'staged': current.committed},
+            {'index': (IndexEntry('app.py', '100644', 'unmerged', 2, 'M', 0x2000),)},
+            {'remote': replace(expected.remote, oid='changed')},
+            {'committed': (replace(current.committed[0], path='docs/ARCHITECTURE.md'),)},
+        ):
+            with self.subTest(changes=changes):
+                self.assertEqual(decision_for(expected, replace(current, operations=auxiliary,
+                                                               **changes)).status,
+                                 RebaseStatus.REJECTED)
+
     def test_owned_detached_conflict_waits_without_mutating_index(self):
         expected = expectation()
         pending = observation(
@@ -313,6 +341,36 @@ class CurrentRebaseObservationTests(unittest.TestCase):
                          RebaseStatus.COMPLETE)
         forbidden_queries = {'reflog', 'rev-list', 'range-diff', 'rebase', 'add', 'commit'}
         self.assertFalse(any(call.args[1] in forbidden_queries for call in adapters.git.call_args_list))
+
+    def test_new_base_observation_uses_common_ancestor_with_retained_auxiliary_files(self):
+        expected, adapters = self.expected, self.adapters()
+        snapshot = adapters.capture_snapshot.return_value
+        snapshot.head = expected.before_head
+        snapshot.refs[f'refs/heads/{expected.branch}'] = (expected.before_head, '')
+        snapshot.worktrees[expected.worktree] = (f'HEAD={expected.before_head}',
+                                               f'branch=refs/heads/{expected.branch}')
+        snapshot.operations = {'REBASE_HEAD': 'last-commit', 'MERGE_MSG': 'retained-message'}
+        original_git = adapters.git.side_effect
+        def git(context, *args, **kwargs):
+            result = original_git(context, *args, **kwargs)
+            if args[:2] == ('merge-base', '--is-ancestor'):
+                result.returncode = 1
+            elif args == ('merge-base', expected.target_base_oid, expected.before_head):
+                result.stdout = 'common-base'
+            elif args[0] == 'diff' and '--raw' in args and '--cached' not in args:
+                if args[-3] != 'common-base':
+                    # The new base's protected change is not part of this branch.
+                    result.stdout = ':100644 000000 base-blob 0 D\0docs/ARCHITECTURE.md\0'
+            return result
+        adapters.git.side_effect = git
+        actual, scope = observe_current_rebase(expected, adapters)
+        self.assertIsInstance(actual, RebaseObservation)
+        self.assertEqual([change.path for change in actual.committed], ['app.py'])
+        self.assertEqual(assess_current_rebase(expected, actual, scope).status, RebaseStatus.START)
+        adapters.git.assert_any_call(Path(expected.worktree), 'merge-base',
+                                    expected.target_base_oid, expected.before_head, check=False)
+        self.assertEqual(snapshot.operations,
+                         {'REBASE_HEAD': 'last-commit', 'MERGE_MSG': 'retained-message'})
 
     def test_adapter_preserves_actual_detached_snapshot_and_waits_for_resolution(self):
         expected = self.expected

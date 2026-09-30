@@ -326,7 +326,8 @@ def assess_current_rebase(
     if observed.base_is_ancestor is None:
         return RebaseDecision(RebaseStatus.UNAVAILABLE, 'ancestry_missing')
     if observed.base_is_ancestor is not True:
-        if (observed.head == expected.before_head and not operations
+        if (observed.head == expected.before_head
+                and not controlling_git_operation(operations)
                 and observed.index_clean and not observed.staged
                 and not any(entry.stage for entry in observed.index)):
             return RebaseDecision(RebaseStatus.START, 'owned_original_head_before_rebase')
