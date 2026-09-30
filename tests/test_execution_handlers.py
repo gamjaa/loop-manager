@@ -6185,7 +6185,17 @@ class ImmediateRebasePublicationTests(TestCase):
     def test_blocked_publication_rejection_keeps_stage_snapshot_and_retries_same_intent(self):
         self.assert_blocked_release(rejected=True)
 
-    def assert_blocked_release(self, *, interrupted=False, rejected=False):
+    def test_blocked_publication_retry_finishes_saved_target_after_base_advances(self):
+        self.assert_blocked_release(rejected=True, advanced_base=True)
+
+    def test_plan_blocks_recovers_pushed_checkpoint_before_old_remote_check(self):
+        self.assert_blocked_release(interrupted=True, entrypoint=True)
+
+    def test_plan_blocks_retries_saved_publication_before_old_remote_check(self):
+        self.assert_blocked_release(rejected=True, advanced_base=True, entrypoint=True)
+
+    def assert_blocked_release(self, *, interrupted=False, rejected=False,
+                               advanced_base=False, entrypoint=False):
         from managed_rebase_validation import FileChange
         connection, runtime = self.fixture.connection, self.fixture.repository
         runtime.transition_and_clear('repo', 'G-047', plan_values={
@@ -6196,7 +6206,7 @@ class ImmediateRebasePublicationTests(TestCase):
             {'app.py': ('H 100644 staged-blob 0',)}, {'app.py': (('staged',), 'saved-content')},
             {f'refs/heads/{branch}': ('before', '')},
             {worktree: ('HEAD=before', f'branch=refs/heads/{branch}')}, {}, {})
-        local = {'head': 'before', 'staged': True}
+        local = {'head': 'before', 'staged': True, 'base': 'base'}
         def capture(_):
             return replace(before, head=local['head'],
                 index=before.index if local['staged'] else {'app.py': ('H 100644 rebased-blob 0',)},
@@ -6208,7 +6218,7 @@ class ImmediateRebasePublicationTests(TestCase):
             if args == ('rev-parse', 'HEAD'):
                 return SimpleNamespace(returncode=0, stdout=local['head'])
             if args == ('rev-parse', 'refs/remotes/origin/main'):
-                return SimpleNamespace(returncode=0, stdout='base')
+                return SimpleNamespace(returncode=0, stdout=local['base'])
             if args == ('merge-base', '--is-ancestor', 'refs/remotes/origin/main', 'HEAD'):
                 return SimpleNamespace(returncode=1, stdout='')
             return original_git(path, *args, **kwargs)
@@ -6267,8 +6277,29 @@ class ImmediateRebasePublicationTests(TestCase):
                 self.assertFalse(local['staged'])
                 self.assertEqual(runtime.get('repo', 'G-047').status, 'PLAN_BLOCKED')
                 self.push_failure = False
-            self.assertTrue(lm.resume_blocked_execplan_if_inputs_changed(
-                connection, Path('/repo'), 'repo', 'main', Path('/state')))
+            if advanced_base:
+                local['base'] = 'later-base'
+            if entrypoint:
+                with mock.patch.object(lm, '_reconcile_published_blocked_checkpoint',
+                                       side_effect=AssertionError('old remote checked before recovery')) as reconcile:
+                    # A retry refusal must preserve the pending release instead
+                    # of falling through to the stale checkpoint remote gate.
+                    with mock.patch.object(lm, '_complete_direct_rebase_checkpoint',
+                                           side_effect=RuntimeError('temporary publication failure')):
+                        self.assertFalse(lm.resume_plan_blocks(
+                            connection, Path('/repo'), Path('/state'), 'repo', 'main'))
+                    self.assertEqual(self.checkpoints.get('repo', 'G-047'), pending)
+                    self.assertEqual(runtime.get('repo', 'G-047').status, 'PLAN_BLOCKED')
+                    self.assertFalse(local['staged'])
+                    self.assertTrue(lm.resume_plan_blocks(
+                        connection, Path('/repo'), Path('/state'), 'repo', 'main'))
+                    reconcile.assert_not_called()
+            else:
+                self.assertTrue(lm.resume_blocked_execplan_if_inputs_changed(
+                    connection, Path('/repo'), 'repo', 'main', Path('/state')))
+            self.assertEqual(self.checkpoints.get('repo', 'G-047').target_base_oid, 'base')
+            self.assertEqual(runtime.get('repo', 'G-047').status, 'READY')
+            self.assertIsNone(runtime.get('repo', 'G-047').verify_result)
             if interrupted or rejected:
                 self.assertEqual(self.checkpoints.get('repo', 'G-047').snapshot['rebase_publication_intent'],
                                  pending.snapshot['rebase_publication_intent'])

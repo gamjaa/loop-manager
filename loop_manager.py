@@ -14949,8 +14949,9 @@ def _resume_interrupted_blocked_rebase(
     if not after_head and current_head == before_head:
         return None
     try:
-        target_base = git(repo_path, 'rev-parse',
-                          f'refs/remotes/origin/{base}').stdout.strip()
+        # Finish the saved release against its own target. A newer base is
+        # applied by the normal lifecycle after this checkpoint is requeued.
+        target_base = checkpoint.target_base_oid
         snapshot = capture_git_snapshot(worktree)
         remote_oid = remote_branch_oid(repo_path, branch)
         adopted_oid = (checkpoint.snapshot or {}).get('last_adopted_remote_oid')
@@ -14969,6 +14970,7 @@ def _resume_interrupted_blocked_rebase(
         safe = (
             owned_oid is not None
             and marker.get('owner_oid') == owned_oid
+            and bool(target_base)
             and marker.get('target_base_oid') == target_base
             and checkpoint.observed_remote_oid == (adopted_oid if confirmed else owned_oid)
             and snapshot.head == current_head and snapshot.branch == branch
@@ -17766,6 +17768,17 @@ def resume_plan_blocks(
                 return True
             continue
         if blocked["blocked_reason"] == PR_CLOSED_BLOCK_REASON:
+            continue
+        # A push may have succeeded before its adopted OID reached SQLite.
+        # Reconcile the saved release before comparing the old checkpoint ref
+        # with the live remote (which may already contain the rebased HEAD).
+        interrupted = _resume_interrupted_blocked_rebase(
+            connection, repo_path, repo, base, blocked,
+            Path(str(blocked["worktree"] or "")), str(blocked["branch"] or ""),
+        )
+        if interrupted is not None:
+            if interrupted:
+                return True
             continue
         checkpoint_row = connection.execute(
             "SELECT * FROM blocked_checkpoints "

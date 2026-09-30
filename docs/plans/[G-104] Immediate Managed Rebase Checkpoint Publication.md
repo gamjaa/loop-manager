@@ -48,6 +48,8 @@ PR이 없는 동일 계획의 기존 원격 작업 branch를 관리 rebase한 �
 - Review 피드백 보정: 미완료 게시 intent도 실제 범위 선검증에서 현재 rebase HEAD와 선택 ref를 대조하며, 저장한 lease 또는 이미 push한 HEAD만 원격 기대값으로 사용한다. 직접 차단 해제에서는 clean index 결과의 게시를 먼저 완료하고 원래 staging을 복원한다. 활성 projection이 없는 차단 계획의 게시도 차단·검증·실행 슬롯을 보존하며, 중단·거부 뒤 같은 intent로 재개한다. 관련 unit class와 직접 수용 case 29개가 모두 통과했고 전체 verify·Review 재검증은 Loop Manager에 맡긴다.
 - 후속 verify 피드백 보정: 직접 rebase 수용 unit fixture의 게시 경계를 mock 처리하고, 정상·중단 차단 해제 unit test는 수용 → 게시 → staging 복원 순서를 확인하도록 갱신했다. 수정한 unit case 6개가 모두 통과했다. 실제 Git checkpoint 해제 테스트는 rebase HEAD의 즉시 원격 게시·채택 OID·고정 이전 lease를 확인하고 별도로 미게시 legacy project block 상태를 재현한다. 실제 Git 테스트와 전체 verify는 Worker가 실행하지 않았다.
 
+- 후속 Review 두 건 보정: 중단된 차단 해제는 최신 base 대신 저장된 checkpoint target으로 완료를 검증하고 READY 재진입 뒤 최신 base를 처리한다. `resume_plan_blocks`는 기존 원격 checkpoint 검사 전에 저장된 rebase 게시를 복구하며 실패 시 intent·차단·staging을 보존한다. 새 회귀 3개와 기존 직접 게시·staging 복구 4개, 총 7개 고유 targeted unit case가 통과했다(6개 실행 및 후속 변경 관련 3개 실행). R-047 archive의 원문 바이트 일치를 재확인했다. 전체 verify와 Review는 Loop Manager 검증 대기다.
+
 ## Decision Log
 
 - G-100·G-101은 R-045의 rebase 완료·오류 차단 복구를 맡는다. 이 계획은 그 결과를 게시하는 R-047의 새 순서와 legacy 다중 rebase 게시 증거만 다룬다.
