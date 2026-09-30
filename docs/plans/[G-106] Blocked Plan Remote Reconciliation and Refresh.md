@@ -68,6 +68,12 @@ priority: critical
   - RERUN: python3 -m unittest tests.test_scoped_blocking.BlockedPlanRemoteRefreshTests
 - 전체 verify·실제 Git 사례·Review는 Manager에 맡기며 Worker는 실행하지 않았다. `tests/test_loop_manager.py`의 기존 격리 import fixture는 실제 Git 저장소를 생성하는 사례이므로 읽기만 했으며 Worker 실행 대상에서 제외했다. commit·push·PR 생성, AGENTS·PLANS·Requirement 변경은 하지 않았다.
 - 2026-09-30: Worker 결과 검증 오류를 재현한 파서 조건을 확인했다. 직전 응답은 `FAILED_COMMAND`와 `RERUN` 사이에 실패 결과가 없어 미해결 이력으로 판정됐다. 최종 보고를 실패 명령·실패 결과·동일 재실행 명령·최종 PASS 순서로 구성하고 기존 `parse_worker_result`가 수용함을 확인했다. 파서와 제품 코드는 추가 변경하지 않았다. 최신 근거 문서와 현재 HEAD/base 대비 diff를 재확인하고 위 최소 unit test 5개 명령을 새로 실행해 36·7·5·2·2개, 총 52개가 모두 통과했다. 전체 verify·실제 Git 검증·Review는 이후 Manager가 수행한다.
+- 2026-09-30: Manager verify의 legacy Agent 범위 검사 오류를 수정했다. 원격 채택 기록이 없는 프로젝트 전용 SQLite에서도 `exec_plans`를 무조건 조회한 것이 원인이었다. 채택 기록과 catalog 존재 여부를 확인한 경우에만 추가 계획 조회를 수행한다. 실제 Git 없이 동일 SQLite/snapshot 조건을 재현한 `LegacyBlockedScopeUnitTests`에서 정상 snapshot 허용과 Agent의 다른 소유 ref 변경 거부를 확인했다. 최초 fixture에 빠진 worktree 등록을 보완하고 동일 명령을 재실행해 1개 통과했다.
+  - FAILED_COMMAND: python3 -m unittest tests.test_scoped_blocking.LegacyBlockedScopeUnitTests
+  - FAILED: 새 fixture의 관리 worktree 등록 정보 누락을 수정했다.
+  - RERUN: python3 -m unittest tests.test_scoped_blocking.LegacyBlockedScopeUnitTests
+  - PASS: 최종 재실행 1개 통과.
+- 최신 계획과 R-046·R-048·PRODUCT·ARCHITECTURE를 다시 확인하고 HEAD `e2340102201b83201b8cb00bdfaf196b6941dada` 및 `origin/main` 대비 변경을 검토했다. 현재 후보에서 `BlockedPlanRemoteRefreshTests` 36개, `EvidenceFreeBlockedScopeTests` 5개, `BlockedCheckpointRefreshUnitTests` 7개, `CatalogCheckpointWiringTest` 2개를 새로 실행해 모두 통과했다. 새 legacy 사례를 포함한 최종 unit 결과는 51개 통과다. Manager가 보고한 `test_blocked_resume_does_not_excuse_agent_owned_ref_change`는 실제 Git 저장소·commit을 사용하는 integration 사례이므로 Worker는 실행하지 않았다. 전체 verify와 해당 사례 재검증·Review는 Manager에 맡긴다.
 - [ ] Manager 전체 verify와 실제 Git 회귀 사례 검증. base만 변경·후속 commit만 변경·동시 변경·원인 지속/해소·Git 효과 뒤 중단 재시작·수동 충돌 해결 사례를 작성했으며 Worker는 실행하지 않았다. Linux 전체 검증 스크립트에 새 모듈의 compile 검사를 추가했으나 스크립트·전체 suite·integration·lint·build·type check는 실행하지 않았다.
 - [ ] Reviewer 검토 및 사용자 Merge. Worker는 commit·push·PR을 생성하지 않았다.
 

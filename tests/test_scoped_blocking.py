@@ -21,6 +21,35 @@ import blocked_remote_observation
 from scoped_blocking import BlockReasonCode, BlockScope
 
 
+class LegacyBlockedScopeUnitTests(unittest.TestCase):
+    def test_missing_plan_catalog_preserves_scope_validation(self):
+        connection = sqlite3.connect(':memory:')
+        self.addCleanup(connection.close)
+        connection.row_factory = sqlite3.Row
+        connection.execute(loop_manager.SCHEMA)
+        before = loop_manager.GitSnapshot('head', 'loop-manager/G-001', {}, {},
+            {'refs/heads/loop-manager/G-099': ('original', '')},
+            {'/managed': ('HEAD=head', 'branch=refs/heads/loop-manager/G-001')}, {}, {})
+        connection.execute(
+            "INSERT INTO projects (repo, base_branch, agent_role, agent_snapshot, agent_result_snapshot) "
+            "VALUES ('repo', 'main', 'reviewer', ?, ?)",
+            (before.serialize(), before.serialize()))
+        connection.commit()
+        with (mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=before) as capture,
+              mock.patch.object(loop_manager, '_proven_manager_base_refs', return_value=frozenset()),
+              mock.patch.object(loop_manager, '_proven_merged_cleanup_paths', return_value=frozenset())):
+            loop_manager.validate_blocked_agent_scope(connection, Path('/repo'), 'repo', 'main',
+                Path('/managed'), 'docs/plans/[G-001] Work.md')
+            changed = replace(before, refs={'refs/heads/loop-manager/G-099': ('foreign', '')})
+            connection.execute("UPDATE projects SET agent_result_snapshot = ?", (changed.serialize(),))
+            capture.return_value = changed
+            with self.assertRaisesRegex(loop_manager.AgentScopeError, 'refs/heads/loop-manager/G-099'):
+                loop_manager.validate_blocked_agent_scope(connection, Path('/repo'), 'repo', 'main',
+                    Path('/managed'), 'docs/plans/[G-001] Work.md')
+        self.assertIsNone(connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'exec_plans'").fetchone())
+
+
 class BlockedPlanRemoteRefreshTests(unittest.TestCase):
     """Coordinator unit tests: every Git/verify/Agent effect is a fake port."""
 

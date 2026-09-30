@@ -13818,8 +13818,13 @@ def validate_blocked_agent_scope(
     plan_id = _plan_id_from_path(selected_plan_path)
     checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, plan_id)
     adopted = (checkpoint.snapshot or {}).get('remote_adoption_scope')
-    adoption_plan = saved_plan if saved_plan is not None else connection.execute(
-        'SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?', (repo, plan_id)).fetchone()
+    adoption_plan = saved_plan
+    if (adopted and not accepted_rebase and adoption_plan is None
+            and connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'exec_plans'"
+            ).fetchone() is not None):
+        adoption_plan = connection.execute(
+            'SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?', (repo, plan_id)).fetchone()
     if (adopted and not accepted_rebase and adoption_plan is not None
             and adopted['agent_snapshot'] == serialized
             and adopted['agent_result_snapshot'] == project['agent_result_snapshot']
