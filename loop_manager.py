@@ -8939,7 +8939,12 @@ def push_managed_publication_branch(
         connection, repo_path, state_dir, repo, branch, worktree
     )
     local_oid = git(worktree, "rev-parse", "HEAD").stdout.strip()
-    remote_oid = remote_branch_oid(repo_path, branch)
+    checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
+        repo, str(plan['plan_id']))
+    def observe_remote():
+        return managed_rebase_adoption.checkpoint_remote_oid(
+            checkpoint, repo_path, branch, git=git, read_fetched=remote_branch_oid)
+    remote_oid = observe_remote()
     if remote_oid is None and plan['publication_remote_oid']:
         raise PublicationSafetyError(
             '저장된 게시 branch가 원격에서 삭제돼 새 branch 생성으로 복구할 수 없습니다.'
@@ -9002,7 +9007,7 @@ def push_managed_publication_branch(
         raise RuntimeError(f"publication branch push 실패:\n{pushed.stdout[-8000:]}")
 
     _recorded_base_fetch(repo_path, state_dir, branch, owner="project")
-    confirmed_oid = remote_branch_oid(repo_path, branch)
+    confirmed_oid = observe_remote()
     if confirmed_oid != local_oid:
         raise RuntimeError(
             "publication branch push 결과를 원격에서 확인할 수 없습니다."
@@ -13766,6 +13771,7 @@ def validate_blocked_agent_scope(
     base: str,
     worktree: Path,
     selected_plan_path: str,
+    *, accepted_rebase: bool = False, saved_plan=None,
 ) -> None:
     """Revalidate preserved Agent output before a BLOCKED plan can resume."""
 
@@ -13774,6 +13780,8 @@ def validate_blocked_agent_scope(
         "FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
+    if saved_plan is not None:
+        project = saved_plan
     if project is None:
         raise AgentScopeError("BLOCKED Agent 범위를 확인할 프로젝트가 없습니다.")
     serialized = project["agent_snapshot"]
@@ -13791,6 +13799,38 @@ def validate_blocked_agent_scope(
             f"저장된 BLOCKED Agent Git snapshot이 유효하지 않습니다: {error}"
         ) from error
     current = capture_git_snapshot(worktree)
+    if accepted_rebase:
+        if role_name not in {'worker', 'reviewer'} or project['agent_recovery']:
+            raise AgentScopeError('현재 rebase와 별도 Agent 복구 범위를 분리할 수 없습니다.')
+        plan_id = _plan_id_from_path(selected_plan_path)
+        checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, plan_id)
+        comparison = managed_rebase_adoption.agent_comparison_baseline(
+            before, checkpoint.snapshot or {}, role_name)
+        result = (GitSnapshot.deserialize(str(project['agent_result_snapshot']))
+                  if project['agent_result_snapshot'] else None)
+        guidance = _guidance_worker_targets(connection, repo, plan_id)
+        common = _published_plan_allows_common_plans(repo_path, saved_plan)
+        archive_sources = requirement_archive_candidates(
+            connection, repo_path, repo,
+            str(saved_plan['current_revision_sha'] or saved_plan['plan_sha']), plan_id)
+        scope_options = dict(
+            selected_plan_path=selected_plan_path if role_name == 'worker' else None,
+            allowed_guidance_targets=guidance, allow_common_plans=common,
+            allowed_requirement_archives=archive_sources,
+            external_worktree=repo_path, base_branch=base)
+        # Check actual Agent output before substituting the accepted selected
+        # rebase state. Shared and external mutations are never normalized.
+        if result is not None:
+            validate_agent_scope(role_name, worktree, comparison, result, **scope_options)
+        normalized = managed_rebase_adoption.selected_baseline(
+            comparison, current, str(saved_plan['branch']), str(worktree.resolve()))
+        validate_agent_scope(
+            role_name, worktree, normalized, current,
+            allowed_ref_changes=_proven_manager_base_refs(
+                connection, repo_path, repo, plan_id, before, current),
+            allowed_worktree_changes=_proven_merged_cleanup_paths(connection, repo, before, current),
+            **scope_options)
+        return
     scope_before = before
     allowed_ref_changes: frozenset[str] = frozenset()
     allowed_worktree_changes: frozenset[str] = frozenset()
@@ -14913,6 +14953,11 @@ def _resume_interrupted_blocked_rebase(
     checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
         repo, str(plan['plan_id']),
     )
+    block = scoped_blocking.plan_block(connection, repo, str(plan['plan_id']))
+    if rebase_block_reconciliation.could_be_rebase_evidence_block(block):
+        state_dir = _owned_rebase_state_dir(repo, str(plan['plan_id']), worktree)
+        return bool(state_dir is not None and _reconcile_rebase_evidence_block(
+            connection, repo_path, state_dir, repo, block, plan_block=True))
     marker = (checkpoint.snapshot or {}).get('blocked_resume')
     if not marker:
         return None
@@ -15059,6 +15104,25 @@ def resume_blocked_execplan_if_inputs_changed(
     base: str,
     state_dir: Path,
 ) -> bool:
+    # Select rebase causes without hydrating a projection or requiring a past
+    # input fingerprint. Current Git state, rather than input change, decides.
+    rebase_blocks = [scoped_blocking.plan_block(connection, repo, str(block['plan_id']))
+                     for block in scoped_blocking.plan_blocks(connection, repo)
+                     if rebase_block_reconciliation.could_be_rebase_evidence_block(block)]
+    if rebase_blocks:
+        runtime = runtime_state.RuntimeStateRepository(connection)
+        if not runtime.recovery_slot_available(repo) or runtime.active_row(repo) is not None:
+            return False
+        projected = project_execplan(connection, repo)
+        selected = next((block for block in rebase_blocks
+                         if projected is not None and block['plan_id'] == projected['plan_id']), None)
+        if selected is None and projected is None and len(rebase_blocks) == 1:
+            selected = rebase_blocks[0]
+        if selected is not None:
+            return _reconcile_rebase_evidence_block(
+                connection, repo_path, state_dir, repo, selected, plan_block=True)
+        if projected is None:
+            return False
     plan = _plan_block_selected_for_release(
         connection,
         repo,
@@ -16565,175 +16629,61 @@ def _reconcile_rebase_evidence_block(
     connection: sqlite3.Connection, repo_path: Path, state_dir: Path,
     repo: str, block: sqlite3.Row, *, plan_block: bool,
 ) -> bool:
-    """Resume only a proven R-045 false block in its original execution slot."""
-
+    """Recheck the owned current rebase and release only its saved cause."""
     plan_id = str(block["plan_id"] or "")
     plan = connection.execute(
-        "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
-        (repo, plan_id),
+        "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?", (repo, plan_id),
     ).fetchone()
-    project = connection.execute(
-        "SELECT * FROM projects WHERE repo = ?", (repo,),
-    ).fetchone()
-    if plan is None or project is None:
+    project = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
+    if plan is None or project is None or block['repo'] != repo:
         return False
-    checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(
-        connection,
-    ).get(repo, plan_id)
+    checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
+    checkpoint = checkpoints.get(repo, plan_id)
     recovery = recovery_state.RecoveryRepository(connection).row(repo, plan_id)
     if not rebase_block_reconciliation.block_matches(block, recovery, checkpoint):
-        operation_log(
-            f"R-045 rebase 차단 유지 ({plan_id}): 저장된 실패 원인·legacy "
-            "재생 증거 또는 rebase intent가 불완전합니다.", error=True,
-        )
         return False
-    if (
-        runtime_state.planning_owns_execution_slot(project)
-        or int(plan["workspace_owned"] or 0) != WORKSPACE_OWNED
-        or not plan["branch"] or not plan["worktree"]
-        or recovery["base_revision"] != plan["active_sha"]
-        or not str(recovery["progress_marker"] or "").startswith(
-            f"{plan['active_sha'] or ''}|{plan['worker_session_id'] or ''}|"
-        )
-        or plan["agent_snapshot"] is not None
-        or project["agent_snapshot"] is not None
-        or project["agent_recovery"] is not None
-        or project["planning_error"]
-        or (plan_block and (plan["status"] != "PLAN_BLOCKED"
-            or plan["blocked_reason"] != block["reason_code"]))
-        or (plan_block and scoped_blocking.project_block(connection, repo) is not None)
-        or (not plan_block and project["phase"] != "PROJECT_BLOCKED")
-        or (not plan_block and plan["status"] == "PLAN_BLOCKED")
-        or (not plan_block and block["previous_phase"] not in
-            {"WORKING", "VERIFYING", "REVIEWING"})
-    ):
+    active = runtime_state.RuntimeStateRepository(connection).active_row(repo)
+    if (runtime_state.planning_owns_execution_slot(project) or project['planning_error']
+            or (active is not None and active['plan_id'] != plan_id)
+            or int(plan['workspace_owned'] or 0) != WORKSPACE_OWNED
+            or not plan['branch'] or not plan['worktree']
+            or unmet_execplan_dependencies(connection, repo, plan_id)
+            or (plan_block and (plan['status'] != 'PLAN_BLOCKED'
+                or plan['blocked_reason'] != block['reason_code']
+                or scoped_blocking.project_block(connection, repo) is not None))
+            or (not plan_block and project['phase'] != 'PROJECT_BLOCKED')):
         return False
-    if plan_block and recovery["phase"] not in {
-        "WORKING", "VERIFYING", "REVIEWING",
-    }:
-        return False
-    if plan_block and active_execplan(connection, repo) is not None:
-        return False
-    if not plan_block:
-        active = active_execplan(connection, repo)
-        if active is None or active["plan_id"] != plan_id:
-            return False
-    branch = str(plan["branch"])
-    worktree = Path(str(plan["worktree"]))
+    worktree, branch = Path(str(plan['worktree'])), str(plan['branch'])
     try:
-        validate_execplan_workspace_identity(
-            state_dir, repo, plan_id, branch, worktree,
-        )
-        validate_managed_worktree(repo_path, worktree, branch)
-        remote_oid = manager_git_journal.live_remote_branch_oid(git, repo_path, branch)
-        if remote_oid != checkpoint.observed_remote_oid:
-            operation_log(
-                f"R-045 rebase remote lease 불일치 ({plan_id}): "
-                f"expected={checkpoint.observed_remote_oid} observed={remote_oid}",
-                error=True,
-            )
-            return False
-        pull_request = pr_for_branch(
-            repo_path, branch, str(plan["pr_url"] or "") or None,
-        )
-        if plan["pr_url"]:
-            if (pull_request is None
-                    or pull_request.get("url") != plan["pr_url"]
-                    or pull_request.get("state") != "OPEN"
-                    or pull_request.get("headRefName") != branch
-                    or pull_request.get("baseRefName") != project["base_branch"]
-                    or pull_request.get("headRefOid") != plan["pr_head_oid"]
-                    or pull_request.get("headRefOid") != remote_oid):
-                operation_log(
-                    f"R-045 rebase PR head 불일치 ({plan_id}): "
-                    f"expected={plan['pr_head_oid']} "
-                    f"observed={(pull_request or {}).get('headRefOid')}",
-                    error=True,
-                )
-                return False
-        elif pull_request is not None:
-            operation_log(
-                f"R-045 rebase 예상 밖 PR ({plan_id}): "
-                f"observed={pull_request.get('headRefOid')}", error=True,
-            )
-            return False
-        with runtime_state._transaction(connection):
-            repository = runtime_state.RuntimeStateRepository(connection)
-            if plan_block:
-                restored_phase = str(recovery["phase"])
-                restored_status = (
-                    "IMPLEMENTING" if restored_phase == "WORKING"
-                    else restored_phase
-                )
-                projection = runtime_state.ExecutionSnapshot.from_row(
-                    plan,
-                ).project_values()
-                projection.update(phase=restored_phase, last_error=None)
-                repository.transition(
-                    repo, plan_id,
-                    plan_values={"status": restored_status, "last_error": None},
-                    project_values=projection, enqueue=False,
-                )
-            else:
-                scoped_blocking.clear_project_block(connection, repo)
-            handler = _ExecutionLifecyclePorts(
-                connection, repository, repo=repo, repo_path=repo_path,
-                state_dir=state_dir, base=str(project["base_branch"]),
-                base_sha=str(checkpoint.target_base_oid),
-                provider=str(project["provider"]),
-                config_path=ROOT / "config/config.ini",
-                newly_activated=False,
-            )
-            handler.catalog_plan = repository.active_row(repo)
-            handler.plan = handler._cached_plan(handler.catalog_plan)
-            context = handler._context()
-            current = handler.effects.checkpoint.get(repo, plan_id)
-            row = handler._row()
-            # Published checkpoint ownership can seal a completed rebase journal.
-            # Reject unapproved files/index before any such file-system effect.
-            rebase_block_reconciliation.require_clean_completion(
-                handler._rebase_journal_state(context),
-            )
-            if not handler._owned_checkpoint_remote(
-                context, row, remote_oid, current, pull_request,
-            ):
-                raise RuntimeError("R-045 rebase: published checkpoint owner differs")
-            handler._finish_rebase_journal(context, allow_equal=True)
-            observed_remote = manager_git_journal.live_remote_branch_oid(git, repo_path, branch)
-            observed_pr = pr_for_branch(
-                repo_path, branch, str(plan["pr_url"] or "") or None,
-            )
-            if observed_remote != remote_oid or observed_pr != pull_request:
-                raise RuntimeError(
-                    "R-045 rebase remote lease/PR head: "
-                    f"expected={remote_oid}/{(pull_request or {}).get('headRefOid')} "
-                    f"observed={observed_remote}/{(observed_pr or {}).get('headRefOid')}"
-                )
-            rebase_block_reconciliation.require_clean_completion(
-                handler._rebase_journal_state(context),
-            )
-            handler._complete_rebase_intent(context)
-            recovery_state.RecoveryRepository(
-                connection,
-            ).resolve_rebase_evidence_failure(
-                repo, plan_id, base_revision=str(plan["active_sha"] or ""),
-                worker_session=str(plan["worker_session_id"] or ""),
-                released_block_reason=str(block["reason_code"]),
-            )
-            if plan_block:
-                scoped_blocking.clear_plan_block(connection, repo, plan_id)
-                repository.transition(
-                    repo, plan_id,
-                    plan_values={
-                        "blocked_reason": None, "blocked_fingerprint": None,
-                        "blocked_worktree_fingerprint": None,
-                        "blocked_review_fingerprint": None,
-                    },
-                    project_values={"last_error": None}, enqueue=False,
-                )
+        service = _current_rebase_service(
+            connection, repo_path, state_dir, repo, plan_id, worktree, branch)
+        def observe():
+            observation = service.require_owned(checkpoint=checkpoints.get(repo, plan_id))
+            validate_blocked_agent_scope(
+                connection, repo_path, repo, str(project['base_branch']), worktree,
+                str(plan['path']), accepted_rebase=True, saved_plan=plan)
+            if (observation[1].status is managed_rebase_validation.RebaseStatus.WAITING
+                    and plan['agent_result_snapshot']
+                    and plan['blocked_fingerprint'] and plan['blocked_worktree_fingerprint']):
+                before = GitSnapshot.deserialize(str(plan['agent_result_snapshot']))
+                current = capture_git_snapshot(worktree)
+                if rebase_block_reconciliation.pending_block_unchanged(
+                        plan, block, recovery, before, current,
+                        revision_input=_revision_execplan_input_fingerprint(
+                            repo_path, str(plan['current_revision_sha'] or plan['plan_sha']), plan),
+                        worktree_input=_worktree_execplan_input_fingerprint(worktree, plan)):
+                    raise RuntimeError('unchanged blocked rebase still needs user input or Git progress')
+            return observation
+        observation = observe()
+        runtime_state.RuntimeStateRepository(connection).resume_rebase_block(
+            plan, project, block, checkpoints, observation, expected_checkpoint=checkpoint,
+            is_plan_block=plan_block,
+            reobserve=observe,
+            dependencies_ready=lambda: not unmet_execplan_dependencies(connection, repo, plan_id),
+            pending_error=REBASE_IN_PROGRESS_ERROR)
         return True
     except (RuntimeError, OSError, ValueError, sqlite3.Error) as error:
-        operation_log(f"R-045 rebase 차단 재평가 보류 ({plan_id}): {error}", error=True)
+        operation_log(f"관리 rebase 차단 재평가 보류 ({plan_id}): {error}", error=True)
         return False
 
 
@@ -16748,10 +16698,18 @@ def resume_project_block_if_safe(
     block = scoped_blocking.project_block(connection, repo)
     if block is None:
         return False
-    if rebase_block_reconciliation.could_be_rebase_evidence_block(block):
+    checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
+        repo, str(block['plan_id'] or ''))
+    recovery = recovery_state.RecoveryRepository(connection).row(repo, str(block['plan_id'] or ''))
+    if rebase_block_reconciliation.could_be_rebase_evidence_block(block, recovery, checkpoint):
         return _reconcile_rebase_evidence_block(
             connection, repo_path, state_dir, repo, block, plan_block=False,
         )
+    if (block['plan_id'] and block['reason_code'] in rebase_block_reconciliation.REBASE_BLOCK_REASONS
+            and checkpoint.operation == 'rebase'):
+        # A pending rebase cannot borrow the generic branch-only release path
+        # when its stored safety cause cannot be connected to this operation.
+        return False
     if block["reason_code"] == BlockReasonCode.LEGACY_UNSCOPED_BLOCK.value:
         return False
     plan_id = str(block["plan_id"] or "")
@@ -17750,11 +17708,11 @@ def resume_plan_blocks(
 
     if scoped_blocking.project_block(connection, repo) is not None:
         return False
-    if active_execplan(connection, repo) is not None:
-        return False
     if not runtime_state.RuntimeStateRepository(
         connection
     ).recovery_slot_available(repo):
+        return False
+    if runtime_state.RuntimeStateRepository(connection).active_row(repo) is not None:
         return False
     for blocked in plan_blocked_execplans(connection, repo):
         current_block = scoped_blocking.plan_block(

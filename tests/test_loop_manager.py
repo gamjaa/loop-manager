@@ -14214,7 +14214,10 @@ class LatestBasePublicationTest(unittest.TestCase):
 
     def test_owned_branch_push_rechecks_live_ref_before_lease(self):
         branch = 'loop-manager/G-081'
-        plan = {'publication_remote_oid': 'a' * 40, 'pr_url': None}
+        connection = sqlite3.connect(':memory:')
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        plan = {'plan_id': 'G-081', 'publication_remote_oid': 'a' * 40, 'pr_url': None}
         calls = []
 
         def git(_path, *arguments, **_kwargs):
@@ -14235,19 +14238,22 @@ class LatestBasePublicationTest(unittest.TestCase):
         ):
             with self.assertRaises(loop_manager.PublicationSafetyError):
                 loop_manager.push_managed_publication_branch(
-                    object(), Path('/repo'), Path('/state'), 'repo',
+                    connection, Path('/repo'), Path('/state'), 'repo',
                     branch, Path('/managed'),
                 )
             remote.return_value = None
             with self.assertRaises(loop_manager.PublicationSafetyError):
                 loop_manager.push_managed_publication_branch(
-                    object(), Path('/repo'), Path('/state'), 'repo',
+                    connection, Path('/repo'), Path('/state'), 'repo',
                     branch, Path('/managed'),
                 )
         self.assertFalse(any(args[0] == 'push' for args in calls))
 
     def test_owned_branch_push_uses_exact_lease_and_saves_confirmed_head(self):
         branch = 'loop-manager/G-081'
+        connection = sqlite3.connect(':memory:')
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
         old, new = 'a' * 40, 'b' * 40
         pushes = []
         remote_observations = iter((old, new))
@@ -14266,7 +14272,7 @@ class LatestBasePublicationTest(unittest.TestCase):
 
         with (
             mock.patch('loop_manager._owned_publication_plan', return_value={
-                'publication_remote_oid': old, 'pr_url': None,
+                'plan_id': 'G-081', 'publication_remote_oid': old, 'pr_url': None,
             }),
             mock.patch('loop_manager.remote_branch_oid', side_effect=[old, new]),
             mock.patch('loop_manager.record_remote_publication_branch'),
@@ -14276,7 +14282,7 @@ class LatestBasePublicationTest(unittest.TestCase):
             mock.patch('loop_manager._recorded_base_fetch', return_value=new) as fetched,
         ):
             result = loop_manager.push_managed_publication_branch(
-                object(), Path('/repo'), Path('/state'), 'repo',
+                connection, Path('/repo'), Path('/state'), 'repo',
                 branch, Path('/managed'),
             )
 
@@ -14286,7 +14292,7 @@ class LatestBasePublicationTest(unittest.TestCase):
         )
         self.assertEqual(len(pushes), 1)
         self.assertIn(f'--force-with-lease=refs/heads/{branch}:{old}', pushes[0])
-        update.assert_called_once_with(mock.ANY, 'repo', publication_remote_oid=new)
+        update.assert_called_once_with(connection, 'repo', publication_remote_oid=new)
 
     def test_unowned_remote_branch_is_blocked_without_force_push(self):
         with tempfile.TemporaryDirectory() as directory:

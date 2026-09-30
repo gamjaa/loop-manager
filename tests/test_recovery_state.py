@@ -482,3 +482,50 @@ class RecoveryRepositoryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RebaseCauseResolutionTests(unittest.TestCase):
+    def setUp(self):
+        import notifications
+        RecoveryRepositoryTests.setUp(self)
+        notifications.ensure_schema(self.connection)
+
+    def block(self, detail='manual rebase conflict'):
+        from scoped_blocking import BlockReasonCode
+        begin_external_run(self.connection)
+        observation = RecoveryObservation(RecoveryReason.MANAGED_CONFLICT_UNRECOVERABLE, 'repo', 'G-042',
+            'WORKING', 'old-input', 'old-base', 'failure', 'old-session-progress', detail)
+        self.repository.observe(observation, final_block_reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT)
+        return {'reason_code': 'managed_worktree_conflict', 'evidence': detail}
+
+    def test_current_resolution_closes_only_matching_cause_and_keeps_failure_audit(self):
+        block = self.block()
+        # Missing occurrence history and old progress/session are not gates.
+        self.connection.execute("UPDATE recovery_records SET occurrence_index = '{}'")
+        before = dict(self.repository.row('repo', 'G-042'))
+        self.repository.resolve_rebase_block('repo', 'G-042', block)
+        after = dict(self.repository.row('repo', 'G-042'))
+        self.assertEqual(after['pending_action'], 'reconcile')
+        for key in ('detail', 'reason_code', 'final_evidence', 'progress_marker', 'occurrence_index'):
+            self.assertEqual(after[key], before[key])
+        failure = self.connection.execute('SELECT * FROM persistent_execution_failures').fetchone()
+        self.assertEqual(failure['active'], 0)
+        self.assertEqual(failure['detail'], block['evidence'])
+        self.assertIsNotNone(failure['resolved_at'])
+        self.repository.resolve_rebase_block('repo', 'G-042', block)
+        self.assertEqual(dict(self.repository.row('repo', 'G-042')), after)
+
+    def test_independent_recovery_record_is_not_resolved_by_rebase_release(self):
+        block = self.block()
+        self.repository.observe(RecoveryObservation(RecoveryReason.USER_DECISION, 'repo', 'G-042',
+            'WORKING', 'new-input', 'new-base', 'decision', 'current', 'choose a policy'))
+        before = dict(self.repository.row('repo', 'G-042'))
+        self.repository.resolve_rebase_block('repo', 'G-042', block)
+        self.assertEqual(dict(self.repository.row('repo', 'G-042')), before)
+
+    def test_final_block_reason_must_match_before_closing_its_record(self):
+        block = self.block()
+        block['reason_code'] = 'repository_state_unsafe'
+        before = dict(self.repository.row('repo', 'G-042'))
+        self.repository.resolve_rebase_block('repo', 'G-042', block)
+        self.assertEqual(dict(self.repository.row('repo', 'G-042')), before)

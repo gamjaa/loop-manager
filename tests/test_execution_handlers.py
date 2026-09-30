@@ -40,7 +40,40 @@ READY_WORKER_RESULT = 'WORKER_OUTCOME: {"kind":"ready_for_validation"}\nresult'
 VALID_WORKER_RESULT = 'WORKER_OUTCOME: {"kind":"ready_for_validation"}\nvalid result'
 
 
+def recovered_rebase_workspace(workspace, *, connection, repo_path, state_dir,
+                               repo, plan_id, worktree):
+    """Share the Manager workspace bindings between real Git and unit fixtures."""
+    return replace(workspace, git=mock.Mock(wraps=lm.git),
+        _rebase_in_progress_for_branch=lm._rebase_in_progress_for_branch,
+        git_operation_entries=lm._git_operation_entries,
+        current_rebase_service=lambda context, **options: lm._current_rebase_service(
+            connection, repo_path, state_dir, repo, plan_id,
+            worktree, context.branch, **options))
+
+
+def recovered_rebase_publication(publication, state):
+    """Use the Manager's snapshot-bound mutating publication adapters."""
+    names = ('record_remote_publication_branch', 'push_managed_publication_branch',
+             'push_owned_pr_conflict_recovery')
+    return replace(publication, **{name: mock.Mock(side_effect=state.bind(
+        getattr(lm, name), connected=True, mutates=True, name=name)) for name in names})
+
+
 class ExecutionHandlerTests(TestCase):
+    def test_manual_detached_block_recovers_changed_plan_without_rebase_journal(self):
+        self._legacy_rebase_false_block_recovery(plan_block=True, manual='waiting')
+
+    def test_manual_stage_block_recovers_changed_plan_without_worker_stage_evidence(self):
+        self._legacy_rebase_false_block_recovery(plan_block=True, manual='staged')
+
+    def test_manual_stage_owned_pr_requires_fresh_validation_before_publication(self):
+        self._legacy_rebase_false_block_recovery(
+            plan_block=True, existing_pr=True, manual='staged',
+        )
+
+    def test_manual_completed_owned_pr_recovers_changed_plan_without_rebase_journal(self):
+        self._legacy_rebase_false_block_recovery(plan_block=False, existing_pr=True, manual='complete')
+
     def test_legacy_rebase_false_block_recovers_after_restart_with_later_file_changes(self):
         self._legacy_rebase_false_block_recovery(plan_block=True)
 
@@ -91,7 +124,7 @@ class ExecutionHandlerTests(TestCase):
 
     def _legacy_rebase_false_block_recovery(self, *, plan_block, rejected=None,
                                           existing_pr=False, published_checkpoint=False,
-                                          stale_cache=False):
+                                          stale_cache=False, manual=None):
         self.journal_start.stop()
         fixture = BlockedCheckpointGitAdapterTest(methodName='runTest')
         fixture.setUp()
@@ -151,7 +184,8 @@ class ExecutionHandlerTests(TestCase):
             config_path=Path('/config'), newly_activated=False,
         )
         handler.plan = handler._cached_plan(handler.effects.state.active_execplan(repo))
-        context = handler._context()
+        with mock.patch.object(lm, 'pr_for_branch', return_value=pull_request):
+            context = handler._context()
         journal = handlers.manager_git_journal
         expected = dict(
             branch=branch, before_head=original, target_base_oid=target,
@@ -163,39 +197,47 @@ class ExecutionHandlerTests(TestCase):
             target=str(fixture.worktree.resolve()),
             before=lm._owned_rebase_journal_state(fixture.worktree, branch),
             expected=expected,
-        )
-        environment = dict(os.environ, GIT_REFLOG_ACTION=f'loop-manager-rebase:{identity}',
-                           GIT_EDITOR='true')
+        ) if manual is None else None
+        environment = dict(os.environ, GIT_EDITOR='true')
+        if identity is not None:
+            environment['GIT_REFLOG_ACTION'] = f'loop-manager-rebase:{identity}'
         self.assertNotEqual(lm.git(
             fixture.worktree, 'rebase', target, check=False, env=environment,
         ).returncode, 0)
-        with mock.patch.object(lm, 'pr_for_branch', return_value=pull_request):
-            handler._finish_rebase_journal(context)
+        if manual is None:
+            with mock.patch.object(lm, 'pr_for_branch', return_value=pull_request):
+                handler._finish_rebase_journal(context)
         resolved = ['value=resolved\n'] + [f'line-{n}\n' for n in range(30)]
-        app.write_text(''.join(resolved))
-        git(fixture.worktree, 'add', 'code.py')
-        staged = lm._owned_rebase_journal_state(fixture.worktree, branch)
-        tree = git(fixture.worktree, 'write-tree')
-        continuation = journal.begin_rebase(
-            fixture.state_dir, owner='plan:G-034', repo=repo,
-            target=str(fixture.worktree.resolve()), before=staged,
-            expected={**expected, 'action': 'continue', 'staged_tree_oid': tree,
-                      'accepted_files': {'code.py': staged['dirty']['code.py'][1]}},
-        )
-        environment['GIT_REFLOG_ACTION'] = f'loop-manager-rebase:{continuation}'
-        self.assertEqual(lm.git(
-            fixture.worktree, 'rebase', '--continue', check=False, env=environment,
-        ).returncode, 0)
-        self.assertNotEqual(git(fixture.worktree, 'rev-parse', 'HEAD^{tree}'), tree)
-        reason = rebase_block_reconciliation.LEGACY_COMPLETION_DIAGNOSTIC
+        continuation = None
+        if manual != 'waiting':
+            app.write_text(''.join(resolved))
+            git(fixture.worktree, 'add', 'code.py')
+            staged = lm._owned_rebase_journal_state(fixture.worktree, branch)
+            tree = git(fixture.worktree, 'write-tree')
+            if manual is None:
+                continuation = journal.begin_rebase(
+                    fixture.state_dir, owner='plan:G-034', repo=repo,
+                    target=str(fixture.worktree.resolve()), before=staged,
+                    expected={**expected, 'action': 'continue', 'staged_tree_oid': tree,
+                              'accepted_files': {'code.py': staged['dirty']['code.py'][1]}},
+                )
+                environment['GIT_REFLOG_ACTION'] = f'loop-manager-rebase:{continuation}'
+            if manual != 'staged':
+                self.assertEqual(lm.git(
+                    fixture.worktree, 'rebase', '--continue', check=False, env=environment,
+                ).returncode, 0)
+                self.assertNotEqual(git(fixture.worktree, 'rev-parse', 'HEAD^{tree}'), tree)
+        reason = ('manual G-088 conflict; inputs changed' if manual else
+                  rebase_block_reconciliation.LEGACY_COMPLETION_DIAGNOSTIC)
         handlers.recovery_state.begin_external_run(connection)
-        handlers.recovery_state.RecoveryRepository(connection).observe(
-            handlers.RecoveryObservation(
-                handlers.RecoveryReason.STATUS_FAILED, repo, 'G-034', 'WORKING',
-                fixture.base_oid, fixture.base_oid, 'old-failure',
-                f'{fixture.base_oid}|saved-worker|', reason,
-            ),
-        )
+        if manual is None:
+            handlers.recovery_state.RecoveryRepository(connection).observe(
+                handlers.RecoveryObservation(
+                    handlers.RecoveryReason.STATUS_FAILED, repo, 'G-034', 'WORKING',
+                    fixture.base_oid, fixture.base_oid, 'old-failure',
+                    f'{fixture.base_oid}|saved-worker|', reason,
+                ),
+            )
         if plan_block:
             fixture.block('managed_worktree_conflict', reason)
         else:
@@ -206,6 +248,15 @@ class ExecutionHandlerTests(TestCase):
                     "'repository_state_unsafe', 'G-034', ?, 'WORKING')", (repo, reason),
                 )
                 connection.execute("UPDATE projects SET phase = 'PROJECT_BLOCKED'")
+            if manual:
+                handlers.recovery_state.RecoveryRepository(connection).observe(
+                    handlers.RecoveryObservation(handlers.RecoveryReason.STATE_UNSAFE, repo, 'G-034',
+                        'WORKING', fixture.base_oid, fixture.base_oid, 'saved-rebase', 'old-progress', reason),
+                    final_block_reason=scoped_blocking.BlockReasonCode.REPOSITORY_STATE_UNSAFE)
+        if manual:
+            plan_path = connection.execute('SELECT path FROM exec_plans').fetchone()[0]
+            document = fixture.worktree / plan_path
+            document.write_text(document.read_text() + '\nUser input changed during blocked rebase.\n')
         published_before = None
         if published_checkpoint:
             # Legacy published checkpoints may adopt an existing clean commit.
@@ -256,10 +307,7 @@ class ExecutionHandlerTests(TestCase):
             )
 
         with mock.patch.object(lm, 'pr_for_branch', return_value=pull_request):
-            # Another session and planning state cannot borrow this proof.
-            connection.execute("UPDATE exec_plans SET worker_session_id = 'foreign'")
-            self.assertFalse(resume())
-            connection.execute("UPDATE exec_plans SET worker_session_id = 'saved-worker'")
+            # Planning still owns the slot; historical sessions are not gates.
             connection.execute("UPDATE projects SET planning_error = 'independent error'")
             self.assertFalse(resume())
             self.assertEqual(connection.execute(
@@ -273,8 +321,11 @@ class ExecutionHandlerTests(TestCase):
                                  expected_remote)
             if rejected:
                 completed = git(fixture.worktree, 'rev-parse', 'HEAD')
+                rejected_file = (fixture.worktree / 'docs/ARCHITECTURE.md'
+                                 if rejected in {'unstaged', 'late-file'} else app)
                 if rejected in {'unstaged', 'staged'}:
-                    app.write_text(app.read_text() + 'unapproved change\n')
+                    rejected_file.write_text(rejected_file.read_text() + 'unapproved change\n'
+                                             if rejected_file.exists() else 'unapproved change\n')
                     if rejected == 'staged':
                         git(fixture.worktree, 'add', 'code.py')
                 elif rejected == 'index-flags':
@@ -292,16 +343,22 @@ class ExecutionHandlerTests(TestCase):
                 saved_recovery = dict(handlers.recovery_state.RecoveryRepository(
                     connection,
                 ).row(repo, 'G-034'))
-                complete_rebase = journal.record_current_rebase_result
-                def complete_then_change(*args, **kwargs):
-                    completed = complete_rebase(*args, **kwargs)
-                    if rejected == 'late-file':
-                        app.write_text(app.read_text() + 'late unapproved change\n')
-                    elif rejected == 'late-remote':
-                        git(fixture.worktree, 'push', 'origin', f'{original}:refs/heads/{branch}')
-                        git(fixture.repo, 'update-ref', '-d', f'refs/remotes/origin/{branch}')
-                    return completed
-                with mock.patch.object(journal, 'record_current_rebase_result', side_effect=complete_then_change):
+                current_service = lm._current_rebase_service
+                def service_with_race(*args, **kwargs):
+                    service = current_service(*args, **kwargs)
+                    require_owned = service.require_owned
+                    calls = []
+                    def observe(**options):
+                        calls.append(None)
+                        if len(calls) == 2:
+                            if rejected == 'late-file':
+                                rejected_file.write_text('late unapproved change\n')
+                            elif rejected == 'late-remote':
+                                git(fixture.worktree, 'push', 'origin', f'{original}:refs/heads/{branch}')
+                                git(fixture.repo, 'update-ref', '-d', f'refs/remotes/origin/{branch}')
+                        return require_owned(**options)
+                    return SimpleNamespace(require_owned=observe)
+                with mock.patch.object(lm, '_current_rebase_service', side_effect=service_with_race):
                     for _ in range(2):
                         self.assertFalse(resume())
                 self.assertEqual(dict(connection.execute('SELECT * FROM exec_plans').fetchone()), before)
@@ -313,30 +370,44 @@ class ExecutionHandlerTests(TestCase):
                 ).fetchone()[0])
                 slot = journal._slot(fixture.state_dir, repo, 'managed_rebase',
                                      str(fixture.worktree.resolve()))
-                sealed = rejected in {'late-file', 'late-remote'}
-                self.assertEqual((slot / 'active.json').exists(), not sealed)
-                self.assertEqual((slot / f'{continuation}.result.json').exists(), sealed)
+                self.assertTrue((slot / 'active.json').exists())
+                self.assertFalse((slot / f'{continuation}.result.json').exists())
                 self.assertEqual(git(fixture.worktree, 'rev-parse', 'HEAD'), completed)
                 if rejected in {'unstaged', 'staged', 'late-file'}:
-                    self.assertIn('unapproved change', app.read_text())
+                    self.assertIn('unapproved change', rejected_file.read_text())
                 if published_checkpoint:
                     self.assertEqual(dict(connection.execute(
                         'SELECT * FROM blocked_checkpoints',
                     ).fetchone()), published_before)
                     # Restoring the unexpected change must leave the same original
                     # completion intent usable; a poisoned result would prevent this.
-                    git(fixture.worktree, 'restore', '--source=HEAD', '--staged', '--worktree',
-                        '--', 'code.py')
+                    if rejected == 'unstaged':
+                        rejected_file.unlink()
+                    else:
+                        git(fixture.worktree, 'restore', '--source=HEAD', '--staged', '--worktree',
+                            '--', 'code.py')
                 else:
                     return
             self.assertTrue(resume())
+            if manual in {'waiting', 'staged'}:
+                self.assertTrue(lm._rebase_in_progress_for_branch(fixture.worktree, branch))
+                if manual == 'waiting':
+                    app.write_text(''.join(resolved))
+                    git(fixture.worktree, 'add', 'code.py')
+                # The user's changed plan is also part of this manual result;
+                # Git continue requires all tracked edits to be staged.
+                git(fixture.worktree, 'add', '--', plan_path)
+                # Leave continuation and candidate adoption to Manager recover().
+                self.assertEqual(ExecutionCheckpointRepository(connection).get(repo, 'G-034').operation,
+                                 'rebase')
             self.assertFalse(resume())
         row = connection.execute('SELECT * FROM exec_plans').fetchone()
         self.assertEqual(row['status'], 'IMPLEMENTING')
         self.assertEqual(row['worker_session_id'], 'saved-worker')
-        self.assertIsNone(row['worker_result'])
-        self.assertIsNone(row['verify_result'])
-        self.assertIsNone(row['review_result'])
+        if manual not in {'waiting', 'staged'}:
+            self.assertIsNone(row['worker_result'])
+            self.assertIsNone(row['verify_result'])
+            self.assertIsNone(row['review_result'])
         self.assertIsNone(scoped_blocking.plan_block(connection, repo, 'G-034'))
         self.assertIsNone(scoped_blocking.project_block(connection, repo))
         incidents = connection.execute('SELECT * FROM notified_block_incidents').fetchall()
@@ -344,10 +415,14 @@ class ExecutionHandlerTests(TestCase):
         self.assertIsNotNone(incidents[0]['released_at'])
         self.assertEqual(json.loads(incidents[0]['payload'])['cause'], reason)
         failure = connection.execute('SELECT * FROM persistent_execution_failures').fetchone()
-        self.assertEqual(failure['active'], 0)
-        self.assertEqual(failure['detail'], reason)
-        self.assertIsNotNone(failure['resolved_at'])
-        self.assertIsNone(ExecutionCheckpointRepository(connection).get(repo, 'G-034').operation)
+        if manual in {'waiting', 'staged'}:
+            self.assertIsNone(failure)
+        else:
+            self.assertEqual(failure['active'], 0)
+            self.assertEqual(failure['detail'], reason)
+            self.assertIsNotNone(failure['resolved_at'])
+        self.assertEqual(ExecutionCheckpointRepository(connection).get(repo, 'G-034').operation,
+                         'rebase' if manual in {'waiting', 'staged'} else None)
         if published_checkpoint:
             self.assertEqual(dict(connection.execute(
                 'SELECT * FROM blocked_checkpoints',
@@ -360,11 +435,14 @@ class ExecutionHandlerTests(TestCase):
             audit_slot = journal._slot(fixture.state_dir, repo, 'managed_rebase', str(fixture.worktree.resolve()))
             self.assertEqual(journal._read(audit_slot / f'{continuation}.intent.json')['expected']['before_head'], original)
             self.assertEqual(proof['head'], git(fixture.worktree, 'rev-parse', 'HEAD'))
-        self.assertEqual(handlers.recovery_state.RecoveryRepository(connection).row(
-            repo, 'G-034',
-        )['pending_action'], 'reconcile')
-        self.assertEqual(app.read_text().splitlines()[20], 'later-20')
-        self.assertEqual(app.read_text().splitlines()[12], 'later-12')
+        recovery = handlers.recovery_state.RecoveryRepository(connection).row(repo, 'G-034')
+        if manual in {'waiting', 'staged'}:
+            self.assertIsNone(recovery)
+        else:
+            self.assertEqual(recovery['pending_action'], 'reconcile')
+        if manual not in {'waiting', 'staged'}:
+            self.assertEqual(app.read_text().splitlines()[20], 'later-20')
+            self.assertEqual(app.read_text().splitlines()[12], 'later-12')
         fixture.verify_probe.assert_not_called()
         fixture.reviewer_probe.assert_not_called()
         git(fixture.repo, 'push', 'origin', 'main')
@@ -382,10 +460,11 @@ class ExecutionHandlerTests(TestCase):
         effects = replace(
             self.effects, state=state,
             checkpoint=ExecutionCheckpointRepository(fixture.connection),
-            workspace=replace(self.effects.workspace, git=lm.git,
-                current_rebase_service=lambda context, **options: lm._current_rebase_service(
-                    fixture.connection, fixture.repo, fixture.state_dir, repo, 'G-034',
-                    fixture.worktree, context.branch, **options)),
+            publication=recovered_rebase_publication(self.effects.publication, state),
+            workspace=recovered_rebase_workspace(self.effects.workspace,
+                connection=fixture.connection, repo_path=fixture.repo,
+                state_dir=fixture.state_dir, repo=repo, plan_id='G-034',
+                worktree=fixture.worktree),
         )
         handler = handlers.ExecutionHandlers(
             effects, repo=repo, repo_path=fixture.repo, state_dir=fixture.state_dir,
@@ -410,17 +489,39 @@ class ExecutionHandlerTests(TestCase):
             'TARGETED_TESTS:\nrebase correction: PASS\n'
         )
         roles = []
+        lifecycle = []
         def agent(*args, **kwargs):
             roles.append(args[4])
             if args[4] == 'worker':
+                self.assertIn('현재 HEAD의 base 대비 최종 diff 전체', args[5])
+                self.assertIn('targeted unit test', args[5])
+                lifecycle.extend(('worker_confirmation', 'targeted_tests'))
                 kwargs['on_session_started']('saved-worker')
                 return lm.AgentResult(0, worker_result, session_id='saved-worker')
+            lifecycle.append('review')
             return lm.AgentResult(0, 'VERDICT: PASS', session_id='review-session')
         effects.agent.run_agent.side_effect = agent
         effects.agent.resolve_worker_profile.return_value = lm.ResolvedProfile('model', 'high')
+        coordinator = ExecutionPhaseCoordinator(handler)
         # Saved profiles are durable input; resuming should keep the Worker session.
         binding = SessionBinding('codex', 'model', 'high').serialize()
         state.update_project(repo, worker_session_binding=binding)
+        pending_before = effects.checkpoint.get(repo, 'G-034').operation == 'rebase'
+        continued = handler.recover(handler._context())
+        self.assertNotIsInstance(continued, ExecutionOutcome)
+        self.assertFalse(lm._rebase_in_progress_for_branch(fixture.worktree, continued.branch))
+        self.assertIsNone(effects.checkpoint.get(repo, 'G-034').operation)
+        for field in ('worker_result', 'verify_result', 'review_result',
+                      'verify_token', 'review_token', 'publication_token'):
+            self.assertIsNone(state.row()[field], field)
+        self.assertEqual((fixture.worktree / 'code.py').read_text().splitlines()[20], 'later-20')
+        self.assertEqual((fixture.worktree / 'code.py').read_text().splitlines()[12], 'later-12')
+        effects.agent.run_agent.assert_not_called()
+        effects.validation.verify.assert_not_called()
+        handler.recover(handler._context())
+        continues = [call for call in effects.workspace.git.call_args_list
+                     if 'rebase' in call.args[1:] and '--continue' in call.args[1:]]
+        self.assertEqual(len(continues), int(pending_before))
         context = handler.guard(handler._context())
         self.assertNotIsInstance(context, ExecutionOutcome)
         # The recovered old Worker publication must be checked before verify.
@@ -428,15 +529,18 @@ class ExecutionHandlerTests(TestCase):
             invalid = handler.verify(context, handler)
             self.assertEqual(invalid.kind, ExecutionOutcomeKind.RETRY)
         self.assertEqual(state.row()['phase'], 'WORKING')
-        worker = handler.run(handler._context())
+        worker = coordinator.dispatch(handler._context())
         self.assertEqual(worker.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
         self.assertEqual(state.row()['worker_session_id'], 'saved-worker')
         effects.validation.verify.reset_mock()
-        verified = handler.verify(handler._context(), handler)
+        effects.validation.verify.side_effect = lambda _: (
+            lifecycle.append('verify') or True, 'fresh recovered candidate: OK',
+        )
+        verified = coordinator.dispatch(handler._context())
         self.assertEqual(verified.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
         self.assertEqual(state.row()['phase'], 'REVIEWING')
         effects.validation.verify.assert_called_once_with(fixture.worktree)
-        reviewed = handler.review(handler._context())
+        reviewed = coordinator.dispatch(handler._context())
         self.assertEqual(reviewed.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
         self.assertEqual(roles, ['worker', 'reviewer'])
         self.assertEqual(state.row()['phase'], 'PUBLISHING')
@@ -445,6 +549,41 @@ class ExecutionHandlerTests(TestCase):
         self.assertEqual(state.row()['pr_url'], (pull_request or {}).get('url'))
         effects.publication.push_managed_publication_branch.assert_not_called()
         effects.publication.command.assert_not_called()
+        if pull_request:
+            state.update_project(repo, pr_conflict_recovery=1,
+                pr_conflict_head_oid=pull_request['headRefOid'], pr_conflict_base_oid=target)
+        # The real publication policy must reject a stale successful token.
+        fresh_review = state.row()['review_token']
+        state.update_project(repo, review_token='old candidate review')
+        stale = coordinator.dispatch(handler._context())
+        self.assertEqual(stale.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(state.row()['phase'], 'REVIEWING')
+        effects.publication.push_managed_publication_branch.assert_not_called()
+        effects.publication.command.assert_not_called()
+        # Re-run Review through Manager, rather than restoring its old result.
+        reviewed = coordinator.dispatch(handler._context())
+        self.assertEqual(reviewed.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
+        self.assertEqual(state.row()['review_token'], fresh_review)
+        published = coordinator.dispatch(handler._context())
+        self.assertEqual(published.kind, ExecutionOutcomeKind.SUCCESS)
+        lifecycle.append('publication')
+        self.assertEqual(lifecycle, ['worker_confirmation', 'targeted_tests',
+                                     'verify', 'review', 'review', 'publication'])
+        self.assertEqual(state.repository.get(repo, 'G-034').status, 'PR_OPEN')
+        if pull_request:
+            effects.publication.push_owned_pr_conflict_recovery.assert_called_once()
+            effects.publication.command.assert_not_called()
+        else:
+            saved = effects.checkpoint.get(repo, 'G-034')
+            if saved.snapshot.get('rebase_publication_result'):
+                # An owned checkpoint was already pushed during recovery.
+                # Final publication creates its PR without a second push.
+                effects.publication.push_managed_publication_branch.assert_not_called()
+                self.assertEqual(lm.remote_branch_oid(fixture.repo, 'loop-manager/G-034'),
+                                 lm.git(fixture.worktree, 'rev-parse', 'HEAD').stdout.strip())
+            else:
+                effects.publication.push_managed_publication_branch.assert_called_once()
+            effects.publication.command.assert_called_once()
 
     def test_real_git_published_review_release_restart_and_correction(self):
         # Exercise the ownership boundary with real commits, refs, registration,
@@ -5470,8 +5609,15 @@ class CurrentRebaseAdoptionTests(TestCase):
                                     branch_ref=('owned-head', ''),
                                     registration=('HEAD=owned-head', 'branch=refs/heads/loop-manager/G-047'))
         def factory(context, **options):
+            current = self.checkpoint.get('repo', 'G-047')
             expected = replace(self.expected,
-                               generation=self.checkpoint.get('repo', 'G-047').generation)
+                               generation=current.generation)
+            if current.operation != 'rebase':
+                row = self.fixture.connection.execute(
+                    "SELECT publication_remote_oid FROM exec_plans "
+                    "WHERE repo = 'repo' AND plan_id = 'G-047'").fetchone()
+                expected = replace(expected, remote=replace(expected.remote,
+                    oid=row['publication_remote_oid'] or current.observed_remote_oid))
             if 'remote_oid' in options:
                 expected = replace(expected, remote=replace(expected.remote, oid=options['remote_oid']))
             return ManagedRebaseService(expected, mock.Mock())
@@ -5486,6 +5632,20 @@ class CurrentRebaseAdoptionTests(TestCase):
         # Isolate current-result adoption from the independently tested remote
         # publication boundary. These observations use synthetic Git OIDs.
         self.handler._publish_rebased_checkpoint = mock.Mock()
+
+    def test_ordinary_checkpoint_remote_observation_keeps_fetched_reader(self):
+        from managed_rebase_adoption import checkpoint_remote_oid
+        current = self.checkpoint.get('repo', 'G-047')
+        for selected in (None, replace(current, operation=None, snapshot={}),
+                         replace(current, operation=None, snapshot={
+                             'current_rebase_acceptance': {'kind': 'unverified'}})):
+            with self.subTest(selected=selected):
+                git = mock.Mock(side_effect=AssertionError('ordinary observation must use its existing reader'))
+                fetched = mock.Mock(return_value='fetched-oid')
+                self.assertEqual(checkpoint_remote_oid(selected, Path('/repo'), 'loop-manager/G-047',
+                    git=git, read_fetched=fetched), 'fetched-oid')
+                fetched.assert_called_once_with(Path('/repo'), 'loop-manager/G-047')
+                git.assert_not_called()
 
     def _prepare_current_checkpoint_recovery(self):
         self.expected = replace(self.expected, remote=replace(self.expected.remote, repository='repo'))
@@ -5504,6 +5664,12 @@ class CurrentRebaseAdoptionTests(TestCase):
         self.fixture.effects.publication.pr_for_branch.return_value = None
         self.fixture.effects.workspace.git.side_effect = self.fixture.observed_git
         self.handler._fetch_latest_base = mock.Mock(return_value='base')
+        # These unit observations use symbolic OIDs. Fake the live-ref process
+        # boundary as well as the fetched-ref boundary, retaining real policy.
+        live_remote = mock.patch.object(handlers.manager_git_journal, 'live_remote_branch_oid',
+                                       side_effect=lambda *_: self.observed.remote.oid)
+        live_remote.start()
+        self.addCleanup(live_remote.stop)
         self.owner_patch = mock.patch.object(handlers.checkpoint_ownership,
                                             'owned_remote_oid', return_value='remote')
         self.owner_patch.start()
@@ -6540,3 +6706,440 @@ class ImmediateRebasePublicationTests(TestCase):
         self.assertEqual(len(self.pushes), 1)
         self.assertNotIn('completed_rebase', saved.snapshot)
         self.assertNotIn('rebase_completion', saved.snapshot)
+
+
+class EvidenceFreeBlockedScopeTests(TestCase):
+    setUp = CurrentRebaseAgentScopeTests.setUp
+
+    def validate(self):
+        connection = self.case.fixture.connection
+        plan = connection.execute("SELECT * FROM exec_plans WHERE repo='repo'").fetchone()
+        with mock.patch.object(lm, '_published_plan_allows_common_plans', return_value=False), \
+             mock.patch.object(lm, 'requirement_archive_candidates', return_value=()), \
+             mock.patch.object(lm, '_proven_manager_base_refs', return_value=frozenset()):
+            lm.validate_blocked_agent_scope(connection, Path('/repo'), 'repo', 'main',
+                Path('/state/G-047'), plan['path'], accepted_rebase=True, saved_plan=plan)
+
+    def test_manual_result_can_replace_selected_rebase_state_without_changing_saved_agent_start(self):
+        self.validate()
+        row = self.case.fixture.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual(row['agent_snapshot'], self.original.serialize())
+
+    def test_saved_actual_agent_ref_violation_is_checked_before_rebase_normalization(self):
+        violation = replace(self.original, refs={**self.original.refs, 'refs/heads/other': ('foreign', '')})
+        self.case.state.update_project('repo', agent_result_snapshot=violation.serialize())
+        with self.assertRaises(lm.AgentScopeError):
+            self.validate()
+
+    def test_current_external_ref_and_default_worktree_mutation_remain_rejected(self):
+        original = self.current
+        for current in (replace(original, refs={**original.refs, 'refs/heads/other': ('foreign', '')}),
+                        replace(original, worktrees={**original.worktrees, '/repo': ('HEAD=foreign',)})):
+            with self.subTest(current=current):
+                self.current = current
+                with self.assertRaises(lm.AgentScopeError):
+                    self.validate()
+
+
+class EvidenceFreeRecoveryLifecycleTests(TestCase):
+    """Manager phase policies with SQLite and fake Git/Agent/process adapters."""
+
+    def setUp(self):
+        from tests.test_scoped_blocking import EvidenceFreeRebaseBlockTests
+        self.blocked = EvidenceFreeRebaseBlockTests()
+        self.blocked.setUp()
+        self.addCleanup(self.blocked.doCleanups)
+        self.case = self.blocked.case
+        self.fixture = self.case.fixture
+        self.handler, self.state = self.case.handler, self.case.state
+        workspace = recovered_rebase_workspace(self.handler.effects.workspace,
+            connection=self.fixture.connection, repo_path=self.handler.repo_path,
+            state_dir=self.handler.state_dir, repo='repo', plan_id='G-047',
+            worktree=Path('/state/G-047'))
+        # Substitute external Git effects after constructing the same bindings
+        # as the real lifecycle fixture; no Git process runs in these cases.
+        self.effects = replace(self.handler.effects, workspace=replace(workspace,
+            _rebase_in_progress_for_branch=mock.Mock(side_effect=lambda *_: self.pending),
+            git_operation_entries=mock.Mock(side_effect=lambda *_:
+                {'rebase-merge': 'operation'} if self.pending else {})))
+        self.handler.effects = self.effects
+        self.case.expected = replace(self.case.expected,
+            input_fingerprint='changed-plan-and-source',
+            remote=replace(self.case.expected.remote, oid=None, repository='repo'))
+        self.case.observed = replace(self.case.observed,
+            input_fingerprint=self.case.expected.input_fingerprint,
+            remote=self.case.expected.remote)
+        self.final_head = 'c' * 40
+        self.case.observed = replace(self.case.observed, head=self.final_head,
+            branch_ref=(self.final_head, ''), registration=(
+                f'HEAD={self.final_head}', 'branch=refs/heads/loop-manager/G-047'))
+        self.completed = self.case.observed
+        self.pending = True
+        self.remote = None
+        self.lifecycle = []
+        self.worker_result = (
+            'WORKER_OUTCOME: {"kind":"ready_for_validation"}\n'
+            'COMMIT_TITLE: Preserve current manual conflict resolution\n'
+            'PR_SUMMARY: Recheck the changed plan and current diff.\n'
+            'TARGETED_TESTS:\ncurrent candidate unit case: OK\n'
+        )
+        self.effects.validation.parse_worker_result.side_effect = lm.parse_worker_result
+        self.effects.revision.body_hash.return_value = 'changed-plan-body'
+        self.effects.revision.source_fingerprint.return_value = 'changed-source'
+        self.effects.workspace.git.side_effect = self.git
+        self.effects.workspace.remote_branch_oid.side_effect = lambda *_: self.remote
+        self.effects.agent.capture_git_snapshot.side_effect = lambda *_: lm.GitSnapshot(
+            'partial' if self.pending else self.final_head,
+            None if self.pending else 'loop-manager/G-047', {},
+            {'app.py': (('staged',), 'manual')} if self.pending else {}, {}, {}, {}, {})
+        self.effects.agent.run_agent.side_effect = self.agent
+        self.effects.validation.verify.side_effect = (
+            lambda _: (self.lifecycle.append('verify') or True, 'fresh candidate: OK'))
+        self.effects.publication.command.side_effect = (
+            lambda *_args, **_kwargs: SimpleNamespace(stdout='https://example.test/pr/47'))
+        saved = self.case.checkpoint.get('repo', 'G-047')
+        # There is no saved Worker correction, stage approval or journal proof.
+        self.case.checkpoint.record('repo', 'G-047', expected_generation=saved.generation,
+            operation='rebase', expected_head='before', target_base_oid='base',
+            observed_remote_oid=None, snapshot={'failure': 'old failure'})
+        self.blocked.block()
+        self.blocked.pending(staged=True)
+        self.assertTrue(self.blocked.resume())
+        self.assertIsNone(scoped_blocking.plan_block(self.fixture.connection, 'repo', 'G-047'))
+        self.assertTrue(self.pending)
+        self.effects.workspace.git.assert_not_called()
+        # A resumed Manager opens a new port bound to the released execution.
+        self.state = ExecutionStatePort(self.fixture.connection, self.fixture.repository, 'repo')
+        self.case.state = self.fixture.state = self.state
+        with mock.patch.object(lm, 'push_managed_publication_branch', side_effect=self.push), \
+                mock.patch.object(lm, 'push_owned_pr_conflict_recovery', side_effect=self.push):
+            publication = recovered_rebase_publication(self.effects.publication, self.state)
+        self.effects = replace(self.effects, state=self.state, publication=publication)
+        self.handler.effects = self.effects
+        self.handler.catalog_plan = self.state.active_execplan('repo')
+        self.coordinator = ExecutionPhaseCoordinator(self.handler)
+        for patch in (
+                mock.patch.object(lm, 'git', side_effect=self.git),
+                mock.patch.object(lm, '_owned_publication_plan',
+                                  side_effect=lambda *_: self.state.active_execplan('repo'))):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def git(self, _path, *args, **_kwargs):
+        self.assertNotIn(args[0], ('add', 'commit', 'checkout', 'reset'),
+                         'the manually staged candidate must be preserved')
+        if 'rebase' in args:
+            self.assertIn('--continue', args)
+            self.assertTrue(self.pending)
+            self.pending = False
+            self.case.observed = self.completed
+            self.lifecycle.append('manager_continue')
+        output, code = '', 0
+        if args == ('rev-parse', 'HEAD'):
+            output = 'partial' if self.pending else self.final_head
+        elif args[:2] == ('rev-parse', '--git-path'):
+            code = 1
+        elif args[0] == 'rev-parse':
+            output = 'base'
+        elif args[0] == 'symbolic-ref':
+            output, code = ('', 1) if self.pending else ('loop-manager/G-047', 0)
+        elif args == ('diff', '--cached', '--quiet'):
+            code = int(self.pending)
+        elif args[:2] == ('ls-files', '--cached'):
+            output = 'app.py\0'
+        elif args[0] == 'ls-remote' and self.remote:
+            output = f'{self.remote}\trefs/heads/loop-manager/G-047\n'
+        return SimpleNamespace(stdout=output, returncode=code)
+
+    def agent(self, *args, **kwargs):
+        role = args[4]
+        if role == 'worker':
+            self.assertEqual(kwargs['session_id'], 'saved-worker')
+            self.assertIn('현재 HEAD의 base 대비 최종 diff 전체', args[5])
+            self.assertIn('targeted unit test', args[5])
+            self.assertEqual(self.handler._definition_snapshot.body_hash, 'changed-plan-body')
+            self.assertEqual(self.handler._definition_snapshot.source_fingerprint, 'changed-source')
+            self.lifecycle.extend(('worker_confirmation', 'targeted_tests'))
+            kwargs['on_session_started']('saved-worker')
+            return lm.AgentResult(0, self.worker_result, session_id='saved-worker')
+        self.assertEqual(role, 'reviewer')
+        self.lifecycle.append('review')
+        return lm.AgentResult(0, 'VERDICT: PASS', session_id='review-session')
+
+    def push(self, connection, *_args):
+        self.assertEqual(self.state.row()['verify_result'], 'fresh candidate: OK')
+        self.assertEqual(self.state.row()['review_result'], 'VERDICT: PASS')
+        current = self.handler._definition_snapshot
+        self.assertEqual(self.state.row()['verify_token'], current.verify_token('base', self.final_head))
+        self.assertEqual(self.state.row()['review_token'], current.review_token('base', self.final_head))
+        self.remote = self.final_head
+        self.case.expected = replace(self.case.expected,
+            remote=replace(self.case.expected.remote, oid=self.remote))
+        self.case.observed = replace(self.case.observed, remote=self.case.expected.remote)
+        self.lifecycle.append('publication')
+        lm.update_project(connection, 'repo', publication_remote_oid=self.remote)
+        return self.remote
+
+    def recover(self):
+        result = self.handler.recover(self.handler._context())
+        self.assertIsInstance(result, handlers.ExecutionContext)
+        self.assertEqual(result.phase, ExecutionPhase.IMPLEMENTING)
+        self.assertFalse(self.pending)
+        self.assertIsNone(self.case.checkpoint.get('repo', 'G-047').operation)
+        for field in ('worker_result', 'verify_result', 'review_result',
+                      'verify_token', 'review_token', 'publication_token'):
+            self.assertIsNone(self.state.row()[field], field)
+        self.effects.agent.run_agent.assert_not_called()
+        self.effects.validation.verify.assert_not_called()
+
+    def confirm_worker(self):
+        context = self.handler.guard(self.handler._context())
+        self.assertIsInstance(context, handlers.ExecutionContext)
+        outcome = self.coordinator.dispatch(context)
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
+        saved = self.case.checkpoint.get('repo', 'G-047')
+        self.assertEqual(saved.snapshot['worker_candidate_token'],
+                         self.handler._definition_snapshot.worker_candidate_token(self.final_head))
+
+    def existing_pr(self):
+        from managed_rebase_validation import PullRequest
+        self.remote = self.prior_remote = 'a' * 40
+        pr = PullRequest('https://example.test/pr/47', 'repo', 'loop-manager/G-047',
+                         self.remote, 'OPEN')
+        self.case.expected = replace(self.case.expected,
+            remote=replace(self.case.expected.remote, oid=self.remote, pull_request=pr))
+        self.case.observed = replace(self.case.observed, remote=self.case.expected.remote)
+        self.completed = replace(self.completed, remote=self.case.expected.remote)
+        current = self.case.checkpoint.get('repo', 'G-047')
+        self.case.checkpoint.record('repo', 'G-047', expected_generation=current.generation,
+            operation='rebase', expected_head=current.expected_head,
+            target_base_oid=current.target_base_oid, observed_remote_oid=self.remote,
+            snapshot=current.snapshot)
+        self.state.update_project('repo', pr_url=pr.identity, pr_head_oid=pr.head)
+        self.effects.publication.pr_for_branch.return_value = dict(
+            url=pr.identity, state=pr.state, headRefName=pr.branch,
+            headRefOid=pr.head, baseRefName='main')
+
+    def test_current_pr_lease_survives_recovery_and_fresh_publication(self):
+        self.existing_pr()
+        self.effects.workspace.remote_branch_oid.side_effect = lambda *_: 'stale-cache'
+        self.recover()
+        self.handler.recover(self.handler._context())
+        self.effects.workspace.remote_branch_oid.assert_not_called()
+        self.confirm_worker()
+        for _ in range(2):
+            self.assertEqual(self.coordinator.dispatch(self.handler._context()).kind,
+                             ExecutionOutcomeKind.PHASE_ADVANCED)
+        self.effects.publication.push_owned_pr_conflict_recovery.assert_not_called()
+        self.state.update_project('repo', pr_conflict_recovery=1,
+            pr_conflict_head_oid=self.prior_remote, pr_conflict_base_oid='base')
+        self.effects.workspace.remote_branch_oid.side_effect = lambda *_: self.remote
+        result = self.coordinator.dispatch(self.handler._context())
+        self.assertEqual(result.kind, ExecutionOutcomeKind.SUCCESS)
+        self.assertEqual(self.lifecycle, ['manager_continue', 'worker_confirmation',
+            'targeted_tests', 'verify', 'review', 'publication'])
+        self.effects.publication.push_owned_pr_conflict_recovery.assert_called_once()
+        self.effects.publication.command.assert_not_called()
+        self.assertEqual(self.state.repository.get('repo', 'G-047').status, 'PR_OPEN')
+
+    def test_absent_live_remote_ignores_stale_tracking_ref_after_adoption(self):
+        self.effects.workspace.remote_branch_oid.side_effect = lambda *_: 'stale-cache'
+        self.recover()
+        result = self.handler.recover(self.handler._context())
+        self.assertIsInstance(result, handlers.ExecutionContext)
+        self.effects.workspace.remote_branch_oid.assert_not_called()
+        self.effects.agent.run_agent.assert_not_called()
+        self.effects.publication.push_managed_publication_branch.assert_not_called()
+
+    def test_stale_cache_recovery_reaches_actual_push_adapter_after_fresh_validation(self):
+        self.effects.workspace.remote_branch_oid.side_effect = lambda *_: 'stale-cache'
+        self.recover()
+        self.confirm_worker()
+        for _ in range(2):
+            self.assertEqual(self.coordinator.dispatch(self.handler._context()).kind,
+                             ExecutionOutcomeKind.PHASE_ADVANCED)
+        self.effects = replace(self.effects, publication=recovered_rebase_publication(
+            self.effects.publication, self.state))
+        self.handler.effects = self.effects
+        pushes = []
+        def git(path, *args, **kwargs):
+            if args[0] == 'push':
+                self.assertEqual(self.state.row()['verify_result'], 'fresh candidate: OK')
+                self.assertEqual(self.state.row()['review_result'], 'VERDICT: PASS')
+                pushes.append(args)
+                self.remote = self.final_head
+                self.case.expected = replace(self.case.expected,
+                    remote=replace(self.case.expected.remote, oid=self.remote))
+                self.case.observed = replace(self.case.observed, remote=self.case.expected.remote)
+                self.lifecycle.append('publication')
+            return self.git(path, *args, **kwargs)
+        self.effects.workspace.git.side_effect = git
+        with mock.patch.object(lm, 'git', side_effect=git), \
+                mock.patch.object(lm, '_recorded_base_fetch') as fetch, \
+                mock.patch.object(lm, 'remote_branch_oid', return_value='stale-cache') as cached:
+            result = self.coordinator.dispatch(self.handler._context())
+        self.assertEqual(result.kind, ExecutionOutcomeKind.SUCCESS)
+        self.assertEqual(pushes, [('push', '-u', 'origin', 'HEAD:refs/heads/loop-manager/G-047')])
+        fetch.assert_called_once()
+        cached.assert_not_called()
+        self.effects.workspace.remote_branch_oid.assert_not_called()
+        self.effects.publication.push_managed_publication_branch.assert_called_once()
+        self.effects.publication.command.assert_called_once()
+        self.assertEqual(self.lifecycle, ['manager_continue', 'worker_confirmation',
+            'targeted_tests', 'verify', 'review', 'publication'])
+        row = self.state.repository.get('repo', 'G-047')
+        self.assertEqual(row.status, 'PR_OPEN')
+        self.assertEqual(row.publication_remote_oid, self.final_head)
+
+    def test_live_remote_creation_before_publication_is_rejected_despite_absent_cache(self):
+        self.recover()
+        self.confirm_worker()
+        for _ in range(2):
+            self.assertEqual(self.coordinator.dispatch(self.handler._context()).kind,
+                             ExecutionOutcomeKind.PHASE_ADVANCED)
+        self.remote = 'b' * 40
+        self.effects.workspace.remote_branch_oid.side_effect = lambda *_: None
+        result = self.coordinator.dispatch(self.handler._context())
+        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.effects.publication.push_managed_publication_branch.assert_not_called()
+        self.effects.publication.command.assert_not_called()
+        self.assertNotIn('publication', self.lifecycle)
+
+    def test_live_remote_change_after_adoption_keeps_publication_closed(self):
+        self.existing_pr()
+        self.recover()
+        self.remote = 'b' * 40
+        self.case.observed = replace(self.case.observed,
+            remote=replace(self.case.observed.remote, oid=self.remote))
+        result = self.handler.recover(self.handler._context())
+        self.assertIsInstance(result, ExecutionOutcome)
+        self.effects.agent.run_agent.assert_not_called()
+        self.effects.validation.verify.assert_not_called()
+        self.effects.publication.push_owned_pr_conflict_recovery.assert_not_called()
+        self.effects.publication.command.assert_not_called()
+
+    def test_existing_remote_head_creates_pr_without_repeated_push(self):
+        self.recover()
+        self.confirm_worker()
+        for _ in range(2):
+            self.assertEqual(self.coordinator.dispatch(self.handler._context()).kind,
+                             ExecutionOutcomeKind.PHASE_ADVANCED)
+        # A push completed before its remote observation was recorded. The
+        # actual record adapter must refresh the snapshot for the next guard.
+        self.remote = self.final_head
+        self.case.expected = replace(self.case.expected,
+            remote=replace(self.case.expected.remote, oid=self.remote))
+        self.case.observed = replace(self.case.observed, remote=self.case.expected.remote)
+        result = self.coordinator.dispatch(self.handler._context())
+        self.assertEqual(result.kind, ExecutionOutcomeKind.SUCCESS)
+        expected_record = mock.call(Path('/repo'), Path('/state'), 'repo',
+                                    'loop-manager/G-047', Path('/state/G-047'), self.final_head)
+        self.assertEqual(self.effects.publication.record_remote_publication_branch.call_args_list,
+                         [expected_record, expected_record])
+        self.effects.publication.push_managed_publication_branch.assert_not_called()
+        self.effects.publication.command.assert_called_once()
+        row = self.state.repository.get('repo', 'G-047')
+        self.assertEqual(row.status, 'PR_OPEN')
+        self.assertEqual(row.publication_remote_oid, self.final_head)
+
+    def test_manual_stage_continue_rechecks_worker_verify_review_and_publication_gate(self):
+        self.recover()
+        self.handler.recover(self.handler._context())
+        self.assertEqual(self.lifecycle, ['manager_continue'])
+        self.confirm_worker()
+        self.assertEqual(self.coordinator.dispatch(self.handler._context()).kind,
+                         ExecutionOutcomeKind.PHASE_ADVANCED)
+        self.assertEqual(self.coordinator.dispatch(self.handler._context()).kind,
+                         ExecutionOutcomeKind.PHASE_ADVANCED)
+        self.state.update_project('repo', review_token='old candidate review')
+        stale = self.coordinator.dispatch(self.handler._context())
+        self.assertEqual(stale.kind, ExecutionOutcomeKind.RETRY)
+        self.effects.publication.push_managed_publication_branch.assert_not_called()
+        self.effects.publication.command.assert_not_called()
+        self.assertEqual(self.state.row()['phase'], 'REVIEWING')
+        self.assertEqual(self.coordinator.dispatch(self.handler._context()).kind,
+                         ExecutionOutcomeKind.PHASE_ADVANCED)
+        self.assertEqual(self.coordinator.dispatch(self.handler._context()).kind,
+                         ExecutionOutcomeKind.SUCCESS)
+        self.assertEqual(self.lifecycle, ['manager_continue', 'worker_confirmation',
+            'targeted_tests', 'verify', 'review', 'review', 'publication'])
+        self.assertEqual(self.state.repository.get('repo', 'G-047').status, 'PR_OPEN')
+        self.effects.publication.command.assert_called_once()
+
+    def test_old_success_results_cannot_publish_without_current_worker_confirmation(self):
+        self.recover()
+        self.state.update_project('repo', phase='PUBLISHING', worker_result=self.worker_result,
+            verify_result='old verify', review_result='VERDICT: PASS', validated_base_sha='base',
+            worker_input_token='old-input', verify_token='old-verify', review_token='old-review')
+        # Coordinator runs guard before dispatching the saved PUBLISHING phase.
+        result = self.coordinator.dispatch(self.handler._context())
+        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(self.state.row()['phase'], 'WORKING')
+        self.effects.agent.run_agent.assert_not_called()
+        self.effects.validation.verify.assert_not_called()
+        self.effects.publication.push_managed_publication_branch.assert_not_called()
+        self.effects.publication.command.assert_not_called()
+
+    def test_unsuccessful_fresh_verify_does_not_open_review_or_publication(self):
+        self.recover()
+        self.confirm_worker()
+        self.effects.validation.verify.side_effect = lambda _: (False, 'current candidate rejected')
+        def rejected(_repo, _worktree, _stage, output):
+            self.state.update_project('repo', phase='WORKING', validated_base_sha=None,
+                                     verify_result=output, last_error=output)
+            return SimpleNamespace(blocked=False, fingerprint='current-verify')
+        self.effects.validation.transition_validation_failure.side_effect = rejected
+        result = self.coordinator.dispatch(self.handler._context())
+        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(self.state.row()['phase'], 'WORKING')
+        self.assertIsNone(self.state.row()['review_token'])
+        self.assertNotIn('review', self.lifecycle)
+        self.effects.publication.push_managed_publication_branch.assert_not_called()
+        self.effects.publication.command.assert_not_called()
+
+
+class EvidenceFreeRebasePreparationTests(TestCase):
+    def setUp(self):
+        self.case = current_rebase_case(self)
+        self.case.fixture.effects.workspace.is_directory.return_value = True
+        self.case.handler.catalog_plan = self.case.state.active_execplan('repo')
+
+    def pending(self):
+        from managed_rebase_validation import IndexEntry
+        self.case.observed = replace(self.case.observed, head='partial', branch=None,
+            branch_ref=('before', ''), registration=('HEAD=partial', 'detached=True'),
+            branch_worktrees=(), operations=(('rebase-merge', 'operation'),),
+            metadata=(('head-name', 'refs/heads/loop-manager/G-047'),
+                      ('orig-head', 'before'), ('onto', 'base')),
+            index=(IndexEntry('app.py', '100644', 'manual', 0, 'H', 0),), index_clean=False)
+
+    def test_owned_detached_rebase_is_recognized_without_old_error_marker(self):
+        self.pending()
+        self.case.state.update_project('repo', last_error='different historical failure')
+        self.assertTrue(self.case.handler._resolving_rebase(self.case.state.row()))
+
+    def test_detached_metadata_alone_cannot_bypass_current_remote_or_target_check(self):
+        self.pending()
+        original = self.case.observed
+        for observed in (replace(original, remote=replace(original.remote, oid='foreign')),
+                         replace(original, metadata=(('head-name', 'refs/heads/loop-manager/G-047'),
+                                                     ('orig-head', 'before'), ('onto', 'foreign')))):
+            with self.subTest(observed=observed):
+                self.case.observed = observed
+                with self.assertRaises(handlers.manager_git_journal.MutationEvidenceError):
+                    self.case.handler._resolving_rebase(self.case.state.row())
+
+    def test_initial_and_detached_context_validate_current_existing_pr_lease(self):
+        from managed_rebase_validation import PullRequest
+        remote = replace(self.case.expected.remote, repository='repo', oid='remote', pull_request=PullRequest(
+            'https://example.test/pr/47', 'repo', 'loop-manager/G-047',
+            'remote', 'OPEN'))
+        self.case.expected = replace(self.case.expected, remote=remote)
+        self.case.observed = replace(self.case.observed, remote=remote)
+        self.case.state.update_project('repo', pr_url=remote.pull_request.identity, pr_head_oid=remote.oid)
+        self.assertFalse(self.case.handler._context().resolving_rebase)
+        self.pending()
+        self.assertTrue(self.case.handler._context().resolving_rebase)
+        self.case.observed = replace(self.case.observed, remote=replace(remote, pull_request=None))
+        with self.assertRaises(handlers.manager_git_journal.MutationEvidenceError):
+            self.case.handler._context()

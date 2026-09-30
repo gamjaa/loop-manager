@@ -50,7 +50,7 @@ class RecoveryPolicyTests(unittest.TestCase):
         self.assertEqual(resolved['reason_code'], 'ownership_uncertain')
         self.assertEqual(len(json.loads(resolved['occurrence_index'])), 2)
 
-    def test_rebase_block_selector_requires_saved_cause_and_pending_intent(self):
+    def test_rebase_block_selector_requires_linked_cause_but_not_historical_records(self):
         recovery = {
             "reason_code": RecoveryReason.STATUS_FAILED.value,
             "detail": rebase_blocks.LEGACY_COMPLETION_DIAGNOSTIC,
@@ -64,9 +64,9 @@ class RecoveryPolicyTests(unittest.TestCase):
             "evidence": rebase_blocks.LEGACY_COMPLETION_DIAGNOSTIC,
         }
         self.assertTrue(rebase_blocks.could_be_rebase_evidence_block(block))
-        self.assertFalse(rebase_blocks.block_matches(block, None, checkpoint))
+        self.assertTrue(rebase_blocks.block_matches(block, None, checkpoint))
         self.assertTrue(rebase_blocks.block_matches(block, recovery, checkpoint))
-        self.assertFalse(rebase_blocks.block_matches(
+        self.assertTrue(rebase_blocks.block_matches(
             block, {**recovery, "reason_code": RecoveryReason.REVIEW_EXHAUSTED.value},
             checkpoint,
         ))
@@ -97,7 +97,7 @@ class RecoveryPolicyTests(unittest.TestCase):
         self.assertTrue(rebase_blocks.block_matches(
             block, final, checkpoint,
         ))
-        self.assertFalse(rebase_blocks.block_matches(
+        self.assertTrue(rebase_blocks.block_matches(
             block, {**final, "occurrence_index": "{}"}, checkpoint,
         ))
 

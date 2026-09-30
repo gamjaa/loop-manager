@@ -12,6 +12,16 @@ from managed_rebase_validation import (
     ObservationFailure, RebaseExpectation, RebaseStatus, assess_current_rebase, valid_acceptance,
 )
 from manager_git_journal import MutationEvidenceError
+import manager_git_journal
+
+
+def checkpoint_remote_oid(checkpoint, repo, branch, *, git, read_fetched):
+    """Keep current rebase observation on the live ref through publication."""
+    if checkpoint is not None and (
+            checkpoint.operation == 'rebase'
+            or valid_acceptance((checkpoint.snapshot or {}).get('current_rebase_acceptance'))):
+        return manager_git_journal.live_remote_branch_oid(git, repo, branch)
+    return read_fetched(repo, branch)
 
 
 def revalidation_values(target):

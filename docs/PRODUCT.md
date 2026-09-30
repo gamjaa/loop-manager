@@ -217,6 +217,10 @@ PR 없는 게시 checkpoint의 Review 횟수 차단을 rebase 없이 해제할 �
 7. 해제 조건이 충족된 계획은 기존 branch와 worktree에서 재개하고 재시도 횟수와 verify·Review 실패 지문 이력을 초기화하며 effective Worker level과 승격 이력을 최초 level로 되돌린 뒤 READY 또는 PR_OPEN으로 변경한다. 같은 branch의 최초 PR은 최종 verify와 Review 성공 뒤에만 생성한다
 8. `PROJECT_BLOCKED`는 기본 worktree, 허용되지 않은 공유 ref, 외부 worktree와 workspace 소유권을 다시 검증해 프로젝트 안전이 증명된 경우에만 해제한다. `refs/codex/turn-diffs/*`의 순변경은 해제 조건을 무효화하지 않는다
 9. 프로젝트 차단이 해제돼도 별도 계획 원인이 남은 ExecPlan은 `PLAN_BLOCKED`를 유지하며, 다른 차단 계획의 fingerprint와 작업 공간은 변경하지 않는다
+10. 저장된 `managed_worktree_conflict`와 계획에 연결된 rebase 완료·소유권 오탐은 같은 현재 상태 서비스로 재평가한다. 특정 구형 오류 문구, 과거 Worker 세션·교정 turn·stage 승인·receipt·journal 완전성이나 입력 변경 지문 부재만으로 복구를 거부하지 않는다. 저장 원인을 해당 계획의 rebase intent와 연결할 수 없으면 차단을 유지한다
+11. 현재 repository·reservation·등록 worktree·소유 branch·target base·원격 기대값과 rebase metadata가 일치하면 일반 branch 검사 전에 detached rebase를 인식하고 충돌·사용자 stage를 보존한 채 같은 실행을 재개한다. 이미 완료됐으면 Git 단계를 반복하지 않고 결과를 채택한다. 관측을 transaction 안에서 다시 확인하고 대상 원인 해제와 후보 검증 무효화를 함께 기록한다. 다른 활성 실행·planning 또는 미충족 dependency가 있으면 투영·session·진단을 바꾸지 않고 대기한다
+12. rebase 원인 해제는 별도 Review 실패·guidance·사용자 결정·PR reopen·실제 Agent 범위 위반과 다른 계획·planning·프로젝트 안전 원인을 해제하지 않는다. 원문·실패·알림 감사와 기존 branch·worktree·session을 보존하며 변경된 후보는 Worker의 현재 입력·최종 diff 확인과 targeted test, Manager 전체 verify, Reviewer 및 기존 게시 ownership·lease·PR identity 조건을 다시 통과해야 한다
+13. 교정 소진으로 차단된 진행 중 rebase는 저장된 실제 차단 기준선과 현재 입력·선택 worktree를 비교할 수 있고 모두 같으면 차단을 유지해 동일 Worker 실패를 반복하지 않는다. 입력 또는 수동 해결·stage·continue 결과가 바뀌면 현재 상태를 다시 검사한다. 과거 기준선이나 실패 기록의 부재 자체는 복구 거부 조건이 아니다
 
 ### 사용자 승인 및 완료
 
@@ -389,7 +393,7 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 - PR 없는 게시 checkpoint의 원격 OID가 rebased HEAD의 조상이 아니어도 동일 계획의 게시 identity·마지막 채택 원격 OID·현재 branch/worktree·target·허용 최종 변경이 일치하면 소유권을 유지한다. 원격 후속 commit·삭제·재작성과 PR head 변경은 수용하지 않으며 journal/replay 완전성을 ownership 조건으로 다시 요구하지 않는다
 - rebase로 후보 HEAD 또는 ExecPlan·근거 입력이 바뀌면 이전 Worker 후보 확인·전체 verify·Review·publication 증거를 무효화한다. 기존 또는 정상 fallback Worker 세션이 현재 입력과 최종 diff를 재확인하고 관련 targeted test 결과를 반환한 뒤 Manager 전체 verify와 Reviewer를 다시 통과해야 한다. 같은 확인 후보에서는 Worker를 반복 호출하지 않는다. 수용 자체는 구현 완료·게시 승인·차단 해제가 아니며 중간 checkpoint 게시도 최종 성공을 대신하지 않는다
 - 현재 결과는 선택 branch/worktree의 비교 기준선에만 반영한다. Agent 원본 snapshot·session·허용 범위와 과거 감사를 보존하고 수동 복구를 Manager 실행·Agent 격리 증거로 표시하지 않는다. 실제 Agent 범위 위반, 다른 Manager Git 작업의 증거와 별도 Review·사용자 결정·planning 차단은 기존 경계를 유지한다
-- 저장된 구형 rebase 완료 오탐의 `status_failed` 재시도나 차단은 해당 실패 원인과 미완료 intent를 연결하고 현재 Git 상태, checkpoint, 원격 branch·PR 소유권 및 허용 최종 변경을 다시 확인한 경우에만 해제한다. 다른 Review·사용자 결정·Agent 범위·planning 원인과 실패·알림 감사는 보존한다. 해제 후 후보 revision에 필요한 Worker 확인, targeted test, 전체 verify와 Review를 다시 수행하며 게시 직전 최신 원격 lease를 확인한다
+- 저장된 rebase 충돌·완료·소유권 오탐 차단은 실제 원인과 대상 계획의 rebase를 연결하고 현재 Git 상태, checkpoint, 원격 branch·PR 소유권 및 허용 최종 변경을 다시 확인한 경우에만 해당 원인을 해제한다. 과거 작업 기록이나 세션 일치는 해제 조건이 아니다. 다른 Review·사용자 결정·Agent 범위·planning 원인과 실패·알림 감사는 보존한다. 해제 후 후보 revision에 필요한 Worker 확인, targeted test, 전체 verify와 Review를 다시 수행하며 게시 직전 최신 원격 lease를 확인한다
 - PR 생성 직전에 최신 `origin/<base-branch>`를 확인하고 변경됐으면 rebase 후 Worker의 현재 후보 확인과 targeted test, 전체 검증과 Review를 다시 통과해야 한다
 - 게시 직전 archive eligibility가 검증된 이동 집합과 다르면 같은 Worker 세션으로 돌아가 전체 검증과 Review를 다시 수행한다
 - 관련 테스트와 전체 검증이 통과해야 한다

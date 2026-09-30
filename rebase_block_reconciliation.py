@@ -1,7 +1,7 @@
-"""Identify the historical R-045 completion false positive by durable cause.
+"""Select a saved rebase cause, independently of current-result validation.
 
-The diagnostic is only a selector.  A caller must still verify the entire
-managed rebase journal and current Git/remote ownership before release.
+Selection grants no Git or publication permission. Callers recheck the owned
+current operation and release only this exact block in a transaction.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ REBASE_BLOCK_REASONS = frozenset({
     BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value,
     BlockReasonCode.REPOSITORY_STATE_UNSAFE.value,
     BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value,
+    BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value,
 })
 
 
@@ -40,46 +41,74 @@ def saved_failure_matches(recovery, checkpoint) -> bool:
 
 
 def block_matches(block, recovery, checkpoint) -> bool:
-    """Never release a different final cause using an old retry record."""
+    """Connect a structured cause to its selected plan's rebase intent.
 
-    if not could_be_rebase_evidence_block(block) or recovery is None:
+    Conflict causes already identify rebase recovery. Generic project safety
+    causes additionally need a saved diagnosis connecting them to rebase. Past
+    sessions, correction counts and occurrence history are not ownership proof.
+    """
+    if (block is None or block['reason_code'] not in REBASE_BLOCK_REASONS
+            or checkpoint is None or not checkpoint.expected_head
+            or not checkpoint.target_base_oid):
         return False
-    if saved_failure_matches(recovery, checkpoint):
+    saved = getattr(checkpoint, 'snapshot', None) or {}
+    if checkpoint.operation != 'rebase' and not (
+            checkpoint.operation is None and any(saved.get(key) for key in (
+                'current_rebase_acceptance', 'completed_rebase', 'rebase_completion',
+                'blocked_resume'))):
+        return False
+    if block['reason_code'] == BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value:
         return True
-    if checkpoint is None or checkpoint.operation != "rebase":
+    if block['evidence'] == LEGACY_COMPLETION_DIAGNOSTIC:
+        return True
+    if (recovery is None or recovery['detail'] != block['evidence']
+            or recovery['reason_code'] not in {
+                RecoveryReason.REBASE_CONFLICT.value, RecoveryReason.STATUS_FAILED.value,
+                RecoveryReason.MANAGED_CONFLICT_UNRECOVERABLE.value,
+                RecoveryReason.STATE_UNSAFE.value, RecoveryReason.REMOTE_OID_UNCERTAIN.value,
+                RecoveryReason.OWNERSHIP_UNCERTAIN.value}):
         return False
-    if (recovery["pending_action"] != "final_block"
-            or recovery["detail"] != LEGACY_COMPLETION_DIAGNOSTIC
-            or not recovery["occurrence_index"]):
-        return False
+    if recovery['pending_action'] != 'final_block':
+        return recovery['reason_code'] == RecoveryReason.REBASE_CONFLICT.value
     try:
         evidence = json.loads(recovery["final_evidence"] or "null")
-        occurrences = json.loads(recovery["occurrence_index"])
-        history = [json.loads(key) for key in occurrences]
     except (TypeError, ValueError):
         return False
     return bool(
         isinstance(evidence, dict)
         and evidence.get("block_reason_code") == block["reason_code"]
-        and isinstance(occurrences, dict)
-        and any(
-            isinstance(parts, list)
-            and len(parts) == 3
-            and parts[0] == RecoveryReason.STATUS_FAILED.value
-            and parts[2] == recovery["progress_marker"]
-            for parts in history
-        )
-        and checkpoint.expected_head and checkpoint.target_base_oid
     )
 
 
-def could_be_rebase_evidence_block(block) -> bool:
+def could_be_rebase_evidence_block(block, recovery=None, checkpoint=None) -> bool:
     """Quarantine legacy-looking blocks even when their proof is missing."""
 
     return bool(
         block is not None
         and block["reason_code"] in REBASE_BLOCK_REASONS
-        and block["evidence"] == LEGACY_COMPLETION_DIAGNOSTIC
+        and (block['reason_code'] == BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value
+             or block["evidence"] == LEGACY_COMPLETION_DIAGNOSTIC
+             or block_matches(block, recovery, checkpoint))
+    )
+
+
+def pending_block_unchanged(plan, block, recovery, before, current, *,
+                            revision_input, worktree_input) -> bool:
+    """A saved blocked state suppresses unchanged retries, never proves ownership.
+
+    Missing historical baselines permit current-state recovery. Only an actual
+    unchanged selected worktree and unchanged inputs retain an exhausted block.
+    """
+    return bool(
+        block['reason_code'] == BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value
+        and recovery is not None and recovery['pending_action'] == 'final_block'
+        and recovery['reason_code'] == RecoveryReason.REBASE_CONFLICT.value
+        and recovery['detail'] == block['evidence']
+        and plan['blocked_fingerprint'] and plan['blocked_worktree_fingerprint']
+        and revision_input == plan['blocked_fingerprint']
+        and worktree_input == plan['blocked_worktree_fingerprint']
+        and all(getattr(before, field) == getattr(current, field)
+                for field in ('head', 'branch', 'index', 'dirty', 'operations'))
     )
 
 

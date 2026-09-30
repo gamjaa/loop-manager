@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Callable, Any
 from pathlib import Path
+from types import SimpleNamespace
 from dataclasses import asdict
 import hashlib
 import json
@@ -436,6 +437,14 @@ class ExecutionHandlers:
             raise manager_git_journal.MutationEvidenceError('current rebase adapter unavailable')
         return factory(context, **options)
 
+    def _checkpoint_remote_oid(self, repo_path, branch):
+        checkpoints = self.effects.checkpoint
+        current = (checkpoints.get(self.repo, self.effects.state.plan_id)
+                   if checkpoints is not None else None)
+        return managed_rebase_adoption.checkpoint_remote_oid(
+            current, repo_path, branch, git=self.effects.workspace.git,
+            read_fetched=self.effects.workspace.remote_branch_oid)
+
     def _owned_current_checkpoint_rebase(self, context, row, remote_oid, current,
                                          checkpoint, pull_request):
         original = str(checkpoint['accepted_remote_oid'] or '')
@@ -842,18 +851,32 @@ class ExecutionHandlers:
         return ExecutionOutcome.advanced(self._context())
 
     def _resolving_rebase(self, row):
+        checkpoint = self.effects.checkpoint
+        worktree = Path(str(row['worktree'] or ''))
+        if (checkpoint is not None and self.catalog_plan is not None
+                and self.effects.workspace.current_rebase_service is not None
+                and self.effects.workspace.is_directory(worktree)):
+            current = checkpoint.get(self.repo, self.catalog_plan['plan_id'])
+            if (current.operation == 'rebase'
+                    or self.effects.workspace._rebase_in_progress_for_branch(worktree, str(row['branch'] or ''))
+                    or (int(row['pr_conflict_recovery']) and self._unmerged_stages(worktree))):
+                # Validate detached ownership before the ordinary branch gate;
+                # a diagnostic string or metadata directory alone is insufficient.
+                context = SimpleNamespace(
+                    plan=SimpleNamespace(plan_id=self.catalog_plan['plan_id']),
+                    worktree=worktree, branch=str(row['branch'] or ''))
+                _, decision = self._current_rebase_service(context).require_owned(checkpoint=current)
+                return decision.status is RebaseStatus.WAITING
         rebase_error = str(row['last_error'] or '')
         rebase_recovery = bool(
             row['phase'] == 'WORKING' and (rebase_error == self.effects.contract.REBASE_IN_PROGRESS_ERROR or rebase_error.startswith(self.effects.contract.REBASE_CONFLICT_PREFIX)),
         )
-        worktree = Path(str(row['worktree'] or ''))
         if not rebase_recovery or not self.effects.workspace.is_directory(worktree):
             return False
         if self.effects.workspace._rebase_in_progress_for_branch(worktree, str(row['branch'] or '')):
             return True
         if int(row['pr_conflict_recovery']) and row['pr_conflict_base_oid']:
             return bool(self._unmerged_stages(worktree))
-        checkpoint = self.effects.checkpoint
         return bool(
             checkpoint is not None
             and checkpoint.get(self.repo, self.catalog_plan['plan_id']).operation == 'rebase'
@@ -980,7 +1003,7 @@ class ExecutionHandlers:
                         'remote_oid': observed.remote.oid})
             return
         head = self.effects.workspace.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
-        remote_oid = self.effects.workspace.remote_branch_oid(self.repo_path, context.branch)
+        remote_oid = self._checkpoint_remote_oid(self.repo_path, context.branch)
         live = manager_git_journal.live_remote_branch_oid(
             self.effects.workspace.git, self.repo_path, context.branch)
         row = self._row()
@@ -1638,7 +1661,7 @@ class ExecutionHandlers:
                 snapshot={**(current.snapshot or {}), 'fetch_in_progress': False,
                           'fetched_base_oid': base_oid},
             )
-            remote_oid = self.effects.workspace.remote_branch_oid(self.repo_path, context.branch)
+            remote_oid = self._checkpoint_remote_oid(self.repo_path, context.branch)
             # A PR needs a remote branch.  With neither a remote branch nor a
             # recorded PR there is no publication state to reconcile here;
             # the publication service will query again before creating one.
@@ -1683,9 +1706,7 @@ class ExecutionHandlers:
             stable_base = self.effects.workspace.git(
                 self.repo_path, 'rev-parse', f'origin/{self.base}'
             ).stdout.strip()
-            stable_remote = self.effects.workspace.remote_branch_oid(
-                self.repo_path, context.branch
-            )
+            stable_remote = self._checkpoint_remote_oid(self.repo_path, context.branch)
             stable_pr = (
                 self.effects.publication.pr_for_branch(
                     self.repo_path, context.branch, str(row['pr_url'] or '') or None
@@ -1719,6 +1740,15 @@ class ExecutionHandlers:
                     '게시 checkpoint의 원격 OID 또는 재활성화 계보가 유효하지 않습니다.',
                     context=context,
                 )
+            if (current.operation is None
+                    and valid_acceptance((current.snapshot or {}).get('current_rebase_acceptance'))):
+                observed, _ = self._current_rebase_service(context).require_owned(checkpoint=current)
+                if observed.remote.oid != remote_oid:
+                    return self._recover(RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                                         'adopted rebase remote observation changed', context=context)
+                # The current service has checked this exact lease and PR.
+                # A rebased local HEAD need not equal its prior remote HEAD.
+                snapshot = replace(snapshot, recorded_remote_oid=remote_oid)
             if (current.operation is None and not (current.snapshot or {}).get('current_rebase_acceptance')
                     and ((current.snapshot or {}).get('completed_rebase')
                          or (current.snapshot or {}).get('rebase_completion')
@@ -2218,7 +2248,7 @@ class ExecutionHandlers:
         if context.phase is ExecutionPhase.PUBLISHING and not int(
             row['pr_conflict_recovery']
         ):
-            remote_oid = self.effects.workspace.remote_branch_oid(
+            remote_oid = self._checkpoint_remote_oid(
                 self.repo_path, context.branch
             )
             try:
@@ -4243,7 +4273,7 @@ class ExecutionHandlers:
         row = self._row()
         assert self.catalog_plan is not None
         latest_sha = self._fetch_latest_base()
-        remote_oid = None if int(row['pr_conflict_recovery']) else self.effects.workspace.remote_branch_oid(self.repo_path, context.branch)
+        remote_oid = None if int(row['pr_conflict_recovery']) else self._checkpoint_remote_oid(self.repo_path, context.branch)
         try:
             if not int(row['pr_conflict_recovery']):
                 self.effects.publication.record_remote_publication_branch(
@@ -4339,7 +4369,7 @@ class ExecutionHandlers:
     def _publication_resume(self):
         return PublicationResume(
             self.effects.publication.pr_for_branch,
-            self.effects.workspace.remote_branch_oid,
+            self._checkpoint_remote_oid,
             self.effects.workspace.git,
         )
 

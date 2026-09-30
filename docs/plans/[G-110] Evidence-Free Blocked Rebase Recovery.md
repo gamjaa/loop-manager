@@ -39,11 +39,25 @@ G-088처럼 `managed_worktree_conflict`로 차단된 뒤 계획 입력이 바뀌
 
 ## Progress
 
-- [ ] 저장 rebase 차단 selector와 현재 상태 복구 연결
-- [ ] detached·수동 stage/완료 재개와 원인별 원자 해제
-- [ ] G-088 재현·다른 차단 보존·중단/재시작 회귀 사례
+- [x] 저장 rebase 차단 selector와 현재 상태 복구 연결
+- [x] detached·수동 stage/완료 재개와 원인별 원자 해제
+- [x] G-088 형태의 입력 변경·수동 결과와 다른 차단 보존·중단/rollback 회귀 unit 사례 구현
+- 최신 base로 rebase한 뒤 autostash 복원에서 같은 파일 끝에 추가된 테스트 클래스가 충돌했다. 기존 checkpoint 게시 테스트와 G-110 테스트를 모두 보존해 병합했으며, 직접 변경한 복구·scope·준비·원인 해제 경계의 targeted unit test 26개를 다시 실행해 모두 통과했다.
+- Manager verify 피드백에서 초기 context의 PR 응답 누락, 수동 continue 전 계획 파일의 unstaged 변경과 최초 교정 소진 차단의 동일 상태 재개를 확인했다. fixture의 PR·stage·실패 기록 기대값을 수정하고, 비교 가능한 차단 기준선의 입력·선택 작업 상태가 같은 경우 재개를 억제했다. 관련 targeted unit test 30개의 최종 실행은 모두 통과했으며 실제 Git lifecycle 실패 사례는 Manager의 후속 verify에서 다시 검증한다.
+- Review의 lifecycle 누락 지적을 반영해 실제 Git fixture의 수동 stage 이후 직접 continue·완료 채택을 Manager recover로 교체했다. PR 없음·기존 PR의 coordinator 경로를 Worker 현재 입력·후보 확인과 targeted test 보고, 새 verify·Review 및 실제 게시 adapter까지 연결하고 오래된 Review token으로 게시되지 않는지 확인한다. 외부 Git·Agent·verify를 대체한 unit case에서는 동일 continue 중복 방지, 오래된 성공 결과의 재사용 거부와 새 verify가 통과하지 못한 경우의 gate 보존을 검증한다. 현재 후보의 관련 targeted unit test 33개가 최종 실행에서 모두 통과했으며 실제 Git lifecycle 실행은 Manager의 후속 verify에 남긴다.
+- 후속 Manager verify의 11개 오류는 실제 Git fixture가 잘못된 `git_operation_entries` 이름을 참조한 같은 구성 오류였다. 실제 `_git_operation_entries` adapter를 바인딩하는 workspace 구성 함수를 실제 Git·unit fixture가 공유하게 해, 외부 Git 실행 없이도 해당 구성과 Manager lifecycle을 함께 검증한다.
+- 후속 verify의 snapshot·원격 차단·push 횟수 오류를 수정했다. 현재 rebase 복구는 실제 원격을 재관측하고 수용된 후보의 현재 소유권·PR lease를 일반 checkpoint 판정에 전달한다. 실제 Git·unit lifecycle fixture가 Manager의 상태 변경 adapter 바인딩을 공유하며, 이미 게시한 중간 checkpoint에는 최종 push를 반복하지 않는 기대값과 현재 원격 HEAD 검사를 적용했다. PR lease·원격 cache·실제 원격 변경·게시 snapshot 회귀를 추가했고, 현재 후보의 직접 관련 unit case 43개가 최종 실행에서 모두 통과했다. 최초 unit 실행에서 드러난 OID 형식·멱등 호출 횟수·차단 row 읽기 fixture 문제는 각각 수정 후 동일 명령으로 재실행했다.
+- 마지막 verify의 stale remote cache 사례는 복구 뒤 최종 게시·push adapter가 fetched ref로 되돌아가 발생했다. `managed_rebase_adoption.py`의 공유 원격 관측을 복구·새 rebase·revision 갱신·게시 판단·push 전후 확인에 연결했다. 외부 Git·fetch만 대체한 실제 push adapter unit 경로에서 Worker 확인·새 verify·Review 후 정상 게시와 원격 경쟁 거부를 확인하고, 일반 checkpoint의 기존 fetched 관측 유지도 검증했다. 현재 후보의 관련 targeted unit case 46개가 모두 통과했으며 실제 Git lifecycle과 전체 verify·Review는 Manager가 다시 수행한다.
+- 후속 verify의 게시 lease unit case 두 오류는 checkpoint 조회가 추가된 adapter에 기존 fixture가 SQLite 연결 대신 `object()`를 넘기고 계획 ID를 생략해 발생했다. 두 fixture에 메모리 SQLite 연결과 실제 계획 ID를 제공하고, 확인된 원격 OID가 같은 연결에 기록되는 assertion을 강화했다. 현재 후보에서 원격 경쟁 거부·정확한 lease 게시 unit case 2개와 stale cache 복구 후 실제 push adapter 연결 unit case 1개를 새로 실행해 모두 통과했다. 이전 후보의 테스트 결과를 현재 결과로 재사용하지 않았으며 전체 verify·Review는 Manager에 남긴다.
+- Worker는 좁은 unit case만 실행한다. 실제 Git lifecycle과 전체 verify·Review는 Worker 종료 뒤 Manager 검증 경로에 남긴다.
 
 ## Decision Log
 
 - 이 계획은 R-048의 수동 복구와 rebase 원인 해제만 담당한다. G-092는 R-023의 격리된 Agent 범위·Manager 기준선·index flags 오탐을 계속 담당하고, G-106·G-107은 차단 중 새 원격 입력 반영·checkpoint/진단 게시를 담당한다.
 - G-088·G-092에 의존하지 않는다. 차단된 기존 계획을 먼저 Merge해야 복구를 구현할 수 있는 순환을 만들지 않고 G-108 → G-109 → G-110으로 검증 가능한 변경을 진행한다.
+- 저장 원인 selector는 충돌 원인 또는 대상 rebase에 연결된 구조화 진단만 선택하며, Git 관측·해제는 G-109 현재 상태 서비스와 원자적 SQLite 경계에서 처리한다. 과거 세션·진전 marker·occurrence history는 gate로 사용하지 않는다.
+- 복구 자체는 Git 쓰기 없이 현재 상태를 두 번 관측한다. 진행 중 operation은 보존해 기존 Manager continue/Worker 경로로 연결하고, 완료 후보는 채택과 대상 원인 해제를 같은 transaction으로 적용한다. 별도 차단 원문·session·실패 이력과 검증 전 결과는 감사로 보존한다.
+- 최초 교정 소진 차단의 실제 Agent 결과 snapshot과 입력 기준선은 동일 실패 반복을 억제하는 데만 사용한다. ownership은 계속 현재 상태 서비스가 판정하며, 과거 세션·progress 일치나 기준선·실패 기록의 존재를 복구에 요구하지 않는다.
+- 수동 stage 회귀 테스트는 사용자 해결·stage까지만 직접 준비하고 이후 continue·채택·검증·게시 판단은 Manager 정책과 coordinator에 맡긴다. unit case는 외부 실행 효과만 대체하고 현재 상태 판정, 원인 해제 transaction과 후보 token gate는 실제 구현을 사용한다.
+- 수용된 rebase의 일반 checkpoint 판정에는 현재 상태 서비스가 다시 확인한 lease만 전달한다. fetched cache의 부재·불일치나 rebased HEAD와 기존 PR head의 차이 자체를 외부 변경으로 취급하지 않으며, 실제 원격·PR·범위 불일치는 계속 거부한다. 게시 adapter의 상태 변경은 실제 Manager처럼 snapshot 바인딩을 갱신한다.
+- 진행 중이거나 현재 상태 수용이 유효한 rebase는 게시까지 같은 live ref 관측을 사용한다. 이는 원격 읽기 선택만 바꾸며 새 lease를 채택하거나 기존 소유권·PR·최종 검증 gate를 생략하지 않는다. 그 밖의 checkpoint는 기존 fetched ref 관측을 유지한다.

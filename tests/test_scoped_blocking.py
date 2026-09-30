@@ -2030,3 +2030,396 @@ class ScopedBlockingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EvidenceFreeRebaseBlockTests(unittest.TestCase):
+    """Real current-state decisions and SQLite transitions; no Git lifecycle."""
+    def setUp(self):
+        from tests.test_execution_handlers import current_rebase_case
+        self.case = current_rebase_case(self)
+        self.connection = self.case.fixture.connection
+        self.checkpoints = self.case.checkpoint
+        self.repo, self.plan_id = 'repo', 'G-047'
+        loop_manager._ensure_execplans_schema(self.connection)
+        self.connection.execute("UPDATE projects SET planning_attempt_fingerprint = NULL")
+        self.connection.execute("UPDATE exec_plans SET workspace_owned = 1")
+        self.connection.commit()
+        self.is_plan_block = True
+        def patch(*args, **kwargs):
+            patcher = mock.patch.object(*args, **kwargs)
+            value = patcher.start()
+            self.addCleanup(patcher.stop)
+            return value
+        self.factory = patch(loop_manager, '_current_rebase_service',
+            side_effect=lambda *_a, **_k: self.case.factory(None))
+        self.git_write = patch(loop_manager, 'git',
+            side_effect=AssertionError('recovery must not write or invoke Git directly'))
+        patch(loop_manager, 'operation_log')
+
+    def block(self, *, project=False, separate=None, reason=None):
+        self.is_plan_block = not project
+        reason = reason or ('repository_state_unsafe' if project else 'managed_worktree_conflict')
+        evidence = (rebase_block_reconciliation.LEGACY_COMPLETION_DIAGNOSTIC
+                    if project else 'G-088 repeated conflict with changed plan inputs')
+        with self.connection:
+            if project:
+                self.connection.execute("UPDATE projects SET phase = 'PROJECT_BLOCKED'")
+                self.connection.execute("INSERT INTO project_blocks "
+                    "(repo, scope, reason_code, plan_id, evidence, previous_phase) "
+                    "VALUES ('repo', 'project', ?, 'G-047', ?, 'WORKING')", (reason, evidence))
+            if not project or separate:
+                cause = separate or reason
+                self.connection.execute("UPDATE exec_plans SET status = 'PLAN_BLOCKED', "
+                    "blocked_reason = ?, last_error = 'original block text', "
+                    "blocked_fingerprint = 'old-input'", (cause,))
+                self.connection.execute("INSERT INTO execplan_blocks "
+                    "(repo, plan_id, scope, reason_code, evidence) "
+                    "VALUES ('repo', 'G-047', 'plan', ?, ?)",
+                    (cause, 'independent original cause' if separate else evidence))
+                if not project:
+                    self.connection.execute("UPDATE projects SET phase = 'PLAN_BLOCKED'")
+            subject = 'project' if project else 'plan:G-047'
+            self.connection.execute("INSERT INTO notified_block_incidents "
+                "(repo, subject, block_key, event_key, payload) VALUES ('repo', ?, 'block', 'event', '{}')",
+                (subject,))
+        return evidence
+
+    def resume(self):
+        if self.is_plan_block:
+            return loop_manager.resume_plan_blocks(self.connection, Path('/repo'), Path('/state'), 'repo', 'main')
+        return loop_manager.resume_project_block_if_safe(self.connection, Path('/repo'), Path('/state'), 'repo')
+
+    def snapshot(self):
+        return {table: [dict(row) for row in self.connection.execute('SELECT * FROM ' + table)]
+                for table in ('projects', 'exec_plans', 'execplan_blocks', 'project_blocks',
+                              'execution_checkpoints', 'recovery_records', 'notified_block_incidents')}
+
+    def pending(self, *, staged=False):
+        from dataclasses import replace
+        from managed_rebase_validation import FileChange, IndexEntry
+        self.case.observed = replace(self.case.observed, head='partial', branch=None,
+            branch_ref=('before', ''), registration=('HEAD=partial', 'detached=True'),
+            branch_worktrees=(), operations=(('rebase-merge', 'operation'),),
+            metadata=(('head-name', 'refs/heads/loop-manager/G-047'),
+                      ('orig-head', 'before'), ('onto', 'base')),
+            index=(IndexEntry('app.py', '100644', 'manual', 0 if staged else 2,
+                              'H' if staged else 'M', 0 if staged else 0x2000),),
+            staged=(FileChange('app.py', '100644', '100644', 'old', 'manual', 'M'),) if staged else (),
+            index_clean=False)
+
+    def test_changed_inputs_and_session_resume_manual_completion_without_recovery_history(self):
+        self.block()
+        self.connection.execute("UPDATE exec_plans SET worker_session_id = 'replacement-session', "
+                                "worker_input_token = 'obsolete', review_failure_history = '{\"issue\":2}'")
+        self.connection.commit()
+        before = self.checkpoints.get('repo', 'G-047')
+        self.assertTrue(self.resume())
+        row = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual(row['status'], 'IMPLEMENTING')
+        self.assertEqual(row['worker_session_id'], 'replacement-session')
+        self.assertEqual(row['review_failure_history'], '{"issue":2}')
+        for field in ('worker_result', 'worker_input_token', 'verify_result', 'review_result',
+                      'verify_token', 'review_token', 'publication_token'):
+            self.assertIsNone(row[field], field)
+        self.assertIsNone(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
+        adopted = self.checkpoints.get('repo', 'G-047')
+        self.assertIsNone(adopted.operation)
+        self.assertEqual(adopted.snapshot['failure'], before.snapshot['failure'])
+        self.assertTrue(adopted.current_rebase_acceptance())
+        self.assertEqual(adopted.snapshot['rebase_revalidation_audit'][-1]['released_rebase_block']['evidence'],
+                         'G-088 repeated conflict with changed plan inputs')
+        self.assertFalse(self.resume())
+        self.assertEqual(self.checkpoints.get('repo', 'G-047'), adopted)
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM notified_block_incidents').fetchone()[0], 1)
+        self.git_write.assert_not_called()
+
+    def test_owned_detached_conflict_resumes_same_operation(self):
+        self.block()
+        self.pending()
+        original = self.case.observed
+        self.assertTrue(self.resume())
+        self.assertEqual(self.case.observed, original)
+        self.assertEqual(self.checkpoints.get('repo', 'G-047').operation, 'rebase')
+        row = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual(row['status'], 'IMPLEMENTING')
+        self.assertEqual(row['last_error'], loop_manager.REBASE_IN_PROGRESS_ERROR)
+        self.assertEqual(row['worker_session_id'], 'saved-worker')
+        self.git_write.assert_not_called()
+
+    def test_manual_stage_resumes_without_stage_approval_or_extra_git_step(self):
+        self.block()
+        self.pending(staged=True)
+        self.assertTrue(self.resume())
+        self.assertEqual(self.case.observed.staged[0].new_oid, 'manual')
+        self.assertEqual(self.checkpoints.get('repo', 'G-047').operation, 'rebase')
+        self.git_write.assert_not_called()
+
+    def test_previously_adopted_result_rechecks_current_state_and_releases_once(self):
+        self.case.handler._complete_rebase_intent(self.case.fixture.context())
+        self.block()
+        self.assertTrue(self.resume())
+        adopted = self.checkpoints.get('repo', 'G-047')
+        self.assertFalse(self.resume())
+        self.assertEqual(self.checkpoints.get('repo', 'G-047'), adopted)
+        self.git_write.assert_not_called()
+
+    def test_same_pending_result_cannot_repeat_a_released_correction(self):
+        detail = self.block()
+        self.pending()
+        self.assertTrue(self.resume())
+        with self.connection:
+            self.connection.execute("UPDATE exec_plans SET status = 'PLAN_BLOCKED', "
+                                    "blocked_reason = 'managed_worktree_conflict'")
+            self.connection.execute("UPDATE projects SET phase = 'PLAN_BLOCKED'")
+            self.connection.execute("INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+                "VALUES ('repo', 'G-047', 'plan', 'managed_worktree_conflict', ?)", (detail,))
+        before = self.snapshot()
+        self.assertFalse(self.resume())
+        self.assertEqual(self.snapshot(), before)
+        from dataclasses import replace
+        self.case.expected = replace(self.case.expected, input_fingerprint='new-user-input')
+        self.case.observed = replace(self.case.observed, input_fingerprint='new-user-input')
+        self.assertTrue(self.resume())
+
+    def exhausted_pending(self):
+        from recovery_runtime import RecoveryObservation, RecoveryReason
+        from recovery_state import RecoveryRepository
+        detail = self.block()
+        self.pending()
+        RecoveryRepository(self.connection).observe(RecoveryObservation(
+            RecoveryReason.REBASE_CONFLICT, 'repo', 'G-047', 'WORKING',
+            'old-revision', 'old-base', 'conflict', 'old-progress', detail), correction_limit=1)
+        snapshot = loop_manager.GitSnapshot('partial', None,
+            {'app.py': ('M 100644 manual 2',)},
+            {'app.py': (('unstaged',), 'unresolved-content')},
+            {'refs/heads/loop-manager/G-047': ('before', '')},
+            {'/state/G-047': ('HEAD=partial', 'detached=True')}, {}, {'rebase-merge': 'operation'})
+        with self.connection:
+            self.connection.execute("UPDATE exec_plans SET blocked_fingerprint = 'same-input', "
+                "blocked_worktree_fingerprint = 'same-input', agent_result_snapshot = ?",
+                (snapshot.serialize(),))
+        return snapshot
+
+    def test_first_exhausted_conflict_stays_blocked_until_selected_git_state_changes(self):
+        from dataclasses import replace
+        snapshot = self.exhausted_pending()
+        with mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=snapshot) as capture, \
+             mock.patch.object(loop_manager, '_revision_execplan_input_fingerprint', return_value='same-input'), \
+             mock.patch.object(loop_manager, '_worktree_execplan_input_fingerprint', return_value='same-input'):
+            before = self.snapshot()
+            self.assertFalse(self.resume())
+            self.assertEqual(self.snapshot(), before)
+            self.assertFalse(self.resume())
+            self.assertEqual(self.snapshot(), before)
+            capture.return_value = replace(snapshot, dirty={'app.py': (('unstaged',), 'user-resolution')})
+            self.assertTrue(self.resume())
+            self.assertIsNone(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
+        self.git_write.assert_not_called()
+
+    def test_changed_current_inputs_resume_exhausted_conflict_without_git_progress(self):
+        snapshot = self.exhausted_pending()
+        for changed in ('revision', 'worktree'):
+            with self.subTest(changed=changed), \
+                 mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=snapshot), \
+                 mock.patch.object(loop_manager, '_revision_execplan_input_fingerprint',
+                     return_value='new-input' if changed == 'revision' else 'same-input'), \
+                 mock.patch.object(loop_manager, '_worktree_execplan_input_fingerprint',
+                     return_value='new-input' if changed == 'worktree' else 'same-input'), \
+                 mock.patch.object(loop_manager.runtime_state.RuntimeStateRepository,
+                     'resume_rebase_block') as release:
+                self.assertTrue(self.resume())
+                release.assert_called_once()
+        self.git_write.assert_not_called()
+
+    def test_missing_recovery_history_does_not_make_saved_snapshot_a_resume_gate(self):
+        snapshot = self.exhausted_pending()
+        self.connection.execute('DELETE FROM recovery_records')
+        self.connection.commit()
+        with mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=snapshot), \
+             mock.patch.object(loop_manager, '_revision_execplan_input_fingerprint', return_value='same-input'), \
+             mock.patch.object(loop_manager, '_worktree_execplan_input_fingerprint', return_value='same-input'):
+            self.assertTrue(self.resume())
+        self.git_write.assert_not_called()
+
+    def test_project_rebase_release_preserves_each_independent_plan_cause(self):
+        for cause in ('review_retry_exhausted', 'guidance_approval_required', 'user_decision_required',
+                      'pull_request_closed', 'managed_worktree_scope_violation'):
+            with self.subTest(cause=cause):
+                # One isolated fixture per cause, without inheriting unrelated tests.
+                case = EvidenceFreeRebaseBlockTests()
+                case.setUp()
+                try:
+                    case.block(project=True, separate=cause)
+                    original = dict(scoped_blocking.plan_block(case.connection, 'repo', 'G-047'))
+                    self.assertTrue(case.resume())
+                    self.assertEqual(dict(scoped_blocking.plan_block(case.connection, 'repo', 'G-047')), original)
+                    row = case.connection.execute('SELECT * FROM exec_plans').fetchone()
+                    self.assertEqual(row['status'], 'PLAN_BLOCKED')
+                    self.assertEqual(row['blocked_reason'], cause)
+                    self.assertEqual(row['last_error'], 'original block text')
+                    self.assertEqual(row['review_result'], 'old review')
+                    self.assertEqual(row['worker_session_id'], 'saved-worker')
+                    self.assertIsNone(row['review_token'])
+                    self.assertIsNone(scoped_blocking.project_block(case.connection, 'repo'))
+                finally:
+                    case.doCleanups()
+
+    def test_unrelated_project_cause_is_not_released_by_rebase(self):
+        self.block(project=True, reason='shared_ref_mutation')
+        before = self.snapshot()
+        with mock.patch.object(loop_manager, 'validate_execplan_workspace_identity',
+                               side_effect=loop_manager.WorkspaceOwnershipError('foreign owner')):
+            self.assertFalse(self.resume())
+        self.assertEqual(self.snapshot(), before)
+        self.factory.assert_not_called()
+
+    def test_other_execution_and_planning_keep_projection_sessions_and_diagnostics(self):
+        self.block()
+        for values in ("planning_error = 'separate error'", "planning_attempt_fingerprint = 'pending'",
+                       "planner_session_id = 'planner'"):
+            with self.subTest(values=values), self.connection:
+                self.connection.execute('UPDATE projects SET ' + values)
+                before = self.snapshot()
+                self.assertFalse(self.resume())
+                self.assertEqual(self.snapshot(), before)
+                self.connection.execute("UPDATE projects SET planning_error = NULL, "
+                    "planning_attempt_fingerprint = NULL, planner_session_id = NULL")
+        self.connection.execute("INSERT INTO exec_plans (repo, plan_id, path, title, sources, "
+            "depends_on, priority, content_hash, status) VALUES ('repo', 'G-048', "
+            "'docs/plans/[G-048] Other.md', 'Other', '[]', '[]', 'normal', 'hash', 'IMPLEMENTING')")
+        self.connection.commit()
+        before = self.snapshot()
+        self.assertFalse(self.resume())
+        self.assertEqual(self.snapshot(), before)
+        self.factory.assert_not_called()
+
+    def test_dependency_gate_blocks_release_without_observation(self):
+        self.block()
+        self.connection.execute("UPDATE exec_plans SET depends_on = '[\"G-109\"]'")
+        self.connection.commit()
+        before = self.snapshot()
+        self.assertFalse(self.resume())
+        self.assertEqual(self.snapshot(), before)
+        self.factory.assert_not_called()
+
+    def test_new_project_rebase_diagnosis_needs_no_legacy_text_or_occurrence_history(self):
+        from recovery_state import RecoveryRepository
+        from recovery_runtime import RecoveryObservation, RecoveryReason
+        self.block(project=True, reason='publication_ownership_uncertain')
+        detail = 'current owned rebase completion was misclassified'
+        self.connection.execute('UPDATE project_blocks SET evidence = ?', (detail,))
+        RecoveryRepository(self.connection).observe(RecoveryObservation(
+            RecoveryReason.REMOTE_OID_UNCERTAIN, 'repo', 'G-047', 'WORKING',
+            'old-input', 'old-base', 'old-fingerprint', 'another-session', detail),
+            final_block_reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN)
+        self.connection.execute("UPDATE recovery_records SET occurrence_index = '{}'")
+        self.connection.commit()
+        self.assertTrue(self.resume())
+        self.assertIsNone(scoped_blocking.project_block(self.connection, 'repo'))
+        self.assertEqual(RecoveryRepository(self.connection).row('repo', 'G-047')['pending_action'], 'reconcile')
+
+    def test_unlinked_pending_rebase_project_cause_cannot_take_generic_release(self):
+        self.block(project=True)
+        self.connection.execute("UPDATE project_blocks SET evidence = 'unknown unrelated safety cause'")
+        self.connection.commit()
+        before = self.snapshot()
+        with mock.patch.object(loop_manager, 'validate_managed_worktree') as generic:
+            self.assertFalse(self.resume())
+        generic.assert_not_called()
+        self.factory.assert_not_called()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_remote_scope_index_and_operation_mismatches_preserve_block(self):
+        from dataclasses import replace
+        from managed_rebase_validation import FileChange, IndexEntry
+        self.block()
+        original = self.case.observed
+        for observed in (replace(original, remote=replace(original.remote, oid='foreign')),
+                         replace(original, base_is_ancestor=False),
+                         replace(original, base_is_ancestor=False, head='before', branch_ref=('before', ''),
+                                 registration=('HEAD=before', 'branch=refs/heads/loop-manager/G-047')),
+                         replace(original, operations=(('MERGE_HEAD', 'foreign'),)),
+                         replace(original, index=(IndexEntry('app.py', '100644', 'blob', 0, 'S', 0x40000000),)),
+                         replace(original, committed=(FileChange('docs/ARCHITECTURE.md',
+                             '100644', '100644', 'old', 'new', 'M'),))):
+            with self.subTest(observed=observed):
+                self.case.observed = observed
+                before = self.snapshot()
+                self.assertFalse(self.resume())
+                self.assertEqual(self.snapshot(), before)
+
+    def test_target_and_original_head_mismatch_reject_detached_recovery(self):
+        from dataclasses import replace
+        self.block()
+        self.pending()
+        original = self.case.observed
+        for key in ('onto', 'orig-head', 'head-name'):
+            self.case.observed = replace(original, metadata=tuple(
+                (name, 'foreign' if name == key else value) for name, value in original.metadata))
+            before = self.snapshot()
+            self.assertFalse(self.resume())
+            self.assertEqual(self.snapshot(), before)
+
+    def test_reobservation_race_and_transaction_faults_roll_back_then_resume_once(self):
+        from dataclasses import replace
+        import runtime_state
+        self.block()
+        before = self.snapshot()
+        original = self.case.observed
+        observe = self.case.factory(None).require_owned
+        calls = []
+        def raced(**kwargs):
+            calls.append(None)
+            if len(calls) == 2:
+                self.case.observed = replace(original, remote=replace(original.remote, oid='raced'))
+            return observe(**kwargs)
+        with mock.patch.object(loop_manager, '_current_rebase_service',
+                               return_value=SimpleNamespace(require_owned=raced)):
+            self.assertFalse(self.resume())
+        self.assertEqual(self.snapshot(), before)
+        self.case.observed = original
+        for stage in ('after_rebase_acceptance', 'after_rebase_block_release'):
+            def fault(actual):
+                if actual == stage:
+                    raise runtime_state.RuntimeStateError('interrupted ' + stage)
+            with mock.patch.object(runtime_state.RuntimeStateRepository, '_fault', side_effect=fault):
+                self.assertFalse(self.resume())
+            self.assertEqual(self.snapshot(), before)
+        self.assertTrue(self.resume())
+        adopted = self.checkpoints.get('repo', 'G-047')
+        self.assertFalse(self.resume())
+        self.assertEqual(self.checkpoints.get('repo', 'G-047'), adopted)
+
+    def test_direct_input_and_interrupted_entry_use_current_recovery_before_generic_branch_gate(self):
+        self.block()
+        self.pending(staged=True)
+        with mock.patch.object(loop_manager, 'make_worktree', side_effect=AssertionError('generic branch gate')):
+            self.assertTrue(loop_manager.resume_blocked_execplan_if_inputs_changed(
+                self.connection, Path('/repo'), 'repo', 'main', Path('/state')))
+        self.git_write.assert_not_called()
+
+    def test_interrupted_entry_routes_detached_state_to_same_service(self):
+        self.block()
+        self.pending()
+        plan = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        with mock.patch.object(loop_manager, '_owned_rebase_state_dir', return_value=Path('/state')):
+            self.assertTrue(loop_manager._resume_interrupted_blocked_rebase(
+                self.connection, Path('/repo'), 'repo', 'main', plan,
+                Path('/state/G-047'), 'loop-manager/G-047'))
+        self.git_write.assert_not_called()
+
+    def test_direct_input_recovery_cannot_replace_a_different_selected_block(self):
+        self.block()
+        self.connection.execute("INSERT INTO exec_plans (repo, plan_id, path, title, sources, "
+            "depends_on, priority, content_hash, status, blocked_reason, blocked_fingerprint) "
+            "VALUES ('repo', 'G-048', 'docs/plans/[G-048] Other.md', 'Other', '[]', '[]', "
+            "'normal', 'hash', 'PLAN_BLOCKED', 'verify_retry_exhausted', 'other-input')")
+        self.connection.execute("UPDATE projects SET plan_path = 'docs/plans/[G-048] Other.md'")
+        self.connection.commit()
+        other = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id = 'G-048'").fetchone()
+        with mock.patch.object(loop_manager, '_plan_block_selected_for_release', return_value=None) as selected:
+            self.assertFalse(loop_manager.resume_blocked_execplan_if_inputs_changed(
+                self.connection, Path('/repo'), 'repo', 'main', Path('/state')))
+        selected.assert_called_once()
+        self.factory.assert_not_called()
+        self.assertEqual(self.connection.execute("SELECT plan_path FROM projects").fetchone()[0], other['path'])
