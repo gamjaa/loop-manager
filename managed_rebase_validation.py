@@ -285,7 +285,7 @@ def assess_current_rebase(
                     key: value for key, value in operations.items()
                     if key not in rebase_markers
                 }) or observed.branch is not None
-                or 'detached=' not in registration
+                or 'detached=True' not in registration
                 or any(item.startswith('branch=') for item in registration)
                 or observed.branch_worktrees
                 or observed.branch_ref[0] != expected.before_head):
@@ -323,7 +323,7 @@ def assess_current_rebase(
             or observed.branch_ref[0] != observed.head
             or f'branch=refs/heads/{expected.branch}' not in registration
             or observed.branch_worktrees != (expected.worktree,)
-            or 'detached=' in registration):
+            or any(item.startswith('detached=') for item in registration)):
         return reject('final_branch_or_head_mismatch')
     if observed.base_is_ancestor is None:
         return RebaseDecision(RebaseStatus.UNAVAILABLE, 'ancestry_missing')

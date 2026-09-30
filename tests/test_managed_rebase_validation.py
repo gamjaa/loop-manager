@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from loop_manager import _worker_path_allowed
+from loop_manager import _worker_path_allowed, capture_git_snapshot
 from managed_rebase_observation import (
     ObservationAdapters, observe_current_rebase, parse_index, parse_raw_changes,
 )
@@ -96,7 +96,7 @@ class CurrentRebasePolicyTests(unittest.TestCase):
         expected = expectation()
         pending = observation(
             expected, head='partial', branch=None, branch_ref=('before', ''),
-            registration=('HEAD=partial', 'detached='),
+            registration=('HEAD=partial', 'detached=True'),
             branch_worktrees=(),
             operations=(('rebase-merge', 'metadata-signature'),),
             metadata=(('head-name', f'refs/heads/{expected.branch}'),
@@ -123,6 +123,8 @@ class CurrentRebasePolicyTests(unittest.TestCase):
             {'operations': (*pending.operations, ('MERGE_HEAD', 'merge'))},
             {'operations': (*pending.operations, ('rebase-apply', 'other'))},
             {'registration': ('HEAD=partial', f'branch=refs/heads/{expected.branch}')},
+            {'registration': ('HEAD=partial', 'detached=')},
+            {'registration': ('HEAD=partial', 'detached=False')},
             {'branch_ref': ('other', '')}, {'metadata': None},
             {'branch_worktrees': ('/other',)}, {'base_is_ancestor': False},
         ):
@@ -141,6 +143,8 @@ class CurrentRebasePolicyTests(unittest.TestCase):
             {'worktree': '/other'}, {'identity_verified': False}, {'branch': 'other'},
             {'branch_ref': ('other', '')}, {'branch_ref': ('after', 'symbolic')},
             {'registration': None}, {'registration': ('HEAD=other',)},
+            {'registration': ('HEAD=after', f'branch=refs/heads/{expected.branch}',
+                              'detached=True')},
             {'branch_worktrees': ('/owned', '/other')},
             {'base_is_ancestor': False}, {'index_clean': False},
             {'operations': (('CHERRY_PICK_HEAD', 'commit'),)},
@@ -283,6 +287,66 @@ class CurrentRebaseObservationTests(unittest.TestCase):
                          RebaseStatus.COMPLETE)
         forbidden_queries = {'reflog', 'rev-list', 'range-diff', 'rebase', 'add', 'commit'}
         self.assertFalse(any(call.args[1] in forbidden_queries for call in adapters.git.call_args_list))
+
+    def test_adapter_preserves_actual_detached_snapshot_and_waits_for_resolution(self):
+        expected = expectation()
+        for operation in ('rebase-merge', 'rebase-apply'):
+            for conflicted in (False, True):
+                with self.subTest(operation=operation, conflicted=conflicted):
+                    adapters = self.adapters()
+                    stages = (1, 2, 3) if conflicted else (0,)
+                    index = {'app.py': tuple(
+                        f"{'M' if stage else 'H'} 100644 blob-{stage} {stage}"
+                        for stage in stages
+                    )}
+                    dirty = {'app.py': (('staged',), 'artifact')} if conflicted else {}
+                    original_git = adapters.git.side_effect
+                    def git(context, *args, **kwargs):
+                        result = original_git(context, *args, **kwargs)
+                        if args[:2] == ('ls-files', '--debug'):
+                            result.stdout = ''.join(
+                                'app.py\0  ctime: 1:1\n  mtime: 1:1\n  dev: 1\tino: 1\n'
+                                f'  uid: 1\tgid: 1\n  size: 1\tflags: {stage << 12:x}\n'
+                                for stage in stages
+                            )
+                        elif args[0] == 'diff' and '--cached' in args:
+                            if '--quiet' in args:
+                                result.returncode = int(conflicted)
+                            elif '--raw' in args and conflicted:
+                                result.stdout = ':100644 000000 old 0 U\0app.py\0'
+                        return result
+                    adapters.git.side_effect = git
+                    adapters.read_rebase_metadata.return_value = {
+                        'head-name': f'refs/heads/{expected.branch}',
+                        'orig-head': expected.before_head, 'onto': expected.target_base_oid,
+                    }
+                    adapters = replace(adapters, capture_snapshot=capture_git_snapshot)
+                    # Run the real catalog parser and snapshot serializer. Only
+                    # Git reads and unrelated snapshot readers are replaced.
+                    porcelain = f'worktree {expected.worktree}\nHEAD partial\ndetached\n\n'
+                    with (
+                        mock.patch('loop_manager.git', return_value=SimpleNamespace(stdout=porcelain)),
+                        mock.patch('loop_manager._capture_local_worktree_state',
+                                   return_value=('partial', None, index, dirty)),
+                        mock.patch('loop_manager._shared_ref_entries', return_value={
+                            f'refs/heads/{expected.branch}': (expected.before_head, ''),
+                        }),
+                        mock.patch('loop_manager._config_entries', return_value={}),
+                        mock.patch('loop_manager._git_operation_entries',
+                                   return_value={operation: 'metadata-signature'}),
+                    ):
+                        actual, scope = observe_current_rebase(expected, adapters)
+                    self.assertIsInstance(actual, RebaseObservation)
+                    self.assertEqual(actual.registration, ('HEAD=partial', 'detached=True'))
+                    self.assertIsNone(actual.branch)
+                    self.assertEqual(tuple(entry.stage for entry in actual.index), stages)
+                    result = assess_current_rebase(expected, actual, scope)
+                    self.assertEqual(result.status, RebaseStatus.WAITING)
+                    self.assertIsNone(result.acceptance)
+                    self.assertEqual(index['app.py'], tuple(
+                        f"{'M' if stage else 'H'} 100644 blob-{stage} {stage}"
+                        for stage in stages
+                    ))
 
     def test_adapter_reports_query_failures_missing_flags_and_remote_races(self):
         expected = expectation()

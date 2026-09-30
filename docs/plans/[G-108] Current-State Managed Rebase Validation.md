@@ -59,6 +59,14 @@ RERUN: python3 -B -m unittest tests.test_loop_manager.AgentScopeValidatorTest.te
 
 후속 Worker 결과 검증은 `TARGETED_TESTS`에 작성한 "실패 없음"을 실패 토큰으로 인식했다. 이전 보고의 실패·재실행 명령은 이 단락 밖에 있어 해결 이력으로 대조되지 않았다. 같은 unit case를 다시 실행해 1개 test 통과(`OK`)를 확인했고, 실패 명령·최초 실행 결과·동일 명령 재실행·최종 `OK`를 모두 `TARGETED_TESTS` 안에 순서대로 배치했다. 준비된 최종 보고문은 기존 `parse_worker_outcome`과 `parse_worker_result`의 읽기 전용 검증을 통과했다.
 
+Reviewer 피드백 `review:managed_rebase_validation.py::assess_current_rebase::detached-registration-mismatch` (occurrence=1, revision=1)을 교정했다. 진행 상태는 실제 snapshot의 `detached=True` 등록 값을 요구하고, 완료 상태는 detached 등록 표식이 있으면 거부한다. 직접 판정 fixture를 실제 형식에 맞추고, Git porcelain catalog parser와 `capture_git_snapshot`의 등록 serializer를 그대로 사용하는 관측 unit case를 추가했다. Git 읽기와 나머지 snapshot reader는 mock으로 한정하여 실제 Git lifecycle 없이 두 rebase backend의 clean·충돌 index 해결 대기를 확인했다.
+
+FAILED_COMMAND: python3 -B -m unittest tests.test_managed_rebase_validation.CurrentRebasePolicyTests.test_owned_detached_conflict_waits_without_mutating_index tests.test_managed_rebase_validation.CurrentRebasePolicyTests.test_rejects_identity_target_operation_and_lease_mismatches tests.test_managed_rebase_validation.CurrentRebaseObservationTests.test_adapter_preserves_actual_detached_snapshot_and_waits_for_resolution
+최초 실행 결과: FAILED (failures=8)
+RERUN: python3 -B -m unittest tests.test_managed_rebase_validation.CurrentRebasePolicyTests.test_owned_detached_conflict_waits_without_mutating_index tests.test_managed_rebase_validation.CurrentRebasePolicyTests.test_rejects_identity_target_operation_and_lease_mismatches tests.test_managed_rebase_validation.CurrentRebaseObservationTests.test_adapter_preserves_actual_detached_snapshot_and_waits_for_resolution
+
+수정 후 동일 명령의 최종 결과는 3개 unit test 통과(`OK`)다. 기존 불일치 거부 및 index 보존 assertion을 유지했고, 이번 교정에서도 전체 verify·commit·push·PR 생성은 실행하지 않았다.
+
 ## Decision Log
 
 - R-048과 ARCHITECTURE의 R-048 절은 기존 R-045의 작업 수행 증거 정책을 명시적으로 대체한다. 추가 사용자 결정을 요구하거나 구 정책을 새 완료 조건으로 재도입하지 않는다.
