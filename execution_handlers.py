@@ -406,7 +406,7 @@ class ExecutionHandlers:
                 return False
             pending_push = (
                 current.operation == 'push'
-                and (current.snapshot or {}).get('remote_before') == recorded
+                and (current.snapshot or {}).get('remote_before') == original
                 and current.expected_head == local == remote_oid
                 and remote_oid != original
                 and recorded in (original, remote_oid)
@@ -446,8 +446,14 @@ class ExecutionHandlers:
         pending_intermediate = (current.operation == 'rebase_publish'
                                 and intermediate.get('remote_before') == recorded
                                 and remote_oid in (recorded, intermediate.get('head')))
+        before = (current.snapshot or {}).get('remote_before')
+        adopted = (current.snapshot or {}).get('last_adopted_remote_oid') or original
+        # Final push recovery can run after the runtime row adopted its head,
+        # but before the checkpoint intent was cleared. Keep the saved lease
+        # bound to the prior owned OID in either ordering.
         pending_push = (current.operation == 'push'
-                        and (current.snapshot or {}).get('remote_before') == recorded
+                        and before in (recorded, adopted)
+                        and recorded in (before, current.expected_head)
                         and remote_oid == current.expected_head)
         pushed = ((current.snapshot or {}).get('pushed_checkpoint_head') == remote_oid
                   and recorded == remote_oid)
@@ -1415,16 +1421,19 @@ class ExecutionHandlers:
         # A persisted target beyond the adopted remote base identifies legacy
         # pending rebase work without inventing execution receipts. This only
         # selects the common G-109 ownership/scope check; it grants no push.
-        if (current.operation is not None or not current.target_base_oid
-                or not current.expected_head or not current.observed_remote_oid
-                or current.expected_head == current.observed_remote_oid
-                or (current.snapshot or {}).get('current_rebase_acceptance')):
+        saved = current.snapshot or {}
+        target = getattr(current, 'target_base_oid', None)
+        head = getattr(current, 'expected_head', None)
+        remote = getattr(current, 'observed_remote_oid', None)
+        if (current.operation is not None or not target or not head or not remote
+                or head == remote or saved.get('current_rebase_acceptance')
+                or saved.get('published_review_resume')):
             return False
         row = self._row()
         if row['pr_url'] or row['pr_conflict_recovery']:
             return False
         ancestry = self.effects.workspace.git(self.repo_path, 'merge-base', '--is-ancestor',
-            current.target_base_oid, current.observed_remote_oid, check=False)
+            target, remote, check=False)
         if ancestry.returncode not in (0, 1):
             raise manager_git_journal.MutationEvidenceError('legacy rebase target ancestry unavailable')
         return ancestry.returncode == 1

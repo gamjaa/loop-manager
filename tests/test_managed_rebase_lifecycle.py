@@ -421,6 +421,9 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
 
             effects.workspace.git.side_effect = no_repeated_rebase
             if publication_interruption:
+                # Conflict correction already used Worker turns. Publication
+                # must precede any additional candidate work on this restart.
+                publication_start = len(events)
                 attempted = []
                 def interrupted_push(path, *args, **kwargs):
                     if args[0] == 'push':
@@ -458,9 +461,10 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                     f'--force-with-lease=refs/heads/{branch}:{original}', 'origin',
                     f'{final_head}:refs/heads/{branch}')])
                 self.assertEqual(effects.state.row()['publication_remote_oid'], original)
-                self.assertNotIn('verify', events)
-                self.assertNotIn('reviewer', events)
-                self.assertNotIn('worker', events)
+                publication_events = events[publication_start:]
+                self.assertNotIn('verify', publication_events)
+                self.assertNotIn('reviewer', publication_events)
+                self.assertNotIn('worker', publication_events)
                 effects.workspace.git.side_effect = no_repeated_rebase
                 if publication_interruption == 'permission':
                     (remote / 'hooks/pre-receive').unlink()

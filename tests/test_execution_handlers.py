@@ -755,6 +755,7 @@ class ExecutionHandlerTests(TestCase):
                   'head': 'owned-head'}
         current = SimpleNamespace(
             operation=None, expected_head='owned-head',
+            target_base_oid='new-base', observed_remote_oid='prior-head',
             snapshot={'published_review_resume': marker},
             completed_rebase=lambda: None,
         )
@@ -6235,6 +6236,17 @@ class ImmediateRebasePublicationTests(TestCase):
             self.state.row(), 'worker-head', pending))
         self.assertFalse(self.handler._owned_checkpoint_remote(self.handler._context(),
             self.state.row(), 'unrelated-head', pending))
+        # A restart may see the confirmed runtime head while the final push
+        # checkpoint still holds the intermediate checkpoint's fixed lease.
+        self.state.update_project('repo', publication_remote_oid='worker-head')
+        self.assertTrue(self.handler._owned_checkpoint_remote(self.handler._context(),
+            self.state.row(), 'worker-head', pending))
+        for unowned_before in ('remote', 'unrelated-head'):
+            with self.subTest(unowned_before=unowned_before):
+                changed = replace(pending, snapshot={**pending.snapshot,
+                    'remote_before': unowned_before})
+                self.assertFalse(self.handler._owned_checkpoint_remote(self.handler._context(),
+                    self.state.row(), 'worker-head', changed))
 
     def test_publication_comparison_updates_only_selected_remote_tracking_ref(self):
         from managed_rebase_adoption import selected_baseline

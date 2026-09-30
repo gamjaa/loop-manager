@@ -44,6 +44,7 @@ PR이 없는 동일 계획의 기존 원격 작업 branch를 관리 rebase한 �
 - [x] 원격 lease 게시·중단 복구와 최종 검증 경계 연결
 
 - Targeted unit 검증: `ImmediateRebasePublicationTests`와 `RebasePublicationRepositoryTests` 16개 및 기존 rebase 수용·소유권 case 4개 통과. 실제 Git lifecycle 테스트와 전체 verify는 Worker가 실행하지 않고 Loop Manager 검증에 맡긴다.
+- 검증 피드백 보정: 게시 OID 반영 후에도 남아 있는 최종 push intent의 이전 lease 소유권과 일반 교정·Review checkpoint의 legacy 판정 회귀를 수정했다. 실패했던 소유권 unit case 4개는 동일 명령 재실행에서 모두 통과했고, 갱신한 `ImmediateRebasePublicationTests` 11개도 통과했다. Planner import fixture에 새 게시 모듈을 포함하고 lifecycle 순서 assertion은 중간 게시 재개 이후의 호출을 검사하도록 수정했다. 이 실제 Git 테스트와 전체 verify의 재검증은 Loop Manager가 수행한다.
 
 ## Decision Log
 
