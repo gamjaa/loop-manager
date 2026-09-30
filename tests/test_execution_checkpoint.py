@@ -261,6 +261,9 @@ class CheckpointAssessmentTests(unittest.TestCase):
                 mock.patch.object(loop_manager, 'active_execplan', return_value=plan),
                 mock.patch.object(loop_manager, '_owned_rebase_state_dir',
                                   return_value=state),
+                mock.patch.object(loop_manager, '_current_rebase_service',
+                                  return_value=SimpleNamespace(require_owned=lambda: (None,
+                                      SimpleNamespace(status=SimpleNamespace(value='ready_to_start'))))),
                 mock.patch.object(loop_manager, '_finish_owned_direct_rebase',
                                   return_value=False),
                 mock.patch.object(loop_manager.execution_checkpoint_state,
@@ -516,3 +519,29 @@ class CheckpointAssessmentTests(unittest.TestCase):
         ))
         self.assertEqual(actual.staged_paths, ('app.py',))
         self.assertEqual(assess(actual).action, CheckpointAction.CONFLICT)
+
+class CurrentRebaseBoundaryTests(unittest.TestCase):
+    def test_original_owned_head_can_start_without_receipt_or_original_commit_list(self):
+        from dataclasses import replace
+        from tests.test_managed_rebase_validation import expectation, observation, decision_for
+        from managed_rebase_validation import RebaseStatus
+        expected = expectation()
+        original = observation(expected, head='before', branch_ref=('before', ''),
+            registration=('HEAD=before', 'branch=refs/heads/loop-manager/G-108'),
+            base_is_ancestor=False)
+        self.assertEqual(decision_for(expected, original).status, RebaseStatus.START)
+        self.assertEqual(decision_for(expected, replace(original,
+            remote=replace(expected.remote, oid='external'))).status, RebaseStatus.REJECTED)
+
+    def test_autostash_restoration_waits_and_other_operations_are_rejected(self):
+        from dataclasses import replace
+        from tests.test_managed_rebase_validation import expectation, observation, decision_for
+        from managed_rebase_validation import RebaseStatus, IndexEntry
+        expected = expectation(autostash_oid='owned-stash')
+        pending = observation(expected, index_clean=False,
+            index=(IndexEntry('app.py', '100644', 'conflict', 2, 'M', 0x2000),))
+        self.assertEqual(decision_for(expected, pending).status, RebaseStatus.WAITING)
+        self.assertEqual(decision_for(expected, replace(pending,
+            operations=(('MERGE_HEAD', 'unowned merge'),))).status, RebaseStatus.REJECTED)
+        self.assertEqual(decision_for(replace(expected, autostash_oid=None), pending).status,
+                         RebaseStatus.REJECTED)

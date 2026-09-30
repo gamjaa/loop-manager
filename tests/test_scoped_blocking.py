@@ -1036,6 +1036,7 @@ class ScopedBlockingTest(unittest.TestCase):
             head='after', branch='loop/G-081', operations={}, dirty={},
         )
         with (
+            mock.patch.object(loop_manager, '_direct_rebase_history_proven', return_value=True),
             mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
             mock.patch.object(loop_manager, 'validate_managed_worktree'),
             mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=current),
@@ -1090,6 +1091,7 @@ class ScopedBlockingTest(unittest.TestCase):
                 "'G-081', 'old error', 'PLAN_BLOCKED')", (self.repo,),
             )
         with (
+            mock.patch.object(loop_manager, '_direct_rebase_history_proven', return_value=True),
             mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
             mock.patch.object(loop_manager, 'validate_managed_worktree'),
             mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=current),

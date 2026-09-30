@@ -121,7 +121,7 @@ class ExecutionCheckpointRepository:
         return self.get(repo, plan_id)
 
     def accept_current_rebase(self, repo: str, plan_id: str, *,
-                              acceptance: dict) -> CheckpointRecord:
+                              acceptance: dict, prior_artifacts: dict | None = None) -> CheckpointRecord:
         """CAS an acceptance while preserving prior evidence and audit records.
 
         The runtime repository owns the transaction and live-state recheck.
@@ -146,6 +146,9 @@ class ExecutionCheckpointRepository:
             history.append(snapshot['current_rebase_acceptance'])
         snapshot['current_rebase_acceptance_history'] = history
         snapshot['current_rebase_acceptance'] = dict(acceptance)
+        if prior_artifacts is not None:
+            snapshot.setdefault('rebase_revalidation_audit', []).append(prior_artifacts)
+        snapshot.pop('worker_candidate_token', None)
         return self.record(
             repo, plan_id, expected_generation=current.generation,
             operation=None, expected_head=acceptance['head'],

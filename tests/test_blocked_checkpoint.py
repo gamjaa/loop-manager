@@ -604,6 +604,9 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
         return result.stdout.strip()
 
     def setUp(self):
+        pr_query = mock.patch.object(loop_manager, 'pr_for_branch', return_value=None)
+        pr_query.start()
+        self.addCleanup(pr_query.stop)
         self.temporary = tempfile.TemporaryDirectory()
         root = Path(self.temporary.name)
         self.remote = root / "remote.git"

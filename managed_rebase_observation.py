@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 from typing import Callable
 
+from execution_checkpoint import controlling_git_operation
 from managed_rebase_validation import (
     FileChange, IndexEntry, ObservationFailure, RebaseExpectation,
     RebaseObservation, Remote, ScopeResult, WorktreeFile, assess_scope, fingerprint,
@@ -134,9 +135,16 @@ def _once(expected: RebaseExpectation, adapters: ObservationAdapters) -> RebaseO
                                               'ls-files', '--debug', '-z'))
     diff_options = ('--raw', '--no-abbrev', '--no-renames', '--no-ext-diff',
                     '--no-textconv', '--ignore-submodules=none', '-z')
+    diff_base = expected.target_base_oid
+    if (ancestor.returncode == 1 and snapshot.head == expected.before_head
+            and metadata is None and not controlling_git_operation(snapshot.operations)):
+        diff_base = _stdout(adapters, worktree, 'merge-base',
+                            expected.target_base_oid, snapshot.head).strip()
+        if not diff_base:
+            raise ValueError('original branch has no common target base')
     committed = parse_raw_changes(_stdout(
         adapters, worktree, 'diff', *diff_options,
-        expected.target_base_oid, snapshot.head, '--',
+        diff_base, snapshot.head, '--',
     ))
     staged = parse_raw_changes(_stdout(
         adapters, worktree, 'diff', '--cached', *diff_options, '--',

@@ -730,7 +730,7 @@ class RuntimeStateRepository:
                     })):
             raise RuntimeStateError('current rebase execution ownership changed')
         values = dict(project_values)
-        if (values.get('phase') not in {'WORKING', 'IMPLEMENTING', 'VERIFYING'}
+        if (values.get('phase') not in {'WORKING', 'IMPLEMENTING'}
                 and not (expected.status == 'PLAN_BLOCKED'
                          and values.get('phase') == expected.phase)):
             raise RuntimeStateError('current acceptance requires candidate revalidation')
@@ -740,11 +740,16 @@ class RuntimeStateRepository:
             raise RuntimeStateError('current acceptance cannot release an execution block')
         invalidated = {
             'validated_base_sha', 'verify_result', 'review_result', 'verify_token',
-            'review_token', 'publication_token',
+            'review_token', 'publication_token', 'worker_result', 'worker_input_token',
+            'archive_token',
         }
-        if (not set(values) <= invalidated | {'phase', 'active_sha'}
-                or any(values.get(key) is not None for key in invalidated)):
+        if (not set(values) <= invalidated | {'phase', 'active_sha', 'last_error', 'revision_resume_status'}
+                or any(values.get(key) is not None for key in invalidated | {
+                    'last_error', 'revision_resume_status'})):
             raise RuntimeStateError('current acceptance cannot approve publication or clear blocks')
+        if expected.status == 'PLAN_BLOCKED' and any(
+                key in values for key in ('last_error', 'revision_resume_status')):
+            raise RuntimeStateError('current acceptance cannot release an execution block')
         values.update({key: None for key in invalidated})
         values['active_sha'] = acceptance['target_base_oid']
         def check_owner():
@@ -775,7 +780,12 @@ class RuntimeStateRepository:
             if already_applied:
                 return expected
             checkpoint_repository.accept_current_rebase(
-                repo, plan_id, acceptance=dict(acceptance),
+                repo, plan_id, acceptance=dict(acceptance), prior_artifacts={
+                    key: getattr(expected, key) for key in (
+                        'worker_result', 'worker_input_token', 'archive_token',
+                        'verify_result', 'review_result', 'verify_token',
+                        'review_token', 'publication_token', 'last_error',
+                    )},
             )
             self._fault('after_rebase_acceptance')
             plan_values = dict(values)
