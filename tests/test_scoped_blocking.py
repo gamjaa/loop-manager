@@ -111,6 +111,51 @@ class BlockedPlanRemoteRefreshTests(unittest.TestCase):
         self.assertEqual(dict(self.row()), before)
         self.ports.git.assert_not_called()
 
+    def test_legacy_origin_not_yet_registered_keeps_existing_document_recovery(self):
+        self.connection.execute(
+            "UPDATE blocked_remote_observations SET registered_origin = NULL, "
+            "base_result = 'error', branch_result = 'error', base_oid = NULL, "
+            "base_error = 'registered-origin-missing', branch_error = 'registered-origin-missing' "
+            "WHERE plan_id = 'G-106'")
+        self.connection.commit()
+        plan, block = dict(self.plan()), dict(scoped_blocking.plan_block(self.connection, self.repo, 'G-106'))
+        self.assertEqual(self.coordinator.reconcile('G-106'), 'unhandled')
+        self.assertEqual(dict(self.plan()), plan)
+        self.assertEqual(dict(scoped_blocking.plan_block(self.connection, self.repo, 'G-106')), block)
+        self.assertTrue(blocked_remote_observation.pending_input(self.row()))
+        self.ports.git.assert_not_called()
+        self.ports._update_blocked_error.assert_not_called()
+
+    def test_registered_origin_lookup_failure_does_not_take_legacy_release_path(self):
+        failure = blocked_remote_observation.RefObservation('error', error='network')
+        with mock.patch.object(blocked_remote_observation, 'observe_refs', return_value=(failure, failure)):
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.ports._journaled_direct_rebase.assert_not_called()
+        self.ports._evaluate_remote_checkpoint_cause.assert_not_called()
+        self.assertEqual(scoped_blocking.plan_block(self.connection, self.repo, 'G-106')['evidence'], 'original verify failure')
+
+    def test_manager_keeps_legacy_input_recovery_when_origin_is_not_registered(self):
+        self.connection.execute(
+            "UPDATE blocked_remote_observations SET registered_origin = NULL WHERE plan_id = 'G-106'")
+        loop_manager._ensure_execplans_schema(self.connection)
+        self.connection.commit()
+        other = dict(self.plan('G-107'))
+        def resume(connection, repo_path, repo, base, state_dir, *, plan_id):
+            self.assertEqual(plan_id, 'G-106')
+            runtime = loop_manager.runtime_state.RuntimeStateRepository(connection)
+            runtime.update_plan(repo, plan_id, plan_values={'status': 'IMPLEMENTING',
+                                'blocked_reason': None, 'blocked_fingerprint': None}, enqueue=False)
+            scoped_blocking.clear_plan_block(connection, repo, plan_id)
+            return True
+        with (mock.patch.object(loop_manager, '_resume_interrupted_blocked_rebase', return_value=None),
+              mock.patch.object(loop_manager, 'resume_blocked_execplan_if_inputs_changed', side_effect=resume) as recover):
+            self.assertTrue(loop_manager.resume_plan_blocks(
+                self.connection, Path('/repo'), Path('/state'), self.repo, 'main'))
+        recover.assert_called_once()
+        self.assertEqual(self.plan()['status'], 'IMPLEMENTING')
+        self.assertEqual(dict(self.plan('G-107')), other)
+        self.assertTrue(blocked_remote_observation.pending_input(self.row()))
+
     def test_unmerged_dependency_leaves_observed_input_unconsumed(self):
         self.ports.unmet_execplan_dependencies.return_value = ['G-105']
         self.assertEqual(self.coordinator.reconcile('G-106'), 'deferred')

@@ -53,6 +53,15 @@ priority: critical
   - RERUN: python3 -m unittest tests.test_scoped_blocking.BlockedPlanRemoteRefreshTests
 - 2026-09-30: 관리 rebase 결과 수용 뒤 현재 ExecPlan·R-046·R-048·PRODUCT·ARCHITECTURE를 다시 읽었다. 현재 HEAD와 `origin/main`은 `c16a98c1f4fe84291a9f28f28b8f4cea9600c6ba`이며, 작업 공간 변경과 신규 모듈을 포함한 base 대비 최종 diff 전체를 확인했다. 이전 후보의 성공을 재사용하지 않고 위 세 targeted unit test 명령을 현재 후보에서 새로 실행해 각각 26개·7개·5개가 실패 없이 통과했다. 전체 verify와 Review는 이후 Manager가 수행한다.
 - 2026-09-30: Worker 결과 검증 오류의 원인은 `COMMIT_TITLE`과 `PR_SUMMARY` 사이의 빈 줄이었다. 기존 파서가 두 필드의 인접한 줄을 요구하므로 최종 출력에서 빈 줄을 제거했으며, 실제 `parse_worker_result`로 동일한 응답 초안이 통과하는 것을 확인했다. 현재 입력·base 대비 전체 diff를 다시 확인하고 위 세 targeted unit test 명령을 다시 실행해 26개·7개·5개가 모두 통과했다. 파서나 제품 동작을 추가 변경하지 않았다.
+- 2026-09-30: Manager의 verify 실패 7개·error 1개에 대한 저장된 진단을 읽었다. 등록 origin이 아직 없는 legacy 프로젝트의 관측을 새 원격 복구가 가로채 기존 문서·Agent 범위 복구를 막고 원래 오류를 덮는 원인을 수정했다. 이 경우 기존 복구 경로로 넘기며, 등록 origin이 있는 프로젝트의 원격 조회 실패는 계속 차단한다. 격리된 Planner import fixture에 새 모듈을 포함하고, Linux 검증 스크립트의 기존 단일 compile 명령 안에 새 모듈을 넣어 전체 기존 검사 목록을 유지했다.
+- 2026-09-30: 현재 HEAD `a0e207d720dc64a090953e326d2a16357bbca8f2`의 후보를 base `origin/main` (`c16a98c1f4fe84291a9f28f28b8f4cea9600c6ba`)와 비교해 최종 diff 전체와 현재 ExecPlan·R-046·R-048·PRODUCT·ARCHITECTURE를 다시 확인했다. 현재 후보에서 targeted unit test를 새로 실행해 아래 결과를 얻었다. origin 미등록 기존 복구 경로, 등록 origin 조회 실패 차단, 다른 계획 보존과 스크립트 wiring 회귀를 포함한다.
+  - `python3 -m unittest tests.test_scoped_blocking.BlockedPlanRemoteRefreshTests`: 29개 통과.
+  - `python3 -m unittest tests.test_blocked_checkpoint.BlockedCheckpointRefreshUnitTests`: 7개 통과.
+  - `python3 -m unittest tests.test_execution_handlers.EvidenceFreeBlockedScopeTests`: 5개 통과.
+  - `python3 -m unittest tests.test_catalog_checkpoint_wiring.CatalogCheckpointWiringTest`: 2개 통과. 스크립트 내용만 읽고 실행하지 않는다.
+- 새 회귀 test fixture의 mock 적용 대상과 비교 기준선 초기화 오류를 수정하고 동일 명령을 재실행했다. 마지막 실행은 29개 모두 실패 없이 통과했다. Manager가 보고한 실제 Git 사례와 전체 verify는 Worker가 실행하지 않았으며 이후 Manager 검증을 기다린다.
+  - FAILED_COMMAND: python3 -m unittest tests.test_scoped_blocking.BlockedPlanRemoteRefreshTests
+  - RERUN: python3 -m unittest tests.test_scoped_blocking.BlockedPlanRemoteRefreshTests
 - [ ] Manager 전체 verify와 실제 Git 회귀 사례 검증. base만 변경·후속 commit만 변경·동시 변경·원인 지속/해소·Git 효과 뒤 중단 재시작·수동 충돌 해결 사례를 작성했으며 Worker는 실행하지 않았다. Linux 전체 검증 스크립트에 새 모듈의 compile 검사를 추가했으나 스크립트·전체 suite·integration·lint·build·type check는 실행하지 않았다.
 - [ ] Reviewer 검토 및 사용자 Merge. Worker는 commit·push·PR을 생성하지 않았다.
 
@@ -62,3 +71,4 @@ priority: critical
 - 2026-09-30: 제공된 mutable READY snapshot의 기준 revision·원본 hash를 확인해 R-048을 반영했다. G-110 뒤에 새 원격 입력 반영을 구현하고 G-104의 중간 게시 순서를 유지한다. rebase 완료는 R-045 작업 증거 대신 G-109의 현재 상태로 판정한다.
 - 2026-09-30: 복구 단계와 원래 차단 원인·검증 artifact는 별도의 additive SQLite 기록에 저장한다. rebase 수용으로 기존 검증 결과가 무효화돼도 저장된 원인을 검사할 수 있으며, 완료된 Git 효과나 완료된 원인 검사를 재시작에서 반복하지 않는다. 후속 checkpoint identity를 갱신할 때 이전 게시 identity는 감사 이력으로 보존한다.
 - 2026-09-30: 대상 계획 ID를 명시해 mirror에 의존하지 않고 복구한다. 문서 입력 해제는 원래 revision과 차단 당시 worktree 기준선을 비교해 기존 로컬 제안을 새 사용자 결정으로 오인하지 않는다. 복구 도중 실행 자리 소유자가 바뀌면 다른 계획의 투영·진단을 보존한다. 프로젝트 차단 복구·진단 branch는 G-107 범위로 남기며 이 계획에는 추가하지 않았다.
+- 2026-09-30: 등록 origin이 없는 legacy 관측은 유효한 원격 갱신 입력으로 간주하지 않는다. 기존 문서·Agent 범위 복구 경계를 유지하고 원래 차단·진단과 미처리 관측을 보존한다. 등록 origin이 있는 프로젝트에는 원격 identity·조회 오류 검사와 현재 원격 복구 gate를 그대로 적용한다.

@@ -371,6 +371,12 @@ class BlockedPlanReconciler:
                                       (self.repo, plan_id)).fetchone()
         if row is None:
             return 'unhandled'
+        # Legacy projects can reach the existing document/scope recovery before
+        # repository validation has backfilled their registered origin. Their
+        # unavailable observation is not a remote-refresh input or a reason to
+        # replace the saved block; keep that original recovery boundary.
+        if not row['registered_origin']:
+            return 'unhandled'
         if not slot_available(self.connection, self.repo, plan_id):
             return 'deferred'
         if self.ports.unmet_execplan_dependencies(self.connection, self.repo, plan_id):
