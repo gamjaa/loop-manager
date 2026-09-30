@@ -51,6 +51,14 @@ def recovered_rebase_workspace(workspace, *, connection, repo_path, state_dir,
             worktree, context.branch, **options))
 
 
+def recovered_rebase_publication(publication, state):
+    """Use the Manager's snapshot-bound mutating publication adapters."""
+    names = ('record_remote_publication_branch', 'push_managed_publication_branch',
+             'push_owned_pr_conflict_recovery')
+    return replace(publication, **{name: mock.Mock(side_effect=state.bind(
+        getattr(lm, name), connected=True, mutates=True, name=name)) for name in names})
+
+
 class ExecutionHandlerTests(TestCase):
     def test_manual_detached_block_recovers_changed_plan_without_rebase_journal(self):
         self._legacy_rebase_false_block_recovery(plan_block=True, manual='waiting')
@@ -452,6 +460,7 @@ class ExecutionHandlerTests(TestCase):
         effects = replace(
             self.effects, state=state,
             checkpoint=ExecutionCheckpointRepository(fixture.connection),
+            publication=recovered_rebase_publication(self.effects.publication, state),
             workspace=recovered_rebase_workspace(self.effects.workspace,
                 connection=fixture.connection, repo_path=fixture.repo,
                 state_dir=fixture.state_dir, repo=repo, plan_id='G-034',
@@ -467,15 +476,6 @@ class ExecutionHandlerTests(TestCase):
         handler.catalog_plan = state.active_execplan(repo)
         effects.workspace.remote_branch_oid.side_effect = lm.remote_branch_oid
         effects.publication.pr_for_branch.return_value = pull_request
-        effects.publication.record_remote_publication_branch.side_effect = (
-            lambda *args: lm.record_remote_publication_branch(fixture.connection, *args)
-        )
-        effects.publication.push_managed_publication_branch.side_effect = (
-            lambda *args: lm.push_managed_publication_branch(fixture.connection, *args)
-        )
-        effects.publication.push_owned_pr_conflict_recovery.side_effect = (
-            lambda *args: lm.push_owned_pr_conflict_recovery(fixture.connection, *args)
-        )
         effects.agent.validate_worker_workspace_scope.return_value = plan
         effects.validation.validate_active_execplan_metadata.return_value = plan
         effects.validation.parse_worker_result.side_effect = lm.parse_worker_result
@@ -574,7 +574,15 @@ class ExecutionHandlerTests(TestCase):
             effects.publication.push_owned_pr_conflict_recovery.assert_called_once()
             effects.publication.command.assert_not_called()
         else:
-            effects.publication.push_managed_publication_branch.assert_called_once()
+            saved = effects.checkpoint.get(repo, 'G-034')
+            if saved.snapshot.get('rebase_publication_result'):
+                # An owned checkpoint was already pushed during recovery.
+                # Final publication creates its PR without a second push.
+                effects.publication.push_managed_publication_branch.assert_not_called()
+                self.assertEqual(lm.remote_branch_oid(fixture.repo, 'loop-manager/G-034'),
+                                 lm.git(fixture.worktree, 'rev-parse', 'HEAD').stdout.strip())
+            else:
+                effects.publication.push_managed_publication_branch.assert_called_once()
             effects.publication.command.assert_called_once()
 
     def test_real_git_published_review_release_restart_and_correction(self):
@@ -5601,8 +5609,15 @@ class CurrentRebaseAdoptionTests(TestCase):
                                     branch_ref=('owned-head', ''),
                                     registration=('HEAD=owned-head', 'branch=refs/heads/loop-manager/G-047'))
         def factory(context, **options):
+            current = self.checkpoint.get('repo', 'G-047')
             expected = replace(self.expected,
-                               generation=self.checkpoint.get('repo', 'G-047').generation)
+                               generation=current.generation)
+            if current.operation != 'rebase':
+                row = self.fixture.connection.execute(
+                    "SELECT publication_remote_oid FROM exec_plans "
+                    "WHERE repo = 'repo' AND plan_id = 'G-047'").fetchone()
+                expected = replace(expected, remote=replace(expected.remote,
+                    oid=row['publication_remote_oid'] or current.observed_remote_oid))
             if 'remote_oid' in options:
                 expected = replace(expected, remote=replace(expected.remote, oid=options['remote_oid']))
             return ManagedRebaseService(expected, mock.Mock())
@@ -5635,6 +5650,12 @@ class CurrentRebaseAdoptionTests(TestCase):
         self.fixture.effects.publication.pr_for_branch.return_value = None
         self.fixture.effects.workspace.git.side_effect = self.fixture.observed_git
         self.handler._fetch_latest_base = mock.Mock(return_value='base')
+        # These unit observations use symbolic OIDs. Fake the live-ref process
+        # boundary as well as the fetched-ref boundary, retaining real policy.
+        live_remote = mock.patch.object(handlers.manager_git_journal, 'live_remote_branch_oid',
+                                       side_effect=lambda *_: self.observed.remote.oid)
+        live_remote.start()
+        self.addCleanup(live_remote.stop)
         self.owner_patch = mock.patch.object(handlers.checkpoint_ownership,
                                             'owned_remote_oid', return_value='remote')
         self.owner_patch.start()
@@ -6756,7 +6777,6 @@ class EvidenceFreeRecoveryLifecycleTests(TestCase):
         self.effects.agent.run_agent.side_effect = self.agent
         self.effects.validation.verify.side_effect = (
             lambda _: (self.lifecycle.append('verify') or True, 'fresh candidate: OK'))
-        self.effects.publication.push_managed_publication_branch.side_effect = self.push
         self.effects.publication.command.side_effect = (
             lambda *_args, **_kwargs: SimpleNamespace(stdout='https://example.test/pr/47'))
         saved = self.case.checkpoint.get('repo', 'G-047')
@@ -6773,10 +6793,19 @@ class EvidenceFreeRecoveryLifecycleTests(TestCase):
         # A resumed Manager opens a new port bound to the released execution.
         self.state = ExecutionStatePort(self.fixture.connection, self.fixture.repository, 'repo')
         self.case.state = self.fixture.state = self.state
-        self.effects = replace(self.effects, state=self.state)
+        with mock.patch.object(lm, 'push_managed_publication_branch', side_effect=self.push), \
+                mock.patch.object(lm, 'push_owned_pr_conflict_recovery', side_effect=self.push):
+            publication = recovered_rebase_publication(self.effects.publication, self.state)
+        self.effects = replace(self.effects, state=self.state, publication=publication)
         self.handler.effects = self.effects
         self.handler.catalog_plan = self.state.active_execplan('repo')
         self.coordinator = ExecutionPhaseCoordinator(self.handler)
+        for patch in (
+                mock.patch.object(lm, 'git', side_effect=self.git),
+                mock.patch.object(lm, '_owned_publication_plan',
+                                  side_effect=lambda *_: self.state.active_execplan('repo'))):
+            patch.start()
+            self.addCleanup(patch.stop)
 
     def git(self, _path, *args, **_kwargs):
         self.assertNotIn(args[0], ('add', 'commit', 'checkout', 'reset'),
@@ -6819,7 +6848,7 @@ class EvidenceFreeRecoveryLifecycleTests(TestCase):
         self.lifecycle.append('review')
         return lm.AgentResult(0, 'VERDICT: PASS', session_id='review-session')
 
-    def push(self, *_args):
+    def push(self, connection, *_args):
         self.assertEqual(self.state.row()['verify_result'], 'fresh candidate: OK')
         self.assertEqual(self.state.row()['review_result'], 'VERDICT: PASS')
         current = self.handler._definition_snapshot
@@ -6830,6 +6859,7 @@ class EvidenceFreeRecoveryLifecycleTests(TestCase):
             remote=replace(self.case.expected.remote, oid=self.remote))
         self.case.observed = replace(self.case.observed, remote=self.case.expected.remote)
         self.lifecycle.append('publication')
+        lm.update_project(connection, 'repo', publication_remote_oid=self.remote)
         return self.remote
 
     def recover(self):
@@ -6852,6 +6882,93 @@ class EvidenceFreeRecoveryLifecycleTests(TestCase):
         saved = self.case.checkpoint.get('repo', 'G-047')
         self.assertEqual(saved.snapshot['worker_candidate_token'],
                          self.handler._definition_snapshot.worker_candidate_token('owned-head'))
+
+    def existing_pr(self):
+        from managed_rebase_validation import PullRequest
+        self.remote = self.prior_remote = 'a' * 40
+        pr = PullRequest('https://example.test/pr/47', 'repo', 'loop-manager/G-047',
+                         self.remote, 'OPEN')
+        self.case.expected = replace(self.case.expected,
+            remote=replace(self.case.expected.remote, oid=self.remote, pull_request=pr))
+        self.case.observed = replace(self.case.observed, remote=self.case.expected.remote)
+        self.completed = replace(self.completed, remote=self.case.expected.remote)
+        current = self.case.checkpoint.get('repo', 'G-047')
+        self.case.checkpoint.record('repo', 'G-047', expected_generation=current.generation,
+            operation='rebase', expected_head=current.expected_head,
+            target_base_oid=current.target_base_oid, observed_remote_oid=self.remote,
+            snapshot=current.snapshot)
+        self.state.update_project('repo', pr_url=pr.identity, pr_head_oid=pr.head)
+        self.effects.publication.pr_for_branch.return_value = dict(
+            url=pr.identity, state=pr.state, headRefName=pr.branch,
+            headRefOid=pr.head, baseRefName='main')
+
+    def test_current_pr_lease_survives_recovery_and_fresh_publication(self):
+        self.existing_pr()
+        self.effects.workspace.remote_branch_oid.side_effect = lambda *_: 'stale-cache'
+        self.recover()
+        self.handler.recover(self.handler._context())
+        self.effects.workspace.remote_branch_oid.assert_not_called()
+        self.confirm_worker()
+        for _ in range(2):
+            self.assertEqual(self.coordinator.dispatch(self.handler._context()).kind,
+                             ExecutionOutcomeKind.PHASE_ADVANCED)
+        self.effects.publication.push_owned_pr_conflict_recovery.assert_not_called()
+        self.state.update_project('repo', pr_conflict_recovery=1,
+            pr_conflict_head_oid=self.prior_remote, pr_conflict_base_oid='base')
+        self.effects.workspace.remote_branch_oid.side_effect = lambda *_: self.remote
+        result = self.coordinator.dispatch(self.handler._context())
+        self.assertEqual(result.kind, ExecutionOutcomeKind.SUCCESS)
+        self.assertEqual(self.lifecycle, ['manager_continue', 'worker_confirmation',
+            'targeted_tests', 'verify', 'review', 'publication'])
+        self.effects.publication.push_owned_pr_conflict_recovery.assert_called_once()
+        self.effects.publication.command.assert_not_called()
+        self.assertEqual(self.state.repository.get('repo', 'G-047').status, 'PR_OPEN')
+
+    def test_absent_live_remote_ignores_stale_tracking_ref_after_adoption(self):
+        self.effects.workspace.remote_branch_oid.side_effect = lambda *_: 'stale-cache'
+        self.recover()
+        result = self.handler.recover(self.handler._context())
+        self.assertIsInstance(result, handlers.ExecutionContext)
+        self.effects.workspace.remote_branch_oid.assert_not_called()
+        self.effects.agent.run_agent.assert_not_called()
+        self.effects.publication.push_managed_publication_branch.assert_not_called()
+
+    def test_live_remote_change_after_adoption_keeps_publication_closed(self):
+        self.existing_pr()
+        self.recover()
+        self.remote = 'b' * 40
+        self.case.observed = replace(self.case.observed,
+            remote=replace(self.case.observed.remote, oid=self.remote))
+        result = self.handler.recover(self.handler._context())
+        self.assertIsInstance(result, ExecutionOutcome)
+        self.effects.agent.run_agent.assert_not_called()
+        self.effects.validation.verify.assert_not_called()
+        self.effects.publication.push_owned_pr_conflict_recovery.assert_not_called()
+        self.effects.publication.command.assert_not_called()
+
+    def test_existing_remote_head_creates_pr_without_repeated_push(self):
+        self.recover()
+        self.confirm_worker()
+        for _ in range(2):
+            self.assertEqual(self.coordinator.dispatch(self.handler._context()).kind,
+                             ExecutionOutcomeKind.PHASE_ADVANCED)
+        # A push completed before its remote observation was recorded. The
+        # actual record adapter must refresh the snapshot for the next guard.
+        self.remote = 'owned-head'
+        self.case.expected = replace(self.case.expected,
+            remote=replace(self.case.expected.remote, oid=self.remote))
+        self.case.observed = replace(self.case.observed, remote=self.case.expected.remote)
+        result = self.coordinator.dispatch(self.handler._context())
+        self.assertEqual(result.kind, ExecutionOutcomeKind.SUCCESS)
+        expected_record = mock.call(Path('/repo'), Path('/state'), 'repo',
+                                    'loop-manager/G-047', Path('/state/G-047'), 'owned-head')
+        self.assertEqual(self.effects.publication.record_remote_publication_branch.call_args_list,
+                         [expected_record, expected_record])
+        self.effects.publication.push_managed_publication_branch.assert_not_called()
+        self.effects.publication.command.assert_called_once()
+        row = self.state.repository.get('repo', 'G-047')
+        self.assertEqual(row.status, 'PR_OPEN')
+        self.assertEqual(row.publication_remote_oid, 'owned-head')
 
     def test_manual_stage_continue_rechecks_worker_verify_review_and_publication_gate(self):
         self.recover()

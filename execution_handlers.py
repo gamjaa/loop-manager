@@ -1653,7 +1653,14 @@ class ExecutionHandlers:
                 snapshot={**(current.snapshot or {}), 'fetch_in_progress': False,
                           'fetched_base_oid': base_oid},
             )
-            remote_oid = self.effects.workspace.remote_branch_oid(self.repo_path, context.branch)
+            current_rebase = (current.operation == 'rebase'
+                              or valid_acceptance((current.snapshot or {}).get('current_rebase_acceptance')))
+            def observe_remote():
+                if current_rebase:
+                    return manager_git_journal.live_remote_branch_oid(
+                        self.effects.workspace.git, self.repo_path, context.branch)
+                return self.effects.workspace.remote_branch_oid(self.repo_path, context.branch)
+            remote_oid = observe_remote()
             # A PR needs a remote branch.  With neither a remote branch nor a
             # recorded PR there is no publication state to reconcile here;
             # the publication service will query again before creating one.
@@ -1698,9 +1705,7 @@ class ExecutionHandlers:
             stable_base = self.effects.workspace.git(
                 self.repo_path, 'rev-parse', f'origin/{self.base}'
             ).stdout.strip()
-            stable_remote = self.effects.workspace.remote_branch_oid(
-                self.repo_path, context.branch
-            )
+            stable_remote = observe_remote()
             stable_pr = (
                 self.effects.publication.pr_for_branch(
                     self.repo_path, context.branch, str(row['pr_url'] or '') or None
@@ -1734,6 +1739,15 @@ class ExecutionHandlers:
                     '게시 checkpoint의 원격 OID 또는 재활성화 계보가 유효하지 않습니다.',
                     context=context,
                 )
+            if (current.operation is None
+                    and valid_acceptance((current.snapshot or {}).get('current_rebase_acceptance'))):
+                observed, _ = self._current_rebase_service(context).require_owned(checkpoint=current)
+                if observed.remote.oid != remote_oid:
+                    return self._recover(RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                                         'adopted rebase remote observation changed', context=context)
+                # The current service has checked this exact lease and PR.
+                # A rebased local HEAD need not equal its prior remote HEAD.
+                snapshot = replace(snapshot, recorded_remote_oid=remote_oid)
             if (current.operation is None and not (current.snapshot or {}).get('current_rebase_acceptance')
                     and ((current.snapshot or {}).get('completed_rebase')
                          or (current.snapshot or {}).get('rebase_completion')
