@@ -5633,6 +5633,20 @@ class CurrentRebaseAdoptionTests(TestCase):
         # publication boundary. These observations use synthetic Git OIDs.
         self.handler._publish_rebased_checkpoint = mock.Mock()
 
+    def test_ordinary_checkpoint_remote_observation_keeps_fetched_reader(self):
+        from managed_rebase_adoption import checkpoint_remote_oid
+        current = self.checkpoint.get('repo', 'G-047')
+        for selected in (None, replace(current, operation=None, snapshot={}),
+                         replace(current, operation=None, snapshot={
+                             'current_rebase_acceptance': {'kind': 'unverified'}})):
+            with self.subTest(selected=selected):
+                git = mock.Mock(side_effect=AssertionError('ordinary observation must use its existing reader'))
+                fetched = mock.Mock(return_value='fetched-oid')
+                self.assertEqual(checkpoint_remote_oid(selected, Path('/repo'), 'loop-manager/G-047',
+                    git=git, read_fetched=fetched), 'fetched-oid')
+                fetched.assert_called_once_with(Path('/repo'), 'loop-manager/G-047')
+                git.assert_not_called()
+
     def _prepare_current_checkpoint_recovery(self):
         self.expected = replace(self.expected, remote=replace(self.expected.remote, repository='repo'))
         self.observed = replace(self.observed, remote=self.expected.remote)
@@ -6755,6 +6769,10 @@ class EvidenceFreeRecoveryLifecycleTests(TestCase):
         self.case.observed = replace(self.case.observed,
             input_fingerprint=self.case.expected.input_fingerprint,
             remote=self.case.expected.remote)
+        self.final_head = 'c' * 40
+        self.case.observed = replace(self.case.observed, head=self.final_head,
+            branch_ref=(self.final_head, ''), registration=(
+                f'HEAD={self.final_head}', 'branch=refs/heads/loop-manager/G-047'))
         self.completed = self.case.observed
         self.pending = True
         self.remote = None
@@ -6771,7 +6789,7 @@ class EvidenceFreeRecoveryLifecycleTests(TestCase):
         self.effects.workspace.git.side_effect = self.git
         self.effects.workspace.remote_branch_oid.side_effect = lambda *_: self.remote
         self.effects.agent.capture_git_snapshot.side_effect = lambda *_: lm.GitSnapshot(
-            'partial' if self.pending else 'owned-head',
+            'partial' if self.pending else self.final_head,
             None if self.pending else 'loop-manager/G-047', {},
             {'app.py': (('staged',), 'manual')} if self.pending else {}, {}, {}, {}, {})
         self.effects.agent.run_agent.side_effect = self.agent
@@ -6818,7 +6836,7 @@ class EvidenceFreeRecoveryLifecycleTests(TestCase):
             self.lifecycle.append('manager_continue')
         output, code = '', 0
         if args == ('rev-parse', 'HEAD'):
-            output = 'partial' if self.pending else 'owned-head'
+            output = 'partial' if self.pending else self.final_head
         elif args[:2] == ('rev-parse', '--git-path'):
             code = 1
         elif args[0] == 'rev-parse':
@@ -6852,9 +6870,9 @@ class EvidenceFreeRecoveryLifecycleTests(TestCase):
         self.assertEqual(self.state.row()['verify_result'], 'fresh candidate: OK')
         self.assertEqual(self.state.row()['review_result'], 'VERDICT: PASS')
         current = self.handler._definition_snapshot
-        self.assertEqual(self.state.row()['verify_token'], current.verify_token('base', 'owned-head'))
-        self.assertEqual(self.state.row()['review_token'], current.review_token('base', 'owned-head'))
-        self.remote = 'owned-head'
+        self.assertEqual(self.state.row()['verify_token'], current.verify_token('base', self.final_head))
+        self.assertEqual(self.state.row()['review_token'], current.review_token('base', self.final_head))
+        self.remote = self.final_head
         self.case.expected = replace(self.case.expected,
             remote=replace(self.case.expected.remote, oid=self.remote))
         self.case.observed = replace(self.case.observed, remote=self.case.expected.remote)
@@ -6881,7 +6899,7 @@ class EvidenceFreeRecoveryLifecycleTests(TestCase):
         self.assertEqual(outcome.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
         saved = self.case.checkpoint.get('repo', 'G-047')
         self.assertEqual(saved.snapshot['worker_candidate_token'],
-                         self.handler._definition_snapshot.worker_candidate_token('owned-head'))
+                         self.handler._definition_snapshot.worker_candidate_token(self.final_head))
 
     def existing_pr(self):
         from managed_rebase_validation import PullRequest
@@ -6933,6 +6951,60 @@ class EvidenceFreeRecoveryLifecycleTests(TestCase):
         self.effects.agent.run_agent.assert_not_called()
         self.effects.publication.push_managed_publication_branch.assert_not_called()
 
+    def test_stale_cache_recovery_reaches_actual_push_adapter_after_fresh_validation(self):
+        self.effects.workspace.remote_branch_oid.side_effect = lambda *_: 'stale-cache'
+        self.recover()
+        self.confirm_worker()
+        for _ in range(2):
+            self.assertEqual(self.coordinator.dispatch(self.handler._context()).kind,
+                             ExecutionOutcomeKind.PHASE_ADVANCED)
+        self.effects = replace(self.effects, publication=recovered_rebase_publication(
+            self.effects.publication, self.state))
+        self.handler.effects = self.effects
+        pushes = []
+        def git(path, *args, **kwargs):
+            if args[0] == 'push':
+                self.assertEqual(self.state.row()['verify_result'], 'fresh candidate: OK')
+                self.assertEqual(self.state.row()['review_result'], 'VERDICT: PASS')
+                pushes.append(args)
+                self.remote = self.final_head
+                self.case.expected = replace(self.case.expected,
+                    remote=replace(self.case.expected.remote, oid=self.remote))
+                self.case.observed = replace(self.case.observed, remote=self.case.expected.remote)
+                self.lifecycle.append('publication')
+            return self.git(path, *args, **kwargs)
+        self.effects.workspace.git.side_effect = git
+        with mock.patch.object(lm, 'git', side_effect=git), \
+                mock.patch.object(lm, '_recorded_base_fetch') as fetch, \
+                mock.patch.object(lm, 'remote_branch_oid', return_value='stale-cache') as cached:
+            result = self.coordinator.dispatch(self.handler._context())
+        self.assertEqual(result.kind, ExecutionOutcomeKind.SUCCESS)
+        self.assertEqual(pushes, [('push', '-u', 'origin', 'HEAD:refs/heads/loop-manager/G-047')])
+        fetch.assert_called_once()
+        cached.assert_not_called()
+        self.effects.workspace.remote_branch_oid.assert_not_called()
+        self.effects.publication.push_managed_publication_branch.assert_called_once()
+        self.effects.publication.command.assert_called_once()
+        self.assertEqual(self.lifecycle, ['manager_continue', 'worker_confirmation',
+            'targeted_tests', 'verify', 'review', 'publication'])
+        row = self.state.repository.get('repo', 'G-047')
+        self.assertEqual(row.status, 'PR_OPEN')
+        self.assertEqual(row.publication_remote_oid, self.final_head)
+
+    def test_live_remote_creation_before_publication_is_rejected_despite_absent_cache(self):
+        self.recover()
+        self.confirm_worker()
+        for _ in range(2):
+            self.assertEqual(self.coordinator.dispatch(self.handler._context()).kind,
+                             ExecutionOutcomeKind.PHASE_ADVANCED)
+        self.remote = 'b' * 40
+        self.effects.workspace.remote_branch_oid.side_effect = lambda *_: None
+        result = self.coordinator.dispatch(self.handler._context())
+        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.effects.publication.push_managed_publication_branch.assert_not_called()
+        self.effects.publication.command.assert_not_called()
+        self.assertNotIn('publication', self.lifecycle)
+
     def test_live_remote_change_after_adoption_keeps_publication_closed(self):
         self.existing_pr()
         self.recover()
@@ -6954,21 +7026,21 @@ class EvidenceFreeRecoveryLifecycleTests(TestCase):
                              ExecutionOutcomeKind.PHASE_ADVANCED)
         # A push completed before its remote observation was recorded. The
         # actual record adapter must refresh the snapshot for the next guard.
-        self.remote = 'owned-head'
+        self.remote = self.final_head
         self.case.expected = replace(self.case.expected,
             remote=replace(self.case.expected.remote, oid=self.remote))
         self.case.observed = replace(self.case.observed, remote=self.case.expected.remote)
         result = self.coordinator.dispatch(self.handler._context())
         self.assertEqual(result.kind, ExecutionOutcomeKind.SUCCESS)
         expected_record = mock.call(Path('/repo'), Path('/state'), 'repo',
-                                    'loop-manager/G-047', Path('/state/G-047'), 'owned-head')
+                                    'loop-manager/G-047', Path('/state/G-047'), self.final_head)
         self.assertEqual(self.effects.publication.record_remote_publication_branch.call_args_list,
                          [expected_record, expected_record])
         self.effects.publication.push_managed_publication_branch.assert_not_called()
         self.effects.publication.command.assert_called_once()
         row = self.state.repository.get('repo', 'G-047')
         self.assertEqual(row.status, 'PR_OPEN')
-        self.assertEqual(row.publication_remote_oid, 'owned-head')
+        self.assertEqual(row.publication_remote_oid, self.final_head)
 
     def test_manual_stage_continue_rechecks_worker_verify_review_and_publication_gate(self):
         self.recover()

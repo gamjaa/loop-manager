@@ -437,6 +437,14 @@ class ExecutionHandlers:
             raise manager_git_journal.MutationEvidenceError('current rebase adapter unavailable')
         return factory(context, **options)
 
+    def _checkpoint_remote_oid(self, repo_path, branch):
+        checkpoints = self.effects.checkpoint
+        current = (checkpoints.get(self.repo, self.effects.state.plan_id)
+                   if checkpoints is not None else None)
+        return managed_rebase_adoption.checkpoint_remote_oid(
+            current, repo_path, branch, git=self.effects.workspace.git,
+            read_fetched=self.effects.workspace.remote_branch_oid)
+
     def _owned_current_checkpoint_rebase(self, context, row, remote_oid, current,
                                          checkpoint, pull_request):
         original = str(checkpoint['accepted_remote_oid'] or '')
@@ -995,7 +1003,7 @@ class ExecutionHandlers:
                         'remote_oid': observed.remote.oid})
             return
         head = self.effects.workspace.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
-        remote_oid = self.effects.workspace.remote_branch_oid(self.repo_path, context.branch)
+        remote_oid = self._checkpoint_remote_oid(self.repo_path, context.branch)
         live = manager_git_journal.live_remote_branch_oid(
             self.effects.workspace.git, self.repo_path, context.branch)
         row = self._row()
@@ -1653,14 +1661,7 @@ class ExecutionHandlers:
                 snapshot={**(current.snapshot or {}), 'fetch_in_progress': False,
                           'fetched_base_oid': base_oid},
             )
-            current_rebase = (current.operation == 'rebase'
-                              or valid_acceptance((current.snapshot or {}).get('current_rebase_acceptance')))
-            def observe_remote():
-                if current_rebase:
-                    return manager_git_journal.live_remote_branch_oid(
-                        self.effects.workspace.git, self.repo_path, context.branch)
-                return self.effects.workspace.remote_branch_oid(self.repo_path, context.branch)
-            remote_oid = observe_remote()
+            remote_oid = self._checkpoint_remote_oid(self.repo_path, context.branch)
             # A PR needs a remote branch.  With neither a remote branch nor a
             # recorded PR there is no publication state to reconcile here;
             # the publication service will query again before creating one.
@@ -1705,7 +1706,7 @@ class ExecutionHandlers:
             stable_base = self.effects.workspace.git(
                 self.repo_path, 'rev-parse', f'origin/{self.base}'
             ).stdout.strip()
-            stable_remote = observe_remote()
+            stable_remote = self._checkpoint_remote_oid(self.repo_path, context.branch)
             stable_pr = (
                 self.effects.publication.pr_for_branch(
                     self.repo_path, context.branch, str(row['pr_url'] or '') or None
@@ -2247,7 +2248,7 @@ class ExecutionHandlers:
         if context.phase is ExecutionPhase.PUBLISHING and not int(
             row['pr_conflict_recovery']
         ):
-            remote_oid = self.effects.workspace.remote_branch_oid(
+            remote_oid = self._checkpoint_remote_oid(
                 self.repo_path, context.branch
             )
             try:
@@ -4272,7 +4273,7 @@ class ExecutionHandlers:
         row = self._row()
         assert self.catalog_plan is not None
         latest_sha = self._fetch_latest_base()
-        remote_oid = None if int(row['pr_conflict_recovery']) else self.effects.workspace.remote_branch_oid(self.repo_path, context.branch)
+        remote_oid = None if int(row['pr_conflict_recovery']) else self._checkpoint_remote_oid(self.repo_path, context.branch)
         try:
             if not int(row['pr_conflict_recovery']):
                 self.effects.publication.record_remote_publication_branch(
@@ -4368,7 +4369,7 @@ class ExecutionHandlers:
     def _publication_resume(self):
         return PublicationResume(
             self.effects.publication.pr_for_branch,
-            self.effects.workspace.remote_branch_oid,
+            self._checkpoint_remote_oid,
             self.effects.workspace.git,
         )
 

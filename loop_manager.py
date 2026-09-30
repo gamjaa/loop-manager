@@ -8939,7 +8939,12 @@ def push_managed_publication_branch(
         connection, repo_path, state_dir, repo, branch, worktree
     )
     local_oid = git(worktree, "rev-parse", "HEAD").stdout.strip()
-    remote_oid = remote_branch_oid(repo_path, branch)
+    checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
+        repo, str(plan['plan_id']))
+    def observe_remote():
+        return managed_rebase_adoption.checkpoint_remote_oid(
+            checkpoint, repo_path, branch, git=git, read_fetched=remote_branch_oid)
+    remote_oid = observe_remote()
     if remote_oid is None and plan['publication_remote_oid']:
         raise PublicationSafetyError(
             '저장된 게시 branch가 원격에서 삭제돼 새 branch 생성으로 복구할 수 없습니다.'
@@ -9002,7 +9007,7 @@ def push_managed_publication_branch(
         raise RuntimeError(f"publication branch push 실패:\n{pushed.stdout[-8000:]}")
 
     _recorded_base_fetch(repo_path, state_dir, branch, owner="project")
-    confirmed_oid = remote_branch_oid(repo_path, branch)
+    confirmed_oid = observe_remote()
     if confirmed_oid != local_oid:
         raise RuntimeError(
             "publication branch push 결과를 원격에서 확인할 수 없습니다."
