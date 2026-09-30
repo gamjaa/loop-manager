@@ -351,8 +351,10 @@ class ExecutionHandlerTests(TestCase):
             self.assertEqual(dict(connection.execute(
                 'SELECT * FROM blocked_checkpoints',
             ).fetchone()), published_before)
-            self.assertEqual(row['publication_remote_oid'], original)
-            proof = ExecutionCheckpointRepository(connection).get(repo, 'G-034').current_rebase_acceptance()
+            saved = ExecutionCheckpointRepository(connection).get(repo, 'G-034')
+            expected_published = (saved.expected_head if saved.snapshot.get('rebase_publication_result') else original)
+            self.assertEqual(row['publication_remote_oid'], expected_published)
+            proof = saved.snapshot['current_rebase_acceptance']
             self.assertEqual(proof['remote']['oid'], original)
             audit_slot = journal._slot(fixture.state_dir, repo, 'managed_rebase', str(fixture.worktree.resolve()))
             self.assertEqual(journal._read(audit_slot / f'{continuation}.intent.json')['expected']['before_head'], original)
@@ -5479,6 +5481,9 @@ class CurrentRebaseAdoptionTests(TestCase):
         self.observation_patch.start()
         self.addCleanup(self.observation_patch.stop)
         self.handler._complete_rebase_intent = handlers.ExecutionHandlers._complete_rebase_intent.__get__(self.handler)
+        # Isolate current-result adoption from the independently tested remote
+        # publication boundary. These observations use synthetic Git OIDs.
+        self.handler._publish_rebased_checkpoint = mock.Mock()
 
     def _prepare_current_checkpoint_recovery(self):
         self.expected = replace(self.expected, remote=replace(self.expected.remote, repository='repo'))
@@ -6014,3 +6019,269 @@ class CurrentRebaseAgentScopeTests(TestCase):
         with self.assertRaises(lm.AgentScopeError):
             lm.validate_persisted_agent_scope(connection, Path('/repo'), Path('/state'), 'repo')
         self.assertEqual(connection.execute("SELECT agent_snapshot FROM projects WHERE repo = 'repo'").fetchone()[0], self.original.serialize())
+
+
+class ImmediateRebasePublicationTests(TestCase):
+    """Only fake external effects; test real acceptance, intents and runtime CAS."""
+    def setUp(self):
+        self.seed = CurrentRebaseAdoptionTests()
+        self.seed.setUp()
+        self.addCleanup(self.seed.doCleanups)
+        self.seed._prepare_current_checkpoint_recovery()
+        self.handler = self.seed.handler
+        self.handler._publish_rebased_checkpoint = handlers.ExecutionHandlers._publish_rebased_checkpoint.__get__(self.handler)
+        self.state, self.checkpoints = self.seed.state, self.seed.checkpoint
+        self.fixture = self.seed.fixture
+        self.remote = 'remote'
+        live = mock.patch.object(handlers.manager_git_journal, 'live_remote_branch_oid',
+                                 side_effect=lambda *_: self.remote)
+        live.start()
+        self.addCleanup(live.stop)
+        self.pushes = []
+        self.events = []
+        self.push_failure = False
+        self.before_push = None
+        self.handler.effects.workspace.remote_branch_oid.side_effect = lambda *_: self.remote
+        self.handler.effects.workspace.git.side_effect = self.git
+        factory = self.seed.factory
+        self.handler.effects = replace(self.handler.effects, workspace=replace(
+            self.handler.effects.workspace, current_rebase_service=lambda context, **options:
+            factory(context, **{'remote_oid': self.state.row()['publication_remote_oid'] or self.seed.expected.remote.oid, **options})))
+
+    def git(self, path, *args, **kwargs):
+        if args[0] == 'ls-remote':
+            return SimpleNamespace(returncode=0, stdout=(
+                f'{self.remote}\trefs/heads/loop-manager/G-047\n' if self.remote else ''))
+        if args[0] == 'push':
+            self.events.append('push')
+            self.pushes.append(args)
+            if self.before_push:
+                self.before_push()
+            if self.push_failure:
+                return SimpleNamespace(returncode=1, stdout='permission denied')
+            self.remote = 'owned-head'
+            self.seed.observed = replace(self.seed.observed,
+                                         remote=replace(self.seed.expected.remote, oid=self.remote))
+            return SimpleNamespace(returncode=0, stdout='pushed')
+        return self.fixture.observed_git(path, *args, **kwargs)
+
+    def complete(self):
+        self.handler._complete_rebase_intent(self.handler._context())
+
+    def restart(self):
+        self.state = ExecutionStatePort(self.fixture.connection,
+            runtime_state.RuntimeStateRepository(self.fixture.connection), 'repo')
+        self.handler.effects = replace(self.handler.effects, state=self.state)
+        replacement = handlers.ExecutionHandlers(self.handler.effects,
+            repo='repo', repo_path=Path('/repo'), state_dir=Path('/state'), base='main',
+            base_sha='later-base', provider='codex', config_path=Path('/config'), newly_activated=False)
+        replacement.plan = self.handler.plan
+        replacement.catalog_plan = self.handler.catalog_plan
+        self.handler = replacement
+
+    def test_completion_publishes_before_candidate_work_without_historical_receipts(self):
+        self.complete()
+        saved = self.checkpoints.get('repo', 'G-047')
+        self.assertEqual(self.pushes, [('push',
+            '--force-with-lease=refs/heads/loop-manager/G-047:remote', 'origin',
+            'owned-head:refs/heads/loop-manager/G-047')])
+        self.assertIsNone(saved.operation)
+        self.assertEqual(saved.observed_remote_oid, 'owned-head')
+        self.assertEqual(saved.snapshot['last_adopted_remote_oid'], 'owned-head')
+        self.assertEqual(saved.snapshot['failure'], 'old failure')
+        self.assertEqual(self.state.row()['phase'], 'WORKING')
+        self.assertEqual(self.state.row()['worker_session_id'], 'saved-worker')
+        for key in ('worker_result', 'verify_result', 'review_result', 'publication_token'):
+            self.assertIsNone(self.state.row()[key])
+        self.fixture.effects.agent.run_agent.assert_not_called()
+        self.fixture.effects.validation.verify.assert_not_called()
+        self.fixture.effects.publication.push_managed_publication_branch.assert_not_called()
+        self.fixture.effects.publication.command.assert_not_called()
+        self.handler._publish_rebased_checkpoint(self.handler._context())
+        self.assertEqual(self.checkpoints.get('repo', 'G-047'), saved)
+        self.assertEqual(len(self.pushes), 1)
+
+    def test_interruption_before_push_reuses_intent_before_later_base_fetch(self):
+        class Exit(BaseException):
+            pass
+        self.before_push = lambda: (_ for _ in ()).throw(Exit())
+        with self.assertRaises(Exit):
+            self.complete()
+        intent = self.checkpoints.get('repo', 'G-047').snapshot['rebase_publication_intent']
+        self.before_push = None
+        self.restart()
+        def fetch():
+            self.events.append('fetch-later-base')
+            raise Exit()
+        self.handler._fetch_latest_base = fetch
+        with self.assertRaises(Exit):
+            self.handler.guard(self.handler._context())
+        self.assertEqual(self.events[-2:], ['push', 'fetch-later-base'])
+        self.assertEqual(self.checkpoints.get('repo', 'G-047').snapshot['rebase_publication_intent'], intent)
+        self.assertEqual(self.state.row()['publication_remote_oid'], 'owned-head')
+
+    def test_interruption_after_push_confirms_once_without_repeating_push(self):
+        class Exit(BaseException):
+            pass
+        with mock.patch.object(self.state, 'complete_rebase_publication', side_effect=Exit()):
+            with self.assertRaises(Exit):
+                self.complete()
+        pending = self.checkpoints.get('repo', 'G-047')
+        self.assertEqual(pending.operation, 'rebase_publish')
+        self.assertEqual(self.state.row()['publication_remote_oid'], 'remote')
+        self.restart()
+        self.handler._publish_rebased_checkpoint(self.handler._context())
+        saved = self.checkpoints.get('repo', 'G-047')
+        self.assertEqual(saved.snapshot['rebase_publication_intent'], pending.snapshot['rebase_publication_intent'])
+        self.assertEqual(self.state.row()['publication_remote_oid'], 'owned-head')
+        self.handler._publish_rebased_checkpoint(self.handler._context())
+        self.assertEqual(self.checkpoints.get('repo', 'G-047'), saved)
+        self.assertEqual(len(self.pushes), 1)
+
+    def test_transient_push_failure_retains_same_lease_and_intent(self):
+        self.push_failure = True
+        with self.assertRaises(handlers.RecoveryFailure):
+            self.complete()
+        pending = self.checkpoints.get('repo', 'G-047')
+        self.push_failure = False
+        self.restart()
+        self.handler._publish_rebased_checkpoint(self.handler._context())
+        self.assertEqual(self.pushes[0], self.pushes[1])
+        self.assertEqual(self.checkpoints.get('repo', 'G-047').snapshot['rebase_publication_intent'],
+                         pending.snapshot['rebase_publication_intent'])
+
+    def test_remote_race_deletion_or_new_pr_never_replaces_intent_lease(self):
+        for raced in ('external-commit', None, 'pr'):
+            with self.subTest(raced=raced):
+                self.setUp()
+                self.push_failure = True
+                with self.assertRaises(handlers.RecoveryFailure):
+                    self.complete()
+                pending = self.checkpoints.get('repo', 'G-047')
+                if raced == 'pr':
+                    self.fixture.effects.publication.pr_for_branch.return_value = {'url': 'new-pr'}
+                else:
+                    self.remote = raced
+                self.push_failure = False
+                with self.assertRaises(handlers.RecoveryFailure):
+                    self.handler._publish_rebased_checkpoint(self.handler._context())
+                self.assertEqual(len(self.pushes), 1)
+                self.assertEqual(self.checkpoints.get('repo', 'G-047'), pending)
+                self.assertEqual(self.state.row()['publication_remote_oid'], 'remote')
+
+    def test_new_branch_existing_pr_or_different_owner_never_gets_early_push(self):
+        for excluded in ('new-branch', 'existing-pr', 'other-owner'):
+            with self.subTest(excluded=excluded):
+                self.setUp()
+                if excluded == 'new-branch':
+                    self.seed.expected = replace(self.seed.expected,
+                        remote=replace(self.seed.expected.remote, oid=None))
+                    self.seed.observed = replace(self.seed.observed, remote=self.seed.expected.remote)
+                    current = self.checkpoints.get('repo', 'G-047')
+                    self.checkpoints.record('repo', 'G-047', expected_generation=current.generation,
+                        operation='rebase', expected_head='before', target_base_oid='base',
+                        observed_remote_oid=None, snapshot=current.snapshot)
+                    self.state.update_project('repo', publication_remote_oid=None)
+                elif excluded == 'existing-pr':
+                    self.state.update_project('repo', pr_url='existing-pr')
+                else:
+                    self.seed.observed = replace(self.seed.observed, branch='another-plan')
+                with mock.patch.object(self.handler, '_owned_checkpoint_remote', return_value=True):
+                    if excluded == 'other-owner':
+                        with self.assertRaises(RuntimeError):
+                            self.complete()
+                    elif excluded == 'existing-pr':
+                        # Existing PR rebase still uses the ordinary path; there
+                        # is no intermediate publication entry for its branch.
+                        saved = self.checkpoints.get('repo', 'G-047')
+                        from tests.test_managed_rebase_validation import decision_for
+                        accepted = decision_for(self.seed.expected, self.seed.observed).acceptance
+                        self.checkpoints.accept_current_rebase('repo', 'G-047', acceptance=accepted)
+                        self.handler._publish_rebased_checkpoint(self.handler._context())
+                    else:
+                        self.complete()
+                self.assertEqual(self.pushes, [])
+
+    def test_same_oid_completes_without_push_and_next_rebase_uses_adopted_oid(self):
+        self.remote = 'owned-head'
+        self.seed.expected = replace(self.seed.expected, remote=replace(self.seed.expected.remote, oid=self.remote))
+        self.seed.observed = replace(self.seed.observed, remote=self.seed.expected.remote)
+        self.state.update_project('repo', publication_remote_oid=self.remote)
+        current = self.checkpoints.get('repo', 'G-047')
+        self.checkpoints.record('repo', 'G-047', expected_generation=current.generation,
+            operation='rebase', expected_head='before', target_base_oid='base',
+            observed_remote_oid=self.remote, snapshot=current.snapshot)
+        with mock.patch.object(self.handler, '_owned_checkpoint_remote', return_value=True):
+            self.complete()
+        self.assertEqual(self.pushes, [])
+        with mock.patch.object(handlers.manager_git_journal, 'begin_current_rebase'):
+            self.handler._record_rebase_intent(self.handler._context(), 'later-base')
+        current = self.checkpoints.get('repo', 'G-047')
+        self.assertEqual(current.operation, 'rebase')
+        self.assertEqual(current.observed_remote_oid, 'owned-head')
+        self.assertEqual(current.target_base_oid, 'later-base')
+
+    def test_final_push_resume_uses_latest_adopted_oid_instead_of_original_checkpoint(self):
+        self.complete()
+        current = self.checkpoints.get('repo', 'G-047')
+        pending = self.checkpoints.record('repo', 'G-047', expected_generation=current.generation,
+            operation='push', expected_head='worker-head', target_base_oid='base',
+            observed_remote_oid='owned-head', snapshot={**current.snapshot, 'remote_before': 'owned-head'})
+        self.seed.observed = replace(self.seed.observed, head='worker-head',
+            branch_ref=('worker-head', ''),
+            registration=('HEAD=worker-head', 'branch=refs/heads/loop-manager/G-047'),
+            remote=replace(self.seed.expected.remote, oid='worker-head'))
+        self.assertTrue(self.handler._owned_checkpoint_remote(self.handler._context(),
+            self.state.row(), 'worker-head', pending))
+        self.assertFalse(self.handler._owned_checkpoint_remote(self.handler._context(),
+            self.state.row(), 'unrelated-head', pending))
+
+    def test_publication_comparison_updates_only_selected_remote_tracking_ref(self):
+        from managed_rebase_adoption import selected_baseline
+        self.complete()
+        branch, worktree = 'loop-manager/G-047', '/state/G-047'
+        ref, remote_ref = f'refs/heads/{branch}', f'refs/remotes/origin/{branch}'
+        before = lm.GitSnapshot('before', branch, {}, {},
+            {ref: ('before', ''), remote_ref: ('remote', ''), 'refs/heads/other': ('original', '')},
+            {worktree: ('HEAD=before',)}, {}, {})
+        current = replace(before, head='owned-head', refs={ref: ('owned-head', ''),
+            remote_ref: ('owned-head', ''), 'refs/heads/other': ('unauthorized', '')},
+            worktrees={worktree: ('HEAD=owned-head',)})
+        published = self.checkpoints.get('repo', 'G-047')
+        accepted = selected_baseline(before, current, branch, worktree, publication=published)
+        self.assertEqual(accepted.refs[remote_ref], ('owned-head', ''))
+        self.assertEqual(accepted.refs['refs/heads/other'], ('original', ''))
+        self.assertEqual(before.refs[remote_ref], ('remote', ''))
+        tampered = replace(current, refs={**current.refs, remote_ref: ('foreign', '')})
+        with self.assertRaises(handlers.manager_git_journal.MutationEvidenceError):
+            selected_baseline(before, tampered, branch, worktree, publication=published)
+
+    def test_existing_remote_without_durable_publication_identity_is_preserved(self):
+        self.state.update_project('repo', publication_remote_oid=None)
+        self.fixture.connection.execute("DELETE FROM blocked_checkpoints WHERE repo = 'repo'")
+        with self.assertRaises(handlers.RecoveryFailure):
+            self.complete()
+        saved = self.checkpoints.get('repo', 'G-047')
+        self.assertEqual(saved.expected_head, 'owned-head')
+        self.assertNotIn('rebase_publication_intent', saved.snapshot)
+        self.assertEqual(self.remote, 'remote')
+        self.assertEqual(self.pushes, [])
+
+    def test_legacy_completed_result_without_journal_or_completion_markers_publishes(self):
+        current = self.checkpoints.get('repo', 'G-047')
+        self.checkpoints.record('repo', 'G-047', expected_generation=current.generation,
+            operation=None, expected_head='owned-head', target_base_oid='base',
+            observed_remote_oid='remote', snapshot={'failure': 'preserved legacy audit'})
+        original_git = self.git
+        def legacy_git(path, *args, **kwargs):
+            if args == ('merge-base', '--is-ancestor', 'base', 'remote'):
+                return SimpleNamespace(returncode=1, stdout='')
+            return original_git(path, *args, **kwargs)
+        self.handler.effects.workspace.git.side_effect = legacy_git
+        self.complete()
+        saved = self.checkpoints.get('repo', 'G-047')
+        self.assertEqual(self.state.row()['publication_remote_oid'], 'owned-head')
+        self.assertEqual(saved.snapshot['failure'], 'preserved legacy audit')
+        self.assertEqual(len(self.pushes), 1)
+        self.assertNotIn('completed_rebase', saved.snapshot)
+        self.assertNotIn('rebase_completion', saved.snapshot)

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import json
 import sqlite3
 from recovery_runtime import RecoveryFailure, RecoveryReason
-from managed_rebase_validation import valid_acceptance
+from managed_rebase_validation import valid_acceptance, fingerprint
 
 
 SCHEMA = """
@@ -62,6 +62,30 @@ class CheckpointRecord:
             return None
         return result
 
+    def rebase_publication_intent(self):
+        """Return only the immutable intent bound to this selected checkpoint."""
+        intent = (self.snapshot or {}).get('rebase_publication_intent')
+        fields = {'kind', 'version', 'repo', 'plan_id', 'repository_identity', 'branch',
+                  'worktree', 'target_base_oid', 'head', 'remote_before', 'acceptance',
+                  'generation', 'id'}
+        if not isinstance(intent, dict) or set(intent) != fields:
+            return None
+        accepted = intent['acceptance']
+        if (intent['kind'] != 'intermediate_rebase_publication' or intent['version'] != 1
+                or type(intent['generation']) is not int or intent['generation'] < 0
+                or not valid_acceptance(accepted)
+                or not intent['remote_before'] or accepted['remote']['pull_request'] is not None
+                or accepted['remote']['oid'] != intent['remote_before']
+                or any(accepted[key] != intent[key] for key in (
+                    'repo', 'plan_id', 'repository_identity', 'branch', 'worktree',
+                    'target_base_oid', 'head'))
+                or intent['id'] != fingerprint({k: v for k, v in intent.items() if k != 'id'})
+                or self.generation <= intent['generation']
+                or self.expected_head != intent['head'] or self.target_base_oid != intent['target_base_oid']
+                or (self.operation == 'rebase_publish' and self.observed_remote_oid != intent['remote_before'])):
+            return None
+        return intent
+
 
 class ExecutionCheckpointRepository:
     def __init__(self, connection: sqlite3.Connection):
@@ -90,6 +114,24 @@ class ExecutionCheckpointRepository:
         snapshot: dict | None,
     ) -> CheckpointRecord:
         """Commit an intent or completion only against the observed generation."""
+        current = self.get(repo, plan_id)
+        if current.operation == 'rebase_publish':
+            saved = current.snapshot or {}
+            intent = current.rebase_publication_intent()
+            supplied = snapshot or {}
+            completed = supplied.get('rebase_publication_result') or {}
+            same_candidate = (intent is not None
+                and supplied.get('rebase_publication_intent') == intent
+                and expected_head == current.expected_head
+                and target_base_oid == current.target_base_oid)
+            pending = (operation == 'rebase_publish'
+                       and observed_remote_oid == current.observed_remote_oid)
+            confirmed = (operation is None and intent is not None
+                         and observed_remote_oid == intent['head']
+                         and completed.get('intent_id') == intent['id']
+                         and completed.get('head') == intent['head'])
+            if not same_candidate or not (pending or confirmed):
+                raise CheckpointRace('intermediate publication must finish before another Git operation')
         payload = json.dumps(snapshot, sort_keys=True) if snapshot is not None else None
         self.connection.execute("SAVEPOINT execution_checkpoint_record")
         try:
@@ -155,3 +197,63 @@ class ExecutionCheckpointRepository:
             target_base_oid=acceptance['target_base_oid'],
             observed_remote_oid=acceptance['remote']['oid'], snapshot=snapshot,
         )
+
+    def begin_rebase_publication(self, repo, plan_id, *, expected_generation,
+                                 acceptance, remote_before):
+        """Persist one immutable lease and candidate for intermediate publication."""
+        current = self.get(repo, plan_id)
+        if (current.generation != expected_generation or current.operation is not None
+                or not valid_acceptance(acceptance) or acceptance['repo'] != repo
+                or acceptance['plan_id'] != plan_id
+                or current.expected_head != acceptance['head']
+                or current.target_base_oid != acceptance['target_base_oid']
+                or acceptance['remote']['oid'] != remote_before or not remote_before
+                or acceptance['remote']['pull_request'] is not None):
+            raise CheckpointRace('intermediate rebase publication acceptance changed')
+        intent = {key: acceptance[key] for key in (
+            'repo', 'plan_id', 'repository_identity', 'branch', 'worktree',
+            'target_base_oid', 'head')}
+        intent.update(kind='intermediate_rebase_publication', version=1,
+                      remote_before=remote_before, acceptance=dict(acceptance),
+                      generation=current.generation)
+        intent['id'] = fingerprint(intent)
+        saved = dict(current.snapshot or {})
+        if 'rebase_publication_intent' in saved:
+            saved.setdefault('rebase_publication_history', []).append({
+                'intent': saved['rebase_publication_intent'],
+                'result': saved.get('rebase_publication_result')})
+        saved['rebase_publication_intent'] = intent
+        return self.record(repo, plan_id, expected_generation=current.generation,
+                           operation='rebase_publish', expected_head=intent['head'],
+                           target_base_oid=intent['target_base_oid'],
+                           observed_remote_oid=remote_before, snapshot=saved)
+
+    def finish_rebase_publication(self, repo, plan_id, *, intent, acceptance):
+        """CAS the confirmed result; the caller atomically updates the runtime lease."""
+        current = self.get(repo, plan_id)
+        saved = dict(current.snapshot or {})
+        if (current.rebase_publication_intent() != intent
+                or intent.get('id') != fingerprint({k: v for k, v in intent.items() if k != 'id'})
+                or not valid_acceptance(acceptance)
+                or any(acceptance[key] != intent[key] for key in (
+                    'repo', 'plan_id', 'repository_identity', 'branch', 'worktree',
+                    'target_base_oid', 'head'))
+                or intent['repo'] != repo or intent['plan_id'] != plan_id
+                or acceptance['remote']['oid'] != intent['head']
+                or acceptance['remote']['pull_request'] is not None):
+            raise CheckpointRace('intermediate rebase publication result changed')
+        if current.operation is None and saved.get('rebase_publication_result', {}).get('intent_id') == intent['id']:
+            return current
+        if (current.operation != 'rebase_publish' or current.expected_head != intent['head']
+                or current.observed_remote_oid != intent['remote_before']):
+            raise CheckpointRace('intermediate rebase publication intent changed')
+        saved['rebase_publication_result'] = {
+            'intent_id': intent['id'], 'head': intent['head'],
+            'acceptance_id': saved['current_rebase_acceptance']['id'],
+            'current_acceptance': dict(acceptance)}
+        saved['pushed_checkpoint_head'] = intent['head']
+        saved['last_adopted_remote_oid'] = intent['head']
+        return self.record(repo, plan_id, expected_generation=current.generation,
+                           operation=None, expected_head=intent['head'],
+                           target_base_oid=intent['target_base_oid'],
+                           observed_remote_oid=intent['head'], snapshot=saved)

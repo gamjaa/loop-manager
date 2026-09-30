@@ -40,10 +40,15 @@ PR이 없는 동일 계획의 기존 원격 작업 branch를 관리 rebase한 �
 
 ## Progress
 
-- [ ] 현재 상태의 완료 rebase 수용과 중간 게시 intent 검증
-- [ ] 원격 lease 게시·중단 복구와 최종 검증 경계 연결
+- [x] 현재 상태의 완료 rebase 수용과 중간 게시 intent 검증
+- [x] 원격 lease 게시·중단 복구와 최종 검증 경계 연결
+
+- Targeted unit 검증: `ImmediateRebasePublicationTests`와 `RebasePublicationRepositoryTests` 16개 및 기존 rebase 수용·소유권 case 4개 통과. 실제 Git lifecycle 테스트와 전체 verify는 Worker가 실행하지 않고 Loop Manager 검증에 맡긴다.
 
 ## Decision Log
 
 - G-100·G-101은 R-045의 rebase 완료·오류 차단 복구를 맡는다. 이 계획은 그 결과를 게시하는 R-047의 새 순서와 legacy 다중 rebase 게시 증거만 다룬다.
 - 2026-09-30: mutable READY snapshot token `5d5162255574800d9d989ed1db28373663ca028d91b2faab321d45e609690e8e`, 기준 revision `d9769d7a5b437ceddc2efdeb87f9cc3bda2c74da`와 원본 hash 일치를 확인해 개정했다. R-048은 위 과거 Decision의 완료 증거 정책을 대체한다. G-109에 의존해 현재 상태 수용 결과를 게시에 사용하고 R-047의 검증 전 중간 게시 순서는 유지한다.
+
+- 2026-09-30: G-109 현재 상태 수용 결과를 재검사하는 `managed_rebase_publication.py`에 중간 게시를 분리했다. `rebase_publish` intent는 최종 PR 게시와 독립적이며 정확한 원격 lease와 후보 HEAD를 고정한다. 기존 checkpoint JSON 저장과 runtime transaction을 사용해 비호환 SQLite schema 변경 없이 게시 감사·마지막 채택 OID를 함께 반영한다.
+- 2026-09-30: 게시 뒤에도 기존 blocked checkpoint identity와 rebase 감사는 보존한다. 원격 OID 갱신 외 phase·Worker·verify·Review·차단 상태를 게시 완료로 승인하지 않는다. 실제 Git lifecycle 시나리오는 전체 verify용으로 작성했고 Worker는 실행하지 않았다.

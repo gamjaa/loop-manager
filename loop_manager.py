@@ -10880,7 +10880,7 @@ def begin_agent_scope(
             _current_rebase_service(connection, Path(repo), state_dir, repo,
                                     plan_id, worktree, row['branch']).require_owned()
             effective = managed_rebase_adoption.selected_baseline(
-                stored, current, row['branch'], str(worktree.resolve()))
+                stored, current, row['branch'], str(worktree.resolve()), publication=checkpoint)
             managed_rebase_adoption.remember_agent_baseline(
                 execution_checkpoint_state.ExecutionCheckpointRepository(connection),
                 repo, plan_id, stored, effective, role_name)
@@ -13526,7 +13526,8 @@ def validate_persisted_agent_scope(
                 external_worktree=repo_path, base_branch=str(project['base_branch']))
         def accepted_baseline(value):
             return managed_rebase_adoption.selected_baseline(
-                value, current, project['branch'], str(saved_worktree.resolve()))
+                value, current, project['branch'], str(saved_worktree.resolve()),
+                publication=rebase_checkpoint)
         rebase_scope_normalized = True
         before = accepted_baseline(before)
         if result is not None:

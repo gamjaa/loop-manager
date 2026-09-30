@@ -13,6 +13,7 @@ import rebase_file_evidence
 import manager_git_journal
 import managed_rebase_evidence
 import managed_rebase_adoption
+import managed_rebase_publication
 from managed_rebase_validation import RebaseStatus, valid_acceptance
 import notifications
 import recovery_state
@@ -309,7 +310,8 @@ class ExecutionHandlers:
                 context, row, remote_oid, current, checkpoint, pull_request)
         if current is not None and ((current.snapshot or {}).get('current_rebase_acceptance')
                 or (current.snapshot or {}).get('completed_rebase')
-                or (current.snapshot or {}).get('rebase_completion')):
+                or (current.snapshot or {}).get('rebase_completion')
+                or self._legacy_current_rebase(context, current)):
             return self._owned_persisted_rebase(
                 context, row, remote_oid, current, checkpoint, pull_request,
             )
@@ -404,7 +406,7 @@ class ExecutionHandlers:
                 return False
             pending_push = (
                 current.operation == 'push'
-                and (current.snapshot or {}).get('remote_before') == original
+                and (current.snapshot or {}).get('remote_before') == recorded
                 and current.expected_head == local == remote_oid
                 and remote_oid != original
                 and recorded in (original, remote_oid)
@@ -440,12 +442,18 @@ class ExecutionHandlers:
         recorded = str(row['publication_remote_oid'] or original)
         if not original or row['pr_url']:
             return False
+        intermediate = (current.snapshot or {}).get('rebase_publication_intent') or {}
+        pending_intermediate = (current.operation == 'rebase_publish'
+                                and intermediate.get('remote_before') == recorded
+                                and remote_oid in (recorded, intermediate.get('head')))
         pending_push = (current.operation == 'push'
-                        and (current.snapshot or {}).get('remote_before') == original
+                        and (current.snapshot or {}).get('remote_before') == recorded
                         and remote_oid == current.expected_head)
         pushed = ((current.snapshot or {}).get('pushed_checkpoint_head') == remote_oid
                   and recorded == remote_oid)
-        if not ((remote_oid == original and recorded == original) or pending_push or pushed):
+        if not ((remote_oid == original and recorded == original) or pending_push or pushed
+                or pending_intermediate
+                or (remote_oid == recorded and (current.snapshot or {}).get('last_adopted_remote_oid') == recorded)):
             return False
         if pull_request is not None and (current.operation != 'pr_create'
                                         or pull_request.get('headRefOid') != remote_oid):
@@ -948,7 +956,11 @@ class ExecutionHandlers:
         checkpoint = self.effects.checkpoint
         if checkpoint is None:
             return
+        self._publish_rebased_checkpoint(context)
         current = checkpoint.get(self.repo, context.plan.plan_id)
+        if self._legacy_current_rebase(context, current):
+            self._complete_rebase_intent(context)
+            current = checkpoint.get(self.repo, context.plan.plan_id)
         if current.operation == 'rebase':
             # Reentry observes the saved operation before deciding another step.
             observed, decision = self._current_rebase_service(context).require_owned()
@@ -1399,6 +1411,24 @@ class ExecutionHandlers:
                 return reject('approved blob')
         return True
 
+    def _legacy_current_rebase(self, context, current):
+        # A persisted target beyond the adopted remote base identifies legacy
+        # pending rebase work without inventing execution receipts. This only
+        # selects the common G-109 ownership/scope check; it grants no push.
+        if (current.operation is not None or not current.target_base_oid
+                or not current.expected_head or not current.observed_remote_oid
+                or current.expected_head == current.observed_remote_oid
+                or (current.snapshot or {}).get('current_rebase_acceptance')):
+            return False
+        row = self._row()
+        if row['pr_url'] or row['pr_conflict_recovery']:
+            return False
+        ancestry = self.effects.workspace.git(self.repo_path, 'merge-base', '--is-ancestor',
+            current.target_base_oid, current.observed_remote_oid, check=False)
+        if ancestry.returncode not in (0, 1):
+            raise manager_git_journal.MutationEvidenceError('legacy rebase target ancestry unavailable')
+        return ancestry.returncode == 1
+
     def _complete_rebase_intent(self, context, *, project_values=None):
         checkpoint = self.effects.checkpoint
         if checkpoint is None:
@@ -1406,7 +1436,8 @@ class ExecutionHandlers:
         current = checkpoint.get(self.repo, context.plan.plan_id)
         saved = current.snapshot or {}
         legacy_completed = (current.operation is None and not saved.get('current_rebase_acceptance')
-                            and (saved.get('completed_rebase') or saved.get('rebase_completion')))
+                            and (saved.get('completed_rebase') or saved.get('rebase_completion')
+                                 or self._legacy_current_rebase(context, current)))
         if current.operation != 'rebase' and not legacy_completed:
             return
         service = self._current_rebase_service(context)
@@ -1416,6 +1447,20 @@ class ExecutionHandlers:
                 checkpoint.get(self.repo, context.plan.plan_id)):
             raise manager_git_journal.MutationEvidenceError('current checkpoint remote ownership differs')
         service.adopt(self.effects.state, checkpoint)
+        self._publish_rebased_checkpoint(context)
+
+    def _publish_rebased_checkpoint(self, context):
+        if self.effects.checkpoint is None:
+            return
+        managed_rebase_publication.publish_checkpoint(
+            state=self.effects.state, checkpoints=self.effects.checkpoint,
+            repo=self.repo, plan_id=context.plan.plan_id, repo_path=self.repo_path,
+            worktree=context.worktree, branch=context.branch,
+            service=lambda **options: self._current_rebase_service(context, **options),
+            owns_remote=lambda oid, selected: self._owned_checkpoint_remote(
+                context, self._row(), oid, selected),
+            git=self.effects.workspace.git,
+            lookup_pr=self.effects.publication.pr_for_branch)
 
     def _publication_intent(self, context, operation, remote_oid):
         checkpoint = self.effects.checkpoint
@@ -1539,6 +1584,9 @@ class ExecutionHandlers:
                 str(catalog['current_revision_sha'])
                 if catalog['current_revision_sha'] is not None else None,
             )
+            current = checkpoint.get(self.repo, context.plan.plan_id)
+            self._publish_rebased_checkpoint(context)
+            row = self._row()
             current = checkpoint.get(self.repo, context.plan.plan_id)
             if self.newly_activated and current.operation is None and current.expected_head:
                 adopted = valid_acceptance((current.snapshot or {}).get('current_rebase_acceptance'))
@@ -1664,7 +1712,8 @@ class ExecutionHandlers:
                 )
             if (current.operation is None and not (current.snapshot or {}).get('current_rebase_acceptance')
                     and ((current.snapshot or {}).get('completed_rebase')
-                         or (current.snapshot or {}).get('rebase_completion'))):
+                         or (current.snapshot or {}).get('rebase_completion')
+                         or self._legacy_current_rebase(context, current))):
                 self._complete_rebase_intent(context)
                 return self._context()
             if current.operation == 'rebase':
@@ -2324,6 +2373,7 @@ class ExecutionHandlers:
         """Refresh and reconcile before any phase effect consumes its snapshot."""
 
         self.effects.state.check_context(context)
+        self._publish_rebased_checkpoint(context)
         latest_sha = self._fetch_latest_base()
         try:
             result = self.effects.revision.reconcile_catalog(

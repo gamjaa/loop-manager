@@ -71,7 +71,7 @@ def needs_agent_comparison(checkpoint, original, current):
         and original.head != current.head))
 
 
-def selected_baseline(snapshot, current, branch, worktree):
+def selected_baseline(snapshot, current, branch, worktree, *, publication=None):
     """Replace only accepted selected state, keeping other refs/config intact.
 
     Callers validate actual Agent output first and recheck current ownership.
@@ -80,6 +80,20 @@ def selected_baseline(snapshot, current, branch, worktree):
     refs, worktrees = dict(snapshot.refs), dict(snapshot.worktrees)
     ref = f'refs/heads/{branch}'
     refs[ref] = current.refs[ref]
+    if publication is not None:
+        intent = publication.rebase_publication_intent()
+        result = (publication.snapshot or {}).get('rebase_publication_result') or {}
+        if (intent is not None and result.get('intent_id') == intent['id']
+                and result.get('head') == intent['head']
+                and (intent['branch'], intent['worktree']) == (branch, worktree)
+                and publication.observed_remote_oid == intent['head']):
+            # Only a confirmed intermediate publication may account for its
+            # selected tracking ref. Unrelated shared refs stay at the original
+            # Agent baseline and remain subject to scope violation checks.
+            remote_ref = f'refs/remotes/origin/{branch}'
+            if current.refs.get(remote_ref) != (intent['head'], ''):
+                raise MutationEvidenceError('published comparison remote ref changed')
+            refs[remote_ref] = current.refs[remote_ref]
     worktrees[worktree] = current.worktrees[worktree]
     return replace(snapshot, head=current.head, branch=current.branch,
                    index=current.index, dirty=current.dirty,

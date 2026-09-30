@@ -133,6 +133,31 @@ class ExecutionStatePort:
                 worker_session=expected.worker_session_id,
             )
 
+    def complete_rebase_publication(self, checkpoints, *, intent, acceptance, reobserve):
+        """Atomically advance the lease without approving or unblocking a candidate."""
+        if checkpoints.connection is not self.connection:
+            raise runtime_state.RuntimeStateError('intermediate publication database differs')
+        with runtime_state._transaction(self.connection):
+            expected = self.check()
+            if (expected is None or expected.repo != intent['repo']
+                    or expected.plan_id != intent['plan_id']
+                    or expected.branch != intent['branch'] or expected.worktree != intent['worktree']
+                    or expected.workspace_owned != 1 or expected.pr_url
+                    or expected.publication_remote_oid not in (None, intent['remote_before'], intent['head'])):
+                raise runtime_state.RuntimeStateError('intermediate publication owner changed')
+            oid, checked = reobserve()
+            if oid != intent['head'] or checked != acceptance:
+                raise runtime_state.RuntimeStateError('intermediate publication observation changed')
+            before = checkpoints.get(self.repo, self.plan_id)
+            completed = checkpoints.finish_rebase_publication(self.repo, self.plan_id,
+                                                             intent=intent, acceptance=acceptance)
+            if completed == before and expected.publication_remote_oid == intent['head']:
+                return
+            updated = self.repository.transition_from_snapshot(
+                expected, plan_values={'publication_remote_oid': intent['head']},
+                project_values={'publication_remote_oid': intent['head']})
+        self.expected = updated
+
     def open_pull_request(self, repo, **values):
         if repo != self.repo:
             raise runtime_state.RuntimeStateError("execution repository identity 불일치")
