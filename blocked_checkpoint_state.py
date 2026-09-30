@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+import json
 import sqlite3
 import notifications
 
@@ -11,6 +12,7 @@ from blocked_checkpoint import (
     CheckpointPhase,
     CheckpointRequest,
     PreparedCheckpoint,
+    checkpoint_identity,
 )
 
 
@@ -43,6 +45,7 @@ CREATE TABLE IF NOT EXISTS blocked_checkpoints (
     result TEXT,
     unpublished_reason TEXT,
     retryable INTEGER NOT NULL DEFAULT 0,
+    publication_history TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (repo, plan_id),
@@ -66,6 +69,8 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
             "ALTER TABLE blocked_checkpoints ADD COLUMN inspection_retryable "
             "INTEGER NOT NULL DEFAULT 0"
         )
+    if "publication_history" not in columns:
+        connection.execute("ALTER TABLE blocked_checkpoints ADD COLUMN publication_history TEXT NOT NULL DEFAULT '[]'")
 
 
 def request_identity(
@@ -245,6 +250,16 @@ class BlockedCheckpointRepository:
         self, request: CheckpointRequest, prepared: PreparedCheckpoint
     ) -> None:
         with self.connection:
+            row = self.connection.execute(
+                'SELECT * FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?',
+                (request.repo, request.plan_id)).fetchone()
+            if row is not None and row['published_oid'] and row['commit_identity']:
+                publication = {key: row[key] for key in (
+                    'published_oid', 'accepted_remote_oid', 'commit_identity', 'tree_oid',
+                    'identity_reason_code', 'identity_evidence')}
+                history = json.loads(row['publication_history'])
+                if not history or history[-1] != publication:
+                    self._update(request, publication_history=json.dumps([*history, publication], sort_keys=True))
             self._update(
                 request,
                 phase=CheckpointPhase.PREPARED.value,
@@ -257,6 +272,46 @@ class BlockedCheckpointRepository:
                 unpublished_reason=None,
                 retryable=0,
             )
+
+    def refresh(self, request: CheckpointRequest, *, expected_remote_oid: str | None) -> None:
+        """Reopen a terminal request, retaining its last published ownership."""
+        current = self.get(request.repo, request.plan_id)
+        if current.request_identity != request.request_identity:
+            raise RuntimeError("checkpoint refresh identity가 변경됐습니다.")
+        if current.phase not in {CheckpointPhase.PUBLISHED, CheckpointPhase.UNPUBLISHED}:
+            return
+        with self.connection:
+            self._update(
+                request, phase=CheckpointPhase.REQUESTED.value,
+                expected_remote_oid=expected_remote_oid, remote_observed=1,
+                result=None, unpublished_reason=None, retryable=0,
+            )
+
+    def record_rebased_publication(self, request: CheckpointRequest, head: str, tree: str) -> None:
+        """Keep the prior publication as audit and identify the new clean result.
+
+        The caller has accepted current Git state and confirmed G-104 publication.
+        This is the existing no-new-commit identity, not a synthetic Git receipt.
+        """
+        row = self.connection.execute(
+            'SELECT * FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?',
+            (request.repo, request.plan_id)).fetchone()
+        if row is None or row['request_identity'] != request.request_identity or row['phase'] != 'published':
+            raise RuntimeError('rebase checkpoint publication identity가 변경됐습니다.')
+        if row['accepted_remote_oid'] == head:
+            return
+        history = json.loads(row['publication_history'])
+        history.append({key: row[key] for key in (
+            'published_oid', 'accepted_remote_oid', 'commit_identity', 'tree_oid',
+            'identity_reason_code', 'identity_evidence')})
+        identity = checkpoint_identity(plan_id=request.plan_id, reason_code=request.reason_code,
+                                       evidence=request.evidence, parent_oid=head, tree_oid=tree,
+                                       included_paths=())
+        self._update(request, published_oid=head, accepted_remote_oid=head,
+                     local_oid=head, remote_oid=head, expected_remote_oid=head,
+                     commit_identity=identity, tree_oid=tree,
+                     identity_reason_code=request.reason_code, identity_evidence=request.evidence,
+                     publication_history=json.dumps(history, sort_keys=True))
 
     def record_local(self, request: CheckpointRequest, local_oid: str) -> None:
         with self.connection:

@@ -14,8 +14,154 @@ import loop_manager
 import notifications
 import runtime_state
 import scoped_blocking
+import checkpoint_ownership
+import blocked_plan_reconciliation
 from scoped_blocking import BlockReasonCode
 from worker_session import SessionBinding
+
+
+class BlockedCheckpointRefreshUnitTests(unittest.TestCase):
+    def setUp(self):
+        self.connection = sqlite3.connect(':memory:')
+        self.connection.row_factory = sqlite3.Row
+        self.addCleanup(self.connection.close)
+        self.connection.execute(loop_manager.SCHEMA)
+        loop_manager._ensure_execplans_schema(self.connection)
+        self.connection.execute("INSERT INTO projects (repo, base_branch) VALUES ('repo', 'main')")
+        self.connection.execute(
+            "INSERT INTO exec_plans (repo, plan_id, path, title, sources, depends_on, priority, content_hash, status) "
+            "VALUES ('repo', 'G-106', 'docs/plans/[G-106] Work.md', 'Work', '[]', '[]', 'critical', 'hash', 'PLAN_BLOCKED')")
+        self.store = blocked_checkpoint_state.BlockedCheckpointRepository(self.connection)
+        self.request = self.store.request(repo='repo', plan_id='G-106', reason_code='verify_retry_exhausted',
+                                          evidence='original failure', branch='loop-manager/G-106', worktree='/state/G-106',
+                                          expected_remote_oid='a' * 40, rebase_recovery=False)
+        self.store.record_prepared(self.request, blocked_checkpoint.PreparedCheckpoint(
+            'a' * 40, 'c' * 40, 'identity', 'message', ()))
+        self.store.finish_published(self.request, 'a' * 40)
+
+    def row(self):
+        return self.connection.execute('SELECT * FROM blocked_checkpoints').fetchone()
+
+    def test_refresh_keeps_published_ownership_and_same_request(self):
+        request = self.store.get('repo', 'G-106')
+        self.store.refresh(request, expected_remote_oid='a' * 40)
+        row = self.row()
+        self.assertEqual(row['phase'], 'requested')
+        self.assertEqual(row['published_oid'], 'a' * 40)
+        self.assertEqual(row['commit_identity'], 'identity')
+        self.assertEqual(row['request_identity'], request.request_identity)
+        self.assertEqual(row['evidence'], 'original failure')
+
+    def test_refresh_does_not_overwrite_pending_push_lease(self):
+        request = self.store.get('repo', 'G-106')
+        self.store.refresh(request, expected_remote_oid='a' * 40)
+        self.store.record_local(request, 'b' * 40)
+        self.store.finish_unpublished(request, 'network error', retryable=True)
+        self.store.refresh(self.store.get('repo', 'G-106'), expected_remote_oid='different')
+        row = self.row()
+        self.assertEqual(row['phase'], 'retry_pending')
+        self.assertEqual(row['expected_remote_oid'], 'a' * 40)
+        self.assertEqual(row['local_oid'], 'b' * 40)
+
+    def test_rebased_result_preserves_prior_identity_and_accepts_next_successor(self):
+        request = self.store.get('repo', 'G-106')
+        with self.connection:
+            self.store.record_rebased_publication(request, 'b' * 40, 'd' * 40)
+        first = dict(self.row())
+        with self.connection:
+            self.store.record_rebased_publication(request, 'b' * 40, 'd' * 40)
+        self.assertEqual(dict(self.row()), first)
+        history = json.loads(self.row()['publication_history'])
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]['published_oid'], 'a' * 40)
+        self.assertEqual(history[0]['commit_identity'], 'identity')
+        self.assertEqual(self.row()['reason_code'], 'verify_retry_exhausted')
+        def git(_, *args, **kwargs):
+            output = ''
+            if args[:1] == ('rev-parse',):
+                output = 'd' * 40
+            elif args[:1] == ('show',):
+                output = 'Rebased result with no checkpoint trailer'
+            elif args[:1] == ('ls-remote',):
+                output = 'b' * 40 + '\trefs/heads/loop-manager/G-106\n'
+            return mock.Mock(returncode=0, stdout=output)
+        self.assertEqual(checkpoint_ownership.owned_remote_oid(
+            self.connection, Path('/repo'), 'repo', 'G-106', 'loop-manager/G-106',
+            Path('/state/G-106'), 'b' * 40, git, before_head='b' * 40, recorded_oid='b' * 40), 'b' * 40)
+
+    def test_refresh_preparation_retains_old_publication_audit(self):
+        request = self.store.get('repo', 'G-106')
+        self.store.refresh(request, expected_remote_oid='a' * 40)
+        prepared = blocked_checkpoint.PreparedCheckpoint('a' * 40, 'new-tree', 'new-identity', 'new-message', ())
+        self.store.record_prepared(request, prepared)
+        history = json.loads(self.row()['publication_history'])
+        self.assertEqual(history[0]['commit_identity'], 'identity')
+        self.assertEqual(self.row()['commit_identity'], 'new-identity')
+
+    def _adoption(self, *, fetched_oid=None, observed_oid=None):
+        branch, worktree = 'loop-manager/G-106', '/state/G-106'
+        original, successor = 'a' * 40, 'b' * 40
+        self.connection.execute("UPDATE projects SET origin = 'example/repo'")
+        self.connection.execute(
+            "UPDATE exec_plans SET branch = ?, worktree = ?, workspace_owned = 1, blocked_reason = 'verify_retry_exhausted'",
+            (branch, worktree))
+        self.connection.execute(
+            "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+            "VALUES ('repo', 'G-106', 'plan', 'verify_retry_exhausted', 'original failure')")
+        self.connection.commit()
+        plan = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        snapshot = loop_manager.GitSnapshot(original, branch, {}, {},
+                                            {f'refs/heads/{branch}': (original, '')},
+                                            {worktree: (f'branch=refs/heads/{branch}',)}, {}, {})
+        def git(_, *args, **kwargs):
+            output = ''
+            if args[:2] == ('remote', 'get-url'):
+                output = 'https://github.com/example/repo'
+            elif args == ('rev-parse', 'FETCH_HEAD^{commit}'):
+                output = fetched_oid or successor
+            elif args == ('rev-parse', 'HEAD^{commit}'):
+                output = successor
+            elif args[:1] == ('ls-tree',):
+                output = '100644 blob ' + successor + '\tcode.py'
+            return subprocess.CompletedProcess([], 0, output)
+        with (mock.patch.object(loop_manager, '_BlockedCheckpointAdapter') as adapter,
+              mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
+              mock.patch.object(loop_manager, 'validate_managed_worktree'),
+              mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=snapshot),
+              mock.patch.object(loop_manager, '_nul_git_paths', side_effect=lambda _, *args:
+                                ('code.py',) if args[0] == 'diff' else ()),
+              mock.patch.object(loop_manager, '_published_plan_allows_common_plans', return_value=False),
+              mock.patch.object(loop_manager, '_blocked_execplan_revision_metadata_error', return_value=None),
+              mock.patch.object(loop_manager, 'git', side_effect=git) as commands,
+              mock.patch.object(loop_manager, '_evaluate_remote_checkpoint_cause') as evaluate):
+            adapter.return_value.observe_remote.return_value = observed_oid or successor
+            adapter.return_value._approved_guidance_targets.return_value = ()
+            result = loop_manager._reconcile_published_blocked_checkpoint(
+                self.connection, Path('/repo'), Path('/state'), 'repo', plan, self.row(),
+                self.store.get('repo', 'G-106'), self.store, adopt_only=True, expected_remote_oid=successor)
+        evaluate.assert_not_called()
+        self.assertEqual(scoped_blocking.plan_block(self.connection, 'repo', 'G-106')['evidence'], 'original failure')
+        return result, commands
+
+    def test_adoption_defers_cause_check_and_records_exact_successor_lease(self):
+        result, _ = self._adoption()
+        self.assertEqual(result, 'adopted')
+        self.assertEqual(self.row()['accepted_remote_oid'], 'b' * 40)
+        self.assertEqual(self.connection.execute('SELECT publication_remote_oid FROM exec_plans').fetchone()[0], 'b' * 40)
+        checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get('repo', 'G-106')
+        self.assertEqual(checkpoint.observed_remote_oid, 'b' * 40)
+        self.assertIsNone(checkpoint.operation)
+
+    def test_adoption_fetch_race_does_not_fast_forward_or_change_accepted_oid(self):
+        result, commands = self._adoption(fetched_oid='c' * 40)
+        self.assertEqual(result, 'blocked')
+        self.assertEqual(self.row()['accepted_remote_oid'], 'a' * 40)
+        self.assertFalse(any('merge' in call.args for call in commands.call_args_list))
+
+    def test_adoption_observation_race_is_refused_before_fetch(self):
+        result, commands = self._adoption(observed_oid='c' * 40)
+        self.assertEqual(result, 'blocked')
+        commands.assert_not_called()
 
 
 class BlockedCheckpointPolicyTest(unittest.TestCase):
@@ -266,6 +412,156 @@ class BlockedCheckpointPolicyTest(unittest.TestCase):
 
 
 class BlockedCheckpointGitAdapterTest(unittest.TestCase):
+    # Real Git histories belong to Manager full verify, never Worker targeted runs.
+    def _remote_refresh_fixture(self, *, base_changed=False, branch_changed=False):
+        self.block()
+        (self.worktree / 'code.py').write_text('checkpoint\n', encoding='utf-8')
+        repo = str(self.repo.resolve())
+        loop_manager.dispatch_blocked_checkpoints(self.connection, self.repo, self.state_dir, repo)
+        published = self.run_git(self.worktree, 'rev-parse', 'HEAD')
+        if branch_changed:
+            self.user_commit()
+        if base_changed:
+            (self.repo / 'dependency.py').write_text('dependency = True\n', encoding='utf-8')
+            self.run_git(self.repo, 'add', 'dependency.py')
+            self.run_git(self.repo, 'commit', '-m', 'Advance dependency without changing specification')
+            self.run_git(self.repo, 'push', 'origin', 'main')
+        project = self.connection.execute('SELECT * FROM projects WHERE repo = ?', (repo,)).fetchone()
+        loop_manager.observe_blocked_plan_remotes(self.connection, self.repo, repo, project)
+        return repo, published
+
+    def _assert_remote_refresh(self, *, base_changed, branch_changed, resolved):
+        repo, published = self._remote_refresh_fixture(base_changed=base_changed, branch_changed=branch_changed)
+        source_head = self.run_git(self.repo, 'rev-parse', 'HEAD')
+        with mock.patch.object(loop_manager, '_evaluate_remote_checkpoint_cause',
+                               return_value=(resolved, 'original cause assessment', None)) as assess:
+            self.assertEqual(loop_manager.resume_plan_blocks(
+                self.connection, self.repo, self.state_dir, repo, 'main'), resolved)
+            plan = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id = 'G-034'").fetchone()
+            head = self.run_git(self.worktree, 'rev-parse', 'HEAD')
+            self.assertEqual(plan['status'], 'IMPLEMENTING' if resolved else 'PLAN_BLOCKED')
+            self.assertEqual(self.run_git(self.repo, 'rev-parse', 'HEAD'), source_head)
+            if base_changed:
+                self.run_git(self.worktree, 'merge-base', '--is-ancestor', source_head, head)
+                self.assertNotEqual(head, published)
+            if branch_changed:
+                self.assertEqual((self.worktree / 'code.py').read_text(), 'corrected\n')
+            remote = loop_manager._BlockedCheckpointAdapter(self.connection, self.repo, self.state_dir, repo).observe_remote(
+                blocked_checkpoint_state.BlockedCheckpointRepository(self.connection).get(repo, 'G-034'))
+            self.assertEqual(remote, head)
+            if not resolved:
+                assess.reset_mock()
+                with mock.patch.object(loop_manager, '_journaled_direct_rebase') as rebase:
+                    self.assertFalse(loop_manager.resume_plan_blocks(
+                        self.connection, self.repo, self.state_dir, repo, 'main'))
+                assess.assert_not_called()
+                rebase.assert_not_called()
+
+    def test_guidance_remote_decision_resumes_after_real_base_rebase(self):
+        # Manager integration coverage: never run by the Worker.
+        from tests.test_guidance_approval import guidance_plan
+        repo = str(self.repo.resolve())
+        path = 'docs/plans/[G-034] Checkpoint.md'
+        def document(**options):
+            return (guidance_plan(**options).replace('G-020', 'G-034')
+                    .replace('title: Guidance', 'title: Checkpoint')
+                    .replace('priority: high', 'priority: critical'))
+        (self.repo / 'AGENTS.md').write_text('# Agents\n', encoding='utf-8')
+        (self.repo / path).write_text(document(), encoding='utf-8')
+        self.run_git(self.repo, 'add', 'AGENTS.md', path)
+        self.run_git(self.repo, 'commit', '-m', 'Guidance proposal fixture')
+        self.run_git(self.repo, 'push', 'origin', 'main')
+        self.run_git(self.worktree, 'merge', '--ff-only', 'origin/main')
+        initial = loop_manager.capture_git_snapshot(self.worktree)
+        self.connection.execute(
+            "UPDATE exec_plans SET agent_role = 'worker', agent_snapshot = ?, worker_session_id = 'session'",
+            (initial.serialize(),))
+        self.connection.commit()
+        (self.worktree / 'code.py').write_text('checkpoint work\n', encoding='utf-8')
+        plan = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        pending = loop_manager.parse_guidance_document(document())
+        with mock.patch.object(loop_manager, 'is_loop_manager_repository', return_value=False):
+            loop_manager._block_for_new_guidance(self.connection, self.repo, repo, self.worktree,
+                plan, pending, pending.proposals, 'proposal')
+            loop_manager.dispatch_blocked_checkpoints(self.connection, self.repo, self.state_dir, repo)
+        checkpoint = blocked_checkpoint_state.BlockedCheckpointRepository(self.connection).get(repo, 'G-034')
+        self.assertEqual(checkpoint.phase.value, 'published')
+        snapshot = self.connection.execute('SELECT agent_snapshot FROM exec_plans').fetchone()[0]
+        successor = self.user_commit(path, document(decision='approve', revision='user-1'))
+        (self.repo / 'dependency.py').write_text('dependency = True\n', encoding='utf-8')
+        self.run_git(self.repo, 'add', 'dependency.py')
+        self.run_git(self.repo, 'commit', '-m', 'Advance base after guidance checkpoint')
+        self.run_git(self.repo, 'push', 'origin', 'main')
+        project = self.connection.execute('SELECT * FROM projects').fetchone()
+        loop_manager.observe_blocked_plan_remotes(self.connection, self.repo, repo, project)
+        original_resume = loop_manager.resume_guidance_approval_if_decided
+        def resume(*args, **kwargs):
+            self.assertEqual(self.connection.execute('SELECT agent_snapshot FROM exec_plans').fetchone()[0], snapshot)
+            return original_resume(*args, **kwargs)
+        with (mock.patch.object(loop_manager, 'is_loop_manager_repository', return_value=False),
+              mock.patch.object(loop_manager, 'resume_guidance_approval_if_decided', side_effect=resume)):
+            self.assertTrue(loop_manager.resume_plan_blocks(self.connection, self.repo, self.state_dir, repo, 'main'),
+                            self.connection.execute('SELECT last_error FROM exec_plans').fetchone()[0])
+        head = self.run_git(self.worktree, 'rev-parse', 'HEAD')
+        self.assertNotEqual(head, successor)
+        self.run_git(self.worktree, 'merge-base', '--is-ancestor', 'origin/main', head)
+        self.assertEqual(self.connection.execute('SELECT status FROM exec_plans').fetchone()[0], 'IMPLEMENTING')
+        self.assertEqual(self.connection.execute('SELECT decision FROM guidance_approvals').fetchone()[0], 'approve')
+        self.assertEqual(self.connection.execute('SELECT worker_session_id FROM exec_plans').fetchone()[0], 'session')
+
+    def test_remote_refresh_base_only_with_same_specification(self):
+        self._assert_remote_refresh(base_changed=True, branch_changed=False, resolved=False)
+
+    def test_remote_refresh_successor_only_keeps_unresolved_cause(self):
+        self._assert_remote_refresh(base_changed=False, branch_changed=True, resolved=False)
+
+    def test_remote_refresh_adopts_successor_before_new_base_and_resumes(self):
+        self._assert_remote_refresh(base_changed=True, branch_changed=True, resolved=True)
+
+    def test_remote_refresh_simultaneous_changes_remain_blocked_and_are_idempotent(self):
+        self._assert_remote_refresh(base_changed=True, branch_changed=True, resolved=False)
+
+    def test_remote_refresh_completed_git_effect_survives_before_stage_persistence(self):
+        repo, _ = self._remote_refresh_fixture(base_changed=True, branch_changed=True)
+        save = blocked_plan_reconciliation.BlockedPlanReconciler._save
+        interrupted = False
+        def save_after_git(instance, plan_id, key, stage, context):
+            nonlocal interrupted
+            if stage == 'incorporated' and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt()
+            return save(instance, plan_id, key, stage, context)
+        with (mock.patch.object(blocked_plan_reconciliation.BlockedPlanReconciler, '_save', new=save_after_git),
+              mock.patch.object(loop_manager, '_evaluate_remote_checkpoint_cause', return_value=(False, 'same cause', None))):
+            with self.assertRaises(KeyboardInterrupt):
+                loop_manager.resume_plan_blocks(self.connection, self.repo, self.state_dir, repo, 'main')
+            head = self.run_git(self.worktree, 'rev-parse', 'HEAD')
+            with mock.patch.object(loop_manager, '_journaled_direct_rebase') as rebase:
+                self.assertFalse(loop_manager.resume_plan_blocks(self.connection, self.repo, self.state_dir, repo, 'main'))
+            rebase.assert_not_called()
+        self.assertEqual(self.run_git(self.worktree, 'rev-parse', 'HEAD'), head)
+
+    def test_remote_refresh_manual_conflict_completion_has_no_worker_receipts(self):
+        repo, _ = self._remote_refresh_fixture()
+        (self.repo / 'code.py').write_text('base change\n', encoding='utf-8')
+        self.run_git(self.repo, 'add', 'code.py')
+        self.run_git(self.repo, 'commit', '-m', 'Conflicting base change')
+        self.run_git(self.repo, 'push', 'origin', 'main')
+        project = self.connection.execute('SELECT * FROM projects WHERE repo = ?', (repo,)).fetchone()
+        loop_manager.observe_blocked_plan_remotes(self.connection, self.repo, repo, project)
+        with mock.patch.object(loop_manager, '_evaluate_remote_checkpoint_cause', return_value=(False, 'same cause', None)) as assess:
+            self.assertFalse(loop_manager.resume_plan_blocks(self.connection, self.repo, self.state_dir, repo, 'main'))
+            assess.assert_not_called()
+            self.assertTrue(self.run_git(self.worktree, 'ls-files', '-u'))
+            (self.worktree / 'code.py').write_text('manual resolution\n', encoding='utf-8')
+            self.run_git(self.worktree, 'add', 'code.py')
+            self.run_git(self.worktree, '-c', 'core.editor=true', 'rebase', '--continue')
+            project = self.connection.execute('SELECT * FROM projects WHERE repo = ?', (repo,)).fetchone()
+            loop_manager.observe_blocked_plan_remotes(self.connection, self.repo, repo, project)
+            self.assertFalse(loop_manager.resume_plan_blocks(self.connection, self.repo, self.state_dir, repo, 'main'))
+            assess.assert_called_once()
+        self.assertEqual((self.worktree / 'code.py').read_text(), 'manual resolution\n')
+
     def test_clean_checkpoint_identity_survives_reclassification(self):
         import checkpoint_ownership
         repo = str(self.repo.resolve())

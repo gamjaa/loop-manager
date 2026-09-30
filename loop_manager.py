@@ -58,6 +58,7 @@ import work_exhaustion
 import reviewer_specification
 import blocked_checkpoint
 import blocked_checkpoint_state
+import blocked_plan_reconciliation
 import blocked_remote_observation
 import execplan_archive
 import execplan_archive_state
@@ -10889,7 +10890,7 @@ def begin_agent_scope(
     input_fingerprint: str | None = None,
 ) -> GitSnapshot:
     row = connection.execute(
-        "SELECT agent_role, agent_snapshot, agent_input_fingerprint, plan_path, branch "
+        "SELECT * "
         "FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
@@ -10913,8 +10914,9 @@ def begin_agent_scope(
         stored = GitSnapshot.deserialize(str(row['agent_snapshot']))
         plan_id = _plan_id_from_path(str(row['plan_path'] or ''))
         checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, plan_id or '')
-        if plan_id and (checkpoint.operation == 'rebase'
-                        or (checkpoint.snapshot or {}).get('current_rebase_acceptance')):
+        if (plan_id and not blocked_plan_reconciliation.remote_adoption_is_current(checkpoint)
+                and (checkpoint.operation == 'rebase'
+                     or (checkpoint.snapshot or {}).get('current_rebase_acceptance'))):
             current = capture_git_snapshot(worktree)
             if not managed_rebase_adoption.needs_agent_comparison(checkpoint, stored, current):
                 return stored
@@ -10928,6 +10930,17 @@ def begin_agent_scope(
             managed_rebase_adoption.remember_agent_baseline(
                 execution_checkpoint_state.ExecutionCheckpointRepository(connection),
                 repo, plan_id, stored, effective, role_name)
+            return effective
+        if plan_id and (checkpoint.snapshot or {}).get('remote_adoption_scope'):
+            current = capture_git_snapshot(worktree)
+            effective, _ = _remote_adoption_agent_baseline(
+                connection, repo, plan_id, worktree, row, stored, current, checkpoint)
+            validate_agent_scope(role_name, worktree, effective, current,
+                                 selected_plan_path=row['plan_path'] if role_name == 'worker' else None,
+                                 allowed_guidance_targets=_guidance_worker_targets(connection, repo, plan_id),
+                                 allow_common_plans=_published_plan_allows_common_plans(
+                                     Path(repo), project_execplan(connection, repo)),
+                                 external_worktree=Path(repo), base_branch=row['base_branch'])
             return effective
         return stored
     preliminary_snapshot = capture_git_snapshot(worktree)
@@ -12204,6 +12217,7 @@ def _plan_block_selected_for_release(
     *,
     blocked_reason: str | None = None,
     require_fingerprint: bool = False,
+    plan_id: str | None = None,
 ) -> sqlite3.Row | None:
     """Return the mirrored block, or hydrate one uniquely matching block."""
 
@@ -12215,6 +12229,12 @@ def _plan_block_selected_for_release(
             and (not require_fingerprint or candidate["blocked_fingerprint"])
         )
 
+    if plan_id is not None:
+        plan = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+            (repo, plan_id),
+        ).fetchone()
+        return plan if matches(plan) else None
     plan = project_execplan(connection, repo)
     if matches(plan):
         return plan
@@ -12241,11 +12261,13 @@ def resume_guidance_approval_if_decided(
     repo: str,
     base: str,
     state_dir: Path,
+    *, plan_id: str | None = None,
 ) -> bool:
     plan = _plan_block_selected_for_release(
         connection,
         repo,
         blocked_reason=GUIDANCE_BLOCK_REASON,
+        plan_id=plan_id,
     )
     if plan is None:
         return False
@@ -12272,6 +12294,15 @@ def resume_guidance_approval_if_decided(
             allow_existing=True,
             allow_rebase=resuming_rebase,
         )
+        checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
+            repo, str(plan['plan_id']))
+        accepted_rebase = bool((checkpoint.snapshot or {}).get('current_rebase_acceptance'))
+        if accepted_rebase:
+            _, decision = _current_rebase_service(
+                connection, repo_path, state_dir, repo, str(plan['plan_id']),
+                worktree, branch).require_owned(checkpoint=checkpoint)
+            if checkpoint.operation is not None or decision.status.value != 'complete':
+                return False
         validate_blocked_agent_scope(
             connection,
             repo_path,
@@ -12279,6 +12310,7 @@ def resume_guidance_approval_if_decided(
             base,
             worktree,
             str(plan["path"]),
+            accepted_rebase=accepted_rebase, saved_plan=plan,
         )
         document = _guidance_document(worktree, str(plan["path"]))
         if document is None:
@@ -12709,20 +12741,26 @@ def _update_blocked_error(
     repo: str,
     plan_id: str,
     error: str,
+    *, preserve_cause: bool = False,
 ) -> None:
     with connection:
-        runtime_state.RuntimeStateRepository(connection).transition(
-            repo,
-            plan_id,
-            plan_values={"last_error": error},
-            project_values={"last_error": error},
-            enqueue=False,
-        )
-        connection.execute(
-            "UPDATE execplan_blocks SET evidence = ?, updated_at = CURRENT_TIMESTAMP "
-            "WHERE repo = ? AND plan_id = ?",
-            (error, repo, plan_id),
-        )
+        runtime = runtime_state.RuntimeStateRepository(connection)
+        projected = runtime.projected_row(repo)
+        if preserve_cause and projected is not None and projected['plan_id'] != plan_id:
+            runtime.update_plan(repo, plan_id, plan_values={"last_error": error}, enqueue=False)
+        else:
+            runtime.transition(
+                repo, plan_id,
+                plan_values={"last_error": error},
+                project_values={"last_error": error},
+                enqueue=False,
+            )
+        if not preserve_cause:
+            connection.execute(
+                "UPDATE execplan_blocks SET evidence = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE repo = ? AND plan_id = ?",
+                (error, repo, plan_id),
+            )
         notifications.enqueue_current_project_events(connection, repo)
 
 
@@ -13368,7 +13406,7 @@ def validate_persisted_agent_scope(
 
     project = connection.execute(
         "SELECT phase, base_branch, branch, worktree, agent_role, agent_snapshot, "
-        "agent_result_snapshot, agent_manager_snapshot, plan_path FROM projects WHERE repo = ?",
+        "agent_result_snapshot, agent_manager_snapshot, agent_recovery, plan_path FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
     if project is None or not project["agent_snapshot"]:
@@ -13538,15 +13576,36 @@ def validate_persisted_agent_scope(
 
     rebase_checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
         repo, _plan_id_from_path(selected_plan_path) or '')
-    if (role_name in {'worker', 'reviewer'}
+    remote_adoption_current = blocked_plan_reconciliation.remote_adoption_is_current(rebase_checkpoint)
+    if (role_name in {'worker', 'reviewer'} and not remote_adoption_current
             and (rebase_checkpoint.snapshot or {}).get('current_rebase_agent_baseline')):
         comparison = managed_rebase_adoption.agent_comparison_baseline(
             GitSnapshot.deserialize(str(project['agent_snapshot'])),
             rebase_checkpoint.snapshot or {}, role_name)
         before = _normalize_legacy_ignored_snapshot(
             saved_worktree, _with_proven_legacy_ignore_config(comparison, current_config), current)
+    if role_name in {'worker', 'reviewer'} and remote_adoption_current:
+        plan_id = _plan_id_from_path(selected_plan_path)
+        plan = connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
+                                  (repo, plan_id)).fetchone()
+        if plan is None or plan['branch'] != project['branch'] or plan['worktree'] != str(saved_worktree):
+            raise AgentScopeError('원격 채택의 계획·worktree identity가 다릅니다.')
+        before, adoption_project = _remote_adoption_agent_baseline(
+            connection, repo, plan_id, saved_worktree, project, before, current,
+            rebase_checkpoint, saved_plan=plan)
+        if adoption_project['agent_result_snapshot'] is None:
+            result = None
+            checkpoint = None
+        else:
+            result = GitSnapshot.deserialize(str(adoption_project['agent_result_snapshot']))
+            validate_agent_scope(
+                role_name, saved_worktree, before, result,
+                selected_plan_path=selected_plan_path if role_name == 'worker' else None,
+                allowed_guidance_targets=guidance_targets, allow_common_plans=allow_common_plans,
+                external_worktree=repo_path, base_branch=str(project['base_branch']))
     rebase_scope_normalized = False
     if (role_name in {'worker', 'reviewer'} and phase != 'PLAN_BLOCKED'
+            and not remote_adoption_current
             and managed_rebase_adoption.needs_agent_comparison(rebase_checkpoint,
                 GitSnapshot.deserialize(str(project['agent_snapshot'])), current)):
         _current_rebase_service(
@@ -13764,6 +13823,67 @@ def refresh_persisted_agent_scope_after_manager_git(
     return refreshed
 
 
+def _remote_adoption_agent_baseline(connection, repo, plan_id, worktree, project, before, current,
+                                    checkpoint, *, saved_plan=None, accepted_rebase=False):
+    """Share the exact Manager adoption boundary across all Agent entry points."""
+    serialized = project['agent_snapshot']
+    adopted = (checkpoint.snapshot or {}).get('remote_adoption_scope')
+    pending = (checkpoint.snapshot or {}).get('remote_adoption_intent')
+    if pending and not accepted_rebase and saved_plan is not None:
+        request = connection.execute(
+            'SELECT request_identity, pending_remote_oid FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?',
+            (repo, plan_id)).fetchone()
+        if (request is None or request['request_identity'] != pending['request_identity']
+                or request['pending_remote_oid'] not in {None, pending['head']}
+                or pending['branch'] != saved_plan['branch'] or pending['worktree'] != str(worktree)
+                or pending['agent_snapshot'] != serialized
+                or pending['agent_result_snapshot'] != project['agent_result_snapshot']
+                or project['agent_recovery']):
+            raise AgentScopeError('미완료 원격 채택 identity가 현재 범위와 다릅니다.')
+        original = GitSnapshot.deserialize(pending['snapshot'])
+        if current.head == pending['head']:
+            own_ref = f"refs/heads/{pending['branch']}"
+            registration = current.worktrees.get(str(_canonical_path(worktree)), ())
+            if (current.branch != pending['branch'] or current.refs.get(own_ref) != (current.head, '')
+                    or f'branch={own_ref}' not in registration
+                    or current.operations or current.dirty
+                    or any(_non_default_index_flags(entries) for entries in current.index.values())
+                    or git(worktree, 'diff', '--cached', '--quiet', check=False).returncode != 0):
+                raise AgentScopeError('미완료 원격 채택의 HEAD·index·작업 범위가 다릅니다.')
+            before = managed_rebase_adoption.selected_baseline(
+                original, current, pending['branch'], str(_canonical_path(worktree)))
+            remote_ref = f"refs/remotes/origin/{pending['branch']}"
+            if current.refs.get(remote_ref) == (pending['head'], ''):
+                before = replace(before, refs={**before.refs, remote_ref: (pending['head'], '')})
+            project = {**dict(project), 'agent_result_snapshot': None}
+        elif current.head != original.head:
+            raise AgentScopeError('미완료 원격 채택과 다른 로컬 HEAD를 보존합니다.')
+        else:
+            before = original
+            project = {**dict(project), 'agent_result_snapshot': None}
+    adoption_plan = saved_plan
+    if (adopted and not accepted_rebase and adoption_plan is None
+            and connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'exec_plans'"
+            ).fetchone() is not None):
+        adoption_plan = connection.execute(
+            'SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?', (repo, plan_id)).fetchone()
+    if (adopted and not pending and not accepted_rebase and adoption_plan is not None
+            and adopted['agent_snapshot'] == serialized
+            and adopted['branch'] == adoption_plan['branch']
+            and adopted['worktree'] == str(worktree)
+            and adopted['head'] == checkpoint.expected_head
+            and adopted['head'] == checkpoint.observed_remote_oid
+            and not project['agent_recovery']):
+        # R-039 validated the preserved Agent output before the Manager's
+        # fast-forward. Compare later changes to that exact durable result;
+        # never rewrite the Agent audit or absorb subsequent local Git writes.
+        before = GitSnapshot.deserialize(adopted['snapshot'])
+        if project['agent_result_snapshot'] == adopted['agent_result_snapshot']:
+            project = {**dict(project), 'agent_result_snapshot': None}
+    return before, project
+
+
 def validate_blocked_agent_scope(
     connection: sqlite3.Connection,
     repo_path: Path,
@@ -13776,7 +13896,7 @@ def validate_blocked_agent_scope(
     """Revalidate preserved Agent output before a BLOCKED plan can resume."""
 
     project = connection.execute(
-        "SELECT agent_role, agent_snapshot, agent_result_snapshot, agent_manager_snapshot "
+        "SELECT agent_role, agent_snapshot, agent_result_snapshot, agent_manager_snapshot, agent_recovery "
         "FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
@@ -13799,6 +13919,18 @@ def validate_blocked_agent_scope(
             f"저장된 BLOCKED Agent Git snapshot이 유효하지 않습니다: {error}"
         ) from error
     current = capture_git_snapshot(worktree)
+    plan_id = _plan_id_from_path(selected_plan_path)
+    checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, plan_id)
+    if blocked_plan_reconciliation.remote_adoption_is_current(checkpoint):
+        accepted_rebase = False
+    before, project = _remote_adoption_agent_baseline(
+        connection, repo, plan_id, worktree, project, before, current, checkpoint,
+        saved_plan=saved_plan, accepted_rebase=accepted_rebase)
+    scope_result = (GitSnapshot.deserialize(str(project['agent_result_snapshot']))
+                    if project['agent_result_snapshot'] else None)
+    observed_refs = blocked_plan_reconciliation.validated_scope_refs(
+        sys.modules[__name__], connection, repo_path, repo, base, plan_id,
+        before, scope_result, current)
     if accepted_rebase:
         if role_name not in {'worker', 'reviewer'} or project['agent_recovery']:
             raise AgentScopeError('현재 rebase와 별도 Agent 복구 범위를 분리할 수 없습니다.')
@@ -13823,16 +13955,27 @@ def validate_blocked_agent_scope(
         if result is not None:
             validate_agent_scope(role_name, worktree, comparison, result, **scope_options)
         normalized = managed_rebase_adoption.selected_baseline(
-            comparison, current, str(saved_plan['branch']), str(worktree.resolve()))
+            comparison, current, str(saved_plan['branch']), str(worktree.resolve()),
+            publication=checkpoint)
+        published_refs: frozenset[str] = frozenset()
+        remote_ref = f"refs/remotes/origin/{saved_plan['branch']}"
+        if current.refs.get(remote_ref) != normalized.refs.get(remote_ref):
+            publication = connection.execute(
+                'SELECT 1 FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?',
+                (repo, plan_id)).fetchone()
+            if publication is not None:
+                request = blocked_checkpoint_state.BlockedCheckpointRepository(connection).get(repo, plan_id)
+                if _owned_checkpoint_remote_oid(connection, repo_path, request, saved_plan, current) is not None:
+                    published_refs = frozenset({remote_ref})
         validate_agent_scope(
             role_name, worktree, normalized, current,
             allowed_ref_changes=_proven_manager_base_refs(
-                connection, repo_path, repo, plan_id, before, current),
+                connection, repo_path, repo, plan_id, before, current) | published_refs | observed_refs,
             allowed_worktree_changes=_proven_merged_cleanup_paths(connection, repo, before, current),
             **scope_options)
         return
     scope_before = before
-    allowed_ref_changes: frozenset[str] = frozenset()
+    allowed_ref_changes: frozenset[str] = observed_refs
     allowed_worktree_changes: frozenset[str] = frozenset()
     allowed_worktree_changes |= _proven_merged_cleanup_paths(
         connection, repo, before, current,
@@ -15103,12 +15246,14 @@ def resume_blocked_execplan_if_inputs_changed(
     repo: str,
     base: str,
     state_dir: Path,
+    *, plan_id: str | None = None,
 ) -> bool:
     # Select rebase causes without hydrating a projection or requiring a past
     # input fingerprint. Current Git state, rather than input change, decides.
     rebase_blocks = [scoped_blocking.plan_block(connection, repo, str(block['plan_id']))
                      for block in scoped_blocking.plan_blocks(connection, repo)
-                     if rebase_block_reconciliation.could_be_rebase_evidence_block(block)]
+                     if rebase_block_reconciliation.could_be_rebase_evidence_block(block)
+                     and (plan_id is None or block['plan_id'] == plan_id)]
     if rebase_blocks:
         runtime = runtime_state.RuntimeStateRepository(connection)
         if not runtime.recovery_slot_available(repo) or runtime.active_row(repo) is not None:
@@ -15127,6 +15272,7 @@ def resume_blocked_execplan_if_inputs_changed(
         connection,
         repo,
         require_fingerprint=True,
+        plan_id=plan_id,
     )
     if plan is None:
         return False
@@ -16877,7 +17023,7 @@ def _remote_checkpoint_refusal(
     oid: str | None,
     input_identity: str,
     reason: str,
-    *, retryable: bool = False,
+    *, retryable: bool = False, preserve_cause: bool = False,
 ) -> None:
     if (
         row["inspected_remote_oid"] == oid
@@ -16890,17 +17036,23 @@ def _remote_checkpoint_refusal(
             request, oid, input_identity, reason, commit=False,
             retryable=retryable,
         )
-        runtime_state.RuntimeStateRepository(connection).transition(
-            request.repo, request.plan_id,
-            plan_values={"last_error": reason},
-            project_values={"last_error": reason},
-            enqueue=False,
-        )
-        connection.execute(
-            "UPDATE execplan_blocks SET evidence = ?, updated_at = CURRENT_TIMESTAMP "
-            "WHERE repo = ? AND plan_id = ?",
-            (reason, request.repo, request.plan_id),
-        )
+        runtime = runtime_state.RuntimeStateRepository(connection)
+        projected = runtime.projected_row(request.repo)
+        if preserve_cause and projected is not None and projected['plan_id'] != request.plan_id:
+            runtime.update_plan(request.repo, request.plan_id, plan_values={"last_error": reason}, enqueue=False)
+        else:
+            runtime.transition(
+                request.repo, request.plan_id,
+                plan_values={"last_error": reason},
+                project_values={"last_error": reason},
+                enqueue=False,
+            )
+        if not preserve_cause:
+            connection.execute(
+                "UPDATE execplan_blocks SET evidence = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE repo = ? AND plan_id = ?",
+                (reason, request.repo, request.plan_id),
+            )
         notifications.enqueue_current_project_events(connection, request.repo)
 
 
@@ -17227,6 +17379,7 @@ def _reconcile_published_blocked_checkpoint(
     repository: blocked_checkpoint_state.BlockedCheckpointRepository,
     config_path: Path | None = None,
     verify_timeout_seconds: int | None = None,
+    *, adopt_only: bool = False, expected_remote_oid: str | None = None,
 ) -> str:
     """Inspect one exact remote ref without adopting unproven or unsafe work."""
     adapter = _BlockedCheckpointAdapter(connection, repo_path, state_dir, repo)
@@ -17264,17 +17417,21 @@ def _reconcile_published_blocked_checkpoint(
     def refuse(message: str) -> str:
         _remote_checkpoint_refusal(
             connection, repository, request, row, observed, input_identity,
-            message,
+            message, preserve_cause=adopt_only,
         )
         return "blocked"
 
     def retry(message: str) -> str:
         _remote_checkpoint_refusal(
             connection, repository, request, row, observed, input_identity,
-            message, retryable=True,
+            message, retryable=True, preserve_cause=adopt_only,
         )
         return "blocked"
 
+    if adopt_only and observed != expected_remote_oid:
+        return retry("원격 checkpoint branch가 계획별 관측 이후 변경됐습니다.")
+    if adopt_only and unchanged:
+        return "unchanged"
     if (
         not row["pending_remote_oid"]
         and row["inspected_remote_oid"] == observed
@@ -17344,10 +17501,13 @@ def _reconcile_published_blocked_checkpoint(
                     raise RuntimeError("등록 origin과 fetch/push 대상이 다릅니다.")
     except RuntimeError as error:
         return refuse(f"원격 저장소 소유권을 증명할 수 없습니다: {error}")
-    fetched = git(
-        repo_path, "fetch", "--no-tags", "origin",
-        f"refs/heads/{branch}", check=False,
-    )
+    try:
+        fetched = git(
+            repo_path, "fetch", "--no-tags", "origin",
+            f"refs/heads/{branch}", check=False,
+        )
+    except (OSError, RuntimeError) as error:
+        return retry("원격 checkpoint branch fetch 미완료: " + str(error))
     if fetched.returncode:
         return retry("원격 checkpoint branch fetch 실패: " + fetched.stdout[-2000:])
     fetched_result = git(
@@ -17412,6 +17572,28 @@ def _reconcile_published_blocked_checkpoint(
     )
     if metadata_error:
         return refuse(metadata_error)
+    if adopt_only:
+        checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
+        current = checkpoints.get(repo, str(blocked['plan_id']))
+        pending_scope = (current.snapshot or {}).get('remote_adoption_intent')
+        if pending_scope is None:
+            pending_scope = {
+                'head': observed, 'branch': branch, 'worktree': str(worktree),
+                'request_identity': request.request_identity,
+                'agent_snapshot': blocked['agent_snapshot'],
+                'agent_result_snapshot': blocked['agent_result_snapshot'],
+                'snapshot': snapshot.serialize(),
+            }
+            with runtime_state._transaction(connection):
+                checkpoints.record(
+                    repo, str(blocked['plan_id']), expected_generation=current.generation,
+                    operation=current.operation, expected_head=current.expected_head,
+                    target_base_oid=current.target_base_oid,
+                    observed_remote_oid=current.observed_remote_oid,
+                    snapshot={**(current.snapshot or {}), 'remote_adoption_intent': pending_scope})
+        elif (pending_scope['head'], pending_scope['branch'], pending_scope['worktree'],
+              pending_scope['request_identity']) != (observed, branch, str(worktree), request.request_identity):
+            return refuse('저장된 원격 채택 intent와 현재 요청이 다릅니다.')
     repository.start_remote_adoption(request, observed)
     if snapshot.head != observed:
         advanced = git(
@@ -17426,6 +17608,42 @@ def _reconcile_published_blocked_checkpoint(
     input_identity = _remote_checkpoint_input_identity(
         blocked, adopted_snapshot, ignored_paths,
     )
+    if adopt_only:
+        scope_snapshot = managed_rebase_adoption.selected_baseline(
+            GitSnapshot.deserialize(pending_scope['snapshot']), adopted_snapshot,
+            branch, str(_canonical_path(worktree)))
+        remote_ref = f'refs/remotes/origin/{branch}'
+        if adopted_snapshot.refs.get(remote_ref) == (observed, ''):
+            scope_snapshot = replace(scope_snapshot, refs={
+                **scope_snapshot.refs, remote_ref: (observed, '')})
+        with runtime_state._transaction(connection):
+            repository.record_remote_inspection(
+                request, observed, input_identity,
+                "원격 후속 commit 채택 완료; base 반영 뒤 원래 차단 원인을 검사합니다.",
+                commit=False,
+            )
+            connection.execute(
+                "UPDATE exec_plans SET publication_remote_oid = ? WHERE repo = ? AND plan_id = ?",
+                (observed, repo, blocked['plan_id']),
+            )
+            checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
+            current = checkpoints.get(repo, str(blocked['plan_id']))
+            if current.operation is not None:
+                raise RuntimeError("원격 후속 commit 채택 중 다른 Git intent가 생겼습니다.")
+            checkpoints.record(
+                repo, str(blocked['plan_id']), expected_generation=current.generation,
+                operation=None, expected_head=observed,
+                target_base_oid=current.target_base_oid, observed_remote_oid=observed,
+                snapshot={**(current.snapshot or {}), 'last_adopted_remote_oid': observed,
+                          'remote_adoption_intent': None,
+                          'remote_adoption_scope': {
+                              'head': observed, 'branch': branch, 'worktree': str(worktree),
+                              'agent_snapshot': blocked['agent_snapshot'],
+                              'agent_result_snapshot': blocked['agent_result_snapshot'],
+                              'snapshot': scope_snapshot.serialize(),
+                          }},
+            )
+        return "adopted"
     failure_evidence = "\n".join(
         str(value) for value in (
             request.evidence,
@@ -17725,6 +17943,49 @@ def resume_plan_blocks(
             ):
                 return True
             continue
+        observed = connection.execute(
+            'SELECT registered_origin FROM blocked_remote_observations WHERE repo = ? AND plan_id = ?',
+            (repo, blocked['plan_id'])).fetchone()
+        if (observed is not None and observed['registered_origin']
+                and blocked['blocked_reason'] == BlockReasonCode.REVIEW_RETRY_EXHAUSTED.value
+                and not unmet_execplan_dependencies(connection, repo, str(blocked['plan_id']))
+                and blocked_plan_reconciliation.slot_available(connection, repo, str(blocked['plan_id']))):
+            hydrate_execplan_project(connection, repo, blocked)
+            if _resume_legacy_review_count_block(connection, repo_path, state_dir, repo, blocked):
+                return True
+            with connection:
+                _clear_active_in_current_transaction(connection, repo)
+        remote_result = blocked_plan_reconciliation.BlockedPlanReconciler(
+            sys.modules[__name__], connection, repo_path, state_dir, repo, base,
+            config_path, verify_timeout_seconds,
+        ).reconcile(str(blocked['plan_id']))
+        if scoped_blocking.project_block(connection, repo) is not None:
+            return False
+        if remote_result == 'resumed':
+            return True
+        if remote_result in {'blocked', 'deferred'}:
+            refresh = connection.execute(
+                'SELECT stage FROM blocked_plan_reconciliations WHERE repo = ? AND plan_id = ?',
+                (repo, blocked['plan_id']),
+            ).fetchone()
+            if (remote_result == 'blocked' and refresh is not None
+                    and refresh['stage'] == 'complete'
+                    and blocked['blocked_reason'] == GUIDANCE_BLOCK_REASON):
+                refreshed = connection.execute(
+                    'SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
+                    (repo, blocked['plan_id']),
+                ).fetchone()
+                hydrate_execplan_project(connection, repo, refreshed)
+                if resume_guidance_approval_if_decided(
+                        connection, repo_path, repo, base, state_dir,
+                        plan_id=str(blocked['plan_id'])):
+                    return True
+            projected = project_execplan(connection, repo)
+            if (projected is not None and projected['plan_id'] == blocked['plan_id']
+                    and active_execplan(connection, repo) is None):
+                with connection:
+                    _clear_active_in_current_transaction(connection, repo)
+            continue
         if blocked["blocked_reason"] == PR_CLOSED_BLOCK_REASON:
             continue
         # A push may have succeeded before its adopted OID reached SQLite.
@@ -17828,7 +18089,8 @@ def resume_plan_blocks(
             if blocked["blocked_reason"] == GUIDANCE_BLOCK_REASON
             else resume_blocked_execplan_if_inputs_changed
         )
-        resumed = resume(connection, repo_path, repo, base, state_dir)
+        resumed = resume(connection, repo_path, repo, base, state_dir,
+                         plan_id=str(blocked['plan_id']))
         refreshed = connection.execute(
             "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
             (repo, blocked["plan_id"]),
@@ -21076,6 +21338,7 @@ def reconcile_false_positive_runtime_block(
 def observe_blocked_plan_remotes(
     connection: sqlite3.Connection, repo_path: Path, repo: str,
     project: sqlite3.Row,
+    *, plan_id: str | None = None,
 ) -> None:
     """Persist blocked-plan remote input before any project execution gate."""
 
@@ -21084,8 +21347,9 @@ def observe_blocked_plan_remotes(
     linked_plan_id = str(project_block["plan_id"] or "") if project_block else ""
     plans = connection.execute(
         "SELECT * FROM exec_plans WHERE repo = ? AND "
-        "(status = 'PLAN_BLOCKED' OR plan_id = ?) ORDER BY plan_id",
-        (repo, linked_plan_id),
+        "(status = 'PLAN_BLOCKED' OR plan_id = ? OR plan_id = ?) "
+        "AND (? IS NULL OR plan_id = ?) ORDER BY plan_id",
+        (repo, linked_plan_id, plan_id, plan_id, plan_id),
     ).fetchall()
     if not plans:
         return
@@ -23073,11 +23337,13 @@ class _BlockedCheckpointAdapter:
         repo_path: Path,
         state_dir: Path,
         repo: str,
+        *, reconciliation_scope: bool = False,
     ):
         self.connection = connection
         self.repo_path = repo_path
         self.state_dir = state_dir
         self.repo = repo
+        self.reconciliation_scope = reconciliation_scope
 
     def _plan(self, request: blocked_checkpoint.CheckpointRequest) -> sqlite3.Row:
         row = self.connection.execute(
@@ -23297,10 +23563,27 @@ class _BlockedCheckpointAdapter:
                 or (
                     plan["agent_snapshot"]
                     and not self._validated_guidance_checkpoint(request, plan, snapshot)
+                    and not self._validated_reconciliation_scope(request, plan)
                 )
             ),
         )
         return blocked_checkpoint.assess_safety(observation)
+
+    def _validated_reconciliation_scope(self, request, plan) -> bool:
+        if not self.reconciliation_scope:
+            return False
+        project = self.connection.execute(
+            'SELECT base_branch FROM projects WHERE repo = ?', (request.repo,)).fetchone()
+        checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get(
+            request.repo, request.plan_id)
+        try:
+            validate_blocked_agent_scope(
+                self.connection, self.repo_path, request.repo, project['base_branch'],
+                Path(request.worktree), plan['path'], saved_plan=plan,
+                accepted_rebase=bool((checkpoint.snapshot or {}).get('current_rebase_acceptance')))
+        except (OSError, RuntimeError, ValueError):
+            return False
+        return True
 
     def _validated_guidance_checkpoint(
         self, request: blocked_checkpoint.CheckpointRequest,
