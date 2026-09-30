@@ -41,11 +41,93 @@ G-108의 현재 상태 판정을 일반 구현, 관리 rebase 재시작, PR 충�
 
 ## Progress
 
-- [ ] handler·직접 경로의 공통 현재 상태 채택
-- [ ] checkpoint 소유권·중단 복구와 감사 보존
-- [ ] 최종 후보 Worker 확인·검증 무효화·실제 Git 회귀 사례
+- [x] handler·직접 경로의 공통 현재 상태 채택 구현 및 관련 unit 검증
+- [x] checkpoint 소유권·중단 복구와 감사 보존 구현 및 관련 unit 검증
+- [x] 최종 후보 Worker 확인·검증 무효화 구현과 unit 검증, 실제 Git 회귀 사례 작성
+- [ ] Loop Manager 전체 verify·실제 Git lifecycle 실행, Reviewer 검토와 사용자 Merge 확인
 
 ## Decision Log
 
 - 일반 구현과 PR 충돌 복구까지 적용하는 R-048의 전역 정책이다. legacy 오탐 차단만 고쳤던 G-101을 다시 계획하지 않는다. 저장된 최종 차단을 원인별로 해제하는 추가 연결은 G-110이 담당한다.
 - G-104의 중간 게시 순서와 G-106·G-107의 차단 중 원격 갱신은 기존 계획에 남긴다. 이 계획의 수용 결과를 그 계획들이 사용하며 과거 replay 증거를 게시 gate로 재도입하지 않는다.
+
+- 2026-09-30 Worker: `managed_rebase_adoption.py`에 공통 관측·수용·재확인 orchestration을, `managed_rebase_runtime.py`에 현재 identity·입력·scope·archive/guidance·원격/PR adapter를 분리했다. handler와 직접 복구가 같은 판정과 transactional recheck/CAS를 사용한다.
+- 현재 원래 HEAD의 시작 대기, 소유 detached 충돌과 autostash 복원 대기, 최종 clean index 결과를 구분한다. 수동 완료나 구형 완료 marker는 과거 turn·stage·receipt·replay를 요구하지 않고 한 번만 수용한다. staged-only path는 반복 stage하지 않고 허용된 unstaged/untracked 해결 path만 stage한다.
+- 현재 결과 수용은 WORKING/IMPLEMENTING으로 돌아가 이전 Worker·verify·Review·publication 결과와 token을 무효화한다. Worker 확인 token은 현재 입력과 HEAD에 결합하며 확인한 Worker patch의 Manager commit에만 넘긴다. 전체 verify가 만든 새 commit은 Worker 확인을 다시 요구한다.
+- 원래 Agent snapshot·session과 실제 Agent 위반 검증은 보존한다. 수용한 선택 branch/worktree를 메모리 비교 기준에만 반영하고 재개한 실제 Agent의 시작 관측은 별도 comparison baseline으로 저장한다. 수동 진행을 Agent 실행 또는 Manager replay receipt로 기록하지 않는다. 이전 scope·rebase 작업 감사도 보존한다.
+- 구형 historical reader와 다른 Manager Git 작업의 ownership/receipt 경계는 유지했다. 실제 Git 회귀 사례는 작성했으며 Worker는 실행하지 않았다. PRODUCT에 R-048 장기 규칙을 반영하고 양쪽 verify script에 새 모듈을 등록했다. AGENTS·ARCHITECTURE·PLANS·Requirement·archive를 수정하지 않았고 commit/push/PR을 만들지 않았다.
+
+## Worker Validation Results
+
+- 최소 범위로 선택한 관련 unit case 62개가 각각 최종 오류 없는 실행에서 통과했다. 아래 실패 이력은 혼합 성공 실행을 통과로 계산하지 않고 수정 후 **동일 명령**의 최종 성공만 기록한다.
+- 메모리 SQLite와 fake Git 관측으로 현재 수용·범위/metadata/index flags·원격 lease·autostash·중단 복구/CAS rollback·Worker token·원래 Agent snapshot 보존을 검증했다. 실제 Git lifecycle·전체 suite·integration/E2E·전체 lint/build/type check·scripts/verify는 Worker 제한에 따라 실행하지 않았다.
+- `git diff --check` 통과. 전체 verify와 Reviewer 결과가 아직 없으므로 ExecPlan 완료나 Merge를 선언하지 않는다.
+
+### 수정 후 동일 명령 재실행 이력
+
+- 수정: unit fixture의 원격 branch 기대값을 실제 선택 branch로 수정.
+
+```text
+FAILED_COMMAND: python3 -B -m unittest tests.test_execution_handlers.CurrentRebaseAdoptionTests tests.test_execution_revision.RebaseCandidateRevisionTests tests.test_manager_git_journal.CurrentRebaseAuditTests
+RERUN: python3 -B -m unittest tests.test_execution_handlers.CurrentRebaseAdoptionTests tests.test_execution_revision.RebaseCandidateRevisionTests tests.test_manager_git_journal.CurrentRebaseAuditTests
+FINAL_RESULT: PASS (10 tests, failures=0, errors=0)
+```
+
+- 수정: adapter fixture의 Git 응답을 명령별로 분리해 unmerged index 오인 수정.
+
+```text
+FAILED_COMMAND: python3 -B -m unittest tests.test_managed_mutation_evidence.CurrentRebaseRuntimeAdapterTests tests.test_execution_checkpoint.CurrentRebaseBoundaryTests
+RERUN: python3 -B -m unittest tests.test_managed_mutation_evidence.CurrentRebaseRuntimeAdapterTests tests.test_execution_checkpoint.CurrentRebaseBoundaryTests
+FINAL_RESULT: PASS (4 tests, failures=0, errors=0)
+```
+
+- 수정: 잘못 지정한 selector를 실제 갱신된 수용 의미의 test 이름으로 정리.
+
+```text
+FAILED_COMMAND: python3 -B -m unittest tests.test_execution_handlers.ExecutionHandlerTests.test_sealed_rebase_completion_updates_runtime_without_repeating_git tests.test_execution_handlers.ExecutionHandlerTests.test_autostash_completion_reports_rejected_operation_marker tests.test_execution_handlers.ExecutionHandlerTests.test_completed_published_rebase_keeps_remote_lease_only_with_sealed_owner tests.test_execution_handlers.ExecutionHandlerTests.test_published_rebase_completion_accepts_current_ref_without_remote_ancestry tests.test_execution_handlers.ExecutionHandlerTests.test_legacy_published_rebase_completion_accepts_current_ref_without_remote_ancestry tests.test_execution_handlers.ExecutionHandlerTests.test_autostash_published_completion_keeps_start_session_after_worker_replacement
+RERUN: python3 -B -m unittest tests.test_execution_handlers.ExecutionHandlerTests.test_sealed_rebase_completion_updates_runtime_without_repeating_git tests.test_execution_handlers.ExecutionHandlerTests.test_autostash_completion_reports_rejected_operation_marker tests.test_execution_handlers.ExecutionHandlerTests.test_completed_published_rebase_keeps_remote_lease_only_with_sealed_owner tests.test_execution_handlers.ExecutionHandlerTests.test_published_rebase_completion_accepts_current_ref_without_remote_ancestry tests.test_execution_handlers.ExecutionHandlerTests.test_legacy_published_rebase_completion_accepts_current_ref_without_remote_ancestry tests.test_execution_handlers.ExecutionHandlerTests.test_autostash_published_completion_keeps_start_session_after_worker_replacement
+FINAL_RESULT: PASS (6 tests, failures=0, errors=0)
+```
+
+- 수정: journal mock을 실제 파일 감사 fixture에서 해제하고 호환 인자 및 새 runtime port의 최신 상태 assertion 수정; 중간 재실행도 실패하여 같은 명령으로 최종 재실행.
+
+```text
+FAILED_COMMAND: python3 -B -m unittest tests.test_managed_mutation_evidence.ManagedTransitionTests.test_direct_rebase_result_recovers_after_git_before_journal_result tests.test_managed_mutation_evidence.ManagedTransitionTests.test_direct_rebase_completion_rechecks_pre_head_marker_after_head_record tests.test_managed_mutation_evidence.ManagedTransitionTests.test_direct_rebase_completion_accepts_only_original_restored_stage tests.test_managed_mutation_evidence.DetachedRebaseOwnershipTests.test_rebase_start_retry_reuses_frozen_run_and_generation tests.test_managed_mutation_evidence.DetachedRebaseOwnershipTests.test_versioned_continuation_binds_source_turn_and_stage_before_git tests.test_managed_mutation_evidence.DetachedRebaseOwnershipTests.test_skip_checks_approved_index_before_recording_intent tests.test_managed_mutation_evidence.DetachedRebaseOwnershipTests.test_continuation_intent_carries_only_matching_saved_stage_files tests.test_managed_mutation_evidence.DetachedRebaseOwnershipTests.test_continuation_checks_saved_stage_commit_instead_of_final_file tests.test_managed_mutation_evidence.DetachedRebaseOwnershipTests.test_legacy_skip_without_source_receipt_is_rejected tests.test_managed_mutation_evidence.DetachedRebaseOwnershipTests.test_published_conflict_reaches_owned_gate_after_restart tests.test_managed_mutation_evidence.DetachedRebaseOwnershipTests.test_completed_published_rebase_requires_exact_saved_result
+RERUN: python3 -B -m unittest tests.test_managed_mutation_evidence.ManagedTransitionTests.test_direct_rebase_result_recovers_after_git_before_journal_result tests.test_managed_mutation_evidence.ManagedTransitionTests.test_direct_rebase_completion_rechecks_pre_head_marker_after_head_record tests.test_managed_mutation_evidence.ManagedTransitionTests.test_direct_rebase_completion_accepts_only_original_restored_stage tests.test_managed_mutation_evidence.DetachedRebaseOwnershipTests.test_rebase_start_retry_reuses_frozen_run_and_generation tests.test_managed_mutation_evidence.DetachedRebaseOwnershipTests.test_versioned_continuation_binds_source_turn_and_stage_before_git tests.test_managed_mutation_evidence.DetachedRebaseOwnershipTests.test_skip_checks_approved_index_before_recording_intent tests.test_managed_mutation_evidence.DetachedRebaseOwnershipTests.test_continuation_intent_carries_only_matching_saved_stage_files tests.test_managed_mutation_evidence.DetachedRebaseOwnershipTests.test_continuation_checks_saved_stage_commit_instead_of_final_file tests.test_managed_mutation_evidence.DetachedRebaseOwnershipTests.test_legacy_skip_without_source_receipt_is_rejected tests.test_managed_mutation_evidence.DetachedRebaseOwnershipTests.test_published_conflict_reaches_owned_gate_after_restart tests.test_managed_mutation_evidence.DetachedRebaseOwnershipTests.test_completed_published_rebase_requires_exact_saved_result
+FINAL_RESULT: PASS (11 tests, failures=0, errors=0)
+```
+
+- 수정: 현재 해결 내용을 stage하는 분기에서 git diff에 잡히지 않는 허용된 untracked 파일도 확인하도록 구현 수정.
+
+```text
+FAILED_COMMAND: python3 -B -m unittest tests.test_execution_handlers.ExecutionHandlerTests.test_latest_base_uses_same_intent_and_rebase_for_both_checkpoints tests.test_execution_handlers.ExecutionHandlerTests.test_resolved_rebase_then_verify_failure_returns_to_same_worker tests.test_execution_handlers.ExecutionHandlerTests.test_staged_rebase_resume_reuses_saved_worker_result tests.test_execution_handlers.ExecutionHandlerTests.test_staged_autostash_resume_reuses_saved_worker_result tests.test_execution_handlers.ExecutionHandlerTests.test_completed_stage_matching_head_resumes_without_restaging tests.test_execution_handlers.ExecutionHandlerTests.test_completed_autostash_stage_matching_head_resumes_without_rebase tests.test_execution_handlers.ExecutionHandlerTests.test_pending_stage_resumes_accepted_unstaged_changes tests.test_execution_handlers.ExecutionHandlerTests.test_pending_stage_resumes_accepted_untracked_files tests.test_execution_handlers.ExecutionHandlerTests.test_pending_stage_with_unmerged_index_retries_only_accepted_paths tests.test_execution_handlers.ExecutionHandlerTests.test_stage_lock_resume_uses_checkpoint_without_new_worker_turn tests.test_execution_handlers.ExecutionHandlerTests.test_continue_lock_resume_does_not_repeat_stage tests.test_execution_handlers.ExecutionHandlerTests.test_revision_refresh_checkpoints_dirty_verified_worker_patch_before_rebase tests.test_execution_handlers.ExecutionHandlerTests.test_rebase_discards_prior_candidate_evidence_before_verify
+RERUN: python3 -B -m unittest tests.test_execution_handlers.ExecutionHandlerTests.test_latest_base_uses_same_intent_and_rebase_for_both_checkpoints tests.test_execution_handlers.ExecutionHandlerTests.test_resolved_rebase_then_verify_failure_returns_to_same_worker tests.test_execution_handlers.ExecutionHandlerTests.test_staged_rebase_resume_reuses_saved_worker_result tests.test_execution_handlers.ExecutionHandlerTests.test_staged_autostash_resume_reuses_saved_worker_result tests.test_execution_handlers.ExecutionHandlerTests.test_completed_stage_matching_head_resumes_without_restaging tests.test_execution_handlers.ExecutionHandlerTests.test_completed_autostash_stage_matching_head_resumes_without_rebase tests.test_execution_handlers.ExecutionHandlerTests.test_pending_stage_resumes_accepted_unstaged_changes tests.test_execution_handlers.ExecutionHandlerTests.test_pending_stage_resumes_accepted_untracked_files tests.test_execution_handlers.ExecutionHandlerTests.test_pending_stage_with_unmerged_index_retries_only_accepted_paths tests.test_execution_handlers.ExecutionHandlerTests.test_stage_lock_resume_uses_checkpoint_without_new_worker_turn tests.test_execution_handlers.ExecutionHandlerTests.test_continue_lock_resume_does_not_repeat_stage tests.test_execution_handlers.ExecutionHandlerTests.test_revision_refresh_checkpoints_dirty_verified_worker_patch_before_rebase tests.test_execution_handlers.ExecutionHandlerTests.test_rebase_discards_prior_candidate_evidence_before_verify
+FINAL_RESULT: PASS (13 tests, failures=0, errors=0)
+```
+
+- 수정: 새 fixture의 필수 operation 인자 및 runtime status/SQLite projection 기대값을 IMPLEMENTING/WORKING으로 수정; 중간 재실행도 실패하여 같은 명령으로 최종 재실행.
+
+```text
+FAILED_COMMAND: python3 -B -m unittest tests.test_execution_handlers.CurrentRebaseAdoptionTests tests.test_runtime_state.CurrentRebaseRuntimeTests tests.test_loop_manager.AgentScopeValidatorTest.test_planner_import_bytecode_is_ignored_without_hiding_scope_violations
+RERUN: python3 -B -m unittest tests.test_execution_handlers.CurrentRebaseAdoptionTests tests.test_runtime_state.CurrentRebaseRuntimeTests tests.test_loop_manager.AgentScopeValidatorTest.test_planner_import_bytecode_is_ignored_without_hiding_scope_violations
+FINAL_RESULT: PASS (16 tests, failures=0, errors=0)
+```
+
+- 수정: 다음 rebase 기록 시 기존 snapshot의 nested list alias를 독립 복사해 이전 감사를 변경하지 않도록 구현 수정.
+
+```text
+FAILED_COMMAND: python3 -B -m unittest tests.test_execution_handlers.CurrentRebaseAgentScopeTests tests.test_execution_handlers.CurrentRebaseAdoptionTests.test_new_rebase_preserves_nested_prior_operation_audit_without_cycles
+RERUN: python3 -B -m unittest tests.test_execution_handlers.CurrentRebaseAgentScopeTests tests.test_execution_handlers.CurrentRebaseAdoptionTests.test_new_rebase_preserves_nested_prior_operation_audit_without_cycles
+FINAL_RESULT: PASS (3 tests, failures=0, errors=0)
+```
+
+### 추가 최소 범위 unit 검증
+
+- `tests.test_execution_handlers.CurrentRebaseAdoptionTests`의 현재 수용·원격 경쟁·stage·현재 Worker 확인·Manager commit·발행 직전 재베이스·이전 감사·legacy 완료 경계: 최종 13 case 모두 통과한 실행 결과 보유.
+- `tests.test_execution_handlers.CurrentRebaseAgentScopeTests`: 2 case 통과.
+- `tests.test_runtime_state.CurrentRebaseRuntimeTests`: 5 case 통과.
+- `tests.test_execution_revision.RebaseCandidateRevisionTests`, `tests.test_manager_git_journal.CurrentRebaseAuditTests`, `tests.test_managed_mutation_evidence.CurrentRebaseRuntimeAdapterTests`, `tests.test_execution_checkpoint.CurrentRebaseBoundaryTests`: 각각 2 case, 총 8 case 통과.
+- `tests.test_loop_manager.AgentScopeValidatorTest.test_planner_import_bytecode_is_ignored_without_hiding_scope_violations`: 1 case 통과.
+- 위 실패 이력의 기존 handler 6 case·direct/continuation 11 case·phase 13 case와 `test_owned_pr_correction_stages_only_publishable_resolution`, `test_saved_worker_result_finishes_after_restart_without_second_agent_turn`, `test_preparation_resumes_durable_rebase_continue_without_worker`: 총 33 기존 case 통과.
+
+최종 Worker 상태: 구현과 targeted unit 검증 준비 완료, Loop Manager의 전체 verify·실제 Git integration 실행 및 Reviewer 검토 대기.

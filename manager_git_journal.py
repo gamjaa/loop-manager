@@ -854,6 +854,62 @@ def begin_rebase(
     return identity
 
 
+def record_current_rebase_result(state_dir, *, repo, target, owner, decision, observed):
+    """Close an existing audit pointer without claiming replay or Agent evidence.
+
+    Missing/incomplete old audit is retained and does not gate current acceptance.
+    Non-rebase journals and their receipts are unaffected.
+    """
+    from managed_rebase_validation import RebaseStatus
+    if decision.status not in {RebaseStatus.WAITING, RebaseStatus.COMPLETE}:
+        raise MutationEvidenceError('cannot record rejected current rebase')
+    slot = _slot(state_dir, repo, 'managed_rebase', target)
+    active = slot / 'active.json'
+    if not active.exists():
+        return False
+    try:
+        intent = _read(active)
+    except MutationEvidenceError:
+        return False
+    if (intent.get('repo') != repo or intent.get('target') != target
+            or intent.get('owner') != owner or not intent.get('id')):
+        return False
+    # A result sealed by an older policy is audit data. Do not rewrite it.
+    result_path = slot / f"{intent['id']}.result.json"
+    if result_path.exists():
+        _write_new(slot / f"{intent['id']}.{secrets.token_hex(8)}.acceptance.json", {
+            'kind': 'current_rebase_observation', 'acceptance': decision.acceptance,
+            'status': decision.status.value, 'observed': observed,
+        })
+        active.unlink()
+        _sync_directory(slot)
+    else:
+        _finish(slot, active, intent, observed, {
+            'kind': 'current_rebase_observation', 'acceptance': decision.acceptance,
+            'status': decision.status.value,
+        }, 'current_state')
+    return True
+
+
+def begin_current_rebase(state_dir, *, owner, repo, target, before, expected):
+    """Start Manager execution audit without requiring the old audit chain."""
+    slot = _slot(state_dir, repo, 'managed_rebase', target)
+    active = slot / 'active.json'
+    if active.exists():
+        # Preserve the old pointer verbatim before replacing it. Its contents
+        # are not represented as execution evidence for this new command.
+        prior = active.read_bytes()
+        archive = slot / f'{secrets.token_hex(16)}.superseded-active.json'
+        with archive.open('xb') as stream:
+            stream.write(prior)
+            stream.flush()
+            os.fsync(stream.fileno())
+        active.unlink()
+        _sync_directory(slot)
+    return begin_rebase(state_dir, owner=owner, repo=repo, target=target,
+                        before=before, expected=expected)
+
+
 def complete_rebase(
     state_dir: Path, *, repo: str, target: str,
     observe: Callable[[], dict[str, Any]],

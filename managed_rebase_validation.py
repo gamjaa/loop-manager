@@ -1,8 +1,8 @@
 """Current Git result acceptance, independent of rebase execution evidence.
 
 This boundary does not authorize publication or reconcile Agent scope incidents.
-Its observation adapter lives in managed_rebase_observation; existing journal
-validation remains in force until the execution paths explicitly adopt this API.
+Its observation adapter lives in managed_rebase_observation; execution and
+direct recovery consume it through managed_rebase_adoption.
 """
 
 from __future__ import annotations
@@ -63,6 +63,7 @@ class RebaseExpectation:
     remote: Remote | None
     before_head: str | None = None
     role: str = 'worker'
+    autostash_oid: str | None = None
 
 
 @dataclass(frozen=True)
@@ -200,6 +201,7 @@ def assess_scope(
 
 
 class RebaseStatus(str, Enum):
+    START = 'ready_to_start'
     WAITING = 'waiting_for_resolution'
     COMPLETE = 'complete'
     REJECTED = 'rejected'
@@ -315,10 +317,6 @@ def assess_current_rebase(
         if observed.base_is_ancestor is not True:
             return reject('detached_head_outside_target_base')
         return RebaseDecision(RebaseStatus.WAITING, 'owned_rebase_in_progress')
-    if (controlling_git_operation(operations)
-            or any(entry.stage for entry in observed.index)
-            or observed.index_clean is not True or observed.staged):
-        return reject('unresolved_operation_or_index')
     if (observed.branch != expected.branch
             or observed.branch_ref[0] != observed.head
             or f'branch=refs/heads/{expected.branch}' not in registration
@@ -328,7 +326,20 @@ def assess_current_rebase(
     if observed.base_is_ancestor is None:
         return RebaseDecision(RebaseStatus.UNAVAILABLE, 'ancestry_missing')
     if observed.base_is_ancestor is not True:
+        if (observed.head == expected.before_head and not operations
+                and observed.index_clean and not observed.staged
+                and not any(entry.stage for entry in observed.index)):
+            return RebaseDecision(RebaseStatus.START, 'owned_original_head_before_rebase')
         return reject('target_base_not_ancestor')
+    if expected.autostash_oid and (
+            any(entry.stage for entry in observed.index) or observed.staged or operations):
+        if set(operations) - {'MERGE_MSG', 'MERGE_MODE', 'REBASE_HEAD'}:
+            return reject('unresolved_operation_or_index')
+        return RebaseDecision(RebaseStatus.WAITING, 'owned_autostash_restore_pending')
+    if (controlling_git_operation(operations)
+            or any(entry.stage for entry in observed.index)
+            or observed.index_clean is not True or observed.staged):
+        return reject('unresolved_operation_or_index')
     acceptance = {
         'kind': ACCEPTANCE_KIND, 'policy_version': POLICY_VERSION,
         'repo': expected.repo, 'repository_identity': expected.repository_identity,

@@ -267,5 +267,40 @@ class ManagerGitTransitionTests(unittest.TestCase):
             )
 
 
-if __name__ == "__main__":
+
+class CurrentRebaseAuditTests(unittest.TestCase):
+    def test_current_observation_preserves_old_result_without_fabricating_receipts(self):
+        from tests.test_managed_rebase_validation import decision_for
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            token = journal.begin_rebase(state, owner='plan:G-108', repo='/repo',
+                target='/owned', before={'head': 'before'}, expected={'branch': 'loop-manager/G-108'})
+            slot = journal._slot(state, '/repo', 'managed_rebase', '/owned')
+            old_intent = (slot / f'{token}.intent.json').read_bytes()
+            observed = {'head': 'after'}
+            self.assertTrue(journal.record_current_rebase_result(state, repo='/repo',
+                target='/owned', owner='plan:G-108', decision=decision_for(), observed=observed))
+            self.assertEqual((slot / f'{token}.intent.json').read_bytes(), old_intent)
+            result = journal._read(slot / f'{token}.result.json')
+            self.assertEqual(result['status'], 'current_state')
+            self.assertEqual(journal.verified_managed_transitions(state, '/repo', 'plan:G-108'), [])
+            self.assertFalse(journal.record_current_rebase_result(state, repo='/repo',
+                target='/owned', owner='plan:G-108', decision=decision_for(), observed=observed))
+            self.assertFalse(list(slot.glob('*.invocation.json')))
+
+    def test_continuation_retains_incomplete_old_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            token = journal.begin_rebase(state, owner='plan:G-108', repo='/repo', target='/owned',
+                before={'head': 'before'}, expected={'branch': 'loop-manager/G-108'})
+            slot = journal._slot(state, '/repo', 'managed_rebase', '/owned')
+            old = (slot / 'active.json').read_bytes()
+            replacement = journal.begin_current_rebase(state, owner='plan:G-108', repo='/repo',
+                target='/owned', before={'head': 'partial'}, expected={'action': 'continue'})
+            self.assertNotEqual(token, replacement)
+            self.assertEqual(next(slot.glob('*.superseded-active.json')).read_bytes(), old)
+            self.assertTrue((slot / f'{token}.intent.json').exists())
+
+
+if __name__ == '__main__':
     unittest.main()

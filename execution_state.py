@@ -114,8 +114,8 @@ class ExecutionStatePort:
                 expected_catalog=expected_catalog,
             )
 
-    def complete_rebase(self, checkpoint_repository, *, completion, project_values,
-                        published_proof=None):
+    def complete_rebase(self, checkpoint_repository, *, completion=None, project_values,
+                        published_proof=None, acceptance=None, reobserve=None):
         with runtime_state._transaction(self.connection):
             expected = self.check()
             if expected is None:
@@ -123,6 +123,7 @@ class ExecutionStatePort:
             self.expected = self.repository.complete_rebase(
                 expected, checkpoint_repository, completion=completion,
                 project_values=project_values, published_proof=published_proof,
+                acceptance=acceptance, reobserve=reobserve,
             )
             import recovery_state
             recovery_state.RecoveryRepository(

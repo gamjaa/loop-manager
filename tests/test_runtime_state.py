@@ -42,7 +42,7 @@ class CurrentRebaseRuntimeTests(unittest.TestCase):
                 connection, runtime, checkpoint, original, expected, decision = self.fixture(legacy=legacy)
                 result = runtime.complete_rebase(
                     original, checkpoint, acceptance=decision.acceptance,
-                    project_values={'phase': 'VERIFYING'}, reobserve=lambda: decision,
+                    project_values={'phase': 'WORKING'}, reobserve=lambda: decision,
                 )
                 saved = checkpoint.get('repo', 'G-047')
                 self.assertEqual(saved.current_rebase_acceptance(), decision.acceptance)
@@ -51,18 +51,18 @@ class CurrentRebaseRuntimeTests(unittest.TestCase):
                 if not legacy:
                     self.assertEqual(saved.snapshot['old_journal'], 'failed-audit')
                     self.assertEqual(saved.snapshot['stage_evidence'], {'tree': 'old'})
-                self.assertEqual(result.status, 'VERIFYING')
+                self.assertEqual(result.status, 'IMPLEMENTING')
                 self.assertIsNone(result.verify_result)
                 self.assertIsNone(result.review_result)
                 self.assertEqual(connection.execute(
                     "SELECT phase, active_sha FROM projects WHERE repo = 'repo'"
-                ).fetchone()[:], ('VERIFYING', 'base'))
+                ).fetchone()[:], ('WORKING', 'base'))
                 # A new repository instance models restart; the same result is
                 # re-observed but does not increment generation or update rows.
                 restarted = runtime_state.RuntimeStateRepository(connection)
                 result_again = restarted.complete_rebase(
                     result, ExecutionCheckpointRepository(connection), acceptance=decision.acceptance,
-                    project_values={'phase': 'VERIFYING'}, reobserve=lambda: decision,
+                    project_values={'phase': 'WORKING'}, reobserve=lambda: decision,
                 )
                 self.assertEqual(result_again, result)
                 self.assertEqual(checkpoint.get('repo', 'G-047'), saved)
@@ -71,7 +71,7 @@ class CurrentRebaseRuntimeTests(unittest.TestCase):
                 with self.assertRaises(runtime_state.RuntimeStateError):
                     restarted.complete_rebase(
                         result, checkpoint, acceptance=decision.acceptance,
-                        project_values={'phase': 'VERIFYING'}, reobserve=lambda: changed,
+                        project_values={'phase': 'WORKING'}, reobserve=lambda: changed,
                     )
 
     def test_current_acceptance_rolls_back_checkpoint_plan_project_and_outbox(self):
@@ -91,7 +91,7 @@ class CurrentRebaseRuntimeTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'interrupted'):
                     failing.complete_rebase(
                         original, checkpoint, acceptance=decision.acceptance,
-                        project_values={'phase': 'VERIFYING'}, reobserve=lambda: decision,
+                        project_values={'phase': 'WORKING'}, reobserve=lambda: decision,
                     )
                 self.assertEqual(checkpoint.get('repo', 'G-047'), before_checkpoint)
                 self.assertEqual(runtime.projected('repo'), original)
@@ -100,9 +100,9 @@ class CurrentRebaseRuntimeTests(unittest.TestCase):
                                  before_events)
                 recovered = runtime.complete_rebase(
                     original, checkpoint, acceptance=decision.acceptance,
-                    project_values={'phase': 'VERIFYING'}, reobserve=lambda: decision,
+                    project_values={'phase': 'WORKING'}, reobserve=lambda: decision,
                 )
-                self.assertEqual(recovered.status, 'VERIFYING')
+                self.assertEqual(recovered.status, 'IMPLEMENTING')
 
     def test_current_acceptance_refuses_stale_generation_or_post_check_drift(self):
         for drift in ('generation', 'remote', 'files', 'inputs', 'scope', 'ownership',
@@ -139,7 +139,7 @@ class CurrentRebaseRuntimeTests(unittest.TestCase):
                 with self.assertRaises(runtime_state.RuntimeStateError):
                     runtime.complete_rebase(
                         original, checkpoint, acceptance=decision.acceptance,
-                        project_values={'phase': 'VERIFYING'}, reobserve=reobserve,
+                        project_values={'phase': 'WORKING'}, reobserve=reobserve,
                     )
                 self.assertEqual(checkpoint.get('repo', 'G-047'), baseline)
 
@@ -149,12 +149,13 @@ class CurrentRebaseRuntimeTests(unittest.TestCase):
             {'reobserve': None}, {'completion': {'id': 'made-up'}},
             {'published_proof': {'journal_id': 'made-up'}},
             {'project_values': {'phase': 'PUBLISHING'}},
-            {'project_values': {'phase': 'VERIFYING', 'verify_result': 'PASS'}},
-            {'project_values': {'phase': 'VERIFYING', 'last_error': None}},
+            {'project_values': {'phase': 'VERIFYING'}},
+            {'project_values': {'phase': 'WORKING', 'verify_result': 'PASS'}},
+            {'project_values': {'phase': 'WORKING', 'last_error': 'cannot preserve a successful candidate'}},
         ):
             with self.subTest(arguments=arguments):
                 kwargs = dict(acceptance=decision.acceptance,
-                              project_values={'phase': 'VERIFYING'}, reobserve=lambda: decision)
+                              project_values={'phase': 'WORKING'}, reobserve=lambda: decision)
                 kwargs.update(arguments)
                 with self.assertRaises(runtime_state.RuntimeStateError):
                     runtime.complete_rebase(original, checkpoint, **kwargs)
@@ -168,7 +169,7 @@ class CurrentRebaseRuntimeTests(unittest.TestCase):
         )
         with self.assertRaises(runtime_state.RuntimeStateError):
             runtime.complete_rebase(blocked, checkpoint, acceptance=decision.acceptance,
-                                    project_values={'phase': 'VERIFYING'}, reobserve=lambda: decision)
+                                    project_values={'phase': 'WORKING'}, reobserve=lambda: decision)
         accepted = runtime.complete_rebase(
             blocked, checkpoint, acceptance=decision.acceptance,
             project_values={'phase': 'PLAN_BLOCKED'}, reobserve=lambda: decision,

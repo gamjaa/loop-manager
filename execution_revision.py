@@ -198,6 +198,9 @@ class DefinitionSnapshot:
             (self.sources, self.archive_candidates),
         )
 
+    def worker_candidate_token(self, head: str) -> str:
+        return _digest('worker-candidate', (self.worker_token, head))
+
     def verify_token(self, base_token: str, candidate_head: str | None = None) -> str:
         return _digest("verify-stage", (self.worker_token, base_token, candidate_head))
 
@@ -271,6 +274,8 @@ WORKER_INVALIDATING_DELTAS = frozenset(
 
 @dataclass(frozen=True)
 class StageArtifacts:
+    require_worker_candidate: bool = False
+    worker_candidate_token: str | None = None
     worker_result: bool = False
     verify_result: bool = False
     review_result: bool = False
@@ -331,6 +336,9 @@ def decide_revision_gate(
         not artifacts.worker_result
         or artifacts.worker_input_token != current.worker_token
         or artifacts.archive_token != current.archive_token
+        or (artifacts.require_worker_candidate and (
+            not candidate_head
+            or artifacts.worker_candidate_token != current.worker_candidate_token(candidate_head)))
     ):
         target = "IMPLEMENTING"
 

@@ -229,5 +229,41 @@ class ExecutionRevisionTests(unittest.TestCase):
             DefinitionSnapshot.deserialize("{}")
 
 
-if __name__ == "__main__":
+
+class RebaseCandidateRevisionTests(unittest.TestCase):
+    def test_rebased_head_or_inputs_require_worker_confirmation_then_stabilize(self):
+        current = definition()
+        artifacts = replace(complete_artifacts(current), require_worker_candidate=True,
+                            worker_candidate_token=current.worker_candidate_token('old'))
+        for head, inputs in (('new', current), ('old', replace(current, source_fingerprint='new'))):
+            with self.subTest(head=head, inputs=inputs):
+                result = decide_revision_gate(phase='PUBLISHING', previous=current, current=inputs,
+                    active_base_token='base', current_base_token='base', artifacts=artifacts,
+                    candidate_head=head)
+                self.assertEqual(result.phase, 'IMPLEMENTING')
+        confirmed = replace(artifacts, worker_candidate_token=current.worker_candidate_token('new'),
+                            verify_token=current.verify_token('base', 'new'),
+                            review_token=current.review_token('base', 'new'))
+        result = decide_revision_gate(phase='PUBLISHING', previous=current, current=current,
+            active_base_token='base', current_base_token='base', artifacts=confirmed,
+            candidate_head='new')
+        self.assertEqual(result.kind, RevisionGateKind.CONTINUE)
+
+    def test_confirmation_retains_dependency_wait_and_full_validation(self):
+        current = definition()
+        confirmed = StageArtifacts(worker_result=True, worker_input_token=current.worker_token,
+                                   archive_token=current.archive_token, require_worker_candidate=True,
+                                   worker_candidate_token=current.worker_candidate_token('new'))
+        result = decide_revision_gate(phase='PUBLISHING', previous=current, current=current,
+            active_base_token='base', current_base_token='base', artifacts=confirmed,
+            candidate_head='new')
+        self.assertEqual(result.phase, 'VERIFYING')
+        waited = decide_revision_gate(phase='PUBLISHING', previous=current, current=current,
+            active_base_token='base', current_base_token='base', artifacts=confirmed,
+            candidate_head='new', unmet_dependencies=('G-036',))
+        self.assertEqual(waited.kind, RevisionGateKind.WAIT)
+        self.assertEqual(waited.phase, 'VERIFYING')
+
+
+if __name__ == '__main__':
     unittest.main()

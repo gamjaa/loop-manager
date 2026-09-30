@@ -8,6 +8,7 @@ from dataclasses import replace
 import os
 from pathlib import Path
 import sqlite3
+from types import SimpleNamespace
 import subprocess
 from tempfile import TemporaryDirectory
 import unittest
@@ -55,7 +56,17 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
     def test_legacy_checkpoint_restart_after_journal_seal(self):
         self._lifecycle(with_pr=False, legacy=True, sealed_restart=True)
 
-    def _lifecycle(self, *, with_pr, legacy=False, sealed_restart=False):
+    def test_manual_checkpoint_completion_without_journal_reconfirms_candidate(self):
+        self._lifecycle(with_pr=False, manual=True, missing_journal=True)
+
+    def test_manual_pr_completion_after_seal_reconfirms_candidate(self):
+        self._lifecycle(with_pr=True, manual=True, sealed_restart=True)
+
+    def test_manual_completion_with_new_base_and_changed_inputs_reconfirms_latest_candidate(self):
+        self._lifecycle(with_pr=False, manual=True, latest_base_advanced=True)
+
+    def _lifecycle(self, *, with_pr, legacy=False, sealed_restart=False,
+                   manual=False, missing_journal=False, latest_base_advanced=False):
         # Reuse only the deterministic service bundle, not the policy fixture's
         # substituted Manager rebase methods or its substituted journal writer.
         real_begin = journal.begin_rebase
@@ -66,6 +77,7 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
             root = Path(directory)
             repo, remote, state_dir = root / 'repo', root / 'remote.git', root / 'state'
             state_dir.mkdir()
+            repo_key = str(repo.resolve())
             for args in (('init', '--bare', str(remote)), ('init', '-b', 'main', str(repo))):
                 subprocess.run(['git', *args], check=True, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT)
@@ -75,6 +87,12 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
             git(repo, 'config', 'core.fileMode', 'true')
             git(repo, 'remote', 'add', 'origin', str(remote))
             lines = ['value=initial\n'] + [f'line-{n}\n' for n in range(1, 25)]
+            (repo / 'docs/plans').mkdir(parents=True)
+            (repo / 'docs/PRODUCT.md').write_text('# Product\n\nFixture behavior.\n')
+            (repo / 'docs/plans/[G-047] Runtime.md').write_text(
+                '---\nid: G-047\ntitle: Runtime\nsources:\n  - docs/PRODUCT.md\n'
+                'depends_on: []\ncomplexity: low\nrisk: low\npriority: normal\n---\n'
+                '\n## Purpose\nResolve current changes.\n')
             (repo / 'app.txt').write_text(''.join(lines))
             (repo / 'skip.txt').write_text('initial\n')
             (repo / 'scripts').mkdir()
@@ -93,7 +111,7 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
             git(repo, 'commit', '-m', 'Initial fixture')
             base = git(repo, 'rev-parse', 'HEAD').stdout.strip()
             git(repo, 'push', '-u', 'origin', 'main')
-            branch, worktree = lm.expected_execplan_workspace(state_dir, 'repo', 'G-047')
+            branch, worktree = lm.expected_execplan_workspace(state_dir, repo_key, 'G-047')
             worktree.parent.mkdir(parents=True, exist_ok=True)
             git(repo, 'worktree', 'add', '-b', branch, str(worktree), base)
 
@@ -134,10 +152,13 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
             fixture.connection.backup(connection)
             connection.row_factory = sqlite3.Row
             self.addCleanup(lambda: connection.close())
+            connection.execute('UPDATE projects SET repo = ?', (repo_key,))
+            connection.execute('UPDATE exec_plans SET repo = ?, plan_sha = ?, current_revision_sha = ?, '
+                               "current_complexity = 'low', current_risk = 'low'", (repo_key, base, target))
             repository = runtime_state.RuntimeStateRepository(connection)
-            state = ExecutionStatePort(connection, repository, 'repo')
+            state = ExecutionStatePort(connection, repository, repo_key)
             state.update_project(
-                'repo', worktree=str(worktree), branch=branch, active_sha=base,
+                repo_key, worktree=str(worktree), branch=branch, active_sha=base,
                 phase='VERIFYING', publication_remote_oid=original,
                 worker_session_id='worker-session',
                 worker_session_binding=SessionBinding('codex', 'model', 'high').serialize(),
@@ -161,12 +182,19 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                     "(repo, plan_id, request_identity, phase, reason_code, evidence, "
                     "branch, worktree, commit_identity, tree_oid, local_oid, "
                     "published_oid, accepted_remote_oid, result) "
-                    "VALUES ('repo', 'G-047', 'checkpoint', 'published', "
+                    "VALUES (?, 'G-047', 'checkpoint', 'published', "
                     "'verify_retry_exhausted', 'fixture checkpoint', ?, ?, ?, ?, ?, ?, ?, 'published')",
-                    (branch, str(worktree), identity, tree, original, original, original))
+                    (repo_key, branch, str(worktree), identity, tree, original, original, original))
 
             effects = replace(fixture.effects, state=state,
                               checkpoint=ExecutionCheckpointRepository(connection))
+            effects = replace(effects, workspace=replace(effects.workspace,
+                current_rebase_service=lambda context, **options: lm._current_rebase_service(
+                    connection, repo, state_dir, repo_key, 'G-047', worktree, branch, **options)))
+            pr_patch = mock.patch.object(lm, 'pr_for_branch', side_effect=lambda *_a, **_k:
+                                        effects.publication.pr_for_branch.return_value)
+            pr_patch.start()
+            self.addCleanup(pr_patch.stop)
             effects.workspace.git.side_effect = git
             effects.workspace.is_directory.side_effect = lambda path: path.is_dir()
             effects.workspace.remote_branch_oid.side_effect = lm.remote_branch_oid
@@ -181,7 +209,8 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
             effects.agent.validate_agent_scope.side_effect = lm.validate_agent_scope
             effects.agent._guidance_worker_targets.return_value = ()
             effects.publication.pr_for_branch.return_value = (
-                {'state': 'OPEN', 'headRefOid': original, 'url': 'https://example.test/pr/47'}
+                {'state': 'OPEN', 'headRefOid': original, 'url': 'https://example.test/pr/47',
+                 'headRefName': branch, 'baseRefName': 'main'}
                 if with_pr else None)
             events = []
             resolutions = []
@@ -222,11 +251,11 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
 
             def new_handler():
                 instance = handlers.ExecutionHandlers(
-                    effects, repo='repo', repo_path=repo, state_dir=state_dir,
+                    effects, repo=repo_key, repo_path=repo, state_dir=state_dir,
                     base='main', base_sha=target, provider='codex',
                     config_path=root / 'config', newly_activated=False)
                 instance.plan = fixture.plan
-                instance.catalog_plan = effects.state.active_execplan('repo')
+                instance.catalog_plan = effects.state.active_execplan(repo_key)
                 return instance
 
             def restart():
@@ -236,7 +265,7 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                 connection = sqlite3.connect(database)
                 connection.row_factory = sqlite3.Row
                 effects = replace(effects, state=ExecutionStatePort(
-                    connection, runtime_state.RuntimeStateRepository(connection), 'repo'),
+                    connection, runtime_state.RuntimeStateRepository(connection), repo_key),
                     checkpoint=ExecutionCheckpointRepository(connection))
                 return new_handler()
 
@@ -253,10 +282,10 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                             'action', 'accepted_files', 'staged_tree_oid',
                         ) if key in expected
                     }
-                    current = effects.checkpoint.get('repo', 'G-047')
+                    current = effects.checkpoint.get(repo_key, 'G-047')
                     if (current.snapshot or {}).get('rebase_evidence_version') == 2:
                         effects.checkpoint.record(
-                            'repo', 'G-047', expected_generation=current.generation,
+                            repo_key, 'G-047', expected_generation=current.generation,
                             operation=current.operation, expected_head=current.expected_head,
                             target_base_oid=current.target_base_oid,
                             observed_remote_oid=current.observed_remote_oid,
@@ -275,28 +304,56 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
             self.assertNotIsInstance(conflict_context, ExecutionOutcome)
             self.assertTrue(conflict_context.resolving_rebase)
             self.assertEqual(events, [])
-            if not legacy:
-                handler.run(conflict_context)
-                self.assertEqual(len(resolutions), 1)
-                self.assertEqual(git(worktree, 'diff', '--name-only', '--diff-filter=U').stdout.strip(), 'skip.txt')
-            real_post = handler._post_rebase_observation
+            if manual:
+                while lm._rebase_in_progress_for_branch(worktree, branch):
+                    source = git(worktree, 'rev-parse', 'REBASE_HEAD').stdout.strip()
+                    resolutions.append(source)
+                    conflicts = git(worktree, 'diff', '--name-only', '--diff-filter=U').stdout.splitlines()
+                    if 'app.txt' in conflicts:
+                        resolved = upstream.copy()
+                        resolved[0] = 'value=resolved\n'
+                        (worktree / 'app.txt').write_text(''.join(resolved))
+                        git(worktree, 'add', '--', 'app.txt')
+                        git(worktree, '-c', 'core.editor=true', 'rebase', '--continue', check=False)
+                    elif 'skip.txt' in conflicts:
+                        (worktree / 'skip.txt').write_text('base\n')
+                        git(worktree, 'add', '--', 'skip.txt')
+                        git(worktree, 'rebase', '--skip', check=False)
+                    else:
+                        self.fail('unexpected manual conflict')
+                if sealed_restart:
+                    handler._finish_rebase_journal(handler._context())
+                if missing_journal:
+                    (state_dir / 'manager-git-journal').rename(state_dir / 'preserved-old-audit')
+            else:
+                if not legacy:
+                    handler.run(conflict_context)
+                    self.assertEqual(len(resolutions), 1)
+                    self.assertEqual(git(worktree, 'diff', '--name-only', '--diff-filter=U').stdout.strip(), 'skip.txt')
+                real_post = handler._post_rebase_observation
 
-            def crash_after_git(context, target_oid, output, **kwargs):
-                if not lm._rebase_in_progress_for_branch(worktree, branch):
-                    raise SimulatedProcessExit()
-                return real_post(context, target_oid, output, **kwargs)
+                def crash_after_git(context, target_oid, output, **kwargs):
+                    if not lm._rebase_in_progress_for_branch(worktree, branch):
+                        raise SimulatedProcessExit()
+                    return real_post(context, target_oid, output, **kwargs)
 
-            crash = (mock.patch.object(effects.state, 'complete_rebase',
-                                       side_effect=SimulatedProcessExit)
-                     if sealed_restart else mock.patch.object(
-                         handler, '_post_rebase_observation', side_effect=crash_after_git))
-            with crash:
-                with self.assertRaises(SimulatedProcessExit):
-                    handler.run(handler._context())
+                crash = (mock.patch.object(effects.state, 'complete_rebase', side_effect=SimulatedProcessExit)
+                         if sealed_restart else mock.patch.object(handler, '_post_rebase_observation',
+                                                                   side_effect=crash_after_git))
+                with crash:
+                    with self.assertRaises(SimulatedProcessExit):
+                        handler.run(handler._context())
             self.assertEqual(len(resolutions), 1 if legacy else 2)
             final_head = git(worktree, 'rev-parse', 'HEAD').stdout.strip()
+            if latest_base_advanced:
+                (repo / 'docs/PRODUCT.md').write_text('# Product\n\nUpdated current input.\n')
+                git(repo, 'add', '--', 'docs/PRODUCT.md')
+                git(repo, 'commit', '-m', 'Advance inputs after completed Git rebase')
+                git(repo, 'push', 'origin', 'main')
+                fixture.remote = git(repo, 'rev-parse', 'HEAD').stdout.strip()
+                connection.execute('UPDATE exec_plans SET current_revision_sha = ?', (fixture.remote,))
             slot = journal._slot(state_dir, str(repo.resolve()), 'managed_rebase', str(worktree.resolve()))
-            self.assertEqual((slot / 'active.json').exists(), not sealed_restart)
+            self.assertEqual((slot / 'active.json').exists(), not sealed_restart and not missing_journal)
             sealed_before = {path.name: path.read_bytes()
                              for path in slot.glob('*.result.json')}
             intents_before = {path.name: path.read_bytes()
@@ -306,50 +363,56 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                                  if journal._read(path)['observed']['metadata'] is None]
                 self.assertEqual(len(final_results), 1)
                 sealed_id = final_results[0]['id']
-                self.assertIsNone(effects.checkpoint.get('repo', 'G-047').completed_rebase())
-            self.assertEqual(effects.checkpoint.get('repo', 'G-047').operation, 'rebase')
-            audit_before = handler.rebase_corrections.get('repo', 'G-047').audit
+                self.assertIsNone(effects.checkpoint.get(repo_key, 'G-047').completed_rebase())
+            self.assertEqual(effects.checkpoint.get(repo_key, 'G-047').operation, 'rebase')
+            audit_row = handler.rebase_corrections.get(repo_key, 'G-047')
+            audit_before = audit_row.audit if audit_row else ()
             handler = restart()
 
             def no_repeated_rebase(path, *args, **kwargs):
-                if 'rebase' in args:
+                if 'rebase' in args and (not latest_base_advanced or args[-1] != fixture.remote):
                     self.fail('restart repeated completed Git rebase')
                 return git(path, *args, **kwargs)
 
             effects.workspace.git.side_effect = no_repeated_rebase
             recovered = handler.recover(handler._context())
             self.assertNotIsInstance(recovered, ExecutionOutcome)
-            completed_checkpoint = effects.checkpoint.get('repo', 'G-047')
+            completed_checkpoint = effects.checkpoint.get(repo_key, 'G-047')
             self.assertIsNone(completed_checkpoint.operation)
             for name, content in {**sealed_before, **intents_before}.items():
                 self.assertEqual((slot / name).read_bytes(), content)
             if sealed_restart:
-                self.assertEqual(completed_checkpoint.snapshot['rebase_completion']['id'], sealed_id)
+                self.assertEqual(completed_checkpoint.snapshot['current_rebase_acceptance']['head'], final_head)
             handler._complete_rebase_intent(handler._context())
-            self.assertEqual(effects.checkpoint.get('repo', 'G-047'), completed_checkpoint)
+            self.assertEqual(effects.checkpoint.get(repo_key, 'G-047'), completed_checkpoint)
             if not with_pr:
                 self.assertTrue(handler._owned_checkpoint_remote(
                     handler._context(), handler._row(), original,
-                    effects.checkpoint.get('repo', 'G-047'),
+                    effects.checkpoint.get(repo_key, 'G-047'),
                 ))
             self.assertEqual(effects.state.row()['worker_session_id'], 'worker-session')
-            self.assertEqual(handler.rebase_corrections.get('repo', 'G-047').audit, audit_before)
+            audit_row = handler.rebase_corrections.get(repo_key, 'G-047')
+            self.assertEqual(audit_row.audit if audit_row else (), audit_before)
             self.assertEqual(len(resolutions), 1 if legacy else 2)
             transitions = journal.verified_managed_transitions(
                 state_dir, str(repo.resolve()), 'plan:G-047',
                 agent_session_id='worker-session', git=git)
-            completed = [item for item in transitions
-                         if item['result']['observed']['metadata'] is None]
-            self.assertEqual(len(completed), 1)
-            proof = completed[0]['result']['replay_proof']
-            self.assertEqual([item['outcome'] for item in proof],
-                             (['patch', 'resolved', 'patch', 'patch'] if legacy else
-                              ['patch', 'resolved', 'skip', 'patch', 'patch']))
-            self.assertNotEqual(proof[1]['tree'], proof[-1]['tree'])
+            self.assertEqual(transitions, [], 'manual/current acceptance is not Manager replay evidence')
+            self.assertEqual(recovered.phase, ExecutionPhase.IMPLEMENTING)
+            self.assertIsNone(effects.state.row()['worker_result'])
+            self.assertIsNone(effects.state.row()['verify_result'])
+            self.assertIsNone(effects.state.row()['review_result'])
             context = handler.guard(recovered)
+            if latest_base_advanced:
+                self.assertIsInstance(context, ExecutionOutcome)
+                context = handler.guard(handler._context())
+                final_head = git(worktree, 'rev-parse', 'HEAD').stdout.strip()
+                self.assertEqual(effects.state.row()['active_sha'], fixture.remote)
             self.assertNotIsInstance(context, ExecutionOutcome)
-            if context.phase is ExecutionPhase.IMPLEMENTING:
-                context = handler.run(context).context
+            self.assertEqual(context.phase, ExecutionPhase.IMPLEMENTING)
+            before_worker_count = events.count('worker')
+            context = handler.run(context).context
+            self.assertEqual(events.count('worker'), before_worker_count + 1)
             self.assertEqual(context.phase, ExecutionPhase.VERIFYING)
             verified = handler.verify(context, handler)
             self.assertEqual(verified.context.phase, ExecutionPhase.REVIEWING, verified.detail)
