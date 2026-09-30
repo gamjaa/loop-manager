@@ -37,11 +37,48 @@ priority: critical
 
 ## Progress
 
-- [ ] 현재 Git 관측·범위 검사와 공통 판정 경계
-- [ ] 호환 가능한 수용 결과 저장·generation 검사
-- [ ] 정상 수동 결과와 실제 상태 불일치의 targeted 회귀 사례
+- [x] 현재 Git 관측·범위 검사와 공통 판정 경계
+- [x] 호환 가능한 수용 결과 저장·generation 검사
+- [x] 정상 수동 결과와 실제 상태 불일치의 targeted 회귀 사례
+
+Worker는 새 판정 module, 새 runtime test class와 변경한 checkpoint 저장 case만 실행했다. 기존 journal 완료의 원자 저장·멱등성 case도 같은 targeted command로 확인했다. 전체 verify, 실제 Git lifecycle, commit·push·PR 생성은 실행하지 않았으며 Manager 검증과 Reviewer 검토는 후속 단계다.
+
+기반 구현의 targeted command는 아래와 같으며 19개 unit test가 모두 통과했다.
+
+```sh
+python3 -B -m unittest tests.test_managed_rebase_validation tests.test_runtime_state.CurrentRebaseRuntimeTests tests.test_execution_checkpoint_state.CheckpointRepositoryTests.test_current_acceptance_is_generation_bound_and_preserves_legacy_audit tests.test_execution_checkpoint_state.CheckpointRepositoryTests.test_current_acceptance_supports_no_history_and_retains_prior_acceptances tests.test_execution_checkpoint_state.CheckpointRepositoryTests.test_rebase_completion_rolls_back_checkpoint_when_projection_fails tests.test_execution_checkpoint_state.CheckpointRepositoryTests.test_rebase_completion_updates_checkpoint_and_projection_once
+```
+
+Manager verify 피드백 `verify:d0372d9f34e1e77042ee07cd2450b3cacb5b6c0201d9546f898589cd5c44f7db` (occurrence=1, revision=1)의 Planner 격리 import 실패를 재현했다. 해당 fixture의 복사 목록에 새 rebase 관측·판정 모듈을 포함하고, import 실패의 stderr를 assertion에 표시하도록 보강했다. bytecode 보존 및 범위 밖 파일 거부 assertion은 유지했다.
+
+FAILED_COMMAND: python3 -B -m unittest tests.test_loop_manager.AgentScopeValidatorTest.test_planner_import_bytecode_is_ignored_without_hiding_scope_violations
+최초 실행 결과: FAILED (errors=1)
+RERUN: python3 -B -m unittest tests.test_loop_manager.AgentScopeValidatorTest.test_planner_import_bytecode_is_ignored_without_hiding_scope_violations
+
+수정 후 동일 명령의 최종 결과는 1개 test 통과(`OK`)다. 이번 교정에서는 이 case만 실행했고 전체 verify는 다시 실행하지 않았다.
+
+후속 Worker 결과 검증은 `TARGETED_TESTS`에 작성한 "실패 없음"을 실패 토큰으로 인식했다. 이전 보고의 실패·재실행 명령은 이 단락 밖에 있어 해결 이력으로 대조되지 않았다. 같은 unit case를 다시 실행해 1개 test 통과(`OK`)를 확인했고, 실패 명령·최초 실행 결과·동일 명령 재실행·최종 `OK`를 모두 `TARGETED_TESTS` 안에 순서대로 배치했다. 준비된 최종 보고문은 기존 `parse_worker_outcome`과 `parse_worker_result`의 읽기 전용 검증을 통과했다.
+
+Reviewer 피드백 `review:managed_rebase_validation.py::assess_current_rebase::detached-registration-mismatch` (occurrence=1, revision=1)을 교정했다. 진행 상태는 실제 snapshot의 `detached=True` 등록 값을 요구하고, 완료 상태는 detached 등록 표식이 있으면 거부한다. 직접 판정 fixture를 실제 형식에 맞추고, Git porcelain catalog parser와 `capture_git_snapshot`의 등록 serializer를 그대로 사용하는 관측 unit case를 추가했다. Git 읽기와 나머지 snapshot reader는 mock으로 한정하여 실제 Git lifecycle 없이 두 rebase backend의 clean·충돌 index 해결 대기를 확인했다.
+
+FAILED_COMMAND: python3 -B -m unittest tests.test_managed_rebase_validation.CurrentRebasePolicyTests.test_owned_detached_conflict_waits_without_mutating_index tests.test_managed_rebase_validation.CurrentRebasePolicyTests.test_rejects_identity_target_operation_and_lease_mismatches tests.test_managed_rebase_validation.CurrentRebaseObservationTests.test_adapter_preserves_actual_detached_snapshot_and_waits_for_resolution
+최초 실행 결과: FAILED (failures=8)
+RERUN: python3 -B -m unittest tests.test_managed_rebase_validation.CurrentRebasePolicyTests.test_owned_detached_conflict_waits_without_mutating_index tests.test_managed_rebase_validation.CurrentRebasePolicyTests.test_rejects_identity_target_operation_and_lease_mismatches tests.test_managed_rebase_validation.CurrentRebaseObservationTests.test_adapter_preserves_actual_detached_snapshot_and_waits_for_resolution
+
+수정 후 동일 명령의 최종 결과는 3개 unit test 통과(`OK`)다. 기존 불일치 거부 및 index 보존 assertion을 유지했고, 이번 교정에서도 전체 verify·commit·push·PR 생성은 실행하지 않았다.
+
+Reviewer 피드백 `review:tests/test_managed_rebase_validation.py::currentrebaseobservationtests.adapters::windows-noncanonical-fixture` (occurrence=1, revision=1)을 교정했다. 관측 unit test 클래스는 임시 repository·worktree·common-dir 디렉터리를 만들고 실제 `Path.resolve()`로 현재 플랫폼의 canonical 경로를 구성한다. 기대값, Git common-dir 응답, snapshot worktree 등록과 detached porcelain fixture는 같은 경로를 사용한다. 순수 판정·저장 테스트가 공유하는 기존 fixture는 유지했다. 정상 관측의 경로·등록 일치를 확인하고, repository 또는 worktree 경로에 `..`가 남아 있으면 Git 조회 전에 거부하는 회귀 case를 추가했다.
+
+```sh
+python3 -B -m unittest tests.test_managed_rebase_validation.CurrentRebaseObservationTests
+```
+
+수정한 관측 test 클래스만 Linux에서 실행해 6개 unit test가 통과했다(`OK`). Windows 실행 환경이 없어 Windows에서 실행하지 않았으며, 전체 verify·commit·push·PR 생성은 실행하지 않았다.
 
 ## Decision Log
 
 - R-048과 ARCHITECTURE의 R-048 절은 기존 R-045의 작업 수행 증거 정책을 명시적으로 대체한다. 추가 사용자 결정을 요구하거나 구 정책을 새 완료 조건으로 재도입하지 않는다.
 - 실행 연결 없이 검증 가능한 기반을 먼저 Merge한다. G-109가 모든 기존 rebase 호출 경로를 연결하며, G-104·G-106·G-107의 게시·원격 복구 기능을 이 계획에서 중복 구현하지 않는다.
+- `managed_rebase_validation.py`는 순수 현재 상태·파일 범위 판정과 수용 형식을, `managed_rebase_observation.py`는 Git 읽기 및 관측 안정성 확인을 담당한다. 기존 루트 내부 모듈 import 방식과 checkpoint 경계에 맞춰 배치했으며 두 모듈의 import·unit test·verify 참조는 G-060의 내부 구현 inventory 대상이다. 이 계획에서는 파일 이동을 수행하지 않는다.
+- 관측 adapter에는 기존 canonical workspace 검증, 현재 Worker 경로 정책, 현재 입력·guidance/archive 계약, 실제 파일 mode·signature와 live remote/PR 조회를 명시적으로 주입한다. 최종 target-to-HEAD diff와 실제 index debug flags를 검사하며 과거 commit replay 또는 stage tree를 복원하지 않는다. 안정성 확인과 저장 직전 재관측이 같은 정책·입력·현재 상태 지문에 결합된다.
+- 수용은 기존 journal 완료와 다른 snapshot key·kind로 저장한다. 기존 완료·stage·실패 기록은 보존하고 current acceptance 이력만 추가한다. checkpoint·실행 row·project projection은 같은 transaction에서 갱신하며 수용 자체로 게시 승인이나 별도 차단 해제를 수행하지 않는다. 기존 운영 호출은 계속 legacy 완료 정책을 사용한다.

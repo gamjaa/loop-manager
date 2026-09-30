@@ -641,11 +641,27 @@ class RuntimeStateRepository:
                 self._enqueue(repo)
 
     def complete_rebase(
-        self, expected, checkpoint_repository, *, completion: Mapping[str, object],
+        self, expected, checkpoint_repository, *,
         project_values: Mapping[str, object],
+        completion: Mapping[str, object] | None = None,
         published_proof: Mapping[str, object] | None = None,
+        acceptance: Mapping[str, object] | None = None,
+        reobserve=None,
     ):
-        """Apply one sealed journal result to checkpoint and both runtime rows."""
+        """Atomically apply legacy proof or an explicitly rechecked current result.
+
+        Existing callers retain their journal policy. Current-result acceptance
+        requires a fresh decision and grants neither publication nor completion.
+        """
+        if acceptance is not None:
+            if completion is not None or published_proof is not None:
+                raise RuntimeStateError('current acceptance is not journal execution proof')
+            return self._complete_current_rebase(
+                expected, checkpoint_repository, acceptance=acceptance,
+                project_values=project_values, reobserve=reobserve,
+            )
+        if completion is None:
+            raise RuntimeStateError('rebase completion result is missing')
         repo, plan_id = expected.repo, expected.plan_id
         with _transaction(self.connection):
             current = checkpoint_repository.get(repo, plan_id)
@@ -686,6 +702,86 @@ class RuntimeStateRepository:
             return self.transition_from_snapshot(
                 expected, plan_values=plan_values,
                 project_values=project_values,
+            )
+
+    def _complete_current_rebase(
+        self, expected, checkpoint_repository, *, acceptance, project_values, reobserve,
+    ):
+        from managed_rebase_validation import RebaseDecision, RebaseStatus, valid_acceptance
+
+        if (not valid_acceptance(acceptance) or not callable(reobserve)
+                or checkpoint_repository.connection is not self.connection):
+            raise RuntimeStateError('current rebase acceptance or recheck is missing')
+        repo, plan_id = expected.repo, expected.plan_id
+        if (acceptance['repo'] != repo or acceptance['plan_id'] != plan_id
+                or acceptance['plan_path'] != expected.path
+                or acceptance['branch'] != expected.branch
+                or acceptance['worktree'] != expected.worktree
+                or expected.workspace_owned != 1
+                or (expected.publication_remote_oid is not None
+                    and acceptance['remote'].get('oid') != expected.publication_remote_oid
+                    and acceptance['remote'].get('oid') != expected.pr_conflict_head_oid)
+                or acceptance['remote'].get('pull_request') != (
+                    None if expected.pr_url is None else {
+                        'identity': expected.pr_url,
+                        'repository': acceptance['remote'].get('repository'),
+                        'branch': expected.branch, 'head': expected.pr_head_oid,
+                        'state': 'OPEN',
+                    })):
+            raise RuntimeStateError('current rebase execution ownership changed')
+        values = dict(project_values)
+        if (values.get('phase') not in {'WORKING', 'IMPLEMENTING', 'VERIFYING'}
+                and not (expected.status == 'PLAN_BLOCKED'
+                         and values.get('phase') == expected.phase)):
+            raise RuntimeStateError('current acceptance requires candidate revalidation')
+        if ((expected.status == 'PLAN_BLOCKED' and values.get('phase') != expected.phase)
+                or values.get('active_sha', acceptance['target_base_oid']) !=
+                    acceptance['target_base_oid']):
+            raise RuntimeStateError('current acceptance cannot release an execution block')
+        invalidated = {
+            'validated_base_sha', 'verify_result', 'review_result', 'verify_token',
+            'review_token', 'publication_token',
+        }
+        if (not set(values) <= invalidated | {'phase', 'active_sha'}
+                or any(values.get(key) is not None for key in invalidated)):
+            raise RuntimeStateError('current acceptance cannot approve publication or clear blocks')
+        values.update({key: None for key in invalidated})
+        values['active_sha'] = acceptance['target_base_oid']
+        def check_owner():
+            projection = self.connection.execute(
+                'SELECT plan_path, branch, worktree, pr_url, pr_head_oid, phase '
+                'FROM projects WHERE repo = ?', (repo,),
+            ).fetchone()
+            owner = (expected.path, expected.branch, expected.worktree,
+                     expected.pr_url, expected.pr_head_oid, expected.phase)
+            if (self.projected(repo) != expected or self.get(repo, plan_id) != expected
+                    or projection is None or tuple(projection) != owner):
+                raise RuntimeStateError('execution ownership or project projection changed')
+        with _transaction(self.connection):
+            check_owner()
+            current = checkpoint_repository.get(repo, plan_id)
+            already_applied = current.current_rebase_acceptance() == dict(acceptance)
+            if not already_applied and current.generation != acceptance['generation']:
+                raise RuntimeStateError('current rebase acceptance generation is stale')
+            decision = reobserve()
+            if (not isinstance(decision, RebaseDecision)
+                    or decision.status is not RebaseStatus.COMPLETE
+                    or decision.acceptance != dict(acceptance)):
+                raise RuntimeStateError('current rebase state or inputs changed after validation')
+            # Rechecking Git may take time; compare SQLite ownership once more.
+            check_owner()
+            if checkpoint_repository.get(repo, plan_id) != current:
+                raise RuntimeStateError('checkpoint changed during rebase recheck')
+            if already_applied:
+                return expected
+            checkpoint_repository.accept_current_rebase(
+                repo, plan_id, acceptance=dict(acceptance),
+            )
+            self._fault('after_rebase_acceptance')
+            plan_values = dict(values)
+            plan_values['status'] = execplan_status_for_phase(plan_values.pop('phase'))
+            return self.transition_from_snapshot(
+                expected, plan_values=plan_values, project_values=values,
             )
 
     def mirror_project_values(

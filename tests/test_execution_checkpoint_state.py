@@ -8,9 +8,57 @@ from execution_checkpoint_state import (
 )
 import runtime_state
 from tests import test_runtime_state
+from tests.test_managed_rebase_validation import decision_for, expectation, observation
 
 
 class CheckpointRepositoryTests(unittest.TestCase):
+    def test_current_acceptance_is_generation_bound_and_preserves_legacy_audit(self):
+        connection = sqlite3.connect(':memory:')
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        repository = ExecutionCheckpointRepository(connection)
+        history = {'rebase_completion': {'id': 'old-journal'},
+                   'completed_rebase': {'generation': 0, 'journal_id': 'legacy'},
+                   'stage_evidence': {'tree': 'old-tree'}, 'failure': 'old-failure'}
+        repository.record(
+            '/repo', 'G-108', expected_generation=0, operation='rebase',
+            expected_head='before', target_base_oid='base',
+            observed_remote_oid='remote', snapshot=history,
+        )
+        result = decision_for().acceptance
+        saved = repository.accept_current_rebase('/repo', 'G-108', acceptance=result)
+        self.assertEqual(saved.current_rebase_acceptance(), result)
+        for key, value in history.items():
+            self.assertEqual(saved.snapshot[key], value)
+        self.assertEqual(saved.completed_rebase(), history['completed_rebase'])
+        self.assertEqual(repository.accept_current_rebase('/repo', 'G-108',
+                                                        acceptance=result), saved)
+        with self.assertRaises(CheckpointRace):
+            repository.accept_current_rebase('/repo', 'G-108', acceptance={**result, 'head': 'forged'})
+        repository.record(
+            '/repo', 'G-108', expected_generation=saved.generation, operation=None,
+            expected_head='other', target_base_oid='base',
+            observed_remote_oid='remote', snapshot=saved.snapshot,
+        )
+        self.assertIsNone(repository.get('/repo', 'G-108').current_rebase_acceptance())
+        with self.assertRaises(CheckpointRace):
+            repository.accept_current_rebase('/repo', 'G-108', acceptance=result)
+
+    def test_current_acceptance_supports_no_history_and_retains_prior_acceptances(self):
+        connection = sqlite3.connect(':memory:')
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        repository = ExecutionCheckpointRepository(connection)
+        first = decision_for(expectation(generation=0)).acceptance
+        saved = repository.accept_current_rebase('/repo', 'G-108', acceptance=first)
+        self.assertEqual(saved.generation, 1)
+        self.assertIsNone(saved.completed_rebase())
+        expected = expectation(generation=saved.generation)
+        second = decision_for(expected, observation(expected, repository_state_fingerprint='new')).acceptance
+        final = repository.accept_current_rebase('/repo', 'G-108', acceptance=second)
+        self.assertEqual(final.snapshot['current_rebase_acceptance_history'], [first])
+        self.assertEqual(final.current_rebase_acceptance(), second)
+
     def test_completed_rebase_requires_later_generation_and_cleared_operation(self):
         connection = sqlite3.connect(':memory:')
         connection.row_factory = sqlite3.Row
