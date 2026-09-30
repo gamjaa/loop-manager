@@ -34,7 +34,7 @@ PR이 없는 동일 계획의 기존 원격 작업 branch를 관리 rebase한 �
 
 ## Validation
 
-- Worker는 직접 변경한 `tests/test_execution_handlers.py`, `tests/test_execution_checkpoint_state.py`, `tests/test_manager_git_journal.py` 중 게시 intent·순서·lease에 관련된 targeted unit case만 실행한다. 실제 Git lifecycle test는 작성하고 Manager 전체 verify에 맡긴다.
+- Worker는 직접 변경한 `tests/test_execution_handlers.py`, `tests/test_execution_checkpoint_state.py`, `tests/test_manager_git_journal.py`, `tests/test_managed_mutation_evidence.py` 중 게시 intent·순서·lease와 직접 rebase 수용에 관련된 targeted unit case만 실행한다. 실제 Git lifecycle test는 작성하고 Manager 전체 verify에 맡긴다.
 - 실제 Git 이력으로 게시 checkpoint → 첫 rebase → 중간 게시 → 새 base 전진 → 두 번째 rebase를 검증한다. 첫 push 전·후 중단, 자동·수동 충돌 교정, 원격 OID 경쟁, lease·권한 거부 및 미게시 다중 rebase를 다룬다. 과거 rebase 증거가 없는 정상 현재 결과는 게시 대상으로 인정하고 현재 소유권·범위·원격 불일치는 계속 거부한다.
 - 전체 verify는 중간 게시 이후 최종 후보의 검증·Review·PR gate가 유지되고 기존 PR 및 신규 branch가 조기 게시되지 않는지 확인한다.
 
@@ -46,6 +46,7 @@ PR이 없는 동일 계획의 기존 원격 작업 branch를 관리 rebase한 �
 - Targeted unit 검증: `ImmediateRebasePublicationTests`와 `RebasePublicationRepositoryTests` 16개 및 기존 rebase 수용·소유권 case 4개 통과. 실제 Git lifecycle 테스트와 전체 verify는 Worker가 실행하지 않고 Loop Manager 검증에 맡긴다.
 - 검증 피드백 보정: 게시 OID 반영 후에도 남아 있는 최종 push intent의 이전 lease 소유권과 일반 교정·Review checkpoint의 legacy 판정 회귀를 수정했다. 실패했던 소유권 unit case 4개는 동일 명령 재실행에서 모두 통과했고, 갱신한 `ImmediateRebasePublicationTests` 11개도 통과했다. Planner import fixture에 새 게시 모듈을 포함하고 lifecycle 순서 assertion은 중간 게시 재개 이후의 호출을 검사하도록 수정했다. 이 실제 Git 테스트와 전체 verify의 재검증은 Loop Manager가 수행한다.
 - Review 피드백 보정: 미완료 게시 intent도 실제 범위 선검증에서 현재 rebase HEAD와 선택 ref를 대조하며, 저장한 lease 또는 이미 push한 HEAD만 원격 기대값으로 사용한다. 직접 차단 해제에서는 clean index 결과의 게시를 먼저 완료하고 원래 staging을 복원한다. 활성 projection이 없는 차단 계획의 게시도 차단·검증·실행 슬롯을 보존하며, 중단·거부 뒤 같은 intent로 재개한다. 관련 unit class와 직접 수용 case 29개가 모두 통과했고 전체 verify·Review 재검증은 Loop Manager에 맡긴다.
+- 후속 verify 피드백 보정: 직접 rebase 수용 unit fixture의 게시 경계를 mock 처리하고, 정상·중단 차단 해제 unit test는 수용 → 게시 → staging 복원 순서를 확인하도록 갱신했다. 수정한 unit case 6개가 모두 통과했다. 실제 Git checkpoint 해제 테스트는 rebase HEAD의 즉시 원격 게시·채택 OID·고정 이전 lease를 확인하고 별도로 미게시 legacy project block 상태를 재현한다. 실제 Git 테스트와 전체 verify는 Worker가 실행하지 않았다.
 
 ## Decision Log
 
