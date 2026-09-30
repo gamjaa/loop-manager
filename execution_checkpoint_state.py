@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import json
 import sqlite3
 from recovery_runtime import RecoveryFailure, RecoveryReason
+from managed_rebase_validation import valid_acceptance
 
 
 SCHEMA = """
@@ -48,6 +49,18 @@ class CheckpointRecord:
                 or proof['generation'] >= self.generation):
             return None
         return proof
+
+    def current_rebase_acceptance(self) -> dict | None:
+        """Read a current-result acceptance separately from legacy execution proof."""
+        result = (self.snapshot or {}).get('current_rebase_acceptance')
+        if (not isinstance(result, dict) or not valid_acceptance(result)
+                or self.operation is not None
+                or self.generation != result['generation'] + 1
+                or self.expected_head != result['head']
+                or self.target_base_oid != result['target_base_oid']
+                or self.observed_remote_oid != result['remote'].get('oid')):
+            return None
+        return result
 
 
 class ExecutionCheckpointRepository:
@@ -106,3 +119,36 @@ class ExecutionCheckpointRepository:
             self.connection.execute("RELEASE SAVEPOINT execution_checkpoint_record")
             raise
         return self.get(repo, plan_id)
+
+    def accept_current_rebase(self, repo: str, plan_id: str, *,
+                              acceptance: dict) -> CheckpointRecord:
+        """CAS an acceptance while preserving prior evidence and audit records.
+
+        The runtime repository owns the transaction and live-state recheck.
+        This method only stores the already checked result.
+        """
+        if (not valid_acceptance(acceptance) or acceptance['repo'] != repo
+                or acceptance['plan_id'] != plan_id):
+            raise CheckpointRace('current rebase acceptance identity is invalid')
+        current = self.get(repo, plan_id)
+        if current.current_rebase_acceptance() == acceptance:
+            return current
+        if (current.generation != acceptance['generation']
+                or current.operation not in {None, 'rebase'}
+                or (current.target_base_oid is not None
+                    and current.target_base_oid != acceptance['target_base_oid'])
+                or (current.observed_remote_oid is not None
+                    and current.observed_remote_oid != acceptance['remote']['oid'])):
+            raise CheckpointRace('current rebase checkpoint generation or target changed')
+        snapshot = dict(current.snapshot or {})
+        history = list(snapshot.get('current_rebase_acceptance_history', []))
+        if 'current_rebase_acceptance' in snapshot:
+            history.append(snapshot['current_rebase_acceptance'])
+        snapshot['current_rebase_acceptance_history'] = history
+        snapshot['current_rebase_acceptance'] = dict(acceptance)
+        return self.record(
+            repo, plan_id, expected_generation=current.generation,
+            operation=None, expected_head=acceptance['head'],
+            target_base_oid=acceptance['target_base_oid'],
+            observed_remote_oid=acceptance['remote']['oid'], snapshot=snapshot,
+        )

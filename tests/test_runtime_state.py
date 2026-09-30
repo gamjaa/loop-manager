@@ -7,8 +7,177 @@ import unittest
 import loop_manager
 import notifications
 import runtime_state
+from execution_checkpoint_state import ExecutionCheckpointRepository
+from tests.test_managed_rebase_validation import decision_for, expectation, observation
 from recovery_runtime import RecoveryObservation, RecoveryReason, decide
 from scoped_blocking import BlockReasonCode
+
+
+class CurrentRebaseRuntimeTests(unittest.TestCase):
+    def fixture(self, *, legacy=False):
+        connection = RuntimeStateRepositoryTest()._connection()
+        self.addCleanup(connection.close)
+        runtime = runtime_state.RuntimeStateRepository(connection)
+        runtime.activate('repo', 'G-047', activation_sha='old-base',
+                         branch='loop-manager/G-047', worktree='/owned')
+        runtime.reserve_workspace('repo', 'G-047', reserved_value=1, allowed_values=(1,))
+        current = runtime.projected('repo')
+        checkpoint = ExecutionCheckpointRepository(connection)
+        if not legacy:
+            checkpoint.record(
+                'repo', 'G-047', expected_generation=0, operation='rebase',
+                expected_head='before', target_base_oid='base', observed_remote_oid='remote',
+                snapshot={'old_journal': 'failed-audit', 'stage_evidence': {'tree': 'old'}},
+            )
+        expected = expectation(repo='repo', plan_id=current.plan_id, plan_path=current.path,
+                               branch=current.branch, worktree=current.worktree,
+                               generation=checkpoint.get('repo', 'G-047').generation,
+                               remote=dataclasses.replace(expectation().remote, branch=current.branch))
+        decision = decision_for(expected, observation(expected))
+        return connection, runtime, checkpoint, current, expected, decision
+
+    def test_current_acceptance_is_atomic_idempotent_and_never_execution_proof(self):
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                connection, runtime, checkpoint, original, expected, decision = self.fixture(legacy=legacy)
+                result = runtime.complete_rebase(
+                    original, checkpoint, acceptance=decision.acceptance,
+                    project_values={'phase': 'VERIFYING'}, reobserve=lambda: decision,
+                )
+                saved = checkpoint.get('repo', 'G-047')
+                self.assertEqual(saved.current_rebase_acceptance(), decision.acceptance)
+                self.assertNotIn('rebase_completion', saved.snapshot)
+                self.assertNotIn('completed_rebase', saved.snapshot)
+                if not legacy:
+                    self.assertEqual(saved.snapshot['old_journal'], 'failed-audit')
+                    self.assertEqual(saved.snapshot['stage_evidence'], {'tree': 'old'})
+                self.assertEqual(result.status, 'VERIFYING')
+                self.assertIsNone(result.verify_result)
+                self.assertIsNone(result.review_result)
+                self.assertEqual(connection.execute(
+                    "SELECT phase, active_sha FROM projects WHERE repo = 'repo'"
+                ).fetchone()[:], ('VERIFYING', 'base'))
+                # A new repository instance models restart; the same result is
+                # re-observed but does not increment generation or update rows.
+                restarted = runtime_state.RuntimeStateRepository(connection)
+                result_again = restarted.complete_rebase(
+                    result, ExecutionCheckpointRepository(connection), acceptance=decision.acceptance,
+                    project_values={'phase': 'VERIFYING'}, reobserve=lambda: decision,
+                )
+                self.assertEqual(result_again, result)
+                self.assertEqual(checkpoint.get('repo', 'G-047'), saved)
+                changed = decision_for(expected, dataclasses.replace(observation(expected),
+                                                                      input_fingerprint='new-input'))
+                with self.assertRaises(runtime_state.RuntimeStateError):
+                    restarted.complete_rebase(
+                        result, checkpoint, acceptance=decision.acceptance,
+                        project_values={'phase': 'VERIFYING'}, reobserve=lambda: changed,
+                    )
+
+    def test_current_acceptance_rolls_back_checkpoint_plan_project_and_outbox(self):
+        for stage in ('after_rebase_acceptance', 'after_execplan_update',
+                      'after_project_update', 'after_outbox_enqueue'):
+            with self.subTest(stage=stage):
+                connection, runtime, checkpoint, original, _expected, decision = self.fixture()
+                notifications.configure_session(connection, enabled=True)
+                connection.commit()
+                before_checkpoint = checkpoint.get('repo', 'G-047')
+                before_project = tuple(connection.execute("SELECT * FROM projects").fetchone())
+                before_events = connection.execute('SELECT COUNT(*) FROM notification_outbox').fetchone()[0]
+                def fail(current):
+                    if current == stage:
+                        raise RuntimeError(f'interrupted at {stage}')
+                failing = runtime_state.RuntimeStateRepository(connection, fault_hook=fail)
+                with self.assertRaisesRegex(RuntimeError, 'interrupted'):
+                    failing.complete_rebase(
+                        original, checkpoint, acceptance=decision.acceptance,
+                        project_values={'phase': 'VERIFYING'}, reobserve=lambda: decision,
+                    )
+                self.assertEqual(checkpoint.get('repo', 'G-047'), before_checkpoint)
+                self.assertEqual(runtime.projected('repo'), original)
+                self.assertEqual(tuple(connection.execute("SELECT * FROM projects").fetchone()), before_project)
+                self.assertEqual(connection.execute('SELECT COUNT(*) FROM notification_outbox').fetchone()[0],
+                                 before_events)
+                recovered = runtime.complete_rebase(
+                    original, checkpoint, acceptance=decision.acceptance,
+                    project_values={'phase': 'VERIFYING'}, reobserve=lambda: decision,
+                )
+                self.assertEqual(recovered.status, 'VERIFYING')
+
+    def test_current_acceptance_refuses_stale_generation_or_post_check_drift(self):
+        for drift in ('generation', 'remote', 'files', 'inputs', 'scope', 'ownership',
+                      'project_projection', 'recheck_checkpoint'):
+            with self.subTest(drift=drift):
+                connection, runtime, checkpoint, original, expected, decision = self.fixture()
+                before = checkpoint.get('repo', 'G-047')
+                reobserve = lambda: decision
+                if drift == 'generation':
+                    checkpoint.record('repo', 'G-047', expected_generation=before.generation,
+                                      operation='rebase', expected_head='before', target_base_oid='base',
+                                      observed_remote_oid='remote', snapshot=before.snapshot)
+                elif drift == 'ownership':
+                    connection.execute("UPDATE exec_plans SET workspace_owned = 0 WHERE repo = 'repo'")
+                elif drift == 'project_projection':
+                    connection.execute("UPDATE projects SET branch = 'other' WHERE repo = 'repo'")
+                elif drift == 'recheck_checkpoint':
+                    def reobserve():
+                        checkpoint.record('repo', 'G-047', expected_generation=before.generation,
+                                          operation='rebase', expected_head='before', target_base_oid='base',
+                                          observed_remote_oid='remote', snapshot=before.snapshot)
+                        return decision
+                else:
+                    actual = observation(expected)
+                    changes = {
+                        'remote': {'remote': dataclasses.replace(expected.remote, oid='race')},
+                        'files': {'repository_state_fingerprint': 'changed-files'},
+                        'inputs': {'input_fingerprint': 'changed'},
+                        'scope': {'scope_fingerprint': 'changed'},
+                    }[drift]
+                    changed = decision_for(expected, dataclasses.replace(actual, **changes))
+                    reobserve = lambda: changed
+                baseline = checkpoint.get('repo', 'G-047')
+                with self.assertRaises(runtime_state.RuntimeStateError):
+                    runtime.complete_rebase(
+                        original, checkpoint, acceptance=decision.acceptance,
+                        project_values={'phase': 'VERIFYING'}, reobserve=reobserve,
+                    )
+                self.assertEqual(checkpoint.get('repo', 'G-047'), baseline)
+
+    def test_current_acceptance_cannot_publish_clear_blocks_or_fake_journal(self):
+        _connection, runtime, checkpoint, original, _expected, decision = self.fixture()
+        for arguments in (
+            {'reobserve': None}, {'completion': {'id': 'made-up'}},
+            {'published_proof': {'journal_id': 'made-up'}},
+            {'project_values': {'phase': 'PUBLISHING'}},
+            {'project_values': {'phase': 'VERIFYING', 'verify_result': 'PASS'}},
+            {'project_values': {'phase': 'VERIFYING', 'last_error': None}},
+        ):
+            with self.subTest(arguments=arguments):
+                kwargs = dict(acceptance=decision.acceptance,
+                              project_values={'phase': 'VERIFYING'}, reobserve=lambda: decision)
+                kwargs.update(arguments)
+                with self.assertRaises(runtime_state.RuntimeStateError):
+                    runtime.complete_rebase(original, checkpoint, **kwargs)
+
+    def test_current_acceptance_preserves_unrelated_block_and_failure_audit(self):
+        connection, runtime, checkpoint, original, _expected, decision = self.fixture()
+        blocked = runtime.transition_from_snapshot(
+            original, plan_values={'status': 'PLAN_BLOCKED', 'blocked_reason': 'agent_scope',
+                                    'last_error': 'existing failure'},
+            project_values={'phase': 'PLAN_BLOCKED', 'last_error': 'existing failure'},
+        )
+        with self.assertRaises(runtime_state.RuntimeStateError):
+            runtime.complete_rebase(blocked, checkpoint, acceptance=decision.acceptance,
+                                    project_values={'phase': 'VERIFYING'}, reobserve=lambda: decision)
+        accepted = runtime.complete_rebase(
+            blocked, checkpoint, acceptance=decision.acceptance,
+            project_values={'phase': 'PLAN_BLOCKED'}, reobserve=lambda: decision,
+        )
+        self.assertEqual(accepted.status, 'PLAN_BLOCKED')
+        self.assertEqual(accepted.last_error, 'existing failure')
+        self.assertEqual(connection.execute(
+            "SELECT blocked_reason FROM exec_plans WHERE repo = 'repo'"
+        ).fetchone()[0], 'agent_scope')
 
 
 class RuntimeStateRepositoryTest(unittest.TestCase):

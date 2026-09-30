@@ -1,0 +1,337 @@
+"""Unit observations only: no Git lifecycle or external service is executed."""
+
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+import unittest
+from unittest import mock
+
+from loop_manager import _worker_path_allowed
+from managed_rebase_observation import (
+    ObservationAdapters, observe_current_rebase, parse_index, parse_raw_changes,
+)
+from managed_rebase_validation import (
+    FileChange, IndexEntry, ObservationFailure, PullRequest, RebaseExpectation,
+    RebaseObservation, RebaseStatus, Remote, WorktreeFile,
+    assess_current_rebase, assess_scope, valid_acceptance,
+)
+
+
+def expectation(**changes):
+    values = dict(
+        repo='/repo', repository_identity='/repo/.git', plan_id='G-108',
+        plan_path='docs/plans/[G-108] Current-State Managed Rebase Validation.md',
+        worktree='/owned', branch='loop-manager/G-108', target_base_oid='base',
+        generation=1, workspace_owned=True, input_fingerprint='inputs',
+        scope_fingerprint='worker-contract',
+        remote=Remote('owner/repo', 'loop-manager/G-108', 'remote'),
+        before_head='before',
+    )
+    values.update(changes)
+    return RebaseExpectation(**values)
+
+
+def observation(expected=None, **changes):
+    expected = expected or expectation()
+    values = dict(
+        repo=expected.repo, repository_identity=expected.repository_identity,
+        worktree=expected.worktree, identity_verified=True, head='after',
+        branch=expected.branch, branch_ref=('after', ''),
+        registration=('HEAD=after', f'branch=refs/heads/{expected.branch}'),
+        branch_worktrees=(expected.worktree,),
+        operations=(), metadata=None, base_is_ancestor=True, index_clean=True,
+        index=(IndexEntry('app.py', '100644', 'blob', 0, 'H', 0),),
+        committed=(FileChange('app.py', '100644', '100644', 'old', 'blob', 'M'),),
+        staged=(), files=(), remote=expected.remote, input_fingerprint='inputs',
+        scope_fingerprint='worker-contract', repository_state_fingerprint='repository',
+    )
+    values.update(changes)
+    return RebaseObservation(**values)
+
+
+def scope_for(expected, observed, **changes):
+    arguments = dict(
+        path_allowed=lambda path: _worker_path_allowed(path, expected.plan_path),
+        contracts_allowed=lambda _observed: True,
+    )
+    arguments.update(changes)
+    return assess_scope(expected, observed, **arguments)
+
+
+def decision_for(expected=None, observed=None):
+    expected = expected or expectation()
+    observed = observed or observation(expected)
+    return assess_current_rebase(expected, observed, scope_for(expected, observed))
+
+
+class CurrentRebasePolicyTests(unittest.TestCase):
+    def test_final_manual_result_needs_no_execution_evidence(self):
+        current = observation()
+        expected = expectation(before_head=None)
+        result = decision_for(expected, current)
+        self.assertEqual(result.status, RebaseStatus.COMPLETE)
+        self.assertTrue(valid_acceptance(result.acceptance))
+        self.assertEqual(result, decision_for(expected, current))
+        auxiliary = replace(current, operations=(('REBASE_HEAD', 'last-commit'),
+                                                  ('MERGE_MSG', 'message')))
+        self.assertEqual(decision_for(expected, auxiliary).status, RebaseStatus.COMPLETE)
+        # These historical records are deliberately outside the API. Removing
+        # each cannot affect acceptance of identical current Git facts.
+        history = dict(turn='turn', stage_tree='tree', receipt='receipt',
+                       reflog='marker', replay=['original'], journal='incomplete')
+        for key in history:
+            with self.subTest(missing=key):
+                remaining = {name: value for name, value in history.items() if name != key}
+                self.assertNotIn(key, remaining)
+                self.assertEqual(decision_for(expected, current), result)
+        # Squash/reorder/content changes are not compared to old commit lists.
+        rewritten = replace(current, head='rewritten', branch_ref=('rewritten', ''),
+                            registration=('HEAD=rewritten',
+                                          f'branch=refs/heads/{expected.branch}'),
+                            committed=(FileChange('app.py', '100644', '100755',
+                                                  'old', 'new-content', 'M'),))
+        self.assertEqual(decision_for(expected, rewritten).status, RebaseStatus.COMPLETE)
+
+    def test_owned_detached_conflict_waits_without_mutating_index(self):
+        expected = expectation()
+        pending = observation(
+            expected, head='partial', branch=None, branch_ref=('before', ''),
+            registration=('HEAD=partial', 'detached='),
+            branch_worktrees=(),
+            operations=(('rebase-merge', 'metadata-signature'),),
+            metadata=(('head-name', f'refs/heads/{expected.branch}'),
+                      ('orig-head', 'before'), ('onto', 'base')),
+            index_clean=False, base_is_ancestor=True,
+            index=tuple(IndexEntry('app.py', '100644', f'blob-{stage}',
+                                   stage, 'M', stage << 12) for stage in (1, 2, 3)),
+            staged=(FileChange('app.py', '100644', '000000', 'old', '0', 'U'),),
+            files=(WorktreeFile('app.py', ('staged', 'unstaged'), '100644', 'conflict'),),
+        )
+        for remote in (expected.remote, replace(expected.remote, oid=None)):
+            with self.subTest(remote=remote):
+                owned = replace(expected, remote=remote)
+                actual = replace(pending, remote=remote)
+                before = actual.index
+                result = decision_for(owned, actual)
+                self.assertEqual(result.status, RebaseStatus.WAITING)
+                self.assertIsNone(result.acceptance)
+                self.assertEqual(actual.index, before)
+        for changes in (
+            {'metadata': (('head-name', 'refs/heads/other'), ('orig-head', 'before'), ('onto', 'base'))},
+            {'metadata': (('head-name', f'refs/heads/{expected.branch}'), ('orig-head', 'other'), ('onto', 'base'))},
+            {'metadata': (('head-name', f'refs/heads/{expected.branch}'), ('orig-head', 'before'), ('onto', 'other'))},
+            {'operations': (*pending.operations, ('MERGE_HEAD', 'merge'))},
+            {'operations': (*pending.operations, ('rebase-apply', 'other'))},
+            {'registration': ('HEAD=partial', f'branch=refs/heads/{expected.branch}')},
+            {'branch_ref': ('other', '')}, {'metadata': None},
+            {'branch_worktrees': ('/other',)}, {'base_is_ancestor': False},
+        ):
+            with self.subTest(changes=changes):
+                self.assertEqual(decision_for(expected, replace(pending, **changes)).status,
+                                 RebaseStatus.REJECTED)
+
+    def test_rejects_identity_target_operation_and_lease_mismatches(self):
+        expected, current = expectation(), observation()
+        pr = PullRequest('pr/1', 'owner/repo', expected.branch, 'remote', 'OPEN')
+        pr_expected = replace(expected, remote=replace(expected.remote, pull_request=pr))
+        pr_current = replace(current, remote=pr_expected.remote)
+        self.assertEqual(decision_for(pr_expected, pr_current).status, RebaseStatus.COMPLETE)
+        for changes in (
+            {'repo': '/other'}, {'repository_identity': '/other/.git'},
+            {'worktree': '/other'}, {'identity_verified': False}, {'branch': 'other'},
+            {'branch_ref': ('other', '')}, {'branch_ref': ('after', 'symbolic')},
+            {'registration': None}, {'registration': ('HEAD=other',)},
+            {'branch_worktrees': ('/owned', '/other')},
+            {'base_is_ancestor': False}, {'index_clean': False},
+            {'operations': (('CHERRY_PICK_HEAD', 'commit'),)},
+            {'input_fingerprint': 'new-inputs'}, {'scope_fingerprint': 'new-approval'},
+            {'remote': replace(expected.remote, oid='racing-remote')},
+            {'remote': replace(expected.remote, repository='other/repo')},
+            {'remote': replace(expected.remote, branch='other')},
+        ):
+            with self.subTest(changes=changes):
+                self.assertEqual(decision_for(expected, replace(current, **changes)).status,
+                                 RebaseStatus.REJECTED)
+        for changes in ({'identity': 'pr/2'}, {'head': 'other'}, {'state': 'CLOSED'},
+                        {'repository': 'other/repo'}, {'branch': 'other'}):
+            actual = replace(pr_current, remote=replace(pr_expected.remote,
+                                                       pull_request=replace(pr, **changes)))
+            self.assertEqual(decision_for(pr_expected, actual).status, RebaseStatus.REJECTED)
+
+    def test_missing_expectations_and_observations_are_not_clean_success(self):
+        for changes in (
+            {'remote': None}, {'workspace_owned': False}, {'target_base_oid': ''},
+            {'repository_identity': ''}, {'scope_fingerprint': ''}, {'input_fingerprint': ''},
+            {'plan_id': 'G-109'}, {'generation': -1}, {'role': 'reviewer'},
+            {'plan_id': None}, {'remote': Remote('owner/repo', 'loop-manager/G-108', 123)},
+        ):
+            self.assertEqual(decision_for(expectation(**changes)).status, RebaseStatus.REJECTED)
+        expected = expectation()
+        for actual in (None, ObservationFailure('remote_query', 'offline')):
+            self.assertEqual(assess_current_rebase(expected, actual, None).status,
+                             RebaseStatus.UNAVAILABLE)
+        for actual in (observation(remote=None), observation(base_is_ancestor=None),
+                       observation(index_clean=None)):
+            self.assertEqual(decision_for(expected, actual).status, RebaseStatus.UNAVAILABLE)
+        confirmed_absence = expectation(remote=Remote('owner/repo', expected.branch, None))
+        self.assertEqual(decision_for(confirmed_absence).status, RebaseStatus.COMPLETE)
+
+    def test_scope_covers_final_dirty_staged_ignored_modes_and_real_flags(self):
+        expected, current = expectation(), observation()
+        forbidden = 'docs/requirements/[R-048] Evidence-Free Managed Rebase Recovery.md'
+        for changes in (
+            {'committed': (replace(current.committed[0], path=forbidden),)},
+            {'committed': (replace(current.committed[0], new_mode='040000'),)},
+            {'staged': (replace(current.committed[0], path=forbidden),)},
+            {'files': (WorktreeFile(forbidden, ('unstaged',), '100644', 'changed'),)},
+            {'files': (WorktreeFile('AGENTS.md', ('untracked',), '100644', 'new'),)},
+            {'files': (WorktreeFile('docs/ARCHITECTURE.md', ('ignored',), '100644', 'hidden'),)},
+            {'files': (WorktreeFile('../escape', ('untracked',), '100644', 'outside'),)},
+            {'files': (WorktreeFile('.GIT/config', ('ignored',), '100644', 'outside'),)},
+            {'index': (replace(current.index[0], mode='040000'),)},
+            {'index': (replace(current.index[0], stage=1, tag='M', flags=0x1000),)},
+            *({'index': (replace(current.index[0], flags=flag),)}
+              for flag in (0x8000, 0x40000000, 0x20000000)),
+        ):
+            with self.subTest(changes=changes):
+                self.assertEqual(decision_for(expected, replace(current, **changes)).status,
+                                 RebaseStatus.REJECTED)
+        dirty_allowed = replace(current, files=(
+            WorktreeFile('app.py', ('unstaged',), '100644', 'local'),
+            WorktreeFile('cache.pyc', ('ignored',), '100644', 'artifact'),
+        ))
+        self.assertEqual(decision_for(expected, dirty_allowed).status, RebaseStatus.COMPLETE)
+        stale_scope = scope_for(expected, current)
+        self.assertEqual(assess_current_rebase(expected, dirty_allowed, stale_scope).status,
+                         RebaseStatus.REJECTED)
+
+    def test_guidance_and_archive_need_exact_current_contract(self):
+        expected = expectation()
+        guidance = observation(committed=(FileChange('AGENTS.md', '100644', '100644',
+                                                     'old', 'approved', 'M'),))
+        def contracts(actual):
+            return actual.committed == guidance.committed and not actual.files
+        path_allowed = lambda path: _worker_path_allowed(
+            path, expected.plan_path, allowed_guidance_targets=('AGENTS.md',),
+        )
+        for actual, status in ((guidance, RebaseStatus.COMPLETE),
+                               (replace(guidance, committed=(replace(guidance.committed[0],
+                                                                    new_oid='unapproved'),)),
+                                RebaseStatus.REJECTED)):
+            scope = scope_for(expected, actual, path_allowed=path_allowed,
+                              contracts_allowed=contracts)
+            self.assertEqual(assess_current_rebase(expected, actual, scope).status, status)
+        archives = observation(committed=(
+            FileChange('docs/requirements/a.md', '100644', '000000', 'content', '0', 'D'),
+            FileChange('docs/requirements/archive/a.md', '000000', '100644', '0', 'content', 'A'),
+        ))
+        path_allowed = lambda path: _worker_path_allowed(
+            path, expected.plan_path, allowed_requirement_archives=('docs/requirements/a.md',),
+        )
+        archive_contract = lambda actual: actual.committed == archives.committed
+        accepted = scope_for(expected, archives, path_allowed=path_allowed,
+                             contracts_allowed=archive_contract)
+        self.assertEqual(assess_current_rebase(expected, archives, accepted).status,
+                         RebaseStatus.COMPLETE)
+        self.assertEqual(assess_current_rebase(expected, archives,
+                                              scope_for(expected, archives)).status,
+                         RebaseStatus.REJECTED)
+
+
+class CurrentRebaseObservationTests(unittest.TestCase):
+    def adapters(self):
+        expected = expectation()
+        snapshot = SimpleNamespace(
+            head='after', branch=expected.branch, index={'app.py': ('H 100644 blob 0',)},
+            dirty={}, refs={f'refs/heads/{expected.branch}': ('after', '')},
+            worktrees={'/owned': ('HEAD=after', f'branch=refs/heads/{expected.branch}')},
+            config={}, operations={}, shared_metadata_complete=True,
+        )
+        def git(_context, *args, **_kwargs):
+            if args[0] == 'rev-parse':
+                output = '/repo/.git\n' if '--git-common-dir' in args else 'base\n'
+            elif args[:2] == ('ls-files', '--debug'):
+                output = ('app.py\0  ctime: 1:1\n  mtime: 1:1\n  dev: 1\tino: 1\n'
+                          '  uid: 1\tgid: 1\n  size: 1\tflags: 0\n')
+            elif args[:2] == ('ls-files', '--others'):
+                output = 'ignored.pyc\0'
+            elif args[0] == 'diff' and '--raw' in args and '--cached' not in args:
+                output = ':100644 100644 old blob M\0app.py\0'
+            elif args[0] in {'diff', 'merge-base'}:
+                output = ''
+            else:
+                self.fail(f'unexpected Git query {args}')
+            return SimpleNamespace(returncode=0, stdout=output)
+        return ObservationAdapters(
+            git=mock.Mock(side_effect=git), capture_snapshot=mock.Mock(return_value=snapshot),
+            validate_identity=mock.Mock(), read_rebase_metadata=mock.Mock(return_value=None),
+            read_remote=mock.Mock(return_value=expected.remote),
+            read_inputs=mock.Mock(return_value=('inputs', 'worker-contract')),
+            read_file=mock.Mock(return_value=('100644', 'artifact')),
+            path_allowed=lambda path: _worker_path_allowed(path, expected.plan_path),
+            contracts_allowed=lambda _actual: True,
+        )
+
+    def test_adapter_reads_final_modes_ignored_files_and_flags_without_history(self):
+        expected, adapters = expectation(), self.adapters()
+        actual, scope = observe_current_rebase(expected, adapters)
+        self.assertIsInstance(actual, RebaseObservation)
+        self.assertEqual(actual.files[0].kinds, ('ignored',))
+        self.assertEqual(actual.index[0].flags, 0)
+        self.assertEqual(actual.committed[0].new_oid, 'blob')
+        self.assertEqual(assess_current_rebase(expected, actual, scope).status,
+                         RebaseStatus.COMPLETE)
+        forbidden_queries = {'reflog', 'rev-list', 'range-diff', 'rebase', 'add', 'commit'}
+        self.assertFalse(any(call.args[1] in forbidden_queries for call in adapters.git.call_args_list))
+
+    def test_adapter_reports_query_failures_missing_flags_and_remote_races(self):
+        expected = expectation()
+        for configure in (
+            lambda adapters: setattr(adapters.read_remote, 'side_effect', RuntimeError('offline')),
+            lambda adapters: setattr(adapters.validate_identity, 'side_effect', RuntimeError('other worktree')),
+            lambda adapters: setattr(adapters.read_inputs, 'side_effect', [('inputs', 'worker-contract'),
+                                                                        ('changed', 'worker-contract')]),
+            lambda adapters: setattr(adapters.read_remote, 'side_effect', [expected.remote,
+                                                                           replace(expected.remote, oid='race')]),
+            lambda adapters: setattr(adapters.git, 'side_effect', lambda *_args, **_kwargs:
+                                     SimpleNamespace(returncode=128, stdout='')),
+        ):
+            with self.subTest(configure=configure):
+                adapters = self.adapters()
+                configure(adapters)
+                actual, scope = observe_current_rebase(expected, adapters)
+                self.assertIsInstance(actual, ObservationFailure)
+                self.assertIsNone(scope)
+        with self.assertRaises(ValueError):
+            parse_index({'app.py': ('H 100644 blob 0',)}, '')
+        with self.assertRaises(ValueError):
+            parse_raw_changes(':100644 100644 old new M\0truncated')
+
+    def test_debug_flags_and_unusual_paths_cannot_be_hidden_by_v_tag(self):
+        debug = ('weird\nname.py\0  ctime: 1:1\n  mtime: 1:1\n  dev: 1\tino: 1\n'
+                 '  uid: 1\tgid: 1\n  size: 1\tflags: 20000000\n')
+        entries = parse_index({'weird\nname.py': ('H 100644 blob 0',)}, debug)
+        self.assertEqual(entries[0].flags, 0x20000000)
+        actual = observation(index=entries)
+        self.assertEqual(decision_for(observed=actual).status, RebaseStatus.REJECTED)
+
+    def test_adapter_detects_hidden_tracked_mode_change(self):
+        adapters = self.adapters()
+        snapshot = adapters.capture_snapshot.return_value
+        protected = 'docs/ARCHITECTURE.md'
+        snapshot.index = {protected: ('H 100644 blob 0',)}
+        original_git = adapters.git.side_effect
+        def git(context, *args, **kwargs):
+            result = original_git(context, *args, **kwargs)
+            if args[:2] == ('ls-files', '--debug'):
+                result.stdout = result.stdout.replace('app.py\0', protected + '\0')
+            return result
+        adapters.git.side_effect = git
+        adapters.read_file.side_effect = lambda _worktree, path: (
+            '100755' if path == protected else '100644', 'current-mode',
+        )
+        actual, scope = observe_current_rebase(expectation(), adapters)
+        self.assertEqual(actual.files[0].path, protected)
+        self.assertEqual(actual.files[0].kinds, ('unstaged',))
+        self.assertEqual(assess_current_rebase(expectation(), actual, scope).status,
+                         RebaseStatus.REJECTED)

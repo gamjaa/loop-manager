@@ -37,11 +37,22 @@ priority: critical
 
 ## Progress
 
-- [ ] 현재 Git 관측·범위 검사와 공통 판정 경계
-- [ ] 호환 가능한 수용 결과 저장·generation 검사
-- [ ] 정상 수동 결과와 실제 상태 불일치의 targeted 회귀 사례
+- [x] 현재 Git 관측·범위 검사와 공통 판정 경계
+- [x] 호환 가능한 수용 결과 저장·generation 검사
+- [x] 정상 수동 결과와 실제 상태 불일치의 targeted 회귀 사례
+
+Worker는 새 판정 module, 새 runtime test class와 변경한 checkpoint 저장 case만 실행했다. 기존 journal 완료의 원자 저장·멱등성 case도 같은 targeted command로 확인했다. 전체 verify, 실제 Git lifecycle, commit·push·PR 생성은 실행하지 않았으며 Manager 검증과 Reviewer 검토는 후속 단계다.
+
+최종 targeted command는 아래와 같으며 19개 unit test가 모두 통과했다.
+
+```sh
+python3 -B -m unittest tests.test_managed_rebase_validation tests.test_runtime_state.CurrentRebaseRuntimeTests tests.test_execution_checkpoint_state.CheckpointRepositoryTests.test_current_acceptance_is_generation_bound_and_preserves_legacy_audit tests.test_execution_checkpoint_state.CheckpointRepositoryTests.test_current_acceptance_supports_no_history_and_retains_prior_acceptances tests.test_execution_checkpoint_state.CheckpointRepositoryTests.test_rebase_completion_rolls_back_checkpoint_when_projection_fails tests.test_execution_checkpoint_state.CheckpointRepositoryTests.test_rebase_completion_updates_checkpoint_and_projection_once
+```
 
 ## Decision Log
 
 - R-048과 ARCHITECTURE의 R-048 절은 기존 R-045의 작업 수행 증거 정책을 명시적으로 대체한다. 추가 사용자 결정을 요구하거나 구 정책을 새 완료 조건으로 재도입하지 않는다.
 - 실행 연결 없이 검증 가능한 기반을 먼저 Merge한다. G-109가 모든 기존 rebase 호출 경로를 연결하며, G-104·G-106·G-107의 게시·원격 복구 기능을 이 계획에서 중복 구현하지 않는다.
+- `managed_rebase_validation.py`는 순수 현재 상태·파일 범위 판정과 수용 형식을, `managed_rebase_observation.py`는 Git 읽기 및 관측 안정성 확인을 담당한다. 기존 루트 내부 모듈 import 방식과 checkpoint 경계에 맞춰 배치했으며 두 모듈의 import·unit test·verify 참조는 G-060의 내부 구현 inventory 대상이다. 이 계획에서는 파일 이동을 수행하지 않는다.
+- 관측 adapter에는 기존 canonical workspace 검증, 현재 Worker 경로 정책, 현재 입력·guidance/archive 계약, 실제 파일 mode·signature와 live remote/PR 조회를 명시적으로 주입한다. 최종 target-to-HEAD diff와 실제 index debug flags를 검사하며 과거 commit replay 또는 stage tree를 복원하지 않는다. 안정성 확인과 저장 직전 재관측이 같은 정책·입력·현재 상태 지문에 결합된다.
+- 수용은 기존 journal 완료와 다른 snapshot key·kind로 저장한다. 기존 완료·stage·실패 기록은 보존하고 current acceptance 이력만 추가한다. checkpoint·실행 row·project projection은 같은 transaction에서 갱신하며 수용 자체로 게시 승인이나 별도 차단 해제를 수행하지 않는다. 기존 운영 호출은 계속 legacy 완료 정책을 사용한다.
