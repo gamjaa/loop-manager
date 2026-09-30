@@ -50,7 +50,7 @@ priority: normal
 
 ## Implementation
 
-- G-059의 Loop Manager 자체 전수 inventory를 최신 루트 파일 집합과 대조해 파일별 참조, 소유권과 이동 목적지를 기록한다. G-051, G-064~G-072, G-077, G-080, G-081, G-083~G-095, G-099~G-101과 G-104~G-107에서 추가·변경된 루트 모듈이 있으면 import·검증 참조에 포함하고, `ROOT` 기반 resource lookup과 launcher가 요구하는 고정 파일을 식별한다.
+- G-059의 Loop Manager 자체 전수 inventory를 최신 루트 파일 집합과 대조해 파일별 참조, 소유권과 이동 목적지를 기록한다. G-051, G-064~G-072, G-077, G-080, G-081, G-083~G-095, G-099~G-101과 G-104~G-110에서 추가·변경된 루트 모듈이 있으면 import·검증 참조에 포함하고, `ROOT` 기반 resource lookup과 launcher가 요구하는 고정 파일을 식별한다.
 - 필수 폴더·파일과 신규 루트 항목 판정 기준을 공통 provider-neutral prompt에 반영한다. 실제 내부 모듈 이동은 G-063에서 수행한다.
 - 기존 등록 프로젝트에도 적용되는 provider-neutral prompt에 필수 루트 경로와 안전한 파일 배치 기준을 반영한다.
 - G-086의 정상 파일별 평가가 처음 도래할 때 유지보수 Planner의 평가 입력과 결과에 루트 항목 inventory를 포함한다. G-083의 추적 source 목록만으로 문서·고정 경로 등 루트 항목을 누락하지 않으며, 별도 조기 평가나 중복 전체 파일 읽기를 만들지 않는다. 이미 평가된 프로젝트는 다음 해당 평가에서 확인된 기존 결과를 재사용한다. 소유권·참조를 증명하지 못한 항목은 이동 계획에서 제외하고 판단 근거를 기록한다.
@@ -77,3 +77,4 @@ priority: normal
 - G-093~G-095의 planning 상태·차단 사건 복구가 Merge된 뒤 변경된 복구 경계와 테스트 참조를 inventory에 포함한다.
 - G-099~G-101의 단계별 rebase 증거·복구가 Merge된 뒤 변경된 코드·테스트·검증 참조를 inventory에 포함한다.
 - G-104~G-107의 중간 checkpoint 게시와 차단 중 원격 복구가 Merge된 뒤 변경된 코드·테스트·검증 참조를 inventory에 포함한다.
+- 2026-09-30: mutable READY snapshot의 기준 revision·원본 hash를 확인해 inventory 범위를 갱신했다. G-092와 G-107의 dependency를 통해 G-108~G-110의 현재 상태 rebase 판정·수용·복구가 먼저 Merge된다. 그 변경의 내부 모듈·import·테스트 참조도 조사하며 동일한 선행 작업을 새 루트 정리 계획으로 중복하지 않는다.
