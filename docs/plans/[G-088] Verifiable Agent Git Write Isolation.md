@@ -19,6 +19,7 @@ priority: critical
 
 - 사용자는 2026-09-29에 하위 경로에 별도 Git 경로가 있거나 이와 유사한 특수 배치가 있는 경우를 고려하지 않아도 된다고 결정했다. 이 계획은 선택된 writable worktree와 실행별 임시 경로 안에 별도 하위 Git 저장소가 없고, 기본 source checkout·다른 worktree·shared Git metadata를 하위 경로로 노출하는 별도 bind mount 별칭이 없는 운영 환경을 전제로 한다.
 - 하위 Git 저장소 및 위와 같은 mount 별칭의 전수 탐지, 별칭 원본의 device·inode 대조, 해당 배치를 통한 우회 방지와 그 회귀 테스트는 이 계획의 구현·격리 증명·Review 범위에서 제외한다. 그 전제를 프로그램이 별도로 증명하도록 요구하지 않으며, 해당 제외 사례만을 이유로 격리 확인을 거부하거나 blocking issue를 만들지 않는다.
+- 2026-09-30 사용자 범위 명확화: worktree 및 실행별 writable 임시 경로의 하위 구성을 전수 조사하지 않는다. 하위 파일·디렉터리, 별도 Git 저장소, bind mount·symlink·hardlink 등으로 보호 자원이 노출되는 특수 배치의 탐지·증명·우회 방지·회귀 테스트는 범위에서 제외한다. 해당 트리를 재귀 순회하거나 하위 파일의 device·inode·link count를 조사해 이 전제를 검증하지 않으며, 하위 구성 또는 이를 조사할 수 없다는 사실을 격리 거부·Worker 교정·Reviewer blocking 근거로 삼지 않는다. 현재 `agent_sandbox_exec.py::check_hardlinks`의 writable tree 전수 순회·hardlink 거부는 이 제외 범위에 속한다. 선택된 등록 저장소 자체의 canonical identity, 표준 `.git` pointer, 실제 per-worktree/common Git directory와 직접 선언된 쓰기 경계의 기존 검증은 유지한다.
 - 선택된 등록 저장소의 표준 `.git` 디렉터리 또는 linked worktree의 `.git` 파일, 실제 per-worktree Git directory와 common/shared Git directory는 보호 대상이다. 기본 source checkout과 다른 등록 worktree의 canonical 경로, provider 내부 쓰기와 역할별 허용 파일·index 범위에 대한 기존 검증은 계속 적용한다.
 
 ## Acceptance Criteria
@@ -92,3 +93,5 @@ priority: critical
 
 - 2026-09-30 Worker review `review:agent_codex_sandbox.py::codexlaunch.run::runtime-handoff-bypass` occurrence=1, revision=1 수정: `CodexLaunch.run`은 process 생성 함수를 필수 입력으로 받고 실제 `run_codex` 호출은 기존 `_handoff_popen`을 전달한다. runtime handoff 확인·spawn을 기존 gate 잠금 안에서 수행하며 process 대기·종료 처리 중에는 잠금을 유지하지 않는다. 사전 검사 중 handoff가 발생하면 실제 sandbox 실행 경로에서 Reviewer·재개 Worker·신규 streaming Worker의 spawn을 거부하고 호출별 격리 증거를 무효화하며 기존 session·결과·로그를 보존한다. 정상 Reviewer·재개 Worker가 같은 잠금 경계에서 시작하고 대기 중 handoff를 허용하는 회귀 테스트도 추가했다.
 - 현재 후보의 targeted 검증: `python3 -m unittest discover -s tests -p test_agent_invocation.py -k WriteIsolationTests` 32개, `python3 -m unittest discover -s tests -p test_agent_invocation.py -k RuntimeReadOnlyIsolationTests` 3개, `python3 -m unittest discover -s tests -p test_origin_isolation.py -k test_unverified_agent_snapshot_keeps_strict_shared_git_boundary` 1개가 모두 통과했다. 새 회귀 테스트는 `CodexLaunch.run`과 `_handoff_popen`을 실제로 실행하고 외부 CLI·kernel 및 process 생성만 unit test double로 제어한다. 전체 verify·Review는 Manager가 수행하며 Worker는 commit·push·PR 생성·전체 verify를 실행하지 않았다.
+
+- 2026-09-30 User Decision: 사용자는 “이런 건 신경 안 쓰겠다고 했는데 왜 자꾸 걸리는 거야? worktree 하위에 뭐가 있는지 신경 안 쓸 거야”라고 기존 제외 결정을 재확인하고 범위를 명확히 했다. 이 계획의 하위 구성 전수 조사와 그 특수 배치에 대한 격리 증명 요구를 제외한다. Worker는 남아 있는 하위 hardlink 전수 검사와 관련 거부·테스트를 이 범위에 맞게 정리하고, Reviewer는 제외한 하위 구성 사례를 다시 blocking 근거로 요구하지 않는다. 실제 구현 변경 뒤 필요한 targeted test·전체 verify·Review는 Manager의 정상 경로를 거친다. 기존 실패·Review 감사 기록은 보존한다.
