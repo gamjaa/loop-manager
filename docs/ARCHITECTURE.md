@@ -299,6 +299,8 @@ BLOCKED → PR_OPEN
 
 이 절은 `docs/requirements/[R-045] Phase-Bound Managed Rebase Validation and Recovery.md`를 구현하기 위한 목표 설계다. 구현·Merge 전의 요구를 현재 완료된 제품 동작으로 해석하지 않는다. 기존 ExecPlan 상태 모델, Manager의 Git 쓰기 권한과 게시 경계를 유지하며, rebase 내부 단계의 증거와 복구 판정을 구체화한다.
 
+R-048은 이 절의 Worker 교정 turn·stage 승인·명령 receipt·commit별 재생 증거를 rebase 완료의 필수 조건으로 삼는 정책을 대체한다. R-048 구현 전에는 현재 Merge된 PRODUCT 규칙을 적용하며, 구현 후의 관리 rebase에는 아래 R-048 설계를 적용한다.
+
 #### 증거의 적용 시점
 
 충돌 해결의 승인 대상은 Manager가 검증해 stage한 결과와 그 결과를 반영한 재생 commit이다. 최종 HEAD에는 나머지 commit이 추가로 반영될 수 있으므로, 승인 시점의 파일 해시를 전체 rebase 완료 시점의 작업 폴더와 비교하지 않는다. 대신 원본 commit, 충돌 해결 commit과 최종 HEAD를 연결하는 재생 근거를 검증한다.
@@ -355,6 +357,16 @@ target base나 원격 OID가 달라졌으면 저장된 작업의 완료 사실�
 실패 진단에는 안정적인 원인 code, 단계, intent·교정 identity, 원본/재생 commit, 관련 경로와 기대·관측 지문을 기록한다. 해결 tree 불일치, 재생 대응 누락·변조, 최종 branch/ref/등록 불일치, 원격 lease 변화와 legacy 증거 부족을 구분한다. 큰 index·파일 본문·인증 자료를 로그에 출력하지 않으며 기존 실패 사건 및 알림 중복 제거를 유지한다.
 
 직접 변경한 판정·저장 경계에는 targeted unit test를 두고, Manager가 실행하는 전체 verify에서는 실제 Git 이력의 충돌 해결·여러 후속 commit의 동일 파일 변경·다중 충돌·기존 PR 및 PR 없는 checkpoint를 확인한다. 각 저장 경계의 중단을 주입해 완료된 단계가 반복되지 않고 이후 Worker 교정·verify·Review까지 진행되는지 확인한다. 해결 tree 변조, 범위 밖 stage, 후속 commit 누락·변조, 다른 invocation의 증거, 원격 OID 변경과 불완전한 legacy 기록은 계속 거부해야 한다. 이 검증 책임은 기존 Worker·Manager·Reviewer 분담을 따른다.
+
+### 작업 수행 증거 없는 관리 rebase 완료와 수동 복구 — R-048 목표 설계
+
+이 절은 `docs/requirements/[R-048] Evidence-Free Managed Rebase Recovery.md`의 목표 설계다. 구현·Merge 전의 현재 제품 동작으로 해석하지 않는다. R-045의 단계별 작업 수행 증거를 필수 완료 조건으로 삼는 규칙과, R-046·R-047에서 그 조건을 참조하는 부분은 이 절로 대체한다. 기존 기록은 감사 자료로 보존하지만 누락·불완전 자체를 완료 거부 이유로 쓰지 않는다.
+
+자동 Worker 교정과 사용자 수동 복구를 같은 판정 경계에서 다룬다. Manager는 Git 쓰기 전 또는 외부에서 끝난 Git 작업을 채택하기 전에 저장된 계획의 repository·canonical worktree·소유 branch, 대상 base와 관측 원격 OID·PR head를 현재 Git 등록·ref와 대조한다. 진행 중인 소유 rebase의 detached HEAD는 다른 Git operation과 구분해 허용하고 충돌 파일·index를 보존한다. Worker invocation, 교정 turn, 승인된 stage tree, 명령 receipt 또는 commit별 원본·재생 대응이 없는 경우도 현재 상태 판정을 계속한다.
+
+rebase가 끝났으면 실제 branch·HEAD·ref·worktree 등록, 대상 base ancestry, 미해결 operation·index 부재, 허용 변경 범위와 최신 원격 lease를 검사한다. 원본 commit의 내용·개수·순서를 과거 실행 증거로 재구성하지 않는다. 이 검사는 현재 Git 결과의 소유 범위를 확인하는 단계이며 제품 적합성 판정은 아니다. 최종 후보가 바뀌거나 ExecPlan·근거 입력이 변경됐다면 Worker가 현재 입력과 변경 전체를 다시 확인하고 targeted test를 실행한다. Manager 전체 verify와 Reviewer가 통과하기 전에는 PR 또는 게시 완료로 전이하지 않는다. 기존 Review·사용자 결정·Agent 범위 차단은 각각의 원인으로 남긴다.
+
+완료 결과는 현재 Git 상태 지문과 계획·원격 기대값에 결합해 SQLite에 멱등하게 반영한다. Git 완료와 저장 사이의 중단은 같은 현재 상태 검사로 복구하고 이전 journal 기록을 삭제하거나 사후에 Worker 증거를 만든 것으로 표시하지 않는다. branch·worktree 소유권, 범위, 원격 OID 또는 Git operation이 불명확하면 작업물과 감사를 보존한 채 차단한다. 기존 게시 lease와 `--force-with-lease` 제한은 유지한다.
 
 ### 차단 중 원격 반영과 checkpoint 갱신 — R-046 목표 설계
 
