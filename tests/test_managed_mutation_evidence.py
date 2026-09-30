@@ -1359,6 +1359,9 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
         )
         signature = mock.Mock(return_value='accepted-content')
         def git(_path, *args, **_kwargs):
+            if args[0] == 'ls-remote':
+                self.assertEqual(args, ('ls-remote', '--heads', 'origin', f'refs/heads/{BRANCH}'))
+                return SimpleNamespace(stdout=f'{OLD}\trefs/heads/{BRANCH}\n', returncode=0)
             return SimpleNamespace(
                 stdout=f'{NEW}\0loop-manager-rebase:owned-token (finish): refs/heads/{BRANCH} onto {NEW}\n', returncode=0,
             )
@@ -1368,7 +1371,7 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
             agent=SimpleNamespace(path_signature=signature),
             workspace=SimpleNamespace(
                 git=mock.Mock(side_effect=git),
-                remote_branch_oid=lambda *_: OLD,
+                remote_branch_oid=mock.Mock(return_value=NEW),
             ),
         )
         handler.repo = 'repo'
@@ -1401,10 +1404,13 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
                          return_value=False)):
             handler._finish_rebase_journal(context)
             self.assertTrue(verified.call_args.kwargs['accepted_correction'])
+            self.assertEqual(verified.call_args.kwargs['current_remote_oid'], OLD)
             signature.return_value = 'external-edit'
             handler._finish_rebase_journal(context)
             self.assertTrue(verified.call_args.kwargs['accepted_correction'])
+            self.assertEqual(verified.call_args.kwargs['current_remote_oid'], OLD)
             signature.assert_not_called()
+            handler.effects.workspace.remote_branch_oid.assert_not_called()
             proof.side_effect = journal.MutationEvidenceError('resolution tree mismatch')
             with self.assertRaises(journal.MutationEvidenceError):
                 handler._finish_rebase_journal(context)

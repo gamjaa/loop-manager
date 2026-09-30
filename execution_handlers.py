@@ -1628,11 +1628,8 @@ class ExecutionHandlers:
                 replay_verified = True
             return manager_git_journal.verified_rebase_result(
                 intent, observed,
-                current_remote_oid=(
-                    manager_git_journal.live_remote_branch_oid(
-                        self.effects.workspace.git, self.repo_path, context.branch,
-                    ) if expected.get('evidence_version') == 2 else
-                    self.effects.workspace.remote_branch_oid(self.repo_path, context.branch)
+                current_remote_oid=manager_git_journal.live_remote_branch_oid(
+                    self.effects.workspace.git, self.repo_path, context.branch,
                 ),
                 target_ancestor=ancestor.returncode == 0,
                 patches_preserved=patches, reflog_marker=marker,

@@ -386,6 +386,70 @@ class RecoveryRepository:
             (repo, self._subject(plan_id)),
         )
 
+    def resolve_rebase_evidence_failure(
+        self, repo: str, plan_id: str, *, base_revision: str | None,
+        worker_session: str | None, released_block_reason: str | None = None,
+    ) -> None:
+        """Close only the historical R-045 retry, retaining its failure audit."""
+
+        from rebase_block_reconciliation import LEGACY_COMPLETION_DIAGNOSTIC
+
+        subject = self._subject(plan_id)
+        saved = self.row(repo, plan_id)
+        if (saved is None or saved["detail"] != LEGACY_COMPLETION_DIAGNOSTIC
+                or saved["base_revision"] != base_revision
+                or not str(saved["progress_marker"] or "").startswith(
+                    f"{base_revision or ''}|{worker_session or ''}|"
+                )):
+            return
+        direct_retry = (
+            saved["reason_code"] == RecoveryReason.STATUS_FAILED.value
+            and saved["pending_action"] in {"retry", "pause"}
+        )
+        final_block = False
+        if released_block_reason and saved["pending_action"] == "final_block":
+            try:
+                evidence = json.loads(saved["final_evidence"] or "null")
+            except (TypeError, ValueError):
+                evidence = None
+            final_block = (
+                isinstance(evidence, dict)
+                and evidence.get("block_reason_code") == released_block_reason
+            )
+        if not (direct_retry or final_block):
+            return
+        changed = self.connection.execute(
+            "UPDATE recovery_records SET pending_action = 'reconcile', "
+            "updated_at = CURRENT_TIMESTAMP WHERE repo = ? AND subject = ? "
+            "AND generation = ? AND pending_action = ?",
+            (repo, subject, saved["generation"], saved["pending_action"]),
+        )
+        if not changed.rowcount:
+            return
+        failure = self.connection.execute(
+            "SELECT episode, phase, reason_code, fingerprint FROM "
+            "persistent_execution_failures WHERE repo = ? AND subject = ? "
+            "AND active = 1 AND reason_code = ? AND detail = ? "
+            "AND progress_marker = ?",
+            (repo, subject, RecoveryReason.STATUS_FAILED.value,
+             LEGACY_COMPLETION_DIAGNOSTIC, saved["progress_marker"]),
+        ).fetchone()
+        if failure is None:
+            return
+        import notifications
+        notifications.cancel_pending_persistent_execution_failure_event(
+            self.connection, repo, subject, int(failure["episode"]),
+            str(failure["phase"]), str(failure["reason_code"]),
+            str(failure["fingerprint"]),
+        )
+        self.connection.execute(
+            "UPDATE persistent_execution_failures SET active = 0, "
+            "consecutive_runs = 0, notification_eligible = 0, "
+            "notification_queued = 0, updated_at = CURRENT_TIMESTAMP, "
+            "resolved_at = CURRENT_TIMESTAMP WHERE repo = ? AND subject = ?",
+            (repo, subject),
+        )
+
     def external_run_snapshot(self, repo: str) -> dict[str, int]:
         """Capture recovery generations before one scheduler invocation."""
 

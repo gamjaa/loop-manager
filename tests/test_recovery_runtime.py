@@ -1,10 +1,14 @@
 import unittest
+import json
+import sqlite3
 from dataclasses import replace
 from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
 
 import loop_manager
+import rebase_block_reconciliation as rebase_blocks
+from recovery_state import RecoveryRepository
 from planning_runtime import PlanningOutcome, PlanningOutcomeKind
 
 from recovery_runtime import (
@@ -22,6 +26,81 @@ def observation(reason, detail="same RuntimeError"):
 
 
 class RecoveryPolicyTests(unittest.TestCase):
+    def test_verified_rebase_can_resolve_final_record_without_erasing_failure_history(self):
+        connection = sqlite3.connect(':memory:')
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        repository = RecoveryRepository(connection)
+        detail = rebase_blocks.LEGACY_COMPLETION_DIAGNOSTIC
+        saved = RecoveryObservation(
+            RecoveryReason.STATUS_FAILED, 'repo', 'G-101', 'VERIFYING',
+            'plan', 'base', 'old-fingerprint', 'base|worker|', detail,
+        )
+        repository.observe(saved)
+        repository.observe(
+            replace(saved, reason=RecoveryReason.OWNERSHIP_UNCERTAIN),
+            final_block_reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE,
+        )
+        repository.resolve_rebase_evidence_failure(
+            'repo', 'G-101', base_revision='base', worker_session='worker',
+            released_block_reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE.value,
+        )
+        resolved = repository.row('repo', 'G-101')
+        self.assertEqual(resolved['pending_action'], 'reconcile')
+        self.assertEqual(resolved['reason_code'], 'ownership_uncertain')
+        self.assertEqual(len(json.loads(resolved['occurrence_index'])), 2)
+
+    def test_rebase_block_selector_requires_saved_cause_and_pending_intent(self):
+        recovery = {
+            "reason_code": RecoveryReason.STATUS_FAILED.value,
+            "detail": rebase_blocks.LEGACY_COMPLETION_DIAGNOSTIC,
+            "pending_action": "pause",
+        }
+        checkpoint = SimpleNamespace(
+            operation="rebase", expected_head="before", target_base_oid="base",
+        )
+        block = {
+            "reason_code": BlockReasonCode.REPOSITORY_STATE_UNSAFE.value,
+            "evidence": rebase_blocks.LEGACY_COMPLETION_DIAGNOSTIC,
+        }
+        self.assertTrue(rebase_blocks.could_be_rebase_evidence_block(block))
+        self.assertFalse(rebase_blocks.block_matches(block, None, checkpoint))
+        self.assertTrue(rebase_blocks.block_matches(block, recovery, checkpoint))
+        self.assertFalse(rebase_blocks.block_matches(
+            block, {**recovery, "reason_code": RecoveryReason.REVIEW_EXHAUSTED.value},
+            checkpoint,
+        ))
+        self.assertFalse(rebase_blocks.block_matches(
+            {**block, "reason_code": BlockReasonCode.DEFAULT_WORKTREE_MUTATION.value},
+            recovery, checkpoint,
+        ))
+        self.assertFalse(rebase_blocks.block_matches(
+            {**block, "evidence": "another safety failure"}, recovery, checkpoint,
+        ))
+        self.assertFalse(rebase_blocks.block_matches(
+            block, recovery, SimpleNamespace(
+                operation=None, expected_head="before", target_base_oid="base",
+            ),
+        ))
+        final = {
+            **recovery,
+            "reason_code": RecoveryReason.OWNERSHIP_UNCERTAIN.value,
+            "pending_action": "final_block",
+            "final_evidence": json.dumps({
+                "block_reason_code": block["reason_code"],
+            }),
+            "progress_marker": "base|worker|",
+            "occurrence_index": json.dumps({
+                json.dumps(["status_failed", "old", "base|worker|"]): 1,
+            }),
+        }
+        self.assertTrue(rebase_blocks.block_matches(
+            block, final, checkpoint,
+        ))
+        self.assertFalse(rebase_blocks.block_matches(
+            block, {**final, "occurrence_index": "{}"}, checkpoint,
+        ))
+
     def test_review_feedback_occurrence_never_blocks_and_budget_pauses(self):
         correction = decide(
             observation(RecoveryReason.REVIEW_FEEDBACK_CORRECTION),

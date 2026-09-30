@@ -34,10 +34,18 @@ priority: critical
 
 ## Progress
 
-- [ ] R-045 증거 실패의 저장된 retry·차단 원인별 재평가
-- [ ] 차단 사건·진단 및 재검증 연결
-- [ ] 실제 Git 이력과 중단·재시작 회귀
+- [x] R-045 증거 실패의 저장된 retry·차단 원인별 재평가
+- [x] 차단 사건·진단 및 재검증 연결
+- [x] 실제 Git 이력과 중단·재시작 회귀
 
 ## Decision Log
 
+- Worker 재개 시 기존 변경을 보존했다. 실제 Git의 충돌 해결 뒤 동일 파일을 수정하는 두 후속 commit과 SQLite 재시작을 사용하는 개별 unit test로 계획·프로젝트 차단의 해제와 VERIFYING 전이를 검증했다. 외부 Worker·verify·Review 호출은 mock으로 두었으며 전체 verify는 Loop Manager에 남긴다.
+- 계획 차단 해제의 마지막 runtime 전이가 빈 project_values를 전달해 롤백되는 결함을 수정했다. 완료 증거 반영과 차단 해제를 하나의 중첩 안전 transaction에서 확정하고 실패·차단 사건 감사를 보존한다.
+
 - G-092는 R-023의 Agent Git 범위와 Manager 기준선 차단을 담당한다. 이 계획은 R-045의 완료 증거 오탐으로 남은 실패·차단만 다룬다.
+
+- Reviewer 피드백에 따라 차단 재평가에서 실제 원격 branch OID를 journal 확정 전후로 조회하고, 완료 채택 전에 clean worktree·index·표준 index flag를 확인한다. 예상 밖 변경은 journal 완료 근거로 채택하지 않으며 차단·작업물·사건 감사를 보존한다.
+- 실제 Git fixture로 완료 뒤 unstaged/staged/flag 변경, 오래된 원격 캐시, journal 확정 뒤 파일·원격 경쟁을 검증했다. PR 유무와 계획·프로젝트 차단 복구 후 기존 Worker session을 유지하며 실제 phase handler의 Worker 확인 → verify mock → Review mock → PUBLISHING 진행을 검증한다. 전체 verify와 게시 작업은 Worker 밖의 Loop Manager에 남긴다.
+
+- 추가 Reviewer 피드백에 따라 clean 검사를 게시 checkpoint 소유권 확인보다 먼저 수행한다. 해당 확인이 journal을 확정할 수 있으므로, 예상 밖 파일·index를 거부할 때 journal intent와 결과 파일을 보존하고 변경 복원 뒤 같은 intent로 재개할 수 있도록 한다. legacy handler의 journal validator도 증거 버전과 관계없이 실제 원격 OID를 조회한다. 게시 checkpoint의 unstaged/staged 거부·복원과 실제 원격 일치/캐시 불일치(PROJECT_BLOCKED 및 게시 checkpoint)를 개별 unit test로 검증했다.

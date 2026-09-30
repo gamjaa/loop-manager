@@ -116,13 +116,20 @@ class ExecutionStatePort:
 
     def complete_rebase(self, checkpoint_repository, *, completion, project_values,
                         published_proof=None):
-        with self.connection:
+        with runtime_state._transaction(self.connection):
             expected = self.check()
             if expected is None:
                 raise runtime_state.RuntimeStateError("execution projection이 없습니다.")
             self.expected = self.repository.complete_rebase(
                 expected, checkpoint_repository, completion=completion,
                 project_values=project_values, published_proof=published_proof,
+            )
+            import recovery_state
+            recovery_state.RecoveryRepository(
+                self.connection,
+            ).resolve_rebase_evidence_failure(
+                self.repo, self.plan_id, base_revision=expected.active_sha,
+                worker_session=expected.worker_session_id,
             )
 
     def open_pull_request(self, repo, **values):
