@@ -355,6 +355,48 @@ class BlockedPlanRemoteRefreshTests(unittest.TestCase):
         self.assertEqual(self.plan()['blocked_reason'], reason)
         self.ports._evaluate_remote_checkpoint_cause.assert_not_called()
 
+    def interrupt_after_fast_forward(self):
+        original = self.published_successor()
+        with mock.patch.object(blocked_checkpoint_state.BlockedCheckpointRepository,
+                               'record_remote_inspection', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.coordinator.reconcile('G-106')
+        checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get(self.repo, 'G-106')
+        self.assertNotIn('remote_adoption_scope', checkpoint.snapshot)
+        self.assertEqual(checkpoint.snapshot['remote_adoption_intent']['head'], self.head)
+        self.assertEqual(self.connection.execute(
+            "SELECT pending_remote_oid FROM blocked_checkpoints WHERE plan_id = 'G-106'").fetchone()[0], self.head)
+        return original
+
+    def test_fast_forward_effect_before_sqlite_result_resumes_without_repeating_merge(self):
+        original = self.interrupt_after_fast_forward()
+        self.ports.git.reset_mock()
+        restarted = blocked_plan_reconciliation.BlockedPlanReconciler(
+            self.ports, self.connection, Path('/repo'), Path('/state'), self.repo, 'main')
+        with mock.patch.object(restarted, '_publish'):
+            self.assertEqual(restarted.reconcile('G-106'), 'blocked')
+        self.ports._evaluate_remote_checkpoint_cause.assert_called_once()
+        self.assertFalse(any('merge' in call.args for call in self.ports.git.call_args_list))
+        self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
+        checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get(self.repo, 'G-106')
+        self.assertIsNone(checkpoint.snapshot['remote_adoption_intent'])
+        self.assertEqual(checkpoint.snapshot['remote_adoption_scope']['head'], self.head)
+
+    def test_interrupted_fast_forward_rejects_later_shared_mutation(self):
+        original = self.interrupt_after_fast_forward()
+        self.current_snapshot = replace(self.current_snapshot,
+            refs={**self.current_snapshot.refs, 'refs/heads/unowned': ('foreign', '')})
+        self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.ports._evaluate_remote_checkpoint_cause.assert_not_called()
+        self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
+
+    def test_interrupted_fast_forward_rejects_later_staged_edit(self):
+        self.interrupt_after_fast_forward()
+        self.current_snapshot = replace(self.current_snapshot,
+            dirty={'code.py': (('staged',), 'changed')})
+        self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.ports._evaluate_remote_checkpoint_cause.assert_not_called()
+
     def test_agent_scope_violation_before_adoption_is_not_absorbed(self):
         original = self.published_successor()
         self.current_snapshot = replace(original, refs={**original.refs, 'refs/heads/unowned': ('foreign', '')})

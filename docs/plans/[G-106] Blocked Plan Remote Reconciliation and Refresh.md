@@ -74,6 +74,8 @@ priority: critical
   - RERUN: python3 -m unittest tests.test_scoped_blocking.LegacyBlockedScopeUnitTests
   - PASS: 최종 재실행 1개 통과.
 - 최신 계획과 R-046·R-048·PRODUCT·ARCHITECTURE를 다시 확인하고 HEAD `e2340102201b83201b8cb00bdfaf196b6941dada` 및 `origin/main` 대비 변경을 검토했다. 현재 후보에서 `BlockedPlanRemoteRefreshTests` 36개, `EvidenceFreeBlockedScopeTests` 5개, `BlockedCheckpointRefreshUnitTests` 7개, `CatalogCheckpointWiringTest` 2개를 새로 실행해 모두 통과했다. 새 legacy 사례를 포함한 최종 unit 결과는 51개 통과다. Manager가 보고한 `test_blocked_resume_does_not_excuse_agent_owned_ref_change`는 실제 Git 저장소·commit을 사용하는 integration 사례이므로 Worker는 실행하지 않았다. 전체 verify와 해당 사례 재검증·Review는 Manager에 맡긴다.
+- 2026-09-30: Review의 guidance 재개·원격 채택 중단 경계 두 건을 수정했다. guidance 재개는 저장된 rebase 수용이 있으면 공통 현재 상태 서비스에서 완료·소유권을 다시 확인한 뒤 `accepted_rebase` 범위 검사를 사용한다. 실제 pending/approve 결정과 원본 Agent snapshot을 사용하는 unit 회귀를 추가했다. fast-forward 전에 정확한 요청·후속 OID·branch/worktree·Agent 원본/결과·비교 snapshot을 실행 checkpoint intent에 저장한다. Git 효과 직후 완료 SQLite 기록 전 중단에서도 해당 clean HEAD·index·등록 상태를 대조해 기존 R-039 채택 검사를 재개하며, 후속 shared ref·staged 변경은 거부한다.
+- 최신 근거 입력과 HEAD `73cd54d0cf6a584d071e0e92c518c91c50b8df62`의 base 대비 후보 변경을 다시 확인했다. 현재 후보에서 `python3 -m unittest tests.test_scoped_blocking.BlockedPlanRemoteRefreshTests` 39개, `python3 -m unittest tests.test_execution_handlers.EvidenceFreeBlockedScopeTests` 6개, `python3 -m unittest tests.test_blocked_checkpoint.BlockedCheckpointRefreshUnitTests` 7개, `python3 -m unittest tests.test_scoped_blocking.LegacyBlockedScopeUnitTests` 1개, `python3 -m unittest tests.test_catalog_checkpoint_wiring.CatalogCheckpointWiringTest` 2개가 모두 통과했다. 이번 실행에 targeted 실패는 없었다. 실제 guidance 사용자 결정 후속 commit·base rebase·중간 checkpoint·승인 재개를 함께 거치는 Git 회귀를 추가했으며 Worker는 실행하지 않았다. 전체 verify·실제 Git 회귀·Review는 Manager가 수행한다.
 - [ ] Manager 전체 verify와 실제 Git 회귀 사례 검증. base만 변경·후속 commit만 변경·동시 변경·원인 지속/해소·Git 효과 뒤 중단 재시작·수동 충돌 해결 사례를 작성했으며 Worker는 실행하지 않았다. Linux 전체 검증 스크립트에 새 모듈의 compile 검사를 추가했으나 스크립트·전체 suite·integration·lint·build·type check는 실행하지 않았다.
 - [ ] Reviewer 검토 및 사용자 Merge. Worker는 commit·push·PR을 생성하지 않았다.
 
@@ -86,3 +88,5 @@ priority: critical
 - 2026-09-30: 등록 origin이 없는 legacy 관측은 유효한 원격 갱신 입력으로 간주하지 않는다. 기존 문서·Agent 범위 복구 경계를 유지하고 원래 차단·진단과 미처리 관측을 보존한다. 등록 origin이 있는 프로젝트에는 원격 identity·조회 오류 검사와 현재 원격 복구 gate를 그대로 적용한다.
 
 - 2026-09-30: 원격 채택 비교 기준선은 R-039가 확인한 선택 branch·worktree 상태와 정확한 후속 OID에만 결합한다. 원래 Agent snapshot과 별도로 저장하며 이후 로컬 HEAD·공유 ref·config 변경을 자동으로 흡수하지 않는다. 일시적 외부 검사 실패는 영구 거부 입력으로 기록하지 않는다. 기존 Review 횟수 해제는 원격 복구의 완료 여부가 아니라 기존 소유권·PR·rebase·별도 차단 검사에 의해 결정한다.
+
+- 2026-09-30: 미완료 fast-forward의 비교 intent는 Git 효과 전에 저장하고 완료 채택 기준선과 구분한다. 현재 HEAD가 정확한 의도 결과이고 index·작업물이 clean인 경우에만 선택 상태를 비교에서 수용하며 다른 공유 metadata와 원본 Agent 감사는 보존한다. guidance 승인 검사는 rebase 현재 상태 수용과 별도로 계속 수행한다.

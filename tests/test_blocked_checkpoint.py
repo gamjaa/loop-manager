@@ -457,6 +457,58 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
                 assess.assert_not_called()
                 rebase.assert_not_called()
 
+    def test_guidance_remote_decision_resumes_after_real_base_rebase(self):
+        # Manager integration coverage: never run by the Worker.
+        from tests.test_guidance_approval import guidance_plan
+        repo = str(self.repo.resolve())
+        path = 'docs/plans/[G-034] Checkpoint.md'
+        def document(**options):
+            return (guidance_plan(**options).replace('G-020', 'G-034')
+                    .replace('title: Guidance', 'title: Checkpoint')
+                    .replace('priority: high', 'priority: critical'))
+        (self.repo / 'AGENTS.md').write_text('# Agents\n', encoding='utf-8')
+        (self.repo / path).write_text(document(), encoding='utf-8')
+        self.run_git(self.repo, 'add', 'AGENTS.md', path)
+        self.run_git(self.repo, 'commit', '-m', 'Guidance proposal fixture')
+        self.run_git(self.repo, 'push', 'origin', 'main')
+        self.run_git(self.worktree, 'merge', '--ff-only', 'origin/main')
+        initial = loop_manager.capture_git_snapshot(self.worktree)
+        self.connection.execute(
+            "UPDATE exec_plans SET agent_role = 'worker', agent_snapshot = ?, worker_session_id = 'session'",
+            (initial.serialize(),))
+        self.connection.commit()
+        (self.worktree / 'code.py').write_text('checkpoint work\n', encoding='utf-8')
+        plan = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        pending = loop_manager.parse_guidance_document(document())
+        with mock.patch.object(loop_manager, 'is_loop_manager_repository', return_value=False):
+            loop_manager._block_for_new_guidance(self.connection, self.repo, repo, self.worktree,
+                plan, pending, pending.proposals, 'proposal')
+            loop_manager.dispatch_blocked_checkpoints(self.connection, self.repo, self.state_dir, repo)
+        checkpoint = blocked_checkpoint_state.BlockedCheckpointRepository(self.connection).get(repo, 'G-034')
+        self.assertEqual(checkpoint.phase.value, 'published')
+        snapshot = self.connection.execute('SELECT agent_snapshot FROM exec_plans').fetchone()[0]
+        successor = self.user_commit(path, document(decision='approve', revision='user-1'))
+        (self.repo / 'dependency.py').write_text('dependency = True\n', encoding='utf-8')
+        self.run_git(self.repo, 'add', 'dependency.py')
+        self.run_git(self.repo, 'commit', '-m', 'Advance base after guidance checkpoint')
+        self.run_git(self.repo, 'push', 'origin', 'main')
+        project = self.connection.execute('SELECT * FROM projects').fetchone()
+        loop_manager.observe_blocked_plan_remotes(self.connection, self.repo, repo, project)
+        original_resume = loop_manager.resume_guidance_approval_if_decided
+        def resume(*args, **kwargs):
+            self.assertEqual(self.connection.execute('SELECT agent_snapshot FROM exec_plans').fetchone()[0], snapshot)
+            return original_resume(*args, **kwargs)
+        with (mock.patch.object(loop_manager, 'is_loop_manager_repository', return_value=False),
+              mock.patch.object(loop_manager, 'resume_guidance_approval_if_decided', side_effect=resume)):
+            self.assertTrue(loop_manager.resume_plan_blocks(self.connection, self.repo, self.state_dir, repo, 'main'),
+                            self.connection.execute('SELECT last_error FROM exec_plans').fetchone()[0])
+        head = self.run_git(self.worktree, 'rev-parse', 'HEAD')
+        self.assertNotEqual(head, successor)
+        self.run_git(self.worktree, 'merge-base', '--is-ancestor', 'origin/main', head)
+        self.assertEqual(self.connection.execute('SELECT status FROM exec_plans').fetchone()[0], 'IMPLEMENTING')
+        self.assertEqual(self.connection.execute('SELECT decision FROM guidance_approvals').fetchone()[0], 'approve')
+        self.assertEqual(self.connection.execute('SELECT worker_session_id FROM exec_plans').fetchone()[0], 'session')
+
     def test_remote_refresh_base_only_with_same_specification(self):
         self._assert_remote_refresh(base_changed=True, branch_changed=False, resolved=False)
 
