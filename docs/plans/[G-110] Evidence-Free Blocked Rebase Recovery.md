@@ -45,6 +45,7 @@ G-088처럼 `managed_worktree_conflict`로 차단된 뒤 계획 입력이 바뀌
 - 최신 base로 rebase한 뒤 autostash 복원에서 같은 파일 끝에 추가된 테스트 클래스가 충돌했다. 기존 checkpoint 게시 테스트와 G-110 테스트를 모두 보존해 병합했으며, 직접 변경한 복구·scope·준비·원인 해제 경계의 targeted unit test 26개를 다시 실행해 모두 통과했다.
 - Manager verify 피드백에서 초기 context의 PR 응답 누락, 수동 continue 전 계획 파일의 unstaged 변경과 최초 교정 소진 차단의 동일 상태 재개를 확인했다. fixture의 PR·stage·실패 기록 기대값을 수정하고, 비교 가능한 차단 기준선의 입력·선택 작업 상태가 같은 경우 재개를 억제했다. 관련 targeted unit test 30개의 최종 실행은 모두 통과했으며 실제 Git lifecycle 실패 사례는 Manager의 후속 verify에서 다시 검증한다.
 - Review의 lifecycle 누락 지적을 반영해 실제 Git fixture의 수동 stage 이후 직접 continue·완료 채택을 Manager recover로 교체했다. PR 없음·기존 PR의 coordinator 경로를 Worker 현재 입력·후보 확인과 targeted test 보고, 새 verify·Review 및 실제 게시 adapter까지 연결하고 오래된 Review token으로 게시되지 않는지 확인한다. 외부 Git·Agent·verify를 대체한 unit case에서는 동일 continue 중복 방지, 오래된 성공 결과의 재사용 거부와 새 verify가 통과하지 못한 경우의 gate 보존을 검증한다. 현재 후보의 관련 targeted unit test 33개가 최종 실행에서 모두 통과했으며 실제 Git lifecycle 실행은 Manager의 후속 verify에 남긴다.
+- 후속 Manager verify의 11개 오류는 실제 Git fixture가 잘못된 `git_operation_entries` 이름을 참조한 같은 구성 오류였다. 실제 `_git_operation_entries` adapter를 바인딩하는 workspace 구성 함수를 실제 Git·unit fixture가 공유하게 해, 외부 Git 실행 없이도 해당 구성과 Manager lifecycle을 함께 검증한다.
 - Worker는 좁은 unit case만 실행한다. 실제 Git lifecycle과 전체 verify·Review는 Worker 종료 뒤 Manager 검증 경로에 남긴다.
 
 ## Decision Log

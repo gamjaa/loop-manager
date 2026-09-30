@@ -40,6 +40,17 @@ READY_WORKER_RESULT = 'WORKER_OUTCOME: {"kind":"ready_for_validation"}\nresult'
 VALID_WORKER_RESULT = 'WORKER_OUTCOME: {"kind":"ready_for_validation"}\nvalid result'
 
 
+def recovered_rebase_workspace(workspace, *, connection, repo_path, state_dir,
+                               repo, plan_id, worktree):
+    """Share the Manager workspace bindings between real Git and unit fixtures."""
+    return replace(workspace, git=mock.Mock(wraps=lm.git),
+        _rebase_in_progress_for_branch=lm._rebase_in_progress_for_branch,
+        git_operation_entries=lm._git_operation_entries,
+        current_rebase_service=lambda context, **options: lm._current_rebase_service(
+            connection, repo_path, state_dir, repo, plan_id,
+            worktree, context.branch, **options))
+
+
 class ExecutionHandlerTests(TestCase):
     def test_manual_detached_block_recovers_changed_plan_without_rebase_journal(self):
         self._legacy_rebase_false_block_recovery(plan_block=True, manual='waiting')
@@ -441,12 +452,10 @@ class ExecutionHandlerTests(TestCase):
         effects = replace(
             self.effects, state=state,
             checkpoint=ExecutionCheckpointRepository(fixture.connection),
-            workspace=replace(self.effects.workspace, git=mock.Mock(wraps=lm.git),
-                _rebase_in_progress_for_branch=lm._rebase_in_progress_for_branch,
-                git_operation_entries=lm.git_operation_entries,
-                current_rebase_service=lambda context, **options: lm._current_rebase_service(
-                    fixture.connection, fixture.repo, fixture.state_dir, repo, 'G-034',
-                    fixture.worktree, context.branch, **options)),
+            workspace=recovered_rebase_workspace(self.effects.workspace,
+                connection=fixture.connection, repo_path=fixture.repo,
+                state_dir=fixture.state_dir, repo=repo, plan_id='G-034',
+                worktree=fixture.worktree),
         )
         handler = handlers.ExecutionHandlers(
             effects, repo=repo, repo_path=fixture.repo, state_dir=fixture.state_dir,
@@ -6708,7 +6717,17 @@ class EvidenceFreeRecoveryLifecycleTests(TestCase):
         self.case = self.blocked.case
         self.fixture = self.case.fixture
         self.handler, self.state = self.case.handler, self.case.state
-        self.effects = self.handler.effects
+        workspace = recovered_rebase_workspace(self.handler.effects.workspace,
+            connection=self.fixture.connection, repo_path=self.handler.repo_path,
+            state_dir=self.handler.state_dir, repo='repo', plan_id='G-047',
+            worktree=Path('/state/G-047'))
+        # Substitute external Git effects after constructing the same bindings
+        # as the real lifecycle fixture; no Git process runs in these cases.
+        self.effects = replace(self.handler.effects, workspace=replace(workspace,
+            _rebase_in_progress_for_branch=mock.Mock(side_effect=lambda *_: self.pending),
+            git_operation_entries=mock.Mock(side_effect=lambda *_:
+                {'rebase-merge': 'operation'} if self.pending else {})))
+        self.handler.effects = self.effects
         self.case.expected = replace(self.case.expected,
             input_fingerprint='changed-plan-and-source',
             remote=replace(self.case.expected.remote, oid=None, repository='repo'))
@@ -6729,10 +6748,7 @@ class EvidenceFreeRecoveryLifecycleTests(TestCase):
         self.effects.revision.body_hash.return_value = 'changed-plan-body'
         self.effects.revision.source_fingerprint.return_value = 'changed-source'
         self.effects.workspace.git.side_effect = self.git
-        self.effects.workspace._rebase_in_progress_for_branch.side_effect = lambda *_: self.pending
         self.effects.workspace.remote_branch_oid.side_effect = lambda *_: self.remote
-        self.effects.workspace.git_operation_entries.side_effect = (
-            lambda *_: {'rebase-merge': 'operation'} if self.pending else {})
         self.effects.agent.capture_git_snapshot.side_effect = lambda *_: lm.GitSnapshot(
             'partial' if self.pending else 'owned-head',
             None if self.pending else 'loop-manager/G-047', {},
