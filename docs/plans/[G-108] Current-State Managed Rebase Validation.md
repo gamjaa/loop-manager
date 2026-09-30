@@ -43,11 +43,21 @@ priority: critical
 
 Worker는 새 판정 module, 새 runtime test class와 변경한 checkpoint 저장 case만 실행했다. 기존 journal 완료의 원자 저장·멱등성 case도 같은 targeted command로 확인했다. 전체 verify, 실제 Git lifecycle, commit·push·PR 생성은 실행하지 않았으며 Manager 검증과 Reviewer 검토는 후속 단계다.
 
-최종 targeted command는 아래와 같으며 19개 unit test가 모두 통과했다.
+기반 구현의 targeted command는 아래와 같으며 19개 unit test가 모두 통과했다.
 
 ```sh
 python3 -B -m unittest tests.test_managed_rebase_validation tests.test_runtime_state.CurrentRebaseRuntimeTests tests.test_execution_checkpoint_state.CheckpointRepositoryTests.test_current_acceptance_is_generation_bound_and_preserves_legacy_audit tests.test_execution_checkpoint_state.CheckpointRepositoryTests.test_current_acceptance_supports_no_history_and_retains_prior_acceptances tests.test_execution_checkpoint_state.CheckpointRepositoryTests.test_rebase_completion_rolls_back_checkpoint_when_projection_fails tests.test_execution_checkpoint_state.CheckpointRepositoryTests.test_rebase_completion_updates_checkpoint_and_projection_once
 ```
+
+Manager verify 피드백 `verify:d0372d9f34e1e77042ee07cd2450b3cacb5b6c0201d9546f898589cd5c44f7db` (occurrence=1, revision=1)의 Planner 격리 import 실패를 재현했다. 해당 fixture의 복사 목록에 새 rebase 관측·판정 모듈을 포함하고, import 실패의 stderr를 assertion에 표시하도록 보강했다. bytecode 보존 및 범위 밖 파일 거부 assertion은 유지했다.
+
+FAILED_COMMAND: python3 -B -m unittest tests.test_loop_manager.AgentScopeValidatorTest.test_planner_import_bytecode_is_ignored_without_hiding_scope_violations
+최초 실행 결과: FAILED (errors=1)
+RERUN: python3 -B -m unittest tests.test_loop_manager.AgentScopeValidatorTest.test_planner_import_bytecode_is_ignored_without_hiding_scope_violations
+
+수정 후 동일 명령의 최종 결과는 1개 test 통과(`OK`)다. 이번 교정에서는 이 case만 실행했고 전체 verify는 다시 실행하지 않았다.
+
+후속 Worker 결과 검증은 `TARGETED_TESTS`에 작성한 "실패 없음"을 실패 토큰으로 인식했다. 이전 보고의 실패·재실행 명령은 이 단락 밖에 있어 해결 이력으로 대조되지 않았다. 같은 unit case를 다시 실행해 1개 test 통과(`OK`)를 확인했고, 실패 명령·최초 실행 결과·동일 명령 재실행·최종 `OK`를 모두 `TARGETED_TESTS` 안에 순서대로 배치했다. 준비된 최종 보고문은 기존 `parse_worker_outcome`과 `parse_worker_result`의 읽기 전용 검증을 통과했다.
 
 ## Decision Log
 

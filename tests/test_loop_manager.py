@@ -8151,6 +8151,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "loop_manager.py",
                 "manager_git_journal.py",
                 "managed_rebase_evidence.py",
+                "managed_rebase_observation.py",
+                "managed_rebase_validation.py",
                 "rebase_block_reconciliation.py",
                 "rebase_file_evidence.py",
                 "execution_checkpoint.py",
@@ -8204,7 +8206,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
             commit_and_push(repo, "Add planner import fixtures")
 
             planner_environment = loop_manager.agent_environment("codex", "planner")
-            subprocess.run(
+            import_result = subprocess.run(
                 [
                     sys.executable,
                     "-c",
@@ -8213,18 +8215,19 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 ],
                 cwd=repo,
                 env=planner_environment,
-                check=True,
+                check=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
             )
+            self.assertEqual(import_result.returncode, 0, import_result.stderr)
             self.assertTrue(any(repo.rglob("*.pyc")))
 
             existing_cache = repo / "__pycache__" / "preserved.pyc"
             existing_cache.parent.mkdir(exist_ok=True)
             existing_cache.write_bytes(b"existing cache")
             before = loop_manager.capture_git_snapshot(repo)
-            subprocess.run(
+            import_result = subprocess.run(
                 [
                     sys.executable,
                     "-c",
@@ -8233,11 +8236,12 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 ],
                 cwd=repo,
                 env=planner_environment,
-                check=True,
+                check=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
             )
+            self.assertEqual(import_result.returncode, 0, import_result.stderr)
             self.assertEqual(existing_cache.read_bytes(), b"existing cache")
             write_execplan(repo, "G-002", "Imported Without Bytecode")
             after = loop_manager.capture_git_snapshot(repo)
