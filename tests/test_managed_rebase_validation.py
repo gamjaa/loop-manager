@@ -3,6 +3,7 @@
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+import tempfile
 import unittest
 from unittest import mock
 
@@ -243,17 +244,30 @@ class CurrentRebasePolicyTests(unittest.TestCase):
 
 
 class CurrentRebaseObservationTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        repo, worktree = root / 'repo', root / 'owned'
+        common_dir = repo / '.git'
+        common_dir.mkdir(parents=True)
+        worktree.mkdir()
+        self.expected = expectation(
+            repo=str(repo.resolve()), repository_identity=str(common_dir.resolve()),
+            worktree=str(worktree.resolve()),
+        )
+
     def adapters(self):
-        expected = expectation()
+        expected = self.expected
         snapshot = SimpleNamespace(
             head='after', branch=expected.branch, index={'app.py': ('H 100644 blob 0',)},
             dirty={}, refs={f'refs/heads/{expected.branch}': ('after', '')},
-            worktrees={'/owned': ('HEAD=after', f'branch=refs/heads/{expected.branch}')},
+            worktrees={expected.worktree: ('HEAD=after', f'branch=refs/heads/{expected.branch}')},
             config={}, operations={}, shared_metadata_complete=True,
         )
         def git(_context, *args, **_kwargs):
             if args[0] == 'rev-parse':
-                output = '/repo/.git\n' if '--git-common-dir' in args else 'base\n'
+                output = expected.repository_identity + '\n' if '--git-common-dir' in args else 'base\n'
             elif args[:2] == ('ls-files', '--debug'):
                 output = ('app.py\0  ctime: 1:1\n  mtime: 1:1\n  dev: 1\tino: 1\n'
                           '  uid: 1\tgid: 1\n  size: 1\tflags: 0\n')
@@ -277,9 +291,21 @@ class CurrentRebaseObservationTests(unittest.TestCase):
         )
 
     def test_adapter_reads_final_modes_ignored_files_and_flags_without_history(self):
-        expected, adapters = expectation(), self.adapters()
+        expected, adapters = self.expected, self.adapters()
         actual, scope = observe_current_rebase(expected, adapters)
         self.assertIsInstance(actual, RebaseObservation)
+        for path in (actual.repo, actual.worktree, actual.repository_identity):
+            self.assertTrue(Path(path).is_absolute())
+            self.assertEqual(path, str(Path(path).resolve()))
+        self.assertEqual(actual.repository_identity, expected.repository_identity)
+        self.assertEqual(actual.registration,
+                         ('HEAD=after', f'branch=refs/heads/{expected.branch}'))
+        self.assertEqual(actual.branch_worktrees, (expected.worktree,))
+        for context in (expected.repo, expected.worktree):
+            adapters.git.assert_any_call(
+                Path(context), 'rev-parse', '--path-format=absolute',
+                '--git-common-dir', check=False,
+            )
         self.assertEqual(actual.files[0].kinds, ('ignored',))
         self.assertEqual(actual.index[0].flags, 0)
         self.assertEqual(actual.committed[0].new_oid, 'blob')
@@ -289,7 +315,7 @@ class CurrentRebaseObservationTests(unittest.TestCase):
         self.assertFalse(any(call.args[1] in forbidden_queries for call in adapters.git.call_args_list))
 
     def test_adapter_preserves_actual_detached_snapshot_and_waits_for_resolution(self):
-        expected = expectation()
+        expected = self.expected
         for operation in ('rebase-merge', 'rebase-apply'):
             for conflicted in (False, True):
                 with self.subTest(operation=operation, conflicted=conflicted):
@@ -349,7 +375,7 @@ class CurrentRebaseObservationTests(unittest.TestCase):
                     ))
 
     def test_adapter_reports_query_failures_missing_flags_and_remote_races(self):
-        expected = expectation()
+        expected = self.expected
         for configure in (
             lambda adapters: setattr(adapters.read_remote, 'side_effect', RuntimeError('offline')),
             lambda adapters: setattr(adapters.validate_identity, 'side_effect', RuntimeError('other worktree')),
@@ -371,6 +397,22 @@ class CurrentRebaseObservationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_raw_changes(':100644 100644 old new M\0truncated')
 
+    def test_adapter_rejects_noncanonical_repository_and_worktree_paths(self):
+        expected = self.expected
+        for field in ('repo', 'worktree'):
+            with self.subTest(field=field):
+                path = Path(getattr(expected, field))
+                noncanonical = str(path / '..' / path.name)
+                self.assertNotEqual(noncanonical, str(Path(noncanonical).resolve()))
+                adapters = self.adapters()
+                actual, scope = observe_current_rebase(
+                    replace(expected, **{field: noncanonical}), adapters,
+                )
+                self.assertIsInstance(actual, ObservationFailure)
+                self.assertIsNone(scope)
+                adapters.validate_identity.assert_not_called()
+                adapters.git.assert_not_called()
+
     def test_debug_flags_and_unusual_paths_cannot_be_hidden_by_v_tag(self):
         debug = ('weird\nname.py\0  ctime: 1:1\n  mtime: 1:1\n  dev: 1\tino: 1\n'
                  '  uid: 1\tgid: 1\n  size: 1\tflags: 20000000\n')
@@ -380,6 +422,7 @@ class CurrentRebaseObservationTests(unittest.TestCase):
         self.assertEqual(decision_for(observed=actual).status, RebaseStatus.REJECTED)
 
     def test_adapter_detects_hidden_tracked_mode_change(self):
+        expected = self.expected
         adapters = self.adapters()
         snapshot = adapters.capture_snapshot.return_value
         protected = 'docs/ARCHITECTURE.md'
@@ -394,8 +437,8 @@ class CurrentRebaseObservationTests(unittest.TestCase):
         adapters.read_file.side_effect = lambda _worktree, path: (
             '100755' if path == protected else '100644', 'current-mode',
         )
-        actual, scope = observe_current_rebase(expectation(), adapters)
+        actual, scope = observe_current_rebase(expected, adapters)
         self.assertEqual(actual.files[0].path, protected)
         self.assertEqual(actual.files[0].kinds, ('unstaged',))
-        self.assertEqual(assess_current_rebase(expectation(), actual, scope).status,
+        self.assertEqual(assess_current_rebase(expected, actual, scope).status,
                          RebaseStatus.REJECTED)

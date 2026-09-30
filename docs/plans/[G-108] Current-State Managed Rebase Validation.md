@@ -67,6 +67,14 @@ RERUN: python3 -B -m unittest tests.test_managed_rebase_validation.CurrentRebase
 
 수정 후 동일 명령의 최종 결과는 3개 unit test 통과(`OK`)다. 기존 불일치 거부 및 index 보존 assertion을 유지했고, 이번 교정에서도 전체 verify·commit·push·PR 생성은 실행하지 않았다.
 
+Reviewer 피드백 `review:tests/test_managed_rebase_validation.py::currentrebaseobservationtests.adapters::windows-noncanonical-fixture` (occurrence=1, revision=1)을 교정했다. 관측 unit test 클래스는 임시 repository·worktree·common-dir 디렉터리를 만들고 실제 `Path.resolve()`로 현재 플랫폼의 canonical 경로를 구성한다. 기대값, Git common-dir 응답, snapshot worktree 등록과 detached porcelain fixture는 같은 경로를 사용한다. 순수 판정·저장 테스트가 공유하는 기존 fixture는 유지했다. 정상 관측의 경로·등록 일치를 확인하고, repository 또는 worktree 경로에 `..`가 남아 있으면 Git 조회 전에 거부하는 회귀 case를 추가했다.
+
+```sh
+python3 -B -m unittest tests.test_managed_rebase_validation.CurrentRebaseObservationTests
+```
+
+수정한 관측 test 클래스만 Linux에서 실행해 6개 unit test가 통과했다(`OK`). Windows 실행 환경이 없어 Windows에서 실행하지 않았으며, 전체 verify·commit·push·PR 생성은 실행하지 않았다.
+
 ## Decision Log
 
 - R-048과 ARCHITECTURE의 R-048 절은 기존 R-045의 작업 수행 증거 정책을 명시적으로 대체한다. 추가 사용자 결정을 요구하거나 구 정책을 새 완료 조건으로 재도입하지 않는다.
