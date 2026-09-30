@@ -2181,6 +2181,66 @@ class EvidenceFreeRebaseBlockTests(unittest.TestCase):
         self.case.observed = replace(self.case.observed, input_fingerprint='new-user-input')
         self.assertTrue(self.resume())
 
+    def exhausted_pending(self):
+        from recovery_runtime import RecoveryObservation, RecoveryReason
+        from recovery_state import RecoveryRepository
+        detail = self.block()
+        self.pending()
+        RecoveryRepository(self.connection).observe(RecoveryObservation(
+            RecoveryReason.REBASE_CONFLICT, 'repo', 'G-047', 'WORKING',
+            'old-revision', 'old-base', 'conflict', 'old-progress', detail), correction_limit=1)
+        snapshot = loop_manager.GitSnapshot('partial', None,
+            {'app.py': ('M 100644 manual 2',)},
+            {'app.py': (('unstaged',), 'unresolved-content')},
+            {'refs/heads/loop-manager/G-047': ('before', '')},
+            {'/state/G-047': ('HEAD=partial', 'detached=True')}, {}, {'rebase-merge': 'operation'})
+        with self.connection:
+            self.connection.execute("UPDATE exec_plans SET blocked_fingerprint = 'same-input', "
+                "blocked_worktree_fingerprint = 'same-input', agent_result_snapshot = ?",
+                (snapshot.serialize(),))
+        return snapshot
+
+    def test_first_exhausted_conflict_stays_blocked_until_selected_git_state_changes(self):
+        from dataclasses import replace
+        snapshot = self.exhausted_pending()
+        with mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=snapshot) as capture, \
+             mock.patch.object(loop_manager, '_revision_execplan_input_fingerprint', return_value='same-input'), \
+             mock.patch.object(loop_manager, '_worktree_execplan_input_fingerprint', return_value='same-input'):
+            before = self.snapshot()
+            self.assertFalse(self.resume())
+            self.assertEqual(self.snapshot(), before)
+            self.assertFalse(self.resume())
+            self.assertEqual(self.snapshot(), before)
+            capture.return_value = replace(snapshot, dirty={'app.py': (('unstaged',), 'user-resolution')})
+            self.assertTrue(self.resume())
+            self.assertIsNone(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
+        self.git_write.assert_not_called()
+
+    def test_changed_current_inputs_resume_exhausted_conflict_without_git_progress(self):
+        snapshot = self.exhausted_pending()
+        for changed in ('revision', 'worktree'):
+            with self.subTest(changed=changed), \
+                 mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=snapshot), \
+                 mock.patch.object(loop_manager, '_revision_execplan_input_fingerprint',
+                     return_value='new-input' if changed == 'revision' else 'same-input'), \
+                 mock.patch.object(loop_manager, '_worktree_execplan_input_fingerprint',
+                     return_value='new-input' if changed == 'worktree' else 'same-input'), \
+                 mock.patch.object(loop_manager.runtime_state.RuntimeStateRepository,
+                     'resume_rebase_block') as release:
+                self.assertTrue(self.resume())
+                release.assert_called_once()
+        self.git_write.assert_not_called()
+
+    def test_missing_recovery_history_does_not_make_saved_snapshot_a_resume_gate(self):
+        snapshot = self.exhausted_pending()
+        self.connection.execute('DELETE FROM recovery_records')
+        self.connection.commit()
+        with mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=snapshot), \
+             mock.patch.object(loop_manager, '_revision_execplan_input_fingerprint', return_value='same-input'), \
+             mock.patch.object(loop_manager, '_worktree_execplan_input_fingerprint', return_value='same-input'):
+            self.assertTrue(self.resume())
+        self.git_write.assert_not_called()
+
     def test_project_rebase_release_preserves_each_independent_plan_cause(self):
         for cause in ('review_retry_exhausted', 'guidance_approval_required', 'user_decision_required',
                       'pull_request_closed', 'managed_worktree_scope_violation'):

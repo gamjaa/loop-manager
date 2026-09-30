@@ -160,7 +160,8 @@ class ExecutionHandlerTests(TestCase):
             config_path=Path('/config'), newly_activated=False,
         )
         handler.plan = handler._cached_plan(handler.effects.state.active_execplan(repo))
-        context = handler._context()
+        with mock.patch.object(lm, 'pr_for_branch', return_value=pull_request):
+            context = handler._context()
         journal = handlers.manager_git_journal
         expected = dict(
             branch=branch, before_head=original, target_base_oid=target,
@@ -369,6 +370,9 @@ class ExecutionHandlerTests(TestCase):
                 if manual == 'waiting':
                     app.write_text(''.join(resolved))
                     git(fixture.worktree, 'add', 'code.py')
+                # The user's changed plan is also part of this manual result;
+                # Git continue requires all tracked edits to be staged.
+                git(fixture.worktree, 'add', '--', plan_path)
                 self.assertEqual(lm.git(fixture.worktree, '-c', 'core.editor=true',
                     'rebase', '--continue', check=False).returncode, 0)
                 lm._complete_direct_rebase_checkpoint(connection, repo, 'G-034', fixture.worktree,
@@ -387,9 +391,12 @@ class ExecutionHandlerTests(TestCase):
         self.assertIsNotNone(incidents[0]['released_at'])
         self.assertEqual(json.loads(incidents[0]['payload'])['cause'], reason)
         failure = connection.execute('SELECT * FROM persistent_execution_failures').fetchone()
-        self.assertEqual(failure['active'], 0)
-        self.assertEqual(failure['detail'], reason)
-        self.assertIsNotNone(failure['resolved_at'])
+        if manual in {'waiting', 'staged'}:
+            self.assertIsNone(failure)
+        else:
+            self.assertEqual(failure['active'], 0)
+            self.assertEqual(failure['detail'], reason)
+            self.assertIsNotNone(failure['resolved_at'])
         self.assertIsNone(ExecutionCheckpointRepository(connection).get(repo, 'G-034').operation)
         if published_checkpoint:
             self.assertEqual(dict(connection.execute(
@@ -403,9 +410,11 @@ class ExecutionHandlerTests(TestCase):
             audit_slot = journal._slot(fixture.state_dir, repo, 'managed_rebase', str(fixture.worktree.resolve()))
             self.assertEqual(journal._read(audit_slot / f'{continuation}.intent.json')['expected']['before_head'], original)
             self.assertEqual(proof['head'], git(fixture.worktree, 'rev-parse', 'HEAD'))
-        self.assertEqual(handlers.recovery_state.RecoveryRepository(connection).row(
-            repo, 'G-034',
-        )['pending_action'], 'reconcile')
+        recovery = handlers.recovery_state.RecoveryRepository(connection).row(repo, 'G-034')
+        if manual in {'waiting', 'staged'}:
+            self.assertIsNone(recovery)
+        else:
+            self.assertEqual(recovery['pending_action'], 'reconcile')
         self.assertEqual(app.read_text().splitlines()[20], 'later-20')
         self.assertEqual(app.read_text().splitlines()[12], 'later-12')
         fixture.verify_probe.assert_not_called()
@@ -6648,3 +6657,18 @@ class EvidenceFreeRebasePreparationTests(TestCase):
                 self.case.observed = observed
                 with self.assertRaises(handlers.manager_git_journal.MutationEvidenceError):
                     self.case.handler._resolving_rebase(self.case.state.row())
+
+    def test_initial_and_detached_context_validate_current_existing_pr_lease(self):
+        from managed_rebase_validation import PullRequest
+        remote = replace(self.case.expected.remote, repository='repo', oid='remote', pull_request=PullRequest(
+            'https://example.test/pr/47', 'repo', 'loop-manager/G-047',
+            'remote', 'OPEN'))
+        self.case.expected = replace(self.case.expected, remote=remote)
+        self.case.observed = replace(self.case.observed, remote=remote)
+        self.case.state.update_project('repo', pr_url=remote.pull_request.identity, pr_head_oid=remote.oid)
+        self.assertFalse(self.case.handler._context().resolving_rebase)
+        self.pending()
+        self.assertTrue(self.case.handler._context().resolving_rebase)
+        self.case.observed = replace(self.case.observed, remote=replace(remote, pull_request=None))
+        with self.assertRaises(handlers.manager_git_journal.MutationEvidenceError):
+            self.case.handler._context()

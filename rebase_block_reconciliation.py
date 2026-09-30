@@ -92,6 +92,26 @@ def could_be_rebase_evidence_block(block, recovery=None, checkpoint=None) -> boo
     )
 
 
+def pending_block_unchanged(plan, block, recovery, before, current, *,
+                            revision_input, worktree_input) -> bool:
+    """A saved blocked state suppresses unchanged retries, never proves ownership.
+
+    Missing historical baselines permit current-state recovery. Only an actual
+    unchanged selected worktree and unchanged inputs retain an exhausted block.
+    """
+    return bool(
+        block['reason_code'] == BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value
+        and recovery is not None and recovery['pending_action'] == 'final_block'
+        and recovery['reason_code'] == RecoveryReason.REBASE_CONFLICT.value
+        and recovery['detail'] == block['evidence']
+        and plan['blocked_fingerprint'] and plan['blocked_worktree_fingerprint']
+        and revision_input == plan['blocked_fingerprint']
+        and worktree_input == plan['blocked_worktree_fingerprint']
+        and all(getattr(before, field) == getattr(current, field)
+                for field in ('head', 'branch', 'index', 'dirty', 'operations'))
+    )
+
+
 def require_clean_completion(observed) -> None:
     """Do not seal unapproved post-rebase files or index changes as completion."""
 

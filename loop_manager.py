@@ -16657,6 +16657,17 @@ def _reconcile_rebase_evidence_block(
             validate_blocked_agent_scope(
                 connection, repo_path, repo, str(project['base_branch']), worktree,
                 str(plan['path']), accepted_rebase=True, saved_plan=plan)
+            if (observation[1].status is managed_rebase_validation.RebaseStatus.WAITING
+                    and plan['agent_result_snapshot']
+                    and plan['blocked_fingerprint'] and plan['blocked_worktree_fingerprint']):
+                before = GitSnapshot.deserialize(str(plan['agent_result_snapshot']))
+                current = capture_git_snapshot(worktree)
+                if rebase_block_reconciliation.pending_block_unchanged(
+                        plan, block, recovery, before, current,
+                        revision_input=_revision_execplan_input_fingerprint(
+                            repo_path, str(plan['current_revision_sha'] or plan['plan_sha']), plan),
+                        worktree_input=_worktree_execplan_input_fingerprint(worktree, plan)):
+                    raise RuntimeError('unchanged blocked rebase still needs user input or Git progress')
             return observation
         observation = observe()
         runtime_state.RuntimeStateRepository(connection).resume_rebase_block(
