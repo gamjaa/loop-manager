@@ -1358,7 +1358,7 @@ class ExecutionHandlerTests(TestCase):
                 index=(SimpleNamespace(stage=1),) if stages else ())
             decision = RebaseDecision(RebaseStatus.WAITING if in_progress or stages else RebaseStatus.COMPLETE)
             return SimpleNamespace(expected=SimpleNamespace(remote=remote),
-                require_owned=lambda: (observed, decision),
+                require_owned=lambda **_options: (observed, decision),
                 adopt=lambda *_args: fake_complete_rebase(context, project_values={'active_sha': current.target_base_oid}))
         self.handler._current_rebase_service = fake_current_service
 
@@ -5479,6 +5479,152 @@ class CurrentRebaseAdoptionTests(TestCase):
         self.observation_patch.start()
         self.addCleanup(self.observation_patch.stop)
         self.handler._complete_rebase_intent = handlers.ExecutionHandlers._complete_rebase_intent.__get__(self.handler)
+
+    def _prepare_current_checkpoint_recovery(self):
+        self.expected = replace(self.expected, remote=replace(self.expected.remote, repository='repo'))
+        self.observed = replace(self.observed, remote=self.expected.remote)
+        blocked_checkpoint_state.ensure_schema(self.fixture.connection)
+        self.fixture.connection.execute(
+            "INSERT INTO blocked_checkpoints "
+            "(repo, plan_id, request_identity, phase, reason_code, evidence, "
+            "branch, worktree, accepted_remote_oid) "
+            "VALUES ('repo', 'G-047', 'request', 'published', 'review', 'evidence', "
+            "'loop-manager/G-047', '/state/G-047', 'remote')")
+        self.state.update_project('repo', publication_remote_oid='remote')
+        self.fixture.effects.workspace._rebase_in_progress_for_branch.return_value = False
+        self.fixture.effects.workspace.git_operation_entries.return_value = {}
+        self.fixture.effects.workspace.remote_branch_oid.return_value = 'remote'
+        self.fixture.effects.publication.pr_for_branch.return_value = None
+        self.fixture.effects.workspace.git.side_effect = self.fixture.observed_git
+        self.handler._fetch_latest_base = mock.Mock(return_value='base')
+        self.owner_patch = mock.patch.object(handlers.checkpoint_ownership,
+                                            'owned_remote_oid', return_value='remote')
+        self.owner_patch.start()
+        self.addCleanup(self.owner_patch.stop)
+
+    def test_current_acceptance_push_completion_retains_ownership_on_restart(self):
+        self._prepare_current_checkpoint_recovery()
+        self.handler._complete_rebase_intent(self.fixture.context())
+        accepted = self.checkpoint.get('repo', 'G-047').snapshot['current_rebase_acceptance']
+        for entry in ('normal', 'recover'):
+            with self.subTest(entry=entry):
+                saved = self.checkpoint.get('repo', 'G-047')
+                self.checkpoint.record('repo', 'G-047', expected_generation=saved.generation,
+                    operation='push', expected_head='owned-head', target_base_oid='base',
+                    observed_remote_oid='remote', snapshot={
+                        'current_rebase_acceptance': accepted, 'remote_before': 'remote'})
+                self.state.update_project('repo', publication_remote_oid='remote')
+                self.fixture.effects.workspace.remote_branch_oid.return_value = 'owned-head'
+                self.observed = replace(self.observed, remote=replace(self.expected.remote, oid='owned-head'))
+                self.fixture.dirty = False
+                if entry == 'normal':
+                    # Publication has already confirmed the exact live push.
+                    self.state.update_project('repo', publication_remote_oid='owned-head')
+                    self.handler._complete_publication_intent(self.fixture.context())
+                else:
+                    self.assertIsInstance(self.handler.recover(self.fixture.context()), handlers.ExecutionContext)
+                saved = self.checkpoint.get('repo', 'G-047')
+                self.assertEqual(saved.snapshot['pushed_checkpoint_head'], 'owned-head')
+                self.assertIsNone(saved.operation)
+                self.assertEqual(self.state.row()['publication_remote_oid'], 'owned-head')
+                self.assertIsInstance(self.handler.recover(self.fixture.context()), handlers.ExecutionContext)
+                saved = self.checkpoint.get('repo', 'G-047')
+                self.checkpoint.record('repo', 'G-047', expected_generation=saved.generation,
+                    operation='pr_create', expected_head='owned-head', target_base_oid='base',
+                    observed_remote_oid='owned-head', snapshot=saved.snapshot)
+                pr = dict(url='new-pr', headRefOid='owned-head')
+                from managed_rebase_validation import PullRequest
+                self.observed = replace(self.observed, remote=replace(self.observed.remote,
+                    pull_request=PullRequest('new-pr', 'repo', self.expected.branch, 'owned-head', 'OPEN')))
+                self.assertTrue(self.handler._owned_checkpoint_remote(self.fixture.context(),
+                    self.state.row(), 'owned-head', self.checkpoint.get('repo', 'G-047'), pr))
+                self.assertFalse(self.handler._owned_checkpoint_remote(self.fixture.context(),
+                    self.state.row(), 'foreign', self.checkpoint.get('repo', 'G-047'), pr))
+                self.observed = replace(self.observed, remote=self.expected.remote)
+
+    def test_adopted_checkpoint_restored_stage_reaches_worker_revalidation(self):
+        from managed_rebase_validation import FileChange, IndexEntry
+        self._prepare_current_checkpoint_recovery()
+        self.handler._complete_rebase_intent(self.fixture.context())
+        accepted = self.checkpoint.get('repo', 'G-047').snapshot['current_rebase_acceptance']
+        clean = self.observed
+        staged = FileChange('app.py', '100644', '100644', 'old', 'new', 'M')
+        self.observed = replace(clean, staged=(staged,), index_clean=False)
+        result = self.handler.recover(self.fixture.context())
+        self.assertIsInstance(result, handlers.ExecutionContext)
+        self.assertEqual(result.phase, ExecutionPhase.IMPLEMENTING)
+        self.assertEqual(self.checkpoint.get('repo', 'G-047').snapshot['current_rebase_acceptance'], accepted)
+        self.assertIsNone(self.state.row()['worker_result'])
+        self.fixture.effects.agent.run_agent.assert_not_called()
+        self.fixture.effects.validation.verify.assert_not_called()
+        with self.assertRaises(handlers.manager_git_journal.MutationEvidenceError):
+            self.factory(None).require_owned()  # Staging is not a new completion.
+        saved = self.checkpoint.get('repo', 'G-047')
+        preserved = self.observed
+        for invalid in (
+            replace(self.observed, operations=(('MERGE_HEAD', 'foreign'),)),
+            replace(self.observed, head='foreign', branch_ref=('foreign', '')),
+            replace(self.observed, staged=(replace(staged, path='docs/ARCHITECTURE.md'),)),
+            replace(self.observed, index=(IndexEntry('app.py', '100644', 'new', 1, 'M', 0),)),
+            replace(self.observed, index=(IndexEntry('app.py', '100644', 'new', 0, 'H', 32768),)),
+            replace(self.observed, remote=replace(self.observed.remote, oid='foreign')),
+        ):
+            with self.subTest(observed=invalid):
+                self.observed = invalid
+                self.assertFalse(self.handler._owned_checkpoint_remote(
+                    self.fixture.context(), self.state.row(), 'remote', saved))
+        self.observed = preserved
+        for acceptance in (None, {**accepted, 'head': 'tampered'}):
+            with self.subTest(acceptance=acceptance):
+                changed = replace(saved, snapshot={**saved.snapshot, 'current_rebase_acceptance': acceptance})
+                self.assertFalse(self.handler._owned_checkpoint_remote(
+                    self.fixture.context(), self.state.row(), 'remote', changed))
+        from tests.test_execution_revision import definition
+        self.handler._definition_snapshot = definition(path='docs/plans/[G-047] Runtime.md')
+        finished = self.handler._finish_worker(result, self.state.row(), VALID_WORKER_RESULT)
+        self.assertEqual(finished.context.phase, ExecutionPhase.VERIFYING)
+        self.assertEqual(self.checkpoint.get('repo', 'G-047').snapshot['worker_candidate_token'],
+                         self.handler._definition_snapshot.worker_candidate_token('owned-head'))
+
+    def test_manual_autostash_stage_without_worker_result_is_committed_and_readopted(self):
+        from managed_rebase_validation import FileChange
+        self._prepare_current_checkpoint_recovery()
+        saved = self.checkpoint.get('repo', 'G-047')
+        self.checkpoint.record('repo', 'G-047', expected_generation=saved.generation,
+            operation='rebase', expected_head='before', target_base_oid='base',
+            observed_remote_oid='remote', snapshot={'stash_oid': 'stash'})
+        self.state.update_project('repo', worker_result=None)
+        self.expected = replace(self.expected, autostash_oid='stash')
+        self.observed = replace(self.observed, index_clean=False, staged=(
+            FileChange('app.py', '100644', '100644', 'old', 'new', 'M'),))
+        calls = []
+        def git(path, *args, **kwargs):
+            calls.append(args)
+            if args == ('diff', '--cached', '--quiet'):
+                return SimpleNamespace(stdout='', returncode=int(not self.observed.index_clean))
+            if args[:1] == ('commit',):
+                self.observed = replace(self.observed, head='resolved-head', staged=(), index_clean=True,
+                    branch_ref=('resolved-head', ''), registration=(
+                        'HEAD=resolved-head', 'branch=refs/heads/loop-manager/G-047'))
+                return SimpleNamespace(stdout='', returncode=0)
+            if args == ('rev-parse', 'HEAD'):
+                return SimpleNamespace(stdout=self.observed.head, returncode=0)
+            return self.fixture.observed_git(path, *args, **kwargs)
+        self.fixture.effects.workspace.git.side_effect = git
+        result = self.handler.recover(self.fixture.context())
+        self.assertIsInstance(result, handlers.ExecutionContext)
+        self.assertEqual(result.phase, ExecutionPhase.IMPLEMENTING)
+        saved = self.checkpoint.get('repo', 'G-047')
+        self.assertIsNone(saved.operation)
+        self.assertEqual(saved.snapshot['current_rebase_acceptance']['head'], 'resolved-head')
+        self.assertIsNone(self.state.row()['worker_result'])
+        self.assertIsNone(self.state.row()['verify_result'])
+        self.assertEqual(sum(args[0] == 'commit' for args in calls), 1)
+        self.assertFalse(any(args[0] == 'add' or 'rebase' in args for args in calls))
+        self.assertIsInstance(self.handler.recover(self.fixture.context()), handlers.ExecutionContext)
+        self.assertEqual(sum(args[0] == 'commit' for args in calls), 1)
+        self.fixture.effects.agent.run_agent.assert_not_called()
+        self.fixture.effects.validation.verify.assert_not_called()
 
     def test_manual_completion_without_journal_invalidates_worker_and_validation_once(self):
         with mock.patch.object(handlers.manager_git_journal, 'verified_rebase_completion',

@@ -9,7 +9,7 @@ import hashlib
 
 from managed_rebase_observation import ObservationAdapters, observe_current_rebase
 from managed_rebase_validation import (
-    ObservationFailure, RebaseExpectation, RebaseStatus, assess_current_rebase,
+    ObservationFailure, RebaseExpectation, RebaseStatus, assess_current_rebase, valid_acceptance,
 )
 from manager_git_journal import MutationEvidenceError
 
@@ -29,13 +29,22 @@ class ManagedRebaseService:
     expected: RebaseExpectation
     adapters: ObservationAdapters
 
-    def observe(self):
+    def observe(self, *, checkpoint=None):
         observed, scope = observe_current_rebase(self.expected, self.adapters)
-        decision = assess_current_rebase(self.expected, observed, scope)
+        accepted = (checkpoint.snapshot or {}).get('current_rebase_acceptance') if checkpoint else None
+        adopted_head = None
+        if (checkpoint is not None and checkpoint.operation != 'rebase'
+                and valid_acceptance(accepted)
+                and all(accepted[key] == getattr(self.expected, key) for key in (
+                    'repo', 'repository_identity', 'plan_id', 'worktree', 'branch',
+                    'target_base_oid', 'role'))):
+            adopted_head = checkpoint.expected_head
+        decision = assess_current_rebase(self.expected, observed, scope,
+                                         adopted_head=adopted_head)
         return observed, decision
 
-    def require_owned(self):
-        observed, decision = self.observe()
+    def require_owned(self, *, checkpoint=None):
+        observed, decision = self.observe(checkpoint=checkpoint)
         if decision.status not in {RebaseStatus.START, RebaseStatus.WAITING, RebaseStatus.COMPLETE}:
             detail = ': ' + observed.detail if isinstance(observed, ObservationFailure) else ''
             raise MutationEvidenceError('current rebase rejected: ' + decision.reason + detail)

@@ -467,7 +467,7 @@ class ExecutionHandlers:
                     service.expected, remote=replace(service.expected.remote,
                         pull_request=PullRequest(str(pull_request['url']), self.repo,
                             context.branch, remote_oid, 'OPEN'))))
-            observed, decision = service.require_owned()
+            observed, decision = service.require_owned(checkpoint=current)
             if current.operation == 'commit' and observed.head != current.expected_head:
                 return checkpoint_ownership.committed_tree_matches_intent(
                     self.repo_path, current.expected_head, observed.head,
@@ -1474,6 +1474,19 @@ class ExecutionHandlers:
             )
         return result
 
+    def _commit_rebase_resolution(self, context, title):
+        """Commit resolved autostash contents, retaining the rebase adoption boundary."""
+        checkpoints = self.effects.checkpoint
+        pending = checkpoints.get(self.repo, context.plan.plan_id)
+        self._commit_owned(context, title)
+        committed = checkpoints.get(self.repo, context.plan.plan_id)
+        checkpoints.record(
+            self.repo, context.plan.plan_id, expected_generation=committed.generation,
+            operation='rebase', expected_head=pending.expected_head,
+            target_base_oid=pending.target_base_oid,
+            observed_remote_oid=pending.observed_remote_oid,
+            snapshot={**(pending.snapshot or {}), 'after_head': committed.expected_head})
+
     def _complete_publication_intent(self, context):
         checkpoint = self.effects.checkpoint
         if checkpoint is None:
@@ -1493,6 +1506,7 @@ class ExecutionHandlers:
                          if current.operation == 'push' and
                          ((current.snapshot or {}).get('blocked_resume') or
                           (current.snapshot or {}).get('published_review_resume') or
+                          (current.snapshot or {}).get('current_rebase_acceptance') or
                           current.completed_rebase()) else {})},
         )
 
@@ -1647,7 +1661,8 @@ class ExecutionHandlers:
                     self._finish_rebase_journal(context)
                     self._complete_rebase_intent(context)
                     return self._context()
-                if (observed.metadata is not None
+                if ((observed.metadata is not None
+                         or accepted.reason == 'owned_autostash_restore_pending')
                         and not any(entry.stage for entry in observed.index)):
                     unstaged = self.effects.workspace.git(
                         context.worktree, 'diff', '--quiet', check=False)
@@ -1668,6 +1683,9 @@ class ExecutionHandlers:
                     action = next_action(self._rebase_observation(context),
                                          worker_result=True, staged=staged.returncode == 1)
                     continued = self._execute_rebase_step(context, action)
+                    if action is CorrectionAction.VERIFY and staged.returncode == 1:
+                        self._commit_rebase_resolution(
+                            context, f'Resolve autostash for {context.plan.plan_id}')
                     conflict = self._post_rebase_observation(
                         context, current.target_base_oid, continued.output)
                     if conflict is not None:
@@ -1708,6 +1726,7 @@ class ExecutionHandlers:
                                  if completed_push and
                                  ((current.snapshot or {}).get('blocked_resume') or
                                   (current.snapshot or {}).get('published_review_resume') or
+                                  (current.snapshot or {}).get('current_rebase_acceptance') or
                                   current.completed_rebase())
                                  else {})},
                 )
@@ -3281,16 +3300,8 @@ class ExecutionHandlers:
                         continued.output[-8000:], context=context,
                     )
             if action is CorrectionAction.VERIFY and staged.returncode == 1 and self.effects.checkpoint is not None:
-                pending = self.effects.checkpoint.get(self.repo, context.plan.plan_id)
                 title = self.effects.validation.parse_worker_result(message, self.plan).commit_title
-                self._commit_owned(context, title)
-                committed = self.effects.checkpoint.get(self.repo, context.plan.plan_id)
-                self.effects.checkpoint.record(
-                    self.repo, context.plan.plan_id, expected_generation=committed.generation,
-                    operation='rebase', expected_head=pending.expected_head,
-                    target_base_oid=pending.target_base_oid,
-                    observed_remote_oid=pending.observed_remote_oid,
-                    snapshot={**(pending.snapshot or {}), 'after_head': committed.expected_head})
+                self._commit_rebase_resolution(context, title)
             post_conflict = self._post_rebase_observation(
                 context, str(
                     (self.effects.checkpoint.get(self.repo, context.plan.plan_id).target_base_oid

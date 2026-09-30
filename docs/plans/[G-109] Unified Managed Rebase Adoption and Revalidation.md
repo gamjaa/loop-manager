@@ -212,3 +212,30 @@ FINAL_RESULT: PASS (10 tests, failures=0, errors=0)
 ```
 
 - 서로 다른 관련 unit case 총 13개 통과. 전체 suite, integration/E2E, 전체 lint/build/type check, scripts/verify 실행과 commit/push/PR 생성은 하지 않았다. AGENTS.md·docs/PLANS.md·PRODUCT·ARCHITECTURE·Requirement·archive를 변경하지 않았다. Worker 준비 완료이며 전체 verify와 Reviewer 결과를 기다린다.
+
+## Reviewer Delta Follow-up (2026-09-30)
+
+- `current-acceptance-push-ownership`, `restored-stage-rejection`, `manual-autostash-stage-recovery` (각 occurrence=1, revision=1)를 수정했다.
+- 정상 push 완료와 중단 후 recover 모두 `current_rebase_acceptance`만 있는 checkpoint에 `pushed_checkpoint_head`를 저장한다. 재시작 뒤 원격 lease와 PR 생성 소유권을 유지하고 다른 원격 OID는 거부한다.
+- 이미 수용된 checkpoint의 현재 소유 HEAD에 남은 정상 stage는 공통 service에서 재검증 대기로 처리한다. 수용 기록 identity·현재 HEAD·target과 현재 scope·원격·operation·index 안전을 확인하며, stage 자체를 새 rebase 완료 또는 검증 성공으로 수용하지 않는다. 실제 handler recover와 Worker 후보 확인 후 VERIFYING 전이를 unit case로 확인했다.
+- metadata가 없는 수동 autostash 해결도 현재 WAITING 판정에서 이어간다. Manager가 이미 staged된 해결을 반복 stage/rebase 없이 commit하고 공통 수용을 거쳐 Worker 재확인으로 돌아간다. 기존 Worker 경로와 commit helper를 공유하며 과거 Worker 결과를 요구하지 않는다.
+- fake Git와 실제 handler/SQLite 판정을 사용하는 새 unit case 3개 및 직접 관련 기존 case 6개, 서로 다른 총 9개가 통과했다. 새 fixture의 최초 실패는 PR repository identity 불일치와 IndexEntry 필수 필드 누락이었다. 이를 수정하고 index flag·범위 위반·원격 경쟁·수용 기록 변조 거부를 추가한 뒤 동일 명령의 최종 실행도 통과했다.
+
+```text
+FAILED_COMMAND: python3 -B -m unittest tests.test_execution_handlers.CurrentRebaseAdoptionTests.test_current_acceptance_push_completion_retains_ownership_on_restart tests.test_execution_handlers.CurrentRebaseAdoptionTests.test_adopted_checkpoint_restored_stage_reaches_worker_revalidation tests.test_execution_handlers.CurrentRebaseAdoptionTests.test_manual_autostash_stage_without_worker_result_is_committed_and_readopted
+RERUN: python3 -B -m unittest tests.test_execution_handlers.CurrentRebaseAdoptionTests.test_current_acceptance_push_completion_retains_ownership_on_restart tests.test_execution_handlers.CurrentRebaseAdoptionTests.test_adopted_checkpoint_restored_stage_reaches_worker_revalidation tests.test_execution_handlers.CurrentRebaseAdoptionTests.test_manual_autostash_stage_without_worker_result_is_committed_and_readopted
+FINAL_RESULT: PASS (3 tests, failures=0, errors=0)
+```
+
+```text
+COMMAND: python3 -B -m unittest tests.test_execution_handlers.ExecutionHandlerTests.test_confirmed_checkpoint_push_remains_owned_during_pr_creation tests.test_execution_handlers.ExecutionHandlerTests.test_interrupted_owned_push_persists_oid_before_clearing_intent tests.test_execution_handlers.ExecutionHandlerTests.test_published_review_resume_push_completion_survives_restart tests.test_execution_handlers.ExecutionHandlerTests.test_staged_autostash_resume_reuses_saved_worker_result tests.test_execution_handlers.ExecutionHandlerTests.test_staged_rebase_resume_reuses_saved_worker_result tests.test_execution_handlers.CurrentRebaseAdoptionTests.test_manual_completion_without_journal_invalidates_worker_and_validation_once
+FINAL_RESULT: PASS (6 tests, failures=0, errors=0)
+```
+
+- 기존 scripts/verify.sh·scripts/verify.ps1은 변경 모듈과 test discovery를 이미 포함하므로 수정이 필요하지 않았다. 전체 suite·integration/E2E·전체 lint/build/type check·scripts/verify는 실행하지 않았다. commit/push/PR 생성과 AGENTS·PLANS·PRODUCT·ARCHITECTURE·Requirement·archive 변경도 하지 않았다. Manager 전체 verify와 Reviewer 재검토 대기.
+
+## Worker Result Protocol Revalidation (2026-09-30)
+
+- 이전 최종 응답의 `failures=0, errors=0` 및 “실패·재실행 이력” 문구가 `parse_worker_result`의 실패 검색에 걸렸으나, 최종 응답 자체에는 대응하는 명령 쌍이 없어 미해결로 판정됐다. 테스트 구현의 추가 실패가 아니라 보고 계약 불일치였다. 검증기를 변경하거나 실패 감사를 삭제하지 않았다.
+- Reviewer Delta Follow-up에 기록된 동일 3-case 명령과 기존 6-case 명령을 다시 실행했다. 각각 PASS (3 tests, 0 failures, 0 errors), PASS (6 tests, 0 failures, 0 errors).
+- 최종 응답에 최초 실패 명령, 최초 결과, 동일 재실행 명령과 최종 성공을 순서대로 포함하고, 그 응답 전문을 현재 `parse_worker_result`로 검증해 수용됨을 확인했다. 전체 검증 및 Git 게시 작업은 실행하지 않았다.

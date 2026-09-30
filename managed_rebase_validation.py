@@ -234,6 +234,7 @@ def assess_current_rebase(
     expected: RebaseExpectation,
     observed: RebaseObservation | ObservationFailure | None,
     scope: ScopeResult | None,
+    *, adopted_head: str | None = None,
 ) -> RebaseDecision:
     """Distinguish an owned pending operation from an acceptable final result."""
     def reject(reason: str) -> RebaseDecision:
@@ -337,6 +338,12 @@ def assess_current_rebase(
         if set(operations) - {'MERGE_MSG', 'MERGE_MODE', 'REBASE_HEAD'}:
             return reject('unresolved_operation_or_index')
         return RebaseDecision(RebaseStatus.WAITING, 'owned_autostash_restore_pending')
+    if (adopted_head == observed.head and observed.staged
+            and not controlling_git_operation(operations)
+            and not any(entry.stage for entry in observed.index)):
+        # Already adopted checkpoints may carry preserved or new Worker work.
+        # This is ownership for revalidation, never a completed rebase result.
+        return RebaseDecision(RebaseStatus.WAITING, 'adopted_checkpoint_work_pending')
     if (controlling_git_operation(operations)
             or any(entry.stage for entry in observed.index)
             or observed.index_clean is not True or observed.staged):
