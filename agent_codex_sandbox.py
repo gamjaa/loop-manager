@@ -1,6 +1,7 @@
 """Native Codex sandbox envelope for the complete CLI process tree."""
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from hashlib import sha256
 import json
@@ -32,11 +33,13 @@ class CodexLaunch:
         except ProcessLookupError:
             pass
 
-    def run(self, arguments: list[str], **kwargs):
+    def run(self, arguments: list[str], *,
+            launch_process: Callable[..., subprocess.Popen], **kwargs):
         prompt = kwargs.pop('input')
         timeout = kwargs.pop('timeout')
-        process = subprocess.Popen(arguments, stdin=subprocess.PIPE,
-                                   start_new_session=True, **kwargs)
+        # The caller owns the atomic runtime handoff check at process creation.
+        process = launch_process(arguments, stdin=subprocess.PIPE,
+                                 start_new_session=True, **kwargs)
         try:
             process.communicate(prompt, timeout=timeout)
             return subprocess.CompletedProcess(arguments, process.returncode)

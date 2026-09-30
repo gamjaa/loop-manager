@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import io
 import json
+import threading
 from unittest import TestCase, mock, skipUnless
 
 import agent_invocation as invocation
@@ -643,6 +644,113 @@ class NativeWriteIsolationTests(TestCase):
                     FROM agent_isolation_evidence proof JOIN agent_invocations call USING(invocation_id)''').fetchone()
                 self.assertEqual(row, ('verified', 'success', session))
 
+    def test_handoff_after_preflight_blocks_native_spawn_and_invalidates_evidence(self):
+        cases = (('reviewer', True, False, None),
+                 ('worker', False, True, 'saved-session'),
+                 ('worker', False, True, None))
+        for role, read_only, persist_session, session in cases:
+            with self.subTest(role=role, session=session), tempfile.TemporaryDirectory() as directory:
+                boundary, state_root, home = self.boundary(Path(directory))
+                connection = sqlite3.connect(':memory:')
+                self.addCleanup(connection.close)
+                state.ensure_schema(connection)
+                logs = state_root / 'logs' / manager.hashlib.sha256(
+                    str(boundary.worktree).encode()).hexdigest()[:16]
+                logs.mkdir(parents=True)
+                (logs / f'{role}.log').write_text('old log')
+                (logs / f'{role}-last.txt').write_text('old result')
+                handoff = manager.RuntimeHandoffGate(threading.Event(), threading.Lock())
+                token = manager._runtime_handoff_signal.set(handoff)
+                try:
+                    with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
+                         mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
+                         mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
+                         mock.patch.object(manager, 'capture_git_snapshot', return_value=
+                                           mock.Mock(serialize=lambda: 'snapshot')), \
+                         mock.patch.object(isolation.subprocess, 'run', return_value=
+                                           manager.subprocess.CompletedProcess([], 0, 'version', '')), \
+                         mock.patch.object(envelope.CodexLaunch, 'probe', side_effect=handoff.stop) as probe, \
+                         mock.patch.object(manager.subprocess, 'Popen') as spawn, \
+                         mock.patch.object(envelope.os, 'killpg') as terminate:
+                        with self.assertRaises(manager.SelfMergeRuntimeHandoff):
+                            manager.run_agent(
+                                'codex', boundary.worktree, state_root, state_root / 'config',
+                                role, 'prompt', read_only=read_only, persist_session=persist_session,
+                                session_id=session, connection=connection,
+                                resolved_profile=invocation.ResolvedProfile('model', 'high'),
+                                invocation=invocation.InvocationContext(str(boundary.source), 'G-088'))
+                        probe.assert_called_once()
+                        spawn.assert_not_called()
+                        terminate.assert_not_called()
+                finally:
+                    manager._runtime_handoff_signal.reset(token)
+                proof = connection.execute('''SELECT proof.status, call.session_id, call.finished_at
+                    FROM agent_isolation_evidence proof JOIN agent_invocations call USING(invocation_id)''').fetchone()
+                self.assertEqual(proof[:2], ('invalidated', session))
+                self.assertIsNotNone(proof[2])
+                self.assertEqual((logs / f'{role}.log').read_text(), 'old log')
+                self.assertEqual((logs / f'{role}-last.txt').read_text(), 'old result')
+
+    def test_native_spawn_holds_handoff_lock_only_until_process_starts(self):
+        for role, read_only, session in (('reviewer', True, None),
+                                        ('worker', False, 'saved-session')):
+            with self.subTest(role=role), tempfile.TemporaryDirectory() as directory:
+                boundary, state_root, home = self.boundary(Path(directory))
+                connection = sqlite3.connect(':memory:')
+                self.addCleanup(connection.close)
+                state.ensure_schema(connection)
+                handoff = manager.RuntimeHandoffGate(threading.Event(), threading.Lock())
+                process = mock.Mock(pid=4321, returncode=0)
+
+                def start(command, **kwargs):
+                    self.assertTrue(handoff.launch_lock.locked())
+                    self.assertEqual(command[:2], ['codex', 'sandbox'])
+                    self.assertTrue(kwargs['start_new_session'])
+                    if session:
+                        self.assertIn('resume', command)
+                        self.assertIn(session, command)
+
+                    def communicate(prompt, *, timeout):
+                        self.assertEqual(prompt, 'prompt')
+                        self.assertEqual(timeout, manager.AGENT_CLI_TIMEOUT_SECONDS)
+                        self.assertTrue(handoff.launch_lock.acquire(blocking=False))
+                        handoff.launch_lock.release()
+                        handoff.stop()
+                        Path(command[command.index('-o') + 1]).write_text('completed')
+                        kwargs['stdout'].write('provider log\n')
+
+                    process.communicate.side_effect = communicate
+                    return process
+
+                token = manager._runtime_handoff_signal.set(handoff)
+                try:
+                    with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
+                         mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
+                         mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
+                         mock.patch.object(manager, 'capture_git_snapshot', return_value=
+                                           mock.Mock(serialize=lambda: 'snapshot')), \
+                         mock.patch.object(isolation.subprocess, 'run', return_value=
+                                           manager.subprocess.CompletedProcess([], 0, 'version', '')), \
+                         mock.patch.object(envelope.CodexLaunch, 'probe'), \
+                         mock.patch.object(manager.subprocess, 'Popen', side_effect=start) as spawn, \
+                         mock.patch.object(envelope.os, 'killpg') as terminate:
+                        result = manager.run_agent(
+                            'codex', boundary.worktree, state_root, state_root / 'config', role, 'prompt',
+                            read_only=read_only, persist_session=session is not None, session_id=session,
+                            connection=connection,
+                            resolved_profile=invocation.ResolvedProfile('model', 'high'),
+                            invocation=invocation.InvocationContext(str(boundary.source), 'G-088'))
+                        spawn.assert_called_once()
+                        terminate.assert_called_once_with(4321, envelope.signal.SIGKILL)
+                finally:
+                    manager._runtime_handoff_signal.reset(token)
+                process.communicate.assert_called_once()
+                process.wait.assert_called_once()
+                self.assertEqual((result.code, result.message, result.session_id), (0, 'completed', session))
+                proof = connection.execute('''SELECT proof.status, call.result_kind, call.session_id
+                    FROM agent_isolation_evidence proof JOIN agent_invocations call USING(invocation_id)''').fetchone()
+                self.assertEqual(proof, ('verified', 'success', session))
+
     def test_envelope_timeout_kills_process_group_and_waits(self):
         launch = envelope.CodexLaunch((), ('native',), {}, Path('/runtime'), Path('/attempt'), '{}')
         process = mock.Mock(pid=4321)
@@ -650,7 +758,8 @@ class NativeWriteIsolationTests(TestCase):
         with mock.patch.object(envelope.subprocess, 'Popen', return_value=process) as start, \
              mock.patch.object(envelope.os, 'killpg') as terminate:
             with self.assertRaises(manager.subprocess.TimeoutExpired):
-                launch.run(['native'], input='prompt', timeout=1, text=True)
+                launch.run(['native'], launch_process=manager._handoff_popen,
+                           input='prompt', timeout=1, text=True)
         self.assertTrue(start.call_args.kwargs['start_new_session'])
         terminate.assert_called_once_with(4321, envelope.signal.SIGKILL)
         process.wait.assert_called_once()

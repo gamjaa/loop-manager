@@ -7742,6 +7742,7 @@ def run_codex(
                 env=launch_environment,
                 cwd=worktree,
                 timeout=AGENT_CLI_TIMEOUT_SECONDS,
+                **({"launch_process": _handoff_popen} if sandbox_launch is not None else {}),
             )
         returncode = result.returncode
     message = (provider_last_message.read_text(encoding="utf-8")
