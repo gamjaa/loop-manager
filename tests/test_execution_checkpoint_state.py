@@ -291,6 +291,51 @@ class RebasePublicationRepositoryTests(unittest.TestCase):
             expected_generation=self.accepted.generation,
             acceptance=self.acceptance, remote_before='remote')
 
+    def test_unprojected_blocked_publication_preserves_block_and_execution_slot(self):
+        from execution_state import DirectRebasePublicationStatePort
+        self.runtime.transition_and_clear('repo', 'G-047', plan_values={
+            'status': 'PLAN_BLOCKED', 'blocked_reason': 'verify_retry_exhausted'}, enqueue=False)
+        state = DirectRebasePublicationStatePort(self.connection, self.runtime, 'repo', 'G-047')
+        before = state.expected
+        project = dict(self.connection.execute("SELECT * FROM projects WHERE repo = 'repo'").fetchone())
+        pending = self.begin()
+        acceptance = self.after_push()
+        def finish():
+            state.complete_rebase_publication(self.checkpoints,
+                intent=pending.snapshot['rebase_publication_intent'], acceptance=acceptance,
+                reobserve=lambda: ('after', acceptance))
+        finish()
+        from dataclasses import replace
+        self.assertEqual(self.runtime.get('repo', 'G-047'), replace(before, publication_remote_oid='after'))
+        self.assertEqual(dict(self.connection.execute("SELECT * FROM projects WHERE repo = 'repo'").fetchone()), project)
+        completed = self.checkpoints.get('repo', 'G-047')
+        finish()
+        self.assertEqual(self.checkpoints.get('repo', 'G-047'), completed)
+        self.assertIsNone(self.runtime.projected('repo'))
+
+    def test_unprojected_publication_rejects_changed_plan_and_rolls_back_storage_failure(self):
+        from execution_state import DirectRebasePublicationStatePort
+        self.runtime.transition_and_clear('repo', 'G-047', plan_values={'status': 'PLAN_BLOCKED'}, enqueue=False)
+        pending = self.begin()
+        acceptance = self.after_push()
+        def fail(stage):
+            if stage == 'after_execplan_update':
+                raise RuntimeError('storage interrupted')
+        state = DirectRebasePublicationStatePort(self.connection,
+            runtime_state.RuntimeStateRepository(self.connection, fault_hook=fail), 'repo', 'G-047')
+        before = state.expected
+        with self.assertRaisesRegex(RuntimeError, 'storage interrupted'):
+            state.complete_rebase_publication(self.checkpoints,
+                intent=pending.snapshot['rebase_publication_intent'], acceptance=acceptance,
+                reobserve=lambda: ('after', acceptance))
+        self.assertEqual(self.checkpoints.get('repo', 'G-047'), pending)
+        self.assertEqual(self.runtime.get('repo', 'G-047'), before)
+        self.assertEqual(state.expected, before)
+        self.runtime.update_plan('repo', 'G-047', plan_values={'branch': 'other-owner'}, enqueue=False)
+        with self.assertRaises(runtime_state.RuntimeStateError):
+            state.check()
+        self.assertEqual(self.checkpoints.get('repo', 'G-047'), pending)
+
     def after_push(self):
         from dataclasses import replace
         expected = replace(self.expected, generation=self.checkpoints.get('repo', 'G-047').generation,

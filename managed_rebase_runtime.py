@@ -29,6 +29,16 @@ def build_service(ports, connection, repo_path, state_dir, repo, plan_id,
     expected_oid = (saved.get('rebase_remote_oid', checkpoint.observed_remote_oid)
                     if checkpoint.operation == 'rebase' else
                     plan['publication_remote_oid'] or checkpoint.observed_remote_oid)
+    if checkpoint.operation == 'rebase_publish':
+        intent = checkpoint.rebase_publication_intent()
+        if intent is None:
+            raise MutationEvidenceError('pending publication identity differs')
+        live = ports.manager_git_journal.live_remote_branch_oid(ports.git, repo_path, branch)
+        if live not in (intent['remote_before'], intent['head']):
+            raise MutationEvidenceError('pending publication remote lease differs')
+        expected_oid = live
+        if remote_oid is not _UNSET and remote_oid != live:
+            raise MutationEvidenceError('pending publication remote observation changed')
     if remote_oid is not _UNSET:
         expected_oid = remote_oid
     pr = (PullRequest(str(plan['pr_url']), repo, branch,
