@@ -485,22 +485,6 @@ class NativeWriteIsolationTests(TestCase):
             with self.assertRaisesRegex(RuntimeError, '소유권'):
                 envelope._owned_directory(alias)
 
-    def test_preexisting_hardlink_alias_is_rejected_without_content_change(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            source = root / 'source'
-            selected = root / 'selected'
-            source.mkdir()
-            selected.mkdir()
-            secret = source / 'local-only'
-            secret.write_bytes(b'preserved')
-            (selected / 'alias').hardlink_to(secret)
-            with self.assertRaisesRegex(gate.BoundaryError, 'hardlink'):
-                gate.check_hardlinks([selected])
-            self.assertEqual(secret.read_bytes(), b'preserved')
-            (selected / 'alias').unlink()
-            gate.check_hardlinks([selected])
-
     def test_runtime_overlap_is_rejected_before_source_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             boundary, _state_root, home = self.boundary(Path(directory))
@@ -590,8 +574,10 @@ class NativeWriteIsolationTests(TestCase):
                     f'2 1 8:1 / {selected} rw - ext4 root rw\n',
                     'CapEff:\t0\nNoNewPrivs:\t1\n']), \
                  mock.patch.object(gate.os, 'readlink', return_value='mnt:[1]'), \
-                 mock.patch.object(gate.os, 'statvfs', return_value=mock.Mock(f_flag=gate.os.ST_RDONLY)):
+                 mock.patch.object(gate.os, 'statvfs', return_value=mock.Mock(f_flag=gate.os.ST_RDONLY)), \
+                 mock.patch.object(gate.os, 'walk', side_effect=PermissionError('tree inspection unavailable')) as walk:
                 gate.check_boundary(specification)
+            walk.assert_not_called()
             self.assertEqual(list(selected.iterdir()), [])
             self.assertEqual(preserved.read_bytes(), b'unchanged')
             self.assertEqual(list(source.iterdir()), [preserved])

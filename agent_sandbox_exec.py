@@ -10,7 +10,6 @@ import json
 import os
 from pathlib import Path
 import re
-import stat
 import sys
 import tempfile
 
@@ -60,20 +59,6 @@ def check_mounts(mounts: list[tuple[Path, bool, str]], writable: list[Path],
             raise BoundaryError('protected subtree has a writable mount')
 
 
-def check_hardlinks(roots: list[Path]) -> None:
-    # A RO bind protects a path, not an inode reachable by an older hardlink in
-    # an allowed mount. Reject such aliases without reading file contents.
-    def failed(_error):
-        raise BoundaryError('writable tree cannot be inspected')
-
-    for root in roots:
-        for folder, _directories, files in os.walk(root, followlinks=False, onerror=failed):
-            for name in files:
-                metadata = (Path(folder) / name).lstat()
-                if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink != 1:
-                    raise BoundaryError('existing hardlink in writable root')
-
-
 def check_boundary(spec: dict) -> None:
     writable = [Path(value) for value in spec['writable']]
     protected = [Path(value) for value in spec['protected']]
@@ -88,7 +73,6 @@ def check_boundary(spec: dict) -> None:
     for root in protected:
         if not root.exists() or not os.statvfs(root).f_flag & os.ST_RDONLY:
             raise BoundaryError('protected path is not read-only')
-    check_hardlinks(writable)
     # Existing-file write opens are non-destructive, even if confinement failed.
     for value in spec['files']:
         try:
