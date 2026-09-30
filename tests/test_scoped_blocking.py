@@ -15,7 +15,403 @@ import notifications
 import project_registry
 import scoped_blocking
 import rebase_block_reconciliation
+import blocked_plan_reconciliation
+import blocked_remote_observation
 from scoped_blocking import BlockReasonCode, BlockScope
+
+
+class BlockedPlanRemoteRefreshTests(unittest.TestCase):
+    """Coordinator unit tests: every Git/verify/Agent effect is a fake port."""
+
+    def setUp(self):
+        self.connection = sqlite3.connect(':memory:')
+        self.connection.row_factory = sqlite3.Row
+        self.addCleanup(self.connection.close)
+        self.connection.execute(loop_manager.SCHEMA)
+        loop_manager._ensure_execplans_schema(self.connection)
+        maintenance_state.ensure_schema(self.connection)
+        self.repo, self.base, self.head = 'repo', 'a' * 40, 'b' * 40
+        self.connection.execute("INSERT INTO projects (repo, base_branch, origin) VALUES ('repo', 'main', 'example/repo')")
+        for plan_id in ('G-106', 'G-107'):
+            self.connection.execute(
+                'INSERT INTO exec_plans (repo, plan_id, path, title, sources, depends_on, '
+                'content_hash, status, branch, worktree, workspace_owned, worker_session_id, '
+                'verify_failure_history, effective_worker_level, priority) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                (self.repo, plan_id, f'docs/plans/[{plan_id}] Work.md', 'Work', '[]', '[]', 'hash',
+                 'IMPLEMENTING', f'loop-manager/{plan_id}', f'/state/{plan_id}', 1, 'session', '{"failure":3}', 6, 'critical'))
+            runtime_state = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
+            runtime_state.block_plan(self.repo, plan_id, reason_code='verify_retry_exhausted',
+                                     evidence='original verify failure', release_fingerprint='input',
+                                     clear_projection=True)
+            self.connection.execute('UPDATE exec_plans SET blocked_fingerprint = ? WHERE plan_id = ?',
+                                    ('input', plan_id))
+            self.record_observation(plan_id)
+        self.signature = 'before'
+        self.ports = mock.Mock(spec=loop_manager)
+        self.ports.GUIDANCE_BLOCK_REASON = loop_manager.GUIDANCE_BLOCK_REASON
+        self.ports.PR_CLOSED_BLOCK_REASON = loop_manager.PR_CLOSED_BLOCK_REASON
+        self.ports.unmet_execplan_dependencies.return_value = []
+        self.ports.github_repository.return_value = 'example/repo'
+        self.ports.pr_for_branch.return_value = None
+        self.ports._blocked_execplan_metadata_error.return_value = None
+        self.ports._worktree_execplan_input_fingerprint.return_value = 'input'
+        self.ports._revision_execplan_input_fingerprint.return_value = 'input'
+        self.ports._worktree_state_signature.side_effect = lambda _: self.signature
+        self.ports.capture_git_snapshot.return_value = SimpleNamespace(
+            head=self.head, dirty={}, index={}, operations={})
+        self.ports.git.side_effect = self.git
+        self.ports._update_blocked_error.side_effect = loop_manager._update_blocked_error
+        self.ports._evaluate_remote_checkpoint_cause.return_value = (False, 'same failure', 'verify')
+        self.ports._current_rebase_service.return_value.require_owned.return_value = (
+            SimpleNamespace(head=self.head), SimpleNamespace(status=SimpleNamespace(value='complete')))
+        self.ports.observe_blocked_plan_remotes.side_effect = self.observe
+        self.ref_probe = mock.patch.object(blocked_remote_observation, 'observe_refs', return_value=(
+            blocked_remote_observation.RefObservation('present', self.base),
+            blocked_remote_observation.RefObservation('absent')))
+        self.ref_probe.start()
+        self.addCleanup(self.ref_probe.stop)
+        self.coordinator = blocked_plan_reconciliation.BlockedPlanReconciler(
+            self.ports, self.connection, Path('/repo'), Path('/state'), self.repo, 'main',
+            timeout_seconds=600)
+
+    def git(self, _, *args, **kwargs):
+        output = ''
+        if args[:2] == ('remote', 'get-url'):
+            output = 'https://example.test/example/repo'
+        elif args[:1] == ('rev-parse',):
+            output = self.base if args[1] == 'FETCH_HEAD^{commit}' else self.head
+        return SimpleNamespace(returncode=0, stdout=output)
+
+    def record_observation(self, plan_id='G-106'):
+        blocked_remote_observation.record(
+            self.connection, repo=self.repo, plan_id=plan_id,
+            registered_origin='example/repo', origin_url='https://example.test/example/repo',
+            base_ref='refs/heads/main', branch_ref=f'refs/heads/loop-manager/{plan_id}',
+            base=blocked_remote_observation.RefObservation('present', self.base),
+            branch=blocked_remote_observation.RefObservation('absent'),
+            blocked_reason='verify_retry_exhausted', blocked_fingerprint='input',
+            project_blocked_reason=None, project_blocked_fingerprint=None,
+            worktree_fingerprint=getattr(self, 'signature', 'before'))
+        self.connection.commit()
+
+    def observe(self, connection, repo_path, repo, project, *, plan_id):
+        self.record_observation(plan_id)
+
+    def plan(self, plan_id='G-106'):
+        return self.connection.execute('SELECT * FROM exec_plans WHERE plan_id = ?', (plan_id,)).fetchone()
+
+    def row(self):
+        return self.connection.execute("SELECT * FROM blocked_remote_observations WHERE plan_id = 'G-106'").fetchone()
+
+    def test_other_worker_defers_without_losing_observation_or_projection(self):
+        self.connection.execute("UPDATE exec_plans SET status = 'IMPLEMENTING' WHERE plan_id = 'G-107'")
+        self.connection.commit()
+        before = dict(self.row())
+        self.assertEqual(self.coordinator.reconcile('G-106'), 'deferred')
+        self.assertEqual(dict(self.row()), before)
+        self.ports.git.assert_not_called()
+
+    def test_unmerged_dependency_leaves_observed_input_unconsumed(self):
+        self.ports.unmet_execplan_dependencies.return_value = ['G-105']
+        self.assertEqual(self.coordinator.reconcile('G-106'), 'deferred')
+        self.assertTrue(blocked_remote_observation.pending_input(self.row()))
+        self.ports.git.assert_not_called()
+
+    def test_planning_and_maintenance_keep_the_serial_slot(self):
+        for update, reset in (
+                ("UPDATE projects SET phase = 'PLANNING'", "UPDATE projects SET phase = NULL"),
+                ("UPDATE projects SET planning_error = 'saved error'", "UPDATE projects SET planning_error = NULL"),
+                ("UPDATE projects SET pr_conflict_recovery = 1", "UPDATE projects SET pr_conflict_recovery = 0"),
+                ("INSERT INTO maintenance_cycles (repo, phase) VALUES ('repo', 'assessment')", "DELETE FROM maintenance_cycles")):
+            with self.subTest(update=update):
+                self.connection.execute(update)
+                self.connection.commit()
+                self.assertEqual(self.coordinator.reconcile('G-106'), 'deferred')
+                self.connection.execute(reset)
+                self.connection.commit()
+        self.ports.git.assert_not_called()
+        self.assertTrue(blocked_remote_observation.pending_input(self.row()))
+
+    def test_order_and_unchanged_input_do_not_repeat_cause_check_or_publication(self):
+        steps = []
+        with (mock.patch.object(self.coordinator, '_adopt', side_effect=lambda *args: steps.append('adopt')),
+              mock.patch.object(self.coordinator, '_incorporate', side_effect=lambda plan, context:
+                                (steps.append('rebase-and-publish'), context.update(candidate=self.signature))),
+              mock.patch.object(self.coordinator, '_publish', side_effect=lambda *args: steps.append('checkpoint'))):
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.assertEqual(steps, ['adopt', 'rebase-and-publish', 'checkpoint'])
+        self.ports._evaluate_remote_checkpoint_cause.assert_called_once()
+        self.assertFalse(blocked_remote_observation.pending_input(self.row()))
+        self.assertTrue(blocked_remote_observation.pending_input(self.connection.execute(
+            "SELECT * FROM blocked_remote_observations WHERE plan_id = 'G-107'").fetchone()))
+        self.assertEqual(scoped_blocking.plan_block(self.connection, self.repo, 'G-106')['evidence'], 'original verify failure')
+
+    def test_release_keeps_session_failure_audit_and_other_plan_and_invalidates_tokens(self):
+        self.connection.execute("UPDATE exec_plans SET worker_result = 'old worker', verify_token = 'old verify', review_token = 'old review', publication_token = 'old publication' WHERE plan_id = 'G-106'")
+        self.connection.commit()
+        other = dict(self.plan('G-107'))
+        self.ports._evaluate_remote_checkpoint_cause.return_value = (True, 'fixed', None)
+        with mock.patch.object(self.coordinator, '_publish') as publish:
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'resumed')
+        publish.assert_not_called()
+        plan = self.plan()
+        self.assertEqual(plan['status'], 'IMPLEMENTING')
+        self.assertEqual(plan['worker_session_id'], 'session')
+        self.assertEqual(plan['verify_failure_history'], '{"failure":3}')
+        self.assertEqual(plan['effective_worker_level'], 6)
+        for field in ('worker_result', 'verify_token', 'review_token', 'publication_token'):
+            self.assertIsNone(plan[field])
+        self.assertEqual(dict(self.plan('G-107')), other)
+        self.assertIsNone(scoped_blocking.plan_block(self.connection, self.repo, 'G-106'))
+        self.assertEqual(self.connection.execute('SELECT plan_path FROM projects').fetchone()[0], plan['path'])
+
+    def test_refusal_keeps_original_cause_and_is_memoized(self):
+        self.ports.pr_for_branch.return_value = {'state': 'OPEN'}
+        self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.ports._evaluate_remote_checkpoint_cause.assert_not_called()
+        self.ports._update_blocked_error.assert_called_once()
+        self.assertEqual(scoped_blocking.plan_block(self.connection, self.repo, 'G-106')['evidence'], 'original verify failure')
+
+    def test_fetch_race_preserves_files_and_does_not_rebase_or_release(self):
+        real_fake_git = self.git
+        self.ports.git.side_effect = lambda path, *args, **kwargs: (
+            SimpleNamespace(returncode=0, stdout='different') if args == ('rev-parse', 'FETCH_HEAD^{commit}')
+            else real_fake_git(path, *args, **kwargs))
+        self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.ports._journaled_direct_rebase.assert_not_called()
+        self.ports._evaluate_remote_checkpoint_cause.assert_not_called()
+        self.assertIn('OID 경쟁', self.plan()['last_error'])
+
+    def test_base_only_change_rebases_even_with_unchanged_document_fingerprint(self):
+        self.ports.git.side_effect = lambda path, *args, **kwargs: (
+            SimpleNamespace(returncode=1, stdout='') if args[:1] == ('merge-base',)
+            else self.git(path, *args, **kwargs))
+        store = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
+        def rebase(*args, **kwargs):
+            store.record(self.repo, 'G-106', expected_generation=0, operation='rebase',
+                         expected_head=self.head, target_base_oid=self.base, observed_remote_oid=None, snapshot={})
+            return SimpleNamespace(returncode=0, stdout='rebased')
+        def complete(*args, **kwargs):
+            current = store.get(self.repo, 'G-106')
+            store.record(self.repo, 'G-106', expected_generation=current.generation, operation=None,
+                         expected_head=self.head, target_base_oid=self.base, observed_remote_oid=None, snapshot={})
+        self.ports._journaled_direct_rebase.side_effect = rebase
+        self.ports._complete_direct_rebase_checkpoint.side_effect = complete
+        with mock.patch.object(self.coordinator, '_publish'):
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.ports._journaled_direct_rebase.assert_called_once()
+        self.ports._complete_direct_rebase_checkpoint.assert_called_once()
+        self.assertEqual(self.plan()['blocked_fingerprint'], 'input')
+
+    def test_interrupted_evaluated_stage_does_not_repeat_rebase_or_cause_check(self):
+        with mock.patch.object(self.coordinator, '_publish', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.coordinator.reconcile('G-106')
+        with (mock.patch.object(self.coordinator, '_incorporate') as incorporate,
+              mock.patch.object(self.coordinator, '_publish') as publish):
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        incorporate.assert_not_called()
+        publish.assert_called_once()
+        self.ports._evaluate_remote_checkpoint_cause.assert_called_once()
+
+    def test_candidate_change_after_evaluation_does_not_release(self):
+        with mock.patch.object(self.coordinator, '_publish', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.coordinator.reconcile('G-106')
+        self.signature = 'external edit'
+        self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.assertEqual(self.plan()['status'], 'PLAN_BLOCKED')
+        self.assertIn('후보', self.plan()['last_error'])
+
+    def test_pending_rebase_reuses_current_state_without_execution_history(self):
+        store = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
+        store.record(self.repo, 'G-106', expected_generation=0, operation='rebase',
+                     expected_head=self.head, target_base_oid=self.base, observed_remote_oid=None, snapshot={})
+        self.connection.commit()
+        def finish(*args, **kwargs):
+            current = store.get(self.repo, 'G-106')
+            store.record(self.repo, 'G-106', expected_generation=current.generation,
+                         operation=None, expected_head=self.head, target_base_oid=self.base,
+                         observed_remote_oid=None, snapshot={})
+        self.ports._complete_direct_rebase_checkpoint.side_effect = finish
+        with mock.patch.object(self.coordinator, '_publish'):
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.ports._journaled_direct_rebase.assert_not_called()
+        self.ports._complete_direct_rebase_checkpoint.assert_called_once()
+
+    def test_current_scope_mismatch_does_not_run_cause_check_or_publication(self):
+        self.ports._current_rebase_service.return_value.require_owned.side_effect = RuntimeError('scope mismatch')
+        with mock.patch.object(self.coordinator, '_publish') as publish:
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.ports._evaluate_remote_checkpoint_cause.assert_not_called()
+        publish.assert_not_called()
+        self.assertIn('scope mismatch', self.plan()['last_error'])
+
+    def test_scope_is_rechecked_after_resolved_probe_before_release(self):
+        def resolved(*args, **kwargs):
+            self.ports._current_rebase_service.return_value.require_owned.side_effect = RuntimeError('current scope changed')
+            return True, 'fixed', None
+        self.ports._evaluate_remote_checkpoint_cause.side_effect = resolved
+        self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.assertEqual(self.plan()['status'], 'PLAN_BLOCKED')
+        self.assertIsNotNone(scoped_blocking.plan_block(self.connection, self.repo, 'G-106'))
+
+    def test_changed_slot_owner_keeps_other_plan_projection_and_diagnostic(self):
+        projected = {}
+        def switch_owner(*args, **kwargs):
+            self.connection.execute(
+                "UPDATE exec_plans SET status = 'IMPLEMENTING', last_error = 'other worker feedback' WHERE plan_id = 'G-107'")
+            runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
+            runtime.hydrate_snapshot(self.repo, runtime.get(self.repo, 'G-107'))
+            projected.update(dict(self.connection.execute('SELECT * FROM projects').fetchone()))
+            return True, 'fixed', None
+        self.ports._evaluate_remote_checkpoint_cause.side_effect = switch_owner
+        with mock.patch.object(self.coordinator, '_publish') as publish:
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        publish.assert_not_called()
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM projects').fetchone()), projected)
+        self.assertEqual(self.plan()['status'], 'PLAN_BLOCKED')
+        self.assertEqual(self.plan('G-107')['last_error'], 'other worker feedback')
+
+    def test_new_verify_failure_does_not_clear_a_saved_review_cause(self):
+        self.ports._evaluate_remote_checkpoint_cause.return_value = (True, 'new verify failure', 'verify')
+        context = {'block': {'reason_code': 'review_retry_exhausted', 'evidence': 'review issue'}, 'artifacts': {}}
+        self.assertFalse(self.coordinator._evaluate(self.plan(), context)['resolved'])
+
+    def test_saved_start_intent_runs_git_once_after_interruption_before_rebase(self):
+        store = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
+        store.record(self.repo, 'G-106', expected_generation=0, operation='rebase',
+                     expected_head=self.head, target_base_oid=self.base, observed_remote_oid=None, snapshot={})
+        self.connection.commit()
+        status = SimpleNamespace(value='ready_to_start')
+        self.ports._current_rebase_service.return_value.require_owned.return_value = (
+            SimpleNamespace(head=self.head), SimpleNamespace(status=status))
+        def start(*args, **kwargs):
+            status.value = 'complete'
+            return SimpleNamespace(returncode=0, stdout='rebased')
+        def finish(*args, **kwargs):
+            current = store.get(self.repo, 'G-106')
+            store.record(self.repo, 'G-106', expected_generation=current.generation, operation=None,
+                         expected_head=self.head, target_base_oid=self.base, observed_remote_oid=None, snapshot={})
+        self.ports._journaled_direct_rebase.side_effect = start
+        self.ports._complete_direct_rebase_checkpoint.side_effect = finish
+        with mock.patch.object(self.coordinator, '_publish'):
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.ports._journaled_direct_rebase.assert_called_once()
+        self.assertIsNone(store.get(self.repo, 'G-106').operation)
+
+    def test_incomplete_assessment_retries_only_the_cause_probe(self):
+        self.ports._evaluate_remote_checkpoint_cause.side_effect = [RuntimeError('transport unavailable'),
+                                                                   (False, 'same cause', None)]
+        self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.assertTrue(blocked_remote_observation.pending_input(self.row()))
+        with (mock.patch.object(self.coordinator, '_incorporate') as incorporate,
+              mock.patch.object(self.coordinator, '_publish')):
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        incorporate.assert_not_called()
+        self.assertEqual(self.ports._evaluate_remote_checkpoint_cause.call_count, 2)
+
+    def test_stale_base_probe_leaves_input_pending_for_a_new_target(self):
+        self.ports._evaluate_remote_checkpoint_cause.return_value = (False, 'base advanced', 'stale_base')
+        with mock.patch.object(self.coordinator, '_publish') as publish:
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.assertTrue(blocked_remote_observation.pending_input(self.row()))
+        publish.assert_not_called()
+        self.assertEqual(self.plan()['status'], 'PLAN_BLOCKED')
+
+    def test_saved_target_finishes_before_rebase_of_later_observed_base(self):
+        old_target = 'c' * 40
+        store = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
+        store.record(self.repo, 'G-106', expected_generation=0, operation='rebase',
+                     expected_head=self.head, target_base_oid=old_target, observed_remote_oid=None, snapshot={})
+        self.connection.commit()
+        steps = []
+        def finish(*args, **kwargs):
+            current = store.get(self.repo, 'G-106')
+            steps.append(('complete', current.target_base_oid))
+            store.record(self.repo, 'G-106', expected_generation=current.generation, operation=None,
+                         expected_head=self.head, target_base_oid=current.target_base_oid, observed_remote_oid=None, snapshot={})
+        def start(*args, **kwargs):
+            steps.append(('start', args[6]))
+            current = store.get(self.repo, 'G-106')
+            store.record(self.repo, 'G-106', expected_generation=current.generation, operation='rebase',
+                         expected_head=self.head, target_base_oid=self.base, observed_remote_oid=None, snapshot={})
+            return SimpleNamespace(returncode=0, stdout='rebased')
+        self.ports._complete_direct_rebase_checkpoint.side_effect = finish
+        self.ports._journaled_direct_rebase.side_effect = start
+        self.ports.git.side_effect = lambda path, *args, **kwargs: (
+            SimpleNamespace(returncode=1, stdout='') if args[:1] == ('merge-base',) else self.git(path, *args, **kwargs))
+        with mock.patch.object(self.coordinator, '_publish'):
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.assertEqual(steps, [('complete', old_target), ('start', self.base), ('complete', self.base)])
+
+    def test_explicit_decision_and_safety_causes_cannot_be_cleared_by_oid_change(self):
+        for reason in (loop_manager.GUIDANCE_BLOCK_REASON, 'user_decision_required',
+                       'workspace_ownership_uncertain', loop_manager.PR_CLOSED_BLOCK_REASON):
+            with self.subTest(reason=reason):
+                context = {'block': {'reason_code': reason, 'evidence': 'original'},
+                           'artifacts': {}, 'base_oid': self.base}
+                result = self.coordinator._evaluate(self.plan(), context)
+                self.assertFalse(result['resolved'])
+        self.ports._evaluate_remote_checkpoint_cause.assert_not_called()
+
+    def test_specification_and_worker_output_causes_use_their_document_release_input(self):
+        self.ports._worktree_execplan_input_fingerprint.return_value = 'changed specification'
+        for reason in ('review_specification_deadlock', 'worker_output_invalid'):
+            with self.subTest(reason=reason):
+                context = {'block': {'reason_code': reason, 'evidence': 'original'},
+                           'artifacts': {}, 'base_oid': self.base}
+                self.assertTrue(self.coordinator._evaluate(self.plan(), context)['resolved'])
+        self.ports._evaluate_remote_checkpoint_cause.assert_not_called()
+
+    def test_preexisting_local_decision_document_is_not_a_new_release_input(self):
+        self.connection.execute(
+            "UPDATE exec_plans SET blocked_worktree_fingerprint = 'pending local proposal' WHERE plan_id = 'G-106'")
+        self.ports._worktree_execplan_input_fingerprint.return_value = 'pending local proposal'
+        context = {'block': {'reason_code': 'user_decision_required', 'evidence': 'pending decision'},
+                   'artifacts': {}, 'base_oid': self.base}
+        self.assertFalse(self.coordinator._evaluate(self.plan(), context)['resolved'])
+        # Publishing that document to base is a new explicit input even when
+        # its contents match the local proposal captured at the original block.
+        self.ports._revision_execplan_input_fingerprint.return_value = 'pending local proposal'
+        self.assertTrue(self.coordinator._evaluate(self.plan(), context)['resolved'])
+        self.ports._evaluate_remote_checkpoint_cause.assert_not_called()
+
+    def test_explicit_plan_selection_does_not_depend_on_another_mirror(self):
+        self.connection.execute("UPDATE projects SET plan_path = 'docs/plans/[G-107] Work.md'")
+        selected = loop_manager._plan_block_selected_for_release(self.connection, self.repo, plan_id='G-106')
+        self.assertEqual(selected['plan_id'], 'G-106')
+        self.assertEqual(self.connection.execute('SELECT plan_path FROM projects').fetchone()[0], self.plan('G-107')['path'])
+
+    def test_manager_iterates_explicit_plan_ids_and_stops_after_selected_resume(self):
+        with mock.patch.object(blocked_plan_reconciliation, 'BlockedPlanReconciler') as factory:
+            factory.return_value.reconcile.side_effect = ['blocked', 'resumed']
+            self.assertTrue(loop_manager.resume_plan_blocks(
+                self.connection, Path('/repo'), Path('/state'), self.repo, 'main'))
+        self.assertEqual(factory.return_value.reconcile.call_args_list, [mock.call('G-106'), mock.call('G-107')])
+
+    def test_uncertain_verify_process_creates_safety_block_without_publication(self):
+        self.ports._evaluate_remote_checkpoint_cause.side_effect = loop_manager.VerifyTerminationUncertain('verify child is still alive')
+        with mock.patch.object(self.coordinator, '_publish') as publish:
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        publish.assert_not_called()
+        self.assertEqual(scoped_blocking.project_block(self.connection, self.repo)['reason_code'], 'repository_state_unsafe')
+        self.assertEqual(scoped_blocking.plan_block(self.connection, self.repo, 'G-106')['evidence'], 'original verify failure')
+
+    def test_manager_preserves_new_project_safety_block_and_stops_other_recovery(self):
+        def block_project(plan_id):
+            with self.connection:
+                scoped_blocking.record_project_block(self.connection, self.repo, BlockReasonCode.REPOSITORY_STATE_UNSAFE,
+                                                     'uncertain child', 'input', plan_id=plan_id, previous_phase=None)
+            return 'blocked'
+        with mock.patch.object(blocked_plan_reconciliation, 'BlockedPlanReconciler') as factory:
+            factory.return_value.reconcile.side_effect = block_project
+            self.assertFalse(loop_manager.resume_plan_blocks(
+                self.connection, Path('/repo'), Path('/state'), self.repo, 'main'))
+        factory.return_value.reconcile.assert_called_once_with('G-106')
+        self.assertEqual(self.connection.execute('SELECT phase FROM projects').fetchone()[0], 'PROJECT_BLOCKED')
 
 
 class ScopedBlockingTest(unittest.TestCase):

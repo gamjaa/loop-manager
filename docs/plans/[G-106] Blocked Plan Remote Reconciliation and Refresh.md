@@ -41,10 +41,24 @@ priority: critical
 
 ## Progress
 
-- [ ] 실행 자리와 후속 commit 채택·관리 rebase 연결
-- [ ] 원인별 재검증·checkpoint 갱신 및 단계별 복구
+- [x] 실행 자리와 후속 commit 채택·관리 rebase 연결
+- [x] 원인별 재검증·checkpoint 갱신 및 단계별 복구
+- 2026-09-30: `blocked_plan_reconciliation.py`에 계획별 직렬 복구와 저장 단계 전이를 구현했다. 기존 후속 commit 채택, 현재 상태 rebase 판정, 중간 checkpoint 게시와 차단 원인 검사 경계를 재사용한다. 기존 session·실패 감사와 다른 계획의 상태를 보존하며 후보 검증 토큰을 무효화한다.
+- 2026-09-30: Worker targeted unit test 최종 결과는 다음과 같다. 모든 Git·verify·Agent 외부 효과를 fake/mock으로 대체한 class만 실행했다.
+  - `python3 -m unittest tests.test_scoped_blocking.BlockedPlanRemoteRefreshTests`: 26개 통과.
+  - `python3 -m unittest tests.test_blocked_checkpoint.BlockedCheckpointRefreshUnitTests`: 7개 통과.
+  - `python3 -m unittest tests.test_execution_handlers.EvidenceFreeBlockedScopeTests`: 5개 통과.
+- 초기 fixture의 필수 SQLite 필드 누락과 마지막 진단 보호 변경의 빈 project 전이 값 오류를 수정했다. 실패한 명령과 동일한 명령을 재실행했으며 최종 실행에는 실패가 없다.
+  - FAILED_COMMAND: python3 -m unittest tests.test_scoped_blocking.BlockedPlanRemoteRefreshTests
+  - RERUN: python3 -m unittest tests.test_scoped_blocking.BlockedPlanRemoteRefreshTests
+- 2026-09-30: 관리 rebase 결과 수용 뒤 현재 ExecPlan·R-046·R-048·PRODUCT·ARCHITECTURE를 다시 읽었다. 현재 HEAD와 `origin/main`은 `c16a98c1f4fe84291a9f28f28b8f4cea9600c6ba`이며, 작업 공간 변경과 신규 모듈을 포함한 base 대비 최종 diff 전체를 확인했다. 이전 후보의 성공을 재사용하지 않고 위 세 targeted unit test 명령을 현재 후보에서 새로 실행해 각각 26개·7개·5개가 실패 없이 통과했다. 전체 verify와 Review는 이후 Manager가 수행한다.
+- 2026-09-30: Worker 결과 검증 오류의 원인은 `COMMIT_TITLE`과 `PR_SUMMARY` 사이의 빈 줄이었다. 기존 파서가 두 필드의 인접한 줄을 요구하므로 최종 출력에서 빈 줄을 제거했으며, 실제 `parse_worker_result`로 동일한 응답 초안이 통과하는 것을 확인했다. 현재 입력·base 대비 전체 diff를 다시 확인하고 위 세 targeted unit test 명령을 다시 실행해 26개·7개·5개가 모두 통과했다. 파서나 제품 동작을 추가 변경하지 않았다.
+- [ ] Manager 전체 verify와 실제 Git 회귀 사례 검증. base만 변경·후속 commit만 변경·동시 변경·원인 지속/해소·Git 효과 뒤 중단 재시작·수동 충돌 해결 사례를 작성했으며 Worker는 실행하지 않았다. Linux 전체 검증 스크립트에 새 모듈의 compile 검사를 추가했으나 스크립트·전체 suite·integration·lint·build·type check는 실행하지 않았다.
+- [ ] Reviewer 검토 및 사용자 Merge. Worker는 commit·push·PR을 생성하지 않았다.
 
 ## Decision Log
 
 - G-101은 R-045의 기존 오탐 차단만 복구한다. 이 계획은 새 원격 입력으로 다시 평가해야 하는 R-046의 계획별 복구를 맡는다.
 - 2026-09-30: 제공된 mutable READY snapshot의 기준 revision·원본 hash를 확인해 R-048을 반영했다. G-110 뒤에 새 원격 입력 반영을 구현하고 G-104의 중간 게시 순서를 유지한다. rebase 완료는 R-045 작업 증거 대신 G-109의 현재 상태로 판정한다.
+- 2026-09-30: 복구 단계와 원래 차단 원인·검증 artifact는 별도의 additive SQLite 기록에 저장한다. rebase 수용으로 기존 검증 결과가 무효화돼도 저장된 원인을 검사할 수 있으며, 완료된 Git 효과나 완료된 원인 검사를 재시작에서 반복하지 않는다. 후속 checkpoint identity를 갱신할 때 이전 게시 identity는 감사 이력으로 보존한다.
+- 2026-09-30: 대상 계획 ID를 명시해 mirror에 의존하지 않고 복구한다. 문서 입력 해제는 원래 revision과 차단 당시 worktree 기준선을 비교해 기존 로컬 제안을 새 사용자 결정으로 오인하지 않는다. 복구 도중 실행 자리 소유자가 바뀌면 다른 계획의 투영·진단을 보존한다. 프로젝트 차단 복구·진단 branch는 G-107 범위로 남기며 이 계획에는 추가하지 않았다.

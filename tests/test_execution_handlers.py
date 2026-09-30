@@ -6740,6 +6740,29 @@ class EvidenceFreeBlockedScopeTests(TestCase):
                 with self.assertRaises(lm.AgentScopeError):
                     self.validate()
 
+    def _published_tracking_ref(self):
+        remote_ref = 'refs/remotes/origin/loop-manager/G-047'
+        self.original = replace(self.original, refs={**self.original.refs, remote_ref: ('remote', '')})
+        self.current = replace(self.current, refs={**self.current.refs, remote_ref: ('owned-head', '')})
+        self.case.state.update_project('repo', agent_snapshot=self.original.serialize(), publication_remote_oid='owned-head')
+        lm.blocked_checkpoint_state.BlockedCheckpointRepository(self.case.fixture.connection).request(
+            repo='repo', plan_id='G-047', reason_code='verify_retry_exhausted', evidence='original cause',
+            branch='loop-manager/G-047', worktree='/state/G-047', expected_remote_oid='remote', rebase_recovery=False)
+
+    def test_owned_checkpoint_tracking_update_does_not_rewrite_original_agent_snapshot(self):
+        self._published_tracking_ref()
+        with mock.patch.object(lm, '_owned_checkpoint_remote_oid', return_value='owned-head') as ownership:
+            self.validate()
+        ownership.assert_called_once()
+        self.assertEqual(self.case.fixture.connection.execute('SELECT agent_snapshot FROM exec_plans').fetchone()[0],
+                         self.original.serialize())
+
+    def test_unproven_checkpoint_tracking_update_remains_a_scope_violation(self):
+        self._published_tracking_ref()
+        with mock.patch.object(lm, '_owned_checkpoint_remote_oid', return_value=None):
+            with self.assertRaises(lm.AgentScopeError):
+                self.validate()
+
 
 class EvidenceFreeRecoveryLifecycleTests(TestCase):
     """Manager phase policies with SQLite and fake Git/Agent/process adapters."""
