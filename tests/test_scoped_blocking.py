@@ -456,6 +456,69 @@ class BlockedPlanRemoteRefreshTests(unittest.TestCase):
         self.assertIsNone(checkpoint.snapshot['remote_adoption_intent'])
         self.assertEqual(checkpoint.snapshot['remote_adoption_scope']['head'], self.head)
 
+    def persisted_adoption_scope(self):
+        # Exercise the exact pre-reconciler gate used by _run_project_step.
+        with mock.patch.object(Path, 'is_dir', return_value=True), \
+             mock.patch.object(loop_manager, '_config_entries', return_value={}), \
+             mock.patch.object(loop_manager, '_normalize_legacy_ignored_snapshot', side_effect=lambda path, before, current: before):
+            return loop_manager.validate_persisted_agent_scope(
+                self.connection, Path('/repo'), Path('/state'), self.repo)
+
+    def test_occupied_project_restart_validates_pending_adoption_before_reconcile(self):
+        original = self.interrupt_after_fast_forward()
+        loop_manager.hydrate_execplan_project(self.connection, self.repo, self.plan())
+        self.assertEqual(self.persisted_adoption_scope().head, self.head)
+        self.connection.execute("UPDATE projects SET registered = 1 WHERE repo = ?", (self.repo,))
+        # Stop immediately after the real project-entry persisted scope gate.
+        # All repository and process effects remain fake unit ports.
+        class RepositoryGateReached(Exception):
+            pass
+        with (mock.patch.object(Path, 'expanduser', autospec=True, side_effect=lambda path:
+                  SimpleNamespace(resolve=lambda **kwargs: Path(self.repo)) if str(path) == self.repo else path),
+              mock.patch.object(Path, 'is_dir', return_value=True),
+              mock.patch.object(loop_manager, '_check_runtime_handoff'),
+              mock.patch.object(loop_manager, '_self_runtime_project', return_value=None),
+              mock.patch.object(loop_manager, 'observe_blocked_plan_remotes'),
+              mock.patch.object(loop_manager, '_config_entries', return_value={}),
+              mock.patch.object(loop_manager, '_normalize_legacy_ignored_snapshot', side_effect=lambda path, before, current: before),
+              mock.patch.object(loop_manager, 'validate_repository', side_effect=RepositoryGateReached),
+              mock.patch.object(loop_manager, 'block_persisted_agent_scope_violation') as block):
+            with self.assertRaises(RepositoryGateReached):
+                loop_manager._run_project_step(self.connection, Path('/state'), self.repo,
+                    Path('/config'), None, False, registered_only=True)
+            block.assert_not_called()
+        with mock.patch.object(self.coordinator, '_publish'):
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
+
+    def test_occupied_restart_pending_adoption_rejects_unowned_ref(self):
+        self.interrupt_after_fast_forward()
+        loop_manager.hydrate_execplan_project(self.connection, self.repo, self.plan())
+        self.current_snapshot = replace(self.current_snapshot,
+            refs={**self.current_snapshot.refs, 'refs/heads/unowned': ('foreign', '')})
+        with self.assertRaises(loop_manager.AgentScopeError):
+            self.persisted_adoption_scope()
+
+    def test_resumed_worker_uses_adopted_head_and_checks_its_output(self):
+        original = self.published_successor()
+        self.ports._evaluate_remote_checkpoint_cause.return_value = (True, 'resolved', 'verify')
+        self.assertEqual(self.coordinator.reconcile('G-106'), 'resumed')
+        self.assertEqual(self.plan()['status'], 'IMPLEMENTING')
+        self.assertEqual(self.persisted_adoption_scope().head, self.head)
+        before = loop_manager.begin_agent_scope(
+            self.connection, self.repo, Path(self.plan()['worktree']), 'worker')
+        self.assertEqual(before.head, self.head)
+        loop_manager.validate_agent_scope('worker', Path(self.plan()['worktree']),
+            before, self.current_snapshot, selected_plan_path=self.plan()['path'])
+        loop_manager.update_project(self.connection, self.repo,
+                                    agent_result_snapshot=self.current_snapshot.serialize())
+        self.persisted_adoption_scope()
+        self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
+        changed = replace(self.current_snapshot, head='unauthorized')
+        loop_manager.update_project(self.connection, self.repo, agent_result_snapshot=changed.serialize())
+        with self.assertRaises(loop_manager.AgentScopeError):
+            self.persisted_adoption_scope()
+
     def test_interrupted_fast_forward_rejects_later_shared_mutation(self):
         original = self.interrupt_after_fast_forward()
         self.current_snapshot = replace(self.current_snapshot,

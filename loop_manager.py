@@ -10890,7 +10890,7 @@ def begin_agent_scope(
     input_fingerprint: str | None = None,
 ) -> GitSnapshot:
     row = connection.execute(
-        "SELECT agent_role, agent_snapshot, agent_input_fingerprint, plan_path, branch "
+        "SELECT * "
         "FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
@@ -10929,6 +10929,17 @@ def begin_agent_scope(
             managed_rebase_adoption.remember_agent_baseline(
                 execution_checkpoint_state.ExecutionCheckpointRepository(connection),
                 repo, plan_id, stored, effective, role_name)
+            return effective
+        if plan_id and (checkpoint.snapshot or {}).get('remote_adoption_scope'):
+            current = capture_git_snapshot(worktree)
+            effective, _ = _remote_adoption_agent_baseline(
+                connection, repo, plan_id, worktree, row, stored, current, checkpoint)
+            validate_agent_scope(role_name, worktree, effective, current,
+                                 selected_plan_path=row['plan_path'] if role_name == 'worker' else None,
+                                 allowed_guidance_targets=_guidance_worker_targets(connection, repo, plan_id),
+                                 allow_common_plans=_published_plan_allows_common_plans(
+                                     Path(repo), project_execplan(connection, repo)),
+                                 external_worktree=Path(repo), base_branch=row['base_branch'])
             return effective
         return stored
     preliminary_snapshot = capture_git_snapshot(worktree)
@@ -13394,7 +13405,7 @@ def validate_persisted_agent_scope(
 
     project = connection.execute(
         "SELECT phase, base_branch, branch, worktree, agent_role, agent_snapshot, "
-        "agent_result_snapshot, agent_manager_snapshot, plan_path FROM projects WHERE repo = ?",
+        "agent_result_snapshot, agent_manager_snapshot, agent_recovery, plan_path FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
     if project is None or not project["agent_snapshot"]:
@@ -13571,6 +13582,28 @@ def validate_persisted_agent_scope(
             rebase_checkpoint.snapshot or {}, role_name)
         before = _normalize_legacy_ignored_snapshot(
             saved_worktree, _with_proven_legacy_ignore_config(comparison, current_config), current)
+    if (role_name in {'worker', 'reviewer'}
+            and not (rebase_checkpoint.snapshot or {}).get('current_rebase_acceptance')
+            and any((rebase_checkpoint.snapshot or {}).get(key)
+                    for key in ('remote_adoption_scope', 'remote_adoption_intent'))):
+        plan_id = _plan_id_from_path(selected_plan_path)
+        plan = connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
+                                  (repo, plan_id)).fetchone()
+        if plan is None or plan['branch'] != project['branch'] or plan['worktree'] != str(saved_worktree):
+            raise AgentScopeError('원격 채택의 계획·worktree identity가 다릅니다.')
+        before, adoption_project = _remote_adoption_agent_baseline(
+            connection, repo, plan_id, saved_worktree, project, before, current,
+            rebase_checkpoint, saved_plan=plan)
+        if adoption_project['agent_result_snapshot'] is None:
+            result = None
+            checkpoint = None
+        else:
+            result = GitSnapshot.deserialize(str(adoption_project['agent_result_snapshot']))
+            validate_agent_scope(
+                role_name, saved_worktree, before, result,
+                selected_plan_path=selected_plan_path if role_name == 'worker' else None,
+                allowed_guidance_targets=guidance_targets, allow_common_plans=allow_common_plans,
+                external_worktree=repo_path, base_branch=str(project['base_branch']))
     rebase_scope_normalized = False
     if (role_name in {'worker', 'reviewer'} and phase != 'PLAN_BLOCKED'
             and managed_rebase_adoption.needs_agent_comparison(rebase_checkpoint,
@@ -13790,43 +13823,10 @@ def refresh_persisted_agent_scope_after_manager_git(
     return refreshed
 
 
-def validate_blocked_agent_scope(
-    connection: sqlite3.Connection,
-    repo_path: Path,
-    repo: str,
-    base: str,
-    worktree: Path,
-    selected_plan_path: str,
-    *, accepted_rebase: bool = False, saved_plan=None,
-) -> None:
-    """Revalidate preserved Agent output before a BLOCKED plan can resume."""
-
-    project = connection.execute(
-        "SELECT agent_role, agent_snapshot, agent_result_snapshot, agent_manager_snapshot, agent_recovery "
-        "FROM projects WHERE repo = ?",
-        (repo,),
-    ).fetchone()
-    if saved_plan is not None:
-        project = saved_plan
-    if project is None:
-        raise AgentScopeError("BLOCKED Agent 범위를 확인할 프로젝트가 없습니다.")
-    serialized = project["agent_snapshot"]
-    if not serialized:
-        return
-    role_name = str(project["agent_role"] or "")
-    if role_name not in {"planner", "worker", "reviewer"}:
-        raise AgentScopeError(
-            f"저장된 BLOCKED Agent 역할이 유효하지 않습니다: {role_name or '없음'}"
-        )
-    try:
-        before = GitSnapshot.deserialize(str(serialized))
-    except (KeyError, TypeError, ValueError, RuntimeError) as error:
-        raise AgentScopeError(
-            f"저장된 BLOCKED Agent Git snapshot이 유효하지 않습니다: {error}"
-        ) from error
-    current = capture_git_snapshot(worktree)
-    plan_id = _plan_id_from_path(selected_plan_path)
-    checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, plan_id)
+def _remote_adoption_agent_baseline(connection, repo, plan_id, worktree, project, before, current,
+                                    checkpoint, *, saved_plan=None, accepted_rebase=False):
+    """Share the exact Manager adoption boundary across all Agent entry points."""
+    serialized = project['agent_snapshot']
     adopted = (checkpoint.snapshot or {}).get('remote_adoption_scope')
     pending = (checkpoint.snapshot or {}).get('remote_adoption_intent')
     if pending and not accepted_rebase and saved_plan is not None:
@@ -13870,7 +13870,6 @@ def validate_blocked_agent_scope(
             'SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?', (repo, plan_id)).fetchone()
     if (adopted and not pending and not accepted_rebase and adoption_plan is not None
             and adopted['agent_snapshot'] == serialized
-            and adopted['agent_result_snapshot'] == project['agent_result_snapshot']
             and adopted['branch'] == adoption_plan['branch']
             and adopted['worktree'] == str(worktree)
             and adopted['head'] == checkpoint.expected_head
@@ -13880,7 +13879,51 @@ def validate_blocked_agent_scope(
         # fast-forward. Compare later changes to that exact durable result;
         # never rewrite the Agent audit or absorb subsequent local Git writes.
         before = GitSnapshot.deserialize(adopted['snapshot'])
-        project = {**dict(project), 'agent_result_snapshot': None}
+        if project['agent_result_snapshot'] == adopted['agent_result_snapshot']:
+            project = {**dict(project), 'agent_result_snapshot': None}
+    return before, project
+
+
+def validate_blocked_agent_scope(
+    connection: sqlite3.Connection,
+    repo_path: Path,
+    repo: str,
+    base: str,
+    worktree: Path,
+    selected_plan_path: str,
+    *, accepted_rebase: bool = False, saved_plan=None,
+) -> None:
+    """Revalidate preserved Agent output before a BLOCKED plan can resume."""
+
+    project = connection.execute(
+        "SELECT agent_role, agent_snapshot, agent_result_snapshot, agent_manager_snapshot, agent_recovery "
+        "FROM projects WHERE repo = ?",
+        (repo,),
+    ).fetchone()
+    if saved_plan is not None:
+        project = saved_plan
+    if project is None:
+        raise AgentScopeError("BLOCKED Agent 범위를 확인할 프로젝트가 없습니다.")
+    serialized = project["agent_snapshot"]
+    if not serialized:
+        return
+    role_name = str(project["agent_role"] or "")
+    if role_name not in {"planner", "worker", "reviewer"}:
+        raise AgentScopeError(
+            f"저장된 BLOCKED Agent 역할이 유효하지 않습니다: {role_name or '없음'}"
+        )
+    try:
+        before = GitSnapshot.deserialize(str(serialized))
+    except (KeyError, TypeError, ValueError, RuntimeError) as error:
+        raise AgentScopeError(
+            f"저장된 BLOCKED Agent Git snapshot이 유효하지 않습니다: {error}"
+        ) from error
+    current = capture_git_snapshot(worktree)
+    plan_id = _plan_id_from_path(selected_plan_path)
+    checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, plan_id)
+    before, project = _remote_adoption_agent_baseline(
+        connection, repo, plan_id, worktree, project, before, current, checkpoint,
+        saved_plan=saved_plan, accepted_rebase=accepted_rebase)
     scope_result = (GitSnapshot.deserialize(str(project['agent_result_snapshot']))
                     if project['agent_result_snapshot'] else None)
     observed_refs = blocked_plan_reconciliation.validated_scope_refs(
