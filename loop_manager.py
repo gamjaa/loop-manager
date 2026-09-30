@@ -99,6 +99,7 @@ from agent_invocation import (AgentProfile, AgentRequest, AgentResult, AgentResu
                               TrackedAgentCall, Usage, classify_agent_result)
 from agent_provider_usage import claude_usage, codex_log_usage
 import agent_invocation_state
+import agent_write_isolation
 import validation_feedback_state
 from validation_feedback import normalize_feedback, redact_secrets
 from worker_outcome import worker_outcome_instruction
@@ -7563,6 +7564,11 @@ def run_codex(
     session_id: str | None = None,
     on_session_started: Callable[[str], None] | None = None,
     resolved_profile: ResolvedProfile | None = None,
+    isolation_arguments: tuple[str, ...] | None = None,
+    isolation_evidence: agent_write_isolation.IsolationEvidence | None = None,
+    isolation_snapshot_digest: Callable[[], str] | None = None,
+    expected_repository: str | None = None,
+    on_isolation_checked: Callable[[agent_write_isolation.IsolationEvidence], None] | None = None,
 ) -> tuple[int, str] | CodexResult:
     if resolved_profile is not None:
         model, effort = resolved_profile.model, resolved_profile.effort
@@ -7574,16 +7580,52 @@ def run_codex(
         if level is not None:
             raise RuntimeError(f"Codex {role_name}에 Worker level을 지정할 수 없습니다.")
         model, effort = role(config_path, role_name, worktree)
+    sandbox_launch = None
+    launch_environment = agent_environment("codex", role_name)
+    if on_isolation_checked is not None:
+        checked: list[agent_write_isolation.IsolationEvidence] = []
+
+        def observe(evidence: agent_write_isolation.IsolationEvidence) -> None:
+            on_isolation_checked(evidence)
+            checked.append(evidence)
+
+        isolation_arguments = agent_write_isolation.prepare_isolation(
+            "codex", role_name, worktree, state_dir, read_only, observe,
+            isolation_snapshot_digest, config_path=config_path,
+            expected_repository=expected_repository, session_id=session_id,
+            environment_variables=launch_environment,
+        )
+        if isinstance(isolation_arguments, agent_write_isolation.CodexLaunch):
+            sandbox_launch = isolation_arguments
+            isolation_arguments = sandbox_launch.arguments
+            launch_environment = sandbox_launch.environment
+        if len(checked) != 1 or checked[0].status != "verified":
+            raise agent_write_isolation.IsolationError("Codex 격리 증거가 없습니다.")
+        isolation_evidence = checked[0]
+    if isolation_arguments is not None:
+        if isolation_evidence is None or isolation_snapshot_digest is None:
+            raise agent_write_isolation.IsolationError("Codex 격리 증거가 없습니다.")
+        agent_write_isolation.assert_current(
+            isolation_evidence, worktree, state_dir, config_path,
+            expected_repository, read_only, isolation_snapshot_digest,
+        )
     project_dir = state_dir / "logs" / hashlib.sha256(str(worktree).encode()).hexdigest()[:16]
     project_dir.mkdir(parents=True, exist_ok=True)
     last_message = project_dir / f"{role_name}-last.txt"
-    log = project_dir / f"{role_name}.log"
-    last_message.unlink(missing_ok=True)
+    saved_log = project_dir / f"{role_name}.log"
+    log = sandbox_launch.attempt / "provider.log" if sandbox_launch else saved_log
+    # Preserve the previous result until the sandbox gate has accepted the call.
+    provider_last_message = (sandbox_launch.attempt / "last-message.txt"
+                             if sandbox_launch else last_message)
+    if sandbox_launch is None:
+        last_message.unlink(missing_ok=True)
+    permissions = (list(isolation_arguments) if isolation_arguments is not None
+                   else codex_sandbox_arguments(read_only))
     if session_id:
         arguments = [
             "codex",
             "exec",
-            *codex_sandbox_arguments(read_only),
+            *permissions,
             "-C",
             str(worktree),
             "resume",
@@ -7593,7 +7635,7 @@ def run_codex(
             "-c",
             f'model_reasoning_effort="{effort}"',
             "-o",
-            str(last_message),
+            str(provider_last_message),
             session_id,
             "-",
         ]
@@ -7602,7 +7644,7 @@ def run_codex(
             "codex",
             "exec",
             *(["--json"] if persist_session else ["--ephemeral"]),
-            *codex_sandbox_arguments(read_only),
+            *permissions,
             "-C",
             str(worktree),
             "-m",
@@ -7610,9 +7652,11 @@ def run_codex(
             "-c",
             f'model_reasoning_effort="{effort}"',
             "-o",
-            str(last_message),
+            str(provider_last_message),
             "-",
         ]
+    if sandbox_launch is not None:
+        arguments = sandbox_launch.wrap(arguments)
     resolved_session_id = session_id
     timeout_triggered = threading.Event()
     if persist_session and not session_id:
@@ -7625,8 +7669,9 @@ def run_codex(
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                env=agent_environment("codex", role_name),
+                env=launch_environment,
                 cwd=worktree,
+                start_new_session=sandbox_launch is not None,
             )
             assert process.stdin is not None
             assert process.stdout is not None
@@ -7634,7 +7679,10 @@ def run_codex(
             def terminate_on_timeout() -> None:
                 timeout_triggered.set()
                 try:
-                    process.kill()
+                    if sandbox_launch is not None:
+                        sandbox_launch.stop(process)
+                    else:
+                        process.kill()
                 except OSError:
                     pass
 
@@ -7667,7 +7715,10 @@ def run_codex(
                 returncode = process.wait()
             except BaseException:
                 try:
-                    process.kill()
+                    if sandbox_launch is not None:
+                        sandbox_launch.stop(process)
+                    else:
+                        process.kill()
                 except OSError:
                     pass
                 process.wait()
@@ -7675,9 +7726,12 @@ def run_codex(
             finally:
                 timeout.cancel()
                 process.stdout.close()
+                if sandbox_launch is not None:
+                    sandbox_launch.stop(process)
     else:
         with log.open("w", encoding="utf-8") as output:
-            result = _handoff_run(
+            runner = sandbox_launch.run if sandbox_launch is not None else _handoff_run
+            result = runner(
                 arguments,
                 input=prompt,
                 text=True,
@@ -7685,12 +7739,16 @@ def run_codex(
                 errors="replace",
                 stdout=output,
                 stderr=subprocess.STDOUT,
-                env=agent_environment("codex", role_name),
+                env=launch_environment,
                 cwd=worktree,
                 timeout=AGENT_CLI_TIMEOUT_SECONDS,
+                **({"launch_process": _handoff_popen} if sandbox_launch is not None else {}),
             )
         returncode = result.returncode
-    message = last_message.read_text(encoding="utf-8") if last_message.is_file() else ""
+    message = (provider_last_message.read_text(encoding="utf-8")
+               if provider_last_message.is_file() else "")
+    if sandbox_launch is not None and provider_last_message.is_file():
+        last_message.write_text(message, encoding="utf-8")
     if timeout_triggered.is_set():
         message = f"Codex {role_name} 실행 timeout ({AGENT_CLI_TIMEOUT_SECONDS}초)"
     if returncode and not message:
@@ -7700,6 +7758,8 @@ def run_codex(
     except (OSError, UnicodeError):
         # Usage is observational; a failed log read cannot retry a completed CLI call.
         usage = Usage(status="invalid")
+    if sandbox_launch is not None and returncode != 125:
+        saved_log.write_text(log.read_text(encoding="utf-8"), encoding="utf-8")
     if persist_session and not resolved_session_id:
         if returncode == 0:
             return CodexResult(
@@ -7860,11 +7920,21 @@ def run_claude(
     session_id: str | None = None,
     on_session_started: Callable[[str], None] | None = None,
     resolved_profile: ResolvedProfile | None = None,
+    on_isolation_checked: Callable[[agent_write_isolation.IsolationEvidence], None] | None = None,
+    isolation_snapshot_digest: Callable[[], str] | None = None,
+    expected_repository: str | None = None,
 ) -> tuple[int, str] | AgentResult:
     profile = resolved_profile or _agent_profile(
         config_path, "claude", role_name, level, worktree
     )
     model, effort = profile.model, profile.effort
+    if on_isolation_checked is not None:
+        agent_write_isolation.prepare_isolation(
+            "claude", role_name, worktree, state_dir, read_only,
+            on_isolation_checked, isolation_snapshot_digest,
+            config_path=config_path, expected_repository=expected_repository,
+            session_id=session_id,
+        )
     project_dir = (
         state_dir
         / "logs"
@@ -8059,6 +8129,9 @@ class CodexAgentAdapter:
             session_id=request.session_id,
             on_session_started=request.on_session_started,
             resolved_profile=request.profile,
+            isolation_snapshot_digest=request.isolation_snapshot_digest,
+            expected_repository=request.expected_repository,
+            on_isolation_checked=request.on_isolation_checked,
         )
 
 
@@ -8078,6 +8151,9 @@ class ClaudeAgentAdapter:
             session_id=request.session_id,
             on_session_started=request.on_session_started,
             resolved_profile=request.profile,
+            on_isolation_checked=request.on_isolation_checked,
+            isolation_snapshot_digest=request.isolation_snapshot_digest,
+            expected_repository=request.expected_repository,
         )
 
 
@@ -8150,6 +8226,18 @@ def run_agent(
         if on_session_started is not None:
             on_session_started(started_session_id)
 
+    def observe_isolation(evidence: agent_write_isolation.IsolationEvidence) -> None:
+        if ledger is None or identity is None:
+            raise agent_write_isolation.IsolationError(
+                "Agent 격리 증거를 저장할 invocation 상태가 없습니다."
+            )
+        try:
+            ledger.record_isolation(identity, evidence)
+        except sqlite3.Error as error:
+            raise agent_write_isolation.IsolationError(
+                "Agent 격리 증거 저장 실패"
+            ) from error
+
     request = AgentRequest(
         worktree=worktree,
         state_dir=state_dir,
@@ -8162,6 +8250,10 @@ def run_agent(
         session_id=session_id,
         on_session_started=observe_session,
         profile=resolved,
+        on_isolation_checked=observe_isolation,
+        isolation_snapshot_digest=lambda: hashlib.sha256(
+            capture_git_snapshot(worktree).serialize().encode()).hexdigest(),
+        expected_repository=invocation.repo if invocation is not None else None,
     )
     started = time.monotonic()
     try:
@@ -8190,7 +8282,11 @@ def run_agent(
         except sqlite3.Error:
             collection_status = "error"
     if isinstance(raw, AgentResult):
-        return replace(raw, collection_status=collection_status)
+        return replace(raw, collection_status=collection_status,
+                       isolation_invocation_id=identity)
+    if identity is not None:
+        return replace(result, collection_status=collection_status,
+                       isolation_invocation_id=identity)
     return raw
 
 
@@ -17219,6 +17315,8 @@ def _evaluate_remote_checkpoint_cause(
                 protocol_error=protocol_error,
             ),
             read_only=True,
+            connection=connection,
+            invocation=InvocationContext(repo, str(blocked["plan_id"])),
         )
         validate_agent_scope(
             "reviewer", worktree, review_before, capture_git_snapshot(worktree),
@@ -23032,6 +23130,8 @@ def _document_drafts_command(
                 run_agent(
                     str(project["provider"]), ROOT, state_dir, config_path,
                     "planner", prompt, read_only=True,
+                    connection=connection,
+                    invocation=InvocationContext(repo, None),
                 ),
                 None,
             )
