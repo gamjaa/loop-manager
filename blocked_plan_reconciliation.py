@@ -108,7 +108,9 @@ class BlockedPlanReconciler:
             raise RuntimeError('원격 저장소 identity가 관측과 다릅니다.')
         base, branch = observations.observe_refs(
             self.repo_path, origin, (context['base_ref'], context['branch_ref']))
-        if base.result != 'present' or branch.result == 'error':
+        if base.result == 'error' or branch.result == 'error':
+            raise AssessmentPending('차단 계획 원격 ref 조회를 다음 실행에서 재시도합니다.')
+        if base.result != 'present':
             raise RuntimeError('차단 계획 원격 ref 조회 실패 또는 base 삭제')
         # Finish a saved target/publication before considering a later base.
         checkpoint = ExecutionCheckpointRepository(self.connection).get(self.repo, context['plan_id'])
@@ -151,6 +153,12 @@ class BlockedPlanReconciler:
                 repository.get(self.repo, plan['plan_id']), repository,
                 adopt_only=True, expected_remote_oid=context['branch_oid'])
             if result not in {'unchanged', 'adopted'}:
+                inspection = self.connection.execute(
+                    'SELECT inspection_retryable FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?',
+                    (self.repo, plan['plan_id'])).fetchone()
+                if inspection is not None and inspection['inspection_retryable']:
+                    raise AssessmentPending(self._plan(plan['plan_id'])['last_error'] or
+                                            '원격 checkpoint 검사를 다음 실행에서 재시도합니다.')
                 raise RuntimeError(self._plan(plan['plan_id'])['last_error'] or
                                    '원격 checkpoint 후속 commit의 안전한 채택이 거부됐습니다.')
             current = self._plan(plan['plan_id'])
@@ -182,9 +190,14 @@ class BlockedPlanReconciler:
         worktree, branch = self._validate(plan, rebase=pending or bool(
             (checkpoint.snapshot or {}).get('current_rebase_acceptance')))
         if not pending and not completed:
-            fetched = self.ports.git(self.repo_path, 'fetch', '--no-tags', 'origin', context['base_ref'], check=False)
-            if fetched.returncode or self.ports.git(self.repo_path, 'rev-parse', 'FETCH_HEAD^{commit}').stdout.strip() != context['base_oid']:
-                raise RuntimeError('차단 계획 base fetch 실패 또는 조회·fetch 사이 OID 경쟁')
+            try:
+                fetched = self.ports.git(self.repo_path, 'fetch', '--no-tags', 'origin', context['base_ref'], check=False)
+            except (OSError, RuntimeError) as error:
+                raise AssessmentPending('차단 계획 base fetch 미완료: ' + str(error)) from error
+            if fetched.returncode:
+                raise AssessmentPending('차단 계획 base fetch 실패: ' + fetched.stdout[-2000:])
+            if self.ports.git(self.repo_path, 'rev-parse', 'FETCH_HEAD^{commit}').stdout.strip() != context['base_oid']:
+                raise InputChanged('차단 계획 base 조회·fetch 사이 OID 경쟁')
             remote = self._remote(context, allow_published=True)
             if remote != context['branch_oid']:
                 # A checkpoint push may have finished before the recovery

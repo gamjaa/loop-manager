@@ -62,6 +62,12 @@ priority: critical
 - 새 회귀 test fixture의 mock 적용 대상과 비교 기준선 초기화 오류를 수정하고 동일 명령을 재실행했다. 마지막 실행은 29개 모두 실패 없이 통과했다. Manager가 보고한 실제 Git 사례와 전체 verify는 Worker가 실행하지 않았으며 이후 Manager 검증을 기다린다.
   - FAILED_COMMAND: python3 -m unittest tests.test_scoped_blocking.BlockedPlanRemoteRefreshTests
   - RERUN: python3 -m unittest tests.test_scoped_blocking.BlockedPlanRemoteRefreshTests
+- 2026-09-30: 재개 세션에서 최신 계획·R-046·R-048·PRODUCT·ARCHITECTURE와 HEAD `be95a79f4938394db06460ee05e3cf5be5b0bac6`의 `origin/main` 대비 전체 변경을 다시 확인했다. Review 지적 세 건을 수정했다. 안전한 원격 후속 commit의 선택 branch/worktree 비교 기준선을 execution checkpoint에 별도로 저장해 Agent 원본·결과 snapshot을 보존한다. base·후속 branch fetch와 원격 조회의 일시 실패는 입력을 소비하지 않고 재시도한다. 등록 origin·관측 row가 있는 기존 Review 횟수 차단도 기존 소유권 검사를 먼저 거쳐 교정을 재개한다.
+- 2026-09-30: 현재 후보의 최소 unit test 최종 결과는 52개 통과다. `BlockedPlanRemoteRefreshTests` 36개, `BlockedCheckpointRefreshUnitTests` 7개, `EvidenceFreeBlockedScopeTests` 5개, `CatalogCheckpointWiringTest` 2개 및 `ScopedBlockingTest`의 `test_published_review_checkpoint_reconciles_before_legacy_count_release`, `test_legacy_review_count_block_releases_only_owned_non_rebase_workspace` 두 사례를 실행했다. 원격 채택 뒤 실제 Agent snapshot 보존·guidance 재시작·후속 범위 위반 거부와 동일 입력 fetch 실패 후 성공을 포함한다. 새 fixture의 schema 초기화와 index 형식·fake 검사 포트를 수정한 뒤 동일 명령의 마지막 실행은 36개 모두 통과했다.
+  - FAILED_COMMAND: python3 -m unittest tests.test_scoped_blocking.BlockedPlanRemoteRefreshTests
+  - RERUN: python3 -m unittest tests.test_scoped_blocking.BlockedPlanRemoteRefreshTests
+- 전체 verify·실제 Git 사례·Review는 Manager에 맡기며 Worker는 실행하지 않았다. `tests/test_loop_manager.py`의 기존 격리 import fixture는 실제 Git 저장소를 생성하는 사례이므로 읽기만 했으며 Worker 실행 대상에서 제외했다. commit·push·PR 생성, AGENTS·PLANS·Requirement 변경은 하지 않았다.
+- 2026-09-30: Worker 결과 검증 오류를 재현한 파서 조건을 확인했다. 직전 응답은 `FAILED_COMMAND`와 `RERUN` 사이에 실패 결과가 없어 미해결 이력으로 판정됐다. 최종 보고를 실패 명령·실패 결과·동일 재실행 명령·최종 PASS 순서로 구성하고 기존 `parse_worker_result`가 수용함을 확인했다. 파서와 제품 코드는 추가 변경하지 않았다. 최신 근거 문서와 현재 HEAD/base 대비 diff를 재확인하고 위 최소 unit test 5개 명령을 새로 실행해 36·7·5·2·2개, 총 52개가 모두 통과했다. 전체 verify·실제 Git 검증·Review는 이후 Manager가 수행한다.
 - [ ] Manager 전체 verify와 실제 Git 회귀 사례 검증. base만 변경·후속 commit만 변경·동시 변경·원인 지속/해소·Git 효과 뒤 중단 재시작·수동 충돌 해결 사례를 작성했으며 Worker는 실행하지 않았다. Linux 전체 검증 스크립트에 새 모듈의 compile 검사를 추가했으나 스크립트·전체 suite·integration·lint·build·type check는 실행하지 않았다.
 - [ ] Reviewer 검토 및 사용자 Merge. Worker는 commit·push·PR을 생성하지 않았다.
 
@@ -72,3 +78,5 @@ priority: critical
 - 2026-09-30: 복구 단계와 원래 차단 원인·검증 artifact는 별도의 additive SQLite 기록에 저장한다. rebase 수용으로 기존 검증 결과가 무효화돼도 저장된 원인을 검사할 수 있으며, 완료된 Git 효과나 완료된 원인 검사를 재시작에서 반복하지 않는다. 후속 checkpoint identity를 갱신할 때 이전 게시 identity는 감사 이력으로 보존한다.
 - 2026-09-30: 대상 계획 ID를 명시해 mirror에 의존하지 않고 복구한다. 문서 입력 해제는 원래 revision과 차단 당시 worktree 기준선을 비교해 기존 로컬 제안을 새 사용자 결정으로 오인하지 않는다. 복구 도중 실행 자리 소유자가 바뀌면 다른 계획의 투영·진단을 보존한다. 프로젝트 차단 복구·진단 branch는 G-107 범위로 남기며 이 계획에는 추가하지 않았다.
 - 2026-09-30: 등록 origin이 없는 legacy 관측은 유효한 원격 갱신 입력으로 간주하지 않는다. 기존 문서·Agent 범위 복구 경계를 유지하고 원래 차단·진단과 미처리 관측을 보존한다. 등록 origin이 있는 프로젝트에는 원격 identity·조회 오류 검사와 현재 원격 복구 gate를 그대로 적용한다.
+
+- 2026-09-30: 원격 채택 비교 기준선은 R-039가 확인한 선택 branch·worktree 상태와 정확한 후속 OID에만 결합한다. 원래 Agent snapshot과 별도로 저장하며 이후 로컬 HEAD·공유 ref·config 변경을 자동으로 흡수하지 않는다. 일시적 외부 검사 실패는 영구 거부 입력으로 기록하지 않는다. 기존 Review 횟수 해제는 원격 복구의 완료 여부가 아니라 기존 소유권·PR·rebase·별도 차단 검사에 의해 결정한다.

@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 import sqlite3
 import tempfile
 from types import SimpleNamespace
@@ -218,6 +219,190 @@ class BlockedPlanRemoteRefreshTests(unittest.TestCase):
         self.ports._evaluate_remote_checkpoint_cause.assert_not_called()
         self.ports._update_blocked_error.assert_called_once()
         self.assertEqual(scoped_blocking.plan_block(self.connection, self.repo, 'G-106')['evidence'], 'original verify failure')
+
+    def published_successor(self):
+        branch, worktree = self.plan()['branch'], self.plan()['worktree']
+        remote = 'c' * 40
+        original = loop_manager.GitSnapshot(self.head, branch, {}, {},
+            {f'refs/heads/{branch}': (self.head, '')},
+            {worktree: (f'HEAD={self.head}', f'branch=refs/heads/{branch}')}, {}, {})
+        self.current_snapshot = original
+        self.connection.execute(
+            "UPDATE exec_plans SET agent_role = 'worker', agent_snapshot = ?, agent_result_snapshot = ? "
+            "WHERE plan_id = 'G-106'", (original.serialize(), original.serialize()))
+        repository = blocked_checkpoint_state.BlockedCheckpointRepository(self.connection)
+        repository.finish_published(repository.get(self.repo, 'G-106'), self.head)
+        self.connection.execute("UPDATE blocked_remote_observations SET branch_result = 'present', branch_oid = ? WHERE plan_id = 'G-106'", (remote,))
+        self.connection.commit()
+        fetched = [self.base]
+        self.fail_branch_fetch = False
+        def git(path, *args, **kwargs):
+            if args[:1] == ('fetch',):
+                fetched[0] = self.base if args[-1] == 'refs/heads/main' else remote
+                if fetched[0] == remote and self.fail_branch_fetch:
+                    self.fail_branch_fetch = False
+                    return SimpleNamespace(returncode=1, stdout='temporary fetch failure')
+            if args[:1] == ('rev-parse',) and args[1] == 'FETCH_HEAD^{commit}':
+                return SimpleNamespace(returncode=0, stdout=fetched[0])
+            if 'merge' in args:
+                self.head = remote
+                self.current_snapshot = replace(original, head=remote,
+                    index={self.plan()['path']: ('H 100644 blob 0',)},
+                    refs={f'refs/heads/{branch}': (remote, '')},
+                    worktrees={worktree: (f'HEAD={remote}', f'branch=refs/heads/{branch}')})
+            return self.git(path, *args, **kwargs)
+        self.ports.git.side_effect = git
+        self.ports._non_default_index_flags.side_effect = loop_manager._non_default_index_flags
+        self.ports.capture_git_snapshot.side_effect = lambda *_: self.current_snapshot
+        self.ports.validate_blocked_agent_scope.side_effect = loop_manager.validate_blocked_agent_scope
+        self.ports._reconcile_published_blocked_checkpoint.side_effect = loop_manager._reconcile_published_blocked_checkpoint
+        self.ports.checkpoint_ownership.owned_remote_oid.return_value = remote
+        adapter = mock.Mock()
+        adapter.observe_remote.return_value = remote
+        adapter._approved_guidance_targets.return_value = ()
+        for patch in (
+            mock.patch.object(loop_manager, 'git', side_effect=git),
+            mock.patch.object(loop_manager, 'capture_git_snapshot', side_effect=lambda *_: self.current_snapshot),
+            mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
+            mock.patch.object(loop_manager, 'validate_managed_worktree'),
+            mock.patch.object(loop_manager, 'github_repository', return_value='example/repo'),
+            mock.patch.object(loop_manager, '_BlockedCheckpointAdapter', return_value=adapter),
+            mock.patch.object(loop_manager, '_nul_git_paths', return_value=[]),
+            mock.patch.object(loop_manager, '_blocked_execplan_revision_metadata_error', return_value=None),
+            mock.patch.object(loop_manager, '_published_plan_allows_common_plans', return_value=False),
+            mock.patch.object(loop_manager, '_proven_manager_base_refs', return_value=frozenset()),
+            mock.patch.object(loop_manager, '_proven_merged_cleanup_paths', return_value=frozenset()),
+            mock.patch.object(blocked_remote_observation, 'observe_refs', return_value=(
+                blocked_remote_observation.RefObservation('present', self.base),
+                blocked_remote_observation.RefObservation('present', remote))),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+        return original
+
+    def test_successor_adoption_preserves_agent_audit_and_validates_new_baseline(self):
+        original = self.published_successor()
+        with mock.patch.object(self.coordinator, '_publish'):
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.assertEqual(self.ports._evaluate_remote_checkpoint_cause.call_count, 1, self.plan()['last_error'])
+        self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
+        self.assertEqual(self.plan()['agent_result_snapshot'], original.serialize())
+        checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get(self.repo, 'G-106')
+        self.assertEqual(checkpoint.snapshot['remote_adoption_scope']['head'], self.head)
+        # Later shared metadata writes and local commits are not absorbed.
+        adopted = self.current_snapshot
+        for changed in (replace(adopted, head='unauthorized'),
+                        replace(adopted, config={'unexpected': ('value',)}),
+                        replace(adopted, refs={**adopted.refs, 'refs/heads/unowned': ('foreign', '')})):
+            self.current_snapshot = changed
+            with self.assertRaises(loop_manager.AgentScopeError):
+                self.coordinator._validate(self.plan())
+
+    def test_guidance_successor_scope_survives_restart_without_rewriting_agent_snapshots(self):
+        original = self.published_successor()
+        reason = loop_manager.GUIDANCE_BLOCK_REASON
+        for table, field in (('exec_plans', 'blocked_reason'), ('execplan_blocks', 'reason_code'),
+                             ('blocked_checkpoints', 'reason_code')):
+            self.connection.execute(f"UPDATE {table} SET {field} = ? WHERE plan_id = 'G-106'", (reason,))
+        self.connection.commit()
+        save = self.coordinator._save
+        def interrupt(plan_id, key, stage, context):
+            if stage == 'adopted':
+                raise KeyboardInterrupt()
+            return save(plan_id, key, stage, context)
+        with mock.patch.object(self.coordinator, '_save', side_effect=interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.coordinator.reconcile('G-106')
+        restarted = blocked_plan_reconciliation.BlockedPlanReconciler(
+            self.ports, self.connection, Path('/repo'), Path('/state'), self.repo, 'main')
+        with mock.patch.object(restarted, '_publish'):
+            self.assertEqual(restarted.reconcile('G-106'), 'blocked')
+        saved = self.connection.execute("SELECT stage FROM blocked_plan_reconciliations WHERE plan_id = 'G-106'").fetchone()
+        self.assertEqual(saved['stage'], 'complete', self.plan()['last_error'])
+        loop_manager.hydrate_execplan_project(self.connection, self.repo, self.plan())
+        loop_manager.validate_blocked_agent_scope(self.connection, Path('/repo'), self.repo, 'main',
+                                                 Path(self.plan()['worktree']), self.plan()['path'])
+        self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
+        self.assertEqual(self.plan()['blocked_reason'], reason)
+        self.ports._evaluate_remote_checkpoint_cause.assert_not_called()
+
+    def test_agent_scope_violation_before_adoption_is_not_absorbed(self):
+        original = self.published_successor()
+        self.current_snapshot = replace(original, refs={**original.refs, 'refs/heads/unowned': ('foreign', '')})
+        self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.ports._reconcile_published_blocked_checkpoint.assert_not_called()
+        self.ports._evaluate_remote_checkpoint_cause.assert_not_called()
+        self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
+
+    def test_successor_fetch_failure_retries_without_consuming_observation(self):
+        self.published_successor()
+        self.fail_branch_fetch = True
+        self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.assertTrue(blocked_remote_observation.pending_input(self.row()))
+        self.ports._evaluate_remote_checkpoint_cause.assert_not_called()
+        with mock.patch.object(self.coordinator, '_publish'):
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.ports._evaluate_remote_checkpoint_cause.assert_called_once()
+
+    def test_base_fetch_failure_retries_same_input_after_restart(self):
+        calls = []
+        def git(path, *args, **kwargs):
+            if args[:1] == ('fetch',):
+                calls.append(args)
+                if len(calls) == 1:
+                    return SimpleNamespace(returncode=1, stdout='network unavailable')
+            return self.git(path, *args, **kwargs)
+        self.ports.git.side_effect = git
+        self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.assertTrue(blocked_remote_observation.pending_input(self.row()))
+        self.ports._evaluate_remote_checkpoint_cause.assert_not_called()
+        restarted = blocked_plan_reconciliation.BlockedPlanReconciler(
+            self.ports, self.connection, Path('/repo'), Path('/state'), self.repo, 'main')
+        with mock.patch.object(restarted, '_publish'):
+            self.assertEqual(restarted.reconcile('G-106'), 'blocked')
+        self.assertEqual(len(calls), 2)
+        self.ports._evaluate_remote_checkpoint_cause.assert_called_once()
+        self.assertFalse(blocked_remote_observation.pending_input(self.row()))
+
+    def test_remote_lookup_failure_retries_same_input(self):
+        failed = blocked_remote_observation.RefObservation('error', error='network')
+        with mock.patch.object(blocked_remote_observation, 'observe_refs', return_value=(failed, failed)):
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.assertTrue(blocked_remote_observation.pending_input(self.row()))
+        with mock.patch.object(self.coordinator, '_publish'):
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.ports._evaluate_remote_checkpoint_cause.assert_called_once()
+
+    def test_registered_observation_preserves_legacy_review_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = loop_manager.GitSnapshot(self.head, self.plan()['branch'], {}, {},
+                                                refs={}, worktrees={}, config={}, operations={})
+            self.connection.execute(
+                "UPDATE exec_plans SET worktree = ?, review_result = 'VERDICT: FAIL', "
+                "agent_result_snapshot = ?, blocked_reason = 'review_retry_exhausted' WHERE plan_id = 'G-106'",
+                (directory, snapshot.serialize()))
+            self.connection.execute("UPDATE execplan_blocks SET reason_code = 'review_retry_exhausted' WHERE plan_id = 'G-106'")
+            self.connection.execute("UPDATE blocked_checkpoints SET reason_code = 'review_retry_exhausted', phase = 'unpublished' WHERE plan_id = 'G-106'")
+            self.connection.commit()
+            loop_manager._ensure_execplans_schema(self.connection)
+            other = dict(self.plan('G-107'))
+            with (mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
+                  mock.patch.object(loop_manager, 'validate_managed_worktree'),
+                  mock.patch.object(loop_manager, 'validate_blocked_agent_scope'),
+                  mock.patch.object(loop_manager, '_rebase_in_progress_for_branch', return_value=False),
+                  mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=snapshot),
+                  mock.patch.object(loop_manager, 'remote_branch_oid', return_value=None),
+                  mock.patch.object(loop_manager, 'git', return_value=SimpleNamespace(returncode=0, stdout='')),
+                  mock.patch.object(loop_manager, 'pr_for_branch', return_value=None),
+                  mock.patch.object(blocked_plan_reconciliation, 'BlockedPlanReconciler') as remote):
+                remote.return_value.reconcile.return_value = 'blocked'
+                self.assertTrue(loop_manager.resume_plan_blocks(
+                    self.connection, Path('/repo'), Path('/state'), self.repo, 'main'))
+            remote.assert_not_called()
+            self.assertEqual(self.plan()['status'], 'IMPLEMENTING')
+            self.assertEqual(self.plan()['worker_session_id'], 'session')
+            self.assertEqual(self.plan()['review_result'], 'VERDICT: FAIL')
+            self.assertEqual(dict(self.plan('G-107')), other)
 
     def test_fetch_race_preserves_files_and_does_not_rebase_or_release(self):
         real_fake_git = self.git

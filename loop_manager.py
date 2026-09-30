@@ -13792,7 +13792,7 @@ def validate_blocked_agent_scope(
     """Revalidate preserved Agent output before a BLOCKED plan can resume."""
 
     project = connection.execute(
-        "SELECT agent_role, agent_snapshot, agent_result_snapshot, agent_manager_snapshot "
+        "SELECT agent_role, agent_snapshot, agent_result_snapshot, agent_manager_snapshot, agent_recovery "
         "FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
@@ -13815,6 +13815,24 @@ def validate_blocked_agent_scope(
             f"저장된 BLOCKED Agent Git snapshot이 유효하지 않습니다: {error}"
         ) from error
     current = capture_git_snapshot(worktree)
+    plan_id = _plan_id_from_path(selected_plan_path)
+    checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, plan_id)
+    adopted = (checkpoint.snapshot or {}).get('remote_adoption_scope')
+    adoption_plan = saved_plan if saved_plan is not None else connection.execute(
+        'SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?', (repo, plan_id)).fetchone()
+    if (adopted and not accepted_rebase and adoption_plan is not None
+            and adopted['agent_snapshot'] == serialized
+            and adopted['agent_result_snapshot'] == project['agent_result_snapshot']
+            and adopted['branch'] == adoption_plan['branch']
+            and adopted['worktree'] == str(worktree)
+            and adopted['head'] == checkpoint.expected_head
+            and adopted['head'] == checkpoint.observed_remote_oid
+            and not project['agent_recovery']):
+        # R-039 validated the preserved Agent output before the Manager's
+        # fast-forward. Compare later changes to that exact durable result;
+        # never rewrite the Agent audit or absorb subsequent local Git writes.
+        before = GitSnapshot.deserialize(adopted['snapshot'])
+        project = {**dict(project), 'agent_result_snapshot': None}
     if accepted_rebase:
         if role_name not in {'worker', 'reviewer'} or project['agent_recovery']:
             raise AgentScopeError('현재 rebase와 별도 Agent 복구 범위를 분리할 수 없습니다.')
@@ -17385,10 +17403,13 @@ def _reconcile_published_blocked_checkpoint(
                     raise RuntimeError("등록 origin과 fetch/push 대상이 다릅니다.")
     except RuntimeError as error:
         return refuse(f"원격 저장소 소유권을 증명할 수 없습니다: {error}")
-    fetched = git(
-        repo_path, "fetch", "--no-tags", "origin",
-        f"refs/heads/{branch}", check=False,
-    )
+    try:
+        fetched = git(
+            repo_path, "fetch", "--no-tags", "origin",
+            f"refs/heads/{branch}", check=False,
+        )
+    except (OSError, RuntimeError) as error:
+        return retry("원격 checkpoint branch fetch 미완료: " + str(error))
     if fetched.returncode:
         return retry("원격 checkpoint branch fetch 실패: " + fetched.stdout[-2000:])
     fetched_result = git(
@@ -17468,6 +17489,12 @@ def _reconcile_published_blocked_checkpoint(
         blocked, adopted_snapshot, ignored_paths,
     )
     if adopt_only:
+        scope_snapshot = managed_rebase_adoption.selected_baseline(
+            snapshot, adopted_snapshot, branch, str(_canonical_path(worktree)))
+        remote_ref = f'refs/remotes/origin/{branch}'
+        if adopted_snapshot.refs.get(remote_ref) == (observed, ''):
+            scope_snapshot = replace(scope_snapshot, refs={
+                **scope_snapshot.refs, remote_ref: (observed, '')})
         with runtime_state._transaction(connection):
             repository.record_remote_inspection(
                 request, observed, input_identity,
@@ -17486,7 +17513,13 @@ def _reconcile_published_blocked_checkpoint(
                 repo, str(blocked['plan_id']), expected_generation=current.generation,
                 operation=None, expected_head=observed,
                 target_base_oid=current.target_base_oid, observed_remote_oid=observed,
-                snapshot={**(current.snapshot or {}), 'last_adopted_remote_oid': observed},
+                snapshot={**(current.snapshot or {}), 'last_adopted_remote_oid': observed,
+                          'remote_adoption_scope': {
+                              'head': observed, 'branch': branch, 'worktree': str(worktree),
+                              'agent_snapshot': blocked['agent_snapshot'],
+                              'agent_result_snapshot': blocked['agent_result_snapshot'],
+                              'snapshot': scope_snapshot.serialize(),
+                          }},
             )
         return "adopted"
     failure_evidence = "\n".join(
@@ -17788,6 +17821,18 @@ def resume_plan_blocks(
             ):
                 return True
             continue
+        observed = connection.execute(
+            'SELECT registered_origin FROM blocked_remote_observations WHERE repo = ? AND plan_id = ?',
+            (repo, blocked['plan_id'])).fetchone()
+        if (observed is not None and observed['registered_origin']
+                and blocked['blocked_reason'] == BlockReasonCode.REVIEW_RETRY_EXHAUSTED.value
+                and not unmet_execplan_dependencies(connection, repo, str(blocked['plan_id']))
+                and blocked_plan_reconciliation.slot_available(connection, repo, str(blocked['plan_id']))):
+            hydrate_execplan_project(connection, repo, blocked)
+            if _resume_legacy_review_count_block(connection, repo_path, state_dir, repo, blocked):
+                return True
+            with connection:
+                _clear_active_in_current_transaction(connection, repo)
         remote_result = blocked_plan_reconciliation.BlockedPlanReconciler(
             sys.modules[__name__], connection, repo_path, state_dir, repo, base,
             config_path, verify_timeout_seconds,
