@@ -239,3 +239,23 @@ FINAL_RESULT: PASS (6 tests, failures=0, errors=0)
 - 이전 최종 응답의 `failures=0, errors=0` 및 “실패·재실행 이력” 문구가 `parse_worker_result`의 실패 검색에 걸렸으나, 최종 응답 자체에는 대응하는 명령 쌍이 없어 미해결로 판정됐다. 테스트 구현의 추가 실패가 아니라 보고 계약 불일치였다. 검증기를 변경하거나 실패 감사를 삭제하지 않았다.
 - Reviewer Delta Follow-up에 기록된 동일 3-case 명령과 기존 6-case 명령을 다시 실행했다. 각각 PASS (3 tests, 0 failures, 0 errors), PASS (6 tests, 0 failures, 0 errors).
 - 최종 응답에 최초 실패 명령, 최초 결과, 동일 재실행 명령과 최종 성공을 순서대로 포함하고, 그 응답 전문을 현재 `parse_worker_result`로 검증해 수용됨을 확인했다. 전체 검증 및 Git 게시 작업은 실행하지 않았다.
+
+## Resolution Commit and READY Reactivation Follow-up (2026-09-30)
+
+- `interrupted-resolution-commit` (occurrence=1, revision=1): autostash 해결 commit은 일반 commit checkpoint로 전환하지 않고 원래 rebase operation·expected HEAD·target·원격 기대값·stash와 감사를 유지한다. commit 전 audit 저장, Git 효과 후, 결과 저장 후 중단을 각각 주입해 최초 수용 전의 게시 checkpoint도 실제 handler recover를 거쳐 한 번만 commit하고 Worker 재확인으로 돌아옴을 unit 검증했다. 이전 active_sha와 rebase target을 다르게 설정했다.
+- `restored-stage-rejection` (occurrence=2, revision=2): READY 재활성화는 유효한 현재 수용 기록과 checkpoint HEAD·target·원격 및 snapshot을 보존한다. stage 복원으로 generation이 증가한 기록도 현재 identity·scope·index·원격 소유권 검사로 재개한다. 실제 HEAD가 저장 후보와 다르면 거부한다. 소유권 handler를 mock하지 않고 newly_activated=True와 blocked_resume marker를 함께 검증했으며, 변경된 HEAD·원격 거부와 기존 비수용 checkpoint 초기화도 확인했다.
+- 최초 targeted 실행에서 generation에 민감한 완료 직후 reader를 사용해 재활성화 1 case가 실패했다. 저장된 수용 record 자체의 검증과 현재 상태 판정을 사용하도록 수정했다.
+
+```text
+FAILED_COMMAND: python3 -B -m unittest tests.test_execution_handlers.CurrentRebaseAdoptionTests.test_autostash_commit_interruptions_recover_original_rebase_intent tests.test_execution_handlers.CurrentRebaseAdoptionTests.test_new_activation_preserves_adopted_stage_and_revalidates_worker
+최초 결과: FAILED (1 failure).
+RERUN: python3 -B -m unittest tests.test_execution_handlers.CurrentRebaseAdoptionTests.test_autostash_commit_interruptions_recover_original_rebase_intent tests.test_execution_handlers.CurrentRebaseAdoptionTests.test_new_activation_preserves_adopted_stage_and_revalidates_worker
+FINAL_RESULT: PASS (2 tests, 0 failures, 0 errors)
+```
+
+```text
+COMMAND: python3 -B -m unittest tests.test_execution_handlers.CurrentRebaseAdoptionTests.test_new_activation_rejects_changed_adopted_head_or_remote tests.test_execution_handlers.CurrentRebaseAdoptionTests.test_adopted_checkpoint_restored_stage_reaches_worker_revalidation tests.test_execution_handlers.CurrentRebaseAdoptionTests.test_manual_autostash_stage_without_worker_result_is_committed_and_readopted tests.test_execution_handlers.ExecutionHandlerTests.test_new_activation_drops_old_execution_head_checkpoint tests.test_execution_handlers.ExecutionHandlerTests.test_new_activation_keeps_published_resume_lineage
+FINAL_RESULT: PASS (5 tests, 0 failures, 0 errors)
+```
+
+- 총 7개 관련 unit case 통과. 기존 전체 verify 스크립트는 변경 모듈과 테스트를 이미 포함하므로 수정하지 않았다. 전체 suite·integration/E2E·전체 lint/build/type check·scripts/verify 및 commit/push/PR 생성은 실행하지 않았다. AGENTS·PLANS·PRODUCT·ARCHITECTURE·Requirement·archive는 수정하지 않았다. Manager 전체 verify와 Reviewer 재검토 대기.

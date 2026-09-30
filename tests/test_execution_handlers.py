@@ -5543,10 +5543,50 @@ class CurrentRebaseAdoptionTests(TestCase):
                 self.observed = replace(self.observed, remote=self.expected.remote)
 
     def test_adopted_checkpoint_restored_stage_reaches_worker_revalidation(self):
+        self._assert_restored_stage_recovery()
+
+    def test_new_activation_preserves_adopted_stage_and_revalidates_worker(self):
+        self._assert_restored_stage_recovery(newly_activated=True)
+
+    def test_new_activation_rejects_changed_adopted_head_or_remote(self):
+        for changed in ('head', 'remote'):
+            with self.subTest(changed=changed):
+                case = current_rebase_case(self)
+                case._prepare_current_checkpoint_recovery()
+                case.handler._complete_rebase_intent(case.fixture.context())
+                accepted = case.checkpoint.get('repo', 'G-047').snapshot['current_rebase_acceptance']
+                case.handler.newly_activated = True
+                if changed == 'head':
+                    case.observed = replace(case.observed, head='foreign', branch_ref=('foreign', ''),
+                        registration=('HEAD=foreign', 'branch=refs/heads/loop-manager/G-047'))
+                    def git(path, *args, **kwargs):
+                        if args == ('rev-parse', 'HEAD'):
+                            return SimpleNamespace(stdout='foreign', returncode=0)
+                        return case.fixture.observed_git(path, *args, **kwargs)
+                    case.fixture.effects.workspace.git.side_effect = git
+                else:
+                    case.fixture.effects.workspace.remote_branch_oid.return_value = 'foreign'
+                    case.observed = replace(case.observed, remote=replace(case.observed.remote, oid='foreign'))
+                result = case.handler.recover(case.fixture.context())
+                self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+                saved = case.checkpoint.get('repo', 'G-047')
+                self.assertEqual(saved.expected_head, 'owned-head')
+                self.assertEqual(saved.snapshot['current_rebase_acceptance'], accepted)
+                case.fixture.effects.agent.run_agent.assert_not_called()
+
+    def _assert_restored_stage_recovery(self, *, newly_activated=False):
         from managed_rebase_validation import FileChange, IndexEntry
         self._prepare_current_checkpoint_recovery()
         self.handler._complete_rebase_intent(self.fixture.context())
         accepted = self.checkpoint.get('repo', 'G-047').snapshot['current_rebase_acceptance']
+        self.handler.newly_activated = newly_activated
+        if newly_activated:
+            current = self.checkpoint.get('repo', 'G-047')
+            self.checkpoint.record('repo', 'G-047', expected_generation=current.generation,
+                operation=None, expected_head=current.expected_head, target_base_oid='base',
+                observed_remote_oid='remote', snapshot={**current.snapshot, 'blocked_resume': {
+                    'before_head': 'before', 'after_head': 'owned-head',
+                    'target_base_oid': 'base', 'owner_oid': 'remote'}})
         clean = self.observed
         staged = FileChange('app.py', '100644', '100644', 'old', 'new', 'M')
         self.observed = replace(clean, staged=(staged,), index_clean=False)
@@ -5587,17 +5627,38 @@ class CurrentRebaseAdoptionTests(TestCase):
                          self.handler._definition_snapshot.worker_candidate_token('owned-head'))
 
     def test_manual_autostash_stage_without_worker_result_is_committed_and_readopted(self):
+        self._assert_manual_autostash_recovery()
+
+    def test_autostash_commit_interruptions_recover_original_rebase_intent(self):
+        for boundary in ('intent', 'git', 'result'):
+            with self.subTest(boundary=boundary):
+                case = current_rebase_case(self)
+                case._assert_manual_autostash_recovery(interruption=boundary)
+
+    def _assert_manual_autostash_recovery(self, *, interruption=None):
         from managed_rebase_validation import FileChange
         self._prepare_current_checkpoint_recovery()
         saved = self.checkpoint.get('repo', 'G-047')
         self.checkpoint.record('repo', 'G-047', expected_generation=saved.generation,
             operation='rebase', expected_head='before', target_base_oid='base',
             observed_remote_oid='remote', snapshot={'stash_oid': 'stash'})
-        self.state.update_project('repo', worker_result=None)
+        self.state.update_project('repo', worker_result=None, active_sha='old-base')
         self.expected = replace(self.expected, autostash_oid='stash')
         self.observed = replace(self.observed, index_clean=False, staged=(
             FileChange('app.py', '100644', '100644', 'old', 'new', 'M'),))
         calls = []
+        class Interrupted(BaseException):
+            pass
+        armed = [interruption]
+        record = self.checkpoint.record
+        def interrupted_record(*args, **kwargs):
+            saved = record(*args, **kwargs)
+            audit = (saved.snapshot or {}).get('rebase_resolution_commit')
+            boundary = 'result' if audit and 'after_head' in audit else 'intent'
+            if audit and armed[0] == boundary:
+                armed[0] = None
+                raise Interrupted()
+            return saved
         def git(path, *args, **kwargs):
             calls.append(args)
             if args == ('diff', '--cached', '--quiet'):
@@ -5606,12 +5667,26 @@ class CurrentRebaseAdoptionTests(TestCase):
                 self.observed = replace(self.observed, head='resolved-head', staged=(), index_clean=True,
                     branch_ref=('resolved-head', ''), registration=(
                         'HEAD=resolved-head', 'branch=refs/heads/loop-manager/G-047'))
+                if armed[0] == 'git':
+                    armed[0] = None
+                    raise Interrupted()
                 return SimpleNamespace(stdout='', returncode=0)
             if args == ('rev-parse', 'HEAD'):
                 return SimpleNamespace(stdout=self.observed.head, returncode=0)
             return self.fixture.observed_git(path, *args, **kwargs)
         self.fixture.effects.workspace.git.side_effect = git
-        result = self.handler.recover(self.fixture.context())
+        with mock.patch.object(self.checkpoint, 'record', side_effect=interrupted_record):
+            if interruption:
+                with self.assertRaises(Interrupted):
+                    self.handler.recover(self.fixture.context())
+                pending = self.checkpoint.get('repo', 'G-047')
+                self.assertEqual(pending.operation, 'rebase')
+                self.assertEqual(pending.expected_head, 'before')
+                self.assertEqual(pending.target_base_oid, 'base')
+                self.assertEqual(pending.observed_remote_oid, 'remote')
+                self.assertEqual(pending.snapshot['stash_oid'], 'stash')
+                self.assertIsNone(pending.current_rebase_acceptance())
+            result = self.handler.recover(self.fixture.context())
         self.assertIsInstance(result, handlers.ExecutionContext)
         self.assertEqual(result.phase, ExecutionPhase.IMPLEMENTING)
         saved = self.checkpoint.get('repo', 'G-047')

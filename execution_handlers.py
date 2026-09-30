@@ -13,7 +13,7 @@ import rebase_file_evidence
 import manager_git_journal
 import managed_rebase_evidence
 import managed_rebase_adoption
-from managed_rebase_validation import RebaseStatus
+from managed_rebase_validation import RebaseStatus, valid_acceptance
 import notifications
 import recovery_state
 import re
@@ -1475,17 +1475,32 @@ class ExecutionHandlers:
         return result
 
     def _commit_rebase_resolution(self, context, title):
-        """Commit resolved autostash contents, retaining the rebase adoption boundary."""
+        """Keep the rebase intent durable across every resolution commit boundary."""
         checkpoints = self.effects.checkpoint
         pending = checkpoints.get(self.repo, context.plan.plan_id)
-        self._commit_owned(context, title)
-        committed = checkpoints.get(self.repo, context.plan.plan_id)
-        checkpoints.record(
-            self.repo, context.plan.plan_id, expected_generation=committed.generation,
+        if pending.operation != 'rebase':
+            raise manager_git_journal.MutationEvidenceError('resolution lost its rebase intent')
+        git = self.effects.workspace.git
+        audit = {
+            'before_head': git(context.worktree, 'rev-parse', 'HEAD').stdout.strip(),
+            'tree': git(context.worktree, 'write-tree').stdout.strip(),
+            'message': title,
+        }
+        pending = checkpoints.record(
+            self.repo, context.plan.plan_id, expected_generation=pending.generation,
             operation='rebase', expected_head=pending.expected_head,
             target_base_oid=pending.target_base_oid,
             observed_remote_oid=pending.observed_remote_oid,
-            snapshot={**(pending.snapshot or {}), 'after_head': committed.expected_head})
+            snapshot={**(pending.snapshot or {}), 'rebase_resolution_commit': audit})
+        git(context.worktree, 'commit', '-m', title)
+        after = git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
+        checkpoints.record(
+            self.repo, context.plan.plan_id, expected_generation=pending.generation,
+            operation='rebase', expected_head=pending.expected_head,
+            target_base_oid=pending.target_base_oid,
+            observed_remote_oid=pending.observed_remote_oid,
+            snapshot={**(pending.snapshot or {}), 'after_head': after,
+                      'rebase_resolution_commit': {**audit, 'after_head': after}})
 
     def _complete_publication_intent(self, context):
         checkpoint = self.effects.checkpoint
@@ -1526,15 +1541,17 @@ class ExecutionHandlers:
             )
             current = checkpoint.get(self.repo, context.plan.plan_id)
             if self.newly_activated and current.operation is None and current.expected_head:
-                # A previously blocked plan can be requeued after its inputs
-                # change. Its old execution HEAD does not describe this new
-                # activation, whose owned workspace was just prepared.
+                adopted = valid_acceptance((current.snapshot or {}).get('current_rebase_acceptance'))
+                # Preserve an adopted candidate and restored work across activation.
+                # Ordinary stale checkpoints still use the newly prepared workspace.
                 current = checkpoint.record(
                     self.repo, context.plan.plan_id,
                     expected_generation=current.generation, operation=None,
-                    expected_head=None, target_base_oid=None,
-                    observed_remote_oid=None,
+                    expected_head=current.expected_head if adopted else None,
+                    target_base_oid=current.target_base_oid if adopted else None,
+                    observed_remote_oid=current.observed_remote_oid if adopted else None,
                     snapshot={
+                        **(current.snapshot or {} if adopted else {}),
                         'reactivated_from_head': current.expected_head,
                         **({'blocked_resume': current.snapshot['blocked_resume']}
                            if current.snapshot and 'blocked_resume' in current.snapshot
@@ -1631,6 +1648,12 @@ class ExecutionHandlers:
                     RecoveryReason.REMOTE_SNAPSHOT_RACE,
                     'checkpoint catalog revision changed', context=context,
                 )
+            if (self.newly_activated
+                    and valid_acceptance((current.snapshot or {}).get('current_rebase_acceptance'))
+                    and snapshot.local_head != current.expected_head):
+                return self._recover(
+                    RecoveryReason.REMOTE_OID_UNCERTAIN,
+                    'reactivated rebase candidate HEAD differs', context=context)
             if not self._owned_checkpoint_remote(
                 context, row, remote_oid, current, pull_request,
             ):
