@@ -16661,13 +16661,15 @@ def _reconcile_rebase_evidence_block(
             context = handler._context()
             current = handler.effects.checkpoint.get(repo, plan_id)
             row = handler._row()
+            # Published checkpoint ownership can seal a completed rebase journal.
+            # Reject unapproved files/index before any such file-system effect.
+            rebase_block_reconciliation.require_clean_completion(
+                handler._rebase_journal_state(context),
+            )
             if not handler._owned_checkpoint_remote(
                 context, row, remote_oid, current, pull_request,
             ):
                 raise RuntimeError("R-045 rebase: published checkpoint owner differs")
-            rebase_block_reconciliation.require_clean_completion(
-                handler._rebase_journal_state(context),
-            )
             handler._finish_rebase_journal(context, allow_equal=True)
             observed_remote = manager_git_journal.live_remote_branch_oid(git, repo_path, branch)
             observed_pr = pr_for_branch(

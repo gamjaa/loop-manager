@@ -70,8 +70,27 @@ class ExecutionHandlerTests(TestCase):
     def test_legacy_rebase_existing_pr_recovers_after_restart(self):
         self._legacy_rebase_false_block_recovery(plan_block=False, existing_pr=True)
 
+    def test_published_legacy_dirty_rejection_preserves_journal_for_restored_files(self):
+        self._legacy_rebase_false_block_recovery(
+            plan_block=True, rejected='unstaged', published_checkpoint=True,
+        )
+
+    def test_published_legacy_staged_rejection_preserves_journal_for_restored_index(self):
+        self._legacy_rebase_false_block_recovery(
+            plan_block=False, rejected='staged', published_checkpoint=True,
+        )
+
+    def test_legacy_project_recovery_ignores_stale_remote_cache(self):
+        self._legacy_rebase_false_block_recovery(plan_block=False, stale_cache=True)
+
+    def test_published_legacy_recovery_ignores_stale_remote_cache(self):
+        self._legacy_rebase_false_block_recovery(
+            plan_block=False, published_checkpoint=True, stale_cache=True,
+        )
+
     def _legacy_rebase_false_block_recovery(self, *, plan_block, rejected=None,
-                                          existing_pr=False):
+                                          existing_pr=False, published_checkpoint=False,
+                                          stale_cache=False):
         self.journal_start.stop()
         fixture = BlockedCheckpointGitAdapterTest(methodName='runTest')
         fixture.setUp()
@@ -91,7 +110,8 @@ class ExecutionHandlerTests(TestCase):
             git(fixture.worktree, 'add', 'code.py')
             git(fixture.worktree, 'commit', '-m', f'Later change {index}')
         original = git(fixture.worktree, 'rev-parse', 'HEAD')
-        expected_remote = original if existing_pr or rejected == 'remote-changed' else None
+        expected_remote = original if (existing_pr or published_checkpoint
+                                       or rejected == 'remote-changed') else None
         if expected_remote:
             git(fixture.worktree, 'push', 'origin', f'HEAD:refs/heads/{branch}')
         (fixture.repo / 'code.py').write_text('value=base\n')
@@ -184,6 +204,31 @@ class ExecutionHandlerTests(TestCase):
                     "'repository_state_unsafe', 'G-034', ?, 'WORKING')", (repo, reason),
                 )
                 connection.execute("UPDATE projects SET phase = 'PROJECT_BLOCKED'")
+        published_before = None
+        if published_checkpoint:
+            # Legacy published checkpoints may adopt an existing clean commit.
+            # Its durable identity binds that actual commit/tree, with no mocked owner proof.
+            checkpoint_repository = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
+            request = checkpoint_repository.request(
+                repo=repo, plan_id='G-034', reason_code='managed_worktree_conflict',
+                evidence=reason, branch=branch, worktree=str(fixture.worktree),
+                expected_remote_oid=original, rebase_recovery=True,
+                release_fingerprint='fingerprint',
+            ) if not plan_block else checkpoint_repository.get(repo, 'G-034')
+            published_tree = git(fixture.repo, 'rev-parse', f'{original}^{{tree}}')
+            identity = blocked_checkpoint.checkpoint_identity(
+                plan_id='G-034', reason_code=request.reason_code, evidence=request.evidence,
+                parent_oid=original, tree_oid=published_tree, included_paths=(),
+            )
+            connection.execute(
+                "UPDATE blocked_checkpoints SET phase = 'published', result = 'published', "
+                "published_oid = ?, local_oid = ?, remote_oid = ?, accepted_remote_oid = ?, "
+                "commit_identity = ?, tree_oid = ? WHERE repo = ? AND plan_id = 'G-034'",
+                (original, original, original, original, identity, published_tree, repo),
+            )
+            connection.execute('UPDATE exec_plans SET publication_remote_oid = ?', (original,))
+            connection.execute('UPDATE projects SET publication_remote_oid = ?', (original,))
+            published_before = dict(connection.execute('SELECT * FROM blocked_checkpoints').fetchone())
         subject = 'plan:G-034' if plan_block else 'project'
         connection.execute(
             "INSERT INTO notified_block_incidents "
@@ -219,6 +264,11 @@ class ExecutionHandlerTests(TestCase):
                 'SELECT planning_error FROM projects',
             ).fetchone()[0], 'independent error')
             connection.execute('UPDATE projects SET planning_error = NULL')
+            if stale_cache:
+                git(fixture.repo, 'update-ref', f'refs/remotes/origin/{branch}', target)
+                self.assertNotEqual(lm.remote_branch_oid(fixture.repo, branch), expected_remote)
+                self.assertEqual(journal.live_remote_branch_oid(lm.git, fixture.repo, branch),
+                                 expected_remote)
             if rejected:
                 completed = git(fixture.worktree, 'rev-parse', 'HEAD')
                 if rejected in {'unstaged', 'staged'}:
@@ -267,7 +317,16 @@ class ExecutionHandlerTests(TestCase):
                 self.assertEqual(git(fixture.worktree, 'rev-parse', 'HEAD'), completed)
                 if rejected in {'unstaged', 'staged', 'late-file'}:
                     self.assertIn('unapproved change', app.read_text())
-                return
+                if published_checkpoint:
+                    self.assertEqual(dict(connection.execute(
+                        'SELECT * FROM blocked_checkpoints',
+                    ).fetchone()), published_before)
+                    # Restoring the unexpected change must leave the same original
+                    # completion intent usable; a poisoned result would prevent this.
+                    git(fixture.worktree, 'restore', '--source=HEAD', '--staged', '--worktree',
+                        '--', 'code.py')
+                else:
+                    return
             self.assertTrue(resume())
             self.assertFalse(resume())
         row = connection.execute('SELECT * FROM exec_plans').fetchone()
@@ -287,6 +346,15 @@ class ExecutionHandlerTests(TestCase):
         self.assertEqual(failure['detail'], reason)
         self.assertIsNotNone(failure['resolved_at'])
         self.assertIsNone(ExecutionCheckpointRepository(connection).get(repo, 'G-034').operation)
+        if published_checkpoint:
+            self.assertEqual(dict(connection.execute(
+                'SELECT * FROM blocked_checkpoints',
+            ).fetchone()), published_before)
+            self.assertEqual(row['publication_remote_oid'], original)
+            proof = ExecutionCheckpointRepository(connection).get(repo, 'G-034').completed_rebase()
+            self.assertEqual(proof['remote_oid'], original)
+            self.assertEqual(proof['before_head'], original)
+            self.assertEqual(proof['after_head'], git(fixture.worktree, 'rev-parse', 'HEAD'))
         self.assertEqual(handlers.recovery_state.RecoveryRepository(connection).row(
             repo, 'G-034',
         )['pending_action'], 'reconcile')
