@@ -277,7 +277,8 @@ class BlockedPlanRemoteRefreshTests(unittest.TestCase):
                 self.head = remote
                 self.current_snapshot = replace(original, head=remote,
                     index={self.plan()['path']: ('H 100644 blob 0',)},
-                    refs={f'refs/heads/{branch}': (remote, '')},
+                    refs={**self.current_snapshot.refs, f'refs/heads/{branch}': (remote, ''),
+                          f'refs/remotes/origin/{branch}': (remote, '')},
                     worktrees={worktree: (f'HEAD={remote}', f'branch=refs/heads/{branch}')})
             return self.git(path, *args, **kwargs)
         self.ports.git.side_effect = git
@@ -308,6 +309,79 @@ class BlockedPlanRemoteRefreshTests(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
         return original
+
+    def guidance_tracking_updates(self):
+        original = self.published_successor()
+        branch = self.plan()['branch']
+        original = replace(original, refs={**original.refs, 'refs/remotes/origin/main': ('old-base', '')})
+        self.current_snapshot = replace(original, refs={**original.refs,
+            'refs/remotes/origin/main': (self.base, ''),
+            f'refs/remotes/origin/{branch}': (original.head, '')})
+        self.connection.execute(
+            "UPDATE exec_plans SET agent_snapshot = ?, agent_result_snapshot = ?, "
+            "blocked_reason = ?, publication_remote_oid = ? WHERE plan_id = 'G-106'",
+            (original.serialize(), original.serialize(), loop_manager.GUIDANCE_BLOCK_REASON, original.head))
+        self.connection.commit()
+        patch = mock.patch.object(loop_manager.checkpoint_ownership, 'owned_remote_oid',
+                                  return_value=original.head)
+        proof = patch.start()
+        self.addCleanup(patch.stop)
+        return original, proof
+
+    def test_guidance_post_checkpoint_tracking_updates_allow_scope_before_successor_adoption(self):
+        original, proof = self.guidance_tracking_updates()
+        self.coordinator._validate(self.plan())
+        self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
+        proof.assert_called_once()
+        self.assertFalse(proof.call_args.kwargs['require_live'])
+        self.assertEqual(proof.call_args.args[6], original.head)
+        self.ports._reconcile_published_blocked_checkpoint.assert_not_called()
+
+    def test_guidance_tracking_updates_continue_through_successor_scope_and_cause_check(self):
+        original, proof = self.guidance_tracking_updates()
+        for table in ('execplan_blocks', 'blocked_checkpoints'):
+            self.connection.execute(f"UPDATE {table} SET reason_code = ? WHERE plan_id = 'G-106'",
+                                    (loop_manager.GUIDANCE_BLOCK_REASON,))
+        self.connection.commit()
+        proof.side_effect = lambda *args, **kwargs: args[6]
+        with mock.patch.object(self.coordinator, '_publish'):
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        stage = self.connection.execute("SELECT stage FROM blocked_plan_reconciliations WHERE plan_id = 'G-106'").fetchone()[0]
+        self.assertEqual(stage, 'complete', self.plan()['last_error'])
+        self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
+        self.assertEqual(self.plan()['blocked_reason'], loop_manager.GUIDANCE_BLOCK_REASON)
+        self.ports._evaluate_remote_checkpoint_cause.assert_not_called()
+        # The accepted rebase path still compares the original Agent output,
+        # then validates post-Agent tracking refs against the same proofs.
+        branch, worktree = self.plan()['branch'], self.plan()['worktree']
+        self.current_snapshot = replace(self.current_snapshot, head='rebased',
+            refs={**self.current_snapshot.refs, f'refs/heads/{branch}': ('rebased', '')},
+            worktrees={worktree: ('HEAD=rebased', f'branch=refs/heads/{branch}')})
+        with mock.patch.object(loop_manager, 'requirement_archive_candidates', return_value=()):
+            self.coordinator._validate(self.plan(), rebase=True)
+        self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
+
+    def test_guidance_tracking_allowance_does_not_excuse_actual_agent_ref_changes(self):
+        original, _ = self.guidance_tracking_updates()
+        for ref in ('refs/remotes/origin/main', f"refs/remotes/origin/{self.plan()['branch']}"):
+            with self.subTest(ref=ref):
+                result = replace(original, refs={**original.refs, ref: self.current_snapshot.refs[ref]})
+                self.connection.execute("UPDATE exec_plans SET agent_result_snapshot = ? WHERE plan_id = 'G-106'",
+                                        (result.serialize(),))
+                with self.assertRaises(loop_manager.AgentScopeError):
+                    self.coordinator._validate(self.plan())
+
+    def test_guidance_tracking_requires_exact_live_base_and_durable_branch_identity(self):
+        original, proof = self.guidance_tracking_updates()
+        current = self.current_snapshot
+        self.current_snapshot = replace(current, refs={**current.refs, 'refs/remotes/origin/main': ('unproven', '')})
+        with self.assertRaises(loop_manager.AgentScopeError):
+            self.coordinator._validate(self.plan())
+        self.current_snapshot = current
+        proof.return_value = None
+        with self.assertRaises(loop_manager.AgentScopeError):
+            self.coordinator._validate(self.plan())
+        self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
 
     def test_successor_adoption_preserves_agent_audit_and_validates_new_baseline(self):
         original = self.published_successor()

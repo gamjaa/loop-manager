@@ -13881,6 +13881,11 @@ def validate_blocked_agent_scope(
         # never rewrite the Agent audit or absorb subsequent local Git writes.
         before = GitSnapshot.deserialize(adopted['snapshot'])
         project = {**dict(project), 'agent_result_snapshot': None}
+    scope_result = (GitSnapshot.deserialize(str(project['agent_result_snapshot']))
+                    if project['agent_result_snapshot'] else None)
+    observed_refs = blocked_plan_reconciliation.validated_scope_refs(
+        sys.modules[__name__], connection, repo_path, repo, base, plan_id,
+        before, scope_result, current)
     if accepted_rebase:
         if role_name not in {'worker', 'reviewer'} or project['agent_recovery']:
             raise AgentScopeError('현재 rebase와 별도 Agent 복구 범위를 분리할 수 없습니다.')
@@ -13920,12 +13925,12 @@ def validate_blocked_agent_scope(
         validate_agent_scope(
             role_name, worktree, normalized, current,
             allowed_ref_changes=_proven_manager_base_refs(
-                connection, repo_path, repo, plan_id, before, current) | published_refs,
+                connection, repo_path, repo, plan_id, before, current) | published_refs | observed_refs,
             allowed_worktree_changes=_proven_merged_cleanup_paths(connection, repo, before, current),
             **scope_options)
         return
     scope_before = before
-    allowed_ref_changes: frozenset[str] = frozenset()
+    allowed_ref_changes: frozenset[str] = observed_refs
     allowed_worktree_changes: frozenset[str] = frozenset()
     allowed_worktree_changes |= _proven_merged_cleanup_paths(
         connection, repo, before, current,

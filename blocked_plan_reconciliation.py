@@ -66,6 +66,65 @@ def slot_available(connection, repo, plan_id) -> bool:
                 and cycle.publication_stage is None and not publication)
 
 
+def validated_scope_refs(ports, connection, repo_path, repo, base, plan_id,
+                         before, result, current) -> frozenset[str]:
+    """Classify post-Agent tracking updates, never approve a remote adoption.
+
+    A published tracking OID remains Manager-owned when origin has a newer
+    successor. Base tracking must equal the freshly checked observed base.
+    R-039 still checks that successor before any worktree change or release.
+    """
+    if connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'blocked_remote_observations'"
+    ).fetchone() is None:
+        return frozenset()
+    row = connection.execute(
+        'SELECT * FROM blocked_remote_observations WHERE repo = ? AND plan_id = ?',
+        (repo, plan_id)).fetchone()
+    if row is None or not row['registered_origin']:
+        return frozenset()
+    plan = connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
+                              (repo, plan_id)).fetchone()
+    project = connection.execute('SELECT origin, base_branch FROM projects WHERE repo = ?',
+                                 (repo,)).fetchone()
+    if (plan is None or plan['status'] != 'PLAN_BLOCKED' or plan['workspace_owned'] != 1
+            or not plan['branch'] or not plan['worktree'] or project is None
+            or project['origin'] != row['registered_origin'] or project['base_branch'] != base
+            or row['base_ref'] != f'refs/heads/{base}'
+            or row['branch_ref'] != f"refs/heads/{plan['branch']}"):
+        return frozenset()
+    base_ref, branch_ref = f'refs/remotes/origin/{base}', f"refs/remotes/origin/{plan['branch']}"
+    blocked = result if result is not None else before
+    candidates = {ref for ref in (base_ref, branch_ref)
+                  if before.refs.get(ref) == blocked.refs.get(ref)
+                  and before.refs.get(ref) != current.refs.get(ref)}
+    if not candidates:
+        return frozenset()
+    allowed = set()
+    try:
+        origin = ports.git(repo_path, 'remote', 'get-url', 'origin').stdout.strip()
+        if origin != row['origin_url'] or ports.github_repository(origin) != project['origin']:
+            return frozenset()
+        live_base, live_branch = observations.observe_refs(repo_path, origin, (row['base_ref'], row['branch_ref']))
+        if (base_ref in candidates and row['base_result'] == 'present'
+                and live_base.result == 'present' and live_base.oid == row['base_oid']
+                and current.refs.get(base_ref) == (live_base.oid, '')):
+            allowed.add(base_ref)
+        tracked = current.refs.get(branch_ref)
+        if (branch_ref in candidates and live_branch.result == 'present'
+                and tracked is not None and not tracked[1]
+                and current.branch == plan['branch']
+                and current.refs.get(f"refs/heads/{plan['branch']}") == (current.head, '')
+                and ports.checkpoint_ownership.owned_remote_oid(
+                    connection, repo_path, repo, plan_id, plan['branch'], Path(plan['worktree']),
+                    tracked[0], ports.git, before_head=current.head,
+                    recorded_oid=plan['publication_remote_oid'], require_live=False) == tracked[0]):
+            allowed.add(branch_ref)
+    except (OSError, RuntimeError, ValueError):
+        return frozenset()
+    return frozenset(allowed)
+
+
 class BlockedPlanReconciler:
     def __init__(self, ports, connection, repo_path, state_dir, repo, base,
                  config_path=None, timeout_seconds=None):
