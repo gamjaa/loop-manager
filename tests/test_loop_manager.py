@@ -8155,6 +8155,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "managed_rebase_observation.py",
                 "managed_rebase_validation.py",
                 "managed_rebase_adoption.py",
+                "managed_rebase_publication.py",
                 "managed_rebase_runtime.py",
                 "rebase_block_reconciliation.py",
                 "rebase_file_evidence.py",

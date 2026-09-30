@@ -65,13 +65,15 @@ class ManagedRebaseService:
 def needs_agent_comparison(checkpoint, original, current):
     """Only absorb a rebase across a saved scope, not a fresh Agent's work."""
     accepted = (checkpoint.snapshot or {}).get('current_rebase_acceptance')
-    return bool(checkpoint.operation == 'rebase' or (
+    intent = checkpoint.rebase_publication_intent() if checkpoint.operation == 'rebase_publish' else None
+    return bool(checkpoint.operation == 'rebase'
+        or (intent is not None and intent['head'] == current.head) or (
         checkpoint.operation is None and isinstance(accepted, dict)
         and accepted.get('head') == current.head
         and original.head != current.head))
 
 
-def selected_baseline(snapshot, current, branch, worktree):
+def selected_baseline(snapshot, current, branch, worktree, *, publication=None):
     """Replace only accepted selected state, keeping other refs/config intact.
 
     Callers validate actual Agent output first and recheck current ownership.
@@ -80,6 +82,25 @@ def selected_baseline(snapshot, current, branch, worktree):
     refs, worktrees = dict(snapshot.refs), dict(snapshot.worktrees)
     ref = f'refs/heads/{branch}'
     refs[ref] = current.refs[ref]
+    if publication is not None:
+        intent = publication.rebase_publication_intent()
+        result = (publication.snapshot or {}).get('rebase_publication_result') or {}
+        pending = publication.operation == 'rebase_publish'
+        confirmed = (intent is not None and result.get('intent_id') == intent['id']
+                     and result.get('head') == intent['head']
+                     and publication.observed_remote_oid == intent['head'])
+        if (intent is not None and (pending or confirmed)
+                and (intent['branch'], intent['worktree']) == (branch, worktree)):
+            # A pending push may have changed its tracking ref before SQLite
+            # completion. The caller rechecks the exact live lease and current
+            # ownership; unrelated shared refs retain the original baseline.
+            remote_ref = f'refs/remotes/origin/{branch}'
+            allowed = {(intent['head'], '')}
+            if pending:
+                allowed.add((intent['remote_before'], ''))
+            if current.refs.get(remote_ref) not in allowed:
+                raise MutationEvidenceError('published comparison remote ref changed')
+            refs[remote_ref] = current.refs[remote_ref]
     worktrees[worktree] = current.worktrees[worktree]
     return replace(snapshot, head=current.head, branch=current.branch,
                    index=current.index, dirty=current.dirty,

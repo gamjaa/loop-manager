@@ -89,6 +89,7 @@ import runtime_state
 import recovery_state
 import recovery_runtime
 import execution_handlers
+import managed_rebase_publication
 import execution_revision
 import execution_checkpoint_state
 import checkpoint_ownership
@@ -9510,11 +9511,18 @@ def _complete_direct_rebase_checkpoint(
     saved = current.snapshot or {}
     legacy_completed = (current.operation is None and not saved.get('current_rebase_acceptance')
                         and (saved.get('completed_rebase') or saved.get('rebase_completion')))
-    if current.operation != 'rebase' and not legacy_completed:
+    publication_pending = (current.operation == 'rebase_publish'
+                           or current.operation is None
+                           and managed_rebase_validation.valid_acceptance(saved.get('current_rebase_acceptance')))
+    if current.operation != 'rebase' and not legacy_completed and not publication_pending:
         return
     state_dir = _owned_rebase_state_dir(repo, plan_id, worktree)
     if state_dir is None or current.target_base_oid != target_base_oid:
         raise manager_git_journal.MutationEvidenceError('current rebase target or workspace missing')
+    if publication_pending:
+        _publish_direct_rebase_checkpoint(
+            connection, repo_path, state_dir, repo, plan_id, worktree, branch)
+        return
     if preserved_observation is not None:
         live = _owned_rebase_journal_state(worktree, branch)
         if live != preserved_observation:
@@ -9556,11 +9564,42 @@ def _complete_direct_rebase_checkpoint(
                                        'SELECT phase FROM projects WHERE repo = ?', (repo,)
                                    ).fetchone()[0]},
                                    expected_status='PLAN_BLOCKED', enqueue=False)
-        return
-    if projected.plan_id != plan_id:
-        raise manager_git_journal.MutationEvidenceError('current rebase execution is not selected')
-    from execution_state import ExecutionStatePort
-    service.adopt(ExecutionStatePort(connection, runtime, repo), checkpoint)
+    else:
+        if projected.plan_id != plan_id:
+            raise manager_git_journal.MutationEvidenceError('current rebase execution is not selected')
+        service.adopt(_ExecutionStatePort(connection, runtime, repo), checkpoint)
+    # Preserve the clean-index publication boundary before a blocked release
+    # restores its original staging for the next Worker turn.
+    _publish_direct_rebase_checkpoint(
+        connection, repo_path, state_dir, repo, plan_id, worktree, branch)
+
+
+def _publish_direct_rebase_checkpoint(connection, repo_path, state_dir, repo,
+                                      plan_id, worktree, branch):
+    from execution_state import DirectRebasePublicationStatePort
+    checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
+    state = DirectRebasePublicationStatePort(
+        connection, runtime_state.RuntimeStateRepository(connection), repo, plan_id)
+    owner = connection.execute(
+        "SELECT accepted_remote_oid FROM blocked_checkpoints WHERE repo = ? AND plan_id = ? "
+        "AND phase = 'published'", (repo, plan_id)).fetchone()
+
+    def owns_remote(oid, selected):
+        if owner is None:
+            return True
+        original = owner['accepted_remote_oid']
+        if not original:
+            return False
+        return checkpoint_ownership.owned_remote_oid(
+            connection, repo_path, repo, plan_id, branch, worktree, original, git,
+            recorded_oid=original, require_live=oid == original) == original
+
+    managed_rebase_publication.publish_checkpoint(
+        state=state, checkpoints=checkpoints, repo=repo, plan_id=plan_id,
+        repo_path=repo_path, worktree=worktree, branch=branch,
+        service=lambda **options: _current_rebase_service(
+            connection, repo_path, state_dir, repo, plan_id, worktree, branch, **options),
+        owns_remote=owns_remote, git=git, lookup_pr=pr_for_branch)
 
 
 def validate_managed_worktree(
@@ -10880,7 +10919,7 @@ def begin_agent_scope(
             _current_rebase_service(connection, Path(repo), state_dir, repo,
                                     plan_id, worktree, row['branch']).require_owned()
             effective = managed_rebase_adoption.selected_baseline(
-                stored, current, row['branch'], str(worktree.resolve()))
+                stored, current, row['branch'], str(worktree.resolve()), publication=checkpoint)
             managed_rebase_adoption.remember_agent_baseline(
                 execution_checkpoint_state.ExecutionCheckpointRepository(connection),
                 repo, plan_id, stored, effective, role_name)
@@ -13526,7 +13565,8 @@ def validate_persisted_agent_scope(
                 external_worktree=repo_path, base_branch=str(project['base_branch']))
         def accepted_baseline(value):
             return managed_rebase_adoption.selected_baseline(
-                value, current, project['branch'], str(saved_worktree.resolve()))
+                value, current, project['branch'], str(saved_worktree.resolve()),
+                publication=rebase_checkpoint)
         rebase_scope_normalized = True
         before = accepted_baseline(before)
         if result is not None:
@@ -14795,6 +14835,12 @@ def _record_blocked_resume_head(
     checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
     current = checkpoint.get(repo, plan_id)
     active_rebase = current.operation == 'rebase'
+    intent = current.rebase_publication_intent()
+    result = (current.snapshot or {}).get('rebase_publication_result') or {}
+    published_oid = (intent['head'] if intent is not None
+                     and result.get('intent_id') == intent['id']
+                     and result.get('head') == after_head == intent['head']
+                     else owner_oid)
     marker = {
         'owner_oid': owner_oid, 'before_head': before_head,
         'target_base_oid': target_base_oid, 'after_head': after_head,
@@ -14805,7 +14851,8 @@ def _record_blocked_resume_head(
         repo, plan_id, expected_generation=current.generation,
         operation='rebase' if active_rebase else None,
         expected_head=current.expected_head if active_rebase else after_head or before_head,
-        target_base_oid=target_base_oid, observed_remote_oid=owner_oid,
+        target_base_oid=target_base_oid,
+        observed_remote_oid=published_oid,
         snapshot={**(current.snapshot or {}), 'blocked_resume': marker},
     )
 
@@ -14879,26 +14926,53 @@ def _resume_interrupted_blocked_rebase(
         # A later block may publish a new checkpoint while retaining the old
         # execution snapshot. It must start a fresh release proof.
         return None
+    intent = checkpoint.rebase_publication_intent()
+    if intent is not None:
+        try:
+            # Finish the saved lease before restoring staging or observing a
+            # later base. A completed publication is an idempotent no-op.
+            _complete_direct_rebase_checkpoint(
+                connection, repo, str(plan['plan_id']), worktree,
+                checkpoint.target_base_oid, repo_path=repo_path, branch=branch,
+                agent_session_id=plan['worker_session_id'])
+        except (RuntimeError, OSError, ValueError) as error:
+            _update_blocked_error(connection, repo, str(plan['plan_id']),
+                                  f'중단된 차단 해제 rebase 게시를 완료할 수 없습니다: {error}')
+            return False
+        checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
+            repo, str(plan['plan_id']))
+        plan = connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
+                                  (repo, plan['plan_id'])).fetchone()
     current_head = git(worktree, 'rev-parse', 'HEAD').stdout.strip()
     before_head = str(marker.get('before_head') or '')
     after_head = str(marker.get('after_head') or '')
     if not after_head and current_head == before_head:
         return None
     try:
-        target_base = git(repo_path, 'rev-parse',
-                          f'refs/remotes/origin/{base}').stdout.strip()
+        # Finish the saved release against its own target. A newer base is
+        # applied by the normal lifecycle after this checkpoint is requeued.
+        target_base = checkpoint.target_base_oid
         snapshot = capture_git_snapshot(worktree)
         remote_oid = remote_branch_oid(repo_path, branch)
+        adopted_oid = (checkpoint.snapshot or {}).get('last_adopted_remote_oid')
+        original_oid = published['accepted_remote_oid']
+        published_result = (checkpoint.snapshot or {}).get('rebase_publication_result') or {}
+        confirmed = (intent is not None and published_result.get('intent_id') == intent['id']
+                     and published_result.get('head') == adopted_oid == remote_oid
+                     and plan['publication_remote_oid'] == adopted_oid)
         owned_oid = checkpoint_ownership.owned_remote_oid(
             connection, repo_path, repo, str(plan['plan_id']), branch,
-            worktree, remote_oid, git, before_head=before_head,
-            recorded_oid=str(plan['publication_remote_oid'] or '') or None,
+            worktree, original_oid if confirmed else remote_oid, git,
+            before_head=None if confirmed else before_head,
+            recorded_oid=original_oid if confirmed else str(plan['publication_remote_oid'] or '') or None,
+            require_live=not confirmed,
         ) if not plan['pr_url'] else None
         safe = (
             owned_oid is not None
             and marker.get('owner_oid') == owned_oid
+            and bool(target_base)
             and marker.get('target_base_oid') == target_base
-            and checkpoint.observed_remote_oid == owned_oid
+            and checkpoint.observed_remote_oid == (adopted_oid if confirmed else owned_oid)
             and snapshot.head == current_head and snapshot.branch == branch
             and not snapshot.operations
             and (not after_head or after_head == current_head)
@@ -14919,14 +14993,14 @@ def _resume_interrupted_blocked_rebase(
                     observed, decision = _current_rebase_service(
                         connection, repo_path, state_dir, repo, str(plan['plan_id']),
                         worktree, branch, target=target_base,
-                    ).observe()
-                    restored_stage = (decision.reason == 'unresolved_operation_or_index'
+                    ).observe(checkpoint=checkpoint)
+                    restored_stage = (decision.reason == 'adopted_checkpoint_work_pending'
                                       and observed.metadata is None and not observed.operations
                                       and observed.index_clean is False and bool(observed.staged)
                                       and not any(entry.stage for entry in observed.index))
                     safe = (accepted['head'] == current_head == checkpoint.expected_head
                             and accepted['target_base_oid'] == target_base
-                            and accepted['remote']['oid'] == owned_oid
+                            and accepted['remote']['oid'] == (intent['remote_before'] if confirmed else owned_oid)
                             and (decision.status.value == 'complete' or restored_stage))
                 else:
                     _finish_owned_direct_rebase(
@@ -14971,7 +15045,9 @@ def _resume_interrupted_blocked_rebase(
         )
     clear_agent_scope(connection, repo)
     _requeue_blocked_execplan(
-        connection, repo, str(plan['plan_id']), publication_remote_oid=owned_oid,
+        connection, repo, str(plan['plan_id']),
+        publication_remote_oid=runtime_state.RuntimeStateRepository(connection).get(
+            repo, str(plan['plan_id'])).publication_remote_oid or owned_oid,
     )
     return True
 
@@ -15240,14 +15316,19 @@ def resume_blocked_execplan_if_inputs_changed(
         # Restored work remains unverified and belongs to the next Worker turn.
         preserved_observation = _owned_rebase_journal_state(worktree, branch)
         if base_ancestry.returncode == 1:
-            _complete_direct_rebase_checkpoint(
-                connection, repo, str(plan['plan_id']), worktree,
-                target_base_oid, repo_path=repo_path, branch=branch,
-                agent_session_id=plan['worker_session_id'],
-                preserved_worktree=True,
-                preserved_marker=pending.snapshot['blocked_resume'],
-                preserved_observation=preserved_observation,
-            )
+            try:
+                _complete_direct_rebase_checkpoint(
+                    connection, repo, str(plan['plan_id']), worktree,
+                    target_base_oid, repo_path=repo_path, branch=branch,
+                    agent_session_id=plan['worker_session_id'],
+                    preserved_worktree=True,
+                    preserved_marker=pending.snapshot['blocked_resume'],
+                    preserved_observation=preserved_observation,
+                )
+            except recovery_runtime.RecoveryFailure as error:
+                _update_blocked_error(connection, repo, str(plan['plan_id']),
+                                      f'차단 해제 rebase 게시를 완료할 수 없습니다: {error}')
+                return False
     elif base_ancestry.returncode == 1:
         _complete_direct_rebase_checkpoint(
             connection, repo, str(plan['plan_id']), worktree, target_base_oid,
@@ -15276,7 +15357,8 @@ def resume_blocked_execplan_if_inputs_changed(
 
     clear_agent_scope(connection, repo)
     _requeue_blocked_execplan(connection, repo, str(plan["plan_id"]),
-                              publication_remote_oid=owned_oid)
+                              publication_remote_oid=runtime_state.RuntimeStateRepository(connection).get(
+                                  repo, str(plan['plan_id'])).publication_remote_oid or owned_oid)
     return True
 
 
@@ -17686,6 +17768,17 @@ def resume_plan_blocks(
                 return True
             continue
         if blocked["blocked_reason"] == PR_CLOSED_BLOCK_REASON:
+            continue
+        # A push may have succeeded before its adopted OID reached SQLite.
+        # Reconcile the saved release before comparing the old checkpoint ref
+        # with the live remote (which may already contain the rebased HEAD).
+        interrupted = _resume_interrupted_blocked_rebase(
+            connection, repo_path, repo, base, blocked,
+            Path(str(blocked["worktree"] or "")), str(blocked["branch"] or ""),
+        )
+        if interrupted is not None:
+            if interrupted:
+                return True
             continue
         checkpoint_row = connection.execute(
             "SELECT * FROM blocked_checkpoints "

@@ -262,3 +262,157 @@ class CheckpointRepositoryTests(unittest.TestCase):
                 expected_catalog=(expected.catalog_generation,
                                   expected.current_revision_sha),
             )
+
+
+class RebasePublicationRepositoryTests(unittest.TestCase):
+    def setUp(self):
+        from execution_state import ExecutionStatePort
+        self.connection = test_runtime_state.RuntimeStateRepositoryTest()._connection()
+        self.addCleanup(self.connection.close)
+        self.runtime = runtime_state.RuntimeStateRepository(self.connection)
+        self.runtime.activate('repo', 'G-047', activation_sha='base',
+                              branch='loop/G-047', worktree='/owned')
+        self.state = ExecutionStatePort(self.connection, self.runtime, 'repo')
+        self.state.update_project('repo', publication_remote_oid='remote',
+                                  last_error='preserved error', verify_result='unrelated audit')
+        self.checkpoints = ExecutionCheckpointRepository(self.connection)
+        self.checkpoints.record('repo', 'G-047', expected_generation=0,
+            operation='rebase', expected_head='before', target_base_oid='base',
+            observed_remote_oid='remote', snapshot={'failure': 'preserved failure'})
+        self.expected = expectation(repo='repo', plan_id='G-047',
+            plan_path='docs/plans/[G-047] Runtime.md', branch='loop/G-047')
+        from dataclasses import replace
+        self.expected = replace(self.expected, remote=replace(self.expected.remote, branch='loop/G-047'))
+        self.acceptance = decision_for(self.expected, observation(self.expected)).acceptance
+        self.accepted = self.checkpoints.accept_current_rebase('repo', 'G-047', acceptance=self.acceptance)
+
+    def begin(self):
+        return self.checkpoints.begin_rebase_publication('repo', 'G-047',
+            expected_generation=self.accepted.generation,
+            acceptance=self.acceptance, remote_before='remote')
+
+    def test_unprojected_blocked_publication_preserves_block_and_execution_slot(self):
+        from execution_state import DirectRebasePublicationStatePort
+        self.runtime.transition_and_clear('repo', 'G-047', plan_values={
+            'status': 'PLAN_BLOCKED', 'blocked_reason': 'verify_retry_exhausted'}, enqueue=False)
+        state = DirectRebasePublicationStatePort(self.connection, self.runtime, 'repo', 'G-047')
+        before = state.expected
+        project = dict(self.connection.execute("SELECT * FROM projects WHERE repo = 'repo'").fetchone())
+        pending = self.begin()
+        acceptance = self.after_push()
+        def finish():
+            state.complete_rebase_publication(self.checkpoints,
+                intent=pending.snapshot['rebase_publication_intent'], acceptance=acceptance,
+                reobserve=lambda: ('after', acceptance))
+        finish()
+        from dataclasses import replace
+        self.assertEqual(self.runtime.get('repo', 'G-047'), replace(before, publication_remote_oid='after'))
+        self.assertEqual(dict(self.connection.execute("SELECT * FROM projects WHERE repo = 'repo'").fetchone()), project)
+        completed = self.checkpoints.get('repo', 'G-047')
+        finish()
+        self.assertEqual(self.checkpoints.get('repo', 'G-047'), completed)
+        self.assertIsNone(self.runtime.projected('repo'))
+
+    def test_unprojected_publication_rejects_changed_plan_and_rolls_back_storage_failure(self):
+        from execution_state import DirectRebasePublicationStatePort
+        self.runtime.transition_and_clear('repo', 'G-047', plan_values={'status': 'PLAN_BLOCKED'}, enqueue=False)
+        pending = self.begin()
+        acceptance = self.after_push()
+        def fail(stage):
+            if stage == 'after_execplan_update':
+                raise RuntimeError('storage interrupted')
+        state = DirectRebasePublicationStatePort(self.connection,
+            runtime_state.RuntimeStateRepository(self.connection, fault_hook=fail), 'repo', 'G-047')
+        before = state.expected
+        with self.assertRaisesRegex(RuntimeError, 'storage interrupted'):
+            state.complete_rebase_publication(self.checkpoints,
+                intent=pending.snapshot['rebase_publication_intent'], acceptance=acceptance,
+                reobserve=lambda: ('after', acceptance))
+        self.assertEqual(self.checkpoints.get('repo', 'G-047'), pending)
+        self.assertEqual(self.runtime.get('repo', 'G-047'), before)
+        self.assertEqual(state.expected, before)
+        self.runtime.update_plan('repo', 'G-047', plan_values={'branch': 'other-owner'}, enqueue=False)
+        with self.assertRaises(runtime_state.RuntimeStateError):
+            state.check()
+        self.assertEqual(self.checkpoints.get('repo', 'G-047'), pending)
+
+    def after_push(self):
+        from dataclasses import replace
+        expected = replace(self.expected, generation=self.checkpoints.get('repo', 'G-047').generation,
+                           remote=replace(self.expected.remote, oid='after'))
+        return decision_for(expected, observation(expected)).acceptance
+
+    def test_publication_intent_rejects_stale_generation_head_or_lease(self):
+        for changes in ({'expected_generation': 0}, {'remote_before': 'other'},
+                        {'acceptance': {**self.acceptance, 'head': 'forged'}}):
+            with self.subTest(changes=changes):
+                arguments = dict(expected_generation=self.accepted.generation,
+                                 acceptance=self.acceptance, remote_before='remote')
+                arguments.update(changes)
+                with self.assertRaises(CheckpointRace):
+                    self.checkpoints.begin_rebase_publication('repo', 'G-047', **arguments)
+                self.assertEqual(self.checkpoints.get('repo', 'G-047'), self.accepted)
+
+    def test_completion_is_idempotent_preserves_phase_failure_and_validation(self):
+        pending = self.begin()
+        intent = pending.snapshot['rebase_publication_intent']
+        acceptance = self.after_push()
+        before = dict(self.state.row())
+        def finish():
+            self.state.complete_rebase_publication(self.checkpoints, intent=intent,
+                acceptance=acceptance, reobserve=lambda: ('after', acceptance))
+        finish()
+        completed = self.checkpoints.get('repo', 'G-047')
+        projected = self.runtime.projected('repo')
+        self.assertIsNone(completed.operation)
+        self.assertEqual(completed.snapshot['failure'], 'preserved failure')
+        for key in ('phase', 'last_error', 'verify_result', 'review_result', 'worker_result'):
+            self.assertEqual(self.state.row()[key], before[key])
+        self.assertEqual(self.state.row()['publication_remote_oid'], 'after')
+        finish()
+        self.assertEqual(self.checkpoints.get('repo', 'G-047'), completed)
+        self.assertEqual(self.runtime.projected('repo'), projected)
+
+    def test_projection_failure_rolls_back_completion_and_keeps_retryable_intent(self):
+        from execution_state import ExecutionStatePort
+        pending = self.begin()
+        intent = pending.snapshot['rebase_publication_intent']
+        acceptance = self.after_push()
+        def fail(stage):
+            if stage == 'after_execplan_update':
+                raise RuntimeError('projection interrupted')
+        state = ExecutionStatePort(self.connection,
+            runtime_state.RuntimeStateRepository(self.connection, fault_hook=fail), 'repo')
+        before = state.expected
+        with self.assertRaisesRegex(RuntimeError, 'projection interrupted'):
+            state.complete_rebase_publication(self.checkpoints, intent=intent,
+                acceptance=acceptance, reobserve=lambda: ('after', acceptance))
+        self.assertEqual(self.checkpoints.get('repo', 'G-047'), pending)
+        self.assertEqual(self.runtime.projected('repo'), before)
+        self.assertEqual(state.expected, before)
+        self.state.complete_rebase_publication(self.checkpoints, intent=intent,
+            acceptance=acceptance, reobserve=lambda: ('after', acceptance))
+        self.assertEqual(self.state.row()['publication_remote_oid'], 'after')
+
+    def test_changed_confirmation_never_advances_runtime_lease(self):
+        pending = self.begin()
+        acceptance = self.after_push()
+        with self.assertRaises(runtime_state.RuntimeStateError):
+            self.state.complete_rebase_publication(self.checkpoints,
+                intent=pending.snapshot['rebase_publication_intent'], acceptance=acceptance,
+                reobserve=lambda: ('competitor', acceptance))
+        self.assertEqual(self.checkpoints.get('repo', 'G-047'), pending)
+        self.assertEqual(self.state.row()['publication_remote_oid'], 'remote')
+
+    def test_pending_publication_cannot_be_replaced_by_another_rebase_or_lease(self):
+        pending = self.begin()
+        for changed in ({'operation': 'rebase'}, {'observed_remote_oid': 'competitor'},
+                        {'expected_head': 'other-head'}):
+            with self.subTest(changed=changed):
+                values = dict(operation='rebase_publish', expected_head=pending.expected_head,
+                              target_base_oid=pending.target_base_oid,
+                              observed_remote_oid=pending.observed_remote_oid, snapshot=pending.snapshot)
+                values.update(changed)
+                with self.assertRaises(CheckpointRace):
+                    self.checkpoints.record('repo', 'G-047', expected_generation=pending.generation, **values)
+                self.assertEqual(self.checkpoints.get('repo', 'G-047'), pending)

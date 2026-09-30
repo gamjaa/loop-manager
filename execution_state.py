@@ -133,6 +133,34 @@ class ExecutionStatePort:
                 worker_session=expected.worker_session_id,
             )
 
+    def complete_rebase_publication(self, checkpoints, *, intent, acceptance, reobserve):
+        """Atomically advance the lease without approving or unblocking a candidate."""
+        if checkpoints.connection is not self.connection:
+            raise runtime_state.RuntimeStateError('intermediate publication database differs')
+        with runtime_state._transaction(self.connection):
+            expected = self.check()
+            if (expected is None or expected.repo != intent['repo']
+                    or expected.plan_id != intent['plan_id']
+                    or expected.branch != intent['branch'] or expected.worktree != intent['worktree']
+                    or expected.workspace_owned != 1 or expected.pr_url
+                    or expected.publication_remote_oid not in (None, intent['remote_before'], intent['head'])):
+                raise runtime_state.RuntimeStateError('intermediate publication owner changed')
+            oid, checked = reobserve()
+            if oid != intent['head'] or checked != acceptance:
+                raise runtime_state.RuntimeStateError('intermediate publication observation changed')
+            before = checkpoints.get(self.repo, self.plan_id)
+            completed = checkpoints.finish_rebase_publication(self.repo, self.plan_id,
+                                                             intent=intent, acceptance=acceptance)
+            if completed == before and expected.publication_remote_oid == intent['head']:
+                return
+            updated = self._record_rebase_publication(expected, intent['head'])
+        self.expected = updated
+
+    def _record_rebase_publication(self, expected, head):
+        return self.repository.transition_from_snapshot(
+            expected, plan_values={'publication_remote_oid': head},
+            project_values={'publication_remote_oid': head})
+
     def open_pull_request(self, repo, **values):
         if repo != self.repo:
             raise runtime_state.RuntimeStateError("execution repository identity 불일치")
@@ -174,3 +202,30 @@ class ExecutionStatePort:
             return result
 
         return invoke
+
+
+class DirectRebasePublicationStatePort(ExecutionStatePort):
+    """Publish a selected blocked plan without claiming the execution slot."""
+
+    def __init__(self, connection, repository, repo, plan_id):
+        self.connection, self.repository, self.repo = connection, repository, repo
+        self.plan_id = plan_id
+        self.expected = repository.get(repo, plan_id)
+        projection = repository.projected(repo)
+        if (projection is not None and projection != self.expected
+                or projection is None and self.expected.status != 'PLAN_BLOCKED'):
+            raise runtime_state.RuntimeStateError('direct publication execution is not selected')
+        self.projected = projection is not None
+
+    def check(self):
+        if (self.repository.get(self.repo, self.plan_id) != self.expected
+                or self.repository.projected(self.repo) != (self.expected if self.projected else None)):
+            raise runtime_state.RuntimeStateError('direct publication execution changed')
+        return self.expected
+
+    def _record_rebase_publication(self, expected, head):
+        if self.projected:
+            return super()._record_rebase_publication(expected, head)
+        return self.repository.update_plan(
+            self.repo, self.plan_id, plan_values={'publication_remote_oid': head},
+            expected_status=expected.status, enqueue=False)

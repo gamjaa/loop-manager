@@ -323,7 +323,7 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
     def test_interrupted_rebase_rejects_changed_preserved_file(self):
         self._owned_checkpoint_release(dirty=True, tamper_preserved=True)
 
-    def test_owned_checkpoint_release_keeps_remote_oid_across_real_rebase(self):
+    def test_owned_checkpoint_release_publishes_rebased_head(self):
         self._owned_checkpoint_release()
 
     def test_new_block_ignores_previous_release_marker(self):
@@ -400,7 +400,11 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
             "SELECT status, publication_remote_oid FROM exec_plans "
             "WHERE repo = ? AND plan_id = 'G-034'", (repo,),
         ).fetchone()
-        self.assertEqual(tuple(released), ('READY', new_oid))
+        rebased = self.run_git(self.worktree, 'rev-parse', 'HEAD')
+        self.assertNotEqual(rebased, new_oid)
+        self.assertEqual(tuple(released), ('READY', rebased))
+        self.assertEqual(self.run_git(self.repo, 'ls-remote', '--heads', 'origin',
+                                      'refs/heads/loop-manager/G-034').split()[0], rebased)
         resumed = execution_checkpoint_state.ExecutionCheckpointRepository(
             self.connection,
         ).get(repo, 'G-034').snapshot['blocked_resume']
@@ -529,17 +533,25 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
             "SELECT status, publication_remote_oid FROM exec_plans "
             "WHERE repo = ? AND plan_id = 'G-034'", (repo_id,),
         ).fetchone()
-        self.assertEqual(tuple(plan), ('READY', published))
         rebased = self.run_git(self.worktree, 'rev-parse', 'HEAD')
         self.assertNotEqual(rebased, published)
+        self.assertEqual(tuple(plan), ('READY', rebased))
         self.assertEqual(self.run_git(self.repo, 'ls-remote', '--heads', 'origin',
                                       'refs/heads/loop-manager/G-034').split()[0],
-                         published)
+                         rebased)
         checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(
             self.connection,
         ).get(repo_id, 'G-034')
         self.assertEqual(checkpoint.snapshot['blocked_resume']['before_head'], published)
         self.assertEqual(checkpoint.snapshot['blocked_resume']['after_head'], rebased)
+        self.assertEqual(checkpoint.observed_remote_oid, rebased)
+        self.assertEqual(checkpoint.snapshot['last_adopted_remote_oid'], rebased)
+        self.assertEqual(checkpoint.snapshot['rebase_publication_intent']['remote_before'], published)
+
+        # Independently recreate a pre-publication legacy project block. The
+        # immediate checkpoint above has already been verified against origin.
+        self.run_git(self.remote, 'update-ref', 'refs/heads/loop-manager/G-034', published, rebased)
+        self.run_git(self.repo, 'fetch', 'origin')
 
         target = self.run_git(self.repo, 'rev-parse', 'refs/remotes/origin/main')
         runtime_state.RuntimeStateRepository(self.connection).activate(

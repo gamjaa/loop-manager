@@ -34,16 +34,27 @@ PR이 없는 동일 계획의 기존 원격 작업 branch를 관리 rebase한 �
 
 ## Validation
 
-- Worker는 직접 변경한 `tests/test_execution_handlers.py`, `tests/test_execution_checkpoint_state.py`, `tests/test_manager_git_journal.py` 중 게시 intent·순서·lease에 관련된 targeted unit case만 실행한다. 실제 Git lifecycle test는 작성하고 Manager 전체 verify에 맡긴다.
+- Worker는 직접 변경한 `tests/test_execution_handlers.py`, `tests/test_execution_checkpoint_state.py`, `tests/test_manager_git_journal.py`, `tests/test_managed_mutation_evidence.py` 중 게시 intent·순서·lease와 직접 rebase 수용에 관련된 targeted unit case만 실행한다. 실제 Git lifecycle test는 작성하고 Manager 전체 verify에 맡긴다.
 - 실제 Git 이력으로 게시 checkpoint → 첫 rebase → 중간 게시 → 새 base 전진 → 두 번째 rebase를 검증한다. 첫 push 전·후 중단, 자동·수동 충돌 교정, 원격 OID 경쟁, lease·권한 거부 및 미게시 다중 rebase를 다룬다. 과거 rebase 증거가 없는 정상 현재 결과는 게시 대상으로 인정하고 현재 소유권·범위·원격 불일치는 계속 거부한다.
 - 전체 verify는 중간 게시 이후 최종 후보의 검증·Review·PR gate가 유지되고 기존 PR 및 신규 branch가 조기 게시되지 않는지 확인한다.
 
 ## Progress
 
-- [ ] 현재 상태의 완료 rebase 수용과 중간 게시 intent 검증
-- [ ] 원격 lease 게시·중단 복구와 최종 검증 경계 연결
+- [x] 현재 상태의 완료 rebase 수용과 중간 게시 intent 검증
+- [x] 원격 lease 게시·중단 복구와 최종 검증 경계 연결
+
+- Targeted unit 검증: `ImmediateRebasePublicationTests`와 `RebasePublicationRepositoryTests` 16개 및 기존 rebase 수용·소유권 case 4개 통과. 실제 Git lifecycle 테스트와 전체 verify는 Worker가 실행하지 않고 Loop Manager 검증에 맡긴다.
+- 검증 피드백 보정: 게시 OID 반영 후에도 남아 있는 최종 push intent의 이전 lease 소유권과 일반 교정·Review checkpoint의 legacy 판정 회귀를 수정했다. 실패했던 소유권 unit case 4개는 동일 명령 재실행에서 모두 통과했고, 갱신한 `ImmediateRebasePublicationTests` 11개도 통과했다. Planner import fixture에 새 게시 모듈을 포함하고 lifecycle 순서 assertion은 중간 게시 재개 이후의 호출을 검사하도록 수정했다. 이 실제 Git 테스트와 전체 verify의 재검증은 Loop Manager가 수행한다.
+- Review 피드백 보정: 미완료 게시 intent도 실제 범위 선검증에서 현재 rebase HEAD와 선택 ref를 대조하며, 저장한 lease 또는 이미 push한 HEAD만 원격 기대값으로 사용한다. 직접 차단 해제에서는 clean index 결과의 게시를 먼저 완료하고 원래 staging을 복원한다. 활성 projection이 없는 차단 계획의 게시도 차단·검증·실행 슬롯을 보존하며, 중단·거부 뒤 같은 intent로 재개한다. 관련 unit class와 직접 수용 case 29개가 모두 통과했고 전체 verify·Review 재검증은 Loop Manager에 맡긴다.
+- 후속 verify 피드백 보정: 직접 rebase 수용 unit fixture의 게시 경계를 mock 처리하고, 정상·중단 차단 해제 unit test는 수용 → 게시 → staging 복원 순서를 확인하도록 갱신했다. 수정한 unit case 6개가 모두 통과했다. 실제 Git checkpoint 해제 테스트는 rebase HEAD의 즉시 원격 게시·채택 OID·고정 이전 lease를 확인하고 별도로 미게시 legacy project block 상태를 재현한다. 실제 Git 테스트와 전체 verify는 Worker가 실행하지 않았다.
+
+- 후속 Review 두 건 보정: 중단된 차단 해제는 최신 base 대신 저장된 checkpoint target으로 완료를 검증하고 READY 재진입 뒤 최신 base를 처리한다. `resume_plan_blocks`는 기존 원격 checkpoint 검사 전에 저장된 rebase 게시를 복구하며 실패 시 intent·차단·staging을 보존한다. 새 회귀 3개와 기존 직접 게시·staging 복구 4개, 총 7개 고유 targeted unit case가 통과했다(6개 실행 및 후속 변경 관련 3개 실행). R-047 archive의 원문 바이트 일치를 재확인했다. 전체 verify와 Review는 Loop Manager 검증 대기다.
 
 ## Decision Log
 
 - G-100·G-101은 R-045의 rebase 완료·오류 차단 복구를 맡는다. 이 계획은 그 결과를 게시하는 R-047의 새 순서와 legacy 다중 rebase 게시 증거만 다룬다.
 - 2026-09-30: mutable READY snapshot token `5d5162255574800d9d989ed1db28373663ca028d91b2faab321d45e609690e8e`, 기준 revision `d9769d7a5b437ceddc2efdeb87f9cc3bda2c74da`와 원본 hash 일치를 확인해 개정했다. R-048은 위 과거 Decision의 완료 증거 정책을 대체한다. G-109에 의존해 현재 상태 수용 결과를 게시에 사용하고 R-047의 검증 전 중간 게시 순서는 유지한다.
+
+- 2026-09-30: G-109 현재 상태 수용 결과를 재검사하는 `managed_rebase_publication.py`에 중간 게시를 분리했다. `rebase_publish` intent는 최종 PR 게시와 독립적이며 정확한 원격 lease와 후보 HEAD를 고정한다. 기존 checkpoint JSON 저장과 runtime transaction을 사용해 비호환 SQLite schema 변경 없이 게시 감사·마지막 채택 OID를 함께 반영한다.
+- 2026-09-30: 게시 뒤에도 기존 blocked checkpoint identity와 rebase 감사는 보존한다. 원격 OID 갱신 외 phase·Worker·verify·Review·차단 상태를 게시 완료로 승인하지 않는다. 실제 Git lifecycle 시나리오는 전체 verify용으로 작성했고 Worker는 실행하지 않았다.
+- 2026-09-30: 미완료 중간 게시의 범위 비교는 유효한 고정 intent와 G-109의 현재 소유권 검사를 함께 요구한다. 현재 선택 remote tracking ref만 intent의 이전 OID 또는 HEAD에 한정해 비교 기준에 반영하고 다른 shared ref·Agent 결과 위반과 원본 snapshot은 그대로 검사·보존한다. 차단 계획의 직접 게시에는 별도 state port를 사용해 실행 projection을 만들지 않고 원격 OID와 완료 기록만 원자적으로 갱신한다. staging은 이 게시 경계 뒤에 복원하며 blocked resume marker와 재활성화의 원격 기대값도 채택한 OID를 유지한다.

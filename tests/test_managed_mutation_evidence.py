@@ -731,6 +731,9 @@ class ManagedTransitionTests(unittest.TestCase):
                 mock.patch.object(loop_manager, '_owned_rebase_state_dir', return_value=state_dir),
                 mock.patch.object(loop_manager, '_current_rebase_service', side_effect=lambda *_a, **_k: case.factory(None)),
                 mock.patch.object(loop_manager, '_owned_rebase_journal_state', return_value={'head': 'owned-head'}),
+                # This case owns rebase acceptance; publication has its own
+                # lease, interruption and staging tests with durable owners.
+                mock.patch.object(loop_manager, '_publish_direct_rebase_checkpoint'),
             ):
                 with mock.patch.object(journal, '_finish', side_effect=RuntimeError('crash')):
                     with self.assertRaisesRegex(RuntimeError, 'crash'):
@@ -781,6 +784,7 @@ class ManagedTransitionTests(unittest.TestCase):
             mock.patch.object(loop_manager, '_owned_rebase_state_dir', return_value=Path('/state')),
             mock.patch.object(loop_manager, '_current_rebase_service', side_effect=lambda *_a, **_k: case.factory(None)),
             mock.patch.object(loop_manager, '_owned_rebase_journal_state', return_value=observed),
+            mock.patch.object(loop_manager, '_publish_direct_rebase_checkpoint'),
         ):
             for field, value in (('head', 'before'), ('dirty', {'app.py': 'older'}), ('index', {'app.py': 'older'})):
                 with self.subTest(field=field), self.assertRaisesRegex(journal.MutationEvidenceError, 'observation drift'):
@@ -835,6 +839,7 @@ class ManagedTransitionTests(unittest.TestCase):
         with (
             mock.patch.object(loop_manager, '_owned_rebase_state_dir', return_value=Path('/state')),
             mock.patch.object(loop_manager, '_current_rebase_service', side_effect=lambda *_a, **_k: case.factory(None)),
+            mock.patch.object(loop_manager, '_publish_direct_rebase_checkpoint'),
         ):
             for pending in (
                 replace(clean, index_clean=False, staged=(FileChange('app.py', '100644', '100644', 'old', 'manual', 'M'),)),
@@ -1165,6 +1170,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
                     mock.patch.object(loop_manager, '_owned_rebase_state_dir', return_value=Path('/state')),
                     mock.patch.object(loop_manager, '_current_rebase_service',
                                       side_effect=lambda *_a, **_k: case.factory(None)),
+                    mock.patch.object(loop_manager, '_publish_direct_rebase_checkpoint'),
                 ):
                     loop_manager._complete_direct_rebase_checkpoint(connection, 'repo', 'G-047',
                         Path('/state/G-047'), 'base', repo_path=Path('/repo'),
@@ -1240,6 +1246,8 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
             mock.patch.object(loop_manager, '_current_rebase_service', side_effect=lambda *_a, **_k: case.factory(None)),
             mock.patch.object(loop_manager, '_owned_rebase_journal_state', return_value={'head': 'owned-head'}),
             mock.patch.object(loop_manager, '_complete_direct_rebase_checkpoint', side_effect=complete),
+            mock.patch.object(loop_manager, '_publish_direct_rebase_checkpoint',
+                              side_effect=lambda *_a, **_k: events.append('publish')),
             mock.patch.object(loop_manager, '_restore_agent_staged_entries', side_effect=restore),
             mock.patch.object(loop_manager, '_record_blocked_resume_head', side_effect=record),
             mock.patch.object(loop_manager, 'clear_agent_scope'),
@@ -1250,7 +1258,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
                 stack.enter_context(patch)
             self.assertTrue(loop_manager.resume_blocked_execplan_if_inputs_changed(
                 connection, Path('/repo'), 'repo', 'main', Path('/state')))
-        self.assertEqual(events, ['rebase', 'adopt', 'restore', 'record-head', 'requeue'])
+        self.assertEqual(events, ['rebase', 'adopt', 'publish', 'restore', 'record-head', 'requeue'])
         self.assertEqual(snapshots[0].index, before.index)
 
     def test_interrupted_blocked_rebase_adopts_clean_index_before_restoring_stage(self):
@@ -1301,13 +1309,15 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
             mock.patch.object(loop_manager, '_finish_owned_direct_rebase'),
             mock.patch.object(loop_manager, '_owned_rebase_journal_state', return_value={'head': 'owned-head'}),
             mock.patch.object(loop_manager, '_complete_direct_rebase_checkpoint', side_effect=complete),
+            mock.patch.object(loop_manager, '_publish_direct_rebase_checkpoint',
+                              side_effect=lambda *_a, **_k: events.append('publish')),
             mock.patch.object(loop_manager, '_restore_agent_staged_entries', side_effect=restore),
             mock.patch.object(loop_manager, 'clear_agent_scope'),
             mock.patch.object(loop_manager, '_requeue_blocked_execplan', side_effect=lambda *_a, **_k: events.append('requeue')) as requeue,
         ):
             self.assertTrue(loop_manager._resume_interrupted_blocked_rebase(
                 connection, Path('/repo'), 'repo', 'main', plan, Path('/state/G-047'), 'loop-manager/G-047'))
-            self.assertEqual(events, ['adopt', 'restore', 'requeue'])
+            self.assertEqual(events, ['adopt', 'publish', 'restore', 'requeue'])
             saved = case.checkpoint.get('repo', 'G-047')
             events.clear()
             case.observed = replace(case.observed, index_clean=False,
