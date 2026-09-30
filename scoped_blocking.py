@@ -314,6 +314,18 @@ def clear_plan_block(connection: sqlite3.Connection, repo: str, plan_id: str) ->
     )
 
 
+def clear_revalidated_rebase_block(connection, expected, *, is_plan_block):
+    """Release the selected cause only; the caller owns the transaction."""
+    current = (plan_block(connection, expected['repo'], expected['plan_id'])
+               if is_plan_block else project_block(connection, expected['repo']))
+    if current is None or dict(current) != dict(expected):
+        raise runtime_state.RuntimeStateError('rebase block changed during revalidation')
+    if is_plan_block:
+        clear_plan_block(connection, expected['repo'], expected['plan_id'])
+    else:
+        clear_project_block(connection, expected['repo'])
+
+
 def clear_project_block(connection: sqlite3.Connection, repo: str) -> str | None:
     row = project_block(connection, repo)
     if row is None:

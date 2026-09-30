@@ -794,6 +794,105 @@ class RuntimeStateRepository:
                 expected, plan_values=plan_values, project_values=values,
             )
 
+    def resume_rebase_block(self, expected_plan, expected_project, block, checkpoint_repository,
+                            observation, *, expected_checkpoint, is_plan_block, reobserve, dependencies_ready,
+                            pending_error):
+        """Adopt current Git state and release one rebase cause atomically.
+
+        No Git writes occur here. Other plan causes, sessions, failure history and
+        planning ownership remain intact; every resumed candidate needs validation.
+        """
+        import scoped_blocking
+        import recovery_state
+        from managed_rebase_adoption import revalidation_values
+        from managed_rebase_validation import RebaseStatus, valid_acceptance
+
+        repo, plan_id = expected_plan['repo'], expected_plan['plan_id']
+        observed, decision = observation
+        if decision.status not in {RebaseStatus.WAITING, RebaseStatus.COMPLETE}:
+            raise RuntimeStateError('current rebase recovery is unsafe')
+        if decision.status is RebaseStatus.COMPLETE and not valid_acceptance(decision.acceptance):
+            raise RuntimeStateError('current rebase recovery acceptance is missing')
+        with _transaction(self.connection):
+            current_checkpoint = checkpoint_repository.get(repo, plan_id)
+            if current_checkpoint != expected_checkpoint:
+                raise RuntimeStateError('rebase recovery checkpoint changed before release')
+            saved = current_checkpoint.snapshot or {}
+            prior_release = saved.get('rebase_block_release') or {}
+            if (decision.status is RebaseStatus.WAITING
+                    and prior_release.get('reason_code') == block['reason_code']
+                    and saved.get('rebase_block_release_state') == observed.fingerprint):
+                raise RuntimeStateError('unchanged pending rebase recovery was already resumed')
+            def check_owner():
+                project = self.connection.execute('SELECT * FROM projects WHERE repo = ?', (repo,)).fetchone()
+                current_block = (scoped_blocking.plan_block(self.connection, repo, plan_id)
+                                 if is_plan_block else scoped_blocking.project_block(self.connection, repo))
+                active = self.active_row(repo)
+                if (project is None or block['repo'] != repo or block['plan_id'] != plan_id
+                        or dict(self._plan_row(repo, plan_id)) != dict(expected_plan)
+                        or dict(project) != dict(expected_project)
+                        or current_block is None or dict(current_block) != dict(block)
+                        or planning_owns_execution_slot(project) or project['planning_error']
+                        or (active is not None and active['plan_id'] != plan_id)
+                        or (is_plan_block and scoped_blocking.project_block(self.connection, repo) is not None)
+                        or not dependencies_ready()
+                        or checkpoint_repository.get(repo, plan_id) != current_checkpoint):
+                    raise RuntimeStateError('rebase recovery owner, cause or execution slot changed')
+            check_owner()
+            if reobserve() != observation:
+                raise RuntimeStateError('current rebase state changed during block release')
+            check_owner()
+            separate_block = not is_plan_block and expected_plan['status'] == 'PLAN_BLOCKED'
+            values = revalidation_values(current_checkpoint.target_base_oid)
+            phase = values.pop('phase')
+            values['status'] = 'PLAN_BLOCKED' if separate_block else 'IMPLEMENTING'
+            if separate_block:
+                values.pop('last_error')
+                values.pop('revision_resume_status')
+                # Retain outstanding feedback; its tokens no longer validate
+                # this candidate. Adoption also stores previous artifacts.
+                values.pop('review_result')
+                values.pop('verify_result')
+                phase = 'PLAN_BLOCKED'
+            elif decision.status is not RebaseStatus.COMPLETE:
+                values['last_error'] = pending_error
+            if decision.status is RebaseStatus.COMPLETE:
+                if current_checkpoint.generation != decision.acceptance['generation']:
+                    raise RuntimeStateError('current rebase recovery generation changed')
+                checkpoint_repository.accept_current_rebase(
+                    repo, plan_id, acceptance=decision.acceptance,
+                    prior_artifacts={key: expected_plan[key] for key in (
+                        'worker_result', 'worker_input_token', 'verify_result', 'review_result',
+                        'verify_token', 'review_token', 'publication_token', 'last_error')}
+                        | {'released_rebase_block': dict(block)})
+                self._fault('after_rebase_acceptance')
+            else:
+                checkpoint_repository.record(
+                    repo, plan_id, expected_generation=current_checkpoint.generation,
+                    operation=current_checkpoint.operation, expected_head=current_checkpoint.expected_head,
+                    target_base_oid=current_checkpoint.target_base_oid,
+                    observed_remote_oid=current_checkpoint.observed_remote_oid,
+                    snapshot={**(current_checkpoint.snapshot or {}),
+                              'rebase_block_release': dict(block),
+                              'rebase_block_release_state': observed.fingerprint,
+                              'rebase_block_recovery_audit': [
+                                  *(current_checkpoint.snapshot or {}).get('rebase_block_recovery_audit', ()),
+                                  {'block': dict(block), 'prior_artifacts': {key: expected_plan[key] for key in (
+                                      'worker_result', 'verify_result', 'review_result', 'last_error')}}]})
+            scoped_blocking.clear_revalidated_rebase_block(
+                self.connection, block, is_plan_block=is_plan_block)
+            self._fault('after_rebase_block_release')
+            recovery_state.RecoveryRepository(self.connection).resolve_rebase_block(
+                repo, plan_id, block)
+            if is_plan_block:
+                values.update(blocked_reason=None, blocked_fingerprint=None,
+                              blocked_worktree_fingerprint=None, blocked_review_fingerprint=None)
+            projection = ExecutionSnapshot.from_row(expected_plan).project_values()
+            projection.update({key: value for key, value in values.items() if key in MIRRORED_FIELDS})
+            projection['phase'] = phase
+            return self.transition(repo, plan_id, plan_values=values,
+                                   project_values=projection, enqueue=False)
+
     def mirror_project_values(
         self,
         repo: str,

@@ -41,6 +41,15 @@ VALID_WORKER_RESULT = 'WORKER_OUTCOME: {"kind":"ready_for_validation"}\nvalid re
 
 
 class ExecutionHandlerTests(TestCase):
+    def test_manual_detached_block_recovers_changed_plan_without_rebase_journal(self):
+        self._legacy_rebase_false_block_recovery(plan_block=True, manual='waiting')
+
+    def test_manual_stage_block_recovers_changed_plan_without_worker_stage_evidence(self):
+        self._legacy_rebase_false_block_recovery(plan_block=True, manual='staged')
+
+    def test_manual_completed_owned_pr_recovers_changed_plan_without_rebase_journal(self):
+        self._legacy_rebase_false_block_recovery(plan_block=False, existing_pr=True, manual='complete')
+
     def test_legacy_rebase_false_block_recovers_after_restart_with_later_file_changes(self):
         self._legacy_rebase_false_block_recovery(plan_block=True)
 
@@ -91,7 +100,7 @@ class ExecutionHandlerTests(TestCase):
 
     def _legacy_rebase_false_block_recovery(self, *, plan_block, rejected=None,
                                           existing_pr=False, published_checkpoint=False,
-                                          stale_cache=False):
+                                          stale_cache=False, manual=None):
         self.journal_start.stop()
         fixture = BlockedCheckpointGitAdapterTest(methodName='runTest')
         fixture.setUp()
@@ -163,39 +172,47 @@ class ExecutionHandlerTests(TestCase):
             target=str(fixture.worktree.resolve()),
             before=lm._owned_rebase_journal_state(fixture.worktree, branch),
             expected=expected,
-        )
-        environment = dict(os.environ, GIT_REFLOG_ACTION=f'loop-manager-rebase:{identity}',
-                           GIT_EDITOR='true')
+        ) if manual is None else None
+        environment = dict(os.environ, GIT_EDITOR='true')
+        if identity is not None:
+            environment['GIT_REFLOG_ACTION'] = f'loop-manager-rebase:{identity}'
         self.assertNotEqual(lm.git(
             fixture.worktree, 'rebase', target, check=False, env=environment,
         ).returncode, 0)
-        with mock.patch.object(lm, 'pr_for_branch', return_value=pull_request):
-            handler._finish_rebase_journal(context)
+        if manual is None:
+            with mock.patch.object(lm, 'pr_for_branch', return_value=pull_request):
+                handler._finish_rebase_journal(context)
         resolved = ['value=resolved\n'] + [f'line-{n}\n' for n in range(30)]
-        app.write_text(''.join(resolved))
-        git(fixture.worktree, 'add', 'code.py')
-        staged = lm._owned_rebase_journal_state(fixture.worktree, branch)
-        tree = git(fixture.worktree, 'write-tree')
-        continuation = journal.begin_rebase(
-            fixture.state_dir, owner='plan:G-034', repo=repo,
-            target=str(fixture.worktree.resolve()), before=staged,
-            expected={**expected, 'action': 'continue', 'staged_tree_oid': tree,
-                      'accepted_files': {'code.py': staged['dirty']['code.py'][1]}},
-        )
-        environment['GIT_REFLOG_ACTION'] = f'loop-manager-rebase:{continuation}'
-        self.assertEqual(lm.git(
-            fixture.worktree, 'rebase', '--continue', check=False, env=environment,
-        ).returncode, 0)
-        self.assertNotEqual(git(fixture.worktree, 'rev-parse', 'HEAD^{tree}'), tree)
-        reason = rebase_block_reconciliation.LEGACY_COMPLETION_DIAGNOSTIC
+        continuation = None
+        if manual != 'waiting':
+            app.write_text(''.join(resolved))
+            git(fixture.worktree, 'add', 'code.py')
+            staged = lm._owned_rebase_journal_state(fixture.worktree, branch)
+            tree = git(fixture.worktree, 'write-tree')
+            if manual is None:
+                continuation = journal.begin_rebase(
+                    fixture.state_dir, owner='plan:G-034', repo=repo,
+                    target=str(fixture.worktree.resolve()), before=staged,
+                    expected={**expected, 'action': 'continue', 'staged_tree_oid': tree,
+                              'accepted_files': {'code.py': staged['dirty']['code.py'][1]}},
+                )
+                environment['GIT_REFLOG_ACTION'] = f'loop-manager-rebase:{continuation}'
+            if manual != 'staged':
+                self.assertEqual(lm.git(
+                    fixture.worktree, 'rebase', '--continue', check=False, env=environment,
+                ).returncode, 0)
+                self.assertNotEqual(git(fixture.worktree, 'rev-parse', 'HEAD^{tree}'), tree)
+        reason = ('manual G-088 conflict; inputs changed' if manual else
+                  rebase_block_reconciliation.LEGACY_COMPLETION_DIAGNOSTIC)
         handlers.recovery_state.begin_external_run(connection)
-        handlers.recovery_state.RecoveryRepository(connection).observe(
-            handlers.RecoveryObservation(
-                handlers.RecoveryReason.STATUS_FAILED, repo, 'G-034', 'WORKING',
-                fixture.base_oid, fixture.base_oid, 'old-failure',
-                f'{fixture.base_oid}|saved-worker|', reason,
-            ),
-        )
+        if manual is None:
+            handlers.recovery_state.RecoveryRepository(connection).observe(
+                handlers.RecoveryObservation(
+                    handlers.RecoveryReason.STATUS_FAILED, repo, 'G-034', 'WORKING',
+                    fixture.base_oid, fixture.base_oid, 'old-failure',
+                    f'{fixture.base_oid}|saved-worker|', reason,
+                ),
+            )
         if plan_block:
             fixture.block('managed_worktree_conflict', reason)
         else:
@@ -206,6 +223,15 @@ class ExecutionHandlerTests(TestCase):
                     "'repository_state_unsafe', 'G-034', ?, 'WORKING')", (repo, reason),
                 )
                 connection.execute("UPDATE projects SET phase = 'PROJECT_BLOCKED'")
+            if manual:
+                handlers.recovery_state.RecoveryRepository(connection).observe(
+                    handlers.RecoveryObservation(handlers.RecoveryReason.STATE_UNSAFE, repo, 'G-034',
+                        'WORKING', fixture.base_oid, fixture.base_oid, 'saved-rebase', 'old-progress', reason),
+                    final_block_reason=scoped_blocking.BlockReasonCode.REPOSITORY_STATE_UNSAFE)
+        if manual:
+            plan_path = connection.execute('SELECT path FROM exec_plans').fetchone()[0]
+            document = fixture.worktree / plan_path
+            document.write_text(document.read_text() + '\nUser input changed during blocked rebase.\n')
         published_before = None
         if published_checkpoint:
             # Legacy published checkpoints may adopt an existing clean commit.
@@ -256,10 +282,7 @@ class ExecutionHandlerTests(TestCase):
             )
 
         with mock.patch.object(lm, 'pr_for_branch', return_value=pull_request):
-            # Another session and planning state cannot borrow this proof.
-            connection.execute("UPDATE exec_plans SET worker_session_id = 'foreign'")
-            self.assertFalse(resume())
-            connection.execute("UPDATE exec_plans SET worker_session_id = 'saved-worker'")
+            # Planning still owns the slot; historical sessions are not gates.
             connection.execute("UPDATE projects SET planning_error = 'independent error'")
             self.assertFalse(resume())
             self.assertEqual(connection.execute(
@@ -273,8 +296,11 @@ class ExecutionHandlerTests(TestCase):
                                  expected_remote)
             if rejected:
                 completed = git(fixture.worktree, 'rev-parse', 'HEAD')
+                rejected_file = (fixture.worktree / 'docs/ARCHITECTURE.md'
+                                 if rejected in {'unstaged', 'late-file'} else app)
                 if rejected in {'unstaged', 'staged'}:
-                    app.write_text(app.read_text() + 'unapproved change\n')
+                    rejected_file.write_text(rejected_file.read_text() + 'unapproved change\n'
+                                             if rejected_file.exists() else 'unapproved change\n')
                     if rejected == 'staged':
                         git(fixture.worktree, 'add', 'code.py')
                 elif rejected == 'index-flags':
@@ -292,16 +318,22 @@ class ExecutionHandlerTests(TestCase):
                 saved_recovery = dict(handlers.recovery_state.RecoveryRepository(
                     connection,
                 ).row(repo, 'G-034'))
-                complete_rebase = journal.record_current_rebase_result
-                def complete_then_change(*args, **kwargs):
-                    completed = complete_rebase(*args, **kwargs)
-                    if rejected == 'late-file':
-                        app.write_text(app.read_text() + 'late unapproved change\n')
-                    elif rejected == 'late-remote':
-                        git(fixture.worktree, 'push', 'origin', f'{original}:refs/heads/{branch}')
-                        git(fixture.repo, 'update-ref', '-d', f'refs/remotes/origin/{branch}')
-                    return completed
-                with mock.patch.object(journal, 'record_current_rebase_result', side_effect=complete_then_change):
+                current_service = lm._current_rebase_service
+                def service_with_race(*args, **kwargs):
+                    service = current_service(*args, **kwargs)
+                    require_owned = service.require_owned
+                    calls = []
+                    def observe(**options):
+                        calls.append(None)
+                        if len(calls) == 2:
+                            if rejected == 'late-file':
+                                rejected_file.write_text('late unapproved change\n')
+                            elif rejected == 'late-remote':
+                                git(fixture.worktree, 'push', 'origin', f'{original}:refs/heads/{branch}')
+                                git(fixture.repo, 'update-ref', '-d', f'refs/remotes/origin/{branch}')
+                        return require_owned(**options)
+                    return SimpleNamespace(require_owned=observe)
+                with mock.patch.object(lm, '_current_rebase_service', side_effect=service_with_race):
                     for _ in range(2):
                         self.assertFalse(resume())
                 self.assertEqual(dict(connection.execute('SELECT * FROM exec_plans').fetchone()), before)
@@ -313,23 +345,34 @@ class ExecutionHandlerTests(TestCase):
                 ).fetchone()[0])
                 slot = journal._slot(fixture.state_dir, repo, 'managed_rebase',
                                      str(fixture.worktree.resolve()))
-                sealed = rejected in {'late-file', 'late-remote'}
-                self.assertEqual((slot / 'active.json').exists(), not sealed)
-                self.assertEqual((slot / f'{continuation}.result.json').exists(), sealed)
+                self.assertTrue((slot / 'active.json').exists())
+                self.assertFalse((slot / f'{continuation}.result.json').exists())
                 self.assertEqual(git(fixture.worktree, 'rev-parse', 'HEAD'), completed)
                 if rejected in {'unstaged', 'staged', 'late-file'}:
-                    self.assertIn('unapproved change', app.read_text())
+                    self.assertIn('unapproved change', rejected_file.read_text())
                 if published_checkpoint:
                     self.assertEqual(dict(connection.execute(
                         'SELECT * FROM blocked_checkpoints',
                     ).fetchone()), published_before)
                     # Restoring the unexpected change must leave the same original
                     # completion intent usable; a poisoned result would prevent this.
-                    git(fixture.worktree, 'restore', '--source=HEAD', '--staged', '--worktree',
-                        '--', 'code.py')
+                    if rejected == 'unstaged':
+                        rejected_file.unlink()
+                    else:
+                        git(fixture.worktree, 'restore', '--source=HEAD', '--staged', '--worktree',
+                            '--', 'code.py')
                 else:
                     return
             self.assertTrue(resume())
+            if manual in {'waiting', 'staged'}:
+                self.assertTrue(lm._rebase_in_progress_for_branch(fixture.worktree, branch))
+                if manual == 'waiting':
+                    app.write_text(''.join(resolved))
+                    git(fixture.worktree, 'add', 'code.py')
+                self.assertEqual(lm.git(fixture.worktree, '-c', 'core.editor=true',
+                    'rebase', '--continue', check=False).returncode, 0)
+                lm._complete_direct_rebase_checkpoint(connection, repo, 'G-034', fixture.worktree,
+                    target, repo_path=fixture.repo, branch=branch, agent_session_id='saved-worker')
             self.assertFalse(resume())
         row = connection.execute('SELECT * FROM exec_plans').fetchone()
         self.assertEqual(row['status'], 'IMPLEMENTING')
@@ -6540,3 +6583,68 @@ class ImmediateRebasePublicationTests(TestCase):
         self.assertEqual(len(self.pushes), 1)
         self.assertNotIn('completed_rebase', saved.snapshot)
         self.assertNotIn('rebase_completion', saved.snapshot)
+
+
+class EvidenceFreeBlockedScopeTests(TestCase):
+    setUp = CurrentRebaseAgentScopeTests.setUp
+
+    def validate(self):
+        connection = self.case.fixture.connection
+        plan = connection.execute("SELECT * FROM exec_plans WHERE repo='repo'").fetchone()
+        with mock.patch.object(lm, '_published_plan_allows_common_plans', return_value=False), \
+             mock.patch.object(lm, 'requirement_archive_candidates', return_value=()), \
+             mock.patch.object(lm, '_proven_manager_base_refs', return_value=frozenset()):
+            lm.validate_blocked_agent_scope(connection, Path('/repo'), 'repo', 'main',
+                Path('/state/G-047'), plan['path'], accepted_rebase=True, saved_plan=plan)
+
+    def test_manual_result_can_replace_selected_rebase_state_without_changing_saved_agent_start(self):
+        self.validate()
+        row = self.case.fixture.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual(row['agent_snapshot'], self.original.serialize())
+
+    def test_saved_actual_agent_ref_violation_is_checked_before_rebase_normalization(self):
+        violation = replace(self.original, refs={**self.original.refs, 'refs/heads/other': ('foreign', '')})
+        self.case.state.update_project('repo', agent_result_snapshot=violation.serialize())
+        with self.assertRaises(lm.AgentScopeError):
+            self.validate()
+
+    def test_current_external_ref_and_default_worktree_mutation_remain_rejected(self):
+        original = self.current
+        for current in (replace(original, refs={**original.refs, 'refs/heads/other': ('foreign', '')}),
+                        replace(original, worktrees={**original.worktrees, '/repo': ('HEAD=foreign',)})):
+            with self.subTest(current=current):
+                self.current = current
+                with self.assertRaises(lm.AgentScopeError):
+                    self.validate()
+
+
+class EvidenceFreeRebasePreparationTests(TestCase):
+    def setUp(self):
+        self.case = current_rebase_case(self)
+        self.case.fixture.effects.workspace.is_directory.return_value = True
+        self.case.handler.catalog_plan = self.case.state.active_execplan('repo')
+
+    def pending(self):
+        from managed_rebase_validation import IndexEntry
+        self.case.observed = replace(self.case.observed, head='partial', branch=None,
+            branch_ref=('before', ''), registration=('HEAD=partial', 'detached=True'),
+            branch_worktrees=(), operations=(('rebase-merge', 'operation'),),
+            metadata=(('head-name', 'refs/heads/loop-manager/G-047'),
+                      ('orig-head', 'before'), ('onto', 'base')),
+            index=(IndexEntry('app.py', '100644', 'manual', 0, 'H', 0),), index_clean=False)
+
+    def test_owned_detached_rebase_is_recognized_without_old_error_marker(self):
+        self.pending()
+        self.case.state.update_project('repo', last_error='different historical failure')
+        self.assertTrue(self.case.handler._resolving_rebase(self.case.state.row()))
+
+    def test_detached_metadata_alone_cannot_bypass_current_remote_or_target_check(self):
+        self.pending()
+        original = self.case.observed
+        for observed in (replace(original, remote=replace(original.remote, oid='foreign')),
+                         replace(original, metadata=(('head-name', 'refs/heads/loop-manager/G-047'),
+                                                     ('orig-head', 'before'), ('onto', 'foreign')))):
+            with self.subTest(observed=observed):
+                self.case.observed = observed
+                with self.assertRaises(handlers.manager_git_journal.MutationEvidenceError):
+                    self.case.handler._resolving_rebase(self.case.state.row())

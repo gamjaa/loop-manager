@@ -418,6 +418,33 @@ class RecoveryRepository:
             )
         if not (direct_retry or final_block):
             return
+        self._resolve_rebase_failure(repo, subject, saved)
+
+    def resolve_rebase_block(self, repo, plan_id, block):
+        """Resolve the released cause without using past session/progress as a gate."""
+        from rebase_block_reconciliation import REBASE_BLOCK_REASONS
+
+        saved = self.row(repo, plan_id)
+        if (saved is None or block['reason_code'] not in REBASE_BLOCK_REASONS
+                or saved['detail'] != block['evidence']
+                or saved['reason_code'] not in {
+                    RecoveryReason.REBASE_CONFLICT.value, RecoveryReason.STATUS_FAILED.value,
+                    RecoveryReason.MANAGED_CONFLICT_UNRECOVERABLE.value,
+                    RecoveryReason.STATE_UNSAFE.value, RecoveryReason.REMOTE_OID_UNCERTAIN.value,
+                    RecoveryReason.OWNERSHIP_UNCERTAIN.value}):
+            return
+        if saved['pending_action'] == 'final_block':
+            try:
+                evidence = json.loads(saved['final_evidence'] or 'null')
+            except (TypeError, ValueError):
+                return
+            if not isinstance(evidence, dict) or evidence.get('block_reason_code') != block['reason_code']:
+                return
+        elif saved['pending_action'] not in {'retry', 'pause', 'correct'}:
+            return
+        self._resolve_rebase_failure(repo, self._subject(plan_id), saved)
+
+    def _resolve_rebase_failure(self, repo, subject, saved):
         changed = self.connection.execute(
             "UPDATE recovery_records SET pending_action = 'reconcile', "
             "updated_at = CURRENT_TIMESTAMP WHERE repo = ? AND subject = ? "
@@ -431,8 +458,7 @@ class RecoveryRepository:
             "persistent_execution_failures WHERE repo = ? AND subject = ? "
             "AND active = 1 AND reason_code = ? AND detail = ? "
             "AND progress_marker = ?",
-            (repo, subject, RecoveryReason.STATUS_FAILED.value,
-             LEGACY_COMPLETION_DIAGNOSTIC, saved["progress_marker"]),
+            (repo, subject, saved['reason_code'], saved['detail'], saved["progress_marker"]),
         ).fetchone()
         if failure is None:
             return

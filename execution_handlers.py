@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Callable, Any
 from pathlib import Path
+from types import SimpleNamespace
 from dataclasses import asdict
 import hashlib
 import json
@@ -842,18 +843,32 @@ class ExecutionHandlers:
         return ExecutionOutcome.advanced(self._context())
 
     def _resolving_rebase(self, row):
+        checkpoint = self.effects.checkpoint
+        worktree = Path(str(row['worktree'] or ''))
+        if (checkpoint is not None and self.catalog_plan is not None
+                and self.effects.workspace.current_rebase_service is not None
+                and self.effects.workspace.is_directory(worktree)):
+            current = checkpoint.get(self.repo, self.catalog_plan['plan_id'])
+            if (current.operation == 'rebase'
+                    or self.effects.workspace._rebase_in_progress_for_branch(worktree, str(row['branch'] or ''))
+                    or (int(row['pr_conflict_recovery']) and self._unmerged_stages(worktree))):
+                # Validate detached ownership before the ordinary branch gate;
+                # a diagnostic string or metadata directory alone is insufficient.
+                context = SimpleNamespace(
+                    plan=SimpleNamespace(plan_id=self.catalog_plan['plan_id']),
+                    worktree=worktree, branch=str(row['branch'] or ''))
+                _, decision = self._current_rebase_service(context).require_owned(checkpoint=current)
+                return decision.status is RebaseStatus.WAITING
         rebase_error = str(row['last_error'] or '')
         rebase_recovery = bool(
             row['phase'] == 'WORKING' and (rebase_error == self.effects.contract.REBASE_IN_PROGRESS_ERROR or rebase_error.startswith(self.effects.contract.REBASE_CONFLICT_PREFIX)),
         )
-        worktree = Path(str(row['worktree'] or ''))
         if not rebase_recovery or not self.effects.workspace.is_directory(worktree):
             return False
         if self.effects.workspace._rebase_in_progress_for_branch(worktree, str(row['branch'] or '')):
             return True
         if int(row['pr_conflict_recovery']) and row['pr_conflict_base_oid']:
             return bool(self._unmerged_stages(worktree))
-        checkpoint = self.effects.checkpoint
         return bool(
             checkpoint is not None
             and checkpoint.get(self.repo, self.catalog_plan['plan_id']).operation == 'rebase'

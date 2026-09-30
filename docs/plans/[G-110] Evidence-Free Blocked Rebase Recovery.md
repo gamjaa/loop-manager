@@ -39,11 +39,15 @@ G-088처럼 `managed_worktree_conflict`로 차단된 뒤 계획 입력이 바뀌
 
 ## Progress
 
-- [ ] 저장 rebase 차단 selector와 현재 상태 복구 연결
-- [ ] detached·수동 stage/완료 재개와 원인별 원자 해제
-- [ ] G-088 재현·다른 차단 보존·중단/재시작 회귀 사례
+- [x] 저장 rebase 차단 selector와 현재 상태 복구 연결
+- [x] detached·수동 stage/완료 재개와 원인별 원자 해제
+- [x] G-088 형태의 입력 변경·수동 결과와 다른 차단 보존·중단/rollback 회귀 unit 사례 구현
+- 최신 base로 rebase한 뒤 autostash 복원에서 같은 파일 끝에 추가된 테스트 클래스가 충돌했다. 기존 checkpoint 게시 테스트와 G-110 테스트를 모두 보존해 병합했으며, 직접 변경한 복구·scope·준비·원인 해제 경계의 targeted unit test 26개를 다시 실행해 모두 통과했다.
+- Worker는 좁은 unit case만 실행한다. 실제 Git lifecycle과 전체 verify·Review는 Worker 종료 뒤 Manager 검증 경로에 남긴다.
 
 ## Decision Log
 
 - 이 계획은 R-048의 수동 복구와 rebase 원인 해제만 담당한다. G-092는 R-023의 격리된 Agent 범위·Manager 기준선·index flags 오탐을 계속 담당하고, G-106·G-107은 차단 중 새 원격 입력 반영·checkpoint/진단 게시를 담당한다.
 - G-088·G-092에 의존하지 않는다. 차단된 기존 계획을 먼저 Merge해야 복구를 구현할 수 있는 순환을 만들지 않고 G-108 → G-109 → G-110으로 검증 가능한 변경을 진행한다.
+- 저장 원인 selector는 충돌 원인 또는 대상 rebase에 연결된 구조화 진단만 선택하며, Git 관측·해제는 G-109 현재 상태 서비스와 원자적 SQLite 경계에서 처리한다. 과거 세션·진전 marker·occurrence history는 gate로 사용하지 않는다.
+- 복구 자체는 Git 쓰기 없이 현재 상태를 두 번 관측한다. 진행 중 operation은 보존해 기존 Manager continue/Worker 경로로 연결하고, 완료 후보는 채택과 대상 원인 해제를 같은 transaction으로 적용한다. 별도 차단 원문·session·실패 이력과 검증 전 결과는 감사로 보존한다.
