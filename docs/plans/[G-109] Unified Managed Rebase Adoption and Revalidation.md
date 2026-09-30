@@ -57,6 +57,8 @@ G-108의 현재 상태 판정을 일반 구현, 관리 rebase 재시작, PR 충�
 - 원래 Agent snapshot·session과 실제 Agent 위반 검증은 보존한다. 수용한 선택 branch/worktree를 메모리 비교 기준에만 반영하고 재개한 실제 Agent의 시작 관측은 별도 comparison baseline으로 저장한다. 수동 진행을 Agent 실행 또는 Manager replay receipt로 기록하지 않는다. 이전 scope·rebase 작업 감사도 보존한다.
 - 구형 historical reader와 다른 Manager Git 작업의 ownership/receipt 경계는 유지했다. 실제 Git 회귀 사례는 작성했으며 Worker는 실행하지 않았다. PRODUCT에 R-048 장기 규칙을 반영하고 양쪽 verify script에 새 모듈을 등록했다. AGENTS·ARCHITECTURE·PLANS·Requirement·archive를 수정하지 않았고 commit/push/PR을 만들지 않았다.
 
+- 2026-09-30 Manager verify 피드백 반영: rebase 채택이 PLAN_BLOCKED 원인을 해제하지 않도록 하고, 깨끗한 결과 채택과 원래 staged 작업 복원을 분리한다. 현재 수용 HEAD의 비교 기준선과 이후 일반 Manager Git 증거 검사를 구분한다. 기존 차단 해제 정책은 유지한다.
+
 ## Worker Validation Results
 
 - 최소 범위로 선택한 관련 unit case 62개가 각각 최종 오류 없는 실행에서 통과했다. 아래 실패 이력은 혼합 성공 실행을 통과로 계산하지 않고 수정 후 **동일 명령**의 최종 성공만 기록한다.
@@ -131,3 +133,53 @@ FINAL_RESULT: PASS (3 tests, failures=0, errors=0)
 - 위 실패 이력의 기존 handler 6 case·direct/continuation 11 case·phase 13 case와 `test_owned_pr_correction_stages_only_publishable_resolution`, `test_saved_worker_result_finishes_after_restart_without_second_agent_turn`, `test_preparation_resumes_durable_rebase_continue_without_worker`: 총 33 기존 case 통과.
 
 최종 Worker 상태: 구현과 targeted unit 검증 준비 완료, Loop Manager의 전체 verify·실제 Git integration 실행 및 Reviewer 검토 대기.
+
+## Manager Verify Feedback Revalidation (2026-09-30)
+
+- Manager feedback `verify:aaf6a2b5a09c4ece70479ec68b2ce978e4de1afda1b4e9bd8d91872a6fcdf67e`, occurrence=1, revision=1의 전체 verify 결과는 failures=14, errors=57이었다. Worker는 저장된 진단을 읽고 아래 수정과 최소 범위 unit 검증을 수행했으며 전체 verify를 재실행하지 않았다.
+- lifecycle adapter의 잘못된 변수 binding을 수정하고, projected/unprojected PLAN_BLOCKED 상태를 유지하며 후보·검증 결과를 무효화한다. 깨끗한 rebase 수용 뒤 원래 stage를 복원하고 HEAD marker를 기록하며, 복원 뒤 중단도 같은 현재 소유권과 보존 작업 검사로 재개한다.
+- 새 Worker scope의 원래 staged index를 유지하고, rebase로 채택한 HEAD 이후의 별도 Manager Git 변경을 수용 기준선으로 흡수하지 않는다. 현재 PR 조회와 별도 최종 Worker 확인에 맞춰 기존 Git lifecycle fixture를 갱신했다. 수동 완료에 가짜 Manager 실행 결과를 요구하지 않는다.
+- 현재 수정과 관련된 서로 다른 unit case **21개**가 최종 오류 없는 실행에서 통과했다. 최초 adapter selector 실행 이후 추가된 두 case는 개별 검증 후 같은 selector의 최종 재실행(8 case)에도 포함됐다. 아래 개별 1-case 결과는 총 21개에 중복 포함하지 않는다.
+- 실제 Git integration/lifecycle은 작성·갱신만 했고 사용자 제한에 따라 실행하지 않았다. 전체 suite, integration/E2E, 전체 lint/build/type check, scripts/verify 실행, commit/push/PR 생성은 하지 않았다. AGENTS.md·docs/PLANS.md·ARCHITECTURE·Requirement·archive는 변경하지 않았다. 새 Manager 전체 verify와 Reviewer 결과 대기 상태다.
+
+### Feedback targeted unit 실패와 동일 명령 재실행
+
+- 수정: project projection이 없는 차단의 기존 phase를 보존하는 runtime 전이로 수정했다.
+
+```text
+FAILED_COMMAND: python3 -B -m unittest tests.test_managed_mutation_evidence.CurrentRebaseRuntimeAdapterTests tests.test_execution_checkpoint.CheckpointAssessmentTests.test_pr_rebase_resume_retries_unsealed_active_intent_after_lock
+RERUN: python3 -B -m unittest tests.test_managed_mutation_evidence.CurrentRebaseRuntimeAdapterTests tests.test_execution_checkpoint.CheckpointAssessmentTests.test_pr_rebase_resume_retries_unsealed_active_intent_after_lock
+FINAL_RESULT: PASS (8 tests, failures=0, errors=0)
+```
+
+- 수정: checkpoint lease fixture의 선택 ExecPlan 경로와 PR repository identity를 실제 값에 맞췄다. 동일 명령의 중간 재실행도 실패했고 최종 재실행만 통과로 계산했다.
+
+```text
+FAILED_COMMAND: python3 -B -m unittest tests.test_execution_handlers.ExecutionHandlerTests.test_completed_stage_accepts_replaced_clean_resolution_before_skip tests.test_execution_handlers.ExecutionHandlerTests.test_completed_autostash_stage_accepts_replaced_clean_resolution tests.test_execution_handlers.ExecutionHandlerTests.test_staged_rebase_resume_accepts_allowed_added_files tests.test_execution_handlers.ExecutionHandlerTests.test_confirmed_checkpoint_push_remains_owned_during_pr_creation tests.test_execution_handlers.ExecutionHandlerTests.test_conflict_revision_priority_change_allows_old_workspace_metadata tests.test_execution_handlers.ExecutionHandlerTests.test_conflict_profile_complexity_change_resumes_same_worker tests.test_execution_handlers.ExecutionHandlerTests.test_conflict_profile_risk_change_resumes_same_worker tests.test_execution_handlers.ExecutionHandlerTests.test_conflict_profile_downgrade_preserves_escalated_level tests.test_scoped_blocking.ScopedBlockingTest.test_project_publication_block_recovers_only_matching_owned_rebase
+RERUN: python3 -B -m unittest tests.test_execution_handlers.ExecutionHandlerTests.test_completed_stage_accepts_replaced_clean_resolution_before_skip tests.test_execution_handlers.ExecutionHandlerTests.test_completed_autostash_stage_accepts_replaced_clean_resolution tests.test_execution_handlers.ExecutionHandlerTests.test_staged_rebase_resume_accepts_allowed_added_files tests.test_execution_handlers.ExecutionHandlerTests.test_confirmed_checkpoint_push_remains_owned_during_pr_creation tests.test_execution_handlers.ExecutionHandlerTests.test_conflict_revision_priority_change_allows_old_workspace_metadata tests.test_execution_handlers.ExecutionHandlerTests.test_conflict_profile_complexity_change_resumes_same_worker tests.test_execution_handlers.ExecutionHandlerTests.test_conflict_profile_risk_change_resumes_same_worker tests.test_execution_handlers.ExecutionHandlerTests.test_conflict_profile_downgrade_preserves_escalated_level tests.test_scoped_blocking.ScopedBlockingTest.test_project_publication_block_recovers_only_matching_owned_rebase
+FINAL_RESULT: PASS (9 tests, failures=0, errors=0)
+```
+
+- 수정: stage 복원 후 marker 기록이 generation을 증가시키므로, 같은 계획·worktree·HEAD·target·원격의 유효한 현재 수용 기록과 원래 stage를 함께 재검사하도록 수정했다. unmerged index·보호 문서 변경·원격 경쟁은 계속 거부한다.
+
+```text
+FAILED_COMMAND: python3 -B -m unittest tests.test_managed_mutation_evidence.CurrentRebaseRuntimeAdapterTests.test_interrupted_blocked_rebase_adopts_clean_index_before_restoring_stage
+RERUN: python3 -B -m unittest tests.test_managed_mutation_evidence.CurrentRebaseRuntimeAdapterTests.test_interrupted_blocked_rebase_adopts_clean_index_before_restoring_stage
+FINAL_RESULT: PASS (1 tests, failures=0, errors=0)
+```
+
+- 수정: 별도 Manager HEAD 변경 검사에 필요한 fake git_bytes 응답을 추가했다. 현재 수용 HEAD만 비교 기준에 반영하고 이후 Manager Git 변경은 독립 증거 검사를 유지한다.
+
+```text
+FAILED_COMMAND: python3 -B -m unittest tests.test_execution_handlers.CurrentRebaseAgentScopeTests
+RERUN: python3 -B -m unittest tests.test_execution_handlers.CurrentRebaseAgentScopeTests
+FINAL_RESULT: PASS (4 tests, failures=0, errors=0)
+```
+
+- 수정: 많은 독립 mock context를 ExitStack으로 바꿔 Python의 정적 block 수 제한을 해결했다.
+
+```text
+FAILED_COMMAND: python3 -B -m unittest tests.test_managed_mutation_evidence.CurrentRebaseRuntimeAdapterTests.test_blocked_release_records_head_after_adoption_and_stage_restore
+RERUN: python3 -B -m unittest tests.test_managed_mutation_evidence.CurrentRebaseRuntimeAdapterTests.test_blocked_release_records_head_after_adoption_and_stage_restore
+FINAL_RESULT: PASS (1 tests, failures=0, errors=0)
+```

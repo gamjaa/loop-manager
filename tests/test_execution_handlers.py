@@ -168,7 +168,8 @@ class ExecutionHandlerTests(TestCase):
         self.assertNotEqual(lm.git(
             fixture.worktree, 'rebase', target, check=False, env=environment,
         ).returncode, 0)
-        handler._finish_rebase_journal(context)
+        with mock.patch.object(lm, 'pr_for_branch', return_value=pull_request):
+            handler._finish_rebase_journal(context)
         resolved = ['value=resolved\n'] + [f'line-{n}\n' for n in range(30)]
         app.write_text(''.join(resolved))
         git(fixture.worktree, 'add', 'code.py')
@@ -290,7 +291,7 @@ class ExecutionHandlerTests(TestCase):
                 saved_recovery = dict(handlers.recovery_state.RecoveryRepository(
                     connection,
                 ).row(repo, 'G-034'))
-                complete_rebase = journal.complete_rebase
+                complete_rebase = journal.record_current_rebase_result
                 def complete_then_change(*args, **kwargs):
                     completed = complete_rebase(*args, **kwargs)
                     if rejected == 'late-file':
@@ -299,7 +300,7 @@ class ExecutionHandlerTests(TestCase):
                         git(fixture.worktree, 'push', 'origin', f'{original}:refs/heads/{branch}')
                         git(fixture.repo, 'update-ref', '-d', f'refs/remotes/origin/{branch}')
                     return completed
-                with mock.patch.object(journal, 'complete_rebase', side_effect=complete_then_change):
+                with mock.patch.object(journal, 'record_current_rebase_result', side_effect=complete_then_change):
                     for _ in range(2):
                         self.assertFalse(resume())
                 self.assertEqual(dict(connection.execute('SELECT * FROM exec_plans').fetchone()), before)
@@ -330,9 +331,9 @@ class ExecutionHandlerTests(TestCase):
             self.assertTrue(resume())
             self.assertFalse(resume())
         row = connection.execute('SELECT * FROM exec_plans').fetchone()
-        self.assertEqual(row['status'], 'VERIFYING')
+        self.assertEqual(row['status'], 'IMPLEMENTING')
         self.assertEqual(row['worker_session_id'], 'saved-worker')
-        self.assertEqual(row['worker_result'], 'accepted correction')
+        self.assertIsNone(row['worker_result'])
         self.assertIsNone(row['verify_result'])
         self.assertIsNone(row['review_result'])
         self.assertIsNone(scoped_blocking.plan_block(connection, repo, 'G-034'))
@@ -351,10 +352,11 @@ class ExecutionHandlerTests(TestCase):
                 'SELECT * FROM blocked_checkpoints',
             ).fetchone()), published_before)
             self.assertEqual(row['publication_remote_oid'], original)
-            proof = ExecutionCheckpointRepository(connection).get(repo, 'G-034').completed_rebase()
-            self.assertEqual(proof['remote_oid'], original)
-            self.assertEqual(proof['before_head'], original)
-            self.assertEqual(proof['after_head'], git(fixture.worktree, 'rev-parse', 'HEAD'))
+            proof = ExecutionCheckpointRepository(connection).get(repo, 'G-034').current_rebase_acceptance()
+            self.assertEqual(proof['remote']['oid'], original)
+            audit_slot = journal._slot(fixture.state_dir, repo, 'managed_rebase', str(fixture.worktree.resolve()))
+            self.assertEqual(journal._read(audit_slot / f'{continuation}.intent.json')['expected']['before_head'], original)
+            self.assertEqual(proof['head'], git(fixture.worktree, 'rev-parse', 'HEAD'))
         self.assertEqual(handlers.recovery_state.RecoveryRepository(connection).row(
             repo, 'G-034',
         )['pending_action'], 'reconcile')
@@ -368,13 +370,19 @@ class ExecutionHandlerTests(TestCase):
     def _continue_recovered_rebase(self, fixture, target, pull_request):
         """Run the phase policies; external Agent and verify services stay fake."""
         repo = str(fixture.repo.resolve())
+        pr_query = mock.patch.object(lm, 'pr_for_branch', return_value=pull_request)
+        pr_query.start()
+        self.addCleanup(pr_query.stop)
         state = ExecutionStatePort(
             fixture.connection, runtime_state.RuntimeStateRepository(fixture.connection), repo,
         )
         effects = replace(
             self.effects, state=state,
             checkpoint=ExecutionCheckpointRepository(fixture.connection),
-            workspace=replace(self.effects.workspace, git=lm.git),
+            workspace=replace(self.effects.workspace, git=lm.git,
+                current_rebase_service=lambda context, **options: lm._current_rebase_service(
+                    fixture.connection, fixture.repo, fixture.state_dir, repo, 'G-034',
+                    fixture.worktree, context.branch, **options)),
         )
         handler = handlers.ExecutionHandlers(
             effects, repo=repo, repo_path=fixture.repo, state_dir=fixture.state_dir,
@@ -384,6 +392,8 @@ class ExecutionHandlerTests(TestCase):
         plan = handler._cached_plan(state.active_execplan(repo))
         handler.plan = plan
         handler.catalog_plan = state.active_execplan(repo)
+        effects.workspace.remote_branch_oid.side_effect = lm.remote_branch_oid
+        effects.publication.pr_for_branch.return_value = pull_request
         effects.agent.validate_worker_workspace_scope.return_value = plan
         effects.validation.validate_active_execplan_metadata.return_value = plan
         effects.validation.parse_worker_result.side_effect = lm.parse_worker_result
@@ -3073,6 +3083,8 @@ class ExecutionHandlerTests(TestCase):
         self.assertEqual(saved.snapshot['reactivated_from_head'], 'owned-head')
 
     def test_confirmed_checkpoint_push_remains_owned_during_pr_creation(self):
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.handler.effects = replace(self.effects, checkpoint=checkpoint)
         blocked_checkpoint_state.ensure_schema(self.connection)
         self.connection.execute(
             "INSERT INTO blocked_checkpoints "
@@ -3089,6 +3101,21 @@ class ExecutionHandlerTests(TestCase):
             expected_head='b' * 40, operation='push',
             snapshot={'blocked_resume': marker, 'remote_before': 'a' * 40},
         )
+        from managed_rebase_adoption import ManagedRebaseService
+        from tests.test_managed_rebase_validation import expectation, observation, scope_for
+        def current_service(context, **options):
+            expected = expectation(repo='repo', worktree='/state/G-047',
+                                   branch=context.branch, plan_id='G-047',
+                                   plan_path=context.plan.path)
+            expected = replace(expected, remote=replace(expected.remote,
+                               repository='repo', branch=context.branch, oid=options['remote_oid']))
+            service = ManagedRebaseService(expected, mock.Mock())
+            return service
+        self.handler._current_rebase_service = current_service
+        def current_observation(expected, _):
+            actual = observation(expected, head='b' * 40, branch_ref=('b' * 40, ''),
+                registration=('HEAD=' + 'b' * 40, 'branch=refs/heads/' + expected.branch))
+            return actual, scope_for(expected, actual)
         def git(_repo, *args, **_kwargs):
             self.assertEqual(args[0], 'ls-remote')
             return SimpleNamespace(
@@ -3097,6 +3124,8 @@ class ExecutionHandlerTests(TestCase):
             )
         self.effects.workspace.git.side_effect = git
         with (
+            mock.patch('managed_rebase_adoption.observe_current_rebase',
+                       side_effect=current_observation),
             mock.patch.object(handlers.checkpoint_ownership,
                               'rebase_preserves_commits', return_value=True),
             mock.patch.object(handlers.checkpoint_ownership,
@@ -3131,13 +3160,13 @@ class ExecutionHandlerTests(TestCase):
             ))
             self.assertFalse(self.handler._owned_checkpoint_remote(
                 self.context(), row, 'b' * 40, current,
-                {'headRefOid': 'b' * 40},
+                {'headRefOid': 'b' * 40, 'url': 'new-pr'},
             ))
             current.operation = 'pr_create'
             current.snapshot['remote_before'] = 'b' * 40
             self.assertTrue(self.handler._owned_checkpoint_remote(
                 self.context(), row, 'b' * 40, current,
-                {'headRefOid': 'b' * 40},
+                {'headRefOid': 'b' * 40, 'url': 'new-pr'},
             ))
 
     def test_interrupted_owned_push_persists_oid_before_clearing_intent(self):
@@ -3506,17 +3535,17 @@ class ExecutionHandlerTests(TestCase):
     def test_completed_autostash_stage_matching_head_resumes_without_rebase(self):
         self._assert_staged_rebase_resume(False, clean_after_stage=True)
 
-    def test_completed_stage_rejects_replaced_clean_resolution_before_skip(self):
+    def test_completed_stage_accepts_replaced_clean_resolution_before_skip(self):
         self._assert_staged_rebase_resume(
             True, clean_after_stage=True, replaced_resolution=True,
         )
 
-    def test_completed_autostash_stage_rejects_replaced_clean_resolution(self):
+    def test_completed_autostash_stage_accepts_replaced_clean_resolution(self):
         self._assert_staged_rebase_resume(
             False, clean_after_stage=True, replaced_resolution=True,
         )
 
-    def test_staged_rebase_resume_rejects_added_files(self):
+    def test_staged_rebase_resume_accepts_allowed_added_files(self):
         self._assert_staged_rebase_resume(True, changed=True)
 
     def test_pending_stage_resumes_accepted_unstaged_changes(self):
@@ -3738,13 +3767,6 @@ class ExecutionHandlerTests(TestCase):
             self.assertEqual(set(call.args[4:]),
                              {'app.py', 'allowed.py'} if unstaged or untracked
                              else {'app.py'})
-        if changed or replaced_resolution:
-            self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
-            self.assertEqual(checkpoint.get('repo', 'G-047').operation, 'rebase')
-            self.assertFalse(any('--continue' in call.args or '--skip' in call.args
-                                 for call in self.effects.workspace.git.call_args_list))
-            self.effects.validation.verify.assert_not_called()
-            return
         self.assertEqual(result.phase, ExecutionPhase.IMPLEMENTING)
         self.assertIsNone(self.state.row()['worker_result'])
         self.assertEqual(self.state.row()['worker_session_id'], 'saved-session')
@@ -4196,8 +4218,8 @@ class ExecutionHandlerTests(TestCase):
         self.effects.workspace._rebase_in_progress_for_branch.return_value = False
         refreshed = self.handler.guard(self.handler._context())
         self.assertEqual(refreshed.kind, ExecutionOutcomeKind.RETRY)
-        self.assertEqual(self.state.row()['phase'], 'VERIFYING')
-        self.assertEqual(self.state.row()['worker_result'], READY_WORKER_RESULT)
+        self.assertEqual(self.state.row()['phase'], 'WORKING')
+        self.assertIsNone(self.state.row()['worker_result'])
 
     def _assert_conflict_profile_resume(self, old_profile, new_profile, effective):
         self.connection.execute(
@@ -4247,8 +4269,8 @@ class ExecutionHandlerTests(TestCase):
         self.dirty = False
         self.effects.workspace._rebase_in_progress_for_branch.return_value = False
         self.handler.guard(self.handler._context())
-        self.assertEqual(self.state.row()['phase'], 'VERIFYING')
-        self.assertEqual(self.state.row()['worker_result'], READY_WORKER_RESULT)
+        self.assertEqual(self.state.row()['phase'], 'WORKING')
+        self.assertIsNone(self.state.row()['worker_result'])
 
     def test_conflict_profile_complexity_change_resumes_same_worker(self):
         self._assert_conflict_profile_resume(('low', 'low'), ('high', 'low'), 1)
@@ -5702,6 +5724,7 @@ class CurrentRebaseAgentScopeTests(TestCase):
             mock.patch.object(lm, '_proven_merged_cleanup_paths', return_value=frozenset()),
             mock.patch.object(Path, 'is_dir', return_value=True),
             mock.patch.object(lm, 'git', return_value=SimpleNamespace(stdout='', returncode=0)),
+            mock.patch.object(lm, 'git_bytes', return_value=b''),
         ):
             patch.start()
             self.addCleanup(patch.stop)
@@ -5721,6 +5744,38 @@ class CurrentRebaseAgentScopeTests(TestCase):
         updated = self.case.checkpoint.get('repo', 'G-047')
         self.assertEqual(updated.snapshot['current_rebase_agent_baseline_history'],
                          [saved.snapshot['current_rebase_agent_baseline']])
+
+    def test_later_head_change_still_requires_independent_manager_git_proof(self):
+        connection = self.case.fixture.connection
+        lm.begin_agent_scope(connection, 'repo', Path('/state/G-047'), 'worker')
+        accepted_start = self.current
+        from managed_rebase_adoption import needs_agent_comparison
+        self.assertFalse(needs_agent_comparison(
+            replace(self.case.checkpoint.get('repo', 'G-047'), operation='commit'),
+            self.original, accepted_start))
+        self.current = replace(self.current, head='later-head',
+            refs={**self.current.refs, 'refs/heads/loop-manager/G-047': ('later-head', '')},
+            worktrees={'/state/G-047': ('HEAD=later-head', 'branch=refs/heads/loop-manager/G-047')})
+        connection.execute("UPDATE projects SET agent_result_snapshot = ? WHERE repo='repo'",
+                           (accepted_start.serialize(),))
+        with self.assertRaises(lm.AgentScopeError):
+            lm.validate_persisted_agent_scope(connection, Path('/repo'), Path('/state'), 'repo')
+        self.assertEqual(connection.execute("SELECT agent_snapshot FROM projects WHERE repo='repo'").fetchone()[0],
+                         self.original.serialize())
+
+    def test_fresh_scope_preserves_restored_stage_without_readopting_rebase(self):
+        connection = self.case.fixture.connection
+        self.current = replace(self.current,
+            index={'app.py': ('H 100644 original-staged-blob 0',)},
+            dirty={'app.py': (('staged',), 'original-file')})
+        self.original = self.current
+        self.case.state.update_project('repo', agent_snapshot=self.original.serialize(),
+                                       agent_result_snapshot=self.current.serialize())
+        with mock.patch.object(lm, '_current_rebase_service', side_effect=AssertionError('fresh scope is not rebase completion')):
+            self.assertEqual(lm.begin_agent_scope(connection, 'repo', Path('/state/G-047'), 'worker'), self.original)
+            self.assertEqual(lm.validate_persisted_agent_scope(connection, Path('/repo'), Path('/state'), 'repo'), self.current)
+        self.assertEqual(connection.execute("SELECT agent_snapshot FROM projects WHERE repo='repo'").fetchone()[0],
+                         self.original.serialize())
 
     def test_persisted_actual_agent_result_still_rejects_shared_ref_violation(self):
         connection = self.case.fixture.connection

@@ -140,6 +140,7 @@ import agent_scope_decision
 import rebase_file_evidence
 import managed_rebase_evidence
 import managed_rebase_adoption
+import managed_rebase_validation
 import managed_rebase_runtime
 import rebase_block_reconciliation
 import manager_git_journal
@@ -9526,17 +9527,35 @@ def _complete_direct_rebase_checkpoint(
     )
     runtime = runtime_state.RuntimeStateRepository(connection)
     projected = runtime.projected(repo)
-    if projected is None:
+    if projected is None or projected.status == 'PLAN_BLOCKED':
         selected = runtime.get(repo, plan_id)
         observed, decision = service.require_owned()
         if selected is None or selected.status != 'PLAN_BLOCKED' or decision.status.value != 'complete':
             raise manager_git_journal.MutationEvidenceError('current rebase execution is not selected')
-        with runtime_state._transaction(connection):
-            if runtime.get(repo, plan_id) != selected or checkpoint.get(repo, plan_id) != current:
-                raise manager_git_journal.MutationEvidenceError('current blocked rebase ownership changed')
-            if service.observe()[1] != decision:
-                raise manager_git_journal.MutationEvidenceError('current blocked rebase state changed')
-            checkpoint.accept_current_rebase(repo, plan_id, acceptance=decision.acceptance)
+        if projected is not None:
+            runtime.complete_rebase(
+                selected, checkpoint, acceptance=decision.acceptance,
+                project_values={'phase': selected.phase},
+                reobserve=lambda: service.observe()[1],
+            )
+        else:
+            with runtime_state._transaction(connection):
+                if runtime.get(repo, plan_id) != selected or checkpoint.get(repo, plan_id) != current:
+                    raise manager_git_journal.MutationEvidenceError('current blocked rebase ownership changed')
+                if service.observe()[1] != decision or runtime.projected(repo) is not None:
+                    raise manager_git_journal.MutationEvidenceError('current blocked rebase state changed')
+                values = managed_rebase_adoption.revalidation_values(target_base_oid)
+                for field in ('phase', 'last_error', 'revision_resume_status'):
+                    values.pop(field)
+                checkpoint.accept_current_rebase(
+                    repo, plan_id, acceptance=decision.acceptance,
+                    prior_artifacts={field: getattr(selected, field) for field in values},
+                )
+                runtime.transition(repo, plan_id, plan_values=values,
+                                   project_values={'phase': connection.execute(
+                                       'SELECT phase FROM projects WHERE repo = ?', (repo,)
+                                   ).fetchone()[0]},
+                                   expected_status='PLAN_BLOCKED', enqueue=False)
         return
     if projected.plan_id != plan_id:
         raise manager_git_journal.MutationEvidenceError('current rebase execution is not selected')
@@ -10852,13 +10871,16 @@ def begin_agent_scope(
         checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, plan_id or '')
         if plan_id and (checkpoint.operation == 'rebase'
                         or (checkpoint.snapshot or {}).get('current_rebase_acceptance')):
+            current = capture_git_snapshot(worktree)
+            if not managed_rebase_adoption.needs_agent_comparison(checkpoint, stored, current):
+                return stored
             state_dir = _owned_rebase_state_dir(repo, plan_id, worktree)
             if state_dir is None:
                 raise AgentScopeError('accepted rebase workspace unavailable')
             _current_rebase_service(connection, Path(repo), state_dir, repo,
                                     plan_id, worktree, row['branch']).require_owned()
             effective = managed_rebase_adoption.selected_baseline(
-                stored, capture_git_snapshot(worktree), row['branch'], str(worktree.resolve()))
+                stored, current, row['branch'], str(worktree.resolve()))
             managed_rebase_adoption.remember_agent_baseline(
                 execution_checkpoint_state.ExecutionCheckpointRepository(connection),
                 repo, plan_id, stored, effective, role_name)
@@ -13472,10 +13494,17 @@ def validate_persisted_agent_scope(
 
     rebase_checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
         repo, _plan_id_from_path(selected_plan_path) or '')
+    if (role_name in {'worker', 'reviewer'}
+            and (rebase_checkpoint.snapshot or {}).get('current_rebase_agent_baseline')):
+        comparison = managed_rebase_adoption.agent_comparison_baseline(
+            GitSnapshot.deserialize(str(project['agent_snapshot'])),
+            rebase_checkpoint.snapshot or {}, role_name)
+        before = _normalize_legacy_ignored_snapshot(
+            saved_worktree, _with_proven_legacy_ignore_config(comparison, current_config), current)
     rebase_scope_normalized = False
     if (role_name in {'worker', 'reviewer'} and phase != 'PLAN_BLOCKED'
-            and (rebase_checkpoint.operation == 'rebase'
-                 or (rebase_checkpoint.snapshot or {}).get('current_rebase_acceptance'))):
+            and managed_rebase_adoption.needs_agent_comparison(rebase_checkpoint,
+                GitSnapshot.deserialize(str(project['agent_snapshot'])), current)):
         _current_rebase_service(
             connection, repo_path, state_dir, repo,
             _plan_id_from_path(selected_plan_path), saved_worktree, project['branch'],
@@ -14782,7 +14811,7 @@ def _record_blocked_resume_head(
 
 
 def _blocked_resume_worktree_matches(
-    worktree: Path, marker: dict, current: GitSnapshot,
+    worktree: Path, marker: dict, current: GitSnapshot, *, restore_staged: bool = True,
 ) -> bool:
     """Match preserved files and staging, allowing only autostash unstaging."""
     serialized = marker.get('before_snapshot')
@@ -14818,6 +14847,8 @@ def _blocked_resume_worktree_matches(
         # Only a clean index can be attributed to rebase --autostash.
         if git(worktree, 'diff', '--cached', '--quiet', check=False).returncode:
             return False
+        if not restore_staged:
+            return True
         _restore_agent_staged_entries(worktree, before)
         restored = capture_git_snapshot(worktree)
         return restored.dirty == before.dirty and all(
@@ -14878,19 +14909,38 @@ def _resume_interrupted_blocked_rebase(
             if state_dir is None:
                 safe = False
             else:
-                _finish_owned_direct_rebase(
-                    state_dir, connection, repo_path, repo,
-                    str(plan['plan_id']), worktree, branch,
-                    agent_session_id=plan['worker_session_id'],
-                )
-                safe = (
-                    _direct_rebase_history_proven(
+                accepted = (checkpoint.snapshot or {}).get('current_rebase_acceptance')
+                if (checkpoint.operation is None and isinstance(accepted, dict)
+                        and managed_rebase_validation.valid_acceptance(accepted)
+                        and (accepted['repo'], accepted['plan_id'], accepted['branch'], accepted['worktree'])
+                            == (repo, str(plan['plan_id']), branch, str(worktree.resolve()))):
+                    # A prior clean result was already adopted. Original stage
+                    # restoration is preservation, not another completed candidate.
+                    observed, decision = _current_rebase_service(
+                        connection, repo_path, state_dir, repo, str(plan['plan_id']),
+                        worktree, branch, target=target_base,
+                    ).observe()
+                    restored_stage = (decision.reason == 'unresolved_operation_or_index'
+                                      and observed.metadata is None and not observed.operations
+                                      and observed.index_clean is False and bool(observed.staged)
+                                      and not any(entry.stage for entry in observed.index))
+                    safe = (accepted['head'] == current_head == checkpoint.expected_head
+                            and accepted['target_base_oid'] == target_base
+                            and accepted['remote']['oid'] == owned_oid
+                            and (decision.status.value == 'complete' or restored_stage))
+                else:
+                    _finish_owned_direct_rebase(
+                        state_dir, connection, repo_path, repo,
+                        str(plan['plan_id']), worktree, branch,
+                        agent_session_id=plan['worker_session_id'],
+                    )
+                    safe = _direct_rebase_history_proven(
                         connection, repo_path, repo, str(plan['plan_id']), worktree,
                         branch, before_head, current_head, target_base,
                         plan['worker_session_id'],
                     )
-                    and _blocked_resume_worktree_matches(worktree, marker, snapshot)
-                )
+                safe = safe and _blocked_resume_worktree_matches(
+                    worktree, marker, snapshot, restore_staged=False)
     except (OSError, RuntimeError, ValueError, KeyError, TypeError):
         safe = False
     if not safe:
@@ -14909,6 +14959,10 @@ def _resume_interrupted_blocked_rebase(
     except (RuntimeError, OSError, ValueError) as error:
         _update_blocked_error(connection, repo, str(plan['plan_id']),
                               f'중단된 차단 해제 rebase 완료 근거가 다릅니다: {error}')
+        return False
+    if not _blocked_resume_worktree_matches(worktree, marker, capture_git_snapshot(worktree)):
+        _update_blocked_error(connection, repo, str(plan["plan_id"]),
+                              "중단된 차단 해제 rebase의 index 복원 결과가 다릅니다.")
         return False
     if not after_head:
         _record_blocked_resume_head(
@@ -15151,18 +15205,6 @@ def resume_blocked_execplan_if_inputs_changed(
             error = f"BLOCKED 해제 전 rebase 실패:\n{rebased.stdout[-8000:]}"
             _update_blocked_error(connection, repo, str(plan["plan_id"]), error)
             return False
-        if preserved_before is not None:
-            try:
-                _restore_agent_staged_entries(worktree, preserved_before)
-            except (AgentScopeError, RuntimeError) as error:
-                restore_error = f"BLOCKED 해제 후 index 복원 실패:\n{error}"
-                _update_blocked_error(
-                    connection,
-                    repo,
-                    str(plan["plan_id"]),
-                    restore_error,
-                )
-                return False
     if worktree.is_dir():
         metadata_error = _blocked_execplan_metadata_error(repo_path, worktree, plan)
         if metadata_error:
@@ -15189,17 +15231,14 @@ def resume_blocked_execplan_if_inputs_changed(
         )
         if not _blocked_resume_worktree_matches(
             worktree, pending.snapshot['blocked_resume'], capture_git_snapshot(worktree),
+            restore_staged=False,
         ):
             _update_blocked_error(connection, repo, str(plan['plan_id']),
                                   '차단 해제 rebase 이후 보존한 작업 상태가 다릅니다.')
             return False
-        # The preservation check may restore staged entries. Pin its resulting
-        # Git state before recording a new HEAD in the checkpoint marker.
+        # Adopt the clean rebase result before restoring the original staging.
+        # Restored work remains unverified and belongs to the next Worker turn.
         preserved_observation = _owned_rebase_journal_state(worktree, branch)
-        _record_blocked_resume_head(
-            connection, repo, str(plan['plan_id']), owned_oid,
-            before_head, target_base_oid, after_head,
-        )
         if base_ancestry.returncode == 1:
             _complete_direct_rebase_checkpoint(
                 connection, repo, str(plan['plan_id']), worktree,
@@ -15214,6 +15253,25 @@ def resume_blocked_execplan_if_inputs_changed(
             connection, repo, str(plan['plan_id']), worktree, target_base_oid,
             repo_path=repo_path, branch=branch,
             agent_session_id=plan['worker_session_id'],
+        )
+
+    if base_ancestry.returncode == 1 and preserved_before is not None:
+        try:
+            _restore_agent_staged_entries(worktree, preserved_before)
+        except (AgentScopeError, RuntimeError) as error:
+            restore_error = f"BLOCKED 해제 후 index 복원 실패:\n{error}"
+            _update_blocked_error(
+                connection,
+                repo,
+                str(plan["plan_id"]),
+                restore_error,
+            )
+            return False
+
+    if owned_oid is not None:
+        _record_blocked_resume_head(
+            connection, repo, str(plan['plan_id']), owned_oid,
+            before_head, target_base_oid, after_head,
         )
 
     clear_agent_scope(connection, repo)
@@ -23772,8 +23830,8 @@ def _ExecutionLifecyclePorts(connection, runtime_repository, **identity):
             resume_pr_conflict_rebase=state.bind(resume_pr_conflict_rebase, name="resume_pr_conflict_rebase", connected=True, mutates=True),
             git_operation_entries=state.bind(_git_operation_entries, name="git_operation_entries", connected=False, mutates=False),
             current_rebase_service=lambda context, **options: _current_rebase_service(
-                connection, repo_path, state_dir, repo, context.plan.plan_id,
-                context.worktree, context.branch, **options),
+                connection, identity["repo_path"], identity["state_dir"], identity["repo"],
+                context.plan.plan_id, context.worktree, context.branch, **options),
         ),
         agent=execution_handlers.AgentEffects(
             begin_agent_scope=state.bind(begin_agent_scope, name="begin_agent_scope", connected=True, mutates=True),

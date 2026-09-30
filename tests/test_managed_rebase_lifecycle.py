@@ -353,7 +353,7 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                 fixture.remote = git(repo, 'rev-parse', 'HEAD').stdout.strip()
                 connection.execute('UPDATE exec_plans SET current_revision_sha = ?', (fixture.remote,))
             slot = journal._slot(state_dir, str(repo.resolve()), 'managed_rebase', str(worktree.resolve()))
-            self.assertEqual((slot / 'active.json').exists(), not sealed_restart and not missing_journal)
+            self.assertEqual((slot / 'active.json').exists(), not sealed_restart and not missing_journal and not manual)
             sealed_before = {path.name: path.read_bytes()
                              for path in slot.glob('*.result.json')}
             intents_before = {path.name: path.read_bytes()
@@ -361,8 +361,7 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
             if sealed_restart:
                 final_results = [journal._read(path) for path in slot.glob('*.result.json')
                                  if journal._read(path)['observed']['metadata'] is None]
-                self.assertEqual(len(final_results), 1)
-                sealed_id = final_results[0]['id']
+                self.assertEqual(len(final_results), 0 if manual else 1)
                 self.assertIsNone(effects.checkpoint.get(repo_key, 'G-047').completed_rebase())
             self.assertEqual(effects.checkpoint.get(repo_key, 'G-047').operation, 'rebase')
             audit_row = handler.rebase_corrections.get(repo_key, 'G-047')

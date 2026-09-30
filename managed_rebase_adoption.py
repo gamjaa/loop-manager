@@ -9,7 +9,7 @@ import hashlib
 
 from managed_rebase_observation import ObservationAdapters, observe_current_rebase
 from managed_rebase_validation import (
-    RebaseExpectation, RebaseStatus, assess_current_rebase,
+    ObservationFailure, RebaseExpectation, RebaseStatus, assess_current_rebase,
 )
 from manager_git_journal import MutationEvidenceError
 
@@ -37,7 +37,8 @@ class ManagedRebaseService:
     def require_owned(self):
         observed, decision = self.observe()
         if decision.status not in {RebaseStatus.START, RebaseStatus.WAITING, RebaseStatus.COMPLETE}:
-            raise MutationEvidenceError('current rebase rejected: ' + decision.reason)
+            detail = ': ' + observed.detail if isinstance(observed, ObservationFailure) else ''
+            raise MutationEvidenceError('current rebase rejected: ' + decision.reason + detail)
         return observed, decision
 
     def adopt(self, state, checkpoint):
@@ -50,6 +51,15 @@ class ManagedRebaseService:
             project_values=revalidation_values(self.expected.target_base_oid),
         )
         return observed
+
+
+def needs_agent_comparison(checkpoint, original, current):
+    """Only absorb a rebase across a saved scope, not a fresh Agent's work."""
+    accepted = (checkpoint.snapshot or {}).get('current_rebase_acceptance')
+    return bool(checkpoint.operation == 'rebase' or (
+        checkpoint.operation is None and isinstance(accepted, dict)
+        and accepted.get('head') == current.head
+        and original.head != current.head))
 
 
 def selected_baseline(snapshot, current, branch, worktree):

@@ -1,6 +1,7 @@
 """Narrow ownership checks for managed workspace and rebase journal entries."""
 
 from pathlib import Path
+from contextlib import ExitStack
 from dataclasses import replace
 from managed_rebase_validation import FileChange, IndexEntry
 from tests.test_execution_handlers import current_rebase_case
@@ -15,6 +16,7 @@ from execution_handlers import ExecutionHandlers
 from rebase_correction import CorrectionAction
 import manager_git_journal as journal
 import loop_manager
+import runtime_state
 from execution_checkpoint_state import ExecutionCheckpointRepository
 
 
@@ -1126,6 +1128,223 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
         ports.reset_mock()
         self.assertTrue(service.adapters.contracts_allowed(observation(service.expected)))
         self.assertEqual(ports.mock_calls, [])
+
+    def test_lifecycle_factory_binds_selected_repository_identity_and_options(self):
+        from tests.test_runtime_state import CurrentRebaseRuntimeTests
+        fixture = CurrentRebaseRuntimeTests()
+        connection, runtime, *_ = fixture.fixture()
+        self.addCleanup(fixture.doCleanups)
+        handler = loop_manager._ExecutionLifecyclePorts(
+            connection, runtime, repo='repo', repo_path=Path('/repo'),
+            state_dir=Path('/state'), base='main', base_sha='base',
+            provider='codex', config_path=Path('/config'), newly_activated=False,
+        )
+        context = SimpleNamespace(plan=SimpleNamespace(plan_id='G-047'),
+                                  worktree=Path('/owned'), branch='loop-manager/G-047')
+        service = object()
+        with mock.patch.object(loop_manager, '_current_rebase_service', return_value=service) as build:
+            self.assertIs(handler.effects.workspace.current_rebase_service(
+                context, target='latest', remote_oid=None), service)
+        build.assert_called_once_with(connection, Path('/repo'), Path('/state'), 'repo',
+                                      'G-047', Path('/owned'), 'loop-manager/G-047',
+                                      target='latest', remote_oid=None)
+
+    def test_direct_acceptance_preserves_projected_and_unprojected_blocks(self):
+        for projected in (True, False):
+            with self.subTest(projected=projected):
+                case = current_rebase_case(self)
+                connection, runtime = case.fixture.connection, case.fixture.repository
+                selected = runtime.projected('repo')
+                runtime.transition_from_snapshot(selected,
+                    plan_values={'status': 'PLAN_BLOCKED', 'blocked_reason': 'agent_scope',
+                                 'last_error': 'scope failure'},
+                    project_values={'phase': 'PLAN_BLOCKED', 'last_error': 'scope failure'})
+                if not projected:
+                    runtime.update_project('repo', runtime_state.clear_project_values())
+                with (
+                    mock.patch.object(loop_manager, '_owned_rebase_state_dir', return_value=Path('/state')),
+                    mock.patch.object(loop_manager, '_current_rebase_service',
+                                      side_effect=lambda *_a, **_k: case.factory(None)),
+                ):
+                    loop_manager._complete_direct_rebase_checkpoint(connection, 'repo', 'G-047',
+                        Path('/state/G-047'), 'base', repo_path=Path('/repo'),
+                        branch='loop-manager/G-047', agent_session_id=None)
+                result = runtime.get('repo', 'G-047')
+                self.assertEqual(result.status, 'PLAN_BLOCKED')
+                self.assertEqual(result.last_error, 'scope failure')
+                self.assertIsNone(result.worker_result)
+                self.assertIsNone(result.verify_result)
+                self.assertIsNone(result.review_result)
+                self.assertEqual(connection.execute('SELECT blocked_reason FROM exec_plans').fetchone()[0],
+                                 'agent_scope')
+                self.assertIsNone(case.checkpoint.get('repo', 'G-047').operation)
+                self.assertEqual(runtime.projected('repo') is not None, projected)
+
+    def test_blocked_release_records_head_after_adoption_and_stage_restore(self):
+        import blocked_checkpoint_state
+        case = current_rebase_case(self)
+        connection, runtime = case.fixture.connection, case.fixture.repository
+        selected = runtime.projected('repo')
+        runtime.transition_from_snapshot(selected,
+            plan_values={'status': 'PLAN_BLOCKED', 'blocked_reason': 'verify',
+                         'blocked_fingerprint': 'old-input'}, project_values={'phase': 'PLAN_BLOCKED'})
+        blocked_checkpoint_state.ensure_schema(connection)
+        connection.execute("INSERT INTO blocked_checkpoints "
+            "(repo, plan_id, request_identity, phase, reason_code, evidence, branch, worktree, accepted_remote_oid) "
+            "VALUES ('repo', 'G-047', 'request', 'published', 'verify', 'failure', "
+            "'loop-manager/G-047', '/state/G-047', 'remote')")
+        before = loop_manager.GitSnapshot('before', 'loop-manager/G-047',
+            {'app.py': ('H 100644 staged-blob 0',)}, {'app.py': (('staged',), 'preserved')}, {}, {}, {}, {})
+        snapshots, events = [before], []
+        plan = connection.execute('SELECT * FROM exec_plans').fetchone()
+        def git(_root, *args, **_kwargs):
+            return SimpleNamespace(returncode=int(args[:1] == ('merge-base',) and 'refs/remotes/origin/main' in args),
+                stdout='base' if 'refs/remotes/origin/main' in args else snapshots[0].head)
+        def rebase(*_args, **_kwargs):
+            events.append('rebase')
+            snapshots[0] = replace(before, head='owned-head', index={'app.py': ('H 100644 rebased-blob 0',)},
+                                   dirty={'app.py': (('unstaged',), 'preserved')})
+            return SimpleNamespace(returncode=0, stdout='completed')
+        actual_complete = loop_manager._complete_direct_rebase_checkpoint
+        actual_record = loop_manager._record_blocked_resume_head
+        def complete(*args, **kwargs):
+            self.assertEqual(snapshots[0].dirty['app.py'][0], ('unstaged',))
+            events.append('adopt')
+            return actual_complete(*args, **kwargs)
+        def restore(*_args):
+            self.assertIsNone(case.checkpoint.get('repo', 'G-047').operation)
+            events.append('restore')
+            snapshots[0] = replace(snapshots[0], index=before.index, dirty=before.dirty)
+        def record(*args):
+            if args[6] is not None:
+                events.append('record-head')
+            return actual_record(*args)
+        patches = (
+            mock.patch.object(loop_manager, '_plan_block_selected_for_release', return_value=plan),
+            mock.patch.object(loop_manager, '_revision_execplan_input_fingerprint', return_value='new-input'),
+            mock.patch.object(loop_manager, '_revision_review_issue_fingerprint', return_value=None),
+            mock.patch.object(loop_manager, '_worktree_execplan_input_fingerprint', return_value='old-input'),
+            mock.patch.object(Path, 'is_dir', return_value=True),
+            mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
+            mock.patch.object(loop_manager, 'make_worktree'),
+            mock.patch.object(loop_manager, '_resume_interrupted_blocked_rebase', return_value=None),
+            mock.patch.object(loop_manager, 'validate_blocked_agent_scope'),
+            mock.patch.object(loop_manager, 'preserve_blocked_agent_changes', return_value=before),
+            mock.patch.object(loop_manager, 'remote_branch_oid', return_value='remote'),
+            mock.patch.object(loop_manager.checkpoint_ownership, 'owned_remote_oid', return_value='remote'),
+            mock.patch.object(loop_manager, 'capture_git_snapshot', side_effect=lambda _: snapshots[0]),
+            mock.patch.object(loop_manager, 'git', side_effect=git),
+            mock.patch.object(loop_manager, '_journaled_direct_rebase', side_effect=rebase),
+            mock.patch.object(loop_manager, '_blocked_execplan_metadata_error', return_value=None),
+            mock.patch.object(loop_manager, '_owned_rebase_state_dir', return_value=Path('/state')),
+            mock.patch.object(loop_manager, '_current_rebase_service', side_effect=lambda *_a, **_k: case.factory(None)),
+            mock.patch.object(loop_manager, '_owned_rebase_journal_state', return_value={'head': 'owned-head'}),
+            mock.patch.object(loop_manager, '_complete_direct_rebase_checkpoint', side_effect=complete),
+            mock.patch.object(loop_manager, '_restore_agent_staged_entries', side_effect=restore),
+            mock.patch.object(loop_manager, '_record_blocked_resume_head', side_effect=record),
+            mock.patch.object(loop_manager, 'clear_agent_scope'),
+            mock.patch.object(loop_manager, '_requeue_blocked_execplan', side_effect=lambda *_a, **_k: events.append('requeue')),
+        )
+        with ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            self.assertTrue(loop_manager.resume_blocked_execplan_if_inputs_changed(
+                connection, Path('/repo'), 'repo', 'main', Path('/state')))
+        self.assertEqual(events, ['rebase', 'adopt', 'restore', 'record-head', 'requeue'])
+        self.assertEqual(snapshots[0].index, before.index)
+
+    def test_interrupted_blocked_rebase_adopts_clean_index_before_restoring_stage(self):
+        import blocked_checkpoint_state
+        from managed_rebase_validation import WorktreeFile
+        case = current_rebase_case(self)
+        connection, runtime = case.fixture.connection, case.fixture.repository
+        selected = runtime.projected('repo')
+        runtime.transition_from_snapshot(selected,
+            plan_values={'status': 'PLAN_BLOCKED', 'blocked_reason': 'verify'},
+            project_values={'phase': 'PLAN_BLOCKED'})
+        blocked_checkpoint_state.ensure_schema(connection)
+        connection.execute("INSERT INTO blocked_checkpoints "
+            "(repo, plan_id, request_identity, phase, reason_code, evidence, branch, worktree, accepted_remote_oid) "
+            "VALUES ('repo', 'G-047', 'request', 'published', 'verify', 'failure', "
+            "'loop-manager/G-047', '/state/G-047', 'remote')")
+        before = loop_manager.GitSnapshot('before', 'loop-manager/G-047',
+            {'app.py': ('H 100644 staged-blob 0',)}, {'app.py': (('staged',), 'preserved')},
+            {}, {}, {}, {})
+        current = replace(before, head='owned-head', index={'app.py': ('H 100644 rebased-blob 0',)},
+                          dirty={'app.py': (('unstaged',), 'preserved')})
+        snapshots = [current]
+        case.observed = replace(case.observed,
+            files=(WorktreeFile('app.py', ('unstaged',), '100644', 'preserved'),))
+        loop_manager._record_blocked_resume_head(connection, 'repo', 'G-047', 'remote',
+                                               'before', 'base', None, before.serialize())
+        events = []
+        actual_complete = loop_manager._complete_direct_rebase_checkpoint
+        def complete(*args, **kwargs):
+            self.assertEqual(snapshots[0].dirty['app.py'][0], ('unstaged',))
+            events.append('adopt')
+            return actual_complete(*args, **kwargs)
+        def restore(_worktree, _before):
+            self.assertIsNone(case.checkpoint.get('repo', 'G-047').operation)
+            self.assertEqual(runtime.get('repo', 'G-047').status, 'PLAN_BLOCKED')
+            events.append('restore')
+            snapshots[0] = replace(current, index=before.index, dirty=before.dirty)
+        plan = connection.execute('SELECT * FROM exec_plans').fetchone()
+        with (
+            mock.patch.object(loop_manager, 'git', side_effect=lambda _root, *args, **_k: SimpleNamespace(returncode=0,
+                stdout='base' if 'refs/remotes/origin/main' in args else 'owned-head')),
+            mock.patch.object(loop_manager, 'remote_branch_oid', return_value='remote'),
+            mock.patch.object(loop_manager.checkpoint_ownership, 'owned_remote_oid', return_value='remote'),
+            mock.patch.object(loop_manager, 'capture_git_snapshot', side_effect=lambda _: snapshots[0]),
+            mock.patch.object(loop_manager, '_blocked_execplan_metadata_error', return_value=None),
+            mock.patch.object(loop_manager, '_owned_rebase_state_dir', return_value=Path('/state')),
+            mock.patch.object(loop_manager, '_current_rebase_service', side_effect=lambda *_a, **_k: case.factory(None)),
+            mock.patch.object(loop_manager, '_finish_owned_direct_rebase'),
+            mock.patch.object(loop_manager, '_owned_rebase_journal_state', return_value={'head': 'owned-head'}),
+            mock.patch.object(loop_manager, '_complete_direct_rebase_checkpoint', side_effect=complete),
+            mock.patch.object(loop_manager, '_restore_agent_staged_entries', side_effect=restore),
+            mock.patch.object(loop_manager, 'clear_agent_scope'),
+            mock.patch.object(loop_manager, '_requeue_blocked_execplan', side_effect=lambda *_a, **_k: events.append('requeue')) as requeue,
+        ):
+            self.assertTrue(loop_manager._resume_interrupted_blocked_rebase(
+                connection, Path('/repo'), 'repo', 'main', plan, Path('/state/G-047'), 'loop-manager/G-047'))
+            self.assertEqual(events, ['adopt', 'restore', 'requeue'])
+            saved = case.checkpoint.get('repo', 'G-047')
+            events.clear()
+            case.observed = replace(case.observed, index_clean=False,
+                staged=(FileChange('app.py', '100644', '100644', 'rebased-blob', 'staged-blob', 'M'),))
+            with mock.patch.object(loop_manager, '_complete_direct_rebase_checkpoint') as completed:
+                self.assertTrue(loop_manager._resume_interrupted_blocked_rebase(
+                    connection, Path('/repo'), 'repo', 'main', plan, Path('/state/G-047'), 'loop-manager/G-047'))
+                completed.assert_called_once()
+            self.assertEqual(case.checkpoint.get('repo', 'G-047'), saved)
+            staged = case.observed
+            for unsafe in (
+                replace(staged, index=(IndexEntry('app.py', '100644', 'unmerged', 2, 'M', 0x2000),)),
+                replace(staged, committed=(FileChange('AGENTS.md', '100644', '100644', 'old', 'unsafe', 'M'),)),
+                replace(staged, remote=replace(staged.remote, oid='external')),
+            ):
+                with self.subTest(unsafe=unsafe):
+                    case.observed = unsafe
+                    requeue.reset_mock()
+                    self.assertFalse(loop_manager._resume_interrupted_blocked_rebase(
+                        connection, Path('/repo'), 'repo', 'main', plan, Path('/state/G-047'), 'loop-manager/G-047'))
+                    requeue.assert_not_called()
+                    self.assertEqual(case.checkpoint.get('repo', 'G-047'), saved)
+        self.assertEqual(events, ['requeue'])
+        self.assertEqual(snapshots[0].dirty, before.dirty)
+        self.assertEqual(snapshots[0].index, before.index)
+        self.assertIsNone(runtime.get('repo', 'G-047').verify_result)
+
+    def test_observation_failure_keeps_query_detail_without_acceptance(self):
+        from managed_rebase_adoption import ManagedRebaseService
+        from managed_rebase_validation import ObservationFailure
+        case = current_rebase_case(self)
+        original = case.checkpoint.get('repo', 'G-047')
+        with mock.patch('managed_rebase_adoption.observe_current_rebase',
+                        return_value=(ObservationFailure('query_or_scope_failed', 'live PR query failed'), None)):
+            with self.assertRaisesRegex(journal.MutationEvidenceError, 'live PR query failed'):
+                case.factory(None).require_owned()
+        self.assertEqual(case.checkpoint.get('repo', 'G-047'), original)
 
     def test_continuation_needs_current_owned_state_not_worker_turn(self):
         from managed_rebase_validation import RebaseDecision, RebaseStatus, Remote

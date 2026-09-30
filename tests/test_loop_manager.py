@@ -5832,11 +5832,12 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             )
             commit_and_push(repo, "Resolve structured review input")
             latest_sha = git_command(repo, "rev-parse", "origin/main")
-            self.assertTrue(
-                loop_manager.resume_blocked_execplan_if_inputs_changed(
-                    connection, repo, str(repo), "main", state_dir
+            with mock.patch.object(loop_manager, 'pr_for_branch', return_value=None):
+                self.assertTrue(
+                    loop_manager.resume_blocked_execplan_if_inputs_changed(
+                        connection, repo, str(repo), "main", state_dir
+                    )
                 )
-            )
             resumed = connection.execute(
                 "SELECT * FROM exec_plans "
                 "WHERE repo = ? AND plan_id = 'G-001'",
@@ -10903,7 +10904,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
             ).splitlines()
 
             self.assertEqual(result, 1)
-            self.assertEqual(roles, ["worker", "reviewer"])
+            self.assertEqual(roles, ["worker", "worker", "reviewer"])
             self.assertEqual(len(verify_calls), 2)
             self.assertEqual(project["phase"], "REVIEWING")
             self.assertIn("stop after publication check", project["last_error"])
@@ -11723,7 +11724,7 @@ class WorkspaceRecoveryTest(unittest.TestCase):
             ):
                 self.assertEqual(role_name, "worker")
                 sessions.append(kwargs["session_id"])
-                if len(sessions) == 1:
+                if len(sessions) <= 2:
                     (agent_worktree / "src/app.py").write_text(
                         "VALUE = 'resolved'\n",
                         encoding="utf-8",
@@ -11783,7 +11784,7 @@ class WorkspaceRecoveryTest(unittest.TestCase):
                  dict(recovery) if recovery else None),
             )
             self.assertEqual(
-                sessions, ["worker-session", "worker-session"]
+                sessions, ["worker-session", "worker-session", "worker-session"]
             )
             self.assertEqual(resumed["phase"], "WORKING")
             self.assertEqual(
@@ -13284,6 +13285,10 @@ class LatestBasePublicationTest(unittest.TestCase):
             review_base_advanced = False
 
             def reviewer(_worktree, _state, _config, role_name, _prompt, **_kwargs):
+                if role_name == "worker":
+                    return loop_manager.CodexResult(0,
+                        worker_result("Confirm current rebase candidate", "Checks the latest candidate and inputs.",
+                                      "current rebase candidate: PASS"), "worker-session")
                 self.assertEqual(role_name, "reviewer")
                 reviews.append(role_name)
                 return loop_manager.CodexResult(
@@ -13513,7 +13518,7 @@ class LatestBasePublicationTest(unittest.TestCase):
             def agent(agent_worktree, _state, _config, role, _prompt, **_kwargs):
                 roles.append(role)
                 if role == "worker":
-                    self.assertTrue(git_command(worktree, "ls-files", "-u"))
+                    self.assertEqual(bool(git_command(worktree, "ls-files", "-u")), roles.count("worker") == 1)
                     self.assertFalse(
                         loop_manager._rebase_in_progress_for_branch(worktree, branch)
                     )
@@ -13578,7 +13583,7 @@ class LatestBasePublicationTest(unittest.TestCase):
                 (worktree / "src/app.py").read_text(encoding="utf-8"),
                 "VALUE = 'resolved'\n",
             )
-            self.assertEqual(roles, ["worker", "reviewer"])
+            self.assertEqual(roles, ["worker", "worker", "reviewer"])
             verify.assert_called_once()
             self.assertEqual(git_steps, [])
             self.assertEqual(len(created), 1)
@@ -14161,6 +14166,10 @@ class LatestBasePublicationTest(unittest.TestCase):
                 return original_git(path, *arguments, **kwargs)
 
             def reviewer(_worktree, _state, _config, role_name, _prompt, **_kwargs):
+                if role_name == "worker":
+                    return loop_manager.CodexResult(0,
+                        worker_result("Confirm current rebase candidate", "Checks the latest candidate and inputs.",
+                                      "current rebase candidate: PASS"), "worker-session")
                 self.assertEqual(role_name, "reviewer")
                 return loop_manager.CodexResult(
                     0, "VERDICT: PASS", "reviewer-session"
@@ -15743,10 +15752,11 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             self.assertIsNone(stored["pr_conflict_base_oid"])
             self.assertEqual(stored["worker_session_id"], "worker-existing")
             self.assertEqual(stored["reviewer_session_id"], "reviewer-existing")
-            self.assertEqual(roles, ["worker", "reviewer", "reviewer"])
+            self.assertEqual(roles, ["worker", "worker", "reviewer", "worker", "reviewer"])
             self.assertEqual(
                 session_ids,
-                ["worker-existing", "reviewer-existing", "reviewer-existing"],
+                ["worker-existing", "worker-existing", "reviewer-existing",
+                 "worker-existing", "reviewer-existing"],
             )
             self.assertEqual(verify.call_count, 2)
             self.assertEqual(len(pushes), 1)
@@ -15813,9 +15823,11 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                 "loop_manager.verify", return_value=(True, "verify: PASS")
             ), mock.patch(
                 "loop_manager.run_codex",
-                return_value=loop_manager.CodexResult(
-                    0, "VERDICT: PASS", "reviewer-existing"
-                ),
+                side_effect=lambda _worktree, _state, _config, role, _prompt, **_kwargs:
+                    loop_manager.CodexResult(0,
+                        worker_result("Confirm rebased owned PR", "Checks the current final candidate.",
+                                      "owned PR candidate: PASS") if role == "worker" else "VERDICT: PASS",
+                        "worker-existing" if role == "worker" else "reviewer-existing"),
             ):
                 outcome = loop_manager.run_project_result(
                     connection,
@@ -16303,7 +16315,7 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                 ).fetchone()
                 self.assertEqual(resumed.kind, loop_manager.ProjectRunKind.WAITING)
                 self.assertEqual(tuple(final), ("PR_OPEN", 0))
-                self.assertEqual(roles, ["worker", "reviewer"])
+                self.assertEqual(roles, ["worker", "worker", "reviewer"])
                 self.assertEqual(
                     self._source_checkout_snapshot(repo), source_before
                 )
@@ -16846,9 +16858,11 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                     "loop_manager._recorded_base_fetch", side_effect=interrupted_fetch
                 ), mock.patch("loop_manager.verify", return_value=(True, "verify: PASS")), mock.patch(
                     "loop_manager.run_codex",
-                    return_value=loop_manager.CodexResult(
-                        0, "VERDICT: PASS", "reviewer-existing"
-                    ),
+                    side_effect=lambda _worktree, _state, _config, role, _prompt, **_kwargs:
+                        loop_manager.CodexResult(0,
+                            worker_result("Confirm rebased owned PR", "Checks the current final candidate.",
+                                          "owned PR candidate: PASS") if role == "worker" else "VERDICT: PASS",
+                            "worker-existing" if role == "worker" else "reviewer-existing"),
                 ):
                     if stage in ("github", "fetch"):
                         with self.assertRaises(RuntimeError):
