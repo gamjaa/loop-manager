@@ -10914,8 +10914,9 @@ def begin_agent_scope(
         stored = GitSnapshot.deserialize(str(row['agent_snapshot']))
         plan_id = _plan_id_from_path(str(row['plan_path'] or ''))
         checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, plan_id or '')
-        if plan_id and (checkpoint.operation == 'rebase'
-                        or (checkpoint.snapshot or {}).get('current_rebase_acceptance')):
+        if (plan_id and not blocked_plan_reconciliation.remote_adoption_is_current(checkpoint)
+                and (checkpoint.operation == 'rebase'
+                     or (checkpoint.snapshot or {}).get('current_rebase_acceptance'))):
             current = capture_git_snapshot(worktree)
             if not managed_rebase_adoption.needs_agent_comparison(checkpoint, stored, current):
                 return stored
@@ -13575,17 +13576,15 @@ def validate_persisted_agent_scope(
 
     rebase_checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
         repo, _plan_id_from_path(selected_plan_path) or '')
-    if (role_name in {'worker', 'reviewer'}
+    remote_adoption_current = blocked_plan_reconciliation.remote_adoption_is_current(rebase_checkpoint)
+    if (role_name in {'worker', 'reviewer'} and not remote_adoption_current
             and (rebase_checkpoint.snapshot or {}).get('current_rebase_agent_baseline')):
         comparison = managed_rebase_adoption.agent_comparison_baseline(
             GitSnapshot.deserialize(str(project['agent_snapshot'])),
             rebase_checkpoint.snapshot or {}, role_name)
         before = _normalize_legacy_ignored_snapshot(
             saved_worktree, _with_proven_legacy_ignore_config(comparison, current_config), current)
-    if (role_name in {'worker', 'reviewer'}
-            and not (rebase_checkpoint.snapshot or {}).get('current_rebase_acceptance')
-            and any((rebase_checkpoint.snapshot or {}).get(key)
-                    for key in ('remote_adoption_scope', 'remote_adoption_intent'))):
+    if role_name in {'worker', 'reviewer'} and remote_adoption_current:
         plan_id = _plan_id_from_path(selected_plan_path)
         plan = connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
                                   (repo, plan_id)).fetchone()
@@ -13606,6 +13605,7 @@ def validate_persisted_agent_scope(
                 external_worktree=repo_path, base_branch=str(project['base_branch']))
     rebase_scope_normalized = False
     if (role_name in {'worker', 'reviewer'} and phase != 'PLAN_BLOCKED'
+            and not remote_adoption_current
             and managed_rebase_adoption.needs_agent_comparison(rebase_checkpoint,
                 GitSnapshot.deserialize(str(project['agent_snapshot'])), current)):
         _current_rebase_service(
@@ -13921,6 +13921,8 @@ def validate_blocked_agent_scope(
     current = capture_git_snapshot(worktree)
     plan_id = _plan_id_from_path(selected_plan_path)
     checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, plan_id)
+    if blocked_plan_reconciliation.remote_adoption_is_current(checkpoint):
+        accepted_rebase = False
     before, project = _remote_adoption_agent_baseline(
         connection, repo, plan_id, worktree, project, before, current, checkpoint,
         saved_plan=saved_plan, accepted_rebase=accepted_rebase)

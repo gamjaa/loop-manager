@@ -18,6 +18,7 @@ import scoped_blocking
 import rebase_block_reconciliation
 import blocked_plan_reconciliation
 import blocked_remote_observation
+import managed_rebase_validation
 from scoped_blocking import BlockReasonCode, BlockScope
 
 
@@ -357,6 +358,12 @@ class BlockedPlanRemoteRefreshTests(unittest.TestCase):
         self.current_snapshot = replace(self.current_snapshot, head='rebased',
             refs={**self.current_snapshot.refs, f'refs/heads/{branch}': ('rebased', '')},
             worktrees={worktree: ('HEAD=rebased', f'branch=refs/heads/{branch}')})
+        checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
+        prior = checkpoints.get(self.repo, 'G-106')
+        checkpoints.record(self.repo, 'G-106', expected_generation=prior.generation,
+            operation=None, expected_head='rebased', target_base_oid=self.base,
+            observed_remote_oid=prior.observed_remote_oid,
+            snapshot={**prior.snapshot, 'current_rebase_acceptance': {'head': 'rebased'}})
         with mock.patch.object(loop_manager, 'requirement_archive_candidates', return_value=()):
             self.coordinator._validate(self.plan(), rebase=True)
         self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
@@ -455,6 +462,61 @@ class BlockedPlanRemoteRefreshTests(unittest.TestCase):
         checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get(self.repo, 'G-106')
         self.assertIsNone(checkpoint.snapshot['remote_adoption_intent'])
         self.assertEqual(checkpoint.snapshot['remote_adoption_scope']['head'], self.head)
+
+    def with_previous_rebase_acceptance(self, scenario):
+        successor = self.published_successor
+        saved = {}
+        def prepare():
+            original = successor()
+            repository = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
+            current = repository.get(self.repo, 'G-106')
+            acceptance = dict(kind=managed_rebase_validation.ACCEPTANCE_KIND,
+                policy_version=managed_rebase_validation.POLICY_VERSION, repo=self.repo,
+                repository_identity='example/repo', plan_id='G-106', plan_path=self.plan()['path'],
+                worktree=self.plan()['worktree'], branch=self.plan()['branch'], target_base_oid=self.base,
+                remote=dict(repository='example/repo', branch=self.plan()['branch'],
+                            oid=original.head, pull_request=None), head=original.head,
+                generation=current.generation, role='worker', input_fingerprint='input',
+                scope_fingerprint='scope', state_fingerprint='state')
+            acceptance['id'] = managed_rebase_validation.fingerprint(acceptance)
+            self.assertTrue(managed_rebase_validation.valid_acceptance(acceptance))
+            repository.record(self.repo, 'G-106', expected_generation=current.generation,
+                operation=None, expected_head=original.head, target_base_oid=self.base,
+                observed_remote_oid=original.head,
+                snapshot={**(current.snapshot or {}), 'current_rebase_acceptance': acceptance})
+            loop_manager.managed_rebase_adoption.remember_agent_baseline(
+                repository, self.repo, 'G-106', original, original, 'worker')
+            saved.update(repository.get(self.repo, 'G-106').snapshot)
+            return original
+        with mock.patch.object(self, 'published_successor', side_effect=prepare):
+            scenario()
+        checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get(self.repo, 'G-106')
+        for key in ('current_rebase_acceptance', 'current_rebase_agent_baseline'):
+            self.assertEqual(checkpoint.snapshot[key], saved[key])
+
+    def test_previous_rebase_does_not_shadow_resumed_worker_adoption(self):
+        self.with_previous_rebase_acceptance(self.test_resumed_worker_uses_adopted_head_and_checks_its_output)
+
+    def test_previous_rebase_does_not_shadow_project_entry_pending_adoption(self):
+        self.with_previous_rebase_acceptance(self.test_occupied_project_restart_validates_pending_adoption_before_reconcile)
+
+    def test_previous_rebase_pending_adoption_still_rejects_unowned_ref(self):
+        self.with_previous_rebase_acceptance(self.test_occupied_restart_pending_adoption_rejects_unowned_ref)
+
+    def test_later_rebase_has_priority_over_completed_adoption(self):
+        checkpoint = SimpleNamespace(operation=None, expected_head='adopted', observed_remote_oid='adopted',
+            snapshot={'remote_adoption_scope': {'head': 'adopted'},
+                      'current_rebase_acceptance': {'head': 'previous'}})
+        self.assertTrue(blocked_plan_reconciliation.remote_adoption_is_current(checkpoint))
+        checkpoint.operation = 'rebase'
+        self.assertFalse(blocked_plan_reconciliation.remote_adoption_is_current(checkpoint))
+        checkpoint.operation = None
+        checkpoint.expected_head = 'rebased'
+        checkpoint.snapshot['current_rebase_acceptance'] = {'head': 'rebased'}
+        self.assertFalse(blocked_plan_reconciliation.remote_adoption_is_current(checkpoint))
+        checkpoint.expected_head = 'adopted'
+        checkpoint.snapshot['current_rebase_acceptance'] = {'head': 'adopted'}
+        self.assertFalse(blocked_plan_reconciliation.remote_adoption_is_current(checkpoint))
 
     def persisted_adoption_scope(self):
         # Exercise the exact pre-reconciler gate used by _run_project_step.

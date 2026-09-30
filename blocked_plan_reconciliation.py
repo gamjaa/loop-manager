@@ -66,6 +66,26 @@ def slot_available(connection, repo, plan_id) -> bool:
                 and cycle.publication_stage is None and not publication)
 
 
+def remote_adoption_is_current(checkpoint) -> bool:
+    """Select the latest Manager transition without discarding rebase audit.
+
+    An unfinished adoption is newer than an idle rebase receipt. A completed
+    adoption owns the comparison only while its exact HEAD remains the current
+    checkpoint; a subsequent rebase operation or acceptance takes precedence.
+    Identity and actual Git scope are still checked by the caller.
+    """
+    if checkpoint.operation is not None:
+        return False
+    saved = checkpoint.snapshot or {}
+    if saved.get('remote_adoption_intent'):
+        return True
+    adopted = saved.get('remote_adoption_scope')
+    accepted = saved.get('current_rebase_acceptance') or {}
+    return bool(adopted and adopted.get('head') == checkpoint.expected_head
+                and adopted.get('head') == checkpoint.observed_remote_oid
+                and accepted.get('head') != adopted.get('head'))
+
+
 def validated_scope_refs(ports, connection, repo_path, repo, base, plan_id,
                          before, result, current) -> frozenset[str]:
     """Classify post-Agent tracking updates, never approve a remote adoption.

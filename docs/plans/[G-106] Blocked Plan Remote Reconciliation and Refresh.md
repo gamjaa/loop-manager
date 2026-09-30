@@ -83,6 +83,12 @@ priority: critical
   - FAILED: 새 Worker 저장 결과 검사 누락 및 경로 mock의 resolve 인자 오류를 수정했다.
   - RERUN: python3 -m unittest tests.test_scoped_blocking.BlockedPlanRemoteRefreshTests
   - PASS: 최종 재실행 46개 모두 통과.
+- 2026-09-30: 최신 근거 입력과 HEAD `4e45b3663d48a1157867d80f12c4b44621a38b61`의 base 대비 후보를 다시 확인했다. 이전 `current_rebase_acceptance` 존재 여부 대신 현재 checkpoint의 operation·기대 HEAD·채택 원격 OID로 기준선 우선순위를 결정한다. 미완료 원격 채택과 현재 후속 HEAD의 채택은 과거 rebase 비교를 가리지 않으며, 이후 새 rebase operation·수용 결과는 다시 우선한다. 기존 rebase 수용·Agent 비교 기록은 수정하거나 삭제하지 않는다. 유효한 과거 수용 기록을 보존한 Worker 시작·결과 검사, 실제 `_run_project_step`의 중단 복구 진입과 공유 ref 위반 거부를 추가 검증했다.
+- 현재 후보에서 `python3 -m unittest tests.test_scoped_blocking.BlockedPlanRemoteRefreshTests` 최종 50개와 `python3 -m unittest tests.test_execution_handlers.EvidenceFreeBlockedScopeTests tests.test_scoped_blocking.LegacyBlockedScopeUnitTests` 7개가 모두 통과했다. 새 rebase를 모사하면서 checkpoint는 이전 채택 HEAD에 둔 기존 fixture를 실제 완료 전이처럼 갱신했다. 전체 verify·실제 Git·Review는 Manager가 수행한다.
+  - FAILED_COMMAND: python3 -m unittest tests.test_scoped_blocking.BlockedPlanRemoteRefreshTests
+  - FAILED: 후속 rebase fixture의 checkpoint 갱신 누락을 수정했다.
+  - RERUN: python3 -m unittest tests.test_scoped_blocking.BlockedPlanRemoteRefreshTests
+  - PASS: 최종 재실행 50개 모두 통과.
 - [ ] Manager 전체 verify와 실제 Git 회귀 사례 검증. base만 변경·후속 commit만 변경·동시 변경·원인 지속/해소·Git 효과 뒤 중단 재시작·수동 충돌 해결 사례를 작성했으며 Worker는 실행하지 않았다. Linux 전체 검증 스크립트에 새 모듈의 compile 검사를 추가했으나 스크립트·전체 suite·integration·lint·build·type check는 실행하지 않았다.
 - [ ] Reviewer 검토 및 사용자 Merge. Worker는 commit·push·PR을 생성하지 않았다.
 
