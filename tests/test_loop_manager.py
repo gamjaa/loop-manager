@@ -14643,7 +14643,7 @@ class LatestBasePublicationTest(unittest.TestCase):
         remote_observations = iter((old, new))
 
         def git(_path, *arguments, **_kwargs):
-            if arguments[:2] == ('rev-parse', 'HEAD'):
+            if arguments[0] == 'rev-parse':
                 return subprocess.CompletedProcess(arguments, 0, new + '\n')
             if arguments[0] == 'ls-remote':
                 return subprocess.CompletedProcess(
@@ -14678,7 +14678,7 @@ class LatestBasePublicationTest(unittest.TestCase):
         self.assertIn(f'--force-with-lease=refs/heads/{branch}:{old}', pushes[0])
         self.assertNotIn('-u', pushes[0])
         self.assertNotIn('--set-upstream', pushes[0])
-        self.assertEqual(pushes[0][-2:], ('origin', f'HEAD:refs/heads/{branch}'))
+        self.assertEqual(pushes[0][-2:], ('origin', f'{new}:refs/heads/{branch}'))
         update.assert_called_once_with(connection, 'repo', publication_remote_oid=new)
 
     def test_pr_conflict_push_preserves_config_and_exact_lease(self):
@@ -14697,7 +14697,7 @@ class LatestBasePublicationTest(unittest.TestCase):
         def git(_path, *arguments, **_kwargs):
             calls.append(arguments)
             return subprocess.CompletedProcess(arguments, 0,
-                new + '\n' if arguments[:2] == ('rev-parse', 'HEAD') else '')
+                new + '\n' if arguments[0] == 'rev-parse' else '')
 
         with (
             mock.patch('loop_manager.active_execplan', return_value=plan),
@@ -14706,6 +14706,7 @@ class LatestBasePublicationTest(unittest.TestCase):
             mock.patch('loop_manager._fetch_pr_conflict_recovery_refs'),
             mock.patch('loop_manager._recorded_base_fetch'),
             mock.patch('loop_manager.remote_branch_oid', side_effect=[old, new]),
+            mock.patch('loop_manager.pr_for_branch', return_value=pr),
             mock.patch('loop_manager.git', side_effect=git),
         ):
             self.assertEqual(loop_manager.push_owned_pr_conflict_recovery(
@@ -14713,7 +14714,7 @@ class LatestBasePublicationTest(unittest.TestCase):
                 Path('/managed'), pr), new)
         self.assertEqual([args for args in calls if args[0] == 'push'], [(
             'push', f'--force-with-lease=refs/heads/{branch}:{old}',
-            'origin', f'HEAD:refs/heads/{branch}')])
+            'origin', f'{new}:refs/heads/{branch}')])
         self.assertFalse(any(args[0] == 'config' for args in calls))
 
     def test_unowned_remote_branch_is_blocked_without_force_push(self):

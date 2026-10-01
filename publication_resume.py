@@ -46,17 +46,24 @@ class PublicationResume:
     """Requery both Git and GitHub at each external publication boundary."""
 
     def __init__(self, lookup_pr: Callable[..., Mapping[str, object] | None],
-                 remote_oid: Callable[..., str | None], git: Callable[..., object]):
+                 remote_oid: Callable[..., str | None], git: Callable[..., object],
+                 validate_workspace: Callable[..., None] | None = None):
         self.lookup_pr = lookup_pr
         self.remote_oid = remote_oid
         self.git = git
+        self.validate_workspace = validate_workspace
 
     def observe(self, repo, worktree, branch, recorded_remote_oid,
                 pr_url=None) -> PublicationObservation:
+        if self.validate_workspace is not None:
+            self.validate_workspace(repo, worktree, branch, None)
         local_oid = self.git(worktree, "rev-parse", "HEAD").stdout.strip()
-        return PublicationObservation(
+        observation = PublicationObservation(
             branch=branch, local_oid=local_oid,
             remote_oid=self.remote_oid(repo, branch),
             recorded_remote_oid=recorded_remote_oid,
             pull_request=self.lookup_pr(repo, branch, pr_url),
         )
+        if self.validate_workspace is not None:
+            self.validate_workspace(repo, worktree, branch, local_oid)
+        return observation

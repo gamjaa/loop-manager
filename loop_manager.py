@@ -11,7 +11,7 @@ import contextlib
 from contextvars import ContextVar
 import difflib
 import errno
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 import hashlib
@@ -604,11 +604,15 @@ class GitSnapshot:
     config: dict[str, tuple[str, ...]]
     operations: dict[str, str]
     shared_metadata_complete: bool = True
+    scope_id: str | None = field(default=None, compare=False)
+    scope_start_digest: str | None = field(default=None, compare=False)
 
     def serialize(self) -> str:
         return json.dumps(
             {
-                "version": 4,
+                "version": 5 if self.scope_id else 4,
+                **({"scope_id": self.scope_id, "scope_start_digest": self.scope_start_digest}
+                   if self.scope_id else {}),
                 "head": self.head,
                 "branch": self.branch,
                 "index": {path: list(entries) for path, entries in self.index.items()},
@@ -634,7 +638,7 @@ class GitSnapshot:
     def deserialize(cls, value: str) -> GitSnapshot:
         parsed = json.loads(value)
         version = parsed.get("version")
-        if version not in {1, 2, 3, 4}:
+        if version not in {1, 2, 3, 4, 5}:
             raise RuntimeError("저장된 Agent Git snapshot 형식을 지원하지 않습니다.")
         return cls(
             head=str(parsed["head"]),
@@ -666,7 +670,9 @@ class GitSnapshot:
                 str(name): str(signature)
                 for name, signature in parsed.get("operations", {}).items()
             },
-            shared_metadata_complete=version == 4,
+            shared_metadata_complete=version in {4, 5},
+            scope_id=parsed.get("scope_id") if version == 5 else None,
+            scope_start_digest=parsed.get("scope_start_digest") if version == 5 else None,
         )
 
 
@@ -8380,16 +8386,27 @@ def run_agent(
             collection_status = "error"
     ledger = agent_invocation_state.InvocationRepository(connection) if connection is not None else None
     identity: str | None = None
+    scope_id = None
+    if connection is not None and invocation is not None:
+        try:
+            scope = connection.execute("SELECT * FROM projects WHERE repo = ?", (invocation.repo,)).fetchone()
+            if (scope is not None and (scope['agent_role'] == role_name
+                    or (scope['agent_role'] == 'maintenance_planner' and role_name == 'planner'))
+                    and scope['worktree'] == str(worktree) and scope['agent_snapshot']):
+                scope_id = GitSnapshot.deserialize(str(scope['agent_snapshot'])).scope_id
+        except (sqlite3.Error, KeyError, IndexError, TypeError, ValueError, RuntimeError):
+            pass  # Legacy/minimal records cannot grant reduced monitoring.
     if ledger is not None and invocation is not None and resolved is not None:
         try:
             gate = _runtime_handoff_signal.get()
             if gate is None:
-                identity = ledger.start(invocation, role_name, provider, resolved, session_id)
+                identity = ledger.start(invocation, role_name, provider, resolved, session_id,
+                                        scope_id=scope_id)
             else:
                 with gate.launch_lock:
                     gate.check()
                     identity = ledger.start(
-                        invocation, role_name, provider, resolved, session_id,
+                        invocation, role_name, provider, resolved, session_id, scope_id=scope_id,
                     )
             collection_status = "pending"
         except sqlite3.Error:
@@ -9242,7 +9259,7 @@ def push_managed_publication_branch(
     push_arguments = [
         "push",
         "origin",
-        f"HEAD:refs/heads/{branch}",
+        f"{local_oid}:refs/heads/{branch}",
     ]
     if remote_oid is not None:
         recorded_oid = str(plan["publication_remote_oid"] or "")
@@ -9278,6 +9295,14 @@ def push_managed_publication_branch(
             raise PublicationSafetyError(
                 '새 branch push 직전 원격 ref가 생성되거나 조회에 실패했습니다.'
             )
+        push_arguments.insert(1, f"--force-with-lease=refs/heads/{branch}:")
+
+    _owned_publication_plan(connection, repo_path, state_dir, repo, branch, worktree)
+    if (git(worktree, 'rev-parse', 'HEAD').stdout.strip() != local_oid
+            or git(worktree, 'rev-parse', '--verify', f'refs/heads/{branch}').stdout.strip() != local_oid):
+        raise PublicationSafetyError('push 직전 소유 branch 또는 관리 HEAD가 변경됐습니다.')
+    if pr_for_branch(repo_path, branch) is not None:
+        raise PublicationSafetyError('push 직전 게시 대상 branch의 PR이 변경됐습니다.')
 
     pushed = git(worktree, *push_arguments, check=False)
     if pushed.returncode:
@@ -9381,13 +9406,21 @@ def push_owned_pr_conflict_recovery(
         raise PublicationSafetyError(
             "게시 직전 원격 PR head가 복구 시작 시 관측값과 달라졌습니다."
         )
+    current_pr = pr_for_branch(repo_path, branch, url)
+    if (current_pr is None or any(current_pr.get(key) != pull_request.get(key)
+                                 for key in ('url', 'state', 'headRefName', 'headRefOid'))):
+        raise PublicationSafetyError('push 직전 PR identity 또는 head가 변경됐습니다.')
+    validate_managed_worktree(repo_path, worktree, branch)
+    if (git(worktree, 'rev-parse', 'HEAD').stdout.strip() != local_oid
+            or git(worktree, 'rev-parse', '--verify', f'refs/heads/{branch}').stdout.strip() != local_oid):
+        raise PublicationSafetyError('PR push 직전 소유 branch 또는 관리 HEAD가 변경됐습니다.')
     lease = f"--force-with-lease=refs/heads/{branch}:{observed_head}"
     pushed = git(
         worktree,
         "push",
         lease,
         "origin",
-        f"HEAD:refs/heads/{branch}",
+        f"{local_oid}:refs/heads/{branch}",
         check=False,
     )
     if pushed.returncode:
@@ -10754,6 +10787,68 @@ def _worker_path_allowed(
     return True
 
 
+def _agent_git_resources(
+    connection: sqlite3.Connection, repo_path: Path, worktree: Path,
+    before: GitSnapshot, role: str, *, selected_plan_path: str | None = None,
+) -> agent_scope_decision.GitResources | None:
+    """Narrow scope only for a complete ledger bound to this saved execution."""
+    if not before.scope_id or not before.scope_start_digest or not before.shared_metadata_complete:
+        return None
+    repo = str(repo_path)
+    try:
+        project = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
+        if project is None:
+            return None
+        owner = project
+        saved = GitSnapshot.deserialize(str(owner['agent_snapshot'])) if owner['agent_snapshot'] else None
+        plan_id = _plan_id_from_path(selected_plan_path or str(project['plan_path'] or ''))
+        if saved is None or saved.scope_id != before.scope_id:
+            owner = connection.execute("SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+                                       (repo, plan_id)).fetchone()
+            saved = (GitSnapshot.deserialize(str(owner['agent_snapshot']))
+                     if owner is not None and owner['agent_snapshot'] else None)
+        if (saved is None or saved.scope_id != before.scope_id
+                or saved.scope_start_digest != before.scope_start_digest
+                or owner['agent_role'] != role or owner['worktree'] != str(worktree)):
+            return None
+        if role in {'planner', 'maintenance_planner'}:
+            plan_id = None
+        session_key = 'planner_session_id' if role in {'planner', 'maintenance_planner'} else f'{role}_session_id'
+        session_id = owner[session_key]
+        invocation_role = role
+        if role == 'maintenance_planner':
+            # Maintenance units own their sessions in their own state tables;
+            # the provider executes the same Planner policy in this unique scope.
+            invocation_role = 'planner'
+            latest = connection.execute('SELECT session_id FROM agent_invocations WHERE scope_id = ? ORDER BY rowid DESC LIMIT 1',
+                                        (before.scope_id,)).fetchone()
+            session_id = latest[0] if latest else None
+        common = _git_common_directory(worktree)
+        if common != _git_common_directory(repo_path):
+            return None
+        origin = git(worktree, 'remote', 'get-url', 'origin').stdout.strip()
+        repository_identity = hashlib.sha256((str(common) + '\0' + origin).encode()).hexdigest()
+        if not agent_invocation_state.InvocationRepository(connection).verified_scope(
+            before.scope_id, repo=repo, plan_id=plan_id, role=invocation_role,
+            provider=str(project['provider']), session_id=session_id,
+            worktree=str(_canonical_path(worktree)), repository_identity=repository_identity,
+            start_digest=before.scope_start_digest,
+        ):
+            return None
+        phase = str(owner['phase'] if 'phase' in owner.keys() else owner['status'])
+        owned_branch = owner['branch'] if role in {'worker', 'reviewer'} else saved.branch
+        resources = agent_scope_decision.used_git_resources(
+            role=role, phase=phase, base_branch=str(project['base_branch']),
+            branch=owned_branch, worktree_key=str(_canonical_path(worktree)),
+        )
+    except (sqlite3.Error, KeyError, IndexError, TypeError, ValueError, RuntimeError, OSError):
+        return None
+    if resources is not None:
+        validate_managed_worktree(repo_path, worktree, owned_branch,
+                                  allow_rebase=_rebase_in_progress_for_branch(worktree, owned_branch))
+    return resources
+
+
 def validate_agent_scope(
     role_name: str,
     worktree: Path,
@@ -10768,10 +10863,17 @@ def validate_agent_scope(
     allowed_worktree_changes: frozenset[str] = frozenset(),
     external_worktree: Path | None = None,
     base_branch: str | None = None,
+    connection: sqlite3.Connection | None = None,
+    resources: agent_scope_decision.GitResources | None = None,
 ) -> None:
     """Validate the net Git mutation made by one Agent role."""
 
     after = _scope_snapshot_with_start_ignore_rules(worktree, before, after)
+    if resources is None and connection is not None and external_worktree is not None:
+        resources = _agent_git_resources(
+            connection, external_worktree, worktree, before, role_name,
+            selected_plan_path=selected_plan_path,
+        )
     changes = agent_snapshot_changes(worktree, before, after)
     violations: list[str] = []
     violation_reason = BlockReasonCode.MANAGED_WORKTREE_SCOPE_VIOLATION
@@ -10820,18 +10922,30 @@ def validate_agent_scope(
             BlockReasonCode.REPOSITORY_STATE_UNSAFE,
         )
     else:
+        scope_before, scope_after = agent_scope_decision.scoped_metadata(before, after, resources)
+        if resources is not None:
+            excluded_refs = sorted(key for key in set(before.refs) | set(after.refs)
+                if key not in resources.refs and before.refs.get(key) != after.refs.get(key))
+            excluded_worktrees = sorted(key for key in set(before.worktrees) | set(after.worktrees)
+                if key not in resources.worktrees and before.worktrees.get(key) != after.worktrees.get(key))
+            excluded_config = sorted(key for key in set(before.config) | set(after.config)
+                if key not in scope_before.config and key not in scope_after.config
+                and before.config.get(key) != after.config.get(key))
+            if excluded_refs or excluded_worktrees or excluded_config:
+                operation_log(f"Agent 범위 밖 독립 Git 변화: refs={excluded_refs[:8]} "
+                              f"worktrees={excluded_worktrees[:8]} config={excluded_config[:8]}")
         # Codex owns this ephemeral namespace for turn capture/checkpoint
         # bookkeeping. It never identifies a published branch or a managed
         # workspace, so normalize both sides for current and persisted scope
         # snapshots while keeping every other repository ref protected.
         before_scope_refs = {
             key: value
-            for key, value in before.refs.items()
+            for key, value in scope_before.refs.items()
             if not key.startswith("refs/codex/turn-diffs/")
         }
         after_scope_refs = {
             key: value
-            for key, value in after.refs.items()
+            for key, value in scope_after.refs.items()
             if not key.startswith("refs/codex/turn-diffs/")
         }
         metadata_states = (
@@ -10844,15 +10958,15 @@ def validate_agent_scope(
             ),
             (
                 "Git worktree 등록·HEAD·index·파일 상태",
-                before.worktrees,
-                after.worktrees,
+                scope_before.worktrees,
+                scope_after.worktrees,
                 allowed_worktree_changes,
                 BlockReasonCode.OUTSIDE_MANAGED_WORKTREE_MUTATION,
             ),
             (
                 "Git config",
-                before.config,
-                after.config,
+                scope_before.config,
+                scope_after.config,
                 frozenset(),
                 BlockReasonCode.SHARED_GIT_CONFIG_MUTATION,
             ),
@@ -11228,7 +11342,7 @@ def begin_agent_scope(
                                  allowed_guidance_targets=_guidance_worker_targets(connection, repo, plan_id),
                                  allow_common_plans=_published_plan_allows_common_plans(
                                      Path(repo), project_execplan(connection, repo)),
-                                 external_worktree=Path(repo), base_branch=row['base_branch'])
+                                 external_worktree=Path(repo), base_branch=row['base_branch'], connection=connection)
             return effective
         return stored
     preliminary_snapshot = capture_git_snapshot(worktree)
@@ -11244,6 +11358,8 @@ def begin_agent_scope(
     )
     if not _same_local_snapshot(preliminary_snapshot, snapshot):
         raise RuntimeError("Agent 시작 상태를 보존하는 동안 worktree가 변경됐습니다.")
+    snapshot = replace(snapshot, scope_id=secrets.token_hex(16),
+                       scope_start_digest=hashlib.sha256(snapshot.serialize().encode()).hexdigest())
     plan_path = str(row["plan_path"] or "")
     plan_file = worktree / plan_path
     agent_input_plan = (
@@ -12118,6 +12234,7 @@ def validate_worker_workspace_scope(
     allowed_requirement_archives: tuple[str, ...] = (),
     allowed_guidance_targets: tuple[str, ...] = (),
     allow_common_plans: bool = False,
+    connection: sqlite3.Connection | None = None,
 ) -> dict[str, object]:
     """Validate one Worker-controlled operation before Manager Git writes."""
 
@@ -12135,6 +12252,7 @@ def validate_worker_workspace_scope(
         allow_common_plans=allow_common_plans,
         external_worktree=repo_path,
         base_branch=base_branch,
+        connection=connection,
     )
     plan = validate_active_execplan_metadata(
         repo_path,
@@ -13710,13 +13828,19 @@ def validate_persisted_agent_scope(
         raise AgentScopeError("저장된 Agent Git metadata 기준 snapshot이 없습니다.")
 
     saved_worktree = Path(str(project["worktree"] or ""))
+    resources = _agent_git_resources(
+        connection, repo_path, saved_worktree, before, str(project['agent_role'] or ''),
+        selected_plan_path=str(project['plan_path'] or ''),
+    ) if saved_worktree.is_dir() else None
     config_context = saved_worktree if saved_worktree.is_dir() else repo_path
     current_config = _config_entries(config_context)
     before = _with_proven_legacy_ignore_config(before, current_config)
+    before_config = resources.config(before.config) if resources is not None else before.config
+    scope_config = resources.config(current_config) if resources is not None else current_config
     changed_keys = sorted(
         key
-        for key in set(before.config) | set(current_config)
-        if before.config.get(key) != current_config.get(key)
+        for key in set(before_config) | set(scope_config)
+        if before_config.get(key) != scope_config.get(key)
     )
     if changed_keys:
         displayed = ", ".join(changed_keys[:8])
@@ -13891,7 +14015,7 @@ def validate_persisted_agent_scope(
                 role_name, saved_worktree, before, result,
                 selected_plan_path=selected_plan_path if role_name == 'worker' else None,
                 allowed_guidance_targets=guidance_targets, allow_common_plans=allow_common_plans,
-                external_worktree=repo_path, base_branch=str(project['base_branch']))
+                external_worktree=repo_path, base_branch=str(project['base_branch']), connection=connection)
     rebase_scope_normalized = False
     if (role_name in {'worker', 'reviewer'} and phase != 'PLAN_BLOCKED'
             and not remote_adoption_current
@@ -13915,7 +14039,7 @@ def validate_persisted_agent_scope(
                 selected_plan_path=selected_plan_path if role_name == 'worker' else None,
                 allowed_guidance_targets=guidance_targets,
                 allow_common_plans=allow_common_plans,
-                external_worktree=repo_path, base_branch=str(project['base_branch']))
+                external_worktree=repo_path, base_branch=str(project['base_branch']), connection=connection)
         def accepted_baseline(value):
             return managed_rebase_adoption.selected_baseline(
                 value, current, project['branch'], str(saved_worktree.resolve()),
@@ -14021,6 +14145,7 @@ def validate_persisted_agent_scope(
                 allowed_worktree_changes=check_worktrees,
                 external_worktree=repo_path,
                 base_branch=str(project["base_branch"]),
+                resources=resources,
             )
         except AgentScopeError as error:
             if check.checkpoint_result:
@@ -14060,7 +14185,7 @@ def refresh_persisted_agent_scope_after_manager_git(
     """Merge trusted Manager refs into an interrupted Agent's start snapshot."""
 
     project = connection.execute(
-        "SELECT base_branch, worktree, agent_snapshot FROM projects WHERE repo = ?",
+        "SELECT * FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
     if project is None or not project["agent_snapshot"]:
@@ -14073,6 +14198,9 @@ def refresh_persisted_agent_scope_after_manager_git(
         )
 
     current = capture_git_snapshot(worktree)
+    resources = _agent_git_resources(connection, Path(repo), worktree, stored,
+                                    str(project['agent_role'] or ''),
+                                    selected_plan_path=str(project['plan_path'] or ''))
     manager_refs = frozenset(
         refname
         for refname in set(validated.refs) | set(current.refs)
@@ -14092,6 +14220,7 @@ def refresh_persisted_agent_scope_after_manager_git(
             allowed_worktree_changes=manager_worktree_changes,
             external_worktree=Path(repo),
             base_branch=str(project["base_branch"]),
+            resources=resources,
         )
     except AgentScopeError as error:
         raise AgentScopeError(
@@ -14104,11 +14233,8 @@ def refresh_persisted_agent_scope_after_manager_git(
             refreshed_worktrees.pop(path, None)
         else:
             refreshed_worktrees[path] = registration
-    refreshed = GitSnapshot(
-        head=stored.head,
-        branch=stored.branch,
-        index=stored.index,
-        dirty=stored.dirty,
+    refreshed = replace(
+        stored,
         refs=current.refs,
         worktrees=refreshed_worktrees,
         config=stored.config,
@@ -14253,7 +14379,7 @@ def validate_blocked_agent_scope(
         # Check actual Agent output before substituting the accepted selected
         # rebase state. Shared and external mutations are never normalized.
         if result is not None:
-            validate_agent_scope(role_name, worktree, comparison, result, **scope_options)
+            validate_agent_scope(role_name, worktree, comparison, result, **scope_options, connection=connection)
         normalized = managed_rebase_adoption.selected_baseline(
             comparison, current, str(saved_plan['branch']), str(worktree.resolve()),
             publication=checkpoint)
@@ -14272,7 +14398,7 @@ def validate_blocked_agent_scope(
             allowed_ref_changes=_proven_manager_base_refs(
                 connection, repo_path, repo, plan_id, before, current) | published_refs | observed_refs,
             allowed_worktree_changes=_proven_merged_cleanup_paths(connection, repo, before, current),
-            **scope_options)
+            **scope_options, connection=connection)
         return
     scope_before = before
     allowed_ref_changes: frozenset[str] = observed_refs
@@ -14391,6 +14517,7 @@ def validate_blocked_agent_scope(
         allowed_worktree_changes=allowed_worktree_changes,
         external_worktree=repo_path,
         base_branch=base,
+        connection=connection,
     )
 
 
@@ -17196,6 +17323,7 @@ def resume_project_block_if_safe(
                     after,
                     external_worktree=repo_path,
                     base_branch=str(project["base_branch"]),
+                    connection=connection,
                 )
             else:
                 return False
@@ -17292,6 +17420,7 @@ def resume_project_block_if_safe(
                 ),
                 external_worktree=repo_path,
                 base_branch=str(project["base_branch"]),
+                connection=connection,
             )
     except (AgentScopeError, RuntimeError, WorkspaceOwnershipError, ValueError):
         return False
@@ -21188,6 +21317,7 @@ class _PlanningAgentPorts:
                 after,
                 external_worktree=self._context.repo_path,
                 base_branch=self._context.base_branch,
+                connection=self._connection,
             )
             validate_managed_worktree(
                 self._context.repo_path, worktree, None
@@ -21212,6 +21342,7 @@ class _PlanningAgentPorts:
                 after,
                 external_worktree=self._context.repo_path,
                 base_branch=self._context.base_branch,
+                connection=self._connection,
             )
             validate_managed_worktree(
                 self._context.repo_path, worktree, None
@@ -24638,14 +24769,21 @@ def _ExecutionLifecyclePorts(connection, runtime_repository, **identity):
             current_rebase_service=lambda context, **options: _current_rebase_service(
                 connection, identity["repo_path"], identity["state_dir"], identity["repo"],
                 context.plan.plan_id, context.worktree, context.branch, **options),
+            live_remote_branch_oid=state.bind(
+                lambda repo, branch: manager_git_journal.live_remote_branch_oid(git, repo, branch),
+                name="live_remote_branch_oid", connected=False, mutates=False),
         ),
         agent=execution_handlers.AgentEffects(
             begin_agent_scope=state.bind(begin_agent_scope, name="begin_agent_scope", connected=True, mutates=True),
             capture_git_snapshot=state.bind(capture_git_snapshot, name="capture_git_snapshot", connected=False, mutates=False),
             path_signature=state.bind(_path_signature, name="path_signature", connected=False, mutates=False),
             clear_agent_scope=state.bind(clear_agent_scope, name="clear_agent_scope", connected=True, mutates=True),
-            validate_agent_scope=state.bind(validate_agent_scope, name="validate_agent_scope", connected=False, mutates=False),
-            validate_worker_workspace_scope=state.bind(validate_worker_workspace_scope, name="validate_worker_workspace_scope", connected=False, mutates=False),
+            validate_agent_scope=state.bind(
+                lambda *args, **kwargs: validate_agent_scope(*args, connection=connection, **kwargs),
+                name="validate_agent_scope", connected=False, mutates=False),
+            validate_worker_workspace_scope=state.bind(
+                lambda *args, **kwargs: validate_worker_workspace_scope(*args, connection=connection, **kwargs),
+                name="validate_worker_workspace_scope", connected=False, mutates=False),
             _worktree_execplan_input_fingerprint=state.bind(_worktree_execplan_input_fingerprint, name="_worktree_execplan_input_fingerprint", connected=False, mutates=False),
             _revision_execplan_input_fingerprint=state.bind(_revision_execplan_input_fingerprint, name="_revision_execplan_input_fingerprint", connected=False, mutates=False),
             _guidance_worker_targets=state.bind(_guidance_worker_targets, name="_guidance_worker_targets", connected=True, mutates=False),

@@ -1,5 +1,6 @@
 import contextlib
 from dataclasses import replace
+import hashlib
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -9,6 +10,9 @@ from unittest import mock
 
 import loop_manager
 import manager_git_journal
+import agent_invocation_state
+from agent_invocation import InvocationContext, ResolvedProfile, Usage
+from agent_write_isolation import IsolationEvidence, inspect_worktree
 
 
 def git(repo: Path, *arguments: str) -> str:
@@ -1860,6 +1864,171 @@ class OriginIsolatedRegistrationAndExecutionTest(unittest.TestCase):
         self.assertIn('loop_manager.py" run "$@"', bash)
         self.assertIn("loop_manager.py", powershell)
         self.assertIn("run @args", powershell)
+
+
+class TaskRelevantInvocationScopeTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.remote, self.source, self.writer = remote_fixture(directory.name)
+        self.state = Path(directory.name) / 'state'
+        self.state.mkdir()
+        self.worktree = self.state / 'worktrees' / 'planning'
+        self.worktree.parent.mkdir()
+        git(self.source, 'worktree', 'add', '--detach', str(self.worktree), 'origin/main')
+        self.connection = loop_manager.connect_database(self.state, create=True)
+        self.addCleanup(self.connection.close)
+        self.repo = str(self.source)
+        self.connection.execute("INSERT INTO projects (repo, base_branch, phase, worktree) VALUES (?, 'main', 'PLANNING', ?)",
+                                (self.repo, str(self.worktree)))
+        self.connection.commit()
+        self.before = loop_manager.begin_agent_scope(self.connection, self.repo, self.worktree, 'planner')
+        self.ledger = agent_invocation_state.InvocationRepository(self.connection)
+        self.evidence = IsolationEvidence('codex', 'codex test', 'Linux:test', 'planner',
+            str(self.worktree), inspect_worktree(self.worktree, self.state).repository_identity,
+            'a' * 64, 'verified', snapshot_digest=self.before.scope_start_digest,
+            configuration_digest='b' * 64)
+
+    def prove(self, *, status='success', role='planner', plan_id=None):
+        identity = self.ledger.start(InvocationContext(self.repo, plan_id), role, 'codex',
+            ResolvedProfile('model', 'high'), 'session', scope_id=self.before.scope_id)
+        self.ledger.record_isolation(identity, self.evidence)
+        self.ledger.finish(identity, status, 0 if status == 'success' else 1, 10, 'session', Usage())
+        session_key = 'planner_session_id' if role == 'planner' else f'{role}_session_id'
+        self.connection.execute(f"UPDATE projects SET {session_key} = 'session' WHERE repo = ?", (self.repo,))
+        self.connection.commit()
+        return identity
+
+    def validate(self, before=None):
+        loop_manager.validate_agent_scope('planner', self.worktree, before or self.before,
+            loop_manager.capture_git_snapshot(self.worktree), external_worktree=self.source,
+            base_branch='main', connection=self.connection)
+
+    def unrelated_ref(self):
+        git(self.source, 'update-ref', 'refs/heads/unrelated', self.before.head)
+
+    def test_current_and_saved_scope_accept_independent_changes_with_exact_invocation_proof(self):
+        self.prove()
+        self.unrelated_ref()
+        git(self.source, 'tag', 'independent')
+        other = self.state / 'worktrees' / 'other'
+        git(self.source, 'worktree', 'add', '--detach', str(other), self.before.head)
+        (other / 'tracked.txt').write_text('independent worktree\n')
+        git(other, 'add', 'tracked.txt')
+        git(self.source, 'checkout', '-b', 'user-local')
+        (self.source / 'tracked.txt').write_text('source worktree\n')
+        git(self.source, 'add', 'tracked.txt')
+        git(self.source, 'config', 'branch.unrelated.remote', 'other')
+        self.validate()
+        loop_manager.validate_persisted_agent_scope(self.connection, self.source, self.state, self.repo)
+        self.assertEqual(loop_manager.GitSnapshot.deserialize(self.connection.execute(
+            'SELECT agent_snapshot FROM projects WHERE repo = ?', (self.repo,)).fetchone()[0]), self.before)
+        git(self.source, 'worktree', 'remove', '--force', str(other))
+        self.validate()
+
+    def test_missing_invalidated_pending_or_mismatched_proof_keeps_strict_comparison(self):
+        identity = self.prove()
+        self.unrelated_ref()
+        cases = [
+            ('agent_isolation_evidence', 'status', 'prepared'),
+            ('agent_isolation_evidence', 'snapshot_digest', 'c' * 64),
+            ('agent_isolation_evidence', 'canonical_worktree', str(self.source)),
+            ('agent_isolation_evidence', 'repository_identity', 'c' * 64),
+            ('agent_isolation_evidence', 'policy_digest', ''),
+            ('agent_isolation_evidence', 'configuration_digest', ''),
+            ('agent_isolation_evidence', 'provider', 'claude'),
+            ('agent_isolation_evidence', 'role', 'reviewer'),
+            ('agent_invocations', 'session_id', 'different'),
+            ('agent_invocations', 'scope_id', 'different'),
+            ('agent_invocations', 'finished_at', None),
+        ]
+        for table, key, value in cases:
+            original = self.connection.execute(f'SELECT {key} FROM {table} WHERE invocation_id = ?', (identity,)).fetchone()[0]
+            self.connection.execute(f'UPDATE {table} SET {key} = ? WHERE invocation_id = ?', (value, identity))
+            with self.subTest(table=table, key=key), self.assertRaises(loop_manager.AgentScopeError):
+                self.validate()
+            self.connection.execute(f'UPDATE {table} SET {key} = ? WHERE invocation_id = ?', (original, identity))
+        legacy = replace(self.before, scope_id=None, scope_start_digest=None)
+        with self.assertRaises(loop_manager.AgentScopeError):
+            self.validate(legacy)
+        self.prove(status='transient_failure')
+        with self.assertRaises(loop_manager.AgentScopeError):
+            self.validate()
+
+    def test_used_base_config_operation_and_out_of_scope_files_still_block(self):
+        self.prove()
+        (self.worktree / 'unowned.txt').write_text('unexpected')
+        with self.assertRaises(loop_manager.AgentScopeError):
+            self.validate()
+        (self.worktree / 'unowned.txt').unlink()
+        git(self.worktree, 'update-index', '--assume-unchanged', 'tracked.txt')
+        with self.assertRaises(loop_manager.AgentScopeError):
+            self.validate()
+        git(self.worktree, 'update-index', '--no-assume-unchanged', 'tracked.txt')
+        git(self.source, 'config', 'core.hooksPath', 'unexpected')
+        with self.assertRaises(loop_manager.AgentScopeError):
+            self.validate()
+        git(self.source, 'config', '--unset', 'core.hooksPath')
+        operation = Path(git(self.worktree, 'rev-parse', '--git-path', 'MERGE_HEAD'))
+        operation.write_text(self.before.head)
+        with self.assertRaises(loop_manager.AgentScopeError):
+            self.validate()
+        operation.unlink()
+        new_base = advance_remote(self.writer)
+        git(self.source, 'fetch', 'origin')
+        with self.assertRaises(loop_manager.AgentScopeError):
+            self.validate()
+        loop_manager.validate_agent_scope('planner', self.worktree, self.before,
+            loop_manager.capture_git_snapshot(self.worktree), external_worktree=self.source,
+            base_branch='main', connection=self.connection,
+            allowed_ref_changes=frozenset({'refs/remotes/origin/main'}))
+        self.assertEqual(git(self.source, 'rev-parse', 'origin/main'), new_base)
+
+    def test_run_agent_binds_the_physical_invocation_to_the_saved_scope(self):
+        def run(request):
+            request.on_isolation_checked(self.evidence)
+            request.on_session_started('session')
+            return loop_manager.AgentResult(0, 'done', 'session')
+        with mock.patch.object(loop_manager, 'agent_provider') as provider:
+            provider.return_value.run.side_effect = run
+            result = loop_manager.run_agent('codex', self.worktree, self.state,
+                self.state / 'config.ini', 'planner', 'prompt', read_only=False,
+                connection=self.connection, invocation=InvocationContext(self.repo, None),
+                resolved_profile=ResolvedProfile('model', 'high'),
+                on_session_started=lambda session: self.connection.execute(
+                    'UPDATE projects SET planner_session_id = ? WHERE repo = ?', (session, self.repo)))
+        row = self.connection.execute('SELECT scope_id FROM agent_invocations WHERE invocation_id = ?',
+                                      (result.isolation_invocation_id,)).fetchone()
+        self.assertEqual(row[0], self.before.scope_id)
+        self.unrelated_ref()
+        self.validate()
+
+    def test_worker_reviewer_and_maintenance_use_their_owned_resources(self):
+        plan_path = 'docs/plans/[G-089] Task-Relevant Agent Git Scope.md'
+        branch = 'loop-manager/G-089'
+        git(self.worktree, 'checkout', '-b', branch)
+        for role, phase in (('worker', 'WORKING'), ('reviewer', 'REVIEWING'),
+                            ('maintenance_planner', 'PLANNING')):
+            with self.subTest(role=role):
+                if role == 'maintenance_planner':
+                    git(self.worktree, 'checkout', '--detach')
+                self.connection.execute('UPDATE projects SET phase = ?, branch = ?, plan_path = ?, agent_snapshot = NULL WHERE repo = ?',
+                    (phase, None if role == 'maintenance_planner' else branch, plan_path, self.repo))
+                self.connection.commit()
+                self.before = loop_manager.begin_agent_scope(self.connection, self.repo, self.worktree, role)
+                provider_role = 'planner' if role == 'maintenance_planner' else role
+                self.evidence = replace(self.evidence, role=provider_role,
+                                        snapshot_digest=self.before.scope_start_digest)
+                self.prove(role=provider_role, plan_id=None if role == 'maintenance_planner' else 'G-089')
+                git(self.source, 'tag', f'independent-{role}')
+                resources = loop_manager._agent_git_resources(self.connection, self.source,
+                    self.worktree, self.before, role, selected_plan_path=plan_path)
+                self.assertIsNotNone(resources)
+                if role != 'maintenance_planner':
+                    self.assertIn(f'refs/heads/{branch}', resources.refs)
+                loop_manager.validate_agent_scope(role, self.worktree, self.before,
+                    loop_manager.capture_git_snapshot(self.worktree), external_worktree=self.source,
+                    base_branch='main', connection=self.connection, selected_plan_path=plan_path)
 
 
 if __name__ == "__main__":

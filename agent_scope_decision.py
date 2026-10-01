@@ -18,6 +18,64 @@ class ScopeDecisionError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class GitResources:
+    """Resources used by this role and phase, after invocation proof validation."""
+
+    refs: frozenset[str]
+    worktrees: frozenset[str]
+    branches: frozenset[str]
+
+    def config(self, entries: Mapping[str, tuple[str, ...]]) -> dict[str, tuple[str, ...]]:
+        # Only known branch-local settings have a provably unrelated effect.
+        # Includes, remote settings, hooks and unknown keys remain protected.
+        result = {}
+        for key, value in entries.items():
+            _, _, name = key.partition(":")
+            branch, _, setting = name.removeprefix("branch.").rpartition(".")
+            if (name.startswith("branch.") and branch not in self.branches
+                    and setting.lower() in {"remote", "merge", "pushremote", "rebase", "description"}):
+                continue
+            result[key] = value
+        return result
+
+
+def used_git_resources(*, role: str, phase: str, base_branch: str,
+                       branch: str | None, worktree_key: str) -> GitResources | None:
+    """Unknown roles/stages retain repository-wide comparison."""
+    stages = {
+        "planner": {"PLANNING", "PLAN_BLOCKED"},
+        "maintenance_planner": {"PLANNING", "PLAN_BLOCKED"},
+        "worker": {"WORKING", "IMPLEMENTING", "VERIFYING", "REVIEWING", "PUBLISHING", "PLAN_BLOCKED"},
+        "reviewer": {"REVIEWING", "PUBLISHING", "PLAN_BLOCKED"},
+    }
+    if phase not in stages.get(role, ()) or not base_branch or not worktree_key:
+        return None
+    refs = {f"refs/remotes/origin/{base_branch}"}
+    branches = {base_branch}
+    if role in {"worker", "reviewer"}:
+        if not branch:
+            return None
+        branches.add(branch)
+        refs.update((f"refs/heads/{branch}", f"refs/remotes/origin/{branch}"))
+    elif branch is not None:
+        return None  # Planning must stay detached.
+    return GitResources(frozenset(refs), frozenset((worktree_key,)), frozenset(branches))
+
+
+def scoped_metadata(before: GitSnapshot, after: GitSnapshot,
+                    resources: GitResources | None) -> tuple[GitSnapshot, GitSnapshot]:
+    """Keep full snapshots for audit; project only the comparison operands."""
+    if resources is None:
+        return before, after
+    def project(snapshot):
+        return replace(snapshot,
+            refs={key: value for key, value in snapshot.refs.items() if key in resources.refs},
+            worktrees={key: value for key, value in snapshot.worktrees.items() if key in resources.worktrees},
+            config=resources.config(snapshot.config))
+    return project(before), project(after)
+
+
+@dataclass(frozen=True)
 class ScopeCheck:
     role: str
     before: GitSnapshot

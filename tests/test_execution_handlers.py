@@ -1421,6 +1421,8 @@ class ExecutionHandlerTests(TestCase):
             revision=bundle(handlers.RevisionEffects),
         )
         self.effects = replace(self.effects, workspace=replace(self.effects.workspace, current_rebase_service=None))
+        self.effects = replace(self.effects, workspace=replace(self.effects.workspace,
+            live_remote_branch_oid=self.effects.workspace.remote_branch_oid))
         self.effects.workspace.is_directory.return_value = False
         self.effects.workspace.branch_has_changes.return_value = True
         self.effects.workspace.git.side_effect = self.git
@@ -1441,7 +1443,11 @@ class ExecutionHandlerTests(TestCase):
             'model', 'high',
         )
         self.effects.publication.published_execplan.return_value = self.plan
-        self.effects.publication.push_managed_publication_branch.side_effect = lambda *a: self.calls.append('push') or 'head'
+        def push(*args):
+            self.calls.append('push')
+            self.effects.workspace.remote_branch_oid.return_value = self.remote
+            return self.remote
+        self.effects.publication.push_managed_publication_branch.side_effect = push
         self.effects.publication.command.side_effect = lambda *a, **k: self.calls.append('pr') or SimpleNamespace(stdout='https://example/pr/1')
         self.effects.revision.reconcile_catalog.side_effect = lambda *_: SimpleNamespace(
             kind=SimpleNamespace(value='reconciled'), revision_sha=self.remote
@@ -5112,7 +5118,8 @@ class ExecutionHandlerTests(TestCase):
         self.effects.publication.reconcile_existing_pull_request.return_value = 0
         result = self.handler.publish(self.context('PUBLISHING'), self.handler)
         self.assertEqual(result.kind, ExecutionOutcomeKind.SUCCESS)
-        self.assertEqual(self.calls, ['rev-parse'])
+        self.assertTrue(self.calls)
+        self.assertTrue(all(call == 'rev-parse' for call in self.calls))
 
     def test_worker_format_scope_and_guidance_stop_before_verify(self):
         scenarios = ('format', 'scope', 'guidance')
@@ -7200,3 +7207,138 @@ class EvidenceFreeRebasePreparationTests(TestCase):
         self.case.observed = replace(self.case.observed, remote=replace(remote, pull_request=None))
         with self.assertRaises(handlers.manager_git_journal.MutationEvidenceError):
             self.case.handler._context()
+
+
+class TaskRelevantPublicationBoundaryTests(TestCase):
+    def setUp(self):
+        self.case = ExecutionHandlerTests(methodName='runTest')
+        self.case.setUp()
+        self.addCleanup(self.case.doCleanups)
+        self.handler = self.case.handler
+        self.effects = self.case.effects
+
+    def observation(self):
+        context = self.case.context('PUBLISHING')
+        return self.handler._publication_resume().observe(
+            context.repo_path, context.worktree, context.branch, None)
+
+    def test_publication_reads_live_remote_instead_of_unused_tracking_cache(self):
+        live = mock.Mock(return_value='base')
+        self.handler.effects = replace(self.effects, workspace=replace(
+            self.effects.workspace, live_remote_branch_oid=live))
+        self.effects.workspace.remote_branch_oid.return_value = 'stale'
+        self.assertEqual(self.observation().remote_oid, 'base')
+        self.effects.workspace.remote_branch_oid.assert_not_called()
+        live.assert_called_once()
+        self.assertEqual(self.effects.workspace.validate_managed_worktree.call_count, 2)
+
+    def test_observation_rejects_head_change_during_pr_query(self):
+        self.effects.publication.pr_for_branch.side_effect = lambda *args: setattr(self.case, 'remote', 'changed')
+        with self.assertRaises(lm.PublicationSafetyError):
+            self.observation()
+
+    def test_observation_rechecks_selected_worktree_ownership(self):
+        self.effects.workspace.validate_managed_worktree.side_effect = [None, lm.WorkspaceOwnershipError('registration changed')]
+        with self.assertRaises(lm.WorkspaceOwnershipError):
+            self.observation()
+        self.effects.publication.command.assert_not_called()
+
+    def test_candidate_changed_since_review_cannot_be_observed_for_publication(self):
+        self.case.review_context()
+        self.case.state.update_project('repo', phase='PUBLISHING')
+        self.case.remote = 'changed'
+        with self.assertRaises(lm.PublicationSafetyError):
+            self.observation()
+
+    def test_remote_change_between_push_and_pr_creation_stops_creation(self):
+        self.case.state.update_project('repo', validated_base_sha='base')
+        live = mock.Mock(side_effect=[None, 'competitor'])
+        self.handler.effects = replace(self.effects, workspace=replace(
+            self.effects.workspace, live_remote_branch_oid=live))
+        result = self.handler._publish_new_pull_request(self.case.context('PUBLISHING'), self.case.state.row())
+        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.effects.publication.command.assert_not_called()
+
+    def test_base_advance_before_pr_creation_returns_to_existing_revalidation_flow(self):
+        self.case.state.update_project('repo', validated_base_sha='base')
+        self.handler._fetch_latest_base = mock.Mock(return_value='advanced')
+        expected = ExecutionOutcome(ExecutionOutcomeKind.RETRY)
+        self.handler._latest_before_publication = mock.Mock(return_value=expected)
+        result = self.handler._publish_new_pull_request(self.case.context('PUBLISHING'), self.case.state.row())
+        self.assertEqual(result, expected)
+        self.effects.publication.command.assert_not_called()
+        self.handler._latest_before_publication.assert_called_once()
+
+    def push_fixture(self, *, branch_changed=False, remote_race=False, existing_pr=False):
+        branch = 'loop-manager/G-047'
+        head = 'a' * 40
+        remote = None
+        def git(path, *args, **kwargs):
+            nonlocal remote
+            if args[0] == 'rev-parse':
+                value = 'b' * 40 if branch_changed and '--verify' in args else head
+                return SimpleNamespace(stdout=value, returncode=0)
+            if args[0] == 'ls-remote':
+                return SimpleNamespace(stdout=f'{remote}\trefs/heads/{branch}\n' if remote else '', returncode=0)
+            if args[0] == 'push':
+                if remote_race:
+                    remote = 'c' * 40
+                    return SimpleNamespace(stdout='lease rejected', returncode=1)
+                remote = head
+            return SimpleNamespace(stdout='', returncode=0)
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        owned = stack.enter_context(mock.patch.object(lm, '_owned_publication_plan', return_value={
+            'plan_id': 'G-047', 'publication_remote_oid': None, 'pr_url': None}))
+        command = stack.enter_context(mock.patch.object(lm, 'git', side_effect=git))
+        stack.enter_context(mock.patch.object(lm, 'remote_branch_oid', side_effect=lambda *args: remote))
+        stack.enter_context(mock.patch.object(lm, '_recorded_base_fetch'))
+        stack.enter_context(mock.patch.object(lm, 'pr_for_branch', return_value={'headRefOid': head} if existing_pr else None))
+        return branch, head, owned, command
+
+    def push(self, branch):
+        return lm.push_managed_publication_branch(self.case.connection, Path('/repo'),
+            Path('/state'), 'repo', branch, Path('/state/G-047'))
+
+    def test_push_uses_confirmed_object_oid_and_create_only_lease(self):
+        branch, head, owned, command = self.push_fixture()
+        self.assertEqual(self.push(branch), head)
+        pushed = next(call for call in command.call_args_list if call.args[1] == 'push')
+        self.assertIn(f'{head}:refs/heads/{branch}', pushed.args)
+        self.assertIn(f'--force-with-lease=refs/heads/{branch}:', pushed.args)
+        self.assertEqual(owned.call_count, 2)
+
+    def test_push_rejects_changed_owned_branch_or_new_pr_before_mutation(self):
+        for options in ({'branch_changed': True}, {'existing_pr': True}):
+            with self.subTest(options=options):
+                branch, _, _, command = self.push_fixture(**options)
+                with self.assertRaises(lm.PublicationSafetyError):
+                    self.push(branch)
+                self.assertFalse(any(call.args[1] == 'push' for call in command.call_args_list))
+
+    def test_remote_creation_race_cannot_be_overwritten_by_first_push(self):
+        branch, _, _, command = self.push_fixture(remote_race=True)
+        with self.assertRaisesRegex(RuntimeError, 'lease rejected'):
+            self.push(branch)
+        pushed = next(call for call in command.call_args_list if call.args[1] == 'push')
+        self.assertIn(f'--force-with-lease=refs/heads/{branch}:', pushed.args)
+
+    def test_conflict_push_requeries_actual_pr_head_after_fetch(self):
+        branch = 'loop-manager/G-047'
+        head, base, old = 'a' * 40, 'b' * 40, 'c' * 40
+        plan = dict(self.case.repository.active_row('repo'))
+        plan.update(status='PUBLISHING', pr_conflict_recovery=1, workspace_owned=lm.WORKSPACE_OWNED,
+            branch=branch, worktree='/state/G-047', pr_url='https://example/pr/1',
+            pr_conflict_head_oid=old, pr_conflict_base_oid=base, active_sha=base, validated_base_sha=base)
+        pr = {'url': plan['pr_url'], 'state': 'OPEN', 'headRefName': branch, 'headRefOid': old}
+        with mock.patch.object(lm, 'active_execplan', return_value=plan), \
+                mock.patch.object(lm, 'validate_execplan_workspace_identity'), \
+                mock.patch.object(lm, 'validate_managed_worktree'), \
+                mock.patch.object(lm, '_fetch_pr_conflict_recovery_refs'), \
+                mock.patch.object(lm, 'remote_branch_oid', return_value=old), \
+                mock.patch.object(lm, 'git', return_value=SimpleNamespace(stdout=head, returncode=0)) as command, \
+                mock.patch.object(lm, 'pr_for_branch', return_value={**pr, 'headRefOid': 'd' * 40}):
+            with self.assertRaises(lm.PublicationSafetyError):
+                lm.push_owned_pr_conflict_recovery(self.case.connection, Path('/repo'),
+                    Path('/state'), 'repo', branch, Path('/state/G-047'), pr)
+        self.assertFalse(any(call.args[1] == 'push' for call in command.call_args_list))

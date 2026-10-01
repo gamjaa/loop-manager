@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS agent_invocations (
     previous_model TEXT,
     previous_effort TEXT,
     previous_session_id TEXT,
+    scope_id TEXT,
     attempt INTEGER NOT NULL,
     started_at TEXT NOT NULL,
     finished_at TEXT,
@@ -67,7 +68,7 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.execute(ISOLATION_SCHEMA)
     columns = {row[1] for row in connection.execute("PRAGMA table_info(agent_invocations)")}
     for field in ("transition_id", "previous_provider", "previous_model",
-                  "previous_effort", "previous_session_id"):
+                  "previous_effort", "previous_session_id", "scope_id"):
         if field not in columns:
             connection.execute(f"ALTER TABLE agent_invocations ADD COLUMN {field} TEXT")
     connection.execute("""CREATE INDEX IF NOT EXISTS agent_invocations_analysis
@@ -83,23 +84,55 @@ class InvocationRepository:
         self.connection = connection
 
     def start(self, context: InvocationContext, role: str, provider: str,
-              profile: ResolvedProfile, session_id: str | None) -> str:
+              profile: ResolvedProfile, session_id: str | None, *,
+              scope_id: str | None = None) -> str:
         identity = uuid4().hex
         with self.connection:
             self.connection.execute("""INSERT INTO agent_invocations
                 (invocation_id, repo, plan_id, definition_revision, role, provider,
                  model, effort, session_id, transition, transition_cause,
                  transition_id, previous_provider, previous_model, previous_effort,
-                 previous_session_id, attempt, started_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 previous_session_id, attempt, started_at, scope_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (identity, context.repo, context.plan_id, context.definition_revision,
                  role, provider, profile.model, profile.effort, session_id,
                  context.transition or ("resume" if session_id else "start"),
                  context.transition_cause, context.transition_id,
                  context.previous_provider, context.previous_model,
                  context.previous_effort, context.previous_session_id,
-                 context.attempt, utc_now()))
+                 context.attempt, utc_now(), scope_id))
         return identity
+
+    def verified_scope(self, scope_id: str, *, repo: str, plan_id: str | None,
+                       role: str, provider: str, session_id: str | None,
+                       worktree: str, repository_identity: str, start_digest: str) -> bool:
+        """Every physical attempt in a saved scope must carry matching proof."""
+        if not scope_id or not session_id:
+            return False
+        rows = self.connection.execute("""SELECT call.*, proof.status AS proof_status,
+            proof.provider AS proof_provider, proof.role AS proof_role,
+            proof.cli_version, proof.environment, proof.canonical_worktree,
+            proof.repository_identity, proof.policy_digest, proof.snapshot_digest,
+            proof.configuration_digest
+            FROM agent_invocations AS call LEFT JOIN agent_isolation_evidence AS proof
+            USING (invocation_id) WHERE call.scope_id = ? ORDER BY call.rowid""",
+            (scope_id,)).fetchall()
+        if not rows or rows[0]['snapshot_digest'] != start_digest:
+            return False
+        for row in rows:
+            if (row['repo'] != repo or row['plan_id'] != plan_id
+                    or row['role'] != role or row['provider'] != provider
+                    or row['proof_provider'] != provider or row['proof_role'] != role
+                    or row['proof_status'] != 'verified' or not row['finished_at']
+                    or row['result_kind'] != 'success' or row['result_code'] != 0
+                    or not row['session_id'] or not row['cli_version'] or not row['environment']
+                    or row['canonical_worktree'] != worktree
+                    or row['repository_identity'] != repository_identity
+                    or any(not isinstance(row[key], str) or len(row[key]) != 64
+                           or any(char not in '0123456789abcdef' for char in row[key])
+                           for key in ('policy_digest', 'snapshot_digest', 'configuration_digest'))):
+                return False
+        return rows[-1]['session_id'] == session_id
 
     def observe_session(self, identity: str, session_id: str) -> None:
         with self.connection:
