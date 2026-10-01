@@ -2007,7 +2007,7 @@ class PersistedMergeProjectQueryTest(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             for name in (
                 "observe_blocked_plan_remotes", "backfill_plan_shas",
-                "migrate_legacy_execplans", "resume_plan_blocks",
+                "migrate_legacy_execplans", "resume_plan_blocks", "_recorded_base_fetch",
             ):
                 stack.enter_context(mock.patch.object(loop_manager, name))
             stack.enter_context(mock.patch.object(loop_manager, "validate_repository", return_value=Path("/repo")))
@@ -15427,7 +15427,9 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertNotEqual(remote_sha, head)
             self.assertEqual(source_shas, [remote_sha])
-            self.assertEqual(catalog_shas, [remote_sha])
+            # The fetched source is validated once; the proven archive rename
+            # advances catalog paths/revision atomically without a full reread.
+            self.assertEqual(catalog_shas, [head])
             self.assertEqual(git_command(repo, "rev-parse", "HEAD"), remote_sha)
             planner.assert_called_once()
 

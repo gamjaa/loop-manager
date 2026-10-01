@@ -46,9 +46,9 @@ priority: critical
 ## Progress
 
 - [x] 현재 처리 순서와 fetch 이후 catalog 반영 전 archive/유지보수 조회 경로 확인
-- [ ] fetch 직후 동기화와 소비자 순서 정리
-- [ ] PR·cleanup·archive 변경의 DB 반영과 원격 race 재검증
-- [ ] targeted unit test 작성·실행
+- [x] fetch 직후 동기화와 소비자 순서 정리
+- [x] PR·cleanup·archive 변경의 DB 반영과 원격 race 재검증
+- [x] targeted unit test 작성·실행
 - [ ] Manager 전체 verify·Reviewer 확인
 - [ ] 사용자 PR Merge
 
@@ -58,3 +58,6 @@ priority: critical
 - 원격이 동일하거나 Manager 결과를 기존 snapshot과 게시 증거로 검증할 수 있으면 중복 전체 동기화를 피한다. PR Merge commit이나 예상 밖 원격 전진에는 새로운 선언·source 변경이 포함될 수 있으므로 DB 상태 전이만으로 catalog 최신화를 대신하지 않는다.
 - 계획 삭제 후 유지보수 집합에 남은 참조를 자동 취소하는 정책은 이 계획의 범위가 아니다. 실제로 존재하지 않는 미취소 계획을 조용히 제외하거나 MERGED로 가장하지 않는다.
 - 이 게시에는 새 계획 문서만 포함한다. 구현과 targeted 검증, Manager 전체 verify·Review 및 구현 PR의 사용자 Merge는 후속 Loop Manager 실행에서 수행한다.
+
+- 2026-10-01 Worker: fetch 뒤 PR·cleanup·archive eligibility 전에 catalog를 반영한다. 프로젝트별 검증 snapshot은 선언 변경 또는 원격 전진에서만 다시 읽으며, 검증된 archive 게시의 경로·revision과 감사 결과는 같은 transaction/CAS로 적용한다. 별도 안전 차단은 읽기 전용 PR 조회와 검증된 연결 작업의 catalog refresh를 거쳐 기존 복구 경계를 유지하고, prepared planning publication은 소유 coordinator에서 먼저 복구한다.
+- Worker 검증: `python3 -m unittest tests.test_project_catalog_refresh -v`의 29건과 수정한 기존 unit test 개별 7건이 통과했다. archive publication의 기존 integration assertion은 최초 source 검증 + archive delta 반영에 맞춰 갱신했으며 Worker의 integration 실행 금지에 따라 Manager 전체 verify에 남긴다. Linux verify의 unit discovery는 유지하고 새 catalog refresh 모듈을 compile 목록에 추가했다. 전체 verify·Review·Merge는 아직 수행하지 않았다.

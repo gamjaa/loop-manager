@@ -9,7 +9,7 @@ import json
 from pathlib import PurePosixPath
 import re
 import sqlite3
-from typing import Iterator, Sequence
+from typing import Callable, Iterator, Sequence
 
 
 ARCHIVE_ITEMS_SCHEMA = """
@@ -72,6 +72,10 @@ class ArchiveWriteResult(str, Enum):
     SUPERSEDED = "superseded"
 
 
+class _ArchiveCatalogSuperseded(RuntimeError):
+    pass
+
+
 def _revision_token(candidates: Sequence[MergedArchiveCandidate]) -> str:
     return json.dumps(
         [
@@ -115,8 +119,10 @@ def _transaction(connection: sqlite3.Connection) -> Iterator[None]:
 class ExecPlanArchiveRepository:
     """SQLite boundary that never changes ExecPlan execution status or path."""
 
-    def __init__(self, connection: sqlite3.Connection, *, ensure: bool = True):
+    def __init__(self, connection: sqlite3.Connection, *, ensure: bool = True,
+                 apply_catalog: Callable[..., bool] | None = None):
         self.connection = connection
+        self.apply_catalog = apply_catalog
         if ensure:
             ensure_schema(connection)
 
@@ -376,31 +382,37 @@ class ExecPlanArchiveRepository:
         commit_oid: str | None,
         push_result: str,
     ) -> ArchiveWriteResult:
-        with _transaction(self.connection):
-            if not self.candidates_current(repo, candidates):
-                return ArchiveWriteResult.SUPERSEDED
-            if operation_id is not None:
-                self.connection.execute(
-                    """
-                    UPDATE execplan_archive_operations
-                    SET push_result = ?, pending_reason = NULL,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE repo = ? AND operation_id = ?
-                    """,
-                    (push_result, repo, operation_id),
-                )
-            for candidate in candidates:
-                self._upsert_item(
-                    repo,
-                    candidate,
-                    base_sha=base_sha,
-                    final_hash=candidate.content_hash,
-                    operation_id=operation_id,
-                    commit_oid=commit_oid,
-                    push_result=push_result,
-                    pending_reason=None,
-                    archived=True,
-                )
+        try:
+            with _transaction(self.connection):
+                if not self.candidates_current(repo, candidates):
+                    return ArchiveWriteResult.SUPERSEDED
+                if operation_id is not None:
+                    self.connection.execute(
+                        """
+                        UPDATE execplan_archive_operations
+                        SET push_result = ?, pending_reason = NULL,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE repo = ? AND operation_id = ?
+                        """,
+                        (push_result, repo, operation_id),
+                    )
+                for candidate in candidates:
+                    self._upsert_item(
+                        repo,
+                        candidate,
+                        base_sha=base_sha,
+                        final_hash=candidate.content_hash,
+                        operation_id=operation_id,
+                        commit_oid=commit_oid,
+                        push_result=push_result,
+                        pending_reason=None,
+                        archived=True,
+                    )
+                if (commit_oid is not None and self.apply_catalog is not None
+                        and not self.apply_catalog(base_sha, commit_oid, candidates)):
+                    raise _ArchiveCatalogSuperseded
+        except _ArchiveCatalogSuperseded:
+            return ArchiveWriteResult.SUPERSEDED
         return ArchiveWriteResult.APPLIED
 
     def item(self, repo: str, plan_id: str) -> sqlite3.Row | None:

@@ -969,7 +969,7 @@ class ProjectBlockedRemoteRecoveryTests(unittest.TestCase):
         with (mock.patch.object(Path, 'resolve', return_value=Path(self.repo)),
               mock.patch.object(loop_manager, '_self_runtime_project', return_value=None),
               mock.patch.object(loop_manager, 'observe_blocked_plan_remotes') as observe,
-              mock.patch.object(loop_manager, 'synchronize_waiting_pull_requests') as pr,
+              mock.patch.object(loop_manager, 'observe_waiting_pull_requests') as pr,
               mock.patch.object(loop_manager, 'resume_project_block_if_safe', return_value=False),
               mock.patch.object(self.recovery, 'ProjectBlockedReconciler') as recovery,
               mock.patch.object(loop_manager, '_recorded_base_fetch') as fetch,
@@ -980,6 +980,8 @@ class ProjectBlockedRemoteRecoveryTests(unittest.TestCase):
                 registered_only=True), 1)
         observe.assert_called_once()
         pr.assert_called_once()
+        self.assertTrue(pr.call_args.kwargs['read_only'])
+        recovery.return_value.refresh_catalog.assert_called_once_with('G-106')
         recovery.return_value.reconcile.assert_called_once_with('G-106')
         fetch.assert_not_called()
         agent.assert_not_called()
