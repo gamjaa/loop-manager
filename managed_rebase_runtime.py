@@ -139,7 +139,22 @@ def build_service(ports, connection, repo_path, state_dir, repo, plan_id,
     archive_blobs = {}
     archive_signatures = {}
     if archives:
-        moves = ports.requirement_archive_move_set(repo_path, target, worktree)
+        archive_base = target
+        # Before the rebase starts, this checkout cannot contain requirements
+        # added by the target. Match the observation adapter's original-branch
+        # diff base; once rebase starts or target is included, check target.
+        if pending_metadata is None and not pending_index and expected.before_head:
+            head = ports.git(worktree, 'rev-parse', 'HEAD').stdout.strip()
+            if head == expected.before_head:
+                ancestry = ports.git(worktree, 'merge-base', '--is-ancestor',
+                                     target, head, check=False)
+                if ancestry.returncode not in (0, 1):
+                    raise MutationEvidenceError('archive target ancestry unavailable')
+                if ancestry.returncode == 1:
+                    archive_base = ports.git(worktree, 'merge-base', target, head).stdout.strip()
+                    if not archive_base:
+                        raise MutationEvidenceError('archive original branch base unavailable')
+        moves = ports.requirement_archive_move_set(repo_path, archive_base, worktree)
         archive_ok = not (set(moves) - set(archives))
         for source in archives:
             entry = ports.git(repo_path, 'ls-tree', '-z', target, '--', source).stdout

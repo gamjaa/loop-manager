@@ -1095,6 +1095,82 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
 
 class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
     """The production factory's identity/input adapters, with no Git process."""
+    def test_archive_contract_uses_original_base_only_before_rebase(self):
+        import requirement_archive
+        from managed_rebase_runtime import build_service
+        from tests.test_runtime_state import CurrentRebaseRuntimeTests
+        source = 'docs/requirements/old.md'
+        archived = 'docs/requirements/archive/old.md'
+        original_tree = {source.encode(): (b'blob', b'original')}
+        target_tree = {**original_tree,
+                       b'docs/requirements/new.md': (b'blob', b'new')}
+        cases = (
+            ('before', None, '', 1, True),
+            ('before', None, '', 0, False),
+            ('after', None, '', 1, False),
+            ('before', 'rebase-metadata', '', 1, False),
+            ('before', None, 'unmerged-index', 1, False),
+        )
+        for head, metadata, index, ancestry, allowed in cases:
+            with self.subTest(head=head, metadata=metadata, index=index, ancestry=ancestry):
+                fixture = CurrentRebaseRuntimeTests()
+                connection, *_ = fixture.fixture()
+                self.addCleanup(fixture.doCleanups)
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    (root / archived).parent.mkdir(parents=True)
+                    (root / archived).write_bytes(b'body')
+                    ports = mock.Mock()
+                    ports.WORKSPACE_OWNED = 1
+                    ports.requirement_archive_candidates.return_value = (source,)
+                    ports.requirement_archive_path.side_effect = loop_manager.requirement_archive_path
+                    ports._owned_rebase_metadata.return_value = metadata
+                    ports._published_plan_allows_common_plans.return_value = False
+                    ports._revision_execplan_input_fingerprint.return_value = 'published-input'
+                    ports._worktree_execplan_input_fingerprint.return_value = 'current-input'
+                    ports._path_signature.return_value = 'signature'
+                    def git(_root, *args, **kwargs):
+                        output = {
+                            ('rev-parse', '--git-common-dir'): '/repo/.git',
+                            ('rev-parse', 'HEAD'): head,
+                            ('ls-files', '-u', '-z'): index,
+                            ('merge-base', 'base', 'before'): 'common',
+                            ('ls-tree', '-z', 'base', '--', source):
+                                '100644 blob ' + 'a' * 40 + '\t' + source + '\0',
+                        }.get(args, '')
+                        code = ancestry if args[:2] == ('merge-base', '--is-ancestor') else 0
+                        return SimpleNamespace(stdout=output, returncode=code)
+                    ports.git.side_effect = git
+                    def moves(_repo, revision, _worktree):
+                        return requirement_archive.validated_moves(
+                            original_tree if revision == 'common' else target_tree,
+                            root, blob_contents=lambda _oid: b'body',
+                            ignore_status=lambda _path: (1, ''))
+                    ports.requirement_archive_move_set.side_effect = moves
+                    def build():
+                        return build_service(ports, connection, Path('/repo'), Path('/state'),
+                                             'repo', 'G-047', Path('/owned'), 'loop-manager/G-047')
+                    if allowed:
+                        service = build()
+                        ports.requirement_archive_move_set.assert_called_once_with(
+                            Path('/repo'), 'common', Path('/owned'))
+                        from tests.test_managed_rebase_validation import observation
+                        from managed_rebase_validation import FileChange
+                        def archived_change(oid):
+                            return observation(service.expected, committed=(FileChange(
+                                archived, '000000', '100644', '0', oid, 'A'),))
+                        self.assertTrue(service.adapters.contracts_allowed(archived_change('a' * 40)))
+                        self.assertFalse(service.adapters.contracts_allowed(archived_change('b' * 40)))
+                        # Existing requirements still cannot disappear from both paths.
+                        (root / archived).unlink()
+                        with self.assertRaises(requirement_archive.ArchiveMoveError):
+                            build()
+                    else:
+                        with self.assertRaises(requirement_archive.ArchiveMoveError):
+                            build()
+                        ports.requirement_archive_move_set.assert_called_once_with(
+                            Path('/repo'), 'base', Path('/owned'))
+
     def test_factory_uses_current_inputs_exact_lease_and_final_scope(self):
         from tests.test_runtime_state import CurrentRebaseRuntimeTests
         from managed_rebase_runtime import build_service
