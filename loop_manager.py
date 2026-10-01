@@ -9122,9 +9122,10 @@ def push_managed_publication_branch(
     if remote_oid == local_oid:
         return local_oid
 
+    # The explicit destination needs no upstream; -u mutates shared config
+    # and invalidates snapshots of other interrupted plans.
     push_arguments = [
         "push",
-        "-u",
         "origin",
         f"HEAD:refs/heads/{branch}",
     ]
@@ -9270,7 +9271,6 @@ def push_owned_pr_conflict_recovery(
         worktree,
         "push",
         lease,
-        "-u",
         "origin",
         f"HEAD:refs/heads/{branch}",
         check=False,

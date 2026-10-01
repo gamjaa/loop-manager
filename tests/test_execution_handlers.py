@@ -7036,7 +7036,7 @@ class EvidenceFreeRecoveryLifecycleTests(TestCase):
                 mock.patch.object(lm, 'remote_branch_oid', return_value='stale-cache') as cached:
             result = self.coordinator.dispatch(self.handler._context())
         self.assertEqual(result.kind, ExecutionOutcomeKind.SUCCESS)
-        self.assertEqual(pushes, [('push', '-u', 'origin', 'HEAD:refs/heads/loop-manager/G-047')])
+        self.assertEqual(pushes, [('push', 'origin', 'HEAD:refs/heads/loop-manager/G-047')])
         fetch.assert_called_once()
         cached.assert_not_called()
         self.effects.workspace.remote_branch_oid.assert_not_called()

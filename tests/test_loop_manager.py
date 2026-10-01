@@ -14633,7 +14633,45 @@ class LatestBasePublicationTest(unittest.TestCase):
         )
         self.assertEqual(len(pushes), 1)
         self.assertIn(f'--force-with-lease=refs/heads/{branch}:{old}', pushes[0])
+        self.assertNotIn('-u', pushes[0])
+        self.assertNotIn('--set-upstream', pushes[0])
+        self.assertEqual(pushes[0][-2:], ('origin', f'HEAD:refs/heads/{branch}'))
         update.assert_called_once_with(connection, 'repo', publication_remote_oid=new)
+
+    def test_pr_conflict_push_preserves_config_and_exact_lease(self):
+        branch, old, new, base = 'loop-manager/G-081', 'a' * 40, 'b' * 40, 'c' * 40
+        connection = mock.Mock()
+        connection.execute.return_value.fetchone.return_value = {'base_branch': 'main'}
+        plan = {
+            'plan_id': 'G-081', 'status': 'PUBLISHING', 'workspace_owned': 1,
+            'pr_conflict_recovery': 1, 'branch': branch, 'worktree': '/managed',
+            'pr_url': 'https://example.test/pr/81', 'pr_conflict_head_oid': old,
+            'pr_conflict_base_oid': base, 'active_sha': base, 'validated_base_sha': base,
+        }
+        pr = {'url': plan['pr_url'], 'state': 'OPEN', 'headRefName': branch, 'headRefOid': old}
+        calls = []
+
+        def git(_path, *arguments, **_kwargs):
+            calls.append(arguments)
+            return subprocess.CompletedProcess(arguments, 0,
+                new + '\n' if arguments[:2] == ('rev-parse', 'HEAD') else '')
+
+        with (
+            mock.patch('loop_manager.active_execplan', return_value=plan),
+            mock.patch('loop_manager.validate_execplan_workspace_identity'),
+            mock.patch('loop_manager.validate_managed_worktree'),
+            mock.patch('loop_manager._fetch_pr_conflict_recovery_refs'),
+            mock.patch('loop_manager._recorded_base_fetch'),
+            mock.patch('loop_manager.remote_branch_oid', side_effect=[old, new]),
+            mock.patch('loop_manager.git', side_effect=git),
+        ):
+            self.assertEqual(loop_manager.push_owned_pr_conflict_recovery(
+                connection, Path('/repo'), Path('/state'), 'repo', branch,
+                Path('/managed'), pr), new)
+        self.assertEqual([args for args in calls if args[0] == 'push'], [(
+            'push', f'--force-with-lease=refs/heads/{branch}:{old}',
+            'origin', f'HEAD:refs/heads/{branch}')])
+        self.assertFalse(any(args[0] == 'config' for args in calls))
 
     def test_unowned_remote_branch_is_blocked_without_force_push(self):
         with tempfile.TemporaryDirectory() as directory:
