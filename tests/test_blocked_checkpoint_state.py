@@ -10,6 +10,36 @@ import runtime_state
 
 
 class BlockedCheckpointRepositoryTest(unittest.TestCase):
+    def test_diagnostic_intent_reuse_does_not_promote_original_ownership(self):
+        request = self.request()
+        repository = blocked_checkpoint_state.DiagnosticPublicationRepository(self.connection)
+        original = dict(self.connection.execute('SELECT * FROM exec_plans').fetchone())
+        intent = repository.intent(request, base_oid='a' * 40, head_oid='b' * 40,
+                                   tree_oid='c' * 40, cause='original failure')
+        reused = repository.intent(request, base_oid='a' * 40, head_oid='b' * 40,
+                                   tree_oid='c' * 40, cause='later observation')
+        self.assertEqual(dict(intent), dict(reused))
+        payload = dict(result='published', diagnostic=True, branch=intent['ref'], commit_oid='b' * 40)
+        repository.result('repo', 'G-034', 'cause', payload, intent=intent)
+        repository.result('repo', 'G-034', 'cause', payload, intent=intent)
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM exec_plans').fetchone()), original)
+        self.assertIsNone(self.connection.execute('SELECT accepted_remote_oid FROM blocked_checkpoints').fetchone()[0])
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM blocked_diagnostic_publications').fetchone()[0], 1)
+        self.assertEqual(self.connection.execute('SELECT confirmed_oid FROM blocked_diagnostic_publications').fetchone()[0], 'b' * 40)
+        with self.assertRaises(RuntimeError):
+            repository.result('repo', 'G-034', 'cause', {**payload, 'commit_oid': 'd' * 40}, intent=intent)
+
+    def test_diagnostic_result_and_notification_rollback_together(self):
+        request = self.request()
+        repository = blocked_checkpoint_state.DiagnosticPublicationRepository(self.connection)
+        intent = repository.intent(request, base_oid='a' * 40, head_oid='b' * 40, tree_oid='c' * 40, cause='failure')
+        with mock.patch.object(notifications, 'enqueue_current_project_events', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                repository.result('repo', 'G-034', 'cause',
+                                  dict(result='published', branch=intent['ref'], commit_oid='b' * 40), intent=intent)
+        self.assertIsNone(self.connection.execute('SELECT confirmed_oid FROM blocked_diagnostic_publications').fetchone()[0])
+        self.assertIsNone(self.connection.execute('SELECT * FROM project_checkpoint_results').fetchone())
+
     def setUp(self):
         self.connection = sqlite3.connect(":memory:")
         self.connection.row_factory = sqlite3.Row

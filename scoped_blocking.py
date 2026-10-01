@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 import sqlite3
 import hashlib
+import json
 
 import runtime_state
 
@@ -148,6 +149,20 @@ def project_block(connection: sqlite3.Connection, repo: str) -> sqlite3.Row | No
     return connection.execute(
         "SELECT * FROM project_blocks WHERE repo = ?", (repo,)
     ).fetchone()
+
+
+def project_cause_identity(block) -> str:
+    return hashlib.sha256(json.dumps(
+        {key: block[key] for key in ('repo', 'plan_id', 'reason_code', 'evidence',
+                                    'release_fingerprint', 'created_at')},
+        sort_keys=True, separators=(',', ':'),
+    ).encode()).hexdigest()
+
+
+def project_cause_matches(connection, expected) -> bool:
+    """Recovery can revalidate only the original, still-current cause."""
+    current = project_block(connection, expected['repo'])
+    return current is not None and dict(current) == dict(expected)
 
 
 def record_plan_block(

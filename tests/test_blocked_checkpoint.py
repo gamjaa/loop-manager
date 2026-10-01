@@ -164,7 +164,51 @@ class BlockedCheckpointRefreshUnitTests(unittest.TestCase):
         commands.assert_not_called()
 
 
+class BlockedCheckpointDiscoveryUnitTests(unittest.TestCase):
+    def test_git_fixture_cases_are_collected_once_across_consuming_modules(self):
+        from collections import Counter
+        from tests import test_blocked_checkpoint, test_execution_handlers
+
+        def cases(suite):
+            for item in suite:
+                if isinstance(item, unittest.TestSuite):
+                    yield from cases(item)
+                else:
+                    yield item.id()
+
+        loader = unittest.TestLoader()
+        fixture_ids = set(cases(loader.loadTestsFromTestCase(
+            test_blocked_checkpoint.BlockedCheckpointGitAdapterTest)))
+        counts = Counter(case for module in (test_blocked_checkpoint, test_execution_handlers)
+                         for case in cases(loader.loadTestsFromModule(module)))
+        self.assertTrue(fixture_ids)
+        self.assertEqual({counts[case] for case in fixture_ids}, {1})
+
+
 class BlockedCheckpointPolicyTest(unittest.TestCase):
+    def test_project_exception_still_requires_current_scope_and_git_safety(self):
+        denied = blocked_checkpoint.assess_safety(self.observation(project_blocked=True))
+        self.assertFalse(denied.safe)
+        self.assertTrue(blocked_checkpoint.assess_safety(self.observation(
+            project_blocked=True, project_recovery_verified=True)).safe)
+        for changes in ({'workspace_owned': False}, {'shared_metadata_owned': False},
+                        {'operations': ('rebase-merge',)}, {'actual_branch': None},
+                        {'legacy_scope_uncertain': True},
+                        {'dirty_paths': (blocked_checkpoint.DirtyPath('AGENTS.md', ('staged',), False),)}):
+            with self.subTest(changes=changes):
+                self.assertFalse(blocked_checkpoint.assess_safety(self.observation(
+                    project_blocked=True, project_recovery_verified=True, **changes)).safe)
+
+    def test_diagnostic_refs_are_immutable_and_bound_to_the_artifact(self):
+        values = ('repo', 'G-107', 'loop-manager/G-107', 'a' * 40, 'b' * 40, 'c' * 40)
+        branch = blocked_checkpoint.diagnostic_branch(*values)
+        self.assertEqual(branch, blocked_checkpoint.diagnostic_branch(*values))
+        self.assertNotEqual(branch, blocked_checkpoint.diagnostic_branch(*values[:-2], 'd' * 40, values[-1]))
+        for remote, mode in ((None, blocked_checkpoint.PushMode.CREATE),
+                             ('b' * 40, blocked_checkpoint.PushMode.NONE),
+                             ('d' * 40, blocked_checkpoint.PushMode.REJECT)):
+            self.assertEqual(blocked_checkpoint.decide_diagnostic_push('b' * 40, remote).mode, mode)
+
     def test_existing_base_fetch_table_adds_action_token_column(self):
         connection = sqlite3.connect(":memory:")
         try:
@@ -413,6 +457,124 @@ class BlockedCheckpointPolicyTest(unittest.TestCase):
 
 class BlockedCheckpointGitAdapterTest(unittest.TestCase):
     # Real Git histories belong to Manager full verify, never Worker targeted runs.
+    def _project_block_fixture(self, *, known=False, advance=True):
+        if known:
+            repo, original = self._remote_refresh_fixture(base_changed=advance)
+        else:
+            self.block()
+            repo, original = str(self.repo.resolve()), self.base_oid
+            self.run_git(self.repo, 'push', 'origin', f'{original}:refs/heads/loop-manager/G-034')
+            (self.worktree / 'code.py').write_text('diagnostic artifact\n', encoding='utf-8')
+            if advance:
+                (self.repo / 'dependency.py').write_text('dependency = True\n', encoding='utf-8')
+                self.run_git(self.repo, 'add', 'dependency.py')
+                self.run_git(self.repo, 'commit', '-m', 'Advance diagnostic recovery base')
+                self.run_git(self.repo, 'push', 'origin', 'main')
+        self.connection.execute("UPDATE projects SET phase = 'PROJECT_BLOCKED', last_error = 'preserved project cause'")
+        self.connection.execute(
+            "INSERT INTO project_blocks (repo, scope, reason_code, plan_id, evidence, previous_phase) "
+            "VALUES (?, 'project', 'publication_ownership_uncertain', 'G-034', 'preserved project cause', 'PLAN_BLOCKED')",
+            (repo,))
+        self.connection.commit()
+        project = self.connection.execute('SELECT * FROM projects').fetchone()
+        loop_manager.observe_blocked_plan_remotes(self.connection, self.repo, repo, project)
+        coordinator = loop_manager.project_blocked_recovery.ProjectBlockedReconciler(
+            loop_manager, self.connection, self.repo, self.state_dir, repo, 'main')
+        return repo, original, coordinator
+
+    def test_project_block_rebases_and_publishes_diagnostic_without_original_ownership(self):
+        repo, original, coordinator = self._project_block_fixture()
+        source = self.run_git(self.repo, 'rev-parse', 'HEAD')
+        self.assertEqual(coordinator.reconcile('G-034'), 'blocked')
+        result = json.loads(self.connection.execute('SELECT payload FROM project_checkpoint_results').fetchone()[0])
+        self.assertEqual(result['result'], 'published', result)
+        self.assertTrue(result['diagnostic'])
+        head = self.run_git(self.worktree, 'rev-parse', 'HEAD')
+        self.assertEqual(self.run_git(self.remote, 'rev-parse', f"refs/heads/{result['branch']}"), head)
+        self.assertEqual(self.run_git(self.remote, 'rev-parse', 'refs/heads/loop-manager/G-034'), original)
+        self.run_git(self.worktree, 'merge-base', '--is-ancestor', source, head)
+        self.assertEqual(self.run_git(self.repo, 'rev-parse', 'HEAD'), source)
+        self.assertIsNone(self.connection.execute('SELECT publication_remote_oid FROM exec_plans').fetchone()[0])
+        with mock.patch.object(loop_manager, 'push_diagnostic_checkpoint', side_effect=AssertionError('duplicate push')):
+            self.assertEqual(coordinator.reconcile('G-034'), 'blocked')
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM blocked_diagnostic_publications').fetchone()[0], 1)
+        self.assertEqual(scoped_blocking.project_block(self.connection, repo)['evidence'], 'preserved project cause')
+
+    def test_project_diagnostic_push_sqlite_interruption_confirms_without_repush(self):
+        _, _, coordinator = self._project_block_fixture()
+        with mock.patch.object(blocked_checkpoint_state.DiagnosticPublicationRepository, 'result', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                coordinator.reconcile('G-034')
+        intent = self.connection.execute('SELECT * FROM blocked_diagnostic_publications').fetchone()
+        self.assertEqual(self.run_git(self.remote, 'rev-parse', f"refs/heads/{intent['ref']}"), intent['head_oid'])
+        with mock.patch.object(loop_manager, 'push_diagnostic_checkpoint', side_effect=AssertionError('duplicate push')):
+            self.assertEqual(coordinator.reconcile('G-034'), 'blocked')
+        self.assertEqual(self.connection.execute('SELECT confirmed_oid FROM blocked_diagnostic_publications').fetchone()[0], intent['head_oid'])
+
+    def test_project_diagnostic_collision_preserves_both_refs(self):
+        _, original, coordinator = self._project_block_fixture()
+        with mock.patch.object(loop_manager, 'push_diagnostic_checkpoint', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                coordinator.reconcile('G-034')
+        intent = self.connection.execute('SELECT * FROM blocked_diagnostic_publications').fetchone()
+        self.run_git(self.repo, 'push', 'origin', f"{original}:refs/heads/{intent['ref']}")
+        self.assertEqual(coordinator.reconcile('G-034'), 'blocked')
+        result = json.loads(self.connection.execute('SELECT payload FROM project_checkpoint_results').fetchone()[0])
+        self.assertEqual(result['result'], 'local_only')
+        self.assertIn('다른 OID', result['reason'])
+        self.assertEqual(self.run_git(self.remote, 'rev-parse', f"refs/heads/{intent['ref']}"), original)
+
+    def test_project_successor_fetch_ignores_configured_shared_ref_mapping(self):
+        repo, original, coordinator = self._project_block_fixture(known=True, advance=False)
+        successor = self.user_commit()
+        self.run_git(self.repo, 'update-ref', 'refs/heads/unowned', original)
+        self.run_git(self.repo, 'config', '--replace-all', 'remote.origin.fetch',
+                     '+refs/heads/loop-manager/G-034:refs/heads/unowned')
+        before = self.run_git(self.repo, 'for-each-ref', '--format=%(refname) %(objectname)')
+        loop_manager.observe_blocked_plan_remotes(
+            self.connection, self.repo, repo,
+            self.connection.execute('SELECT * FROM projects').fetchone())
+        # Stop at the adoption boundary so subsequent publication is unrelated
+        # to this fetch regression; real Git effects above run only in verify.
+        with mock.patch.object(coordinator, '_incorporate', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                coordinator.reconcile('G-034')
+        self.assertEqual(self.run_git(self.worktree, 'rev-parse', 'HEAD'), successor)
+        after = self.run_git(self.repo, 'for-each-ref', '--format=%(refname) %(objectname)')
+        own_prefix = 'refs/heads/loop-manager/G-034 '
+        self.assertEqual([line for line in before.splitlines() if not line.startswith(own_prefix)],
+                         [line for line in after.splitlines() if not line.startswith(own_prefix)])
+        self.assertEqual(self.run_git(self.repo, 'rev-parse', 'refs/heads/unowned'), original)
+
+    def test_project_known_lineage_refreshes_original_branch_with_exact_lease(self):
+        repo, original, coordinator = self._project_block_fixture(known=True)
+        self.assertEqual(coordinator.reconcile('G-034'), 'recovered')
+        result = json.loads(self.connection.execute('SELECT payload FROM project_checkpoint_results').fetchone()[0])
+        self.assertEqual(result['result'], 'published', result)
+        self.assertNotIn('diagnostic', result)
+        head = self.run_git(self.worktree, 'rev-parse', 'HEAD')
+        self.assertNotEqual(original, head)
+        self.assertEqual(self.run_git(self.remote, 'rev-parse', 'refs/heads/loop-manager/G-034'), head)
+        self.assertIsNone(scoped_blocking.project_block(self.connection, repo))
+        self.assertEqual(scoped_blocking.plan_block(self.connection, repo, 'G-034')['reason_code'], 'verify_retry_exhausted')
+
+    def test_project_rebase_conflict_preserves_worktree_without_checkpoint_push(self):
+        repo, original, coordinator = self._project_block_fixture(advance=False)
+        # Advance the same path so the owned rebase conflicts after preserving
+        # the local artifact in a checkpoint commit.
+        (self.repo / 'code.py').write_text('conflicting upstream\n', encoding='utf-8')
+        self.run_git(self.repo, 'add', 'code.py')
+        self.run_git(self.repo, 'commit', '-m', 'Conflicting base')
+        self.run_git(self.repo, 'push', 'origin', 'main')
+        loop_manager.observe_blocked_plan_remotes(self.connection, self.repo, repo,
+                                                self.connection.execute('SELECT * FROM projects').fetchone())
+        with mock.patch.object(loop_manager, 'push_diagnostic_checkpoint', side_effect=AssertionError('conflict push')):
+            self.assertEqual(coordinator.reconcile('G-034'), 'blocked')
+        result = json.loads(self.connection.execute('SELECT payload FROM project_checkpoint_results').fetchone()[0])
+        self.assertEqual(result['result'], 'local_only')
+        self.assertTrue(self.run_git(self.worktree, 'ls-files', '-u'))
+        self.assertEqual(self.run_git(self.remote, 'rev-parse', 'refs/heads/loop-manager/G-034'), original)
+
     def _remote_refresh_fixture(self, *, base_changed=False, branch_changed=False):
         self.block()
         (self.worktree / 'code.py').write_text('checkpoint\n', encoding='utf-8')

@@ -216,7 +216,7 @@ class BlockedPlanReconciler:
             accepted_rebase=rebase, saved_plan=plan)
         return worktree, branch
 
-    def _adopt(self, plan, context):
+    def _adopt(self, plan, context, *, project_recovery_context=None):
         checkpoint = ExecutionCheckpointRepository(self.connection).get(self.repo, plan['plan_id'])
         if checkpoint.operation in {'rebase', 'rebase_publish'}:
             self.ports._current_rebase_service(
@@ -230,7 +230,8 @@ class BlockedPlanReconciler:
             result = self.ports._reconcile_published_blocked_checkpoint(
                 self.connection, self.repo_path, self.state_dir, self.repo, plan, row,
                 repository.get(self.repo, plan['plan_id']), repository,
-                adopt_only=True, expected_remote_oid=context['branch_oid'])
+                adopt_only=True, expected_remote_oid=context['branch_oid'],
+                project_recovery_context=project_recovery_context)
             if result not in {'unchanged', 'adopted'}:
                 inspection = self.connection.execute(
                     'SELECT inspection_retryable FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?',

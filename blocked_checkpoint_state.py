@@ -13,6 +13,7 @@ from blocked_checkpoint import (
     CheckpointRequest,
     PreparedCheckpoint,
     checkpoint_identity,
+    diagnostic_branch,
 )
 
 
@@ -56,6 +57,16 @@ CREATE TABLE IF NOT EXISTS blocked_checkpoints (
 
 def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.execute(SCHEMA)
+    connection.execute("""CREATE TABLE IF NOT EXISTS blocked_diagnostic_publications (
+        repo TEXT NOT NULL, plan_id TEXT NOT NULL, ref TEXT NOT NULL,
+        original_branch TEXT NOT NULL, base_oid TEXT NOT NULL,
+        head_oid TEXT NOT NULL, tree_oid TEXT NOT NULL, cause TEXT NOT NULL,
+        confirmed_oid TEXT, PRIMARY KEY (repo, plan_id, ref)
+    )""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS project_checkpoint_results (
+        repo TEXT NOT NULL, plan_id TEXT NOT NULL, cause_identity TEXT NOT NULL,
+        payload TEXT NOT NULL, PRIMARY KEY (repo, plan_id)
+    )""")
     columns = {row[1] for row in connection.execute("PRAGMA table_info(blocked_checkpoints)")}
     for name in (
         "published_oid", "accepted_remote_oid", "pending_remote_oid",
@@ -474,3 +485,45 @@ class BlockedCheckpointRepository:
             # Reserving the event key now would hide a later published result.
             if not retryable:
                 notifications.enqueue_current_project_events(self.connection, request.repo)
+
+
+class DiagnosticPublicationRepository:
+    """Immutable diagnostic intents never confer original-branch ownership."""
+
+    def __init__(self, connection):
+        self.connection = connection
+        ensure_schema(connection)
+
+    def intent(self, request, *, base_oid, head_oid, tree_oid, cause):
+        ref = diagnostic_branch(request.repo, request.plan_id, request.branch,
+                                base_oid, head_oid, tree_oid)
+        with self.connection:
+            self.connection.execute(
+                'INSERT OR IGNORE INTO blocked_diagnostic_publications '
+                '(repo, plan_id, ref, original_branch, base_oid, head_oid, tree_oid, cause) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                (request.repo, request.plan_id, ref, request.branch, base_oid,
+                 head_oid, tree_oid, cause))
+        row = self.connection.execute(
+            'SELECT * FROM blocked_diagnostic_publications WHERE repo = ? AND plan_id = ? AND ref = ?',
+            (request.repo, request.plan_id, ref)).fetchone()
+        if (row['original_branch'], row['base_oid'], row['head_oid'], row['tree_oid']) != (
+                request.branch, base_oid, head_oid, tree_oid):
+            raise RuntimeError('진단 게시 intent의 작업물 identity가 변경됐습니다.')
+        return row
+
+    def result(self, repo, plan_id, cause_identity, payload, *, intent=None):
+        with self.connection:
+            if intent is not None:
+                if payload.get('commit_oid') != intent['head_oid'] or payload.get('branch') != intent['ref']:
+                    raise RuntimeError('진단 ref·확인 OID가 저장된 intent와 다릅니다.')
+                self.connection.execute(
+                    'UPDATE blocked_diagnostic_publications SET confirmed_oid = head_oid '
+                    'WHERE repo = ? AND plan_id = ? AND ref = ?',
+                    (repo, plan_id, intent['ref']))
+            self.connection.execute(
+                'INSERT INTO project_checkpoint_results VALUES (?, ?, ?, ?) '
+                'ON CONFLICT(repo, plan_id) DO UPDATE SET cause_identity = excluded.cause_identity, '
+                'payload = excluded.payload',
+                (repo, plan_id, cause_identity, json.dumps(payload, sort_keys=True)))
+            notifications.enqueue_current_project_events(self.connection, repo)

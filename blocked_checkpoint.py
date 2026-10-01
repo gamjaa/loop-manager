@@ -72,6 +72,7 @@ class SafetyObservation:
     dirty_paths: tuple[DirtyPath, ...] = ()
     shared_metadata_owned: bool = True
     project_blocked: bool = False
+    project_recovery_verified: bool = False
     legacy_scope_uncertain: bool = False
     agent_scope_recovery_pending: bool = False
 
@@ -112,7 +113,7 @@ class CheckpointPushError(RuntimeError):
 def assess_safety(observation: SafetyObservation) -> SafetyVerdict:
     """Return a typed verdict without reading SQLite or parsing free-form errors."""
 
-    if observation.project_blocked:
+    if observation.project_blocked and not observation.project_recovery_verified:
         return SafetyVerdict(
             False,
             SafetyScope.PROJECT,
@@ -298,6 +299,31 @@ def decide_push(
         PushMode.REJECT,
         "원격 branch를 fast-forward할 수 없어 checkpoint 갱신을 거부합니다.",
     )
+
+
+def diagnostic_branch(repo: str, plan_id: str, branch: str, base: str, head: str, tree: str) -> str:
+    """Name one immutable artifact independently of the original publication."""
+    identity = hashlib.sha256(json.dumps(
+        [repo, plan_id, branch, base, head, tree], separators=(",", ":"),
+    ).encode()).hexdigest()
+    return f"loop-manager/diagnostics/{plan_id}/{identity}"
+
+
+def decide_diagnostic_push(local_oid: str, remote_oid: str | None) -> PushDecision:
+    if remote_oid == local_oid:
+        return PushDecision(PushMode.NONE)
+    if remote_oid is None:
+        return PushDecision(PushMode.CREATE)
+    return PushDecision(PushMode.REJECT, "진단 ref에 다른 OID가 있어 갱신하지 않습니다.")
+
+
+def push_failure_retryable(output: str) -> bool:
+    normalized = ' '.join(output.casefold().split())
+    return not any(marker in normalized for marker in (
+        'protected branch', 'permission denied', 'not permitted',
+        'authentication failed', 'authorization failed', 'http 403',
+        'stale info', 'fetch first', 'non-fast-forward',
+    ))
 
 
 class CheckpointStatePort(Protocol):

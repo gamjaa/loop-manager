@@ -60,6 +60,44 @@ class NotificationFixture:
         ).fetchall()
 
 
+class ProjectCheckpointNotificationUnitTests(NotificationFixture, unittest.TestCase):
+    def setUp(self):
+        self.db = self.connection()
+        self.addCleanup(self.db.close)
+        self.repo = '/projects/alpha'
+        self.db.execute("UPDATE projects SET origin = 'example/repo', phase = 'PROJECT_BLOCKED'")
+        self.db.execute("INSERT INTO project_blocks (repo, scope, reason_code, plan_id, evidence) "
+                        "VALUES (?, 'project', 'publication_ownership_uncertain', 'G-018', 'original cause')", (self.repo,))
+        self.db.commit()
+        self.repository = blocked_checkpoint_state.DiagnosticPublicationRepository(self.db)
+        self.cause = scoped_blocking.project_cause_identity(scoped_blocking.project_block(self.db, self.repo))
+
+    def test_diagnostic_notice_contains_confirmed_ref_oid_and_original_branch_once(self):
+        payload = dict(result='published', diagnostic=True, branch='loop-manager/diagnostics/G-018/content',
+                       commit_oid='a' * 40, original_branch='loop-manager/G-018', base_oid='b' * 40)
+        self.repository.result(self.repo, 'G-018', self.cause, payload)
+        self.repository.result(self.repo, 'G-018', self.cause, payload)
+        notices = self.events(self.db)
+        self.assertEqual(len(notices), 1)
+        decoded = json.loads(notices[0]['payload'])
+        text = notifications._message('blocked', decoded)
+        self.assertIn('loop-manager/diagnostics/G-018/content', text)
+        self.assertIn('Original branch: loop-manager/G-018', text)
+        self.assertIn('a' * 40, text)
+        self.assertEqual(decoded['cause'], 'original cause')
+        self.assertEqual(notifications._current_block_key(self.db, self.repo, decoded),
+                         self.db.execute('SELECT block_key FROM notified_block_incidents').fetchone()[0])
+
+    def test_local_only_notice_reports_actual_reason_and_ignores_stale_cause_result(self):
+        self.repository.result(self.repo, 'G-018', self.cause,
+                               dict(result='local_only', reason='unresolved rebase conflict', worktree='/state/G-018'))
+        decoded = json.loads(self.events(self.db)[0]['payload'])
+        self.assertIn('unresolved rebase conflict', notifications._message('blocked', decoded))
+        self.assertIn('/state/G-018', notifications._message('blocked', decoded))
+        self.db.execute("UPDATE project_blocks SET evidence = 'new independent cause'")
+        self.assertIsNone(notifications._project_checkpoint(self.db, self.repo, 'G-018'))
+
+
 class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
     def test_inflight_planning_piece_confirmed_after_start_still_resumes(self):
         connection = self.connection()
