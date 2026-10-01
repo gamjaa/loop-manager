@@ -36,7 +36,7 @@ def approval_policy_failure(message: str) -> bool:
     failure = (r"fail(?:ed|ure)?|error|unavailable|unsupported|disabled|denied|"
                r"reject(?:ed|ion)?|conflict|invalid|cannot|could not|unable|"
                r"not (?:available|supported|allowed|found|enabled)|does not exist|expired|"
-               r"timed? out|실패|거부|중단")
+               r"timeout|timed? out|실패|거부|중단")
     # Keep line boundaries: a normal sandbox banner followed by an unrelated
     # network/quota error must retain the existing provider recovery behavior.
     return bool(re.search(

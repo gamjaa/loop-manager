@@ -18202,6 +18202,9 @@ class TimestampedExecutionProgressLogsTest(unittest.TestCase):
 class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
     def test_policy_failure_stops_retry_and_session_fallback(self):
         failures = (
+            "auto_review classifier timeout",
+            "auto_review classifier timed out",
+            "auto_review classifier timeout: cannot resume",
             "auto_review classifier unavailable: session not found; try again later",
             "guardian review failed: usage limit reached; cannot resume",
             "sandbox initialization failed: connection reset; thread not found",
@@ -18228,6 +18231,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
     def test_policy_banner_preserves_normal_transport_and_session_recovery(self):
         banner = "approvals_reviewer: auto_review\nsandbox: workspace-write\n"
         messages = (("service unavailable", loop_manager.AgentResultKind.TRANSIENT_FAILURE),
+                    ("request timeout", loop_manager.AgentResultKind.TRANSIENT_FAILURE),
                     ("usage limit reached", loop_manager.AgentResultKind.USAGE_LIMIT),
                     ("session not found", loop_manager.AgentResultKind.PERMANENT_CONFIGURATION))
         for message, kind in messages:
