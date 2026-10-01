@@ -2154,6 +2154,40 @@ class PersistedMergeProjectQueryTest(unittest.TestCase):
 
 
 class ProjectDiagnosticPublicationUnitTests(unittest.TestCase):
+    def test_guidance_checkpoint_archive_validates_both_rename_paths(self):
+        parent, head, tree = 'a' * 40, 'b' * 40, 'c' * 40
+        evidence = 'Guidance decision pending'
+        paths = ('docs/requirements/Archive.md', 'docs/requirements/archive/Archive.md')
+        identity = loop_manager.blocked_checkpoint.checkpoint_identity(
+            plan_id='G-058', reason_code=loop_manager.GUIDANCE_BLOCK_REASON,
+            evidence=evidence, parent_oid=parent, tree_oid=tree, included_paths=paths)
+        message = '\n'.join([
+            '[G-058] BLOCKED checkpoint', 'Scope: plan',
+            'Reason: ' + loop_manager.GUIDANCE_BLOCK_REASON,
+            'Evidence: ' + json.dumps(evidence),
+            'Evidence-SHA256: ' + hashlib.sha256(evidence.encode()).hexdigest(),
+            'Checkpoint-Identity: ' + identity, 'Paths:', *('- ' + p for p in paths)])
+
+        def git(_path, *args, **_kwargs):
+            if args[0] == 'diff':
+                changed = paths if '--no-renames' in args else paths[1:]
+                output = '\0'.join(changed) + '\0'
+            elif args[:2] == ('rev-parse', head + '^{tree}'):
+                output = tree
+            else:
+                output = {'--format=%B': message, '--format=%P': parent,
+                    '--format=%an <%ae>%n%cn <%ce>':
+                    'Loop Manager <loop-manager@localhost>\nLoop Manager <loop-manager@localhost>'}[args[2]]
+            return subprocess.CompletedProcess(args, 0, output)
+
+        with (mock.patch.object(loop_manager, 'git', side_effect=git),
+              mock.patch.object(loop_manager, 'git_bytes',
+                  side_effect=lambda path, *args: git(path, *args).stdout.encode())):
+            self.assertEqual(loop_manager._guidance_checkpoint_commit_evidence(
+                Path('/repo'), 'G-058', head), evidence)
+            self.assertIsNone(loop_manager._guidance_checkpoint_commit_evidence(
+                Path('/repo'), 'G-097', head))
+
     def test_planner_import_fixture_contains_direct_manager_modules(self):
         import ast
         import inspect

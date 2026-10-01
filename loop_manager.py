@@ -23552,7 +23552,7 @@ def _guidance_checkpoint_commit_evidence(
         parents = parent_line.split()
         tree = git(repo_path, "rev-parse", f"{oid}^{{tree}}").stdout.strip()
         changed = tuple(sorted(_nul_git_paths(
-            repo_path, "diff", "--name-only", "-z", parents[0], oid,
+            repo_path, "diff", "--no-renames", "--name-only", "-z", parents[0], oid,
         ))) if len(parents) == 1 else ()
         author = git(repo_path, "show", "-s", "--format=%an <%ae>%n%cn <%ce>", oid).stdout.splitlines()
         fields = dict(line.split(": ", 1) for line in message.splitlines() if ": " in line)
