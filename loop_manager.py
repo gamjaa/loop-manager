@@ -5369,8 +5369,17 @@ class _LegacyCatalogMergeProof:
         self, entry: execplan_catalog.ExecPlanCatalogEntry
     ) -> execplan_catalog_state.MergeProof:
         identity = self.stored.get(entry.plan_id)
+        if identity is None:
+            return execplan_catalog_state.MergeProof(False)
+        return self.verify_stored(entry, identity)
+
+    def verify_stored(
+        self,
+        entry: execplan_catalog.ExecPlanCatalogEntry,
+        identity: execplan_catalog_state.StoredPlanIdentity,
+    ) -> execplan_catalog_state.MergeProof:
         if (
-            identity is None
+            identity.plan_id != entry.plan_id
             or identity.status != "MERGED"
             or not identity.plan_sha
         ):
@@ -6051,10 +6060,10 @@ def catalog_schedule_decision(
         "SELECT * FROM exec_plans WHERE repo = ?", (repo,)
     ).fetchall()
     historical_confirmation = {
-        str(row["plan_id"]): bool(row["merge_confirmed"])
+        str(row["plan_id"]): bool(row["merge_confirmed"]) and not row["diagnostic_code"]
         for row in connection.execute(
             """
-            SELECT plan_id, merge_confirmed
+            SELECT plan_id, merge_confirmed, diagnostic_code
             FROM execplan_catalog_history
             WHERE repo = ?
               AND currently_archived = 1
@@ -6206,7 +6215,7 @@ def _advance_maintenance_cycle_after_merges(
         "WHERE h.repo = exec_plans.repo "
         "AND h.currently_archived = 1 "
         "AND h.plan_id = exec_plans.plan_id "
-        "AND h.merge_confirmed = 0)",
+        "AND (h.merge_confirmed = 0 OR h.diagnostic_code IS NOT NULL))",
         (repo,),
     ).fetchall()
     error = cycle_plan_status_error(rows, cycle)
@@ -19649,13 +19658,14 @@ def requirement_archive_snapshot(
         ),
     )
     historical_rows = connection.execute(
-        "SELECT plan_id, merge_confirmed FROM execplan_catalog_history "
+        "SELECT plan_id, merge_confirmed, diagnostic_code FROM execplan_catalog_history "
         "WHERE repo = ? AND currently_archived = 1",
         (repo,),
     ).fetchall()
     unverified_historical_ids = {
         str(row["plan_id"])
-        for row in historical_rows if not int(row["merge_confirmed"])
+        for row in historical_rows
+        if not int(row["merge_confirmed"]) or row["diagnostic_code"]
     }
     state_ids = set(states)
     if allow_future_publication:

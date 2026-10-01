@@ -42,6 +42,17 @@ class FakeMergeProof:
     def __init__(self, proof: execplan_catalog_state.MergeProof):
         self.proof = proof
         self.calls = []
+        self.local_calls = []
+
+    def verify_stored(self, entry, identity):
+        self.local_calls.append(identity)
+        return execplan_catalog_state.MergeProof(
+            True,
+            kind=execplan_catalog_state.MergeProofKind.STORED_AND_GIT,
+            plan_sha=identity.plan_sha,
+            publication_content_hash=identity.content_hash,
+            revision="b" * 40,
+        )
 
     def proof_for(self, entry):
         self.calls.append(entry.plan_id)
@@ -256,8 +267,10 @@ class ExecPlanCatalogStateTest(unittest.TestCase):
         self.assertEqual(len(result.merged), 1)
         self.assertEqual(
             result.merged[0].proof.kind,
-            execplan_catalog_state.MergeProofKind.GITHUB_PR,
+            execplan_catalog_state.MergeProofKind.STORED_AND_GIT,
         )
+        self.assertEqual(len(port.local_calls), 1)
+        self.assertEqual(result.merged[0].proof.pr_url, "https://example.test/pr/1")
 
     def test_verified_audit_only_history_rejects_tampered_archive_without_port_call(self):
         original = archived_entry()
@@ -272,7 +285,7 @@ class ExecPlanCatalogStateTest(unittest.TestCase):
         self.assertEqual(result.merged, ())
         self.assertEqual(result.diagnostics[0].code, "archived-content-hash-mismatch")
 
-    def test_verified_history_with_different_original_path_is_not_reused(self):
+    def test_verified_history_with_conflicting_runtime_identity_is_not_reused(self):
         entry = archived_entry()
         self.repository.record(
             "/repo",
@@ -292,12 +305,30 @@ class ExecPlanCatalogStateTest(unittest.TestCase):
         )
 
         result, port = self._recover(
-            entry, execplan_catalog_state.MergeProof(False)
+            entry, execplan_catalog_state.MergeProof(False),
+            {entry.plan_id: execplan_catalog_state.StoredPlanIdentity(
+                entry.plan_id, entry.active_path, entry.content_hash,
+                "a" * 40, "MERGED",
+            )},
         )
 
         self.assertEqual(port.calls, [])
+        self.assertEqual(port.local_calls, [])
         self.assertEqual(result.merged, ())
         self.assertEqual(result.diagnostics[0].code, "stable-identity-mismatch")
+
+    def test_incomplete_confirmed_history_never_falls_back_to_merge_lookup(self):
+        entry = archived_entry()
+        self._record_verified_history(entry)
+        self.connection.execute(
+            "UPDATE execplan_catalog_history SET proof_revision = NULL"
+        )
+        result, port = self._recover(entry, execplan_catalog_state.MergeProof(False))
+        self.assertEqual(port.calls, [])
+        self.assertEqual(port.local_calls, [])
+        self.assertEqual(result.merged, ())
+        self.assertEqual(result.diagnostics[0].code, "publication-proof-missing")
+
 
 
 class ArchivedDependencySelectionTest(unittest.TestCase):
@@ -423,6 +454,78 @@ class ArchivedDependencySelectionTest(unittest.TestCase):
         )._merged_count("/repo")
 
         self.assertEqual(count, 2)
+
+    def test_durable_merge_with_archive_diagnostic_does_not_satisfy_dependency(self):
+        import work_exhaustion
+
+        self._insert_plan("G-001", "MERGED")
+        self._record_historical("G-001", confirmed=True)
+        self._insert_plan("G-002", "READY", ("G-001",))
+        self.connection.execute(
+            "UPDATE execplan_catalog_history SET diagnostic_code = "
+            "'archived-content-hash-mismatch', diagnostic_message = 'tampered' "
+            "WHERE plan_id = 'G-001'"
+        )
+        self.connection.commit()
+
+        decision = loop_manager.catalog_schedule_decision(self.connection, "/repo")
+        self.assertIsNone(decision.runnable_ready)
+        self.assertEqual(
+            maintenance_state.MaintenanceRepository(self.connection)._merged_count("/repo"), 0,
+        )
+        snapshot = work_exhaustion.collect(
+            self.connection, "/repo", cycle="cycle", active_requirements=(),
+        )
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot.plans[0]["dependencies"], [
+            {"id": "G-001", "status": "HISTORICAL_UNVERIFIED"},
+        ])
+
+
+    def test_archive_diagnostic_prevents_maintenance_cycle_advancement(self):
+        self._insert_plan("G-001", "MERGED")
+        self._record_historical("G-001", confirmed=True)
+        self.connection.execute(
+            "UPDATE execplan_catalog_history SET diagnostic_code = 'merge-proof-missing'"
+        )
+        cycle = mock.Mock(
+            phase=maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
+            prerequisite_plan_ids=("G-001",),
+        )
+        with (
+            mock.patch.object(maintenance_state.MaintenanceRepository, "get", return_value=cycle),
+            mock.patch.object(maintenance_state.MaintenanceRepository, "transition") as transition,
+            self.assertRaises(loop_manager.MaintenancePlanningError),
+        ):
+            loop_manager._advance_maintenance_cycle_after_merges(self.connection, "/repo", "base")
+        transition.assert_not_called()
+
+    def test_archive_diagnostic_prevents_related_requirement_candidate(self):
+        self._insert_plan("G-001", "MERGED")
+        self._record_historical("G-001", confirmed=True)
+        self._insert_plan("G-002", "READY")
+        source = "docs/requirements/[R-001] Shared.md"
+        catalog = {
+            plan_id: {**archived_entry(plan_id, f"Plan {plan_id}").metadata(),
+                      "sources": [source]}
+            for plan_id in ("G-001", "G-002")
+        }
+        with (
+            mock.patch.object(loop_manager, "_revision_execplan_catalog", return_value=catalog),
+            mock.patch.object(loop_manager, "_requirement_archive_tree", return_value={
+                source.encode(): (b"blob", b"oid"),
+            }),
+        ):
+            self.assertEqual(loop_manager.requirement_archive_snapshot(
+                self.connection, Path("/repo"), "/repo", "base", "G-002",
+            ).candidates, (source,))
+            self.connection.execute(
+                "UPDATE execplan_catalog_history SET diagnostic_code = 'merge-proof-missing'"
+            )
+            self.assertEqual(loop_manager.requirement_archive_snapshot(
+                self.connection, Path("/repo"), "/repo", "base", "G-002",
+            ).candidates, ())
+
 
 
 class FakeDefinitionPort:
