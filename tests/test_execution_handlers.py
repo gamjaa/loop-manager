@@ -43,7 +43,10 @@ VALID_WORKER_RESULT = 'WORKER_OUTCOME: {"kind":"ready_for_validation"}\nvalid re
 def recovered_rebase_workspace(workspace, *, connection, repo_path, state_dir,
                                repo, plan_id, worktree):
     """Share the Manager workspace bindings between real Git and unit fixtures."""
-    return replace(workspace, git=mock.Mock(wraps=lm.git),
+    git_port = mock.Mock(wraps=lm.git)
+    return replace(workspace, git=git_port,
+        live_remote_branch_oid=mock.Mock(side_effect=lambda repo, branch:
+            handlers.manager_git_journal.live_remote_branch_oid(git_port, repo, branch)),
         _rebase_in_progress_for_branch=lm._rebase_in_progress_for_branch,
         git_operation_entries=lm._git_operation_entries,
         current_rebase_service=lambda context, **options: lm._current_rebase_service(
@@ -6901,6 +6904,8 @@ class EvidenceFreeRecoveryLifecycleTests(TestCase):
         output, code = '', 0
         if args == ('rev-parse', 'HEAD'):
             output = 'partial' if self.pending else self.final_head
+        elif args == ('rev-parse', '--verify', 'refs/heads/loop-manager/G-047'):
+            output = self.final_head
         elif args[:2] == ('rev-parse', '--git-path'):
             code = 1
         elif args[0] == 'rev-parse':
@@ -7040,11 +7045,15 @@ class EvidenceFreeRecoveryLifecycleTests(TestCase):
         self.effects.workspace.git.side_effect = git
         with mock.patch.object(lm, 'git', side_effect=git), \
                 mock.patch.object(lm, '_recorded_base_fetch') as fetch, \
+                mock.patch.object(lm, 'pr_for_branch', return_value=None) as pr_query, \
                 mock.patch.object(lm, 'remote_branch_oid', return_value='stale-cache') as cached:
             result = self.coordinator.dispatch(self.handler._context())
         self.assertEqual(result.kind, ExecutionOutcomeKind.SUCCESS)
-        self.assertEqual(pushes, [('push', 'origin', 'HEAD:refs/heads/loop-manager/G-047')])
+        self.assertEqual(pushes, [('push',
+            '--force-with-lease=refs/heads/loop-manager/G-047:', 'origin',
+            f'{self.final_head}:refs/heads/loop-manager/G-047')])
         fetch.assert_called_once()
+        pr_query.assert_called_once_with(self.handler.repo_path, 'loop-manager/G-047')
         cached.assert_not_called()
         self.effects.workspace.remote_branch_oid.assert_not_called()
         self.effects.publication.push_managed_publication_branch.assert_called_once()
