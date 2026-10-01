@@ -22060,6 +22060,7 @@ def _run_project_step(
         operation_print(result.diagnostic.message, file=sys.stderr)
         return 1
 
+    recovered_planning_outcome: PlanningOutcome | None = None
     row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
     if row is not None and execplan_catalog_state.DefinitionStateRepository(
         connection
@@ -22073,11 +22074,23 @@ def _run_project_step(
             refactoring_review_interval=refactoring_review_interval,
             self_repository=registered_only and is_loop_manager_repository(repo_path),
         )
-        outcome = PlanningLifecycleCoordinator(_PlanningLifecyclePorts(
+        recovered_planning_outcome = PlanningLifecycleCoordinator(_PlanningLifecyclePorts(
             connection, runtime_state.RuntimeStateRepository(connection),
             maintenance_state.MaintenanceRepository(connection), context, planner_mutex,
         )).run(context)
-        return _planning_outcome_step_result(outcome) or PROJECT_STEP_RETRY
+        recovery_step_result = _planning_outcome_step_result(recovered_planning_outcome)
+        if recovery_step_result is not None:
+            return recovery_step_result
+        # Publication may finish and select its Worker in this same turn.
+        # Reconcile the published catalog before consumers, then carry the
+        # outcome to execution without selecting or planning a second time.
+        recovered_project = connection.execute(
+            "SELECT * FROM projects WHERE repo = ?", (repo,),
+        ).fetchone()
+        if recovered_project is not None and not recovered_project["agent_snapshot"]:
+            # The coordinator completed and cleared the validated Planner
+            # scope; it no longer belongs to the selected Worker workspace.
+            validated_agent_scope = None
     try:
         base_sha = refresh_catalog()
     except project_catalog_refresh.CatalogRefreshStopped as error:
@@ -22299,7 +22312,9 @@ def _run_project_step(
             "SELECT * FROM projects WHERE repo = ?", (repo,)
         ).fetchone()
 
-    if row and row["branch"] and not runtime_state.planning_owns_execution_slot(row):
+    if (row and row["branch"] and not runtime_state.planning_owns_execution_slot(row)
+            and not (recovered_planning_outcome is not None
+                     and recovered_planning_outcome.newly_activated)):
         existing_pr = pr_for_branch(repo_path, row["branch"], row["pr_url"])
         if existing_pr:
             try:
@@ -22373,15 +22388,18 @@ def _run_project_step(
         self_repository=registered_only and is_loop_manager_repository(repo_path),
     )
     _check_runtime_handoff()
-    planning_outcome = PlanningLifecycleCoordinator(
-        _PlanningLifecyclePorts(
-            connection,
-            runtime_repository,
-            maintenance_repository,
-            planning_context,
-            planner_mutex,
-        )
-    ).run(planning_context)
+    if recovered_planning_outcome is not None:
+        planning_outcome = replace(recovered_planning_outcome, base_sha=base_sha)
+    else:
+        planning_outcome = PlanningLifecycleCoordinator(
+            _PlanningLifecyclePorts(
+                connection,
+                runtime_repository,
+                maintenance_repository,
+                planning_context,
+                planner_mutex,
+            )
+        ).run(planning_context)
     if planning_outcome.kind in {
         PlanningOutcomeKind.REMOTE_BASE_RESTART,
         PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED,

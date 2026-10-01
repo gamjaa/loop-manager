@@ -447,3 +447,123 @@ class ProjectCatalogRefreshTest(unittest.TestCase):
         port.push_fast_forward.assert_not_called()
         self.assertIsNone(result.commit_oid)
         self.assertEqual(self.row('G-002')['status'], 'MERGED')
+
+    def test_publication_recovery_runs_selected_worker_in_same_step_after_catalog(self):
+        self.connection.execute(
+            "UPDATE projects SET phase='PLANNING', agent_snapshot='planner-before', "
+            "agent_manager_snapshot=NULL, branch='planning', worktree='/planning', plan_path=NULL")
+        self.connection.execute("UPDATE exec_plans SET status='READY' WHERE plan_id='G-001'")
+        self.connection.commit()
+        pending = True
+        events = []
+        def complete_publication(context):
+            nonlocal pending
+            pending = False
+            self.sha = 'c' * 40
+            self.connection.execute(
+                "UPDATE exec_plans SET status='IMPLEMENTING' WHERE plan_id='G-001'")
+            self.connection.execute(
+                "UPDATE projects SET agent_snapshot=NULL, agent_manager_snapshot=NULL WHERE repo=?", (self.repo,))
+            manager.hydrate_execplan_project(self.connection, self.repo, self.row())
+            events.append('publication-and-activation')
+            return manager.PlanningOutcome(manager.PlanningOutcomeKind.EXECUTION_READY,
+                                           base_sha=self.sha, newly_activated=True)
+        def observe_pr(*args, **kwargs):
+            self.assertEqual(self.row()['current_revision_sha'], self.sha)
+            self.assertEqual(self.row()['priority'], 'critical')
+            events.append('pr-after-catalog')
+            kwargs['after_reconciliation']()
+            return SimpleNamespace(step_result=0)
+        def prepare():
+            self.assertEqual(self.row()['current_revision_sha'], self.sha)
+            events.append('worker-prepare')
+            return SimpleNamespace()
+        def dispatch(context):
+            events.append('worker-dispatch')
+            return manager.ExecutionOutcome(manager.ExecutionOutcomeKind.OPERATIONAL_ERROR)
+        with contextlib.ExitStack() as stack:
+            for name in ('observe_blocked_plan_remotes', 'migrate_legacy_execplans', 'backfill_plan_shas',
+                         'resume_plan_blocks', '_recorded_base_fetch', 'ensure_safe_base_worktree'):
+                stack.enter_context(mock.patch.object(manager, name))
+            stack.enter_context(mock.patch.object(manager, 'validate_repository', return_value=Path(self.repo)))
+            stack.enter_context(mock.patch.object(manager, 'validate_persisted_agent_scope', return_value=object()))
+            stack.enter_context(mock.patch.object(manager, 'ManagerGitCheckpoint',
+                                                  return_value=SimpleNamespace(serialize=lambda: 'checkpoint')))
+            refresh_scope = stack.enter_context(mock.patch.object(manager, 'refresh_persisted_agent_scope_after_manager_git'))
+            stack.enter_context(mock.patch.object(manager, 'remote_base', return_value='main'))
+            stack.enter_context(mock.patch.object(manager, 'git', side_effect=lambda *a, **k: SimpleNamespace(stdout=self.sha)))
+            stack.enter_context(mock.patch.object(state.DefinitionStateRepository, 'has_publication_intent', side_effect=lambda *a: pending))
+            planner = stack.enter_context(mock.patch.object(manager.PlanningLifecycleCoordinator, 'run', side_effect=complete_publication))
+            stack.enter_context(mock.patch.object(manager.project_catalog_refresh, 'ProjectCatalogRefresh', return_value=self.boundary))
+            stack.enter_context(mock.patch.object(manager, 'synchronize_waiting_pull_requests', side_effect=observe_pr))
+            stack.enter_context(mock.patch.object(manager, 'recheck_cleanup_pending', return_value=[]))
+            stack.enter_context(mock.patch.object(manager, '_execplan_archive_housekeeping_safe', return_value=False))
+            pr = stack.enter_context(mock.patch.object(manager, 'pr_for_branch', side_effect=AssertionError('new Worker PR lookup')))
+            execution = stack.enter_context(mock.patch.object(manager, 'ExecutionPhaseCoordinator'))
+            execution.return_value.prepare.side_effect = prepare
+            execution.return_value.dispatch.side_effect = dispatch
+            result = manager._run_project_step(self.connection, Path('/state'), self.repo, Path('unused.ini'), 'main', False)
+        self.assertEqual(result, 1)
+        self.assertEqual(events, ['publication-and-activation', 'pr-after-catalog', 'worker-prepare', 'worker-dispatch'])
+        self.assertEqual(self.row()['status'], 'IMPLEMENTING')
+        self.assertEqual(self.row()['worker_session_id'], 'worker')
+        planner.assert_called_once()
+        pr.assert_not_called()
+        refresh_scope.assert_not_called()
+
+    def test_project_safety_block_keeps_closed_pr_block_when_head_is_restored(self):
+        self.connection.execute(
+            "UPDATE exec_plans SET status='PLAN_BLOCKED', ever_started=1, blocked_reason=?, pr_head_oid=? WHERE plan_id='G-001'",
+            (manager.PR_CLOSED_BLOCK_REASON, 'd'*40))
+        manager.scoped_blocking.record_project_block(
+            self.connection, self.repo, manager.BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
+            'independent head safety cause', 'head-safety', plan_id='G-001', previous_phase='PLAN_BLOCKED')
+        self.connection.commit()
+        original = dict(self.row())
+        for head, pr_state in (('c'*40, 'OPEN'), ('d'*40, 'CLOSED'), ('d'*40, 'OPEN'), ('d'*40, 'OPEN')):
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(manager, 'observe_blocked_plan_remotes'))
+                stack.enter_context(mock.patch.object(manager, 'resume_project_block_if_safe', return_value=False))
+                stack.enter_context(mock.patch.object(manager, 'pr_for_branch', return_value={
+                    'state': pr_state, 'headRefOid': head, 'headRefName': 'branch',
+                    'baseRefName': 'main', 'url': 'https://example/pr/1'}))
+                reconciler = stack.enter_context(mock.patch.object(manager.project_blocked_recovery, 'ProjectBlockedReconciler'))
+                reconciler.return_value.refresh_catalog.return_value = False
+                fetch = stack.enter_context(mock.patch.object(manager, 'remote_base'))
+                mutation = stack.enter_context(mock.patch.object(manager, '_recorded_base_fetch'))
+                cleanup = stack.enter_context(mock.patch.object(manager, 'complete_merged_execplan_worktree'))
+                agent = stack.enter_context(mock.patch.object(manager, 'run_agent'))
+                result = manager._run_project_step(self.connection, Path('/state'), self.repo, Path('unused.ini'), 'main', False)
+            self.assertEqual(result, 1)
+            self.assertEqual(dict(self.row()), original)
+            self.assertEqual(manager.scoped_blocking.project_block(self.connection, self.repo)['evidence'],
+                             'independent head safety cause')
+            reconciler.return_value.reconcile.assert_not_called()
+            fetch.assert_not_called()
+            mutation.assert_not_called()
+            cleanup.assert_not_called()
+            agent.assert_not_called()
+
+    def test_planner_import_fixture_loads_catalog_adapter_without_git_or_provider(self):
+        import ast
+        import inspect
+        import shutil
+        import subprocess
+        import sys
+        import tempfile
+        import textwrap
+        from tests import test_loop_manager as manager_tests
+        fixture = ast.parse(textwrap.dedent(inspect.getsource(
+            manager_tests.AgentScopeValidatorTest.test_planner_import_bytecode_is_ignored_without_hiding_scope_violations)))
+        copied = next(node.iter for node in ast.walk(fixture)
+                      if isinstance(node, ast.For) and isinstance(node.target, ast.Name)
+                      and node.target.id == 'module_name')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for node in copied.elts:
+                shutil.copy(manager.ROOT / node.value, root / node.value)
+            result = subprocess.run(
+                [sys.executable, '-B', '-c', 'import loop_manager, project_catalog_refresh'],
+                cwd=root, capture_output=True, text=True, check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)

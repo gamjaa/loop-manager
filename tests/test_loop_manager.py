@@ -8552,6 +8552,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "execplan_archive_state.py",
                 "execplan_catalog.py",
                 "execplan_catalog_state.py",
+                "project_catalog_refresh.py",
                 "managed_config.py",
                 "maintenance_file_inventory.py",
                 "maintenance_file_ledger.py",
@@ -17182,11 +17183,13 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
             with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
                 "loop_manager.run_codex"
             ) as agent, mock.patch("loop_manager.push_owned_pr_conflict_recovery") as push:
+                # A separate project safety cause permits PR queries, but no
+                # close/reopen transition before a validated catalog boundary.
                 scenarios = (
                     (base, "OPEN", "PLAN_BLOCKED"),
                     (head, "CLOSED", "PLAN_BLOCKED"),
-                    (head, "OPEN", "PR_OPEN"),
-                    (head, "OPEN", "PR_OPEN"),
+                    (head, "OPEN", "PLAN_BLOCKED"),
+                    (head, "OPEN", "PLAN_BLOCKED"),
                 )
                 for observed, state, expected_status in scenarios:
                     with mock.patch("loop_manager.pr_for_branch", return_value=
