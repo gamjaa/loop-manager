@@ -501,6 +501,29 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
         connection.commit()
         return connection
 
+    def test_active_hydration_preserves_planner_scope_and_interrupted_attempt(self):
+        for phase, attempt in (("PLANNING", None), (None, "saved-attempt")):
+            with self.subTest(phase=phase, attempt=attempt):
+                connection = self._connection()
+                self.addCleanup(connection.close)
+                connection.execute("UPDATE exec_plans SET status='IMPLEMENTING', branch='loop-manager/G-047', worktree='/worker' WHERE repo='repo'")
+                connection.execute("UPDATE projects SET phase=?, planning_attempt_fingerprint=?, worktree='/planner', agent_role='planner', agent_snapshot='planner-scope' WHERE repo='repo'", (phase, attempt))
+                connection.commit()
+                before = dict(connection.execute("SELECT * FROM projects WHERE repo='repo'").fetchone())
+                loop_manager.hydrate_active_project(connection, 'repo')
+                self.assertEqual(dict(connection.execute("SELECT * FROM projects WHERE repo='repo'").fetchone()), before)
+                self.assertEqual(connection.execute("SELECT status FROM exec_plans WHERE repo='repo'").fetchone()[0], 'IMPLEMENTING')
+
+    def test_active_hydration_resumes_worker_when_planner_does_not_own_slot(self):
+        connection = self._connection()
+        self.addCleanup(connection.close)
+        connection.execute("UPDATE projects SET planning_attempt_fingerprint=NULL WHERE repo='repo'")
+        connection.execute("UPDATE exec_plans SET status='IMPLEMENTING', branch='loop-manager/G-047', worktree='/worker' WHERE repo='repo'")
+        connection.commit()
+        loop_manager.hydrate_active_project(connection, 'repo')
+        row = connection.execute("SELECT phase,branch,worktree FROM projects WHERE repo='repo'").fetchone()
+        self.assertEqual(tuple(row), ('WORKING', 'loop-manager/G-047', '/worker'))
+
     def test_phase_mapping_and_field_ownership_are_declared_once(self):
         self.assertEqual(
             runtime_state.project_phase_for_status("IMPLEMENTING"), "WORKING"

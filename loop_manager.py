@@ -6264,6 +6264,8 @@ def activate_ready_execplan(
 def hydrate_active_project(connection: sqlite3.Connection, repo: str) -> None:
     """Refresh the legacy execution mirror from the plan-state source of truth."""
 
+    if not runtime_state.RuntimeStateRepository(connection).recovery_slot_available(repo):
+        return
     plan = active_execplan(connection, repo)
     if plan is None:
         return

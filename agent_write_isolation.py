@@ -135,8 +135,12 @@ def _configuration_digest(provider: str, worktree: Path,
 
 def _codex_config_files(worktree: Path) -> tuple[Path, ...]:
     provider_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
-    return tuple(dict.fromkeys((provider_home / "config.toml",
-            *(parent / ".codex/config.toml" for parent in (worktree, *worktree.parents)),
+    project_configs = []
+    for parent in (worktree, *worktree.parents):
+        project_configs.append(parent / ".codex/config.toml")
+        if (parent / ".git").exists():
+            break
+    return tuple(dict.fromkeys((provider_home / "config.toml", *project_configs,
             Path("/etc/codex/config.toml"), Path("/etc/codex/managed_config.toml"),
             Path("/etc/codex/requirements.toml"))))
 
