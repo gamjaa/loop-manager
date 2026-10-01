@@ -22134,8 +22134,21 @@ def _run_project_step(
     if (
         row and row["branch"]
         and not runtime_state.planning_owns_execution_slot(row)
-        and not _project_pr_merge_confirmed(connection, repo, row)
+        and _project_pr_merge_confirmed(connection, repo, row)
     ):
+        # MERGED is durable even if its compatibility projection survived
+        # the transition. Release that execution slot without changing the
+        # plan's audit, sessions, worktree or pending cleanup evidence.
+        if active_execplan(connection, repo) is None:
+            with connection:
+                _clear_active_in_current_transaction(connection, repo)
+        else:
+            hydrate_active_project(connection, repo)
+        row = connection.execute(
+            "SELECT * FROM projects WHERE repo = ?", (repo,)
+        ).fetchone()
+
+    if row and row["branch"] and not runtime_state.planning_owns_execution_slot(row):
         existing_pr = pr_for_branch(repo_path, row["branch"], row["pr_url"])
         if existing_pr:
             try:

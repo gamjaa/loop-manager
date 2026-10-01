@@ -1999,7 +1999,7 @@ class PersistedMergeProjectQueryTest(unittest.TestCase):
         )
         self.connection.commit()
 
-    def run_step(self, *, synchronize=None):
+    def run_step(self, *, synchronize=None, real_lifecycle=False):
         reconciled = SimpleNamespace(
             kind=loop_manager.execplan_catalog_state.ReconciliationKind.RECONCILED,
             revision_sha="a" * 40,
@@ -2017,15 +2017,22 @@ class PersistedMergeProjectQueryTest(unittest.TestCase):
             stack.enter_context(mock.patch.object(loop_manager, "synchronize_waiting_pull_requests",
                 side_effect=synchronize, return_value=SimpleNamespace(step_result=0)))
             stack.enter_context(mock.patch.object(loop_manager, "reconcile_execplan_catalog", return_value=reconciled))
-            planning = stack.enter_context(mock.patch.object(
-                loop_manager.PlanningLifecycleCoordinator, "run",
-                return_value=SimpleNamespace(kind=loop_manager.PlanningOutcomeKind.WAITING),
-            ))
+            planning = None
+            if real_lifecycle:
+                stack.enter_context(mock.patch.object(loop_manager, "_planning_input_fingerprint", return_value="stable"))
+                stack.enter_context(mock.patch.object(loop_manager, "_specification_input_fingerprint", return_value="spec"))
+                stack.enter_context(mock.patch.object(loop_manager, "is_loop_manager_repository", return_value=False))
+            else:
+                planning = stack.enter_context(mock.patch.object(
+                    loop_manager.PlanningLifecycleCoordinator, "run",
+                    return_value=SimpleNamespace(kind=loop_manager.PlanningOutcomeKind.WAITING),
+                ))
             result = loop_manager._run_project_step(
                 self.connection, Path("/state"), "/repo", Path("unused.ini"), "main", False,
             )
         self.assertEqual(result, 0)
-        planning.assert_called_once()
+        if planning is not None:
+            planning.assert_called_once()
 
     def test_stale_merged_projection_skips_pr_query_after_plan_rename(self):
         self.connection.execute(
@@ -2035,8 +2042,13 @@ class PersistedMergeProjectQueryTest(unittest.TestCase):
         with mock.patch.object(loop_manager, "pr_for_branch", side_effect=AssertionError("PR query")) as pr:
             for phase in ("PUBLISHING", "WORKING", "VERIFYING", "REVIEWING"):
                 with self.subTest(phase=phase):
-                    self.connection.execute("UPDATE projects SET phase = ?", (phase,))
+                    self.connection.execute(
+                        "UPDATE projects SET phase = ?, plan_path = 'docs/plans/[G-001] Original.md', "
+                        "branch = 'loop-manager/G-001', pr_url = 'https://example.test/pr/1'", (phase,),
+                    )
                     self.run_step()
+                    projection = self.connection.execute("SELECT phase, plan_path, branch FROM projects").fetchone()
+                    self.assertEqual(tuple(projection), (None, None, None))
                     self.assertEqual(self.connection.execute(
                         "SELECT status FROM exec_plans WHERE repo = '/repo' AND plan_id = 'G-001'"
                     ).fetchone()[0], "MERGED")
@@ -2069,6 +2081,76 @@ class PersistedMergeProjectQueryTest(unittest.TestCase):
         with mock.patch.object(loop_manager, "pr_for_branch", return_value=None) as pr:
             self.run_step()
             pr.assert_called_once_with(Path("/repo"), "loop-manager/G-001", "https://example.test/pr/1")
+
+    def stable_planning_input(self):
+        self.connection.execute(
+            "INSERT INTO execplan_catalog_revisions (repo, revision_sha, catalog_fingerprint) "
+            "VALUES ('/repo', ?, 'catalog')", ("a" * 40,),
+        )
+        self.connection.execute(
+            "UPDATE projects SET planning_fingerprint = 'stable', "
+            "specification_fingerprint = 'spec', processed_sha = ?", ("a" * 40,),
+        )
+        self.connection.commit()
+
+    def test_merged_projection_allows_actual_planning_to_complete(self):
+        self.stable_planning_input()
+        self.connection.execute(
+            "UPDATE exec_plans SET worktree = '/preserved/worktree', "
+            "worker_session_id = 'saved-worker', reviewer_session_id = 'saved-reviewer'"
+        )
+        loop_manager._ensure_execplans_schema(self.connection)
+        before = tuple(self.connection.execute("SELECT * FROM exec_plans").fetchone())
+        with (
+            mock.patch.object(loop_manager, "pr_for_branch", side_effect=AssertionError("PR query")) as pr,
+            mock.patch.object(loop_manager.ExecutionPhaseCoordinator, "prepare", side_effect=AssertionError("unexpected execution")) as prepare,
+        ):
+            self.run_step(real_lifecycle=True)
+            # A subsequent step observes the settled state as well.
+            self.run_step(real_lifecycle=True)
+        pr.assert_not_called()
+        prepare.assert_not_called()
+        self.assertEqual(tuple(self.connection.execute("SELECT * FROM exec_plans").fetchone()), before)
+        project = self.connection.execute("SELECT phase, branch, plan_path, last_error FROM projects").fetchone()
+        self.assertEqual(tuple(project), (None, None, None, None))
+        self.assertIsNone(scoped_blocking.project_block(self.connection, "/repo"))
+
+    def test_merged_projection_allows_ready_activation_and_actual_execution_prepare(self):
+        self.stable_planning_input()
+        self.insert_plan("G-002", "READY")
+        self.connection.execute("UPDATE exec_plans SET depends_on = '[\"G-001\"]' WHERE plan_id = 'G-002'")
+        with (
+            mock.patch.object(loop_manager, "pr_for_branch", side_effect=AssertionError("PR query")) as pr,
+            mock.patch.object(loop_manager, "make_worktree") as workspace,
+            mock.patch.object(loop_manager.execution_handlers.ExecutionHandlers, "recover", autospec=True,
+                side_effect=lambda _handler, context: context),
+            mock.patch.object(loop_manager.ExecutionPhaseCoordinator, "dispatch", autospec=True,
+                return_value=loop_manager.ExecutionOutcome(loop_manager.ExecutionOutcomeKind.SUCCESS)) as dispatch,
+        ):
+            self.run_step(real_lifecycle=True)
+        pr.assert_not_called()
+        workspace.assert_called_once()
+        dispatch.assert_called_once()
+        context = dispatch.call_args.args[1]
+        self.assertEqual(context.plan.plan_id, "G-002")
+        self.assertEqual(context.phase.value, "IMPLEMENTING")
+        project = self.connection.execute("SELECT phase, plan_path, last_error FROM projects").fetchone()
+        self.assertEqual(tuple(project), ("WORKING", "docs/plans/[G-002] Original.md", None))
+        self.assertEqual(self.connection.execute("SELECT status FROM exec_plans WHERE plan_id = 'G-001'").fetchone()[0], "MERGED")
+        self.assertIsNone(scoped_blocking.project_block(self.connection, "/repo"))
+
+    def test_preserved_planning_attempt_keeps_merged_projection_and_sessions(self):
+        self.connection.execute(
+            "UPDATE projects SET planning_error = 'saved planning error', "
+            "planning_error_fingerprint = 'saved-input', planner_session_id = 'saved-planner', "
+            "planning_workspace_owned = 1, worktree = '/preserved/planning'"
+        )
+        before = tuple(self.connection.execute("SELECT * FROM projects").fetchone())
+        with mock.patch.object(loop_manager, "pr_for_branch", side_effect=AssertionError("PR query")) as pr:
+            self.run_step()
+        pr.assert_not_called()
+        self.assertEqual(tuple(self.connection.execute("SELECT * FROM projects").fetchone()), before)
+
 
 
 class ProjectDiagnosticPublicationUnitTests(unittest.TestCase):
