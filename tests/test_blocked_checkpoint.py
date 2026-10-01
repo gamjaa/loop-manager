@@ -524,6 +524,28 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
         self.assertIn('다른 OID', result['reason'])
         self.assertEqual(self.run_git(self.remote, 'rev-parse', f"refs/heads/{intent['ref']}"), original)
 
+    def test_project_successor_fetch_ignores_configured_shared_ref_mapping(self):
+        repo, original, coordinator = self._project_block_fixture(known=True, advance=False)
+        successor = self.user_commit()
+        self.run_git(self.repo, 'update-ref', 'refs/heads/unowned', original)
+        self.run_git(self.repo, 'config', '--replace-all', 'remote.origin.fetch',
+                     '+refs/heads/loop-manager/G-034:refs/heads/unowned')
+        before = self.run_git(self.repo, 'for-each-ref', '--format=%(refname) %(objectname)')
+        loop_manager.observe_blocked_plan_remotes(
+            self.connection, self.repo, repo,
+            self.connection.execute('SELECT * FROM projects').fetchone())
+        # Stop at the adoption boundary so subsequent publication is unrelated
+        # to this fetch regression; real Git effects above run only in verify.
+        with mock.patch.object(coordinator, '_incorporate', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                coordinator.reconcile('G-034')
+        self.assertEqual(self.run_git(self.worktree, 'rev-parse', 'HEAD'), successor)
+        after = self.run_git(self.repo, 'for-each-ref', '--format=%(refname) %(objectname)')
+        own_prefix = 'refs/heads/loop-manager/G-034 '
+        self.assertEqual([line for line in before.splitlines() if not line.startswith(own_prefix)],
+                         [line for line in after.splitlines() if not line.startswith(own_prefix)])
+        self.assertEqual(self.run_git(self.repo, 'rev-parse', 'refs/heads/unowned'), original)
+
     def test_project_known_lineage_refreshes_original_branch_with_exact_lease(self):
         repo, original, coordinator = self._project_block_fixture(known=True)
         self.assertEqual(coordinator.reconcile('G-034'), 'recovered')

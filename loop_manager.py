@@ -17650,8 +17650,10 @@ def _reconcile_published_blocked_checkpoint(
     except RuntimeError as error:
         return refuse(f"원격 저장소 소유권을 증명할 수 없습니다: {error}")
     try:
+        # Project recovery may not trust configured mappings to shared refs.
+        refmap_options = ("--refmap=",) if project_recovery_context is not None else ()
         fetched = git(
-            repo_path, "fetch", "--no-tags", "origin",
+            repo_path, "fetch", "--no-tags", *refmap_options, "origin",
             f"refs/heads/{branch}", check=False,
         )
     except (OSError, RuntimeError) as error:

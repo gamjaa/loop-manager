@@ -1110,6 +1110,29 @@ class ProjectBlockedRemoteRecoveryTests(unittest.TestCase):
         self.assertEqual(dict(self.connection.execute('SELECT * FROM projects').fetchone()), project)
         self.assertEqual(dict(self.plan('G-107')), other)
 
+    def test_project_successor_fetch_preserves_refs_with_unowned_mapping(self):
+        original = self.published_project_successor()
+        refs = {'refs/heads/unowned': original.head}
+        configured_refspec = f"+refs/heads/{self.plan()['branch']}:refs/heads/unowned"
+        git_effect = loop_manager.git.side_effect
+        fetches = []
+
+        def mapped_git(path, *args, **kwargs):
+            if args[:1] == ('fetch',):
+                fetches.append(args)
+                if '--refmap=' not in args:
+                    refs[configured_refspec.split(':')[1]] = 'c' * 40
+            return git_effect(path, *args, **kwargs)
+
+        context = self.complete_context()
+        context['branch_oid'] = 'c' * 40
+        with mock.patch.object(loop_manager, 'git', side_effect=mapped_git):
+            self.coordinator._adopt(self.plan(), context)
+        self.assertEqual(self.head, 'c' * 40)
+        self.assertEqual(refs, {'refs/heads/unowned': original.head})
+        self.assertEqual(fetches, [('fetch', '--no-tags', '--refmap=', 'origin',
+                                   f"refs/heads/{self.plan()['branch']}")])
+
     def test_project_adoption_preserves_an_independent_plan_cause(self):
         original = self.published_project_successor(plan_block=True)
         self.connection.execute(
