@@ -8547,6 +8547,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "execution_revision.py",
                 "execution_state.py",
                 "guidance_approval.py",
+                "quality_guidance.py",
                 "execplan_archive.py",
                 "execplan_archive_state.py",
                 "execplan_catalog.py",
