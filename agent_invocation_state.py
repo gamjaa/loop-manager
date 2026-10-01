@@ -150,7 +150,7 @@ class InvocationRepository:
             if kind != "success":
                 self.connection.execute("""UPDATE agent_isolation_evidence
                     SET status = 'invalidated', reason = 'agent_attempt_not_successful'
-                    WHERE invocation_id = ? AND status = 'verified'""", (identity,))
+                    WHERE invocation_id = ? AND status IN ('verified', 'prepared')""", (identity,))
             self.connection.execute("""UPDATE agent_invocations SET
                 finished_at = ?, duration_ms = ?, result_kind = ?, result_code = ?,
                 session_id = COALESCE(?, session_id), collection_status = ?,
@@ -167,7 +167,7 @@ class InvocationRepository:
         with self.connection:
             self.connection.execute("""UPDATE agent_isolation_evidence
                 SET status = 'invalidated', reason = 'agent_attempt_interrupted'
-                WHERE status = 'verified' AND invocation_id IN (
+                WHERE status IN ('verified', 'prepared') AND invocation_id IN (
                     SELECT invocation_id FROM agent_invocations WHERE finished_at IS NULL
                 )""")
             cursor = self.connection.execute("""UPDATE agent_invocations SET

@@ -98,7 +98,8 @@ import execution_checkpoint_state
 import checkpoint_ownership
 from agent_invocation import (AgentProfile, AgentRequest, AgentResult, AgentResultKind,
                               AttemptSequence, InvocationContext, ResolvedProfile,
-                              TrackedAgentCall, Usage, classify_agent_result)
+                              TrackedAgentCall, Usage, approval_policy_failure,
+                              classify_agent_result)
 from agent_provider_usage import claude_usage, codex_log_usage
 import agent_invocation_state
 import agent_write_isolation
@@ -751,6 +752,8 @@ class ProcessLockBusyError(RuntimeError):
 
 
 def session_resume_unavailable(message: str) -> bool:
+    if approval_policy_failure(message):
+        return False
     normalized = " ".join(message.casefold().split())
     return bool(
         re.search(
@@ -812,6 +815,8 @@ def run_agent_with_retries(
             active_session_id = result.session_id
         if result.result_kind is AgentResultKind.SUCCESS:
             return result
+        if approval_policy_failure(result.message):
+            return replace(result, kind=AgentResultKind.PERMANENT_CONFIGURATION)
         if isinstance(invoke, TrackedAgentCall):
             invoke.attempts.previous_failure = result.ledger_kind
         if (
@@ -7937,16 +7942,21 @@ def validate_provider_runtime(
 
 
 def claude_permission_arguments(read_only: bool) -> list[str]:
+    arguments = ["--permission-mode", "auto"]
     if read_only:
-        return [
-            "--permission-mode",
-            "plan",
+        arguments.extend([
             "--disallowedTools",
             "Edit",
             "Write",
             "NotebookEdit",
-        ]
-    return ["--permission-mode", "acceptEdits"]
+        ])
+    settings = {"permissions": {"defaultMode": "auto"}, "sandbox": {
+        "enabled": True, "failIfUnavailable": True,
+        "allowUnsandboxedCommands": False, "autoAllowBashIfSandboxed": False,
+        "excludedCommands": [],
+    }}
+    arguments.extend(["--settings", json.dumps(settings, sort_keys=True)])
+    return arguments
 
 
 def _claude_result_message(event: Mapping[str, object]) -> str:
