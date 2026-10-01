@@ -1976,8 +1976,14 @@ class PlannerFutureIdeasTest(unittest.TestCase):
 
 class LoopManagerTest(unittest.TestCase):
     def test_codex_uses_mutually_exclusive_sandbox_options(self):
-        self.assertEqual(loop_manager.codex_sandbox_arguments(False), ["--approve-for-me"])
-        self.assertEqual(loop_manager.codex_sandbox_arguments(True), ["--sandbox", "read-only"])
+        for read_only, mode in ((False, "workspace-write"), (True, "read-only")):
+            with self.subTest(read_only=read_only):
+                args = loop_manager.codex_sandbox_arguments(read_only)
+                self.assertEqual(args[:2], ["--sandbox", mode])
+                self.assertNotIn("--approve-for-me", args)
+                self.assertIn('approvals_reviewer="auto_review"', args)
+                self.assertTrue(any("sandbox_approval=false" in item and
+                                    "request_permissions=false" in item for item in args))
 
     def test_schema_and_project_update(self):
         connection = sqlite3.connect(":memory:")
@@ -3660,10 +3666,10 @@ risk: medium
         self.assertEqual(resumed.session_id, started.session_id)
         self.assertEqual(calls[0][:3], ["codex", "exec", "--json"])
         self.assertNotIn("--ephemeral", calls[0])
-        self.assertEqual(
-            calls[1][:6],
-            ["codex", "exec", "--approve-for-me", "-C", str(worktree), "resume"],
-        )
+        self.assertEqual(calls[1][:4], ["codex", "exec", "--sandbox", "workspace-write"])
+        cwd_index = calls[1].index("-C")
+        self.assertEqual(calls[1][cwd_index:cwd_index + 3], ["-C", str(worktree), "resume"])
+        self.assertNotIn("--approve-for-me", calls[1])
         self.assertIn("--json", calls[1])
         self.assertIn(started.session_id, calls[1])
         self.assertEqual(call_options[0]["cwd"], worktree)
@@ -3725,10 +3731,10 @@ risk: medium
             self.assertFalse((base / "resume-output.txt").exists())
 
         arguments = observed["arguments"]
-        self.assertEqual(
-            arguments[:7],
-            ["codex", "exec", "--sandbox", "read-only", "-C", str(worktree), "resume"],
-        )
+        self.assertEqual(arguments[:4], ["codex", "exec", "--sandbox", "read-only"])
+        cwd_index = arguments.index("-C")
+        self.assertEqual(arguments[cwd_index:cwd_index + 3], ["-C", str(worktree), "resume"])
+        self.assertIn('approvals_reviewer="auto_review"', arguments)
         self.assertIn(session_id, arguments)
 
     def test_interrupted_planner_persists_started_session_and_resumes(self):

@@ -76,6 +76,7 @@
 - ExecPlan은 연결된 PR이 실제로 Merge된 경우에만 MERGED 상태가 된다
 - 자동 작업의 Git 기준은 최신 `origin/<base-branch>`이며 로컬 base ref, 기본 worktree 파일과 로컬 전용 commit을 입력으로 사용하지 않는다
 - Codex가 Agent turn 추적을 위해 자동 생성·갱신·정리하는 `refs/codex/turn-diffs/*`는 게시 또는 workspace 소유권에 사용하지 않는 provider 소유의 비권위 임시 ref다. 그 namespace의 순변경만으로 Agent 범위 위반이나 `PROJECT_BLOCKED`를 만들지 않으며, 소유 branch, remote ref, tag와 그 밖의 공유 ref 변경은 계속 보호한다
+- Codex는 Manager가 `codex exec`로 직접 호출하며 선택 workspace의 내장 쓰기 제한과 granular 자동 승인 검토를 유지한다. Reviewer는 읽기 전용이고 테스트·verify 재실행 금지는 별도의 역할 지침으로 유지한다. Codex 프로세스 전체를 감싸는 바깥 sandbox와 중첩 sandbox 호환성은 호출 조건이 아니며, 정상 session·로그 저장을 Agent의 workspace 밖 쓰기 권한과 구분한다
 - Loop Manager는 저장 base branch의 local HEAD가 fetch된 원격 base와 같으면 dirty 상태에서도 동기화를 생략한다. behind-only이고 진행 중인 Git operation이나 비정상 index가 없으며 원격 변경 tracked 경로와 staged·unstaged·untracked·ignored 로컬 경로가 이름 또는 부모·자식 관계로 겹치지 않을 때만, 로컬 변경과 index 상태를 보존하며 기본 worktree를 safe fast-forward한다. 그 밖의 로컬 상태는 이유를 기록하고 보존한다
 - SQLite, 관리 worktree, 로그, 임시 파일과 lock은 source checkout 밖의 사용자 상태 디렉터리에 저장한다
 - 대상 프로젝트의 기존 변경을 사용자 승인 없이 삭제하거나 덮어쓰지 않는다

@@ -1,4 +1,4 @@
-"""Native Codex sandbox envelope for the complete CLI process tree."""
+"""Direct Codex launch with a separate native tool-policy preflight."""
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -17,14 +17,11 @@ import tempfile
 @dataclass(frozen=True)
 class CodexLaunch:
     arguments: tuple[str, ...]
-    prefix: tuple[str, ...]
+    probe_arguments: tuple[str, ...]
     environment: dict[str, str]
     runtime: Path
     attempt: Path
     specification: str
-
-    def wrap(self, arguments: list[str]) -> list[str]:
-        return [*self.prefix, *arguments]
 
     @staticmethod
     def stop(process) -> None:
@@ -44,16 +41,16 @@ class CodexLaunch:
             process.communicate(prompt, timeout=timeout)
             return subprocess.CompletedProcess(arguments, process.returncode)
         finally:
-            # The native sandbox is an extra parent process. Terminate its whole
-            # process group on timeout/interruption, including background tools.
+            # Direct exec can still spawn tools. Reap the whole process group.
             self.stop(process)
             process.wait()
 
     def probe(self) -> None:
-        result = subprocess.run(self.prefix, cwd=self.runtime, env=self.environment,
+        result = subprocess.run(self.probe_arguments, cwd=json.loads(self.specification)['worktree'],
+                                env=self.environment,
                                 capture_output=True, text=True, timeout=30, check=False)
-        if result.returncode or result.stdout.strip() != 'agent-write-boundary-v1':
-            raise RuntimeError('Codex 전체 CLI sandbox의 mount·파일 쓰기 경계를 확인할 수 없습니다.')
+        if result.returncode or result.stdout.strip() != 'agent-tool-boundary-v2':
+            raise RuntimeError('Codex 내장 도구 sandbox의 파일 쓰기 경계를 확인할 수 없습니다.')
 
 
 def _owned_directory(path: Path) -> None:
@@ -80,8 +77,8 @@ def _read_only_link(target: Path, link: Path) -> None:
 
 def prepare_launch(boundary, state_dir: Path, role: str, read_only: bool,
                    arguments: tuple[str, ...], environment: dict[str, str]) -> CodexLaunch:
-    # Dedicated role/repository session storage; authentication remains a RO link
-    # to its existing location, never copied or granted write access.
+    # Preserve G-088's role/repository session location for existing sessions.
+    # Runtime storage belongs to Codex; it is not a writable root for its tools.
     base = state_dir.resolve() / 'agent-runtime'
     source_home = Path(environment.get('CODEX_HOME', str(Path.home() / '.codex'))).resolve()
     # Validate containment before mkdir/link/mkdtemp: a misregistered state root
@@ -104,7 +101,7 @@ def prepare_launch(boundary, state_dir: Path, role: str, read_only: bool,
     child_environment = dict(environment)
     child_environment['CODEX_HOME'] = str(home)
     child_environment['TMPDIR'] = str(attempt)
-    writable = [home, attempt]
+    writable = [] if read_only else [attempt]
     if not read_only:
         writable.append(boundary.worktree)
     protected = [boundary.source, *boundary.other_worktrees, boundary.common_dir,
@@ -123,25 +120,30 @@ def prepare_launch(boundary, state_dir: Path, role: str, read_only: bool,
     files = [boundary.common_dir / 'HEAD', boundary.git_dir / 'HEAD']
     if (boundary.worktree / '.git').is_file():
         files.append(boundary.worktree / '.git')
+    # Probe the same tool boundary in one standalone sandbox. Never wrap exec.
+    # Mirror workspace-write's built-in protected paths in this explicit profile.
+    for root in writable:
+        for name in ('.git', '.codex', '.agents'):
+            target = root / name
+            if target.exists():
+                protected.append(target)
     specification = json.dumps({'writable': [str(path) for path in writable],
                                 'protected': [str(path) for path in protected],
                                 'files': [str(path) for path in files],
                                 'worktree': str(boundary.worktree)}, sort_keys=True)
-    # The outer native sandbox permits provider API traffic. Model shell
-    # commands retain their own inner network_access=false and granular review.
     permissions = {":root": "read", **{str(path): "write" for path in writable},
                    **{str(path): "read" for path in protected}}
     filesystem = "{" + ",".join(
         json.dumps(path) + "=" + json.dumps(access)
         for path, access in permissions.items()
     ) + "}"
-    prefix = ('codex', 'sandbox', '-C', str(attempt),
-              '--permission-profile', 'loop-manager-envelope',
-              '-c', 'permissions.loop-manager-envelope.filesystem=' + filesystem,
-              '-c', 'permissions.loop-manager-envelope.network.enabled=true',
+    probe_arguments = ('codex', 'sandbox', '-C', str(boundary.worktree),
+              '--permission-profile', 'loop-manager-tools', '--include-managed-config',
+              '-c', 'permissions.loop-manager-tools.filesystem=' + filesystem,
+              '-c', 'permissions.loop-manager-tools.network.enabled=false',
               '--', sys.executable, '-I', str(Path(__file__).with_name('agent_sandbox_exec.py')),
               specification)
     if not read_only:
         arguments = (*arguments, '-c',
                      'sandbox_workspace_write.writable_roots=' + json.dumps([str(attempt)]))
-    return CodexLaunch(arguments, prefix, child_environment, runtime, attempt, specification)
+    return CodexLaunch(arguments, probe_arguments, child_environment, runtime, attempt, specification)

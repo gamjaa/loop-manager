@@ -1,7 +1,7 @@
 """Preflight evidence for an Agent write boundary.
 
-The whole provider process runs behind the same native sandbox gate as the
-preflight. Unproven calls stop before provider execution.
+The provider runs directly with its native tool policy, checked by a separate
+standalone sandbox preflight. Unproven calls stop before provider execution.
 """
 
 from __future__ import annotations
@@ -156,9 +156,10 @@ def _assert_no_codex_extensions(worktree: Path) -> None:
         except (OSError, tomllib.TOMLDecodeError) as error:
             raise IsolationError("Codex 확장 설정을 확인할 수 없습니다.") from error
         if any(configuration.get(name) for name in
-               ("mcp_servers", "plugins", "hooks", "notify", "profile", "profiles")):
+               ("mcp_servers", "plugins", "hooks", "notify", "profile", "profiles",
+                "permissions", "default_permissions")):
             raise IsolationError(
-                "Codex MCP·plugin·hook·profile 설정이 있어 쓰기 격리를 검증할 수 없습니다."
+                "Codex MCP·plugin·hook·profile·permissions 설정이 있어 쓰기 격리를 검증할 수 없습니다."
             )
 
 
@@ -196,7 +197,7 @@ def _codex_configuration(read_only: bool) -> tuple[str, ...]:
 
 def codex_arguments(read_only: bool) -> tuple[str, ...]:
     return ("--sandbox", "read-only" if read_only else "workspace-write",
-            "--strict-config", *_codex_configuration(read_only))
+            "--strict-config", "--ignore-rules", *_codex_configuration(read_only))
 
 
 def prepare_isolation(provider: str, role: str, worktree: Path, state_dir: Path,
@@ -241,7 +242,7 @@ def prepare_isolation(provider: str, role: str, worktree: Path, state_dir: Path,
         version = result.stdout.strip()
         args = codex_arguments(read_only)
         if environment_variables is None:
-            raise IsolationError("전체 CLI 경계를 위한 필터된 Agent 환경이 없습니다.")
+            raise IsolationError("내장 도구 경계를 위한 필터된 Agent 환경이 없습니다.")
         try:
             launch = prepare_launch(boundary, state_dir, role, read_only, args,
                                     environment_variables)
@@ -258,7 +259,8 @@ def prepare_isolation(provider: str, role: str, worktree: Path, state_dir: Path,
                          "repository": boundary.repository_identity if boundary else "",
                          "configuration": configuration,
                          "arguments": args,
-                         "envelope": launch.prefix if launch else (),
+                         "boundary": "native-tools-v2",
+                         "probe": launch.probe_arguments if launch else (),
                          "session": session_id}, sort_keys=True)
     evidence = IsolationEvidence(
         provider, version, environment, role,

@@ -71,6 +71,7 @@ class WriteIsolationTests(TestCase):
         self.assertIn('sandbox_workspace_write.exclude_tmpdir_env_var=true', args)
         self.assertIn('mcp_servers={}', args)
         self.assertNotIn('--approve-for-me', args)
+        self.assertIn('--ignore-rules', args)
         self.assertEqual(args[args.index('--sandbox') + 1], 'workspace-write')
         self.assertEqual(isolation.codex_arguments(True)[1], 'read-only')
 
@@ -98,7 +99,9 @@ class WriteIsolationTests(TestCase):
                 isolation._assert_no_codex_extensions(root)
                 for setting in ('[mcp_servers.external]\ncommand = "tool"\n',
                                 '[plugins.external]\nenabled = true\n',
-                                'notify = ["external-command"]\n'):
+                                'notify = ["external-command"]\n',
+                                'default_permissions = "broad"\n',
+                                '[permissions.broad.filesystem]\n"/" = "write"\n'):
                     config.write_text(setting, encoding='utf-8')
                     with self.assertRaisesRegex(isolation.IsolationError, 'MCP'):
                         isolation._assert_no_codex_extensions(root)
@@ -170,7 +173,7 @@ class WriteIsolationTests(TestCase):
                                                  str(root / 'source'), False,
                                                  lambda: 'snapshot')
 
-    def test_full_cli_probe_binds_new_configuration_and_resume(self):
+    def test_native_tool_probe_binds_new_configuration_and_resume(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             provider_home = root / 'codex-home'
@@ -180,7 +183,7 @@ class WriteIsolationTests(TestCase):
             boundary = isolation.WorktreeBoundary(root, root / 'source', (),
                                                    root / 'git', root / 'common', 'repository')
             records = []
-            launch = mock.Mock(prefix=('native', 'envelope'), arguments=('inner',))
+            launch = mock.Mock(probe_arguments=('standalone',), arguments=('inner',))
             with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(provider_home)}), \
                  mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
                  mock.patch.object(isolation, 'prepare_launch', return_value=launch), \
@@ -242,7 +245,7 @@ class WriteIsolationTests(TestCase):
             self.assertEqual(proof[2], 'exception')
             self.assertEqual(prior.read_text(encoding='utf-8'), 'previous result')
 
-    def test_resume_rechecks_envelope_and_records_rejection_on_failure(self):
+    def test_resume_rechecks_native_policy_and_records_rejection_on_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             home = root / 'home'
@@ -250,7 +253,7 @@ class WriteIsolationTests(TestCase):
             boundary = isolation.WorktreeBoundary(root, root / 'source', (),
                                                    root / 'git', root / 'common', 'repo')
             records = []
-            launch = mock.Mock(prefix=('native',))
+            launch = mock.Mock(probe_arguments=('standalone',))
             launch.probe.side_effect = RuntimeError('sandbox unavailable')
             with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
                  mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
@@ -446,7 +449,7 @@ class WriteIsolationTests(TestCase):
                                                     expected=evidence))
 
 
-@skipUnless(isolation.platform.system() == "Linux", "native mount proof requires Linux")
+@skipUnless(isolation.platform.system() == "Linux", "native tool policy probe requires Linux")
 class NativeWriteIsolationTests(TestCase):
     def boundary(self, root):
         state_root = root / 'state'
@@ -466,7 +469,7 @@ class NativeWriteIsolationTests(TestCase):
         return isolation.WorktreeBoundary(selected, source, (other,), git_dir, common,
                                          'repository'), state_root, home
 
-    def test_native_envelope_keeps_auth_read_only_and_limits_runtime_roots(self):
+    def test_direct_launch_preserves_sessions_and_excludes_runtime_from_tool_writes(self):
         with tempfile.TemporaryDirectory() as directory:
             boundary, state_root, home = self.boundary(Path(directory))
             environment = {'CODEX_HOME': str(home), 'PATH': '/bin'}
@@ -478,21 +481,26 @@ class NativeWriteIsolationTests(TestCase):
             self.assertEqual((scoped_home / 'auth.json').resolve(), home / 'auth.json')
             policy = json.loads(launch.specification)
             self.assertEqual(set(policy['writable']),
-                             {str(scoped_home), str(launch.attempt), str(boundary.worktree)})
+                             {str(launch.attempt), str(boundary.worktree)})
             self.assertIn(str(home), policy['protected'])
             self.assertIn(str(boundary.common_dir), policy['protected'])
             self.assertIn(str(boundary.other_worktrees[0]), policy['protected'])
             self.assertIn(str(boundary.worktree / '.git'), policy['protected'])
-            self.assertIn('--permission-profile', launch.prefix)
-            self.assertIn('loop-manager-envelope', launch.prefix)
-            self.assertIn('permissions.loop-manager-envelope.network.enabled=true', launch.prefix)
+            self.assertEqual(launch.probe_arguments[:2], ('codex', 'sandbox'))
+            self.assertIn('--include-managed-config', launch.probe_arguments)
+            self.assertEqual(launch.probe_arguments[launch.probe_arguments.index('-C') + 1],
+                             str(boundary.worktree))
+            self.assertNotIn('exec', launch.probe_arguments)
+            self.assertNotIn('app-server', launch.probe_arguments)
             import tomllib
-            profile = next(arg for arg in launch.prefix if arg.startswith('permissions.loop-manager-envelope.filesystem='))
-            filesystem = tomllib.loads(profile)['permissions']['loop-manager-envelope']['filesystem']
+            profile = next(arg for arg in launch.probe_arguments
+                           if arg.startswith('permissions.loop-manager-tools.filesystem='))
+            filesystem = tomllib.loads(profile)['permissions']['loop-manager-tools']['filesystem']
             self.assertEqual(filesystem[':root'], 'read')
-            self.assertEqual({path for path, access in filesystem.items() if access == 'write'}, set(policy['writable']))
+            self.assertEqual({path for path, access in filesystem.items() if access == 'write'},
+                             set(policy['writable']))
             self.assertTrue(all(filesystem[path] == 'read' for path in policy['protected']))
-            self.assertFalse(any(arg.startswith('sandbox_mode=') for arg in launch.prefix))
+            self.assertIn('permissions.loop-manager-tools.network.enabled=false', launch.probe_arguments)
             self.assertIn('sandbox_workspace_write.network_access=false', launch.arguments)
             second = envelope.prepare_launch(boundary, state_root, 'worker', False,
                                               launch.arguments, environment)
@@ -532,129 +540,47 @@ class NativeWriteIsolationTests(TestCase):
 
     def test_failed_proof_and_unknown_probe_output_do_not_verify(self):
         launch = envelope.CodexLaunch((), ('codex', 'sandbox'), {}, Path('/runtime'),
-                                     Path('/attempt'), '{}')
-        for code, output in ((1, ''), (0, '{}'), (0, 'agent-write-boundary-v1 extra')):
+                                     Path('/attempt'), '{"worktree":"/selected"}')
+        for code, output in ((1, ''), (0, '{}'), (0, 'agent-tool-boundary-v2 extra')):
             with self.subTest(code=code, output=output), \
                  mock.patch.object(envelope.subprocess, 'run', return_value=
                                    manager.subprocess.CompletedProcess([], code, output, '')):
                 with self.assertRaisesRegex(RuntimeError, '확인할 수 없습니다'):
                     launch.probe()
 
-    def test_mount_proof_rejects_writable_root_submount_and_git_pointer(self):
-        writable = [Path('/work'), Path('/runtime')]
-        protected = [Path('/source'), Path('/common'), Path('/work/.git')]
-        mounts = [(Path('/'), True, 'ext4'), (Path('/work'), False, 'ext4'),
-                  (Path('/runtime'), False, 'ext4'), (Path('/work/.git'), True, 'ext4')]
-        gate.check_mounts(mounts, writable, protected)
-        for invalid in (
-            [(Path('/'), False, 'ext4'), *mounts[1:]],
-            [*mounts, (Path('/source/subdir'), False, 'ext4')],
-            [*mounts[:-1], (Path('/work/.git'), False, 'ext4')],
-            [*mounts, (Path('/tmp'), False, 'tmpfs')],
-            [*mounts, (Path('/unexpected'), False, 'ext4')],
-        ):
-            with self.subTest(mounts=invalid), self.assertRaises(gate.BoundaryError):
-                gate.check_mounts(invalid, writable, protected)
+    def test_probe_never_executes_provider_and_fails_closed(self):
+        specification = json.dumps({'writable': [], 'protected': [], 'files': []})
+        with mock.patch.object(gate.sys, 'argv', ['probe', specification]), \
+             mock.patch.object(gate, 'check_boundary') as check, \
+             mock.patch.object(gate.sys, 'stdout', io.StringIO()):
+            self.assertEqual(gate.main(), 0)
+            check.assert_called_once()
+        with mock.patch.object(gate.sys, 'argv', ['probe', specification, 'codex', 'exec']), \
+             mock.patch.object(gate, 'check_boundary') as check, \
+             mock.patch.object(gate.sys, 'stderr', io.StringIO()):
+            self.assertEqual(gate.main(), 125)
+            check.assert_not_called()
 
-    def test_mount_visibility_ignores_only_covered_or_inaccessible_unrelated_mounts(self):
-        text = ('1 0 8:1 / / ro - ext4 root rw\n'
-                '2 1 0:1 / /run/docker/netns/test rw - nsfs nsfs rw\n'
-                '3 1 0:2 / /proc/sys/fs/binfmt_misc rw - autofs autofs rw\n'
-                '4 1 8:1 / /work rw - ext4 root rw\n')
-        with mock.patch.object(gate, '_mount_id', side_effect=[1, None, 99, 4]):
-            mounts = gate.visible_mounts(text, [Path('/source')])
-        self.assertEqual(mounts, [(Path('/'), True, 'ext4'),
-                                  (Path('/work'), False, 'ext4')])
-        gate.check_mounts(mounts, [Path('/work')], [Path('/source')])
-
-    def test_mount_visibility_rejects_inaccessible_protected_mounts_and_ancestors(self):
-        for path in ('/source', '/source/subtree', '/parent'):
-            root = Path('/parent/source') if path == '/parent' else Path('/source')
-            with self.subTest(path=path), \
-                 mock.patch.object(gate, '_mount_id', return_value=None), \
-                 self.assertRaisesRegex(gate.BoundaryError, 'inaccessible'):
-                gate.visible_mounts(f'1 0 8:1 / {path} rw - ext4 root rw\n', [root])
-
-    def test_mount_visibility_does_not_allow_visible_external_writable_mount(self):
-        text = ('1 0 8:1 / / ro - ext4 root rw\n'
-                '2 1 8:1 / /outside rw - ext4 root rw\n')
-        with mock.patch.object(gate, '_mount_id', side_effect=[1, 2]):
-            mounts = gate.visible_mounts(text, [Path('/source')])
-        with self.assertRaisesRegex(gate.BoundaryError, 'unexpected writable'):
-            gate.check_mounts(mounts, [], [Path('/source')])
-
-    def test_effective_mount_identity_requires_kernel_evidence_and_closes_descriptor(self):
-        with mock.patch.object(gate.os, 'open', return_value=17) as opened, \
-             mock.patch.object(gate.os, 'close') as closed, \
-             mock.patch.object(gate.Path, 'read_text', return_value='mnt_id:\t42\n'):
-            self.assertEqual(gate._mount_id(Path('/outside')), 42)
-        opened.assert_called_once_with(Path('/outside'), gate.os.O_PATH | gate.os.O_CLOEXEC)
-        closed.assert_called_once_with(17)
-        for info in ('', 'mnt_id: invalid'):
-            with self.subTest(info=info), \
-                 mock.patch.object(gate.os, 'open', return_value=17), \
-                 mock.patch.object(gate.os, 'close') as closed, \
-                 mock.patch.object(gate.Path, 'read_text', return_value=info), \
-                 self.assertRaises((gate.BoundaryError, ValueError)):
-                gate._mount_id(Path('/outside'))
-            closed.assert_called_once_with(17)
-        with mock.patch.object(gate.os, 'open', side_effect=FileNotFoundError):
-            self.assertIsNone(gate._mount_id(Path('/missing')))
-        with mock.patch.object(gate.os, 'open', side_effect=OSError(5, 'I/O failure')), \
-             self.assertRaises(OSError):
-            gate._mount_id(Path('/unknown'))
-        with mock.patch.object(gate.os, 'open', side_effect=PermissionError):
-            self.assertIsNone(gate._mount_id(Path('/inaccessible')))
+    def test_protected_file_write_is_checked_without_truncation(self):
+        import errno
+        spec = {'writable': [], 'protected': [], 'files': ['/source/HEAD']}
+        for denied in (errno.EROFS, errno.EACCES, errno.EPERM):
+            with self.subTest(denied=denied), \
+                 mock.patch.object(gate.os, 'open', side_effect=OSError(denied, 'denied')) as opened:
+                gate.check_boundary(spec)
+                opened.assert_called_once_with('/source/HEAD', gate.os.O_WRONLY | gate.os.O_CLOEXEC)
         with mock.patch.object(gate.os, 'open', return_value=17), \
              mock.patch.object(gate.os, 'close') as closed, \
-             mock.patch.object(gate.Path, 'read_text', side_effect=PermissionError), \
-             self.assertRaises(PermissionError):
-            gate._mount_id(Path('/outside'))
+             self.assertRaisesRegex(gate.BoundaryError, 'write was allowed'):
+            gate.check_boundary(spec)
         closed.assert_called_once_with(17)
-
-    def test_native_standard_devices_do_not_allow_regular_files_or_other_mounts(self):
-        root = (Path('/'), True, 'ext4')
-        gate.check_mounts([root, (Path('/dev/null'), False, 'devtmpfs')], [], [])
-        for path, filesystem in (('/dev/unexpected', 'devtmpfs'),
-                                 ('/outside', 'devtmpfs'), ('/dev/null', 'ext4')):
-            with self.subTest(path=path, filesystem=filesystem), \
-                 self.assertRaises(gate.BoundaryError):
-                gate.check_mounts([root, (Path(path), False, filesystem)], [], [])
-        with mock.patch.object(gate.Path, 'stat', return_value=mock.Mock(st_mode=0o100644)), \
-             self.assertRaises(gate.BoundaryError):
-            gate.check_mounts([root, (Path('/dev/null'), False, 'devtmpfs')], [], [])
-
-    def test_mount_parser_preserves_escaped_paths_and_per_mount_readonly(self):
-        mounts = gate.mount_table(
-            '1 0 8:1 / / ro,relatime - ext4 /dev/root rw\n'
-            '2 1 8:1 /work /with\\040space rw,relatime - ext4 /dev/root rw\n')
-        self.assertEqual(mounts, [(Path('/'), True, 'ext4'),
-                                  (Path('/with space'), False, 'ext4')])
-
-    def test_same_gate_must_pass_before_provider_exec(self):
-        specification = json.dumps({'worktree': '/selected'})
-        with mock.patch.object(gate.sys, 'argv', ['gate', specification, 'codex', 'exec']), \
-             mock.patch.object(gate, 'check_boundary') as check, \
-             mock.patch.object(gate.os, 'chdir') as chdir, \
-             mock.patch.object(gate.os, 'execvpe') as execute:
-            gate.main()
-            check.assert_called_once_with({'worktree': '/selected'})
-            chdir.assert_called_once_with('/selected')
-            execute.assert_called_once_with('codex', ['codex', 'exec'], gate.os.environ)
-            execute.reset_mock()
-            check.side_effect = gate.BoundaryError('unproven')
-            with mock.patch.object(gate.sys, 'stderr', io.StringIO()):
-                self.assertEqual(gate.main(), 125)
-            execute.assert_not_called()
+        with mock.patch.object(gate.os, 'open', side_effect=FileNotFoundError), \
+             self.assertRaisesRegex(gate.BoundaryError, 'inconclusive'):
+            gate.check_boundary(spec)
 
     def test_source_readonly_failure_never_attempts_mutation(self):
         specification = {'writable': [], 'protected': ['/source'], 'files': ['/source/file']}
-        with mock.patch.object(gate.Path, 'read_text', side_effect=[
-                '1 0 8:1 / / ro - ext4 root rw\n',
-                'CapEff:\t00000000\nNoNewPrivs:\t1\n']), \
-             mock.patch.object(gate, '_mount_id', side_effect=lambda path: 2 if path.name == 'selected' else 1), \
-             mock.patch.object(gate.os, 'readlink', return_value='mnt:[1]'), \
-             mock.patch.object(gate.Path, 'exists', return_value=True), \
+        with mock.patch.object(gate.Path, 'exists', return_value=True), \
              mock.patch.object(gate.os, 'statvfs', return_value=mock.Mock(f_flag=0)), \
              mock.patch.object(gate.os, 'open') as write_open, \
              mock.patch.object(gate.tempfile, 'TemporaryDirectory') as scratch:
@@ -673,13 +599,7 @@ class NativeWriteIsolationTests(TestCase):
             preserved = source / 'local-only'
             preserved.write_bytes(b'unchanged')
             specification = {'writable': [str(selected)], 'protected': [str(source)], 'files': []}
-            with mock.patch.object(gate.Path, 'read_text', side_effect=[
-                    '1 0 8:1 / / ro - ext4 root rw\n'
-                    f'2 1 8:1 / {selected} rw - ext4 root rw\n',
-                    'CapEff:\t0\nNoNewPrivs:\t1\n']), \
-                 mock.patch.object(gate, '_mount_id', side_effect=lambda path: 2 if path == selected else 1), \
-                 mock.patch.object(gate.os, 'readlink', return_value='mnt:[1]'), \
-                 mock.patch.object(gate.os, 'statvfs', return_value=mock.Mock(f_flag=gate.os.ST_RDONLY)), \
+            with mock.patch.object(gate.os, 'statvfs', return_value=mock.Mock(f_flag=gate.os.ST_RDONLY)), \
                  mock.patch.object(gate.os, 'walk', side_effect=PermissionError('tree inspection unavailable')) as walk:
                 gate.check_boundary(specification)
             walk.assert_not_called()
@@ -687,7 +607,7 @@ class NativeWriteIsolationTests(TestCase):
             self.assertEqual(preserved.read_bytes(), b'unchanged')
             self.assertEqual(list(source.iterdir()), [preserved])
 
-    def test_actual_adapter_wraps_roles_and_resume_and_persists_evidence(self):
+    def test_actual_adapter_runs_direct_roles_and_resume_and_persists_evidence(self):
         for role, read_only, session in (('planner', False, None), ('worker', False, 'saved'),
                                         ('reviewer', True, None), ('maintenance', False, None)):
             with self.subTest(role=role), tempfile.TemporaryDirectory() as directory:
@@ -700,11 +620,11 @@ class NativeWriteIsolationTests(TestCase):
                 def run(command, **kwargs):
                     if command == ['codex', '--version']:
                         return manager.subprocess.CompletedProcess(command, 0, 'version', '')
-                    self.assertEqual(command[:2], ('codex', 'sandbox') if isinstance(command, tuple)
-                                     else ['codex', 'sandbox'])
+                    self.assertEqual(list(command[:2]), ['codex', 'sandbox'] if 'exec' not in command
+                                     else ['codex', 'exec'])
                     commands.append(command)
                     if 'exec' not in command:
-                        return manager.subprocess.CompletedProcess(command, 0, 'agent-write-boundary-v1\n', '')
+                        return manager.subprocess.CompletedProcess(command, 0, 'agent-tool-boundary-v2\n', '')
                     self.assertIn('approvals_reviewer="auto_review"', command)
                     self.assertIn('sandbox_workspace_write.network_access=false', command)
                     if session:
@@ -730,7 +650,11 @@ class NativeWriteIsolationTests(TestCase):
                 self.assertEqual(result.code, 0)
                 self.assertEqual(result.message, 'completed')
                 self.assertEqual(len(commands), 2)
-                self.assertEqual(list(commands[0]), list(commands[1][:len(commands[0])]))
+                self.assertEqual(list(commands[0][:2]), ['codex', 'sandbox'])
+                self.assertEqual(commands[1][:2], ['codex', 'exec'])
+                self.assertNotIn('sandbox', commands[1])
+                self.assertNotIn('app-server', commands[1])
+                self.assertEqual(commands[1][commands[1].index('-C') + 1], str(boundary.worktree))
                 row = connection.execute('''SELECT proof.status, call.result_kind, call.session_id
                     FROM agent_isolation_evidence proof JOIN agent_invocations call USING(invocation_id)''').fetchone()
                 self.assertEqual(row, ('verified', 'success', session))
@@ -795,7 +719,7 @@ class NativeWriteIsolationTests(TestCase):
 
                 def start(command, **kwargs):
                     self.assertTrue(handoff.launch_lock.locked())
-                    self.assertEqual(command[:2], ['codex', 'sandbox'])
+                    self.assertEqual(command[:2], ['codex', 'exec'])
                     self.assertTrue(kwargs['start_new_session'])
                     if session:
                         self.assertIn('resume', command)
@@ -855,7 +779,7 @@ class NativeWriteIsolationTests(TestCase):
         terminate.assert_called_once_with(4321, envelope.signal.SIGKILL)
         process.wait.assert_called_once()
 
-    def test_streamed_new_session_uses_envelope_and_persists_session(self):
+    def test_streamed_new_session_uses_direct_exec_and_persists_session(self):
         with tempfile.TemporaryDirectory() as directory:
             boundary, state_root, home = self.boundary(Path(directory))
             connection = sqlite3.connect(':memory:')
@@ -870,7 +794,7 @@ class NativeWriteIsolationTests(TestCase):
             def run(command, **kwargs):
                 if command == ['codex', '--version']:
                     return manager.subprocess.CompletedProcess(command, 0, 'version', '')
-                return manager.subprocess.CompletedProcess(command, 0, 'agent-write-boundary-v1\n', '')
+                return manager.subprocess.CompletedProcess(command, 0, 'agent-tool-boundary-v2\n', '')
 
             def start(command, **kwargs):
                 commands.append(command)
@@ -891,7 +815,7 @@ class NativeWriteIsolationTests(TestCase):
                     read_only=False, persist_session=True, connection=connection,
                     resolved_profile=invocation.ResolvedProfile('model', 'high'),
                     invocation=invocation.InvocationContext(str(boundary.source), 'G-088'))
-            self.assertEqual(commands[0][:2], ['codex', 'sandbox'])
+            self.assertEqual(commands[0][:2], ['codex', 'exec'])
             self.assertEqual((result.code, result.session_id), (0, 'new-session'))
             self.assertEqual(connection.execute('SELECT session_id FROM agent_invocations').fetchone()[0],
                              'new-session')
@@ -912,7 +836,7 @@ class NativeWriteIsolationTests(TestCase):
                 if command == ['codex', '--version']:
                     return manager.subprocess.CompletedProcess(command, 0, 'version', '')
                 if 'exec' not in command:
-                    return manager.subprocess.CompletedProcess(command, 0, 'agent-write-boundary-v1\n', '')
+                    return manager.subprocess.CompletedProcess(command, 0, 'agent-tool-boundary-v2\n', '')
                 kwargs['stdout'].write('agent write boundary verification failed')
                 return manager.subprocess.CompletedProcess(command, 125)
 
@@ -935,7 +859,7 @@ class NativeWriteIsolationTests(TestCase):
             self.assertEqual((logs / 'planner-last.txt').read_text(), 'old result')
 
 
-@skipUnless(isolation.platform.system() == 'Linux', 'native runtime envelope requires Linux')
+@skipUnless(isolation.platform.system() == 'Linux', 'native tool policy probe requires Linux')
 class RuntimeReadOnlyIsolationTests(TestCase):
     def fixture(self, root):
         boundary, state_root, home = NativeWriteIsolationTests.boundary(self, root)
@@ -1028,15 +952,12 @@ class RuntimeReadOnlyIsolationTests(TestCase):
             def run(command, **kwargs):
                 if command == ['codex', '--version']:
                     return manager.subprocess.CompletedProcess(command, 0, 'version', '')
-                return manager.subprocess.CompletedProcess(command, 0, 'agent-write-boundary-v1\n', '')
+                return manager.subprocess.CompletedProcess(command, 0, 'agent-tool-boundary-v2\n', '')
 
             def execute(command, **kwargs):
                 launched.append(command)
-                helper = str(Path(envelope.__file__).with_name('agent_sandbox_exec.py'))
-                specification = json.loads(command[command.index(helper) + 1])
-                self.assertEqual(specification['worktree'], str(runtime))
-                self.assertIn(str(runtime), specification['protected'])
-                self.assertNotIn(str(runtime), specification['writable'])
+                self.assertEqual(command[:2], ['codex', 'exec'])
+                self.assertEqual(command[command.index('-C') + 1], str(runtime))
                 self.assertIn('--sandbox', command)
                 self.assertEqual(command[command.index('--sandbox') + 1], 'read-only')
                 Path(command[command.index('-o') + 1]).write_text('draft response')

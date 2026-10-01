@@ -1,7 +1,7 @@
-"""Small trusted gate executed *inside* the native Codex sandbox.
+"""Standalone native tool-policy probe; never launches a provider process.
 
-No provider code runs until this gate has checked the actual mount namespace.
-The same gate is used for preflight and exec; source files are never mutated.
+Check declared protected paths without mutating them and exercise writes only
+in explicitly allowed scratch/workspace roots. No process-tree mount scan.
 """
 from __future__ import annotations
 
@@ -9,8 +9,6 @@ import errno
 import json
 import os
 from pathlib import Path
-import re
-import stat
 import sys
 import tempfile
 
@@ -19,100 +17,13 @@ class BoundaryError(RuntimeError):
     pass
 
 
-def _inside(path: Path, root: Path) -> bool:
-    return path == root or root in path.parents
-
-
-def mount_table(text: str) -> list[tuple[Path, bool, str]]:
-    mounts = []
-    for line in text.splitlines():
-        fields = line.split()
-        split = fields.index('-')
-        name = re.sub(r'\\([0-7]{3})', lambda match: chr(int(match[1], 8)), fields[4])
-        mounts.append((Path(name), 'ro' in fields[5].split(','), fields[split + 1]))
-    if not mounts:
-        raise BoundaryError('mount table unavailable')
-    return mounts
-
-
-def _mount_id(path: Path) -> int | None:
-    # O_PATH checks traversal without opening device contents or mutating files.
-    try:
-        descriptor = os.open(path, os.O_PATH | os.O_CLOEXEC)
-    except (PermissionError, FileNotFoundError):
-        return None
-    try:
-        info = Path(f'/proc/self/fdinfo/{descriptor}').read_text()
-        for line in info.splitlines():
-            if line.startswith('mnt_id:'):
-                return int(line.split(':', 1)[1].strip())
-        raise BoundaryError('effective mount identity is unavailable')
-    finally:
-        os.close(descriptor)
-
-
-def visible_mounts(text: str, protected: list[Path]) -> list[tuple[Path, bool, str]]:
-    result = []
-    for fields, mount in zip(text.splitlines(), mount_table(text), strict=True):
-        path, _, _ = mount
-        identity = _mount_id(path)
-        if identity is None:
-            if any(_inside(path, root) or _inside(root, path) for root in protected):
-                raise BoundaryError('protected mount is inaccessible')
-            continue
-        # Covered mounts can retain rw flags in mountinfo although path lookup
-        # reaches a different mount (e.g. the sandbox's replacement /proc).
-        if identity == int(fields.split()[0]):
-            result.append(mount)
-    return result
-
-
-def check_mounts(mounts: list[tuple[Path, bool, str]], writable: list[Path],
-                 protected: list[Path]) -> None:
-    # A Landlock-only/unknown implementation is not claimed as mount proof.
-    if not any(path == Path('/') and readonly for path, readonly, _ in mounts):
-        raise BoundaryError('root mount is not read-only')
-    for path, readonly, filesystem in mounts:
-        if readonly:
-            continue
-        if any(_inside(path, root) for root in writable):
-            if any(_inside(path, root) for root in protected):
-                raise BoundaryError('writable mount below protected path')
-            continue
-        # Native sandbox proc/device filesystems are not host repository storage.
-        if filesystem in ('proc', 'devpts', 'tmpfs') and (
-                _inside(path, Path('/proc')) or _inside(path, Path('/dev'))):
-            continue
-        if (filesystem == 'devtmpfs'
-                and path in {Path('/dev') / name for name in
-                             ('null', 'zero', 'full', 'random', 'urandom', 'tty')}
-                and stat.S_ISCHR(path.stat().st_mode)):
-            continue
-        raise BoundaryError('unexpected writable mount')
-    for root in protected:
-        candidates = [(path, readonly) for path, readonly, _ in mounts if _inside(root, path)]
-        if not candidates or not max(candidates, key=lambda item: len(item[0].parts))[1]:
-            raise BoundaryError('protected path mount is writable')
-        if any(_inside(path, root) and not readonly for path, readonly, _ in mounts):
-            raise BoundaryError('protected subtree has a writable mount')
-
-
 def check_boundary(spec: dict) -> None:
-    writable = [Path(value) for value in spec['writable']]
-    protected = [Path(value) for value in spec['protected']]
-    check_mounts(visible_mounts(Path('/proc/self/mountinfo').read_text(), protected),
-                 writable, protected)
-    status = Path('/proc/self/status').read_text()
-    values = dict(line.split(':', 1) for line in status.splitlines() if ':' in line)
-    if int(values.get('CapEff', '1').strip(), 16) or values.get('NoNewPrivs', '').strip() != '1':
-        raise BoundaryError('sandbox privilege reduction is unavailable')
-    # Host /proc/<pid>/root must not provide an alternate writable host mount.
-    if os.readlink('/proc/1/ns/mnt') != os.readlink('/proc/self/ns/mnt'):
-        raise BoundaryError('host process namespace remains reachable')
-    for root in protected:
+    # The Linux native sandbox presents declared protected roots read-only.
+    # Check only those roots, not unrelated mounts or workspace descendants.
+    for value in spec['protected']:
+        root = Path(value)
         if not root.exists() or not os.statvfs(root).f_flag & os.ST_RDONLY:
             raise BoundaryError('protected path is not read-only')
-    # Existing-file write opens are non-destructive, even if confinement failed.
     for value in spec['files']:
         try:
             descriptor = os.open(value, os.O_WRONLY | os.O_CLOEXEC)
@@ -122,11 +33,8 @@ def check_boundary(spec: dict) -> None:
         else:
             os.close(descriptor)
             raise BoundaryError('protected file write was allowed')
-    # Only Manager-owned scratch paths and the selected writing worktree are
-    # touched. RO mount proof above also covers create/unlink/rename of protected
-    # names, without creating a sentinel in a user's source checkout.
-    for root in writable:
-        with tempfile.TemporaryDirectory(prefix='.isolation-', dir=root) as scratch:
+    for value in spec['writable']:
+        with tempfile.TemporaryDirectory(prefix='.isolation-', dir=value) as scratch:
             target = Path(scratch) / 'probe'
             target.write_bytes(b'probe')
             target.write_bytes(b'updated')
@@ -136,20 +44,15 @@ def check_boundary(spec: dict) -> None:
 
 
 def main() -> int:
-    spec = json.loads(sys.argv[1])
     try:
-        check_boundary(spec)
-    except (BoundaryError, OSError, ValueError, KeyError):
-        # Paths, provider configuration and source data never enter diagnostics.
-        print('agent write boundary verification failed', file=sys.stderr)
+        if len(sys.argv) != 2:
+            raise BoundaryError('probe cannot launch a command')
+        check_boundary(json.loads(sys.argv[1]))
+    except (BoundaryError, OSError, ValueError, KeyError, TypeError):
+        print('agent tool boundary verification failed', file=sys.stderr)
         return 125
-    command = sys.argv[2:]
-    if not command:
-        print('agent-write-boundary-v1')
-        return 0
-    os.chdir(spec['worktree'])
-    os.execvpe(command[0], command, os.environ)
-    return 125
+    print('agent-tool-boundary-v2')
+    return 0
 
 
 if __name__ == '__main__':
