@@ -1475,6 +1475,10 @@ def _tracking_ref_oid(repo: Path, refname: str) -> str | None:
     return result.stdout.strip() if result.returncode == 0 else None
 
 
+class RemoteBranchMissingError(RuntimeError):
+    """A successful remote query confirmed that the requested branch is absent."""
+
+
 def _recorded_base_fetch(
     repo: Path, state_dir: Path, base: str, *, owner: str,
 ) -> str:
@@ -1483,6 +1487,8 @@ def _recorded_base_fetch(
     remote_ref = f"refs/heads/{base}"
     remote = git(repo, "ls-remote", "--heads", "origin", remote_ref, check=False)
     rows = [line.split() for line in remote.stdout.splitlines() if line.strip()]
+    if remote.returncode == 0 and not rows:
+        raise RemoteBranchMissingError(f"origin/{base} 원격 branch를 찾을 수 없습니다.")
     if remote.returncode or len(rows) != 1 or rows[0][1:] != [remote_ref]:
         raise RuntimeError(f"origin/{base}의 원격 OID를 확정할 수 없습니다.")
     selected = rows[0][0]
@@ -6410,7 +6416,13 @@ def remote_base(
         if base not in branches:
             raise RuntimeError(f"origin/{base} 원격 branch를 찾을 수 없습니다.")
         for branch in sorted(branches):
-            _recorded_base_fetch(repo, state_dir, branch, owner="project")
+            try:
+                _recorded_base_fetch(repo, state_dir, branch, owner="project")
+            except RemoteBranchMissingError:
+                # A merged PR head may be deleted after the list query. Keep
+                # its tracking ref and stored PR head for cleanup assessment.
+                if branch == base:
+                    raise
     git(repo, "rev-parse", "--verify", f"refs/remotes/origin/{base}^{{commit}}")
     return base
 
