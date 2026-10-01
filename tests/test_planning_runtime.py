@@ -596,6 +596,7 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
             "saved-session", PlanningAgentResultKind.SUCCESS,
         )
         ports.git.head = "a" * 40
+        ports.agent.run_planner = mock.Mock(wraps=ports.agent.run_planner)
         coordinator = PlanningLifecycleCoordinator(ports)
         run = coordinator._new_run(self.context)
         run.planning_worktree = Path("/worktree")
@@ -605,6 +606,16 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         self.assertEqual(outcome.kind, PlanningOutcomeKind.WAITING)
         self.assertEqual(ports.agent.resumed_session, "saved-session")
         self.assertEqual(ports.agent.run_count, 1)
+        prompt = ports.agent.run_planner.call_args.args[1]
+        for phrase in (
+            "기존 구현·공유 helper·관련 테스트와 표준 도구",
+            "현재 목표에 필요하지 않은 추상화·설정·파일 추가",
+            "오류 처리·보안·접근성·회귀 검증",
+            "결정·예외·실패 흐름과 Acceptance Criteria의 의미",
+            "파일이나 문서를 수정하지 마라",
+            "FILE_REVIEW_RESULT:",
+        ):
+            self.assertIn(phrase, prompt)
         self.assertEqual(ports.file_review.complete.call_args.args[2], source)
         self.assertEqual(ports.file_review.fail.call_count, 0)
 
