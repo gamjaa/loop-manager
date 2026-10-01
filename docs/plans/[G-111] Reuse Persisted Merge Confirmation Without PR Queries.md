@@ -46,12 +46,22 @@ SQLite에 이미 Merge가 확정된 PR은 이후 Loop 실행, 재시작과 archi
 
 ## Progress
 
-- [ ] 저장 Merge proof 선택과 archived 복구의 PR 조회 제외
-- [ ] PR 조회 진입점의 MERGED guard와 미확정 조회 보존
+- [x] 저장 Merge proof 선택과 archived 복구의 PR 조회 제외
+- [x] PR 조회 진입점의 MERGED guard와 미확정 조회 보존
 - [ ] 관련 targeted unit test 및 Manager 전체 verify 결과 확인
+
+- 2026-10-01: 재개한 Worker에서 세 가지 Review 피드백을 수정했다. 변조 진단 이후에도 확정 Merge 증명과 마지막 정상 archive hash를 보존하고, 최초 게시 경로와 현재 rename 경로를 구분하며, audit-only 복구도 로컬 게시 blob·ancestry를 검증한다. 관련 개별 unit case 12개를 총 13회 실행해 모두 통과했다. Manager 전체 verify와 재Review는 대기 중이다.
+
+- 2026-10-01: Manager 전체 verify에서 archive 후보 계산 unit fixture의 `diagnostic_code` 열 누락이 확인됐다. 축소 history DDL 대신 실제 catalog schema 생성 함수를 사용하도록 수정했다. 실패한 개별 unit case를 동일 명령으로 재실행해 1 test PASS를 확인했다. 전체 verify 재검증은 Manager에 맡긴다.
+
+- 2026-10-01: 오래된 PUBLISHING 등의 project projection에서 PR 복구 조회가 재발하는 Review 피드백을 수정했다. 조회 직전에 repository·계획 ID·branch와 최신 SQLite MERGED 상태를 비교한다. rename 후 projection, 같은 실행의 선행 Merge 전이와 미확정 PR 혼합, 다른 repository의 동일 ID를 검증하는 `tests.test_loop_manager.PersistedMergeProjectQueryTest`의 unit case 3개가 PASS했다. 전체 verify와 재Review는 Manager에 맡긴다.
+
+- 2026-10-01: MERGED 조회 guard 뒤에 남은 실행 projection이 다음 READY와 완료 경로를 막는 Review 피드백을 수정했다. planning 소유권이 없는 동일 계획의 projection을 기존 runtime 정리 경계로 해제하고, 다른 활성 계획이 있으면 그 계획으로 다시 hydrate한다. 실제 planning coordinator와 실행 prepare를 사용하는 unit case 및 planning 보존 case를 추가했다. fixture의 catalog revision·publication audit backfill 기준을 보완한 뒤 동일 targeted 명령 `python3 -m unittest tests.test_loop_manager.PersistedMergeProjectQueryTest`에서 6 tests PASS를 확인했다. 전체 verify와 재Review는 Manager에 맡긴다.
 
 ## Decision Log
 
 - 2026-09-30: 사용자가 DB상 이미 Merge된 PR의 재조회 제외를 요청했다. 기존 PRODUCT의 실행 상태·복구·archive 목표 안에서 확정된 사실을 재사용하는 수정으로 계획하며, PRODUCT·Requirement·ARCHITECTURE와 기존 ExecPlan은 변경하지 않는다.
 - `MERGED`는 최초 GitHub 확인 뒤 SQLite에 저장된 실행 상태다. 저장 proof가 불완전하다는 이유로 같은 PR을 다시 조회하지 않으며, archive 적합성은 별도의 로컬 identity·본문 검증으로 판단한다.
 - GitHub에서 처음 Merge를 확인하기 위한 조회와 아직 미확정인 PR의 복구 조회는 계속 필요하다. 이 계획은 새로운 PR 상태나 자동 Merge, 데이터 삭제·migration, 게시 권한 또는 새로운 infrastructure를 추가하지 않는다.
+
+- 2026-10-01: `merge_confirmed`는 한 번 확인된 Merge 사실을 보존하며, 현재 archive 적합성은 `diagnostic_code`와 함께 판단한다. dependency 선택, 유지보수 Merge 집계·단계 전환, Requirement archive 후보와 대기 사유 계산은 진단이 남은 archive를 검증되지 않은 이력으로 취급한다. 저장 증명 재사용을 위한 외부 port는 PR 조회 없이 로컬 Git 검증만 수행한다.

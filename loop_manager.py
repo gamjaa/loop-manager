@@ -5369,8 +5369,17 @@ class _LegacyCatalogMergeProof:
         self, entry: execplan_catalog.ExecPlanCatalogEntry
     ) -> execplan_catalog_state.MergeProof:
         identity = self.stored.get(entry.plan_id)
+        if identity is None:
+            return execplan_catalog_state.MergeProof(False)
+        return self.verify_stored(entry, identity)
+
+    def verify_stored(
+        self,
+        entry: execplan_catalog.ExecPlanCatalogEntry,
+        identity: execplan_catalog_state.StoredPlanIdentity,
+    ) -> execplan_catalog_state.MergeProof:
         if (
-            identity is None
+            identity.plan_id != entry.plan_id
             or identity.status != "MERGED"
             or not identity.plan_sha
         ):
@@ -5403,6 +5412,14 @@ class _LegacyCatalogMergeProof:
     def proof_for(
         self, entry: execplan_catalog.ExecPlanCatalogEntry
     ) -> execplan_catalog_state.MergeProof:
+        # SQLite's MERGED transition is the durable result of the first
+        # GitHub observation.  Archive reconciliation may still need local
+        # publication evidence, but it must never turn an incomplete local
+        # proof into another PR query.
+        identity = self.stored.get(entry.plan_id)
+        if identity is not None and identity.status == "MERGED":
+            return self._stored_git_proof(entry)
+
         pull_request = pr_for_branch(
             self.root, f"loop-manager/{entry.plan_id}"
         )
@@ -5417,7 +5434,6 @@ class _LegacyCatalogMergeProof:
                 pr_url=str(pull_request.get("url") or "") or None,
                 detail=str(pull_request.get("state") or "unknown"),
             )
-        identity = self.stored.get(entry.plan_id)
         if identity is not None and identity.plan_sha:
             plan_sha = identity.plan_sha
         else:
@@ -5840,6 +5856,30 @@ def project_execplan(connection: sqlite3.Connection, repo: str) -> sqlite3.Row |
     return runtime_state.RuntimeStateRepository(connection).projected_row(repo)
 
 
+def _project_pr_merge_confirmed(
+    connection: sqlite3.Connection,
+    repo: str,
+    project: sqlite3.Row,
+) -> bool:
+    """Resolve a stale projection against this plan's durable execution row."""
+
+    path = str(project["plan_path"] or "").replace(
+        "docs/plans/archive/", "docs/plans/", 1,
+    )
+    plan_id = _plan_id_from_path(path)
+    if plan_id is None:
+        return False
+    plan = connection.execute(
+        "SELECT status, branch FROM exec_plans WHERE repo = ? AND plan_id = ?",
+        (repo, plan_id),
+    ).fetchone()
+    return bool(
+        plan is not None
+        and plan["status"] == "MERGED"
+        and project["branch"] == (plan["branch"] or f"loop-manager/{plan_id}")
+    )
+
+
 def plan_blocked_execplans(
     connection: sqlite3.Connection, repo: str
 ) -> tuple[sqlite3.Row, ...]:
@@ -6044,10 +6084,10 @@ def catalog_schedule_decision(
         "SELECT * FROM exec_plans WHERE repo = ?", (repo,)
     ).fetchall()
     historical_confirmation = {
-        str(row["plan_id"]): bool(row["merge_confirmed"])
+        str(row["plan_id"]): bool(row["merge_confirmed"]) and not row["diagnostic_code"]
         for row in connection.execute(
             """
-            SELECT plan_id, merge_confirmed
+            SELECT plan_id, merge_confirmed, diagnostic_code
             FROM execplan_catalog_history
             WHERE repo = ?
               AND currently_archived = 1
@@ -6199,7 +6239,7 @@ def _advance_maintenance_cycle_after_merges(
         "WHERE h.repo = exec_plans.repo "
         "AND h.currently_archived = 1 "
         "AND h.plan_id = exec_plans.plan_id "
-        "AND h.merge_confirmed = 0)",
+        "AND (h.merge_confirmed = 0 OR h.diagnostic_code IS NOT NULL))",
         (repo,),
     ).fetchall()
     error = cycle_plan_status_error(rows, cycle)
@@ -19642,13 +19682,14 @@ def requirement_archive_snapshot(
         ),
     )
     historical_rows = connection.execute(
-        "SELECT plan_id, merge_confirmed FROM execplan_catalog_history "
+        "SELECT plan_id, merge_confirmed, diagnostic_code FROM execplan_catalog_history "
         "WHERE repo = ? AND currently_archived = 1",
         (repo,),
     ).fetchall()
     unverified_historical_ids = {
         str(row["plan_id"])
-        for row in historical_rows if not int(row["merge_confirmed"])
+        for row in historical_rows
+        if not int(row["merge_confirmed"]) or row["diagnostic_code"]
     }
     state_ids = set(states)
     if allow_future_publication:
@@ -22089,6 +22130,23 @@ def _run_project_step(
     row = connection.execute(
         "SELECT * FROM projects WHERE repo = ?", (repo,)
     ).fetchone()
+
+    if (
+        row and row["branch"]
+        and not runtime_state.planning_owns_execution_slot(row)
+        and _project_pr_merge_confirmed(connection, repo, row)
+    ):
+        # MERGED is durable even if its compatibility projection survived
+        # the transition. Release that execution slot without changing the
+        # plan's audit, sessions, worktree or pending cleanup evidence.
+        if active_execplan(connection, repo) is None:
+            with connection:
+                _clear_active_in_current_transaction(connection, repo)
+        else:
+            hydrate_active_project(connection, repo)
+        row = connection.execute(
+            "SELECT * FROM projects WHERE repo = ?", (repo,)
+        ).fetchone()
 
     if row and row["branch"] and not runtime_state.planning_owns_execution_slot(row):
         existing_pr = pr_for_branch(repo_path, row["branch"], row["pr_url"])

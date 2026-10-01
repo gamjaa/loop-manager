@@ -321,7 +321,7 @@ class MaintenanceRepository:
                 "WHERE h.repo = exec_plans.repo "
                 "AND h.currently_archived = 1 "
                 "AND h.plan_id = exec_plans.plan_id "
-                "AND h.merge_confirmed = 0)"
+                "AND (h.merge_confirmed = 0 OR h.diagnostic_code IS NOT NULL))"
             )
         return int(
             self.connection.execute(

@@ -95,9 +95,9 @@ def collect(
     history = {}
     if _table_exists(connection, "execplan_catalog_history"):
         history = {
-            str(row[0]): bool(row[1])
+            str(row[0]): bool(row[1]) and not row[2]
             for row in connection.execute(
-                "SELECT plan_id, merge_confirmed FROM execplan_catalog_history "
+                "SELECT plan_id, merge_confirmed, diagnostic_code FROM execplan_catalog_history "
                 "WHERE repo = ? AND currently_archived = 1", (repo,),
             )
         }

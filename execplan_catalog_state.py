@@ -8,10 +8,11 @@ apply confirmed recovery decisions through the runtime-state boundary.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 import hashlib
 import json
+import re
 import sqlite3
 from typing import Callable, Iterator, Mapping, Protocol
 from uuid import uuid4
@@ -90,6 +91,10 @@ class MergeProofPort(Protocol):
     """External Git/GitHub evidence supplied to the pure recovery service."""
 
     def proof_for(self, entry: ExecPlanCatalogEntry) -> MergeProof: ...
+
+    def verify_stored(
+        self, entry: ExecPlanCatalogEntry, identity: StoredPlanIdentity,
+    ) -> MergeProof: ...
 
 
 @dataclass(frozen=True)
@@ -994,7 +999,11 @@ class CatalogStateRepository:
         diagnostic: CatalogDiagnostic | None,
         identity_verified: bool,
     ) -> None:
-        """Promote observations only when publication evidence verifies identity."""
+        """Retain confirmed merge evidence while recording current diagnostics.
+
+        merge_confirmed is durable; archive consumers must also require no
+        diagnostic before using that confirmation to satisfy dependencies.
+        """
 
         self.connection.execute(
             """
@@ -1019,21 +1028,39 @@ class CatalogStateRepository:
                     ELSE execplan_catalog_history.original_content_hash
                 END,
                 observed_path = excluded.observed_path,
-                final_content_hash = excluded.final_content_hash,
+                final_content_hash = CASE
+                    WHEN execplan_catalog_history.merge_confirmed = 1
+                     AND excluded.diagnostic_code IS NOT NULL
+                    THEN execplan_catalog_history.final_content_hash
+                    ELSE excluded.final_content_hash
+                END,
                 plan_sha = CASE
                     WHEN execplan_catalog_history.identity_verified = 0
                      AND excluded.identity_verified = 1
                     THEN excluded.plan_sha
                     ELSE COALESCE(execplan_catalog_history.plan_sha, excluded.plan_sha)
                 END,
-                merge_confirmed = excluded.merge_confirmed,
+                merge_confirmed = MAX(
+                    execplan_catalog_history.merge_confirmed,
+                    excluded.merge_confirmed
+                ),
                 identity_verified = MAX(
                     execplan_catalog_history.identity_verified,
                     excluded.identity_verified
                 ),
                 currently_archived = 1,
-                proof_kind = excluded.proof_kind,
-                proof_revision = excluded.proof_revision,
+                proof_kind = CASE
+                    WHEN execplan_catalog_history.merge_confirmed = 1
+                     AND excluded.diagnostic_code IS NOT NULL
+                    THEN execplan_catalog_history.proof_kind
+                    ELSE excluded.proof_kind
+                END,
+                proof_revision = CASE
+                    WHEN execplan_catalog_history.merge_confirmed = 1
+                     AND excluded.diagnostic_code IS NOT NULL
+                    THEN execplan_catalog_history.proof_revision
+                    ELSE excluded.proof_revision
+                END,
                 pr_url = COALESCE(execplan_catalog_history.pr_url, excluded.pr_url),
                 diagnostic_code = excluded.diagnostic_code,
                 diagnostic_message = excluded.diagnostic_message,
@@ -1143,6 +1170,56 @@ class CatalogRecoveryService:
     ) -> CatalogDiagnostic:
         return CatalogDiagnostic(entry.plan_id, entry.path, code, message)
 
+    @staticmethod
+    def _verified_history_proof(
+        entry: ExecPlanCatalogEntry,
+        audit: sqlite3.Row | None,
+    ) -> MergeProof | None:
+        """Return only a complete, identity-bound durable merge observation."""
+
+        if audit is None or not (
+            audit["merge_confirmed"]
+            and audit["identity_verified"]
+            and audit["plan_id"] == entry.plan_id
+            and re.fullmatch(
+                rf"docs/plans/\[{re.escape(entry.plan_id)}\] [^/]+\.md",
+                str(audit["original_path"]),
+            )
+            and audit["original_content_hash"]
+            and audit["final_content_hash"]
+            and audit["plan_sha"]
+            and audit["proof_revision"]
+        ):
+            return None
+        try:
+            kind = MergeProofKind(str(audit["proof_kind"]))
+        except ValueError:
+            return None
+        if kind is MergeProofKind.NONE:
+            return None
+        return MergeProof(
+            True,
+            kind=kind,
+            plan_sha=str(audit["plan_sha"]),
+            publication_content_hash=str(audit["original_content_hash"]),
+            revision=str(audit["proof_revision"]),
+            pr_url=str(audit["pr_url"] or "") or None,
+        )
+
+    @staticmethod
+    def _stored_identity_conflicts_with_history(
+        identity: StoredPlanIdentity,
+        audit: sqlite3.Row,
+    ) -> bool:
+        return any(
+            stored and stored != recorded
+            for stored, recorded in (
+                (identity.path, str(audit["original_path"])),
+                (identity.content_hash, str(audit["original_content_hash"])),
+                (identity.plan_sha, str(audit["plan_sha"] or "") or None),
+            )
+        )
+
     def reconcile(
         self,
         repo: str,
@@ -1155,6 +1232,7 @@ class CatalogRecoveryService:
         for plan_id, entry in snapshot.archived.items():
             identity = stored.get(plan_id)
             audit = self.repository.historical_row(repo, plan_id)
+            history_proof = self._verified_history_proof(entry, audit)
             trusted_identity = bool(
                 identity is not None
                 or (audit is not None and audit["identity_verified"])
@@ -1170,9 +1248,13 @@ class CatalogRecoveryService:
                 original_path = str(audit["original_path"])
                 original_hash = str(audit["original_content_hash"])
                 # An audit-only row has no synchronized declaration cache.
-                # Its last observation may be the rejected tampered bytes, so
-                # only the verified publication hash is safe as a baseline.
-                current_hash = original_hash
+                # Diagnostics must retain the last verified archive bytes
+                # and durable merge evidence for subsequent recovery.
+                current_hash = (
+                    str(audit["final_content_hash"])
+                    if history_proof is not None
+                    else original_hash
+                )
                 stable_plan_sha = (
                     str(audit["plan_sha"]) if audit["plan_sha"] else None
                 )
@@ -1185,13 +1267,48 @@ class CatalogRecoveryService:
             proof = MergeProof(False)
             diagnostic: CatalogDiagnostic | None = None
 
-            if not trusted_identity and original_path != entry.active_path:
+            if (
+                audit is not None
+                and audit["identity_verified"]
+                and identity is not None
+                and self._stored_identity_conflicts_with_history(identity, audit)
+            ):
+                diagnostic = self._diagnostic(
+                    entry,
+                    "stable-identity-mismatch",
+                    "archived ExecPlan의 SQLite identity와 검증된 archive 이력이 다릅니다: "
+                    f"{entry.plan_id}",
+                )
+            elif not trusted_identity and original_path != entry.active_path:
                 diagnostic = self._diagnostic(
                     entry,
                     "stable-identity-mismatch",
                     "archived ExecPlan의 최초 active 경로가 저장 identity와 다릅니다: "
                     f"{original_path} != {entry.active_path}",
                 )
+            elif audit is not None and audit["merge_confirmed"] and history_proof is None:
+                diagnostic = self._diagnostic(
+                    entry, "publication-proof-missing",
+                    "확정된 Merge 이력의 게시 identity 또는 증명이 불완전합니다: "
+                    f"{entry.plan_id}",
+                )
+            elif history_proof is not None and (
+                identity is None or identity.status == "MERGED"
+            ):
+                try:
+                    proof = self.merge_proof.verify_stored(
+                        entry,
+                        StoredPlanIdentity(
+                            plan_id, original_path, original_hash,
+                            stable_plan_sha, "MERGED", current_hash,
+                        ),
+                    )
+                    proof = replace(proof, pr_url=history_proof.pr_url)
+                except Exception as error:
+                    diagnostic = self._diagnostic(
+                        entry, "merge-proof-error",
+                        f"archived ExecPlan 로컬 Git 검증에 실패했습니다: {error}",
+                    )
             else:
                 try:
                     proof = self.merge_proof.proof_for(entry)
@@ -1201,48 +1318,48 @@ class CatalogRecoveryService:
                         "merge-proof-error",
                         f"archived ExecPlan Merge 이력 조회에 실패했습니다: {error}",
                     )
+            if diagnostic is None:
+                stable_plan_sha = stable_plan_sha or proof.plan_sha
+                if not proof.merged:
+                    diagnostic = self._diagnostic(
+                        entry,
+                        "merge-proof-missing",
+                        "archive 파일 위치만으로 MERGED를 확인할 수 없습니다: "
+                        f"{entry.path}" + (f" ({proof.detail})" if proof.detail else ""),
+                    )
+                elif not stable_plan_sha:
+                    diagnostic = self._diagnostic(
+                        entry,
+                        "publication-proof-missing",
+                        "archived ExecPlan의 최초 게시 revision을 확인할 수 없습니다: "
+                        f"{entry.path}",
+                    )
+                elif not proof.publication_content_hash:
+                    diagnostic = self._diagnostic(
+                        entry,
+                        "publication-content-proof-missing",
+                        "archived ExecPlan의 게시 본문 hash를 확인할 수 없습니다: "
+                        f"{entry.path}",
+                    )
                 else:
-                    stable_plan_sha = stable_plan_sha or proof.plan_sha
-                    if not proof.merged:
+                    if not trusted_identity:
+                        original_hash = proof.publication_content_hash
+                    publication_mismatch = (
+                        proof.publication_content_hash != original_hash
+                    )
+                    current_mismatch = not final_content_matches(
+                        entry.content_hash,
+                        current_hash if trusted_identity
+                        else proof.publication_content_hash,
+                    )
+                    if publication_mismatch or current_mismatch:
                         diagnostic = self._diagnostic(
                             entry,
-                            "merge-proof-missing",
-                            "archive 파일 위치만으로 MERGED를 확인할 수 없습니다: "
+                            "archived-content-hash-mismatch",
+                            "archived ExecPlan byte hash가 게시 revision 또는 "
+                            "마지막 동기화 본문 hash와 다릅니다: "
                             f"{entry.path}",
                         )
-                    elif not stable_plan_sha:
-                        diagnostic = self._diagnostic(
-                            entry,
-                            "publication-proof-missing",
-                            "archived ExecPlan의 최초 게시 revision을 확인할 수 없습니다: "
-                            f"{entry.path}",
-                        )
-                    elif not proof.publication_content_hash:
-                        diagnostic = self._diagnostic(
-                            entry,
-                            "publication-content-proof-missing",
-                            "archived ExecPlan의 게시 본문 hash를 확인할 수 없습니다: "
-                            f"{entry.path}",
-                        )
-                    else:
-                        if not trusted_identity:
-                            original_hash = proof.publication_content_hash
-                        publication_mismatch = (
-                            proof.publication_content_hash != original_hash
-                        )
-                        current_mismatch = not final_content_matches(
-                            entry.content_hash,
-                            current_hash if trusted_identity
-                            else proof.publication_content_hash,
-                        )
-                        if publication_mismatch or current_mismatch:
-                            diagnostic = self._diagnostic(
-                                entry,
-                                "archived-content-hash-mismatch",
-                                "archived ExecPlan byte hash가 게시 revision 또는 "
-                                "마지막 동기화 본문 hash와 다릅니다: "
-                                f"{entry.path}",
-                            )
 
             self.repository.record(
                 repo,
