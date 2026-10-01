@@ -16,7 +16,7 @@ import subprocess
 import tomllib
 from typing import Callable
 
-from agent_codex_sandbox import CodexLaunch, prepare_launch
+from agent_codex_sandbox import CODEX_EXTENSION_ARGUMENTS, CodexLaunch, prepare_launch
 
 
 class IsolationError(RuntimeError):
@@ -146,7 +146,7 @@ def _codex_config_files(worktree: Path) -> tuple[Path, ...]:
 
 
 def _assert_no_codex_extensions(worktree: Path) -> None:
-    """Configured tools and hooks do not share the shell sandbox probe."""
+    """Reject external tools not disabled by the managed feature policy."""
     for path in _codex_config_files(worktree):
         try:
             with path.open("rb") as stream:
@@ -156,11 +156,15 @@ def _assert_no_codex_extensions(worktree: Path) -> None:
         except (OSError, tomllib.TOMLDecodeError) as error:
             raise IsolationError("Codex 확장 설정을 확인할 수 없습니다.") from error
         if any(configuration.get(name) for name in
-               ("mcp_servers", "plugins", "hooks", "notify", "profile", "profiles",
+               ("mcp_servers", "hooks", "notify", "profile", "profiles",
                 "permissions", "default_permissions")):
             raise IsolationError(
                 "Codex MCP·plugin·hook·profile·permissions 설정이 있어 쓰기 격리를 검증할 수 없습니다."
             )
+        if path.name == 'requirements.toml' and any(
+            configuration.get('features', {}).get(name) is True for name in ('plugins', 'apps')
+        ):
+            raise IsolationError('Codex 관리 정책이 확장 도구 활성화를 요구합니다.')
 
 
 def _assert_no_codex_execpolicy(worktree: Path) -> None:
@@ -183,6 +187,7 @@ def _assert_no_codex_execpolicy(worktree: Path) -> None:
 def _codex_configuration(read_only: bool) -> tuple[str, ...]:
     mode = "read-only" if read_only else "workspace-write"
     return (
+        *CODEX_EXTENSION_ARGUMENTS,
         "-c", f'sandbox_mode="{mode}"',
         "-c", 'approvals_reviewer="auto_review"',
         "-c", "approval_policy={granular={sandbox_approval=false,request_permissions=false,"

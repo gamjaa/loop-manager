@@ -13,6 +13,8 @@ import subprocess
 import sys
 import tempfile
 
+CODEX_EXTENSION_ARGUMENTS = ('-c', 'features.plugins=false', '-c', 'features.apps=false')
+
 
 @dataclass(frozen=True)
 class CodexLaunch:
@@ -46,6 +48,19 @@ class CodexLaunch:
             process.wait()
 
     def probe(self) -> None:
+        feature_result = subprocess.run(
+            ('codex', *CODEX_EXTENSION_ARGUMENTS, 'features', 'list'),
+            cwd=json.loads(self.specification)['worktree'], env=self.environment,
+            capture_output=True, text=True, timeout=30, check=False)
+        feature_states = {}
+        for line in feature_result.stdout.splitlines():
+            fields = line.split()
+            if fields and fields[0] in ('plugins', 'apps'):
+                if fields[0] in feature_states or len(fields) < 3:
+                    raise RuntimeError('Codex 확장 도구 비활성화 결과를 확인할 수 없습니다.')
+                feature_states[fields[0]] = fields[-1]
+        if feature_result.returncode or feature_states != {'plugins': 'false', 'apps': 'false'}:
+            raise RuntimeError('Codex 확장 도구 비활성화 결과를 확인할 수 없습니다.')
         result = subprocess.run(self.probe_arguments, cwd=json.loads(self.specification)['worktree'],
                                 env=self.environment,
                                 capture_output=True, text=True, timeout=30, check=False)
@@ -138,6 +153,7 @@ def prepare_launch(boundary, state_dir: Path, role: str, read_only: bool,
         for path, access in permissions.items()
     ) + "}"
     probe_arguments = ('codex', 'sandbox', '-C', str(boundary.worktree),
+              *CODEX_EXTENSION_ARGUMENTS,
               '--permission-profile', 'loop-manager-tools', '--include-managed-config',
               '-c', 'permissions.loop-manager-tools.filesystem=' + filesystem,
               '-c', 'permissions.loop-manager-tools.network.enabled=false',

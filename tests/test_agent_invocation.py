@@ -70,6 +70,8 @@ class WriteIsolationTests(TestCase):
         self.assertIn('sandbox_workspace_write.exclude_slash_tmp=true', args)
         self.assertIn('sandbox_workspace_write.exclude_tmpdir_env_var=true', args)
         self.assertIn('mcp_servers={}', args)
+        self.assertIn('features.plugins=false', args)
+        self.assertIn('features.apps=false', args)
         self.assertNotIn('--approve-for-me', args)
         self.assertIn('--ignore-rules', args)
         self.assertEqual(args[args.index('--sandbox') + 1], 'workspace-write')
@@ -98,13 +100,37 @@ class WriteIsolationTests(TestCase):
                 config.write_text('model = "test"\n', encoding='utf-8')
                 isolation._assert_no_codex_extensions(root)
                 for setting in ('[mcp_servers.external]\ncommand = "tool"\n',
-                                '[plugins.external]\nenabled = true\n',
                                 'notify = ["external-command"]\n',
                                 'default_permissions = "broad"\n',
                                 '[permissions.broad.filesystem]\n"/" = "write"\n'):
                     config.write_text(setting, encoding='utf-8')
                     with self.assertRaisesRegex(isolation.IsolationError, 'MCP'):
                         isolation._assert_no_codex_extensions(root)
+
+    def test_personal_plugin_registration_is_disabled_without_config_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / 'config.toml'
+            content = '[plugins."github@openai-curated"]\nenabled = true\n'
+            config.write_text(content)
+            with mock.patch.object(isolation, '_codex_config_files', return_value=(config,)):
+                isolation._assert_no_codex_extensions(root)
+            self.assertEqual(config.read_text(), content)
+            for read_only in (True, False):
+                args = isolation.codex_arguments(read_only)
+                self.assertIn('features.plugins=false', args)
+                self.assertIn('features.apps=false', args)
+
+    def test_managed_requirements_cannot_force_extensions_on(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / 'requirements.toml'
+            for feature in ('plugins', 'apps'):
+                with self.subTest(feature=feature):
+                    config.write_text('[features]\n' + feature + '=true\n')
+                    with mock.patch.object(isolation, '_codex_config_files', return_value=(config,)):
+                        with self.assertRaisesRegex(isolation.IsolationError, '활성화'):
+                            isolation._assert_no_codex_extensions(root)
 
     def test_selected_codex_home_does_not_inherit_config_above_git_root(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -488,6 +514,9 @@ class NativeWriteIsolationTests(TestCase):
             self.assertIn(str(boundary.worktree / '.git'), policy['protected'])
             self.assertEqual(launch.probe_arguments[:2], ('codex', 'sandbox'))
             self.assertIn('--include-managed-config', launch.probe_arguments)
+            for args in (launch.probe_arguments, launch.arguments):
+                self.assertIn('features.plugins=false', args)
+                self.assertIn('features.apps=false', args)
             self.assertEqual(launch.probe_arguments[launch.probe_arguments.index('-C') + 1],
                              str(boundary.worktree))
             self.assertNotIn('exec', launch.probe_arguments)
@@ -543,10 +572,31 @@ class NativeWriteIsolationTests(TestCase):
                                      Path('/attempt'), '{"worktree":"/selected"}')
         for code, output in ((1, ''), (0, '{}'), (0, 'agent-tool-boundary-v2 extra')):
             with self.subTest(code=code, output=output), \
-                 mock.patch.object(envelope.subprocess, 'run', return_value=
-                                   manager.subprocess.CompletedProcess([], code, output, '')):
+                 mock.patch.object(envelope.subprocess, 'run', side_effect=(
+                                   manager.subprocess.CompletedProcess([], 0, 'plugins stable false\napps stable false\n', ''),
+                                   manager.subprocess.CompletedProcess([], code, output, ''))):
                 with self.assertRaisesRegex(RuntimeError, '확인할 수 없습니다'):
                     launch.probe()
+
+    def test_effective_extensions_must_be_disabled_before_native_probe(self):
+        launch = envelope.CodexLaunch((), ('codex', 'sandbox'), {'CODEX_HOME': '/owned'},
+                                     Path('/runtime'), Path('/attempt'), '{"worktree":"/selected"}')
+        for output in ('plugins stable true\napps stable false\n',
+                       'plugins stable false\n',
+                       'plugins stable false\nplugins stable false\napps stable false\n'):
+            with self.subTest(output=output), mock.patch.object(envelope.subprocess, 'run',
+                    return_value=manager.subprocess.CompletedProcess([], 0, output, '')) as run:
+                with self.assertRaisesRegex(RuntimeError, '확장 도구'):
+                    launch.probe()
+                self.assertEqual(run.call_count, 1)
+        with mock.patch.object(envelope.subprocess, 'run', side_effect=(
+                manager.subprocess.CompletedProcess([], 0, 'plugins stable false\napps stable false\n', ''),
+                manager.subprocess.CompletedProcess([], 0, 'agent-tool-boundary-v2\n', ''))) as run:
+            launch.probe()
+            self.assertEqual(run.call_count, 2)
+            for call in run.call_args_list:
+                self.assertEqual(call.kwargs['cwd'], '/selected')
+                self.assertEqual(call.kwargs['env'], launch.environment)
 
     def test_probe_never_executes_provider_and_fails_closed(self):
         specification = json.dumps({'writable': [], 'protected': [], 'files': []})
@@ -620,6 +670,8 @@ class NativeWriteIsolationTests(TestCase):
                 def run(command, **kwargs):
                     if command == ['codex', '--version']:
                         return manager.subprocess.CompletedProcess(command, 0, 'version', '')
+                    if tuple(command[-2:]) == ('features', 'list'):
+                        return manager.subprocess.CompletedProcess(command, 0, 'plugins stable false\napps stable false\n', '')
                     self.assertEqual(list(command[:2]), ['codex', 'sandbox'] if 'exec' not in command
                                      else ['codex', 'exec'])
                     commands.append(command)
@@ -794,6 +846,8 @@ class NativeWriteIsolationTests(TestCase):
             def run(command, **kwargs):
                 if command == ['codex', '--version']:
                     return manager.subprocess.CompletedProcess(command, 0, 'version', '')
+                if tuple(command[-2:]) == ('features', 'list'):
+                    return manager.subprocess.CompletedProcess(command, 0, 'plugins stable false\napps stable false\n', '')
                 return manager.subprocess.CompletedProcess(command, 0, 'agent-tool-boundary-v2\n', '')
 
             def start(command, **kwargs):
@@ -835,6 +889,8 @@ class NativeWriteIsolationTests(TestCase):
             def run(command, **kwargs):
                 if command == ['codex', '--version']:
                     return manager.subprocess.CompletedProcess(command, 0, 'version', '')
+                if tuple(command[-2:]) == ('features', 'list'):
+                    return manager.subprocess.CompletedProcess(command, 0, 'plugins stable false\napps stable false\n', '')
                 if 'exec' not in command:
                     return manager.subprocess.CompletedProcess(command, 0, 'agent-tool-boundary-v2\n', '')
                 kwargs['stdout'].write('agent write boundary verification failed')
@@ -952,6 +1008,8 @@ class RuntimeReadOnlyIsolationTests(TestCase):
             def run(command, **kwargs):
                 if command == ['codex', '--version']:
                     return manager.subprocess.CompletedProcess(command, 0, 'version', '')
+                if tuple(command[-2:]) == ('features', 'list'):
+                    return manager.subprocess.CompletedProcess(command, 0, 'plugins stable false\napps stable false\n', '')
                 return manager.subprocess.CompletedProcess(command, 0, 'agent-tool-boundary-v2\n', '')
 
             def execute(command, **kwargs):
