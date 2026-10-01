@@ -429,6 +429,87 @@ class ProjectCatalogRefreshTest(unittest.TestCase):
                         self.connection, Path(self.repo), self.repo, self.sha))
         self.assertEqual(dict(self.row()), before)
 
+    def test_closed_pr_merge_conflict_reconciles_before_merge_observation(self):
+        active = 'docs/plans/[G-001] Updated.md'
+        archived = 'docs/plans/archive/[G-001] Old.md'
+        documents = {**self.documents, archived: self.fixture._text('G-001', 'Old')}
+        self.connection.execute(
+            "UPDATE exec_plans SET status='PLAN_BLOCKED', blocked_reason=?, pr_head_oid=? WHERE plan_id='G-001'",
+            (manager.PR_CLOSED_BLOCK_REASON, 'd'*40))
+        self.connection.commit()
+        proof = {'state': 'MERGED', 'baseRefName': 'main', 'headRefName': 'branch',
+                 'headRefOid': 'd'*40, 'url': 'https://example/pr/1'}
+        with mock.patch.object(manager, '_git_tree_entries', return_value={
+                path.encode(): () for path in documents}), \
+             mock.patch.object(manager, 'pr_for_branch', return_value=proof), \
+             mock.patch.object(manager, 'complete_merged_execplan_worktree',
+                               return_value=SimpleNamespace(status='missing')) as cleanup, \
+             mock.patch.object(manager, '_recorded_base_fetch'):
+            for field, value in (('baseRefName', 'other'), ('headRefName', 'other'),
+                                 ('headRefOid', 'other'), ('url', 'other')):
+                with mock.patch.object(manager, 'pr_for_branch', return_value={**proof, field: value}):
+                    self.assertNotIn('G-001', manager._catalog_archive_conflict_ids(
+                        self.connection, Path(self.repo), self.repo, self.sha))
+            confirmed = manager._catalog_archive_conflict_ids(
+                self.connection, Path(self.repo), self.repo, self.sha)
+            self.assertIn('G-001', confirmed)
+            snapshot = catalog.snapshot_from_documents(
+                documents, revision_sha=self.sha, archive_conflict_plan_ids=confirmed,
+                validate_sources=True, available_regular_paths=self.paths | {archived})
+            self.assertEqual(snapshot.active['G-001'].path, active)
+            self.assertNotIn('G-001', snapshot.archived)
+            result = state.CatalogReconciliationService(
+                state.DefinitionStateRepository(self.connection), fixtures.FakeDefinitionPort(
+                    state.PinnedCatalog(self.sha, snapshot, self.paths | {archived}))
+            ).reconcile(self.repo)
+            self.assertEqual(result.kind, state.ReconciliationKind.RECONCILED)
+            self.assertEqual(self.row()['status'], 'PLAN_BLOCKED')
+            self.assertEqual(self.row()['blocked_reason'], manager.PR_CLOSED_BLOCK_REASON)
+            observation = manager.observe_waiting_pull_requests(
+                self.connection, Path(self.repo), Path('/state'), self.repo)
+            self.assertTrue(observation.merged)
+            cleanup.assert_called_once()
+            self.assertEqual(cleanup.call_args.args[4]['plan_id'], 'G-001')
+            self.connection.execute(
+                "UPDATE exec_plans SET blocked_reason='unrelated safety block' WHERE plan_id='G-001'")
+            self.connection.commit()
+            self.assertNotIn('G-001', manager._catalog_archive_conflict_ids(
+                self.connection, Path(self.repo), self.repo, self.sha))
+
+    def test_new_pr_head_safety_block_prevents_followup_git_and_consumers(self):
+        def observe_reopened_pr():
+            self.connection.execute(
+                "UPDATE exec_plans SET status='PLAN_BLOCKED', ever_started=1, blocked_reason=?, "
+                "branch='branch', pr_url='https://example/pr/1', pr_head_oid=? WHERE plan_id='G-001'",
+                (manager.PR_CLOSED_BLOCK_REASON, 'd'*40))
+            self.connection.commit()
+            # Capture the step's mocks before invoking the real PR observer.
+            self.followup_fetch = manager._recorded_base_fetch
+            self.source_sync = manager.ensure_safe_base_worktree
+            manager.observe_waiting_pull_requests(
+                self.connection, Path(self.repo), Path('/state'), self.repo)
+            block = manager.scoped_blocking.project_block(self.connection, self.repo)
+            self.assertEqual(block['reason_code'],
+                             manager.BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value)
+            self.block_evidence = block['evidence']
+        with mock.patch.object(manager, 'pr_for_branch', return_value={
+                'state': 'OPEN', 'headRefOid': 'c'*40, 'headRefName': 'branch',
+                'baseRefName': 'main', 'url': 'https://example/pr/1'}), \
+             mock.patch.object(manager, 'resume_project_block_if_safe', return_value=False), \
+             mock.patch.object(manager, 'dispatch_execplan_archive_housekeeping') as archive, \
+             mock.patch.object(manager, 'run_agent') as agent:
+            self.assertEqual(self.run_step(pr=observe_reopened_pr), 1)
+        self.assertEqual(self.events, ['fetch', 'catalog', 'pr'])
+        self.followup_fetch.assert_not_called()
+        self.source_sync.assert_not_called()
+        archive.assert_not_called()
+        agent.assert_not_called()
+        self.assertEqual(self.row()['status'], 'PLAN_BLOCKED')
+        self.assertEqual(self.row()['blocked_reason'], manager.PR_CLOSED_BLOCK_REASON)
+        self.assertEqual(self.row()['pr_head_oid'], 'd'*40)
+        block = manager.scoped_blocking.project_block(self.connection, self.repo)
+        self.assertEqual(block['evidence'], self.block_evidence)
+
     def test_archive_refresh_rechecks_safety_before_preparing_or_publishing(self):
         self.boundary.refresh()
         port = mock.Mock()

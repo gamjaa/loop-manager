@@ -2301,7 +2301,8 @@ def _catalog_archive_conflict_ids(
     """Use read-only, identity-bound PR evidence for archive path conflicts.
 
     Declaration validation precedes PR transitions. A newly merged PR may
-    therefore still be PR_OPEN in SQLite when its archive collision is read.
+    therefore still be PR_OPEN or blocked on a previously closed PR in SQLite
+    when its archive collision is read.
     This proof permits only the existing collision diagnostic, never cleanup
     or an execution-state transition.
     """
@@ -2318,7 +2319,12 @@ def _catalog_archive_conflict_ids(
             "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
             (repo, plan_id),
         ).fetchone()
-        if plan is None or plan["status"] != "PR_OPEN" or not plan["branch"]:
+        if plan is None or not plan["branch"]:
+            continue
+        if not (plan["status"] == "PR_OPEN" or (
+            plan["status"] == "PLAN_BLOCKED"
+            and plan["blocked_reason"] == PR_CLOSED_BLOCK_REASON
+        )):
             continue
         pull_request = pr_for_branch(repo_path, str(plan["branch"]), plan["pr_url"])
         if pull_request is None:
@@ -22171,6 +22177,9 @@ def _run_project_step(
 
     def synchronize_source_after_pr_reconciliation() -> None:
         nonlocal base_sha
+        # PR observation can introduce a new ownership safety block.
+        if scoped_blocking.project_block(connection, repo) is not None:
+            return
         # Read the durable project state after all PR transitions and cleanup.
         current_project = connection.execute(
             "SELECT * FROM projects WHERE repo = ?", (repo,)
