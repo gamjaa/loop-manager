@@ -38,9 +38,10 @@ G-088 establishes verifiable Agent write isolation, but R-023 also requires Code
 
 ## Progress
 
-- [ ] Effective provider auto-review policy and per-call validation
-- [ ] Fail-closed invocation and resume behavior
-- [ ] Focused provider-policy regression tests
+- [x] Effective provider auto-review policy and per-call validation
+- [x] Fail-closed invocation and resume behavior
+- [x] Focused provider-policy regression tests
+- Current rebased candidate: 46 targeted unit cases passed in 0.300s. The selection covers `WriteIsolationTests`, `NativeWriteIsolationTests`, the read-only runtime document-generation case and eight provider policy/profile/auth/resume cases in `tests/test_loop_manager.py`. Manager full verification and independent Review are still pending.
 
 ## Decision Log
 
@@ -48,3 +49,4 @@ G-088 establishes verifiable Agent write isolation, but R-023 also requires Code
 - 2026-10-01: The user approved direct codex exec with native workspace restrictions and requested an immediate hotfix to remove the nested sandbox blocker. The direct-exec decision supersedes the pending nested-runtime restoration proposal. Preserve existing G-097 sessions, worktree and audit history; reconcile the old transport implementation with the hotfix and complete any remaining provider policy work through the normal verification and Review gates.
 - 2026-10-01: The direct-exec hotfix was implemented in commit 06862bf and 39 directly affected unit cases passed. The manually executed hotfix plan is excluded from the published catalog so it cannot create a duplicate READY job. This existing plan retains its identity, sessions and execution history; Manager full verification and independent Review remain required.
 - 2026-10-01: Actual G-107 recovery exposed a personal GitHub plugin registration that stopped the managed call. Managed Codex exec and its native probe now explicitly disable plugins and apps without editing personal configuration. A separate effective-feature check requires both to be false before the filesystem probe; enabled managed requirements and other external tool settings still fail closed. The 42 directly affected unit cases pass. The local hotfix plan remains outside the published catalog.
+- 2026-10-01: Reconciled the rebased candidate with direct exec by removing unused app-server policy modules and their unused confirmation API. The supported Codex baseline is the installed 0.159.3; unknown or older versions reject preflight. Policy failures stop before transport retry or session fallback, while normal provider recovery remains available. Failed/interrupted legacy `prepared` records are invalidated without deleting sessions or audit history. Claude arguments now request `auto` with strict sandbox settings, following the official [permissions](https://code.claude.com/docs/en/permissions) and [sandbox](https://code.claude.com/docs/en/sandboxing) contracts; managed Claude calls remain blocked when their file-tool boundary cannot be proven. No app-server effective-field or nested compatibility requirement was restored.

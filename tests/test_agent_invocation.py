@@ -63,6 +63,8 @@ class WriteIsolationTests(TestCase):
                         isolation.inspect_worktree(selected, state_root)
 
     def test_codex_policy_preserves_auto_review_and_denies_broad_writes(self):
+        import tomllib
+
         args = isolation.codex_arguments(False)
         self.assertIn('approvals_reviewer="auto_review"', args)
         self.assertTrue(any('sandbox_approval=false' in item and
@@ -76,6 +78,40 @@ class WriteIsolationTests(TestCase):
         self.assertIn('--ignore-rules', args)
         self.assertEqual(args[args.index('--sandbox') + 1], 'workspace-write')
         self.assertEqual(isolation.codex_arguments(True)[1], 'read-only')
+        for read_only in (False, True):
+            policy = next(arg for arg in isolation.codex_arguments(read_only)
+                          if arg.startswith('approval_policy='))
+            self.assertEqual(tomllib.loads(policy)['approval_policy'], {'granular': {
+                'sandbox_approval': False, 'request_permissions': False,
+                'rules': True, 'mcp_elicitations': True, 'skill_approval': True,
+            }})
+
+    def test_unsupported_codex_version_rejects_before_native_probe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            boundary = isolation.WorktreeBoundary(root, root / 'source', (),
+                                                   root / 'git', root / 'common', 'repo')
+            for version in ('codex-cli 0.159.2', 'codex-cli 0.158.0', 'unknown'):
+                for session in (None, 'saved-session'):
+                    with self.subTest(version=version, session=session):
+                        records = []
+                        with mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
+                             mock.patch.object(isolation, '_configuration_digest', return_value='config'), \
+                             mock.patch.object(isolation, '_assert_no_codex_execpolicy'), \
+                             mock.patch.object(isolation, '_assert_no_codex_extensions'), \
+                             mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
+                             mock.patch.object(isolation.subprocess, 'run', return_value=
+                                               manager.subprocess.CompletedProcess([], 0, version, '')), \
+                             mock.patch.object(isolation, 'prepare_launch') as launch:
+                            with self.assertRaisesRegex(isolation.IsolationError, '자동 검토 버전'):
+                                isolation.prepare_isolation(
+                                    'codex', 'worker', root, root, False, records.append,
+                                    lambda: 'snapshot', expected_repository=str(boundary.source),
+                                    session_id=session, environment_variables={})
+                        launch.assert_not_called()
+                        self.assertEqual(records[0].status, 'rejected')
+                        self.assertEqual(records[0].cli_version, version)
+                        self.assertEqual(records[0].snapshot_digest, 'snapshot')
 
     def test_execpolicy_rule_blocks_unproven_sandbox_bypass(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -183,13 +219,13 @@ class WriteIsolationTests(TestCase):
             with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(provider_home)}):
                 digest = isolation._configuration_digest('codex', root, root / 'config')
                 evidence = isolation.IsolationEvidence(
-                    'codex', 'codex version', 'Linux:x:y', 'worker', str(root),
+                    'codex', 'codex-cli 0.159.3', 'Linux:x:y', 'worker', str(root),
                     'repository', 'policy', 'verified', snapshot_digest='snapshot',
                     configuration_digest=digest)
                 with mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
                      mock.patch.object(isolation.subprocess, 'run', return_value=
                                        manager.subprocess.CompletedProcess(
-                                           ['codex', '--version'], 0, 'codex version\n', '')):
+                                           ['codex', '--version'], 0, 'codex-cli 0.159.3\n', '')):
                     isolation.assert_current(evidence, root, root, root / 'config',
                                              str(root / 'source'), False,
                                              lambda: 'snapshot')
@@ -216,7 +252,7 @@ class WriteIsolationTests(TestCase):
                  mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
                  mock.patch.object(isolation.subprocess, 'run', return_value=
                                    manager.subprocess.CompletedProcess(
-                                       ['codex', '--version'], 0, 'codex version\n', '')):
+                                       ['codex', '--version'], 0, 'codex-cli 0.159.3\n', '')):
                 for session in (None, 'resume-session'):
                     result = isolation.prepare_isolation(
                         'codex', 'worker', root, root, False, records.append,
@@ -251,7 +287,7 @@ class WriteIsolationTests(TestCase):
                                    mock.Mock(serialize=lambda: 'snapshot')), \
                  mock.patch.object(isolation.subprocess, 'run', return_value=
                                    manager.subprocess.CompletedProcess(
-                                       ['codex', '--version'], 0, 'codex version\n', '')), \
+                                       ['codex', '--version'], 0, 'codex-cli 0.159.3\n', '')), \
                  mock.patch.object(manager.subprocess, 'Popen') as launch:
                 with self.assertRaisesRegex(isolation.IsolationError, '파일 도구'):
                     manager.run_agent(
@@ -286,7 +322,7 @@ class WriteIsolationTests(TestCase):
                  mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
                  mock.patch.object(isolation, 'prepare_launch', return_value=launch), \
                  mock.patch.object(isolation.subprocess, 'run', return_value=
-                                   manager.subprocess.CompletedProcess([], 0, 'version', '')):
+                                   manager.subprocess.CompletedProcess([], 0, 'codex-cli 0.159.3', '')):
                 with self.assertRaisesRegex(isolation.IsolationError, 'sandbox unavailable'):
                     isolation.prepare_isolation(
                         'codex', 'worker', root, root, False, records.append,
@@ -300,31 +336,40 @@ class WriteIsolationTests(TestCase):
             root = Path(directory)
             boundary = isolation.WorktreeBoundary(root, root / 'source', (),
                                                    root / 'git', root / 'common', 'repo')
-            records = []
             with mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
-                 mock.patch.object(isolation.platform, 'system', return_value='Linux'):
-                with self.assertRaisesRegex(isolation.IsolationError, 'claude'):
-                    isolation.prepare_isolation('claude', 'worker', root, root,
-                                                False, records.append, lambda: 'snapshot',
-                                                expected_repository=str(root / 'source'))
-            self.assertEqual(records[0].status, 'rejected')
-            self.assertEqual(records[0].repository_identity, 'repo')
+                 mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
+                 mock.patch.object(isolation.subprocess, 'run') as run:
+                for role in ('planner', 'worker', 'maintenance', 'reviewer'):
+                    for session in (None, 'saved-session'):
+                        with self.subTest(role=role, session=session):
+                            records = []
+                            with self.assertRaisesRegex(isolation.IsolationError, 'claude'):
+                                isolation.prepare_isolation(
+                                    'claude', role, root, root, role == 'reviewer',
+                                    records.append, lambda: 'snapshot',
+                                    expected_repository=str(root / 'source'), session_id=session)
+                            self.assertEqual(records[0].status, 'rejected')
+                            self.assertEqual(records[0].repository_identity, 'repo')
+                            self.assertEqual(records[0].role, role)
+                run.assert_not_called()
 
-    def test_native_windows_records_rejection_before_codex_probe(self):
+    def test_native_windows_records_rejection_before_provider_probe(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             boundary = isolation.WorktreeBoundary(root, root / 'source', (),
                                                    root / 'git', root / 'common', 'repo')
-            records = []
             with mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
                  mock.patch.object(isolation.platform, 'system', return_value='Windows'), \
                  mock.patch.object(isolation, 'prepare_launch') as probe:
-                with self.assertRaisesRegex(isolation.IsolationError, 'Windows'):
-                    isolation.prepare_isolation(
-                        'codex', 'worker', root, root, False, records.append,
-                        lambda: 'snapshot', expected_repository=str(root / 'source'))
+                for provider in ('codex', 'claude'):
+                    with self.subTest(provider=provider):
+                        records = []
+                        with self.assertRaisesRegex(isolation.IsolationError, 'Windows'):
+                            isolation.prepare_isolation(
+                                provider, 'worker', root, root, False, records.append,
+                                lambda: 'snapshot', expected_repository=str(root / 'source'))
+                        self.assertEqual(records[0].status, 'rejected')
             probe.assert_not_called()
-            self.assertEqual(records[0].status, 'rejected')
 
     def test_rejected_preflight_stops_adapter_and_persists_attempt(self):
         connection = sqlite3.connect(':memory:')
@@ -459,20 +504,46 @@ class WriteIsolationTests(TestCase):
         self.addCleanup(connection.close)
         state.ensure_schema(connection)
         ledger = state.InvocationRepository(connection)
-        identity = ledger.start(invocation.InvocationContext('repo', 'G-088'),
-                                'worker', 'codex',
-                                invocation.ResolvedProfile('model', 'high'),
-                                'saved-session')
-        evidence = isolation.IsolationEvidence(
-            'codex', 'version', 'Linux:x:y', 'worker', '/worktree', 'repo',
-            'policy', 'verified', snapshot_digest='snapshot')
-        ledger.record_isolation(identity, evidence)
-        self.assertEqual(ledger.reconcile_interrupted(), 1)
-        row = connection.execute('''SELECT status, reason FROM agent_isolation_evidence
-            WHERE invocation_id = ?''', (identity,)).fetchone()
-        self.assertEqual(row, ('invalidated', 'agent_attempt_interrupted'))
-        self.assertFalse(ledger.verified_invocation(identity, session_id='saved-session',
-                                                    expected=evidence))
+        for status in ('verified', 'prepared'):
+            with self.subTest(status=status):
+                identity = ledger.start(invocation.InvocationContext('repo', 'G-088'),
+                                        'worker', 'codex',
+                                        invocation.ResolvedProfile('model', 'high'),
+                                        'saved-session')
+                evidence = isolation.IsolationEvidence(
+                    'codex', 'version', 'Linux:x:y', 'worker', '/worktree', 'repo',
+                    'policy', status, snapshot_digest='snapshot')
+                ledger.record_isolation(identity, evidence)
+                self.assertEqual(ledger.reconcile_interrupted(), 1)
+                row = connection.execute('''SELECT status, reason FROM agent_isolation_evidence
+                    WHERE invocation_id = ?''', (identity,)).fetchone()
+                self.assertEqual(row, ('invalidated', 'agent_attempt_interrupted'))
+                self.assertFalse(ledger.verified_invocation(identity, session_id='saved-session',
+                                                            expected=evidence))
+                session = connection.execute('''SELECT session_id FROM agent_invocations
+                    WHERE invocation_id = ?''', (identity,)).fetchone()[0]
+                self.assertEqual(session, 'saved-session')
+
+    def test_failed_legacy_preparation_invalidates_only_its_own_evidence(self):
+        connection = sqlite3.connect(':memory:')
+        self.addCleanup(connection.close)
+        state.ensure_schema(connection)
+        ledger = state.InvocationRepository(connection)
+        identities = []
+        for session in ('saved-session', 'other-session'):
+            identity = ledger.start(invocation.InvocationContext('repo', 'G-097'),
+                                    'worker', 'codex',
+                                    invocation.ResolvedProfile('model', 'high'), session)
+            identities.append(identity)
+            ledger.record_isolation(identity, isolation.IsolationEvidence(
+                'codex', 'version', 'Linux:x:y', 'worker', '/worktree', 'repo',
+                'policy', 'prepared', snapshot_digest='snapshot'))
+        ledger.finish(identities[0], 'exception', None, 1, None, invocation.Usage())
+        rows = connection.execute('''SELECT call.session_id, proof.status, proof.reason
+            FROM agent_invocations call JOIN agent_isolation_evidence proof USING(invocation_id)
+            ORDER BY call.started_at''').fetchall()
+        self.assertEqual(rows, [('saved-session', 'invalidated', 'agent_attempt_not_successful'),
+                                ('other-session', 'prepared', '')])
 
 
 @skipUnless(isolation.platform.system() == "Linux", "native tool policy probe requires Linux")
@@ -658,9 +729,11 @@ class NativeWriteIsolationTests(TestCase):
             self.assertEqual(list(source.iterdir()), [preserved])
 
     def test_actual_adapter_runs_direct_roles_and_resume_and_persists_evidence(self):
-        for role, read_only, session in (('planner', False, None), ('worker', False, 'saved'),
-                                        ('reviewer', True, None), ('maintenance', False, None)):
-            with self.subTest(role=role), tempfile.TemporaryDirectory() as directory:
+        cases = ((role, role == 'reviewer', session)
+                 for role in ('planner', 'worker', 'reviewer', 'maintenance')
+                 for session in (None, 'saved'))
+        for role, read_only, session in cases:
+            with self.subTest(role=role, session=session), tempfile.TemporaryDirectory() as directory:
                 boundary, state_root, home = self.boundary(Path(directory))
                 connection = sqlite3.connect(':memory:')
                 self.addCleanup(connection.close)
@@ -669,7 +742,7 @@ class NativeWriteIsolationTests(TestCase):
 
                 def run(command, **kwargs):
                     if command == ['codex', '--version']:
-                        return manager.subprocess.CompletedProcess(command, 0, 'version', '')
+                        return manager.subprocess.CompletedProcess(command, 0, 'codex-cli 0.159.3', '')
                     if tuple(command[-2:]) == ('features', 'list'):
                         return manager.subprocess.CompletedProcess(command, 0, 'plugins stable false\napps stable false\n', '')
                     self.assertEqual(list(command[:2]), ['codex', 'sandbox'] if 'exec' not in command
@@ -711,6 +784,62 @@ class NativeWriteIsolationTests(TestCase):
                     FROM agent_isolation_evidence proof JOIN agent_invocations call USING(invocation_id)''').fetchone()
                 self.assertEqual(row, ('verified', 'success', session))
 
+    def test_session_unavailable_fallback_rechecks_direct_policy_without_losing_history(self):
+        for role in ('planner', 'worker', 'maintenance', 'reviewer'):
+            with self.subTest(role=role), tempfile.TemporaryDirectory() as directory:
+                boundary, state_root, home = self.boundary(Path(directory))
+                connection = sqlite3.connect(':memory:')
+                self.addCleanup(connection.close)
+                state.ensure_schema(connection)
+                product = boundary.worktree / 'work-product.txt'
+                product.write_text('saved work product')
+                calls = []
+
+                def run(command, **kwargs):
+                    if command == ['codex', '--version']:
+                        return manager.subprocess.CompletedProcess(command, 0, 'codex-cli 0.159.3', '')
+                    if tuple(command[-2:]) == ('features', 'list'):
+                        return manager.subprocess.CompletedProcess(command, 0,
+                                                                  'plugins stable false\napps stable false\n', '')
+                    if command[:2] != ['codex', 'exec']:
+                        self.assertEqual(command[:2], ('codex', 'sandbox'))
+                        return manager.subprocess.CompletedProcess(command, 0, 'agent-tool-boundary-v2', '')
+                    calls.append(command)
+                    self.assertIn('approvals_reviewer="auto_review"', command)
+                    self.assertEqual(command[command.index('--sandbox') + 1],
+                                     'read-only' if role == 'reviewer' else 'workspace-write')
+                    self.assertNotIn('--approve-for-me', command)
+                    if 'resume' in command:
+                        kwargs['stdout'].write('thread saved-session not found\n')
+                        return manager.subprocess.CompletedProcess(command, 1)
+                    Path(command[command.index('-o') + 1]).write_text('completed')
+                    return manager.subprocess.CompletedProcess(command, 0)
+
+                attempts = invocation.AttemptSequence(str(boundary.source), 'G-097', 'revision')
+                invoke = invocation.TrackedAgentCall(
+                    lambda session, fallback, context: manager.run_agent(
+                        'codex', boundary.worktree, state_root, state_root / 'config', role, 'prompt',
+                        read_only=role == 'reviewer', session_id=session, connection=connection,
+                        resolved_profile=invocation.ResolvedProfile('model', 'high'), invocation=context),
+                    attempts)
+                with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
+                     mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
+                     mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
+                     mock.patch.object(manager, 'capture_git_snapshot', return_value=
+                                       mock.Mock(serialize=lambda: 'snapshot')), \
+                     mock.patch.object(isolation.subprocess, 'run', side_effect=run), \
+                     mock.patch.object(envelope.CodexLaunch, 'run', side_effect=run):
+                    result = manager.run_agent_with_retries(invoke, session_id='saved-session')
+                self.assertEqual(result.code, 0)
+                self.assertEqual(len(calls), 2)
+                rows = connection.execute('''SELECT call.session_id, call.transition, proof.status,
+                    proof.policy_digest FROM agent_invocations call JOIN agent_isolation_evidence proof
+                    USING(invocation_id) ORDER BY call.attempt''').fetchall()
+                self.assertEqual([row[:3] for row in rows],
+                                 [('saved-session', 'resume', 'invalidated'), (None, 'fallback', 'verified')])
+                self.assertNotEqual(rows[0][3], rows[1][3])
+                self.assertEqual(product.read_text(), 'saved work product')
+
     def test_handoff_after_preflight_blocks_native_spawn_and_invalidates_evidence(self):
         cases = (('reviewer', True, False, None),
                  ('worker', False, True, 'saved-session'),
@@ -735,7 +864,7 @@ class NativeWriteIsolationTests(TestCase):
                          mock.patch.object(manager, 'capture_git_snapshot', return_value=
                                            mock.Mock(serialize=lambda: 'snapshot')), \
                          mock.patch.object(isolation.subprocess, 'run', return_value=
-                                           manager.subprocess.CompletedProcess([], 0, 'version', '')), \
+                                           manager.subprocess.CompletedProcess([], 0, 'codex-cli 0.159.3', '')), \
                          mock.patch.object(envelope.CodexLaunch, 'probe', side_effect=handoff.stop) as probe, \
                          mock.patch.object(manager.subprocess, 'Popen') as spawn, \
                          mock.patch.object(envelope.os, 'killpg') as terminate:
@@ -797,7 +926,7 @@ class NativeWriteIsolationTests(TestCase):
                          mock.patch.object(manager, 'capture_git_snapshot', return_value=
                                            mock.Mock(serialize=lambda: 'snapshot')), \
                          mock.patch.object(isolation.subprocess, 'run', return_value=
-                                           manager.subprocess.CompletedProcess([], 0, 'version', '')), \
+                                           manager.subprocess.CompletedProcess([], 0, 'codex-cli 0.159.3', '')), \
                          mock.patch.object(envelope.CodexLaunch, 'probe'), \
                          mock.patch.object(manager.subprocess, 'Popen', side_effect=start) as spawn, \
                          mock.patch.object(envelope.os, 'killpg') as terminate:
@@ -845,7 +974,7 @@ class NativeWriteIsolationTests(TestCase):
 
             def run(command, **kwargs):
                 if command == ['codex', '--version']:
-                    return manager.subprocess.CompletedProcess(command, 0, 'version', '')
+                    return manager.subprocess.CompletedProcess(command, 0, 'codex-cli 0.159.3', '')
                 if tuple(command[-2:]) == ('features', 'list'):
                     return manager.subprocess.CompletedProcess(command, 0, 'plugins stable false\napps stable false\n', '')
                 return manager.subprocess.CompletedProcess(command, 0, 'agent-tool-boundary-v2\n', '')
@@ -888,7 +1017,7 @@ class NativeWriteIsolationTests(TestCase):
 
             def run(command, **kwargs):
                 if command == ['codex', '--version']:
-                    return manager.subprocess.CompletedProcess(command, 0, 'version', '')
+                    return manager.subprocess.CompletedProcess(command, 0, 'codex-cli 0.159.3', '')
                 if tuple(command[-2:]) == ('features', 'list'):
                     return manager.subprocess.CompletedProcess(command, 0, 'plugins stable false\napps stable false\n', '')
                 if 'exec' not in command:
@@ -1007,7 +1136,7 @@ class RuntimeReadOnlyIsolationTests(TestCase):
 
             def run(command, **kwargs):
                 if command == ['codex', '--version']:
-                    return manager.subprocess.CompletedProcess(command, 0, 'version', '')
+                    return manager.subprocess.CompletedProcess(command, 0, 'codex-cli 0.159.3', '')
                 if tuple(command[-2:]) == ('features', 'list'):
                     return manager.subprocess.CompletedProcess(command, 0, 'plugins stable false\napps stable false\n', '')
                 return manager.subprocess.CompletedProcess(command, 0, 'agent-tool-boundary-v2\n', '')

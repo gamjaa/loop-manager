@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import subprocess
 import tomllib
 from typing import Callable
@@ -245,6 +246,12 @@ def prepare_isolation(provider: str, role: str, worktree: Path, state_dir: Path,
         if result.returncode or not result.stdout.strip():
             raise IsolationError("Codex CLI 버전을 확인할 수 없습니다.")
         version = result.stdout.strip()
+        # The installed 0.159.3 baseline supports granular auto-review. Older
+        # CLIs may ignore unknown overrides, so a filesystem probe alone is
+        # insufficient. Direct exec still validates merged settings itself.
+        match = re.fullmatch(r"codex-cli (\d+)\.(\d+)\.(\d+)", version)
+        if not match or tuple(map(int, match.groups())) < (0, 159, 3):
+            raise IsolationError("Codex CLI가 지원되는 granular 자동 검토 버전이 아닙니다.")
         args = codex_arguments(read_only)
         if environment_variables is None:
             raise IsolationError("내장 도구 경계를 위한 필터된 Agent 환경이 없습니다.")

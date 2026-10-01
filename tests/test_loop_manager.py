@@ -18200,6 +18200,43 @@ class TimestampedExecutionProgressLogsTest(unittest.TestCase):
 
 
 class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
+    def test_policy_failure_stops_retry_and_session_fallback(self):
+        failures = (
+            "auto_review classifier unavailable: session not found; try again later",
+            "guardian review failed: usage limit reached; cannot resume",
+            "sandbox initialization failed: connection reset; thread not found",
+            "request_permissions denied: unknown session",
+            "approval policy invalid: service unavailable; cannot resume",
+            "automatic approval review disabled: session expired",
+            "guardian thread not found",
+            "invalid value auto for --permission-mode: cannot resume",
+        )
+        for message in failures:
+            for kind in (None, loop_manager.AgentResultKind.TRANSIENT_FAILURE):
+                with self.subTest(message=message, kind=kind):
+                    invoke = mock.Mock(return_value=loop_manager.AgentResult(
+                        1, message, "saved-session", kind))
+                    self.assertEqual(loop_manager.classify_agent_result(1, message),
+                                     loop_manager.AgentResultKind.PERMANENT_CONFIGURATION)
+                    self.assertFalse(loop_manager.session_resume_unavailable(message))
+                    result = loop_manager.run_agent_with_retries(invoke, session_id="saved-session")
+                    invoke.assert_called_once_with("saved-session", False)
+                    self.assertEqual(result.session_id, "saved-session")
+                    self.assertEqual(result.result_kind,
+                                     loop_manager.AgentResultKind.PERMANENT_CONFIGURATION)
+
+    def test_policy_banner_preserves_normal_transport_and_session_recovery(self):
+        banner = "approvals_reviewer: auto_review\nsandbox: workspace-write\n"
+        messages = (("service unavailable", loop_manager.AgentResultKind.TRANSIENT_FAILURE),
+                    ("usage limit reached", loop_manager.AgentResultKind.USAGE_LIMIT),
+                    ("session not found", loop_manager.AgentResultKind.PERMANENT_CONFIGURATION))
+        for message, kind in messages:
+            with self.subTest(message=message):
+                self.assertEqual(loop_manager.classify_agent_result(1, banner + message), kind)
+        self.assertTrue(loop_manager.session_resume_unavailable(banner + "session not found"))
+        self.assertEqual(loop_manager.classify_agent_result(0, "classifier unavailable"),
+                         loop_manager.AgentResultKind.SUCCESS)
+
     def test_legacy_project_migration_defaults_provider_to_codex(self):
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
@@ -18488,7 +18525,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
             start_arguments[
                 start_arguments.index("--permission-mode") + 1
             ],
-            "acceptEdits",
+            "auto",
         )
         self.assertNotIn("worker prompt", start_arguments)
         self.assertEqual(start_options["cwd"], worktree)
@@ -18498,10 +18535,18 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
             resume_arguments[
                 resume_arguments.index("--permission-mode") + 1
             ],
-            "plan",
+            "auto",
         )
         self.assertIn("--disallowedTools", resume_arguments)
         self.assertEqual(resume_options["cwd"], worktree)
+        for arguments in (start_arguments, resume_arguments):
+            settings = json.loads(arguments[arguments.index("--settings") + 1])
+            self.assertEqual(settings["permissions"]["defaultMode"], "auto")
+            self.assertEqual(settings["sandbox"], {
+                "enabled": True, "failIfUnavailable": True,
+                "allowUnsandboxedCommands": False, "autoAllowBashIfSandboxed": False,
+                "excludedCommands": [],
+            })
 
     def test_claude_planner_processes_do_not_force_bytecode_isolation(self):
         config = loop_manager.ROOT / "config/config.ini.example"

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+import re
 from typing import Callable
 
 from agent_write_isolation import IsolationEvidence
@@ -26,9 +27,28 @@ class AgentResultKind(str, Enum):
     PERMANENT_CONFIGURATION = "permanent_configuration"
 
 
+def approval_policy_failure(message: str) -> bool:
+    """Policy failures cannot become transport retries or session fallback."""
+    policy = (r"auto[_ -]?review|automatic (?:approval )?review|approval (?:review|policy)|"
+              r"approvals_reviewer|guardian|classifier|sandbox|request_permissions|"
+              r"permission[_ -](?:policy|mode)|"
+              r"자동 (?:승인 )?검토")
+    failure = (r"fail(?:ed|ure)?|error|unavailable|unsupported|disabled|denied|"
+               r"reject(?:ed|ion)?|conflict|invalid|cannot|could not|unable|"
+               r"not (?:available|supported|allowed|found|enabled)|does not exist|expired|"
+               r"timed? out|실패|거부|중단")
+    # Keep line boundaries: a normal sandbox banner followed by an unrelated
+    # network/quota error must retain the existing provider recovery behavior.
+    return bool(re.search(
+        rf"(?:{policy})[^\n]{{0,80}}(?:{failure})|"
+        rf"(?:{failure})[^\n]{{0,80}}(?:{policy})", message, re.I))
+
+
 def classify_agent_result(code: int, message: str) -> AgentResultKind:
     if code == 0:
         return AgentResultKind.SUCCESS
+    if approval_policy_failure(message):
+        return AgentResultKind.PERMANENT_CONFIGURATION
     normalized = " ".join(message.casefold().split())
     if any(phrase in normalized for phrase in (
         "usage limit", "usage cap", "quota exceeded", "insufficient_quota",
