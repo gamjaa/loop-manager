@@ -69,6 +69,27 @@ class ExecPlanCatalogStateTest(unittest.TestCase):
         ).reconcile("/repo", snapshot, stored or {})
         return result, port
 
+    def _record_verified_history(self, entry, *, original=None, final=None):
+        original = original or entry
+        final = final or entry
+        self.repository.record(
+            "/repo",
+            final,
+            original_path=original.active_path,
+            original_content_hash=original.content_hash,
+            plan_sha="a" * 40,
+            proof=execplan_catalog_state.MergeProof(
+                True,
+                kind=execplan_catalog_state.MergeProofKind.GITHUB_PR,
+                plan_sha="a" * 40,
+                publication_content_hash=original.content_hash,
+                revision="b" * 40,
+                pr_url="https://example.test/pr/1",
+            ),
+            diagnostic=None,
+            identity_verified=True,
+        )
+
     def test_recovers_archived_plan_only_with_merge_and_publication_proof(self):
         entry = archived_entry()
         proof = execplan_catalog_state.MergeProof(
@@ -222,6 +243,61 @@ class ExecPlanCatalogStateTest(unittest.TestCase):
         row = self.repository.historical_row("/repo", "G-001")
         self.assertEqual(row["original_content_hash"], published.content_hash)
         self.assertEqual(row["final_content_hash"], revised.content_hash)
+
+    def test_verified_audit_only_history_reuses_merge_proof_without_port_call(self):
+        entry = archived_entry()
+        self._record_verified_history(entry)
+
+        result, port = self._recover(
+            entry, execplan_catalog_state.MergeProof(False)
+        )
+
+        self.assertEqual(port.calls, [])
+        self.assertEqual(len(result.merged), 1)
+        self.assertEqual(
+            result.merged[0].proof.kind,
+            execplan_catalog_state.MergeProofKind.GITHUB_PR,
+        )
+
+    def test_verified_audit_only_history_rejects_tampered_archive_without_port_call(self):
+        original = archived_entry()
+        self._record_verified_history(original)
+        tampered = archived_entry(text_suffix=" tampered after archive")
+
+        result, port = self._recover(
+            tampered, execplan_catalog_state.MergeProof(False)
+        )
+
+        self.assertEqual(port.calls, [])
+        self.assertEqual(result.merged, ())
+        self.assertEqual(result.diagnostics[0].code, "archived-content-hash-mismatch")
+
+    def test_verified_history_with_different_original_path_is_not_reused(self):
+        entry = archived_entry()
+        self.repository.record(
+            "/repo",
+            entry,
+            original_path="docs/plans/[G-001] Different.md",
+            original_content_hash=entry.content_hash,
+            plan_sha="a" * 40,
+            proof=execplan_catalog_state.MergeProof(
+                True,
+                kind=execplan_catalog_state.MergeProofKind.GITHUB_PR,
+                plan_sha="a" * 40,
+                publication_content_hash=entry.content_hash,
+                revision="b" * 40,
+            ),
+            diagnostic=None,
+            identity_verified=True,
+        )
+
+        result, port = self._recover(
+            entry, execplan_catalog_state.MergeProof(False)
+        )
+
+        self.assertEqual(port.calls, [])
+        self.assertEqual(result.merged, ())
+        self.assertEqual(result.diagnostics[0].code, "stable-identity-mismatch")
 
 
 class ArchivedDependencySelectionTest(unittest.TestCase):

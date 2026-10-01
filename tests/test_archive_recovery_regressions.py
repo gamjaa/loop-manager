@@ -126,25 +126,49 @@ class ArchiveRecoveryRegressionTest(unittest.TestCase):
         self.assertEqual(self.row()["status"], "REVIEWING")
 
     def test_stored_revised_publication_sha_is_preserved(self):
+        published = b"stored revision"
+        identity = execplan_catalog_state.StoredPlanIdentity(
+            "G-001", self.entry.active_path, hashlib.sha256(published).hexdigest(),
+            "c" * 40, "MERGED",
+        )
+        with (
+            mock.patch("loop_manager.pr_for_branch") as pr_for_branch,
+            mock.patch(
+                "loop_manager.git",
+                return_value=subprocess.CompletedProcess([], 0, "d" * 40 + "\n", ""),
+            ) as git,
+            mock.patch("loop_manager.git_bytes", return_value=published) as blob,
+            mock.patch("loop_manager._git_commit_is_ancestor", return_value=True),
+        ):
+            proof = loop_manager._LegacyCatalogMergeProof(
+                Path("/repo"), "origin/main", {"G-001": identity}
+            ).proof_for(self.entry)
+        pr_for_branch.assert_not_called()
+        git.assert_called_once_with(Path("/repo"), "rev-parse", "origin/main^{commit}")
+        blob.assert_called_once_with(
+            Path("/repo"), "show", "c" * 40 + ":" + self.entry.active_path
+        )
+        self.assertEqual(proof.plan_sha, "c" * 40)
+        self.assertEqual(
+            proof.kind, execplan_catalog_state.MergeProofKind.STORED_AND_GIT
+        )
+
+    def test_stored_merge_with_unavailable_git_does_not_query_pr_again(self):
         identity = execplan_catalog_state.StoredPlanIdentity(
             "G-001", self.entry.active_path, self.entry.content_hash,
             "c" * 40, "MERGED",
         )
         with (
-            mock.patch("loop_manager.pr_for_branch", return_value={
-                "state": "MERGED", "url": "https://example.test/pr/1",
-            }),
-            mock.patch("loop_manager.git") as git,
-            mock.patch("loop_manager.git_bytes", return_value=b"stored revision") as blob,
+            mock.patch("loop_manager.pr_for_branch") as pr_for_branch,
+            mock.patch("loop_manager.git", side_effect=RuntimeError("git unavailable")),
         ):
             proof = loop_manager._LegacyCatalogMergeProof(
                 Path("/repo"), "origin/main", {"G-001": identity}
             ).proof_for(self.entry)
-        git.assert_not_called()
-        blob.assert_called_once_with(
-            Path("/repo"), "show", "c" * 40 + ":" + self.entry.active_path
-        )
-        self.assertEqual(proof.plan_sha, "c" * 40)
+
+        pr_for_branch.assert_not_called()
+        self.assertFalse(proof.merged)
+        self.assertEqual(proof.detail, "git unavailable")
 
     def publication_recovery(self, observed, published):
         revised_sha = "b" * 40

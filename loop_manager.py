@@ -5403,6 +5403,14 @@ class _LegacyCatalogMergeProof:
     def proof_for(
         self, entry: execplan_catalog.ExecPlanCatalogEntry
     ) -> execplan_catalog_state.MergeProof:
+        # SQLite's MERGED transition is the durable result of the first
+        # GitHub observation.  Archive reconciliation may still need local
+        # publication evidence, but it must never turn an incomplete local
+        # proof into another PR query.
+        identity = self.stored.get(entry.plan_id)
+        if identity is not None and identity.status == "MERGED":
+            return self._stored_git_proof(entry)
+
         pull_request = pr_for_branch(
             self.root, f"loop-manager/{entry.plan_id}"
         )
@@ -5417,7 +5425,6 @@ class _LegacyCatalogMergeProof:
                 pr_url=str(pull_request.get("url") or "") or None,
                 detail=str(pull_request.get("state") or "unknown"),
             )
-        identity = self.stored.get(entry.plan_id)
         if identity is not None and identity.plan_sha:
             plan_sha = identity.plan_sha
         else:
