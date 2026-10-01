@@ -17161,7 +17161,10 @@ def _remote_checkpoint_refusal(
         )
         runtime = runtime_state.RuntimeStateRepository(connection)
         projected = runtime.projected_row(request.repo)
-        if preserve_cause and projected is not None and projected['plan_id'] != request.plan_id:
+        if preserve_cause and (
+            scoped_blocking.project_block(connection, request.repo) is not None
+            or projected is not None and projected['plan_id'] != request.plan_id
+        ):
             runtime.update_plan(request.repo, request.plan_id, plan_values={"last_error": reason}, enqueue=False)
         else:
             runtime.transition(
@@ -17505,9 +17508,13 @@ def _reconcile_published_blocked_checkpoint(
     config_path: Path | None = None,
     verify_timeout_seconds: int | None = None,
     *, adopt_only: bool = False, expected_remote_oid: str | None = None,
+    project_recovery_context: dict | None = None,
 ) -> str:
     """Inspect one exact remote ref without adopting unproven or unsafe work."""
-    adapter = _BlockedCheckpointAdapter(connection, repo_path, state_dir, repo)
+    adapter = _BlockedCheckpointAdapter(
+        connection, repo_path, state_dir, repo,
+        project_recovery_scope=project_recovery_context is not None,
+    )
     snapshot = None
     worktree = Path(str(blocked["worktree"] or ""))
     branch = str(blocked["branch"] or "")
@@ -17558,7 +17565,8 @@ def _reconcile_published_blocked_checkpoint(
     if adopt_only and unchanged:
         return "unchanged"
     if (
-        not row["pending_remote_oid"]
+        project_recovery_context is None
+        and not row["pending_remote_oid"]
         and row["inspected_remote_oid"] == observed
         and row["inspected_input"] == input_identity
         and row["inspection_reason"]
@@ -17571,17 +17579,32 @@ def _reconcile_published_blocked_checkpoint(
         return "unchanged"
     if observation_error:
         return retry(observation_error)
-    current_block = connection.execute(
-        "SELECT reason_code FROM execplan_blocks WHERE repo = ? AND plan_id = ?",
-        (repo, blocked["plan_id"]),
-    ).fetchone()
-    if (
-        current_block is None
-        or current_block["reason_code"] != request.reason_code
-        or blocked["blocked_reason"] != request.reason_code
-        or request.plan_id != blocked["plan_id"]
-    ):
-        return refuse("checkpoint와 현재 PLAN_BLOCKED 원인/계획 identity가 다릅니다.")
+    if project_recovery_context is not None:
+        # A historical publication may outlive its PLAN_BLOCKED cause. The
+        # selected project recovery owns adoption, never a synthetic plan block.
+        context = project_recovery_context
+        current_block = scoped_blocking.plan_block(connection, repo, request.plan_id)
+        if (
+            not adopt_only or request.plan_id != blocked["plan_id"]
+            or context['plan_id'] != request.plan_id
+            or context['status'] != blocked['status']
+            or context['identity'] != {
+                field: blocked[field] for field in blocked_plan_reconciliation.IDENTITY_FIELDS
+            }
+            or context['plan_block'] != (dict(current_block) if current_block else None)
+            or not scoped_blocking.project_cause_matches(connection, context['project_block'])
+            or not project_blocked_recovery.project_slot_available(connection, repo, request.plan_id)
+        ):
+            return refuse("checkpoint와 현재 PROJECT_BLOCKED 원인/계획 identity가 다릅니다.")
+    else:
+        current_block = scoped_blocking.plan_block(connection, repo, request.plan_id)
+        if (
+            current_block is None
+            or current_block["reason_code"] != request.reason_code
+            or blocked["blocked_reason"] != request.reason_code
+            or request.plan_id != blocked["plan_id"]
+        ):
+            return refuse("checkpoint와 현재 PLAN_BLOCKED 원인/계획 identity가 다릅니다.")
     if observed is None:
         return refuse("게시된 원격 checkpoint branch가 삭제됐습니다.")
     if not row["published_oid"]:
@@ -17697,6 +17720,20 @@ def _reconcile_published_blocked_checkpoint(
     )
     if metadata_error:
         return refuse(metadata_error)
+    if project_recovery_context is not None:
+        scope_base = blocked['active_sha'] or blocked['plan_sha']
+        if not scope_base:
+            return refuse('현재 계획의 기존 실행 base를 확정할 수 없어 원격 checkpoint 채택을 중단합니다.')
+        try:
+            # Inspect the complete artifact against its existing execution
+            # base, which retains archive sources. The latest base may not be
+            # fetched yet; incorporation subsequently fetches and checks it.
+            project_blocked_recovery.independent_scope(
+                sys.modules[__name__], connection, repo_path, state_dir, repo, blocked,
+                target=scope_base, remote_oid=observed,
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            return refuse(str(error))
     if adopt_only:
         checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
         current = checkpoints.get(repo, str(blocked['plan_id']))

@@ -189,7 +189,8 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
         row = self.connection.execute('SELECT phase FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?',
                                       (self.repo, plan['plan_id'])).fetchone()
         if row is not None and row['phase'] == 'published':
-            return super()._adopt(plan, context)
+            self._check_owner(plan['plan_id'], context)
+            return super()._adopt(plan, context, project_recovery_context=context)
         if context['branch_oid'] not in (None, plan['publication_remote_oid']):
             raise RuntimeError('기존 checkpoint 없이 원격 후속 commit을 채택하지 않습니다.')
 

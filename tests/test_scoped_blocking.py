@@ -1041,6 +1041,143 @@ class ProjectBlockedRemoteRecoveryTests(unittest.TestCase):
         payload = json.loads(self.connection.execute('SELECT payload FROM project_checkpoint_results').fetchone()[0])
         self.assertEqual(payload['reason'], 'unresolved rebase conflict')
 
+    def published_project_successor(self, *, plan_block=False):
+        original = BlockedPlanRemoteRefreshTests.published_successor(self)
+        if not plan_block:
+            scoped_blocking.clear_plan_block(self.connection, self.repo, 'G-106')
+            self.connection.execute(
+                "UPDATE exec_plans SET status = 'IMPLEMENTING', blocked_reason = NULL, "
+                "blocked_fingerprint = NULL WHERE plan_id = 'G-106'")
+        self.connection.execute("UPDATE project_blocks SET reason_code = 'repository_state_unsafe'")
+        self.previous_base = 'd' * 40
+        self.connection.execute("UPDATE exec_plans SET active_sha = ? WHERE plan_id = 'G-106'",
+                                (self.previous_base,))
+        self.connection.commit()
+        self.ports.checkpoint_ownership.owned_remote_oid.side_effect = lambda *args, **kwargs: args[6]
+        self.ports._current_rebase_service.side_effect = self.current_service
+        self.ports.observe_blocked_plan_remotes.side_effect = None
+        self.adoption_scope_targets = []
+        for patch in (
+            mock.patch.object(loop_manager, '_current_rebase_service', side_effect=self.current_service),
+            mock.patch.object(self.recovery, 'observe_current_rebase', side_effect=self.adoption_observation),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+        return original
+
+    def adoption_observation(self, expected, adapters):
+        snapshot = self.current_snapshot
+        self.adoption_scope_targets.append((expected.target_base_oid, snapshot.head))
+        observed = SimpleNamespace(
+            remote=expected.remote, operations=snapshot.operations, metadata=None,
+            branch=snapshot.branch, head=snapshot.head,
+            branch_ref=snapshot.refs[f'refs/heads/{snapshot.branch}'],
+            branch_worktrees=(self.plan()['worktree'],),
+            registration=snapshot.worktrees[self.plan()['worktree']],
+            index=(), files=(), staged=())
+        return observed, SimpleNamespace(allowed=True)
+
+    def test_project_only_adopts_successor_before_base_and_cause_revalidation(self):
+        original = self.published_project_successor()
+        project = dict(self.connection.execute('SELECT * FROM projects').fetchone())
+        cause = dict(scoped_blocking.project_block(self.connection, self.repo))
+        other = dict(self.plan('G-107'))
+        steps = []
+        incorporate = self.coordinator._incorporate
+        def incorporate_adopted(plan, context):
+            self.assertEqual(self.head, 'c' * 40)
+            self.assertEqual(plan['publication_remote_oid'], self.head)
+            self.assertIsNone(scoped_blocking.plan_block(self.connection, self.repo, 'G-106'))
+            steps.append('incorporate')
+            return incorporate(plan, context)
+        self.ports.resume_project_block_if_safe.side_effect = lambda *args: steps.append('revalidate') or False
+        with (mock.patch.object(self.coordinator, '_incorporate', side_effect=incorporate_adopted),
+              mock.patch.object(self.coordinator, '_publish', side_effect=lambda *args: steps.append('publish'))):
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.assertEqual(steps, ['incorporate', 'publish', 'revalidate'])
+        self.assertEqual(self.adoption_scope_targets, [(self.previous_base, original.head), (self.base, self.head)])
+        checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get(self.repo, 'G-106')
+        self.assertEqual(checkpoint.snapshot['last_adopted_remote_oid'], self.head)
+        self.assertEqual(checkpoint.current_rebase_acceptance()['target_base_oid'], self.base)
+        self.assertEqual(checkpoint.current_rebase_acceptance()['remote']['oid'], self.head)
+        self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
+        self.assertEqual(self.plan()['agent_result_snapshot'], original.serialize())
+        self.assertEqual(self.plan()['worker_session_id'], 'session')
+        self.assertEqual(self.plan()['status'], 'IMPLEMENTING')
+        self.assertIsNone(scoped_blocking.plan_block(self.connection, self.repo, 'G-106'))
+        self.assertEqual(dict(scoped_blocking.project_block(self.connection, self.repo)), cause)
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM projects').fetchone()), project)
+        self.assertEqual(dict(self.plan('G-107')), other)
+
+    def test_project_adoption_preserves_an_independent_plan_cause(self):
+        original = self.published_project_successor(plan_block=True)
+        self.connection.execute(
+            "UPDATE execplan_blocks SET reason_code = ?, evidence = 'pending user decision' WHERE plan_id = 'G-106'",
+            (loop_manager.GUIDANCE_BLOCK_REASON,))
+        self.connection.execute("UPDATE exec_plans SET blocked_reason = ? WHERE plan_id = 'G-106'",
+                                (loop_manager.GUIDANCE_BLOCK_REASON,))
+        self.connection.commit()
+        cause = dict(scoped_blocking.plan_block(self.connection, self.repo, 'G-106'))
+        context = self.complete_context()
+        context['branch_oid'] = 'c' * 40
+        self.coordinator._adopt(self.plan(), context)
+        self.assertEqual(self.head, 'c' * 40)
+        self.assertEqual(dict(scoped_blocking.plan_block(self.connection, self.repo, 'G-106')), cause)
+        self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
+        self.assertEqual(self.plan()['status'], 'PLAN_BLOCKED')
+
+    def test_project_only_scope_refusal_preserves_local_head_and_project_cause(self):
+        original = self.published_project_successor()
+        cause = dict(scoped_blocking.project_block(self.connection, self.repo))
+        project = dict(self.connection.execute('SELECT * FROM projects').fetchone())
+        with (mock.patch.object(self.recovery, 'observe_current_rebase', return_value=(
+                  SimpleNamespace(remote=None), SimpleNamespace(allowed=False))),
+              mock.patch.object(self.coordinator, '_incorporate') as incorporate,
+              mock.patch.object(self.coordinator, '_publish') as publish):
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        incorporate.assert_not_called()
+        publish.assert_not_called()
+        self.assertFalse(any('merge' in call.args for call in self.ports.git.call_args_list))
+        self.assertEqual(self.head, original.head)
+        self.assertEqual(dict(scoped_blocking.project_block(self.connection, self.repo)), cause)
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM projects').fetchone()), project)
+        self.assertIsNone(scoped_blocking.plan_block(self.connection, self.repo, 'G-106'))
+
+    def test_plan_adoption_still_requires_its_own_plan_block(self):
+        original = self.published_project_successor()
+        project = dict(self.connection.execute('SELECT * FROM projects').fetchone())
+        coordinator = blocked_plan_reconciliation.BlockedPlanReconciler(
+            self.ports, self.connection, Path('/repo'), Path('/state'), self.repo, 'main')
+        with self.assertRaisesRegex(RuntimeError, 'PLAN_BLOCKED'):
+            coordinator._adopt(self.plan(), {'branch_oid': 'c' * 40})
+        self.assertEqual(self.head, original.head)
+        self.assertFalse(any('merge' in call.args for call in self.ports.git.call_args_list))
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM projects').fetchone()), project)
+
+    def test_project_adoption_rejects_changed_cause_or_execution_slot(self):
+        original = self.published_project_successor()
+        context = self.complete_context()
+        context['branch_oid'] = 'c' * 40
+        repository = blocked_checkpoint_state.BlockedCheckpointRepository(self.connection)
+        for update, reset in (
+                ("UPDATE project_blocks SET evidence = 'another safety cause'",
+                 "UPDATE project_blocks SET evidence = 'original project cause'"),
+                ("UPDATE projects SET plan_path = 'docs/plans/[G-107] Work.md'",
+                 "UPDATE projects SET plan_path = NULL")):
+            with self.subTest(update=update):
+                self.connection.execute(update)
+                self.connection.commit()
+                row = self.connection.execute("SELECT * FROM blocked_checkpoints WHERE plan_id = 'G-106'").fetchone()
+                self.assertEqual(loop_manager._reconcile_published_blocked_checkpoint(
+                    self.connection, Path('/repo'), Path('/state'), self.repo, self.plan(), row,
+                    repository.get(self.repo, 'G-106'), repository, adopt_only=True,
+                    expected_remote_oid=context['branch_oid'], project_recovery_context=context), 'blocked')
+                self.assertEqual(self.head, original.head)
+                self.connection.execute(reset)
+                self.connection.commit()
+        self.assertFalse(any('merge' in call.args for call in self.ports.git.call_args_list))
+
     def diagnostic_context(self):
         plan = self.plan()
         block = scoped_blocking.project_block(self.connection, self.repo)
@@ -1064,14 +1201,16 @@ class ProjectBlockedRemoteRecoveryTests(unittest.TestCase):
         acceptance = dict(
             kind=managed_rebase_validation.ACCEPTANCE_KIND, policy_version=managed_rebase_validation.POLICY_VERSION,
             repo=self.repo, repository_identity='/repo/.git', plan_id='G-106', plan_path=self.plan()['path'],
-            worktree=self.plan()['worktree'], branch=self.plan()['branch'], target_base_oid=self.base,
-            remote=dict(repository=self.repo, branch=self.plan()['branch'], oid=None, pull_request=None),
+            worktree=self.plan()['worktree'], branch=self.plan()['branch'], target_base_oid=kwargs.get('target', self.base),
+            remote=dict(repository=self.repo, branch=self.plan()['branch'], oid=kwargs.get('remote_oid'), pull_request=None),
             head=self.head, generation=current.generation, role='worker', input_fingerprint='input',
             scope_fingerprint='scope', state_fingerprint='state')
         acceptance['id'] = managed_rebase_validation.fingerprint(acceptance)
         decision = SimpleNamespace(status=SimpleNamespace(value='complete'), acceptance=acceptance)
         observed = SimpleNamespace(head=self.head, files=(), staged=())
         service = mock.Mock()
+        service.expected.remote = SimpleNamespace(oid=kwargs.get('remote_oid'), pull_request=None)
+        service.expected.target_base_oid = acceptance['target_base_oid']
         service.require_owned.return_value = observed, decision
         service.observe.return_value = observed, decision
         return service
