@@ -6254,6 +6254,12 @@ def activate_ready_execplan(
             activation_sha=activation_sha,
             branch=branch,
             worktree=str(worktree),
+            preserve_worker_session=(
+                assessment_can_yield(
+                    maintenance_state.MaintenanceRepository(connection).get(repo)
+                )
+                and not is_unowned_ready(selected)
+            ),
         )
     except runtime_state.RuntimeStateError as error:
         raise RuntimeError(

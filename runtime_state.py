@@ -1078,8 +1078,17 @@ class RuntimeStateRepository:
         activation_sha: str,
         branch: str,
         worktree: str,
+        preserve_worker_session: bool = False,
     ) -> ExecutionSnapshot:
         selected = self.get(repo, plan_id)
+        # Maintenance deferral resumes an owned execution; ordinary activation
+        # still discards stale session state from a newly queued declaration.
+        worker_session_values = {
+            field: getattr(selected, field) if preserve_worker_session else None
+            for field in (
+                "worker_session_id", "worker_session_binding", "worker_session_transition",
+            )
+        }
         return self.transition(
             repo,
             plan_id,
@@ -1091,10 +1100,8 @@ class RuntimeStateRepository:
                 "branch": branch,
                 "worktree": worktree,
                 "last_error": None,
-                "worker_session_id": None,
+                **worker_session_values,
                 "definition_snapshot": None,
-                "worker_session_binding": None,
-                "worker_session_transition": None,
                 "worker_input_token": None,
                 "archive_token": None,
                 "verify_token": None,
@@ -1117,9 +1124,7 @@ class RuntimeStateRepository:
                 "pr_url": None,
                 "pr_head_oid": None,
                 "last_error": None,
-                "worker_session_id": None,
-                "worker_session_binding": None,
-                "worker_session_transition": None,
+                **worker_session_values,
                 "reviewer_session_id": None,
                 "worker_result": None,
                 "verify_result": None,
