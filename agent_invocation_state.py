@@ -143,6 +143,31 @@ class InvocationRepository:
              session_id, session_id)).fetchone()
         return row is not None
 
+    def update_isolation(self, identity: str, previous: IsolationEvidence,
+                         evidence: IsolationEvidence) -> None:
+        """Complete only this unfinished call's preparation; never reuse proof."""
+        immutable = ("provider", "cli_version", "environment", "role", "worktree",
+                     "repository_identity", "snapshot_digest", "configuration_digest")
+        if (any(getattr(previous, name) != getattr(evidence, name) for name in immutable)
+                or (previous.status, evidence.status) not in (
+                    ("prepared", "verified"), ("prepared", "rejected"), ("verified", "rejected"))):
+            raise sqlite3.IntegrityError("invalid isolation confirmation transition")
+        with self.connection:
+            cursor = self.connection.execute("""UPDATE agent_isolation_evidence SET
+                policy_digest = ?, status = ?, reason = ?, checked_at = ?
+                WHERE invocation_id = ? AND policy_digest = ? AND status = ?
+                  AND provider = ? AND cli_version = ? AND environment = ? AND role = ?
+                  AND canonical_worktree = ? AND repository_identity = ?
+                  AND snapshot_digest = ? AND configuration_digest = ?
+                  AND EXISTS (SELECT 1 FROM agent_invocations call
+                              WHERE call.invocation_id = ? AND call.finished_at IS NULL)""",
+                (evidence.policy_digest, evidence.status, evidence.reason, utc_now(), identity,
+                 previous.policy_digest, previous.status, previous.provider, previous.cli_version,
+                 previous.environment, previous.role, previous.worktree, previous.repository_identity,
+                 previous.snapshot_digest, previous.configuration_digest, identity))
+            if cursor.rowcount != 1:
+                raise sqlite3.IntegrityError("isolation preparation changed or attempt finished")
+
     def finish(self, identity: str, kind: str, code: int | None,
                duration_ms: int, session_id: str | None, usage: Usage,
                collection_status: str | None = None) -> None:
@@ -150,7 +175,7 @@ class InvocationRepository:
             if kind != "success":
                 self.connection.execute("""UPDATE agent_isolation_evidence
                     SET status = 'invalidated', reason = 'agent_attempt_not_successful'
-                    WHERE invocation_id = ? AND status = 'verified'""", (identity,))
+                    WHERE invocation_id = ? AND status IN ('verified', 'prepared')""", (identity,))
             self.connection.execute("""UPDATE agent_invocations SET
                 finished_at = ?, duration_ms = ?, result_kind = ?, result_code = ?,
                 session_id = COALESCE(?, session_id), collection_status = ?,
@@ -167,7 +192,7 @@ class InvocationRepository:
         with self.connection:
             self.connection.execute("""UPDATE agent_isolation_evidence
                 SET status = 'invalidated', reason = 'agent_attempt_interrupted'
-                WHERE status = 'verified' AND invocation_id IN (
+                WHERE status IN ('verified', 'prepared') AND invocation_id IN (
                     SELECT invocation_id FROM agent_invocations WHERE finished_at IS NULL
                 )""")
             cursor = self.connection.execute("""UPDATE agent_invocations SET
