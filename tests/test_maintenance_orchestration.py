@@ -30,6 +30,16 @@ from tests.test_maintenance_planning import plan_text
 
 
 class MaintenanceOrchestrationTest(unittest.TestCase):
+    def test_unowned_ready_does_not_bypass_unpublished_assessment_barrier(self):
+        connection = self._connection()
+        self.addCleanup(connection.close)
+        self._insert_plan(connection, "/one", "G-115", priority="critical")
+        cycle, _ = self._legacy_cycle(connection, "/one", "a" * 40)
+        decision = loop_manager.catalog_schedule_decision(connection, "/one")
+        self.assertTrue(decision.has_ready)
+        self.assertIsNone(decision.runnable_ready)
+        self.assertEqual(maintenance_state.MaintenanceRepository(connection).get("/one"), cycle)
+
     def test_unpublished_assessment_resumes_owned_ready_without_relaxing_barriers(self):
         connection = self._connection()
         self.addCleanup(connection.close)

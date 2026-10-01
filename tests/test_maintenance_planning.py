@@ -656,12 +656,15 @@ class MaintenancePlanningTest(unittest.TestCase):
             (str(self.repo),),
         )
         self.connection.commit()
-        with self.assertRaisesRegex(
-            loop_manager.MaintenancePlanningError, "무소유 READY"
-        ):
-            loop_manager.prepare_maintenance_planning_context(
-                self.connection, str(self.repo), self.repo, self.base_sha
-            )
+        context = loop_manager.prepare_maintenance_planning_context(
+            self.connection, str(self.repo), self.repo, self.base_sha
+        )
+        self.assertEqual(context.eligible_plans, ())
+        loop_manager._assert_maintenance_context_current(self.connection, context)
+        self.assertEqual(self.connection.execute(
+            "SELECT workspace_owned FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+            (str(self.repo),),
+        ).fetchone()[0], 2)
 
     def test_ready_snapshot_rejects_mismatched_plan_revision(self):
         original = self.ready_path.read_text(encoding="utf-8")

@@ -857,6 +857,16 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         ports.state.maintenance_due_required = True
         ports.state.schedule_result.has_ready = True
         ports.state.schedule_result.runnable_ready = object()
+        # The real scheduler exposes only resumable owned READY during assessment.
+        # This fixture is an unowned READY, runnable only while the cycle is idle.
+        def schedule(_repo):
+            decision = SimpleNamespace(**vars(ports.state.schedule_result))
+            if ports.state.cycle.phase is not maintenance_state.MaintenancePhase.IDLE:
+                decision.runnable_ready = None
+            return decision
+
+        ports.state.schedule = mock.Mock(side_effect=schedule)
+        ports.state.activate_ready = mock.Mock()
         for index, reason in enumerate(("no_successful_assessment", "interval_reached"), 1):
             ports.state.maintenance_due_reason = reason
             run = PlanningLifecycleCoordinator(ports)._new_run(
@@ -876,6 +886,7 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         )
         PlanningLifecycleCoordinator(ports)._select_planning_work(run)
         self.assertEqual(ports.state.maintenance_begin_count, 3)
+        ports.state.activate_ready.assert_not_called()
 
     def test_missing_full_assessment_evidence_uses_bounded_planner_retry(self):
         cycle = maintenance_cycle(
