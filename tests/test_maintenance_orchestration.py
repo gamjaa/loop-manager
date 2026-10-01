@@ -30,6 +30,88 @@ from tests.test_maintenance_planning import plan_text
 
 
 class MaintenanceOrchestrationTest(unittest.TestCase):
+    def test_assessment_activation_preserves_worker_session_in_plan_and_projection(self):
+        from worker_session import SessionBinding, SessionTransition
+
+        connection = self._connection()
+        self.addCleanup(connection.close)
+        self._insert_plan(connection, "/one", "G-058")
+        binding = SessionBinding("codex", "existing-model", "high").serialize()
+        transition = SessionTransition(
+            "existing-transition", "switch", "model_changed", "existing-session",
+            SessionBinding("codex", "existing-model", "high"),
+            SessionBinding("codex", "next-model", "high"),
+        ).serialize()
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = str(Path(directory) / "G-058")
+            connection.execute(
+                "UPDATE exec_plans SET ever_started = 1, branch = 'owned-G-058', "
+                "worktree = ?, workspace_owned = 1, worker_session_id = 'existing-session', "
+                "worker_session_binding = ?, worker_session_transition = ? "
+                "WHERE repo = '/one' AND plan_id = 'G-058'",
+                (worktree, binding, transition),
+            )
+            cycle, _ = self._legacy_cycle(connection, "/one", "a" * 40)
+            connection.commit()
+            activated = loop_manager.activate_ready_execplan(
+                connection, "/one", Path(directory), "a" * 40,
+            )
+        project = connection.execute("SELECT * FROM projects WHERE repo = '/one'").fetchone()
+        self.assertEqual(activated["status"], "IMPLEMENTING")
+        self.assertEqual(project["phase"], "WORKING")
+        for row in (activated, project):
+            self.assertEqual(row["worker_session_id"], "existing-session")
+            self.assertEqual(row["worker_session_binding"], binding)
+            self.assertEqual(row["worker_session_transition"], transition)
+            self.assertEqual(row["branch"], "owned-G-058")
+            self.assertEqual(row["worktree"], worktree)
+        self.assertEqual(activated["workspace_owned"], 1)
+        self.assertEqual(activated["ever_started"], 1)
+        self.assertEqual(activated["depends_on"], "[]")
+        self.assertEqual(maintenance_state.MaintenanceRepository(connection).get("/one"), cycle)
+
+    def test_unowned_ready_does_not_bypass_unpublished_assessment_barrier(self):
+        connection = self._connection()
+        self.addCleanup(connection.close)
+        self._insert_plan(connection, "/one", "G-115", priority="critical")
+        cycle, _ = self._legacy_cycle(connection, "/one", "a" * 40)
+        decision = loop_manager.catalog_schedule_decision(connection, "/one")
+        self.assertTrue(decision.has_ready)
+        self.assertIsNone(decision.runnable_ready)
+        self.assertEqual(maintenance_state.MaintenanceRepository(connection).get("/one"), cycle)
+
+    def test_unpublished_assessment_resumes_owned_ready_without_relaxing_barriers(self):
+        connection = self._connection()
+        self.addCleanup(connection.close)
+        self._insert_plan(connection, "/one", "G-058")
+        self._insert_plan(connection, "/one", "G-115", priority="critical")
+        connection.execute(
+            "UPDATE exec_plans SET ever_started = 1, branch = 'owned', "
+            "worktree = '/managed', workspace_owned = 1, worker_session_id = 'session' "
+            "WHERE repo = '/one' AND plan_id = 'G-058'"
+        )
+        cycle, _ = self._legacy_cycle(connection, "/one", "a" * 40)
+        loop_manager._ensure_execplans_schema(connection)
+        before = dict(connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = '/one' AND plan_id = 'G-058'"
+        ).fetchone())
+        for _restart in range(2):
+            decision = loop_manager.catalog_schedule_decision(connection, "/one")
+            self.assertEqual(decision.runnable_ready["plan_id"], "G-058")
+            self.assertEqual(maintenance_state.MaintenanceRepository(connection).get("/one"), cycle)
+        connection.execute(
+            "UPDATE maintenance_cycles SET publication_stage = 'prepared' WHERE repo = '/one'"
+        )
+        self.assertIsNone(loop_manager.catalog_schedule_decision(connection, "/one").runnable_ready)
+        connection.execute(
+            "UPDATE maintenance_cycles SET publication_stage = NULL, phase = 'post_refactor_revalidation' "
+            "WHERE repo = '/one'"
+        )
+        self.assertIsNone(loop_manager.catalog_schedule_decision(connection, "/one").runnable_ready)
+        self.assertEqual(dict(connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = '/one' AND plan_id = 'G-058'"
+        ).fetchone()), before)
+
     @staticmethod
     def _legacy_cycle(
         connection: sqlite3.Connection, repo: str, source_sha: str,

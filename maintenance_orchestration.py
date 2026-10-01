@@ -178,6 +178,34 @@ def maintenance_planning_fingerprint(
     return digest.hexdigest()
 
 
+def is_unowned_ready(row: Mapping[str, object]) -> bool:
+    """Recognize never-started declarations without execution ownership."""
+
+    return (
+        str(row["status"]) == "READY"
+        and not bool(row["ever_started"])
+        and all(row[field] is None for field in (
+            "branch", "worktree", "worker_session_id", "reviewer_session_id",
+            "pr_url", "pr_head_oid", "pr_conflict_head_oid", "pr_conflict_base_oid",
+        ))
+        and all(int(row[field] or 0) == 0 for field in (
+            "workspace_owned", "pr_conflict_recovery",
+        ))
+    )
+
+
+def assessment_can_yield(cycle: maintenance_state.MaintenanceCycle) -> bool:
+    """Published maintenance sets retain their execution barrier."""
+
+    return (
+        cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT
+        and cycle.publication_stage is None
+        and not cycle.prerequisite_plan_ids
+        and not cycle.refactoring_plan_ids
+        and not cycle.revalidation_plan_ids
+    )
+
+
 def validate_prerequisite_plan_ids(
     rows: Sequence[Mapping[str, object]],
     plan_ids: Sequence[str],

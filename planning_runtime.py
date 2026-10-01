@@ -14,6 +14,7 @@ from planning_catalog import MutableReadySnapshot
 
 from maintenance_orchestration import (
     MaintenanceOrchestrationError,
+    assessment_can_yield,
     MaintenanceOutcome,
     MaintenancePlannerDecision,
     maintenance_planning_fingerprint,
@@ -730,6 +731,35 @@ class PlanningLifecycleCoordinator:
         context = run.context
         row = run.row
         cycle = run.maintenance_cycle
+        if (
+            row.phase == "PLANNING"
+            and assessment_can_yield(cycle)
+            and not row.planning_error
+            and not row.planning_validation_error
+            and self._ports.state.general_publication(context.repo) is None
+        ):
+            decision = self._ports.state.schedule(context.repo)
+            if (decision.runnable_ready is not None
+                and getattr(decision, "active", None) is None
+                and not getattr(decision, "project_blocked", False)):
+                worktree = Path(str(row.worktree or ""))
+                self._ports.git.validate_worktree_ownership(
+                    context.repo, str(row.planning_attempt_fingerprint or ""), worktree,
+                )
+                clean = not self._ports.git.run(worktree, "status", "--porcelain").stdout.strip()
+                head = self._ports.git.run(worktree, "rev-parse", "HEAD").stdout.strip()
+                if clean and head == row.active_sha:
+                    self._ports.state.preserve_diagnostics(context.repo, row)
+                    with self._ports.state.transaction():
+                        if worktree.exists():
+                            self._ports.git.run(context.repo_path, "worktree", "remove", str(worktree))
+                        self._ports.state.clear_active_in_transaction(
+                            context.repo,
+                            processed_sha=row.processed_sha,
+                            specification_fingerprint=row.specification_fingerprint,
+                            planning_fingerprint=row.planning_fingerprint,
+                        )
+                    return PlanningOutcome(PlanningOutcomeKind.REMOTE_BASE_RESTART)
         if row.phase:
             return None
         try:
@@ -855,6 +885,21 @@ class PlanningLifecycleCoordinator:
                     self_repository=context.self_repository,
                     completion_candidate=completion_candidate,
                 )
+        if assessment_can_yield(cycle):
+            decision = self._ports.state.schedule(context.repo)
+            if (
+                decision.runnable_ready is not None
+                and getattr(decision, "active", None) is None
+                and not getattr(decision, "project_blocked", False)
+            ):
+                latest_sha = self._fetch_remote_head(context)
+                if latest_sha != run.base_sha:
+                    return self._restart_for_new_input()
+                selected = self._ports.state.activate_ready(context.repo, latest_sha)
+                if selected is None:
+                    return PlanningOutcome(PlanningOutcomeKind.WAITING)
+                self._ports.events.info("기존 READY 실행을 재개하고 미게시 유지보수 평가를 보류합니다.")
+                return PlanningOutcome(PlanningOutcomeKind.EXECUTION_READY)
         if (
             decision.has_waiting
             and cycle.phase

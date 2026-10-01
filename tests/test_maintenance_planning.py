@@ -656,12 +656,15 @@ class MaintenancePlanningTest(unittest.TestCase):
             (str(self.repo),),
         )
         self.connection.commit()
-        with self.assertRaisesRegex(
-            loop_manager.MaintenancePlanningError, "무소유 READY"
-        ):
-            loop_manager.prepare_maintenance_planning_context(
-                self.connection, str(self.repo), self.repo, self.base_sha
-            )
+        context = loop_manager.prepare_maintenance_planning_context(
+            self.connection, str(self.repo), self.repo, self.base_sha
+        )
+        self.assertEqual(context.eligible_plans, ())
+        loop_manager._assert_maintenance_context_current(self.connection, context)
+        self.assertEqual(self.connection.execute(
+            "SELECT workspace_owned FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+            (str(self.repo),),
+        ).fetchone()[0], 2)
 
     def test_ready_snapshot_rejects_mismatched_plan_revision(self):
         original = self.ready_path.read_text(encoding="utf-8")
@@ -731,10 +734,75 @@ class MaintenancePlanningTest(unittest.TestCase):
         ):
             self._begin_barrier()
 
-    def test_ready_snapshot_rejects_all_ownership_nonready_and_hash_drift(self):
+    def test_assessment_mixed_ready_catalog_grants_only_unowned_authority(self):
+        self.connection.execute(
+            "UPDATE exec_plans SET status = 'READY', ever_started = 1, "
+            "branch = 'existing', worktree = '/existing', worker_session_id = 'session' "
+            "WHERE repo = ? AND plan_id = 'G-000'", (str(self.repo),),
+        )
+        context = self._begin_barrier()
+        self.assertEqual(tuple(plan.plan_id for plan in context.eligible_plans), ("G-001",))
+        loop_manager._assert_maintenance_context_current(self.connection, context)
+        cycle = maintenance_state.MaintenanceRepository(self.connection).get(str(self.repo))
+        pinned = loop_manager._maintenance_context_at_revision(
+            self.connection, str(self.repo), self.repo, self.base_sha, cycle,
+        )
+        self.assertEqual(pinned, context)
+        self.assertIsNone(self.connection.execute(
+            "SELECT planning_error FROM projects WHERE repo = ?", (str(self.repo),),
+        ).fetchone()[0])
+
+    def test_assessment_selected_plan_history_and_ownership_race_is_rejected(self):
+        context = self._begin_barrier()
+        self.assertEqual(tuple(plan.plan_id for plan in context.eligible_plans), ("G-001",))
+        for field, value in (("ever_started", 1), ("worker_session_id", "resumed"),
+                             ("current_revision_sha", "b" * 40)):
+            with self.subTest(field=field):
+                row = self.connection.execute(
+                    "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+                    (str(self.repo),),
+                ).fetchone()
+                self.connection.execute(
+                    f"UPDATE exec_plans SET {field} = ? WHERE repo = ? AND plan_id = 'G-001'",
+                    (value, str(self.repo)),
+                )
+                with self.assertRaises(loop_manager.MaintenancePlanningError):
+                    loop_manager._assert_maintenance_context_current(self.connection, context)
+                self.connection.execute(
+                    f"UPDATE exec_plans SET {field} = ? WHERE repo = ? AND plan_id = 'G-001'",
+                    (row[field], str(self.repo)),
+                )
+
+    def test_revalidation_explicit_owned_target_is_not_filtered(self):
+        repository = maintenance_state.MaintenanceRepository(self.connection)
+        assessment, _ = self._begin_legacy_assessment(self.base_sha)
+        refactoring = repository.transition(
+            str(self.repo), expected_phase=assessment.phase,
+            expected_revision=assessment.revision,
+            next_phase=maintenance_state.MaintenancePhase.REFACTORING,
+            refactoring_plan_ids=("G-000",), revalidation_plan_ids=("G-001",),
+        )
+        repository.transition(
+            str(self.repo), expected_phase=refactoring.phase,
+            expected_revision=refactoring.revision,
+            next_phase=maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+        )
+        for field, value in (("ever_started", 1), ("branch", "owned")):
+            with self.subTest(field=field):
+                self.connection.execute(
+                    f"UPDATE exec_plans SET {field} = ? WHERE repo = ? AND plan_id = 'G-001'",
+                    (value, str(self.repo)),
+                )
+                with self.assertRaisesRegex(loop_manager.MaintenancePlanningError, "무소유 READY"):
+                    loop_manager.prepare_maintenance_planning_context(
+                        self.connection, str(self.repo), self.repo, self.base_sha,
+                    )
+
+    def test_assessment_excludes_owned_ready_but_rejects_hash_drift(self):
         self._begin_legacy_assessment(self.base_sha)
 
         ownership_cases = (
+            ("ever_started", 1),
             ("branch", "loop-manager/G-001"),
             ("branch", ""),
             ("worktree", "/tmp/managed-G-001"),
@@ -756,14 +824,17 @@ class MaintenancePlanningTest(unittest.TestCase):
                     (value, str(self.repo)),
                 )
                 self.connection.commit()
-                with self.assertRaisesRegex(
-                    loop_manager.MaintenancePlanningError, "무소유 READY"
-                ):
-                    loop_manager.prepare_maintenance_planning_context(
-                        self.connection, str(self.repo), self.repo, self.base_sha
-                    )
+                context = loop_manager.prepare_maintenance_planning_context(
+                    self.connection, str(self.repo), self.repo, self.base_sha
+                )
+                self.assertEqual(context.eligible_plans, ())
+                loop_manager._assert_maintenance_context_current(self.connection, context)
+                self.assertEqual(self.connection.execute(
+                    "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+                    (str(self.repo),),
+                ).fetchone()[field], value)
                 reset = 0 if field in {
-                    "workspace_owned", "pr_conflict_recovery"
+                    "ever_started", "workspace_owned", "pr_conflict_recovery"
                 } else None
                 self.connection.execute(
                     f"UPDATE exec_plans SET {field} = ? "

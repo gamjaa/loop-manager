@@ -124,6 +124,8 @@ from maintenance_orchestration import (
     MaintenanceOutcome,
     MaintenancePlannerDecision,
     all_cycle_plans_merged,
+    is_unowned_ready,
+    assessment_can_yield,
     cycle_plan_status_error,
     maintenance_planning_fingerprint,
     parse_maintenance_planner_decision,
@@ -2965,7 +2967,7 @@ def _ready_plan_snapshot_from_contents(
         for name, value in ownership.items()
         if value is not None and value != 0
     ]
-    if str(row["status"]) != "READY" or owned:
+    if not is_unowned_ready(row) or owned:
         detail = ", ".join(owned) if owned else str(row["status"])
         raise MaintenancePlanningError(
             f"유지보수 개정 대상은 무소유 READY 계획이어야 합니다: {plan_id} ({detail})"
@@ -3167,7 +3169,7 @@ _MUTABLE_READY_EVIDENCE_FIELDS = (
 def _row_is_mutable_ready(row: sqlite3.Row) -> bool:
     """Keep the general Planner boundary conservative and evidence based."""
 
-    if str(row["status"]) != "READY" or bool(row["ever_started"]):
+    if not is_unowned_ready(row):
         return False
     if any(row[field] is not None for field in _MUTABLE_READY_EVIDENCE_FIELDS):
         return False
@@ -3311,7 +3313,7 @@ def _maintenance_mode_and_rows(
             "ORDER BY plan_id",
             (repo,),
         ).fetchall()
-        return MaintenancePlanMode.BARRIER, list(rows)
+        return MaintenancePlanMode.BARRIER, [row for row in rows if is_unowned_ready(row)]
     if cycle.phase is maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION:
         rows = []
         for plan_id in cycle.revalidation_plan_ids:
@@ -3398,18 +3400,10 @@ def _assert_maintenance_context_current(
         )
     if cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT:
         expected_mode = MaintenancePlanMode.BARRIER
-        expected_plan_ids = tuple(
-            str(row[0])
-            for row in connection.execute(
-                "SELECT plan_id FROM exec_plans "
-                "WHERE repo = ? AND status = 'READY' "
-                "AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h "
-                "WHERE h.repo = exec_plans.repo "
-                "AND h.currently_archived = 1 "
-                "AND h.plan_id = exec_plans.plan_id) ORDER BY plan_id",
-                (context.repo,),
-            )
+        _mode, rows = _maintenance_mode_and_rows(
+            connection, context.repo, cycle, context.active_sha
         )
+        expected_plan_ids = tuple(str(row["plan_id"]) for row in rows)
     elif cycle.phase is maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION:
         expected_mode = MaintenancePlanMode.REVALIDATION
         expected_plan_ids = cycle.revalidation_plan_ids
@@ -3431,6 +3425,10 @@ def _assert_maintenance_context_current(
         if row is None:
             raise MaintenancePlanningError(
                 f"READY snapshot 계획이 catalog에서 사라졌습니다: {snapshot.plan_id}"
+            )
+        if not is_unowned_ready(row):
+            raise MaintenancePlanningError(
+                f"READY snapshot의 실행 이력 또는 소유권이 변경됐습니다: {snapshot.plan_id}"
             )
         ownership_values = (
             row["branch"],
@@ -6087,6 +6085,12 @@ def catalog_schedule_decision(
         maintenance_state.MaintenancePhase.REFACTORING,
     }:
         selected = select_cycle_ready_execplan(execution_rows, cycle)
+    elif active is None and not project_is_blocked and assessment_can_yield(cycle):
+        resumable = [row for row in candidates if not is_unowned_ready(row)]
+        if resumable:
+            selected = min(resumable, key=lambda row: (
+                PRIORITY_ORDER[str(row["priority"])], int(str(row["plan_id"])[2:]),
+            ))
     elif (
         active is None
         and not project_is_blocked
@@ -6250,6 +6254,12 @@ def activate_ready_execplan(
             activation_sha=activation_sha,
             branch=branch,
             worktree=str(worktree),
+            preserve_worker_session=(
+                assessment_can_yield(
+                    maintenance_state.MaintenanceRepository(connection).get(repo)
+                )
+                and not is_unowned_ready(selected)
+            ),
         )
     except runtime_state.RuntimeStateError as error:
         raise RuntimeError(

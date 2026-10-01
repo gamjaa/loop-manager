@@ -441,6 +441,89 @@ class FakePorts:
 
 
 class PlanningLifecycleCoordinatorTest(unittest.TestCase):
+    def test_unpublished_planning_slot_yields_only_clean_owned_base_worktree(self):
+        for guard in ("clean", "dirty", "committed", "ownership", "publication", "project_blocked", "active"):
+            with self.subTest(guard=guard), tempfile.TemporaryDirectory() as directory:
+                snapshot = planning_snapshot(
+                    phase="PLANNING", active_sha="base", worktree=directory,
+                    planning_attempt_fingerprint="attempt", planning_workspace_owned=1,
+                    processed_sha="old", planning_fingerprint="successful-input",
+                    specification_fingerprint="successful-specification",
+                )
+                cycle = maintenance_cycle(
+                    phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+                    cycle_base_sha="base", last_success_merged_count=5,
+                    last_success_file_assessment_merged_count=5,
+                )
+                ports = FakePorts(snapshot, cycle)
+                ports.state.schedule_result.runnable_ready = {"plan_id": "G-058"}
+                if guard == "dirty":
+                    original = ports.git.run
+                    ports.git.run = lambda path, *args: (
+                        SimpleNamespace(stdout="?? user.txt", returncode=0)
+                        if args == ("status", "--porcelain") else original(path, *args)
+                    )
+                elif guard == "committed":
+                    ports.git.head = "new-commit"
+                elif guard == "ownership":
+                    ports.git.ownership_error = PlanningWorkspaceOwnershipError("foreign workspace")
+                elif guard == "publication":
+                    ports.state.general_intent = object()
+                elif guard == "project_blocked":
+                    ports.state.schedule_result.project_blocked = True
+                elif guard == "active":
+                    ports.state.schedule_result.active = {"plan_id": "G-059"}
+                coordinator = PlanningLifecycleCoordinator(ports)
+                run = coordinator._new_run(self.context)
+                if guard == "ownership":
+                    with self.assertRaises(PlanningWorkspaceOwnershipError):
+                        coordinator._select_planning_work(run)
+                else:
+                    outcome = coordinator._select_planning_work(run)
+                    if guard == "clean":
+                        self.assertEqual(outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
+                        self.assertIsNone(ports.state.snapshot.phase)
+                        self.assertEqual(ports.state.snapshot.planning_fingerprint, "successful-input")
+                        self.assertEqual(ports.state.snapshot.processed_sha, "old")
+                    else:
+                        self.assertIsNone(outcome)
+                        self.assertEqual(ports.state.snapshot, snapshot)
+                self.assertEqual(ports.state.cycle, cycle)
+
+    def test_assessment_resume_restarts_selection_if_remote_base_changes(self):
+        ports = FakePorts(planning_snapshot(), maintenance_cycle(
+            phase=maintenance_state.MaintenancePhase.ASSESSMENT, cycle_base_sha="base",
+        ))
+        ports.state.schedule_result.runnable_ready = {"plan_id": "G-058"}
+        ports.state.activate_ready = mock.Mock()
+        ports.git.remote = "new-base"
+        coordinator = PlanningLifecycleCoordinator(ports)
+        outcome = coordinator._select_planning_work(coordinator._new_run(self.context))
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
+        ports.state.activate_ready.assert_not_called()
+        self.assertEqual(ports.state.updates, [])
+
+    def test_due_and_unpublished_assessment_yield_without_advancing_success(self):
+        for phase in (maintenance_state.MaintenancePhase.IDLE,
+                      maintenance_state.MaintenancePhase.ASSESSMENT):
+            with self.subTest(phase=phase):
+                cycle = maintenance_cycle(phase=phase, cycle_base_sha="base",
+                    last_success_merged_count=5, last_success_file_assessment_merged_count=5)
+                ports = FakePorts(planning_snapshot(), cycle)
+                ports.state.maintenance_due_required = True
+                ports.state.schedule_result.has_ready = True
+                ports.state.schedule_result.runnable_ready = {"plan_id": "G-058"}
+                ports.state.activate_result = {"plan_id": "G-058"}
+                coordinator = PlanningLifecycleCoordinator(ports)
+                run = coordinator._new_run(replace(self.context, registered_only=True))
+                run.base_sha = "base"
+                outcome = coordinator._select_planning_work(run)
+                self.assertEqual(outcome.kind, PlanningOutcomeKind.EXECUTION_READY)
+                self.assertEqual(ports.state.cycle.last_success_merged_count, 5)
+                self.assertEqual(ports.state.cycle.last_success_file_assessment_merged_count, 5)
+                self.assertEqual(ports.state.updates, [])
+                self.assertEqual(ports.state.snapshot.phase, "WORKING")
+
     def test_assessment_reconciles_one_relation_before_final_planner(self):
         left_content = b"def calculate(): return helper()\n"
         right_content = b"def helper(): return 1\n"
@@ -774,6 +857,16 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         ports.state.maintenance_due_required = True
         ports.state.schedule_result.has_ready = True
         ports.state.schedule_result.runnable_ready = object()
+        # The real scheduler exposes only resumable owned READY during assessment.
+        # This fixture is an unowned READY, runnable only while the cycle is idle.
+        def schedule(_repo):
+            decision = SimpleNamespace(**vars(ports.state.schedule_result))
+            if ports.state.cycle.phase is not maintenance_state.MaintenancePhase.IDLE:
+                decision.runnable_ready = None
+            return decision
+
+        ports.state.schedule = mock.Mock(side_effect=schedule)
+        ports.state.activate_ready = mock.Mock()
         for index, reason in enumerate(("no_successful_assessment", "interval_reached"), 1):
             ports.state.maintenance_due_reason = reason
             run = PlanningLifecycleCoordinator(ports)._new_run(
@@ -793,6 +886,7 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         )
         PlanningLifecycleCoordinator(ports)._select_planning_work(run)
         self.assertEqual(ports.state.maintenance_begin_count, 3)
+        ports.state.activate_ready.assert_not_called()
 
     def test_missing_full_assessment_evidence_uses_bounded_planner_retry(self):
         cycle = maintenance_cycle(
