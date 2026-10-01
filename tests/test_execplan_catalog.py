@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import execplan_catalog
+import execplan_catalog_state
 import loop_manager
 
 
@@ -309,10 +310,7 @@ class ExecPlanCatalogSnapshotTest(unittest.TestCase):
             "sources TEXT, status TEXT, plan_sha TEXT, "
             "publication_path TEXT, publication_sha TEXT)"
         )
-        connection.execute(
-            "CREATE TABLE execplan_catalog_history (repo TEXT, plan_id TEXT, "
-            "merge_confirmed INTEGER, currently_archived INTEGER)"
-        )
+        execplan_catalog_state.ensure_schema(connection)
         connection.executemany(
             "INSERT INTO exec_plans VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL)",
             (

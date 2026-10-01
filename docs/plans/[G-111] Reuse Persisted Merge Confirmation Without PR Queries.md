@@ -52,6 +52,8 @@ SQLite에 이미 Merge가 확정된 PR은 이후 Loop 실행, 재시작과 archi
 
 - 2026-10-01: 재개한 Worker에서 세 가지 Review 피드백을 수정했다. 변조 진단 이후에도 확정 Merge 증명과 마지막 정상 archive hash를 보존하고, 최초 게시 경로와 현재 rename 경로를 구분하며, audit-only 복구도 로컬 게시 blob·ancestry를 검증한다. 관련 개별 unit case 12개를 총 13회 실행해 모두 통과했다. Manager 전체 verify와 재Review는 대기 중이다.
 
+- 2026-10-01: Manager 전체 verify에서 archive 후보 계산 unit fixture의 `diagnostic_code` 열 누락이 확인됐다. 축소 history DDL 대신 실제 catalog schema 생성 함수를 사용하도록 수정했다. 실패한 개별 unit case를 동일 명령으로 재실행해 1 test PASS를 확인했다. 전체 verify 재검증은 Manager에 맡긴다.
+
 ## Decision Log
 
 - 2026-09-30: 사용자가 DB상 이미 Merge된 PR의 재조회 제외를 요청했다. 기존 PRODUCT의 실행 상태·복구·archive 목표 안에서 확정된 사실을 재사용하는 수정으로 계획하며, PRODUCT·Requirement·ARCHITECTURE와 기존 ExecPlan은 변경하지 않는다.
