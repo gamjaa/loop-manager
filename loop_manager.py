@@ -139,6 +139,7 @@ import maintenance_findings
 import maintenance_file_inventory
 import document_publication
 import scoped_blocking
+import runtime_scope
 import agent_scope_decision
 import rebase_file_evidence
 import managed_rebase_evidence
@@ -13735,6 +13736,7 @@ def validate_persisted_agent_scope(
             checkpoint = replace(checkpoint, snapshot=accepted_baseline(checkpoint.snapshot))
 
     manager_runtime: tuple[str, str] | None = None
+    runtime_recreation_proven = False
     if runtime_mutation is not None and _canonical_path(repo_path) == _canonical_path(runtime_mutation.source):
         try:
             held_identity = _held_process_lock_identity(state_dir)
@@ -13764,6 +13766,15 @@ def validate_persisted_agent_scope(
         manager_runtime = (
             str(_canonical_path(runtime_mutation.path)), runtime_mutation.commit_sha,
         )
+        runtime_recreation_proven = runtime_scope.proven_runtime_recreation(
+            state_dir, _canonical_path(runtime_mutation.source),
+            _canonical_path(runtime_mutation.path), runtime_mutation.commit_sha,
+            before.worktrees.get(manager_runtime[0]), current.worktrees.get(manager_runtime[0]),
+            validate_lock=lambda lock: _validate_runtime_lock_origin(
+                state_dir, runtime_mutation.source, runtime_mutation.path,
+                runtime_mutation.commit_sha, lock,
+            ),
+        )
 
     try:
         decision = agent_scope_decision.decide_persisted_scope(
@@ -13780,6 +13791,7 @@ def validate_persisted_agent_scope(
             planner_correction=allow_planner_worktree_correction,
             manager_cleanup_worktrees=manager_cleanup_worktrees,
             manager_runtime=manager_runtime,
+            runtime_recreation_proven=runtime_recreation_proven,
         )
     except agent_scope_decision.ScopeDecisionError as error:
         raise AgentScopeError(str(error)) from error

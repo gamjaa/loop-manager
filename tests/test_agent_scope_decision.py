@@ -22,13 +22,13 @@ def snapshot(**changes):
 
 def decide(before, current, *, role="worker", phase="IMPLEMENTING", result=None,
            checkpoint=None, planner_correction=False, cleanup=frozenset(),
-           manager_runtime=None):
+           manager_runtime=None, runtime_recreation_proven=False):
     return decision.decide_persisted_scope(
         role=role, phase=phase, base_branch="main", selected_plan_path=PLAN,
         before=before, current=current, result=result, checkpoint=checkpoint,
         worktree_key=WORKTREE, repo_key=REPO,
         planner_correction=planner_correction, manager_cleanup_worktrees=cleanup,
-        manager_runtime=manager_runtime,
+        manager_runtime=manager_runtime, runtime_recreation_proven=runtime_recreation_proven,
     )
 
 
@@ -54,6 +54,29 @@ class PersistedScopeDecisionTests(unittest.TestCase):
         self.assertNotIn("/external", check.before.worktrees)
         with self.assertRaisesRegex(decision.ScopeDecisionError, "runtime 기준선"):
             decide(before, current, manager_runtime=(runtime, "other"))
+
+    def test_runtime_lock_replacement_requires_proof_and_preserves_other_changes(self):
+        runtime = "/state/runtime"
+        old = ("HEAD=b", "detached=True", "locked=old", "state=same")
+        new = ("HEAD=b", "detached=True", "locked=new", "state=same")
+        before = snapshot(
+            refs={"refs/remotes/origin/main": ("b", "")},
+            worktrees={**snapshot().worktrees, runtime: old},
+        )
+        current = replace(before, worktrees={**before.worktrees, runtime: new,
+                                             "/other": ("HEAD=c",)})
+        with self.assertRaisesRegex(decision.ScopeDecisionError, "runtime 기준선"):
+            decide(before, current, manager_runtime=(runtime, "b"))
+        check, = decide(before, current, manager_runtime=(runtime, "b"),
+                        runtime_recreation_proven=True).checks
+        self.assertEqual(check.before.worktrees[runtime], new)
+        self.assertNotIn("/other", check.before.worktrees)
+        self.assertEqual(check.after.worktrees["/other"], ("HEAD=c",))
+        changed = replace(current, worktrees={**current.worktrees,
+                                              runtime: new[:-1] + ("state=changed",)})
+        with self.assertRaisesRegex(decision.ScopeDecisionError, "runtime 기준선"):
+            decide(before, changed, manager_runtime=(runtime, "b"),
+                   runtime_recreation_proven=True)
 
     def test_blocked_false_positive_reconciles_from_original_start_snapshot(self):
         before = snapshot()

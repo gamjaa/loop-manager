@@ -153,6 +153,7 @@ def decide_persisted_scope(
     planner_correction: bool,
     manager_cleanup_worktrees: frozenset[str],
     manager_runtime: tuple[str, str] | None = None,
+    runtime_recreation_proven: bool = False,
 ) -> ScopeDecision:
     """Describe ordered scope checks without reading Git or persisted state."""
     if role not in {"planner", "maintenance_planner", "worker", "reviewer"}:
@@ -167,12 +168,18 @@ def decide_persisted_scope(
         previous_origin = before.refs.get("refs/remotes/origin/main")
         previous_head = before.refs.get("refs/remotes/origin/HEAD")
         current_head = current.refs.get("refs/remotes/origin/HEAD")
+        previous_registration = before.worktrees.get(runtime_path)
+        registration_matches = previous_registration in (None, registration)
+        if runtime_recreation_proven and previous_registration is not None and registration is not None:
+            registration_matches = tuple(
+                field for field in previous_registration if not field.startswith("locked=")
+            ) == tuple(field for field in registration if not field.startswith("locked="))
         if (
             registration is None
             or f"HEAD={runtime_sha}" not in registration
             or "detached=True" not in registration
             or origin is None or origin[0] != runtime_sha
-            or before.worktrees.get(runtime_path) not in (None, registration)
+            or not registration_matches
             or (previous_head != current_head and (
                 previous_origin is None
                 or previous_head != (previous_origin[0], "refs/remotes/origin/main")
