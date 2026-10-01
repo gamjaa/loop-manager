@@ -661,6 +661,31 @@ def _checkpoint_link(origin: object, oid: object) -> str | None:
     return value.removesuffix(".git") + "/tree/" + str(oid)
 
 
+def _project_checkpoint(connection, repo, plan_id):
+    """Read only the result bound to the current project cause."""
+    import scoped_blocking
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                          "AND name = 'project_checkpoint_results'").fetchone() is None:
+        return None
+    block = scoped_blocking.project_block(connection, repo)
+    row = connection.execute(
+        'SELECT cause_identity, payload FROM project_checkpoint_results WHERE repo = ? AND plan_id = ?',
+        (repo, plan_id)).fetchone()
+    if block is None or row is None or row[0] != scoped_blocking.project_cause_identity(block):
+        return None
+    result = json.loads(row[1])
+    origin = connection.execute('SELECT origin FROM projects WHERE repo = ?', (repo,)).fetchone()
+    if result.get('result') == 'published':
+        result['branch_url'] = _checkpoint_link(origin[0] if origin else None, result.get('commit_oid'))
+    return result
+
+
+def _project_checkpoint_suffix(checkpoint):
+    return ("\0checkpoint:" + hashlib.sha256(json.dumps(
+        checkpoint, sort_keys=True, separators=(',', ':'),
+    ).encode()).hexdigest()) if checkpoint else ""
+
+
 def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) -> None:
     """Enqueue all plan/project events after their owning update and before commit."""
 
@@ -825,6 +850,7 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
         (repo,),
     ).fetchone()
     if project_block is not None:
+        checkpoint = _project_checkpoint(connection, repo, project_block[1])
         recovery_identity, recovery_evidence = final_recovery(
             str(project_block[1] or "__project__")
         )
@@ -853,7 +879,8 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
                 "blocked",
                 repo,
                 f"project\0{project_block[0]}\0{project_block[1] or ''}" +
-                (f"\0{recovery_identity}" if recovery_identity else ""),
+                (f"\0{recovery_identity}" if recovery_identity else "") +
+                _project_checkpoint_suffix(checkpoint),
             ),
             {
                 "project": name,
@@ -866,6 +893,7 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
                 "paths": project_paths,
                 "guidance_locations": [],
                 "recovery": recovery_evidence,
+                "checkpoint": checkpoint,
             },
         )
 
@@ -1224,10 +1252,15 @@ def _message(kind: str, payload: dict[str, object]) -> str:
                     + "\nCommit: "
                     + str(checkpoint.get("commit_oid"))
                 )
+                if checkpoint.get('diagnostic'):
+                    checkpoint_text += '\nDiagnostic ref: ' + str(checkpoint.get('branch'))
+                    checkpoint_text += '\nOriginal branch: ' + str(checkpoint.get('original_branch'))
             else:
                 checkpoint_text = "\nCheckpoint: local only (" + str(
                     checkpoint.get("reason")
                 ) + ")"
+                if checkpoint.get('worktree'):
+                    checkpoint_text += '\nPreserved worktree: ' + str(checkpoint['worktree'])
         return (
             f"[{payload['project']}] BLOCKED ({payload.get('scope')}: {subject})\n"
             f"Reason: {payload.get('reason_code')}\n{payload['cause']}"
@@ -1322,7 +1355,7 @@ def _current_block_key(
             return None
         recovery_subject = str(subject or "__project__")
         identity = f"project\0{reason}\0{subject or ''}"
-        remote = ""
+        remote = _project_checkpoint_suffix(_project_checkpoint(connection, repo, subject))
     else:
         return None
     recovery_table = connection.execute(

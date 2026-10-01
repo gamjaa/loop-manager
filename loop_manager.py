@@ -58,6 +58,7 @@ import work_exhaustion
 import reviewer_specification
 import blocked_checkpoint
 import blocked_checkpoint_state
+import project_blocked_recovery
 import blocked_plan_reconciliation
 import blocked_remote_observation
 import execplan_archive
@@ -9449,6 +9450,7 @@ def _journaled_direct_rebase(
     connection: sqlite3.Connection, repo_path: Path, repo: str, plan_id: str,
     worktree: Path, branch: str, target_oid: str, *, autostash: bool = False,
     agent_session_id: str | None = None,
+    observed_remote: tuple[str | None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     state_dir = _owned_rebase_state_dir(repo, plan_id, worktree)
     if state_dir is None:
@@ -9458,7 +9460,8 @@ def _journaled_direct_rebase(
     before = _owned_rebase_journal_state(worktree, branch)
     checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
     current = checkpoint.get(repo, plan_id)
-    remote_oid = remote_branch_oid(repo_path, branch)
+    remote_oid = (remote_branch_oid(repo_path, branch) if observed_remote is None
+                  else observed_remote[0])
     if current.observed_remote_oid not in (None, remote_oid):
         raise manager_git_journal.MutationEvidenceError(
             "Manager rebase 전 게시 원격 OID가 checkpoint와 다릅니다."
@@ -9509,7 +9512,9 @@ def _journaled_direct_rebase(
                   'agent_session_id': agent_session_id})
     environment = dict(os.environ)
     environment["GIT_REFLOG_ACTION"] = f"loop-manager-rebase:{token}"
-    result = git(worktree, "rebase", *(("--autostash",) if autostash else ()),
+    scoped_options = (("-c", f"core.hooksPath={os.devnull}", "-c", "rebase.updateRefs=false")
+                      if observed_remote is not None else ())
+    result = git(worktree, *scoped_options, "rebase", *(("--autostash",) if autostash else ()),
                  target_oid, check=False, env=environment)
     if result.returncode == 0:
         manager_git_journal.record_rebase_invocation(
@@ -9680,6 +9685,15 @@ def _complete_direct_rebase_checkpoint(
 def _publish_direct_rebase_checkpoint(connection, repo_path, state_dir, repo,
                                       plan_id, worktree, branch):
     from execution_state import DirectRebasePublicationStatePort
+    project_recovery = scoped_blocking.project_block(connection, repo) is not None
+    if project_recovery and not project_blocked_recovery.project_slot_available(connection, repo, plan_id):
+        raise manager_git_journal.MutationEvidenceError('project checkpoint publication is not selected')
+
+    def publication_git(target, *arguments, **options):
+        if project_recovery and arguments[:1] == ('push',):
+            return git(target, '-c', f'core.hooksPath={os.devnull}', *arguments, **options)
+        return git(target, *arguments, **options)
+
     checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
     state = DirectRebasePublicationStatePort(
         connection, runtime_state.RuntimeStateRepository(connection), repo, plan_id)
@@ -9702,7 +9716,7 @@ def _publish_direct_rebase_checkpoint(connection, repo_path, state_dir, repo,
         repo_path=repo_path, worktree=worktree, branch=branch,
         service=lambda **options: _current_rebase_service(
             connection, repo_path, state_dir, repo, plan_id, worktree, branch, **options),
-        owns_remote=owns_remote, git=git, lookup_pr=pr_for_branch)
+        owns_remote=owns_remote, git=publication_git, lookup_pr=pr_for_branch)
 
 
 def validate_managed_worktree(
@@ -12843,7 +12857,8 @@ def _update_blocked_error(
     with connection:
         runtime = runtime_state.RuntimeStateRepository(connection)
         projected = runtime.projected_row(repo)
-        if preserve_cause and projected is not None and projected['plan_id'] != plan_id:
+        if preserve_cause and (scoped_blocking.project_block(connection, repo) is not None
+                or projected is not None and projected['plan_id'] != plan_id):
             runtime.update_plan(repo, plan_id, plan_values={"last_error": error}, enqueue=False)
         else:
             runtime.transition(
@@ -21598,6 +21613,14 @@ def _run_project_step(
         resume_project_block_if_safe(connection, repo_path, state_dir, repo)
         project_block = scoped_blocking.project_block(connection, repo)
         if project_block is not None:
+            linked_plan_id = str(project_block['plan_id'] or '')
+            if linked_plan_id:
+                project_blocked_recovery.ProjectBlockedReconciler(
+                    sys.modules[__name__], connection, repo_path, state_dir, repo,
+                    str(row['base_branch']), config_path, verify_timeout_seconds,
+                ).reconcile(linked_plan_id)
+                project_block = scoped_blocking.project_block(connection, repo)
+        if project_block is not None:
             operation_print(
                 "프로젝트 안전 차단 상태입니다: "
                 + str(project_block["evidence"]),
@@ -23450,14 +23473,25 @@ class _BlockedCheckpointAdapter:
         state_dir: Path,
         repo: str,
         *, reconciliation_scope: bool = False,
+        project_recovery_scope: bool = False,
     ):
         self.connection = connection
         self.repo_path = repo_path
         self.state_dir = state_dir
         self.repo = repo
         self.reconciliation_scope = reconciliation_scope
+        self.project_recovery_scope = project_recovery_scope
 
     def _plan(self, request: blocked_checkpoint.CheckpointRequest) -> sqlite3.Row:
+        if self.project_recovery_scope:
+            row = self.connection.execute(
+                'SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
+                (request.repo, request.plan_id)).fetchone()
+            if (row is None or not project_blocked_recovery.project_slot_available(
+                    self.connection, request.repo, request.plan_id)
+                    or (row['branch'], row['worktree']) != (request.branch, request.worktree)):
+                raise RuntimeError('project checkpoint의 선택 identity가 변경됐습니다.')
+            return row
         row = self.connection.execute(
             "SELECT p.*, b.reason_code AS checkpoint_reason, "
             "b.evidence AS checkpoint_evidence "
@@ -23532,6 +23566,10 @@ class _BlockedCheckpointAdapter:
         project_blocked = scoped_blocking.project_block(
             self.connection, request.repo
         ) is not None
+        project_recovery_verified = bool(
+            project_blocked and self.project_recovery_scope
+            and project_blocked_recovery.checkpoint_scope_verified(
+                sys.modules[__name__], self.connection, self.repo_path, self.state_dir, request, plan))
         branch = str(plan["branch"] or "")
         worktree = Path(str(plan["worktree"] or ""))
         identity_matches = bool(
@@ -23581,7 +23619,8 @@ class _BlockedCheckpointAdapter:
         actual_branch = snapshot.branch if snapshot is not None else None
         operations = tuple(sorted(snapshot.operations)) if snapshot is not None else ()
         if snapshot is not None:
-            metadata_error = self._shared_safety_error(request, plan, snapshot)
+            metadata_error = (self._origin_safety_error(request, snapshot)
+                              if project_recovery_verified else self._shared_safety_error(request, plan, snapshot))
             if metadata_error is not None:
                 return metadata_error
             active_key = str(_canonical_path(worktree))
@@ -23666,11 +23705,13 @@ class _BlockedCheckpointAdapter:
             dirty_paths=tuple(dirty_paths),
             shared_metadata_owned=shared_metadata_owned,
             project_blocked=project_blocked,
+            project_recovery_verified=project_recovery_verified,
             legacy_scope_uncertain=(
                 request.reason_code
                 == BlockReasonCode.LEGACY_UNSCOPED_BLOCK.value
+                and not project_recovery_verified
             ),
-            agent_scope_recovery_pending=bool(
+            agent_scope_recovery_pending=not project_recovery_verified and bool(
                 plan["agent_recovery"]
                 or (
                     plan["agent_snapshot"]
@@ -23758,6 +23799,27 @@ class _BlockedCheckpointAdapter:
                 (snapshot, snapshot, request.repo, request.repo, request.plan_id),
             )
 
+    def _origin_safety_error(self, request, current):
+        """Registered fetch and push destinations are never a project exception."""
+        project = self.connection.execute('SELECT origin FROM projects WHERE repo = ?',
+                                          (request.repo,)).fetchone()
+        if project is None or not project['origin']:
+            return blocked_checkpoint.SafetyVerdict(
+                False, blocked_checkpoint.SafetyScope.PLAN, 'registered_origin_missing',
+                '등록 origin이 없어 checkpoint를 local-only로 보존합니다.', current.head, ())
+        try:
+            for context in (self.repo_path, Path(request.worktree)):
+                for arguments in (('remote', 'get-url', '--all', 'origin'),
+                                  ('remote', 'get-url', '--push', '--all', 'origin')):
+                    urls = git(context, *arguments).stdout.splitlines()
+                    if len(urls) != 1 or github_repository(urls[0]) != project['origin']:
+                        raise RuntimeError('등록 origin과 fetch/push 대상이 다릅니다.')
+        except (OSError, RuntimeError) as error:
+            return blocked_checkpoint.SafetyVerdict(
+                False, blocked_checkpoint.SafetyScope.PROJECT, 'shared_git_config_mutation',
+                str(error), current.head, ())
+        return None
+
     def _shared_safety_error(
         self,
         request: blocked_checkpoint.CheckpointRequest,
@@ -23771,26 +23833,9 @@ class _BlockedCheckpointAdapter:
                 reason, detail, current.head, (),
             )
 
-        project = self.connection.execute(
-            "SELECT origin FROM projects WHERE repo = ?", (request.repo,)
-        ).fetchone()
-        try:
-            expected = str(project["origin"] or "") if project else ""
-            if not expected:
-                return blocked_checkpoint.SafetyVerdict(
-                    False, blocked_checkpoint.SafetyScope.PLAN,
-                    "registered_origin_missing",
-                    "등록 origin이 없어 checkpoint를 local-only로 보존합니다.",
-                    current.head, (),
-                )
-            for context in (self.repo_path, Path(request.worktree)):
-                for arguments in (("remote", "get-url", "--all", "origin"),
-                                  ("remote", "get-url", "--push", "--all", "origin")):
-                    urls = git(context, *arguments).stdout.splitlines()
-                    if len(urls) != 1 or github_repository(urls[0]) != expected:
-                        raise RuntimeError("등록 origin과 fetch/push 대상이 다릅니다.")
-        except RuntimeError as error:
-            return reject("shared_git_config_mutation", str(error))
+        origin_error = self._origin_safety_error(request, current)
+        if origin_error is not None:
+            return origin_error
 
         serialized = plan["agent_snapshot"] or plan["agent_result_snapshot"]
         try:
@@ -24008,7 +24053,8 @@ class _BlockedCheckpointAdapter:
         rows = [line.split() for line in result.stdout.splitlines() if line.strip()]
         if not rows:
             return None
-        if len(rows) != 1 or len(rows[0]) != 2:
+        if (len(rows) != 1 or len(rows[0]) != 2
+                or rows[0][1] != f"refs/heads/{request.branch}"):
             raise RuntimeError("checkpoint 원격 branch 응답이 유일하지 않습니다.")
         oid = rows[0][0]
         if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", oid) is None:
@@ -24044,6 +24090,9 @@ class _BlockedCheckpointAdapter:
             "origin",
             f"{local_oid}:refs/heads/{request.branch}",
         ]
+        if decision.mode in {blocked_checkpoint.PushMode.CREATE, blocked_checkpoint.PushMode.FAST_FORWARD}:
+            arguments.insert(1, '--force-with-lease='
+                             f"refs/heads/{request.branch}:{request.expected_remote_oid or ''}")
         if decision.mode is blocked_checkpoint.PushMode.REBASE_LEASE:
             if not request.expected_remote_oid:
                 raise blocked_checkpoint.CheckpointPushError(
@@ -24054,26 +24103,13 @@ class _BlockedCheckpointAdapter:
                 "--force-with-lease="
                 f"refs/heads/{request.branch}:{request.expected_remote_oid}",
             )
-        pushed = git(Path(request.worktree), *arguments, check=False)
+        scoped_options = (("-c", f"core.hooksPath={os.devnull}")
+                          if self.project_recovery_scope else ())
+        pushed = git(Path(request.worktree), *scoped_options, *arguments, check=False)
         if pushed.returncode:
-            normalized = " ".join(pushed.stdout.casefold().split())
-            permanent = any(
-                marker in normalized
-                for marker in (
-                    "protected branch",
-                    "permission denied",
-                    "not permitted",
-                    "authentication failed",
-                    "authorization failed",
-                    "http 403",
-                    "stale info",
-                    "fetch first",
-                    "non-fast-forward",
-                )
-            )
             raise blocked_checkpoint.CheckpointPushError(
                 "checkpoint push 실패:\n" + pushed.stdout[-8000:],
-                retryable=not permanent,
+                retryable=blocked_checkpoint.push_failure_retryable(pushed.stdout),
             )
 
 
@@ -24086,6 +24122,9 @@ class _BlockedCheckpointResults:
         request: blocked_checkpoint.CheckpointRequest,
         verdict: blocked_checkpoint.SafetyVerdict,
     ) -> None:
+        if scoped_blocking.project_block(self.connection, request.repo) is not None:
+            # A checkpoint refusal cannot replace an independent safety cause.
+            return
         reason = {
             "shared_ref_mutation": BlockReasonCode.SHARED_REF_MUTATION,
             "shared_git_config_mutation": BlockReasonCode.SHARED_GIT_CONFIG_MUTATION,
@@ -24112,6 +24151,25 @@ class _BlockedCheckpointResults:
         # The repository commits the result and outbox together. There must be
         # no separate, crash-sensitive notification transaction here.
         pass
+
+
+def push_diagnostic_checkpoint(adapter, request, head):
+    """Create an exact absent ref; never update original or tracking refs."""
+    if not request.branch or not request.branch.startswith('loop-manager/diagnostics/'):
+        raise RuntimeError('진단 ref 이름이 유효하지 않습니다.')
+    snapshot = capture_git_snapshot(Path(request.worktree))
+    verdict = adapter._origin_safety_error(request, snapshot)
+    if verdict is not None:
+        raise RuntimeError(verdict.detail)
+    # An explicit verified URL avoids Git's automatic remote-tracking update.
+    origin = git(Path(request.worktree), 'remote', 'get-url', '--push', 'origin').stdout.strip()
+    pushed = git(Path(request.worktree), '-c', f'core.hooksPath={os.devnull}', 'push',
+                 f'--force-with-lease=refs/heads/{request.branch}:', origin,
+                 f'{head}:refs/heads/{request.branch}', check=False)
+    if pushed.returncode:
+        raise blocked_checkpoint.CheckpointPushError(
+            '진단 ref 게시 실패: ' + pushed.stdout[-8000:],
+            retryable=blocked_checkpoint.push_failure_retryable(pushed.stdout))
 
 
 def dispatch_blocked_checkpoints(

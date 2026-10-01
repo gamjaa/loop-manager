@@ -137,7 +137,7 @@
 - 기존 ExecPlan 작업을 이어서 처리할 수 있다
 
 흐름:
-1. 프로그램이 `PROJECT_BLOCKED`의 저장소 안전을 확인하고 저장된 모든 Merge 대기 PR의 GitHub identity와 Open·Merged·Closed 상태를 조회한다. 안전 gate가 허용하는 Merge·Close 전이와 worktree cleanup 판정 및 알림 outbox를 기본 worktree 동기화보다 먼저 SQLite에 기록한다. 프로젝트 안전이 증명되지 않으면 기본 worktree 동기화와 저장소 변경 단계를 실행하지 않는다. 단, 원격 ExecPlan catalog 오류 차단은 원인 push를 fetch하고 재검증해야 하므로 이 저장소 안전 gate와 별도로 처리한다
+1. 프로그램이 `PROJECT_BLOCKED`의 저장소 안전을 확인하고 저장된 모든 Merge 대기 PR의 GitHub identity와 Open·Merged·Closed 상태를 조회한다. 안전 gate가 허용하는 Merge·Close 전이와 worktree cleanup 판정 및 알림 outbox를 기본 worktree 동기화보다 먼저 SQLite에 기록한다. 프로젝트 안전이 증명되지 않으면 기본 worktree 동기화와 일반 저장소 변경 단계를 실행하지 않는다. 계획과 연결된 차단의 검증 가능한 대상 작업 복구·보존은 아래의 계획별 실행 자리와 현재 상태 검증 경계에서만 수행한다. 단, 원격 ExecPlan catalog 오류 차단은 원인 push를 fetch하고 재검증해야 하므로 이 저장소 안전 gate와 별도로 처리한다
 2. 프로젝트 안전 gate가 열려 있으면 새 Merge 뒤 `origin/<base-branch>`를 다시 fetch하고 최신 ExecPlan·project 상태를 읽는다. 가능한 ExecPlan archive 게시를 먼저 완료한 뒤 최종 원격 SHA를 기준으로 기본 worktree의 safe fast-forward eligibility와 catalog를 평가한다. 저장된 `PR_OPEN` mirror, 다른 안정된 Open PR 또는 충돌 marker만으로 평가를 생략하지 않는다. 그 뒤 각 `PLAN_BLOCKED`의 계획별 해제 조건 및 `planning_error`의 근거 입력 변경 여부를 독립적으로 확인한다
 3. 동시에 처리할 프로젝트를 `max_workers` 범위에서 선택한다
 4. 실행 중인 변경 단계가 없으면 dependency를 충족한 확정 PR 충돌 복구 하나를 먼저 선택하고, 없으면 프로젝트별 유지보수 평가 주기를 확인한다. `PLAN_BLOCKED` 또는 `PR_OPEN`이 있으면 유지보수 평가는 보류하고 독립 READY 선택으로 이동한다
@@ -211,9 +211,9 @@ PR 없는 게시 checkpoint의 Review 횟수 차단을 rebase 없이 해제할 �
 흐름:
 1. `PLAN_BLOCKED` 상태, scope, 구조화 원인과 판단 근거를 SQLite에 먼저 commit하고 PR이 없는 계획에 별도 durable checkpoint request를 기록한다
 2. 저장된 branch·결정적 worktree·workspace 소유권·HEAD와 Worker 허용 변경 범위가 모두 일치하고 미해결 Git operation, symlink, ignored 파일, 범위 밖 staged entry, index flag 또는 공유 metadata 불확실성이 없을 때만 검증된 pathspec으로 checkpoint commit을 만든다. 이미 commit된 변경이나 변경 없음에는 빈 commit을 만들지 않는다
-3. 같은 소유 branch의 원격이 없으면 생성하고, 저장된 expected OID와 일치하는 fast-forward만 갱신한다. PR 없는 기존 rebase 복구만 정확한 `--force-with-lease`를 사용할 수 있으며 예상하지 못한 원격 commit, branch protection과 권한 거부를 우회하지 않는다
+3. 같은 소유 branch의 원격이 없으면 정확한 부재 lease로 생성하고, 저장된 expected OID의 정확한 lease에 결합된 fast-forward만 갱신한다. fast-forward가 아닌 갱신은 PR 없는 동일 소유 branch의 검증된 관리 rebase에만 허용하며 예상하지 못한 원격 commit, branch protection과 권한 거부를 우회하지 않는다
 4. commit·push phase와 local/remote OID를 저장해 중단 후 같은 checkpoint를 재개하고, 일시적 push 실패는 실행당 제한 횟수만 재시도한 뒤 local commit과 worktree를 보존한다. checkpoint 결과와 무관하게 ExecPlan은 `PLAN_BLOCKED`로 남고 독립 READY 선택 자리를 점유하지 않는다
-5. `PROJECT_BLOCKED`, `planning_error`, 등록·branch 생성 전 실패, 기존 PR 또는 소유권을 증명할 수 없는 legacy 차단에는 원격 쓰기를 수행하지 않고 미게시 이유를 저장한다. 차단 알림은 checkpoint 결과 확정 뒤 성공 시 commit OID와 immutable branch link를, 미게시 시 local-only 이유를 포함한다
+5. `planning_error`, 등록·branch 생성 전 실패, 기존 PR 또는 현재 대상 작업의 소유권·범위를 증명할 수 없는 차단에는 원격 쓰기를 수행하지 않고 미게시 이유를 저장한다. `PROJECT_BLOCKED`에서는 검증 가능한 대상 계획의 복구·보존만 15번의 경계에서 허용한다. 차단 알림은 checkpoint 결과 확정 뒤 성공 시 commit OID와 immutable branch link를, 미게시 시 local-only 이유를 포함한다
 6. 계획별 입력 변경, guidance 결정 또는 닫힌 PR reopen 조건은 해당 `PLAN_BLOCKED`만 재평가한다. PR 없는 게시 checkpoint의 저장된 원격 branch가 달라지면 게시 OID와 마지막 채택 head를 포함하는 후속 commit인지 확인한다. 계획·branch·worktree·저장소 소유권, 로컬 HEAD·index·작업 파일·ignored 경로·Git operation 및 허용 변경 범위를 검증한 뒤 로컬 작업을 보존할 수 있을 때만 같은 branch를 fast-forward한다. 삭제·재작성·분기·소유권 불명확·충돌은 구체적인 이유로 계속 차단한다. 새 OID만으로 해제하지 않고 실제 변경과 원인별 조건을 재평가하며, 해결된 사용자 commit은 Worker 검토와 targeted test, 전체 verify, Review를 다시 거친다. 해결되지 않은 검사 결과는 원격 head와 함께 저장해 동일 입력의 반복 시도와 알림을 막는다. 게시 증거가 없는 legacy checkpoint와 닫힌 PR에는 이 경로를 적용하지 않는다
 7. 해제 조건이 충족된 계획은 기존 branch와 worktree에서 재개하고 재시도 횟수와 verify·Review 실패 지문 이력을 초기화하며 effective Worker level과 승격 이력을 최초 level로 되돌린 뒤 READY 또는 PR_OPEN으로 변경한다. 같은 branch의 최초 PR은 최종 verify와 Review 성공 뒤에만 생성한다
 8. `PROJECT_BLOCKED`는 기본 worktree, 허용되지 않은 공유 ref, 외부 worktree와 workspace 소유권을 다시 검증해 프로젝트 안전이 증명된 경우에만 해제한다. `refs/codex/turn-diffs/*`의 순변경은 해제 조건을 무효화하지 않는다
@@ -222,7 +222,10 @@ PR 없는 게시 checkpoint의 Review 횟수 차단을 rebase 없이 해제할 �
 11. 현재 repository·reservation·등록 worktree·소유 branch·target base·원격 기대값과 rebase metadata가 일치하면 일반 branch 검사 전에 detached rebase를 인식하고 충돌·사용자 stage를 보존한 채 같은 실행을 재개한다. 이미 완료됐으면 Git 단계를 반복하지 않고 결과를 채택한다. 관측을 transaction 안에서 다시 확인하고 대상 원인 해제와 후보 검증 무효화를 함께 기록한다. 다른 활성 실행·planning 또는 미충족 dependency가 있으면 투영·session·진단을 바꾸지 않고 대기한다
 12. rebase 원인 해제는 별도 Review 실패·guidance·사용자 결정·PR reopen·실제 Agent 범위 위반과 다른 계획·planning·프로젝트 안전 원인을 해제하지 않는다. 원문·실패·알림 감사와 기존 branch·worktree·session을 보존하며 변경된 후보는 Worker의 현재 입력·최종 diff 확인과 targeted test, Manager 전체 verify, Reviewer 및 기존 게시 ownership·lease·PR identity 조건을 다시 통과해야 한다
 13. 교정 소진으로 차단된 진행 중 rebase는 저장된 실제 차단 기준선과 현재 입력·선택 worktree를 비교할 수 있고 모두 같으면 차단을 유지해 동일 Worker 실패를 반복하지 않는다. 입력 또는 수동 해결·stage·continue 결과가 바뀌면 현재 상태를 다시 검사한다. 과거 기준선이나 실패 기록의 부재 자체는 복구 거부 조건이 아니다
-14. `PLAN_BLOCKED`의 계획별 원격 관측 입력은 다른 활성 계획·PR 충돌 복구·planning publication·유지보수가 변경 실행 자리를 점유하는 동안 보존한다. 자리가 비었거나 차단된 동일 계획이 점유한 때에만 정확한 원격 ref·PR·계획·branch·worktree·작업 범위를 다시 확인하고, 안전한 작업 branch 후속 commit을 먼저 채택한 뒤 최신 base를 관리 worktree에 반영한다. 계획·Requirement 지문이 같아도 base 전진은 rebase 대상으로 처리한다. PR 없는 기존 branch의 완료 결과는 현재 상태 판정과 중간 checkpoint 게시를 먼저 마친 뒤 원래 원인만 재검사한다. 원인이 남으면 이유와 차단을 유지해 기존 checkpoint 경계로 현재 작업물을 게시하며, 같은 원격 HEAD에는 빈 commit·반복 push를 만들지 않는다. 원인이 해소된 원격 복구는 기존 session·branch·worktree와 실패·승격 감사를 보존하고 후보 검증 토큰을 무효화해 Worker 확인·targeted test·전체 verify·Review부터 다시 진행한다. 저장 단계와 실제 Git 결과를 대조해 중단을 복구하며 동일한 처리 입력과 원인의 검사·rebase·알림을 반복하지 않는다. 별도 사용자 결정·PR reopen·소유권·안전 차단과 다른 계획의 상태는 유지한다
+14. `PLAN_BLOCKED`와 계획과 연결된 `PROJECT_BLOCKED`의 계획별 원격 관측 입력은 다른 활성 계획·PR 충돌 복구·planning publication·유지보수가 변경 실행 자리를 점유하는 동안 보존한다. 자리가 비었거나 차단된 동일 계획이 점유한 때에만 정확한 원격 ref·PR·계획·branch·worktree·작업 범위를 다시 확인하고, 안전한 작업 branch 후속 commit을 먼저 채택한 뒤 최신 base를 관리 worktree에 반영한다. 계획·Requirement 지문이 같아도 base 전진은 rebase 대상으로 처리한다. PR 없는 기존 branch의 완료 결과는 현재 상태 판정과 중간 checkpoint 게시를 먼저 마친 뒤 원래 원인만 재검사한다. 원인이 남으면 이유와 차단을 유지해 기존 checkpoint 경계로 현재 작업물을 게시하며, 같은 원격 HEAD에는 빈 commit·반복 push를 만들지 않는다. 원인이 해소된 원격 복구는 기존 session·branch·worktree와 실패·승격 감사를 보존하고 후보 검증 토큰을 무효화해 Worker 확인·targeted test·전체 verify·Review부터 다시 진행한다. 저장 단계와 실제 Git 결과를 대조해 중단을 복구하며 동일한 처리 입력과 원인의 검사·rebase·알림을 반복하지 않는다. 별도 사용자 결정·PR reopen·소유권·안전 차단과 다른 계획의 상태는 유지한다
+
+15. 프로젝트 차단 중 기존 branch의 게시 identity와 마지막 채택 원격 OID가 확인되면 동일 소유 branch에 관측 OID의 정확한 lease로 checkpoint를 게시한다. fast-forward 또는 PR 없는 검증된 관리 rebase만 허용하며 원래 차단이 남으면 상태·원인을 보존한다. 게시 계보를 증명할 수 없어도 현재 repository·plan·worktree·branch·target·원격 기대값·허용 변경 범위와 rebase 완료를 검증한 작업물은 결정적 진단 branch에 보존한다. 진단 ref는 계획·원본 branch·base·내용 OID에 결합하며 부재 시에만 생성한다. 같은 OID는 재사용하고 다른 OID는 갱신하지 않는다. 원인·ref·OID와 게시 intent·확정 결과는 SQLite에 보존하며 PR 생성·원래 branch 소유권 승격·차단 해제 근거로 사용하지 않는다
+16. 충돌 중이거나 현재 상태·작업 범위를 검증하지 못하면 commit·push하지 않고 작업물·session과 실제 local-only 이유를 보존한다. 원격 삭제·재작성·경쟁·권한·branch protection 오류를 예상 밖 ref의 force push로 우회하지 않는다. 과거 rebase turn·stage 승인·receipt·replay·journal 부재 자체는 현재 상태 판정의 거부 사유가 아니다. 진단 ref 생성·checkpoint commit·push·SQLite 확정 사이의 중단은 저장 intent와 실제 OID를 대조해 복구하며, 같은 입력·같은 결과의 rebase·게시·검사·알림을 반복하지 않는다. 알림에는 확인된 ref·OID 또는 실제 local-only 이유와 보존 경로를 포함한다
 
 ### 사용자 승인 및 완료
 
@@ -285,7 +288,7 @@ PLAN_BLOCKED → PR_OPEN (같은 PR을 사용자가 다시 열음)
 - MERGED: 연결된 PR의 Merge가 확인된 최종 상태
 - PLAN_BLOCKED: 특정 계획의 사용자 결정, 입력 변경, 검증 한도 또는 PR reopen을 기다림
 
-`PROJECT_BLOCKED`는 ExecPlan 상태가 아니라 프로젝트별 안전 gate다. 현재 실행 단계와 작업 공간을 보존한 채 Planner, maintenance Planner, Worker와 Git 쓰기를 중단하며, GitHub PR 상태 확인과 durable 알림 dispatch 같은 읽기·관리 작업만 계속한다. 차단 전이는 코드가 정의한 reason-to-scope mapping, 관련 ExecPlan, 판단 근거와 해제 fingerprint를 하나의 SQLite transaction에 저장한다. 범위를 증명할 수 없는 legacy `BLOCKED`는 보수적으로 `PROJECT_BLOCKED`로 이관한다.
+`PROJECT_BLOCKED`는 ExecPlan 상태가 아니라 프로젝트별 안전 gate다. 현재 실행 단계와 작업 공간을 보존한 채 Planner, maintenance Planner, Worker와 일반 Git 쓰기를 중단한다. GitHub PR 상태·계획별 원격 관측과 durable 알림은 계속하며, 실행 자리와 현재 작업 범위를 독립적으로 증명한 연결 계획의 관리 rebase·checkpoint·진단 게시만 예외로 허용한다. 차단 전이는 코드가 정의한 reason-to-scope mapping, 관련 ExecPlan, 판단 근거와 해제 fingerprint를 하나의 SQLite transaction에 저장한다. 범위를 증명할 수 없는 legacy `BLOCKED`는 보수적으로 `PROJECT_BLOCKED`로 이관한다.
 
 유지보수 cycle은 ExecPlan 상태와 별도로 프로젝트별 SQLite에 보존한다.
 
@@ -352,14 +355,14 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 - dependency를 충족하지 못한 READY만 남은 프로젝트도 명세 또는 no-runnable 전체 입력 trigger가 있으면 Planner를 한 번 실행하고, 성공 기준과 입력이 같으면 대기한다
 - 제품 우선순위는 안전한 무인 실행을 막거나 반복적인 사용자 복구를 요구하는 작업, 정상 경로의 사용자 개입을 제거하는 핵심 자동화, 그 밖의 Current Goal, 선택적 편의와 최적화 순이다
 - 실행 가능한 READY ExecPlan이 여럿이면 제품 우선순위가 높은 계획을 먼저 선택하고 같은 우선순위에서는 숫자 ExecPlan ID가 가장 작은 계획을 선택한다
-- 활성 유지보수 prerequisite 집합은 dependency gate 뒤 priority와 숫자 ID 순으로, 리팩터링 DAG는 dependency gate 뒤 숫자 ID 순으로 선택하며 집합 밖 READY는 cycle이 끝날 때까지 시작하지 않는다. 이때도 `PROJECT_BLOCKED`는 모든 실행을 막고, 다른 `PLAN_BLOCKED`·`PR_OPEN`과 dependency로 연결된 계획은 건너뛴다
+- 활성 유지보수 prerequisite 집합은 dependency gate 뒤 priority와 숫자 ID 순으로, 리팩터링 DAG는 dependency gate 뒤 숫자 ID 순으로 선택하며 집합 밖 READY는 cycle이 끝날 때까지 시작하지 않는다. 이때도 `PROJECT_BLOCKED`는 일반 실행을 막고, 다른 `PLAN_BLOCKED`·`PR_OPEN`과 dependency로 연결된 계획은 건너뛴다
 - 마지막 리팩터링 계획 Merge 뒤에는 최신 원격 기준 사후 재검증을 성공하고 계획 개정의 원격 게시와 catalog 반영을 마칠 때까지 장벽 뒤 READY를 시작하지 않는다
 - 각 ExecPlan은 고유하고 결정적인 이름의 branch와 별도 관리 worktree에서 작업한다
 - 서로 다른 프로젝트는 `max_workers` 범위에서 병렬로 처리한다
 - runtime 자식은 병렬 프로젝트 작업을 제출하기 전에 등록된 self source checkout의 대기 PR을 동기화한다. PR의 실제 base branch가 등록 base와 같음을 확인한 새 self PR Merge만 handoff 근거로 삼는다. Merge 전이·cleanup·알림 outbox를 영속화하고 등록 base의 최신 fetch와 source checkout 안전 동기화를 평가한다. 원격 SHA가 현재 runtime SHA와 같으면 계속 실행하고 fast-forward 후속이면 source 동기화 결과와 관계없이 정상 종료해 다음 외부 실행의 bootstrap에 제어를 넘긴다. handoff 판정 뒤에는 새 Agent·verify·publication 또는 다른 프로젝트 작업을 시작하지 않는다. self Merge가 없거나 다른 프로젝트의 Merge 또는 일반 push만 있으면 handoff하지 않는다. repository·origin·PR base identity, fetch 또는 ancestry를 확인할 수 없으면 성공 handoff로 처리하지 않고 기존 작업 상태를 보존한다
 - `max_workers` 기본값은 3이며 `config/config.ini`에서 변경할 수 있다
 - `PLAN_BLOCKED` 또는 안정된 `PR_OPEN`이 있어도 명세 변경 우선 trigger를 먼저 평가하고, 없으면 독립 READY 하나를 기존 priority와 숫자 ID 순으로 시작한다. 독립 READY가 없으면 변경된 전체 입력만 한 번 재계획한다
-- `PROJECT_BLOCKED` 동안에는 새 Planner, maintenance Planner, Worker와 저장소 변경 단계를 시작하지 않는다
+- `PROJECT_BLOCKED` 동안에는 새 Planner, maintenance Planner, Worker와 일반 저장소 변경 단계를 시작하지 않는다. 연결 계획이 기존 실행 자리를 점유했거나 자리가 비어 있고 현재 작업 범위를 독립적으로 검증한 경우에만 해당 관리 worktree의 원격 복구·보존 Git 쓰기를 허용한다
 
 ### 복구 판단과 최종 차단
 
@@ -367,7 +370,7 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 - 일시적 Git·서비스 실패는 현재 실행을 보존해 다음 실행에서 재시도하고, 유효한 최신 base·catalog 및 실제 소유 Git 상태로 하나의 다음 단계를 확정할 수 있으면 상태를 재구성한다. archive 이동 집합과 rebase 충돌은 진전과 반복 한도를 기록하며 교정한다. Manager가 처음 rebase 충돌을 관측하거나 Worker 결과 형식 오류를 받으면 현재 실행을 끝내고 다음 실행에서 보존된 Worker 세션으로 재개한다. 진행 중인 Worker·검증·Review 교정은 같은 실행에서 이어갈 수 있다
 - 일시 재시도, 상태 재구성, 한도 내 Agent 교정은 현재 phase, branch, worktree, 소유권, Agent session, 승인, 변경, 검증 원문과 실패 이력을 보존하며 차단, 원격 checkpoint, BLOCKED 알림을 만들지 않는다. 한 실행에서 최신 원격 snapshot이 안정되지 않으면 같은 상태로 일시 중단하고 다음 실행에서 다시 판정한다
 - 승인·PR reopen·소유권·Agent 범위·원격 OID 불확실성, 안전한 원본으로 확정할 수 없는 손상, verify·rebase·Worker 결과 형식·Reviewer 프로토콜의 최종 반복 한도 소진과 의미를 확정할 수 없는 무변경 결과만 최종 사용자 조치로 차단한다. Review 유발 Worker 교정의 실행별 한도는 작업을 보존하는 일시 중단으로 처리한다. 최종 기록에는 복구 횟수, 마지막 안정 revision, 남은 불확실성과 실제 조치 대상을 포함한다
-- 최종 `PLAN_BLOCKED`만 안전한 원격 checkpoint 대상이다. BLOCKED 알림은 최종 차단 transaction과 checkpoint 결과 뒤에 생성하고 동일 plan/scope/reason/fingerprint/revision은 한 번만 알린다. 사용자 수정 경로는 원인이 실제 대상을 제공할 때만 표시한다
+- 최종 `PLAN_BLOCKED`와 계획에 연결된 `PROJECT_BLOCKED`의 검증 가능한 대상 작업만 안전한 원격 checkpoint 또는 진단 게시 대상이다. BLOCKED 알림은 최종 차단 transaction과 checkpoint 결과 뒤에 생성하고 동일 plan/scope/reason/fingerprint/revision은 한 번만 알린다. 사용자 수정 경로는 원인이 실제 대상을 제공할 때만 표시한다
 
 ### Model과 Effort 선택
 

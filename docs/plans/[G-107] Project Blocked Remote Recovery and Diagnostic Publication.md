@@ -38,10 +38,13 @@ priority: critical
 
 ## Progress
 
-- [ ] project 차단 중 계획별 안전 복구 경계
-- [ ] 진단 branch 게시·local-only 결과 및 중단 복구
+- [x] project 차단 중 계획별 안전 복구 경계
+- [x] 진단 branch 게시·local-only 결과 및 중단 복구
+- Worker: 현재 상태 수용·직렬 실행 자리·진단 ref 재사용·충돌·중단 복구·알림의 targeted unit test 통과. 실제 Git 회귀 테스트와 전체 verify는 Manager 실행 대기.
 
 ## Decision Log
 
 - `PROJECT_BLOCKED`의 일반 실행 제한은 유지한다. 이 계획은 R-046에 명시된 검증 가능한 대상 작업의 복구·보존만 예외로 허용한다.
 - 2026-09-30: mutable READY snapshot의 기준 revision·원본 hash를 확인해 R-048 완료 정책을 연결했다. G-106을 통해 G-110·G-109를 선행하며 과거 rebase 작업 증거를 project 복구 또는 진단 게시의 필수 조건으로 재도입하지 않는다. 기존 branch의 게시 identity·원격 lease 검증은 유지한다.
+- 2026-10-01: project 복구 orchestration은 `project_blocked_recovery.py`로 분리하고 G-106 원격 관측·후속 commit 채택 및 현재 rebase 상태 서비스를 재사용한다. 진단 intent·결과는 원래 branch 게시 소유권과 분리된 additive SQLite 테이블에 저장한다. 진단 ref는 검증된 push URL과 정확한 부재 lease로 생성해 원래 ref와 tracking ref를 변경하지 않는다. 원래 project 원인·투영·다른 plan 및 감사 기록은 보존하고, 현재 후보 검증 토큰만 무효화한다.
+- 2026-10-01: project 예외 rebase는 명령별 `core.hooksPath`와 `rebase.updateRefs=false`로 hook과 다른 branch의 자동 갱신을 막는다. project 예외 push도 hook을 비활성화한다. 기본 worktree 및 다른 계획 ref의 쓰기 경계는 유지한다.
