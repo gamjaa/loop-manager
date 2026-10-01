@@ -951,6 +951,18 @@ class ProjectBlockedRemoteRecoveryTests(unittest.TestCase):
                 self.connection.execute(reset)
                 self.connection.commit()
 
+    def test_missing_legacy_plan_preserves_project_block_before_dependency_check(self):
+        block = dict(scoped_blocking.project_block(self.connection, self.repo))
+        project = dict(self.connection.execute('SELECT * FROM projects').fetchone())
+        self.connection.execute("DELETE FROM exec_plans WHERE plan_id = 'G-106'")
+        self.connection.commit()
+        self.ports.unmet_execplan_dependencies.side_effect = loop_manager.unmet_execplan_dependencies
+        self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.ports.unmet_execplan_dependencies.assert_not_called()
+        self.ports.git.assert_not_called()
+        self.assertEqual(dict(scoped_blocking.project_block(self.connection, self.repo)), block)
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM projects').fetchone()), project)
+
     def test_manager_project_gate_runs_only_linked_recovery_before_returning_blocked(self):
         self.connection.execute('UPDATE projects SET registered = 1')
         self.connection.commit()
@@ -1081,6 +1093,69 @@ class ProjectBlockedRemoteRecoveryTests(unittest.TestCase):
         self.assertEqual(self.plan()['status'], 'PLAN_BLOCKED')
         self.assertEqual(self.plan()['worker_session_id'], 'session')
         self.ports._publish_direct_rebase_checkpoint.assert_not_called()
+
+    def confirmed_original_checkpoint(self):
+        checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
+        original = 'c' * 40
+        acceptance = self.current_service().require_owned()[1].acceptance
+        acceptance['remote']['oid'] = original
+        acceptance['id'] = managed_rebase_validation.fingerprint(
+            {key: value for key, value in acceptance.items() if key != 'id'})
+        current = checkpoints.accept_current_rebase(self.repo, 'G-106', acceptance=acceptance)
+        current = checkpoints.begin_rebase_publication(
+            self.repo, 'G-106', expected_generation=current.generation,
+            acceptance=acceptance, remote_before=original)
+        published = self.current_service().require_owned()[1].acceptance
+        published['remote']['oid'] = self.head
+        published['id'] = managed_rebase_validation.fingerprint(
+            {key: value for key, value in published.items() if key != 'id'})
+        checkpoints.finish_rebase_publication(
+            self.repo, 'G-106', intent=current.rebase_publication_intent(), acceptance=published)
+        self.connection.execute("UPDATE exec_plans SET publication_remote_oid = ? WHERE plan_id = 'G-106'", (self.head,))
+        self.connection.execute("UPDATE blocked_remote_observations SET branch_oid = ?, branch_result = 'present' WHERE plan_id = 'G-106'", (original,))
+        self.connection.commit()
+        return checkpoints, original
+
+    def test_confirmed_original_publication_supplies_scope_lease_after_generation_advance(self):
+        checkpoints, _ = self.confirmed_original_checkpoint()
+        self.assertIsNone(checkpoints.get(self.repo, 'G-106').current_rebase_acceptance())
+        request = blocked_checkpoint_state.BlockedCheckpointRepository(self.connection).get(self.repo, 'G-106')
+        def inspect(*args, remote_oid, **kwargs):
+            if remote_oid != self.head:
+                raise RuntimeError('stale checkpoint lease')
+        with mock.patch.object(self.recovery, 'independent_scope', side_effect=inspect) as scope:
+            self.assertTrue(self.recovery.checkpoint_scope_verified(
+                self.ports, self.connection, Path('/repo'), Path('/state'), request, self.plan()))
+            scope.assert_called_once()
+            current = checkpoints.get(self.repo, 'G-106')
+            changed = json.loads(json.dumps(current.snapshot))
+            changed['rebase_publication_result']['intent_id'] = 'unconfirmed'
+            for checkpoint in (replace(current, snapshot=changed),
+                               replace(current, operation='rebase_publish'),
+                               replace(current, observed_remote_oid='unexpected')):
+                with self.subTest(checkpoint=checkpoint.operation), mock.patch.object(
+                        execution_checkpoint_state.ExecutionCheckpointRepository, 'get', return_value=checkpoint):
+                    self.assertFalse(self.recovery.checkpoint_scope_verified(
+                        self.ports, self.connection, Path('/repo'), Path('/state'), request, self.plan()))
+            self.connection.execute("UPDATE exec_plans SET publication_remote_oid = 'unexpected' WHERE plan_id = 'G-106'")
+            self.assertFalse(self.recovery.checkpoint_scope_verified(
+                self.ports, self.connection, Path('/repo'), Path('/state'), request, self.plan()))
+
+    def test_confirmed_original_publication_restart_keeps_acceptance_and_skips_fetch(self):
+        checkpoints, original = self.confirmed_original_checkpoint()
+        before = checkpoints.get(self.repo, 'G-106')
+        context = self.complete_context()
+        context.update(diagnostic=False, branch_oid=original)
+        self.ports._current_rebase_service.side_effect = self.current_service
+        service = self.current_service()
+        with (mock.patch.object(blocked_remote_observation, 'observe_refs', return_value=(
+                  blocked_remote_observation.RefObservation('present', self.base),
+                  blocked_remote_observation.RefObservation('present', self.head))),
+              mock.patch.object(self.recovery, 'independent_scope', return_value=(service, service.require_owned()[0]))):
+            self.coordinator._incorporate(self.plan(), context)
+        self.assertEqual(checkpoints.get(self.repo, 'G-106'), before)
+        self.assertFalse(any(call.args[1:2] == ('fetch',) for call in self.ports.git.call_args_list))
+        self.ports._journaled_direct_rebase.assert_not_called()
 
     def test_owned_original_oid_does_not_need_to_be_an_ancestor_of_rebased_head(self):
         self.connection.execute("UPDATE exec_plans SET publication_remote_oid = ? WHERE plan_id = 'G-106'", (self.base,))

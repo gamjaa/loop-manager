@@ -16,7 +16,7 @@ from blocked_plan_reconciliation import (
 from execution_checkpoint_state import ExecutionCheckpointRepository
 from managed_rebase_adoption import revalidation_values
 from managed_rebase_observation import observe_current_rebase
-from managed_rebase_validation import ObservationFailure
+from managed_rebase_validation import ObservationFailure, valid_acceptance
 import blocked_remote_observation as observations
 import runtime_state
 import scoped_blocking
@@ -69,6 +69,34 @@ def independent_scope(ports, connection, repo_path, state_dir, repo, plan,
     return service, observed
 
 
+def _confirmed_original_publication(checkpoint, plan):
+    """Read the current acceptance stored by a confirmed intermediate push.
+
+    Publication advances both generation and remote OID beyond the original
+    rebase acceptance. Its result must still match this selected plan and HEAD.
+    """
+    intent = checkpoint.rebase_publication_intent()
+    result = (checkpoint.snapshot or {}).get('rebase_publication_result')
+    if intent is None or not isinstance(result, dict):
+        return None
+    accepted = result.get('current_acceptance')
+    if (checkpoint.operation is not None or not valid_acceptance(accepted)
+            or checkpoint.generation != accepted['generation'] + 1
+            or result.get('intent_id') != intent['id']
+            or result.get('head') != intent['head']
+            or any(accepted[key] != intent[key] for key in (
+                'repo', 'plan_id', 'repository_identity', 'branch', 'worktree',
+                'target_base_oid', 'head'))
+            or (plan['repo'], plan['plan_id'], plan['branch'], plan['worktree'])
+            != (intent['repo'], intent['plan_id'], intent['branch'], intent['worktree'])
+            or accepted['remote']['pull_request'] is not None
+            or accepted['remote']['oid'] != intent['head']
+            or checkpoint.observed_remote_oid != intent['head']
+            or plan['publication_remote_oid'] != intent['head']):
+        return None
+    return accepted
+
+
 def checkpoint_scope_verified(ports, connection, repo_path, state_dir, request, plan):
     try:
         row = connection.execute(
@@ -78,7 +106,7 @@ def checkpoint_scope_verified(ports, connection, repo_path, state_dir, request, 
         target = checkpoint.target_base_oid or (row['base_oid'] if row else None)
         if not target or row is None:
             return False
-        accepted = checkpoint.current_rebase_acceptance()
+        accepted = checkpoint.current_rebase_acceptance() or _confirmed_original_publication(checkpoint, plan)
         remote = checkpoint.observed_remote_oid if accepted else row['branch_oid']
         independent_scope(ports, connection, repo_path, state_dir, request.repo, plan,
                           target=target, remote_oid=remote)
@@ -222,7 +250,7 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
                     and intent['head'] == remote == self._plan(plan_id)['publication_remote_oid']):
                 self._adopt(plan, {**context, 'branch_oid': remote})
             context['branch_oid'] = remote
-        accepted = current.current_rebase_acceptance()
+        accepted = current.current_rebase_acceptance() or _confirmed_original_publication(current, self._plan(plan_id))
         completed = bool(accepted and accepted['target_base_oid'] == target
                          and accepted['remote']['oid'] == remote
                          and accepted['head'] == self.ports.git(
@@ -377,6 +405,10 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
     def reconcile(self, plan_id):
         if not project_slot_available(self.connection, self.repo, plan_id):
             return 'deferred'
+        if self._plan(plan_id) is None:
+            # Legacy project projections may name a plan absent from the
+            # catalog. Preserve that safety block without attempting recovery.
+            return 'blocked'
         if self.ports.unmet_execplan_dependencies(self.connection, self.repo, plan_id):
             return 'deferred'
         row = self.connection.execute('SELECT * FROM blocked_remote_observations WHERE repo = ? AND plan_id = ?',

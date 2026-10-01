@@ -1975,6 +1975,27 @@ class PlannerFutureIdeasTest(unittest.TestCase):
 
 
 class ProjectDiagnosticPublicationUnitTests(unittest.TestCase):
+    def test_planner_import_fixture_contains_direct_manager_modules(self):
+        import ast
+        import inspect
+        import textwrap
+        fixture = ast.parse(textwrap.dedent(inspect.getsource(
+            AgentScopeValidatorTest.test_planner_import_bytecode_is_ignored_without_hiding_scope_violations)))
+        copied = next(node.iter for node in ast.walk(fixture)
+                      if isinstance(node, ast.For) and isinstance(node.target, ast.Name)
+                      and node.target.id == 'module_name')
+        modules = {node.value for node in copied.elts}
+        manager = ast.parse(Path(loop_manager.__file__).read_text(encoding='utf-8'))
+        imports = set()
+        for node in manager.body:
+            if isinstance(node, ast.Import):
+                imports.update(alias.name.split('.')[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imports.add(node.module.split('.')[0])
+        required = {name + '.py' for name in imports
+                    if (Path(loop_manager.__file__).parent / (name + '.py')).is_file()}
+        self.assertFalse(required - modules, required - modules)
+
     def test_missing_origin_keeps_local_only_scope_and_mismatched_push_url_is_rejected(self):
         connection = mock.Mock()
         adapter = loop_manager._BlockedCheckpointAdapter(connection, Path('/repo'), Path('/state'), 'repo')
@@ -8285,6 +8306,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "blocked_checkpoint_state.py",
                 "blocked_plan_reconciliation.py",
                 "blocked_remote_observation.py",
+                "project_blocked_recovery.py",
                 "document_drafts.py",
                 "document_publication.py",
                 "checkpoint_ownership.py",
@@ -8337,6 +8359,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "requirement_archive_recovery.py",
                 "requirement_archive_state.py",
                 "runtime_state.py",
+                "runtime_scope.py",
                 "scoped_blocking.py",
                 "validation_feedback.py",
                 "validation_feedback_state.py",
