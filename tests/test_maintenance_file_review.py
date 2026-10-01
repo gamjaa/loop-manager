@@ -52,6 +52,36 @@ def result_for(source, excerpt, content):
     }
 
 
+class FileReviewPromptTest(unittest.TestCase):
+    def test_quality_guidance_preserves_single_file_review_contract(self):
+        for content in (b"", b"def calculate(): return 1\n",
+                        b"x" * (review.MAX_EMBEDDED_SOURCE_BYTES + 1)):
+            with self.subTest(size=len(content)):
+                source = maintenance_file_inventory.TrackedSource(
+                    "src/calc.py", hashlib.sha256(content).hexdigest(), "100644",
+                    "a" * 40, "source",
+                )
+                prompt = review.review_prompt(source, content)
+                for phrase in (
+                    "기존 구현·공유 helper·관련 테스트와 표준 도구",
+                    "현재 목표에 필요하지 않은 추상화·설정·파일 추가",
+                    "오류 처리·보안·접근성·회귀 검증",
+                    "결정·예외·실패 흐름과 Acceptance Criteria의 의미",
+                    "파일이나 문서를 수정하지 마라",
+                    "길이만으로 개선을 강제하지 말고",
+                    "FILE_REVIEW_RESULT:",
+                    "chunk_reviews:",
+                ):
+                    self.assertIn(phrase, prompt)
+                self.assertIn(source.content_hash, prompt)
+                self.assertIn(source.revision, prompt)
+                self.assertIn(source.path, prompt)
+                if len(content) > review.MAX_EMBEDDED_SOURCE_BYTES:
+                    self.assertIn("작은 연속 구간으로 끝까지 읽어라", prompt)
+                else:
+                    self.assertIn("원본 시작\n" + content.decode() + "\n원본 끝", prompt)
+
+
 class ProvisionalFileReviewTest(unittest.TestCase):
     def test_structured_reference_candidates_are_normalized_and_source_checked(self):
         content = b"def calculate(): return helper()\n"

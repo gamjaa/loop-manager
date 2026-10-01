@@ -796,6 +796,31 @@ class MaintenanceOrchestrationTest(unittest.TestCase):
             with self.subTest(signal=signal):
                 self.assertIn(signal, prompt)
 
+    def test_maintenance_planner_prompt_shares_quality_guidance_in_each_mode(self):
+        for mode in MaintenancePlanMode:
+            context = MaintenancePlanningContext(
+                repo="/quality-guidance",
+                mode=mode,
+                active_sha="a" * 40,
+                cycle_revision=1,
+                cycle_phase="ASSESSMENT",
+                eligible_plans=(),
+            )
+            prompt = loop_manager.maintenance_planner_prompt(
+                context,
+                "[]",
+                "{}",
+                include_general_planning=mode is MaintenancePlanMode.BARRIER,
+            )
+            for signal in (
+                "기존 구현·공유 helper·관련 테스트와 표준 도구",
+                "현재 목표에 필요하지 않은 추상화·설정·파일 추가",
+                "오류 처리·보안·접근성·회귀 검증",
+                "결정·예외·실패 흐름과 Acceptance Criteria의 의미",
+            ):
+                with self.subTest(mode=mode, signal=signal):
+                    self.assertIn(signal, prompt)
+
     def test_active_legacy_cycle_combines_general_gate_in_one_planner_call(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -297,6 +297,35 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
                     root, "HEAD", approve_agents_mismatch=True
                 )
 
+    def test_copy_project_files_distributes_document_quality_guidance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "project"
+            target.mkdir()
+            subprocess.run(
+                [
+                    "bash",
+                    str(loop_manager.ROOT / "scripts/copy-project-files.sh"),
+                    str(target),
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+
+            skill = (target / ".agents/skills/specification-docs/SKILL.md").read_text(
+                encoding="utf-8"
+            )
+
+        for phrase in (
+            "기존 문서와 템플릿의 재사용 가능성",
+            "현재 요청에 필요하지 않은 구조·파일·표현",
+            "결정, 예외, 실패 흐름, Acceptance Criteria의 의미",
+            "간결화를 위해",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, skill)
+
     def test_registration_rejects_unchanged_product_and_architecture_templates(self):
         for filename, expected in (
             ("PRODUCT", "PRODUCT.md"),

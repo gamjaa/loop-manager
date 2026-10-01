@@ -21,6 +21,7 @@ from maintenance_file_inventory import (
     verify_remote_revision,
 )
 from maintenance_file_ledger import FileReviewRepository
+from quality_guidance import AGENT_QUALITY_GUIDANCE
 
 
 class FileReviewError(ValueError):
@@ -315,6 +316,7 @@ def review_prompt(source: TrackedSource, content: bytes) -> str:
         "책임과 외부 연동, 오류 복구, 테스트 경계, 중복 및 후속 작업의 관련 없는 문맥 "
         "감소를 각각 구체적으로 평가하라. 현재 원본에서 확인한 직접 참조·유사 책임 중 "
         "나중에 확인할 후보만 pending에 남겨라. 문맥 파일은 검토 완료 대상으로 세지 마라.\n"
+        f"{AGENT_QUALITY_GUIDANCE}\n"
         f"source identity: {source_location}\n"
         + source_instruction +
         "최종 응답에는 FILE_REVIEW_RESULT: 다음에 한 줄 JSON object를 정확히 하나 기록하라. "

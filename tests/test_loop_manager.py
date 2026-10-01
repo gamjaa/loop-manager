@@ -4536,6 +4536,7 @@ risk: medium
         self.assertIsNotNone(plan["blocked_fingerprint"])
 
     def test_worker_and_reviewer_prompts_define_test_execution_boundary(self):
+        planner = loop_manager.planner_prompt(None)
         worker = loop_manager.worker_prompt("docs/plans/[G-001] Worker Boundary.md", None)
         reviewer = loop_manager.reviewer_prompt("main")
         no_test_reviewer = loop_manager.reviewer_prompt(
@@ -4566,6 +4567,12 @@ risk: medium
         self.assertIn("COMMIT_TITLE:", worker)
         self.assertIn("PR_SUMMARY:", worker)
         self.assertIn("TARGETED_TESTS:", worker)
+        for prompt in (planner, worker, reviewer):
+            with self.subTest(prompt=prompt[:32]):
+                self.assertIn("기존 구현·공유 helper·관련 테스트와 표준 도구", prompt)
+                self.assertIn("현재 목표에 필요하지 않은 추상화·설정·파일 추가", prompt)
+                self.assertIn("오류 처리·보안·접근성·회귀 검증", prompt)
+                self.assertIn("결정·예외·실패 흐름과 Acceptance Criteria의 의미", prompt)
         self.assertIsNone(
             loop_manager.reviewer_targeted_test_reason("targeted test: PASS")
         )
@@ -8540,6 +8547,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 "execution_revision.py",
                 "execution_state.py",
                 "guidance_approval.py",
+                "quality_guidance.py",
                 "execplan_archive.py",
                 "execplan_archive_state.py",
                 "execplan_catalog.py",

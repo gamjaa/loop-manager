@@ -56,6 +56,7 @@ from managed_config import ManagedConfig, ManagedConfigError, load_managed_confi
 import notifications
 import work_exhaustion
 import reviewer_specification
+from quality_guidance import AGENT_QUALITY_GUIDANCE
 import blocked_checkpoint
 import blocked_checkpoint_state
 import project_blocked_recovery
@@ -19055,6 +19056,7 @@ def planner_prompt(
     return f"""
 당신은 Loop Manager의 Planner다.
 AGENTS.md, 활성 PRODUCT와 Requirement, docs/ARCHITECTURE.md, docs/PLANS.md 및 현재 코드·테스트를 읽어라.
+{AGENT_QUALITY_GUIDANCE}
 아래 compact catalog는 SQLite의 비종료 ExecPlan만 코드로 직렬화한 것이다. MERGED 계획은 제외됐다.
 {compact_catalog}
 
@@ -19130,6 +19132,7 @@ MAINTENANCE_RESULT: {{"outcome":"unsafe","reason":"구체적인 진단"}}
     return f"""
 당신은 Loop Manager의 유지보수 Planner다.
 AGENTS.md, 활성 PRODUCT와 Requirement, docs/ARCHITECTURE.md, docs/PLANS.md, 현재 코드·테스트 및 아래 compact catalog와 bounded 변경 문맥을 읽어라.
+{AGENT_QUALITY_GUIDANCE}
 책임·상태 전이·외부 연동의 혼합, 핵심 경로의 반복 변경 집중, 독립 테스트가 어려운 경계, 이름·제어 흐름·결합도, 오류 복구 경계, 중복 구현·불필요한 전역 가변 상태와 후속 변경 충돌을 함께 검토하라.
 assessment에서는 선정 파일의 원본을 실제로 읽는 파일별 단위와 동시에 책임·진입점·공개 심벌·직접 참조·관련 테스트 경로의 짧은 코드맵을 만든다. 아래 잠정 기록은 관계 확인 후보이지 성공 ledger가 아니다. 변경되지 않은 파일은 필요한 문맥으로만 읽고 검토 완료 대상으로 세지 마라. 인용과 source revision을 확인하고, 줄 수나 토큰 수만으로 분리를 강제하지 마라.
 
@@ -19250,6 +19253,7 @@ Patch:
     return f"""
 당신은 Loop Manager의 Worker다.
 AGENTS.md와 {plan_path}를 읽고 해당 ExecPlan 하나만 구현하라.
+{AGENT_QUALITY_GUIDANCE}
 관련 targeted test를 작성하되 commit, push, PR 생성과 scripts/verify 실행은 하지 마라.
 docs/plans에 새 ExecPlan을 만들지 말고 불필요한 후속 기능도 구현하지 마라.
 {plans_scope}
@@ -19972,6 +19976,7 @@ def reviewer_prompt(
     return f"""
 origin/{base}와 현재 HEAD의 차이를 읽기 전용으로 검토하라.
 AGENTS.md, 근거 PRODUCT/Requirement, ARCHITECTURE와 ExecPlan을 기준으로 correctness, 회귀, 테스트 누락, verify 약화를 확인하라.
+{AGENT_QUALITY_GUIDANCE}
 {targeted_test_context}
 {recovery}
 {correction}

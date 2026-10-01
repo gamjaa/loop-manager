@@ -26,6 +26,10 @@ description: Create, review, and refine PRODUCT.md, ARCHITECTURE.md, requirement
 
 초기 제품은 `PRODUCT.md`에서 정의할 수 있다. 운영 중 새 기능이나 정책 변경은 Requirement에서 시작하고, 구현이 완료된 뒤 계속 유지할 규칙만 `PRODUCT.md`에 반영한다. 구현 세부를 PRODUCT나 Requirement에 넣거나 사용자 동작을 ARCHITECTURE에 중복하지 않는다.
 
+## Quality Guidance
+
+문서를 작성하거나 검토하기 전에 기존 문서와 템플릿의 재사용 가능성을 확인하고, 현재 요청에 필요하지 않은 구조·파일·표현을 추가하지 않는다. PRODUCT·Requirement·ARCHITECTURE의 역할을 유지한 채 중복과 장황함을 줄인다. 간결화를 위해 결정, 예외, 실패 흐름, Acceptance Criteria의 의미나 필요한 완전성을 생략하지 않는다.
+
 ## Write Scope
 
 프로젝트의 다른 파일은 문맥 확인을 위해 읽을 수 있지만, 일반적인 Skill 작업에서 생성·수정·삭제할 수 있는 파일은 다음으로 제한한다.
