@@ -43,6 +43,7 @@ priority: critical
 - Worker: 현재 상태 수용·직렬 실행 자리·진단 ref 재사용·충돌·중단 복구·알림의 targeted unit test 통과. 실제 Git 회귀 테스트와 전체 verify는 Manager 실행 대기.
 - Manager의 600초 verify 시간 초과를 진단해 Git fixture class의 전역 import로 중복 수집되던 실제 Git 테스트 72개를 제거했다. 기존 고유 검증은 모두 유지하고 수집 회귀 unit test와 Linux verify의 개별 case 진행 출력을 추가했다. 전체 verify 재실행은 Manager 대기.
 - 중복 제거 후 Manager verify는 1,639개 case를 535.144초에 마쳤으며 세 건의 실패를 전달했다. legacy catalog 누락, 중간 게시 완료 후 lease 선택과 import fixture 누락을 수정하고 관련 최소 범위 unit test 5개를 검증했다. 실제 Git 회귀와 전체 verify 재실행은 Manager 대기.
+- Reviewer의 읽기 전용 Git 실행 전 sandbox 오류를 재현했다. 승인 검토를 거친 읽기 전용 명령으로 기존 구현 diff와 근거 문서를 열 수 있음을 확인했다. 코드 결함 피드백은 없으며 Reviewer 재검토는 대기 중이다.
 
 ## Decision Log
 
@@ -52,3 +53,4 @@ priority: critical
 - 2026-10-01: project 예외 rebase는 명령별 `core.hooksPath`와 `rebase.updateRefs=false`로 hook과 다른 branch의 자동 갱신을 막는다. project 예외 push도 hook을 비활성화한다. 기본 worktree 및 다른 계획 ref의 쓰기 경계는 유지한다.
 - 2026-10-01: verify 피드백 `8262527e49a77b20169ba26cc971a4d307032fe79ff83eb5b88e46bd1258594e`를 읽기 전용으로 조사했다. 04:56:03에 600초 제한으로 종료됐으며 마지막 04:55:38 runtime 출력 뒤 22개 case가 완료됐다. 그 다음 순서의 `test_final_assessment_uses_independent_pages_and_durable_evidence`는 단독 unit 실행에서 1.469초에 통과했다. 실행 없는 discovery에서 기존 1,710개 중 고유 case는 1,638개이고 `BlockedCheckpointGitAdapterTest`의 72개가 전역 fixture import 때문에 두 번 수집됨을 확인했다. fixture를 모듈 경유로 참조해 고유 검증을 보존하고, 재발 방지 unit test와 `-v` 진행 출력을 추가한다. 시간 상한은 변경하지 않고 중복 제거 후 전체 검증을 Manager에 맡긴다.
 - 2026-10-01: verify 피드백 `5840f78b5b77c598bb47c64daf5306bcd816ff75610c1280afaf5bdaf5c7bbdd`의 세 실패를 진단했다. catalog에 없는 legacy 계획은 dependency 검사 전에 원래 project 차단을 보존한다. G-104 게시 완료는 원래 rebase 수용보다 checkpoint generation·원격 OID를 전진시키므로, intent·확인된 현재 acceptance·plan 게시 OID가 모두 일치할 때만 그 lease를 현재 범위 검사와 멱등 복구에 사용한다. 미확정·변조·원격 불일치는 허용하지 않으며 실제 현재 Git 상태 검사는 유지한다. planner import fixture는 누락된 `project_blocked_recovery.py`와 `runtime_scope.py`를 포함하고 직접 import 의존성 목록을 unit test로 검사한다.
+- 2026-10-01: `review:agents.md::reviewer::review-environment-blocked`는 Git 명령 실행 전에 발생한 환경 오류다. 현재 Worker에서도 기본 실행이 같은 오류로 실패했으며 `/proc/self/mountinfo`와 경로 metadata에서 `/tmp/codex-daemon-1001`이 현재 사용자 소유이지만 mode `000`인 읽기 전용 tmpfs로 가려져 있음을 확인했다. 이 mount는 Worker에서 권한을 복구할 수 없다. `require_escalated`로 승인 검토를 거친 `git status`, `git log`, 실제 코드 diff 및 ExecPlan 읽기는 정상 종료했고 해당 명령 안에서도 차단 mount는 유지됐다. Reviewer는 승인 가능한 읽기 전용 명령으로 재시도하거나 Manager가 Agent 실행 환경을 재생성한 뒤 재검토해야 한다. sandbox·AGENTS 규칙과 검증 항목은 변경하지 않으며 이번 진단은 문서 기록만 추가하므로 테스트·verify를 재실행하지 않는다.
