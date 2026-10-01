@@ -30,7 +30,7 @@ from execution_runtime import (
 )
 from tests import test_runtime_state
 from tests.test_guidance_approval import guidance_plan
-from tests.test_blocked_checkpoint import BlockedCheckpointGitAdapterTest
+from tests import test_blocked_checkpoint
 import blocked_checkpoint_state
 import blocked_checkpoint
 from worker_session import SessionBinding, SessionTransition
@@ -126,7 +126,7 @@ class ExecutionHandlerTests(TestCase):
                                           existing_pr=False, published_checkpoint=False,
                                           stale_cache=False, manual=None):
         self.journal_start.stop()
-        fixture = BlockedCheckpointGitAdapterTest(methodName='runTest')
+        fixture = test_blocked_checkpoint.BlockedCheckpointGitAdapterTest(methodName='runTest')
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
         self.addCleanup(fixture.tearDown)
@@ -588,7 +588,7 @@ class ExecutionHandlerTests(TestCase):
     def test_real_git_published_review_release_restart_and_correction(self):
         # Exercise the ownership boundary with real commits, refs, registration,
         # snapshots and SQLite persistence; only external PR/agent services are fake.
-        fixture = BlockedCheckpointGitAdapterTest(methodName='runTest')
+        fixture = test_blocked_checkpoint.BlockedCheckpointGitAdapterTest(methodName='runTest')
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
         self.addCleanup(fixture.tearDown)
@@ -1731,7 +1731,7 @@ class ExecutionHandlerTests(TestCase):
         self.effects.agent.run_agent.assert_not_called()
 
     def _run_real_worker_guidance_checkpoint(self, *, implementation_changes):
-        fixture = BlockedCheckpointGitAdapterTest(methodName='runTest')
+        fixture = test_blocked_checkpoint.BlockedCheckpointGitAdapterTest(methodName='runTest')
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
         self.addCleanup(fixture.tearDown)

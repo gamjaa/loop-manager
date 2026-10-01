@@ -41,6 +41,7 @@ priority: critical
 - [x] project 차단 중 계획별 안전 복구 경계
 - [x] 진단 branch 게시·local-only 결과 및 중단 복구
 - Worker: 현재 상태 수용·직렬 실행 자리·진단 ref 재사용·충돌·중단 복구·알림의 targeted unit test 통과. 실제 Git 회귀 테스트와 전체 verify는 Manager 실행 대기.
+- Manager의 600초 verify 시간 초과를 진단해 Git fixture class의 전역 import로 중복 수집되던 실제 Git 테스트 72개를 제거했다. 기존 고유 검증은 모두 유지하고 수집 회귀 unit test와 Linux verify의 개별 case 진행 출력을 추가했다. 전체 verify 재실행은 Manager 대기.
 
 ## Decision Log
 
@@ -48,3 +49,4 @@ priority: critical
 - 2026-09-30: mutable READY snapshot의 기준 revision·원본 hash를 확인해 R-048 완료 정책을 연결했다. G-106을 통해 G-110·G-109를 선행하며 과거 rebase 작업 증거를 project 복구 또는 진단 게시의 필수 조건으로 재도입하지 않는다. 기존 branch의 게시 identity·원격 lease 검증은 유지한다.
 - 2026-10-01: project 복구 orchestration은 `project_blocked_recovery.py`로 분리하고 G-106 원격 관측·후속 commit 채택 및 현재 rebase 상태 서비스를 재사용한다. 진단 intent·결과는 원래 branch 게시 소유권과 분리된 additive SQLite 테이블에 저장한다. 진단 ref는 검증된 push URL과 정확한 부재 lease로 생성해 원래 ref와 tracking ref를 변경하지 않는다. 원래 project 원인·투영·다른 plan 및 감사 기록은 보존하고, 현재 후보 검증 토큰만 무효화한다.
 - 2026-10-01: project 예외 rebase는 명령별 `core.hooksPath`와 `rebase.updateRefs=false`로 hook과 다른 branch의 자동 갱신을 막는다. project 예외 push도 hook을 비활성화한다. 기본 worktree 및 다른 계획 ref의 쓰기 경계는 유지한다.
+- 2026-10-01: verify 피드백 `8262527e49a77b20169ba26cc971a4d307032fe79ff83eb5b88e46bd1258594e`를 읽기 전용으로 조사했다. 04:56:03에 600초 제한으로 종료됐으며 마지막 04:55:38 runtime 출력 뒤 22개 case가 완료됐다. 그 다음 순서의 `test_final_assessment_uses_independent_pages_and_durable_evidence`는 단독 unit 실행에서 1.469초에 통과했다. 실행 없는 discovery에서 기존 1,710개 중 고유 case는 1,638개이고 `BlockedCheckpointGitAdapterTest`의 72개가 전역 fixture import 때문에 두 번 수집됨을 확인했다. fixture를 모듈 경유로 참조해 고유 검증을 보존하고, 재발 방지 unit test와 `-v` 진행 출력을 추가한다. 시간 상한은 변경하지 않고 중복 제거 후 전체 검증을 Manager에 맡긴다.

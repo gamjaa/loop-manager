@@ -164,6 +164,27 @@ class BlockedCheckpointRefreshUnitTests(unittest.TestCase):
         commands.assert_not_called()
 
 
+class BlockedCheckpointDiscoveryUnitTests(unittest.TestCase):
+    def test_git_fixture_cases_are_collected_once_across_consuming_modules(self):
+        from collections import Counter
+        from tests import test_blocked_checkpoint, test_execution_handlers
+
+        def cases(suite):
+            for item in suite:
+                if isinstance(item, unittest.TestSuite):
+                    yield from cases(item)
+                else:
+                    yield item.id()
+
+        loader = unittest.TestLoader()
+        fixture_ids = set(cases(loader.loadTestsFromTestCase(
+            test_blocked_checkpoint.BlockedCheckpointGitAdapterTest)))
+        counts = Counter(case for module in (test_blocked_checkpoint, test_execution_handlers)
+                         for case in cases(loader.loadTestsFromModule(module)))
+        self.assertTrue(fixture_ids)
+        self.assertEqual({counts[case] for case in fixture_ids}, {1})
+
+
 class BlockedCheckpointPolicyTest(unittest.TestCase):
     def test_project_exception_still_requires_current_scope_and_git_safety(self):
         denied = blocked_checkpoint.assess_safety(self.observation(project_blocked=True))
