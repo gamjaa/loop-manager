@@ -4597,10 +4597,10 @@ class ExecutionHandlers:
             )
             context = self._context()
         if int(row['pr_conflict_recovery']):
-            return self._publish_conflict_recovery(context, row)
+            return self._publish_conflict_recovery(context, row, publication.local_oid)
         return self._publish_new_pull_request(context, row)
 
-    def _publish_conflict_recovery(self, context, row):
+    def _publish_conflict_recovery(self, context, row, expected_oid):
         current_pr = self.effects.publication.pr_for_branch(self.repo_path, context.branch, str(row['pr_url'] or ''))
         if current_pr is None:
             publication_error = '게시 직전 저장된 기존 PR을 다시 조회할 수 없습니다.'
@@ -4631,6 +4631,7 @@ class ExecutionHandlers:
                 context.branch,
                 context.worktree,
                 current_pr,
+                expected_oid,
             )
         except (self.effects.contract.PublicationSafetyError, self.effects.contract.WorkspaceOwnershipError) as error:
             publication_error = str(error)
@@ -4755,7 +4756,7 @@ class ExecutionHandlers:
                 )
                 head_oid = self.effects.publication.push_managed_publication_branch(
                     self.repo_path, self.state_dir, self.repo,
-                    context.branch, context.worktree,
+                    context.branch, context.worktree, publication.local_oid,
                 )
                 self._complete_publication_intent(context)
         except (self.effects.contract.PublicationSafetyError, self.effects.contract.WorkspaceOwnershipError) as error:
@@ -4790,32 +4791,42 @@ class ExecutionHandlers:
         except (self.effects.contract.PublicationSafetyError, self.effects.contract.WorkspaceOwnershipError) as error:
             return self._block_final(self.repo, context.worktree, str(error),
                 str(self._row()['verify_result'] or ''), reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN)
-        if after_push.local_oid != head_oid or after_push.remote_oid != head_oid:
+        if after_push.local_oid != head_oid:
             return self._block_final(self.repo, context.worktree,
-                'PR 생성 직전 관리 HEAD 또는 원격 게시 ref가 변경됐습니다.',
+                'PR 생성 직전 관리 HEAD가 검증한 게시 commit과 다릅니다.',
                 str(self._row()['verify_result'] or ''), reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN)
         existing_after_push = after_push.pull_request
-        current = (self.effects.checkpoint.get(self.repo, context.plan.plan_id)
-                   if self.effects.checkpoint else None)
-        if not self._owned_checkpoint_remote(
-            context, self._row(), after_push.remote_oid, current,
-            existing_after_push,
-        ):
+        if (existing_after_push is not None
+                and assess_publication(after_push) is not PublicationNext.ATTACH_PR):
             return self._block_final(
                 self.repo, context.worktree,
-                'push 뒤 checkpoint branch의 원격 OID 또는 PR 소유권을 증명할 수 없습니다.',
+                'push 뒤 PR head가 검증한 게시 commit과 다릅니다.',
                 str(self._row()['verify_result'] or ''),
                 reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
             )
-        if existing_after_push is not None:
-            if (after_push.local_oid != head_oid
-                    or assess_publication(after_push) is not PublicationNext.ATTACH_PR):
+        # GitHub's terminal PR state remains authoritative after automatic
+        # head-branch deletion. Active publication still requires its live ref.
+        terminal_pr = (existing_after_push is not None
+                       and str(existing_after_push.get('state') or '').upper()
+                       in {'CLOSED', 'MERGED'})
+        if not terminal_pr:
+            if after_push.remote_oid != head_oid:
+                return self._block_final(self.repo, context.worktree,
+                    'PR 생성 직전 원격 게시 ref가 변경됐습니다.',
+                    str(self._row()['verify_result'] or ''), reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN)
+            current = (self.effects.checkpoint.get(self.repo, context.plan.plan_id)
+                       if self.effects.checkpoint else None)
+            if not self._owned_checkpoint_remote(
+                context, self._row(), after_push.remote_oid, current,
+                existing_after_push,
+            ):
                 return self._block_final(
                     self.repo, context.worktree,
-                    'push 뒤 PR head가 검증한 게시 commit과 다릅니다.',
+                    'push 뒤 checkpoint branch의 원격 OID 또는 PR 소유권을 증명할 수 없습니다.',
                     str(self._row()['verify_result'] or ''),
                     reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
                 )
+        if existing_after_push is not None:
             reconciliation = self.effects.publication.reconcile_existing_pull_request(
                 self.repo_path, self.state_dir, self.repo, self._row(),
                 existing_after_push,

@@ -14623,13 +14623,13 @@ class LatestBasePublicationTest(unittest.TestCase):
             with self.assertRaises(loop_manager.PublicationSafetyError):
                 loop_manager.push_managed_publication_branch(
                     connection, Path('/repo'), Path('/state'), 'repo',
-                    branch, Path('/managed'),
+                    branch, Path('/managed'), 'b' * 40,
                 )
             remote.return_value = None
             with self.assertRaises(loop_manager.PublicationSafetyError):
                 loop_manager.push_managed_publication_branch(
                     connection, Path('/repo'), Path('/state'), 'repo',
-                    branch, Path('/managed'),
+                    branch, Path('/managed'), 'b' * 40,
                 )
         self.assertFalse(any(args[0] == 'push' for args in calls))
 
@@ -14667,7 +14667,7 @@ class LatestBasePublicationTest(unittest.TestCase):
         ):
             result = loop_manager.push_managed_publication_branch(
                 connection, Path('/repo'), Path('/state'), 'repo',
-                branch, Path('/managed'),
+                branch, Path('/managed'), new,
             )
 
         self.assertEqual(result, new)
@@ -14711,7 +14711,7 @@ class LatestBasePublicationTest(unittest.TestCase):
         ):
             self.assertEqual(loop_manager.push_owned_pr_conflict_recovery(
                 connection, Path('/repo'), Path('/state'), 'repo', branch,
-                Path('/managed'), pr), new)
+                Path('/managed'), pr, new), new)
         self.assertEqual([args for args in calls if args[0] == 'push'], [(
             'push', f'--force-with-lease=refs/heads/{branch}:{old}',
             'origin', f'{new}:refs/heads/{branch}')])

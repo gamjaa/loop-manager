@@ -3983,21 +3983,23 @@ class ExecutionHandlerTests(TestCase):
     def test_post_push_pr_with_verified_head_is_attached(self):
         self._assert_post_push_pr_attachment('base', True)
 
-    def _assert_post_push_pr_attachment(self, pr_head, accepted):
+    def _assert_post_push_pr_attachment(self, pr_head, accepted, *,
+                                       pr_state='OPEN', remote_deleted=False,
+                                       reconciled_kind=ExecutionOutcomeKind.SUCCESS):
         self.state.update_project('repo', validated_base_sha='base')
         self.effects.publication.push_managed_publication_branch.side_effect = (
             lambda *_: self.calls.append('push') or 'base'
         )
         self.effects.workspace.remote_branch_oid.side_effect = (
-            lambda *_: 'base' if 'push' in self.calls else None
+            lambda *_: 'base' if 'push' in self.calls and not remote_deleted else None
         )
         self.effects.publication.pr_for_branch.side_effect = lambda *_: (
-            {'url': 'existing', 'state': 'OPEN', 'headRefOid': pr_head,
+            {'url': 'existing', 'state': pr_state, 'headRefOid': pr_head,
              'headRefName': 'loop-manager/G-047'} if 'push' in self.calls else None
         )
         self.effects.publication.reconcile_existing_pull_request.return_value = 0
         result = self.handler.publish(self.context('PUBLISHING'), self.handler)
-        self.assertEqual(result.kind, ExecutionOutcomeKind.SUCCESS if accepted
+        self.assertEqual(result.kind, reconciled_kind if accepted
                          else ExecutionOutcomeKind.FINAL_BLOCK)
         self.assertEqual(self.effects.publication.reconcile_existing_pull_request.call_count,
                          int(accepted))
@@ -7268,6 +7270,32 @@ class TaskRelevantPublicationBoundaryTests(TestCase):
         self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
         self.effects.publication.command.assert_not_called()
 
+    def test_merged_pr_with_deleted_head_after_push_is_reconciled(self):
+        self.handler._owned_checkpoint_remote = mock.Mock(side_effect=lambda *args:
+            'push' not in self.case.calls or args[2] is not None)
+        self.case._assert_post_push_pr_attachment(
+            'base', True, pr_state='MERGED', remote_deleted=True)
+        self.assertEqual(self.handler._owned_checkpoint_remote.call_count, 2)
+        pr = self.effects.publication.reconcile_existing_pull_request.call_args.args[-1]
+        self.assertEqual(pr['state'], 'MERGED')
+        self.effects.blocking.block_active_execplan.assert_not_called()
+
+    def test_deleted_head_after_push_does_not_authorize_mismatched_or_open_pr(self):
+        for state, head in (('MERGED', 'other-head'), ('OPEN', 'base')):
+            with self.subTest(state=state):
+                case = ExecutionHandlerTests(methodName='runTest')
+                case.setUp()
+                self.addCleanup(case.doCleanups)
+                case._assert_post_push_pr_attachment(
+                    head, False, pr_state=state, remote_deleted=True)
+
+    def test_closed_pr_with_deleted_head_after_push_keeps_closed_pr_outcome(self):
+        self.effects.publication.reconcile_existing_pull_request.side_effect = lambda *_: 1
+        self.case._assert_post_push_pr_attachment(
+            'base', True, pr_state='CLOSED', remote_deleted=True,
+            reconciled_kind=ExecutionOutcomeKind.FINAL_BLOCK)
+        self.effects.blocking.block_active_execplan.assert_not_called()
+
     def test_base_advance_before_pr_creation_returns_to_existing_revalidation_flow(self):
         self.case.state.update_project('repo', validated_base_sha='base')
         self.handler._fetch_latest_base = mock.Mock(return_value='advanced')
@@ -7278,14 +7306,16 @@ class TaskRelevantPublicationBoundaryTests(TestCase):
         self.effects.publication.command.assert_not_called()
         self.handler._latest_before_publication.assert_called_once()
 
-    def push_fixture(self, *, branch_changed=False, remote_race=False, existing_pr=False):
+    def push_fixture(self, *, branch_changed=False, remote_race=False, existing_pr=False,
+                     candidate_changed=False):
         branch = 'loop-manager/G-047'
         head = 'a' * 40
         remote = None
         def git(path, *args, **kwargs):
             nonlocal remote
             if args[0] == 'rev-parse':
-                value = 'b' * 40 if branch_changed and '--verify' in args else head
+                value = ('b' * 40 if candidate_changed or branch_changed and '--verify' in args
+                         else head)
                 return SimpleNamespace(stdout=value, returncode=0)
             if args[0] == 'ls-remote':
                 return SimpleNamespace(stdout=f'{remote}\trefs/heads/{branch}\n' if remote else '', returncode=0)
@@ -7305,9 +7335,27 @@ class TaskRelevantPublicationBoundaryTests(TestCase):
         stack.enter_context(mock.patch.object(lm, 'pr_for_branch', return_value={'headRefOid': head} if existing_pr else None))
         return branch, head, owned, command
 
-    def push(self, branch):
+    def push(self, branch, expected_oid='a' * 40):
         return lm.push_managed_publication_branch(self.case.connection, Path('/repo'),
-            Path('/state'), 'repo', branch, Path('/state/G-047'))
+            Path('/state'), 'repo', branch, Path('/state/G-047'), expected_oid)
+
+    def test_candidate_changed_between_observation_and_push_helper_cannot_be_pushed(self):
+        branch, head, _, command = self.push_fixture(candidate_changed=True)
+        self.case.remote = head
+        self.case.review_context()
+        snapshot = self.handler._definition_snapshot
+        self.case.state.update_project('repo',
+            verify_token=snapshot.verify_token('base', head),
+            review_token=snapshot.review_token('base', head))
+        self.effects.publication.push_managed_publication_branch.side_effect = (
+            lambda *args: lm.push_managed_publication_branch(self.case.connection, *args))
+        result = self.handler._publish_new_pull_request(
+            self.case.context('PUBLISHING'), self.case.state.row())
+        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.effects.publication.push_managed_publication_branch.assert_called_once_with(
+            Path('/repo'), Path('/state'), 'repo', branch, Path('/state/G-047'), head)
+        self.assertFalse(any(call.args[1] == 'push' for call in command.call_args_list))
+        self.effects.publication.command.assert_not_called()
 
     def test_push_uses_confirmed_object_oid_and_create_only_lease(self):
         branch, head, owned, command = self.push_fixture()
@@ -7332,7 +7380,7 @@ class TaskRelevantPublicationBoundaryTests(TestCase):
         pushed = next(call for call in command.call_args_list if call.args[1] == 'push')
         self.assertIn(f'--force-with-lease=refs/heads/{branch}:', pushed.args)
 
-    def test_conflict_push_requeries_actual_pr_head_after_fetch(self):
+    def conflict_push_fixture(self):
         branch = 'loop-manager/G-047'
         head, base, old = 'a' * 40, 'b' * 40, 'c' * 40
         plan = dict(self.case.repository.active_row('repo'))
@@ -7340,14 +7388,33 @@ class TaskRelevantPublicationBoundaryTests(TestCase):
             branch=branch, worktree='/state/G-047', pr_url='https://example/pr/1',
             pr_conflict_head_oid=old, pr_conflict_base_oid=base, active_sha=base, validated_base_sha=base)
         pr = {'url': plan['pr_url'], 'state': 'OPEN', 'headRefName': branch, 'headRefOid': old}
-        with mock.patch.object(lm, 'active_execplan', return_value=plan), \
-                mock.patch.object(lm, 'validate_execplan_workspace_identity'), \
-                mock.patch.object(lm, 'validate_managed_worktree'), \
-                mock.patch.object(lm, '_fetch_pr_conflict_recovery_refs'), \
-                mock.patch.object(lm, 'remote_branch_oid', return_value=old), \
-                mock.patch.object(lm, 'git', return_value=SimpleNamespace(stdout=head, returncode=0)) as command, \
-                mock.patch.object(lm, 'pr_for_branch', return_value={**pr, 'headRefOid': 'd' * 40}):
-            with self.assertRaises(lm.PublicationSafetyError):
-                lm.push_owned_pr_conflict_recovery(self.case.connection, Path('/repo'),
-                    Path('/state'), 'repo', branch, Path('/state/G-047'), pr)
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        for patch in (
+                mock.patch.object(lm, 'active_execplan', return_value=plan),
+                mock.patch.object(lm, 'validate_execplan_workspace_identity'),
+                mock.patch.object(lm, 'validate_managed_worktree'),
+                mock.patch.object(lm, '_fetch_pr_conflict_recovery_refs'),
+                mock.patch.object(lm, 'remote_branch_oid', return_value=old)):
+            stack.enter_context(patch)
+        command = stack.enter_context(mock.patch.object(lm, 'git',
+            return_value=SimpleNamespace(stdout=head, returncode=0)))
+        lookup = stack.enter_context(mock.patch.object(lm, 'pr_for_branch', return_value=pr))
+        return branch, head, pr, command, lookup
+
+    def test_conflict_push_requeries_actual_pr_head_after_fetch(self):
+        branch, head, pr, command, lookup = self.conflict_push_fixture()
+        lookup.return_value = {**pr, 'headRefOid': 'd' * 40}
+        with self.assertRaises(lm.PublicationSafetyError):
+            lm.push_owned_pr_conflict_recovery(self.case.connection, Path('/repo'),
+                Path('/state'), 'repo', branch, Path('/state/G-047'), pr, head)
         self.assertFalse(any(call.args[1] == 'push' for call in command.call_args_list))
+
+    def test_conflict_push_rejects_candidate_changed_before_helper_entry(self):
+        branch, head, pr, command, lookup = self.conflict_push_fixture()
+        command.return_value.stdout = 'd' * 40
+        with self.assertRaises(lm.PublicationSafetyError):
+            lm.push_owned_pr_conflict_recovery(self.case.connection, Path('/repo'),
+                Path('/state'), 'repo', branch, Path('/state/G-047'), pr, head)
+        self.assertFalse(any(call.args[1] == 'push' for call in command.call_args_list))
+        lookup.assert_not_called()

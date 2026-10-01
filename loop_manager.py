@@ -9225,13 +9225,16 @@ def push_managed_publication_branch(
     repo: str,
     branch: str,
     worktree: Path,
+    expected_oid: str,
 ) -> str:
-    """Push idempotently, using an explicit lease only for owned PR-less recovery."""
+    """Push the expected reviewed candidate with an explicit owned-branch lease."""
 
     plan = _owned_publication_plan(
         connection, repo_path, state_dir, repo, branch, worktree
     )
     local_oid = git(worktree, "rev-parse", "HEAD").stdout.strip()
+    if not expected_oid or local_oid != expected_oid:
+        raise PublicationSafetyError('push 대상 HEAD가 verify·Review를 통과한 후보와 다릅니다.')
     checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
         repo, str(plan['plan_id']))
     def observe_remote():
@@ -9336,8 +9339,9 @@ def push_owned_pr_conflict_recovery(
     branch: str,
     worktree: Path,
     pull_request: Mapping[str, object],
+    expected_oid: str,
 ) -> str:
-    """Rewrite only the proven owned PR head with its observed explicit lease."""
+    """Push the expected reviewed candidate to the owned PR with its exact lease."""
 
     plan = active_execplan(connection, repo)
     project = connection.execute(
@@ -9382,6 +9386,8 @@ def push_owned_pr_conflict_recovery(
     )
     validate_managed_worktree(repo_path, worktree, branch)
     local_oid = git(worktree, "rev-parse", "HEAD").stdout.strip()
+    if not expected_oid or local_oid != expected_oid:
+        raise PublicationSafetyError('PR push 대상 HEAD가 verify·Review를 통과한 후보와 다릅니다.')
     contains_base = git(
         worktree,
         "merge-base",
