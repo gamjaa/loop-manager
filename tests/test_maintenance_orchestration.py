@@ -30,6 +30,38 @@ from tests.test_maintenance_planning import plan_text
 
 
 class MaintenanceOrchestrationTest(unittest.TestCase):
+    def test_unpublished_assessment_resumes_owned_ready_without_relaxing_barriers(self):
+        connection = self._connection()
+        self.addCleanup(connection.close)
+        self._insert_plan(connection, "/one", "G-058")
+        self._insert_plan(connection, "/one", "G-115", priority="critical")
+        connection.execute(
+            "UPDATE exec_plans SET ever_started = 1, branch = 'owned', "
+            "worktree = '/managed', workspace_owned = 1, worker_session_id = 'session' "
+            "WHERE repo = '/one' AND plan_id = 'G-058'"
+        )
+        cycle, _ = self._legacy_cycle(connection, "/one", "a" * 40)
+        loop_manager._ensure_execplans_schema(connection)
+        before = dict(connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = '/one' AND plan_id = 'G-058'"
+        ).fetchone())
+        for _restart in range(2):
+            decision = loop_manager.catalog_schedule_decision(connection, "/one")
+            self.assertEqual(decision.runnable_ready["plan_id"], "G-058")
+            self.assertEqual(maintenance_state.MaintenanceRepository(connection).get("/one"), cycle)
+        connection.execute(
+            "UPDATE maintenance_cycles SET publication_stage = 'prepared' WHERE repo = '/one'"
+        )
+        self.assertIsNone(loop_manager.catalog_schedule_decision(connection, "/one").runnable_ready)
+        connection.execute(
+            "UPDATE maintenance_cycles SET publication_stage = NULL, phase = 'post_refactor_revalidation' "
+            "WHERE repo = '/one'"
+        )
+        self.assertIsNone(loop_manager.catalog_schedule_decision(connection, "/one").runnable_ready)
+        self.assertEqual(dict(connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = '/one' AND plan_id = 'G-058'"
+        ).fetchone()), before)
+
     @staticmethod
     def _legacy_cycle(
         connection: sqlite3.Connection, repo: str, source_sha: str,

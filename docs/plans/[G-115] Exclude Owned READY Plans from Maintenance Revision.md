@@ -42,11 +42,16 @@ priority: critical
 
 - [x] 운영 SQLite와 assessment 후보 선정·소유권 검사에서 원인 확인
 - [ ] 원격 main 계획 게시 및 운영 prerequisite 복구
-- [ ] eligibility와 안전한 평가 보류·기존 실행 재개 구현
-- [ ] targeted unit test 및 Manager 전체 verify·Review
+- [x] eligibility와 안전한 평가 보류·기존 실행 재개 구현
+- [x] 관련 targeted unit test 작성·실행
+- [ ] Manager 전체 verify·Review
 - [ ] 사용자 PR Merge 뒤 유지보수 평가와 기존 READY 작업 정상 진행 확인
 
 ## Decision Log
 
 - 2026-10-01: 사용자가 계획 작성·main push·정상 진행을 위한 복구를 요청했다. 기존 PRODUCT의 무소유 READY 개정 권한과 실행 중 작업 보존 규칙을 복구하는 결함 수정이며 새로운 Requirement나 AGENTS.md 변경을 만들지 않는다.
 - 단순 planning_error 삭제는 같은 assessment에서 다시 실패한다. 실행 이력이 있는 계획의 자원을 지워 미착수로 위장하거나 평가 성공 기준을 올려 cycle을 건너뛰지 않고, 미게시 cycle의 정상 prerequisite 경로로 수정 계획을 먼저 실행한다. 이 복구는 구현·검증·사용자 Merge를 대신하지 않는다.
+
+- 2026-10-01 Worker: 미착수·무소유 READY 판정을 일반 mutable READY와 공유하되 일반 Planner의 추가 실행 증거 제한은 유지했다. assessment만 후보를 필터링하고 게시 전에는 필터 결과의 ID와 각 snapshot의 이력·소유권·revision을 다시 검사한다. 명시적인 사후 재검증 대상은 제외하지 않고 오류로 거부한다.
+- 2026-10-01 Worker: 게시 집합이 없는 assessment에서 dependency를 충족한 기존 READY를 재개하며 성공 기준과 cycle을 보존한다. 보존된 planning 실행 자리는 소유 worktree가 clean하고 HEAD가 시작 SHA와 같으며 publication·별도 차단이 없을 때 진단 보존 후 해제한다. 게시된 prerequisite·refactoring·사후 재검증 장벽은 유지한다.
+- 2026-10-01 Worker: 이번 호출의 지시에 따라 원격 계획 게시, 운영 SQLite 복구, commit·push·PR 생성 및 전체 verify는 수행하지 않았다. 기존 Linux verify 스크립트가 전체 unittest discovery와 모듈 컴파일을 포함하므로 변경하지 않았다. targeted test는 후보 제외·빈/혼합 snapshot, 소유권/revision race, 사후 재검증 거부, due/재시작 시 기존 실행 보존과 게시 장벽, planning 자리 해제의 안전 gate를 검증했다.
