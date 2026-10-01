@@ -38,6 +38,8 @@ priority: critical
 - Worker 결과 계약 재검증에서 두 피드백 case를 같은 명령으로 다시 실행해 모두 통과했다. 이전 보고는 실패 명령·재실행 명령 사이에 실패 결과 설명이 없어 거부됐다. 실패 결과와 최종 통과 결과를 순서대로 기록한 보고문을 기존 `parse_worker_result`로 확인했다.
 - Reviewer 피드백 회귀 검증: `TaskRelevantPublicationBoundaryTests` 15개와 변경한 push 호출 계약·lease·기존 PR 연결·복구 게시 관련 개별 case 7개 모두 통과했다. 관측과 push helper 진입 사이의 후보 변경은 신규·PR 충돌 복구 push 모두 차단하고, push 후 같은 head의 Merged·Closed PR은 삭제된 원격 branch 없이 기존 종료 처리를 따른다. Open PR의 branch 삭제와 PR head 불일치는 계속 차단한다. 전체 suite·verify는 Worker가 실행하지 않았다.
 
+- 추가 Reviewer 피드백: push 뒤 Merge·base 전진·원격 head 삭제가 함께 발생하는 회귀를 추가했다. 신규 테스트의 mock이 push 전 정상 검사를 가로막은 실패를 수정한 뒤 동일 명령 `python3 -m unittest tests.test_execution_handlers.TaskRelevantPublicationBoundaryTests`로 16개 모두 통과했다. 종료 PR은 head 검증 후 base 재검증 분기보다 먼저 기존 reconciliation으로 전달하며, 활성 게시의 base 전진 재검증 회귀도 통과했다. 전체 verify는 실행하지 않았다.
+
 ## Progress
 
 - [x] 역할·단계별 사용 Git 자원 판정
@@ -53,3 +55,4 @@ priority: critical
 - 기존 verify 스크립트가 변경 모듈과 unittest discovery를 이미 포함하므로 스크립트 변경은 필요하지 않다. Worker는 targeted unit test만 실행하며 전체 verify·Reviewer·Merge 완료 판정은 Loop Manager에 남긴다.
 - 검증 피드백은 복구 테스트의 공용 workspace가 live 조회를 tracking cache mock으로 대체한 데서 발생했다. fixture에서 기존 live 조회 helper를 재사용하고 새 소유 branch·PR 재조회 및 push 인자를 검증한다. 제품 코드의 게시 전 검증과 lease 보호는 유지한다.
 - 게시 관측에서 검증한 후보 OID를 두 push adapter의 필수 입력으로 전달한다. helper 진입 시 HEAD가 달라졌으면 게시 기록·push 전에 차단하며 기존 직전 branch·HEAD 검사와 immutable OID·lease를 유지한다. push 후 정확한 branch·head가 일치하는 종료 PR은 원격 branch 존재 검사보다 먼저 기존 reconciliation에 넘긴다. Merge cleanup과 Closed 차단은 기존 PR 정책이 담당하며, 활성 게시의 원격 ref·checkpoint 소유권 검사는 유지한다.
+- push 후 base fetch 결과는 보존하되 PR 재조회·head 검증 전에 rebase로 반환하지 않는다. Merge에 따른 base 전진과 branch 삭제는 종료 PR reconciliation이 처리하고, 종료 PR이 없는 활성 게시에 기존 base 재검증 분기를 적용한다.

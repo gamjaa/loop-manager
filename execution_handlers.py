@@ -4783,8 +4783,7 @@ class ExecutionHandlers:
             return guarded
         context = guarded
         try:
-            if self._fetch_latest_base() != self._row()['validated_base_sha']:
-                return self._latest_before_publication(context) or self._retry('최신 base를 다시 검증합니다.')
+            latest_base = self._fetch_latest_base()
             after_push = self._publication_resume().observe(
                 self.repo_path, context.worktree, context.branch, head_oid,
             )
@@ -4805,11 +4804,14 @@ class ExecutionHandlers:
                 reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
             )
         # GitHub's terminal PR state remains authoritative after automatic
-        # head-branch deletion. Active publication still requires its live ref.
+        # head-branch deletion and base advancement. Reconcile it before
+        # considering another rebase; active publication still needs its live ref.
         terminal_pr = (existing_after_push is not None
                        and str(existing_after_push.get('state') or '').upper()
                        in {'CLOSED', 'MERGED'})
         if not terminal_pr:
+            if latest_base != self._row()['validated_base_sha']:
+                return self._latest_before_publication(context) or self._retry('최신 base를 다시 검증합니다.')
             if after_push.remote_oid != head_oid:
                 return self._block_final(self.repo, context.worktree,
                     'PR 생성 직전 원격 게시 ref가 변경됐습니다.',

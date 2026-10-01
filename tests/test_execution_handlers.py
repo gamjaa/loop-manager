@@ -7280,6 +7280,27 @@ class TaskRelevantPublicationBoundaryTests(TestCase):
         self.assertEqual(pr['state'], 'MERGED')
         self.effects.blocking.block_active_execplan.assert_not_called()
 
+    def test_merged_pr_with_advanced_base_and_deleted_head_is_reconciled(self):
+        fetched_bases = []
+        def fetch_base():
+            base = 'merged-base' if 'push' in self.case.calls else 'base'
+            fetched_bases.append(base)
+            return base
+        self.handler._fetch_latest_base = mock.Mock(side_effect=fetch_base)
+        self.handler._latest_before_publication = mock.Mock(side_effect=lambda *_:
+            self.assertNotIn('push', self.case.calls))
+        self.handler._owned_checkpoint_remote = mock.Mock(side_effect=lambda *args:
+            'push' not in self.case.calls or args[2] is not None)
+
+        self.case._assert_post_push_pr_attachment(
+            'base', True, pr_state='MERGED', remote_deleted=True)
+
+        self.assertIn('merged-base', fetched_bases)
+        self.handler._latest_before_publication.assert_called_once()
+        pr = self.effects.publication.reconcile_existing_pull_request.call_args.args[-1]
+        self.assertEqual(pr['state'], 'MERGED')
+        self.effects.blocking.block_active_execplan.assert_not_called()
+
     def test_deleted_head_after_push_does_not_authorize_mismatched_or_open_pr(self):
         for state, head in (('MERGED', 'other-head'), ('OPEN', 'base')):
             with self.subTest(state=state):
