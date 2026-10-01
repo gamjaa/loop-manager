@@ -20,6 +20,7 @@ from managed_rebase_validation import ObservationFailure, valid_acceptance
 import blocked_remote_observation as observations
 import runtime_state
 import scoped_blocking
+from execplan_catalog_state import ReconciliationKind
 
 
 class LocalWorkPending(RuntimeError):
@@ -402,6 +403,34 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
                 runtime = runtime_state.RuntimeStateRepository(self.connection)
                 updated = runtime.update_plan(self.repo, plan['plan_id'], plan_values=values, enqueue=False)
                 runtime.hydrate_snapshot(self.repo, updated)
+
+    def refresh_catalog(self, plan_id):
+        """Prove the linked scope before fetching declarations for recovery."""
+        if not project_slot_available(self.connection, self.repo, plan_id):
+            return False
+        plan = self._plan(plan_id)
+        row = self.connection.execute(
+            'SELECT * FROM blocked_remote_observations WHERE repo = ? AND plan_id = ?',
+            (self.repo, plan_id),
+        ).fetchone()
+        if plan is None or row is None or not row['base_oid']:
+            return False
+        try:
+            self._validate(plan, rebase=True)
+            independent_scope(
+                self.ports, self.connection, self.repo_path, self.state_dir,
+                self.repo, plan, target=row['base_oid'], remote_oid=row['branch_oid'],
+            )
+            self.ports._recorded_base_fetch(
+                self.repo_path, self.state_dir, self.base, owner='project',
+            )
+            result = self.ports.reconcile_execplan_catalog(
+                self.connection, self.repo_path, self.repo, self.base,
+                record_invalid=False,
+            )
+            return result.kind is ReconciliationKind.RECONCILED
+        except (OSError, RuntimeError, ValueError, TypeError):
+            return False
 
     def reconcile(self, plan_id):
         if not project_slot_available(self.connection, self.repo, plan_id):

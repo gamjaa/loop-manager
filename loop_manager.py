@@ -68,6 +68,7 @@ import requirement_archive
 import requirement_archive_state
 import execplan_catalog
 import execplan_catalog_state
+import project_catalog_refresh
 from planning_catalog import (
     MutableReadySnapshot,
     PlanDeletion,
@@ -2137,6 +2138,7 @@ def backfill_plan_shas(
     connection: sqlite3.Connection,
     *,
     target_repo: str | None = None,
+    manage_transaction: bool = True,
 ) -> None:
     rows = connection.execute(
         """
@@ -2184,7 +2186,8 @@ def backfill_plan_shas(
                 previous_phase=(str(project["phase"] or "") or None),
             )
             notifications.enqueue_current_project_events(connection, str(row["repo"]))
-    connection.commit()
+    if manage_transaction:
+        connection.commit()
 
 
 def git_bytes(repo: Path, *arguments: str) -> bytes:
@@ -2292,6 +2295,50 @@ def _merged_execplan_ids(
     )
 
 
+def _catalog_archive_conflict_ids(
+    connection: sqlite3.Connection, repo_path: Path, repo: str, revision: str,
+) -> frozenset[str]:
+    """Use read-only, identity-bound PR evidence for archive path conflicts.
+
+    Declaration validation precedes PR transitions. A newly merged PR may
+    therefore still be PR_OPEN or blocked on a previously closed PR in SQLite
+    when its archive collision is read.
+    This proof permits only the existing collision diagnostic, never cleanup
+    or an execution-state transition.
+    """
+    confirmed = set(_merged_execplan_ids(connection, repo))
+    paths = (os.fsdecode(path) for path in _git_tree_entries(repo_path, revision))
+    conflicts = execplan_catalog.conflicting_archived_plan_paths(paths)
+    project = connection.execute(
+        "SELECT base_branch FROM projects WHERE repo = ?", (repo,),
+    ).fetchone()
+    if project is None:
+        return frozenset(confirmed)
+    for plan_id in conflicts.keys() - confirmed:
+        plan = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+            (repo, plan_id),
+        ).fetchone()
+        if plan is None or not plan["branch"]:
+            continue
+        if not (plan["status"] == "PR_OPEN" or (
+            plan["status"] == "PLAN_BLOCKED"
+            and plan["blocked_reason"] == PR_CLOSED_BLOCK_REASON
+        )):
+            continue
+        pull_request = pr_for_branch(repo_path, str(plan["branch"]), plan["pr_url"])
+        if pull_request is None:
+            continue
+        if (pull_request.get("baseRefName") != project["base_branch"]
+                or pull_request.get("headRefName") != plan["branch"]
+                or (plan["pr_url"] and pull_request.get("url") != plan["pr_url"])
+                or (plan["pr_head_oid"] and pull_request.get("headRefOid") != plan["pr_head_oid"])):
+            continue
+        if pull_request.get("state") == "MERGED" or pull_request.get("mergedAt"):
+            confirmed.add(plan_id)
+    return frozenset(confirmed)
+
+
 class _GitCatalogDefinitionPort:
     """Pin catalog reads to a fetched remote ref without consulting worktrees."""
 
@@ -2306,6 +2353,7 @@ class _GitCatalogDefinitionPort:
         self.remote_ref = remote_ref
         self.archive_conflict_plan_ids = archive_conflict_plan_ids
         self.pinned_revision = pinned_revision
+        self.loaded: execplan_catalog_state.PinnedCatalog | None = None
 
     def current_revision(self) -> str:
         return git(
@@ -2316,6 +2364,8 @@ class _GitCatalogDefinitionPort:
         ).stdout.strip()
 
     def load(self) -> execplan_catalog_state.PinnedCatalog:
+        if self.loaded is not None:
+            return self.loaded
         revision_sha = self.pinned_revision or self.current_revision()
         try:
             snapshot = revision_execplan_snapshot(
@@ -2368,9 +2418,10 @@ class _GitCatalogDefinitionPort:
                 regular_paths.add(path.decode("utf-8"))
             except UnicodeDecodeError:
                 continue
-        return execplan_catalog_state.PinnedCatalog(
+        self.loaded = execplan_catalog_state.PinnedCatalog(
             revision_sha, snapshot, frozenset(regular_paths)
         )
+        return self.loaded
 
 
 def reconcile_execplan_catalog(
@@ -2381,6 +2432,7 @@ def reconcile_execplan_catalog(
     *,
     record_invalid: bool = True,
     remote_sha: str | None = None,
+    on_reconciled: Callable[[execplan_catalog_state.PinnedCatalog], None] | None = None,
 ) -> execplan_catalog_state.CatalogReconciliationResult:
     """Converge declaration cache or persist a recoverable project diagnostic."""
 
@@ -2397,17 +2449,63 @@ def reconcile_execplan_catalog(
     port = _GitCatalogDefinitionPort(
         repo_path,
         remote_ref,
-        lambda: _merged_execplan_ids(connection, repo),
+        lambda: _catalog_archive_conflict_ids(
+            connection, repo_path, repo, remote_sha or port.current_revision(),
+        ),
         pinned_revision=remote_sha,
     )
-    result = execplan_catalog_state.CatalogReconciliationService(
-        execplan_catalog_state.DefinitionStateRepository(connection),
-        port,
-    ).reconcile(repo)
+    repository = execplan_catalog_state.DefinitionStateRepository(connection)
+    service = execplan_catalog_state.CatalogReconciliationService(repository, port)
+    legacy = connection.execute(
+        "SELECT 1 FROM execplan_catalog_revisions WHERE repo = ?", (repo,),
+    ).fetchone() is None
+    if legacy and not repository.has_publication_intent(repo):
+        # Initial migration and declaration reconciliation share a rollback
+        # boundary. Validate the remote graph before recovering runtime rows.
+        try:
+            with execplan_catalog_state._transaction(connection):
+                pinned = port.load()
+                if repository.capture(repo).plan_ids - frozenset(pinned.snapshot.all):
+                    raise project_catalog_refresh.CatalogRefreshStopped(service.reconcile(repo))
+                backfill_plan_shas(connection, target_repo=repo, manage_transaction=False)
+                migrate_legacy_execplans(
+                    connection, reconcile_history=True, target_repo=repo,
+                    ensure_schema=False, manage_transaction=False,
+                    pinned_catalog=pinned,
+                )
+                result = service.reconcile(repo)
+                if result.kind is not execplan_catalog_state.ReconciliationKind.RECONCILED:
+                    raise project_catalog_refresh.CatalogRefreshStopped(result)
+        except execplan_catalog_state.InvalidPinnedCatalog as error:
+            result = execplan_catalog_state.CatalogReconciliationResult(
+                execplan_catalog_state.ReconciliationKind.INVALID_CATALOG,
+                revision_sha=error.diagnostic.revision_sha, diagnostic=error.diagnostic,
+            )
+        except project_catalog_refresh.CatalogRefreshStopped as error:
+            result = error.result
+        except execplan_catalog.ExecPlanCatalogError as error:
+            revision = port.loaded.revision_sha if port.loaded else (remote_sha or "")
+            result = execplan_catalog_state.CatalogReconciliationResult(
+                execplan_catalog_state.ReconciliationKind.INVALID_CATALOG,
+                revision_sha=revision,
+                diagnostic=execplan_catalog_state.ReconciliationDiagnostic(
+                    revision, error.code, str(error), error.path, error.source,
+                    execplan_catalog_state.diagnostic_fingerprint(
+                        revision, error.code, str(error), error.related_paths,
+                    ), error.related_paths,
+                ),
+            )
+    else:
+        result = service.reconcile(repo)
+    if (result.kind is execplan_catalog_state.ReconciliationKind.RECONCILED
+            and on_reconciled is not None):
+        assert port.loaded is not None
+        on_reconciled(port.loaded)
     catalog_reason = BlockReasonCode.EXECPLAN_CATALOG_INVALID.value
     existing_block = scoped_blocking.project_block(connection, repo)
     if result.kind is execplan_catalog_state.ReconciliationKind.INVALID_CATALOG:
-        if not record_invalid:
+        if (not record_invalid or (existing_block is not None
+                and existing_block["reason_code"] != catalog_reason)):
             return result
         diagnostic = result.diagnostic
         assert diagnostic is not None
@@ -5615,6 +5713,7 @@ def _migrate_execplan_catalog(
     reconcile_history: bool,
     target_repo: str | None,
     manage_transaction: bool = True,
+    pinned_catalog: execplan_catalog_state.PinnedCatalog | None = None,
 ) -> None:
     phase_status = {
         "WORKING": "IMPLEMENTING",
@@ -5638,13 +5737,16 @@ def _migrate_execplan_catalog(
                 continue
             root = Path(str(project["repo"]))
             revision = f"refs/remotes/origin/{project['base_branch']}"
-            snapshot = revision_execplan_snapshot(
-                root,
-                revision,
-                archive_conflict_plan_ids=_merged_execplan_ids(
-                    connection, str(project["repo"])
-                ),
-            )
+            if pinned_catalog is not None:
+                revision = pinned_catalog.revision_sha
+                snapshot = pinned_catalog.snapshot
+            else:
+                snapshot = revision_execplan_snapshot(
+                    root, revision,
+                    archive_conflict_plan_ids=_merged_execplan_ids(
+                        connection, str(project["repo"])
+                    ),
+                )
             active_path = str(project["plan_path"] or "")
             rows = connection.execute(
                 "SELECT plan_id, path, content_hash, plan_sha, status, "
@@ -5832,6 +5934,7 @@ def migrate_legacy_execplans(
     target_repo: str | None = None,
     ensure_schema: bool = True,
     manage_transaction: bool = True,
+    pinned_catalog: execplan_catalog_state.PinnedCatalog | None = None,
 ) -> None:
     """Conservatively move legacy project-owned execution state into the catalog."""
 
@@ -5842,6 +5945,7 @@ def migrate_legacy_execplans(
         reconcile_history=reconcile_history,
         target_repo=target_repo,
         manage_transaction=manage_transaction,
+        pinned_catalog=pinned_catalog,
     )
     with connection if manage_transaction else contextlib.nullcontext():
         scoped_blocking.migrate_legacy_blocks(connection)
@@ -16326,6 +16430,7 @@ def observe_waiting_pull_requests(
     repo: str,
     *,
     require_base_identity: bool = False,
+    read_only: bool = False,
 ) -> WaitingPullRequestObservation:
     """Commit every merge-wait observation before source or conflict work."""
 
@@ -16387,6 +16492,8 @@ def observe_waiting_pull_requests(
         head_value = pull_request.get("headRefOid")
         head_oid = str(head_value) if head_value else stored["pr_head_oid"]
         state = str(pull_request.get("state") or "OPEN").upper()
+        if read_only:
+            continue
         if state == "MERGED" or pull_request.get("mergedAt"):
             if scoped_blocking.project_block(connection, repo) is not None:
                 continue
@@ -20890,10 +20997,16 @@ def dispatch_execplan_archive_housekeeping(
     state_dir: Path,
     repo: str,
     base_branch: str,
+    *,
+    catalog_refresh: project_catalog_refresh.ProjectCatalogRefresh | None = None,
+    archive_safety: Callable[[], bool] | None = None,
 ) -> execplan_archive.ArchiveDispatchOutcome:
     """Assemble the archive service and map its result to operator logging."""
 
     def refresh_candidates(base_sha: str) -> bool:
+        if catalog_refresh is not None:
+            return (catalog_refresh.refresh(base_sha) == base_sha
+                    and (archive_safety is None or archive_safety()))
         result = reconcile_execplan_catalog(
             connection, repo_path, repo, base_branch
         )
@@ -20905,9 +21018,33 @@ def dispatch_execplan_archive_housekeeping(
         ).stdout.strip()
         return result.revision_sha == base_sha and current == base_sha
 
+    git_port = _ExecPlanArchiveGitPort(repo_path, state_dir, repo)
+
+    def apply_catalog(base_sha, commit_oid, candidates):
+        assert catalog_refresh is not None
+        expected = catalog_refresh.repository.capture(repo)
+        moves = tuple(execplan_archive.ArchiveMove(
+            item.plan_id, item.active_path, item.archive_path, item.content_hash, item.revision_sha,
+        ) for item in candidates)
+        operation_id = execplan_archive.archive_operation_id(base_sha, moves)
+        stored = archive_repository.prepared_operation(repo, operation_id)
+        if stored is None or stored.commit_oid != commit_oid:
+            return False
+        prepared = execplan_archive.PreparedArchive(
+            operation_id, base_sha, stored.final_hash, commit_oid,
+        )
+        if not git_port.commit_matches(prepared, moves):
+            return False
+        return catalog_refresh.apply_archive(
+            base_sha, commit_oid, candidates, expected=expected,
+        )
+
+    archive_repository = execplan_archive_state.ExecPlanArchiveRepository(
+        connection, apply_catalog=apply_catalog if catalog_refresh else None,
+    )
     outcome = execplan_archive.ExecPlanArchiveDispatcher(
-        execplan_archive_state.ExecPlanArchiveRepository(connection),
-        _ExecPlanArchiveGitPort(repo_path, state_dir, repo),
+        archive_repository,
+        git_port,
         refresh_candidates=refresh_candidates,
     ).dispatch(repo, base_branch)
     if outcome.commit_oid:
@@ -21720,23 +21857,21 @@ def _run_project_step(
         and initial_project_block["reason_code"]
         != BlockReasonCode.EXECPLAN_CATALOG_INVALID.value
     ):
-        synchronize_waiting_pull_requests(
+        observe_waiting_pull_requests(
             connection, repo_path, state_dir, repo,
-            require_base_identity=require_self_pr_base,
-            after_observation=lambda observation: _handoff_observed_self_merge(
-                connection, repo, state_dir, runtime_mutation, observation,
-            ),
+            require_base_identity=require_self_pr_base, read_only=True,
         )
         resume_project_block_if_safe(connection, repo_path, state_dir, repo)
         project_block = scoped_blocking.project_block(connection, repo)
-        if project_block is not None:
-            linked_plan_id = str(project_block['plan_id'] or '')
-            if linked_plan_id:
-                project_blocked_recovery.ProjectBlockedReconciler(
-                    sys.modules[__name__], connection, repo_path, state_dir, repo,
-                    str(row['base_branch']), config_path, verify_timeout_seconds,
-                ).reconcile(linked_plan_id)
-                project_block = scoped_blocking.project_block(connection, repo)
+        if project_block is not None and project_block["plan_id"]:
+            reconciler = project_blocked_recovery.ProjectBlockedReconciler(
+                sys.modules[__name__], connection, repo_path, state_dir, repo,
+                str(row["base_branch"]), config_path, verify_timeout_seconds,
+            )
+            linked_plan_id = str(project_block["plan_id"])
+            if reconciler.refresh_catalog(linked_plan_id):
+                reconciler.reconcile(linked_plan_id)
+            project_block = scoped_blocking.project_block(connection, repo)
         if project_block is not None:
             operation_print(
                 "프로젝트 안전 차단 상태입니다: "
@@ -21894,18 +22029,79 @@ def _run_project_step(
         )
     else:
         base = remote_base(repo_path, selected_base, state_dir=state_dir)
-    backfill_plan_shas(connection, target_repo=repo)
-    try:
-        migrate_legacy_execplans(
-            connection,
-            reconcile_history=True,
-            target_repo=repo,
-            ensure_schema=not registered_only,
+    catalog_refresh = project_catalog_refresh.ProjectCatalogRefresh(
+        connection, repo,
+        lambda: git(repo_path, "rev-parse", "--verify",
+                    f"refs/remotes/origin/{base}^{{commit}}").stdout.strip(),
+        lambda revision, remember: reconcile_execplan_catalog(
+            connection, repo_path, repo, base, remote_sha=revision,
+            on_reconciled=remember,
+        ),
+    )
+
+    history_revision = None
+
+    def refresh_catalog() -> str:
+        nonlocal history_revision
+        revision = catalog_refresh.refresh()
+        if history_revision != revision:
+            migrate_legacy_execplans(
+                connection, reconcile_history=True, target_repo=repo, ensure_schema=False,
+                pinned_catalog=catalog_refresh.pinned,
+            )
+            history_revision = revision
+            catalog_refresh.adopt_history()
+        return revision
+
+    def catalog_stop(error) -> int:
+        result = error.result
+        if result.kind is execplan_catalog_state.ReconciliationKind.STALE:
+            _record_project_recovery(
+                connection, repo, recovery_runtime.RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                "ExecPlan catalog snapshot이 적용 전에 변경되어 다시 조회합니다: "
+                + str(result.revision_sha or ""),
+            )
+            return PROJECT_STEP_RETRY
+        assert result.diagnostic is not None
+        operation_print(result.diagnostic.message, file=sys.stderr)
+        return 1
+
+    recovered_planning_outcome: PlanningOutcome | None = None
+    row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
+    if row is not None and execplan_catalog_state.DefinitionStateRepository(
+        connection
+    ).has_publication_intent(repo):
+        # The owning publication must recover its manifest before the catalog
+        # can classify new IDs. No PR/archive/selection consumer runs here.
+        context = PlanningContext(
+            repo=repo, repo_path=repo_path, state_dir=state_dir, base_branch=base,
+            base_sha=catalog_refresh.current_revision(), provider=provider,
+            config_path=config_path, registered_only=registered_only,
+            refactoring_review_interval=refactoring_review_interval,
+            self_repository=registered_only and is_loop_manager_repository(repo_path),
         )
-    except execplan_catalog.ExecPlanCatalogError:
-        # The typed reconciliation boundary below records invalid remote input
-        # after PR synchronization without mutating declaration cache rows.
-        pass
+        recovered_planning_outcome = PlanningLifecycleCoordinator(_PlanningLifecyclePorts(
+            connection, runtime_state.RuntimeStateRepository(connection),
+            maintenance_state.MaintenanceRepository(connection), context, planner_mutex,
+        )).run(context)
+        recovery_step_result = _planning_outcome_step_result(recovered_planning_outcome)
+        if recovery_step_result is not None:
+            return recovery_step_result
+        # Publication may finish and select its Worker in this same turn.
+        # Reconcile the published catalog before consumers, then carry the
+        # outcome to execution without selecting or planning a second time.
+        recovered_project = connection.execute(
+            "SELECT * FROM projects WHERE repo = ?", (repo,),
+        ).fetchone()
+        if recovered_project is not None and not recovered_project["agent_snapshot"]:
+            # The coordinator completed and cleared the validated Planner
+            # scope; it no longer belongs to the selected Worker workspace.
+            validated_agent_scope = None
+    try:
+        base_sha = refresh_catalog()
+    except project_catalog_refresh.CatalogRefreshStopped as error:
+        return catalog_stop(error)
+    backfill_plan_shas(connection, target_repo=repo)
     row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
     if row:
         hydrate_active_project(connection, repo)
@@ -21947,14 +22143,17 @@ def _run_project_step(
             file=sys.stderr,
         )
 
-    def archive_housekeeping() -> None:
-        if not _execplan_archive_housekeeping_safe(
+    def archive_housekeeping_safe() -> bool:
+        return _execplan_archive_housekeeping_safe(
             connection,
             repo,
             validated_agent_scope,
             maintenance_assessment_enabled=registered_only,
             refactoring_review_interval=refactoring_review_interval,
-        ):
+        )
+
+    def archive_housekeeping() -> None:
+        if not archive_housekeeping_safe():
             return
         try:
             dispatch_execplan_archive_housekeeping(
@@ -21963,7 +22162,11 @@ def _run_project_step(
                 state_dir,
                 repo,
                 base,
+                catalog_refresh=catalog_refresh,
+                archive_safety=archive_housekeeping_safe,
             )
+        except project_catalog_refresh.CatalogRefreshStopped:
+            raise
         except Exception as error:
             # Archive maintenance is deliberately non-gating: MERGED state,
             # READY selection, planning, and completion continue unchanged.
@@ -21972,24 +22175,21 @@ def _run_project_step(
                 file=sys.stderr,
             )
 
-    base_sha = ""
-
     def synchronize_source_after_pr_reconciliation() -> None:
         nonlocal base_sha
+        # PR observation can introduce a new ownership safety block.
+        if scoped_blocking.project_block(connection, repo) is not None:
+            return
         # Read the durable project state after all PR transitions and cleanup.
         current_project = connection.execute(
             "SELECT * FROM projects WHERE repo = ?", (repo,)
         ).fetchone()
         if current_project is not None and str(current_project["base_branch"]) != base:
             raise RuntimeError("PR 상태 동기화 중 프로젝트 base branch가 변경됐습니다.")
+        _recorded_base_fetch(repo_path, state_dir, base, owner="project")
+        base_sha = refresh_catalog()
         archive_housekeeping()
-        # Archive publication may fast-forward origin. Pin both source sync
-        # and catalog reconciliation to the resulting remote revision.
-        base_sha = git(
-            repo_path,
-            "rev-parse",
-            f"refs/remotes/origin/{base}^{{commit}}",
-        ).stdout.strip()
+        base_sha = refresh_catalog()
         if scoped_blocking.project_block(connection, repo) is None:
             waiting_open = connection.execute(
                 "SELECT 1 FROM exec_plans WHERE repo = ? AND status = 'PR_OPEN' LIMIT 1",
@@ -22016,63 +22216,21 @@ def _run_project_step(
             if isinstance(sync_result, BaseWorktreeSyncResult):
                 log_base_worktree_sync(repo_path, sync_result)
 
-    pr_sync = synchronize_waiting_pull_requests(
-        connection,
-        repo_path,
-        state_dir,
-        repo,
-        after_reconciliation=synchronize_source_after_pr_reconciliation,
-        require_base_identity=require_self_pr_base,
-        after_observation=lambda observation: _handoff_observed_self_merge(
-            connection, repo, state_dir, runtime_mutation, observation,
-        ),
-    )
+    try:
+        pr_sync = synchronize_waiting_pull_requests(
+            connection, repo_path, state_dir, repo,
+            after_reconciliation=synchronize_source_after_pr_reconciliation,
+            require_base_identity=require_self_pr_base,
+            after_observation=lambda observation: _handoff_observed_self_merge(
+                connection, repo, state_dir, runtime_mutation, observation,
+            ),
+        )
+        base_sha = refresh_catalog()
+    except project_catalog_refresh.CatalogRefreshStopped as error:
+        return catalog_stop(error)
     if pr_sync.step_result not in {None, 0}:
         return pr_sync.step_result
-    if not base_sha:
-        base_sha = git(
-            repo_path,
-            "rev-parse",
-            f"refs/remotes/origin/{base}^{{commit}}",
-        ).stdout.strip()
-    row = connection.execute(
-        "SELECT * FROM projects WHERE repo = ?", (repo,)
-    ).fetchone()
-    if row is not None and row["phase"] != "PLANNING":
-        catalog_result = reconcile_execplan_catalog(
-            connection, repo_path, repo, base, remote_sha=base_sha
-        )
-        if (
-            catalog_result.kind
-            is execplan_catalog_state.ReconciliationKind.STALE
-        ):
-            _record_project_recovery(
-                connection, repo,
-                recovery_runtime.RecoveryReason.REMOTE_SNAPSHOT_RACE,
-                "ExecPlan catalog snapshot이 적용 전에 변경되어 다시 조회합니다: "
-                + str(catalog_result.revision_sha or ""),
-            )
-            return PROJECT_STEP_RETRY
-        if (
-            catalog_result.kind
-            is execplan_catalog_state.ReconciliationKind.INVALID_CATALOG
-        ):
-            assert catalog_result.diagnostic is not None
-            operation_print(
-                catalog_result.diagnostic.message,
-                file=sys.stderr,
-            )
-            return 1
-        base_sha = str(catalog_result.revision_sha or base_sha)
-        migrate_legacy_execplans(
-            connection,
-            reconcile_history=True,
-            target_repo=repo,
-            ensure_schema=False,
-        )
-        row = connection.execute(
-            "SELECT * FROM projects WHERE repo = ?", (repo,)
-        ).fetchone()
+    row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
     project_block = scoped_blocking.project_block(connection, repo)
     if project_block is not None:
         resume_project_block_if_safe(
@@ -22163,7 +22321,9 @@ def _run_project_step(
             "SELECT * FROM projects WHERE repo = ?", (repo,)
         ).fetchone()
 
-    if row and row["branch"] and not runtime_state.planning_owns_execution_slot(row):
+    if (row and row["branch"] and not runtime_state.planning_owns_execution_slot(row)
+            and not (recovered_planning_outcome is not None
+                     and recovered_planning_outcome.newly_activated)):
         existing_pr = pr_for_branch(repo_path, row["branch"], row["pr_url"])
         if existing_pr:
             try:
@@ -22217,6 +22377,11 @@ def _run_project_step(
         ).fetchone()
 
     assert row is not None
+    _recorded_base_fetch(repo_path, state_dir, base, owner="project")
+    try:
+        base_sha = refresh_catalog()
+    except project_catalog_refresh.CatalogRefreshStopped as error:
+        return catalog_stop(error)
     runtime_repository = runtime_state.RuntimeStateRepository(connection)
     maintenance_repository = maintenance_state.MaintenanceRepository(connection)
     planning_context = PlanningContext(
@@ -22232,15 +22397,18 @@ def _run_project_step(
         self_repository=registered_only and is_loop_manager_repository(repo_path),
     )
     _check_runtime_handoff()
-    planning_outcome = PlanningLifecycleCoordinator(
-        _PlanningLifecyclePorts(
-            connection,
-            runtime_repository,
-            maintenance_repository,
-            planning_context,
-            planner_mutex,
-        )
-    ).run(planning_context)
+    if recovered_planning_outcome is not None:
+        planning_outcome = replace(recovered_planning_outcome, base_sha=base_sha)
+    else:
+        planning_outcome = PlanningLifecycleCoordinator(
+            _PlanningLifecyclePorts(
+                connection,
+                runtime_repository,
+                maintenance_repository,
+                planning_context,
+                planner_mutex,
+            )
+        ).run(planning_context)
     if planning_outcome.kind in {
         PlanningOutcomeKind.REMOTE_BASE_RESTART,
         PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED,
