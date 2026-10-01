@@ -5856,6 +5856,30 @@ def project_execplan(connection: sqlite3.Connection, repo: str) -> sqlite3.Row |
     return runtime_state.RuntimeStateRepository(connection).projected_row(repo)
 
 
+def _project_pr_merge_confirmed(
+    connection: sqlite3.Connection,
+    repo: str,
+    project: sqlite3.Row,
+) -> bool:
+    """Resolve a stale projection against this plan's durable execution row."""
+
+    path = str(project["plan_path"] or "").replace(
+        "docs/plans/archive/", "docs/plans/", 1,
+    )
+    plan_id = _plan_id_from_path(path)
+    if plan_id is None:
+        return False
+    plan = connection.execute(
+        "SELECT status, branch FROM exec_plans WHERE repo = ? AND plan_id = ?",
+        (repo, plan_id),
+    ).fetchone()
+    return bool(
+        plan is not None
+        and plan["status"] == "MERGED"
+        and project["branch"] == (plan["branch"] or f"loop-manager/{plan_id}")
+    )
+
+
 def plan_blocked_execplans(
     connection: sqlite3.Connection, repo: str
 ) -> tuple[sqlite3.Row, ...]:
@@ -22107,7 +22131,11 @@ def _run_project_step(
         "SELECT * FROM projects WHERE repo = ?", (repo,)
     ).fetchone()
 
-    if row and row["branch"] and not runtime_state.planning_owns_execution_slot(row):
+    if (
+        row and row["branch"]
+        and not runtime_state.planning_owns_execution_slot(row)
+        and not _project_pr_merge_confirmed(connection, repo, row)
+    ):
         existing_pr = pr_for_branch(repo_path, row["branch"], row["pr_url"])
         if existing_pr:
             try:

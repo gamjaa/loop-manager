@@ -1974,6 +1974,103 @@ class PlannerFutureIdeasTest(unittest.TestCase):
                     self.assertEqual(project["planning_fingerprint"], original_fingerprint)
 
 
+class PersistedMergeProjectQueryTest(unittest.TestCase):
+    def setUp(self):
+        self.connection = sqlite3.connect(":memory:")
+        self.connection.row_factory = sqlite3.Row
+        self.connection.execute(loop_manager.SCHEMA)
+        loop_manager._ensure_execplans_schema(self.connection)
+        self.addCleanup(self.connection.close)
+        self.connection.execute(
+            "INSERT INTO projects (repo, base_branch, phase, plan_path, branch, pr_url) "
+            "VALUES ('/repo', 'main', 'PUBLISHING', 'docs/plans/[G-001] Original.md', "
+            "'loop-manager/G-001', 'https://example.test/pr/1')"
+        )
+        self.insert_plan("G-001", "MERGED")
+
+    def insert_plan(self, plan_id, status, *, repo="/repo"):
+        self.connection.execute(
+            "INSERT INTO exec_plans (repo, plan_id, path, title, sources, depends_on, "
+            "priority, content_hash, status, branch, pr_url) "
+            "VALUES (?, ?, ?, 'Original', '[\"docs/PRODUCT.md\"]', '[]', "
+            "'normal', 'hash', ?, ?, ?)",
+            (repo, plan_id, f"docs/plans/[{plan_id}] Original.md", status,
+             f"loop-manager/{plan_id}", f"https://example.test/pr/{plan_id}"),
+        )
+        self.connection.commit()
+
+    def run_step(self, *, synchronize=None):
+        reconciled = SimpleNamespace(
+            kind=loop_manager.execplan_catalog_state.ReconciliationKind.RECONCILED,
+            revision_sha="a" * 40,
+        )
+        with contextlib.ExitStack() as stack:
+            for name in (
+                "observe_blocked_plan_remotes", "backfill_plan_shas",
+                "migrate_legacy_execplans", "resume_plan_blocks",
+            ):
+                stack.enter_context(mock.patch.object(loop_manager, name))
+            stack.enter_context(mock.patch.object(loop_manager, "validate_repository", return_value=Path("/repo")))
+            stack.enter_context(mock.patch.object(loop_manager, "remote_base", return_value="main"))
+            stack.enter_context(mock.patch.object(loop_manager, "git", return_value=SimpleNamespace(stdout="a" * 40)))
+            stack.enter_context(mock.patch.object(loop_manager, "recheck_cleanup_pending", return_value=[]))
+            stack.enter_context(mock.patch.object(loop_manager, "synchronize_waiting_pull_requests",
+                side_effect=synchronize, return_value=SimpleNamespace(step_result=0)))
+            stack.enter_context(mock.patch.object(loop_manager, "reconcile_execplan_catalog", return_value=reconciled))
+            planning = stack.enter_context(mock.patch.object(
+                loop_manager.PlanningLifecycleCoordinator, "run",
+                return_value=SimpleNamespace(kind=loop_manager.PlanningOutcomeKind.WAITING),
+            ))
+            result = loop_manager._run_project_step(
+                self.connection, Path("/state"), "/repo", Path("unused.ini"), "main", False,
+            )
+        self.assertEqual(result, 0)
+        planning.assert_called_once()
+
+    def test_stale_merged_projection_skips_pr_query_after_plan_rename(self):
+        self.connection.execute(
+            "UPDATE exec_plans SET path = 'docs/plans/archive/[G-001] Renamed.md' "
+            "WHERE repo = '/repo' AND plan_id = 'G-001'"
+        )
+        with mock.patch.object(loop_manager, "pr_for_branch", side_effect=AssertionError("PR query")) as pr:
+            for phase in ("PUBLISHING", "WORKING", "VERIFYING", "REVIEWING"):
+                with self.subTest(phase=phase):
+                    self.connection.execute("UPDATE projects SET phase = ?", (phase,))
+                    self.run_step()
+                    self.assertEqual(self.connection.execute(
+                        "SELECT status FROM exec_plans WHERE repo = '/repo' AND plan_id = 'G-001'"
+                    ).fetchone()[0], "MERGED")
+            pr.assert_not_called()
+
+    def test_same_step_merge_with_open_plan_queries_only_unconfirmed_pr(self):
+        self.connection.execute("UPDATE exec_plans SET status = 'PR_OPEN' WHERE plan_id = 'G-001'")
+        self.insert_plan("G-002", "PR_OPEN")
+
+        def synchronize(connection, _repo_path, _state_dir, repo, **_kwargs):
+            connection.execute(
+                "UPDATE exec_plans SET status = 'MERGED' WHERE repo = ? AND plan_id = 'G-001'", (repo,),
+            )
+            connection.commit()
+            # The first observation has committed G-001's merge. The remaining
+            # unconfirmed plan still requires its normal observation query.
+            loop_manager.pr_for_branch(Path(repo), "loop-manager/G-002")
+            return SimpleNamespace(step_result=0)
+
+        with mock.patch.object(loop_manager, "pr_for_branch", return_value={"state": "OPEN"}) as pr:
+            self.run_step(synchronize=synchronize)
+            pr.assert_called_once_with(Path("/repo"), "loop-manager/G-002")
+        self.assertEqual(self.connection.execute(
+            "SELECT status FROM exec_plans WHERE plan_id = 'G-002'"
+        ).fetchone()[0], "PR_OPEN")
+
+    def test_unconfirmed_project_keeps_query_despite_other_repository_merge(self):
+        self.connection.execute("UPDATE exec_plans SET status = 'PR_OPEN' WHERE repo = '/repo'")
+        self.insert_plan("G-001", "MERGED", repo="/other")
+        with mock.patch.object(loop_manager, "pr_for_branch", return_value=None) as pr:
+            self.run_step()
+            pr.assert_called_once_with(Path("/repo"), "loop-manager/G-001", "https://example.test/pr/1")
+
+
 class ProjectDiagnosticPublicationUnitTests(unittest.TestCase):
     def test_planner_import_fixture_contains_direct_manager_modules(self):
         import ast

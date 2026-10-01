@@ -54,6 +54,8 @@ SQLite에 이미 Merge가 확정된 PR은 이후 Loop 실행, 재시작과 archi
 
 - 2026-10-01: Manager 전체 verify에서 archive 후보 계산 unit fixture의 `diagnostic_code` 열 누락이 확인됐다. 축소 history DDL 대신 실제 catalog schema 생성 함수를 사용하도록 수정했다. 실패한 개별 unit case를 동일 명령으로 재실행해 1 test PASS를 확인했다. 전체 verify 재검증은 Manager에 맡긴다.
 
+- 2026-10-01: 오래된 PUBLISHING 등의 project projection에서 PR 복구 조회가 재발하는 Review 피드백을 수정했다. 조회 직전에 repository·계획 ID·branch와 최신 SQLite MERGED 상태를 비교한다. rename 후 projection, 같은 실행의 선행 Merge 전이와 미확정 PR 혼합, 다른 repository의 동일 ID를 검증하는 `tests.test_loop_manager.PersistedMergeProjectQueryTest`의 unit case 3개가 PASS했다. 전체 verify와 재Review는 Manager에 맡긴다.
+
 ## Decision Log
 
 - 2026-09-30: 사용자가 DB상 이미 Merge된 PR의 재조회 제외를 요청했다. 기존 PRODUCT의 실행 상태·복구·archive 목표 안에서 확정된 사실을 재사용하는 수정으로 계획하며, PRODUCT·Requirement·ARCHITECTURE와 기존 ExecPlan은 변경하지 않는다.
