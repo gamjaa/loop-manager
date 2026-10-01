@@ -556,6 +556,74 @@ class NativeWriteIsolationTests(TestCase):
             with self.subTest(mounts=invalid), self.assertRaises(gate.BoundaryError):
                 gate.check_mounts(invalid, writable, protected)
 
+    def test_mount_visibility_ignores_only_covered_or_inaccessible_unrelated_mounts(self):
+        text = ('1 0 8:1 / / ro - ext4 root rw\n'
+                '2 1 0:1 / /run/docker/netns/test rw - nsfs nsfs rw\n'
+                '3 1 0:2 / /proc/sys/fs/binfmt_misc rw - autofs autofs rw\n'
+                '4 1 8:1 / /work rw - ext4 root rw\n')
+        with mock.patch.object(gate, '_mount_id', side_effect=[1, None, 99, 4]):
+            mounts = gate.visible_mounts(text, [Path('/source')])
+        self.assertEqual(mounts, [(Path('/'), True, 'ext4'),
+                                  (Path('/work'), False, 'ext4')])
+        gate.check_mounts(mounts, [Path('/work')], [Path('/source')])
+
+    def test_mount_visibility_rejects_inaccessible_protected_mounts_and_ancestors(self):
+        for path in ('/source', '/source/subtree', '/parent'):
+            root = Path('/parent/source') if path == '/parent' else Path('/source')
+            with self.subTest(path=path), \
+                 mock.patch.object(gate, '_mount_id', return_value=None), \
+                 self.assertRaisesRegex(gate.BoundaryError, 'inaccessible'):
+                gate.visible_mounts(f'1 0 8:1 / {path} rw - ext4 root rw\n', [root])
+
+    def test_mount_visibility_does_not_allow_visible_external_writable_mount(self):
+        text = ('1 0 8:1 / / ro - ext4 root rw\n'
+                '2 1 8:1 / /outside rw - ext4 root rw\n')
+        with mock.patch.object(gate, '_mount_id', side_effect=[1, 2]):
+            mounts = gate.visible_mounts(text, [Path('/source')])
+        with self.assertRaisesRegex(gate.BoundaryError, 'unexpected writable'):
+            gate.check_mounts(mounts, [], [Path('/source')])
+
+    def test_effective_mount_identity_requires_kernel_evidence_and_closes_descriptor(self):
+        with mock.patch.object(gate.os, 'open', return_value=17) as opened, \
+             mock.patch.object(gate.os, 'close') as closed, \
+             mock.patch.object(gate.Path, 'read_text', return_value='mnt_id:\t42\n'):
+            self.assertEqual(gate._mount_id(Path('/outside')), 42)
+        opened.assert_called_once_with(Path('/outside'), gate.os.O_PATH | gate.os.O_CLOEXEC)
+        closed.assert_called_once_with(17)
+        for info in ('', 'mnt_id: invalid'):
+            with self.subTest(info=info), \
+                 mock.patch.object(gate.os, 'open', return_value=17), \
+                 mock.patch.object(gate.os, 'close') as closed, \
+                 mock.patch.object(gate.Path, 'read_text', return_value=info), \
+                 self.assertRaises((gate.BoundaryError, ValueError)):
+                gate._mount_id(Path('/outside'))
+            closed.assert_called_once_with(17)
+        with mock.patch.object(gate.os, 'open', side_effect=FileNotFoundError):
+            self.assertIsNone(gate._mount_id(Path('/missing')))
+        with mock.patch.object(gate.os, 'open', side_effect=OSError(5, 'I/O failure')), \
+             self.assertRaises(OSError):
+            gate._mount_id(Path('/unknown'))
+        with mock.patch.object(gate.os, 'open', side_effect=PermissionError):
+            self.assertIsNone(gate._mount_id(Path('/inaccessible')))
+        with mock.patch.object(gate.os, 'open', return_value=17), \
+             mock.patch.object(gate.os, 'close') as closed, \
+             mock.patch.object(gate.Path, 'read_text', side_effect=PermissionError), \
+             self.assertRaises(PermissionError):
+            gate._mount_id(Path('/outside'))
+        closed.assert_called_once_with(17)
+
+    def test_native_standard_devices_do_not_allow_regular_files_or_other_mounts(self):
+        root = (Path('/'), True, 'ext4')
+        gate.check_mounts([root, (Path('/dev/null'), False, 'devtmpfs')], [], [])
+        for path, filesystem in (('/dev/unexpected', 'devtmpfs'),
+                                 ('/outside', 'devtmpfs'), ('/dev/null', 'ext4')):
+            with self.subTest(path=path, filesystem=filesystem), \
+                 self.assertRaises(gate.BoundaryError):
+                gate.check_mounts([root, (Path(path), False, filesystem)], [], [])
+        with mock.patch.object(gate.Path, 'stat', return_value=mock.Mock(st_mode=0o100644)), \
+             self.assertRaises(gate.BoundaryError):
+            gate.check_mounts([root, (Path('/dev/null'), False, 'devtmpfs')], [], [])
+
     def test_mount_parser_preserves_escaped_paths_and_per_mount_readonly(self):
         mounts = gate.mount_table(
             '1 0 8:1 / / ro,relatime - ext4 /dev/root rw\n'
@@ -584,6 +652,7 @@ class NativeWriteIsolationTests(TestCase):
         with mock.patch.object(gate.Path, 'read_text', side_effect=[
                 '1 0 8:1 / / ro - ext4 root rw\n',
                 'CapEff:\t00000000\nNoNewPrivs:\t1\n']), \
+             mock.patch.object(gate, '_mount_id', side_effect=lambda path: 2 if path.name == 'selected' else 1), \
              mock.patch.object(gate.os, 'readlink', return_value='mnt:[1]'), \
              mock.patch.object(gate.Path, 'exists', return_value=True), \
              mock.patch.object(gate.os, 'statvfs', return_value=mock.Mock(f_flag=0)), \
@@ -608,6 +677,7 @@ class NativeWriteIsolationTests(TestCase):
                     '1 0 8:1 / / ro - ext4 root rw\n'
                     f'2 1 8:1 / {selected} rw - ext4 root rw\n',
                     'CapEff:\t0\nNoNewPrivs:\t1\n']), \
+                 mock.patch.object(gate, '_mount_id', side_effect=lambda path: 2 if path == selected else 1), \
                  mock.patch.object(gate.os, 'readlink', return_value='mnt:[1]'), \
                  mock.patch.object(gate.os, 'statvfs', return_value=mock.Mock(f_flag=gate.os.ST_RDONLY)), \
                  mock.patch.object(gate.os, 'walk', side_effect=PermissionError('tree inspection unavailable')) as walk:

@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 import tempfile
 
@@ -34,6 +35,38 @@ def mount_table(text: str) -> list[tuple[Path, bool, str]]:
     return mounts
 
 
+def _mount_id(path: Path) -> int | None:
+    # O_PATH checks traversal without opening device contents or mutating files.
+    try:
+        descriptor = os.open(path, os.O_PATH | os.O_CLOEXEC)
+    except (PermissionError, FileNotFoundError):
+        return None
+    try:
+        info = Path(f'/proc/self/fdinfo/{descriptor}').read_text()
+        for line in info.splitlines():
+            if line.startswith('mnt_id:'):
+                return int(line.split(':', 1)[1].strip())
+        raise BoundaryError('effective mount identity is unavailable')
+    finally:
+        os.close(descriptor)
+
+
+def visible_mounts(text: str, protected: list[Path]) -> list[tuple[Path, bool, str]]:
+    result = []
+    for fields, mount in zip(text.splitlines(), mount_table(text), strict=True):
+        path, _, _ = mount
+        identity = _mount_id(path)
+        if identity is None:
+            if any(_inside(path, root) or _inside(root, path) for root in protected):
+                raise BoundaryError('protected mount is inaccessible')
+            continue
+        # Covered mounts can retain rw flags in mountinfo although path lookup
+        # reaches a different mount (e.g. the sandbox's replacement /proc).
+        if identity == int(fields.split()[0]):
+            result.append(mount)
+    return result
+
+
 def check_mounts(mounts: list[tuple[Path, bool, str]], writable: list[Path],
                  protected: list[Path]) -> None:
     # A Landlock-only/unknown implementation is not claimed as mount proof.
@@ -50,6 +83,11 @@ def check_mounts(mounts: list[tuple[Path, bool, str]], writable: list[Path],
         if filesystem in ('proc', 'devpts', 'tmpfs') and (
                 _inside(path, Path('/proc')) or _inside(path, Path('/dev'))):
             continue
+        if (filesystem == 'devtmpfs'
+                and path in {Path('/dev') / name for name in
+                             ('null', 'zero', 'full', 'random', 'urandom', 'tty')}
+                and stat.S_ISCHR(path.stat().st_mode)):
+            continue
         raise BoundaryError('unexpected writable mount')
     for root in protected:
         candidates = [(path, readonly) for path, readonly, _ in mounts if _inside(root, path)]
@@ -62,7 +100,8 @@ def check_mounts(mounts: list[tuple[Path, bool, str]], writable: list[Path],
 def check_boundary(spec: dict) -> None:
     writable = [Path(value) for value in spec['writable']]
     protected = [Path(value) for value in spec['protected']]
-    check_mounts(mount_table(Path('/proc/self/mountinfo').read_text()), writable, protected)
+    check_mounts(visible_mounts(Path('/proc/self/mountinfo').read_text(), protected),
+                 writable, protected)
     status = Path('/proc/self/status').read_text()
     values = dict(line.split(':', 1) for line in status.splitlines() if ':' in line)
     if int(values.get('CapEff', '1').strip(), 16) or values.get('NoNewPrivs', '').strip() != '1':
