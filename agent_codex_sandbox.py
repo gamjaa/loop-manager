@@ -129,12 +129,16 @@ def prepare_launch(boundary, state_dir: Path, role: str, read_only: bool,
                                 'worktree': str(boundary.worktree)}, sort_keys=True)
     # The outer native sandbox permits provider API traffic. Model shell
     # commands retain their own inner network_access=false and granular review.
+    permissions = {":root": "read", **{str(path): "write" for path in writable},
+                   **{str(path): "read" for path in protected}}
+    filesystem = "{" + ",".join(
+        json.dumps(path) + "=" + json.dumps(access)
+        for path, access in permissions.items()
+    ) + "}"
     prefix = ('codex', 'sandbox', '-C', str(attempt),
-              '-c', 'sandbox_mode="workspace-write"',
-              '-c', 'sandbox_workspace_write.writable_roots=' + json.dumps([str(p) for p in writable]),
-              '-c', 'sandbox_workspace_write.exclude_slash_tmp=true',
-              '-c', 'sandbox_workspace_write.exclude_tmpdir_env_var=true',
-              '-c', 'sandbox_workspace_write.network_access=true',
+              '--permission-profile', 'loop-manager-envelope',
+              '-c', 'permissions.loop-manager-envelope.filesystem=' + filesystem,
+              '-c', 'permissions.loop-manager-envelope.network.enabled=true',
               '--', sys.executable, '-I', str(Path(__file__).with_name('agent_sandbox_exec.py')),
               specification)
     if not read_only:

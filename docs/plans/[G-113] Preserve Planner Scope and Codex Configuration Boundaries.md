@@ -27,6 +27,7 @@ priority: critical
 - hydrate_active_project에서 기존 planning ownership 판정을 적용한다.
 - Codex config 경로 수집을 .git repository 경계로 제한한다.
 - 별도 운영 Codex home을 사용해 개인 plugin 설정을 유지하면서 자동 실행의 설정 충돌을 해결한다.
+- 현재 Codex CLI의 `sandbox --permission-profile` 인자에 기존 최소 쓰기 경계를 명시한다. outer profile과 기존 mount gate를 함께 검증하며 inner model 명령의 network 제한과 자동 승인 검토는 유지한다.
 
 ## Validation
 
@@ -43,3 +44,5 @@ priority: critical
 
 - 2026-10-01: 사용자가 재차 차단된 자동 실행의 복구와 G-058 대신 critical 계획 처리를 요청했다. 직전 수동 해제의 IMPLEMENTING 상태가 active 재개를 유발했고, Planner snapshot과 G-058 worktree 비교 오류를 확인했다. 제품의 비선점 정책은 변경하지 않고 사용자 요청으로 G-058을 보류한다.
 - OpenAI 공식 문서에 따라 Codex 사용자 설정과 repository project 설정의 경계를 구분한다. 사용자 plugin 설정은 삭제하지 않으며 새 자동 실행 home은 비밀값을 출력하거나 복제하지 않는다.
+
+- 2026-10-01: 실제 자동 실행에서 CLI 0.159.3의 outer sandbox는 named permission profile을 요구함을 확인했다. 기존 mount proof와 쓰기 경계를 유지하는 형식으로 갱신한다. Ubuntu AppArmor가 vendor bwrap의 namespace 초기화를 거부하는 운영 환경 조건은 개별 binary profile로 해결하며 시스템 전체 userns 정책은 변경하지 않는다.

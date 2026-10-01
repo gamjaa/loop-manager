@@ -483,7 +483,16 @@ class NativeWriteIsolationTests(TestCase):
             self.assertIn(str(boundary.common_dir), policy['protected'])
             self.assertIn(str(boundary.other_worktrees[0]), policy['protected'])
             self.assertIn(str(boundary.worktree / '.git'), policy['protected'])
-            self.assertIn('sandbox_workspace_write.network_access=true', launch.prefix)
+            self.assertIn('--permission-profile', launch.prefix)
+            self.assertIn('loop-manager-envelope', launch.prefix)
+            self.assertIn('permissions.loop-manager-envelope.network.enabled=true', launch.prefix)
+            import tomllib
+            profile = next(arg for arg in launch.prefix if arg.startswith('permissions.loop-manager-envelope.filesystem='))
+            filesystem = tomllib.loads(profile)['permissions']['loop-manager-envelope']['filesystem']
+            self.assertEqual(filesystem[':root'], 'read')
+            self.assertEqual({path for path, access in filesystem.items() if access == 'write'}, set(policy['writable']))
+            self.assertTrue(all(filesystem[path] == 'read' for path in policy['protected']))
+            self.assertFalse(any(arg.startswith('sandbox_mode=') for arg in launch.prefix))
             self.assertIn('sandbox_workspace_write.network_access=false', launch.arguments)
             second = envelope.prepare_launch(boundary, state_root, 'worker', False,
                                               launch.arguments, environment)
