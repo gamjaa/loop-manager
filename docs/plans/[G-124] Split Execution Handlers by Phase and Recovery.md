@@ -79,6 +79,31 @@ RERUN: python3 -m unittest tests.test_execution_current_rebase_adoption_phase.Cu
 - 2026-10-02 보고 보정: 최초 Worker 응답은 FAILED_COMMAND/RERUN을 TARGETED_TESTS 밖에 두고 그 안에는 실패 시나리오 설명을 남겨 결과 검증에서 거부됐다. 실제 테스트 재실행은 통과했으므로 runtime 정책은 변경하지 않았다. 재실행 기록과 최초 ERROR, 최종 PASS를 TARGETED_TESTS 안에 함께 배치했다.
 - 위 checkpoint 선택 명령을 다시 실행해 3개 PASS를 확인했다. `python3 -m unittest tests.test_worker_result_contract.WorkerResultContractTest.test_targeted_test_evidence_requires_a_clean_explicit_rerun -v`도 1개 PASS이며, 최종 응답 원문은 기존 publication/outcome parser로 검증했다. 전체 verify는 실행하지 않았다.
 
+### 검증 피드백 대응 (2026-10-02)
+
+- immutable snapshot의 `sources`·`depends_on` tuple이 기존 helper의 dict/list 계약에 그대로 전달되어 문서 승인 guard, 저장된 Worker 결과의 재시작 복구와 PR 본문 생성에서 회귀가 발생했다. snapshot을 가변으로 되돌리지 않고 기존 helper 호출 경계에서 독립된 dict/list 복사본을 전달한다. Worker 결과 parser 5개 phase, workspace/revision level helper와 publication renderer에 같은 변환을 적용하고 문서 승인 validator도 기존 입력 계약을 유지한다.
+- 분리된 blocked scope test가 다른 module의 test class 이름을 참조해 import되지 않았다. 공통 setup을 기존 `tests/support/current_rebase.py`의 non-TestCase fixture로 추출하고 두 module에서 재사용한다. 기존 scenario와 assertion은 보존하고 중복 discovery를 피한다.
+- PR publication 검증의 실제 Git 시나리오는 실행하지 않았다. 해당 traceback의 `build_pr_body` list assertion을 실제 renderer를 사용하는 composition unit test로 직접 검증했다. parser 입력의 독립성, `sources`·`depends_on` 불변성 및 preparation/revision helper 경계도 새 unit test로 확인했다.
+
+FAILED_COMMAND: python3 -m unittest tests.test_execution_documents.ExecutionDocumentsTests.test_document_execution_guard_preserves_crlf_approved_diff tests.test_execution_failure_policy.ExecutionFailurePolicyTests.test_saved_worker_result_finishes_after_restart_without_second_agent_turn tests.test_execution_evidence_free_blocked_scope -v
+Initial run: ERROR (test module import NameError). fixture 수정 뒤 동일 명령의 중간 실행은 FAIL 1개, ERROR 1개였으며 helper metadata 입력 계약을 복원했다.
+RERUN: python3 -m unittest tests.test_execution_documents.ExecutionDocumentsTests.test_document_execution_guard_preserves_crlf_approved_diff tests.test_execution_failure_policy.ExecutionFailurePolicyTests.test_saved_worker_result_finishes_after_restart_without_second_agent_turn tests.test_execution_evidence_free_blocked_scope -v
+최종 결과: 8개 모두 PASS, exit code 0.
+
+추가 targeted unit test:
+
+```text
+python3 -m unittest tests.test_execution_handlers.ExecutionCompositionTests.test_phase_parsers_receive_owned_legacy_metadata_without_mutating_snapshot tests.test_execution_handlers.ExecutionCompositionTests.test_publication_renderer_accepts_immutable_plan_sources tests.test_execution_current_rebase_agent_scope.CurrentRebaseAgentScopeTests.test_resumed_scope_keeps_original_and_records_observed_comparison_start tests.test_blocked_checkpoint.BlockedCheckpointDiscoveryUnitTests.test_git_fixture_cases_are_collected_once_across_consuming_modules -v
+```
+
+최종 결과: 4개 모두 PASS, exit code 0.
+
+```text
+python3 -m unittest tests.test_execution_handlers.ExecutionCompositionTests.test_preparation_and_revision_level_helpers_receive_owned_metadata -v
+```
+
+최종 결과: 1개 PASS, exit code 0. Worker는 전체 verify를 실행하지 않았다.
+
 ## Decision Log
 
 - 2026-10-02: 이미 분리된 `execution_runtime` coordinator를 다시 만들지 않는다. phase 전이는 coordinator, 외부 효과는 adapter, phase의 작업은 해당 handler가 담당하도록 기존 경계를 완성한다.

@@ -7,6 +7,12 @@ from loop_manager_internal.catalog.requirement_archive import ArchiveSnapshot
 from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
 from loop_manager_internal.execution.execution_runtime import ExecutionPlanMetadata
 
+
+def legacy_plan_metadata(plan: Mapping[str, object]) -> dict[str, object]:
+    """Give existing metadata helpers an owned dict with their list contract."""
+    return {key: list(value) if isinstance(value, tuple) else value
+            for key, value in plan.items()}
+
 @dataclass(frozen=True)
 class ExecutionIdentity:
     repo: str = ''

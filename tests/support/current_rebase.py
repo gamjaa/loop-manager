@@ -2,6 +2,9 @@ from tests.support.execution import VALID_WORKER_RESULT
 from tests.support.lifecycle import fixture_cleanup
 from tests.support.execution import execution_fixture
 from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+import loop_manager as lm
 from unittest import mock
 from loop_manager_internal.execution import execution_handlers as handlers
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
@@ -93,3 +96,31 @@ def current_rebase_case(test):
     fixture = fixture_cleanup(test, CurrentRebaseFixture())
     fixture.setUp()
     return fixture
+
+
+class CurrentRebaseAgentScopeFixture:
+    """Shared accepted-rebase scope setup, with no discoverable test methods."""
+    def setUp(self):
+        self.case = current_rebase_case(self)
+        self.case.handler._complete_rebase_intent(self.case.fixture.context())
+        branch, worktree = 'loop-manager/G-047', '/state/G-047'
+        self.original = lm.GitSnapshot('before', branch, {}, {},
+            {f'refs/heads/{branch}': ('before', ''), 'refs/heads/other': ('other', '')},
+            {worktree: ('HEAD=before', f'branch=refs/heads/{branch}')}, {}, {})
+        self.current = replace(self.original, head='owned-head',
+            refs={**self.original.refs, f'refs/heads/{branch}': ('owned-head', '')},
+            worktrees={worktree: ('HEAD=owned-head', f'branch=refs/heads/{branch}')})
+        self.case.state.update_project('repo', agent_role='worker',
+            agent_snapshot=self.original.serialize())
+        for patch in (
+            mock.patch.object(lm, '_owned_rebase_state_dir', return_value=Path('/state')),
+            mock.patch.object(lm, '_current_rebase_service', side_effect=lambda *_a, **_k: self.case.factory(None)),
+            mock.patch.object(lm, 'capture_git_snapshot', side_effect=lambda *_a: self.current),
+            mock.patch.object(lm, '_config_entries', return_value={}),
+            mock.patch.object(lm, '_proven_merged_cleanup_paths', return_value=frozenset()),
+            mock.patch.object(Path, 'is_dir', return_value=True),
+            mock.patch.object(lm, 'git', return_value=SimpleNamespace(stdout='', returncode=0)),
+            mock.patch.object(lm, 'git_bytes', return_value=b''),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)

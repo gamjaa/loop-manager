@@ -7,12 +7,12 @@ from unittest import TestCase, mock
 import loop_manager as lm
 from loop_manager_internal.recovery import scoped_blocking
 from tests.support.guidance import guidance_plan
+from tests.support.current_rebase import CurrentRebaseAgentScopeFixture
 
 
 
 
-class EvidenceFreeBlockedScopeTests(TestCase):
-    setUp = CurrentRebaseAgentScopeTests.setUp
+class EvidenceFreeBlockedScopeTests(CurrentRebaseAgentScopeFixture, TestCase):
 
     def validate(self):
         connection = self.case.fixture.connection

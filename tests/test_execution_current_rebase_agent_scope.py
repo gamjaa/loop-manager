@@ -1,9 +1,8 @@
 """Current Rebase Agent Scope regression tests."""
 
-from tests.support.current_rebase import current_rebase_case
+from tests.support.current_rebase import CurrentRebaseAgentScopeFixture
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import TestCase, mock
 
 import loop_manager as lm
@@ -11,31 +10,7 @@ import loop_manager as lm
 
 
 
-class CurrentRebaseAgentScopeTests(TestCase):
-    def setUp(self):
-        self.case = current_rebase_case(self)
-        self.case.handler._complete_rebase_intent(self.case.fixture.context())
-        branch, worktree = 'loop-manager/G-047', '/state/G-047'
-        self.original = lm.GitSnapshot('before', branch, {}, {},
-            {f'refs/heads/{branch}': ('before', ''), 'refs/heads/other': ('other', '')},
-            {worktree: ('HEAD=before', f'branch=refs/heads/{branch}')}, {}, {})
-        self.current = replace(self.original, head='owned-head',
-            refs={**self.original.refs, f'refs/heads/{branch}': ('owned-head', '')},
-            worktrees={worktree: ('HEAD=owned-head', f'branch=refs/heads/{branch}')})
-        self.case.state.update_project('repo', agent_role='worker',
-            agent_snapshot=self.original.serialize())
-        for patch in (
-            mock.patch.object(lm, '_owned_rebase_state_dir', return_value=Path('/state')),
-            mock.patch.object(lm, '_current_rebase_service', side_effect=lambda *_a, **_k: self.case.factory(None)),
-            mock.patch.object(lm, 'capture_git_snapshot', side_effect=lambda *_a: self.current),
-            mock.patch.object(lm, '_config_entries', return_value={}),
-            mock.patch.object(lm, '_proven_merged_cleanup_paths', return_value=frozenset()),
-            mock.patch.object(Path, 'is_dir', return_value=True),
-            mock.patch.object(lm, 'git', return_value=SimpleNamespace(stdout='', returncode=0)),
-            mock.patch.object(lm, 'git_bytes', return_value=b''),
-        ):
-            patch.start()
-            self.addCleanup(patch.stop)
+class CurrentRebaseAgentScopeTests(CurrentRebaseAgentScopeFixture, TestCase):
 
     def test_resumed_scope_keeps_original_and_records_observed_comparison_start(self):
         from loop_manager_internal.git.managed_rebase_adoption import agent_comparison_baseline

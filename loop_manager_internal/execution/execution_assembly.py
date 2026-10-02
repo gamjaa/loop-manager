@@ -1,8 +1,8 @@
 """Compose phase ports from selected effect callbacks, never the whole effects bundle."""
 from __future__ import annotations
-from typing import Callable
+from typing import Any, Callable, Mapping
 from loop_manager_internal.execution.execution_effects import ExecutionEffects, ExecutionContract
-from loop_manager_internal.execution.execution_session import ExecutionIdentity, PreparationSnapshot
+from loop_manager_internal.execution.execution_session import ExecutionIdentity, PreparationSnapshot, legacy_plan_metadata
 
 from loop_manager_internal.execution.execution_context_handler import ContextHandler, ContextHandlerPorts
 
@@ -29,6 +29,13 @@ from loop_manager_internal.execution.execution_review_handler import ReviewHandl
 from loop_manager_internal.execution.execution_latest_base_handler import LatestBaseHandler, LatestBaseHandlerPorts
 
 from loop_manager_internal.execution.execution_publication_handler import PublicationHandler, PublicationHandlerPorts
+
+
+def _legacy_plan_callback(callback: Callable[..., Any]) -> Callable[..., Any]:
+    """Adapt immutable metadata at the existing helper boundary."""
+    def invoke(value: Any, plan: Mapping[str, object], *args: Any, **kwargs: Any) -> Any:
+        return callback(value, legacy_plan_metadata(plan), *args, **kwargs)
+    return invoke
 
 
 def context(effects: ExecutionEffects, identity: ExecutionIdentity,
@@ -141,7 +148,7 @@ def workspace(effects: ExecutionEffects, identity: ExecutionIdentity,
         state=effects.state,
         _plan_id_from_path=effects.workspace._plan_id_from_path,
         _rebase_in_progress_for_branch=effects.workspace._rebase_in_progress_for_branch,
-        ensure_worker_level_state=effects.validation.ensure_worker_level_state,
+        ensure_worker_level_state=_legacy_plan_callback(effects.validation.ensure_worker_level_state),
         git=effects.workspace.git,
         git_operation_entries=getattr(effects.workspace, "git_operation_entries", None),
         make_worktree=effects.workspace.make_worktree,
@@ -192,11 +199,11 @@ def revision(effects: ExecutionEffects, identity: ExecutionIdentity,
         body_hash=effects.revision.body_hash,
         branch_has_changes=effects.workspace.branch_has_changes,
         changed_paths=effects.revision.changed_paths,
-        ensure_worker_level_state=effects.validation.ensure_worker_level_state,
+        ensure_worker_level_state=_legacy_plan_callback(effects.validation.ensure_worker_level_state),
         git=effects.workspace.git,
         operation_log=effects.events.operation_log,
         operation_print=effects.events.operation_print,
-        parse_worker_result=effects.validation.parse_worker_result,
+        parse_worker_result=_legacy_plan_callback(effects.validation.parse_worker_result),
         pr_for_branch=effects.publication.pr_for_branch,
         reconcile_catalog=effects.revision.reconcile_catalog,
         record_remote_publication_branch=effects.publication.record_remote_publication_branch,
@@ -276,7 +283,7 @@ def worker(effects: ExecutionEffects, identity: ExecutionIdentity,
         is_loop_manager_repository=effects.agent.is_loop_manager_repository,
         operation_log=effects.events.operation_log,
         operation_print=effects.events.operation_print,
-        parse_worker_result=effects.validation.parse_worker_result,
+        parse_worker_result=_legacy_plan_callback(effects.validation.parse_worker_result),
         requirement_archive_move_set=effects.archive.requirement_archive_move_set,
         requirement_archive_reconciliation_error=effects.archive.requirement_archive_reconciliation_error,
         resolve_worker_profile=effects.agent.resolve_worker_profile,
@@ -331,7 +338,7 @@ def verify(effects: ExecutionEffects, identity: ExecutionIdentity,
         git=effects.workspace.git,
         operation_log=effects.events.operation_log,
         operation_print=effects.events.operation_print,
-        parse_worker_result=effects.validation.parse_worker_result,
+        parse_worker_result=_legacy_plan_callback(effects.validation.parse_worker_result),
         transition_validation_failure=effects.validation.transition_validation_failure,
         validate_active_execplan_metadata=effects.validation.validate_active_execplan_metadata,
         validate_guidance_publication=effects.agent.validate_guidance_publication,
@@ -374,7 +381,7 @@ def review(effects: ExecutionEffects, identity: ExecutionIdentity,
         operation_log=effects.events.operation_log,
         operation_print=effects.events.operation_print,
         parse_reviewer_result=effects.validation.parse_reviewer_result,
-        parse_worker_result=effects.validation.parse_worker_result,
+        parse_worker_result=_legacy_plan_callback(effects.validation.parse_worker_result),
         reviewer_prompt=effects.agent.reviewer_prompt,
         run_agent=effects.agent.run_agent,
         run_agent_with_retries=effects.agent.run_agent_with_retries,
@@ -437,12 +444,12 @@ def publication(effects: ExecutionEffects, identity: ExecutionIdentity,
         contract=ExecutionContract.from_source(effects.contract),
         state=effects.state,
         branch_has_changes=effects.workspace.branch_has_changes,
-        build_pr_body=effects.publication.build_pr_body,
+        build_pr_body=_legacy_plan_callback(effects.publication.build_pr_body),
         command=effects.publication.command,
         git=effects.workspace.git,
         live_remote_branch_oid=getattr(effects.workspace, "live_remote_branch_oid", None),
         operation_print=effects.events.operation_print,
-        parse_worker_result=effects.validation.parse_worker_result,
+        parse_worker_result=_legacy_plan_callback(effects.validation.parse_worker_result),
         pr_for_branch=effects.publication.pr_for_branch,
         published_execplan=effects.publication.published_execplan,
         push_managed_publication_branch=effects.publication.push_managed_publication_branch,

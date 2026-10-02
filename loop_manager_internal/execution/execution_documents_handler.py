@@ -7,7 +7,7 @@ from loop_manager_internal.documents import document_drafts
 from loop_manager_internal.documents import document_publication
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 
-from loop_manager_internal.execution.execution_session import ExecutionIdentity, PreparationSnapshot
+from loop_manager_internal.execution.execution_session import ExecutionIdentity, PreparationSnapshot, legacy_plan_metadata
 from loop_manager_internal.execution.execution_state import ExecutionStatePort
 
 @dataclass(frozen=True)
@@ -71,7 +71,9 @@ class DocumentsHandler:
         plan_text = document_publication.read_plan_text(
             context.worktree / context.plan.path,
         )
-        document_publication.validate_document_plan(plan_text, self.ports.snapshot().plan, draft)
+        document_publication.validate_document_plan(
+            plan_text, legacy_plan_metadata(self.ports.snapshot().plan), draft,
+        )
         document_publication.validate_exact_worktree(
             draft, context.worktree, str(self.ports._row()['active_sha'] or ''),
         )
@@ -99,7 +101,9 @@ class DocumentsHandler:
             plan_text = document_publication.read_plan_text(
                 context.worktree / context.plan.path,
             )
-            document_publication.validate_document_plan(plan_text, self.ports.snapshot().plan, draft)
+            document_publication.validate_document_plan(
+                plan_text, legacy_plan_metadata(self.ports.snapshot().plan), draft,
+            )
             document_publication.apply_approved_bytes(
                 draft, context.worktree, str(self.ports._row()['active_sha'] or ''),
             )
