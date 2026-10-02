@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from loop_manager_internal.planning.planning_runtime import PlanningContext
+from loop_manager_internal.planning.assessment_port import LegacyAssessmentPort
 from loop_manager_internal.storage import maintenance_state
 from loop_manager_internal.storage import runtime_state
 import sqlite3
@@ -43,4 +44,5 @@ class _PlanningLifecyclePorts:
         self.validation = self._effects._PlanningValidationPorts(connection)
         self.file_review = self._effects._PlanningFileReviewPorts(connection)
         self.reconciliation = self._effects._PlanningReconciliationPorts(connection)
+        self.assessment = LegacyAssessmentPort()
         self.events = self._effects._PlanningEventPorts()
