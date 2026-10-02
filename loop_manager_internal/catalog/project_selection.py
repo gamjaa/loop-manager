@@ -1,0 +1,349 @@
+"""catalog project selection boundaries and named composition effects."""
+from __future__ import annotations
+from collections.abc import Callable
+from dataclasses import dataclass
+from loop_manager_internal.application.contracts import CatalogScheduleDecision
+from loop_manager_internal.application.contracts import PRIORITY_ORDER
+from loop_manager_internal.maintenance.maintenance_orchestration import MaintenanceOrchestrationError
+from loop_manager_internal.recovery import scoped_blocking
+from loop_manager_internal.runtime.contracts import WORKSPACE_OWNED
+from loop_manager_internal.runtime.contracts import WORKSPACE_RESERVED
+from loop_manager_internal.runtime.contracts import WORKSPACE_UNOWNED
+from loop_manager_internal.storage import execplan_catalog_state
+from loop_manager_internal.storage import maintenance_state
+from loop_manager_internal.storage import runtime_state
+import json
+import re
+import sqlite3
+
+
+@dataclass(frozen=True)
+class PlanBlockedExecplansEffects:
+    """Named effects for plan_blocked_execplans; no entry-point/module access."""
+    _ensure_execplans_schema: Callable[..., object]
+
+
+def plan_blocked_execplans(
+    effects: PlanBlockedExecplansEffects, connection: sqlite3.Connection, repo: str
+) -> tuple[sqlite3.Row, ...]:
+    effects._ensure_execplans_schema(connection)
+    return tuple(
+        connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND status = 'PLAN_BLOCKED' "
+            "AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h "
+            "WHERE h.repo = exec_plans.repo "
+            "AND h.currently_archived = 1 "
+            "AND h.plan_id = exec_plans.plan_id) "
+            "ORDER BY plan_id",
+            (repo,),
+        ).fetchall()
+    )
+
+
+@dataclass(frozen=True)
+class MergeWaitExecplansEffects:
+    """Named effects for merge_wait_execplans; no entry-point/module access."""
+    _ensure_execplans_schema: Callable[..., object]
+
+
+def merge_wait_execplans(
+    effects: MergeWaitExecplansEffects, connection: sqlite3.Connection, repo: str
+) -> tuple[sqlite3.Row, ...]:
+    effects._ensure_execplans_schema(connection)
+    return tuple(
+        connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND status = 'PR_OPEN' "
+            "AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h "
+            "WHERE h.repo = exec_plans.repo "
+            "AND h.currently_archived = 1 "
+            "AND h.plan_id = exec_plans.plan_id) "
+            "ORDER BY plan_id",
+            (repo,),
+        ).fetchall()
+    )
+
+
+def mark_execplan_workspace_owned(
+    connection: sqlite3.Connection,
+    repo: str,
+    plan_id: str,
+) -> None:
+    with connection:
+        try:
+            runtime_state.RuntimeStateRepository(connection).update_plan(
+                repo,
+                plan_id,
+                plan_values={"workspace_owned": WORKSPACE_OWNED},
+                enqueue=False,
+            )
+        except runtime_state.RuntimeStateError as error:
+            raise RuntimeError(
+                "workspace 소유권을 기록할 ExecPlan을 찾을 수 없습니다."
+            ) from error
+
+
+def reserve_execplan_workspace(
+    connection: sqlite3.Connection,
+    repo: str,
+    plan_id: str,
+) -> None:
+    with connection:
+        try:
+            runtime_state.RuntimeStateRepository(connection).reserve_workspace(
+                repo,
+                plan_id,
+                reserved_value=WORKSPACE_RESERVED,
+                allowed_values=(WORKSPACE_UNOWNED, WORKSPACE_RESERVED),
+            )
+        except runtime_state.RuntimeStateError as error:
+            raise RuntimeError(
+                "workspace 생성을 예약할 ExecPlan을 찾을 수 없습니다."
+            ) from error
+
+
+@dataclass(frozen=True)
+class CompactExecplanCatalogEffects:
+    """Named effects for compact_execplan_catalog; no entry-point/module access."""
+    _ensure_execplans_schema: Callable[..., object]
+
+
+def compact_execplan_catalog(effects: CompactExecplanCatalogEffects, connection: sqlite3.Connection, repo: str) -> str:
+    """Serialize only non-terminal plan metadata, never plan bodies."""
+
+    effects._ensure_execplans_schema(connection)
+    rows = connection.execute(
+        "SELECT * FROM exec_plans WHERE repo = ? AND status != 'MERGED' "
+        "AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h "
+        "WHERE h.repo = exec_plans.repo "
+        "AND h.currently_archived = 1 "
+        "AND h.plan_id = exec_plans.plan_id)",
+        (repo,),
+    ).fetchall()
+    rows = sorted(rows, key=lambda row: int(str(row["plan_id"])[2:]))
+    catalog = [
+        {
+            "id": row["plan_id"],
+            "title": row["title"],
+            "status": row["status"],
+            "sources": json.loads(row["sources"]),
+            "depends_on": json.loads(row["depends_on"]),
+            "priority": row["priority"],
+        }
+        for row in rows
+    ]
+    return json.dumps(catalog, ensure_ascii=False, indent=2)
+
+
+@dataclass(frozen=True)
+class PrerequisiteValidationRowsEffects:
+    """Named effects for prerequisite_validation_rows; no entry-point/module access."""
+    _ensure_execplans_schema: Callable[..., object]
+
+
+def prerequisite_validation_rows(
+    effects: PrerequisiteValidationRowsEffects, connection: sqlite3.Connection, repo: str
+) -> list[sqlite3.Row]:
+    """Load active plans and only their verified, merged dependency closure."""
+
+    effects._ensure_execplans_schema(connection)
+    active = connection.execute(
+        "SELECT * FROM exec_plans WHERE repo = ? AND status != 'MERGED' "
+        "AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h "
+        "WHERE h.repo = exec_plans.repo AND h.plan_id = exec_plans.plan_id "
+        "AND h.currently_archived = 1)",
+        (repo,),
+    ).fetchall()
+    included = {str(row["plan_id"]): row for row in active}
+    pending = list(active)
+    while pending:
+        plan = pending.pop()
+        plan_id = str(plan["plan_id"])
+        try:
+            dependencies = json.loads(str(plan["depends_on"]))
+        except json.JSONDecodeError as error:
+            raise MaintenanceOrchestrationError(
+                f"선행 후보 dependency를 읽을 수 없습니다: {plan_id}"
+            ) from error
+        if not isinstance(dependencies, list) or any(
+            not isinstance(dependency, str) for dependency in dependencies
+        ):
+            raise MaintenanceOrchestrationError(
+                f"선행 후보 dependency 형식이 유효하지 않습니다: {plan_id}"
+            )
+        for dependency in dependencies:
+            if dependency in included:
+                continue
+            row = connection.execute(
+                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+                (repo, dependency),
+            ).fetchone()
+            if row is None:
+                raise MaintenanceOrchestrationError(
+                    f"선행 후보의 dependency가 catalog에 없습니다: {plan_id} -> {dependency}"
+                )
+            history = connection.execute(
+                "SELECT * FROM execplan_catalog_history "
+                "WHERE repo = ? AND plan_id = ? AND currently_archived = 1",
+                (repo, dependency),
+            ).fetchone()
+            if history is None and str(row["path"]).startswith(
+                "docs/plans/archive/"
+            ):
+                raise MaintenanceOrchestrationError(
+                    f"archived dependency 검증 실패: {plan_id} -> {dependency}: "
+                    "archive identity와 Merge 증명이 없습니다"
+                )
+            if history is not None:
+                identity_ok = (
+                    bool(history["identity_verified"])
+                    and re.fullmatch(
+                        rf"docs/plans/\[{re.escape(dependency)}\] [^/]+\.md",
+                        str(history["original_path"]),
+                    ) is not None
+                    and re.fullmatch(
+                        rf"docs/plans/archive/\[{re.escape(dependency)}\] [^/]+\.md",
+                        str(history["observed_path"]),
+                    ) is not None
+                    and bool(history["original_content_hash"])
+                    and bool(history["final_content_hash"])
+                    and bool(history["plan_sha"])
+                    and row["path"] == history["observed_path"]
+                    and row["content_hash"] == history["final_content_hash"]
+                )
+                proof_ok = (
+                    bool(history["merge_confirmed"])
+                    and history["proof_kind"] in {
+                        kind.value for kind in execplan_catalog_state.MergeProofKind
+                        if kind is not execplan_catalog_state.MergeProofKind.NONE
+                    }
+                    and bool(history["proof_revision"])
+                    and not history["diagnostic_code"]
+                )
+                if row["status"] != "MERGED" or not identity_ok or not proof_ok:
+                    reason = (
+                        "SQLite 상태가 MERGED가 아닙니다" if row["status"] != "MERGED"
+                        else "archive identity가 확인되지 않았습니다" if not identity_ok
+                        else "Merge 증명이 확인되지 않았습니다"
+                    )
+                    raise MaintenanceOrchestrationError(
+                        f"archived dependency 검증 실패: {plan_id} -> {dependency}: {reason}"
+                    )
+            included[dependency] = row
+            pending.append(row)
+    return list(included.values())
+
+
+@dataclass(frozen=True)
+class CatalogScheduleDecisionEffects:
+    """Named effects for catalog_schedule_decision; no entry-point/module access."""
+    _ensure_execplans_schema: Callable[..., object]
+    active_execplan: Callable[..., object]
+    assessment_can_yield: Callable[..., object]
+    is_unowned_ready: Callable[..., object]
+    select_cycle_ready_execplan: Callable[..., object]
+
+
+def catalog_schedule_decision(
+    effects: CatalogScheduleDecisionEffects, connection: sqlite3.Connection,
+    repo: str,
+) -> CatalogScheduleDecision:
+    """Separate active work, READY presence, and dependency-gated selection."""
+
+    effects._ensure_execplans_schema(connection)
+    active = effects.active_execplan(connection, repo)
+    rows = connection.execute(
+        "SELECT * FROM exec_plans WHERE repo = ?", (repo,)
+    ).fetchall()
+    historical_confirmation = {
+        str(row["plan_id"]): bool(row["merge_confirmed"]) and not row["diagnostic_code"]
+        for row in connection.execute(
+            """
+            SELECT plan_id, merge_confirmed, diagnostic_code
+            FROM execplan_catalog_history
+            WHERE repo = ?
+              AND currently_archived = 1
+            """,
+            (repo,),
+        ).fetchall()
+    }
+    historical_ids = set(historical_confirmation)
+    project_is_blocked = scoped_blocking.project_block(connection, repo) is not None
+    statuses = {
+        row["plan_id"]: (
+            row["status"]
+            if str(row["plan_id"]) not in historical_confirmation
+            or historical_confirmation[str(row["plan_id"])]
+            else "HISTORICAL_UNVERIFIED"
+        )
+        for row in rows
+    }
+    ready = [
+        row
+        for row in rows
+        if row["status"] == "READY" and str(row["plan_id"]) not in historical_ids
+    ]
+    execution_rows = [
+        row for row in rows
+        if str(row["plan_id"]) not in historical_ids
+        or (
+            historical_confirmation[str(row["plan_id"])]
+            and row["status"] == "MERGED"
+        )
+    ]
+    candidates = []
+    for row in ready:
+        dependencies = json.loads(row["depends_on"])
+        if all(statuses.get(dependency) == "MERGED" for dependency in dependencies):
+            candidates.append(row)
+    selected = None
+    cycle = maintenance_state.MaintenanceRepository(connection).get(repo)
+    if active is None and not project_is_blocked and cycle.phase in {
+        maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
+        maintenance_state.MaintenancePhase.REFACTORING,
+    }:
+        selected = effects.select_cycle_ready_execplan(execution_rows, cycle)
+    elif active is None and not project_is_blocked and effects.assessment_can_yield(cycle):
+        resumable = [row for row in candidates if not effects.is_unowned_ready(row)]
+        if resumable:
+            selected = min(resumable, key=lambda row: (
+                PRIORITY_ORDER[str(row["priority"])], int(str(row["plan_id"])[2:]),
+            ))
+    elif (
+        active is None
+        and not project_is_blocked
+        and cycle.phase is maintenance_state.MaintenancePhase.IDLE
+        and candidates
+    ):
+        selected = min(
+            candidates,
+            key=lambda row: (
+                PRIORITY_ORDER[str(row["priority"])],
+                int(str(row["plan_id"])[2:]),
+            ),
+        )
+    return CatalogScheduleDecision(
+        active=active,
+        has_ready=bool(ready),
+        runnable_ready=selected,
+        has_plan_blocked=any(
+            row["status"] == "PLAN_BLOCKED"
+            and str(row["plan_id"]) not in historical_ids for row in rows
+        ),
+        has_pr_open=any(
+            row["status"] == "PR_OPEN"
+            and str(row["plan_id"]) not in historical_ids for row in rows
+        ),
+        project_blocked=project_is_blocked,
+    )
+
+
+@dataclass(frozen=True)
+class SelectReadyExecplanEffects:
+    """Named effects for select_ready_execplan; no entry-point/module access."""
+    catalog_schedule_decision: Callable[..., object]
+
+
+def select_ready_execplan(effects: SelectReadyExecplanEffects, connection: sqlite3.Connection, repo: str) -> sqlite3.Row | None:
+    """Apply the dependency gate before deterministic priority/ID ordering."""
+
+    return effects.catalog_schedule_decision(connection, repo).runnable_ready

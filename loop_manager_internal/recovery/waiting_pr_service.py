@@ -1,0 +1,499 @@
+"""recovery waiting pr service boundaries and named composition effects."""
+from __future__ import annotations
+from collections.abc import Callable
+from collections.abc import Mapping
+from dataclasses import dataclass
+from loop_manager_internal.application.contracts import PRIORITY_ORDER
+from loop_manager_internal.application.contracts import PullRequestSyncResult
+from loop_manager_internal.application.contracts import WaitingPullRequestObservation
+from loop_manager_internal.notifications import notifications
+from loop_manager_internal.recovery import pull_request_recovery
+from loop_manager_internal.recovery import scoped_blocking
+from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
+from loop_manager_internal.recovery.scoped_blocking import PR_CLOSED_BLOCK_REASON
+from loop_manager_internal.runtime.contracts import PublicationSafetyError
+from loop_manager_internal.runtime.contracts import REBASE_IN_PROGRESS_ERROR
+from loop_manager_internal.storage import runtime_state
+from pathlib import Path
+import json
+import sqlite3
+import sys
+
+
+@dataclass(frozen=True)
+class ProjectPrMergeConfirmedEffects:
+    """Named effects for _project_pr_merge_confirmed; no entry-point/module access."""
+    _plan_id_from_path: Callable[..., object]
+
+
+def _project_pr_merge_confirmed(
+    effects: ProjectPrMergeConfirmedEffects, connection: sqlite3.Connection,
+    repo: str,
+    project: sqlite3.Row,
+) -> bool:
+    """Resolve a stale projection against this plan's durable execution row."""
+
+    path = str(project["plan_path"] or "").replace(
+        "docs/plans/archive/", "docs/plans/", 1,
+    )
+    plan_id = effects._plan_id_from_path(path)
+    if plan_id is None:
+        return False
+    plan = connection.execute(
+        "SELECT status, branch FROM exec_plans WHERE repo = ? AND plan_id = ?",
+        (repo, plan_id),
+    ).fetchone()
+    return bool(
+        plan is not None
+        and plan["status"] == "MERGED"
+        and project["branch"] == (plan["branch"] or f"loop-manager/{plan_id}")
+    )
+
+
+@dataclass(frozen=True)
+class ObserveWaitingPullRequestsEffects:
+    """Named effects for observe_waiting_pull_requests; no entry-point/module access."""
+    _block_closed_pull_request: Callable[..., object]
+    _recorded_base_fetch: Callable[..., object]
+    _resume_reopened_pull_request: Callable[..., object]
+    classify_pull_request_mergeability: Callable[..., object]
+    complete_merged_execplan_worktree: Callable[..., object]
+    operation_log: Callable[..., object]
+    operation_print: Callable[..., object]
+    pr_for_branch: Callable[..., object]
+
+
+def observe_waiting_pull_requests(
+    effects: ObserveWaitingPullRequestsEffects, connection: sqlite3.Connection,
+    repo_path: Path,
+    state_dir: Path,
+    repo: str,
+    *,
+    require_base_identity: bool = False,
+    read_only: bool = False,
+) -> WaitingPullRequestObservation:
+    """Commit every merge-wait observation before source or conflict work."""
+
+    rows = connection.execute(
+        "SELECT * FROM exec_plans WHERE repo = ? AND "
+        "(status = 'PR_OPEN' OR (status = 'PLAN_BLOCKED' AND blocked_reason = ?)) "
+        "ORDER BY plan_id",
+        (repo, PR_CLOSED_BLOCK_REASON),
+    ).fetchall()
+    registered_base = ""
+    if rows:
+        project = connection.execute(
+            "SELECT base_branch FROM projects WHERE repo = ?", (repo,)
+        ).fetchone()
+        if project is None or not project["base_branch"]:
+            raise RuntimeError("Merge 대기 PR의 등록 base branch를 확인할 수 없습니다.")
+        registered_base = str(project["base_branch"])
+    conflicts: list[tuple[sqlite3.Row, Mapping[str, object]]] = []
+    merged = False
+    merged_pr_urls: list[str] = []
+    for stored in rows:
+        branch = str(stored["branch"] or "")
+        if not branch:
+            raise RuntimeError(
+                f"저장된 Merge 대기 PR의 관리 branch를 확인할 수 없습니다: {stored['plan_id']}"
+            )
+        pull_request = effects.pr_for_branch(
+            repo_path,
+            branch,
+            str(stored["pr_url"] or "") or None,
+        )
+        if pull_request is None:
+            raise RuntimeError(
+                f"저장된 Merge 대기 PR의 GitHub 상태를 확인할 수 없습니다: {branch}"
+            )
+        observed_url = str(pull_request.get("url") or "")
+        stored_url = str(stored["pr_url"] or "")
+        if stored_url and observed_url and observed_url != stored_url:
+            raise PublicationSafetyError(
+                f"저장된 PR URL과 GitHub PR identity가 다릅니다: {branch}"
+            )
+        head_name = pull_request.get("headRefName")
+        if head_name and str(head_name) != branch:
+            raise PublicationSafetyError(
+                f"저장된 PR head branch와 GitHub PR identity가 다릅니다: {branch}"
+            )
+        observed_base = pull_request.get("baseRefName")
+        if observed_base is not None and str(observed_base) != registered_base:
+            raise PublicationSafetyError(
+                f"GitHub PR base branch가 등록 base와 다릅니다: {branch}"
+            )
+        if require_base_identity and not observed_base:
+            raise PublicationSafetyError(
+                f"self PR base branch identity를 확인할 수 없습니다: {branch}"
+            )
+        url = str(pull_request.get("url") or stored["pr_url"] or "")
+        if not url:
+            raise RuntimeError(f"저장된 Merge 대기 PR URL을 확인할 수 없습니다: {branch}")
+        head_value = pull_request.get("headRefOid")
+        head_oid = str(head_value) if head_value else stored["pr_head_oid"]
+        state = str(pull_request.get("state") or "OPEN").upper()
+        if read_only:
+            continue
+        if state == "MERGED" or pull_request.get("mergedAt"):
+            if scoped_blocking.project_block(connection, repo) is not None:
+                continue
+            assessment = effects.complete_merged_execplan_worktree(
+                connection,
+                repo_path,
+                repo,
+                state_dir,
+                stored,
+                url,
+                str(head_oid) if head_oid else None,
+            )
+            merged = True
+            merged_pr_urls.append(url)
+            if assessment.status in {"safe", "missing"}:
+                effects.operation_print(f"Merge 확인 및 worktree 정리 완료: {url}")
+            else:
+                effects.operation_print(
+                    f"Merge 확인 완료; worktree 보존: {stored['worktree']} "
+                    f"({assessment.reason or assessment.status})",
+                    file=sys.stderr,
+                )
+            continue
+        if state == "CLOSED":
+            if stored["status"] == "PR_OPEN":
+                effects._block_closed_pull_request(connection, repo, stored, url, head_oid)
+            continue
+        if state != "OPEN":
+            raise RuntimeError(f"지원하지 않는 GitHub PR 상태입니다: {state}")
+        if (
+            stored["status"] == "PLAN_BLOCKED"
+            and stored["blocked_reason"] == PR_CLOSED_BLOCK_REASON
+        ):
+            expected_head = str(stored["pr_head_oid"] or "")
+            if expected_head and head_oid and str(head_oid) != expected_head:
+                if not runtime_state.RuntimeStateRepository(
+                    connection
+                ).recovery_slot_available(repo):
+                    # Keep the closed-PR block until its head can be checked
+                    # without replacing an unrelated planning projection.
+                    continue
+                error = (
+                    "다시 열린 PR head OID가 저장된 관리 head와 다릅니다: "
+                    f"expected {expected_head}, actual {head_oid}"
+                )
+                with connection:
+                    scoped_blocking.record_project_block(
+                        connection,
+                        repo,
+                        BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
+                        error,
+                        expected_head,
+                        plan_id=str(stored["plan_id"]),
+                        previous_phase=None,
+                    )
+                    notifications.enqueue_current_project_events(connection, repo)
+                continue
+            effects._resume_reopened_pull_request(
+                connection,
+                repo,
+                stored,
+                url,
+                head_oid,
+                recovery=False,
+            )
+            stored = connection.execute(
+                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+                (repo, stored["plan_id"]),
+            ).fetchone()
+        with connection:
+            resumed = notifications.record_work_start(
+                connection, repo, "PR handling", plan_id=str(stored["plan_id"]),
+            )
+        if resumed:
+            effects.operation_log(f"차단 해제 후 PR 처리 재개: {stored['plan_id']}")
+        mergeability = effects.classify_pull_request_mergeability(pull_request)
+        with connection:
+            plan_values: dict[str, object] = {"pr_url": url}
+            # Conflict recovery must compare GitHub's head with the stored
+            # ownership OID before adopting a changed head.
+            if mergeability != "conflicting":
+                plan_values["pr_head_oid"] = head_oid
+            runtime_state.RuntimeStateRepository(connection).update_plan(
+                repo,
+                str(stored["plan_id"]),
+                plan_values=plan_values,
+                enqueue=False,
+            )
+            notifications.enqueue_current_project_events(connection, repo)
+        if mergeability == "conflicting":
+            conflicts.append((stored, pull_request))
+
+    # Each completed transition is committed before a remote fetch can fail.
+    # A later run fetches again and resumes source synchronization from SQLite.
+    if merged:
+        project = connection.execute(
+            "SELECT base_branch FROM projects WHERE repo = ?", (repo,)
+        ).fetchone()
+        if project is None or not project["base_branch"]:
+            raise RuntimeError("Merge 뒤 fetch할 프로젝트 base branch를 확인할 수 없습니다.")
+        base = str(project["base_branch"])
+        effects._recorded_base_fetch(repo_path, state_dir, base, owner="project")
+    return WaitingPullRequestObservation(
+        tuple(conflicts), merged, tuple(merged_pr_urls)
+    )
+
+
+@dataclass(frozen=True)
+class SelectWaitingPullRequestConflictEffects:
+    """Named effects for select_waiting_pull_request_conflict; no entry-point/module access."""
+    active_execplan: Callable[..., object]
+    hydrate_execplan_project: Callable[..., object]
+    reconcile_existing_pull_request: Callable[..., object]
+
+
+def select_waiting_pull_request_conflict(
+    effects: SelectWaitingPullRequestConflictEffects, connection: sqlite3.Connection,
+    repo_path: Path,
+    state_dir: Path,
+    repo: str,
+    observation: WaitingPullRequestObservation,
+) -> PullRequestSyncResult:
+    """Select one still-eligible conflict after all observations are durable."""
+
+    if effects.active_execplan(connection, repo) is not None:
+        return PullRequestSyncResult(merged=observation.merged)
+    if not runtime_state.RuntimeStateRepository(
+        connection
+    ).recovery_slot_available(repo):
+        return PullRequestSyncResult(merged=observation.merged)
+    if scoped_blocking.project_block(connection, repo) is not None:
+        return PullRequestSyncResult(merged=observation.merged)
+    current_rows = {
+        str(row["plan_id"]): row
+        for row in connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ?", (repo,)
+        )
+    }
+    statuses = {
+        plan_id: str(row["status"]) for plan_id, row in current_rows.items()
+    }
+    eligible: list[tuple[sqlite3.Row, Mapping[str, object]]] = []
+    for stored, pull_request in observation.conflicts:
+        current = current_rows.get(str(stored["plan_id"]))
+        if current is None or current["status"] != "PR_OPEN":
+            continue
+        if all(
+            statuses.get(str(dependency)) == "MERGED"
+            for dependency in json.loads(str(current["depends_on"]))
+        ):
+            eligible.append((current, pull_request))
+    if not eligible:
+        return PullRequestSyncResult(merged=observation.merged)
+    plan, pull_request = min(
+        eligible,
+        key=lambda item: (
+            PRIORITY_ORDER[str(item[0]["priority"])],
+            int(str(item[0]["plan_id"])[2:]),
+        ),
+    )
+    effects.hydrate_execplan_project(connection, repo, plan)
+    project = connection.execute(
+        "SELECT * FROM projects WHERE repo = ?", (repo,)
+    ).fetchone()
+    assert project is not None
+    result = effects.reconcile_existing_pull_request(
+        connection,
+        repo_path,
+        state_dir,
+        repo,
+        project,
+        pull_request,
+    )
+    return PullRequestSyncResult(result, result is None, observation.merged)
+
+
+@dataclass(frozen=True)
+class SynchronizeWaitingPullRequestsEffects:
+    """Named effects for synchronize_waiting_pull_requests; no entry-point/module access."""
+    observe_waiting_pull_requests: Callable[..., object]
+    select_waiting_pull_request_conflict: Callable[..., object]
+
+
+def synchronize_waiting_pull_requests(
+    effects: SynchronizeWaitingPullRequestsEffects, connection: sqlite3.Connection,
+    repo_path: Path,
+    state_dir: Path,
+    repo: str,
+    *,
+    after_reconciliation: Callable[[], None] | None = None,
+    after_observation: Callable[[WaitingPullRequestObservation], None] | None = None,
+    require_base_identity: bool = False,
+) -> PullRequestSyncResult:
+    observation = effects.observe_waiting_pull_requests(
+        connection, repo_path, state_dir, repo,
+        require_base_identity=require_base_identity,
+    )
+    if after_observation is not None:
+        after_observation(observation)
+    if after_reconciliation is not None:
+        after_reconciliation()
+    return effects.select_waiting_pull_request_conflict(
+        connection, repo_path, state_dir, repo, observation
+    )
+
+
+@dataclass(frozen=True)
+class BlockClosedPullRequestEffects:
+    """Named effects for _block_closed_pull_request; no entry-point/module access."""
+    _final_block_recovery_decision: Callable[..., object]
+
+
+def _block_closed_pull_request(
+    effects: BlockClosedPullRequestEffects, connection: sqlite3.Connection,
+    repo: str,
+    plan: sqlite3.Row,
+    url: str,
+    head_oid: object,
+) -> None:
+    error = "PR이 Merge 없이 닫혔습니다."
+    mirrored = connection.execute(
+        "SELECT * FROM projects WHERE repo = ?", (repo,)
+    ).fetchone()
+    clear_projection = bool(
+        mirrored and not runtime_state.planning_owns_execution_slot(mirrored)
+        and mirrored["plan_path"] == plan["path"]
+    )
+    with runtime_state._transaction(connection):
+        effects._final_block_recovery_decision(
+            connection, repo, plan, "PR_OPEN",
+            BlockReasonCode.PULL_REQUEST_CLOSED, error,
+            str(head_oid or ""), None,
+        )
+        runtime_state.RuntimeStateRepository(connection).block_plan(
+            repo,
+            str(plan["plan_id"]),
+            reason_code=BlockReasonCode.PULL_REQUEST_CLOSED.value,
+            evidence=error,
+            release_fingerprint=str(head_oid or "") or None,
+            plan_values={
+                "pr_url": url,
+                "pr_head_oid": head_oid,
+            },
+            clear_projection=clear_projection,
+        )
+
+
+@dataclass(frozen=True)
+class ResumeReopenedPullRequestEffects:
+    """Named effects for _resume_reopened_pull_request; no entry-point/module access."""
+    _clear_active_values: Callable[..., object]
+    operation_log: Callable[..., object]
+
+
+def _resume_reopened_pull_request(
+    effects: ResumeReopenedPullRequestEffects, connection: sqlite3.Connection,
+    repo: str,
+    plan: sqlite3.Row,
+    url: str,
+    head_oid: object,
+    *,
+    recovery: bool,
+    conflict_oids: tuple[str, str] | None = None,
+) -> None:
+    if conflict_oids is not None and not recovery:
+        raise ValueError("PR 충돌 복구 OID는 복구 전이에만 기록할 수 있습니다.")
+    phase = "WORKING" if recovery else "PR_OPEN"
+    status = "IMPLEMENTING" if recovery else "PR_OPEN"
+    last_error = REBASE_IN_PROGRESS_ERROR if recovery else None
+    execplan_values: dict[str, object] = {
+        "status": status,
+        "blocked_reason": None,
+        "blocked_fingerprint": None,
+        "blocked_worktree_fingerprint": None,
+        "blocked_review_fingerprint": None,
+        "pr_url": url,
+        "pr_head_oid": head_oid,
+        "last_error": last_error,
+    }
+    project_values: dict[str, object] = {
+        "phase": phase,
+        "pr_url": url,
+        "pr_head_oid": head_oid,
+        "last_error": last_error,
+    }
+    if recovery:
+        for values in (execplan_values, project_values):
+            values.update(
+                validated_base_sha=None,
+                verify_result=None,
+                review_result=None,
+            )
+            if conflict_oids is not None:
+                values.update(
+                    pr_conflict_recovery=1,
+                    pr_conflict_head_oid=conflict_oids[0],
+                    pr_conflict_base_oid=conflict_oids[1],
+                )
+    with runtime_state._transaction(connection):
+        mirrored = connection.execute(
+            "SELECT * FROM projects WHERE repo = ?", (repo,)
+        ).fetchone()
+        repository = runtime_state.RuntimeStateRepository(connection)
+        if (mirrored and not runtime_state.planning_owns_execution_slot(mirrored)
+                and mirrored["plan_path"] == plan["path"]):
+            projection = project_values if recovery else effects._clear_active_values()
+            repository.transition(
+                repo,
+                str(plan["plan_id"]),
+                plan_values=execplan_values,
+                project_values=projection,
+                enqueue=False,
+            )
+        else:
+            repository.update_plan(
+                repo,
+                str(plan["plan_id"]),
+                plan_values=execplan_values,
+                enqueue=False,
+            )
+        scoped_blocking.clear_plan_block(
+            connection, repo, str(plan["plan_id"])
+        )
+        resumed = notifications.record_work_start(
+            connection, repo, "PR handling", plan_id=str(plan["plan_id"]),
+        )
+        notifications.enqueue_current_project_events(connection, repo)
+    if resumed:
+        effects.operation_log(f"차단 해제 후 PR 처리 재개: {plan['plan_id']}")
+
+
+@dataclass(frozen=True)
+class ReconcileExistingPullRequestEffects:
+    """Named effects for reconcile_existing_pull_request; no entry-point/module access."""
+    _pull_request_recovery_effects_reconcile_existing_pull_request: Callable[..., object]
+
+
+def reconcile_existing_pull_request(
+    effects: ReconcileExistingPullRequestEffects, connection: sqlite3.Connection,
+    repo_path: Path,
+    state_dir: Path,
+    repo: str,
+    project: sqlite3.Row,
+    pull_request: Mapping[str, object],
+) -> int | None:
+    return pull_request_recovery.reconcile_existing_pull_request(effects._pull_request_recovery_effects_reconcile_existing_pull_request(), connection, repo_path, state_dir, repo, project, pull_request)
+
+
+@dataclass(frozen=True)
+class ResumePrConflictRebaseEffects:
+    """Named effects for resume_pr_conflict_rebase; no entry-point/module access."""
+    _pull_request_recovery_effects_resume_pr_conflict_rebase: Callable[..., object]
+
+
+def resume_pr_conflict_rebase(
+    effects: ResumePrConflictRebaseEffects, connection: sqlite3.Connection,
+    repo_path: Path,
+    repo: str,
+    project: sqlite3.Row,
+    worktree: Path,
+    branch: str,
+) -> int | None:
+    return pull_request_recovery.resume_pr_conflict_rebase(effects._pull_request_recovery_effects_resume_pr_conflict_rebase(), connection, repo_path, repo, project, worktree, branch)
