@@ -2383,6 +2383,61 @@ class ManagerBaselineReconciliationUnitTests(unittest.TestCase):
             "VALUES (?, 'main', 'WORKING', 'loop-manager/G-092', 'docs/plans/[G-092] Work.md', ?, 'worker', ?, 'saved-worker')",
             (str(self.source), str(worktree), self.before.serialize()))
 
+    def planner_ports(self):
+        from types import SimpleNamespace
+        worktree = self.state / 'planner'
+        worktree.mkdir()
+        self.before = replace(self.before, branch=None, dirty={})
+        self.current = replace(self.before, refs={self.ref: ('b' * 40, '')})
+        self.prepare_project(worktree)
+        self.connection.execute("UPDATE projects SET phase = 'PLANNING', plan_path = NULL, "
+            "branch = NULL, agent_role = 'planner', planner_session_id = 'saved-planner', "
+            "agent_input_fingerprint = 'same-input'")
+        context = SimpleNamespace(repo=str(self.source), repo_path=self.source,
+                                  state_dir=self.state, base_branch='main')
+        return worktree, loop_manager._PlanningAgentPorts(self.connection, context, None)
+
+    def test_planner_resume_and_saved_result_use_proven_fetch_baseline(self):
+        worktree, ports = self.planner_ports()
+        self.record_fetch(interrupted=True)
+        original = self.before.serialize()
+        with mock.patch.object(loop_manager, 'capture_git_snapshot', side_effect=lambda *_: self.current), \
+                mock.patch.object(loop_manager, 'validate_managed_worktree'):
+            for role in ('planner', 'maintenance_planner'):
+                with self.subTest(role=role):
+                    self.connection.execute('UPDATE projects SET agent_role = ?', (role,))
+                    resumed = ports.begin_scope(role, worktree)
+                    self.assertEqual(resumed.refs, self.current.refs)
+                    self.assertIsNone(ports.finish_scope(role, worktree, resumed).error)
+                    self.assertIsNone(ports.validate_saved_scope(role, worktree, original).error)
+                    row = self.connection.execute('SELECT * FROM projects').fetchone()
+                    self.assertEqual(row['agent_snapshot'], original)
+                    self.assertEqual(row['planner_session_id'], 'saved-planner')
+                    self.assertEqual(row['agent_input_fingerprint'], 'same-input')
+
+    def test_planner_resume_rejects_unproven_refs_and_saved_file_violation(self):
+        worktree, ports = self.planner_ports()
+        with mock.patch.object(loop_manager, 'capture_git_snapshot', side_effect=lambda *_: self.current), \
+                mock.patch.object(loop_manager, 'validate_managed_worktree'):
+            resumed = ports.begin_scope('planner', worktree)
+            self.assertIsNotNone(ports.finish_scope('planner', worktree, resumed).error)
+            self.assertIsNotNone(ports.validate_saved_scope('planner', worktree, self.before.serialize()).error)
+            self.record_fetch()
+            self.current = replace(self.current, dirty={'app.py': (('unstaged',), 'forbidden')})
+            resumed = ports.begin_scope('planner', worktree)
+            self.assertIsNotNone(ports.finish_scope('planner', worktree, resumed).error)
+            self.assertIsNotNone(ports.validate_saved_scope('planner', worktree, self.before.serialize()).error)
+
+    def test_planner_finish_keeps_baseline_fixed_during_agent_turn(self):
+        worktree, ports = self.planner_ports()
+        self.record_fetch()
+        with mock.patch.object(loop_manager, 'capture_git_snapshot', side_effect=lambda *_: self.current), \
+                mock.patch.object(loop_manager, 'validate_managed_worktree'):
+            resumed = ports.begin_scope('planner', worktree)
+            self.record_fetch(before_oid='b' * 40, target_oid='c' * 40)
+            self.current = replace(self.current, refs={self.ref: ('c' * 40, '')})
+            self.assertIsNotNone(ports.finish_scope('planner', worktree, resumed).error)
+
     def test_runtime_prevalidation_reconciles_only_proven_delta_and_rejects_saved_mutation(self):
         self.source = self.state / 'source'
         self.source.mkdir()

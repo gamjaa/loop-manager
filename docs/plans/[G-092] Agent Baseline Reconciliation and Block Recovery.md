@@ -69,6 +69,8 @@ Agent 시작 snapshot 뒤에 Manager의 검증된 Git 작업이 있어도 현재
 
 ## Decision Log
 
+- 2026-10-02 Planner 재개 Review 보정: plan ID가 없는 일반·유지보수 Planner도 context의 state directory로 기존 Manager 전이 증거 검사를 수행한다. 재개 시작 및 저장 결과 재검증에 보정 기준선을 전달하고 원본 snapshot·session·입력 지문은 유지한다. 실행 후 검사는 시작 시 기준선을 고정해 이후 전이로 Agent 결과를 덮지 않는다. 해당 fake-port unit test 3개가 통과했으며 전체 verify는 Loop Manager 검증 대기다.
+
 - 과거 실행에 쓰기 격리 증거가 없으면 무관한 shared ref·worktree 변화를 자동으로 외부 변경이라 단정하지 않는다. G-088/G-089와 G-090/G-091의 독립 증거가 있는 경우에만 해제한다.
 - 2026-09-27: 사용자 요청으로 G-093의 정상 충돌 stage 해소가 `index flags` 위반으로 판정되고 이후 차단 복구의 일반 branch 검사에서 detached HEAD가 거부되는 재발 조건을 보강했다. Manager 소유 rebase와 허용된 파일·index 전이를 독립적으로 증명하는 범위로 한정하며, 무관한 외부 Git 변화를 과거 실행에 소급 허용하지 않는다.
 - G-088처럼 실제 Review 실패와 진행 rebase가 함께 남은 경우 rebase 소유권 확인은 별도 Review 원인의 해제 근거가 아니다. 이 보강은 기존 dependency를 변경하거나 선행 계획의 차단을 우회해 G-092를 시작하도록 허용하지 않는다.

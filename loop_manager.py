@@ -11281,6 +11281,7 @@ def begin_agent_scope(
     role_name: str,
     *,
     input_fingerprint: str | None = None,
+    state_dir: Path | None = None,
 ) -> GitSnapshot:
     row = connection.execute(
         "SELECT * "
@@ -11307,16 +11308,16 @@ def begin_agent_scope(
         stored = GitSnapshot.deserialize(str(row['agent_snapshot']))
         original_scope = stored
         plan_id = _plan_id_from_path(str(row['plan_path'] or ''))
-        if plan_id:
-            scope_state_dir = _owned_rebase_state_dir(repo, plan_id, worktree)
-            if scope_state_dir is not None:
-                stored = _reconciled_manager_scope_metadata(
-                    connection, Path(repo), scope_state_dir, repo, plan_id, stored,
-                    capture_git_snapshot(worktree),
-                    _agent_git_resources(connection, Path(repo), worktree, stored, role_name,
-                                         selected_plan_path=str(row['plan_path'] or '')))
+        scope_state_dir = state_dir or (
+            _owned_rebase_state_dir(repo, plan_id, worktree) if plan_id else None)
+        if scope_state_dir is not None:
+            stored = _reconciled_manager_scope_metadata(
+                connection, Path(repo), scope_state_dir, repo, plan_id, stored,
+                capture_git_snapshot(worktree),
+                _agent_git_resources(connection, Path(repo), worktree, stored, role_name,
+                                     selected_plan_path=str(row['plan_path'] or '')))
         checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, plan_id or '')
-        if stored != original_scope:
+        if plan_id and stored != original_scope:
             checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
             saved = dict(checkpoint.snapshot or {})
             previous = saved.get('manager_metadata_agent_baseline')
@@ -21507,7 +21508,8 @@ class _PlanningAgentPorts:
 
     def begin_scope(self, role: str, worktree: Path) -> GitSnapshot:
         return begin_agent_scope(
-            self._connection, self._context.repo, worktree, role
+            self._connection, self._context.repo, worktree, role,
+            state_dir=self._context.state_dir,
         )
 
     def run_planner(
@@ -21596,6 +21598,11 @@ class _PlanningAgentPorts:
         try:
             before = GitSnapshot.deserialize(snapshot)
             after = capture_git_snapshot(worktree)
+            before = _reconciled_manager_scope_metadata(
+                self._connection, self._context.repo_path, self._context.state_dir,
+                self._context.repo, None, before, after,
+                _agent_git_resources(self._connection, self._context.repo_path,
+                                     worktree, before, role))
             validate_agent_scope(
                 role,
                 worktree,
