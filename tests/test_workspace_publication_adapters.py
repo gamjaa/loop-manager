@@ -262,10 +262,11 @@ class PublicationObservationBoundaryTests(unittest.TestCase):
         archive = loop_manager._ExecPlanArchiveGitPort(Path('/repo'), Path('/state'), 'repo')
         self.assertEqual(type(checkpoint).__module__, 'loop_manager_internal.recovery.checkpoint_adapter')
         self.assertEqual(type(archive).__module__, 'loop_manager_internal.catalog.archive_git')
-        with mock.patch.object(loop_manager, 'git') as git:
-            self.assertIs(checkpoint.safety_effects.git, git)
-            self.assertIs(checkpoint.publication_effects.git, git)
-            self.assertIs(archive.effects.git, git)
+        callbacks = (checkpoint.safety_effects.git, checkpoint.publication_effects.git, archive.effects.git)
+        with mock.patch.object(loop_manager, 'git', return_value='observed') as git:
+            for callback in callbacks:
+                self.assertEqual(callback(Path('/repo'), 'rev-parse', 'HEAD', check=False), 'observed')
+            self.assertEqual(git.call_args_list, [mock.call(Path('/repo'), 'rev-parse', 'HEAD', check=False)] * 3)
         self.assertFalse(hasattr(archive.effects, 'resume_project_block_if_safe'))
 
     def test_extracted_boundaries_import_without_the_root_module(self):

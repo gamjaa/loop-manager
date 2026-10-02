@@ -51,6 +51,14 @@ class ProjectServiceCompositionTests(unittest.TestCase):
         self.assertEqual(definitions, ['build_parser', 'main'])
         self.assertNotIn('globals()', ast.unparse(tree))
 
+    def test_catalog_class_export_keeps_method_patches_on_existing_instances(self):
+        self.assertIsInstance(loop_manager._GitCatalogDefinitionPort, type)
+        port = loop_manager._GitCatalogDefinitionPort(Path('/repo'), 'refs/remotes/origin/main', frozenset)
+        self.assertIsInstance(port, loop_manager._GitCatalogDefinitionPort)
+        with mock.patch.object(loop_manager._GitCatalogDefinitionPort, 'load', return_value='pinned') as load:
+            self.assertEqual(port.load(), 'pinned')
+            load.assert_called_once_with()
+
     def test_compatibility_exports_bind_the_matching_named_effect_contract(self):
         # A private/public helper pair must not shadow either helper's effect type.
         for name, value in vars(loop_manager).items():
@@ -58,7 +66,8 @@ class ProjectServiceCompositionTests(unittest.TestCase):
             if implementation is None or getattr(value, '__module__', None) != 'loop_manager':
                 continue
             with self.subTest(helper=name):
-                factory = getclosurevars(value).nonlocals['effects']
+                binding = value.__init__ if isinstance(value, type) else value
+                factory = getclosurevars(binding).nonlocals['effects']
                 effects = factory()
                 parameter = next(iter(signature(implementation).parameters.values()))
                 contract = getattr(importlib.import_module(implementation.__module__), parameter.annotation)

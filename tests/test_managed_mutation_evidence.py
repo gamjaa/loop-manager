@@ -137,8 +137,12 @@ class ManagedTransitionTests(unittest.TestCase):
                 )
             transitions.assert_called_with(
                 Path('/state'), str(Path('/repo').resolve()), 'plan:G-091',
-                git=loop_manager.git, kind='managed_worktree_create', target='/worktree',
+                git=mock.ANY, kind='managed_worktree_create', target='/worktree',
             )
+            observed_git = transitions.call_args.kwargs['git']
+            with mock.patch.object(loop_manager, 'git', return_value='observed') as git:
+                self.assertEqual(observed_git(Path('/repo'), 'rev-parse', 'HEAD', check=False), 'observed')
+                git.assert_called_once_with(Path('/repo'), 'rev-parse', 'HEAD', check=False)
 
     def test_rebase_continuation_accepts_only_proven_worker_correction(self):
         before = {
@@ -1192,7 +1196,9 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
         self.assertIsNone(service.adapters.read_remote(service.expected).pull_request)
         self.assertTrue(service.adapters.path_allowed('app.py'))
         self.assertFalse(service.adapters.path_allowed('docs/ARCHITECTURE.md'))
-        self.assertFalse(service.adapters.path_allowed('docs/plans/[G-048] Other.md'))
+        # Current Worker guidance permits updating other existing ExecPlan records.
+        self.assertTrue(service.adapters.path_allowed('docs/plans/[G-048] Other.md'))
+        self.assertFalse(service.adapters.path_allowed('docs/requirements/Other.md'))
         first = service.adapters.read_inputs(service.expected)
         ports._worktree_execplan_input_fingerprint.return_value = 'edited-plan'
         self.assertNotEqual(service.adapters.read_inputs(service.expected), first)
