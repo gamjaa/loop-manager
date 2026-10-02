@@ -15,6 +15,16 @@ from typing import Mapping, Sequence
 from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
 
 
+class PlanningResultInvalid(RuntimeError):
+    """A Planner result that may be repaired in the same Agent session."""
+
+
+
+class PlannerValidationError(PlanningResultInvalid):
+    """A Planner output error that is eligible for a correction attempt."""
+
+
+
 @dataclass(frozen=True)
 class MutableReadySnapshot:
     """Never-started READY plans that one general Planner turn may mutate."""

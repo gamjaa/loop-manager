@@ -8,7 +8,7 @@ import unittest
 from unittest import mock
 
 import loop_manager
-from loop_manager_internal.storage import maintenance_state
+from loop_manager_internal.storage import maintenance_state, planning_publication_state
 from loop_manager_internal.maintenance.maintenance_planning import PlanRevision, ReadyPlanSnapshot
 from loop_manager_internal.planning.planning_catalog import PlanDeletion, MutableReadySnapshot, mutable_snapshot_token
 
@@ -693,7 +693,7 @@ class MutableReadyMetadataCasTest(unittest.TestCase):
             "repo", "prepared", "base", "commit", self.snapshot.token,
             "spec", "planning", "", "",
         )
-        real_cas = loop_manager._mutable_ready_cas_where
+        real_cas = planning_publication_state._mutable_ready_cas_where
         for operation in ("delete", "revise", "rename"):
             with self.subTest(operation=operation):
                 error_name = {
@@ -728,7 +728,7 @@ class MutableReadyMetadataCasTest(unittest.TestCase):
                     loop_manager, "general_planning_publication",
                     return_value=publication,
                 ), mock.patch.object(
-                    loop_manager, "_mutable_ready_cas_where",
+                    planning_publication_state, "_mutable_ready_cas_where",
                     side_effect=change_cache_after_guard,
                 ), mock.patch.object(loop_manager, "file_hash", return_value="newhash"):
                     with self.assertRaisesRegex(

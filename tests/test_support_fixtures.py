@@ -16,9 +16,25 @@ from loop_manager_internal.execution.worker_session import SessionBinding
 from loop_manager_internal.git import manager_git_journal
 from tests.support.execution import ExecutionFixture, execution_fixture
 from tests.support.worker import dummy_worker_context, dummy_worker_sessions
+from tests.support.origin import OriginScopeFixture
 
 
 class SupportFixtureTests(unittest.TestCase):
+    def test_origin_scope_fixture_preserves_project_snapshot_without_git(self):
+        connection = sqlite3.connect(':memory:')
+        self.addCleanup(connection.close)
+        connection.row_factory = sqlite3.Row
+        source = Path('/source')
+        before = loop_manager.GitSnapshot('source-head', 'main', {}, {}, {}, {}, {}, {})
+        with mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=before) as capture:
+            saved = OriginScopeFixture()._persist_planner_scope(connection, source)
+        capture.assert_called_once_with(source)
+        self.assertEqual(saved, before)
+        row = connection.execute('SELECT * FROM projects').fetchone()
+        self.assertEqual((row['repo'], row['phase'], row['agent_role']), ('/source', 'PLANNING', 'planner'))
+        self.assertEqual(loop_manager.GitSnapshot.deserialize(row['agent_snapshot']), before)
+        self.assertFalse(connection.in_transaction)
+
     def test_imports_create_no_resources_or_discoverable_cases(self):
         modules = sorted('tests.support.' + path.stem
                          for path in Path('tests/support').glob('*.py'))

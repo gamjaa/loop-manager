@@ -10,7 +10,6 @@ import configparser
 import contextlib
 from contextvars import ContextVar
 import difflib
-import errno
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
@@ -72,6 +71,7 @@ from loop_manager_internal.catalog import project_catalog_refresh
 from loop_manager_internal.planning.planning_catalog import (
     MutableReadySnapshot,
     PlanDeletion,
+    PlannerValidationError,
     mutable_snapshot_token,
     snapshot_from_dict,
     snapshot_to_dict,
@@ -155,6 +155,64 @@ from loop_manager_internal.git import managed_rebase_runtime
 from loop_manager_internal.git import rebase_block_reconciliation
 from loop_manager_internal.git import manager_git_journal
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode, BlockScope
+from loop_manager_internal.runtime import bootstrap
+from loop_manager_internal.storage import catalog_migration, planning_publication_state
+from loop_manager_internal.storage.planning_publication_state import (
+    GeneralPlanningPublication, general_planning_publication,
+)
+from loop_manager_internal.runtime.contracts import (
+    BaseWorktreeSyncResult,
+    BaseWorktreeSnapshot,
+    RuntimeWorktree,
+    BootstrapRefreshHandoff,
+    RuntimeMutation,
+    GitLockError,
+    WorkspaceOwnershipError,
+    ProcessLockBusyError,
+)
+from loop_manager_internal.runtime.process_lock import (
+    state_directory,
+    is_lock_contention,
+    process_lock,
+    _write_process_lock_identity,
+    _held_process_lock_identity,
+)
+from loop_manager_internal.runtime.runtime_identity import (
+    _canonical_path,
+    _runtime_intent_path,
+    _runtime_intent_fields,
+    _write_runtime_intent,
+    _read_runtime_intent,
+    _legacy_runtime_adoption_path,
+    _validate_legacy_runtime_adoption,
+    _record_legacy_runtime_adoption,
+    runtime_repository_id,
+    expected_runtime_worktree,
+    source_config_path,
+    runtime_child_arguments,
+)
+from loop_manager_internal.storage.database import (
+    SCHEMA,
+    CLEANUP_PENDING_SCHEMA,
+    MERGED_WORKTREE_CLEANUP_SCHEMA,
+    MANAGER_BASE_FETCH_SCHEMA,
+    EXEC_PLANS_SCHEMA,
+    GUIDANCE_APPROVALS_SCHEMA,
+    EXEC_PLANS_ACTIVE_INDEX,
+    EXECPLAN_CANCELLATIONS_SCHEMA,
+    GENERAL_PLANNING_PUBLICATIONS_SCHEMA,
+    StateConnection,
+    _ensure_execplans_schema,
+    connect_database,
+    _ensure_cleanup_pending_schema,
+)
+from loop_manager_internal.storage.execplan_catalog_state import (
+    serialize_plan_metadata as _execplan_metadata, _merged_execplan_ids, worker_level,
+)
+from loop_manager_internal.storage.planning_publication_state import (
+    _MUTABLE_READY_EVIDENCE_FIELDS, _mutable_ready_cas_where,
+)
+from loop_manager_internal.storage.catalog_migration import (_insert_recovered_execplan, _quarantine_unverified_historical_runtime)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -187,252 +245,6 @@ KNOWN_EXECPLAN_STATUSES = ACTIVE_EXECPLAN_STATUSES | WAITING_EXECPLAN_STATUSES |
     "MERGED",
 }
 FIELDS = runtime_state.PROJECT_UPDATE_FIELDS
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS projects (
-    repo TEXT PRIMARY KEY,
-    base_branch TEXT NOT NULL,
-    processed_sha TEXT,
-    provider TEXT NOT NULL DEFAULT 'codex',
-    origin TEXT,
-    registered INTEGER NOT NULL DEFAULT 1,
-    agents_hash TEXT,
-    agents_approved INTEGER NOT NULL DEFAULT 0,
-    specification_fingerprint TEXT,
-    planning_fingerprint TEXT,
-    planning_attempt_fingerprint TEXT,
-    planning_workspace_owned INTEGER NOT NULL DEFAULT 0,
-    planning_retry_count INTEGER NOT NULL DEFAULT 0,
-    planner_session_id TEXT,
-    worker_session_id TEXT,
-    worker_session_binding TEXT,
-    worker_session_transition TEXT,
-    reviewer_session_id TEXT,
-    worker_result TEXT,
-    verify_result TEXT,
-    review_result TEXT,
-    definition_snapshot TEXT,
-    worker_input_token TEXT,
-    archive_token TEXT,
-    verify_token TEXT,
-    review_token TEXT,
-    publication_token TEXT,
-    revision_resume_status TEXT,
-    planning_validation_error TEXT,
-    planning_result_pending_validation INTEGER NOT NULL DEFAULT 0,
-    planning_result_completed INTEGER NOT NULL DEFAULT 0,
-    planning_result TEXT,
-    planning_error TEXT,
-    planning_error_fingerprint TEXT,
-    active_sha TEXT,
-    validated_base_sha TEXT,
-    publication_remote_oid TEXT,
-    pr_conflict_recovery INTEGER NOT NULL DEFAULT 0,
-    pr_conflict_head_oid TEXT,
-    pr_conflict_base_oid TEXT,
-    plan_sha TEXT,
-    phase TEXT,
-    branch TEXT,
-    worktree TEXT,
-    plan_path TEXT,
-    pr_url TEXT,
-    pr_head_oid TEXT,
-    last_error TEXT,
-    agent_role TEXT,
-    agent_snapshot TEXT,
-    agent_input_fingerprint TEXT,
-    agent_baseline TEXT,
-    agent_recovery TEXT,
-    agent_input_plan TEXT,
-    agent_result_plan TEXT,
-    agent_result_snapshot TEXT,
-    agent_manager_snapshot TEXT
-)
-"""
-
-CLEANUP_PENDING_SCHEMA = """
-CREATE TABLE IF NOT EXISTS cleanup_pending (
-    repo TEXT NOT NULL,
-    worktree TEXT NOT NULL,
-    pr_url TEXT NOT NULL,
-    pr_head_oid TEXT,
-    reason TEXT NOT NULL,
-    workspace_owned INTEGER NOT NULL DEFAULT 1,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (repo, worktree),
-    FOREIGN KEY (repo) REFERENCES projects(repo)
-)
-"""
-
-MERGED_WORKTREE_CLEANUP_SCHEMA = """
-CREATE TABLE IF NOT EXISTS merged_worktree_cleanups (
-    repo TEXT NOT NULL,
-    plan_id TEXT NOT NULL,
-    worktree TEXT NOT NULL,
-    branch TEXT NOT NULL,
-    registration TEXT NOT NULL,
-    pr_head_oid TEXT NOT NULL,
-    PRIMARY KEY (repo, plan_id),
-    FOREIGN KEY (repo, plan_id) REFERENCES exec_plans(repo, plan_id)
-)
-"""
-
-MANAGER_BASE_FETCH_SCHEMA = """
-CREATE TABLE IF NOT EXISTS manager_base_fetches (
-    id INTEGER PRIMARY KEY,
-    repo TEXT NOT NULL,
-    plan_id TEXT NOT NULL,
-    refname TEXT NOT NULL,
-    before_ref TEXT,
-    target_oid TEXT NOT NULL,
-    action_token TEXT,
-    phase TEXT NOT NULL
-)
-"""
-
-EXEC_PLANS_SCHEMA = """
-CREATE TABLE IF NOT EXISTS exec_plans (
-    repo TEXT NOT NULL,
-    plan_id TEXT NOT NULL,
-    path TEXT NOT NULL,
-    title TEXT NOT NULL,
-    sources TEXT NOT NULL,
-    depends_on TEXT NOT NULL,
-    priority TEXT NOT NULL,
-    content_hash TEXT NOT NULL,
-    current_complexity TEXT,
-    current_risk TEXT,
-    current_revision_sha TEXT,
-    catalog_generation INTEGER NOT NULL DEFAULT 0,
-    publication_path TEXT,
-    publication_content_hash TEXT,
-    publication_sha TEXT,
-    status TEXT NOT NULL,
-    plan_sha TEXT,
-    active_sha TEXT,
-    validated_base_sha TEXT,
-    publication_remote_oid TEXT,
-    pr_conflict_recovery INTEGER NOT NULL DEFAULT 0,
-    pr_conflict_head_oid TEXT,
-    pr_conflict_base_oid TEXT,
-    branch TEXT,
-    worktree TEXT,
-    pr_url TEXT,
-    pr_head_oid TEXT,
-    last_error TEXT,
-    blocked_fingerprint TEXT,
-    blocked_worktree_fingerprint TEXT,
-    blocked_review_fingerprint TEXT,
-    retry_count INTEGER NOT NULL DEFAULT 0,
-    worker_session_id TEXT,
-    worker_session_binding TEXT,
-    worker_session_transition TEXT,
-    reviewer_session_id TEXT,
-    worker_result TEXT,
-    verify_result TEXT,
-    review_result TEXT,
-    definition_snapshot TEXT,
-    worker_input_token TEXT,
-    archive_token TEXT,
-    verify_token TEXT,
-    review_token TEXT,
-    publication_token TEXT,
-    revision_resume_status TEXT,
-    verify_failure_history TEXT NOT NULL DEFAULT '{}',
-    review_failure_history TEXT NOT NULL DEFAULT '{}',
-    initial_worker_level INTEGER,
-    effective_worker_level INTEGER,
-    review_level_history TEXT NOT NULL DEFAULT '{}',
-    blocked_reason TEXT,
-    guidance_plan_hash TEXT,
-    workspace_owned INTEGER NOT NULL DEFAULT 0,
-    ever_started INTEGER NOT NULL DEFAULT 0,
-    agent_role TEXT,
-    agent_snapshot TEXT,
-    agent_input_fingerprint TEXT,
-    agent_baseline TEXT,
-    agent_recovery TEXT,
-    agent_input_plan TEXT,
-    agent_result_plan TEXT,
-    agent_result_snapshot TEXT,
-    agent_manager_snapshot TEXT,
-    PRIMARY KEY (repo, plan_id),
-    UNIQUE (repo, path),
-    FOREIGN KEY (repo) REFERENCES projects(repo)
-)
-"""
-
-GUIDANCE_APPROVALS_SCHEMA = """
-CREATE TABLE IF NOT EXISTS guidance_approvals (
-    repo TEXT NOT NULL,
-    plan_id TEXT NOT NULL,
-    proposal_id TEXT NOT NULL,
-    proposal_hash TEXT NOT NULL,
-    target_path TEXT NOT NULL,
-    scope TEXT NOT NULL,
-    proposal_patch TEXT NOT NULL,
-    proposal_patch_hash TEXT NOT NULL,
-    proposal_line INTEGER NOT NULL,
-    decision_line INTEGER NOT NULL,
-    batch_id TEXT NOT NULL,
-    sequence INTEGER NOT NULL,
-    decision TEXT NOT NULL DEFAULT 'pending',
-    decision_revision TEXT NOT NULL DEFAULT '',
-    decision_hash TEXT,
-    approved_patch TEXT,
-    approved_patch_hash TEXT,
-    baseline_content BLOB NOT NULL,
-    baseline_mode INTEGER NOT NULL,
-    expected_content_hash TEXT,
-    applied INTEGER NOT NULL DEFAULT 0,
-    invalidated_decision_hash TEXT,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (repo, plan_id, proposal_id),
-    FOREIGN KEY (repo, plan_id) REFERENCES exec_plans(repo, plan_id)
-)
-"""
-
-EXEC_PLANS_ACTIVE_INDEX = """
-CREATE UNIQUE INDEX IF NOT EXISTS one_active_execplan_per_project
-ON exec_plans(repo)
-WHERE status IN ('IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING')
-"""
-
-EXECPLAN_CANCELLATIONS_SCHEMA = """
-CREATE TABLE IF NOT EXISTS execplan_cancellations (
-    repo TEXT NOT NULL,
-    plan_id TEXT NOT NULL,
-    path TEXT NOT NULL,
-    title TEXT NOT NULL,
-    sources TEXT NOT NULL,
-    depends_on TEXT NOT NULL,
-    complexity TEXT NOT NULL,
-    risk TEXT NOT NULL,
-    priority TEXT NOT NULL,
-    content_hash TEXT NOT NULL,
-    plan_sha TEXT NOT NULL,
-    deletion_commit TEXT NOT NULL,
-    cancelled_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (repo, plan_id),
-    FOREIGN KEY (repo) REFERENCES projects(repo)
-)
-"""
-
-GENERAL_PLANNING_PUBLICATIONS_SCHEMA = """
-CREATE TABLE IF NOT EXISTS general_planning_publications (
-    repo TEXT PRIMARY KEY,
-    stage TEXT NOT NULL,
-    base_sha TEXT NOT NULL,
-    commit_sha TEXT NOT NULL,
-    snapshot_token TEXT NOT NULL,
-    specification_fingerprint TEXT NOT NULL,
-    planning_fingerprint TEXT NOT NULL,
-    manifest TEXT NOT NULL,
-    manifest_hash TEXT NOT NULL,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (repo) REFERENCES projects(repo)
-)
-"""
 
 
 class ProjectRunKind(str, Enum):
@@ -482,53 +294,6 @@ class ProjectRegistrationInspection:
     agents_approved: bool
     origin: str | None = None
     source_revision: str | None = None
-
-
-@dataclass(frozen=True)
-class BaseWorktreeSyncResult:
-    """A best-effort primary-worktree update that never gates remote work."""
-
-    status: str
-    reason: str
-    remote_sha: str
-
-
-@dataclass(frozen=True)
-class BaseWorktreeSnapshot:
-    branch: str | None
-    head: str
-    index: tuple[tuple[str, tuple[str, ...]], ...]
-    changes: tuple[tuple[str, str, str], ...]
-    operations: tuple[tuple[str, str], ...]
-
-
-@dataclass(frozen=True)
-class RuntimeWorktree:
-    """The immutable Loop Manager revision selected by the source bootstrap."""
-
-    path: Path
-    commit_sha: str
-    mutation_id: str | None = None
-
-
-@dataclass(frozen=True)
-class BootstrapRefreshHandoff:
-    base_branch: str
-    commit_sha: str
-
-
-@dataclass(frozen=True)
-class RuntimeMutation:
-    source: Path
-    path: Path
-    commit_sha: str
-    mutation_id: str | None
-    legacy: bool = False
-    registration_lock_reason: str | None = None
-
-
-class GitLockError(RuntimeError):
-    """A concurrent Git process owns a repository lock."""
 
 
 # Public compatibility name for integrations written before provider-neutral
@@ -730,10 +495,6 @@ class AgentScopeError(RuntimeError):
         self.reason_code = reason_code
 
 
-class WorkspaceOwnershipError(RuntimeError):
-    """A managed worktree cannot be proven to belong to its saved task."""
-
-
 class WorkerResultError(RuntimeError):
     """A Worker final response cannot safely be published."""
 
@@ -752,10 +513,6 @@ class PublicationSafetyError(RuntimeError):
 
 class ManagedWorktreeConflictError(PublicationSafetyError):
     """A managed worktree has plan-local state that prevents publication."""
-
-
-class ProcessLockBusyError(RuntimeError):
-    """The single Loop Manager process lock is already held."""
 
 
 def session_resume_unavailable(message: str) -> bool:
@@ -866,219 +623,32 @@ def operation_print(*values: object, **kwargs: object) -> None:
     separator = str(kwargs.get("sep", " "))
     operation_log(separator.join(str(value) for value in values), error=output is sys.stderr)
 
-def state_directory(value: str | None = None) -> Path:
 
-    if value:
-        return Path(value).expanduser().resolve()
-    if configured := os.environ.get("LOOP_MANAGER_STATE_DIR"):
-        return Path(configured).expanduser().resolve()
-    if os.name == "nt":
-        parent = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local"))
-    else:
-        parent = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
-    return parent / "loop-manager"
-
-
-def is_lock_contention(error: OSError) -> bool:
-    """Return whether a non-blocking lock failure means another process holds it."""
-
-    return error.errno in {errno.EACCES, errno.EAGAIN} or (
-        os.name == "nt" and error.winerror in {32, 33}
+def _bootstrap_service() -> bootstrap.BootstrapService:
+    return bootstrap.BootstrapService(
+        bootstrap.BootstrapGitEffects(
+            git=git,
+            _git_operation_entries=_git_operation_entries,
+            _validate_managed_path_boundary=_validate_managed_path_boundary,
+            validate_managed_worktree=validate_managed_worktree,
+            _worktree_catalog=_worktree_catalog,
+            _ignored_worktree_paths=_ignored_worktree_paths,
+            _recorded_base_fetch=_recorded_base_fetch,
+            github_repository=github_repository,
+            synchronize_base_worktree=synchronize_base_worktree,
+            repository_origin=repository_origin,
+            operation_log=operation_log,
+        ), runtime_root=ROOT,
     )
 
 
-@contextlib.contextmanager
-def process_lock(state_dir: Path, *, identity: str = "0"):
-    # ponytail: 부트스트랩은 전역 직렬화한다. 실제 병렬 처리 도입 시 프로젝트별 잠금으로 교체한다.
-    state_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = state_dir / "loop-manager.lock"
-    handle = os.fdopen(os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600), "r+b")
-    handle.seek(0)
-    try:
-        if os.name == "nt":
-            import msvcrt
-
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError as error:
-        handle.close()
-        if is_lock_contention(error):
-            raise ProcessLockBusyError("다른 Loop Manager 프로세스가 실행 중입니다.") from error
-        raise
-    try:
-        _write_process_lock_identity(handle, identity)
-        yield handle
-    finally:
-        handle.seek(0)
-        if os.name == "nt":
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        handle.close()
-
-
-def _write_process_lock_identity(handle, identity: str) -> None:
-    handle.seek(0)
-    handle.write(identity.encode("ascii"))
-    handle.truncate()
-    handle.flush()
-    os.fsync(handle.fileno())
-
-
-def _held_process_lock_identity(state_dir: Path) -> str:
-    """Read the parent lease only after proving another process still holds it."""
-    with (state_dir / "loop-manager.lock").open("r+b") as handle:
-        identity = handle.read(128).decode("ascii", errors="replace")
-        handle.seek(0)
-        try:
-            if os.name == "nt":
-                import msvcrt
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as error:
-            if is_lock_contention(error):
-                return identity
-            raise
-        else:
-            if os.name == "nt":
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    raise RuntimeError("runtime 부모 process lock이 유지되지 않습니다.")
-
-
-def _runtime_intent_path(state_dir: Path, mutation_id: str) -> Path:
-    if not re.fullmatch(r"[0-9a-f]{32}", mutation_id):
-        raise RuntimeError("runtime mutation ID 형식이 유효하지 않습니다.")
-    return state_dir / "runtime-intents" / f"{mutation_id}.json"
-
-
-def _runtime_intent_fields(source: Path, runtime: Path, sha: str) -> dict[str, str]:
-    return {
-        "source": str(_canonical_path(source)),
-        "path": str(_canonical_path(runtime)),
-        "sha": sha,
-    }
-
-
-def _write_runtime_intent(
-    state_dir: Path, mutation_id: str, source: Path, runtime: Path, sha: str,
-    *, created: bool, lock_reason: str | None,
-) -> None:
-    path = _runtime_intent_path(state_dir, mutation_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if os.name != "nt":
-        directory = os.open(state_dir, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    payload = {
-        **_runtime_intent_fields(source, runtime, sha),
-        "created": created,
-        "lock_reason": lock_reason,
-    }
-    try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        if _read_runtime_intent(state_dir, mutation_id, source, runtime, sha) == (
-            created, lock_reason,
-        ):
-            return
-        raise RuntimeError("runtime mutation intent가 기존 기록과 다릅니다.")
-    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, sort_keys=True)
-        handle.flush()
-        os.fsync(handle.fileno())
-    if os.name != "nt":
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-
-
-def _read_runtime_intent(
-    state_dir: Path, mutation_id: str, source: Path, runtime: Path, sha: str,
-) -> tuple[bool, str | None]:
-    try:
-        payload = json.loads(_runtime_intent_path(state_dir, mutation_id).read_text(encoding="utf-8"))
-    except (OSError, ValueError) as error:
-        raise RuntimeError("runtime mutation intent를 확인할 수 없습니다.") from error
-    if not isinstance(payload, dict) or any(
-        payload.get(key) != value
-        for key, value in _runtime_intent_fields(source, runtime, sha).items()
-    ) or type(payload.get("created")) is not bool or (
-        payload.get("lock_reason") is not None
-        and not isinstance(payload.get("lock_reason"), str)
-    ):
-        raise RuntimeError("runtime mutation intent의 repository·경로·SHA가 다릅니다.")
-    return payload["created"], payload.get("lock_reason")
-
-
-def _legacy_runtime_adoption_path(state_dir: Path, source: Path, sha: str) -> Path:
-    return state_dir / "runtime-intents" / "legacy" / runtime_repository_id(source) / f"{sha}.json"
-
-
-def _validate_legacy_runtime_adoption(
-    state_dir: Path, source: Path, runtime: Path, sha: str,
-) -> None:
-    try:
-        payload = json.loads(
-            _legacy_runtime_adoption_path(state_dir, source, sha).read_text(encoding="utf-8")
-        )
-    except (OSError, ValueError) as error:
-        raise WorkspaceOwnershipError(
-            f"runtime의 구버전 전환 소유 증거가 없습니다: {runtime}"
-        ) from error
-    if payload != {**_runtime_intent_fields(source, runtime, sha), "legacy": True}:
-        raise WorkspaceOwnershipError(
-            f"runtime의 구버전 전환 소유 증거가 다릅니다: {runtime}"
-        )
-
-
-def _record_legacy_runtime_adoption(
-    state_dir: Path, source: Path, runtime: Path, sha: str,
-) -> None:
-    path = _legacy_runtime_adoption_path(state_dir, source, sha)
-    if path.exists():
-        _validate_legacy_runtime_adoption(state_dir, source, runtime, sha)
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {**_runtime_intent_fields(source, runtime, sha), "legacy": True}
-    try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        _validate_legacy_runtime_adoption(state_dir, source, runtime, sha)
-        return
-    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, sort_keys=True)
-        handle.flush()
-        os.fsync(handle.fileno())
-    if os.name != "nt":
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-
-
-def runtime_repository_id(source: Path) -> str:
-    return hashlib.sha256(str(_canonical_path(source)).encode()).hexdigest()[:16]
-
-
-def expected_runtime_worktree(
-    state_dir: Path,
-    source: Path,
-    commit_sha: str,
-) -> Path:
-    return state_dir / "runtimes" / runtime_repository_id(source) / commit_sha
-
+def _catalog_migration_effects() -> catalog_migration.CatalogMigrationEffects:
+    return catalog_migration.CatalogMigrationEffects(
+        revision_execplan_snapshot=revision_execplan_snapshot,
+        pr_for_branch=pr_for_branch,
+        _current_execplan_sha=_current_execplan_sha,
+        _LegacyCatalogMergeProof=_LegacyCatalogMergeProof,
+    )
 
 def validate_runtime_worktree(
     source: Path,
@@ -1086,56 +656,15 @@ def validate_runtime_worktree(
     runtime: Path,
     commit_sha: str,
 ) -> None:
-    """Prove that an existing runtime is the clean detached worktree we own."""
-
-    expected = expected_runtime_worktree(state_dir, source, commit_sha)
-    _validate_managed_path_boundary(state_dir, runtime, expected, "runtime worktree")
-    validate_managed_worktree(source, runtime, None)
-    head = git(runtime, "rev-parse", "HEAD").stdout.strip()
-    if head != commit_sha:
-        raise WorkspaceOwnershipError(
-            f"runtime HEAD가 선택한 origin/main과 다릅니다: {head} "
-            f"(expected {commit_sha})"
-        )
-    status = git(
-        runtime,
-        "status",
-        "--porcelain=v1",
-        "--untracked-files=all",
-    ).stdout
-    if status.strip():
-        raise WorkspaceOwnershipError(
-            f"기존 runtime worktree가 clean 상태가 아닙니다: {runtime}"
-        )
-    operations = _git_operation_entries(runtime)
-    if operations:
-        raise WorkspaceOwnershipError(
-            "기존 runtime worktree에 Git operation이 진행 중입니다: "
-            + ", ".join(sorted(operations))
-        )
+    return _bootstrap_service().validate_runtime_worktree(source, state_dir, runtime, commit_sha)
 
 
 def _runtime_catalog_record(source: Path, runtime: Path) -> dict[str, str | bool]:
-    expected = _canonical_path(runtime)
-    for record in _worktree_catalog(source):
-        if _canonical_path(Path(str(record.get("worktree", "")))) == expected:
-            return record
-    raise WorkspaceOwnershipError(f"runtime Git worktree 등록이 없습니다: {runtime}")
+    return _bootstrap_service()._runtime_catalog_record(source, runtime)
 
 
 def _runtime_transition_state(source: Path, runtime: Path) -> dict[str, object]:
-    expected = _canonical_path(runtime)
-    record = next((item for item in _worktree_catalog(source)
-                   if _canonical_path(Path(str(item.get("worktree", "")))) == expected),
-                  None)
-    return {
-        "exists": runtime.exists() or runtime.is_symlink(),
-        "registration": (
-            {"head": record.get("HEAD"), "detached": bool(record.get("detached")),
-             "locked": record.get("locked")}
-            if record is not None else None
-        ),
-    }
+    return _bootstrap_service()._runtime_transition_state(source, runtime)
 
 
 def _managed_worktree_transition_state(repo: Path, worktree: Path) -> dict[str, object]:
@@ -1213,30 +742,13 @@ def _runtime_transition_marker(
     state_dir: Path, source: Path, runtime: Path, sha: str,
     intent: Mapping[str, object],
 ) -> bool:
-    expected = intent["expected"]
-    lock_reason = expected["registration"]["locked"]
-    if not isinstance(lock_reason, str) or not lock_reason.startswith("loop-manager-runtime:"):
-        return False
-    mutation_id = lock_reason.removeprefix("loop-manager-runtime:")
-    try:
-        return _read_runtime_intent(
-            state_dir, mutation_id, source, runtime, sha,
-        ) == (True, lock_reason)
-    except RuntimeError:
-        return False
+    return _bootstrap_service()._runtime_transition_marker(state_dir, source, runtime, sha, intent)
 
 
 def _validate_runtime_lock_origin(
     state_dir: Path, source: Path, runtime: Path, sha: str, lock_reason: object,
 ) -> None:
-    prefix = "loop-manager-runtime:"
-    if not isinstance(lock_reason, str) or not lock_reason.startswith(prefix):
-        raise RuntimeError("runtime 잠금 소유권을 확인할 수 없습니다.")
-    prior_created, prior_lock = _read_runtime_intent(
-        state_dir, lock_reason.removeprefix(prefix), source, runtime, sha,
-    )
-    if not prior_created or prior_lock != lock_reason:
-        raise RuntimeError("runtime 등록 증거가 유효하지 않습니다.")
+    return _bootstrap_service()._validate_runtime_lock_origin(state_dir, source, runtime, sha, lock_reason)
 
 
 def _validated_runtime_registration_marker(
@@ -1249,238 +761,24 @@ def _validated_runtime_registration_marker(
     legacy: bool,
     record_legacy_adoption: bool = False,
 ) -> str | None:
-    """Verify the catalog marker against durable intent without changing Git."""
-    lock_reason = _runtime_catalog_record(source, runtime).get("locked")
-    if legacy:
-        if lock_reason is None:
-            if record_legacy_adoption:
-                _record_legacy_runtime_adoption(state_dir, source, runtime, sha)
-            else:
-                _validate_legacy_runtime_adoption(state_dir, source, runtime, sha)
-            return None
-        _validate_runtime_lock_origin(state_dir, source, runtime, sha, lock_reason)
-        return lock_reason
-
-    if mutation_id is None:
-        raise RuntimeError("runtime mutation ID가 없습니다.")
-    created, expected_lock_reason = _read_runtime_intent(
-        state_dir, mutation_id, source, runtime, sha,
-    )
-    if lock_reason != expected_lock_reason:
-        raise RuntimeError("runtime 등록의 durable mutation 표식이 다릅니다.")
-    if created and expected_lock_reason != f"loop-manager-runtime:{mutation_id}":
-        raise RuntimeError("runtime 등록의 durable mutation ID가 다릅니다.")
-    if not created and expected_lock_reason is None:
-        _validate_legacy_runtime_adoption(state_dir, source, runtime, sha)
-    elif not created:
-        _validate_runtime_lock_origin(
-            state_dir, source, runtime, sha, expected_lock_reason,
-        )
-    return lock_reason
+    return _bootstrap_service()._validated_runtime_registration_marker(source, state_dir, runtime, sha, mutation_id, legacy=legacy, record_legacy_adoption=record_legacy_adoption)
 
 
 def prepare_runtime_worktree(
     source: Path, state_dir: Path, *, mutation_id: str | None = None,
     commit_sha: str | None = None,
 ) -> RuntimeWorktree:
-    """Select an immutable linked runtime worktree at a fetched commit."""
-
-    source = _canonical_path(source)
-    if commit_sha is None:
-        _, commit_sha = fetch_bootstrap_revision(source, state_dir)
-    runtime = expected_runtime_worktree(state_dir, source, commit_sha)
-    _validate_managed_path_boundary(
-        state_dir,
-        runtime,
-        runtime,
-        "runtime worktree",
-    )
-    try:
-        _canonical_path(runtime).relative_to(source)
-    except ValueError:
-        pass
-    else:
-        raise WorkspaceOwnershipError(
-            f"runtime 경로가 source checkout 내부에 있습니다: {runtime}"
-        )
-    removal_slot = manager_git_journal._slot(
-        state_dir, str(source), "runtime_remove", str(runtime),
-    )
-    if (removal_slot / "active.json").exists():
-        remove_runtime_worktree(
-            source, state_dir, RuntimeWorktree(runtime, commit_sha, mutation_id),
-        )
-    if mutation_id is not None:
-        manager_git_journal.recover_active(
-            state_dir, repo=str(source), kind="runtime_create", target=str(runtime),
-            observe=lambda: _runtime_transition_state(source, runtime),
-            marker=lambda intent: _runtime_transition_marker(
-                state_dir, source, runtime, commit_sha, intent,
-            ),
-        )
-    if runtime.exists() or runtime.is_symlink():
-        if not runtime.is_dir():
-            raise WorkspaceOwnershipError(
-                f"runtime 경로가 디렉터리가 아닙니다: {runtime}"
-            )
-        validate_runtime_worktree(source, state_dir, runtime, commit_sha)
-        if mutation_id is not None:
-            record = _runtime_catalog_record(source, runtime)
-            lock_reason = record.get("locked")
-            if lock_reason:
-                prefix = "loop-manager-runtime:"
-                if not isinstance(lock_reason, str) or not lock_reason.startswith(prefix):
-                    raise WorkspaceOwnershipError(f"runtime 잠금 소유권을 확인할 수 없습니다: {runtime}")
-                prior_id = lock_reason.removeprefix(prefix)
-                prior_created, prior_lock = _read_runtime_intent(
-                    state_dir, prior_id, source, runtime, commit_sha,
-                )
-                if not prior_created or prior_lock != lock_reason:
-                    raise WorkspaceOwnershipError(f"runtime 등록 증거가 유효하지 않습니다: {runtime}")
-            else:
-                _validate_legacy_runtime_adoption(state_dir, source, runtime, commit_sha)
-            _write_runtime_intent(
-                state_dir, mutation_id, source, runtime, commit_sha,
-                created=False, lock_reason=lock_reason if isinstance(lock_reason, str) else None,
-            )
-        return RuntimeWorktree(runtime, commit_sha, mutation_id)
-
-    expected_path = _canonical_path(runtime)
-    registered = next(
-        (
-            record
-            for record in _worktree_catalog(source)
-            if _canonical_path(Path(str(record.get("worktree", ""))))
-            == expected_path
-        ),
-        None,
-    )
-    if registered is not None:
-        raise WorkspaceOwnershipError(
-            f"runtime 경로가 없지만 Git worktree 등록이 남아 있습니다: {runtime}"
-        )
-    runtime.parent.mkdir(parents=True, exist_ok=True)
-    if mutation_id is not None:
-        lock_reason = f"loop-manager-runtime:{mutation_id}"
-        before_state = _runtime_transition_state(source, runtime)
-        if before_state != {"exists": False, "registration": None}:
-            raise WorkspaceOwnershipError("runtime 생성 직전 worktree 상태가 변경됐습니다.")
-        expected_state = {
-            "exists": True,
-            "registration": {"head": commit_sha, "detached": True,
-                             "locked": lock_reason},
-        }
-
-        def apply(_token: str) -> None:
-            _write_runtime_intent(
-                state_dir, mutation_id, source, runtime, commit_sha,
-                created=True, lock_reason=lock_reason,
-            )
-            git(source, "worktree", "add", "--detach", "--lock",
-                f"--reason={lock_reason}", str(runtime), commit_sha)
-            validate_runtime_worktree(source, state_dir, runtime, commit_sha)
-
-        manager_git_journal.execute(
-            state_dir, owner="bootstrap", kind="runtime_create",
-            repo=str(source), target=str(runtime), before=before_state,
-            expected=expected_state, observe=lambda: _runtime_transition_state(source, runtime),
-            apply=apply, marker=lambda intent: _runtime_transition_marker(
-                state_dir, source, runtime, commit_sha, intent,
-            ),
-        )
-    else:
-        git(source, "worktree", "add", "--detach", str(runtime), commit_sha)
-    validate_runtime_worktree(source, state_dir, runtime, commit_sha)
-    return RuntimeWorktree(runtime, commit_sha, mutation_id)
+    return _bootstrap_service().prepare_runtime_worktree(source, state_dir, mutation_id=mutation_id, commit_sha=commit_sha)
 
 
 def remove_runtime_worktree(
     source: Path, state_dir: Path, runtime: RuntimeWorktree,
 ) -> None:
-    """Remove an inactive owned runtime under the caller's process lock.
-
-    A missing directory is never proof of our removal: recovery requires the
-    durable receipt written only after a successful non-forced Git removal.
-    """
-    source = _canonical_path(source)
-    path = runtime.path
-    sha = runtime.commit_sha
-    _validate_managed_path_boundary(
-        state_dir, path, expected_runtime_worktree(state_dir, source, sha),
-        "runtime worktree",
-    )
-    receipts = state_dir / "runtime-removals"
-
-    def marker(intent: Mapping[str, object]) -> bool:
-        receipt = receipts / f"{intent['id']}.json"
-        return receipt.is_file() and manager_git_journal._read(receipt) == {
-            "id": intent["id"], "repo": str(source), "target": str(path),
-            "before": intent["before"],
-        }
-
-    if manager_git_journal.recover_active(
-        state_dir, repo=str(source), kind="runtime_remove", target=str(path),
-        observe=lambda: _runtime_transition_state(source, path), marker=marker,
-    ):
-        return
-    validate_runtime_worktree(source, state_dir, path, sha)
-    before = _runtime_transition_state(source, path)
-    lock_reason = before["registration"]["locked"]
-    _validate_runtime_lock_origin(state_dir, source, path, sha, lock_reason)
-    # Do not let Git remove ignored user data as part of an otherwise clean tree.
-    if _ignored_worktree_paths(path):
-        raise WorkspaceOwnershipError("runtime ignored 파일을 보존하기 위해 정리를 중단합니다.")
-    receipts.mkdir(parents=True, exist_ok=True)
-    manager_git_journal._sync_directory(state_dir)
-
-    def apply(token: str) -> None:
-        validate_runtime_worktree(source, state_dir, path, sha)
-        if _runtime_transition_state(source, path) != before or _ignored_worktree_paths(path):
-            raise WorkspaceOwnershipError("runtime 정리 직전 상태가 변경됐습니다.")
-        git(source, "worktree", "unlock", str(path))
-        # An interruption after unlock or before the receipt deliberately blocks;
-        # neither absence nor a stale creation marker can authorize recovery.
-        git(source, "worktree", "remove", str(path))
-        manager_git_journal._write_new(receipts / f"{token}.json", {
-            "id": token, "repo": str(source), "target": str(path), "before": before,
-        })
-
-    manager_git_journal.execute(
-        state_dir, owner="bootstrap", kind="runtime_remove", repo=str(source),
-        target=str(path), before=before,
-        expected={"exists": False, "registration": None},
-        observe=lambda: _runtime_transition_state(source, path),
-        apply=apply, marker=marker,
-    )
+    return _bootstrap_service().remove_runtime_worktree(source, state_dir, runtime)
 
 
 def bootstrap_base_branch(source: Path, state_dir: Path, origin: str) -> str:
-    """Read a registered self base without changing SQLite before the handoff."""
-
-    database = state_dir / "loop-manager.db"
-    if not database.is_file():
-        return "main"
-    with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as connection:
-        columns = {row[1] for row in connection.execute("PRAGMA table_info(projects)")}
-        if not {"repo", "base_branch"} <= columns:
-            raise RuntimeError("상태 DB의 프로젝트 등록 정보를 읽을 수 없습니다.")
-        origin_column = "origin" if "origin" in columns else "NULL AS origin"
-        registered_filter = "WHERE registered = 1" if "registered" in columns else ""
-        rows = connection.execute(
-            f"SELECT repo, base_branch, {origin_column} FROM projects {registered_filter}"
-        ).fetchall()
-    # A registered alias or another worktree must not select the bootstrap base.
-    matches = [row for row in rows if row[0] == str(source)]
-    if len(matches) > 1:
-        raise RuntimeError("등록된 self source identity가 중복됩니다.")
-    if not matches:
-        return "main"
-    _, base, saved_origin = matches[0]
-    if saved_origin is not None and str(saved_origin) != origin:
-        raise RuntimeError("등록된 self origin과 현재 source origin이 다릅니다.")
-    if not base:
-        raise RuntimeError("등록된 self base branch가 비어 있습니다.")
-    return str(base)
+    return _bootstrap_service().bootstrap_base_branch(source, state_dir, origin)
 
 
 def _tracking_ref_oid(repo: Path, refname: str) -> str | None:
@@ -1540,119 +838,17 @@ def _recorded_base_fetch(
 
 
 def fetch_bootstrap_revision(source: Path, state_dir: Path) -> tuple[str, str]:
-    """Resolve the registered base and fetch that branch under the process lock."""
-
-    source = _canonical_path(source)
-    root = _canonical_path(Path(git(source, "rev-parse", "--show-toplevel").stdout.strip()))
-    if root != source:
-        raise RuntimeError(f"Loop Manager source 저장소 루트가 아닙니다: {source}")
-    origin = github_repository(git(source, "remote", "get-url", "origin").stdout)
-    base = bootstrap_base_branch(source, state_dir, origin)
-    sha = _recorded_base_fetch(source, state_dir, base, owner="bootstrap")
-    return base, sha
+    return _bootstrap_service().fetch_bootstrap_revision(source, state_dir)
 
 
 def validate_bootstrap_revision(source: Path, base: str, sha: str) -> None:
-    """Reject a source or remote race before starting work at the selected SHA."""
-
-    current = git(source, "rev-parse", "HEAD").stdout.strip()
-    branch_result = git(source, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
-    branch = branch_result.stdout.strip() if branch_result.returncode == 0 else None
-    remote = git(
-        source, "rev-parse", "--verify", f"refs/remotes/origin/{base}^{{commit}}"
-    ).stdout.strip()
-    if current != sha or remote != sha or branch != base:
-        raise RuntimeError(
-            f"bootstrap revision 변경: source={current} branch={branch} "
-            f"origin/{base}={remote} expected={sha}"
-        )
-    operations = _git_operation_entries(source)
-    if operations:
-        raise RuntimeError("진행 중 Git operation: " + ", ".join(sorted(operations)))
+    return _bootstrap_service().validate_bootstrap_revision(source, base, sha)
 
 
 def prepare_bootstrap_runtime(
     source: Path, state_dir: Path, mutation_id: str,
 ) -> RuntimeWorktree | BootstrapRefreshHandoff:
-    """Refresh an old source and hand control to the next external invocation."""
-
-    base, sha = fetch_bootstrap_revision(source, state_dir)
-    result = synchronize_base_worktree(
-        source, base, remote_sha=sha, state_dir=state_dir, owner="bootstrap",
-    )
-    if result.status == "updated":
-        operation_log(f"bootstrap source 갱신 완료: origin/{base} {sha}; 다음 실행에 인계")
-        return BootstrapRefreshHandoff(base, sha)
-    if result.status != "equal":
-        raise RuntimeError(
-            f"bootstrap source 갱신 불가 (origin/{base} {sha}): "
-            f"{result.status}: {result.reason}"
-        )
-    validate_bootstrap_revision(source, base, sha)
-    runtime = prepare_runtime_worktree(
-        source, state_dir, mutation_id=mutation_id, commit_sha=sha,
-    )
-    validate_bootstrap_revision(source, base, sha)
-    return runtime
-
-
-def source_config_path(source: Path, value: str) -> Path:
-    candidate = Path(value).expanduser()
-    if not candidate.is_absolute():
-        candidate = source / candidate
-    return candidate.resolve()
-
-
-def runtime_child_arguments(
-    arguments: list[str],
-    *,
-    source: Path,
-    state_dir: Path,
-    config_path: Path,
-    runtime: RuntimeWorktree,
-) -> list[str]:
-    """Preserve user CLI semantics while pinning external path inputs."""
-
-    stripped: list[str] = []
-    skip_value = False
-    value_options = {
-        "--state-dir",
-        "--config",
-        "--runtime-source",
-        "--runtime-sha",
-        "--runtime-mutation-id",
-    }
-    for argument in arguments:
-        if skip_value:
-            skip_value = False
-            continue
-        if argument in value_options:
-            skip_value = True
-            continue
-        if any(argument.startswith(option + "=") for option in value_options):
-            continue
-        if argument == "--runtime-child":
-            continue
-        stripped.append(argument)
-    if skip_value:
-        raise RuntimeError("경로 옵션 값이 없습니다.")
-    child_arguments = [
-        "--runtime-child",
-        "--runtime-source",
-        str(source),
-        "--runtime-sha",
-        runtime.commit_sha,
-    ]
-    if runtime.mutation_id is not None:
-        child_arguments.extend(("--runtime-mutation-id", runtime.mutation_id))
-    return [
-        *child_arguments,
-        "--state-dir",
-        str(state_dir),
-        "--config",
-        str(config_path),
-        *stripped,
-    ]
+    return _bootstrap_service().prepare_bootstrap_runtime(source, state_dir, mutation_id)
 
 
 def run_runtime_child(
@@ -1662,30 +858,7 @@ def run_runtime_child(
     runtime: RuntimeWorktree,
     arguments: list[str],
 ) -> int:
-    child_arguments = runtime_child_arguments(
-        arguments,
-        source=source,
-        state_dir=state_dir,
-        config_path=config_path,
-        runtime=runtime,
-    )
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-B",  # Keep immutable runtime imports from creating ignored bytecode.
-            "-u",
-            str(runtime.path / "loop_manager.py"),
-            *child_arguments,
-        ],
-        cwd=runtime.path,
-        check=False,
-    )
-    if runtime.mutation_id is not None:
-        try:
-            remove_runtime_worktree(source, state_dir, runtime)
-        except (RuntimeError, OSError) as error:
-            operation_log(f"runtime 정리 보류: {error}", error=True)
-    return completed.returncode
+    return _bootstrap_service().run_runtime_child(source, state_dir, config_path, runtime, arguments)
 
 
 def validate_runtime_child(
@@ -1693,340 +866,13 @@ def validate_runtime_child(
     state_dir: Path,
     commit_sha: str,
 ) -> None:
-    validate_runtime_worktree(source, state_dir, ROOT, commit_sha)
+    return _bootstrap_service().validate_runtime_child(source, state_dir, commit_sha)
 
 
 def validate_runtime_mutation(
     source: Path, state_dir: Path, sha: str, mutation_id: str | None,
 ) -> RuntimeMutation:
-    """Bind a child invocation to the held parent lock and actual Git runtime."""
-    runtime = expected_runtime_worktree(state_dir, source, sha)
-    if _canonical_path(ROOT) != _canonical_path(runtime):
-        raise RuntimeError(f"runtime 경로가 선택한 SHA와 다릅니다: {ROOT} (expected {runtime})")
-    identity = _held_process_lock_identity(state_dir)
-    if mutation_id is None:
-        if identity != "0":
-            raise RuntimeError("mutation ID가 없는 새 형식 runtime 호출은 허용되지 않습니다.")
-        legacy = True
-    else:
-        if identity != f"runtime:{mutation_id}":
-            raise RuntimeError("runtime mutation ID와 부모 process lock이 다릅니다.")
-        legacy = False
-    origin = repository_origin(source)
-    base = bootstrap_base_branch(source, state_dir, origin)
-    origin_sha = git(
-        source, "rev-parse", "--verify", f"refs/remotes/origin/{base}^{{commit}}"
-    ).stdout.strip()
-    if origin_sha != sha:
-        raise RuntimeError(
-            f"runtime SHA가 현재 origin/{base}와 다릅니다: "
-            f"{sha} (origin/{base} {origin_sha})"
-        )
-    validate_runtime_worktree(source, state_dir, runtime, sha)
-    lock_reason = _validated_runtime_registration_marker(
-        source, state_dir, runtime, sha, mutation_id,
-        legacy=legacy, record_legacy_adoption=True,
-    )
-    operation_log(
-        f"runtime mutation 검증: path={runtime} sha={sha} "
-        f"mode={'legacy' if legacy else 'owned'}"
-    )
-    return RuntimeMutation(source, runtime, sha, mutation_id, legacy, lock_reason)
-
-class StateConnection(sqlite3.Connection):
-    """Keep completed schema initialization local to one database connection."""
-
-    execplans_schema_ready = False
-
-
-def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
-    if isinstance(connection, StateConnection) and connection.execplans_schema_ready:
-        return
-    connection.execute(EXEC_PLANS_SCHEMA)
-    execplan_catalog_state.ensure_schema(connection)
-    execplan_archive_state.ensure_schema(connection)
-    requirement_archive_state.ensure_schema(connection)
-    columns = {row[1] for row in connection.execute("PRAGMA table_info(exec_plans)")}
-    if "blocked_fingerprint" not in columns:
-        connection.execute("ALTER TABLE exec_plans ADD COLUMN blocked_fingerprint TEXT")
-    if "blocked_worktree_fingerprint" not in columns:
-        connection.execute(
-            "ALTER TABLE exec_plans ADD COLUMN blocked_worktree_fingerprint TEXT"
-        )
-    if "blocked_review_fingerprint" not in columns:
-        connection.execute(
-            "ALTER TABLE exec_plans ADD COLUMN blocked_review_fingerprint TEXT"
-        )
-    if "workspace_owned" not in columns:
-        connection.execute(
-            "ALTER TABLE exec_plans ADD COLUMN workspace_owned "
-            "INTEGER NOT NULL DEFAULT 0"
-        )
-    migrations = {
-        "archive_resume_status": "TEXT",
-        "reviewer_session_id": "TEXT",
-        "worker_session_binding": "TEXT",
-        "worker_session_transition": "TEXT",
-        "review_result": "TEXT",
-        "validated_base_sha": "TEXT",
-        "publication_remote_oid": "TEXT",
-        "pr_conflict_recovery": "INTEGER NOT NULL DEFAULT 0",
-        "pr_conflict_head_oid": "TEXT",
-        "pr_conflict_base_oid": "TEXT",
-        "pr_head_oid": "TEXT",
-        "verify_failure_history": "TEXT NOT NULL DEFAULT '{}'",
-        "review_failure_history": "TEXT NOT NULL DEFAULT '{}'",
-        "initial_worker_level": "INTEGER",
-        "effective_worker_level": "INTEGER",
-        "review_level_history": "TEXT NOT NULL DEFAULT '{}'",
-        "blocked_reason": "TEXT",
-        "guidance_plan_hash": "TEXT",
-        "agent_role": "TEXT",
-        "agent_snapshot": "TEXT",
-        "agent_input_fingerprint": "TEXT",
-        "agent_baseline": "TEXT",
-        "agent_recovery": "TEXT",
-        "agent_input_plan": "TEXT",
-        "agent_result_plan": "TEXT",
-        "agent_result_snapshot": "TEXT",
-        "agent_manager_snapshot": "TEXT",
-        "current_complexity": "TEXT",
-        "current_risk": "TEXT",
-        "current_revision_sha": "TEXT",
-        "catalog_generation": "INTEGER NOT NULL DEFAULT 0",
-        "publication_path": "TEXT",
-        "publication_content_hash": "TEXT",
-        "publication_sha": "TEXT",
-        "definition_snapshot": "TEXT",
-        "worker_input_token": "TEXT",
-        "archive_token": "TEXT",
-        "verify_token": "TEXT",
-        "review_token": "TEXT",
-        "publication_token": "TEXT",
-        "revision_resume_status": "TEXT",
-        "ever_started": "INTEGER NOT NULL DEFAULT 0",
-    }
-    for column, definition in migrations.items():
-        if column not in columns:
-            connection.execute(
-                f"ALTER TABLE exec_plans ADD COLUMN {column} {definition}"
-            )
-    if {
-        "path",
-        "content_hash",
-        "plan_sha",
-    }.issubset(columns):
-        # RELEASE commits a standalone backfill, but preserves an existing
-        # caller transaction. Re-run after interrupted column additions too.
-        connection.execute("SAVEPOINT publication_backfill")
-        try:
-            connection.execute(
-                """
-                UPDATE exec_plans
-                SET publication_path = COALESCE(publication_path, path),
-                    publication_content_hash = COALESCE(
-                        publication_content_hash, content_hash
-                    ),
-                    publication_sha = COALESCE(publication_sha, plan_sha),
-                    current_revision_sha = COALESCE(current_revision_sha, plan_sha)
-                WHERE publication_path IS NULL
-                   OR publication_content_hash IS NULL
-                   OR (publication_sha IS NULL AND plan_sha IS NOT NULL)
-                   OR (current_revision_sha IS NULL AND plan_sha IS NOT NULL)
-                """
-            )
-        except BaseException:
-            connection.execute("ROLLBACK TO publication_backfill")
-            connection.execute("RELEASE publication_backfill")
-            raise
-        else:
-            connection.execute("RELEASE publication_backfill")
-    # A prior process may have committed the column before backfilling rows.
-    # Repeat the monotonic evidence check on every new connection.
-    migrated_columns = {
-        str(row[1])
-        for row in connection.execute("PRAGMA table_info(exec_plans)")
-    }
-    evidence = []
-    if "status" in migrated_columns:
-        evidence.append("status != 'READY'")
-    for field in (
-        "active_sha",
-        "validated_base_sha",
-        "publication_remote_oid",
-        "pr_conflict_head_oid",
-        "pr_conflict_base_oid",
-        "branch",
-        "worktree",
-        "pr_url",
-        "pr_head_oid",
-        "last_error",
-        "blocked_fingerprint",
-        "blocked_worktree_fingerprint",
-        "blocked_review_fingerprint",
-        "worker_session_id",
-        "reviewer_session_id",
-        "worker_result",
-        "verify_result",
-        "review_result",
-        "blocked_reason",
-        "guidance_plan_hash",
-        "agent_role",
-        "agent_snapshot",
-        "agent_input_fingerprint",
-        "agent_baseline",
-        "agent_recovery",
-        "agent_input_plan",
-        "agent_result_plan",
-        "agent_result_snapshot",
-        "agent_manager_snapshot",
-    ):
-        if field in migrated_columns:
-            evidence.append(f"{field} IS NOT NULL")
-    for field in (
-        "pr_conflict_recovery",
-        "retry_count",
-        "workspace_owned",
-    ):
-        if field in migrated_columns:
-            evidence.append(f"{field} != 0")
-    for field in (
-        "verify_failure_history",
-        "review_failure_history",
-        "review_level_history",
-    ):
-        if field in migrated_columns:
-            evidence.append(f"{field} != '{{}}'")
-    if evidence:
-        # RELEASE commits a standalone repair without committing a caller's
-        # existing transaction, matching the publication backfill above.
-        connection.execute("SAVEPOINT ever_started_backfill")
-        try:
-            connection.execute(
-                "UPDATE exec_plans SET ever_started = 1 WHERE ever_started = 0 "
-                "AND (" + " OR ".join(evidence) + ")"
-            )
-        except BaseException:
-            connection.execute("ROLLBACK TO ever_started_backfill")
-            connection.execute("RELEASE ever_started_backfill")
-            raise
-        else:
-            connection.execute("RELEASE ever_started_backfill")
-    connection.execute(GUIDANCE_APPROVALS_SCHEMA)
-    connection.execute(EXECPLAN_CANCELLATIONS_SCHEMA)
-    connection.execute(GENERAL_PLANNING_PUBLICATIONS_SCHEMA)
-    agent_invocation_state.ensure_schema(connection)
-    validation_feedback_state.ensure_schema(connection)
-    validation_feedback_state.ValidationFeedbackRepository(connection).migrate_legacy()
-    scoped_blocking.ensure_schema(connection)
-    if not getattr(connection, "execplans_schema_ready", False):
-        recovery_state.ensure_schema(connection)
-    blocked_checkpoint_state.ensure_schema(connection)
-    blocked_remote_observation.ensure_schema(connection)
-    connection.execute("DROP INDEX IF EXISTS one_active_execplan_per_project")
-    connection.execute(EXEC_PLANS_ACTIVE_INDEX)
-    scoped_blocking.migrate_legacy_blocks(connection)
-    if isinstance(connection, StateConnection):
-        connection.execplans_schema_ready = True
-
-
-def connect_database(
-    state_dir: Path,
-    *,
-    create: bool = False,
-    run_migrations: bool = True,
-) -> sqlite3.Connection:
-    database = state_dir / "loop-manager.db"
-    if not create and not database.is_file():
-        raise RuntimeError(
-            "상태 DB가 없습니다. 먼저 `loop_manager.py config init`을 실행하세요."
-        )
-    connection = sqlite3.connect(database, timeout=30.0, factory=StateConnection)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA busy_timeout = 30000")
-    if create:
-        connection.execute(SCHEMA)
-        project_registry.ensure_registry_schema(connection)
-        _ensure_execplans_schema(connection)
-        _ensure_cleanup_pending_schema(connection)
-        maintenance_state.ensure_schema(connection)
-        notifications.ensure_schema(connection)
-        blocked_checkpoint_state.ensure_schema(connection)
-        blocked_remote_observation.ensure_schema(connection)
-        connection.commit()
-    else:
-        try:
-            connection.execute("SELECT 1 FROM projects LIMIT 1")
-        except sqlite3.DatabaseError as error:
-            connection.close()
-            raise RuntimeError("상태 DB를 읽을 수 없습니다. 백업을 복원하거나 다시 초기화하세요.") from error
-    if not run_migrations:
-        # Scheduler workers inherit the schema initialized by the parent.
-        connection.execplans_schema_ready = True
-        return connection
-    columns = {row[1] for row in connection.execute("PRAGMA table_info(projects)")}
-    migrations = {
-        "provider": "TEXT NOT NULL DEFAULT 'codex'",
-        "specification_fingerprint": "TEXT",
-        "plan_path": "TEXT",
-        "planning_fingerprint": "TEXT",
-        "planning_attempt_fingerprint": "TEXT",
-        "planning_workspace_owned": "INTEGER NOT NULL DEFAULT 0",
-        "planning_retry_count": "INTEGER NOT NULL DEFAULT 0",
-        "planner_session_id": "TEXT",
-        "plan_sha": "TEXT",
-        "worker_session_id": "TEXT",
-        "worker_session_binding": "TEXT",
-        "worker_session_transition": "TEXT",
-        "reviewer_session_id": "TEXT",
-        "worker_result": "TEXT",
-        "verify_result": "TEXT",
-        "review_result": "TEXT",
-        "planning_validation_error": "TEXT",
-        "planning_result_pending_validation": "INTEGER NOT NULL DEFAULT 0",
-        "planning_result_completed": "INTEGER NOT NULL DEFAULT 0",
-        "planning_result": "TEXT",
-        "planning_error": "TEXT",
-        "planning_error_fingerprint": "TEXT",
-        "validated_base_sha": "TEXT",
-        "publication_remote_oid": "TEXT",
-        "pr_conflict_recovery": "INTEGER NOT NULL DEFAULT 0",
-        "pr_conflict_head_oid": "TEXT",
-        "pr_conflict_base_oid": "TEXT",
-        "pr_head_oid": "TEXT",
-        "agent_role": "TEXT",
-        "agent_snapshot": "TEXT",
-        "agent_input_fingerprint": "TEXT",
-        "agent_baseline": "TEXT",
-        "agent_recovery": "TEXT",
-        "agent_input_plan": "TEXT",
-        "agent_result_plan": "TEXT",
-        "agent_result_snapshot": "TEXT",
-        "agent_manager_snapshot": "TEXT",
-        "definition_snapshot": "TEXT",
-        "worker_input_token": "TEXT",
-        "archive_token": "TEXT",
-        "verify_token": "TEXT",
-        "review_token": "TEXT",
-        "publication_token": "TEXT",
-        "revision_resume_status": "TEXT",
-    }
-    for column, definition in migrations.items():
-        if column not in columns:
-            connection.execute(f"ALTER TABLE projects ADD COLUMN {column} {definition}")
-    if not migrations.keys() <= columns:
-        connection.commit()
-    project_registry.ensure_registry_schema(connection)
-    _ensure_execplans_schema(connection)
-    _ensure_cleanup_pending_schema(connection)
-    maintenance_state.ensure_schema(connection)
-    notifications.ensure_schema(connection)
-    blocked_checkpoint_state.ensure_schema(connection)
-    blocked_remote_observation.ensure_schema(connection)
-    connection.commit()
-    # Repository-aware migrations belong in run_project, after persisted Agent
-    # config has been checked against its pre-invocation snapshot.
-    return connection
+    return _bootstrap_service().validate_runtime_mutation(source, state_dir, sha, mutation_id)
 
 
 def update_project(connection: sqlite3.Connection, repo: str, **values: object) -> None:
@@ -2286,18 +1132,6 @@ def revision_execplan_snapshot(
         invalid_plan_entries=invalid_plan_entries,
         revision_sha=revision_sha,
         archive_conflict_plan_ids=archive_conflict_plan_ids,
-    )
-
-
-def _merged_execplan_ids(
-    connection: sqlite3.Connection, repo: str
-) -> frozenset[str]:
-    return frozenset(
-        str(row[0])
-        for row in connection.execute(
-            "SELECT plan_id FROM exec_plans WHERE repo = ? AND status = 'MERGED'",
-            (repo,),
-        )
     )
 
 
@@ -2706,7 +1540,6 @@ def _parse_execplan(
     )
 
 
-
 def _validate_dependency_graph(catalog: dict[str, dict[str, object]]) -> None:
     return execplan_catalog.validate_dependency_graph(catalog)
 
@@ -2737,7 +1570,6 @@ def load_execplan_catalog(
     ).active_metadata()
 
 
-
 def validate_execplan(worktree: Path, relative_path: str) -> dict[str, object]:
     catalog = load_execplan_catalog(worktree)
     match = re.fullmatch(r"docs/plans/\[(G-\d{3,})\] [^/]+\.md", relative_path)
@@ -2748,10 +1580,6 @@ def validate_execplan(worktree: Path, relative_path: str) -> dict[str, object]:
             if relative_path == expected_path:
                 return plan
     raise RuntimeError(f"검증된 ExecPlan 카탈로그에 계획이 없습니다: {relative_path}")
-
-
-class PlannerValidationError(PlanningResultInvalid):
-    """A Planner output error that is eligible for a correction attempt."""
 
 
 @dataclass(frozen=True)
@@ -3249,37 +2077,6 @@ def _ready_plan_snapshot_at_revision(
     snapshot = _ready_plan_snapshot_from_contents(row, contents)
     _assert_ready_plan_revision(repository, revision, snapshot, contents)
     return snapshot
-
-
-_MUTABLE_READY_EVIDENCE_FIELDS = (
-    "active_sha",
-    "validated_base_sha",
-    "publication_remote_oid",
-    "branch",
-    "worktree",
-    "pr_url",
-    "pr_head_oid",
-    "last_error",
-    "blocked_fingerprint",
-    "blocked_worktree_fingerprint",
-    "blocked_review_fingerprint",
-    "worker_session_id",
-    "reviewer_session_id",
-    "worker_result",
-    "verify_result",
-    "review_result",
-    "blocked_reason",
-    "guidance_plan_hash",
-    "agent_role",
-    "agent_snapshot",
-    "agent_input_fingerprint",
-    "agent_baseline",
-    "agent_recovery",
-    "agent_input_plan",
-    "agent_result_plan",
-    "agent_result_snapshot",
-    "agent_manager_snapshot",
-)
 
 
 def _row_is_mutable_ready(row: sqlite3.Row) -> bool:
@@ -3837,14 +2634,6 @@ def _plan_id_from_path(path: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _execplan_metadata(plan: dict[str, object]) -> tuple[str, str, str]:
-    return (
-        json.dumps(plan["sources"], ensure_ascii=False, separators=(",", ":")),
-        json.dumps(plan["depends_on"], ensure_ascii=False, separators=(",", ":")),
-        str(plan["priority"]),
-    )
-
-
 def _register_execplan_rows(
     connection: sqlite3.Connection,
     repo: str,
@@ -3856,45 +2645,8 @@ def _register_execplan_rows(
 
     _ensure_execplans_schema(connection)
     for path, plan in plans:
-        plan_id = str(plan["id"])
-        sources, dependencies, priority = _execplan_metadata(plan)
-        content_hash = file_hash(worktree / path)
-        initial_level = worker_level(plan)
-        historical = connection.execute(
-            "SELECT plan_id FROM execplan_catalog_history "
-            "WHERE repo = ? AND (plan_id = ? OR original_path = ?)",
-            (repo, plan_id, path),
-        ).fetchone()
-        if historical is not None:
-            raise RuntimeError(
-                "게시된 ExecPlan이 archived historical identity와 충돌합니다: "
-                f"{plan_id}"
-            )
-        existing = connection.execute(
-            "SELECT * FROM exec_plans WHERE repo = ? AND (plan_id = ? OR path = ?)",
-            (repo, plan_id, path),
-        ).fetchone()
-        if existing:
-            immutable = (
-                existing["plan_id"], existing["path"], existing["title"],
-                existing["sources"], existing["depends_on"], existing["priority"],
-                existing["content_hash"], existing["plan_sha"],
-            )
-            expected = (
-                plan_id, path, str(plan["title"]), sources, dependencies,
-                priority, content_hash, plan_commit,
-            )
-            if immutable != expected:
-                raise RuntimeError(f"게시된 ExecPlan 등록 정보가 충돌합니다: {plan_id}")
-            if existing["initial_worker_level"] is None:
-                connection.execute(
-                    "UPDATE exec_plans SET initial_worker_level = ?, "
-                    "effective_worker_level = ? WHERE repo = ? AND plan_id = ?",
-                    (initial_level, initial_level, repo, plan_id),
-                )
-            continue
-        execplan_catalog_state.insert_published_plan_row(
-            connection, repo, path, plan, content_hash, plan_commit,
+        execplan_catalog_state.register_published_plan_row(
+            connection, repo, path, plan, file_hash(worktree / path), plan_commit,
         )
 
 
@@ -3916,19 +2668,6 @@ def register_execplans(
             planning_fingerprint=planning_fingerprint,
             enqueue=False,
         )
-
-
-@dataclass(frozen=True)
-class GeneralPlanningPublication:
-    repo: str
-    stage: str
-    base_sha: str
-    commit_sha: str
-    snapshot_token: str
-    specification_fingerprint: str
-    planning_fingerprint: str
-    manifest: str
-    manifest_hash: str
 
 
 def _planning_result_manifest(result: ValidatedPlanningResult) -> str:
@@ -4024,34 +2763,6 @@ def _planning_result_from_manifest(manifest: str) -> ValidatedPlanningResult:
         raise PlannerValidationError(
             "보존된 general planning publication manifest가 유효하지 않습니다."
         ) from error
-
-
-def general_planning_publication(
-    connection: sqlite3.Connection, repo: str
-) -> GeneralPlanningPublication | None:
-    row = connection.execute(
-        "SELECT * FROM general_planning_publications WHERE repo = ?", (repo,)
-    ).fetchone()
-    if row is None:
-        return None
-    publication = GeneralPlanningPublication(
-        repo=str(row["repo"]),
-        stage=str(row["stage"]),
-        base_sha=str(row["base_sha"]),
-        commit_sha=str(row["commit_sha"]),
-        snapshot_token=str(row["snapshot_token"]),
-        specification_fingerprint=str(row["specification_fingerprint"]),
-        planning_fingerprint=str(row["planning_fingerprint"]),
-        manifest=str(row["manifest"]),
-        manifest_hash=str(row["manifest_hash"]),
-    )
-    if hashlib.sha256(publication.manifest.encode("utf-8")).hexdigest() != (
-        publication.manifest_hash
-    ):
-        raise PlannerValidationError(
-            "보존된 general planning publication manifest hash가 다릅니다."
-        )
-    return publication
 
 
 def _validate_general_planning_commit(
@@ -4166,68 +2877,11 @@ def record_general_planning_publication_intent(
             raise PlannerValidationError(str(error)) from error
     manifest = _planning_result_manifest(result)
     manifest_hash = hashlib.sha256(manifest.encode("utf-8")).hexdigest()
-    expected = (
-        "prepared",
-        snapshot.active_sha,
-        plan_commit,
-        snapshot.token,
-        specification_fingerprint,
-        planning_fingerprint,
-        manifest_hash,
-    )
-    with connection:
-        current = general_planning_publication(connection, repo)
-        if current is not None:
-            actual = (
-                current.stage,
-                current.base_sha,
-                current.commit_sha,
-                current.snapshot_token,
-                current.specification_fingerprint,
-                current.planning_fingerprint,
-                current.manifest_hash,
-            )
-            if actual != expected:
-                raise PlannerValidationError(
-                    "다른 general planning publication intent가 이미 있습니다."
-                )
-            return current
-        connection.execute(
-            """
-            INSERT INTO general_planning_publications (
-                repo, stage, base_sha, commit_sha, snapshot_token,
-                specification_fingerprint, planning_fingerprint,
-                manifest, manifest_hash
-            ) VALUES (?, 'prepared', ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                repo,
-                snapshot.active_sha,
-                plan_commit,
-                snapshot.token,
-                specification_fingerprint,
-                planning_fingerprint,
-                manifest,
-                manifest_hash,
-            ),
-        )
-    publication = general_planning_publication(connection, repo)
-    assert publication is not None
-    return publication
-
-
-def _mutable_ready_cas_where() -> str:
-    null_fields = " AND ".join(
-        f"{field} IS NULL" for field in _MUTABLE_READY_EVIDENCE_FIELDS
-    )
-    return (
-        "status = 'READY' AND ever_started = 0 "
-        "AND workspace_owned = 0 AND retry_count = 0 "
-        "AND pr_conflict_recovery = 0 "
-        "AND verify_failure_history = '{}' "
-        "AND review_failure_history = '{}' "
-        "AND review_level_history = '{}' AND "
-        + null_fields
+    return planning_publication_state.record_general_planning_publication(
+        connection, GeneralPlanningPublication(
+            repo, "prepared", snapshot.active_sha, plan_commit, snapshot.token,
+            specification_fingerprint, planning_fingerprint, manifest, manifest_hash,
+        ),
     )
 
 
@@ -4378,151 +3032,11 @@ def _apply_general_planning_batch(
                 "보존된 general planning publication intent가 batch와 다릅니다."
             )
         _assert_mutable_ready_snapshot_current(connection, snapshot)
-        cas = _mutable_ready_cas_where()
-        for deletion in result.deletions:
-            original = deletion.snapshot
-            changed = connection.execute(
-                f"""
-                DELETE FROM exec_plans
-                WHERE repo = ? AND plan_id = ? AND path = ? AND title = ?
-                  AND sources = ? AND depends_on = ? AND priority = ?
-                  AND current_complexity IS ? AND current_risk IS ?
-                  AND content_hash = ?
-                  AND COALESCE(current_revision_sha, plan_sha) = ? AND {cas}
-                """,
-                (
-                    repo,
-                    original.plan_id,
-                    original.path,
-                    original.title,
-                    json.dumps(original.sources, ensure_ascii=False, separators=(",", ":")),
-                    json.dumps(original.depends_on, ensure_ascii=False, separators=(",", ":")),
-                    original.priority,
-                    original.current_complexity,
-                    original.current_risk,
-                    original.content_hash,
-                    original.plan_sha,
-                ),
-            )
-            if changed.rowcount != 1:
-                raise PlannerValidationError(
-                    "publication 직전 mutable READY deletion이 변경됐습니다: "
-                    f"{original.plan_id}"
-                )
-            connection.execute(
-                """
-                INSERT INTO execplan_cancellations (
-                    repo, plan_id, path, title, sources, depends_on,
-                    complexity, risk, priority, content_hash, plan_sha,
-                    deletion_commit
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    repo,
-                    original.plan_id,
-                    original.path,
-                    original.title,
-                    json.dumps(original.sources, ensure_ascii=False, separators=(",", ":")),
-                    json.dumps(original.depends_on, ensure_ascii=False, separators=(",", ":")),
-                    original.complexity,
-                    original.risk,
-                    original.priority,
-                    original.content_hash,
-                    original.plan_sha,
-                    plan_commit,
-                ),
-            )
-
-        staged_paths: dict[str, str] = {}
-        for revision in result.revisions:
-            original = revision.snapshot
-            if revision.path == original.path:
-                continue
-            staged = (
-                f"docs/plans/.planning-{snapshot.token[:12]}-"
-                f"{original.plan_id}.md"
-            )
-            changed = connection.execute(
-                f"""
-                UPDATE exec_plans SET path = ?
-                WHERE repo = ? AND plan_id = ? AND path = ? AND title = ?
-                  AND sources = ? AND depends_on = ? AND priority = ?
-                  AND current_complexity IS ? AND current_risk IS ?
-                  AND content_hash = ?
-                  AND COALESCE(current_revision_sha, plan_sha) = ? AND {cas}
-                """,
-                (
-                    staged,
-                    repo,
-                    original.plan_id,
-                    original.path,
-                    original.title,
-                    json.dumps(original.sources, ensure_ascii=False, separators=(",", ":")),
-                    json.dumps(original.depends_on, ensure_ascii=False, separators=(",", ":")),
-                    original.priority,
-                    original.current_complexity,
-                    original.current_risk,
-                    original.content_hash,
-                    original.plan_sha,
-                ),
-            )
-            if changed.rowcount != 1:
-                raise PlannerValidationError(
-                    "publication 직전 mutable READY rename이 변경됐습니다: "
-                    f"{original.plan_id}"
-                )
-            staged_paths[original.plan_id] = staged
-
-        for revision in result.revisions:
-            original = revision.snapshot
-            plan = dict(revision.plan)
-            sources, dependencies, priority = _execplan_metadata(plan)
-            initial_level = worker_level(plan)
-            expected_path = staged_paths.get(original.plan_id, original.path)
-            changed = connection.execute(
-                f"""
-                UPDATE exec_plans
-                SET path = ?, title = ?, sources = ?, depends_on = ?,
-                    priority = ?, content_hash = ?, current_revision_sha = ?,
-                    current_complexity = ?, current_risk = ?,
-                    initial_worker_level = ?, effective_worker_level = ?
-                WHERE repo = ? AND plan_id = ? AND path = ? AND title = ?
-                  AND sources = ? AND depends_on = ? AND priority = ?
-                  AND current_complexity IS ? AND current_risk IS ?
-                  AND content_hash = ?
-                  AND COALESCE(current_revision_sha, plan_sha) = ? AND {cas}
-                """,
-                (
-                    revision.path,
-                    str(plan["title"]),
-                    sources,
-                    dependencies,
-                    priority,
-                    file_hash(worktree / revision.path),
-                    plan_commit,
-                    str(plan["complexity"]),
-                    str(plan["risk"]),
-                    initial_level,
-                    initial_level,
-                    repo,
-                    original.plan_id,
-                    expected_path,
-                    original.title,
-                    json.dumps(original.sources, ensure_ascii=False, separators=(",", ":")),
-                    json.dumps(original.depends_on, ensure_ascii=False, separators=(",", ":")),
-                    original.priority,
-                    original.current_complexity,
-                    original.current_risk,
-                    original.content_hash,
-                    original.plan_sha,
-                ),
-            )
-            if changed.rowcount != 1:
-                raise PlannerValidationError(
-                    "publication 직전 mutable READY revision이 변경됐습니다: "
-                    f"{original.plan_id}"
-                )
-
+        planning_publication_state.apply_mutable_catalog_changes(
+            connection, repo, deletions=result.deletions, revisions=result.revisions,
+            snapshot_token=snapshot.token, plan_commit=plan_commit,
+            content_hash=lambda path: file_hash(worktree / path),
+        )
         _register_execplan_rows(
             connection, repo, worktree, list(result.plans), plan_commit
         )
@@ -4546,9 +3060,7 @@ def _apply_general_planning_batch(
             specification_fingerprint=specification_fingerprint,
             planning_fingerprint=planning_fingerprint,
         )
-        connection.execute(
-            "DELETE FROM general_planning_publications WHERE repo = ?", (repo,)
-        )
+        planning_publication_state.delete_general_planning_publication(connection, repo)
 
 
 def publish_general_planning_batch(
@@ -4636,9 +3148,7 @@ def recover_general_planning_batch(
             "general planning publication base가 origin/base 이력에 없습니다."
         )
     with runtime_state._transaction(connection):
-        connection.execute(
-            "DELETE FROM general_planning_publications WHERE repo = ?", (repo,)
-        )
+        planning_publication_state.delete_general_planning_publication(connection, repo)
         _clear_active_in_current_transaction(connection, repo)
     return "restart"
 
@@ -5577,142 +4087,6 @@ class _LegacyCatalogMergeProof:
         )
 
 
-def _insert_recovered_execplan(
-    connection: sqlite3.Connection,
-    repo: str,
-    entry: execplan_catalog.ExecPlanCatalogEntry,
-    *,
-    path: str,
-    content_hash: str,
-    status: str,
-    plan_sha: str | None,
-    pr_url: str | None = None,
-    project: sqlite3.Row | None = None,
-) -> None:
-    existing = connection.execute(
-        "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
-        (repo, entry.plan_id),
-    ).fetchone()
-    if existing is not None:
-        if (
-            str(existing["publication_path"] or existing["path"]) != path
-            or str(
-                existing["publication_content_hash"] or existing["content_hash"]
-            ) != content_hash
-            or (
-                (existing["publication_sha"] or existing["plan_sha"])
-                and plan_sha
-                and str(existing["publication_sha"] or existing["plan_sha"])
-                != plan_sha
-            )
-        ):
-            raise RuntimeError(
-                f"복구된 ExecPlan identity가 기존 catalog와 충돌합니다: {entry.plan_id}"
-            )
-        if status == "MERGED" and str(existing["status"]) != "MERGED":
-            runtime_state.RuntimeStateRepository(connection).update_plan(
-                repo,
-                entry.plan_id,
-                plan_values={"status": "MERGED"},
-                enqueue=False,
-            )
-        return
-
-    plan = entry.metadata()
-    sources, dependencies, priority = _execplan_metadata(plan)
-    initial_level = worker_level(plan)
-    is_active = project is not None
-    connection.execute(
-        """
-        INSERT INTO exec_plans (
-            repo, plan_id, path, title, sources, depends_on, priority,
-            content_hash, current_complexity, current_risk,
-            current_revision_sha, publication_path,
-            publication_content_hash, publication_sha,
-            status, plan_sha, active_sha, branch, worktree,
-            pr_url, last_error, worker_session_id, worker_result, verify_result,
-            initial_worker_level, effective_worker_level, workspace_owned
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                  ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            repo,
-            entry.plan_id,
-            path,
-            entry.title,
-            sources,
-            dependencies,
-            priority,
-            content_hash,
-            entry.complexity,
-            entry.risk,
-            plan_sha,
-            path,
-            content_hash,
-            plan_sha,
-            status,
-            plan_sha,
-            project["active_sha"] if is_active else None,
-            project["branch"] if is_active else None,
-            project["worktree"] if is_active else None,
-            project["pr_url"] if is_active else pr_url,
-            project["last_error"] if is_active else None,
-            project["worker_session_id"] if is_active else None,
-            project["worker_result"] if is_active else None,
-            project["verify_result"] if is_active else None,
-            initial_level,
-            initial_level,
-            1 if is_active else 0,
-        ),
-    )
-
-
-def _quarantine_unverified_historical_runtime(
-    connection: sqlite3.Connection,
-    repo: str,
-    recovery: execplan_catalog_state.CatalogRecoveryResult,
-) -> None:
-    """Keep an archived diagnostic from resuming an old active runtime row."""
-
-    diagnostic_ids = {item.plan_id for item in recovery.diagnostics}
-    if not diagnostic_ids:
-        return
-    repository = runtime_state.RuntimeStateRepository(connection)
-    project = connection.execute(
-        "SELECT plan_path FROM projects WHERE repo = ?", (repo,)
-    ).fetchone()
-    projected_path = str(project["plan_path"] or "") if project else ""
-    for plan_id in sorted(diagnostic_ids):
-        row = connection.execute(
-            "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
-            (repo, plan_id),
-        ).fetchone()
-        if row is None or str(row["status"]) not in ACTIVE_EXECPLAN_STATUSES:
-            continue
-        plan_values = {
-            "status": "PLAN_BLOCKED",
-            "archive_resume_status": str(row["status"]),
-        }
-        if projected_path == str(row["path"]):
-            repository.transition(
-                repo,
-                plan_id,
-                plan_values=plan_values,
-                project_values=runtime_state.clear_project_values(),
-                expected_status=str(row["status"]),
-                enqueue=False,
-            )
-            projected_path = ""
-        else:
-            repository.update_plan(
-                repo,
-                plan_id,
-                plan_values=plan_values,
-                expected_status=str(row["status"]),
-                enqueue=False,
-            )
-
-
 def _migrate_execplan_catalog(
     connection: sqlite3.Connection,
     *,
@@ -5721,216 +4095,11 @@ def _migrate_execplan_catalog(
     manage_transaction: bool = True,
     pinned_catalog: execplan_catalog_state.PinnedCatalog | None = None,
 ) -> None:
-    phase_status = {
-        "WORKING": "IMPLEMENTING",
-        "VERIFYING": "VERIFYING",
-        "REVIEWING": "REVIEWING",
-        "PUBLISHING": "PUBLISHING",
-        "PR_OPEN": "PR_OPEN",
-        "BLOCKED": "PLAN_BLOCKED",
-        "PLAN_BLOCKED": "PLAN_BLOCKED",
-    }
-    query = "SELECT * FROM projects ORDER BY repo"
-    parameters: tuple[str, ...] = ()
-    if target_repo is not None:
-        query = "SELECT * FROM projects WHERE repo = ?"
-        parameters = (target_repo,)
-    projects = connection.execute(query, parameters).fetchall()
-
-    with connection if manage_transaction else contextlib.nullcontext():
-        for project in projects:
-            if project["phase"] == "PLANNING":
-                continue
-            root = Path(str(project["repo"]))
-            revision = f"refs/remotes/origin/{project['base_branch']}"
-            if pinned_catalog is not None:
-                revision = pinned_catalog.revision_sha
-                snapshot = pinned_catalog.snapshot
-            else:
-                snapshot = revision_execplan_snapshot(
-                    root, revision,
-                    archive_conflict_plan_ids=_merged_execplan_ids(
-                        connection, str(project["repo"])
-                    ),
-                )
-            active_path = str(project["plan_path"] or "")
-            rows = connection.execute(
-                "SELECT plan_id, path, content_hash, plan_sha, status, "
-                "publication_path, publication_content_hash, publication_sha "
-                "FROM exec_plans WHERE repo = ?",
-                (project["repo"],),
-            ).fetchall()
-            stored = {
-                str(row["plan_id"]): execplan_catalog_state.StoredPlanIdentity(
-                    plan_id=str(row["plan_id"]),
-                    path=str(row["publication_path"] or row["path"]),
-                    content_hash=str(
-                        row["publication_content_hash"] or row["content_hash"]
-                    ),
-                    plan_sha=(
-                        str(row["publication_sha"] or row["plan_sha"])
-                        if row["publication_sha"] or row["plan_sha"]
-                        else None
-                    ),
-                    status=str(row["status"]),
-                    current_content_hash=str(row["content_hash"]),
-                )
-                for row in rows
-            }
-            historical_ids = {
-                str(row["plan_id"])
-                for row in connection.execute(
-                    "SELECT plan_id FROM execplan_catalog_history WHERE repo = ?",
-                    (project["repo"],),
-                )
-            }
-            catalog_initialized = connection.execute(
-                "SELECT 1 FROM execplan_catalog_revisions WHERE repo = ?",
-                (project["repo"],),
-            ).fetchone() is not None
-            missing_stored_ids = set(stored) - set(snapshot.all)
-            legacy_backfill_allowed = (
-                not catalog_initialized and not missing_stored_ids
-            )
-            unknown_active_ids = set(snapshot.active) - set(stored) - historical_ids
-            unknown_archived_ids = (
-                set(snapshot.archived) - set(stored) - historical_ids
-            )
-            unknown_ids = sorted(unknown_active_ids | unknown_archived_ids)
-            if missing_stored_ids:
-                missing_id = sorted(missing_stored_ids)[0]
-                if unknown_ids:
-                    replacement_id = unknown_ids[0]
-                    raise execplan_catalog.ExecPlanCatalogError(
-                        "원격 ExecPlan ID 변경을 기존 실행 이력과 하나로 "
-                        f"대응할 수 없습니다: {missing_id} -> {replacement_id}",
-                        code="ambiguous-id-change",
-                        path=snapshot.all[replacement_id].path,
-                        related_paths=(stored[missing_id].path,),
-                    )
-                raise execplan_catalog.ExecPlanCatalogError(
-                    "SQLite ExecPlan에 대응하는 원격 파일이 없습니다: "
-                    f"{missing_id}",
-                    code="missing-plan",
-                    path=stored[missing_id].path,
-                )
-            if catalog_initialized and unknown_ids:
-                unknown_id = unknown_ids[0]
-                raise execplan_catalog.ExecPlanCatalogError(
-                    "원격 ExecPlan ID를 SQLite 실행 이력과 대응할 수 없습니다: "
-                    f"{unknown_id}",
-                    code="unknown-plan-id",
-                    path=snapshot.all[unknown_id].path,
-                )
-            catalog_repository = execplan_catalog_state.CatalogStateRepository(
-                connection, ensure=False
-            )
-            runtime_repository = runtime_state.RuntimeStateRepository(connection)
-            for entry in snapshot.active.values():
-                row = connection.execute(
-                    "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
-                    (project["repo"], entry.plan_id),
-                ).fetchone()
-                if (
-                    row is not None
-                    and row["status"] == "PLAN_BLOCKED"
-                    and row["archive_resume_status"] in ACTIVE_EXECPLAN_STATUSES
-                    and row["path"] == entry.active_path
-                    and row["content_hash"] == entry.content_hash
-                    and project["phase"] is None
-                    and runtime_repository.active_row(str(project["repo"])) is None
-                ):
-                    runtime_repository.update_plan(
-                        str(project["repo"]), entry.plan_id,
-                        plan_values={
-                            "status": row["archive_resume_status"],
-                            "archive_resume_status": None,
-                        },
-                        expected_status="PLAN_BLOCKED", enqueue=False,
-                    )
-                    runtime_repository.hydrate(str(project["repo"]), entry.plan_id)
-            catalog_repository.mark_active(str(project["repo"]), snapshot.active)
-
-            for entry in snapshot.active.values():
-                is_active = (
-                    entry.path == active_path
-                    and str(project["phase"] or "") in phase_status
-                )
-                if not is_active and not reconcile_history:
-                    continue
-                identity = stored.get(entry.plan_id)
-                if identity is not None:
-                    continue
-                if (
-                    not legacy_backfill_allowed
-                    and entry.plan_id not in historical_ids
-                ):
-                    # A newly observed ID is a reconciliation diagnostic, not
-                    # legacy state that may be registered ahead of validation.
-                    continue
-                pull_request = None
-                if is_active:
-                    status = phase_status[str(project["phase"])]
-                    plan_sha = str(project["plan_sha"] or "") or None
-                else:
-                    pull_request = pr_for_branch(
-                        root, f"loop-manager/{entry.plan_id}"
-                    )
-                    if pull_request is None:
-                        status = "READY"
-                    elif pull_request["state"] == "MERGED" or pull_request.get("mergedAt"):
-                        status = "MERGED"
-                    else:
-                        raise RuntimeError(
-                            "Legacy ExecPlan의 PR 상태를 자동 이관할 수 없습니다: "
-                            f"{entry.plan_id} ({pull_request['state']})"
-                        )
-                    plan_sha = _current_execplan_sha(
-                        root, revision, entry
-                    )
-                _insert_recovered_execplan(
-                    connection,
-                    str(project["repo"]),
-                    entry,
-                    path=entry.active_path,
-                    content_hash=entry.content_hash,
-                    status=status,
-                    plan_sha=plan_sha,
-                    pr_url=(str(pull_request["url"]) if pull_request else None),
-                    project=(project if is_active else None),
-                )
-
-            if not reconcile_history:
-                continue
-            recovery_snapshot = execplan_catalog.ExecPlanCatalogSnapshot(
-                active=snapshot.active,
-                archived={
-                    plan_id: entry
-                    for plan_id, entry in snapshot.archived.items()
-                    if legacy_backfill_allowed
-                    or plan_id in stored
-                    or plan_id in historical_ids
-                },
-                revision_sha=snapshot.revision_sha,
-            )
-            recovery = execplan_catalog_state.CatalogRecoveryService(
-                catalog_repository,
-                _LegacyCatalogMergeProof(root, revision, stored),
-            ).reconcile(str(project["repo"]), recovery_snapshot, stored)
-            _quarantine_unverified_historical_runtime(
-                connection, str(project["repo"]), recovery
-            )
-            for recovered in recovery.merged:
-                _insert_recovered_execplan(
-                    connection,
-                    str(project["repo"]),
-                    recovered.entry,
-                    path=recovered.original_path,
-                    content_hash=recovered.original_content_hash,
-                    status="MERGED",
-                    plan_sha=recovered.plan_sha,
-                    pr_url=recovered.proof.pr_url,
-                )
+    return catalog_migration._migrate_execplan_catalog(
+        connection, effects=_catalog_migration_effects(),
+        reconcile_history=reconcile_history, target_repo=target_repo,
+        manage_transaction=manage_transaction, pinned_catalog=pinned_catalog,
+    )
 
 
 def migrate_legacy_execplans(
@@ -5956,7 +4125,6 @@ def migrate_legacy_execplans(
     with connection if manage_transaction else contextlib.nullcontext():
         scoped_blocking.migrate_legacy_blocks(connection)
     return
-
 
 
 def active_execplan(connection: sqlite3.Connection, repo: str) -> sqlite3.Row | None:
@@ -7267,16 +5435,6 @@ def log_base_worktree_sync(repo: Path, result: BaseWorktreeSyncResult) -> None:
         f"기본 worktree 동기화 {result.status} ({repo}): {result.reason}",
         error=result.status in {"skipped", "failed"},
     )
-
-def worker_level(plan: dict[str, object]) -> int:
-    complexity_scores = {"low": 1, "medium": 3, "high": 5}
-    risk_scores = {"low": 0, "medium": 1, "high": 2, "critical": 3}
-    try:
-        complexity = complexity_scores[plan["complexity"]]
-        risk = risk_scores[plan["risk"]]
-    except (KeyError, TypeError) as error:
-        raise ValueError("검증된 ExecPlan complexity와 risk가 필요합니다.") from error
-    return min(complexity + risk, 7)
 
 
 def _deserialize_review_level_history(
@@ -9518,11 +7676,6 @@ def recover_confirmed_pr_conflict_push(
     )
     return True
 
-def _canonical_path(path: Path) -> Path:
-    return path.expanduser().resolve(strict=False)
-
-
-
 
 def _validate_managed_path_boundary(
     state_dir: Path,
@@ -10008,7 +8161,6 @@ def validate_reserved_worktree(
             "예약 workspace가 저장된 생성 기준과 다릅니다: "
             + "; ".join(violations)
         )
-
 
 
 def make_worktree(
@@ -11648,27 +9800,6 @@ def remove_cleanup_worktree(
     return assessment
 
 
-def _ensure_cleanup_pending_schema(connection: sqlite3.Connection) -> None:
-    connection.execute(CLEANUP_PENDING_SCHEMA)
-    connection.execute(MERGED_WORKTREE_CLEANUP_SCHEMA)
-    connection.execute(MANAGER_BASE_FETCH_SCHEMA)
-    columns = {
-        row[1] for row in connection.execute("PRAGMA table_info(cleanup_pending)")
-    }
-    if "workspace_owned" not in columns:
-        connection.execute(
-            "ALTER TABLE cleanup_pending ADD COLUMN workspace_owned "
-            "INTEGER NOT NULL DEFAULT 1"
-        )
-    fetch_columns = {
-        row[1] for row in connection.execute("PRAGMA table_info(manager_base_fetches)")
-    }
-    if "action_token" not in fetch_columns:
-        connection.execute(
-            "ALTER TABLE manager_base_fetches ADD COLUMN action_token TEXT"
-        )
-
-
 def _store_cleanup_pending(
     connection: sqlite3.Connection,
     repo: str,
@@ -13135,7 +11266,6 @@ def guidance_resume_context(
         for row in rows
     ]
     return json.dumps(payload, ensure_ascii=False, indent=2)
-
 
 
 def _blocked_execplan_metadata_error(
@@ -19780,7 +17910,6 @@ TARGETED_TESTS:
 """.strip()
 
 
-
 _TARGETED_TEST_FAILURE = re.compile(
     r"(?i)(?<![\w])(?:FAIL(?:ED|URES?)?|ERRORS?|실패"
     r"|(?:did|does|do|has|have|had|was|were|is|are)\s+not\s+pass(?:ed)?"
@@ -20157,7 +18286,6 @@ def _revision_execplan_catalog(
     }
 
 
-
 def requirement_archive_snapshot(
     connection: sqlite3.Connection,
     repo_path: Path,
@@ -20414,7 +18542,6 @@ def requirement_archive_reconciliation_error(
         f"현재: {json.dumps(actual, ensure_ascii=False)}\n"
         "기대 집합만 내용 변경 없이 docs/requirements/archive/로 이동하라."
     )
-
 
 
 def build_pr_body(
@@ -23816,7 +21943,6 @@ def configure_registry(
         return 0
 
 
-
 def _document_drafts_command(
     args: argparse.Namespace, state_dir: Path, config_path: Path,
 ) -> int:
@@ -24922,7 +23048,6 @@ def dispatch_blocked_checkpoints(
             )
             results.finalized(request)
         return 0
-
 
 
 def _execution_outcome_step_result(outcome: ExecutionOutcome) -> int:

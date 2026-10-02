@@ -1,4 +1,5 @@
 import io
+import errno
 import os
 import datetime
 import subprocess
@@ -7,6 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 import loop_manager
+from loop_manager_internal.runtime import process_lock as process_lock_module
 
 
 class TimestampedExecutionProgressLogsTest(unittest.TestCase):
@@ -53,16 +55,16 @@ class TimestampedExecutionProgressLogsTest(unittest.TestCase):
 
     def test_process_lock_only_classifies_contention_errnos_as_busy(self):
         with tempfile.TemporaryDirectory() as directory:
-            with mock.patch("fcntl.flock", side_effect=OSError(loop_manager.errno.EAGAIN, "busy")):
+            with mock.patch("fcntl.flock", side_effect=OSError(errno.EAGAIN, "busy")):
                 with self.assertRaises(loop_manager.ProcessLockBusyError):
-                    with loop_manager.process_lock(Path(directory)):
+                    with process_lock_module.process_lock(Path(directory)):
                         pass
-            with mock.patch("fcntl.flock", side_effect=OSError(loop_manager.errno.ENOLCK, "lock system failure")):
+            with mock.patch("fcntl.flock", side_effect=OSError(errno.ENOLCK, "lock system failure")):
                 with self.assertRaises(OSError) as raised:
-                    with loop_manager.process_lock(Path(directory)):
+                    with process_lock_module.process_lock(Path(directory)):
                         pass
 
-        self.assertEqual(raised.exception.errno, loop_manager.errno.ENOLCK)
+        self.assertEqual(raised.exception.errno, errno.ENOLCK)
 
     def test_bash_launcher_skips_git_and_preserves_run_arguments(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -18,6 +18,24 @@ PACKAGE = ROOT / "loop_manager_internal"
 
 
 class InternalPackageMigrationTests(unittest.TestCase):
+    def test_foundation_modules_import_without_loading_the_entry_point(self):
+        modules = (
+            "runtime.contracts", "runtime.process_lock", "runtime.runtime_identity",
+            "runtime.bootstrap", "storage.database", "storage.catalog_migration",
+            "storage.planning_publication_state",
+        )
+        for module in modules:
+            with self.subTest(module=module):
+                result = subprocess.run(
+                    [sys.executable, "-I", "-B", "-c",
+                     "import importlib, sys; sys.path.insert(0, sys.argv[1]); "
+                     "importlib.import_module('loop_manager_internal.' + sys.argv[2]); "
+                     "assert 'loop_manager' not in sys.modules",
+                     str(ROOT), module],
+                    capture_output=True, text=True, check=False, timeout=30,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_each_module_imports_first_without_loading_the_entry_point(self):
         # Fresh interpreters expose import-order cycles hidden by the manager's imports.
         for path in sorted(PACKAGE.rglob("*.py")):

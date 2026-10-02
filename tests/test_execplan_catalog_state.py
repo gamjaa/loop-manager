@@ -1,3 +1,4 @@
+from loop_manager_internal.storage import database
 from tests.support.catalog import CatalogReconciliationFixture
 from tests.support.catalog import archived_entry, FakeDefinitionPort, active_snapshot
 import hashlib
@@ -309,8 +310,8 @@ class ArchivedDependencySelectionTest(unittest.TestCase):
     def setUp(self):
         self.connection = sqlite3.connect(":memory:")
         self.connection.row_factory = sqlite3.Row
-        self.connection.execute(loop_manager.SCHEMA)
-        loop_manager._ensure_execplans_schema(self.connection)
+        self.connection.execute(database.SCHEMA)
+        database._ensure_execplans_schema(self.connection)
         loop_manager.notifications.ensure_schema(self.connection)
         self.connection.execute(
             "INSERT INTO projects (repo, base_branch) VALUES ('/repo', 'main')"
@@ -508,8 +509,8 @@ class CatalogReconciliationTest(CatalogReconciliationFixture, unittest.TestCase)
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)
         connection.row_factory = sqlite3.Row
-        connection.execute(loop_manager.SCHEMA)
-        legacy_schema = loop_manager.EXEC_PLANS_SCHEMA
+        connection.execute(database.SCHEMA)
+        legacy_schema = database.EXEC_PLANS_SCHEMA
         for line in (
             "    current_complexity TEXT,\n",
             "    current_risk TEXT,\n",
@@ -536,7 +537,7 @@ class CatalogReconciliationTest(CatalogReconciliationFixture, unittest.TestCase)
             ("a" * 40,),
         )
 
-        loop_manager._ensure_execplans_schema(connection)
+        database._ensure_execplans_schema(connection)
 
         row = connection.execute(
             "SELECT publication_path, publication_content_hash, publication_sha, "
@@ -561,7 +562,7 @@ class CatalogReconciliationTest(CatalogReconciliationFixture, unittest.TestCase)
             "current_revision_sha = NULL WHERE plan_id = 'G-001'"
         )
         connection.commit()
-        loop_manager._ensure_execplans_schema(connection)
+        database._ensure_execplans_schema(connection)
         self.assertFalse(connection.in_transaction)
         audit = self.repository.publication_audit('/repo', 'G-001')
         self.assertEqual(audit.path, 'docs/plans/[G-001] Old.md')
@@ -575,7 +576,7 @@ class CatalogReconciliationTest(CatalogReconciliationFixture, unittest.TestCase)
             "UPDATE exec_plans SET path = 'changed', content_hash = 'changed' "
             "WHERE plan_id = 'G-001'"
         )
-        loop_manager._ensure_execplans_schema(connection)
+        database._ensure_execplans_schema(connection)
         self.assertTrue(connection.in_transaction)
         self.assertEqual(self.repository.publication_audit('/repo', 'G-001'), audit)
         connection.rollback()

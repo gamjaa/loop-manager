@@ -388,10 +388,7 @@ def insert_published_plan_row(
 ) -> None:
     """Register validated publication metadata without reading a worktree."""
 
-    sources = json.dumps(plan["sources"], ensure_ascii=False, separators=(",", ":"))
-    dependencies = json.dumps(
-        plan["depends_on"], ensure_ascii=False, separators=(",", ":")
-    )
+    sources, dependencies, priority = serialize_plan_metadata(plan)
     initial_level = _worker_level(str(plan["complexity"]), str(plan["risk"]))
     connection.execute(
         """
@@ -405,7 +402,7 @@ def insert_published_plan_row(
         """,
         (
             repo, str(plan["id"]), path, str(plan["title"]), sources,
-            dependencies, str(plan["priority"]), content_hash,
+            dependencies, priority, content_hash,
             str(plan["complexity"]), str(plan["risk"]), revision_sha,
             path, content_hash, revision_sha, revision_sha,
             initial_level, initial_level,
@@ -579,22 +576,16 @@ class DefinitionStateRepository:
 
     def publication_audit(self, repo: str, plan_id: str) -> PublicationAudit:
         row = self.connection.execute(
-            "SELECT path, content_hash, plan_sha, publication_path, "
+            "SELECT plan_id, status, path, content_hash, plan_sha, publication_path, "
             "publication_content_hash, publication_sha "
             "FROM exec_plans WHERE repo = ? AND plan_id = ?",
             (repo, plan_id),
         ).fetchone()
         if row is None:
             raise RuntimeError(f"ExecPlan publication audit가 없습니다: {plan_id}")
+        identity = publication_identity(row)
         return PublicationAudit(
-            plan_id,
-            str(row["publication_path"] or row["path"]),
-            str(row["publication_content_hash"] or row["content_hash"]),
-            (
-                str(row["publication_sha"] or row["plan_sha"])
-                if row["publication_sha"] or row["plan_sha"]
-                else None
-            ),
+            identity.plan_id, identity.path, identity.content_hash, identity.plan_sha,
         )
 
     def current_definition(
@@ -1393,3 +1384,90 @@ class CatalogRecoveryService:
             )
 
         return CatalogRecoveryResult(tuple(merged), tuple(diagnostics))
+
+
+def serialize_plan_metadata(plan: Mapping[str, object]) -> tuple[str, str, str]:
+    return (
+        json.dumps(plan["sources"], ensure_ascii=False, separators=(",", ":")),
+        json.dumps(plan["depends_on"], ensure_ascii=False, separators=(",", ":")),
+        str(plan["priority"]),
+    )
+
+
+def publication_identity(row: sqlite3.Row) -> StoredPlanIdentity:
+    """Interpret the immutable audit fallback separately from current cache."""
+    return StoredPlanIdentity(
+        plan_id=str(row["plan_id"]),
+        path=str(row["publication_path"] or row["path"]),
+        content_hash=str(row["publication_content_hash"] or row["content_hash"]),
+        plan_sha=(str(row["publication_sha"] or row["plan_sha"])
+                  if row["publication_sha"] or row["plan_sha"] else None),
+        status=str(row["status"]),
+        current_content_hash=str(row["content_hash"]),
+    )
+
+
+def _merged_execplan_ids(
+    connection: sqlite3.Connection, repo: str
+) -> frozenset[str]:
+    return frozenset(
+        str(row[0])
+        for row in connection.execute(
+            "SELECT plan_id FROM exec_plans WHERE repo = ? AND status = 'MERGED'",
+            (repo,),
+        )
+    )
+
+
+def register_published_plan_row(
+    connection: sqlite3.Connection, repo: str, path: str,
+    plan: Mapping[str, object], content_hash: str, plan_commit: str,
+) -> None:
+    """Apply a validated publication row without committing the caller event."""
+    plan_id = str(plan["id"])
+    sources, dependencies, priority = serialize_plan_metadata(plan)
+    initial_level = worker_level(plan)
+    historical = connection.execute(
+        "SELECT plan_id FROM execplan_catalog_history "
+        "WHERE repo = ? AND (plan_id = ? OR original_path = ?)",
+        (repo, plan_id, path),
+    ).fetchone()
+    if historical is not None:
+        raise RuntimeError(
+            "게시된 ExecPlan이 archived historical identity와 충돌합니다: "
+            f"{plan_id}"
+        )
+    existing = connection.execute(
+        "SELECT * FROM exec_plans WHERE repo = ? AND (plan_id = ? OR path = ?)",
+        (repo, plan_id, path),
+    ).fetchone()
+    if existing:
+        immutable = (
+            existing["plan_id"], existing["path"], existing["title"],
+            existing["sources"], existing["depends_on"], existing["priority"],
+            existing["content_hash"], existing["plan_sha"],
+        )
+        expected = (
+            plan_id, path, str(plan["title"]), sources, dependencies,
+            priority, content_hash, plan_commit,
+        )
+        if immutable != expected:
+            raise RuntimeError(f"게시된 ExecPlan 등록 정보가 충돌합니다: {plan_id}")
+        if existing["initial_worker_level"] is None:
+            connection.execute(
+                "UPDATE exec_plans SET initial_worker_level = ?, "
+                "effective_worker_level = ? WHERE repo = ? AND plan_id = ?",
+                (initial_level, initial_level, repo, plan_id),
+            )
+        return
+    insert_published_plan_row(
+        connection, repo, path, plan, content_hash, plan_commit,
+    )
+
+
+def worker_level(plan: Mapping[str, object]) -> int:
+    """Keep the public metadata validation while sharing the score calculation."""
+    try:
+        return _worker_level(plan["complexity"], plan["risk"])
+    except (KeyError, TypeError) as error:
+        raise ValueError("검증된 ExecPlan complexity와 risk가 필요합니다.") from error
