@@ -208,6 +208,20 @@ def matching_branch_pr_lookup(responses):
     return lookup
 
 
+def publishing_branch_pr_lookup(connection, url):
+    """Expose an existing PR throughout publication, independent of query count."""
+    def response(repo, branch, *_args, **_kwargs):
+        row = connection.execute(
+            "SELECT phase FROM projects WHERE repo = ? AND branch = ?",
+            (str(repo), branch),
+        ).fetchone()
+        if row is not None and row[0] in {'PUBLISHING', 'PR_OPEN'}:
+            return {'url': url, 'state': 'OPEN'}
+        return None
+
+    return matching_branch_pr_lookup(response)
+
+
 class PublicationFixtureTest(unittest.TestCase):
     def test_matching_pr_reads_head_only_when_queried(self):
         with mock.patch(__name__ + '.git_command', side_effect=['first', 'rebased']) as git:
@@ -4825,8 +4839,8 @@ risk: medium
             with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
                 "loop_manager.remote_base", return_value="main"
             ), mock.patch("loop_manager.ensure_safe_base_worktree"), mock.patch(
-                "loop_manager.pr_for_branch", side_effect=matching_branch_pr_lookup(
-                    [None, {"url": "https://example.test/pr/1"}]
+                "loop_manager.pr_for_branch", side_effect=publishing_branch_pr_lookup(
+                    connection, "https://example.test/pr/1"
                 )
             ), mock.patch("loop_manager.run_codex", side_effect=agent), mock.patch(
                 "loop_manager.verify", return_value=(True, "verify: PASS")
@@ -6515,7 +6529,6 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                 (False, "failure D"),
                 (True, "verify: PASS"),
             ]
-            pr_results = [None] * 5 + [{"url": "https://example.test/pr/13"}]
             with mock.patch(
                 "loop_manager.validate_repository", return_value=repo
             ), mock.patch(
@@ -6523,7 +6536,9 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             ), mock.patch(
                 "loop_manager.ensure_safe_base_worktree"
             ), mock.patch(
-                "loop_manager.pr_for_branch", side_effect=matching_branch_pr_lookup(pr_results)
+                "loop_manager.pr_for_branch", side_effect=publishing_branch_pr_lookup(
+                    connection, "https://example.test/pr/13"
+                )
             ), mock.patch(
                 "loop_manager.run_codex", side_effect=agent
             ), mock.patch(
@@ -6817,12 +6832,9 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                 "loop_manager.ensure_safe_base_worktree"
             ), mock.patch(
                 "loop_manager.pr_for_branch",
-                side_effect=matching_branch_pr_lookup([
-                    None,
-                    None,
-                    None,
-                    {"url": "https://example.test/pr/13"},
-                ]),
+                side_effect=publishing_branch_pr_lookup(
+                    connection, "https://example.test/pr/13"
+                ),
             ), mock.patch(
                 "loop_manager.run_codex", side_effect=agent
             ), mock.patch(
@@ -7077,11 +7089,8 @@ class ReviewDrivenWorkerProfileEscalationTest(unittest.TestCase):
                 )
             return next(responses)
 
-        pr_results: list[dict[str, str] | None] = [None] * len(reviewer_results)
-        if publish:
-            pr_results.append({"url": "https://example.test/pr/19"})
-        else:
-            pr_results.extend((None, None))
+        pr_lookup = (publishing_branch_pr_lookup(connection, "https://example.test/pr/19")
+                     if publish else lambda *_args, **_kwargs: None)
 
         with mock.patch(
             "loop_manager.validate_repository", return_value=repo
@@ -7090,7 +7099,7 @@ class ReviewDrivenWorkerProfileEscalationTest(unittest.TestCase):
         ), mock.patch(
             "loop_manager.ensure_safe_base_worktree"
         ), mock.patch(
-            "loop_manager.pr_for_branch", side_effect=matching_branch_pr_lookup(pr_results)
+            "loop_manager.pr_for_branch", side_effect=pr_lookup
         ), mock.patch(
             "loop_manager.run_codex", side_effect=agent
         ), mock.patch(
@@ -7942,8 +7951,8 @@ class WorkerPublicationTest(unittest.TestCase):
                 "loop_manager.remote_base", return_value="main"
             ), mock.patch("loop_manager.ensure_safe_base_worktree"), mock.patch(
                 "loop_manager.pr_for_branch",
-                side_effect=matching_branch_pr_lookup(
-                    [None, None, {"url": "https://example.test/pr/1"}]
+                side_effect=publishing_branch_pr_lookup(
+                    connection, "https://example.test/pr/1"
                 ),
             ), mock.patch("loop_manager.run_codex", side_effect=worker), mock.patch(
                 "loop_manager.verify",
