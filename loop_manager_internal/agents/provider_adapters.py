@@ -1,0 +1,558 @@
+"""Codex/Claude command construction, output parsing and process execution."""
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+import threading
+from typing import Protocol
+
+from loop_manager_internal.agents.agent_invocation import AgentRequest, AgentResult, AgentResultKind, ResolvedProfile, Usage
+from loop_manager_internal.agents.agent_profiles import agent_environment
+from loop_manager_internal.agents.agent_provider_usage import claude_usage, codex_log_usage
+from loop_manager_internal.agents import agent_write_isolation
+
+AGENT_CLI_TIMEOUT_SECONDS = 3600
+CodexResult = AgentResult
+
+@dataclass(frozen=True)
+class ProviderEffects:
+    """Explicit effects supplied by the composition boundary."""
+
+    role: Callable[[Path, str, Path | None], tuple[str, str]]
+    worker_profile: Callable[[Path, int, Path | None], tuple[str, str]]
+    _agent_profile: Callable[[Path, str, str, int | None, Path], ResolvedProfile]
+    _handoff_popen: Callable[..., subprocess.Popen[str]]
+    _handoff_run: Callable[..., subprocess.CompletedProcess[str]]
+
+
+def _provider_log_directory(worktree: Path, state_dir: Path) -> Path:
+    directory = state_dir / "logs" / hashlib.sha256(str(worktree).encode()).hexdigest()[:16]
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _json_object(line: str) -> tuple[dict[str, object] | None, bool]:
+    try:
+        event = json.loads(line)
+    except (ValueError, RecursionError):
+        return None, False
+    return (event if isinstance(event, dict) else None), True
+
+
+def _start_timeout(process: subprocess.Popen[str], triggered: threading.Event,
+                   stop: Callable[[subprocess.Popen[str]], None] | None = None) -> threading.Timer:
+    def terminate() -> None:
+        triggered.set()
+        _stop_process(process, stop)
+
+    timeout = threading.Timer(AGENT_CLI_TIMEOUT_SECONDS, terminate)
+    timeout.daemon = True
+    timeout.start()
+    return timeout
+
+
+def _stop_process(process: subprocess.Popen[str],
+                  stop: Callable[[subprocess.Popen[str]], None] | None = None) -> None:
+    try:
+        if stop is None:
+            process.kill()
+        else:
+            stop(process)
+    except OSError:
+        pass
+
+
+def run_codex(
+    worktree: Path,
+    state_dir: Path,
+    config_path: Path,
+    role_name: str,
+    prompt: str,
+    *,
+    read_only: bool,
+    level: int | None = None,
+    persist_session: bool = False,
+    session_id: str | None = None,
+    on_session_started: Callable[[str], None] | None = None,
+    resolved_profile: ResolvedProfile | None = None,
+    isolation_arguments: tuple[str, ...] | None = None,
+    isolation_evidence: agent_write_isolation.IsolationEvidence | None = None,
+    isolation_snapshot_digest: Callable[[], str] | None = None,
+    expected_repository: str | None = None,
+    on_isolation_checked: Callable[[agent_write_isolation.IsolationEvidence], None] | None = None,
+    effects: ProviderEffects,
+) -> tuple[int, str] | CodexResult:
+    if resolved_profile is not None:
+        model, effort = resolved_profile.model, resolved_profile.effort
+    elif role_name == "worker":
+        if level is None:
+            raise RuntimeError("Codex Worker level이 없습니다.")
+        model, effort = effects.worker_profile(config_path, level, worktree)
+    else:
+        if level is not None:
+            raise RuntimeError(f"Codex {role_name}에 Worker level을 지정할 수 없습니다.")
+        model, effort = effects.role(config_path, role_name, worktree)
+    codex_launch = None
+    launch_environment = agent_environment("codex", role_name)
+    if on_isolation_checked is not None:
+        checked: list[agent_write_isolation.IsolationEvidence] = []
+
+        def observe(evidence: agent_write_isolation.IsolationEvidence) -> None:
+            on_isolation_checked(evidence)
+            checked.append(evidence)
+
+        isolation_arguments = agent_write_isolation.prepare_isolation(
+            "codex", role_name, worktree, state_dir, read_only, observe,
+            isolation_snapshot_digest, config_path=config_path,
+            expected_repository=expected_repository, session_id=session_id,
+            environment_variables=launch_environment,
+        )
+        if isinstance(isolation_arguments, agent_write_isolation.CodexLaunch):
+            codex_launch = isolation_arguments
+            isolation_arguments = codex_launch.arguments
+            launch_environment = codex_launch.environment
+        if len(checked) != 1 or checked[0].status != "verified":
+            raise agent_write_isolation.IsolationError("Codex 격리 증거가 없습니다.")
+        isolation_evidence = checked[0]
+    if isolation_arguments is not None:
+        if isolation_evidence is None or isolation_snapshot_digest is None:
+            raise agent_write_isolation.IsolationError("Codex 격리 증거가 없습니다.")
+        agent_write_isolation.assert_current(
+            isolation_evidence, worktree, state_dir, config_path,
+            expected_repository, read_only, isolation_snapshot_digest,
+        )
+    project_dir = _provider_log_directory(worktree, state_dir)
+    last_message = project_dir / f"{role_name}-last.txt"
+    saved_log = project_dir / f"{role_name}.log"
+    log = codex_launch.attempt / "provider.log" if codex_launch else saved_log
+    # Preserve the previous result until native policy preflight accepts the call.
+    provider_last_message = (codex_launch.attempt / "last-message.txt"
+                             if codex_launch else last_message)
+    if codex_launch is None:
+        last_message.unlink(missing_ok=True)
+    permissions = (list(isolation_arguments) if isolation_arguments is not None
+                   else codex_sandbox_arguments(read_only))
+    if session_id:
+        arguments = [
+            "codex",
+            "exec",
+            *permissions,
+            "-C",
+            str(worktree),
+            "resume",
+            "--json",
+            "-m",
+            model,
+            "-c",
+            f'model_reasoning_effort="{effort}"',
+            "-o",
+            str(provider_last_message),
+            session_id,
+            "-",
+        ]
+    else:
+        arguments = [
+            "codex",
+            "exec",
+            *(["--json"] if persist_session else ["--ephemeral"]),
+            *permissions,
+            "-C",
+            str(worktree),
+            "-m",
+            model,
+            "-c",
+            f'model_reasoning_effort="{effort}"',
+            "-o",
+            str(provider_last_message),
+            "-",
+        ]
+    resolved_session_id = session_id
+    timeout_triggered = threading.Event()
+    if persist_session and not session_id:
+        with log.open("w", encoding="utf-8") as output:
+            process = effects._handoff_popen(
+                arguments,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=launch_environment,
+                cwd=worktree,
+                start_new_session=codex_launch is not None,
+            )
+            assert process.stdin is not None
+            assert process.stdout is not None
+
+            timeout = _start_timeout(process, timeout_triggered, codex_launch.stop if codex_launch else None)
+            try:
+                process.stdin.write(prompt)
+                process.stdin.close()
+                for line in process.stdout:
+                    output.write(line)
+                    output.flush()
+                    if resolved_session_id:
+                        continue
+                    event, _decoded = _json_object(line)
+                    if event is None:
+                        continue
+                    if event.get("type") == "thread.started" and isinstance(
+                        event.get("thread_id"), str
+                    ):
+                        resolved_session_id = event["thread_id"]
+                        if on_session_started:
+                            on_session_started(resolved_session_id)
+                returncode = process.wait()
+            except BaseException:
+                _stop_process(process, codex_launch.stop if codex_launch else None)
+                process.wait()
+                raise
+            finally:
+                timeout.cancel()
+                process.stdout.close()
+                if codex_launch is not None:
+                    codex_launch.stop(process)
+    else:
+        with log.open("w", encoding="utf-8") as output:
+            runner = codex_launch.run if codex_launch is not None else effects._handoff_run
+            result = runner(
+                arguments,
+                input=prompt,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                env=launch_environment,
+                cwd=worktree,
+                timeout=AGENT_CLI_TIMEOUT_SECONDS,
+                **({"launch_process": effects._handoff_popen} if codex_launch is not None else {}),
+            )
+        returncode = result.returncode
+    message = (provider_last_message.read_text(encoding="utf-8")
+               if provider_last_message.is_file() else "")
+    if codex_launch is not None and provider_last_message.is_file():
+        last_message.write_text(message, encoding="utf-8")
+    if timeout_triggered.is_set():
+        message = f"Codex {role_name} 실행 timeout ({AGENT_CLI_TIMEOUT_SECONDS}초)"
+    if returncode and not message:
+        message = log.read_text(encoding="utf-8")[-6000:]
+    try:
+        usage = codex_log_usage(log.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError):
+        # Usage is observational; a failed log read cannot retry a completed CLI call.
+        usage = Usage(status="invalid")
+    if codex_launch is not None and returncode != 125:
+        saved_log.write_text(log.read_text(encoding="utf-8"), encoding="utf-8")
+    if persist_session and not resolved_session_id:
+        if returncode == 0:
+            return CodexResult(
+                1,
+                f"Codex {role_name} 실행 결과에서 세션 ID를 확인할 수 없습니다.",
+                usage=usage,
+            )
+    if persist_session or session_id:
+        return CodexResult(
+            returncode,
+            message.strip(),
+            resolved_session_id,
+            (
+                AgentResultKind.TRANSIENT_FAILURE
+                if timeout_triggered.is_set()
+                else None
+            ),
+            usage,
+        )
+    return returncode, message.strip()
+
+
+def run_claude(
+    worktree: Path,
+    state_dir: Path,
+    config_path: Path,
+    role_name: str,
+    prompt: str,
+    *,
+    read_only: bool,
+    level: int | None = None,
+    persist_session: bool = False,
+    session_id: str | None = None,
+    on_session_started: Callable[[str], None] | None = None,
+    resolved_profile: ResolvedProfile | None = None,
+    on_isolation_checked: Callable[[agent_write_isolation.IsolationEvidence], None] | None = None,
+    isolation_snapshot_digest: Callable[[], str] | None = None,
+    expected_repository: str | None = None,
+    effects: ProviderEffects,
+) -> tuple[int, str] | AgentResult:
+    profile = resolved_profile or effects._agent_profile(
+        config_path, "claude", role_name, level, worktree
+    )
+    model, effort = profile.model, profile.effort
+    if on_isolation_checked is not None:
+        agent_write_isolation.prepare_isolation(
+            "claude", role_name, worktree, state_dir, read_only,
+            on_isolation_checked, isolation_snapshot_digest,
+            config_path=config_path, expected_repository=expected_repository,
+            session_id=session_id,
+        )
+    project_dir = _provider_log_directory(worktree, state_dir)
+    log = project_dir / f"claude-{role_name}.log"
+    last_message = project_dir / f"claude-{role_name}-last.txt"
+    last_message.unlink(missing_ok=True)
+
+    streaming = persist_session and session_id is None
+    arguments = [
+        "claude",
+        "--print",
+        "--output-format",
+        "stream-json" if streaming else "json",
+        *(["--verbose"] if streaming else []),
+        "--model",
+        model,
+        "--effort",
+        effort,
+        *claude_permission_arguments(read_only),
+        *(["--resume", session_id] if session_id else []),
+    ]
+    resolved_session_id = session_id
+    message = ""
+    returncode = 0
+    timeout_triggered = threading.Event()
+    usage = Usage()
+
+    if streaming:
+        final_event: Mapping[str, object] = {}
+        stream_error_seen = False
+        stream_error_message = ""
+        diagnostic_tail = ""
+        with log.open("w", encoding="utf-8") as output:
+            process = effects._handoff_popen(
+                arguments,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=agent_environment("claude", role_name),
+                cwd=worktree,
+            )
+            assert process.stdin is not None
+            assert process.stdout is not None
+
+            timeout = _start_timeout(process, timeout_triggered)
+            try:
+                process.stdin.write(prompt)
+                process.stdin.close()
+                for line in process.stdout:
+                    output.write(line)
+                    output.flush()
+                    event, decoded = _json_object(line)
+                    if event is None:
+                        if not decoded:
+                            diagnostic_tail = (diagnostic_tail + line)[-6000:]
+                        if usage.status == "unknown":
+                            usage = Usage(status="invalid")
+                        continue
+                    if event.get("is_error") or event.get("type") == "error":
+                        stream_error_seen = True
+                        candidate = _claude_result_message(event)
+                        stream_error_message = candidate or line.strip()[-6000:]
+                    if event.get("is_error") or event.get("type") in {
+                        "error",
+                        "result",
+                    }:
+                        diagnostic_tail = (diagnostic_tail + line)[-6000:]
+                    event_session = event.get("session_id")
+                    if (
+                        resolved_session_id is None
+                        and isinstance(event_session, str)
+                        and event_session
+                    ):
+                        resolved_session_id = event_session
+                        if on_session_started:
+                            on_session_started(resolved_session_id)
+                    if event.get("type") == "result":
+                        final_event = event
+                        parsed_usage = claude_usage(event)
+                        if parsed_usage.status != "unknown" or usage.status != "invalid":
+                            usage = parsed_usage
+                returncode = process.wait()
+            except BaseException:
+                _stop_process(process)
+                process.wait()
+                raise
+            finally:
+                timeout.cancel()
+                process.stdout.close()
+        message = stream_error_message or _claude_result_message(final_event)
+        if stream_error_seen and returncode == 0:
+            returncode = 1
+        if returncode and not message:
+            message = diagnostic_tail
+    else:
+        result = effects._handoff_run(
+            arguments,
+            input=prompt,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=agent_environment("claude", role_name),
+            cwd=worktree,
+            timeout=AGENT_CLI_TIMEOUT_SECONDS,
+        )
+        returncode = result.returncode
+        raw_output = result.stdout or ""
+        log.write_text(raw_output, encoding="utf-8")
+        try:
+            event = json.loads(raw_output)
+        except (ValueError, RecursionError):
+            event = {}
+            usage = Usage(status="invalid")
+        if isinstance(event, dict):
+            message = _claude_result_message(event)
+            parsed_usage = claude_usage(event)
+            if parsed_usage.status != "unknown" or usage.status != "invalid":
+                usage = parsed_usage
+            event_session = event.get("session_id")
+            if isinstance(event_session, str) and event_session:
+                resolved_session_id = event_session
+            if event.get("is_error") and returncode == 0:
+                returncode = 1
+        if not message and returncode:
+            message = raw_output[-6000:]
+
+    if timeout_triggered.is_set():
+        message = f"Claude {role_name} 실행 timeout ({AGENT_CLI_TIMEOUT_SECONDS}초)"
+    if message:
+        last_message.write_text(message, encoding="utf-8")
+    if persist_session and not resolved_session_id and returncode == 0:
+        return AgentResult(
+            1,
+            f"Claude {role_name} 실행 결과에서 세션 ID를 확인할 수 없습니다.",
+            usage=usage,
+        )
+    if persist_session or session_id:
+        return AgentResult(
+            returncode,
+            message.strip(),
+            resolved_session_id,
+            (
+                AgentResultKind.TRANSIENT_FAILURE
+                if timeout_triggered.is_set()
+                else None
+            ),
+            usage,
+        )
+    return returncode, message.strip()
+
+
+def codex_sandbox_arguments(read_only: bool) -> list[str]:
+    return list(agent_write_isolation.codex_arguments(read_only))
+
+
+def claude_permission_arguments(read_only: bool) -> list[str]:
+    arguments = ["--permission-mode", "auto"]
+    if read_only:
+        arguments.extend([
+            "--disallowedTools",
+            "Edit",
+            "Write",
+            "NotebookEdit",
+        ])
+    settings = {"permissions": {"defaultMode": "auto"}, "sandbox": {
+        "enabled": True, "failIfUnavailable": True,
+        "allowUnsandboxedCommands": False, "autoAllowBashIfSandboxed": False,
+        "excludedCommands": [],
+    }}
+    arguments.extend(["--settings", json.dumps(settings, sort_keys=True)])
+    return arguments
+
+
+def _claude_result_message(event: Mapping[str, object]) -> str:
+    result = event.get("result")
+    if isinstance(result, str):
+        return result
+    message = event.get("message")
+    if isinstance(message, str):
+        return message
+    if isinstance(message, Mapping):
+        content = message.get("content")
+        if isinstance(content, list):
+            return "".join(
+                str(block.get("text", ""))
+                for block in content
+                if isinstance(block, Mapping) and block.get("type") == "text"
+            )
+    error = event.get("error")
+    if isinstance(error, str):
+        return error
+    if isinstance(error, Mapping) and isinstance(error.get("message"), str):
+        return str(error["message"])
+    return ""
+
+
+class AgentProvider(Protocol):
+    """Provider boundary consumed by orchestration state transitions."""
+
+    name: str
+
+    def run(self, request: AgentRequest) -> tuple[int, str] | AgentResult:
+        ...
+
+
+class CodexAgentAdapter:
+    name = "codex"
+
+    def __init__(self, run: Callable[..., tuple[int, str] | AgentResult]):
+        self._run = run
+
+    def run(self, request: AgentRequest) -> tuple[int, str] | AgentResult:
+        return self._run(
+            request.worktree,
+            request.state_dir,
+            request.config_path,
+            request.role_name,
+            request.prompt,
+            read_only=request.read_only,
+            level=request.level,
+            persist_session=request.persist_session,
+            session_id=request.session_id,
+            on_session_started=request.on_session_started,
+            resolved_profile=request.profile,
+            isolation_snapshot_digest=request.isolation_snapshot_digest,
+            expected_repository=request.expected_repository,
+            on_isolation_checked=request.on_isolation_checked,
+        )
+
+
+class ClaudeAgentAdapter:
+    name = "claude"
+
+    def __init__(self, run: Callable[..., tuple[int, str] | AgentResult]):
+        self._run = run
+
+    def run(self, request: AgentRequest) -> tuple[int, str] | AgentResult:
+        return self._run(
+            request.worktree,
+            request.state_dir,
+            request.config_path,
+            request.role_name,
+            request.prompt,
+            read_only=request.read_only,
+            level=request.level,
+            persist_session=request.persist_session,
+            session_id=request.session_id,
+            on_session_started=request.on_session_started,
+            resolved_profile=request.profile,
+            on_isolation_checked=request.on_isolation_checked,
+            isolation_snapshot_digest=request.isolation_snapshot_digest,
+            expected_repository=request.expected_repository,
+        )

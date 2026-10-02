@@ -485,6 +485,22 @@ class RuntimeStateRepository:
         if self._fault_hook is not None:
             self._fault_hook(stage)
 
+    def scope_owner(self, repo: str, plan_id: str | None = None) -> sqlite3.Row | None:
+        """Read saved Agent scope from its project or selected plan owner."""
+        if plan_id is None:
+            return self.connection.execute(
+                "SELECT * FROM projects WHERE repo = ?", (repo,),
+            ).fetchone()
+        return self.connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?", (repo, plan_id),
+        ).fetchone()
+
+    def scope_catalog_available(self) -> bool:
+        """Keep pre-catalog scope recovery read-only until migration runs."""
+        return self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'exec_plans'",
+        ).fetchone() is not None
+
     @staticmethod
     def _validate_fields(values: Mapping[str, object], allowed: frozenset[str]) -> None:
         if not values or not set(values).issubset(allowed):

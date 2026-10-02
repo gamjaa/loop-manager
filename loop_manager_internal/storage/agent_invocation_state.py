@@ -8,6 +8,8 @@ from uuid import uuid4
 
 from loop_manager_internal.agents.agent_invocation import InvocationContext, ResolvedProfile, Usage
 from loop_manager_internal.agents.agent_write_isolation import IsolationEvidence
+from loop_manager_internal.agents.scope_contracts import GitSnapshot
+from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
 
 
 SCHEMA = """
@@ -82,6 +84,22 @@ def utc_now() -> str:
 class InvocationRepository:
     def __init__(self, connection: sqlite3.Connection):
         self.connection = connection
+
+    def invocation_scope_id(self, repo: str, role: str, worktree: str) -> str | None:
+        """Bind an attempt only to the matching persisted role/workspace scope."""
+        scope = RuntimeStateRepository(self.connection).scope_owner(repo)
+        if (scope is not None and (scope['agent_role'] == role
+                or (scope['agent_role'] == 'maintenance_planner' and role == 'planner'))
+                and scope['worktree'] == worktree and scope['agent_snapshot']):
+            return GitSnapshot.deserialize(str(scope['agent_snapshot'])).scope_id
+        return None
+
+    def latest_scope_session(self, scope_id: str) -> str | None:
+        row = self.connection.execute(
+            'SELECT session_id FROM agent_invocations WHERE scope_id = ? ORDER BY rowid DESC LIMIT 1',
+            (scope_id,),
+        ).fetchone()
+        return row[0] if row else None
 
     def start(self, context: InvocationContext, role: str, provider: str,
               profile: ResolvedProfile, session_id: str | None, *,

@@ -18,6 +18,24 @@ PACKAGE = ROOT / "loop_manager_internal"
 
 
 class InternalPackageMigrationTests(unittest.TestCase):
+    def test_agent_services_import_without_loading_the_entry_point(self):
+        modules = (
+            'agent_profiles', 'agent_prompts', 'invocation_service', 'provider_adapters',
+            'scope_contracts', 'scope_observation', 'scope_validation',
+            'scope_lifecycle', 'scope_baseline', 'scope_recovery',
+        )
+        for module in modules:
+            with self.subTest(module=module):
+                result = subprocess.run(
+                    [sys.executable, '-I', '-B', '-c',
+                     "import importlib, sys; sys.path.insert(0, sys.argv[1]); "
+                     "importlib.import_module('loop_manager_internal.agents.' + sys.argv[2]); "
+                     "assert 'loop_manager' not in sys.modules",
+                     str(ROOT), module],
+                    capture_output=True, text=True, check=False, timeout=30,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_foundation_modules_import_without_loading_the_entry_point(self):
         modules = (
             "runtime.contracts", "runtime.process_lock", "runtime.runtime_identity",

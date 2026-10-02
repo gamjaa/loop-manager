@@ -7,6 +7,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from collections.abc import Callable
+import sqlite3
+import subprocess
 
 from loop_manager_internal.recovery import blocked_remote_observation as observations
 from loop_manager_internal.storage.blocked_checkpoint_state import BlockedCheckpointRepository
@@ -18,6 +21,7 @@ from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.notifications import notifications
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.execution.verify_process import VerifyTerminationUncertain
+from loop_manager_internal.agents.scope_contracts import GitSnapshot
 
 
 SCHEMA = """
@@ -86,8 +90,12 @@ def remote_adoption_is_current(checkpoint) -> bool:
                 and accepted.get('head') != adopted.get('head'))
 
 
-def validated_scope_refs(ports, connection, repo_path, repo, base, plan_id,
-                         before, result, current) -> frozenset[str]:
+def validated_scope_refs(
+    connection: sqlite3.Connection, repo_path: Path, repo: str, base: str,
+    plan_id: str | None, before: GitSnapshot, result: GitSnapshot | None,
+    current: GitSnapshot, *, git: Callable[..., subprocess.CompletedProcess[str]],
+    github_repository: Callable[[str], str], owned_remote_oid: Callable[..., str | None],
+) -> frozenset[str]:
     """Classify post-Agent tracking updates, never approve a remote adoption.
 
     A published tracking OID remains Manager-owned when origin has a newer
@@ -122,8 +130,8 @@ def validated_scope_refs(ports, connection, repo_path, repo, base, plan_id,
         return frozenset()
     allowed = set()
     try:
-        origin = ports.git(repo_path, 'remote', 'get-url', 'origin').stdout.strip()
-        if origin != row['origin_url'] or ports.github_repository(origin) != project['origin']:
+        origin = git(repo_path, 'remote', 'get-url', 'origin').stdout.strip()
+        if origin != row['origin_url'] or github_repository(origin) != project['origin']:
             return frozenset()
         live_base, live_branch = observations.observe_refs(repo_path, origin, (row['base_ref'], row['branch_ref']))
         if (base_ref in candidates and row['base_result'] == 'present'
@@ -135,9 +143,9 @@ def validated_scope_refs(ports, connection, repo_path, repo, base, plan_id,
                 and tracked is not None and not tracked[1]
                 and current.branch == plan['branch']
                 and current.refs.get(f"refs/heads/{plan['branch']}") == (current.head, '')
-                and ports.checkpoint_ownership.owned_remote_oid(
+                and owned_remote_oid(
                     connection, repo_path, repo, plan_id, plan['branch'], Path(plan['worktree']),
-                    tracked[0], ports.git, before_head=current.head,
+                    tracked[0], git, before_head=current.head,
                     recorded_oid=plan['publication_remote_oid'], require_live=False) == tracked[0]):
             allowed.add(branch_ref)
     except (OSError, RuntimeError, ValueError):

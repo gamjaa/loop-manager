@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 import re
+import subprocess
 from typing import Callable
 
 from loop_manager_internal.agents.agent_write_isolation import IsolationEvidence
@@ -185,3 +186,91 @@ class TrackedAgentCall:
 
     def __call__(self, session_id: str | None, fallback: bool):
         return self.invoke(session_id, fallback, self.attempts.next(session_id, fallback))
+
+
+MAX_TRANSIENT_AGENT_RETRIES = 3
+
+def session_resume_unavailable(message: str) -> bool:
+    if approval_policy_failure(message):
+        return False
+    normalized = " ".join(message.casefold().split())
+    return bool(
+        re.search(
+            r"(?:session|thread|rollout).{0,80}(?:not found|does not exist|expired)",
+            normalized,
+        )
+    ) or any(
+        phrase in normalized
+        for phrase in (
+            "unknown session",
+            "unknown thread",
+            "cannot resume",
+            "could not resume",
+            "unable to resume",
+        )
+    )
+
+
+def _coerce_agent_result(
+    result: tuple[int, str] | AgentResult,
+    session_id: str | None,
+) -> AgentResult:
+    if isinstance(result, AgentResult):
+        return result
+    code, message = result
+    return AgentResult(code, message, session_id)
+
+
+def run_agent_with_retries(
+    invoke: Callable[[str | None, bool], tuple[int, str] | AgentResult],
+    *,
+    session_id: str | None,
+) -> AgentResult:
+    """Retry transient CLI failures and replace an unavailable saved session once."""
+
+    active_session_id = session_id
+    transient_retries = 0
+    session_fallback = False
+    while True:
+        try:
+            raw_result = invoke(active_session_id, session_fallback)
+            result = _coerce_agent_result(raw_result, active_session_id)
+        except subprocess.TimeoutExpired as error:
+            result = AgentResult(
+                1,
+                f"Agent CLI timeout: {error}",
+                active_session_id,
+                AgentResultKind.TRANSIENT_FAILURE,
+            )
+        except OSError as error:
+            result = AgentResult(
+                1,
+                f"Agent CLI 실행 실패: {error}",
+                active_session_id,
+                AgentResultKind.TRANSIENT_FAILURE,
+            )
+
+        if result.session_id:
+            active_session_id = result.session_id
+        if result.result_kind is AgentResultKind.SUCCESS:
+            return result
+        if approval_policy_failure(result.message):
+            return replace(result, kind=AgentResultKind.PERMANENT_CONFIGURATION)
+        if isinstance(invoke, TrackedAgentCall):
+            invoke.attempts.previous_failure = result.ledger_kind
+        if (
+            result.result_kind is not AgentResultKind.USAGE_LIMIT
+            and active_session_id is not None
+            and not session_fallback
+            and session_resume_unavailable(result.message)
+        ):
+            active_session_id = None
+            session_fallback = True
+            continue
+        if (
+            result.result_kind is AgentResultKind.TRANSIENT_FAILURE
+            and transient_retries < MAX_TRANSIENT_AGENT_RETRIES
+        ):
+            transient_retries += 1
+            continue
+        return result

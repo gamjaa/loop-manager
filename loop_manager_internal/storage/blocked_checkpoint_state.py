@@ -107,6 +107,13 @@ def request_identity(
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+def scope_request_row(connection: sqlite3.Connection, repo: str, plan_id: str) -> sqlite3.Row | None:
+    """Observe scope publication identity without initializing checkpoint schema."""
+    return connection.execute(
+        "SELECT * FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?", (repo, plan_id),
+    ).fetchone()
+
+
 class BlockedCheckpointRepository:
     def __init__(self, connection: sqlite3.Connection):
         self.connection = connection
