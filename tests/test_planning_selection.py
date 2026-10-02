@@ -169,15 +169,47 @@ class PlanningSelectionTest(PlanningCase):
             planner_session_id="saved-session",
         )
         ports = FakePorts(before, cycle)
+        ports.git.remote = "advanced-base"
         for _ in range(4):
             outcome = PlanningLifecycleCoordinator(ports).run(
                 replace(self.context, base_sha="advanced-base")
             )
             self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
-            self.assertEqual(ports.state.snapshot, before)
-            self.assertEqual(ports.state.cycle, cycle)
+            self.assertEqual(ports.state.snapshot.active_sha, "advanced-base")
+            self.assertEqual(ports.state.snapshot.worktree, before.worktree)
+            self.assertEqual(ports.state.snapshot.planning_error, before.planning_error)
+            self.assertEqual(ports.state.snapshot.planner_session_id, "saved-session")
+            self.assertEqual(ports.state.snapshot.planning_attempt_fingerprint, fingerprint)
+            self.assertEqual(ports.state.cycle.cycle_base_sha, "advanced-base")
+            self.assertEqual(ports.state.clear_calls, [])
         self.assertEqual(ports.agent.run_count, 0)
-        self.assertEqual(ports.git.ownership_checks, [])
+        self.assertEqual(ports.git.ownership_checks,
+                         [("/repo", fingerprint, Path("/planning"))])
+
+    def test_maintenance_mode_error_survives_base_and_source_advance(self):
+        cycle = maintenance_cycle(
+            phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+            cycle_base_sha="base", revision=4,
+        )
+        ports = FakePorts(planning_snapshot(
+            phase="PLANNING", active_sha="base", worktree="/planning",
+            planning_attempt_fingerprint=maintenance_planning_fingerprint(cycle, "old-input"),
+            planning_workspace_owned=1, planning_error="mode requires user action",
+            planning_error_fingerprint="maintenance-cycle:assessment:4",
+            planner_session_id="saved-session",
+        ), cycle)
+        ports.git.remote = "advanced-base"
+        ports.git.fingerprints = {"base": "old-input", "advanced-base": "new-input"}
+
+        for _ in range(2):
+            outcome = PlanningLifecycleCoordinator(ports).run(
+                replace(self.context, base_sha="advanced-base"),
+            )
+            self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+            self.assertEqual(ports.state.snapshot.active_sha, "advanced-base")
+            self.assertEqual(ports.state.snapshot.planning_error, "mode requires user action")
+        self.assertEqual(ports.agent.run_count, 0)
+        self.assertEqual(ports.state.clear_calls, [])
 
     def test_failed_maintenance_input_restarts_after_related_source_change(self):
         cycle = maintenance_cycle(
@@ -194,19 +226,36 @@ class PlanningSelectionTest(PlanningCase):
             planning_workspace_owned=1,
             planning_error="saved maintenance failure",
             planning_error_fingerprint=fingerprint,
+            planner_session_id="saved-session",
         ), cycle)
         ports.git.fingerprints = {"base": "old-input", "advanced-base": "new-input"}
+        ports.git.remote = "advanced-base"
+        ports.validation.prepare_maintenance_context = mock.Mock(return_value=object())
+        ports.validation.maintenance_change_context = mock.Mock(return_value="source changed")
+        ports.validation.maintenance_prompt = mock.Mock(return_value="correct the saved failure")
+        ports.agent.result = PlanningAgentResult(
+            1, "same failure", "saved-session", PlanningAgentResultKind.TRANSIENT_FAILURE,
+        )
 
         outcome = PlanningLifecycleCoordinator(ports).run(
             replace(self.context, base_sha="advanced-base")
         )
 
-        self.assertEqual(outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.TRANSIENT_PAUSE)
         self.assertEqual(ports.git.ownership_checks,
                          [("/repo", fingerprint, Path("/planning"))])
-        self.assertIsNone(ports.state.snapshot.planning_error)
+        self.assertEqual(ports.state.snapshot.planning_error, "saved maintenance failure")
+        self.assertEqual(ports.state.snapshot.active_sha, "advanced-base")
+        self.assertEqual(ports.state.snapshot.worktree, "/planning")
+        self.assertEqual(ports.state.clear_calls, [])
         self.assertEqual(ports.state.cycle.cycle_base_sha, "advanced-base")
-        self.assertEqual(ports.agent.run_count, 0)
+        self.assertEqual(ports.agent.run_count, 1)
+        self.assertEqual(ports.agent.resumed_session, "saved-session")
+        repeated = PlanningLifecycleCoordinator(ports).run(
+            replace(self.context, base_sha="advanced-base"),
+        )
+        self.assertEqual(repeated.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+        self.assertEqual(ports.agent.run_count, 1)
 
     def test_specification_change_plans_once_before_runnable_ready(self):
         ports = FakePorts(
@@ -373,18 +422,29 @@ class PlanningSelectionTest(PlanningCase):
         )
         ports.state.activate_result = object()
         ports.validation.result = None
-        ports.git.remote = "new-base"
         ports.git.specification_fingerprints["new-base"] = "new-specification"
         ports.git.fingerprints["new-base"] = "new-full"
 
+        ports.git.relevant_document_changes = mock.Mock(return_value=("docs/PRODUCT.md",))
+        original_planner = ports.agent.run_planner
+
+        def advance_after_planner(*args):
+            result = original_planner(*args)
+            ports.git.remote = "new-base"
+            return result
+
+        ports.agent.run_planner = advance_after_planner
         first = PlanningLifecycleCoordinator(ports).run(self.context)
 
-        self.assertEqual(first.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
-        self.assertIsNone(ports.state.snapshot.phase)
+        self.assertEqual(first.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED)
+        self.assertEqual(ports.state.snapshot.phase, "PLANNING")
         self.assertEqual(ports.agent.run_count, 1)
         self.assertEqual(
-            ports.state.snapshot.specification_fingerprint, "specification"
+            ports.state.snapshot.specification_fingerprint, "old-specification"
         )
+        self.assertEqual(ports.state.snapshot.planner_session_id, "session-1")
+        self.assertTrue(ports.state.snapshot.planning_result_completed)
+        self.assertEqual(ports.state.clear_calls, [])
 
         ports.git.head = "new-base"
         second = PlanningLifecycleCoordinator(ports).run(
@@ -393,10 +453,107 @@ class PlanningSelectionTest(PlanningCase):
 
         self.assertEqual(second.kind, PlanningOutcomeKind.EXECUTION_READY)
         self.assertEqual(ports.agent.run_count, 2)
+        self.assertEqual(ports.agent.resumed_session, "session-1")
         self.assertEqual(
             ports.state.snapshot.specification_fingerprint,
             "new-specification",
         )
+
+    def test_unrelated_remote_change_reuses_completed_no_change_result_after_pause(self):
+        ports = FakePorts(planning_snapshot(planning_fingerprint="old-input"))
+        ports.validation.result = None
+        ports.git.fingerprints["new-base"] = "new-input"
+        original_planner = ports.agent.run_planner
+
+        def advance_after_planner(*args):
+            result = original_planner(*args)
+            ports.git.remote = "new-base"
+            return result
+
+        ports.agent.run_planner = advance_after_planner
+        coordinator = PlanningLifecycleCoordinator(ports)
+        first = coordinator.run(self.context)
+        preserved = ports.state.snapshot
+
+        self.assertEqual(first.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED)
+        self.assertEqual(preserved.phase, "PLANNING")
+        self.assertTrue(preserved.planning_result_completed)
+        self.assertEqual(ports.state.clear_calls, [])
+        second = coordinator.run(replace(self.context, base_sha="new-base"))
+
+        self.assertEqual(second.kind, PlanningOutcomeKind.NO_CHANGE)
+        self.assertEqual(ports.agent.run_count, 1)
+        self.assertEqual(ports.state.snapshot.processed_sha, "new-base")
+        self.assertEqual(ports.state.snapshot.planning_fingerprint, "new-input")
+
+    def test_failed_input_correction_resumes_after_base_adoption_before_agent(self):
+        ports = FakePorts(planning_snapshot(
+            phase="PLANNING", active_sha="base", worktree="/planning",
+            planning_attempt_fingerprint="old-input", planning_workspace_owned=1,
+            planning_error="saved failure", planning_error_fingerprint="old-input",
+            planner_session_id="saved-session", planning_retry_count=3,
+            planning_validation_error="saved failure",
+        ))
+        ports.git.fingerprints = {"base": "old-input", "new-base": "new-input"}
+        ports.git.remote = "new-base"
+        ports.agent.result = PlanningAgentResult(
+            1, "same failure", "saved-session", PlanningAgentResultKind.TRANSIENT_FAILURE,
+        )
+        coordinator = PlanningLifecycleCoordinator(ports)
+        prepared = coordinator._workspace._prepare_workspace(coordinator._new_run(self.context))
+
+        self.assertIsNone(prepared)
+        self.assertEqual(ports.agent.run_count, 0)
+        self.assertEqual(ports.state.snapshot.active_sha, "new-base")
+        self.assertEqual(ports.state.snapshot.planning_error, "saved failure")
+        self.assertEqual(ports.state.snapshot.planning_error_fingerprint, "new-input")
+        self.assertTrue(ports.state.snapshot.planning_result_pending_validation)
+        self.assertEqual(ports.state.snapshot.planning_retry_count, 0)
+        resumed = PlanningLifecycleCoordinator(ports).run(
+            replace(self.context, base_sha="new-base"),
+        )
+
+        self.assertEqual(resumed.kind, PlanningOutcomeKind.TRANSIENT_PAUSE)
+        self.assertEqual(ports.agent.resumed_session, "saved-session")
+        self.assertEqual(ports.agent.run_count, 1)
+        self.assertEqual(ports.state.snapshot.planning_error, "saved failure")
+        self.assertEqual(ports.state.clear_calls, [])
+
+    def test_related_document_correction_survives_interruption_before_planner(self):
+        ports = FakePorts(planning_snapshot(
+            phase="PLANNING", active_sha="base", worktree="/planning",
+            planning_attempt_fingerprint="old-input", planning_workspace_owned=1,
+            planning_error="saved failure", planning_error_fingerprint="old-input",
+            planner_session_id="saved-session", planning_retry_count=3,
+            planning_validation_error="saved failure", planning_result_completed=True,
+            planning_result="saved result",
+        ))
+        ports.git.fingerprints = {"base": "old-input", "new-base": "new-input"}
+        ports.git.remote = "new-base"
+        ports.git.relevant_document_changes = mock.Mock(return_value=("docs/PRODUCT.md",))
+        ports.agent.result = PlanningAgentResult(
+            1, "same failure", "saved-session", PlanningAgentResultKind.TRANSIENT_FAILURE,
+        )
+        coordinator = PlanningLifecycleCoordinator(ports)
+        self.assertIsNone(coordinator._workspace._prepare_workspace(coordinator._new_run(self.context)))
+        preserved = ports.state.snapshot
+
+        self.assertEqual(ports.agent.run_count, 0)
+        self.assertEqual(preserved.active_sha, "new-base")
+        self.assertEqual(preserved.planning_result, "saved result")
+        self.assertEqual(preserved.planning_error, preserved.planning_validation_error)
+        self.assertIn("docs/PRODUCT.md", preserved.planning_validation_error)
+        self.assertTrue(preserved.planning_result_pending_validation)
+        self.assertFalse(preserved.planning_result_completed)
+        resumed = PlanningLifecycleCoordinator(ports).run(
+            replace(self.context, base_sha="new-base"),
+        )
+
+        self.assertEqual(resumed.kind, PlanningOutcomeKind.TRANSIENT_PAUSE)
+        self.assertEqual(ports.agent.resumed_session, "saved-session")
+        self.assertEqual(ports.agent.run_count, 1)
+        self.assertEqual(ports.state.snapshot.planning_error, preserved.planning_error)
+        self.assertEqual(ports.state.clear_calls, [])
 
     def test_no_runnable_fallback_plans_once_then_stably_waits(self):
         ports = FakePorts(

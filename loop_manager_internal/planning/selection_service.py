@@ -18,6 +18,12 @@ class PlanningSelectionService(PlanningService):
 
         row = run.row
         if (row.phase == "PLANNING" and row.planning_workspace_owned == 1
+                and row.planning_result_pending_validation
+                and not row.planning_result_completed):
+            # Resume an already-authorized correction after an interruption;
+            # the failed-input gate still stops completed/exhausted attempts.
+            return None
+        if (row.phase == "PLANNING" and row.planning_workspace_owned == 1
                 and row.active_sha != run.base_sha):
             # A remote advance is handled in the owned workspace. Keep any
             # independent planning error until the preserved result is checked.
@@ -461,6 +467,8 @@ class PlanningSelectionService(PlanningService):
             and row.planning_error_fingerprint == run.current_fingerprint
             and not recoverable_publication
             and not run.error_input_changed
+            and not (row.planning_result_pending_validation
+                     and not row.planning_result_completed)
         ):
             self._ports.events.error(
                 f"계획 오류가 해결되지 않았습니다: {row.planning_error}\n"

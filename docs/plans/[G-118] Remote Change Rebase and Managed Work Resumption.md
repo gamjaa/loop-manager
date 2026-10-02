@@ -64,7 +64,11 @@ priority: critical
 
 루트 항목 추가·이동은 없으며 새 모듈과 테스트는 기존 패키지·테스트 경로에 둔다. Linux verify의 명시적 compile 대상에 새 모듈을 추가하고 전체 검증 실행은 Manager에 맡긴다. R-051은 사용자 지정 경로로 원문을 보존해 archive 이동한다.
 
-재개 후보의 관련 unit test 101개가 통과했다. 잠정 검토 재사용과 충돌하는 기존 cycle 변경 테스트를 갱신한 뒤 같은 명령을 재실행했다. `test_planning_error_recovery.py`의 프로젝트 복구 시나리오는 폐기·새 세션 기대값을 보존·재개로 갱신했으며 통합 테스트 실행은 Manager 전체 verify에 남긴다. Worker는 전체 verify·Review·게시를 실행하지 않았다.
+첫 Worker 후보의 관련 unit test 101개가 통과했다. 잠정 검토 재사용과 충돌하는 기존 cycle 변경 테스트를 갱신한 뒤 같은 명령을 재실행했다. `test_planning_error_recovery.py`의 프로젝트 복구 시나리오는 폐기·새 세션 기대값을 보존·재개로 갱신했으며 통합 테스트 실행은 Manager 전체 verify에 남긴다. Worker는 전체 verify·Review·게시를 실행하지 않았다.
+
+Manager verify 피드백 6건에 따라 Windows verify에도 새 모듈을 등록하고 source-only 변경·planning 폐기·추가 호출의 기존 테스트 기대값을 재개 규칙에 맞췄다. 원격 base와 cycle revision만 전진하면 오류 입력을 현재 기준에 결합하되 Agent를 재호출하지 않는다. 관련 입력 교정은 기존 세션과 감사 자료를 유지하며, base 채택 뒤 호출 전 중단돼도 pending correction에서 이어간다. 유지보수 mode 오류는 실제 조건이 해소되기 전까지 보존한다.
+
+현재 후보의 planning 선택·execution 실패 정책·verify 목록 unit test는 실패 원인 수정 후 동일 명령으로 38개 통과했다. snapshot·staged/unstaged 중단 복구·잠정 검토 재사용·source-only gate의 개별 회귀 6개도 새로 실행해 통과했다. `test_catalog_scheduling.py`의 통합 시나리오는 no-change 결과와 세션을 보존하는 일시 중단·다음 실행 기대값으로 갱신했으며 Manager 전체 verify에서 실행한다.
 
 ## Decision Log
 
@@ -75,3 +79,4 @@ priority: critical
 
 - 2026-10-02: 사용자가 G-118의 ARCHITECTURE diff를 확인하고 반영을 승인했다. 이 정확한 문서 변경은 별도 사용자 결정 commit으로 게시하며 Worker는 해당 문서를 다시 수정하지 않는다. 기존 작업물·session과 범위 검사, Manager 전체 verify·Review 및 사용자 Merge 조건을 유지한다.
 - 2026-10-02: 재개 세션에서 현재 HEAD 대비 후보 전체를 재검토했다. prepared commit 위의 미커밋 변경은 rebased commit에 먼저 복원하고 soft reset으로 검증 후보를 구성해 staged·unstaged 구분을 보존한다. stash apply·reset 직후 중단, 완료된 no-change 호출 재사용과 내용 보존 ExecPlan 이동을 targeted unit test로 검증한다. 보존 stash는 SQLite의 새 base 확정과 작업물 identity 확인 뒤에만 제거한다.
+- 2026-10-02: verify 피드백 대응에서 실패의 내용 identity와 maintenance cycle/base identity를 분리했다. 동일 입력의 오류는 새 base 채택 후에도 재시도 gate에 남기고 원래 fingerprint는 진단으로 보존한다. 관련 입력 변경으로 허용된 교정은 pending validation에 기록해 호출 전 중단을 복구하며, 원격 반영만으로 mode 오류나 독립 차단을 해제하지 않는다.
