@@ -1395,6 +1395,7 @@ class FileReviewLedgerTest(unittest.TestCase):
             str(self.repo), include_retired=True,
         )}
         self.assertFalse(retired["src/alpha.go"].active)
+        self.assertEqual(self.ledger.root_placements(str(self.repo)), ())
         self.write("src/alpha.go", b"package alpha\n")
         returned_source = self.publish()
         returned_inventory = self.inventory(returned_source)

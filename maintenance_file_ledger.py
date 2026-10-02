@@ -193,8 +193,6 @@ class FileReviewRepository:
         ):
             raise FileReviewLedgerError("평가 후 원격 파일 목록 또는 내용이 변경됐습니다.")
         placements = root_placement_inventory(current)
-        if not placements:
-            raise FileReviewLedgerError("평가할 루트 항목이 없습니다.")
         with _transaction(self.connection):
             selected = self.selected_sources(repo, inventory)
             if len(reviewed) != len(selected):
