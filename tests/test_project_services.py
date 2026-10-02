@@ -6,6 +6,7 @@ from dataclasses import fields
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -17,6 +18,32 @@ from tests.support.database import runtime_connection
 
 
 class ProjectServiceCompositionTests(unittest.TestCase):
+    def test_relocated_workspace_boundary_accepts_owned_path_and_rejects_mismatch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / 'state'
+            expected = state / 'worktree'
+            loop_manager._validate_managed_path_boundary(state, expected, expected, 'Worker')
+            with self.assertRaisesRegex(loop_manager.WorkspaceOwnershipError, '결정적 소유 경계'):
+                loop_manager._validate_managed_path_boundary(state, state / 'other', expected, 'Worker')
+
+    def test_relocated_workspace_boundary_rejects_symlink_escape_without_changing_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / 'state'
+            state.mkdir()
+            outside = Path(temporary) / 'outside'
+            outside.mkdir()
+            preserved = outside / 'user.txt'
+            preserved.write_text('preserved', encoding='utf-8')
+            worktree = state / 'worktree'
+            try:
+                worktree.symlink_to(outside, target_is_directory=True)
+            except (OSError, NotImplementedError) as error:
+                self.skipTest(f'symlink creation is unavailable: {error}')
+            with self.assertRaisesRegex(loop_manager.WorkspaceOwnershipError, '상태 디렉터리 밖'):
+                loop_manager._validate_managed_path_boundary(state, worktree, worktree, 'Worker')
+            self.assertTrue(worktree.is_symlink())
+            self.assertEqual(preserved.read_text(encoding='utf-8'), 'preserved')
+
     def test_root_contains_only_cli_definitions_and_public_composition(self):
         tree = ast.parse(Path(loop_manager.__file__).read_text(encoding='utf-8'))
         definitions = [node.name for node in tree.body

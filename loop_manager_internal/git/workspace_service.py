@@ -1,9 +1,11 @@
-"""agents scope adapter boundaries and named composition effects."""
+"""Workspace ownership boundaries and named composition effects."""
 from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from loop_manager_internal.git import workspace
+from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
 from pathlib import Path
+import os
 
 
 @dataclass(frozen=True)
@@ -218,5 +220,3 @@ def validate_execplan_workspace_identity(
     worktree: Path,
 ) -> None:
     return workspace.validate_execplan_workspace_identity(effects._workspace_effects_validate_execplan_workspace_identity(), state_dir, repo, plan_id, branch, worktree)
-
-
