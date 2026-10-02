@@ -2,7 +2,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-import agent_scope_decision as decision
+from loop_manager_internal.agents import agent_scope_decision as decision
 from loop_manager import GitSnapshot, ManagerGitCheckpoint, AgentScopeError, validate_agent_scope
 
 

@@ -2,7 +2,7 @@ from dataclasses import FrozenInstanceError
 from pathlib import Path
 import unittest
 
-from execution_runtime import (
+from loop_manager_internal.execution.execution_runtime import (
     ExecutionContext,
     ExecutionOutcome,
     ExecutionOutcomeKind,
@@ -11,7 +11,7 @@ from execution_runtime import (
     ExecutionPlanMetadata,
 )
 import loop_manager
-from recovery_runtime import (
+from loop_manager_internal.recovery.recovery_runtime import (
     RecoveryFailure, RecoveryObservation, RecoveryReason, decide,
 )
 

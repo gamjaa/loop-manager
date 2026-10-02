@@ -8,10 +8,10 @@ import unittest
 from unittest import mock
 
 from loop_manager import _worker_path_allowed, capture_git_snapshot
-from managed_rebase_observation import (
+from loop_manager_internal.git.managed_rebase_observation import (
     ObservationAdapters, observe_current_rebase, parse_index, parse_raw_changes,
 )
-from managed_rebase_validation import (
+from loop_manager_internal.git.managed_rebase_validation import (
     FileChange, IndexEntry, ObservationFailure, PullRequest, RebaseExpectation,
     RebaseObservation, RebaseStatus, Remote, WorktreeFile,
     assess_current_rebase, assess_scope, valid_acceptance,

@@ -10,8 +10,8 @@ import time
 import unittest
 from unittest import mock
 
-import verify_process
-from verify_process import (
+from loop_manager_internal.execution import verify_process
+from loop_manager_internal.execution.verify_process import (
     _confirm_posix_group_stopped, _linux_group_has_live_members,
     _stop_linux_tree, _wait_linux_process_stopped,
     run_verify_process, VerifyTerminationUncertain,
@@ -30,15 +30,15 @@ class VerifyProcessTests(unittest.TestCase):
                 else {101: 1, 102: 2}
             )
 
-        with mock.patch("verify_process.os.killpg") as group_signal, mock.patch(
-            "verify_process._linux_process_info", return_value=(1, 50, "R", 3)
+        with mock.patch("loop_manager_internal.execution.verify_process.os.killpg") as group_signal, mock.patch(
+            "loop_manager_internal.execution.verify_process._linux_process_info", return_value=(1, 50, "R", 3)
         ), mock.patch(
-            "verify_process._linux_descendants", side_effect=descendants
+            "loop_manager_internal.execution.verify_process._linux_descendants", side_effect=descendants
         ), mock.patch(
-            "verify_process._signal_linux_process",
+            "loop_manager_internal.execution.verify_process._signal_linux_process",
             side_effect=lambda pid, _started, _action: events.append(f"stop {pid}"),
         ), mock.patch(
-            "verify_process._wait_linux_process_stopped",
+            "loop_manager_internal.execution.verify_process._wait_linux_process_stopped",
             side_effect=lambda pid, _started, _deadline, **_kwargs: events.append(f"wait {pid}"),
         ):
             self.assertEqual(_stop_linux_tree(50), {101: 1, 102: 2})
@@ -51,15 +51,15 @@ class VerifyProcessTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux stop state assertion")
     def test_child_that_never_stops_fails_closed(self):
         with mock.patch(
-            "verify_process._linux_process_info", return_value=(1, 50, "R", 3)
-        ), mock.patch("verify_process.time.monotonic", return_value=2):
+            "loop_manager_internal.execution.verify_process._linux_process_info", return_value=(1, 50, "R", 3)
+        ), mock.patch("loop_manager_internal.execution.verify_process.time.monotonic", return_value=2):
             with self.assertRaisesRegex(VerifyTerminationUncertain, "PID 101"):
                 _wait_linux_process_stopped(101, 3, 1)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux subreaper assertion")
     def test_exited_subreaper_cannot_confirm_orphan_shutdown(self):
         with mock.patch(
-            "verify_process._linux_process_info", return_value=(1, 50, "Z", 3)
+            "loop_manager_internal.execution.verify_process._linux_process_info", return_value=(1, 50, "Z", 3)
         ):
             with self.assertRaisesRegex(VerifyTerminationUncertain, "PID 50"):
                 _wait_linux_process_stopped(50, 3, 1, required=True)
@@ -77,9 +77,9 @@ class VerifyProcessTests(unittest.TestCase):
 
     @unittest.skipIf(os.name == "nt", "POSIX process-group assertion")
     def test_live_group_after_kill_fails_closed(self):
-        with mock.patch('verify_process.os.killpg'), mock.patch(
-            'verify_process._linux_group_has_live_members', return_value=True
-        ), mock.patch('verify_process.time.monotonic', side_effect=(0, 3)):
+        with mock.patch('loop_manager_internal.execution.verify_process.os.killpg'), mock.patch(
+            'loop_manager_internal.execution.verify_process._linux_group_has_live_members', return_value=True
+        ), mock.patch('loop_manager_internal.execution.verify_process.time.monotonic', side_effect=(0, 3)):
             with self.assertRaisesRegex(VerifyTerminationUncertain, 'PGID 456'):
                 _confirm_posix_group_stopped(456)
 
@@ -220,7 +220,7 @@ class VerifyProcessTests(unittest.TestCase):
 
             try:
                 with mock.patch(
-                    "verify_process._signal_linux_process", side_effect=fork_before_stop,
+                    "loop_manager_internal.execution.verify_process._signal_linux_process", side_effect=fork_before_stop,
                 ):
                     passed, timed_out, output = run_verify_process(
                         [sys.executable, "-c", verify], root, 1,
@@ -242,9 +242,9 @@ class VerifyProcessTests(unittest.TestCase):
     @unittest.skipIf(os.name == "nt", "POSIX process-group assertion")
     def test_unconfirmed_group_kill_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            'verify_process.subprocess.Popen'
+            'loop_manager_internal.execution.verify_process.subprocess.Popen'
         ) as started, mock.patch(
-            'verify_process.os.killpg', side_effect=PermissionError('denied')
+            'loop_manager_internal.execution.verify_process.os.killpg', side_effect=PermissionError('denied')
         ):
             started.return_value.pid = 123
             started.return_value.wait.side_effect = subprocess.TimeoutExpired(
@@ -264,9 +264,9 @@ class VerifyProcessTests(unittest.TestCase):
         ), mock.patch.object(
             subprocess, 'CREATE_NEW_PROCESS_GROUP', 0x200, create=True
         ), mock.patch(
-            'verify_process.subprocess.Popen'
+            'loop_manager_internal.execution.verify_process.subprocess.Popen'
         ) as started, mock.patch(
-            'verify_process.subprocess.run'
+            'loop_manager_internal.execution.verify_process.subprocess.run'
         ) as taskkill:
             started.return_value.pid = 123
             started.return_value.poll.return_value = 0

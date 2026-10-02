@@ -2,7 +2,7 @@
 
 import unittest
 
-import requirement_archive as archive
+from loop_manager_internal.catalog import requirement_archive as archive
 
 
 SOURCE = "docs/requirements/Feature.md"

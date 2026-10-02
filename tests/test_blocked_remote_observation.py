@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-import blocked_remote_observation as observation
+from loop_manager_internal.recovery import blocked_remote_observation as observation
 import loop_manager
 
 

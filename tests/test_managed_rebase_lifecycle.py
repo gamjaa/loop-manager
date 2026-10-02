@@ -15,15 +15,15 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest import mock
 
-import blocked_checkpoint
-import execution_handlers as handlers
-from execution_checkpoint_state import ExecutionCheckpointRepository
-from execution_runtime import ExecutionOutcome, ExecutionPhase
-from execution_state import ExecutionStatePort
+from loop_manager_internal.recovery import blocked_checkpoint
+from loop_manager_internal.execution import execution_handlers as handlers
+from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+from loop_manager_internal.execution.execution_runtime import ExecutionOutcome, ExecutionPhase
+from loop_manager_internal.execution.execution_state import ExecutionStatePort
 import loop_manager as lm
-import manager_git_journal as journal
-import runtime_state
-from worker_session import SessionBinding
+from loop_manager_internal.git import manager_git_journal as journal
+from loop_manager_internal.storage import runtime_state
+from loop_manager_internal.execution.worker_session import SessionBinding
 from tests import test_execution_handlers as policy_fixture
 
 

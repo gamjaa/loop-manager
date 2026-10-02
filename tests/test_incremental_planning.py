@@ -8,9 +8,9 @@ import unittest
 from unittest import mock
 
 import loop_manager
-import maintenance_state
-from maintenance_planning import PlanRevision, ReadyPlanSnapshot
-from planning_catalog import PlanDeletion, MutableReadySnapshot, mutable_snapshot_token
+from loop_manager_internal.storage import maintenance_state
+from loop_manager_internal.maintenance.maintenance_planning import PlanRevision, ReadyPlanSnapshot
+from loop_manager_internal.planning.planning_catalog import PlanDeletion, MutableReadySnapshot, mutable_snapshot_token
 
 
 def git(repo: Path, *arguments: str) -> str:

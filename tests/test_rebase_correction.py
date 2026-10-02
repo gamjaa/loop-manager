@@ -4,7 +4,7 @@ from unittest import TestCase
 from unittest import mock
 from types import SimpleNamespace
 
-from rebase_correction import (
+from loop_manager_internal.git.rebase_correction import (
     ConflictObservation, CorrectionAction, CorrectionSource, execute_git_step,
     next_action, stage_evidence_preserved,
     parse_unmerged,

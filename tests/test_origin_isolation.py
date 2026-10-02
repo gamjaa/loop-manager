@@ -9,10 +9,10 @@ import unittest
 from unittest import mock
 
 import loop_manager
-import manager_git_journal
-import agent_invocation_state
-from agent_invocation import InvocationContext, ResolvedProfile, Usage
-from agent_write_isolation import IsolationEvidence, inspect_worktree
+from loop_manager_internal.git import manager_git_journal
+from loop_manager_internal.storage import agent_invocation_state
+from loop_manager_internal.agents.agent_invocation import InvocationContext, ResolvedProfile, Usage
+from loop_manager_internal.agents.agent_write_isolation import IsolationEvidence, inspect_worktree
 
 
 def git(repo: Path, *arguments: str) -> str:
@@ -2229,7 +2229,7 @@ class ManagerBaselineReconciliationUnitTests(unittest.TestCase):
 
     def test_archive_push_keeps_tracking_ref_for_owned_fetch_and_later_scope_refresh(self):
         from types import SimpleNamespace
-        import execplan_archive
+        from loop_manager_internal.catalog import execplan_archive
 
         self.record_fetch()
         commit = 'c' * 40

@@ -2,7 +2,7 @@ import re
 import unittest
 
 import loop_manager as lm
-from validation_feedback import (MAX_DIAGNOSTIC, format_verify_failure,
+from loop_manager_internal.execution.validation_feedback import (MAX_DIAGNOSTIC, format_verify_failure,
                                  is_validation_error, normalize_feedback,
                                  redact_secrets, render_delta)
 

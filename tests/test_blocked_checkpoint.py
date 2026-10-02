@@ -7,17 +7,17 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-import blocked_checkpoint
-import blocked_checkpoint_state
-import execution_checkpoint_state
+from loop_manager_internal.recovery import blocked_checkpoint
+from loop_manager_internal.storage import blocked_checkpoint_state
+from loop_manager_internal.storage import execution_checkpoint_state
 import loop_manager
-import notifications
-import runtime_state
-import scoped_blocking
-import checkpoint_ownership
-import blocked_plan_reconciliation
-from scoped_blocking import BlockReasonCode
-from worker_session import SessionBinding
+from loop_manager_internal.notifications import notifications
+from loop_manager_internal.storage import runtime_state
+from loop_manager_internal.recovery import scoped_blocking
+from loop_manager_internal.recovery import checkpoint_ownership
+from loop_manager_internal.recovery import blocked_plan_reconciliation
+from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
+from loop_manager_internal.execution.worker_session import SessionBinding
 
 
 class BlockedCheckpointRefreshUnitTests(unittest.TestCase):
@@ -729,7 +729,7 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
         self.assertEqual((self.worktree / 'code.py').read_text(), 'manual resolution\n')
 
     def test_clean_checkpoint_identity_survives_reclassification(self):
-        import checkpoint_ownership
+        from loop_manager_internal.recovery import checkpoint_ownership
         repo = str(self.repo.resolve())
         store = blocked_checkpoint_state.BlockedCheckpointRepository(self.connection)
         request = self.block()

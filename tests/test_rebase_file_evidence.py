@@ -6,9 +6,9 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-import manager_git_journal as journal
-import rebase_file_evidence as files
-from execution_checkpoint import rebase_preserves_worktree_files
+from loop_manager_internal.git import manager_git_journal as journal
+from loop_manager_internal.git import rebase_file_evidence as files
+from loop_manager_internal.execution.execution_checkpoint import rebase_preserves_worktree_files
 
 
 def evidence(base, local, signature):
@@ -108,7 +108,7 @@ class AutostashFileEvidenceTests(unittest.TestCase):
 
     def test_both_rebase_snapshot_paths_capture_file_evidence(self):
         import loop_manager
-        from execution_handlers import ExecutionHandlers
+        from loop_manager_internal.execution.execution_handlers import ExecutionHandlers
 
         worktree = Path('/owned')
         branch = 'loop-manager/G-091'

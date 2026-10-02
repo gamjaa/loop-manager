@@ -4,7 +4,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 import unittest
 
-from publication_resume import (
+from loop_manager_internal.execution.publication_resume import (
     PublicationNext, PublicationObservation, PublicationResume,
     assess_publication,
 )

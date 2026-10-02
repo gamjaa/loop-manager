@@ -3,9 +3,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-import execplan_archive
-import execplan_archive_state
-import execplan_catalog
+from loop_manager_internal.catalog import execplan_archive
+from loop_manager_internal.storage import execplan_archive_state
+from loop_manager_internal.catalog import execplan_catalog
 import loop_manager
 
 

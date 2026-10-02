@@ -9,21 +9,21 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
-import document_drafts
-import document_publication
-import execplan_catalog
-import full_assessment
-import execplan_catalog_state
+from loop_manager_internal.documents import document_drafts
+from loop_manager_internal.documents import document_publication
+from loop_manager_internal.catalog import execplan_catalog
+from loop_manager_internal.maintenance import full_assessment
+from loop_manager_internal.storage import execplan_catalog_state
 import loop_manager
-import maintenance_planning
-import maintenance_findings
-import maintenance_file_inventory
-import maintenance_file_ledger
-import maintenance_file_publication
-import maintenance_reconciliation
-import maintenance_state
-from maintenance_file_inventory import SourceInventory, TrackedSource
-from planning_catalog import MutableReadySnapshot, mutable_snapshot_token
+from loop_manager_internal.maintenance import maintenance_planning
+from loop_manager_internal.maintenance import maintenance_findings
+from loop_manager_internal.maintenance import maintenance_file_inventory
+from loop_manager_internal.storage import maintenance_file_ledger
+from loop_manager_internal.maintenance import maintenance_file_publication
+from loop_manager_internal.maintenance import maintenance_reconciliation
+from loop_manager_internal.storage import maintenance_state
+from loop_manager_internal.maintenance.maintenance_file_inventory import SourceInventory, TrackedSource
+from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot, mutable_snapshot_token
 
 
 def git(repo: Path, *arguments: str) -> str:

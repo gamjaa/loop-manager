@@ -19,11 +19,11 @@ from types import SimpleNamespace
 from unittest import mock
 
 import loop_manager
-import scoped_blocking
-import execplan_catalog
-from execution_revision import DefinitionSnapshot
-from worker_outcome import parse_worker_outcome
-from worker_session import SessionBinding
+from loop_manager_internal.recovery import scoped_blocking
+from loop_manager_internal.catalog import execplan_catalog
+from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
+from loop_manager_internal.execution.worker_outcome import parse_worker_outcome
+from loop_manager_internal.execution.worker_session import SessionBinding
 
 
 _real_agent_profile = loop_manager._agent_profile
@@ -2224,24 +2224,34 @@ class ProjectDiagnosticPublicationUnitTests(unittest.TestCase):
 
     def test_planner_import_fixture_contains_direct_manager_modules(self):
         import ast
-        import inspect
-        import textwrap
-        fixture = ast.parse(textwrap.dedent(inspect.getsource(
-            AgentScopeValidatorTest.test_planner_import_bytecode_is_ignored_without_hiding_scope_violations)))
-        copied = next(node.iter for node in ast.walk(fixture)
-                      if isinstance(node, ast.For) and isinstance(node.target, ast.Name)
-                      and node.target.id == 'module_name')
-        modules = {node.value for node in copied.elts}
         manager = ast.parse(Path(loop_manager.__file__).read_text(encoding='utf-8'))
         imports = set()
         for node in manager.body:
             if isinstance(node, ast.Import):
-                imports.update(alias.name.split('.')[0] for alias in node.names)
+                imports.update(alias.name for alias in node.names)
             elif isinstance(node, ast.ImportFrom) and node.module:
-                imports.add(node.module.split('.')[0])
-        required = {name + '.py' for name in imports
-                    if (Path(loop_manager.__file__).parent / (name + '.py')).is_file()}
-        self.assertFalse(required - modules, required - modules)
+                imports.add(node.module)
+                imports.update(node.module + '.' + alias.name for alias in node.names)
+        required = {Path('loop_manager.py')}
+        for name in imports:
+            module_path = Path(*name.split('.'))
+            for path in (module_path.with_suffix('.py'), module_path / '__init__.py'):
+                if (loop_manager.ROOT / path).is_file():
+                    required.add(path)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = AgentScopeValidatorTest(
+                'test_planner_import_bytecode_is_ignored_without_hiding_scope_violations')
+            # Reuse the actual copy setup; stop before its Git/scope scenario starts.
+            with (mock.patch.object(fixture, '_repository_with_plan', return_value=(root, None)),
+                  mock.patch.object(sys.modules[fixture.__module__], 'commit_and_push',
+                                    side_effect=StopIteration('fixture copied')),
+                  self.assertRaisesRegex(StopIteration, '^fixture copied$')):
+                fixture.test_planner_import_bytecode_is_ignored_without_hiding_scope_violations()
+            for path in required:
+                with self.subTest(module=path):
+                    self.assertTrue((root / path).is_file())
+                    self.assertEqual((root / path).read_bytes(), (loop_manager.ROOT / path).read_bytes())
 
     def test_missing_origin_keeps_local_only_scope_and_mismatched_push_url_is_rejected(self):
         connection = mock.Mock()
@@ -2344,7 +2354,7 @@ class ProjectDiagnosticPublicationUnitTests(unittest.TestCase):
         connection.execute("INSERT INTO project_blocks (repo, scope, reason_code, plan_id, evidence) "
                            "VALUES ('repo', 'project', 'publication_ownership_uncertain', 'G-107', 'cause')")
         connection.commit()
-        with (mock.patch('execution_state.DirectRebasePublicationStatePort'),
+        with (mock.patch('loop_manager_internal.execution.execution_state.DirectRebasePublicationStatePort'),
               mock.patch.object(loop_manager.managed_rebase_publication, 'publish_checkpoint') as publish,
               mock.patch.object(loop_manager, 'git') as git):
             loop_manager._publish_direct_rebase_checkpoint(connection, Path('/repo'), Path('/state'),
@@ -4940,7 +4950,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
 
     def test_verify_port_uses_supplied_timeout_without_rereading_config(self):
         from tests.test_runtime_state import RuntimeStateRepositoryTest
-        import runtime_state
+        from loop_manager_internal.storage import runtime_state
 
         connection = RuntimeStateRepositoryTest()._connection()
         self.addCleanup(connection.close)
@@ -5434,7 +5444,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
 
     def test_remote_checkpoint_reviewer_specification_skips_fail_fingerprint(self):
         from tests.test_runtime_state import RuntimeStateRepositoryTest
-        import runtime_state
+        from loop_manager_internal.storage import runtime_state
 
         connection = RuntimeStateRepositoryTest()._connection()
         self.addCleanup(connection.close)
@@ -5483,11 +5493,11 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         fingerprint.assert_not_called()
 
     def test_remote_checkpoint_new_review_failure_uses_existing_run_budget(self):
-        import blocked_checkpoint_state
-        import runtime_state
+        from loop_manager_internal.storage import blocked_checkpoint_state
+        from loop_manager_internal.storage import runtime_state
         from tests.test_runtime_state import RuntimeStateRepositoryTest
-        from validation_feedback import normalize_feedback
-        from validation_feedback_state import ValidationFeedbackRepository
+        from loop_manager_internal.execution.validation_feedback import normalize_feedback
+        from loop_manager_internal.storage.validation_feedback_state import ValidationFeedbackRepository
 
         connection = RuntimeStateRepositoryTest()._connection()
         self.addCleanup(connection.close)
@@ -5570,7 +5580,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
 
     def test_remote_checkpoint_requires_valid_worker_evidence_before_reviewer(self):
         from tests.test_runtime_state import RuntimeStateRepositoryTest
-        import runtime_state
+        from loop_manager_internal.storage import runtime_state
 
         connection = RuntimeStateRepositoryTest()._connection()
         self.addCleanup(connection.close)
@@ -5609,7 +5619,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
 
     def test_remote_checkpoint_base_change_after_verify_skips_reviewer(self):
         from tests.test_runtime_state import RuntimeStateRepositoryTest
-        import runtime_state
+        from loop_manager_internal.storage import runtime_state
 
         connection = RuntimeStateRepositoryTest()._connection()
         self.addCleanup(connection.close)
@@ -5693,7 +5703,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
 
     def test_remote_checkpoint_corrects_invalid_specification_to_pass(self):
         from tests.test_runtime_state import RuntimeStateRepositoryTest
-        import runtime_state
+        from loop_manager_internal.storage import runtime_state
 
         connection = RuntimeStateRepositoryTest()._connection()
         self.addCleanup(connection.close)
@@ -5754,8 +5764,8 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
 
     def test_remote_checkpoint_protocol_exhaustion_stops_at_three_attempts(self):
         from tests.test_runtime_state import RuntimeStateRepositoryTest
-        import runtime_state
-        import blocked_checkpoint_state
+        from loop_manager_internal.storage import runtime_state
+        from loop_manager_internal.storage import blocked_checkpoint_state
 
         connection = RuntimeStateRepositoryTest()._connection()
         self.addCleanup(connection.close)
@@ -5848,8 +5858,8 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
 
     def test_remote_checkpoint_specification_block_preserves_published_identity(self):
         from tests.test_runtime_state import RuntimeStateRepositoryTest
-        import runtime_state
-        import blocked_checkpoint_state
+        from loop_manager_internal.storage import runtime_state
+        from loop_manager_internal.storage import blocked_checkpoint_state
 
         connection = RuntimeStateRepositoryTest()._connection()
         self.addCleanup(connection.close)
@@ -6083,7 +6093,7 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
         )
 
     def test_legacy_review_block_uses_base_and_worktree_fingerprints_across_rebase(self):
-        import runtime_state
+        from loop_manager_internal.storage import runtime_state
 
         with tempfile.TemporaryDirectory() as directory:
             repo, state_dir, connection = self._active_worker_project(directory)
@@ -8549,82 +8559,11 @@ class AgentScopeValidatorTest(unittest.TestCase):
     def test_planner_import_bytecode_is_ignored_without_hiding_scope_violations(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, _plan_path = self._repository_with_plan(directory)
-            for module_name in (
-                "agent_scope_decision.py",
-                "agent_invocation.py",
-                "agent_invocation_state.py",
-                "agent_write_isolation.py",
-                "agent_codex_sandbox.py",
-                "agent_sandbox_exec.py",
-                "agent_provider_usage.py",
-                "blocked_checkpoint.py",
-                "blocked_checkpoint_state.py",
-                "blocked_plan_reconciliation.py",
-                "blocked_remote_observation.py",
-                "project_blocked_recovery.py",
-                "document_drafts.py",
-                "document_publication.py",
-                "checkpoint_ownership.py",
-                "loop_manager.py",
-                "manager_git_journal.py",
-                "managed_rebase_evidence.py",
-                "managed_rebase_observation.py",
-                "managed_rebase_validation.py",
-                "managed_rebase_adoption.py",
-                "managed_rebase_publication.py",
-                "managed_rebase_runtime.py",
-                "rebase_block_reconciliation.py",
-                "rebase_file_evidence.py",
-                "execution_checkpoint.py",
-                "execution_checkpoint_state.py",
-                "execution_runtime.py",
-                "execution_handlers.py",
-                "execution_revision.py",
-                "execution_state.py",
-                "guidance_approval.py",
-                "quality_guidance.py",
-                "execplan_archive.py",
-                "execplan_archive_state.py",
-                "execplan_catalog.py",
-                "execplan_catalog_state.py",
-                "project_catalog_refresh.py",
-                "managed_config.py",
-                "maintenance_file_inventory.py",
-                "maintenance_file_ledger.py",
-                "maintenance_file_publication.py",
-                "maintenance_file_review.py",
-                "maintenance_reconciliation.py",
-                "maintenance_findings.py",
-                "maintenance_git.py",
-                "maintenance_orchestration.py",
-                "maintenance_planning.py",
-                "full_assessment.py",
-                "maintenance_state.py",
-                "notifications.py",
-                "work_exhaustion.py",
-                "planning_catalog.py",
-                "planning_runtime.py",
-                "publication_resume.py",
-                "project_registry.py",
-                "rebase_correction.py",
-                "rebase_correction_state.py",
-                "recovery_dispatcher.py",
-                "recovery_runtime.py",
-                "recovery_state.py",
-                "reviewer_specification.py",
-                "requirement_archive.py",
-                "requirement_archive_recovery.py",
-                "requirement_archive_state.py",
-                "runtime_state.py",
-                "runtime_scope.py",
-                "scoped_blocking.py",
-                "validation_feedback.py",
-                "validation_feedback_state.py",
-                "verify_process.py",
-                "worker_session.py",
-                "worker_outcome.py",
-            ):
-                shutil.copy(loop_manager.ROOT / module_name, repo / module_name)
+            shutil.copy(loop_manager.ROOT / "loop_manager.py", repo / "loop_manager.py")
+            shutil.copytree(
+                loop_manager.ROOT / "loop_manager_internal", repo / "loop_manager_internal",
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
             (repo / ".gitignore").write_text("__pycache__/\n", encoding="utf-8")
             commit_and_push(repo, "Add planner import fixtures")
 
@@ -8633,8 +8572,11 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 [
                     sys.executable,
                     "-c",
-                    "import loop_manager, managed_config, maintenance_git, "
-                    "maintenance_planning, maintenance_state, project_registry",
+                    "import loop_manager; "
+                    "from loop_manager_internal.config import managed_config; "
+                    "from loop_manager_internal.maintenance import maintenance_git, maintenance_planning; "
+                    "from loop_manager_internal.storage import maintenance_state; "
+                    "from loop_manager_internal.runtime import project_registry",
                 ],
                 cwd=repo,
                 env=planner_environment,
@@ -8654,8 +8596,11 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 [
                     sys.executable,
                     "-c",
-                    "import loop_manager, managed_config, maintenance_git, "
-                    "maintenance_planning, maintenance_state, project_registry",
+                    "import loop_manager; "
+                    "from loop_manager_internal.config import managed_config; "
+                    "from loop_manager_internal.maintenance import maintenance_git, maintenance_planning; "
+                    "from loop_manager_internal.storage import maintenance_state; "
+                    "from loop_manager_internal.runtime import project_registry",
                 ],
                 cwd=repo,
                 env=planner_environment,
@@ -19159,8 +19104,8 @@ class PersistentExecutionFailureBoundaryTest(unittest.TestCase):
         connection.commit()
 
         def recovered_run(*_args, **_kwargs):
-            from recovery_runtime import RecoveryObservation, RecoveryReason
-            from recovery_state import RecoveryRepository
+            from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason
+            from loop_manager_internal.storage.recovery_state import RecoveryRepository
 
             RecoveryRepository(connection).observe(RecoveryObservation(
                 RecoveryReason.FETCH_FAILED, repo, None, "WORKING", None,
@@ -19202,8 +19147,8 @@ class PersistentExecutionFailureBoundaryTest(unittest.TestCase):
         connection.commit()
 
         def failed_step(*_args, **_kwargs):
-            from recovery_runtime import RecoveryObservation, RecoveryReason
-            from recovery_state import RecoveryRepository
+            from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason
+            from loop_manager_internal.storage.recovery_state import RecoveryRepository
 
             RecoveryRepository(connection).observe(RecoveryObservation(
                 RecoveryReason.FETCH_FAILED, repo, None, "WORKING", None,
@@ -19338,7 +19283,7 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
 
     def test_planner_no_change_with_active_requirement_waits_without_completion(self):
         connection, repo = self._connection()
-        import work_exhaustion
+        from loop_manager_internal.notifications import work_exhaustion
         snapshot = work_exhaustion.WorkReasonSnapshot(
             "cycle-one", (),
             ({"id": "[R-031]", "path": "docs/requirements/[R-031] Waiting.md",
@@ -19360,7 +19305,7 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
 
     def test_stable_result_reports_reason_and_pause_skips_notification(self):
         connection, repo = self._connection()
-        import work_exhaustion
+        from loop_manager_internal.notifications import work_exhaustion
         snapshot = work_exhaustion.WorkReasonSnapshot(
             "cycle-one", ({"id": "G-018", "title": "Work", "status": "PR_OPEN",
                             "reason": "PR Merge 대기"},), (), None, None,

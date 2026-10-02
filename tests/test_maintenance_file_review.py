@@ -6,9 +6,9 @@ import subprocess
 import tempfile
 import unittest
 
-import maintenance_file_inventory
-import maintenance_file_review as review
-import maintenance_file_ledger
+from loop_manager_internal.maintenance import maintenance_file_inventory
+from loop_manager_internal.maintenance import maintenance_file_review as review
+from loop_manager_internal.storage import maintenance_file_ledger
 
 
 def root_results_for(repository, inventory):
@@ -345,7 +345,7 @@ class ProvisionalFileReviewTest(unittest.TestCase):
         return parsed
 
     def test_asset_only_tree_requires_investigation_and_resumes_root_unit(self):
-        import maintenance_file_publication as publication
+        from loop_manager_internal.maintenance import maintenance_file_publication as publication
         import loop_manager
         from unittest import mock
         inventory = self.publish({"scratch.png": b"\x89PNG\x00fixture"})
@@ -389,7 +389,7 @@ class ProvisionalFileReviewTest(unittest.TestCase):
 
     def test_root_only_move_requires_synthesis_and_cannot_use_empty_stabilization(self):
         import loop_manager
-        import maintenance_file_publication as publication
+        from loop_manager_internal.maintenance import maintenance_file_publication as publication
         inventory = self.publish({"notes.md": "Internal development notes owned by the documentation team.\n"})
         source = maintenance_file_ledger.root_review_source(self.repo, inventory)
         roots = list(root_results_for(self.repo, inventory))

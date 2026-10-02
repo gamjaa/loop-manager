@@ -1,7 +1,7 @@
 import sqlite3
 import unittest
 
-import execplan_archive_state
+from loop_manager_internal.storage import execplan_archive_state
 
 
 class ExecPlanArchiveStateTest(unittest.TestCase):

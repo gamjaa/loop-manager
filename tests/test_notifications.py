@@ -6,14 +6,14 @@ from pathlib import Path
 from unittest import mock
 
 import loop_manager
-import blocked_checkpoint_state
-from managed_config import ManagedConfigError, load_managed_config
-import notifications
-import work_exhaustion
-import project_registry
-import scoped_blocking
-from recovery_runtime import RecoveryObservation, RecoveryReason
-from recovery_state import RecoveryRepository
+from loop_manager_internal.storage import blocked_checkpoint_state
+from loop_manager_internal.config.managed_config import ManagedConfigError, load_managed_config
+from loop_manager_internal.notifications import notifications
+from loop_manager_internal.notifications import work_exhaustion
+from loop_manager_internal.runtime import project_registry
+from loop_manager_internal.recovery import scoped_blocking
+from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason
+from loop_manager_internal.storage.recovery_state import RecoveryRepository
 
 
 class NotificationFixture:

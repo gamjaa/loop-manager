@@ -3,8 +3,8 @@
 import sqlite3
 from unittest import TestCase
 
-from agent_invocation import InvocationContext, ResolvedProfile, Usage
-from agent_invocation_state import InvocationRepository, ensure_schema
+from loop_manager_internal.agents.agent_invocation import InvocationContext, ResolvedProfile, Usage
+from loop_manager_internal.storage.agent_invocation_state import InvocationRepository, ensure_schema
 
 
 class InvocationRepositoryTests(TestCase):

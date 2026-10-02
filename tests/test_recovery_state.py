@@ -6,13 +6,13 @@ from pathlib import Path
 from unittest import mock
 
 import loop_manager
-import runtime_state
-from recovery_runtime import RecoveryAction, RecoveryObservation, RecoveryReason
-from recovery_state import (
+from loop_manager_internal.storage import runtime_state
+from loop_manager_internal.recovery.recovery_runtime import RecoveryAction, RecoveryObservation, RecoveryReason
+from loop_manager_internal.storage.recovery_state import (
     RecoveryRepository, RecoveryStateConflict, begin_external_run,
     pending_review_correction, reserve_review_correction, start_review_correction,
 )
-from recovery_dispatcher import RecoveryDispatcher
+from loop_manager_internal.recovery.recovery_dispatcher import RecoveryDispatcher
 from tests import test_runtime_state
 
 
@@ -486,12 +486,12 @@ if __name__ == "__main__":
 
 class RebaseCauseResolutionTests(unittest.TestCase):
     def setUp(self):
-        import notifications
+        from loop_manager_internal.notifications import notifications
         RecoveryRepositoryTests.setUp(self)
         notifications.ensure_schema(self.connection)
 
     def block(self, detail='manual rebase conflict'):
-        from scoped_blocking import BlockReasonCode
+        from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
         begin_external_run(self.connection)
         observation = RecoveryObservation(RecoveryReason.MANAGED_CONFLICT_UNRECOVERABLE, 'repo', 'G-042',
             'WORKING', 'old-input', 'old-base', 'failure', 'old-session-progress', detail)

@@ -10,8 +10,8 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 
-from execution_checkpoint import CheckpointAction, assess, observe
-from execution_checkpoint_state import ExecutionCheckpointRepository
+from loop_manager_internal.execution.execution_checkpoint import CheckpointAction, assess, observe
+from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
 
 
 class AutostashCheckpointGitTests(unittest.TestCase):

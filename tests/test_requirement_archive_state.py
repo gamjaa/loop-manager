@@ -2,9 +2,9 @@
 
 import unittest
 
-import requirement_archive as archive
-import requirement_archive_state as state
-import runtime_state
+from loop_manager_internal.catalog import requirement_archive as archive
+from loop_manager_internal.storage import requirement_archive_state as state
+from loop_manager_internal.storage import runtime_state
 from tests import test_runtime_state
 
 

@@ -6,9 +6,9 @@ import tempfile
 import unittest
 from unittest import mock
 
-import execplan_catalog
-import execplan_catalog_state
-import maintenance_state
+from loop_manager_internal.catalog import execplan_catalog
+from loop_manager_internal.storage import execplan_catalog_state
+from loop_manager_internal.storage import maintenance_state
 import loop_manager
 
 
@@ -456,7 +456,7 @@ class ArchivedDependencySelectionTest(unittest.TestCase):
         self.assertEqual(count, 2)
 
     def test_durable_merge_with_archive_diagnostic_does_not_satisfy_dependency(self):
-        import work_exhaustion
+        from loop_manager_internal.notifications import work_exhaustion
 
         self._insert_plan("G-001", "MERGED")
         self._record_historical("G-001", confirmed=True)

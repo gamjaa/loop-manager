@@ -8,17 +8,17 @@ from pathlib import Path
 from unittest import mock
 
 import loop_manager
-from maintenance_orchestration import (
+from loop_manager_internal.maintenance.maintenance_orchestration import (
     MaintenanceOrchestrationError,
     MaintenanceOutcome,
     maintenance_planning_fingerprint,
     parse_maintenance_planner_decision,
     validate_prerequisite_plan_ids,
 )
-from maintenance_planning import MaintenancePlanMode, MaintenancePlanningContext
-import maintenance_state
-import planning_runtime
-from maintenance_file_inventory import SourceInventoryError
+from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanMode, MaintenancePlanningContext
+from loop_manager_internal.storage import maintenance_state
+from loop_manager_internal.planning import planning_runtime
+from loop_manager_internal.maintenance.maintenance_file_inventory import SourceInventoryError
 from tests.test_loop_manager import (
     _ports_with_bound_dummy_sessions,
     _profile_for_dummy_worker_config,
@@ -31,7 +31,7 @@ from tests.test_maintenance_planning import plan_text
 
 class MaintenanceOrchestrationTest(unittest.TestCase):
     def test_assessment_activation_preserves_worker_session_in_plan_and_projection(self):
-        from worker_session import SessionBinding, SessionTransition
+        from loop_manager_internal.execution.worker_session import SessionBinding, SessionTransition
 
         connection = self._connection()
         self.addCleanup(connection.close)

@@ -8,10 +8,10 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import mock
 
-import manager_git_journal as journal
+from loop_manager_internal.git import manager_git_journal as journal
 import loop_manager
 
-from managed_rebase_evidence import (
+from loop_manager_internal.git.managed_rebase_evidence import (
     ReplayEvidenceError, reconcile_frozen_sources, source_commits, stage_index_matches,
     stage_matches, stage_modes_match, verify_replay,
 )

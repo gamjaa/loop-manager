@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import manager_git_journal as journal
+from loop_manager_internal.git import manager_git_journal as journal
 
 
 OLD = "a" * 40

@@ -8,12 +8,12 @@ import json
 import threading
 from unittest import TestCase, mock, skipUnless
 
-import agent_invocation as invocation
-import agent_write_isolation as isolation
-import agent_codex_sandbox as envelope
-import agent_sandbox_exec as gate
-import agent_invocation_state as state
-import agent_provider_usage as provider_usage
+from loop_manager_internal.agents import agent_invocation as invocation
+from loop_manager_internal.agents import agent_write_isolation as isolation
+from loop_manager_internal.agents import agent_codex_sandbox as envelope
+from loop_manager_internal.agents import agent_sandbox_exec as gate
+from loop_manager_internal.storage import agent_invocation_state as state
+from loop_manager_internal.agents import agent_provider_usage as provider_usage
 import loop_manager as manager
 
 
@@ -584,6 +584,10 @@ class NativeWriteIsolationTests(TestCase):
             self.assertIn(str(boundary.other_worktrees[0]), policy['protected'])
             self.assertIn(str(boundary.worktree / '.git'), policy['protected'])
             self.assertEqual(launch.probe_arguments[:2], ('codex', 'sandbox'))
+            probe_script = Path(launch.probe_arguments[launch.probe_arguments.index('-I') + 1])
+            self.assertEqual(probe_script, Path(gate.__file__))
+            self.assertEqual(probe_script.parent, Path(envelope.__file__).parent)
+            self.assertTrue(probe_script.is_file())
             self.assertIn('--include-managed-config', launch.probe_arguments)
             for args in (launch.probe_arguments, launch.arguments):
                 self.assertIn('features.plugins=false', args)
@@ -1117,7 +1121,7 @@ class RuntimeReadOnlyIsolationTests(TestCase):
                     isolation.inspect_worktree(invalid, state_root, read_only=True)
 
     def test_document_generate_reaches_isolated_agent_from_runtime_root(self):
-        import document_drafts
+        from loop_manager_internal.documents import document_drafts
 
         with tempfile.TemporaryDirectory() as directory:
             boundary, state_root, home, observed, git = self.fixture(Path(directory))

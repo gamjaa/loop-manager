@@ -10,16 +10,16 @@ import unittest
 from unittest import mock
 
 import loop_manager
-import notifications
-import maintenance_state
-import maintenance_file_review
-import maintenance_findings
-import maintenance_reconciliation
-from maintenance_file_inventory import RootPlacement, TrackedSource
+from loop_manager_internal.notifications import notifications
+from loop_manager_internal.storage import maintenance_state
+from loop_manager_internal.maintenance import maintenance_file_review
+from loop_manager_internal.maintenance import maintenance_findings
+from loop_manager_internal.maintenance import maintenance_reconciliation
+from loop_manager_internal.maintenance.maintenance_file_inventory import RootPlacement, TrackedSource
 from tests.test_maintenance_file_review import result_for
-from planning_catalog import MutableReadySnapshot, mutable_snapshot_token
-from maintenance_orchestration import maintenance_planning_fingerprint
-from planning_runtime import (
+from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot, mutable_snapshot_token
+from loop_manager_internal.maintenance.maintenance_orchestration import maintenance_planning_fingerprint
+from loop_manager_internal.planning.planning_runtime import (
     PlanningAgentResult,
     PlanningAgentResultKind,
     PlanningContext,
@@ -31,7 +31,7 @@ from planning_runtime import (
     PlanningDecisionKind,
     choose_planning_decision,
 )
-from runtime_state import PlanningSnapshot
+from loop_manager_internal.storage.runtime_state import PlanningSnapshot
 
 
 def planning_snapshot(**overrides):
@@ -920,7 +920,7 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         run = coordinator._new_run(replace(self.context, self_repository=True))
         run.planning_worktree = Path("/planning")
         run.maintenance_context = object()
-        with mock.patch("planning_runtime.full_assessment.source_inventory",
+        with mock.patch("loop_manager_internal.planning.planning_runtime.full_assessment.source_inventory",
                         return_value={"docs/PRODUCT.md": "hash"}):
             outcome = coordinator._validate_planner_result(run)
         self.assertEqual(outcome.kind, PlanningOutcomeKind.VALIDATION_RETRY)
@@ -954,7 +954,7 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
         run = coordinator._new_run(replace(self.context, self_repository=True))
         run.planning_worktree = Path("/planning")
         run.maintenance_context = object()
-        with mock.patch("planning_runtime.full_assessment.source_inventory",
+        with mock.patch("loop_manager_internal.planning.planning_runtime.full_assessment.source_inventory",
                         return_value={"module.py": "b" * 64}):
             outcome = coordinator._validate_planner_result(run)
         self.assertEqual(outcome.kind, PlanningOutcomeKind.VALIDATION_RETRY)
@@ -1661,7 +1661,7 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
             run.maintenance_context = object()
 
             with mock.patch(
-                "planning_runtime.validate_prerequisite_plan_ids",
+                "loop_manager_internal.planning.planning_runtime.validate_prerequisite_plan_ids",
                 return_value=("G-001",),
             ):
                 outcome = coordinator._validate_planner_result(run)
