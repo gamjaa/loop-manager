@@ -1,4 +1,8 @@
 """Adapters from existing runtime policies to current rebase adoption."""
+from __future__ import annotations
+from dataclasses import dataclass
+from collections.abc import Callable
+from loop_manager_internal.runtime.contracts import WORKSPACE_OWNED
 import os
 import hashlib
 import stat
@@ -10,10 +14,36 @@ from loop_manager_internal.git.managed_rebase_observation import ObservationAdap
 from loop_manager_internal.git.managed_rebase_validation import RebaseExpectation, Remote, PullRequest, fingerprint
 from loop_manager_internal.git.manager_git_journal import MutationEvidenceError
 
+
+@dataclass(frozen=True)
+class RebaseRuntimeEffects:
+    """Explicit effects for this service; persisted decisions remain in repositories."""
+    _guidance_document: Callable[..., object]
+    _guidance_document_matches_rows: Callable[..., object]
+    _guidance_final_expected: Callable[..., object]
+    _guidance_target_state: Callable[..., object]
+    _owned_rebase_metadata: Callable[..., object]
+    _path_signature: Callable[..., object]
+    _published_plan_allows_common_plans: Callable[..., object]
+    _revision_execplan_input_fingerprint: Callable[..., object]
+    _worker_path_allowed: Callable[..., object]
+    _worktree_execplan_input_fingerprint: Callable[..., object]
+    capture_git_snapshot: Callable[..., object]
+    git: Callable[..., object]
+    live_remote_branch_oid: Callable[..., object]
+    pr_for_branch: Callable[..., object]
+    requirement_archive_candidates: Callable[..., object]
+    requirement_archive_move_set: Callable[..., object]
+    requirement_archive_path: Callable[..., object]
+    validate_active_execplan_metadata: Callable[..., object]
+    validate_execplan_workspace_identity: Callable[..., object]
+    validate_managed_worktree: Callable[..., object]
+
+
 _UNSET = object()
 
 
-def build_service(ports, connection, repo_path, state_dir, repo, plan_id,
+def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir, repo, plan_id,
                   worktree, branch, *, target=None, remote_oid=_UNSET):
     """Use current declarations and exact live leases, never execution receipts."""
     plan = connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
@@ -33,7 +63,7 @@ def build_service(ports, connection, repo_path, state_dir, repo, plan_id,
         intent = checkpoint.rebase_publication_intent()
         if intent is None:
             raise MutationEvidenceError('pending publication identity differs')
-        live = ports.manager_git_journal.live_remote_branch_oid(ports.git, repo_path, branch)
+        live = ports.live_remote_branch_oid(ports.git, repo_path, branch)
         if live not in (intent['remote_before'], intent['head']):
             raise MutationEvidenceError('pending publication remote lease differs')
         expected_oid = live
@@ -47,7 +77,7 @@ def build_service(ports, connection, repo_path, state_dir, repo, plan_id,
     remote = Remote(repo, branch, expected_oid, pr)
     if (str(plan['branch'] or '') != branch
             or str(plan['worktree'] or '') != str(worktree)
-            or int(plan['workspace_owned']) != ports.WORKSPACE_OWNED):
+            or int(plan['workspace_owned']) != WORKSPACE_OWNED):
         raise MutationEvidenceError('current rebase reservation differs')
     project = connection.execute('SELECT base_branch FROM projects WHERE repo = ?', (repo,)).fetchone()
 
@@ -81,7 +111,7 @@ def build_service(ports, connection, repo_path, state_dir, repo, plan_id,
         repo=repo, repository_identity=identity, plan_id=plan_id,
         plan_path=str(plan['path']), worktree=str(worktree.resolve()), branch=branch,
         target_base_oid=target, generation=checkpoint.generation,
-        workspace_owned=int(plan['workspace_owned']) == ports.WORKSPACE_OWNED,
+        workspace_owned=int(plan['workspace_owned']) == WORKSPACE_OWNED,
         input_fingerprint=inputs, scope_fingerprint=policy, remote=remote,
         autostash_oid=saved.get('stash_oid') if checkpoint.operation == 'rebase' else None,
         before_head=(checkpoint.expected_head if checkpoint.operation == 'rebase' else
@@ -93,11 +123,11 @@ def build_service(ports, connection, repo_path, state_dir, repo, plan_id,
         ports.validate_managed_worktree(repo_path, worktree, branch, allow_rebase=True)
         current = connection.execute('SELECT branch, worktree, workspace_owned FROM exec_plans '
                                      'WHERE repo = ? AND plan_id = ?', (repo, plan_id)).fetchone()
-        if tuple(current) != (branch, str(worktree), ports.WORKSPACE_OWNED):
+        if tuple(current) != (branch, str(worktree), WORKSPACE_OWNED):
             raise MutationEvidenceError('current rebase reservation changed')
 
     def read_remote(_expected):
-        oid = ports.manager_git_journal.live_remote_branch_oid(ports.git, repo_path, branch)
+        oid = ports.live_remote_branch_oid(ports.git, repo_path, branch)
         live = ports.pr_for_branch(repo_path, branch, str(plan['pr_url'] or '') or None)
         if live is not None and live.get('state') != 'OPEN' and not plan['pr_url']:
             live = None

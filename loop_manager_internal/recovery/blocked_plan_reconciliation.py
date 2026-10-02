@@ -8,6 +8,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from collections.abc import Callable
+from dataclasses import dataclass
+from loop_manager_internal.recovery.scoped_blocking import GUIDANCE_BLOCK_REASON, PR_CLOSED_BLOCK_REASON
+from loop_manager_internal.recovery import blocked_checkpoint
 import sqlite3
 import subprocess
 
@@ -153,6 +156,43 @@ def validated_scope_refs(
     return frozenset(allowed)
 
 
+@dataclass(frozen=True)
+class RecoveryWorkspaceEffects:
+    """Shared ref, identity, adoption and checkpoint effects; no release policy."""
+    _BlockedCheckpointAdapter: Callable[..., object]
+    _BlockedCheckpointResults: Callable[..., object]
+    _current_rebase_service: Callable[..., object]
+    _journaled_direct_rebase: Callable[..., object]
+    _reconcile_published_blocked_checkpoint: Callable[..., object]
+    _recorded_base_fetch: Callable[..., object]
+    _update_blocked_error: Callable[..., object]
+    _worktree_state_signature: Callable[..., object]
+    capture_git_snapshot: Callable[..., object]
+    git: Callable[..., object]
+    github_repository: Callable[..., object]
+    observe_blocked_plan_remotes: Callable[..., object]
+    owned_remote_oid: Callable[..., object]
+    pr_for_branch: Callable[..., object]
+    unmet_execplan_dependencies: Callable[..., object]
+    validate_execplan_workspace_identity: Callable[..., object]
+    validate_managed_worktree: Callable[..., object]
+
+
+@dataclass(frozen=True)
+class PlanRecoveryEffects(RecoveryWorkspaceEffects):
+    """Explicit effects for this service; persisted decisions remain in repositories."""
+    ROOT: Path
+    _blocked_execplan_metadata_error: Callable[..., object]
+    _complete_direct_rebase_checkpoint: Callable[..., object]
+    _evaluate_remote_checkpoint_cause: Callable[..., object]
+    _non_default_index_flags: Callable[..., object]
+    _revision_execplan_input_fingerprint: Callable[..., object]
+    _worktree_execplan_input_fingerprint: Callable[..., object]
+    hydrate_execplan_project: Callable[..., object]
+    load_managed_config: Callable[..., object]
+    validate_blocked_agent_scope: Callable[..., object]
+
+
 class BlockedPlanReconciler:
     def __init__(self, ports, connection, repo_path, state_dir, repo, base,
                  config_path=None, timeout_seconds=None):
@@ -251,7 +291,7 @@ class BlockedPlanReconciler:
                                    '원격 checkpoint 후속 commit의 안전한 채택이 거부됐습니다.')
             current = self._plan(plan['plan_id'])
             head = self.ports.git(Path(plan['worktree']), 'rev-parse', 'HEAD^{commit}').stdout.strip()
-            if self.ports.checkpoint_ownership.owned_remote_oid(
+            if self.ports.owned_remote_oid(
                     self.connection, self.repo_path, self.repo, plan['plan_id'], plan['branch'],
                     Path(plan['worktree']), context['branch_oid'], self.ports.git,
                     before_head=head, recorded_oid=current['publication_remote_oid']) is None:
@@ -396,7 +436,7 @@ class BlockedPlanReconciler:
             if reason != BlockReasonCode.VERIFY_RETRY_EXHAUSTED.value and stage == 'verify':
                 resolved = False
             return dict(resolved=resolved, detail=detail, stage=stage)
-        if reason in {self.ports.GUIDANCE_BLOCK_REASON, self.ports.PR_CLOSED_BLOCK_REASON}:
+        if reason in {GUIDANCE_BLOCK_REASON, PR_CLOSED_BLOCK_REASON}:
             return dict(resolved=False, detail=context['block']['evidence'], stage=None)
         if reason == BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT.value:
             timeout = self.timeout if self.timeout is not None else self.ports.load_managed_config(
@@ -431,7 +471,7 @@ class BlockedPlanReconciler:
             return
         repository.refresh(request, expected_remote_oid=remote)
         results = self.ports._BlockedCheckpointResults(self.connection)
-        self.ports.blocked_checkpoint.BlockedCheckpointDispatcher(repository, adapter, adapter, results)._dispatch_one(
+        blocked_checkpoint.BlockedCheckpointDispatcher(repository, adapter, adapter, results)._dispatch_one(
             repository.get(self.repo, plan['plan_id']))
         if repository.get(self.repo, plan['plan_id']).phase.value == 'retry_pending':
             raise RuntimeError('차단 checkpoint의 일시적 게시 실패를 같은 요청으로 재개합니다.')

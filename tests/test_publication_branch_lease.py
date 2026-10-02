@@ -12,7 +12,10 @@ from tests.support.publication import seed_validated_candidate
 from tests.support.worker import dummy_worker_sessions
 
 
-class PublicationBranchLeaseTest(PublicationFixture, unittest.TestCase):
+class PublicationBranchLeaseTestFixture(PublicationFixture):
+    pass
+
+class PublicationLeaseRaceTests(PublicationBranchLeaseTestFixture, unittest.TestCase):
     @dummy_worker_sessions
     def test_remote_branch_push_interruption_recovers_without_another_push(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -84,6 +87,7 @@ class PublicationBranchLeaseTest(PublicationFixture, unittest.TestCase):
         self.assertEqual(plan["pr_head_oid"], local_head)
         self.assertEqual(git_calls, [])
         self.assertEqual(len(created), 1)
+
 
     @dummy_worker_sessions
     def test_owned_remote_branch_rebase_uses_explicit_force_with_lease(self):
@@ -162,6 +166,7 @@ class PublicationBranchLeaseTest(PublicationFixture, unittest.TestCase):
         self.assertNotIn("--force", pushes[0])
         self.assertEqual(len(created), 1)
 
+
     def test_owned_branch_push_rechecks_live_ref_before_lease(self):
         branch = 'loop-manager/G-081'
         connection = sqlite3.connect(':memory:')
@@ -198,6 +203,7 @@ class PublicationBranchLeaseTest(PublicationFixture, unittest.TestCase):
                     branch, Path('/managed'), 'b' * 40,
                 )
         self.assertFalse(any(args[0] == 'push' for args in calls))
+
 
     def test_owned_branch_push_uses_exact_lease_and_saves_confirmed_head(self):
         branch = 'loop-manager/G-081'
@@ -246,6 +252,7 @@ class PublicationBranchLeaseTest(PublicationFixture, unittest.TestCase):
         self.assertNotIn('--set-upstream', pushes[0])
         self.assertEqual(pushes[0][-2:], ('origin', f'{new}:refs/heads/{branch}'))
         update.assert_called_once_with(connection, 'repo', publication_remote_oid=new)
+
 
     @dummy_worker_sessions
     def test_unowned_remote_branch_is_blocked_without_force_push(self):
@@ -302,6 +309,8 @@ class PublicationBranchLeaseTest(PublicationFixture, unittest.TestCase):
         self.assertIn("갱신을 거부", blocked["last_error"])
         self.assertEqual(pushes, [])
 
+
+class PublicationPrObservationTests(PublicationBranchLeaseTestFixture, unittest.TestCase):
     @dummy_worker_sessions
     def test_existing_open_closed_reopened_and_merged_prs_are_reused(self):
         for initial_state in ("OPEN", "CLOSED", "MERGED"):

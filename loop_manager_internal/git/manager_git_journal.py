@@ -43,13 +43,23 @@ def live_remote_branch_oid(git: Callable[..., Any], repo: Path,
     result = git(repo, 'ls-remote', '--heads', 'origin', ref, check=False)
     if result.returncode:
         raise MutationEvidenceError('rebase remote: live branch query failed')
-    lines = [line.split() for line in result.stdout.splitlines() if line.strip()]
+    return parse_remote_branch_oid(result.stdout, ref)
+
+
+def parse_remote_branch_oid(output: str, ref: str) -> str | None:
+    """Parse one exact live ref; never grant ownership from this observation."""
+    lines = [line.split() for line in output.splitlines() if line.strip()]
     if not lines:
         return None
     if (len(lines) != 1 or len(lines[0]) != 2 or lines[0][1] != ref
             or re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', lines[0][0]) is None):
         raise MutationEvidenceError('rebase remote: live branch response is ambiguous')
     return lines[0][0]
+
+
+def exact_branch_lease(branch: str, expected_oid: str | None) -> str:
+    """Encode a pinned OID or absence; callers retain their own safety gates."""
+    return f'--force-with-lease=refs/heads/{branch}:{expected_oid or ""}'
 
 
 def rebase_conflict_matches(git: Callable[..., Any], worktree: Path, *,

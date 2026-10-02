@@ -44,6 +44,10 @@ class BlockReasonCode(str, Enum):
     LEGACY_UNSCOPED_BLOCK = "legacy_unscoped_block"
 
 
+PR_CLOSED_BLOCK_REASON = BlockReasonCode.PULL_REQUEST_CLOSED.value
+GUIDANCE_BLOCK_REASON = BlockReasonCode.GUIDANCE_APPROVAL_REQUIRED.value
+
+
 _PLAN_REASONS = frozenset(
     {
         BlockReasonCode.VERIFY_RETRY_EXHAUSTED,

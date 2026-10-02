@@ -83,7 +83,7 @@ def publish_checkpoint(*, state, checkpoints, repo, plan_id, repo_path, worktree
         oid, checked = inspect()
         if oid != intent['head']:
             pushed = git(worktree, 'push',
-                         f"--force-with-lease=refs/heads/{branch}:{intent['remote_before']}",
+                         manager_git_journal.exact_branch_lease(branch, intent['remote_before']),
                          'origin', f"{intent['head']}:refs/heads/{branch}", check=False)
             if pushed.returncode:
                 raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,

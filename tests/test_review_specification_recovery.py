@@ -452,7 +452,7 @@ class ReviewSpecificationRecoveryTest(BoundedRecoveryFixture, unittest.TestCase)
         next_snapshot = mock.Mock()
         next_snapshot.serialize.return_value = 'saved-worktree'
         with (
-            mock.patch.object(loop_manager._BlockedCheckpointAdapter, 'observe_remote',
+            mock.patch.object(loop_manager.checkpoint_adapter.BlockedCheckpointAdapter, 'observe_remote',
                               return_value='accepted-oid'),
             mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
             mock.patch.object(loop_manager, 'validate_managed_worktree'),
@@ -551,7 +551,7 @@ class ReviewSpecificationRecoveryTest(BoundedRecoveryFixture, unittest.TestCase)
         snapshot = mock.Mock()
         snapshot.serialize.return_value = 'saved-worktree'
         with (
-            mock.patch.object(loop_manager._BlockedCheckpointAdapter, 'observe_remote',
+            mock.patch.object(loop_manager.checkpoint_adapter.BlockedCheckpointAdapter, 'observe_remote',
                               return_value='accepted-oid'),
             mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
             mock.patch.object(loop_manager, 'validate_managed_worktree'),

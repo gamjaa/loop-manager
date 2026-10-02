@@ -3,16 +3,15 @@
 Current-state scope is independent of publication lineage. Diagnostic refs
 preserve artifacts but never update the original branch's ownership records.
 """
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from collections.abc import Callable
 import json
 from pathlib import Path
 
+from loop_manager_internal.recovery import blocked_checkpoint
 from loop_manager_internal.recovery.blocked_checkpoint import CheckpointPushError, PreparedCheckpoint, PushMode, decide_diagnostic_push
 from loop_manager_internal.storage.blocked_checkpoint_state import BlockedCheckpointRepository, DiagnosticPublicationRepository
-from loop_manager_internal.recovery.blocked_plan_reconciliation import (
-    ARTIFACT_FIELDS, IDENTITY_FIELDS, TERMINAL, AssessmentPending,
-    BlockedPlanReconciler, InputChanged, slot_available,
-)
+from loop_manager_internal.recovery.blocked_plan_reconciliation import ARTIFACT_FIELDS, IDENTITY_FIELDS, TERMINAL, AssessmentPending, BlockedPlanReconciler, InputChanged, slot_available, RecoveryWorkspaceEffects
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
 from loop_manager_internal.git.managed_rebase_adoption import revalidation_values
 from loop_manager_internal.git.managed_rebase_observation import observe_current_rebase
@@ -21,6 +20,21 @@ from loop_manager_internal.recovery import blocked_remote_observation as observa
 from loop_manager_internal.storage import runtime_state
 from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.storage.execplan_catalog_state import ReconciliationKind
+
+
+@dataclass(frozen=True)
+class ProjectRecoveryEffects(RecoveryWorkspaceEffects):
+    """Explicit effects for this service; persisted decisions remain in repositories."""
+    _publish_direct_rebase_checkpoint: Callable[..., object]
+    push_diagnostic_checkpoint: Callable[..., object]
+    reconcile_execplan_catalog: Callable[..., object]
+    resume_project_block_if_safe: Callable[..., object]
+
+
+@dataclass(frozen=True)
+class CurrentScopeEffects:
+    """Read current rebase scope independently of publication lineage."""
+    _current_rebase_service: Callable[..., object]
 
 
 class LocalWorkPending(RuntimeError):
@@ -177,7 +191,7 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
         if original:
             # Publication lineage is proved at its last accepted OID. A
             # currently valid rebased HEAD need not contain that old commit.
-            return self.ports.checkpoint_ownership.owned_remote_oid(
+            return self.ports.owned_remote_oid(
                 self.connection, self.repo_path, self.repo, plan['plan_id'], plan['branch'],
                 Path(plan['worktree']), original, self.ports.git,
                 before_head=original, recorded_oid=original, require_live=False) == original
@@ -348,7 +362,7 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
         else:
             store.refresh(request, expected_remote_oid=expected)
             request = store.get(self.repo, plan['plan_id'])
-            self.ports.blocked_checkpoint.BlockedCheckpointDispatcher(
+            blocked_checkpoint.BlockedCheckpointDispatcher(
                 store, adapter, adapter, self.ports._BlockedCheckpointResults(self.connection))._dispatch_one(request)
             request = store.get(self.repo, plan['plan_id'])
             if request.phase.value != 'published':
