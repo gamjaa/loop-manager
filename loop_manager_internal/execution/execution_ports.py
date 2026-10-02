@@ -32,7 +32,7 @@ from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
 from loop_manager_internal.storage import execution_checkpoint_state
 from loop_manager_internal.storage import validation_feedback_state
 from pathlib import Path
-from types import SimpleNamespace
+from loop_manager_internal.execution.execution_effects import ExecutionContract
 
 
 @dataclass(frozen=True)
@@ -168,7 +168,7 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
     effects = execution_handlers.ExecutionEffects(
         state=state,
         checkpoint=execution_checkpoint_state.ExecutionCheckpointRepository(connection),
-        contract=SimpleNamespace(AgentResultKind=AgentResultKind, AgentScopeError=AgentScopeError, ExecPlanMetadataError=ExecPlanMetadataError, GitLockError=GitLockError, MAX_REVIEWER_PROTOCOL_ATTEMPTS=MAX_REVIEWER_PROTOCOL_ATTEMPTS, MAX_VALIDATION_FINGERPRINT_REPEATS=MAX_VALIDATION_FINGERPRINT_REPEATS, PROJECT_STEP_RETRY=PROJECT_STEP_RETRY, PROJECT_STEP_TRANSIENT_PAUSE=PROJECT_STEP_TRANSIENT_PAUSE, PROJECT_STEP_USAGE_PAUSE=PROJECT_STEP_USAGE_PAUSE, PROJECT_STEP_PLANNING_PENDING=PROJECT_STEP_PLANNING_PENDING, PublicationSafetyError=PublicationSafetyError, REBASE_CONFLICT_PREFIX=REBASE_CONFLICT_PREFIX, REBASE_IN_PROGRESS_ERROR=REBASE_IN_PROGRESS_ERROR, RequirementArchiveCollisionError=RequirementArchiveCollisionError, RequirementArchiveError=RequirementArchiveError, ReviewerProtocolError=ReviewerProtocolError, TRANSIENT_AGENT_ERROR_PREFIX=TRANSIENT_AGENT_ERROR_PREFIX, USAGE_LIMIT_ERROR_PREFIX=USAGE_LIMIT_ERROR_PREFIX, WORKSPACE_OWNED=WORKSPACE_OWNED, WORKSPACE_RESERVED=WORKSPACE_RESERVED, WorkerResultError=WorkerResultError, WorkspaceOwnershipError=WorkspaceOwnershipError, reviewer_targeted_test_reason=dependencies.reviewer_targeted_test_reason, VerifyTerminationUncertain=VerifyTerminationUncertain),
+        contract=ExecutionContract(AgentResultKind=AgentResultKind, AgentScopeError=AgentScopeError, ExecPlanMetadataError=ExecPlanMetadataError, GitLockError=GitLockError, MAX_REVIEWER_PROTOCOL_ATTEMPTS=MAX_REVIEWER_PROTOCOL_ATTEMPTS, MAX_VALIDATION_FINGERPRINT_REPEATS=MAX_VALIDATION_FINGERPRINT_REPEATS, PROJECT_STEP_RETRY=PROJECT_STEP_RETRY, PROJECT_STEP_TRANSIENT_PAUSE=PROJECT_STEP_TRANSIENT_PAUSE, PROJECT_STEP_USAGE_PAUSE=PROJECT_STEP_USAGE_PAUSE, PROJECT_STEP_PLANNING_PENDING=PROJECT_STEP_PLANNING_PENDING, PublicationSafetyError=PublicationSafetyError, REBASE_CONFLICT_PREFIX=REBASE_CONFLICT_PREFIX, REBASE_IN_PROGRESS_ERROR=REBASE_IN_PROGRESS_ERROR, RequirementArchiveCollisionError=RequirementArchiveCollisionError, RequirementArchiveError=RequirementArchiveError, ReviewerProtocolError=ReviewerProtocolError, TRANSIENT_AGENT_ERROR_PREFIX=TRANSIENT_AGENT_ERROR_PREFIX, USAGE_LIMIT_ERROR_PREFIX=USAGE_LIMIT_ERROR_PREFIX, WORKSPACE_OWNED=WORKSPACE_OWNED, WORKSPACE_RESERVED=WORKSPACE_RESERVED, WorkerResultError=WorkerResultError, WorkspaceOwnershipError=WorkspaceOwnershipError, reviewer_targeted_test_reason=dependencies.reviewer_targeted_test_reason, VerifyTerminationUncertain=VerifyTerminationUncertain),
         workspace=execution_handlers.WorkspaceEffects(
             is_directory=lambda path: path.is_dir(),
             git=state.bind(dependencies._typed_execution_git, name="git", connected=False, mutates=False),

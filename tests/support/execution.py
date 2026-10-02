@@ -37,6 +37,42 @@ def recovered_rebase_publication(publication, state):
         getattr(lm, name), connected=True, mutates=True, name=name)) for name in names})
 
 
+def effect_bundle(cls, partial=None, *, optional_missing=False):
+    """Supply external-operation fakes, without performing phase transitions."""
+    return cls(**{field.name: getattr(partial, field.name,
+                     None if optional_missing and field.name in ('current_rebase_service',
+                                           'live_remote_branch_oid', 'git_operation_entries')
+                     else mock.Mock(name=field.name, return_value=None))
+                  for field in fields(cls)})
+
+
+def complete_execution_effects(partial=None):
+    """Complete small evidence-test fakes at the composition boundary."""
+    bundles = {
+        'workspace': handlers.WorkspaceEffects, 'agent': handlers.AgentEffects,
+        'validation': handlers.ValidationEffects, 'archive': handlers.ArchiveEffects,
+        'publication': handlers.PublicationEffects, 'blocking': handlers.BlockingEffects,
+        'events': handlers.EventsEffects, 'revision': handlers.RevisionEffects,
+    }
+    return handlers.ExecutionEffects(
+        state=getattr(partial, 'state', mock.Mock()),
+        contract=handlers.ExecutionContract.from_source(getattr(partial, 'contract', None)),
+        checkpoint=getattr(partial, 'checkpoint', None),
+        feedback=getattr(partial, 'feedback', None),
+        **{name: effect_bundle(cls, getattr(partial, name, None), optional_missing=True)
+           for name, cls in bundles.items()},
+    )
+
+
+def execution_handler_stub():
+    """Compose isolated ownership tests without allocating a database or Git repo."""
+    handler = object.__new__(handlers.ExecutionHandlers)
+    handler.effects = complete_execution_effects()
+    handler.recovery = mock.Mock()
+    handler.rebase_corrections = mock.Mock()
+    return handler
+
+
 class ExecutionFixture:
     """Reusable setup and adapters; no discoverable test methods."""
 
@@ -62,20 +98,17 @@ class ExecutionFixture:
         self.remote = 'base'
         self.dirty = True
 
-        def bundle(cls):
-            return cls(**{f.name: mock.Mock(name=f.name, return_value=None)
-                          for f in fields(cls)})
-
         self.effects = handlers.ExecutionEffects(
-            state=self.state, contract=lm,
-            workspace=bundle(handlers.WorkspaceEffects),
-            agent=bundle(handlers.AgentEffects),
-            validation=bundle(handlers.ValidationEffects),
-            archive=bundle(handlers.ArchiveEffects),
-            blocking=bundle(handlers.BlockingEffects),
-            publication=bundle(handlers.PublicationEffects),
-            events=bundle(handlers.EventsEffects),
-            revision=bundle(handlers.RevisionEffects),
+            state=self.state, contract=handlers.ExecutionContract(
+                reviewer_targeted_test_reason=lm.reviewer_targeted_test_reason),
+            workspace=effect_bundle(handlers.WorkspaceEffects),
+            agent=effect_bundle(handlers.AgentEffects),
+            validation=effect_bundle(handlers.ValidationEffects),
+            archive=effect_bundle(handlers.ArchiveEffects),
+            blocking=effect_bundle(handlers.BlockingEffects),
+            publication=effect_bundle(handlers.PublicationEffects),
+            events=effect_bundle(handlers.EventsEffects),
+            revision=effect_bundle(handlers.RevisionEffects),
         )
         self.effects = replace(self.effects, workspace=replace(self.effects.workspace, current_rebase_service=None))
         self.effects = replace(self.effects, workspace=replace(self.effects.workspace,

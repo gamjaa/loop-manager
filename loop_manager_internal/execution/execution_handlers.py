@@ -1,4902 +1,721 @@
-"""Execution handlers; all external operations arrive through effect ports."""
+"""Compatibility facade: immutable preparation state, composition and phase delegation."""
 from __future__ import annotations
-from dataclasses import dataclass, replace
-from typing import Callable, Any
-from pathlib import Path
-from types import SimpleNamespace
-from dataclasses import asdict
-import hashlib
-import json
-import os
-from loop_manager_internal.documents import document_drafts
-from loop_manager_internal.documents import document_publication
-from loop_manager_internal.git import rebase_file_evidence
-from loop_manager_internal.git import manager_git_journal
-from loop_manager_internal.git import managed_rebase_evidence
-from loop_manager_internal.git import managed_rebase_adoption
-from loop_manager_internal.git import managed_rebase_publication
-from loop_manager_internal.git.managed_rebase_validation import RebaseStatus, valid_acceptance
-from loop_manager_internal.notifications import notifications
-from loop_manager_internal.storage import recovery_state
-import re
-import subprocess
-import sys
-from uuid import uuid4
-from loop_manager_internal.agents.agent_invocation import (AgentResult, AgentResultKind, AttemptSequence,
-                              TrackedAgentCall, ResolvedProfile)
-from loop_manager_internal.execution.worker_session import (SessionBinding, SessionTransition, decide_session,
-                            unavailable_transition)
-from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
-from loop_manager_internal.recovery.recovery_runtime import (
-    RecoveryAction, RecoveryObservation, RecoveryReason, RecoveryFailure,
-    classify_exception,
-    TRANSIENT, RECONCILE, reason_from_block,
+from dataclasses import replace
+from types import MappingProxyType
+from loop_manager_internal.execution import execution_assembly
+from loop_manager_internal.execution.execution_effects import (
+    ExecutionEffects, ExecutionContract, WorkspaceEffects, AgentEffects, ValidationEffects,
+    FeedbackEffects, ArchiveEffects, PublicationEffects, BlockingEffects, EventsEffects, RevisionEffects,
 )
+from loop_manager_internal.execution.execution_session import ExecutionIdentity, PreparationSnapshot
+from loop_manager_internal.execution.execution_runtime import ExecutionContext, ExecutionOutcome
+from loop_manager_internal.execution.worker_outcome import WorkerOutcome
 from loop_manager_internal.recovery.recovery_dispatcher import RecoveryDispatcher
-from loop_manager_internal.execution.execution_revision import (DefinitionDelta, DefinitionSnapshot, RevisionGateKind,
-    StageArtifacts, WORKER_INVALIDATING_DELTAS, decide_revision_gate)
-from loop_manager_internal.execution.execution_runtime import (ExecutionContext, ExecutionOutcome, ExecutionOutcomeKind,
-    ExecutionPhase, ExecutionPlanMetadata, LatestBaseCheckpoint)
-from loop_manager_internal.storage.requirement_archive_state import ArchiveTargetRepository, ArchiveTargetConflict
-from loop_manager_internal.catalog.requirement_archive_recovery import (
-    ArchiveRecoveryPorts, ArchiveRecoveryService,
-)
-from loop_manager_internal.execution.execution_checkpoint import CheckpointAction, assess, observe, owned_detached_rebase
-from loop_manager_internal.storage.execution_checkpoint_state import CheckpointRace
+from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryObservation, RecoveryReason
+from loop_manager_internal.storage.rebase_correction_state import RebaseCorrectionRepository
+# Preserve module patch points consumed by the existing recovery fixtures.
+from loop_manager_internal.git import manager_git_journal, managed_rebase_evidence
 from loop_manager_internal.recovery import checkpoint_ownership
-from loop_manager_internal.storage.runtime_state import RuntimeStateError
-from loop_manager_internal.execution.publication_resume import PublicationNext, PublicationResume, assess_publication
-from loop_manager_internal.git.rebase_correction import (
-    CorrectionAction, CorrectionSource, execute_git_step, next_action, observe_git,
-    stage_evidence_preserved,
-)
-from loop_manager_internal.storage.rebase_correction_state import CorrectionRace, RebaseCorrectionRepository
-from loop_manager_internal.execution.validation_feedback import is_validation_error, normalize_feedback, render_delta
-from loop_manager_internal.execution.validation_feedback import redact_secrets
-from loop_manager_internal.execution.worker_outcome import WorkerOutcome, WorkerOutcomeError, parse_worker_outcome
-from loop_manager_internal.documents.reviewer_specification import SpecificationDeadlock, validate_locations
-
-@dataclass(frozen=True)
-class WorkspaceEffects:
-    is_directory: Callable[..., Any]
-    git: Callable[..., Any]
-    make_worktree: Callable[..., Any]
-    branch_has_changes: Callable[..., Any]
-    remote_branch_oid: Callable[..., Any]
-    _rebase_in_progress_for_branch: Callable[..., Any]
-    validate_execplan_workspace_identity: Callable[..., Any]
-    validate_managed_worktree: Callable[..., Any]
-    _plan_id_from_path: Callable[..., Any]
-    reserve_execplan_workspace: Callable[..., Any]
-    mark_execplan_workspace_owned: Callable[..., Any]
-    resume_pr_conflict_rebase: Callable[..., Any]
-    git_operation_entries: Callable[..., Any] | None = None
-    current_rebase_service: Callable[..., Any] | None = None
-    live_remote_branch_oid: Callable[..., Any] | None = None
-
-@dataclass(frozen=True)
-class AgentEffects:
-    begin_agent_scope: Callable[..., Any]
-    capture_git_snapshot: Callable[..., Any]
-    path_signature: Callable[..., str]
-    clear_agent_scope: Callable[..., Any]
-    validate_agent_scope: Callable[..., Any]
-    validate_worker_workspace_scope: Callable[..., Any]
-    _worktree_execplan_input_fingerprint: Callable[..., Any]
-    _revision_execplan_input_fingerprint: Callable[..., Any]
-    _guidance_worker_targets: Callable[..., Any]
-    guidance_resume_context: Callable[..., Any]
-    _published_plan_allows_common_plans: Callable[..., Any]
-    is_loop_manager_repository: Callable[..., Any]
-    inspect_worker_guidance_result: Callable[..., Any]
-    validate_guidance_publication: Callable[..., Any]
-    run_agent: Callable[..., Any]
-    run_agent_with_retries: Callable[..., Any]
-    worker_prompt: Callable[..., Any]
-    reviewer_prompt: Callable[..., Any]
-    resolve_worker_profile: Callable[..., ResolvedProfile]
-
-@dataclass(frozen=True)
-class ValidationEffects:
-    verify: Callable[..., Any]
-    block_verify_timeout_limit: Callable[..., Any]
-    parse_worker_result: Callable[..., Any]
-    parse_reviewer_result: Callable[..., Any]
-    validate_active_execplan_metadata: Callable[..., Any]
-    ensure_worker_level_state: Callable[..., Any]
-    clear_validation_failure_history: Callable[..., Any]
-    transition_validation_failure: Callable[..., Any]
-
-@dataclass(frozen=True)
-class FeedbackEffects:
-    repository: Any
-    fingerprints: Callable[..., Any]
-
-@dataclass(frozen=True)
-class ArchiveEffects:
-    requirement_archive_sources: Callable[..., Any]
-    requirement_archive_snapshot: Callable[..., Any]
-    requirement_archive_candidates: Callable[..., Any]
-    requirement_archive_move_set: Callable[..., Any]
-    requirement_archive_reconciliation_error: Callable[..., Any]
-    requirement_archive_touched_sources: Callable[..., Any]
-
-@dataclass(frozen=True)
-class PublicationEffects:
-    pr_for_branch: Callable[..., Any]
-    reconcile_existing_pull_request: Callable[..., Any]
-    record_remote_publication_branch: Callable[..., Any]
-    push_managed_publication_branch: Callable[..., Any]
-    push_owned_pr_conflict_recovery: Callable[..., Any]
-    published_execplan: Callable[..., Any]
-    build_pr_body: Callable[..., Any]
-    command: Callable[..., Any]
-
-@dataclass(frozen=True)
-class BlockingEffects:
-    block_active_execplan: Callable[..., Any]
-    block_active_execplan_from_revision: Callable[..., Any]
-
-@dataclass(frozen=True)
-class EventsEffects:
-    operation_log: Callable[..., Any]
-    operation_print: Callable[..., Any]
-
-
-@dataclass(frozen=True)
-class RevisionEffects:
-    reconcile_catalog: Callable[..., Any]
-    source_fingerprint: Callable[..., Any]
-    body_hash: Callable[..., Any]
-    changed_paths: Callable[..., Any]
-    unmet_dependencies: Callable[..., Any]
-
-@dataclass(frozen=True)
-class ExecutionEffects:
-    state: Any
-    contract: Any
-    workspace: WorkspaceEffects
-    agent: AgentEffects
-    validation: ValidationEffects
-    archive: ArchiveEffects
-    publication: PublicationEffects
-    blocking: BlockingEffects
-    events: EventsEffects
-    revision: RevisionEffects
-    checkpoint: Any = None
-    feedback: FeedbackEffects | None = None
-
+from loop_manager_internal.documents import document_drafts, document_publication
+from loop_manager_internal.storage import recovery_state
 
 class ExecutionHandlers:
-    """Bind phase coordination to existing policy helpers and effect adapters."""
-
-    def __init__(self, effects, *, repo, repo_path, state_dir, base, base_sha, provider, config_path, newly_activated):
+    """Delegate the coordinator's existing contract to independently scoped handlers."""
+    def __init__(self, effects: ExecutionEffects, *, repo, repo_path, state_dir, base,
+                 base_sha, provider, config_path, newly_activated):
         self.effects = effects
-        self.repo = repo
-        self.repo_path = repo_path
-        self.state_dir = state_dir
-        self.base = base
-        self.base_sha = base_sha
-        self.provider = provider
-        self.config_path = config_path
-        self.newly_activated = newly_activated
-        self.catalog_plan = None
-        self.plan = None
-        self.level = 1
-        self.archive_sources = ()
-        self.archive_candidates = ()
-        self.archive_scope_sources = ()
-        self._archive_snapshot = None
-        self._latest_verify_output = ''
-        self._definition_snapshot = None
-        self.recovery = RecoveryDispatcher(
-            effects.state.connection,
-            effects.blocking.block_active_execplan,
-            effects.blocking.block_active_execplan_from_revision,
-        )
+        self._identity = ExecutionIdentity(repo, repo_path, state_dir, base, base_sha,
+                                           provider, config_path, newly_activated)
+        self._preparation = PreparationSnapshot()
+        self.recovery = RecoveryDispatcher(effects.state.connection,
+            effects.blocking.block_active_execplan, effects.blocking.block_active_execplan_from_revision)
         self.rebase_corrections = RebaseCorrectionRepository(effects.state.connection)
 
+    def _snapshot(self) -> PreparationSnapshot:
+        return getattr(self, '_preparation', PreparationSnapshot())
+
+    def _update_snapshot(self, **changes: object) -> None:
+        for field in ('plan', 'catalog_plan'):
+            if changes.get(field) is not None:
+                changes[field] = MappingProxyType({
+                    key: tuple(value) if isinstance(value, list) else value
+                    for key, value in dict(changes[field]).items()
+                })
+        self._preparation = replace(self._snapshot(), **changes)
+
+    @property
+    def repo(self):
+        return getattr(self, '_identity', ExecutionIdentity()).repo
+
+    @repo.setter
+    def repo(self, value):
+        self._identity = replace(getattr(self, '_identity', ExecutionIdentity()), repo=value)
+
+    @property
+    def repo_path(self):
+        return getattr(self, '_identity', ExecutionIdentity()).repo_path
+
+    @repo_path.setter
+    def repo_path(self, value):
+        self._identity = replace(getattr(self, '_identity', ExecutionIdentity()), repo_path=value)
+
+    @property
+    def state_dir(self):
+        return getattr(self, '_identity', ExecutionIdentity()).state_dir
+
+    @state_dir.setter
+    def state_dir(self, value):
+        self._identity = replace(getattr(self, '_identity', ExecutionIdentity()), state_dir=value)
+
+    @property
+    def base(self):
+        return getattr(self, '_identity', ExecutionIdentity()).base
+
+    @base.setter
+    def base(self, value):
+        self._identity = replace(getattr(self, '_identity', ExecutionIdentity()), base=value)
+
+    @property
+    def base_sha(self):
+        return getattr(self, '_identity', ExecutionIdentity()).base_sha
+
+    @base_sha.setter
+    def base_sha(self, value):
+        self._identity = replace(getattr(self, '_identity', ExecutionIdentity()), base_sha=value)
+
+    @property
+    def provider(self):
+        return getattr(self, '_identity', ExecutionIdentity()).provider
+
+    @provider.setter
+    def provider(self, value):
+        self._identity = replace(getattr(self, '_identity', ExecutionIdentity()), provider=value)
+
+    @property
+    def config_path(self):
+        return getattr(self, '_identity', ExecutionIdentity()).config_path
+
+    @config_path.setter
+    def config_path(self, value):
+        self._identity = replace(getattr(self, '_identity', ExecutionIdentity()), config_path=value)
+
+    @property
+    def newly_activated(self):
+        return getattr(self, '_identity', ExecutionIdentity()).newly_activated
+
+    @newly_activated.setter
+    def newly_activated(self, value):
+        self._identity = replace(getattr(self, '_identity', ExecutionIdentity()), newly_activated=value)
+
+    @property
+    def catalog_plan(self):
+        return self._snapshot().catalog_plan
+
+    @catalog_plan.setter
+    def catalog_plan(self, value):
+        self._update_snapshot(catalog_plan=value)
+
+    @property
+    def plan(self):
+        return self._snapshot().plan
+
+    @plan.setter
+    def plan(self, value):
+        self._update_snapshot(plan=value)
+
+    @property
+    def level(self):
+        return self._snapshot().level
+
+    @level.setter
+    def level(self, value):
+        self._update_snapshot(level=value)
+
+    @property
+    def archive_sources(self):
+        return self._snapshot().archive_sources
+
+    @archive_sources.setter
+    def archive_sources(self, value):
+        self._update_snapshot(archive_sources=value)
+
+    @property
+    def archive_candidates(self):
+        return self._snapshot().archive_candidates
+
+    @archive_candidates.setter
+    def archive_candidates(self, value):
+        self._update_snapshot(archive_candidates=value)
+
+    @property
+    def archive_scope_sources(self):
+        return self._snapshot().archive_scope_sources
+
+    @archive_scope_sources.setter
+    def archive_scope_sources(self, value):
+        self._update_snapshot(archive_scope_sources=value)
+
+    @property
+    def _archive_snapshot(self):
+        return self._snapshot()._archive_snapshot
+
+    @_archive_snapshot.setter
+    def _archive_snapshot(self, value):
+        self._update_snapshot(_archive_snapshot=value)
+
+    @property
+    def _latest_verify_output(self):
+        return self._snapshot()._latest_verify_output
+
+    @_latest_verify_output.setter
+    def _latest_verify_output(self, value):
+        self._update_snapshot(_latest_verify_output=value)
+
+    @property
+    def _definition_snapshot(self):
+        return self._snapshot()._definition_snapshot
+
+    @_definition_snapshot.setter
+    def _definition_snapshot(self, value):
+        self._update_snapshot(_definition_snapshot=value)
+
+    def _context_handler(self):
+        return execution_assembly.context(
+            self.effects, getattr(self, "_identity", ExecutionIdentity()),
+            self._snapshot, self._update_snapshot,
+            {
+                "_resolving_rebase": lambda *a, **kw: self._resolving_rebase(*a, **kw),
+            },
+        )
+
     def _row(self):
-        return self.effects.state.row()
-
-    def _document_draft(self, context):
-        if not self.effects.agent.is_loop_manager_repository(self.repo_path):
-            return None
-        draft = document_drafts.DocumentDraftRepository(
-            self.effects.state.connection,
-        ).for_plan(self.repo, context.plan.plan_id)
-        try:
-            claim = document_publication.plan_claim(
-                document_publication.read_plan_text(context.worktree / context.plan.path)
-            )
-        except (OSError, UnicodeError) as error:
-            raise document_drafts.DocumentDraftError(
-                '문서 ExecPlan identity를 읽을 수 없습니다.'
-            ) from error
-        if (claim is None) != (draft is None) or (
-            claim is not None and draft is not None and claim != draft.draft_id
-        ):
-            raise document_drafts.DocumentDraftError(
-                '문서 ExecPlan과 승인 매핑 identity가 다릅니다.'
-            )
-        return draft
-
-    def _document_block(self, context, draft, error):
-        detail = f"승인 문서 게시 중단: {error}"
-        with self.effects.state.connection:
-            document_drafts.DocumentDraftRepository(
-                self.effects.state.connection,
-            ).record_publication_error(draft.draft_id, detail)
-        return self._block_final(
-            self.repo, context.worktree, detail,
-            str(self._row()['verify_result'] or ''),
-            reason=BlockReasonCode.REVIEW_SPECIFICATION_DEADLOCK,
-            user_targets=(draft.target_path,),
-        )
-
-    def _document_guard(self, context, draft):
-        drafts = document_drafts.DocumentDraftRepository(
-            self.effects.state.connection,
-        )
-        drafts.assert_current(draft, self.repo_path, self.base)
-        plan_text = document_publication.read_plan_text(
-            context.worktree / context.plan.path,
-        )
-        document_publication.validate_document_plan(plan_text, self.plan, draft)
-        document_publication.validate_exact_worktree(
-            draft, context.worktree, str(self._row()['active_sha'] or ''),
-        )
-
-    def _document_review_prompt(self, base_prompt, draft):
-        if draft is None:
-            return base_prompt
-        return (
-            base_prompt
-            + "\n문서 전용 검토: 아래 승인 artifact의 원본·수정본·전체 diff와 "
-            "현재 PR diff를 비교하고 PRODUCT·Requirement·ARCHITECTURE 역할, "
-            "기존 동작·결정·Acceptance Criteria·문서 간 일관성의 의미 보존을 "
-            "판정하라. 마지막 VERDICT 앞에 DOCUMENT_MEANING: PASS 또는 "
-            "DOCUMENT_MEANING: UNCERTAIN 및 DOCUMENT_DIFF: PASS 또는 "
-            "DOCUMENT_DIFF: FAIL을 각각 한 줄로 명시하라.\n"
-            + document_drafts.review_artifact(draft)
-        )
-
-    def _run_document(self, context, draft):
-        try:
-            drafts = document_drafts.DocumentDraftRepository(
-                self.effects.state.connection,
-            )
-            drafts.assert_current(draft, self.repo_path, self.base)
-            plan_text = document_publication.read_plan_text(
-                context.worktree / context.plan.path,
-            )
-            document_publication.validate_document_plan(plan_text, self.plan, draft)
-            document_publication.apply_approved_bytes(
-                draft, context.worktree, str(self._row()['active_sha'] or ''),
-            )
-        except (document_drafts.DocumentDraftError, OSError, UnicodeError) as error:
-            return self._document_block(context, draft, error)
-        result = (
-            f"COMMIT_TITLE: Apply approved document draft {draft.draft_id[:12]}\n"
-            f"PR_SUMMARY: Apply the exact approved bytes to {draft.target_path}; "
-            "retain the source and meaning-preservation review gates.\n"
-            "TARGETED_TESTS: 문서 바이트 적용만 수행하므로 실행 가능한 관련 unit test가 없습니다."
-        )
-        return self._finish_worker(context, self._row(), result)
-
-    def work_started(self, context):
-        with self.effects.state.connection:
-            resumed = notifications.record_work_start(
-                self.effects.state.connection, self.repo,
-                f"ExecPlan {context.phase.value}",
-                plan_id=context.plan.plan_id,
-            )
-        if resumed:
-            self.effects.events.operation_log(
-                f"차단 해제 후 ExecPlan 작업 재개: {context.plan.plan_id}"
-            )
-    def _owned_checkpoint_remote(
-        self, context, row, remote_oid, current, pull_request=None,
-    ):
-        """Require the published checkpoint's durable owner on an active resume."""
-        checkpoint = self.effects.state.connection.execute(
-            'SELECT phase, accepted_remote_oid, request_identity, branch, worktree '
-            'FROM blocked_checkpoints '
-            'WHERE repo = ? AND plan_id = ?',
-            (self.repo, context.plan.plan_id),
-        ).fetchone()
-        if checkpoint is None or checkpoint['phase'] != 'published':
-            return True
-        if current is not None and current.operation == 'rebase':
-            return self._owned_current_checkpoint_rebase(
-                context, row, remote_oid, current, checkpoint, pull_request)
-        if current is not None and ((current.snapshot or {}).get('current_rebase_acceptance')
-                or (current.snapshot or {}).get('completed_rebase')
-                or (current.snapshot or {}).get('rebase_completion')
-                or self._legacy_current_rebase(context, current)):
-            return self._owned_persisted_rebase(
-                context, row, remote_oid, current, checkpoint, pull_request,
-            )
-        review_resume = (current.snapshot or {}).get('published_review_resume') if current else None
-        if review_resume is not None and current.operation != 'rebase':
-            return self._owned_published_review_resume(
-                context, row, remote_oid, current, checkpoint,
-                review_resume, pull_request,
-            )
-        marker = (current.snapshot or {}).get('blocked_resume') if current else None
-        if marker:
-            return self._owned_current_checkpoint_rebase(
-                context, row, remote_oid, current, checkpoint, pull_request)
-        if not marker and not row['publication_remote_oid']:
-            # A reviewed correction is Worker input only when its remote head
-            # is still the checkpoint's last accepted, owned ref.
-            if (row['pr_url'] or pull_request is not None
-                    or remote_oid != checkpoint['accepted_remote_oid']):
-                return False
-            try:
-                self.effects.workspace.validate_execplan_workspace_identity(
-                    self.state_dir, self.repo, context.plan.plan_id,
-                    context.branch, context.worktree,
-                )
-                self.effects.workspace.validate_managed_worktree(
-                    self.repo_path, context.worktree, context.branch,
-                )
-                local_oid = self.effects.workspace.git(
-                    context.worktree, 'rev-parse', 'HEAD',
-                ).stdout.strip()
-            except (RuntimeError, OSError):
-                return False
-            if local_oid != remote_oid:
-                return False
-            return checkpoint_ownership.owned_remote_oid(
-                self.effects.state.connection, self.repo_path, self.repo,
-                context.plan.plan_id, context.branch, context.worktree,
-                remote_oid, self.effects.workspace.git,
-                before_head=local_oid, recorded_oid=remote_oid,
-            ) == remote_oid
-        return False
-
-    def _owned_published_review_resume(
-        self, context, row, remote_oid, current, checkpoint, marker, pull_request,
-    ):
-        """Recheck the original published owner without inventing rebase proof."""
-        original = str(checkpoint['accepted_remote_oid'] or '')
-        recorded = str(row['publication_remote_oid'] or '')
-        if (
-            not isinstance(marker, dict) or not original
-            or marker.get('request_identity') != checkpoint['request_identity']
-            or marker.get('owner_oid') != original
-            or marker.get('head') != original
-            or checkpoint['branch'] != context.branch
-            or checkpoint['worktree'] != str(context.worktree)
-            or (current.snapshot or {}).get('blocked_resume')
-            or row['pr_url']
-            or (pull_request is not None and current.operation != 'pr_create')
-            or (pull_request is not None
-                and pull_request.get('headRefOid') != remote_oid)
-        ):
-            return False
-        try:
-            self.effects.workspace.validate_execplan_workspace_identity(
-                self.state_dir, self.repo, context.plan.plan_id,
-                context.branch, context.worktree,
-            )
-            self.effects.workspace.validate_managed_worktree(
-                self.repo_path, context.worktree, context.branch,
-            )
-            local = self.effects.workspace.git(
-                context.worktree, 'rev-parse', 'HEAD',
-            ).stdout.strip()
-            branch_ref = self.effects.workspace.git(
-                self.repo_path, 'rev-parse', f'refs/heads/{context.branch}',
-            ).stdout.strip()
-            if local != branch_ref:
-                return False
-            if (current.operation == 'commit'
-                    and local != current.expected_head
-                    and not checkpoint_ownership.committed_tree_matches_intent(
-                        self.repo_path, current.expected_head, local,
-                        current.snapshot or {}, self.effects.workspace.git,
-                    )):
-                return False
-            if checkpoint_ownership.owned_remote_oid(
-                self.effects.state.connection, self.repo_path, self.repo,
-                context.plan.plan_id, context.branch, context.worktree,
-                original, self.effects.workspace.git,
-                before_head=local, require_live=False,
-            ) != original:
-                return False
-            pending_push = (
-                current.operation == 'push'
-                and (current.snapshot or {}).get('remote_before') == original
-                and current.expected_head == local == remote_oid
-                and remote_oid != original
-                and recorded in (original, remote_oid)
-            )
-            if remote_oid == original and recorded == original:
-                expected_live = original
-            elif pending_push or (
-                remote_oid == recorded == local
-                and (current.snapshot or {}).get('pushed_checkpoint_head') == local
-            ):
-                expected_live = remote_oid
-            else:
-                return False
-            observed = self.effects.workspace.git(
-                self.repo_path, 'ls-remote', '--heads', 'origin',
-                f'refs/heads/{context.branch}', check=False,
-            )
-        except (RuntimeError, OSError):
-            return False
-        return (observed.returncode == 0 and
-                [line.split() for line in observed.stdout.splitlines() if line.strip()]
-                == [[expected_live, f'refs/heads/{context.branch}']])
-
-    def _current_rebase_service(self, context, **options):
-        factory = self.effects.workspace.current_rebase_service
-        if factory is None:
-            raise manager_git_journal.MutationEvidenceError('current rebase adapter unavailable')
-        return factory(context, **options)
-
-    def _checkpoint_remote_oid(self, repo_path, branch):
-        checkpoints = self.effects.checkpoint
-        current = (checkpoints.get(self.repo, self.effects.state.plan_id)
-                   if checkpoints is not None else None)
-        return managed_rebase_adoption.checkpoint_remote_oid(
-            current, repo_path, branch, git=self.effects.workspace.git,
-            read_fetched=self.effects.workspace.remote_branch_oid)
-
-    def _owned_current_checkpoint_rebase(self, context, row, remote_oid, current,
-                                         checkpoint, pull_request):
-        original = str(checkpoint['accepted_remote_oid'] or '')
-        recorded = str(row['publication_remote_oid'] or original)
-        if not original or row['pr_url']:
-            return False
-        intermediate = (current.snapshot or {}).get('rebase_publication_intent') or {}
-        pending_intermediate = (current.operation == 'rebase_publish'
-                                and intermediate.get('remote_before') == recorded
-                                and remote_oid in (recorded, intermediate.get('head')))
-        before = (current.snapshot or {}).get('remote_before')
-        adopted = (current.snapshot or {}).get('last_adopted_remote_oid') or original
-        # Final push recovery can run after the runtime row adopted its head,
-        # but before the checkpoint intent was cleared. Keep the saved lease
-        # bound to the prior owned OID in either ordering.
-        pending_push = (current.operation == 'push'
-                        and before in (recorded, adopted)
-                        and recorded in (before, current.expected_head)
-                        and remote_oid == current.expected_head)
-        pushed = ((current.snapshot or {}).get('pushed_checkpoint_head') == remote_oid
-                  and recorded == remote_oid)
-        if not ((remote_oid == original and recorded == original) or pending_push or pushed
-                or pending_intermediate
-                or (remote_oid == recorded and (current.snapshot or {}).get('last_adopted_remote_oid') == recorded)):
-            return False
-        if pull_request is not None and (current.operation != 'pr_create'
-                                        or pull_request.get('headRefOid') != remote_oid):
-            return False
-        try:
-            if checkpoint_ownership.owned_remote_oid(
-                self.effects.state.connection, self.repo_path, self.repo,
-                context.plan.plan_id, context.branch, context.worktree,
-                original, self.effects.workspace.git, recorded_oid=original,
-                require_live=remote_oid == original,
-            ) != original:
-                return False
-            service = self._current_rebase_service(context, remote_oid=remote_oid)
-            if pull_request is not None:
-                # The pending PR creation is checked separately by publication
-                # recovery; bind its exact head here without granting a push.
-                from loop_manager_internal.git.managed_rebase_validation import PullRequest
-                service = replace(service, expected=replace(
-                    service.expected, remote=replace(service.expected.remote,
-                        pull_request=PullRequest(str(pull_request['url']), self.repo,
-                            context.branch, remote_oid, 'OPEN'))))
-            observed, decision = service.require_owned(checkpoint=current)
-            if current.operation == 'commit' and observed.head != current.expected_head:
-                return checkpoint_ownership.committed_tree_matches_intent(
-                    self.repo_path, current.expected_head, observed.head,
-                    current.snapshot or {}, self.effects.workspace.git)
-            return decision.status in {RebaseStatus.START, RebaseStatus.WAITING, RebaseStatus.COMPLETE}
-        except (RuntimeError, OSError, KeyError, TypeError):
-            return False
-
-    def _owned_detached_rebase(self, context, row, remote_oid, current, checkpoint, pull_request):
-        return self._owned_current_checkpoint_rebase(
-            context, row, remote_oid, current, checkpoint, pull_request)
-
-    @staticmethod
-    def _rebase_completion_session(context, current):
-        snapshot = getattr(current, 'snapshot', None) or {}
-        session = getattr(context, 'worker_session_id', None)
-        if snapshot.get('stash_oid') and snapshot.get('pending') == 'continue':
-            return snapshot.get('rebase_start_session_id', session)
-        return session
-
-    def _matching_rebase_journal_result(self, context, current, remote_oid,
-                                        observed, *, allow_later_file_changes=False):
-        checkpoint_snapshot = getattr(current, 'snapshot', None) or {}
-
-        def matches(item):
-            saved = item['result']['observed']
-            if not allow_later_file_changes:
-                return saved == observed or (
-                    checkpoint_snapshot.get('stash_oid')
-                    and checkpoint_snapshot.get('pending') == 'continue'
-                    and self._completed_autostash_correction(
-                        context, item['intent'], saved, observed,
-                    )
-                )
-            # The sealed rebase result owns Git's progress, not subsequent
-            # Worker edits to conflict files and their index entries.
-            return all(saved.get(field) == observed.get(field) for field in (
-                'head', 'branch', 'ref', 'registration', 'operations', 'metadata',
-            ))
-
-        return any(
-            item['intent']['kind'] == 'managed_rebase'
-            and item['intent']['target'] == str(context.worktree.resolve())
-            and (checkpoint_snapshot.get('rebase_evidence_version') != 2
-                 or (item['intent']['expected'].get('branch') == context.branch
-                     and item['intent']['expected'].get('run_id')
-                         == checkpoint_snapshot.get('rebase_run_id')
-                     and item['intent']['expected'].get('checkpoint_generation', -1)
-                         <= getattr(current, 'generation', -1)))
-            and item['intent']['expected']['before_head'] == current.expected_head
-            and item['intent']['expected']['target_base_oid'] == current.target_base_oid
-            and item['intent']['expected']['remote_oid'] == remote_oid
-            and matches(item)
-            for item in manager_git_journal.verified_managed_transitions(
-                self.state_dir, str(self.repo_path.resolve()),
-                f'plan:{context.plan.plan_id}',
-                agent_session_id=self._rebase_completion_session(context, current),
-                git=self.effects.workspace.git,
-            )
-        )
-
-    def _owned_persisted_rebase(self, context, row, remote_oid, current, checkpoint, pull_request):
-        return self._owned_current_checkpoint_rebase(
-            context, row, remote_oid, current, checkpoint, pull_request)
-
-    def _completed_rebase_proof(self, context, current, remote_oid, observed):
-        """Bind the SQLite completion generation to one verified journal result."""
-        for item in manager_git_journal.verified_managed_transitions(
-            self.state_dir, str(self.repo_path.resolve()),
-            f'plan:{context.plan.plan_id}',
-            agent_session_id=self._rebase_completion_session(context, current),
-            git=self.effects.workspace.git,
-        ):
-            expected = item['intent']['expected']
-            if (item['intent']['kind'] == 'managed_rebase'
-                    and item['intent']['target'] == str(context.worktree.resolve())
-                    and expected.get('branch') == context.branch
-                    and expected.get('run_id') == (current.snapshot or {}).get('rebase_run_id')
-                    and expected.get('checkpoint_generation', -1) <= current.generation
-                    and expected.get('before_head') == current.expected_head
-                    and expected.get('target_base_oid') == current.target_base_oid
-                    and expected.get('remote_oid') == remote_oid
-                    and item['result']['observed'] == observed):
-                proof = {
-                    'journal_id': item['intent']['id'],
-                    'generation': current.generation,
-                    'run_id': expected.get('run_id'),
-                    'before_head': current.expected_head,
-                    'after_head': observed['head'],
-                    'target_base_oid': current.target_base_oid,
-                    'remote_oid': remote_oid,
-                    'branch': context.branch,
-                    'worktree': str(context.worktree.resolve()),
-                    'session': self._rebase_completion_session(context, current),
-                }
-                snapshot = current.snapshot or {}
-                if snapshot.get('stash_oid') and snapshot.get('pending') == 'continue':
-                    live = self._rebase_journal_state(context)
-                    if not self._completed_autostash_correction(
-                            context, item['intent'], observed, live):
-                        return None
-                    proof['autostash_correction'] = {
-                        'sealed': observed, 'approved': live,
-                        'stash_oid': snapshot['stash_oid'],
-                        'stage_evidence': snapshot.get('stage_evidence'),
-                        'session': getattr(context, 'worker_session_id', None),
-                    }
-                return proof
-        return None
-
-    def _owned_completed_rebase(self, context, row, remote_oid, current, checkpoint,
-                                pull_request, local_head):
-        return self._owned_current_checkpoint_rebase(
-            context, row, remote_oid, current, checkpoint, pull_request)
-
-    def recover_failure(self, context, error):
-        return self._recover(error.reason, str(error), context=context)
+        return self._context_handler()._row()
 
     def _context(self):
-        row = self._row()
-        catalog_plan = self.effects.state.active_execplan(self.repo)
-        if catalog_plan is None or self.plan is None:
-            raise RuntimeError('활성 ExecPlan 실행 context를 복구할 수 없습니다.')
-        self.catalog_plan = catalog_plan
-        phase = ExecutionPhase(str(catalog_plan['status']))
-        return ExecutionContext(
-            repo=self.repo,
-            repo_path=self.repo_path,
-            state_dir=self.state_dir,
-            base_branch=self.base,
-            base_sha=self.base_sha,
-            provider=self.provider,
-            config_path=self.config_path,
-            plan=ExecutionPlanMetadata(
-                plan_id=str(self.plan['id']),
-                title=str(self.plan['title']),
-                path=str(row['plan_path']),
-                plan_sha=str(row['plan_sha']) if row['plan_sha'] is not None else None,
-                sources=tuple((str(item) for item in self.plan.get('sources', ()))),
-                definition_revision_sha=(
-                    str(self.catalog_plan['current_revision_sha'])
-                    if self.catalog_plan['current_revision_sha'] is not None
-                    else None
-                ),
-                content_hash=str(self.catalog_plan['content_hash']),
-                depends_on=tuple(
-                    str(item) for item in self.plan.get('depends_on', ())
-                ),
-                complexity=str(self.plan.get('complexity')),
-                risk=str(self.plan.get('risk')),
-                priority=str(self.plan.get('priority')),
-            ),
-            phase=phase,
-            branch=str(row['branch'] or ''),
-            worktree=Path(str(row['worktree'] or '')),
-            active_sha=str(row['active_sha'] or ''),
-            validated_base_sha=str(row['validated_base_sha']) if row['validated_base_sha'] is not None else None,
-            worker_session_id=str(row['worker_session_id']) if row['worker_session_id'] is not None else None,
-            worker_session_binding=row['worker_session_binding'],
-            worker_session_transition=row['worker_session_transition'],
-            reviewer_session_id=str(row['reviewer_session_id']) if row['reviewer_session_id'] is not None else None,
-            worker_result=str(row['worker_result']) if row['worker_result'] is not None else None,
-            verify_result=str(row['verify_result']) if row['verify_result'] is not None else None,
-            review_result=str(row['review_result']) if row['review_result'] is not None else None,
-            pr_url=str(row['pr_url']) if row['pr_url'] is not None else None,
-            pr_conflict_recovery=bool(row['pr_conflict_recovery']),
-            pr_conflict_base_oid=str(row['pr_conflict_base_oid']) if row['pr_conflict_base_oid'] is not None else None,
-            resolving_rebase=self._resolving_rebase(row),
-            archive_sources=self.archive_sources,
-            archive_snapshot_token=(
-                self._archive_snapshot.token
-                if self._archive_snapshot is not None else None
-            ),
-            archive_candidate_scope=self.archive_candidates,
-            current_definition_token=(
-                self._definition_snapshot.definition_token
-                if self._definition_snapshot is not None
-                else None
-            ),
-            current_base_token=str(row['active_sha'] or ''),
-            worker_input_token=(
-                str(row['worker_input_token'])
-                if row['worker_input_token'] is not None else None
-            ),
-            archive_token=(
-                str(row['archive_token'])
-                if row['archive_token'] is not None else None
-            ),
-            verify_token=(
-                str(row['verify_token'])
-                if row['verify_token'] is not None else None
-            ),
-            review_token=(
-                str(row['review_token'])
-                if row['review_token'] is not None else None
-            ),
-            publication_token=(
-                str(row['publication_token'])
-                if row['publication_token'] is not None else None
-            ),
-        )
-
-    @staticmethod
-    def _final(detail=None):
-        return ExecutionOutcome(ExecutionOutcomeKind.FINAL_BLOCK, detail=detail, error=True)
-
-    @staticmethod
-    def _retry(detail=None):
-        return ExecutionOutcome(ExecutionOutcomeKind.RETRY, detail=detail, error=detail is not None)
-
-    def _recover(self, reason, detail, *, context=None, fingerprint=None,
-                 progress_marker=None, final_block_reason=None,
-                 from_revision=False, correction_limit=None, attempts=0,
-                 user_targets=(), verify_result=None, worker_result=None,
-                 worker_decision=None):
-        """Persist a typed decision and apply the final gate in one transaction."""
-
-        row = self._row()
-        plan_id = str(self.plan['id']) if self.plan is not None else self.effects.state.plan_id
-        base = str(row['active_sha'] or self.base_sha)
-        progress = progress_marker or '|'.join(str(row[key] or '') for key in (
-            'active_sha', 'worker_session_id', 'reviewer_session_id',
-            'worker_input_token', 'verify_token', 'review_token'))
-        fingerprint_input = (
-            f"{reason.value}|{row['phase']}|{base}"
-            if reason in TRANSIENT or reason in RECONCILE
-            else f"{reason.value}|{detail}"
-        )
-        stable_fingerprint = fingerprint or hashlib.sha256(
-            fingerprint_input.encode()
-        ).hexdigest()
-        observation = RecoveryObservation(
-            reason=reason, repo=self.repo, plan_id=plan_id,
-            phase=str(row['phase'] or ''),
-            plan_revision=str(self.catalog_plan['current_revision_sha'] or '')
-            if self.catalog_plan is not None else None,
-            base_revision=base, fingerprint=stable_fingerprint,
-            progress_marker=progress, detail=detail,
-            user_targets=tuple(user_targets),
-            worker_decision=worker_decision,
-        )
-        decision = self.recovery.apply(
-            observation,
-            worktree=Path(str(row['worktree'] or '')),
-            repo_path=self.repo_path,
-            revision=f"refs/remotes/origin/{self.base}",
-            verify_result=(str(row['verify_result'] or '')
-                           if verify_result is None else verify_result),
-            from_revision=from_revision,
-            correction_limit=correction_limit,
-            attempts=attempts,
-            final_block_reason=final_block_reason,
-            worker_result=worker_result,
-        )
-        kind = {
-            RecoveryAction.RETRY: ExecutionOutcomeKind.RETRY,
-            RecoveryAction.RECONCILE: ExecutionOutcomeKind.RETRY,
-            RecoveryAction.CORRECT: ExecutionOutcomeKind.RETRY,
-            RecoveryAction.PAUSE: ExecutionOutcomeKind.TRANSIENT_PAUSE,
-            RecoveryAction.FINAL_BLOCK: ExecutionOutcomeKind.FINAL_BLOCK,
-        }[decision.action]
-        return ExecutionOutcome(kind, context=context, detail=detail,
-                                error=kind is ExecutionOutcomeKind.FINAL_BLOCK,
-                                recovery=decision)
-
-    def _parse_worker_outcome(self, context, message, *, allow_legacy_ready=False):
-        allowed = {context.plan.path, *context.plan.sources,
-                   'docs/PRODUCT.md', 'docs/ARCHITECTURE.md'}
-        documents = {}
-        root = context.worktree.resolve()
-        for path in allowed:
-            target = root / path
-            if target.is_file() and target.resolve() == target:
-                documents[path] = target.read_text(encoding='utf-8')
-        return parse_worker_outcome(
-            message, plan_path=context.plan.path,
-            sources=context.plan.sources, documents=documents,
-            allow_legacy_ready=allow_legacy_ready,
-        )
-
-    def _block_worker_decision(self, context, message, outcome: WorkerOutcome):
-        if not self._row()['agent_input_fingerprint']:
-            # Legacy saved results may have cleared their Agent projection
-            # before the disposition contract existed. Anchor release to an
-            # immutable remote definition instead of the Worker's local edit.
-            revision = context.plan.definition_revision_sha or context.base_sha
-            self.effects.state.update_project(
-                self.repo,
-                agent_input_fingerprint=self.effects.agent._revision_execplan_input_fingerprint(
-                    self.repo_path, revision, self.catalog_plan,
-                ),
-            )
-        evidence = outcome.evidence()
-        for field in ('problem', 'proposal', 'question'):
-            evidence[field] = redact_secrets(str(evidence[field]))
-        locations = [
-            redact_secrets(f"{item.path}#{item.section}")
-            for item in outcome.locations
-        ]
-        evidence['locations'] = [
-            {'path': item.path, 'section': redact_secrets(item.section)}
-            for item in outcome.locations
-        ]
-        detail = (
-            f"Worker 사용자 결정 대기: {evidence['problem']}\n"
-            f"제안: {evidence['proposal']}\n"
-            f"질문: {evidence['question']}\n"
-            f"근거: {', '.join(locations)}"
-        )
-        return self._recover(
-            RecoveryReason.USER_DECISION, detail, context=context,
-            final_block_reason=BlockReasonCode.USER_DECISION_REQUIRED,
-            user_targets=tuple(locations),
-            worker_result=message, worker_decision=evidence,
-        )
-
-    def _block_final(self, repo, worktree, detail, verify_result, *, reason,
-                     recovery_reason=None, user_targets=()):
-        return self._recover(recovery_reason or reason_from_block(reason), detail,
-                             final_block_reason=reason,
-                             user_targets=user_targets,
-                             verify_result=verify_result)
-
-    def _metadata_correction(self, context, error, *, verify_result=None):
-        detail = f"ExecPlan metadata 검증 실패:\n{error}"
-        if context.resolving_rebase:
-            detail = self.effects.contract.REBASE_CONFLICT_PREFIX + detail
-        values = {'phase': 'WORKING', 'last_error': detail}
-        if verify_result is not None:
-            values['verify_result'] = verify_result
-        self.effects.state.update_project(self.repo, **values)
-        self.effects.events.operation_print(detail, file=sys.stderr)
-        return self._recover(
-            RecoveryReason.WORKER_CORRECTION, detail, context=context,
-            verify_result=verify_result,
-            final_block_reason=BlockReasonCode.PLAN_INPUT_INVALID,
-        )
-
-    def _block_from_revision_final(self, repo_path, repo, revision, detail,
-                                   verify_result='', *, reason):
-        return self._recover(
-            RecoveryReason.OWNERSHIP_UNCERTAIN, detail,
-            final_block_reason=reason, from_revision=True,
-            verify_result=verify_result,
-        )
-
-    def _step_outcome(self, step_result):
-        kind = {0: ExecutionOutcomeKind.SUCCESS, 1: ExecutionOutcomeKind.FINAL_BLOCK, self.effects.contract.PROJECT_STEP_RETRY: ExecutionOutcomeKind.RETRY, self.effects.contract.PROJECT_STEP_TRANSIENT_PAUSE: ExecutionOutcomeKind.TRANSIENT_PAUSE, self.effects.contract.PROJECT_STEP_USAGE_PAUSE: ExecutionOutcomeKind.USAGE_PAUSE, self.effects.contract.PROJECT_STEP_PLANNING_PENDING: ExecutionOutcomeKind.PLANNING_PENDING}.get(
-            step_result,
-            ExecutionOutcomeKind.OPERATIONAL_ERROR,
-        )
-        return ExecutionOutcome(kind, error=kind in {
-            ExecutionOutcomeKind.FINAL_BLOCK,
-            ExecutionOutcomeKind.OPERATIONAL_ERROR,
-        })
-
-    def _advanced(self):
-        return ExecutionOutcome.advanced(self._context())
-
-    def _resolving_rebase(self, row):
-        checkpoint = self.effects.checkpoint
-        worktree = Path(str(row['worktree'] or ''))
-        if (checkpoint is not None and self.catalog_plan is not None
-                and self.effects.workspace.current_rebase_service is not None
-                and self.effects.workspace.is_directory(worktree)):
-            current = checkpoint.get(self.repo, self.catalog_plan['plan_id'])
-            if (current.operation == 'rebase'
-                    or self.effects.workspace._rebase_in_progress_for_branch(worktree, str(row['branch'] or ''))
-                    or (int(row['pr_conflict_recovery']) and self._unmerged_stages(worktree))):
-                # Validate detached ownership before the ordinary branch gate;
-                # a diagnostic string or metadata directory alone is insufficient.
-                context = SimpleNamespace(
-                    plan=SimpleNamespace(plan_id=self.catalog_plan['plan_id']),
-                    worktree=worktree, branch=str(row['branch'] or ''))
-                _, decision = self._current_rebase_service(context).require_owned(checkpoint=current)
-                return decision.status is RebaseStatus.WAITING
-        rebase_error = str(row['last_error'] or '')
-        rebase_recovery = bool(
-            row['phase'] == 'WORKING' and (rebase_error == self.effects.contract.REBASE_IN_PROGRESS_ERROR or rebase_error.startswith(self.effects.contract.REBASE_CONFLICT_PREFIX)),
-        )
-        if not rebase_recovery or not self.effects.workspace.is_directory(worktree):
-            return False
-        if self.effects.workspace._rebase_in_progress_for_branch(worktree, str(row['branch'] or '')):
-            return True
-        if int(row['pr_conflict_recovery']) and row['pr_conflict_base_oid']:
-            return bool(self._unmerged_stages(worktree))
-        return bool(
-            checkpoint is not None
-            and checkpoint.get(self.repo, self.catalog_plan['plan_id']).operation == 'rebase'
-            and self._unmerged_stages(worktree)
-        ) if self.catalog_plan is not None else False
-
-    def _unmerged_stages(self, worktree):
-        return self.effects.workspace.git(worktree, 'ls-files', '-u', '-z').stdout
-
-    def _rebase_observation(self, context, *, target=None, stash_oid=None):
-        checkpoint = self.effects.checkpoint
-        intent = checkpoint.get(self.repo, context.plan.plan_id) if checkpoint else None
-        snapshot = (intent.snapshot or {}) if intent else {}
-        row = self._row()
-        in_progress = self.effects.workspace._rebase_in_progress_for_branch(
-            context.worktree, context.branch
-        )
-        return observe_git(
-            plan_revision=(f'{context.plan.definition_revision_sha}:'
-                           f'{context.plan.content_hash}'),
-            target_base=str(target or (intent.target_base_oid if intent else None)
-                            or row['pr_conflict_base_oid'] or row['active_sha'] or ''),
-            before_head=str((intent.expected_head if intent else None)
-                            or row['pr_conflict_head_oid'] or row['active_sha'] or ''),
-            source=(CorrectionSource.REBASE if in_progress
-                    else CorrectionSource.AUTOSTASH),
-            stash_oid=stash_oid or snapshot.get('stash_oid'), worktree=context.worktree,
-            git=self.effects.workspace.git,
-            capture_snapshot=self.effects.agent.capture_git_snapshot,
-        )
-
-    def _rebase_conflict(self, context, detail, *, corrected=False, worker_result=None,
-                         abnormal_result=False, target=None, stash_oid=None,
-                         recovery_reason=RecoveryReason.REBASE_CONFLICT):
-        """Track actual Git progress before considering the final safety gate."""
-        try:
-            observation = self._rebase_observation(
-                context, target=target, stash_oid=stash_oid,
-            )
-            if not observation.target_base or not observation.before_head:
-                return self._recover(
-                    RecoveryReason.OWNERSHIP_UNCERTAIN,
-                    'rebase intent cannot identify its original head and target base',
-                    context=context,
-                    final_block_reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE,
-                )
-            if observation.source is CorrectionSource.AUTOSTASH and not observation.stash_oid:
-                return self._recover(
-                    RecoveryReason.OWNERSHIP_UNCERTAIN, 'autostash_identity_unavailable',
-                    context=context,
-                    final_block_reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE,
-                )
-            current = self.rebase_corrections.get(self.repo, context.plan.plan_id)
-            saved = self.rebase_corrections.observe(
-                self.repo, context.plan.plan_id, observation,
-                corrected=corrected,
-                expected_generation=current.generation if current else None,
-                worker_session=self._row()['worker_session_id'],
-                worker_result=worker_result,
-                # This result has been consumed by the correction decision.
-                # Only finish_turn() may retain an unconsumed result for restart.
-                persist_worker_result=False,
-            )
-        except CorrectionRace:
-            return self._recover(RecoveryReason.REMOTE_SNAPSHOT_RACE,
-                                 'rebase correction generation changed', context=context)
-        except (RuntimeError, OSError, ValueError) as error:
-            return self._recover(
-                classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
-                str(error), context=context,
-            )
-        # An abnormal Agent exit is the first failed correction. Block only
-        # after three further identical, progress-free results.
-        correction_limit = 4 if abnormal_result else 3
-        if saved.occurrence >= correction_limit:
-            attempts = [
-                {
-                    'occurrence': event['occurrence'],
-                    'fingerprint': event['fingerprint'],
-                    'progress': event['progress'],
-                    'worker_result': str(event.get('worker_result') or '')[-1000:],
-                }
-                for event in saved.audit if event['occurrence'] > 0
-            ][-3:]
-            detail = (
-                f'{detail}\n동일 충돌·진전 없는 Worker correction {saved.occurrence}회; '
-                f'마지막 Worker 결과: {worker_result or self._row()["worker_result"] or ""}; '
-                f'보존된 worktree: {context.worktree}; '
-                f'기존 HEAD: {saved.before_head}; 대상 base: {saved.target_base}; '
-                f'Worker session: {saved.worker_session}; '
-                f'fingerprint: {saved.fingerprint}; progress: {saved.progress}; '
-                f'수행한 correction: {json.dumps(attempts, ensure_ascii=False)}'
-            )
-            return self._recover(
-                RecoveryReason.REBASE_CONFLICT, detail, context=context,
-                fingerprint=saved.fingerprint, progress_marker=saved.progress,
-                correction_limit=1,
-            )
-        return self._recover(
-            recovery_reason, detail, context=context,
-            fingerprint=saved.fingerprint, progress_marker=saved.progress,
-            correction_limit=10**9,
-        )
-
-    def _record_rebase_intent(self, context, target_oid):
-        checkpoint = self.effects.checkpoint
-        if checkpoint is None:
-            return
-        self._publish_rebased_checkpoint(context)
-        current = checkpoint.get(self.repo, context.plan.plan_id)
-        if self._legacy_current_rebase(context, current):
-            self._complete_rebase_intent(context)
-            current = checkpoint.get(self.repo, context.plan.plan_id)
-        if current.operation == 'rebase':
-            # Reentry observes the saved operation before deciding another step.
-            observed, decision = self._current_rebase_service(context).require_owned()
-            if decision.status is RebaseStatus.START:
-                manager_git_journal.begin_current_rebase(
-                    self.state_dir, owner=f'plan:{context.plan.plan_id}',
-                    repo=str(self.repo_path.resolve()), target=str(context.worktree.resolve()),
-                    before=self._rebase_journal_state(context), expected={
-                        'branch': context.branch, 'before_head': current.expected_head,
-                        'target_base_oid': current.target_base_oid,
-                        'remote_oid': observed.remote.oid})
-            return
-        head = self.effects.workspace.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
-        remote_oid = self._checkpoint_remote_oid(self.repo_path, context.branch)
-        live = manager_git_journal.live_remote_branch_oid(
-            self.effects.workspace.git, self.repo_path, context.branch)
-        row = self._row()
-        pr_head = str(row['pr_head_oid'] or row['pr_conflict_head_oid'] or '') or None
-        if (current.observed_remote_oid not in (None, remote_oid)
-                or live != remote_oid or (pr_head and pr_head != remote_oid)):
-            raise manager_git_journal.MutationEvidenceError('rebase start remote or PR lease differs')
-        saved = json.loads(json.dumps(current.snapshot or {}))
-        if saved:
-            saved['rebase_operation_history'] = [
-                *saved.get('rebase_operation_history', ()), dict(current.snapshot)]
-        if 'current_rebase_acceptance' in saved:
-            saved.setdefault('current_rebase_acceptance_history', []).append(saved.pop('current_rebase_acceptance'))
-        for key in ('pending', 'stage_evidence', 'worker_result', 'stash_oid', 'after_head'):
-            saved.pop(key, None)
-        checkpoint.record(
-            self.repo, context.plan.plan_id, expected_generation=current.generation,
-            operation='rebase', expected_head=head, target_base_oid=target_oid,
-            observed_remote_oid=remote_oid,
-            snapshot={**saved, 'before_head': head, 'target_base': target_oid,
-                      'rebase_remote_oid': remote_oid, 'rebase_policy': 'current_state'},
-        )
-        manager_git_journal.begin_current_rebase(
-            self.state_dir, owner=f'plan:{context.plan.plan_id}',
-            repo=str(self.repo_path.resolve()), target=str(context.worktree.resolve()),
-            before=self._rebase_journal_state(context), expected={
-                'branch': context.branch, 'before_head': head,
-                'target_base_oid': target_oid, 'remote_oid': remote_oid,
-                'agent_session_id': getattr(context, 'worker_session_id', None),
-            })
-
-    def _rebase_metadata(self, context):
-        for directory in ('rebase-merge', 'rebase-apply'):
-            values = {}
-            for name in ('orig-head', 'head-name', 'onto'):
-                result = self.effects.workspace.git(
-                    context.worktree, 'rev-parse', '--git-path',
-                    f'{directory}/{name}', check=False,
-                )
-                if result.returncode:
-                    break
-                path = Path(result.stdout.strip())
-                if not path.is_absolute():
-                    path = context.worktree / path
-                if not path.is_file():
-                    break
-                values[name] = path.read_text(encoding='utf-8').strip()
-            if len(values) == 3:
-                return values
-        return None
-
-    def _rebase_journal_state(self, context):
-        snapshot = self.effects.agent.capture_git_snapshot(context.worktree)
-        key = str(context.worktree.resolve())
-        ref = f'refs/heads/{context.branch}'
-        metadata = self._rebase_metadata(context)
-        rebase_head = None
-        if metadata is not None:
-            result = self.effects.workspace.git(
-                context.worktree, 'rev-parse', '--verify', 'REBASE_HEAD', check=False,
-            )
-            if result.returncode == 0:
-                rebase_head = result.stdout.strip()
-        return json.loads(json.dumps({
-            'head': snapshot.head, 'branch': snapshot.branch,
-            'ref': snapshot.refs.get(ref), 'index': snapshot.index,
-            'dirty': snapshot.dirty,
-            'file_evidence': rebase_file_evidence.capture(
-                context.worktree, snapshot.head, snapshot.dirty,
-            ),
-            'registration': snapshot.worktrees.get(key),
-            'operations': snapshot.operations,
-            'metadata': metadata,
-            'rebase_head': rebase_head,
-            'unmerged': bool(self._unmerged_stages(context.worktree)),
-            'index_clean': self.effects.workspace.git(
-                context.worktree, 'diff', '--cached', '--quiet', check=False,
-            ).returncode == 0,
-        }, sort_keys=True))
-
-    def _begin_rebase_continuation(self, context, action):
-        current = self.effects.checkpoint.get(self.repo, context.plan.plan_id)
-        observed, decision = self._current_rebase_service(context).require_owned()
-        if current.operation != 'rebase' or decision.status is not RebaseStatus.WAITING:
-            raise manager_git_journal.MutationEvidenceError('rebase continuation is no longer pending')
-        return manager_git_journal.begin_current_rebase(
-            self.state_dir, owner=f'plan:{context.plan.plan_id}',
-            repo=str(self.repo_path.resolve()), target=str(context.worktree.resolve()),
-            before=self._rebase_journal_state(context), expected={
-                'branch': context.branch, 'before_head': current.expected_head,
-                'target_base_oid': current.target_base_oid,
-                'remote_oid': observed.remote.oid, 'action': action.value,
-                'agent_session_id': getattr(context, 'worker_session_id', None),
-            })
-
-    def _execute_rebase_step(self, context, action):
-        rebase_git = self.effects.workspace.git
-        token = None
-        if action in {CorrectionAction.CONTINUE, CorrectionAction.SKIP}:
-            token = self._begin_rebase_continuation(context, action)
-            environment = dict(os.environ)
-            environment['GIT_REFLOG_ACTION'] = f'loop-manager-rebase:{token}'
-
-            def rebase_git(worktree, *arguments, **kwargs):
-                return self.effects.workspace.git(
-                    worktree, *arguments, env=environment, **kwargs,
-                )
-        result = execute_git_step(
-            action, git=rebase_git, worktree=context.worktree,
-        )
-        checkpoint = getattr(self.effects, 'checkpoint', None)
-        current = checkpoint.get(self.repo, context.plan.plan_id) if checkpoint else None
-        if (token is not None and result.returncode == 0 and current is not None
-                and (current.snapshot or {}).get('rebase_evidence_version') == 2):
-            manager_git_journal.record_rebase_invocation(
-                self.state_dir, str(self.repo_path.resolve()),
-                str(context.worktree.resolve()), token,
-                returncode=result.returncode,
-            )
-        return result
-
-    def _rebase_journal_checks(self, context):
-        def validate(_intent, _observed):
-            return self._current_rebase_service(context).require_owned()[1]
-        return None, validate
-
-    def _finish_rebase_journal(self, context, *, allow_equal=False):
-        # Autostash restoration remains a correction boundary until its index
-        # is clean; do not seal it as a completed current result.
-        if self._unmerged_stages(context.worktree) and not self._rebase_metadata(context):
-            return False
-        _, decision = self._current_rebase_service(context).require_owned()
-        return manager_git_journal.record_current_rebase_result(
-            self.state_dir, repo=str(self.repo_path.resolve()),
-            target=str(context.worktree.resolve()), owner=f'plan:{context.plan.plan_id}',
-            decision=decision, observed=self._rebase_journal_state(context))
-
-    def _run_managed_rebase(self, context, target_oid, *, autostash=False):
-        if getattr(self.effects.workspace, 'current_rebase_service', None) is not None:
-            service = self._current_rebase_service(context)
-            _, decision = service.require_owned()
-            if service.expected.target_base_oid != target_oid:
-                raise manager_git_journal.MutationEvidenceError('current rebase target differs')
-            if decision.status is RebaseStatus.COMPLETE:
-                return subprocess.CompletedProcess([], 0, 'current rebase already complete')
-            if decision.status is not RebaseStatus.START:
-                raise manager_git_journal.MutationEvidenceError('rebase start is no longer pending')
-        slot = manager_git_journal._slot(
-            self.state_dir, str(self.repo_path.resolve()), 'managed_rebase',
-            str(context.worktree.resolve()),
-        )
-        intent = manager_git_journal._read(slot / 'active.json')
-        if intent.get('expected', {}).get('target_base_oid') != target_oid:
-            raise manager_git_journal.MutationEvidenceError(
-                'Manager rebase 대상이 durable intent와 다릅니다.'
-            )
-        environment = dict(os.environ)
-        environment['GIT_REFLOG_ACTION'] = f"loop-manager-rebase:{intent['id']}"
-        rebased = self.effects.workspace.git(
-            context.worktree, 'rebase',
-            *(('--autostash',) if autostash else ()), target_oid,
-            check=False, env=environment,
-        )
-        if rebased.returncode == 0:
-            manager_git_journal.record_rebase_invocation(
-                self.state_dir, str(self.repo_path.resolve()),
-                str(context.worktree.resolve()), intent['id'],
-                returncode=rebased.returncode,
-            )
-        return rebased
-
-    def _workspace_boundary(self, plan_id, row, *, pending):
-        checkpoint = self.effects.checkpoint
-        if checkpoint is None:
-            return
-        current = checkpoint.get(self.repo, plan_id)
-        checkpoint.record(
-            self.repo, plan_id, expected_generation=current.generation,
-            operation=current.operation, expected_head=current.expected_head,
-            target_base_oid=current.target_base_oid,
-            observed_remote_oid=current.observed_remote_oid,
-            snapshot={
-                **(current.snapshot or {}),
-                'worktree_recovery_pending': pending,
-                'worktree': str(row['worktree'] or ''),
-                'branch': str(row['branch'] or ''),
-                'stored_active_sha': str(row['active_sha'] or ''),
-            },
-        )
-
-    def _record_rebase_suboperation(self, context, pending, *, worker_result=None):
-        checkpoint = self.effects.checkpoint
-        if checkpoint is None:
-            return
-        current = checkpoint.get(self.repo, context.plan.plan_id)
-        if current.operation != 'rebase':
-            return
-        stage_evidence = (
-            {'stage_evidence': self._rebase_stage_evidence(context)}
-            if pending == 'stage' else {}
-        )
-        checkpoint.record(
-            self.repo, context.plan.plan_id,
-            expected_generation=current.generation, operation='rebase',
-            expected_head=current.expected_head,
-            target_base_oid=current.target_base_oid,
-            observed_remote_oid=current.observed_remote_oid,
-            snapshot={
-                **(current.snapshot or {}), 'pending': pending,
-                'worker_result': worker_result or (current.snapshot or {}).get('worker_result'),
-                **stage_evidence,
-            },
-        )
-
-    def _rebase_stage_evidence(self, context):
-        observed = self.effects.agent.capture_git_snapshot(context.worktree)
-        evidence = {
-            'head': observed.head, 'branch': observed.branch,
-            'files': {path: signature for path, (_, signature) in observed.dirty.items()},
-        }
-        if hasattr(observed, 'index'):
-            evidence['index'] = {
-                path: list(entries) for path, entries in observed.index.items()
-            }
-        checkpoint = self.effects.checkpoint
-        current = checkpoint.get(self.repo, context.plan.plan_id) if checkpoint else None
-        if current and (current.snapshot or {}).get('rebase_evidence_version') == 2:
-            evidence['modes'] = rebase_file_evidence.capture_modes(
-                context.worktree, evidence['files'], self.effects.agent.path_signature,
-            )
-        return evidence
-
-    def _stage_rebase_correction(self, context):
-        """Stage only paths accepted by the Worker scope validator."""
-        checkpoint = self.effects.checkpoint
-        intent = checkpoint.get(self.repo, context.plan.plan_id) if checkpoint else None
-        accepted = (intent.snapshot or {}).get('stage_evidence') if intent else None
-        observed = self._rebase_stage_evidence(context)
-        tracked = self.effects.workspace.git(
-            context.worktree, 'ls-files', '--cached', '-z'
-        ).stdout
-        untracked = self.effects.workspace.git(
-            context.worktree, 'ls-files', '--others', '--exclude-standard', '-z'
-        ).stdout
-        tracked_paths = {path for path in tracked.split('\0') if path}
-        if getattr(self.effects.workspace, 'current_rebase_service', None) is not None:
-            self._current_rebase_service(context).require_owned()
-        elif accepted is not None and not self._stage_evidence_preserved(
-                context, accepted, observed, tracked_paths):
-            raise RecoveryFailure(RecoveryReason.OWNERSHIP_UNCERTAIN,
-                                  'rebase correction changed after Worker scope validation')
-        stageable = tracked_paths | {path for path in untracked.split('\0') if path}
-        paths = set(observed['files']) & stageable
-        if getattr(self.effects.workspace, 'current_rebase_service', None) is not None:
-            local = self.effects.agent.capture_git_snapshot(context.worktree)
-            paths = {path for path in paths if set(local.dirty[path][0]) - {'staged'}}
-        return execute_git_step(
-            CorrectionAction.STAGE, git=self.effects.workspace.git,
-            worktree=context.worktree, paths=tuple(sorted(paths)),
-        )
-
-    def _stage_evidence_preserved(self, context, accepted, observed, tracked_paths):
-        accepted_files = accepted.get('files') if isinstance(accepted, dict) else None
-        disappeared = (accepted_files.keys() - observed['files'].keys()
-                       if isinstance(accepted_files, dict) else set())
-        clean_signatures = {
-            path: self.effects.agent.path_signature(context.worktree, path)
-            for path in disappeared & tracked_paths
-        }
-        return stage_evidence_preserved(
-            accepted, observed, tracked_paths, clean_signatures,
-        )
-
-    def _post_rebase_observation(self, context, target_oid, output, *, corrected=False,
-                                 worker_result=None):
-        """A successful exit may leave autostash conflicts without rebase metadata."""
-        unmerged = self._unmerged_stages(context.worktree)
-        in_progress = self.effects.workspace._rebase_in_progress_for_branch(
-            context.worktree, context.branch
-        )
-        checkpoint = self.effects.checkpoint
-        stash_oid = None
-        if checkpoint is not None and unmerged:
-            current = checkpoint.get(self.repo, context.plan.plan_id)
-            stash_match = re.search(r'Created autostash: ([0-9a-fA-F]{7,64})', output)
-            stash_oid = None
-            if stash_match:
-                resolved = self.effects.workspace.git(
-                    context.worktree, 'rev-parse', '--verify',
-                    f'{stash_match.group(1)}^{{commit}}', check=False,
-                )
-                if resolved.returncode == 0:
-                    stash_oid = resolved.stdout.strip()
-            checkpoint.record(
-                self.repo, context.plan.plan_id,
-                expected_generation=current.generation, operation='rebase',
-                expected_head=current.expected_head,
-                target_base_oid=target_oid,
-                observed_remote_oid=current.observed_remote_oid,
-                snapshot={
-                    **(current.snapshot or {}),
-                    'after_head': self.effects.workspace.git(
-                        context.worktree, 'rev-parse', 'HEAD'
-                    ).stdout.strip(),
-                    'unmerged_index': unmerged,
-                    'stash_oid': stash_oid or (current.snapshot or {}).get('stash_oid'),
-                },
-            )
-            if not in_progress and not (stash_oid or (current.snapshot or {}).get('stash_oid')):
-                return self._recover(
-                    RecoveryReason.OWNERSHIP_UNCERTAIN, 'autostash_identity_unavailable',
-                    context=context,
-                    final_block_reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE,
-                )
-        if not unmerged and not in_progress:
-            if checkpoint is not None:
-                self.effects.workspace.validate_managed_worktree(
-                    self.repo_path, context.worktree, context.branch
-                )
-                ancestry = self.effects.workspace.git(
-                    context.worktree, 'merge-base', '--is-ancestor',
-                    target_oid, 'HEAD', check=False,
-                )
-                if ancestry.returncode != 0:
-                    raise RecoveryFailure(
-                        RecoveryReason.STATUS_FAILED,
-                        'rebase completed without expected target ancestry',
-                    )
-            try:
-                self._finish_rebase_journal(context, allow_equal=True)
-            except manager_git_journal.MutationEvidenceError:
-                if self.effects.workspace.branch_has_changes(
-                    context.worktree, self.base,
-                ):
-                    raise
-                # A dropped Worker patch is not journal evidence. Keep the
-                # intent unresolved and let the existing no-change gate block.
-            return None
-        self._finish_rebase_journal(context, allow_equal=True)
-        message = self.effects.contract.REBASE_CONFLICT_PREFIX + output[-8000:]
-        self.effects.state.update_project(
-            self.repo, phase='WORKING', validated_base_sha=None,
-            last_error=message,
-        )
-        return self._rebase_conflict(
-            context, message, corrected=corrected, worker_result=worker_result,
-            target=target_oid,
-            stash_oid=(stash_oid if unmerged and not in_progress else None),
-        )
-
-    def _completed_autostash_correction(
-        self, context, intent, sealed, live, *, rejection=None,
-    ):
-        def reject(reason):
-            if rejection is not None:
-                rejection.append(reason)
-            return False
-
-        current = self.effects.checkpoint.get(self.repo, context.plan.plan_id)
-        saved = current.snapshot or {}
-        stage = saved.get('stage_evidence')
-        accepted = stage.get('files') if isinstance(stage, dict) else None
-        modes = stage.get('modes') if isinstance(stage, dict) else None
-        sealed_operations = sealed.get('operations')
-        live_operations = live.get('operations')
-        operation_markers_match = (
-            live_operations == sealed_operations
-            or (isinstance(sealed_operations, dict) and live_operations == {}
-                and set(sealed_operations) <= {
-                    'MERGE_MSG', 'MERGE_MODE', 'REBASE_HEAD',
-                })
-        )
-        if (intent['expected'].get('evidence_version') != 2
-                or not saved.get('stash_oid') or saved.get('pending') != 'continue'
-                or intent['expected'].get('agent_session_id')
-                != saved.get('rebase_start_session_id')
-                or not saved.get('worker_result') or not isinstance(accepted, dict)
-                or not accepted or not isinstance(modes, dict)
-                or sealed.get('metadata') is not None or not sealed.get('unmerged')
-                or live.get('metadata') is not None or live.get('unmerged')):
-            return reject('checkpoint or conflict identity')
-        if not operation_markers_match:
-            return reject('Git operation markers')
-        if any(live.get(field) != sealed.get(field) for field in (
-                'head', 'branch', 'ref', 'registration')):
-            return reject('HEAD, branch or registration')
-        tracked = {
-            path for path in self.effects.workspace.git(
-                context.worktree, 'ls-files', '--cached', '-z',
-            ).stdout.split('\0') if path
-        }
-        observed_stage = self._rebase_stage_evidence(context)
-        # Normal staging changes the index. Compare the approved file
-        # signatures here; stage_matches below checks every index entry.
-        file_fields = ('head', 'branch', 'files')
-        if not self._stage_evidence_preserved(
-                context,
-                {field: stage.get(field) for field in file_fields},
-                {field: observed_stage.get(field) for field in file_fields},
-                tracked):
-            return reject('approved stage evidence')
-        if any(sealed['dirty'].get(path) != live['dirty'].get(path)
-               for path in sealed['dirty'].keys() | live['dirty'].keys()
-               if path not in accepted):
-            return reject('unapproved dirty path')
-        sealed_files = sealed.get('file_evidence') or {}
-        live_files = live.get('file_evidence') or {}
-        if any(sealed_files.get(path) != live_files.get(path)
-               for path in sealed_files.keys() | live_files.keys()
-               if path not in accepted):
-            return reject('unapproved file evidence')
-        if not managed_rebase_evidence.stage_matches(
-                before_index=sealed['index'], staged_index=live['index'],
-                allowed_paths=list(accepted), accepted_files=accepted,
-                accepted_modes=modes,
-                staged_dirty={path: [[], signature]
-                              for path, signature in accepted.items()}):
-            return reject('staged index or mode')
-        for path in accepted:
-            entries = live['index'].get(path)
-            if modes[path] is None:
-                if entries or (context.worktree / path).exists() or (
-                        context.worktree / path).is_symlink():
-                    return reject('approved deletion')
-                continue
-            if not isinstance(entries, list) or len(entries) != 1:
-                return reject('approved index entry')
-            staged_oid = entries[0].split()[2]
-            blob = self.effects.workspace.git(
-                context.worktree, 'hash-object', f'--path={path}', '--', path,
-                check=False,
-            )
-            if blob.returncode or blob.stdout.strip() != staged_oid:
-                return reject('approved blob')
-        return True
-
-    def _legacy_current_rebase(self, context, current):
-        # A persisted target beyond the adopted remote base identifies legacy
-        # pending rebase work without inventing execution receipts. This only
-        # selects the common G-109 ownership/scope check; it grants no push.
-        saved = current.snapshot or {}
-        target = getattr(current, 'target_base_oid', None)
-        head = getattr(current, 'expected_head', None)
-        remote = getattr(current, 'observed_remote_oid', None)
-        if (current.operation is not None or not target or not head or not remote
-                or head == remote or saved.get('current_rebase_acceptance')
-                or saved.get('published_review_resume')):
-            return False
-        row = self._row()
-        if row['pr_url'] or row['pr_conflict_recovery']:
-            return False
-        ancestry = self.effects.workspace.git(self.repo_path, 'merge-base', '--is-ancestor',
-            target, remote, check=False)
-        if ancestry.returncode not in (0, 1):
-            raise manager_git_journal.MutationEvidenceError('legacy rebase target ancestry unavailable')
-        return ancestry.returncode == 1
-
-    def _complete_rebase_intent(self, context, *, project_values=None):
-        checkpoint = self.effects.checkpoint
-        if checkpoint is None:
-            return
-        current = checkpoint.get(self.repo, context.plan.plan_id)
-        saved = current.snapshot or {}
-        legacy_completed = (current.operation is None and not saved.get('current_rebase_acceptance')
-                            and (saved.get('completed_rebase') or saved.get('rebase_completion')
-                                 or self._legacy_current_rebase(context, current)))
-        if current.operation != 'rebase' and not legacy_completed:
-            return
-        service = self._current_rebase_service(context)
-        row = self._row()
-        if not self._owned_checkpoint_remote(
-                context, row, service.expected.remote.oid,
-                checkpoint.get(self.repo, context.plan.plan_id)):
-            raise manager_git_journal.MutationEvidenceError('current checkpoint remote ownership differs')
-        service.adopt(self.effects.state, checkpoint)
-        self._publish_rebased_checkpoint(context)
-
-    def _publish_rebased_checkpoint(self, context):
-        if self.effects.checkpoint is None:
-            return
-        managed_rebase_publication.publish_checkpoint(
-            state=self.effects.state, checkpoints=self.effects.checkpoint,
-            repo=self.repo, plan_id=context.plan.plan_id, repo_path=self.repo_path,
-            worktree=context.worktree, branch=context.branch,
-            service=lambda **options: self._current_rebase_service(context, **options),
-            owns_remote=lambda oid, selected: self._owned_checkpoint_remote(
-                context, self._row(), oid, selected),
-            git=self.effects.workspace.git,
-            lookup_pr=self.effects.publication.pr_for_branch)
-
-    def _publication_intent(self, context, operation, remote_oid):
-        checkpoint = self.effects.checkpoint
-        if checkpoint is None:
-            return
-        current = checkpoint.get(self.repo, context.plan.plan_id)
-        head = self.effects.workspace.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
-        if current.operation == operation and current.expected_head == head:
-            return
-        checkpoint.record(
-            self.repo, context.plan.plan_id,
-            expected_generation=current.generation, operation=operation,
-            expected_head=head, target_base_oid=context.active_sha,
-            observed_remote_oid=remote_oid,
-            snapshot={**(current.snapshot or {}), 'phase': 'PUBLISHING',
-                      'head': head, 'remote_before': remote_oid},
-        )
-
-    def _commit_owned(self, context, title, *, worker_confirmed=False):
-        checkpoint = self.effects.checkpoint
-        if checkpoint is not None:
-            current = checkpoint.get(self.repo, context.plan.plan_id)
-            before = self.effects.workspace.git(
-                context.worktree, 'rev-parse', 'HEAD'
-            ).stdout.strip()
-            approved_tree = self.effects.workspace.git(
-                context.worktree, 'write-tree',
-            ).stdout.strip()
-            checkpoint.record(
-                self.repo, context.plan.plan_id,
-                expected_generation=current.generation, operation='commit',
-                expected_head=before, target_base_oid=context.active_sha,
-                observed_remote_oid=current.observed_remote_oid,
-                snapshot={**(current.snapshot or {}),
-                          'commit_message': title, 'before_head': before,
-                          'commit_tree_oid': approved_tree},
-            )
-        result = self.effects.workspace.git(
-            context.worktree, 'commit', '-m', title,
-        )
-        if checkpoint is not None:
-            current = checkpoint.get(self.repo, context.plan.plan_id)
-            after = self.effects.workspace.git(
-                context.worktree, 'rev-parse', 'HEAD'
-            ).stdout.strip()
-            checkpoint.record(
-                self.repo, context.plan.plan_id,
-                expected_generation=current.generation, operation=None,
-                expected_head=after, target_base_oid=current.target_base_oid,
-                observed_remote_oid=current.observed_remote_oid,
-                snapshot={**(current.snapshot or {}), 'after_head': after,
-                          **({'worker_candidate_token': self._definition_snapshot.worker_candidate_token(after)}
-                             if worker_confirmed and self._definition_snapshot is not None
-                             and (current.snapshot or {}).get('worker_candidate_token') ==
-                                 self._definition_snapshot.worker_candidate_token(before) else {})},
-            )
-        return result
-
-    def _commit_rebase_resolution(self, context, title):
-        """Keep the rebase intent durable across every resolution commit boundary."""
-        checkpoints = self.effects.checkpoint
-        pending = checkpoints.get(self.repo, context.plan.plan_id)
-        if pending.operation != 'rebase':
-            raise manager_git_journal.MutationEvidenceError('resolution lost its rebase intent')
-        git = self.effects.workspace.git
-        audit = {
-            'before_head': git(context.worktree, 'rev-parse', 'HEAD').stdout.strip(),
-            'tree': git(context.worktree, 'write-tree').stdout.strip(),
-            'message': title,
-        }
-        pending = checkpoints.record(
-            self.repo, context.plan.plan_id, expected_generation=pending.generation,
-            operation='rebase', expected_head=pending.expected_head,
-            target_base_oid=pending.target_base_oid,
-            observed_remote_oid=pending.observed_remote_oid,
-            snapshot={**(pending.snapshot or {}), 'rebase_resolution_commit': audit})
-        git(context.worktree, 'commit', '-m', title)
-        after = git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
-        checkpoints.record(
-            self.repo, context.plan.plan_id, expected_generation=pending.generation,
-            operation='rebase', expected_head=pending.expected_head,
-            target_base_oid=pending.target_base_oid,
-            observed_remote_oid=pending.observed_remote_oid,
-            snapshot={**(pending.snapshot or {}), 'after_head': after,
-                      'rebase_resolution_commit': {**audit, 'after_head': after}})
-
-    def _complete_publication_intent(self, context):
-        checkpoint = self.effects.checkpoint
-        if checkpoint is None:
-            return
-        current = checkpoint.get(self.repo, context.plan.plan_id)
-        if current.operation not in {'push', 'pr_create'}:
-            return
-        checkpoint.record(
-            self.repo, context.plan.plan_id,
-            expected_generation=current.generation, operation=None,
-            expected_head=current.expected_head,
-            target_base_oid=current.target_base_oid,
-            observed_remote_oid=(current.expected_head if current.operation == 'push'
-                                 else current.observed_remote_oid),
-            snapshot={**(current.snapshot or {}),
-                      **({'pushed_checkpoint_head': current.expected_head}
-                         if current.operation == 'push' and
-                         ((current.snapshot or {}).get('blocked_resume') or
-                          (current.snapshot or {}).get('published_review_resume') or
-                          (current.snapshot or {}).get('current_rebase_acceptance') or
-                          current.completed_rebase()) else {})},
-        )
-
-    def recover(self, context):
-        """Observe owned Git and reconcile stale markers before phase dispatch."""
-        checkpoint = self.effects.checkpoint
-        if checkpoint is None:
-            return context
-        try:
-            self.effects.state.check_context(context)
-            row = self._row()
-            catalog = self.effects.state.active_execplan(self.repo)
-            catalog_marker = (
-                int(catalog['catalog_generation']),
-                str(catalog['current_revision_sha'])
-                if catalog['current_revision_sha'] is not None else None,
-            )
-            current = checkpoint.get(self.repo, context.plan.plan_id)
-            self._publish_rebased_checkpoint(context)
-            row = self._row()
-            current = checkpoint.get(self.repo, context.plan.plan_id)
-            if self.newly_activated and current.operation is None and current.expected_head:
-                adopted = valid_acceptance((current.snapshot or {}).get('current_rebase_acceptance'))
-                # Preserve an adopted candidate and restored work across activation.
-                # Ordinary stale checkpoints still use the newly prepared workspace.
-                current = checkpoint.record(
-                    self.repo, context.plan.plan_id,
-                    expected_generation=current.generation, operation=None,
-                    expected_head=current.expected_head if adopted else None,
-                    target_base_oid=current.target_base_oid if adopted else None,
-                    observed_remote_oid=current.observed_remote_oid if adopted else None,
-                    snapshot={
-                        **(current.snapshot or {} if adopted else {}),
-                        'reactivated_from_head': current.expected_head,
-                        **({'blocked_resume': current.snapshot['blocked_resume']}
-                           if current.snapshot and 'blocked_resume' in current.snapshot
-                           else {}),
-                        **({'published_review_resume': current.snapshot['published_review_resume']}
-                           if current.snapshot and 'published_review_resume' in current.snapshot
-                           else {}),
-                    },
-                )
-            current = checkpoint.record(
-                self.repo, context.plan.plan_id,
-                expected_generation=current.generation,
-                operation=current.operation,
-                expected_head=current.expected_head,
-                target_base_oid=current.target_base_oid,
-                observed_remote_oid=current.observed_remote_oid,
-                snapshot={**(current.snapshot or {}), 'fetch_in_progress': True},
-            )
-            base_oid = self._fetch_latest_base()
-            current = checkpoint.record(
-                self.repo, context.plan.plan_id,
-                expected_generation=current.generation,
-                operation=current.operation,
-                expected_head=current.expected_head,
-                target_base_oid=current.target_base_oid,
-                observed_remote_oid=current.observed_remote_oid,
-                snapshot={**(current.snapshot or {}), 'fetch_in_progress': False,
-                          'fetched_base_oid': base_oid},
-            )
-            remote_oid = self._checkpoint_remote_oid(self.repo_path, context.branch)
-            # A PR needs a remote branch.  With neither a remote branch nor a
-            # recorded PR there is no publication state to reconcile here;
-            # the publication service will query again before creating one.
-            inspect_pr = remote_oid is not None or bool(row['pr_url'])
-            pull_request = (
-                self.effects.publication.pr_for_branch(
-                    self.repo_path, context.branch, str(row['pr_url'] or '') or None
-                ) if inspect_pr else None
-            )
-            snapshot = observe(
-                plan_id=context.plan.plan_id,
-                row={**row, 'phase': context.phase.value},
-                definition_revision=catalog_marker[1],
-                base_oid=base_oid, branch=context.branch,
-                worktree=context.worktree, owned=True,
-                git=self.effects.workspace.git,
-                rebase_in_progress=self.effects.workspace._rebase_in_progress_for_branch,
-                remote_oid=remote_oid, pull_request=pull_request,
-                rebase_intent=(
-                    current.operation == 'rebase'
-                    or bool(
-                        row['pr_conflict_recovery'] and row['pr_conflict_base_oid']
-                        and row['phase'] == 'WORKING'
-                        and (
-                            row['last_error'] == self.effects.contract.REBASE_IN_PROGRESS_ERROR
-                            or str(row['last_error'] or '').startswith(
-                                self.effects.contract.REBASE_CONFLICT_PREFIX
-                            )
-                        )
-                    )
-                ),
-                rebase_before_head=(current.expected_head or row['pr_conflict_head_oid']),
-                rebase_target_oid=(current.target_base_oid or row['pr_conflict_base_oid']),
-                stash_oid=(current.snapshot or {}).get('stash_oid'),
-                recorded_local_head=current.expected_head,
-                pending_operation=current.operation,
-                operation_markers=(
-                    self.effects.workspace.git_operation_entries(context.worktree)
-                    if self.effects.workspace.git_operation_entries else None
-                ),
-            )
-            stable_base = self.effects.workspace.git(
-                self.repo_path, 'rev-parse', f'origin/{self.base}'
-            ).stdout.strip()
-            stable_remote = self._checkpoint_remote_oid(self.repo_path, context.branch)
-            stable_pr = (
-                self.effects.publication.pr_for_branch(
-                    self.repo_path, context.branch, str(row['pr_url'] or '') or None
-                ) if inspect_pr else None
-            )
-            if (stable_base != base_oid or stable_remote != remote_oid
-                    or stable_pr != pull_request):
-                return self._recover(RecoveryReason.REMOTE_SNAPSHOT_RACE,
-                                     'checkpoint observation changed', context=context)
-            current_catalog = self.effects.state.active_execplan(self.repo)
-            if (
-                int(current_catalog['catalog_generation']),
-                str(current_catalog['current_revision_sha'])
-                if current_catalog['current_revision_sha'] is not None else None,
-            ) != catalog_marker:
-                return self._recover(
-                    RecoveryReason.REMOTE_SNAPSHOT_RACE,
-                    'checkpoint catalog revision changed', context=context,
-                )
-            if (self.newly_activated
-                    and valid_acceptance((current.snapshot or {}).get('current_rebase_acceptance'))
-                    and snapshot.local_head != current.expected_head):
-                return self._recover(
-                    RecoveryReason.REMOTE_OID_UNCERTAIN,
-                    'reactivated rebase candidate HEAD differs', context=context)
-            if not self._owned_checkpoint_remote(
-                context, row, remote_oid, current, pull_request,
-            ):
-                return self._recover(
-                    RecoveryReason.REMOTE_OID_UNCERTAIN,
-                    '게시 checkpoint의 원격 OID 또는 재활성화 계보가 유효하지 않습니다.',
-                    context=context,
-                )
-            if (current.operation is None
-                    and valid_acceptance((current.snapshot or {}).get('current_rebase_acceptance'))):
-                observed, _ = self._current_rebase_service(context).require_owned(checkpoint=current)
-                if observed.remote.oid != remote_oid:
-                    return self._recover(RecoveryReason.REMOTE_SNAPSHOT_RACE,
-                                         'adopted rebase remote observation changed', context=context)
-                # The current service has checked this exact lease and PR.
-                # A rebased local HEAD need not equal its prior remote HEAD.
-                snapshot = replace(snapshot, recorded_remote_oid=remote_oid)
-            if (current.operation is None and not (current.snapshot or {}).get('current_rebase_acceptance')
-                    and ((current.snapshot or {}).get('completed_rebase')
-                         or (current.snapshot or {}).get('rebase_completion')
-                         or self._legacy_current_rebase(context, current))):
-                self._complete_rebase_intent(context)
-                return self._context()
-            if current.operation == 'rebase':
-                service = self._current_rebase_service(context)
-                observed, accepted = service.require_owned()
-                if accepted.status is RebaseStatus.START:
-                    self._record_rebase_intent(context, current.target_base_oid)
-                    rebased = self._run_managed_rebase(context, current.target_base_oid, autostash=True)
-                    conflict = self._post_rebase_observation(context, current.target_base_oid, rebased.stdout)
-                    if conflict is not None:
-                        return conflict
-                    if rebased.returncode:
-                        return self._recover(RecoveryReason.WORKTREE_RECOVERY_FAILED, rebased.stdout, context=context)
-                    self._complete_rebase_intent(context)
-                    return self._context()
-                if accepted.status is RebaseStatus.COMPLETE:
-                    self._finish_rebase_journal(context)
-                    self._complete_rebase_intent(context)
-                    return self._context()
-                if ((observed.metadata is not None
-                         or accepted.reason == 'owned_autostash_restore_pending')
-                        and not any(entry.stage for entry in observed.index)):
-                    unstaged = self.effects.workspace.git(
-                        context.worktree, 'diff', '--quiet', check=False)
-                    if unstaged.returncode not in {0, 1}:
-                        raise manager_git_journal.MutationEvidenceError('current resolution diff unavailable')
-                    untracked = self.effects.workspace.git(
-                        context.worktree, 'ls-files', '--others', '--exclude-standard', '-z', check=False)
-                    if untracked.returncode:
-                        raise manager_git_journal.MutationEvidenceError('current untracked resolution unavailable')
-                    if unstaged.returncode or untracked.stdout:
-                        stage = self._stage_rebase_correction(context)
-                        if stage.returncode:
-                            return self._recover(RecoveryReason.STAGE_FAILED, stage.output, context=context)
-                    staged = self.effects.workspace.git(
-                        context.worktree, 'diff', '--cached', '--quiet', check=False)
-                    if staged.returncode not in {0, 1}:
-                        raise manager_git_journal.MutationEvidenceError('current resolution index unavailable')
-                    action = next_action(self._rebase_observation(context),
-                                         worker_result=True, staged=staged.returncode == 1)
-                    continued = self._execute_rebase_step(context, action)
-                    if action is CorrectionAction.VERIFY and staged.returncode == 1:
-                        self._commit_rebase_resolution(
-                            context, f'Resolve autostash for {context.plan.plan_id}')
-                    conflict = self._post_rebase_observation(
-                        context, current.target_base_oid, continued.output)
-                    if conflict is not None:
-                        return conflict
-                    if continued.returncode:
-                        return self._recover(RecoveryReason.REBASE_CONTINUE_FAILED,
-                                             continued.output, context=context)
-                    self._complete_rebase_intent(context)
-                    return self._context()
-            marker = (current.snapshot or {}).get('blocked_resume')
-            if (self.newly_activated and marker
-                    and (snapshot.local_head != marker['after_head']
-                         or (current.snapshot or {}).get('reactivated_from_head')
-                         != marker['after_head'])):
-                return self._recover(
-                    RecoveryReason.REMOTE_OID_UNCERTAIN,
-                    '재활성화 전후 HEAD가 게시 checkpoint 기록과 다릅니다.',
-                    context=context,
-                )
-            self.effects.state.check_context(context)
-            if (current.operation == 'push' and remote_oid == snapshot.local_head
-                    or current.operation == 'pr_create' and pull_request is not None):
-                completed_push = current.operation == 'push'
-                if completed_push and (marker or current.completed_rebase()
-                                       or (current.snapshot or {}).get('current_rebase_acceptance')
-                                       or (current.snapshot or {}).get('published_review_resume')):
-                    self.effects.state.update_project(
-                        self.repo, publication_remote_oid=remote_oid,
-                    )
-                current = checkpoint.record(
-                    self.repo, context.plan.plan_id,
-                    expected_generation=current.generation, operation=None,
-                    expected_head=snapshot.local_head,
-                    target_base_oid=current.target_base_oid,
-                    observed_remote_oid=remote_oid,
-                    snapshot={**(current.snapshot or {}),
-                              **({'pushed_checkpoint_head': snapshot.local_head}
-                                 if completed_push and
-                                 ((current.snapshot or {}).get('blocked_resume') or
-                                  (current.snapshot or {}).get('published_review_resume') or
-                                  (current.snapshot or {}).get('current_rebase_acceptance') or
-                                  current.completed_rebase())
-                                 else {})},
-                )
-            current = checkpoint.record(
-                self.repo, context.plan.plan_id,
-                expected_generation=current.generation,
-                operation=current.operation,
-                expected_head=current.expected_head or snapshot.local_head,
-                target_base_oid=current.target_base_oid,
-                observed_remote_oid=remote_oid,
-                snapshot={**(current.snapshot or {}), **asdict(snapshot)},
-            )
-            self.effects.state.check_context(context)
-            decision = assess(snapshot)
-            if (current.operation == 'rebase'
-                    and decision.action not in {CheckpointAction.USER_ACTION, CheckpointAction.PAUSE}
-                    and (current.snapshot or {}).get('pending') == 'stage'
-                    and (current.snapshot or {}).get('worker_result')):
-                self._current_rebase_service(context).require_owned()
-                unstaged = self.effects.workspace.git(context.worktree, 'diff', '--quiet', check=False)
-                if unstaged.returncode not in {0, 1}:
-                    raise manager_git_journal.MutationEvidenceError('current stage observation failed')
-                saved_result = current.snapshot['worker_result']
-                try:
-                    disposition = self._parse_worker_outcome(
-                        context, saved_result, allow_legacy_ready=True,
-                    )
-                    if disposition.kind == 'needs_user_decision':
-                        return self._block_worker_decision(
-                            context, saved_result, disposition,
-                        )
-                except WorkerOutcomeError as error:
-                    return self._recover(
-                        RecoveryReason.WORKER_CORRECTION,
-                        f'저장된 Worker 결과 검증 실패: {error}',
-                        context=context,
-                    )
-                untracked = self.effects.workspace.git(
-                    context.worktree, 'ls-files', '--others', '--exclude-standard', '-z',
-                ).stdout
-                # The intent precedes staging. Identical accepted contents
-                # may still need staging, including accepted new files.
-                if unstaged.returncode == 1 or untracked or snapshot.unmerged_stages:
-                    try:
-                        stage = self._stage_rebase_correction(context)
-                    except (RuntimeError, OSError) as error:
-                        return self._recover(
-                            classify_exception(error, operation=RecoveryReason.STAGE_FAILED),
-                            str(error), context=context,
-                        )
-                    if stage.returncode:
-                        return self._recover(RecoveryReason.STAGE_FAILED,
-                                             stage.output[-8000:], context=context)
-                resumed = self._finish_worker(
-                    replace(context, resolving_rebase=True), row,
-                    current.snapshot['worker_result'], staged=True,
-                )
-                return (resumed.context
-                        if resumed.kind is ExecutionOutcomeKind.PHASE_ADVANCED
-                        else resumed)
-            if (current.operation == 'rebase'
-                    and decision.action not in {CheckpointAction.USER_ACTION, CheckpointAction.PAUSE}
-                    and (current.snapshot or {}).get('pending') == 'continue'
-                    and snapshot.git_operation == 'rebase'
-                    and not snapshot.unmerged_stages):
-                staged = self.effects.workspace.git(
-                    context.worktree, 'diff', '--cached', '--quiet', check=False
-                )
-                if staged.returncode not in {0, 1}:
-                    return self._recover(RecoveryReason.STAGE_FAILED,
-                                         'staged rebase correction observation failed',
-                                         context=context)
-                observation = self._rebase_observation(context)
-                action = next_action(
-                    observation, worker_result=True,
-                    staged=staged.returncode == 1,
-                )
-                try:
-                    continued = self._execute_rebase_step(context, action)
-                except (RuntimeError, OSError) as error:
-                    return self._recover(
-                        classify_exception(error, operation=RecoveryReason.REBASE_CONTINUE_FAILED),
-                        str(error), context=context,
-                    )
-                conflict = self._post_rebase_observation(
-                    context, str(current.target_base_oid or base_oid),
-                    continued.output, corrected=True,
-                    worker_result=(current.snapshot or {}).get('worker_result'),
-                )
-                if conflict is not None:
-                    return conflict
-                if continued.returncode:
-                    return self._recover(RecoveryReason.REBASE_CONTINUE_FAILED,
-                                         continued.output[-8000:], context=context)
-                self._complete_rebase_intent(context, project_values={
-                    'phase': 'VERIFYING',
-                    'active_sha': str(current.target_base_oid or base_oid),
-                    'validated_base_sha': None, 'last_error': None,
-                    'revision_resume_status': None,
-                    'verify_result': None, 'review_result': None,
-                    'verify_token': None, 'review_token': None,
-                    'publication_token': None,
-                })
-                return self._context()
-            if decision.action is CheckpointAction.CONTINUE:
-                return context
-            if decision.action is CheckpointAction.CONFLICT:
-                # A correction already in progress owns its diagnostic and
-                # Worker session.  Re-observation must not replace the
-                # actionable failure with a generic index description.
-                if context.resolving_rebase:
-                    return context
-                self.effects.state.update_project(
-                    self.repo, phase='WORKING', validated_base_sha=None,
-                    revision_resume_status='VERIFYING',
-                    last_error=self.effects.contract.REBASE_CONFLICT_PREFIX + decision.reason,
-                )
-                return self._context()
-            if decision.action is CheckpointAction.CORRECT:
-                completion = None
-                if current.operation == 'rebase':
-                    return self._recover(
-                        RecoveryReason.OWNERSHIP_UNCERTAIN,
-                        'rebase checkpoint correction lacks a sealed completion',
-                        context=context,
-                    )
-                self.effects.state.correct_checkpoint(
-                    phase=decision.phase, active_sha=decision.active_sha,
-                    validated_base_sha=decision.validated_base_sha,
-                    invalidate_validation=decision.invalidate_validation,
-                    expected_catalog=catalog_marker,
-                )
-                checkpoint.record(
-                    self.repo, context.plan.plan_id,
-                    expected_generation=current.generation, operation=None,
-                    expected_head=snapshot.local_head,
-                    target_base_oid=base_oid, observed_remote_oid=remote_oid,
-                    snapshot={**asdict(snapshot), **(
-                        {'completed_rebase': completion} if completion else
-                        {'completed_rebase': current.completed_rebase()}
-                        if current.completed_rebase() else {}
-                    ), **(
-                        {'published_review_resume': current.snapshot['published_review_resume']}
-                        if (current.snapshot or {}).get('published_review_resume')
-                        else {}
-                    )},
-                )
-                return self._context()
-            if decision.action is CheckpointAction.REBASE:
-                # The revision gate decides which artifacts a changed base
-                # invalidates. VERIFYING commits its Worker result before
-                # reconciling the latest base and starting full verify.
-                return context
-            if decision.action is CheckpointAction.PAUSE:
-                return self._recover(RecoveryReason.STATUS_FAILED, decision.reason,
-                                     context=context, attempts=3)
-            if decision.reason in {'external_remote_oid', 'external_pr_head'}:
-                return self._recover(
-                    RecoveryReason.REMOTE_OID_UNCERTAIN,
-                    '관측하지 않은 원격 branch 또는 PR head 갱신을 거부합니다: '
-                    + decision.reason,
-                    context=context,
-                )
-            return self._recover(
-                RecoveryReason.OWNERSHIP_UNCERTAIN, decision.reason,
-                context=context,
-                final_block_reason=(BlockReasonCode.REPOSITORY_STATE_UNSAFE
-                                    if decision.reason == 'autostash_identity_unavailable'
-                                    else BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN),
-            )
-        except CheckpointRace:
-            return self._recover(RecoveryReason.REMOTE_SNAPSHOT_RACE,
-                                 'checkpoint generation changed', context=context)
-        except RuntimeStateError as error:
-            return ExecutionOutcome(
-                ExecutionOutcomeKind.TRANSIENT_PAUSE,
-                detail=f'execution row changed during checkpoint observation: {error}',
-            )
-        except RecoveryFailure as error:
-            return self._recover(error.reason, str(error), context=context)
-        except (RuntimeError, OSError) as error:
-            return self._recover(
-                classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
-                str(error), context=context,
-            )
+        return self._context_handler()._context()
 
     @staticmethod
     def _cached_plan(catalog_plan):
-        return {
-            'id': str(catalog_plan['plan_id']),
-            'title': str(catalog_plan['title']),
-            'sources': list(json.loads(str(catalog_plan['sources']))),
-            'depends_on': list(json.loads(str(catalog_plan['depends_on']))),
-            'complexity': str(catalog_plan['current_complexity'] or 'low'),
-            'risk': str(catalog_plan['current_risk'] or 'low'),
-            'priority': str(catalog_plan['priority']),
-        }
+        return execution_assembly.ContextHandler._cached_plan(catalog_plan)
+
+    def _advanced(self):
+        return self._context_handler()._advanced()
+
+    def work_started(self, context):
+        return self._context_handler().work_started(context)
+
+    def _recovery_handler(self):
+        return execution_assembly.recovery(
+            self.effects, getattr(self, "_identity", ExecutionIdentity()),
+            self._snapshot, self._update_snapshot,
+            {
+                "_row": lambda *a, **kw: self._row(*a, **kw),
+            },
+            recovery=self.recovery,
+        )
+
+    def recover_failure(self, context, error):
+        return self._recovery_handler().recover_failure(context, error)
+
+    @staticmethod
+    def _final(detail=None):
+        return execution_assembly.RecoveryHandler._final(detail)
+
+    @staticmethod
+    def _retry(detail=None):
+        return execution_assembly.RecoveryHandler._retry(detail)
+
+    def _recover(self, reason, detail, *, context=None, fingerprint=None, progress_marker=None, final_block_reason=None, from_revision=False, correction_limit=None, attempts=0, user_targets=(), verify_result=None, worker_result=None, worker_decision=None):
+        return self._recovery_handler()._recover(reason, detail, context=context, fingerprint=fingerprint, progress_marker=progress_marker, final_block_reason=final_block_reason, from_revision=from_revision, correction_limit=correction_limit, attempts=attempts, user_targets=user_targets, verify_result=verify_result, worker_result=worker_result, worker_decision=worker_decision)
+
+    def _block_final(self, repo, worktree, detail, verify_result, *, reason, recovery_reason=None, user_targets=()):
+        return self._recovery_handler()._block_final(repo, worktree, detail, verify_result, reason=reason, recovery_reason=recovery_reason, user_targets=user_targets)
+
+    def _block_from_revision_final(self, repo_path, repo, revision, detail, verify_result='', *, reason):
+        return self._recovery_handler()._block_from_revision_final(repo_path, repo, revision, detail, verify_result, reason=reason)
+
+    def _step_outcome(self, step_result):
+        return self._recovery_handler()._step_outcome(step_result)
+
+    def _documents_handler(self):
+        return execution_assembly.documents(
+            self.effects, getattr(self, "_identity", ExecutionIdentity()),
+            self._snapshot, self._update_snapshot,
+            {
+                "_block_final": lambda *a, **kw: self._block_final(*a, **kw),
+                "_document_block": lambda *a, **kw: self._document_block(*a, **kw),
+                "_finish_worker": lambda *a, **kw: self._finish_worker(*a, **kw),
+                "_row": lambda *a, **kw: self._row(*a, **kw),
+            },
+        )
+
+    def _document_draft(self, context):
+        return self._documents_handler()._document_draft(context)
+
+    def _document_block(self, context, draft, error):
+        return self._documents_handler()._document_block(context, draft, error)
+
+    def _document_guard(self, context, draft):
+        return self._documents_handler()._document_guard(context, draft)
+
+    def _document_review_prompt(self, base_prompt, draft):
+        return self._documents_handler()._document_review_prompt(base_prompt, draft)
+
+    def _run_document(self, context, draft):
+        return self._documents_handler()._run_document(context, draft)
+
+    def _ownership_handler(self):
+        return execution_assembly.ownership(
+            self.effects, getattr(self, "_identity", ExecutionIdentity()),
+            self._snapshot, self._update_snapshot,
+            {
+                "_completed_autostash_correction": lambda *a, **kw: self._completed_autostash_correction(*a, **kw),
+                "_current_rebase_service": lambda *a, **kw: self._current_rebase_service(*a, **kw),
+                "_rebase_journal_state": lambda *a, **kw: self._rebase_journal_state(*a, **kw),
+                "_row": lambda *a, **kw: self._row(*a, **kw),
+            },
+        )
+
+    def _owned_checkpoint_remote(self, context, row, remote_oid, current, pull_request=None):
+        return self._ownership_handler()._owned_checkpoint_remote(context, row, remote_oid, current, pull_request)
+
+    def _owned_published_review_resume(self, context, row, remote_oid, current, checkpoint, marker, pull_request):
+        return self._ownership_handler()._owned_published_review_resume(context, row, remote_oid, current, checkpoint, marker, pull_request)
+
+    def _current_rebase_service(self, context, **options):
+        return self._ownership_handler()._current_rebase_service(context, **options)
+
+    def _checkpoint_remote_oid(self, repo_path, branch):
+        return self._ownership_handler()._checkpoint_remote_oid(repo_path, branch)
+
+    def _owned_current_checkpoint_rebase(self, context, row, remote_oid, current, checkpoint, pull_request):
+        return self._ownership_handler()._owned_current_checkpoint_rebase(context, row, remote_oid, current, checkpoint, pull_request)
+
+    def _owned_detached_rebase(self, context, row, remote_oid, current, checkpoint, pull_request):
+        return self._ownership_handler()._owned_detached_rebase(context, row, remote_oid, current, checkpoint, pull_request)
+
+    @staticmethod
+    def _rebase_completion_session(context, current):
+        return execution_assembly.OwnershipHandler._rebase_completion_session(context, current)
+
+    def _matching_rebase_journal_result(self, context, current, remote_oid, observed, *, allow_later_file_changes=False):
+        return self._ownership_handler()._matching_rebase_journal_result(context, current, remote_oid, observed, allow_later_file_changes=allow_later_file_changes)
+
+    def _owned_persisted_rebase(self, context, row, remote_oid, current, checkpoint, pull_request):
+        return self._ownership_handler()._owned_persisted_rebase(context, row, remote_oid, current, checkpoint, pull_request)
+
+    def _completed_rebase_proof(self, context, current, remote_oid, observed):
+        return self._ownership_handler()._completed_rebase_proof(context, current, remote_oid, observed)
+
+    def _owned_completed_rebase(self, context, row, remote_oid, current, checkpoint, pull_request, local_head):
+        return self._ownership_handler()._owned_completed_rebase(context, row, remote_oid, current, checkpoint, pull_request, local_head)
+
+    def _legacy_current_rebase(self, context, current):
+        return self._ownership_handler()._legacy_current_rebase(context, current)
+
+    def _rebase_handler(self):
+        return execution_assembly.rebase(
+            self.effects, getattr(self, "_identity", ExecutionIdentity()),
+            self._snapshot, self._update_snapshot,
+            {
+                "_begin_rebase_continuation": lambda *a, **kw: self._begin_rebase_continuation(*a, **kw),
+                "_checkpoint_remote_oid": lambda *a, **kw: self._checkpoint_remote_oid(*a, **kw),
+                "_complete_rebase_intent": lambda *a, **kw: self._complete_rebase_intent(*a, **kw),
+                "_current_rebase_service": lambda *a, **kw: self._current_rebase_service(*a, **kw),
+                "_finish_rebase_journal": lambda *a, **kw: self._finish_rebase_journal(*a, **kw),
+                "_legacy_current_rebase": lambda *a, **kw: self._legacy_current_rebase(*a, **kw),
+                "_owned_checkpoint_remote": lambda *a, **kw: self._owned_checkpoint_remote(*a, **kw),
+                "_publish_rebased_checkpoint": lambda *a, **kw: self._publish_rebased_checkpoint(*a, **kw),
+                "_rebase_conflict": lambda *a, **kw: self._rebase_conflict(*a, **kw),
+                "_rebase_journal_state": lambda *a, **kw: self._rebase_journal_state(*a, **kw),
+                "_rebase_metadata": lambda *a, **kw: self._rebase_metadata(*a, **kw),
+                "_rebase_stage_evidence": lambda *a, **kw: self._rebase_stage_evidence(*a, **kw),
+                "_recover": lambda *a, **kw: self._recover(*a, **kw),
+                "_row": lambda *a, **kw: self._row(*a, **kw),
+                "_stage_evidence_preserved": lambda *a, **kw: self._stage_evidence_preserved(*a, **kw),
+                "_unmerged_stages": lambda *a, **kw: self._unmerged_stages(*a, **kw),
+            },
+            rebase_corrections=self.rebase_corrections,
+        )
+
+    def _resolving_rebase(self, row):
+        return self._rebase_handler()._resolving_rebase(row)
+
+    def _unmerged_stages(self, worktree):
+        return self._rebase_handler()._unmerged_stages(worktree)
+
+    def _rebase_observation(self, context, *, target=None, stash_oid=None):
+        return self._rebase_handler()._rebase_observation(context, target=target, stash_oid=stash_oid)
+
+    def _rebase_conflict(self, context, detail, *, corrected=False, worker_result=None, abnormal_result=False, target=None, stash_oid=None, recovery_reason=RecoveryReason.REBASE_CONFLICT):
+        return self._rebase_handler()._rebase_conflict(context, detail, corrected=corrected, worker_result=worker_result, abnormal_result=abnormal_result, target=target, stash_oid=stash_oid, recovery_reason=recovery_reason)
+
+    def _record_rebase_intent(self, context, target_oid):
+        return self._rebase_handler()._record_rebase_intent(context, target_oid)
+
+    def _rebase_metadata(self, context):
+        return self._rebase_handler()._rebase_metadata(context)
+
+    def _rebase_journal_state(self, context):
+        return self._rebase_handler()._rebase_journal_state(context)
+
+    def _begin_rebase_continuation(self, context, action):
+        return self._rebase_handler()._begin_rebase_continuation(context, action)
+
+    def _execute_rebase_step(self, context, action):
+        return self._rebase_handler()._execute_rebase_step(context, action)
+
+    def _rebase_journal_checks(self, context):
+        return self._rebase_handler()._rebase_journal_checks(context)
+
+    def _finish_rebase_journal(self, context, *, allow_equal=False):
+        return self._rebase_handler()._finish_rebase_journal(context, allow_equal=allow_equal)
+
+    def _run_managed_rebase(self, context, target_oid, *, autostash=False):
+        return self._rebase_handler()._run_managed_rebase(context, target_oid, autostash=autostash)
+
+    def _record_rebase_suboperation(self, context, pending, *, worker_result=None):
+        return self._rebase_handler()._record_rebase_suboperation(context, pending, worker_result=worker_result)
+
+    def _rebase_stage_evidence(self, context):
+        return self._rebase_handler()._rebase_stage_evidence(context)
+
+    def _stage_rebase_correction(self, context):
+        return self._rebase_handler()._stage_rebase_correction(context)
+
+    def _stage_evidence_preserved(self, context, accepted, observed, tracked_paths):
+        return self._rebase_handler()._stage_evidence_preserved(context, accepted, observed, tracked_paths)
+
+    def _post_rebase_observation(self, context, target_oid, output, *, corrected=False, worker_result=None):
+        return self._rebase_handler()._post_rebase_observation(context, target_oid, output, corrected=corrected, worker_result=worker_result)
+
+    def _completed_autostash_correction(self, context, intent, sealed, live, *, rejection=None):
+        return self._rebase_handler()._completed_autostash_correction(context, intent, sealed, live, rejection=rejection)
+
+    def _complete_rebase_intent(self, context, *, project_values=None):
+        return self._rebase_handler()._complete_rebase_intent(context, project_values=project_values)
+
+    def _publish_rebased_checkpoint(self, context):
+        return self._rebase_handler()._publish_rebased_checkpoint(context)
+
+    def _workspace_handler(self):
+        return execution_assembly.workspace(
+            self.effects, getattr(self, "_identity", ExecutionIdentity()),
+            self._snapshot, self._update_snapshot,
+            {
+                "_block_worker_decision": lambda *a, **kw: self._block_worker_decision(*a, **kw),
+                "_cached_plan": lambda *a, **kw: self._cached_plan(*a, **kw),
+                "_checkpoint_remote_oid": lambda *a, **kw: self._checkpoint_remote_oid(*a, **kw),
+                "_commit_rebase_resolution": lambda *a, **kw: self._commit_rebase_resolution(*a, **kw),
+                "_complete_rebase_intent": lambda *a, **kw: self._complete_rebase_intent(*a, **kw),
+                "_context": lambda *a, **kw: self._context(*a, **kw),
+                "_current_rebase_service": lambda *a, **kw: self._current_rebase_service(*a, **kw),
+                "_execute_rebase_step": lambda *a, **kw: self._execute_rebase_step(*a, **kw),
+                "_fetch_latest_base": lambda *a, **kw: self._fetch_latest_base(*a, **kw),
+                "_final": lambda *a, **kw: self._final(*a, **kw),
+                "_finish_rebase_journal": lambda *a, **kw: self._finish_rebase_journal(*a, **kw),
+                "_finish_worker": lambda *a, **kw: self._finish_worker(*a, **kw),
+                "_legacy_current_rebase": lambda *a, **kw: self._legacy_current_rebase(*a, **kw),
+                "_owned_checkpoint_remote": lambda *a, **kw: self._owned_checkpoint_remote(*a, **kw),
+                "_parse_worker_outcome": lambda *a, **kw: self._parse_worker_outcome(*a, **kw),
+                "_post_rebase_observation": lambda *a, **kw: self._post_rebase_observation(*a, **kw),
+                "_publish_rebased_checkpoint": lambda *a, **kw: self._publish_rebased_checkpoint(*a, **kw),
+                "_rebase_observation": lambda *a, **kw: self._rebase_observation(*a, **kw),
+                "_record_rebase_intent": lambda *a, **kw: self._record_rebase_intent(*a, **kw),
+                "_recover": lambda *a, **kw: self._recover(*a, **kw),
+                "_resolving_rebase": lambda *a, **kw: self._resolving_rebase(*a, **kw),
+                "_row": lambda *a, **kw: self._row(*a, **kw),
+                "_run_managed_rebase": lambda *a, **kw: self._run_managed_rebase(*a, **kw),
+                "_stage_rebase_correction": lambda *a, **kw: self._stage_rebase_correction(*a, **kw),
+            },
+        )
+
+    def _workspace_boundary(self, plan_id, row, *, pending):
+        return self._workspace_handler()._workspace_boundary(plan_id, row, pending=pending)
+
+    def recover(self, context):
+        return self._workspace_handler().recover(context)
 
     def prepare(self):
-        row = self._row()
-        branch = str(row['branch'] or '')
-        worktree = Path(str(row['worktree'] or ''))
-        plan_id = self.effects.workspace._plan_id_from_path(str(row['plan_path'] or ''))
-        catalog_plan = self.effects.state.active_execplan(self.repo)
-        self.catalog_plan = catalog_plan
-        workspace_ownership = int(catalog_plan['workspace_owned'] if catalog_plan else 0)
-        workspace_owned = workspace_ownership == self.effects.contract.WORKSPACE_OWNED
-        workspace_reserved = workspace_ownership == self.effects.contract.WORKSPACE_RESERVED
-        try:
-            resolving_rebase = self._resolving_rebase(row)
-        except (RecoveryFailure, RuntimeError, OSError) as error:
-            return self._recover(
-                classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
-                str(error),
-            )
-        try:
-            if plan_id is None:
-                raise self.effects.contract.WorkspaceOwnershipError('활성 ExecPlan 경로에서 ID를 확인할 수 없습니다.')
-            if catalog_plan is None or catalog_plan['plan_id'] != plan_id:
-                raise self.effects.contract.WorkspaceOwnershipError('활성 ExecPlan의 catalog 상태를 확인할 수 없습니다.')
-            self.effects.workspace.validate_execplan_workspace_identity(
-                self.state_dir,
-                self.repo,
-                plan_id,
-                branch,
-                worktree,
-            )
-            self._workspace_boundary(plan_id, row, pending=True)
-            self.effects.workspace.make_worktree(
-                self.repo_path,
-                worktree,
-                branch,
-                self.base,
-                allow_create_branch=self.newly_activated and (not workspace_owned) and (not workspace_reserved),
-                allow_recovery=workspace_owned or workspace_reserved,
-                allow_existing=workspace_owned or workspace_reserved,
-                ownership_reserved=workspace_reserved,
-                expected_head=str(row['active_sha'] or ''),
-                before_create=lambda: self.effects.workspace.reserve_execplan_workspace(self.repo, plan_id),
-                allow_rebase=resolving_rebase,
-                journal_state_dir=self.state_dir,
-                journal_owner=f'plan:{plan_id}',
-            )
-            self.effects.workspace.mark_execplan_workspace_owned(self.repo, plan_id)
-            self._workspace_boundary(plan_id, row, pending=False)
-        except self.effects.contract.WorkspaceOwnershipError as error:
-            workspace_error = f"관리 workspace 소유권/복구 검증 실패: {error}"
-            outcome = self._recover(
-                RecoveryReason.OWNERSHIP_UNCERTAIN, workspace_error,
-                from_revision=True,
-            )
-            self.effects.events.operation_print(workspace_error, file=sys.stderr)
-            return outcome
-        except RecoveryFailure as error:
-            return self._recover(error.reason, str(error))
-        except (RuntimeError, OSError) as error:
-            detail = f"관리 workspace 복구 재시도: {error}"
-            self.effects.events.operation_print(detail, file=sys.stderr)
-            return self._recover(
-                classify_exception(error, operation=RecoveryReason.WORKTREE_RECOVERY_FAILED),
-                detail,
-            )
-        if int(row['pr_conflict_recovery']):
-            recovery_rebase = self.effects.workspace.resume_pr_conflict_rebase(self.repo_path, self.repo, row, worktree, branch)
-            if recovery_rebase == 1:
-                return self._final()
-            if recovery_rebase == self.effects.contract.PROJECT_STEP_RETRY:
-                return self._recover(
-                    RecoveryReason.REBASE_CONTINUE_FAILED,
-                    str(self._row()['last_error'] or 'PR rebase 복구 재시도'),
-                )
-            row = self._row()
-            resolving_rebase = self._resolving_rebase(row)
-        rebase_error = str(row['last_error'] or '')
-        rebase_recovery = bool(
-            row['phase'] == 'WORKING' and (rebase_error == self.effects.contract.REBASE_IN_PROGRESS_ERROR or rebase_error.startswith(self.effects.contract.REBASE_CONFLICT_PREFIX)),
+        return self._workspace_handler().prepare()
+
+    def _revision_handler(self):
+        return execution_assembly.revision(
+            self.effects, getattr(self, "_identity", ExecutionIdentity()),
+            self._snapshot, self._update_snapshot,
+            {
+                "_archive_collision": lambda *a, **kw: self._archive_collision(*a, **kw),
+                "_archive_workspace_owned": lambda *a, **kw: self._archive_workspace_owned(*a, **kw),
+                "_block_final": lambda *a, **kw: self._block_final(*a, **kw),
+                "_block_worker_decision": lambda *a, **kw: self._block_worker_decision(*a, **kw),
+                "_cached_plan": lambda *a, **kw: self._cached_plan(*a, **kw),
+                "_checkpoint_remote_oid": lambda *a, **kw: self._checkpoint_remote_oid(*a, **kw),
+                "_commit_owned": lambda *a, **kw: self._commit_owned(*a, **kw),
+                "_complete_rebase_intent": lambda *a, **kw: self._complete_rebase_intent(*a, **kw),
+                "_context": lambda *a, **kw: self._context(*a, **kw),
+                "_document_draft": lambda *a, **kw: self._document_draft(*a, **kw),
+                "_fetch_latest_base": lambda *a, **kw: self._fetch_latest_base(*a, **kw),
+                "_final": lambda *a, **kw: self._final(*a, **kw),
+                "_parse_worker_outcome": lambda *a, **kw: self._parse_worker_outcome(*a, **kw),
+                "_post_rebase_observation": lambda *a, **kw: self._post_rebase_observation(*a, **kw),
+                "_publish_rebased_checkpoint": lambda *a, **kw: self._publish_rebased_checkpoint(*a, **kw),
+                "_reconcile_terminal_publication": lambda *a, **kw: self._reconcile_terminal_publication(*a, **kw),
+                "_record_rebase_intent": lambda *a, **kw: self._record_rebase_intent(*a, **kw),
+                "_recover": lambda *a, **kw: self._recover(*a, **kw),
+                "_refresh_revision_base": lambda *a, **kw: self._refresh_revision_base(*a, **kw),
+                "_retry": lambda *a, **kw: self._retry(*a, **kw),
+                "_row": lambda *a, **kw: self._row(*a, **kw),
+                "_run_managed_rebase": lambda *a, **kw: self._run_managed_rebase(*a, **kw),
+                "guard": lambda *a, **kw: self.guard(*a, **kw),
+            },
         )
-        if rebase_recovery and (not resolving_rebase) and (not int(row['pr_conflict_recovery'])):
-            resume_status = str(row['revision_resume_status'] or 'VERIFYING')
-            resume_phase = 'WORKING' if resume_status == 'IMPLEMENTING' else resume_status
-            self.effects.state.update_project(
-                self.repo,
-                phase=resume_phase,
-                revision_resume_status=None,
-                last_error=None,
-            )
-            row = self._row()
-        assert catalog_plan is not None
-        self.plan = self._cached_plan(catalog_plan)
-        self.level = self.effects.validation.ensure_worker_level_state(
-            self.repo, self.plan
-        )
-        self.catalog_plan = catalog_plan
-        return self._context()
 
     @staticmethod
     def _project_phase(status):
-        return 'WORKING' if status == 'IMPLEMENTING' else status
+        return execution_assembly.RevisionHandler._project_phase(status)
 
-    def _revision_state_values(
-        self, snapshot, decision, latest_sha, *, legacy_baseline=False
-    ):
-        row = self._row()
-        target = decision.phase
-        values = {
-            'definition_snapshot': snapshot.serialize(),
-            'phase': self._project_phase(target),
-            'revision_resume_status': None,
-        }
-        if decision.kind is RevisionGateKind.REFRESH_WORKTREE:
-            # The refresh intent marker is crash recovery state. Once rebase
-            # succeeds it must not be mistaken for an unfinished legacy
-            # latest-base rebase on the next process step.
-            values['last_error'] = None
-        if legacy_baseline:
-            if row['worker_result'] is not None:
-                values['worker_input_token'] = snapshot.worker_token
-                values['archive_token'] = snapshot.archive_token
-            # Legacy validation has no durable candidate HEAD. Retain its
-            # audit text but require validation on the current candidate.
-        if target == 'IMPLEMENTING' and (
-            decision.kind is RevisionGateKind.INVALIDATE_TO_PHASE
-            or str(row['phase']) != 'WORKING'
-            or bool(decision.deltas & WORKER_INVALIDATING_DELTAS)
-        ):
-            values.update(
-                validated_base_sha=None,
-                worker_result=None,
-                verify_result=None,
-                review_result=None,
-                worker_input_token=None,
-                archive_token=None,
-                verify_token=None,
-                review_token=None,
-                publication_token=None,
-                last_error=None,
-            )
-        elif target == 'VERIFYING' and (
-            decision.kind is RevisionGateKind.INVALIDATE_TO_PHASE
-            or str(row['phase']) not in {'WORKING', 'VERIFYING'}
-        ):
-            values.update(
-                validated_base_sha=None,
-                verify_result=None,
-                review_result=None,
-                verify_token=None,
-                review_token=None,
-                publication_token=None,
-                last_error=None,
-            )
-        elif target == 'REVIEWING' and (
-            decision.kind is RevisionGateKind.INVALIDATE_TO_PHASE
-            or str(row['phase']) == 'PUBLISHING'
-        ):
-            values.update(
-                review_result=None,
-                review_token=None,
-                publication_token=None,
-                last_error=None,
-            )
-        return values
+    def _revision_state_values(self, snapshot, decision, latest_sha, *, legacy_baseline=False):
+        return self._revision_handler()._revision_state_values(snapshot, decision, latest_sha, legacy_baseline=legacy_baseline)
 
-    def _install_revision_state(
-        self, snapshot, decision, latest_sha, *, legacy_baseline=False
-    ):
-        self.effects.state.update_project(
-            self.repo,
-            **self._revision_state_values(
-                snapshot,
-                decision,
-                latest_sha,
-                legacy_baseline=legacy_baseline,
-            ),
-        )
-        self._definition_snapshot = snapshot
-        self.catalog_plan = self.effects.state.active_execplan(self.repo)
-        assert self.catalog_plan is not None
-        self.plan = self._cached_plan(self.catalog_plan)
+    def _install_revision_state(self, snapshot, decision, latest_sha, *, legacy_baseline=False):
+        return self._revision_handler()._install_revision_state(snapshot, decision, latest_sha, legacy_baseline=legacy_baseline)
 
-    def _refresh_revision_base(
-        self,
-        context,
-        snapshot,
-        decision,
-        latest_sha,
-        *,
-        legacy_baseline=False,
-    ):
-        row = self._row()
-        if row['worker_result']:
-            try:
-                disposition = self._parse_worker_outcome(
-                    context, str(row['worker_result']), allow_legacy_ready=True,
-                )
-                if disposition.kind == 'needs_user_decision':
-                    return self._block_worker_decision(
-                        context, str(row['worker_result']), disposition,
-                    )
-            except WorkerOutcomeError as error:
-                detail = f'저장된 Worker 결과 검증 실패: {error}'
-                self.effects.state.update_project(
-                    self.repo, phase='WORKING', last_error=detail,
-                )
-                return self._recover(
-                    RecoveryReason.WORKER_CORRECTION, detail,
-                    context=context,
-                )
-        if context.phase is ExecutionPhase.PUBLISHING and not int(
-            row['pr_conflict_recovery']
-        ):
-            remote_oid = self._checkpoint_remote_oid(
-                self.repo_path, context.branch
-            )
-            try:
-                self.effects.publication.record_remote_publication_branch(
-                    self.repo_path,
-                    self.state_dir,
-                    self.repo,
-                    context.branch,
-                    context.worktree,
-                    remote_oid,
-                )
-            except self.effects.contract.PublicationSafetyError as error:
-                publication_error = str(error)
-                self._block_final(
-                    self.repo,
-                    context.worktree,
-                    publication_error,
-                    str(row['verify_result'] or ''),
-                    reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
-                )
-                self.effects.events.operation_print(
-                    publication_error, file=sys.stderr
-                )
-                return self._final(publication_error)
-            row = self._row()
-        if (
-            context.phase is ExecutionPhase.VERIFYING
-            and decision.phase == 'VERIFYING'
-            and self.effects.workspace.git(
-                context.worktree, 'status', '--porcelain'
-            ).stdout.strip()
-        ):
-            # Preserve the uncommitted Worker patch as a local checkpoint so
-            # a conflicting base rebase remains a resumable Git operation.
-            worker_publication = self.effects.validation.parse_worker_result(
-                str(row['worker_result'] or ''), self.plan
-            )
-            self.plan = self.effects.validation.validate_active_execplan_metadata(
-                self.repo_path,
-                context.worktree,
-                context.plan.path,
-                self.catalog_plan,
-            )
-            self.effects.workspace.git(context.worktree, 'add', '-A')
-            self._commit_owned(context, worker_publication.commit_title)
-        refresh_values = {
-            'phase': 'WORKING',
-            'validated_base_sha': None,
-            'revision_resume_status': decision.phase,
-            'last_error': self.effects.contract.REBASE_IN_PROGRESS_ERROR,
-        }
-        if int(row['pr_conflict_recovery']):
-            refresh_values['pr_conflict_base_oid'] = latest_sha
-        self.effects.state.update_project(self.repo, **refresh_values)
-        self._record_rebase_intent(context, latest_sha)
-        rebased = self._run_managed_rebase(context, latest_sha, autostash=True)
-        conflict = self._post_rebase_observation(context, latest_sha, rebased.stdout)
-        if conflict is not None:
-            return conflict
-        if rebased.returncode:
-            rebase_failure = self.effects.contract.REBASE_CONFLICT_PREFIX + rebased.stdout[-8000:]
-            in_progress = self.effects.workspace._rebase_in_progress_for_branch(
-                context.worktree, context.branch
-            )
-            if in_progress:
-                self.effects.state.update_project(
-                    self.repo,
-                    phase='WORKING',
-                    validated_base_sha=None,
-                    last_error=rebase_failure,
-                )
-            self.effects.events.operation_print(rebase_failure, file=sys.stderr)
-            return self._recover(
-                RecoveryReason.REBASE_CONFLICT if in_progress else RecoveryReason.WORKTREE_RECOVERY_FAILED,
-                rebase_failure, context=context,
-            )
-        if (
-            decision.phase != 'IMPLEMENTING'
-            and not self.effects.workspace.branch_has_changes(
-                context.worktree, self.base
-            )
-        ):
-            prefix = (
-                '게시 직전 '
-                if context.phase is ExecutionPhase.PUBLISHING
-                else ''
-            )
-            no_change_error = (
-                f'{prefix}rebase 후 Worker 변경이 남지 않아 PR을 생성할 수 없습니다.'
-            )
-            self._block_final(
-                self.repo,
-                context.worktree,
-                no_change_error,
-                str(row['verify_result'] or ''),
-                reason=BlockReasonCode.PLAN_INPUT_INVALID,
-                recovery_reason=RecoveryReason.NO_CHANGE,
-            )
-            self.effects.events.operation_print(no_change_error, file=sys.stderr)
-            return self._final(no_change_error)
-        self._complete_rebase_intent(context, project_values={
-            'phase': 'WORKING', 'active_sha': latest_sha,
-            'validated_base_sha': None, 'last_error': None,
-            'verify_result': None, 'review_result': None,
-            'verify_token': None, 'review_token': None,
-            'publication_token': None,
-        })
-        self._install_revision_state(
-            snapshot,
-            replace(decision, kind=RevisionGateKind.INVALIDATE_TO_PHASE, phase='IMPLEMENTING'),
-            latest_sha,
-            legacy_baseline=False,
-        )
-        return self._retry('최신 ExecPlan revision을 관리 worktree에 반영했습니다.')
+    def _refresh_revision_base(self, context, snapshot, decision, latest_sha, *, legacy_baseline=False):
+        return self._revision_handler()._refresh_revision_base(context, snapshot, decision, latest_sha, legacy_baseline=legacy_baseline)
 
     def _revision_error(self, context, detail):
-        self._block_final(
-            self.repo,
-            context.worktree,
-            detail,
-            str(self._row()['verify_result'] or ''),
-            reason=BlockReasonCode.PLAN_INPUT_INVALID,
-            user_targets=(context.plan.path,),
-        )
-        self.effects.events.operation_print(detail, file=sys.stderr)
-        return self._final(detail)
-
-    def _archive_collision(self, context, error):
-        return self._recover(
-            RecoveryReason.PLAN_INPUT_INVALID, str(error), context=context,
-            user_targets=(error.path,),
-        )
-
-    def _archive_workspace_owned(self, context):
-        active = self.effects.state.active_execplan(self.repo)
-        if not (
-            active is not None
-            and str(active['plan_id']) == context.plan.plan_id
-            and int(active['workspace_owned']) == self.effects.contract.WORKSPACE_OWNED
-            and str(active['branch'] or '') == context.branch
-            and str(active['worktree'] or '') == str(context.worktree)
-            and context.plan.plan_sha
-        ):
-            return False
-        try:
-            self.effects.workspace.validate_managed_worktree(
-                self.repo_path, context.worktree, context.branch
-            )
-            return self.effects.workspace.git(
-                context.worktree, 'merge-base', '--is-ancestor',
-                context.plan.plan_sha, 'HEAD', check=False,
-            ).returncode == 0
-        except self.effects.contract.WorkspaceOwnershipError:
-            return False
-        except self.effects.contract.GitLockError as error:
-            raise RecoveryFailure(RecoveryReason.GIT_LOCK, str(error)) from error
-        except (RuntimeError, OSError) as error:
-            raise RecoveryFailure(RecoveryReason.STATUS_FAILED, str(error)) from error
+        return self._revision_handler()._revision_error(context, detail)
 
     def guard(self, context):
-        """Refresh and reconcile before any phase effect consumes its snapshot."""
-
-        self.effects.state.check_context(context)
-        if context.phase is ExecutionPhase.PUBLISHING:
-            terminal = self._reconcile_terminal_publication(context)
-            if terminal is not None:
-                return terminal
-        self._publish_rebased_checkpoint(context)
-        latest_sha = self._fetch_latest_base()
-        try:
-            result = self.effects.revision.reconcile_catalog(
-                self.repo_path, self.repo, self.base
-            )
-        except self.effects.contract.GitLockError as error:
-            return self._recover(RecoveryReason.GIT_LOCK, str(error), context=context)
-        except (RuntimeError, OSError) as error:
-            return self._recover(
-                RecoveryReason.STATUS_FAILED, str(error), context=context
-            )
-        kind = getattr(getattr(result, 'kind', None), 'value', None)
-        if kind == 'stale':
-            return self._recover(
-                RecoveryReason.CATALOG_CACHE_STALE,
-                'ExecPlan catalog revision이 변경되어 다시 평가합니다.',
-                context=context,
-            )
-        if kind == 'invalid-catalog':
-            diagnostic = getattr(result, 'diagnostic', None)
-            detail = str(getattr(diagnostic, 'message', None) or '원격 ExecPlan catalog가 유효하지 않습니다.')
-            return self._recover(
-                RecoveryReason.CATALOG_INVALID, detail, context=context,
-                user_targets=tuple(
-                    path for path in (getattr(diagnostic, 'path', None),
-                                      getattr(diagnostic, 'source', None)) if path
-                ),
-            )
-        if str(getattr(result, 'revision_sha', '') or '') != latest_sha:
-            return self._recover(
-                RecoveryReason.REMOTE_SNAPSHOT_RACE,
-                '원격 base와 reconciled ExecPlan revision이 달라 다시 평가합니다.',
-                context=context,
-            )
-
-        catalog_plan = self.effects.state.active_execplan(self.repo)
-        if catalog_plan is None:
-            return ExecutionOutcome(
-                ExecutionOutcomeKind.OPERATIONAL_ERROR,
-                detail='revision gate에서 활성 ExecPlan을 찾을 수 없습니다.',
-                error=True,
-            )
-        self.catalog_plan = catalog_plan
-        self.plan = self._cached_plan(catalog_plan)
-        try:
-            archive_sources = (
-                () if self._document_draft(context) is not None
-                else self.effects.archive.requirement_archive_sources(self.repo)
-            )
-            archive_snapshot = (
-                self.effects.archive.requirement_archive_snapshot(
-                    self.repo_path,
-                    self.repo,
-                    latest_sha,
-                    str(catalog_plan['plan_id']),
-                )
-                if archive_sources else None
-            )
-            archive_candidates = (
-                archive_snapshot.candidates
-                if archive_snapshot is not None else ()
-            )
-            snapshot = DefinitionSnapshot(
-                revision_sha=latest_sha,
-                path=str(catalog_plan['path']),
-                title=str(catalog_plan['title']),
-                sources=tuple(json.loads(str(catalog_plan['sources']))),
-                depends_on=tuple(json.loads(str(catalog_plan['depends_on']))),
-                complexity=str(catalog_plan['current_complexity'] or self.plan['complexity']),
-                risk=str(catalog_plan['current_risk'] or self.plan['risk']),
-                priority=str(catalog_plan['priority']),
-                body_hash=self.effects.revision.body_hash(
-                    self.repo_path, latest_sha, str(catalog_plan['path'])
-                ),
-                source_fingerprint=self.effects.revision.source_fingerprint(
-                    self.repo_path, latest_sha, catalog_plan
-                ),
-                archive_candidates=tuple(sorted(archive_candidates)),
-            )
-            previous = DefinitionSnapshot.deserialize(
-                self._row()['definition_snapshot']
-            )
-            unmet = self.effects.revision.unmet_dependencies(
-                self.repo, str(catalog_plan['plan_id'])
-            )
-            changed_paths = self.effects.revision.changed_paths(
-                self.repo_path,
-                str(self._row()['active_sha'] or ''),
-                latest_sha,
-            )
-        except RecoveryFailure:
-            raise
-        except self.effects.contract.GitLockError as error:
-            return self._recover(RecoveryReason.GIT_LOCK, str(error), context=context)
-        except self.effects.contract.RequirementArchiveCollisionError as error:
-            return self._archive_collision(context, error)
-        except self.effects.contract.RequirementArchiveError as error:
-            if self._fetch_latest_base() != latest_sha:
-                return self._recover(
-                    RecoveryReason.REMOTE_SNAPSHOT_RACE,
-                    'Requirement archive 계산 중 원격 base가 변경됐습니다.',
-                    context=context,
-                )
-            return self._revision_error(
-                context, f"ExecPlan revision gate 확인 실패: {error}"
-            )
-        except (RuntimeError, ValueError) as error:
-            return self._revision_error(
-                context, f"ExecPlan revision gate 확인 실패: {error}"
-            )
-
-        row = self._row()
-        active_sha = str(row['active_sha'] or '')
-        legacy_input_paths = {
-            str(catalog_plan['path']),
-            *(str(item) for item in json.loads(str(catalog_plan['sources']))),
-        }
-        legacy_definition_changed = any(
-            path in legacy_input_paths
-            or path.startswith('docs/plans/')
-            or (bool(archive_sources) and path.startswith('docs/requirements/'))
-            for path in changed_paths
-        )
-        legacy_baseline = bool(
-            previous is None
-            and active_sha
-            and not legacy_definition_changed
-        )
-        candidate_head = self.effects.workspace.git(
-            context.worktree, 'rev-parse', 'HEAD'
-        ).stdout.strip()
-        decision = decide_revision_gate(
-            phase=ExecutionPhase(str(catalog_plan['status'])).value,
-            # Rows created before G-037 have valid phase artifacts but no
-            # revision tokens. Adopt the reconciled definition as their
-            # baseline, then let real base and definition deltas invalidate
-            # only the stages that must run again.
-            previous=snapshot if legacy_baseline else previous,
-            current=snapshot,
-            active_base_token=active_sha,
-            current_base_token=latest_sha,
-            artifacts=StageArtifacts(
-                require_worker_candidate=bool(self.effects.checkpoint and
-                    (self.effects.checkpoint.get(self.repo, context.plan.plan_id).snapshot or {}).get('current_rebase_acceptance')),
-                worker_candidate_token=((self.effects.checkpoint.get(self.repo, context.plan.plan_id).snapshot or {}).get('worker_candidate_token')
-                                        if self.effects.checkpoint else None),
-                worker_result=row['worker_result'] is not None,
-                verify_result=row['verify_result'] is not None,
-                review_result=row['review_result'] is not None,
-                worker_input_token=(
-                    snapshot.worker_token
-                    if legacy_baseline and row['worker_result'] is not None
-                    else str(row['worker_input_token'])
-                    if row['worker_input_token'] is not None
-                    else None
-                ),
-                archive_token=(
-                    snapshot.archive_token
-                    if legacy_baseline and row['worker_result'] is not None
-                    else str(row['archive_token'])
-                    if row['archive_token'] is not None
-                    else None
-                ),
-                verify_token=(
-                    str(row['verify_token'])
-                    if row['verify_token'] is not None
-                    else None
-                ),
-                review_token=(
-                    str(row['review_token'])
-                    if row['review_token'] is not None
-                    else None
-                ),
-                publication_token=(str(row['publication_token']) if row['publication_token'] is not None else None),
-            ),
-            unmet_dependencies=tuple(unmet),
-            candidate_head=candidate_head,
-        )
-        self.archive_sources = tuple(archive_sources)
-        self.archive_candidates = tuple(archive_candidates)
-        self.archive_scope_sources = tuple(sorted(set(archive_candidates)))
-        self._archive_snapshot = archive_snapshot
-
-        if decision.kind is RevisionGateKind.FINAL_SAFETY_ERROR:
-            return self._revision_error(context, str(decision.detail))
-        if decision.kind is RevisionGateKind.WAIT:
-            # A conflicted rebase cannot accept a second refresh or clear its
-            # recovery marker. Still reconcile dependencies before Worker.
-            if not context.resolving_rebase:
-                self._install_revision_state(
-                    snapshot,
-                    decision,
-                    latest_sha,
-                    legacy_baseline=legacy_baseline,
-                )
-            self.effects.events.operation_log(str(decision.detail))
-            return ExecutionOutcome(
-                ExecutionOutcomeKind.STABLE_WAIT,
-                context=context if context.resolving_rebase else self._context(),
-                detail=decision.detail,
-            )
-        if context.resolving_rebase:
-            if (
-                (previous is None and not legacy_baseline)
-                or decision.deltas & (
-                    WORKER_INVALIDATING_DELTAS - {DefinitionDelta.DEPENDENCIES}
-                )
-            ):
-                detail = (
-                    'rebase 충돌 복구 중 ExecPlan 구현 입력이 변경되어 기존 '
-                    'Worker 변경과 안전하게 결합할 수 없습니다.'
-                )
-                self._block_final(
-                    self.repo,
-                    context.worktree,
-                    detail,
-                    str(row['verify_result'] or ''),
-                    reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
-                )
-                self.effects.events.operation_print(detail, file=sys.stderr)
-                return self._final(detail)
-            if DefinitionDelta.DEPENDENCIES in decision.deltas:
-                # Dependency readiness was checked above. Resolve the existing
-                # conflict first, but retain the applied definition so the next
-                # gate refreshes the worktree and reruns Worker on the new DAG.
-                self.effects.state.update_project(
-                    self.repo,
-                    validated_base_sha=None,
-                    worker_result=None,
-                    verify_result=None,
-                    review_result=None,
-                    worker_input_token=None,
-                    archive_token=None,
-                    verify_token=None,
-                    review_token=None,
-                    publication_token=None,
-                )
-            # The ongoing Git rebase remains pinned to its original target.
-            # Do not install the new stage state until it has been resolved.
-            self._definition_snapshot = snapshot
-            self.level = self.effects.validation.ensure_worker_level_state(
-                self.repo, self.plan
-            )
-            return self._context()
-        if str(row['active_sha'] or '') != latest_sha:
-            if self._archive_snapshot is not None:
-                try:
-                    workspace_owned = self._archive_workspace_owned(context)
-                except RecoveryFailure as error:
-                    return self._recover(error.reason, str(error), context=context)
-                if not workspace_owned:
-                    return self._recover(
-                        RecoveryReason.OWNERSHIP_UNCERTAIN,
-                        'Requirement archive 관리 worktree와 ExecPlan HEAD의 소유권을 확인할 수 없습니다.',
-                        context=context,
-                    )
-                repository = ArchiveTargetRepository(self.effects.state.connection)
-                previous_target = repository.get(self.repo, str(self.plan['id']))
-                try:
-                    repository.put(
-                        self.repo, self._archive_snapshot,
-                        expected_execution=self.effects.state.expected,
-                        expected_generation=(
-                            previous_target.generation if previous_target else None
-                        ),
-                        base_is_current=lambda oid: self._fetch_latest_base() == oid,
-                        snapshot_is_current=lambda: (
-                            self.effects.archive.requirement_archive_snapshot(
-                                self.repo_path, self.repo, latest_sha,
-                                str(self.plan['id']),
-                            ).token == self._archive_snapshot.token
-                        ),
-                        stage='OBSERVED',
-                    )
-                except ArchiveTargetConflict:
-                    return self._recover(
-                        RecoveryReason.REMOTE_SNAPSHOT_RACE,
-                        'Requirement archive rebase 대상 snapshot이 변경됐습니다.',
-                        context=context,
-                    )
-                except self.effects.contract.RequirementArchiveCollisionError as error:
-                    return self._archive_collision(context, error)
-                except self.effects.contract.RequirementArchiveError as error:
-                    return self._recover(
-                        RecoveryReason.CATALOG_INVALID, str(error), context=context
-                    )
-            return self._refresh_revision_base(
-                context,
-                snapshot,
-                decision,
-                latest_sha,
-                legacy_baseline=legacy_baseline,
-            )
-        self._install_revision_state(
-            snapshot,
-            decision,
-            latest_sha,
-            legacy_baseline=legacy_baseline,
-        )
-        if decision.kind is RevisionGateKind.INVALIDATE_TO_PHASE:
-            return self._retry('ExecPlan revision 변경으로 필요한 실행 단계부터 재개합니다.')
-        try:
-            self.plan = self.effects.validation.validate_active_execplan_metadata(
-                self.repo_path,
-                context.worktree,
-                str(self._row()['plan_path']),
-                self.catalog_plan,
-            )
-            self.level = self.effects.validation.ensure_worker_level_state(
-                self.repo, self.plan
-            )
-            if self.archive_sources and self._row()['phase'] == 'WORKING':
-                self.archive_scope_sources = tuple(
-                    sorted(
-                        set(self.archive_candidates)
-                        | set(
-                            self.effects.archive.requirement_archive_touched_sources(
-                                self.repo_path,
-                                latest_sha,
-                                context.worktree,
-                            )
-                        )
-                    )
-                )
-        except RecoveryFailure:
-            raise
-        except RuntimeError as error:
-            return self._revision_error(context, str(error))
-        if self._archive_snapshot is not None:
-            def require_next_guard(_base):
-                raise RecoveryFailure(
-                    RecoveryReason.BASE_BEHIND,
-                    'Requirement archive 복구 중 새 원격 base를 관측했습니다.',
-                )
-
-            def reconcile_catalog(_base):
-                try:
-                    return self.effects.revision.reconcile_catalog(
-                        self.repo_path, self.repo, self.base
-                    )
-                except self.effects.contract.GitLockError as error:
-                    raise RecoveryFailure(RecoveryReason.GIT_LOCK, str(error)) from error
-
-            def applied_base():
-                try:
-                    return self.effects.workspace.git(
-                        context.worktree, 'merge-base', 'HEAD',
-                        f'origin/{self.base}',
-                    ).stdout.strip()
-                except self.effects.contract.GitLockError as error:
-                    raise RecoveryFailure(RecoveryReason.GIT_LOCK, str(error)) from error
-                except RuntimeError as error:
-                    raise RecoveryFailure(RecoveryReason.STATUS_FAILED, str(error)) from error
-
-            def calculate_snapshot(oid):
-                try:
-                    return self.effects.archive.requirement_archive_snapshot(
-                        self.repo_path, self.repo, oid, str(self.plan['id'])
-                    )
-                except self.effects.contract.GitLockError as error:
-                    raise RecoveryFailure(RecoveryReason.GIT_LOCK, str(error)) from error
-
-            ports = ArchiveRecoveryPorts(
-                fetch_base=self._fetch_latest_base,
-                observe_pull_request=lambda: self.effects.publication.pr_for_branch(
-                    self.repo_path, context.branch, context.pr_url or ''
-                ),
-                reconcile_catalog=reconcile_catalog,
-                workspace_owned=lambda: self._archive_workspace_owned(context),
-                applied_base=applied_base,
-                refresh_worktree=require_next_guard,
-                calculate_snapshot=calculate_snapshot,
-                current_base=self._fetch_latest_base,
-                execution_snapshot=lambda: self.effects.state.expected,
-                plan_revision=lambda: (
-                    str(self.catalog_plan['current_revision_sha'])
-                    if self.catalog_plan is not None
-                    and self.catalog_plan['current_revision_sha'] is not None
-                    else None
-                ),
-            )
-            try:
-                recovered = ArchiveRecoveryService(
-                    ArchiveTargetRepository(self.effects.state.connection),
-                    ports,
-                ).run()
-            except RecoveryFailure as error:
-                return self._recover(
-                    error.reason, str(error), context=context
-                )
-            except self.effects.contract.RequirementArchiveCollisionError as error:
-                return self._archive_collision(context, error)
-            except self.effects.contract.RequirementArchiveError as error:
-                reason = (
-                    RecoveryReason.REMOTE_SNAPSHOT_RACE
-                    if self._fetch_latest_base() != latest_sha
-                    else RecoveryReason.CATALOG_INVALID
-                )
-                return self._recover(reason, str(error), context=context)
-            if recovered.decision is not None:
-                return self._recover(
-                    recovered.decision.observation.reason,
-                    recovered.decision.observation.detail,
-                    context=context, attempts=recovered.decision.attempts,
-                    user_targets=recovered.decision.observation.user_targets,
-                )
-            if recovered.snapshot is None or recovered.snapshot.token != self._archive_snapshot.token:
-                return self._recover(
-                    RecoveryReason.CATALOG_CACHE_STALE,
-                    'Requirement archive snapshot이 변경되어 최신 선언으로 다시 평가합니다.',
-                    context=context,
-                )
-        return self._context()
+        return self._revision_handler().guard(context)
 
     def _post_effect_guard(self, context):
-        # Direct policy unit tests can still exercise a handler without the
-        # coordinator. Real execution always installs this snapshot first.
-        if self._definition_snapshot is None:
-            return context
-        return self.guard(self._context())
+        return self._revision_handler()._post_effect_guard(context)
+
+    def _metadata_correction(self, context, error, *, verify_result=None):
+        return self._revision_handler()._metadata_correction(context, error, verify_result=verify_result)
+
+    def _archive_handler(self):
+        return execution_assembly.archive(
+            self.effects, getattr(self, "_identity", ExecutionIdentity()),
+            self._snapshot, self._update_snapshot,
+            {
+                "_fetch_latest_base": lambda *a, **kw: self._fetch_latest_base(*a, **kw),
+                "_recover": lambda *a, **kw: self._recover(*a, **kw),
+            },
+        )
+
+    def _archive_collision(self, context, error):
+        return self._archive_handler()._archive_collision(context, error)
+
+    def _archive_workspace_owned(self, context):
+        return self._archive_handler()._archive_workspace_owned(context)
 
     def _archive_candidates_at(self, context, revision):
-        """Require the archive input used by this phase before reading moves."""
-
-        try:
-            if self._archive_snapshot is None:
-                return self.effects.archive.requirement_archive_candidates(
-                    self.repo_path, self.repo, revision, str(self.plan['id'])
-                )
-            snapshot = self.effects.archive.requirement_archive_snapshot(
-                self.repo_path, self.repo, revision, str(self.plan['id'])
-            )
-        except self.effects.contract.GitLockError as error:
-            raise RecoveryFailure(RecoveryReason.GIT_LOCK, str(error)) from error
-        if (
-            snapshot.token != self._archive_snapshot.token
-            or snapshot.token != context.archive_snapshot_token
-        ):
-            raise RecoveryFailure(
-                RecoveryReason.CATALOG_CACHE_STALE,
-                'Requirement archive base/catalog/state snapshot이 변경됐습니다.',
-            )
-        return snapshot.candidates
+        return self._archive_handler()._archive_candidates_at(context, revision)
 
     def _record_archive_target(self, stage, *, moves=None):
-        if self._archive_snapshot is None:
-            return
-        snapshot = (
-            self._archive_snapshot.with_moves(tuple(moves))
-            if moves is not None else self._archive_snapshot
+        return self._archive_handler()._record_archive_target(stage, moves=moves)
+
+    def _worker_handler(self):
+        return execution_assembly.worker(
+            self.effects, getattr(self, "_identity", ExecutionIdentity()),
+            self._snapshot, self._update_snapshot,
+            {
+                "_advanced": lambda *a, **kw: self._advanced(*a, **kw),
+                "_archive_candidates_at": lambda *a, **kw: self._archive_candidates_at(*a, **kw),
+                "_archive_collision": lambda *a, **kw: self._archive_collision(*a, **kw),
+                "_block_final": lambda *a, **kw: self._block_final(*a, **kw),
+                "_commit_rebase_resolution": lambda *a, **kw: self._commit_rebase_resolution(*a, **kw),
+                "_complete_rebase_intent": lambda *a, **kw: self._complete_rebase_intent(*a, **kw),
+                "_current_rebase_service": lambda *a, **kw: self._current_rebase_service(*a, **kw),
+                "_document_draft": lambda *a, **kw: self._document_draft(*a, **kw),
+                "_execute_rebase_step": lambda *a, **kw: self._execute_rebase_step(*a, **kw),
+                "_fetch_latest_base": lambda *a, **kw: self._fetch_latest_base(*a, **kw),
+                "_final": lambda *a, **kw: self._final(*a, **kw),
+                "_finish_worker": lambda *a, **kw: self._finish_worker(*a, **kw),
+                "_metadata_correction": lambda *a, **kw: self._metadata_correction(*a, **kw),
+                "_post_effect_guard": lambda *a, **kw: self._post_effect_guard(*a, **kw),
+                "_post_rebase_observation": lambda *a, **kw: self._post_rebase_observation(*a, **kw),
+                "_rebase_conflict": lambda *a, **kw: self._rebase_conflict(*a, **kw),
+                "_rebase_observation": lambda *a, **kw: self._rebase_observation(*a, **kw),
+                "_record_archive_target": lambda *a, **kw: self._record_archive_target(*a, **kw),
+                "_record_rebase_suboperation": lambda *a, **kw: self._record_rebase_suboperation(*a, **kw),
+                "_recover": lambda *a, **kw: self._recover(*a, **kw),
+                "_retry": lambda *a, **kw: self._retry(*a, **kw),
+                "_row": lambda *a, **kw: self._row(*a, **kw),
+                "_run_document": lambda *a, **kw: self._run_document(*a, **kw),
+                "_stage_rebase_correction": lambda *a, **kw: self._stage_rebase_correction(*a, **kw),
+                "_unmerged_stages": lambda *a, **kw: self._unmerged_stages(*a, **kw),
+            },
+            rebase_corrections=self.rebase_corrections,
         )
-        repository = ArchiveTargetRepository(self.effects.state.connection)
-        previous = repository.get(self.repo, str(self.plan['id']))
-        try:
-            repository.put(
-                self.repo, snapshot,
-                expected_execution=self.effects.state.expected,
-                expected_generation=previous.generation if previous else None,
-                base_is_current=lambda oid: self._fetch_latest_base() == oid,
-                snapshot_is_current=lambda: (
-                    self.effects.archive.requirement_archive_snapshot(
-                        self.repo_path, self.repo, snapshot.base_oid,
-                        str(self.plan['id']),
-                    ).token == snapshot.token
-                ),
-                stage=stage,
-            )
-        except ArchiveTargetConflict as error:
-            raise RecoveryFailure(
-                RecoveryReason.REMOTE_SNAPSHOT_RACE,
-                'Requirement archive target 저장 중 snapshot이 변경됐습니다.',
-            ) from error
-        except self.effects.contract.GitLockError as error:
-            raise RecoveryFailure(RecoveryReason.GIT_LOCK, str(error)) from error
-        except self.effects.contract.RequirementArchiveError as error:
-            raise RecoveryFailure(RecoveryReason.CATALOG_INVALID, str(error)) from error
+
+    def _parse_worker_outcome(self, context, message, *, allow_legacy_ready=False):
+        return self._worker_handler()._parse_worker_outcome(context, message, allow_legacy_ready=allow_legacy_ready)
+
+    def _block_worker_decision(self, context, message, outcome: WorkerOutcome):
+        return self._worker_handler()._block_worker_decision(context, message, outcome)
 
     def run(self, context):
-        self.effects.state.check_context(context)
-        row = self._row()
-        catalog_plan = self.catalog_plan
-        plan = self.plan
-        assert catalog_plan is not None and plan is not None
-        draft = self._document_draft(context)
-        if draft is not None:
-            return self._run_document(context, draft)
-        self.effects.events.operation_log(f"Worker 시작: {plan['id']} {plan['title']}")
-        correction_turn = None
-        if context.resolving_rebase:
-            try:
-                observation = self._rebase_observation(context)
-                current = self.rebase_corrections.get(self.repo, context.plan.plan_id)
-                if current is not None and current.worker_result is not None:
-                    return self._resume_saved_rebase_worker(
-                        context, current, observation,
-                    )
-                if current is not None and current.pending_turn:
-                    # Agent scope retains the pre-turn snapshot across a
-                    # process restart, including partial Worker file edits.
-                    if (observation.progress != current.progress and row['agent_snapshot'] is None):
-                        if getattr(self.effects.workspace, 'current_rebase_service', None) is None:
-                            return self._recover(
-                                RecoveryReason.OWNERSHIP_UNCERTAIN,
-                                'pending rebase Worker changed files without its scope baseline',
-                                context=context, final_block_reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE)
-                        self._current_rebase_service(context).require_owned()
-                        self.rebase_corrections.abandon_turn(
-                            self.repo, context.plan.plan_id, expected_generation=current.generation)
-                        current = self.rebase_corrections.observe(
-                            self.repo, context.plan.plan_id, observation,
-                            worker_session=row['worker_session_id'], persist_worker_result=False)
-                        current = self.rebase_corrections.begin_turn(
-                            self.repo, context.plan.plan_id, expected_generation=current.generation,
-                            session=row['worker_session_id'])
-                    correction_turn = current
-                else:
-                    current = self.rebase_corrections.observe(
-                        self.repo, context.plan.plan_id, observation,
-                        expected_generation=current.generation if current else None,
-                        worker_session=row['worker_session_id'],
-                    )
-                    correction_turn = self.rebase_corrections.begin_turn(
-                        self.repo, context.plan.plan_id,
-                        expected_generation=current.generation,
-                        session=row['worker_session_id'],
-                    )
-            except CorrectionRace:
-                return self._recover(RecoveryReason.REMOTE_SNAPSHOT_RACE,
-                                     'rebase Worker turn changed', context=context)
-            except (RuntimeError, OSError, ValueError) as error:
-                return self._recover(
-                    classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
-                    str(error), context=context,
-                )
-        resolved = self.effects.agent.resolve_worker_profile(
-            self.config_path, self.provider, self.level, context.worktree,
-        )
-        review_result_id = None
-        review_turn_run_id = None
-        if not context.resolving_rebase:
-            review_result_id = recovery_state.pending_review_correction(
-                self.effects.state.connection, self.repo, str(plan['id']),
-                str(row['review_result'] or ''),
-            )
-            if review_result_id is not None:
-                allowed, used, review_turn_run_id = recovery_state.reserve_review_correction(
-                    self.effects.state.connection, self.repo, str(plan['id']),
-                    review_result_id,
-                )
-                if not allowed:
-                    detail = (
-                        f"Review 교정 실행 한도 도달: run={review_turn_run_id}, "
-                        f"plan={plan['id']}, used={used}/"
-                        f"{recovery_state.MAX_REVIEW_CORRECTIONS_PER_RUN}. "
-                        "다음 외부 실행에서 저장된 Review 피드백으로 재개합니다.\n"
-                        + str(row['review_result'] or '')[-8000:]
-                    )
-                    return self._recover(
-                        RecoveryReason.REVIEW_CORRECTION_BUDGET, detail,
-                        context=context, attempts=3,
-                        fingerprint=hashlib.sha256(
-                            ("review-correction-budget|" + str(plan['id']) + "|"
-                             + str(row['review_result'] or '')).encode()
-                        ).hexdigest(),
-                    )
-        decision = decide_session(
-            row['worker_session_id'],
-            SessionBinding.deserialize(row['worker_session_binding']),
-            SessionTransition.deserialize(row['worker_session_transition']),
-            self.provider, resolved, uuid4().hex,
-        )
-        active_transition = decision.transition
-        target = decision.target
-        if active_transition is not None and row['worker_session_transition'] is None:
-            self.effects.state.update_project(
-                self.repo, worker_session_id=None,
-                worker_session_transition=active_transition.serialize(),
-            )
-            row = self._row()
-        active_session_id = decision.session_id
-        observed_session_id = None
-        worker_scope_before = self.effects.agent.begin_agent_scope(
-            self.repo,
-            context.worktree,
-            'worker',
-            input_fingerprint=self.effects.agent._revision_execplan_input_fingerprint(
-                self.repo_path, context.base_sha, catalog_plan,
-            ),
-        )
-        feedback_repo = self.effects.feedback.repository if self.effects.feedback else None
-        delivery = None
-        def session_started(started_session_id):
-            nonlocal observed_session_id
-            if observed_session_id == started_session_id:
-                return
-            self.effects.state.observe_worker_session(
-                active_transition.identity if active_transition else None,
-                started_session_id, target.serialize(),
-            )
-            observed_session_id = started_session_id
-            if feedback_repo is not None and delivery is not None:
-                feedback_repo.bind_session(delivery.attempt_id, started_session_id)
-        def worker_call(current_session_id, session_recovery, invocation):
-            nonlocal delivery, active_transition
-            previous_session = observed_session_id or active_session_id
-            if (session_recovery and previous_session
-                    and (active_transition is None
-                         or self._row()['worker_session_transition'] is None)):
-                active_transition = unavailable_transition(
-                    str(previous_session),
-                    SessionBinding.deserialize(self._row()['worker_session_binding']),
-                    target, uuid4().hex,
-                )
-                self.effects.state.update_project(
-                    self.repo, worker_session_id=None,
-                    worker_session_transition=active_transition.serialize(),
-                )
-            previous = active_transition.previous_binding if active_transition else None
-            invocation = replace(
-                invocation,
-                transition_id=active_transition.identity if active_transition else None,
-                previous_provider=previous.provider if previous else None,
-                previous_model=previous.model if previous else None,
-                previous_effort=previous.effort if previous else None,
-                previous_session_id=(active_transition.previous_session
-                                     if active_transition else None),
-            )
-            recovering = bool(session_recovery or (
-                active_transition is not None and current_session_id is None
-            ))
-            if feedback_repo is not None:
-                delivery = feedback_repo.prepare(
-                    self.repo, str(plan['id']), current_session_id,
-                    recovery=recovering,
-                )
-                recovering = delivery.recovery
-                validation_feedback = render_delta(delivery.rows)
-            else:
-                validation_feedback = ''
-            prompt_error = row['last_error']
-            if is_validation_error(prompt_error, row['verify_result'], row['review_result']):
-                prompt_error = None
-            prompt = self.effects.agent.worker_prompt(
-                row['plan_path'], prompt_error, row['worker_result'], validation_feedback,
-                archive_candidates=self.archive_candidates, session_recovery=recovering,
-                guidance_common_allowed=self.effects.agent.is_loop_manager_repository(self.repo_path),
-                guidance_context=guidance_context, allow_common_plans=allow_common_plans)
-            checkpoint = self.effects.checkpoint
-            accepted = (checkpoint.get(self.repo, str(plan['id'])).snapshot or {}).get('current_rebase_acceptance') if checkpoint else None
-            if accepted and not context.resolving_rebase:
-                prompt = (prompt or '') + (
-                    '\n관리 rebase 결과를 현재 상태로 수용했다. 현재 ExecPlan과 근거 입력을 다시 읽고 '
-                    '현재 HEAD의 base 대비 최종 diff 전체를 확인하라. 이전 후보의 성공을 재사용하지 말고 '
-                    '관련 최소 범위 targeted unit test를 실행해 현재 후보의 결과를 보고하라. '
-                    '전체 verify와 Review는 이후 Manager가 수행한다.\n')
-            try:
-                recovery_state.start_review_correction(
-                    self.effects.state.connection, self.repo, str(plan['id']),
-                    review_turn_run_id, review_result_id,
-                )
-                with self.effects.state.connection:
-                    resumed = notifications.record_work_start(
-                        self.effects.state.connection, self.repo, "Worker",
-                        plan_id=str(plan['id']),
-                    )
-                if resumed:
-                    self.effects.events.operation_log(
-                        f"차단 해제 후 Worker 작업 재개: {plan['id']}"
-                    )
-                return self.effects.agent.run_agent(
-                    target.provider, context.worktree, self.state_dir,
-                    self.config_path, 'worker',
-                    prompt,
-                    read_only=False, level=self.level, persist_session=True,
-                    session_id=current_session_id,
-                    on_session_started=session_started,
-                    invocation=invocation,
-                    resolved_profile=ResolvedProfile(target.model, target.effort),
-                )
-            except (subprocess.TimeoutExpired, OSError) as error:
-                if observed_session_id is None:
-                    raise
-                detail = (f'Agent CLI timeout: {error}' if isinstance(error, subprocess.TimeoutExpired)
-                          else f'Agent CLI 실행 실패: {error}')
-                return AgentResult(1, detail, observed_session_id,
-                                   AgentResultKind.TRANSIENT_FAILURE)
-        guidance_targets = self.effects.agent._guidance_worker_targets(self.repo, str(catalog_plan['plan_id']))
-        guidance_context = self.effects.agent.guidance_resume_context(self.repo, str(catalog_plan['plan_id']))
-        allow_common_plans = self.effects.agent._published_plan_allows_common_plans(self.repo_path, catalog_plan)
-        result = self.effects.agent.run_agent_with_retries(
-            TrackedAgentCall(worker_call, AttemptSequence(
-                self.repo, str(plan['id']),
-                str(catalog_plan['current_revision_sha']) if catalog_plan['current_revision_sha'] is not None else None,
-                initial_transition=decision.kind,
-                initial_cause=decision.cause,
-            )),
-            session_id=active_session_id,
-        )
-        code, message = result
-        if feedback_repo is not None and delivery is not None and result.session_id:
-            feedback_repo.bind_session(delivery.attempt_id, result.session_id)
-        if result.session_id and observed_session_id != result.session_id:
-            session_started(result.session_id)
-        try:
-            self.plan = self.effects.agent.validate_worker_workspace_scope(
-                self.repo_path,
-                context.worktree,
-                context.branch,
-                self.base,
-                str(row['plan_path']),
-                catalog_plan,
-                worker_scope_before,
-                allow_rebase=context.resolving_rebase,
-                **({'rebase_definition': DefinitionSnapshot.deserialize(
-                    row['definition_snapshot']
-                )} if context.resolving_rebase else {}),
-                allowed_requirement_archives=self.archive_scope_sources,
-                allowed_guidance_targets=guidance_targets,
-                allow_common_plans=allow_common_plans,
-            )
-        except (self.effects.contract.AgentScopeError, self.effects.contract.WorkspaceOwnershipError) as error:
-            scope_error = str(error)
-            self._block_final(
-                self.repo,
-                context.worktree,
-                scope_error,
-                str(row['verify_result'] or ''),
-                reason=getattr(error, 'reason_code', BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN),
-            )
-            self.effects.events.operation_print(scope_error, file=sys.stderr)
-            return self._final(scope_error)
-        except self.effects.contract.ExecPlanMetadataError as error:
-            return self._metadata_correction(context, error)
-        except RuntimeError as error:
-            detail = f"Worker workspace 상태 조회 재시도: {error}"
-            self.effects.events.operation_print(detail, file=sys.stderr)
-            return self._recover(
-                classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
-                detail, context=context,
-            )
-        if correction_turn is not None:
-            try:
-                marker = self._rebase_observation(context).progress
-                self.rebase_corrections.finish_turn(
-                    self.repo, context.plan.plan_id,
-                    expected_generation=correction_turn.generation,
-                    turn=correction_turn.pending_turn,
-                    session=result.session_id or self._row()['worker_session_id'],
-                    result=message, scope_marker=marker, code=code,
-                    result_kind=result.result_kind.value,
-                )
-            except CorrectionRace:
-                return self._recover(RecoveryReason.REMOTE_SNAPSHOT_RACE,
-                                     'rebase Worker result changed', context=context)
-            except (RuntimeError, OSError, ValueError) as error:
-                return self._recover(
-                    classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
-                    str(error), context=context,
-                )
-        guarded = self._post_effect_guard(context)
-        if isinstance(guarded, ExecutionOutcome):
-            self.effects.agent.clear_agent_scope(self.repo)
-            return guarded
-        context = guarded
-        row = self._row()
-        catalog_plan = self.catalog_plan
-        assert catalog_plan is not None
-        guidance_blocked = self.effects.agent.inspect_worker_guidance_result(
-            self.repo_path,
-            self.repo,
-            context.worktree,
-            catalog_plan,
-            message,
-        )
-        if guidance_blocked:
-            blocked = self.effects.state.blocked()
-            self.effects.events.operation_print(
-                str(blocked['last_error'] if blocked else 'guidance 승인 대기'),
-                file=sys.stderr,
-            )
-            return self._final()
-        if code:
-            self.effects.agent.clear_agent_scope(self.repo)
-            if context.resolving_rebase:
-                saved_turn = self.rebase_corrections.get(self.repo, context.plan.plan_id)
-                self.rebase_corrections.abandon_turn(
-                    self.repo, context.plan.plan_id,
-                    expected_generation=saved_turn.generation,
-                )
-            worker_error = message or f"Agent 종료 코드 {code}"
-            if result.result_kind is self.effects.contract.AgentResultKind.TRANSIENT_FAILURE:
-                worker_error = f"{self.effects.contract.TRANSIENT_AGENT_ERROR_PREFIX} {worker_error}"
-                if context.resolving_rebase:
-                    worker_error = self.effects.contract.REBASE_CONFLICT_PREFIX + worker_error
-                self.effects.state.update_project(self.repo, phase='WORKING', last_error=worker_error)
-                self.effects.events.operation_print(worker_error, file=sys.stderr)
-                return self._recover(
-                    RecoveryReason.SERVICE_UNAVAILABLE, worker_error,
-                    context=context, attempts=3,
-                )
-            elif result.result_kind is self.effects.contract.AgentResultKind.USAGE_LIMIT:
-                worker_error = f"{self.effects.contract.USAGE_LIMIT_ERROR_PREFIX} {worker_error}"
-                outcome = ExecutionOutcomeKind.USAGE_PAUSE
-            elif context.resolving_rebase:
-                worker_error = self.effects.contract.REBASE_CONFLICT_PREFIX + worker_error
-                self.effects.state.update_project(self.repo, phase='WORKING', last_error=worker_error)
-                self.effects.events.operation_print(worker_error, file=sys.stderr)
-                return self._rebase_conflict(
-                    context, worker_error, corrected=True, worker_result=message,
-                    abnormal_result=True,
-                )
-            else:
-                outcome = ExecutionOutcomeKind.OPERATIONAL_ERROR
-            if context.resolving_rebase:
-                worker_error = self.effects.contract.REBASE_CONFLICT_PREFIX + worker_error
-            self.effects.state.update_project(self.repo, phase='WORKING', last_error=worker_error)
-            self.effects.events.operation_print(worker_error, file=sys.stderr)
-            return ExecutionOutcome(outcome, detail=worker_error, error=True)
-        try:
-            disposition = self._parse_worker_outcome(context, message)
-            if disposition.kind == 'needs_user_decision':
-                return self._block_worker_decision(context, message, disposition)
-            self.effects.validation.parse_worker_result(message, self.plan)
-        except (WorkerOutcomeError, self.effects.contract.WorkerResultError) as error:
-            self.effects.agent.clear_agent_scope(self.repo)
-            validation_error = f"Worker 결과 검증 실패:\n{error}"
-            if context.resolving_rebase:
-                validation_error = self.effects.contract.REBASE_CONFLICT_PREFIX + validation_error
-            self.effects.state.update_project(self.repo, phase='WORKING', last_error=validation_error)
-            self.effects.events.operation_print(validation_error, file=sys.stderr)
-            if context.resolving_rebase:
-                return self._rebase_conflict(
-                    context, validation_error, corrected=True, worker_result=message,
-                    recovery_reason=RecoveryReason.WORKER_CORRECTION,
-                )
-            return self._recover(
-                RecoveryReason.WORKER_CORRECTION, validation_error,
-                context=context,
-            )
-        self.effects.agent.clear_agent_scope(self.repo)
-        delivered_session = result.session_id or self._row()['worker_session_id']
-        if feedback_repo is not None and delivery is not None and delivered_session:
-            feedback_repo.delivered(delivery.attempt_id, str(delivered_session))
-        evidence = re.search(
-            r"(?m)^VERIFY_TIMEOUT_LIMIT_INSUFFICIENT:\s*(\S[^\r\n]*)$",
-            message,
-        )
-        if (
-            evidence is not None
-            and not context.resolving_rebase
-            and "전체 verify 시간 초과:" in str(row['verify_result'] or '')
-        ):
-            detail = self.effects.validation.block_verify_timeout_limit(
-                self.repo, context.worktree, message, evidence.group(1),
-                str(row['verify_result']),
-            )
-            self.effects.events.operation_print(detail, file=sys.stderr)
-            return self._final(detail)
-        return self._finish_worker(context, row, message)
+        return self._worker_handler().run(context)
 
     def _resume_saved_rebase_worker(self, context, saved, observation):
-        """Consume a completed Agent turn after interruption without invoking it twice."""
-        checkpoint = self.effects.checkpoint
-        intent = checkpoint.get(self.repo, context.plan.plan_id) if checkpoint else None
-        if intent and (intent.snapshot or {}).get('pending') in {'stage', 'continue'}:
-            return self._retry('saved rebase Worker turn awaits Git recovery')
-        if observation.progress != saved.scope_marker:
-            if getattr(self.effects.workspace, 'current_rebase_service', None) is not None:
-                self._current_rebase_service(context).require_owned()
-                self.rebase_corrections.abandon_turn(
-                    self.repo, context.plan.plan_id, expected_generation=saved.generation)
-                self.rebase_corrections.observe(
-                    self.repo, context.plan.plan_id, observation,
-                    worker_session=self._row()['worker_session_id'], persist_worker_result=False)
-                return self._retry('현재 수동 해결 상태를 보존하고 필요한 교정만 다시 확인합니다.')
-            return self._recover(
-                RecoveryReason.OWNERSHIP_UNCERTAIN,
-                'saved rebase Worker result no longer matches the accepted worktree',
-                context=context, final_block_reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE)
-        if saved.worker_code:
-            if self._row()['agent_snapshot'] is not None:
-                self.effects.agent.clear_agent_scope(self.repo)
-            self.rebase_corrections.abandon_turn(
-                self.repo, context.plan.plan_id,
-                expected_generation=saved.generation,
-            )
-            detail = self.effects.contract.REBASE_CONFLICT_PREFIX + (
-                saved.worker_result or f'Agent 종료 코드 {saved.worker_code}'
-            )
-            self.effects.state.update_project(self.repo, phase='WORKING', last_error=detail)
-            if saved.result_kind == 'usage_limit':
-                return ExecutionOutcome(ExecutionOutcomeKind.USAGE_PAUSE,
-                                        detail=detail)
-            if saved.result_kind == 'transient_failure':
-                return self._recover(RecoveryReason.SERVICE_UNAVAILABLE, detail,
-                                     context=context, attempts=3)
-            return self._rebase_conflict(
-                context, detail, corrected=True, worker_result=saved.worker_result,
-                abnormal_result=True,
-            )
-        guarded = self._post_effect_guard(context)
-        if isinstance(guarded, ExecutionOutcome):
-            if self._row()['agent_snapshot'] is not None:
-                self.effects.agent.clear_agent_scope(self.repo)
-            return guarded
-        context = guarded
-        if self.effects.agent.inspect_worker_guidance_result(
-            self.repo_path, self.repo, context.worktree, self.catalog_plan,
-            saved.worker_result,
-        ):
-            return self._final()
-        try:
-            disposition = self._parse_worker_outcome(
-                context, saved.worker_result,
-                allow_legacy_ready=saved.outcome_contract_version == 0,
-            )
-            if disposition.kind == 'needs_user_decision':
-                return self._block_worker_decision(
-                    context, saved.worker_result, disposition,
-                )
-            self.effects.validation.parse_worker_result(saved.worker_result, self.plan)
-        except (WorkerOutcomeError, self.effects.contract.WorkerResultError) as error:
-            if self._row()['agent_snapshot'] is not None:
-                self.effects.agent.clear_agent_scope(self.repo)
-            detail = self.effects.contract.REBASE_CONFLICT_PREFIX + (
-                f'Worker 결과 검증 실패:\n{error}'
-            )
-            self.effects.state.update_project(self.repo, phase='WORKING', last_error=detail)
-            return self._rebase_conflict(
-                context, detail, corrected=True,
-                worker_result=saved.worker_result,
-                recovery_reason=RecoveryReason.WORKER_CORRECTION,
-            )
-        if self._row()['agent_snapshot'] is not None:
-            self.effects.agent.clear_agent_scope(self.repo)
-        return self._finish_worker(context, self._row(), saved.worker_result)
+        return self._worker_handler()._resume_saved_rebase_worker(context, saved, observation)
 
     def _finish_worker(self, context, row, message, *, staged=False):
-        assert self.catalog_plan is not None and self.plan is not None
-        latest_sha = str(row['active_sha'] or '')
-        if context.resolving_rebase:
-            if getattr(self.effects.workspace, 'current_rebase_service', None) is not None:
-                _, decision = self._current_rebase_service(context).require_owned()
-                if decision.status is RebaseStatus.COMPLETE:
-                    self._complete_rebase_intent(context)
-                    return self._advanced()
-            self.effects.state.update_project(self.repo, worker_result=message)
-            if not staged:
-                self._record_rebase_suboperation(
-                    context, 'stage', worker_result=message,
-                )
-                try:
-                    stage = self._stage_rebase_correction(context)
-                except (RuntimeError, OSError) as error:
-                    return self._recover(
-                        classify_exception(error, operation=RecoveryReason.STAGE_FAILED),
-                        str(error), context=context,
-                    )
-                if stage.returncode:
-                    return self._recover(RecoveryReason.STAGE_FAILED,
-                                         stage.output[-8000:], context=context)
-            if self._unmerged_stages(context.worktree):
-                detail = self.effects.contract.REBASE_CONFLICT_PREFIX + 'unmerged index remains after Worker correction'
-                self.effects.state.update_project(self.repo, phase='WORKING', last_error=detail)
-                return self._rebase_conflict(context, detail, corrected=True,
-                                             worker_result=message)
-            staged = self.effects.workspace.git(context.worktree, 'diff', '--cached', '--quiet', check=False)
-            if staged.returncode not in {0, 1}:
-                staging_error = f"rebase 충돌 해결 결과 확인 실패 (git 종료 코드 {staged.returncode})."
-                self.effects.events.operation_print(staging_error, file=sys.stderr)
-                return self._recover(RecoveryReason.STAGE_FAILED, staging_error,
-                                     context=context)
-            self._record_rebase_suboperation(context, 'continue')
-            observation = self._rebase_observation(context)
-            action = next_action(
-                observation, worker_result=True, staged=staged.returncode == 1,
-            )
-            if action is CorrectionAction.USER_ACTION:
-                return self._recover(
-                    RecoveryReason.OWNERSHIP_UNCERTAIN,
-                    'autostash_identity_unavailable', context=context,
-                    final_block_reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE,
-                )
-            try:
-                continued = self._execute_rebase_step(context, action)
-            except (RuntimeError, OSError) as error:
-                return self._recover(
-                    classify_exception(error, operation=RecoveryReason.REBASE_CONTINUE_FAILED),
-                    str(error), context=context,
-                )
-            if continued.returncode and not self._unmerged_stages(context.worktree):
-                if self.effects.workspace._rebase_in_progress_for_branch(
-                    context.worktree, context.branch
-                ):
-                    return self._recover(
-                        RecoveryReason.REBASE_CONTINUE_FAILED,
-                        continued.output[-8000:], context=context,
-                    )
-            if action is CorrectionAction.VERIFY and staged.returncode == 1 and self.effects.checkpoint is not None:
-                title = self.effects.validation.parse_worker_result(message, self.plan).commit_title
-                self._commit_rebase_resolution(context, title)
-            post_conflict = self._post_rebase_observation(
-                context, str(
-                    (self.effects.checkpoint.get(self.repo, context.plan.plan_id).target_base_oid
-                     if self.effects.checkpoint is not None else None)
-                    or row['pr_conflict_base_oid'] or row['active_sha'] or ''
-                ),
-                continued.output, corrected=True, worker_result=message,
-            )
-            if post_conflict is not None:
-                return post_conflict
-            if continued.returncode:
-                continuation_error = self.effects.contract.REBASE_CONFLICT_PREFIX + continued.output[-8000:]
-                in_progress = self.effects.workspace._rebase_in_progress_for_branch(context.worktree, context.branch)
-                if in_progress:
-                    self.effects.state.update_project(self.repo, phase='WORKING', last_error=continuation_error)
-                self.effects.events.operation_print(continuation_error, file=sys.stderr)
-                return self._recover(
-                    RecoveryReason.REBASE_CONFLICT if in_progress else RecoveryReason.REBASE_CONTINUE_FAILED,
-                    continuation_error, context=context,
-                )
-            if not self.effects.workspace.branch_has_changes(context.worktree, self.base):
-                no_change_error = 'rebase 충돌 해결 후 Worker 변경이 남지 않아 PR을 생성할 수 없습니다.'
-                self._block_final(
-                    self.repo,
-                    context.worktree,
-                    no_change_error,
-                    str(row['verify_result'] or ''),
-                    reason=BlockReasonCode.PLAN_INPUT_INVALID,
-                    recovery_reason=RecoveryReason.NO_CHANGE,
-                )
-                self.effects.events.operation_print(no_change_error, file=sys.stderr)
-                return self._final(no_change_error)
-            # The conflict may have been resolved on an older rebase target
-            # while origin advanced again. Keep the last *proven* base until
-            # the next revision gate can refresh the completed worktree.
-            latest_sha = (
-                str(row['pr_conflict_base_oid'])
-                if int(row['pr_conflict_recovery'])
-                else str(
-                    (self.effects.checkpoint.get(self.repo, context.plan.plan_id).target_base_oid
-                     if self.effects.checkpoint is not None else None)
-                    or row['active_sha'] or ''
-                )
-            )
-            self._complete_rebase_intent(context, project_values={
-                'phase': 'WORKING', 'active_sha': latest_sha,
-                'validated_base_sha': None, 'last_error': None,
-                'verify_result': None, 'review_result': None,
-                'verify_token': None, 'review_token': None,
-                'publication_token': None,
-            })
-            if self.effects.agent.validate_guidance_publication(
-                self.repo,
-                context.worktree,
-                self.catalog_plan,
-                message,
-                previous_base=str(row['active_sha']),
-                latest_base=latest_sha,
-            ):
-                return self._final()
-            return self._advanced()
-        if context.archive_sources:
-            post_worker_revision = latest_sha if context.resolving_rebase else str(row['active_sha'] or '')
-            try:
-                expected_archives = self._archive_candidates_at(
-                    context, post_worker_revision
-                )
-            except RecoveryFailure as error:
-                return self._recover(error.reason, str(error), context=context)
-            except self.effects.contract.RequirementArchiveCollisionError as error:
-                return self._archive_collision(context, error)
-            except self.effects.contract.RequirementArchiveError as error:
-                archive_error = f"Requirement archive eligibility 확인 실패: {error}"
-                if self._fetch_latest_base() != post_worker_revision:
-                    return self._recover(
-                        RecoveryReason.REMOTE_SNAPSHOT_RACE,
-                        archive_error, context=context,
-                    )
-                outcome = self._recover(
-                    RecoveryReason.CATALOG_INVALID,
-                    archive_error, context=context,
-                )
-                self.effects.events.operation_print(archive_error, file=sys.stderr)
-                return outcome
-            try:
-                actual_archives = self.effects.archive.requirement_archive_move_set(
-                    self.repo_path,
-                    post_worker_revision,
-                    context.worktree,
-                )
-            except self.effects.contract.GitLockError as error:
-                return self._recover(RecoveryReason.GIT_LOCK, str(error), context=context)
-            except self.effects.contract.RequirementArchiveCollisionError as error:
-                return self._archive_collision(context, error)
-            except self.effects.contract.RequirementArchiveError as error:
-                archive_error = (
-                    f"Requirement archive 이동 검증 실패: {error}\n"
-                    f"기준 revision: {post_worker_revision}; "
-                    f"기대: {json.dumps(expected_archives, ensure_ascii=False)}"
-                )
-                self.effects.state.update_project(
-                    self.repo, phase='WORKING', validated_base_sha=None,
-                    worker_result=message,
-                    worker_input_token=None, archive_token=None,
-                    verify_token=None, review_token=None,
-                    publication_token=None, last_error=archive_error,
-                )
-                self.effects.events.operation_print(
-                    'Requirement archive 이동을 같은 Worker 세션에서 다시 확인합니다.',
-                    file=sys.stderr,
-                )
-                try:
-                    self._record_archive_target('CORRECTION_PENDING')
-                except RecoveryFailure as race:
-                    return self._recover(race.reason, str(race), context=context)
-                return self._recover(
-                    RecoveryReason.ARCHIVE_MOVE_MISMATCH,
-                    archive_error, context=context,
-                )
-            archive_error = self.effects.archive.requirement_archive_reconciliation_error(
-                expected_archives, actual_archives,
-                revision=post_worker_revision,
-            )
-            if archive_error is not None:
-                self.effects.state.update_project(
-                    self.repo,
-                    phase='WORKING',
-                    validated_base_sha=None,
-                    worker_result=message,
-                    worker_input_token=None,
-                    archive_token=None,
-                    verify_token=None,
-                    review_token=None,
-                    publication_token=None,
-                    last_error=archive_error,
-                )
-                self.effects.events.operation_print(
-                    'Requirement archive 이동 집합을 같은 Worker 세션에서 다시 맞춥니다.',
-                    file=sys.stderr,
-                )
-                try:
-                    self._record_archive_target(
-                        'CORRECTION_PENDING', moves=actual_archives
-                    )
-                except RecoveryFailure as error:
-                    return self._recover(error.reason, str(error), context=context)
-                return self._recover(
-                    RecoveryReason.ARCHIVE_MOVE_MISMATCH,
-                    archive_error, context=context,
-                    fingerprint=hashlib.sha256(
-                        json.dumps((post_worker_revision, context.archive_snapshot_token,
-                                    sorted(expected_archives or ()), sorted(actual_archives or ()))).encode()
-                    ).hexdigest(),
-                )
-            try:
-                self._record_archive_target(
-                    'WORKTREE_UPDATED', moves=actual_archives
-                )
-            except RecoveryFailure as error:
-                return self._recover(error.reason, str(error), context=context)
-        if self.effects.checkpoint is not None and self._definition_snapshot is not None:
-            current = self.effects.checkpoint.get(self.repo, context.plan.plan_id)
-            if (current.snapshot or {}).get('current_rebase_acceptance'):
-                head = self.effects.workspace.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
-                self.effects.checkpoint.record(
-                    self.repo, context.plan.plan_id, expected_generation=current.generation,
-                    operation=current.operation, expected_head=head,
-                    target_base_oid=current.target_base_oid,
-                    observed_remote_oid=current.observed_remote_oid,
-                    snapshot={**current.snapshot, 'worker_candidate_token':
-                              self._definition_snapshot.worker_candidate_token(head)},
-                )
-        self.effects.state.update_project(
-            self.repo,
-            phase='VERIFYING',
-            validated_base_sha=None,
-            worker_result=message,
-            verify_result=None,
-            review_result=None,
-            worker_input_token=(
-                self._definition_snapshot.worker_token
-                if self._definition_snapshot is not None else None
-            ),
-            archive_token=(
-                self._definition_snapshot.archive_token
-                if self._definition_snapshot is not None else None
-            ),
-            verify_token=None,
-            review_token=None,
-            publication_token=None,
-            last_error=None,
+        return self._worker_handler()._finish_worker(context, row, message, staged=staged)
+
+    def _verify_handler(self):
+        return execution_assembly.verify(
+            self.effects, getattr(self, "_identity", ExecutionIdentity()),
+            self._snapshot, self._update_snapshot,
+            {
+                "_advanced": lambda *a, **kw: self._advanced(*a, **kw),
+                "_block_final": lambda *a, **kw: self._block_final(*a, **kw),
+                "_block_worker_decision": lambda *a, **kw: self._block_worker_decision(*a, **kw),
+                "_commit_owned": lambda *a, **kw: self._commit_owned(*a, **kw),
+                "_context": lambda *a, **kw: self._context(*a, **kw),
+                "_document_block": lambda *a, **kw: self._document_block(*a, **kw),
+                "_document_draft": lambda *a, **kw: self._document_draft(*a, **kw),
+                "_document_guard": lambda *a, **kw: self._document_guard(*a, **kw),
+                "_fetch_latest_base": lambda *a, **kw: self._fetch_latest_base(*a, **kw),
+                "_final": lambda *a, **kw: self._final(*a, **kw),
+                "_metadata_correction": lambda *a, **kw: self._metadata_correction(*a, **kw),
+                "_parse_worker_outcome": lambda *a, **kw: self._parse_worker_outcome(*a, **kw),
+                "_post_effect_guard": lambda *a, **kw: self._post_effect_guard(*a, **kw),
+                "_recover": lambda *a, **kw: self._recover(*a, **kw),
+                "_retry": lambda *a, **kw: self._retry(*a, **kw),
+                "_row": lambda *a, **kw: self._row(*a, **kw),
+            },
         )
-        return self._advanced()
 
     def _verify_once(self, context):
-        assert self.catalog_plan is not None and self.plan is not None
-        self.effects.events.operation_log(f"전체 verify 시작: {self.plan['id']} {self.plan['title']}")
-        verify_scope_before = self.effects.agent.begin_agent_scope(
-            self.repo,
-            context.worktree,
-            'worker',
-            input_fingerprint=self.effects.agent._worktree_execplan_input_fingerprint(context.worktree, self.catalog_plan),
-        )
-        try:
-            passed, output = self.effects.validation.verify(context.worktree)
-        except self.effects.contract.VerifyTerminationUncertain as error:
-            detail = str(error)
-            self._block_final(
-                self.repo, context.worktree, detail, detail,
-                reason=BlockReasonCode.REPOSITORY_STATE_UNSAFE,
-            )
-            self.effects.events.operation_print(detail, file=sys.stderr)
-            return (self._final(detail), detail)
-        feedback_repo = self.effects.feedback.repository if self.effects.feedback else None
-        if feedback_repo is not None:
-            fingerprints = () if passed else self.effects.feedback.fingerprints(
-                'verify', output, context.worktree,
-            )
-            raw_output = getattr(output, 'fingerprint_source', str(output))
-            feedback_items = () if passed else normalize_feedback(
-                'verify', raw_output, fingerprints,
-                exit_code=getattr(output, 'exit_code', None),
-                timed_out=bool(getattr(output, 'timed_out', False)),
-            )
-            def audit_rejected():
-                feedback_repo.record_result(
-                    self.repo, str(self.plan['id']), context.plan.definition_revision_sha,
-                    'verify', 'success' if passed else 'failure', raw_output,
-                    feedback_items,
-                )
-        try:
-            self.plan = self.effects.agent.validate_worker_workspace_scope(
-                self.repo_path,
-                context.worktree,
-                context.branch,
-                self.base,
-                context.plan.path,
-                self.catalog_plan,
-                verify_scope_before,
-            )
-        except (self.effects.contract.AgentScopeError, self.effects.contract.WorkspaceOwnershipError) as error:
-            if feedback_repo is not None:
-                audit_rejected()
-            scope_error = str(error)
-            self._block_final(
-                self.repo,
-                context.worktree,
-                scope_error,
-                output,
-                reason=getattr(error, 'reason_code', BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN),
-            )
-            self.effects.events.operation_print(scope_error, file=sys.stderr)
-            return (self._final(scope_error), output)
-        except self.effects.contract.ExecPlanMetadataError as error:
-            if feedback_repo is not None:
-                audit_rejected()
-            return (self._metadata_correction(
-                context, error, verify_result=output,
-            ), output)
-        except RuntimeError as error:
-            if feedback_repo is not None:
-                audit_rejected()
-            detail = f"verify workspace 상태 조회 재시도: {error}"
-            self.effects.events.operation_print(detail, file=sys.stderr)
-            return (self._recover(
-                classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
-                detail, context=context,
-            ), output)
-        self.effects.agent.clear_agent_scope(self.repo)
-        guarded = self._post_effect_guard(context)
-        if isinstance(guarded, ExecutionOutcome):
-            if feedback_repo is not None:
-                audit_rejected()
-            return (guarded, output)
-        context = guarded
-        if feedback_repo is not None:
-            feedback_repo.observe(
-                self.repo, str(self.plan['id']), context.plan.definition_revision_sha,
-                'verify', passed, raw_output, feedback_items,
-            )
-        if not passed:
-            self.effects.events.operation_log(
-                f"Worker 반환: {self.plan['id']} {self.plan['title']} (전체 verify 실패)",
-                error=True,
-            )
-            decision = self.effects.validation.transition_validation_failure(
-                self.repo,
-                context.worktree,
-                'verify',
-                output,
-            )
-            self.effects.events.operation_print(output, file=sys.stderr)
-            if decision.blocked:
-                return (ExecutionOutcome(
-                    ExecutionOutcomeKind.FINAL_BLOCK, detail=output, error=True,
-                    recovery=getattr(decision, 'recovery', None),
-                ), output)
-            return (self._recover(
-                RecoveryReason.WORKER_CORRECTION, output,
-                context=context, fingerprint=decision.fingerprint,
-                correction_limit=self.effects.contract.MAX_VALIDATION_FINGERPRINT_REPEATS + 1,
-            ), output)
-        return (None, output)
+        return self._verify_handler()._verify_once(context)
 
     def verify(self, context, latest_base):
-        self.effects.state.check_context(context)
-        row = self._row()
-        assert self.catalog_plan is not None and self.plan is not None
-        draft = self._document_draft(context)
-        if draft is not None:
-            try:
-                self._document_guard(context, draft)
-            except (document_drafts.DocumentDraftError, OSError, UnicodeError) as error:
-                return self._document_block(context, draft, error)
-        if self.effects.agent.validate_guidance_publication(
-            self.repo,
-            context.worktree,
-            self.catalog_plan,
-            str(row['worker_result'] or ''),
-        ):
-            return self._final()
-        try:
-            disposition = self._parse_worker_outcome(
-                context, str(row['worker_result'] or ''), allow_legacy_ready=True,
-            )
-            if disposition.kind == 'needs_user_decision':
-                return self._block_worker_decision(
-                    context, str(row['worker_result'] or ''), disposition,
-                )
-            worker_publication = self.effects.validation.parse_worker_result(str(row['worker_result'] or ''), self.plan)
-        except (WorkerOutcomeError, self.effects.contract.WorkerResultError) as error:
-            validation_error = f"Worker 결과 검증 실패:\n{error}"
-            self.effects.state.update_project(self.repo, phase='WORKING', last_error=validation_error)
-            self.effects.events.operation_print(validation_error, file=sys.stderr)
-            return self._recover(
-                RecoveryReason.WORKER_CORRECTION, validation_error,
-                context=context,
-            )
-        latest_sha = self._fetch_latest_base()
-        dirty = bool(self.effects.workspace.git(context.worktree, 'status', '--porcelain').stdout.strip())
-        if not dirty and (not self.effects.workspace.branch_has_changes(context.worktree, self.base)):
-            no_change_error = 'Worker가 변경을 만들지 않아 PR을 생성할 수 없습니다. ExecPlan은 연결된 PR의 Merge가 확인된 경우에만 MERGED가 됩니다.'
-            self._block_final(
-                self.repo,
-                context.worktree,
-                no_change_error,
-                str(row['verify_result'] or ''),
-                reason=BlockReasonCode.PLAN_INPUT_INVALID,
-                recovery_reason=RecoveryReason.NO_CHANGE,
-            )
-            self.effects.events.operation_print(no_change_error, file=sys.stderr)
-            return self._final(no_change_error)
-        if dirty:
-            self.effects.workspace.git(context.worktree, 'add', '-A')
-            self.plan = self.effects.validation.validate_active_execplan_metadata(
-                self.repo_path,
-                context.worktree,
-                context.plan.path,
-                self.catalog_plan,
-            )
-            self._commit_owned(context, worker_publication.commit_title, worker_confirmed=True)
-        guarded = self._post_effect_guard(context)
-        if isinstance(guarded, ExecutionOutcome):
-            return guarded
-        context = guarded
-        latest_outcome = latest_base.reconcile(
-            context, LatestBaseCheckpoint.BEFORE_VERIFY, latest_sha,
-        )
-        if latest_outcome is not None:
-            return latest_outcome
-        context = self._context()
-        candidate_head = self.effects.workspace.git(
-            context.worktree, 'rev-parse', 'HEAD'
-        ).stdout.strip()
-        outcome, output = self._verify_once(context)
-        if outcome is not None:
-            return outcome
-        if self.effects.workspace.git(
-            context.worktree, 'rev-parse', 'HEAD'
-        ).stdout.strip() != candidate_head:
-            self.effects.state.update_project(
-                self.repo, validated_base_sha=None, verify_result=None,
-                review_result=None, verify_token=None, review_token=None,
-                publication_token=None,
-            )
-            return self._retry('전체 verify 중 게시 후보 HEAD가 변경되어 다시 검증합니다.')
-        if self.effects.workspace.git(
-            context.worktree, 'status', '--porcelain'
-        ).stdout.strip():
-            # Scope validation in _verify_once accepted these paths, but the
-            # verified HEAD has not included them. Commit and validate the
-            # resulting candidate on the next VERIFYING turn.
-            self.plan = self.effects.validation.validate_active_execplan_metadata(
-                self.repo_path, context.worktree, context.plan.path,
-                self.catalog_plan,
-            )
-            self.effects.workspace.git(context.worktree, 'add', '-A')
-            self._commit_owned(context, worker_publication.commit_title)
-            return self._retry('전체 verify 중 허용된 변경을 commit했습니다. 새 후보를 다시 검증합니다.')
-        self.effects.validation.clear_validation_failure_history(self.repo, 'verify')
-        self.effects.state.update_project(
-            self.repo,
-            validated_base_sha=context.active_sha,
-            verify_result=output,
-            verify_token=(
-                self._definition_snapshot.verify_token(context.active_sha, candidate_head)
-                if self._definition_snapshot is not None else None
-            ),
-            review_token=None,
-            publication_token=None,
-        )
-        self._latest_verify_output = output
-        return self._finish_verified(context)
-
-    def reconcile(self, context, checkpoint, observed_base_sha=None):
-        if checkpoint is LatestBaseCheckpoint.BEFORE_VERIFY:
-            return self._latest_before_verify(context, observed_base_sha)
-        return self._latest_before_publication(context)
-
-    def _fetch_latest_base(self):
-        try:
-            self.effects.workspace.git(self.repo_path, 'fetch', 'origin')
-            return self.effects.workspace.git(
-                self.repo_path, 'rev-parse', f"origin/{self.base}"
-            ).stdout.strip()
-        except self.effects.contract.GitLockError as error:
-            raise RecoveryFailure(RecoveryReason.GIT_LOCK, str(error)) from error
-        except (RuntimeError, OSError) as error:
-            raise RecoveryFailure(RecoveryReason.FETCH_FAILED, str(error)) from error
-
-    def _rebase_latest(self, context, row, latest_sha, *, publishing):
-        """Persist rebase intent, observe Git, then record the applied base."""
-        prefix = '게시 직전 ' if publishing else ''
-        self.effects.state.update_project(
-            self.repo,
-            phase='WORKING',
-            validated_base_sha=None,
-            revision_resume_status='VERIFYING',
-            pr_conflict_base_oid=latest_sha if int(row['pr_conflict_recovery']) else row['pr_conflict_base_oid'],
-            last_error=self.effects.contract.REBASE_IN_PROGRESS_ERROR,
-        )
-        self._record_rebase_intent(context, latest_sha)
-        rebased = self._run_managed_rebase(context, latest_sha)
-        conflict = self._post_rebase_observation(context, latest_sha, rebased.stdout)
-        if conflict is not None:
-            return conflict
-        if rebased.returncode:
-            in_progress = self.effects.workspace._rebase_in_progress_for_branch(context.worktree, context.branch)
-            if in_progress:
-                if self.effects.agent.validate_guidance_publication(
-                    self.repo,
-                    context.worktree,
-                    self.catalog_plan,
-                    str(row['worker_result'] or ''),
-                    previous_base=str(row['active_sha']),
-                    latest_base=latest_sha,
-                ):
-                    return self._final()
-                rebase_failure = self.effects.contract.REBASE_CONFLICT_PREFIX + rebased.stdout[-8000:]
-                self.effects.state.update_project(
-                    self.repo,
-                    phase='WORKING',
-                    validated_base_sha=None,
-                    last_error=rebase_failure,
-                )
-            else:
-                rebase_failure = f"{prefix}rebase 실패:\n{rebased.stdout[-8000:]}"
-            self.effects.events.operation_print(
-                rebase_failure if publishing else rebased.stdout,
-                file=sys.stderr,
-            )
-            return self._recover(
-                RecoveryReason.REBASE_CONFLICT if in_progress else RecoveryReason.WORKTREE_RECOVERY_FAILED,
-                rebase_failure, context=context,
-            )
-        self._complete_rebase_intent(context, project_values=managed_rebase_adoption.revalidation_values(latest_sha))
-        if self.effects.agent.validate_guidance_publication(
-            self.repo,
-            context.worktree,
-            self.catalog_plan,
-            str(row['worker_result'] or ''),
-            previous_base=str(row['active_sha']),
-            latest_base=latest_sha,
-        ):
-            return self._final()
-        return None
-
-    def _latest_before_verify(self, context, observed_base_sha):
-        row = self._row()
-        assert self.catalog_plan is not None and self.plan is not None
-        latest_sha = observed_base_sha or self._fetch_latest_base()
-        if latest_sha != row['active_sha']:
-            outcome = self._rebase_latest(context, row, latest_sha, publishing=False)
-            if outcome is not None:
-                return outcome
-            return self._retry('최신 base를 반영했습니다. 게시 후보와 선언을 다시 확인합니다.')
-        return None
+        return self._verify_handler().verify(context, latest_base)
 
     def _finish_verified(self, context):
-        assert self.catalog_plan is not None
-        output = self._latest_verify_output
-        try:
-            self.plan = self.effects.validation.validate_active_execplan_metadata(
-                self.repo_path,
-                context.worktree,
-                context.plan.path,
-                self.catalog_plan,
-            )
-        except RecoveryFailure:
-            raise
-        except RuntimeError as error:
-            metadata_error = str(error)
-            self._block_final(
-                self.repo,
-                context.worktree,
-                metadata_error,
-                output,
-                reason=BlockReasonCode.PLAN_INPUT_INVALID,
-            )
-            self.effects.events.operation_print(metadata_error, file=sys.stderr)
-            return self._final(metadata_error)
-        if not self.effects.workspace.branch_has_changes(context.worktree, self.base):
-            no_change_error = 'rebase 후 Worker 변경이 남지 않아 PR을 생성할 수 없습니다. ExecPlan은 연결된 PR의 Merge가 확인된 경우에만 MERGED가 됩니다.'
-            self._block_final(
-                self.repo,
-                context.worktree,
-                no_change_error,
-                output,
-                reason=BlockReasonCode.PLAN_INPUT_INVALID,
-                recovery_reason=RecoveryReason.NO_CHANGE,
-            )
-            self.effects.events.operation_print(no_change_error, file=sys.stderr)
-            return self._final(no_change_error)
-        self.effects.state.update_project(self.repo, phase='REVIEWING', last_error=None)
-        return self._advanced()
+        return self._verify_handler()._finish_verified(context)
+
+    def _review_handler(self):
+        return execution_assembly.review(
+            self.effects, getattr(self, "_identity", ExecutionIdentity()),
+            self._snapshot, self._update_snapshot,
+            {
+                "_advanced": lambda *a, **kw: self._advanced(*a, **kw),
+                "_block_final": lambda *a, **kw: self._block_final(*a, **kw),
+                "_document_block": lambda *a, **kw: self._document_block(*a, **kw),
+                "_document_draft": lambda *a, **kw: self._document_draft(*a, **kw),
+                "_document_guard": lambda *a, **kw: self._document_guard(*a, **kw),
+                "_document_review_prompt": lambda *a, **kw: self._document_review_prompt(*a, **kw),
+                "_fetch_latest_base": lambda *a, **kw: self._fetch_latest_base(*a, **kw),
+                "_final": lambda *a, **kw: self._final(*a, **kw),
+                "_latest_before_verify": lambda *a, **kw: self._latest_before_verify(*a, **kw),
+                "_post_effect_guard": lambda *a, **kw: self._post_effect_guard(*a, **kw),
+                "_recover": lambda *a, **kw: self._recover(*a, **kw),
+                "_retry": lambda *a, **kw: self._retry(*a, **kw),
+                "_row": lambda *a, **kw: self._row(*a, **kw),
+            },
+        )
 
     def _run_reviewer_attempt(self, context, *args, **kwargs):
-        """Persist returned provider failures before the retry runner advances."""
-        result = self.effects.agent.run_agent(*args, **kwargs)
-        code, raw = result
-        if code and self.effects.feedback is not None:
-            self.effects.feedback.repository.record_result(
-                self.repo, context.plan.plan_id, context.plan.definition_revision_sha,
-                'review', getattr(result, 'ledger_kind', 'agent_failure'), raw,
-            )
-        return result
+        return self._review_handler()._run_reviewer_attempt(context, *args, **kwargs)
 
     def _review_entry_evidence(self, context):
-        """Require current Worker and verify evidence before invoking Reviewer."""
-        row = self._row()
-        try:
-            worker_publication = self.effects.validation.parse_worker_result(
-                str(row['worker_result'] or ''), self.plan,
-            )
-        except self.effects.contract.WorkerResultError as error:
-            detail = f"Reviewer 시작 전 Worker 결과 검증 실패:\n{error}"
-            self.effects.state.update_project(
-                self.repo, phase='WORKING', validated_base_sha=None,
-                verify_result=None, review_result=None, verify_token=None,
-                review_token=None, publication_token=None, last_error=detail,
-            )
-            self.effects.events.operation_print(detail, file=sys.stderr)
-            return self._recover(
-                RecoveryReason.WORKER_CORRECTION, detail, context=context,
-            )
-
-        # Every normal execution turn installs this durable definition snapshot
-        # in guard(). Keep legacy direct callers from inventing a verification
-        # identity; they must return through the normal correction path.
-        if self._definition_snapshot is None:
-            detail = 'Reviewer 시작 전 검증 대상 ExecPlan 선언 증거가 없습니다.'
-            self.effects.state.update_project(
-                self.repo, phase='VERIFYING', validated_base_sha=None,
-                verify_result=None, review_result=None, verify_token=None,
-                review_token=None, publication_token=None, last_error=detail,
-            )
-            self.effects.events.operation_print(detail, file=sys.stderr)
-            return self._retry(detail)
-
-        latest_sha = self._fetch_latest_base()
-        if latest_sha != row['active_sha']:
-            return self._latest_before_verify(context, latest_sha)
-
-        candidate_head = self.effects.workspace.git(
-            context.worktree, 'rev-parse', 'HEAD',
-        ).stdout.strip()
-        expected_verify = self._definition_snapshot.verify_token(
-            latest_sha, candidate_head,
-        )
-        if (
-            row['verify_result'] is None
-            or row['validated_base_sha'] != latest_sha
-            or row['verify_token'] != expected_verify
-        ):
-            detail = 'Reviewer 시작 전 현재 후보 revision의 성공한 전체 verify 증거가 없습니다. 다시 검증합니다.'
-            self.effects.state.update_project(
-                self.repo, phase='VERIFYING', validated_base_sha=None,
-                verify_result=None, review_result=None, verify_token=None,
-                review_token=None, publication_token=None, last_error=detail,
-            )
-            self.effects.events.operation_print(detail, file=sys.stderr)
-            return self._retry(detail)
-        return worker_publication
+        return self._review_handler()._review_entry_evidence(context)
 
     def review(self, context):
-        self.effects.state.check_context(context)
-        row = self._row()
-        assert self.catalog_plan is not None and self.plan is not None
-        draft = self._document_draft(context)
-        if draft is not None:
-            try:
-                self._document_guard(context, draft)
-            except (document_drafts.DocumentDraftError, OSError, UnicodeError) as error:
-                return self._document_block(context, draft, error)
-        entry_evidence = self._review_entry_evidence(context)
-        if isinstance(entry_evidence, ExecutionOutcome):
-            return entry_evidence
-        targeted_test_reason = self.effects.contract.reviewer_targeted_test_reason(
-            entry_evidence.test_evidence,
+        return self._review_handler().review(context)
+
+    def _latest_base_handler(self):
+        return execution_assembly.latest_base(
+            self.effects, getattr(self, "_identity", ExecutionIdentity()),
+            self._snapshot, self._update_snapshot,
+            {
+                "_block_final": lambda *a, **kw: self._block_final(*a, **kw),
+                "_checkpoint_remote_oid": lambda *a, **kw: self._checkpoint_remote_oid(*a, **kw),
+                "_complete_rebase_intent": lambda *a, **kw: self._complete_rebase_intent(*a, **kw),
+                "_fetch_latest_base": lambda *a, **kw: self._fetch_latest_base(*a, **kw),
+                "_final": lambda *a, **kw: self._final(*a, **kw),
+                "_latest_before_publication": lambda *a, **kw: self._latest_before_publication(*a, **kw),
+                "_post_rebase_observation": lambda *a, **kw: self._post_rebase_observation(*a, **kw),
+                "_rebase_latest": lambda *a, **kw: self._rebase_latest(*a, **kw),
+                "_record_rebase_intent": lambda *a, **kw: self._record_rebase_intent(*a, **kw),
+                "_recover": lambda *a, **kw: self._recover(*a, **kw),
+                "_retry": lambda *a, **kw: self._retry(*a, **kw),
+                "_row": lambda *a, **kw: self._row(*a, **kw),
+                "_run_managed_rebase": lambda *a, **kw: self._run_managed_rebase(*a, **kw),
+            },
         )
-        protocol_error: str | None = None
-        verdict: str | None = None
-        review = ''
-        for protocol_attempt in range(1, self.effects.contract.MAX_REVIEWER_PROTOCOL_ATTEMPTS + 1):
-            if protocol_attempt == 1:
-                self.effects.events.operation_log(f"Reviewer 시작: {self.plan['id']} {self.plan['title']}")
-            else:
-                self.effects.events.operation_log(
-                    f"Reviewer 프로토콜 교정 재시도: {self.plan['id']} {self.plan['title']} ({protocol_attempt}/{self.effects.contract.MAX_REVIEWER_PROTOCOL_ATTEMPTS})",
-                )
-            reviewer_scope_before = self.effects.agent.begin_agent_scope(
-                self.repo,
-                context.worktree,
-                'reviewer',
-                input_fingerprint=self.effects.agent._worktree_execplan_input_fingerprint(context.worktree, self.catalog_plan),
-            )
-            review_result = self.effects.agent.run_agent_with_retries(
-                TrackedAgentCall(lambda current_session_id, session_recovery, invocation: self._run_reviewer_attempt(
-                    context,
-                    self.provider,
-                    context.worktree,
-                    self.state_dir,
-                    self.config_path,
-                    'reviewer',
-                    self._document_review_prompt(
-                        self.effects.agent.reviewer_prompt(
-                            self.base,
-                            targeted_test_reason,
-                            row['review_result'],
-                            session_recovery=session_recovery,
-                            protocol_error=protocol_error,
-                        ),
-                        draft,
-                    ),
-                    read_only=True,
-                    persist_session=True,
-                    session_id=current_session_id,
-                    on_session_started=lambda started_session_id: self.effects.state.update_project(self.repo, reviewer_session_id=started_session_id),
-                    invocation=invocation,
-                ), AttemptSequence(self.repo, str(self.plan['id']),
-                                   str(self.catalog_plan['current_revision_sha']) if self.catalog_plan['current_revision_sha'] is not None else None)),
-                session_id=row['reviewer_session_id'],
-            )
-            code, review = review_result
-            # Nonzero returned attempts are already audited before retries;
-            # post-call rejection records classify only unaudited zero exits.
-            feedback_repo = self.effects.feedback.repository if self.effects.feedback else None
-            if review_result.session_id:
-                self.effects.state.update_project(self.repo, reviewer_session_id=review_result.session_id)
-            try:
-                reviewer_scope_after = self.effects.agent.capture_git_snapshot(context.worktree)
-                self.effects.agent.validate_agent_scope(
-                    'reviewer',
-                    context.worktree,
-                    reviewer_scope_before,
-                    reviewer_scope_after,
-                    external_worktree=self.repo_path,
-                    base_branch=self.base,
-                )
-                self.effects.workspace.validate_managed_worktree(self.repo_path, context.worktree, context.branch)
-            except (self.effects.contract.AgentScopeError, self.effects.contract.WorkspaceOwnershipError) as error:
-                if feedback_repo is not None and not code:
-                    feedback_repo.record_result(
-                        self.repo, str(self.plan['id']), context.plan.definition_revision_sha,
-                        'review', 'scope_failure', review,
-                    )
-                scope_error = str(error)
-                self._block_final(
-                    self.repo,
-                    context.worktree,
-                    scope_error,
-                    str(row['verify_result'] or ''),
-                    reason=getattr(error, 'reason_code', BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN),
-                )
-                self.effects.events.operation_print(scope_error, file=sys.stderr)
-                return self._final(scope_error)
-            except RuntimeError as error:
-                if feedback_repo is not None and not code:
-                    feedback_repo.record_result(
-                        self.repo, str(self.plan['id']), context.plan.definition_revision_sha,
-                        'review', 'scope_failure', review,
-                    )
-                detail = f"Reviewer workspace 상태 조회 재시도: {error}"
-                self.effects.events.operation_print(detail, file=sys.stderr)
-                return self._recover(
-                    classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
-                    detail, context=context,
-                )
-            self.effects.agent.clear_agent_scope(self.repo)
-            guarded = self._post_effect_guard(context)
-            if isinstance(guarded, ExecutionOutcome):
-                if feedback_repo is not None and not code:
-                    feedback_repo.record_result(
-                        self.repo, str(self.plan['id']), context.plan.definition_revision_sha,
-                        'review', 'stale_result', review,
-                    )
-                return guarded
-            context = guarded
-            row = self._row()
-            if code:
-                reviewer_error = review or f"Reviewer 종료 코드 {code}"
-                if review_result.result_kind is self.effects.contract.AgentResultKind.TRANSIENT_FAILURE:
-                    reviewer_error = f"{self.effects.contract.TRANSIENT_AGENT_ERROR_PREFIX} {reviewer_error}"
-                    self.effects.state.update_project(
-                        self.repo, phase='REVIEWING', last_error=reviewer_error,
-                        review_result=review,
-                    )
-                    self.effects.events.operation_print(reviewer_error, file=sys.stderr)
-                    return self._recover(
-                        RecoveryReason.SERVICE_UNAVAILABLE, reviewer_error,
-                        context=context, attempts=3,
-                    )
-                elif review_result.result_kind is self.effects.contract.AgentResultKind.USAGE_LIMIT:
-                    reviewer_error = f"{self.effects.contract.USAGE_LIMIT_ERROR_PREFIX} {reviewer_error}"
-                    outcome = ExecutionOutcomeKind.USAGE_PAUSE
-                else:
-                    outcome = ExecutionOutcomeKind.OPERATIONAL_ERROR
-                self.effects.state.update_project(
-                    self.repo,
-                    phase='REVIEWING',
-                    last_error=reviewer_error,
-                    review_result=review,
-                )
-                self.effects.events.operation_print(reviewer_error, file=sys.stderr)
-                return ExecutionOutcome(outcome, detail=reviewer_error, error=True)
-            try:
-                verdict, review_details = self.effects.validation.parse_reviewer_result(review)
-                if verdict == 'SPEC_BLOCKED':
-                    if not isinstance(review_details, SpecificationDeadlock):
-                        raise self.effects.contract.ReviewerProtocolError(
-                            'SPEC_BLOCKED 증거 형식이 유효하지 않습니다.'
-                        )
-                    try:
-                        validate_locations(
-                            review_details,
-                            str(self.catalog_plan['path']),
-                            tuple(str(path) for path in self.plan.get('sources', ())),
-                        )
-                    except ValueError as error:
-                        raise self.effects.contract.ReviewerProtocolError(str(error)) from error
-            except self.effects.contract.ReviewerProtocolError as error:
-                if feedback_repo is not None:
-                    feedback_repo.record_result(
-                        self.repo, str(self.plan['id']), context.plan.definition_revision_sha,
-                        'review', 'protocol_failure', review,
-                    )
-                protocol_error = str(error)
-                reviewer_error = f"Reviewer 결과 프로토콜 오류: {protocol_error}"
-                self.effects.state.update_project(
-                    self.repo,
-                    phase='REVIEWING',
-                    last_error=reviewer_error,
-                    review_result=review,
-                )
-                if protocol_attempt == self.effects.contract.MAX_REVIEWER_PROTOCOL_ATTEMPTS:
-                    exhausted_error = f"{reviewer_error} (프로토콜 교정 {self.effects.contract.MAX_REVIEWER_PROTOCOL_ATTEMPTS}회 실패)"
-                    self._block_final(
-                        self.repo,
-                        context.worktree,
-                        exhausted_error,
-                        str(row['verify_result'] or ''),
-                        reason=BlockReasonCode.REVIEW_PROTOCOL_EXHAUSTED,
-                    )
-                    self.effects.events.operation_print(exhausted_error, file=sys.stderr)
-                    return self._final(exhausted_error)
-                self.effects.events.operation_print(reviewer_error, file=sys.stderr)
-                row = self._row()
-                continue
-            break
-        assert verdict is not None
-        if draft is not None and (
-            verdict != 'PASS'
-            or not document_publication.review_confirms_publication(review)
-        ):
-            return self._document_block(
-                context, draft,
-                "Reviewer가 의미 보존과 승인 diff 일치를 명시적으로 확정하지 못했습니다. "
-                + review[-6000:],
-            )
-        if verdict == 'SPEC_BLOCKED':
-            self.effects.state.update_project(self.repo, review_result=review)
-            self.effects.events.operation_log(
-                f"사용자 명세 결정 필요: {self.plan['id']} {self.plan['title']}",
-                error=True,
-            )
-            return self._block_final(
-                self.repo, context.worktree, review,
-                str(row['verify_result'] or ''),
-                reason=BlockReasonCode.REVIEW_SPECIFICATION_DEADLOCK,
-                user_targets=review_details.paths,
-            )
-        if feedback_repo is not None:
-            feedback_repo.observe(
-                self.repo, str(self.plan['id']), context.plan.definition_revision_sha,
-                'review', verdict == 'PASS', review,
-                normalize_feedback('review', review) if verdict == 'FAIL' else (),
-            )
-        if verdict == 'FAIL':
-            decision = self.effects.validation.transition_validation_failure(
-                self.repo,
-                context.worktree,
-                'review',
-                review,
-            )
-            self.effects.events.operation_log(
-                f"Worker 반환: {self.plan['id']} {self.plan['title']} (Review 실패)",
-                error=True,
-            )
-            self.effects.events.operation_print(review or 'Reviewer 결과가 유효하지 않습니다.', file=sys.stderr)
-            if decision.blocked:
-                return ExecutionOutcome(
-                    ExecutionOutcomeKind.FINAL_BLOCK, detail=review, error=True,
-                    recovery=getattr(decision, 'recovery', None),
-                )
-            return self._recover(
-                RecoveryReason.REVIEW_FEEDBACK_CORRECTION, review,
-                context=context, fingerprint=decision.fingerprint,
-            )
-        self.effects.validation.clear_validation_failure_history(self.repo, 'review')
-        self.effects.state.update_project(
-            self.repo,
-            phase='PUBLISHING',
-            last_error=None,
-            review_result=review,
-            review_token=(
-                self._definition_snapshot.review_token(
-                    str(row['validated_base_sha'] or row['active_sha'] or ''),
-                    self.effects.workspace.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip(),
-                )
-                if self._definition_snapshot is not None else None
-            ),
-            publication_token=None,
-        )
-        return self._advanced()
+
+    def reconcile(self, context, checkpoint, observed_base_sha=None):
+        return self._latest_base_handler().reconcile(context, checkpoint, observed_base_sha)
+
+    def _fetch_latest_base(self):
+        return self._latest_base_handler()._fetch_latest_base()
+
+    def _rebase_latest(self, context, row, latest_sha, *, publishing):
+        return self._latest_base_handler()._rebase_latest(context, row, latest_sha, publishing=publishing)
+
+    def _latest_before_verify(self, context, observed_base_sha):
+        return self._latest_base_handler()._latest_before_verify(context, observed_base_sha)
 
     def _latest_before_publication(self, context):
-        row = self._row()
-        assert self.catalog_plan is not None
-        latest_sha = self._fetch_latest_base()
-        remote_oid = None if int(row['pr_conflict_recovery']) else self._checkpoint_remote_oid(self.repo_path, context.branch)
-        try:
-            if not int(row['pr_conflict_recovery']):
-                self.effects.publication.record_remote_publication_branch(
-                    self.repo_path,
-                    self.state_dir,
-                    self.repo,
-                    context.branch,
-                    context.worktree,
-                    remote_oid,
-                )
-        except self.effects.contract.PublicationSafetyError as error:
-            publication_error = str(error)
-            self._block_final(
-                self.repo,
-                context.worktree,
-                publication_error,
-                str(row['verify_result'] or ''),
-                reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
-            )
-            self.effects.events.operation_print(publication_error, file=sys.stderr)
-            return self._final(publication_error)
-        if latest_sha != row['validated_base_sha']:
-            if latest_sha != row['active_sha']:
-                outcome = self._rebase_latest(
-                    context,
-                    row,
-                    latest_sha,
-                    publishing=True,
-                )
-                if outcome is not None:
-                    return outcome
-                if not self.effects.workspace.branch_has_changes(context.worktree, self.base):
-                    no_change_error = '게시 직전 rebase 후 Worker 변경이 남지 않아 PR을 생성할 수 없습니다.'
-                    self._block_final(
-                        self.repo,
-                        context.worktree,
-                        no_change_error,
-                        str(row['verify_result'] or ''),
-                        reason=BlockReasonCode.PLAN_INPUT_INVALID,
-                        recovery_reason=RecoveryReason.NO_CHANGE,
-                    )
-                    self.effects.events.operation_print(no_change_error, file=sys.stderr)
-                    return self._final(no_change_error)
-                return self._retry('최신 rebase 후보를 Worker가 다시 확인합니다.')
-            else:
-                self.effects.state.update_project(
-                    self.repo,
-                    validated_base_sha=None,
-                    phase='VERIFYING',
-                    verify_result=None,
-                    review_result=None,
-                    verify_token=None,
-                    review_token=None,
-                    publication_token=None,
-                    last_error=None,
-                )
-            self.effects.events.operation_print(
-                '게시 직전 base가 변경되어 전체 verify와 Review를 다시 수행합니다.',
-                file=sys.stderr,
-            )
-            return self._retry()
-        if row['active_sha'] != latest_sha:
-            ancestry = self.effects.workspace.git(
-                context.worktree, 'merge-base', '--is-ancestor',
-                latest_sha, 'HEAD', check=False,
-            )
-            if ancestry.returncode not in {0, 1}:
-                return self._recover(
-                    RecoveryReason.STATUS_FAILED,
-                    f"게시 checkpoint ancestry 조회 실패: {ancestry.stdout[-8000:]}",
-                    context=context,
-                )
-            if ancestry.returncode == 1:
-                outcome = self._rebase_latest(
-                    context, row, latest_sha, publishing=True,
-                )
-                if outcome is not None:
-                    return outcome
-                return self._retry('최신 rebase 후보를 Worker가 다시 확인합니다.')
-            self.effects.state.update_project(
-                self.repo, active_sha=latest_sha, validated_base_sha=None,
-                phase='VERIFYING', verify_result=None, review_result=None,
-                verify_token=None, review_token=None, publication_token=None,
-                last_error=None,
-            )
-            return self._recover(
-                RecoveryReason.CHECKPOINT_STALE,
-                '관리 branch의 실제 HEAD와 최신 base에서 게시 checkpoint를 재구성했습니다.',
-                context=context,
-            )
-        return None
+        return self._latest_base_handler()._latest_before_publication(context)
+
+    def _publication_handler(self):
+        return execution_assembly.publication(
+            self.effects, getattr(self, "_identity", ExecutionIdentity()),
+            self._snapshot, self._update_snapshot,
+            {
+                "_archive_candidates_at": lambda *a, **kw: self._archive_candidates_at(*a, **kw),
+                "_archive_collision": lambda *a, **kw: self._archive_collision(*a, **kw),
+                "_block_final": lambda *a, **kw: self._block_final(*a, **kw),
+                "_context": lambda *a, **kw: self._context(*a, **kw),
+                "_document_block": lambda *a, **kw: self._document_block(*a, **kw),
+                "_document_draft": lambda *a, **kw: self._document_draft(*a, **kw),
+                "_document_guard": lambda *a, **kw: self._document_guard(*a, **kw),
+                "_fetch_latest_base": lambda *a, **kw: self._fetch_latest_base(*a, **kw),
+                "_final": lambda *a, **kw: self._final(*a, **kw),
+                "_latest_before_publication": lambda *a, **kw: self._latest_before_publication(*a, **kw),
+                "_owned_checkpoint_remote": lambda *a, **kw: self._owned_checkpoint_remote(*a, **kw),
+                "_post_effect_guard": lambda *a, **kw: self._post_effect_guard(*a, **kw),
+                "_record_archive_target": lambda *a, **kw: self._record_archive_target(*a, **kw),
+                "_recover": lambda *a, **kw: self._recover(*a, **kw),
+                "_retry": lambda *a, **kw: self._retry(*a, **kw),
+                "_row": lambda *a, **kw: self._row(*a, **kw),
+                "_step_outcome": lambda *a, **kw: self._step_outcome(*a, **kw),
+            },
+        )
+
+    def _publication_intent(self, context, operation, remote_oid):
+        return self._publication_handler()._publication_intent(context, operation, remote_oid)
+
+    def _commit_owned(self, context, title, *, worker_confirmed=False):
+        return self._publication_handler()._commit_owned(context, title, worker_confirmed=worker_confirmed)
+
+    def _commit_rebase_resolution(self, context, title):
+        return self._publication_handler()._commit_rebase_resolution(context, title)
+
+    def _complete_publication_intent(self, context):
+        return self._publication_handler()._complete_publication_intent(context)
 
     def _publication_resume(self):
-        return PublicationResume(
-            self.effects.publication.pr_for_branch,
-            self.effects.workspace.live_remote_branch_oid or (
-                lambda repo, branch: manager_git_journal.live_remote_branch_oid(
-                    self.effects.workspace.git, repo, branch)),
-            self.effects.workspace.git,
-            self._publication_workspace,
-        )
+        return self._publication_handler()._publication_resume()
 
     def _reconcile_terminal_publication(self, context):
-        """Resolve a completed PR before the revision gate can rebase its head."""
-        row = self._row()
-        pr_url = str(row['pr_url'] or '') or None
-        try:
-            pr = self.effects.publication.pr_for_branch(
-                self.repo_path, context.branch, pr_url,
-            )
-            if pr is None or str(pr.get('state') or '').upper() not in {'MERGED', 'CLOSED'}:
-                return None
-            # Reuse the live observation boundary, including workspace identity,
-            # candidate tokens and a second head check across the PR query.
-            observed = self._publication_resume().observe(
-                self.repo_path, context.worktree, context.branch,
-                str(row['publication_remote_oid'] or '') or None, pr_url,
-            )
-            pr = observed.pull_request
-            if pr is None or str(pr.get('state') or '').upper() not in {'MERGED', 'CLOSED'}:
-                return None
-            if assess_publication(observed) is not PublicationNext.ATTACH_PR:
-                raise self.effects.contract.PublicationSafetyError(
-                    '종료 PR의 branch 또는 head가 관리 게시 후보와 다릅니다.'
-                )
-            reconciliation = self.effects.publication.reconcile_existing_pull_request(
-                self.repo_path, self.state_dir, self.repo, row, pr,
-            )
-            return (self._step_outcome(reconciliation) if reconciliation is not None
-                    else self._retry('종료 PR 상태를 다시 확인합니다.'))
-        except (self.effects.contract.PublicationSafetyError, self.effects.contract.WorkspaceOwnershipError) as error:
-            return self._block_final(
-                self.repo, context.worktree, str(error),
-                str(row['verify_result'] or ''),
-                reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
-            )
+        return self._publication_handler()._reconcile_terminal_publication(context)
 
     def _publication_workspace(self, repo, worktree, branch, expected_oid):
-        row = self._row()
-        self.effects.workspace.validate_execplan_workspace_identity(
-            self.state_dir, self.repo, self.effects.state.plan_id, branch, worktree)
-        self.effects.workspace.validate_managed_worktree(repo, worktree, branch)
-        head = self.effects.workspace.git(worktree, 'rev-parse', 'HEAD').stdout.strip()
-        if expected_oid is not None and head != expected_oid:
-            raise self.effects.contract.PublicationSafetyError('게시 관측 중 관리 HEAD가 변경됐습니다.')
-        if self._definition_snapshot is not None and (
-                row['verify_token'] != self._definition_snapshot.verify_token(str(row['validated_base_sha'] or ''), head)
-                or row['review_token'] != self._definition_snapshot.review_token(str(row['validated_base_sha'] or ''), head)):
-            raise self.effects.contract.PublicationSafetyError('게시 HEAD가 verify·Review를 통과한 후보와 다릅니다.')
+        return self._publication_handler()._publication_workspace(repo, worktree, branch, expected_oid)
 
     def publish(self, context, latest_base):
-        self.effects.state.check_context(context)
-        row = self._row()
-        assert self.catalog_plan is not None and self.plan is not None
-        draft = self._document_draft(context)
-        if draft is not None:
-            try:
-                self._fetch_latest_base()
-                self._document_guard(context, draft)
-            except (document_drafts.DocumentDraftError, OSError, UnicodeError) as error:
-                return self._document_block(context, draft, error)
-        try:
-            publication = self._publication_resume().observe(
-                self.repo_path, context.worktree, context.branch,
-                str(row['publication_remote_oid'] or '') or None,
-                str(row['pr_url']) if int(row['pr_conflict_recovery']) else None,
-            )
-        except (self.effects.contract.PublicationSafetyError, self.effects.contract.WorkspaceOwnershipError) as error:
-            return self._block_final(self.repo, context.worktree, str(error),
-                str(row['verify_result'] or ''), reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN)
-        current = (self.effects.checkpoint.get(self.repo, context.plan.plan_id)
-                   if self.effects.checkpoint else None)
-        if not self._owned_checkpoint_remote(
-            context, row, publication.remote_oid, current,
-            publication.pull_request,
-        ):
-            return self._block_final(
-                self.repo, context.worktree,
-                '게시 checkpoint 원격 OID 소유권을 다시 증명할 수 없습니다.',
-                str(row['verify_result'] or ''),
-                reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
-            )
-        existing_pr = publication.pull_request
-        # Owned PR conflict recovery deliberately starts from its saved PR
-        # head; its existing lease gate authorizes the later rebased push.
-        attachment = (replace(publication, local_oid=str(row['pr_conflict_head_oid'] or ''))
-                      if int(row['pr_conflict_recovery']) else publication)
-        if assess_publication(attachment) is PublicationNext.USER_ACTION:
-            return self._block_final(
-                self.repo, context.worktree,
-                '원격 branch 또는 PR head가 관측한 소유 OID와 다릅니다.',
-                str(row['verify_result'] or ''),
-                reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
-            )
-        if existing_pr:
-            try:
-                reconciliation = self.effects.publication.reconcile_existing_pull_request(
-                    self.repo_path,
-                    self.state_dir,
-                    self.repo,
-                    row,
-                    existing_pr,
-                )
-                if reconciliation is not None:
-                    return self._step_outcome(reconciliation)
-                row = self._row()
-            except self.effects.contract.PublicationSafetyError as error:
-                publication_error = f"기존 PR 복구 거부: {error}"
-                self._block_final(
-                    self.repo,
-                    context.worktree,
-                    publication_error,
-                    str(row['verify_result'] or ''),
-                    reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
-                )
-                self.effects.events.operation_print(publication_error, file=sys.stderr)
-                return self._final(publication_error)
-        latest_outcome = latest_base.reconcile(context, LatestBaseCheckpoint.BEFORE_PUBLICATION)
-        if latest_outcome is not None:
-            return latest_outcome
-        if draft is not None:
-            try:
-                self._document_guard(self._context(), draft)
-            except (document_drafts.DocumentDraftError, OSError, UnicodeError) as error:
-                return self._document_block(context, draft, error)
-        row = self._row()
-        latest_sha = str(row['active_sha'] or '')
-        if context.archive_sources:
-            try:
-                final_archive_candidates = self._archive_candidates_at(
-                    context, latest_sha
-                )
-            except RecoveryFailure as error:
-                return self._recover(error.reason, str(error), context=context)
-            except self.effects.contract.RequirementArchiveCollisionError as error:
-                return self._archive_collision(context, error)
-            except self.effects.contract.RequirementArchiveError as error:
-                archive_error = f"게시 직전 Requirement archive eligibility 확인 실패: {error}"
-                if self._fetch_latest_base() != latest_sha:
-                    return self._recover(
-                        RecoveryReason.REMOTE_SNAPSHOT_RACE,
-                        archive_error, context=context,
-                    )
-                outcome = self._recover(
-                    RecoveryReason.CATALOG_INVALID,
-                    archive_error, context=context,
-                )
-                self.effects.events.operation_print(archive_error, file=sys.stderr)
-                return outcome
-            try:
-                final_archive_moves = self.effects.archive.requirement_archive_move_set(
-                    self.repo_path,
-                    latest_sha,
-                    context.worktree,
-                    tracked_revision='HEAD',
-                )
-            except self.effects.contract.GitLockError as error:
-                return self._recover(RecoveryReason.GIT_LOCK, str(error), context=context)
-            except self.effects.contract.RequirementArchiveCollisionError as error:
-                return self._archive_collision(context, error)
-            except self.effects.contract.RequirementArchiveError as error:
-                archive_error = (
-                    f"게시 직전 Requirement archive 확인 실패: {error}\n"
-                    f"기준 revision: {latest_sha}; "
-                    f"기대: {json.dumps(final_archive_candidates, ensure_ascii=False)}"
-                )
-                self.effects.state.update_project(
-                    self.repo, phase='WORKING', validated_base_sha=None,
-                    worker_input_token=None, archive_token=None,
-                    verify_token=None, review_token=None,
-                    publication_token=None, last_error=archive_error,
-                )
-                self.effects.events.operation_print(
-                    '게시 직전 Requirement archive 이동을 다시 확인합니다.',
-                    file=sys.stderr,
-                )
-                try:
-                    self._record_archive_target('CORRECTION_PENDING')
-                except RecoveryFailure as race:
-                    return self._recover(race.reason, str(race), context=context)
-                return self._recover(
-                    RecoveryReason.ARCHIVE_MOVE_MISMATCH,
-                    archive_error, context=context,
-                )
-            archive_error = self.effects.archive.requirement_archive_reconciliation_error(
-                final_archive_candidates,
-                final_archive_moves,
-                revision=latest_sha,
-            )
-            if archive_error is not None:
-                self.effects.state.update_project(
-                    self.repo,
-                    phase='WORKING',
-                    validated_base_sha=None,
-                    worker_input_token=None,
-                    archive_token=None,
-                    verify_token=None,
-                    review_token=None,
-                    publication_token=None,
-                    last_error=archive_error,
-                )
-                self.effects.events.operation_print(
-                    '게시 직전 Requirement archive 이동 집합을 다시 맞춥니다.',
-                    file=sys.stderr,
-                )
-                try:
-                    self._record_archive_target(
-                        'CORRECTION_PENDING', moves=final_archive_moves
-                    )
-                except RecoveryFailure as error:
-                    return self._recover(error.reason, str(error), context=context)
-                return self._recover(
-                    RecoveryReason.ARCHIVE_MOVE_MISMATCH,
-                    archive_error, context=context,
-                    fingerprint=hashlib.sha256(
-                        json.dumps((latest_sha, context.archive_snapshot_token,
-                                    sorted(final_archive_candidates or ()), sorted(final_archive_moves or ()))).encode()
-                    ).hexdigest(),
-                )
-            try:
-                self._record_archive_target('VALIDATED', moves=final_archive_moves)
-            except RecoveryFailure as error:
-                return self._recover(error.reason, str(error), context=context)
-        if self.effects.agent.validate_guidance_publication(
-            self.repo,
-            context.worktree,
-            self.catalog_plan,
-            str(row['worker_result'] or ''),
-        ):
-            return self._final()
-        guarded = self._post_effect_guard(context)
-        if isinstance(guarded, ExecutionOutcome):
-            return guarded
-        context = guarded
-        row = self._row()
-        if not self.effects.workspace.branch_has_changes(context.worktree, self.base):
-            no_change_error = '게시할 Worker 변경이 남지 않아 PR을 생성할 수 없습니다.'
-            self._block_final(
-                self.repo,
-                context.worktree,
-                no_change_error,
-                str(row['verify_result'] or ''),
-                reason=BlockReasonCode.PLAN_INPUT_INVALID,
-                recovery_reason=RecoveryReason.NO_CHANGE,
-            )
-            self.effects.events.operation_print(no_change_error, file=sys.stderr)
-            return self._final(no_change_error)
-        if self._definition_snapshot is not None:
-            self.effects.state.update_project(
-                self.repo,
-                publication_token=self._definition_snapshot.publication_token(
-                    str(self._row()['validated_base_sha'] or ''),
-                    self.effects.workspace.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip(),
-                ),
-            )
-            context = self._context()
-        if int(row['pr_conflict_recovery']):
-            return self._publish_conflict_recovery(context, row, publication.local_oid)
-        return self._publish_new_pull_request(context, row)
+        return self._publication_handler().publish(context, latest_base)
 
     def _publish_conflict_recovery(self, context, row, expected_oid):
-        current_pr = self.effects.publication.pr_for_branch(self.repo_path, context.branch, str(row['pr_url'] or ''))
-        if current_pr is None:
-            publication_error = '게시 직전 저장된 기존 PR을 다시 조회할 수 없습니다.'
-            self._block_final(
-                self.repo,
-                context.worktree,
-                publication_error,
-                str(row['verify_result'] or ''),
-                reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
-            )
-            self.effects.events.operation_print(publication_error, file=sys.stderr)
-            return self._final(publication_error)
-        reconciliation = self.effects.publication.reconcile_existing_pull_request(
-            self.repo_path,
-            self.state_dir,
-            self.repo,
-            row,
-            current_pr,
-        )
-        if reconciliation is not None:
-            return self._step_outcome(reconciliation)
-        row = self._row()
-        try:
-            head_oid = self.effects.publication.push_owned_pr_conflict_recovery(
-                self.repo_path,
-                self.state_dir,
-                self.repo,
-                context.branch,
-                context.worktree,
-                current_pr,
-                expected_oid,
-            )
-        except (self.effects.contract.PublicationSafetyError, self.effects.contract.WorkspaceOwnershipError) as error:
-            publication_error = str(error)
-            self._block_final(
-                self.repo,
-                context.worktree,
-                publication_error,
-                str(row['verify_result'] or ''),
-                reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
-            )
-            self.effects.events.operation_print(publication_error, file=sys.stderr)
-            return self._final(publication_error)
-        except RuntimeError as error:
-            publication_error = str(error)
-            self.effects.state.update_project(self.repo, phase='PUBLISHING', last_error=publication_error)
-            self.effects.events.operation_print(publication_error, file=sys.stderr)
-            return self._recover(
-                classify_exception(error, operation=RecoveryReason.PUBLICATION_RETRY),
-                publication_error, context=context,
-            )
-        guarded = self._post_effect_guard(context)
-        if isinstance(guarded, ExecutionOutcome):
-            return guarded
-        context = guarded
-        self.effects.state.open_pull_request(
-            self.repo,
-            publication_remote_oid=head_oid,
-            pr_head_oid=head_oid,
-            pr_conflict_recovery=0,
-            pr_conflict_head_oid=None,
-            pr_conflict_base_oid=None,
-        )
-        self.effects.events.operation_print(f"기존 PR 충돌 복구 게시 완료: {row['pr_url']}")
-        return ExecutionOutcome(ExecutionOutcomeKind.SUCCESS)
+        return self._publication_handler()._publish_conflict_recovery(context, row, expected_oid)
 
     def _publish_new_pull_request(self, context, row):
-        assert self.plan is not None
-        assert self.catalog_plan is not None
-        plan_sha = str(
-            self.catalog_plan['publication_sha']
-            or self.catalog_plan['plan_sha']
-            or ''
-        )
-        publication_path = str(
-            self.catalog_plan['publication_path']
-            or self.catalog_plan['path']
-        )
-        if not plan_sha:
-            plan_error = '계획 commit SHA가 없습니다.'
-            self._block_final(
-                self.repo,
-                context.worktree,
-                plan_error,
-                str(row['verify_result'] or ''),
-                reason=BlockReasonCode.PLAN_INPUT_INVALID,
-            )
-            self.effects.events.operation_print(plan_error, file=sys.stderr)
-            return self._final(plan_error)
-        plan_text = self.effects.workspace.git(
-            context.worktree, 'show', f"{plan_sha}:{publication_path}"
-        ).stdout
-        self.effects.publication.published_execplan(publication_path, plan_text)
-        try:
-            worker_publication = self.effects.validation.parse_worker_result(str(row['worker_result'] or ''), self.plan)
-        except self.effects.contract.WorkerResultError as error:
-            validation_error = f"Worker 결과 검증 실패:\n{error}"
-            self.effects.state.update_project(
-                self.repo,
-                phase='WORKING',
-                validated_base_sha=None,
-                last_error=validation_error,
-            )
-            self.effects.events.operation_print(validation_error, file=sys.stderr)
-            return self._recover(
-                RecoveryReason.WORKER_CORRECTION, validation_error,
-                context=context,
-            )
-        origin_url = self.effects.workspace.git(context.worktree, 'remote', 'get-url', 'origin').stdout.strip()
-        body = self.effects.publication.build_pr_body(
-            worker_publication,
-            self.plan,
-            publication_path,
-            plan_text,
-            origin_url,
-            plan_sha,
-        )
-        try:
-            publication = self._publication_resume().observe(
-                self.repo_path, context.worktree, context.branch,
-                str(row['publication_remote_oid'] or '') or None,
-            )
-            current = (self.effects.checkpoint.get(self.repo, context.plan.plan_id)
-                       if self.effects.checkpoint else None)
-            if not self._owned_checkpoint_remote(
-                context, row, publication.remote_oid, current,
-                publication.pull_request,
-            ):
-                raise self.effects.contract.PublicationSafetyError(
-                    '게시 직전 checkpoint 원격 OID 소유권을 증명할 수 없습니다.'
-                )
-            action = assess_publication(publication)
-            if action is PublicationNext.USER_ACTION:
-                raise self.effects.contract.PublicationSafetyError(
-                    '게시 직전 원격 branch 또는 PR head가 변경됐습니다.'
-                )
-            if action is PublicationNext.ATTACH_PR:
-                reconciliation = self.effects.publication.reconcile_existing_pull_request(
-                    self.repo_path, self.state_dir, self.repo, row,
-                    publication.pull_request,
-                )
-                return (self._step_outcome(reconciliation) if reconciliation is not None
-                        else self._retry('기존 PR을 연결했습니다.'))
-            if action is PublicationNext.CREATE_PR:
-                self.effects.publication.record_remote_publication_branch(
-                    self.repo_path, self.state_dir, self.repo,
-                    context.branch, context.worktree, publication.remote_oid,
-                )
-                head_oid = publication.local_oid
-            else:
-                self._publication_intent(
-                    context, 'push', publication.remote_oid,
-                )
-                head_oid = self.effects.publication.push_managed_publication_branch(
-                    self.repo_path, self.state_dir, self.repo,
-                    context.branch, context.worktree, publication.local_oid,
-                )
-                self._complete_publication_intent(context)
-        except (self.effects.contract.PublicationSafetyError, self.effects.contract.WorkspaceOwnershipError) as error:
-            publication_error = str(error)
-            self._block_final(
-                self.repo,
-                context.worktree,
-                publication_error,
-                str(row['verify_result'] or ''),
-                reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
-            )
-            self.effects.events.operation_print(publication_error, file=sys.stderr)
-            return self._final(publication_error)
-        except RuntimeError as error:
-            publication_error = str(error)
-            self.effects.state.update_project(self.repo, phase='PUBLISHING', last_error=publication_error)
-            self.effects.events.operation_print(publication_error, file=sys.stderr)
-            return self._recover(
-                classify_exception(error, operation=RecoveryReason.PUBLICATION_RETRY),
-                publication_error, context=context,
-            )
-        guarded = self._post_effect_guard(context)
-        if isinstance(guarded, ExecutionOutcome):
-            return guarded
-        context = guarded
-        try:
-            latest_base = self._fetch_latest_base()
-            after_push = self._publication_resume().observe(
-                self.repo_path, context.worktree, context.branch, head_oid,
-            )
-        except (self.effects.contract.PublicationSafetyError, self.effects.contract.WorkspaceOwnershipError) as error:
-            return self._block_final(self.repo, context.worktree, str(error),
-                str(self._row()['verify_result'] or ''), reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN)
-        if after_push.local_oid != head_oid:
-            return self._block_final(self.repo, context.worktree,
-                'PR 생성 직전 관리 HEAD가 검증한 게시 commit과 다릅니다.',
-                str(self._row()['verify_result'] or ''), reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN)
-        existing_after_push = after_push.pull_request
-        if (existing_after_push is not None
-                and assess_publication(after_push) is not PublicationNext.ATTACH_PR):
-            return self._block_final(
-                self.repo, context.worktree,
-                'push 뒤 PR head가 검증한 게시 commit과 다릅니다.',
-                str(self._row()['verify_result'] or ''),
-                reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
-            )
-        # GitHub's terminal PR state remains authoritative after automatic
-        # head-branch deletion and base advancement. Reconcile it before
-        # considering another rebase; active publication still needs its live ref.
-        terminal_pr = (existing_after_push is not None
-                       and str(existing_after_push.get('state') or '').upper()
-                       in {'CLOSED', 'MERGED'})
-        if not terminal_pr:
-            if latest_base != self._row()['validated_base_sha']:
-                return self._latest_before_publication(context) or self._retry('최신 base를 다시 검증합니다.')
-            if after_push.remote_oid != head_oid:
-                return self._block_final(self.repo, context.worktree,
-                    'PR 생성 직전 원격 게시 ref가 변경됐습니다.',
-                    str(self._row()['verify_result'] or ''), reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN)
-            current = (self.effects.checkpoint.get(self.repo, context.plan.plan_id)
-                       if self.effects.checkpoint else None)
-            if not self._owned_checkpoint_remote(
-                context, self._row(), after_push.remote_oid, current,
-                existing_after_push,
-            ):
-                return self._block_final(
-                    self.repo, context.worktree,
-                    'push 뒤 checkpoint branch의 원격 OID 또는 PR 소유권을 증명할 수 없습니다.',
-                    str(self._row()['verify_result'] or ''),
-                    reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
-                )
-        if existing_after_push is not None:
-            reconciliation = self.effects.publication.reconcile_existing_pull_request(
-                self.repo_path, self.state_dir, self.repo, self._row(),
-                existing_after_push,
-            )
-            return (self._step_outcome(reconciliation) if reconciliation is not None
-                    else self._retry('push 뒤 기존 PR을 연결했습니다.'))
-        title = f"Implement {self.plan['id']}: {self.plan['title']}"
-        try:
-            self._publication_workspace(self.repo_path, context.worktree, context.branch, head_oid)
-            self._publication_intent(context, 'pr_create', head_oid)
-            created = self.effects.publication.command(
-                ['gh', 'pr', 'create', '--base', self.base, '--head', context.branch, '--title', title, '--body', body],
-                cwd=context.worktree,
-            )
-        except (self.effects.contract.PublicationSafetyError, self.effects.contract.WorkspaceOwnershipError) as error:
-            return self._block_final(self.repo, context.worktree, str(error),
-                str(self._row()['verify_result'] or ''), reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN)
-        except RuntimeError as error:
-            publication_error = str(error)
-            self.effects.state.update_project(
-                self.repo, phase='PUBLISHING', last_error=publication_error,
-            )
-            self.effects.events.operation_print(publication_error, file=sys.stderr)
-            return self._recover(
-                classify_exception(error, operation=RecoveryReason.PUBLICATION_RETRY),
-                publication_error, context=context,
-            )
-        url = created.stdout.strip().splitlines()[-1]
-        self.effects.state.open_pull_request(self.repo, pr_url=url, pr_head_oid=head_oid)
-        self._complete_publication_intent(context)
-        self.effects.events.operation_print(f"PR 생성 완료: {url}")
-        return ExecutionOutcome(ExecutionOutcomeKind.SUCCESS)
+        return self._publication_handler()._publish_new_pull_request(context, row)

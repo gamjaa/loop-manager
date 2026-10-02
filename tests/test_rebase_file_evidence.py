@@ -1,4 +1,5 @@
 """Unit evidence checks; Git observations are mocked, no repository is mutated."""
+from tests.support.execution import complete_execution_effects, execution_handler_stub
 import hashlib
 from pathlib import Path
 import tempfile
@@ -108,7 +109,6 @@ class AutostashFileEvidenceTests(unittest.TestCase):
 
     def test_both_rebase_snapshot_paths_capture_file_evidence(self):
         import loop_manager
-        from loop_manager_internal.execution.execution_handlers import ExecutionHandlers
 
         worktree = Path('/owned')
         branch = 'loop-manager/G-091'
@@ -119,11 +119,11 @@ class AutostashFileEvidenceTests(unittest.TestCase):
         )
         saved = {'app.py': evidence(['a'], ['b'], 'signature')}
         git = mock.Mock(return_value=SimpleNamespace(returncode=0, stdout=''))
-        handler = object.__new__(ExecutionHandlers)
-        handler.effects = SimpleNamespace(
+        handler = execution_handler_stub()
+        handler.effects = complete_execution_effects(SimpleNamespace(
             agent=SimpleNamespace(capture_git_snapshot=lambda *_: snapshot),
             workspace=SimpleNamespace(git=git),
-        )
+        ))
         handler._rebase_metadata = lambda *_: None
         handler._unmerged_stages = lambda *_: ''
         with (mock.patch.object(files, 'capture', return_value=saved) as capture,
