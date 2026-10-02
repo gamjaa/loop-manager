@@ -70,9 +70,13 @@ class RecoveryPolicyTests(unittest.TestCase):
             block, {**recovery, "reason_code": RecoveryReason.REVIEW_EXHAUSTED.value},
             checkpoint,
         ))
-        self.assertFalse(rebase_blocks.block_matches(
+        self.assertTrue(rebase_blocks.block_matches(
             {**block, "reason_code": BlockReasonCode.DEFAULT_WORKTREE_MUTATION.value},
             recovery, checkpoint,
+        ))
+        self.assertFalse(rebase_blocks.block_matches(
+            {**block, "reason_code": BlockReasonCode.DEFAULT_WORKTREE_MUTATION.value},
+            recovery, SimpleNamespace(operation=None, expected_head='before', target_base_oid='base'),
         ))
         self.assertFalse(rebase_blocks.block_matches(
             {**block, "evidence": "another safety failure"}, recovery, checkpoint,

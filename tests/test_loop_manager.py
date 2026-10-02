@@ -291,6 +291,26 @@ def commit_and_push(repo: Path, message: str) -> None:
     git_command(repo, "push", "origin", "HEAD:main")
 
 
+def advance_remote_file(directory: str, repo: Path, relative_path: str,
+                        contents: str, message: str) -> str:
+    upstream = Path(directory) / f"upstream-{message.replace(' ', '-')}"
+    git_command(Path(directory), "clone", str(repo.parent / "remote.git"), str(upstream))
+    git_command(upstream, "config", "user.email", "upstream@example.com")
+    git_command(upstream, "config", "user.name", "Upstream Test")
+    target = upstream / relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(contents, encoding="utf-8")
+    commit_and_push(upstream, message)
+    return git_command(upstream, "rev-parse", "HEAD")
+
+
+def isolated_scope_resources(_connection, _repo, worktree, before, role_name, **_kwargs):
+    """These Agent fakes model a proven isolated invocation, tested elsewhere."""
+    return loop_manager.agent_scope_decision.used_git_resources(
+        role=role_name, phase='PLAN_BLOCKED', base_branch='main',
+        branch=before.branch, worktree_key=str(worktree.resolve()))
+
+
 class PinnedPublishedPlanRegistrationTest(unittest.TestCase):
     def test_registration_uses_pinned_tree_when_checkout_is_absent(self):
         sha = "a" * 40
@@ -3220,6 +3240,9 @@ class LoopManagerTest(unittest.TestCase):
             self.assertIsNotNone(row["planning_error"])
 
     def test_planning_error_blocks_same_input_and_changed_input_starts_fresh(self):
+        isolation = mock.patch.object(loop_manager, '_agent_git_resources', side_effect=isolated_scope_resources)
+        isolation.start()
+        self.addCleanup(isolation.stop)
         planner_sessions = []
 
         def invalid_planner(worktree, _state, _config, role_name, _prompt, **kwargs):
@@ -3289,8 +3312,7 @@ class LoopManagerTest(unittest.TestCase):
                 )
                 self.assertEqual(planner.call_count, 4)
 
-                (repo / "src/app.py").write_text("VALUE = 2\n", encoding="utf-8")
-                commit_and_push(repo, "Change planning input")
+                advance_remote_file(directory, repo, 'src/app.py', 'VALUE = 2\n', 'Change planning input')
                 self.assertEqual(
                     loop_manager.run_project(
                         connection, state_dir, str(repo), Path("unused.ini"), "main", False
@@ -8953,6 +8975,9 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     after,
                     selected_plan_path=plan_path,
                 )
+            resources = loop_manager.agent_scope_decision.used_git_resources(
+                role='worker', phase='WORKING', base_branch='main',
+                branch='loop-manager/G-099', worktree_key=str(managed.resolve()))
             loop_manager.validate_agent_scope(
                 "worker",
                 managed,
@@ -8961,6 +8986,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 selected_plan_path=plan_path,
                 external_worktree=repo,
                 base_branch="main",
+                resources=resources,
             )
 
     def test_primary_worktree_registration_removal_is_still_rejected(self):
@@ -9101,7 +9127,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     previous_phase="WORKING",
                 )
 
-            self.assertTrue(
+            self.assertFalse(
                 loop_manager.resume_project_block_if_safe(
                     connection,
                     repo,
@@ -9109,6 +9135,12 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     str(repo),
                 )
             )
+            resources = loop_manager.agent_scope_decision.used_git_resources(
+                role='worker', phase='WORKING', base_branch='main',
+                branch=branch, worktree_key=str(worktree.resolve()))
+            with mock.patch.object(loop_manager, '_agent_git_resources', return_value=resources):
+                self.assertTrue(loop_manager.resume_project_block_if_safe(
+                    connection, repo, state_dir, str(repo)))
 
             project = connection.execute(
                 "SELECT phase, worker_session_id, last_error FROM projects "
@@ -9709,6 +9741,9 @@ class AgentScopeValidatorTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo, plan_path = self._repository_with_plan(directory)
+            cleanup_plan = write_execplan(repo, 'G-099', 'Cleanup')
+            cleanup_plan_path = cleanup_plan.relative_to(repo).as_posix()
+            commit_and_push(repo, 'Add merged cleanup plan fixture')
             state_dir = root / "state"
             state_dir.mkdir()
             plan_sha = git_command(repo, "rev-parse", "origin/main")
@@ -9737,7 +9772,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 connection,
                 str(repo),
                 repo,
-                [(plan_path, loop_manager._parse_execplan(repo, repo / plan_path))],
+                [(plan_path, loop_manager._parse_execplan(repo, repo / plan_path)),
+                 (cleanup_plan_path, loop_manager._parse_execplan(repo, cleanup_plan))],
                 plan_sha,
                 loop_manager.planning_input_fingerprint(repo, "main"),
             )
@@ -9755,6 +9791,11 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 encoding="utf-8",
             )
             blocked_result = loop_manager.capture_git_snapshot(worktree)
+            # Deferred cleanup belongs to an already merged, owned plan.
+            connection.execute(
+                "UPDATE exec_plans SET status = 'MERGED', branch = ?, worktree = ?, "
+                "workspace_owned = 1, pr_head_oid = ? WHERE repo = ? AND plan_id = 'G-099'",
+                (cleanup_branch, str(cleanup_worktree), plan_sha, str(repo)))
             loop_manager._ensure_cleanup_pending_schema(connection)
             loop_manager._store_cleanup_pending(
                 connection,
@@ -9850,11 +9891,10 @@ class AgentScopeValidatorTest(unittest.TestCase):
             )
             blocked_agent.assert_not_called()
 
-            (repo / "docs/PRODUCT.md").write_text(
-                "# Product changed after cleanup\n",
-                encoding="utf-8",
-            )
-            commit_and_push(repo, "Change source after blocked cleanup")
+            isolation = mock.patch.object(loop_manager, '_agent_git_resources', side_effect=isolated_scope_resources)
+            isolation.start()
+            self.addCleanup(isolation.stop)
+            advance_remote_file(directory, repo, 'docs/PRODUCT.md', '# Product changed after cleanup\n', 'Change source after blocked cleanup')
             with connection:
                 connection.execute(
                     "UPDATE projects SET specification_fingerprint = ? "
@@ -9974,6 +10014,9 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 )
 
     def test_agent_commit_isolated_automatically_after_blocked_input_change(self):
+        isolation = mock.patch.object(loop_manager, '_agent_git_resources', side_effect=isolated_scope_resources)
+        isolation.start()
+        self.addCleanup(isolation.stop)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo, plan_path = self._repository_with_plan(directory)
@@ -10115,11 +10158,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
                     ),
                 )
 
-            (repo / "docs/PRODUCT.md").write_text(
-                "# Product changed after blocked Agent commit\n",
-                encoding="utf-8",
-            )
-            commit_and_push(repo, "Change source after blocked Agent commit")
+            advance_remote_file(directory, repo, 'docs/PRODUCT.md', '# Product changed after blocked Agent commit\n', 'Change source after blocked Agent commit')
             with connection:
                 connection.execute(
                     "UPDATE projects SET specification_fingerprint = ? "
@@ -10224,6 +10263,9 @@ class AgentScopeValidatorTest(unittest.TestCase):
             )
 
     def test_restored_worker_git_metadata_allows_changed_input_to_requeue(self):
+        isolation = mock.patch.object(loop_manager, '_agent_git_resources', side_effect=isolated_scope_resources)
+        isolation.start()
+        self.addCleanup(isolation.stop)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo, plan_path = self._repository_with_plan(directory)
@@ -10319,11 +10361,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
             git_command(worktree, "reset", "--hard", plan_sha)
             git_command(worktree, "branch", "-D", "agent-branch")
             git_command(worktree, "update-ref", "-d", "refs/tags/agent-tag")
-            (repo / "docs/PRODUCT.md").write_text(
-                "# Product changed after Git recovery\n",
-                encoding="utf-8",
-            )
-            commit_and_push(repo, "Change source after Git recovery")
+            advance_remote_file(directory, repo, 'docs/PRODUCT.md', '# Product changed after Git recovery\n', 'Change source after Git recovery')
             with connection:
                 connection.execute(
                     "UPDATE projects SET specification_fingerprint = ? "
@@ -10508,6 +10546,9 @@ class AgentScopeValidatorTest(unittest.TestCase):
             self.assertEqual(tuple(row), (None, None, None, None, 0))
 
     def test_reviewer_mutation_blocks_even_when_verdict_passes(self):
+        isolation = mock.patch.object(loop_manager, '_agent_git_resources', side_effect=isolated_scope_resources)
+        isolation.start()
+        self.addCleanup(isolation.stop)
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -10665,11 +10706,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
             )
             unchanged_agent.assert_not_called()
 
-            (repo / "docs/PRODUCT.md").write_text(
-                "# Product changed after blocked review\n",
-                encoding="utf-8",
-            )
-            commit_and_push(repo, "Change source after blocked review")
+            advance_remote_file(directory, repo, 'docs/PRODUCT.md', '# Product changed after blocked review\n', 'Change source after blocked review')
             with connection:
                 connection.execute(
                     "UPDATE projects SET specification_fingerprint = ? "
@@ -10806,6 +10843,9 @@ class AgentScopeValidatorTest(unittest.TestCase):
             self.assertEqual(plan["agent_result_plan"], result_plan)
 
     def test_blocked_scope_resume_rebases_non_source_remote_and_direct_execplan_edit(self):
+        isolation = mock.patch.object(loop_manager, '_agent_git_resources', side_effect=isolated_scope_resources)
+        isolation.start()
+        self.addCleanup(isolation.stop)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo, plan_path = self._repository_with_plan(directory)
@@ -10938,12 +10978,7 @@ class AgentScopeValidatorTest(unittest.TestCase):
             self.assertIsNotNone(persisted_plan["agent_snapshot"])
             blocked_agent.assert_not_called()
 
-            (repo / "docs/notes.md").write_text(
-                "# Notes\n\nRemote non-input change.\n",
-                encoding="utf-8",
-            )
-            commit_and_push(repo, "Change non-input documentation")
-            remote_head = git_command(repo, "rev-parse", "origin/main")
+            remote_head = advance_remote_file(directory, repo, 'docs/notes.md', '# Notes\n\nRemote non-input change.\n', 'Change non-input documentation')
             self.assertEqual(
                 loop_manager._revision_execplan_input_fingerprint(
                     repo,
@@ -15174,25 +15209,9 @@ class AutomaticOwnedPrConflictRecoveryTest(unittest.TestCase):
                 loop_manager._runtime_handoff_signal.reset(token)
                 connection.close()
 
-    def _advance_base(
-        self,
-        directory: str,
-        repo: Path,
-        relative_path: str,
-        contents: str,
-        message: str,
-    ) -> str:
-        upstream = Path(directory) / f"upstream-{message.replace(' ', '-')}"
-        git_command(Path(directory), "clone", str(repo.parent / "remote.git"), str(upstream))
-        git_command(upstream, "config", "user.email", "upstream@example.com")
-        git_command(upstream, "config", "user.name", "Upstream Test")
-        target = upstream / relative_path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(contents, encoding="utf-8")
-        git_command(upstream, "add", "-A")
-        git_command(upstream, "commit", "-m", message)
-        git_command(upstream, "push", "origin", "HEAD:main")
-        return git_command(upstream, "rev-parse", "HEAD")
+    def _advance_base(self, directory: str, repo: Path, relative_path: str,
+                      contents: str, message: str) -> str:
+        return advance_remote_file(directory, repo, relative_path, contents, message)
 
     def _pull_request(
         self,
@@ -19400,6 +19419,64 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
             "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'work_waiting'"
         ).fetchone()[0], 0)
         connection.close()
+
+
+class WorkerConflictScopeUnitTests(unittest.TestCase):
+    """Validate fresh Worker stage transitions through the owned rebase port."""
+    def setUp(self):
+        from types import SimpleNamespace
+        self.repo, self.worktree = Path('/repo'), Path('/managed')
+        self.connection = sqlite3.connect(':memory:')
+        self.connection.row_factory = sqlite3.Row
+        self.addCleanup(self.connection.close)
+        self.connection.execute(loop_manager.SCHEMA)
+        loop_manager._ensure_execplans_schema(self.connection)
+        self.connection.execute("INSERT INTO projects (repo, base_branch) VALUES ('/repo', 'main')")
+        self.connection.execute("INSERT INTO exec_plans (repo, plan_id, path, title, sources, "
+            "depends_on, priority, content_hash, status, branch, worktree, workspace_owned) VALUES "
+            "('/repo', 'G-092', 'docs/plans/[G-092] Work.md', 'Work', '[]', '[]', 'normal', 'hash', "
+            "'IMPLEMENTING', 'loop-manager/G-092', '/managed', 1)")
+        self.plan = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.before = loop_manager.GitSnapshot('partial', None,
+            {'app.py': tuple(f'M 100644 old-{stage} {stage}' for stage in (1, 2, 3))}, {},
+            {'refs/heads/loop-manager/G-092': ('before', '')},
+            {'/managed': ('HEAD=partial', 'detached=True')}, {}, {'rebase-merge': 'owned'})
+        self.after = replace(self.before, index={'app.py': ('H 100644 resolved 0',)},
+                             dirty={'app.py': (('staged',), 'resolved-file')})
+        self.service = mock.Mock()
+        self.service.require_owned.return_value = (None, SimpleNamespace(
+            status=loop_manager.managed_rebase_validation.RebaseStatus.WAITING))
+        for patcher in (
+            mock.patch.object(loop_manager, 'capture_git_snapshot', side_effect=lambda *_: self.after),
+            mock.patch.object(loop_manager, '_owned_rebase_state_dir', return_value=Path('/state')),
+            mock.patch.object(loop_manager, '_current_rebase_service', return_value=self.service),
+            mock.patch.object(loop_manager, 'validate_active_execplan_metadata', return_value={'id': 'G-092'}),
+            mock.patch.object(loop_manager, 'validate_managed_worktree'),
+            mock.patch.object(loop_manager, 'git', side_effect=AssertionError('unit test has no Git writes')),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def validate(self):
+        return loop_manager.validate_worker_workspace_scope(
+            self.repo, self.worktree, 'loop-manager/G-092', 'main', self.plan['path'],
+            self.plan, self.before, allow_rebase=True, connection=self.connection)
+
+    def test_normal_stage_resolution_requires_and_uses_current_owned_rebase(self):
+        self.assertEqual(self.validate(), {'id': 'G-092'})
+        self.service.require_owned.assert_called_once()
+
+    def test_allow_rebase_alone_cannot_accept_uncertain_metadata_remote_or_scope(self):
+        self.service.require_owned.side_effect = RuntimeError('current ownership or remote mismatch')
+        with self.assertRaisesRegex(loop_manager.AgentScopeError, '소유 rebase'):
+            self.validate()
+        loop_manager.validate_active_execplan_metadata.assert_not_called()
+
+    def test_flag_change_mixed_with_resolution_still_fails_after_owned_rebase(self):
+        for tag in ('S', 'h'):
+            self.after = replace(self.after, index={'app.py': (f'{tag} 100644 resolved 0',)})
+            with self.subTest(tag=tag), self.assertRaisesRegex(loop_manager.AgentScopeError, 'index flags'):
+                self.validate()
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import execplan_archive
@@ -141,6 +142,41 @@ class FakeGit:
 
 
 class ExecPlanArchiveTest(unittest.TestCase):
+    def test_push_uses_all_resolved_urls_and_preserves_remote_result_checks(self):
+        prepared = execplan_archive.PreparedArchive('archive', 'base', 'tree', 'commit')
+        urls = ('https://example.test/repo.git', 'ssh://example.test/repo.git')
+        for remote, succeeded, changed in (('commit', True, False),
+                                            ('base', False, False),
+                                            ('raced', False, True),
+                                            (RuntimeError('network unavailable'), False, False)):
+            with self.subTest(remote=remote):
+                port = loop_manager._ExecPlanArchiveGitPort(Path('/repo'), Path('/state'), '/repo')
+                calls = []
+                def git(repo, *args, **kwargs):
+                    calls.append(args)
+                    if args == ('remote', 'get-url', '--push', '--all', 'origin'):
+                        return SimpleNamespace(stdout='\n'.join(urls), returncode=0)
+                    self.assertEqual(args, ('push', '--', urls[len(calls) - 2], 'commit:refs/heads/main'))
+                    return SimpleNamespace(stdout='push rejected', returncode=1)
+                with (mock.patch.object(loop_manager, 'git', side_effect=git),
+                      mock.patch.object(port, 'fetch_remote_base',
+                          side_effect=remote if isinstance(remote, Exception) else None,
+                          return_value=remote) as fetch):
+                    result = port.push_fast_forward(prepared, 'main')
+                self.assertEqual(result.success, succeeded)
+                self.assertEqual(result.base_changed, changed)
+                fetch.assert_called_once_with('main')
+                self.assertEqual(len(calls), 3)
+
+    def test_missing_push_url_refuses_archive_before_any_push(self):
+        port = loop_manager._ExecPlanArchiveGitPort(Path('/repo'), Path('/state'), '/repo')
+        with (mock.patch.object(loop_manager, 'git', return_value=SimpleNamespace(stdout='', returncode=0)) as git,
+              mock.patch.object(port, 'fetch_remote_base') as fetch):
+            with self.assertRaisesRegex(RuntimeError, 'origin URL'):
+                port.push_fast_forward(execplan_archive.PreparedArchive('archive', 'base', 'tree', 'commit'), 'main')
+        git.assert_called_once_with(Path('/repo'), 'remote', 'get-url', '--push', '--all', 'origin')
+        fetch.assert_not_called()
+
     def test_empty_candidate_set_is_checked_after_remote_refresh(self):
         repository = FakeRepository(())
         git = FakeGit({})

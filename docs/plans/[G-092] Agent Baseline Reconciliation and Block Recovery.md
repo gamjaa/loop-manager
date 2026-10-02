@@ -47,15 +47,35 @@ Agent 시작 snapshot 뒤에 Manager의 검증된 Git 작업이 있어도 현재
 
 ## Progress
 
-- [ ] 검증된 Manager 전이의 Agent 기준선 반영
-- [ ] 저장된 오탐 차단의 증거 기반 해제
-- [ ] 정상 충돌 stage 전이와 실제 index flags 변경 구분
-- [ ] PLAN_BLOCKED의 소유 rebase 및 detached HEAD 복구 경계
-- [ ] 재개·재검증 및 다른 차단 보존 회귀 사례
+- [x] 검증된 Manager 전이의 Agent 기준선 반영
+- [x] 저장된 오탐 차단의 증거 기반 해제
+- [x] 정상 충돌 stage 전이와 실제 index flags 변경 구분
+- [x] PLAN_BLOCKED의 소유 rebase 및 detached HEAD 복구 경계
+- [x] 재개·재검증 및 다른 차단 보존 회귀 사례
+
+2026-10-02 Worker: 관련 unit test 73개 통과. 실제 Git 충돌·재시작에서 Worker 후보 확인·verify·Review·게시까지 이어지는 PR 없는 branch 및 기존 PR 회귀를 기존 fixture에 추가했다. integration test와 전체 verify는 실행하지 않았으며 Loop Manager 검증·Reviewer·사용자 Merge는 대기 중이다. 현재 Linux 환경의 기존 `scripts/verify.sh`가 전체 unittest discovery 및 변경 모듈 검증을 포함하므로 스크립트 변경은 필요하지 않았다.
+
+2026-10-02 검증 피드백 보정: Manager가 전달한 verify 실패 진단을 읽고 guidance 게시 ref 허용 전달, 증명된 fetch의 symbolic ref 해석 OID, SQLite와 journal의 서로 다른 fetch token, 지연 Merge cleanup 완료 기록 및 기존 입력 변경 교정 경로를 수정했다. 재개 호출의 metadata 시작값을 원본 scope·역할에 결합해 보존하며 실제 Agent 결과 검사는 후속 Manager 전이로 덮지 않는다. 기존 실제 Git fixture도 원격 변경·Manager fetch·증명된 격리를 구분하도록 갱신했다. 관련 pure/fake-port unit test 91개가 최종 실행에서 통과했으며 실패한 targeted command는 수정 뒤 같은 명령으로 재실행했다. 실제 Git integration 및 전체 verify는 Worker가 실행하지 않았고 Loop Manager 재검증을 기다린다.
+
+2026-10-02 Worker 결과 보고 보정: 이전 보고의 `FAILED_COMMAND`와 `RERUN` 사이에 첫 실행의 실패 결과가 빠져 결과 검증기가 재실행 이력을 거부했다. 실패 결과와 동일 명령의 최종 `OK`를 명시하도록 보고를 수정했다. 기존 결과 계약 unit test 1개와 수정된 전체 보고의 parser 검증이 통과했으며 검증기 코드는 변경하지 않았다.
+
+2026-10-02 추가 verify 피드백 보정: 원격 successor를 채택한 재개 결과는 기존 채택 기준선 검사로 연결하고, runtime 소유권·등록 증거를 확인한 뒤 원본과 같은 자원만 보정해 저장된 실제 Agent 변경은 계속 거부한다. scope 재개 실패 시 새 임시 project projection만 정리하며 기존 선택·계획 진단과 새 프로젝트 안전 차단을 보존한다. guidance 원격 변경 fixture의 `main` clone을 명시하고, 지연 cleanup fixture의 Merge된 계획을 실제 원격 문서와 같은 metadata로 등록했다. 직접 관련된 fake-port unit test 10개가 최종 실행에서 통과했으며 targeted 실패는 fixture를 수정한 뒤 동일 명령으로 재실행했다. 실제 Git fixture 검증과 전체 verify는 실행하지 않았고 Loop Manager 재검증을 기다린다.
+
+2026-10-02 남은 verify 실패 보정: 차단 계획의 base fetch를 기존 소유 CAS·journal 경로로 연결했다. Merge cleanup 후 archive 게시도 설정된 push URL을 사용해 tracking ref의 자동 갱신을 피하고, 후속 기록형 fetch가 전후 증거를 남기도록 했다. 복수 push URL과 원격 결과 확인, 통신 실패·OID 경쟁·재시작 및 외부 reflog 혼합을 다루는 관련 fake-port unit test 53개가 통과했다. 실제 Git 회귀와 전체 verify는 Loop Manager 재검증을 기다린다.
+
+2026-10-02 공유 fixture 보정: 위 fetch 변경에서 추가한 helper를 project recovery fixture의 재사용 목록에도 연결했다. Manager가 보고한 동일 초기화 오류 28건에 해당하는 project recovery 클래스와 catalog recovery unit test가 모두 통과했다. 전체 verify는 실행하지 않았고 Loop Manager 재검증을 기다린다.
+
+2026-10-02 Review 보정: 현재 Agent 기준선에서 필요한 전이만 소유 reflog로 검사해 기준선 이전의 fetch·외부 변경이 새 전이를 거부하지 않게 했다. SQLite action token은 같은 repository·계획·ref·전후 OID의 fetch로 연결해 일반 journal fetch와 양방향 연쇄를 검증하며, Git 실행 표식이 없는 완료 행은 후보에서 제외한다. 외부 변경·identity 불일치·중단 복구·감사 보존을 포함한 fake-port unit test 23개가 최종 실행에서 통과했다. 첫 targeted 실행의 기존 반환 계약 차이는 수정 후 같은 명령으로 재실행했으며 전체 verify는 Loop Manager 재검증 대기다.
 
 ## Decision Log
+
+- 2026-10-02 Planner 재개 Review 보정: plan ID가 없는 일반·유지보수 Planner도 context의 state directory로 기존 Manager 전이 증거 검사를 수행한다. 재개 시작 및 저장 결과 재검증에 보정 기준선을 전달하고 원본 snapshot·session·입력 지문은 유지한다. 실행 후 검사는 시작 시 기준선을 고정해 이후 전이로 Agent 결과를 덮지 않는다. 해당 fake-port unit test 3개가 통과했으며 전체 verify는 Loop Manager 검증 대기다.
 
 - 과거 실행에 쓰기 격리 증거가 없으면 무관한 shared ref·worktree 변화를 자동으로 외부 변경이라 단정하지 않는다. G-088/G-089와 G-090/G-091의 독립 증거가 있는 경우에만 해제한다.
 - 2026-09-27: 사용자 요청으로 G-093의 정상 충돌 stage 해소가 `index flags` 위반으로 판정되고 이후 차단 복구의 일반 branch 검사에서 detached HEAD가 거부되는 재발 조건을 보강했다. Manager 소유 rebase와 허용된 파일·index 전이를 독립적으로 증명하는 범위로 한정하며, 무관한 외부 Git 변화를 과거 실행에 소급 허용하지 않는다.
 - G-088처럼 실제 Review 실패와 진행 rebase가 함께 남은 경우 rebase 소유권 확인은 별도 Review 원인의 해제 근거가 아니다. 이 보강은 기존 dependency를 변경하거나 선행 계획의 차단을 우회해 G-092를 시작하도록 허용하지 않는다.
 - 2026-09-30: mutable READY snapshot의 기준 revision·원본 hash를 확인해 R-048을 반영했다. 앞선 기록의 rebase 작업 수행 증거 요구는 G-109·G-110의 현재 상태 판정으로 대체한다. G-110은 rebase 충돌/완료 원인의 수동 복구를 먼저 구현하고, 이 계획은 그 결과에 기반한 Agent scope 기준선·정상 stage 오탐 복구를 담당한다. 격리 없는 과거 Agent 실행의 무관한 ref/worktree 변화는 계속 소급 허용하지 않는다.
+- 2026-10-02: G-109/G-110의 현재 rebase 서비스·기준선 수용·원자적 원인 해제·후보 재검증을 재사용했다. 실제 Agent 결과를 먼저 검사한 뒤 선택 rebase 상태만 비교 기준선에 반영하고, fetch에는 일치하는 전후 intent와 끊김 없는 소유 reflog 전이를 요구한다. 복구 worktree는 해당 create receipt만 검증하므로 무관한 과거 rebase journal 누락이 gate가 되지 않는다. 원본 snapshot과 수동 복구 감사를 Manager 실행·격리 증거로 바꾸지 않는다. 새 scope 해제는 입력 지문 변경을 요구하지 않으며 다른 Review·planning·계획 차단과 retry·실패 이력을 보존한다. Requirement archive 허용 경로도 revision별 eligibility를 재사용한다.
+- 검증 피드백에서 드러난 기존 사용자 교정 흐름은 보존한다. 입력 변경 없는 오탐 해제에는 저장된 Agent 결과의 안전성을 요구하고, 실제 위반의 복원·격리 후 재개는 기존 입력 변경 교정 경로로 넘긴다. 현재 index 보안 flags가 복원되지 않았거나 프로젝트 안전 gate·다른 활성 실행이 남으면 그 경로도 진행하지 않는다.
+- 2026-10-02: fetch의 현재 소유 표식은 Agent 기준선부터 현재 값까지 필요한 전이에 요구한다. journal ID와 SQLite action token은 구분하되 같은 소유 작업의 정확한 전후 값으로 연결하며, 중간 외부 reflog·다른 계획/자원·실행 표식 부재는 현재 기준선 갱신의 근거가 아니다. 이 결합은 기존 기록을 읽기만 하고 receipt를 생성하거나 수정하지 않는다.
+- 2026-10-02 저장 Planner 결과 Review 보정: plan ID가 없는 Planner의 보정 시작값도 기존 project checkpoint에 역할·원본 snapshot hash와 결합해 저장한다. 원본과 실제 결과를 유지한 채 차단 해제 이후 공통 선검증이 같은 시작값을 읽는다. 일반·유지보수 Planner의 저장 결과, planning_validation_error 없는 차단 해제, 공통 선검증 및 실제 ref·파일 위반 거부를 연결한 fake-port unit test 1개가 통과했다. 첫 실행의 테스트 상수명 오류를 수정하고 동일 명령으로 재실행했으며 전체 verify는 실행하지 않았다.

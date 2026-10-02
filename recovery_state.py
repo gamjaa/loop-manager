@@ -431,7 +431,11 @@ class RecoveryRepository:
                     RecoveryReason.REBASE_CONFLICT.value, RecoveryReason.STATUS_FAILED.value,
                     RecoveryReason.MANAGED_CONFLICT_UNRECOVERABLE.value,
                     RecoveryReason.STATE_UNSAFE.value, RecoveryReason.REMOTE_OID_UNCERTAIN.value,
-                    RecoveryReason.OWNERSHIP_UNCERTAIN.value}):
+                    RecoveryReason.OWNERSHIP_UNCERTAIN.value,
+                    RecoveryReason.AGENT_SCOPE_VIOLATION.value,
+                    RecoveryReason.DEFAULT_WORKTREE_MUTATION.value,
+                    RecoveryReason.SHARED_REF_MUTATION.value,
+                    RecoveryReason.OUTSIDE_MANAGED_WORKTREE_MUTATION.value}):
             return
         if saved['pending_action'] == 'final_block':
             try:

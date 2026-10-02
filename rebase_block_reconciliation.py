@@ -12,7 +12,7 @@ import json
 from execution_checkpoint import controlling_git_operation
 
 from recovery_runtime import RecoveryReason
-from scoped_blocking import BlockReasonCode
+from scoped_blocking import BlockReasonCode, SCOPE_BASELINE_REASONS
 
 
 LEGACY_COMPLETION_DIAGNOSTIC = (
@@ -23,7 +23,7 @@ REBASE_BLOCK_REASONS = frozenset({
     BlockReasonCode.REPOSITORY_STATE_UNSAFE.value,
     BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value,
     BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value,
-})
+}) | SCOPE_BASELINE_REASONS
 
 
 def saved_failure_matches(recovery, checkpoint) -> bool:
@@ -58,6 +58,10 @@ def block_matches(block, recovery, checkpoint) -> bool:
                 'blocked_resume'))):
         return False
     if block['reason_code'] == BlockReasonCode.MANAGED_WORKTREE_CONFLICT.value:
+        return True
+    if block['reason_code'] in SCOPE_BASELINE_REASONS:
+        # Selection only. The caller must independently validate saved Agent
+        # output and current ownership before releasing this scope diagnosis.
         return True
     if block['evidence'] == LEGACY_COMPLETION_DIAGNOSTIC:
         return True
