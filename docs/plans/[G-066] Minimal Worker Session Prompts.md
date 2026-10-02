@@ -6,6 +6,7 @@ sources:
 depends_on:
   - G-058
   - G-065
+  - G-127
 complexity: high
 risk: medium
 priority: low
@@ -44,3 +45,4 @@ priority: low
 ## Decision Log
 
 - CLI가 보존하는 대화를 Loop Manager가 별도로 압축하거나 재구성하지 않는다. G-058의 공통 지침과 G-065의 verify 피드백을 전제로 한다.
+- 2026-10-02 사용자 결정: 리팩터링을 먼저 진행하므로 G-127 Merge 이후 시작한다. SQLite에서 미착수·무소유 READY임을 확인했으며 원래 목표·Acceptance Criteria와 기존 dependency는 유지한다. 실행 시 G-119~G-125에서 정리된 prompt·session·handler와 테스트의 최신 경로를 확인한다.

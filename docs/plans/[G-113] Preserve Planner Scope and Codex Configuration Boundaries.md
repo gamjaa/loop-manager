@@ -4,7 +4,8 @@ title: Preserve Planner Scope and Codex Configuration Boundaries
 sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-023] Self-Hosted Runtime Refresh Handoff.md
-depends_on: []
+depends_on:
+  - G-127
 complexity: medium
 risk: high
 priority: critical
@@ -46,3 +47,4 @@ priority: critical
 - OpenAI 공식 문서에 따라 Codex 사용자 설정과 repository project 설정의 경계를 구분한다. 사용자 plugin 설정은 삭제하지 않으며 새 자동 실행 home은 비밀값을 출력하거나 복제하지 않는다.
 
 - 2026-10-01: 실제 자동 실행에서 CLI 0.159.3의 outer sandbox는 named permission profile을 요구함을 확인했다. 기존 mount proof와 쓰기 경계를 유지하는 형식으로 갱신한다. Ubuntu AppArmor가 vendor bwrap의 namespace 초기화를 거부하는 운영 환경 조건은 개별 binary profile로 해결하며 시스템 전체 userns 정책은 변경하지 않는다.
+- 2026-10-02 사용자 결정: 리팩터링 우선 요청에 따라 미착수·무소유 READY인 이 계획은 G-127 Merge 이후 진행한다. 원래 Planner 소유권·설정 경계·거부 조건과 목표는 유지하고 실행 시 최신 application·Agent 경로와 현재 PRODUCT/R-050의 직접 Codex 실행 계약을 확인한다. 과거 운영·targeted test 기록은 보존하되 새 revision의 검증 성공으로 사용하지 않는다.

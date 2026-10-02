@@ -4,7 +4,8 @@ title: Verified Runtime Recreation Baseline
 sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-023] Self-Hosted Runtime Refresh Handoff.md
-depends_on: []
+depends_on:
+  - G-127
 complexity: medium
 risk: high
 priority: critical
@@ -43,3 +44,4 @@ priority: critical
 
 - 2026-10-01: 보고된 runtime 선검증 실패와 SQLite snapshot, runtime 생성 intent 및 삭제 receipt를 읽기 전용으로 비교했다. 같은 SHA의 정상 삭제·재생성에 따른 잠금 ID 변경을 확인했다. 기존 G-092는 더 넓은 기준선 복구 계획이며 이 수정은 현재 구현의 runtime equality 결함만 다룬다.
 - source checkout 밖의 별도 관리 worktree에서 변경을 준비하며 운영 DB를 수동 수정하지 않는다.
+- 2026-10-02 사용자 결정: 리팩터링 우선 요청에 따라 미착수·무소유 READY인 이 계획은 G-127 Merge 이후 진행한다. 원래 runtime 증거·거부 조건·검증 결과와 목표는 유지하고, 실행 시 리팩터링된 runtime·scope 경로를 확인한다. 과거 targeted test 기록을 새로운 revision의 검증 성공으로 사용하지 않는다.

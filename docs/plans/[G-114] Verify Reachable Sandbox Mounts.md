@@ -4,7 +4,8 @@ title: Verify Reachable Sandbox Mounts
 sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-023] Self-Hosted Runtime Refresh Handoff.md
-depends_on: []
+depends_on:
+  - G-127
 complexity: medium
 risk: high
 priority: critical
@@ -44,3 +45,4 @@ Ubuntu의 Codex sandbox 초기화는 성공하지만 접근 불가능한 Docker 
 - 2026-10-01: 사용자가 확인된 로직 오류를 핫픽스로 수정하고 main에 push하도록 요청했다. AppArmor profile 설치 후 native sandbox 초기화는 성공하며 보호 경로 100개와 Git pointer는 실제 읽기 전용이다. mountinfo에 남아 있는 접근 불가 Docker mount와 현재 proc에 덮인 autofs entry가 오탐의 원인이다. 격리 정책을 완화하지 않고 실제 mount identity와 접근 불가 상태를 구분한다.
 
 - 실제 mount가 replacement /dev 아래에서 사라진 경우도 kernel 경로 open의 ENOENT로 구분한다. fdinfo 읽기 실패와 그 밖의 오류는 접근 불가로 오인하지 않고 실패를 유지한다. 표준 device 예외는 /dev의 지정된 character device에만 적용한다. 기존 verify 스크립트가 해당 모듈과 테스트 전체를 포함하므로 변경하지 않는다.
+- 2026-10-02 사용자 결정: 리팩터링 우선 요청에 따라 미착수·무소유 READY인 이 계획은 G-127 Merge 이후 진행한다. 원래 mount 판정·보호 경계·검증 조건과 목표는 유지하고 실행 시 최신 Agent module·test 경로 및 현재 PRODUCT/R-050의 직접 Codex 실행 계약을 확인한다. 과거 운영·targeted test 결과를 새로운 revision의 검증 성공으로 사용하지 않는다.
