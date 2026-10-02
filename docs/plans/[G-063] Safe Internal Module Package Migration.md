@@ -122,6 +122,18 @@ Worker targeted 결과 (2026-10-02, 모두 통과):
 전체 verify·integration/e2e·build·type check·commit·push·PR 생성은 실행하지 않았다.
 Loop Manager 전체 검증과 Reviewer/사용자 Merge는 아직 남아 있으며 ExecPlan 완료 상태를 선언하지 않는다.
 
+추가 verify 피드백 `verify:a30fff4f3c143e00ba6d4631a17efe514043ebe5c1d6d88f1ed855091791928e`
+(occurrence=1, revision=1)은 옛 파일명 tuple을 찾던 fixture 검증 두 case의 `StopIteration`이었다.
+두 case는 기존 bytecode fixture의 실제 복사 단계를 재사용하고 Git 작업 전에 중단하도록 수정했다.
+직접 import의 새 package 경로·파일 내용과 격리된 자식의 catalog adapter import 위치를 검증한다.
+
+FAILED_COMMAND: PYTHONPATH=tests python3 -B -m unittest -v test_loop_manager.ProjectDiagnosticPublicationUnitTests.test_planner_import_fixture_contains_direct_manager_modules test_project_catalog_refresh.ProjectCatalogRefreshTest.test_planner_import_fixture_loads_catalog_adapter_without_git_or_provider
+최초 실행 결과: FAIL (StopIteration; 종료 코드 1).
+RERUN: PYTHONPATH=tests python3 -B -m unittest -v test_loop_manager.ProjectDiagnosticPublicationUnitTests.test_planner_import_fixture_contains_direct_manager_modules test_project_catalog_refresh.ProjectCatalogRefreshTest.test_planner_import_fixture_loads_catalog_adapter_without_git_or_provider
+수정 후 동일 명령 최종 결과: 2 tests OK. 전체 verify는 Worker가 재실행하지 않았으며 Loop Manager 재검증을 기다린다.
+Worker 결과 검증 재시도에서는 최초 결과가 없는 명령 표식 쌍이 미해결로 판정됨을 확인했다.
+최초 FAIL과 재실행 PASS를 분리해 보고하며, 같은 두 case 재확인도 2 tests OK였다.
+
 ## Decision Log
 
 - 내부 모듈을 옮기는 순서는 의존성 graph를 따른다. 공개 launcher와 고정 문서 경로는 이동 대상이 아니다.

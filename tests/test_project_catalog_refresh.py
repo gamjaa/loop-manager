@@ -626,25 +626,26 @@ class ProjectCatalogRefreshTest(unittest.TestCase):
             agent.assert_not_called()
 
     def test_planner_import_fixture_loads_catalog_adapter_without_git_or_provider(self):
-        import ast
-        import inspect
-        import shutil
         import subprocess
         import sys
         import tempfile
-        import textwrap
         from tests import test_loop_manager as manager_tests
-        fixture = ast.parse(textwrap.dedent(inspect.getsource(
-            manager_tests.AgentScopeValidatorTest.test_planner_import_bytecode_is_ignored_without_hiding_scope_violations)))
-        copied = next(node.iter for node in ast.walk(fixture)
-                      if isinstance(node, ast.For) and isinstance(node.target, ast.Name)
-                      and node.target.id == 'module_name')
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for node in copied.elts:
-                shutil.copy(manager.ROOT / node.value, root / node.value)
+            fixture = manager_tests.AgentScopeValidatorTest(
+                'test_planner_import_bytecode_is_ignored_without_hiding_scope_violations')
+            with (mock.patch.object(fixture, '_repository_with_plan', return_value=(root, None)),
+                  mock.patch.object(manager_tests, 'commit_and_push',
+                                    side_effect=StopIteration('fixture copied')),
+                  self.assertRaisesRegex(StopIteration, '^fixture copied$')):
+                fixture.test_planner_import_bytecode_is_ignored_without_hiding_scope_violations()
             result = subprocess.run(
-                [sys.executable, '-B', '-c', 'import loop_manager, project_catalog_refresh'],
+                [sys.executable, '-I', '-B', '-c',
+                 'import pathlib, sys; sys.path.insert(0, sys.argv[1]); '
+                 'import loop_manager; from loop_manager_internal.catalog import project_catalog_refresh; '
+                 'root = pathlib.Path(sys.argv[1]); assert loop_manager.ROOT == root; '
+                 'assert pathlib.Path(project_catalog_refresh.__file__).is_relative_to(root)', str(root)],
                 cwd=root, capture_output=True, text=True, check=False,
+                timeout=30,
             )
         self.assertEqual(result.returncode, 0, result.stderr)

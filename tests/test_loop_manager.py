@@ -2224,24 +2224,34 @@ class ProjectDiagnosticPublicationUnitTests(unittest.TestCase):
 
     def test_planner_import_fixture_contains_direct_manager_modules(self):
         import ast
-        import inspect
-        import textwrap
-        fixture = ast.parse(textwrap.dedent(inspect.getsource(
-            AgentScopeValidatorTest.test_planner_import_bytecode_is_ignored_without_hiding_scope_violations)))
-        copied = next(node.iter for node in ast.walk(fixture)
-                      if isinstance(node, ast.For) and isinstance(node.target, ast.Name)
-                      and node.target.id == 'module_name')
-        modules = {node.value for node in copied.elts}
         manager = ast.parse(Path(loop_manager.__file__).read_text(encoding='utf-8'))
         imports = set()
         for node in manager.body:
             if isinstance(node, ast.Import):
-                imports.update(alias.name.split('.')[0] for alias in node.names)
+                imports.update(alias.name for alias in node.names)
             elif isinstance(node, ast.ImportFrom) and node.module:
-                imports.add(node.module.split('.')[0])
-        required = {name + '.py' for name in imports
-                    if (Path(loop_manager.__file__).parent / (name + '.py')).is_file()}
-        self.assertFalse(required - modules, required - modules)
+                imports.add(node.module)
+                imports.update(node.module + '.' + alias.name for alias in node.names)
+        required = {Path('loop_manager.py')}
+        for name in imports:
+            module_path = Path(*name.split('.'))
+            for path in (module_path.with_suffix('.py'), module_path / '__init__.py'):
+                if (loop_manager.ROOT / path).is_file():
+                    required.add(path)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = AgentScopeValidatorTest(
+                'test_planner_import_bytecode_is_ignored_without_hiding_scope_violations')
+            # Reuse the actual copy setup; stop before its Git/scope scenario starts.
+            with (mock.patch.object(fixture, '_repository_with_plan', return_value=(root, None)),
+                  mock.patch.object(sys.modules[fixture.__module__], 'commit_and_push',
+                                    side_effect=StopIteration('fixture copied')),
+                  self.assertRaisesRegex(StopIteration, '^fixture copied$')):
+                fixture.test_planner_import_bytecode_is_ignored_without_hiding_scope_violations()
+            for path in required:
+                with self.subTest(module=path):
+                    self.assertTrue((root / path).is_file())
+                    self.assertEqual((root / path).read_bytes(), (loop_manager.ROOT / path).read_bytes())
 
     def test_missing_origin_keeps_local_only_scope_and_mismatched_push_url_is_rejected(self):
         connection = mock.Mock()
