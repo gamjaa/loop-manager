@@ -1,8 +1,9 @@
 import unittest
 from dataclasses import replace
+from pathlib import Path
 
 import agent_scope_decision as decision
-from loop_manager import GitSnapshot, ManagerGitCheckpoint
+from loop_manager import GitSnapshot, ManagerGitCheckpoint, AgentScopeError, validate_agent_scope
 
 
 WORKTREE = "/managed"
@@ -167,6 +168,76 @@ class PersistedScopeDecisionTests(unittest.TestCase):
         current = replace(before, dirty={"src/unrelated.py": (("unstaged",), "new")})
         with self.assertRaisesRegex(decision.ScopeDecisionError, "src/unrelated.py"):
             decide(before, current, phase="PLAN_BLOCKED", result=before)
+
+
+class TaskRelevantScopeTests(unittest.TestCase):
+    def setUp(self):
+        self.before = snapshot(refs={
+            'refs/heads/loop-manager/G-051': ('a', ''),
+            'refs/remotes/origin/develop': ('base', ''),
+            'refs/remotes/origin/loop-manager/G-051': ('published', ''),
+        })
+        self.resources = decision.used_git_resources(
+            role='worker', phase='WORKING', base_branch='develop',
+            branch=self.before.branch, worktree_key=WORKTREE)
+
+    def validate(self, after, *, role='worker', resources=True):
+        validate_agent_scope(role, Path(WORKTREE), self.before, after,
+            selected_plan_path=PLAN, resources=self.resources if resources else None)
+
+    def test_independent_refs_and_worktrees_do_not_change_audit_snapshots(self):
+        after = replace(self.before,
+            refs={**self.before.refs, 'refs/tags/new': ('other', ''), 'refs/heads/unused': ('other', '')},
+            worktrees={**self.before.worktrees, '/source': ('HEAD=changed', 'state=dirty'),
+                       '/other': ('HEAD=changed',)})
+        self.validate(after)
+        first, second = decision.scoped_metadata(self.before, after, self.resources)
+        self.assertEqual(first.refs, second.refs)
+        self.assertIn('refs/tags/new', after.refs)
+        self.assertIn('/other', after.worktrees)
+        with self.assertRaises(AgentScopeError):
+            self.validate(after, resources=False)
+
+    def test_each_used_ref_registration_operation_and_unknown_config_remains_protected(self):
+        cases = [replace(self.before, refs={**self.before.refs, ref: ('unexpected', '')})
+                 for ref in self.resources.refs]
+        cases += [replace(self.before, worktrees={}),
+                  replace(self.before, operations={'MERGE_HEAD': 'new'}),
+                  replace(self.before, config={'local:unknown.option': ('new',)})]
+        for after in cases:
+            with self.subTest(after=after), self.assertRaises(AgentScopeError):
+                self.validate(after)
+
+    def test_allowance_does_not_expand_worker_paths_or_reviewer_contract(self):
+        allowed = replace(self.before, dirty={'app.py': (('unstaged',), 'new')})
+        self.validate(allowed)
+        with self.assertRaises(AgentScopeError):
+            self.validate(allowed, role='reviewer')
+        for after in (replace(self.before, dirty={'AGENTS.md': (('unstaged',), 'new')}),
+                      replace(self.before, index={'AGENTS.md': ('H oid 0',)}),
+                      replace(self.before, index={'app.py': ('h oid 0',)})):
+            with self.subTest(after=after), self.assertRaises(AgentScopeError):
+                self.validate(after)
+
+    def test_only_known_unrelated_branch_config_is_excluded(self):
+        self.validate(replace(self.before, config={'local:branch.unused.remote': ('new',)}))
+        for key in ('local:branch.loop-manager/G-051.remote', 'local:remote.origin.url',
+                    'local:branch.unused.unknown', 'global:include.path', 'local:core.hooksPath'):
+            with self.subTest(key=key), self.assertRaises(AgentScopeError):
+                self.validate(replace(self.before, config={key: ('new',)}))
+
+    def test_role_stage_resources_and_legacy_serialization(self):
+        for role in ('planner', 'maintenance_planner'):
+            resources = decision.used_git_resources(role=role, phase='PLANNING',
+                base_branch='develop', branch=None, worktree_key=WORKTREE)
+            self.assertEqual(resources.refs, frozenset({'refs/remotes/origin/develop'}))
+        self.assertIsNone(decision.used_git_resources(role='worker', phase='unknown',
+            base_branch='develop', branch=self.before.branch, worktree_key=WORKTREE))
+        scoped = replace(self.before, scope_id='invocation-scope', scope_start_digest='digest')
+        restored = GitSnapshot.deserialize(scoped.serialize())
+        self.assertEqual(restored, scoped)
+        self.assertEqual((restored.scope_id, restored.scope_start_digest), ('invocation-scope', 'digest'))
+        self.assertIsNone(GitSnapshot.deserialize(self.before.serialize()).scope_id)
 
 
 if __name__ == "__main__":

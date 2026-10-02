@@ -72,6 +72,7 @@ class WorkspaceEffects:
     resume_pr_conflict_rebase: Callable[..., Any]
     git_operation_entries: Callable[..., Any] | None = None
     current_rebase_service: Callable[..., Any] | None = None
+    live_remote_branch_oid: Callable[..., Any] | None = None
 
 @dataclass(frozen=True)
 class AgentEffects:
@@ -2412,6 +2413,10 @@ class ExecutionHandlers:
         """Refresh and reconcile before any phase effect consumes its snapshot."""
 
         self.effects.state.check_context(context)
+        if context.phase is ExecutionPhase.PUBLISHING:
+            terminal = self._reconcile_terminal_publication(context)
+            if terminal is not None:
+                return terminal
         self._publish_rebased_checkpoint(context)
         latest_sha = self._fetch_latest_base()
         try:
@@ -4369,9 +4374,60 @@ class ExecutionHandlers:
     def _publication_resume(self):
         return PublicationResume(
             self.effects.publication.pr_for_branch,
-            self._checkpoint_remote_oid,
+            self.effects.workspace.live_remote_branch_oid or (
+                lambda repo, branch: manager_git_journal.live_remote_branch_oid(
+                    self.effects.workspace.git, repo, branch)),
             self.effects.workspace.git,
+            self._publication_workspace,
         )
+
+    def _reconcile_terminal_publication(self, context):
+        """Resolve a completed PR before the revision gate can rebase its head."""
+        row = self._row()
+        pr_url = str(row['pr_url'] or '') or None
+        try:
+            pr = self.effects.publication.pr_for_branch(
+                self.repo_path, context.branch, pr_url,
+            )
+            if pr is None or str(pr.get('state') or '').upper() not in {'MERGED', 'CLOSED'}:
+                return None
+            # Reuse the live observation boundary, including workspace identity,
+            # candidate tokens and a second head check across the PR query.
+            observed = self._publication_resume().observe(
+                self.repo_path, context.worktree, context.branch,
+                str(row['publication_remote_oid'] or '') or None, pr_url,
+            )
+            pr = observed.pull_request
+            if pr is None or str(pr.get('state') or '').upper() not in {'MERGED', 'CLOSED'}:
+                return None
+            if assess_publication(observed) is not PublicationNext.ATTACH_PR:
+                raise self.effects.contract.PublicationSafetyError(
+                    '종료 PR의 branch 또는 head가 관리 게시 후보와 다릅니다.'
+                )
+            reconciliation = self.effects.publication.reconcile_existing_pull_request(
+                self.repo_path, self.state_dir, self.repo, row, pr,
+            )
+            return (self._step_outcome(reconciliation) if reconciliation is not None
+                    else self._retry('종료 PR 상태를 다시 확인합니다.'))
+        except (self.effects.contract.PublicationSafetyError, self.effects.contract.WorkspaceOwnershipError) as error:
+            return self._block_final(
+                self.repo, context.worktree, str(error),
+                str(row['verify_result'] or ''),
+                reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
+            )
+
+    def _publication_workspace(self, repo, worktree, branch, expected_oid):
+        row = self._row()
+        self.effects.workspace.validate_execplan_workspace_identity(
+            self.state_dir, self.repo, self.effects.state.plan_id, branch, worktree)
+        self.effects.workspace.validate_managed_worktree(repo, worktree, branch)
+        head = self.effects.workspace.git(worktree, 'rev-parse', 'HEAD').stdout.strip()
+        if expected_oid is not None and head != expected_oid:
+            raise self.effects.contract.PublicationSafetyError('게시 관측 중 관리 HEAD가 변경됐습니다.')
+        if self._definition_snapshot is not None and (
+                row['verify_token'] != self._definition_snapshot.verify_token(str(row['validated_base_sha'] or ''), head)
+                or row['review_token'] != self._definition_snapshot.review_token(str(row['validated_base_sha'] or ''), head)):
+            raise self.effects.contract.PublicationSafetyError('게시 HEAD가 verify·Review를 통과한 후보와 다릅니다.')
 
     def publish(self, context, latest_base):
         self.effects.state.check_context(context)
@@ -4384,11 +4440,15 @@ class ExecutionHandlers:
                 self._document_guard(context, draft)
             except (document_drafts.DocumentDraftError, OSError, UnicodeError) as error:
                 return self._document_block(context, draft, error)
-        publication = self._publication_resume().observe(
-            self.repo_path, context.worktree, context.branch,
-            str(row['publication_remote_oid'] or '') or None,
-            str(row['pr_url']) if int(row['pr_conflict_recovery']) else None,
-        )
+        try:
+            publication = self._publication_resume().observe(
+                self.repo_path, context.worktree, context.branch,
+                str(row['publication_remote_oid'] or '') or None,
+                str(row['pr_url']) if int(row['pr_conflict_recovery']) else None,
+            )
+        except (self.effects.contract.PublicationSafetyError, self.effects.contract.WorkspaceOwnershipError) as error:
+            return self._block_final(self.repo, context.worktree, str(error),
+                str(row['verify_result'] or ''), reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN)
         current = (self.effects.checkpoint.get(self.repo, context.plan.plan_id)
                    if self.effects.checkpoint else None)
         if not self._owned_checkpoint_remote(
@@ -4576,10 +4636,10 @@ class ExecutionHandlers:
             )
             context = self._context()
         if int(row['pr_conflict_recovery']):
-            return self._publish_conflict_recovery(context, row)
+            return self._publish_conflict_recovery(context, row, publication.local_oid)
         return self._publish_new_pull_request(context, row)
 
-    def _publish_conflict_recovery(self, context, row):
+    def _publish_conflict_recovery(self, context, row, expected_oid):
         current_pr = self.effects.publication.pr_for_branch(self.repo_path, context.branch, str(row['pr_url'] or ''))
         if current_pr is None:
             publication_error = '게시 직전 저장된 기존 PR을 다시 조회할 수 없습니다.'
@@ -4610,8 +4670,9 @@ class ExecutionHandlers:
                 context.branch,
                 context.worktree,
                 current_pr,
+                expected_oid,
             )
-        except self.effects.contract.PublicationSafetyError as error:
+        except (self.effects.contract.PublicationSafetyError, self.effects.contract.WorkspaceOwnershipError) as error:
             publication_error = str(error)
             self._block_final(
                 self.repo,
@@ -4734,10 +4795,10 @@ class ExecutionHandlers:
                 )
                 head_oid = self.effects.publication.push_managed_publication_branch(
                     self.repo_path, self.state_dir, self.repo,
-                    context.branch, context.worktree,
+                    context.branch, context.worktree, publication.local_oid,
                 )
                 self._complete_publication_intent(context)
-        except self.effects.contract.PublicationSafetyError as error:
+        except (self.effects.contract.PublicationSafetyError, self.effects.contract.WorkspaceOwnershipError) as error:
             publication_error = str(error)
             self._block_final(
                 self.repo,
@@ -4760,31 +4821,53 @@ class ExecutionHandlers:
         if isinstance(guarded, ExecutionOutcome):
             return guarded
         context = guarded
-        after_push = self._publication_resume().observe(
-            self.repo_path, context.worktree, context.branch, head_oid,
-        )
+        try:
+            latest_base = self._fetch_latest_base()
+            after_push = self._publication_resume().observe(
+                self.repo_path, context.worktree, context.branch, head_oid,
+            )
+        except (self.effects.contract.PublicationSafetyError, self.effects.contract.WorkspaceOwnershipError) as error:
+            return self._block_final(self.repo, context.worktree, str(error),
+                str(self._row()['verify_result'] or ''), reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN)
+        if after_push.local_oid != head_oid:
+            return self._block_final(self.repo, context.worktree,
+                'PR 생성 직전 관리 HEAD가 검증한 게시 commit과 다릅니다.',
+                str(self._row()['verify_result'] or ''), reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN)
         existing_after_push = after_push.pull_request
-        current = (self.effects.checkpoint.get(self.repo, context.plan.plan_id)
-                   if self.effects.checkpoint else None)
-        if not self._owned_checkpoint_remote(
-            context, self._row(), after_push.remote_oid, current,
-            existing_after_push,
-        ):
+        if (existing_after_push is not None
+                and assess_publication(after_push) is not PublicationNext.ATTACH_PR):
             return self._block_final(
                 self.repo, context.worktree,
-                'push 뒤 checkpoint branch의 원격 OID 또는 PR 소유권을 증명할 수 없습니다.',
+                'push 뒤 PR head가 검증한 게시 commit과 다릅니다.',
                 str(self._row()['verify_result'] or ''),
                 reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
             )
-        if existing_after_push is not None:
-            if (after_push.local_oid != head_oid
-                    or assess_publication(after_push) is not PublicationNext.ATTACH_PR):
+        # GitHub's terminal PR state remains authoritative after automatic
+        # head-branch deletion and base advancement. Reconcile it before
+        # considering another rebase; active publication still needs its live ref.
+        terminal_pr = (existing_after_push is not None
+                       and str(existing_after_push.get('state') or '').upper()
+                       in {'CLOSED', 'MERGED'})
+        if not terminal_pr:
+            if latest_base != self._row()['validated_base_sha']:
+                return self._latest_before_publication(context) or self._retry('최신 base를 다시 검증합니다.')
+            if after_push.remote_oid != head_oid:
+                return self._block_final(self.repo, context.worktree,
+                    'PR 생성 직전 원격 게시 ref가 변경됐습니다.',
+                    str(self._row()['verify_result'] or ''), reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN)
+            current = (self.effects.checkpoint.get(self.repo, context.plan.plan_id)
+                       if self.effects.checkpoint else None)
+            if not self._owned_checkpoint_remote(
+                context, self._row(), after_push.remote_oid, current,
+                existing_after_push,
+            ):
                 return self._block_final(
                     self.repo, context.worktree,
-                    'push 뒤 PR head가 검증한 게시 commit과 다릅니다.',
+                    'push 뒤 checkpoint branch의 원격 OID 또는 PR 소유권을 증명할 수 없습니다.',
                     str(self._row()['verify_result'] or ''),
                     reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
                 )
+        if existing_after_push is not None:
             reconciliation = self.effects.publication.reconcile_existing_pull_request(
                 self.repo_path, self.state_dir, self.repo, self._row(),
                 existing_after_push,
@@ -4793,11 +4876,15 @@ class ExecutionHandlers:
                     else self._retry('push 뒤 기존 PR을 연결했습니다.'))
         title = f"Implement {self.plan['id']}: {self.plan['title']}"
         try:
+            self._publication_workspace(self.repo_path, context.worktree, context.branch, head_oid)
             self._publication_intent(context, 'pr_create', head_oid)
             created = self.effects.publication.command(
                 ['gh', 'pr', 'create', '--base', self.base, '--head', context.branch, '--title', title, '--body', body],
                 cwd=context.worktree,
             )
+        except (self.effects.contract.PublicationSafetyError, self.effects.contract.WorkspaceOwnershipError) as error:
+            return self._block_final(self.repo, context.worktree, str(error),
+                str(self._row()['verify_result'] or ''), reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN)
         except RuntimeError as error:
             publication_error = str(error)
             self.effects.state.update_project(

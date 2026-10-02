@@ -208,6 +208,20 @@ def matching_branch_pr_lookup(responses):
     return lookup
 
 
+def publishing_branch_pr_lookup(connection, url):
+    """Expose an existing PR throughout publication, independent of query count."""
+    def response(repo, branch, *_args, **_kwargs):
+        row = connection.execute(
+            "SELECT phase FROM projects WHERE repo = ? AND branch = ?",
+            (str(repo), branch),
+        ).fetchone()
+        if row is not None and row[0] in {'PUBLISHING', 'PR_OPEN'}:
+            return {'url': url, 'state': 'OPEN'}
+        return None
+
+    return matching_branch_pr_lookup(response)
+
+
 class PublicationFixtureTest(unittest.TestCase):
     def test_matching_pr_reads_head_only_when_queried(self):
         with mock.patch(__name__ + '.git_command', side_effect=['first', 'rebased']) as git:
@@ -4825,8 +4839,8 @@ risk: medium
             with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
                 "loop_manager.remote_base", return_value="main"
             ), mock.patch("loop_manager.ensure_safe_base_worktree"), mock.patch(
-                "loop_manager.pr_for_branch", side_effect=matching_branch_pr_lookup(
-                    [None, {"url": "https://example.test/pr/1"}]
+                "loop_manager.pr_for_branch", side_effect=publishing_branch_pr_lookup(
+                    connection, "https://example.test/pr/1"
                 )
             ), mock.patch("loop_manager.run_codex", side_effect=agent), mock.patch(
                 "loop_manager.verify", return_value=(True, "verify: PASS")
@@ -6515,7 +6529,6 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                 (False, "failure D"),
                 (True, "verify: PASS"),
             ]
-            pr_results = [None] * 5 + [{"url": "https://example.test/pr/13"}]
             with mock.patch(
                 "loop_manager.validate_repository", return_value=repo
             ), mock.patch(
@@ -6523,7 +6536,9 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
             ), mock.patch(
                 "loop_manager.ensure_safe_base_worktree"
             ), mock.patch(
-                "loop_manager.pr_for_branch", side_effect=matching_branch_pr_lookup(pr_results)
+                "loop_manager.pr_for_branch", side_effect=publishing_branch_pr_lookup(
+                    connection, "https://example.test/pr/13"
+                )
             ), mock.patch(
                 "loop_manager.run_codex", side_effect=agent
             ), mock.patch(
@@ -6817,12 +6832,9 @@ class BoundedExecutionRecoveryTest(unittest.TestCase):
                 "loop_manager.ensure_safe_base_worktree"
             ), mock.patch(
                 "loop_manager.pr_for_branch",
-                side_effect=matching_branch_pr_lookup([
-                    None,
-                    None,
-                    None,
-                    {"url": "https://example.test/pr/13"},
-                ]),
+                side_effect=publishing_branch_pr_lookup(
+                    connection, "https://example.test/pr/13"
+                ),
             ), mock.patch(
                 "loop_manager.run_codex", side_effect=agent
             ), mock.patch(
@@ -7077,11 +7089,8 @@ class ReviewDrivenWorkerProfileEscalationTest(unittest.TestCase):
                 )
             return next(responses)
 
-        pr_results: list[dict[str, str] | None] = [None] * len(reviewer_results)
-        if publish:
-            pr_results.append({"url": "https://example.test/pr/19"})
-        else:
-            pr_results.extend((None, None))
+        pr_lookup = (publishing_branch_pr_lookup(connection, "https://example.test/pr/19")
+                     if publish else lambda *_args, **_kwargs: None)
 
         with mock.patch(
             "loop_manager.validate_repository", return_value=repo
@@ -7090,7 +7099,7 @@ class ReviewDrivenWorkerProfileEscalationTest(unittest.TestCase):
         ), mock.patch(
             "loop_manager.ensure_safe_base_worktree"
         ), mock.patch(
-            "loop_manager.pr_for_branch", side_effect=matching_branch_pr_lookup(pr_results)
+            "loop_manager.pr_for_branch", side_effect=pr_lookup
         ), mock.patch(
             "loop_manager.run_codex", side_effect=agent
         ), mock.patch(
@@ -7942,8 +7951,8 @@ class WorkerPublicationTest(unittest.TestCase):
                 "loop_manager.remote_base", return_value="main"
             ), mock.patch("loop_manager.ensure_safe_base_worktree"), mock.patch(
                 "loop_manager.pr_for_branch",
-                side_effect=matching_branch_pr_lookup(
-                    [None, None, {"url": "https://example.test/pr/1"}]
+                side_effect=publishing_branch_pr_lookup(
+                    connection, "https://example.test/pr/1"
                 ),
             ), mock.patch("loop_manager.run_codex", side_effect=worker), mock.patch(
                 "loop_manager.verify",
@@ -14623,13 +14632,13 @@ class LatestBasePublicationTest(unittest.TestCase):
             with self.assertRaises(loop_manager.PublicationSafetyError):
                 loop_manager.push_managed_publication_branch(
                     connection, Path('/repo'), Path('/state'), 'repo',
-                    branch, Path('/managed'),
+                    branch, Path('/managed'), 'b' * 40,
                 )
             remote.return_value = None
             with self.assertRaises(loop_manager.PublicationSafetyError):
                 loop_manager.push_managed_publication_branch(
                     connection, Path('/repo'), Path('/state'), 'repo',
-                    branch, Path('/managed'),
+                    branch, Path('/managed'), 'b' * 40,
                 )
         self.assertFalse(any(args[0] == 'push' for args in calls))
 
@@ -14643,7 +14652,7 @@ class LatestBasePublicationTest(unittest.TestCase):
         remote_observations = iter((old, new))
 
         def git(_path, *arguments, **_kwargs):
-            if arguments[:2] == ('rev-parse', 'HEAD'):
+            if arguments[0] == 'rev-parse':
                 return subprocess.CompletedProcess(arguments, 0, new + '\n')
             if arguments[0] == 'ls-remote':
                 return subprocess.CompletedProcess(
@@ -14667,7 +14676,7 @@ class LatestBasePublicationTest(unittest.TestCase):
         ):
             result = loop_manager.push_managed_publication_branch(
                 connection, Path('/repo'), Path('/state'), 'repo',
-                branch, Path('/managed'),
+                branch, Path('/managed'), new,
             )
 
         self.assertEqual(result, new)
@@ -14678,7 +14687,7 @@ class LatestBasePublicationTest(unittest.TestCase):
         self.assertIn(f'--force-with-lease=refs/heads/{branch}:{old}', pushes[0])
         self.assertNotIn('-u', pushes[0])
         self.assertNotIn('--set-upstream', pushes[0])
-        self.assertEqual(pushes[0][-2:], ('origin', f'HEAD:refs/heads/{branch}'))
+        self.assertEqual(pushes[0][-2:], ('origin', f'{new}:refs/heads/{branch}'))
         update.assert_called_once_with(connection, 'repo', publication_remote_oid=new)
 
     def test_pr_conflict_push_preserves_config_and_exact_lease(self):
@@ -14697,7 +14706,7 @@ class LatestBasePublicationTest(unittest.TestCase):
         def git(_path, *arguments, **_kwargs):
             calls.append(arguments)
             return subprocess.CompletedProcess(arguments, 0,
-                new + '\n' if arguments[:2] == ('rev-parse', 'HEAD') else '')
+                new + '\n' if arguments[0] == 'rev-parse' else '')
 
         with (
             mock.patch('loop_manager.active_execplan', return_value=plan),
@@ -14706,14 +14715,15 @@ class LatestBasePublicationTest(unittest.TestCase):
             mock.patch('loop_manager._fetch_pr_conflict_recovery_refs'),
             mock.patch('loop_manager._recorded_base_fetch'),
             mock.patch('loop_manager.remote_branch_oid', side_effect=[old, new]),
+            mock.patch('loop_manager.pr_for_branch', return_value=pr),
             mock.patch('loop_manager.git', side_effect=git),
         ):
             self.assertEqual(loop_manager.push_owned_pr_conflict_recovery(
                 connection, Path('/repo'), Path('/state'), 'repo', branch,
-                Path('/managed'), pr), new)
+                Path('/managed'), pr, new), new)
         self.assertEqual([args for args in calls if args[0] == 'push'], [(
             'push', f'--force-with-lease=refs/heads/{branch}:{old}',
-            'origin', f'HEAD:refs/heads/{branch}')])
+            'origin', f'{new}:refs/heads/{branch}')])
         self.assertFalse(any(args[0] == 'config' for args in calls))
 
     def test_unowned_remote_branch_is_blocked_without_force_push(self):

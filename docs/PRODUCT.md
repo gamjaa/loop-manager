@@ -75,7 +75,8 @@
 - ExecPlan archive는 원본 hash, regular-file source, 비어 있는 destination과 원격 base 불변성을 검증해 fast-forward로 직접 게시하며, 후보별 충돌·원격 경쟁·push 실패는 MERGED 상태와 다른 작업·완료 처리를 막지 않는 archive pending으로 재시도한다
 - ExecPlan은 연결된 PR이 실제로 Merge된 경우에만 MERGED 상태가 된다
 - 자동 작업의 Git 기준은 최신 `origin/<base-branch>`이며 로컬 base ref, 기본 worktree 파일과 로컬 전용 commit을 입력으로 사용하지 않는다
-- Codex가 Agent turn 추적을 위해 자동 생성·갱신·정리하는 `refs/codex/turn-diffs/*`는 게시 또는 workspace 소유권에 사용하지 않는 provider 소유의 비권위 임시 ref다. 그 namespace의 순변경만으로 Agent 범위 위반이나 `PROJECT_BLOCKED`를 만들지 않으며, 소유 branch, remote ref, tag와 그 밖의 공유 ref 변경은 계속 보호한다
+- 실행별 쓰기 격리 증거가 저장된 작업 기준선·호출·역할·session·repository 및 관리 worktree와 일치할 때만 Agent Git 감시를 선택 worktree의 identity·등록·branch·HEAD·index·허용 파일, 작업 소유 branch·원격 base·게시 ref와 영향을 주는 config·operation으로 좁힌다. 무관한 ref·다른 worktree 변화는 진단에 보존하며, 사용 중인 자원의 예상 밖 변화와 영향이 불확실한 config는 차단한다. 증거가 없거나 불완전한 과거 snapshot은 기존 엄격 비교를 유지하고, 이후 사용할 자원은 사용 직전에 실제 값·소유권·기대 OID를 재검증한다
+- Codex가 Agent turn 추적을 위해 자동 생성·갱신·정리하는 `refs/codex/turn-diffs/*`는 게시 또는 workspace 소유권에 사용하지 않는 provider 소유의 비권위 임시 ref다. 그 namespace의 순변경만으로 Agent 범위 위반이나 `PROJECT_BLOCKED`를 만들지 않으며, 작업 소유 branch와 사용 중인 원격 ref는 계속 보호한다
 - Codex는 Manager가 `codex exec`로 직접 호출하며 선택 workspace의 내장 쓰기 제한과 granular 자동 승인 검토를 유지한다. Reviewer는 읽기 전용이고 테스트·verify 재실행 금지는 별도의 역할 지침으로 유지한다. Codex 프로세스 전체를 감싸는 바깥 sandbox와 중첩 sandbox 호환성은 호출 조건이 아니며, 정상 session·로그 저장을 Agent의 workspace 밖 쓰기 권한과 구분한다
 - Loop Manager는 저장 base branch의 local HEAD가 fetch된 원격 base와 같으면 dirty 상태에서도 동기화를 생략한다. behind-only이고 진행 중인 Git operation이나 비정상 index가 없으며 원격 변경 tracked 경로와 staged·unstaged·untracked·ignored 로컬 경로가 이름 또는 부모·자식 관계로 겹치지 않을 때만, 로컬 변경과 index 상태를 보존하며 기본 worktree를 safe fast-forward한다. 그 밖의 로컬 상태는 이유를 기록하고 보존한다
 - SQLite, 관리 worktree, 로그, 임시 파일과 lock은 source checkout 밖의 사용자 상태 디렉터리에 저장한다
