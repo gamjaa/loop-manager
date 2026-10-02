@@ -32,7 +32,7 @@ from loop_manager_internal.planning.planning_runtime import (
     choose_planning_decision,
 )
 from loop_manager_internal.storage.runtime_state import PlanningSnapshot
-from loop_manager_internal.maintenance import full_assessment
+from loop_manager_internal.maintenance import maintenance_file_inventory
 
 
 from tests.support.planning_case import (
@@ -41,6 +41,35 @@ from tests.support.planning_case import (
 )
 
 class PlanningAssessmentTest(PlanningCase):
+    def test_corrupt_saved_assessment_stops_before_agent_invocation(self):
+        revision = "a" * 40
+        ports = FakePorts(
+            planning_snapshot(phase="PLANNING", active_sha=revision),
+            maintenance_cycle(
+                phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+                cycle_base_sha=revision, revision=4,
+                full_assessment_result='{"source_revision":"tampered"}',
+            ),
+        )
+        ports.validation.maintenance_prompt = mock.Mock(return_value="legacy prompt")
+        ports.git.head = revision
+        ports.assessment = mock.Mock()
+        ports.assessment.inventory.return_value = {"module.py": "b" * 64}
+        ports.assessment.prompt.side_effect = maintenance_file_inventory.AssessmentError(
+            "저장된 보고서가 현재 source와 다릅니다."
+        )
+        coordinator = PlanningLifecycleCoordinator(ports)
+        run = coordinator._new_run(replace(self.context, self_repository=True))
+        run.planning_worktree = Path("/worktree")
+        run.maintenance_context = object()
+
+        outcome = coordinator._assessment._run_planner_turn(run)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.VALIDATION_RETRY)
+        self.assertEqual(ports.agent.run_count, 0)
+        self.assertEqual(ports.state.snapshot.planning_retry_count, 1)
+        self.assertEqual(ports.state.snapshot.planning_result_pending_validation, 0)
+
     def test_assessment_port_rejects_invalid_report_without_completing_cycle(self):
         revision = "a" * 40
         cycle = maintenance_cycle(
@@ -55,7 +84,7 @@ class PlanningAssessmentTest(PlanningCase):
         ports.validation.validate_maintenance_result = mock.Mock(return_value=None)
         ports.assessment = mock.Mock()
         ports.assessment.inventory.return_value = {"docs/PRODUCT.md": "hash"}
-        ports.assessment.validate.side_effect = full_assessment.FullAssessmentError(
+        ports.assessment.validate.side_effect = maintenance_file_inventory.AssessmentError(
             "invalid report"
         )
         coordinator = PlanningLifecycleCoordinator(ports)
@@ -410,7 +439,7 @@ class PlanningAssessmentTest(PlanningCase):
         run = coordinator._new_run(replace(self.context, self_repository=True))
         run.planning_worktree = Path("/planning")
         run.maintenance_context = object()
-        with mock.patch("loop_manager_internal.planning.assessment_port.full_assessment.source_inventory",
+        with mock.patch("loop_manager_internal.planning.assessment_port.maintenance_file_inventory.source_inventory",
                         return_value={"docs/PRODUCT.md": "hash"}):
             outcome = coordinator._assessment._validate_planner_result(run)
         self.assertEqual(outcome.kind, PlanningOutcomeKind.VALIDATION_RETRY)
@@ -444,7 +473,7 @@ class PlanningAssessmentTest(PlanningCase):
         run = coordinator._new_run(replace(self.context, self_repository=True))
         run.planning_worktree = Path("/planning")
         run.maintenance_context = object()
-        with mock.patch("loop_manager_internal.planning.assessment_port.full_assessment.source_inventory",
+        with mock.patch("loop_manager_internal.planning.assessment_port.maintenance_file_inventory.source_inventory",
                         return_value={"module.py": "b" * 64}):
             outcome = coordinator._assessment._validate_planner_result(run)
         self.assertEqual(outcome.kind, PlanningOutcomeKind.VALIDATION_RETRY)

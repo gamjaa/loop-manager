@@ -50,10 +50,10 @@ priority: critical
 
 ## Progress
 
-- [ ] G-060 발견·경로·테스트 대응표를 최종 구현과 대조
-- [ ] 상시 유지보수 평가 경계로 통합하고 legacy/pending cycle 보존
-- [ ] `full_assessment.py` 및 확인된 임시 코드/참조 제거
-- [ ] targeted unit test와 정적 참조·수집 집합 확인
+- [x] G-060 발견·경로·테스트 대응표를 현재 구현과 대조 (아래 기록 및 G-060 Implementation)
+- [x] 상시 유지보수 평가 경계로 통합하고 legacy/pending cycle 보존
+- [x] `full_assessment.py` 및 확인된 runtime/test/verify 참조 제거
+- [x] targeted unit test와 정적 참조·수집 집합 확인
 - [ ] Manager 전체 verify, 독립 Review 및 모든 관련 사용자 Merge
 
 ## Decision Log
@@ -63,3 +63,7 @@ priority: critical
 - 이 마지막 계획은 잔여 범위 확인과 정리를 담당하며 검증·Review·Merge를 대신하지 않는다. 원래 요청과 무관한 기능·정책은 추가하지 않는다.
 
 - 2026-10-02 사용자 결정: 기존 다른 미착수 작업보다 리팩터링을 먼저 진행하도록 priority를 `critical`로 지정한다. 리팩터링 내부의 선행 Merge 의존성과 검증·Review·사용자 Merge 조건은 유지한다.
+
+- 2026-10-02 구현 대조: 기준 HEAD `0795a1a90c289d174b1e7ca55d4fab7f993a14d8`와 작업 tree를 조사했다. 추적 루트 13개는 G-060의 유지 근거와 일치하며 새 루트 항목은 없다. `.git`은 worktree 제어 경로, 읽기 전용 `.aws/`·`.codex/`와 파생 `__pycache__/`는 소유권·이동 근거가 없으므로 건드리지 않았다. 작업 tree의 Python source 396개 중 두 verify가 runtime/package 198개를 같은 목록으로 compile한다. TestCase 이름 중복은 없었고 실제 test module은 167개다. 숫자는 coverage나 전체 verify 통과를 뜻하지 않는다.
+- 제거 전 `full_assessment.py`의 마지막 대응: `source_inventory` → `maintenance_file_inventory.source_inventory` (기존 report의 경로·SHA256 계약), `inventory_prompt`·`assessment_prompt` → `maintenance_planning`, `parse_assessment_result` → `maintenance_validation`, `FullAssessmentError` → `maintenance_file_inventory.AssessmentError`, `RESULT_PREFIX` → `maintenance_validation.RESULT_PREFIX`. 소비자는 `planning/assessment_port.py` → `assessment_service.py`와 `tests/test_maintenance_planning.py`·`tests/test_planning_assessment.py`였고 두 verify의 compile 참조를 제거했다. 저장 report는 `maintenance_cycles.full_assessment_result`와 `documents/document_drafts.py`가 계속 읽으며 schema·완료 marker·감사 자료는 유지한다.
+- 저장 report reader는 같은 revision의 현재 inventory와 각 finding의 source hash를 검증한 뒤 기존 JSON 형식으로 prompt에 전달한다. 과거 `G-051` resolved finding은 계속 읽히지만 신규 평가에는 강제하지 않는다. 오류가 있으면 Planner를 호출하지 않고 기존 bounded validation retry를 사용한다. 기존 prerequisite/refactoring/revalidation, publication과 문서 후보 handoff 코드는 변경하지 않았으며 관련 좁은 회귀 test로 재개·drift·완료 marker를 확인했다. 요청한 R-028은 내용 변경 없이 archive로 이동했다.
