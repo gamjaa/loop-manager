@@ -222,7 +222,8 @@ class BlockedPlanRemoteRefreshTests(BlockedRemoteFixture, unittest.TestCase):
             mock.patch.object(loop_manager, 'validate_managed_worktree'),
             mock.patch.object(loop_manager, 'github_repository', return_value='example/repo'),
             mock.patch.object(loop_manager, '_BlockedCheckpointAdapter', return_value=adapter),
-            mock.patch.object(loop_manager, '_nul_git_paths', return_value=[]),
+            # Both facade callers and the extracted observation service use this Git port.
+            mock.patch.object(loop_manager, 'git_bytes', return_value=b''),
             mock.patch.object(loop_manager, '_blocked_execplan_revision_metadata_error', return_value=None),
             mock.patch.object(loop_manager, '_published_plan_allows_common_plans', return_value=False),
             mock.patch.object(loop_manager, '_proven_manager_base_refs', return_value=frozenset()),

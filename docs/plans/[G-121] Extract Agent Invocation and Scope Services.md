@@ -68,3 +68,7 @@ priority: critical
 - 최초 scope fixture에 관리 worktree 등록이 없어 42-case 명령이 ERROR였다. 등록을 보강하고 같은 명령을 재실행해 42개 PASS, repository probe 추가 뒤 같은 명령으로 43개 PASS를 확인했다. 72-case 명령은 공유 JSON decoder에서 Claude malformed-text diagnostic tail을 누락해 FAIL이었다. decode 성공 여부와 진단을 복원한 뒤 같은 명령으로 72개 PASS를 확인했다. command별 최초 결과와 동일 명령 재실행은 최종 `TARGETED_TESTS`에 보고한다.
 
 - baseline tree capture/restore의 직접 unit test 2개를 추가했다. 임시 index·content hash, 고정 author/date, 보존 ref/tree 확인, stage-0 및 기존 index flags 복원, 최종 local snapshot 불일치 거부를 검증한다. 첫 2-case 실행은 fixture가 기존 구현에 없는 GIT_CONFIG_GLOBAL 값을 가정해 ERROR였으며, 기존 deterministic author/date 계약으로 교정하고 동일 명령 재실행에서 2개 PASS를 확인했다.
+
+- 2026-10-02 Manager verify 피드백 수정: 원격 채택/Worker 재개 테스트의 `_nul_git_paths` mock은 분리된 관측 service에 적용되지 않아 가짜 worktree에 실제 Git 명령을 호출했다. facade와 관측 service가 함께 사용하는 `git_bytes` port를 mock하도록 바꿨다. handoff 테스트의 환경 mock도 provider adapter가 참조하는 위치로 옮겼다. 무단 HEAD·ref·config 변경 거부, 원본 Agent 감사 보존, handoff 후 process 시작 금지 assertion은 그대로 유지했다.
+- 피드백의 세 scope case만 실행한 최초 결과는 ERROR 3개였으며 같은 명령 재실행에서 3개 PASS였다. 저장된 Manager 진단에서 생략된 handoff case를 확인하고 해당 case만 실행한 최초 결과는 FAIL 1개였으며 같은 명령 재실행에서 1개 PASS였다. 이번 교정에서는 이 네 unit case만 실행했다. 전체 verify는 Worker가 실행하지 않았으며 Manager 재검증·독립 Review·사용자 Merge는 계속 대기 중이다.
+- Worker 결과 형식 재검증: 마지막에 쓴 “재실행 실패 없음” 문구가 결과 parser에서 새 실패 기록으로 해석됐다. 기존 계약 테스트에도 이 모호한 형식을 거부하는 case가 있어 parser를 수정하지 않고, 각 최초 결과와 동일 명령 재실행 뒤 명확한 PASS만 기록하도록 보고를 교정했다. 같은 세 scope case와 한 handoff case를 다시 실행해 각각 3개·1개 PASS를 확인했다.

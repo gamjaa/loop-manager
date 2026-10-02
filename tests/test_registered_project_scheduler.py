@@ -132,7 +132,8 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
                 with mock.patch(
                     "loop_manager.role", return_value=("model", "medium"),
                 ), mock.patch(
-                    "loop_manager.agent_environment", side_effect=wait_before_launch,
+                    "loop_manager_internal.agents.provider_adapters.agent_environment",
+                    side_effect=wait_before_launch,
                 ), (
                     mock.patch(
                         "loop_manager._handoff_popen", side_effect=wait_before_launch,
