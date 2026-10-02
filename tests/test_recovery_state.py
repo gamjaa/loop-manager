@@ -13,7 +13,7 @@ from loop_manager_internal.storage.recovery_state import (
     pending_review_correction, reserve_review_correction, start_review_correction,
 )
 from loop_manager_internal.recovery.recovery_dispatcher import RecoveryDispatcher
-from tests import test_runtime_state
+from tests.support.database import runtime_connection
 
 
 class RecoveryRepositoryTests(unittest.TestCase):
@@ -315,7 +315,7 @@ class RecoveryRepositoryTests(unittest.TestCase):
         self.assertEqual(row, (1, 0))
 
     def test_validation_success_resets_only_its_correction_streak(self):
-        connection = test_runtime_state.RuntimeStateRepositoryTest()._connection()
+        connection = runtime_connection()
         self.addCleanup(connection.close)
         runtime_state.RuntimeStateRepository(connection).activate(
             'repo', 'G-047', activation_sha='base',

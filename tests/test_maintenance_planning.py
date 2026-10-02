@@ -1,3 +1,4 @@
+from tests.support.catalog import plan_text
 import hashlib
 import json
 import sqlite3
@@ -290,65 +291,6 @@ class ApprovedDocumentPlanTest(unittest.TestCase):
             "DOCUMENT_MEANING: PASS\nDOCUMENT_MEANING: UNCERTAIN\n"
             "DOCUMENT_DIFF: PASS\nVERDICT: PASS",
         ))
-
-
-def plan_text(
-    plan_id: str,
-    title: str,
-    *,
-    depends_on: tuple[str, ...] = (),
-    priority: str = "normal",
-    purpose: str = (
-        "A concrete structural responsibility problem crosses the module boundary. "
-        "Preserve user behavior, the public contract, and storage format."
-    ),
-    acceptance_criteria: str = (
-        "Preserve user behavior, the public API contract, and storage format "
-        "for `legacy/module.py`."
-    ),
-    implementation: str = "Separate the responsibility into a testable module boundary.",
-) -> str:
-    dependencies = "depends_on: []"
-    if depends_on:
-        dependencies = "depends_on:\n" + "\n".join(
-            f"  - {dependency}" for dependency in depends_on
-        )
-    return f"""---
-id: {plan_id}
-title: {title}
-sources:
-  - docs/PRODUCT.md
-{dependencies}
-complexity: low
-risk: low
-priority: {priority}
----
-
-## Purpose
-
-{purpose}
-
-## Acceptance Criteria
-
-{acceptance_criteria}
-
-## Implementation
-
-{implementation}
-
-## Validation
-
-- Run the targeted unit test for this responsibility boundary.
-- The full verify must preserve existing behavior.
-
-## Progress
-
-- [ ] Pending
-
-## Decision Log
-
-- Keep the change structural.
-"""
 
 
 class FullAssessmentEvidenceTest(unittest.TestCase):
@@ -1496,7 +1438,7 @@ class MaintenancePlanningTest(unittest.TestCase):
             "entry_points": [], "public_symbols": [],
             "direct_references": [], "related_tests": [],
         })) for source in inventory.sources)
-        from tests.test_maintenance_file_review import root_results_for
+        from tests.support.maintenance import root_results_for
         evidence = maintenance_file_publication.AssessmentEvidence(
             inventory, reviewed, maps, 1,
             root_results_for(self.repo, inventory),
@@ -1950,7 +1892,7 @@ class MaintenancePlanningTest(unittest.TestCase):
             "entry_points": [], "public_symbols": [],
             "direct_references": [], "related_tests": [],
         })) for source in inventory.sources)
-        from tests.test_maintenance_file_review import root_results_for
+        from tests.support.maintenance import root_results_for
         evidence = maintenance_file_publication.AssessmentEvidence(
             inventory, reviewed, maps, 1,
             root_results_for(self.repo, inventory),
@@ -2560,7 +2502,6 @@ class ReconciledPlanLinkTest(unittest.TestCase):
                                    "reason": "There is no issue requiring any refactoring."}], "relations": []}):
             with self.subTest(reason=reason), self.assertRaises(maintenance_reconciliation.ReconciliationError):
                 parse({**no_issue, "no_issue_reason": reason}, {}, ())
-
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ from pathlib import Path
 from contextlib import ExitStack
 from dataclasses import replace
 from loop_manager_internal.git.managed_rebase_validation import FileChange, IndexEntry
-from tests.test_execution_handlers import current_rebase_case
+from tests.support.current_rebase import current_rebase_case
 import sqlite3
 import tempfile
 from types import SimpleNamespace
@@ -1092,13 +1092,12 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
                 case.checkpoint.get('repo', 'G-047'), checkpoint, None, case.observed.head))
 
 
-
 class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
     """The production factory's identity/input adapters, with no Git process."""
     def test_archive_contract_uses_original_base_only_before_rebase(self):
         from loop_manager_internal.catalog import requirement_archive
         from loop_manager_internal.git.managed_rebase_runtime import build_service
-        from tests.test_runtime_state import CurrentRebaseRuntimeTests
+        from tests.support.runtime import runtime_rebase_fixture
         source = 'docs/requirements/old.md'
         archived = 'docs/requirements/archive/old.md'
         original_tree = {source.encode(): (b'blob', b'original')}
@@ -1113,9 +1112,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
         )
         for head, metadata, index, ancestry, allowed in cases:
             with self.subTest(head=head, metadata=metadata, index=index, ancestry=ancestry):
-                fixture = CurrentRebaseRuntimeTests()
-                connection, *_ = fixture.fixture()
-                self.addCleanup(fixture.doCleanups)
+                connection, *_ = runtime_rebase_fixture(self)
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
                     (root / archived).parent.mkdir(parents=True)
@@ -1154,7 +1151,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
                         service = build()
                         ports.requirement_archive_move_set.assert_called_once_with(
                             Path('/repo'), 'common', Path('/owned'))
-                        from tests.test_managed_rebase_validation import observation
+                        from tests.support.rebase_observations import observation
                         from loop_manager_internal.git.managed_rebase_validation import FileChange
                         def archived_change(oid):
                             return observation(service.expected, committed=(FileChange(
@@ -1172,12 +1169,10 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
                             Path('/repo'), 'base', Path('/owned'))
 
     def test_factory_uses_current_inputs_exact_lease_and_final_scope(self):
-        from tests.test_runtime_state import CurrentRebaseRuntimeTests
+        from tests.support.runtime import runtime_rebase_fixture
         from loop_manager_internal.git.managed_rebase_runtime import build_service
-        from tests.test_managed_rebase_validation import observation
-        fixture = CurrentRebaseRuntimeTests()
-        connection, runtime, checkpoints, original, expected, decision = fixture.fixture()
-        self.addCleanup(fixture.doCleanups)
+        from tests.support.rebase_observations import observation
+        connection, runtime, checkpoints, original, expected, decision = runtime_rebase_fixture(self)
         ports = mock.Mock()
         ports.WORKSPACE_OWNED = 1
         ports.git.side_effect = lambda _root, *args, **kwargs: SimpleNamespace(
@@ -1211,10 +1206,8 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(ports.mock_calls, [])
 
     def test_lifecycle_factory_binds_selected_repository_identity_and_options(self):
-        from tests.test_runtime_state import CurrentRebaseRuntimeTests
-        fixture = CurrentRebaseRuntimeTests()
-        connection, runtime, *_ = fixture.fixture()
-        self.addCleanup(fixture.doCleanups)
+        from tests.support.runtime import runtime_rebase_fixture
+        connection, runtime, *_ = runtime_rebase_fixture(self)
         handler = loop_manager._ExecutionLifecyclePorts(
             connection, runtime, repo='repo', repo_path=Path('/repo'),
             state_dir=Path('/state'), base='main', base_sha='base',

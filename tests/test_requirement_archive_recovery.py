@@ -12,7 +12,7 @@ from loop_manager_internal.catalog.requirement_archive_recovery import (
     ArchiveRecoveryPorts, ArchiveRecoveryService,
 )
 from loop_manager_internal.recovery.recovery_runtime import RecoveryAction, RecoveryDisposition
-from tests import test_runtime_state
+from tests.support.database import runtime_connection
 
 
 class ArchiveRecoveryServiceTests(unittest.TestCase):
@@ -146,7 +146,7 @@ class ArchiveRecoveryServiceTests(unittest.TestCase):
         self.repository.put.assert_not_called()
 
     def test_real_repository_pauses_race_without_touching_execution(self):
-        connection = test_runtime_state.RuntimeStateRepositoryTest()._connection()
+        connection = runtime_connection()
         self.addCleanup(connection.close)
         runtime = runtime_state.RuntimeStateRepository(connection)
         runtime.activate(

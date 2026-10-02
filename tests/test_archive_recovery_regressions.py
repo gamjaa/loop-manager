@@ -13,7 +13,7 @@ from loop_manager_internal.catalog import execplan_catalog
 from loop_manager_internal.storage import execplan_catalog_state
 import loop_manager
 from loop_manager_internal.storage import runtime_state
-from tests.test_execplan_catalog_state import archived_entry
+from tests.support.catalog import archived_entry
 
 
 class ArchiveRecoveryRegressionTest(unittest.TestCase):

@@ -7,8 +7,8 @@ from loop_manager_internal.storage.execution_checkpoint_state import (
     CheckpointRace, ExecutionCheckpointRepository,
 )
 from loop_manager_internal.storage import runtime_state
-from tests import test_runtime_state
-from tests.test_managed_rebase_validation import decision_for, expectation, observation
+from tests.support.database import runtime_connection
+from tests.support.rebase_observations import decision_for, expectation, observation
 
 
 class CheckpointRepositoryTests(unittest.TestCase):
@@ -85,7 +85,7 @@ class CheckpointRepositoryTests(unittest.TestCase):
         ).completed_rebase())
 
     def test_rebase_completion_rolls_back_checkpoint_when_projection_fails(self):
-        connection = test_runtime_state.RuntimeStateRepositoryTest()._connection()
+        connection = runtime_connection()
         self.addCleanup(connection.close)
         runtime = runtime_state.RuntimeStateRepository(connection)
         runtime.activate('repo', 'G-047', activation_sha='old-base',
@@ -116,7 +116,7 @@ class CheckpointRepositoryTests(unittest.TestCase):
         self.assertEqual(runtime.projected('repo'), original)
 
     def test_rebase_completion_updates_checkpoint_and_projection_once(self):
-        connection = test_runtime_state.RuntimeStateRepositoryTest()._connection()
+        connection = runtime_connection()
         self.addCleanup(connection.close)
         runtime = runtime_state.RuntimeStateRepository(connection)
         runtime.activate('repo', 'G-047', activation_sha='old-base',
@@ -204,7 +204,7 @@ class CheckpointRepositoryTests(unittest.TestCase):
         self.assertIsNone(completed.operation)
 
     def test_runtime_correction_preserves_sessions_and_rejects_stale_row(self):
-        connection = test_runtime_state.RuntimeStateRepositoryTest()._connection()
+        connection = runtime_connection()
         self.addCleanup(connection.close)
         repository = runtime_state.RuntimeStateRepository(connection)
         repository.activate('repo', 'G-047', activation_sha='old-base',
@@ -237,7 +237,7 @@ class CheckpointRepositoryTests(unittest.TestCase):
             )
 
     def test_catalog_generation_change_rejects_old_checkpoint_correction(self):
-        connection = test_runtime_state.RuntimeStateRepositoryTest()._connection()
+        connection = runtime_connection()
         self.addCleanup(connection.close)
         repository = runtime_state.RuntimeStateRepository(connection)
         repository.activate('repo', 'G-047', activation_sha='base',
@@ -267,7 +267,7 @@ class CheckpointRepositoryTests(unittest.TestCase):
 class RebasePublicationRepositoryTests(unittest.TestCase):
     def setUp(self):
         from loop_manager_internal.execution.execution_state import ExecutionStatePort
-        self.connection = test_runtime_state.RuntimeStateRepositoryTest()._connection()
+        self.connection = runtime_connection()
         self.addCleanup(self.connection.close)
         self.runtime = runtime_state.RuntimeStateRepository(self.connection)
         self.runtime.activate('repo', 'G-047', activation_sha='base',
