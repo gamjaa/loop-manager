@@ -34,7 +34,7 @@ priority: critical
 5. 최신 원격 catalog와 대상 상태·소유권으로 planning 권한을 재검증한다. ID 충돌·동시 계획 개정은 같은 Planner 세션에 필요한 교정만 전달한다. maintenance mode·cycle 및 source-bound 파일 검토 근거를 검증하고 최신 입력에 유효한 근거만 유지한다.
 6. 변경된 문서의 내용 identity와 현재 작업의 관련성을 판단하는 좁은 경계를 둔다. Planner의 관련 근거·의존성 변경과 Worker·Reviewer의 현재 ExecPlan 변경을 구분하고, 무관한 문서 변경은 추가 확인 호출을 만들지 않는다. 현재 계획의 변경된 승인·dependency 조건은 기존 gate에 전달한다.
 7. 후보 변경에 필요한 targeted test·전체 verify·Review 무효화와 재실행을 기존 실행 단계에 연결한다. PR Merge·Close 및 이미 게시된 planning 결과를 먼저 확인해 종료 작업을 재개하지 않는다. 게시 경쟁·fetch 실패는 기존 일시 재시도 경계를 사용한다.
-8. PRODUCT의 장기 규칙과 ARCHITECTURE의 planning 폐기·재시작 경로를 구현 결과에 맞게 반영한다. ARCHITECTURE 갱신은 사용자가 승인한 R-051의 목표 설계와 기존 책임 경계를 대조하는 명세 작성 범위로 수행하며, 비호환 schema·권한 확대 등 별도 승인 변경은 포함하지 않는다.
+8. PRODUCT의 장기 규칙을 구현 결과에 맞게 반영한다. ARCHITECTURE의 planning 폐기·재시작 경로는 사용자가 정확한 diff를 승인해 별도 문서 commit으로 반영했다. Worker는 ARCHITECTURE.md를 직접 수정하지 않고 승인된 설계를 기준으로 구현·검증을 이어간다. 추가 설계 변경이 필요하면 diff와 사유를 Decision Log에 기록해 사용자 결정을 받으며, 비호환 schema·권한 확대 등 별도 승인 변경은 포함하지 않는다.
 
 ## Validation
 
@@ -58,3 +58,5 @@ priority: critical
 - 2026-10-02: 사용자는 R-051과 이 G-118 구현 계획의 main 게시 및 중단된 Manager 작업 재개를 승인했다. 이는 계획 게시와 운영 재개 승인이고 구현 PR의 자동 Merge 승인이 아니다.
 - 2026-10-02: 현재 catalog의 마지막 예약 번호 G-117 뒤에 G-119~G-127이 게시돼 연속 ID 검사에서 중단됐다. R-051의 실제 구현 범위를 G-118로 정의해 누락을 해소한다. 기존 계획의 ID·본문·dependency는 변경하지 않는다.
 - 새로운 운영상 장애의 안전한 복구를 우선해 priority를 critical로 둔다. 다른 계획과 충돌하는 코드·테스트 추출은 본 작업에 필요한 책임 경계로 제한한다.
+
+- 2026-10-02: 사용자가 G-118의 ARCHITECTURE diff를 확인하고 반영을 승인했다. 이 정확한 문서 변경은 별도 사용자 결정 commit으로 게시하며 Worker는 해당 문서를 다시 수정하지 않는다. 기존 작업물·session과 범위 검사, Manager 전체 verify·Review 및 사용자 Merge 조건을 유지한다.

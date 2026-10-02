@@ -161,10 +161,10 @@ ExecPlan 하나의 실행 흐름은 다음과 같다.
 4. 프로그램이 Planner 변경을 새 계획, snapshot에 결합된 개정·rename·삭제와 선택적인 `docs/FUTURE_IDEAS.md` 변경으로 분리한다. snapshot 밖 기존 계획과 그 밖의 파일 변경은 거부하고, 적용 후 전체 활성 catalog의 ID·경로, sources와 dependency graph를 검증한다. 삭제 ID는 취소 감사 대상으로 예약하며 참조 dependency가 같은 batch에서 모두 해소되지 않으면 거부한다
 5. 검증에 실패하면 오류를 같은 Planner 세션에 전달하고 최대 3회까지 수정과 재검증을 수행한다
 6. 계속 실패하면 원인과 두 계획 입력 지문을 프로젝트의 `planning_error`에 저장하고 planning worktree와 세션을 보존한 뒤 처리를 중단한다
-7. 같은 실패 지문에서는 Planner를 다시 실행하지 않는다. 입력 지문이 바뀌면 검증 오류와 diff를 로그에 보존하고, 소유권을 확인한 이전 planning worktree를 제거한 뒤 `planning_error`를 지우고 최신 지문의 planning worktree에서 다시 시작한다
+7. 같은 실패 지문에서는 Planner를 다시 실행하지 않는다. 원격 입력이 전진하면 검증 오류와 diff·session을 보존하고 소유 planning worktree에서 최신 base를 반영한다. `planning_error`는 재검증으로 원인이 해소된 뒤에만 지운다
 8. 계획과 `docs/FUTURE_IDEAS.md` 변경이 모두 없으면 `planning_error`를 지우고 명세·전체 계획 입력 지문을 저장한 뒤 planning worktree를 제거한다
 9. 유효한 생성·개정·rename·삭제와 `docs/FUTURE_IDEAS.md` 변경을 planning worktree에서 하나의 planning commit으로 만든다. FUTURE_IDEAS만 변경된 결과는 ExecPlan 실행 상태를 만들지 않는다
-10. `git fetch` 후 `origin/<base-branch>`가 planning worktree의 시작 commit과 다르거나 대상 READY snapshot의 상태·소유권·revision이 달라졌으면 계획 commit을 게시하지 않고 planning worktree를 정리한 뒤 최신 기준으로 다시 계획한다
+10. `git fetch` 후 원격 base가 전진했으면 staged·unstaged·untracked 결과를 보존해 detached planning worktree에서 반영한다. 시작 revision의 READY 원본은 Git blob과 SQLite 권한으로 복원하고 작성 결과는 별도 변경으로 검증한다. 최신 catalog와 대상 상태·소유권·revision이 충돌하면 기존 Planner 세션에 필요한 교정만 전달하며 과거 snapshot 권한으로 덮어쓰지 않는다
 11. 기준과 snapshot이 그대로면 planning commit과 적용 manifest를 publication intent로 SQLite에 저장한 뒤 `origin/<base-branch>`에 fast-forward push한다. force push는 사용하지 않는다
 12. push된 commit을 원격에서 확인한 뒤에만 생성 row 등록, 개정 row cache 교체, 삭제 row 제거와 ID 취소 감사 기록, 성공 지문 및 planning 상태 정리를 하나의 SQLite transaction으로 적용한다. push 후 transaction 전에 중단되면 intent와 원격 commit을 검증해 같은 batch를 멱등하게 복구한다
 13. planning worktree를 제거하고, 다음 안전한 선택에서 갱신된 전체 catalog의 모든 `depends_on`이 MERGED인 READY 중 priority가 가장 높은 계획을 선택하며 같은 priority에서는 숫자 ID가 가장 작은 계획을 선택한다
@@ -182,6 +182,8 @@ ExecPlan 하나의 실행 흐름은 다음과 같다.
 ExecPlan 파일은 구현 PR에 처음 포함하지 않는다. Planner 단계에서 먼저 base branch에 게시되며, 각 구현 branch는 해당 ExecPlan이 포함된 원격 기준에서 시작한다.
 
 사용자가 BLOCKED의 근거 PRODUCT/Requirement를 기본 branch에서 수정한 경우 변경을 commit하고 push해야 한다. Loop Manager는 변경된 `origin/<base-branch>`를 관리 branch에 rebase한 뒤 재개한다. rebase는 관리 worktree에서만 수행하며, 등록 프로젝트 동기화가 별도로 safe fast-forward 조건을 만족하지 않는 한 기본 worktree의 파일, index와 HEAD는 바꾸지 않는다. 사용자는 안내된 관리 worktree의 ExecPlan을 직접 수정할 수도 있다.
+
+원격 관측은 Agent·verify가 worktree를 사용하는 동안 파일을 바꾸지 않고 다음 안전한 경계에서 적용한다. planning rebase는 작업물과 stash를 보존한 채 Git 상태를 복구하고 새 base를 SQLite에 기록한 뒤 보존 stash를 정리한다. 관련 문서 판별은 Planner의 현재 계획 sources·dependency 및 활성 평가 입력, Worker·Reviewer의 현재 ExecPlan 내용에 한정한다. 후보 HEAD가 바뀐 실행은 기존 검증·Review 증거를 무효화하고 최종 후보에서 다시 통과한다. 게시 직전 다시 원격을 확인하며 planning은 fast-forward, 구현은 기존 lease·PR·checkpoint 정책을 따른다.
 
 ## 동시 실행
 
