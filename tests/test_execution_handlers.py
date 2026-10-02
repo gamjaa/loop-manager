@@ -7301,6 +7301,43 @@ class TaskRelevantPublicationBoundaryTests(TestCase):
         self.assertEqual(pr['state'], 'MERGED')
         self.effects.blocking.block_active_execplan.assert_not_called()
 
+    def test_post_push_terminal_pr_precedes_real_publication_guard_refresh(self):
+        for state, head, accepted, kind in (
+            ('MERGED', 'base', True, ExecutionOutcomeKind.SUCCESS),
+            ('CLOSED', 'base', True, ExecutionOutcomeKind.FINAL_BLOCK),
+            ('MERGED', 'other-head', False, ExecutionOutcomeKind.FINAL_BLOCK),
+        ):
+            with self.subTest(state=state, head=head):
+                case = ExecutionHandlerTests(methodName='runTest')
+                case.setUp()
+                self.addCleanup(case.doCleanups)
+                case.review_context()
+                snapshot = case.handler._definition_snapshot
+                case.state.update_project(
+                    'repo', phase='PUBLISHING', definition_snapshot=snapshot.serialize(),
+                    review_result='PASS', review_token=snapshot.review_token('base', 'base'),
+                )
+                case.handler._fetch_latest_base = mock.Mock(side_effect=lambda:
+                    'merged-base' if 'push' in case.calls else 'base')
+                case.effects.revision.reconcile_catalog.side_effect = lambda *_: SimpleNamespace(
+                    kind=SimpleNamespace(value='reconciled'),
+                    revision_sha='merged-base' if 'push' in case.calls else 'base')
+                case.effects.publication.reconcile_existing_pull_request.side_effect = (
+                    lambda *_: 1 if state == 'CLOSED' else 0)
+                with mock.patch.object(case.handler, 'guard', wraps=case.handler.guard) as guard, \
+                     mock.patch.object(case.handler, '_refresh_revision_base',
+                                       wraps=case.handler._refresh_revision_base) as refresh, \
+                     mock.patch.object(case.handler, '_publish_rebased_checkpoint',
+                                       wraps=case.handler._publish_rebased_checkpoint) as checkpoint:
+                    case._assert_post_push_pr_attachment(
+                        head, accepted, pr_state=state, remote_deleted=True,
+                        reconciled_kind=kind)
+                self.assertEqual(guard.call_count, 2)
+                refresh.assert_not_called()
+                checkpoint.assert_called_once()
+                self.assertNotIn('rebase', case.calls)
+                case.effects.revision.reconcile_catalog.assert_called_once()
+
     def test_deleted_head_after_push_does_not_authorize_mismatched_or_open_pr(self):
         for state, head in (('MERGED', 'other-head'), ('OPEN', 'base')):
             with self.subTest(state=state):

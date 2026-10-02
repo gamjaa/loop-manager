@@ -2413,6 +2413,10 @@ class ExecutionHandlers:
         """Refresh and reconcile before any phase effect consumes its snapshot."""
 
         self.effects.state.check_context(context)
+        if context.phase is ExecutionPhase.PUBLISHING:
+            terminal = self._reconcile_terminal_publication(context)
+            if terminal is not None:
+                return terminal
         self._publish_rebased_checkpoint(context)
         latest_sha = self._fetch_latest_base()
         try:
@@ -4376,6 +4380,41 @@ class ExecutionHandlers:
             self.effects.workspace.git,
             self._publication_workspace,
         )
+
+    def _reconcile_terminal_publication(self, context):
+        """Resolve a completed PR before the revision gate can rebase its head."""
+        row = self._row()
+        pr_url = str(row['pr_url'] or '') or None
+        try:
+            pr = self.effects.publication.pr_for_branch(
+                self.repo_path, context.branch, pr_url,
+            )
+            if pr is None or str(pr.get('state') or '').upper() not in {'MERGED', 'CLOSED'}:
+                return None
+            # Reuse the live observation boundary, including workspace identity,
+            # candidate tokens and a second head check across the PR query.
+            observed = self._publication_resume().observe(
+                self.repo_path, context.worktree, context.branch,
+                str(row['publication_remote_oid'] or '') or None, pr_url,
+            )
+            pr = observed.pull_request
+            if pr is None or str(pr.get('state') or '').upper() not in {'MERGED', 'CLOSED'}:
+                return None
+            if assess_publication(observed) is not PublicationNext.ATTACH_PR:
+                raise self.effects.contract.PublicationSafetyError(
+                    '종료 PR의 branch 또는 head가 관리 게시 후보와 다릅니다.'
+                )
+            reconciliation = self.effects.publication.reconcile_existing_pull_request(
+                self.repo_path, self.state_dir, self.repo, row, pr,
+            )
+            return (self._step_outcome(reconciliation) if reconciliation is not None
+                    else self._retry('종료 PR 상태를 다시 확인합니다.'))
+        except (self.effects.contract.PublicationSafetyError, self.effects.contract.WorkspaceOwnershipError) as error:
+            return self._block_final(
+                self.repo, context.worktree, str(error),
+                str(row['verify_result'] or ''),
+                reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
+            )
 
     def _publication_workspace(self, repo, worktree, branch, expected_oid):
         row = self._row()

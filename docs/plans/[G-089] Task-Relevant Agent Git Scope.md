@@ -40,6 +40,8 @@ priority: critical
 
 - 추가 Reviewer 피드백: push 뒤 Merge·base 전진·원격 head 삭제가 함께 발생하는 회귀를 추가했다. 신규 테스트의 mock이 push 전 정상 검사를 가로막은 실패를 수정한 뒤 동일 명령 `python3 -m unittest tests.test_execution_handlers.TaskRelevantPublicationBoundaryTests`로 16개 모두 통과했다. 종료 PR은 head 검증 후 base 재검증 분기보다 먼저 기존 reconciliation으로 전달하며, 활성 게시의 base 전진 재검증 회귀도 통과했다. 전체 verify는 실행하지 않았다.
 
+- production guard 피드백: definition snapshot과 verify·Review token을 설치한 실제 `publish`/`guard` 회귀에서 push 뒤 Merge·base 전진·branch 삭제, Closed 처리와 종료 PR head 불일치 차단을 검증했다. fixture의 push 전 catalog revision을 바로잡은 뒤 동일 명령 `python3 -m unittest tests.test_execution_handlers.TaskRelevantPublicationBoundaryTests`로 17개 모두 통과했다. 기존 전체 phase 정책과 PUBLISHING 입력 변경의 artifact 무효화 개별 unit test 2개도 통과했다. 전체 verify는 실행하지 않았다.
+
 ## Progress
 
 - [x] 역할·단계별 사용 Git 자원 판정
@@ -56,3 +58,4 @@ priority: critical
 - 검증 피드백은 복구 테스트의 공용 workspace가 live 조회를 tracking cache mock으로 대체한 데서 발생했다. fixture에서 기존 live 조회 helper를 재사용하고 새 소유 branch·PR 재조회 및 push 인자를 검증한다. 제품 코드의 게시 전 검증과 lease 보호는 유지한다.
 - 게시 관측에서 검증한 후보 OID를 두 push adapter의 필수 입력으로 전달한다. helper 진입 시 HEAD가 달라졌으면 게시 기록·push 전에 차단하며 기존 직전 branch·HEAD 검사와 immutable OID·lease를 유지한다. push 후 정확한 branch·head가 일치하는 종료 PR은 원격 branch 존재 검사보다 먼저 기존 reconciliation에 넘긴다. Merge cleanup과 Closed 차단은 기존 PR 정책이 담당하며, 활성 게시의 원격 ref·checkpoint 소유권 검사는 유지한다.
 - push 후 base fetch 결과는 보존하되 PR 재조회·head 검증 전에 rebase로 반환하지 않는다. Merge에 따른 base 전진과 branch 삭제는 종료 PR reconciliation이 처리하고, 종료 PR이 없는 활성 게시에 기존 base 재검증 분기를 적용한다.
+- PUBLISHING guard는 checkpoint 게시·revision 갱신 전에 종료 PR을 확인한다. 종료 후보만 기존 live observation으로 workspace identity·후보 token·branch·head를 재검증해 기존 reconciliation으로 넘기며, Open 또는 PR 부재 시 기존 revision gate를 유지한다. 종료 PR 관측 뒤 다시 Open으로 바뀌면 종료 처리를 적용하지 않는다.
