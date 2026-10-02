@@ -942,6 +942,7 @@ class ProjectBlockedRemoteRecoveryTests(unittest.TestCase):
     """Only mocked Git effects are executed by these project recovery tests."""
 
     git = BlockedPlanRemoteRefreshTests.git
+    recorded_fetch = BlockedPlanRemoteRefreshTests.recorded_fetch
     record_observation = BlockedPlanRemoteRefreshTests.record_observation
     observe = BlockedPlanRemoteRefreshTests.observe
     plan = BlockedPlanRemoteRefreshTests.plan

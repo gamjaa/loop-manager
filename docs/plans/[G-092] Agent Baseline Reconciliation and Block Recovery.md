@@ -63,6 +63,8 @@ Agent 시작 snapshot 뒤에 Manager의 검증된 Git 작업이 있어도 현재
 
 2026-10-02 남은 verify 실패 보정: 차단 계획의 base fetch를 기존 소유 CAS·journal 경로로 연결했다. Merge cleanup 후 archive 게시도 설정된 push URL을 사용해 tracking ref의 자동 갱신을 피하고, 후속 기록형 fetch가 전후 증거를 남기도록 했다. 복수 push URL과 원격 결과 확인, 통신 실패·OID 경쟁·재시작 및 외부 reflog 혼합을 다루는 관련 fake-port unit test 53개가 통과했다. 실제 Git 회귀와 전체 verify는 Loop Manager 재검증을 기다린다.
 
+2026-10-02 공유 fixture 보정: 위 fetch 변경에서 추가한 helper를 project recovery fixture의 재사용 목록에도 연결했다. Manager가 보고한 동일 초기화 오류 28건에 해당하는 project recovery 클래스와 catalog recovery unit test가 모두 통과했다. 전체 verify는 실행하지 않았고 Loop Manager 재검증을 기다린다.
+
 ## Decision Log
 
 - 과거 실행에 쓰기 격리 증거가 없으면 무관한 shared ref·worktree 변화를 자동으로 외부 변경이라 단정하지 않는다. G-088/G-089와 G-090/G-091의 독립 증거가 있는 경우에만 해제한다.
