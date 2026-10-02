@@ -9,17 +9,17 @@ from pathlib import Path
 from unittest import mock
 
 import loop_manager
-import blocked_checkpoint_state
-import execution_checkpoint_state
-import maintenance_state
-import notifications
-import project_registry
-import scoped_blocking
-import rebase_block_reconciliation
-import blocked_plan_reconciliation
-import blocked_remote_observation
-import managed_rebase_validation
-from scoped_blocking import BlockReasonCode, BlockScope
+from loop_manager_internal.storage import blocked_checkpoint_state
+from loop_manager_internal.storage import execution_checkpoint_state
+from loop_manager_internal.storage import maintenance_state
+from loop_manager_internal.notifications import notifications
+from loop_manager_internal.runtime import project_registry
+from loop_manager_internal.recovery import scoped_blocking
+from loop_manager_internal.git import rebase_block_reconciliation
+from loop_manager_internal.recovery import blocked_plan_reconciliation
+from loop_manager_internal.recovery import blocked_remote_observation
+from loop_manager_internal.git import managed_rebase_validation
+from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode, BlockScope
 
 
 class LegacyBlockedScopeUnitTests(unittest.TestCase):
@@ -949,7 +949,7 @@ class ProjectBlockedRemoteRecoveryTests(unittest.TestCase):
     row = BlockedPlanRemoteRefreshTests.row
 
     def setUp(self):
-        import project_blocked_recovery
+        from loop_manager_internal.recovery import project_blocked_recovery
         self.recovery = project_blocked_recovery
         BlockedPlanRemoteRefreshTests.setUp(self)
         self.connection.execute(
@@ -1370,7 +1370,7 @@ class ProjectBlockedRemoteRecoveryTests(unittest.TestCase):
         self.assertEqual(checkpoints.get(self.repo, 'G-106').current_rebase_acceptance()['target_base_oid'], self.base)
 
     def test_prepared_local_commit_is_recovered_before_rebase_without_duplicate_commit(self):
-        import blocked_checkpoint
+        from loop_manager_internal.recovery import blocked_checkpoint
         context = self.complete_context()
         adapter = self.ports._BlockedCheckpointAdapter.return_value
         adapter.assess.return_value = SimpleNamespace(safe=True)
@@ -1442,7 +1442,7 @@ class ProjectBlockedRemoteRecoveryTests(unittest.TestCase):
         self.assertEqual(self.connection.execute('SELECT phase FROM projects').fetchone()[0], 'WORKING')
 
     def test_push_before_sqlite_interruption_reuses_the_same_diagnostic_ref(self):
-        import blocked_checkpoint_state
+        from loop_manager_internal.storage import blocked_checkpoint_state
         context, remote = self.diagnostic_context(), [None]
         adapter = self.ports._BlockedCheckpointAdapter.return_value
         adapter.observe_remote.side_effect = lambda _: remote[0]
@@ -3520,7 +3520,7 @@ class ScopeBaselineRecoveryUnitTests(unittest.TestCase):
     """Scope-only releases use in-memory state and read-only fake Git ports."""
     def setUp(self):
         from tests.test_execution_handlers import current_rebase_case
-        from agent_scope_decision import used_git_resources
+        from loop_manager_internal.agents.agent_scope_decision import used_git_resources
         self.case = current_rebase_case(self)
         self.connection = self.case.fixture.connection
         self.checkpoints = self.case.checkpoint
@@ -3716,7 +3716,7 @@ class ScopeBaselineRecoveryUnitTests(unittest.TestCase):
                          plans)
 
     def test_planner_scope_release_rechecks_snapshot_and_preserves_planning_error(self):
-        from agent_scope_decision import used_git_resources
+        from loop_manager_internal.agents.agent_scope_decision import used_git_resources
         self.before = replace(self.before, branch=None, dirty={})
         self.current = replace(self.before, worktrees=self.current.worktrees)
         self.resources = used_git_resources(role='planner', phase='PLANNING', base_branch='main',
@@ -3834,7 +3834,7 @@ class EvidenceFreeRebaseBlockTests(unittest.TestCase):
 
     def pending(self, *, staged=False):
         from dataclasses import replace
-        from managed_rebase_validation import FileChange, IndexEntry
+        from loop_manager_internal.git.managed_rebase_validation import FileChange, IndexEntry
         self.case.observed = replace(self.case.observed, head='partial', branch=None,
             branch_ref=('before', ''), registration=('HEAD=partial', 'detached=True'),
             branch_worktrees=(), operations=(('rebase-merge', 'operation'),),
@@ -3935,7 +3935,7 @@ class EvidenceFreeRebaseBlockTests(unittest.TestCase):
         self.git_write.assert_not_called()
 
     def test_saved_scope_stage_false_positive_uses_same_owned_existing_pr_service(self):
-        from managed_rebase_validation import PullRequest
+        from loop_manager_internal.git.managed_rebase_validation import PullRequest
         remote = replace(self.case.expected.remote, pull_request=PullRequest(
             'https://example/pr/1', self.case.expected.remote.repository,
             'loop-manager/G-047', 'remote', 'OPEN'))
@@ -4032,8 +4032,8 @@ class EvidenceFreeRebaseBlockTests(unittest.TestCase):
         self.assertTrue(self.resume())
 
     def exhausted_pending(self):
-        from recovery_runtime import RecoveryObservation, RecoveryReason
-        from recovery_state import RecoveryRepository
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason
+        from loop_manager_internal.storage.recovery_state import RecoveryRepository
         detail = self.block()
         self.pending()
         RecoveryRepository(self.connection).observe(RecoveryObservation(
@@ -4153,8 +4153,8 @@ class EvidenceFreeRebaseBlockTests(unittest.TestCase):
         self.factory.assert_not_called()
 
     def test_new_project_rebase_diagnosis_needs_no_legacy_text_or_occurrence_history(self):
-        from recovery_state import RecoveryRepository
-        from recovery_runtime import RecoveryObservation, RecoveryReason
+        from loop_manager_internal.storage.recovery_state import RecoveryRepository
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason
         self.block(project=True, reason='publication_ownership_uncertain')
         detail = 'current owned rebase completion was misclassified'
         self.connection.execute('UPDATE project_blocks SET evidence = ?', (detail,))
@@ -4181,7 +4181,7 @@ class EvidenceFreeRebaseBlockTests(unittest.TestCase):
 
     def test_remote_scope_index_and_operation_mismatches_preserve_block(self):
         from dataclasses import replace
-        from managed_rebase_validation import FileChange, IndexEntry
+        from loop_manager_internal.git.managed_rebase_validation import FileChange, IndexEntry
         self.block()
         original = self.case.observed
         for observed in (replace(original, remote=replace(original.remote, oid='foreign')),
@@ -4212,7 +4212,7 @@ class EvidenceFreeRebaseBlockTests(unittest.TestCase):
 
     def test_reobservation_race_and_transaction_faults_roll_back_then_resume_once(self):
         from dataclasses import replace
-        import runtime_state
+        from loop_manager_internal.storage import runtime_state
         self.block()
         before = self.snapshot()
         original = self.case.observed

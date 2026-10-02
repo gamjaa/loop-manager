@@ -8,9 +8,9 @@ from pathlib import Path
 from unittest import mock
 
 import loop_manager
-import notifications
+from loop_manager_internal.notifications import notifications
 from tests import test_runtime_state
-from worker_outcome import (
+from loop_manager_internal.execution.worker_outcome import (
     WorkerOutcomeError, parse_worker_outcome, worker_outcome_instruction,
 )
 

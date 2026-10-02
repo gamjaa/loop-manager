@@ -1,12 +1,12 @@
 import sqlite3
 import unittest
 from unittest import mock
-import notifications
+from loop_manager_internal.notifications import notifications
 
-import blocked_checkpoint
-import blocked_checkpoint_state
+from loop_manager_internal.recovery import blocked_checkpoint
+from loop_manager_internal.storage import blocked_checkpoint_state
 import loop_manager
-import runtime_state
+from loop_manager_internal.storage import runtime_state
 
 
 class BlockedCheckpointRepositoryTest(unittest.TestCase):

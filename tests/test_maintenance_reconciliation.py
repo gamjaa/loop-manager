@@ -7,9 +7,9 @@ from dataclasses import replace
 import unittest
 from unittest import mock
 
-from maintenance_file_inventory import SourceInventory, TrackedSource
-from maintenance_file_review import FileReviewProgress
-import maintenance_reconciliation as reconciliation
+from loop_manager_internal.maintenance.maintenance_file_inventory import SourceInventory, TrackedSource
+from loop_manager_internal.maintenance.maintenance_file_review import FileReviewProgress
+from loop_manager_internal.maintenance import maintenance_reconciliation as reconciliation
 
 
 REVISION = "a" * 40

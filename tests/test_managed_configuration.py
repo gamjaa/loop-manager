@@ -8,9 +8,9 @@ from pathlib import Path
 from unittest import mock
 
 import loop_manager
-import maintenance_state
-from managed_config import ManagedConfig, ManagedConfigError, load_managed_config
-import project_registry
+from loop_manager_internal.storage import maintenance_state
+from loop_manager_internal.config.managed_config import ManagedConfig, ManagedConfigError, load_managed_config
+from loop_manager_internal.runtime import project_registry
 
 
 class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
@@ -316,6 +316,12 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
             skill = (target / ".agents/skills/specification-docs/SKILL.md").read_text(
                 encoding="utf-8"
             )
+            self.assertEqual((target / "AGENTS.md").read_bytes(),
+                             (loop_manager.ROOT / "AGENTS.md").read_bytes())
+            self.assertEqual((target / "docs/PLANS.md").read_bytes(),
+                             (loop_manager.ROOT / "docs/PLANS.md").read_bytes())
+            self.assertEqual((target / "docs/ARCHITECTURE.md").read_bytes(),
+                             (loop_manager.ROOT / "docs/ARCHITECTURE.template.md").read_bytes())
 
         for phrase in (
             "기존 문서와 템플릿의 재사용 가능성",

@@ -10,11 +10,11 @@ import unittest
 from unittest import mock
 
 import loop_manager
-import checkpoint_ownership
-import blocked_checkpoint
-import execution_checkpoint_state
+from loop_manager_internal.recovery import checkpoint_ownership
+from loop_manager_internal.recovery import blocked_checkpoint
+from loop_manager_internal.storage import execution_checkpoint_state
 
-from execution_checkpoint import (
+from loop_manager_internal.execution.execution_checkpoint import (
     CheckpointAction, CheckpointSnapshot, assess, observe,
 )
 
@@ -524,7 +524,7 @@ class CurrentRebaseBoundaryTests(unittest.TestCase):
     def test_original_owned_head_can_start_without_receipt_or_original_commit_list(self):
         from dataclasses import replace
         from tests.test_managed_rebase_validation import expectation, observation, decision_for
-        from managed_rebase_validation import RebaseStatus
+        from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
         expected = expectation()
         original = observation(expected, head='before', branch_ref=('before', ''),
             registration=('HEAD=before', 'branch=refs/heads/loop-manager/G-108'),
@@ -536,7 +536,7 @@ class CurrentRebaseBoundaryTests(unittest.TestCase):
     def test_autostash_restoration_waits_and_other_operations_are_rejected(self):
         from dataclasses import replace
         from tests.test_managed_rebase_validation import expectation, observation, decision_for
-        from managed_rebase_validation import RebaseStatus, IndexEntry
+        from loop_manager_internal.git.managed_rebase_validation import RebaseStatus, IndexEntry
         expected = expectation(autostash_oid='owned-stash')
         pending = observation(expected, index_clean=False,
             index=(IndexEntry('app.py', '100644', 'conflict', 2, 'M', 0x2000),))

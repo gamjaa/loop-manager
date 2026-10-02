@@ -2,8 +2,8 @@
 
 from unittest import TestCase
 
-from agent_invocation import ResolvedProfile
-from worker_session import (SessionBinding, SessionTransition, decide_session,
+from loop_manager_internal.agents.agent_invocation import ResolvedProfile
+from loop_manager_internal.execution.worker_session import (SessionBinding, SessionTransition, decide_session,
                             unavailable_transition)
 
 

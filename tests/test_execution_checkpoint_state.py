@@ -3,10 +3,10 @@
 import sqlite3
 import unittest
 
-from execution_checkpoint_state import (
+from loop_manager_internal.storage.execution_checkpoint_state import (
     CheckpointRace, ExecutionCheckpointRepository,
 )
-import runtime_state
+from loop_manager_internal.storage import runtime_state
 from tests import test_runtime_state
 from tests.test_managed_rebase_validation import decision_for, expectation, observation
 
@@ -266,7 +266,7 @@ class CheckpointRepositoryTests(unittest.TestCase):
 
 class RebasePublicationRepositoryTests(unittest.TestCase):
     def setUp(self):
-        from execution_state import ExecutionStatePort
+        from loop_manager_internal.execution.execution_state import ExecutionStatePort
         self.connection = test_runtime_state.RuntimeStateRepositoryTest()._connection()
         self.addCleanup(self.connection.close)
         self.runtime = runtime_state.RuntimeStateRepository(self.connection)
@@ -292,7 +292,7 @@ class RebasePublicationRepositoryTests(unittest.TestCase):
             acceptance=self.acceptance, remote_before='remote')
 
     def test_unprojected_blocked_publication_preserves_block_and_execution_slot(self):
-        from execution_state import DirectRebasePublicationStatePort
+        from loop_manager_internal.execution.execution_state import DirectRebasePublicationStatePort
         self.runtime.transition_and_clear('repo', 'G-047', plan_values={
             'status': 'PLAN_BLOCKED', 'blocked_reason': 'verify_retry_exhausted'}, enqueue=False)
         state = DirectRebasePublicationStatePort(self.connection, self.runtime, 'repo', 'G-047')
@@ -314,7 +314,7 @@ class RebasePublicationRepositoryTests(unittest.TestCase):
         self.assertIsNone(self.runtime.projected('repo'))
 
     def test_unprojected_publication_rejects_changed_plan_and_rolls_back_storage_failure(self):
-        from execution_state import DirectRebasePublicationStatePort
+        from loop_manager_internal.execution.execution_state import DirectRebasePublicationStatePort
         self.runtime.transition_and_clear('repo', 'G-047', plan_values={'status': 'PLAN_BLOCKED'}, enqueue=False)
         pending = self.begin()
         acceptance = self.after_push()
@@ -374,7 +374,7 @@ class RebasePublicationRepositoryTests(unittest.TestCase):
         self.assertEqual(self.runtime.projected('repo'), projected)
 
     def test_projection_failure_rolls_back_completion_and_keeps_retryable_intent(self):
-        from execution_state import ExecutionStatePort
+        from loop_manager_internal.execution.execution_state import ExecutionStatePort
         pending = self.begin()
         intent = pending.snapshot['rebase_publication_intent']
         acceptance = self.after_push()

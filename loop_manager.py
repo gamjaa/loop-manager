@@ -31,7 +31,7 @@ import time
 from typing import Protocol
 from urllib.parse import quote
 
-from guidance_approval import (
+from loop_manager_internal.documents.guidance_approval import (
     GuidanceDocument,
     GuidanceFormatError,
     GuidanceProposal,
@@ -42,7 +42,7 @@ from guidance_approval import (
     guidance_patch_hash,
     parse_guidance_document,
 )
-from execution_runtime import (
+from loop_manager_internal.execution.execution_runtime import (
     ExecutionContext,
     ExecutionOutcome,
     ExecutionOutcomeKind,
@@ -52,31 +52,31 @@ from execution_runtime import (
     LatestBaseCheckpoint,
     LatestBasePort,
 )
-from managed_config import ManagedConfig, ManagedConfigError, load_managed_config
-import notifications
-import work_exhaustion
-import reviewer_specification
-from quality_guidance import AGENT_QUALITY_GUIDANCE
-import blocked_checkpoint
-import blocked_checkpoint_state
-import project_blocked_recovery
-import blocked_plan_reconciliation
-import blocked_remote_observation
-import execplan_archive
-import execplan_archive_state
-import requirement_archive
-import requirement_archive_state
-import execplan_catalog
-import execplan_catalog_state
-import project_catalog_refresh
-from planning_catalog import (
+from loop_manager_internal.config.managed_config import ManagedConfig, ManagedConfigError, load_managed_config
+from loop_manager_internal.notifications import notifications
+from loop_manager_internal.notifications import work_exhaustion
+from loop_manager_internal.documents import reviewer_specification
+from loop_manager_internal.quality.quality_guidance import AGENT_QUALITY_GUIDANCE
+from loop_manager_internal.recovery import blocked_checkpoint
+from loop_manager_internal.storage import blocked_checkpoint_state
+from loop_manager_internal.recovery import project_blocked_recovery
+from loop_manager_internal.recovery import blocked_plan_reconciliation
+from loop_manager_internal.recovery import blocked_remote_observation
+from loop_manager_internal.catalog import execplan_archive
+from loop_manager_internal.storage import execplan_archive_state
+from loop_manager_internal.catalog import requirement_archive
+from loop_manager_internal.storage import requirement_archive_state
+from loop_manager_internal.catalog import execplan_catalog
+from loop_manager_internal.storage import execplan_catalog_state
+from loop_manager_internal.catalog import project_catalog_refresh
+from loop_manager_internal.planning.planning_catalog import (
     MutableReadySnapshot,
     PlanDeletion,
     mutable_snapshot_token,
     snapshot_from_dict,
     snapshot_to_dict,
 )
-from planning_runtime import (
+from loop_manager_internal.planning.planning_runtime import (
     MAX_PLANNER_VALIDATION_RETRIES,
     PlanningAgentResult,
     PlanningAgentResultKind,
@@ -88,29 +88,29 @@ from planning_runtime import (
     PlanningScopeResult,
     PlanningWorkspaceOwnershipError,
 )
-import project_registry
-import runtime_state
-import recovery_state
-import recovery_runtime
-import execution_handlers
-import managed_rebase_publication
-import execution_revision
-import execution_checkpoint_state
-import checkpoint_ownership
-from agent_invocation import (AgentProfile, AgentRequest, AgentResult, AgentResultKind,
+from loop_manager_internal.runtime import project_registry
+from loop_manager_internal.storage import runtime_state
+from loop_manager_internal.storage import recovery_state
+from loop_manager_internal.recovery import recovery_runtime
+from loop_manager_internal.execution import execution_handlers
+from loop_manager_internal.git import managed_rebase_publication
+from loop_manager_internal.execution import execution_revision
+from loop_manager_internal.storage import execution_checkpoint_state
+from loop_manager_internal.recovery import checkpoint_ownership
+from loop_manager_internal.agents.agent_invocation import (AgentProfile, AgentRequest, AgentResult, AgentResultKind,
                               AttemptSequence, InvocationContext, ResolvedProfile,
                               TrackedAgentCall, Usage, approval_policy_failure,
                               classify_agent_result)
-from agent_provider_usage import claude_usage, codex_log_usage
-import agent_invocation_state
-import agent_write_isolation
-import validation_feedback_state
-from validation_feedback import normalize_feedback, redact_secrets
-from worker_outcome import worker_outcome_instruction
-from verify_process import run_verify_process, VerifyTerminationUncertain
-from execution_state import ExecutionStatePort as _ExecutionStatePort
+from loop_manager_internal.agents.agent_provider_usage import claude_usage, codex_log_usage
+from loop_manager_internal.storage import agent_invocation_state
+from loop_manager_internal.agents import agent_write_isolation
+from loop_manager_internal.storage import validation_feedback_state
+from loop_manager_internal.execution.validation_feedback import normalize_feedback, redact_secrets
+from loop_manager_internal.execution.worker_outcome import worker_outcome_instruction
+from loop_manager_internal.execution.verify_process import run_verify_process, VerifyTerminationUncertain
+from loop_manager_internal.execution.execution_state import ExecutionStatePort as _ExecutionStatePort
 from types import SimpleNamespace
-from maintenance_planning import (
+from loop_manager_internal.maintenance.maintenance_planning import (
     MaintenancePlanMode,
     MaintenancePlanningContext,
     MaintenancePlanningError,
@@ -122,7 +122,7 @@ from maintenance_planning import (
     validate_refactoring_plan,
     validate_revalidation_revision,
 )
-from maintenance_orchestration import (
+from loop_manager_internal.maintenance.maintenance_orchestration import (
     MaintenanceOrchestrationError,
     MaintenanceOutcome,
     MaintenancePlannerDecision,
@@ -135,26 +135,26 @@ from maintenance_orchestration import (
     select_cycle_ready_execplan,
     validate_prerequisite_plan_ids,
 )
-import maintenance_git
-import maintenance_state
-import maintenance_file_review
-import maintenance_reconciliation
-import maintenance_file_publication
-import maintenance_file_ledger
-import maintenance_findings
-import maintenance_file_inventory
-import document_publication
-import scoped_blocking
-import runtime_scope
-import agent_scope_decision
-import rebase_file_evidence
-import managed_rebase_evidence
-import managed_rebase_adoption
-import managed_rebase_validation
-import managed_rebase_runtime
-import rebase_block_reconciliation
-import manager_git_journal
-from scoped_blocking import BlockReasonCode, BlockScope
+from loop_manager_internal.maintenance import maintenance_git
+from loop_manager_internal.storage import maintenance_state
+from loop_manager_internal.maintenance import maintenance_file_review
+from loop_manager_internal.maintenance import maintenance_reconciliation
+from loop_manager_internal.maintenance import maintenance_file_publication
+from loop_manager_internal.storage import maintenance_file_ledger
+from loop_manager_internal.maintenance import maintenance_findings
+from loop_manager_internal.maintenance import maintenance_file_inventory
+from loop_manager_internal.documents import document_publication
+from loop_manager_internal.recovery import scoped_blocking
+from loop_manager_internal.runtime import runtime_scope
+from loop_manager_internal.agents import agent_scope_decision
+from loop_manager_internal.git import rebase_file_evidence
+from loop_manager_internal.git import managed_rebase_evidence
+from loop_manager_internal.git import managed_rebase_adoption
+from loop_manager_internal.git import managed_rebase_validation
+from loop_manager_internal.git import managed_rebase_runtime
+from loop_manager_internal.git import rebase_block_reconciliation
+from loop_manager_internal.git import manager_git_journal
+from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode, BlockScope
 
 
 ROOT = Path(__file__).resolve().parent
@@ -4143,7 +4143,7 @@ def record_general_planning_publication_intent(
     _assert_mutable_ready_snapshot_current(connection, snapshot)
     _validate_general_planning_commit(worktree, result, plan_commit)
     if is_loop_manager_repository(Path(repo)):
-        import document_drafts
+        from loop_manager_internal.documents import document_drafts
         project = connection.execute(
             "SELECT base_branch FROM projects WHERE repo = ?", (repo,),
         ).fetchone()
@@ -4527,7 +4527,7 @@ def _apply_general_planning_batch(
             connection, repo, worktree, list(result.plans), plan_commit
         )
         if is_loop_manager_repository(Path(repo)):
-            import document_drafts
+            from loop_manager_internal.documents import document_drafts
             drafts = document_drafts.DocumentDraftRepository(connection)
             try:
                 for path, plan in result.plans:
@@ -9900,7 +9900,7 @@ def _complete_direct_rebase_checkpoint(
 
 def _publish_direct_rebase_checkpoint(connection, repo_path, state_dir, repo,
                                       plan_id, worktree, branch):
-    from execution_state import DirectRebasePublicationStatePort
+    from loop_manager_internal.execution.execution_state import DirectRebasePublicationStatePort
     project_recovery = scoped_blocking.project_block(connection, repo) is not None
     if project_recovery and not project_blocked_recovery.project_slot_available(connection, repo, plan_id):
         raise manager_git_journal.MutationEvidenceError('project checkpoint publication is not selected')
@@ -20541,7 +20541,7 @@ class _PlanningStatePorts:
     ) -> bool:
         if not is_loop_manager_repository(repository):
             return False
-        import document_drafts
+        from loop_manager_internal.documents import document_drafts
         return bool(document_drafts.DocumentDraftRepository(
             self._connection,
         ).unplanned_approved(repo, repository, base_branch))
@@ -21671,7 +21671,7 @@ class _PlanningValidationPorts:
         mutable_snapshot: MutableReadySnapshot,
     ) -> str:
         prompt = planner_prompt(error, catalog, mutable_snapshot)
-        import document_drafts
+        from loop_manager_internal.documents import document_drafts
         repository = Path(mutable_snapshot.repo)
         if is_loop_manager_repository(repository):
             project = self._connection.execute(
@@ -21721,7 +21721,7 @@ class _PlanningValidationPorts:
             repo=repo,
             mutable_snapshot=mutable_snapshot,
         )
-        import document_drafts
+        from loop_manager_internal.documents import document_drafts
         repository = Path(repo)
         if not is_loop_manager_repository(repository):
             return result
@@ -23820,7 +23820,7 @@ def configure_registry(
 def _document_drafts_command(
     args: argparse.Namespace, state_dir: Path, config_path: Path,
 ) -> int:
-    import document_drafts
+    from loop_manager_internal.documents import document_drafts
 
     repository = Path(args.repository).expanduser().resolve()
     if not is_loop_manager_repository(repository):

@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 import loop_manager
-import execplan_catalog_state
+from loop_manager_internal.storage import execplan_catalog_state
 
 
 def git(repo: Path, *arguments: str) -> str:

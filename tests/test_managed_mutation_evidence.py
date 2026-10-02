@@ -3,7 +3,7 @@
 from pathlib import Path
 from contextlib import ExitStack
 from dataclasses import replace
-from managed_rebase_validation import FileChange, IndexEntry
+from loop_manager_internal.git.managed_rebase_validation import FileChange, IndexEntry
 from tests.test_execution_handlers import current_rebase_case
 import sqlite3
 import tempfile
@@ -11,13 +11,13 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from execution_checkpoint import owned_detached_rebase, rebase_preserves_worktree_files
-from execution_handlers import ExecutionHandlers
-from rebase_correction import CorrectionAction
-import manager_git_journal as journal
+from loop_manager_internal.execution.execution_checkpoint import owned_detached_rebase, rebase_preserves_worktree_files
+from loop_manager_internal.execution.execution_handlers import ExecutionHandlers
+from loop_manager_internal.git.rebase_correction import CorrectionAction
+from loop_manager_internal.git import manager_git_journal as journal
 import loop_manager
-import runtime_state
-from execution_checkpoint_state import ExecutionCheckpointRepository
+from loop_manager_internal.storage import runtime_state
+from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
 
 
 OLD = 'a' * 40
@@ -866,7 +866,7 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
         original = case.checkpoint.get('repo', 'G-047')
         with (
             mock.patch.object(journal, 'begin_current_rebase', return_value='audit-only') as begin,
-            mock.patch('execution_handlers.managed_rebase_evidence.source_commits', side_effect=AssertionError('no replay')),
+            mock.patch('loop_manager_internal.execution.execution_handlers.managed_rebase_evidence.source_commits', side_effect=AssertionError('no replay')),
         ):
             case.handler._record_rebase_intent(case.fixture.context(), 'base')
             case.handler._record_rebase_intent(case.fixture.context(), 'base')
@@ -909,7 +909,7 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
         case = pending_current_case(self)
         with (
             mock.patch.object(journal, 'begin_current_rebase', return_value='current-step') as begin,
-            mock.patch('execution_handlers.managed_rebase_evidence.source_commits', side_effect=AssertionError('no historical stage')),
+            mock.patch('loop_manager_internal.execution.execution_handlers.managed_rebase_evidence.source_commits', side_effect=AssertionError('no historical stage')),
         ):
             token = case.handler._begin_rebase_continuation(case.fixture.context(), CorrectionAction.CONTINUE)
         self.assertEqual(token, 'current-step')
@@ -1060,7 +1060,7 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
         row = dict(case.state.row(), publication_remote_oid='remote')
         checkpoint = {'accepted_remote_oid': 'remote'}
         with (
-            mock.patch('execution_handlers.checkpoint_ownership.owned_remote_oid', return_value='remote'),
+            mock.patch('loop_manager_internal.execution.execution_handlers.checkpoint_ownership.owned_remote_oid', return_value='remote'),
             mock.patch.object(journal, 'verified_managed_transitions', side_effect=AssertionError('no receipt gate')),
         ):
             for _ in range(2):
@@ -1077,7 +1077,7 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
         row = dict(case.state.row(), publication_remote_oid='remote')
         checkpoint = {'accepted_remote_oid': 'remote'}
         with (
-            mock.patch('execution_handlers.checkpoint_ownership.owned_remote_oid', return_value='remote'),
+            mock.patch('loop_manager_internal.execution.execution_handlers.checkpoint_ownership.owned_remote_oid', return_value='remote'),
             mock.patch.object(journal, 'verified_managed_transitions', side_effect=AssertionError('no journal gate')),
         ):
             self.assertTrue(case.handler._owned_completed_rebase(case.fixture.context(), row, 'remote',
@@ -1096,8 +1096,8 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
 class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
     """The production factory's identity/input adapters, with no Git process."""
     def test_archive_contract_uses_original_base_only_before_rebase(self):
-        import requirement_archive
-        from managed_rebase_runtime import build_service
+        from loop_manager_internal.catalog import requirement_archive
+        from loop_manager_internal.git.managed_rebase_runtime import build_service
         from tests.test_runtime_state import CurrentRebaseRuntimeTests
         source = 'docs/requirements/old.md'
         archived = 'docs/requirements/archive/old.md'
@@ -1155,7 +1155,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
                         ports.requirement_archive_move_set.assert_called_once_with(
                             Path('/repo'), 'common', Path('/owned'))
                         from tests.test_managed_rebase_validation import observation
-                        from managed_rebase_validation import FileChange
+                        from loop_manager_internal.git.managed_rebase_validation import FileChange
                         def archived_change(oid):
                             return observation(service.expected, committed=(FileChange(
                                 archived, '000000', '100644', '0', oid, 'A'),))
@@ -1173,7 +1173,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
 
     def test_factory_uses_current_inputs_exact_lease_and_final_scope(self):
         from tests.test_runtime_state import CurrentRebaseRuntimeTests
-        from managed_rebase_runtime import build_service
+        from loop_manager_internal.git.managed_rebase_runtime import build_service
         from tests.test_managed_rebase_validation import observation
         fixture = CurrentRebaseRuntimeTests()
         connection, runtime, checkpoints, original, expected, decision = fixture.fixture()
@@ -1263,7 +1263,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
                 self.assertEqual(runtime.projected('repo') is not None, projected)
 
     def test_blocked_release_records_head_after_adoption_and_stage_restore(self):
-        import blocked_checkpoint_state
+        from loop_manager_internal.storage import blocked_checkpoint_state
         case = current_rebase_case(self)
         connection, runtime = case.fixture.connection, case.fixture.repository
         selected = runtime.projected('repo')
@@ -1338,8 +1338,8 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(snapshots[0].index, before.index)
 
     def test_interrupted_blocked_rebase_adopts_clean_index_before_restoring_stage(self):
-        import blocked_checkpoint_state
-        from managed_rebase_validation import WorktreeFile
+        from loop_manager_internal.storage import blocked_checkpoint_state
+        from loop_manager_internal.git.managed_rebase_validation import WorktreeFile
         case = current_rebase_case(self)
         connection, runtime = case.fixture.connection, case.fixture.repository
         selected = runtime.projected('repo')
@@ -1422,18 +1422,18 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
         self.assertIsNone(runtime.get('repo', 'G-047').verify_result)
 
     def test_observation_failure_keeps_query_detail_without_acceptance(self):
-        from managed_rebase_adoption import ManagedRebaseService
-        from managed_rebase_validation import ObservationFailure
+        from loop_manager_internal.git.managed_rebase_adoption import ManagedRebaseService
+        from loop_manager_internal.git.managed_rebase_validation import ObservationFailure
         case = current_rebase_case(self)
         original = case.checkpoint.get('repo', 'G-047')
-        with mock.patch('managed_rebase_adoption.observe_current_rebase',
+        with mock.patch('loop_manager_internal.git.managed_rebase_adoption.observe_current_rebase',
                         return_value=(ObservationFailure('query_or_scope_failed', 'live PR query failed'), None)):
             with self.assertRaisesRegex(journal.MutationEvidenceError, 'live PR query failed'):
                 case.factory(None).require_owned()
         self.assertEqual(case.checkpoint.get('repo', 'G-047'), original)
 
     def test_continuation_needs_current_owned_state_not_worker_turn(self):
-        from managed_rebase_validation import RebaseDecision, RebaseStatus, Remote
+        from loop_manager_internal.git.managed_rebase_validation import RebaseDecision, RebaseStatus, Remote
         handler = object.__new__(ExecutionHandlers)
         handler.repo, handler.repo_path, handler.state_dir = 'repo', Path('/repo'), Path('/state')
         checkpoint = SimpleNamespace(operation='rebase', expected_head=OLD, target_base_oid=NEW,

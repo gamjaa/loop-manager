@@ -7,11 +7,11 @@ import sqlite3
 import unittest
 from unittest import mock
 
-import execplan_archive_state as archive_state
-import execplan_catalog as catalog
-import execplan_catalog_state as state
+from loop_manager_internal.storage import execplan_archive_state as archive_state
+from loop_manager_internal.catalog import execplan_catalog as catalog
+from loop_manager_internal.storage import execplan_catalog_state as state
 import loop_manager as manager
-import project_catalog_refresh as refresh
+from loop_manager_internal.catalog import project_catalog_refresh as refresh
 from tests import test_execplan_catalog_state as fixtures
 
 
@@ -334,7 +334,7 @@ class ProjectCatalogRefreshTest(unittest.TestCase):
         self.assertEqual(events, [])
 
     def test_archive_adapter_validates_publication_then_adopts_delta_and_audit(self):
-        import execplan_archive as archive
+        from loop_manager_internal.catalog import execplan_archive as archive
         self.boundary.refresh()
         port = mock.Mock()
         port.fetch_remote_base.side_effect = lambda base: self.sha

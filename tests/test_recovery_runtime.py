@@ -7,15 +7,15 @@ from pathlib import Path
 from unittest import mock
 
 import loop_manager
-import rebase_block_reconciliation as rebase_blocks
-from recovery_state import RecoveryRepository
-from planning_runtime import PlanningOutcome, PlanningOutcomeKind
+from loop_manager_internal.git import rebase_block_reconciliation as rebase_blocks
+from loop_manager_internal.storage.recovery_state import RecoveryRepository
+from loop_manager_internal.planning.planning_runtime import PlanningOutcome, PlanningOutcomeKind
 
-from recovery_runtime import (
+from loop_manager_internal.recovery.recovery_runtime import (
     RecoveryAction, RecoveryDisposition, RecoveryFailure, RecoveryObservation,
     RecoveryReason, classify_exception, decide, reason_from_block, require_final,
 )
-from scoped_blocking import BlockReasonCode, BlockScope, reason_scope
+from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode, BlockScope, reason_scope
 
 
 def observation(reason, detail="same RuntimeError"):

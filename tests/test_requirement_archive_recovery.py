@@ -5,13 +5,13 @@ from dataclasses import replace
 import unittest
 from unittest import mock
 
-import requirement_archive as archive
-import requirement_archive_state
-import runtime_state
-from requirement_archive_recovery import (
+from loop_manager_internal.catalog import requirement_archive as archive
+from loop_manager_internal.storage import requirement_archive_state
+from loop_manager_internal.storage import runtime_state
+from loop_manager_internal.catalog.requirement_archive_recovery import (
     ArchiveRecoveryPorts, ArchiveRecoveryService,
 )
-from recovery_runtime import RecoveryAction, RecoveryDisposition
+from loop_manager_internal.recovery.recovery_runtime import RecoveryAction, RecoveryDisposition
 from tests import test_runtime_state
 
 

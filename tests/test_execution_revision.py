@@ -1,7 +1,7 @@
 from dataclasses import replace
 import unittest
 
-from execution_revision import (
+from loop_manager_internal.execution.execution_revision import (
     DefinitionDelta,
     DefinitionSnapshot,
     RevisionGateKind,

@@ -9,14 +9,14 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-import document_drafts
-import document_publication
+from loop_manager_internal.documents import document_drafts
+from loop_manager_internal.documents import document_publication
 import loop_manager
-import maintenance_git
-import maintenance_file_inventory
-import maintenance_file_ledger
-import maintenance_file_publication
-import maintenance_state
+from loop_manager_internal.maintenance import maintenance_git
+from loop_manager_internal.maintenance import maintenance_file_inventory
+from loop_manager_internal.storage import maintenance_file_ledger
+from loop_manager_internal.maintenance import maintenance_file_publication
+from loop_manager_internal.storage import maintenance_state
 
 
 class DocumentDraftTest(unittest.TestCase):
@@ -1173,7 +1173,7 @@ class BoundedGitChangeContextTest(unittest.TestCase):
             )
 
             with mock.patch(
-                "maintenance_git._bounded_git_output",
+                "loop_manager_internal.maintenance.maintenance_git._bounded_git_output",
                 return_value=(failed, True),
             ):
                 context = maintenance_git.bounded_remote_change_context(

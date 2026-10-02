@@ -5,8 +5,8 @@ import tempfile
 from pathlib import Path
 from unittest import TestCase
 
-from rebase_correction import ConflictObservation, CorrectionSource
-from rebase_correction_state import SCHEMA, CorrectionRace, RebaseCorrectionRepository
+from loop_manager_internal.git.rebase_correction import ConflictObservation, CorrectionSource
+from loop_manager_internal.storage.rebase_correction_state import SCHEMA, CorrectionRace, RebaseCorrectionRepository
 
 
 class RebaseCorrectionStateTests(TestCase):

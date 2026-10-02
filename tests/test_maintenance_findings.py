@@ -5,9 +5,9 @@ import sqlite3
 import tempfile
 import unittest
 
-import maintenance_findings as stream
-import maintenance_reconciliation as review
-from maintenance_file_inventory import SourceInventory, TrackedSource
+from loop_manager_internal.maintenance import maintenance_findings as stream
+from loop_manager_internal.maintenance import maintenance_reconciliation as review
+from loop_manager_internal.maintenance.maintenance_file_inventory import SourceInventory, TrackedSource
 
 
 class FindingsStreamTest(unittest.TestCase):

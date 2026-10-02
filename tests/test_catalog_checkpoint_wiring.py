@@ -3,11 +3,11 @@
 from pathlib import Path
 import unittest
 
-import blocked_checkpoint
-import blocked_checkpoint_state
-import blocked_plan_reconciliation
-import execplan_catalog
-import execplan_catalog_state
+from loop_manager_internal.recovery import blocked_checkpoint
+from loop_manager_internal.storage import blocked_checkpoint_state
+from loop_manager_internal.recovery import blocked_plan_reconciliation
+from loop_manager_internal.catalog import execplan_catalog
+from loop_manager_internal.storage import execplan_catalog_state
 import loop_manager
 
 
@@ -18,16 +18,16 @@ class CatalogCheckpointWiringTest(unittest.TestCase):
             execplan_catalog, execplan_catalog_state,
         ):
             with self.subTest(module=module.__name__):
-                self.assertIs(getattr(loop_manager, module.__name__), module)
+                self.assertIs(getattr(loop_manager, module.__name__.rsplit(".", 1)[-1]), module)
 
     def test_verify_scripts_keep_both_features_and_runtime_modules(self):
         root = Path(__file__).resolve().parents[1]
         required = {
-            "blocked_checkpoint.py", "blocked_checkpoint_state.py",
-            "execplan_catalog.py", "execplan_catalog_state.py",
-            "planning_runtime.py", "runtime_state.py",
-            "recovery_dispatcher.py", "recovery_runtime.py",
-            "recovery_state.py",
+            "loop_manager_internal/recovery/blocked_checkpoint.py", "loop_manager_internal/storage/blocked_checkpoint_state.py",
+            "loop_manager_internal/catalog/execplan_catalog.py", "loop_manager_internal/storage/execplan_catalog_state.py",
+            "loop_manager_internal/planning/planning_runtime.py", "loop_manager_internal/storage/runtime_state.py",
+            "loop_manager_internal/recovery/recovery_dispatcher.py", "loop_manager_internal/recovery/recovery_runtime.py",
+            "loop_manager_internal/storage/recovery_state.py",
         }
         for name in ("verify.sh", "verify.ps1"):
             with self.subTest(script=name):
@@ -36,4 +36,4 @@ class CatalogCheckpointWiringTest(unittest.TestCase):
                 self.assertEqual(len(commands), 1)
                 self.assertTrue(required.issubset(set(commands[0].split())))
                 if name == 'verify.sh':
-                    self.assertIn('blocked_plan_reconciliation.py', commands[0].split())
+                    self.assertIn('loop_manager_internal/recovery/blocked_plan_reconciliation.py', commands[0].split())

@@ -4,8 +4,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-import manager_git_journal as journal
-from runtime_scope import proven_runtime_recreation
+from loop_manager_internal.git import manager_git_journal as journal
+from loop_manager_internal.runtime.runtime_scope import proven_runtime_recreation
 
 
 class RuntimeRecreationEvidenceTests(unittest.TestCase):

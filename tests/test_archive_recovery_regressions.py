@@ -9,10 +9,10 @@ import tempfile
 import unittest
 from unittest import mock
 
-import execplan_catalog
-import execplan_catalog_state
+from loop_manager_internal.catalog import execplan_catalog
+from loop_manager_internal.storage import execplan_catalog_state
 import loop_manager
-import runtime_state
+from loop_manager_internal.storage import runtime_state
 from tests.test_execplan_catalog_state import archived_entry
 
 

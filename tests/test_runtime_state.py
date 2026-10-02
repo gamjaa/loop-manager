@@ -5,12 +5,12 @@ import tempfile
 import unittest
 
 import loop_manager
-import notifications
-import runtime_state
-from execution_checkpoint_state import ExecutionCheckpointRepository
+from loop_manager_internal.notifications import notifications
+from loop_manager_internal.storage import runtime_state
+from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
 from tests.test_managed_rebase_validation import decision_for, expectation, observation
-from recovery_runtime import RecoveryObservation, RecoveryReason, decide
-from scoped_blocking import BlockReasonCode
+from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason, decide
+from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 
 
 class CurrentRebaseRuntimeTests(unittest.TestCase):
@@ -278,7 +278,7 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
         self.assertEqual(project['publication_remote_oid'], 'a' * 40)
 
     def test_blocked_requeue_discards_stale_worker_profile_target(self):
-        from worker_session import SessionBinding, SessionTransition
+        from loop_manager_internal.execution.worker_session import SessionBinding, SessionTransition
 
         connection = self._connection()
         self.addCleanup(connection.close)
@@ -307,7 +307,7 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
             self.assertIsNone(row['worker_session_transition'])
 
     def test_activation_clears_stale_ready_session_transition(self):
-        from worker_session import SessionBinding, SessionTransition
+        from loop_manager_internal.execution.worker_session import SessionBinding, SessionTransition
 
         connection = self._connection()
         self.addCleanup(connection.close)
@@ -335,7 +335,7 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
         self.assertIsNone(project['worker_session_transition'])
 
     def test_conflict_requeue_keeps_bound_session_but_drops_pending_target(self):
-        from worker_session import SessionBinding, SessionTransition
+        from loop_manager_internal.execution.worker_session import SessionBinding, SessionTransition
 
         connection = self._connection()
         self.addCleanup(connection.close)
@@ -367,8 +367,8 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
             self.assertIsNone(row['worker_session_transition'])
 
     def test_worker_transition_cas_preserves_execution_evidence(self):
-        from worker_session import SessionBinding, decide_session
-        from agent_invocation import ResolvedProfile
+        from loop_manager_internal.execution.worker_session import SessionBinding, decide_session
+        from loop_manager_internal.agents.agent_invocation import ResolvedProfile
 
         connection = self._connection()
         self.addCleanup(connection.close)

@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import guidance_approval
+from loop_manager_internal.documents import guidance_approval
 import loop_manager
 
 

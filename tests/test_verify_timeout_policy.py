@@ -6,8 +6,8 @@ import unittest
 from unittest import mock
 
 import loop_manager
-import runtime_state
-from scoped_blocking import BlockReasonCode
+from loop_manager_internal.storage import runtime_state
+from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from tests import test_runtime_state
 
 

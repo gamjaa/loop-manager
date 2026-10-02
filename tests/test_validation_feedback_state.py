@@ -2,8 +2,8 @@ import json
 import sqlite3
 import unittest
 
-from validation_feedback import Feedback, normalize_feedback
-from validation_feedback_state import ValidationFeedbackRepository, ensure_schema
+from loop_manager_internal.execution.validation_feedback import Feedback, normalize_feedback
+from loop_manager_internal.storage.validation_feedback_state import ValidationFeedbackRepository, ensure_schema
 
 
 class ValidationFeedbackStateTests(unittest.TestCase):

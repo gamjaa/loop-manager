@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-import maintenance_file_inventory as source_inventory
+from loop_manager_internal.maintenance import maintenance_file_inventory as source_inventory
 
 
 class TrackedSourceInventoryTest(unittest.TestCase):

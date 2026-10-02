@@ -10,19 +10,19 @@ import tempfile
 from types import SimpleNamespace
 from unittest import TestCase, mock
 
-import execution_handlers as handlers
-import rebase_block_reconciliation
-from execution_revision import DefinitionSnapshot
+from loop_manager_internal.execution import execution_handlers as handlers
+from loop_manager_internal.git import rebase_block_reconciliation
+from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
 import loop_manager as lm
-import notifications
-import scoped_blocking
-import runtime_state
-from validation_feedback import Feedback
-from validation_feedback_state import ValidationFeedbackRepository
-from execution_checkpoint_state import CheckpointRecord, ExecutionCheckpointRepository
-from requirement_archive import ArchiveSnapshot
-from execution_state import ExecutionStatePort
-from execution_runtime import (
+from loop_manager_internal.notifications import notifications
+from loop_manager_internal.recovery import scoped_blocking
+from loop_manager_internal.storage import runtime_state
+from loop_manager_internal.execution.validation_feedback import Feedback
+from loop_manager_internal.storage.validation_feedback_state import ValidationFeedbackRepository
+from loop_manager_internal.storage.execution_checkpoint_state import CheckpointRecord, ExecutionCheckpointRepository
+from loop_manager_internal.catalog.requirement_archive import ArchiveSnapshot
+from loop_manager_internal.execution.execution_state import ExecutionStatePort
+from loop_manager_internal.execution.execution_runtime import (
     ExecutionPhase,
     ExecutionPhaseCoordinator,
     ExecutionOutcome,
@@ -31,9 +31,9 @@ from execution_runtime import (
 from tests import test_runtime_state
 from tests.test_guidance_approval import guidance_plan
 from tests import test_blocked_checkpoint
-import blocked_checkpoint_state
-import blocked_checkpoint
-from worker_session import SessionBinding, SessionTransition
+from loop_manager_internal.storage import blocked_checkpoint_state
+from loop_manager_internal.recovery import blocked_checkpoint
+from loop_manager_internal.execution.worker_session import SessionBinding, SessionTransition
 from tests.test_worker_outcome import decision as worker_decision
 
 READY_WORKER_RESULT = 'WORKER_OUTCOME: {"kind":"ready_for_validation"}\nresult'
@@ -1521,12 +1521,12 @@ class ExecutionHandlerTests(TestCase):
                         observed_remote_oid=current.observed_remote_oid,
                         snapshot=current.snapshot,
                     )
-            from managed_rebase_adoption import revalidation_values
+            from loop_manager_internal.git.managed_rebase_adoption import revalidation_values
             target = (project_values or {}).get('active_sha') or self.remote
             self.state.update_project('repo', **revalidation_values(target))
         self.handler._complete_rebase_intent = mock.Mock(side_effect=fake_complete_rebase)
         def fake_current_service(context, **options):
-            from managed_rebase_validation import RebaseDecision, RebaseStatus, Remote
+            from loop_manager_internal.git.managed_rebase_validation import RebaseDecision, RebaseStatus, Remote
             current = self.handler.effects.checkpoint.get('repo', context.plan.plan_id)
             in_progress = bool(self.effects.workspace._rebase_in_progress_for_branch(
                 context.worktree, context.branch))
@@ -3280,7 +3280,7 @@ class ExecutionHandlerTests(TestCase):
             expected_head='b' * 40, operation='push',
             snapshot={'blocked_resume': marker, 'remote_before': 'a' * 40},
         )
-        from managed_rebase_adoption import ManagedRebaseService
+        from loop_manager_internal.git.managed_rebase_adoption import ManagedRebaseService
         from tests.test_managed_rebase_validation import expectation, observation, scope_for
         def current_service(context, **options):
             expected = expectation(repo='repo', worktree='/state/G-047',
@@ -3303,7 +3303,7 @@ class ExecutionHandlerTests(TestCase):
             )
         self.effects.workspace.git.side_effect = git
         with (
-            mock.patch('managed_rebase_adoption.observe_current_rebase',
+            mock.patch('loop_manager_internal.git.managed_rebase_adoption.observe_current_rebase',
                        side_effect=current_observation),
             mock.patch.object(handlers.checkpoint_ownership,
                               'rebase_preserves_commits', return_value=True),
@@ -3571,7 +3571,7 @@ class ExecutionHandlerTests(TestCase):
             self.assertFalse(case.handler._owned_checkpoint_remote(case.handler._context(), case.state.row(), 'remote', saved))
 
     def test_autostash_published_completion_keeps_start_session_after_worker_replacement(self):
-        from managed_rebase_validation import FileChange
+        from loop_manager_internal.git.managed_rebase_validation import FileChange
         case = current_rebase_case(self)
         case.expected = replace(case.expected, autostash_oid='stash')
         case.state.update_project('repo', worker_session_id='replacement-session')
@@ -4874,7 +4874,7 @@ class ExecutionHandlerTests(TestCase):
         self.assertEqual(self.effects.agent.run_agent.call_args.kwargs['session_id'], 'session')
 
     def test_review_specification_deadlock_blocks_plan_without_worker_correction(self):
-        from reviewer_specification import SpecificationDeadlock
+        from loop_manager_internal.documents.reviewer_specification import SpecificationDeadlock
 
         self.plan['sources'] = ['docs/requirements/source.md']
         details = SpecificationDeadlock(
@@ -4901,7 +4901,7 @@ class ExecutionHandlerTests(TestCase):
         self.effects.validation.transition_validation_failure.assert_not_called()
 
     def test_review_deadlock_accepts_architecture_outside_sources(self):
-        from reviewer_specification import SpecificationDeadlock
+        from loop_manager_internal.documents.reviewer_specification import SpecificationDeadlock
 
         self.plan['sources'] = ['docs/requirements/source.md']
         details = SpecificationDeadlock(
@@ -4922,7 +4922,7 @@ class ExecutionHandlerTests(TestCase):
         )
 
     def test_review_deadlock_with_unrelated_path_uses_protocol_correction(self):
-        from reviewer_specification import SpecificationDeadlock
+        from loop_manager_internal.documents.reviewer_specification import SpecificationDeadlock
 
         details = SpecificationDeadlock(
             'missing', (('docs/other.md', 'Policy'),),
@@ -5623,7 +5623,7 @@ class ExecutionHandlerTests(TestCase):
 class CurrentRebaseAdoptionTests(TestCase):
     """Real handler/CAS policies with immutable fake Git observations only."""
     def setUp(self):
-        from managed_rebase_adoption import ManagedRebaseService
+        from loop_manager_internal.git.managed_rebase_adoption import ManagedRebaseService
         from tests.test_managed_rebase_validation import expectation, observation, scope_for
         self.fixture = ExecutionHandlerTests()
         self.fixture.setUp()
@@ -5663,7 +5663,7 @@ class CurrentRebaseAdoptionTests(TestCase):
         self.factory = factory
         self.handler.effects = replace(self.fixture.effects, checkpoint=self.checkpoint,
             workspace=replace(self.fixture.effects.workspace, current_rebase_service=factory))
-        self.observation_patch = mock.patch('managed_rebase_adoption.observe_current_rebase',
+        self.observation_patch = mock.patch('loop_manager_internal.git.managed_rebase_adoption.observe_current_rebase',
             side_effect=lambda expected, _: (self.observed, scope_for(expected, self.observed)))
         self.observation_patch.start()
         self.addCleanup(self.observation_patch.stop)
@@ -5673,7 +5673,7 @@ class CurrentRebaseAdoptionTests(TestCase):
         self.handler._publish_rebased_checkpoint = mock.Mock()
 
     def test_ordinary_checkpoint_remote_observation_keeps_fetched_reader(self):
-        from managed_rebase_adoption import checkpoint_remote_oid
+        from loop_manager_internal.git.managed_rebase_adoption import checkpoint_remote_oid
         current = self.checkpoint.get('repo', 'G-047')
         for selected in (None, replace(current, operation=None, snapshot={}),
                          replace(current, operation=None, snapshot={
@@ -5745,7 +5745,7 @@ class CurrentRebaseAdoptionTests(TestCase):
                     operation='pr_create', expected_head='owned-head', target_base_oid='base',
                     observed_remote_oid='owned-head', snapshot=saved.snapshot)
                 pr = dict(url='new-pr', headRefOid='owned-head')
-                from managed_rebase_validation import PullRequest
+                from loop_manager_internal.git.managed_rebase_validation import PullRequest
                 self.observed = replace(self.observed, remote=replace(self.observed.remote,
                     pull_request=PullRequest('new-pr', 'repo', self.expected.branch, 'owned-head', 'OPEN')))
                 self.assertTrue(self.handler._owned_checkpoint_remote(self.fixture.context(),
@@ -5787,7 +5787,7 @@ class CurrentRebaseAdoptionTests(TestCase):
                 case.fixture.effects.agent.run_agent.assert_not_called()
 
     def _assert_restored_stage_recovery(self, *, newly_activated=False):
-        from managed_rebase_validation import FileChange, IndexEntry
+        from loop_manager_internal.git.managed_rebase_validation import FileChange, IndexEntry
         self._prepare_current_checkpoint_recovery()
         self.handler._complete_rebase_intent(self.fixture.context())
         accepted = self.checkpoint.get('repo', 'G-047').snapshot['current_rebase_acceptance']
@@ -5848,7 +5848,7 @@ class CurrentRebaseAdoptionTests(TestCase):
                 case._assert_manual_autostash_recovery(interruption=boundary)
 
     def _assert_manual_autostash_recovery(self, *, interruption=None):
-        from managed_rebase_validation import FileChange
+        from loop_manager_internal.git.managed_rebase_validation import FileChange
         self._prepare_current_checkpoint_recovery()
         saved = self.checkpoint.get('repo', 'G-047')
         self.checkpoint.record('repo', 'G-047', expected_generation=saved.generation,
@@ -5935,7 +5935,7 @@ class CurrentRebaseAdoptionTests(TestCase):
         self.fixture.effects.agent.run_agent.assert_not_called()
 
     def test_stale_or_out_of_scope_current_result_preserves_checkpoint_and_audit(self):
-        from managed_rebase_validation import FileChange
+        from loop_manager_internal.git.managed_rebase_validation import FileChange
         original = self.checkpoint.get('repo', 'G-047')
         for observed in (replace(self.observed, remote=replace(self.expected.remote, oid='foreign')),
                          replace(self.observed, input_fingerprint='changed'),
@@ -5976,7 +5976,7 @@ class CurrentRebaseAdoptionTests(TestCase):
         self.assertIsNone(self.checkpoint.get('repo', 'G-047').operation)
 
     def test_owned_detached_resolution_waits_without_worker_turn_or_stage_approval(self):
-        from managed_rebase_validation import IndexEntry
+        from loop_manager_internal.git.managed_rebase_validation import IndexEntry
         self.observed = replace(self.observed, head='partial', branch=None,
             branch_ref=('before', ''), registration=('HEAD=partial', 'detached=True'),
             branch_worktrees=(), operations=(('rebase-merge', 'operation'),),
@@ -5984,7 +5984,7 @@ class CurrentRebaseAdoptionTests(TestCase):
                       ('orig-head', 'before'), ('onto', 'base')),
             index=(IndexEntry('app.py', '100644', 'conflict', 2, 'M', 0x2000),),
             index_clean=False)
-        from managed_rebase_validation import RebaseStatus
+        from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
         service = self.factory(None)
         before = self.checkpoint.get('repo', 'G-047')
         self.assertEqual(service.require_owned()[1].status, RebaseStatus.WAITING)
@@ -5993,7 +5993,7 @@ class CurrentRebaseAdoptionTests(TestCase):
         self.assertEqual(self.checkpoint.get('repo', 'G-047'), before)
 
     def test_selected_baseline_keeps_original_and_unrelated_metadata(self):
-        from managed_rebase_adoption import selected_baseline
+        from loop_manager_internal.git.managed_rebase_adoption import selected_baseline
         before = lm.GitSnapshot('before', 'loop-manager/G-047', {}, {},
             {'refs/heads/loop-manager/G-047': ('before', ''), 'refs/heads/other': ('old', '')},
             {'/state/G-047': ('HEAD=before',), '/other': ('HEAD=other',)}, {}, {})
@@ -6169,7 +6169,7 @@ class CurrentRebaseAgentScopeTests(TestCase):
             self.addCleanup(patch.stop)
 
     def test_resumed_scope_keeps_original_and_records_observed_comparison_start(self):
-        from managed_rebase_adoption import agent_comparison_baseline
+        from loop_manager_internal.git.managed_rebase_adoption import agent_comparison_baseline
         before = lm.begin_agent_scope(self.case.fixture.connection, 'repo', Path('/state/G-047'), 'worker')
         self.assertEqual(before, self.current)
         saved = self.case.checkpoint.get('repo', 'G-047')
@@ -6188,7 +6188,7 @@ class CurrentRebaseAgentScopeTests(TestCase):
         connection = self.case.fixture.connection
         lm.begin_agent_scope(connection, 'repo', Path('/state/G-047'), 'worker')
         accepted_start = self.current
-        from managed_rebase_adoption import needs_agent_comparison
+        from loop_manager_internal.git.managed_rebase_adoption import needs_agent_comparison
         self.assertFalse(needs_agent_comparison(
             replace(self.case.checkpoint.get('repo', 'G-047'), operation='commit'),
             self.original, accepted_start))
@@ -6417,7 +6417,7 @@ class ImmediateRebasePublicationTests(TestCase):
 
     def assert_blocked_release(self, *, interrupted=False, rejected=False,
                                advanced_base=False, entrypoint=False):
-        from managed_rebase_validation import FileChange
+        from loop_manager_internal.git.managed_rebase_validation import FileChange
         connection, runtime = self.fixture.connection, self.fixture.repository
         runtime.transition_and_clear('repo', 'G-047', plan_values={
             'status': 'PLAN_BLOCKED', 'blocked_fingerprint': 'stored'}, enqueue=False)
@@ -6713,7 +6713,7 @@ class ImmediateRebasePublicationTests(TestCase):
                     self.state.row(), 'worker-head', changed))
 
     def test_publication_comparison_updates_only_selected_remote_tracking_ref(self):
-        from managed_rebase_adoption import selected_baseline
+        from loop_manager_internal.git.managed_rebase_adoption import selected_baseline
         self.complete()
         branch, worktree = 'loop-manager/G-047', '/state/G-047'
         ref, remote_ref = f'refs/heads/{branch}', f'refs/remotes/origin/{branch}'
@@ -7016,7 +7016,7 @@ class EvidenceFreeRecoveryLifecycleTests(TestCase):
                          self.handler._definition_snapshot.worker_candidate_token(self.final_head))
 
     def existing_pr(self):
-        from managed_rebase_validation import PullRequest
+        from loop_manager_internal.git.managed_rebase_validation import PullRequest
         self.remote = self.prior_remote = 'a' * 40
         pr = PullRequest('https://example.test/pr/47', 'repo', 'loop-manager/G-047',
                          self.remote, 'OPEN')
@@ -7223,7 +7223,7 @@ class EvidenceFreeRebasePreparationTests(TestCase):
         self.case.handler.catalog_plan = self.case.state.active_execplan('repo')
 
     def pending(self):
-        from managed_rebase_validation import IndexEntry
+        from loop_manager_internal.git.managed_rebase_validation import IndexEntry
         self.case.observed = replace(self.case.observed, head='partial', branch=None,
             branch_ref=('before', ''), registration=('HEAD=partial', 'detached=True'),
             branch_worktrees=(), operations=(('rebase-merge', 'operation'),),
@@ -7248,7 +7248,7 @@ class EvidenceFreeRebasePreparationTests(TestCase):
                     self.case.handler._resolving_rebase(self.case.state.row())
 
     def test_initial_and_detached_context_validate_current_existing_pr_lease(self):
-        from managed_rebase_validation import PullRequest
+        from loop_manager_internal.git.managed_rebase_validation import PullRequest
         remote = replace(self.case.expected.remote, repository='repo', oid='remote', pull_request=PullRequest(
             'https://example.test/pr/47', 'repo', 'loop-manager/G-047',
             'remote', 'OPEN'))
