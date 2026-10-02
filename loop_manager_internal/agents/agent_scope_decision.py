@@ -8,10 +8,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import hashlib
+from pathlib import Path
+import re
+from loop_manager_internal.catalog.execplan_catalog import requirement_archive_path
 from typing import Mapping, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from loop_manager import GitSnapshot, ManagerGitCheckpoint
+    from loop_manager_internal.agents.scope_contracts import GitSnapshot, ManagerGitCheckpoint
 
 
 class ScopeDecisionError(RuntimeError):
@@ -411,3 +414,62 @@ def decide_persisted_scope(
         allowed_worktrees = manager_cleanup_worktrees | commit_worktrees
     return ScopeDecision((ScopeCheck(role, scope_before, current, allowed_refs | manager_refs,
                                     allowed_worktrees | manager_cleanup_worktrees),), before)
+
+
+def _worker_path_allowed(
+    path: str,
+    selected_plan_path: str,
+    allowed_requirement_archives: tuple[str, ...] = (),
+    allowed_guidance_targets: tuple[str, ...] = (),
+    allow_common_plans: bool = False,
+) -> bool:
+    normalized = path.replace("\\", "/")
+    lowered = normalized.casefold()
+    if normalized == selected_plan_path:
+        return True
+    if normalized in allowed_guidance_targets:
+        return True
+    if lowered in {"docs/product.md", "docs/future_ideas.md"}:
+        return True
+    if Path(normalized).name.casefold() == "agents.md":
+        return False
+    if lowered == "docs/plans.md":
+        return allow_common_plans
+    if lowered == "docs/architecture.md":
+        return False
+    if lowered.startswith("docs/requirements/"):
+        allowed_paths = {
+            candidate
+            for source in allowed_requirement_archives
+            for candidate in (source, requirement_archive_path(source))
+        }
+        return normalized in allowed_paths
+    if re.fullmatch(r"docs/plans/[^/]+\.md", normalized):
+        return False
+    return True
+
+
+def _same_local_snapshot(left: GitSnapshot, right: GitSnapshot) -> bool:
+    return (
+        left.head == right.head
+        and left.branch == right.branch
+        and left.index == right.index
+        and left.dirty == right.dirty
+        and left.operations == right.operations
+    )
+
+
+def _non_default_index_flags(entries: tuple[str, ...]) -> tuple[str, ...]:
+    return index_security_flags(entries)
+
+
+def _metadata_changes_after_block(
+    before: Mapping[str, object],
+    blocked: Mapping[str, object],
+    current: Mapping[str, object],
+    candidates: frozenset[str],
+) -> frozenset[str]:
+    """Compatibility surface for callers of the persisted-scope policy."""
+    return metadata_changes_after_block(
+        before, blocked, current, candidates
+    )

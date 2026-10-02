@@ -5,9 +5,28 @@ from unittest import TestCase
 
 from loop_manager_internal.agents.agent_invocation import InvocationContext, ResolvedProfile, Usage
 from loop_manager_internal.storage.agent_invocation_state import InvocationRepository, ensure_schema
+from loop_manager_internal.agents.scope_contracts import GitSnapshot
 
 
 class InvocationRepositoryTests(TestCase):
+    def test_scope_binding_requires_matching_role_workspace_and_saved_snapshot(self):
+        for field in ('agent_role', 'worktree', 'agent_snapshot'):
+            self.connection.execute(f'ALTER TABLE projects ADD COLUMN {field} TEXT')
+        snapshot = GitSnapshot('head', None, {}, {}, {}, {}, {}, {}, scope_id='scope')
+        self.connection.execute("UPDATE projects SET agent_role='maintenance_planner', "
+                                "worktree='/managed', agent_snapshot=?", (snapshot.serialize(),))
+        self.assertEqual(self.repository.invocation_scope_id('repo', 'planner', '/managed'), 'scope')
+        self.assertIsNone(self.repository.invocation_scope_id('repo', 'reviewer', '/managed'))
+        self.assertIsNone(self.repository.invocation_scope_id('repo', 'planner', '/other'))
+        self.assertTrue(self.connection.in_transaction)
+
+    def test_latest_scope_session_is_bound_to_last_physical_attempt(self):
+        self.assertIsNone(self.repository.latest_scope_session('scope'))
+        for session, scope in (('original', 'scope'), ('unrelated', 'other'), ('resumed', 'scope')):
+            self.repository.start(InvocationContext('repo', None), 'planner', 'codex',
+                                  ResolvedProfile('model', 'high'), session, scope_id=scope)
+        self.assertEqual(self.repository.latest_scope_session('scope'), 'resumed')
+
     def test_replacement_ledger_links_transition_and_profiles(self):
         context = InvocationContext(
             'repo', 'G-041', transition='replacement', transition_cause='model_changed',

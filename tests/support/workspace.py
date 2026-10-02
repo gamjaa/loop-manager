@@ -1,6 +1,7 @@
 import sqlite3
 from pathlib import Path
 import loop_manager
+from loop_manager_internal.agents import agent_write_isolation as isolation
 from tests.support.catalog import write_execplan
 from tests.support.git import git_command, make_remote_repository, commit_and_push
 
@@ -74,3 +75,23 @@ class CleanupFixture:
         )
         connection.commit()
         return connection
+
+
+def native_agent_boundary(root: Path):
+    """Build synthetic linked-worktree/config files for native provider unit tests."""
+    state_root = root / 'state'
+    selected = state_root / 'worktrees' / 'project' / 'G-088'
+    source = root / 'source'
+    other = root / 'other'
+    common = source / '.git'
+    git_dir = common / 'worktrees' / 'G-088'
+    home = root / 'user-codex'
+    for path in (selected, other, git_dir, home):
+        path.mkdir(parents=True)
+    (selected / '.git').write_text('gitdir: ' + str(git_dir))
+    for path in (common / 'HEAD', git_dir / 'HEAD'):
+        path.write_text('ref: refs/heads/main\n')
+    (home / 'auth.json').write_text('private-auth-placeholder')
+    (home / 'config.toml').write_text('model="test"\n')
+    return isolation.WorktreeBoundary(selected, source, (other,), git_dir, common,
+                                     'repository'), state_root, home

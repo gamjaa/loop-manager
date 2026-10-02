@@ -360,13 +360,13 @@ class CurrentRebaseObservationTests(unittest.TestCase):
                     porcelain = f'worktree {expected.worktree}\nHEAD partial\ndetached\n\n'
                     with (
                         mock.patch('loop_manager.git', return_value=SimpleNamespace(stdout=porcelain)),
-                        mock.patch('loop_manager._capture_local_worktree_state',
+                        mock.patch('loop_manager_internal.agents.scope_observation._capture_local_worktree_state',
                                    return_value=('partial', None, index, dirty)),
-                        mock.patch('loop_manager._shared_ref_entries', return_value={
+                        mock.patch('loop_manager_internal.agents.scope_observation._shared_ref_entries', return_value={
                             f'refs/heads/{expected.branch}': (expected.before_head, ''),
                         }),
-                        mock.patch('loop_manager._config_entries', return_value={}),
-                        mock.patch('loop_manager._git_operation_entries',
+                        mock.patch('loop_manager_internal.agents.scope_observation._config_entries', return_value={}),
+                        mock.patch('loop_manager_internal.agents.scope_observation._git_operation_entries',
                                    return_value={operation: 'metadata-signature'}),
                     ):
                         actual, scope = observe_current_rebase(expected, adapters)
