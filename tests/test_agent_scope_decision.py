@@ -23,13 +23,14 @@ def snapshot(**changes):
 
 def decide(before, current, *, role="worker", phase="IMPLEMENTING", result=None,
            checkpoint=None, planner_correction=False, cleanup=frozenset(),
-           manager_runtime=None, runtime_recreation_proven=False):
+           manager_runtime=None, runtime_recreation_proven=False, manager_refs=frozenset()):
     return decision.decide_persisted_scope(
         role=role, phase=phase, base_branch="main", selected_plan_path=PLAN,
         before=before, current=current, result=result, checkpoint=checkpoint,
         worktree_key=WORKTREE, repo_key=REPO,
         planner_correction=planner_correction, manager_cleanup_worktrees=cleanup,
         manager_runtime=manager_runtime, runtime_recreation_proven=runtime_recreation_proven,
+        manager_refs=manager_refs,
     )
 
 
@@ -125,19 +126,21 @@ class PersistedScopeDecisionTests(unittest.TestCase):
         )
         current = replace(result, refs={**result.refs, "refs/remotes/origin/main": ("c", "commit")},
                           worktrees={**result.worktrees, REPO: ("HEAD=c",)})
-        check, = decide(before, current, phase="PLAN_BLOCKED", result=result).checks
+        check, = decide(before, current, phase="PLAN_BLOCKED", result=result,
+                        manager_refs=frozenset({'refs/remotes/origin/main'})).checks
         self.assertEqual(check.before.head, "b")
         self.assertEqual(check.allowed_refs, frozenset((
             "refs/heads/loop-manager/G-051", "refs/remotes/origin/main",
         )))
-        self.assertEqual(check.allowed_worktrees, frozenset((WORKTREE, REPO)))
+        self.assertEqual(check.allowed_worktrees, frozenset((WORKTREE,)))
 
     def test_manager_checkpoint_requires_agent_then_read_only_manager_check(self):
         before = snapshot()
         checkpoint = ManagerGitCheckpoint(before, frozenset(("/cleanup",)))
         current = replace(before, refs={**before.refs, "refs/tags/release": ("b", "tag")})
         first, second = decide(before, current, checkpoint=checkpoint,
-                               cleanup=frozenset(("/other-cleanup",))).checks
+                               cleanup=frozenset(("/other-cleanup",)),
+                               manager_refs=frozenset({'refs/tags/release'})).checks
         self.assertEqual((first.role, first.before, first.after), ("worker", before, before))
         self.assertEqual(second.role, "reviewer")
         self.assertEqual(second.allowed_refs, frozenset(("refs/tags/release",)))
@@ -150,7 +153,7 @@ class PersistedScopeDecisionTests(unittest.TestCase):
         checkpoint = ManagerGitCheckpoint(before, frozenset())
         check, = decide(before, current, phase="PLAN_BLOCKED", checkpoint=checkpoint).checks
         self.assertEqual(check.before.dirty, current.dirty)
-        self.assertEqual(check.allowed_worktrees, frozenset((REPO,)))
+        self.assertEqual(check.allowed_worktrees, frozenset())
 
     def test_unknown_role_and_incomplete_result_get_no_allowance(self):
         before = snapshot()
@@ -168,6 +171,75 @@ class PersistedScopeDecisionTests(unittest.TestCase):
         current = replace(before, dirty={"src/unrelated.py": (("unstaged",), "new")})
         with self.assertRaisesRegex(decision.ScopeDecisionError, "src/unrelated.py"):
             decide(before, current, phase="PLAN_BLOCKED", result=before)
+
+    def test_observed_fetch_drift_without_operation_proof_gets_no_allowance(self):
+        before = snapshot()
+        current = replace(before, refs={**before.refs, 'refs/remotes/origin/main': ('other', '')})
+        for checkpoint in (None, ManagerGitCheckpoint(before, frozenset())):
+            check = decide(before, current, phase='PLAN_BLOCKED', result=before,
+                           checkpoint=checkpoint).checks[-1]
+            self.assertFalse(check.allowed_refs)
+            with self.assertRaises(AgentScopeError):
+                validate_agent_scope(check.role, Path(WORKTREE), check.before, check.after,
+                                     selected_plan_path=PLAN if check.role == 'worker' else None)
+
+    def test_proven_metadata_advances_only_matching_used_resources_and_keeps_agent_work(self):
+        before = snapshot(dirty={'app.py': (('unstaged',), 'work')})
+        current = replace(before, refs={**before.refs, 'refs/remotes/origin/main': ('base', ''),
+                                       'refs/heads/other': ('foreign', '')},
+                          worktrees={**before.worktrees, '/cleanup': ('HEAD=other',)})
+        effective = decision.reconcile_manager_metadata(before, current,
+            refs=frozenset({'refs/remotes/origin/main'}), worktrees=frozenset())
+        self.assertEqual(effective.dirty, before.dirty)
+        self.assertNotIn('refs/heads/other', effective.refs)
+        self.assertNotIn('/cleanup', effective.worktrees)
+        self.assertNotIn('refs/remotes/origin/main', before.refs)
+        resources = decision.used_git_resources(role='worker', phase='WORKING',
+            base_branch='main', branch=before.branch, worktree_key=WORKTREE)
+        isolated = decision.reconcile_manager_metadata(before, current,
+            refs=frozenset(current.refs), worktrees=frozenset(current.worktrees), resources=resources)
+        self.assertNotIn('refs/heads/other', isolated.refs)
+        self.assertNotIn('/cleanup', isolated.worktrees)
+
+
+class ConflictIndexScopeTests(unittest.TestCase):
+    def setUp(self):
+        self.before = snapshot(branch=None, index={'app.py': tuple(
+            f'M 100644 blob-{stage} {stage}' for stage in (1, 2, 3))},
+            worktrees={WORKTREE: ('HEAD=a', 'detached=True')},
+            operations={'rebase-merge': 'same-metadata'})
+        self.after = replace(self.before, index={'app.py': ('H 100644 resolved 0',)},
+                             dirty={'app.py': (('staged',), 'resolved-file')})
+
+    def validate(self, after, *, owned=True):
+        validate_agent_scope('worker', Path(WORKTREE), self.before, after,
+                             selected_plan_path=PLAN, owned_rebase=owned)
+
+    def test_owned_stage_resolution_is_an_index_change_without_security_flags(self):
+        from loop_manager import agent_snapshot_changes
+        changes = agent_snapshot_changes(Path(WORKTREE), self.before, self.after)
+        self.assertNotIn('index flags', changes[0].kinds)
+        self.validate(self.after)
+        with self.assertRaisesRegex(AgentScopeError, '소유 rebase'):
+            self.validate(self.after, owned=False)
+
+    def test_real_flags_set_or_removed_with_resolution_still_block(self):
+        for tag in ('h', 'S', 's'):
+            with self.subTest(tag=tag), self.assertRaisesRegex(AgentScopeError, 'index flags'):
+                self.validate(replace(self.after, index={'app.py': (f'{tag} 100644 resolved 0',)}))
+        for tag in ('m', 'S', 's'):
+            flagged = replace(self.before, index={'app.py': tuple(
+                f'{tag} 100644 blob-{stage} {stage}' for stage in (1, 2, 3))})
+            with self.subTest(removed=tag), self.assertRaisesRegex(AgentScopeError, 'index flags'):
+                validate_agent_scope('worker', Path(WORKTREE), flagged, self.after,
+                                     selected_plan_path=PLAN, owned_rebase=True)
+
+    def test_resolution_cannot_absorb_protected_path_or_shared_metadata(self):
+        for after in (replace(self.after, index={**self.after.index, 'AGENTS.md': ('H 100644 foreign 0',)}),
+                      replace(self.after, refs={**self.after.refs, 'refs/heads/other': ('foreign', '')}),
+                      replace(self.after, operations={'rebase-merge': 'different'})):
+            with self.subTest(after=after), self.assertRaises(AgentScopeError):
+                self.validate(after)
 
 
 class TaskRelevantScopeTests(unittest.TestCase):

@@ -723,11 +723,42 @@ def _finish(
     _sync_directory(slot)
 
 
+def fetch_reflog_matches(state_dir: Path, repo: str, intent: Mapping[str, Any],
+                         lines: list[str], live_oid: str | None) -> bool:
+    """Require this fetch at the tip or an uninterrupted journal-owned suffix."""
+    action = f"{intent['expected']['oid']}\0loop-manager-base-fetch:{intent['id']}"
+    if lines.count(action) != 1:
+        return False
+    cursor = intent['expected']['oid']
+    for line in reversed(lines[:lines.index(action)]):
+        match = re.fullmatch(r'([0-9a-fA-F]{40}|[0-9a-fA-F]{64})\x00loop-manager-base-fetch:([0-9a-f]{32})', line)
+        if match is None:
+            return False
+        oid, token = match.groups()
+        successors = []
+        for kind in ('bootstrap_fetch', 'project_fetch'):
+            path = _slot(state_dir, repo, kind, intent['target']) / f'{token}.intent.json'
+            if path.exists():
+                saved = _read(path)
+                if (saved.get('id') != token or saved.get('repo') != repo
+                        or saved.get('kind') != kind or saved.get('target') != intent['target']
+                        or saved.get('before') != {'oid': cursor}
+                        or saved.get('expected') != {'oid': oid}):
+                    return False
+                successors.append(saved)
+        if len(successors) != 1:
+            return False
+        cursor = oid
+    return cursor == live_oid
+
+
 def verified_candidates(
     state_dir: Path, repo: str, *,
     baseline_refs: Mapping[str, Any], baseline_worktrees: Mapping[str, Any],
     live_refs: Mapping[str, Any], live_worktrees: Mapping[str, Any],
     marker: Callable[[Mapping[str, Any]], bool],
+    include_pending_fetch: bool = False,
+    fetch_refs: frozenset[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Offer only unbroken, owned transitions from a caller's baseline to Git."""
     root = state_dir / "manager-git-journal"
@@ -736,26 +767,54 @@ def verified_candidates(
         return candidates
     transitions: dict[tuple[str, str], list[tuple[Any, Any]]] = {}
     active_targets: set[tuple[str, str]] = set()
-    for slot in root.iterdir():
+    slots = (root.iterdir() if fetch_refs is None else (
+        _slot(state_dir, repo, kind, ref)
+        for kind in ('bootstrap_fetch', 'project_fetch') for ref in fetch_refs))
+    for slot in slots:
         if not slot.is_dir():
             continue
         active = slot / "active.json"
         if active.exists():
             intent = _read(active)
+            if fetch_refs is not None and (
+                    intent.get('repo') != repo
+                    or intent.get('kind') not in {'bootstrap_fetch', 'project_fetch'}
+                    or intent.get('target') not in fetch_refs
+                    or _slot(state_dir, repo, intent['kind'], intent['target']) != slot):
+                raise MutationEvidenceError('Manager pending fetch resource identity differs')
             if str(intent.get("kind", "")).startswith("managed_"):
                 continue
             category = "refs" if intent.get("kind") in {
                 "bootstrap_fetch", "project_fetch",
             } else "worktrees"
-            active_targets.add((category, str(intent.get("target"))))
+            target = str(intent.get('target'))
+            if (include_pending_fetch and intent.get('repo') == repo
+                    and intent.get('kind') in {'bootstrap_fetch', 'project_fetch'}
+                    and _read(slot / f"{intent.get('id')}.intent.json") == intent
+                    and live_refs.get(target) == intent['expected'].get('oid')
+                    and marker(intent)):
+                # Read-only acceptance of a completed Git effect before its
+                # receipt save. Do not fabricate or finalize execution audit.
+                verified_transition(intent, {'oid': live_refs[target]}, True)
+                transitions.setdefault(('refs', target), []).append(
+                    (intent['before']['oid'], intent['expected']['oid']))
+            else:
+                active_targets.add((category, target))
         for result_path in slot.glob("*.result.json"):
             result = _read(result_path)
             if result.get("status") != "complete":
                 continue
             identity = str(result.get("id", ""))
             intent = _read(slot / f"{identity}.intent.json")
+            if intent.get('id') != identity or result_path.name != f'{identity}.result.json':
+                raise MutationEvidenceError('Manager Git result identity differs')
             if intent.get("repo") != repo:
                 continue
+            if fetch_refs is not None and (
+                    intent.get('kind') not in {'bootstrap_fetch', 'project_fetch'}
+                    or intent.get('target') not in fetch_refs
+                    or _slot(state_dir, repo, intent['kind'], intent['target']) != slot):
+                raise MutationEvidenceError('Manager fetch journal resource identity differs')
             if str(intent.get("kind", "")).startswith("managed_"):
                 continue
             validated = verified_transition(
@@ -1022,13 +1081,17 @@ def verified_managed_transitions(
     state_dir: Path, repo: str, owner: str, *,
     agent_session_id: str | None = None,
     git: Callable[..., Any] | None = None,
+    kind: str | None = None, target: str | None = None,
 ) -> list[dict[str, Any]]:
     """Offer G-092 sealed per-operation evidence, not a live-state allowance."""
     root = state_dir / "manager-git-journal"
     if not root.exists():
         return []
     transitions = []
-    for slot in root.iterdir():
+    if (kind is None) != (target is None):
+        raise MutationEvidenceError('Manager Git resource filter requires kind and target')
+    slots = root.iterdir() if kind is None else (_slot(state_dir, repo, kind, target),)
+    for slot in slots:
         if not slot.is_dir():
             continue
         active = slot / "active.json"
@@ -1040,14 +1103,16 @@ def verified_managed_transitions(
             if result.get("id") == active_id or result.get("status") != "complete":
                 continue
             intent = _read(slot / f"{result.get('id')}.intent.json")
+            if kind is not None and (intent.get('kind') != kind or intent.get('target') != target):
+                raise MutationEvidenceError('Manager Git resource identity differs')
             if intent.get("repo") != repo or intent.get("owner") != owner:
                 continue
-            kind = intent.get("kind")
-            if kind not in {
+            operation_kind = intent.get("kind")
+            if operation_kind not in {
                 "managed_worktree_create", "managed_worktree_remove", "managed_rebase",
             }:
                 continue
-            if (kind == "managed_rebase"
+            if (operation_kind == "managed_rebase"
                     and intent["expected"].get("agent_session_id")
                     != agent_session_id):
                 continue
@@ -1055,8 +1120,8 @@ def verified_managed_transitions(
                 raise MutationEvidenceError("Manager Git 전이 결과 identity가 다릅니다.")
             if not isinstance(result.get("observed"), dict):
                 raise MutationEvidenceError("Manager Git 저장 결과 상태가 불완전합니다.")
-            if kind in {"managed_worktree_create", "managed_worktree_remove"}:
-                action = "create" if kind.endswith("create") else "remove"
+            if operation_kind in {"managed_worktree_create", "managed_worktree_remove"}:
+                action = "create" if operation_kind.endswith("create") else "remove"
                 receipt = state_dir / "managed-worktree-intents" / f"{intent['id']}.{action}.json"
                 marker = receipt.is_file() and _read(receipt) == {
                     "id": intent["id"], "repo": intent["repo"],

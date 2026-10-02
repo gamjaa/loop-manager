@@ -17,6 +17,59 @@ class ScopeDecisionError(RuntimeError):
     """A persisted snapshot cannot be safely reconciled."""
 
 
+def index_security_flags(entries: tuple[str, ...]) -> tuple[str, ...]:
+    """Separate ls-files status/stage from assume-unchanged and skip-worktree.
+
+    M is Git's unmerged status, not an index flag. Multiple conflict stages
+    share one path's flags, so their count must not affect this comparison.
+    Unknown or malformed markers remain protected rather than disappearing.
+    """
+    flags = set()
+    for entry in entries:
+        fields = entry.split()
+        tag = fields[0] if fields else ''
+        stage = fields[-1] if len(fields) >= 3 else ''
+        if tag == 'H' or (tag == 'M' and stage in {'1', '2', '3'}):
+            continue
+        if tag in {'h', 'm', 's'}:
+            flags.add('assume-unchanged')
+        if tag in {'S', 's'}:
+            flags.add('skip-worktree')
+        if tag not in {'h', 'S', 's'} and not (tag == 'm' and stage in {'1', '2', '3'}):
+            flags.add('unknown:' + entry)
+    return tuple(sorted(flags))
+
+
+def changed_conflict_paths(before: GitSnapshot, after: GitSnapshot) -> frozenset[str]:
+    return frozenset(path for path in before.index.keys() | after.index.keys()
+        if before.index.get(path) != after.index.get(path)
+        and any(entry.split()[-1:] in (['1'], ['2'], ['3'])
+                for entry in (*before.index.get(path, ()), *after.index.get(path, ()))))
+
+
+def reconcile_manager_metadata(snapshot: GitSnapshot, current: GitSnapshot, *,
+                               refs: frozenset[str], worktrees: frozenset[str],
+                               resources: GitResources | None = None) -> GitSnapshot:
+    """Apply only operation-proven keys; preserve local Agent work and audit.
+
+    The caller must prove each chain from this snapshot to current Git. With
+    invocation isolation, unrelated resources need no baseline advancement.
+    """
+    def advance(previous, observed, keys):
+        updated = dict(previous)
+        for key in keys:
+            if key in observed:
+                updated[key] = observed[key]
+            else:
+                updated.pop(key, None)
+        return updated
+    if resources is not None:
+        refs &= resources.refs
+        worktrees &= resources.worktrees
+    return replace(snapshot, refs=advance(snapshot.refs, current.refs, refs),
+                   worktrees=advance(snapshot.worktrees, current.worktrees, worktrees))
+
+
 @dataclass(frozen=True)
 class GitResources:
     """Resources used by this role and phase, after invocation proof validation."""
@@ -212,6 +265,7 @@ def decide_persisted_scope(
     manager_cleanup_worktrees: frozenset[str],
     manager_runtime: tuple[str, str] | None = None,
     runtime_recreation_proven: bool = False,
+    manager_refs: frozenset[str] = frozenset(),
 ) -> ScopeDecision:
     """Describe ordered scope checks without reading Git or persisted state."""
     if role not in {"planner", "maintenance_planner", "worker", "reviewer"}:
@@ -273,13 +327,8 @@ def decide_persisted_scope(
         allowed_refs = frozenset()
         allowed_worktrees = frozenset()
         if result is not None and result.shared_metadata_complete:
-            allowed_refs = metadata_changes_after_block(
-                before.refs, result.refs, current.refs,
-                frozenset((f"refs/heads/{base_branch}", f"refs/remotes/origin/{base_branch}")),
-            )
-            allowed_worktrees = metadata_changes_after_block(
-                before.worktrees, result.worktrees, current.worktrees, frozenset((repo_key,)),
-            )
+            allowed_refs = manager_refs
+            allowed_worktrees = manager_cleanup_worktrees
         if result is not None and result.worktrees.get(worktree_key) != current_registration:
             correction_worktrees[worktree_key] = before_registration
         correction_result = result or current
@@ -300,18 +349,7 @@ def decide_persisted_scope(
                 checkpoint.snapshot, checkpoint.snapshot, current, worktree_key,
                 allowed_dirty_paths=frozenset((selected_plan_path,)),
             )
-        manager_refs = frozenset(
-            refname for refname in set(checkpoint.snapshot.refs) | set(current.refs)
-            if checkpoint.snapshot.refs.get(refname) != current.refs.get(refname)
-            and (
-                refname.startswith("refs/remotes/origin/")
-                or refname.startswith("refs/tags/")
-                or (phase == "PLAN_BLOCKED" and refname == f"refs/heads/{base_branch}")
-            )
-        )
         allowed_cleanup = checkpoint.cleanup_worktrees | manager_cleanup_worktrees
-        if phase == "PLAN_BLOCKED":
-            allowed_cleanup |= frozenset((repo_key,))
         checks.append(ScopeCheck(
             "reviewer", scope_before, current, manager_refs, allowed_cleanup,
             checkpoint_result=True,
@@ -329,15 +367,7 @@ def decide_persisted_scope(
         scope_before, commit_refs, commit_worktrees = diagnosed_blocked_commit_allowances(
             before, result, current, worktree_key, scope_before,
         )
-        manager_candidates = frozenset(
-            {f"refs/heads/{base_branch}"}
-            | {refname for refname in set(before.refs) | set(current.refs)
-               if refname.startswith("refs/remotes/origin/") or refname.startswith("refs/tags/")}
-        )
-        allowed_refs = metadata_changes_after_block(
-            before.refs, result.refs, current.refs, manager_candidates,
-        ) | commit_refs
-        allowed_worktrees = metadata_changes_after_block(
-            before.worktrees, result.worktrees, current.worktrees, frozenset((repo_key,)),
-        ) | commit_worktrees
-    return ScopeDecision((ScopeCheck(role, scope_before, current, allowed_refs, allowed_worktrees),), before)
+        allowed_refs = manager_refs | commit_refs
+        allowed_worktrees = manager_cleanup_worktrees | commit_worktrees
+    return ScopeDecision((ScopeCheck(role, scope_before, current, allowed_refs | manager_refs,
+                                    allowed_worktrees | manager_cleanup_worktrees),), before)

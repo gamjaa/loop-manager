@@ -47,11 +47,13 @@ Agent 시작 snapshot 뒤에 Manager의 검증된 Git 작업이 있어도 현재
 
 ## Progress
 
-- [ ] 검증된 Manager 전이의 Agent 기준선 반영
-- [ ] 저장된 오탐 차단의 증거 기반 해제
-- [ ] 정상 충돌 stage 전이와 실제 index flags 변경 구분
-- [ ] PLAN_BLOCKED의 소유 rebase 및 detached HEAD 복구 경계
-- [ ] 재개·재검증 및 다른 차단 보존 회귀 사례
+- [x] 검증된 Manager 전이의 Agent 기준선 반영
+- [x] 저장된 오탐 차단의 증거 기반 해제
+- [x] 정상 충돌 stage 전이와 실제 index flags 변경 구분
+- [x] PLAN_BLOCKED의 소유 rebase 및 detached HEAD 복구 경계
+- [x] 재개·재검증 및 다른 차단 보존 회귀 사례
+
+2026-10-02 Worker: 관련 unit test 73개 통과. 실제 Git 충돌·재시작에서 Worker 후보 확인·verify·Review·게시까지 이어지는 PR 없는 branch 및 기존 PR 회귀를 기존 fixture에 추가했다. integration test와 전체 verify는 실행하지 않았으며 Loop Manager 검증·Reviewer·사용자 Merge는 대기 중이다. 현재 Linux 환경의 기존 `scripts/verify.sh`가 전체 unittest discovery 및 변경 모듈 검증을 포함하므로 스크립트 변경은 필요하지 않았다.
 
 ## Decision Log
 
@@ -59,3 +61,4 @@ Agent 시작 snapshot 뒤에 Manager의 검증된 Git 작업이 있어도 현재
 - 2026-09-27: 사용자 요청으로 G-093의 정상 충돌 stage 해소가 `index flags` 위반으로 판정되고 이후 차단 복구의 일반 branch 검사에서 detached HEAD가 거부되는 재발 조건을 보강했다. Manager 소유 rebase와 허용된 파일·index 전이를 독립적으로 증명하는 범위로 한정하며, 무관한 외부 Git 변화를 과거 실행에 소급 허용하지 않는다.
 - G-088처럼 실제 Review 실패와 진행 rebase가 함께 남은 경우 rebase 소유권 확인은 별도 Review 원인의 해제 근거가 아니다. 이 보강은 기존 dependency를 변경하거나 선행 계획의 차단을 우회해 G-092를 시작하도록 허용하지 않는다.
 - 2026-09-30: mutable READY snapshot의 기준 revision·원본 hash를 확인해 R-048을 반영했다. 앞선 기록의 rebase 작업 수행 증거 요구는 G-109·G-110의 현재 상태 판정으로 대체한다. G-110은 rebase 충돌/완료 원인의 수동 복구를 먼저 구현하고, 이 계획은 그 결과에 기반한 Agent scope 기준선·정상 stage 오탐 복구를 담당한다. 격리 없는 과거 Agent 실행의 무관한 ref/worktree 변화는 계속 소급 허용하지 않는다.
+- 2026-10-02: G-109/G-110의 현재 rebase 서비스·기준선 수용·원자적 원인 해제·후보 재검증을 재사용했다. 실제 Agent 결과를 먼저 검사한 뒤 선택 rebase 상태만 비교 기준선에 반영하고, fetch에는 일치하는 전후 intent와 끊김 없는 소유 reflog 전이를 요구한다. 복구 worktree는 해당 create receipt만 검증하므로 무관한 과거 rebase journal 누락이 gate가 되지 않는다. 원본 snapshot과 수동 복구 감사를 Manager 실행·격리 증거로 바꾸지 않는다. 새 scope 해제는 입력 지문 변경을 요구하지 않으며 다른 Review·planning·계획 차단과 retry·실패 이력을 보존한다. Requirement archive 허용 경로도 revision별 eligibility를 재사용한다.

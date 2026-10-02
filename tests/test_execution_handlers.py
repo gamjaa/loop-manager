@@ -63,6 +63,14 @@ def recovered_rebase_publication(publication, state):
 
 
 class ExecutionHandlerTests(TestCase):
+    def test_scope_stage_false_block_recovers_checkpoint_through_fresh_validation(self):
+        self._legacy_rebase_false_block_recovery(
+            plan_block=True, manual='staged', scope_stage_block=True)
+
+    def test_scope_stage_false_block_recovers_existing_pr_through_fresh_validation(self):
+        self._legacy_rebase_false_block_recovery(
+            plan_block=True, existing_pr=True, manual='staged', scope_stage_block=True)
+
     def test_manual_detached_block_recovers_changed_plan_without_rebase_journal(self):
         self._legacy_rebase_false_block_recovery(plan_block=True, manual='waiting')
 
@@ -127,7 +135,7 @@ class ExecutionHandlerTests(TestCase):
 
     def _legacy_rebase_false_block_recovery(self, *, plan_block, rejected=None,
                                           existing_pr=False, published_checkpoint=False,
-                                          stale_cache=False, manual=None):
+                                          stale_cache=False, manual=None, scope_stage_block=False):
         self.journal_start.stop()
         fixture = test_blocked_checkpoint.BlockedCheckpointGitAdapterTest(methodName='runTest')
         fixture.setUp()
@@ -207,6 +215,13 @@ class ExecutionHandlerTests(TestCase):
         self.assertNotEqual(lm.git(
             fixture.worktree, 'rebase', target, check=False, env=environment,
         ).returncode, 0)
+        if scope_stage_block:
+            before_scope = lm.capture_git_snapshot(fixture.worktree)
+            self.assertTrue(any(entry.endswith((' 1', ' 2', ' 3'))
+                                for entry in before_scope.index['code.py']))
+            connection.execute(
+                "UPDATE exec_plans SET agent_role = 'worker', agent_snapshot = ?, agent_baseline = ?",
+                (before_scope.serialize(), before_scope.head))
         if manual is None:
             with mock.patch.object(lm, 'pr_for_branch', return_value=pull_request):
                 handler._finish_rebase_journal(context)
@@ -232,6 +247,16 @@ class ExecutionHandlerTests(TestCase):
                 self.assertNotEqual(git(fixture.worktree, 'rev-parse', 'HEAD^{tree}'), tree)
         reason = ('manual G-088 conflict; inputs changed' if manual else
                   rebase_block_reconciliation.LEGACY_COMPLETION_DIAGNOSTIC)
+        if scope_stage_block:
+            reason = 'code.py: legacy index flags M -> H false positive'
+            resolved_scope = lm.capture_git_snapshot(fixture.worktree)
+            self.assertTrue(all(entry.startswith('H ') and entry.endswith(' 0')
+                                for entry in resolved_scope.index['code.py']))
+            with mock.patch.object(lm, 'pr_for_branch', return_value=pull_request):
+                lm.validate_worker_workspace_scope(
+                    fixture.repo, fixture.worktree, branch, 'main', context.plan.path,
+                    connection.execute('SELECT * FROM exec_plans').fetchone(), before_scope,
+                    allow_rebase=True, connection=connection)
         handlers.recovery_state.begin_external_run(connection)
         if manual is None:
             handlers.recovery_state.RecoveryRepository(connection).observe(
@@ -242,7 +267,8 @@ class ExecutionHandlerTests(TestCase):
                 ),
             )
         if plan_block:
-            fixture.block('managed_worktree_conflict', reason)
+            fixture.block('managed_worktree_scope_violation' if scope_stage_block
+                          else 'managed_worktree_conflict', reason)
         else:
             with connection:
                 connection.execute(
@@ -256,7 +282,7 @@ class ExecutionHandlerTests(TestCase):
                     handlers.RecoveryObservation(handlers.RecoveryReason.STATE_UNSAFE, repo, 'G-034',
                         'WORKING', fixture.base_oid, fixture.base_oid, 'saved-rebase', 'old-progress', reason),
                     final_block_reason=scoped_blocking.BlockReasonCode.REPOSITORY_STATE_UNSAFE)
-        if manual:
+        if manual and not scope_stage_block:
             plan_path = connection.execute('SELECT path FROM exec_plans').fetchone()[0]
             document = fixture.worktree / plan_path
             document.write_text(document.read_text() + '\nUser input changed during blocked rebase.\n')
@@ -399,7 +425,8 @@ class ExecutionHandlerTests(TestCase):
                     git(fixture.worktree, 'add', 'code.py')
                 # The user's changed plan is also part of this manual result;
                 # Git continue requires all tracked edits to be staged.
-                git(fixture.worktree, 'add', '--', plan_path)
+                if not scope_stage_block:
+                    git(fixture.worktree, 'add', '--', plan_path)
                 # Leave continuation and candidate adoption to Manager recover().
                 self.assertEqual(ExecutionCheckpointRepository(connection).get(repo, 'G-034').operation,
                                  'rebase')
@@ -6201,6 +6228,22 @@ class CurrentRebaseAgentScopeTests(TestCase):
         with self.assertRaises(lm.AgentScopeError):
             lm.validate_persisted_agent_scope(connection, Path('/repo'), Path('/state'), 'repo')
         self.assertEqual(connection.execute("SELECT agent_snapshot FROM projects WHERE repo = 'repo'").fetchone()[0], self.original.serialize())
+
+    def test_persisted_rebase_keeps_only_revision_eligible_requirement_archive_paths(self):
+        connection = self.case.fixture.connection
+        lm.begin_agent_scope(connection, 'repo', Path('/state/G-047'), 'worker')
+        source = 'docs/requirements/[R-048] Evidence-Free Managed Rebase Recovery.md'
+        archive = lm.requirement_archive_path(source)
+        self.current = replace(self.current, dirty={source: (('staged',), 'deleted'),
+                                                    archive: (('staged',), 'unchanged-document')})
+        connection.execute("UPDATE projects SET agent_result_snapshot = ? WHERE repo = 'repo'",
+                           (self.current.serialize(),))
+        with mock.patch.object(lm, 'requirement_archive_candidates', return_value=(source,)):
+            self.assertEqual(lm.validate_persisted_agent_scope(
+                connection, Path('/repo'), Path('/state'), 'repo'), self.current)
+        with mock.patch.object(lm, 'requirement_archive_candidates', return_value=()):
+            with self.assertRaises(lm.AgentScopeError):
+                lm.validate_persisted_agent_scope(connection, Path('/repo'), Path('/state'), 'repo')
 
 
 class ImmediateRebasePublicationTests(TestCase):

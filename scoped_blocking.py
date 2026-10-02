@@ -61,6 +61,19 @@ _PLAN_REASONS = frozenset(
     }
 )
 
+# Only these saved scope diagnoses can be reconsidered as stale baselines.
+# Revalidation still checks every used resource and actual Agent result.
+SCOPE_BASELINE_REASONS = frozenset({
+    BlockReasonCode.DEFAULT_WORKTREE_MUTATION.value,
+    BlockReasonCode.SHARED_REF_MUTATION.value,
+    BlockReasonCode.OUTSIDE_MANAGED_WORKTREE_MUTATION.value,
+    BlockReasonCode.MANAGED_WORKTREE_SCOPE_VIOLATION.value,
+})
+
+
+def is_scope_baseline_block(block) -> bool:
+    return block is not None and block['reason_code'] in SCOPE_BASELINE_REASONS
+
 
 def reason_scope(reason: BlockReasonCode) -> BlockScope:
     """Return the single allowed scope for a code-owned reason."""

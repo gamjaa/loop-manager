@@ -3488,6 +3488,170 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class ScopeBaselineRecoveryUnitTests(unittest.TestCase):
+    """Scope-only releases use in-memory state and read-only fake Git ports."""
+    def setUp(self):
+        from tests.test_execution_handlers import current_rebase_case
+        from agent_scope_decision import used_git_resources
+        self.case = current_rebase_case(self)
+        self.connection = self.case.fixture.connection
+        self.checkpoints = self.case.checkpoint
+        self.worktree = Path('/state/G-047')
+        self.repo_path = Path('/repo')
+        self.before = loop_manager.GitSnapshot('owned-head', 'loop-manager/G-047', {}, {},
+            {'refs/heads/loop-manager/G-047': ('owned-head', '')},
+            {'/state/G-047': ('HEAD=owned-head', 'branch=refs/heads/loop-manager/G-047'),
+             '/repo': ('HEAD=source', 'state=clean')}, {}, {})
+        self.current = replace(self.before, dirty={'app.py': (('unstaged',), 'saved-work')},
+            worktrees={**self.before.worktrees, '/repo': ('HEAD=source', 'state=user-dirty')})
+        self.resources = used_git_resources(role='worker', phase='WORKING', base_branch='main',
+            branch='loop-manager/G-047', worktree_key=str(self.worktree))
+        self.isolated = True
+        checkpoint = self.checkpoints.get('repo', 'G-047')
+        self.checkpoints.record('repo', 'G-047', expected_generation=checkpoint.generation,
+            operation=None, expected_head='owned-head', target_base_oid='base',
+            observed_remote_oid=None, snapshot={})
+        self.connection.execute("UPDATE projects SET planning_attempt_fingerprint = NULL")
+        self.connection.execute("UPDATE exec_plans SET workspace_owned = 1, agent_role = 'worker', "
+            "agent_snapshot = ?, agent_result_snapshot = ?, retry_count = 3, review_failure_history = '{\"failure\":2}'",
+            (self.before.serialize(), self.current.serialize()))
+        self.connection.commit()
+        for patcher in (
+            mock.patch.object(loop_manager, 'capture_git_snapshot', side_effect=lambda *_: self.current),
+            mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
+            mock.patch.object(loop_manager, 'validate_managed_worktree'),
+            mock.patch.object(loop_manager, '_owned_rebase_state_dir', return_value=Path('/state')),
+            mock.patch.object(loop_manager, '_agent_git_resources',
+                              side_effect=lambda *_a, **_k: self.resources if self.isolated else None),
+            mock.patch.object(loop_manager, '_published_plan_allows_common_plans', return_value=False),
+            mock.patch.object(loop_manager, 'git', side_effect=AssertionError('recovery must not write Git or start an Agent')),
+            mock.patch.object(loop_manager, 'git_bytes', return_value=b''),
+            mock.patch.object(loop_manager, 'operation_log'),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def project_block(self):
+        scoped_blocking.record_project_block(self.connection, 'repo',
+            BlockReasonCode.DEFAULT_WORKTREE_MUTATION, 'source checkout changed', 'scope-fingerprint',
+            plan_id='G-047', previous_phase='WORKING')
+
+    def resume_project(self):
+        return loop_manager.resume_project_block_if_safe(
+            self.connection, self.repo_path, Path('/state'), 'repo')
+
+    def test_isolated_default_worktree_false_positive_keeps_work_session_and_retry_history(self):
+        self.project_block()
+        self.assertTrue(self.resume_project())
+        row = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual(row['agent_snapshot'], self.before.serialize())
+        self.assertEqual(row['agent_result_snapshot'], self.current.serialize())
+        self.assertEqual((row['worker_session_id'], row['retry_count'], row['review_failure_history']),
+                         ('saved-worker', 3, '{"failure":2}'))
+        self.assertIsNone(scoped_blocking.project_block(self.connection, 'repo'))
+
+    def test_legacy_execution_without_isolation_cannot_attribute_external_source_change(self):
+        self.isolated = False
+        self.project_block()
+        block = dict(scoped_blocking.project_block(self.connection, 'repo'))
+        self.assertFalse(self.resume_project())
+        self.assertEqual(dict(scoped_blocking.project_block(self.connection, 'repo')), block)
+
+    def test_mixed_used_ref_or_config_change_keeps_default_worktree_block(self):
+        self.project_block()
+        original = self.current
+        for current in (replace(original, refs={**original.refs, 'refs/remotes/origin/main': ('foreign', '')}),
+                        replace(original, config={'local:core.hooksPath': ('foreign',)})):
+            self.current = current
+            with self.subTest(current=current):
+                self.assertFalse(self.resume_project())
+                self.assertEqual(scoped_blocking.project_block(self.connection, 'repo')['evidence'],
+                                 'source checkout changed')
+
+    def test_releasing_project_scope_does_not_release_separate_review_cause(self):
+        runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
+        runtime.block_plan('repo', 'G-047', reason_code='review_specification_deadlock',
+                           evidence='review still needs a decision', release_fingerprint='review')
+        review = dict(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
+        self.project_block()
+        self.assertTrue(self.resume_project())
+        self.assertEqual(dict(scoped_blocking.plan_block(self.connection, 'repo', 'G-047')), review)
+        self.assertEqual(self.connection.execute('SELECT status FROM exec_plans').fetchone()[0], 'PLAN_BLOCKED')
+
+    def test_current_git_race_keeps_original_project_scope_block(self):
+        self.project_block()
+        original = self.current
+        count = 0
+        def capture(*_args):
+            nonlocal count
+            count += 1
+            return original if count < 3 else replace(original, head='foreign')
+        with mock.patch.object(loop_manager, 'capture_git_snapshot', side_effect=capture):
+            self.assertFalse(self.resume_project())
+        self.assertIsNotNone(scoped_blocking.project_block(self.connection, 'repo'))
+
+    def test_saved_real_index_flag_violation_remains_blocked_after_flag_restoration(self):
+        self.project_block()
+        flagged = replace(self.current, index={'app.py': ('S 100644 resolved 0',)})
+        self.connection.execute('UPDATE exec_plans SET agent_result_snapshot = ?', (flagged.serialize(),))
+        self.assertFalse(self.resume_project())
+        self.assertIsNotNone(scoped_blocking.project_block(self.connection, 'repo'))
+
+    def test_planner_scope_release_rechecks_snapshot_and_preserves_planning_error(self):
+        from agent_scope_decision import used_git_resources
+        self.before = replace(self.before, branch=None, dirty={})
+        self.current = replace(self.before, worktrees=self.current.worktrees)
+        self.resources = used_git_resources(role='planner', phase='PLANNING', base_branch='main',
+            branch=None, worktree_key=str(self.worktree))
+        self.connection.execute("UPDATE projects SET phase = 'PLANNING', plan_path = NULL, "
+            "agent_role = 'planner', agent_snapshot = ?, agent_result_snapshot = ?, "
+            "worktree = ?, planning_error = 'independent planning error'",
+            (self.before.serialize(), self.current.serialize(), str(self.worktree)))
+        scoped_blocking.record_project_block(self.connection, 'repo',
+            BlockReasonCode.DEFAULT_WORKTREE_MUTATION, 'source changed', 'same',
+            plan_id=None, previous_phase='PLANNING')
+        original = self.current
+        count = 0
+        def capture(*_args):
+            nonlocal count
+            count += 1
+            return original if count == 1 else replace(original, head='late mutation')
+        with mock.patch.object(loop_manager, 'capture_git_snapshot', side_effect=capture):
+            self.assertFalse(self.resume_project())
+        self.assertTrue(self.resume_project())
+        project = self.connection.execute('SELECT * FROM projects').fetchone()
+        self.assertEqual(project['planning_error'], 'independent planning error')
+        self.assertEqual(project['last_error'], 'independent planning error')
+
+    def test_plan_scope_release_requires_matching_published_checkpoint_ownership(self):
+        runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
+        runtime.block_plan('repo', 'G-047', reason_code='managed_worktree_scope_violation',
+                           evidence='old scope', release_fingerprint='same')
+        self.connection.execute("UPDATE blocked_checkpoints SET phase = 'published', published_oid = 'foreign'")
+        self.connection.commit()
+        with mock.patch.object(loop_manager, '_owned_checkpoint_remote_oid', return_value=None) as ownership:
+            self.assertFalse(loop_manager.resume_plan_blocks(
+                self.connection, self.repo_path, Path('/state'), 'repo', 'main'))
+        ownership.assert_called_once()
+        self.assertIsNotNone(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
+
+    def test_plan_scope_false_positive_requeues_same_worker_and_invalidates_validation(self):
+        runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
+        runtime.block_plan('repo', 'G-047', reason_code='managed_worktree_scope_violation',
+                           evidence='legacy unrelated source scope', release_fingerprint='unchanged')
+        self.connection.commit()
+        self.assertTrue(loop_manager.resume_plan_blocks(
+            self.connection, self.repo_path, Path('/state'), 'repo', 'main'))
+        row = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual((row['status'], row['worker_session_id'], row['retry_count']),
+                         ('IMPLEMENTING', 'saved-worker', 3))
+        for field in ('worker_result', 'verify_result', 'review_result', 'worker_input_token',
+                      'verify_token', 'review_token', 'publication_token'):
+            self.assertIsNone(row[field], field)
+        self.assertEqual(row['agent_snapshot'], self.before.serialize())
+        self.assertTrue(self.checkpoints.get('repo', 'G-047').snapshot['scope_block_release_audit'])
+
+
 class EvidenceFreeRebaseBlockTests(unittest.TestCase):
     """Real current-state decisions and SQLite transitions; no Git lifecycle."""
     def setUp(self):
@@ -3608,6 +3772,118 @@ class EvidenceFreeRebaseBlockTests(unittest.TestCase):
         self.assertTrue(self.resume())
         self.assertEqual(self.case.observed.staged[0].new_oid, 'manual')
         self.assertEqual(self.checkpoints.get('repo', 'G-047').operation, 'rebase')
+        self.git_write.assert_not_called()
+
+    def scope_stage_result(self):
+        self.pending(staged=True)
+        path, branch = '/state/G-047', 'loop-manager/G-047'
+        before = loop_manager.GitSnapshot('partial', None,
+            {'app.py': tuple(f'M 100644 old-{stage} {stage}' for stage in (1, 2, 3))}, {},
+            {f'refs/heads/{branch}': ('before', '')},
+            {path: ('HEAD=partial', 'detached=True')}, {}, {'rebase-merge': 'same'})
+        result = replace(before, index={'app.py': ('H 100644 manual 0',)},
+                         dirty={'app.py': (('staged',), 'manual-file')})
+        self.current_scope = result
+        self.connection.execute("UPDATE exec_plans SET agent_role = 'worker', agent_snapshot = ?, "
+            "agent_result_snapshot = ?, retry_count = 3, review_failure_history = '{\"issue\":2}'",
+            (before.serialize(), result.serialize()))
+        self.connection.execute("UPDATE projects SET agent_role = 'worker', agent_snapshot = ?, "
+            "agent_result_snapshot = ?", (before.serialize(), result.serialize()))
+        self.connection.commit()
+        for patcher in (
+            mock.patch.object(loop_manager, 'capture_git_snapshot', side_effect=lambda *_: self.current_scope),
+            mock.patch.object(loop_manager, '_published_plan_allows_common_plans', return_value=False),
+            mock.patch.object(loop_manager, 'requirement_archive_candidates', return_value=()),
+            mock.patch.object(loop_manager, '_owned_rebase_state_dir', return_value=None),
+            mock.patch.object(loop_manager, '_proven_merged_cleanup_paths', return_value=frozenset()),
+            mock.patch.object(loop_manager, 'git_bytes', return_value=b''),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return before, result
+
+    def test_saved_scope_stage_false_positive_resumes_without_input_change_or_retry_reset(self):
+        self.block(reason='managed_worktree_scope_violation')
+        before, result = self.scope_stage_result()
+        self.assertTrue(self.resume())
+        row = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual(row['status'], 'IMPLEMENTING')
+        self.assertEqual(row['agent_snapshot'], before.serialize())
+        self.assertEqual(row['agent_result_snapshot'], result.serialize())
+        self.assertEqual(row['retry_count'], 3)
+        self.assertEqual(row['review_failure_history'], '{"issue":2}')
+        self.assertEqual(row['worker_session_id'], 'saved-worker')
+        self.assertEqual(self.checkpoints.get('repo', 'G-047').operation, 'rebase')
+        self.git_write.assert_not_called()
+
+    def test_saved_scope_stage_false_positive_uses_same_owned_existing_pr_service(self):
+        from managed_rebase_validation import PullRequest
+        remote = replace(self.case.expected.remote, pull_request=PullRequest(
+            'https://example/pr/1', self.case.expected.remote.repository,
+            'loop-manager/G-047', 'remote', 'OPEN'))
+        self.case.expected = replace(self.case.expected, remote=remote)
+        self.case.observed = replace(self.case.observed, remote=remote)
+        self.connection.execute("UPDATE exec_plans SET pr_url = 'https://example/pr/1', pr_head_oid = 'remote', "
+                                "pr_conflict_recovery = 1, pr_conflict_head_oid = 'remote'")
+        self.block(reason='managed_worktree_scope_violation')
+        self.scope_stage_result()
+        self.assertTrue(self.resume())
+        row = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual((row['pr_url'], row['pr_head_oid'], row['pr_conflict_recovery']),
+                         ('https://example/pr/1', 'remote', 1))
+        self.git_write.assert_not_called()
+
+    def test_completed_scope_stage_result_adopts_after_restart_and_keeps_other_block(self):
+        self.block(reason='managed_worktree_scope_violation')
+        self.scope_stage_result()
+        self.case.observed = replace(self.case.observed, head='owned-head', branch='loop-manager/G-047',
+            branch_ref=('owned-head', ''), branch_worktrees=('/state/G-047',),
+            registration=('HEAD=owned-head', 'branch=refs/heads/loop-manager/G-047'),
+            operations=(), metadata=None, index_clean=True, staged=())
+        self.current_scope = replace(self.current_scope, head='owned-head', branch='loop-manager/G-047',
+            refs={'refs/heads/loop-manager/G-047': ('owned-head', '')},
+            worktrees={'/state/G-047': self.case.observed.registration}, operations={}, dirty={})
+        self.connection.execute("INSERT INTO exec_plans (repo, plan_id, path, title, sources, "
+            "depends_on, priority, content_hash, status, blocked_reason) VALUES ('repo', 'G-048', "
+            "'docs/plans/[G-048] Other.md', 'Other', '[]', '[]', 'normal', 'hash', 'PLAN_BLOCKED', 'user_decision_required')")
+        self.connection.execute("INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+            "VALUES ('repo', 'G-048', 'plan', 'user_decision_required', 'keep decision')")
+        self.connection.commit()
+        other = dict(scoped_blocking.plan_block(self.connection, 'repo', 'G-048'))
+        self.assertTrue(self.resume())
+        adopted = self.checkpoints.get('repo', 'G-047')
+        self.assertIsNone(adopted.operation)
+        self.assertEqual(adopted.current_rebase_acceptance()['head'], 'owned-head')
+        self.assertEqual(dict(scoped_blocking.plan_block(self.connection, 'repo', 'G-048')), other)
+        self.assertIsNone(self.connection.execute("SELECT verify_token FROM exec_plans WHERE plan_id = 'G-047'").fetchone()[0])
+        self.git_write.assert_not_called()
+
+    def test_saved_scope_recovery_keeps_real_flags_and_out_of_scope_result_blocked(self):
+        self.block(reason='managed_worktree_scope_violation')
+        _, result = self.scope_stage_result()
+        for changed in (replace(result, index={'app.py': ('S 100644 manual 0',)}),
+                        replace(result, index={'app.py': ('h 100644 manual 0',)}),
+                        replace(result, dirty={**result.dirty, 'AGENTS.md': (('unstaged',), 'foreign')}),
+                        replace(result, refs={**result.refs, 'refs/heads/other': ('foreign', '')})):
+            self.connection.execute("UPDATE exec_plans SET agent_result_snapshot = ?", (changed.serialize(),))
+            self.connection.commit()
+            saved = self.snapshot()
+            with self.subTest(changed=changed):
+                self.assertFalse(self.resume())
+                self.assertEqual(self.snapshot(), saved)
+        self.git_write.assert_not_called()
+
+    def test_scope_rebase_release_rolls_back_with_transaction_interruption(self):
+        self.block(reason='managed_worktree_scope_violation')
+        self.scope_stage_result()
+        before = self.snapshot()
+        def fault(_runtime, stage):
+            if stage == 'after_rebase_block_release':
+                raise RuntimeError('interrupted scope release')
+        with mock.patch.object(loop_manager.runtime_state.RuntimeStateRepository, '_fault', fault):
+            self.assertFalse(self.resume())
+        self.assertEqual(self.snapshot(), before)
+        self.assertTrue(self.resume())
         self.git_write.assert_not_called()
 
     def test_previously_adopted_result_rechecks_current_state_and_releases_once(self):
