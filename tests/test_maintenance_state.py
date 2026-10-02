@@ -1405,6 +1405,31 @@ class FileReviewLedgerTest(unittest.TestCase):
             ["src/alpha.go"],
         )
 
+    def test_empty_selection_records_root_placement_inventory(self):
+        self.write(".agents/guide.txt", b"guidance\n")
+        self.write("AGENTS.md", b"# guidance\n")
+        self.write("README.md", b"# project\n")
+        self.write("config/settings.ini", b"[loop]\n")
+        self.write("docs/PRODUCT.md", b"# Product\n")
+        revision = self.publish()
+        inventory = self.inventory(revision)
+
+        self.assertEqual(inventory.sources, ())
+        self.assertEqual(self.ledger.selected_sources(str(self.repo), inventory), ())
+        self.record(inventory, ())
+
+        placements = {item.path: item for item in self.ledger.root_placements(str(self.repo))}
+        self.assertEqual(placements[".agents"].category, "tool_required")
+        self.assertEqual(placements["AGENTS.md"].category, "tool_required")
+        self.assertEqual(placements["docs"].category, "tool_required")
+        self.assertEqual(placements["README.md"].category, "user_entry")
+        self.assertEqual(placements["config"].category, "execution_build_deploy")
+        rows = self.connection.execute(
+            "SELECT DISTINCT source_revision FROM root_placement_reviews WHERE repo = ?",
+            (str(self.repo),),
+        ).fetchall()
+        self.assertEqual([row[0] for row in rows], [revision])
+
     def test_empty_stabilization_source_drift_keeps_ledger_and_baseline(self):
         self.write("src/alpha.go", b"package alpha\n")
         first = self.publish()
@@ -1489,6 +1514,7 @@ class FileReviewLedgerTest(unittest.TestCase):
         with self.assertRaises(sqlite3.IntegrityError):
             self.record(inventory, self.reviewed(selected))
         self.assertEqual(self.ledger.reviews(str(self.repo)), ())
+        self.assertEqual(self.ledger.root_placements(str(self.repo)), ())
         self.assertIsNone(self.ledger.last_success(str(self.repo)))
 
     def test_file_publication_requires_complete_reviews_and_accepts_empty_inventory(self):

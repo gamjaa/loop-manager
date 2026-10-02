@@ -12,7 +12,8 @@ from typing import Iterator, Sequence
 from uuid import uuid4
 
 from maintenance_file_inventory import (
-    SourceInventory, TrackedSource, tracked_source_inventory, verify_remote_revision,
+    RootPlacement, SourceInventory, TrackedSource, root_placement_inventory,
+    tracked_source_inventory, verify_remote_revision,
 )
 
 
@@ -70,11 +71,26 @@ CREATE TABLE IF NOT EXISTS file_assessment_successes (
 )
 """
 
+ROOT_PLACEMENT_REVIEW_SCHEMA = """
+CREATE TABLE IF NOT EXISTS root_placement_reviews (
+    repo TEXT NOT NULL,
+    path TEXT NOT NULL,
+    category TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    source_revision TEXT NOT NULL,
+    reviewed_at TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    PRIMARY KEY (repo, path),
+    FOREIGN KEY (repo) REFERENCES projects(repo)
+)
+"""
+
 
 def ensure_schema(connection: sqlite3.Connection) -> None:
     """Add the ledger without changing existing maintenance rows or markers."""
     connection.execute(FILE_REVIEW_SCHEMA)
     connection.execute(FILE_ASSESSMENT_SUCCESS_SCHEMA)
+    connection.execute(ROOT_PLACEMENT_REVIEW_SCHEMA)
 
 
 @contextmanager
@@ -119,6 +135,18 @@ class FileReviewRepository:
             for path, content_hash, mode, revision, reviewed_at, active in rows
         )
 
+    def root_placements(
+        self, repo: str, *, include_retired: bool = False,
+    ) -> tuple[RootPlacement, ...]:
+        rows = self.connection.execute(
+            "SELECT path, category, reason FROM root_placement_reviews WHERE repo = ? "
+            + ("" if include_retired else "AND active = 1 ")
+            + "ORDER BY path",
+            (repo,),
+        ).fetchall()
+        return tuple(RootPlacement(str(path), str(category), str(reason))
+                     for path, category, reason in rows)
+
     def selected_sources(
         self, repo: str, inventory: SourceInventory,
     ) -> tuple[TrackedSource, ...]:
@@ -162,8 +190,11 @@ class FileReviewRepository:
                  for item in current.sources) != tuple(
                      (item.path, item.content_hash, item.mode, item.reason)
                      for item in inventory.sources
-                 ):
+        ):
             raise FileReviewLedgerError("평가 후 원격 파일 목록 또는 내용이 변경됐습니다.")
+        placements = root_placement_inventory(current)
+        if not placements:
+            raise FileReviewLedgerError("평가할 루트 항목이 없습니다.")
         with _transaction(self.connection):
             selected = self.selected_sources(repo, inventory)
             if len(reviewed) != len(selected):
@@ -202,6 +233,26 @@ class FileReviewRepository:
                     "source_revision = excluded.source_revision, reviewed_at = excluded.reviewed_at, "
                     "active = 1",
                     (repo, source.path, source.content_hash, source.mode,
+                     inventory.revision, reviewed_at),
+                )
+            current_root_paths = {item.path for item in placements}
+            for placement in self.root_placements(repo, include_retired=True):
+                if placement.path not in current_root_paths:
+                    self.connection.execute(
+                        "UPDATE root_placement_reviews SET active = 0 "
+                        "WHERE repo = ? AND path = ?",
+                        (repo, placement.path),
+                    )
+            for placement in placements:
+                self.connection.execute(
+                    "INSERT INTO root_placement_reviews "
+                    "(repo, path, category, reason, source_revision, reviewed_at, active) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 1) "
+                    "ON CONFLICT(repo, path) DO UPDATE SET "
+                    "category = excluded.category, reason = excluded.reason, "
+                    "source_revision = excluded.source_revision, "
+                    "reviewed_at = excluded.reviewed_at, active = 1",
+                    (repo, placement.path, placement.category, placement.reason,
                      inventory.revision, reviewed_at),
                 )
             self.connection.execute(

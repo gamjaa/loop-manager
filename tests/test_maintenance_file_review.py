@@ -71,6 +71,8 @@ class FileReviewPromptTest(unittest.TestCase):
                     "길이만으로 개선을 강제하지 말고",
                     "FILE_REVIEW_RESULT:",
                     "chunk_reviews:",
+                    "revision-bound root placement inventory:",
+                    "실제 참조·사용자 경로·소유권·안전한 목적지",
                 ):
                     self.assertIn(phrase, prompt)
                 self.assertIn(source.content_hash, prompt)

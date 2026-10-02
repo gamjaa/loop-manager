@@ -1717,7 +1717,9 @@ class PlanningLifecycleCoordinator:
             if unit is None:
                 return None
             content = review.content(context.repo_path, context.base_branch, unit.source)
-            prompt = maintenance_file_review.review_prompt(unit.source, content)
+            prompt = maintenance_file_review.review_prompt(
+                unit.source, content, root_placements=progress.root_placements,
+            )
             if unit.error:
                 prompt += "\n이전 검토 결과 오류를 수정하라: " + unit.error
             review.start(context.repo, run.maintenance_cycle.revision, unit.source)

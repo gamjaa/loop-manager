@@ -17,7 +17,8 @@ import sqlite3
 from typing import Sequence
 
 from maintenance_file_inventory import (
-    SourceInventory, TrackedSource, _git, cached_source_inventory,
+    RootPlacement, SourceInventory, TrackedSource, _git, cached_source_inventory,
+    root_placement_inventory,
     verify_remote_revision,
 )
 from maintenance_file_ledger import FileReviewRepository
@@ -65,6 +66,7 @@ class FileReviewProgress:
     selected: tuple[TrackedSource, ...]
     completed: tuple[dict, ...]
     next_unit: ReviewUnit | None
+    root_placements: tuple[RootPlacement, ...] = ()
 
 
 def _string(value: object, label: str, *, minimum: int = 1) -> str:
@@ -277,7 +279,10 @@ def parse_review(output: str, source: TrackedSource, content: bytes) -> dict:
     return result
 
 
-def review_prompt(source: TrackedSource, content: bytes) -> str:
+def review_prompt(
+    source: TrackedSource, content: bytes, *,
+    root_placements: tuple[RootPlacement, ...] = (),
+) -> str:
     """Give the Agent the exact blob for a bounded, single-file review unit."""
     text = _source_text(content)
     source_location = json.dumps({
@@ -310,6 +315,9 @@ def review_prompt(source: TrackedSource, content: bytes) -> str:
             "0 byte이면 chunk_reviews도 []이며, 공백 byte가 있으면 모든 구간의 "
             "지문과 공백 인용 및 검토 근거를 기록하라.\n"
         )
+    root_inventory = json.dumps(
+        [item.__dict__ for item in root_placements], ensure_ascii=False,
+    )
     return (
         "당신은 유지보수 Planner다. 아래 Git blob 원본 파일 하나를 실제로 읽고 검토하라. "
         "파일이나 문서를 수정하지 마라. 길이만으로 개선을 강제하지 말고, 읽기 쉬움, "
@@ -318,6 +326,10 @@ def review_prompt(source: TrackedSource, content: bytes) -> str:
         "나중에 확인할 후보만 pending에 남겨라. 문맥 파일은 검토 완료 대상으로 세지 마라.\n"
         f"{AGENT_QUALITY_GUIDANCE}\n"
         f"source identity: {source_location}\n"
+        "revision-bound root placement inventory: " + root_inventory + "\n"
+        "각 root 항목의 분류와 근거를 보존하고, 현재 source와 직접 연결되는 "
+        "항목은 실제 참조·사용자 경로·소유권·안전한 목적지를 확인하라. "
+        "근거가 불명확하면 이동·삭제 후보로 만들지 마라.\n"
         + source_instruction +
         "최종 응답에는 FILE_REVIEW_RESULT: 다음에 한 줄 JSON object를 정확히 하나 기록하라. "
         "필수 필드: path, content_hash, mode, source_revision, "
@@ -402,7 +414,9 @@ class ProvisionalReviewRepository:
                                 if item.path not in valid or valid[item.path][2] is None), None)
             unit = (ReviewUnit(next_source, *valid.get(next_source.path, (None, None, None))[:2])
                     if next_source else None)
-        return FileReviewProgress(selected, completed, unit)
+        return FileReviewProgress(
+            selected, completed, unit, root_placement_inventory(inventory),
+        )
 
     def start(self, repo: str, cycle_revision: int, source: TrackedSource) -> None:
         with self.connection:

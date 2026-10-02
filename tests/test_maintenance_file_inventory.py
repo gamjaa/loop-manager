@@ -112,6 +112,34 @@ class TrackedSourceInventoryTest(unittest.TestCase):
         self.assertEqual(classified["requirements-dev.txt"].reason, "root dependency manifest")
         self.assertEqual(classified["build/generated.go"].disposition, "excluded")
 
+    def test_root_placement_inventory_keeps_fixed_paths_and_marks_root_source_for_review(self):
+        files = {
+            ".agents/guide.txt": b"agent guidance\n",
+            "AGENTS.md": b"# guidance\n",
+            "README.md": b"# project\n",
+            "config/settings.ini": b"[app]\n",
+            "docs/PRODUCT.md": b"# Product\n",
+            "tests/check.py": b"assert True\n",
+            "engine.py": b"def run(): pass\n",
+        }
+        for path, content in files.items():
+            self.write(path, content)
+        revision = self.publish()
+
+        inventory = source_inventory.tracked_source_inventory(self.repo, "main", revision)
+        placements = {
+            item.path: item for item in source_inventory.root_placement_inventory(inventory)
+        }
+
+        self.assertEqual(placements[".agents"].category, "tool_required")
+        self.assertEqual(placements["AGENTS.md"].category, "tool_required")
+        self.assertEqual(placements["docs"].category, "tool_required")
+        self.assertEqual(placements["README.md"].category, "user_entry")
+        self.assertEqual(placements["config"].category, "execution_build_deploy")
+        self.assertEqual(placements["tests"].category, "execution_build_deploy")
+        self.assertEqual(placements["engine.py"].category, "internal_implementation")
+        self.assertIn("entry path, references, owner", placements["engine.py"].reason)
+
     def test_revision_drift_and_invalid_revision_fail_before_inventory(self):
         self.write("main.go", b"package main\n")
         first = self.publish()
