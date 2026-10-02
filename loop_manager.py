@@ -536,6 +536,8 @@ def _scope_reconciliation_effects_resume_project_block_if_safe() -> scope_reconc
 
 def _scope_reconciliation_effects_resume_plan_blocks() -> scope_reconciliation.ResumePlanBlocksEffects:
     return scope_reconciliation.ResumePlanBlocksEffects(
+        ROOT=ROOT,
+        load_managed_config=load_managed_config,
         plan_recovery_effects=_blocked_plan_reconciliation_effects,
         _clear_active_in_current_transaction=_clear_active_in_current_transaction,
         _reconcile_published_blocked_checkpoint=_reconcile_published_blocked_checkpoint,
@@ -679,7 +681,9 @@ def _project_blocked_recovery_effects() -> project_blocked_recovery.ProjectRecov
         observe_blocked_plan_remotes=observe_blocked_plan_remotes,
         owned_remote_oid=checkpoint_ownership.owned_remote_oid,
         pr_for_branch=pr_for_branch,
-        push_diagnostic_checkpoint=push_diagnostic_checkpoint,
+        # This reconciler may outlive one publication attempt. Resolve the
+        # injected publication boundary when the attempt actually starts.
+        push_diagnostic_checkpoint=lambda adapter, request, head: push_diagnostic_checkpoint(adapter, request, head),
         reconcile_execplan_catalog=reconcile_execplan_catalog,
         resume_project_block_if_safe=resume_project_block_if_safe,
         unmet_execplan_dependencies=unmet_execplan_dependencies,
@@ -719,6 +723,7 @@ def _checkpoint_recovery_effects_evaluate_remote_checkpoint_cause() -> checkpoin
         _remote_checkpoint_has_new_failure=_remote_checkpoint_has_new_failure,
         _remote_checkpoint_review_revision=_remote_checkpoint_review_revision,
         capture_git_snapshot=capture_git_snapshot,
+        load_managed_config=load_managed_config,
         parse_reviewer_result=parse_reviewer_result,
         parse_worker_result=parse_worker_result,
         reviewer_targeted_test_reason=reviewer_targeted_test_reason,
@@ -12156,7 +12161,7 @@ def _reconcile_guidance_double_block(
         operation_log(f"guidance 이중 차단 복구 보류 ({plan['plan_id']}): {error}", error=True)
         return False
     identity = blocked_checkpoint_state.request_identity(
-        repo, str(plan["plan_id"]), evidence,
+        repo, str(plan["plan_id"]), GUIDANCE_BLOCK_REASON, evidence,
         branch, str(worktree), str(plan["guidance_plan_hash"]),
     )
     with runtime_state._transaction(connection):
@@ -12178,7 +12183,7 @@ def _reconcile_guidance_double_block(
             "commit_identity = ?, tree_oid = ?, local_oid = ?, remote_oid = ?, "
             "published_oid = ?, accepted_remote_oid = ?, result = 'published', "
             "unpublished_reason = NULL, retryable = 0 WHERE repo = ? AND plan_id = ?",
-            (identity, evidence, branch, str(worktree),
+            (identity, GUIDANCE_BLOCK_REASON, evidence, branch, str(worktree),
              commit_fields["Checkpoint-Identity"], tree, oid, oid, oid, oid,
              repo, plan["plan_id"]),
         )

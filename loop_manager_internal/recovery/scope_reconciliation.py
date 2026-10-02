@@ -5,7 +5,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from loop_manager_internal.agents.scope_contracts import AgentScopeError
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
-from loop_manager_internal.config.managed_config import load_managed_config
 from loop_manager_internal.git import rebase_block_reconciliation
 from loop_manager_internal.recovery import blocked_plan_reconciliation
 from loop_manager_internal.recovery import scoped_blocking
@@ -48,6 +47,8 @@ class ResumeProjectBlockIfSafeEffects:
 @dataclass(frozen=True)
 class ResumePlanBlocksEffects:
     """Only the effects consumed by this boundary; no Manager module access."""
+    ROOT: Path
+    load_managed_config: Callable[..., object]
     _clear_active_in_current_transaction: Callable[..., object]
     _reconcile_published_blocked_checkpoint: Callable[..., object]
     _reconcile_rebase_evidence_block: Callable[..., object]
@@ -412,7 +413,7 @@ def resume_plan_blocks(effects: ResumePlanBlocksEffects,
             new_timeout = (
                 verify_timeout_seconds
                 if verify_timeout_seconds is not None
-                else load_managed_config(config_path or ROOT / "config/config.ini").verify_timeout_seconds
+                else effects.load_managed_config(config_path or effects.ROOT / "config/config.ini").verify_timeout_seconds
             )
             if new_timeout <= old_timeout:
                 continue

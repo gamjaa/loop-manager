@@ -56,7 +56,9 @@ G-060의 root inventory와 Git mutation·lease·transaction 대응표를 재사�
 - archive 내용/identity 불일치, source 로컬 변경과 예상 밖 Git config/index flag 변경의 거부를 유지한다.
 - Manager 전체 verify는 실제 Git repository의 workspace/source 동기화, rebase 충돌·재개, PR 복구, archive와 cleanup을 확인한다. Reviewer는 diff와 전달 결과로 gate 누락이나 lease·transaction 경계 약화를 판단한다.
 
-Worker 최종 targeted 결과: adapter 경계 12개, plan 복구 50개, project 복구 27개, scope 복구 39개, checkpoint 채택 7개, block gate/policy 27개, 기존 rebase/archive/diagnostic adapter class 24개, 변경된 checkpoint patch 경로의 개별 case 3개로 총 189개 통과했다. 각 module/class/case에 `python3 -B -m unittest ... -v`를 사용했다. 새 fixture의 snapshot 필드 누락, 분리 class 사이 시나리오 재사용과 이동한 private class의 patch 경로를 수정한 뒤 실패했던 동일 명령을 재실행해 모두 통과했다. 기존 split 대상과 유지한 test 이름의 multiset 257개도 보존했다. 전체 verify, 실제 Git/PR 통합 테스트, Review와 Merge는 아직 수행하지 않았다.
+Worker 최초 구현 targeted 결과: adapter 경계 12개, plan 복구 50개, project 복구 27개, scope 복구 39개, checkpoint 채택 7개, block gate/policy 27개, 기존 rebase/archive/diagnostic adapter class 24개, 변경된 checkpoint patch 경로의 개별 case 3개로 총 189개 통과했다. 각 module/class/case에 `python3 -B -m unittest ... -v`를 사용했다. 새 fixture의 snapshot 필드 누락, 분리 class 사이 시나리오 재사용과 이동한 private class의 patch 경로를 수정한 뒤 실패했던 동일 명령을 재실행해 모두 통과했다. 기존 split 대상과 유지한 test 이름의 multiset 257개도 보존했다.
+
+Manager 전체 verify 피드백 `verify:ad3fe5fb1d0daf6f56660b6988aae674b8c5bf340d41b7d6e5e186555f562f8c` (occurrence 1, revision 1)은 18 failures와 3 errors였다. 저장된 원본 결과를 읽기 전용으로 확인해 guidance 복구의 누락된 사유 인자, 후보 원인 재검증의 설정 로더 우회, 생성 시점에 고정된 진단 게시 callback을 수정했다. timeout 차단 복구에도 설정 로더와 runtime ROOT를 명시적으로 주입했다. `python3 -B -m unittest tests.test_workspace_publication_adapters.CheckpointRecoveryBoundaryRegressionTests -v`의 초기 실패 후 코드와 fixture를 수정하고 같은 명령으로 4개 모두 통과했다. Git·verify·Agent 효과는 mock이며 실제 SQLite로 guidance 변조 거부와 reason/request identity 복원, timeout 차단 유지 및 후보 오류 전파를 확인한다. Worker는 전체 verify나 실제 Git/PR 통합 테스트를 실행하지 않았다. Manager 재검증, Review와 Merge는 남아 있다.
 
 ## Progress
 
@@ -74,3 +76,5 @@ Worker 최종 targeted 결과: adapter 경계 12개, plan 복구 50개, project 
 - 2026-10-02 Worker: block/checkpoint와 G-119 PR/publication 테스트 248개를 test 이름·assertion을 보존해 역할별 class로 나눴다. 공통 fixture는 기존 `tests/support/blocked_remote.py`, `blocked_git.py`와 scope 전용 `scoped_recovery.py`에 둔다. 실제 Git 이력 테스트는 Manager verify 대상으로 남겼으며 Worker는 mock 기반 module/class/case만 실행했다. 두 verify script의 compile manifest를 갱신했고 실행하지 않았다.
 
 - 2026-10-02 사용자 결정: 기존 다른 미착수 작업보다 리팩터링을 먼저 진행하도록 priority를 `critical`로 지정한다. 리팩터링 내부의 선행 Merge 의존성과 검증·Review·사용자 Merge 조건은 유지한다.
+
+- 2026-10-02 Worker 검증 피드백 수정: guidance request identity와 checkpoint UPDATE에 원래의 `GUIDANCE_BLOCK_REASON` 인자를 복원했다. 설정 I/O는 두 recovery effect 계약에 주입하고 timeout의 기본 경로는 주입된 ROOT로 결정한다. 오래 유지되는 project reconciler의 진단 게시 callback은 호출 시점에 root 경계를 조회하도록 연결해 게시 중단·재시작 테스트 경계를 보존한다. 안전 gate·lease·transaction 정책은 변경하지 않았다.

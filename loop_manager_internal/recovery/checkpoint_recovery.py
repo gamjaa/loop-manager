@@ -3,14 +3,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from dataclasses import field
 from dataclasses import replace
 from loop_manager_internal.agents.agent_invocation import InvocationContext
 from loop_manager_internal.agents.agent_prompts import reviewer_prompt
 from loop_manager_internal.agents.agent_scope_decision import _non_default_index_flags
 from loop_manager_internal.agents.agent_scope_decision import _worker_path_allowed
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
-from loop_manager_internal.config.managed_config import load_managed_config
 from loop_manager_internal.documents import reviewer_specification
 from loop_manager_internal.execution import execution_revision
 from loop_manager_internal.execution.validation_feedback import normalize_feedback
@@ -65,6 +63,7 @@ class EvaluateRemoteCheckpointCauseEffects:
     _remote_checkpoint_has_new_failure: Callable[..., object]
     _remote_checkpoint_review_revision: Callable[..., object]
     capture_git_snapshot: Callable[..., object]
+    load_managed_config: Callable[..., object]
     parse_reviewer_result: Callable[..., object]
     parse_worker_result: Callable[..., object]
     reviewer_targeted_test_reason: Callable[..., object]
@@ -486,7 +485,7 @@ def _evaluate_remote_checkpoint_cause(effects: EvaluateRemoteCheckpointCauseEffe
     worktree = Path(str(blocked["worktree"]))
     config = config_path or effects.ROOT / "config/config.ini"
     timeout = (timeout_seconds if timeout_seconds is not None
-               else load_managed_config(config).verify_timeout_seconds)
+               else effects.load_managed_config(config).verify_timeout_seconds)
     project = connection.execute(
         "SELECT provider, base_branch FROM projects WHERE repo = ?", (repo,),
     ).fetchone()
