@@ -41,10 +41,22 @@ priority: critical
 
 ## Progress
 
-- [ ] planning 단계·권한·평가·publication 대응표 확인
-- [ ] 단계별 service·assessment port 추출과 같은 계약의 중복 제거
-- [ ] planning/maintenance test 분리 및 targeted unit test
+- [x] planning 단계·권한·평가·publication 대응표 확인
+- [x] 단계별 service·assessment port 추출과 같은 계약의 중복 제거
+- [x] planning/maintenance test 분리 및 targeted unit test
 - [ ] Manager 전체 verify, 독립 Review 및 사용자 Merge
+
+## Implementation Record
+
+| 단계 | 책임 경계 | 보존된 저장 근거 |
+| --- | --- | --- |
+| 입력 선택·안전 gate·activation | `selection_service.py` | planning 오류 지문, 성공 지문, 유지보수 cycle과 READY catalog |
+| workspace·소유권 | `workspace_service.py` | 저장된 worktree identity와 planning attempt 지문 |
+| Planner 호출·파일/관계 평가·결과 검증 | `assessment_service.py` | Agent session/scope, file ledger·code map, pending result와 retry 기록 |
+| 일회성 전수 평가 | `assessment_port.py` | 기존 serialized report와 cycle audit; 새 port로 대체 가능 |
+| 게시·복구 | `publication_service.py` | mode별 intent, 원격 확인, catalog·cycle transaction과 성공 기준 |
+
+Coordinator는 저장된 snapshot을 읽고 단계별 service에 불변 상태를 전달한다. 일반 planning의 mutable READY 권한과 유지보수 barrier·사후 재검증 권한은 기존 mode별 validation port에서 독립적으로 검사한다. 파일 inventory, ledger, source-bound code map과 관계/발견 검토는 기존 maintenance port를 계속 사용한다.
 
 ## Decision Log
 
