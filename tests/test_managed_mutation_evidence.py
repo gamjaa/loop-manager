@@ -1,4 +1,5 @@
 """Narrow ownership checks for managed workspace and rebase journal entries."""
+from tests.support.execution import complete_execution_effects, execution_handler_stub
 
 from pathlib import Path
 from contextlib import ExitStack
@@ -331,9 +332,9 @@ class ManagedTransitionTests(unittest.TestCase):
             self.assertEqual(journal.verified_managed_transitions(
                 state, '/repo', 'plan:G-091', agent_session_id='other-worker',
             ), [])
-            handler = object.__new__(ExecutionHandlers)
+            handler = execution_handler_stub()
             handler.state_dir, handler.repo_path = state, Path('/repo')
-            handler.effects = SimpleNamespace(workspace=SimpleNamespace(git=mock.Mock()))
+            handler.effects = complete_execution_effects(SimpleNamespace(workspace=SimpleNamespace(git=mock.Mock())))
             context = SimpleNamespace(
                 plan=SimpleNamespace(plan_id='G-091'), worktree=Path(target),
                 worker_session_id='worker-original',
@@ -894,13 +895,13 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
                 head=OLD, branch=None, index={},
                 dirty={'app.py': (('unstaged',), signature),
                        'removed.py': (('unstaged',), 'missing')})
-            handler = object.__new__(ExecutionHandlers)
+            handler = execution_handler_stub()
             handler.repo = 'repo'
-            handler.effects = SimpleNamespace(
+            handler.effects = complete_execution_effects(SimpleNamespace(
                 agent=SimpleNamespace(capture_git_snapshot=lambda *_: observed,
                                       path_signature=loop_manager._path_signature),
                 checkpoint=SimpleNamespace(get=lambda *_: SimpleNamespace(
-                    snapshot={'rebase_evidence_version': 2})))
+                    snapshot={'rebase_evidence_version': 2}))))
             context = SimpleNamespace(worktree=worktree,
                                       plan=SimpleNamespace(plan_id='G-099'))
             evidence = handler._rebase_stage_evidence(context)
@@ -954,14 +955,14 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
             begin.assert_not_called()
 
     def test_dropped_rebase_patch_leaves_journal_unverified_for_no_change_gate(self):
-        handler = object.__new__(ExecutionHandlers)
-        handler.effects = SimpleNamespace(
+        handler = execution_handler_stub()
+        handler.effects = complete_execution_effects(SimpleNamespace(
             checkpoint=None,
             workspace=SimpleNamespace(
                 _rebase_in_progress_for_branch=lambda *_: False,
                 branch_has_changes=mock.Mock(return_value=False),
             ),
-        )
+        ))
         handler.base = 'main'
         handler._unmerged_stages = lambda *_: ''
         handler._finish_rebase_journal = mock.Mock(side_effect=
@@ -1003,8 +1004,8 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
 
     def test_resumed_continue_uses_the_saved_journal_identity(self):
         git = mock.Mock(return_value=SimpleNamespace(returncode=0, stdout=''))
-        handler = object.__new__(ExecutionHandlers)
-        handler.effects = SimpleNamespace(workspace=SimpleNamespace(git=git))
+        handler = execution_handler_stub()
+        handler.effects = complete_execution_effects(SimpleNamespace(workspace=SimpleNamespace(git=git)))
         handler._begin_rebase_continuation = mock.Mock(return_value='owned-token')
         context = SimpleNamespace(worktree=Path('/owned'))
         handler._execute_rebase_step(context, CorrectionAction.CONTINUE)
@@ -1015,15 +1016,15 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
 
     def test_conflict_dispatch_waits_for_journal_result(self):
         events = []
-        handler = object.__new__(ExecutionHandlers)
-        handler.effects = SimpleNamespace(
+        handler = execution_handler_stub()
+        handler.effects = complete_execution_effects(SimpleNamespace(
             checkpoint=None,
             workspace=SimpleNamespace(
                 _rebase_in_progress_for_branch=lambda *_: True,
             ),
             state=SimpleNamespace(update_project=mock.Mock()),
             contract=SimpleNamespace(REBASE_CONFLICT_PREFIX='conflict: '),
-        )
+        ))
         handler.repo = 'repo'
         handler._unmerged_stages = lambda *_: 'unmerged'
         handler._finish_rebase_journal = lambda *_args, **_kwargs: events.append('journal')
@@ -1433,15 +1434,15 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
 
     def test_continuation_needs_current_owned_state_not_worker_turn(self):
         from loop_manager_internal.git.managed_rebase_validation import RebaseDecision, RebaseStatus, Remote
-        handler = object.__new__(ExecutionHandlers)
+        handler = execution_handler_stub()
         handler.repo, handler.repo_path, handler.state_dir = 'repo', Path('/repo'), Path('/state')
         checkpoint = SimpleNamespace(operation='rebase', expected_head=OLD, target_base_oid=NEW,
                                      snapshot={})
         service = mock.Mock()
         service.require_owned.return_value = (SimpleNamespace(remote=Remote('repo', BRANCH, OLD)),
                                                RebaseDecision(RebaseStatus.WAITING))
-        handler.effects = SimpleNamespace(checkpoint=SimpleNamespace(get=lambda *_: checkpoint),
-                                          workspace=SimpleNamespace(current_rebase_service=lambda _: service))
+        handler.effects = complete_execution_effects(SimpleNamespace(checkpoint=SimpleNamespace(get=lambda *_: checkpoint),
+                                          workspace=SimpleNamespace(current_rebase_service=lambda _: service)))
         handler._rebase_journal_state = lambda _: {'head': 'partial'}
         context = SimpleNamespace(plan=SimpleNamespace(plan_id='G-091'), worktree=Path('/owned'),
                                   branch=BRANCH, worker_session_id=None)

@@ -154,6 +154,32 @@ priority: critical
 
 484개 원본 정의를 이동한 뒤 AST를 역대응해 비교했으며, 의도적으로 바뀐 본문은 프로젝트 단계 분리와 execution contract의 `globals()` 제거 두 곳이다. 그 밖의 본문은 named effect 접근으로만 바뀌었다. 상태 필드·status 집합은 `storage/project_state_adapter.py`가 기존 `runtime_state`의 선언을 재사용하므로 순수 결과 contract가 repository를 import하지 않는다. G-124/G-125/G-126의 상세 coordinator·알림 분리는 수행하지 않았다. 두 verify의 compile 목록에 새 module을 포함했으며 Worker는 스크립트를 실행하지 않았다.
 
+### G-124: 실행 phase와 recovery 대응
+
+기준 revision `eb3331da49ce36d7ff9e55d8d6eca8b5ca1ae306`의 실제 루트 17개 항목은 위 G-123 inventory와 일치한다. `.agents/`, `docs/`, `scripts/`, `AGENTS.md`는 등록·Agent 지침·verify의 고정 경로, `README.md`는 사용자 안내, `run.sh`·`run.ps1`·`loop_manager.py`는 launcher/bootstrap 진입점이다. `config/`·`requirements.txt`·`.gitignore`는 source 설정·setup·Git 탐색, `tests/`·`loop_manager_internal/`는 verify discovery와 Python import의 소유 경계로 유지한다. Git 소유 `.git`, ignored 파생 `__pycache__/`, 소유권을 확정하지 않은 읽기 전용 `.aws/`·`.codex/`는 이동·삭제하지 않는다. 새 루트 항목은 없으며 아래 목적지는 모두 기존 패키지와 tests/support 안이다.
+
+아래 handler 경로는 `loop_manager_internal/execution/` 기준이다. 소비자는 기존 `ExecutionPhaseCoordinator` → `ExecutionHandlers` 위임 경계이며 SQLite 형식과 Git 효과 adapter를 바꾸지 않는다.
+
+| 원본 method·입력 | 목적지·재사용 service | 효과·상태 확정 경계 |
+| --- | --- | --- |
+| `_context`, `_cached_plan`, `_advanced`, `work_started` / 선택된 row | `execution_context_handler.py`; `ExecutionStatePort`, notification outbox | 최신 projection 확인 뒤 immutable 실행 context 구성; 작업 재개 알림의 transaction 유지 |
+| `prepare`, `recover`, `_workspace_boundary` / context·checkpoint | `execution_workspace_handler.py`; 기존 checkpoint `assess/observe` | workspace 예약·소유권·scope와 저장 checkpoint를 확인한 뒤 make/recover; stale marker 교정은 기존 snapshot transaction 사용 |
+| `_recover`, `_block_final`, `recover_failure` / typed reason·실패 증거 | `execution_recovery_handler.py`; `RecoveryDispatcher` | retry·pause·final block 지문과 횟수·사용자 대상 기록; 단계별 정책을 그대로 사용 |
+| `_owned_checkpoint_remote`, current/persisted ownership helpers / live remote·PR·checkpoint | `execution_ownership_handler.py`; `ManagedRebaseService`, `checkpoint_ownership` | 현재 lease·worktree·수용된 checkpoint identity 재검사; 과거 journal만으로 게시 허용하지 않음 |
+| rebase intent·continue·stage·completion·중간 push / context·현재 관측 | `execution_rebase_handler.py`; manager journal, rebase correction repository, managed adoption/publication | Git 전 intent, stage 증거와 journal 확인, completion·remote lease의 원자 확정 및 재시작 멱등성 유지 |
+| `guard`, revision refresh/install, metadata correction / definition·base·stage token | `execution_revision_handler.py`; `DefinitionSnapshot`, `decide_revision_gate` | catalog/base 일치·dependency·후보 HEAD·archive token 재검사; 필요한 phase만 무효화하고 session 보존 |
+| archive candidate·target·collision·workspace gates / revision-bound archive snapshot | `execution_archive_handler.py`; 기존 archive callbacks와 `ArchiveTargetRepository` | 각 단계의 최신 후보·실제 이동 집합을 대조하고 target 저장 시 base/catalog race 거부 |
+| `run`, saved rebase result, `_finish_worker`, outcome·사용자 결정 / immutable context | `execution_worker_handler.py`; worker_session, worker_outcome, validation_feedback | profile/session 전환 intent → Agent → 결과·scope·guidance·archive 검증 → VERIFYING; correction/usage pause와 같은 세션 재개 유지 |
+| `verify`, `_verify_once`, `_finish_verified` / 후보 HEAD·Worker 결과 | `execution_verify_handler.py`; 기존 Manager verify callback·feedback repository | 최신 base 반영 뒤 verify, scope와 HEAD 재검사 후 verify token 저장; 실패만 Worker로 전달 |
+| `review`, reviewer attempt·entry evidence / 현재 Worker·verify 증거 | `execution_review_handler.py`; reviewer parser·feedback·recovery correction budget | 읽기 전용 Reviewer, 각 attempt 감사·교정 한도와 session 유지; 성공 후보에만 review/publication token 저장 |
+| `reconcile`, latest-base helpers / BEFORE_VERIFY 또는 BEFORE_PUBLICATION | `execution_latest_base_handler.py`; 공통 rebase/checkpoint 서비스 | 두 시점의 독립 fetch·재검증 유지; base 변경 뒤 Worker 확인과 verify·Review를 다시 요구 |
+| `publish`, commit/push/PR intent·resume / immutable 후보·live PR/remote | `execution_publication_handler.py`; publication_resume와 기존 Git/PR adapter | 게시 전후 lease·후보·scope·archive 재확인; 성공 OID/PR 확인 뒤에만 PR_OPEN transaction |
+| 승인 문서 lookup·guard·apply·Review artifact / draft identity·승인 원본 | `execution_documents_handler.py`; document_drafts/publication | 승인 mapping·원본·정확한 bytes·의미 보존 verdict 확인; Agent 없이 승인 문서만 적용하고 기존 차단 경계 유지 |
+| 기존 effects·임시 contract·준비 cache / G-123 조립 | `execution_effects.py`, `execution_session.py`, `execution_assembly.py` | frozen contract/identity/preparation, 명시적 필요 callback만 phase port로 전달; 전체 effects는 조립 경계에만 남음 |
+| `tests/test_execution_handlers.py` / 원본 277개 test method | 단계별 `tests/test_execution_*.py`; `tests/support/execution*_scenarios.py`, `execution_assertions.py` | G-119 fixture·모든 기존 assertion 재사용, TestCase를 support로 가져오지 않음; 외부 효과 fake는 구현 전이를 대신하지 않음 |
+
+원본 테스트 277개는 정확히 한 destination에 대응하며 assertion을 보존했다. 두 Review deadlock 테스트는 원래 source 변경을 immutable 준비 snapshot에 명시적으로 설치하도록 setup만 보완했다. 별도의 composition unit test 3개는 준비 정보 격리·새 snapshot 관측·낡은 context 거부를 검증한다. 두 verify 스크립트는 새 module의 compile 목록만 확장하고 전체 unittest discovery를 유지한다.
+
 ## Validation
 
 - Worker는 `tests/test_loop_manager.py`의 역할별 prompt와 `tests/test_managed_configuration.py`의 공통 지침 배포 관련 targeted unit test만 실행한다.

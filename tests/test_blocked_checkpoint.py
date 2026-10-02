@@ -20,7 +20,7 @@ class BlockedCheckpointDiscoveryUnitTests(unittest.TestCase):
 
         loader = unittest.TestLoader()
         suites = [loader.discover('tests', pattern=pattern)
-                  for pattern in ('test_checkpoint_git_safety.py', 'test_checkpoint_remote_recovery.py', 'test_execution_handlers.py')]
+                  for pattern in ('test_checkpoint_git_safety.py', 'test_checkpoint_remote_recovery.py', 'test_execution_*.py')]
         counts = Counter(case for suite in suites for case in cases(suite))
         fixture_ids = {case for case in counts
                        if case.startswith(('test_checkpoint_git_safety.', 'test_checkpoint_remote_recovery.'))}

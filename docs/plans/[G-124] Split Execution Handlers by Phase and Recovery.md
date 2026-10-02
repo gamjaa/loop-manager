@@ -41,14 +41,48 @@ priority: critical
 
 ## Progress
 
-- [ ] phase·recovery·validation 책임과 기존 service 대응표 확인
-- [ ] 단계별 handler·좁은 port 추출 및 중복 제거
-- [ ] 실행 테스트 분리와 targeted unit test
+- [x] phase·recovery·validation 책임과 기존 service 대응표 확인
+- [x] 단계별 handler·좁은 port 추출 및 중복 제거
+- [x] 실행 테스트 분리와 targeted unit test
 - [ ] Manager 전체 verify, 독립 Review 및 사용자 Merge
+
+### 구현·검증 기록 (2026-10-02)
+
+- G-060의 `G-124: 실행 phase와 recovery 대응`에 원본 method의 입력·효과·상태 확정, 기존 service와 목적지, 현재 root 소유 경계를 기록했다.
+- 90개 method를 13개 책임으로 나누고 기존 facade에는 immutable 준비 snapshot의 교체와 명시적 구성·위임만 남겼다. 전체 effects는 조립 단계에서 분해하며 각 handler는 frozen port와 immutable 실행 identity/context만 사용한다. session·feedback·checkpoint·archive·revision 정책 구현을 재사용한다.
+- port·snapshot 접근과 annotation을 역대응한 AST 비교에서 89개 원본 method 본문이 일치했다. 나머지 한 곳은 준비 중 rebase identity의 임시 namespace를 frozen context로 바꾼 부분이다. 기존 호출 인자·default와 예외 identity를 유지했다.
+- 원본 277개 test method와 assertion을 단계·복구 경계 모듈로 옮겼다. 공유 setup·assertion은 G-119 support를 사용한다. composition test 3개를 추가하고 evidence-only fixture 및 중복 discovery 검사도 새 구성에 맞췄다.
+- `scripts/verify.sh`와 `scripts/verify.ps1`의 compile 대상에 새 module을 추가했다. 전체 verify·integration·end-to-end·전체 lint/build/type check는 실행하지 않았다.
+- 아래 개별 unit test 선택 명령으로 고유 test case 34개가 최종 통과했다. 재시작·race는 in-memory SQLite와 외부 효과 fake로 검증했으며 실제 Git repository를 생성하는 기존 시나리오는 Manager verify에 남겼다.
+
+```text
+python3 -m unittest tests.test_execution_revision_gate.ExecutionRevisionGateTests.test_revision_guard_tokens_follow_complete_phase_lifecycle tests.test_execution_revision_gate.ExecutionRevisionGateTests.test_source_revision_invalidates_artifacts_but_preserves_sessions_and_workspace tests.test_execution_revision_gate.ExecutionRevisionGateTests.test_archive_change_returns_to_worker_before_push -v
+python3 -m unittest tests.test_execution_worker_phase.ExecutionWorkerPhaseTests.test_level_and_alias_change_with_same_resolved_model_resumes_session tests.test_execution_worker_phase.ExecutionWorkerPhaseTests.test_model_replacement_records_intent_before_agent_and_binds_event tests.test_execution_failure_policy.ExecutionFailurePolicyTests.test_unavailable_fallback_intent_survives_failed_new_start -v
+python3 -m unittest tests.test_execution_verify_phase.ExecutionVerifyPhaseTests.test_timeout_verify_uses_stable_fingerprint_and_returns_to_worker tests.test_execution_verify_phase.ExecutionVerifyPhaseTests.test_head_change_during_verify_does_not_save_success tests.test_execution_verify_phase.ExecutionVerifyPhaseTests.test_latest_base_uses_same_intent_and_rebase_for_both_checkpoints -v
+python3 -m unittest tests.test_execution_review_phase.ExecutionReviewPhaseTests.test_review_pass_after_third_correction_advances_to_publication tests.test_execution_review_phase.ExecutionReviewPhaseTests.test_review_budget_pauses_before_worker_and_preserves_projection tests.test_execution_review_phase.ExecutionReviewPhaseTests.test_review_retry_interruption_preserves_previous_raw_result -v
+python3 -m unittest tests.test_execution_documents.ExecutionDocumentsTests.test_document_plan_applies_program_bytes_without_worker_agent tests.test_execution_documents.ExecutionDocumentsTests.test_document_publication_stops_before_pr_when_original_is_stale tests.test_execution_documents.ExecutionDocumentsTests.test_document_uncertainty_persists_audit_and_blocks_plan -v
+python3 -m unittest tests.test_execution_publication_phase.ExecutionPublicationPhaseTests.test_publication_interruption_recovers_existing_pr_without_repush tests.test_execution_publication_phase.ExecutionPublicationPhaseTests.test_pr_conflict_lease_rejection_blocks_without_opening_pr tests.test_execution_task_relevant_publication_boundary.TaskRelevantPublicationBoundaryTests.test_base_advance_before_pr_creation_returns_to_existing_revalidation_flow -v
+python3 -m unittest tests.test_execution_workspace_phase.ExecutionWorkspacePhaseTests.test_worktree_recovery_failure_keeps_durable_pending_boundary tests.test_execution_workspace_phase.ExecutionWorkspacePhaseTests.test_workspace_violation_blocks_before_agent tests.test_execution_rebase_correction_phase.ExecutionRebaseCorrectionPhaseTests.test_partial_stage_resume_only_stages_remaining_dirty_path tests.test_execution_rebase_correction_phase.ExecutionRebaseCorrectionPhaseTests.test_partial_stage_resume_rejects_replaced_clean_resolution -v
+python3 -m unittest tests.test_execution_current_rebase_adoption_phase.CurrentRebaseAdoptionTests.test_manual_completion_without_journal_invalidates_worker_and_validation_once tests.test_execution_immediate_rebase_publication_phase.ImmediateRebasePublicationTests.test_interruption_after_push_confirms_once_without_repeating_push tests.test_execution_evidence_free_recovery_phase.EvidenceFreeRecoveryLifecycleTests.test_old_success_results_cannot_publish_without_current_worker_confirmation -v
+python3 -m unittest tests.test_execution_handlers.ExecutionCompositionTests -v
+python3 -m unittest tests.test_rebase_file_evidence.AutostashFileEvidenceTests.test_both_rebase_snapshot_paths_capture_file_evidence tests.test_managed_mutation_evidence.DetachedRebaseOwnershipTests.test_resumed_continue_uses_the_saved_journal_identity tests.test_managed_mutation_evidence.DetachedRebaseOwnershipTests.test_stage_capture_binds_modes_to_approved_file_signatures -v
+python3 -m unittest tests.test_execution_review_phase.ExecutionReviewPhaseTests.test_review_specification_deadlock_blocks_plan_without_worker_correction tests.test_execution_review_phase.ExecutionReviewPhaseTests.test_review_deadlock_accepts_architecture_outside_sources tests.test_blocked_checkpoint.BlockedCheckpointDiscoveryUnitTests.test_git_fixture_cases_are_collected_once_across_consuming_modules -v
+```
+
+중간 checkpoint test의 첫 실행은 공유 fixture가 기대한 `git_operation_entries` mock을 추출 helper에서 None으로 만든 setup 오류로 실패했다. 일반 phase fixture의 원래 mock 기본값을 복원하고 고립된 evidence fake에서만 선택적 port 부재를 표현하도록 수정했다.
+
+FAILED_COMMAND: python3 -m unittest tests.test_execution_current_rebase_adoption_phase.CurrentRebaseAdoptionTests.test_manual_completion_without_journal_invalidates_worker_and_validation_once tests.test_execution_immediate_rebase_publication_phase.ImmediateRebasePublicationTests.test_interruption_after_push_confirms_once_without_repeating_push tests.test_execution_evidence_free_recovery_phase.EvidenceFreeRecoveryLifecycleTests.test_old_success_results_cannot_publish_without_current_worker_confirmation -v
+Initial run: ERROR (1 fixture setup error). git_operation_entries의 원래 mock 기본값을 복원했다.
+RERUN: python3 -m unittest tests.test_execution_current_rebase_adoption_phase.CurrentRebaseAdoptionTests.test_manual_completion_without_journal_invalidates_worker_and_validation_once tests.test_execution_immediate_rebase_publication_phase.ImmediateRebasePublicationTests.test_interruption_after_push_confirms_once_without_repeating_push tests.test_execution_evidence_free_recovery_phase.EvidenceFreeRecoveryLifecycleTests.test_old_success_results_cannot_publish_without_current_worker_confirmation -v
+최종 결과: 동일 명령의 3개 test 모두 PASS. 나머지 선택 명령도 모두 PASS.
+
+- 2026-10-02 보고 보정: 최초 Worker 응답은 FAILED_COMMAND/RERUN을 TARGETED_TESTS 밖에 두고 그 안에는 실패 시나리오 설명을 남겨 결과 검증에서 거부됐다. 실제 테스트 재실행은 통과했으므로 runtime 정책은 변경하지 않았다. 재실행 기록과 최초 ERROR, 최종 PASS를 TARGETED_TESTS 안에 함께 배치했다.
+- 위 checkpoint 선택 명령을 다시 실행해 3개 PASS를 확인했다. `python3 -m unittest tests.test_worker_result_contract.WorkerResultContractTest.test_targeted_test_evidence_requires_a_clean_explicit_rerun -v`도 1개 PASS이며, 최종 응답 원문은 기존 publication/outcome parser로 검증했다. 전체 verify는 실행하지 않았다.
 
 ## Decision Log
 
 - 2026-10-02: 이미 분리된 `execution_runtime` coordinator를 다시 만들지 않는다. phase 전이는 coordinator, 외부 효과는 adapter, phase의 작업은 해당 handler가 담당하도록 기존 경계를 완성한다.
 - 실제 저장 형식과 실행 결과를 보존하는 리팩터링이며 새로운 phase, retry 정책과 검증 생략을 도입하지 않는다.
+- 2026-10-02: phase 전이는 기존 coordinator에 남겼다. 공유 준비 정보는 frozen snapshot 교체로만 갱신하며 각 효과 뒤의 revision·scope·archive·후보 재검사를 합치거나 생략하지 않았다. 기존 recovery fixture의 private patch 지점은 facade의 명시적 callback으로 유지한다.
 
 - 2026-10-02 사용자 결정: 기존 다른 미착수 작업보다 리팩터링을 먼저 진행하도록 priority를 `critical`로 지정한다. 리팩터링 내부의 선행 Merge 의존성과 검증·Review·사용자 Merge 조건은 유지한다.
