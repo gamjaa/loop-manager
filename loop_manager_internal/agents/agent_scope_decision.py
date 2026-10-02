@@ -444,8 +444,8 @@ def _worker_path_allowed(
             for candidate in (source, requirement_archive_path(source))
         }
         return normalized in allowed_paths
-    if re.fullmatch(r"docs/plans/[^/]+\.md", normalized):
-        return False
+    # A Worker may update plan records while implementing its selected plan.
+    # The selected plan limits implementation, not ExecPlan document paths.
     return True
 
 

@@ -225,6 +225,7 @@ AGENTS.md와 {plan_path}를 읽고 해당 ExecPlan 하나만 구현하라.
 {AGENT_QUALITY_GUIDANCE}
 관련 targeted test를 작성하되 commit, push, PR 생성과 scripts/verify 실행은 하지 마라.
 docs/plans에 새 ExecPlan을 만들지 말고 불필요한 후속 기능도 구현하지 마라.
+현재 ExecPlan 구현에 필요한 대응표·구현 기록은 docs/plans의 다른 기존 ExecPlan에도 갱신할 수 있다. 다른 계획의 목표를 추가 구현하거나 실행 상태를 문서에 기록하지 마라.
 {plans_scope}
 {guidance_instruction}
 구현과 관련 unit test를 작성하거나 갱신한 뒤, 수정한 코드와 새로 작성하거나 변경한 테스트를 직접 검증하는 최소 범위의 targeted unit test만 실행하라. 개별 test case, test class, test module 또는 이에 준하는 좁은 단위만 허용된다.

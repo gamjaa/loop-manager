@@ -296,6 +296,60 @@ class ConflictIndexScopeTests(unittest.TestCase):
                 self.validate(after)
 
 
+class WorkerPlanDocumentScopeTests(unittest.TestCase):
+    related_plan = "docs/plans/[G-060] Project Root Placement Policy and Inventory.md"
+
+    def test_related_plan_updates_are_allowed_in_worker_result(self):
+        before = snapshot()
+        for kinds in (("unstaged", "worktree"), ("staged",)):
+            with self.subTest(kinds=kinds):
+                after = replace(before, dirty={self.related_plan: (kinds, "inventory-update")})
+                validate_agent_scope("worker", Path(WORKTREE), before, after,
+                                     selected_plan_path=PLAN)
+
+    def test_saved_worker_result_can_be_revalidated_after_scope_block(self):
+        before = snapshot()
+        after = replace(before, dirty={self.related_plan: (("unstaged", "worktree"), "inventory-update")})
+        checks = decide(before, after, phase="PLAN_BLOCKED", result=after).checks
+        self.assertTrue(checks)
+        for check in checks:
+            validate_agent_scope(check.role, Path(WORKTREE), check.before, check.after,
+                                 selected_plan_path=PLAN, allowed_ref_changes=check.allowed_refs,
+                                 allowed_worktree_changes=check.allowed_worktrees)
+
+    def test_reviewer_still_rejects_related_plan_updates(self):
+        before = snapshot()
+        after = replace(before, dirty={self.related_plan: (("unstaged",), "inventory-update")})
+        with self.assertRaises(AgentScopeError):
+            validate_agent_scope("reviewer", Path(WORKTREE), before, after)
+
+    def test_protected_documents_remain_blocked_with_related_plan_update(self):
+        before = snapshot()
+        for path in ("AGENTS.md", "docs/ARCHITECTURE.md", "docs/PLANS.md",
+                     "docs/requirements/Active.md"):
+            with self.subTest(path=path):
+                after = replace(before, dirty={
+                    self.related_plan: (("unstaged",), "inventory-update"),
+                    path: (("unstaged",), "unapproved-update"),
+                })
+                with self.assertRaises(AgentScopeError) as raised:
+                    validate_agent_scope("worker", Path(WORKTREE), before, after,
+                                         selected_plan_path=PLAN)
+                self.assertIn(path, str(raised.exception))
+                self.assertNotIn(self.related_plan, str(raised.exception))
+
+    def test_related_plan_update_does_not_allow_index_flags_or_foreign_refs(self):
+        before = snapshot(index={self.related_plan: ("H 100644 inventory 0",)})
+        after = replace(before, dirty={self.related_plan: (("unstaged",), "inventory-update")})
+        for unsafe in (
+            replace(after, index={self.related_plan: ("S 100644 inventory 0",)}),
+            replace(after, refs={**after.refs, "refs/heads/unowned": ("foreign", "commit")}),
+        ):
+            with self.subTest(unsafe=unsafe), self.assertRaises(AgentScopeError):
+                validate_agent_scope("worker", Path(WORKTREE), before, unsafe,
+                                     selected_plan_path=PLAN)
+
+
 class TaskRelevantScopeTests(unittest.TestCase):
     def setUp(self):
         self.before = snapshot(refs={

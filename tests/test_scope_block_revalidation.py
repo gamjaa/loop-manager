@@ -15,6 +15,34 @@ from tests.support.scoped_recovery import CurrentRebaseBlockFixture
 
 
 class ScopeBaselineRecoveryUnitTests(ScopeBaselineFixture, unittest.TestCase):
+    def test_related_plan_document_scope_block_resumes_without_discarding_worker(self):
+        related_plan = 'docs/plans/[G-060] Project Root Placement Policy and Inventory.md'
+        self.current = replace(self.current, dirty={
+            **self.current.dirty,
+            related_plan: (('unstaged', 'worktree'), 'inventory-update'),
+        })
+        self.connection.execute('UPDATE exec_plans SET agent_result_snapshot = ?',
+                                (self.current.serialize(),))
+        runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
+        runtime.block_plan('repo', 'G-047', reason_code='managed_worktree_scope_violation',
+                           evidence='worker Git 범위 위반: ' + related_plan,
+                           release_fingerprint='input',
+                           plan_values={'blocked_fingerprint': 'input'})
+        block = scoped_blocking.plan_block(self.connection, 'repo', 'G-047')
+
+        self.assertTrue(loop_manager._reconcile_scope_baseline_plan_block(
+            self.connection, self.repo_path, Path('/state'), 'repo', block))
+
+        row = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual(row['status'], 'IMPLEMENTING')
+        self.assertEqual(row['agent_snapshot'], self.before.serialize())
+        self.assertEqual(row['agent_result_snapshot'], self.current.serialize())
+        self.assertEqual((row['worker_session_id'], row['retry_count'], row['review_failure_history']),
+                         ('saved-worker', 3, '{"failure":2}'))
+        self.assertIsNone(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
+        audit = self.checkpoints.get('repo', 'G-047').snapshot['scope_block_release_audit']
+        self.assertEqual(audit[-1]['block']['evidence'], 'worker Git 범위 위반: ' + related_plan)
+
     def test_isolated_default_worktree_false_positive_keeps_work_session_and_retry_history(self):
         self.project_block()
         self.assertTrue(self.resume_project())
