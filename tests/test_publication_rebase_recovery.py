@@ -11,7 +11,10 @@ from tests.support.worker import worker_result
 from tests.support.worker import dummy_worker_sessions
 
 
-class PublicationRebaseRecoveryTest(PublicationFixture, unittest.TestCase):
+class PublicationRebaseRecoveryTestFixture(PublicationFixture):
+    pass
+
+class PublicationConflictRecoveryTests(PublicationRebaseRecoveryTestFixture, unittest.TestCase):
     @dummy_worker_sessions
     def test_publication_rebase_conflict_blocks_when_worker_cannot_resolve(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -99,6 +102,7 @@ class PublicationRebaseRecoveryTest(PublicationFixture, unittest.TestCase):
         self.assertIsNone(blocked["phase"])
         self.assertIn("cannot resolve conflict", plan["last_error"])
         self.assertEqual(plan["status"], "PLAN_BLOCKED")
+
 
     @dummy_worker_sessions
     def test_real_autostash_conflict_resumes_to_verified_pr_without_reapplying_stash(self):
@@ -241,6 +245,122 @@ class PublicationRebaseRecoveryTest(PublicationFixture, unittest.TestCase):
             self.assertEqual(git_steps, [])
             self.assertEqual(len(created), 1)
 
+
+    @dummy_worker_sessions
+    def test_empty_conflict_resolution_blocks_instead_of_reinvoking_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                repo,
+                state_dir,
+                connection,
+                _plan,
+                branch,
+                worktree,
+            ) = self._publication_state(directory)
+            (repo / "src/app.py").write_text(
+                "VALUE = 'base'\n", encoding="utf-8"
+            )
+            commit_and_push(repo, "Create publication conflict")
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.run_codex"
+            ) as agent:
+                first = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            self.assertEqual(first, 1)
+            self.assertTrue(
+                loop_manager._rebase_in_progress_for_branch(worktree, branch)
+            )
+            agent.assert_not_called()
+
+            def choose_latest_base(
+                agent_worktree,
+                _state,
+                _config,
+                role_name,
+                _prompt,
+                **_kwargs,
+            ):
+                self.assertEqual(role_name, "worker")
+                (agent_worktree / "src/app.py").write_text(
+                    "VALUE = 'base'\n", encoding="utf-8"
+                )
+                return loop_manager.CodexResult(
+                    0,
+                    worker_result(
+                        "Resolve publication conflict",
+                        "Keeps the latest base version while resolving "
+                        "the conflict.",
+                        "LatestBasePublicationTest: PASS",
+                    ),
+                    "worker-session",
+                )
+
+            with mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ), mock.patch(
+                "loop_manager.remote_base", return_value="main"
+            ), mock.patch(
+                "loop_manager.ensure_safe_base_worktree"
+            ), mock.patch(
+                "loop_manager.pr_for_branch", return_value=None
+            ), mock.patch(
+                "loop_manager.run_codex", side_effect=choose_latest_base
+            ) as resolving_agent, mock.patch(
+                "loop_manager.verify"
+            ) as verify:
+                second = loop_manager.run_project(
+                    connection,
+                    state_dir,
+                    str(repo),
+                    Path("unused.ini"),
+                    "main",
+                    False,
+                )
+
+            blocked = connection.execute(
+                "SELECT phase, last_error FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            plan = connection.execute(
+                "SELECT status, last_error FROM exec_plans "
+                "WHERE repo = ? AND plan_id = 'G-014'",
+                (str(repo),),
+            ).fetchone()
+            rebase_in_progress = loop_manager._rebase_in_progress_for_branch(
+                worktree, branch
+            )
+
+        self.assertEqual(second, 0)
+        self.assertIsNone(blocked["phase"])
+        self.assertIn(
+            "rebase 충돌 해결 후 Worker 변경이 남지 않아",
+            plan["last_error"],
+        )
+        self.assertEqual(plan["status"], "PLAN_BLOCKED")
+        self.assertFalse(
+            loop_manager._rebase_in_progress_for_branch(worktree, branch)
+        )
+        resolving_agent.assert_called_once()
+        verify.assert_not_called()
+
+
+class PublicationRebaseInterruptionTests(PublicationRebaseRecoveryTestFixture, unittest.TestCase):
     @dummy_worker_sessions
     def test_rebase_recovery_marker_survives_agent_pause(self):
         cases = (
@@ -401,6 +521,7 @@ class PublicationRebaseRecoveryTest(PublicationFixture, unittest.TestCase):
                 self.assertEqual(plan_status, "PLAN_BLOCKED")
                 self.assertEqual(resumed_agent.call_count, 4)
 
+
     @dummy_worker_sessions
     def test_rebase_recovery_marker_survives_worker_result_validation_failure(
         self,
@@ -555,119 +676,8 @@ class PublicationRebaseRecoveryTest(PublicationFixture, unittest.TestCase):
         self.assertEqual(resumed_agent.call_count, 3)
         self.assertEqual(len(resumed_prompts), 3)
 
-    @dummy_worker_sessions
-    def test_empty_conflict_resolution_blocks_instead_of_reinvoking_worker(self):
-        with tempfile.TemporaryDirectory() as directory:
-            (
-                repo,
-                state_dir,
-                connection,
-                _plan,
-                branch,
-                worktree,
-            ) = self._publication_state(directory)
-            (repo / "src/app.py").write_text(
-                "VALUE = 'base'\n", encoding="utf-8"
-            )
-            commit_and_push(repo, "Create publication conflict")
 
-            with mock.patch(
-                "loop_manager.validate_repository", return_value=repo
-            ), mock.patch(
-                "loop_manager.remote_base", return_value="main"
-            ), mock.patch(
-                "loop_manager.ensure_safe_base_worktree"
-            ), mock.patch(
-                "loop_manager.pr_for_branch", return_value=None
-            ), mock.patch(
-                "loop_manager.run_codex"
-            ) as agent:
-                first = loop_manager.run_project(
-                    connection,
-                    state_dir,
-                    str(repo),
-                    Path("unused.ini"),
-                    "main",
-                    False,
-                )
-
-            self.assertEqual(first, 1)
-            self.assertTrue(
-                loop_manager._rebase_in_progress_for_branch(worktree, branch)
-            )
-            agent.assert_not_called()
-
-            def choose_latest_base(
-                agent_worktree,
-                _state,
-                _config,
-                role_name,
-                _prompt,
-                **_kwargs,
-            ):
-                self.assertEqual(role_name, "worker")
-                (agent_worktree / "src/app.py").write_text(
-                    "VALUE = 'base'\n", encoding="utf-8"
-                )
-                return loop_manager.CodexResult(
-                    0,
-                    worker_result(
-                        "Resolve publication conflict",
-                        "Keeps the latest base version while resolving "
-                        "the conflict.",
-                        "LatestBasePublicationTest: PASS",
-                    ),
-                    "worker-session",
-                )
-
-            with mock.patch(
-                "loop_manager.validate_repository", return_value=repo
-            ), mock.patch(
-                "loop_manager.remote_base", return_value="main"
-            ), mock.patch(
-                "loop_manager.ensure_safe_base_worktree"
-            ), mock.patch(
-                "loop_manager.pr_for_branch", return_value=None
-            ), mock.patch(
-                "loop_manager.run_codex", side_effect=choose_latest_base
-            ) as resolving_agent, mock.patch(
-                "loop_manager.verify"
-            ) as verify:
-                second = loop_manager.run_project(
-                    connection,
-                    state_dir,
-                    str(repo),
-                    Path("unused.ini"),
-                    "main",
-                    False,
-                )
-
-            blocked = connection.execute(
-                "SELECT phase, last_error FROM projects WHERE repo = ?",
-                (str(repo),),
-            ).fetchone()
-            plan = connection.execute(
-                "SELECT status, last_error FROM exec_plans "
-                "WHERE repo = ? AND plan_id = 'G-014'",
-                (str(repo),),
-            ).fetchone()
-            rebase_in_progress = loop_manager._rebase_in_progress_for_branch(
-                worktree, branch
-            )
-
-        self.assertEqual(second, 0)
-        self.assertIsNone(blocked["phase"])
-        self.assertIn(
-            "rebase 충돌 해결 후 Worker 변경이 남지 않아",
-            plan["last_error"],
-        )
-        self.assertEqual(plan["status"], "PLAN_BLOCKED")
-        self.assertFalse(
-            loop_manager._rebase_in_progress_for_branch(worktree, branch)
-        )
-        resolving_agent.assert_called_once()
-        verify.assert_not_called()
-
+class PublicationRebaseLeaseTests(PublicationRebaseRecoveryTestFixture, unittest.TestCase):
     def test_pr_conflict_push_preserves_config_and_exact_lease(self):
         branch, old, new, base = 'loop-manager/G-081', 'a' * 40, 'b' * 40, 'c' * 40
         connection = mock.Mock()

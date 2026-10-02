@@ -37,7 +37,7 @@ class ExecPlanArchiveHousekeepingAdapterTest(unittest.TestCase):
         with mock.patch.dict(os.environ, ambient), mock.patch(
             "loop_manager.command", return_value=completed
         ) as command_mock:
-            loop_manager._ExecPlanArchiveGitPort._commit_archive(
+            loop_manager._ExecPlanArchiveGitPort(Path('/repo'), Path('/state'), 'repo')._commit_archive(
                 workspace, "Archive merged ExecPlans: G-000"
             )
 
@@ -171,7 +171,7 @@ class ExecPlanArchiveHousekeepingAdapterTest(unittest.TestCase):
         )
 
         with mock.patch("loop_manager.git") as git_mock:
-            loop_manager._ExecPlanArchiveGitPort._stage_archive_moves(
+            loop_manager._ExecPlanArchiveGitPort(Path('/repo'), Path('/state'), 'repo')._stage_archive_moves(
                 workspace, (move,)
             )
 

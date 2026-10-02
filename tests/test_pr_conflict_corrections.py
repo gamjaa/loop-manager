@@ -11,7 +11,7 @@ from tests.support.worker import worker_result
 from tests.support.worker import dummy_worker_sessions
 
 
-class PrConflictCorrectionsTest(PrRecoveryFixture, unittest.TestCase):
+class PrConflictCorrectionsTestFixture(PrRecoveryFixture):
     def _add_ignored_cache(self, worktree: Path) -> Path:
         exclude = Path(
             git_command(worktree, "rev-parse", "--git-path", "info/exclude")
@@ -32,6 +32,8 @@ class PrConflictCorrectionsTest(PrRecoveryFixture, unittest.TestCase):
         )
         return cache
 
+
+class PrConflictLeaseTests(PrConflictCorrectionsTestFixture, unittest.TestCase):
     @dummy_worker_sessions
     def test_conflicting_pr_reuses_sessions_revalidates_new_base_and_leases_push(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -221,6 +223,8 @@ class PrConflictCorrectionsTest(PrRecoveryFixture, unittest.TestCase):
             self.assertEqual(source_after, source_before)
             synchronize.assert_not_called()
 
+
+class PrConflictCauseRevalidationTests(PrConflictCorrectionsTestFixture, unittest.TestCase):
     @dummy_worker_sessions
     def test_worker_failure_blocks_after_three_corrections_and_stays_blocked(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -307,6 +311,7 @@ class PrConflictCorrectionsTest(PrRecoveryFixture, unittest.TestCase):
             self.assertEqual(roles, ["worker", "worker", "worker", "worker", "planner"])
             self.assertEqual(agent.call_count, 5)
 
+
     def test_repeated_verify_fingerprint_blocks_recovery_without_auto_resume(self):
         with tempfile.TemporaryDirectory() as directory:
             (
@@ -390,6 +395,8 @@ class PrConflictCorrectionsTest(PrRecoveryFixture, unittest.TestCase):
                 loop_manager.MAX_VALIDATION_FINGERPRINT_REPEATS + 1,
             )
 
+
+class PrConflictInterruptionTests(PrConflictCorrectionsTestFixture, unittest.TestCase):
     @dummy_worker_sessions
     def test_transient_and_usage_limit_pauses_resume_same_recovery(self):
         pauses = (
@@ -526,6 +533,7 @@ class PrConflictCorrectionsTest(PrRecoveryFixture, unittest.TestCase):
                 self.assertEqual(
                     self._source_checkout_snapshot(repo), source_before
                 )
+
 
     @dummy_worker_sessions
     def test_external_command_interruptions_preserve_recovery_and_resume(self):

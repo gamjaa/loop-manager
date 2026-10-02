@@ -58,3 +58,22 @@ class WorkspaceOwnershipError(RuntimeError):
 
 class ProcessLockBusyError(RuntimeError):
     """The single Loop Manager process lock is already held."""
+
+
+class PublicationSafetyError(RuntimeError):
+    """Publication cannot prove the selected branch and workspace ownership."""
+
+
+class ManagedWorktreeConflictError(PublicationSafetyError):
+    """A managed Git update would overwrite preserved local artifacts."""
+
+
+PROJECT_STEP_RETRY = 2
+PROJECT_STEP_PLANNING_PENDING = 5
+WORKSPACE_UNOWNED = 0
+WORKSPACE_OWNED = 1
+WORKSPACE_RESERVED = 2
+REBASE_IN_PROGRESS_ERROR = "Manager rebase 진행 중"
+REBASE_CONFLICT_PREFIX = "rebase 충돌 해결 필요:\n"
+PR_CONFLICT_PREFLIGHT_BLOCK_REASON = "pr-conflict-preflight"
+PR_CONFLICT_PREFLIGHT_ERROR_PREFIX = "PR_OPEN 충돌 복구 소유권 검증 실패:"

@@ -1182,7 +1182,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
         ports._revision_execplan_input_fingerprint.return_value = 'published-input'
         ports._worktree_execplan_input_fingerprint.return_value = 'current-input'
         ports._owned_rebase_metadata.return_value = None
-        ports.manager_git_journal.live_remote_branch_oid.return_value = 'remote'
+        ports.live_remote_branch_oid.return_value = 'remote'
         ports.pr_for_branch.return_value = None
         ports._worker_path_allowed.side_effect = loop_manager._worker_path_allowed
         service = build_service(ports, connection, Path('/repo'), Path('/state'),

@@ -2,7 +2,6 @@
 """AI Agent가 Loop Manager의 다음 PR을 만들게 하는 부트스트랩 실행기."""
 
 from __future__ import annotations
-
 import argparse
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -29,6 +28,31 @@ import threading
 import time
 from typing import Protocol
 from urllib.parse import quote
+
+from loop_manager_internal.recovery.scoped_blocking import PR_CLOSED_BLOCK_REASON, GUIDANCE_BLOCK_REASON
+from loop_manager_internal.git.source_sync import _base_worktree_index_error
+from loop_manager_internal.git.source_sync import _base_local_path_signature
+from loop_manager_internal.git.workspace import expected_execplan_workspace
+from loop_manager_internal.git.github_observation import classify_pull_request_mergeability
+
+from loop_manager_internal.runtime.contracts import (
+    PublicationSafetyError, ManagedWorktreeConflictError,
+    WORKSPACE_UNOWNED, WORKSPACE_OWNED, WORKSPACE_RESERVED,
+    REBASE_IN_PROGRESS_ERROR, REBASE_CONFLICT_PREFIX,
+    PR_CONFLICT_PREFLIGHT_BLOCK_REASON, PR_CONFLICT_PREFLIGHT_ERROR_PREFIX,
+    PROJECT_STEP_RETRY, PROJECT_STEP_PLANNING_PENDING,
+)
+from loop_manager_internal.git import command_adapter
+from loop_manager_internal.git import github_observation
+from loop_manager_internal.git import workspace
+from loop_manager_internal.git import source_sync
+from loop_manager_internal.recovery import pull_request_recovery
+from loop_manager_internal.recovery import scope_reconciliation
+from loop_manager_internal.catalog import archive_git
+from loop_manager_internal.recovery import checkpoint_adapter
+from loop_manager_internal.recovery import checkpoint_recovery
+from loop_manager_internal.recovery.checkpoint_adapter import _BlockedCheckpointResults
+
 
 from loop_manager_internal.documents.guidance_approval import (
     GuidanceDocument,
@@ -277,21 +301,11 @@ from loop_manager_internal.agents.scope_recovery import _blocked_agent_local_bas
 ROOT = Path(__file__).resolve().parent
 MAX_VALIDATION_FINGERPRINT_REPEATS = 3
 MAX_REVIEWER_PROTOCOL_ATTEMPTS = 3
-PROJECT_STEP_RETRY = 2
 PROJECT_STEP_TRANSIENT_PAUSE = 3
 PROJECT_STEP_USAGE_PAUSE = 4
-PROJECT_STEP_PLANNING_PENDING = 5
 TRANSIENT_AGENT_ERROR_PREFIX = "일시적 Agent 실패 (상태 보존):"
 USAGE_LIMIT_ERROR_PREFIX = "AI 사용 한도 소진 (상태 보존):"
 PLAN_SHA_BACKFILL_ERROR = "계획 commit SHA를 기존 작업에서 안전하게 복구할 수 없습니다."
-WORKSPACE_UNOWNED = 0
-WORKSPACE_OWNED = 1
-WORKSPACE_RESERVED = 2
-REBASE_IN_PROGRESS_ERROR = "Manager rebase 진행 중"
-REBASE_CONFLICT_PREFIX = "rebase 충돌 해결 필요:\n"
-PR_CLOSED_BLOCK_REASON = BlockReasonCode.PULL_REQUEST_CLOSED.value
-PR_CONFLICT_PREFLIGHT_BLOCK_REASON = "pr-conflict-preflight"
-PR_CONFLICT_PREFLIGHT_ERROR_PREFIX = "PR_OPEN 충돌 복구 소유권 검증 실패:"
 PRIORITY_ORDER = {"critical": 0, "high": 1, "normal": 2, "low": 3}
 ACTIVE_EXECPLAN_STATUSES = runtime_state.ACTIVE_STATUSES
 WAITING_EXECPLAN_STATUSES = frozenset({"PR_OPEN", "PLAN_BLOCKED"})
@@ -328,6 +342,444 @@ def _start_agent_invocation(
     with gate.launch_lock:
         gate.check()
         return ledger.start(invocation, role_name, provider, profile, session_id, scope_id=scope_id)
+
+
+def _command_adapter_effects_git() -> command_adapter.GitEffects:
+    return command_adapter.GitEffects(
+        _ignored_paths_overlapping_git_update=_ignored_paths_overlapping_git_update,
+        _rebase_resume_ignored_overlap=_rebase_resume_ignored_overlap,
+        command=command,
+        is_git_lock_failure=is_git_lock_failure,
+    )
+
+
+def _command_adapter_effects_git_bytes() -> command_adapter.GitBytesEffects:
+    return command_adapter.GitBytesEffects(
+        _handoff_run=_handoff_run,
+        is_git_lock_failure=is_git_lock_failure,
+    )
+
+
+def _github_observation_effects_pr_for_branch() -> github_observation.PrForBranchEffects:
+    return github_observation.PrForBranchEffects(
+        command=command,
+    )
+
+
+def _workspace_effects_validate_managed_worktree() -> workspace.ValidateManagedWorktreeEffects:
+    return workspace.ValidateManagedWorktreeEffects(
+        _rebase_in_progress_for_branch=_rebase_in_progress_for_branch,
+        _worktree_catalog=_worktree_catalog,
+    )
+
+
+def _workspace_effects_validate_reserved_worktree() -> workspace.ValidateReservedWorktreeEffects:
+    return workspace.ValidateReservedWorktreeEffects(
+        capture_git_snapshot=capture_git_snapshot,
+        validate_managed_worktree=validate_managed_worktree,
+    )
+
+
+def _workspace_effects_make_worktree() -> workspace.MakeWorktreeEffects:
+    return workspace.MakeWorktreeEffects(
+        _managed_worktree_marker=_managed_worktree_marker,
+        _managed_worktree_transition_state=_managed_worktree_transition_state,
+        _worktree_catalog=_worktree_catalog,
+        _write_managed_worktree_receipt=_write_managed_worktree_receipt,
+        git=git,
+        validate_managed_worktree=validate_managed_worktree,
+        validate_reserved_worktree=validate_reserved_worktree,
+    )
+
+
+def _workspace_effects_make_planning_worktree() -> workspace.MakePlanningWorktreeEffects:
+    return workspace.MakePlanningWorktreeEffects(
+        git=git,
+        validate_managed_worktree=validate_managed_worktree,
+        validate_reserved_worktree=validate_reserved_worktree,
+    )
+
+
+def _workspace_effects_validate_execplan_workspace_identity() -> workspace.ValidateExecplanWorkspaceIdentityEffects:
+    return workspace.ValidateExecplanWorkspaceIdentityEffects(
+        _validate_managed_path_boundary=_validate_managed_path_boundary,
+        expected_execplan_workspace=expected_execplan_workspace,
+    )
+
+
+def _source_sync_effects_base_worktree_snapshot() -> source_sync.BaseWorktreeSnapshotEffects:
+    return source_sync.BaseWorktreeSnapshotEffects(
+        _base_local_path_signature=_base_local_path_signature,
+        _base_worktree_index_error=_base_worktree_index_error,
+        _git_operation_entries=_git_operation_entries,
+        _ignored_worktree_paths=_ignored_worktree_paths,
+        _index_entries=_index_entries,
+        _nul_git_paths=_nul_git_paths,
+        git=git,
+    )
+
+
+def _source_sync_effects_base_paths_overlap() -> source_sync.BasePathsOverlapEffects:
+    return source_sync.BasePathsOverlapEffects(
+        _paths_overlap=_paths_overlap,
+    )
+
+
+def _source_sync_effects_source_transition_state() -> source_sync.SourceTransitionStateEffects:
+    return source_sync.SourceTransitionStateEffects(
+        _base_worktree_snapshot=_base_worktree_snapshot,
+    )
+
+
+def _source_sync_effects_source_transition_marker() -> source_sync.SourceTransitionMarkerEffects:
+    return source_sync.SourceTransitionMarkerEffects(
+        git=git,
+    )
+
+
+def _source_sync_effects_source_expected_index() -> source_sync.SourceExpectedIndexEffects:
+    return source_sync.SourceExpectedIndexEffects(
+        git_bytes=git_bytes,
+    )
+
+
+def _source_sync_effects_synchronize_base_worktree() -> source_sync.SynchronizeBaseWorktreeEffects:
+    return source_sync.SynchronizeBaseWorktreeEffects(
+        _base_paths_overlap=_base_paths_overlap,
+        _base_worktree_index_error=_base_worktree_index_error,
+        _base_worktree_snapshot=_base_worktree_snapshot,
+        _git_operation_entries=_git_operation_entries,
+        _nul_git_paths=_nul_git_paths,
+        _source_expected_index=_source_expected_index,
+        _source_transition_marker=_source_transition_marker,
+        _source_transition_state=_source_transition_state,
+        git=git,
+        is_git_lock_failure=is_git_lock_failure,
+    )
+
+
+def _source_sync_effects_ensure_safe_base_worktree() -> source_sync.EnsureSafeBaseWorktreeEffects:
+    return source_sync.EnsureSafeBaseWorktreeEffects(
+        synchronize_base_worktree=synchronize_base_worktree,
+    )
+
+
+def _source_sync_effects_log_base_worktree_sync() -> source_sync.LogBaseWorktreeSyncEffects:
+    return source_sync.LogBaseWorktreeSyncEffects(
+        operation_log=operation_log,
+    )
+
+
+def _pull_request_recovery_effects_reconcile_existing_pull_request() -> pull_request_recovery.ReconcileExistingPullRequestEffects:
+    return pull_request_recovery.ReconcileExistingPullRequestEffects(
+        _block_closed_pull_request=_block_closed_pull_request,
+        _fetch_pr_conflict_recovery_refs=_fetch_pr_conflict_recovery_refs,
+        _is_pr_conflict_preflight_block=_is_pr_conflict_preflight_block,
+        _plan_id_from_path=_plan_id_from_path,
+        _record_project_recovery=_record_project_recovery,
+        _resume_reopened_pull_request=_resume_reopened_pull_request,
+        _update_blocked_error=_update_blocked_error,
+        _validate_active_pr_conflict_recovery=_validate_active_pr_conflict_recovery,
+        _validate_blocked_pr_without_conflict=_validate_blocked_pr_without_conflict,
+        _validate_pr_conflict_recovery_identity=_validate_pr_conflict_recovery_identity,
+        _validate_pr_conflict_recovery_ownership=_validate_pr_conflict_recovery_ownership,
+        block_active_execplan_from_revision=block_active_execplan_from_revision,
+        classify_pull_request_mergeability=classify_pull_request_mergeability,
+        complete_merged_execplan_worktree=complete_merged_execplan_worktree,
+        make_worktree=make_worktree,
+        operation_print=operation_print,
+        project_execplan=project_execplan,
+        recover_confirmed_pr_conflict_push=recover_confirmed_pr_conflict_push,
+        remote_base=remote_base,
+        update_project=update_project,
+        validate_execplan_workspace_identity=validate_execplan_workspace_identity,
+    )
+
+
+def _pull_request_recovery_effects_resume_pr_conflict_rebase() -> pull_request_recovery.ResumePrConflictRebaseEffects:
+    return pull_request_recovery.ResumePrConflictRebaseEffects(
+        _complete_direct_rebase_checkpoint=_complete_direct_rebase_checkpoint,
+        _current_rebase_service=_current_rebase_service,
+        _finish_owned_direct_rebase=_finish_owned_direct_rebase,
+        _journaled_direct_rebase=_journaled_direct_rebase,
+        _owned_rebase_state_dir=_owned_rebase_state_dir,
+        _rebase_in_progress_for_branch=_rebase_in_progress_for_branch,
+        active_execplan=active_execplan,
+        block_active_execplan=block_active_execplan,
+        git=git,
+        is_git_lock_failure=is_git_lock_failure,
+        operation_print=operation_print,
+        update_project=update_project,
+    )
+
+
+def _scope_reconciliation_effects_resume_project_block_if_safe() -> scope_reconciliation.ResumeProjectBlockIfSafeEffects:
+    return scope_reconciliation.ResumeProjectBlockIfSafeEffects(
+        _agent_git_resources=_agent_git_resources,
+        _clear_active_in_current_transaction=_clear_active_in_current_transaction,
+        _clear_project_block_without_losing_planning_error=_clear_project_block_without_losing_planning_error,
+        _reconcile_guidance_double_block=_reconcile_guidance_double_block,
+        _reconcile_rebase_evidence_block=_reconcile_rebase_evidence_block,
+        _reconciled_manager_scope_metadata=_reconciled_manager_scope_metadata,
+        _requeue_blocked_execplan=_requeue_blocked_execplan,
+        _resume_owned_checkpoint_project_block=_resume_owned_checkpoint_project_block,
+        capture_git_snapshot=capture_git_snapshot,
+        git=git,
+        hydrate_execplan_project=hydrate_execplan_project,
+        validate_agent_scope=validate_agent_scope,
+        validate_blocked_agent_scope=validate_blocked_agent_scope,
+        validate_execplan_workspace_identity=validate_execplan_workspace_identity,
+        validate_managed_worktree=validate_managed_worktree,
+        validate_planning_worktree_ownership=validate_planning_worktree_ownership,
+    )
+
+
+def _scope_reconciliation_effects_resume_plan_blocks() -> scope_reconciliation.ResumePlanBlocksEffects:
+    return scope_reconciliation.ResumePlanBlocksEffects(
+        ROOT=ROOT,
+        load_managed_config=load_managed_config,
+        plan_recovery_effects=_blocked_plan_reconciliation_effects,
+        _clear_active_in_current_transaction=_clear_active_in_current_transaction,
+        _reconcile_published_blocked_checkpoint=_reconcile_published_blocked_checkpoint,
+        _reconcile_rebase_evidence_block=_reconcile_rebase_evidence_block,
+        _resume_interrupted_blocked_rebase=_resume_interrupted_blocked_rebase,
+        _resume_legacy_review_count_block=_resume_legacy_review_count_block,
+        _update_blocked_error=_update_blocked_error,
+        active_execplan=active_execplan,
+        hydrate_execplan_project=hydrate_execplan_project,
+        plan_blocked_execplans=plan_blocked_execplans,
+        project_execplan=project_execplan,
+        resume_blocked_execplan_if_inputs_changed=resume_blocked_execplan_if_inputs_changed,
+        resume_guidance_approval_if_decided=resume_guidance_approval_if_decided,
+        unmet_execplan_dependencies=unmet_execplan_dependencies,
+        validate_blocked_agent_scope=validate_blocked_agent_scope,
+        validate_execplan_workspace_identity=validate_execplan_workspace_identity,
+    )
+
+
+def _archive_git_effects() -> archive_git.ArchiveGitEffects:
+    return archive_git.ArchiveGitEffects(
+        _recorded_base_fetch=_recorded_base_fetch,
+        _validate_managed_path_boundary=_validate_managed_path_boundary,
+        command=command,
+        git=git,
+        git_bytes=git_bytes,
+        is_git_lock_failure=is_git_lock_failure,
+        validate_managed_worktree=validate_managed_worktree,
+    )
+
+
+def _checkpoint_safety_effects() -> checkpoint_adapter.CheckpointSafetyEffects:
+    return checkpoint_adapter.CheckpointSafetyEffects(
+        _guidance_document=_guidance_document,
+        _guidance_document_matches_rows=_guidance_document_matches_rows,
+        _guidance_rows=_guidance_rows,
+        _owned_checkpoint_remote_oid=_owned_checkpoint_remote_oid,
+        _proven_manager_base_refs=_proven_manager_base_refs,
+        _proven_merged_cleanup_paths=_proven_merged_cleanup_paths,
+        _published_plan_allows_common_plans=_published_plan_allows_common_plans,
+        _rebase_in_progress_for_branch=_rebase_in_progress_for_branch,
+        capture_git_snapshot=capture_git_snapshot,
+        current_scope_effects=lambda: project_blocked_recovery.CurrentScopeEffects(_current_rebase_service),
+        git=git,
+        github_repository=github_repository,
+        pr_for_branch=pr_for_branch,
+        validate_agent_scope=validate_agent_scope,
+        validate_blocked_agent_scope=validate_blocked_agent_scope,
+        validate_execplan_workspace_identity=validate_execplan_workspace_identity,
+        validate_managed_worktree=validate_managed_worktree,
+    )
+
+
+def _checkpoint_publication_effects() -> checkpoint_adapter.CheckpointPublicationEffects:
+    return checkpoint_adapter.CheckpointPublicationEffects(
+        _git_with_index=_git_with_index,
+        capture_git_snapshot=capture_git_snapshot,
+        command=command,
+        git=git,
+    )
+
+
+def _diagnostic_publication_effects() -> checkpoint_adapter.PushDiagnosticCheckpointEffects:
+    return checkpoint_adapter.PushDiagnosticCheckpointEffects(
+        capture_git_snapshot=capture_git_snapshot,
+        git=git,
+    )
+
+
+def _managed_rebase_runtime_effects() -> managed_rebase_runtime.RebaseRuntimeEffects:
+    return managed_rebase_runtime.RebaseRuntimeEffects(
+        _guidance_document=_guidance_document,
+        _guidance_document_matches_rows=_guidance_document_matches_rows,
+        _guidance_final_expected=_guidance_final_expected,
+        _guidance_target_state=_guidance_target_state,
+        _owned_rebase_metadata=_owned_rebase_metadata,
+        _path_signature=_path_signature,
+        _published_plan_allows_common_plans=_published_plan_allows_common_plans,
+        _revision_execplan_input_fingerprint=_revision_execplan_input_fingerprint,
+        _worker_path_allowed=_worker_path_allowed,
+        _worktree_execplan_input_fingerprint=_worktree_execplan_input_fingerprint,
+        capture_git_snapshot=capture_git_snapshot,
+        git=git,
+        live_remote_branch_oid=lambda git_effect, repo_path, branch: manager_git_journal.live_remote_branch_oid(git_effect, repo_path, branch),
+        pr_for_branch=pr_for_branch,
+        requirement_archive_candidates=requirement_archive_candidates,
+        requirement_archive_move_set=requirement_archive_move_set,
+        requirement_archive_path=requirement_archive_path,
+        validate_active_execplan_metadata=validate_active_execplan_metadata,
+        validate_execplan_workspace_identity=validate_execplan_workspace_identity,
+        validate_managed_worktree=validate_managed_worktree,
+    )
+
+
+def _blocked_plan_reconciliation_effects() -> blocked_plan_reconciliation.PlanRecoveryEffects:
+    return blocked_plan_reconciliation.PlanRecoveryEffects(
+        ROOT=ROOT,
+        _BlockedCheckpointAdapter=_BlockedCheckpointAdapter,
+        _BlockedCheckpointResults=_BlockedCheckpointResults,
+        _blocked_execplan_metadata_error=_blocked_execplan_metadata_error,
+        _complete_direct_rebase_checkpoint=_complete_direct_rebase_checkpoint,
+        _current_rebase_service=_current_rebase_service,
+        _evaluate_remote_checkpoint_cause=_evaluate_remote_checkpoint_cause,
+        _journaled_direct_rebase=_journaled_direct_rebase,
+        _non_default_index_flags=_non_default_index_flags,
+        _reconcile_published_blocked_checkpoint=_reconcile_published_blocked_checkpoint,
+        _recorded_base_fetch=_recorded_base_fetch,
+        _revision_execplan_input_fingerprint=_revision_execplan_input_fingerprint,
+        _update_blocked_error=_update_blocked_error,
+        _worktree_execplan_input_fingerprint=_worktree_execplan_input_fingerprint,
+        _worktree_state_signature=_worktree_state_signature,
+        capture_git_snapshot=capture_git_snapshot,
+        git=git,
+        github_repository=github_repository,
+        hydrate_execplan_project=hydrate_execplan_project,
+        load_managed_config=load_managed_config,
+        observe_blocked_plan_remotes=observe_blocked_plan_remotes,
+        owned_remote_oid=checkpoint_ownership.owned_remote_oid,
+        pr_for_branch=pr_for_branch,
+        unmet_execplan_dependencies=unmet_execplan_dependencies,
+        validate_blocked_agent_scope=validate_blocked_agent_scope,
+        validate_execplan_workspace_identity=validate_execplan_workspace_identity,
+        validate_managed_worktree=validate_managed_worktree,
+    )
+
+
+def _project_blocked_recovery_effects() -> project_blocked_recovery.ProjectRecoveryEffects:
+    return project_blocked_recovery.ProjectRecoveryEffects(
+        _BlockedCheckpointAdapter=_BlockedCheckpointAdapter,
+        _BlockedCheckpointResults=_BlockedCheckpointResults,
+        _current_rebase_service=_current_rebase_service,
+        _journaled_direct_rebase=_journaled_direct_rebase,
+        _publish_direct_rebase_checkpoint=_publish_direct_rebase_checkpoint,
+        _reconcile_published_blocked_checkpoint=_reconcile_published_blocked_checkpoint,
+        _recorded_base_fetch=_recorded_base_fetch,
+        _update_blocked_error=_update_blocked_error,
+        _worktree_state_signature=_worktree_state_signature,
+        capture_git_snapshot=capture_git_snapshot,
+        git=git,
+        github_repository=github_repository,
+        observe_blocked_plan_remotes=observe_blocked_plan_remotes,
+        owned_remote_oid=checkpoint_ownership.owned_remote_oid,
+        pr_for_branch=pr_for_branch,
+        # This reconciler may outlive one publication attempt. Resolve the
+        # injected publication boundary when the attempt actually starts.
+        push_diagnostic_checkpoint=lambda adapter, request, head: push_diagnostic_checkpoint(adapter, request, head),
+        reconcile_execplan_catalog=reconcile_execplan_catalog,
+        resume_project_block_if_safe=resume_project_block_if_safe,
+        unmet_execplan_dependencies=unmet_execplan_dependencies,
+        validate_execplan_workspace_identity=validate_execplan_workspace_identity,
+        validate_managed_worktree=validate_managed_worktree,
+    )
+
+
+def _checkpoint_recovery_effects_reconcile_published_blocked_checkpoint() -> checkpoint_recovery.ReconcilePublishedBlockedCheckpointEffects:
+    return checkpoint_recovery.ReconcilePublishedBlockedCheckpointEffects(
+        _BlockedCheckpointAdapter=_BlockedCheckpointAdapter,
+        _blocked_execplan_revision_metadata_error=_blocked_execplan_revision_metadata_error,
+        _current_rebase_service=_current_rebase_service,
+        _evaluate_remote_checkpoint_cause=_evaluate_remote_checkpoint_cause,
+        _nul_git_paths=_nul_git_paths,
+        _published_plan_allows_common_plans=_published_plan_allows_common_plans,
+        _reclassify_remote_checkpoint_block=_reclassify_remote_checkpoint_block,
+        _reclassify_remote_specification_deadlock=_reclassify_remote_specification_deadlock,
+        _remote_checkpoint_input_identity=_remote_checkpoint_input_identity,
+        _remote_checkpoint_refusal=_remote_checkpoint_refusal,
+        _resume_remote_corrected_execplan=_resume_remote_corrected_execplan,
+        _revision_execplan_input_fingerprint=_revision_execplan_input_fingerprint,
+        capture_git_snapshot=capture_git_snapshot,
+        git=git,
+        github_repository=github_repository,
+        validate_execplan_workspace_identity=validate_execplan_workspace_identity,
+        validate_managed_worktree=validate_managed_worktree,
+    )
+
+
+def _checkpoint_recovery_effects_evaluate_remote_checkpoint_cause() -> checkpoint_recovery.EvaluateRemoteCheckpointCauseEffects:
+    return checkpoint_recovery.EvaluateRemoteCheckpointCauseEffects(
+        MAX_REVIEWER_PROTOCOL_ATTEMPTS=MAX_REVIEWER_PROTOCOL_ATTEMPTS,
+        ROOT=ROOT,
+        ReviewerProtocolError=ReviewerProtocolError,
+        WorkerResultError=WorkerResultError,
+        _remote_checkpoint_has_new_failure=_remote_checkpoint_has_new_failure,
+        _remote_checkpoint_review_revision=_remote_checkpoint_review_revision,
+        capture_git_snapshot=capture_git_snapshot,
+        load_managed_config=load_managed_config,
+        parse_reviewer_result=parse_reviewer_result,
+        parse_worker_result=parse_worker_result,
+        reviewer_targeted_test_reason=reviewer_targeted_test_reason,
+        run_agent=run_agent,
+        validate_agent_scope=validate_agent_scope,
+        verify=verify,
+    )
+
+
+def _scope_reconciliation_effects_resume_owned_checkpoint_project_block() -> scope_reconciliation.ResumeOwnedCheckpointProjectBlockEffects:
+    return scope_reconciliation.ResumeOwnedCheckpointProjectBlockEffects(
+        _clear_active_in_current_transaction=_clear_active_in_current_transaction,
+        _direct_rebase_history_proven=_direct_rebase_history_proven,
+        _published_review_commit_intent_matches=_published_review_commit_intent_matches,
+        capture_git_snapshot=capture_git_snapshot,
+        git=git,
+        pr_for_branch=pr_for_branch,
+        remote_branch_oid=remote_branch_oid,
+        validate_execplan_workspace_identity=validate_execplan_workspace_identity,
+        validate_managed_worktree=validate_managed_worktree,
+    )
+
+
+def _scope_reconciliation_effects_resume_legacy_review_count_block() -> scope_reconciliation.ResumeLegacyReviewCountBlockEffects:
+    return scope_reconciliation.ResumeLegacyReviewCountBlockEffects(
+        _rebase_in_progress_for_branch=_rebase_in_progress_for_branch,
+        capture_git_snapshot=capture_git_snapshot,
+        git=git,
+        pr_for_branch=pr_for_branch,
+        remote_branch_oid=remote_branch_oid,
+        validate_blocked_agent_scope=validate_blocked_agent_scope,
+        validate_execplan_workspace_identity=validate_execplan_workspace_identity,
+        validate_managed_worktree=validate_managed_worktree,
+    )
+
+
+def _scope_reconciliation_effects_resume_interrupted_blocked_rebase() -> scope_reconciliation.ResumeInterruptedBlockedRebaseEffects:
+    return scope_reconciliation.ResumeInterruptedBlockedRebaseEffects(
+        _blocked_execplan_metadata_error=_blocked_execplan_metadata_error,
+        _blocked_resume_worktree_matches=_blocked_resume_worktree_matches,
+        _complete_direct_rebase_checkpoint=_complete_direct_rebase_checkpoint,
+        _current_rebase_service=_current_rebase_service,
+        _direct_rebase_history_proven=_direct_rebase_history_proven,
+        _finish_owned_direct_rebase=_finish_owned_direct_rebase,
+        _owned_rebase_journal_state=_owned_rebase_journal_state,
+        _owned_rebase_state_dir=_owned_rebase_state_dir,
+        _reconcile_rebase_evidence_block=_reconcile_rebase_evidence_block,
+        _record_blocked_resume_head=_record_blocked_resume_head,
+        _requeue_blocked_execplan=_requeue_blocked_execplan,
+        _update_blocked_error=_update_blocked_error,
+        capture_git_snapshot=capture_git_snapshot,
+        clear_agent_scope=clear_agent_scope,
+        git=git,
+        remote_branch_oid=remote_branch_oid,
+    )
+
 
 
 def _scope_observation_effects() -> scope_observation.ObservationEffects:
@@ -534,14 +986,6 @@ class ExecPlanMetadataError(RuntimeError):
 
 class ReviewerProtocolError(RuntimeError):
     """A failed Reviewer response does not identify actionable issues."""
-
-
-class PublicationSafetyError(RuntimeError):
-    """A remote publication branch cannot be proven safe to update."""
-
-
-class ManagedWorktreeConflictError(PublicationSafetyError):
-    """A managed worktree has plan-local state that prevents publication."""
 
 
 def local_now() -> datetime:
@@ -881,42 +1325,7 @@ def git(
     repo: Path, *arguments: str, check: bool = True,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    command_index = 0
-    while command_index < len(arguments) and arguments[command_index] == "-c":
-        command_index += 2
-    if arguments[command_index : command_index + 1] == ("rebase",):
-        rebase_arguments = arguments[command_index + 1:]
-        overlap_error = None
-        if rebase_arguments and rebase_arguments[-1] in {
-            "--continue", "--skip", "--abort"
-        }:
-            overlap_error = _rebase_resume_ignored_overlap(repo, rebase_arguments[-1])
-        elif rebase_arguments and not rebase_arguments[-1].startswith("-"):
-            overlaps = _ignored_paths_overlapping_git_update(
-                repo, rebase_arguments[-1]
-            )
-            if overlaps:
-                overlap_error = (
-                    "rebase 대상 tracked 경로와 겹치는 ignored 파일: "
-                    + ", ".join(overlaps[:8])
-                )
-        if overlap_error:
-            if check:
-                raise ManagedWorktreeConflictError(overlap_error)
-            return subprocess.CompletedProcess(
-                ["git", "-C", str(repo), *arguments], 1, overlap_error
-            )
-    result = command(
-        ["git", "-C", str(repo), *arguments], check=False,
-        **({"env": env} if env is not None else {}),
-    )
-    if check and result.returncode:
-        output = result.stdout[-6000:].strip()
-        message = f"명령 실패 (git -C {repo}):\n{output}"
-        if is_git_lock_failure(output):
-            raise GitLockError(message)
-        raise RuntimeError(message)
-    return result
+    return command_adapter.git(_command_adapter_effects_git(), repo, *arguments, check=check, env=env)
 
 
 def github_repository(origin_url: str) -> str:
@@ -987,18 +1396,7 @@ def backfill_plan_shas(
 
 
 def git_bytes(repo: Path, *arguments: str) -> bytes:
-    result = _handoff_run(
-        ["git", "-C", str(repo), *arguments],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
-    if result.returncode:
-        output = result.stdout[-6000:].decode("utf-8", errors="replace").strip()
-        message = f"명령 실패 (git -C {repo}):\n{output}"
-        if is_git_lock_failure(output):
-            raise GitLockError(message)
-        raise RuntimeError(message)
-    return result.stdout
+    return command_adapter.git_bytes(_command_adapter_effects_git_bytes(), repo, *arguments)
 
 
 def _git_tree_entries(repo: Path, revision: str) -> dict[bytes, tuple[bytes, bytes]]:
@@ -5038,118 +5436,27 @@ def _rebase_resume_ignored_overlap(worktree: Path, action: str) -> str | None:
 def _base_worktree_snapshot(
     repo: Path,
 ) -> BaseWorktreeSnapshot:
-    branch_result = git(
-        repo,
-        "symbolic-ref",
-        "--quiet",
-        "--short",
-        "HEAD",
-        check=False,
-    )
-    branch = branch_result.stdout.strip() if branch_result.returncode == 0 else None
-    head = git(repo, "rev-parse", "HEAD").stdout.strip()
-    index = _index_entries(repo)
-    operations = tuple(sorted(_git_operation_entries(repo).items()))
-    preliminary = BaseWorktreeSnapshot(
-        branch=branch,
-        head=head,
-        index=tuple(sorted(index.items())),
-        changes=(),
-        operations=operations,
-    )
-    if operations or _base_worktree_index_error(preliminary):
-        return preliminary
-    changes = []
-    for kind, paths in (
-        ("staged", _nul_git_paths(
-            repo, "diff", "--cached", "--no-renames", "--name-only", "-z",
-            "--ignore-submodules=none",
-        )),
-        ("unstaged", _nul_git_paths(
-            repo, "diff", "--no-renames", "--name-only", "-z",
-            "--ignore-submodules=none",
-        )),
-        ("untracked", _nul_git_paths(
-            repo, "ls-files", "--others", "--exclude-standard", "-z",
-        )),
-        ("ignored", _ignored_worktree_paths(repo)),
-    ):
-        changes.extend((kind, path, _base_local_path_signature(repo, path)) for path in paths)
-    return BaseWorktreeSnapshot(
-        branch=branch,
-        head=head,
-        index=preliminary.index,
-        changes=tuple(sorted(changes)),
-        operations=operations,
-    )
-
-
-def _base_local_path_signature(repo: Path, relative_path: str) -> str:
-    path = repo / relative_path
-    if not path.exists() and not path.is_symlink():
-        return "missing"
-    return _git_operation_path_signature(path)
-
-
-def _base_worktree_index_error(snapshot: BaseWorktreeSnapshot) -> str | None:
-    for path, entries in snapshot.index:
-        if len(entries) != 1:
-            return path
-        fields = entries[0].split()
-        if (
-            len(fields) != 4
-            or fields[0] != "H"
-            or fields[3] != "0"
-            or not fields[2].strip("0")
-        ):
-            return path
-    return None
+    return source_sync._base_worktree_snapshot(_source_sync_effects_base_worktree_snapshot(), repo)
 
 
 def _base_paths_overlap(left: str, right: str) -> bool:
     # A remote checkout can be case insensitive even when the current host is not.
-    return _paths_overlap(left.casefold(), right.casefold())
+    return source_sync._base_paths_overlap(_source_sync_effects_base_paths_overlap(), left, right)
 
 
 def _source_transition_state(repo: Path) -> dict[str, object]:
-    snapshot = _base_worktree_snapshot(repo)
-    return {
-        "branch": snapshot.branch, "head": snapshot.head,
-        "index": {path: list(entries) for path, entries in snapshot.index},
-        "changes": [list(entry) for entry in snapshot.changes],
-        "operations": [list(entry) for entry in snapshot.operations],
-    }
+    return source_sync._source_transition_state(_source_sync_effects_source_transition_state(), repo)
 
 
 def _source_transition_marker(repo: Path, base: str, intent: Mapping[str, object]) -> bool:
-    token = f"loop-manager-source:{intent['id']}: "
-    for refname in (f"refs/heads/{base}", "HEAD"):
-        result = git(repo, "reflog", "show", "-1", "--format=%H%x00%gs",
-                     refname, check=False)
-        if result.returncode or not result.stdout.startswith(
-            f"{intent['expected']['head']}\x00{token}"
-        ):
-            return False
-    return True
+    return source_sync._source_transition_marker(_source_sync_effects_source_transition_marker(), repo, base, intent)
 
 
 def _source_expected_index(
     repo: Path, selected_remote: str, before_index: Mapping[str, object],
     changed_paths: tuple[str, ...],
 ) -> dict[str, object]:
-    """Keep local entries verbatim and replace only the remote tree delta."""
-    expected = dict(before_index)
-    remote_entries = {}
-    for record in git_bytes(repo, "ls-tree", "-r", "-z", selected_remote).split(b"\0"):
-        if record:
-            metadata, path = record.split(b"\t", 1)
-            mode, _kind, oid = metadata.decode("ascii").split()
-            remote_entries[os.fsdecode(path)] = [f"H {mode} {oid} 0"]
-    for path in changed_paths:
-        expected.pop(path, None)
-        if path in remote_entries:
-            expected[path] = remote_entries[path]
-    return expected
+    return source_sync._source_expected_index(_source_sync_effects_source_expected_index(), repo, selected_remote, before_index, changed_paths)
 
 
 def synchronize_base_worktree(
@@ -5160,204 +5467,7 @@ def synchronize_base_worktree(
     state_dir: Path | None = None,
     owner: str = "project",
 ) -> BaseWorktreeSyncResult:
-    """Best-effort fast-forward of an eligible primary checkout."""
-
-    selected_remote = remote_sha or ""
-    try:
-        if state_dir is not None:
-            manager_git_journal.recover_active(
-                state_dir, repo=str(_canonical_path(repo)),
-                kind="source_fast_forward", target=str(_canonical_path(repo)),
-                observe=lambda: _source_transition_state(repo),
-                marker=lambda intent: _source_transition_marker(repo, base, intent),
-            )
-        observed_remote = git(
-            repo,
-            "rev-parse",
-            "--verify",
-            f"refs/remotes/origin/{base}^{{commit}}",
-        ).stdout.strip()
-        selected_remote = selected_remote or observed_remote
-        if selected_remote != observed_remote:
-            return BaseWorktreeSyncResult(
-                "skipped", "선택한 원격 SHA와 현재 origin ref가 다름", selected_remote
-            )
-        # Equal HEAD needs no file or index scan: nothing will be checked out.
-        if git(repo, "rev-parse", "HEAD").stdout.strip() == selected_remote:
-            current_branch = git(
-                repo, "symbolic-ref", "--quiet", "--short", "HEAD", check=False
-            )
-            if current_branch.returncode:
-                return BaseWorktreeSyncResult("skipped", "detached HEAD", selected_remote)
-            branch = current_branch.stdout.strip()
-            if branch != base:
-                return BaseWorktreeSyncResult(
-                    "skipped", f"다른 branch checkout: {branch}", selected_remote
-                )
-            operations = _git_operation_entries(repo)
-            if operations:
-                return BaseWorktreeSyncResult(
-                    "skipped",
-                    "진행 중 Git operation: " + ", ".join(sorted(operations)),
-                    selected_remote,
-                )
-            return BaseWorktreeSyncResult("equal", "이미 원격 base와 같음", selected_remote)
-        before = _base_worktree_snapshot(repo)
-        if before.branch is None:
-            return BaseWorktreeSyncResult("skipped", "detached HEAD", selected_remote)
-        if before.branch != base:
-            return BaseWorktreeSyncResult(
-                "skipped",
-                f"다른 branch checkout: {before.branch}",
-                selected_remote,
-            )
-        if before.operations:
-            return BaseWorktreeSyncResult(
-                "skipped",
-                "진행 중 Git operation: " + ", ".join(name for name, _ in before.operations),
-                selected_remote,
-            )
-        if before.head == selected_remote:
-            return BaseWorktreeSyncResult("equal", "이미 원격 base와 같음", selected_remote)
-        index_error = _base_worktree_index_error(before)
-        if index_error:
-            return BaseWorktreeSyncResult(
-                "skipped",
-                f"비정상 index entry: {index_error}",
-                selected_remote,
-            )
-
-        behind = git(
-            repo,
-            "merge-base",
-            "--is-ancestor",
-            before.head,
-            selected_remote,
-            check=False,
-        )
-        if behind.returncode not in {0, 1}:
-            return BaseWorktreeSyncResult(
-                "failed",
-                "local/remote ancestry 확인 실패: " + behind.stdout[-2000:].strip(),
-                selected_remote,
-            )
-        if behind.returncode == 1:
-            ahead = git(
-                repo,
-                "merge-base",
-                "--is-ancestor",
-                selected_remote,
-                before.head,
-                check=False,
-            )
-            if ahead.returncode not in {0, 1}:
-                return BaseWorktreeSyncResult(
-                    "failed",
-                    "local/remote ancestry 확인 실패: "
-                    + ahead.stdout[-2000:].strip(),
-                    selected_remote,
-                )
-            reason = "ahead" if ahead.returncode == 0 else "diverged"
-            return BaseWorktreeSyncResult("skipped", reason, selected_remote)
-
-        changed_paths = tuple(
-            _nul_git_paths(
-                repo,
-                "diff",
-                "--no-renames",
-                "--name-only",
-                "-z",
-                before.head,
-                selected_remote,
-            )
-        )
-        overlaps = sorted({
-            (kind, path)
-            for kind, path, _ in before.changes
-            if any(_base_paths_overlap(path, changed) for changed in changed_paths)
-        })
-        if overlaps:
-            return BaseWorktreeSyncResult(
-                "skipped",
-                "원격 변경과 겹치는 로컬 경로: "
-                + ", ".join(f"{kind} {path}" for kind, path in overlaps[:8]),
-                selected_remote,
-            )
-
-        rechecked = _base_worktree_snapshot(repo)
-        if rechecked != before:
-            return BaseWorktreeSyncResult(
-                "skipped",
-                "eligibility 확인 뒤 기본 worktree 상태가 변경됨",
-                selected_remote,
-            )
-        current_remote = git(
-            repo, "rev-parse", "--verify", f"refs/remotes/origin/{base}^{{commit}}"
-        ).stdout.strip()
-        if current_remote != selected_remote:
-            return BaseWorktreeSyncResult(
-                "skipped", "eligibility 확인 뒤 origin ref가 변경됨", selected_remote
-            )
-        if state_dir is None:
-            updated = git(
-                repo, "merge", "--ff-only", "--no-autostash", selected_remote,
-                check=False,
-            )
-            if updated.returncode:
-                output = updated.stdout[-2000:].strip()
-                reason = "Git lock 충돌" if is_git_lock_failure(output) else "fast-forward 실패"
-                if output:
-                    reason += f": {output}"
-                return BaseWorktreeSyncResult("failed", reason, selected_remote)
-        else:
-            before_state = _source_transition_state(repo)
-            if before_state["head"] != before.head or before_state["branch"] != base:
-                raise manager_git_journal.MutationEvidenceError(
-                    "source fast-forward 직전 HEAD 또는 branch가 변경됐습니다."
-                )
-            if before_state != {
-                "branch": before.branch, "head": before.head,
-                "index": {path: list(entries) for path, entries in before.index},
-                "changes": [list(entry) for entry in before.changes],
-                "operations": [list(entry) for entry in before.operations],
-            }:
-                raise manager_git_journal.MutationEvidenceError(
-                    "source fast-forward 직전 로컬 상태가 변경됐습니다."
-                )
-            expected_state = {
-                **before_state, "head": selected_remote,
-                "index": _source_expected_index(
-                    repo, selected_remote, before_state["index"], changed_paths,
-                ),
-            }
-
-            def apply(token: str) -> None:
-                environment = {**os.environ,
-                               "GIT_REFLOG_ACTION": f"loop-manager-source:{token}"}
-                updated = git(
-                    repo, "merge", "--ff-only", "--no-autostash", selected_remote,
-                    check=False, env=environment,
-                )
-                if updated.returncode:
-                    raise RuntimeError("fast-forward 실패: " + updated.stdout[-2000:].strip())
-
-            manager_git_journal.execute(
-                state_dir, owner=owner, kind="source_fast_forward",
-                repo=str(_canonical_path(repo)), target=str(_canonical_path(repo)),
-                before=before_state, expected=expected_state,
-                observe=lambda: _source_transition_state(repo), apply=apply,
-                marker=lambda intent: _source_transition_marker(repo, base, intent),
-            )
-        final_head = git(repo, "rev-parse", "HEAD").stdout.strip()
-        if final_head != selected_remote:
-            return BaseWorktreeSyncResult(
-                "failed",
-                f"fast-forward 결과 HEAD 불일치: {final_head}",
-                selected_remote,
-            )
-        return BaseWorktreeSyncResult("updated", "원격 base로 fast-forward", selected_remote)
-    except (GitLockError, RuntimeError, OSError) as error:
-        return BaseWorktreeSyncResult("failed", str(error), selected_remote)
+    return source_sync.synchronize_base_worktree(_source_sync_effects_synchronize_base_worktree(), repo, base, remote_sha=remote_sha, state_dir=state_dir, owner=owner)
 
 
 def ensure_safe_base_worktree(
@@ -5367,18 +5477,11 @@ def ensure_safe_base_worktree(
     remote_sha: str | None = None,
     state_dir: Path | None = None,
 ) -> BaseWorktreeSyncResult:
-    """Compatibility entry point for the non-blocking worktree synchronizer."""
-
-    return synchronize_base_worktree(
-        repo, base, remote_sha=remote_sha, state_dir=state_dir,
-    )
+    return source_sync.ensure_safe_base_worktree(_source_sync_effects_ensure_safe_base_worktree(), repo, base, remote_sha=remote_sha, state_dir=state_dir)
 
 
 def log_base_worktree_sync(repo: Path, result: BaseWorktreeSyncResult) -> None:
-    operation_log(
-        f"기본 worktree 동기화 {result.status} ({repo}): {result.reason}",
-        error=result.status in {"skipped", "failed"},
-    )
+    return source_sync.log_base_worktree_sync(_source_sync_effects_log_base_worktree_sync(), repo, result)
 
 
 def _deserialize_review_level_history(
@@ -6062,29 +6165,7 @@ def clear_validation_failure_history(
 
 
 def pr_for_branch(repo: Path, branch: str, url: str | None = None) -> dict[str, object] | None:
-    fields = "url,state,mergedAt,headRefOid,headRefName,baseRefName,mergeable"
-    if url:
-        result = command(["gh", "pr", "view", url, "--json", fields], cwd=repo)
-        return json.loads(result.stdout)
-    result = command(
-        ["gh", "pr", "list", "--head", branch, "--state", "all", "--limit", "1", "--json", fields],
-        cwd=repo,
-    )
-    rows = json.loads(result.stdout)
-    return rows[0] if rows else None
-
-
-def classify_pull_request_mergeability(
-    pull_request: Mapping[str, object],
-) -> str:
-    """Normalize GitHub's asynchronous mergeability result."""
-
-    value = str(pull_request.get("mergeable") or "UNKNOWN").upper()
-    if value == "CONFLICTING":
-        return "conflicting"
-    if value == "MERGEABLE":
-        return "mergeable"
-    return "unknown"
+    return github_observation.pr_for_branch(_github_observation_effects_pr_for_branch(), repo, branch, url)
 
 
 def _fetch_pr_conflict_recovery_refs(
@@ -6853,7 +6934,7 @@ def _owned_rebase_journal_state(worktree: Path, branch: str) -> dict[str, object
 def _current_rebase_service(connection, repo_path, state_dir, repo, plan_id,
                             worktree, branch, **options):
     return managed_rebase_runtime.build_service(
-        sys.modules[__name__], connection, repo_path, state_dir, repo, plan_id,
+        _managed_rebase_runtime_effects(), connection, repo_path, state_dir, repo, plan_id,
         worktree, branch, **options,
     )
 
@@ -7158,41 +7239,7 @@ def validate_managed_worktree(
     *,
     allow_rebase: bool = False,
 ) -> None:
-    """Prove that a path is registered to this repository and expected branch."""
-
-    if not worktree.is_dir():
-        raise WorkspaceOwnershipError(f"관리 worktree 경로가 없습니다: {worktree}")
-    expected_path = _canonical_path(worktree)
-    record = next(
-        (
-            item
-            for item in _worktree_catalog(repo)
-            if _canonical_path(Path(str(item.get("worktree", "")))) == expected_path
-        ),
-        None,
-    )
-    if record is None:
-        raise WorkspaceOwnershipError(
-            f"Git에 등록되지 않은 관리 worktree입니다: {worktree}"
-        )
-    actual_branch = record.get("branch")
-    if branch is None:
-        if "detached" not in record:
-            raise WorkspaceOwnershipError(
-                f"planning worktree가 detached HEAD가 아닙니다: {worktree}"
-            )
-    elif actual_branch != f"refs/heads/{branch}":
-        if (
-            allow_rebase
-            and "detached" in record
-            and _rebase_in_progress_for_branch(worktree, branch)
-        ):
-            return
-        rendered = actual_branch or "detached"
-        raise WorkspaceOwnershipError(
-            f"관리 worktree branch 불일치: {worktree} "
-            f"(expected refs/heads/{branch}, actual {rendered})"
-        )
+    return workspace.validate_managed_worktree(_workspace_effects_validate_managed_worktree(), repo, worktree, branch, allow_rebase=allow_rebase)
 
 def validate_reserved_worktree(
     repo: Path,
@@ -7200,30 +7247,7 @@ def validate_reserved_worktree(
     branch: str | None,
     expected_head: str,
 ) -> None:
-    """Prove that a reserved path is the clean worktree Manager intended."""
-
-    if not expected_head:
-        raise WorkspaceOwnershipError(
-            "예약 workspace의 기준 commit SHA가 저장되지 않았습니다."
-        )
-    validate_managed_worktree(repo, worktree, branch)
-    snapshot = capture_git_snapshot(worktree)
-    violations: list[str] = []
-    if snapshot.head != expected_head:
-        violations.append(
-            f"HEAD {snapshot.head} (expected {expected_head})"
-        )
-    if snapshot.dirty:
-        paths = ", ".join(sorted(snapshot.dirty)[:8])
-        violations.append(f"변경 파일 {paths}")
-    if snapshot.operations:
-        operations = ", ".join(sorted(snapshot.operations))
-        violations.append(f"Git operation {operations}")
-    if violations:
-        raise WorkspaceOwnershipError(
-            "예약 workspace가 저장된 생성 기준과 다릅니다: "
-            + "; ".join(violations)
-        )
+    return workspace.validate_reserved_worktree(_workspace_effects_validate_reserved_worktree(), repo, worktree, branch, expected_head)
 
 
 def make_worktree(
@@ -7242,137 +7266,7 @@ def make_worktree(
     journal_state_dir: Path | None = None,
     journal_owner: str | None = None,
 ) -> str:
-    """Create, recover, or validate one owned ExecPlan worktree."""
-
-    if ownership_reserved and not expected_head:
-        raise WorkspaceOwnershipError(
-            "예약 ExecPlan workspace의 기준 commit SHA가 없습니다."
-        )
-    if worktree.exists() and not worktree.is_dir():
-        raise WorkspaceOwnershipError(
-            f"관리 worktree 경로가 디렉터리가 아닙니다: {worktree}"
-        )
-    if journal_state_dir is not None:
-        if not journal_owner:
-            raise WorkspaceOwnershipError("관리 worktree journal의 계획 identity가 없습니다.")
-        manager_git_journal.recover_active(
-            journal_state_dir, repo=str(_canonical_path(repo)),
-            kind="managed_worktree_create", target=str(_canonical_path(worktree)),
-            observe=lambda: _managed_worktree_transition_state(repo, worktree),
-            marker=lambda intent: _managed_worktree_marker(
-                journal_state_dir, intent, "create",
-            ),
-        )
-    if worktree.is_dir():
-        if not allow_existing:
-            raise WorkspaceOwnershipError(
-                f"새 ExecPlan의 관리 worktree가 이미 존재해 소유권을 증명할 수 없습니다: "
-                f"{worktree}"
-            )
-        if ownership_reserved:
-            validate_reserved_worktree(repo, worktree, branch, str(expected_head))
-        else:
-            validate_managed_worktree(
-                repo, worktree, branch, allow_rebase=allow_rebase
-            )
-        return "existing"
-
-    worktree.parent.mkdir(parents=True, exist_ok=True)
-    if journal_state_dir is None:
-        git(repo, "worktree", "prune", "--expire", "now")
-    branch_exists = (
-        git(
-            repo,
-            "show-ref",
-            "--verify",
-            "--quiet",
-            f"refs/heads/{branch}",
-            check=False,
-        ).returncode
-        == 0
-    )
-    if branch_exists:
-        if (allow_create_branch and not ownership_reserved) or not allow_recovery:
-            raise WorkspaceOwnershipError(
-                f"새 ExecPlan의 관리 branch가 이미 존재해 소유권을 증명할 수 없습니다: "
-                f"{branch}"
-            )
-        for record in _worktree_catalog(repo):
-            if record.get("branch") == f"refs/heads/{branch}":
-                owner = Path(str(record["worktree"]))
-                raise WorkspaceOwnershipError(
-                    f"관리 branch가 다른 worktree에 연결되어 있습니다: "
-                    f"{branch} ({owner})"
-                )
-        if ownership_reserved:
-            branch_head = git(
-                repo,
-                "rev-parse",
-                "--verify",
-                f"refs/heads/{branch}",
-            ).stdout.strip()
-            if branch_head != expected_head:
-                raise WorkspaceOwnershipError(
-                    "예약 ExecPlan branch가 저장된 기준 commit과 다릅니다: "
-                    f"{branch} ({branch_head}, expected {expected_head})"
-                )
-        arguments = ("worktree", "add", str(worktree), branch)
-        outcome = "recovered"
-    elif allow_create_branch or ownership_reserved:
-        if before_create is not None:
-            before_create()
-        start_point = expected_head or f"origin/{base}"
-        arguments = ("worktree", "add", "-b", branch, str(worktree), start_point)
-        outcome = "created"
-    else:
-        raise WorkspaceOwnershipError(
-            f"저장된 worktree와 관리 branch를 모두 복구할 수 없습니다: "
-            f"{worktree} ({branch})"
-        )
-    if journal_state_dir is None:
-        git(repo, *arguments)
-    else:
-        before = _managed_worktree_transition_state(repo, worktree)
-        if before != {"exists": False, "registration": None, "index": None}:
-            raise WorkspaceOwnershipError("관리 worktree 생성 직전 등록 상태가 변경됐습니다.")
-        head = git(
-            repo, "rev-parse", "--verify",
-            start_point if outcome == "created" else branch,
-        ).stdout.strip()
-        tree = git(repo, "rev-parse", "--verify", f"{head}^{{tree}}").stdout.strip()
-        mutation_id = secrets.token_hex(16)
-        lock_reason = f"loop-manager-worktree:{mutation_id}"
-        expected = {
-            "exists": True,
-            "registration": {"head": head, "branch": f"refs/heads/{branch}",
-                             "locked": lock_reason},
-            "index": tree,
-        }
-
-        def apply(token: str) -> None:
-            _write_managed_worktree_receipt(
-                journal_state_dir, token, repo, worktree, before, expected,
-                "create",
-            )
-            git(repo, "worktree", "add", "--lock", f"--reason={lock_reason}",
-                *arguments[2:])
-
-        manager_git_journal.execute(
-            journal_state_dir, owner=journal_owner,
-            kind="managed_worktree_create", repo=str(_canonical_path(repo)),
-            target=str(_canonical_path(worktree)), before=before,
-            expected=expected,
-            observe=lambda: _managed_worktree_transition_state(repo, worktree),
-            apply=apply,
-            marker=lambda intent: _managed_worktree_marker(
-                journal_state_dir, intent, "create",
-            ),
-        )
-    if ownership_reserved:
-        validate_reserved_worktree(repo, worktree, branch, str(expected_head))
-    else:
-        validate_managed_worktree(repo, worktree, branch, allow_rebase=allow_rebase)
-    return outcome
+    return workspace.make_worktree(_workspace_effects_make_worktree(), repo, worktree, branch, base, allow_recovery=allow_recovery, allow_existing=allow_existing, allow_rebase=allow_rebase, allow_create_branch=allow_create_branch, ownership_reserved=ownership_reserved, expected_head=expected_head, before_create=before_create, journal_state_dir=journal_state_dir, journal_owner=journal_owner)
 
 
 def make_planning_worktree(
@@ -7386,52 +7280,7 @@ def make_planning_worktree(
     ownership_reserved: bool = False,
     expected_head: str | None = None,
 ) -> str:
-    if ownership_reserved and not expected_head:
-        raise WorkspaceOwnershipError(
-            "예약 planning workspace의 기준 commit SHA가 없습니다."
-        )
-    if worktree.exists() and not worktree.is_dir():
-        raise WorkspaceOwnershipError(
-            f"planning worktree 경로가 디렉터리가 아닙니다: {worktree}"
-        )
-    if worktree.is_dir():
-        if not allow_existing:
-            raise WorkspaceOwnershipError(
-                "새 planning worktree 경로가 이미 존재해 소유권을 증명할 수 "
-                f"없습니다: {worktree}"
-            )
-        if ownership_reserved:
-            validate_reserved_worktree(repo, worktree, None, str(expected_head))
-        else:
-            validate_managed_worktree(repo, worktree, None)
-        return "existing"
-    if not allow_create:
-        raise WorkspaceOwnershipError(
-            f"보존된 planning worktree를 복구할 branch가 없습니다: "
-            f"{worktree}"
-        )
-    worktree.parent.mkdir(parents=True, exist_ok=True)
-    if before_create is not None:
-        before_create()
-    start_point = expected_head or f"origin/{base}"
-    git(repo, "worktree", "add", "--detach", str(worktree), start_point)
-    if ownership_reserved:
-        validate_reserved_worktree(repo, worktree, None, str(expected_head))
-    else:
-        validate_managed_worktree(repo, worktree, None)
-    return "created"
-
-
-def expected_execplan_workspace(
-    state_dir: Path,
-    repo: str,
-    plan_id: str,
-) -> tuple[str, Path]:
-    project_id = hashlib.sha256(repo.encode()).hexdigest()[:16]
-    return (
-        f"loop-manager/{plan_id}",
-        state_dir / "worktrees" / project_id / plan_id,
-    )
+    return workspace.make_planning_worktree(_workspace_effects_make_planning_worktree(), repo, worktree, base, allow_create=allow_create, before_create=before_create, allow_existing=allow_existing, ownership_reserved=ownership_reserved, expected_head=expected_head)
 
 
 def validate_execplan_workspace_identity(
@@ -7441,20 +7290,7 @@ def validate_execplan_workspace_identity(
     branch: str,
     worktree: Path,
 ) -> None:
-    expected_branch, expected_worktree = expected_execplan_workspace(
-        state_dir, repo, plan_id
-    )
-    if branch != expected_branch:
-        raise WorkspaceOwnershipError(
-            f"ExecPlan 관리 branch가 결정적 소유 경계와 다릅니다: "
-            f"{branch} (expected {expected_branch})"
-        )
-    _validate_managed_path_boundary(
-        state_dir,
-        worktree,
-        expected_worktree,
-        "ExecPlan worktree",
-    )
+    return workspace.validate_execplan_workspace_identity(_workspace_effects_validate_execplan_workspace_identity(), state_dir, repo, plan_id, branch, worktree)
 
 
 def _nul_git_paths(repo: Path, *arguments: str) -> list[str]:
@@ -8500,9 +8336,6 @@ def validate_worker_workspace_scope(
         allow_rebase=allow_rebase,
     )
     return plan
-
-
-GUIDANCE_BLOCK_REASON = BlockReasonCode.GUIDANCE_APPROVAL_REQUIRED.value
 
 
 def _guidance_document(worktree: Path, plan_path: str) -> GuidanceDocument | None:
@@ -10972,152 +10805,10 @@ def _resume_interrupted_blocked_rebase(
     connection: sqlite3.Connection, repo_path: Path,
     repo: str, base: str, plan: sqlite3.Row, worktree: Path, branch: str,
 ) -> bool | None:
-    """Complete a saved release only after its Git effect is independently proven."""
-    checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
-        repo, str(plan['plan_id']),
+    return scope_reconciliation._resume_interrupted_blocked_rebase(
+        _scope_reconciliation_effects_resume_interrupted_blocked_rebase(),
+        connection, repo_path, repo, base, plan, worktree, branch,
     )
-    block = scoped_blocking.plan_block(connection, repo, str(plan['plan_id']))
-    if rebase_block_reconciliation.could_be_rebase_evidence_block(block):
-        state_dir = _owned_rebase_state_dir(repo, str(plan['plan_id']), worktree)
-        return bool(state_dir is not None and _reconcile_rebase_evidence_block(
-            connection, repo_path, state_dir, repo, block, plan_block=True))
-    marker = (checkpoint.snapshot or {}).get('blocked_resume')
-    if not marker:
-        return None
-    published = connection.execute(
-        'SELECT phase, accepted_remote_oid FROM blocked_checkpoints '
-        'WHERE repo = ? AND plan_id = ?',
-        (repo, plan['plan_id']),
-    ).fetchone()
-    if (published is None or published['phase'] != 'published'
-            or marker.get('owner_oid') != published['accepted_remote_oid']):
-        # A later block may publish a new checkpoint while retaining the old
-        # execution snapshot. It must start a fresh release proof.
-        return None
-    intent = checkpoint.rebase_publication_intent()
-    if intent is not None:
-        try:
-            # Finish the saved lease before restoring staging or observing a
-            # later base. A completed publication is an idempotent no-op.
-            _complete_direct_rebase_checkpoint(
-                connection, repo, str(plan['plan_id']), worktree,
-                checkpoint.target_base_oid, repo_path=repo_path, branch=branch,
-                agent_session_id=plan['worker_session_id'])
-        except (RuntimeError, OSError, ValueError) as error:
-            _update_blocked_error(connection, repo, str(plan['plan_id']),
-                                  f'중단된 차단 해제 rebase 게시를 완료할 수 없습니다: {error}')
-            return False
-        checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
-            repo, str(plan['plan_id']))
-        plan = connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
-                                  (repo, plan['plan_id'])).fetchone()
-    current_head = git(worktree, 'rev-parse', 'HEAD').stdout.strip()
-    before_head = str(marker.get('before_head') or '')
-    after_head = str(marker.get('after_head') or '')
-    if not after_head and current_head == before_head:
-        return None
-    try:
-        # Finish the saved release against its own target. A newer base is
-        # applied by the normal lifecycle after this checkpoint is requeued.
-        target_base = checkpoint.target_base_oid
-        snapshot = capture_git_snapshot(worktree)
-        remote_oid = remote_branch_oid(repo_path, branch)
-        adopted_oid = (checkpoint.snapshot or {}).get('last_adopted_remote_oid')
-        original_oid = published['accepted_remote_oid']
-        published_result = (checkpoint.snapshot or {}).get('rebase_publication_result') or {}
-        confirmed = (intent is not None and published_result.get('intent_id') == intent['id']
-                     and published_result.get('head') == adopted_oid == remote_oid
-                     and plan['publication_remote_oid'] == adopted_oid)
-        owned_oid = checkpoint_ownership.owned_remote_oid(
-            connection, repo_path, repo, str(plan['plan_id']), branch,
-            worktree, original_oid if confirmed else remote_oid, git,
-            before_head=None if confirmed else before_head,
-            recorded_oid=original_oid if confirmed else str(plan['publication_remote_oid'] or '') or None,
-            require_live=not confirmed,
-        ) if not plan['pr_url'] else None
-        safe = (
-            owned_oid is not None
-            and marker.get('owner_oid') == owned_oid
-            and bool(target_base)
-            and marker.get('target_base_oid') == target_base
-            and checkpoint.observed_remote_oid == (adopted_oid if confirmed else owned_oid)
-            and snapshot.head == current_head and snapshot.branch == branch
-            and not snapshot.operations
-            and (not after_head or after_head == current_head)
-            and _blocked_execplan_metadata_error(repo_path, worktree, plan) is None
-        )
-        if safe:
-            state_dir = _owned_rebase_state_dir(repo, str(plan['plan_id']), worktree)
-            if state_dir is None:
-                safe = False
-            else:
-                accepted = (checkpoint.snapshot or {}).get('current_rebase_acceptance')
-                if (checkpoint.operation is None and isinstance(accepted, dict)
-                        and managed_rebase_validation.valid_acceptance(accepted)
-                        and (accepted['repo'], accepted['plan_id'], accepted['branch'], accepted['worktree'])
-                            == (repo, str(plan['plan_id']), branch, str(worktree.resolve()))):
-                    # A prior clean result was already adopted. Original stage
-                    # restoration is preservation, not another completed candidate.
-                    observed, decision = _current_rebase_service(
-                        connection, repo_path, state_dir, repo, str(plan['plan_id']),
-                        worktree, branch, target=target_base,
-                    ).observe(checkpoint=checkpoint)
-                    restored_stage = (decision.reason == 'adopted_checkpoint_work_pending'
-                                      and observed.metadata is None and not observed.operations
-                                      and observed.index_clean is False and bool(observed.staged)
-                                      and not any(entry.stage for entry in observed.index))
-                    safe = (accepted['head'] == current_head == checkpoint.expected_head
-                            and accepted['target_base_oid'] == target_base
-                            and accepted['remote']['oid'] == (intent['remote_before'] if confirmed else owned_oid)
-                            and (decision.status.value == 'complete' or restored_stage))
-                else:
-                    _finish_owned_direct_rebase(
-                        state_dir, connection, repo_path, repo,
-                        str(plan['plan_id']), worktree, branch,
-                        agent_session_id=plan['worker_session_id'],
-                    )
-                    safe = _direct_rebase_history_proven(
-                        connection, repo_path, repo, str(plan['plan_id']), worktree,
-                        branch, before_head, current_head, target_base,
-                        plan['worker_session_id'],
-                    )
-                safe = safe and _blocked_resume_worktree_matches(
-                    worktree, marker, snapshot, restore_staged=False)
-    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
-        safe = False
-    if not safe:
-        _update_blocked_error(connection, repo, str(plan['plan_id']),
-                              '중단된 차단 해제 rebase의 게시 소유권과 HEAD를 증명할 수 없습니다.')
-        return False
-    try:
-        preserved_observation = _owned_rebase_journal_state(worktree, branch)
-        _complete_direct_rebase_checkpoint(
-            connection, repo, str(plan['plan_id']), worktree, target_base,
-            repo_path=repo_path, branch=branch,
-            agent_session_id=plan['worker_session_id'],
-            preserved_worktree=True,
-            preserved_observation=preserved_observation,
-        )
-    except (RuntimeError, OSError, ValueError) as error:
-        _update_blocked_error(connection, repo, str(plan['plan_id']),
-                              f'중단된 차단 해제 rebase 완료 근거가 다릅니다: {error}')
-        return False
-    if not _blocked_resume_worktree_matches(worktree, marker, capture_git_snapshot(worktree)):
-        _update_blocked_error(connection, repo, str(plan["plan_id"]),
-                              "중단된 차단 해제 rebase의 index 복원 결과가 다릅니다.")
-        return False
-    if not after_head:
-        _record_blocked_resume_head(
-            connection, repo, str(plan['plan_id']), owned_oid,
-            before_head, target_base, current_head,
-        )
-    clear_agent_scope(connection, repo)
-    _requeue_blocked_execplan(
-        connection, repo, str(plan['plan_id']),
-        publication_remote_oid=runtime_state.RuntimeStateRepository(connection).get(
-            repo, str(plan['plan_id'])).publication_remote_oid or owned_oid,
-    )
-    return True
 
 
 def resume_blocked_execplan_if_inputs_changed(
@@ -12523,196 +12214,10 @@ def _resume_owned_checkpoint_project_block(
     connection: sqlite3.Connection, repo_path: Path, state_dir: Path,
     repo: str, block: sqlite3.Row, project: sqlite3.Row, plan: sqlite3.Row,
 ) -> bool:
-    """Restore only a proven published checkpoint mistaken for external work."""
-    plan_id = str(plan['plan_id'])
-    branch = str(plan['branch'] or '')
-    worktree = Path(str(plan['worktree'] or ''))
-    original_phase = ('WORKING' if plan['status'] == 'IMPLEMENTING'
-                      else str(plan['status']))
-    blocked_projection = plan['status'] == 'PLAN_BLOCKED'
-    projection_matches = (
-        project['plan_path'] in (None, plan['path'])
-        and project['branch'] in (None, branch)
-        and project['worktree'] in (None, str(worktree))
-    ) if blocked_projection else (
-        project['plan_path'] == plan['path']
-        and project['branch'] == branch
-        and project['worktree'] == str(worktree)
+    return scope_reconciliation._resume_owned_checkpoint_project_block(
+        _scope_reconciliation_effects_resume_owned_checkpoint_project_block(),
+        connection, repo_path, state_dir, repo, block, project, plan,
     )
-    if (
-        block['plan_id'] != plan_id
-        or project['phase'] != 'PROJECT_BLOCKED'
-        or block['previous_phase'] != original_phase
-        or plan['status'] not in ACTIVE_EXECPLAN_STATUSES | {'PLAN_BLOCKED'}
-        or not projection_matches
-        or plan['pr_url'] or project['pr_url']
-        or int(plan['workspace_owned'] or 0) != WORKSPACE_OWNED
-    ):
-        return False
-    checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
-        repo, plan_id,
-    )
-    snapshot = checkpoint.snapshot or {}
-    marker = snapshot.get('blocked_resume')
-    review_marker = snapshot.get('published_review_resume')
-    if review_marker is not None and not isinstance(review_marker, dict):
-        return False
-    try:
-        validate_execplan_workspace_identity(state_dir, repo, plan_id, branch, worktree)
-        validate_managed_worktree(repo_path, worktree, branch)
-        current = capture_git_snapshot(worktree)
-        if (current.operations or current.dirty or current.branch != branch
-                or (not marker and any(_non_default_index_flags(entries)
-                                       for entries in current.index.values()))
-                or not current.head):
-            return False
-        remote_oid = remote_branch_oid(repo_path, branch)
-        if pr_for_branch(repo_path, branch) is not None:
-            return False
-        if marker:
-            before_head = str(marker.get('before_head') or '')
-            after_head = str(marker.get('after_head') or '')
-            target_base = str(marker.get('target_base_oid') or '')
-            if (not before_head or not after_head or not target_base
-                    or marker.get('owner_oid') != remote_oid
-                    or after_head != current.head):
-                return False
-        else:
-            before_head = str(
-                (review_marker.get('head') if isinstance(review_marker, dict) else None)
-                or snapshot.get('reactivated_from_head') or ''
-            )
-            after_head = current.head
-            target_base = str(snapshot.get('base_oid') or checkpoint.target_base_oid or '')
-            if not before_head:
-                return False
-        pending_review_commit = (
-            not marker and review_marker is not None
-            and _published_review_commit_intent_matches(
-                repo_path, checkpoint, current.head,
-            )
-        )
-        pushed_review = (
-            not marker and review_marker is not None
-            and remote_oid != before_head
-            and remote_oid == current.head == checkpoint.expected_head
-            and plan['publication_remote_oid'] in (before_head, remote_oid)
-            and (
-                (snapshot.get('pushed_checkpoint_head') == remote_oid
-                 and checkpoint.observed_remote_oid == remote_oid)
-                or (checkpoint.operation == 'push'
-                    and snapshot.get('remote_before') == before_head
-                    and checkpoint.observed_remote_oid in (before_head, remote_oid))
-            )
-        )
-        direct_review = (
-            pushed_review or (
-                not marker and before_head == remote_oid
-                and (after_head == remote_oid or review_marker is not None)
-                and (checkpoint.expected_head == current.head or pending_review_commit)
-                and checkpoint.observed_remote_oid == remote_oid
-                and (not plan['publication_remote_oid']
-                     or plan['publication_remote_oid'] == remote_oid)
-            )
-        )
-        if direct_review:
-            published = connection.execute(
-                'SELECT request_identity, phase, reason_code, branch, worktree, '
-                'accepted_remote_oid FROM blocked_checkpoints '
-                'WHERE repo = ? AND plan_id = ?', (repo, plan_id),
-            ).fetchone()
-            if (published is None or published['phase'] != 'published'
-                    or published['reason_code'] != BlockReasonCode.REVIEW_RETRY_EXHAUSTED.value
-                    or published['branch'] != branch
-                    or published['worktree'] != str(worktree)
-                    or published['accepted_remote_oid'] != before_head
-                    or not published['request_identity']
-                    or (review_marker and (
-                        review_marker.get('request_identity') != published['request_identity']
-                        or review_marker.get('owner_oid') != before_head
-                        or review_marker.get('head') != before_head
-                    ))
-                    or not current.shared_metadata_complete
-                    or current.refs.get(f'refs/heads/{branch}') != (current.head, '')
-                    or current.refs.get(f'refs/remotes/origin/{branch}') != (remote_oid, '')):
-                return False
-        elif review_marker is not None and not marker:
-            return False
-        elif not target_base:
-            return False
-        if (
-            (checkpoint.expected_head != current.head and not pending_review_commit)
-            or (checkpoint.observed_remote_oid != remote_oid and not pushed_review)
-            or (not direct_review and not _direct_rebase_history_proven(
-                connection, repo_path, repo, plan_id, worktree, branch,
-                before_head, after_head, target_base,
-                plan['worker_session_id'],
-            ))
-        ):
-            return False
-        if pushed_review:
-            original_oid = checkpoint_ownership.owned_remote_oid(
-                connection, repo_path, repo, plan_id, branch, worktree,
-                before_head, git, before_head=current.head,
-                recorded_oid=before_head, require_live=False,
-            )
-            live = git(repo_path, 'ls-remote', '--heads', 'origin',
-                       f'refs/heads/{branch}', check=False)
-            rows = [line.split() for line in live.stdout.splitlines() if line.strip()]
-            if (original_oid != before_head or live.returncode
-                    or rows != [[remote_oid, f'refs/heads/{branch}']]):
-                return False
-            owned_oid = remote_oid
-        else:
-            owned_oid = checkpoint_ownership.owned_remote_oid(
-                connection, repo_path, repo, plan_id, branch, worktree,
-                remote_oid, git,
-                before_head=current.head if direct_review else before_head,
-                recorded_oid=str(plan['publication_remote_oid'] or '') or None,
-            )
-        if owned_oid is None:
-            return False
-    except (OSError, RuntimeError, WorkspaceOwnershipError, ValueError):
-        return False
-    with runtime_state._transaction(connection):
-        if direct_review and review_marker is None:
-            execution_checkpoint_state.ExecutionCheckpointRepository(connection).record(
-                repo, plan_id, expected_generation=checkpoint.generation,
-                operation=checkpoint.operation, expected_head=checkpoint.expected_head,
-                target_base_oid=checkpoint.target_base_oid,
-                observed_remote_oid=checkpoint.observed_remote_oid,
-                snapshot={**snapshot, 'published_review_resume': {
-                    'request_identity': str(published['request_identity']),
-                    'owner_oid': owned_oid, 'head': current.head,
-                }},
-            )
-        elif not marker and not direct_review:
-            execution_checkpoint_state.ExecutionCheckpointRepository(connection).record(
-                repo, plan_id, expected_generation=checkpoint.generation,
-                operation=checkpoint.operation, expected_head=checkpoint.expected_head,
-                target_base_oid=checkpoint.target_base_oid,
-                observed_remote_oid=checkpoint.observed_remote_oid,
-                snapshot={**snapshot, 'blocked_resume': {
-                    'owner_oid': owned_oid, 'before_head': before_head,
-                    'after_head': after_head, 'target_base_oid': target_base,
-                }},
-            )
-        connection.execute(
-            'UPDATE exec_plans SET publication_remote_oid = ? '
-            'WHERE repo = ? AND plan_id = ?', (owned_oid, repo, plan_id),
-        )
-        scoped_blocking.clear_project_block(connection, repo)
-        if plan['status'] in ACTIVE_EXECPLAN_STATUSES:
-            refreshed = connection.execute(
-                'SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
-                (repo, plan_id),
-            ).fetchone()
-            runtime_state.RuntimeStateRepository(connection).hydrate_snapshot(
-                repo, runtime_state.ExecutionSnapshot.from_row(refreshed),
-            )
-        else:
-            _clear_active_in_current_transaction(connection, repo)
-    return True
 
 
 def _clear_project_block_without_losing_planning_error(
@@ -12869,192 +12374,7 @@ def resume_project_block_if_safe(
     state_dir: Path,
     repo: str,
 ) -> bool:
-    """Release only a project block whose original safety boundary is restored."""
-
-    block = scoped_blocking.project_block(connection, repo)
-    if block is None:
-        return False
-    checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
-        repo, str(block['plan_id'] or ''))
-    recovery = recovery_state.RecoveryRepository(connection).row(repo, str(block['plan_id'] or ''))
-    if rebase_block_reconciliation.could_be_rebase_evidence_block(block, recovery, checkpoint):
-        return _reconcile_rebase_evidence_block(
-            connection, repo_path, state_dir, repo, block, plan_block=False,
-        )
-    if (block['plan_id'] and block['reason_code'] in rebase_block_reconciliation.REBASE_BLOCK_REASONS
-            and checkpoint.operation == 'rebase'):
-        # A pending rebase cannot borrow the generic branch-only release path
-        # when its stored safety cause cannot be connected to this operation.
-        return False
-    if block["reason_code"] == BlockReasonCode.LEGACY_UNSCOPED_BLOCK.value:
-        return False
-    plan_id = str(block["plan_id"] or "")
-    project = connection.execute(
-        "SELECT * FROM projects WHERE repo = ?", (repo,)
-    ).fetchone()
-    if project is None:
-        return False
-    planning_owns_slot = runtime_state.planning_owns_execution_slot(project)
-    if not plan_id:
-        if block['reason_code'] == BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value:
-            return False
-        if scoped_blocking.is_scope_baseline_block(block) and project['agent_recovery']:
-            return False
-        try:
-            worktree = Path(str(project['worktree'] or repo_path))
-            checked = None
-            if block["reason_code"] == BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value:
-                worktree = Path(str(project["worktree"] or ""))
-                fingerprint = str(project["planning_attempt_fingerprint"] or "")
-                if not fingerprint:
-                    return False
-                validate_planning_worktree_ownership(
-                    connection,
-                    repo_path,
-                    state_dir,
-                    repo,
-                    fingerprint,
-                    worktree,
-                )
-            elif project["agent_snapshot"]:
-                before = GitSnapshot.deserialize(str(project["agent_snapshot"]))
-                after = checked = capture_git_snapshot(worktree)
-                resources = _agent_git_resources(connection, repo_path, worktree, before,
-                                                str(project['agent_role'] or 'planner'))
-                if scoped_blocking.is_scope_baseline_block(block) and project['agent_result_snapshot']:
-                    result = GitSnapshot.deserialize(str(project['agent_result_snapshot']))
-                    comparison = _reconciled_manager_scope_metadata(
-                        connection, repo_path, state_dir, repo, None, before, after, resources)
-                    result = _reconciled_manager_scope_metadata(
-                        connection, repo_path, state_dir, repo, None, result, after, resources)
-                    validate_agent_scope(str(project['agent_role'] or 'planner'), worktree,
-                        comparison, result, external_worktree=repo_path,
-                        base_branch=str(project['base_branch']), resources=resources)
-                before = _reconciled_manager_scope_metadata(
-                    connection, repo_path, state_dir, repo, None, before, after, resources)
-                validate_agent_scope(
-                    str(project["agent_role"] or "planner"),
-                    worktree,
-                    before,
-                    after,
-                    external_worktree=repo_path,
-                    base_branch=str(project["base_branch"]),
-                    connection=connection,
-                )
-            else:
-                return False
-        except (AgentScopeError, RuntimeError, WorkspaceOwnershipError, ValueError):
-            return False
-        with runtime_state._transaction(connection):
-            if (not scoped_blocking.project_cause_matches(connection, block)
-                    or dict(connection.execute('SELECT * FROM projects WHERE repo = ?',
-                                               (repo,)).fetchone()) != dict(project)
-                    or (checked is not None and capture_git_snapshot(worktree) != checked)):
-                return False
-            _clear_project_block_without_losing_planning_error(connection, repo, project)
-        return True
-    plan = connection.execute(
-        "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
-        (repo, plan_id),
-    ).fetchone()
-    if plan is None:
-        return False
-    if planning_owns_slot and str(plan["status"]) in ACTIVE_EXECPLAN_STATUSES:
-        return False
-    if (
-        planning_owns_slot
-        and block['reason_code']
-        == BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value
-    ):
-        return False
-    if not planning_owns_slot and _reconcile_guidance_double_block(
-        connection, repo_path, state_dir, repo, block, project, plan,
-    ):
-        return True
-    if block['reason_code'] == BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value:
-        return _resume_owned_checkpoint_project_block(
-            connection, repo_path, state_dir, repo, block, project, plan,
-        )
-    if (
-        block["reason_code"]
-        == BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value
-        and int(plan["workspace_owned"])
-        in {WORKSPACE_UNOWNED, WORKSPACE_RESERVED}
-    ):
-        worktree = Path(str(plan["worktree"] or ""))
-        branch = str(plan["branch"] or "")
-        try:
-            validate_execplan_workspace_identity(
-                state_dir, repo, plan_id, branch, worktree
-            )
-        except WorkspaceOwnershipError:
-            return False
-        branch_state = git(
-            repo_path,
-            "show-ref",
-            "--verify",
-            "--quiet",
-            f"refs/heads/{branch}",
-            check=False,
-        )
-        if (
-            worktree.exists()
-            or worktree.is_symlink()
-            or branch_state.returncode != 1
-        ):
-            return False
-        status = str(plan["status"])
-        with connection:
-            _clear_project_block_without_losing_planning_error(connection, repo, project)
-        if status in ACTIVE_EXECPLAN_STATUSES:
-            _requeue_blocked_execplan(connection, repo, plan_id)
-        else:
-            if not planning_owns_slot:
-                with connection:
-                    _clear_active_in_current_transaction(connection, repo)
-        return True
-    if int(plan["workspace_owned"]) != WORKSPACE_OWNED:
-        return False
-    if scoped_blocking.is_scope_baseline_block(block) and (
-            not plan['agent_snapshot'] or plan['agent_recovery']):
-        return False
-    worktree = Path(str(plan["worktree"] or ""))
-    branch = str(plan["branch"] or "")
-    try:
-        checked = capture_git_snapshot(worktree) if plan['agent_snapshot'] else None
-        validate_execplan_workspace_identity(
-            state_dir, repo, plan_id, branch, worktree
-        )
-        validate_managed_worktree(
-            repo_path,
-            worktree,
-            branch,
-        )
-        if plan["agent_snapshot"]:
-            validate_blocked_agent_scope(
-                connection, repo_path, repo, str(project['base_branch']),
-                worktree, str(plan['path']), saved_plan=plan,
-                require_safe_result=scoped_blocking.is_scope_baseline_block(block))
-        if checked is not None and capture_git_snapshot(worktree) != checked:
-            return False
-    except (AgentScopeError, RuntimeError, WorkspaceOwnershipError, ValueError):
-        return False
-    with runtime_state._transaction(connection):
-        if (not scoped_blocking.project_cause_matches(connection, block)
-                or dict(connection.execute('SELECT * FROM projects WHERE repo = ?',
-                                           (repo,)).fetchone()) != dict(project)
-                or dict(connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
-                                           (repo, plan_id)).fetchone()) != dict(plan)
-                or (checked is not None and capture_git_snapshot(worktree) != checked)):
-            return False
-        _clear_project_block_without_losing_planning_error(connection, repo, project)
-        if scoped_blocking.is_scope_baseline_block(block):
-            recovery_state.RecoveryRepository(connection).resolve_rebase_block(repo, plan_id, block)
-        if str(plan["status"]) in ACTIVE_EXECPLAN_STATUSES:
-            hydrate_execplan_project(connection, repo, plan)
-        elif not planning_owns_slot:
-            _clear_active_in_current_transaction(connection, repo)
-    return True
+    return scope_reconciliation.resume_project_block_if_safe(_scope_reconciliation_effects_resume_project_block_if_safe(), connection, repo_path, state_dir, repo)
 
 
 def _remote_checkpoint_input_identity(
@@ -13222,103 +12542,10 @@ def _evaluate_remote_checkpoint_cause(
     repo: str, blocked: sqlite3.Row, config_path: Path | None,
     timeout_seconds: int | None,
 ) -> tuple[bool, str, str | None]:
-    """Inspect the candidate while retaining the block and all execution evidence."""
-    worktree = Path(str(blocked["worktree"]))
-    config = config_path or ROOT / "config/config.ini"
-    timeout = (timeout_seconds if timeout_seconds is not None
-               else load_managed_config(config).verify_timeout_seconds)
-    project = connection.execute(
-        "SELECT provider, base_branch FROM projects WHERE repo = ?", (repo,),
-    ).fetchone()
-    revision = _remote_checkpoint_review_revision(
-        repo_path, worktree, str(project["base_branch"]), state_dir,
+    return checkpoint_recovery._evaluate_remote_checkpoint_cause(
+        _checkpoint_recovery_effects_evaluate_remote_checkpoint_cause(),
+        connection, repo_path, state_dir, repo, blocked, config_path, timeout_seconds,
     )
-    if revision is None:
-        return False, "원격 checkpoint 후보가 최신 base를 포함하지 않습니다.", "stale_base"
-    before = capture_git_snapshot(worktree)
-    passed, output = verify(worktree, timeout)
-    validate_agent_scope(
-        "reviewer", worktree, before, capture_git_snapshot(worktree),
-        external_worktree=repo_path,
-    )
-    validation_feedback_state.ValidationFeedbackRepository(connection).record_result(
-        repo, str(blocked["plan_id"]), revision[0], "verify",
-        "success" if passed else "failure",
-        str(getattr(output, "fingerprint_source", output)),
-    )
-    if not passed:
-        return _remote_checkpoint_has_new_failure(
-            connection, repo, blocked, "verify", output, worktree,
-        ), str(output), "verify"
-    if blocked["blocked_reason"] == BlockReasonCode.VERIFY_RETRY_EXHAUSTED.value:
-        return True, str(output), None
-    try:
-        worker_publication = parse_worker_result(
-            str(blocked["worker_result"] or ""),
-            {"id": str(blocked["plan_id"]), "title": str(blocked["title"])},
-        )
-    except WorkerResultError as error:
-        return False, f"원격 checkpoint Worker 결과 검증 실패: {error}", "worker"
-    targeted_test_reason = reviewer_targeted_test_reason(
-        worker_publication.test_evidence,
-    )
-    previous_review = blocked["review_result"]
-    protocol_error = None
-    for attempt in range(1, MAX_REVIEWER_PROTOCOL_ATTEMPTS + 1):
-        if _remote_checkpoint_review_revision(
-            repo_path, worktree, str(project["base_branch"]), state_dir,
-        ) != revision:
-            return False, "원격 checkpoint verify 뒤 base 또는 HEAD가 변경됐습니다.", "revision_drift"
-        review_before = capture_git_snapshot(worktree)
-        code, review = run_agent(
-            str(project["provider"]), worktree, state_dir, config, "reviewer",
-            reviewer_prompt(
-                str(project["base_branch"]), targeted_test_reason, previous_review,
-                session_recovery=True,
-                protocol_error=protocol_error,
-            ),
-            read_only=True,
-            connection=connection,
-            invocation=InvocationContext(repo, str(blocked["plan_id"])),
-        )
-        validate_agent_scope(
-            "reviewer", worktree, review_before, capture_git_snapshot(worktree),
-            external_worktree=repo_path,
-        )
-        if code:
-            raise RuntimeError(f"원격 checkpoint Reviewer 실행 미완료: {review}")
-        try:
-            verdict, details = parse_reviewer_result(review)
-            if verdict == "SPEC_BLOCKED":
-                assert isinstance(details, reviewer_specification.SpecificationDeadlock)
-                try:
-                    reviewer_specification.validate_locations(
-                        details, str(blocked["path"]),
-                        tuple(str(source) for source in json.loads(str(blocked["sources"]))),
-                    )
-                except ValueError as error:
-                    raise ReviewerProtocolError(str(error)) from error
-        except ReviewerProtocolError as error:
-            protocol_error = str(error)
-            previous_review = review
-            if attempt == MAX_REVIEWER_PROTOCOL_ATTEMPTS:
-                evidence = (
-                    f"Reviewer 결과 프로토콜 오류: {protocol_error} "
-                    f"(프로토콜 교정 {MAX_REVIEWER_PROTOCOL_ATTEMPTS}회 실패)\n"
-                    f"직전 결과:\n{review}"
-                )
-                return False, evidence, "protocol_exhausted"
-            continue
-        if verdict == "SPEC_BLOCKED":
-            return False, review, "specification"
-        validation_feedback_state.ValidationFeedbackRepository(connection).observe(
-            repo, str(blocked["plan_id"]), revision[0], "review", verdict == "PASS", review,
-            normalize_feedback("review", review) if verdict == "FAIL" else (),
-        )
-        return verdict == "PASS" or _remote_checkpoint_has_new_failure(
-            connection, repo, blocked, "review", review, worktree,
-        ), review, "review" if verdict != "PASS" else None
-    raise AssertionError("Reviewer 프로토콜 교정 횟수가 소진되지 않았습니다.")
 
 
 def _reclassify_remote_specification_deadlock(
@@ -13443,571 +12670,20 @@ def _reconcile_published_blocked_checkpoint(
     *, adopt_only: bool = False, expected_remote_oid: str | None = None,
     project_recovery_context: dict | None = None,
 ) -> str:
-    """Inspect one exact remote ref without adopting unproven or unsafe work."""
-    adapter = _BlockedCheckpointAdapter(
-        connection, repo_path, state_dir, repo,
-        project_recovery_scope=project_recovery_context is not None,
+    return checkpoint_recovery._reconcile_published_blocked_checkpoint(
+        _checkpoint_recovery_effects_reconcile_published_blocked_checkpoint(),
+        connection, repo_path, state_dir, repo, blocked, row, request, repository, config_path, verify_timeout_seconds, adopt_only=adopt_only, expected_remote_oid=expected_remote_oid, project_recovery_context=project_recovery_context,
     )
-    snapshot = None
-    worktree = Path(str(blocked["worktree"] or ""))
-    branch = str(blocked["branch"] or "")
-    try:
-        observed = adapter.observe_remote(request)
-    except (OSError, RuntimeError) as error:
-        observed = None
-        observation_error = f"원격 checkpoint를 재검증할 수 없습니다: {error}"
-    else:
-        observation_error = None
-    accepted = str(row["accepted_remote_oid"] or row["published_oid"] or row["remote_oid"])
-    unchanged = observed == accepted and not row["pending_remote_oid"]
-    try:
-        validate_execplan_workspace_identity(
-            state_dir, repo, str(blocked["plan_id"]), branch, worktree,
-        )
-        validate_managed_worktree(repo_path, worktree, branch)
-        snapshot = capture_git_snapshot(worktree)
-        ignored_paths = tuple(_nul_git_paths(
-            worktree, "ls-files", "--others", "--ignored",
-            "--exclude-standard", "-z",
-        ))
-    except (OSError, RuntimeError, WorkspaceOwnershipError) as error:
-        safety_error = f"관리 branch/worktree 소유권을 증명할 수 없습니다: {error}"
-        ignored_paths = ()
-    else:
-        safety_error = None
-    input_identity = _remote_checkpoint_input_identity(
-        blocked, snapshot, ignored_paths,
-    )
-
-    def refuse(message: str) -> str:
-        _remote_checkpoint_refusal(
-            connection, repository, request, row, observed, input_identity,
-            message, preserve_cause=adopt_only,
-        )
-        return "blocked"
-
-    def retry(message: str) -> str:
-        _remote_checkpoint_refusal(
-            connection, repository, request, row, observed, input_identity,
-            message, retryable=True, preserve_cause=adopt_only,
-        )
-        return "blocked"
-
-    if adopt_only and observed != expected_remote_oid:
-        return retry("원격 checkpoint branch가 계획별 관측 이후 변경됐습니다.")
-    if adopt_only and unchanged:
-        return "unchanged"
-    if (
-        project_recovery_context is None
-        and not row["pending_remote_oid"]
-        and row["inspected_remote_oid"] == observed
-        and row["inspected_input"] == input_identity
-        and row["inspection_reason"]
-        and not row["inspection_retryable"]
-        and blocked["blocked_reason"]
-        != BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT.value
-    ):
-        return "blocked"
-    if unchanged:
-        return "unchanged"
-    if observation_error:
-        return retry(observation_error)
-    if project_recovery_context is not None:
-        # A historical publication may outlive its PLAN_BLOCKED cause. The
-        # selected project recovery owns adoption, never a synthetic plan block.
-        context = project_recovery_context
-        current_block = scoped_blocking.plan_block(connection, repo, request.plan_id)
-        if (
-            not adopt_only or request.plan_id != blocked["plan_id"]
-            or context['plan_id'] != request.plan_id
-            or context['status'] != blocked['status']
-            or context['identity'] != {
-                field: blocked[field] for field in blocked_plan_reconciliation.IDENTITY_FIELDS
-            }
-            or context['plan_block'] != (dict(current_block) if current_block else None)
-            or not scoped_blocking.project_cause_matches(connection, context['project_block'])
-            or not project_blocked_recovery.project_slot_available(connection, repo, request.plan_id)
-        ):
-            return refuse("checkpoint와 현재 PROJECT_BLOCKED 원인/계획 identity가 다릅니다.")
-    else:
-        current_block = scoped_blocking.plan_block(connection, repo, request.plan_id)
-        if (
-            current_block is None
-            or current_block["reason_code"] != request.reason_code
-            or blocked["blocked_reason"] != request.reason_code
-            or request.plan_id != blocked["plan_id"]
-        ):
-            return refuse("checkpoint와 현재 PLAN_BLOCKED 원인/계획 identity가 다릅니다.")
-    if observed is None:
-        return refuse("게시된 원격 checkpoint branch가 삭제됐습니다.")
-    if not row["published_oid"]:
-        return refuse("게시 OID가 증명되지 않은 legacy checkpoint의 원격 변경은 채택할 수 없습니다.")
-    if row["pending_remote_oid"] and row["pending_remote_oid"] != observed:
-        return refuse("미완료 원격 checkpoint 채택 중 branch OID가 다시 변경됐습니다.")
-    if blocked["pr_url"] or int(blocked["workspace_owned"] or 0) != WORKSPACE_OWNED:
-        return refuse("PR 또는 관리 workspace 소유권 때문에 원격 checkpoint를 채택할 수 없습니다.")
-    if request.branch != branch or request.worktree != str(worktree):
-        return refuse("저장된 checkpoint branch/worktree가 ExecPlan 소유권과 다릅니다.")
-    if safety_error:
-        return refuse(safety_error)
-    assert snapshot is not None
-    if snapshot.operations:
-        return refuse("미해결 Git operation: " + ", ".join(sorted(snapshot.operations)))
-    if snapshot.branch != branch or not snapshot.head:
-        return refuse("관리 worktree의 branch 또는 HEAD가 저장된 ExecPlan과 다릅니다.")
-    own_ref = f"refs/heads/{branch}"
-    own_worktree = snapshot.worktrees.get(str(_canonical_path(worktree)), ())
-    if (
-        not snapshot.shared_metadata_complete
-        or snapshot.refs.get(own_ref, (None, None))[0] != snapshot.head
-        or f"branch={own_ref}" not in own_worktree
-    ):
-        return refuse("관리 branch ref와 worktree 등록 상태의 소유권을 증명할 수 없습니다.")
-    if snapshot.dirty:
-        return refuse("로컬 tracked/index/untracked 변경을 보존하기 위해 원격 fast-forward를 중단합니다.")
-    if any(_non_default_index_flags(entries) for entries in snapshot.index.values()):
-        return refuse("관리 worktree index flag가 안전하지 않습니다.")
-    project = connection.execute(
-        "SELECT origin FROM projects WHERE repo = ?", (repo,)
-    ).fetchone()
-    expected_origin = str(project["origin"] or "") if project else ""
-    try:
-        if not expected_origin:
-            raise RuntimeError("등록 origin이 없습니다.")
-        for context in (repo_path, worktree):
-            for args in (("remote", "get-url", "--all", "origin"),
-                         ("remote", "get-url", "--push", "--all", "origin")):
-                urls = git(context, *args).stdout.splitlines()
-                if len(urls) != 1 or github_repository(urls[0]) != expected_origin:
-                    raise RuntimeError("등록 origin과 fetch/push 대상이 다릅니다.")
-    except RuntimeError as error:
-        return refuse(f"원격 저장소 소유권을 증명할 수 없습니다: {error}")
-    try:
-        # Project recovery may not trust configured mappings to shared refs.
-        refmap_options = ("--refmap=",) if project_recovery_context is not None else ()
-        fetched = git(
-            repo_path, "fetch", "--no-tags", *refmap_options, "origin",
-            f"refs/heads/{branch}", check=False,
-        )
-    except (OSError, RuntimeError) as error:
-        return retry("원격 checkpoint branch fetch 미완료: " + str(error))
-    if fetched.returncode:
-        return retry("원격 checkpoint branch fetch 실패: " + fetched.stdout[-2000:])
-    fetched_result = git(
-        repo_path, "rev-parse", "FETCH_HEAD^{commit}", check=False,
-    )
-    if fetched_result.returncode:
-        return retry("fetch된 원격 checkpoint OID를 확인할 수 없습니다.")
-    fetched_oid = fetched_result.stdout.strip()
-    if fetched_oid != observed:
-        return retry("원격 checkpoint branch가 조회와 fetch 사이에 변경됐습니다.")
-    local_history = git(
-        repo_path, "merge-base", "--is-ancestor", accepted, snapshot.head,
-        check=False,
-    )
-    if local_history.returncode not in {0, 1}:
-        return retry("로컬 checkpoint ancestry를 확인할 수 없습니다.")
-    if local_history.returncode == 1:
-        return refuse("로컬 branch HEAD가 마지막 확인 원격 head의 후속이 아닙니다.")
-    for ancestor, label in ((accepted, "마지막 확인 head"),
-                            (str(row["published_oid"]), "게시 checkpoint"),
-                            (snapshot.head, "로컬 HEAD")):
-        relation = git(
-            repo_path, "merge-base", "--is-ancestor", ancestor, observed,
-            check=False,
-        )
-        if relation.returncode not in {0, 1}:
-            return retry(f"원격 branch의 {label} ancestry를 확인할 수 없습니다.")
-        if relation.returncode == 1:
-            return refuse(f"원격 branch가 {label}의 후속이 아닙니다 (삭제/재작성/분기 또는 검증 실패).")
-    try:
-        changed_paths = _nul_git_paths(
-            repo_path, "diff", "--no-renames", "--name-only", "-z",
-            accepted, observed, "--",
-        )
-    except RuntimeError as error:
-        return retry(f"원격 checkpoint 변경 경로를 확인할 수 없습니다: {error}")
-    try:
-        sources = tuple(str(source) for source in json.loads(str(blocked["sources"])))
-    except (TypeError, ValueError):
-        return refuse("ExecPlan source 목록을 검증할 수 없습니다.")
-    archives = tuple(source for source in sources if source.startswith("docs/requirements/")
-                     and "/archive/" not in source)
-    guidance = adapter._approved_guidance_targets(request)
-    common_plans = _published_plan_allows_common_plans(repo_path, blocked)
-    for path in changed_paths:
-        if not _worker_path_allowed(path, str(blocked["path"]), archives,
-                                    guidance, common_plans):
-            return refuse(f"원격 checkpoint 변경 범위 위반: {path}")
-        entry = git(repo_path, "ls-tree", observed, "--", path).stdout
-        if entry and not entry.startswith("100644 ") and not entry.startswith("100755 "):
-            return refuse(f"원격 checkpoint에 symlink 또는 특수 파일이 있습니다: {path}")
-    for local_path in ignored_paths:
-        if any(
-            local_path == remote_path
-            or local_path.startswith(remote_path + "/")
-            or remote_path.startswith(local_path + "/")
-            for remote_path in changed_paths
-        ):
-            return refuse(f"ignored 로컬 경로와 원격 변경이 겹칩니다: {local_path}")
-    metadata_error = _blocked_execplan_revision_metadata_error(
-        repo_path, observed, blocked,
-    )
-    if metadata_error:
-        return refuse(metadata_error)
-    if project_recovery_context is not None:
-        scope_base = blocked['active_sha'] or blocked['plan_sha']
-        if not scope_base:
-            return refuse('현재 계획의 기존 실행 base를 확정할 수 없어 원격 checkpoint 채택을 중단합니다.')
-        try:
-            # Inspect the complete artifact against its existing execution
-            # base, which retains archive sources. The latest base may not be
-            # fetched yet; incorporation subsequently fetches and checks it.
-            project_blocked_recovery.independent_scope(
-                sys.modules[__name__], connection, repo_path, state_dir, repo, blocked,
-                target=scope_base, remote_oid=observed,
-            )
-        except (OSError, RuntimeError, ValueError) as error:
-            return refuse(str(error))
-    if adopt_only:
-        checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
-        current = checkpoints.get(repo, str(blocked['plan_id']))
-        pending_scope = (current.snapshot or {}).get('remote_adoption_intent')
-        if pending_scope is None:
-            pending_scope = {
-                'head': observed, 'branch': branch, 'worktree': str(worktree),
-                'request_identity': request.request_identity,
-                'agent_snapshot': blocked['agent_snapshot'],
-                'agent_result_snapshot': blocked['agent_result_snapshot'],
-                'snapshot': snapshot.serialize(),
-            }
-            with runtime_state._transaction(connection):
-                checkpoints.record(
-                    repo, str(blocked['plan_id']), expected_generation=current.generation,
-                    operation=current.operation, expected_head=current.expected_head,
-                    target_base_oid=current.target_base_oid,
-                    observed_remote_oid=current.observed_remote_oid,
-                    snapshot={**(current.snapshot or {}), 'remote_adoption_intent': pending_scope})
-        elif (pending_scope['head'], pending_scope['branch'], pending_scope['worktree'],
-              pending_scope['request_identity']) != (observed, branch, str(worktree), request.request_identity):
-            return refuse('저장된 원격 채택 intent와 현재 요청이 다릅니다.')
-    repository.start_remote_adoption(request, observed)
-    if snapshot.head != observed:
-        advanced = git(
-            worktree, "-c", "core.hooksPath=/dev/null",
-            "merge", "--ff-only", "--no-edit", observed, check=False,
-        )
-        if advanced.returncode:
-            return retry("로컬 checkpoint fast-forward 실패: " + advanced.stdout[-2000:])
-    if git(worktree, "rev-parse", "HEAD^{commit}").stdout.strip() != observed:
-        return refuse("fast-forward 뒤 관리 worktree HEAD가 원격 후보와 다릅니다.")
-    adopted_snapshot = capture_git_snapshot(worktree)
-    input_identity = _remote_checkpoint_input_identity(
-        blocked, adopted_snapshot, ignored_paths,
-    )
-    if adopt_only:
-        scope_snapshot = managed_rebase_adoption.selected_baseline(
-            GitSnapshot.deserialize(pending_scope['snapshot']), adopted_snapshot,
-            branch, str(_canonical_path(worktree)))
-        remote_ref = f'refs/remotes/origin/{branch}'
-        if adopted_snapshot.refs.get(remote_ref) == (observed, ''):
-            scope_snapshot = replace(scope_snapshot, refs={
-                **scope_snapshot.refs, remote_ref: (observed, '')})
-        with runtime_state._transaction(connection):
-            repository.record_remote_inspection(
-                request, observed, input_identity,
-                "원격 후속 commit 채택 완료; base 반영 뒤 원래 차단 원인을 검사합니다.",
-                commit=False,
-            )
-            connection.execute(
-                "UPDATE exec_plans SET publication_remote_oid = ? WHERE repo = ? AND plan_id = ?",
-                (observed, repo, blocked['plan_id']),
-            )
-            checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
-            current = checkpoints.get(repo, str(blocked['plan_id']))
-            if current.operation is not None:
-                raise RuntimeError("원격 후속 commit 채택 중 다른 Git intent가 생겼습니다.")
-            checkpoints.record(
-                repo, str(blocked['plan_id']), expected_generation=current.generation,
-                operation=None, expected_head=observed,
-                target_base_oid=current.target_base_oid, observed_remote_oid=observed,
-                snapshot={**(current.snapshot or {}), 'last_adopted_remote_oid': observed,
-                          'remote_adoption_intent': None,
-                          'remote_adoption_scope': {
-                              'head': observed, 'branch': branch, 'worktree': str(worktree),
-                              'agent_snapshot': blocked['agent_snapshot'],
-                              'agent_result_snapshot': blocked['agent_result_snapshot'],
-                              'snapshot': scope_snapshot.serialize(),
-                          }},
-            )
-        return "adopted"
-    failure_evidence = "\n".join(
-        str(value) for value in (
-            request.evidence,
-            blocked["verify_result"]
-            if blocked["blocked_reason"] == BlockReasonCode.VERIFY_RETRY_EXHAUSTED.value
-            else blocked["review_result"],
-        ) if value
-    )
-    corrected_paths = execution_revision.remote_failure_correction_paths(
-        str(blocked["blocked_reason"]), changed_paths, failure_evidence,
-    )
-    if corrected_paths:
-        try:
-            resolved, assessment, new_failure_stage = _evaluate_remote_checkpoint_cause(
-                connection, repo_path, state_dir, repo, blocked, config_path,
-                verify_timeout_seconds,
-            )
-        except VerifyTerminationUncertain as error:
-            with connection:
-                scoped_blocking.record_project_block(
-                    connection, repo, BlockReasonCode.REPOSITORY_STATE_UNSAFE,
-                    str(error), request.request_identity,
-                    plan_id=request.plan_id, previous_phase=None,
-                )
-                notifications.enqueue_current_project_events(connection, repo)
-            return "project-blocked"
-        except (OSError, RuntimeError, ValueError) as error:
-            return retry(f"원격 checkpoint 원인 재평가 미완료: {error}")
-        if new_failure_stage == "specification":
-            try:
-                _reclassify_remote_specification_deadlock(
-                    connection, repo_path, repo, blocked, repository, request,
-                    observed, worktree, assessment,
-                )
-            except (OSError, RuntimeError, ValueError) as error:
-                return retry(f"원격 checkpoint 명세 교착 기록 미완료: {error}")
-            return "blocked"
-        if new_failure_stage == "protocol_exhausted":
-            try:
-                _reclassify_remote_checkpoint_block(
-                    connection, repo_path, repo, blocked, repository, request,
-                    observed, worktree,
-                    reason=BlockReasonCode.REVIEW_PROTOCOL_EXHAUSTED,
-                    evidence=assessment, review_fingerprint_source=None,
-                    user_targets=(
-                        str(blocked["path"]),
-                        *(str(source) for source in json.loads(str(blocked["sources"]))),
-                    ),
-                )
-            except (OSError, RuntimeError, ValueError) as error:
-                return retry(f"원격 checkpoint Reviewer 프로토콜 차단 기록 미완료: {error}")
-            return "blocked"
-        if new_failure_stage == "revision_drift":
-            return retry(assessment)
-        if not resolved:
-            detail = "원격 checkpoint 원인 유지:\n" + assessment
-            with connection:
-                connection.execute(
-                    "UPDATE execplan_blocks SET evidence = ?, updated_at = CURRENT_TIMESTAMP "
-                    "WHERE repo = ? AND plan_id = ?",
-                    (detail, repo, request.plan_id),
-                )
-                connection.execute(
-                    "UPDATE exec_plans SET last_error = ? WHERE repo = ? AND plan_id = ?",
-                    (detail, repo, request.plan_id),
-                )
-                repository.record_remote_inspection(
-                    request, observed, input_identity, detail, commit=False,
-                )
-                notifications.enqueue_current_project_events(connection, repo)
-            return "blocked"
-        _resume_remote_corrected_execplan(
-            connection, repo, blocked, repository, request, observed,
-            input_identity, "원격 checkpoint 진행 확인 후 Worker부터 재검증: " + assessment,
-            new_failure_stage=new_failure_stage, assessment=assessment,
-        )
-        return "resumed"
-    if blocked["blocked_reason"] == BlockReasonCode.PLAN_INPUT_INVALID.value and (
-        blocked["blocked_fingerprint"]
-        and _revision_execplan_input_fingerprint(repo_path, observed, blocked)
-        != str(blocked["blocked_fingerprint"])
-    ):
-        _resume_remote_corrected_execplan(
-            connection, repo, blocked, repository, request, observed,
-            input_identity, "변경된 ExecPlan 입력을 Worker부터 재검증",
-        )
-        return "resumed"
-    reason = str(blocked["last_error"] or "저장된 차단 원인의 해제 조건이 아직 충족되지 않았습니다.")
-    repository.record_remote_inspection(request, observed, input_identity, reason)
-    return "adopted"
 
 
 def _resume_legacy_review_count_block(
     connection: sqlite3.Connection, repo_path: Path, state_dir: Path,
     repo: str, plan: sqlite3.Row,
 ) -> bool:
-    """Release only a Review occurrence block with proven workspace ownership."""
-
-    plan_id = str(plan["plan_id"])
-    block = scoped_blocking.plan_block(connection, repo, plan_id)
-    if (
-        block is None
-        or block["reason_code"] != BlockReasonCode.REVIEW_RETRY_EXHAUSTED.value
-        or scoped_blocking.project_block(connection, repo) is not None
-        or plan["status"] != "PLAN_BLOCKED"
-        or plan["blocked_reason"] != BlockReasonCode.REVIEW_RETRY_EXHAUSTED.value
-        or plan["pr_url"] or plan["pr_head_oid"]
-        or plan["agent_recovery"] or int(plan["pr_conflict_recovery"] or 0)
-        or not str(plan["review_result"] or "").strip().endswith("VERDICT: FAIL")
-        or not plan["agent_result_snapshot"]
-        or int(plan["workspace_owned"] or 0) != WORKSPACE_OWNED
-    ):
-        return False
-    record = recovery_state.RecoveryRepository(connection).row(repo, plan_id)
-    if record is not None and record["final_evidence"]:
-        try:
-            evidence = json.loads(str(record["final_evidence"]))
-        except (TypeError, ValueError):
-            return False
-        if evidence.get("block_reason_code") != BlockReasonCode.REVIEW_RETRY_EXHAUSTED.value:
-            return False
-    worktree = Path(str(plan["worktree"] or ""))
-    branch = str(plan["branch"] or "")
-    if not branch or not worktree.is_dir():
-        return False
-    checkpoint = connection.execute(
-        "SELECT phase, reason_code, published_oid, local_oid, "
-        "tree_oid, commit_identity FROM blocked_checkpoints "
-        "WHERE repo = ? AND plan_id = ?", (repo, plan_id),
-    ).fetchone()
-    if checkpoint is not None and checkpoint["reason_code"] != BlockReasonCode.REVIEW_RETRY_EXHAUSTED.value:
-        return False
-    if checkpoint is not None and checkpoint["phase"] not in {"published", "unpublished"}:
-        return False
-    published_resume = None
-    try:
-        validate_execplan_workspace_identity(state_dir, repo, plan_id, branch, worktree)
-        validate_managed_worktree(repo_path, worktree, branch)
-        if _rebase_in_progress_for_branch(worktree, branch):
-            return False
-        snapshot = capture_git_snapshot(worktree)
-        if snapshot.branch != branch or snapshot.operations or not snapshot.head:
-            return False
-        blocked_snapshot = GitSnapshot.deserialize(str(plan["agent_result_snapshot"]))
-        if (not snapshot.shared_metadata_complete
-                or not blocked_snapshot.shared_metadata_complete):
-            return False
-        if checkpoint is None or (
-            checkpoint["phase"] == "unpublished" and not checkpoint["local_oid"]
-        ):
-            if (
-                snapshot.head != blocked_snapshot.head
-                or snapshot.branch != blocked_snapshot.branch
-                or snapshot.index != blocked_snapshot.index
-                or snapshot.dirty != blocked_snapshot.dirty
-            ):
-                return False
-        elif checkpoint["phase"] == "unpublished":
-            local_oid = str(checkpoint["local_oid"])
-            commit_identity = str(checkpoint["commit_identity"] or "")
-            tree_oid = str(checkpoint["tree_oid"] or "")
-            if (
-                snapshot.head != local_oid or not commit_identity or not tree_oid
-                or git(repo_path, "rev-parse", f"{local_oid}^{{tree}}").stdout.strip() != tree_oid
-                or f"Checkpoint-Identity: {commit_identity}" not in git(
-                    repo_path, "show", "-s", "--format=%B", local_oid,
-                ).stdout
-            ):
-                return False
-        validate_blocked_agent_scope(
-            connection, repo_path, repo,
-            str(connection.execute(
-                "SELECT base_branch FROM projects WHERE repo = ?", (repo,),
-            ).fetchone()[0]),
-            worktree, str(plan["path"]),
-        )
-        remote_oid = remote_branch_oid(repo_path, branch)
-        observed_remote = git(
-            repo_path, "ls-remote", "--heads", "origin",
-            f"refs/heads/{branch}", check=False,
-        )
-        remote_lines = [
-            line.split() for line in observed_remote.stdout.splitlines() if line.strip()
-        ]
-        expected_lines = ([[remote_oid, f"refs/heads/{branch}"]]
-                          if remote_oid is not None else [])
-        if observed_remote.returncode or remote_lines != expected_lines:
-            return False
-        if pr_for_branch(repo_path, branch) is not None:
-            return False
-        if checkpoint is not None and checkpoint["phase"] == "published":
-            published = str(checkpoint["published_oid"] or "")
-            request_row = connection.execute(
-                "SELECT request_identity, reason_code, branch, worktree, "
-                "accepted_remote_oid FROM blocked_checkpoints "
-                "WHERE repo = ? AND plan_id = ?", (repo, plan_id),
-            ).fetchone()
-            if (not published or remote_oid != published
-                    or snapshot.head != published or snapshot.dirty
-                    or any(_non_default_index_flags(entries)
-                           for entries in snapshot.index.values())
-                    or request_row is None
-                    or request_row["reason_code"] != block["reason_code"]
-                    or request_row["branch"] != branch
-                    or request_row["worktree"] != str(worktree)
-                    or request_row["accepted_remote_oid"] != published
-                    or request_row["request_identity"] !=
-                    blocked_checkpoint_state.request_identity(
-                        repo, plan_id, str(block["reason_code"]),
-                        str(block["evidence"]), branch, str(worktree),
-                        str(block["release_fingerprint"] or "") or None,
-                    )
-                    or checkpoint_ownership.owned_remote_oid(
-                        connection, repo_path, repo, plan_id, branch,
-                        worktree, remote_oid, git, before_head=snapshot.head,
-                        recorded_oid=str(plan["publication_remote_oid"] or "") or None,
-                    ) != remote_oid):
-                return False
-            published_resume = {
-                "request_identity": str(request_row["request_identity"]),
-                "owner_oid": published,
-                "head": snapshot.head,
-            }
-        elif remote_oid is not None and remote_oid != plan["publication_remote_oid"]:
-            return False
-        if remote_oid is not None and git(
-            repo_path, "merge-base", "--is-ancestor", remote_oid,
-            snapshot.head, check=False,
-        ).returncode != 0:
-            return False
-    except (AgentScopeError, OSError, RuntimeError, WorkspaceOwnershipError,
-            KeyError, TypeError, ValueError):
-        return False
-    with runtime_state._transaction(connection):
-        if published_resume is not None:
-            execution = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
-            current = execution.get(repo, plan_id)
-            execution.record(
-                repo, plan_id, expected_generation=current.generation,
-                operation=None, expected_head=snapshot.head,
-                target_base_oid=current.target_base_oid,
-                observed_remote_oid=remote_oid,
-                snapshot={**(current.snapshot or {}),
-                          "published_review_resume": published_resume},
-            )
-        runtime_state.RuntimeStateRepository(connection).transition(
-            repo, plan_id,
-            plan_values={
-                "status": "IMPLEMENTING", "blocked_reason": None,
-                "blocked_fingerprint": None,
-                "blocked_worktree_fingerprint": None,
-                "blocked_review_fingerprint": None,
-                "validated_base_sha": None,
-                **({"publication_remote_oid": remote_oid}
-                   if published_resume is not None else {}),
-                "last_error": f"Review 실패:\n{str(plan['review_result'] or '')[-8000:]}",
-            },
-            project_values={
-                "phase": "WORKING", "validated_base_sha": None,
-                **({"publication_remote_oid": remote_oid}
-                   if published_resume is not None else {}),
-                "last_error": f"Review 실패:\n{str(plan['review_result'] or '')[-8000:]}",
-            },
-            enqueue=False,
-        )
-        scoped_blocking.clear_plan_block(connection, repo, plan_id)
-    return True
+    return scope_reconciliation._resume_legacy_review_count_block(
+        _scope_reconciliation_effects_resume_legacy_review_count_block(),
+        connection, repo_path, state_dir, repo, plan,
+    )
 
 
 def resume_plan_blocks(
@@ -14019,205 +12695,7 @@ def resume_plan_blocks(
     config_path: Path | None = None,
     verify_timeout_seconds: int | None = None,
 ) -> bool:
-    """Reevaluate each plan block without letting one overwrite another."""
-
-    if scoped_blocking.project_block(connection, repo) is not None:
-        return False
-    if not runtime_state.RuntimeStateRepository(
-        connection
-    ).recovery_slot_available(repo):
-        return False
-    if runtime_state.RuntimeStateRepository(connection).active_row(repo) is not None:
-        return False
-    for blocked in plan_blocked_execplans(connection, repo):
-        current_block = scoped_blocking.plan_block(
-            connection, repo, str(blocked["plan_id"]),
-        )
-        if scoped_blocking.is_scope_baseline_block(current_block):
-            prior_projection = project_execplan(connection, repo)
-            if resume_blocked_execplan_if_inputs_changed(
-                    connection, repo_path, repo, base, state_dir, plan_id=str(blocked['plan_id'])):
-                return True
-            if scoped_blocking.project_block(connection, repo) is not None:
-                return False
-            projected = project_execplan(connection, repo)
-            if (projected is not None and projected['plan_id'] == blocked['plan_id']
-                    and active_execplan(connection, repo) is None):
-                if prior_projection is None:
-                    with connection:
-                        _clear_active_in_current_transaction(connection, repo)
-                elif prior_projection['plan_id'] != projected['plan_id']:
-                    prior_plan = connection.execute(
-                        'SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
-                        (repo, prior_projection['plan_id'])).fetchone()
-                    hydrate_execplan_project(connection, repo, prior_plan)
-            continue
-        if rebase_block_reconciliation.could_be_rebase_evidence_block(current_block):
-            if _reconcile_rebase_evidence_block(
-                connection, repo_path, state_dir, repo, current_block,
-                plan_block=True,
-            ):
-                return True
-            continue
-        observed = connection.execute(
-            'SELECT registered_origin FROM blocked_remote_observations WHERE repo = ? AND plan_id = ?',
-            (repo, blocked['plan_id'])).fetchone()
-        if (observed is not None and observed['registered_origin']
-                and blocked['blocked_reason'] == BlockReasonCode.REVIEW_RETRY_EXHAUSTED.value
-                and not unmet_execplan_dependencies(connection, repo, str(blocked['plan_id']))
-                and blocked_plan_reconciliation.slot_available(connection, repo, str(blocked['plan_id']))):
-            hydrate_execplan_project(connection, repo, blocked)
-            if _resume_legacy_review_count_block(connection, repo_path, state_dir, repo, blocked):
-                return True
-            with connection:
-                _clear_active_in_current_transaction(connection, repo)
-        remote_result = blocked_plan_reconciliation.BlockedPlanReconciler(
-            sys.modules[__name__], connection, repo_path, state_dir, repo, base,
-            config_path, verify_timeout_seconds,
-        ).reconcile(str(blocked['plan_id']))
-        if scoped_blocking.project_block(connection, repo) is not None:
-            return False
-        if remote_result == 'resumed':
-            return True
-        if remote_result in {'blocked', 'deferred'}:
-            refresh = connection.execute(
-                'SELECT stage FROM blocked_plan_reconciliations WHERE repo = ? AND plan_id = ?',
-                (repo, blocked['plan_id']),
-            ).fetchone()
-            if (remote_result == 'blocked' and refresh is not None
-                    and refresh['stage'] == 'complete'
-                    and blocked['blocked_reason'] == GUIDANCE_BLOCK_REASON):
-                refreshed = connection.execute(
-                    'SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
-                    (repo, blocked['plan_id']),
-                ).fetchone()
-                hydrate_execplan_project(connection, repo, refreshed)
-                if resume_guidance_approval_if_decided(
-                        connection, repo_path, repo, base, state_dir,
-                        plan_id=str(blocked['plan_id'])):
-                    return True
-            projected = project_execplan(connection, repo)
-            if (projected is not None and projected['plan_id'] == blocked['plan_id']
-                    and active_execplan(connection, repo) is None):
-                with connection:
-                    _clear_active_in_current_transaction(connection, repo)
-            continue
-        if blocked["blocked_reason"] == PR_CLOSED_BLOCK_REASON:
-            continue
-        # A push may have succeeded before its adopted OID reached SQLite.
-        # Reconcile the saved release before comparing the old checkpoint ref
-        # with the live remote (which may already contain the rebased HEAD).
-        interrupted = _resume_interrupted_blocked_rebase(
-            connection, repo_path, repo, base, blocked,
-            Path(str(blocked["worktree"] or "")), str(blocked["branch"] or ""),
-        )
-        if interrupted is not None:
-            if interrupted:
-                return True
-            continue
-        checkpoint_row = connection.execute(
-            "SELECT * FROM blocked_checkpoints "
-            "WHERE repo = ? AND plan_id = ?",
-            (repo, blocked["plan_id"]),
-        ).fetchone()
-        if (
-            checkpoint_row is not None
-            and checkpoint_row["phase"] == "published"
-            and checkpoint_row["remote_oid"]
-        ):
-            checkpoint_repository = (
-                blocked_checkpoint_state.BlockedCheckpointRepository(connection)
-            )
-            checkpoint_request = checkpoint_repository.get(
-                repo, str(blocked["plan_id"])
-            )
-            remote_result = _reconcile_published_blocked_checkpoint(
-                connection, repo_path, state_dir, repo, blocked,
-                checkpoint_row, checkpoint_request, checkpoint_repository,
-                config_path, verify_timeout_seconds,
-            )
-            if remote_result == "project-blocked":
-                return False
-            if remote_result == "blocked":
-                continue
-            if remote_result == "resumed":
-                return True
-        else:
-            remote_result = None
-        if blocked["blocked_reason"] == BlockReasonCode.REVIEW_RETRY_EXHAUSTED.value:
-            # A changed published checkpoint needs the existing remote cause
-            # and ownership review. Only an unchanged (or absent) checkpoint
-            # can use the count-only legacy release path.
-            if remote_result in {None, "unchanged"}:
-                hydrate_execplan_project(connection, repo, blocked)
-                if _resume_legacy_review_count_block(
-                    connection, repo_path, state_dir, repo, blocked,
-                ):
-                    return True
-            with connection:
-                _clear_active_in_current_transaction(connection, repo)
-            continue
-        if blocked["blocked_reason"] == BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT.value:
-            old_timeout = int(blocked["blocked_fingerprint"])
-            new_timeout = (
-                verify_timeout_seconds
-                if verify_timeout_seconds is not None
-                else load_managed_config(config_path or ROOT / "config/config.ini").verify_timeout_seconds
-            )
-            if new_timeout <= old_timeout:
-                continue
-            hydrate_execplan_project(connection, repo, blocked)
-            worktree = Path(str(blocked["worktree"]))
-            try:
-                validate_execplan_workspace_identity(
-                    state_dir, repo, str(blocked["plan_id"]),
-                    str(blocked["branch"]), worktree,
-                )
-                validate_blocked_agent_scope(
-                    connection, repo_path, repo, base, worktree,
-                    str(blocked["path"]),
-                )
-            except (AgentScopeError, WorkspaceOwnershipError, RuntimeError) as error:
-                _update_blocked_error(connection, repo, str(blocked["plan_id"]), str(error))
-                with connection:
-                    _clear_active_in_current_transaction(connection, repo)
-                continue
-            with connection:
-                runtime_state.RuntimeStateRepository(connection).transition(
-                    repo, str(blocked["plan_id"]),
-                    plan_values={
-                        "status": "VERIFYING", "blocked_reason": None,
-                        "blocked_fingerprint": None,
-                        "blocked_worktree_fingerprint": None,
-                        "blocked_review_fingerprint": None,
-                        "verify_failure_history": "{}",
-                        "retry_count": 0,
-                        "last_error": None,
-                    },
-                    project_values={"phase": "VERIFYING", "last_error": None},
-                    enqueue=False,
-                )
-                scoped_blocking.clear_plan_block(connection, repo, str(blocked["plan_id"]))
-            return True
-        hydrate_execplan_project(connection, repo, blocked)
-        resume = (
-            resume_guidance_approval_if_decided
-            if blocked["blocked_reason"] == GUIDANCE_BLOCK_REASON
-            else resume_blocked_execplan_if_inputs_changed
-        )
-        resumed = resume(connection, repo_path, repo, base, state_dir,
-                         plan_id=str(blocked['plan_id']))
-        refreshed = connection.execute(
-            "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
-            (repo, blocked["plan_id"]),
-        ).fetchone()
-        if resumed and refreshed and refreshed["status"] in ACTIVE_EXECPLAN_STATUSES:
-            hydrate_execplan_project(connection, repo, refreshed)
-            return True
-        if active_execplan(connection, repo) is None:
-            with connection:
-                _clear_active_in_current_transaction(connection, repo)
-    return False
+    return scope_reconciliation.resume_plan_blocks(_scope_reconciliation_effects_resume_plan_blocks(), connection, repo_path, state_dir, repo, base, config_path, verify_timeout_seconds)
 
 
 def _block_closed_pull_request(
@@ -14339,416 +12817,7 @@ def reconcile_existing_pull_request(
     project: sqlite3.Row,
     pull_request: Mapping[str, object],
 ) -> int | None:
-    """Attach one existing head-branch PR and apply its durable state."""
-
-    branch = str(project["branch"] or "")
-    url = str(pull_request.get("url") or project["pr_url"] or "")
-    if not url:
-        raise RuntimeError("기존 PR URL을 확인할 수 없습니다.")
-    head_name = pull_request.get("headRefName")
-    if head_name and str(head_name) != branch:
-        raise PublicationSafetyError(
-            f"기존 PR head branch가 관리 branch와 다릅니다: {head_name}"
-        )
-    head_value = pull_request.get("headRefOid")
-    head_oid = str(head_value) if head_value else project["pr_head_oid"]
-    state = str(pull_request.get("state") or "OPEN").upper()
-    blocked_plan = project_execplan(connection, repo)
-    if blocked_plan is not None and blocked_plan["status"] != "PLAN_BLOCKED":
-        blocked_plan = None
-    reopening_closed_pr = bool(
-        state == "OPEN"
-        and blocked_plan is not None
-        and blocked_plan["blocked_reason"] == PR_CLOSED_BLOCK_REASON
-    )
-    recovering_preflight_block = bool(
-        state == "OPEN"
-        and project["phase"] == "PLAN_BLOCKED"
-        and _is_pr_conflict_preflight_block(project, blocked_plan)
-    )
-    if (
-        state in {"OPEN", "CLOSED"}
-        and project["phase"] == "PLAN_BLOCKED"
-        and blocked_plan is not None
-        and blocked_plan["blocked_reason"] != PR_CLOSED_BLOCK_REASON
-        and not recovering_preflight_block
-    ):
-        operation_print(
-            "PR 충돌 복구 차단 상태를 유지합니다: "
-            + str(project["last_error"] or "사용자 조치가 필요합니다."),
-            file=sys.stderr,
-        )
-        return 1
-    if state != "OPEN" or (
-        project["phase"] not in {"PR_OPEN", "PLAN_BLOCKED"}
-        and not int(project["pr_conflict_recovery"])
-    ):
-        update_project(
-            connection,
-            repo,
-            pr_url=url,
-            pr_head_oid=head_oid,
-        )
-
-    if state == "OPEN":
-        if recovering_preflight_block:
-            assert blocked_plan is not None
-            try:
-                mergeability = classify_pull_request_mergeability(pull_request)
-                if mergeability == "conflicting":
-                    _validate_pr_conflict_recovery_identity(
-                        connection, repo, project, pull_request,
-                        expected_status="PLAN_BLOCKED",
-                    )
-                    _fetch_pr_conflict_recovery_refs(
-                        repo_path, state_dir, str(project["base_branch"]), branch
-                    )
-                    (_plan, _worktree, _branch, observed_head, base_oid) = (
-                        _validate_pr_conflict_recovery_ownership(
-                            connection, repo_path, state_dir, repo, project,
-                            pull_request, expected_status="PLAN_BLOCKED",
-                        )
-                    )
-                else:
-                    _validate_blocked_pr_without_conflict(
-                        connection, repo_path, state_dir, repo, project,
-                        pull_request,
-                    )
-            except (
-                PublicationSafetyError,
-                WorkspaceOwnershipError,
-            ) as error:
-                recovery_error = (
-                    f"{PR_CONFLICT_PREFLIGHT_ERROR_PREFIX} {error}"
-                )
-                _update_blocked_error(
-                    connection,
-                    repo,
-                    str(blocked_plan["plan_id"]),
-                    recovery_error,
-                )
-                operation_print(recovery_error, file=sys.stderr)
-                return 1
-            _resume_reopened_pull_request(
-                connection,
-                repo,
-                blocked_plan,
-                url,
-                head_oid,
-                recovery=mergeability == "conflicting",
-                conflict_oids=(observed_head, base_oid)
-                if mergeability == "conflicting" else None,
-            )
-            if mergeability == "conflicting":
-                operation_print(f"PR 충돌 자동 복구 재개: {url}")
-                return None
-            operation_print(f"PR_OPEN 충돌 복구 false positive 자동 해제: {url}")
-            return 0
-
-        if int(project["pr_conflict_recovery"]):
-            try:
-                if recover_confirmed_pr_conflict_push(
-                    connection,
-                    repo_path,
-                    state_dir,
-                    repo,
-                    project,
-                    pull_request,
-                ):
-                    operation_print(
-                        f"기존 PR 충돌 복구 push 확인 완료: {url}"
-                    )
-                    return 0
-                if reopening_closed_pr:
-                    _validate_pr_conflict_recovery_ownership(
-                        connection,
-                        repo_path,
-                        state_dir,
-                        repo,
-                        project,
-                        pull_request,
-                        expected_status="PLAN_BLOCKED",
-                    )
-                else:
-                    _validate_active_pr_conflict_recovery(
-                        connection,
-                        repo_path,
-                        state_dir,
-                        repo,
-                        project,
-                        pull_request,
-                    )
-            except (
-                PublicationSafetyError,
-                WorkspaceOwnershipError,
-            ) as error:
-                recovery_error = f"PR 충돌 복구 안전 검증 실패: {error}"
-                block_active_execplan_from_revision(
-                    connection,
-                    repo_path,
-                    repo,
-                    f"refs/remotes/origin/{project['base_branch']}",
-                    recovery_error,
-                    str(project["verify_result"] or ""),
-                    reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
-                )
-                operation_print(recovery_error, file=sys.stderr)
-                return 1
-            if project["phase"] in {"PR_OPEN", "PLAN_BLOCKED"}:
-                if reopening_closed_pr:
-                    assert blocked_plan is not None
-                    _resume_reopened_pull_request(
-                        connection,
-                        repo,
-                        blocked_plan,
-                        url,
-                        head_oid,
-                        recovery=True,
-                    )
-                else:
-                    update_project(
-                        connection,
-                        repo,
-                        phase="WORKING",
-                        validated_base_sha=None,
-                        verify_result=None,
-                        review_result=None,
-                        last_error=REBASE_IN_PROGRESS_ERROR,
-                    )
-            return None
-
-        if project["phase"] == "PR_OPEN":
-            try:
-                _validate_pr_conflict_recovery_identity(
-                    connection,
-                    repo,
-                    project,
-                    pull_request,
-                    expected_status="PR_OPEN",
-                )
-            except PublicationSafetyError as error:
-                recovery_error = (
-                    f"{PR_CONFLICT_PREFLIGHT_ERROR_PREFIX} {error}"
-                )
-                block_active_execplan_from_revision(
-                    connection,
-                    repo_path,
-                    repo,
-                    f"refs/remotes/origin/{project['base_branch']}",
-                    recovery_error,
-                    str(project["verify_result"] or ""),
-                    reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
-                    blocked_reason=PR_CONFLICT_PREFLIGHT_BLOCK_REASON,
-                )
-                operation_print(recovery_error, file=sys.stderr)
-                return 1
-            mergeability = classify_pull_request_mergeability(pull_request)
-            if mergeability != "conflicting":
-                if mergeability == "unknown":
-                    operation_print(
-                        f"PR mergeability 계산 대기 중: {url}"
-                    )
-                else:
-                    operation_print(f"Merge 대기 중: {url}")
-                return 0
-            try:
-                _fetch_pr_conflict_recovery_refs(
-                    repo_path, state_dir, str(project["base_branch"]), branch
-                )
-                (
-                    _plan,
-                    _worktree,
-                    _branch,
-                    observed_head,
-                    base_oid,
-                ) = _validate_pr_conflict_recovery_ownership(
-                    connection,
-                    repo_path,
-                    state_dir,
-                    repo,
-                    project,
-                    pull_request,
-                )
-            except (
-                PublicationSafetyError,
-                WorkspaceOwnershipError,
-            ) as error:
-                recovery_error = f"PR_OPEN 충돌 복구 소유권 검증 실패: {error}"
-                reason = (
-                    BlockReasonCode.MANAGED_WORKTREE_CONFLICT
-                    if isinstance(error, ManagedWorktreeConflictError)
-                    else BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN
-                )
-                block_active_execplan_from_revision(
-                    connection,
-                    repo_path,
-                    repo,
-                    f"refs/remotes/origin/{project['base_branch']}",
-                    recovery_error,
-                    str(project["verify_result"] or ""),
-                    reason=reason,
-                    blocked_reason=PR_CONFLICT_PREFLIGHT_BLOCK_REASON,
-                )
-                operation_print(recovery_error, file=sys.stderr)
-                return 1
-
-            update_project(
-                connection,
-                repo,
-                phase="WORKING",
-                validated_base_sha=None,
-                pr_conflict_recovery=1,
-                pr_conflict_head_oid=observed_head,
-                pr_conflict_base_oid=base_oid,
-                verify_result=None,
-                review_result=None,
-                last_error=REBASE_IN_PROGRESS_ERROR,
-            )
-            operation_print(f"PR 충돌 자동 복구 시작: {url}")
-            return None
-        plan_id = _plan_id_from_path(str(project["plan_path"] or ""))
-        worktree = Path(str(project["worktree"] or ""))
-        try:
-            if plan_id is None:
-                raise WorkspaceOwnershipError(
-                    "PR_OPEN ExecPlan ID를 확인할 수 없습니다."
-                )
-            plan = project_execplan(connection, repo)
-            if (
-                plan is None
-                or plan["plan_id"] != plan_id
-                or int(plan["workspace_owned"]) != WORKSPACE_OWNED
-            ):
-                raise WorkspaceOwnershipError(
-                    "PR_OPEN workspace의 Loop Manager 소유권이 확인되지 않았습니다."
-                )
-            validate_execplan_workspace_identity(
-                state_dir,
-                repo,
-                plan_id,
-                branch,
-                worktree,
-            )
-            make_worktree(
-                repo_path,
-                worktree,
-                branch,
-                str(project["base_branch"]),
-                journal_state_dir=state_dir,
-                journal_owner=f"plan:{plan_id}",
-                allow_create_branch=False,
-                allow_recovery=True,
-                allow_existing=True,
-            )
-        except WorkspaceOwnershipError as error:
-            workspace_error = (
-                f"PR_OPEN workspace 소유권/복구 검증 실패: {error}"
-            )
-            block_active_execplan_from_revision(
-                connection,
-                repo_path,
-                repo,
-                f"refs/remotes/origin/{project['base_branch']}",
-                workspace_error,
-                reason=BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN,
-            )
-            operation_print(workspace_error, file=sys.stderr)
-            return 1
-        except RuntimeError as error:
-            detail = f"PR_OPEN workspace 복구 재시도: {error}"
-            _record_project_recovery(
-                connection, repo, recovery_runtime.RecoveryReason.WORKTREE_RECOVERY_FAILED,
-                detail,
-            )
-            operation_print(detail, file=sys.stderr)
-            return PROJECT_STEP_RETRY
-        if reopening_closed_pr:
-            assert blocked_plan is not None
-            _resume_reopened_pull_request(
-                connection,
-                repo,
-                blocked_plan,
-                url,
-                head_oid,
-                recovery=False,
-            )
-        else:
-            runtime_state.RuntimeStateRepository(connection).open_pull_request(
-                repo,
-                pr_url=url,
-                pr_head_oid=head_oid,
-            )
-        operation_print(f"Merge 대기 중: {url}")
-        return 0
-
-    if state == "MERGED" or pull_request.get("mergedAt"):
-        remote_base(
-            repo_path, str(project["base_branch"]), state_dir=state_dir,
-        )
-        persisted = connection.execute(
-            "SELECT pr_head_oid FROM projects WHERE repo = ?",
-            (repo,),
-        ).fetchone()
-        stored_head_oid = (
-            str(persisted["pr_head_oid"])
-            if persisted and persisted["pr_head_oid"]
-            else None
-        )
-        plan = project_execplan(connection, repo)
-        if plan is None:
-            raise RuntimeError("병합된 PR과 연결된 ExecPlan을 찾을 수 없습니다.")
-        worktree = Path(str(plan["worktree"] or ""))
-        try:
-            assessment = complete_merged_execplan_worktree(
-                connection,
-                repo_path,
-                repo,
-                state_dir,
-                plan,
-                url,
-                stored_head_oid,
-            )
-        except WorkspaceOwnershipError as error:
-            workspace_error = (
-                f"Merge cleanup workspace 소유권 검증 실패: {error}"
-            )
-            block_active_execplan_from_revision(
-                connection,
-                repo_path,
-                repo,
-                f"refs/remotes/origin/{project['base_branch']}",
-                workspace_error,
-                reason=BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN,
-            )
-            operation_print(workspace_error, file=sys.stderr)
-            return 1
-        except RuntimeError as error:
-            detail = f"Merge cleanup workspace 조회 재시도: {error}"
-            _record_project_recovery(
-                connection, repo, recovery_runtime.RecoveryReason.WORKTREE_RECOVERY_FAILED,
-                detail,
-            )
-            operation_print(detail, file=sys.stderr)
-            return PROJECT_STEP_RETRY
-        if assessment.status in {"safe", "missing"}:
-            operation_print(f"Merge 확인 및 worktree 정리 완료: {url}")
-        else:
-            operation_print(
-                f"Merge 확인 완료; worktree 보존: {worktree} "
-                f"({assessment.reason or assessment.status})",
-                file=sys.stderr,
-            )
-        return PROJECT_STEP_PLANNING_PENDING
-
-    if state == "CLOSED":
-        plan = project_execplan(connection, repo)
-        if plan is None:
-            raise RuntimeError("닫힌 PR과 연결된 활성 ExecPlan을 찾을 수 없습니다.")
-        _block_closed_pull_request(connection, repo, plan, url, head_oid)
-        operation_print(f"닫힌 PR을 다시 열어야 합니다: {url}", file=sys.stderr)
-        return 1
-
-    raise RuntimeError(f"지원하지 않는 GitHub PR 상태입니다: {state}")
+    return pull_request_recovery.reconcile_existing_pull_request(_pull_request_recovery_effects_reconcile_existing_pull_request(), connection, repo_path, state_dir, repo, project, pull_request)
 
 
 def resume_pr_conflict_rebase(
@@ -14759,176 +12828,7 @@ def resume_pr_conflict_rebase(
     worktree: Path,
     branch: str,
 ) -> int | None:
-    """Resume the Manager-owned rebase only after its intent is durable."""
-
-    if (
-        not int(project["pr_conflict_recovery"])
-        or project["phase"] != "WORKING"
-        or project["last_error"] != REBASE_IN_PROGRESS_ERROR
-        or _rebase_in_progress_for_branch(worktree, branch)
-    ):
-        return None
-    if git(worktree, "ls-files", "-u", "-z").stdout:
-        update_project(
-            connection, repo, phase="WORKING", validated_base_sha=None,
-            last_error=REBASE_CONFLICT_PREFIX + "unmerged index after rebase/autostash",
-        )
-        return 0
-    plan = active_execplan(connection, repo)
-    target_base = str(project["pr_conflict_base_oid"] or "")
-    observed_head = str(project["pr_conflict_head_oid"] or "")
-    if (
-        plan is None
-        or not int(plan["pr_conflict_recovery"])
-        or not target_base
-        or not observed_head
-    ):
-        error = "PR 충돌 복구 rebase marker 또는 관측 OID가 유효하지 않습니다."
-        block_active_execplan(
-            connection,
-            repo,
-            worktree,
-            error,
-            str(project["verify_result"] or ""),
-            reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
-        )
-        operation_print(error, file=sys.stderr)
-        return 1
-
-    state_dir = _owned_rebase_state_dir(repo, str(plan['plan_id']), worktree)
-    rebase_retry_pending = False
-    checkpoint_record = execution_checkpoint_state.ExecutionCheckpointRepository(
-        connection,
-    ).get(repo, str(plan['plan_id']))
-    if state_dir is None and checkpoint_record.operation == 'rebase':
-        error = 'PR 충돌 복구 rebase journal workspace가 없습니다.'
-        block_active_execplan(
-            connection, repo, worktree, error,
-            str(project['verify_result'] or ''),
-            reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
-        )
-        operation_print(error, file=sys.stderr)
-        return 1
-    if state_dir is not None:
-        try:
-            _finish_owned_direct_rebase(
-                state_dir, connection, repo_path, repo,
-                str(plan['plan_id']), worktree, branch,
-                agent_session_id=plan['worker_session_id'],
-            )
-            if checkpoint_record.operation == 'rebase':
-                _, current_decision = _current_rebase_service(
-                    connection, repo_path, state_dir, repo,
-                    str(plan['plan_id']), worktree, branch).require_owned()
-                if current_decision.status.value == 'ready_to_start':
-                    rebase_retry_pending = True
-                elif current_decision.status.value == 'complete':
-                    _complete_direct_rebase_checkpoint(
-                        connection, repo, str(plan['plan_id']), worktree,
-                        target_base_oid=checkpoint_record.target_base_oid,
-                        repo_path=repo_path, branch=branch,
-                        agent_session_id=plan['worker_session_id'])
-                    return 0
-                else:
-                    return None
-        except manager_git_journal.MutationEvidenceError as error:
-            detail = f'PR 충돌 복구 rebase 증거가 다릅니다: {error}'
-            block_active_execplan(
-                connection, repo, worktree, detail,
-                str(project['verify_result'] or ''),
-                reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
-            )
-            operation_print(detail, file=sys.stderr)
-            return 1
-
-    latest_base = git(
-        repo_path,
-        "rev-parse",
-        f"refs/remotes/origin/{project['base_branch']}^{{commit}}",
-    ).stdout.strip()
-    if latest_base != target_base:
-        target_base = latest_base
-        update_project(
-            connection,
-            repo,
-            pr_conflict_base_oid=target_base,
-            validated_base_sha=None,
-            verify_result=None,
-            review_result=None,
-            last_error=REBASE_IN_PROGRESS_ERROR,
-        )
-
-    ancestry = git(
-        worktree,
-        "merge-base",
-        "--is-ancestor",
-        target_base,
-        "HEAD",
-        check=False,
-    )
-    if ancestry.returncode == 0 and not rebase_retry_pending:
-        update_project(
-            connection,
-            repo,
-            active_sha=target_base,
-            phase="WORKING",
-            worker_result=None, worker_input_token=None, archive_token=None,
-            verify_result=None, review_result=None, verify_token=None,
-            review_token=None, publication_token=None, validated_base_sha=None,
-            last_error=None,
-        )
-        return 0
-    if ancestry.returncode not in (0, 1):
-        error = (
-            "PR 충돌 복구 base ancestry 확인 실패:\n"
-            + ancestry.stdout[-8000:]
-        )
-        operation_print(error, file=sys.stderr)
-        return PROJECT_STEP_RETRY
-
-    rebased = _journaled_direct_rebase(
-        connection, repo_path, repo, str(plan['plan_id']), worktree,
-        branch, target_base, agent_session_id=plan['worker_session_id'],
-    )
-    if rebased.returncode and is_git_lock_failure(rebased.stdout):
-        raise GitLockError(rebased.stdout[-8000:])
-    if git(worktree, "ls-files", "-u", "-z").stdout:
-        update_project(
-            connection, repo, phase="WORKING", validated_base_sha=None,
-            last_error=REBASE_CONFLICT_PREFIX + rebased.stdout[-8000:],
-        )
-        return 0
-    if rebased.returncode == 0:
-        if state_dir is not None:
-            _complete_direct_rebase_checkpoint(
-                connection, repo, str(plan['plan_id']), worktree, target_base,
-                repo_path=repo_path, branch=branch,
-                agent_session_id=plan['worker_session_id'],
-            )
-        update_project(
-            connection,
-            repo,
-            active_sha=target_base,
-            phase="WORKING",
-            worker_result=None, worker_input_token=None, archive_token=None,
-            verify_result=None, review_result=None, verify_token=None,
-            review_token=None, publication_token=None, validated_base_sha=None,
-            last_error=None,
-        )
-        return 0
-    if _rebase_in_progress_for_branch(worktree, branch):
-        update_project(
-            connection,
-            repo,
-            phase="WORKING",
-            validated_base_sha=None,
-            last_error=REBASE_CONFLICT_PREFIX + rebased.stdout[-8000:],
-        )
-        return 0
-
-    error = f"PR 충돌 복구 rebase 실패:\n{rebased.stdout[-8000:]}"
-    operation_print(error, file=sys.stderr)
-    return PROJECT_STEP_RETRY
+    return pull_request_recovery.resume_pr_conflict_rebase(_pull_request_recovery_effects_resume_pr_conflict_rebase(), connection, repo_path, repo, project, worktree, branch)
 
 
 _TARGETED_TEST_FAILURE = re.compile(
@@ -16033,453 +13933,12 @@ class _PlanningGitPorts:
         validate_managed_worktree(self._repo_path, worktree, None)
 
 
-class _ExecPlanArchiveGitPort:
-    """Concrete detached-worktree Git adapter for archive housekeeping."""
-
-    def __init__(self, repo_path: Path, state_dir: Path, repo: str):
-        self.repo_path = repo_path
-        self.state_dir = state_dir
-        self.repo = repo
-
-    def fetch_remote_base(self, base_branch: str) -> str:
-        return _recorded_base_fetch(
-            self.repo_path, self.state_dir, base_branch, owner="project",
-        )
-
-    @staticmethod
-    def _parse_tree_record(record: bytes) -> tuple[str, str, str, str]:
-        metadata, separator, raw_path = record.partition(b"\t")
-        parts = metadata.split()
-        if not separator or len(parts) != 3:
-            raise RuntimeError("ExecPlan archive Git tree 항목 형식이 올바르지 않습니다.")
-        mode, object_type, object_id = parts
-        try:
-            path = raw_path.decode("utf-8")
-        except UnicodeDecodeError as error:
-            raise RuntimeError("ExecPlan archive Git 경로가 UTF-8이 아닙니다.") from error
-        return (
-            mode.decode("ascii"),
-            object_type.decode("ascii"),
-            object_id.decode("ascii"),
-            path,
-        )
-
-    def _manifest(self, revision: str) -> dict[str, tuple[str, str, str]]:
-        raw = git_bytes(
-            self.repo_path,
-            "ls-tree",
-            "-r",
-            "-z",
-            "--full-tree",
-            revision,
-        )
-        manifest: dict[str, tuple[str, str, str]] = {}
-        for record in raw.split(b"\0"):
-            if not record:
-                continue
-            mode, object_type, object_id, path = self._parse_tree_record(record)
-            manifest[path] = (mode, object_type, object_id)
-        return manifest
-
-    def _entry(
-        self, revision: str, path: str
-    ) -> execplan_archive.ArchiveTreeEntry | None:
-        raw = git_bytes(
-            self.repo_path,
-            "ls-tree",
-            "-z",
-            revision,
-            "--",
-            f":(literal){path}",
-        )
-        records = [record for record in raw.split(b"\0") if record]
-        exact = []
-        for record in records:
-            mode, object_type, object_id, observed = self._parse_tree_record(record)
-            if observed == path:
-                exact.append((mode, object_type, object_id))
-        if not exact:
-            return None
-        if len(exact) != 1:
-            raise RuntimeError(f"ExecPlan archive 경로가 중복 관측됐습니다: {path}")
-        mode, object_type, object_id = exact[0]
-        contents = (
-            git_bytes(self.repo_path, "cat-file", "blob", object_id)
-            if object_type == "blob"
-            else b""
-        )
-        return execplan_archive.ArchiveTreeEntry(
-            mode,
-            object_type,
-            object_id,
-            execplan_catalog.plan_content_hash(contents),
-        )
-
-    def definitions_current(
-        self,
-        base_sha: str,
-        candidates: Sequence[execplan_archive_state.MergedArchiveCandidate],
-    ) -> bool:
-        for candidate in candidates:
-            source = self._entry(base_sha, candidate.active_path)
-            destination = self._entry(base_sha, candidate.archive_path)
-            observed = source if source is not None else destination
-            if observed is None or not observed.regular:
-                return False
-            if observed.content_hash != candidate.content_hash:
-                return False
-        return True
-
-    def observe(
-        self,
-        revision: str,
-        candidates: Sequence[execplan_archive_state.MergedArchiveCandidate],
-    ) -> tuple[execplan_archive.ArchiveCandidateObservation, ...]:
-        conflicts = execplan_catalog.conflicting_archived_plan_paths(
-            self._manifest(revision)
-        )
-        return tuple(
-            execplan_archive.ArchiveCandidateObservation(
-                candidate,
-                self._entry(revision, candidate.active_path),
-                self._entry(revision, candidate.archive_path),
-                next(
-                    (
-                        path for path in conflicts.get(candidate.plan_id, ())
-                        if path != candidate.archive_path
-                    ),
-                    None,
-                ),
-            )
-            for candidate in candidates
-        )
-
-    def _workspace(self, operation_id: str) -> Path:
-        project_id = hashlib.sha256(self.repo.encode("utf-8")).hexdigest()[:16]
-        workspace = (
-            self.state_dir
-            / "worktrees"
-            / project_id
-            / "execplan-archive"
-            / operation_id
-        )
-        _validate_managed_path_boundary(
-            self.state_dir,
-            workspace,
-            workspace,
-            "ExecPlan archive worktree",
-        )
-        return workspace
-
-    @staticmethod
-    def _expected_moves(
-        moves: Sequence[execplan_archive.ArchiveMove],
-    ) -> tuple[tuple[str, str], ...]:
-        return tuple(sorted((move.source, move.destination) for move in moves))
-
-    def _validate_archive_tree(
-        self,
-        base_sha: str,
-        revision: str,
-        moves: Sequence[execplan_archive.ArchiveMove],
-    ) -> str:
-        before = self._manifest(base_sha)
-        after = self._manifest(revision)
-        classification = execplan_catalog.classify_archive_only_tree_change(
-            before, after
-        )
-        actual = tuple(
-            sorted((move.source, move.destination) for move in classification.moves)
-        )
-        if not classification.execplan_only or actual != self._expected_moves(moves):
-            raise RuntimeError(
-                "archive commit diff가 검증된 ExecPlan rename-only 집합과 다릅니다."
-            )
-        return git(
-            self.repo_path, "rev-parse", f"{revision}^{{tree}}"
-        ).stdout.strip()
-
-    def _prepared_from_commit(
-        self,
-        base_sha: str,
-        operation_id: str,
-        commit_oid: str,
-        moves: Sequence[execplan_archive.ArchiveMove],
-    ) -> execplan_archive.PreparedArchive:
-        parents = git(
-            self.repo_path,
-            "rev-list",
-            "--parents",
-            "-n",
-            "1",
-            commit_oid,
-        ).stdout.split()
-        if len(parents) != 2 or parents[1] != base_sha:
-            raise RuntimeError("archive commit은 원격 base의 단일 자식이어야 합니다.")
-        final_hash = self._validate_archive_tree(base_sha, commit_oid, moves)
-        return execplan_archive.PreparedArchive(
-            operation_id, base_sha, final_hash, commit_oid
-        )
-
-    def _remove_clean_workspace(self, workspace: Path) -> None:
-        if not (workspace.exists() or workspace.is_symlink()):
-            return
-        validate_managed_worktree(self.repo_path, workspace, None)
-        status = git(workspace, "status", "--porcelain=v1", "-z").stdout
-        if status:
-            raise RuntimeError(
-                f"archive 임시 worktree에 예상하지 못한 변경이 남았습니다: {workspace}"
-            )
-        removed = git(
-            self.repo_path,
-            "worktree",
-            "remove",
-            str(workspace),
-            check=False,
-        )
-        if removed.returncode:
-            raise RuntimeError(
-                "archive 임시 worktree 제거 실패:\n" + removed.stdout[-6000:]
-            )
-
-    def _discard_staged_workspace(
-        self,
-        workspace: Path,
-        base_sha: str,
-        moves: Sequence[execplan_archive.ArchiveMove],
-    ) -> None:
-        """Remove only a proven Manager-owned archive staging workspace."""
-
-        validate_managed_worktree(self.repo_path, workspace, None)
-        head = git(workspace, "rev-parse", "HEAD").stdout.strip()
-        if head != base_sha:
-            raise RuntimeError(
-                "archive base-race worktree HEAD가 시작 base와 다릅니다."
-            )
-        staged_tree = git(workspace, "write-tree").stdout.strip()
-        self._validate_archive_tree(base_sha, staged_tree, moves)
-        unstaged = git(
-            workspace, "diff", "--name-only", "-z", "--"
-        ).stdout
-        untracked = git(
-            workspace,
-            "ls-files",
-            "--others",
-            "--exclude-standard",
-            "-z",
-        ).stdout
-        if unstaged or untracked:
-            raise RuntimeError(
-                "archive base-race worktree에 검증되지 않은 파일 변경이 있습니다."
-            )
-        for move in reversed(moves):
-            git(workspace, "mv", "--", move.destination, move.source)
-        restored_tree = git(workspace, "write-tree").stdout.strip()
-        base_tree = git(
-            self.repo_path, "rev-parse", f"{base_sha}^{{tree}}"
-        ).stdout.strip()
-        if restored_tree != base_tree:
-            raise RuntimeError(
-                "archive base-race worktree를 원래 tree로 복원하지 못했습니다."
-            )
-        self._remove_clean_workspace(workspace)
-
-    @staticmethod
-    def _stage_archive_moves(
-        workspace: Path,
-        moves: Sequence[execplan_archive.ArchiveMove],
-    ) -> None:
-        """Stage recovered renames without requiring deleted paths to exist."""
-
-        for move in moves:
-            git(
-                workspace,
-                "update-index",
-                "--force-remove",
-                "--",
-                move.source,
-            )
-        destinations = [
-            f":(literal){move.destination}" for move in moves
-        ]
-        git(workspace, "add", "--", *destinations)
-
-    @staticmethod
-    def _commit_archive(workspace: Path, message: str) -> None:
-        """Create a Manager-owned commit without ambient identity or hooks."""
-
-        environment = os.environ.copy()
-        environment.update(
-            {
-                "GIT_AUTHOR_NAME": "Loop Manager",
-                "GIT_AUTHOR_EMAIL": "loop-manager@localhost",
-                "GIT_COMMITTER_NAME": "Loop Manager",
-                "GIT_COMMITTER_EMAIL": "loop-manager@localhost",
-            }
-        )
-        with tempfile.TemporaryDirectory(
-            prefix="loop-manager-execplan-archive-hooks-"
-        ) as hooks_directory:
-            committed = command(
-                [
-                    "git",
-                    "-c",
-                    f"core.hooksPath={hooks_directory}",
-                    "-c",
-                    "commit.gpgSign=false",
-                    "-C",
-                    str(workspace),
-                    "commit",
-                    "-m",
-                    message,
-                ],
-                check=False,
-                env=environment,
-            )
-        if committed.returncode:
-            output = committed.stdout[-6000:].strip()
-            detail = f"archive commit 실패:\n{output}"
-            if is_git_lock_failure(output):
-                raise GitLockError(detail)
-            raise RuntimeError(detail)
-
-    def prepare_commit(
-        self,
-        base_sha: str,
-        base_branch: str,
-        operation_id: str,
-        moves: Sequence[execplan_archive.ArchiveMove],
-    ) -> execplan_archive.PreparedArchive:
-        workspace = self._workspace(operation_id)
-        if workspace.exists() or workspace.is_symlink():
-            validate_managed_worktree(self.repo_path, workspace, None)
-            head = git(workspace, "rev-parse", "HEAD").stdout.strip()
-            if head != base_sha:
-                return self._prepared_from_commit(
-                    base_sha, operation_id, head, moves
-                )
-        else:
-            workspace.parent.mkdir(parents=True, exist_ok=True)
-            git(self.repo_path, "worktree", "prune", "--expire", "now")
-            git(
-                self.repo_path,
-                "worktree",
-                "add",
-                "--detach",
-                str(workspace),
-                base_sha,
-            )
-            validate_managed_worktree(self.repo_path, workspace, None)
-
-        for move in moves:
-            source = workspace / move.source
-            destination = workspace / move.destination
-            source_present = source.exists() or source.is_symlink()
-            destination_present = destination.exists() or destination.is_symlink()
-            if source_present and not destination_present:
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                git(workspace, "mv", "--", move.source, move.destination)
-            elif not source_present and destination_present:
-                continue
-            else:
-                raise RuntimeError(
-                    "archive 임시 worktree의 rename 상태가 불확실합니다: "
-                    f"{move.source} -> {move.destination}"
-                )
-
-        self._stage_archive_moves(workspace, moves)
-        staged_tree = git(workspace, "write-tree").stdout.strip()
-        self._validate_archive_tree(base_sha, staged_tree, moves)
-        if self.fetch_remote_base(base_branch) != base_sha:
-            self._discard_staged_workspace(workspace, base_sha, moves)
-            raise execplan_archive.ArchiveRemoteBaseChanged(
-                "archive commit 직전 원격 base가 변경됐습니다."
-            )
-        plan_ids = ", ".join(sorted(move.plan_id for move in moves))
-        self._commit_archive(
-            workspace, f"Archive merged ExecPlans: {plan_ids}"
-        )
-        commit_oid = git(workspace, "rev-parse", "HEAD").stdout.strip()
-        prepared = self._prepared_from_commit(
-            base_sha, operation_id, commit_oid, moves
-        )
-        return prepared
-
-    def commit_matches(
-        self,
-        prepared: execplan_archive.PreparedArchive,
-        moves: Sequence[execplan_archive.ArchiveMove],
-    ) -> bool:
-        exists = git(
-            self.repo_path,
-            "cat-file",
-            "-e",
-            f"{prepared.commit_oid}^{{commit}}",
-            check=False,
-        )
-        if exists.returncode:
-            return False
-        actual = self._prepared_from_commit(
-            prepared.base_sha,
-            prepared.operation_id,
-            prepared.commit_oid,
-            moves,
-        )
-        if actual.final_hash != prepared.final_hash:
-            return False
-        return True
-
-    def cleanup_prepared(
-        self, prepared: execplan_archive.PreparedArchive
-    ) -> None:
-        workspace = self._workspace(prepared.operation_id)
-        if not (workspace.exists() or workspace.is_symlink()):
-            return
-        validate_managed_worktree(self.repo_path, workspace, None)
-        head = git(workspace, "rev-parse", "HEAD").stdout.strip()
-        if head != prepared.commit_oid:
-            raise RuntimeError(
-                "archive 임시 worktree HEAD가 저장된 commit과 다릅니다: "
-                f"{head} != {prepared.commit_oid}"
-            )
-        self._remove_clean_workspace(workspace)
-
-    def push_fast_forward(
-        self,
-        prepared: execplan_archive.PreparedArchive,
-        base_branch: str,
-    ) -> execplan_archive.ArchivePushResult:
-        # Named-remote push updates tracking refs before the recorded fetch
-        # can prove their transition. Use the resolved push destinations, as
-        # diagnostic publication does, and let fetch perform the owned CAS.
-        urls = git(self.repo_path, "remote", "get-url", "--push", "--all", "origin").stdout.splitlines()
-        if not urls:
-            raise RuntimeError("archive push 대상 origin URL을 확인할 수 없습니다.")
-        pushes = [git(
-            self.repo_path, "push", "--", url,
-            f"{prepared.commit_oid}:refs/heads/{base_branch}", check=False,
-        ) for url in urls]
-        try:
-            remote_oid = self.fetch_remote_base(base_branch)
-        except Exception as error:
-            return execplan_archive.ArchivePushResult(
-                False,
-                error=f"push 결과 원격 확인 실패: {error}",
-            )
-        if remote_oid == prepared.commit_oid:
-            return execplan_archive.ArchivePushResult(True, remote_oid)
-        if remote_oid != prepared.base_sha:
-            return execplan_archive.ArchivePushResult(
-                False,
-                remote_oid=remote_oid,
-                error="push 도중 원격 base가 변경됐습니다.",
-                base_changed=True,
-            )
-        return execplan_archive.ArchivePushResult(
-            False,
-            remote_oid=remote_oid,
-            error="\n".join(pushed.stdout for pushed in pushes)[-6000:] or "fast-forward push가 거부됐습니다.",
-        )
+def _ExecPlanArchiveGitPort(
+    repo_path: Path, state_dir: Path, repo: str,
+) -> archive_git.ExecPlanArchiveGitPort:
+    return archive_git.ExecPlanArchiveGitPort(
+        repo_path, state_dir, repo, effects=_archive_git_effects,
+    )
 
 
 def dispatch_execplan_archive_housekeeping(
@@ -17367,7 +14826,7 @@ def _run_project_step(
         project_block = scoped_blocking.project_block(connection, repo)
         if project_block is not None and project_block["plan_id"]:
             reconciler = project_blocked_recovery.ProjectBlockedReconciler(
-                sys.modules[__name__], connection, repo_path, state_dir, repo,
+                _project_blocked_recovery_effects(), connection, repo_path, state_dir, repo,
                 str(row["base_branch"]), config_path, verify_timeout_seconds,
             )
             linked_plan_id = str(project_block["plan_id"])
@@ -19267,713 +16726,21 @@ def _guidance_checkpoint_commit_evidence(
         return None
 
 
-class _BlockedCheckpointAdapter:
-    """Git/GitHub safety and publication adapter for one registered project."""
-
-    def __init__(
-        self,
-        connection: sqlite3.Connection,
-        repo_path: Path,
-        state_dir: Path,
-        repo: str,
-        *, reconciliation_scope: bool = False,
-        project_recovery_scope: bool = False,
-    ):
-        self.connection = connection
-        self.repo_path = repo_path
-        self.state_dir = state_dir
-        self.repo = repo
-        self.reconciliation_scope = reconciliation_scope
-        self.project_recovery_scope = project_recovery_scope
-
-    def _plan(self, request: blocked_checkpoint.CheckpointRequest) -> sqlite3.Row:
-        if self.project_recovery_scope:
-            row = self.connection.execute(
-                'SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
-                (request.repo, request.plan_id)).fetchone()
-            if (row is None or not project_blocked_recovery.project_slot_available(
-                    self.connection, request.repo, request.plan_id)
-                    or (row['branch'], row['worktree']) != (request.branch, request.worktree)):
-                raise RuntimeError('project checkpoint의 선택 identity가 변경됐습니다.')
-            return row
-        row = self.connection.execute(
-            "SELECT p.*, b.reason_code AS checkpoint_reason, "
-            "b.evidence AS checkpoint_evidence "
-            "FROM exec_plans AS p JOIN execplan_blocks AS b "
-            "USING (repo, plan_id) WHERE p.repo = ? AND p.plan_id = ?",
-            (request.repo, request.plan_id),
-        ).fetchone()
-        if (
-            row is None
-            or row["status"] != "PLAN_BLOCKED"
-            or row["checkpoint_reason"] != request.reason_code
-            or row["checkpoint_evidence"] != request.evidence
-        ):
-            raise RuntimeError("checkpoint 대상 PLAN_BLOCKED identity가 변경됐습니다.")
-        return row
-
-    def _approved_guidance_targets(self, request: blocked_checkpoint.CheckpointRequest) -> tuple[str, ...]:
-        targets = []
-        for row in self.connection.execute(
-            "SELECT target_path, expected_content_hash FROM guidance_approvals "
-            "WHERE repo = ? AND plan_id = ? AND applied = 1 "
-            "AND expected_content_hash IS NOT NULL ORDER BY target_path",
-            (request.repo, request.plan_id),
-        ):
-            target = str(row["target_path"])
-            path = Path(str(request.worktree or "")) / target
-            try:
-                matches = (
-                    path.is_file()
-                    and not path.is_symlink()
-                    and guidance_content_hash(path.read_bytes())
-                    == str(row["expected_content_hash"])
-                )
-            except OSError:
-                matches = False
-            if matches:
-                targets.append(target)
-        return tuple(targets)
-
-    def assess(
-        self, request: blocked_checkpoint.CheckpointRequest
-    ) -> blocked_checkpoint.SafetyVerdict:
-        try:
-            plan = self._plan(request)
-        except RuntimeError as error:
-            return blocked_checkpoint.SafetyVerdict(
-                False,
-                blocked_checkpoint.SafetyScope.PLAN,
-                "checkpoint_identity_changed",
-                str(error),
-                None,
-                (),
-            )
-        if plan["pr_url"]:
-            return blocked_checkpoint.SafetyVerdict(
-                False,
-                blocked_checkpoint.SafetyScope.PLAN,
-                "existing_pull_request",
-                "기존 PR에 연결된 계획은 checkpoint 대상이 아닙니다.",
-                None,
-                (),
-            )
-        if not request.branch or not request.worktree:
-            return blocked_checkpoint.SafetyVerdict(
-                False,
-                blocked_checkpoint.SafetyScope.PLAN,
-                "managed_workspace_not_created",
-                "관리 branch 또는 worktree 생성 전에 차단되어 local-only로 보존합니다.",
-                None,
-                (),
-            )
-        project_blocked = scoped_blocking.project_block(
-            self.connection, request.repo
-        ) is not None
-        project_recovery_verified = bool(
-            project_blocked and self.project_recovery_scope
-            and project_blocked_recovery.checkpoint_scope_verified(
-                sys.modules[__name__], self.connection, self.repo_path, self.state_dir, request, plan))
-        branch = str(plan["branch"] or "")
-        worktree = Path(str(plan["worktree"] or ""))
-        identity_matches = bool(
-            request.branch
-            and request.worktree
-            and request.branch == branch
-            and Path(request.worktree) == worktree
-        )
-        snapshot = None
-        try:
-            validate_execplan_workspace_identity(
-                self.state_dir,
-                request.repo,
-                request.plan_id,
-                branch,
-                worktree,
-            )
-            validate_managed_worktree(
-                self.repo_path,
-                worktree,
-                branch,
-                allow_rebase=_rebase_in_progress_for_branch(worktree, branch),
-            )
-            snapshot = capture_git_snapshot(worktree)
-        except (OSError, RuntimeError, WorkspaceOwnershipError):
-            identity_matches = False
-
-        if (
-            snapshot is not None
-            and identity_matches
-            and not project_blocked
-            and snapshot.operations
-        ):
-            operations = tuple(sorted(snapshot.operations))
-            return blocked_checkpoint.SafetyVerdict(
-                False,
-                blocked_checkpoint.SafetyScope.PLAN,
-                "git_operation_in_progress",
-                "미해결 Git operation: " + ", ".join(operations),
-                snapshot.head,
-                (),
-            )
-
-        dirty_paths: list[blocked_checkpoint.DirtyPath] = []
-        shared_metadata_owned = False
-        head_oid = snapshot.head if snapshot is not None else None
-        actual_branch = snapshot.branch if snapshot is not None else None
-        operations = tuple(sorted(snapshot.operations)) if snapshot is not None else ()
-        if snapshot is not None:
-            metadata_error = (self._origin_safety_error(request, snapshot)
-                              if project_recovery_verified else self._shared_safety_error(request, plan, snapshot))
-            if metadata_error is not None:
-                return metadata_error
-            active_key = str(_canonical_path(worktree))
-            worktree_entry = snapshot.worktrees.get(active_key, ())
-            branch_ref = f"refs/heads/{branch}"
-            shared_metadata_owned = bool(
-                snapshot.shared_metadata_complete
-                and f"branch={branch_ref}" in worktree_entry
-                and snapshot.refs.get(branch_ref, (None, None))[0] == snapshot.head
-            )
-            try:
-                sources = tuple(str(item) for item in json.loads(str(plan["sources"])))
-            except (TypeError, ValueError):
-                sources = ()
-            archive_sources = tuple(
-                source
-                for source in sources
-                if source.startswith("docs/requirements/")
-                and "/archive/" not in source
-            )
-            guidance_targets = self._approved_guidance_targets(request)
-            allow_common_plans = _published_plan_allows_common_plans(
-                self.repo_path, plan
-            )
-            for path, (kinds, _) in sorted(snapshot.dirty.items()):
-                target = worktree / path
-                try:
-                    tree_entry = git(worktree, "ls-tree", "HEAD", "--", path).stdout
-                    symlink = (
-                        target.is_symlink()
-                        or tree_entry.startswith("120000 ")
-                        or any(
-                            entry.split()[1:2] == ["120000"]
-                            for entry in snapshot.index.get(path, ())
-                        )
-                    )
-                    external_worktree = bool(
-                        target.exists()
-                        and not target.is_file()
-                        and not symlink
-                    )
-                except OSError:
-                    symlink = True
-                    external_worktree = True
-                ignored_result = git(
-                    worktree,
-                    "check-ignore",
-                    "--no-index",
-                    "--quiet",
-                    "--",
-                    path,
-                    check=False,
-                )
-                ignored = ignored_result.returncode == 0
-                if ignored_result.returncode not in {0, 1}:
-                    ignored = True
-                entries = snapshot.index.get(path, ())
-                dirty_paths.append(
-                    blocked_checkpoint.DirtyPath(
-                        path=path,
-                        kinds=kinds,
-                        allowed=_worker_path_allowed(
-                            path,
-                            str(plan["path"]),
-                            archive_sources,
-                            guidance_targets,
-                            allow_common_plans,
-                        ),
-                        symlink=symlink,
-                        ignored=ignored,
-                        index_flags=_non_default_index_flags(entries),
-                        external_worktree=external_worktree,
-                    )
-                )
-        observation = blocked_checkpoint.SafetyObservation(
-            workspace_identity_matches=identity_matches,
-            workspace_owned=int(plan["workspace_owned"] or 0) == WORKSPACE_OWNED,
-            head_oid=head_oid,
-            actual_branch=actual_branch,
-            expected_branch=branch,
-            operations=operations,
-            dirty_paths=tuple(dirty_paths),
-            shared_metadata_owned=shared_metadata_owned,
-            project_blocked=project_blocked,
-            project_recovery_verified=project_recovery_verified,
-            legacy_scope_uncertain=(
-                request.reason_code
-                == BlockReasonCode.LEGACY_UNSCOPED_BLOCK.value
-                and not project_recovery_verified
-            ),
-            agent_scope_recovery_pending=not project_recovery_verified and bool(
-                plan["agent_recovery"]
-                or (
-                    plan["agent_snapshot"]
-                    and not self._validated_guidance_checkpoint(request, plan, snapshot)
-                    and not self._validated_reconciliation_scope(request, plan)
-                )
-            ),
-        )
-        return blocked_checkpoint.assess_safety(observation)
-
-    def _validated_reconciliation_scope(self, request, plan) -> bool:
-        if not self.reconciliation_scope:
-            return False
-        project = self.connection.execute(
-            'SELECT base_branch FROM projects WHERE repo = ?', (request.repo,)).fetchone()
-        checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get(
-            request.repo, request.plan_id)
-        try:
-            validate_blocked_agent_scope(
-                self.connection, self.repo_path, request.repo, project['base_branch'],
-                Path(request.worktree), plan['path'], saved_plan=plan,
-                accepted_rebase=bool((checkpoint.snapshot or {}).get('current_rebase_acceptance')))
-        except (OSError, RuntimeError, ValueError):
-            return False
-        return True
-
-    def _validated_guidance_checkpoint(
-        self, request: blocked_checkpoint.CheckpointRequest,
-        plan: sqlite3.Row, current: GitSnapshot | None,
-    ) -> bool:
-        if (
-            request.reason_code != GUIDANCE_BLOCK_REASON
-            or plan["agent_role"] != "worker"
-            or current is None
-            or not plan["agent_result_snapshot"]
-        ):
-            return False
-        rows = _guidance_rows(self.connection, request.repo, request.plan_id)
-        if not rows or any(row["invalidated_decision_hash"] for row in rows):
-            return False
-        worktree = Path(str(request.worktree))
-        try:
-            document = _guidance_document(worktree, str(plan["path"]))
-            if document is None or document.structure_hash != plan["guidance_plan_hash"]:
-                return False
-            _guidance_document_matches_rows(document, rows, require_decisions=False)
-            before = GitSnapshot.deserialize(str(plan["agent_snapshot"]))
-            result = GitSnapshot.deserialize(str(plan["agent_result_snapshot"]))
-            validate_agent_scope(
-                "worker", worktree, before, result,
-                selected_plan_path=str(plan["path"]),
-                allowed_guidance_targets=self._approved_guidance_targets(request),
-                allow_common_plans=_published_plan_allows_common_plans(self.repo_path, plan),
-            )
-            if _same_local_snapshot(result, current):
-                return True
-            # A crash can occur after commit but before recording the Manager
-            # snapshot. Accept only the durable prepared tree and identity.
-            return bool(
-                request.commit_identity and request.tree_oid
-                and not current.dirty
-                and git(worktree, "rev-parse", "HEAD^{tree}").stdout.strip() == request.tree_oid
-                and f"Checkpoint-Identity: {request.commit_identity}" in
-                git(worktree, "show", "-s", "--format=%B", "HEAD").stdout
-            )
-        except (RuntimeError, ValueError, TypeError, KeyError):
-            return False
-
-    def _record_guidance_checkpoint_scope(
-        self, request: blocked_checkpoint.CheckpointRequest,
-    ) -> None:
-        if request.reason_code != GUIDANCE_BLOCK_REASON:
-            return
-        snapshot = capture_git_snapshot(Path(str(request.worktree))).serialize()
-        with self.connection:
-            self.connection.execute(
-                "UPDATE exec_plans SET agent_snapshot = ?, agent_result_snapshot = ? "
-                "WHERE repo = ? AND plan_id = ?",
-                (snapshot, snapshot, request.repo, request.plan_id),
-            )
-            self.connection.execute(
-                "UPDATE projects SET agent_snapshot = ?, agent_result_snapshot = ? "
-                "WHERE repo = ? AND plan_path = "
-                "(SELECT path FROM exec_plans WHERE repo = ? AND plan_id = ?)",
-                (snapshot, snapshot, request.repo, request.repo, request.plan_id),
-            )
-
-    def _origin_safety_error(self, request, current):
-        """Registered fetch and push destinations are never a project exception."""
-        project = self.connection.execute('SELECT origin FROM projects WHERE repo = ?',
-                                          (request.repo,)).fetchone()
-        if project is None or not project['origin']:
-            return blocked_checkpoint.SafetyVerdict(
-                False, blocked_checkpoint.SafetyScope.PLAN, 'registered_origin_missing',
-                '등록 origin이 없어 checkpoint를 local-only로 보존합니다.', current.head, ())
-        try:
-            for context in (self.repo_path, Path(request.worktree)):
-                for arguments in (('remote', 'get-url', '--all', 'origin'),
-                                  ('remote', 'get-url', '--push', '--all', 'origin')):
-                    urls = git(context, *arguments).stdout.splitlines()
-                    if len(urls) != 1 or github_repository(urls[0]) != project['origin']:
-                        raise RuntimeError('등록 origin과 fetch/push 대상이 다릅니다.')
-        except (OSError, RuntimeError) as error:
-            return blocked_checkpoint.SafetyVerdict(
-                False, blocked_checkpoint.SafetyScope.PROJECT, 'shared_git_config_mutation',
-                str(error), current.head, ())
-        return None
-
-    def _shared_safety_error(
-        self,
-        request: blocked_checkpoint.CheckpointRequest,
-        plan: sqlite3.Row,
-        current: GitSnapshot,
-    ) -> blocked_checkpoint.SafetyVerdict | None:
-        """Check persisted ownership before any GitHub or remote operation."""
-        def reject(reason, detail):
-            return blocked_checkpoint.SafetyVerdict(
-                False, blocked_checkpoint.SafetyScope.PROJECT,
-                reason, detail, current.head, (),
-            )
-
-        origin_error = self._origin_safety_error(request, current)
-        if origin_error is not None:
-            return origin_error
-
-        serialized = plan["agent_snapshot"] or plan["agent_result_snapshot"]
-        try:
-            if not serialized:
-                raise ValueError("persisted Git snapshot이 없습니다.")
-            before = GitSnapshot.deserialize(str(serialized))
-            if not before.shared_metadata_complete:
-                raise ValueError("persisted shared metadata가 없습니다.")
-        except (ValueError, TypeError, KeyError, RuntimeError) as error:
-            return reject("workspace_ownership_uncertain", str(error))
-        if before.config != current.config:
-            return reject("shared_git_config_mutation", "checkpoint Git config가 저장된 snapshot과 다릅니다.")
-        own_ref = f"refs/heads/{request.branch}"
-        remote_ref = f"refs/remotes/origin/{request.branch}"
-        owned_remote_oid = (
-            _owned_checkpoint_remote_oid(
-                self.connection, self.repo_path, request, plan, current,
-            )
-            if before.refs.get(remote_ref) != current.refs.get(remote_ref)
-            else None
-        )
-        fetched_refs = _proven_manager_base_refs(
-            self.connection, self.repo_path, request.repo, request.plan_id,
-            before, current,
-        )
-        for name in before.refs.keys() | current.refs.keys():
-            if name == own_ref or name in fetched_refs or name.startswith("refs/codex/turn-diffs/"):
-                continue
-            if before.refs.get(name) == current.refs.get(name):
-                continue
-            if name == remote_ref and current.refs.get(name) == (owned_remote_oid, ""):
-                continue
-            return reject("shared_ref_mutation", f"checkpoint 공유 ref 변경: {name}")
-        own_path = str(_canonical_path(Path(request.worktree)))
-        cleaned = _proven_merged_cleanup_paths(
-            self.connection, request.repo, before, current,
-        )
-        for path in before.worktrees.keys() | current.worktrees.keys():
-            if (path != own_path and path not in cleaned
-                    and before.worktrees.get(path) != current.worktrees.get(path)):
-                return reject("outside_managed_worktree_mutation", f"checkpoint 외부 worktree 변경: {path}")
-        return None
-
-    def existing_pull_request(
-        self, request: blocked_checkpoint.CheckpointRequest
-    ) -> object | None:
-        if not request.branch:
-            return None
-        try:
-            return pr_for_branch(self.repo_path, request.branch)
-        except RuntimeError as error:
-            raise blocked_checkpoint.CheckpointPushError(
-                f"checkpoint PR 조회 실패: {error}", retryable=True
-            ) from error
-
-    def _tree_for_paths(
-        self, worktree: Path, paths: tuple[str, ...]
-    ) -> str:
-        with tempfile.TemporaryDirectory(
-            prefix="loop-manager-checkpoint-index-"
-        ) as directory:
-            temporary_index = Path(directory) / "index"
-            _git_with_index(worktree, temporary_index, "read-tree", "HEAD")
-            if paths:
-                _git_with_index(
-                    worktree,
-                    temporary_index,
-                    "add",
-                    "--all",
-                    "--",
-                    *paths,
-                )
-            return _git_with_index(
-                worktree, temporary_index, "write-tree"
-            ).stdout.strip()
-
-    def prepare(
-        self,
-        request: blocked_checkpoint.CheckpointRequest,
-        verdict: blocked_checkpoint.SafetyVerdict,
-    ) -> blocked_checkpoint.PreparedCheckpoint:
-        if not verdict.safe or verdict.head_oid is None or request.worktree is None:
-            raise RuntimeError("안전하지 않은 checkpoint를 준비할 수 없습니다.")
-        worktree = Path(request.worktree)
-        tree_oid = self._tree_for_paths(worktree, verdict.included_paths)
-        identity = blocked_checkpoint.checkpoint_identity(
-            plan_id=request.plan_id,
-            reason_code=request.reason_code,
-            evidence=request.evidence,
-            parent_oid=verdict.head_oid,
-            tree_oid=tree_oid,
-            included_paths=verdict.included_paths,
-        )
-        return blocked_checkpoint.PreparedCheckpoint(
-            parent_oid=verdict.head_oid,
-            tree_oid=tree_oid,
-            commit_identity=identity,
-            message=blocked_checkpoint.checkpoint_message(
-                plan_id=request.plan_id,
-                reason_code=request.reason_code,
-                evidence=request.evidence,
-                identity=identity,
-                included_paths=verdict.included_paths,
-            ),
-            included_paths=verdict.included_paths,
-        )
-
-    def ensure_local_commit(
-        self,
-        request: blocked_checkpoint.CheckpointRequest,
-        prepared: blocked_checkpoint.PreparedCheckpoint,
-    ) -> str:
-        if request.worktree is None:
-            raise RuntimeError("checkpoint worktree가 저장되지 않았습니다.")
-        worktree = Path(request.worktree)
-        current_head = git(worktree, "rev-parse", "HEAD^{commit}").stdout.strip()
-        if current_head != prepared.parent_oid:
-            current_tree = git(
-                worktree, "rev-parse", "HEAD^{tree}"
-            ).stdout.strip()
-            current_message = git(
-                worktree, "show", "-s", "--format=%B", "HEAD"
-            ).stdout
-            if (
-                current_tree == prepared.tree_oid
-                and f"Checkpoint-Identity: {prepared.commit_identity}"
-                in current_message
-            ):
-                self._record_guidance_checkpoint_scope(request)
-                return current_head
-            raise RuntimeError(
-                "checkpoint 준비 뒤 관리 branch HEAD가 예상하지 못하게 변경됐습니다."
-            )
-        if not prepared.included_paths:
-            head_tree = git(
-                worktree, "rev-parse", "HEAD^{tree}"
-            ).stdout.strip()
-            if head_tree != prepared.tree_oid:
-                raise RuntimeError("clean checkpoint tree가 현재 HEAD와 다릅니다.")
-            self._record_guidance_checkpoint_scope(request)
-            return current_head
-
-        git(
-            worktree,
-            "add",
-            "--all",
-            "--",
-            *prepared.included_paths,
-        )
-        actual_tree = git(worktree, "write-tree").stdout.strip()
-        if actual_tree != prepared.tree_oid:
-            raise RuntimeError(
-                "checkpoint stage 결과가 사전 검증한 tree와 다릅니다."
-            )
-        with tempfile.TemporaryDirectory(
-            prefix="loop-manager-checkpoint-message-"
-        ) as directory:
-            message_path = Path(directory) / "message"
-            message_path.write_text(prepared.message, encoding="utf-8")
-            environment = os.environ.copy()
-            environment.update(
-                {
-                    "GIT_AUTHOR_NAME": "Loop Manager",
-                    "GIT_AUTHOR_EMAIL": "loop-manager@localhost",
-                    "GIT_COMMITTER_NAME": "Loop Manager",
-                    "GIT_COMMITTER_EMAIL": "loop-manager@localhost",
-                }
-            )
-            committed = command(
-                [
-                    "git",
-                    "-c",
-                    f"core.hooksPath={directory}",
-                    "-c",
-                    "commit.gpgSign=false",
-                    "-C",
-                    str(worktree),
-                    "commit",
-                    "--file",
-                    str(message_path),
-                ],
-                check=False,
-                env=environment,
-            )
-        if committed.returncode:
-            raise RuntimeError(
-                "checkpoint commit 실패:\n" + committed.stdout[-8000:]
-            )
-        local_oid = git(
-            worktree, "rev-parse", "HEAD^{commit}"
-        ).stdout.strip()
-        if git(worktree, "rev-parse", "HEAD^{tree}").stdout.strip() != prepared.tree_oid:
-            raise RuntimeError("checkpoint commit tree 검증에 실패했습니다.")
-        self._record_guidance_checkpoint_scope(request)
-        return local_oid
-
-    def observe_remote(
-        self, request: blocked_checkpoint.CheckpointRequest
-    ) -> str | None:
-        if not request.branch:
-            raise RuntimeError("checkpoint branch가 저장되지 않았습니다.")
-        result = git(
-            self.repo_path,
-            "ls-remote",
-            "--heads",
-            "origin",
-            f"refs/heads/{request.branch}",
-            check=False,
-        )
-        if result.returncode:
-            raise blocked_checkpoint.CheckpointPushError(
-                "checkpoint 원격 branch 조회 실패:\n" + result.stdout[-8000:],
-                retryable=True,
-            )
-        rows = [line.split() for line in result.stdout.splitlines() if line.strip()]
-        if not rows:
-            return None
-        if (len(rows) != 1 or len(rows[0]) != 2
-                or rows[0][1] != f"refs/heads/{request.branch}"):
-            raise RuntimeError("checkpoint 원격 branch 응답이 유일하지 않습니다.")
-        oid = rows[0][0]
-        if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", oid) is None:
-            raise RuntimeError("checkpoint 원격 branch OID가 유효하지 않습니다.")
-        return oid
-
-    def is_fast_forward(self, remote_oid: str, local_oid: str) -> bool:
-        result = git(
-            self.repo_path,
-            "merge-base",
-            "--is-ancestor",
-            remote_oid,
-            local_oid,
-            check=False,
-        )
-        if result.returncode not in {0, 1}:
-            raise RuntimeError("checkpoint fast-forward 관계를 확인할 수 없습니다.")
-        return result.returncode == 0
-
-    def push(
-        self,
-        request: blocked_checkpoint.CheckpointRequest,
-        local_oid: str,
-        decision: blocked_checkpoint.PushDecision,
-    ) -> None:
-        if not request.branch or not request.worktree:
-            raise blocked_checkpoint.CheckpointPushError(
-                "checkpoint branch/worktree가 저장되지 않았습니다.",
-                retryable=False,
-            )
-        arguments = [
-            "push",
-            "origin",
-            f"{local_oid}:refs/heads/{request.branch}",
-        ]
-        if decision.mode in {blocked_checkpoint.PushMode.CREATE, blocked_checkpoint.PushMode.FAST_FORWARD}:
-            arguments.insert(1, '--force-with-lease='
-                             f"refs/heads/{request.branch}:{request.expected_remote_oid or ''}")
-        if decision.mode is blocked_checkpoint.PushMode.REBASE_LEASE:
-            if not request.expected_remote_oid:
-                raise blocked_checkpoint.CheckpointPushError(
-                    "rebase checkpoint lease OID가 없습니다.", retryable=False
-                )
-            arguments.insert(
-                1,
-                "--force-with-lease="
-                f"refs/heads/{request.branch}:{request.expected_remote_oid}",
-            )
-        scoped_options = (("-c", f"core.hooksPath={os.devnull}")
-                          if self.project_recovery_scope else ())
-        pushed = git(Path(request.worktree), *scoped_options, *arguments, check=False)
-        if pushed.returncode:
-            raise blocked_checkpoint.CheckpointPushError(
-                "checkpoint push 실패:\n" + pushed.stdout[-8000:],
-                retryable=blocked_checkpoint.push_failure_retryable(pushed.stdout),
-            )
-
-
-class _BlockedCheckpointResults:
-    def __init__(self, connection: sqlite3.Connection):
-        self.connection = connection
-
-    def promote_project_block(
-        self,
-        request: blocked_checkpoint.CheckpointRequest,
-        verdict: blocked_checkpoint.SafetyVerdict,
-    ) -> None:
-        if scoped_blocking.project_block(self.connection, request.repo) is not None:
-            # A checkpoint refusal cannot replace an independent safety cause.
-            return
-        reason = {
-            "shared_ref_mutation": BlockReasonCode.SHARED_REF_MUTATION,
-            "shared_git_config_mutation": BlockReasonCode.SHARED_GIT_CONFIG_MUTATION,
-            "outside_managed_worktree_mutation": BlockReasonCode.OUTSIDE_MANAGED_WORKTREE_MUTATION,
-            "workspace_ownership_uncertain": (
-                BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN
-            ),
-        }.get(
-            str(verdict.reason_code),
-            BlockReasonCode.REPOSITORY_STATE_UNSAFE,
-        )
-        with self.connection:
-            scoped_blocking.record_project_block(
-                self.connection,
-                request.repo,
-                reason,
-                verdict.detail or "checkpoint project safety violation",
-                request.request_identity,
-                plan_id=request.plan_id,
-                previous_phase=None,
-            )
-
-    def finalized(self, request: blocked_checkpoint.CheckpointRequest) -> None:
-        # The repository commits the result and outbox together. There must be
-        # no separate, crash-sensitive notification transaction here.
-        pass
+def _BlockedCheckpointAdapter(
+    connection: sqlite3.Connection, repo_path: Path, state_dir: Path, repo: str,
+    *, reconciliation_scope: bool = False, project_recovery_scope: bool = False,
+) -> checkpoint_adapter.BlockedCheckpointAdapter:
+    return checkpoint_adapter.BlockedCheckpointAdapter(
+        connection, repo_path, state_dir, repo,
+        reconciliation_scope=reconciliation_scope,
+        project_recovery_scope=project_recovery_scope,
+        safety_effects=_checkpoint_safety_effects,
+        publication_effects=_checkpoint_publication_effects,
+    )
 
 
 def push_diagnostic_checkpoint(adapter, request, head):
-    """Create an exact absent ref; never update original or tracking refs."""
-    if not request.branch or not request.branch.startswith('loop-manager/diagnostics/'):
-        raise RuntimeError('진단 ref 이름이 유효하지 않습니다.')
-    snapshot = capture_git_snapshot(Path(request.worktree))
-    verdict = adapter._origin_safety_error(request, snapshot)
-    if verdict is not None:
-        raise RuntimeError(verdict.detail)
-    # An explicit verified URL avoids Git's automatic remote-tracking update.
-    origin = git(Path(request.worktree), 'remote', 'get-url', '--push', 'origin').stdout.strip()
-    pushed = git(Path(request.worktree), '-c', f'core.hooksPath={os.devnull}', 'push',
-                 f'--force-with-lease=refs/heads/{request.branch}:', origin,
-                 f'{head}:refs/heads/{request.branch}', check=False)
-    if pushed.returncode:
-        raise blocked_checkpoint.CheckpointPushError(
-            '진단 ref 게시 실패: ' + pushed.stdout[-8000:],
-            retryable=blocked_checkpoint.push_failure_retryable(pushed.stdout))
+    return checkpoint_adapter.push_diagnostic_checkpoint(_diagnostic_publication_effects(), adapter, request, head)
 
 
 def dispatch_blocked_checkpoints(

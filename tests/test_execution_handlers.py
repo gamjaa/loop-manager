@@ -2327,7 +2327,7 @@ class ExecutionHandlerTests(ExecutionFixture, TestCase):
                 connection.row_factory = sqlite3.Row
                 notifications.configure_session(connection, enabled=True)
                 with (
-                    mock.patch.object(lm._BlockedCheckpointAdapter, 'assess',
+                    mock.patch.object(lm.checkpoint_adapter.BlockedCheckpointAdapter, 'assess',
                                       return_value=local_only) as assess,
                     mock.patch.object(lm, '_revision_execplan_input_fingerprint',
                                       return_value='remote-input'),
