@@ -10,7 +10,9 @@ import json
 from pathlib import Path
 from typing import Any, Callable, Protocol, Sequence
 
-from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot
+from loop_manager_internal.planning.planning_catalog import (
+    MutableReadySnapshot, PlanningResultInvalid, PlannerValidationError,
+)
 
 from loop_manager_internal.maintenance.maintenance_orchestration import (
     MaintenanceOrchestrationError,
@@ -121,8 +123,6 @@ def choose_planning_decision(
     return PlanningDecision(kind)
 
 
-class PlanningResultInvalid(RuntimeError):
-    """A Planner result that may be repaired in the same Agent session."""
 
 
 class PlanningWorkspaceOwnershipError(RuntimeError):

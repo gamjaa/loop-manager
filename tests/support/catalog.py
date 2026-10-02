@@ -1,3 +1,4 @@
+from loop_manager_internal.storage import database
 from loop_manager_internal.storage import execplan_catalog_state
 from tests.support.lifecycle import fixture_cleanup
 import sqlite3
@@ -161,8 +162,8 @@ class CatalogReconciliationFixture:
         self.connection = sqlite3.connect(":memory:")
         self.addCleanup(self.connection.close)
         self.connection.row_factory = sqlite3.Row
-        self.connection.execute(loop_manager.SCHEMA)
-        loop_manager._ensure_execplans_schema(self.connection)
+        self.connection.execute(database.SCHEMA)
+        database._ensure_execplans_schema(self.connection)
         loop_manager.notifications.ensure_schema(self.connection)
         self.connection.execute(
             "INSERT INTO projects (repo, base_branch, phase, plan_path, "

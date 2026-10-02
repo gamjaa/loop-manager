@@ -1,6 +1,6 @@
+from loop_manager_internal.storage import database
 import json
 import sqlite3
-import loop_manager
 
 from loop_manager_internal.notifications import notifications
 
@@ -8,8 +8,8 @@ from loop_manager_internal.notifications import notifications
 def runtime_connection() -> sqlite3.Connection:
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row
-    connection.execute(loop_manager.SCHEMA)
-    loop_manager._ensure_execplans_schema(connection)
+    connection.execute(database.SCHEMA)
+    database._ensure_execplans_schema(connection)
     notifications.ensure_schema(connection)
     connection.execute(
         """
@@ -43,8 +43,8 @@ class AutomationCatalogFixture:
     def _connection(self, repo: str = "repo") -> sqlite3.Connection:
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row
-        connection.execute(loop_manager.SCHEMA)
-        loop_manager._ensure_execplans_schema(connection)
+        connection.execute(database.SCHEMA)
+        database._ensure_execplans_schema(connection)
         connection.execute(
             "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
             (repo,),
