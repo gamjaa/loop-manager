@@ -11317,7 +11317,7 @@ def begin_agent_scope(
                 _agent_git_resources(connection, Path(repo), worktree, stored, role_name,
                                      selected_plan_path=str(row['plan_path'] or '')))
         checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, plan_id or '')
-        if plan_id and stored != original_scope:
+        if stored != original_scope:
             checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
             saved = dict(checkpoint.snapshot or {})
             previous = saved.get('manager_metadata_agent_baseline')

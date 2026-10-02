@@ -2438,6 +2438,44 @@ class ManagerBaselineReconciliationUnitTests(unittest.TestCase):
             self.current = replace(self.current, refs={self.ref: ('c' * 40, '')})
             self.assertIsNotNone(ports.finish_scope('planner', worktree, resumed).error)
 
+    def test_saved_planner_result_survives_block_release_and_common_prevalidation(self):
+        worktree, ports = self.planner_ports()
+        self.record_fetch()
+        original = self.before.serialize()
+        with mock.patch.object(loop_manager, 'capture_git_snapshot', side_effect=lambda *_: self.current), \
+                mock.patch.object(loop_manager, '_config_entries', return_value={}):
+            for role in ('planner', 'maintenance_planner'):
+                with self.subTest(role=role):
+                    self.connection.execute('UPDATE projects SET agent_role = ?', (role,))
+                    resumed = ports.begin_scope(role, worktree)
+                    self.assertEqual(resumed.refs, self.current.refs)
+                    saved = self.current.serialize()
+                    self.connection.execute('UPDATE projects SET agent_result_snapshot = ?, '
+                        'planning_validation_error = NULL', (saved,))
+                    loop_manager.scoped_blocking.record_project_block(
+                        self.connection, str(self.source),
+                        loop_manager.BlockReasonCode.SHARED_REF_MUTATION,
+                        'stale Planner baseline', 'same-input', plan_id=None,
+                        previous_phase='PLANNING')
+                    self.assertTrue(loop_manager.resume_project_block_if_safe(
+                        self.connection, self.source, self.state, str(self.source)))
+                    loop_manager.validate_persisted_agent_scope(
+                        self.connection, self.source, self.state, str(self.source))
+                    row = self.connection.execute('SELECT * FROM projects').fetchone()
+                    self.assertEqual(row['agent_snapshot'], original)
+                    self.assertEqual(row['agent_result_snapshot'], saved)
+                    self.assertEqual(row['planner_session_id'], 'saved-planner')
+                    self.assertEqual(row['agent_input_fingerprint'], 'same-input')
+                    for changed in (
+                            replace(self.current, refs={self.ref: ('c' * 40, '')}),
+                            replace(self.current, dirty={'app.py': (('unstaged',), 'forbidden')})):
+                        self.connection.execute('UPDATE projects SET agent_result_snapshot = ?',
+                                                (changed.serialize(),))
+                        with self.assertRaises(loop_manager.AgentScopeError):
+                            loop_manager.validate_persisted_agent_scope(
+                                self.connection, self.source, self.state, str(self.source))
+                    self.connection.execute('UPDATE projects SET agent_result_snapshot = ?', (saved,))
+
     def test_runtime_prevalidation_reconciles_only_proven_delta_and_rejects_saved_mutation(self):
         self.source = self.state / 'source'
         self.source.mkdir()
