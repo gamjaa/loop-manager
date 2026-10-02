@@ -327,6 +327,13 @@ class BlockedPlanRemoteRefreshTests(unittest.TestCase):
                                   return_value=original.head)
         proof = patch.start()
         self.addCleanup(patch.stop)
+        fetch = mock.patch.object(loop_manager, '_proven_manager_base_refs',
+            side_effect=lambda _connection, _path, _repo, _plan, before, current:
+                frozenset({'refs/remotes/origin/main'})
+                if (before.refs.get('refs/remotes/origin/main') == ('old-base', '')
+                    and current.refs.get('refs/remotes/origin/main') == (self.base, '')) else frozenset())
+        fetch.start()
+        self.addCleanup(fetch.stop)
         return original, proof
 
     def test_guidance_post_checkpoint_tracking_updates_allow_scope_before_successor_adoption(self):
@@ -3168,7 +3175,9 @@ class ScopedBlockingTest(unittest.TestCase):
         with mock.patch(
             "loop_manager.validate_execplan_workspace_identity"
         ), mock.patch("loop_manager.validate_managed_worktree"):
-            self.assertTrue(
+            # A scope cause without its saved invocation cannot be attributed
+            # to harmless external changes from worktree ownership alone.
+            self.assertFalse(
                 loop_manager.resume_project_block_if_safe(
                     self.connection,
                     Path(self.repo),
@@ -3179,7 +3188,8 @@ class ScopedBlockingTest(unittest.TestCase):
         released_project = self.connection.execute(
             "SELECT phase, plan_path FROM projects WHERE repo = ?", (self.repo,)
         ).fetchone()
-        self.assertEqual(tuple(released_project), (None, None))
+        self.assertEqual(tuple(released_project), ('PROJECT_BLOCKED', plan['path']))
+        self.assertIsNotNone(scoped_blocking.project_block(self.connection, self.repo))
 
     def test_project_release_restores_phase_and_preserves_plan_block(self):
         snapshot = loop_manager.GitSnapshot(
@@ -3596,6 +3606,32 @@ class ScopeBaselineRecoveryUnitTests(unittest.TestCase):
         self.connection.execute('UPDATE exec_plans SET agent_result_snapshot = ?', (flagged.serialize(),))
         self.assertFalse(self.resume_project())
         self.assertIsNotNone(scoped_blocking.project_block(self.connection, 'repo'))
+
+    def test_existing_correction_accepts_restored_flags_without_erasing_saved_result(self):
+        flagged = replace(self.current, index={'app.py': ('S 100644 resolved 0',)})
+        self.connection.execute('UPDATE exec_plans SET agent_result_snapshot = ?', (flagged.serialize(),))
+        plan = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        loop_manager.validate_blocked_agent_scope(self.connection, self.repo_path, 'repo', 'main',
+            self.worktree, plan['path'], saved_plan=plan)
+        self.assertEqual(self.connection.execute('SELECT agent_result_snapshot FROM exec_plans').fetchone()[0],
+                         flagged.serialize())
+        self.current = flagged
+        with self.assertRaisesRegex(loop_manager.AgentScopeError, 'index flags'):
+            loop_manager.validate_blocked_agent_scope(self.connection, self.repo_path, 'repo', 'main',
+                self.worktree, plan['path'], saved_plan=plan)
+
+    def test_failed_false_positive_release_keeps_existing_changed_input_correction_route(self):
+        runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
+        runtime.block_plan('repo', 'G-047', reason_code='managed_worktree_scope_violation',
+                           evidence='real violation', release_fingerprint='input',
+                           plan_values={'blocked_fingerprint': 'input'})
+        with mock.patch.object(loop_manager, '_reconcile_scope_baseline_plan_block', return_value=False), \
+                mock.patch.object(loop_manager, '_revision_execplan_input_fingerprint',
+                                  side_effect=RuntimeError('existing correction selected')) as inputs:
+            with self.assertRaisesRegex(RuntimeError, 'existing correction selected'):
+                loop_manager.resume_blocked_execplan_if_inputs_changed(self.connection, self.repo_path,
+                    'repo', 'main', Path('/state'), plan_id='G-047')
+        inputs.assert_called_once()
 
     def test_planner_scope_release_rechecks_snapshot_and_preserves_planning_error(self):
         from agent_scope_decision import used_git_resources

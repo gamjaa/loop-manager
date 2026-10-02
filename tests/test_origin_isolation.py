@@ -2049,6 +2049,8 @@ class ManagerBaselineReconciliationUnitTests(unittest.TestCase):
         self.current = replace(self.before, refs={self.ref: ('b' * 40, '')})
         self.reflog = ''
         def read_git(_repo, *args, **kwargs):
+            if args[:2] == ('rev-parse', '--verify') and args[2] == self.ref + '^{commit}':
+                return SimpleNamespace(stdout=self.current.refs[self.ref][0], returncode=0)
             if args[:2] != ('reflog', 'show'):
                 raise AssertionError('scope reconciliation must not perform Git mutations')
             return SimpleNamespace(stdout=self.reflog, returncode=0)
@@ -2131,6 +2133,96 @@ class ManagerBaselineReconciliationUnitTests(unittest.TestCase):
             (str(self.source), self.ref, '["' + 'a' * 40 + '", ""]', 'b' * 40, 'f' * 32))
         self.reflog = f"{'b' * 40}\0external update"
         self.assertEqual(self.reconcile().refs, self.before.refs)
+
+    def test_sqlite_owned_fetch_is_not_rejected_by_alternate_journal_token(self):
+        self.record_fetch()
+        loop_manager._ensure_cleanup_pending_schema(self.connection)
+        self.connection.execute('INSERT INTO manager_base_fetches '
+            '(repo, plan_id, refname, before_ref, target_oid, action_token, phase) '
+            "VALUES (?, 'G-092', ?, ?, ?, ?, 'complete')",
+            (str(self.source), self.ref, '["' + 'a' * 40 + '", ""]', 'b' * 40, 'f' * 32))
+        self.reflog = f"{'b' * 40}\0loop-manager-base-fetch:{'f' * 32}\n"
+        self.assertEqual(self.reconcile().refs[self.ref], ('b' * 40, ''))
+
+    def test_begin_scope_records_proven_metadata_start_and_retains_original(self):
+        self.record_fetch()
+        self.prepare_project(Path('/managed'))
+        with mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=self.current), \
+                mock.patch.object(loop_manager, '_owned_rebase_state_dir', return_value=self.state), \
+                mock.patch.object(loop_manager, '_agent_git_resources', return_value=None):
+            effective = loop_manager.begin_agent_scope(self.connection, str(self.source), Path('/managed'), 'worker')
+        self.assertEqual(effective.refs, self.current.refs)
+        self.assertEqual(self.connection.execute('SELECT agent_snapshot FROM projects').fetchone()[0],
+                         self.before.serialize())
+        checkpoint = loop_manager.execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get(
+            str(self.source), 'G-092')
+        self.assertEqual(loop_manager.agent_scope_decision.manager_comparison_baseline(
+            self.before, self.before, checkpoint.snapshot, 'worker').refs, self.current.refs)
+
+    def test_deferred_merged_cleanup_records_exact_registration_for_scope_refresh(self):
+        worktree = self.state / 'G-099'
+        worktree.mkdir()
+        self.prepare_project(self.state)
+        branch = 'loop-manager/G-099'
+        registration = ('HEAD=' + 'a' * 40, 'branch=refs/heads/' + branch)
+        self.before = replace(self.before, worktrees={**self.before.worktrees, str(worktree): registration})
+        self.current = self.before
+        self.connection.execute('INSERT INTO exec_plans '
+            '(repo, plan_id, path, title, sources, depends_on, priority, content_hash, status, '
+            'branch, worktree, workspace_owned, pr_head_oid) '
+            "VALUES (?, 'G-099', 'docs/plans/[G-099] Cleanup.md', 'Cleanup', '[]', '[]', 'normal', 'hash', "
+            "'MERGED', ?, ?, 1, ?)", (str(self.source), branch, str(worktree), 'a' * 40))
+        loop_manager._ensure_cleanup_pending_schema(self.connection)
+        loop_manager._store_cleanup_pending(self.connection, str(self.source), worktree,
+                                           'pr', 'a' * 40, 'deferred')
+        def remove(*_args, **_kwargs):
+            worktree.rmdir()
+            self.current = replace(self.current, worktrees=self.before.worktrees.copy())
+            self.current.worktrees.pop(str(worktree))
+            return loop_manager.CleanupAssessment('safe', '')
+        with mock.patch.object(loop_manager, '_recover_managed_worktree_removal'), \
+                mock.patch.object(loop_manager, 'validate_pending_cleanup_worktree'), \
+                mock.patch.object(loop_manager, 'assess_cleanup', return_value=loop_manager.CleanupAssessment('safe', '')), \
+                mock.patch.object(loop_manager, 'remove_cleanup_worktree', side_effect=remove), \
+                mock.patch.object(loop_manager, 'capture_git_snapshot', side_effect=lambda *_: self.current):
+            self.assertEqual(loop_manager.recheck_cleanup_pending(
+                self.connection, self.source, str(self.source), self.state), [])
+        self.assertEqual(loop_manager._proven_merged_cleanup_paths(
+            self.connection, str(self.source), self.before, self.current), frozenset({str(worktree)}))
+        self.assertEqual(self.reconcile().worktrees, self.current.worktrees)
+
+    def test_persisted_guidance_checkpoint_allows_proven_publication_ref_only(self):
+        owned = 'refs/heads/loop-manager/G-092'
+        remote = 'refs/remotes/origin/loop-manager/G-092'
+        worktree = self.state / 'managed'
+        worktree.mkdir()
+        self.before = replace(self.before, refs={**self.before.refs, owned: ('owned', '')},
+                              worktrees={str(worktree): ('HEAD=owned', 'branch=' + owned)})
+        self.current = replace(self.before, refs={**self.before.refs, remote: ('owned', '')})
+        self.prepare_project(worktree)
+        self.connection.execute('INSERT INTO exec_plans '
+            '(repo, plan_id, path, title, sources, depends_on, priority, content_hash, status, '
+            'branch, worktree, workspace_owned, blocked_reason) '
+            "VALUES (?, 'G-092', 'docs/plans/[G-092] Work.md', 'Work', '[]', '[]', 'normal', 'hash', "
+            "'PLAN_BLOCKED', 'loop-manager/G-092', ?, 1, ?)",
+            (str(self.source), str(worktree), loop_manager.GUIDANCE_BLOCK_REASON))
+        self.connection.execute("UPDATE projects SET phase = 'PLAN_BLOCKED', agent_result_snapshot = ?, "
+            'agent_manager_snapshot = ?', (self.before.serialize(),
+            loop_manager.ManagerGitCheckpoint(self.before, frozenset()).serialize()))
+        loop_manager.blocked_checkpoint_state.BlockedCheckpointRepository(self.connection).request(
+            repo=str(self.source), plan_id='G-092', reason_code=loop_manager.GUIDANCE_BLOCK_REASON,
+            evidence='guidance', branch='loop-manager/G-092', worktree=str(worktree),
+            expected_remote_oid=None, rebase_recovery=False)
+        with mock.patch.object(loop_manager, 'capture_git_snapshot', side_effect=lambda *_: self.current), \
+                mock.patch.object(loop_manager, '_config_entries', return_value={}), \
+                mock.patch.object(loop_manager, '_agent_git_resources', return_value=None), \
+                mock.patch.object(loop_manager, '_owned_checkpoint_remote_oid', return_value='owned'), \
+                mock.patch.object(loop_manager, '_published_plan_allows_common_plans', return_value=False), \
+                mock.patch.object(loop_manager, 'requirement_archive_candidates', return_value=()):
+            loop_manager.validate_persisted_agent_scope(self.connection, self.source, self.state, str(self.source))
+            self.current = replace(self.current, refs={**self.current.refs, 'refs/tags/foreign': ('foreign', '')})
+            with self.assertRaises(loop_manager.AgentScopeError):
+                loop_manager.validate_persisted_agent_scope(self.connection, self.source, self.state, str(self.source))
 
     def prepare_project(self, worktree):
         self.connection.execute(loop_manager.SCHEMA)
@@ -2223,10 +2315,14 @@ class ManagerBaselineReconciliationUnitTests(unittest.TestCase):
         self.current = replace(self.before, refs={**self.before.refs, self.ref: ('b' * 40, '')})
         self.record_fetch()
         result = self.current
+        self.prepare_project(Path('/managed'))
+        with mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=result), \
+                mock.patch.object(loop_manager, '_owned_rebase_state_dir', return_value=self.state), \
+                mock.patch.object(loop_manager, '_agent_git_resources', return_value=None):
+            loop_manager.begin_agent_scope(self.connection, str(self.source), Path('/managed'), 'worker')
         self.record_fetch(before_oid='b' * 40, target_oid='c' * 40)
         self.current = replace(self.current, refs={**self.current.refs, self.ref: ('c' * 40, '')})
         worktree = Path('/managed')
-        self.prepare_project(worktree)
         self.connection.execute('INSERT INTO exec_plans '
             '(repo, plan_id, path, title, sources, depends_on, priority, content_hash, status, '
             'branch, worktree, workspace_owned, agent_role, agent_snapshot, agent_result_snapshot) '

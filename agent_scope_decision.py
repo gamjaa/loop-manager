@@ -7,6 +7,7 @@ This module only compares already captured snapshots and describes checks to run
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import hashlib
 from typing import Mapping, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -66,8 +67,43 @@ def reconcile_manager_metadata(snapshot: GitSnapshot, current: GitSnapshot, *,
     if resources is not None:
         refs &= resources.refs
         worktrees &= resources.worktrees
+    # A symbolic ref's OID is derived from its target. Carry that OID only
+    # when the unchanged target itself has an operation-proven transition.
+    refs |= frozenset(key for key, previous in snapshot.refs.items()
+        if previous[1] in refs
+        and previous == (snapshot.refs.get(previous[1], (None, ''))[0], previous[1])
+        and current.refs.get(key) == (current.refs.get(previous[1], (None, ''))[0], previous[1]))
     return replace(snapshot, refs=advance(snapshot.refs, current.refs, refs),
                    worktrees=advance(snapshot.worktrees, current.worktrees, worktrees))
+
+
+def manager_comparison_baseline(original: GitSnapshot, comparison: GitSnapshot,
+                                saved: dict, role: str) -> GitSnapshot:
+    """Read the proven metadata at invocation start without moving local work."""
+    baseline = saved.get('manager_metadata_agent_baseline')
+    if baseline is None:
+        return comparison
+    if not isinstance(baseline, dict):
+        raise ScopeDecisionError('Manager metadata Agent 기준선이 유효하지 않습니다.')
+    if (baseline.get('role') != role
+            or baseline.get('original') != hashlib.sha256(original.serialize().encode()).hexdigest()):
+        return comparison
+    try:
+        effective = type(original).deserialize(baseline['snapshot'])
+    except (KeyError, TypeError, ValueError, RuntimeError) as error:
+        raise ScopeDecisionError('Manager metadata Agent snapshot이 유효하지 않습니다.') from error
+    def advance(previous, observed, at_start):
+        updated = dict(observed)
+        for key in previous.keys() | at_start.keys():
+            if previous.get(key) != at_start.get(key) and observed.get(key) == previous.get(key):
+                if key in at_start:
+                    updated[key] = at_start[key]
+                else:
+                    updated.pop(key, None)
+        return updated
+    return replace(comparison,
+        refs=advance(original.refs, comparison.refs, effective.refs),
+        worktrees=advance(original.worktrees, comparison.worktrees, effective.worktrees))
 
 
 @dataclass(frozen=True)
@@ -190,6 +226,10 @@ def blocked_agent_local_baseline(
 ) -> GitSnapshot:
     if not all(snapshot.shared_metadata_complete for snapshot in (before, result, current)):
         raise ScopeDecisionError("저장된 BLOCKED Agent Git metadata 기준 snapshot이 없습니다.")
+    flagged_paths = sorted(path for path in before.index.keys() | current.index.keys()
+        if index_security_flags(before.index.get(path, ())) != index_security_flags(current.index.get(path, ())))
+    if flagged_paths:
+        raise ScopeDecisionError('BLOCKED index flags 변경: ' + ', '.join(flagged_paths[:8]))
     new_local_changes: set[str] = set()
     for state_name, before_state, result_state, current_state in (
         ("index", before.index, result.index, current.index),

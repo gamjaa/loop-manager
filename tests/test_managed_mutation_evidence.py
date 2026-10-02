@@ -137,7 +137,7 @@ class ManagedTransitionTests(unittest.TestCase):
                 )
             transitions.assert_called_with(
                 Path('/state'), str(Path('/repo').resolve()), 'plan:G-091',
-                git=loop_manager.git,
+                git=loop_manager.git, kind='managed_worktree_create', target='/worktree',
             )
 
     def test_rebase_continuation_accepts_only_proven_worker_correction(self):

@@ -201,6 +201,60 @@ class PersistedScopeDecisionTests(unittest.TestCase):
         self.assertNotIn('refs/heads/other', isolated.refs)
         self.assertNotIn('/cleanup', isolated.worktrees)
 
+    def test_proven_fetch_updates_derived_symbolic_oid_but_never_symbolic_target(self):
+        ref, alias = 'refs/remotes/origin/main', 'refs/remotes/origin/HEAD'
+        before = snapshot(refs={ref: ('a', ''), alias: ('a', ref)})
+        current = replace(before, refs={ref: ('b', ''), alias: ('b', ref)})
+        effective = decision.reconcile_manager_metadata(before, current,
+            refs=frozenset({ref}), worktrees=frozenset())
+        self.assertEqual(effective.refs, current.refs)
+        runtime = '/runtime'
+        current = replace(current, worktrees={**current.worktrees,
+            runtime: ('HEAD=b', 'detached=True')})
+        self.assertEqual(decide(effective, current, manager_runtime=(runtime, 'b')).checks[0].before.refs,
+                         current.refs)
+        for symbolic in (('b', 'refs/remotes/origin/other'), ('foreign', ref)):
+            changed = replace(current, refs={**current.refs, alias: symbolic})
+            effective = decision.reconcile_manager_metadata(before, changed,
+                refs=frozenset({ref}), worktrees=frozenset())
+            self.assertEqual(effective.refs[alias], before.refs[alias])
+
+    def test_blocked_current_flags_must_be_restored_before_local_baseline_adoption(self):
+        before = snapshot(index={'app.py': ('H 100644 blob 0',)})
+        flagged = replace(before, index={'app.py': ('S 100644 blob 0',)})
+        with self.assertRaisesRegex(decision.ScopeDecisionError, 'index flags'):
+            decide(before, flagged, phase='PLAN_BLOCKED', result=flagged)
+        check, = decide(before, before, phase='PLAN_BLOCKED', result=flagged).checks
+        self.assertEqual(check.before.index, before.index)
+
+    def test_post_agent_checkpoint_refs_are_allowed_only_by_explicit_manager_proof(self):
+        before = snapshot()
+        ref = 'refs/remotes/origin/loop-manager/G-051'
+        current = replace(before, refs={**before.refs, ref: ('a', '')})
+        checkpoint = ManagerGitCheckpoint(before, frozenset())
+        checks = decide(before, current, checkpoint=checkpoint,
+                        manager_refs=frozenset({ref})).checks
+        self.assertFalse(checks[0].allowed_refs)
+        self.assertEqual(checks[-1].allowed_refs, frozenset({ref}))
+
+    def test_resumed_manager_metadata_start_is_bound_to_original_scope_and_role(self):
+        import hashlib
+        ref = 'refs/remotes/origin/main'
+        before = snapshot(refs={ref: ('a', '')})
+        effective = replace(before, refs={ref: ('b', '')}, dirty={'app.py': (('unstaged',), 'ignored-local')})
+        saved = {'manager_metadata_agent_baseline': {
+            'original': hashlib.sha256(before.serialize().encode()).hexdigest(),
+            'role': 'worker', 'snapshot': effective.serialize()}}
+        comparison = decision.manager_comparison_baseline(before, before, saved, 'worker')
+        self.assertEqual(comparison.refs, effective.refs)
+        self.assertEqual(comparison.dirty, before.dirty)
+        self.assertEqual(decision.manager_comparison_baseline(before, before, saved, 'reviewer'), before)
+        changed = replace(before, scope_id='other-invocation')
+        self.assertEqual(decision.manager_comparison_baseline(changed, changed, saved, 'worker'), changed)
+        saved['manager_metadata_agent_baseline']['snapshot'] = 'malformed'
+        with self.assertRaisesRegex(decision.ScopeDecisionError, 'snapshot'):
+            decision.manager_comparison_baseline(before, before, saved, 'worker')
+
 
 class ConflictIndexScopeTests(unittest.TestCase):
     def setUp(self):

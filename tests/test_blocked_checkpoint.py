@@ -650,10 +650,14 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
         self.assertEqual(checkpoint.phase.value, 'published')
         snapshot = self.connection.execute('SELECT agent_snapshot FROM exec_plans').fetchone()[0]
         successor = self.user_commit(path, document(decision='approve', revision='user-1'))
-        (self.repo / 'dependency.py').write_text('dependency = True\n', encoding='utf-8')
-        self.run_git(self.repo, 'add', 'dependency.py')
-        self.run_git(self.repo, 'commit', '-m', 'Advance base after guidance checkpoint')
-        self.run_git(self.repo, 'push', 'origin', 'main')
+        upstream = Path(self.temporary.name) / 'base-writer'
+        self.run_git(self.repo, 'clone', str(self.remote), str(upstream))
+        self.run_git(upstream, 'config', 'user.name', 'User')
+        self.run_git(upstream, 'config', 'user.email', 'user@example.com')
+        (upstream / 'dependency.py').write_text('dependency = True\n', encoding='utf-8')
+        self.run_git(upstream, 'add', 'dependency.py')
+        self.run_git(upstream, 'commit', '-m', 'Advance base after guidance checkpoint')
+        self.run_git(upstream, 'push', 'origin', 'main')
         project = self.connection.execute('SELECT * FROM projects').fetchone()
         loop_manager.observe_blocked_plan_remotes(self.connection, self.repo, repo, project)
         original_resume = loop_manager.resume_guidance_approval_if_decided
