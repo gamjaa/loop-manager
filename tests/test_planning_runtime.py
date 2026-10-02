@@ -16,7 +16,7 @@ from loop_manager_internal.maintenance import maintenance_file_review
 from loop_manager_internal.maintenance import maintenance_findings
 from loop_manager_internal.maintenance import maintenance_reconciliation
 from loop_manager_internal.maintenance.maintenance_file_inventory import RootPlacement, TrackedSource
-from tests.test_maintenance_file_review import result_for
+from tests.support.maintenance import result_for
 from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot, mutable_snapshot_token
 from loop_manager_internal.maintenance.maintenance_orchestration import maintenance_planning_fingerprint
 from loop_manager_internal.planning.planning_runtime import (

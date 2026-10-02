@@ -5,12 +5,12 @@ import unittest
 from loop_manager_internal.catalog import requirement_archive as archive
 from loop_manager_internal.storage import requirement_archive_state as state
 from loop_manager_internal.storage import runtime_state
-from tests import test_runtime_state
+from tests.support.database import runtime_connection
 
 
 class ArchiveTargetRepositoryTests(unittest.TestCase):
     def setUp(self):
-        self.connection = test_runtime_state.RuntimeStateRepositoryTest()._connection()
+        self.connection = runtime_connection()
         self.addCleanup(self.connection.close)
         self.runtime = runtime_state.RuntimeStateRepository(self.connection)
         self.runtime.activate('repo', 'G-047', activation_sha='base',

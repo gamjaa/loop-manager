@@ -1284,7 +1284,7 @@ class FileReviewLedgerTest(unittest.TestCase):
         )
 
     def root_results(self, inventory):
-        from tests.test_maintenance_file_review import root_results_for
+        from tests.support.maintenance import root_results_for
         return root_results_for(self.repo, inventory)
 
     def record(self, inventory, reviewed):
@@ -1570,7 +1570,7 @@ class FileReviewLedgerTest(unittest.TestCase):
     def test_file_publication_requires_complete_reviews_and_accepts_empty_inventory(self):
         self.write("docs/PRODUCT.md", b"# Product\n")
         empty_revision = self.publish()
-        from tests.test_maintenance_file_review import review, root_results_for
+        from tests.support.maintenance import review, root_results_for
         provisional = review.ProvisionalReviewRepository(self.connection)
         inventory = self.inventory(empty_revision)
         source = maintenance_file_ledger.root_review_source(self.repo, inventory)

@@ -523,7 +523,7 @@ class CheckpointAssessmentTests(unittest.TestCase):
 class CurrentRebaseBoundaryTests(unittest.TestCase):
     def test_original_owned_head_can_start_without_receipt_or_original_commit_list(self):
         from dataclasses import replace
-        from tests.test_managed_rebase_validation import expectation, observation, decision_for
+        from tests.support.rebase_observations import expectation, observation, decision_for
         from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
         expected = expectation()
         original = observation(expected, head='before', branch_ref=('before', ''),
@@ -535,7 +535,7 @@ class CurrentRebaseBoundaryTests(unittest.TestCase):
 
     def test_autostash_restoration_waits_and_other_operations_are_rejected(self):
         from dataclasses import replace
-        from tests.test_managed_rebase_validation import expectation, observation, decision_for
+        from tests.support.rebase_observations import expectation, observation, decision_for
         from loop_manager_internal.git.managed_rebase_validation import RebaseStatus, IndexEntry
         expected = expectation(autostash_oid='owned-stash')
         pending = observation(expected, index_clean=False,

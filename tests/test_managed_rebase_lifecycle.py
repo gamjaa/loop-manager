@@ -3,13 +3,13 @@
 Git, journal, stage validation, correction turns, checkpoint recovery and phase
 handlers are real. Agent CLI and catalog services use deterministic fixtures.
 """
+from tests.support.execution import execution_fixture
 
 from contextlib import nullcontext
 from dataclasses import replace
 import os
 from pathlib import Path
 import sqlite3
-from types import SimpleNamespace
 import subprocess
 from tempfile import TemporaryDirectory
 import unittest
@@ -24,7 +24,7 @@ import loop_manager as lm
 from loop_manager_internal.git import manager_git_journal as journal
 from loop_manager_internal.storage import runtime_state
 from loop_manager_internal.execution.worker_session import SessionBinding
-from tests import test_execution_handlers as policy_fixture
+from tests.support import execution as policy_fixture
 
 
 class SimulatedProcessExit(BaseException):
@@ -96,9 +96,7 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
         # Reuse only the deterministic service bundle, not the policy fixture's
         # substituted Manager rebase methods or its substituted journal writer.
         real_begin = journal.begin_rebase
-        fixture = policy_fixture.ExecutionHandlerTests()
-        fixture.setUp()
-        self.addCleanup(fixture.doCleanups)
+        fixture = execution_fixture(self)
         with TemporaryDirectory() as directory, mock.patch.object(journal, 'begin_rebase', real_begin):
             root = Path(directory)
             repo, remote, state_dir = root / 'repo', root / 'remote.git', root / 'state'

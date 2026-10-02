@@ -267,10 +267,9 @@ class ManagerGitTransitionTests(unittest.TestCase):
             )
 
 
-
 class CurrentRebaseAuditTests(unittest.TestCase):
     def test_current_observation_preserves_old_result_without_fabricating_receipts(self):
-        from tests.test_managed_rebase_validation import decision_for
+        from tests.support.rebase_observations import decision_for
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)
             token = journal.begin_rebase(state, owner='plan:G-108', repo='/repo',

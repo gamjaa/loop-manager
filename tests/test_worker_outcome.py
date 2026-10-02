@@ -1,6 +1,6 @@
 """Narrow tests for the Worker disposition contract."""
+from tests.support.worker import decision
 
-import json
 import sqlite3
 import tempfile
 import unittest
@@ -9,7 +9,7 @@ from unittest import mock
 
 import loop_manager
 from loop_manager_internal.notifications import notifications
-from tests import test_runtime_state
+from tests.support.database import runtime_connection
 from loop_manager_internal.execution.worker_outcome import (
     WorkerOutcomeError, parse_worker_outcome, worker_outcome_instruction,
 )
@@ -28,19 +28,6 @@ def parse(message):
         message, plan_path=PLAN, sources=("docs/PRODUCT.md",),
         documents=DOCUMENTS,
     )
-
-
-def decision(**changes):
-    value = {
-        "kind": "needs_user_decision",
-        "problem": "설계 승인이 필요함",
-        "proposal": "실행 경계 변경",
-        "locations": [{"path": "docs/ARCHITECTURE.md",
-                       "section": "Architecture Change Policy"}],
-        "question": "이 변경을 승인합니까?",
-    }
-    value.update(changes)
-    return "WORKER_OUTCOME: " + json.dumps(value, ensure_ascii=False)
 
 
 class WorkerOutcomeTests(unittest.TestCase):
@@ -99,7 +86,7 @@ class WorkerOutcomeTests(unittest.TestCase):
                 parse(message)
 
     def test_user_decision_release_ignores_unrelated_review_changes(self):
-        source = test_runtime_state.RuntimeStateRepositoryTest()._connection()
+        source = runtime_connection()
         self.addCleanup(source.close)
         source.execute(
             "UPDATE exec_plans SET status = 'PLAN_BLOCKED', "
@@ -174,7 +161,7 @@ class WorkerOutcomeTests(unittest.TestCase):
         self.assertIn('local only (rebase unresolved)', message)
 
     def test_resumed_worker_scope_rebinds_remote_input_without_losing_snapshot(self):
-        connection = test_runtime_state.RuntimeStateRepositoryTest()._connection()
+        connection = runtime_connection()
         self.addCleanup(connection.close)
         connection.execute(
             "UPDATE projects SET agent_role = 'worker', agent_snapshot = 'saved', "

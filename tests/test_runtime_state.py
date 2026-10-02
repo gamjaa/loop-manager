@@ -1,3 +1,5 @@
+from tests.support.runtime import runtime_rebase_fixture
+from tests.support.database import runtime_connection
 import dataclasses
 from pathlib import Path
 import sqlite3
@@ -8,38 +10,17 @@ import loop_manager
 from loop_manager_internal.notifications import notifications
 from loop_manager_internal.storage import runtime_state
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
-from tests.test_managed_rebase_validation import decision_for, expectation, observation
+from tests.support.rebase_observations import decision_for, observation
 from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason, decide
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 
 
 class CurrentRebaseRuntimeTests(unittest.TestCase):
-    def fixture(self, *, legacy=False):
-        connection = RuntimeStateRepositoryTest()._connection()
-        self.addCleanup(connection.close)
-        runtime = runtime_state.RuntimeStateRepository(connection)
-        runtime.activate('repo', 'G-047', activation_sha='old-base',
-                         branch='loop-manager/G-047', worktree='/owned')
-        runtime.reserve_workspace('repo', 'G-047', reserved_value=1, allowed_values=(1,))
-        current = runtime.projected('repo')
-        checkpoint = ExecutionCheckpointRepository(connection)
-        if not legacy:
-            checkpoint.record(
-                'repo', 'G-047', expected_generation=0, operation='rebase',
-                expected_head='before', target_base_oid='base', observed_remote_oid='remote',
-                snapshot={'old_journal': 'failed-audit', 'stage_evidence': {'tree': 'old'}},
-            )
-        expected = expectation(repo='repo', plan_id=current.plan_id, plan_path=current.path,
-                               branch=current.branch, worktree=current.worktree,
-                               generation=checkpoint.get('repo', 'G-047').generation,
-                               remote=dataclasses.replace(expectation().remote, branch=current.branch))
-        decision = decision_for(expected, observation(expected))
-        return connection, runtime, checkpoint, current, expected, decision
 
     def test_current_acceptance_is_atomic_idempotent_and_never_execution_proof(self):
         for legacy in (False, True):
             with self.subTest(legacy=legacy):
-                connection, runtime, checkpoint, original, expected, decision = self.fixture(legacy=legacy)
+                connection, runtime, checkpoint, original, expected, decision = runtime_rebase_fixture(self, legacy=legacy)
                 result = runtime.complete_rebase(
                     original, checkpoint, acceptance=decision.acceptance,
                     project_values={'phase': 'WORKING'}, reobserve=lambda: decision,
@@ -78,7 +59,7 @@ class CurrentRebaseRuntimeTests(unittest.TestCase):
         for stage in ('after_rebase_acceptance', 'after_execplan_update',
                       'after_project_update', 'after_outbox_enqueue'):
             with self.subTest(stage=stage):
-                connection, runtime, checkpoint, original, _expected, decision = self.fixture()
+                connection, runtime, checkpoint, original, _expected, decision = runtime_rebase_fixture(self)
                 notifications.configure_session(connection, enabled=True)
                 connection.commit()
                 before_checkpoint = checkpoint.get('repo', 'G-047')
@@ -108,7 +89,7 @@ class CurrentRebaseRuntimeTests(unittest.TestCase):
         for drift in ('generation', 'remote', 'files', 'inputs', 'scope', 'ownership',
                       'project_projection', 'recheck_checkpoint'):
             with self.subTest(drift=drift):
-                connection, runtime, checkpoint, original, expected, decision = self.fixture()
+                connection, runtime, checkpoint, original, expected, decision = runtime_rebase_fixture(self)
                 before = checkpoint.get('repo', 'G-047')
                 reobserve = lambda: decision
                 if drift == 'generation':
@@ -144,7 +125,7 @@ class CurrentRebaseRuntimeTests(unittest.TestCase):
                 self.assertEqual(checkpoint.get('repo', 'G-047'), baseline)
 
     def test_current_acceptance_cannot_publish_clear_blocks_or_fake_journal(self):
-        _connection, runtime, checkpoint, original, _expected, decision = self.fixture()
+        _connection, runtime, checkpoint, original, _expected, decision = runtime_rebase_fixture(self)
         for arguments in (
             {'reobserve': None}, {'completion': {'id': 'made-up'}},
             {'published_proof': {'journal_id': 'made-up'}},
@@ -161,7 +142,7 @@ class CurrentRebaseRuntimeTests(unittest.TestCase):
                     runtime.complete_rebase(original, checkpoint, **kwargs)
 
     def test_current_acceptance_preserves_unrelated_block_and_failure_audit(self):
-        connection, runtime, checkpoint, original, _expected, decision = self.fixture()
+        connection, runtime, checkpoint, original, _expected, decision = runtime_rebase_fixture(self)
         blocked = runtime.transition_from_snapshot(
             original, plan_values={'status': 'PLAN_BLOCKED', 'blocked_reason': 'agent_scope',
                                     'last_error': 'existing failure'},
@@ -183,7 +164,7 @@ class CurrentRebaseRuntimeTests(unittest.TestCase):
 
 class RuntimeStateRepositoryTest(unittest.TestCase):
     def test_planning_error_release_rolls_back_with_incident_on_interruption(self):
-        connection = self._connection()
+        connection = runtime_connection()
         self.addCleanup(connection.close)
         notifications.configure_session(connection, enabled=True)
         repository = runtime_state.RuntimeStateRepository(connection)
@@ -230,7 +211,7 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
         ).fetchone()[0])
 
     def test_recovery_slot_waits_for_preserved_planning_attempt(self):
-        connection = self._connection()
+        connection = runtime_connection()
         self.addCleanup(connection.close)
         repository = runtime_state.RuntimeStateRepository(connection)
         for values in (
@@ -260,7 +241,7 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
         self.assertTrue(repository.recovery_slot_available('repo'))
 
     def test_activation_projects_owned_checkpoint_remote_oid(self):
-        connection = self._connection()
+        connection = runtime_connection()
         self.addCleanup(connection.close)
         connection.execute(
             "UPDATE exec_plans SET publication_remote_oid = ? "
@@ -280,7 +261,7 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
     def test_blocked_requeue_discards_stale_worker_profile_target(self):
         from loop_manager_internal.execution.worker_session import SessionBinding, SessionTransition
 
-        connection = self._connection()
+        connection = runtime_connection()
         self.addCleanup(connection.close)
         old = SessionBinding('codex', 'old', 'low')
         target = SessionBinding('codex', 'escalated', 'high')
@@ -309,7 +290,7 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
     def test_activation_clears_stale_ready_session_transition(self):
         from loop_manager_internal.execution.worker_session import SessionBinding, SessionTransition
 
-        connection = self._connection()
+        connection = runtime_connection()
         self.addCleanup(connection.close)
         old = SessionBinding('codex', 'old', 'low')
         target = SessionBinding('codex', 'other', 'high')
@@ -337,7 +318,7 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
     def test_conflict_requeue_keeps_bound_session_but_drops_pending_target(self):
         from loop_manager_internal.execution.worker_session import SessionBinding, SessionTransition
 
-        connection = self._connection()
+        connection = runtime_connection()
         self.addCleanup(connection.close)
         old = SessionBinding('codex', 'old', 'low')
         target = SessionBinding('codex', 'escalated', 'high')
@@ -370,7 +351,7 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
         from loop_manager_internal.execution.worker_session import SessionBinding, decide_session
         from loop_manager_internal.agents.agent_invocation import ResolvedProfile
 
-        connection = self._connection()
+        connection = runtime_connection()
         self.addCleanup(connection.close)
         repository = runtime_state.RuntimeStateRepository(connection)
         repository.activate('repo', 'G-047', activation_sha='base',
@@ -411,7 +392,7 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
         self.assertEqual(observed.worker_session_binding, pending.target.serialize())
 
     def test_nonfinal_recovery_decision_cannot_enter_block_transaction(self):
-        connection = self._connection()
+        connection = runtime_connection()
         repository = runtime_state.RuntimeStateRepository(connection)
         repository.activate(
             'repo', 'G-047', activation_sha='base',
@@ -470,41 +451,11 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
         connection.rollback()
         self.assertEqual(connection.execute("SELECT value FROM state").fetchall(), [(1,)])
 
-    def _connection(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(":memory:")
-        connection.row_factory = sqlite3.Row
-        connection.execute(loop_manager.SCHEMA)
-        loop_manager._ensure_execplans_schema(connection)
-        notifications.ensure_schema(connection)
-        connection.execute(
-            """
-            INSERT INTO projects (
-                repo, base_branch, provider, planning_fingerprint,
-                planning_attempt_fingerprint, phase
-            ) VALUES ('repo', 'main', 'codex', 'planning-kept',
-                      'planning-cleared', NULL)
-            """
-        )
-        connection.execute(
-            """
-            INSERT INTO exec_plans (
-                repo, plan_id, path, title, sources, depends_on, priority,
-                content_hash, status, plan_sha, active_sha, branch, worktree,
-                workspace_owned
-            ) VALUES (
-                'repo', 'G-047', 'docs/plans/[G-047] Runtime.md', 'Runtime',
-                '["docs/PRODUCT.md"]', '[]', 'normal', 'hash', 'READY',
-                'plan-sha', NULL, NULL, NULL, 1
-            )
-            """
-        )
-        connection.commit()
-        return connection
 
     def test_active_hydration_preserves_planner_scope_and_interrupted_attempt(self):
         for phase, attempt in (("PLANNING", None), (None, "saved-attempt")):
             with self.subTest(phase=phase, attempt=attempt):
-                connection = self._connection()
+                connection = runtime_connection()
                 self.addCleanup(connection.close)
                 connection.execute("UPDATE exec_plans SET status='IMPLEMENTING', branch='loop-manager/G-047', worktree='/worker' WHERE repo='repo'")
                 connection.execute("UPDATE projects SET phase=?, planning_attempt_fingerprint=?, worktree='/planner', agent_role='planner', agent_snapshot='planner-scope' WHERE repo='repo'", (phase, attempt))
@@ -515,7 +466,7 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
                 self.assertEqual(connection.execute("SELECT status FROM exec_plans WHERE repo='repo'").fetchone()[0], 'IMPLEMENTING')
 
     def test_active_hydration_resumes_worker_when_planner_does_not_own_slot(self):
-        connection = self._connection()
+        connection = runtime_connection()
         self.addCleanup(connection.close)
         connection.execute("UPDATE projects SET planning_attempt_fingerprint=NULL WHERE repo='repo'")
         connection.execute("UPDATE exec_plans SET status='IMPLEMENTING', branch='loop-manager/G-047', worktree='/worker' WHERE repo='repo'")
@@ -555,7 +506,7 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
         self.assertEqual(loop_manager.FIELDS, runtime_state.PROJECT_UPDATE_FIELDS)
 
     def test_planning_snapshot_is_typed_and_keeps_project_only_state(self):
-        connection = self._connection()
+        connection = runtime_connection()
         repository = runtime_state.RuntimeStateRepository(connection)
 
         snapshot = repository.planning("repo")
@@ -571,7 +522,7 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
             snapshot.phase = "PLANNING"
 
     def test_activation_update_hydrate_and_clear_round_trip_runtime_fields(self):
-        connection = self._connection()
+        connection = runtime_connection()
         repository = runtime_state.RuntimeStateRepository(connection)
 
         activated = repository.activate(
@@ -662,7 +613,7 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
         self.assertEqual(repository.get("repo", "G-047").status, "REVIEWING")
 
     def test_compatibility_wrappers_preserve_public_update_and_hydrate_contract(self):
-        connection = self._connection()
+        connection = runtime_connection()
         loop_manager.activate_ready_execplan(
             connection,
             "repo",
@@ -742,7 +693,7 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
         )
 
     def test_workspace_reservation_and_merge_are_repository_operations(self):
-        connection = self._connection()
+        connection = runtime_connection()
         repository = runtime_state.RuntimeStateRepository(connection)
         repository.update_plan(
             "repo",
@@ -811,7 +762,7 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
     def test_activation_rollback_restores_both_source_and_projection(self):
         for stage in ("after_execplan_update", "after_project_update"):
             with self.subTest(stage=stage):
-                connection = self._connection()
+                connection = runtime_connection()
 
                 def fail(current: str) -> None:
                     if current == stage:
@@ -851,7 +802,7 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
                 self.assertEqual(activated.status, "IMPLEMENTING")
 
     def test_expected_status_mismatch_rejects_second_activation(self):
-        connection = self._connection()
+        connection = runtime_connection()
         repository = runtime_state.RuntimeStateRepository(connection)
         repository.activate(
             "repo",
@@ -871,7 +822,7 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
         self.assertEqual(repository.get("repo", "G-047").active_sha, "active-sha")
 
     def test_stage_revision_tokens_are_snapshot_bound_and_projected_atomically(self):
-        connection = self._connection()
+        connection = runtime_connection()
         repository = runtime_state.RuntimeStateRepository(connection)
         original = repository.activate(
             "repo",
@@ -915,7 +866,7 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
     def test_outbox_failures_roll_back_source_projection_and_event(self):
         for stage in ("before_outbox_enqueue", "after_outbox_enqueue"):
             with self.subTest(stage=stage):
-                connection = self._connection()
+                connection = runtime_connection()
                 repository = runtime_state.RuntimeStateRepository(connection)
                 repository.activate(
                     "repo",

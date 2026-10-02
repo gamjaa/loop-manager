@@ -3,7 +3,6 @@ import contextlib
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-import sqlite3
 import unittest
 from unittest import mock
 
@@ -12,14 +11,12 @@ from loop_manager_internal.catalog import execplan_catalog as catalog
 from loop_manager_internal.storage import execplan_catalog_state as state
 import loop_manager as manager
 from loop_manager_internal.catalog import project_catalog_refresh as refresh
-from tests import test_execplan_catalog_state as fixtures
+from tests.support import catalog as fixtures
 
 
 class ProjectCatalogRefreshTest(unittest.TestCase):
     def setUp(self):
-        self.fixture = fixtures.CatalogReconciliationTest()
-        self.fixture.setUp()
-        self.addCleanup(self.fixture.tearDown)
+        self.fixture = fixtures.catalog_reconciliation_fixture(self)
         self.connection = self.fixture.connection
         self.repo = '/repo'
         self.sha = 'b' * 40
@@ -313,11 +310,8 @@ class ProjectCatalogRefreshTest(unittest.TestCase):
         catalog_call.assert_not_called()
 
     def test_blocked_recovery_validates_scope_before_fetch_and_catalog(self):
-        from tests import test_scoped_blocking as blocking_fixtures
-        fixture = blocking_fixtures.ProjectBlockedRemoteRecoveryTests()
-        fixture.setUp()
-        self.addCleanup(fixture.doCleanups)
-        self.addCleanup(fixture.tearDown)
+        from tests.support.blocked_remote import project_blocked_remote_fixture
+        fixture = project_blocked_remote_fixture(self)
         coordinator = fixture.coordinator
         events = []
         fixture.ports._recorded_base_fetch.side_effect = lambda *a, **k: events.append('fetch')
@@ -629,16 +623,13 @@ class ProjectCatalogRefreshTest(unittest.TestCase):
         import subprocess
         import sys
         import tempfile
-        from tests import test_loop_manager as manager_tests
+        from tests.support.git import prepare_manager_import_fixture
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            fixture = manager_tests.AgentScopeValidatorTest(
-                'test_planner_import_bytecode_is_ignored_without_hiding_scope_violations')
-            with (mock.patch.object(fixture, '_repository_with_plan', return_value=(root, None)),
-                  mock.patch.object(manager_tests, 'commit_and_push',
-                                    side_effect=StopIteration('fixture copied')),
+            with (mock.patch('tests.support.git.commit_and_push',
+                             side_effect=StopIteration('fixture copied')),
                   self.assertRaisesRegex(StopIteration, '^fixture copied$')):
-                fixture.test_planner_import_bytecode_is_ignored_without_hiding_scope_violations()
+                prepare_manager_import_fixture(root)
             result = subprocess.run(
                 [sys.executable, '-I', '-B', '-c',
                  'import pathlib, sys; sys.path.insert(0, sys.argv[1]); '

@@ -1,8 +1,9 @@
+from tests.support.catalog import CatalogReconciliationFixture
+from tests.support.catalog import archived_entry, FakeDefinitionPort, active_snapshot
 import hashlib
 import json
 from pathlib import Path
 import sqlite3
-import tempfile
 import unittest
 from unittest import mock
 
@@ -10,32 +11,6 @@ from loop_manager_internal.catalog import execplan_catalog
 from loop_manager_internal.storage import execplan_catalog_state
 from loop_manager_internal.storage import maintenance_state
 import loop_manager
-
-
-def archived_entry(
-    plan_id: str = "G-001",
-    title: str = "Archived",
-    *,
-    text_suffix: str = "",
-) -> execplan_catalog.ExecPlanCatalogEntry:
-    text = f"""---
-id: {plan_id}
-title: {title}
-sources:
-  - docs/PRODUCT.md
-depends_on: []
-complexity: low
-risk: low
-priority: normal
----
-
-## Purpose
-
-Archived fixture.{text_suffix}
-"""
-    return execplan_catalog.snapshot_from_documents(
-        {f"docs/plans/archive/[{plan_id}] {title}.md": text}
-    ).archived[plan_id]
 
 
 class FakeMergeProof:
@@ -330,7 +305,6 @@ class ExecPlanCatalogStateTest(unittest.TestCase):
         self.assertEqual(result.diagnostics[0].code, "publication-proof-missing")
 
 
-
 class ArchivedDependencySelectionTest(unittest.TestCase):
     def setUp(self):
         self.connection = sqlite3.connect(":memory:")
@@ -527,151 +501,8 @@ class ArchivedDependencySelectionTest(unittest.TestCase):
             ).candidates, ())
 
 
+class CatalogReconciliationTest(CatalogReconciliationFixture, unittest.TestCase):
 
-class FakeDefinitionPort:
-    def __init__(self, pinned, revisions=None):
-        self.pinned = pinned
-        self.revisions = list(revisions or [pinned.revision_sha] * 8)
-
-    def load(self):
-        return self.pinned
-
-    def current_revision(self):
-        return self.revisions.pop(0)
-
-
-def active_snapshot(revision, documents):
-    snapshot = execplan_catalog.snapshot_from_documents(
-        documents, revision_sha=revision
-    )
-    return execplan_catalog_state.PinnedCatalog(
-        revision, snapshot, frozenset({"docs/PRODUCT.md"})
-    )
-
-
-class CatalogReconciliationTest(unittest.TestCase):
-    def setUp(self):
-        self.connection = sqlite3.connect(":memory:")
-        self.connection.row_factory = sqlite3.Row
-        self.connection.execute(loop_manager.SCHEMA)
-        loop_manager._ensure_execplans_schema(self.connection)
-        loop_manager.notifications.ensure_schema(self.connection)
-        self.connection.execute(
-            "INSERT INTO projects (repo, base_branch, phase, plan_path, "
-            "branch, worktree, worker_session_id, pr_url) "
-            "VALUES ('/repo', 'main', 'WORKING', ?, 'branch', '/worktree', "
-            "'project-worker', 'https://example/pr/1')",
-            ("docs/plans/[G-001] Old.md",),
-        )
-        self._insert(
-            "G-001", "Old", status="IMPLEMENTING", effective=8,
-            branch="branch", worktree="/worktree", workspace_owned=1,
-            worker_session="worker", reviewer_session="reviewer",
-            pr_url="https://example/pr/1", retry_count=4,
-        )
-        self._insert("G-002", "Dependency", status="MERGED")
-        self.connection.commit()
-        self.repository = execplan_catalog_state.DefinitionStateRepository(
-            self.connection
-        )
-
-    def tearDown(self):
-        self.connection.close()
-
-    def _insert(
-        self,
-        plan_id,
-        title,
-        *,
-        status,
-        effective=1,
-        branch=None,
-        worktree=None,
-        workspace_owned=0,
-        worker_session=None,
-        reviewer_session=None,
-        pr_url=None,
-        retry_count=0,
-    ):
-        path = f"docs/plans/[{plan_id}] {title}.md"
-        self.connection.execute(
-            """
-            INSERT INTO exec_plans (
-                repo, plan_id, path, title, sources, depends_on, priority,
-                content_hash, current_complexity, current_risk,
-                current_revision_sha, publication_path,
-                publication_content_hash, publication_sha, status, plan_sha,
-                initial_worker_level, effective_worker_level, retry_count,
-                branch, worktree, workspace_owned, worker_session_id,
-                reviewer_session_id, pr_url
-            ) VALUES ('/repo', ?, ?, ?, '["docs/PRODUCT.md"]', '[]',
-                      'normal', ?, 'low', 'low', ?, ?, ?, ?, ?, ?, 1, ?,
-                      ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                plan_id,
-                path,
-                title,
-                f"old-hash-{plan_id}",
-                "a" * 40,
-                path,
-                f"old-hash-{plan_id}",
-                "a" * 40,
-                status,
-                "a" * 40,
-                effective,
-                retry_count,
-                branch,
-                worktree,
-                workspace_owned,
-                worker_session,
-                reviewer_session,
-                pr_url,
-            ),
-        )
-
-    @staticmethod
-    def _text(
-        plan_id,
-        title,
-        *,
-        sources=("docs/PRODUCT.md",),
-        depends_on=(),
-        complexity="low",
-        risk="low",
-        priority="normal",
-        body="Body.",
-    ):
-        source_lines = "\n".join(f"  - {source}" for source in sources)
-        dependencies = "depends_on: []"
-        if depends_on:
-            dependencies = "depends_on:\n" + "\n".join(
-                f"  - {dependency}" for dependency in depends_on
-            )
-        return f"""---
-id: {plan_id}
-title: {title}
-sources:
-{source_lines}
-{dependencies}
-complexity: {complexity}
-risk: {risk}
-priority: {priority}
----
-
-## Purpose
-
-{body}
-"""
-
-    def _service(self, pinned, *, fault_hook=None, revisions=None):
-        repository = execplan_catalog_state.DefinitionStateRepository(
-            self.connection, fault_hook=fault_hook
-        )
-        return execplan_catalog_state.CatalogReconciliationService(
-            repository,
-            FakeDefinitionPort(pinned, revisions),
-        )
 
     def test_additive_migration_backfills_publication_audit_and_current_revision(self):
         connection = sqlite3.connect(":memory:")

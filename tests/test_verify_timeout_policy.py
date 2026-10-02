@@ -8,12 +8,12 @@ from unittest import mock
 import loop_manager
 from loop_manager_internal.storage import runtime_state
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
-from tests import test_runtime_state
+from tests.support.database import runtime_connection
 
 
 class VerifyTimeoutPolicyTests(unittest.TestCase):
     def test_worker_progress_evidence_blocks_only_its_plan(self):
-        connection = test_runtime_state.RuntimeStateRepositoryTest()._connection()
+        connection = runtime_connection()
         self.addCleanup(connection.close)
         repository = runtime_state.RuntimeStateRepository(connection)
         repository.activate(
@@ -48,7 +48,7 @@ class VerifyTimeoutPolicyTests(unittest.TestCase):
         self.assertIn('9 of 10 tests completed', detail)
 
     def test_repeated_unknown_timeout_uses_verify_retry_limit(self):
-        connection = test_runtime_state.RuntimeStateRepositoryTest()._connection()
+        connection = runtime_connection()
         self.addCleanup(connection.close)
         runtime_state.RuntimeStateRepository(connection).activate(
             'repo', 'G-047', activation_sha='base',
@@ -71,7 +71,7 @@ class VerifyTimeoutPolicyTests(unittest.TestCase):
         self.assertEqual(len({item.fingerprint for item in decisions}), 1)
 
     def test_higher_config_limit_resumes_same_workspace_at_verify(self):
-        connection = test_runtime_state.RuntimeStateRepositoryTest()._connection()
+        connection = runtime_connection()
         self.addCleanup(connection.close)
         repository = runtime_state.RuntimeStateRepository(connection)
         repository.activate(

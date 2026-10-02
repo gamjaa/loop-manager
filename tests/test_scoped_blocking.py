@@ -1,3 +1,6 @@
+from tests.support.rebase_block import RebaseBlockFixture, rebase_block_fixture
+from tests.support.blocked_remote import ProjectBlockedRemoteFixture
+from tests.support.blocked_remote import BlockedRemoteFixture
 import json
 from dataclasses import replace
 import sqlite3
@@ -51,98 +54,9 @@ class LegacyBlockedScopeUnitTests(unittest.TestCase):
             "SELECT 1 FROM sqlite_master WHERE name = 'exec_plans'").fetchone())
 
 
-class BlockedPlanRemoteRefreshTests(unittest.TestCase):
+class BlockedPlanRemoteRefreshTests(BlockedRemoteFixture, unittest.TestCase):
     """Coordinator unit tests: every Git/verify/Agent effect is a fake port."""
 
-    def setUp(self):
-        self.connection = sqlite3.connect(':memory:')
-        self.connection.row_factory = sqlite3.Row
-        self.addCleanup(self.connection.close)
-        self.connection.execute(loop_manager.SCHEMA)
-        loop_manager._ensure_execplans_schema(self.connection)
-        maintenance_state.ensure_schema(self.connection)
-        self.repo, self.base, self.head = 'repo', 'a' * 40, 'b' * 40
-        self.connection.execute("INSERT INTO projects (repo, base_branch, origin) VALUES ('repo', 'main', 'example/repo')")
-        for plan_id in ('G-106', 'G-107'):
-            self.connection.execute(
-                'INSERT INTO exec_plans (repo, plan_id, path, title, sources, depends_on, '
-                'content_hash, status, branch, worktree, workspace_owned, worker_session_id, '
-                'verify_failure_history, effective_worker_level, priority) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                (self.repo, plan_id, f'docs/plans/[{plan_id}] Work.md', 'Work', '[]', '[]', 'hash',
-                 'IMPLEMENTING', f'loop-manager/{plan_id}', f'/state/{plan_id}', 1, 'session', '{"failure":3}', 6, 'critical'))
-            runtime_state = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
-            runtime_state.block_plan(self.repo, plan_id, reason_code='verify_retry_exhausted',
-                                     evidence='original verify failure', release_fingerprint='input',
-                                     clear_projection=True)
-            self.connection.execute('UPDATE exec_plans SET blocked_fingerprint = ? WHERE plan_id = ?',
-                                    ('input', plan_id))
-            self.record_observation(plan_id)
-        self.signature = 'before'
-        self.ports = mock.Mock(spec=loop_manager)
-        self.ports.GUIDANCE_BLOCK_REASON = loop_manager.GUIDANCE_BLOCK_REASON
-        self.ports.PR_CLOSED_BLOCK_REASON = loop_manager.PR_CLOSED_BLOCK_REASON
-        self.ports.unmet_execplan_dependencies.return_value = []
-        self.ports.github_repository.return_value = 'example/repo'
-        self.ports.pr_for_branch.return_value = None
-        self.ports._blocked_execplan_metadata_error.return_value = None
-        self.ports._worktree_execplan_input_fingerprint.return_value = 'input'
-        self.ports._revision_execplan_input_fingerprint.return_value = 'input'
-        self.ports._worktree_state_signature.side_effect = lambda _: self.signature
-        self.ports.capture_git_snapshot.return_value = SimpleNamespace(
-            head=self.head, dirty={}, index={}, operations={})
-        self.ports.git.side_effect = self.git
-        self.ports._recorded_base_fetch.side_effect = self.recorded_fetch
-        self.ports._update_blocked_error.side_effect = loop_manager._update_blocked_error
-        self.ports._evaluate_remote_checkpoint_cause.return_value = (False, 'same failure', 'verify')
-        self.ports._current_rebase_service.return_value.require_owned.return_value = (
-            SimpleNamespace(head=self.head), SimpleNamespace(status=SimpleNamespace(value='complete')))
-        self.ports.observe_blocked_plan_remotes.side_effect = self.observe
-        self.ref_probe = mock.patch.object(blocked_remote_observation, 'observe_refs', return_value=(
-            blocked_remote_observation.RefObservation('present', self.base),
-            blocked_remote_observation.RefObservation('absent')))
-        self.ref_probe.start()
-        self.addCleanup(self.ref_probe.stop)
-        self.coordinator = blocked_plan_reconciliation.BlockedPlanReconciler(
-            self.ports, self.connection, Path('/repo'), Path('/state'), self.repo, 'main',
-            timeout_seconds=600)
-
-    def git(self, _, *args, **kwargs):
-        output = ''
-        if args[:2] == ('remote', 'get-url'):
-            output = 'https://example.test/example/repo'
-        elif args[:1] == ('rev-parse',):
-            output = self.base if args[1] == 'FETCH_HEAD^{commit}' else self.head
-        return SimpleNamespace(returncode=0, stdout=output)
-
-    def recorded_fetch(self, repo_path, state_dir, base, *, owner):
-        # The Git and journal adapter is a separate port. Preserve network
-        # failures and FETCH_HEAD pinning in the coordinator's fake fetch.
-        fetched = self.ports.git(repo_path, 'fetch', '--no-tags', '--refmap=', 'origin',
-                                 f'refs/heads/{base}', check=False)
-        if fetched.returncode:
-            raise RuntimeError(fetched.stdout)
-        return self.ports.git(repo_path, 'rev-parse', 'FETCH_HEAD^{commit}').stdout.strip()
-
-    def record_observation(self, plan_id='G-106'):
-        blocked_remote_observation.record(
-            self.connection, repo=self.repo, plan_id=plan_id,
-            registered_origin='example/repo', origin_url='https://example.test/example/repo',
-            base_ref='refs/heads/main', branch_ref=f'refs/heads/loop-manager/{plan_id}',
-            base=blocked_remote_observation.RefObservation('present', self.base),
-            branch=blocked_remote_observation.RefObservation('absent'),
-            blocked_reason='verify_retry_exhausted', blocked_fingerprint='input',
-            project_blocked_reason=None, project_blocked_fingerprint=None,
-            worktree_fingerprint=getattr(self, 'signature', 'before'))
-        self.connection.commit()
-
-    def observe(self, connection, repo_path, repo, project, *, plan_id):
-        self.record_observation(plan_id)
-
-    def plan(self, plan_id='G-106'):
-        return self.connection.execute('SELECT * FROM exec_plans WHERE plan_id = ?', (plan_id,)).fetchone()
-
-    def row(self):
-        return self.connection.execute("SELECT * FROM blocked_remote_observations WHERE plan_id = 'G-106'").fetchone()
 
     def test_other_worker_defers_without_losing_observation_or_projection(self):
         self.connection.execute("UPDATE exec_plans SET status = 'IMPLEMENTING' WHERE plan_id = 'G-107'")
@@ -938,28 +852,9 @@ class BlockedPlanRemoteRefreshTests(unittest.TestCase):
         self.assertEqual(self.connection.execute('SELECT phase FROM projects').fetchone()[0], 'PROJECT_BLOCKED')
 
 
-class ProjectBlockedRemoteRecoveryTests(unittest.TestCase):
+class ProjectBlockedRemoteRecoveryTests(ProjectBlockedRemoteFixture, unittest.TestCase):
     """Only mocked Git effects are executed by these project recovery tests."""
 
-    git = BlockedPlanRemoteRefreshTests.git
-    recorded_fetch = BlockedPlanRemoteRefreshTests.recorded_fetch
-    record_observation = BlockedPlanRemoteRefreshTests.record_observation
-    observe = BlockedPlanRemoteRefreshTests.observe
-    plan = BlockedPlanRemoteRefreshTests.plan
-    row = BlockedPlanRemoteRefreshTests.row
-
-    def setUp(self):
-        from loop_manager_internal.recovery import project_blocked_recovery
-        self.recovery = project_blocked_recovery
-        BlockedPlanRemoteRefreshTests.setUp(self)
-        self.connection.execute(
-            "INSERT INTO project_blocks (repo, scope, reason_code, plan_id, evidence, previous_phase) "
-            "VALUES ('repo', 'project', 'publication_ownership_uncertain', 'G-106', 'original project cause', 'PLAN_BLOCKED')")
-        self.connection.execute("UPDATE projects SET phase = 'PROJECT_BLOCKED', last_error = 'original project cause'")
-        self.connection.commit()
-        self.ports._BlockedCheckpointAdapter.return_value._origin_safety_error.return_value = None
-        self.coordinator = self.recovery.ProjectBlockedReconciler(
-            self.ports, self.connection, Path('/repo'), Path('/state'), self.repo, 'main')
 
     def test_other_active_or_projected_plan_and_planning_defer_all_git_writes(self):
         for update, reset in (
@@ -3519,7 +3414,7 @@ if __name__ == "__main__":
 class ScopeBaselineRecoveryUnitTests(unittest.TestCase):
     """Scope-only releases use in-memory state and read-only fake Git ports."""
     def setUp(self):
-        from tests.test_execution_handlers import current_rebase_case
+        from tests.support.current_rebase import current_rebase_case
         from loop_manager_internal.agents.agent_scope_decision import used_git_resources
         self.case = current_rebase_case(self)
         self.connection = self.case.fixture.connection
@@ -3770,80 +3665,9 @@ class ScopeBaselineRecoveryUnitTests(unittest.TestCase):
         self.assertTrue(self.checkpoints.get('repo', 'G-047').snapshot['scope_block_release_audit'])
 
 
-class EvidenceFreeRebaseBlockTests(unittest.TestCase):
+class EvidenceFreeRebaseBlockTests(RebaseBlockFixture, unittest.TestCase):
     """Real current-state decisions and SQLite transitions; no Git lifecycle."""
-    def setUp(self):
-        from tests.test_execution_handlers import current_rebase_case
-        self.case = current_rebase_case(self)
-        self.connection = self.case.fixture.connection
-        self.checkpoints = self.case.checkpoint
-        self.repo, self.plan_id = 'repo', 'G-047'
-        loop_manager._ensure_execplans_schema(self.connection)
-        self.connection.execute("UPDATE projects SET planning_attempt_fingerprint = NULL")
-        self.connection.execute("UPDATE exec_plans SET workspace_owned = 1")
-        self.connection.commit()
-        self.is_plan_block = True
-        def patch(*args, **kwargs):
-            patcher = mock.patch.object(*args, **kwargs)
-            value = patcher.start()
-            self.addCleanup(patcher.stop)
-            return value
-        self.factory = patch(loop_manager, '_current_rebase_service',
-            side_effect=lambda *_a, **_k: self.case.factory(None))
-        self.git_write = patch(loop_manager, 'git',
-            side_effect=AssertionError('recovery must not write or invoke Git directly'))
-        patch(loop_manager, 'operation_log')
 
-    def block(self, *, project=False, separate=None, reason=None):
-        self.is_plan_block = not project
-        reason = reason or ('repository_state_unsafe' if project else 'managed_worktree_conflict')
-        evidence = (rebase_block_reconciliation.LEGACY_COMPLETION_DIAGNOSTIC
-                    if project else 'G-088 repeated conflict with changed plan inputs')
-        with self.connection:
-            if project:
-                self.connection.execute("UPDATE projects SET phase = 'PROJECT_BLOCKED'")
-                self.connection.execute("INSERT INTO project_blocks "
-                    "(repo, scope, reason_code, plan_id, evidence, previous_phase) "
-                    "VALUES ('repo', 'project', ?, 'G-047', ?, 'WORKING')", (reason, evidence))
-            if not project or separate:
-                cause = separate or reason
-                self.connection.execute("UPDATE exec_plans SET status = 'PLAN_BLOCKED', "
-                    "blocked_reason = ?, last_error = 'original block text', "
-                    "blocked_fingerprint = 'old-input'", (cause,))
-                self.connection.execute("INSERT INTO execplan_blocks "
-                    "(repo, plan_id, scope, reason_code, evidence) "
-                    "VALUES ('repo', 'G-047', 'plan', ?, ?)",
-                    (cause, 'independent original cause' if separate else evidence))
-                if not project:
-                    self.connection.execute("UPDATE projects SET phase = 'PLAN_BLOCKED'")
-            subject = 'project' if project else 'plan:G-047'
-            self.connection.execute("INSERT INTO notified_block_incidents "
-                "(repo, subject, block_key, event_key, payload) VALUES ('repo', ?, 'block', 'event', '{}')",
-                (subject,))
-        return evidence
-
-    def resume(self):
-        if self.is_plan_block:
-            return loop_manager.resume_plan_blocks(self.connection, Path('/repo'), Path('/state'), 'repo', 'main')
-        return loop_manager.resume_project_block_if_safe(self.connection, Path('/repo'), Path('/state'), 'repo')
-
-    def snapshot(self):
-        return {table: [dict(row) for row in self.connection.execute('SELECT * FROM ' + table)]
-                for table in ('projects', 'exec_plans', 'execplan_blocks', 'project_blocks',
-                              'execution_checkpoints', 'recovery_records', 'notified_block_incidents')}
-
-    def pending(self, *, staged=False):
-        from dataclasses import replace
-        from loop_manager_internal.git.managed_rebase_validation import FileChange, IndexEntry
-        self.case.observed = replace(self.case.observed, head='partial', branch=None,
-            branch_ref=('before', ''), registration=('HEAD=partial', 'detached=True'),
-            branch_worktrees=(), operations=(('rebase-merge', 'operation'),),
-            metadata=(('head-name', 'refs/heads/loop-manager/G-047'),
-                      ('orig-head', 'before'), ('onto', 'base')),
-            index=(IndexEntry('app.py', '100644', 'manual', 0 if staged else 2,
-                              'H' if staged else 'M', 0 if staged else 0x2000),),
-            staged=(FileChange('app.py', '100644', '100644', 'old', 'manual', 'M'),) if staged else (),
-            index_clean=False)
 
     def test_changed_inputs_and_session_resume_manual_completion_without_recovery_history(self):
         self.block()
@@ -4096,8 +3920,7 @@ class EvidenceFreeRebaseBlockTests(unittest.TestCase):
                       'pull_request_closed', 'managed_worktree_scope_violation'):
             with self.subTest(cause=cause):
                 # One isolated fixture per cause, without inheriting unrelated tests.
-                case = EvidenceFreeRebaseBlockTests()
-                case.setUp()
+                case = rebase_block_fixture(self)
                 try:
                     case.block(project=True, separate=cause)
                     original = dict(scoped_blocking.plan_block(case.connection, 'repo', 'G-047'))
