@@ -13,6 +13,8 @@ from pathlib import Path
 import tempfile
 from uuid import uuid4
 
+from loop_manager_internal.git.manager_git_journal import _sync_directory
+
 
 class PlanningRebaseError(RuntimeError):
     pass
@@ -46,11 +48,7 @@ def _write(path: Path, record: dict[str, object]) -> None:
             temporary.unlink(missing_ok=True)
             raise
     os.replace(temporary, path)
-    directory = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
+    _sync_directory(path.parent)
 
 
 def _read(path: Path, repo: str, worktree: Path) -> dict[str, object] | None:
@@ -122,6 +120,18 @@ def _restored_digest(git, worktree: Path) -> str:
     return hashlib.sha256(repr(_restored_fingerprint(git, worktree)).encode()).hexdigest()
 
 
+def _apply_stash(git, worktree: Path, stash_sha: str):
+    applied = git(worktree, "stash", "apply", "--index", stash_sha, check=False)
+    if applied.returncode and not _git_ok(
+        git, worktree, "status", "--porcelain", "--untracked-files=all",
+    ):
+        # --index can reject its patch before merging worktree content. Retry
+        # only a clean checkout to expose three-way conflicts; the stash keeps
+        # both staged and unstaged originals for correction.
+        applied = git(worktree, "stash", "apply", stash_sha, check=False)
+    return applied
+
+
 def _matches_completed_stash_apply(
     git, repo_path: Path, state_dir: Path, worktree: Path, target: str,
     restored_head: str, stash_sha: str,
@@ -131,7 +141,7 @@ def _matches_completed_stash_apply(
         scratch = Path(directory) / "expected"
         _git_ok(git, repo_path, "worktree", "add", "--detach", str(scratch), restored_head)
         try:
-            applied = git(scratch, "stash", "apply", "--index", stash_sha, check=False)
+            applied = _apply_stash(git, scratch, stash_sha)
             if applied.returncode:
                 return None
             if _git_ok(git, worktree, "rev-parse", "HEAD") == target and restored_head != target:
@@ -232,6 +242,15 @@ def rebase_planning_worktree(
         _write(path, record)
         just_started_apply = True
 
+    if phase == "conflict" and stash is not None and not _git_ok(
+        git, worktree, "status", "--porcelain", "--untracked-files=all",
+    ):
+        # Recover journals written by an interrupted/rejected index restore
+        # that never produced unmerged entries or worktree changes.
+        record["phase"] = phase = "applying"
+        _write(path, record)
+        just_started_apply = True
+
     if phase == "applying":
         if stash is not None:
             # A crash after an apply begins cannot safely replay it over a
@@ -259,7 +278,7 @@ def rebase_planning_worktree(
                 record["restored_digest"] = _restored_digest(git, worktree)
                 _write(path, record)
                 return PlanningRebaseResult(target, True)
-            applied = git(worktree, "stash", "apply", "--index", stash[1], check=False)
+            applied = _apply_stash(git, worktree, stash[1])
             if applied.returncode:
                 record["phase"] = "conflict"
                 _write(path, record)

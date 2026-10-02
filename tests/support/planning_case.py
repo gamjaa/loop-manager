@@ -119,6 +119,9 @@ class FakeStatePort:
             project_blocked=False,
         )
 
+    def reconcile_catalog(self, *_args):
+        pass
+
     def planning(self, _repo):
         return self.snapshot
 

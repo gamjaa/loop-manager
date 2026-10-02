@@ -3543,6 +3543,7 @@ _PlanningStatePorts = _bind_effects(
         record_maintenance_publication_intent=lambda *args, **kwargs: record_maintenance_publication_intent(*args, **kwargs),
         recover_general_planning_batch=lambda *args, **kwargs: recover_general_planning_batch(*args, **kwargs),
         recover_maintenance_planning_batch=lambda *args, **kwargs: recover_maintenance_planning_batch(*args, **kwargs),
+        reconcile_execplan_catalog=lambda *args, **kwargs: reconcile_execplan_catalog(*args, **kwargs),
         register_execplans=lambda *args, **kwargs: register_execplans(*args, **kwargs),
         update_project=lambda *args, **kwargs: update_project(*args, **kwargs),
     ),

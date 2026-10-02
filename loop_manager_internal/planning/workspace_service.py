@@ -20,9 +20,9 @@ class PlanningWorkspaceService(PlanningService):
         self, run: _PlanningRun, worktree: Path, target: str, detail: str,
         collision_paths: tuple[str, ...] = (), stash_sha: str = "",
     ) -> bool:
-        unmerged = tuple(sorted(set(self._ports.git.run(
-            worktree, "ls-files", "-u", "--name-only",
-        ).stdout.splitlines())))
+        unmerged = tuple(sorted(filter(None, set(self._ports.git.run(
+            worktree, "diff", "--name-only", "--diff-filter=U", "-z",
+        ).stdout.split("\0")))))
         paths = tuple(sorted(set(unmerged) | set(collision_paths)))
         if not paths:
             return False
@@ -44,6 +44,12 @@ class PlanningWorkspaceService(PlanningService):
             "기존 계획 목표와 현재 원격 선언을 모두 확인하라.\n"
             + "\n".join(paths) + "\n" + detail
         )
+        if stash_sha:
+            prompt += (
+                "\n보존된 staged 원본은 "
+                f"`git show {stash_sha}^2:<경로>`, 최종 작업 원본은 "
+                f"`git show {stash_sha}:<경로>`로 확인하고 모두 보존해 해결하라."
+            )
         if collision_paths:
             prompt += (
                 "\n보존 stash의 untracked 파일이 원격의 같은 경로와 충돌했다. "
@@ -338,6 +344,18 @@ class PlanningWorkspaceService(PlanningService):
                     )
                     run.row = row
                     return self._operational_error()
+            # Reconcile even when SQLite already adopted this base before a
+            # crash. Snapshot authority must describe the remote catalog, not
+            # the Planner's dirty checkout or a superseded publication intent.
+            pending_intent = (
+                self._ports.state.general_publication(context.repo) is not None
+                or run.maintenance_planning
+                and run.maintenance_cycle.publication_stage == "prepared"
+            )
+            if not pending_intent:
+                self._ports.state.reconcile_catalog(
+                    context.repo, context.repo_path, context.base_branch, latest,
+                )
             run.base_sha = latest
             run.general_fingerprint = self._ports.git.input_fingerprint(
                 context.repo_path, latest,

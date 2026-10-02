@@ -70,6 +70,11 @@ Manager verify 피드백 6건에 따라 Windows verify에도 새 모듈을 등�
 
 현재 후보의 planning 선택·execution 실패 정책·verify 목록 unit test는 실패 원인 수정 후 동일 명령으로 38개 통과했다. snapshot·staged/unstaged 중단 복구·잠정 검토 재사용·source-only gate의 개별 회귀 6개도 새로 실행해 통과했다. `test_catalog_scheduling.py`의 통합 시나리오는 no-change 결과와 세션을 보존하는 일시 중단·다음 실행 기대값으로 갱신했으며 Manager 전체 verify에서 실행한다.
 
+
+재개 Worker는 현재 base 대비 최종 diff와 미해결 Review 3건을 다시 확인했다. journal 디렉터리 동기화는 기존 Windows 대응 helper를 재사용한다. staged index 복원이 변경 없이 실패하면 보존 stash에서 three-way 충돌을 만들고 같은 Planner 세션으로 해결하며, 이전 빈 conflict journal과 복원 직후 중단도 복구한다. 충돌 경로 조회는 Git이 지원하는 NUL 구분 diff로 교체했다. 미게시 intent를 대체한 뒤 최신 원격 catalog를 SQLite에 반영하고 READY snapshot을 생성하며, 같은 base의 유효한 prepared intent는 기존 catalog를 유지한다. catalog 경쟁은 planning 오류 지문을 오염시키지 않고 일시 중단한다.
+
+현재 후보에서 rebase·workspace 복구 unit test 36개, planning 선택·게시·execution 실패 정책·verify 목록·maintenance snapshot 52개, 후보·source-only gate·유지보수 근거 재사용 6개가 통과했다. 첫 명령에서 확인한 충돌 경로 Git 옵션 결함과 테스트 fixture 오류를 수정한 뒤 동일 명령을 재실행했다. Windows 분기는 플랫폼 모의 검증이며 실제 Windows 실행과 전체 verify·Review는 Manager에 남긴다.
+
 ## Decision Log
 
 - 2026-10-02: 사용자는 원격 전진을 어느 단계에서 관측하든 관리 작업을 rebase 후 이어가고, 단계별 관련 문서가 변경됐을 때만 재확인하도록 요청했다. Worker·Reviewer의 추가 문서 확인 대상은 현재 진행 중인 ExecPlan이다.

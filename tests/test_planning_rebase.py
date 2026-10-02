@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from loop_manager_internal.planning.planning_rebase import (
     PlanningRebaseError, accept_resolved_stash_conflict, complete_planning_rebase,
@@ -66,6 +67,25 @@ class PlanningGitDouble:
 
 
 class PlanningRebaseTest(unittest.TestCase):
+    def test_windows_journal_skips_directory_open(self):
+        from loop_manager_internal.planning import planning_rebase
+        from loop_manager_internal.git import manager_git_journal
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "journal.json"
+            sync = manager_git_journal._sync_directory
+
+            def windows_sync(parent):
+                with mock.patch.object(manager_git_journal, "os") as windows_os:
+                    windows_os.name = "nt"
+                    sync(parent)
+                    windows_os.open.assert_not_called()
+
+            with mock.patch.object(planning_rebase, "_sync_directory",
+                                   side_effect=windows_sync) as synced:
+                planning_rebase._write(path, {"phase": "stashed"})
+            synced.assert_called_once_with(path.parent)
+            self.assertEqual(path.read_text(), '{"phase": "stashed"}')
+
     def test_same_base_does_not_stash_or_move_candidate(self):
         git = PlanningGitDouble()
         with tempfile.TemporaryDirectory() as directory:
@@ -221,6 +241,92 @@ class PlanningDocumentRelevanceTest(unittest.TestCase):
 
 
 class PlanningRebaseGitBoundaryTest(unittest.TestCase):
+    def test_staged_overlap_becomes_resumable_conflict(self):
+        for interrupted in (False, True, "legacy"):
+            with self.subTest(interrupted=interrupted), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repository = root / "repo"
+                repository.mkdir()
+                armed = interrupted is True
+
+                def git(cwd, *args, check=True):
+                    nonlocal armed
+                    result = subprocess.run(
+                        ["git", *args], cwd=cwd, text=True,
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    )
+                    if check and result.returncode:
+                        raise RuntimeError(result.stdout)
+                    if armed and args[:2] == ("stash", "apply") and "--index" not in args:
+                        armed = False
+                        raise RuntimeError("interrupted after conflict")
+                    return result
+
+                git(repository, "init", "-b", "main")
+                git(repository, "config", "user.name", "Test")
+                git(repository, "config", "user.email", "test@example.com")
+                plan = "docs/plans/Plan.md"
+                (repository / plan).parent.mkdir(parents=True)
+                (repository / plan).write_text("base\n")
+                git(repository, "add", ".")
+                git(repository, "commit", "-m", "base")
+                old = git(repository, "rev-parse", "HEAD").stdout.strip()
+                worktree = root / "planning"
+                git(repository, "worktree", "add", "--detach", str(worktree), old)
+                (worktree / plan).write_text("local staged\n")
+                git(worktree, "add", plan)
+                (worktree / "untracked.txt").write_text("preserved\n")
+                (repository / plan).write_text("remote\n")
+                git(repository, "add", ".")
+                git(repository, "commit", "-m", "remote")
+                target = git(repository, "rev-parse", "HEAD").stdout.strip()
+                arguments = (git, repository, root / "state", str(repository), worktree, old, target)
+                if interrupted == "legacy":
+                    from loop_manager_internal.planning import planning_rebase
+                    with mock.patch.object(
+                        planning_rebase, "_apply_stash",
+                        side_effect=lambda runner, tree, sha: runner(
+                            tree, "stash", "apply", "--index", sha, check=False,
+                        ),
+                    ):
+                        self.assertTrue(rebase_planning_worktree(*arguments).conflict)
+                    self.assertEqual(git(worktree, "status", "--porcelain").stdout, "")
+                elif interrupted:
+                    with self.assertRaisesRegex(RuntimeError, "interrupted after conflict"):
+                        rebase_planning_worktree(*arguments)
+                result = rebase_planning_worktree(*arguments)
+                self.assertTrue(result.conflict)
+                self.assertIn(plan, git(worktree, "diff", "--name-only", "--diff-filter=U").stdout)
+                self.assertEqual(git(worktree, "show", result.stash_sha + "^2:" + plan).stdout,
+                                 "local staged\n")
+                from tests.support.planning_case import FakePorts, planning_snapshot
+                from loop_manager_internal.planning.workspace_service import PlanningWorkspaceService
+                ports = FakePorts(planning_snapshot(planner_session_id="saved-session"))
+                ports.git.run = git
+                ports.git.accept_resolved_stash_conflict = lambda repo, tree, revision: (
+                    accept_resolved_stash_conflict(git, root / "state", repo, tree, revision)
+                )
+                invoke = ports.agent.run_planner
+
+                def resolve(tree, prompt, session, callback):
+                    self.assertIn(result.stash_sha + "^2:", prompt)
+                    (tree / plan).write_text("remote\nlocal staged\n")
+                    return invoke(tree, prompt, session, callback)
+
+                ports.agent.run_planner = resolve
+                run = SimpleNamespace(
+                    maintenance_planning=False, row=ports.state.snapshot,
+                    context=SimpleNamespace(repo=str(repository)),
+                )
+                self.assertTrue(PlanningWorkspaceService(ports)._resolve_rebase_conflict(
+                    run, worktree, target, result.detail, result.conflict_paths, result.stash_sha,
+                ))
+                self.assertEqual(ports.agent.resumed_session, "saved-session")
+                self.assertFalse(rebase_planning_worktree(*arguments).conflict)
+                self.assertEqual((worktree / "untracked.txt").read_text(), "preserved\n")
+                complete_planning_rebase(git, root / "state", str(repository), worktree, target)
+                self.assertEqual(git(worktree, "stash", "list").stdout, "")
+
     def test_prepared_commit_and_dirty_index_survive_apply_and_reset_interruptions(self):
         for boundary in ("apply", "reset"):
             with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as directory:

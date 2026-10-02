@@ -152,6 +152,10 @@ class PlanningScopeResult:
 class PlanningStatePort(Protocol):
     """Durable planning and maintenance repository boundary."""
 
+    def reconcile_catalog(
+        self, repo: str, repository: Path, base_branch: str, revision: str,
+    ) -> None: ...
+
     def planning(self, repo: str) -> runtime_state.PlanningSnapshot: ...
 
     def maintenance_cycle(self, repo: str) -> maintenance_state.MaintenanceCycle: ...

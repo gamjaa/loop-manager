@@ -40,6 +40,113 @@ from tests.support.planning_case import (
 )
 
 class PlanningRecoveryTest(PlanningCase):
+    def test_rebased_workspace_refreshes_sqlite_catalog_before_ready_snapshot(self):
+        from tests.support.catalog import make_catalog_root, write_execplan
+        from tests.support.maintenance_planning_case import git
+        from loop_manager_internal.storage import database, runtime_state
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = make_catalog_root(str(root / "repo"))
+            git(repository, "init", "-b", "main")
+            git(repository, "config", "user.name", "Test")
+            git(repository, "config", "user.email", "test@example.com")
+            plan = write_execplan(repository, "G-001", "Unrelated")
+            git(repository, "add", ".")
+            git(repository, "commit", "-m", "base")
+            old = git(repository, "rev-parse", "HEAD").strip()
+            git(repository, "update-ref", "refs/remotes/origin/main", old)
+            connection = database.connect_database(root, create=True)
+            self.addCleanup(connection.close)
+            repo = str(repository)
+            connection.execute("INSERT INTO projects (repo, base_branch) VALUES (?, 'main')", (repo,))
+            connection.commit()
+            with mock.patch.object(loop_manager, "pr_for_branch", return_value=None):
+                loop_manager.reconcile_execplan_catalog(connection, repository, repo, "main")
+            state = loop_manager._PlanningStatePorts(
+                connection, runtime_state.RuntimeStateRepository(connection),
+                maintenance_state.MaintenanceRepository(connection), root,
+            )
+            original = plan.read_text()
+            plan.write_text(original.replace("Test plan.", "Remote acceptance change."))
+            git(repository, "add", ".")
+            git(repository, "commit", "-m", "remote")
+            latest = git(repository, "rev-parse", "HEAD").strip()
+            git(repository, "update-ref", "refs/remotes/origin/main", latest)
+            worktree = root / "planning"
+            git(repository, "worktree", "add", "--detach", str(worktree), latest)
+            candidate = write_execplan(worktree, "G-002", "Saved")
+            saved = candidate.read_bytes()
+            # An unpublished intent prevents outer catalog reconciliation;
+            # workspace adoption must supersede it before refreshing SQLite.
+            connection.execute(
+                "INSERT INTO general_planning_publications "
+                "(repo, stage, base_sha, commit_sha, snapshot_token, "
+                "specification_fingerprint, planning_fingerprint, manifest, manifest_hash) "
+                "VALUES (?, 'prepared', ?, ?, 'snapshot', 'spec', 'input', '[]', ?)",
+                (repo, old, old, hashlib.sha256(b"[]").hexdigest()),
+            )
+            connection.commit()
+            with self.assertRaises(PlanningResultInvalid):
+                loop_manager.mutable_ready_snapshot(connection, repo, worktree, latest)
+            for active in (old, latest):
+                with self.subTest(active=active):
+                    ports = FakePorts(planning_snapshot(
+                        repo=repo, phase="PLANNING", active_sha=active, worktree=str(worktree),
+                        planning_attempt_fingerprint="original-input", planning_workspace_owned=1,
+                        planner_session_id="saved-session", planning_result="saved result",
+                        planning_result_completed=True,
+                    ))
+                    ports.git.remote = latest
+                    ports.state.reconcile_catalog = state.reconcile_catalog
+                    ports.state.general_publication = state.general_publication
+                    ports.state.supersede_unpublished_general_intent = state.supersede_unpublished_general_intent
+                    ports.validation.prepare_general_context = (
+                        lambda repo, worktree, revision: loop_manager.mutable_ready_snapshot(
+                            connection, repo, worktree, revision,
+                        )
+                    )
+                    coordinator = PlanningLifecycleCoordinator(ports)
+                    context = replace(self.context, repo=repo, repo_path=repository, base_sha=latest)
+                    run = coordinator._new_run(context)
+                    self.assertIsNone(coordinator._workspace._prepare_workspace(run))
+                    self.assertEqual(run.mutable_ready_snapshot.active_sha, latest)
+                    self.assertEqual(run.mutable_ready_snapshot.plans[0].content_hash,
+                                     hashlib.sha256(plan.read_bytes()).hexdigest())
+                    self.assertIsNone(ports.state.snapshot.planning_error)
+                    self.assertEqual(ports.state.snapshot.planner_session_id, "saved-session")
+                    self.assertTrue(ports.state.snapshot.planning_result_completed)
+                    self.assertEqual(candidate.read_bytes(), saved)
+                    self.assertIsNone(state.general_publication(repo))
+
+    def test_unchanged_prepared_intent_retains_its_catalog_snapshot(self):
+        ports = FakePorts(planning_snapshot(
+            phase="PLANNING", active_sha="base", worktree="/planning",
+            planning_workspace_owned=1, planner_session_id="saved-session",
+            planning_result_completed=True,
+        ))
+        ports.state.general_intent = object()
+        ports.state.reconcile_catalog = mock.Mock(side_effect=AssertionError("intent owns catalog"))
+        coordinator = PlanningLifecycleCoordinator(ports)
+        self.assertIsNone(coordinator._workspace._prepare_workspace(
+            coordinator._new_run(self.context),
+        ))
+        ports.state.reconcile_catalog.assert_not_called()
+
+    def test_catalog_race_pauses_without_poisoning_planning_error(self):
+        ports = FakePorts(planning_snapshot(
+            phase="PLANNING", active_sha="base", worktree="/planning",
+            planning_workspace_owned=1, planner_session_id="saved-session",
+            planning_result_completed=True,
+        ))
+        ports.state.reconcile_catalog = mock.Mock(side_effect=RuntimeError("catalog changed"))
+        ports.validation.prepare_general_context = mock.Mock()
+        coordinator = PlanningLifecycleCoordinator(ports)
+        outcome = coordinator._workspace._prepare_workspace(coordinator._new_run(self.context))
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.TRANSIENT_PAUSE)
+        self.assertIsNone(ports.state.snapshot.planning_error)
+        ports.validation.prepare_general_context.assert_not_called()
+
     def test_saved_scope_violation_blocks_rebase_without_discarding_result(self):
         ports = FakePorts(planning_snapshot(
             phase="PLANNING", active_sha="base", worktree="/planning",
@@ -166,8 +273,8 @@ class PlanningRecoveryTest(PlanningCase):
             original_run = ports.git.run
 
             def run(repo, *args, check=True):
-                if args == ("ls-files", "-u", "--name-only"):
-                    return SimpleNamespace(stdout="docs/plans/[G-001] Plan.md\n",
+                if args == ("diff", "--name-only", "--diff-filter=U", "-z"):
+                    return SimpleNamespace(stdout="docs/plans/[G-001] Plan.md\0",
                                            returncode=0)
                 if args == ("rev-parse", "--git-path", "rebase-merge"):
                     return SimpleNamespace(
@@ -215,7 +322,7 @@ class PlanningRecoveryTest(PlanningCase):
             original_run = ports.git.run
 
             def run(repo, *args, check=True):
-                if args == ("ls-files", "-u", "--name-only"):
+                if args == ("diff", "--name-only", "--diff-filter=U", "-z"):
                     return SimpleNamespace(stdout="", returncode=0)
                 if args[:4] == ("ls-tree", "-r", "--name-only", "saved-stash^3"):
                     return SimpleNamespace(stdout=collision + "\n", returncode=0)

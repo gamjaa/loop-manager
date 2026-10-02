@@ -33,6 +33,7 @@ class PlanningStatePortsEffects:
     record_maintenance_publication_intent: Callable[..., object]
     recover_general_planning_batch: Callable[..., object]
     recover_maintenance_planning_batch: Callable[..., object]
+    reconcile_execplan_catalog: Callable[..., object]
     register_execplans: Callable[..., object]
     update_project: Callable[..., object]
 
@@ -52,6 +53,18 @@ class _PlanningStatePorts:
         self._runtime_repository = runtime_repository
         self._maintenance_repository = maintenance_repository
         self._state_dir = state_dir
+
+    def reconcile_catalog(
+        self, repo: str, repository: Path, base_branch: str, revision: str,
+    ) -> None:
+        from loop_manager_internal.storage.execplan_catalog_state import ReconciliationKind
+        result = self._effects.reconcile_execplan_catalog(
+            self._connection, repository, repo, base_branch,
+            remote_sha=revision,
+        )
+        if result.kind is not ReconciliationKind.RECONCILED:
+            detail = result.diagnostic.message if result.diagnostic else result.kind.value
+            raise RuntimeError(f"planning catalog 갱신 대기: {detail}")
 
     def planning(self, repo: str) -> runtime_state.PlanningSnapshot:
         return self._runtime_repository.planning(repo)
