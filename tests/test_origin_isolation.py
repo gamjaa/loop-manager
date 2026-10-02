@@ -2232,6 +2232,68 @@ class ManagerBaselineReconciliationUnitTests(unittest.TestCase):
             "VALUES (?, 'main', 'WORKING', 'loop-manager/G-092', 'docs/plans/[G-092] Work.md', ?, 'worker', ?, 'saved-worker')",
             (str(self.source), str(worktree), self.before.serialize()))
 
+    def test_runtime_prevalidation_reconciles_only_proven_delta_and_rejects_saved_mutation(self):
+        self.source = self.state / 'source'
+        self.source.mkdir()
+        runtime_path = self.state / 'runtime'
+        self.before = replace(self.before, head='source-head', branch=None, dirty={},
+            refs={self.ref: ('a' * 40, ''),
+                  'refs/remotes/origin/HEAD': ('a' * 40, self.ref)},
+            worktrees={str(self.source): ('HEAD=source-head', 'detached=True')})
+        self.current = replace(self.before,
+            refs={self.ref: ('b' * 40, ''), 'refs/remotes/origin/HEAD': ('b' * 40, self.ref)},
+            worktrees={**self.before.worktrees, str(runtime_path):
+                ('HEAD=' + 'b' * 40, 'detached=True', 'locked=runtime-marker')})
+        self.prepare_project(self.source)
+        self.connection.execute("UPDATE projects SET phase = 'PLANNING', agent_role = 'planner', "
+            'branch = NULL, plan_path = NULL, agent_result_snapshot = ?', (self.current.serialize(),))
+        loop_manager.scoped_blocking.record_project_block(self.connection, str(self.source),
+            loop_manager.BlockReasonCode.OUTSIDE_MANAGED_WORKTREE_MUTATION,
+            'Agent 범위 선검증 실패:\nruntime', 'unchanged', plan_id=None, previous_phase='PLANNING')
+        mutation = loop_manager.RuntimeMutation(self.source, runtime_path, 'b' * 40, None,
+            legacy=True, registration_lock_reason='runtime-marker')
+        with mock.patch.object(loop_manager, 'capture_git_snapshot', side_effect=lambda *_: self.current), \
+                mock.patch.object(loop_manager, '_config_entries', return_value={}), \
+                mock.patch.object(loop_manager, '_agent_git_resources', return_value=None), \
+                mock.patch.object(loop_manager, 'git_bytes', return_value=b''), \
+                mock.patch.object(loop_manager, '_held_process_lock_identity', return_value='0'), \
+                mock.patch.object(loop_manager, 'validate_runtime_worktree'), \
+                mock.patch.object(loop_manager, '_validated_runtime_registration_marker',
+                                  return_value='runtime-marker') as marker, \
+                mock.patch.object(loop_manager.runtime_scope, 'proven_runtime_recreation', return_value=False):
+            project = self.connection.execute('SELECT * FROM projects').fetchone()
+            block = loop_manager.scoped_blocking.project_block(self.connection, str(self.source))
+            self.assertTrue(loop_manager.reconcile_false_positive_runtime_block(
+                self.connection, self.source, self.state, str(self.source), project, block, mutation))
+            self.assertEqual(self.connection.execute('SELECT agent_result_snapshot FROM projects').fetchone()[0],
+                             self.current.serialize())
+            self.assertTrue(loop_manager.resume_project_block_if_safe(
+                self.connection, self.source, self.state, str(self.source)))
+            for changed in (
+                    replace(self.current, refs={**self.current.refs, 'refs/tags/foreign': ('foreign', '')}),
+                    replace(self.current, refs={**self.current.refs, self.ref: ('foreign', '')}),
+                    replace(self.current, head='foreign')):
+                with self.subTest(changed=changed):
+                    self.connection.execute('UPDATE projects SET agent_snapshot = ?, agent_result_snapshot = ?',
+                        (self.before.serialize(), changed.serialize()))
+                    with self.assertRaises(loop_manager.AgentScopeError):
+                        loop_manager.validate_persisted_agent_scope(self.connection, self.source, self.state,
+                            str(self.source), runtime_mutation=mutation)
+                    self.assertEqual(self.connection.execute('SELECT agent_snapshot FROM projects').fetchone()[0],
+                                     self.before.serialize())
+            self.connection.execute('UPDATE projects SET agent_result_snapshot = ?', (self.current.serialize(),))
+            marker.return_value = 'foreign-marker'
+            with self.assertRaisesRegex(loop_manager.AgentScopeError, 'runtime mutation 검증 실패'):
+                loop_manager.validate_persisted_agent_scope(self.connection, self.source, self.state,
+                    str(self.source), runtime_mutation=mutation)
+            marker.return_value = 'runtime-marker'
+            self.current = replace(self.current,
+                worktrees={**self.current.worktrees, '/foreign': ('HEAD=foreign',)})
+            self.connection.execute('UPDATE projects SET agent_result_snapshot = ?', (self.current.serialize(),))
+            project = self.connection.execute('SELECT * FROM projects').fetchone()
+            self.assertFalse(loop_manager.reconcile_false_positive_runtime_block(
+                self.connection, self.source, self.state, str(self.source), project, block, mutation))
+
     def test_refresh_retains_original_snapshot_and_refuses_unproven_mixed_changes(self):
         self.record_fetch()
         worktree = self.state / 'managed'

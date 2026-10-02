@@ -59,6 +59,8 @@ Agent 시작 snapshot 뒤에 Manager의 검증된 Git 작업이 있어도 현재
 
 2026-10-02 Worker 결과 보고 보정: 이전 보고의 `FAILED_COMMAND`와 `RERUN` 사이에 첫 실행의 실패 결과가 빠져 결과 검증기가 재실행 이력을 거부했다. 실패 결과와 동일 명령의 최종 `OK`를 명시하도록 보고를 수정했다. 기존 결과 계약 unit test 1개와 수정된 전체 보고의 parser 검증이 통과했으며 검증기 코드는 변경하지 않았다.
 
+2026-10-02 추가 verify 피드백 보정: 원격 successor를 채택한 재개 결과는 기존 채택 기준선 검사로 연결하고, runtime 소유권·등록 증거를 확인한 뒤 원본과 같은 자원만 보정해 저장된 실제 Agent 변경은 계속 거부한다. scope 재개 실패 시 새 임시 project projection만 정리하며 기존 선택·계획 진단과 새 프로젝트 안전 차단을 보존한다. guidance 원격 변경 fixture의 `main` clone을 명시하고, 지연 cleanup fixture의 Merge된 계획을 실제 원격 문서와 같은 metadata로 등록했다. 직접 관련된 fake-port unit test 10개가 최종 실행에서 통과했으며 targeted 실패는 fixture를 수정한 뒤 동일 명령으로 재실행했다. 실제 Git fixture 검증과 전체 verify는 실행하지 않았고 Loop Manager 재검증을 기다린다.
+
 ## Decision Log
 
 - 과거 실행에 쓰기 격리 증거가 없으면 무관한 shared ref·worktree 변화를 자동으로 외부 변경이라 단정하지 않는다. G-088/G-089와 G-090/G-091의 독립 증거가 있는 경우에만 해제한다.

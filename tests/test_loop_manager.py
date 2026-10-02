@@ -9741,6 +9741,9 @@ class AgentScopeValidatorTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo, plan_path = self._repository_with_plan(directory)
+            cleanup_plan = write_execplan(repo, 'G-099', 'Cleanup')
+            cleanup_plan_path = cleanup_plan.relative_to(repo).as_posix()
+            commit_and_push(repo, 'Add merged cleanup plan fixture')
             state_dir = root / "state"
             state_dir.mkdir()
             plan_sha = git_command(repo, "rev-parse", "origin/main")
@@ -9769,7 +9772,8 @@ class AgentScopeValidatorTest(unittest.TestCase):
                 connection,
                 str(repo),
                 repo,
-                [(plan_path, loop_manager._parse_execplan(repo, repo / plan_path))],
+                [(plan_path, loop_manager._parse_execplan(repo, repo / plan_path)),
+                 (cleanup_plan_path, loop_manager._parse_execplan(repo, cleanup_plan))],
                 plan_sha,
                 loop_manager.planning_input_fingerprint(repo, "main"),
             )
@@ -9789,11 +9793,9 @@ class AgentScopeValidatorTest(unittest.TestCase):
             blocked_result = loop_manager.capture_git_snapshot(worktree)
             # Deferred cleanup belongs to an already merged, owned plan.
             connection.execute(
-                "INSERT INTO exec_plans (repo, plan_id, path, title, sources, depends_on, "
-                "priority, content_hash, status, branch, worktree, workspace_owned, pr_head_oid) "
-                "VALUES (?, 'G-099', 'docs/plans/[G-099] Cleanup.md', 'Cleanup', "
-                "'[]', '[]', 'normal', 'hash', 'MERGED', ?, ?, 1, ?)",
-                (str(repo), cleanup_branch, str(cleanup_worktree), plan_sha))
+                "UPDATE exec_plans SET status = 'MERGED', branch = ?, worktree = ?, "
+                "workspace_owned = 1, pr_head_oid = ? WHERE repo = ? AND plan_id = 'G-099'",
+                (cleanup_branch, str(cleanup_worktree), plan_sha, str(repo)))
             loop_manager._ensure_cleanup_pending_schema(connection)
             loop_manager._store_cleanup_pending(
                 connection,

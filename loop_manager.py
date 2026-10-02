@@ -14023,19 +14023,7 @@ def validate_persisted_agent_scope(
             _plan_id_from_path(selected_plan_path), value, observed, resources)
     rebase_checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
         repo, _plan_id_from_path(selected_plan_path) or '')
-    if (project['agent_result_snapshot'] and not allow_planner_worktree_correction
-            and (phase != 'PLAN_BLOCKED' or guidance_ref_allowances is not None)
-            and rebase_checkpoint.operation != 'rebase'
-            and not (rebase_checkpoint.snapshot or {}).get('current_rebase_acceptance')):
-        original = GitSnapshot.deserialize(str(project['agent_snapshot']))
-        comparison = agent_scope_decision.manager_comparison_baseline(
-            original, original, rebase_checkpoint.snapshot or {}, role_name)
-        actual_result = GitSnapshot.deserialize(str(project['agent_result_snapshot']))
-        validate_agent_scope(role_name, saved_worktree, comparison, actual_result,
-            selected_plan_path=selected_plan_path if role_name == 'worker' else None,
-            allowed_guidance_targets=guidance_targets, allow_common_plans=allow_common_plans,
-            allowed_requirement_archives=archive_sources,
-            external_worktree=repo_path, base_branch=str(project['base_branch']), resources=resources)
+    remote_adoption_current = blocked_plan_reconciliation.remote_adoption_is_current(rebase_checkpoint)
     before = reconcile_metadata(before)
     if result is not None:
         result = reconcile_metadata(result)
@@ -14043,7 +14031,6 @@ def validate_persisted_agent_scope(
         checkpoint = replace(checkpoint, snapshot=reconcile_metadata(checkpoint.snapshot))
         checkpoint = replace(checkpoint, cleanup_worktrees=checkpoint.cleanup_worktrees & proven_cleanups)
 
-    remote_adoption_current = blocked_plan_reconciliation.remote_adoption_is_current(rebase_checkpoint)
     if (role_name in {'worker', 'reviewer'} and not remote_adoption_current
             and (rebase_checkpoint.snapshot or {}).get('current_rebase_agent_baseline')):
         comparison = managed_rebase_adoption.agent_comparison_baseline(
@@ -14177,6 +14164,27 @@ def validate_persisted_agent_scope(
         )
     except agent_scope_decision.ScopeDecisionError as error:
         raise AgentScopeError(str(error)) from error
+    if (project['agent_result_snapshot'] and not allow_planner_worktree_correction
+            and (phase != 'PLAN_BLOCKED' or guidance_ref_allowances is not None)
+            and not remote_adoption_current
+            and rebase_checkpoint.operation != 'rebase'
+            and not (rebase_checkpoint.snapshot or {}).get('current_rebase_acceptance')):
+        original = GitSnapshot.deserialize(str(project['agent_snapshot']))
+        comparison = agent_scope_decision.manager_comparison_baseline(
+            original, original, rebase_checkpoint.snapshot or {}, role_name)
+        actual_result = GitSnapshot.deserialize(str(project['agent_result_snapshot']))
+        if manager_runtime is not None:
+            # The runtime identity and exact registration were checked above.
+            # Carry only unchanged original keys; retain actual Agent mutations.
+            comparison = agent_scope_decision.reconcile_runtime_snapshot(
+                comparison, original, current, manager_runtime[0])
+            actual_result = agent_scope_decision.reconcile_runtime_snapshot(
+                actual_result, original, current, manager_runtime[0])
+        validate_agent_scope(role_name, saved_worktree, comparison, actual_result,
+            selected_plan_path=selected_plan_path if role_name == 'worker' else None,
+            allowed_guidance_targets=guidance_targets, allow_common_plans=allow_common_plans,
+            allowed_requirement_archives=archive_sources,
+            external_worktree=repo_path, base_branch=str(project['base_branch']), resources=resources)
     if manager_runtime is not None:
         operation_log(
             "runtime scope 기준선 검증: "
@@ -18618,9 +18626,23 @@ def resume_plan_blocks(
             connection, repo, str(blocked["plan_id"]),
         )
         if scoped_blocking.is_scope_baseline_block(current_block):
+            prior_projection = project_execplan(connection, repo)
             if resume_blocked_execplan_if_inputs_changed(
                     connection, repo_path, repo, base, state_dir, plan_id=str(blocked['plan_id'])):
                 return True
+            if scoped_blocking.project_block(connection, repo) is not None:
+                return False
+            projected = project_execplan(connection, repo)
+            if (projected is not None and projected['plan_id'] == blocked['plan_id']
+                    and active_execplan(connection, repo) is None):
+                if prior_projection is None:
+                    with connection:
+                        _clear_active_in_current_transaction(connection, repo)
+                elif prior_projection['plan_id'] != projected['plan_id']:
+                    prior_plan = connection.execute(
+                        'SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
+                        (repo, prior_projection['plan_id'])).fetchone()
+                    hydrate_execplan_project(connection, repo, prior_plan)
             continue
         if rebase_block_reconciliation.could_be_rebase_evidence_block(current_block):
             if _reconcile_rebase_evidence_block(

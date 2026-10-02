@@ -583,10 +583,15 @@ class BlockedPlanRemoteRefreshTests(unittest.TestCase):
                                     agent_result_snapshot=self.current_snapshot.serialize())
         self.persisted_adoption_scope()
         self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
-        changed = replace(self.current_snapshot, head='unauthorized')
-        loop_manager.update_project(self.connection, self.repo, agent_result_snapshot=changed.serialize())
-        with self.assertRaises(loop_manager.AgentScopeError):
-            self.persisted_adoption_scope()
+        for changed in (
+                replace(self.current_snapshot, head='unauthorized'),
+                replace(self.current_snapshot, refs={**self.current_snapshot.refs,
+                    'refs/heads/unowned': ('foreign', '')})):
+            with self.subTest(changed=changed):
+                loop_manager.update_project(self.connection, self.repo, agent_result_snapshot=changed.serialize())
+                with self.assertRaises(loop_manager.AgentScopeError):
+                    self.persisted_adoption_scope()
+        self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
 
     def test_interrupted_fast_forward_rejects_later_shared_mutation(self):
         original = self.interrupt_after_fast_forward()
@@ -3632,6 +3637,70 @@ class ScopeBaselineRecoveryUnitTests(unittest.TestCase):
                 loop_manager.resume_blocked_execplan_if_inputs_changed(self.connection, self.repo_path,
                     'repo', 'main', Path('/state'), plan_id='G-047')
         inputs.assert_called_once()
+
+    def test_failed_scope_resume_releases_projection_without_changing_saved_plan(self):
+        runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
+        runtime.block_plan('repo', 'G-047', reason_code='managed_worktree_scope_violation',
+                           evidence='real violation', release_fingerprint='unchanged')
+        loop_manager._ensure_execplans_schema(self.connection)
+        with self.connection:
+            loop_manager._clear_active_in_current_transaction(self.connection, 'repo')
+        original = dict(self.connection.execute('SELECT * FROM exec_plans').fetchone())
+        block = dict(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
+        def failed_resume(*_args, **_kwargs):
+            loop_manager.hydrate_execplan_project(self.connection, 'repo', original)
+            return False
+        with mock.patch.object(loop_manager, 'resume_blocked_execplan_if_inputs_changed',
+                               side_effect=failed_resume):
+            self.assertFalse(loop_manager.resume_plan_blocks(
+                self.connection, self.repo_path, Path('/state'), 'repo', 'main'))
+        self.assertIsNone(loop_manager.project_execplan(self.connection, 'repo'))
+        self.assertIsNone(self.connection.execute('SELECT phase FROM projects').fetchone()[0])
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM exec_plans').fetchone()), original)
+        self.assertEqual(dict(scoped_blocking.plan_block(self.connection, 'repo', 'G-047')), block)
+
+    def test_failed_scope_resume_keeps_new_project_safety_block(self):
+        runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
+        runtime.block_plan('repo', 'G-047', reason_code='managed_worktree_scope_violation',
+                           evidence='real violation', release_fingerprint='unchanged')
+        plan = dict(self.connection.execute('SELECT * FROM exec_plans').fetchone())
+        def failed_resume(*_args, **_kwargs):
+            loop_manager.hydrate_execplan_project(self.connection, 'repo', plan)
+            self.project_block()
+            return False
+        with mock.patch.object(loop_manager, 'resume_blocked_execplan_if_inputs_changed',
+                               side_effect=failed_resume):
+            self.assertFalse(loop_manager.resume_plan_blocks(
+                self.connection, self.repo_path, Path('/state'), 'repo', 'main'))
+        self.assertEqual(self.connection.execute('SELECT phase FROM projects').fetchone()[0], 'PROJECT_BLOCKED')
+        self.assertIsNotNone(scoped_blocking.project_block(self.connection, 'repo'))
+        self.assertIsNotNone(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
+
+    def test_failed_scope_resume_restores_previously_selected_other_block(self):
+        runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
+        self.connection.execute('INSERT INTO exec_plans '
+            '(repo, plan_id, path, title, sources, depends_on, priority, content_hash, status) '
+            "VALUES ('repo', 'G-048', 'docs/plans/[G-048] Other.md', 'Other', '[]', '[]', "
+            "'normal', 'hash', 'PLAN_BLOCKED')")
+        for plan_id in ('G-047', 'G-048'):
+            runtime.block_plan('repo', plan_id, reason_code='managed_worktree_scope_violation',
+                               evidence='real violation', release_fingerprint='unchanged')
+        loop_manager._ensure_execplans_schema(self.connection)
+        previous = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id = 'G-048'").fetchone()
+        loop_manager.hydrate_execplan_project(self.connection, 'repo', previous)
+        project = dict(self.connection.execute('SELECT * FROM projects').fetchone())
+        plans = [dict(row) for row in self.connection.execute('SELECT * FROM exec_plans ORDER BY plan_id')]
+        def failed_resume(*_args, plan_id, **_kwargs):
+            plan = self.connection.execute('SELECT * FROM exec_plans WHERE plan_id = ?', (plan_id,)).fetchone()
+            loop_manager.hydrate_execplan_project(self.connection, 'repo', plan)
+            return False
+        with mock.patch.object(loop_manager, 'resume_blocked_execplan_if_inputs_changed',
+                               side_effect=failed_resume):
+            self.assertFalse(loop_manager.resume_plan_blocks(
+                self.connection, self.repo_path, Path('/state'), 'repo', 'main'))
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM projects').fetchone()), project)
+        self.assertEqual([dict(row) for row in self.connection.execute('SELECT * FROM exec_plans ORDER BY plan_id')],
+                         plans)
 
     def test_planner_scope_release_rechecks_snapshot_and_preserves_planning_error(self):
         from agent_scope_decision import used_git_resources

@@ -651,7 +651,7 @@ class BlockedCheckpointGitAdapterTest(unittest.TestCase):
         snapshot = self.connection.execute('SELECT agent_snapshot FROM exec_plans').fetchone()[0]
         successor = self.user_commit(path, document(decision='approve', revision='user-1'))
         upstream = Path(self.temporary.name) / 'base-writer'
-        self.run_git(self.repo, 'clone', str(self.remote), str(upstream))
+        self.run_git(self.repo, 'clone', '--branch', 'main', str(self.remote), str(upstream))
         self.run_git(upstream, 'config', 'user.name', 'User')
         self.run_git(upstream, 'config', 'user.email', 'user@example.com')
         (upstream / 'dependency.py').write_text('dependency = True\n', encoding='utf-8')
