@@ -31,6 +31,20 @@ priority: critical
 4. 큰 테스트를 책임별로 나누고 SQLite/HTTP fake와 support fixture를 필요한 범위에 둔다. 전송 결과 확인을 fixture가 대신 수행하지 않는다.
 5. 호출 측은 좁은 event/repository/transport 경계로 갱신한다. 동작·저장 형식·비밀값 취급과 두 verify의 검증 범위를 유지한다.
 
+### 구현 대응표
+
+| 기존 범위 | 새 소유 모듈 / 호출 경계 |
+| --- | --- |
+| schema, legacy notice adoption, outbox insert, session flag | `repository.py`; 기존 `storage/database.py`의 schema 호출과 SQLite 연결 소유권 유지 |
+| block key·generation, release·resumption, checkpoint 상태 조회 | `incidents.py`; `recovery/scoped_blocking.py`와 저장 adapter가 소유한 transaction 안에서 호출 |
+| PR·block·persistent failure·completion·waiting event 판단 | `events.py`; scheduler, catalog, execution, planning과 recovery 호출이 기존 transaction에서 사용 |
+| checkpoint URL, 문구, Unicode 분할 | `rendering.py`; 저장·네트워크 효과 없음 |
+| 조각 claim·확정·재시도·취소 | `delivery.py`; 저장된 outbox cursor와 transaction 유지 |
+| Telegram HTTP 호출 | `transport.py`; 상태 판단 없이 요청만 전송 |
+| 공개 helper와 테스트 | `notifications.py` 호환 경로; `test_notification_incidents.py`, `test_notification_events.py`, `test_notification_delivery.py`, `test_notification_work_cycles.py`와 `support/notification.py` |
+
+G-060의 루트 inventory와 G-063 패키지 배치를 확인했다. 새 루트 항목이나 경로 이동은 없으며 `scripts/verify.sh`·`scripts/verify.ps1`의 명시적 컴파일 목록에 새 모듈을 포함했다.
+
 ## Validation
 
 - Worker는 변경한 event identity/repository와 renderer/transport의 관련 targeted unit test만 실행한다.
@@ -40,9 +54,9 @@ priority: critical
 
 ## Progress
 
-- [ ] notification 저장·event·rendering·transport 계약 확인
-- [ ] 책임별 module 추출과 중복 제거
-- [ ] notification test 분리 및 targeted unit test
+- [x] notification 저장·event·rendering·transport 계약 확인
+- [x] 책임별 module 추출과 중복 제거
+- [x] notification test 분리 및 targeted unit test
 - [ ] Manager 전체 verify, 독립 Review 및 사용자 Merge
 
 ## Decision Log
