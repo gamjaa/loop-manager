@@ -121,6 +121,39 @@ priority: critical
 | `document_drafts.py`, `document_publication.py`, `guidance_approval.py`, `notifications.py`, `reviewer_specification.py` | `loop_manager.py`, `execution_handlers.py`; `tests/test_guidance_approval.py`, `tests/test_notifications.py`, `tests/test_maintenance_planning.py` | `loop_manager_internal/documents/`, `notifications/`; approval hash, document publication and outbox/rendering contract 유지 (G-126). |
 | `project_registry.py`, `recovery_dispatcher.py`, `recovery_runtime.py`, `recovery_state.py`, `runtime_state.py`, `work_exhaustion.py`, `quality_guidance.py` | `loop_manager.py`, `execution_handlers.py`, `planning_runtime.py`; `tests/test_managed_configuration.py`, `tests/test_recovery_runtime.py`, `tests/test_recovery_state.py`, `tests/test_runtime_state.py`, `tests/test_notifications.py`, `tests/test_loop_manager.py` | `loop_manager_internal/runtime/` and `quality/`; registry/base identity, execution state, completion event and shared prompt contract 유지 (G-120/G-126). |
 
+### G-123: 잔여 root 본문과 공개 구성 대응
+
+`71b6c0e7784393643e6128a76be38a7b565100ab`의 root와 기존 G-063 패키지를 다시 확인했다. 아래는 G-123의 이동 기록이며 다른 계획의 목표·상태를 바꾸지 않는다. 새 root 항목은 없다.
+
+| 현재 root 항목 | 실제 참조·사용자 경로 / 소유권 | 목적지 또는 유지 근거 |
+| --- | --- | --- |
+| `.agents/`, `docs/`, `scripts/`, `AGENTS.md` | 등록·Planner·역할 지침과 Manager의 OS별 verify 탐색; 저장소 관리 파일 | 기존 고정 경로 유지 |
+| `README.md` | 사용자 설치·CLI 실행 안내; 저장소 관리 문서 | 사용자 진입 문서로 유지 |
+| `run.sh`, `run.ps1`, `loop_manager.py` | launcher와 `runtime.bootstrap`의 runtime child 실행; 저장소 관리 진입점 | 경로 유지. Python root에는 `build_parser`, `main`, 공개 export와 명시적 서비스 구성만 유지 |
+| `config/`, `requirements.txt`, `.gitignore` | source config 전달, setup의 Python 의존성 설치, Git의 config/cache 제외; 저장소 관리 설정 | 실행·도구 계약 때문에 유지 |
+| `tests/`, `loop_manager_internal/` | 두 verify의 discovery/compile, CLI import와 복사 runtime fixture; 저장소 관리 테스트·내부 구현 | 기존 package root 유지; 내부 본문은 아래 책임별 하위 module로 이동 |
+| `.git` | linked worktree Git identity와 index/ref 조회; Git 소유 control 경로 | 이동·삭제 대상이 아님 |
+| `__pycache__/` (검증 중 생성) | Python import가 만든 `.gitignore` 제외 파생 cache; 사용자 입력·추적 source가 아님 | source·CLI 이동 근거로 사용하지 않고 이 변경에서는 보존 |
+| `.aws/`, `.codex/` | 실행 환경이 노출한 읽기 전용 비추적 경로; 이 변경에서 저장소 소유·사용 참조를 확정하지 않음 | 불확실 항목으로 보존하고 이동·삭제하지 않음 |
+
+아래 경로는 모두 `loop_manager_internal/` 기준이다. 실제 소비자는 root의 명시적 export·callback 구성과 해당 역할의 기존 coordinator이며, callback에는 module 전체를 전달하지 않는다. root patch는 생성 이후에도 callback 호출 시 다시 해석한다.
+
+| 기존 root 범위 / 소비 계약 | 이동·통합 목적지 / 책임 |
+| --- | --- |
+| `_run_project_step`, `_run_project_result`, `run_project_result`, `run_project` / catalog·scheduler unit tests | `application/project_service.py`, `project_runner.py`, `project_outcomes.py`; 안전 확인→catalog/cleanup→PR→기존 실행 복구→기존 coordinator 호출과 typed 결과 |
+| `_run_registered_project`, 다중 project scheduling, self Merge / scheduler·handoff tests | `application/scheduler.py`, `self_runtime.py`, `runtime/handoff_gate.py`; 연결별 실행, 최대 동시 수, preflight와 subprocess 시작 gate |
+| registry·document draft CLI / CLI 및 복사 runtime tests | `application/commands.py`, `runtime/registration_service.py`; 기존 command dispatch·등록 검증과 외부 config identity |
+| planning port와 execution port / planning·maintenance·execution 소비자 | `planning/state_ports.py`, `git_ports.py`, `agent_ports.py`, `validation_ports.py`, `event_ports.py`, `planning_ports.py`, `maintenance/review_ports.py`, `execution/execution_ports.py`; 역할별 named effects 조립. coordinator 본문은 기존 module에 유지 |
+| catalog, READY/dependency/maintenance 선택, archive / catalog refresh·selection tests | `catalog/catalog_service.py`, `legacy_migration.py`, `project_selection.py`, `archive_service.py`, `requirement_archive_service.py`, `maintenance/cycle_service.py`; cache와 실행 자리, PR 우선 및 cycle DAG 유지 |
+| planning 입력·검증·게시 / 기존 planning coordinator와 port | `planning/input_fingerprints.py`, `planner_validation.py`, `planner_publication.py`, `planning_workspace.py`, `diagnostics.py`, `maintenance/maintenance_validation.py`, `maintenance_publication.py`; 기존 revision·snapshot·publication transaction 경계 유지 |
+| bootstrap·state·provider·scope의 잔여 연결 / 기존 adapter·repository | `runtime/bootstrap_adapter.py`, `operation_events.py`, `storage/project_state_adapter.py`, `agents/agent_adapter.py`, `scope_adapter.py`, `scope_state_service.py`; 기존 G-120/G-121 adapter에 위임하고 실제 state/resource identity 전달 |
+| Git/workspace/publication의 잔여 본문 / 기존 Git adapter와 execution | `git/git_adapter.py`, `workspace_service.py`, `direct_rebase_service.py`, `publication_service.py`, `base_fetch_service.py`, `cleanup_service.py`, `merge_cleanup_service.py`; lease·receipt·cleanup 판정과 소유 증거 보존 |
+| block/checkpoint/PR recovery의 잔여 본문 / 기존 recovery coordinator | `recovery/recovery_adapter.py`, `pr_ownership.py`, `block_service.py`, `blocked_agent_service.py`, `blocked_plan_service.py`, `project_block_service.py`, `checkpoint_service.py`, `waiting_pr_service.py`; 계획/프로젝트 차단과 session·retry 보존 |
+| metadata·Worker/Reviewer 응답·guidance·PR 본문 / 기존 execution handler | `execution/plan_validation.py`, `result_validation.py`, `documents/guidance_service.py`, `pr_description.py`; 기존 검증·승인·게시 규칙 유지 |
+| 공개 결과·예외 및 helper 호출 서명 / 기존 direct import·patch 소비자 | `application/contracts.py`, `compatibility.py`; 기존 class identity와 함수 인자를 보존하고 주입 인자는 공개 서명에서 제외 |
+
+484개 원본 정의를 이동한 뒤 AST를 역대응해 비교했으며, 의도적으로 바뀐 본문은 프로젝트 단계 분리와 execution contract의 `globals()` 제거 두 곳이다. 그 밖의 본문은 named effect 접근으로만 바뀌었다. 상태 필드·status 집합은 `storage/project_state_adapter.py`가 기존 `runtime_state`의 선언을 재사용하므로 순수 결과 contract가 repository를 import하지 않는다. G-124/G-125/G-126의 상세 coordinator·알림 분리는 수행하지 않았다. 두 verify의 compile 목록에 새 module을 포함했으며 Worker는 스크립트를 실행하지 않았다.
+
 ## Validation
 
 - Worker는 `tests/test_loop_manager.py`의 역할별 prompt와 `tests/test_managed_configuration.py`의 공통 지침 배포 관련 targeted unit test만 실행한다.

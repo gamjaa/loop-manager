@@ -1,0 +1,586 @@
+"""catalog catalog service boundaries and named composition effects."""
+from __future__ import annotations
+from collections.abc import Callable
+from dataclasses import dataclass
+from loop_manager_internal.application.contracts import PLAN_SHA_BACKFILL_ERROR
+from loop_manager_internal.catalog import execplan_catalog
+from loop_manager_internal.catalog import project_catalog_refresh
+from loop_manager_internal.git import command_adapter
+from loop_manager_internal.notifications import notifications
+from loop_manager_internal.recovery import scoped_blocking
+from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
+from loop_manager_internal.recovery.scoped_blocking import PR_CLOSED_BLOCK_REASON
+from loop_manager_internal.storage import execplan_catalog_state
+from pathlib import Path
+import os
+import re
+import sqlite3
+
+
+@dataclass(frozen=True)
+class BackfillPlanShasEffects:
+    """Named effects for backfill_plan_shas; no entry-point/module access."""
+    _plan_id_from_path: Callable[..., object]
+    git: Callable[..., object]
+
+
+def backfill_plan_shas(
+    effects: BackfillPlanShasEffects, connection: sqlite3.Connection,
+    *,
+    target_repo: str | None = None,
+    manage_transaction: bool = True,
+) -> None:
+    rows = connection.execute(
+        """
+        SELECT repo, plan_path
+        FROM projects
+        WHERE plan_sha IS NULL
+          AND plan_path IS NOT NULL
+          AND phase IN ('WORKING', 'VERIFYING', 'REVIEWING', 'PUBLISHING')
+        """
+    ).fetchall()
+    if target_repo is not None:
+        rows = [row for row in rows if row["repo"] == target_repo]
+    for row in rows:
+        result = effects.git(
+            Path(row["repo"]),
+            "log",
+            "--all",
+            "--diff-filter=A",
+            "--format=%H",
+            "--",
+            row["plan_path"],
+            check=False,
+        )
+        commits = [
+            value
+            for value in result.stdout.splitlines()
+            if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", value)
+        ]
+        if len(commits) == 1:
+            connection.execute(
+                "UPDATE projects SET plan_sha = ? WHERE repo = ?",
+                (commits[0], row["repo"]),
+            )
+        else:
+            project = connection.execute(
+                "SELECT phase FROM projects WHERE repo = ?", (row["repo"],)
+            ).fetchone()
+            scoped_blocking.record_project_block(
+                connection,
+                str(row["repo"]),
+                BlockReasonCode.REPOSITORY_STATE_UNSAFE,
+                PLAN_SHA_BACKFILL_ERROR,
+                None,
+                plan_id=effects._plan_id_from_path(str(row["plan_path"] or "")),
+                previous_phase=(str(project["phase"] or "") or None),
+            )
+            notifications.enqueue_current_project_events(connection, str(row["repo"]))
+    if manage_transaction:
+        connection.commit()
+
+
+@dataclass(frozen=True)
+class GitBytesEffects:
+    """Named effects for git_bytes; no entry-point/module access."""
+    _command_adapter_effects_git_bytes: Callable[..., object]
+
+
+def git_bytes(effects: GitBytesEffects, repo: Path, *arguments: str) -> bytes:
+    return command_adapter.git_bytes(effects._command_adapter_effects_git_bytes(), repo, *arguments)
+
+
+@dataclass(frozen=True)
+class GitTreeEntriesEffects:
+    """Named effects for _git_tree_entries; no entry-point/module access."""
+    git_bytes: Callable[..., object]
+
+
+def _git_tree_entries(effects: GitTreeEntriesEffects, repo: Path, revision: str) -> dict[bytes, tuple[bytes, bytes]]:
+    tree = effects.git_bytes(repo, "ls-tree", "-r", "-z", "--full-tree", revision)
+    entries: dict[bytes, tuple[bytes, bytes]] = {}
+    for record in tree.split(b"\0"):
+        if not record:
+            continue
+        metadata, separator, path = record.partition(b"\t")
+        parts = metadata.split()
+        if not separator or len(parts) != 3:
+            raise RuntimeError("Git tree 항목 형식이 올바르지 않습니다.")
+        _mode, object_type, object_id = parts
+        if object_type not in {b"blob", b"commit"}:
+            raise RuntimeError("지원하지 않는 Git tree 항목 형식입니다.")
+        entries[path] = (object_type, object_id)
+    return entries
+
+
+@dataclass(frozen=True)
+class RevisionExecplanSnapshotEffects:
+    """Named effects for revision_execplan_snapshot; no entry-point/module access."""
+    git: Callable[..., object]
+    git_bytes: Callable[..., object]
+
+
+def revision_execplan_snapshot(
+    effects: RevisionExecplanSnapshotEffects, repo: Path,
+    revision: str,
+    *,
+    archive_conflict_plan_ids: frozenset[str] = frozenset(),
+) -> execplan_catalog.ExecPlanCatalogSnapshot:
+    """Read and fully validate active/archive plans from one immutable tree."""
+
+    revision_sha = effects.git(
+        repo, "rev-parse", "--verify", f"{revision}^{{commit}}"
+    ).stdout.strip()
+    tree = effects.git_bytes(repo, "ls-tree", "-r", "-z", "--full-tree", revision_sha)
+    documents: dict[str, bytes] = {}
+    regular_paths: set[str] = set()
+    invalid_plan_entries: dict[str, str] = {}
+    for record in tree.split(b"\0"):
+        if not record:
+            continue
+        metadata, separator, raw_path = record.partition(b"\t")
+        parts = metadata.split()
+        if not separator or len(parts) != 3:
+            raise RuntimeError("Git tree 항목 형식이 올바르지 않습니다.")
+        mode, object_type, object_id = parts
+        try:
+            relative_path = raw_path.decode("utf-8")
+        except UnicodeDecodeError as error:
+            if raw_path.startswith(b"docs/plans/"):
+                raise execplan_catalog.ExecPlanCatalogError(
+                    "ExecPlan Git 경로가 UTF-8이 아닙니다.",
+                    code="invalid-path-encoding",
+                ) from error
+            continue
+        regular = object_type == b"blob" and mode in {b"100644", b"100755"}
+        if regular:
+            regular_paths.add(relative_path)
+        plan_candidate = bool(
+            re.fullmatch(r"docs/plans/[^/]+\.md", relative_path)
+            or re.fullmatch(
+                r"docs/plans/archive/[^/]+\.md", relative_path
+            )
+        )
+        if not plan_candidate:
+            continue
+        if not regular:
+            invalid_plan_entries[relative_path] = (
+                "symlink" if mode == b"120000" else mode.decode("ascii")
+            )
+            continue
+        documents[relative_path] = effects.git_bytes(
+            repo, "cat-file", "blob", object_id.decode("ascii")
+        )
+    return execplan_catalog.snapshot_from_documents(
+        documents,
+        validate_sources=True,
+        available_regular_paths=frozenset(regular_paths),
+        invalid_plan_entries=invalid_plan_entries,
+        revision_sha=revision_sha,
+        archive_conflict_plan_ids=archive_conflict_plan_ids,
+    )
+
+
+@dataclass(frozen=True)
+class CatalogArchiveConflictIdsEffects:
+    """Named effects for _catalog_archive_conflict_ids; no entry-point/module access."""
+    _git_tree_entries: Callable[..., object]
+    _merged_execplan_ids: Callable[..., object]
+    pr_for_branch: Callable[..., object]
+
+
+def _catalog_archive_conflict_ids(
+    effects: CatalogArchiveConflictIdsEffects, connection: sqlite3.Connection, repo_path: Path, repo: str, revision: str,
+) -> frozenset[str]:
+    """Use read-only, identity-bound PR evidence for archive path conflicts.
+
+    Declaration validation precedes PR transitions. A newly merged PR may
+    therefore still be PR_OPEN or blocked on a previously closed PR in SQLite
+    when its archive collision is read.
+    This proof permits only the existing collision diagnostic, never cleanup
+    or an execution-state transition.
+    """
+    confirmed = set(effects._merged_execplan_ids(connection, repo))
+    paths = (os.fsdecode(path) for path in effects._git_tree_entries(repo_path, revision))
+    conflicts = execplan_catalog.conflicting_archived_plan_paths(paths)
+    project = connection.execute(
+        "SELECT base_branch FROM projects WHERE repo = ?", (repo,),
+    ).fetchone()
+    if project is None:
+        return frozenset(confirmed)
+    for plan_id in conflicts.keys() - confirmed:
+        plan = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+            (repo, plan_id),
+        ).fetchone()
+        if plan is None or not plan["branch"]:
+            continue
+        if not (plan["status"] == "PR_OPEN" or (
+            plan["status"] == "PLAN_BLOCKED"
+            and plan["blocked_reason"] == PR_CLOSED_BLOCK_REASON
+        )):
+            continue
+        pull_request = effects.pr_for_branch(repo_path, str(plan["branch"]), plan["pr_url"])
+        if pull_request is None:
+            continue
+        if (pull_request.get("baseRefName") != project["base_branch"]
+                or pull_request.get("headRefName") != plan["branch"]
+                or (plan["pr_url"] and pull_request.get("url") != plan["pr_url"])
+                or (plan["pr_head_oid"] and pull_request.get("headRefOid") != plan["pr_head_oid"])):
+            continue
+        if pull_request.get("state") == "MERGED" or pull_request.get("mergedAt"):
+            confirmed.add(plan_id)
+    return frozenset(confirmed)
+
+
+@dataclass(frozen=True)
+class GitCatalogDefinitionPortEffects:
+    """Named effects for _GitCatalogDefinitionPort; no entry-point/module access."""
+    _git_tree_entries: Callable[..., object]
+    git: Callable[..., object]
+    git_bytes: Callable[..., object]
+    revision_execplan_snapshot: Callable[..., object]
+
+
+class _GitCatalogDefinitionPort:
+    """Pin catalog reads to a fetched remote ref without consulting worktrees."""
+
+    def __init__(
+        self,
+        effects: GitCatalogDefinitionPortEffects, repo: Path,
+        remote_ref: str,
+        archive_conflict_plan_ids: Callable[[], frozenset[str]],
+        pinned_revision: str | None = None,
+    ):
+        self._effects = effects
+        self.repo = repo
+        self.remote_ref = remote_ref
+        self.archive_conflict_plan_ids = archive_conflict_plan_ids
+        self.pinned_revision = pinned_revision
+        self.loaded: execplan_catalog_state.PinnedCatalog | None = None
+
+    def current_revision(self) -> str:
+        return self._effects.git(
+            self.repo,
+            "rev-parse",
+            "--verify",
+            f"{self.remote_ref}^{{commit}}",
+        ).stdout.strip()
+
+    def load(self) -> execplan_catalog_state.PinnedCatalog:
+        if self.loaded is not None:
+            return self.loaded
+        revision_sha = self.pinned_revision or self.current_revision()
+        try:
+            snapshot = self._effects.revision_execplan_snapshot(
+                self.repo,
+                revision_sha,
+                archive_conflict_plan_ids=self.archive_conflict_plan_ids(),
+            )
+        except execplan_catalog.ExecPlanCatalogError as error:
+            tree = self._effects._git_tree_entries(self.repo, revision_sha)
+            evidence = []
+            for path in error.related_paths:
+                entry = tree.get(path.encode("utf-8"))
+                if entry is not None:
+                    evidence.append(
+                        f"{path}:{entry[0].decode('ascii')}:"
+                        f"{entry[1].decode('ascii')}"
+                    )
+                else:
+                    evidence.append(f"{path}:missing")
+            diagnostic = execplan_catalog_state.ReconciliationDiagnostic(
+                revision_sha=revision_sha,
+                code=error.code,
+                message=str(error),
+                path=error.path,
+                source=error.source,
+                related_paths=error.related_paths,
+                fingerprint=execplan_catalog_state.diagnostic_fingerprint(
+                    revision_sha,
+                    error.code,
+                    str(error),
+                    tuple(evidence),
+                ),
+            )
+            raise execplan_catalog_state.InvalidPinnedCatalog(
+                diagnostic
+            ) from error
+        tree = self._effects.git_bytes(
+            self.repo, "ls-tree", "-r", "-z", "--full-tree", revision_sha
+        )
+        regular_paths: set[str] = set()
+        for record in tree.split(b"\0"):
+            if not record:
+                continue
+            metadata, _separator, path = record.partition(b"\t")
+            if metadata.split()[:2] not in (
+                [b"100644", b"blob"], [b"100755", b"blob"]
+            ):
+                continue
+            try:
+                regular_paths.add(path.decode("utf-8"))
+            except UnicodeDecodeError:
+                continue
+        self.loaded = execplan_catalog_state.PinnedCatalog(
+            revision_sha, snapshot, frozenset(regular_paths)
+        )
+        return self.loaded
+
+
+@dataclass(frozen=True)
+class ReconcileExecplanCatalogEffects:
+    """Named effects for reconcile_execplan_catalog; no entry-point/module access."""
+    _GitCatalogDefinitionPort: Callable[..., object]
+    _catalog_archive_conflict_ids: Callable[..., object]
+    _plan_id_from_path: Callable[..., object]
+    backfill_plan_shas: Callable[..., object]
+    git: Callable[..., object]
+    migrate_legacy_execplans: Callable[..., object]
+
+
+def reconcile_execplan_catalog(
+    effects: ReconcileExecplanCatalogEffects, connection: sqlite3.Connection,
+    repo_path: Path,
+    repo: str,
+    base_branch: str,
+    *,
+    record_invalid: bool = True,
+    remote_sha: str | None = None,
+    on_reconciled: Callable[[execplan_catalog_state.PinnedCatalog], None] | None = None,
+) -> execplan_catalog_state.CatalogReconciliationResult:
+    """Converge declaration cache or persist a recoverable project diagnostic."""
+
+    remote_ref = f"refs/remotes/origin/{base_branch}"
+    if remote_sha is not None:
+        current_sha = effects.git(
+            repo_path, "rev-parse", "--verify", f"{remote_ref}^{{commit}}"
+        ).stdout.strip()
+        if current_sha != remote_sha:
+            return execplan_catalog_state.CatalogReconciliationResult(
+                execplan_catalog_state.ReconciliationKind.STALE,
+                revision_sha=remote_sha,
+            )
+    port = effects._GitCatalogDefinitionPort(
+        repo_path,
+        remote_ref,
+        lambda: effects._catalog_archive_conflict_ids(
+            connection, repo_path, repo, remote_sha or port.current_revision(),
+        ),
+        pinned_revision=remote_sha,
+    )
+    repository = execplan_catalog_state.DefinitionStateRepository(connection)
+    service = execplan_catalog_state.CatalogReconciliationService(repository, port)
+    legacy = connection.execute(
+        "SELECT 1 FROM execplan_catalog_revisions WHERE repo = ?", (repo,),
+    ).fetchone() is None
+    if legacy and not repository.has_publication_intent(repo):
+        # Initial migration and declaration reconciliation share a rollback
+        # boundary. Validate the remote graph before recovering runtime rows.
+        try:
+            with execplan_catalog_state._transaction(connection):
+                pinned = port.load()
+                if repository.capture(repo).plan_ids - frozenset(pinned.snapshot.all):
+                    raise project_catalog_refresh.CatalogRefreshStopped(service.reconcile(repo))
+                effects.backfill_plan_shas(connection, target_repo=repo, manage_transaction=False)
+                effects.migrate_legacy_execplans(
+                    connection, reconcile_history=True, target_repo=repo,
+                    ensure_schema=False, manage_transaction=False,
+                    pinned_catalog=pinned,
+                )
+                result = service.reconcile(repo)
+                if result.kind is not execplan_catalog_state.ReconciliationKind.RECONCILED:
+                    raise project_catalog_refresh.CatalogRefreshStopped(result)
+        except execplan_catalog_state.InvalidPinnedCatalog as error:
+            result = execplan_catalog_state.CatalogReconciliationResult(
+                execplan_catalog_state.ReconciliationKind.INVALID_CATALOG,
+                revision_sha=error.diagnostic.revision_sha, diagnostic=error.diagnostic,
+            )
+        except project_catalog_refresh.CatalogRefreshStopped as error:
+            result = error.result
+        except execplan_catalog.ExecPlanCatalogError as error:
+            revision = port.loaded.revision_sha if port.loaded else (remote_sha or "")
+            result = execplan_catalog_state.CatalogReconciliationResult(
+                execplan_catalog_state.ReconciliationKind.INVALID_CATALOG,
+                revision_sha=revision,
+                diagnostic=execplan_catalog_state.ReconciliationDiagnostic(
+                    revision, error.code, str(error), error.path, error.source,
+                    execplan_catalog_state.diagnostic_fingerprint(
+                        revision, error.code, str(error), error.related_paths,
+                    ), error.related_paths,
+                ),
+            )
+    else:
+        result = service.reconcile(repo)
+    if (result.kind is execplan_catalog_state.ReconciliationKind.RECONCILED
+            and on_reconciled is not None):
+        assert port.loaded is not None
+        on_reconciled(port.loaded)
+    catalog_reason = BlockReasonCode.EXECPLAN_CATALOG_INVALID.value
+    existing_block = scoped_blocking.project_block(connection, repo)
+    if result.kind is execplan_catalog_state.ReconciliationKind.INVALID_CATALOG:
+        if (not record_invalid or (existing_block is not None
+                and existing_block["reason_code"] != catalog_reason)):
+            return result
+        diagnostic = result.diagnostic
+        assert diagnostic is not None
+        location = diagnostic.path or "(catalog)"
+        source = f"; source={diagnostic.source}" if diagnostic.source else ""
+        evidence = (
+            "원격 ExecPlan catalog가 유효하지 않습니다: "
+            f"revision={diagnostic.revision_sha}; path={location}{source}; "
+            f"code={diagnostic.code}; {diagnostic.message}"
+        )
+        project = connection.execute(
+            "SELECT phase FROM projects WHERE repo = ?", (repo,)
+        ).fetchone()
+        plan_id = effects._plan_id_from_path(diagnostic.path or "")
+        with connection:
+            scoped_blocking.record_project_block(
+                connection,
+                repo,
+                BlockReasonCode.EXECPLAN_CATALOG_INVALID,
+                evidence,
+                diagnostic.fingerprint,
+                plan_id=plan_id,
+                previous_phase=(
+                    str(project["phase"])
+                    if project is not None and project["phase"]
+                    else None
+                ),
+            )
+            notifications.enqueue_current_project_events(connection, repo)
+        return result
+    if (
+        record_invalid
+        and result.kind is execplan_catalog_state.ReconciliationKind.RECONCILED
+        and existing_block is not None
+        and existing_block["reason_code"] == catalog_reason
+    ):
+        with connection:
+            scoped_blocking.clear_project_block(connection, repo)
+    return result
+
+
+@dataclass(frozen=True)
+class ReconcileExecutionExecplanCatalogEffects:
+    """Named effects for reconcile_execution_execplan_catalog; no entry-point/module access."""
+    reconcile_execplan_catalog: Callable[..., object]
+
+
+def reconcile_execution_execplan_catalog(
+    effects: ReconcileExecutionExecplanCatalogEffects, connection: sqlite3.Connection,
+    repo_path: Path,
+    repo: str,
+    base_branch: str,
+) -> execplan_catalog_state.CatalogReconciliationResult:
+    """Let the execution recovery gate persist its own final decision."""
+
+    return effects.reconcile_execplan_catalog(
+        connection, repo_path, repo, base_branch, record_invalid=False
+    )
+
+
+def _is_active_requirement(path: bytes) -> bool:
+    return re.fullmatch(rb"docs/requirements/[^/]*\.md", path) is not None
+
+
+@dataclass(frozen=True)
+class IsPlanningInputEffects:
+    """Named effects for _is_planning_input; no entry-point/module access."""
+    _is_active_requirement: Callable[..., object]
+
+
+def _is_planning_input(effects: IsPlanningInputEffects, path: bytes) -> bool:
+    if path in {b"AGENTS.md", b"docs/PRODUCT.md", b"docs/ARCHITECTURE.md"}:
+        return True
+    if effects._is_active_requirement(path):
+        return True
+    return not path.startswith(b"docs/")
+
+
+@dataclass(frozen=True)
+class IsSpecificationInputEffects:
+    """Named effects for _is_specification_input; no entry-point/module access."""
+    _is_active_requirement: Callable[..., object]
+
+
+def _is_specification_input(effects: IsSpecificationInputEffects, path: bytes) -> bool:
+    return path in {b"docs/PRODUCT.md", b"docs/ARCHITECTURE.md"} or (
+        effects._is_active_requirement(path)
+    )
+
+
+def _parse_execplan(
+    worktree: Path,
+    path: Path,
+    *,
+    require_priority: bool = False,
+    validate_sources: bool = True,
+    allow_archive_fallback: bool = True,
+) -> dict[str, object]:
+    return execplan_catalog.parse_execplan_file(
+        worktree,
+        path,
+        require_priority=require_priority,
+        validate_sources=validate_sources,
+        allow_archive_fallback=allow_archive_fallback,
+    )
+
+
+def _validate_dependency_graph(catalog: dict[str, dict[str, object]]) -> None:
+    return execplan_catalog.validate_dependency_graph(catalog)
+
+
+def load_execplan_snapshot(
+    worktree: Path,
+    *,
+    validate_sources: bool = True,
+    allow_archive_fallback: bool = True,
+) -> execplan_catalog.ExecPlanCatalogSnapshot:
+    return execplan_catalog.load_execplan_snapshot(
+        worktree,
+        validate_sources=validate_sources,
+        allow_archive_fallback=allow_archive_fallback,
+    )
+
+
+@dataclass(frozen=True)
+class LoadExecplanCatalogEffects:
+    """Named effects for load_execplan_catalog; no entry-point/module access."""
+    load_execplan_snapshot: Callable[..., object]
+
+
+def load_execplan_catalog(
+    effects: LoadExecplanCatalogEffects, worktree: Path,
+    *,
+    validate_sources: bool = True,
+    allow_archive_fallback: bool = True,
+) -> dict[str, dict[str, object]]:
+    return effects.load_execplan_snapshot(
+        worktree,
+        validate_sources=validate_sources,
+        allow_archive_fallback=allow_archive_fallback,
+    ).active_metadata()
+
+
+@dataclass(frozen=True)
+class ValidateExecplanEffects:
+    """Named effects for validate_execplan; no entry-point/module access."""
+    load_execplan_catalog: Callable[..., object]
+
+
+def validate_execplan(effects: ValidateExecplanEffects, worktree: Path, relative_path: str) -> dict[str, object]:
+    catalog = effects.load_execplan_catalog(worktree)
+    match = re.fullmatch(r"docs/plans/\[(G-\d{3,})\] [^/]+\.md", relative_path)
+    if match:
+        plan = catalog.get(match.group(1))
+        if plan is not None:
+            expected_path = f"docs/plans/[{plan['id']}] {plan['title']}.md"
+            if relative_path == expected_path:
+                return plan
+    raise RuntimeError(f"검증된 ExecPlan 카탈로그에 계획이 없습니다: {relative_path}")
+
+
+def _idea_tokens(text: str) -> tuple[str, ...]:
+    return tuple(re.findall(r"[0-9a-zA-Z가-힣]+", text.casefold()))
