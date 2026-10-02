@@ -89,7 +89,7 @@ class PlanningPublicationTest(PlanningCase):
                         self.assertEqual(ports.state.snapshot, snapshot)
                 self.assertEqual(ports.state.cycle, cycle)
 
-    def test_remote_base_race_discards_commit_before_push_or_registration(self):
+    def test_remote_base_race_preserves_commit_before_push_or_registration(self):
         ports = FakePorts(
             planning_snapshot(
                 phase="PLANNING",
@@ -106,17 +106,27 @@ class PlanningPublicationTest(PlanningCase):
         ports.git.remote = "concurrent-base"
         ports.git.ancestor = False
 
-        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+        coordinator = PlanningLifecycleCoordinator(ports)
+        run = coordinator._new_run(self.context)
+        run.planning_worktree = Path("/planning")
+        run.validated_result = ports.validation.result
+        run.dirty_files = list(ports.git.dirty_files)
+        run.current_fingerprint = "fingerprint"
+        run.general_fingerprint = "fingerprint"
+        run.specification_fingerprint = "specification"
+        outcome = coordinator._publication._publish_planner_result(run)
 
         self.assertEqual(
-            outcome.kind, PlanningOutcomeKind.PUBLICATION_RECOVERY
+            outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED
         )
         commands = [arguments for _repo, arguments, _check in ports.git.calls]
         self.assertIn(("commit", "-m", "Add ExecPlan G-001: Plan"), commands)
         self.assertNotIn(
             ("push", "origin", "HEAD:refs/heads/main"), commands
         )
-        self.assertEqual(len(ports.state.clear_calls), 1)
+        self.assertEqual(ports.state.clear_calls, [])
+        self.assertEqual(ports.state.snapshot.planner_session_id, None)
+        self.assertIsNotNone(ports.state.general_intent)
 
     def test_mutable_ready_race_after_fetch_stops_before_push(self):
         ports = FakePorts(
@@ -200,7 +210,9 @@ class PlanningPublicationTest(PlanningCase):
                 planning_result_completed=True,
             )
             ports = FakePorts(before)
-            ports.state.general_intent = object()
+            ports.state.general_intent = SimpleNamespace(
+                base_sha="base", commit_sha="plan-commit", stage="prepared",
+            )
             ports.git.remove_error = RuntimeError("cleanup failed")
 
             outcome = PlanningLifecycleCoordinator(ports).run(self.context)
@@ -228,7 +240,9 @@ class PlanningPublicationTest(PlanningCase):
             planning_result="saved result",
             planning_result_completed=True,
         ))
-        ports.state.general_intent = object()
+        ports.state.general_intent = SimpleNamespace(
+            base_sha="base", commit_sha="plan-commit", stage="prepared",
+        )
         ports.state.general_recovery_result = "pending"
         ports.git.dirty_files = ["docs/plans/[G-001] Plan.md"]
         ports.git.advance_remote_on_push = True
@@ -262,7 +276,9 @@ class PlanningPublicationTest(PlanningCase):
                 planning_result_completed=True,
             )
             ports = FakePorts(before)
-            ports.state.general_intent = object()
+            ports.state.general_intent = SimpleNamespace(
+                base_sha="base", commit_sha="plan-commit", stage="prepared",
+            )
             ports.state.general_recovery_result = "pending"
             def apply_batch(*_args):
                 ports.state.general_intent = None
@@ -307,7 +323,7 @@ class PlanningPublicationTest(PlanningCase):
             self.assertFalse(ports.state.validation_cleared)
             ports.state.publish_general_batch.assert_called_once()
 
-    def test_remote_publication_recovery_cleanup_failure_keeps_saved_result(self):
+    def test_remote_publication_retry_keeps_saved_result_and_workspace(self):
         with tempfile.TemporaryDirectory() as directory:
             worktree = Path(directory) / "planning"
             worktree.mkdir()
@@ -332,11 +348,12 @@ class PlanningPublicationTest(PlanningCase):
             self.assertEqual(ports.state.snapshot.planning_result,
                              "saved result")
             self.assertTrue(ports.state.snapshot.planning_result_completed)
-            self.assertEqual(ports.state.snapshot.planning_error_fingerprint,
-                             "fingerprint")
+            self.assertIsNone(ports.state.snapshot.planning_error_fingerprint)
             self.assertIsNotNone(ports.state.general_intent)
             self.assertTrue(worktree.exists())
             self.assertEqual(ports.agent.run_count, 0)
+            self.assertNotIn(("worktree", "remove", str(worktree)),
+                             [args for _repo, args, _check in ports.git.calls])
 
     def test_pending_maintenance_publication_cleanup_failure_restores_state(self):
         with tempfile.TemporaryDirectory() as directory:

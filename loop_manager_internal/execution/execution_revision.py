@@ -182,11 +182,9 @@ class DefinitionSnapshot:
         return _digest(
             "worker-input",
             (
-                self.path,
                 self.sources,
                 self.depends_on,
                 self.body_hash,
-                self.source_fingerprint,
                 self.archive_candidates,
             ),
         )
@@ -262,11 +260,9 @@ def classify_definition_delta(
 
 WORKER_INVALIDATING_DELTAS = frozenset(
     {
-        DefinitionDelta.PATH,
         DefinitionDelta.SOURCES,
         DefinitionDelta.DEPENDENCIES,
         DefinitionDelta.BODY,
-        DefinitionDelta.SOURCE_INPUT,
         DefinitionDelta.ARCHIVE_SCOPE,
     }
 )

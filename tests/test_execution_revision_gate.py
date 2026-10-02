@@ -62,7 +62,7 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
         self.assertEqual(completed.review_token, snapshot.review_token('base', 'base'))
 
 
-    def test_source_revision_invalidates_artifacts_but_preserves_sessions_and_workspace(self):
+    def test_source_revision_without_execplan_change_keeps_specification_artifacts(self):
         guarded = self.handler.guard(self.context())
         self.assertNotIsInstance(guarded, handlers.ExecutionOutcome)
         snapshot = DefinitionSnapshot.deserialize(
@@ -80,20 +80,20 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
             review_result='review-result',
             worker_input_token=snapshot.worker_token,
             archive_token=snapshot.archive_token,
-            verify_token=snapshot.verify_token('base'),
-            review_token=snapshot.review_token('base'),
-            publication_token=snapshot.publication_token('base'),
+            verify_token=snapshot.verify_token('base', 'base'),
+            review_token=snapshot.review_token('base', 'base'),
+            publication_token=snapshot.publication_token('base', 'base'),
         )
         self.effects.revision.source_fingerprint.return_value = 'changed-source'
 
         outcome = self.handler.guard(self.handler._context())
 
-        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+        self.assertNotIsInstance(outcome, ExecutionOutcome)
         row = self.state.row()
-        self.assertEqual(row['phase'], 'WORKING')
-        self.assertIsNone(row['worker_result'])
-        self.assertIsNone(row['verify_result'])
-        self.assertIsNone(row['review_result'])
+        self.assertEqual(row['phase'], 'PUBLISHING')
+        self.assertEqual(row['worker_result'], 'worker-result')
+        self.assertEqual(row['verify_result'], 'verify-result')
+        self.assertEqual(row['review_result'], 'review-result')
         self.assertEqual(row['worker_session_id'], 'worker-session')
         self.assertEqual(row['reviewer_session_id'], 'reviewer-session')
         self.assertEqual(row['branch'], 'loop-manager/G-047')

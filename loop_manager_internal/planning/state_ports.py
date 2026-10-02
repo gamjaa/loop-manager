@@ -154,6 +154,24 @@ class _PlanningStatePorts:
             new_base_sha=base_sha,
         )
 
+    def supersede_unpublished_general_intent(self, repo: str) -> None:
+        intent = self.general_publication(repo)
+        if intent is not None:
+            if intent.stage != "prepared":
+                raise RuntimeError("게시된 planning intent를 rebase로 대체할 수 없습니다.")
+            self._connection.execute(
+                "DELETE FROM general_planning_publications WHERE repo = ?", (repo,)
+            )
+            self._connection.commit()
+
+    def supersede_unpublished_maintenance_intent(
+        self, repo: str, cycle: maintenance_state.MaintenanceCycle,
+        base_sha: str,
+    ) -> maintenance_state.MaintenanceCycle:
+        return self._maintenance_repository.restart_prepared_batch(
+            repo, expected=cycle, new_base_sha=base_sha,
+        )
+
     def activate_ready(self, repo: str, base_sha: str) -> sqlite3.Row | None:
         return self._effects.activate_ready_execplan(
             self._connection, repo, self._state_dir, base_sha

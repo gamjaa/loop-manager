@@ -248,6 +248,12 @@ class FakeStatePort:
             self.clear_active("/repo")
         return self.general_recovery_result
 
+    def supersede_unpublished_general_intent(self, _repo):
+        self.general_intent = None
+
+    def supersede_unpublished_maintenance_intent(self, _repo, cycle, _base):
+        return cycle
+
     def record_general_intent(self, *_args):
         self.general_intent_record_count += 1
         if self.general_intent_record_count == self.general_intent_error_call:
@@ -330,6 +336,20 @@ class FakeGitPort:
 
     def changed_files(self, _worktree, _since=None):
         return list(self.dirty_files)
+
+    def rebase_planning_workspace(self, _repo, _fingerprint, _worktree, _old, target):
+        self.validate_worktree_ownership(_repo, _fingerprint, _worktree)
+        self.head = target
+        return SimpleNamespace(target=target, changed=True, conflict=False)
+
+    def complete_planning_rebase(self, *_args):
+        self.calls.append((None, ("complete_planning_rebase", *_args), True))
+
+    def accept_resolved_stash_conflict(self, *_args):
+        pass
+
+    def relevant_document_changes(self, *_args):
+        return ()
 
     def validate_managed_worktree(self, _worktree):
         pass

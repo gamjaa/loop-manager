@@ -41,6 +41,18 @@ class PlanningPublicationService(PlanningService):
             fingerprint = str(row.planning_attempt_fingerprint or "")
             try:
                 self._verify_recovery_workspace(run, worktree)
+                remote_sha = self._ports.git.run(
+                    context.repo_path, "rev-parse", "--verify",
+                    f"refs/remotes/origin/{context.base_branch}^{{commit}}",
+                ).stdout.strip()
+                published = self._ports.git.run(
+                    worktree, "merge-base", "--is-ancestor",
+                    general_intent.commit_sha, remote_sha, check=False,
+                ).returncode == 0
+                if remote_sha != general_intent.base_sha and not published:
+                    # The intent has not reached origin. Keep its candidate
+                    # and session for the owned-worktree rebase boundary.
+                    return None
                 with self._ports.state.transaction():
                     recovery = self._ports.state.recover_general_batch(
                         context.repo, worktree, context.base_branch
@@ -79,6 +91,13 @@ class PlanningPublicationService(PlanningService):
             run.base_sha = remote_sha
             recovered_cycle = None
             if remote_sha != cycle.publication_base_sha:
+                published = self._ports.git.run(
+                    worktree, "merge-base", "--is-ancestor",
+                    str(cycle.publication_commit_sha), remote_sha,
+                    check=False,
+                ).returncode == 0
+                if not published:
+                    return None
                 with self._ports.state.transaction():
                     recovered_cycle = self._ports.state.recover_maintenance_batch(
                         context.repo, worktree, context.base_branch
@@ -109,7 +128,30 @@ class PlanningPublicationService(PlanningService):
         worktree = run.planning_worktree
         assert worktree is not None
         validated_result = run.validated_result
+        pending_intent = (
+            self._ports.state.general_publication(context.repo) is not None
+            or run.maintenance_planning
+            and run.maintenance_cycle.publication_stage == "prepared"
+        )
+        if row.planning_error and not pending_intent:
+            self._ports.events.error(
+                f"해결되지 않은 planning 오류를 보존합니다: {row.planning_error}"
+            )
+            return self._operational_error()
         if validated_result is None:
+            self._ports.git.run(context.repo_path, "fetch", "origin")
+            latest_sha = self._ports.git.run(
+                context.repo_path, "rev-parse", "--verify",
+                f"refs/remotes/origin/{context.base_branch}^{{commit}}",
+            ).stdout.strip()
+            if latest_sha != row.active_sha:
+                self._ports.events.info(
+                    "planning 완료 기록 전 base가 전진해 작업을 보존합니다."
+                )
+                return PlanningOutcome(
+                    PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED,
+                    error=True,
+                )
             completed_fingerprint = self._ports.git.input_fingerprint(
                 context.repo_path, str(row.active_sha or "")
             )
@@ -120,7 +162,7 @@ class PlanningPublicationService(PlanningService):
             )
             self._ports.git.validate_worktree_ownership(
                 context.repo,
-                str(run.current_fingerprint or ""),
+                str(row.planning_attempt_fingerprint or run.current_fingerprint or ""),
                 worktree,
             )
             if run.maintenance_planning:
@@ -134,18 +176,11 @@ class PlanningPublicationService(PlanningService):
                         run.maintenance_context,
                     )
                 except MaintenancePlanningRestart:
-                    self._ports.git.run(
-                        context.repo_path,
-                        "worktree",
-                        "remove",
-                        "--force",
-                        str(worktree),
-                    )
                     self._ports.events.error(
-                        "유지보수 평가 중 base가 변경되어 최신 기준으로 다시 평가합니다."
+                        "유지보수 평가 중 base가 변경되어 관리 worktree를 보존합니다."
                     )
                     return PlanningOutcome(
-                        PlanningOutcomeKind.REMOTE_BASE_RESTART,
+                        PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED,
                         error=True,
                     )
                 except RuntimeError as error:
@@ -266,7 +301,7 @@ class PlanningPublicationService(PlanningService):
             try:
                 self._ports.git.validate_worktree_ownership(
                     context.repo,
-                    str(run.current_fingerprint or ""),
+                    str(row.planning_attempt_fingerprint or run.current_fingerprint or ""),
                     worktree,
                 )
                 if run.maintenance_cycle.publication_stage is None:
@@ -290,18 +325,11 @@ class PlanningPublicationService(PlanningService):
                         "복구할 수 없는 maintenance publication 단계입니다."
                     )
             except MaintenancePlanningRestart:
-                self._ports.git.run(
-                    context.repo_path,
-                    "worktree",
-                    "remove",
-                    "--force",
-                    str(worktree),
-                )
                 self._ports.events.error(
-                    "유지보수 계획 중 base가 변경되어 최신 기준으로 다시 평가합니다."
+                    "유지보수 계획 중 base가 변경되어 관리 worktree를 보존합니다."
                 )
                 return PlanningOutcome(
-                    PlanningOutcomeKind.REMOTE_BASE_RESTART, error=True
+                    PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED, error=True
                 )
             except RuntimeError as error:
                 message = str(error)
@@ -320,7 +348,7 @@ class PlanningPublicationService(PlanningService):
             try:
                 self._ports.git.validate_worktree_ownership(
                     context.repo,
-                    str(run.current_fingerprint or ""),
+                    str(row.planning_attempt_fingerprint or run.current_fingerprint or ""),
                     worktree,
                 )
                 self._ports.state.record_general_intent(
@@ -352,76 +380,24 @@ class PlanningPublicationService(PlanningService):
             not run.maintenance_planning
             and latest_sha not in {row.active_sha, plan_commit}
         ):
-            try:
-                with self._ports.state.transaction():
-                    recovery = self._ports.state.recover_general_batch(
-                        context.repo, worktree, context.base_branch
-                    )
-                    if recovery == "pending":
-                        raise RuntimeError(
-                            "원격 base가 이동했지만 publication recovery가 pending을 반환했습니다."
-                        )
-                    self._ports.git.run(
-                        context.repo_path,
-                        "worktree",
-                        "remove",
-                        str(worktree),
-                    )
-            except RuntimeError as error:
-                message = str(error)
-                self._ports.state.update(
-                    context.repo,
-                    planning_error=row.planning_error or message,
-                    planning_error_fingerprint=(
-                        row.planning_error_fingerprint or run.current_fingerprint
-                    ),
-                    last_error=message,
-                )
-                self._ports.events.error(message)
-                return self._operational_error()
             self._ports.events.info(
-                "게시된 일반 planning batch를 복구했습니다."
-                if recovery == "applied"
-                else "원격 변경에 맞춰 일반 planning batch를 다시 시작합니다."
+                "일반 planning 게시 전 base가 전진해 후보와 세션을 보존합니다."
             )
-            return PlanningOutcome(PlanningOutcomeKind.PUBLICATION_RECOVERY)
+            return PlanningOutcome(
+                PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED,
+                error=True,
+            )
         if run.maintenance_planning and latest_sha not in {
             row.active_sha,
             plan_commit,
         }:
-            try:
-                with self._ports.state.transaction():
-                    recovered_cycle = self._ports.state.recover_maintenance_batch(
-                        context.repo, worktree, context.base_branch
-                    )
-                    self._ports.git.run(
-                        context.repo_path,
-                        "worktree",
-                        "remove",
-                        str(worktree),
-                    )
-            except RuntimeError as error:
-                message = str(error)
-                self._ports.state.update(
-                    context.repo,
-                    planning_error=row.planning_error or message,
-                    planning_error_fingerprint=(
-                        row.planning_error_fingerprint or run.current_fingerprint
-                    ),
-                    last_error=message,
-                )
-                self._ports.events.error(message)
-                return self._operational_error()
-            if recovered_cycle.phase in {
-                maintenance_state.MaintenancePhase.ASSESSMENT,
-                maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
-            }:
-                self._ports.events.info(
-                    "미게시 유지보수 batch를 폐기하고 최신 기준으로 다시 평가합니다."
-                )
-            else:
-                self._ports.events.info("게시된 유지보수 batch를 복구했습니다.")
-            return PlanningOutcome(PlanningOutcomeKind.PUBLICATION_RECOVERY)
+            self._ports.events.info(
+                "유지보수 planning 게시 전 base가 전진해 후보와 세션을 보존합니다."
+            )
+            return PlanningOutcome(
+                PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED,
+                error=True,
+            )
 
         if not run.maintenance_planning:
             assert run.specification_fingerprint is not None
@@ -462,20 +438,8 @@ class PlanningPublicationService(PlanningService):
                 == 0
             )
             if not published:
-                self._ports.git.validate_worktree_ownership(
-                    context.repo,
-                    str(run.current_fingerprint or ""),
-                    worktree,
-                )
-                self._ports.git.run(
-                    context.repo_path,
-                    "worktree",
-                    "remove",
-                    str(worktree),
-                )
-                self._ports.state.clear_active(context.repo)
                 self._ports.events.error(
-                    "계획 중 base가 변경되어 최신 기준으로 다시 계획합니다."
+                    "계획 중 base가 변경되어 후보와 세션을 보존합니다."
                 )
                 return PlanningOutcome(
                     PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED,
@@ -524,7 +488,7 @@ class PlanningPublicationService(PlanningService):
                 else:
                     self._ports.git.validate_worktree_ownership(
                         context.repo,
-                        str(run.current_fingerprint or ""),
+                        str(row.planning_attempt_fingerprint or run.current_fingerprint or ""),
                         worktree,
                     )
                     assert run.specification_fingerprint is not None

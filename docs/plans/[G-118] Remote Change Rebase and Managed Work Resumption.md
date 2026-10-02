@@ -46,11 +46,25 @@ priority: critical
 
 ## Progress
 
-- [ ] 기존 planning·execution 원격 반영 및 재개 경계 조사
-- [ ] 원본 snapshot과 Planner 결과 분리 및 보존 rebase 연결
-- [ ] 단계별 관련 문서 확인·검증 무효화·게시 복구 구현
-- [ ] targeted unit test 및 Manager 전체 검증 경로 유지
+- [x] 기존 planning·execution 원격 반영 및 재개 경계 조사
+- [x] 원본 snapshot과 Planner 결과 분리 및 보존 rebase 연결
+- [x] 단계별 관련 문서 확인·검증 무효화·게시 복구 구현
+- [x] targeted unit test 및 Manager 전체 검증 경로 유지
 - [ ] Manager 전체 verify, 독립 Review 및 사용자 Merge
+
+### 구현 경계 대응
+
+| 계획의 조사 대상 | 현재 책임 소유 경계와 재사용 근거 |
+| --- | --- |
+| `planning_runtime.py`의 선택·원격 반영 | coordinator의 기존 순서를 유지하고 `selection_service.py`, `workspace_service.py`에서 소유 workspace를 보존한다. detached planning의 index·untracked 복원 journal은 `planning_rebase.py`에 둔다. |
+| READY 원본·최신 권한 | 기존 `planner_validation.py`의 revision blob snapshot과 SQLite CAS 검사를 재사용하고 `maintenance_validation.py`에서 신규 checkout 검사와 재개 원본 복원을 구분한다. |
+| Planner 호출·검증·게시 | `assessment_service.py`에서 완료 호출을 재사용하고 `publication_service.py`에서 미게시 후보를 보존한다. 기존 publication intent 복구가 이미 게시된 결과를 먼저 확정한다. |
+| 관련 문서·유지보수 근거 | `planning_document_relevance.py`가 source·dependency의 blob을 비교한다. `maintenance_file_review.py`는 원본 identity가 같은 잠정 파일 검토만 새 revision에 재검증해 재사용하며 관계 검증은 기존 source-bound 경계를 따른다. |
+| Worker·Reviewer 재확인 | `execution_revision.py`, `execution_revision_handler.py`에서 source 내용과 경로 이동을 Worker 재확인 입력에서 제외한다. 기존 후보 HEAD 토큰과 managed rebase acceptance가 targeted test·verify·Review를 무효화한다. |
+
+루트 항목 추가·이동은 없으며 새 모듈과 테스트는 기존 패키지·테스트 경로에 둔다. Linux verify의 명시적 compile 대상에 새 모듈을 추가하고 전체 검증 실행은 Manager에 맡긴다. R-051은 사용자 지정 경로로 원문을 보존해 archive 이동한다.
+
+재개 후보의 관련 unit test 101개가 통과했다. 잠정 검토 재사용과 충돌하는 기존 cycle 변경 테스트를 갱신한 뒤 같은 명령을 재실행했다. `test_planning_error_recovery.py`의 프로젝트 복구 시나리오는 폐기·새 세션 기대값을 보존·재개로 갱신했으며 통합 테스트 실행은 Manager 전체 verify에 남긴다. Worker는 전체 verify·Review·게시를 실행하지 않았다.
 
 ## Decision Log
 
@@ -60,3 +74,4 @@ priority: critical
 - 새로운 운영상 장애의 안전한 복구를 우선해 priority를 critical로 둔다. 다른 계획과 충돌하는 코드·테스트 추출은 본 작업에 필요한 책임 경계로 제한한다.
 
 - 2026-10-02: 사용자가 G-118의 ARCHITECTURE diff를 확인하고 반영을 승인했다. 이 정확한 문서 변경은 별도 사용자 결정 commit으로 게시하며 Worker는 해당 문서를 다시 수정하지 않는다. 기존 작업물·session과 범위 검사, Manager 전체 verify·Review 및 사용자 Merge 조건을 유지한다.
+- 2026-10-02: 재개 세션에서 현재 HEAD 대비 후보 전체를 재검토했다. prepared commit 위의 미커밋 변경은 rebased commit에 먼저 복원하고 soft reset으로 검증 후보를 구성해 staged·unstaged 구분을 보존한다. stash apply·reset 직후 중단, 완료된 no-change 호출 재사용과 내용 보존 ExecPlan 이동을 targeted unit test로 검증한다. 보존 stash는 SQLite의 새 base 확정과 작업물 identity 확인 뒤에만 제거한다.

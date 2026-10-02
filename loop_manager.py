@@ -1465,6 +1465,7 @@ prepare_maintenance_planning_context = _bind_effects(
         _maintenance_context=lambda *args, **kwargs: _maintenance_context(*args, **kwargs),
         _maintenance_mode_and_rows=lambda *args, **kwargs: _maintenance_mode_and_rows(*args, **kwargs),
         _ready_plan_snapshot=lambda *args, **kwargs: _ready_plan_snapshot(*args, **kwargs),
+        _ready_plan_snapshot_at_revision=lambda *args, **kwargs: _ready_plan_snapshot_at_revision(*args, **kwargs),
     ),
 )
 

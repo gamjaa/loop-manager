@@ -202,6 +202,13 @@ class PlanningStatePort(Protocol):
         base_sha: str,
     ) -> maintenance_state.MaintenanceCycle: ...
 
+    def supersede_unpublished_general_intent(self, repo: str) -> None: ...
+
+    def supersede_unpublished_maintenance_intent(
+        self, repo: str, cycle: maintenance_state.MaintenanceCycle,
+        base_sha: str,
+    ) -> maintenance_state.MaintenanceCycle: ...
+
     def activate_ready(self, repo: str, base_sha: str) -> Any | None: ...
 
     def preserve_diagnostics(
@@ -360,6 +367,24 @@ class PlanningGitPort(Protocol):
     def changed_files(
         self, worktree: Path, since: str | None = None
     ) -> list[str]: ...
+
+    def rebase_planning_workspace(
+        self, repo: str, fingerprint: str, worktree: Path,
+        old_base: str, target: str,
+    ) -> Any: ...
+
+    def complete_planning_rebase(
+        self, repo: str, worktree: Path, target: str,
+    ) -> None: ...
+
+    def accept_resolved_stash_conflict(
+        self, repo: str, worktree: Path, target: str,
+    ) -> None: ...
+
+    def relevant_document_changes(
+        self, worktree: Path, old: str, target: str,
+        edited_paths: list[str], catalog_rows: Sequence[Any],
+    ) -> tuple[str, ...]: ...
 
     def validate_managed_worktree(self, worktree: Path) -> None: ...
 

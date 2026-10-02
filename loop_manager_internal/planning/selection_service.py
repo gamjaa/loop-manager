@@ -17,6 +17,12 @@ class PlanningSelectionService(PlanningService):
         """Check the failed input before scheduling or stale-workspace cleanup."""
 
         row = run.row
+        if (row.phase == "PLANNING" and row.planning_workspace_owned == 1
+                and row.active_sha != run.base_sha):
+            # A remote advance is handled in the owned workspace. Keep any
+            # independent planning error until the preserved result is checked.
+            run.error_input_changed = True
+            return None
         if not row.planning_error or run.publication_recovery_verified:
             return None
         cycle = run.maintenance_cycle
@@ -397,6 +403,7 @@ class PlanningSelectionService(PlanningService):
             and cycle.publication_stage is None
             and row.phase == "PLANNING"
             and not row.planning_error
+            and row.planning_workspace_owned != 1
         ):
             stale_worktree = Path(str(row.worktree or ""))
             stored_fingerprint = str(row.planning_attempt_fingerprint or "")
@@ -461,7 +468,8 @@ class PlanningSelectionService(PlanningService):
             )
             return self._operational_error()
 
-        if row.planning_error and not recoverable_publication:
+        if (row.planning_error and not recoverable_publication
+                and row.planning_workspace_owned != 1):
             outcome = self._discard_stale_planning(run, row)
             if outcome is not None:
                 return outcome
@@ -481,7 +489,8 @@ class PlanningSelectionService(PlanningService):
             started_fingerprint = (
                 row.planning_attempt_fingerprint or run.current_fingerprint
             )
-            if started_fingerprint != run.current_fingerprint:
+            if (started_fingerprint != run.current_fingerprint
+                    and row.planning_workspace_owned != 1):
                 outcome = self._discard_stale_planning(
                     run,
                     row,
