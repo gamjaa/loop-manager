@@ -16410,8 +16410,31 @@ def _reconciled_manager_scope_metadata(connection, repo_path, state_dir, repo,
                                       plan_id, before, current, resources=None):
     """Use fetch receipts/CAS effects and exact Merge cleanup, never ref drift."""
     scope_before, scope_current = agent_scope_decision.scoped_metadata(before, current, resources)
+    _ensure_cleanup_pending_schema(connection)
     proven_refs = _proven_manager_base_refs(
         connection, repo_path, repo, plan_id or '', scope_before, scope_current)
+    sqlite_fetches = []
+    for row in connection.execute(
+            "SELECT refname, before_ref, target_oid, action_token FROM manager_base_fetches "
+            "WHERE repo = ? AND plan_id = ? AND phase IN ('pending', 'complete')",
+            (repo, plan_id or '')):
+        try:
+            previous = json.loads(str(row['before_ref']))
+        except (TypeError, ValueError):
+            continue
+        if (not re.fullmatch(r'[0-9a-f]{32}', str(row['action_token'] or ''))
+                or not str(row['refname']).startswith('refs/remotes/origin/')
+                or not re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', str(row['target_oid']))
+                or previous is not None and (not isinstance(previous, list)
+                    or len(previous) != 2 or previous[1] != ''
+                    or not isinstance(previous[0], str)
+                    or not re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', previous[0]))):
+            continue
+        sqlite_fetches.append(dict(version=1, id=row['action_token'],
+            owner=f"guidance:{plan_id}", repo=str(_canonical_path(repo_path)),
+            kind='project_fetch', target=row['refname'],
+            before={'oid': previous[0] if previous is not None else None},
+            expected={'oid': row['target_oid']}))
     live_refs = {key: value[0] for key, value in scope_current.refs.items() if not value[1]}
     def marker(intent):
         if intent.get('kind') not in {'bootstrap_fetch', 'project_fetch'}:
@@ -16420,12 +16443,12 @@ def _reconciled_manager_scope_metadata(connection, repo_path, state_dir, repo,
         output = git(repo_path, 'reflog', 'show', '--format=%H%x00%gs', ref, check=False)
         return bool(not output.returncode and manager_git_journal.fetch_reflog_matches(
             state_dir, str(_canonical_path(repo_path)), intent,
-            output.stdout.splitlines(), live_refs.get(ref)))
+            output.stdout.splitlines(), live_refs.get(ref), additional_fetches=sqlite_fetches))
     evidence = manager_git_journal.verified_candidates(
         state_dir, str(_canonical_path(repo_path)),
         baseline_refs={key: value[0] for key, value in scope_before.refs.items() if not value[1]},
         baseline_worktrees={}, live_refs=live_refs, live_worktrees={}, marker=marker,
-        include_pending_fetch=True,
+        include_pending_fetch=True, additional_fetches=sqlite_fetches,
         fetch_refs=frozenset(key for key in scope_before.refs.keys() | scope_current.refs.keys()
                              if key.startswith('refs/remotes/origin/')
                              and scope_before.refs.get(key) != scope_current.refs.get(key)

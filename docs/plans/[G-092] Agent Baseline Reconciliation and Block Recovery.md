@@ -65,6 +65,8 @@ Agent 시작 snapshot 뒤에 Manager의 검증된 Git 작업이 있어도 현재
 
 2026-10-02 공유 fixture 보정: 위 fetch 변경에서 추가한 helper를 project recovery fixture의 재사용 목록에도 연결했다. Manager가 보고한 동일 초기화 오류 28건에 해당하는 project recovery 클래스와 catalog recovery unit test가 모두 통과했다. 전체 verify는 실행하지 않았고 Loop Manager 재검증을 기다린다.
 
+2026-10-02 Review 보정: 현재 Agent 기준선에서 필요한 전이만 소유 reflog로 검사해 기준선 이전의 fetch·외부 변경이 새 전이를 거부하지 않게 했다. SQLite action token은 같은 repository·계획·ref·전후 OID의 fetch로 연결해 일반 journal fetch와 양방향 연쇄를 검증하며, Git 실행 표식이 없는 완료 행은 후보에서 제외한다. 외부 변경·identity 불일치·중단 복구·감사 보존을 포함한 fake-port unit test 23개가 최종 실행에서 통과했다. 첫 targeted 실행의 기존 반환 계약 차이는 수정 후 같은 명령으로 재실행했으며 전체 verify는 Loop Manager 재검증 대기다.
+
 ## Decision Log
 
 - 과거 실행에 쓰기 격리 증거가 없으면 무관한 shared ref·worktree 변화를 자동으로 외부 변경이라 단정하지 않는다. G-088/G-089와 G-090/G-091의 독립 증거가 있는 경우에만 해제한다.
@@ -73,3 +75,4 @@ Agent 시작 snapshot 뒤에 Manager의 검증된 Git 작업이 있어도 현재
 - 2026-09-30: mutable READY snapshot의 기준 revision·원본 hash를 확인해 R-048을 반영했다. 앞선 기록의 rebase 작업 수행 증거 요구는 G-109·G-110의 현재 상태 판정으로 대체한다. G-110은 rebase 충돌/완료 원인의 수동 복구를 먼저 구현하고, 이 계획은 그 결과에 기반한 Agent scope 기준선·정상 stage 오탐 복구를 담당한다. 격리 없는 과거 Agent 실행의 무관한 ref/worktree 변화는 계속 소급 허용하지 않는다.
 - 2026-10-02: G-109/G-110의 현재 rebase 서비스·기준선 수용·원자적 원인 해제·후보 재검증을 재사용했다. 실제 Agent 결과를 먼저 검사한 뒤 선택 rebase 상태만 비교 기준선에 반영하고, fetch에는 일치하는 전후 intent와 끊김 없는 소유 reflog 전이를 요구한다. 복구 worktree는 해당 create receipt만 검증하므로 무관한 과거 rebase journal 누락이 gate가 되지 않는다. 원본 snapshot과 수동 복구 감사를 Manager 실행·격리 증거로 바꾸지 않는다. 새 scope 해제는 입력 지문 변경을 요구하지 않으며 다른 Review·planning·계획 차단과 retry·실패 이력을 보존한다. Requirement archive 허용 경로도 revision별 eligibility를 재사용한다.
 - 검증 피드백에서 드러난 기존 사용자 교정 흐름은 보존한다. 입력 변경 없는 오탐 해제에는 저장된 Agent 결과의 안전성을 요구하고, 실제 위반의 복원·격리 후 재개는 기존 입력 변경 교정 경로로 넘긴다. 현재 index 보안 flags가 복원되지 않았거나 프로젝트 안전 gate·다른 활성 실행이 남으면 그 경로도 진행하지 않는다.
+- 2026-10-02: fetch의 현재 소유 표식은 Agent 기준선부터 현재 값까지 필요한 전이에 요구한다. journal ID와 SQLite action token은 구분하되 같은 소유 작업의 정확한 전후 값으로 연결하며, 중간 외부 reflog·다른 계획/자원·실행 표식 부재는 현재 기준선 갱신의 근거가 아니다. 이 결합은 기존 기록을 읽기만 하고 receipt를 생성하거나 수정하지 않는다.

@@ -7,7 +7,7 @@ ownership from an OID or elapsed time alone.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 import hashlib
 import json
 import os
@@ -724,13 +724,25 @@ def _finish(
 
 
 def fetch_reflog_matches(state_dir: Path, repo: str, intent: Mapping[str, Any],
-                         lines: list[str], live_oid: str | None) -> bool:
-    """Require this fetch at the tip or an uninterrupted journal-owned suffix."""
-    action = f"{intent['expected']['oid']}\0loop-manager-base-fetch:{intent['id']}"
-    if lines.count(action) != 1:
+                         lines: list[str], live_oid: str | None, *,
+                         additional_fetches: Sequence[Mapping[str, Any]] = ()) -> bool:
+    """Require this fetch and its suffix, including bound SQLite actions."""
+    # SQLite's action token differs from the journal identity. Bind an alias
+    # to the same owner, resource and exact transition before accepting it.
+    tokens = {intent['id']} | {
+        saved['id'] for saved in additional_fetches
+        if all(saved.get(key) == intent.get(key)
+               for key in ('repo', 'owner', 'kind', 'target', 'before', 'expected'))}
+    actions = {f"{intent['expected']['oid']}\0loop-manager-base-fetch:{token}" for token in tokens}
+    positions = [index for index, line in enumerate(lines) if line in actions]
+    if len(positions) != 1:
+        return False
+    position = positions[0]
+    if (position + 1 < len(lines)
+            and lines[position + 1].partition('\0')[0] != intent['before']['oid']):
         return False
     cursor = intent['expected']['oid']
-    for line in reversed(lines[:lines.index(action)]):
+    for line in reversed(lines[:position]):
         match = re.fullmatch(r'([0-9a-fA-F]{40}|[0-9a-fA-F]{64})\x00loop-manager-base-fetch:([0-9a-f]{32})', line)
         if match is None:
             return False
@@ -746,8 +758,16 @@ def fetch_reflog_matches(state_dir: Path, repo: str, intent: Mapping[str, Any],
                         or saved.get('expected') != {'oid': oid}):
                     return False
                 successors.append(saved)
+        successors.extend(saved for saved in additional_fetches if saved.get('id') == token)
         if len(successors) != 1:
             return False
+        saved = successors[0]
+        if (saved.get('repo') != repo or saved.get('kind') not in {'bootstrap_fetch', 'project_fetch'}
+                or saved.get('target') != intent['target']
+                or saved.get('before') != {'oid': cursor}
+                or saved.get('expected') != {'oid': oid}):
+            return False
+        verified_transition(saved, {'oid': oid}, True)
         cursor = oid
     return cursor == live_oid
 
@@ -759,15 +779,16 @@ def verified_candidates(
     marker: Callable[[Mapping[str, Any]], bool],
     include_pending_fetch: bool = False,
     fetch_refs: frozenset[str] | None = None,
+    additional_fetches: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, dict[str, Any]]:
     """Offer only unbroken, owned transitions from a caller's baseline to Git."""
     root = state_dir / "manager-git-journal"
     candidates: dict[str, dict[str, Any]] = {"refs": {}, "worktrees": {}}
-    if not root.exists():
+    if not root.exists() and not additional_fetches:
         return candidates
-    transitions: dict[tuple[str, str], list[tuple[Any, Any]]] = {}
+    transitions: dict[tuple[str, str], list[tuple[Any, Any, Mapping[str, Any]]]] = {}
     active_targets: set[tuple[str, str]] = set()
-    slots = (root.iterdir() if fetch_refs is None else (
+    slots = ((root.iterdir() if root.exists() else ()) if fetch_refs is None else (
         _slot(state_dir, repo, kind, ref)
         for kind in ('bootstrap_fetch', 'project_fetch') for ref in fetch_refs))
     for slot in slots:
@@ -797,7 +818,7 @@ def verified_candidates(
                 # receipt save. Do not fabricate or finalize execution audit.
                 verified_transition(intent, {'oid': live_refs[target]}, True)
                 transitions.setdefault(('refs', target), []).append(
-                    (intent['before']['oid'], intent['expected']['oid']))
+                    (intent['before']['oid'], intent['expected']['oid'], intent))
             else:
                 active_targets.add((category, target))
         for result_path in slot.glob("*.result.json"):
@@ -818,7 +839,7 @@ def verified_candidates(
             if str(intent.get("kind", "")).startswith("managed_"):
                 continue
             validated = verified_transition(
-                intent, result["observed"], marker(intent),
+                intent, result["observed"], True,
             )
             if validated != result["candidates"]:
                 raise MutationEvidenceError("Manager Git 저장된 기준선 후보가 불일치합니다.")
@@ -826,7 +847,15 @@ def verified_candidates(
                 for target, value in validated.get(category, {}).items():
                     before = intent["before"]
                     prior = before["oid"] if category == "refs" else before["registration"]
-                    transitions.setdefault((category, target), []).append((prior, value))
+                    transitions.setdefault((category, target), []).append((prior, value, intent))
+    for intent in additional_fetches:
+        if (intent.get('repo') != repo or intent.get('kind') not in {'bootstrap_fetch', 'project_fetch'}
+                or fetch_refs is not None and intent.get('target') not in fetch_refs
+                or not marker(intent)):
+            continue
+        verified_transition(intent, intent['expected'], True)
+        transitions.setdefault(('refs', intent['target']), []).append(
+            (intent['before']['oid'], intent['expected']['oid'], intent))
     for (category, target), steps in transitions.items():
         if (category, target) in active_targets:
             continue
@@ -843,17 +872,23 @@ def verified_candidates(
             if key in seen:
                 break
             seen.add(key)
-            next_values = [after for before, after in remaining if before == cursor]
+            # A completed record before this Agent baseline need not own the
+            # current reflog suffix. Check only transitions we actually follow.
+            next_steps = [step for step in remaining if step[0] == cursor]
+            owned_steps = [step for step in next_steps if marker(step[2])]
+            if next_steps and not owned_steps:
+                raise MutationEvidenceError("Manager Git 결과 또는 작업 소유 표식이 일치하지 않습니다.")
+            next_values = [step[1] for step in owned_steps]
             if not next_values or any(value != next_values[0] for value in next_values):
                 break
             value = next_values[0]
-            remaining = [(before, after) for before, after in remaining
-                         if not (before == cursor and after == value)]
+            remaining = [step for step in remaining
+                         if not (step[0] == cursor and step[1] == value)]
             cursor = value
             if cursor == wanted:
                 # A later owned transition out of this state means a live
                 # reversion cannot be attributed to this earlier result.
-                if not any(before == cursor for before, _after in remaining):
+                if not any(step[0] == cursor and marker(step[2]) for step in remaining):
                     candidates[category][target] = cursor
                 break
     return candidates

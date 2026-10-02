@@ -2058,7 +2058,8 @@ class ManagerBaselineReconciliationUnitTests(unittest.TestCase):
         self.git = patcher.start()
         self.addCleanup(patcher.stop)
 
-    def record_fetch(self, *, interrupted=False, before_oid='a' * 40, target_oid='b' * 40):
+    def record_fetch(self, *, interrupted=False, before_oid='a' * 40, target_oid='b' * 40,
+                     sqlite=False):
         current = {'oid': before_oid}
         def apply(token):
             current['oid'] = target_oid
@@ -2066,6 +2067,39 @@ class ManagerBaselineReconciliationUnitTests(unittest.TestCase):
         options = dict(owner='project', kind='project_fetch', repo=str(self.source), target=self.ref,
             before={'oid': before_oid}, expected={'oid': target_oid},
             observe=lambda: dict(current), apply=apply, marker=lambda _intent: True)
+        if sqlite:
+            from types import SimpleNamespace
+            loop_manager._ensure_cleanup_pending_schema(self.connection)
+            def git(_repo, *args, **kwargs):
+                if args[:1] == ('ls-remote',):
+                    output = target_oid + '\trefs/heads/main\n'
+                elif args[:1] == ('rev-parse',):
+                    output = target_oid if args[-1] == 'FETCH_HEAD^{commit}' else current['oid']
+                elif args[:1] == ('update-ref',):
+                    self.assertEqual(args[-3:], (self.ref, target_oid, before_oid))
+                    current['oid'] = target_oid
+                    self.reflog = target_oid + '\0' + args[3] + '\n' + self.reflog
+                    output = ''
+                elif args[:2] == ('reflog', 'show'):
+                    output = self.reflog
+                elif args == ('fetch', '--no-tags', '--refmap=', 'origin', 'refs/heads/main'):
+                    output = ''
+                else:
+                    raise AssertionError('Unexpected Git call: ' + repr(args))
+                return SimpleNamespace(stdout=output, returncode=0)
+            with mock.patch.object(loop_manager, 'git', side_effect=git):
+                before = replace(self.before, refs={self.ref: (before_oid, '')})
+                identity = loop_manager._record_manager_base_fetch_intent(
+                    self.connection, self.source, str(self.source), 'G-092', 'main', before)
+                if interrupted:
+                    with mock.patch.object(manager_git_journal, '_finish', side_effect=RuntimeError('interrupted')):
+                        with self.assertRaisesRegex(RuntimeError, 'interrupted'):
+                            loop_manager._journaled_manager_base_fetch(
+                                self.connection, self.source, self.state, identity, 'main', 'G-092')
+                else:
+                    loop_manager._journaled_manager_base_fetch(
+                        self.connection, self.source, self.state, identity, 'main', 'G-092')
+            return
         if interrupted:
             with mock.patch.object(manager_git_journal, '_finish', side_effect=RuntimeError('interrupted')):
                 with self.assertRaisesRegex(RuntimeError, 'interrupted'):
@@ -2124,6 +2158,74 @@ class ManagerBaselineReconciliationUnitTests(unittest.TestCase):
         self.reflog = newest + f"\n{'b' * 40}\0external revert\n" + prior
         with self.assertRaises(manager_git_journal.MutationEvidenceError):
             self.reconcile()
+
+    def test_new_agent_baseline_ignores_old_fetch_before_external_change(self):
+        self.record_fetch()
+        self.reflog = 'c' * 40 + '\0external update\n' + self.reflog
+        self.before = replace(self.before, refs={self.ref: ('c' * 40, '')})
+        self.record_fetch(before_oid='c' * 40, target_oid='d' * 40)
+        self.current = replace(self.current, refs={self.ref: ('d' * 40, '')})
+        audit = {path: path.read_bytes() for path in self.state.rglob('*.json')}
+        self.assertEqual(self.reconcile().refs[self.ref], ('d' * 40, ''))
+        self.assertEqual(self.reconcile().dirty, self.before.dirty)
+        self.assertEqual({path: path.read_bytes() for path in self.state.rglob('*.json')}, audit)
+        # The same external change is unsafe when it follows this baseline.
+        self.before = replace(self.before, refs={self.ref: ('a' * 40, '')})
+        with self.assertRaises(manager_git_journal.MutationEvidenceError):
+            self.reconcile()
+
+    def test_old_fetch_from_repeated_baseline_oid_does_not_shadow_current_fetch(self):
+        self.record_fetch()
+        self.reflog = 'a' * 40 + '\0external revert\n' + self.reflog
+        self.record_fetch(target_oid='d' * 40)
+        self.current = replace(self.current, refs={self.ref: ('d' * 40, '')})
+        self.assertEqual(self.reconcile().refs[self.ref], ('d' * 40, ''))
+
+    def test_mixed_fetch_tokens_accept_both_orders_and_interrupted_sqlite_effect(self):
+        state = self.state
+        for order in ((False, True), (True, False), (False, True, False)):
+            for interrupted in (False, True):
+                with self.subTest(order=order, interrupted=interrupted):
+                    self.state = state / (str(order) + str(interrupted))
+                    loop_manager._ensure_cleanup_pending_schema(self.connection)
+                    self.connection.execute('DELETE FROM manager_base_fetches')
+                    self.reflog = ''
+                    oids = ['a' * 40, 'b' * 40, 'c' * 40, 'd' * 40]
+                    for index, sqlite_fetch in enumerate(order):
+                        self.record_fetch(before_oid=oids[index], target_oid=oids[index + 1],
+                            sqlite=sqlite_fetch, interrupted=interrupted and sqlite_fetch)
+                    self.current = replace(self.current, refs={self.ref: (oids[len(order)], '')})
+                    audit = {path: path.read_bytes() for path in self.state.rglob('*.json')}
+                    self.assertEqual(self.reconcile().refs[self.ref], (oids[len(order)], ''))
+                    self.assertEqual(self.before.refs[self.ref], ('a' * 40, ''))
+                    self.assertEqual({path: path.read_bytes() for path in self.state.rglob('*.json')}, audit)
+
+    def test_mixed_fetch_chain_requires_exact_sqlite_identity_and_reflog(self):
+        self.record_fetch()
+        self.record_fetch(before_oid='b' * 40, target_oid='c' * 40, sqlite=True)
+        self.record_fetch(before_oid='c' * 40, target_oid='d' * 40)
+        self.current = replace(self.current, refs={self.ref: ('d' * 40, '')})
+        self.assertEqual(self.reconcile().refs[self.ref], ('d' * 40, ''))
+        for column, value in (('repo', '/other'), ('plan_id', 'G-099'),
+                ('refname', 'refs/remotes/origin/other'), ('phase', 'aborted'),
+                ('action_token', 'f' * 32), ('before_ref', '["' + 'a' * 40 + '", ""]'),
+                ('target_oid', 'e' * 40)):
+            with self.subTest(column=column):
+                self.connection.execute('SAVEPOINT mutation')
+                try:
+                    self.connection.execute('UPDATE manager_base_fetches SET ' + column + ' = ?', (value,))
+                    with self.assertRaises(manager_git_journal.MutationEvidenceError):
+                        self.reconcile()
+                finally:
+                    self.connection.execute('ROLLBACK TO mutation')
+                    self.connection.execute('RELEASE mutation')
+        reflog = self.reflog
+        newest, previous = reflog.split('\n', 1)
+        self.reflog = newest + '\n' + 'b' * 40 + '\0external round trip\n' + previous
+        with self.assertRaises(manager_git_journal.MutationEvidenceError):
+            self.reconcile()
+        self.reflog = reflog
+        self.assertEqual(self.reconcile().refs[self.ref], ('d' * 40, ''))
 
     def test_archive_push_keeps_tracking_ref_for_owned_fetch_and_later_scope_refresh(self):
         from types import SimpleNamespace
