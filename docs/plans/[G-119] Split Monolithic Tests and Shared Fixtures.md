@@ -100,7 +100,7 @@ Support import는 patch·파일 생성·DB 갱신을 시작하지 않으며 `__i
 ### Collection and preservation evidence
 
 - 실행 없는 이전/이후 `TestLoader.discover` 대조: 기존 1,829개 ID를 아래 이동표로 정규화했을 때 누락 0, 중복 0. fixture 상속에는 test method가 없으므로 inherited scenario의 중복 수집도 없다.
-- 신규 fixture 경계 unit test 9개와 Worker 보고 형식 unit test 1개를 더해 최종 discovery는 1,839개를 한 번씩 수집한다. Discovery는 case를 실행하지 않았다.
+- 신규 fixture 경계 unit test 10개와 Worker 보고 형식 unit test 1개를 더해 최종 discovery는 1,840개를 한 번씩 수집한다. Discovery는 case를 실행하지 않았다.
 - AST 대조: 원래 1,829개 method 중 1,754개 body는 동일하며 75개는 support import/factory 호출, patch 정의 위치 또는 setup 소비 경계만 변경됐다. 각 method의 assertion call과 subTest 입력 AST multiset은 모두 동일하며 원래 skip 등 decorator도 보존했다. 단순 이동 method의 mock side effect도 보존했다. assertion-bearing scenario helper 두 개는 기존 test module에 남기고 실제 test owner와 순수 fixture를 명시적으로 전달한다.
 - 양 OS verify의 기존 `unittest discover -s tests`가 새 `test_*.py` 모듈을 포함하므로 명령·상한·skip 조건을 바꿀 필요가 없다. verify 스크립트는 수정·실행하지 않았다.
 
@@ -152,6 +152,17 @@ Manager 전체 verify, 독립 Review, 선행 Merge 확인 및 사용자 Merge는
 - `python3 -m unittest tests.test_worker_result_contract.WorkerResultContractTest.test_two_corrected_runs_keep_initial_outcomes_and_clean_final_results tests.test_worker_result_contract.WorkerResultContractTest.test_targeted_test_evidence_requires_a_clean_explicit_rerun -v`: 2개 PASS.
 - 위 두 이력의 동일 명령을 다시 실행: fixture module 9개 PASS, recovery 대표 method 5개 PASS. 이번 결과 교정에서 실행한 16개는 모두 통과했다.
 - 최종 Worker 메시지의 정확한 metadata와 targeted evidence를 `parse_worker_result`와 `parse_worker_outcome`에 직접 전달해 두 검증기가 수락함을 확인했다. 전체 verify·integration test·commit·push·PR 생성은 수행하지 않았다.
+
+### Scheduler compatibility correction (2026-10-02)
+
+Manager verify feedback `verify:37b4a49fe6e095cf3789e35223ecd7ba1a64bdcea1406ab3cd46a3463c661e6a` (occurrence=1, revision=1)에서 `CatalogSchedulingTest.test_dependency_blocked_ready_is_not_an_empty_catalog`의 runnable Worker가 `unused.ini` 설정 오류로 Agent fake에 도달하지 못했다. 직접 lifecycle을 호출하는 case를 기준으로 명시적 context를 적용하면서 scheduler를 통한 간접 호출을 빠뜨린 것이 원인이다.
+
+해당 method에도 기존 `@dummy_worker_sessions`를 적용했다. 원래 method body의 AST는 동일하며 planner/worker 역할, catalog 상태와 planning baseline assertion을 그대로 유지했다. 런타임과 공유 fixture 구현은 변경하지 않았다.
+
+- 새 unit case `SupportFixtureTests.test_dummy_profiles_cover_scheduler_threads_and_restore_after_join`는 외부 Git·DB·Agent 실행 없이 scheduler의 project 경계만 mock한다. 실제 thread dispatch에서 Worker fake profile과 Planner의 기존 profile 경로가 함께 적용되고, scheduler 종료 뒤 설정 오류를 포함한 원래 profile callable이 복원되는지 확인한다.
+- `python3 -m unittest tests.test_support_fixtures.SupportFixtureTests.test_dummy_profiles_cover_scheduler_threads_and_restore_after_join tests.test_support_fixtures.SupportFixtureTests.test_decorated_case_does_not_change_following_profile_lookup -v`: 2개 PASS. 이번 교정에는 targeted 실행 오류가 없었으며 누적 성공 집합은 신규 11개와 기존 대표 35개, 총 46개다.
+- 실행 없는 discovery 대조: 1,840개 수집, 기존 1,829개 ID를 이동표로 정규화한 누락 0·중복 0. 위 피드백 case의 원래 body 보존과 명시적 decorator도 AST로 확인했다.
+- 피드백의 원래 case는 실제 Git 저장소·이력을 만드는 integration 시나리오이므로 Worker는 실행하지 않았다. 해당 case 및 전체 verify의 최종 확인은 Manager 재검증에 남긴다.
 
 ### Follow-up test locations
 

@@ -6,6 +6,7 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -122,6 +123,41 @@ with (mock.patch.object(sqlite3, 'connect', side_effect=AssertionError('DB at im
             self.assertEqual(loop_manager._agent_profile(
                 Path('unused.ini'), 'codex', 'worker', 1, Path('/managed')), 'unpatched')
             real_profile.assert_called_once()
+
+    def test_dummy_profiles_cover_scheduler_threads_and_restore_after_join(self):
+        projects = (SimpleNamespace(repo='blocked'), SimpleNamespace(repo='runnable'))
+        config = loop_manager.ManagedConfig(Path('/fixture/unused.ini'), 2, '', '')
+        configured = loop_manager.AgentProfile('configured-planner', 'high')
+
+        def real_profile(config_path, provider, role_name, level, worktree):
+            if role_name == 'worker':
+                raise loop_manager.ManagedConfigError('missing worker config')
+            return configured
+
+        def run_project(project, state_dir, config_path, *_args, **_kwargs):
+            role_name = 'planner' if project.repo == 'blocked' else 'worker'
+            profile = loop_manager._agent_profile(
+                config_path, 'codex', role_name, 1, Path(project.repo))
+            return project.repo, profile, threading.get_ident()
+
+        @dummy_worker_sessions
+        def run_scheduler():
+            return loop_manager.schedule_registered_projects(None, Path('/state'), config)
+
+        with mock.patch.object(loop_manager, '_agent_profile', side_effect=real_profile) as profile, \
+             mock.patch.object(loop_manager.project_registry, 'list_projects', return_value=projects), \
+             mock.patch.object(loop_manager, '_run_registered_project', side_effect=run_project):
+            results = run_scheduler()
+            self.assertEqual([(repo, value) for repo, value, _thread in results], [
+                ('blocked', configured),
+                ('runnable', loop_manager.AgentProfile('fixture-worker-model', 'medium')),
+            ])
+            self.assertTrue(all(thread != threading.get_ident() for _repo, _value, thread in results))
+            profile.assert_called_once_with(
+                config.path, 'codex', 'planner', 1, Path('blocked'))
+            self.assertIs(loop_manager._agent_profile, profile)
+            with self.assertRaisesRegex(loop_manager.ManagedConfigError, 'missing worker config'):
+                loop_manager._agent_profile(config.path, 'codex', 'worker', 1, Path('runnable'))
 
     def test_execution_fixtures_isolate_state_and_close_nested_resources(self):
         original = manager_git_journal.begin_rebase

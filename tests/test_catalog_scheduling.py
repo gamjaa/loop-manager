@@ -44,6 +44,7 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
         self.assertTrue(decision.has_ready)
         self.assertIsNone(decision.runnable_ready)
 
+    @dummy_worker_sessions
     def test_dependency_blocked_ready_is_not_an_empty_catalog(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
