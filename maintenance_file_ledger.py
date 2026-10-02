@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
@@ -60,6 +60,16 @@ def root_review_source(repository: Path, inventory: SourceInventory) -> TrackedS
                          "040000", inventory.revision, ROOT_REVIEW_REASON)
 
 
+def root_move_candidates(reviews: Sequence[dict]) -> dict[str, dict]:
+    """Only investigated internal items with a safe destination can become plans."""
+    return {item["path"]: item for item in reviews
+            if item.get("category") == "internal_implementation" and item.get("destination") is not None}
+
+
+def root_review_hash(review: dict) -> str:
+    return hashlib.sha256(json.dumps(review, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+
 def assessment_input_tree(repository: Path, revision: str) -> tuple[bytes, ...]:
     """Compare investigated input blobs while allowing normal Planner output."""
     return tuple(line for line in _git(repository, "ls-tree", "-r", revision).splitlines()
@@ -100,8 +110,8 @@ def validate_root_reviews(repository: Path, inventory: SourceInventory, results:
             or "\\" in destination or any(part in {"", ".", ".."} for part in destination.split("/"))
         ):
             raise FileReviewLedgerError("안전한 상대 목적지가 필요합니다.")
-        if result["category"] == "uncertain" and destination is not None:
-            raise FileReviewLedgerError("불확실한 루트 항목은 이동 후보가 될 수 없습니다.")
+        if destination is not None and (result["category"] != "internal_implementation" or destination == path):
+            raise FileReviewLedgerError("필수·불확실한 루트 항목은 이동 후보가 될 수 없습니다.")
         if path in {".agents", "docs", "scripts", "AGENTS.md"} and (
             result["category"] != "tool_required" or destination is not None
         ):
@@ -273,6 +283,7 @@ class FileReviewRepository:
         self, repo: str, repository_path: str, base_branch: str,
         inventory: SourceInventory, reviewed: Sequence[ReviewedSource],
         *, published_revision: str | None = None, root_reviews: Sequence[dict] | None = None,
+        legacy_publication_commit: str | None = None,
     ) -> AssessmentSuccess:
         """Commit only complete, source-bound review evidence in one transaction.
 
@@ -297,15 +308,36 @@ class FileReviewRepository:
                      for item in inventory.sources
         ):
             raise FileReviewLedgerError("평가 후 원격 파일 목록 또는 내용이 변경됐습니다.")
-        if root_reviews is None:
-            root_reviews = self.reusable_root_reviews(repo, inventory)
-        placements = validate_root_reviews(source_repo, inventory, root_reviews)
+        legacy = legacy_publication_commit is not None
+        if legacy:
+            row = self.connection.execute(
+                "SELECT p.evidence_json FROM file_assessment_publications p "
+                "JOIN maintenance_cycles c ON c.repo = p.repo AND c.revision = p.cycle_revision "
+                "WHERE p.repo = ? AND p.source_revision = ? AND p.publication_commit = ? "
+                "AND c.phase = 'assessment' AND c.publication_stage = 'prepared' "
+                "AND c.publication_base_sha = p.source_revision "
+                "AND c.publication_commit_sha = p.publication_commit",
+                (repo, inventory.revision, legacy_publication_commit),
+            ).fetchone()
+            payload = json.loads(row[0]) if row else {}
+            if (published_revision is None or root_reviews is not None
+                or "root_reviews" in payload
+                or payload.get("inventory") != json.loads(json.dumps(asdict(inventory)))
+                or payload.get("reviewed") != [asdict(item) for item in reviewed]
+                or _git(source_repo, "merge-base", legacy_publication_commit, remote_revision).decode().strip()
+                   != legacy_publication_commit):
+                raise FileReviewLedgerError("게시된 이전 평가의 intent·원본 identity가 다릅니다.")
+            placements = ()
+        else:
+            if root_reviews is None:
+                root_reviews = self.reusable_root_reviews(repo, inventory)
+            placements = validate_root_reviews(source_repo, inventory, root_reviews)
         # Publication may add plans, but must not change investigated root entries
         # or any evidence-bearing input outside Planner-owned output paths.
         if (assessment_input_tree(source_repo, inventory.revision)
             != assessment_input_tree(source_repo, remote_revision)
-            or {item.path for item in root_placement_inventory(current)}
-            != {item["path"] for item in placements}):
+            or (not legacy and {item.path for item in root_placement_inventory(current)}
+                != {item["path"] for item in placements})):
             raise FileReviewLedgerError("루트 조사 후 참조 또는 소유 대상이 변경됐습니다.")
         with _transaction(self.connection):
             selected = self.selected_sources(repo, inventory)
@@ -348,7 +380,7 @@ class FileReviewRepository:
                      inventory.revision, reviewed_at),
                 )
             current_root_paths = {item["path"] for item in placements}
-            for placement in self.root_placements(repo, include_retired=True):
+            for placement in (() if legacy else self.root_placements(repo, include_retired=True)):
                 if placement.path not in current_root_paths:
                     self.connection.execute(
                         "UPDATE root_placement_reviews SET active = 0 "

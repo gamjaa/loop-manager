@@ -12,6 +12,7 @@ from typing import Mapping, Sequence
 
 from maintenance_file_inventory import SourceInventory, TrackedSource, cached_source_inventory
 from maintenance_file_review import FileReviewError, FileReviewProgress, source_bytes
+from maintenance_file_ledger import root_move_candidates, root_review_hash
 
 
 class ReconciliationError(ValueError):
@@ -490,10 +491,13 @@ def parse_findings(output: str | dict, progress: ReconciliationProgress,
     value = _single_json(output, FINDINGS_PREFIX) if isinstance(output, str) else output
     if set(value) != {"source_revision", "findings", "no_issue_reason"} or value["source_revision"] != inventory.revision:
         raise ReconciliationError("발견 결과의 source 또는 필드가 다릅니다.")
+    roots = root_move_candidates(progress.root_reviews)
     findings = value["findings"]
     if not isinstance(findings, list):
         raise ReconciliationError("발견은 배열이어야 합니다.")
     if not findings:
+        if roots:
+            raise ReconciliationError("확인된 루트 이동 후보마다 계획 연결이 필요합니다.")
         reason = value["no_issue_reason"]
         if synthesis_digest is not None and isinstance(reason, dict) and set(reason) == {"synthesis_digest", "summary"}:
             if reason["synthesis_digest"] != synthesis_digest:
@@ -524,15 +528,24 @@ def parse_findings(output: str | dict, progress: ReconciliationProgress,
         if (not isinstance(targets, list) or not targets
             or any(not isinstance(path, str) for path in targets)
             or len(targets) != len(set(targets))
-            or not set(targets) <= sources.keys() or not set(targets) & selected):
+            or not set(targets) <= sources.keys() | roots.keys()
+            or not set(targets) & (selected | roots.keys())):
             raise ReconciliationError("발견 대상은 선정된 현재 원본을 포함해야 합니다.")
         evidence = finding["evidence"]
         if not isinstance(evidence, list) or set(targets) != {item.get("path") for item in evidence if isinstance(item, dict)}:
             raise ReconciliationError("모든 발견 대상의 코드 근거가 필요합니다.")
         for item in evidence:
+            if isinstance(item, dict) and set(item) == {"path", "root_review_hash", "excerpt"}:
+                root = roots.get(item["path"])
+                if (root is None or item["root_review_hash"] != root_review_hash(root)
+                    or _note(item["excerpt"], "루트 조사 근거", 12) not in json.dumps(root, ensure_ascii=False, sort_keys=True)):
+                    raise ReconciliationError("루트 발견의 조사 근거 또는 목적지가 다릅니다.")
+                continue
             if not isinstance(item, dict) or set(item) != {"path", "content_hash", "mode", "excerpt"}:
                 raise ReconciliationError("발견 근거의 source identity가 필요합니다.")
-            source = sources[item["path"]]
+            source = sources.get(item["path"])
+            if source is None:
+                raise ReconciliationError("제외된 루트 항목에는 검증된 루트 조사 근거가 필요합니다.")
             if (item["content_hash"], item["mode"]) != (source.content_hash, source.mode) or _note(item["excerpt"], "코드 근거", 4) not in contents[item["path"]].decode("utf-8", "backslashreplace"):
                 raise ReconciliationError("발견 근거가 현재 원본과 다릅니다.")
         relation_keys = finding["relation_keys"]
@@ -555,6 +568,9 @@ def parse_findings(output: str | dict, progress: ReconciliationProgress,
             raise ReconciliationError("확인된 관계가 발견 대상들을 연결하지 않습니다.")
         for field in ("boundary", "context_reduction", "integration_cost"):
             _note(finding[field], field, minimum=20)
+        for path in set(targets) & roots.keys():
+            if roots[path]["destination"] not in finding["boundary"]:
+                raise ReconciliationError("루트 이동 계획은 조사한 안전한 목적지를 유지해야 합니다.")
         status, plan_id = finding["status"], finding["plan_id"]
         if (not isinstance(plan_id, str)
             or (status == "existing_plan" and (plan_id not in existing_plans or existing_plans[plan_id] == "MERGED"))
@@ -562,6 +578,9 @@ def parse_findings(output: str | dict, progress: ReconciliationProgress,
             or status not in {"existing_plan", "new_plan"}):
             raise ReconciliationError("발견의 비종료 또는 새 계획 연결이 유효하지 않습니다.")
         _validate_plan_comparisons(finding, existing_plans, plan_texts or {})
+    covered_roots = {path for finding in findings for path in finding["targets"]}
+    if not roots.keys() <= covered_roots:
+        raise ReconciliationError("확인된 루트 이동 후보의 계획 연결이 누락됐습니다.")
     if {item["plan_id"] for item in findings if item["status"] == "new_plan"} != set(new_plan_ids):
         raise ReconciliationError("새 리팩터링 계획마다 근거 있는 발견 연결이 필요합니다.")
     return value

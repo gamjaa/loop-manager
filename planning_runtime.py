@@ -1506,6 +1506,7 @@ class PlanningLifecycleCoordinator:
                 )
                 if (not progress.selected
                     and progress.next_unit is None
+                    and not maintenance_file_ledger.root_move_candidates(progress.root_reviews)
                     and not run.maintenance_cycle.include_general_planning
                     and run.maintenance_cycle.publication_stage is None
                     and not row.planning_result_completed

@@ -387,6 +387,28 @@ class ProvisionalFileReviewTest(unittest.TestCase):
         self.assertIsNotNone(self.state(changed, cycle=2).next_unit)
         self.assertIsNone(port.empty_selection_inventory(str(self.repo), self.repo, "main", changed.revision))
 
+    def test_root_only_move_requires_synthesis_and_cannot_use_empty_stabilization(self):
+        import loop_manager
+        import maintenance_file_publication as publication
+        inventory = self.publish({"notes.md": "Internal development notes owned by the documentation team.\n"})
+        source = maintenance_file_ledger.root_review_source(self.repo, inventory)
+        roots = list(root_results_for(self.repo, inventory))
+        roots[0].update(category="internal_implementation", destination="docs/notes.md",
+                        references=[{"path": "notes.md", "excerpt": "Internal development notes owned by the documentation team."}],
+                        ownership="The documentation team owns these internal notes.",
+                        reason="Internal notes have no user entry path and belong in docs/notes.md.")
+        self.progress.start(str(self.repo), 1, source)
+        self.progress.complete(str(self.repo), 1, source, {"path": source.path, "mode": source.mode,
+            "content_hash": source.content_hash, "source_revision": source.revision, "root_reviews": roots})
+        self.assertEqual(self.state(inventory).selected, ())
+        self.assertIsNone(self.state(inventory).next_unit)
+        with self.assertRaisesRegex(publication.FileAssessmentPublicationError, "종합"):
+            publication.collect(self.connection, str(self.repo), self.repo, "main", 1, inventory.revision)
+        port = loop_manager._PlanningFileReviewPorts(self.connection)
+        self.assertIsNone(port.empty_selection_inventory(str(self.repo), self.repo, "main", inventory.revision))
+        self.ledger.record_success(str(self.repo), str(self.repo), "main", inventory, (), root_reviews=roots)
+        self.assertIsNone(port.empty_selection_inventory(str(self.repo), self.repo, "main", inventory.revision))
+
     def test_legacy_automatic_root_result_cannot_replace_investigation(self):
         from unittest import mock
         inventory = self.publish({"scratch.png": b"\x89PNG\x00fixture"})

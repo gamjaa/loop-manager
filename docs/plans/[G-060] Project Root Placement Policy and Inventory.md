@@ -99,7 +99,7 @@ priority: critical
 
 `maintenance_file_inventory.root_placement_inventory()`는 추적 tree의 모든 top-level 항목을 제공하며, 자동 분류는 조사 결과가 아니다. `ProvisionalReviewRepository.progress()`는 정상 파일 평가 안에서 루트 조사 단위를 선택하고 기존 `FILE_REVIEW_RESULT`·세션·재시도 경로를 재사용한다. 조사 결과는 모든 항목의 실제 참조 인용, 사용자 경로, 소유권, 안전한 목적지 또는 유지·불확실 근거를 포함한다. 참조 원본과 항목별 coverage를 검증한 결과만 publication intent와 종합 증거에 전달하며, `FileReviewRepository.record_success()`가 source review와 같은 transaction에서 저장한다. 파일 목록만으로 실행·사용 계약을 입증할 수 없으며, 참조·소유권을 확인하지 못한 항목은 `uncertain`과 빈 목적지로 기록한다.
 
-기존 조사 결과는 같은 immutable revision의 coverage와 원본 근거가 유효할 때 재사용한다. 기존 자동 분류만 저장된 결과나 revision·참조 drift는 다음 정상 평가에서 조사 단위를 다시 선택한다. source 선택이 비어 있어도 미조사 루트가 있으면 Agent 평가를 거치며 stabilization fast path는 이를 건너뛰지 않는다. Git tree 자체가 빈 revision은 조사할 루트가 없으므로 이전 file·root review를 retire한 baseline으로 성공할 수 있다. publication 뒤 Planner 소유 출력 밖의 원본 변경은 성공 처리를 막거나 정상 평가를 재시작한다. 등록·배포만으로 별도 평가를 시작하지 않으며 기존 경로·SQLite schema와 verify 경로를 유지한다.
+기존 조사 결과는 같은 immutable revision의 coverage와 원본 근거가 유효할 때 재사용한다. 기존 자동 분류만 저장된 결과나 revision·참조 drift는 다음 정상 평가에서 조사 단위를 다시 선택한다. source 선택이 비어 있어도 미조사 루트가 있으면 Agent 평가를 거치며 stabilization fast path는 이를 건너뛰지 않는다. 조사에서 내부 항목과 안전한 목적지가 확인되면 빈 source 완료를 건너뛰고 종합·발견·계획 생성으로 연결한다. source inventory에서 제외된 문서·asset도 검증된 루트 조사 hash와 목적지에 결합된 독립 발견으로 새 계획 또는 동일 문제의 기존 계획에 연결하며, 후보 누락이나 목적지 변경은 거부한다. Git tree 자체가 빈 revision은 조사할 루트가 없으므로 이전 file·root review를 retire한 baseline으로 성공할 수 있다. publication 뒤 Planner 소유 출력 밖의 원본 변경은 성공 처리를 막거나 정상 평가를 재시작한다. 등록·배포만으로 별도 평가를 시작하지 않으며 기존 경로·SQLite schema와 verify 경로를 유지한다.
 
 ### 파일별 import·test patch·이동 대응표
 
@@ -156,3 +156,5 @@ priority: critical
 - 2026-10-02: Review 지적에 따라 root placement를 prompt 문구만으로 처리하지 않았다. immutable tree의 모든 top-level classification을 file-review input으로 전달하고, source review와 빈 source selection 모두 같은 transaction에서 root result를 ledger에 기록하도록 했다. `planning_runtime.py`와 root-inventory 대상의 direct importer/test patch/destination을 Implementation 대응표에 추가했다.
 
 - 2026-10-02: 반복 Review 피드백에 따라 inventory 저장을 성공 조사로 취급하는 경로를 제거했다. 정상 평가의 루트 조사 결과에 참조·사용자 경로·소유권·목적지 계약을 적용하고 원본 인용과 coverage를 검증한다. source가 없는 asset-only tree, 기존 자동 분류, 잘못된 저장 결과 재시도, 참조 drift와 빈 tree retire를 targeted unit test로 확인한다. 기존 verify는 변경 모듈 compile과 전체 unittest discovery를 이미 포함하므로 변경하거나 실행하지 않는다.
+
+- 2026-10-02: 업그레이드 전 `root_reviews`가 없는 durable publication intent는 저장 증거·활성 cycle·source·원격 게시 commit의 identity를 확인한 경우에만 당시 source 평가 범위로 멱등하게 복구한다. 루트 성공 결과를 생성하지 않으며 루트 조사는 다음 정상 평가에 남긴다. 새 형식의 빈 결과나 새로 만든 legacy 증거는 이 예외를 사용할 수 없다. source가 없는 확인된 루트 이동도 종합·계획 연결을 요구하고, 제외된 문서·asset은 루트 조사 근거 hash로 발견을 검증한다. cold restart, 위조·누락·drift, 기존 계획 재사용과 빈 source 분기를 targeted unit test로 확인한다.

@@ -1925,7 +1925,7 @@ class MaintenancePlanningTest(unittest.TestCase):
         )
         self.assertNotEqual(recovered, intent)
 
-    def _prepare_pushed_file_assessment_batch(self):
+    def _prepare_pushed_file_assessment_batch(self, *, legacy=False):
         context = self._begin_barrier()
         self.connection.execute(
             "UPDATE maintenance_cycles SET file_assessment_start_merged_count = 1 "
@@ -1965,8 +1965,84 @@ class MaintenancePlanningTest(unittest.TestCase):
                 self.connection, str(self.repo), self.repo, "main", result,
                 plan_commit,
             )
+        if legacy:
+            row = self.connection.execute("SELECT evidence_json FROM file_assessment_publications WHERE repo = ?",
+                                          (str(self.repo),)).fetchone()
+            payload = json.loads(row[0])
+            del payload["root_reviews"]
+            self.connection.execute("UPDATE file_assessment_publications SET evidence_json = ? WHERE repo = ?",
+                                    (json.dumps(payload), str(self.repo)))
         git(self.repo, "push", "origin", "HEAD:main")
         return plan_commit, intent, inventory
+
+    def test_legacy_pushed_intent_recovers_after_restart_without_claiming_root_review(self):
+        plan_commit, _intent, inventory = self._prepare_pushed_file_assessment_batch(legacy=True)
+        self.connection.commit()
+        restarted_connection = sqlite3.connect(":memory:")
+        self.addCleanup(restarted_connection.close)
+        self.connection.backup(restarted_connection)
+        restarted_connection.row_factory = sqlite3.Row
+        # A new manager instance consumes only durable pre-policy evidence.
+        recovered = loop_manager.recover_maintenance_planning_batch(
+            restarted_connection, str(self.repo), self.repo, "main",
+        )
+        self.assertEqual(recovered.phase, maintenance_state.MaintenancePhase.REFACTORING)
+        self.assertEqual(recovered.last_success_file_assessment_merged_count, 1)
+        ledger = maintenance_file_ledger.FileReviewRepository(restarted_connection)
+        self.assertEqual(ledger.last_success(str(self.repo)).source_revision, self.base_sha)
+        self.assertEqual(len(ledger.reviews(str(self.repo))), len(inventory.sources))
+        self.assertEqual(ledger.root_placements(str(self.repo)), ())
+        self.assertIsNone(ledger.reusable_root_reviews(str(self.repo), inventory))
+        recovered_again = loop_manager.recover_maintenance_planning_batch(
+            restarted_connection, str(self.repo), self.repo, "main",
+        )
+        self.assertEqual(recovered_again, recovered)
+        latest = maintenance_file_inventory.tracked_source_inventory(self.repo, "main", plan_commit)
+        progress = loop_manager.maintenance_file_review.ProvisionalReviewRepository(restarted_connection).progress(
+            str(self.repo), self.repo, "main", recovered.revision, latest,
+        )
+        self.assertEqual(progress.selected, ())
+        self.assertEqual(progress.next_unit.source.reason, maintenance_file_ledger.ROOT_REVIEW_REASON)
+
+    def test_legacy_publication_compatibility_rejects_tampered_and_new_incomplete_evidence(self):
+        from dataclasses import replace
+        plan_commit, intent, _inventory = self._prepare_pushed_file_assessment_batch(legacy=True)
+        row = self.connection.execute("SELECT evidence_json FROM file_assessment_publications WHERE repo = ?",
+                                      (str(self.repo),)).fetchone()
+        payload = json.loads(row[0])
+        evidence = maintenance_file_publication.saved_intent(
+            self.connection, str(self.repo), intent.revision, self.base_sha, plan_commit)
+        self.assertIsNone(evidence.root_reviews)
+        with self.assertRaises(maintenance_file_publication.FileAssessmentPublicationError):
+            maintenance_file_publication.promote(self.connection, str(self.repo), self.repo, "main", plan_commit,
+                                                replace(evidence, merged_count=999))
+        with self.assertRaises(maintenance_file_publication.FileAssessmentPublicationError):
+            maintenance_file_publication.save_intent(self.connection, str(self.repo), intent.revision,
+                                                    self.base_sha, plan_commit, evidence)
+        # An explicit empty array belongs to the new contract, never the legacy exemption.
+        payload["root_reviews"] = []
+        self.connection.execute("UPDATE file_assessment_publications SET evidence_json = ? WHERE repo = ?",
+                                (json.dumps(payload), str(self.repo)))
+        modern = maintenance_file_publication.saved_intent(self.connection, str(self.repo), intent.revision,
+                                                         self.base_sha, plan_commit)
+        with self.assertRaises(maintenance_file_ledger.FileReviewLedgerError):
+            maintenance_file_publication.promote(self.connection, str(self.repo), self.repo, "main", plan_commit, modern)
+        self.assertIsNone(maintenance_file_ledger.FileReviewRepository(self.connection).last_success(str(self.repo)))
+
+    def test_legacy_published_source_drift_restarts_instead_of_promoting(self):
+        plan_commit, intent, _inventory = self._prepare_pushed_file_assessment_batch(legacy=True)
+        other = Path(self.temporary.name) / "legacy-drift-descendant"
+        git(self.repo, "worktree", "add", "--detach", str(other), plan_commit)
+        (other / "legacy/module.py").write_text("# changed reviewed implementation\n", encoding="utf-8")
+        git(other, "add", "legacy/module.py")
+        git(other, "commit", "-m", "Change source after legacy publication")
+        git(other, "push", "origin", "HEAD:main")
+        git(self.repo, "fetch", "origin")
+        restarted = loop_manager.recover_maintenance_planning_batch(self.connection, str(self.repo), self.repo, "main")
+        self.assertEqual(restarted.phase, maintenance_state.MaintenancePhase.ASSESSMENT)
+        self.assertEqual(restarted.revision, intent.revision + 1)
+        self.assertIsNone(restarted.publication_stage)
+        self.assertIsNone(maintenance_file_ledger.FileReviewRepository(self.connection).last_success(str(self.repo)))
 
     def test_published_batch_unchanged_sources_promote_saved_evidence(self):
         plan_commit, _intent, inventory = self._prepare_pushed_file_assessment_batch()
@@ -2364,6 +2440,64 @@ class ReconciledPlanLinkTest(unittest.TestCase):
         with self.assertRaisesRegex(maintenance_planning.MaintenancePlanningError,
                                     "공개 계약"):
             maintenance_planning.validate_refactoring_plan(path, plan, changed)
+
+    def test_excluded_root_moves_link_new_and_existing_plans_and_reject_omissions(self):
+        from copy import deepcopy
+        from dataclasses import replace
+        roots = tuple({"path": path, "category": "internal_implementation", "destination": destination,
+                       "references": [{"path": "README.md", "excerpt": f"Internal material: {path}"}],
+                       "user_path": "This material is not a user entry point.",
+                       "ownership": "Documentation team owns this internal material.",
+                       "reason": f"Move internal material from {path} to {destination}."}
+                      for path, destination in (("notes.md", "docs/notes.md"), ("scratch.png", "assets/scratch.png")))
+        for with_source in (False, True):
+            content = b"def calculate(): return 1\n"
+            src = TrackedSource("src/calc.py", hashlib.sha256(content).hexdigest(), "100644", "a" * 40, "source")
+            inventory = SourceInventory(src.revision, (src,) if with_source else (), ())
+            progress = maintenance_reconciliation.ReconciliationProgress(
+                (src,) if with_source else (), (), (), None, root_reviews=roots)
+            findings = [{"issue_key": "root-" + root["path"], "targets": [root["path"]],
+                "evidence": [{"path": root["path"], "root_review_hash": maintenance_file_ledger.root_review_hash(root),
+                              "excerpt": root["reason"]}], "relation_keys": [],
+                "boundary": root["reason"] + " Preserve import, relative paths, launcher, config, documentation links and verify.",
+                "context_reduction": "Move internal material out of the user entry directory.",
+                "integration_cost": "Update references and validate preserved execution and public contracts.",
+                "status": "new_plan", "plan_id": f"G-{100 + index}", "plan_comparisons": []}
+                for index, root in enumerate(roots)]
+            payload = {"source_revision": src.revision, "findings": findings, "no_issue_reason": None}
+            parse = lambda value, existing={}, new=("G-100", "G-101"), texts={}: maintenance_reconciliation.parse_findings(
+                value, progress, inventory, {src.path: content}, existing, new, texts)
+            self.assertEqual(parse(payload), payload)
+            for invalid in ("omission", "uncertain", "forged", "wrong_destination", "invalid_boundary", "no_plan", "source_hash"):
+                bad = deepcopy(payload)
+                bad_progress = progress
+                if invalid == "omission":
+                    bad["findings"].pop()
+                elif invalid == "uncertain":
+                    bad_progress = replace(progress, root_reviews=tuple(dict(root, category="uncertain", destination=None) for root in roots))
+                elif invalid == "forged":
+                    bad["findings"][0]["evidence"][0]["root_review_hash"] = "0" * 64
+                elif invalid == "wrong_destination":
+                    bad["findings"][0]["boundary"] = "Move this material to a different place without its assessed destination."
+                elif invalid == "invalid_boundary":
+                    bad["findings"][0]["boundary"] = None
+                elif invalid == "source_hash":
+                    bad["findings"][0]["evidence"] = [{"path": "notes.md", "content_hash": src.content_hash,
+                                                        "mode": src.mode, "excerpt": "def calculate()"}]
+                else:
+                    bad["findings"] = []
+                    bad["no_issue_reason"] = {"files": [], "relations": []}
+                with self.subTest(source=with_source, invalid=invalid), self.assertRaises(maintenance_reconciliation.ReconciliationError):
+                    maintenance_reconciliation.parse_findings(bad, bad_progress, inventory, {src.path: content}, {}, ("G-100", "G-101"))
+            existing_payload = deepcopy(payload)
+            for finding in existing_payload["findings"]:
+                finding.update(status="existing_plan", plan_id="G-100", plan_comparisons=[{
+                    "plan_id": "G-100", "plan_excerpt": "Move internal notes and the scratch image into their assessed destinations.",
+                    "finding_excerpt": finding["boundary"], "same_issue": True,
+                    "reason": "The existing plan owns this same assessed root placement change.",
+                }])
+            self.assertEqual(parse(existing_payload, {"G-100": "READY"}, (), {
+                "G-100": "Move internal notes and the scratch image into their assessed destinations."}), existing_payload)
 
     def test_findings_link_existing_plan_without_duplicate_and_allow_grounded_no_issue(self):
         content = b"def calculate(): return 1\n"
