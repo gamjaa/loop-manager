@@ -145,13 +145,32 @@ class PlanningAssessmentService(PlanningService):
                 if (context.self_repository and run.maintenance_cycle.phase
                     is maintenance_state.MaintenancePhase.ASSESSMENT
                     and not run.maintenance_cycle.full_assessment_completed):
-                    inventory = self._assessment.inventory(
-                        context.repo_path, str(row.active_sha)
-                    )
-                    prompt += self._assessment.prompt(
-                        inventory, str(row.active_sha),
-                        run.maintenance_cycle.full_assessment_result,
-                    )
+                    try:
+                        inventory = self._assessment.inventory(
+                            context.repo_path, str(row.active_sha)
+                        )
+                        prompt += self._assessment.prompt(
+                            inventory, str(row.active_sha),
+                            run.maintenance_cycle.full_assessment_result,
+                        )
+                    except AssessmentError as error:
+                        message = str(error)
+                        retry_count = row.planning_retry_count + 1
+                        values: dict[str, object] = {
+                            "planning_validation_error": message,
+                            "planning_result_pending_validation": 0,
+                            "planning_retry_count": retry_count,
+                        }
+                        if retry_count >= MAX_PLANNER_VALIDATION_RETRIES:
+                            values.update(
+                                planning_error=message,
+                                planning_error_fingerprint=run.current_fingerprint,
+                            )
+                        self._ports.state.update(context.repo, **values)
+                        self._ports.events.error(message)
+                        return PlanningOutcome(
+                            PlanningOutcomeKind.VALIDATION_RETRY, error=True,
+                        )
             else:
                 assert run.mutable_ready_snapshot is not None
                 prompt = self._ports.validation.planner_prompt(

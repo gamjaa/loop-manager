@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from loop_manager_internal.application.contracts import ValidatedPlanningResult
+from loop_manager_internal.maintenance.maintenance_file_inventory import AssessmentError
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanMode
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanningContext
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanningError
@@ -12,6 +13,7 @@ from loop_manager_internal.planning.planning_catalog import PlannerValidationErr
 from loop_manager_internal.storage import maintenance_state
 from pathlib import Path
 import hashlib
+import json
 import re
 import sqlite3
 
@@ -490,3 +492,98 @@ def validate_maintenance_planner_result(
 def _plan_id_from_path(path: str) -> str | None:
     match = re.fullmatch(r"docs/plans/\[(G-\d{3,})\] [^/]+\.md", path)
     return match.group(1) if match else None
+
+
+RESULT_PREFIX = "FULL_ASSESSMENT_RESULT: "
+_PLAN_ID = re.compile(r"G-\d{3,}")
+_PRODUCT_DOCS = {"docs/PRODUCT.md", "docs/ARCHITECTURE.md"}
+
+
+def parse_assessment_result(
+    output: str, inventory: dict[str, str], revision: str,
+    new_plan_ids: tuple[str, ...], known_plan_ids: set[str],
+) -> str:
+    """Validate evidence and return canonical JSON suitable for SQLite."""
+    lines = [line[len(RESULT_PREFIX):] for line in output.splitlines()
+             if line.startswith(RESULT_PREFIX)]
+    if len(lines) != 1 or len(lines[0].encode("utf-8")) > 65536:
+        raise AssessmentError("전수 평가 결과 JSON 줄이 하나 필요하며 64 KiB를 넘을 수 없습니다.")
+    try:
+        report = json.loads(lines[0])
+    except json.JSONDecodeError as error:
+        raise AssessmentError("전수 평가 결과가 올바른 JSON이 아닙니다.") from error
+    if not isinstance(report, dict) or set(report) != {"source_revision", "coverage", "findings"}:
+        raise AssessmentError("전수 평가 결과 필드가 올바르지 않습니다.")
+    if report["source_revision"] != revision:
+        raise AssessmentError("전수 평가 결과의 source revision이 다릅니다.")
+    coverage = report["coverage"]
+    if (not isinstance(coverage, dict) or set(coverage) != {"code", "tests", "documents"}
+        or any(not isinstance(value, str) or len(value.strip()) < 12 for value in coverage.values())):
+        raise AssessmentError("코드·테스트·문서 평가 근거가 각각 필요합니다.")
+    findings = report["findings"]
+    if not isinstance(findings, list) or len(findings) > 150:
+        raise AssessmentError("전수 평가 발견 목록은 최대 150개입니다.")
+    seen: set[str] = set()
+    linked_new: set[str] = set()
+    for finding in findings:
+        if not isinstance(finding, dict) or set(finding) != {"id", "kind", "path", "evidence", "status", "plan_ids", "source_hash"}:
+            raise AssessmentError("발견 항목의 필드가 올바르지 않습니다.")
+        identifier, kind, path, evidence, status, plan_ids, source_hash = (
+            finding[key] for key in ("id", "kind", "path", "evidence", "status", "plan_ids", "source_hash")
+        )
+        if (not isinstance(identifier, str) or not re.fullmatch(r"[a-z0-9-]{3,64}", identifier)
+            or identifier in seen
+            or not isinstance(kind, str) or kind not in {"code", "document"}
+            or not isinstance(path, str) or path not in inventory
+            or source_hash != inventory[path]
+            or not isinstance(evidence, str) or len(evidence.strip()) < 20
+            or not isinstance(status, str)
+            or not isinstance(plan_ids, list)
+            or any(not isinstance(item, str) or _PLAN_ID.fullmatch(item) is None for item in plan_ids)
+            or len(plan_ids) != len(set(plan_ids))):
+            raise AssessmentError("발견 항목의 근거·경로·원본 지문이 유효하지 않습니다.")
+        seen.add(identifier)
+        if kind == "document":
+            if path not in _PRODUCT_DOCS and not path.startswith("docs/requirements/"):
+                raise AssessmentError("문서 발견 대상이 활성 제품 문서가 아닙니다.")
+            if status not in {"candidate", "decision_required", "no_issue"} or plan_ids:
+                raise AssessmentError("문서 발견은 수정본 후보·결정 대상·문제 없음으로만 기록합니다.")
+        else:
+            if status not in {"planned", "existing_plan", "resolved", "decision_required", "no_issue"}:
+                raise AssessmentError("코드 발견 상태가 유효하지 않습니다.")
+            if status in {"planned", "existing_plan"} and not plan_ids:
+                raise AssessmentError("코드 개선 발견에는 연결된 계획 ID가 필요합니다.")
+            if status in {"resolved", "decision_required", "no_issue"} and plan_ids:
+                raise AssessmentError("계획 없는 코드 발견 상태에 plan ID가 있습니다.")
+            if status == "planned":
+                linked_new.update(plan_ids)
+            if status == "existing_plan" and not set(plan_ids) <= known_plan_ids:
+                raise AssessmentError("기존 계획으로 연결한 ID가 catalog에 없습니다.")
+    if linked_new != set(new_plan_ids):
+        raise AssessmentError("새 리팩터링 계획과 코드 발견의 연결이 일치하지 않습니다.")
+    return json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def validate_saved_assessment_result(
+    saved_result: str, inventory: dict[str, str], revision: str,
+) -> str:
+    """Read an earlier serialized report against the same immutable source."""
+    try:
+        report = json.loads(saved_result)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise AssessmentError("저장된 전수 평가 결과가 올바른 JSON이 아닙니다.") from error
+    if not isinstance(report, dict) or not isinstance(report.get("findings"), list):
+        raise AssessmentError("저장된 전수 평가 발견 목록이 유효하지 않습니다.")
+    planned: set[str] = set()
+    existing: set[str] = set()
+    for finding in report["findings"]:
+        if not isinstance(finding, dict) or not isinstance(finding.get("plan_ids"), list):
+            raise AssessmentError("저장된 전수 평가 발견 항목이 유효하지 않습니다.")
+        if finding.get("status") == "planned":
+            planned.update(item for item in finding["plan_ids"] if isinstance(item, str))
+        elif finding.get("status") == "existing_plan":
+            existing.update(item for item in finding["plan_ids"] if isinstance(item, str))
+    return parse_assessment_result(
+        RESULT_PREFIX + saved_result, inventory, revision,
+        tuple(sorted(planned)), existing,
+    )

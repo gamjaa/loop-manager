@@ -32,7 +32,7 @@ from loop_manager_internal.planning.planning_runtime import (
     choose_planning_decision,
 )
 from loop_manager_internal.storage.runtime_state import PlanningSnapshot
-from loop_manager_internal.planning.assessment_port import LegacyAssessmentPort
+from loop_manager_internal.planning.assessment_port import MaintenanceAssessmentPort
 
 
 def planning_snapshot(**overrides):
@@ -439,7 +439,7 @@ class FakePorts:
         self.agent = FakeAgentPort()
         self.validation = FakeValidationPort()
         self.events = FakeEventPort()
-        self.assessment = LegacyAssessmentPort()
+        self.assessment = MaintenanceAssessmentPort()
 
 
 

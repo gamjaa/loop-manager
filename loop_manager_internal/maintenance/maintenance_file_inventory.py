@@ -15,6 +15,10 @@ import re
 import subprocess
 
 
+class AssessmentError(ValueError):
+    """The stored self assessment cannot be bound to this source tree."""
+
+
 class SourceInventoryError(ValueError):
     """A remote tree or tracked file cannot be classified safely."""
 
@@ -272,4 +276,36 @@ def cached_source_inventory(connection: sqlite3.Connection, repository: Path,
     with connection:
         connection.execute("INSERT OR REPLACE INTO maintenance_inventory_cache VALUES (?, ?, ?, ?)",
                            (*key, revision, json.dumps(asdict(inventory), ensure_ascii=False)))
+    return inventory
+
+
+# The self repository keeps its original source-hash report format across restarts.
+_ASSESSMENT_EXCLUDED_PARTS = {"archive", "__pycache__", ".venv", "venv", "node_modules", "dist", "build", ".pytest_cache", ".mypy_cache", "coverage"}
+_ASSESSMENT_PRODUCT_DOCS = {"docs/PRODUCT.md", "docs/ARCHITECTURE.md"}
+
+
+def source_inventory(repository: Path, revision: str) -> dict[str, str]:
+    """Hash tracked source bytes at one immutable Git revision."""
+    if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", revision) is None:
+        raise AssessmentError("전수 평가 source revision이 유효하지 않습니다.")
+    tree = _git(repository, "ls-tree", "-rz", "--name-only", revision)
+    paths = sorted(path.decode("utf-8") for path in tree.split(b"\0") if path)
+    inventory: dict[str, str] = {}
+    for path in paths:
+        parts = path.split("/")
+        if any(part in _ASSESSMENT_EXCLUDED_PARTS for part in parts):
+            continue
+        is_doc = path in _ASSESSMENT_PRODUCT_DOCS or (
+            len(parts) == 3 and parts[:2] == ["docs", "requirements"]
+            and path.endswith(".md")
+        )
+        is_code = path.endswith((".py", ".sh", ".ps1")) and (
+            parts[0] not in {"docs", ".agents"}
+        )
+        if not (is_doc or is_code):
+            continue
+        content = _git(repository, "show", f"{revision}:{path}")
+        inventory[path] = hashlib.sha256(content).hexdigest()
+    if not _ASSESSMENT_PRODUCT_DOCS <= inventory.keys():
+        raise AssessmentError("전수 평가 필수 제품 문서가 source revision에 없습니다.")
     return inventory

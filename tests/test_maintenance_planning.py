@@ -13,10 +13,10 @@ from types import SimpleNamespace
 from loop_manager_internal.documents import document_drafts
 from loop_manager_internal.documents import document_publication
 from loop_manager_internal.catalog import execplan_catalog
-from loop_manager_internal.maintenance import full_assessment
 from loop_manager_internal.storage import execplan_catalog_state
 import loop_manager
 from loop_manager_internal.maintenance import maintenance_planning
+from loop_manager_internal.maintenance import maintenance_validation
 from loop_manager_internal.maintenance import maintenance_findings
 from loop_manager_internal.maintenance import maintenance_file_inventory
 from loop_manager_internal.storage import maintenance_file_ledger
@@ -24,6 +24,7 @@ from loop_manager_internal.maintenance import maintenance_file_publication
 from loop_manager_internal.maintenance import maintenance_reconciliation
 from loop_manager_internal.storage import maintenance_state
 from loop_manager_internal.maintenance.maintenance_file_inventory import SourceInventory, TrackedSource
+from loop_manager_internal.planning.assessment_port import MaintenanceAssessmentPort
 from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot, mutable_snapshot_token
 
 
@@ -282,6 +283,62 @@ class ApprovedDocumentPlanTest(unittest.TestCase):
         ))
 
 class FullAssessmentEvidenceTest(unittest.TestCase):
+    def test_saved_report_accepts_historical_finding_and_rejects_drift(self):
+        revision = "a" * 40
+        inventory = {"module.py": "b" * 64}
+        report = {
+            "source_revision": revision,
+            "coverage": {key: "Reviewed source responsibility evidence."
+                         for key in ("code", "tests", "documents")},
+            "findings": [{
+                "id": "agent-scope", "kind": "code", "path": "module.py",
+                "source_hash": inventory["module.py"],
+                "evidence": "G-051 already separated Agent scope responsibilities.",
+                "status": "resolved", "plan_ids": [],
+            }],
+        }
+        saved = json.dumps(report)
+        self.assertEqual(json.loads(maintenance_validation.validate_saved_assessment_result(
+            saved, inventory, revision,
+        )), report)
+        self.assertIn(maintenance_validation.validate_saved_assessment_result(
+            saved, inventory, revision,
+        ), MaintenanceAssessmentPort().prompt(
+            inventory, revision, saved,
+        ))
+        with self.assertRaises(maintenance_file_inventory.AssessmentError):
+            MaintenanceAssessmentPort().prompt(
+                {"module.py": "c" * 64}, revision, saved,
+            )
+        with self.assertRaises(maintenance_file_inventory.AssessmentError):
+            maintenance_validation.validate_saved_assessment_result(
+                saved.replace('"source_hash": "', '"source_hash": "0'),
+                inventory, revision,
+            )
+
+    def test_new_report_does_not_require_historical_plan_finding(self):
+        revision = "a" * 40
+        inventory = {"module.py": "b" * 64}
+        report = {
+            "source_revision": revision,
+            "coverage": {key: "Reviewed source responsibility evidence."
+                         for key in ("code", "tests", "documents")},
+            "findings": [{
+                "id": "current-source", "kind": "code", "path": "module.py",
+                "source_hash": inventory["module.py"],
+                "evidence": "Current source responsibilities remain separated.",
+                "status": "no_issue", "plan_ids": [],
+            }],
+        }
+        result = maintenance_validation.parse_assessment_result(
+            maintenance_validation.RESULT_PREFIX + json.dumps(report),
+            inventory, revision, (), set(),
+        )
+        self.assertEqual(json.loads(result), report)
+        self.assertNotIn("G-051", maintenance_planning.assessment_prompt(
+            inventory, revision, None,
+        ))
+
     def test_malformed_finding_types_raise_validation_error(self):
         revision = "a" * 40
         inventory = {"module.py": "b" * 64}
@@ -302,9 +359,9 @@ class FullAssessmentEvidenceTest(unittest.TestCase):
             with self.subTest(key=key, value=value):
                 malformed = dict(finding, **{key: value})
                 report["findings"] = [malformed]
-                with self.assertRaises(full_assessment.FullAssessmentError):
-                    full_assessment.parse_assessment_result(
-                        full_assessment.RESULT_PREFIX + json.dumps(report),
+                with self.assertRaises(maintenance_file_inventory.AssessmentError):
+                    maintenance_validation.parse_assessment_result(
+                        maintenance_validation.RESULT_PREFIX + json.dumps(report),
                         inventory, revision, (), set(),
                     )
 
@@ -323,14 +380,14 @@ class FullAssessmentEvidenceTest(unittest.TestCase):
             git(repo, "add", "-A")
             git(repo, "commit", "-m", "Fixture")
             sha = git(repo, "rev-parse", "HEAD")
-            inventory = full_assessment.source_inventory(repo, sha)
+            inventory = maintenance_file_inventory.source_inventory(repo, sha)
             self.assertIn("tests/test_module.py", inventory)
             self.assertNotIn("docs/requirements/archive/old.md", inventory)
             self.assertNotIn("node_modules/vendor.py", inventory)
-            prompt = full_assessment.assessment_prompt(inventory, sha, None)
+            prompt = maintenance_planning.assessment_prompt(inventory, sha, None)
             self.assertIn(inventory["module.py"], prompt)
             self.assertNotIn("docs/requirements/archive/old.md", prompt)
-            self.assertIn("saved evidence", full_assessment.assessment_prompt(
+            self.assertIn("saved evidence", maintenance_planning.assessment_prompt(
                 inventory, sha, "saved evidence"))
             report = {
                 "source_revision": sha,
@@ -350,14 +407,14 @@ class FullAssessmentEvidenceTest(unittest.TestCase):
                               "evidence": "A decision and its exception are repeated here.",
                               "status": "candidate", "plan_ids": []}],
             }
-            output = full_assessment.RESULT_PREFIX + json.dumps(report)
-            saved = full_assessment.parse_assessment_result(
+            output = maintenance_validation.RESULT_PREFIX + json.dumps(report)
+            saved = maintenance_validation.parse_assessment_result(
                 output, inventory, sha, ("G-100",), set())
             self.assertEqual(json.loads(saved), report)
             report["findings"][1]["source_hash"] = "0" * 64
-            with self.assertRaises(full_assessment.FullAssessmentError):
-                full_assessment.parse_assessment_result(
-                    full_assessment.RESULT_PREFIX + json.dumps(report),
+            with self.assertRaises(maintenance_file_inventory.AssessmentError):
+                maintenance_validation.parse_assessment_result(
+                    maintenance_validation.RESULT_PREFIX + json.dumps(report),
                     inventory, sha, ("G-100",), set())
 
 class ReconciledPlanLinkTest(unittest.TestCase):

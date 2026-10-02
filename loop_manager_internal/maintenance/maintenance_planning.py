@@ -414,3 +414,38 @@ def validate_refactoring_plan(
         raise MaintenancePlanningError(
             f"상향된 리팩터링 priority의 구체적인 근거가 없습니다: {path}"
         )
+
+
+def inventory_prompt(inventory: dict[str, str], revision: str) -> str:
+    paths = sorted(inventory)
+    return (
+        f"source revision: {revision}\n"
+        f"대상 {len(paths)}개 (추적된 코드·테스트·활성 제품 문서):\n"
+        + "\n".join(f"{inventory[path]}  {path}" for path in paths)
+    )
+
+
+def assessment_prompt(
+    inventory: dict[str, str], revision: str, saved_result: str | None
+) -> str:
+    prompt = (
+        "\n\n일회성 Loop Manager 전수 평가:\n"
+        + inventory_prompt(inventory, revision)
+        + "\n각 대상의 책임·상태 전이·외부 연동, 이름·제어 흐름·결합도, "
+        "중복과 변경 충돌을 검토하라. 생성물·의존성·archive를 제외하라. "
+        "기존 비종료 계획과 대조해 새 리팩터링 계획을 중복 생성하지 마라. "
+        "문서 원본과 AGENTS.md를 바꾸지 말고 문서 후보와 정책 결정 대상을 구분하라. "
+        "선행 READY 계획 실행이 필요해 prerequisites 결과를 반환하면 평가를 재개할 때 "
+        "최종 전수 평가 결과를 작성하라. "
+        "코드·테스트·문서 각각의 평가 근거와 발견을 최종 응답에 JSON 한 줄로 기록하라. "
+        "형식: FULL_ASSESSMENT_RESULT: "
+        '{"source_revision":"<SHA>","coverage":{"code":"<근거>",'
+        '"tests":"<근거>","documents":"<근거>"},"findings":'
+        '[{"id":"<고유-id>","kind":"code|document",'
+        '"path":"<대상 경로>","evidence":"<구체적 근거>",'
+        '"status":"planned|existing_plan|resolved|decision_required|no_issue|candidate",'
+        '"plan_ids":[],"source_hash":"<inventory의 원본 SHA256>"}]}.'
+    )
+    if saved_result:
+        prompt += "\n이전에 같은 source에서 보존된 평가 결과를 재사용하라: " + saved_result
+    return prompt

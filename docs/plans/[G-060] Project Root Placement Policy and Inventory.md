@@ -180,6 +180,23 @@ priority: critical
 
 원본 테스트 277개는 정확히 한 destination에 대응하며 assertion을 보존했다. 두 Review deadlock 테스트는 원래 source 변경을 immutable 준비 snapshot에 명시적으로 설치하도록 setup만 보완했다. 별도의 composition unit test 3개는 준비 정보 격리·새 snapshot 관측·낡은 context 거부를 검증한다. 두 verify 스크립트는 새 module의 compile 목록만 확장하고 전체 unittest discovery를 유지한다.
 
+### G-127: 최종 구조·임시 평가 코드 대조
+
+기준 HEAD `0795a1a90c289d174b1e7ca55d4fab7f993a14d8`와 현재 작업 tree를 대조했다. 위 최신 root inventory의 추적 루트 13개는 같은 사용자 진입·실행·도구 소유권으로 남아 있고 새 루트 항목은 없다. `.git`과 소유권 불명 `.aws/`·`.codex/`, ignored `__pycache__/`는 이동·삭제하지 않았다. 아래 대응은 G-060의 구조·중복 발견 각각의 현재 소비·목적지이며 전체 verify·Review·Merge 완료 선언이 아니다.
+
+| G-060 발견 | 현재 책임·소비 및 확인 결과 |
+| --- | --- |
+| root `loop_manager.py`의 혼합 책임 | G-120/G-123의 `application/`, `runtime/`, `catalog/`, `storage/`와 역할별 adapter가 본문을 소유한다. root는 launcher와 공개 구성 경계로 유지한다. |
+| `tests/test_loop_manager.py`의 fixture·patch 결합 | G-119의 `tests/support/`와 책임별 `tests/test_*.py`가 소비한다. 현재 AST 조사에서 중복 TestCase 이름이 없다. |
+| execution handler와 거대 테스트 | G-124의 `execution/execution_*_handler.py`, `tests/test_execution_*.py` 및 `tests/support/execution*_scenarios.py` 대응표를 유지한다. |
+| planning coordinator와 maintenance 테스트 결합 | G-125의 `planning/assessment_service.py`, `planning/planning_service.py`, `planning/*_service.py`와 각 port·분리된 tests가 소유한다. |
+| block/checkpoint·origin/invocation 테스트 결합 | G-120~G-122의 `recovery/`, `agents/`, `runtime/`, `git/` adapter와 분리된 test module이 소유한다. |
+| notification 저장·rendering·delivery 혼합 | G-126의 `notifications/repository.py`, `rendering.py`, `delivery.py`가 소유하며 `notifications.py`는 공개 facade다. |
+| 나머지 state·Git 결합 | G-120/G-122의 repository·Git adapter가 유지한다. `runtime_state.py`, `execplan_catalog_state.py`, `manager_git_journal.py`의 저장·증거 책임은 그대로이므로 길이만을 근거로 이동하지 않는다. |
+| 일회성 `full_assessment.py` | G-127에서 삭제했다. `source_inventory`는 기존 `maintenance_file_inventory.py`, prompt는 `maintenance_planning.py`, 결과 parser와 이전 report reader는 `maintenance_validation.py`가 소유한다. `planning/assessment_port.py`가 세 경계를 호출하고 `assessment_service.py`가 중단 재개·bounded retry를 맡는다. `documents/document_drafts.py`의 완료 report 소비와 SQLite column·marker는 유지한다. |
+
+원본 `full_assessment.py`의 runtime 소비는 `planning/assessment_port.py` 한 곳이었고, 테스트 소비는 `tests/test_maintenance_planning.py`와 `tests/test_planning_assessment.py`였다. `tests/test_maintenance_publication.py`, `tests/test_maintenance_assessment.py`, `tests/test_maintenance_authority.py`, `tests/support/maintenance_planning_case.py`의 미사용 import도 제거했다. `scripts/verify.sh`와 `scripts/verify.ps1`은 삭제한 module의 compile 인자를 제거했고 같은 198개 runtime/package Python 파일을 대상으로 한다. 작업 tree의 Python 파일 396개, test module 167개와 컴파일 경로를 실행 없이 대조했으며 두 verify의 전체 unittest discovery는 유지했다. 과거 문서의 경로·revision·판단 근거는 감사 기록으로 보존한다.
+
 ## Validation
 
 - Worker는 `tests/test_loop_manager.py`의 역할별 prompt와 `tests/test_managed_configuration.py`의 공통 지침 배포 관련 targeted unit test만 실행한다.

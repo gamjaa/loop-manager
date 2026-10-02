@@ -13,7 +13,6 @@ from types import SimpleNamespace
 from loop_manager_internal.documents import document_drafts
 from loop_manager_internal.documents import document_publication
 from loop_manager_internal.catalog import execplan_catalog
-from loop_manager_internal.maintenance import full_assessment
 from loop_manager_internal.storage import execplan_catalog_state
 import loop_manager
 from loop_manager_internal.maintenance import maintenance_planning
