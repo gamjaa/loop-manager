@@ -91,6 +91,7 @@ class BlockedPlanRemoteRefreshTests(unittest.TestCase):
         self.ports.capture_git_snapshot.return_value = SimpleNamespace(
             head=self.head, dirty={}, index={}, operations={})
         self.ports.git.side_effect = self.git
+        self.ports._recorded_base_fetch.side_effect = self.recorded_fetch
         self.ports._update_blocked_error.side_effect = loop_manager._update_blocked_error
         self.ports._evaluate_remote_checkpoint_cause.return_value = (False, 'same failure', 'verify')
         self.ports._current_rebase_service.return_value.require_owned.return_value = (
@@ -112,6 +113,15 @@ class BlockedPlanRemoteRefreshTests(unittest.TestCase):
         elif args[:1] == ('rev-parse',):
             output = self.base if args[1] == 'FETCH_HEAD^{commit}' else self.head
         return SimpleNamespace(returncode=0, stdout=output)
+
+    def recorded_fetch(self, repo_path, state_dir, base, *, owner):
+        # The Git and journal adapter is a separate port. Preserve network
+        # failures and FETCH_HEAD pinning in the coordinator's fake fetch.
+        fetched = self.ports.git(repo_path, 'fetch', '--no-tags', '--refmap=', 'origin',
+                                 f'refs/heads/{base}', check=False)
+        if fetched.returncode:
+            raise RuntimeError(fetched.stdout)
+        return self.ports.git(repo_path, 'rev-parse', 'FETCH_HEAD^{commit}').stdout.strip()
 
     def record_observation(self, plan_id='G-106'):
         blocked_remote_observation.record(
@@ -715,6 +725,8 @@ class BlockedPlanRemoteRefreshTests(unittest.TestCase):
             self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
         self.ports._journaled_direct_rebase.assert_called_once()
         self.ports._complete_direct_rebase_checkpoint.assert_called_once()
+        self.ports._recorded_base_fetch.assert_called_once_with(
+            Path('/repo'), Path('/state'), 'main', owner='plan:G-106')
         self.assertEqual(self.plan()['blocked_fingerprint'], 'input')
 
     def test_interrupted_evaluated_stage_does_not_repeat_rebase_or_cause_check(self):

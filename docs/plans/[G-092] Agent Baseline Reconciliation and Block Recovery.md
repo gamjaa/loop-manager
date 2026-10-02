@@ -61,6 +61,8 @@ Agent 시작 snapshot 뒤에 Manager의 검증된 Git 작업이 있어도 현재
 
 2026-10-02 추가 verify 피드백 보정: 원격 successor를 채택한 재개 결과는 기존 채택 기준선 검사로 연결하고, runtime 소유권·등록 증거를 확인한 뒤 원본과 같은 자원만 보정해 저장된 실제 Agent 변경은 계속 거부한다. scope 재개 실패 시 새 임시 project projection만 정리하며 기존 선택·계획 진단과 새 프로젝트 안전 차단을 보존한다. guidance 원격 변경 fixture의 `main` clone을 명시하고, 지연 cleanup fixture의 Merge된 계획을 실제 원격 문서와 같은 metadata로 등록했다. 직접 관련된 fake-port unit test 10개가 최종 실행에서 통과했으며 targeted 실패는 fixture를 수정한 뒤 동일 명령으로 재실행했다. 실제 Git fixture 검증과 전체 verify는 실행하지 않았고 Loop Manager 재검증을 기다린다.
 
+2026-10-02 남은 verify 실패 보정: 차단 계획의 base fetch를 기존 소유 CAS·journal 경로로 연결했다. Merge cleanup 후 archive 게시도 설정된 push URL을 사용해 tracking ref의 자동 갱신을 피하고, 후속 기록형 fetch가 전후 증거를 남기도록 했다. 복수 push URL과 원격 결과 확인, 통신 실패·OID 경쟁·재시작 및 외부 reflog 혼합을 다루는 관련 fake-port unit test 53개가 통과했다. 실제 Git 회귀와 전체 verify는 Loop Manager 재검증을 기다린다.
+
 ## Decision Log
 
 - 과거 실행에 쓰기 격리 증거가 없으면 무관한 shared ref·worktree 변화를 자동으로 외부 변경이라 단정하지 않는다. G-088/G-089와 G-090/G-091의 독립 증거가 있는 경우에만 해제한다.

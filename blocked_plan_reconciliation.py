@@ -271,12 +271,11 @@ class BlockedPlanReconciler:
             (checkpoint.snapshot or {}).get('current_rebase_acceptance')))
         if not pending and not completed:
             try:
-                fetched = self.ports.git(self.repo_path, 'fetch', '--no-tags', 'origin', context['base_ref'], check=False)
+                fetched_oid = self.ports._recorded_base_fetch(
+                    self.repo_path, self.state_dir, self.base, owner=f'plan:{plan_id}')
             except (OSError, RuntimeError) as error:
                 raise AssessmentPending('차단 계획 base fetch 미완료: ' + str(error)) from error
-            if fetched.returncode:
-                raise AssessmentPending('차단 계획 base fetch 실패: ' + fetched.stdout[-2000:])
-            if self.ports.git(self.repo_path, 'rev-parse', 'FETCH_HEAD^{commit}').stdout.strip() != context['base_oid']:
+            if fetched_oid != context['base_oid']:
                 raise InputChanged('차단 계획 base 조회·fetch 사이 OID 경쟁')
             remote = self._remote(context, allow_published=True)
             if remote != context['branch_oid']:

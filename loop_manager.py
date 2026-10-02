@@ -21325,13 +21325,16 @@ class _ExecPlanArchiveGitPort:
         prepared: execplan_archive.PreparedArchive,
         base_branch: str,
     ) -> execplan_archive.ArchivePushResult:
-        pushed = git(
-            self.repo_path,
-            "push",
-            "origin",
-            f"{prepared.commit_oid}:refs/heads/{base_branch}",
-            check=False,
-        )
+        # Named-remote push updates tracking refs before the recorded fetch
+        # can prove their transition. Use the resolved push destinations, as
+        # diagnostic publication does, and let fetch perform the owned CAS.
+        urls = git(self.repo_path, "remote", "get-url", "--push", "--all", "origin").stdout.splitlines()
+        if not urls:
+            raise RuntimeError("archive push 대상 origin URL을 확인할 수 없습니다.")
+        pushes = [git(
+            self.repo_path, "push", "--", url,
+            f"{prepared.commit_oid}:refs/heads/{base_branch}", check=False,
+        ) for url in urls]
         try:
             remote_oid = self.fetch_remote_base(base_branch)
         except Exception as error:
@@ -21351,7 +21354,7 @@ class _ExecPlanArchiveGitPort:
         return execplan_archive.ArchivePushResult(
             False,
             remote_oid=remote_oid,
-            error=pushed.stdout[-6000:] or "fast-forward push가 거부됐습니다.",
+            error="\n".join(pushed.stdout for pushed in pushes)[-6000:] or "fast-forward push가 거부됐습니다.",
         )
 
 

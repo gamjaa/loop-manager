@@ -2125,6 +2125,55 @@ class ManagerBaselineReconciliationUnitTests(unittest.TestCase):
         with self.assertRaises(manager_git_journal.MutationEvidenceError):
             self.reconcile()
 
+    def test_archive_push_keeps_tracking_ref_for_owned_fetch_and_later_scope_refresh(self):
+        from types import SimpleNamespace
+        import execplan_archive
+
+        self.record_fetch()
+        commit = 'c' * 40
+        prepared = execplan_archive.PreparedArchive('archive', 'b' * 40, 'tree', commit)
+        port = loop_manager._ExecPlanArchiveGitPort(self.source, self.state, str(self.source))
+        remote, fetched = 'b' * 40, None
+        url = 'https://example.test/repo.git'
+
+        def git(_repo, *args, **kwargs):
+            nonlocal remote, fetched
+            output = ''
+            if args == ('remote', 'get-url', '--push', '--all', 'origin'):
+                output = url
+            elif args[:1] == ('push',):
+                self.assertEqual(args, ('push', '--', url, commit + ':refs/heads/main'))
+                self.assertEqual(self.current.refs[self.ref], ('b' * 40, ''))
+                remote = commit
+            elif args[:1] == ('ls-remote',):
+                output = remote + '\trefs/heads/main\n'
+            elif args == ('fetch', '--no-tags', '--refmap=', 'origin', 'refs/heads/main'):
+                fetched = remote
+            elif args == ('rev-parse', '--verify', 'FETCH_HEAD^{commit}'):
+                output = fetched
+            elif args == ('rev-parse', '--verify', self.ref + '^{commit}'):
+                output = self.current.refs[self.ref][0]
+            elif args[:1] == ('update-ref',):
+                self.assertEqual(args[-3:], (self.ref, commit, 'b' * 40))
+                self.current = replace(self.current, refs={self.ref: (commit, '')})
+                self.reflog = commit + '\0' + args[3] + '\n' + self.reflog
+            elif args[:2] == ('reflog', 'show'):
+                output = self.reflog
+            else:
+                raise AssertionError('Unexpected Git call: ' + repr(args))
+            return SimpleNamespace(returncode=0, stdout=output)
+
+        self.git.side_effect = git
+        result = port.push_fast_forward(prepared, 'main')
+        self.assertTrue(result.success)
+        self.assertEqual(self.reconcile().refs[self.ref], (commit, ''))
+        self.assertEqual(self.before.refs[self.ref], ('a' * 40, ''))
+        self.assertEqual(self.reconcile().dirty, self.before.dirty)
+        # A later unowned transition still invalidates the fetch chain.
+        self.reflog = commit + '\0external update\n' + self.reflog
+        with self.assertRaises(manager_git_journal.MutationEvidenceError):
+            self.reconcile()
+
     def test_completed_sqlite_fetch_without_git_action_is_not_execution_proof(self):
         loop_manager._ensure_cleanup_pending_schema(self.connection)
         self.connection.execute('INSERT INTO manager_base_fetches '
