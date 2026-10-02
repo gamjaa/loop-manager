@@ -5,15 +5,17 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 from pathlib import Path
 import re
+import json
 import sqlite3
 from typing import Iterator, Sequence
 from uuid import uuid4
 
 from maintenance_file_inventory import (
     RootPlacement, SourceInventory, TrackedSource, root_placement_inventory,
-    tracked_source_inventory, verify_remote_revision,
+    _git, tracked_source_inventory, verify_remote_revision,
 )
 
 
@@ -46,6 +48,88 @@ class ReviewedSource:
     mode: str
     source_revision: str
     evidence: str
+
+
+ROOT_REVIEW_PATH = "."
+ROOT_REVIEW_REASON = "revision-bound root placement assessment"
+
+
+def root_review_source(repository: Path, inventory: SourceInventory) -> TrackedSource:
+    content = _git(repository, "ls-tree", inventory.revision)
+    return TrackedSource(ROOT_REVIEW_PATH, hashlib.sha256(content).hexdigest(),
+                         "040000", inventory.revision, ROOT_REVIEW_REASON)
+
+
+def assessment_input_tree(repository: Path, revision: str) -> tuple[bytes, ...]:
+    """Compare investigated input blobs while allowing normal Planner output."""
+    return tuple(line for line in _git(repository, "ls-tree", "-r", revision).splitlines()
+                 if not line.split(b"\t", 1)[-1].startswith(b"docs/plans/")
+                 and line.split(b"\t", 1)[-1] != b"docs/FUTURE_IDEAS.md")
+
+
+def validate_root_reviews(repository: Path, inventory: SourceInventory, results: object) -> tuple[dict, ...]:
+    """Require investigated placement decisions and exact Git evidence for every root."""
+    roots = {item.path for item in root_placement_inventory(inventory)}
+    if not isinstance(results, (list, tuple)) or len(results) != len(roots):
+        raise FileReviewLedgerError("모든 루트 항목의 실제 조사 근거가 필요합니다.")
+    if not roots:
+        return ()
+    seen = set()
+    tree = _git(repository, "ls-tree", inventory.revision).decode("utf-8", "backslashreplace")
+    paths = {item.path for item in inventory.classifications}
+    contents = {}
+    for result in results:
+        if not isinstance(result, dict) or set(result) != {
+            "path", "category", "references", "user_path", "ownership", "destination", "reason",
+        }:
+            raise FileReviewLedgerError("루트 조사 결과 필드가 계약과 다릅니다.")
+        path = result["path"]
+        if not isinstance(path, str) or path not in roots or path in seen:
+            raise FileReviewLedgerError("루트 조사 경로가 누락되거나 중복됐습니다.")
+        seen.add(path)
+        if not isinstance(result["category"], str) or result["category"] not in {
+            "tool_required", "user_entry", "execution_build_deploy", "internal_implementation", "uncertain",
+        }:
+            raise FileReviewLedgerError("루트 조사 분류가 유효하지 않습니다.")
+        for key in ("user_path", "ownership", "reason"):
+            if not isinstance(result[key], str) or not 12 <= len(result[key].strip()) <= 1200:
+                raise FileReviewLedgerError("루트 참조·사용자 경로·소유권·판단 근거가 필요합니다.")
+        destination = result["destination"]
+        if destination is not None and (
+            not isinstance(destination, str) or not destination or destination.startswith("/")
+            or "\\" in destination or any(part in {"", ".", ".."} for part in destination.split("/"))
+        ):
+            raise FileReviewLedgerError("안전한 상대 목적지가 필요합니다.")
+        if result["category"] == "uncertain" and destination is not None:
+            raise FileReviewLedgerError("불확실한 루트 항목은 이동 후보가 될 수 없습니다.")
+        if path in {".agents", "docs", "scripts", "AGENTS.md"} and (
+            result["category"] != "tool_required" or destination is not None
+        ):
+            raise FileReviewLedgerError("필수 루트 경로는 유지해야 합니다.")
+        references = result["references"]
+        if not isinstance(references, list) or not 1 <= len(references) <= 32:
+            raise FileReviewLedgerError("루트 조사에는 원본 참조가 필요합니다.")
+        linked = False
+        for ref in references:
+            if not isinstance(ref, dict) or set(ref) != {"path", "excerpt"}:
+                raise FileReviewLedgerError("루트 원본 참조 형식이 유효하지 않습니다.")
+            reference_path, excerpt = ref["path"], ref["excerpt"]
+            if reference_path == ".":
+                text = tree
+                if result["category"] not in {"uncertain", "tool_required"}:
+                    raise FileReviewLedgerError("파일 목록만으로 실행·사용 계약을 증명할 수 없습니다.")
+            elif isinstance(reference_path, str) and reference_path in paths:
+                if reference_path not in contents:
+                    contents[reference_path] = _git(repository, "show", f"{inventory.revision}:{reference_path}").decode("utf-8", "backslashreplace")
+                text = contents[reference_path]
+            else:
+                raise FileReviewLedgerError("루트 참조 경로가 현재 원본에 없습니다.")
+            if not isinstance(excerpt, str) or not 8 <= len(excerpt) <= 1200 or excerpt not in text:
+                raise FileReviewLedgerError("루트 참조 인용이 현재 원본과 다릅니다.")
+            linked = linked or (isinstance(reference_path, str) and reference_path.split("/", 1)[0] == path) or path in excerpt
+        if not linked:
+            raise FileReviewLedgerError("원본 참조가 조사할 루트 항목과 연결되지 않았습니다.")
+    return tuple(results)
 
 
 FILE_REVIEW_SCHEMA = """
@@ -144,8 +228,29 @@ class FileReviewRepository:
             + "ORDER BY path",
             (repo,),
         ).fetchall()
-        return tuple(RootPlacement(str(path), str(category), str(reason))
-                     for path, category, reason in rows)
+        placements = []
+        for path, category, reason in rows:
+            try:
+                note = json.loads(reason)["reason"]
+            except (ValueError, TypeError, KeyError):
+                note = reason
+            placements.append(RootPlacement(str(path), str(category), str(note)))
+        return tuple(placements)
+
+    def reusable_root_reviews(self, repo: str, inventory: SourceInventory) -> tuple[dict, ...] | None:
+        if not root_placement_inventory(inventory):
+            return ()
+        rows = self.connection.execute(
+            "SELECT reason, source_revision FROM root_placement_reviews WHERE repo = ? AND active = 1 ORDER BY path",
+            (repo,),
+        ).fetchall()
+        try:
+            if any(revision != inventory.revision for _, revision in rows):
+                return None
+            results = [json.loads(raw) for raw, _ in rows]
+            return validate_root_reviews(Path(repo), inventory, results)
+        except (ValueError, TypeError):
+            return None
 
     def selected_sources(
         self, repo: str, inventory: SourceInventory,
@@ -167,7 +272,7 @@ class FileReviewRepository:
     def record_success(
         self, repo: str, repository_path: str, base_branch: str,
         inventory: SourceInventory, reviewed: Sequence[ReviewedSource],
-        *, published_revision: str | None = None,
+        *, published_revision: str | None = None, root_reviews: Sequence[dict] | None = None,
     ) -> AssessmentSuccess:
         """Commit only complete, source-bound review evidence in one transaction.
 
@@ -192,7 +297,16 @@ class FileReviewRepository:
                      for item in inventory.sources
         ):
             raise FileReviewLedgerError("평가 후 원격 파일 목록 또는 내용이 변경됐습니다.")
-        placements = root_placement_inventory(current)
+        if root_reviews is None:
+            root_reviews = self.reusable_root_reviews(repo, inventory)
+        placements = validate_root_reviews(source_repo, inventory, root_reviews)
+        # Publication may add plans, but must not change investigated root entries
+        # or any evidence-bearing input outside Planner-owned output paths.
+        if (assessment_input_tree(source_repo, inventory.revision)
+            != assessment_input_tree(source_repo, remote_revision)
+            or {item.path for item in root_placement_inventory(current)}
+            != {item["path"] for item in placements}):
+            raise FileReviewLedgerError("루트 조사 후 참조 또는 소유 대상이 변경됐습니다.")
         with _transaction(self.connection):
             selected = self.selected_sources(repo, inventory)
             if len(reviewed) != len(selected):
@@ -233,7 +347,7 @@ class FileReviewRepository:
                     (repo, source.path, source.content_hash, source.mode,
                      inventory.revision, reviewed_at),
                 )
-            current_root_paths = {item.path for item in placements}
+            current_root_paths = {item["path"] for item in placements}
             for placement in self.root_placements(repo, include_retired=True):
                 if placement.path not in current_root_paths:
                     self.connection.execute(
@@ -250,7 +364,7 @@ class FileReviewRepository:
                     "category = excluded.category, reason = excluded.reason, "
                     "source_revision = excluded.source_revision, "
                     "reviewed_at = excluded.reviewed_at, active = 1",
-                    (repo, placement.path, placement.category, placement.reason,
+                    (repo, placement["path"], placement["category"], json.dumps(placement, ensure_ascii=False, sort_keys=True),
                      inventory.revision, reviewed_at),
                 )
             self.connection.execute(

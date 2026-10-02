@@ -21819,7 +21819,10 @@ class _PlanningFileReviewPorts:
         selected = maintenance_file_ledger.FileReviewRepository(
             self._connection,
         ).selected_sources(repo, inventory)
-        return None if selected else inventory
+        reusable = maintenance_file_ledger.FileReviewRepository(
+            self._connection,
+        ).reusable_root_reviews(repo, inventory)
+        return None if selected or reusable is None else inventory
 
     def progress(
         self, repo: str, repository: Path, base: str, cycle_revision: int,

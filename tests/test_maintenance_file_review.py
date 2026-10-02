@@ -11,6 +11,26 @@ import maintenance_file_review as review
 import maintenance_file_ledger
 
 
+def root_results_for(repository, inventory):
+    tree = subprocess.check_output([
+        "git", "-C", str(repository), "ls-tree", inventory.revision,
+    ]).decode("utf-8", "backslashreplace")
+    results = []
+    for item in maintenance_file_inventory.root_placement_inventory(inventory):
+        line = next(line for line in tree.splitlines()
+                    if line.split("\t", 1)[1].split("/", 1)[0] == item.path)
+        results.append({
+            "path": item.path,
+            "category": "tool_required" if item.path in {".agents", "docs", "scripts", "AGENTS.md"} else "uncertain",
+            "references": [{"path": ".", "excerpt": line}],
+            "user_path": "No user entry contract is established in this fixture.",
+            "ownership": "No accountable owner is established in this fixture.",
+            "destination": None,
+            "reason": "The tracked tree confirms presence; usage and ownership remain uncertain.",
+        })
+    return tuple(results)
+
+
 def result_for(source, excerpt, content):
     chunk_reviews = []
     for index, start in enumerate(range(0, len(content), review.MAX_EMBEDDED_SOURCE_BYTES)):
@@ -148,7 +168,7 @@ class ProvisionalFileReviewTest(unittest.TestCase):
             str(self.repo), self.repo, "main", 1, inventory,
         )
         self.assertEqual(resumed.completed, (parsed,))
-        self.assertIsNone(resumed.next_unit)
+        self.assertEqual(resumed.next_unit.source.reason, maintenance_file_ledger.ROOT_REVIEW_REASON)
         self.assertEqual(self.ledger.reviews(str(self.repo)), ())
         self.assertIsNone(self.ledger.last_success(str(self.repo)))
 
@@ -212,7 +232,7 @@ class ProvisionalFileReviewTest(unittest.TestCase):
                     str(self.repo), self.repo, "main", 1, inventory,
                 )
                 self.assertEqual(resumed.completed, (parsed,))
-                self.assertIsNone(resumed.next_unit)
+                self.assertEqual(resumed.next_unit.source.reason, maintenance_file_ledger.ROOT_REVIEW_REASON)
                 self.assertEqual(self.ledger.reviews(str(self.repo)), ())
                 self.assertIsNone(self.ledger.last_success(str(self.repo)))
                 for field in ("excerpts", "public_symbols", "readability"):
@@ -313,6 +333,88 @@ class ProvisionalFileReviewTest(unittest.TestCase):
         self.progress.complete(str(self.repo), 1, source, parsed)
         return parsed
 
+    def finish_root(self, inventory, cycle=1):
+        source = maintenance_file_ledger.root_review_source(self.repo, inventory)
+        result = {"path": source.path, "content_hash": source.content_hash,
+                  "mode": source.mode, "source_revision": source.revision,
+                  "root_reviews": list(root_results_for(self.repo, inventory))}
+        content = review.source_bytes(self.repo, "main", source)
+        parsed = review.parse_review(review.RESULT_PREFIX + json.dumps(result), source, content)
+        self.progress.start(str(self.repo), cycle, source)
+        self.progress.complete(str(self.repo), cycle, source, parsed)
+        return parsed
+
+    def test_asset_only_tree_requires_investigation_and_resumes_root_unit(self):
+        import maintenance_file_publication as publication
+        import loop_manager
+        from unittest import mock
+        inventory = self.publish({"scratch.png": b"\x89PNG\x00fixture"})
+        self.assertEqual(inventory.sources, ())
+        port = loop_manager._PlanningFileReviewPorts(self.connection)
+        self.assertIsNone(port.empty_selection_inventory(str(self.repo), self.repo, "main", inventory.revision))
+        with self.assertRaises(publication.FileAssessmentPublicationError):
+            publication.collect(self.connection, str(self.repo), self.repo, "main", 1, inventory.revision)
+        progress = self.state(inventory)
+        source = progress.next_unit.source
+        prompt = review.review_prompt(source, review.source_bytes(self.repo, "main", source),
+                                      root_placements=progress.root_placements)
+        self.assertIn("root_reviews", prompt)
+        self.assertIn("scratch.png", prompt)
+        self.progress.start(str(self.repo), 1, source)
+        self.progress.session(str(self.repo), 1, source, "root-session")
+        self.assertEqual(self.state(inventory).next_unit.session_id, "root-session")
+        result = {"path": source.path, "content_hash": source.content_hash,
+                  "mode": source.mode, "source_revision": source.revision, "root_reviews": []}
+        with self.assertRaises(review.FileReviewError):
+            self.progress.complete(str(self.repo), 1, source, result)
+        self.progress.fail(str(self.repo), 1, source, "missing investigation")
+        self.assertEqual(self.state(inventory).next_unit.error, "missing investigation")
+        self.finish_root(inventory)
+        restarted = review.ProvisionalReviewRepository(self.connection).progress(
+            str(self.repo), self.repo, "main", 1, inventory)
+        self.assertIsNone(restarted.next_unit)
+        self.assertEqual(restarted.root_reviews[0]["category"], "uncertain")
+        # Root records never become source file reviews or code maps.
+        with mock.patch.object(publication, "_merged_count", return_value=0):
+            evidence = publication.collect(self.connection, str(self.repo), self.repo, "main", 1, inventory.revision)
+        self.assertEqual(evidence.reviewed, ())
+        self.assertEqual(evidence.code_maps, ())
+        publication.promote(self.connection, str(self.repo), self.repo, "main", inventory.revision, evidence)
+        self.assertEqual(self.ledger.root_placements(str(self.repo))[0].category, "uncertain")
+        self.assertEqual(port.empty_selection_inventory(str(self.repo), self.repo, "main", inventory.revision), inventory)
+        self.assertIsNone(self.state(inventory, cycle=2).next_unit)
+        changed = self.publish({"scratch.png": b"\x89PNG\x00changed"})
+        self.assertIsNotNone(self.state(changed, cycle=2).next_unit)
+        self.assertIsNone(port.empty_selection_inventory(str(self.repo), self.repo, "main", changed.revision))
+
+    def test_legacy_automatic_root_result_cannot_replace_investigation(self):
+        from unittest import mock
+        inventory = self.publish({"scratch.png": b"\x89PNG\x00fixture"})
+        self.connection.execute(
+            "INSERT INTO root_placement_reviews VALUES (?, 'scratch.png', 'execution_build_deploy', ?, ?, 'old', 1)",
+            (str(self.repo), "root manifest, configuration, asset, or build contract", inventory.revision),
+        )
+        self.assertIsNone(self.ledger.reusable_root_reviews(str(self.repo), inventory))
+        self.assertEqual(self.state(inventory).next_unit.source.reason, maintenance_file_ledger.ROOT_REVIEW_REASON)
+        self.finish_root(inventory)
+        self.assertIsNone(self.state(inventory).next_unit)
+        with mock.patch.object(review, "validate_root_reviews") as validate:
+            self.assertIsNone(self.state(inventory).next_unit)
+            validate.assert_not_called()
+        raw = self.connection.execute(
+            "SELECT result_json FROM provisional_file_reviews WHERE repo = ? AND path = '.'", (str(self.repo),),
+        ).fetchone()[0]
+        forged = json.loads(raw)
+        forged["root_reviews"][0]["ownership"] = ""
+        self.connection.execute(
+            "UPDATE provisional_file_reviews SET result_json = ? WHERE repo = ? AND path = '.'",
+            (json.dumps(forged), str(self.repo)),
+        )
+        self.assertIsNotNone(self.state(inventory).next_unit)
+        # Invalid saved results must allow replacement, rather than trapping retries.
+        self.finish_root(inventory)
+        self.assertIsNone(self.state(inventory).next_unit)
+
     def test_multiple_units_resume_without_advancing_success_ledger(self):
         inventory = self.publish({
             "src/a.py": "def calculate(): return 1\n",
@@ -336,7 +438,9 @@ class ProvisionalFileReviewTest(unittest.TestCase):
         self.assertEqual(resumed.next_unit.source.path, "src/b.py")
         self.finish(resumed.next_unit.source)
         final = self.state(inventory)
-        self.assertIsNone(final.next_unit)
+        self.assertEqual(final.next_unit.source.reason, maintenance_file_ledger.ROOT_REVIEW_REASON)
+        self.finish_root(inventory)
+        self.assertIsNone(self.state(inventory).next_unit)
         self.assertEqual(len(final.completed), 2)
         self.assertEqual(self.ledger.reviews(str(self.repo)), ())
         self.assertIsNone(self.ledger.last_success(str(self.repo)))
@@ -405,6 +509,7 @@ class ProvisionalFileReviewTest(unittest.TestCase):
                 item.path, item.content_hash, item.mode, item.revision,
                 "Reviewed implementation and test responsibilities.",
             ) for item in inventory.sources),
+            root_reviews=root_results_for(self.repo, inventory),
         )
         changed = self.publish({"src/a.py": "def calculate(): return 3\n"})
         state = self.state(changed)

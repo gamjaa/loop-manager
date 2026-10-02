@@ -248,7 +248,7 @@ def root_placement_inventory(inventory: SourceInventory) -> tuple[RootPlacement,
             reason = ("root source candidate; retain unless assessment confirms its "
                       "entry path, references, owner, and safe destination")
         else:
-            category, reason = "execution_build_deploy", "root manifest, configuration, asset, or build contract"
+            category, reason = "uncertain", "root placement requires investigation of actual use and ownership"
         placements.append(RootPlacement(path, category, reason))
     return tuple(placements)
 

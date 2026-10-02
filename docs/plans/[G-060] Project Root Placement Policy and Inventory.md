@@ -97,7 +97,9 @@ priority: critical
 
 `loop_manager.py`의 SQLite transaction/schema·scheduler composition은 G-120/G-123, Agent session/isolation은 G-121, Git mutation·remote lease·checkpoint/validation token·recovery adapter는 G-122, execution handler의 recover/guard/run/verify/review/publish는 G-124, planning/assessment 및 `full_assessment` 소비는 G-125, notification outbox/rendering/delivery는 G-126, 남은 inventory·temporary code와 verify references는 G-127로 대응한다. `tests/test_loop_manager.py`의 module-wide profile/session/Git/catalog patch 수명은 G-119가 먼저 분리한다. 이 대응표는 현재 ownership을 바꾸지 않으며 SQLite 저장 형식, CLI, launcher, user path, public contract와 verify path를 유지한다.
 
-`maintenance_file_inventory.root_placement_inventory()`는 existing `tracked_source_inventory()`의 모든 classification에서 top-level 항목을 만들고, README·manifest·configuration처럼 source selection에서 제외된 항목도 포함한다. `ProvisionalReviewRepository.progress()`가 이 immutable inventory를 선택된 파일의 Planner prompt에 제공하고, `FileReviewRepository.record_success()`는 source review와 같은 transaction에서 `root_placement_reviews`에 revision·분류·근거를 기록한다. 빈 source 선택도 `settle_empty_stabilization_assessment()`가 같은 `record_success()`를 호출하므로 tracked root 항목이 있으면 그 inventory를 기록하고 원격 revision drift에서는 실패한다. Git tree 자체가 빈 revision은 이전 file·root review를 retire한 정상 stabilization baseline이므로 root rows 없이 성공할 수 있다. 따라서 등록·배포만을 이유로 별도 전수 평가를 시작하지 않고, G-086의 다음 정상 평가가 현재 revision-bound inventory와 이전 결과를 재사용하거나 hash drift를 다시 확인한다.
+`maintenance_file_inventory.root_placement_inventory()`는 추적 tree의 모든 top-level 항목을 제공하며, 자동 분류는 조사 결과가 아니다. `ProvisionalReviewRepository.progress()`는 정상 파일 평가 안에서 루트 조사 단위를 선택하고 기존 `FILE_REVIEW_RESULT`·세션·재시도 경로를 재사용한다. 조사 결과는 모든 항목의 실제 참조 인용, 사용자 경로, 소유권, 안전한 목적지 또는 유지·불확실 근거를 포함한다. 참조 원본과 항목별 coverage를 검증한 결과만 publication intent와 종합 증거에 전달하며, `FileReviewRepository.record_success()`가 source review와 같은 transaction에서 저장한다. 파일 목록만으로 실행·사용 계약을 입증할 수 없으며, 참조·소유권을 확인하지 못한 항목은 `uncertain`과 빈 목적지로 기록한다.
+
+기존 조사 결과는 같은 immutable revision의 coverage와 원본 근거가 유효할 때 재사용한다. 기존 자동 분류만 저장된 결과나 revision·참조 drift는 다음 정상 평가에서 조사 단위를 다시 선택한다. source 선택이 비어 있어도 미조사 루트가 있으면 Agent 평가를 거치며 stabilization fast path는 이를 건너뛰지 않는다. Git tree 자체가 빈 revision은 조사할 루트가 없으므로 이전 file·root review를 retire한 baseline으로 성공할 수 있다. publication 뒤 Planner 소유 출력 밖의 원본 변경은 성공 처리를 막거나 정상 평가를 재시작한다. 등록·배포만으로 별도 평가를 시작하지 않으며 기존 경로·SQLite schema와 verify 경로를 유지한다.
 
 ### 파일별 import·test patch·이동 대응표
 
@@ -131,6 +133,7 @@ priority: critical
 
 - [x] 루트 inventory 및 안전한 이동 경계 확정
 - [x] 공통 파일 배치 지침과 targeted test 추가
+- [x] 미조사·기존 자동 분류 결과의 성공 처리 차단, revision-bound 루트 조사·종합·publication·재사용 검증
 - [x] 최신 원격 기준 자체 구조·중복·fixture 대응표와 G-119~G-127 범위 확인
 
 ## Decision Log
@@ -151,3 +154,5 @@ priority: critical
 - 2026-10-02: `d523989e65103ca187815b54808abf09e7ac867f`의 `full_assessment.source_inventory()`와 같은 revision의 root tree를 대조했다. inventory는 147개의 hash-bound 추적 분석 대상을 산출했지만 full assessment 완료나 SQLite 성공으로 기록하지 않았다. root 고정 항목, launcher·config·manifest 및 내부 module의 import/test/verify 결합은 Implementation의 대응표에 기록했으며 실제 이동은 G-063 이후 책임 분리 계획만 수행한다.
 - 2026-10-02: 모든 역할에 주입되는 provider-neutral `AGENT_QUALITY_GUIDANCE`에 root placement 기준을 추가했다. 이 기준은 첫 정상 파일별 구조 평가의 root inventory를 요구하되 평가 schedule을 앞당기지 않고, 근거가 불명확한 파일의 자동 이동·삭제를 금지한다.
 - 2026-10-02: Review 지적에 따라 root placement를 prompt 문구만으로 처리하지 않았다. immutable tree의 모든 top-level classification을 file-review input으로 전달하고, source review와 빈 source selection 모두 같은 transaction에서 root result를 ledger에 기록하도록 했다. `planning_runtime.py`와 root-inventory 대상의 direct importer/test patch/destination을 Implementation 대응표에 추가했다.
+
+- 2026-10-02: 반복 Review 피드백에 따라 inventory 저장을 성공 조사로 취급하는 경로를 제거했다. 정상 평가의 루트 조사 결과에 참조·사용자 경로·소유권·목적지 계약을 적용하고 원본 인용과 coverage를 검증한다. source가 없는 asset-only tree, 기존 자동 분류, 잘못된 저장 결과 재시도, 참조 drift와 빈 tree retire를 targeted unit test로 확인한다. 기존 verify는 변경 모듈 compile과 전체 unittest discovery를 이미 포함하므로 변경하거나 실행하지 않는다.

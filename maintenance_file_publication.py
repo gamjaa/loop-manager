@@ -11,7 +11,7 @@ from maintenance_file_inventory import (
     ClassifiedPath, SourceInventory, TrackedSource, cached_source_inventory,
     tracked_source_inventory,
 )
-from maintenance_file_ledger import FileReviewRepository, ReviewedSource
+from maintenance_file_ledger import FileReviewRepository, ReviewedSource, assessment_input_tree
 from maintenance_file_review import ProvisionalReviewRepository
 from maintenance_reconciliation import (
     ReconciliationRepository, SynthesisRepository, _valid_map_shape,
@@ -40,6 +40,7 @@ class AssessmentEvidence:
     reviewed: tuple[ReviewedSource, ...]
     code_maps: tuple[tuple[str, str], ...]
     merged_count: int
+    root_reviews: tuple[dict, ...] = ()
 
 
 def sources_match_remote(
@@ -48,7 +49,8 @@ def sources_match_remote(
 ) -> bool:
     """Recheck the live remote source set before promoting saved evidence."""
     current = tracked_source_inventory(repository, base_branch, revision)
-    return tuple(
+    return (assessment_input_tree(repository, revision)
+            == assessment_input_tree(repository, evidence.inventory.revision)) and tuple(
         (source.path, source.content_hash, source.mode, source.reason)
         for source in current.sources
     ) == tuple(
@@ -98,6 +100,7 @@ def collect(
                                      ensure_ascii=False, sort_keys=True))
               for source in reviews.selected),
         _merged_count(connection, repo),
+        reviews.root_reviews,
     )
 
 
@@ -123,6 +126,7 @@ def save_intent(
         "reviewed": [asdict(item) for item in evidence.reviewed],
         "code_maps": list(evidence.code_maps),
         "merged_count": evidence.merged_count,
+        "root_reviews": list(evidence.root_reviews),
     }, ensure_ascii=False, sort_keys=True)
     row = connection.execute(
         "SELECT cycle_revision, source_revision, publication_commit, evidence_json "
@@ -169,6 +173,7 @@ def saved_intent(
             tuple(ReviewedSource(**item) for item in value["reviewed"]),
             tuple((str(path), str(raw)) for path, raw in value["code_maps"]),
             int(value["merged_count"]),
+            tuple(value.get("root_reviews", ())),
         )
     except (KeyError, TypeError, ValueError) as error:
         raise FileAssessmentPublicationError("파일 평가 publication intent가 손상됐습니다.") from error
@@ -193,7 +198,7 @@ def promote(
             raise FileAssessmentPublicationError("검토 파일의 코드맵이 유효하지 않습니다.")
     FileReviewRepository(connection).record_success(
         repo, str(repository), base_branch, evidence.inventory, evidence.reviewed,
-        published_revision=published_revision,
+        published_revision=published_revision, root_reviews=evidence.root_reviews,
     )
     for path, raw in evidence.code_maps:
         source = selected[path]

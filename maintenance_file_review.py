@@ -21,7 +21,10 @@ from maintenance_file_inventory import (
     root_placement_inventory,
     verify_remote_revision,
 )
-from maintenance_file_ledger import FileReviewRepository
+from maintenance_file_ledger import (
+    FileReviewRepository, FileReviewLedgerError, ROOT_REVIEW_PATH, ROOT_REVIEW_REASON,
+    root_review_source, validate_root_reviews,
+)
 from quality_guidance import AGENT_QUALITY_GUIDANCE
 
 
@@ -67,6 +70,7 @@ class FileReviewProgress:
     completed: tuple[dict, ...]
     next_unit: ReviewUnit | None
     root_placements: tuple[RootPlacement, ...] = ()
+    root_reviews: tuple[dict, ...] = ()
 
 
 def _string(value: object, label: str, *, minimum: int = 1) -> str:
@@ -140,6 +144,12 @@ def _similar_candidates(value: object) -> list[dict]:
 def source_bytes(repository: Path, base: str, source: TrackedSource) -> bytes:
     """Read one exact Git blob and reject a moved ref or forged inventory row."""
     verify_remote_revision(repository, base, source.revision)
+    if source.reason == ROOT_REVIEW_REASON:
+        content = _git(repository, "ls-tree", source.revision)
+        if source.path != ROOT_REVIEW_PATH or source.mode != "040000" or source.content_hash != hashlib.sha256(content).hexdigest():
+            raise FileReviewError("루트 조사 source identity가 변경됐습니다.")
+        verify_remote_revision(repository, base, source.revision)
+        return content
     if not source.path or source.path.startswith("/") or ".." in source.path.split("/"):
         raise FileReviewError("검토 경로가 유효하지 않습니다.")
     entries = _git(repository, "ls-tree", "-z", source.revision, "--", source.path)
@@ -224,6 +234,15 @@ def parse_review(output: str, source: TrackedSource, content: bytes) -> dict:
         result = json.loads(lines[0])
     except json.JSONDecodeError as error:
         raise FileReviewError("FILE_REVIEW_RESULT JSON이 유효하지 않습니다.") from error
+    if source.reason == ROOT_REVIEW_REASON:
+        if not isinstance(result, dict) or set(result) != {
+            "path", "content_hash", "mode", "source_revision", "root_reviews",
+        } or any(result[key] != getattr(source, key if key != "source_revision" else "revision")
+                 for key in ("path", "content_hash", "mode", "source_revision")):
+            raise FileReviewError("루트 조사 결과 identity 또는 계약이 다릅니다.")
+        if hashlib.sha256(content).hexdigest() != source.content_hash or not isinstance(result["root_reviews"], list):
+            raise FileReviewError("루트 조사 원본 또는 결과가 유효하지 않습니다.")
+        return result
     expected = {
         "path", "content_hash", "mode", "source_revision", "evidence",
         "code_map", "pending_references", "similar_responsibilities",
@@ -284,6 +303,30 @@ def review_prompt(
     root_placements: tuple[RootPlacement, ...] = (),
 ) -> str:
     """Give the Agent the exact blob for a bounded, single-file review unit."""
+    if source.reason == ROOT_REVIEW_REASON:
+        return (
+            "당신은 유지보수 Planner다. 파일이나 문서를 수정하지 마라. "
+            "이 정상 평가에서 모든 루트 항목의 실제 참조·사용자 경로·소유권·안전한 목적지를 조사하라. "
+            "Git tree 목록은 inventory이며 조사 완료 근거가 아니다. "
+            "source_revision의 원본을 git show REVISION:PATH로 확인하고 실제 사용 근거를 인용하라. "
+            "확인할 수 없는 항목은 category=uncertain, destination=null과 구체적인 판단 근거를 남겨라. "
+            "도구 필수 루트는 category=tool_required, destination=null로 보존하라.\n"
+            f"{AGENT_QUALITY_GUIDANCE}\n"
+            "source identity: " + json.dumps({"path": source.path, "content_hash": source.content_hash,
+                "mode": source.mode, "source_revision": source.revision}, ensure_ascii=False) + "\n"
+            "revision-bound root placement inventory: " + json.dumps(
+                [item.__dict__ for item in root_placements], ensure_ascii=False) + "\n"
+            "Git tree:\n" + _source_text(content) + "\n"
+            "FILE_REVIEW_RESULT: 한 줄 JSON을 정확히 하나 기록하라. 필수 필드: "
+            "path, content_hash, mode, source_revision, root_reviews:[모든 루트마다 "
+            "{path, category:tool_required|user_entry|execution_build_deploy|internal_implementation|uncertain, "
+            "references:[{path:실제 추적 파일 경로, excerpt:8자 이상의 정확한 원본 인용}], "
+            "user_path:실제 사용자 이용 경로 또는 확인 불가 이유, ownership:소유권 또는 확인 불가 이유, "
+            "destination:안전한 상대 목적지 또는 null, reason:참조 조사와 유지·이동 판단 근거}]. "
+            "user_path, ownership, reason은 각각 12자 이상의 구체적인 설명이 필요하다. "
+            "binary 등 참조를 증명하지 못한 항목은 uncertain으로 남기고 references에 "
+            "path=., excerpt=Git tree의 정확한 행을 사용할 수 있다. 필수 도구 경로도 tree 참조를 허용한다."
+        )
     text = _source_text(content)
     source_location = json.dumps({
         "source_revision": source.revision, "path": source.path,
@@ -364,8 +407,13 @@ class ProvisionalReviewRepository:
         """Reconcile every saved unit with the current selected source set."""
         if cached_source_inventory(self.connection, repository, base, inventory.revision) != inventory:
             raise FileReviewError("잠정 검토 inventory가 원격 source와 다릅니다.")
-        selected = FileReviewRepository(self.connection).selected_sources(repo, inventory)
+        ledger = FileReviewRepository(self.connection)
+        selected = ledger.selected_sources(repo, inventory)
+        reusable_roots = ledger.reusable_root_reviews(repo, inventory)
+        root_source = root_review_source(repository, inventory) if reusable_roots is None else None
         expected = {item.path: item for item in selected}
+        if root_source is not None:
+            expected[root_source.path] = root_source
         with self.connection:
             rows = self.connection.execute(
                 "SELECT path, cycle_revision, source_revision, content_hash, mode, "
@@ -398,9 +446,11 @@ class ProvisionalReviewRepository:
                         else:
                             result = parse_review(RESULT_PREFIX + str(raw), source,
                                                   source_bytes(repository, base, source))
+                            if source.reason == ROOT_REVIEW_REASON:
+                                validate_root_reviews(repository, inventory, result["root_reviews"])
                             self.connection.execute("INSERT OR REPLACE INTO provisional_review_receipts VALUES (?, ?, ?)",
                                                     (repo, path, identity))
-                except (FileReviewError, ValueError):
+                except (FileReviewError, FileReviewLedgerError, ValueError):
                     self.connection.execute(
                         "DELETE FROM provisional_file_reviews WHERE repo = ? AND path = ?",
                         (repo, path),
@@ -412,10 +462,17 @@ class ProvisionalReviewRepository:
                               if item.path in valid and valid[item.path][2] is not None)
             next_source = next((item for item in selected
                                 if item.path not in valid or valid[item.path][2] is None), None)
+            roots = reusable_roots or ()
+            if root_source is not None:
+                root_result = valid.get(root_source.path, (None, None, None))[2]
+                if root_result is not None:
+                    roots = tuple(root_result["root_reviews"])
+                elif next_source is None:
+                    next_source = root_source
             unit = (ReviewUnit(next_source, *valid.get(next_source.path, (None, None, None))[:2])
                     if next_source else None)
         return FileReviewProgress(
-            selected, completed, unit, root_placement_inventory(inventory),
+            selected, completed, unit, root_placement_inventory(inventory), roots,
         )
 
     def start(self, repo: str, cycle_revision: int, source: TrackedSource) -> None:
@@ -442,6 +499,13 @@ class ProvisionalReviewRepository:
                 raise FileReviewError("검토 세션의 source identity가 변경됐습니다.")
 
     def complete(self, repo: str, cycle_revision: int, source: TrackedSource, result: dict) -> None:
+        if source.reason == ROOT_REVIEW_REASON:
+            try:
+                base = self.connection.execute("SELECT base_branch FROM projects WHERE repo = ?", (repo,)).fetchone()[0]
+                inventory = cached_source_inventory(self.connection, Path(repo), base, source.revision)
+                validate_root_reviews(Path(repo), inventory, result.get("root_reviews"))
+            except FileReviewLedgerError as error:
+                raise FileReviewError(str(error)) from error
         with self.connection:
             changed = self.connection.execute(
                 "UPDATE provisional_file_reviews SET result_json = ?, session_id = NULL, "
@@ -475,6 +539,8 @@ class ProvisionalReviewRepository:
         preview = []
         for row in rows[:12]:
             result = json.loads(str(row[0]))
+            if result["path"] == ROOT_REVIEW_PATH:
+                continue
             code_map = result["code_map"]
             preview.append({
                 "path": result["path"], "content_hash": result["content_hash"],

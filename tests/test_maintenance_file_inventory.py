@@ -121,6 +121,7 @@ class TrackedSourceInventoryTest(unittest.TestCase):
             "docs/PRODUCT.md": b"# Product\n",
             "tests/check.py": b"assert True\n",
             "engine.py": b"def run(): pass\n",
+            "scratch.png": b"\x89PNG\x00asset",
         }
         for path, content in files.items():
             self.write(path, content)
@@ -137,6 +138,7 @@ class TrackedSourceInventoryTest(unittest.TestCase):
         self.assertEqual(placements["README.md"].category, "user_entry")
         self.assertEqual(placements["config"].category, "execution_build_deploy")
         self.assertEqual(placements["tests"].category, "execution_build_deploy")
+        self.assertEqual(placements["scratch.png"].category, "uncertain")
         self.assertEqual(placements["engine.py"].category, "internal_implementation")
         self.assertIn("entry path, references, owner", placements["engine.py"].reason)
 

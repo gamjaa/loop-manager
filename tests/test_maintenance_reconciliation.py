@@ -302,6 +302,15 @@ class SynthesisPagingTest(unittest.TestCase):
             "assessment": "Keep this page's structural issue for the final reconciliation.",
         }))
 
+    def test_root_investigation_is_included_in_synthesis_and_changes_its_digest(self):
+        root = {"path": "scratch.png", "category": "uncertain", "reason": "Actual use could not be verified."}
+        progress = reconciliation.ReconciliationProgress((), (), (), None, root_reviews=(root,))
+        pages = reconciliation.synthesis_pages(progress)
+        self.assertEqual(json.loads(pages[0].partition("\n")[2]), {"kind": "root_placement", "value": root})
+        first = self.repository.prepare("repo", 1, REVISION, progress)
+        changed = reconciliation.ReconciliationProgress((), (), (), None, root_reviews=(dict(root, reason="Ownership cannot be confirmed."),))
+        self.assertNotEqual(self.repository.prepare("repo", 1, REVISION, changed).digest, first.digest)
+
     def test_large_records_are_lossless_bounded_and_resume_after_restart(self):
         pages = reconciliation.synthesis_pages(self.progress)
         self.assertGreater(len(pages), 13)

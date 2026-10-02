@@ -69,6 +69,7 @@ class ReconciliationProgress:
     excluded_candidates: tuple[dict, ...] = ()
     file_reviews: tuple[dict, ...] = ()
     pending_scan: bool = False
+    root_reviews: tuple[dict, ...] = ()
 
 
 def _note(value: object, field: str, minimum: int = 12) -> str:
@@ -370,7 +371,7 @@ class ReconciliationRepository:
         next_relation = next((item for item in relations if item.key not in completed), None)
         return ReconciliationProgress(reviews.selected, tuple(completed[key] for key in sorted(completed)),
                                       relations, next_relation,
-                                      _excluded_candidates(inventory, reviews, maps), reviews.completed, remaining)
+                                      _excluded_candidates(inventory, reviews, maps), reviews.completed, remaining, reviews.root_reviews)
 
     def start(self, repo: str, cycle_revision: int, revision: str, relation: Relation) -> None:
         with self.connection:
@@ -590,6 +591,7 @@ def synthesis_pages(progress: ReconciliationProgress) -> tuple[str, ...]:
     records = (
         *(('selected', source.__dict__) for source in progress.selected),
         *(('file_review', review) for review in progress.file_reviews),
+        *(('root_placement', review) for review in progress.root_reviews),
         *(('relation', result) for result in progress.completed),
         *(('excluded_candidate', candidate) for candidate in progress.excluded_candidates),
     )

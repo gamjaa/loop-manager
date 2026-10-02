@@ -1496,8 +1496,10 @@ class MaintenancePlanningTest(unittest.TestCase):
             "entry_points": [], "public_symbols": [],
             "direct_references": [], "related_tests": [],
         })) for source in inventory.sources)
+        from tests.test_maintenance_file_review import root_results_for
         evidence = maintenance_file_publication.AssessmentEvidence(
             inventory, reviewed, maps, 1,
+            root_results_for(self.repo, inventory),
         )
         git(self.repo, "add", "docs/plans")
         git(self.repo, "commit", "-m", "Publish refactoring plans")
@@ -1948,8 +1950,10 @@ class MaintenancePlanningTest(unittest.TestCase):
             "entry_points": [], "public_symbols": [],
             "direct_references": [], "related_tests": [],
         })) for source in inventory.sources)
+        from tests.test_maintenance_file_review import root_results_for
         evidence = maintenance_file_publication.AssessmentEvidence(
             inventory, reviewed, maps, 1,
+            root_results_for(self.repo, inventory),
         )
         git(self.repo, "add", "docs/plans")
         git(self.repo, "commit", "-m", "Publish refactoring plans")

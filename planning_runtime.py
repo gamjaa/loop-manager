@@ -1505,6 +1505,7 @@ class PlanningLifecycleCoordinator:
                     run.maintenance_cycle.revision, str(row.active_sha),
                 )
                 if (not progress.selected
+                    and progress.next_unit is None
                     and not run.maintenance_cycle.include_general_planning
                     and run.maintenance_cycle.publication_stage is None
                     and not row.planning_result_completed
