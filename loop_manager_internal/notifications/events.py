@@ -1,0 +1,523 @@
+"""Project event selection and completion and waiting episodes."""
+from __future__ import annotations
+import hashlib
+import json
+from pathlib import Path
+import sqlite3
+from loop_manager_internal.documents import reviewer_specification
+from .work_exhaustion import WorkReasonSnapshot
+from .repository import ensure_schema, _enabled, _insert
+from .incidents import (_key, _remote_inspection_suffix, _queue_block,
+                        _plan_block_key, _project_block_key,
+                        _project_checkpoint, _project_checkpoint_suffix)
+from .rendering import _checkpoint_link
+
+def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) -> None:
+    """Enqueue all plan/project events after their owning update and before commit."""
+
+    if not _enabled(connection):
+        return
+    ensure_schema(connection)
+    project = connection.execute(
+        "SELECT phase, plan_path, pr_url, last_error, planning_error "
+        "FROM projects WHERE repo = ?",
+        (repo,),
+    ).fetchone()
+    if project is None:
+        return
+    name = Path(repo).name or repo
+    recovery_available = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'recovery_records'"
+    ).fetchone() is not None
+
+    def final_recovery(subject: str) -> tuple[str | None, dict | None]:
+        if not recovery_available:
+            return None, None
+        row = connection.execute(
+            "SELECT identity, final_evidence FROM recovery_records "
+            "WHERE repo = ? AND subject = ?", (repo, subject),
+        ).fetchone()
+        if row is None or row[1] is None:
+            return None, None
+        return str(row[0]), json.loads(str(row[1]))
+
+    for plan in connection.execute(
+        "SELECT plan_id, title, pr_url FROM exec_plans "
+        "WHERE repo = ? AND status = 'PR_OPEN' AND pr_url IS NOT NULL",
+        (repo,),
+    ).fetchall():
+        _insert(
+            connection,
+            _key("pr", repo, str(plan[2])),
+            repo,
+            "pr_created",
+            {
+                "project": name,
+                "execplan_id": str(plan[0]),
+                "execplan_title": str(plan[1]),
+                "pr_url": str(plan[2]),
+            },
+        )
+
+    plan_blocks = connection.execute(
+        "SELECT p.plan_id, p.title, p.path, p.sources, b.reason_code, b.evidence, "
+        "c.result, c.remote_oid, c.unpublished_reason, c.branch, r.origin, "
+        "c.inspected_remote_oid, c.inspection_reason "
+        "FROM execplan_blocks AS b JOIN exec_plans AS p USING (repo, plan_id) "
+        "JOIN projects AS r ON r.repo = b.repo "
+        "LEFT JOIN blocked_checkpoints AS c USING (repo, plan_id) "
+        "WHERE b.repo = ? AND (c.repo IS NULL OR c.phase IN "
+        "('published', 'unpublished')) ORDER BY p.plan_id",
+        (repo,),
+    ).fetchall()
+    for plan in plan_blocks:
+        try:
+            sources = json.loads(str(plan[3]))
+        except (TypeError, ValueError):
+            sources = []
+        stage = "ExecPlan"
+        plan_id = str(plan[0])
+        plan_title = str(plan[1])
+        recovery_identity, recovery_evidence = final_recovery(plan_id)
+        paths = (
+            list(recovery_evidence["user_targets"])
+            if recovery_evidence is not None
+            else [str(plan[2]), *(str(item) for item in sources)]
+        )
+        deadlock = None
+        if plan[4] == "review_specification_deadlock":
+            try:
+                deadlock = reviewer_specification.parse_evidence(str(plan[5]))
+            except ValueError:
+                pass
+            if deadlock is not None:
+                paths = list(deadlock.paths)
+        checkpoint = None
+        if plan[6] == "published":
+            checkpoint = {
+                "result": "published",
+                "branch": plan[9],
+                "branch_url": _checkpoint_link(plan[10], plan[7]),
+                "commit_oid": plan[7],
+            }
+        elif plan[6] == "local_only":
+            checkpoint = {
+                "result": "local_only",
+                "reason": str(plan[8] or "checkpoint를 게시하지 않았습니다."),
+            }
+        guidance_locations = []
+        if plan[4] == "guidance_approval_required":
+            rows = connection.execute(
+                "SELECT proposal_id, proposal_line, decision_line "
+                "FROM guidance_approvals WHERE repo = ? AND plan_id = ? "
+                "AND applied = 0 ORDER BY sequence, proposal_id",
+                (repo, plan_id),
+            ).fetchall()
+            guidance_locations = [
+                {
+                    "proposal_id": str(row[0]),
+                    "proposal": f"{plan[2]}:{row[1]}",
+                    "user_decision": f"{plan[2]}:{row[2]}",
+                }
+                for row in rows
+            ]
+            paths.extend(
+                location
+                for item in guidance_locations
+                for location in (item["proposal"], item["user_decision"])
+                if location not in paths
+            )
+        remote_inspection = _remote_inspection_suffix(
+            plan[6], plan[11], plan[12]
+        )
+        payload = {
+            "project": name,
+            "stage": stage,
+            "scope": "plan",
+            "reason_code": str(plan[4]),
+            "execplan_id": plan_id,
+            "execplan_title": plan_title,
+            "cause": str(plan[5]),
+            "paths": paths,
+            "guidance_locations": guidance_locations,
+            "checkpoint": checkpoint,
+            "recovery": recovery_evidence,
+        }
+        if recovery_evidence is not None and isinstance(
+            recovery_evidence.get("worker_decision"), dict
+        ):
+            payload["worker_decision"] = recovery_evidence["worker_decision"]
+        if deadlock is not None:
+            payload["specification_deadlock"] = {
+                "kind": deadlock.kind,
+                "locations": [
+                    {"path": path, "section": section}
+                    for path, section in deadlock.locations
+                ],
+                "problem": deadlock.problem,
+                "implementation_choice": deadlock.implementation_choice,
+                "question": deadlock.question,
+            }
+        suppress_persistent_failure_for_block(connection, repo, plan_id)
+        _queue_block(
+            connection,
+            repo,
+            f"plan:{plan_id}",
+            _plan_block_key(repo, plan[4], plan_id, recovery_identity,
+                            remote_inspection),
+            payload,
+        )
+
+    project_block = connection.execute(
+        "SELECT b.reason_code, b.plan_id, b.evidence, p.title, p.path, p.sources "
+        "FROM project_blocks AS b LEFT JOIN exec_plans AS p "
+        "ON p.repo = b.repo AND p.plan_id = b.plan_id WHERE b.repo = ?",
+        (repo,),
+    ).fetchone()
+    if project_block is not None:
+        checkpoint = _project_checkpoint(connection, repo, project_block[1])
+        recovery_identity, recovery_evidence = final_recovery(
+            str(project_block[1] or "__project__")
+        )
+        try:
+            project_sources = json.loads(str(project_block[5])) if project_block[5] else []
+        except (TypeError, ValueError):
+            project_sources = []
+        project_paths = (
+            [
+                str(project_block[4]),
+                *(str(item) for item in project_sources),
+            ]
+            if project_block[4]
+            else []
+        )
+        if recovery_evidence is not None:
+            project_paths = list(recovery_evidence["user_targets"])
+        suppress_persistent_failure_for_block(
+            connection, repo, str(project_block[1] or "__project__"),
+        )
+        _queue_block(
+            connection,
+            repo,
+            "project",
+            _project_block_key(
+                repo, project_block[0], project_block[1], recovery_identity,
+                _project_checkpoint_suffix(checkpoint),
+            ),
+            {
+                "project": name,
+                "stage": "project",
+                "scope": "project",
+                "reason_code": str(project_block[0]),
+                "execplan_id": project_block[1],
+                "execplan_title": project_block[3],
+                "cause": str(project_block[2]),
+                "paths": project_paths,
+                "guidance_locations": [],
+                "recovery": recovery_evidence,
+                "checkpoint": checkpoint,
+            },
+        )
+
+    if project[4] and project_block is None:
+        _queue_block(
+            connection,
+            repo,
+            "planning",
+            _key("blocked", repo, "project\0planning_error\0"),
+            {
+                "project": name,
+                "stage": "planning",
+                "scope": "project",
+                "reason_code": "planning_error",
+                "execplan_id": None,
+                "execplan_title": None,
+                "cause": str(project[4]),
+                "paths": [
+                    "docs/PRODUCT.md",
+                    "docs/requirements/*.md",
+                    "docs/ARCHITECTURE.md",
+                ],
+                "guidance_locations": [],
+            },
+        )
+
+
+def enqueue_persistent_execution_failure_events(
+    connection: sqlite3.Connection, repo: str,
+) -> None:
+    """Queue one actionable notice for each eligible external-run streak.
+
+    The recovery projection is retained even when Telegram is disabled.  The
+    outbox is intentionally populated only for an enabled notification session,
+    matching the established behaviour for all other project events.
+    """
+
+    exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'persistent_execution_failures'"
+    ).fetchone()
+    if exists is None or not _enabled(connection):
+        return
+    ensure_schema(connection)
+    project = connection.execute(
+        "SELECT 1 FROM projects WHERE repo = ?", (repo,)
+    ).fetchone()
+    if project is None:
+        return
+    rows = connection.execute(
+        "SELECT * FROM persistent_execution_failures WHERE repo = ? "
+        "AND active = 1 AND notification_eligible = 1 "
+        "AND notification_queued = 0 AND suppressed_by_block = 0 "
+        "ORDER BY subject",
+        (repo,),
+    ).fetchall()
+    for row in rows:
+        subject = str(row["subject"])
+        plan_id = None if subject == "__project__" else subject
+        identity = "\0".join((subject, str(row["episode"]), str(row["phase"]),
+                              str(row["reason_code"]), str(row["fingerprint"])))
+        payload = {
+            "project": Path(repo).name or repo,
+            "stage": str(row["phase"]),
+            "scope": "execution",
+            "execplan_id": plan_id,
+            "reason_code": str(row["reason_code"]),
+            "cause": str(row["detail"]),
+            "consecutive_external_runs": int(row["consecutive_runs"]),
+            "recovery_attempts": json.loads(str(row["recovery_attempts"])),
+            "required_action": (
+                "Review the structured failure and fix the reported "
+                "configuration, permission, or repository condition."
+            ),
+        }
+        _insert(
+            connection, _key("persistent_failure", repo, identity), repo,
+            "persistent_execution_failure", payload,
+        )
+        connection.execute(
+            "UPDATE persistent_execution_failures SET notification_queued = 1, "
+            "updated_at = CURRENT_TIMESTAMP WHERE repo = ? AND subject = ? "
+            "AND episode = ? AND notification_eligible = 1",
+            (repo, subject, int(row["episode"])),
+        )
+
+
+def cancel_pending_persistent_execution_failure_event(
+    connection: sqlite3.Connection, repo: str, subject: str, episode: int,
+    phase: str, reason_code: str, fingerprint: str,
+) -> None:
+    """Withdraw a notice only before its first delivery attempt."""
+
+    identity = "\0".join((subject, str(episode), phase, reason_code, fingerprint))
+    connection.execute(
+        "DELETE FROM notification_outbox WHERE event_key = ? "
+        "AND sent_at IS NULL AND attempts = 0",
+        (_key("persistent_failure", repo, identity),),
+    )
+
+
+def suppress_persistent_failure_for_block(
+    connection: sqlite3.Connection, repo: str, subject: str,
+) -> None:
+    """Make a final BLOCKED notice own its pending failure incident."""
+
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'persistent_execution_failures'"
+    ).fetchone() is None:
+        return
+    row = connection.execute(
+        "SELECT episode, phase, reason_code, fingerprint "
+        "FROM persistent_execution_failures WHERE repo = ? AND subject = ? "
+        "AND active = 1", (repo, subject),
+    ).fetchone()
+    if row is None:
+        return
+    cancel_pending_persistent_execution_failure_event(
+        connection, repo, subject, int(row[0]), str(row[1]), str(row[2]),
+        str(row[3]),
+    )
+    connection.execute(
+        "UPDATE persistent_execution_failures SET active = 0, "
+        "consecutive_runs = 0, notification_eligible = 0, "
+        "notification_queued = 0, suppressed_by_block = 1, "
+        "updated_at = CURRENT_TIMESTAMP, resolved_at = CURRENT_TIMESTAMP "
+        "WHERE repo = ? AND subject = ?", (repo, subject),
+    )
+
+
+def record_merged_plan(
+    connection: sqlite3.Connection, repo: str, plan_id: str, title: str
+) -> None:
+    ensure_schema(connection)
+    connection.execute(
+        """
+        INSERT INTO project_completion_cycles
+            (repo, last_completed_plan_id, last_completed_title)
+        VALUES (?, ?, ?)
+        ON CONFLICT(repo) DO UPDATE SET
+            last_completed_plan_id = excluded.last_completed_plan_id,
+            last_completed_title = excluded.last_completed_title
+        """,
+        (repo, plan_id, title),
+    )
+
+
+def enqueue_completion_if_ready(
+    connection: sqlite3.Connection, repo: str,
+    snapshot: WorkReasonSnapshot | None = None,
+) -> bool:
+    """Record completion only for an already verified stable selection."""
+
+    if snapshot is None or not snapshot.completed:
+        return False
+    ensure_schema(connection)
+    project = connection.execute(
+        "SELECT phase, planning_fingerprint, planning_error "
+        "FROM projects WHERE repo = ?",
+        (repo,),
+    ).fetchone()
+    has_historical_catalog = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'execplan_catalog_history'"
+    ).fetchone() is not None
+    unfinished_query = (
+        "SELECT 1 FROM exec_plans WHERE repo = ? AND status != 'MERGED' "
+        "AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h "
+        "WHERE h.repo = exec_plans.repo AND h.currently_archived = 1 "
+        "AND h.plan_id = exec_plans.plan_id) LIMIT 1"
+        if has_historical_catalog else
+        "SELECT 1 FROM exec_plans WHERE repo = ? AND status != 'MERGED' LIMIT 1"
+    )
+    if (
+        project is None
+        or project[0] is not None
+        or not project[1]
+        or str(project[1]) != snapshot.cycle
+        or project[2]
+        or connection.execute(unfinished_query, (repo,)).fetchone() is not None
+        or connection.execute(
+            "SELECT 1 FROM project_blocks WHERE repo = ?", (repo,),
+        ).fetchone() is not None
+    ):
+        return False
+
+    cycle_key = str(project[1])
+    completion = connection.execute(
+        "SELECT last_completed_plan_id, last_completed_title "
+        "FROM project_completion_cycles WHERE repo = ?",
+        (repo,),
+    ).fetchone()
+    last_id = str(completion[0]) if completion and completion[0] else None
+    last_title = str(completion[1]) if completion and completion[1] else None
+    if last_id is None:
+        merged = connection.execute(
+            "SELECT plan_id, title FROM exec_plans "
+            "WHERE repo = ? AND status = 'MERGED'",
+            (repo,),
+        ).fetchall()
+        if merged:
+            def plan_order(row: sqlite3.Row) -> tuple[int, str]:
+                value = str(row[0])
+                try:
+                    return int(value.removeprefix("G-")), value
+                except ValueError:
+                    return -1, value
+
+            latest = max(merged, key=plan_order)
+            last_id, last_title = str(latest[0]), str(latest[1])
+    last_title = last_title or "Planner confirmed no additional work"
+    with connection:
+        _cancel_pending_waiting(connection, repo)
+        if not _enabled(connection):
+            return False
+        connection.execute(
+            """
+            INSERT INTO project_completion_cycles (repo, cycle_key, completed_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(repo) DO UPDATE SET
+                cycle_key = excluded.cycle_key,
+                completed_at = excluded.completed_at
+            """,
+            (repo, cycle_key),
+        )
+        _insert(
+            connection,
+            _key("completed", repo, cycle_key),
+            repo,
+            "project_completed",
+            {
+                "project": Path(repo).name or repo,
+                "reason": snapshot.describe(),
+                "last_completed_plan_id": last_id,
+                "last_completed_title": last_title,
+            },
+        )
+    return True
+
+
+def _cancel_pending_waiting(connection: sqlite3.Connection, repo: str) -> None:
+    connection.execute(
+        "UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP "
+        "WHERE repo = ? AND event_type = 'work_waiting' "
+        "AND sent_at IS NULL AND canceled_at IS NULL",
+        (repo,),
+    )
+
+
+def mark_work_available(connection: sqlite3.Connection, repo: str) -> None:
+    """End a waiting incident when selection can proceed again."""
+
+    ensure_schema(connection)
+    with connection:
+        connection.execute(
+            "UPDATE work_reason_episodes SET signature = '__work_available__' "
+            "WHERE repo = ? AND signature != '__work_available__'", (repo,),
+        )
+        _cancel_pending_waiting(connection, repo)
+
+
+def enqueue_waiting_reason(
+    connection: sqlite3.Connection, repo: str, snapshot: WorkReasonSnapshot,
+) -> bool:
+    """Create one waiting incident per stable cause and cause transition."""
+
+    if snapshot.completed:
+        return False
+    ensure_schema(connection)
+    payload = snapshot.payload(Path(repo).name or repo)
+    signature = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                   separators=(",", ":")).encode()
+    ).hexdigest()
+    with connection:
+        previous = connection.execute(
+            "SELECT signature, generation FROM work_reason_episodes WHERE repo = ?",
+            (repo,),
+        ).fetchone()
+        generation = (
+            int(previous[1]) if previous and previous[0] == signature
+            else int(previous[1]) + 1 if previous else 1
+        )
+        connection.execute(
+            "INSERT INTO work_reason_episodes (repo, signature, generation) "
+            "VALUES (?, ?, ?) ON CONFLICT(repo) DO UPDATE SET "
+            "signature = excluded.signature, generation = excluded.generation",
+            (repo, signature, generation),
+        )
+        if not snapshot.has_distinct_wait:
+            _cancel_pending_waiting(connection, repo)
+            return False
+        event_key = _key("waiting", repo, f"{generation}\0{signature}")
+        connection.execute(
+            "UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP "
+            "WHERE repo = ? AND event_type = 'work_waiting' "
+            "AND event_key != ? AND sent_at IS NULL AND canceled_at IS NULL",
+            (repo, event_key),
+        )
+        if not _enabled(connection):
+            return False
+        _insert(connection, event_key, repo, "work_waiting", payload)
+    return True
+
