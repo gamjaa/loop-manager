@@ -11,7 +11,7 @@ from maintenance_file_inventory import (
     ClassifiedPath, SourceInventory, TrackedSource, cached_source_inventory,
     tracked_source_inventory,
 )
-from maintenance_file_ledger import FileReviewRepository, ReviewedSource
+from maintenance_file_ledger import FileReviewRepository, ReviewedSource, assessment_input_tree, root_move_candidates
 from maintenance_file_review import ProvisionalReviewRepository
 from maintenance_reconciliation import (
     ReconciliationRepository, SynthesisRepository, _valid_map_shape,
@@ -40,6 +40,7 @@ class AssessmentEvidence:
     reviewed: tuple[ReviewedSource, ...]
     code_maps: tuple[tuple[str, str], ...]
     merged_count: int
+    root_reviews: tuple[dict, ...] | None = ()
 
 
 def sources_match_remote(
@@ -48,7 +49,8 @@ def sources_match_remote(
 ) -> bool:
     """Recheck the live remote source set before promoting saved evidence."""
     current = tracked_source_inventory(repository, base_branch, revision)
-    return tuple(
+    return (assessment_input_tree(repository, revision)
+            == assessment_input_tree(repository, evidence.inventory.revision)) and tuple(
         (source.path, source.content_hash, source.mode, source.reason)
         for source in current.sources
     ) == tuple(
@@ -72,7 +74,7 @@ def collect(
     )
     if reviews.next_unit is not None or len(reviews.completed) != len(reviews.selected):
         raise FileAssessmentPublicationError("선정된 파일의 검토가 완료되지 않았습니다.")
-    if reviews.selected:
+    if reviews.selected or root_move_candidates(reviews.root_reviews):
         progress = ReconciliationRepository(connection).progress(
             repo, repository, base_branch, cycle_revision, inventory, reviews,
         )
@@ -98,6 +100,7 @@ def collect(
                                      ensure_ascii=False, sort_keys=True))
               for source in reviews.selected),
         _merged_count(connection, repo),
+        reviews.root_reviews,
     )
 
 
@@ -112,6 +115,8 @@ def save_intent(
     source_revision: str, publication_commit: str, evidence: AssessmentEvidence,
 ) -> None:
     ensure_schema(connection)
+    if evidence.root_reviews is None:
+        raise FileAssessmentPublicationError("새 publication에 이전 형식 증거를 사용할 수 없습니다.")
     if evidence.inventory.revision != source_revision:
         raise FileAssessmentPublicationError("평가 증거의 source가 다릅니다.")
     import maintenance_state
@@ -123,6 +128,7 @@ def save_intent(
         "reviewed": [asdict(item) for item in evidence.reviewed],
         "code_maps": list(evidence.code_maps),
         "merged_count": evidence.merged_count,
+        "root_reviews": list(evidence.root_reviews),
     }, ensure_ascii=False, sort_keys=True)
     row = connection.execute(
         "SELECT cycle_revision, source_revision, publication_commit, evidence_json "
@@ -169,6 +175,7 @@ def saved_intent(
             tuple(ReviewedSource(**item) for item in value["reviewed"]),
             tuple((str(path), str(raw)) for path, raw in value["code_maps"]),
             int(value["merged_count"]),
+            tuple(value["root_reviews"]) if "root_reviews" in value else None,
         )
     except (KeyError, TypeError, ValueError) as error:
         raise FileAssessmentPublicationError("파일 평가 publication intent가 손상됐습니다.") from error
@@ -191,9 +198,21 @@ def promote(
             valid = False
         if not valid:
             raise FileAssessmentPublicationError("검토 파일의 코드맵이 유효하지 않습니다.")
+    legacy_commit = None
+    if evidence.root_reviews is None:
+        # Only a durable pre-policy intent can use its original assessment scope.
+        # A missing root investigation remains pending for the next normal cycle.
+        row = connection.execute(
+            "SELECT cycle_revision, source_revision, publication_commit "
+            "FROM file_assessment_publications WHERE repo = ?", (repo,),
+        ).fetchone()
+        if row is None or saved_intent(connection, repo, int(row[0]), str(row[1]), str(row[2])) != evidence:
+            raise FileAssessmentPublicationError("이전 publication 원본 증거를 확인할 수 없습니다.")
+        legacy_commit = str(row[2])
     FileReviewRepository(connection).record_success(
         repo, str(repository), base_branch, evidence.inventory, evidence.reviewed,
-        published_revision=published_revision,
+        published_revision=published_revision, root_reviews=evidence.root_reviews,
+        legacy_publication_commit=legacy_commit,
     )
     for path, raw in evidence.code_maps:
         source = selected[path]

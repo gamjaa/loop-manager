@@ -565,6 +565,8 @@ class MaintenanceOrchestrationTest(unittest.TestCase):
         ports.git.run.return_value.stdout = source
         ports.git.changed_files.return_value = []
         ports.file_review.progress.return_value.selected = ()
+        ports.file_review.progress.return_value.next_unit = None
+        ports.file_review.progress.return_value.root_reviews = ()
         coordinator = planning_runtime.PlanningLifecycleCoordinator(ports)
         outcome = planning_runtime.PlanningOutcome(
             planning_runtime.PlanningOutcomeKind.NO_CHANGE,
@@ -575,6 +577,26 @@ class MaintenanceOrchestrationTest(unittest.TestCase):
             self.assertEqual(coordinator._run_planner_turn(run), outcome)
         complete.assert_called_once_with(run, Path("/worktree"))
         ports.agent.run_planner.assert_not_called()
+        # A source-less tree with an uninvestigated root must run its review unit.
+        ports.file_review.progress.return_value.next_unit = object()
+        review_outcome = planning_runtime.PlanningOutcome(planning_runtime.PlanningOutcomeKind.WAITING)
+        with mock.patch.object(coordinator, "_complete_empty_file_assessment") as complete, mock.patch.object(
+            coordinator, "_review_one_file", return_value=review_outcome,
+        ) as review:
+            self.assertEqual(coordinator._run_planner_turn(run), review_outcome)
+        complete.assert_not_called()
+        review.assert_called_once_with(run, Path("/worktree"))
+        # A completed investigation with a confirmed destination must reach planning.
+        ports.file_review.progress.return_value.next_unit = None
+        ports.file_review.progress.return_value.root_reviews = ({
+            "path": "notes.md", "category": "internal_implementation", "destination": "docs/notes.md",
+        },)
+        with mock.patch.object(coordinator, "_complete_empty_file_assessment") as complete, mock.patch.object(
+            coordinator, "_review_one_file", return_value=None,
+        ), mock.patch.object(coordinator, "_reconcile_one_relation", return_value=review_outcome) as reconcile:
+            self.assertEqual(coordinator._run_planner_turn(run), review_outcome)
+        complete.assert_not_called()
+        reconcile.assert_called_once_with(run, Path("/worktree"))
 
     def test_empty_stabilization_selection_settles_or_restarts_without_an_agent(self):
         source = "a" * 40

@@ -36,6 +36,15 @@ class ClassifiedPath:
 
 
 @dataclass(frozen=True)
+class RootPlacement:
+    """One revision-bound top-level placement decision for file assessment."""
+
+    path: str
+    category: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class SourceInventory:
     revision: str
     sources: tuple[TrackedSource, ...]
@@ -77,6 +86,9 @@ _BUILD_FILES = {
     "build", "build.bazel", "workspace", "workspace.bazel", "package.json",
 }
 _DOCUMENT_NAMES = {"license", "license.txt", "notice", "notice.txt", "authors", "contributors"}
+_ROOT_TOOL_PATHS = {".agents", "docs", "scripts", "AGENTS.md"}
+_ROOT_EXECUTION_PATHS = {"config", "tests", ".github", ".gitignore"}
+_ROOT_ENTRY_NAMES = {"readme", "license", "notice", "authors", "contributors"}
 
 
 def _git(repo: Path, *args: str) -> bytes:
@@ -212,6 +224,33 @@ def tracked_source_inventory(repo: Path, base_branch: str, revision: str) -> Sou
         details = "; ".join(f"{item.path}: {item.reason}" for item in uncertain[:10])
         raise SourceInventoryError("추적 파일 분류를 확정할 수 없습니다: " + details)
     return SourceInventory(revision, tuple(sorted(sources, key=lambda item: item.path)), tuple(classifications))
+
+
+def root_placement_inventory(inventory: SourceInventory) -> tuple[RootPlacement, ...]:
+    """Classify every tracked root item without automatically scheduling a move."""
+
+    source_paths = {source.path for source in inventory.sources}
+    roots: dict[str, list[ClassifiedPath]] = {}
+    for item in inventory.classifications:
+        roots.setdefault(item.path.split("/", 1)[0], []).append(item)
+    placements = []
+    for path, items in sorted(roots.items()):
+        lowered = path.lower()
+        if path in _ROOT_TOOL_PATHS:
+            category, reason = "tool_required", "Loop Manager fixed root path"
+        elif path in _ROOT_EXECUTION_PATHS:
+            category, reason = "execution_build_deploy", "project execution, validation, or configuration root"
+        elif (PurePosixPath(lowered).stem in _ROOT_ENTRY_NAMES
+              or any(item.path == path and item.reason == "documentation file" for item in items)):
+            category, reason = "user_entry", "root user-facing project document"
+        elif any(item.path in source_paths for item in items):
+            category = "internal_implementation"
+            reason = ("root source candidate; retain unless assessment confirms its "
+                      "entry path, references, owner, and safe destination")
+        else:
+            category, reason = "uncertain", "root placement requires investigation of actual use and ownership"
+        placements.append(RootPlacement(path, category, reason))
+    return tuple(placements)
 
 
 def cached_source_inventory(connection: sqlite3.Connection, repository: Path,

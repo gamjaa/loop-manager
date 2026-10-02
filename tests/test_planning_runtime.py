@@ -15,7 +15,7 @@ import maintenance_state
 import maintenance_file_review
 import maintenance_findings
 import maintenance_reconciliation
-from maintenance_file_inventory import TrackedSource
+from maintenance_file_inventory import RootPlacement, TrackedSource
 from tests.test_maintenance_file_review import result_for
 from planning_catalog import MutableReadySnapshot, mutable_snapshot_token
 from maintenance_orchestration import maintenance_planning_fingerprint
@@ -580,9 +580,12 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
                               file_assessment_start_merged_count=0),
         )
         unit = maintenance_file_review.ReviewUnit(source, "saved-session", None)
+        root_placement = RootPlacement(
+            "engine.py", "internal_implementation", "root source candidate",
+        )
         ports.file_review = SimpleNamespace(
             progress=mock.Mock(return_value=maintenance_file_review.FileReviewProgress(
-                (source,), (), unit,
+                (source,), (), unit, (root_placement,),
             )),
             content=mock.Mock(return_value=content),
             start=mock.Mock(), session=mock.Mock(), complete=mock.Mock(),
@@ -614,6 +617,8 @@ class PlanningLifecycleCoordinatorTest(unittest.TestCase):
             "결정·예외·실패 흐름과 Acceptance Criteria의 의미",
             "파일이나 문서를 수정하지 마라",
             "FILE_REVIEW_RESULT:",
+            "revision-bound root placement inventory:",
+            '"path": "engine.py"',
         ):
             self.assertIn(phrase, prompt)
         self.assertEqual(ports.file_review.complete.call_args.args[2], source)

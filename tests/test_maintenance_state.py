@@ -1283,9 +1283,14 @@ class FileReviewLedgerTest(unittest.TestCase):
             ) for source in sources
         )
 
+    def root_results(self, inventory):
+        from tests.test_maintenance_file_review import root_results_for
+        return root_results_for(self.repo, inventory)
+
     def record(self, inventory, reviewed):
         return self.ledger.record_success(
             str(self.repo), str(self.repo), "main", inventory, reviewed,
+            root_reviews=self.root_results(inventory),
         )
 
     def prepare_empty_stabilization(self, source):
@@ -1395,6 +1400,7 @@ class FileReviewLedgerTest(unittest.TestCase):
             str(self.repo), include_retired=True,
         )}
         self.assertFalse(retired["src/alpha.go"].active)
+        self.assertEqual(self.ledger.root_placements(str(self.repo)), ())
         self.write("src/alpha.go", b"package alpha\n")
         returned_source = self.publish()
         returned_inventory = self.inventory(returned_source)
@@ -1404,6 +1410,75 @@ class FileReviewLedgerTest(unittest.TestCase):
             )],
             ["src/alpha.go"],
         )
+
+    def test_empty_selection_requires_investigated_root_placements(self):
+        self.write(".agents/guide.txt", b"guidance\n")
+        self.write("AGENTS.md", b"# guidance\n")
+        self.write("README.md", b"# project\n")
+        self.write("config/settings.ini", b"[loop]\n")
+        self.write("docs/PRODUCT.md", b"# Product\n")
+        revision = self.publish()
+        inventory = self.inventory(revision)
+
+        self.assertEqual(inventory.sources, ())
+        self.assertEqual(self.ledger.selected_sources(str(self.repo), inventory), ())
+        with self.assertRaisesRegex(maintenance_file_ledger.FileReviewLedgerError, "루트"):
+            self.ledger.record_success(str(self.repo), str(self.repo), "main", inventory, ())
+        self.assertIsNone(self.ledger.last_success(str(self.repo)))
+        self.record(inventory, ())
+
+        placements = {item.path: item for item in self.ledger.root_placements(str(self.repo))}
+        self.assertEqual(placements[".agents"].category, "tool_required")
+        self.assertEqual(placements["AGENTS.md"].category, "tool_required")
+        self.assertEqual(placements["docs"].category, "tool_required")
+        self.assertEqual(placements["README.md"].category, "uncertain")
+        self.assertEqual(placements["config"].category, "uncertain")
+        rows = self.connection.execute(
+            "SELECT DISTINCT source_revision FROM root_placement_reviews WHERE repo = ?",
+            (str(self.repo),),
+        ).fetchall()
+        self.assertEqual([row[0] for row in rows], [revision])
+
+    def test_root_investigation_rejects_missing_fields_forged_references_and_stale_results(self):
+        self.write("scratch.png", b"\x89PNG\x00asset")
+        revision = self.publish()
+        inventory = self.inventory(revision)
+        good = self.root_results(inventory)
+        for invalid in ((), (dict(good[0], ownership=""),),
+                        (dict(good[0], references=[{"path": ".", "excerpt": "invented evidence"}]),),
+                        (dict(good[0], category="execution_build_deploy"),),
+                        (dict(good[0], destination="assets/scratch.png"),)):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(maintenance_file_ledger.FileReviewLedgerError):
+                    self.ledger.record_success(str(self.repo), str(self.repo), "main", inventory, (), root_reviews=invalid)
+                self.assertIsNone(self.ledger.last_success(str(self.repo)))
+        self.ledger.record_success(str(self.repo), str(self.repo), "main", inventory, (), root_reviews=good)
+        self.ledger.record_success(str(self.repo), str(self.repo), "main", inventory, ())
+        self.write("README.md", b"Asset is not used by the application.\n")
+        changed = self.inventory(self.publish())
+        with self.assertRaises(maintenance_file_ledger.FileReviewLedgerError):
+            self.ledger.record_success(str(self.repo), str(self.repo), "main", changed, ())
+        self.assertEqual(self.ledger.last_success(str(self.repo)).source_revision, revision)
+
+    def test_root_placement_uses_agent_usage_evidence_and_rechecks_reference_drift(self):
+        self.write("scratch.png", b"\x89PNG\x00asset")
+        self.write("README.md", b"User preview loads scratch.png from the repository root.\n")
+        inventory = self.inventory(self.publish())
+        roots = list(self.root_results(inventory))
+        asset = next(item for item in roots if item["path"] == "scratch.png")
+        asset.update(category="execution_build_deploy", user_path="User preview loads the image from the repository root.",
+                     ownership="Preview UI owns the image referenced by README.md.",
+                     references=[{"path": "README.md", "excerpt": "User preview loads scratch.png from the repository root."}],
+                     reason="The documented preview path requires the image at the root.")
+        self.ledger.record_success(str(self.repo), str(self.repo), "main", inventory, (), root_reviews=roots)
+        self.assertEqual({item.path: item for item in self.ledger.root_placements(str(self.repo))}["scratch.png"].category, "execution_build_deploy")
+        self.write("README.md", b"User preview no longer uses a root image.\n")
+        changed = self.inventory(self.publish())
+        self.assertFalse(maintenance_file_publication.sources_match_remote(
+            self.repo, "main", changed.revision,
+            maintenance_file_publication.AssessmentEvidence(inventory, (), (), 0, tuple(roots))))
+        with self.assertRaises(maintenance_file_ledger.FileReviewLedgerError):
+            self.ledger.record_success(str(self.repo), str(self.repo), "main", changed, (), root_reviews=roots)
 
     def test_empty_stabilization_source_drift_keeps_ledger_and_baseline(self):
         self.write("src/alpha.go", b"package alpha\n")
@@ -1489,11 +1564,19 @@ class FileReviewLedgerTest(unittest.TestCase):
         with self.assertRaises(sqlite3.IntegrityError):
             self.record(inventory, self.reviewed(selected))
         self.assertEqual(self.ledger.reviews(str(self.repo)), ())
+        self.assertEqual(self.ledger.root_placements(str(self.repo)), ())
         self.assertIsNone(self.ledger.last_success(str(self.repo)))
 
     def test_file_publication_requires_complete_reviews_and_accepts_empty_inventory(self):
         self.write("docs/PRODUCT.md", b"# Product\n")
         empty_revision = self.publish()
+        from tests.test_maintenance_file_review import review, root_results_for
+        provisional = review.ProvisionalReviewRepository(self.connection)
+        inventory = self.inventory(empty_revision)
+        source = maintenance_file_ledger.root_review_source(self.repo, inventory)
+        provisional.start(str(self.repo), 1, source)
+        provisional.complete(str(self.repo), 1, source, {"root_reviews": list(root_results_for(self.repo, inventory)),
+            "path": source.path, "content_hash": source.content_hash, "mode": source.mode, "source_revision": source.revision})
         empty = maintenance_file_publication.collect(
             self.connection, str(self.repo), self.repo, "main", 1,
             empty_revision,
@@ -1522,7 +1605,7 @@ class FileReviewLedgerTest(unittest.TestCase):
                 "responsibility": "Alpha package responsibilities",
                 "entry_points": [], "public_symbols": [],
                 "direct_references": [], "related_tests": [],
-            })),), 0,
+            })),), 0, self.root_results(inventory),
         )
         self.connection.execute(
             "INSERT INTO execplan_catalog_revisions "

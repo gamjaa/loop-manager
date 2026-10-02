@@ -1505,6 +1505,8 @@ class PlanningLifecycleCoordinator:
                     run.maintenance_cycle.revision, str(row.active_sha),
                 )
                 if (not progress.selected
+                    and progress.next_unit is None
+                    and not maintenance_file_ledger.root_move_candidates(progress.root_reviews)
                     and not run.maintenance_cycle.include_general_planning
                     and run.maintenance_cycle.publication_stage is None
                     and not row.planning_result_completed
@@ -1717,7 +1719,9 @@ class PlanningLifecycleCoordinator:
             if unit is None:
                 return None
             content = review.content(context.repo_path, context.base_branch, unit.source)
-            prompt = maintenance_file_review.review_prompt(unit.source, content)
+            prompt = maintenance_file_review.review_prompt(
+                unit.source, content, root_placements=progress.root_placements,
+            )
             if unit.error:
                 prompt += "\n이전 검토 결과 오류를 수정하라: " + unit.error
             review.start(context.repo, run.maintenance_cycle.revision, unit.source)

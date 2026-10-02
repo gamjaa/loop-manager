@@ -4609,6 +4609,10 @@ risk: medium
                 self.assertIn("현재 목표에 필요하지 않은 추상화·설정·파일 추가", prompt)
                 self.assertIn("오류 처리·보안·접근성·회귀 검증", prompt)
                 self.assertIn("결정·예외·실패 흐름과 Acceptance Criteria의 의미", prompt)
+                self.assertIn("`.agents/`, `docs/`, `scripts/`", prompt)
+                self.assertIn("새 루트 항목은 사용자 진입, 실행·빌드·배포 또는 도구의 필수 탐색", prompt)
+                self.assertIn("모든 루트 항목의 실제 참조·사용자 경로·소유권과 안전한 목적지", prompt)
+                self.assertIn("근거가 불명확한 항목은 자동 이동·삭제하지 말고", prompt)
         self.assertIsNone(
             loop_manager.reviewer_targeted_test_reason("targeted test: PASS")
         )
