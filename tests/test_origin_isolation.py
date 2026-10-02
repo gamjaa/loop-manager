@@ -1085,7 +1085,7 @@ class ManagerBaselineReconciliationUnitTests(unittest.TestCase):
                 mock.patch.object(loop_manager, '_config_entries', return_value={}), \
                 mock.patch.object(loop_manager, '_agent_git_resources', return_value=None), \
                 mock.patch.object(loop_manager, 'git_bytes', return_value=b''), \
-                mock.patch.object(bootstrap, '_held_process_lock_identity', return_value='0'), \
+                mock.patch.object(loop_manager, '_held_process_lock_identity', return_value='0'), \
                 mock.patch.object(bootstrap.BootstrapService, 'validate_runtime_worktree'), \
                 mock.patch.object(bootstrap.BootstrapService, '_validated_runtime_registration_marker',
                                   return_value='runtime-marker') as marker, \

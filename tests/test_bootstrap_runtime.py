@@ -22,7 +22,7 @@ from tests.support.origin import (
 from loop_manager_internal.runtime import bootstrap
 
 
-class BootstrapRuntimeTests(unittest.TestCase):
+class BootstrapRuntimeTests(OriginScopeFixture, unittest.TestCase):
     def test_runtime_imports_local_module_without_bytecode_and_is_removed(self):
         with tempfile.TemporaryDirectory() as directory:
             _remote, source, _writer = remote_fixture(directory)
@@ -33,15 +33,16 @@ class BootstrapRuntimeTests(unittest.TestCase):
             sha = commit_all(source, "Runtime import fixture")
             state = Path(directory) / "state"
             with loop_manager.process_lock(state):
-                runtime = loop_manager._bootstrap_service().prepare_runtime_worktree(
+                service = loop_manager._bootstrap_service()
+                runtime = service.prepare_runtime_worktree(
                     source, state, mutation_id="a" * 32, commit_sha=sha)
-                remove = loop_manager.remove_runtime_worktree
+                remove = service.remove_runtime_worktree
                 def checked_remove(*args):
                     self.assertFalse((runtime.path / "__pycache__").exists())
                     self.assertFalse(loop_manager._ignored_worktree_paths(runtime.path))
                     remove(*args)
-                with mock.patch.object(bootstrap.BootstrapService, "remove_runtime_worktree", side_effect=checked_remove) as cleanup:
-                    self.assertEqual(loop_manager._bootstrap_service().run_runtime_child(
+                with mock.patch.object(service, "remove_runtime_worktree", side_effect=checked_remove) as cleanup:
+                    self.assertEqual(service.run_runtime_child(
                         source, state, source / "config.ini", runtime, []), 7)
                     cleanup.assert_called_once()
                 self.assertFalse(runtime.path.exists())

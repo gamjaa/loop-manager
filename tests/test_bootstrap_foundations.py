@@ -110,7 +110,15 @@ class BootstrapFoundationTests(unittest.TestCase):
             service = runtime_service(source, git=git, _worktree_catalog=lambda source: records,
                                       _git_operation_entries=lambda path: {}, _ignored_worktree_paths=lambda path: ())
             runtime = service.prepare_runtime_worktree(source, state, mutation_id='b' * 32, commit_sha=sha)
-            service.remove_runtime_worktree(source, state, runtime)
+            remove = service.remove_runtime_worktree
+            def checked_remove(*args):
+                self.assertFalse((runtime.path / '__pycache__').exists())
+                remove(*args)
+            with mock.patch.object(service, 'remove_runtime_worktree', side_effect=checked_remove) as cleanup, \
+                    mock.patch.object(bootstrap.subprocess, 'run', return_value=SimpleNamespace(returncode=7)):
+                self.assertEqual(service.run_runtime_child(source, state, source / 'config.ini', runtime, []), 7)
+                cleanup.assert_called_once_with(source, state, runtime)
+            self.assertFalse(runtime.path.exists())
             replacement = service.prepare_runtime_worktree(source, state, mutation_id='c' * 32, commit_sha=sha)
             self.assertEqual(replacement.path, runtime.path)
             self.assertEqual(replacement.commit_sha, sha)
@@ -147,6 +155,15 @@ class BootstrapFoundationTests(unittest.TestCase):
             identity = service.validate_runtime_mutation(source, state, sha, 'b' * 32)
         self.assertEqual(identity.path, runtime)
         self.assertEqual(identity.registration_lock_reason, 'owned')
+        with mock.patch.object(bootstrap, '_held_process_lock_identity', return_value='0'):
+            legacy_identity = service.validate_runtime_mutation(source, state, sha, None)
+        self.assertTrue(legacy_identity.legacy)
+        self.assertEqual(legacy_identity.path, runtime)
+        service._validated_runtime_registration_marker.assert_called_with(
+            source, state, runtime, sha, None, legacy=True, record_legacy_adoption=True)
+        with mock.patch.object(bootstrap, '_held_process_lock_identity', return_value='runtime:' + 'b' * 32):
+            with self.assertRaisesRegex(RuntimeError, 'mutation ID가 없는 새 형식'):
+                service.validate_runtime_mutation(source, state, sha, None)
         with mock.patch.object(bootstrap, '_held_process_lock_identity', return_value='runtime:other'):
             with self.assertRaisesRegex(RuntimeError, '부모 process lock'):
                 service.validate_runtime_mutation(source, state, sha, 'b' * 32)
