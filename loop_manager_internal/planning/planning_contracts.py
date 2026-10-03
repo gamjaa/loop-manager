@@ -414,7 +414,7 @@ class PlanningGitPort(Protocol):
     def relevant_document_changes(
         self, worktree: Path, old: str, target: str,
         edited_paths: list[str], catalog_rows: Sequence[Any],
-        target_plan_ids: Sequence[str],
+        target_plan_ids: Sequence[str], *, include_active_requirements: bool,
     ) -> tuple[str, ...]: ...
 
     def validate_managed_worktree(self, worktree: Path) -> None: ...

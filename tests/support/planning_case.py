@@ -384,7 +384,7 @@ class FakeGitPort:
     def accept_resolved_stash_conflict(self, *_args):
         pass
 
-    def relevant_document_changes(self, *_args):
+    def relevant_document_changes(self, *_args, **_kwargs):
         return ()
 
     def validate_managed_worktree(self, _worktree):

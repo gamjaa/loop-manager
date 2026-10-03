@@ -188,6 +188,40 @@ class PlanningRebaseTest(unittest.TestCase):
 
 
 class PlanningDocumentRelevanceTest(unittest.TestCase):
+    def test_general_target_rechecks_new_active_requirement_outside_its_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "docs/plans").mkdir(parents=True)
+            plan = write_execplan(root, "G-118", "Current")
+            plan_path = plan.relative_to(root).as_posix()
+            requirement = "docs/requirements/[R-053] New Goal.md"
+
+            def git(_repo, *args, check=True):
+                if args[:2] == ("diff", "--name-only"):
+                    return SimpleNamespace(stdout=requirement + "\0", returncode=0)
+                if args[:2] == ("ls-tree", "-r"):
+                    return SimpleNamespace(stdout=plan_path + "\0", returncode=0)
+                if args[0] == "show":
+                    return SimpleNamespace(stdout=plan.read_text(), returncode=0)
+                revision, path = args[2].split(":", 1)
+                value = "same-plan" if path == plan_path else (
+                    "new-requirement" if revision == "new" and path == requirement else None
+                )
+                return SimpleNamespace(stdout=value or "", returncode=0 if value else 1)
+
+            arguments = (git, root, root, "old", "new", [], (), ("G-118",))
+            self.assertEqual(relevant_document_changes(*arguments), ())
+            self.assertEqual(relevant_document_changes(
+                *arguments, include_active_requirements=True,
+            ), (requirement,))
+            self.assertEqual(relevant_document_changes(
+                git, root, root, "old", "new", [], (), (),
+            ), ())
+            self.assertEqual(relevant_document_changes(
+                git, root, root, "old", "new", [], (), (),
+                include_active_requirements=True,
+            ), (requirement,))
+
     def test_only_current_plan_sources_and_dependencies_require_recheck(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -250,6 +284,10 @@ class PlanningDocumentRelevanceTest(unittest.TestCase):
                 git, root, root, "old", "new", [str(current.relative_to(root))], (),
             )
             self.assertEqual(result, ())
+            self.assertEqual(relevant_document_changes(
+                git, root, root, "old", "new", [str(current.relative_to(root))], (),
+                include_active_requirements=True,
+            ), ())
 
     def test_content_preserving_dependency_archive_needs_no_recheck(self):
         with tempfile.TemporaryDirectory() as directory:

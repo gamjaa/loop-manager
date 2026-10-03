@@ -58,8 +58,9 @@ def _declaration(git, repository: Path, revision: str, path: str) -> dict[str, o
 def relevant_document_changes(
     git, repository: Path, worktree: Path, old: str, new: str,
     edited_paths: list[str], catalog_rows, target_plan_ids=(),
+    *, include_active_requirements: bool = False,
 ) -> tuple[str, ...]:
-    """Compare remote inputs of edited and explicitly assessed plans."""
+    """Compare remote plan inputs and, when requested, active requirements."""
     changed = set(git(repository, "diff", "--name-only", "-z", old, new, "--",
                       "docs", "AGENTS.md").stdout.split("\0")) - {""}
     if not changed:
@@ -137,11 +138,12 @@ def relevant_document_changes(
             row = rows.get(str(dependency))
             if row is not None:
                 relevant.add(str(row["path"]))
-    if not ids:
-        # No current plan declaration exists yet: current product and active
-        # requirements remain the assessment's input.
+    if include_active_requirements:
+        # General planning assesses active requirements beyond the sources of
+        # existing plans, including when there is no plan declaration yet.
         relevant.update(path for path in changed if path == "docs/PRODUCT.md"
-                        or path.startswith("docs/requirements/") and path.count("/") == 2)
+                        or (path.startswith("docs/requirements/")
+                            and path.count("/") == 2 and path.endswith(".md")))
     # A renamed target is reported by its new path even though the old path
     # alone appears in a deletion-only diff.
     changed_inputs = {

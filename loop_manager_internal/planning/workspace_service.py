@@ -181,6 +181,14 @@ class PlanningWorkspaceService(PlanningService):
                         worktree, str(row.active_sha or ""),
                     )) | set(self._ports.git.changed_files(worktree))),
                     catalog_rows, self._assessment_targets(run, catalog_rows),
+                    include_active_requirements=(
+                        not run.maintenance_planning
+                        or run.maintenance_cycle.include_general_planning
+                    ),
+                )
+                relevant_failed_input_change = bool(
+                    changed_documents or
+                    (not run.maintenance_planning and not unchanged_failed_input)
                 )
                 linked_error = self._linked_failed_result(run)
                 if row.agent_snapshot:
@@ -243,13 +251,13 @@ class PlanningWorkspaceService(PlanningService):
                         if mode_failure else maintenance_planning_fingerprint(run.maintenance_cycle, adopted_input)
                         if run.maintenance_planning else adopted_input
                     )
-                    if ((changed_documents or not unchanged_failed_input)
+                    if (relevant_failed_input_change
                             and not row.planning_result_completed
                             and not mode_failure):
                         # Keep the authorized correction durable across the
                         # crash window before the next Planner invocation.
                         values["planning_result_pending_validation"] = 1
-                    if ((changed_documents or not unchanged_failed_input) and not mode_failure
+                    if (relevant_failed_input_change and not mode_failure
                             and linked_error):
                         values["planning_retry_count"] = 0
                 if changed_documents and row.planning_result_completed:
@@ -276,8 +284,7 @@ class PlanningWorkspaceService(PlanningService):
                 correction_pending = bool(
                     (changed_documents and row.planning_result_completed)
                     or (not row.planning_result_completed
-                        and (changed_documents or not unchanged_failed_input)
-                        and not mode_failure)
+                        and relevant_failed_input_change and not mode_failure)
                     or (row.planning_correction_error == row.planning_error
                         and row.planning_result_pending_validation)
                 )
@@ -309,7 +316,7 @@ class PlanningWorkspaceService(PlanningService):
                         detail="원격 base가 다시 전진해 다음 안전 경계에서 반영합니다.",
                         error=True,
                     )
-                if (unchanged_failed_input and (not changed_documents or mode_failure)
+                if (row.planning_error and (not relevant_failed_input_change or mode_failure)
                         and not row.planning_result_completed
                         and not row.planning_result_pending_validation):
                     self._ports.events.error(
