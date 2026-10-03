@@ -140,6 +140,7 @@ class ValidatedPlanningResult:
     maintenance_context: MaintenancePlanningContext | None = None
     refactoring_plan_ids: tuple[str, ...] = ()
     revalidation_plan_ids: tuple[str, ...] = ()
+    maintenance_code_map_hash: str | None = None
 
 
 class VerifyOutput(str):

@@ -300,6 +300,19 @@ class ReconciliationRepository:
                     continue
                 if _valid_map_shape(value):
                     result[path] = value
+        from loop_manager_internal.maintenance.code_map_artifact import read_maps
+        imported = read_maps(Path(repo), inventory, result)
+        # This caches verified context only. Neither the reviewed-file ledger,
+        # successful assessment baseline nor execution state is reconstructed.
+        for path, value in imported.items():
+            source = sources[path]
+            self.connection.execute(
+                "INSERT INTO successful_code_maps VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(repo, path) DO UPDATE SET content_hash = excluded.content_hash, "
+                "mode = excluded.mode, code_map_json = excluded.code_map_json",
+                (repo, path, source.content_hash, source.mode, json.dumps(value, ensure_ascii=False, sort_keys=True)),
+            )
+        result.update(imported)
         return result
 
     def progress(self, repo: str, repository: Path, base: str, cycle_revision: int,

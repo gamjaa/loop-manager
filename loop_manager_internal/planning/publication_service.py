@@ -138,6 +138,34 @@ class PlanningPublicationService(PlanningService):
                 f"해결되지 않은 planning 오류를 보존합니다: {row.planning_error}"
             )
             return self._operational_error()
+        if self._file_assessment_active(run) and run.maintenance_cycle.publication_stage is None:
+            try:
+                self._ports.git.validate_worktree_ownership(
+                    context.repo, str(row.planning_attempt_fingerprint or run.current_fingerprint or ""), worktree,
+                )
+                self._ports.git.fetch_base(context.repo_path, context.base_branch)
+                self._ports.validation.validate_publication_base(
+                    context.repo, context.repo_path, context.base_branch, run.maintenance_context,
+                )
+                validated_result = self._ports.state.prepare_file_assessment_artifact(
+                    context.repo, context.repo_path, context.base_branch,
+                    run.maintenance_context, worktree, validated_result,
+                )
+                run.validated_result = validated_result
+                from loop_manager_internal.maintenance.code_map_artifact import ARTIFACT_PATH
+                # Preparation may restore a stale candidate to identical remote
+                # bytes. Refresh its index and dirty flag before deciding whether
+                # this batch needs a commit at all.
+                self._ports.git.run(worktree, "add", "--", ARTIFACT_PATH)
+                artifact_dirty = self._ports.git.run(
+                    worktree, "status", "--porcelain", "--", ARTIFACT_PATH,
+                ).stdout.strip()
+                run.dirty_files = sorted((set(run.dirty_files or ()) - {ARTIFACT_PATH})
+                                        | ({ARTIFACT_PATH} if artifact_dirty else set()))
+            except MaintenancePlanningRestart:
+                return PlanningOutcome(PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED, error=True)
+            except RuntimeError as error:
+                return self._preserve_recovery_error(run, str(run.current_fingerprint or ""), error)
         if validated_result is None:
             self._ports.git.fetch_base(context.repo_path, context.base_branch)
             latest_sha = self._ports.git.run(

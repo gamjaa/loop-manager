@@ -275,6 +275,10 @@ class PlanningStatePort(Protocol):
         cycle_revision: int, source_sha: str, evidence: Any,
     ) -> None: ...
 
+    def prepare_file_assessment_artifact(
+        self, repo: str, repository: Path, base: str, context: Any, worktree: Path, result: Any,
+    ) -> Any: ...
+
     def recover_maintenance_batch(
         self, repo: str, worktree: Path, base: str
     ) -> maintenance_state.MaintenanceCycle: ...
@@ -347,6 +351,10 @@ class PlanningGitPort(Protocol):
     def planning_correction(
         self, repo: str, worktree: Path, target: str,
     ) -> tuple[tuple[str, ...], bool] | None: ...
+
+    def restore_code_map_conflict(
+        self, repo: str, worktree: Path, stash_sha: str = "",
+    ) -> None: ...
 
     def run(
         self, repo: Path, *arguments: str, check: bool = True

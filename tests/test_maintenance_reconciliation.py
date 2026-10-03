@@ -38,6 +38,9 @@ def review(item, *, reference=None, similar=None):
 
 class ReconciliationUnitTest(unittest.TestCase):
     def setUp(self):
+        reader = mock.patch("loop_manager_internal.maintenance.code_map_artifact.read_maps", return_value={})
+        reader.start()
+        self.addCleanup(reader.stop)
         self.contents = {
             "src/a.py": b"def calculate(): return helper()\n",
             "src/b.py": b"def helper(): return calculate()\n",

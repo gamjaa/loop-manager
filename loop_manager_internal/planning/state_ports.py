@@ -295,6 +295,18 @@ class _PlanningStatePorts:
                 bump_revision=False,
             )
 
+    def prepare_file_assessment_artifact(
+        self, repo: str, repository: Path, base: str, context, worktree: Path, result,
+    ):
+        from loop_manager_internal.maintenance import code_map_artifact
+        try:
+            evidence = maintenance_file_publication.collect(
+                self._connection, repo, repository, base, context.cycle_revision, context.active_sha,
+            )
+            return code_map_artifact.prepare(self._connection, repo, context, worktree, evidence, result)
+        except (maintenance_file_inventory.SourceInventoryError, ValueError, OSError) as error:
+            raise code_map_artifact.CodeMapArtifactError(str(error)) from error
+
     def recover_maintenance_batch(
         self, repo: str, worktree: Path, base: str
     ) -> maintenance_state.MaintenanceCycle:

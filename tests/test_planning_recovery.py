@@ -784,6 +784,58 @@ class PlanningConflictCorrectionUnitTests(PlanningCase):
                 self.assertEqual(self.agent.run_count, 0)
                 self.assert_no_git_writes()
 
+    def test_manager_code_map_conflict_is_resolved_without_agent(self):
+        from loop_manager_internal.maintenance.code_map_artifact import ARTIFACT_PATH
+        self.unmerged = ARTIFACT_PATH + "\0"
+        self.role = "maintenance_planner"
+        self.git.restore_code_map_conflict = mock.Mock()
+        self.assertTrue(self.resolve())
+        self.git.restore_code_map_conflict.assert_called_once_with("/repo", self.worktree, "")
+        self.assertEqual(self.agent.run_count, 0)
+        self.assertIn(("add", "--", ARTIFACT_PATH), self.effects)
+        self.git.save_planning_correction.assert_called_once_with(
+            "/repo", self.worktree, "target", (ARTIFACT_PATH,), True,
+        )
+
+    def test_code_map_stash_collision_uses_proven_stash_bytes_without_agent(self):
+        from loop_manager_internal.maintenance.code_map_artifact import ARTIFACT_PATH
+        self.unmerged = ""
+        self.rebase_dir.rmdir()
+        self.role = "maintenance_planner"
+        self.git.restore_code_map_conflict = mock.Mock()
+        self.assertTrue(self.resolve(collision_paths=(ARTIFACT_PATH,), stash_sha="stash"))
+        self.git.restore_code_map_conflict.assert_called_once_with("/repo", self.worktree, "stash")
+        self.assertEqual(self.agent.run_count, 0)
+        self.git.accept_resolved_stash_conflict.assert_called_once()
+
+    def test_unproven_code_map_conflict_preserves_files_and_general_scope(self):
+        from loop_manager_internal.maintenance.code_map_artifact import ARTIFACT_PATH, CodeMapArtifactError
+        self.unmerged = ARTIFACT_PATH + "\0"
+        self.git.restore_code_map_conflict = mock.Mock(side_effect=CodeMapArtifactError("receipt mismatch"))
+        self.assertFalse(self.resolve())
+        self.git.restore_code_map_conflict.assert_not_called()
+        self.role = "maintenance_planner"
+        self.assertFalse(self.resolve())
+        self.git.restore_code_map_conflict.assert_called_once()
+        self.assertEqual(self.agent.run_count, 0)
+        self.assert_no_git_writes()
+
+    def test_mixed_code_map_conflict_keeps_manager_path_out_of_agent_prompt(self):
+        from loop_manager_internal.maintenance.code_map_artifact import ARTIFACT_PATH
+        self.unmerged = self.plan_path + "\0" + ARTIFACT_PATH + "\0"
+        self.role = "maintenance_planner"
+        self.git.restore_code_map_conflict = mock.Mock()
+        invoke = self.agent.run_planner
+
+        def planner(tree, prompt, session, callback, **kwargs):
+            self.assertNotIn(ARTIFACT_PATH, prompt)
+            return invoke(tree, prompt, session, callback, **kwargs)
+
+        self.agent.run_planner = planner
+        self.assertTrue(self.resolve())
+        self.assertEqual(self.agent.run_count, 1)
+        self.assertIn(("add", "--", *sorted((ARTIFACT_PATH, self.plan_path))), self.effects)
+
     def test_continue_failure_retains_saved_correction_and_session(self):
         self.continue_code = 1
         self.assertFalse(self.resolve())

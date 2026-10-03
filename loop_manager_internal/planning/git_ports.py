@@ -79,6 +79,12 @@ class _PlanningGitPorts:
             self._effects.git, self._state_dir, repo, worktree, target,
         )
 
+    def restore_code_map_conflict(
+        self, repo: str, worktree: Path, stash_sha: str = "",
+    ) -> None:
+        from loop_manager_internal.maintenance.code_map_artifact import restore_conflict
+        restore_conflict(self._connection, repo, worktree, stash_sha)
+
     def input_fingerprint(self, repo_path: Path, sha: str) -> str:
         return self._effects._planning_input_fingerprint(repo_path, sha)
 

@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from loop_manager_internal.application.contracts import ValidatedPlanningResult
 from loop_manager_internal.maintenance import maintenance_file_publication
+from loop_manager_internal.maintenance.code_map_artifact import ARTIFACT_PATH
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanMode
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanningContext
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanningError
@@ -140,6 +141,10 @@ def _validate_maintenance_planning_commit(
                 "maintenance ExecPlan이 Planner 결과 검증 후 "
                 f"변경됐습니다: {path}"
             )
+        if path == ARTIFACT_PATH:
+            if result.maintenance_code_map_hash != expected_hash:
+                raise MaintenancePlanningError("Manager가 검증한 코드맵 출력이 아닙니다.")
+            continue
         if path == "docs/FUTURE_IDEAS.md":
             continue
         parsed = effects._parse_execplan(repository, repository / path, validate_sources=False)

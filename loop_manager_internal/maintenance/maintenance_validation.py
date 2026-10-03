@@ -271,6 +271,7 @@ def validate_maintenance_planner_result(
     # Read Git outside the output-validation boundary. A tree query distinguishes
     # absent paths from an unreadable repository without interpreting cat-file's
     # nonzero status as proof that a path is new.
+    from loop_manager_internal.maintenance import code_map_artifact
     planned_files = sorted(
         set(dirty_files) | set(effects.changed_files(worktree, context.active_sha))
     )
@@ -301,8 +302,14 @@ def validate_maintenance_planner_result(
                 path_moves_by_sha[snapshot.plan_sha] = moves
     try:
         effects._assert_maintenance_context_current(connection, context)
+        artifact_result = None
+        if code_map_artifact.ARTIFACT_PATH in planned_files:
+            artifact_result = code_map_artifact.attach_candidate(
+                connection, context, worktree, None, allow_stale=True,
+            )
+            planned_files.remove(code_map_artifact.ARTIFACT_PATH)
         if not planned_files:
-            return None
+            return artifact_result
         eligible = context.eligible_by_path
         planned_contents: dict[str, tuple[bytes, str]] = {}
         new_paths: list[str] = []
@@ -470,7 +477,7 @@ def validate_maintenance_planner_result(
                 )
             revisions.append(PlanRevision(path, validated_plan, snapshot))
 
-        return ValidatedPlanningResult(
+        result = ValidatedPlanningResult(
             plans=tuple(
                 sorted(new_plans, key=lambda item: int(str(item[1]["id"])[2:]))
             ),
@@ -496,7 +503,9 @@ def validate_maintenance_planner_result(
                 ) if refactoring_plans else ()
             ),
         )
-    except MaintenancePlanningError as error:
+        return (code_map_artifact.attach_candidate(connection, context, worktree, result)
+                if artifact_result is not None else result)
+    except (MaintenancePlanningError, code_map_artifact.CodeMapArtifactError) as error:
         raise PlannerValidationError(str(error)) from error
     except (OSError, UnicodeError) as error:
         raise PlannerValidationError(str(error)) from error

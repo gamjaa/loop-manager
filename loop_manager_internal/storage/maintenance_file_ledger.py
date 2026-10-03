@@ -79,7 +79,9 @@ def assessment_input_tree(repository: Path, revision: str) -> tuple[bytes, ...]:
     """Compare investigated input blobs while allowing normal Planner output."""
     return tuple(line for line in _git(repository, "ls-tree", "-r", revision).splitlines()
                  if not line.split(b"\t", 1)[-1].startswith(b"docs/plans/")
-                 and line.split(b"\t", 1)[-1] != b"docs/FUTURE_IDEAS.md")
+                 and line.split(b"\t", 1)[-1] not in {
+                     b"docs/FUTURE_IDEAS.md", b"docs/maintenance/code-map.jsonl",
+                 })
 
 
 def validate_root_reviews(repository: Path, inventory: SourceInventory, results: object) -> tuple[dict, ...]:

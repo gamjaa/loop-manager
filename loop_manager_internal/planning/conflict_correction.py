@@ -38,6 +38,22 @@ class PlanningConflictCorrection:
         paths = tuple(sorted(set(unmerged) | set(collision_paths)))
         if not paths:
             return False
+        from loop_manager_internal.maintenance.code_map_artifact import ARTIFACT_PATH
+        if role == "maintenance_planner" and ARTIFACT_PATH in paths:
+            try:
+                self._git.restore_code_map_conflict(
+                    repo, worktree, stash_sha if ARTIFACT_PATH in collision_paths else "",
+                )
+            except RuntimeError as error:
+                self._events.error(str(error))
+                return False
+            paths = tuple(path for path in paths if path != ARTIFACT_PATH)
+            collision_paths = tuple(path for path in collision_paths if path != ARTIFACT_PATH)
+            unmerged = tuple(sorted(set(unmerged) | {ARTIFACT_PATH}))
+            if not paths:
+                was_rebase = rebase_in_progress(self._git.run, worktree)
+                self._git.save_planning_correction(repo, worktree, target, unmerged, was_rebase)
+                return self.finish(repo, worktree, target, unmerged, was_rebase)
         if any(
             path != "docs/FUTURE_IDEAS.md"
             and re.fullmatch(r"docs/plans/[^/]+\.md", path) is None

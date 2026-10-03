@@ -261,7 +261,19 @@ def parse_review(output: str, source: TrackedSource, content: bytes, *,
     )
     for key in EVIDENCE_TEXT_FIELDS:
         _string(evidence[key], f"evidence.{key}", minimum=MIN_DESCRIPTION_CHARS)
-    code_map = result["code_map"]
+    result["code_map"] = validate_code_map(result["code_map"], source, content)
+    result["pending_references"] = _references(
+        result["pending_references"], "미확인 직접 참조", text,
+    )
+    result["similar_responsibilities"] = _similar_candidates(
+        result["similar_responsibilities"],
+    )
+    return result
+
+
+def validate_code_map(code_map: object, source: TrackedSource, content: bytes) -> dict:
+    """Validate map context independently; this never marks a file reviewed."""
+    text = _source_text(content)
     require_fields(code_map, CODE_MAP_FIELDS, "code_map")
     _string(code_map["responsibility"], "code_map.responsibility", minimum=MIN_DESCRIPTION_CHARS)
     for key in ("entry_points", "public_symbols"):
@@ -280,13 +292,7 @@ def parse_review(output: str, source: TrackedSource, content: bytes, *,
     code_map["direct_references"] = _references(
         code_map["direct_references"], "직접 참조", text,
     )
-    result["pending_references"] = _references(
-        result["pending_references"], "미확인 직접 참조", text,
-    )
-    result["similar_responsibilities"] = _similar_candidates(
-        result["similar_responsibilities"],
-    )
-    return result
+    return code_map
 
 
 def review_prompt(
