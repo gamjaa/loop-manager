@@ -75,6 +75,8 @@ Manager verify 피드백 6건에 따라 Windows verify에도 새 모듈을 등�
 
 현재 후보에서 rebase·workspace 복구 unit test 36개, planning 선택·게시·execution 실패 정책·verify 목록·maintenance snapshot 52개, 후보·source-only gate·유지보수 근거 재사용 6개가 통과했다. 첫 명령에서 확인한 충돌 경로 Git 옵션 결함과 테스트 fixture 오류를 수정한 뒤 동일 명령을 재실행했다. Windows 분기는 플랫폼 모의 검증이며 실제 Windows 실행과 전체 verify·Review는 Manager에 남긴다.
 
+Manager의 source 동기화 verify 피드백 2건은 planning 준비에서 이미 검증된 catalog를 직접 재조회한 것이 원인이었다. 프로젝트의 기존 `ProjectCatalogRefresh`를 일반 planning과 미게시 intent 복구에 전달해 같은 revision·선언 및 검증된 archive 이동의 증거를 재사용한다. 원격 revision 또는 SQLite 선언이 달라지면 기존 CAS 경계에서 다시 검증하며, 독립 coordinator의 직접 reconciliation 경로도 유지한다. 현재 후보의 `ProjectCatalogRefreshTest`, `test_planning_recovery`, `test_planning_rebase` unit test 75개가 모두 통과했다. 전달된 source 동기화 통합 테스트의 기대값은 변경하지 않았고 실행은 Manager에 남겼다.
+
 ## Decision Log
 
 - 2026-10-02: 사용자는 원격 전진을 어느 단계에서 관측하든 관리 작업을 rebase 후 이어가고, 단계별 관련 문서가 변경됐을 때만 재확인하도록 요청했다. Worker·Reviewer의 추가 문서 확인 대상은 현재 진행 중인 ExecPlan이다.

@@ -353,9 +353,12 @@ class PlanningWorkspaceService(PlanningService):
                 and run.maintenance_cycle.publication_stage == "prepared"
             )
             if not pending_intent:
-                self._ports.state.reconcile_catalog(
-                    context.repo, context.repo_path, context.base_branch, latest,
-                )
+                if context.refresh_catalog is not None:
+                    context.refresh_catalog(latest)
+                else:
+                    self._ports.state.reconcile_catalog(
+                        context.repo, context.repo_path, context.base_branch, latest,
+                    )
             run.base_sha = latest
             run.general_fingerprint = self._ports.git.input_fingerprint(
                 context.repo_path, latest,

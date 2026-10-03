@@ -122,6 +122,7 @@ class PlanningContext:
     registered_only: bool
     refactoring_review_interval: int
     self_repository: bool = False
+    refresh_catalog: Callable[[str], str] | None = None
 
 
 @dataclass(frozen=True)
