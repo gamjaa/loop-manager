@@ -5,7 +5,9 @@
 파일명은 프로젝트 안에서 고유해야 하며 Requirement의 안정적인 식별자로 사용된다.
 Requirement는 제품에 원하는 변화와 완료 조건을 기록하는 순수 문서다.
 docs/requirements/ 바로 아래에 저장한 모든 Requirement는 Planner 입력으로 사용된다.
-미결정 사항을 해소한 뒤 이 위치에 저장하고, 완료 후 사용자가 archive/로 옮긴다.
+미결정 사항을 해소한 뒤 이 위치에 저장한다.
+완료된 Requirement는 마지막 관련 ExecPlan의 구현 PR에서 Loop Manager가 eligibility를 다시 확인한 뒤 내용 변경 없이 archive/로 자동 이동한다.
+archive PR이 Merge되기 전에는 활성 Planner 입력으로 남으며, 관련 비종료 ExecPlan·archive 충돌·source 관계 불확실성이 있으면 이동하지 않는다.
 -->
 
 ## Context

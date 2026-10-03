@@ -10,6 +10,16 @@ from loop_manager_internal.execution.validation_feedback import redact_secrets
 from loop_manager_internal.execution.worker_outcome import worker_outcome_instruction
 
 
+EXECPLAN_AUTHORING_GUIDANCE = """
+## ExecPlan 작성 기준
+
+- docs/PLANS.md의 형식을 유지하고 목표·변경 범위·완료 조건부터 명확히 써라. 상위 명세·AGENTS·공통 검증 규칙은 sources와 필요한 참조로 연결하며 본문에 길게 반복하지 마라.
+- Acceptance Criteria는 관찰·검증 가능한 결과로, Implementation은 변경할 책임 경계와 핵심 방향으로 작성하라. 구현자가 코드에서 결정할 수 있는 파일·함수별 절차는 미리 고정하지 말고, 순서가 안전성이나 계약을 보장하는 경우만 구체화하라.
+- Validation에는 이 작업 고유의 targeted test와 전체 verify 회귀 조건을 남겨라. Progress는 실제 진행, Decision Log는 중요한 결정과 이유를 기록하고 상세 실행 로그는 필요한 증거만 참조하라.
+- 간결화해도 결정·예외·실패 시 보존과 재개·Acceptance Criteria를 생략하지 마라. 기존 계획 개정에서는 해당 snapshot·mode의 변경 범위와 목표 보존 조건을 우선하고, 길이 제한으로 내용을 삭제하거나 권한을 확대하지 마라.
+""".strip()
+
+
 def planner_prompt(
     error: str | None,
     compact_catalog: str = "[]",
@@ -26,6 +36,7 @@ def planner_prompt(
 당신은 Loop Manager의 Planner다.
 AGENTS.md, 활성 PRODUCT와 Requirement, docs/ARCHITECTURE.md, docs/PLANS.md 및 현재 코드·테스트를 읽어라.
 {AGENT_QUALITY_GUIDANCE}
+{EXECPLAN_AUTHORING_GUIDANCE}
 아래 compact catalog는 SQLite의 비종료 ExecPlan만 코드로 직렬화한 것이다. MERGED 계획은 제외됐다.
 {compact_catalog}
 
@@ -102,6 +113,7 @@ MAINTENANCE_RESULT: {{"outcome":"unsafe","reason":"구체적인 진단"}}
 당신은 Loop Manager의 유지보수 Planner다.
 AGENTS.md, 활성 PRODUCT와 Requirement, docs/ARCHITECTURE.md, docs/PLANS.md, 현재 코드·테스트 및 아래 compact catalog와 bounded 변경 문맥을 읽어라.
 {AGENT_QUALITY_GUIDANCE}
+{EXECPLAN_AUTHORING_GUIDANCE}
 책임·상태 전이·외부 연동의 혼합, 핵심 경로의 반복 변경 집중, 독립 테스트가 어려운 경계, 이름·제어 흐름·결합도, 오류 복구 경계, 중복 구현·불필요한 전역 가변 상태와 후속 변경 충돌을 함께 검토하라.
 assessment에서는 선정 파일의 원본을 실제로 읽는 파일별 단위와 동시에 책임·진입점·공개 심벌·직접 참조·관련 테스트 경로의 짧은 코드맵을 만든다. 아래 잠정 기록은 관계 확인 후보이지 성공 ledger가 아니다. 변경되지 않은 파일은 필요한 문맥으로만 읽고 검토 완료 대상으로 세지 마라. 인용과 source revision을 확인하고, 줄 수나 토큰 수만으로 분리를 강제하지 마라.
 

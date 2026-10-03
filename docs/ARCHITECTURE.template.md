@@ -11,7 +11,6 @@ PRODUCT.md의 목표와 동작을 기술적으로 어떻게 구현하고 유지�
 - 제품 목표와 규칙: `docs/PRODUCT.md` (선택)
 - 개별 요구사항: `docs/requirements/*.md` (선택)
 - ExecPlan 작성 규칙: `docs/PLANS.md`
-- 설치와 실행 방법: `README.md`
 
 <!-- PRODUCT.md와 requirements/*.md 중 하나 이상은 프로젝트에 존재해야 한다. -->
 

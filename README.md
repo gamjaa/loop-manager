@@ -1,26 +1,14 @@
 # Loop Manager
 
-Loop Manager는 외부 스케줄러가 반복 실행하며 여러 로컬 GitHub 프로젝트의 계획, 구현, 검증과 Pull Request 생성을 관리하는 도구다.
+Loop Manager는 여러 로컬 GitHub 프로젝트의 계획·구현·검증·Pull Request 생성을 관리한다. 사용자는 제품 문서를 작성하고 프로젝트를 등록한 뒤, 차단 시 필요한 결정을 내리고 PR을 검토·Merge한다.
 
-프로젝트 문서에서 작업을 찾고 Planner, Worker, Reviewer를 순서대로 실행한다. 작업 상태와 AI Agent 세션은 재실행 후에도 이어지며 서로 다른 프로젝트를 병렬로 처리할 수 있다. 같은 프로젝트에서는 한 번에 하나의 작업만 실행하고, 의존 작업은 선행 PR이 Merge될 때까지 기다린다. PR 생성, 작업 차단과 프로젝트 완료는 Telegram으로 알린다.
+외부 스케줄러가 반복 실행하며 상태와 Agent session은 중단 후에도 이어진다. 같은 프로젝트의 변경은 하나씩, 다른 프로젝트는 `max_workers` 안에서 병렬 처리한다. PR 생성·차단·프로젝트 완료는 Telegram으로 알린다.
 
-## 주요 동작
+## 시작하기
 
-- 여러 로컬 Git 프로젝트 등록 및 상태 관리
-- Requirement를 바탕으로 ExecPlan 생성
-- 작업 난이도에 맞는 Codex 또는 Claude 모델 선택
-- ExecPlan별로 격리된 Git branch와 worktree에서 구현
-- 프로젝트별 전체 검증과 AI Reviewer 실행
-- Pull Request 생성 후 사용자의 Merge 대기
-- 외부 스케줄러를 통한 반복 실행과 중단 상태 복구
+Python 3, Git, GitHub CLI와 프로젝트에서 선택한 인증된 Codex 또는 Claude Code CLI가 필요하다. 아래 명령은 Loop Manager 저장소 루트에서 실행한다.
 
-세부 제품 동작은 [PRODUCT.md](docs/PRODUCT.md), 기술 설계는 [ARCHITECTURE.md](docs/ARCHITECTURE.md)에서 관리한다.
-
-## 사용자가 할 일
-
-### 1. 공통 파일 복사
-
-Loop Manager 저장소 루트에서 관리할 프로젝트의 경로를 지정한다.
+### 1. 관리할 프로젝트 준비
 
 ```powershell
 pwsh -File scripts/copy-project-files.ps1 -TargetPath D:\repo\my-project
@@ -30,89 +18,62 @@ pwsh -File scripts/copy-project-files.ps1 -TargetPath D:\repo\my-project
 bash scripts/copy-project-files.sh /path/to/my-project
 ```
 
-복사 스크립트는 사용자가 명시적으로 실행하는 초기 설정 도구다. 공통 `AGENTS.md`, Specification Skill, 문서 템플릿과 빈 작업 폴더를 준비하고 `PRODUCT.md`와 `ARCHITECTURE.md` 초안을 생성한다. 대상에 `AGENTS.md`, `.agents` 또는 `docs`가 이미 있으면 덮어쓰지 않고 중단하며, 자동 Loop에서는 이 스크립트를 호출하지 않는다.
+복사 스크립트는 공통 AGENTS·Specification Skill·문서 템플릿과 빈 작업 폴더, PRODUCT·ARCHITECTURE 초안을 준비한다. 대상에 `AGENTS.md`, `.agents` 또는 `docs`가 있으면 덮어쓰지 않고 중단한다. 자동 Loop에서는 호출하지 않는다.
 
-기존 프로젝트에 적용할 때는 문서를 덮어쓰지 말고 다음 파일만 선택적으로 병합한다.
+기존 프로젝트에는 필요한 공통 파일(`AGENTS.md`, `.agents/skills/`, `docs/PLANS.md`, `docs/*.template.md`)만 선택적으로 병합한다.
 
-- `AGENTS.md`
-- `.agents/skills/`
-- `docs/PLANS.md`
-- `docs/*.template.md`
+### 2. 프로젝트 문서 작성·게시
 
-### 2. 프로젝트 문서 작성
+| 문서 | 작성할 내용 |
+|---|---|
+| `docs/PRODUCT.md` | 현재 제품의 동작·경계·장기 규칙 |
+| `docs/requirements/*.md` | 새 기능·정책 변경과 Acceptance Criteria |
+| `docs/ARCHITECTURE.md` | 제품 규칙을 보장하는 구조·기술 결정·복구 방식 |
+| `AGENTS.md` | 공통 작업 원칙을 유지하면서 필요한 프로젝트 작업 규칙 추가 |
 
-사용자는 대상 프로젝트에 맞게 다음 문서를 작성한다.
+PRODUCT와 활성 Requirement 중 하나 이상은 반드시 있어야 한다. 초기 제품은 PRODUCT로 정의하고 운영 중 변경은 Requirement로 작성한다. Requirement는 frontmatter·상태 없이 `docs/requirements/` 바로 아래에 두며 모두 Planner 입력이 된다.
 
-- `docs/PRODUCT.md`: 현재 제품에서 지켜야 할 동작과 장기 규칙
-- `docs/ARCHITECTURE.md`: 제품 동작을 보장할 시스템 구조와 기술 결정
-- `docs/requirements/*.md`: 새 기능이나 정책 변경이 있을 때 작성하는 Requirement
-- `AGENTS.md`: 프로젝트별 AI 작업 규칙이 필요하면 공통 규칙을 유지한 채 추가
+Specification Skill로 역할에 맞는 초안을 작성하고 누락된 조건을 확인할 수 있다. 작성이 끝나면 commit·push한다. Loop Manager는 최신 원격 base만 입력으로 사용하므로 로컬 전용 파일·commit은 자동 작업에 포함되지 않는다.
 
-`PRODUCT.md`와 Requirement 중 하나 이상은 반드시 있어야 한다. 초기 제품은 `PRODUCT.md`로 정의하고, 운영 중 변경은 `REQUIREMENT.template.md`를 복사해 Requirement로 작성한다. Requirement는 별도 상태나 frontmatter 없이 작성하며 `docs/requirements/` 바로 아래에 둔 모든 문서가 Planner 입력이 된다.
-
-Specification Skill을 사용하면 템플릿을 바탕으로 초안을 작성하고 누락된 흐름이나 조건을 함께 확인할 수 있다.
-
-문서 작성이 끝나면 변경사항을 commit하고 push한다. Loop Manager는 최신 원격 branch만 자동 작업의 입력으로 사용하므로 local-only 파일과 commit은 그대로 보존되지만 계획과 구현에는 포함되지 않는다. 기본 worktree가 clean한 저장 base branch이고 원격과 같거나 behind-only이면 fetch 직후 안전하게 fast-forward하며, dirty·staged·untracked, ahead·diverged, detached, 다른 branch, 진행 중 Git operation 또는 ignored 경로 충돌이면 동기화만 건너뛰고 원격 SHA 기반 작업은 계속한다.
-
-### 3. 실행 환경과 Loop Manager 설정
-
-저장소를 받은 뒤 한 번만 환경 준비 스크립트를 실행한다. 기존 `.venv`가 있으면 재사용하고 `requirements.txt`의 패키지만 설치한다.
+### 3. 환경과 설정 준비
 
 ```powershell
 pwsh -NoProfile -File scripts/setup.ps1
-```
-
-```sh
-bash scripts/setup.sh
-```
-
-현재 최소 실행기는 외부 Python 패키지를 사용하지 않으므로 `requirements.txt`에는 의존성이 없다. 이후 패키지가 추가돼도 같은 스크립트를 다시 실행하면 된다.
-
-`config/config.ini.example`을 `config/config.ini`로 복사한 뒤 Codex와 Claude Code의 AI Agent 모델, Telegram 설정과 동시 실행 수를 입력한다. `max_workers` 기본값은 3이다. 전체 verify의 `verify_timeout_seconds` 기본값은 600초이며, 필요한 검증이 정상 진행 중인데 상한이 부족하면 `[loop]`에서 늘릴 수 있다.
-
-```powershell
 Copy-Item -LiteralPath config/config.ini.example -Destination config/config.ini
 ```
 
 ```sh
+bash scripts/setup.sh
 cp config/config.ini.example config/config.ini
 ```
 
-실제 `config.ini`는 향후 Telegram token을 포함할 수 있으므로 Git에 커밋하지 않는다. 작업 상태와 PR 정보는 source checkout 밖의 운영체제 사용자 상태 디렉터리에 있는 SQLite에 저장한다.
+setup은 기존 `.venv`를 재사용하고 `requirements.txt`의 패키지를 설치한다. 현재 외부 Python 의존성은 없으며 나중에 추가되면 같은 스크립트를 다시 실행한다.
 
-일반 실행 중 SQLite가 없거나 손상되면 자동으로 새 상태를 만들지 않고 중단한다. 상태 디렉터리를 백업해두고, 필요할 때 백업을 복원하거나 손상된 DB를 별도로 보관한 뒤 `config init`으로 다시 만든다.
+`config/config.ini`에 모델·Effort, Telegram과 동시 실행 수를 설정한다. `max_workers` 기본값은 3, 전체 verify의 `verify_timeout_seconds`는 600초다. 검증이 정상 진행 중인데 상한이 부족한 경우 `[loop]`에서 조정한다.
 
-### 4. 초기화 및 반복 실행 설정
+실제 config에는 비밀값이 들어갈 수 있으므로 Git에 commit하지 않는다. 상태·PR·session은 source checkout 밖 사용자 상태 디렉터리의 SQLite에 저장한다. 상태 디렉터리는 백업해 둔다.
 
-상태 DB 초기화와 프로젝트 등록은 명시적인 `config` 하위 명령에서만 수행한다. 프로젝트 추가 시 GitHub origin과 기준 branch를 fetch한 뒤 해당 원격 commit tree의 필수 문서와 공통 파일, 선택 provider를 검증한다. 기본 worktree에서만 추가·수정·삭제한 파일은 등록 결과에 영향을 주지 않는다. 공통 `AGENTS.md`가 포함되지 않은 원격 blob은 거부하며, 내용을 확인한 경우에만 `--approve-agents-mismatch`로 그 blob 해시에 결합된 승인을 저장할 수 있다.
-
-Planner가 만든 ExecPlan은 검증 후 대상 저장소의 base branch에 fast-forward push된다. 따라서 해당 branch는 Loop Manager 계정의 직접 push를 허용해야 한다. 이후 구현은 `loop-manager/<execplan-id>` branch에서 진행되고 PR로 제출된다.
-
-상태 DB를 한 번 초기화한다.
+### 4. 상태 초기화와 프로젝트 등록
 
 ```powershell
 & .\.venv\Scripts\python.exe loop_manager.py config init
-```
-
-```sh
-.venv/bin/python loop_manager.py config init
-```
-
-대상 프로젝트를 등록하고 필요하면 목록을 확인한다. provider를 생략하면 `codex`를 사용한다.
-
-```powershell
 & .\.venv\Scripts\python.exe loop_manager.py config add D:\repo\my-project --provider claude
 & .\.venv\Scripts\python.exe loop_manager.py config list
 ```
 
 ```sh
-.venv/bin/python loop_manager.py config add /path/to/project
+.venv/bin/python loop_manager.py config init
+.venv/bin/python loop_manager.py config add /path/to/project --provider claude
 .venv/bin/python loop_manager.py config list
 ```
 
-진행 중인 ExecPlan이나 해결되지 않은 `planning_error`가 없는 프로젝트는 `config remove <path>`로 등록만 해제할 수 있다. 프로젝트 파일, branch, worktree, PR과 MERGED 감사 이력은 삭제하지 않는다.
+init은 한 번 실행하고 프로젝트마다 add한다. provider를 생략하면 codex를 사용한다. 등록 검사는 fetch한 원격 base의 필수 문서·공통 파일·provider를 기준으로 하며 로컬 전용 편집은 반영하지 않는다.
 
-그다음 저장소 인자 없이 반복 실행한다. 실행기는 registry에 저장된 프로젝트를 결정적 순서로 제출하고 `max_workers` 한도에서 서로 다른 프로젝트를 병렬 처리한다. 프로젝트마다 독립된 SQLite 연결을 사용하며, 같은 프로젝트의 작업은 하나만 진행하고 Planner 호출은 전체 프로세스에서 하나씩 실행한다. 한 프로젝트가 차단되거나 일시 실패해도 나머지 프로젝트 처리는 계속된다.
+공통 AGENTS 내용이 없으면 등록을 거부한다. 파일 내용을 확인한 경우에만 `--approve-agents-mismatch`로 해당 blob 해시에 결합된 승인을 저장할 수 있다. 진행 중인 계획·프로젝트 차단·미해결 planning 오류가 없으면 `config remove <path>`로 등록만 해제하며 파일·branch·worktree·PR·MERGED 감사는 보존한다.
+
+Planner는 검증된 계획을 base branch에 fast-forward push하므로 Loop Manager 계정의 직접 push가 허용돼야 한다. 구현은 `loop-manager/<execplan-id>` branch에서 진행하고 PR로 제출한다.
+
+### 5. 실행과 외부 스케줄러 등록
 
 ```powershell
 & .\.venv\Scripts\python.exe loop_manager.py run
@@ -122,25 +83,30 @@ Planner가 만든 ExecPlan은 검증 후 대상 저장소의 base branch에 fast
 .venv/bin/python loop_manager.py run
 ```
 
-PR을 생성하면 Merge될 때까지 같은 프로젝트의 새 작업을 시작하지 않으며, 현재 기준 commit에서 할 일이 없다고 판단한 뒤에는 입력이 바뀔 때까지 Agent를 다시 호출하지 않는다. 서버에는 Python 3, Git, GitHub CLI와 프로젝트에서 선택한 인증된 Codex 또는 Claude Code CLI가 필요하다.
+저장소 인자 없이 등록된 프로젝트를 처리한다. 한 프로젝트의 차단·일시 실패는 다른 프로젝트를 막지 않는다. 안정된 열린 PR이나 계획별 차단이 있어도 독립 READY는 처리할 수 있으며, 의존 작업은 선행 PR Merge를 기다린다. 같은 성공 입력에서 할 일이 없으면 Agent를 반복 호출하지 않는다.
 
-cron 또는 작업 스케줄러에는 정상적인 중복 실행을 조용히 건너뛰도록 `.venv/bin/python loop_manager.py run --skip-if-running`을 등록한다. source checkout의 Python bootstrap이 먼저 전역 잠금을 획득하고 `origin/main`의 exact SHA를 `<state-dir>` 아래 detached runtime worktree로 선택한 뒤, 같은 Python interpreter와 source 기준의 절대 config 경로로 runtime 자식을 실행한다. source checkout의 local `main`, 미commit 변경과 local-only commit은 실행 revision에 포함하거나 자동 갱신하지 않는다. 이 옵션이 없으면 전역 잠금 충돌은 시각이 포함된 오류와 종료 코드 1로 보고되며 잠금 이외의 오류는 그대로 보고된다.
+cron 또는 Windows 작업 스케줄러에는 `run --skip-if-running`을 등록한다. 정상적인 중복 실행은 조용히 건너뛴다. 옵션 없이 전역 lock이 충돌하면 시각이 포함된 오류와 종료 코드 1을 반환하며, lock 외 오류는 그대로 보고한다.
 
-### 5. Pull Request 검토
+bootstrap은 최신 `origin/main`의 정확한 SHA에서 runtime을 실행한다. source checkout의 로컬 main·미커밋 변경·로컬 전용 commit은 실행 revision이 아니다. 기본 프로젝트 checkout은 안전한 경우에만 fast-forward하고 그 밖의 로컬 상태는 보존한다. [실행·동기화 구조](docs/ARCHITECTURE.md#git과-worktree-실행-모델)
 
-최소 실행기는 생성한 PR URL을 표준 출력에 표시한다. 사용자는 PR을 검토하고 Merge하며, 열린 동안에는 다음 실행도 같은 PR을 기다린다. PR을 Merge하지 않고 닫았다면 같은 PR을 다시 열어야 한다.
+## 실행 후 사용자가 할 일
 
-GitHub가 Merge를 확인하면 PR head commit을 기준으로 로컬 전용 commit이 없는 깨끗한 관리 worktree를 Merge, Squash, Rebase 방식과 관계없이 자동 정리한다. 미커밋 변경, PR에 포함되지 않은 로컬 commit 또는 commit 관계를 확인할 수 없는 worktree는 삭제하지 않고 `cleanup_pending`에 경로와 원인을 기록한다. 이 경고는 다음 작업이나 프로젝트 완료를 막지 않으며, 이후 실행에서 안전 조건이 충족되거나 경로가 사라지면 자동으로 해제된다.
+| 상황 | 조치 |
+|---|---|
+| PR 생성 | 출력·Telegram의 링크로 검토하고 Merge한다. Merge 없이 닫았으면 같은 PR을 다시 연다. |
+| 차단 | 안내된 원인·보존 경로를 확인하고 필요한 문서·사용자 결정 또는 작업물을 수정한다. 원격 입력 변경은 commit·push한다. |
+| SQLite 없음·손상 | 일반 run은 자동 초기화하지 않는다. 백업을 복원하거나 손상 DB를 별도로 보관한 뒤 명시적으로 config init·재등록한다. |
+| cleanup_pending | 미커밋·미게시 작업 또는 불확실한 worktree가 보존돼 있다. 안전 조건 충족·경로 부재 시 자동 해제되며 다음 작업·완료를 막지 않는다. |
 
-## 사용자가 직접 작성하지 않는 항목
+정상 실행에서는 코드·테스트·ExecPlan·SQLite 상태를 직접 작성할 필요가 없다. Planner가 계획을 만들고 Worker가 구현·targeted test·verify 스크립트를 준비한다. 전체 verify는 Manager가 실행하고 실패 출력만 Worker에게 전달한다. Reviewer는 읽기 전용으로 검토하고 사용자가 PR을 Merge한다.
 
-- `docs/PLANS.md`와 `docs/*.template.md`는 복사된 공통 파일을 그대로 사용한다.
-- `docs/plans/*.md`의 ExecPlan은 Planner가 생성한다.
-- 현재 작업 phase, branch, worktree와 PR은 Loop Manager의 SQLite가 관리한다.
-- Worker가 기능을 구현하고 관련 테스트를 작성한다.
-- Worker가 프로젝트에 맞는 `scripts/verify.ps1` 또는 `scripts/verify.sh`를 생성하고 유지한다.
-- Worker는 전체 검증 스크립트를 직접 실행하지 않는다.
-- Loop Manager가 전체 검증을 실행하고 실패 출력만 Worker에게 전달한 뒤 읽기 전용 Reviewer와 Pull Request 생성을 진행한다.
-- worktree, branch와 현재 작업 상태는 Loop Manager가 관리한다.
+Merge 확인 뒤 worktree가 clean하고 PR head에 없는 로컬 commit이 없으면 Merge·Squash·Rebase 방식과 관계없이 정리한다. 안전성을 확인할 수 없는 작업 공간은 보존한다.
 
-일반적인 실행 중에는 사용자가 코드, 테스트, ExecPlan이나 SQLite 상태를 수정할 필요가 없다. 단, BLOCKED 원인을 해소할 때는 ExecPlan 또는 제품 문서를 수정할 수 있다.
+## 상세 기준
+
+- 제품 동작·상태·완료 조건: [PRODUCT.md](docs/PRODUCT.md)
+- 책임·저장·실행 격리·복구: [ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- 공통 ExecPlan 형식: [PLANS.md](docs/PLANS.md)
+- 문서 작성·검토: [Specification Skill](.agents/skills/specification-docs/SKILL.md)
+
+PLANS와 템플릿은 복사된 공통 파일을 사용한다. 계획별 phase·branch·worktree·PR·재시도는 Manager가 SQLite에서 관리한다.

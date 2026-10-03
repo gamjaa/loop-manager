@@ -4,7 +4,7 @@
 
 Loop Manager는 현재 source checkout과 분리된 exact `origin/main` SHA의 detached runtime worktree에서 실행된다. 등록된 self 프로젝트의 base branch는 현재 `main`이지만 앞으로 `develop` 등 다른 branch가 될 수 있으므로, 이 변경의 PR 동기화·source checkout 갱신·runtime handoff는 `main`을 상수로 사용하지 않고 등록 상태에서 해석한 하나의 `<base-branch>`와 `origin/<base-branch>`를 끝까지 사용해야 한다.
 
-현재 bootstrap은 source checkout의 프로그램 revision으로 시작한 뒤 최신 원격 SHA를 fetch해 그 SHA의 runtime 자식을 바로 실행한다. 이 방식은 runtime은 최신이어도 runtime을 선택하고 process lock과 인자를 소유한 bootstrap은 이전 revision일 수 있다. self 저장소의 새 프로그램이 이미 Merge된 다음 실행이라면 PR 상태를 확인하기 전에 bootstrap 자체를 먼저 최신 revision으로 넘겨야 한다.
+현재 bootstrap은 source checkout의 프로그램 revision으로 시작한 뒤 최신 원격 SHA를 fetch해 그 SHA의 runtime 자식을 바로 실행한다. 이 방식은 runtime은 최신이어도 runtime을 선택하고 process lock과 인자를 소유한 bootstrap은 이전 revision일 수 있다. 최신 원격 bootstrap으로 실행을 넘기되, 로컬 source를 먼저 갱신해야만 실행할 수 있다는 기존 요청은 R-056의 비차단 원격 기준으로 대체한다. 로컬 동기화는 R-056, 작업 branch 통합·원격 보존은 R-060, 역할별 문서 권한은 R-061을 따른다.
 
 현재 프로젝트 실행 경로는 저장된 project mirror가 `PR_OPEN`이거나 충돌 복구 marker를 가지고 있으면 GitHub의 실제 PR 상태를 확인하기 전에 기본 worktree 동기화를 건너뛴다. 이 때문에 이미 Merge된 PR도 한 주기 동안 `PR 충돌 감지/복구 중`으로 기록되고, Merge commit을 포함한 원격 base로 source checkout을 갱신할 기회를 놓친 뒤에야 SQLite를 `MERGED`로 전환한다. 여러 `PR_OPEN`을 보존하는 실행 모델에서는 하나의 PR이 Merge됐어도 다른 대기 상태나 낡은 project mirror가 같은 false skip을 만들 수 있다.
 
@@ -14,17 +14,17 @@ Loop Manager 저장소 자체를 등록 프로젝트로 운영할 때는 영향�
 
 ## Requirement
 
-bootstrap은 process lock을 획득한 뒤 runtime worktree를 선택·생성하거나 runtime 자식 및 프로젝트 PR 동기화를 시작하기 전에 self `<base-branch>`를 해석하고 `origin/<base-branch>`를 fetch해야 한다. source checkout의 commit이 fetch된 원격 base와 같으면 staged·unstaged·untracked·ignored 변경의 유무와 관계없이 source는 이미 최신이므로 해당 SHA의 runtime을 선택해 자식을 시작한다. source commit이 원격 base의 조상이라면 dirty non-overlap 허용 규칙으로 source checkout을 safe fast-forward하고, 성공 사실을 기록한 뒤 runtime 자식을 시작하지 않은 채 정상 종료한다. 다음 외부 스케줄 실행은 갱신된 source bootstrap으로 다시 시작한다.
+bootstrap은 process lock을 획득한 뒤 runtime worktree를 선택·생성하거나 runtime 자식 및 프로젝트 PR 동기화를 시작하기 전에 self `<base-branch>`를 해석하고 `origin/<base-branch>`를 fetch해야 한다. 최신으로 검증한 원격 revision의 bootstrap·runtime으로 실행을 넘기며, source checkout의 commit·파일·동기화 성공은 그 revision의 선택과 실행 조건으로 사용하지 않는다. source에 있는 로컬 전용 코드·문서는 자동 실행 입력에 포함하지 않는다.
 
-source bootstrap이 원격 base보다 뒤처졌지만 overlap dirty, ahead·diverged, 다른 branch, Git operation, 동시 변경 또는 Git 거부 때문에 safe fast-forward할 수 없으면 구 bootstrap으로 최신 runtime을 실행하지 않는다. reset, stash, autostash, rebase 또는 강제 checkout 없이 source를 보존하고 명확한 진단과 0이 아닌 종료 상태를 남긴다. runtime 자식이 시작될 때는 source bootstrap commit, runtime SHA와 fetch된 `origin/<base-branch>` SHA가 모두 같아야 한다.
+source bootstrap이 원격 base보다 뒤처졌거나 로컬 동기화를 할 수 없어도 검증한 원격 bootstrap·runtime을 실행할 수 있어야 한다. 원격 실행 revision·소유권 자체를 확인할 수 없는 오류는 상태를 보존해 재시도하며, 로컬 갱신 실패와 구분한다. 원격 실행 코드와 fetch된 원격 SHA는 일치해야 하지만 source checkout의 HEAD까지 일치하도록 요구하지 않는다.
 
 Loop Manager는 각 프로젝트의 기본 worktree 동기화 여부를 결정하기 전에 저장된 모든 Merge 대기 PR의 실제 GitHub state, Merge 여부와 identity를 동기화해야 한다. Merge 또는 Close로 종료된 PR의 상태 전이, worktree cleanup 판정과 알림 outbox 기록을 먼저 영속화하고, 갱신된 ExecPlan 및 project 상태를 다시 읽은 뒤 기본 worktree의 safe fast-forward를 평가해야 한다.
 
 같은 실행에서 하나 이상의 PR Merge를 새로 확인했다면 낡은 `PR_OPEN` project mirror, 이미 종료된 PR 또는 별도의 안정된 `PR_OPEN`이 존재한다는 이유만으로 기본 worktree 동기화를 생략하지 않는다. fetch된 `origin/<base-branch>`를 기준으로 safe fast-forward eligibility를 반드시 평가한다. 기본 worktree가 dirty라는 사실만으로도 동기화를 생략하지 않는다. 현재 checkout이 해석한 base branch이고 local `HEAD`가 원격 base의 조상이며 진행 중인 Git operation이 없고, staged·unstaged·untracked·ignored를 포함한 모든 로컬 변경 경로가 fast-forward로 바뀌는 tracked 경로와 부모·자식 관계까지 겹치지 않으면 로컬 변경을 유지한 채 `git merge --ff-only origin/<base-branch>`와 동등한 갱신을 허용한다.
 
-로컬 변경 경로와 원격 변경 경로가 겹치거나 eligibility 확인 뒤 checkout이 바뀌거나 Git이 fast-forward를 거부하면 reset, clean, stash, autostash, 강제 checkout 또는 source checkout rebase 없이 기존 checkout을 보존하고 실제 이유를 기록한다. local base가 ahead·diverged인 경우도 사용자 commit을 자동 rebase하지 않는다. 최신 bootstrap으로 runtime 자식이 이미 시작된 뒤에는 Planner·Worker와 PR 충돌 복구가 source checkout의 파일·index·dirty 상태가 아니라 clean한 `origin/<base-branch>` 기반의 별도 관리 worktree를 사용하므로, 이후 source checkout sync를 건너뛰었다는 이유만으로 관리 worktree의 생성·재개·rebase·검증을 막지 않는다. 시작 시 source bootstrap 자체가 원격보다 뒤처진 경우에는 위 freshness gate가 우선한다.
+로컬 동기화는 R-056의 equal·ahead·behind·diverged 처리와 사용자 작업 보존 조건을 적용한다. 겹치는 변경·사용자 operation·동시 수정 등으로 안전하게 처리할 수 없으면 기존 checkout을 보존하고 실제 skip 이유를 기록한다. 이 실패나 skip은 검증한 원격 bootstrap·runtime 또는 관리 worktree의 생성·재개·rebase·검증을 막지 않는다.
 
-bootstrap/source checkout의 HEAD·index·tracked·untracked·ignored 파일 상태는 Planner·Worker·Reviewer가 소유하는 관리 worktree 변경 범위가 아니다. source가 dirty하다는 사실이나 Agent 실행 중 그 local 상태가 바뀌었다는 사실만으로 Agent Git 범위 위반 또는 `PROJECT_BLOCKED`를 만들지 않으며, source의 local 상태는 bootstrap freshness gate와 기본 worktree safe fast-forward 판단에서만 평가한다. self bootstrap이 원격보다 뒤처진 경우에는 실제 safe fast-forward가 로컬 상태를 보존하며 성공할 수 있는지가 실행 허용 조건이고, 이미 같은 원격 revision이면 pull이나 파일 상태 정리를 요구하지 않는다.
+bootstrap/source checkout의 HEAD·index·tracked·untracked·ignored 파일 상태는 Planner·Worker·Reviewer가 소유하는 관리 worktree 변경 범위가 아니다. source가 dirty하거나 Agent 실행 중 local 상태가 바뀌었다는 사실만으로 Agent Git 범위 위반 또는 `PROJECT_BLOCKED`를 만들지 않는다. 그 상태는 R-056의 부수적인 로컬 동기화 판단에만 사용하며 자동 작업 입력·실행·차단 해제 조건에서 제외한다.
 
 모든 등록 프로젝트의 Agent Git 범위 판정은 현재 단계의 안전에 필요한 최소 상태만 대상으로 한다. 선택된 관리 worktree의 identity·등록·branch·HEAD·index·허용 파일 변경과 현재 작업이 실제로 사용하는 소유 branch, 원격 base ref, 게시 원격 ref·PR head, 해당 Git 작업에 영향을 주는 config·operation을 검증한다. 사용하지 않는 다른 branch·tag·ref와 다른 worktree의 독립적인 등록·HEAD·index·파일 변화는 Agent 변경으로 귀속하거나 `PLAN_BLOCKED`·`PROJECT_BLOCKED`의 단독 원인으로 삼지 않는다. 해당 자원을 나중에 사용하게 되면 사용 직전에 실제 값과 소유권을 확인한다. 검증된 원격 base 전진은 기존 fetch·rebase·재검증 흐름으로 처리한다. 그 밖에 현재 작업에 영향을 미치는 예상 밖 변화 또는 영향 여부를 증명할 수 없는 변화는 계속 안전 차단한다.
 
@@ -42,7 +42,7 @@ Codex와 Claude의 자동 승인 검토는 쓰기 제한과 함께 유지한다.
 
 Loop Manager 자신이 process lock 아래 수행한 fetch, 관리 worktree 생성·정리·rebase, source safe fast-forward와 runtime worktree 생성·정리는 각 작업의 소유 대상, 실행 전 기대 상태와 실행 뒤 실제 결과를 연결한 durable checkpoint로 증명한다. Agent 시작 snapshot 이후 Manager 작업이 있었다면, 해당 checkpoint와 실제 Git 상태가 정확히 일치하는 부분만 Agent 범위 판정 전에 기준선에 반영한다. Agent의 원래 허용 파일 변경과 session·실행 증거는 보존하며, 불완전한 checkpoint나 관측 OID만으로 Manager 소유권을 추정하지 않는다. Git 작업과 상태 저장 사이에 중단돼도 같은 증거로 재개하고, 다른 주체의 변화가 섞였으면 영향을 받는 작업을 차단한다.
 
-저장된 `PLAN_BLOCKED`·`PROJECT_BLOCKED`의 원인이 격리가 증명된 실행의 무관한 변화 또는 증명된 Manager 작업의 낡은 기준선뿐이라면, 선택된 관리 worktree의 identity·소유권·허용 변경과 사용 중인 ref·Git 상태를 다시 확인한 뒤 해당 차단을 해제하고 안전한 현재 기준으로 재조정한다. 기존 Agent session·작업물과 다른 계획의 차단 원인은 보존하고, 후보 revision이 달라졌다면 필요한 targeted test·전체 verify·Review를 다시 수행한다. 증거가 부족하거나 현재 작업에 영향을 주는 변화가 남으면 차단을 유지한다. source가 원격보다 뒤처졌는지와 dirty 때문에 fast-forward가 불가능한지는 차단 해제 뒤 bootstrap freshness 또는 일반 source sync 단계에서 독립적으로 판정한다.
+저장된 `PLAN_BLOCKED`·`PROJECT_BLOCKED`의 원인이 격리가 증명된 실행의 무관한 변화 또는 증명된 Manager 작업의 낡은 기준선뿐이라면, 선택된 관리 worktree의 identity·소유권·허용 변경과 사용 중인 ref·Git 상태를 다시 확인한 뒤 해당 차단을 해제하고 안전한 현재 기준으로 재조정한다. 기존 Agent session·작업물과 다른 계획의 차단 원인은 보존하고, 후보 revision이 달라졌다면 필요한 targeted test·전체 verify·Review를 다시 수행한다. 증거가 부족하거나 현재 작업에 영향을 주는 변화가 남으면 차단을 유지한다. source가 원격보다 뒤처지거나 로컬 동기화가 실패했다는 이유를 차단 해제의 별도 gate로 남기지 않는다.
 
 runtime 자식은 bootstrap이 전달하고 검증한 canonical source checkout, 현재 runtime SHA, repository identity와 origin을 이용해 등록 프로젝트가 실행 중인 Loop Manager 자신인지 결정해야 한다. 자기 자신으로 인정하려면 등록된 canonical repository path가 runtime source와 같고 실제 Git repository 및 origin identity도 일치해야 한다. 디렉터리 이름, 프로젝트 표시명, 원격 저장소 이름 또는 경로 prefix만으로 자기 자신으로 판단하지 않는다.
 
@@ -59,17 +59,15 @@ self runtime handoff 판정은 같은 실행에서 병렬 프로젝트 작업을
 ## Acceptance Criteria
 
 - bootstrap은 process lock을 획득한 뒤 runtime worktree 선택·생성, runtime 자식 시작과 프로젝트 PR 조회보다 먼저 self `<base-branch>`를 해석하고 `origin/<base-branch>`를 fetch한다.
-- source bootstrap commit과 fetch된 원격 base SHA가 같을 때만 같은 SHA의 clean detached runtime 자식을 시작하며, 자식 시작 시 세 revision이 정확히 일치한다.
-- source bootstrap commit이 fetch된 원격 base SHA와 같으면 source checkout에 staged·unstaged·untracked 또는 ignored 변경이 있어도 정리나 pull을 요구하지 않고 같은 SHA의 runtime 자식을 시작한다.
-- source bootstrap commit이 원격 base의 조상이고 safe fast-forward가 가능하면 non-overlap dirty 변경을 보존해 source를 갱신하고 성공 종료하며, runtime worktree나 자식을 만들거나 PR Merge 상태를 조회하지 않는다.
-- source bootstrap이 뒤처졌지만 overlap dirty, ahead·diverged, 다른 branch, Git operation, 동시 변경 또는 Git 거부로 갱신할 수 없으면 사용자 상태를 보존하고 0이 아닌 코드로 종료하며 최신 runtime 자식을 시작하지 않는다.
-- source를 갱신해 종료한 다음 외부 실행은 갱신된 bootstrap으로 같은 원격 SHA의 runtime을 시작한 뒤에만 저장된 PR Merge 상태를 동기화한다.
+- bootstrap·runtime의 원격 실행 revision과 검증한 원격 SHA가 일치한다. source checkout의 HEAD 일치나 동기화 성공을 자식 실행 조건으로 요구하지 않는다.
+- source checkout의 equal·behind·ahead·diverged·dirty·다른 branch 상태에서도 사용할 원격 revision이 검증되면 원격 bootstrap·runtime 실행과 PR 상태 조회가 진행된다. 로컬 전용 코드·문서는 실행 입력으로 사용하지 않는다.
+- 안전한 로컬 fast-forward·rebase 또는 그 실패·skip은 R-056대로 처리하며, 사용자 작업을 보존하고 원격 기준 실행을 막지 않는다. 기본 checkout을 정리하거나 로컬 갱신만을 위해 다음 외부 실행을 기다리도록 요구하지 않는다.
 - 저장 상태가 `PR_OPEN`인 PR이 GitHub에서 이미 Merge된 실행에서 PR 상태 동기화와 `MERGED` 전이, cleanup 판정 및 알림 outbox 기록이 기본 worktree skip 판정보다 먼저 완료된다.
 - 새 Merge가 확인된 실행은 남아 있는 다른 안정된 `PR_OPEN`이나 낡은 project mirror 때문에 `PR 충돌 감지/복구 중 source checkout 보존`으로 분류되지 않고, fetch된 `origin/<base-branch>`에 대해 safe fast-forward eligibility를 평가한다.
 - Merge 뒤 기본 worktree가 clean한 저장 base branch의 behind-only 상태이면 같은 실행에서 정확한 `origin/<base-branch>`로 fast-forward된다.
 - 기본 worktree에 staged·unstaged·untracked 또는 ignored 변경이 있어도 모든 로컬 변경 경로가 원격 fast-forward 변경 경로와 부모·자식 관계까지 겹치지 않으면 local delta와 파일 내용을 보존한 채 fast-forward한다.
-- 로컬과 원격 변경 경로가 겹치거나 다른 branch·detached·ahead·diverged·Git operation·동시 변경 또는 Git 거부가 있으면 reset·stash·autostash·source rebase 없이 보존하고 실제 skip 이유를 기록한다.
-- source bootstrap과 원격 base가 같은 revision으로 runtime 자식이 시작된 뒤의 source checkout dirty 또는 sync skip은 clean한 `origin/<base-branch>`에서 수행하는 Planner·Worker workspace 생성, 기존 workspace 재개, PR conflict rebase와 검증을 막지 않는다.
+- 로컬 변경과 충돌하거나 소유권·동시 변경 때문에 안전한 동기화가 불가능하면 보존·skip 이유를 기록한다. ahead-only는 보존하고, 안전한 diverged의 로컬 commit rebase는 R-056에 한해서 허용하며 reset·stash·autostash·강제 checkout은 수행하지 않는다.
+- source checkout의 dirty·sync skip·HEAD 차이는 검증한 `origin/<base-branch>`에서 수행하는 Planner·Worker workspace 생성, 기존 workspace 재개, PR conflict rebase와 검증을 막지 않는다.
 - Planner·Worker·Reviewer 실행 전후 bootstrap/default worktree의 HEAD·index·파일·dirty 상태만 달라진 경우 이를 해당 Agent의 변경으로 귀속하거나 `PROJECT_BLOCKED`를 만들지 않는다.
 - 선택된 관리 worktree와 현재 단계가 실제로 사용하는 ref·worktree·Git config·operation만 Agent 범위와 Git 작업 직전 안전 검사의 대상으로 삼는다. 실행과 무관한 `draft` 등 다른 local branch·tag·ref 또는 다른 worktree의 독립적인 변동만으로 Agent 범위 위반이나 프로젝트 차단을 만들지 않는다. 사용하게 되는 자원은 사용 직전에 다시 검증한다.
 - 사용자가 Worker 실행 중 `<base-branch>`에 문서 또는 코드 commit을 직접 push하고 원격 base가 전진해도, 확인된 외부 변경을 Worker 범위 위반으로 차단하지 않는다. Manager는 기존 작업물과 session을 보존해 최신 base에 rebase하고 변경된 후보의 필요한 Worker 확인·targeted test·전체 verify·Review를 거친다. 같은 시점의 실제 Agent 공유 ref 변경이나 증명되지 않은 Git 변화는 이 예외로 해제하지 않는다.
@@ -95,10 +93,10 @@ self runtime handoff 판정은 같은 실행에서 병렬 프로젝트 작업을
 ## Product Impact
 
 - PR의 실제 완료 상태가 source checkout 동기화 판단보다 먼저 반영되며, 종료된 PR의 낡은 상태 때문에 기본 worktree 갱신이 불필요하게 지연되지 않는다.
-- source bootstrap이 원격 base보다 뒤처졌으면 source를 안전하게 갱신하고 현재 실행을 끝내며, 최신 runtime은 다음 외부 실행에서 같은 revision의 최신 bootstrap만 시작한다.
+- source bootstrap이 뒤처져도 검증한 최신 원격 bootstrap·runtime으로 실행을 넘기고, 로컬 동기화는 실행과 분리한다.
 - Loop Manager가 자기 저장소의 PR Merge를 새로 확인하면 해석한 `origin/<base-branch>`를 가져오고, 현재 runtime보다 새로운 경우에만 현재 실행을 끝내 다음 외부 실행에 제어를 넘긴다.
 - non-overlap dirty source checkout은 로컬 변경을 유지한 채 원격 base로 전진할 수 있다.
-- 최신 bootstrap으로 runtime이 이미 시작된 뒤 source checkout을 갱신할 수 없는 로컬 상태는 관리 worktree 작업을 막지 않는다. 시작 시 bootstrap이 원격보다 뒤처졌다면 갱신되기 전까지 runtime 자식을 시작하지 않는다.
+- source checkout을 갱신할 수 없는 로컬 상태는 시작·복구 시점 모두 원격 bootstrap·runtime과 관리 worktree 작업을 막지 않는다.
 - bootstrap이 이미 원격 base revision이면 dirty 상태를 정리하지 않고 실행하며, Agent 실행 중 bootstrap 파일 상태가 바뀌어도 관리 worktree 위반으로 오인하거나 과거 signature에 프로젝트를 영구 차단하지 않는다.
 - Agent 범위 검사는 현재 계획의 안전에 필요한 Git 상태로 제한된다. 무관한 branch·worktree 변화는 실행을 막지 않고, Manager 소유 Git 작업은 검증된 checkpoint로 재개되며, 실제 영향권 위반은 계속 차단된다.
 - provider의 내장 workspace 쓰기 제한과 자동 승인 검토를 함께 사용한다. 격리 밖 쓰기 권한을 자동 승인하지 않으며, 지원하지 않거나 확인할 수 없는 환경에서는 상태를 보존하고 자동 실행을 멈춘다.
@@ -107,7 +105,7 @@ self runtime handoff 판정은 같은 실행에서 병렬 프로젝트 작업을
 
 - 현재 프로세스 안에서 runtime module을 hot reload하거나 새 runtime 자식을 재귀적으로 시작하지 않는다.
 - overlap dirty, ahead, diverged, 다른 branch 또는 소유권 불명의 source checkout을 강제로 최신화하지 않는다.
-- source checkout의 사용자 commit이나 dirty 변경을 자동 rebase, stash 또는 autostash하지 않는다.
+- R-056이 허용한 안전한 diverged 로컬 commit rebase 외에 source를 강제 갱신하지 않는다. dirty 변경의 자동 stash·autostash는 수행하지 않는다.
 - 저장소 이름이나 GitHub URL만으로 임의의 clone을 현재 bootstrap source와 동일한 checkout으로 신뢰하지 않는다.
 - 기존 PR 충돌 복구의 rebase, force-with-lease, branch 소유권 또는 Agent 권한을 확대하지 않는다.
 - runtime refresh를 이유로 영속화되지 않은 작업을 폐기하거나 관리 worktree, Agent session, retry history를 정리하지 않는다.

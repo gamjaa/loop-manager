@@ -16,7 +16,13 @@
 
 ## Planner 변경 범위
 
-일반 Planner는 새 `docs/plans/*.md`를 생성하고, 현재 PRODUCT/Requirement 범위 밖이지만 보존 가치가 있는 아이디어만 `docs/FUTURE_IDEAS.md`에 생성하거나 수정할 수 있다. 기존 ExecPlan을 수정·삭제·이름 변경하거나 그 밖의 파일을 변경하지 않는다.
+상태·소유권과 실행 mode는 프로그램이 제공한 snapshot과 역할별 지침을 기준으로 판단한다.
+
+일반 Planner는 새 `docs/plans/*.md`를 생성하고, 현재 PRODUCT/Requirement 범위 밖이지만 보존 가치가 있는 아이디어만 `docs/FUTURE_IDEAS.md`에 생성하거나 수정할 수 있다.
+
+예외적으로 프로그램이 SQLite 상태와 Git revision에 결합된 mutable READY snapshot을 제공한 경우에만 snapshot 안의 미착수 READY ExecPlan을 같은 ID로 수정·이름 변경·삭제할 수 있다. snapshot 원본과 현재 content hash·revision·무소유 상태가 일치해야 하며, snapshot 밖의 기존 ExecPlan·실행된 계획·MERGED·archive 계획과 앞에서 허용한 파일 외의 파일은 변경하지 않는다.
+
+코드·설계·계획 변경으로 다른 ExecPlan의 경로·구현·검증·dependency가 영향을 받으면, Planner는 허용된 snapshot 안의 해당 계획도 함께 개정한다. 관련성이 있다는 이유로 snapshot 밖의 계획이나 실행 이력의 변경 권한을 확대하지 않는다.
 
 예외적으로 프로그램이 SQLite의 활성 유지보수 주기에서 현재 단계를 `barrier` 또는 `post-refactor revalidation` mode로 지정하고 대상 snapshot을 제공한 경우에만 유지보수 Planner가 기존 ExecPlan을 개정할 수 있다. 대상은 SQLite 상태가 `READY`이고 branch, worktree, workspace reservation, Worker·Reviewer session과 PR이 없는 계획으로 제한한다. 저장된 content hash, plan revision SHA 또는 소유 상태가 snapshot과 다르면 개정을 거부한다.
 
@@ -26,9 +32,13 @@
 
 사용자가 BLOCKED 해제나 명세 보완을 위해 기존 ExecPlan을 직접 편집한 결과는 유지보수 Planner의 개정 결과가 아니다. 저장소 파일이 변경됐다는 사실만으로 유지보수 예외를 부여하지 않으며, 프로그램이 선택한 mode, SQLite 대상 snapshot과 Agent 실행 전후 diff가 모두 일치할 때만 유지보수 Planner 결과로 검증·게시한다.
 
+## 연관 문서의 정합성
+
+Worker는 현재 작업에 제공된 문서 수정 권한 안에서 코드·설계·계획 변경에 필요한 연관 문서를 함께 갱신하고, 이유·영향과 검증 조건을 현재 ExecPlan에 기록한다. Planner는 위 변경 범위의 영향받는 ExecPlan 개정을 담당하고 Reviewer는 구현·문서·요청의 정합성을 읽기 전용으로 검토한다. 새 목표 추가·사용자 결정·AGENTS 변경 승인을 문서 수정으로 대신하지 않는다.
+
 ## Agent guidance 변경 제안과 사용자 결정
 
-Worker가 현재 ExecPlan 달성에 꼭 필요한 `AGENTS.md` 규칙 변경을 발견하면 파일을 직접 수정하지 않고 해당 ExecPlan의 `Decision Log` 끝에 아래 제안과 빈 사용자 결정을 한 쌍으로 추가한 뒤 작업을 중단한다. proposal ID는 ExecPlan 안에서 고유한 소문자·숫자·하이픈 값이어야 한다. `Target`은 저장소 루트의 `AGENTS.md`만 허용하며, `Scope`는 현재 프로젝트 전용이면 `project`, Loop Manager 기준 원본의 공통 규칙이면 `common`이다. 공통 제안은 Loop Manager 자체 저장소의 Worker만 작성할 수 있다. Planner와 Reviewer는 제안하거나 적용하지 않는다.
+Worker가 현재 ExecPlan 달성에 꼭 필요한 `AGENTS.md` 규칙 변경을 발견하면 파일을 직접 수정하지 않고 해당 ExecPlan의 `Decision Log` 끝에 아래 제안과 빈 사용자 결정을 한 쌍으로 추가한 뒤 작업을 중단한다. proposal ID는 ExecPlan 안에서 고유한 소문자·숫자·하이픈 값이어야 한다. `Target`은 저장소 루트의 `AGENTS.md`만 허용하며, `Scope`는 기본적으로 `project`다. 프로그램이 현재 작업을 공통 규칙 원본의 작업으로 명시한 경우에만 `common`을 사용한다. 대상과 범위는 제공된 작업 문맥을 따른다. Planner와 Reviewer는 제안하거나 적용하지 않는다.
 
 ````markdown
 ### Agent Guidance Proposal: guidance-example
